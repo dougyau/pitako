@@ -1,0 +1,113 @@
+{
+  "rpiv-todo": {
+    "decision": "dependency",
+    "package": "@juicesharp/rpiv-todo",
+    "version": "2.11.0",
+    "repository": "https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-todo",
+    "license": "MIT",
+    "loaded": ["index.ts"],
+    "notLoaded": ["@juicesharp/rpiv-i18n"],
+    "reason": "Official Pi package. Session-local TODO overlay, tool, and /todos. Pitako does not vendor the reducer, overlay, or schemas. i18n remains an optional peer."
+  },
+  "ponytail": {
+    "decision": "dependency",
+    "package": "@dietrichgebert/ponytail",
+    "version": "4.10.0",
+    "repository": "https://github.com/DietrichGebert/ponytail",
+    "revision": "e3ba2aa6f1e6f0bc4d69eb09c9f0d0a93af56156",
+    "license": "MIT",
+    "loaded": ["skills/ponytail"],
+    "notLoaded": ["pi-extension/index.js"],
+    "reason": "Official Pi package. The extension injects the full skill body on every turn. Pitako loads only the skill so Ponytail stays on-demand."
+  },
+  "caveman": {
+    "decision": "vendor",
+    "repository": "https://github.com/JuliusBrussee/caveman",
+    "revision": "ae26f3a4775574bd49dc8bdb61c0287bbc3cd268",
+    "license": "MIT for skills/",
+    "paths": ["skills/caveman/SKILL.md", "skills/investigate-first/SKILL.md"],
+    "notVendored": ["engine/", "proxy/", "browse/", "mcp/", "mem/ Go core", "caveman-compress", "cavecrew"],
+    "localModifications": [
+      "Pitako default section: lite intensity, keep architectural explanations, do not pair with the full Ponytail body",
+      "Override upstream Default: full to Pitako default lite"
+    ],
+    "reason": "Not a Pi package. Skills are MIT. Runtime/engine paths are BSL-1.1 and are not shipped."
+  },
+  "pstack": {
+    "decision": "vendor-selected",
+    "repository": "https://github.com/cursor/plugins/tree/main/pstack",
+    "pluginRevision": "6ed0f7a9504f577d7529064103cecce9be7dfc5e",
+    "license": "MIT",
+    "copyright": "Lauren Tan",
+    "inspectedPorts": [
+      {
+        "package": "@zenspc/pi-pstack",
+        "version": "0.6.0",
+        "license": "MIT",
+        "rejected": "Loads poteto-mode, setup-pstack, and pi-subagents."
+      },
+      {
+        "package": "@mccune1224/pi-pstack",
+        "version": "0.1.0",
+        "rejected": "Requires pi-subagents for routed skills."
+      },
+      {
+        "repository": "https://github.com/kkgogogo17/pi-pstack",
+        "rejected": "Bundles poteto-agent and the full 44-skill orchestration set."
+      }
+    ],
+    "practical": [
+      "architect",
+      "how",
+      "why",
+      "blast-radius",
+      "tdd",
+      "show-me-your-work",
+      "create-verification-skill",
+      "maintain-verification-skill",
+      "reflect",
+      "technical-writing",
+      "unslop"
+    ],
+    "principles": [
+      "principle-foundational-thinking",
+      "principle-model-the-domain",
+      "principle-boundary-discipline",
+      "principle-prove-it-works",
+      "principle-fix-root-causes",
+      "principle-guard-the-context-window",
+      "principle-subtract-before-you-add",
+      "principle-minimize-reader-load",
+      "principle-type-system-discipline",
+      "principle-sequence-verifiable-units",
+      "principle-encode-lessons-in-structure",
+      "principle-make-operations-idempotent",
+      "principle-exhaust-the-design-space",
+      "principle-outcome-oriented-execution",
+      "principle-redesign-from-first-principles",
+      "principle-build-the-lever",
+      "principle-migrate-callers-then-delete-legacy-apis",
+      "principle-separate-before-serializing-shared-state",
+      "principle-experience-first"
+    ],
+    "excluded": [
+      "poteto-mode",
+      "setup-pstack",
+      "arena",
+      "interrogate",
+      "swarm",
+      "principle-never-block-on-the-human",
+      "principle-laziness-protocol"
+    ],
+    "localModifications": [
+      "Practical skills rewritten for a single agent using CodeGraph and LSP",
+      "architect stops after the sketch unless the user asked to implement",
+      "Removed disable-model-invocation so skills stay discoverable",
+      "unslop limited to prose",
+      "create-verification-skill writes .pi/skills/",
+      "principle-guard-the-context-window no longer routes bulk work to subagents",
+      "principle-build-the-lever no longer links principle-laziness-protocol"
+    ],
+    "update": "Clone the pstack tree from cursor/plugins, set PSTACK_CHECKOUT, CAVEMAN_CHECKOUT, and PONYTAIL_CHECKOUT, then run scripts/vendor-engineering-layer.py. Re-apply the local modifications documented here. Bump docs/provenance.json."
+  }
+}

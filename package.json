@@ -1,0 +1,72 @@
+{
+  "name": "pitako",
+  "version": "0.1.0",
+  "description": "Opinionated Pi coding baseline: LSP, CodeGraph, Ponytail, selected Caveman and pstack skills, and coding/analysis profiles.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": ["pi-package", "pi", "coding-agent", "pitako"],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "packageManager": "bun@1.3.14",
+  "files": [
+    "extensions",
+    "skills",
+    "prompts",
+    "config",
+    "fixtures",
+    "docs",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "THIRD_PARTY.md"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "smoke": "bun scripts/smoke.ts",
+    "pi": "pi --no-extensions --approve -e .",
+    "typecheck": "tsc --noEmit"
+  },
+  "pi": {
+    "extensions": [
+      "./node_modules/pi-lsp-client/src/index.ts",
+      "./node_modules/@vndv/pi-codegraph/extensions/codegraph.ts",
+      "./node_modules/@juicesharp/rpiv-todo/index.ts",
+      "./extensions/index.ts"
+    ],
+    "skills": [
+      "./skills/pitako-coding",
+      "./skills/caveman",
+      "./skills/investigate-first",
+      "./skills/practical",
+      "./skills/principles",
+      "./node_modules/@dietrichgebert/ponytail/skills/ponytail"
+    ],
+    "prompts": ["./prompts"]
+  },
+  "dependencies": {
+    "@colbymchenry/codegraph": "1.6.0",
+    "@dietrichgebert/ponytail": "4.10.0",
+    "@juicesharp/rpiv-todo": "2.11.0",
+    "@vndv/pi-codegraph": "0.1.10",
+    "pi-lsp-client": "github:code-yeongyu/pi-lsp-client#1c981dfcacc456fe4ce9f4120a2f0250b54d6844"
+  },
+  "bundledDependencies": [
+    "@dietrichgebert/ponytail",
+    "@juicesharp/rpiv-todo",
+    "@vndv/pi-codegraph",
+    "pi-lsp-client"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.87.0",
+    "@types/bun": "1.3.14",
+    "typescript": "5.9.3"
+  }
+}

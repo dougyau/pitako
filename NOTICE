@@ -1,0 +1,19 @@
+Pitako composes third-party Pi packages and vendors selected MIT skills.
+
+Dependencies (not copied into this repository's source):
+
+- pi-lsp-client (code-yeongyu) is MIT. Its NOTICE explains that the ported LSP
+  tools were re-licensed by their author for the Pi ecosystem. Oh My OpenAgent
+  itself remains under a different license and is not shipped here.
+- @vndv/pi-codegraph is MIT.
+- @colbymchenry/codegraph is MIT.
+- @dietrichgebert/ponytail is MIT. Pitako loads the ponytail skill only.
+- @juicesharp/rpiv-todo is MIT. Pitako loads the extension as the session TODO layer.
+- Pi (@earendil-works/pi-coding-agent) is MIT.
+
+Vendored MIT material (see THIRD_PARTY.md and docs/licenses/):
+
+- Caveman coding skills (Julius Brussee). skills/ is MIT. BSL engine/runtime
+  paths are not shipped.
+- Selected pstack skills and principles (Lauren Tan / official Cursor pstack
+  plugin). Orchestration, poteto-mode, and subagent runtimes are not shipped.

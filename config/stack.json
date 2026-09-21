@@ -1,0 +1,50 @@
+{
+  "profiles": ["coding", "analysis"],
+  "defaultProfile": "coding",
+  "pitakoExtension": "extensions/index.ts",
+  "required": [
+    {
+      "id": "pi-lsp-client",
+      "spec": "github:code-yeongyu/pi-lsp-client#1c981dfcacc456fe4ce9f4120a2f0250b54d6844",
+      "entry": "node_modules/pi-lsp-client/src/index.ts",
+      "tools": [
+        "lsp_diagnostics",
+        "lsp_goto_definition",
+        "lsp_find_references",
+        "lsp_symbols",
+        "lsp_prepare_rename",
+        "lsp_rename"
+      ]
+    },
+    {
+      "id": "@vndv/pi-codegraph",
+      "spec": "@vndv/pi-codegraph@0.1.10",
+      "entry": "node_modules/@vndv/pi-codegraph/extensions/codegraph.ts",
+      "bin": "codegraph",
+      "tools": [
+        "codegraph_search",
+        "codegraph_callers",
+        "codegraph_callees",
+        "codegraph_impact",
+        "codegraph_explore",
+        "codegraph_node",
+        "codegraph_status",
+        "codegraph_files"
+      ]
+    },
+    {
+      "id": "@juicesharp/rpiv-todo",
+      "spec": "@juicesharp/rpiv-todo@2.11.0",
+      "entry": "node_modules/@juicesharp/rpiv-todo/index.ts",
+      "tools": ["todo"]
+    }
+  ],
+  "optional": [
+    {
+      "id": "web-research",
+      "status": "not-bundled",
+      "suggestedPackage": "pi-web-access",
+      "reason": "Maintained and capable, but it also pulls PDF extraction, YouTube, repo cloning, and several search-provider API keys. That is more than this coding baseline needs, and it should not be required to start Pitako."
+    }
+  ]
+}

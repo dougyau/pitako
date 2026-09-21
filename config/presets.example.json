@@ -1,0 +1,11 @@
+{
+  "coding": {
+    "thinkingLevel": "medium",
+    "instructions": "Example only. Pitako does not select a provider or model. Copy this file to ~/.pi/agent/presets.json only if you already use Pi's preset example and want a thinking-level hint. Do not add a provider or model from someone else's setup."
+  },
+  "analysis": {
+    "thinkingLevel": "high",
+    "tools": ["read", "bash", "grep", "find", "ls"],
+    "instructions": "Example only. Pitako's analysis profile already removes edit, write, and lsp_rename. This file does not change the model you selected in Pi."
+  }
+}
