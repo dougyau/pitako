@@ -10,6 +10,18 @@ export const ANALYSIS_BUILTINS = ["read", "bash", "grep", "find", "ls"] as const
 /** Tools that change files. Shell is intentionally not in this set. */
 export const MUTATING_TOOLS = new Set(["edit", "write", "lsp_rename"]);
 
+/** Foreground orchestration. Children do not receive these tools. */
+export const ORCHESTRATION_TOOLS = [
+  "agent_run",
+  "agent_supervise",
+  "agent_spawn",
+  "agent_status",
+  "agent_result",
+  "agent_cancel",
+] as const;
+
+const ORCHESTRATION = new Set<string>(ORCHESTRATION_TOOLS);
+
 const BUILTIN_TOOLS = new Set([
   "read",
   "bash",
@@ -35,7 +47,7 @@ export function childActiveTools(available: readonly string[], platform: NodeJS.
     available,
     profile: "coding",
     includePowerShell: platform === "win32" && available.includes("powershell"),
-  }).filter((name) => name !== "agent_run" && name !== "agent_supervise");
+  }).filter((name) => !ORCHESTRATION.has(name));
 }
 
 export function toolsForProfile(options: {

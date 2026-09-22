@@ -1,0 +1,7 @@
+Command: bun test tests/herdr.test.ts tests/agent.test.ts
+Result: 19 pass, 0 fail.
+
+readHerdrPresence is present only when HERDR_ENV=1, HERDR_PANE_ID, and HERDR_SOCKET_PATH are set.
+piIntegrationCurrent passes only when the pi: token is current.
+outdated, needs repair, not installed, and another agent's current fail.
+The presence module does not exec herdr.

@@ -127,6 +127,17 @@ describe("plan and execute contracts", () => {
     expect(execute).toContain("Level 2");
     expect(execute).toContain("Level 3");
     expect(execute).toContain("same Developer");
+    expect(execute).toContain("agent_spawn");
+    expect(execute).toContain("agent_run");
+    expect(execute).toContain("Do not poll `agent_status`");
+    expect(execute).toContain("Do not call `agent_result` in the same turn");
+    expect(execute).toContain("## Workers");
+    expect(execute).toContain("not foreground implementation");
+    expect(execute).toContain("neither `agent_run` nor `agent_spawn` is registered");
+    expect(execute).not.toContain("`agent_run` unavailable still means implement inline");
+    expect(execute).not.toContain("If `agent_run` is unavailable, implement inline");
+    expect(execute).toContain("Consult Architect through `agent_run`");
+    expect(execute).not.toContain("When `agent_run` is available, you coordinate");
     expect(execute).toContain("bindingMismatch");
     expect(execute).not.toMatch(/openai-codex|anthropic\/|gpt-5|claude-/);
   });

@@ -74,7 +74,7 @@ Fallback is availability only. v0 does not select a fallback and does not accept
 
 ## AgentInstance v0
 
-`agent_run` is unchanged. It creates one in-process Pi `AgentSession` with `SessionManager.inMemory`. That gives a new conversation and a new rpiv-todo session id without a child process. Pi's `setModel` keeps the same session when a provider fails after a mutating tool. A fresh session is used only when no mutating tool has run. Unknown errors and cancellation do not fall back. The child prompt is the role instructions plus the task. Parent messages are not passed in.
+`agent_run` stays synchronous. It creates one in-process Pi `AgentSession` with `SessionManager.inMemory`. That gives a new conversation and a new rpiv-todo session id without a child process. Pi's `setModel` keeps the same session when a provider fails after a mutating tool. A fresh session is used only when no mutating tool has run. Unknown errors and cancellation do not fall back. The child prompt is the role instructions plus the task. Parent messages are not passed in.
 
 Board author is resolved from a process-shared session registry, not AsyncLocalStorage. A child Pi session id maps to the instance id. The foreground session stays `pi`. The model cannot pass an author. Child tools are enabled with `setActiveToolsByName` at construction, including grep, find, and ls. `agent_run` stays excluded.
 
@@ -84,7 +84,9 @@ A child session does not receive the foreground sentence that the user selected 
 
 AgentInstance has no 20-minute deadline. The stops at that mark came from the parent tool timeout around `pi --mode json`, not from this package. Pi's HTTP idle timeout defaults to 5 minutes and stays a transport concern. The Pitako watchdog aborts only after confirmed inactivity: 10 minutes idle, 45 minutes during a tool, unless `max_run_time` is set above 0. Cache-warming events do not refresh activity. A stall is a terminal failure and does not fall back.
 
-`agent_supervise` is not an AgentInstance path. It requires Herdr presence and a current official Pi integration. The operator installs that integration with `herdr integration install pi`. Pitako does not install it. A supervised result is an instance id, a pane id, and a Herdr status. It is not an `AgentRunResult`.
+`agent_spawn` is the background scheduling path for that same `runAgentInstance`. It passes an owned `AbortController`, not the foreground tool signal. The registry is process-local (`Symbol.for("pitako.backgroundWorkers")`). It is not `ExecutionIdentity` and not SQLite. Status and result reads do not wait. A watched completion uses `pi.sendMessage` with `deliverAs: "followUp"` and `triggerTurn: true` only when the foreground owner is idle. Otherwise the line is held until the owner's idle boundary. `steer` is not used. A second extension evaluation does not flush or cancel those rows. `session_shutdown` on the foreground owner aborts them. Workers do not survive reload, `/new`, fork, resume, or process exit.
+
+`agent_supervise` stays a synchronous Herdr wait. It is not an AgentInstance path and it is not the background path. It requires Herdr presence and a current official Pi integration. The operator installs that integration with `herdr integration install pi`. Pitako does not install it. A supervised result is an instance id, a pane id, and a Herdr status. It is not an `AgentRunResult`.
 
 ## Plan and execute
 

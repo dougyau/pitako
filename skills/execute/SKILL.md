@@ -29,7 +29,7 @@ Do not build an authority framework. Apply these three levels.
 
 Level 1, technical and reversible: helper placement, local structure, names, ordinary errors, test layout, equivalent stdlib use. Decide, record a short `RULING` in the ledger when resume or review needs it, and continue.
 
-Level 2, architectural but inside the accepted envelope: the planned internal shape is inadequate, and another internal design still preserves Goal, Non-goals, Scope, Invariants, user-visible intent, the safety boundary, and acceptance criteria. Consult Architect through `agent_run` only when that uncertainty is real. Record an `EXECUTION AMENDMENT` or `RULING`. Continue. The frozen plan stays immutable.
+Level 2, architectural but inside the accepted envelope: the planned internal shape is inadequate, and another internal design still preserves Goal, Non-goals, Scope, Invariants, user-visible intent, the safety boundary, and acceptance criteria. Consult Architect through `agent_run` only when that uncertainty is real. That answer is required before the next action, so it stays a synchronous call. Record an `EXECUTION AMENDMENT` or `RULING`. Continue. The frozen plan stays immutable.
 
 Level 3, user-owned: stop with `USER_DECISION_REQUIRED` only when evidence cannot decide for the user. That includes a Goal change, a Non-goal becoming a goal, material scope expansion, an invariant change, two materially different user-visible outcomes, a change in security or privacy risk appetite, or an unauthorized destructive or external side effect. Include the exact decision, evidence already gathered, options, consequences, and a recommendation when evidence supports one.
 
@@ -37,7 +37,19 @@ Never ask the user to make a Level 1 or Level 2 decision.
 
 ## Workers
 
-When `agent_run` is available, you coordinate. You do not re-solve every unit.
+When specialist tools are available, you coordinate. You do not re-solve every unit.
+
+A sync dependency uses `agent_run`. The wait is the dependency. That includes a Level 2 Architect question and a Reviewer judgment the next action needs.
+
+Long specialist work uses `agent_spawn` with `plan` and `unit`. Do not use `agent_run` for that work. Do not call `agent_result` in the same turn. Do not poll `agent_status`. After spawn, write one line under `## Workers` and end the turn if nothing else in the current unit can proceed without that result. Do not ask the user whether to wait.
+
+On the `pitako.worker` wake, call `agent_result` once, replace that worker line, and continue the unit. A failed, cancelled, or lost worker is not foreground implementation. Report it and stop that unit. If the result exists and verification fails, the existing correction order still applies. A missing worker is not that case.
+
+On resume, look only at `## Workers`. Do not treat frontmatter `status: running` or the `## Status` body as a worker. If a worker line says `status running`, call `agent_status` once for that id. If it is running, end the turn. If the id is unknown, record a blocker. Do not poll.
+
+One developer at a time unless the frozen plan already assigns non-overlapping work. New user information during a run is recorded and applied after `agent_result`, or the worker is cancelled. There is no steer into a running worker.
+
+Inline implementation is allowed only when neither `agent_run` nor `agent_spawn` is registered in the session. A failure, stall, cancellation, or lost worker is not foreground implementation.
 
 Build a WorkBrief for the current unit only:
 
@@ -50,9 +62,9 @@ Build a WorkBrief for the current unit only:
 
 Do not send the parent transcript, unrelated units, old evidence, or every Board topic.
 
-Developer implements. Reviewer judges when the risk justifies it. Architect answers only an architecture question. Researcher fills only a real knowledge gap. If `agent_run` fails, report the error. Do not perform that role yourself.
+Developer implements. Reviewer judges when the risk justifies it. Architect answers only an architecture question. Researcher fills only a real knowledge gap. If `agent_run` or `agent_spawn` fails, report the error. Do not perform that role yourself.
 
-If `agent_run` is unavailable, implement inline with the same plan, ledger, evidence, and verification rules.
+When neither `agent_run` nor `agent_spawn` is registered, implement inline with the same plan, ledger, evidence, and verification rules.
 
 Routine implementation does not require Architect or Reviewer.
 

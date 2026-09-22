@@ -2,7 +2,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { skillStatusLines } from "./catalog.ts";
 import { PitakoConfigError } from "./errors.ts";
 import { isProtectedEditPath } from "./paths.ts";
-import { childSessionNote, parseProfile, profileNote, toolsForProfile, type ProfileName } from "./profile.ts";
+import { bindBackgroundOwner, formatWorkerViews, shutdownBackground, takeHeldCompletions, workerStatus } from "./agent/background.ts";
+import { childSessionNote, ORCHESTRATION_TOOLS, parseProfile, profileNote, toolsForProfile, type ProfileName } from "./profile.ts";
 import { currentInstanceId } from "./agent/scope.ts";
 import { inspectPitako } from "./roles/format.ts";
 import { registerSupervisedSession, unregisterSupervisedSession } from "./herdr/author.ts";
@@ -42,8 +43,31 @@ export default function pitako(pi: ExtensionAPI) {
 
   let profile: ProfileName = "coding";
 
+  const ownerToken = Symbol("pitako.foreground");
+
   pi.on("session_start", async (_event, ctx) => {
     registerSupervisedSession(ctx.sessionManager?.getSessionId());
+    if (!currentInstanceId() && !process.env.PITAKO_INSTANCE_ID && typeof ctx.isIdle === "function") {
+      bindBackgroundOwner({
+        token: ownerToken,
+        isIdle: () => ctx.isIdle(),
+        hasUI: ctx.hasUI,
+        notify: (message) => {
+          if (ctx.hasUI) ctx.ui.notify(message, "info");
+        },
+        sendMessage: (content) => {
+          pi.sendMessage(
+            {
+              customType: "pitako.worker",
+              content,
+              display: true,
+              details: { source: "pitako.worker" },
+            },
+            { deliverAs: "followUp", triggerTurn: true },
+          );
+        },
+      });
+    }
     try {
       profile = requestedProfile(pi);
     } catch (error) {
@@ -52,13 +76,13 @@ export default function pitako(pi: ExtensionAPI) {
       throw error;
     }
     const instanceId = currentInstanceId();
-    if (instanceId) {
+    if (instanceId || process.env.PITAKO_INSTANCE_ID) {
       const available = pi.getAllTools().map((tool) => tool.name);
       const coding = toolsForProfile({
         available,
         profile: "coding",
         includePowerShell: process.platform === "win32" || pi.getActiveTools().includes("powershell"),
-      }).filter((name) => name !== "agent_run" && name !== "agent_supervise");
+      }).filter((name) => !ORCHESTRATION_TOOLS.includes(name as (typeof ORCHESTRATION_TOOLS)[number]));
       pi.setActiveTools(coding);
     } else {
       applyProfile(pi, profile);
@@ -68,8 +92,27 @@ export default function pitako(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    shutdownBackground(ownerToken);
     unregisterSupervisedSession();
   });
+
+  const flush = () => {
+    const content = takeHeldCompletions(ownerToken);
+    if (!content) return;
+    pi.sendMessage(
+      {
+        customType: "pitako.worker",
+        content,
+        display: true,
+        details: { source: "pitako.worker" },
+      },
+      { deliverAs: "followUp", triggerTurn: true },
+    );
+  };
+  pi.on("agent_settled", flush);
+  pi.on("session_compact", flush);
+  pi.on("session_compact_failed", flush);
+  pi.on("session_tree", flush);
 
   pi.on("before_agent_start", async (event) => {
     const instanceId = currentInstanceId();
@@ -86,6 +129,14 @@ export default function pitako(pi: ExtensionAPI) {
       if (command === "roles" || command === "role" || command === "policies" || command === "policy") {
         try {
           notify(ctx, inspectPitako(args));
+        } catch (error) {
+          notify(ctx, error instanceof Error ? error.message : String(error), "error");
+        }
+        return;
+      }
+      if (command === "agents") {
+        try {
+          notify(ctx, formatWorkerViews(workerStatus(value)));
         } catch (error) {
           notify(ctx, error instanceof Error ? error.message : String(error), "error");
         }
@@ -108,6 +159,8 @@ export default function pitako(pi: ExtensionAPI) {
         "Switch with /pitako profile analysis",
         "Session TODOs: todo tool and /todos (rpiv-todo). Shared knowledge: board_* tools and /board.",
         "Roles: /pitako roles, /pitako role <id>, /pitako policies, /pitako policy <id>. Definitions only.",
+        "Background workers: /pitako agents",
+
         ...skillStatusLines(),
       ];
       if (ctx.hasUI) ctx.ui.notify(lines.join("\n"), "info");

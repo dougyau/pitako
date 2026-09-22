@@ -6,6 +6,7 @@ import { currentInstanceId } from "../agent/scope.ts";
 import { PitakoConfigError } from "../errors.ts";
 import { loadPitakoConfig, resolveRoleFromConfig, type LoadOptions } from "../roles/load.ts";
 import type { ResolvedRole } from "../roles/types.ts";
+import { ORCHESTRATION_TOOLS } from "../profile.ts";
 import { piIntegrationCurrent, readHerdrPresence } from "./presence.ts";
 
 /** CLI seam. Not an AgentRuntime. */
@@ -118,7 +119,7 @@ async function superviseOnce(input: {
   try {
     const startArgs = ["agent", "start", instanceId, "--kind", "pi", "--pane", paneId, "--", "--model", target.model];
     if (target.reasoning) startArgs.push("--thinking", target.reasoning);
-    startArgs.push("--no-approve", "--append-system-prompt", preamble(role, instanceId), "--exclude-tools", "agent_run,agent_supervise");
+    startArgs.push("--no-approve", "--append-system-prompt", preamble(role, instanceId), "--exclude-tools", ORCHESTRATION_TOOLS.join(","));
     const start = await exec(run, startArgs, input.cwd, signal);
     const startFailure = failureCode(start);
     if (startFailure) {
@@ -191,7 +192,7 @@ function preamble(role: ResolvedRole, instanceId: string): string {
   return [
     `You are Pitako role ${role.id}, instance ${instanceId}, in a visible Herdr pane.`,
     "Your conversation is private. Do not assume you saw the parent session.",
-    "Do not spawn other agents. agent_run and agent_supervise are not available.",
+    "Do not spawn other agents. agent_run, agent_supervise, agent_spawn, agent_status, agent_result, and agent_cancel are not available.",
     "Publish shared findings on the Board. Board contents are not injected here.",
     "Your rpiv-todo list is private to this session.",
     "The model and reasoning for this run come from this role's ModelPolicy, not from the parent session.",

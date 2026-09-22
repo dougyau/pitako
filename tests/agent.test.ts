@@ -464,6 +464,82 @@ reasoning = "medium"
     expect(currentWorkspace(packageRoot())).toBe(currentWorkspace(packageRoot()));
   });
 
+  test("onAccepted publishes instance id before executor start", async () => {
+    const env = tempEnv();
+    const configured = { env, userConfigPath: path.join(env.PI_CODING_AGENT_DIR!, "pitako", "config.toml") };
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(path.dirname(configured.userConfigPath), { recursive: true });
+    writeFileSync(configured.userConfigPath, `[model_policies.architect.primary]\nmodel = "example/primary"\nreasoning = "high"\n`);
+    let acceptedId: string | undefined;
+    let started = false;
+    const controller = new AbortController();
+    const executor: AttemptExecutor = {
+      async start(input) {
+        started = true;
+        controller.abort();
+        await new Promise<void>((resolve) => {
+          if (input.signal.aborted) {
+            resolve();
+            return;
+          }
+          input.signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        return { status: "cancelled", result: "cancelled", sideEffects: false };
+      },
+    };
+    const pending = runAgentInstance({
+      roleId: "architect",
+      task: "review the boundary",
+      cwd: packageRoot(),
+      executor,
+      load: configured,
+      signal: controller.signal,
+      onAccepted(instance) {
+        expect(started).toBe(false);
+        acceptedId = instance.id;
+        expect(instance.roleId).toBe("architect");
+        expect(instance.status).toBe("created");
+      },
+    });
+    expect(acceptedId).toMatch(/^architect-/);
+    expect(started).toBe(false);
+    await pending;
+  });
+
+  test("throwing onAccepted rejects without starting executor or watchdog", async () => {
+    const env = tempEnv();
+    const configured = { env, userConfigPath: path.join(env.PI_CODING_AGENT_DIR!, "pitako", "config.toml") };
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(path.dirname(configured.userConfigPath), { recursive: true });
+    writeFileSync(configured.userConfigPath, `[model_policies.architect.primary]\nmodel = "example/primary"\nreasoning = "high"\n`);
+    let scheduled = false;
+    let started = false;
+    const executor: AttemptExecutor = {
+      async start() {
+        started = true;
+        return { status: "completed", result: "never", sideEffects: false };
+      },
+    };
+    await expect(
+      runAgentInstance({
+        roleId: "architect",
+        task: "review the boundary",
+        cwd: packageRoot(),
+        executor,
+        load: configured,
+        onAccepted() {
+          throw new Error("accept failed");
+        },
+        schedule: () => {
+          scheduled = true;
+          return { unref() {} };
+        },
+      }),
+    ).rejects.toThrow("accept failed");
+    expect(started).toBe(false);
+    expect(scheduled).toBe(false);
+  });
+
   test("agent_run is registered, refused inside an instance, and Pitako still loads", async () => {
     const loaded = await loadPitako(packageRoot());
     expect(registeredToolNames(loaded.extensions)).toContain("agent_run");

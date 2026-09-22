@@ -9,7 +9,7 @@ import {
   type AgentSession,
 } from "@earendil-works/pi-coding-agent";
 import { registerExecution, unregisterExecution } from "../execution-identity.ts";
-import { childActiveTools } from "../profile.ts";
+import { childActiveTools, ORCHESTRATION_TOOLS } from "../profile.ts";
 import { marksSideEffect } from "./effects.ts";
 import { childInstructions, skillNamesForRole, usageDelta, type AgentUsage, type Attempt, type AttemptExecutor } from "./run.ts";
 import type { ModelTarget, ReasoningLevel } from "../roles/types.ts";
@@ -175,7 +175,7 @@ async function openSession(
     settingsManager,
     resourceLoader: loader,
     modelRuntime: runtime,
-    excludeTools: ["agent_run"],
+    excludeTools: [...ORCHESTRATION_TOOLS],
   });
   session.setActiveToolsByName(childActiveTools(session.getAllTools().map((tool) => tool.name)));
   registerExecution({ instanceId: input.instanceId, roleId: input.role.id, sessionId: session.sessionId });

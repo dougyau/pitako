@@ -1,0 +1,8 @@
+bun test tests/agent.test.ts
+12 pass, 0 fail
+onAccepted publishes instance id before executor start: pass
+throwing onAccepted rejects without starting executor or watchdog: pass
+
+developer-8427de stalled after the hook edit.
+developer-5ec2fe stalled after fixing the hang in the accept test.
+Coordinator ran the test. Result above.

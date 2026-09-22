@@ -32,8 +32,9 @@ Disable Ponytail, Caveman, or any individual skill with `pi config` or package s
 - Session-local TODOs via `@juicesharp/rpiv-todo` (`todo`, `/todos`, overlay).
 - A workspace-scoped Board (`board_*` tools, `/board`) stored in SQLite.
 - Role definitions and model policies (`/pitako roles`). These are templates, not running agents.
-- `agent_run` for one isolated in-process AgentInstance. It is unchanged, and it does not start a team.
-- `agent_supervise` for one visible sibling pane. It is not a team.
+- `agent_run` for one synchronous in-process AgentInstance. It does not start a team.
+- `agent_spawn` for one background in-process AgentInstance. The Coordinator stays available. `agent_status`, `agent_result`, and `agent_cancel` inspect that worker. `/pitako agents` prints the same compact view.
+- `agent_supervise` for one synchronous visible sibling pane. It does not run in the background. It is not a team.
 - `$plan` and `$execute`. Planning stops at `PLAN_FROZEN`. Execution is a separate invocation. Neither calls Herdr.
 
 ## Session TODOs
@@ -138,7 +139,9 @@ Before a mutating or unknown tool runs, the next target may start a fresh sessio
 
 The result can include turns, input, output, cache tokens, cost, and tool-call counts when Pi reports them. Input tokens are cumulative across turns, not the size of one prompt.
 
-The child cannot call `agent_run`. There is no background mode, resume, or team.
+The child cannot call `agent_run`, `agent_supervise`, `agent_spawn`, `agent_status`, `agent_result`, or `agent_cancel`. There is no resume and no team.
+
+`agent_spawn` returns while the worker is still running. The worker has its own cancellation. A later Coordinator turn does not cancel it. Completion is one short signal. The result stays out of the Coordinator conversation until `agent_result`. A spawn with `plan` and `unit` can wake an idle `$execute` turn. A spawn without that pair only notifies the UI. Herdr background supervision is not in this milestone.
 
 There is no fixed wall-clock deadline. A run ends for inactivity, not because it is old. The default idle window is 10 minutes with no tool running, and 45 minutes while a tool is running. `max_run_time = "0"` means unlimited. Parent cancellation is immediate and is not a stall. A stall does not switch models. Prompt-cache warming does not count as progress. Pi's HTTP idle timeout is a separate transport limit and is left unchanged.
 

@@ -1,0 +1,12 @@
+bun test
+119 pass, 0 fail
+bunx tsc --noEmit clean
+
+Required proof: tests/agent-background.test.ts
+"a parent prompt completes while the child prompt is pending"
+
+That test calls spawnBackground with createPiExecutor. The child model stream never ends, so session.prompt stays pending. After worker status is running, a separate parent AgentSession.prompt("what remains of the plan") returns "parent-ok". workerStatus is still running after that prompt. Then the test cancels only that worker.
+
+This session could not host a second live TUI Coordinator. The tools were added after this Pi process loaded its extensions. No Herdr pane was split. The Pi integration was not installed.
+
+Dogfood 2 live $execute session was not started. skills/execute/SKILL.md now requires agent_spawn for long work and forbids a status poll. The same child-prompt test is the scheduling proof.

@@ -1,0 +1,3 @@
+README and docs/engineering.md say agent_run is unchanged, agent_supervise requires Herdr presence and a current Pi integration, the operator installs it with `herdr integration install pi`, and a supervised result is not an AgentRunResult.
+They say $plan and $execute are not Herdr callers.
+They do not describe a team, a DAG, or a scheduler.
