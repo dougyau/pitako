@@ -57,6 +57,7 @@ describe("Pi package loading", () => {
       const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
       const pi = {
         registerFlag() {},
+        registerTool() {},
         getFlag() {
           return undefined;
         },

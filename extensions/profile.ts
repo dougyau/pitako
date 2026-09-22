@@ -35,7 +35,7 @@ export function childActiveTools(available: readonly string[], platform: NodeJS.
     available,
     profile: "coding",
     includePowerShell: platform === "win32" && available.includes("powershell"),
-  }).filter((name) => name !== "agent_run");
+  }).filter((name) => name !== "agent_run" && name !== "agent_supervise");
 }
 
 export function toolsForProfile(options: {

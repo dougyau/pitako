@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { PitakoConfigError } from "../errors.ts";
 import { currentInstanceId } from "./scope.ts";
@@ -24,27 +25,44 @@ export default function agentInstance(pi: ExtensionAPI): void {
       },
       noExtra,
     ),
-    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
       if (currentInstanceId()) {
         return errorResult("agent_run cannot be called from an AgentInstance");
       }
       try {
+        let live = "";
         const result = await runAgentInstance({
           roleId: params.role,
           task: params.task,
           cwd: ctx.cwd,
           signal,
           executor: createPiExecutor(),
+          onPresent(text) {
+            live = text;
+            onUpdate?.({
+              content: [{ type: "text", text }],
+              details: { live: text },
+            });
+          },
         });
         return {
           content: [{ type: "text", text: formatAgentResult(result) }],
-          details: result,
+          details: { ...result, live },
           isError: result.status !== "completed",
         };
       } catch (error) {
         const message = error instanceof PitakoConfigError || error instanceof Error ? error.message : String(error);
         return errorResult(message);
       }
+    },
+    renderCall(args, theme) {
+      return new Text(theme.fg("toolTitle", theme.bold("agent_run")) + theme.fg("accent", ` ${args.role}`), 0, 0);
+    },
+    renderResult(result, options, theme) {
+      const details = result.details as { live?: string } | undefined;
+      const full = result.content.map((part) => (part.type === "text" ? part.text ?? "" : "")).join("\n");
+      const text = options.expanded ? full : details?.live || full;
+      return new Text(theme.fg("toolOutput", text), 0, 0);
     },
   });
 }

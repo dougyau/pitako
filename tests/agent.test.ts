@@ -435,12 +435,13 @@ reasoning = "medium"
       if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previous;
     }
-    const names = childActiveTools(["read", "grep", "find", "ls", "bash", "agent_run", "board_post", "database_migrate"]);
+    const names = childActiveTools(["read", "grep", "find", "ls", "bash", "agent_run", "agent_supervise", "board_post", "database_migrate"]);
     expect(names).toContain("grep");
     expect(names).toContain("find");
     expect(names).toContain("ls");
     expect(names).toContain("read");
     expect(names).not.toContain("agent_run");
+    expect(names).not.toContain("agent_supervise");
     const unix = childActiveTools(["read", "bash", "powershell", "agent_run"], "linux");
     expect(unix).toContain("bash");
     expect(unix).not.toContain("powershell");
@@ -491,7 +492,7 @@ reasoning = "medium"
         return ["agent_run", "read"];
       },
       getAllTools() {
-        return [{ name: "agent_run" }, { name: "read" }];
+        return [{ name: "agent_run" }, { name: "agent_supervise" }, { name: "read" }];
       },
       setActiveTools(names: string[]) {
         active.splice(0, active.length, ...names);
@@ -504,6 +505,7 @@ reasoning = "medium"
     pitako(pi as unknown as ExtensionAPI);
     agentInstance(pi as unknown as ExtensionAPI);
     expect(active.includes("agent_run")).toBe(false);
+    expect(active.includes("agent_supervise")).toBe(false);
     expect(currentInstanceId()).toBeUndefined();
     const tool = tools.get("agent_run");
     if (!tool) throw new Error("agent_run missing");

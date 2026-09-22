@@ -4,6 +4,7 @@ import { PitakoConfigError } from "../errors.ts";
 import { loadPitakoConfig, resolveRoleFromConfig, type LoadOptions } from "../roles/load.ts";
 import type { FallbackReason, ModelTarget, ResolvedRole } from "../roles/types.ts";
 import { classifyProviderFailure } from "./fallback.ts";
+import { formatAgentLive } from "./present.ts";
 import { agentScope } from "./scope.ts";
 import {
   activityKind,
@@ -101,6 +102,8 @@ export interface AttemptExecutor {
     cwd: string;
     signal: AbortSignal;
     onActivity?: (event: { type?: string; toolName?: string; assistantMessageEvent?: { type?: string } }) => void;
+    /** Fired only after setModel / session open succeeds. Not a second lifecycle. */
+    onActivated?: (appliedReasoning: string) => void;
   }): Promise<Attempt>;
 }
 
@@ -118,6 +121,7 @@ async function runAttempt(
     cwd: string;
     signal: AbortSignal;
     onActivity?: (event: { type?: string; toolName?: string; assistantMessageEvent?: { type?: string } }) => void;
+    onActivated?: (appliedReasoning: string) => void;
   },
 ): Promise<Attempt> {
   try {
@@ -181,6 +185,8 @@ export async function runAgentInstance(input: {
   /** Test scheduler. Production uses setInterval and unref. */
   schedule?: (fn: () => void, ms: number) => { unref?: () => void };
   watchdog?: WatchdogConfig;
+  /** Live view only. Errors are ignored so UI cannot change the run. */
+  onPresent?: (text: string) => void;
 }): Promise<AgentRunResult> {
   const task = input.task.trim();
   if (task.length === 0) throw new PitakoConfigError("agent_run task must not be empty");
@@ -206,11 +212,33 @@ export async function runAgentInstance(input: {
   };
   const now = input.now ?? Date.now;
   const activity = createActivity(now());
+  const view: { usage?: AgentUsage; error?: string } = {};
+  let lastStable = "";
+  const present = () => {
+    if (!input.onPresent) return;
+    const text = formatAgentLive({
+      instance,
+      task,
+      watchdog: snapshot(activity, now()),
+      usage: view.usage,
+      error: view.error,
+    });
+    const stable = text.replace(/^elapsed: .*$/m, "elapsed").replace(/inactive [^,\n]*/, "inactive");
+    if (stable === lastStable) return;
+    try {
+      input.onPresent(text);
+      lastStable = stable;
+    } catch {
+      // Presentation must not change fallback, cancellation, or stall behavior.
+    }
+  };
   const child = new AbortController();
   const stopParent = input.signal ? watchAbort(input.signal, () => child.abort()) : () => {};
   let stall: StallInfo | undefined;
   const timer = startWatchdogTimer(() => {
+    const before = activity.phase;
     const verdict = evaluateWatchdog(activity, input.watchdog ?? loaded.watchdog, now());
+    if (activity.phase !== before) present();
     if (verdict === "stalled" || verdict === "max_runtime") {
       stall = stallInfo(activity, now(), verdict === "max_runtime" ? "max_runtime" : "stalled");
       timer.stop();
@@ -223,10 +251,16 @@ export async function runAgentInstance(input: {
     if (kind === "tool_start" && event.toolName) noteToolStart(activity, event.toolName, now(), event.toolCallId ?? event.toolName);
     else if (kind === "tool_end") noteToolEnd(activity, now(), event.toolCallId);
     else noteActivity(activity, kind, now());
+    present();
   };
+  const onActivated = (appliedReasoning: string) => {
+    instance.model.appliedReasoning = appliedReasoning;
+    present();
+  };
+  present();
   try {
     return await agentScope.run({ instanceId: instance.id }, () =>
-      executeTargets(instance, role, task, targets, input.executor, child.signal, input.signal, activity, now, () => stall, onActivity),
+      executeTargets(instance, role, task, targets, input.executor, child.signal, input.signal, activity, now, () => stall, onActivity, onActivated, present, view),
     );
   } finally {
     timer.stop();
@@ -246,23 +280,39 @@ async function executeTargets(
   now: () => number,
   stalled: () => StallInfo | undefined,
   onActivity: (event: { type?: string; toolName?: string }) => void,
+  onActivated: (appliedReasoning: string) => void,
+  present: () => void,
+  view: { usage?: AgentUsage; error?: string },
 ): Promise<AgentRunResult> {
   instance.status = "running";
   let session: AttemptSession | undefined;
   let sideEffects = false;
   let lastError = "no model target could be used";
   let usage: AgentUsage | undefined;
+  const done = (
+    status: AgentRunResult["status"],
+    result: string,
+    target?: ModelTarget,
+    index = 0,
+    reason?: FallbackReason,
+  ) => {
+    view.usage = usage;
+    view.error = status === "completed" || result === "cancelled" ? undefined : result;
+    return finish(instance, status, result, target, index, reason, usage, snapshot(activity, now()), present);
+  };
   try {
     for (let index = 0; index < targets.length; index += 1) {
       const pendingStall = stalled();
       if (pendingStall && !parentSignal?.aborted) {
-        return finish(instance, "failed", formatStall(pendingStall), targets[index], index, undefined, usage, snapshot(activity, now()));
+        return done("failed", formatStall(pendingStall), targets[index], index);
       }
-      if (parentSignal?.aborted) return finish(instance, "cancelled", "cancelled", undefined, undefined, undefined, usage, snapshot(activity, now()));
+      if (parentSignal?.aborted) return done("cancelled", "cancelled");
       if (index > 0) noteActivity(activity, "fallback", now());
       noteActivity(activity, "prompt", now());
       const target = targets[index]!;
       instance.model = provenance(instance, target, index);
+      view.error = undefined;
+      present();
       const attempt = await runAttempt(sideEffects, session, executor, {
         instanceId: instance.id,
         role,
@@ -271,27 +321,30 @@ async function executeTargets(
         cwd: instance.cwd,
         signal,
         onActivity,
+        onActivated,
       });
       const stall = stalled();
       if (stall && !parentSignal?.aborted) {
-        return finish(instance, "failed", formatStall(stall), target, index, undefined, usage, snapshot(activity, now()));
+        return done("failed", formatStall(stall), target, index);
       }
       session = attempt.session ?? session;
       sideEffects = sideEffects || attempt.sideEffects;
       usage = mergeUsage(usage, attempt.usage);
-      instance.model.appliedReasoning = attempt.appliedReasoning;
+      view.usage = usage;
+      if (attempt.appliedReasoning !== undefined) instance.model.appliedReasoning = attempt.appliedReasoning;
+      present();
       if (attempt.status === "completed") {
-        return finish(instance, "completed", attempt.result, target, index, undefined, usage, snapshot(activity, now()));
+        return done("completed", attempt.result, target, index);
       }
       lastError = attempt.error ?? "agent failed";
       const reason = classifyProviderFailure(attempt.status === "cancelled" ? undefined : lastError);
       if (reason) instance.model.lastFailure = reason;
       if (attempt.status === "cancelled" || parentSignal?.aborted || signal.aborted) {
-        return finish(instance, "cancelled", attempt.result || "cancelled", undefined, undefined, undefined, usage, snapshot(activity, now()));
+        return done("cancelled", attempt.result || "cancelled");
       }
       const more = index + 1 < targets.length;
       if (!reason || !more) {
-        return finish(instance, "failed", lastError, target, index, reason, usage, snapshot(activity, now()));
+        return done("failed", lastError, target, index, reason);
       }
       instance.model.lastFailure = reason;
       if (!sideEffects) {
@@ -299,7 +352,7 @@ async function executeTargets(
         session = undefined;
       }
     }
-    return finish(instance, "failed", lastError, targets[targets.length - 1], targets.length - 1, undefined, usage, snapshot(activity, now()));
+    return done("failed", lastError, targets[targets.length - 1], targets.length - 1);
   } finally {
     await session?.dispose();
   }
@@ -328,6 +381,7 @@ function finish(
   reason?: FallbackReason,
   usage?: AgentUsage,
   watchdog?: WatchdogSnapshot,
+  present?: () => void,
 ): AgentRunResult {
   instance.status = status;
   if (target) {
@@ -336,6 +390,7 @@ function finish(
     instance.model.fallbackIndex = index === 0 ? undefined : index - 1;
     if (reason) instance.model.fallbackReason = reason;
   }
+  present?.();
   return {
     instanceId: instance.id,
     role: instance.roleId,
@@ -400,7 +455,7 @@ export function formatAgentResult(result: AgentRunResult): string {
   ].filter((line) => line.length > 0).join("\n");
 }
 
-function formatUsage(usage: AgentUsage): string {
+export function formatUsage(usage: AgentUsage): string {
   const lines = ["usage:", `  input: ${usage.input}`, `  output: ${usage.output}`];
   if (usage.cacheRead !== undefined) lines.push(`  cached read: ${usage.cacheRead}`);
   if (usage.cacheWrite !== undefined) lines.push(`  cached write: ${usage.cacheWrite}`);

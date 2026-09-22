@@ -5,6 +5,8 @@ import { isProtectedEditPath } from "./paths.ts";
 import { childSessionNote, parseProfile, profileNote, toolsForProfile, type ProfileName } from "./profile.ts";
 import { currentInstanceId } from "./agent/scope.ts";
 import { inspectPitako } from "./roles/format.ts";
+import { registerSupervisedSession, unregisterSupervisedSession } from "./herdr/author.ts";
+import { registerAgentSupervise } from "./herdr/supervise.ts";
 import { packageRoot, prepareRuntime } from "./stack.ts";
 
 function requestedProfile(pi: ExtensionAPI): ProfileName {
@@ -36,9 +38,12 @@ export default function pitako(pi: ExtensionAPI) {
     type: "string",
   });
 
+  registerAgentSupervise(pi);
+
   let profile: ProfileName = "coding";
 
   pi.on("session_start", async (_event, ctx) => {
+    registerSupervisedSession(ctx.sessionManager?.getSessionId());
     try {
       profile = requestedProfile(pi);
     } catch (error) {
@@ -53,13 +58,17 @@ export default function pitako(pi: ExtensionAPI) {
         available,
         profile: "coding",
         includePowerShell: process.platform === "win32" || pi.getActiveTools().includes("powershell"),
-      }).filter((name) => name !== "agent_run");
+      }).filter((name) => name !== "agent_run" && name !== "agent_supervise");
       pi.setActiveTools(coding);
     } else {
       applyProfile(pi, profile);
     }
     if (!pi.getSessionName()) pi.setSessionName(`pitako:${profile}`);
     if (ctx.hasUI) ctx.ui.setStatus("pitako", `pitako:${profile}`);
+  });
+
+  pi.on("session_shutdown", async () => {
+    unregisterSupervisedSession();
   });
 
   pi.on("before_agent_start", async (event) => {

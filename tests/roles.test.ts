@@ -188,6 +188,7 @@ reasoning = "high"
       const commands = new Map<string, (args: string, ctx: unknown) => Promise<void>>();
       const pi = {
         registerFlag() {},
+        registerTool() {},
         getFlag() {
           return undefined;
         },

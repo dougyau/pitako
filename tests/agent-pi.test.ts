@@ -1,11 +1,12 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import { createAgentSession, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { classifyProviderFailure } from "../extensions/agent/fallback.ts";
-import { activateTarget, DEFAULT_THINKING_LEVEL } from "../extensions/agent/pi.ts";
+import { activateTarget, createPiExecutor, DEFAULT_THINKING_LEVEL } from "../extensions/agent/pi.ts";
 import { childActiveTools } from "../extensions/profile.ts";
+import type { ResolvedRole } from "../extensions/roles/types.ts";
 
 const tempDirs: string[] = [];
 afterEach(() => {
@@ -131,4 +132,146 @@ describe("pi adapter boundary", () => {
     expect(level).not.toBe("xhigh");
     expect(level).toBe(DEFAULT_THINKING_LEVEL);
   });
+});
+
+const lateRole: ResolvedRole = {
+  id: "developer",
+  name: "Developer",
+  description: "test",
+  instructionsPath: "roles/developer.md",
+  instructions: "Reply exactly.",
+  skills: [],
+  principles: [],
+  modelPolicyId: "developer",
+  modelPolicy: { id: "developer", fallbacks: [] },
+};
+
+describe("extension provider bind", () => {
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+
+  afterEach(() => {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    delete (globalThis as { __pitakoLateProvider?: unknown }).__pitakoLateProvider;
+  });
+
+  async function installLateProvider(): Promise<{ calls: string[]; cwd: string }> {
+    const agentDir = mkdtempSync(path.join(tmpdir(), "pitako-late-agent-"));
+    const cwd = mkdtempSync(path.join(tmpdir(), "pitako-late-cwd-"));
+    tempDirs.push(agentDir, cwd);
+    mkdirSync(path.join(agentDir, "extensions"));
+    writeFileSync(
+      path.join(agentDir, "extensions", "late.js"),
+      "export default function (pi) { pi.registerProvider('pitako-late', globalThis.__pitakoLateProvider); }\n",
+    );
+    const calls: string[] = [];
+    const specifier = "@earendil-works/pi-ai/utils/event-stream.js";
+    const { createAssistantMessageEventStream } = await import(specifier);
+    (globalThis as { __pitakoLateProvider?: unknown }).__pitakoLateProvider = {
+      baseUrl: "http://127.0.0.1",
+      apiKey: "test",
+      api: "openai-completions",
+      models: [
+        {
+          id: "late",
+          name: "Late",
+          reasoning: false,
+          input: ["text"],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: 1000,
+          maxTokens: 64,
+        },
+      ],
+      streamSimple(model: { id: string }, context: { messages?: unknown[] }) {
+        calls.push(`${model.id}:${JSON.stringify(context.messages ?? [])}`);
+        const stream = createAssistantMessageEventStream();
+        const message = {
+          role: "assistant",
+          content: [{ type: "text", text: "pong" }],
+          api: "openai-completions",
+          provider: "pitako-late",
+          model: model.id,
+          stopReason: "stop",
+          timestamp: Date.now(),
+          usage: {
+            input: 1,
+            output: 1,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 2,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+        };
+        queueMicrotask(() => {
+          stream.push({ type: "done", reason: "stop", message });
+          stream.end(message);
+        });
+        return stream;
+      },
+    };
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    return { calls, cwd };
+  }
+
+  test("selects a model that appears only after session bind", async () => {
+    const { calls, cwd } = await installLateProvider();
+    const attempt = await createPiExecutor().start({
+      instanceId: "developer-late",
+      role: lateRole,
+      task: "say-pong-marker",
+      target: { model: "pitako-late/late", reasoning: "off" },
+      cwd,
+      signal: new AbortController().signal,
+    });
+    try {
+      expect(attempt.status).toBe("completed");
+      expect(attempt.result).toContain("pong");
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toContain("late:");
+      expect(calls[0]).toContain("say-pong-marker");
+    } finally {
+      await attempt.session?.dispose();
+    }
+  }, 60_000);
+
+  test("a model still missing after bind is unavailable and is not prompted", async () => {
+    const { calls, cwd } = await installLateProvider();
+    const attempt = await createPiExecutor().start({
+      instanceId: "developer-missing",
+      role: lateRole,
+      task: "say-pong-marker",
+      target: { model: "pitako-late/missing", reasoning: "off" },
+      cwd,
+      signal: new AbortController().signal,
+    });
+    expect(attempt.status).toBe("failed");
+    expect(attempt.error).toBe("model unavailable: pitako-late/missing");
+    expect(attempt.sideEffects).toBe(false);
+    expect(calls).toEqual([]);
+  }, 60_000);
+
+  test("same-session continue does not prompt a missing model", async () => {
+    const { calls, cwd } = await installLateProvider();
+    const attempt = await createPiExecutor().start({
+      instanceId: "developer-continue",
+      role: lateRole,
+      task: "say-pong-marker",
+      target: { model: "pitako-late/late", reasoning: "off" },
+      cwd,
+      signal: new AbortController().signal,
+    });
+    try {
+      expect(attempt.status).toBe("completed");
+      const next = await attempt.session!.continueWith(
+        { model: "pitako-late/missing" },
+        "continue",
+        new AbortController().signal,
+      );
+      expect(next.status).toBe("failed");
+      expect(next.error).toBe("model unavailable: pitako-late/missing");
+      expect(calls).toHaveLength(1);
+    } finally {
+      await attempt.session?.dispose();
+    }
+  }, 60_000);
 });

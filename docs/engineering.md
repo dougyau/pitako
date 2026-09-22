@@ -1,6 +1,6 @@
 # Engineering layer
 
-Pitako 0.1 remains a Pi package. This note records the coding distribution, Board v0, role definitions, AgentInstance, and `$plan` / `$execute`. Teams, a DAG, and a scheduler are still out of scope.
+Pitako 0.1 remains a Pi package. This note records the coding distribution, Board v0, role definitions, AgentInstance, one Herdr supervise tool, and `$plan` / `$execute`. Teams, a DAG, and a scheduler are still absent.
 
 ## Decisions
 
@@ -74,19 +74,21 @@ Fallback is availability only. v0 does not select a fallback and does not accept
 
 ## AgentInstance v0
 
-`agent_run` creates one in-process Pi `AgentSession` with `SessionManager.inMemory`. That gives a new conversation and a new rpiv-todo session id without a child process. Pi's `setModel` keeps the same session when a provider fails after a mutating tool. A fresh session is used only when no mutating tool has run. Unknown errors and cancellation do not fall back. The child prompt is the role instructions plus the task. Parent messages are not passed in.
+`agent_run` is unchanged. It creates one in-process Pi `AgentSession` with `SessionManager.inMemory`. That gives a new conversation and a new rpiv-todo session id without a child process. Pi's `setModel` keeps the same session when a provider fails after a mutating tool. A fresh session is used only when no mutating tool has run. Unknown errors and cancellation do not fall back. The child prompt is the role instructions plus the task. Parent messages are not passed in.
 
 Board author is resolved from a process-shared session registry, not AsyncLocalStorage. A child Pi session id maps to the instance id. The foreground session stays `pi`. The model cannot pass an author. Child tools are enabled with `setActiveToolsByName` at construction, including grep, find, and ls. `agent_run` stays excluded.
 
-Target activation is part of fallback. `setModel` throwing `No API key` is an auth failure, and the next target is tried. Unknown throws are not. Pi tools have no mutating flag. Known read-only names do not mark side effects. Every other name does. After that flag is set, fallback continues the same session and does not send the original task again. `reasoning = default` is not rewritten to `medium`.
+A policy model that an extension registers during session bind is resolved after that bind. A missing id is final only then, and the task is not sent until that model is active. Target activation is part of fallback. `setModel` throwing `No API key` is an auth failure, and the next target is tried. Unknown throws are not. Pi tools have no mutating flag. Known read-only names do not mark side effects. Every other name does. After that flag is set, fallback continues the same session and does not send the original task again. `reasoning = default` is not rewritten to `medium`.
 
 A child session does not receive the foreground sentence that the user selected the model. `SessionStats` counters are cumulative, so same-session fallback records a delta, not a second absolute snapshot. `contextTokens` is a gauge and keeps the latest value. HTTP 5xx text classifies only with status wording, not a bare number. A fallback line is printed only after a fallback target starts. An already-aborted signal disposes the child before `prompt`. Windows child sessions include `powershell` when Pi registered it.
 
 AgentInstance has no 20-minute deadline. The stops at that mark came from the parent tool timeout around `pi --mode json`, not from this package. Pi's HTTP idle timeout defaults to 5 minutes and stays a transport concern. The Pitako watchdog aborts only after confirmed inactivity: 10 minutes idle, 45 minutes during a tool, unless `max_run_time` is set above 0. Cache-warming events do not refresh activity. A stall is a terminal failure and does not fall back.
 
+`agent_supervise` is not an AgentInstance path. It requires Herdr presence and a current official Pi integration. The operator installs that integration with `herdr integration install pi`. Pitako does not install it. A supervised result is an instance id, a pane id, and a Herdr status. It is not an `AgentRunResult`.
+
 ## Plan and execute
 
-`$plan` writes `.pitako/plans/<id>.md` and stops at `PLAN_FROZEN`. It does not invoke `$execute`. `$execute` is a separate skill. It requires `status: frozen`.
+`$plan` writes `.pitako/plans/<id>.md` and stops at `PLAN_FROZEN`. It does not invoke `$execute`. `$execute` is a separate skill. It requires `status: frozen`. `$plan` and `$execute` are not Herdr callers.
 
 `extensions/workflow.ts` resolves paths from the git root, or from cwd outside a repository. `initLedger` creates `.pitako/runs/<id>/ledger.md` once and does not overwrite it. Resume reads the plan and the ledger before evidence. A revision or hash mismatch stops the run. Evidence stays under `.pitako/runs/<id>/evidence/`. The helper rejects `..`, absolute paths, and separators. It is not a workflow engine.
 

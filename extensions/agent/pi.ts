@@ -42,11 +42,17 @@ async function runTarget(
     role: Parameters<AttemptExecutor["start"]>[0]["role"];
     cwd: string;
     signal: AbortSignal;
+    onActivity?: Parameters<AttemptExecutor["start"]>[0]["onActivity"];
+    onActivated?: (appliedReasoning: string) => void;
   },
   existing?: AgentSession,
 ): Promise<Attempt> {
   if (input.signal.aborted) return { status: "cancelled", result: "cancelled", sideEffects: false };
-  const model = findModel(runtime, target.model);
+  let model = findModel(runtime, target.model);
+  // Extension providers register during AgentSession bind, not on a fresh runtime.
+  if (!model && !existing) {
+    return bindThenRun(runtime, target, prompt, input);
+  }
   if (!model) {
     return { status: "failed", result: "", error: `model unavailable: ${target.model}`, sideEffects: false };
   }
@@ -54,6 +60,7 @@ async function runTarget(
   if (!session) {
     try {
       session = await openSession(runtime, model, target, input);
+      if (session.thinkingLevel) input.onActivated?.(session.thinkingLevel);
       if (input.signal.aborted) {
         await resume(session, runtime, input).dispose();
         return { status: "cancelled", result: "cancelled", sideEffects: false };
@@ -67,6 +74,7 @@ async function runTarget(
     if (activationError) {
       return { status: "failed", result: "", error: activationError, sideEffects: true, session: resume(session, runtime, input) };
     }
+    if (session.thinkingLevel) input.onActivated?.(session.thinkingLevel);
   }
   return drive(session, runtime, prompt, input);
 }
@@ -99,9 +107,47 @@ export async function activateTarget(
   }
 }
 
+async function bindThenRun(
+  runtime: ModelRuntime,
+  target: ModelTarget,
+  prompt: string,
+  input: {
+    instanceId: string;
+    role: Parameters<AttemptExecutor["start"]>[0]["role"];
+    cwd: string;
+    signal: AbortSignal;
+    onActivity?: Parameters<AttemptExecutor["start"]>[0]["onActivity"];
+    onActivated?: (appliedReasoning: string) => void;
+  },
+): Promise<Attempt> {
+  let session: AgentSession;
+  try {
+    session = await openSession(runtime, undefined, target, input);
+  } catch (error) {
+    if (input.signal.aborted) return { status: "cancelled", result: "cancelled", sideEffects: false };
+    return { status: "failed", result: "", error: messageOf(error), sideEffects: false };
+  }
+  if (input.signal.aborted) {
+    await resume(session, runtime, input).dispose();
+    return { status: "cancelled", result: "cancelled", sideEffects: false };
+  }
+  const model = findModel(runtime, target.model);
+  if (!model) {
+    await resume(session, runtime, input).dispose();
+    return { status: "failed", result: "", error: `model unavailable: ${target.model}`, sideEffects: false };
+  }
+  const activationError = await activateTarget(session, model, target);
+  if (activationError) {
+    await resume(session, runtime, input).dispose();
+    return { status: "failed", result: "", error: activationError, sideEffects: false };
+  }
+  if (session.thinkingLevel) input.onActivated?.(session.thinkingLevel);
+  return drive(session, runtime, prompt, input);
+}
+
 async function openSession(
   runtime: ModelRuntime,
-  model: NonNullable<ReturnType<ModelRuntime["getModel"]>>,
+  model: NonNullable<ReturnType<ModelRuntime["getModel"]>> | undefined,
   target: ModelTarget,
   input: { instanceId: string; role: Parameters<AttemptExecutor["start"]>[0]["role"]; cwd: string },
 ): Promise<AgentSession> {
@@ -119,11 +165,11 @@ async function openSession(
     }),
   });
   await loader.reload();
-  const thinkingLevel = thinkingLevelFor(target.reasoning);
+  const thinkingLevel = model ? thinkingLevelFor(target.reasoning) : undefined;
   const { session } = await createAgentSession({
     cwd: input.cwd,
     agentDir,
-    model,
+    ...(model ? { model } : {}),
     ...(thinkingLevel ? { thinkingLevel } : {}),
     sessionManager: SessionManager.inMemory(input.cwd),
     settingsManager,
@@ -146,6 +192,7 @@ async function drive(
     cwd: string;
     signal: AbortSignal;
     onActivity?: (event: { type?: string; toolName?: string; assistantMessageEvent?: { type?: string } }) => void;
+    onActivated?: (appliedReasoning: string) => void;
   },
 ): Promise<Attempt> {
   let sideEffects = false;
@@ -213,7 +260,13 @@ function failedAttempt(
 function resume(
   session: AgentSession,
   runtime: ModelRuntime,
-  input: { instanceId: string; role: Parameters<AttemptExecutor["start"]>[0]["role"]; cwd: string },
+  input: {
+    instanceId: string;
+    role: Parameters<AttemptExecutor["start"]>[0]["role"];
+    cwd: string;
+    onActivity?: Parameters<AttemptExecutor["start"]>[0]["onActivity"];
+    onActivated?: (appliedReasoning: string) => void;
+  },
 ): NonNullable<Attempt["session"]> {
   let disposed = false;
   return {

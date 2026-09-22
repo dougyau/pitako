@@ -32,8 +32,9 @@ Disable Ponytail, Caveman, or any individual skill with `pi config` or package s
 - Session-local TODOs via `@juicesharp/rpiv-todo` (`todo`, `/todos`, overlay).
 - A workspace-scoped Board (`board_*` tools, `/board`) stored in SQLite.
 - Role definitions and model policies (`/pitako roles`). These are templates, not running agents.
-- `agent_run` for one isolated AgentInstance. It does not start a team.
-- `$plan` and `$execute`. Planning stops at `PLAN_FROZEN`. Execution is a separate invocation.
+- `agent_run` for one isolated in-process AgentInstance. It is unchanged, and it does not start a team.
+- `agent_supervise` for one visible sibling pane. It is not a team.
+- `$plan` and `$execute`. Planning stops at `PLAN_FROZEN`. Execution is a separate invocation. Neither calls Herdr.
 
 ## Session TODOs
 
@@ -148,6 +149,12 @@ tool_stall_timeout = "45m"
 max_run_time = "0"
 ```
 
+`[agent_runtime]` is the in-process watchdog. It does not apply to a supervised pane.
+
+## Visible pane
+
+`agent_supervise` is a separate tool. It requires Herdr presence and a current official Pi integration. The operator installs that integration with `herdr integration install pi`. Pitako does not install it. The result is an instance id, a pane id, and a Herdr status. It is not an `AgentRunResult`.
+
 ## Plans
 
 `$plan` investigates, writes a decision-complete plan, and stops at `PLAN_FROZEN`. It does not implement, and it does not invoke `$execute`.
@@ -164,7 +171,7 @@ Artifacts live in the workspace (git root, or the current directory outside a re
 
 Six records stay separate. `todo` is the current session checklist. The Board holds shared findings, decisions, and handoffs. The plan is the frozen decision. The ledger is the resume checkpoint: plan id, revision, content hash, status, and rulings. Evidence is proof for one unit. The repository is the product change. Do not use one as a substitute for another.
 
-This is not a scheduler, a DAG, or a team.
+`$plan` and `$execute` are not Herdr callers. Teams, a DAG, and a scheduler are still absent.
 
 ## What this is not yet
 

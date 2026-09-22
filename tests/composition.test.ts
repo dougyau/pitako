@@ -106,6 +106,7 @@ describe("engineering-layer composition", () => {
     const commands = new Map<string, (args: string, ctx: unknown) => Promise<unknown>>();
     const pi = {
       registerFlag() {},
+      registerTool() {},
       getFlag() {
         return undefined;
       },
