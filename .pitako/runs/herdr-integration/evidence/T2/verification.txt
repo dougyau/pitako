@@ -1,9 +1,0 @@
-Command: bun test tests/herdr.test.ts tests/agent.test.ts
-Result: 22 pass, 0 fail.
-
-session_start calls registerSupervisedSession(ctx.sessionManager.getSessionId()).
-session_shutdown calls unregisterSupervisedSession() with the id captured at start.
-Registration requires PITAKO_INSTANCE_ID, PITAKO_ROLE_ID, and Herdr presence.
-The hook test drives the registered handler and resolveBoardAuthor.
-Missing session id does not throw.
-Existing agent author tests still pass.
