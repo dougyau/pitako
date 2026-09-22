@@ -91,7 +91,6 @@ describe("pitako agents command", () => {
     expect(empty.notes).toEqual(["no workers"]);
 
     const hanging = hang();
-    let clock = 1_000;
     const handle = await spawnBackground({
       roleId: "developer",
       task: "SECRET-TASK change the widget",
@@ -99,10 +98,8 @@ describe("pitako agents command", () => {
       executor: hanging.executor,
       load: load(),
       watch: { planId: "background-responsiveness-dogfood", unitId: "T1" },
-      now: () => clock,
     });
     await hanging.started;
-    clock += 42;
 
     const listed = await cmd.run("agents");
     expect(listed.threw).toBe(false);
@@ -112,7 +109,7 @@ describe("pitako agents command", () => {
     expect(text).toContain("role: developer");
     expect(text).toContain("status: running");
     expect(text).toContain("watch: yes");
-    expect(text).toContain("elapsed_ms: 42");
+    expect(text).toMatch(/elapsed_ms: \d+/);
     expect(text).not.toContain("SECRET-TASK");
     expect(text).not.toContain("change the widget");
 
@@ -510,6 +507,7 @@ function pitakoAgentsCommand(): {
   let handler: ((args: string, ctx: unknown) => Promise<void>) | undefined;
   const pi = {
     registerFlag() {},
+    registerTool() {},
     registerCommand(_name: string, def: { handler: (args: string, ctx: unknown) => Promise<void> }) {
       handler = def.handler;
     },

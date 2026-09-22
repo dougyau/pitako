@@ -4,13 +4,25 @@ import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import { createAgentSession, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { classifyProviderFailure } from "../extensions/agent/fallback.ts";
-import { activateTarget, createPiExecutor, DEFAULT_THINKING_LEVEL } from "../extensions/agent/pi.ts";
+import { activateTarget, createPiExecutor, cursorProviderContext, DEFAULT_THINKING_LEVEL } from "../extensions/agent/pi.ts";
 import { childActiveTools } from "../extensions/profile.ts";
 import type { ResolvedRole } from "../extensions/roles/types.ts";
 
 const tempDirs: string[] = [];
 afterEach(() => {
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+describe("cursor request", () => {
+  test("keeps session tools on the provider context", () => {
+    const tools = [{ name: "bash", description: "run", parameters: { type: "object" } }];
+    const context = cursorProviderContext(
+      { provider: "cursor", api: "cursor-native" },
+      { systemPrompt: "Pitako", messages: [], tools: tools as never },
+    );
+    expect(context.tools).toEqual(tools);
+    expect(cursorProviderContext({ provider: "xai" }, { messages: [], tools: tools as never }).tools).toEqual(tools);
+  });
 });
 
 describe("pi adapter boundary", () => {

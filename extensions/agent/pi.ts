@@ -1,4 +1,5 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import { lazyStream, normalizeContext, type AssistantMessageEvent, type Context, type Model } from "@earendil-works/pi-ai";
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -27,9 +28,37 @@ export function thinkingLevelFor(reasoning: ReasoningLevel | undefined): Thinkin
 export function createPiExecutor(): AttemptExecutor {
   return {
     async start(input) {
-      const runtime = await ModelRuntime.create({ signal: input.signal, allowModelNetwork: false });
+      // Do not bind the worker abort signal here. The session abort owns cancellation.
+      // A signal on runtime create aborts Cursor auth before the child prompt starts.
+      const runtime = await ModelRuntime.create({ allowModelNetwork: false, refreshOnCreate: false });
+      keepCursorTools(runtime);
       return runTarget(runtime, input.target, input.task, input);
     },
+  };
+}
+
+/** ModelRuntime.streamSimple drops context.tools. Cursor then runs its own shell and that stream does not finish. */
+export function cursorProviderContext(model: { provider?: string; api?: string }, context: Context): Context {
+  if (model.provider !== "cursor" && model.api !== "cursor-native") return context;
+  return { ...normalizeContext(context), tools: context.tools ?? [] };
+}
+
+function keepCursorTools(runtime: ModelRuntime): void {
+  const original = runtime.streamSimple.bind(runtime);
+  const prepare = (runtime as unknown as {
+    prepareRequest(model: Model<any>, options: unknown): Promise<{
+      provider: { streamSimple(model: Model<any>, context: Context, options: unknown): AsyncIterable<AssistantMessageEvent> };
+      model: Model<any>;
+      options: unknown;
+    }>;
+  }).prepareRequest.bind(runtime);
+  runtime.streamSimple = (model, context, options) => {
+    if (model.provider !== "cursor" && model.api !== "cursor-native") return original(model, context, options);
+    const transcript = cursorProviderContext(model, context);
+    return lazyStream(model, async () => {
+      const prepared = await prepare(model, options);
+      return prepared.provider.streamSimple(prepared.model, transcript, prepared.options);
+    });
   };
 }
 
