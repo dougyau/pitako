@@ -3,6 +3,7 @@ import { skillStatusLines } from "./catalog.ts";
 import { PitakoConfigError } from "./errors.ts";
 import { isProtectedEditPath } from "./paths.ts";
 import { parseProfile, profileNote, toolsForProfile, type ProfileName } from "./profile.ts";
+import { currentInstanceId } from "./agent/scope.ts";
 import { inspectPitako } from "./roles/format.ts";
 import { packageRoot, prepareRuntime } from "./stack.ts";
 
@@ -45,7 +46,8 @@ export default function pitako(pi: ExtensionAPI) {
       if (ctx.hasUI) ctx.ui.notify(message, "error");
       throw error;
     }
-    applyProfile(pi, profile);
+    const next = applyProfile(pi, profile);
+    if (currentInstanceId()) pi.setActiveTools(next.filter((name) => name !== "agent_run"));
     if (!pi.getSessionName()) pi.setSessionName(`pitako:${profile}`);
     if (ctx.hasUI) ctx.ui.setStatus("pitako", `pitako:${profile}`);
   });

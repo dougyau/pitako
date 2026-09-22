@@ -34,6 +34,7 @@
       "./node_modules/@vndv/pi-codegraph/extensions/codegraph.ts",
       "./node_modules/@juicesharp/rpiv-todo/index.ts",
       "./extensions/board/index.ts",
+      "./extensions/agent/index.ts",
       "./extensions/index.ts"
     ],
     "skills": [

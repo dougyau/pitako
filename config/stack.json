@@ -50,6 +50,12 @@
         "board_post",
         "board_query"
       ]
+    },
+    {
+      "id": "pitako-agent",
+      "spec": "pitako",
+      "entry": "extensions/agent/index.ts",
+      "tools": ["agent_run"]
     }
   ],
   "optional": [

@@ -1,5 +1,6 @@
 import { mkdirSync } from "node:fs";
 import path from "node:path";
+import { currentBoardAuthor } from "./author.ts";
 import { getBoardDbPath } from "./paths.ts";
 import { openSqlite, type SqlDatabase } from "./sqlite.ts";
 
@@ -222,7 +223,7 @@ class SqliteBoard implements Board {
         `INSERT INTO topics (workspace, scope, title, description, status, created_by, created_at, updated_at)
          VALUES (?, ?, ?, ?, 'open', ?, ?, ?)`,
       )
-      .run(requireWorkspace(workspace), BOARD_SCOPE, title, description, BOARD_AUTHOR, createdAt, createdAt);
+      .run(requireWorkspace(workspace), BOARD_SCOPE, title, description, currentBoardAuthor(), createdAt, createdAt);
     return this.requireTopic(workspace, inserted.lastInsertRowid);
   }
 
@@ -354,7 +355,7 @@ class SqliteBoard implements Board {
           `INSERT INTO posts (topic_id, author, type, subject, content, reply_to, metadata_json, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         )
-        .run(topic.id, BOARD_AUTHOR, type, subject, content, replyTo, metadata, createdAt);
+        .run(topic.id, currentBoardAuthor(), type, subject, content, replyTo, metadata, createdAt);
       this.db.prepare("UPDATE topics SET updated_at = ? WHERE id = ?").run(createdAt, topic.id);
       this.db.exec("COMMIT");
       return this.requirePost(inserted.lastInsertRowid);

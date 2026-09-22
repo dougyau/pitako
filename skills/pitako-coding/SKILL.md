@@ -86,7 +86,7 @@ Do not use the Board as a transcript, a scratchpad, or a TODO list. `todo` is th
 
 ## Roles
 
-`/pitako roles` and `/pitako role <id>` show role definitions. A role is a responsibility template, not a running agent. Do not spawn agents. Model targets belong in `$PI_CODING_AGENT_DIR/pitako/config.toml`, not in the repository.
+`/pitako roles` and `/pitako role <id>` show role definitions. A role is a responsibility template. `agent_run` executes one isolated instance of a role. If `agent_run` fails, report the error. Do not perform that role yourself. Do not build a team.
 
 ## Not in this package
 

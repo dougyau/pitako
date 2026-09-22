@@ -32,6 +32,7 @@ Disable Ponytail, Caveman, or any individual skill with `pi config` or package s
 - Session-local TODOs via `@juicesharp/rpiv-todo` (`todo`, `/todos`, overlay).
 - A workspace-scoped Board (`board_*` tools, `/board`) stored in SQLite.
 - Role definitions and model policies (`/pitako roles`). These are templates, not running agents.
+- `agent_run` for one isolated AgentInstance. It does not start a team.
 
 ## Session TODOs
 
@@ -99,9 +100,9 @@ User overrides go in `$PI_CODING_AGENT_DIR/pitako/config.toml`. If `PI_CODING_AG
 
 Precedence is built-in defaults, then the user file. A scalar replaces that field when set. A `skills` or `principles` array replaces the built-in list when set, and is left alone when omitted. `primary` and `fallbacks` work the same way. There is no append merge.
 
-Reasoning uses Pi's levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Omit it to leave the later runner on Pi's session default. Pitako does not clamp a level the model cannot do. When a model catalog is supplied, an unsupported level fails. Without a catalog, only the syntax of `provider/model` is checked, so a target can be named before that provider is authenticated.
+Reasoning uses Pi's levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. `default`, or omitting the field, leaves the later runner on Pi's session default. Pitako does not clamp a level the model cannot do. When a model catalog is supplied, an unsupported level fails. Without a catalog, only the syntax of `provider/model` is checked, so a target can be named before that provider is authenticated.
 
-Fallback means the preferred target could not be used because of provider or model availability: rate limit, quota, outage, or auth. It does not mean the code failed tests, the answer was weak, or the task got hard. This version does not execute fallback. It keeps the ordered targets and a result shape a later runner can fill (`requested`, `selected`, `fallbackIndex`, `fallbackReason`). Pi does not export a stable error taxonomy, so `fallback_on` is not configurable.
+Fallback means the preferred target could not be used because of provider or model availability: rate limit, quota, outage, or auth. It does not mean the code failed tests, the answer was weak, or the task got hard. `agent_run` may switch to the next target for those availability failures only. Pi does not export a stable error taxonomy, so `fallback_on` is not configurable.
 
 A fresh install still resolves a role. The model policy diagnostic says no primary target is configured. It does not crash the coding session.
 
@@ -117,9 +118,25 @@ reasoning = "medium"
 
 Inspect the effective config with `/pitako roles`, `/pitako role architect`, `/pitako policies`, and `/pitako policy architect`. These commands do not show API keys and do not write config.
 
+## AgentInstance
+
+A RoleDefinition is a template. An AgentInstance is one isolated run of that role.
+
+```
+agent_run({ role: "architect", task: "..." })
+```
+
+The child gets the role instructions, that role's skills and principles, the Pitako coding baseline, the current cwd, and the shared Board. It does not get the parent transcript or the parent TODO list. Board posts from the child use the instance id as author, not a model-supplied string.
+
+The run is synchronous. It returns the final result, the instance id, the selected model, the reasoning level, and whether a fallback happened. It does not return the child transcript.
+
+The model comes from the role's ModelPolicy. Reasoning is the target's configured level. If the provider fails before any mutating tool runs, the next target starts a fresh session. If a mutating tool already ran, the same session switches model and continues. The original task is not replayed. An unknown error, a failed test, or cancellation does not switch models. If every target fails, `agent_run` returns the error. The parent must not do that role's work itself.
+
+The child cannot call `agent_run`. There is no background mode, resume, or team.
+
 ## What this is not yet
 
-Pitako does not implement AgentInstance, teams, subteams, or agent execution. Role definitions and model policies are configuration only. Session TODOs are local execution plans. The Board is not a team roster or a memory store.
+Pitako does not implement teams, subteams, or Coordinator delegation. AgentInstance v0 runs one isolated role at a time. Session TODOs are local execution plans. The Board is not a team roster or a memory store.
 
 Web search is not bundled. See [Web research](#web-research).
 
@@ -322,15 +339,15 @@ The script copies `fixtures/tiny-ts` to a temp directory, runs `codegraph init`,
 - Analysis mode does not sandbox `bash` or `powershell`.
 - Language servers are not installed automatically.
 - `pi-lsp-client` is consumed from git because it is not on npm. The commit is pinned.
-- Web research, teams, and agent execution are not implemented. Board scope is global only. Role fallback is not executed.
+- Web research and teams are not implemented. Board scope is global only. Agent fallback does not rerun a task after side effects.
 - Local `pi install .` requires `bun install` (or `npm install`) in this directory first, so `node_modules` exists.
 
 ## Roadmap
 
 Not built yet:
 
-- AgentInstance and agent execution
-- teams and subteams
+- Teams and Coordinator delegation
+- nested or background agents
 - private or team Board scopes
 - executing model fallback
 

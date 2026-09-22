@@ -377,10 +377,11 @@ export function parseModelId(value: string, file = "", field = "model"): string 
   return model;
 }
 
-function parseReasoning(value: unknown, file: string, field: string): ReasoningLevel {
+function parseReasoning(value: unknown, file: string, field: string): ReasoningLevel | undefined {
+  if (value === "default") return undefined;
   if (typeof value !== "string" || !isReasoningLevel(value)) {
     throw new PitakoConfigError(
-      `${file}: ${field}: invalid reasoning level "${String(value)}". Expected ${REASONING_LIST}.`,
+      `${file}: ${field}: invalid reasoning level "${String(value)}". Expected ${REASONING_LIST}, or default.`,
     );
   }
   return value;

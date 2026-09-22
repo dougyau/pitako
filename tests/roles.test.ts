@@ -119,6 +119,9 @@ reasoning = "medium"
     );
     expect(() => loadPitakoConfig({ env })).toThrow(/invalid reasoning level "turbo"/);
 
+    writeConfig(configPath, "[model_policies.developer.primary]\nmodel = \"example/coder\"\nreasoning = \"default\"\n");
+    expect(resolveRole("developer", { env }).modelPolicy.primary).toEqual({ model: "example/coder" });
+
     writeConfig(configPath, "[model_policies.architect.primary]\nmodel = \"gpt-5\"\n");
     expect(() => loadPitakoConfig({ env })).toThrow(/invalid model id "gpt-5"/);
 

@@ -72,6 +72,12 @@ Fallback is availability only. v0 does not select a fallback and does not accept
 
 `getRole("architect")` and `resolveRole("architect")` return instructions, skills, principles, the policy id, the primary target, reasoning, and ordered fallbacks. If no primary is configured, resolution succeeds with a diagnostic instead of crashing.
 
+## AgentInstance v0
+
+`agent_run` creates one in-process Pi `AgentSession` with `SessionManager.inMemory`. That gives a new conversation and a new rpiv-todo session id without a child process. Pi's `setModel` keeps the same session when a provider fails after a mutating tool. A fresh session is used only when no mutating tool has run. Unknown errors and cancellation do not fall back. The child prompt is the role instructions plus the task. Parent messages are not passed in.
+
+Board author is an `AsyncLocalStorage` value, default `pi`, set to the instance id for the child run. The model cannot pass an author. `agent_run` is removed from the child tool list during that scope.
+
 ## Dogfood
 
 rpiv-todo dogfood: `/pitako` now names the session TODO layer in one line, and `tests/todo.test.ts` drives the real `todo` tool (create, in_progress, complete, `blockedBy`, cycle rejection, branch isolation, replay). No Pitako Task system was added.
