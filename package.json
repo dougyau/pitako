@@ -39,6 +39,9 @@
     ],
     "skills": [
       "./skills/pitako-coding",
+      "./skills/plan",
+      "./skills/execute",
+      "./skills/remove-ai-slops",
       "./skills/caveman",
       "./skills/investigate-first",
       "./skills/practical",

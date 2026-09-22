@@ -1,6 +1,6 @@
 # Engineering layer
 
-Pitako 0.1 remains a Pi package. This note records the coding distribution, Board v0, and role definitions. Teams and agent execution are still out of scope.
+Pitako 0.1 remains a Pi package. This note records the coding distribution, Board v0, role definitions, AgentInstance, and `$plan` / `$execute`. Teams, a DAG, and a scheduler are still out of scope.
 
 ## Decisions
 
@@ -83,6 +83,16 @@ Target activation is part of fallback. `setModel` throwing `No API key` is an au
 A child session does not receive the foreground sentence that the user selected the model. `SessionStats` counters are cumulative, so same-session fallback records a delta, not a second absolute snapshot. `contextTokens` is a gauge and keeps the latest value. HTTP 5xx text classifies only with status wording, not a bare number. A fallback line is printed only after a fallback target starts. An already-aborted signal disposes the child before `prompt`. Windows child sessions include `powershell` when Pi registered it.
 
 AgentInstance has no 20-minute deadline. The stops at that mark came from the parent tool timeout around `pi --mode json`, not from this package. Pi's HTTP idle timeout defaults to 5 minutes and stays a transport concern. The Pitako watchdog aborts only after confirmed inactivity: 10 minutes idle, 45 minutes during a tool, unless `max_run_time` is set above 0. Cache-warming events do not refresh activity. A stall is a terminal failure and does not fall back.
+
+## Plan and execute
+
+`$plan` writes `.pitako/plans/<id>.md` and stops at `PLAN_FROZEN`. It does not invoke `$execute`. `$execute` is a separate skill. It requires `status: frozen`.
+
+`extensions/workflow.ts` resolves paths from the git root, or from cwd outside a repository. `initLedger` creates `.pitako/runs/<id>/ledger.md` once and does not overwrite it. Resume reads the plan and the ledger before evidence. A revision or hash mismatch stops the run. Evidence stays under `.pitako/runs/<id>/evidence/`. The helper rejects `..`, absolute paths, and separators. It is not a workflow engine.
+
+`todo` is the session checklist. Board posts are shared findings and handoffs. The plan is the frozen decision. The ledger is the checkpoint. Evidence is proof. The repository is the product change.
+
+`remove-ai-slops` is on the developer skill list. Use it after verification is green, and only when the diff is large enough to hide waste. It is not mandatory, and not a pass after every edit.
 
 ## Dogfood
 

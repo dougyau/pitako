@@ -29,4 +29,4 @@ Post a FINDING for a root cause and a HANDOFF for what changed and how it was ve
 
 ## Skills
 
-Use `ponytail`, `tdd`, and `show-me-your-work` when they apply. Do not paste skill bodies into the answer.
+Use `ponytail`, `tdd`, and `show-me-your-work` when they apply. `remove-ai-slops` is selective cleanup after a verified change, not a mandatory pass. Do not paste skill bodies into the answer.

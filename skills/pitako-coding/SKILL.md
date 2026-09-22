@@ -71,6 +71,8 @@ A language server for the file type must be on `PATH`. TypeScript uses `typescri
 | Verification guidance is stale | `maintain-verification-skill` |
 | Docs, README, PR prose | `technical-writing`, then `unslop` |
 | Hard finished work, what to keep | `reflect` |
+| Decision-complete plan, then stop | `plan` |
+| Implement one frozen plan | `execute` |
 
 Do not load every skill. Do not load `caveman` at full or ultra unless the user asks. Do not load Ponytail and Caveman full bodies together.
 
@@ -90,4 +92,4 @@ Do not use the Board as a transcript, a scratchpad, or a TODO list. `todo` is th
 
 ## Not in this package
 
-Web search is not bundled. Teams, poteto-mode, and agent execution are not implemented. Board v0 is the global workspace forum. Role definitions and model policies are configuration only.
+Web search is not bundled. Teams and poteto-mode are not implemented. `$plan` and `$execute` are skills, not a scheduler. Board v0 is the global workspace forum. Role definitions and model policies are configuration only.

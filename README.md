@@ -33,6 +33,7 @@ Disable Ponytail, Caveman, or any individual skill with `pi config` or package s
 - A workspace-scoped Board (`board_*` tools, `/board`) stored in SQLite.
 - Role definitions and model policies (`/pitako roles`). These are templates, not running agents.
 - `agent_run` for one isolated AgentInstance. It does not start a team.
+- `$plan` and `$execute`. Planning stops at `PLAN_FROZEN`. Execution is a separate invocation.
 
 ## Session TODOs
 
@@ -146,6 +147,24 @@ idle_timeout = "10m"
 tool_stall_timeout = "45m"
 max_run_time = "0"
 ```
+
+## Plans
+
+`$plan` investigates, writes a decision-complete plan, and stops at `PLAN_FROZEN`. It does not implement, and it does not invoke `$execute`.
+
+`$execute <plan-id>` is the implementation authority for that frozen plan. Until that invocation, planning completion is not permission to change the product.
+
+Artifacts live in the workspace (git root, or the current directory outside a repository):
+
+```
+.pitako/plans/<id>.md
+.pitako/runs/<id>/ledger.md
+.pitako/runs/<id>/evidence/
+```
+
+Six records stay separate. `todo` is the current session checklist. The Board holds shared findings, decisions, and handoffs. The plan is the frozen decision. The ledger is the resume checkpoint: plan id, revision, content hash, status, and rulings. Evidence is proof for one unit. The repository is the product change. Do not use one as a substitute for another.
+
+This is not a scheduler, a DAG, or a team.
 
 ## What this is not yet
 
@@ -317,6 +336,9 @@ pitako/
 ├── extensions/           # Pitako extension, Board, and role resolution
 ├── roles/                # role instruction markdown
 ├── skills/pitako-coding/ # router + baseline
+├── skills/plan/          # $plan, stops at PLAN_FROZEN
+├── skills/execute/       # explicit implementation authority
+├── skills/remove-ai-slops/
 ├── skills/caveman/       # vendored MIT Caveman skill
 ├── skills/practical/     # selected pstack workflows
 ├── skills/principles/    # selected pstack principles
