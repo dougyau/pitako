@@ -16,7 +16,7 @@ It currently combines:
 - LSP (`pi-lsp-client`) and CodeGraph (`@vndv/pi-codegraph`)
 - [`@juicesharp/rpiv-todo`](https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-todo) for session-local TODOs
 
-Not every skill or principle is active all the time. Pi keeps names and descriptions in context and loads a skill body when the task matches. Principles are contextual. Later roles can use different subsets. This milestone does not implement teams or a board.
+Not every skill or principle is active all the time. Pi keeps names and descriptions in context and loads a skill body when the task matches. Principles are contextual. Later roles can use different subsets. This milestone does not implement teams. Board v0 is the shared forum.
 
 `pitako-coding` is the router: inspect the repo, prefer CodeGraph and LSP, keep diffs small, verify real behavior, and load a specialized skill only when it applies. It does not embed the full Ponytail, Caveman, or pstack bodies.
 
@@ -24,12 +24,14 @@ Disable Ponytail, Caveman, or any individual skill with `pi config` or package s
 
 ## What this milestone is
 
-- A Pi package (`keywords: pi-package`) with one Pitako extension, curated skills, and one prompt.
+- A Pi package (`keywords: pi-package`) with the Pitako extension, the Board extension, curated skills, and one prompt.
 - The **coding** profile: Pi's read, bash, edit, and write tools, plus grep, find, and ls, plus LSP and CodeGraph.
 - The **analysis** profile: the same read and search tools, without `edit`, `write`, or `lsp_rename`.
 - Startup checks that fail with a clear configuration error when a required extension file or the `codegraph` CLI is missing.
 - On-demand Ponytail, selected Caveman skills, and selected pstack practical skills and principles.
 - Session-local TODOs via `@juicesharp/rpiv-todo` (`todo`, `/todos`, overlay).
+- A workspace-scoped Board (`board_*` tools, `/board`) stored in SQLite.
+- Role definitions and model policies (`/pitako roles`). These are templates, not running agents.
 
 ## Session TODOs
 
@@ -42,11 +44,82 @@ Pitako uses [`@juicesharp/rpiv-todo`](https://github.com/juicesharp/rpiv-mono/tr
 - `blockedBy` dependencies (cycles are rejected)
 - `owner` and `metadata` fields, unused by Pitako today and left for later Task/Board wiring
 
-This is **not** Pitako's future durable/shared Task system, Board, or Memory. Skip TODOs for questions and one-line edits. Configure overlay size, collapse key, and model guidance in rpiv-todo's own `~/.config/rpiv-todo/config.json`. Disable the extension with a package filter: `!node_modules/@juicesharp/rpiv-todo/index.ts`.
+This is not Pitako's Task system or Memory. The Board is a separate forum. See [Board](#board). Skip TODOs for questions and one-line edits. Configure overlay size, collapse key, and model guidance in rpiv-todo's own `~/.config/rpiv-todo/config.json`. Disable the extension with a package filter: `!node_modules/@juicesharp/rpiv-todo/index.ts`.
+
+## Board
+
+Pitako Board is a forum for the current workspace. A topic is one shared subject. Posts record what the work established. The Board is not chat history, a TODO list, a task scheduler, or durable memory.
+
+```
+Board
+└── Topic
+    └── Posts
+```
+
+Post types are `INFO`, `FINDING`, `QUESTION`, `ANSWER`, `DECISION`, `BLOCKER`, and `HANDOFF`.
+
+| Tool | Behavior |
+| --- | --- |
+| `board_topic_create` | Create a topic. Scope is `global`. Status starts `open`. Author is `pi`. |
+| `board_topic_list` | List topics in this workspace. Defaults to open, newest activity first. Default 20, max 50. |
+| `board_topic_read` | Read one topic and a page of posts, oldest to newest within the page. Default 40, max 100. Page with `beforePostId` or `afterPostId`. |
+| `board_topic_update` | Change title, description, or status (`open`, `resolved`, `closed`). |
+| `board_post` | Add a post. `replyTo` must be a post in the same topic. |
+| `board_query` | Filter current-workspace posts by topic, type, author, or text. Default 20, max 50. |
+
+`/board` lists open topics. `/board 3` reads topic 3.
+
+`todo` is the session plan. The Board is shared knowledge. Do not copy TODOs onto the Board, and do not create TODOs from posts.
+
+The database is `$PI_CODING_AGENT_DIR/pitako/board.db`. If `PI_CODING_AGENT_DIR` is unset, that path is `~/.pi/agent/pitako/board.db`. A relative `PI_CODING_AGENT_DIR` resolves to an absolute path. The file is shared by the Pi installation. Each topic stores a workspace. The workspace is the git repository root, or the current directory when you are not in a git repository. Topics from another repository do not appear.
+
+Agents pull the Board by calling the tools. Pitako does not inject topics or posts into every turn.
+
+Storage is SQLite schema version 1, with foreign keys and WAL. The driver is Node's built-in `node:sqlite`. Node still marks that module experimental. Scope is `global` only. Decisions are immutable posts. A later post can point at an earlier one with `replyTo` or metadata such as `{"supersedes": 17}`. There is no decision graph. A `DECISION` post does not resolve the topic. Set the status when the discussion is done or no longer relevant.
+
+Teams, private boards, memory, embeddings, and automatic summaries are not in this version. A later Pitako Thread may namespace topics. Schema version 1 is checked on open so that change does not have to guess at an old file.
+
+Disable the extension with a package filter: `!extensions/board/index.ts`.
+
+## Roles and model policies
+
+A role is a reusable responsibility template. It is not a running agent. A later AgentInstance may use a role. This version does not spawn one.
+
+```
+RoleDefinition
+  -> ModelPolicy
+    -> ModelTarget
+```
+
+The role carries instructions, skills, and principles. The model policy carries an ordered list of model targets. A target is a Pi model id (`provider/model`) plus an optional reasoning level. The role is not a model.
+
+Built-in roles are `coordinator`, `architect`, `developer`, `reviewer`, and `researcher`. Instructions live in `roles/*.md`. Structured defaults live in `config/defaults.toml`. Concrete models are not shipped, because installations do not share subscriptions.
+
+User overrides go in `$PI_CODING_AGENT_DIR/pitako/config.toml`. If `PI_CODING_AGENT_DIR` is unset, that path is `~/.pi/agent/pitako/config.toml`. Do not edit the package to change models.
+
+Precedence is built-in defaults, then the user file. A scalar replaces that field when set. A `skills` or `principles` array replaces the built-in list when set, and is left alone when omitted. `primary` and `fallbacks` work the same way. There is no append merge.
+
+Reasoning uses Pi's levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Omit it to leave the later runner on Pi's session default. Pitako does not clamp a level the model cannot do. When a model catalog is supplied, an unsupported level fails. Without a catalog, only the syntax of `provider/model` is checked, so a target can be named before that provider is authenticated.
+
+Fallback means the preferred target could not be used because of provider or model availability: rate limit, quota, outage, or auth. It does not mean the code failed tests, the answer was weak, or the task got hard. This version does not execute fallback. It keeps the ordered targets and a result shape a later runner can fill (`requested`, `selected`, `fallbackIndex`, `fallbackReason`). Pi does not export a stable error taxonomy, so `fallback_on` is not configurable.
+
+A fresh install still resolves a role. The model policy diagnostic says no primary target is configured. It does not crash the coding session.
+
+```toml
+[model_policies.architect.primary]
+model = "openai-codex/gpt-5.6-sol"
+reasoning = "high"
+
+[[model_policies.architect.fallbacks]]
+model = "example/other-model"
+reasoning = "medium"
+```
+
+Inspect the effective config with `/pitako roles`, `/pitako role architect`, `/pitako policies`, and `/pitako policy architect`. These commands do not show API keys and do not write config.
 
 ## What this is not yet
 
-Pitako does not implement agents, roles, teams, subteams, a message board, model policies, or fallbacks. Those are later packages (`extensions/` can grow; nothing empty is reserved for them today). Session TODOs are local execution plans, not that shared work.
+Pitako does not implement AgentInstance, teams, subteams, or agent execution. Role definitions and model policies are configuration only. Session TODOs are local execution plans. The Board is not a team roster or a memory store.
 
 Web search is not bundled. See [Web research](#web-research).
 
@@ -211,7 +284,8 @@ Do not commit API keys, `auth.json`, or `~/.pi/agent/settings.json`.
 ```
 pitako/
 ├── package.json          # pi manifest and pinned dependencies
-├── extensions/           # Pitako extension (future first-party extensions go here)
+├── extensions/           # Pitako extension, Board, and role resolution
+├── roles/                # role instruction markdown
 ├── skills/pitako-coding/ # router + baseline
 ├── skills/caveman/       # vendored MIT Caveman skill
 ├── skills/practical/     # selected pstack workflows
@@ -239,6 +313,7 @@ The script copies `fixtures/tiny-ts` to a temp directory, runs `codegraph init`,
 - `codegraph_callers` finds `run`
 - `lsp_goto_definition` resolves into `greet.ts`
 - `lsp_find_references` mentions `greet`
+- Board tools are registered. The smoke test does not call them.
 
 ## Current limitations
 
@@ -247,17 +322,17 @@ The script copies `fixtures/tiny-ts` to a temp directory, runs `codegraph init`,
 - Analysis mode does not sandbox `bash` or `powershell`.
 - Language servers are not installed automatically.
 - `pi-lsp-client` is consumed from git because it is not on npm. The commit is pinned.
-- Web research, roles, teams, boards, and model fallbacks are not implemented.
+- Web research, teams, and agent execution are not implemented. Board scope is global only. Role fallback is not executed.
 - Local `pi install .` requires `bun install` (or `npm install`) in this directory first, so `node_modules` exists.
 
 ## Roadmap
 
 Not built yet:
 
-- agent roles (researcher, architect, development, reviewer)
+- AgentInstance and agent execution
 - teams and subteams
-- a shared message board
-- model policies and fallbacks
+- private or team Board scopes
+- executing model fallback
 
 ## License
 

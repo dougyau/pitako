@@ -1,0 +1,87 @@
+# Built-in roles. Concrete models belong in $PI_CODING_AGENT_DIR/pitako/config.toml.
+# A user file replaces a scalar when it sets that field.
+# A supplied skills or principles array replaces the built-in list. Omitted arrays stay.
+# A supplied primary or fallbacks array replaces that policy field. Omitted fields stay.
+
+[roles.coordinator]
+name = "Coordinator"
+description = "Understands the mission, chooses which specialists are needed, and synthesizes results."
+instructions = "roles/coordinator.md"
+model_policy = "coordinator"
+skills = []
+principles = [
+  "principle-guard-the-context-window",
+  "principle-prove-it-works",
+]
+
+[roles.architect]
+name = "Architect"
+description = "Owns system structure, domain modeling, and module boundaries."
+instructions = "roles/architect.md"
+model_policy = "architect"
+skills = [
+  "architect",
+  "how",
+  "why",
+  "blast-radius",
+]
+principles = [
+  "principle-foundational-thinking",
+  "principle-model-the-domain",
+  "principle-boundary-discipline",
+  "principle-subtract-before-you-add",
+  "principle-exhaust-the-design-space",
+]
+
+[roles.developer]
+name = "Developer"
+description = "Implements focused changes, debugs, and verifies them."
+instructions = "roles/developer.md"
+model_policy = "developer"
+skills = [
+  "ponytail",
+  "tdd",
+  "show-me-your-work",
+]
+principles = [
+  "principle-fix-root-causes",
+  "principle-prove-it-works",
+  "principle-type-system-discipline",
+  "principle-sequence-verifiable-units",
+  "principle-minimize-reader-load",
+]
+
+[roles.reviewer]
+name = "Reviewer"
+description = "Inspects the diff, challenges correctness, and checks evidence."
+instructions = "roles/reviewer.md"
+model_policy = "reviewer"
+skills = [
+  "blast-radius",
+  "show-me-your-work",
+]
+principles = [
+  "principle-prove-it-works",
+  "principle-boundary-discipline",
+  "principle-fix-root-causes",
+]
+
+[roles.researcher]
+name = "Researcher"
+description = "Investigates unfamiliar systems and reports evidence."
+instructions = "roles/researcher.md"
+model_policy = "researcher"
+skills = [
+  "how",
+  "why",
+]
+principles = [
+  "principle-guard-the-context-window",
+  "principle-prove-it-works",
+]
+
+[model_policies.coordinator]
+[model_policies.architect]
+[model_policies.developer]
+[model_policies.reviewer]
+[model_policies.researcher]

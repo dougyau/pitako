@@ -53,6 +53,7 @@ export function profileNote(profile: ProfileName): string {
     "Verify real behavior before claiming done. Load a specialized skill only when it applies.",
     "Research or design does not authorize implementation.",
     "The model and provider are whatever the user selected in Pi.",
+    "Board tools are pull-only shared knowledge. rpiv-todo is the session plan. Do not paste Board posts into the turn.",
   ];
   if (profile === "analysis") {
     return [

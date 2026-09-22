@@ -76,6 +76,18 @@ Do not load every skill. Do not load `caveman` at full or ultra unless the user 
 
 Ponytail governs implementation size. It does not waive validation, security, accessibility, or required error handling. Caveman lite governs noise, not architecture. `principle-prove-it-works` and `show-me-your-work` govern evidence.
 
+## Board
+
+Use the Board when information should stay visible as explicit shared context.
+
+Prefer findings, questions, answers, decisions, blockers, and handoffs. Keep posts concise and evidence-oriented. Query with `board_query` or `board_topic_read` before posting a duplicate. Do not load the whole Board when a focused query is enough.
+
+Do not use the Board as a transcript, a scratchpad, or a TODO list. `todo` is the session plan. The Board is not injected into every turn.
+
+## Roles
+
+`/pitako roles` and `/pitako role <id>` show role definitions. A role is a responsibility template, not a running agent. Do not spawn agents. Model targets belong in `$PI_CODING_AGENT_DIR/pitako/config.toml`, not in the repository.
+
 ## Not in this package
 
-Web search is not bundled. Roles, teams, boards, poteto-mode, and model fallbacks are not implemented.
+Web search is not bundled. Teams, poteto-mode, and agent execution are not implemented. Board v0 is the global workspace forum. Role definitions and model policies are configuration only.

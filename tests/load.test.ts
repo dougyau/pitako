@@ -17,6 +17,7 @@ describe("Pi package loading", () => {
     expect(paths.some((file) => file.includes(`${path.sep}pi-lsp-client${path.sep}`))).toBe(true);
     expect(paths.some((file) => file.includes(`${path.sep}pi-codegraph${path.sep}`))).toBe(true);
     expect(paths.some((file) => file.includes(`${path.sep}rpiv-todo${path.sep}`))).toBe(true);
+    expect(paths.some((file) => file.endsWith(`${path.sep}extensions${path.sep}board${path.sep}index.ts`))).toBe(true);
     for (const file of paths) expect(file.startsWith(root)).toBe(true);
 
     const names = registeredToolNames(loaded.extensions);
@@ -27,6 +28,9 @@ describe("Pi package loading", () => {
       expect(names).toContain(name);
     }
     expect(names).toContain("todo");
+    for (const name of ["board_topic_create", "board_topic_list", "board_topic_read", "board_topic_update", "board_post", "board_query"]) {
+      expect(names).toContain(name);
+    }
     for (const name of ["todo_write", "todowrite", "todoread", "TodoWrite"]) {
       expect(names).not.toContain(name);
     }

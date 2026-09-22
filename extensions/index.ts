@@ -3,6 +3,7 @@ import { skillStatusLines } from "./catalog.ts";
 import { PitakoConfigError } from "./errors.ts";
 import { isProtectedEditPath } from "./paths.ts";
 import { parseProfile, profileNote, toolsForProfile, type ProfileName } from "./profile.ts";
+import { inspectPitako } from "./roles/format.ts";
 import { packageRoot, prepareRuntime } from "./stack.ts";
 
 function requestedProfile(pi: ExtensionAPI): ProfileName {
@@ -57,9 +58,17 @@ export default function pitako(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("pitako", {
-    description: "Show Pitako status or switch profile: /pitako profile <coding|analysis>",
+    description: "Pitako status, profile, roles, and model policies",
     handler: async (args, ctx) => {
       const [command, value] = args.trim().split(/\s+/, 2);
+      if (command === "roles" || command === "role" || command === "policies" || command === "policy") {
+        try {
+          notify(ctx, inspectPitako(args));
+        } catch (error) {
+          notify(ctx, error instanceof Error ? error.message : String(error), "error");
+        }
+        return;
+      }
       if (command === "profile" && value) {
         profile = parseProfile(value);
         const tools = applyProfile(pi, profile);
@@ -75,7 +84,8 @@ export default function pitako(pi: ExtensionAPI) {
         "coding: read, bash, edit, write, grep, find, ls, LSP, CodeGraph, todo",
         "analysis: read, bash, grep, find, ls, LSP, CodeGraph, todo; no edit, write, or lsp_rename",
         "Switch with /pitako profile analysis",
-        "Session TODOs: todo tool and /todos (rpiv-todo). Not a shared Task/Board.",
+        "Session TODOs: todo tool and /todos (rpiv-todo). Shared knowledge: board_* tools and /board.",
+        "Roles: /pitako roles, /pitako role <id>, /pitako policies, /pitako policy <id>. Definitions only.",
         ...skillStatusLines(),
       ];
       if (ctx.hasUI) ctx.ui.notify(lines.join("\n"), "info");
@@ -91,6 +101,18 @@ export default function pitako(pi: ExtensionAPI) {
     if (ctx.hasUI) ctx.ui.notify(reason, "warning");
     return { block: true, reason };
   });
+}
+
+function notify(
+  ctx: { hasUI: boolean; ui: { notify(message: string, kind?: "info" | "error"): void } },
+  message: string,
+  kind: "info" | "error" = "info",
+): void {
+  if (ctx.hasUI) {
+    ctx.ui.notify(message, kind);
+    return;
+  }
+  if (kind === "error") throw new Error(message);
 }
 
 export { PitakoConfigError };

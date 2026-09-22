@@ -71,7 +71,19 @@ export async function runSmoke(root = packageRoot()): Promise<ToolText[]> {
       throw new Error(loaded.extensions.errors.map((error) => `${error.path}: ${error.error}`).join("\n"));
     }
     const names = registeredToolNames(loaded.extensions);
-    for (const required of ["lsp_goto_definition", "lsp_find_references", "codegraph_search", "codegraph_callers", "todo"]) {
+    for (const required of [
+      "lsp_goto_definition",
+      "lsp_find_references",
+      "codegraph_search",
+      "codegraph_callers",
+      "todo",
+      "board_topic_create",
+      "board_topic_list",
+      "board_topic_read",
+      "board_topic_update",
+      "board_post",
+      "board_query",
+    ]) {
       if (!names.includes(required)) throw new Error(`Smoke expected ${required} to be registered`);
     }
     const tools = new Map<string, ToolRunner>();

@@ -53,14 +53,13 @@ describe("stack configuration", () => {
   test("codegraph on PATH is accepted without a bundled binary", () => {
     const root = mkdtempSync(path.join(tmpdir(), "pitako-bin-"));
     mkdirSync(path.join(root, "config"), { recursive: true });
-    mkdirSync(path.join(root, "node_modules", "pi-lsp-client", "src"), { recursive: true });
-    mkdirSync(path.join(root, "node_modules", "@vndv", "pi-codegraph", "extensions"), { recursive: true });
-    mkdirSync(path.join(root, "node_modules", "@juicesharp", "rpiv-todo"), { recursive: true });
     const stack = readStack(packageRoot());
     writeFileSync(path.join(root, "config", "stack.json"), JSON.stringify(stack));
-    writeFileSync(path.join(root, "node_modules", "pi-lsp-client", "src", "index.ts"), "export {};\n");
-    writeFileSync(path.join(root, "node_modules", "@vndv", "pi-codegraph", "extensions", "codegraph.ts"), "export {};\n");
-    writeFileSync(path.join(root, "node_modules", "@juicesharp", "rpiv-todo", "index.ts"), "export {};\n");
+    for (const extension of stack.required) {
+      const entry = path.join(root, extension.entry);
+      mkdirSync(path.dirname(entry), { recursive: true });
+      writeFileSync(entry, "export {};\n");
+    }
     const binDir = mkdtempSync(path.join(tmpdir(), "pitako-path-"));
     writeFileSync(path.join(binDir, "codegraph"), "");
     const env = { PATH: binDir };

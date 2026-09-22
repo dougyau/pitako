@@ -28,6 +28,7 @@ describe("engineering-layer composition", () => {
     expect(extensionPaths.some((file) => file.includes(`${path.sep}pi-lsp-client${path.sep}`))).toBe(true);
     expect(extensionPaths.some((file) => file.includes(`${path.sep}pi-codegraph${path.sep}`))).toBe(true);
     expect(extensionPaths.some((file) => file.includes(`${path.sep}rpiv-todo${path.sep}`))).toBe(true);
+    expect(extensionPaths.some((file) => file.endsWith(`${path.sep}extensions${path.sep}board${path.sep}index.ts`))).toBe(true);
     expect(extensionPaths.some((file) => file.includes(`${path.sep}ponytail${path.sep}pi-extension${path.sep}`))).toBe(false);
     expect(extensionPaths.some((file) => file.includes("pstack"))).toBe(false);
 

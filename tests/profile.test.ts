@@ -17,12 +17,14 @@ const available = [
   "codegraph_search",
   "codegraph_callers",
   "todo",
+  "board_post",
+  "board_query",
 ];
 
 describe("profiles", () => {
   test("coding enables search tools and keeps edits", () => {
     const tools = toolsForProfile({ available, profile: "coding" });
-    for (const name of ["read", "bash", "edit", "write", "grep", "find", "ls", "lsp_rename", "codegraph_search", "todo"]) {
+    for (const name of ["read", "bash", "edit", "write", "grep", "find", "ls", "lsp_rename", "codegraph_search", "todo", "board_post"]) {
       expect(tools).toContain(name);
     }
     expect(tools).not.toContain("powershell");
@@ -30,7 +32,7 @@ describe("profiles", () => {
 
   test("analysis removes file-mutating tools and keeps LSP and CodeGraph reads", () => {
     const tools = toolsForProfile({ available, profile: "analysis" });
-    for (const name of ["read", "bash", "grep", "find", "ls", "lsp_diagnostics", "codegraph_callers", "todo"]) {
+    for (const name of ["read", "bash", "grep", "find", "ls", "lsp_diagnostics", "codegraph_callers", "todo", "board_query"]) {
       expect(tools).toContain(name);
     }
     for (const name of ["edit", "write", "lsp_rename"]) {
@@ -51,6 +53,8 @@ describe("profiles", () => {
     const coding = profileNote("coding");
     const analysis = profileNote("analysis");
     expect(coding).toContain("Keep diffs small");
+    expect(coding).toContain("Board tools are pull-only");
+    expect(coding).not.toContain("FINDING");
     expect(coding).not.toContain("edit, write, and lsp_rename are not");
     expect(analysis).toContain("edit, write, and lsp_rename are not");
     expect(analysis).toContain("this profile is not a sandbox");

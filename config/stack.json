@@ -37,6 +37,19 @@
       "spec": "@juicesharp/rpiv-todo@2.11.0",
       "entry": "node_modules/@juicesharp/rpiv-todo/index.ts",
       "tools": ["todo"]
+    },
+    {
+      "id": "pitako-board",
+      "spec": "pitako",
+      "entry": "extensions/board/index.ts",
+      "tools": [
+        "board_topic_create",
+        "board_topic_list",
+        "board_topic_read",
+        "board_topic_update",
+        "board_post",
+        "board_query"
+      ]
     }
   ],
   "optional": [

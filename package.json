@@ -14,6 +14,7 @@
     "skills",
     "prompts",
     "config",
+    "roles",
     "fixtures",
     "docs",
     "README.md",
@@ -32,6 +33,7 @@
       "./node_modules/pi-lsp-client/src/index.ts",
       "./node_modules/@vndv/pi-codegraph/extensions/codegraph.ts",
       "./node_modules/@juicesharp/rpiv-todo/index.ts",
+      "./extensions/board/index.ts",
       "./extensions/index.ts"
     ],
     "skills": [
@@ -49,7 +51,8 @@
     "@dietrichgebert/ponytail": "4.10.0",
     "@juicesharp/rpiv-todo": "2.11.0",
     "@vndv/pi-codegraph": "0.1.10",
-    "pi-lsp-client": "github:code-yeongyu/pi-lsp-client#1c981dfcacc456fe4ce9f4120a2f0250b54d6844"
+    "pi-lsp-client": "github:code-yeongyu/pi-lsp-client#1c981dfcacc456fe4ce9f4120a2f0250b54d6844",
+    "smol-toml": "1.8.0"
   },
   "bundledDependencies": [
     "@dietrichgebert/ponytail",
