@@ -1,5 +1,4 @@
 import { randomBytes } from "node:crypto";
-import { withBoardAuthor } from "../board/author.ts";
 import { currentWorkspace } from "../board/workspace.ts";
 import { PitakoConfigError } from "../errors.ts";
 import { resolveRole, type LoadOptions } from "../roles/load.ts";
@@ -13,7 +12,8 @@ export interface AgentModelProvenance {
   policyId?: string;
   requestedModel?: string;
   selectedModel: string;
-  reasoning?: string;
+  requestedReasoning?: string;
+  appliedReasoning?: string;
   fallbackIndex?: number;
   fallbackReason?: FallbackReason;
 }
@@ -56,6 +56,7 @@ export interface Attempt {
   error?: string;
   sideEffects: boolean;
   usage?: AgentUsage;
+  appliedReasoning?: string;
   session?: AttemptSession;
 }
 
@@ -105,7 +106,7 @@ async function runAttempt(
     await session?.dispose();
     return await executor.start(input);
   } catch (error) {
-    if (input.signal.aborted || (error instanceof Error && (error.name === "AbortError" || /abort/i.test(error.message)))) {
+    if (input.signal.aborted) {
       return { status: "cancelled", result: "cancelled", sideEffects, session };
     }
     return {
@@ -164,14 +165,12 @@ export async function runAgentInstance(input: {
       policyId: role.modelPolicyId,
       requestedModel: role.modelPolicy.primary.model,
       selectedModel: role.modelPolicy.primary.model,
-      reasoning: role.modelPolicy.primary.reasoning,
+      requestedReasoning: role.modelPolicy.primary.reasoning,
     },
     createdAt: new Date().toISOString(),
   };
   const signal = input.signal ?? new AbortController().signal;
-  return agentScope.run({ instanceId: instance.id }, () =>
-    withBoardAuthor(instance.id, () => executeTargets(instance, role, task, targets, input.executor, signal)),
-  );
+  return agentScope.run({ instanceId: instance.id }, () => executeTargets(instance, role, task, targets, input.executor, signal));
 }
 
 async function executeTargets(
@@ -186,9 +185,10 @@ async function executeTargets(
   let session: AttemptSession | undefined;
   let sideEffects = false;
   let lastError = "no model target could be used";
+  let usage: AgentUsage | undefined;
   try {
     for (let index = 0; index < targets.length; index += 1) {
-      if (signal.aborted) return finish(instance, "cancelled", "cancelled", targets[index]);
+      if (signal.aborted) return finish(instance, "cancelled", "cancelled", undefined, undefined, undefined, usage);
       const target = targets[index]!;
       instance.model = provenance(instance, target, index);
       const attempt = await runAttempt(sideEffects, session, executor, {
@@ -201,17 +201,20 @@ async function executeTargets(
       });
       session = attempt.session ?? session;
       sideEffects = sideEffects || attempt.sideEffects;
+      usage = mergeUsage(usage, attempt.usage);
+      if (attempt.appliedReasoning) instance.model.appliedReasoning = attempt.appliedReasoning;
       if (attempt.status === "completed") {
-        return finish(instance, "completed", attempt.result, target, index, undefined, attempt.usage);
-      }
-      if (attempt.status === "cancelled" || signal.aborted) {
-        return finish(instance, "cancelled", attempt.result || "cancelled", target, index);
+        return finish(instance, "completed", attempt.result, target, index, undefined, usage);
       }
       lastError = attempt.error ?? "agent failed";
-      const reason = classifyProviderFailure(lastError);
+      const reason = classifyProviderFailure(attempt.status === "cancelled" ? undefined : lastError);
+      if (reason) instance.model.fallbackReason = reason;
+      if (attempt.status === "cancelled" || signal.aborted) {
+        return finish(instance, "cancelled", attempt.result || "cancelled", undefined, undefined, instance.model.fallbackReason, usage);
+      }
       const more = index + 1 < targets.length;
       if (!reason || !more) {
-        return finish(instance, "failed", lastError, target, index, reason);
+        return finish(instance, "failed", lastError, target, index, reason, usage);
       }
       instance.model.fallbackReason = reason;
       if (!sideEffects) {
@@ -219,7 +222,7 @@ async function executeTargets(
         session = undefined;
       }
     }
-    return finish(instance, "failed", lastError, targets[targets.length - 1]);
+    return finish(instance, "failed", lastError, targets[targets.length - 1], targets.length - 1, undefined, usage);
   } finally {
     await session?.dispose();
   }
@@ -230,7 +233,8 @@ function provenance(instance: AgentInstance, target: ModelTarget, index: number)
     policyId: instance.model.policyId,
     requestedModel: instance.model.requestedModel,
     selectedModel: target.model,
-    reasoning: target.reasoning,
+    requestedReasoning: target.reasoning,
+    appliedReasoning: instance.model.appliedReasoning,
     fallbackIndex: index === 0 ? undefined : index - 1,
     fallbackReason: index === 0 ? undefined : instance.model.fallbackReason,
   };
@@ -248,7 +252,7 @@ function finish(
   instance.status = status;
   if (target) {
     instance.model.selectedModel = target.model;
-    instance.model.reasoning = target.reasoning;
+    instance.model.requestedReasoning = target.reasoning;
     instance.model.fallbackIndex = index === 0 ? undefined : index - 1;
     if (reason) instance.model.fallbackReason = reason;
   }
@@ -263,11 +267,50 @@ function finish(
 }
 
 export function formatAgentResult(result: AgentRunResult): string {
-  const fallback = result.model.fallbackReason
-    ? ` fallback ${result.model.fallbackIndex ?? 0} (${result.model.fallbackReason})`
+  const requested = result.model.requestedModel && result.model.requestedModel !== result.model.selectedModel
+    ? `\nrequested: ${result.model.requestedModel}`
     : "";
-  const usage = result.usage
-    ? `\nusage: in ${result.usage.input} out ${result.usage.output} turns ${result.usage.turns ?? "?"} tools ${result.usage.toolCalls ?? "?"}`
-    : "";
-  return `${result.instanceId} ${result.status}\nrole: ${result.role}\nmodel: ${result.model.selectedModel} reasoning ${result.model.reasoning ?? "unset"}${fallback}${usage}\n\n${result.result}`;
+  const fallback = result.model.fallbackReason ? `\nfallback: ${result.model.fallbackReason} from ${result.model.requestedModel ?? "primary"}` : "";
+  const usage = result.usage ? `\n${formatUsage(result.usage)}` : "";
+  return [
+    `${result.instanceId} ${result.status}`,
+    `role: ${result.role}`,
+    `model: ${result.model.selectedModel}`,
+    requested,
+    `reasoning requested: ${result.model.requestedReasoning ?? "default"}`,
+    `reasoning applied: ${result.model.appliedReasoning ?? "unknown"}`,
+    fallback,
+    usage,
+    "",
+    result.result,
+  ].filter((line) => line.length > 0).join("\n");
+}
+
+function formatUsage(usage: AgentUsage): string {
+  const lines = ["usage:", `  input: ${usage.input}`, `  output: ${usage.output}`];
+  if (usage.cacheRead !== undefined) lines.push(`  cached read: ${usage.cacheRead}`);
+  if (usage.cacheWrite !== undefined) lines.push(`  cached write: ${usage.cacheWrite}`);
+  if (usage.cost !== undefined) lines.push(`  cost: ${usage.cost}`);
+  lines.push(`  turns: ${usage.turns ?? "?"}`, `  tools: ${usage.toolCalls ?? "?"}`);
+  if (usage.contextTokens !== undefined) lines.push(`  context: ${usage.contextTokens}`);
+  return lines.join("\n");
+}
+
+export function mergeUsage(left: AgentUsage | undefined, right: AgentUsage | undefined): AgentUsage | undefined {
+  if (!right) return left;
+  if (!left) return { ...right, tools: right.tools ? { ...right.tools } : undefined };
+  const tools = { ...(left.tools ?? {}) };
+  for (const [name, count] of Object.entries(right.tools ?? {})) tools[name] = (tools[name] ?? 0) + count;
+  return {
+    input: left.input + right.input,
+    output: left.output + right.output,
+    cacheRead: (left.cacheRead ?? 0) + (right.cacheRead ?? 0),
+    cacheWrite: (left.cacheWrite ?? 0) + (right.cacheWrite ?? 0),
+    total: (left.total ?? 0) + (right.total ?? 0),
+    cost: (left.cost ?? 0) + (right.cost ?? 0),
+    turns: (left.turns ?? 0) + (right.turns ?? 0),
+    toolCalls: (left.toolCalls ?? 0) + (right.toolCalls ?? 0),
+    tools,
+    contextTokens: right.contextTokens ?? left.contextTokens,
+  };
 }

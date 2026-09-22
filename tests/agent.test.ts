@@ -9,9 +9,11 @@ import { currentInstanceId, agentScope } from "../extensions/agent/scope.ts";
 import { marksSideEffect, toolEffect } from "../extensions/agent/effects.ts";
 import { classifyProviderFailure } from "../extensions/agent/fallback.ts";
 import { activateTarget, thinkingLevelFor } from "../extensions/agent/pi.ts";
-import { childInstructions, runAgentInstance, skillNamesForRole, type Attempt, type AttemptExecutor } from "../extensions/agent/run.ts";
+import { childInstructions, formatAgentResult, runAgentInstance, skillNamesForRole, type Attempt, type AttemptExecutor } from "../extensions/agent/run.ts";
 import { childSessionNote } from "../extensions/profile.ts";
-import { withBoardAuthor, currentBoardAuthor } from "../extensions/board/author.ts";
+import { registerExecution, resolveBoardAuthor, unregisterExecution } from "../extensions/execution-identity.ts";
+import { childActiveTools } from "../extensions/profile.ts";
+import boardExtension from "../extensions/board/index.ts";
 import { openBoard } from "../extensions/board/store.ts";
 import { currentWorkspace } from "../extensions/board/workspace.ts";
 import pitako from "../extensions/index.ts";
@@ -60,6 +62,49 @@ function scripted(attempts: Attempt[]): AttemptExecutor & { starts: string[]; no
 }
 
 describe("agent instance", () => {
+  test("usage adds failed attempts and cancel keeps the last attempted target", async () => {
+    const env = tempEnv();
+    const configured = { env, userConfigPath: path.join(env.PI_CODING_AGENT_DIR!, "pitako", "config.toml") };
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(path.dirname(configured.userConfigPath), { recursive: true });
+    writeFileSync(configured.userConfigPath, `[model_policies.architect.primary]\nmodel = "example/primary"\nreasoning = "high"\n[[model_policies.architect.fallbacks]]\nmodel = "example/fallback-1"\nreasoning = "xhigh"\n`);
+    const executor = scripted([
+      { status: "failed", result: "", error: "429 rate limit", sideEffects: false, usage: { input: 10, output: 1, cacheRead: 4, cacheWrite: 2, cost: 0.2, turns: 1, toolCalls: 1 } },
+      { status: "completed", result: "ok", sideEffects: false, usage: { input: 20, output: 3, cacheRead: 5, cacheWrite: 1, cost: 0.3, turns: 2, toolCalls: 2 } },
+    ]);
+    const summed = await runAgentInstance({
+      roleId: "architect",
+      task: "review the boundary",
+      cwd: packageRoot(),
+      executor,
+      load: configured,
+    });
+    expect(summed.usage).toMatchObject({ input: 30, output: 4, cacheRead: 9, cacheWrite: 3, cost: 0.5, turns: 3, toolCalls: 3 });
+    expect(formatAgentResult(summed)).toContain("cached read: 9");
+    expect(formatAgentResult(summed)).toContain("cost: 0.5");
+
+    const controller = new AbortController();
+    const cancelling = {
+      async start() {
+        controller.abort();
+        return { status: "failed" as const, result: "", error: "429 rate limit", sideEffects: false, usage: { input: 7, output: 1 } };
+      },
+    };
+    const cancelled = await runAgentInstance({
+      roleId: "architect",
+      task: "review the boundary",
+      cwd: packageRoot(),
+      signal: controller.signal,
+      executor: cancelling,
+      load: configured,
+    });
+    expect(cancelled.status).toBe("cancelled");
+    expect(cancelled.model.selectedModel).toBe("example/primary");
+    expect(cancelled.model.requestedModel).toBe("example/primary");
+    expect(cancelled.model.fallbackReason).toBe("rate_limit");
+    expect(cancelled.model.fallbackIndex).toBeUndefined();
+    expect(cancelled.usage?.input).toBe(7);
+  });
   test("resolves architect, isolates context, and does not replay side effects", async () => {
     const env = tempEnv();
     const cwd = packageRoot();
@@ -110,7 +155,7 @@ reasoning = "medium"
     });
     expect(first.status).toBe("completed");
     expect(first.model.selectedModel).toBe("example/fallback-1");
-    expect(first.model.reasoning).toBe("xhigh");
+    expect(first.model.requestedReasoning).toBe("xhigh");
     expect(first.model.fallbackIndex).toBe(0);
     expect(first.model.fallbackReason).toBe("rate_limit");
     expect(rateLimited.starts).toEqual(["example/primary", "example/fallback-1"]);
@@ -248,6 +293,14 @@ reasoning = "medium"
     expect(classifyProviderFailure("compilation failed")).toBeUndefined();
     expect(classifyProviderFailure(undefined)).toBeUndefined();
     expect(classifyProviderFailure("No API key for cursor/grok-4.7")).toBe("auth");
+    expect(classifyProviderFailure("500 Internal Server Error")).toBe("unavailable");
+    expect(classifyProviderFailure("OpenAI API error (502): bad gateway")).toBe("unavailable");
+    expect(classifyProviderFailure("503 service unavailable")).toBe("unavailable");
+    expect(classifyProviderFailure("504 gateway timeout")).toBe("unavailable");
+    expect(classifyProviderFailure("fetch failed")).toBe("unavailable");
+    expect(classifyProviderFailure("socket hang up")).toBe("unavailable");
+    expect(classifyProviderFailure("ECONNRESET")).toBe("unavailable");
+    expect(classifyProviderFailure("AbortError: The operation was aborted")).toBeUndefined();
     expect(toolEffect("read")).toBe("read_only");
     expect(toolEffect("board_post")).toBe("mutating");
     expect(toolEffect("database_migrate")).toBe("potentially_mutating");
@@ -266,14 +319,64 @@ reasoning = "medium"
     const board = await openBoard(db);
     const topic = board.createTopic("/repo", { title: "shared" });
     expect(topic.createdBy).toBe("pi");
-    await withBoardAuthor("architect-a31f2c", async () => {
-      expect(currentBoardAuthor()).toBe("architect-a31f2c");
-      board.post("/repo", { topicId: topic.id, type: "FINDING", content: "from the child" });
-    });
-    expect(currentBoardAuthor()).toBe("pi");
+    registerExecution({ instanceId: "architect-a31f2c", roleId: "architect", sessionId: "child-a" });
+    registerExecution({ instanceId: "reviewer-b", roleId: "reviewer", sessionId: "child-b" });
+    expect(resolveBoardAuthor("child-a")).toBe("architect-a31f2c");
+    expect(resolveBoardAuthor("child-b")).toBe("reviewer-b");
+    expect(resolveBoardAuthor(undefined)).toBe("pi");
+    board.post("/repo", { topicId: topic.id, type: "FINDING", content: "from the child" }, resolveBoardAuthor("child-a"));
+    unregisterExecution("child-a");
+    unregisterExecution("child-b");
+    expect(resolveBoardAuthor("child-a")).toBe("pi");
     const page = board.readTopic("/repo", topic.id);
     expect(page.posts[0]?.author).toBe("architect-a31f2c");
     board.close();
+    const agent = mkdtempSync(path.join(tmpdir(), "pitako-agent-author-"));
+    tempDirs.push(agent);
+    const repo = mkdtempSync(path.join(tmpdir(), "pitako-agent-repo-"));
+    tempDirs.push(repo);
+    const { execFileSync } = await import("node:child_process");
+    execFileSync("git", ["init"], { cwd: repo, stdio: "ignore" });
+    const previous = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = agent;
+    try {
+      const tools = new Map<string, { execute: Function }>();
+      boardExtension({
+        registerTool(def: { name: string; execute: Function }) {
+          tools.set(def.name, def);
+        },
+        registerCommand() {},
+      } as never);
+      registerExecution({ instanceId: "architect-tool", roleId: "architect", sessionId: "sess-tool" });
+      const ctx = { cwd: repo, sessionManager: { getSessionId: () => "sess-tool" } };
+      const created = await tools.get("board_topic_create")!.execute("c", { title: "identity" }, undefined, undefined, ctx);
+      const topicId = created.details.topicId as number;
+      const posted = await tools.get("board_post")!.execute(
+        "p",
+        { topicId, type: "INFO", content: "tool author", author: "someone-else" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(posted.isError).toBeFalsy();
+      expect(String(posted.content?.[0]?.text ?? "")).not.toContain("someone-else");
+      const check = await openBoard(path.join(agent, "pitako", "board.db"));
+      const workspace = currentWorkspace(repo);
+      expect(check.readTopic(workspace, topicId).topic.createdBy).toBe("architect-tool");
+      expect(check.readTopic(workspace, topicId).posts[0]?.author).toBe("architect-tool");
+      check.close();
+      unregisterExecution("sess-tool");
+      expect(resolveBoardAuthor("sess-tool")).toBe("pi");
+    } finally {
+      if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previous;
+    }
+    const names = childActiveTools(["read", "grep", "find", "ls", "bash", "agent_run", "board_post", "database_migrate"]);
+    expect(names).toContain("grep");
+    expect(names).toContain("find");
+    expect(names).toContain("ls");
+    expect(names).toContain("read");
+    expect(names).not.toContain("agent_run");
 
     const parent = SessionManager.inMemory(packageRoot());
     const child = SessionManager.inMemory(packageRoot());

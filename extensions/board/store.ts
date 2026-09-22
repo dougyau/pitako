@@ -1,6 +1,6 @@
 import { mkdirSync } from "node:fs";
 import path from "node:path";
-import { currentBoardAuthor } from "./author.ts";
+import { DEFAULT_BOARD_AUTHOR } from "./author.ts";
 import { getBoardDbPath } from "./paths.ts";
 import { openSqlite, type SqlDatabase } from "./sqlite.ts";
 
@@ -94,7 +94,7 @@ export interface QueryResult {
 
 export interface Board {
   close(): void;
-  createTopic(workspace: string, input: { title: string; description?: string }): Topic;
+  createTopic(workspace: string, input: { title: string; description?: string }, author?: string): Topic;
   listTopics(workspace: string, filter?: { status?: TopicStatus; limit?: number }): TopicList;
   readTopic(
     workspace: string,
@@ -116,6 +116,7 @@ export interface Board {
       replyTo?: number;
       metadata?: unknown;
     },
+    author?: string,
   ): Post;
   query(
     workspace: string,
@@ -214,7 +215,7 @@ class SqliteBoard implements Board {
     this.db.close();
   }
 
-  createTopic(workspace: string, input: { title: string; description?: string }): Topic {
+  createTopic(workspace: string, input: { title: string; description?: string }, author = DEFAULT_BOARD_AUTHOR): Topic {
     const title = requireText(input.title, "title");
     const description = optionalText(input.description);
     const createdAt = timestamp();
@@ -223,7 +224,7 @@ class SqliteBoard implements Board {
         `INSERT INTO topics (workspace, scope, title, description, status, created_by, created_at, updated_at)
          VALUES (?, ?, ?, ?, 'open', ?, ?, ?)`,
       )
-      .run(requireWorkspace(workspace), BOARD_SCOPE, title, description, currentBoardAuthor(), createdAt, createdAt);
+      .run(requireWorkspace(workspace), BOARD_SCOPE, title, description, authorOrDefault(author), createdAt, createdAt);
     return this.requireTopic(workspace, inserted.lastInsertRowid);
   }
 
@@ -340,6 +341,7 @@ class SqliteBoard implements Board {
       replyTo?: number;
       metadata?: unknown;
     },
+    author = DEFAULT_BOARD_AUTHOR,
   ): Post {
     const topic = this.requireTopic(workspace, input.topicId);
     const type = parsePostType(input.type);
@@ -355,7 +357,7 @@ class SqliteBoard implements Board {
           `INSERT INTO posts (topic_id, author, type, subject, content, reply_to, metadata_json, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         )
-        .run(topic.id, currentBoardAuthor(), type, subject, content, replyTo, metadata, createdAt);
+        .run(topic.id, authorOrDefault(author), type, subject, content, replyTo, metadata, createdAt);
       this.db.prepare("UPDATE topics SET updated_at = ? WHERE id = ?").run(createdAt, topic.id);
       this.db.exec("COMMIT");
       return this.requirePost(inserted.lastInsertRowid);
@@ -589,6 +591,11 @@ function text(value: unknown, label: string): string {
 function nullableText(value: unknown, label: string): string | null {
   if (value === null || value === undefined) return null;
   return text(value, label);
+}
+
+function authorOrDefault(author: string): string {
+  const trimmed = author.trim();
+  return trimmed.length > 0 ? trimmed : DEFAULT_BOARD_AUTHOR;
 }
 
 function timestamp(): string {

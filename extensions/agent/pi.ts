@@ -8,6 +8,8 @@ import {
   SettingsManager,
   type AgentSession,
 } from "@earendil-works/pi-coding-agent";
+import { registerExecution, unregisterExecution } from "../execution-identity.ts";
+import { childActiveTools } from "../profile.ts";
 import { marksSideEffect } from "./effects.ts";
 import { childInstructions, skillNamesForRole, type AgentUsage, type Attempt, type AttemptExecutor } from "./run.ts";
 import type { ModelTarget, ReasoningLevel } from "../roles/types.ts";
@@ -109,6 +111,8 @@ async function openSession(
     modelRuntime: runtime,
     excludeTools: ["agent_run"],
   });
+  session.setActiveToolsByName(childActiveTools(session.getAllTools().map((tool) => tool.name)));
+  registerExecution({ instanceId: input.instanceId, roleId: input.role.id, sessionId: session.sessionId });
   return session;
 }
 
@@ -137,40 +141,47 @@ async function drive(
   try {
     await session.prompt(prompt, { expandPromptTemplates: false });
     const assistant = lastAssistant(session);
-    if (input.signal.aborted || assistant?.stopReason === "aborted") {
-      return { status: "cancelled", result: "cancelled", sideEffects, session: handle };
+    if (input.signal.aborted) {
+      return { status: "cancelled", result: "cancelled", sideEffects, usage: usageFrom(session, tools), appliedReasoning: session.thinkingLevel, session: handle };
     }
-    if (assistant?.stopReason === "error") {
-      return {
-        status: "failed",
-        result: "",
-        error: assistant.errorMessage ?? "provider error",
-        sideEffects,
-        session: handle,
-      };
+    if (assistant?.stopReason === "aborted" || assistant?.stopReason === "error") {
+      return failedAttempt(assistant.errorMessage ?? assistant.stopReason ?? "provider error", sideEffects, handle, session, tools);
     }
     return {
       status: "completed",
       result: textOf(assistant),
       sideEffects,
       usage: usageFrom(session, tools),
+      appliedReasoning: session.thinkingLevel,
       session: handle,
     };
   } catch (error) {
-    if (input.signal.aborted || isAbort(error)) {
-      return { status: "cancelled", result: "cancelled", sideEffects, session: handle };
+    if (input.signal.aborted) {
+      return { status: "cancelled", result: "cancelled", sideEffects, usage: usageFrom(session, tools), session: handle };
     }
-    return {
-      status: "failed",
-      result: "",
-      error: error instanceof Error ? error.message : String(error),
-      sideEffects,
-      session: handle,
-    };
+    return failedAttempt(messageOf(error), sideEffects, handle, session, tools);
   } finally {
     input.signal.removeEventListener("abort", abort);
     unsubscribe();
   }
+}
+
+function failedAttempt(
+  error: string,
+  sideEffects: boolean,
+  handle: NonNullable<Attempt["session"]>,
+  session: AgentSession,
+  tools: Record<string, number>,
+): Attempt {
+  return {
+    status: "failed",
+    result: "",
+    error,
+    sideEffects,
+    usage: usageFrom(session, tools),
+    appliedReasoning: session.thinkingLevel,
+    session: handle,
+  };
 }
 
 function resume(
@@ -186,6 +197,7 @@ function resume(
     async dispose() {
       if (disposed) return;
       disposed = true;
+      unregisterExecution(session.sessionId);
       await session.dispose();
     },
   };

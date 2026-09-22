@@ -126,7 +126,7 @@ A RoleDefinition is a template. An AgentInstance is one isolated run of that rol
 agent_run({ role: "architect", task: "..." })
 ```
 
-The child gets the role instructions, that role's skills and principles, the Pitako coding baseline, the current cwd, and the shared Board. It does not get the parent transcript or the parent TODO list. Board posts from the child use the instance id as author, not a model-supplied string.
+The child gets the role instructions, that role's skills and principles, the Pitako coding baseline, the current cwd, and the shared Board. It does not get the parent transcript or the parent TODO list. Board posts from the child use the instance id as author. That id is looked up from the child Pi session, not from a module-local async store and not from a tool argument.
 
 The run is synchronous. It returns the final result, the instance id, the selected model, the reasoning level, and whether a fallback happened. It does not return the child transcript.
 

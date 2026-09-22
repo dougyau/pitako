@@ -5,6 +5,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { createAgentSession, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { classifyProviderFailure } from "../extensions/agent/fallback.ts";
 import { activateTarget } from "../extensions/agent/pi.ts";
+import { childActiveTools } from "../extensions/profile.ts";
 
 const tempDirs: string[] = [];
 afterEach(() => {
@@ -12,6 +13,33 @@ afterEach(() => {
 });
 
 describe("pi adapter boundary", () => {
+  test("construction enables grep, find, and ls without session_start", async () => {
+    const agentDir = mkdtempSync(path.join(tmpdir(), "pitako-agent-tools-"));
+    tempDirs.push(agentDir);
+    const cwd = mkdtempSync(path.join(tmpdir(), "pitako-agent-tools-cwd-"));
+    tempDirs.push(cwd);
+    const runtime = await ModelRuntime.create({ authPath: path.join(agentDir, "auth.json"), modelsPath: null, allowModelNetwork: false });
+    const model = runtime.getModels()[0];
+    if (!model) throw new Error("Pi static catalog has no model");
+    const { session } = await createAgentSession({
+      cwd,
+      agentDir,
+      model,
+      sessionManager: SessionManager.inMemory(cwd),
+      modelRuntime: runtime,
+      excludeTools: ["agent_run"],
+    });
+    try {
+      const available = session.getAllTools().map((tool) => tool.name);
+      session.setActiveToolsByName(childActiveTools(available));
+      const active = session.getActiveToolNames();
+      expect(available).toEqual(expect.arrayContaining(["grep", "find", "ls", "read"]));
+      expect(active).toEqual(expect.arrayContaining(["grep", "find", "ls", "read"]));
+      expect(active).not.toContain("agent_run");
+    } finally {
+      session.dispose();
+    }
+  }, 60_000);
   test("in-memory session starts empty, setModel auth failure is fallback-worthy, and reasoning is not forced", async () => {
     const agentDir = mkdtempSync(path.join(tmpdir(), "pitako-agent-pi-"));
     tempDirs.push(agentDir);
@@ -38,6 +66,12 @@ describe("pi adapter boundary", () => {
     });
     try {
       expect(session.messages).toEqual([]);
+      session.setActiveToolsByName(childActiveTools(session.getAllTools().map((tool) => tool.name)));
+      const active = session.getActiveToolNames();
+      for (const name of ["grep", "find", "ls", "read"]) {
+        if (session.getAllTools().some((tool) => tool.name === name)) expect(active).toContain(name);
+      }
+      expect(active).not.toContain("agent_run");
       await expect(session.setModel(model, { persist: false })).rejects.toThrow(/No API key/);
       const thrown = await activateTarget(
         {

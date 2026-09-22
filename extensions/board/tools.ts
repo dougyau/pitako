@@ -14,6 +14,7 @@ import {
   type TopicList,
   type TopicPage,
 } from "./store.ts";
+import { resolveBoardAuthor } from "./author.ts";
 import { currentWorkspace } from "./workspace.ts";
 
 const PostTypeSchema = StringEnum(POST_TYPES);
@@ -39,7 +40,7 @@ export function registerBoard(pi: ExtensionAPI): void {
     ),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       return run(ctx, (board, workspace) => {
-        const topic = board.createTopic(workspace, params);
+        const topic = board.createTopic(workspace, params, authorOf(ctx));
         return { text: formatTopicCreated(topic), details: { topicId: topic.id, title: topic.title, status: topic.status } };
       });
     },
@@ -141,7 +142,7 @@ export function registerBoard(pi: ExtensionAPI): void {
     ),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       return run(ctx, (board, workspace) => {
-        const post = board.post(workspace, params);
+        const post = board.post(workspace, params, authorOf(ctx));
         return { text: formatPostLine(post), details: { postId: post.id, topicId: post.topicId, type: post.type } };
       });
     },
@@ -203,8 +204,12 @@ async function inspectBoard(args: string, ctx: ExtensionCommandContext): Promise
   }
 }
 
+function authorOf(ctx: { sessionManager?: { getSessionId(): string } }): string {
+  return resolveBoardAuthor(ctx.sessionManager?.getSessionId());
+}
+
 async function run(
-  ctx: { cwd: string },
+  ctx: { cwd: string; sessionManager?: { getSessionId(): string } },
   action: (board: Board, workspace: string) => { text: string; details: Record<string, unknown> },
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: Record<string, unknown>; isError?: boolean }> {
   let board: Board | undefined;

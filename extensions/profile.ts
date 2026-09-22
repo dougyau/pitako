@@ -29,6 +29,11 @@ export function parseProfile(value: unknown): ProfileName {
   );
 }
 
+/** Coding tools for a child session, applied at construction. Excludes agent_run. */
+export function childActiveTools(available: readonly string[], includePowerShell = false): string[] {
+  return toolsForProfile({ available, profile: "coding", includePowerShell }).filter((name) => name !== "agent_run");
+}
+
 export function toolsForProfile(options: {
   available: readonly string[];
   profile: ProfileName;
