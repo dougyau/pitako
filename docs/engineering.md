@@ -78,6 +78,10 @@ Fallback is availability only. v0 does not select a fallback and does not accept
 
 Board author is an `AsyncLocalStorage` value, default `pi`, set to the instance id for the child run. The model cannot pass an author. `agent_run` is removed from the child tool list during that scope.
 
+Target activation is part of fallback. `setModel` throwing `No API key` is an auth failure, and the next target is tried. Unknown throws are not. Pi tools have no mutating flag. Known read-only names do not mark side effects. Every other name does. After that flag is set, fallback continues the same session and does not send the original task again. `reasoning = default` is not rewritten to `medium`.
+
+A child session does not receive the foreground sentence that the user selected the model. `SessionStats.tokens.input` is cumulative billed input across turns. It cannot be split into skills, tool output, or file reads. The earlier Architect figure of 472440 input tokens is that cumulative total, not one prompt.
+
 ## Dogfood
 
 rpiv-todo dogfood: `/pitako` now names the session TODO layer in one line, and `tests/todo.test.ts` drives the real `todo` tool (create, in_progress, complete, `blockedBy`, cycle rejection, branch isolation, replay). No Pitako Task system was added.

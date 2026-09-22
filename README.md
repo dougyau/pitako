@@ -130,7 +130,11 @@ The child gets the role instructions, that role's skills and principles, the Pit
 
 The run is synchronous. It returns the final result, the instance id, the selected model, the reasoning level, and whether a fallback happened. It does not return the child transcript.
 
-The model comes from the role's ModelPolicy. Reasoning is the target's configured level. If the provider fails before any mutating tool runs, the next target starts a fresh session. If a mutating tool already ran, the same session switches model and continues. The original task is not replayed. An unknown error, a failed test, or cancellation does not switch models. If every target fails, `agent_run` returns the error. The parent must not do that role's work itself.
+The model comes from the role's ModelPolicy. An explicit reasoning level is applied. `default`, or an omitted level, is not rewritten to `medium`. Pi keeps its own default. Activating a target includes resolving the model and `setModel`. A quota, rate-limit, auth, or unavailable failure at that step tries the next target. An unknown error does not.
+
+Before a mutating or unknown tool runs, the next target may start a fresh session. After one runs, the same session switches model and continues. The original task is not sent again. Unknown tools count as potential side effects. Pi does not mark tools as mutating, so this list is fail-safe rather than a registry. A failed test does not switch models. If every target fails, `agent_run` returns the error. The parent must not do that role's work itself.
+
+The result can include turns, input, output, cache tokens, cost, and tool-call counts when Pi reports them. Input tokens are cumulative across turns, not the size of one prompt.
 
 The child cannot call `agent_run`. There is no background mode, resume, or team.
 

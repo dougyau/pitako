@@ -65,3 +65,14 @@ export function profileNote(profile: ProfileName): string {
   }
   return ["Pitako profile: coding.", ...shared].join(" ");
 }
+
+/** True for an AgentInstance. Does not claim the user picked the model. */
+export function childSessionNote(instanceId: string): string {
+  return [
+    `Pitako AgentInstance ${instanceId}.`,
+    "The model and reasoning come from this role's ModelPolicy, not from the parent session.",
+    "Inspect the repository before editing. Prefer CodeGraph and LSP over broad grep.",
+    "Keep diffs small. Verify real behavior before claiming done.",
+    "Board tools are pull-only. rpiv-todo is private to this session. Do not spawn agents.",
+  ].join(" ");
+}

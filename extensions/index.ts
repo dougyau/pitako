@@ -2,7 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { skillStatusLines } from "./catalog.ts";
 import { PitakoConfigError } from "./errors.ts";
 import { isProtectedEditPath } from "./paths.ts";
-import { parseProfile, profileNote, toolsForProfile, type ProfileName } from "./profile.ts";
+import { childSessionNote, parseProfile, profileNote, toolsForProfile, type ProfileName } from "./profile.ts";
 import { currentInstanceId } from "./agent/scope.ts";
 import { inspectPitako } from "./roles/format.ts";
 import { packageRoot, prepareRuntime } from "./stack.ts";
@@ -46,14 +46,25 @@ export default function pitako(pi: ExtensionAPI) {
       if (ctx.hasUI) ctx.ui.notify(message, "error");
       throw error;
     }
-    const next = applyProfile(pi, profile);
-    if (currentInstanceId()) pi.setActiveTools(next.filter((name) => name !== "agent_run"));
+    const instanceId = currentInstanceId();
+    if (instanceId) {
+      const available = pi.getAllTools().map((tool) => tool.name);
+      const coding = toolsForProfile({
+        available,
+        profile: "coding",
+        includePowerShell: process.platform === "win32" || pi.getActiveTools().includes("powershell"),
+      }).filter((name) => name !== "agent_run");
+      pi.setActiveTools(coding);
+    } else {
+      applyProfile(pi, profile);
+    }
     if (!pi.getSessionName()) pi.setSessionName(`pitako:${profile}`);
     if (ctx.hasUI) ctx.ui.setStatus("pitako", `pitako:${profile}`);
   });
 
   pi.on("before_agent_start", async (event) => {
-    const note = profileNote(profile);
+    const instanceId = currentInstanceId();
+    const note = instanceId ? childSessionNote(instanceId) : profileNote(profile);
     const current = event.systemPrompt ?? "";
     if (current.includes(note)) return undefined;
     return { systemPrompt: current.length > 0 ? `${current}\n\n${note}` : note };

@@ -31,7 +31,14 @@ export interface AgentInstance {
 export interface AgentUsage {
   input: number;
   output: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  total?: number;
   cost?: number;
+  turns?: number;
+  toolCalls?: number;
+  tools?: Record<string, number>;
+  contextTokens?: number;
 }
 
 export interface AgentRunResult {
@@ -70,6 +77,47 @@ export interface AttemptExecutor {
 
 const SIDE_EFFECT_NOTE = "The previous model became unavailable. Continue from the current session. Do not repeat completed side effects.";
 
+async function runAttempt(
+  sideEffects: boolean,
+  session: AttemptSession | undefined,
+  executor: AttemptExecutor,
+  input: {
+    instanceId: string;
+    role: ResolvedRole;
+    task: string;
+    target: ModelTarget;
+    cwd: string;
+    signal: AbortSignal;
+  },
+): Promise<Attempt> {
+  try {
+    if (sideEffects) {
+      if (!session) {
+        return {
+          status: "failed",
+          result: "",
+          error: "cannot continue after side effects without replaying the task",
+          sideEffects: true,
+        };
+      }
+      return await session.continueWith(input.target, SIDE_EFFECT_NOTE, input.signal);
+    }
+    await session?.dispose();
+    return await executor.start(input);
+  } catch (error) {
+    if (input.signal.aborted || (error instanceof Error && (error.name === "AbortError" || /abort/i.test(error.message)))) {
+      return { status: "cancelled", result: "cancelled", sideEffects, session };
+    }
+    return {
+      status: "failed",
+      result: "",
+      error: error instanceof Error ? error.message : String(error),
+      sideEffects,
+      session,
+    };
+  }
+}
+
 export function createInstanceId(roleId: string): string {
   return `${roleId}-${randomBytes(3).toString("hex")}`;
 }
@@ -81,6 +129,7 @@ export function childInstructions(role: ResolvedRole, instanceId: string): strin
     "Do not spawn other agents. agent_run is not available.",
     "Publish shared findings on the Board. Board contents are not injected here.",
     "Your rpiv-todo list is private to this session.",
+    "The model and reasoning for this run come from this role's ModelPolicy, not from the parent session.",
     "",
     role.instructions,
   ].join("\n");
@@ -142,23 +191,15 @@ async function executeTargets(
       if (signal.aborted) return finish(instance, "cancelled", "cancelled", targets[index]);
       const target = targets[index]!;
       instance.model = provenance(instance, target, index);
-      let attempt: Attempt;
-      if (sideEffects) {
-        if (!session) return finish(instance, "failed", "cannot continue after side effects without replaying the task", target, index);
-        attempt = await session.continueWith(target, SIDE_EFFECT_NOTE, signal);
-      } else {
-        await session?.dispose();
-        session = undefined;
-        attempt = await executor.start({
-          instanceId: instance.id,
-          role,
-          task,
-          target,
-          cwd: instance.cwd,
-          signal,
-        });
-        session = attempt.session;
-      }
+      const attempt = await runAttempt(sideEffects, session, executor, {
+        instanceId: instance.id,
+        role,
+        task,
+        target,
+        cwd: instance.cwd,
+        signal,
+      });
+      session = attempt.session ?? session;
       sideEffects = sideEffects || attempt.sideEffects;
       if (attempt.status === "completed") {
         return finish(instance, "completed", attempt.result, target, index, undefined, attempt.usage);
@@ -225,6 +266,8 @@ export function formatAgentResult(result: AgentRunResult): string {
   const fallback = result.model.fallbackReason
     ? ` fallback ${result.model.fallbackIndex ?? 0} (${result.model.fallbackReason})`
     : "";
-  const usage = result.usage ? `\nusage: in ${result.usage.input} out ${result.usage.output}` : "";
+  const usage = result.usage
+    ? `\nusage: in ${result.usage.input} out ${result.usage.output} turns ${result.usage.turns ?? "?"} tools ${result.usage.toolCalls ?? "?"}`
+    : "";
   return `${result.instanceId} ${result.status}\nrole: ${result.role}\nmodel: ${result.model.selectedModel} reasoning ${result.model.reasoning ?? "unset"}${fallback}${usage}\n\n${result.result}`;
 }

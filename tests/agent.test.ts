@@ -6,8 +6,11 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import agentInstance from "../extensions/agent/index.ts";
 import { currentInstanceId, agentScope } from "../extensions/agent/scope.ts";
+import { marksSideEffect, toolEffect } from "../extensions/agent/effects.ts";
 import { classifyProviderFailure } from "../extensions/agent/fallback.ts";
+import { activateTarget, thinkingLevelFor } from "../extensions/agent/pi.ts";
 import { childInstructions, runAgentInstance, skillNamesForRole, type Attempt, type AttemptExecutor } from "../extensions/agent/run.ts";
+import { childSessionNote } from "../extensions/profile.ts";
 import { withBoardAuthor, currentBoardAuthor } from "../extensions/board/author.ts";
 import { openBoard } from "../extensions/board/store.ts";
 import { currentWorkspace } from "../extensions/board/workspace.ts";
@@ -172,6 +175,67 @@ reasoning = "medium"
     });
     expect(aborted.status).toBe("cancelled");
     expect(cancelled.starts).toEqual([]);
+
+    const activation = scripted([]);
+    activation.start = async (input) => {
+      activation.starts.push(input.target.model);
+      if (input.target.model === "example/primary") throw new Error("No API key for example/primary");
+      if (input.target.model === "example/fallback-1") throw new Error("No API key for example/fallback-1");
+      return { status: "completed", result: "third target", sideEffects: false };
+    };
+    const activated = await runAgentInstance({
+      roleId: "architect",
+      task: "review the boundary",
+      cwd,
+      executor: activation,
+      load: configured,
+    });
+    expect(activated.status).toBe("completed");
+    expect(activated.result).toBe("third target");
+    expect(activation.starts).toEqual(["example/primary", "example/fallback-1", "example/fallback-2"]);
+
+    const unknownActivation = scripted([]);
+    unknownActivation.start = async () => {
+      throw new Error("disk on fire");
+    };
+    const stopped = await runAgentInstance({
+      roleId: "architect",
+      task: "review the boundary",
+      cwd,
+      executor: unknownActivation,
+      load: configured,
+    });
+    expect(stopped.status).toBe("failed");
+    expect(stopped.result).toContain("disk on fire");
+
+    const switched = scripted([
+      {
+        status: "failed",
+        result: "",
+        error: "429 rate limit",
+        sideEffects: true,
+        session: {
+          async continueWith(target, note) {
+            switched.notes.push(`${target.model}:${note}`);
+            if (target.model === "example/fallback-1") throw new Error("No API key for example/fallback-1");
+            expect(note).not.toBe("review the boundary");
+            return { status: "completed", result: "same session", sideEffects: true };
+          },
+          async dispose() {},
+        },
+      },
+    ]);
+    const afterSwitch = await runAgentInstance({
+      roleId: "architect",
+      task: "review the boundary",
+      cwd,
+      executor: switched,
+      load: configured,
+    });
+    expect(afterSwitch.status).toBe("completed");
+    expect(afterSwitch.model.selectedModel).toBe("example/fallback-2");
+    expect(switched.starts).toEqual(["example/primary"]);
+    expect(switched.notes.some((note) => note.startsWith("example/fallback-2:"))).toBe(true);
   });
 
   test("fallback classification is narrow", () => {
@@ -183,6 +247,16 @@ reasoning = "medium"
     expect(classifyProviderFailure("tests failed")).toBeUndefined();
     expect(classifyProviderFailure("compilation failed")).toBeUndefined();
     expect(classifyProviderFailure(undefined)).toBeUndefined();
+    expect(classifyProviderFailure("No API key for cursor/grok-4.7")).toBe("auth");
+    expect(toolEffect("read")).toBe("read_only");
+    expect(toolEffect("board_post")).toBe("mutating");
+    expect(toolEffect("database_migrate")).toBe("potentially_mutating");
+    expect(marksSideEffect("codegraph_search")).toBe(false);
+    expect(marksSideEffect("deploy")).toBe(true);
+    expect(thinkingLevelFor(undefined)).toBeUndefined();
+    expect(thinkingLevelFor("high")).toBe("high");
+    expect(childSessionNote("architect-1")).not.toContain("whatever the user selected");
+    expect(childInstructions(resolveRole("architect", { env: tempEnv() }), "architect-1")).toContain("ModelPolicy");
   });
 
   test("Board author follows the instance and todos stay on the session id", async () => {

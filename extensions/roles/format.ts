@@ -52,7 +52,8 @@ export function formatPolicy(policy: ResolvedModelPolicy): string {
     });
   }
   if (policy.diagnostic) lines.push(policy.diagnostic);
-  lines.push("Fallback is for provider availability. It is not selected in this version.");
+  lines.push("Configured fallbacks are availability targets. This listing is the policy, not a run.");
+  lines.push("agent_run reports the selected target and fallback reason separately.");
   return lines.join("\n");
 }
 

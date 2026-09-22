@@ -8,25 +8,20 @@ import {
   SettingsManager,
   type AgentSession,
 } from "@earendil-works/pi-coding-agent";
-import { childInstructions, skillNamesForRole, type Attempt, type AttemptExecutor } from "./run.ts";
-import type { ModelTarget } from "../roles/types.ts";
+import { marksSideEffect } from "./effects.ts";
+import { childInstructions, skillNamesForRole, type AgentUsage, type Attempt, type AttemptExecutor } from "./run.ts";
+import type { ModelTarget, ReasoningLevel } from "../roles/types.ts";
 
-const SIDE_EFFECT_TOOLS = new Set([
-  "edit",
-  "write",
-  "bash",
-  "powershell",
-  "board_post",
-  "board_topic_create",
-  "board_topic_update",
-  "lsp_rename",
-]);
+/** Omitted reasoning is not forced to medium. Pi keeps its own default. */
+export function thinkingLevelFor(reasoning: ReasoningLevel | undefined): ThinkingLevel | undefined {
+  return reasoning;
+}
 
 export function createPiExecutor(): AttemptExecutor {
   return {
     async start(input) {
       const runtime = await ModelRuntime.create({ signal: input.signal, allowModelNetwork: false });
-      return runTarget(runtime, input.target, input.task, input, false);
+      return runTarget(runtime, input.target, input.task, input);
     },
   };
 }
@@ -41,7 +36,6 @@ async function runTarget(
     cwd: string;
     signal: AbortSignal;
   },
-  continuing: boolean,
   existing?: AgentSession,
 ): Promise<Attempt> {
   if (input.signal.aborted) return { status: "cancelled", result: "cancelled", sideEffects: false };
@@ -49,12 +43,38 @@ async function runTarget(
   if (!model) {
     return { status: "failed", result: "", error: `model unavailable: ${target.model}`, sideEffects: false };
   }
-  const session = existing ?? (await openSession(runtime, model, target, input));
-  if (existing) {
-    await existing.setModel(model, { persist: false });
-    if (target.reasoning) existing.setThinkingLevel(target.reasoning as ThinkingLevel);
+  let session = existing;
+  if (!session) {
+    try {
+      session = await openSession(runtime, model, target, input);
+    } catch (error) {
+      return { status: "failed", result: "", error: messageOf(error), sideEffects: false };
+    }
+  } else {
+    const activationError = await activateTarget(session, model, target);
+    if (activationError) {
+      return { status: "failed", result: "", error: activationError, sideEffects: true, session: resume(session, runtime, input) };
+    }
   }
-  return drive(session, runtime, prompt, input, continuing);
+  return drive(session, runtime, prompt, input);
+}
+
+export async function activateTarget(
+  session: {
+    setModel(model: NonNullable<ReturnType<ModelRuntime["getModel"]>>, options?: { persist?: boolean }): Promise<void>;
+    setThinkingLevel(level: ThinkingLevel): void;
+  },
+  model: NonNullable<ReturnType<ModelRuntime["getModel"]>>,
+  target: ModelTarget,
+): Promise<string | undefined> {
+  try {
+    await session.setModel(model, { persist: false });
+    const level = thinkingLevelFor(target.reasoning);
+    if (level) session.setThinkingLevel(level);
+    return undefined;
+  } catch (error) {
+    return messageOf(error);
+  }
 }
 
 async function openSession(
@@ -77,11 +97,12 @@ async function openSession(
     }),
   });
   await loader.reload();
+  const thinkingLevel = thinkingLevelFor(target.reasoning);
   const { session } = await createAgentSession({
     cwd: input.cwd,
     agentDir,
     model,
-    thinkingLevel: (target.reasoning ?? "medium") as ThinkingLevel,
+    ...(thinkingLevel ? { thinkingLevel } : {}),
     sessionManager: SessionManager.inMemory(input.cwd),
     settingsManager,
     resourceLoader: loader,
@@ -101,11 +122,12 @@ async function drive(
     cwd: string;
     signal: AbortSignal;
   },
-  continuing: boolean,
 ): Promise<Attempt> {
   let sideEffects = false;
+  const tools: Record<string, number> = {};
   const unsubscribe = session.subscribe((event) => {
-    if (event.type === "tool_execution_start" && SIDE_EFFECT_TOOLS.has(event.toolName)) sideEffects = true;
+    if (event.type === "tool_execution_start" && marksSideEffect(event.toolName)) sideEffects = true;
+    if (event.type === "tool_execution_end") tools[event.toolName] = (tools[event.toolName] ?? 0) + 1;
   });
   const abort = () => {
     void session.abort();
@@ -127,12 +149,11 @@ async function drive(
         session: handle,
       };
     }
-    const stats = session.getSessionStats();
     return {
       status: "completed",
       result: textOf(assistant),
       sideEffects,
-      usage: { input: stats.tokens.input, output: stats.tokens.output, cost: stats.cost },
+      usage: usageFrom(session, tools),
       session: handle,
     };
   } catch (error) {
@@ -160,7 +181,7 @@ function resume(
   let disposed = false;
   return {
     async continueWith(target, note, signal) {
-      return runTarget(runtime, target, note, { ...input, signal }, true, session);
+      return runTarget(runtime, target, note, { ...input, signal }, session);
     },
     async dispose() {
       if (disposed) return;
@@ -188,6 +209,27 @@ function textOf(message: { content?: Array<{ type?: string; text?: string }> } |
   const parts = message?.content ?? [];
   const text = parts.filter((part) => part.type === "text" && part.text).map((part) => part.text).join("\n").trim();
   return text.length > 0 ? text : "(no final result)";
+}
+
+function usageFrom(session: AgentSession, tools: Record<string, number>): AgentUsage {
+  const stats = session.getSessionStats();
+  const contextTokens = stats.contextUsage?.tokens ?? undefined;
+  return {
+    input: stats.tokens.input,
+    output: stats.tokens.output,
+    cacheRead: stats.tokens.cacheRead,
+    cacheWrite: stats.tokens.cacheWrite,
+    total: stats.tokens.total,
+    cost: stats.cost,
+    turns: stats.assistantMessages,
+    toolCalls: stats.toolCalls,
+    tools,
+    contextTokens: contextTokens ?? undefined,
+  };
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function isAbort(error: unknown): boolean {

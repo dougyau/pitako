@@ -223,7 +223,8 @@ reasoning = "high"
       expect(text).toContain("example/architect");
       expect(text).toContain("reasoning: high");
       expect(text).toContain("blast-radius");
-      expect(text).toContain("Fallback is for provider availability");
+      expect(text).toContain("Configured fallbacks are availability targets");
+      expect(text).not.toContain("not selected in this version");
       expect(text).not.toContain("api_key");
     } finally {
       if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
