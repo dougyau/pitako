@@ -143,7 +143,7 @@ The child cannot call `agent_run`, `agent_supervise`, `agent_spawn`, `agent_stat
 
 `agent_spawn` returns while the worker is still running. The worker has its own cancellation. A later Coordinator turn does not cancel it. Completion is one short signal. The result stays out of the Coordinator conversation until `agent_result`. A spawn with `plan` and `unit` can wake an idle `$execute` turn. A spawn without that pair only notifies the UI. Herdr background supervision is not in this milestone.
 
-There is no fixed wall-clock deadline. A run ends for inactivity, not because it is old. The default idle window is 10 minutes with no tool running, and 45 minutes while a tool is running. `max_run_time = "0"` means unlimited. Parent cancellation is immediate and is not a stall. A stall does not switch models. Prompt-cache warming does not count as progress. Pi's HTTP idle timeout is a separate transport limit and is left unchanged.
+There is no fixed wall-clock deadline. A run ends for inactivity, not because it is old. The default idle window is 10 minutes with no tool running, and 45 minutes while a tool is running. `max_run_time = "0"` means unlimited. Parent cancellation is immediate and is not a stall. An open cursor AgentSession run uses the tool window because native exec emits no Pi tool event, and a stall still does not switch models. Prompt-cache warming does not count as progress. Pi's HTTP idle timeout is a separate transport limit and is left unchanged.
 
 ```toml
 [agent_runtime]

@@ -116,6 +116,24 @@ export function noteToolEnd(state: AgentActivityState, now: number, id?: string)
   noteActivity(state, "tool_end", now);
 }
 
+export const PROVIDER_STREAM_TOOL_ID = "provider-stream";
+
+/** Synthetic in-flight tool for provider-native work that emits no Pi tool event. */
+export function syncToolHold(state: AgentActivityState, hold: { name: string } | undefined, now: number): void {
+  const index = state.runningTools.findIndex((tool) => tool.id === PROVIDER_STREAM_TOOL_ID);
+  if (hold) {
+    if (index >= 0) {
+      state.runningTools[index]!.name = hold.name;
+    } else {
+      state.runningTools.push({ id: PROVIDER_STREAM_TOOL_ID, name: hold.name, startedAt: now });
+    }
+  } else if (index >= 0) {
+    state.runningTools.splice(index, 1);
+  }
+  const oldest = state.runningTools[0];
+  state.activeTool = oldest ? { name: oldest.name, startedAt: oldest.startedAt } : undefined;
+}
+
 /** Cache warming and queue noise are not progress. */
 export function activityKind(event: { type?: string; assistantMessageEvent?: { type?: string } }): string | undefined {
   const type = event.type ?? "";

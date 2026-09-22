@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { runAgentInstance, type AttemptExecutor } from "../extensions/agent/run.ts";
+import { createPiExecutor, cursorStreamHold } from "../extensions/agent/pi.ts";
+import { runAgentInstance, type Attempt, type AttemptExecutor } from "../extensions/agent/run.ts";
 import {
   WALL_CLOCK_TIMEOUT_SOURCE,
   activityKind,
@@ -11,12 +12,16 @@ import {
   noteActivity,
   noteToolEnd,
   noteToolStart,
+  PROVIDER_STREAM_TOOL_ID,
+  syncToolHold,
   startWatchdogTimer,
+  STALL_CONFIRM_MS,
   DEFAULT_IDLE_TIMEOUT_MS,
   DEFAULT_TOOL_STALL_TIMEOUT_MS,
   type WatchdogConfig,
 } from "../extensions/agent/watchdog.ts";
 import { loadPitakoConfig } from "../extensions/roles/load.ts";
+import type { ResolvedRole } from "../extensions/roles/types.ts";
 
 const MINUTE = 60_000;
 
@@ -107,6 +112,55 @@ describe("activity watchdog", () => {
     handle.stop();
     expect(typeof handle.stop).toBe("function");
     expect(stopped || true).toBe(true);
+  });
+
+  test("syncToolHold keeps the tool window without Pi tool events", () => {
+    const config: WatchdogConfig = { idleTimeoutMs: 10 * MINUTE, toolStallTimeoutMs: 45 * MINUTE, maxRunTimeMs: 0 };
+    const state = createActivity(0);
+    syncToolHold(state, { name: "cursor-native" }, 0);
+    expect(evaluateWatchdog(state, config, 10 * MINUTE)).toBe("ok");
+    expect(evaluateWatchdog(state, config, 10 * MINUTE + 1)).toBe("ok");
+    expect(evaluateWatchdog(state, config, 45 * MINUTE)).toBe("suspect");
+    expect(evaluateWatchdog(state, config, 45 * MINUTE + STALL_CONFIRM_MS)).toBe("stalled");
+  });
+
+  test("syncToolHold insert, repeat, and release do not move activity", () => {
+    const state = createActivity(0);
+    noteActivity(state, "model_stream", 1_000);
+    const lastActivityAt = state.lastActivityAt;
+    const lastActivityKind = state.lastActivityKind;
+
+    syncToolHold(state, { name: "probe-name" }, 5_000);
+    expect(state.lastActivityAt).toBe(lastActivityAt);
+    expect(state.lastActivityKind).toBe(lastActivityKind);
+
+    syncToolHold(state, { name: "probe-name" }, 10_000);
+    expect(state.lastActivityAt).toBe(lastActivityAt);
+    expect(state.lastActivityKind).toBe(lastActivityKind);
+
+    syncToolHold(state, undefined, 15_000);
+    expect(state.lastActivityAt).toBe(lastActivityAt);
+    expect(state.lastActivityKind).toBe(lastActivityKind);
+  });
+
+  test("syncToolHold release drops only provider-stream and keeps real tools", () => {
+    const state = createActivity(0);
+    noteToolStart(state, "bash", 0);
+    syncToolHold(state, { name: "probe-name" }, 1_000);
+    expect(state.runningTools.map((tool) => tool.id)).toEqual(["bash", PROVIDER_STREAM_TOOL_ID]);
+    expect(state.activeTool?.name).toBe("bash");
+
+    syncToolHold(state, undefined, 2_000);
+    expect(state.runningTools.map((tool) => tool.id)).toEqual(["bash"]);
+    expect(state.activeTool?.name).toBe("bash");
+  });
+
+  test("syncToolHold display name comes from the probe", () => {
+    const state = createActivity(0);
+    syncToolHold(state, { name: "probe-name" }, 0);
+    const hold = state.runningTools.find((tool) => tool.id === PROVIDER_STREAM_TOOL_ID);
+    expect(hold?.name).toBe("probe-name");
+    expect(state.activeTool?.name).toBe("probe-name");
   });
 
   test("defaults are 10m idle, 45m tool stall, and unlimited max runtime", () => {
@@ -283,6 +337,185 @@ describe("watchdog integration", () => {
     expect(result.model.fallbackOccurred).toBeFalsy();
   });
 
+  test("a probe holds the tool window past idle and still stalls at the tool window", async () => {
+    let clock = 0;
+    let tick = () => {};
+    let signal: AbortSignal | undefined;
+    const starts: string[] = [];
+    let started: () => void = () => {};
+    const ready = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const executor: AttemptExecutor = {
+      async start(input) {
+        starts.push(input.target.model);
+        signal = input.signal;
+        input.bindActivityProbe?.(() => ({ name: "fake-probe" }));
+        started();
+        await waitForAbort(input.signal);
+        input.bindActivityProbe?.(undefined);
+        return { status: "cancelled", result: "cancelled", sideEffects: false };
+      },
+    };
+    const pending = runAgentInstance({
+      roleId: "architect",
+      task: "review the boundary",
+      cwd: packageRoot(),
+      executor,
+      load: isolatedLoad(),
+      now: () => clock,
+      schedule: (fn) => {
+        tick = fn;
+        return { unref() {} };
+      },
+      watchdog: { idleTimeoutMs: 1_000, toolStallTimeoutMs: 60_000, maxRunTimeMs: 0 },
+    });
+    await ready;
+    clock = 1_000 + STALL_CONFIRM_MS;
+    tick();
+    expect(signal?.aborted).toBe(false);
+    expect(starts).toEqual(["example/primary"]);
+    clock = 60_000;
+    tick();
+    clock = 60_000 + STALL_CONFIRM_MS;
+    tick();
+    const result = await pending;
+    expect(result.status).toBe("failed");
+    expect(result.result).toContain("stalled");
+    expect(starts).toEqual(["example/primary"]);
+    expect(result.model.fallbackOccurred).toBeFalsy();
+  });
+
+  test("a throwing probe does not stop the idle stall", async () => {
+    let clock = 0;
+    let tick = () => {};
+    let calls = 0;
+    let started: () => void = () => {};
+    const ready = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const executor: AttemptExecutor = {
+      async start(input) {
+        input.bindActivityProbe?.(() => {
+          calls += 1;
+          throw new Error("probe broke");
+        });
+        started();
+        await waitForAbort(input.signal);
+        input.bindActivityProbe?.(undefined);
+        return { status: "cancelled", result: "cancelled", sideEffects: false };
+      },
+    };
+    const pending = runAgentInstance({
+      roleId: "architect",
+      task: "review the boundary",
+      cwd: packageRoot(),
+      executor,
+      load: isolatedLoad(),
+      now: () => clock,
+      schedule: (fn) => {
+        tick = fn;
+        return { unref() {} };
+      },
+      watchdog: { idleTimeoutMs: 1_000, toolStallTimeoutMs: 60_000, maxRunTimeMs: 0 },
+    });
+    await ready;
+    clock = 1_000;
+    tick();
+    clock = 1_000 + STALL_CONFIRM_MS;
+    tick();
+    const result = await pending;
+    expect(calls).toBeGreaterThan(0);
+    expect(result.status).toBe("failed");
+    expect(result.result).toContain("stalled");
+    expect(result.model.fallbackOccurred).toBeFalsy();
+  });
+
+  test("max runtime still fails while a probe hold is set", async () => {
+    let clock = 0;
+    let tick = () => {};
+    let calls = 0;
+    let started: () => void = () => {};
+    const ready = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const executor: AttemptExecutor = {
+      async start(input) {
+        input.bindActivityProbe?.(() => {
+          calls += 1;
+          return { name: "fake-probe" };
+        });
+        input.onActivity?.({ type: "message_update", assistantMessageEvent: { type: "text_delta" } });
+        started();
+        await waitForAbort(input.signal);
+        input.bindActivityProbe?.(undefined);
+        return { status: "cancelled", result: "cancelled", sideEffects: false };
+      },
+    };
+    const pending = runAgentInstance({
+      roleId: "architect",
+      task: "review the boundary",
+      cwd: packageRoot(),
+      executor,
+      load: isolatedLoad(),
+      now: () => clock,
+      schedule: (fn) => {
+        tick = fn;
+        return { unref() {} };
+      },
+      watchdog: { idleTimeoutMs: 60_000, toolStallTimeoutMs: 60_000, maxRunTimeMs: 5_000 },
+    });
+    await ready;
+    clock = 5_000;
+    tick();
+    const result = await pending;
+    expect(calls).toBeGreaterThan(0);
+    expect(result.status).toBe("failed");
+    expect(result.result).toContain("max runtime");
+    expect(result.model.fallbackOccurred).toBeFalsy();
+  });
+
+  test("parent abort still cancels while a probe hold is set", async () => {
+    const parent = new AbortController();
+    let clock = 0;
+    let tick = () => {};
+    let started: () => void = () => {};
+    const ready = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const executor: AttemptExecutor = {
+      async start(input) {
+        input.bindActivityProbe?.(() => ({ name: "fake-probe" }));
+        started();
+        await waitForAbort(input.signal);
+        input.bindActivityProbe?.(undefined);
+        return { status: "cancelled", result: "cancelled", sideEffects: false };
+      },
+    };
+    const pending = runAgentInstance({
+      roleId: "architect",
+      task: "review the boundary",
+      cwd: packageRoot(),
+      signal: parent.signal,
+      executor,
+      load: isolatedLoad(),
+      now: () => clock,
+      schedule: (fn) => {
+        tick = fn;
+        return { unref() {} };
+      },
+      watchdog: { idleTimeoutMs: 1_000, toolStallTimeoutMs: 60_000, maxRunTimeMs: 0 },
+    });
+    await ready;
+    clock = 5_000;
+    tick();
+    parent.abort();
+    const result = await pending;
+    expect(result.status).toBe("cancelled");
+    expect(result.result).not.toContain("stalled");
+    expect(result.model.fallbackOccurred).toBeFalsy();
+  });
+
   test("parent cancellation is immediate and is not a stall or a fallback", async () => {
     const parent = new AbortController();
     const executor: AttemptExecutor = {
@@ -307,6 +540,233 @@ describe("watchdog integration", () => {
     expect(result.model.fallbackOccurred).toBeFalsy();
   });
 });
+
+describe("cursor stream hold", () => {
+  test("cursorStreamHold is set only for a streaming cursor provider", () => {
+    expect(cursorStreamHold({ model: { provider: "cursor" }, isStreaming: true })).toEqual({ name: "cursor-native" });
+    expect(cursorStreamHold({ model: { provider: "cursor" }, isStreaming: false })).toBeUndefined();
+    expect(cursorStreamHold({ model: { provider: "other" }, isStreaming: true })).toBeUndefined();
+    expect(cursorStreamHold({ model: {}, isStreaming: true })).toBeUndefined();
+    expect(cursorStreamHold({ model: null, isStreaming: true })).toBeUndefined();
+    expect(cursorStreamHold({ isStreaming: true })).toBeUndefined();
+    expect(cursorStreamHold({})).toBeUndefined();
+  });
+
+  test("drive and continueWith bind a per-attempt probe", async () => {
+    const dirs: string[] = [];
+    const previous = process.env.PI_CODING_AGENT_DIR;
+    try {
+      const { cwd } = await installProbeProviders(dirs, () => {}, Promise.resolve());
+      const events: string[] = [];
+      const attempt = await createPiExecutor().start({
+        instanceId: "developer-probe",
+        role: probeRole,
+        task: "say-pong-marker",
+        target: { model: "pitako-probe/late", reasoning: "off" },
+        cwd,
+        signal: new AbortController().signal,
+        bindActivityProbe(probe) {
+          events.push(probe ? "bind" : "clear");
+        },
+      });
+      expect(events).toEqual(["bind", "clear"]);
+      const before = events.length;
+      const next = await attempt.session!.continueWith(
+        { model: "pitako-probe/late", reasoning: "off" },
+        "continue",
+        new AbortController().signal,
+      );
+      expect(events.slice(before)).toEqual(["bind", "clear"]);
+      expect(next.status).toBe("completed");
+      await attempt.session?.dispose();
+    } finally {
+      if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previous;
+      for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("overlapping starts on one executor do not share a hold", async () => {
+    const dirs: string[] = [];
+    const previous = process.env.PI_CODING_AGENT_DIR;
+    let releaseA = () => {};
+    let releaseB = () => {};
+    const hungA = new Promise<void>((resolve) => {
+      releaseA = resolve;
+    });
+    const hungB = new Promise<void>((resolve) => {
+      releaseB = resolve;
+    });
+    let entered = 0;
+    let bothEntered: () => void = () => {};
+    const streaming = new Promise<void>((resolve) => {
+      bothEntered = resolve;
+    });
+    const probes: { a?: () => { name: string } | undefined; b?: () => { name: string } | undefined } = {};
+    let attemptA: Attempt | undefined;
+    let attemptB: Attempt | undefined;
+    try {
+      const { cwd } = await installSplitProviders(dirs, () => {
+        entered += 1;
+        if (entered === 2) bothEntered();
+      }, hungA, hungB);
+      const executor = createPiExecutor();
+      const pendingA = executor.start({
+        instanceId: "developer-a",
+        role: probeRole,
+        task: "hold-a",
+        target: { model: "cursor/late", reasoning: "off" },
+        cwd,
+        signal: new AbortController().signal,
+        bindActivityProbe(probe) {
+          if (probe) probes.a = probe;
+        },
+      }).then((attempt) => {
+        attemptA = attempt;
+        return attempt;
+      });
+      const pendingB = executor.start({
+        instanceId: "developer-b",
+        role: probeRole,
+        task: "hold-b",
+        target: { model: "other/late", reasoning: "off" },
+        cwd,
+        signal: new AbortController().signal,
+        bindActivityProbe(probe) {
+          if (probe) probes.b = probe;
+        },
+      }).then((attempt) => {
+        attemptB = attempt;
+        return attempt;
+      });
+      await Promise.race([
+        streaming,
+        delay(20_000).then(() => {
+          throw new Error("overlapping starts did not reach the provider");
+        }),
+      ]);
+      expect(probes.a?.()).toEqual({ name: "cursor-native" });
+      expect(probes.b?.()).toBeUndefined();
+      releaseA();
+      releaseB();
+      await Promise.all([pendingA, pendingB]);
+    } finally {
+      releaseA();
+      releaseB();
+      await attemptA?.session?.dispose();
+      await attemptB?.session?.dispose();
+      if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previous;
+      for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
+});
+
+const eventStreamSpecifier = "@earendil-works/pi-ai/utils/event-stream.js";
+
+const probeRole: ResolvedRole = {
+  id: "developer",
+  name: "Developer",
+  description: "test",
+  instructionsPath: "roles/developer.md",
+  instructions: "Reply exactly.",
+  skills: [],
+  principles: [],
+  modelPolicyId: "developer",
+  modelPolicy: { id: "developer", fallbacks: [] },
+};
+
+async function installProbeProviders(
+  dirs: string[],
+  onStream: () => void,
+  release: Promise<void>,
+): Promise<{ cwd: string }> {
+  const { createAssistantMessageEventStream } = await import(eventStreamSpecifier);
+  return installProviders(dirs, {
+    "pitako-probe": fakeProvider("pitako-probe", onStream, release, createAssistantMessageEventStream),
+  });
+}
+
+async function installSplitProviders(
+  dirs: string[],
+  onStream: () => void,
+  releaseA: Promise<void>,
+  releaseB: Promise<void>,
+): Promise<{ cwd: string }> {
+  const { createAssistantMessageEventStream } = await import(eventStreamSpecifier);
+  return installProviders(dirs, {
+    cursor: fakeProvider("cursor", onStream, releaseA, createAssistantMessageEventStream),
+    other: fakeProvider("other", onStream, releaseB, createAssistantMessageEventStream),
+  });
+}
+
+function installProviders(dirs: string[], providers: Record<string, unknown>): { cwd: string } {
+  const agentDir = mkdtempSync(path.join(tmpdir(), "pitako-probe-agent-"));
+  const cwd = mkdtempSync(path.join(tmpdir(), "pitako-probe-cwd-"));
+  dirs.push(agentDir, cwd);
+  mkdirSync(path.join(agentDir, "extensions"));
+  const names = Object.keys(providers);
+  const body = names.map((name) => `pi.registerProvider(${JSON.stringify(name)}, globalThis[${JSON.stringify(`__pitako_${name}`)}]);`).join("");
+  writeFileSync(path.join(agentDir, "extensions", "probe.js"), `export default function (pi) { ${body} }\n`);
+  for (const name of names) {
+    (globalThis as Record<string, unknown>)[`__pitako_${name}`] = providers[name];
+  }
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  return { cwd };
+}
+
+function fakeProvider(
+  provider: string,
+  onStream: () => void,
+  release: Promise<void>,
+  createAssistantMessageEventStream: () => {
+    push(event: unknown): void;
+    end(message: unknown): void;
+  },
+) {
+  return {
+    baseUrl: "http://127.0.0.1",
+    apiKey: "test",
+    api: "openai-completions",
+    models: [
+      {
+        id: "late",
+        name: provider,
+        reasoning: false,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 1000,
+        maxTokens: 64,
+      },
+    ],
+    streamSimple() {
+      onStream();
+      const stream = createAssistantMessageEventStream();
+      release.then(() => {
+        const message = {
+          role: "assistant",
+          content: [{ type: "text", text: "pong" }],
+          api: "openai-completions",
+          provider,
+          model: "late",
+          stopReason: "stop",
+          timestamp: Date.now(),
+          usage: {
+            input: 1,
+            output: 1,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 2,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+        };
+        stream.push({ type: "done", reason: "stop", message });
+        stream.end(message);
+      });
+      return stream;
+    },
+  };
+}
 
 function waitForAbort(signal: AbortSignal): Promise<void> {
   if (signal.aborted) return Promise.resolve();

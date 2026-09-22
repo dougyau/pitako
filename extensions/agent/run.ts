@@ -14,6 +14,7 @@ import {
   noteToolEnd,
   noteToolStart,
   stallInfo,
+  syncToolHold,
   startWatchdogTimer,
   type AgentActivityState,
   type StallInfo,
@@ -104,6 +105,8 @@ export interface AttemptExecutor {
     onActivity?: (event: { type?: string; toolName?: string; assistantMessageEvent?: { type?: string } }) => void;
     /** Fired only after setModel / session open succeeds. Not a second lifecycle. */
     onActivated?: (appliedReasoning: string) => void;
+    /** Per attempt. Not stored on a shared executor. Pass undefined to clear. */
+    bindActivityProbe?: (probe: (() => { name: string } | undefined) | undefined) => void;
   }): Promise<Attempt>;
 }
 
@@ -122,6 +125,7 @@ async function runAttempt(
     signal: AbortSignal;
     onActivity?: (event: { type?: string; toolName?: string; assistantMessageEvent?: { type?: string } }) => void;
     onActivated?: (appliedReasoning: string) => void;
+    bindActivityProbe?: (probe: (() => { name: string } | undefined) | undefined) => void;
   },
 ): Promise<Attempt> {
   try {
@@ -238,7 +242,19 @@ export async function runAgentInstance(input: {
   const child = new AbortController();
   const stopParent = input.signal ? watchAbort(input.signal, () => child.abort()) : () => {};
   let stall: StallInfo | undefined;
+  let activityProbe: (() => { name: string } | undefined) | undefined;
+  const bindActivityProbe = (probe: typeof activityProbe) => {
+    activityProbe = probe;
+    if (!probe) syncToolHold(activity, undefined, now());
+  };
   const timer = startWatchdogTimer(() => {
+    let hold: { name: string } | undefined;
+    try {
+      hold = activityProbe?.();
+    } catch {
+      hold = undefined;
+    }
+    syncToolHold(activity, hold, now());
     const before = activity.phase;
     const verdict = evaluateWatchdog(activity, input.watchdog ?? loaded.watchdog, now());
     if (activity.phase !== before) present();
@@ -263,7 +279,7 @@ export async function runAgentInstance(input: {
   present();
   try {
     return await agentScope.run({ instanceId: instance.id }, () =>
-      executeTargets(instance, role, task, targets, input.executor, child.signal, input.signal, activity, now, () => stall, onActivity, onActivated, present, view),
+      executeTargets(instance, role, task, targets, input.executor, child.signal, input.signal, activity, now, () => stall, onActivity, onActivated, present, view, bindActivityProbe),
     );
   } finally {
     timer.stop();
@@ -286,6 +302,7 @@ async function executeTargets(
   onActivated: (appliedReasoning: string) => void,
   present: () => void,
   view: { usage?: AgentUsage; error?: string },
+  bindActivityProbe: (probe: (() => { name: string } | undefined) | undefined) => void,
 ): Promise<AgentRunResult> {
   instance.status = "running";
   let session: AttemptSession | undefined;
@@ -325,7 +342,9 @@ async function executeTargets(
         signal,
         onActivity,
         onActivated,
+        bindActivityProbe,
       });
+      bindActivityProbe(undefined);
       const stall = stalled();
       if (stall && !parentSignal?.aborted) {
         return done("failed", formatStall(stall), target, index);

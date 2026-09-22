@@ -33,6 +33,15 @@ export function createPiExecutor(): AttemptExecutor {
   };
 }
 
+/** Cursor-native exec emits no Pi tool event. Missing provider does not throw. */
+export function cursorStreamHold(session: {
+  model?: { provider?: string } | null;
+  isStreaming?: boolean;
+}): { name: string } | undefined {
+  if (session.model?.provider === "cursor" && session.isStreaming) return { name: "cursor-native" };
+  return undefined;
+}
+
 async function runTarget(
   runtime: ModelRuntime,
   target: ModelTarget,
@@ -44,6 +53,7 @@ async function runTarget(
     signal: AbortSignal;
     onActivity?: Parameters<AttemptExecutor["start"]>[0]["onActivity"];
     onActivated?: (appliedReasoning: string) => void;
+    bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
   },
   existing?: AgentSession,
 ): Promise<Attempt> {
@@ -118,6 +128,7 @@ async function bindThenRun(
     signal: AbortSignal;
     onActivity?: Parameters<AttemptExecutor["start"]>[0]["onActivity"];
     onActivated?: (appliedReasoning: string) => void;
+    bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
   },
 ): Promise<Attempt> {
   let session: AgentSession;
@@ -193,49 +204,56 @@ async function drive(
     signal: AbortSignal;
     onActivity?: (event: { type?: string; toolName?: string; assistantMessageEvent?: { type?: string } }) => void;
     onActivated?: (appliedReasoning: string) => void;
+    bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
   },
 ): Promise<Attempt> {
-  let sideEffects = false;
-  const tools: Record<string, number> = {};
-  const unsubscribe = session.subscribe((event) => {
-    input.onActivity?.(event);
-    if (event.type === "tool_execution_start" && marksSideEffect(event.toolName)) sideEffects = true;
-    if (event.type === "tool_execution_end") tools[event.toolName] = (tools[event.toolName] ?? 0) + 1;
-  });
-  const handle = resume(session, runtime, input);
-  const before = usageFrom(session, {});
-  if (input.signal.aborted) {
-    await session.abort();
-    return { status: "cancelled", result: "cancelled", sideEffects, usage: attemptUsage(before, session, tools), session: handle };
-  }
-  const stopWatch = watchAbort(input.signal, () => {
-    void session.abort();
-  });
+  // continueWith skips executor.start. The probe closes over this session only.
+  input.bindActivityProbe?.(() => cursorStreamHold(session));
   try {
-    await session.prompt(prompt, { expandPromptTemplates: false });
-    const assistant = lastAssistant(session);
+    let sideEffects = false;
+    const tools: Record<string, number> = {};
+    const unsubscribe = session.subscribe((event) => {
+      input.onActivity?.(event);
+      if (event.type === "tool_execution_start" && marksSideEffect(event.toolName)) sideEffects = true;
+      if (event.type === "tool_execution_end") tools[event.toolName] = (tools[event.toolName] ?? 0) + 1;
+    });
+    const handle = resume(session, runtime, input);
+    const before = usageFrom(session, {});
     if (input.signal.aborted) {
-      return { status: "cancelled", result: "cancelled", sideEffects, usage: attemptUsage(before, session, tools), appliedReasoning: session.thinkingLevel, session: handle };
-    }
-    if (assistant?.stopReason === "aborted" || assistant?.stopReason === "error") {
-      return failedAttempt(assistant.errorMessage ?? assistant.stopReason ?? "provider error", sideEffects, handle, session, attemptUsage(before, session, tools));
-    }
-    return {
-      status: "completed",
-      result: textOf(assistant),
-      sideEffects,
-      usage: attemptUsage(before, session, tools),
-      appliedReasoning: session.thinkingLevel,
-      session: handle,
-    };
-  } catch (error) {
-    if (input.signal.aborted) {
+      await session.abort();
       return { status: "cancelled", result: "cancelled", sideEffects, usage: attemptUsage(before, session, tools), session: handle };
     }
-    return failedAttempt(messageOf(error), sideEffects, handle, session, attemptUsage(before, session, tools));
+    const stopWatch = watchAbort(input.signal, () => {
+      void session.abort();
+    });
+    try {
+      await session.prompt(prompt, { expandPromptTemplates: false });
+      const assistant = lastAssistant(session);
+      if (input.signal.aborted) {
+        return { status: "cancelled", result: "cancelled", sideEffects, usage: attemptUsage(before, session, tools), appliedReasoning: session.thinkingLevel, session: handle };
+      }
+      if (assistant?.stopReason === "aborted" || assistant?.stopReason === "error") {
+        return failedAttempt(assistant.errorMessage ?? assistant.stopReason ?? "provider error", sideEffects, handle, session, attemptUsage(before, session, tools));
+      }
+      return {
+        status: "completed",
+        result: textOf(assistant),
+        sideEffects,
+        usage: attemptUsage(before, session, tools),
+        appliedReasoning: session.thinkingLevel,
+        session: handle,
+      };
+    } catch (error) {
+      if (input.signal.aborted) {
+        return { status: "cancelled", result: "cancelled", sideEffects, usage: attemptUsage(before, session, tools), session: handle };
+      }
+      return failedAttempt(messageOf(error), sideEffects, handle, session, attemptUsage(before, session, tools));
+    } finally {
+      stopWatch();
+      unsubscribe();
+    }
   } finally {
-    stopWatch();
-    unsubscribe();
+    input.bindActivityProbe?.(undefined);
   }
 }
 
@@ -266,6 +284,7 @@ function resume(
     cwd: string;
     onActivity?: Parameters<AttemptExecutor["start"]>[0]["onActivity"];
     onActivated?: (appliedReasoning: string) => void;
+    bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
   },
 ): NonNullable<Attempt["session"]> {
   let disposed = false;
