@@ -9,7 +9,7 @@ import { currentInstanceId, agentScope } from "../extensions/agent/scope.ts";
 import { marksSideEffect, toolEffect } from "../extensions/agent/effects.ts";
 import { classifyProviderFailure } from "../extensions/agent/fallback.ts";
 import { activateTarget, thinkingLevelFor } from "../extensions/agent/pi.ts";
-import { childInstructions, formatAgentResult, runAgentInstance, skillNamesForRole, type Attempt, type AttemptExecutor } from "../extensions/agent/run.ts";
+import { childInstructions, formatAgentResult, runAgentInstance, skillNamesForRole, usageDelta, type Attempt, type AttemptExecutor } from "../extensions/agent/run.ts";
 import { childSessionNote } from "../extensions/profile.ts";
 import { registerExecution, resolveBoardAuthor, unregisterExecution } from "../extensions/execution-identity.ts";
 import { childActiveTools } from "../extensions/profile.ts";
@@ -101,9 +101,28 @@ describe("agent instance", () => {
     expect(cancelled.status).toBe("cancelled");
     expect(cancelled.model.selectedModel).toBe("example/primary");
     expect(cancelled.model.requestedModel).toBe("example/primary");
-    expect(cancelled.model.fallbackReason).toBe("rate_limit");
+    expect(cancelled.model.fallbackOccurred).toBeFalsy();
+    expect(cancelled.model.fallbackReason).toBeUndefined();
+    expect(cancelled.model.lastFailure).toBe("rate_limit");
+    expect(formatAgentResult(cancelled)).not.toContain("fallback:");
     expect(cancelled.model.fallbackIndex).toBeUndefined();
     expect(cancelled.usage?.input).toBe(7);
+
+    const leaked = scripted([
+      { status: "failed", result: "", error: "429 rate limit", sideEffects: false, appliedReasoning: "high" },
+      { status: "failed", result: "", error: "No API key for example/fallback-1", sideEffects: false },
+    ]);
+    const cleared = await runAgentInstance({
+      roleId: "architect",
+      task: "review the boundary",
+      cwd: packageRoot(),
+      executor: leaked,
+      load: configured,
+    });
+    expect(cleared.status).toBe("failed");
+    expect(cleared.model.selectedModel).toBe("example/fallback-1");
+    expect(cleared.model.requestedReasoning).toBe("xhigh");
+    expect(cleared.model.appliedReasoning).toBeUndefined();
   });
   test("resolves architect, isolates context, and does not replay side effects", async () => {
     const env = tempEnv();
@@ -167,7 +186,7 @@ reasoning = "medium"
       {
         status: "failed",
         result: "",
-        error: "503 unavailable",
+        error: "503 Service Unavailable",
         sideEffects: true,
         session: {
           async continueWith(target, note) {
@@ -293,10 +312,13 @@ reasoning = "medium"
     expect(classifyProviderFailure("compilation failed")).toBeUndefined();
     expect(classifyProviderFailure(undefined)).toBeUndefined();
     expect(classifyProviderFailure("No API key for cursor/grok-4.7")).toBe("auth");
+    expect(classifyProviderFailure("HTTP 500")).toBe("unavailable");
     expect(classifyProviderFailure("500 Internal Server Error")).toBe("unavailable");
-    expect(classifyProviderFailure("OpenAI API error (502): bad gateway")).toBe("unavailable");
-    expect(classifyProviderFailure("503 service unavailable")).toBe("unavailable");
-    expect(classifyProviderFailure("504 gateway timeout")).toBe("unavailable");
+    expect(classifyProviderFailure("status code 503")).toBe("unavailable");
+    expect(classifyProviderFailure("502 Bad Gateway")).toBe("unavailable");
+    expect(classifyProviderFailure("504 Gateway Timeout")).toBe("unavailable");
+    expect(classifyProviderFailure("you requested 500 tokens")).toBeUndefined();
+    expect(classifyProviderFailure("processed 503 records")).toBeUndefined();
     expect(classifyProviderFailure("fetch failed")).toBe("unavailable");
     expect(classifyProviderFailure("socket hang up")).toBe("unavailable");
     expect(classifyProviderFailure("ECONNRESET")).toBe("unavailable");
@@ -310,6 +332,48 @@ reasoning = "medium"
     expect(thinkingLevelFor("high")).toBe("high");
     expect(childSessionNote("architect-1")).not.toContain("whatever the user selected");
     expect(childInstructions(resolveRole("architect", { env: tempEnv() }), "architect-1")).toContain("ModelPolicy");
+  });
+
+  test("500 status code (no body) is unavailable", () => {
+    expect(classifyProviderFailure("500 status code (no body)")).toBe("unavailable");
+    expect(classifyProviderFailure("502 status code (no body)")).toBe("unavailable");
+    expect(classifyProviderFailure("503 status code (no body)")).toBe("unavailable");
+    expect(classifyProviderFailure("504 status code (no body)")).toBe("unavailable");
+    expect(classifyProviderFailure("520 status code (no body)")).toBe("unavailable");
+    expect(classifyProviderFailure("524 status code (no body)")).toBe("unavailable");
+  });
+
+  test("prefix (500): ... is unavailable", () => {
+    expect(classifyProviderFailure("prefix (500): ...")).toBe("unavailable");
+    expect(classifyProviderFailure("prefix (502): ...")).toBe("unavailable");
+    expect(classifyProviderFailure("prefix (503): ...")).toBe("unavailable");
+    expect(classifyProviderFailure("prefix (504): ...")).toBe("unavailable");
+    expect(classifyProviderFailure("prefix (520): ...")).toBe("unavailable");
+    expect(classifyProviderFailure("prefix (524): ...")).toBe("unavailable");
+  });
+
+  test("500: body is unavailable", () => {
+    expect(classifyProviderFailure("500: body")).toBe("unavailable");
+    expect(classifyProviderFailure("502: body")).toBe("unavailable");
+    expect(classifyProviderFailure("503: body")).toBe("unavailable");
+    expect(classifyProviderFailure("504: body")).toBe("unavailable");
+    expect(classifyProviderFailure("520: body")).toBe("unavailable");
+    expect(classifyProviderFailure("524: body")).toBe("unavailable");
+  });
+
+  test("HTTP/1.1 500 is unavailable", () => {
+    expect(classifyProviderFailure("HTTP/1.1 500")).toBe("unavailable");
+    expect(classifyProviderFailure("HTTP/1.1 502")).toBe("unavailable");
+    expect(classifyProviderFailure("HTTP/1.1 503")).toBe("unavailable");
+    expect(classifyProviderFailure("HTTP/1.1 504")).toBe("unavailable");
+    expect(classifyProviderFailure("HTTP/1.1 520")).toBe("unavailable");
+    expect(classifyProviderFailure("HTTP/1.1 524")).toBe("unavailable");
+  });
+
+  test("500 tokens does not classify", () => {
+    expect(classifyProviderFailure("500 tokens")).toBeUndefined();
+    expect(classifyProviderFailure("see 500")).toBeUndefined();
+    expect(classifyProviderFailure("500")).toBeUndefined();
   });
 
   test("Board author follows the instance and todos stay on the session id", async () => {
@@ -377,6 +441,21 @@ reasoning = "medium"
     expect(names).toContain("ls");
     expect(names).toContain("read");
     expect(names).not.toContain("agent_run");
+    const unix = childActiveTools(["read", "bash", "powershell", "agent_run"], "linux");
+    expect(unix).toContain("bash");
+    expect(unix).not.toContain("powershell");
+    const windows = childActiveTools(["read", "bash", "powershell", "agent_run"], "win32");
+    expect(windows).toContain("powershell");
+    expect(windows).not.toContain("agent_run");
+    const before = { input: 100, output: 10, cacheRead: 5, cacheWrite: 1, total: 116, cost: 0.1, turns: 2, toolCalls: 3, tools: { grep: 2 }, contextTokens: 1000 };
+    const after = { input: 300, output: 40, cacheRead: 15, cacheWrite: 1, total: 356, cost: 0.4, turns: 5, toolCalls: 6, tools: { grep: 4, read: 1 }, contextTokens: 2000 };
+    const delta = usageDelta(before, after);
+    expect(delta?.input).toBe(200);
+    expect(delta?.cacheRead).toBe(10);
+    expect(delta?.turns).toBe(3);
+    expect(delta?.cost).toBeCloseTo(0.3);
+    expect(delta?.contextTokens).toBe(2000);
+    expect(delta?.tools).toEqual({ grep: 2, read: 1 });
 
     const parent = SessionManager.inMemory(packageRoot());
     const child = SessionManager.inMemory(packageRoot());

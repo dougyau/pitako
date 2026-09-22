@@ -11,8 +11,13 @@ import {
 import { registerExecution, unregisterExecution } from "../execution-identity.ts";
 import { childActiveTools } from "../profile.ts";
 import { marksSideEffect } from "./effects.ts";
-import { childInstructions, skillNamesForRole, type AgentUsage, type Attempt, type AttemptExecutor } from "./run.ts";
+import { childInstructions, skillNamesForRole, usageDelta, type AgentUsage, type Attempt, type AttemptExecutor } from "./run.ts";
 import type { ModelTarget, ReasoningLevel } from "../roles/types.ts";
+
+// Package entry does not re-export this. Import the file next to the resolved entry.
+export const { DEFAULT_THINKING_LEVEL } = await import(
+  new URL("./core/defaults.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href,
+) as { DEFAULT_THINKING_LEVEL: ThinkingLevel };
 
 /** Omitted reasoning is not forced to medium. Pi keeps its own default. */
 export function thinkingLevelFor(reasoning: ReasoningLevel | undefined): ThinkingLevel | undefined {
@@ -49,7 +54,12 @@ async function runTarget(
   if (!session) {
     try {
       session = await openSession(runtime, model, target, input);
+      if (input.signal.aborted) {
+        await resume(session, runtime, input).dispose();
+        return { status: "cancelled", result: "cancelled", sideEffects: false };
+      }
     } catch (error) {
+      if (input.signal.aborted) return { status: "cancelled", result: "cancelled", sideEffects: false };
       return { status: "failed", result: "", error: messageOf(error), sideEffects: false };
     }
   } else {
@@ -65,14 +75,24 @@ export async function activateTarget(
   session: {
     setModel(model: NonNullable<ReturnType<ModelRuntime["getModel"]>>, options?: { persist?: boolean }): Promise<void>;
     setThinkingLevel(level: ThinkingLevel): void;
+    settingsManager?: {
+      getModelThinkingLevel(provider: string, modelId: string): ThinkingLevel | undefined;
+      getDefaultThinkingLevel(): ThinkingLevel | undefined;
+    };
   },
   model: NonNullable<ReturnType<ModelRuntime["getModel"]>>,
   target: ModelTarget,
 ): Promise<string | undefined> {
   try {
     await session.setModel(model, { persist: false });
-    const level = thinkingLevelFor(target.reasoning);
-    if (level) session.setThinkingLevel(level);
+    // setModel keeps the previous level when settings have no default.
+    const settings = session.settingsManager;
+    session.setThinkingLevel(
+      thinkingLevelFor(target.reasoning)
+        ?? settings?.getModelThinkingLevel(model.provider, model.id)
+        ?? settings?.getDefaultThinkingLevel()
+        ?? DEFAULT_THINKING_LEVEL,
+    );
     return undefined;
   } catch (error) {
     return messageOf(error);
@@ -125,43 +145,49 @@ async function drive(
     role: Parameters<AttemptExecutor["start"]>[0]["role"];
     cwd: string;
     signal: AbortSignal;
+    onActivity?: (event: { type?: string; toolName?: string; assistantMessageEvent?: { type?: string } }) => void;
   },
 ): Promise<Attempt> {
   let sideEffects = false;
   const tools: Record<string, number> = {};
   const unsubscribe = session.subscribe((event) => {
+    input.onActivity?.(event);
     if (event.type === "tool_execution_start" && marksSideEffect(event.toolName)) sideEffects = true;
     if (event.type === "tool_execution_end") tools[event.toolName] = (tools[event.toolName] ?? 0) + 1;
   });
-  const abort = () => {
-    void session.abort();
-  };
-  input.signal.addEventListener("abort", abort, { once: true });
   const handle = resume(session, runtime, input);
+  const before = usageFrom(session, {});
+  if (input.signal.aborted) {
+    await session.abort();
+    return { status: "cancelled", result: "cancelled", sideEffects, usage: attemptUsage(before, session, tools), session: handle };
+  }
+  const stopWatch = watchAbort(input.signal, () => {
+    void session.abort();
+  });
   try {
     await session.prompt(prompt, { expandPromptTemplates: false });
     const assistant = lastAssistant(session);
     if (input.signal.aborted) {
-      return { status: "cancelled", result: "cancelled", sideEffects, usage: usageFrom(session, tools), appliedReasoning: session.thinkingLevel, session: handle };
+      return { status: "cancelled", result: "cancelled", sideEffects, usage: attemptUsage(before, session, tools), appliedReasoning: session.thinkingLevel, session: handle };
     }
     if (assistant?.stopReason === "aborted" || assistant?.stopReason === "error") {
-      return failedAttempt(assistant.errorMessage ?? assistant.stopReason ?? "provider error", sideEffects, handle, session, tools);
+      return failedAttempt(assistant.errorMessage ?? assistant.stopReason ?? "provider error", sideEffects, handle, session, attemptUsage(before, session, tools));
     }
     return {
       status: "completed",
       result: textOf(assistant),
       sideEffects,
-      usage: usageFrom(session, tools),
+      usage: attemptUsage(before, session, tools),
       appliedReasoning: session.thinkingLevel,
       session: handle,
     };
   } catch (error) {
     if (input.signal.aborted) {
-      return { status: "cancelled", result: "cancelled", sideEffects, usage: usageFrom(session, tools), session: handle };
+      return { status: "cancelled", result: "cancelled", sideEffects, usage: attemptUsage(before, session, tools), session: handle };
     }
-    return failedAttempt(messageOf(error), sideEffects, handle, session, tools);
+    return failedAttempt(messageOf(error), sideEffects, handle, session, attemptUsage(before, session, tools));
   } finally {
-    input.signal.removeEventListener("abort", abort);
+    stopWatch();
     unsubscribe();
   }
 }
@@ -171,14 +197,14 @@ function failedAttempt(
   sideEffects: boolean,
   handle: NonNullable<Attempt["session"]>,
   session: AgentSession,
-  tools: Record<string, number>,
+  usage: AgentUsage | undefined,
 ): Attempt {
   return {
     status: "failed",
     result: "",
     error,
     sideEffects,
-    usage: usageFrom(session, tools),
+    usage,
     appliedReasoning: session.thinkingLevel,
     session: handle,
   };
@@ -223,6 +249,27 @@ function textOf(message: { content?: Array<{ type?: string; text?: string }> } |
   return text.length > 0 ? text : "(no final result)";
 }
 
+export function watchAbort(signal: AbortSignal, onAbort: () => void): () => void {
+  if (signal.aborted) {
+    onAbort();
+    return () => {};
+  }
+  const listener = () => onAbort();
+  signal.addEventListener("abort", listener, { once: true });
+  if (signal.aborted) {
+    signal.removeEventListener("abort", listener);
+    onAbort();
+    return () => {};
+  }
+  return () => signal.removeEventListener("abort", listener);
+}
+
+function attemptUsage(before: AgentUsage, session: AgentSession, tools: Record<string, number>): AgentUsage | undefined {
+  const delta = usageDelta(before, usageFrom(session, {}));
+  if (!delta) return undefined;
+  return { ...delta, tools, contextTokens: usageFrom(session, {}).contextTokens };
+}
+
 function usageFrom(session: AgentSession, tools: Record<string, number>): AgentUsage {
   const stats = session.getSessionStats();
   const contextTokens = stats.contextUsage?.tokens ?? undefined;
@@ -244,6 +291,3 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function isAbort(error: unknown): boolean {
-  return error instanceof Error && (error.name === "AbortError" || /abort/i.test(error.message));
-}

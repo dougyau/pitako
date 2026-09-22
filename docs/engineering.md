@@ -80,7 +80,9 @@ Board author is resolved from a process-shared session registry, not AsyncLocalS
 
 Target activation is part of fallback. `setModel` throwing `No API key` is an auth failure, and the next target is tried. Unknown throws are not. Pi tools have no mutating flag. Known read-only names do not mark side effects. Every other name does. After that flag is set, fallback continues the same session and does not send the original task again. `reasoning = default` is not rewritten to `medium`.
 
-A child session does not receive the foreground sentence that the user selected the model. `SessionStats.tokens.input` is cumulative billed input across turns. It cannot be split into skills, tool output, or file reads. The earlier Architect figure of 472440 input tokens is that cumulative total, not one prompt.
+A child session does not receive the foreground sentence that the user selected the model. `SessionStats` counters are cumulative, so same-session fallback records a delta, not a second absolute snapshot. `contextTokens` is a gauge and keeps the latest value. HTTP 5xx text classifies only with status wording, not a bare number. A fallback line is printed only after a fallback target starts. An already-aborted signal disposes the child before `prompt`. Windows child sessions include `powershell` when Pi registered it.
+
+AgentInstance has no 20-minute deadline. The stops at that mark came from the parent tool timeout around `pi --mode json`, not from this package. Pi's HTTP idle timeout defaults to 5 minutes and stays a transport concern. The Pitako watchdog aborts only after confirmed inactivity: 10 minutes idle, 45 minutes during a tool, unless `max_run_time` is set above 0. Cache-warming events do not refresh activity. A stall is a terminal failure and does not fall back.
 
 ## Dogfood
 

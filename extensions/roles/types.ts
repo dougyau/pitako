@@ -1,4 +1,5 @@
 import type { ThinkingLevel } from "@earendil-works/pi-ai";
+import type { WatchdogConfig } from "../agent/watchdog.ts";
 
 /** Pi thinking levels, plus `off`. Omitting reasoning means "use Pi's session default later." */
 export const REASONING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
@@ -72,6 +73,7 @@ export interface PitakoConfig {
   userConfigPresent: boolean;
   roles: Readonly<Record<string, RoleDefinition>>;
   policies: Readonly<Record<string, ModelPolicy>>;
+  watchdog: WatchdogConfig;
 }
 
 /** Fields Pi's `getSupportedThinkingLevels` reads. Not a second model registry. */

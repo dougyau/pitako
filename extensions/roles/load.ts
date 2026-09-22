@@ -5,6 +5,7 @@ import { parse } from "smol-toml";
 import { getPitakoConfigPath } from "../board/paths.ts";
 import { DEFAULT_SKILL_NAMES, OPTIONAL_LANGUAGE_SKILLS } from "../catalog.ts";
 import { PitakoConfigError } from "../errors.ts";
+import { DEFAULT_WATCHDOG, mergeWatchdog, parseWatchdogConfig } from "../agent/watchdog.ts";
 import { packageRoot } from "../stack.ts";
 import {
   ROLE_IDS,
@@ -28,7 +29,7 @@ export interface LoadOptions {
   availableModels?: readonly ModelCapability[];
 }
 
-const ROOT_KEYS = new Set(["roles", "model_policies"]);
+const ROOT_KEYS = new Set(["roles", "model_policies", "agent_runtime"]);
 const ROLE_KEYS = new Set(["name", "description", "instructions", "model_policy", "skills", "principles"]);
 const POLICY_KEYS = new Set(["primary", "fallbacks"]);
 const TARGET_KEYS = new Set(["model", "reasoning"]);
@@ -88,22 +89,23 @@ function parseBuiltin(defaultsPath: string, root: string): PitakoConfig {
       throw new PitakoConfigError(`${defaultsPath}: unknown role "${id}"`);
     }
   }
-  return { defaultsPath, userConfigPath: "", userConfigPresent: false, roles, policies };
+  return { defaultsPath, userConfigPath: "", userConfigPresent: false, roles, policies, watchdog: parseWatchdogConfig(raw.watchdog, defaultsPath) };
 }
 
-function readUserConfig(userConfigPath: string): { present: boolean; roles: Record<string, RawRole>; policies: Record<string, RawPolicy> } {
+function readUserConfig(userConfigPath: string): { present: boolean; roles: Record<string, RawRole>; policies: Record<string, RawPolicy>; watchdog?: unknown } {
   if (!existsSync(userConfigPath)) return { present: false, roles: {}, policies: {} };
   const raw = readToml(userConfigPath);
   return {
     present: true,
     roles: parseRoleOverrides(raw.roles, userConfigPath),
     policies: parsePolicyTables(raw.policies, userConfigPath) ?? {},
+    watchdog: raw.watchdog,
   };
 }
 
 function mergeConfig(
   builtin: PitakoConfig,
-  user: { present: boolean; roles: Record<string, RawRole>; policies: Record<string, RawPolicy> },
+  user: { present: boolean; roles: Record<string, RawRole>; policies: Record<string, RawPolicy>; watchdog?: unknown },
   userConfigPath: string,
   availableModels: readonly ModelCapability[] | undefined,
 ): PitakoConfig {
@@ -135,6 +137,7 @@ function mergeConfig(
     userConfigPresent: user.present,
     roles,
     policies,
+    watchdog: mergeWatchdog(builtin.watchdog ?? DEFAULT_WATCHDOG, user.watchdog, userConfigPath),
   };
   if (availableModels) validateAgainstModels(config, availableModels);
   return config;
@@ -237,6 +240,7 @@ function requirePolicy(config: PitakoConfig, id: string): ModelPolicy {
 interface RawDocument {
   roles: unknown;
   policies: unknown;
+  watchdog: unknown;
 }
 
 interface RawRole {
@@ -263,7 +267,7 @@ function readToml(file: string): RawDocument {
   }
   const record = expectRecord(parsed, file, "");
   rejectUnknown(record, ROOT_KEYS, file, "");
-  return { roles: record.roles, policies: record.model_policies };
+  return { roles: record.roles, policies: record.model_policies, watchdog: record.agent_runtime };
 }
 
 function parseRoles(value: unknown, file: string, packageRootDir: string, stayInside: string): Record<string, RoleDefinition> {

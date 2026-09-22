@@ -80,6 +80,11 @@ principles = [
   "principle-prove-it-works",
 ]
 
+[agent_runtime]
+idle_timeout = "10m"
+tool_stall_timeout = "45m"
+max_run_time = "0"
+
 [model_policies.coordinator]
 [model_policies.architect]
 [model_policies.developer]

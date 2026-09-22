@@ -29,9 +29,13 @@ export function parseProfile(value: unknown): ProfileName {
   );
 }
 
-/** Coding tools for a child session, applied at construction. Excludes agent_run. */
-export function childActiveTools(available: readonly string[], includePowerShell = false): string[] {
-  return toolsForProfile({ available, profile: "coding", includePowerShell }).filter((name) => name !== "agent_run");
+/** Coding tools for a child session. PowerShell follows the platform, same as a fresh coding profile. */
+export function childActiveTools(available: readonly string[], platform: NodeJS.Platform = process.platform): string[] {
+  return toolsForProfile({
+    available,
+    profile: "coding",
+    includePowerShell: platform === "win32" && available.includes("powershell"),
+  }).filter((name) => name !== "agent_run");
 }
 
 export function toolsForProfile(options: {

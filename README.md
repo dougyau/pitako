@@ -138,6 +138,15 @@ The result can include turns, input, output, cache tokens, cost, and tool-call c
 
 The child cannot call `agent_run`. There is no background mode, resume, or team.
 
+There is no fixed wall-clock deadline. A run ends for inactivity, not because it is old. The default idle window is 10 minutes with no tool running, and 45 minutes while a tool is running. `max_run_time = "0"` means unlimited. Parent cancellation is immediate and is not a stall. A stall does not switch models. Prompt-cache warming does not count as progress. Pi's HTTP idle timeout is a separate transport limit and is left unchanged.
+
+```toml
+[agent_runtime]
+idle_timeout = "10m"
+tool_stall_timeout = "45m"
+max_run_time = "0"
+```
+
 ## What this is not yet
 
 Pitako does not implement teams, subteams, or Coordinator delegation. AgentInstance v0 runs one isolated role at a time. Session TODOs are local execution plans. The Board is not a team roster or a memory store.

@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import { createAgentSession, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { classifyProviderFailure } from "../extensions/agent/fallback.ts";
-import { activateTarget } from "../extensions/agent/pi.ts";
+import { activateTarget, DEFAULT_THINKING_LEVEL } from "../extensions/agent/pi.ts";
 import { childActiveTools } from "../extensions/profile.ts";
 
 const tempDirs: string[] = [];
@@ -110,9 +110,25 @@ describe("pi adapter boundary", () => {
         model,
         { model: "example/default" },
       );
-      expect(levels).toEqual([]);
+      expect(levels).toEqual([DEFAULT_THINKING_LEVEL]);
     } finally {
       session.dispose();
     }
   }, 60_000);
+
+  test("continue without reasoning does not inherit xhigh", async () => {
+    let level = "xhigh";
+    await activateTarget(
+      {
+        async setModel() {},
+        setThinkingLevel(next: string) {
+          level = next;
+        },
+      },
+      { provider: "example", id: "continue" } as never,
+      { model: "example/continue" },
+    );
+    expect(level).not.toBe("xhigh");
+    expect(level).toBe(DEFAULT_THINKING_LEVEL);
+  });
 });
