@@ -2,6 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { skillStatusLines } from "./catalog.ts";
 import { PitakoConfigError } from "./errors.ts";
 import { isProtectedEditPath } from "./paths.ts";
+import { canonicalPath } from "./board/paths.ts";
 import { bindBackgroundOwner, shutdownBackground, takeHeldCompletions } from "./agent/background.ts";
 import { bindAgentUi, listObservations, unbindAgentUi } from "./agent/observe.ts";
 import { formatAgentsDetail } from "./agent/ui.ts";
@@ -11,6 +12,10 @@ import { inspectPitako } from "./roles/format.ts";
 import { registerSupervisedSession, unregisterSupervisedSession } from "./herdr/author.ts";
 import { registerAgentSupervise } from "./herdr/supervise.ts";
 import { packageRoot, prepareRuntime } from "./stack.ts";
+import { planHeading, planInvocation, sessionNameAction } from "./session-name.ts";
+import { parsePlanDocument, planFile } from "./workflow.ts";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 
 function requestedProfile(pi: ExtensionAPI): ProfileName {
   const flag = pi.getFlag("pitako-profile");
@@ -89,9 +94,14 @@ export default function pitako(pi: ExtensionAPI) {
     } else {
       applyProfile(pi, profile);
     }
-    if (!pi.getSessionName()) pi.setSessionName(`pitako:${profile}`);
+    const entries = ctx.sessionManager?.getEntries?.() ?? [];
+    const existingUserText = firstUserText(entries);
+    const invocation = latestPlanInvocation(entries);
+    const workflow = invocation && readWorkflowTitle(invocation.activity, invocation.id, ctx.cwd);
+    const action = sessionNameAction({ current: pi.getSessionName(), existingUserText, workflow });
+    if (action.set !== undefined) pi.setSessionName(action.set);
     if (ctx.hasUI) {
-      ctx.ui.setStatus("pitako", `pitako:${profile}`);
+      ctx.ui.setStatus("pitako", pi.getSessionName() || undefined);
       bindAgentUi({
         setStatus: (key, text) => ctx.ui.setStatus(key, text),
         modelLookup: (provider, id) => ctx.modelRegistry?.find(provider, id),
@@ -123,7 +133,21 @@ export default function pitako(pi: ExtensionAPI) {
   pi.on("session_compact_failed", flush);
   pi.on("session_tree", flush);
 
-  pi.on("before_agent_start", async (event) => {
+  pi.on("before_agent_start", async (event, ctx) => {
+    const entries = ctx.sessionManager?.getEntries?.() ?? [];
+    const existingUserText = firstUserText(entries);
+    const pendingPrompt = existingUserText ? undefined : event.prompt;
+    const invocation = planInvocation(event.prompt);
+    const workflow = invocation && readWorkflowTitle(invocation.activity, invocation.id, ctx.cwd);
+    const action = sessionNameAction({
+      current: pi.getSessionName(),
+      existingUserText,
+      pendingPrompt,
+      workflow,
+    });
+    if (action.set !== undefined) pi.setSessionName(action.set);
+    if (ctx.hasUI) ctx.ui.setStatus("pitako", pi.getSessionName() || undefined);
+
     const instanceId = currentInstanceId();
     const note = instanceId ? childSessionNote(instanceId) : profileNote(profile);
     const current = event.systemPrompt ?? "";
@@ -161,9 +185,7 @@ export default function pitako(pi: ExtensionAPI) {
       if (command === "profile" && value) {
         profile = parseProfile(value);
         const tools = applyProfile(pi, profile);
-        pi.setSessionName(`pitako:${profile}`);
         if (ctx.hasUI) {
-          ctx.ui.setStatus("pitako", `pitako:${profile}`);
           ctx.ui.notify(`Pitako profile: ${profile} (${tools.length} tools)`, "info");
         }
         return;
@@ -183,6 +205,32 @@ export default function pitako(pi: ExtensionAPI) {
     },
   });
 
+  pi.on("tool_result", async (event, ctx) => {
+    if (event.isError || (event.toolName !== "write" && event.toolName !== "edit")) return undefined;
+    const target = event.input.path;
+    if (typeof target !== "string") return undefined;
+    const filename = path.basename(path.resolve(ctx.cwd, target));
+    if (!filename.endsWith(".md")) return undefined;
+    const id = filename.slice(0, -3);
+    let file: string;
+    try {
+      file = planFile(id, ctx.cwd);
+    } catch {
+      return undefined;
+    }
+    if (canonicalPath(target, ctx.cwd) !== file) return undefined;
+    const workflow = readWorkflowTitle("plan", id, ctx.cwd);
+    if (!workflow) return undefined;
+    const action = sessionNameAction({
+      current: pi.getSessionName(),
+      existingUserText: firstUserText(ctx.sessionManager?.getEntries?.() ?? []),
+      workflow: { ...workflow, fromPlanWrite: true },
+    });
+    if (action.set !== undefined) pi.setSessionName(action.set);
+    if (ctx.hasUI) ctx.ui.setStatus("pitako", pi.getSessionName() || undefined);
+    return undefined;
+  });
+
   pi.on("tool_call", async (event, ctx) => {
     if (event.toolName !== "edit" && event.toolName !== "write") return undefined;
     const input = event.input as { path?: unknown };
@@ -192,6 +240,51 @@ export default function pitako(pi: ExtensionAPI) {
     if (ctx.hasUI) ctx.ui.notify(reason, "warning");
     return { block: true, reason };
   });
+}
+
+function latestPlanInvocation(entries: readonly unknown[]): { activity: "plan" | "execute"; id: string } | undefined {
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const entry = entries[index];
+    if (!entry || typeof entry !== "object" || (entry as { type?: unknown }).type !== "message") continue;
+    const message = (entry as { message?: unknown }).message;
+    if (!message || typeof message !== "object" || (message as { role?: unknown }).role !== "user") continue;
+    const text = userMessageText(message);
+    const invocation = planInvocation(text);
+    if (invocation) return invocation;
+  }
+  return undefined;
+}
+
+function readWorkflowTitle(activity: "plan" | "execute", id: string, cwd: string): { activity: "plan" | "execute"; title: string } | undefined {
+  try {
+    const text = readFileSync(planFile(id, cwd), "utf8");
+    if (parsePlanDocument(text).id !== id) return undefined;
+    return { activity, title: planHeading(text) ?? id };
+  } catch {
+    return undefined;
+  }
+}
+
+function userMessageText(message: unknown): string {
+  const content = (message as { content?: unknown }).content;
+  return typeof content === "string"
+    ? content
+    : Array.isArray(content)
+      ? content.filter((part): part is { type: string; text: string } =>
+          !!part && typeof part === "object" && (part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string")
+        .map((part) => part.text).join("")
+      : "";
+}
+
+function firstUserText(entries: readonly unknown[]): string | undefined {
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object" || (entry as { type?: unknown }).type !== "message") continue;
+    const message = (entry as { message?: unknown }).message;
+    if (!message || typeof message !== "object" || (message as { role?: unknown }).role !== "user") continue;
+    const text = userMessageText(message);
+    if (text.trim()) return text;
+  }
+  return undefined;
 }
 
 function notify(

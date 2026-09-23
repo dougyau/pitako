@@ -339,9 +339,9 @@ describe("agent UI lifecycle", () => {
     expect(visibleStatusLine.length).toBeLessThanOrEqual(80);
 
     await commands.get("pitako")?.("profile analysis", ctx);
-    expect(statuses.get("pitako")).toBe("pitako:analysis");
+    expect(statuses.get("pitako")).toBe("pitako:coding");
     publishObservation(baseRow({ id: "production-worker", task: "Still running" }));
-    expect(statuses.get("pitako")).toBe("pitako:analysis");
+    expect(statuses.get("pitako")).toBe("pitako:coding");
 
     await start?.({}, ctx);
     expect(statuses.get("pitako")).toBe("pitako:coding");

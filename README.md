@@ -250,7 +250,7 @@ Or, inside a session: `/pitako profile analysis`. `/pitako` prints the current p
 
 `edit` and `write` are blocked for `.git/`, `node_modules/`, and `.env` files in either profile.
 
-Pitako names an unnamed session `pitako:coding` or `pitako:analysis` and sets a `pitako:` status when the UI is available. It does not override a name you passed with `--name`.
+An unnamed session takes its display name from the first user line, capped at 60 characters. `--name` and `/name` win. A `$plan` or `$execute` session is renamed from the plan heading when that file exists, as `plan: <heading>` or `execute: <heading>`. On resume, Pitako replaces the old `pitako:coding` or `pitako:analysis` placeholder. The footer cwd line and `pitako` status slot both show the display name; the profile is not written into the status slot. `/pitako` still prints the profile.
 
 ## Included extensions
 
