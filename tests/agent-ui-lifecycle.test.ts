@@ -237,6 +237,52 @@ describe("agent UI lifecycle", () => {
     expect(listObservations().length).toBe(1); // unbind does not clear observations
   });
 
+  test("late shutdown from an overlapping same-id session preserves newer footer binding", async () => {
+    const makeSession = () => {
+      const statuses = new Map<string, string>();
+      const handlers = new Map<string, Function>();
+      const pi = {
+        registerFlag() {},
+        registerCommand() {},
+        registerTool() {},
+        on(event: string, handler: Function) { handlers.set(event, handler); },
+        getFlag() { return undefined; },
+        getAllTools() { return [{ name: "read" }]; },
+        getActiveTools() { return ["read"]; },
+        setActiveTools() {},
+        getSessionName() { return "pitako:coding"; },
+        setSessionName() {},
+        sendMessage() {},
+      };
+      const ctx = {
+        hasUI: true,
+        cwd: process.cwd(),
+        sessionManager: { getSessionId: () => "same-session-id", getEntries: () => [] },
+        ui: {
+          notify() {},
+          setStatus(key: string, text: string | undefined) {
+            if (text === undefined) statuses.delete(key);
+            else statuses.set(key, text);
+          },
+        },
+      };
+      pitako(pi as never);
+      return { handlers, statuses, ctx };
+    };
+    const sessionA = makeSession();
+    const sessionB = makeSession();
+    await sessionA.handlers.get("session_start")?.({}, sessionA.ctx);
+    await sessionB.handlers.get("session_start")?.({}, sessionB.ctx);
+    publishObservation(baseRow({ id: "session-b-worker" }));
+    expect(sessionB.statuses.get("pitako.agents")).toContain("● dev");
+
+    await sessionA.handlers.get("session_shutdown")?.();
+
+    expect(sessionB.statuses.get("pitako.agents")).toContain("● dev");
+    await sessionB.handlers.get("session_shutdown")?.();
+    expect(sessionB.statuses.has("pitako.agents")).toBe(false);
+  });
+
   test("second bind does not leave two timers", () => {
     const clock = fakeClock();
     const statuses: StatusCall[] = [];

@@ -1,5 +1,5 @@
 import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -16,6 +16,9 @@ import {
   openBoard,
 } from "../extensions/board/store.ts";
 import { currentWorkspace } from "../extensions/board/workspace.ts";
+import { ledgerFile, planFile, readPlan } from "../extensions/workflow.ts";
+import { registerExecution, unregisterExecution } from "../extensions/execution-identity.ts";
+import { recordPlanTeamWork } from "../extensions/team.ts";
 import { packageRoot } from "../extensions/stack.ts";
 
 const tempDirs: string[] = [];
@@ -77,7 +80,7 @@ describe("workspace", () => {
 });
 
 describe("board store", () => {
-  test("initializes schema v1, enforces foreign keys, and refuses to discard unknown data", async () => {
+  test("initializes schema v2, migrates v1 data, and refuses incomplete schemas", async () => {
     const file = path.join(tempDir("pitako-board-db-"), "board.db");
     const boardDb = await openBoard(file);
     const other = await openSqlite(file);
@@ -102,7 +105,7 @@ describe("board store", () => {
     raw.exec("PRAGMA user_version = 2");
     raw.close();
     await expect(openBoard(kept)).rejects.toThrow(/initialization failed/);
-    await expect(openBoard(kept)).rejects.toThrow(/not supported/);
+    await expect(openBoard(kept)).rejects.toThrow(/incomplete/);
     const still = await openSqlite(kept);
     expect(still.prepare("SELECT note FROM topics").get()?.note).toBe("keep");
     still.close();
@@ -111,6 +114,46 @@ describe("board store", () => {
     writeFileSync(corrupt, "not sqlite");
     await expect(openBoard(corrupt)).rejects.toThrow(/initialization failed/);
     expect(readFileSync(corrupt, "utf8")).toBe("not sqlite");
+  });
+
+  test("migrates v1 rows and serializes competing claims", async () => {
+    const file = path.join(tempDir("pitako-board-migrate-"), "board.db");
+    const initial = await openBoard(file);
+    const topic = initial.createTopic("/repo", { title: "legacy" });
+    initial.post("/repo", { topicId: topic.id, type: "FINDING", content: "kept" });
+    initial.close();
+    const raw = await openSqlite(file);
+    raw.exec("DROP INDEX topics_workspace_owner_plan");
+    raw.exec("ALTER TABLE topics DROP COLUMN owner_plan_id");
+    raw.exec("PRAGMA user_version = 1");
+    raw.close();
+
+    const left = await openBoard(file);
+    const right = await openBoard(file);
+    const migrated = left.readTopic("/repo", topic.id);
+    expect(migrated.posts.map((post) => post.content)).toEqual(["kept"]);
+    expect(migrated.topic.ownerPlanId).toBeNull();
+    const results = await Promise.allSettled([Promise.resolve().then(() => left.claimTopic("/repo", topic.id, "plan-a")), Promise.resolve().then(() => right.claimTopic("/repo", topic.id, "plan-b"))]);
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(["plan-a", "plan-b"]).toContain(left.readTopic("/repo", topic.id).topic.ownerPlanId ?? "");
+    const owner = left.readTopic("/repo", topic.id).topic.ownerPlanId;
+    const other = owner === "plan-a" ? "plan-b" : "plan-a";
+    expect(() => left.claimTopic("/repo", topic.id, other)).toThrow(/already owned/);
+    expect(() => left.claimTopic("/repo", topic.id, owner!)).not.toThrow();
+    expect(() => left.claimTopic("/elsewhere", topic.id, owner!)).toThrow(/another workspace/);
+    expect(() => left.claimTopic("/repo", 0, owner!)).toThrow(/positive integer/);
+    const closed = left.createTopic("/repo", { title: "closed legacy" });
+    left.updateTopic("/repo", closed.id, { status: "closed" });
+    expect(() => left.claimTopic("/repo", closed.id, owner!)).toThrow(/must be open/);
+    expect(() => left.claimTopic("/repo", left.createTopic("/repo", { title: "another" }).id, owner!)).toThrow();
+    expect(() => left.updateTopic("/repo", topic.id, { status: "resolved" })).toThrow(/owned by plan/);
+    expect(() => left.transitionOwnedTopic("/repo", topic.id, other, "resolved")).toThrow(/not owned/);
+    expect(left.transitionOwnedTopic("/repo", topic.id, owner!, "resolved").status).toBe("resolved");
+    expect(left.transitionOwnedTopic("/repo", topic.id, owner!, "resolved").status).toBe("resolved");
+    expect(() => left.transitionOwnedTopic("/repo", topic.id, owner!, "closed")).not.toThrow();
+    expect(() => left.transitionOwnedTopic("/repo", topic.id, owner!, "resolved")).toThrow(/cannot transition closed/);
+    left.close();
+    right.close();
   });
 
   test("isolates workspaces, pages posts, and round-trips every post type", async () => {
@@ -280,7 +323,7 @@ describe("board store", () => {
 
 interface ToolResult {
   content?: Array<{ type?: string; text?: string }>;
-  details?: { error?: string; topicId?: number; postId?: number; status?: string };
+  details?: { error?: string; topicId?: number; postId?: number; status?: string; noTopic?: boolean };
   isError?: boolean;
 }
 
@@ -290,7 +333,7 @@ interface ToolRunner {
     params: unknown,
     signal: AbortSignal | undefined,
     onUpdate: undefined,
-    ctx: { cwd: string },
+    ctx: { cwd: string; sessionManager?: { getSessionId: () => string } },
   ): Promise<ToolResult>;
 }
 
@@ -302,10 +345,12 @@ function textOf(result: ToolResult): string {
 
 function registeredBoard(): {
   tools: Map<string, ToolRunner>;
+  guidance: Map<string, { description?: string; promptGuidelines?: string[] }>;
   command: (args: string, ctx: { cwd: string; hasUI: boolean; ui: { notify(message: string, kind?: string): void } }) => Promise<void>;
   events: string[];
 } {
   const tools = new Map<string, ToolRunner>();
+  const guidance = new Map<string, { description?: string; promptGuidelines?: string[] }>();
   let command: (args: string, ctx: { cwd: string; hasUI: boolean; ui: { notify(message: string, kind?: string): void } }) => Promise<void> =
     async () => {
       throw new Error("/board was not registered");
@@ -315,15 +360,16 @@ function registeredBoard(): {
     on(event: string) {
       events.push(event);
     },
-    registerTool(definition: { name: string; execute: ToolRunner["execute"] }) {
+    registerTool(definition: { name: string; execute: ToolRunner["execute"]; description?: string; promptGuidelines?: string[] }) {
       tools.set(definition.name, definition);
+      guidance.set(definition.name, definition);
     },
     registerCommand(_name: string, spec: { handler: typeof command }) {
       command = spec.handler;
     },
   };
   board(pi as unknown as ExtensionAPI);
-  return { tools, command, events };
+  return { tools, guidance, command, events };
 }
 
 describe("board tools", () => {
@@ -333,6 +379,171 @@ describe("board tools", () => {
   afterEach(() => {
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  });
+
+  test("workflow claim and lifecycle require exact plan binding and foreground ownership", async () => {
+    const agentDir = tempDir("pitako-board-workflow-tools-");
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    const repo = gitRepo();
+    const plan = planFile("workflow-plan", repo);
+    mkdirSync(path.dirname(plan), { recursive: true });
+    writeFileSync(plan, "---\nid: workflow-plan\nrevision: 1\nstatus: draft\nexecution: none\n---\n\nPlan.\n");
+    const { tools } = registeredBoard();
+    const create = tools.get("board_topic_create");
+    const claim = tools.get("board_workflow_claim");
+    const lifecycle = tools.get("board_workflow_lifecycle");
+    const update = tools.get("board_topic_update");
+    const read = tools.get("board_topic_read");
+    if (!create || !claim || !lifecycle || !update || !read) throw new Error("missing workflow Board tool");
+    await create.execute("c", { title: "owned" }, undefined, undefined, { cwd: repo });
+    registerExecution({ instanceId: "child", roleId: "developer", sessionId: "registered-child" });
+    try {
+      const childClaim = await claim.execute("child", { planId: "workflow-plan", topicId: 1 }, undefined, undefined, { cwd: repo, sessionManager: { getSessionId: () => "registered-child" } });
+      expect(childClaim.isError).toBe(true);
+    } finally { unregisterExecution("registered-child"); }
+    const adopted = await claim.execute("claim", { planId: "workflow-plan", topicId: 1 }, undefined, undefined, { cwd: repo });
+    expect(adopted.isError).toBeFalsy();
+    expect(readFileSync(plan, "utf8")).toContain("board_topic_id: 1");
+    expect((await update.execute("u", { topicId: 1, status: "resolved" }, undefined, undefined, { cwd: repo })).isError).toBe(true);
+    registerExecution({ instanceId: "registered-child", roleId: "developer", sessionId: "registered-lifecycle-child" });
+    try {
+      const registeredChildLifecycle = await lifecycle.execute("registered-child", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo, sessionManager: { getSessionId: () => "registered-lifecycle-child" } });
+      expect(registeredChildLifecycle.isError).toBe(true);
+    } finally { unregisterExecution("registered-lifecycle-child"); }
+    const priorChildId = process.env.PITAKO_INSTANCE_ID;
+    process.env.PITAKO_INSTANCE_ID = "child-id";
+    try {
+      expect((await lifecycle.execute("child", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo })).isError).toBe(true);
+    } finally {
+      if (priorChildId === undefined) delete process.env.PITAKO_INSTANCE_ID;
+      else process.env.PITAKO_INSTANCE_ID = priorChildId;
+    }
+    const otherPlan = planFile("other-plan", repo);
+    writeFileSync(otherPlan, "---\nid: other-plan\nrevision: 1\nstatus: frozen\nboard_topic_id: 1\n---\n\nWrong owner.\n");
+    expect((await lifecycle.execute("mismatch", { planId: "other-plan", status: "resolved" }, undefined, undefined, { cwd: repo })).isError).toBe(true);
+    const ledger = ledgerFile("workflow-plan", repo);
+    mkdirSync(path.dirname(ledger), { recursive: true });
+    writeFileSync(ledger, "---\nplan_id: workflow-plan\nrevision: 1\nhash: stale\nstatus: running\n---\n");
+    expect((await lifecycle.execute("stale", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo })).isError).toBe(true);
+    const boundMeta = readPlan("workflow-plan", repo).meta;
+    writeFileSync(ledger, `---\nplan_id: workflow-plan\nrevision: 1\nhash: ${boundMeta.hash}\nstatus: USER_DECISION_REQUIRED\n---\n`);
+    expect((await lifecycle.execute("decision", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo })).isError).toBe(true);
+    const unchanged = await openBoard();
+    expect(unchanged.readTopic(currentWorkspace(repo), 1).topic.status).toBe("open");
+    unchanged.close();
+    rmSync(ledger);
+    const currentPlanMeta = readPlan("workflow-plan", repo).meta;
+    writeFileSync(ledger, `---\nplan_id: workflow-plan\nrevision: 1\nhash: ${currentPlanMeta.hash}\nstatus: running\n---\n\n## Team Holds\n\n<!-- pitako-team-holds:v1 -->\n[]\n<!-- /pitako-team-holds -->\n`);
+    recordPlanTeamWork(repo, "workflow-plan", "unit-a", "cancelled-without-outcome", "pending");
+    expect((await lifecycle.execute("pending", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo })).isError).toBe(true);
+    recordPlanTeamWork(repo, "workflow-plan", "unit-a", "cancelled-without-outcome", "cancelled");
+    expect((await lifecycle.execute("cancelled", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo })).isError).toBe(true);
+    recordPlanTeamWork(repo, "workflow-plan", "unit-b", "later-failure", "failed");
+    expect((await lifecycle.execute("failed", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo })).isError).toBe(true);
+    recordPlanTeamWork(repo, "workflow-plan", "unit-c", "later-success", "completed");
+    recordPlanTeamWork(repo, "workflow-plan", "unit-a", "cancelled-without-outcome", undefined);
+    recordPlanTeamWork(repo, "workflow-plan", "unit-b", "later-failure", undefined);
+    const closedTopic = await create.execute("closed", { title: "closed unowned" }, undefined, undefined, { cwd: repo });
+    const closedDraft = planFile("closed-draft", repo);
+    writeFileSync(closedDraft, "---\nid: closed-draft\nrevision: 1\nstatus: draft\n---\n\nClosed.\n");
+    const closedDb = await openBoard();
+    closedDb.updateTopic(currentWorkspace(repo), closedTopic.details?.topicId as number, { status: "closed" });
+    closedDb.close();
+    expect((await claim.execute("closed-claim", { planId: "closed-draft", topicId: closedTopic.details?.topicId }, undefined, undefined, { cwd: repo })).isError).toBe(true);
+    expect(readFileSync(closedDraft, "utf8")).not.toContain("board_topic_id:");
+    const unowned = await create.execute("unowned", { title: "frozen unowned" }, undefined, undefined, { cwd: repo });
+    const frozenUnowned = planFile("frozen-unowned", repo);
+    writeFileSync(frozenUnowned, `---\nid: frozen-unowned\nrevision: 1\nstatus: frozen\nboard_topic_id: ${unowned.details?.topicId}\n---\n\nFrozen.\n`);
+    expect((await claim.execute("frozen-claim", { planId: "frozen-unowned", topicId: unowned.details?.topicId }, undefined, undefined, { cwd: repo })).isError).toBe(true);
+    const stillUnowned = await openBoard();
+    expect(stillUnowned.readTopic(currentWorkspace(repo), unowned.details?.topicId as number).topic.ownerPlanId).toBeNull();
+    stillUnowned.close();
+
+    const recoveredOwnerPlan = planFile("recovered-owner", repo);
+    writeFileSync(recoveredOwnerPlan, "---\nid: recovered-owner\nrevision: 1\nstatus: draft\nexecution: none\n---\n\nRecovery.\n");
+    const recoveryTopic = await create.execute("recovery-topic", { title: "preclaimed recovery" }, undefined, undefined, { cwd: repo });
+    const recoveryTopicId = recoveryTopic.details?.topicId;
+    const ownedDb = await openBoard();
+    ownedDb.claimTopic(currentWorkspace(repo), recoveryTopicId!, "recovered-owner");
+    ownedDb.close();
+    const recovered = await claim.execute("recover", { planId: "recovered-owner", topicId: recoveryTopicId }, undefined, undefined, { cwd: repo });
+    expect(recovered.isError).toBeFalsy();
+    expect(readFileSync(recoveredOwnerPlan, "utf8")).toContain(`board_topic_id: ${recoveryTopicId}`);
+    const ownerRead = await openBoard();
+    expect(ownerRead.readTopic(currentWorkspace(repo), recoveryTopicId!).topic.ownerPlanId).toBe("recovered-owner");
+    ownerRead.close();
+    const duplicateTopic = await create.execute("duplicate", { title: "second owned topic" }, undefined, undefined, { cwd: repo });
+    const duplicateClaim = await claim.execute("duplicate-claim", { planId: "recovered-owner", topicId: duplicateTopic.details?.topicId }, undefined, undefined, { cwd: repo });
+    expect(duplicateClaim.isError).toBe(true);
+    expect(readFileSync(recoveredOwnerPlan, "utf8")).toContain(`board_topic_id: ${recoveryTopicId}`);
+    expect(textOf(await read.execute("read-owner", { topicId: recoveryTopicId }, undefined, undefined, { cwd: repo }))).toContain("owner plan: recovered-owner");
+    const missingExecution = planFile("missing-execution", repo);
+    const createdForMissing = await create.execute("c3", { title: "missing execution" }, undefined, undefined, { cwd: repo });
+    const missingTopicId = createdForMissing.details?.topicId;
+    writeFileSync(missingExecution, `---\nid: missing-execution\nrevision: 1\nstatus: frozen\nboard_topic_id: ${missingTopicId}\n---\n\nNo intent.\n`);
+    const boundMissing = await claim.execute("claim-missing", { planId: "missing-execution", topicId: missingTopicId }, undefined, undefined, { cwd: repo });
+    expect(boundMissing.isError).toBe(true);
+    const missingOwner = await openBoard();
+    expect(missingOwner.readTopic(currentWorkspace(repo), missingTopicId!).topic.ownerPlanId).toBeNull();
+    missingOwner.close();
+    expect((await lifecycle.execute("resolve-missing", { planId: "missing-execution", status: "resolved" }, undefined, undefined, { cwd: repo })).isError).toBe(true);
+    const resolving = lifecycle.execute("resolve-race", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo });
+    recordPlanTeamWork(repo, "workflow-plan", "resolve-race", "racing-dispatch", "pending");
+    const racedResolve = await resolving;
+    expect(racedResolve.isError).toBe(true);
+    const openAfterRace = await openBoard();
+    expect(openAfterRace.readTopic(currentWorkspace(repo), 1).topic.status).toBe("open");
+    openAfterRace.close();
+    recordPlanTeamWork(repo, "workflow-plan", "resolve-race", "racing-dispatch", "completed");
+    const resolved = await lifecycle.execute("resolve", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo });
+    expect(resolved.details?.status).toBe("resolved");
+    const abandoned = await lifecycle.execute("abandon", { planId: "workflow-plan", status: "closed" }, undefined, undefined, { cwd: repo });
+    expect(abandoned.details?.status).toBe("closed");
+    const noTopicRepo = gitRepo();
+    const noTopicPlan = planFile("without-topic", noTopicRepo);
+    mkdirSync(path.dirname(noTopicPlan), { recursive: true });
+    writeFileSync(noTopicPlan, "---\nid: without-topic\nrevision: 1\nstatus: frozen\n---\n\nNo Board topic.\n");
+    const emptyAgentDir = tempDir("pitako-board-no-topic-");
+    process.env.PI_CODING_AGENT_DIR = emptyAgentDir;
+    const noTopic = await lifecycle.execute("none", { planId: "without-topic", status: "closed" }, undefined, undefined, { cwd: noTopicRepo });
+    expect(noTopic.details?.noTopic).toBe(true);
+    expect(existsSync(getBoardDbPath())).toBe(false);
+
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    const expectedPlan = planFile("expected-plan", repo);
+    writeFileSync(expectedPlan, "---\nid: expected-plan\nrevision: 1\nstatus: draft\nexecution: expected\n---\n\nExpected execution.\n");
+    const secondTopic = await create.execute("c2", { title: "execute lifecycle" }, undefined, undefined, { cwd: repo });
+    const expectedTopicId = secondTopic.details?.topicId;
+    const claimed = await claim.execute("claim2", { planId: "expected-plan", topicId: expectedTopicId }, undefined, undefined, { cwd: repo });
+    expect(claimed.isError).toBeFalsy();
+    writeFileSync(expectedPlan, readFileSync(expectedPlan, "utf8").replace("status: draft", "status: frozen"));
+    expect((await lifecycle.execute("early", { planId: "expected-plan", status: "resolved" }, undefined, undefined, { cwd: repo })).isError).toBe(true);
+    const beforeCompletion = await openBoard();
+    expect(beforeCompletion.readTopic(currentWorkspace(repo), expectedTopicId!).topic.status).toBe("open");
+    beforeCompletion.close();
+    const expectedMeta = readPlan("expected-plan", repo).meta;
+    const expectedLedger = ledgerFile("expected-plan", repo);
+    mkdirSync(path.dirname(expectedLedger), { recursive: true });
+    writeFileSync(expectedLedger, `---\nplan_id: expected-plan\nrevision: 1\nhash: ${expectedMeta.hash}\nstatus: completed\n---\n\n## Team Holds\n\n<!-- pitako-team-holds:v1 -->\n[]\n<!-- /pitako-team-holds -->\n`);
+    const completed = await lifecycle.execute("completed", { planId: "expected-plan", status: "resolved" }, undefined, undefined, { cwd: repo });
+    expect(completed.details?.status).toBe("resolved");
+  });
+
+  test("board post guidance defines every type and rejects progress logging", () => {
+    const { guidance } = registeredBoard();
+    const post = guidance.get("board_post");
+    const text = `${post?.description ?? ""} ${(post?.promptGuidelines ?? []).join(" ")}`;
+    for (const expected of [
+      "FINDING for a fact or constraint",
+      "DECISION for a chosen boundary",
+      "QUESTION/ANSWER for cross-context coordination",
+      "BLOCKER only when another context cannot correctly continue",
+      "HANDOFF only for essential next-context knowledge",
+      "INFO sparingly for mission context",
+      "HANDOFF: T3 done, 44 tests pass",
+      "Ledger and evidence own progress",
+      "Board stays pull-based",
+    ]) expect(text).toContain(expected);
   });
 
   test("tools stay pull-based and cannot see another workspace", async () => {
@@ -348,6 +559,8 @@ describe("board tools", () => {
       "board_topic_list",
       "board_topic_read",
       "board_topic_update",
+      "board_workflow_claim",
+      "board_workflow_lifecycle",
     ]);
 
     const repoA = gitRepo();

@@ -17,7 +17,9 @@ Read the plan with `readPlan` and `requireFrozen` from `extensions/workflow.ts`.
 
 On first start, call `initLedger(ledgerFile(id), meta)`. It returns `exists` when a ledger is already there and does not overwrite it.
 
-On resume, read the plan and the ledger before evidence. Parse the ledger with `parseLedgerBinding`. If `bindingMismatch` returns a string, stop and report that mismatch. Do not continue.
+On resume, read the plan and the ledger before evidence. Parse the ledger with `parseLedgerBinding`. If `bindingMismatch` returns a string, stop and report that mismatch. Do not continue. `USER_DECISION_REQUIRED` must be written to ledger frontmatter `status` before stopping; never resolve the plan's Board topic in that state. Reload and resume never change Board status.
+
+A bound topic remains open for `execution: expected` at `PLAN_FROZEN`; never resolve it at freeze or reopen it during execute. Once all gates, review, and knowledge absorption are complete, set ledger `status: completed`, then resolve only via `board_workflow_lifecycle`. The lifecycle tool rejects ledger mismatch, `USER_DECISION_REQUIRED`, missing execution intent, and Team work that is pending, failed, or cancelled. Bound-plan Team dispatches are held by exact assignment and unit in the `Team Holds` gate in `.pitako/runs/<plan-id>/ledger.md`; no-topic assignments create no persistence artifact. A successful `team_result` removes only its own hold. Failed, cancelled, and no-outcome holds remain blocking across reload, and a missing/malformed gate fails closed. Explicit recovery requires confirming the worker is quiescent, reconciling repository state, recording concrete recovery evidence in the ledger, then removing only that assignment's hold; never clear a pending no-outcome hold without recovered outcome and evidence. Explicit abandonment of the whole workflow closes its bound topic; worker failure/cancellation or an unresolved user decision alone does not. For `execution: none`, `$plan` resolves after absorption at freeze; execute is not invoked.
 
 Then inspect the repository and only the evidence for the current unit. Reconcile plan + ledger + evidence + repository. A stale conversation is not required and is not authoritative.
 
@@ -31,7 +33,7 @@ Level 1, technical and reversible: helper placement, local structure, names, ord
 
 Level 2, architectural but inside the accepted envelope: the planned internal shape is inadequate, and another internal design still preserves Goal, Non-goals, Scope, Invariants, user-visible intent, the safety boundary, and acceptance criteria. Consult Architect through `agent_run` only when that uncertainty is real. That answer is required before the next action, so it stays a synchronous call. Record an `EXECUTION AMENDMENT` or `RULING`. Continue. The frozen plan stays immutable.
 
-Level 3, user-owned: stop with `USER_DECISION_REQUIRED` only when evidence cannot decide for the user. That includes a Goal change, a Non-goal becoming a goal, material scope expansion, an invariant change, two materially different user-visible outcomes, a change in security or privacy risk appetite, or an unauthorized destructive or external side effect. Include the exact decision, evidence already gathered, options, consequences, and a recommendation when evidence supports one.
+Level 3, user-owned: stop with `USER_DECISION_REQUIRED` only when evidence cannot decide for the user. That includes a Goal change, a Non-goal becoming a goal, material scope expansion, an invariant change, two materially different user-visible outcomes, a change in security or privacy risk appetite, or an unauthorized destructive or external side effect. Persist `status: USER_DECISION_REQUIRED` in ledger frontmatter before stopping. Include the exact decision, evidence already gathered, options, consequences, and a recommendation when evidence supports one.
 
 Never ask the user to make a Level 1 or Level 2 decision.
 
@@ -39,17 +41,17 @@ Never ask the user to make a Level 1 or Level 2 decision.
 
 When specialist tools are available, you coordinate. You do not re-solve every unit.
 
-A sync dependency uses `agent_run`. The wait is the dependency. That includes a Level 2 Architect question and a Reviewer judgment the next action needs.
+A sync dependency uses `agent_run`. The wait is the dependency. That includes a Level 2 Architect question and a Reviewer judgment the next action needs. For independent work, prefer `team_assign` when available; it returns immediately and does not replace a needed synchronous dependency.
 
-Long specialist work uses `agent_spawn` with `plan` and `unit`. Do not use `agent_run` for that work. Do not call `agent_result` in the same turn. Do not poll `agent_status`. After spawn, write one line under `## Workers` and end the turn if nothing else in the current unit can proceed without that result. Do not ask the user whether to wait.
+Long specialist work uses `team_assign` when available, with `plan` and `unit`. Otherwise use `agent_spawn` with `plan` and `unit`. Do not use `agent_run` for independent long work. Do not fetch a result in the assignment turn or poll status. After assignment, write one line under `## Workers` with the worker role and the handle type and ID: Team assignment ID for Team, worker instance ID for low-level `agent_spawn`. End the turn if nothing else in the current unit can proceed without that result. Do not ask the user whether to wait.
 
-On the `pitako.worker` wake, call `agent_result` once, replace that worker line, and continue the unit. A failed, cancelled, or lost worker is not foreground implementation. Report it and stop that unit. If the result exists and verification fails, the existing correction order still applies. A missing worker is not that case.
+On a `pitako.worker` wake, use its handle type: call `team_result` once with the Team assignment ID, or `agent_result` once with the low-level worker instance ID. Replace that worker line, then continue the unit. A failed, cancelled, or lost worker is not foreground implementation. Report it and stop that unit. If the result exists and verification fails, the existing correction order still applies. An unknown handle is a blocker, not evidence that another handle type should be tried.
 
-On resume, look only at `## Workers`. Do not treat frontmatter `status: running` or the `## Status` body as a worker. If a worker line says `status running`, call `agent_status` once for that id. If it is running, end the turn. If the id is unknown, record a blocker. Do not poll.
+On resume, look only at `## Workers`. Do not treat frontmatter `status: running` or the `## Status` body as a worker. For a running Team assignment, call `team_status` with its assignment ID; for a low-level worker, call `agent_status` with its instance ID. If it is running, end the turn. If the handle is unknown, record a blocker. Do not poll.
 
-One developer at a time unless the frozen plan already assigns non-overlapping work. New user information during a run is recorded and applied after `agent_result`, or the worker is cancelled. There is no steer into a running worker.
+Keep at most one Developer role active, without exception. New user information during a run is recorded and applied after `team_result` or `agent_result`, or the worker is cancelled. There is no steer into a running worker.
 
-Inline implementation is allowed only when neither `agent_run` nor `agent_spawn` is registered in the session. A failure, stall, cancellation, or lost worker is not foreground implementation.
+Inline implementation is allowed only when neither `agent_run` nor `team_assign` nor `agent_spawn` is registered in the session. A failure, stall, cancellation, or lost worker is not foreground implementation.
 
 Build a WorkBrief for the current unit only:
 
@@ -62,9 +64,9 @@ Build a WorkBrief for the current unit only:
 
 Do not send the parent transcript, unrelated units, old evidence, or every Board topic.
 
-Developer implements. Reviewer judges when the risk justifies it. Architect answers only an architecture question. Researcher fills only a real knowledge gap. If `agent_run` or `agent_spawn` fails, report the error. Do not perform that role yourself.
+Developer implements. Reviewer is adversarial by definition: challenge passing tests and probe violated invariants, negative paths, lifecycle, concurrency, identity/path assumptions, stale state, mocks, coverage, and frozen criteria. Reviewer reports findings and never fixes. Architect answers only an architecture question. Researcher fills only a real knowledge gap. If any delegation fails, report the error; failure never transfers specialist authority to the Coordinator. Do not perform that role yourself. Keep at most one Developer role active, without exception.
 
-When neither `agent_run` nor `agent_spawn` is registered, implement inline with the same plan, ledger, evidence, and verification rules.
+When neither `agent_run` nor `team_assign` nor `agent_spawn` is registered, implement inline with the same plan, ledger, evidence, and verification rules. A failed, stalled, cancelled, or lost delegation does not authorize inline specialist work.
 
 Routine implementation does not require Architect or Reviewer.
 
@@ -104,7 +106,7 @@ Before `EXECUTION_COMPLETED`, one final review against Goal, Scope, Invariants, 
 
 `todo` is what you are doing now. Do not mirror every TODO into the ledger.
 
-The Board is not a progress log. Post a FINDING, DECISION, BLOCKER, or HANDOFF when another agent needs it. Do not post heartbeats or test-by-test progress.
+The Board is not a progress log. Use FINDING for a fact or constraint; DECISION for a chosen boundary before its authoritative artifact; QUESTION/ANSWER for cross-context coordination; BLOCKER only when another context cannot correctly continue; HANDOFF only for essential next-context knowledge; INFO sparingly for mission context. Do not post progress, status, test counts, heartbeats, or ordinary worker events (for example, `HANDOFF: T3 done, 44 tests pass`): ledger and evidence own progress. Once absorbed, the plan, code, tests, or docs are authoritative. No execution-local blocker post is needed when the ledger suffices.
 
 The ledger is a checkpoint: plan id, revision, hash, status, completed units, current unit, next action, rulings, amendments, blockers, and evidence paths. No test logs, diffs, or transcripts.
 

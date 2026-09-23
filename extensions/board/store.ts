@@ -4,7 +4,7 @@ import { DEFAULT_BOARD_AUTHOR } from "./author.ts";
 import { getBoardDbPath } from "./paths.ts";
 import { openSqlite, type SqlDatabase } from "./sqlite.ts";
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 export const BOARD_AUTHOR = "pi";
 export const BOARD_SCOPE = "global";
 
@@ -40,6 +40,7 @@ export interface Topic {
   createdBy: string;
   createdAt: string;
   updatedAt: string;
+  ownerPlanId: string | null;
 }
 
 export interface TopicListItem {
@@ -96,6 +97,7 @@ export interface Board {
   close(): void;
   createTopic(workspace: string, input: { title: string; description?: string }, author?: string): Topic;
   listTopics(workspace: string, filter?: { status?: TopicStatus; limit?: number }): TopicList;
+  findTopicOwnedByPlan(workspace: string, planId: string): number | undefined;
   readTopic(
     workspace: string,
     topicId: number,
@@ -118,6 +120,8 @@ export interface Board {
     },
     author?: string,
   ): Post;
+  claimTopic(workspace: string, topicId: number, planId: string): Topic;
+  transitionOwnedTopic(workspace: string, topicId: number, planId: string, status: "resolved" | "closed"): Topic;
   query(
     workspace: string,
     filter?: { topicId?: number; type?: string; author?: string; text?: string; limit?: number },
@@ -134,7 +138,8 @@ const SCHEMA_STATEMENTS = [
     status TEXT NOT NULL CHECK (status IN ('open', 'resolved', 'closed')),
     created_by TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    owner_plan_id TEXT
   )`,
   `CREATE TABLE posts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -186,16 +191,19 @@ function initialize(db: SqlDatabase, dbPath: string): void {
         throw initError(dbPath, "schema version is 0 but Board tables already exist. Refusing to guess or discard data.");
       }
       for (const statement of SCHEMA_STATEMENTS) db.exec(statement);
+      db.exec("CREATE UNIQUE INDEX topics_workspace_owner_plan ON topics(workspace, owner_plan_id) WHERE owner_plan_id IS NOT NULL");
       db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    } else if (version === 1) {
+      if (!tableExists(db, "topics") || !tableExists(db, "posts")) throw initError(dbPath, "schema v1 is incomplete. Refusing to discard or recreate it.");
+      db.exec("ALTER TABLE topics ADD COLUMN owner_plan_id TEXT");
+      db.exec("CREATE UNIQUE INDEX topics_workspace_owner_plan ON topics(workspace, owner_plan_id) WHERE owner_plan_id IS NOT NULL");
+      db.exec("PRAGMA user_version = 2");
     } else if (version === SCHEMA_VERSION) {
-      if (!tableExists(db, "topics") || !tableExists(db, "posts")) {
-        throw initError(dbPath, `schema v${version} is incomplete. Refusing to discard or recreate it.`);
-      }
+      const column = db.prepare("PRAGMA table_info(topics)").all().some((row) => row.name === "owner_plan_id");
+      const index = db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'topics_workspace_owner_plan'").get();
+      if (!tableExists(db, "topics") || !tableExists(db, "posts") || !column || !index) throw initError(dbPath, `schema v${version} is incomplete. Refusing to discard or recreate it.`);
     } else {
-      throw initError(
-        dbPath,
-        `schema version ${version} is not supported (expected ${SCHEMA_VERSION}). Refusing to migrate or discard data.`,
-      );
+      throw initError(dbPath, `schema version ${version} is not supported (expected ${SCHEMA_VERSION}). Refusing to migrate or discard data.`);
     }
     db.exec("COMMIT");
   } catch (error) {
@@ -260,6 +268,11 @@ class SqliteBoard implements Board {
     };
   }
 
+  findTopicOwnedByPlan(workspace: string, planId: string): number | undefined {
+    const row = this.db.prepare("SELECT id FROM topics WHERE workspace = ? AND owner_plan_id = ?").get(requireWorkspace(workspace), requireText(planId, "planId"));
+    return row ? integer(row.id, "topic id") : undefined;
+  }
+
   readTopic(
     workspace: string,
     topicId: number,
@@ -309,6 +322,7 @@ class SqliteBoard implements Board {
     patch: { status?: TopicStatus; title?: string; description?: string },
   ): Topic {
     const topic = this.requireTopic(workspace, topicId);
+    if (patch.status !== undefined && topic.ownerPlanId !== null) throw new BoardError(`topic ${topic.id} is owned by plan ${topic.ownerPlanId}; use the workflow lifecycle operation`);
     const sets: string[] = [];
     const params: unknown[] = [];
     if (patch.status !== undefined) {
@@ -327,8 +341,46 @@ class SqliteBoard implements Board {
     if (sets.length === 0) throw new BoardError("topic update needs status, title, or description");
     sets.push("updated_at = ?");
     params.push(timestamp(), topic.id);
-    this.db.prepare(`UPDATE topics SET ${sets.join(", ")} WHERE id = ?`).run(...params);
+    const ownerGuard = patch.status === undefined ? "" : " AND owner_plan_id IS NULL";
+    const result = this.db.prepare(`UPDATE topics SET ${sets.join(", ")} WHERE id = ?${ownerGuard}`).run(...params);
+    if (result.changes !== 1) throw new BoardError(`topic ${topic.id} changed ownership during update`);
     return this.requireTopic(workspace, topic.id);
+  }
+
+  claimTopic(workspace: string, topicId: number, planId: string): Topic {
+    const id = requireId(topicId, "topicId");
+    const owner = requireText(planId, "planId");
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const topic = this.requireTopic(workspace, id);
+      if (topic.status !== "open") throw new BoardError(`topic ${id} must be open before it can be claimed`);
+      if (topic.ownerPlanId === owner) {
+        this.db.exec("COMMIT");
+        return topic;
+      }
+      if (topic.ownerPlanId !== null) throw new BoardError(`topic ${id} is already owned by plan ${topic.ownerPlanId}`);
+      const result = this.db.prepare("UPDATE topics SET owner_plan_id = ? WHERE id = ? AND workspace = ? AND status = 'open' AND owner_plan_id IS NULL").run(owner, id, requireWorkspace(workspace));
+      if (result.changes !== 1) throw new BoardError(`topic ${id} could not be claimed`);
+      this.db.exec("COMMIT");
+      return this.requireTopic(workspace, id);
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch { /* transaction already ended */ }
+      throw error;
+    }
+  }
+
+  transitionOwnedTopic(workspace: string, topicId: number, planId: string, status: "resolved" | "closed"): Topic {
+    const id = requireId(topicId, "topicId");
+    const owner = requireText(planId, "planId");
+    const topic = this.requireTopic(workspace, id);
+    if (topic.ownerPlanId !== owner) throw new BoardError(`topic ${id} is not owned by plan ${owner}`);
+    if (topic.status === status) return topic;
+    const allowed = status === "resolved" ? ["open"] : ["open", "resolved"];
+    if (!allowed.includes(topic.status)) throw new BoardError(`cannot transition ${topic.status} topic to ${status}`);
+    const placeholders = allowed.map(() => "?").join(", ");
+    const result = this.db.prepare(`UPDATE topics SET status = ?, updated_at = ? WHERE id = ? AND workspace = ? AND owner_plan_id = ? AND status IN (${placeholders})`).run(status, timestamp(), id, requireWorkspace(workspace), owner, ...allowed);
+    if (result.changes !== 1) throw new BoardError(`topic ${id} lifecycle transition failed`);
+    return this.requireTopic(workspace, id);
   }
 
   post(
@@ -415,7 +467,7 @@ class SqliteBoard implements Board {
     const id = requireId(topicId, "topicId");
     const row = this.db
       .prepare(
-        `SELECT id, workspace, scope, title, description, status, created_by, created_at, updated_at
+        `SELECT id, workspace, scope, title, description, status, created_by, created_at, updated_at, owner_plan_id
          FROM topics WHERE id = ?`,
       )
       .get(id);
@@ -433,6 +485,7 @@ class SqliteBoard implements Board {
       createdBy: text(row.created_by, "created_by"),
       createdAt: text(row.created_at, "created_at"),
       updatedAt: text(row.updated_at, "updated_at"),
+      ownerPlanId: nullableText(row.owner_plan_id, "owner_plan_id"),
     };
   }
 

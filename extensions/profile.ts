@@ -18,6 +18,10 @@ export const ORCHESTRATION_TOOLS = [
   "agent_status",
   "agent_result",
   "agent_cancel",
+  "team_assign",
+  "team_status",
+  "team_result",
+  "team_cancel",
 ] as const;
 
 const ORCHESTRATION = new Set<string>(ORCHESTRATION_TOOLS);

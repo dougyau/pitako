@@ -53,9 +53,11 @@ The `architect` skill continues into implementation when the user asked to build
 
 During `$plan`, call the Architect role with `agent_run`. The task must be design-only: inspect, reason, model, propose, critique. It must say not to modify product files. If `agent_run` fails, report the error. Do not do that role yourself.
 
-Use the Researcher role only for a real external or knowledge gap. Use the Reviewer role for one independent critique of an architectural plan. The reviewer inspects missing constraints, conflicts, unclear boundaries, hidden assumptions, weak acceptance criteria, weak verification, unnecessary complexity, and scope creep. The reviewer does not implement.
+Use the Researcher role only for a real external or knowledge gap. Use the Reviewer role for one independent critique of an architectural plan. The reviewer is adversarial by definition: challenge passing tests and probe violated invariants, negative paths, lifecycle, concurrency, identity/path assumptions, stale state, mocks, coverage, and frozen criteria. The reviewer reports findings and never fixes or implements.
 
 Use Caveman for ephemeral child communication: Architect lite, Reviewer lite, Researcher full. Do not write Caveman grammar into the plan file.
+
+Use Team assignments for independent work that can proceed concurrently without intermediate answers. For awaited independent planning assignments that must resume `$plan` on completion, pass the prospective, validated `plan` ID (which may exist before the artifact is frozen) and a distinct, scoped `unit` ID to every `team_assign` call (for example, concurrent Architect and Researcher assignments with different unit IDs). Keep each returned assignment ID with its role/unit; on each watched completion wake, call `team_result` for that exact assignment ID once, and continue only when the needed results are available. Do not wait or poll. Do not reuse an unrelated execution unit. A delegation failure never transfers specialist authority to the Coordinator; report it rather than doing the specialist work.
 
 Do not hardcode a provider or model. The role ModelPolicy chooses the model.
 
@@ -72,8 +74,12 @@ revision: 1
 status: frozen
 created_at: 2026-08-14T00:00:00Z
 updated_at: 2026-08-14T00:00:00Z
+board_topic_id: 17
+execution: expected
 ---
 ```
+
+A topic is optional. Never create one merely for a plan or delegation. If an existing topic is useful, create it or adopt it with `board_workflow_claim` while the plan is draft, then preserve its `board_topic_id` when revising; never infer a topic by title or recency. `execution: expected` keeps a bound topic open at freeze. For `execution: none`, absorb relevant Board knowledge into the frozen plan and resolve the bound topic with `board_workflow_lifecycle` only when no coordination question remains. No topic means no Board lifecycle call. Watched Team assignments inherit the exact binding automatically; do not copy a topic ID into their WorkBrief.
 
 Keep revision as an integer. For a new plan, revision is 1. If the user invokes `$plan` on an existing frozen plan, keep the id, increment revision, and replace the file. Do not store revision history.
 
@@ -125,6 +131,8 @@ Every meaningful unit needs observable acceptance criteria. Name expected eviden
 
 Integrate findings that change a decision, a boundary, or an acceptance criterion. If only optional hardening remains, do not grow the plan.
 
-Set `status: frozen`. Then return `PLAN_FROZEN` with the id, revision, path, work-unit count, important decisions, whether critique ran and why, and an explicit statement that implementation has not begun.
+Set `status: frozen`. Then return `PLAN_FROZEN` with the id, revision, path, work-unit count, important decisions, whether critique ran and why, and an explicit statement that implementation has not begun. A completion wake does not relax this boundary: `$plan` remains planning-only and must not implement the frozen plan.
+
+After freezing, apply the planning-only lifecycle rule above before returning `PLAN_FROZEN`. For a bound plan with `execution: none`, call `initLedger(ledgerFile(id, cwd), meta)` after freezing and before resolving; the initialized empty Team hold gate is required. Do not resolve a topic when knowledge is not absorbed or a coordination question remains. A bound topic with expected execution stays open; no session start, reload, or worker completion changes its status.
 
 Then stop.

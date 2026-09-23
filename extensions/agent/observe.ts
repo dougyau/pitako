@@ -49,9 +49,11 @@ export type BindAgentUiOptions = {
   now?: () => number;
   columns?: () => number | undefined;
   scheduler?: AgentUiScheduler;
+  ownerToken?: symbol;
 };
 
 type AgentUiSlot = {
+  token: symbol;
   unbind: () => void;
 };
 
@@ -70,8 +72,24 @@ export function noteResultTaken(id: string): void {
   notify();
 }
 
-export function listObservations(): AgentUiSnapshot[] {
-  return [...observations().rows.values()];
+export function listObservations(ownerToken?: symbol): AgentUiSnapshot[] {
+  return [...observations().rows.values()].filter((row) => !row.teamOwnerToken || row.teamOwnerToken === ownerToken);
+}
+
+export function removeTeamObservations(ownerToken: symbol): void {
+  removeObservations((row) => row.teamOwnerToken === ownerToken);
+}
+
+export function removeUntaggedObservations(): void {
+  removeObservations((row) => !row.teamOwnerToken);
+}
+
+function removeObservations(matches: (row: AgentUiSnapshot) => boolean): void {
+  const state = observations();
+  for (const [id, row] of state.rows) {
+    if (matches(row)) state.rows.delete(id);
+  }
+  notify();
 }
 
 export function subscribe(listener: () => void): () => void {
@@ -136,7 +154,7 @@ function defaultScheduler(): AgentUiScheduler {
  * Bind footer to observations. Stops any previous binder first.
  * One 1 Hz clock only while a running worker exists.
  */
-export function bindAgentUi(options: BindAgentUiOptions): { unbind: () => void } {
+export function bindAgentUi(options: BindAgentUiOptions): symbol {
   const prev = (globalThis as Record<symbol, AgentUiSlot | undefined>)[AGENT_UI];
   prev?.unbind();
 
@@ -169,9 +187,9 @@ export function bindAgentUi(options: BindAgentUiOptions): { unbind: () => void }
     const now = nowFn();
     let labeled: AgentUiSnapshot[] = [];
     try {
-      labeled = labelModels(listObservations(), lookup);
+      labeled = labelModels(listObservations(options.ownerToken), lookup);
     } catch {
-      labeled = listObservations();
+      labeled = listObservations(options.ownerToken);
     }
     let text = "";
     try {
@@ -206,6 +224,7 @@ export function bindAgentUi(options: BindAgentUiOptions): { unbind: () => void }
     }
   };
 
+  const token = Symbol("pitako.agentUiBinding");
   const unbind = () => {
     if (!alive) return;
     alive = false;
@@ -232,13 +251,13 @@ export function bindAgentUi(options: BindAgentUiOptions): { unbind: () => void }
     }
   });
 
-  const slot: AgentUiSlot = { unbind };
+  const slot: AgentUiSlot = { token, unbind };
   (globalThis as Record<symbol, AgentUiSlot | undefined>)[AGENT_UI] = slot;
   render();
-  return slot;
+  return token;
 }
 
-export function unbindAgentUi(): void {
+export function unbindAgentUi(token?: symbol): void {
   const slot = (globalThis as Record<symbol, AgentUiSlot | undefined>)[AGENT_UI];
-  slot?.unbind();
+  if (token === undefined || slot?.token === token) slot?.unbind();
 }

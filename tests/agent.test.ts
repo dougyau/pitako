@@ -542,7 +542,9 @@ reasoning = "medium"
 
   test("agent_run is registered, refused inside an instance, and Pitako still loads", async () => {
     const loaded = await loadPitako(packageRoot());
-    expect(registeredToolNames(loaded.extensions)).toContain("agent_run");
+    expect(registeredToolNames(loaded.extensions)).toEqual(expect.arrayContaining([
+      "agent_run", "team_assign", "team_status", "team_result", "team_cancel",
+    ]));
     expect(registeredToolNames(loaded.extensions)).toContain("board_post");
     expect(registeredToolNames(loaded.extensions)).toContain("todo");
 

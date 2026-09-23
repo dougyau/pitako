@@ -1,6 +1,6 @@
 import { PitakoConfigError } from "../errors.ts";
 import { createPiExecutor } from "./pi.ts";
-import { clearObservations, noteResultTaken, observationEpoch, publishObservation } from "./observe.ts";
+import { clearObservations, noteResultTaken, observationEpoch, publishObservation, removeTeamObservations, removeUntaggedObservations } from "./observe.ts";
 import { runAgentInstance, type AgentRunResult, type AttemptExecutor } from "./run.ts";
 import type { LoadOptions } from "../roles/load.ts";
 
@@ -44,12 +44,17 @@ interface Row {
   controller: AbortController;
   outcome?: AgentRunResult;
   signal: SignalState;
+  teamOwnerToken?: symbol;
+  teamAssignmentId?: string;
+  onTeamSettled?: (status: WorkerStatus) => void;
+  teamDeliveryOwner?: BackgroundOwner;
 }
 
 interface Bag {
   rows: Map<string, Row>;
   owner?: BackgroundOwner;
-  held: string[];
+  teamOwners?: Map<symbol, BackgroundOwner>;
+  held: { ownerToken?: symbol; instanceId: string; text: string; owner?: BackgroundOwner }[];
   executor?: AttemptExecutor;
 }
 
@@ -58,18 +63,25 @@ const KEY = Symbol.for("pitako.backgroundWorkers");
 function bag(): Bag {
   const host = globalThis as Record<symbol, Bag | undefined>;
   const existing = host[KEY];
-  if (existing) return existing;
-  const created: Bag = { rows: new Map(), held: [] };
+  if (existing) {
+    existing.teamOwners ??= new Map();
+    return existing;
+  }
+  const created: Bag = { rows: new Map(), held: [], teamOwners: new Map() };
   host[KEY] = created;
   return created;
 }
 
 export function bindBackgroundOwner(owner: BackgroundOwner): void {
-  bag().owner = owner;
+  const state = bag();
+  state.owner = owner;
+  state.teamOwners!.set(owner.token, owner);
 }
 
 export function clearBackgroundOwner(): void {
-  bag().owner = undefined;
+  const state = bag();
+  state.owner = undefined;
+  state.teamOwners?.clear();
 }
 
 export function setBackgroundExecutor(executor: AttemptExecutor | undefined): void {
@@ -91,10 +103,13 @@ export function completionText(input: {
   status: WorkerStatus;
   interest?: WorkerInterest;
   channel: "notify" | "wake";
+  teamAssignmentId?: string;
 }): string {
-  const base = `Pitako worker ${input.instanceId} ${input.status} role ${input.roleId}.`;
+  const base = input.teamAssignmentId
+    ? `Pitako Team assignment ${input.teamAssignmentId} ${input.status} role ${input.roleId} (instance ${input.instanceId}).`
+    : `Pitako worker ${input.instanceId} ${input.status} role ${input.roleId}.`;
   if (input.channel === "notify" || !input.interest) return base;
-  return `${base.slice(0, -1)} plan ${input.interest.planId} unit ${input.interest.unitId}. Use agent_result. Do not do this role's work.`;
+  return `${base.slice(0, -1)} plan ${input.interest.planId} unit ${input.interest.unitId}. Use ${input.teamAssignmentId ? "team_result" : "agent_result"}. Do not do this role's work.`;
 }
 
 export async function spawnBackground(input: {
@@ -106,6 +121,7 @@ export async function spawnBackground(input: {
   executor: AttemptExecutor;
   load?: LoadOptions;
   now?: () => number;
+  teamOwner?: { token: symbol; assignmentId: string; onSettled: (status: WorkerStatus) => void };
 }): Promise<WorkerHandle> {
   if (input.foreground?.aborted) throw new Error("agent_spawn cancelled");
   const controller = new AbortController();
@@ -129,15 +145,21 @@ export async function spawnBackground(input: {
         interest: input.watch,
         controller,
         signal: "pending",
+        teamOwnerToken: input.teamOwner?.token,
+        teamAssignmentId: input.teamOwner?.assignmentId,
+        onTeamSettled: input.teamOwner?.onSettled,
+        teamDeliveryOwner: input.teamOwner ? bag().teamOwners?.get(input.teamOwner.token) : undefined,
       };
       bag().rows.set(instance.id, row);
     },
     onObserve(snapshot) {
+      if (row?.signal === "dropped") return;
       publishObservation(
         {
           ...snapshot,
           planId: input.watch?.planId,
           unitId: input.watch?.unitId,
+          teamOwnerToken: input.teamOwner?.token,
         },
         epoch,
       );
@@ -168,7 +190,7 @@ export async function spawnBackground(input: {
 }
 
 export function workerStatus(instanceId?: string, now: () => number = Date.now): WorkerView[] {
-  const rows = [...bag().rows.values()];
+  const rows = [...bag().rows.values()].filter((row) => !row.teamOwnerToken);
   const matched = instanceId ? rows.filter((row) => row.instanceId === instanceId) : rows;
   if (instanceId && matched.length === 0) throw new Error(`unknown worker ${instanceId}`);
   return matched.map((row) => view(row, now()));
@@ -176,7 +198,7 @@ export function workerStatus(instanceId?: string, now: () => number = Date.now):
 
 export function workerResult(instanceId: string): AgentRunResult {
   const row = bag().rows.get(instanceId);
-  if (!row) throw new Error(`unknown worker ${instanceId}`);
+  if (!row || row.teamOwnerToken) throw new Error(`unknown worker ${instanceId}`);
   if (!row.outcome) {
     throw new Error(statusOf(row) === "running" ? "worker is still running" : "result is not available");
   }
@@ -187,9 +209,44 @@ export function workerResult(instanceId: string): AgentRunResult {
 
 export function cancelWorker(instanceId: string, now: () => number = Date.now): WorkerView {
   const row = bag().rows.get(instanceId);
-  if (!row) throw new Error(`unknown worker ${instanceId}`);
+  if (!row || row.teamOwnerToken) throw new Error(`unknown worker ${instanceId}`);
   if (!row.outcome && !row.controller.signal.aborted) row.controller.abort();
   return view(row, now());
+}
+
+export function teamWorkerStatus(token: symbol, instanceId?: string, now: () => number = Date.now): WorkerView[] {
+  const rows = [...bag().rows.values()].filter((row) => row.teamOwnerToken === token);
+  const matched = instanceId ? rows.filter((row) => row.instanceId === instanceId) : rows;
+  if (instanceId && matched.length === 0) throw new Error(`unknown Team worker ${instanceId}`);
+  return matched.map((row) => view(row, now()));
+}
+
+export function teamWorkerResult(token: symbol, instanceId: string): AgentRunResult {
+  const row = bag().rows.get(instanceId);
+  if (!row || row.teamOwnerToken !== token) throw new Error(`unknown Team worker ${instanceId}`);
+  if (!row.outcome) throw new Error(statusOf(row) === "running" ? "worker is still running" : "result is not available");
+  noteResultTaken(instanceId);
+  return row.outcome;
+}
+
+export function cancelTeamWorker(token: symbol, instanceId: string, now: () => number = Date.now): WorkerView {
+  const row = bag().rows.get(instanceId);
+  if (!row || row.teamOwnerToken !== token) throw new Error(`unknown Team worker ${instanceId}`);
+  if (!row.outcome && !row.controller.signal.aborted) row.controller.abort();
+  return view(row, now());
+}
+
+/** Retire only rows and observations attached to this evaluation lease. */
+export function retireTeamWorkers(token: symbol): void {
+  const state = bag();
+  state.teamOwners?.delete(token);
+  for (const [id, row] of state.rows) {
+    if (row.teamOwnerToken !== token) continue;
+    row.signal = "dropped";
+    if (!row.controller.signal.aborted) row.controller.abort();
+    state.rows.delete(id);
+  }
+  removeTeamObservations(token);
 }
 
 export function cancelAllWorkers(): void {
@@ -206,19 +263,31 @@ export function cancelAllWorkers(): void {
 export function shutdownBackground(token: symbol): void {
   const state = bag();
   if (state.owner?.token !== token) return;
-  cancelAllWorkers();
+  for (const [id, row] of state.rows) {
+    if (row.teamOwnerToken && row.teamOwnerToken !== token) continue;
+    row.signal = "dropped";
+    if (!row.controller.signal.aborted) row.controller.abort();
+    state.rows.delete(id);
+  }
+  state.held = state.held.filter((item) => item.ownerToken !== token);
+  state.teamOwners?.delete(token);
+  removeUntaggedObservations();
+  removeTeamObservations(token);
   state.owner = undefined;
 }
 
 export function takeHeldCompletions(token: symbol): string | undefined {
   const state = bag();
-  if (state.owner?.token !== token || !state.owner.isIdle() || state.held.length === 0) return undefined;
-  const text = state.held.join("\n");
-  state.held = [];
-  for (const row of state.rows.values()) {
-    if (row.signal === "held") row.signal = "sent";
+  if (state.held.length === 0) return undefined;
+  const held = state.held.filter((item) => item.ownerToken === token);
+  const owner = held[0]?.owner;
+  if (held.length === 0 || !owner || !idleOf(owner)) return undefined;
+  state.held = state.held.filter((item) => item.ownerToken !== token);
+  for (const item of held) {
+    const row = state.rows.get(item.instanceId);
+    if (row?.signal === "held") row.signal = "sent";
   }
-  return text;
+  return held.map((item) => item.text).join("\n");
 }
 
 export function formatWorkerHandle(handle: WorkerHandle): string {
@@ -260,25 +329,32 @@ function settle(row: Row, result: AgentRunResult): void {
   const current = state.rows.get(row.instanceId);
   if (!current || current.signal === "dropped" || current.signal === "sent") return;
   current.outcome = result;
-  const channel = deliveryFor(current.interest !== undefined, idleOf(state.owner));
+  current.onTeamSettled?.(result.status);
+  if (current.teamOwnerToken && current.teamDeliveryOwner?.token !== current.teamOwnerToken) {
+    current.signal = "dropped";
+    return;
+  }
+  const deliveryOwner = current.teamOwnerToken ? current.teamDeliveryOwner : state.owner;
+  const channel = deliveryFor(current.interest !== undefined, idleOf(deliveryOwner));
   const text = completionText({
     instanceId: current.instanceId,
     roleId: current.roleId,
     status: result.status,
     interest: current.interest,
     channel: channel === "hold" ? "wake" : channel,
+    teamAssignmentId: current.teamAssignmentId,
   });
   if (channel === "hold") {
     current.signal = "held";
-    state.held.push(text);
+    state.held.push({ ownerToken: current.teamOwnerToken ?? state.owner?.token, instanceId: current.instanceId, text, owner: deliveryOwner });
     return;
   }
   current.signal = "sent";
   if (channel === "notify") {
-    if (state.owner?.hasUI) state.owner.notify(text);
+    if (deliveryOwner?.hasUI) deliveryOwner.notify(text);
     return;
   }
-  state.owner?.sendMessage(text);
+  deliveryOwner?.sendMessage(text);
 }
 
 function idleOf(owner: BackgroundOwner | undefined): boolean {
@@ -288,6 +364,11 @@ function idleOf(owner: BackgroundOwner | undefined): boolean {
   } catch {
     return false;
   }
+}
+
+export function teamWorkerHasOutcome(token: symbol, instanceId: string): boolean {
+  const row = bag().rows.get(instanceId);
+  return row?.teamOwnerToken === token && row.outcome !== undefined;
 }
 
 function statusOf(row: Row): WorkerStatus {

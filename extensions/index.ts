@@ -4,6 +4,8 @@ import { PitakoConfigError } from "./errors.ts";
 import { isProtectedEditPath } from "./paths.ts";
 import { canonicalPath } from "./board/paths.ts";
 import { bindBackgroundOwner, shutdownBackground, takeHeldCompletions } from "./agent/background.ts";
+import { beginTeamEvaluation, retireTeamEvaluation, teamEvaluationForSession, teamAssignments, type TeamEvaluation } from "./team.ts";
+import { teamWorkerStatus } from "./agent/background.ts";
 import { bindAgentUi, listObservations, unbindAgentUi } from "./agent/observe.ts";
 import { formatAgentsDetail } from "./agent/ui.ts";
 import { childSessionNote, ORCHESTRATION_TOOLS, parseProfile, profileNote, toolsForProfile, type ProfileName } from "./profile.ts";
@@ -50,10 +52,20 @@ export default function pitako(pi: ExtensionAPI) {
 
   let profile: ProfileName = "coding";
 
-  const ownerToken = Symbol("pitako.foreground");
+  let ownerToken = Symbol("pitako.foreground");
+  let agentUiBindingToken: symbol | undefined;
+  let teamEvaluation: TeamEvaluation | undefined;
 
   pi.on("session_start", async (_event, ctx) => {
-    registerSupervisedSession(ctx.sessionManager?.getSessionId());
+    const sessionId = ctx.sessionManager?.getSessionId();
+    if (teamEvaluation && teamEvaluation.sessionId !== sessionId) retireTeamEvaluation(teamEvaluation);
+    ownerToken = Symbol("pitako.foreground");
+    teamEvaluation = beginTeamEvaluation(
+      sessionId,
+      Boolean(currentInstanceId() || process.env.PITAKO_INSTANCE_ID),
+      ownerToken,
+    );
+    registerSupervisedSession(sessionId);
     if (!currentInstanceId() && !process.env.PITAKO_INSTANCE_ID && typeof ctx.isIdle === "function") {
       bindBackgroundOwner({
         token: ownerToken,
@@ -102,7 +114,8 @@ export default function pitako(pi: ExtensionAPI) {
     if (action.set !== undefined) pi.setSessionName(action.set);
     if (ctx.hasUI) {
       ctx.ui.setStatus("pitako", pi.getSessionName() || undefined);
-      bindAgentUi({
+      agentUiBindingToken = bindAgentUi({
+        ownerToken,
         setStatus: (key, text) => ctx.ui.setStatus(key, text),
         modelLookup: (provider, id) => ctx.modelRegistry?.find(provider, id),
       });
@@ -110,7 +123,9 @@ export default function pitako(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
-    unbindAgentUi();
+    if (agentUiBindingToken) unbindAgentUi(agentUiBindingToken);
+    agentUiBindingToken = undefined;
+    retireTeamEvaluation(teamEvaluation);
     shutdownBackground(ownerToken);
     unregisterSupervisedSession();
   });
@@ -167,6 +182,31 @@ export default function pitako(pi: ExtensionAPI) {
         }
         return;
       }
+      if (command === "team") {
+        const evaluation = teamEvaluationForSession(
+          ctx.sessionManager?.getSessionId?.(),
+          Boolean(currentInstanceId() || process.env.PITAKO_INSTANCE_ID),
+        );
+        if (!evaluation) {
+          notify(ctx, "Team unavailable for this session", "error");
+          return;
+        }
+        const roles = ["architect", "developer", "reviewer", "researcher"];
+        const rows = teamAssignments(evaluation).map((slot, index) => {
+          const assignment = slot.current ?? slot.last;
+          if (!assignment) return { role: roles[index], status: "idle" };
+          const view = teamWorkerStatus(evaluation.token, assignment.instanceId)[0];
+          return {
+            role: roles[index],
+            assignmentId: assignment.id,
+            instanceId: assignment.instanceId,
+            status: view?.status ?? "settled",
+            elapsedMs: view?.elapsedMs,
+          };
+        });
+        notify(ctx, JSON.stringify(rows));
+        return;
+      }
       if (command === "agents") {
         try {
           let rows = listObservations();
@@ -197,7 +237,7 @@ export default function pitako(pi: ExtensionAPI) {
         "Switch with /pitako profile analysis",
         "Session TODOs: todo tool and /todos (rpiv-todo). Shared knowledge: board_* tools and /board.",
         "Roles: /pitako roles, /pitako role <id>, /pitako policies, /pitako policy <id>. Definitions only.",
-        "Background workers: /pitako agents",
+        "Background workers: /pitako agents; Team roster: /pitako team",
 
         ...skillStatusLines(),
       ];

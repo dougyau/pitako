@@ -32,6 +32,8 @@ export interface AgentUiSnapshot {
   failureKind?: string;
   /** Watchdog inactivity; used for `no stream · mm:ss`. */
   inactivityMs?: number;
+  /** Internal foreground lease; omitted for untagged AgentInstances. */
+  teamOwnerToken?: symbol;
 }
 
 const ROLE_ABBREV: Record<string, string> = {

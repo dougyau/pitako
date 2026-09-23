@@ -5,7 +5,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { createAgentSession, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { classifyProviderFailure } from "../extensions/agent/fallback.ts";
 import { activateTarget, createPiExecutor, cursorProviderContext, DEFAULT_THINKING_LEVEL } from "../extensions/agent/pi.ts";
-import { childActiveTools } from "../extensions/profile.ts";
+import { childActiveTools, ORCHESTRATION_TOOLS } from "../extensions/profile.ts";
 import type { ResolvedRole } from "../extensions/roles/types.ts";
 
 const tempDirs: string[] = [];
@@ -40,7 +40,7 @@ describe("pi adapter boundary", () => {
       model,
       sessionManager: SessionManager.inMemory(cwd),
       modelRuntime: runtime,
-      excludeTools: ["agent_run"],
+      excludeTools: [...ORCHESTRATION_TOOLS],
     });
     try {
       const available = session.getAllTools().map((tool) => tool.name);
@@ -48,7 +48,7 @@ describe("pi adapter boundary", () => {
       const active = session.getActiveToolNames();
       expect(available).toEqual(expect.arrayContaining(["grep", "find", "ls", "read"]));
       expect(active).toEqual(expect.arrayContaining(["grep", "find", "ls", "read"]));
-      expect(active).not.toContain("agent_run");
+      for (const tool of ORCHESTRATION_TOOLS) expect(active).not.toContain(tool);
     } finally {
       session.dispose();
     }
@@ -74,7 +74,7 @@ describe("pi adapter boundary", () => {
       model,
       sessionManager: child,
       modelRuntime: runtime,
-      excludeTools: ["agent_run"],
+      excludeTools: [...ORCHESTRATION_TOOLS],
       noTools: "builtin",
     });
     try {
@@ -84,7 +84,7 @@ describe("pi adapter boundary", () => {
       for (const name of ["grep", "find", "ls", "read"]) {
         if (session.getAllTools().some((tool) => tool.name === name)) expect(active).toContain(name);
       }
-      expect(active).not.toContain("agent_run");
+      for (const tool of ORCHESTRATION_TOOLS) expect(active).not.toContain(tool);
       await expect(session.setModel(model, { persist: false })).rejects.toThrow(/No API key/);
       const thrown = await activateTarget(
         {

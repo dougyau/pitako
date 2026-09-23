@@ -16,6 +16,11 @@ import {
 } from "./store.ts";
 import { resolveBoardAuthor } from "./author.ts";
 import { currentWorkspace } from "./workspace.ts";
+import { currentInstanceId } from "../agent/scope.ts";
+import { bindPlanTopic, ledgerFile, parseLedgerBinding, parseLedgerStatus, readPlan, bindingMismatch, withLedgerTeamHoldLock } from "../workflow.ts";
+import { teamEvaluationForSession, hasUnsettledTeamWork } from "../team.ts";
+import { executionForSession } from "../execution-identity.ts";
+import { existsSync, readFileSync } from "node:fs";
 
 const PostTypeSchema = StringEnum(POST_TYPES);
 const TopicStatusSchema = StringEnum(TOPIC_STATUSES);
@@ -98,7 +103,7 @@ export function registerBoard(pi: ExtensionAPI): void {
     name: "board_topic_update",
     label: "Update Board topic",
     description:
-      "Update a current-workspace topic title, description, or status (open, resolved, closed). A DECISION post does not resolve the topic.",
+      "Update a current-workspace topic title, description, or status (open, resolved, closed). Owned topic status changes require the plan lifecycle tool. A DECISION post does not resolve the topic.",
     promptSnippet: "Update a Board topic title, description, or status",
     promptGuidelines: [
       "Use board_topic_update when a discussion is resolved or no longer active. A DECISION post does not change topic status by itself.",
@@ -121,20 +126,100 @@ export function registerBoard(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
+    name: "board_workflow_claim",
+    label: "Claim Board topic for plan",
+    description: "Explicitly bind an existing open Board topic to a draft plan. Does not create or reopen topics.",
+    promptSnippet: "Claim an existing Board topic for a plan",
+    parameters: Type.Object({ planId: Type.String(), topicId: Type.Number() }, noExtra),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      try {
+        const plan = readPlan(params.planId, ctx.cwd);
+        if (plan.meta.boardTopicId !== undefined && plan.meta.boardTopicId !== params.topicId) throw new BoardError("plan Board topic binding does not match requested topic");
+        if (plan.meta.boardTopicId === undefined && plan.meta.status !== "draft") throw new BoardError("a frozen plan must contain its Board topic binding before claim");
+        return workflowRun(ctx, (board, workspace) => {
+          const current = board.readTopic(workspace, params.topicId).topic;
+          const ownedTopicId = board.findTopicOwnedByPlan(workspace, plan.meta.id);
+          if (ownedTopicId !== undefined && ownedTopicId !== current.id) throw new BoardError(`plan ${plan.meta.id} already owns topic ${ownedTopicId}`);
+          if (current.status !== "open") throw new BoardError(`topic ${current.id} must be open before it can be claimed`);
+          if (current.ownerPlanId !== null && current.ownerPlanId !== plan.meta.id) {
+            throw new BoardError(`topic ${current.id} is already owned by plan ${current.ownerPlanId}`);
+          }
+          if (plan.meta.status === "frozen" && current.ownerPlanId !== plan.meta.id) {
+            throw new BoardError("a frozen bound plan must already own its Board topic");
+          }
+          const topic = board.claimTopic(workspace, current.id, plan.meta.id);
+          if (plan.meta.boardTopicId === undefined) bindPlanTopic(plan.meta.id, current.id, ctx.cwd);
+          return { text: formatTopicCreated(topic), details: { topicId: topic.id, ownerPlanId: topic.ownerPlanId } };
+        });
+      } catch (error) {
+        return toolError(error instanceof Error ? error.message : String(error));
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "board_workflow_lifecycle",
+    label: "Update workflow topic lifecycle",
+    description: "Resolve or close only the explicitly bound Board topic owned by a plan. Child sessions cannot call this operation.",
+    promptSnippet: "Resolve or close a plan-owned Board topic",
+    parameters: Type.Object({ planId: Type.String(), status: StringEnum(["resolved", "closed"] as const) }, noExtra),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      if (isChildSession(ctx)) return toolError("workflow Board lifecycle cannot be called from a child session");
+      try {
+        const plan = readPlan(params.planId, ctx.cwd);
+        const boardTopicId = plan.meta.boardTopicId;
+        if (boardTopicId === undefined) return toolSuccess("Plan has no Board topic; no Board changes made.", { noTopic: true });
+        const ledger = ledgerFile(plan.meta.id, ctx.cwd);
+        let ledgerStatus: string | undefined;
+        if (existsSync(ledger)) {
+          const ledgerText = readFileSync(ledger, "utf8");
+          const mismatch = bindingMismatch(plan.meta, parseLedgerBinding(ledgerText));
+          if (mismatch) throw new BoardError(mismatch);
+          ledgerStatus = parseLedgerStatus(ledgerText);
+        }
+        if (params.status === "resolved") {
+          if (ledgerStatus === "USER_DECISION_REQUIRED") throw new BoardError("USER_DECISION_REQUIRED in ledger prohibits resolving the Board topic");
+          if (plan.meta.execution === undefined) {
+            throw new BoardError("bound frozen plan must declare execution: expected or execution: none before resolving its Board topic");
+          }
+          if (plan.meta.execution === "expected" && ledgerStatus !== "completed") {
+            throw new BoardError("expected execution can resolve its Board topic only after the ledger is completed");
+          }
+        }
+        return run(ctx, (board, workspace) => {
+          const transition = () => {
+            if (params.status === "resolved") {
+              const evaluation = teamEvaluationForSession(ctx.sessionManager?.getSessionId?.(), false);
+              if (hasUnsettledTeamWork(evaluation, plan.meta.id, ctx.cwd)) throw new BoardError("Team work for this plan is pending, failed, or cancelled; wait for its successful result or explicitly reconcile the exact ledger hold after documented recovery");
+            }
+            const topic = board.transitionOwnedTopic(workspace, boardTopicId, plan.meta.id, params.status);
+            return { text: formatTopicCreated(topic), details: { topicId: topic.id, status: topic.status } };
+          };
+          return params.status === "resolved" ? withLedgerTeamHoldLock(ctx.cwd, plan.meta.id, transition) : transition();
+        });
+      } catch (error) {
+        return toolError(error instanceof Error ? error.message : String(error));
+      }
+    },
+  });
+
+  pi.registerTool({
     name: "board_post",
     label: "Board post",
     description:
-      "Post coordination knowledge to a current-workspace topic. Types: INFO, FINDING, QUESTION, ANSWER, DECISION, BLOCKER, HANDOFF. Not a transcript, scratchpad, or TODO.",
-    promptSnippet: "Post a finding, question, answer, decision, blocker, or handoff",
+      "Post cross-context knowledge to a current-workspace topic. FINDING: fact or constraint; DECISION: chosen boundary before an authoritative artifact; QUESTION/ANSWER: unresolved cross-context issue and response; BLOCKER: condition preventing another context from continuing correctly; HANDOFF: essential context the next agent needs; INFO: sparse mission context. Not a transcript, scratchpad, TODO, or progress log.",
+    promptSnippet: "Post cross-context knowledge to a Board topic",
     promptGuidelines: [
-      "Use board_post for findings, questions, answers, decisions, blockers, and handoffs. Keep posts short and evidence-oriented. Do not post transcripts, raw reasoning, or TODO steps.",
+      "Use FINDING for a fact or constraint; DECISION for a chosen boundary before its authoritative artifact; QUESTION/ANSWER for cross-context coordination; BLOCKER only when another context cannot correctly continue; HANDOFF only for essential next-context knowledge; INFO sparingly for mission context.",
+      "Do not post progress, status, test counts, heartbeats, or ordinary worker events: HANDOFF: T3 done, 44 tests pass is invalid. Ledger and evidence own progress; once knowledge is absorbed, the plan, code, tests, or docs are authoritative. Board stays pull-based.",
+      "Do not post transcripts, raw reasoning, TODO steps, or execution-local blockers when the ledger suffices.",
     ],
     parameters: Type.Object(
       {
         topicId: Type.Number({ description: "Topic id" }),
         type: PostTypeSchema,
         subject: Type.Optional(Type.String({ description: "Optional short subject" })),
-        content: Type.String({ description: "The finding, question, answer, decision, blocker, or handoff" }),
+        content: Type.String({ description: "Cross-context knowledge: finding, question, answer, decision, blocker, handoff, or sparse mission context" }),
         replyTo: Type.Optional(Type.Number({ description: "Post id in the same topic" })),
         metadata: Type.Optional(Type.Record(Type.String(), Type.Unknown(), { description: "JSON object, for example {\"supersedes\": 17}" })),
       },
@@ -209,7 +294,7 @@ function authorOf(ctx: { sessionManager?: { getSessionId(): string } }): string 
 }
 
 async function run(
-  ctx: { cwd: string; sessionManager?: { getSessionId(): string } },
+  ctx: { cwd: string; sessionManager?: { getSessionId?: () => string } },
   action: (board: Board, workspace: string) => { text: string; details: Record<string, unknown> },
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: Record<string, unknown>; isError?: boolean }> {
   let board: Board | undefined;
@@ -227,6 +312,27 @@ async function run(
   } finally {
     board?.close();
   }
+}
+
+function isChildSession(ctx: { sessionManager?: { getSessionId?: () => string } }): boolean {
+  const sessionId = ctx.sessionManager?.getSessionId?.();
+  return Boolean(currentInstanceId() || process.env.PITAKO_INSTANCE_ID || executionForSession(sessionId));
+}
+
+function workflowRun(
+  ctx: { cwd: string; sessionManager?: { getSessionId?: () => string } },
+  action: (board: Board, workspace: string) => { text: string; details: Record<string, unknown> },
+) {
+  if (isChildSession(ctx)) return Promise.resolve(toolError("workflow Board operations cannot be called from a child session"));
+  return run(ctx, action);
+}
+
+function toolSuccess(text: string, details: Record<string, unknown>) {
+  return { content: [{ type: "text" as const, text }], details };
+}
+
+function toolError(message: string) {
+  return { content: [{ type: "text" as const, text: `Error: ${message}` }], details: { error: message }, isError: true };
 }
 
 export function formatTopicCreated(topic: Pick<Topic, "id" | "status" | "title">): string {
@@ -249,6 +355,7 @@ export function formatTopicRead(page: TopicPage): string {
     formatTopicCreated(topic),
     `scope: ${topic.scope}`,
     `created by ${topic.createdBy} at ${topic.createdAt}`,
+    `owner plan: ${topic.ownerPlanId ?? "none"}`,
     `updated ${topic.updatedAt}`,
   ];
   if (topic.description) lines.push(topic.description);

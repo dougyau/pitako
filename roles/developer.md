@@ -25,7 +25,7 @@ The change, the check you ran, and the result. No claim that it works without th
 
 ## Board
 
-Post a FINDING for a root cause and a HANDOFF for what changed and how it was verified. Keep TODO steps off the Board.
+Use FINDING for a fact or constraint; DECISION for a chosen boundary before its authoritative artifact; QUESTION/ANSWER for cross-context coordination; BLOCKER only when another context cannot correctly continue; HANDOFF only for essential next-context knowledge; INFO sparingly for mission context. Do not post progress, status, test counts, heartbeats, or ordinary worker events (for example, `HANDOFF: T3 done, 44 tests pass`): ledger and evidence own progress. Once absorbed, the plan, code, tests, or docs are authoritative. Keep TODO steps off the Board.
 
 ## Skills
 

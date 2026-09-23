@@ -82,13 +82,13 @@ Ponytail governs implementation size. It does not waive validation, security, ac
 
 Use the Board when information should stay visible as explicit shared context.
 
-Prefer findings, questions, answers, decisions, blockers, and handoffs. Keep posts concise and evidence-oriented. Query with `board_query` or `board_topic_read` before posting a duplicate. Do not load the whole Board when a focused query is enough.
+Use FINDING for a fact or constraint; DECISION for a chosen boundary before its authoritative artifact; QUESTION/ANSWER for cross-context coordination; BLOCKER only when another context cannot correctly continue; HANDOFF only for essential next-context knowledge; INFO sparingly for mission context. Do not post progress, status, test counts, heartbeats, or ordinary worker events (for example, `HANDOFF: T3 done, 44 tests pass`): ledger and evidence own progress. Once absorbed, the plan, code, tests, or docs are authoritative. Keep posts concise and query with `board_query` or `board_topic_read` before posting a duplicate; do not load the whole Board when a focused query is enough.
 
-Do not use the Board as a transcript, a scratchpad, or a TODO list. `todo` is the session plan. The Board is not injected into every turn.
+Do not use the Board as a transcript, scratchpad, TODO list, or progress log. `todo` is the session plan. The Board is pull-based and is not injected into every turn.
 
 ## Roles
 
-`/pitako roles` and `/pitako role <id>` show role definitions. A role is a responsibility template. `agent_run` executes one isolated instance of a role. If `agent_run` fails, report the error. Do not perform that role yourself. Do not build a team.
+`/pitako roles` and `/pitako role <id>` show role definitions. A role is a responsibility template. `agent_run` executes one isolated instance synchronously; `/pitako team` inspects the foreground session's Team roster. Use `team_assign` only for independent work. If delegation fails, report the error; do not take over that specialist work.
 
 ## Not in this package
 

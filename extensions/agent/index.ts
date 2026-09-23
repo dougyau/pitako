@@ -11,16 +11,27 @@ import {
   spawnBackground,
   workerResult,
   workerStatus,
+  teamWorkerStatus,
+  teamWorkerResult,
+  teamWorkerHasOutcome,
+  cancelTeamWorker,
 } from "./background.ts";
-import { noteResultTaken, observationEpoch, publishObservation } from "./observe.ts";
+import { listObservations, noteResultTaken, observationEpoch, publishObservation } from "./observe.ts";
 import { currentInstanceId } from "./scope.ts";
 import { createPiExecutor } from "./pi.ts";
 import { formatAgentResult, runAgentInstance } from "./run.ts";
+import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import { openBoard } from "../board/store.ts";
+import { currentWorkspace } from "../board/workspace.ts";
+import { planFile, readPlan } from "../workflow.ts";
+import { teamEvaluationForSession, reserveTeamRole, recordTeamAssignment, recordPlanTeamWork, teamAssignments, type TeamAssignment } from "../team.ts";
 
 const noExtra = { additionalProperties: false } as const;
 
 export default function agentInstance(pi: ExtensionAPI): void {
   registerBackgroundTools(pi);
+  registerTeamTools(pi);
   pi.registerTool({
     name: "agent_run",
     label: "Run agent",
@@ -82,6 +93,210 @@ export default function agentInstance(pi: ExtensionAPI): void {
       return new Text(theme.fg("toolOutput", text), 0, 0);
     },
   });
+}
+
+function registerTeamTools(pi: ExtensionAPI): void {
+  const roles = ["architect", "developer", "reviewer", "researcher"] as const;
+  const evaluationFor = (ctx: { sessionManager?: { getSessionId?: () => string | undefined } }) =>
+    teamEvaluationForSession(
+      typeof ctx.sessionManager?.getSessionId === "function" ? ctx.sessionManager.getSessionId() : undefined,
+      Boolean(currentInstanceId() || process.env.PITAKO_INSTANCE_ID),
+    );
+  const assignmentsFor = (evaluation: NonNullable<ReturnType<typeof teamEvaluationForSession>>) =>
+    teamAssignments(evaluation).flatMap((slot) => [slot.current, slot.last].filter((item): item is TeamAssignment => Boolean(item)));
+  const findAssignment = (evaluation: NonNullable<ReturnType<typeof teamEvaluationForSession>>, id: string) => {
+    const assignment = assignmentsFor(evaluation).find((item) => item.id === id);
+    if (!assignment) throw new Error(`unknown Team assignment ${id}`);
+    return assignment;
+  };
+
+  pi.registerTool({
+    name: "team_assign",
+    label: "Assign Team role",
+    description: "Start one isolated Team role. Returns immediately. One assignment per role may run at a time.",
+    promptSnippet: "Assign independent work to a Team role",
+    promptGuidelines: ["Use team_assign for independent long work. Keep task scoped. Do not wait or poll; on a watched plan/unit completion wake, resume and fetch it with team_result using the assignment ID."],
+    parameters: Type.Object({
+      role: Type.String({ enum: [...roles] }),
+      task: Type.String({ minLength: 1, description: "Scoped WorkBrief for this role" }),
+      plan: Type.Optional(Type.String()),
+      unit: Type.Optional(Type.String()),
+      boardTopicId: Type.Optional(Type.String({ description: "Existing Board topic ID; no topic is created" })),
+    }, noExtra),
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      try {
+        const evaluation = evaluationFor(ctx);
+        const id = randomUUID();
+        const admission = reserveTeamRole(evaluation, params.role, id);
+        let accepted = false;
+        let durableWatch: { planId: string; unitId: string } | undefined;
+        try {
+          const watch = interestFrom(params.plan, params.unit);
+          const topic = await teamBoardTopic(params.boardTopicId, watch?.planId, ctx.cwd);
+          if (watch && topic !== undefined && existsSync(planFile(watch.planId, ctx.cwd))) {
+            durableWatch = watch;
+            recordPlanTeamWork(ctx.cwd, watch.planId, watch.unitId, id, "pending");
+          }
+          const task = [
+            `Team assignment header: Team ${evaluation!.sessionId}; role ${params.role}; assignment ${id}${topic !== undefined ? `; Board topic ${topic}` : ""}.`,
+            "WorkBrief:",
+            params.task.trim(),
+          ].join("\n");
+          const handle = await spawnBackground({
+            roleId: params.role,
+            task,
+            cwd: ctx.cwd,
+            foreground: signal,
+            watch,
+            executor: backgroundExecutor(),
+            teamOwner: {
+              token: admission.token,
+              assignmentId: id,
+              onSettled() { admission.settled(); },
+            },
+          });
+          accepted = true;
+          admission.commit();
+          const assignment: TeamAssignment = {
+            id, instanceId: handle.instanceId, roleId: params.role, task: params.task.trim(),
+            planId: watch?.planId, unitId: watch?.unitId, boardTopicId: topic,
+          };
+          recordTeamAssignment(evaluation!, params.role, assignment);
+          return textResult(`assignment_id: ${id}\nrole: ${params.role}\ninstance_id: ${handle.instanceId}\nstatus: running`, assignment);
+        } catch (error) {
+          if (!accepted) {
+            if (durableWatch) {
+              try { recordPlanTeamWork(ctx.cwd, durableWatch.planId, durableWatch.unitId, id, undefined); } catch { /* original assignment failure takes precedence */ }
+            }
+            admission.rollback();
+          }
+          throw error;
+        }
+      } catch (error) {
+        return errorResult(error instanceof Error ? error.message : String(error));
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "team_status",
+    label: "Team status",
+    description: "Show stable ordered Team role status. Does not wait or include task text or transcripts.",
+    promptSnippet: "Inspect Team assignments without waiting",
+    parameters: Type.Object({ assignmentId: Type.Optional(Type.String()) }, noExtra),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      try {
+        const evaluation = evaluationFor(ctx);
+        if (!evaluation) throw new Error("Team requires a foreground session identity");
+        const slots = teamAssignments(evaluation);
+        const rows = roles.map((role, index) => {
+          const assignment = slots[index]?.current;
+          const last = slots[index]?.last;
+          const selected = params.assignmentId ? [assignment, last].find((item) => item?.id === params.assignmentId) : assignment;
+          if (params.assignmentId && !selected) return undefined;
+          const row = selected ?? assignment ?? last;
+          if (!row) return { role, status: "idle" };
+          const view = teamWorkerStatus(evaluation.token, row.instanceId)[0];
+          const observation = listObservations(evaluation.token).find((item) => item.id === row.instanceId);
+          return {
+            role,
+            assignmentId: row.id,
+            instanceId: row.instanceId,
+            task: row.task.split("\n").find((line) => line.trim())?.trim().slice(0, 100) ?? "",
+            status: view?.status ?? "settled",
+            model: observation?.modelLabel ?? observation?.selectedModel,
+            reasoning: observation?.appliedReasoning ?? observation?.requestedReasoning,
+            activity: observation?.activeTool,
+            elapsedMs: view?.elapsedMs,
+            resultAvailable: teamWorkerHasOutcome(evaluation.token, row.instanceId),
+          };
+        }).filter((row) => row !== undefined);
+        if (params.assignmentId && rows.length === 0) throw new Error(`unknown Team assignment ${params.assignmentId}`);
+        return textResult(JSON.stringify(rows), { roles: rows });
+      } catch (error) { return errorResult(error instanceof Error ? error.message : String(error)); }
+    },
+  });
+
+  pi.registerTool({
+    name: "team_result",
+    label: "Team result",
+    description: "Return one settled Team result, capped at 8000 characters. Does not wait.",
+    promptSnippet: "Fetch a finished Team assignment result",
+    parameters: Type.Object({ assignmentId: Type.String() }, noExtra),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      try {
+        const evaluation = evaluationFor(ctx);
+        if (!evaluation) throw new Error("Team requires a foreground session identity");
+        const assignment = findAssignment(evaluation, params.assignmentId);
+        const result = teamWorkerResult(evaluation.token, assignment.instanceId);
+        if (assignment.planId && assignment.unitId && assignment.boardTopicId !== undefined) {
+          recordPlanTeamWork(ctx.cwd, assignment.planId, assignment.unitId, assignment.id, result.status);
+        }
+        const limit = 8000;
+        const truncated = result.result.length > limit;
+        return textResult(`${result.result.slice(0, limit)}${truncated ? "\n[truncated; use a narrower assignment]" : ""}`, {
+          assignmentId: assignment.id, instanceId: result.instanceId, role: result.role,
+          status: result.status, model: result.model, truncated, resultLength: result.result.length,
+        }, result.status !== "completed");
+      } catch (error) { return errorResult(error instanceof Error ? error.message : String(error)); }
+    },
+  });
+
+  pi.registerTool({
+    name: "team_cancel",
+    label: "Cancel Team assignment",
+    description: "Cancel one Team assignment. Its role stays occupied until worker settles.",
+    promptSnippet: "Cancel one Team assignment without waiting",
+    parameters: Type.Object({ assignmentId: Type.String() }, noExtra),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      try {
+        const evaluation = evaluationFor(ctx);
+        if (!evaluation) throw new Error("Team requires a foreground session identity");
+        const assignment = findAssignment(evaluation, params.assignmentId);
+        const view = cancelTeamWorker(evaluation.token, assignment.instanceId);
+        return textResult(JSON.stringify({ assignmentId: assignment.id, ...view }), { assignmentId: assignment.id, ...view });
+      } catch (error) { return errorResult(error instanceof Error ? error.message : String(error)); }
+    },
+  });
+}
+
+async function teamBoardTopic(explicit: string | undefined, planId: string | undefined, cwd: string): Promise<number | undefined> {
+  let explicitId: number | undefined;
+  if (explicit !== undefined) {
+    const value = explicit.trim();
+    if (!/^[1-9]\d*$/.test(value) || !Number.isSafeInteger(Number(value))) {
+      throw new Error("Board topic ID must be a positive safe integer");
+    }
+    explicitId = Number(value);
+  }
+  const file = planId === undefined ? undefined : planFile(planId, cwd);
+  const plan = file && existsSync(file) ? readPlan(planId!, cwd).meta : undefined;
+  if (explicitId !== undefined && (!planId || (plan && plan.boardTopicId === undefined))) {
+    throw new Error("explicit Board topics require a bound watched plan; only planning assignments with a missing plan artifact may pass an explicit topic");
+  }
+  if (planId && !plan && explicitId === undefined) return undefined;
+  const topicId = plan?.boardTopicId ?? (planId && !plan ? explicitId : undefined);
+  if (plan?.boardTopicId !== undefined && explicitId !== undefined && plan.boardTopicId !== explicitId) {
+    throw new Error("explicit Board topic ID conflicts with the watched plan binding");
+  }
+  if (topicId === undefined) return undefined;
+
+  const board = await openBoard();
+  try {
+    const topic = board.readTopic(currentWorkspace(cwd), topicId).topic;
+    if (plan?.boardTopicId !== undefined && topic.ownerPlanId !== plan.id) {
+      throw new Error(`Board topic ${topicId} is not owned by watched plan ${plan.id}`);
+    }
+    if (!plan && topic.ownerPlanId !== null) {
+      throw new Error(`Board topic ${topicId} is not unowned for planning assignment`);
+    }
+    if (topic.ownerPlanId !== null && (plan?.boardTopicId === undefined || topic.ownerPlanId !== plan.id)) {
+      throw new Error(`Board topic ${topicId} is not bound to the watched plan`);
+    }
+    return topicId;
+  } finally {
+    board.close();
+  }
 }
 
 function errorResult(message: string) {
