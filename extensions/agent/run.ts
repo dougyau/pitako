@@ -6,6 +6,7 @@ import type { FallbackReason, ModelTarget, ResolvedRole } from "../roles/types.t
 import { classifyProviderFailure } from "./fallback.ts";
 import { formatAgentLive } from "./present.ts";
 import { agentScope } from "./scope.ts";
+import type { AgentUiSnapshot } from "./ui.ts";
 import {
   activityKind,
   createActivity,
@@ -16,6 +17,7 @@ import {
   stallInfo,
   syncToolHold,
   startWatchdogTimer,
+  PROVIDER_STREAM_TOOL_ID,
   type AgentActivityState,
   type StallInfo,
   type WatchdogConfig,
@@ -191,6 +193,8 @@ export async function runAgentInstance(input: {
   watchdog?: WatchdogConfig;
   /** Live view only. Errors are ignored so UI cannot change the run. */
   onPresent?: (text: string) => void;
+  /** Structured observation copy. Errors are ignored so UI cannot change the run. */
+  onObserve?: (snapshot: AgentUiSnapshot) => void;
   /** Synchronous accept hook. Runs before watchdog setup and the first await. */
   onAccepted?: (instance: AgentInstance) => void;
 }): Promise<AgentRunResult> {
@@ -218,9 +222,13 @@ export async function runAgentInstance(input: {
   };
   input.onAccepted?.(instance);
   const now = input.now ?? Date.now;
-  const activity = createActivity(now());
+  const acceptedAt = now();
+  const activity = createActivity(acceptedAt);
   const view: { usage?: AgentUsage; error?: string } = {};
+  const throughput = createThroughput();
+  const work: WorkCounts = { turns: 0, toolCalls: 0 };
   let lastStable = "";
+  let terminalAt: number | undefined;
   const present = () => {
     if (!input.onPresent) return;
     const text = formatAgentLive({
@@ -239,6 +247,18 @@ export async function runAgentInstance(input: {
       // Presentation must not change fallback, cancellation, or stall behavior.
     }
   };
+  const observe = () => {
+    if (!input.onObserve) return;
+    try {
+      input.onObserve(observationOf(instance, task, activity, throughput, work, acceptedAt, terminalAt, now(), view.usage));
+    } catch {
+      // Observation must not change fallback, cancellation, or stall behavior.
+    }
+  };
+  const refresh = () => {
+    present();
+    observe();
+  };
   const child = new AbortController();
   const stopParent = input.signal ? watchAbort(input.signal, () => child.abort()) : () => {};
   let stall: StallInfo | undefined;
@@ -254,32 +274,67 @@ export async function runAgentInstance(input: {
     } catch {
       hold = undefined;
     }
-    syncToolHold(activity, hold, now());
+    const t = now();
+    const hadHold = activity.runningTools.some((tool) => tool.id === PROVIDER_STREAM_TOOL_ID);
+    syncToolHold(activity, hold, t);
+    const hasHold = Boolean(hold);
+    // Probe hold is not noteActivity. Freeze stream on appear so held time is excluded;
+    // publish so activeTool shows (cursor-native) and tok/s hides.
+    if (hasHold && !hadHold) freezeStream(throughput, t);
     const before = activity.phase;
-    const verdict = evaluateWatchdog(activity, input.watchdog ?? loaded.watchdog, now());
-    if (activity.phase !== before) present();
+    const verdict = evaluateWatchdog(activity, input.watchdog ?? loaded.watchdog, t);
+    if (hasHold !== hadHold || activity.phase !== before) refresh();
     if (verdict === "stalled" || verdict === "max_runtime") {
-      stall = stallInfo(activity, now(), verdict === "max_runtime" ? "max_runtime" : "stalled");
+      stall = stallInfo(activity, t, verdict === "max_runtime" ? "max_runtime" : "stalled");
       timer.stop();
       child.abort();
     }
   }, undefined, input.schedule);
-  const onActivity = (event: { type?: string; toolName?: string; toolCallId?: string; assistantMessageEvent?: { type?: string } }) => {
+  const onActivity = (event: ActivityEvent) => {
+    const t = now();
+    // Token sample must not call noteActivity or change watchdog phase.
+    const sampled = sampleOutputTokens(throughput, event);
+    noteWork(work, event);
     const kind = activityKind(event);
-    if (!kind) return;
-    if (kind === "tool_start" && event.toolName) noteToolStart(activity, event.toolName, now(), event.toolCallId ?? event.toolName);
-    else if (kind === "tool_end") noteToolEnd(activity, now(), event.toolCallId);
-    else noteActivity(activity, kind, now());
-    present();
+    if (kind === "model_stream") noteStreamSample(throughput, activity, t);
+    else if (kind === "tool_start") freezeStream(throughput, t);
+    if (!kind) {
+      if (sampled) observe();
+      return;
+    }
+    if (kind === "tool_start" && event.toolName) noteToolStart(activity, event.toolName, t, event.toolCallId ?? event.toolName);
+    else if (kind === "tool_end") noteToolEnd(activity, t, event.toolCallId);
+    else noteActivity(activity, kind, t);
+    refresh();
   };
   const onActivated = (appliedReasoning: string) => {
     instance.model.appliedReasoning = appliedReasoning;
-    present();
+    refresh();
   };
-  present();
+  refresh();
   try {
     return await agentScope.run({ instanceId: instance.id }, () =>
-      executeTargets(instance, role, task, targets, input.executor, child.signal, input.signal, activity, now, () => stall, onActivity, onActivated, present, view, bindActivityProbe),
+      executeTargets(
+        instance,
+        role,
+        task,
+        targets,
+        input.executor,
+        child.signal,
+        input.signal,
+        activity,
+        now,
+        () => stall,
+        onActivity,
+        onActivated,
+        refresh,
+        view,
+        bindActivityProbe,
+        throughput,
+        (at) => {
+          terminalAt = at;
+        },
+      ),
     );
   } finally {
     timer.stop();
@@ -298,11 +353,13 @@ async function executeTargets(
   activity: AgentActivityState,
   now: () => number,
   stalled: () => StallInfo | undefined,
-  onActivity: (event: { type?: string; toolName?: string }) => void,
+  onActivity: (event: ActivityEvent) => void,
   onActivated: (appliedReasoning: string) => void,
   present: () => void,
   view: { usage?: AgentUsage; error?: string },
   bindActivityProbe: (probe: (() => { name: string } | undefined) | undefined) => void,
+  throughput: ThroughputState,
+  markTerminal: (at: number) => void,
 ): Promise<AgentRunResult> {
   instance.status = "running";
   let session: AttemptSession | undefined;
@@ -318,6 +375,7 @@ async function executeTargets(
   ) => {
     view.usage = usage;
     view.error = status === "completed" || result === "cancelled" ? undefined : result;
+    markTerminal(now());
     return finish(instance, status, result, target, index, reason, usage, snapshot(activity, now()), present);
   };
   try {
@@ -331,6 +389,7 @@ async function executeTargets(
       noteActivity(activity, "prompt", now());
       const target = targets[index]!;
       instance.model = provenance(instance, target, index);
+      resetThroughput(throughput);
       view.error = undefined;
       present();
       const attempt = await runAttempt(sideEffects, session, executor, {
@@ -431,6 +490,118 @@ function snapshot(state: AgentActivityState, now: number): WatchdogSnapshot {
     inactivityMs: now - state.lastActivityAt,
     activeTool: state.activeTool?.name,
     phase: state.phase,
+  };
+}
+
+type ActivityEvent = {
+  type?: string;
+  toolName?: string;
+  toolCallId?: string;
+  message?: { role?: string; usage?: { output?: number } };
+  assistantMessageEvent?: {
+    type?: string;
+    partial?: { usage?: { output?: number } };
+  };
+};
+
+interface WorkCounts {
+  turns: number;
+  toolCalls: number;
+}
+
+function noteWork(counts: WorkCounts, event: ActivityEvent): void {
+  if (event.type === "tool_execution_start") counts.toolCalls += 1;
+  if (event.type === "message_end" && event.message?.role === "assistant") counts.turns += 1;
+}
+
+interface ThroughputState {
+  outputTokens?: number;
+  streamAccumMs: number;
+  streamAnchor?: number;
+}
+
+function createThroughput(): ThroughputState {
+  return { streamAccumMs: 0 };
+}
+
+function resetThroughput(state: ThroughputState): void {
+  state.outputTokens = undefined;
+  state.streamAccumMs = 0;
+  state.streamAnchor = undefined;
+}
+
+/** Finite usage.output > 0 only. Does not touch watchdog. */
+function sampleOutputTokens(state: ThroughputState, event: ActivityEvent): boolean {
+  const candidates = [event.message?.usage?.output, event.assistantMessageEvent?.partial?.usage?.output];
+  for (const value of candidates) {
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+      state.outputTokens = value;
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Open-stream sample: include time since anchor. No-op while a tool is active. */
+function noteStreamSample(state: ThroughputState, activity: AgentActivityState, now: number): void {
+  if (activity.activeTool) return;
+  if (state.streamAnchor === undefined) state.streamAnchor = now;
+}
+
+function freezeStream(state: ThroughputState, now: number): void {
+  if (state.streamAnchor === undefined) return;
+  state.streamAccumMs += Math.max(0, now - state.streamAnchor);
+  state.streamAnchor = undefined;
+}
+
+function streamMsOf(state: ThroughputState, now: number, activity: AgentActivityState): number | undefined {
+  if (state.streamAnchor === undefined && state.streamAccumMs === 0) return undefined;
+  let ms = state.streamAccumMs;
+  if (state.streamAnchor !== undefined && !activity.activeTool) {
+    ms += Math.max(0, now - state.streamAnchor);
+  }
+  return ms;
+}
+
+function observationOf(
+  instance: AgentInstance,
+  task: string,
+  activity: AgentActivityState,
+  throughput: ThroughputState,
+  work: WorkCounts,
+  acceptedAt: number,
+  terminalAt: number | undefined,
+  now: number,
+  usage: AgentUsage | undefined,
+): AgentUiSnapshot {
+  const dog = snapshot(activity, now);
+  const status = instance.status;
+  const streamMs = streamMsOf(throughput, now, activity);
+  const outputTokens = throughput.outputTokens ?? (usage?.output && usage.output > 0 ? usage.output : undefined);
+  const turns = Math.max(work.turns, usage?.turns ?? 0);
+  const toolCalls = Math.max(work.toolCalls, usage?.toolCalls ?? 0);
+  return {
+    id: instance.id,
+    roleId: instance.roleId,
+    status,
+    phase: dog.phase,
+    task,
+    acceptedAt,
+    terminalAt,
+    selectedModel: instance.model.selectedModel,
+    requestedModel: instance.model.requestedModel,
+    appliedReasoning: instance.model.appliedReasoning,
+    requestedReasoning: instance.model.requestedReasoning,
+    fallbackOccurred: instance.model.fallbackOccurred,
+    fallbackReason: instance.model.fallbackReason,
+    activeTool: activity.activeTool ? { name: activity.activeTool.name, startedAt: activity.activeTool.startedAt } : undefined,
+    lastActivityKind: dog.lastActivityKind,
+    outputTokens,
+    streamMs,
+    turns: turns > 0 ? turns : undefined,
+    toolCalls: toolCalls > 0 ? toolCalls : undefined,
+    inactivityMs: dog.inactivityMs,
+    failureKind: status === "failed" ? dog.lastActivityKind : undefined,
   };
 }
 

@@ -93,7 +93,7 @@ describe("pitako agents command", () => {
     const hanging = hang();
     const handle = await spawnBackground({
       roleId: "developer",
-      task: "SECRET-TASK change the widget",
+      task: "change the widget\nSECRET-SECOND-LINE",
       cwd: packageRoot(),
       executor: hanging.executor,
       load: load(),
@@ -105,17 +105,18 @@ describe("pitako agents command", () => {
     expect(listed.threw).toBe(false);
     expect(listed.notes).toHaveLength(1);
     const text = listed.notes[0] ?? "";
-    expect(text).toContain(`instance_id: ${handle.instanceId}`);
-    expect(text).toContain("role: developer");
-    expect(text).toContain("status: running");
-    expect(text).toContain("watch: yes");
-    expect(text).toMatch(/elapsed_ms: \d+/);
-    expect(text).not.toContain("SECRET-TASK");
-    expect(text).not.toContain("change the widget");
+    expect(text).toContain("T1");
+    expect(text).toContain(handle.instanceId);
+    expect(text).toContain("developer");
+    expect(text).toContain("change the widget");
+    expect(text).not.toContain("SECRET-SECOND-LINE");
 
     const filtered = await cmd.run(`agents ${handle.instanceId}`);
     expect(filtered.threw).toBe(false);
-    expect(filtered.notes).toEqual([text]);
+    expect(filtered.notes).toHaveLength(1);
+    expect(filtered.notes[0]).toContain(handle.instanceId);
+    expect(filtered.notes[0]).toContain("change the widget");
+    expect(filtered.notes[0]).not.toContain("SECRET-SECOND-LINE");
 
     const unknown = await cmd.run("agents missing-worker");
     expect(unknown.threw).toBe(false);

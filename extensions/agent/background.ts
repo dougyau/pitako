@@ -1,5 +1,6 @@
 import { PitakoConfigError } from "../errors.ts";
 import { createPiExecutor } from "./pi.ts";
+import { clearObservations, noteResultTaken, observationEpoch, publishObservation } from "./observe.ts";
 import { runAgentInstance, type AgentRunResult, type AttemptExecutor } from "./run.ts";
 import type { LoadOptions } from "../roles/load.ts";
 
@@ -109,6 +110,7 @@ export async function spawnBackground(input: {
   if (input.foreground?.aborted) throw new Error("agent_spawn cancelled");
   const controller = new AbortController();
   const now = input.now ?? Date.now;
+  const epoch = observationEpoch();
   let row: Row | undefined;
   const pending = runAgentInstance({
     roleId: input.roleId,
@@ -129,6 +131,16 @@ export async function spawnBackground(input: {
         signal: "pending",
       };
       bag().rows.set(instance.id, row);
+    },
+    onObserve(snapshot) {
+      publishObservation(
+        {
+          ...snapshot,
+          planId: input.watch?.planId,
+          unitId: input.watch?.unitId,
+        },
+        epoch,
+      );
     },
   });
   if (!row) {
@@ -168,7 +180,9 @@ export function workerResult(instanceId: string): AgentRunResult {
   if (!row.outcome) {
     throw new Error(statusOf(row) === "running" ? "worker is still running" : "result is not available");
   }
-  return row.outcome;
+  const outcome = row.outcome;
+  noteResultTaken(instanceId);
+  return outcome;
 }
 
 export function cancelWorker(instanceId: string, now: () => number = Date.now): WorkerView {
@@ -186,6 +200,7 @@ export function cancelAllWorkers(): void {
   }
   state.rows.clear();
   state.held = [];
+  clearObservations();
 }
 
 export function shutdownBackground(token: symbol): void {

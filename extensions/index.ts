@@ -2,7 +2,9 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { skillStatusLines } from "./catalog.ts";
 import { PitakoConfigError } from "./errors.ts";
 import { isProtectedEditPath } from "./paths.ts";
-import { bindBackgroundOwner, formatWorkerViews, shutdownBackground, takeHeldCompletions, workerStatus } from "./agent/background.ts";
+import { bindBackgroundOwner, shutdownBackground, takeHeldCompletions } from "./agent/background.ts";
+import { bindAgentUi, listObservations, unbindAgentUi } from "./agent/observe.ts";
+import { formatAgentsDetail } from "./agent/ui.ts";
 import { childSessionNote, ORCHESTRATION_TOOLS, parseProfile, profileNote, toolsForProfile, type ProfileName } from "./profile.ts";
 import { currentInstanceId } from "./agent/scope.ts";
 import { inspectPitako } from "./roles/format.ts";
@@ -88,10 +90,17 @@ export default function pitako(pi: ExtensionAPI) {
       applyProfile(pi, profile);
     }
     if (!pi.getSessionName()) pi.setSessionName(`pitako:${profile}`);
-    if (ctx.hasUI) ctx.ui.setStatus("pitako", `pitako:${profile}`);
+    if (ctx.hasUI) {
+      ctx.ui.setStatus("pitako", `pitako:${profile}`);
+      bindAgentUi({
+        setStatus: (key, text) => ctx.ui.setStatus(key, text),
+        modelLookup: (provider, id) => ctx.modelRegistry?.find(provider, id),
+      });
+    }
   });
 
   pi.on("session_shutdown", async () => {
+    unbindAgentUi();
     shutdownBackground(ownerToken);
     unregisterSupervisedSession();
   });
@@ -136,7 +145,14 @@ export default function pitako(pi: ExtensionAPI) {
       }
       if (command === "agents") {
         try {
-          notify(ctx, formatWorkerViews(workerStatus(value)));
+          let rows = listObservations();
+          if (value) {
+            const one = rows.find((row) => row.id === value);
+            if (!one) throw new Error(`unknown worker ${value}`);
+            rows = [one];
+          }
+          const detail = formatAgentsDetail(rows, Date.now());
+          notify(ctx, detail.length === 0 ? "no workers" : detail);
         } catch (error) {
           notify(ctx, error instanceof Error ? error.message : String(error), "error");
         }

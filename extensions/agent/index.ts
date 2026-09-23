@@ -12,6 +12,7 @@ import {
   workerResult,
   workerStatus,
 } from "./background.ts";
+import { noteResultTaken, observationEpoch, publishObservation } from "./observe.ts";
 import { currentInstanceId } from "./scope.ts";
 import { createPiExecutor } from "./pi.ts";
 import { formatAgentResult, runAgentInstance } from "./run.ts";
@@ -42,6 +43,7 @@ export default function agentInstance(pi: ExtensionAPI): void {
       }
       try {
         let live = "";
+        const epoch = observationEpoch();
         const result = await runAgentInstance({
           roleId: params.role,
           task: params.task,
@@ -55,7 +57,11 @@ export default function agentInstance(pi: ExtensionAPI): void {
               details: { live: text },
             });
           },
+          onObserve(snapshot) {
+            publishObservation(snapshot, epoch);
+          },
         });
+        noteResultTaken(result.instanceId);
         return {
           content: [{ type: "text", text: formatAgentResult(result) }],
           details: { ...result, live },
