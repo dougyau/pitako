@@ -236,7 +236,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
         const truncated = result.result.length > limit;
         return textResult(`${result.result.slice(0, limit)}${truncated ? "\n[truncated; use a narrower assignment]" : ""}`, {
           assignmentId: assignment.id, instanceId: result.instanceId, role: result.role,
-          status: result.status, model: result.model, truncated, resultLength: result.result.length,
+          status: result.status, model: result.model, usage: result.usage, truncated, resultLength: result.result.length,
         }, result.status !== "completed");
       } catch (error) { return errorResult(error instanceof Error ? error.message : String(error)); }
     },

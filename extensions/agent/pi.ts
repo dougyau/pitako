@@ -217,7 +217,7 @@ async function openSession(
     modelRuntime: runtime,
     excludeTools: [...ORCHESTRATION_TOOLS],
   });
-  session.setActiveToolsByName(childActiveTools(session.getAllTools().map((tool) => tool.name)));
+  session.setActiveToolsByName(childActiveTools(session.getAllTools().map((tool) => tool.name), process.platform, input.role.id));
   registerExecution({ instanceId: input.instanceId, roleId: input.role.id, sessionId: session.sessionId });
   return session;
 }
