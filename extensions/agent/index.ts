@@ -23,8 +23,8 @@ import { formatAgentResult, runAgentInstance } from "./run.ts";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { openBoard } from "../board/store.ts";
-import { currentWorkspace } from "../board/workspace.ts";
-import { planFile, readPlan } from "../workflow.ts";
+import { boardWorkspace, currentWorkspace } from "../board/workspace.ts";
+import { ledgerFile, openExecutionPlan, planFile, readFrozenPlan, readPlan, type ExecutionBinding, type PlanMeta } from "../workflow.ts";
 import { teamEvaluationForSession, reserveTeamRole, recordTeamAssignment, recordPlanTeamWork, teamAssignments, type TeamAssignment } from "../team.ts";
 
 const noExtra = { additionalProperties: false } as const;
@@ -129,13 +129,26 @@ function registerTeamTools(pi: ExtensionAPI): void {
         const id = randomUUID();
         const admission = reserveTeamRole(evaluation, params.role, id);
         let accepted = false;
-        let durableWatch: { planId: string; unitId: string } | undefined;
+        let durableWatch: { planId: string; unitId: string; execution?: ExecutionBinding } | undefined;
         try {
           const watch = interestFrom(params.plan, params.unit);
-          const topic = await teamBoardTopic(params.boardTopicId, watch?.planId, ctx.cwd);
-          if (watch && topic !== undefined && existsSync(planFile(watch.planId, ctx.cwd))) {
-            durableWatch = watch;
-            recordPlanTeamWork(ctx.cwd, watch.planId, watch.unitId, id, "pending");
+          let plan: { file: string; text: string; meta: PlanMeta } | undefined;
+          let execution: ExecutionBinding | undefined;
+          if (watch) {
+            plan = existsSync(ledgerFile(watch.planId, ctx.cwd))
+              ? openExecutionPlan(watch.planId, ctx.cwd, { createLedger: false })
+              : assignmentPlan(watch.planId, ctx.cwd);
+          }
+          const topic = await teamBoardTopic(params.boardTopicId, watch?.planId, ctx.cwd, plan?.meta);
+          if (watch && plan?.meta.status === "frozen") {
+            const opened = openExecutionPlan(watch.planId, ctx.cwd, { createLedger: true, source: plan });
+            plan = opened;
+            execution = opened.binding;
+            if (topic !== undefined) await claimTeamBoardTopicExecution(topic, opened.meta, ctx.cwd, opened.binding.executionRoot);
+          }
+          if (watch && topic !== undefined && plan) {
+            durableWatch = { ...watch, execution };
+            recordPlanTeamWork(ctx.cwd, watch.planId, watch.unitId, id, "pending", execution);
           }
           const task = [
             `Team assignment header: Team ${evaluation!.sessionId}; role ${params.role}; assignment ${id}${topic !== undefined ? `; Board topic ${topic}` : ""}.`,
@@ -145,9 +158,9 @@ function registerTeamTools(pi: ExtensionAPI): void {
           const handle = await spawnBackground({
             roleId: params.role,
             task,
-            cwd: ctx.cwd,
+            cwd: execution?.executionRoot ?? ctx.cwd,
             foreground: signal,
-            watch,
+            watch: watch ? { ...watch, execution } : undefined,
             executor: backgroundExecutor(),
             teamOwner: {
               token: admission.token,
@@ -159,14 +172,14 @@ function registerTeamTools(pi: ExtensionAPI): void {
           admission.commit();
           const assignment: TeamAssignment = {
             id, instanceId: handle.instanceId, roleId: params.role, task: params.task.trim(),
-            planId: watch?.planId, unitId: watch?.unitId, boardTopicId: topic,
+            planId: watch?.planId, unitId: watch?.unitId, boardTopicId: topic, execution,
           };
           recordTeamAssignment(evaluation!, params.role, assignment);
           return textResult(`assignment_id: ${id}\nrole: ${params.role}\ninstance_id: ${handle.instanceId}\nstatus: running`, assignment);
         } catch (error) {
           if (!accepted) {
             if (durableWatch) {
-              try { recordPlanTeamWork(ctx.cwd, durableWatch.planId, durableWatch.unitId, id, undefined); } catch { /* original assignment failure takes precedence */ }
+              try { recordPlanTeamWork(ctx.cwd, durableWatch.planId, durableWatch.unitId, id, undefined, durableWatch.execution); } catch { /* original assignment failure takes precedence */ }
             }
             admission.rollback();
           }
@@ -230,7 +243,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
         const assignment = findAssignment(evaluation, params.assignmentId);
         const result = teamWorkerResult(evaluation.token, assignment.instanceId);
         if (assignment.planId && assignment.unitId && assignment.boardTopicId !== undefined) {
-          recordPlanTeamWork(ctx.cwd, assignment.planId, assignment.unitId, assignment.id, result.status);
+          recordPlanTeamWork(ctx.cwd, assignment.planId, assignment.unitId, assignment.id, result.status, assignment.execution);
         }
         const limit = 8000;
         const truncated = result.result.length > limit;
@@ -260,7 +273,29 @@ function registerTeamTools(pi: ExtensionAPI): void {
   });
 }
 
-async function teamBoardTopic(explicit: string | undefined, planId: string | undefined, cwd: string): Promise<number | undefined> {
+function watchedExecutionBinding(planId: string, cwd: string): ExecutionBinding | undefined {
+  if (existsSync(ledgerFile(planId, cwd))) return openExecutionPlan(planId, cwd, { createLedger: true }).binding;
+  const plan = assignmentPlan(planId, cwd);
+  if (!plan || plan.meta.status !== "frozen") return undefined;
+  return openExecutionPlan(planId, cwd, { createLedger: true, source: plan }).binding;
+}
+
+function assignmentPlan(planId: string, cwd: string): { file: string; text: string; meta: PlanMeta } | undefined {
+  const local = planFile(planId, cwd);
+  if (existsSync(local)) return readPlan(planId, cwd);
+  try { return readFrozenPlan(planId, cwd); }
+  catch (error) {
+    if (error instanceof Error && error.message.includes("PLAN_NOT_FOUND")) return undefined;
+    throw error;
+  }
+}
+
+async function teamBoardTopic(
+  explicit: string | undefined,
+  planId: string | undefined,
+  cwd: string,
+  plan?: PlanMeta,
+): Promise<number | undefined> {
   let explicitId: number | undefined;
   if (explicit !== undefined) {
     const value = explicit.trim();
@@ -269,8 +304,6 @@ async function teamBoardTopic(explicit: string | undefined, planId: string | und
     }
     explicitId = Number(value);
   }
-  const file = planId === undefined ? undefined : planFile(planId, cwd);
-  const plan = file && existsSync(file) ? readPlan(planId!, cwd).meta : undefined;
   if (explicitId !== undefined && (!planId || (plan && plan.boardTopicId === undefined))) {
     throw new Error("explicit Board topics require a bound watched plan; only planning assignments with a missing plan artifact may pass an explicit topic");
   }
@@ -283,7 +316,9 @@ async function teamBoardTopic(explicit: string | undefined, planId: string | und
 
   const board = await openBoard();
   try {
-    const topic = board.readTopic(currentWorkspace(cwd), topicId).topic;
+    const location = boardWorkspace(cwd);
+    board.migrateLegacyWorkspaces(location.identity, location.legacyRoots);
+    const topic = board.readTopic(location.identity, topicId).topic;
     if (plan?.boardTopicId !== undefined && topic.ownerPlanId !== plan.id) {
       throw new Error(`Board topic ${topicId} is not owned by watched plan ${plan.id}`);
     }
@@ -293,7 +328,38 @@ async function teamBoardTopic(explicit: string | undefined, planId: string | und
     if (topic.ownerPlanId !== null && (plan?.boardTopicId === undefined || topic.ownerPlanId !== plan.id)) {
       throw new Error(`Board topic ${topicId} is not bound to the watched plan`);
     }
+    if (plan?.status === "frozen" && (topic.planRevision !== null || topic.planHash !== null || topic.executionRoot !== null)) {
+      if (topic.planRevision === null || topic.planHash === null || topic.executionRoot === null) {
+        throw new Error(`Board topic ${topicId} has an incomplete frozen execution claim`);
+      }
+      if (topic.executionRoot !== currentWorkspace(cwd)) {
+        throw new Error(`Board topic ${topicId} is pinned to execution worktree ${topic.executionRoot}`);
+      }
+      if (topic.planRevision !== plan.revision || topic.planHash !== plan.hash) {
+        throw new Error(`Board topic ${topicId} frozen plan identity does not match revision ${plan.revision} and hash ${plan.hash}`);
+      }
+    }
     return topicId;
+  } finally {
+    board.close();
+  }
+}
+
+async function claimTeamBoardTopicExecution(
+  topicId: number,
+  plan: PlanMeta,
+  cwd: string,
+  executionRoot: string,
+): Promise<void> {
+  const board = await openBoard();
+  try {
+    const location = boardWorkspace(cwd);
+    board.migrateLegacyWorkspaces(location.identity, location.legacyRoots);
+    board.claimTopicExecution(location.identity, topicId, plan.id, {
+      revision: plan.revision,
+      hash: plan.hash,
+      executionRoot,
+    });
   } finally {
     board.close();
   }
@@ -345,12 +411,14 @@ function registerBackgroundTools(pi: ExtensionAPI): void {
       const blocked = childBlocked("agent_spawn");
       if (blocked) return blocked;
       try {
+        const watch = interestFrom(params.plan, params.unit);
+        const execution = watch ? watchedExecutionBinding(watch.planId, ctx.cwd) : undefined;
         const handle = await spawnBackground({
           roleId: params.role,
           task: params.task,
-          cwd: ctx.cwd,
+          cwd: execution?.executionRoot ?? ctx.cwd,
           foreground: signal,
-          watch: interestFrom(params.plan, params.unit),
+          watch: watch ? { ...watch, execution } : undefined,
           executor: backgroundExecutor(),
         });
         return textResult(formatWorkerHandle(handle), handle);

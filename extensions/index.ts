@@ -15,8 +15,7 @@ import { registerSupervisedSession, unregisterSupervisedSession } from "./herdr/
 import { registerAgentSupervise } from "./herdr/supervise.ts";
 import { packageRoot, prepareRuntime } from "./stack.ts";
 import { planHeading, planInvocation, sessionNameAction } from "./session-name.ts";
-import { parsePlanDocument, planFile } from "./workflow.ts";
-import { readFileSync } from "node:fs";
+import { planFile, readFrozenPlan, readPlan } from "./workflow.ts";
 import path from "node:path";
 
 function requestedProfile(pi: ExtensionAPI): ProfileName {
@@ -297,8 +296,7 @@ function latestPlanInvocation(entries: readonly unknown[]): { activity: "plan" |
 
 function readWorkflowTitle(activity: "plan" | "execute", id: string, cwd: string): { activity: "plan" | "execute"; title: string } | undefined {
   try {
-    const text = readFileSync(planFile(id, cwd), "utf8");
-    if (parsePlanDocument(text).id !== id) return undefined;
+    const { text } = activity === "execute" ? readFrozenPlan(id, cwd) : readPlan(id, cwd);
     return { activity, title: planHeading(text) ?? id };
   } catch {
     return undefined;

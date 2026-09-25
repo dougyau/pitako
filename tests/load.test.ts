@@ -100,7 +100,7 @@ describe("Pi package loading", () => {
 describe("repository hygiene", () => {
   test("source does not embed absolute developer paths or credentials", () => {
     const root = packageRoot();
-    const skip = new Set(["node_modules", ".git", ".codegraph", "bun.lock"]);
+    const skip = new Set(["node_modules", ".git", ".codegraph", ".pitako", "bun.lock"]);
     const offenders: string[] = [];
     const walk = (directory: string) => {
       for (const name of readdirSync(directory)) {

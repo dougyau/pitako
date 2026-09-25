@@ -15,12 +15,13 @@ import {
   type TopicPage,
 } from "./store.ts";
 import { resolveBoardAuthor } from "./author.ts";
-import { currentWorkspace } from "./workspace.ts";
+import { boardWorkspace } from "./workspace.ts";
 import { currentInstanceId } from "../agent/scope.ts";
-import { bindPlanTopic, ledgerFile, parseLedgerBinding, parseLedgerStatus, readPlan, bindingMismatch, withLedgerTeamHoldLock } from "../workflow.ts";
-import { teamEvaluationForSession, hasUnsettledTeamWork } from "../team.ts";
+import { bindPlanTopic, ledgerFile, openExecutionPlan, parseLedgerBinding, parseLedgerStatus, readFrozenPlan, readPlan, bindingMismatch, verifyExecutionBinding, withLedgerTeamHoldLock } from "../workflow.ts";
+import { teamEvaluationForSession, teamExecutionBinding, hasUnsettledTeamWork } from "../team.ts";
 import { executionForSession } from "../execution-identity.ts";
 import { existsSync, readFileSync } from "node:fs";
+import { getBoardDbPath } from "./paths.ts";
 
 const PostTypeSchema = StringEnum(POST_TYPES);
 const TopicStatusSchema = StringEnum(TOPIC_STATUSES);
@@ -166,37 +167,99 @@ export function registerBoard(pi: ExtensionAPI): void {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       if (isChildSession(ctx)) return toolError("workflow Board lifecycle cannot be called from a child session");
       try {
-        const plan = readPlan(params.planId, ctx.cwd);
-        const boardTopicId = plan.meta.boardTopicId;
-        if (boardTopicId === undefined) return toolSuccess("Plan has no Board topic; no Board changes made.", { noTopic: true });
-        const ledger = ledgerFile(plan.meta.id, ctx.cwd);
-        let ledgerStatus: string | undefined;
-        if (existsSync(ledger)) {
-          const ledgerText = readFileSync(ledger, "utf8");
-          const mismatch = bindingMismatch(plan.meta, parseLedgerBinding(ledgerText));
-          if (mismatch) throw new BoardError(mismatch);
-          ledgerStatus = parseLedgerStatus(ledgerText);
+        const evaluation = teamEvaluationForSession(ctx.sessionManager?.getSessionId?.(), false);
+        const captured = teamExecutionBinding(evaluation, params.planId);
+        const initialPlan = captured ? verifyExecutionBinding(captured) : lifecyclePlan(params.planId, ctx.cwd);
+        if (initialPlan.meta.boardTopicId === undefined && !existsSync(getBoardDbPath())) {
+          return toolSuccess("Plan has no Board topic; no Board changes made.", { noTopic: true });
         }
-        if (params.status === "resolved") {
-          if (ledgerStatus === "USER_DECISION_REQUIRED") throw new BoardError("USER_DECISION_REQUIRED in ledger prohibits resolving the Board topic");
-          if (plan.meta.execution === undefined) {
-            throw new BoardError("bound frozen plan must declare execution: expected or execution: none before resolving its Board topic");
-          }
-          if (plan.meta.execution === "expected" && ledgerStatus !== "completed") {
-            throw new BoardError("expected execution can resolve its Board topic only after the ledger is completed");
-          }
-        }
-        return run(ctx, (board, workspace) => {
-          const transition = () => {
-            if (params.status === "resolved") {
-              const evaluation = teamEvaluationForSession(ctx.sessionManager?.getSessionId?.(), false);
-              if (hasUnsettledTeamWork(evaluation, plan.meta.id, ctx.cwd)) throw new BoardError("Team work for this plan is pending, failed, or cancelled; wait for its successful result or explicitly reconcile the exact ledger hold after documented recovery");
+        const location = boardWorkspace(ctx.cwd);
+        const board = await openBoard();
+        try {
+          board.migrateLegacyWorkspaces(location.identity, location.legacyRoots);
+          const ownedTopicId = board.findTopicOwnedByPlan(location.identity, params.planId);
+          if (ownedTopicId === undefined) {
+            if (initialPlan.meta.boardTopicId === undefined) {
+              return toolSuccess("Plan has no Board topic; no Board changes made.", { noTopic: true });
             }
-            const topic = board.transitionOwnedTopic(workspace, boardTopicId, plan.meta.id, params.status);
-            return { text: formatTopicCreated(topic), details: { topicId: topic.id, status: topic.status } };
+            throw new BoardError(`Board topic ${initialPlan.meta.boardTopicId} is not owned by plan ${params.planId}`);
+          }
+          let topic = board.readTopic(location.identity, ownedTopicId).topic;
+          if (topic.ownerPlanId !== params.planId) throw new BoardError(`Board topic ${topic.id} is not owned by plan ${params.planId}`);
+          const executionRoot = topic.executionRoot ?? captured?.executionRoot ?? location.physicalRoot;
+          if (executionRoot !== location.physicalRoot) {
+            throw new BoardError(`caller worktree ${location.physicalRoot} does not match Board topic execution worktree ${executionRoot}`);
+          }
+
+          let plan = initialPlan;
+          let executionBinding = captured;
+          let claimExecution = false;
+          if (topic.executionRoot !== null || plan.meta.status === "frozen") {
+            const source = captured ? verifyExecutionBinding(captured) : topic.executionRoot === null ? plan : undefined;
+            const opened = openExecutionPlan(params.planId, executionRoot, {
+              createLedger: false,
+              ...(source ? { source } : {}),
+            });
+            plan = opened;
+            executionBinding = opened.binding;
+            if (plan.meta.boardTopicId !== topic.id) throw new BoardError(`Board topic ${topic.id} does not match the pinned frozen plan binding`);
+            if (captured && (opened.binding.executionRoot !== captured.executionRoot || opened.binding.planSource !== captured.planSource ||
+              opened.binding.revision !== captured.revision || opened.binding.hash !== captured.hash)) {
+              throw new BoardError("ledger execution binding does not match captured Team execution");
+            }
+            if (topic.planRevision !== null || topic.planHash !== null || topic.executionRoot !== null) {
+              if (topic.planRevision !== plan.meta.revision || topic.planHash !== plan.meta.hash || topic.executionRoot !== executionRoot) {
+                throw new BoardError(`Board topic ${topic.id} frozen plan identity or execution worktree does not match`);
+              }
+            } else {
+              claimExecution = true;
+            }
+          } else if (topic.planRevision !== null || topic.planHash !== null || topic.executionRoot !== null) {
+            throw new BoardError(`Board topic ${topic.id} has a frozen execution claim for a non-frozen plan`);
+          } else if (plan.meta.boardTopicId !== topic.id) {
+            throw new BoardError(`Board topic ${topic.id} does not match the plan binding`);
+          }
+
+          const ledger = ledgerFile(plan.meta.id, executionRoot);
+          let ledgerStatus: string | undefined;
+          if (existsSync(ledger)) {
+            const ledgerText = readFileSync(ledger, "utf8");
+            const ledgerBinding = parseLedgerBinding(ledgerText);
+            const mismatch = bindingMismatch(plan.meta, ledgerBinding);
+            if (mismatch) throw new BoardError(mismatch);
+            if (executionBinding && (ledgerBinding.executionRoot !== executionBinding.executionRoot || ledgerBinding.planSource !== executionBinding.planSource)) {
+              throw new BoardError("ledger execution binding does not match the Board topic execution");
+            }
+            ledgerStatus = parseLedgerStatus(ledgerText);
+          }
+          if (params.status === "resolved") {
+            if (ledgerStatus === "USER_DECISION_REQUIRED") throw new BoardError("USER_DECISION_REQUIRED in ledger prohibits resolving the Board topic");
+            if (plan.meta.execution === undefined) {
+              throw new BoardError("bound frozen plan must declare execution: expected or execution: none before resolving its Board topic");
+            }
+            if (plan.meta.execution === "expected" && ledgerStatus !== "completed") {
+              throw new BoardError("expected execution can resolve its Board topic only after the ledger is completed");
+            }
+          }
+          const transition = () => {
+            if (params.status === "resolved" && hasUnsettledTeamWork(evaluation, plan.meta.id, executionRoot, executionBinding)) {
+              throw new BoardError("Team work for this plan is pending, failed, or cancelled; wait for its successful result or explicitly reconcile the exact ledger hold after documented recovery");
+            }
+            const updated = board.transitionOwnedTopic(
+              location.identity,
+              topic.id,
+              plan.meta.id,
+              params.status,
+              params.status === "resolved" && claimExecution
+                ? { revision: plan.meta.revision, hash: plan.meta.hash, executionRoot }
+                : undefined,
+            );
+            return toolSuccess(formatTopicCreated(updated), { topicId: updated.id, status: updated.status });
           };
-          return params.status === "resolved" ? withLedgerTeamHoldLock(ctx.cwd, plan.meta.id, transition) : transition();
-        });
+          return params.status === "resolved" ? withLedgerTeamHoldLock(executionRoot, plan.meta.id, transition) : transition();
+        } finally {
+          board.close();
+        }
       } catch (error) {
         return toolError(error instanceof Error ? error.message : String(error));
       }
@@ -272,7 +335,9 @@ async function inspectBoard(args: string, ctx: ExtensionCommandContext): Promise
   let board: Board | undefined;
   try {
     board = await openBoard();
-    const workspace = currentWorkspace(ctx.cwd);
+    const location = boardWorkspace(ctx.cwd);
+    board.migrateLegacyWorkspaces(location.identity, location.legacyRoots);
+    const workspace = location.identity;
     if (text.length === 0) {
       report(ctx, formatTopicList(board.listTopics(workspace, {})));
       return;
@@ -300,7 +365,9 @@ async function run(
   let board: Board | undefined;
   try {
     board = await openBoard();
-    const result = action(board, currentWorkspace(ctx.cwd));
+    const location = boardWorkspace(ctx.cwd);
+    board.migrateLegacyWorkspaces(location.identity, location.legacyRoots);
+    const result = action(board, location.identity);
     return { content: [{ type: "text", text: result.text }], details: result.details };
   } catch (error) {
     const message = error instanceof BoardError ? error.message : error instanceof Error ? error.message : String(error);
@@ -311,6 +378,15 @@ async function run(
     };
   } finally {
     board?.close();
+  }
+}
+
+function lifecyclePlan(planId: string, cwd: string): { file: string; text: string; meta: ReturnType<typeof readPlan>["meta"] } {
+  try {
+    return readPlan(planId, cwd);
+  } catch (error) {
+    if (error instanceof Error && /plan not found:/i.test(error.message)) return readFrozenPlan(planId, cwd);
+    throw error;
   }
 }
 
