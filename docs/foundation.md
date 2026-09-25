@@ -1,6 +1,6 @@
 # Foundation notes
 
-The curated engineering layer (Ponytail, Caveman, selected pstack skills, rpiv-todo) is documented in [engineering.md](engineering.md).
+This note records the initial package choices. For the current AgentInstance, Team, Board, and Code Intelligence behavior, see [engineering.md](engineering.md).
 
 Pitako 0.1 composes current Pi (`@earendil-works/pi-coding-agent` 0.87.0). Packages declare resources under `package.json` `pi` (`extensions`, `skills`, `prompts`). Pi installs npm and git packages with `pi install` and runs `npm install` in that package. A local path is not copied and does not install dependencies, so a checkout needs `bun install` first.
 
@@ -22,13 +22,13 @@ MIT. Last commit reviewed: 2026-08-11. Entry `extensions/codegraph.ts`. Peer dep
 
 Native Pi tools: `codegraph_search`, `codegraph_callers`, `codegraph_callees`, `codegraph_impact`, `codegraph_explore`, `codegraph_node`, `codegraph_files`, `codegraph_status`. Each call spawns `codegraph serve --mcp` for the project path. That is the CLI's interface, not a Pi MCP adapter the user has to configure.
 
-`codegraph_explore` is the relevant-context tool. The CLI's separate `codegraph_context` tool is not wrapped.
+`codegraph_explore` is the relevant-context tool. The CLI's separate `codegraph_context` tool is not wrapped. Pitako keeps the vendor's raw tool registrations but omits its prompt hook that prioritizes raw CodeGraph over read and grep. Dense Code Intelligence queries use the SDK directly, not this CLI adapter.
 
 Requires Node >= 22.19, matching Pi. Tested here against CodeGraph CLI 1.6.0, which this package depends on. If `codegraph` is already on `PATH`, that binary wins. Otherwise Pitako prepends its own `node_modules/.bin` for the process.
 
 ### Profiles
 
-Pi's default active built-ins are `read`, `bash`, `edit`, and `write`. `grep`, `find`, and `ls` are registered but inactive until something enables them. The coding profile turns those three on. The analysis profile calls `pi.setActiveTools` with the coding set minus `edit`, `write`, and `lsp_rename`.
+Pi's default active built-ins are `read`, `bash`, `edit`, and `write`. `grep`, `find`, and `ls` are registered but inactive until something enables them. The coding profile turns those three on. The analysis profile calls `pi.setActiveTools` without `edit`, `write`, `apply_patch`, or `lsp_rename`.
 
 No provider or model is set. `config/presets.example.json` is documentation only.
 
@@ -56,10 +56,10 @@ No provider or model is set. `config/presets.example.json` is documentation only
 From the current Pi examples (package 0.87.0):
 
 - **Tool gating:** `pi.getActiveTools` / `pi.setActiveTools`. Used by the profiles.
-- **Protected paths:** `tool_call` can return `{ block: true, reason }`. Pitako blocks `.git/`, `node_modules/`, and `.env` files for `edit` and `write`.
+- **Protected paths:** `tool_call` can return `{ block: true, reason }`. Pitako blocks `.git/`, `node_modules/`, `.env`, and `.env.*` files for `edit` and `write`.
 - **Session name and status:** `pi.setSessionName` and `ctx.ui.setStatus`.
 - **Flags:** `--pitako-profile` via `pi.registerFlag`.
-- **Subagents, for later teams:** the official example spawns a separate `pi` process in JSON mode, discovers agent markdown from `~/.pi/agent/agents` (project agents only when explicitly trusted), and passes a tool list in frontmatter. Parallel and chain modes are capped. Pitako does not copy that runtime. A future team package can reuse isolated processes, markdown agent files, and per-agent tool lists without a roster or board type in this repo.
+- **External subagent example:** the official example spawns a separate `pi` process in JSON mode, discovers agent markdown from `~/.pi/agent/agents` (project agents only when explicitly trusted), and passes a tool list in frontmatter. Pitako instead runs AgentInstances and Team workers in process; it does not copy that subprocess runtime.
 
 ## Startup errors
 
@@ -70,13 +70,11 @@ From the current Pi examples (package 0.87.0):
 
 Pi reports an extension that throws while loading as a startup error. A language server that is not installed is not a package failure. `pi-lsp-client` reports that when a tool runs.
 
-## Deferred
+## Still deferred
 
-- Coordinator, architect, researcher, and development roles
-- Teams, subteams, roster, message board
-- Work intents and execution authority
-- Model class, model policy, and fallbacks
-- Repository hints, worktrees, remote agents
+- Subteams and nested agent delegation
+- Remote agents and process-persistent background workers
+- Private or team Board scopes
 - Web research until a small extension is worth requiring
 - Bash sandbox and plan-mode command allowlists
 - Hover, and `codegraph_context` if a maintained Pi wrapper exposes it without private imports
