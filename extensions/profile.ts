@@ -8,7 +8,7 @@ export const CODING_BUILTINS = ["read", "bash", "edit", "write", "grep", "find",
 export const ANALYSIS_BUILTINS = ["read", "bash", "grep", "find", "ls"] as const;
 
 /** Tools that change files. Shell is intentionally not in this set. */
-export const MUTATING_TOOLS = new Set(["edit", "write", "lsp_rename"]);
+export const MUTATING_TOOLS = new Set(["edit", "write", "apply_patch", "lsp_rename"]);
 
 /** Foreground orchestration. Children do not receive these tools. */
 export const ORCHESTRATION_TOOLS = [
@@ -46,10 +46,15 @@ export function parseProfile(value: unknown): ProfileName {
 }
 
 /** Coding tools for a child session. PowerShell follows the platform, same as a fresh coding profile. */
-export function childActiveTools(available: readonly string[], platform: NodeJS.Platform = process.platform): string[] {
+export function childActiveTools(
+  available: readonly string[],
+  platform: NodeJS.Platform = process.platform,
+  roleId?: string,
+): string[] {
   return toolsForProfile({
     available,
     profile: "coding",
+    roleId,
     includePowerShell: platform === "win32" && available.includes("powershell"),
   }).filter((name) => !ORCHESTRATION.has(name));
 }
@@ -57,6 +62,7 @@ export function childActiveTools(available: readonly string[], platform: NodeJS.
 export function toolsForProfile(options: {
   available: readonly string[];
   profile: ProfileName;
+  roleId?: string;
   includePowerShell?: boolean;
 }): string[] {
   const available = new Set(options.available);
@@ -65,6 +71,7 @@ export function toolsForProfile(options: {
   if (options.includePowerShell && available.has("powershell")) names.push("powershell");
   for (const name of options.available) {
     if (BUILTIN_TOOLS.has(name)) continue;
+    if (name === "apply_patch" && options.roleId !== "developer") continue;
     if (options.profile === "analysis" && MUTATING_TOOLS.has(name)) continue;
     names.push(name);
   }
@@ -73,7 +80,8 @@ export function toolsForProfile(options: {
 
 export function profileNote(profile: ProfileName): string {
   const shared = [
-    "Inspect the repository before editing. Prefer CodeGraph and LSP over broad grep.",
+    "Inspect the repository before editing. Keep raw read, grep, bash, LSP and CodeGraph visible as the navigation baseline; coding keeps edit available.",
+    "Use dense queries for bounded code questions; fall back to raw when coverage is partial or unavailable.",
     "Keep diffs small. Reuse existing code. Do not add speculative machinery.",
     "Verify real behavior before claiming done. Load a specialized skill only when it applies.",
     "Research or design does not authorize implementation.",
@@ -83,12 +91,16 @@ export function profileNote(profile: ProfileName): string {
   if (profile === "analysis") {
     return [
       "Pitako profile: analysis.",
-      "Read-only coding tools are enabled. edit, write, and lsp_rename are not.",
+      "Read-only coding tools are enabled. edit, write, apply_patch, and lsp_rename are not.",
       "Shell is still available; this profile is not a sandbox.",
       ...shared,
     ].join(" ");
   }
-  return ["Pitako profile: coding.", ...shared].join(" ");
+  return [
+    "Pitako profile: coding.",
+    "Keep edit and write active. Use edit for one or a few local replacements.",
+    ...shared,
+  ].join(" ");
 }
 
 /** True for an AgentInstance. Does not claim the user picked the model. */
@@ -96,7 +108,7 @@ export function childSessionNote(instanceId: string): string {
   return [
     `Pitako AgentInstance ${instanceId}.`,
     "The model and reasoning come from this role's ModelPolicy, not from the parent session.",
-    "Inspect the repository before editing. Prefer CodeGraph and LSP over broad grep.",
+    "Inspect the repository before editing. Keep raw read, grep, LSP and CodeGraph available as the navigation baseline; use dense queries for bounded code questions and fall back to raw when needed.",
     "Keep diffs small. Verify real behavior before claiming done.",
     "Board tools are pull-only. rpiv-todo is private to this session. Do not spawn agents.",
   ].join(" ");

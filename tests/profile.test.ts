@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { isProtectedEditPath } from "../extensions/paths.ts";
-import { parseProfile, profileNote, toolsForProfile } from "../extensions/profile.ts";
+import { childActiveTools, parseProfile, profileNote, toolsForProfile } from "../extensions/profile.ts";
 
 const available = [
   "read",
@@ -8,6 +8,7 @@ const available = [
   "powershell",
   "edit",
   "write",
+  "apply_patch",
   "grep",
   "find",
   "ls",
@@ -22,12 +23,18 @@ const available = [
 ];
 
 describe("profiles", () => {
-  test("coding enables search tools and keeps edits", () => {
+  test("coding profile keeps edit/write but hides apply_patch outside Developer AgentInstances", () => {
     const tools = toolsForProfile({ available, profile: "coding" });
     for (const name of ["read", "bash", "edit", "write", "grep", "find", "ls", "lsp_rename", "codegraph_search", "todo", "board_post"]) {
       expect(tools).toContain(name);
     }
+    expect(tools).not.toContain("apply_patch");
     expect(tools).not.toContain("powershell");
+    expect(childActiveTools(available)).not.toContain("apply_patch");
+    for (const roleId of ["architect", "reviewer", "researcher"]) {
+      expect(childActiveTools(available, process.platform, roleId)).not.toContain("apply_patch");
+    }
+    expect(childActiveTools(available, process.platform, "developer")).toContain("apply_patch");
   });
 
   test("analysis removes file-mutating tools and keeps LSP and CodeGraph reads", () => {
@@ -35,7 +42,7 @@ describe("profiles", () => {
     for (const name of ["read", "bash", "grep", "find", "ls", "lsp_diagnostics", "codegraph_callers", "todo", "board_query"]) {
       expect(tools).toContain(name);
     }
-    for (const name of ["edit", "write", "lsp_rename"]) {
+    for (const name of ["edit", "write", "apply_patch", "lsp_rename"]) {
       expect(tools).not.toContain(name);
     }
   });
@@ -55,8 +62,8 @@ describe("profiles", () => {
     expect(coding).toContain("Keep diffs small");
     expect(coding).toContain("Board tools are pull-only");
     expect(coding).not.toContain("FINDING");
-    expect(coding).not.toContain("edit, write, and lsp_rename are not");
-    expect(analysis).toContain("edit, write, and lsp_rename are not");
+    expect(coding).not.toContain("apply_patch");
+    expect(analysis).toContain("edit, write, apply_patch, and lsp_rename are not");
     expect(analysis).toContain("this profile is not a sandbox");
     expect(coding.length).toBeLessThan(800);
   });

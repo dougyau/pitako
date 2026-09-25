@@ -9,6 +9,17 @@
     "notLoaded": ["@juicesharp/rpiv-i18n"],
     "reason": "Official Pi package. Session-local TODO overlay, tool, and /todos. Pitako does not vendor the reducer, overlay, or schemas. i18n remains an optional peer."
   },
+  "pi-codex-tools": {
+    "decision": "dependency",
+    "package": "pi-codex-tools",
+    "version": "0.3.0",
+    "repository": "https://github.com/jvm/pi-mono/tree/main/packages/pi-codex-tools",
+    "license": "Apache-2.0",
+    "attribution": "OpenAI Codex, Copyright 2025 OpenAI; see package NOTICE",
+    "loaded": ["public parser and grammar exports from the package entry"],
+    "notLoaded": ["index.ts extension", "extensions/index.ts", "src/install-telemetry.ts"],
+    "reason": "Use only the public parser/grammar library entry; do not load the extension that replaces edit/write or reports install telemetry."
+  },
   "ponytail": {
     "decision": "dependency",
     "package": "@dietrichgebert/ponytail",

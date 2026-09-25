@@ -1,5 +1,7 @@
 /** Pure agent footer/detail projection. No Pi, bag, ledger, ANSI, or timers. */
 
+import type { AgentUsage } from "./run.ts";
+
 export type AgentUiStatus = "created" | "running" | "completed" | "failed" | "cancelled";
 export type AgentUiPhase = "working" | "idle" | "suspected_stall" | "stalled";
 
@@ -32,6 +34,8 @@ export interface AgentUiSnapshot {
   failureKind?: string;
   /** Watchdog inactivity; used for `no stream · mm:ss`. */
   inactivityMs?: number;
+  /** Usage accumulated by the existing AgentInstance attempt/session. */
+  agentUsage?: AgentUsage;
   /** Internal foreground lease; omitted for untagged AgentInstances. */
   teamOwnerToken?: symbol;
 }

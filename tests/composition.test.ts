@@ -12,7 +12,10 @@ import {
 import pitako from "../extensions/index.ts";
 import { profileNote } from "../extensions/profile.ts";
 import { packageRoot } from "../extensions/stack.ts";
-import { loadPitako } from "../scripts/load-pitako.ts";
+import { loadPitako, registeredToolNames } from "../scripts/load-pitako.ts";
+import codegraphRaw from "../extensions/code-intelligence/codegraph-raw.ts";
+import { CODE_INTELLIGENCE_TOOL_NAMES } from "../extensions/code-intelligence/metrics.ts";
+import { toolsForProfile } from "../extensions/profile.ts";
 
 function readRepo(relative: string): string {
   return readFileSync(path.join(packageRoot(), relative), "utf8");
@@ -26,10 +29,14 @@ describe("engineering-layer composition", () => {
     const extensionPaths = loaded.extensions.extensions.map((extension) => extension.resolvedPath);
     expect(extensionPaths.some((file) => file.endsWith("extensions/index.ts"))).toBe(true);
     expect(extensionPaths.some((file) => file.includes(`${path.sep}pi-lsp-client${path.sep}`))).toBe(true);
-    expect(extensionPaths.some((file) => file.includes(`${path.sep}pi-codegraph${path.sep}`))).toBe(true);
+    expect(extensionPaths.some((file) => file.endsWith(`${path.sep}codegraph-raw.ts`))).toBe(true);
     expect(extensionPaths.some((file) => file.includes(`${path.sep}rpiv-todo${path.sep}`))).toBe(true);
     expect(extensionPaths.some((file) => file.endsWith(`${path.sep}extensions${path.sep}board${path.sep}index.ts`))).toBe(true);
     expect(extensionPaths.some((file) => file.includes(`${path.sep}ponytail${path.sep}pi-extension${path.sep}`))).toBe(false);
+    const registered = registeredToolNames(loaded.extensions);
+    expect(registered).toEqual(expect.arrayContaining([...CODE_INTELLIGENCE_TOOL_NAMES, "codegraph_search", "lsp_diagnostics"]));
+    const active = toolsForProfile({ available: [...registered, "read", "grep", "bash", "edit", "write"], profile: "coding" });
+    expect(active).toEqual(expect.arrayContaining([...CODE_INTELLIGENCE_TOOL_NAMES, "read", "grep", "bash", "edit", "write"]));
     expect(extensionPaths.some((file) => file.includes("pstack"))).toBe(false);
 
     const skills = loaded.loader.getSkills().skills.map((skill) => skill.name).sort();
@@ -45,6 +52,18 @@ describe("engineering-layer composition", () => {
     expect(skills).toContain("pitako-coding");
     expect(skills).toContain("ponytail");
     expect(skills).toContain("caveman");
+  });
+
+  test("CodeGraph facade keeps raw tools but skips only its conflicting prompt hook", () => {
+    const hooks: string[] = [];
+    const tools: string[] = [];
+    codegraphRaw({
+      on(event: string) { hooks.push(event); return () => {}; },
+      registerTool(tool: { name: string }) { tools.push(tool.name); },
+    } as never);
+    expect(hooks).not.toContain("before_agent_start");
+    expect(tools).toContain("codegraph_search");
+    expect(tools).toContain("codegraph_impact");
   });
 
   test("always-on profile note stays small and does not embed third-party bodies", () => {

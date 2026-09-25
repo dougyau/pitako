@@ -1,0 +1,26 @@
+{
+  "fixture": "pitako-session-names-reduced-v1",
+  "historicalCommit": "96ef478137785943d469f3f7e7b99524b9ad6819",
+  "preChangeCommit": "96ef478137785943d469f3f7e7b99524b9ad6819^",
+  "files": [
+    "WORKBRIEF.md",
+    "package.json",
+    "acceptance.gate.ts",
+    "src/index.ts",
+    "src/session-name.ts",
+    "tests/session-name.test.ts"
+  ],
+  "writableFiles": [
+    "src/index.ts",
+    "src/session-name.ts",
+    "tests/session-name.test.ts"
+  ],
+  "sha256": {
+    "WORKBRIEF.md": "36f70ec745d2fc3187c2d6daf631a026a3df658e4e2e604adfe3f83e6204d65a",
+    "package.json": "456599060a57b5113fd197267b8004daaf946e8151465ab26207987253f5e2b9",
+    "acceptance.gate.ts": "d7cb4ecc72b67fe00f6d6cb052ce9ea272d6db1f69c9cdc14ba4e769274ba91b",
+    "src/index.ts": "eb5239303b7012ec69e68665fa2b1a7c1e723e2ef25f5b3ccb989ebb2a7962a0",
+    "src/session-name.ts": "4ad6f9721e339c30fce86cb41bcd80ec3b2e004bf967ac82745bbeea4cea5562",
+    "tests/session-name.test.ts": "10d66368300445152d75effa28d5eecd830d319c5aab374dc619aa4a8ec704f4"
+  }
+}

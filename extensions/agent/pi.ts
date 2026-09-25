@@ -8,17 +8,42 @@ import {
   SessionManager,
   SettingsManager,
   type AgentSession,
+  type ExtensionAPI,
+  type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { registerExecution, unregisterExecution } from "../execution-identity.ts";
 import { childActiveTools, ORCHESTRATION_TOOLS } from "../profile.ts";
 import { marksSideEffect } from "./effects.ts";
 import { childInstructions, skillNamesForRole, usageDelta, type AgentUsage, type Attempt, type AttemptExecutor } from "./run.ts";
+import { completeTool, emptyCodeIntelligenceUsage, isDenseToolName, type CodeIntelligenceUsage, type DenseCallUsage, type ToolOutcome } from "../code-intelligence/metrics.ts";
+import { CODE_INTELLIGENCE_TOOLS } from "../code-intelligence/tools.ts";
+import { bindCodeIntelligenceApi } from "../code-intelligence/index.ts";
+import codegraphRaw from "../code-intelligence/codegraph-raw.ts";
+import lspExtension from "pi-lsp-client/src/index.ts";
 import type { ModelTarget, ReasoningLevel } from "../roles/types.ts";
 
 // Package entry does not re-export this. Import the file next to the resolved entry.
 export const { DEFAULT_THINKING_LEVEL } = await import(
   new URL("./core/defaults.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href,
 ) as { DEFAULT_THINKING_LEVEL: ThinkingLevel };
+
+const navigationWindows = new WeakMap<AgentSession, { remaining: number }>();
+
+function captureExtensionTools(register: (pi: ExtensionAPI) => void): ToolDefinition[] {
+  const tools: ToolDefinition[] = [];
+  register({
+    registerTool(tool: ToolDefinition) { tools.push(tool); },
+    on() { return () => {}; },
+    registerCommand() {},
+  } as unknown as ExtensionAPI);
+  return tools;
+}
+
+const RAW_CHILD_TOOLS = [
+  ...captureExtensionTools(lspExtension),
+  ...captureExtensionTools(codegraphRaw),
+];
+export const CHILD_CODE_TOOLS = [...CODE_INTELLIGENCE_TOOLS, ...RAW_CHILD_TOOLS];
 
 /** Omitted reasoning is not forced to medium. Pi keeps its own default. */
 export function thinkingLevelFor(reasoning: ReasoningLevel | undefined): ThinkingLevel | undefined {
@@ -192,6 +217,7 @@ async function openSession(
   input: { instanceId: string; role: Parameters<AttemptExecutor["start"]>[0]["role"]; cwd: string },
 ): Promise<AgentSession> {
   const agentDir = getAgentDir();
+  bindCodeIntelligenceApi();
   const settingsManager = SettingsManager.create(input.cwd, agentDir);
   const allowed = new Set(skillNamesForRole(input.role));
   const loader = new DefaultResourceLoader({
@@ -205,6 +231,7 @@ async function openSession(
     }),
   });
   await loader.reload();
+  const childTools = [...CHILD_CODE_TOOLS];
   const thinkingLevel = model ? thinkingLevelFor(target.reasoning) : undefined;
   const { session } = await createAgentSession({
     cwd: input.cwd,
@@ -214,10 +241,11 @@ async function openSession(
     sessionManager: SessionManager.inMemory(input.cwd),
     settingsManager,
     resourceLoader: loader,
+    customTools: childTools,
     modelRuntime: runtime,
     excludeTools: [...ORCHESTRATION_TOOLS],
   });
-  session.setActiveToolsByName(childActiveTools(session.getAllTools().map((tool) => tool.name)));
+  session.setActiveToolsByName(childActiveTools(session.getAllTools().map((tool) => tool.name), process.platform, input.role.id));
   registerExecution({ instanceId: input.instanceId, roleId: input.role.id, sessionId: session.sessionId });
   return session;
 }
@@ -241,16 +269,29 @@ async function drive(
   try {
     let sideEffects = false;
     const tools: Record<string, number> = {};
+    const codeIntelligence = emptyCodeIntelligenceUsage();
+    const navigation = navigationWindows.get(session) ?? { remaining: 0 };
+    codeIntelligence.navigation.remaining = navigation.remaining;
+    const toolStarts = new Map<string, number>();
     const unsubscribe = session.subscribe((event) => {
       input.onActivity?.(event);
-      if (event.type === "tool_execution_start" && marksSideEffect(event.toolName)) sideEffects = true;
-      if (event.type === "tool_execution_end") tools[event.toolName] = (tools[event.toolName] ?? 0) + 1;
+      if (event.type === "tool_execution_start") {
+        toolStarts.set(event.toolCallId, performance.now());
+        if (marksSideEffect(event.toolName)) sideEffects = true;
+      }
+      if (event.type === "tool_execution_end") {
+        tools[event.toolName] = (tools[event.toolName] ?? 0) + 1;
+        const started = toolStarts.get(event.toolCallId);
+        toolStarts.delete(event.toolCallId);
+        completeTool(codeIntelligence, event.toolName, denseCallFromExecution(event.toolName, event.result, started, input.signal), navigation);
+        navigationWindows.set(session, navigation);
+      }
     });
     const handle = resume(session, runtime, input);
     const before = usageFrom(session, {});
     if (input.signal.aborted) {
       await session.abort();
-      return { status: "cancelled", result: "cancelled", sideEffects, usage: attemptUsage(before, session, tools), session: handle };
+      return { status: "cancelled", result: "cancelled", sideEffects, usage: attemptUsage(before, session, tools, codeIntelligence), session: handle };
     }
     const stopWatch = watchAbort(input.signal, () => {
       void session.abort();
@@ -259,24 +300,24 @@ async function drive(
       await session.prompt(prompt, { expandPromptTemplates: false });
       const assistant = lastAssistant(session);
       if (input.signal.aborted) {
-        return { status: "cancelled", result: "cancelled", sideEffects, usage: attemptUsage(before, session, tools), appliedReasoning: session.thinkingLevel, session: handle };
+        return { status: "cancelled", result: "cancelled", sideEffects, usage: attemptUsage(before, session, tools, codeIntelligence), appliedReasoning: session.thinkingLevel, session: handle };
       }
       if (assistant?.stopReason === "aborted" || assistant?.stopReason === "error") {
-        return failedAttempt(assistant.errorMessage ?? assistant.stopReason ?? "provider error", sideEffects, handle, session, attemptUsage(before, session, tools));
+        return failedAttempt(assistant.errorMessage ?? assistant.stopReason ?? "provider error", sideEffects, handle, session, attemptUsage(before, session, tools, codeIntelligence));
       }
       return {
         status: "completed",
         result: textOf(assistant),
         sideEffects,
-        usage: attemptUsage(before, session, tools),
+        usage: attemptUsage(before, session, tools, codeIntelligence),
         appliedReasoning: session.thinkingLevel,
         session: handle,
       };
     } catch (error) {
       if (input.signal.aborted) {
-        return { status: "cancelled", result: "cancelled", sideEffects, usage: attemptUsage(before, session, tools), session: handle };
+        return { status: "cancelled", result: "cancelled", sideEffects, usage: attemptUsage(before, session, tools, codeIntelligence), session: handle };
       }
-      return failedAttempt(messageOf(error), sideEffects, handle, session, attemptUsage(before, session, tools));
+      return failedAttempt(messageOf(error), sideEffects, handle, session, attemptUsage(before, session, tools, codeIntelligence));
     } finally {
       stopWatch();
       unsubscribe();
@@ -365,10 +406,31 @@ export function watchAbort(signal: AbortSignal, onAbort: () => void): () => void
   return () => signal.removeEventListener("abort", listener);
 }
 
-function attemptUsage(before: AgentUsage, session: AgentSession, tools: Record<string, number>): AgentUsage | undefined {
+function denseCallFromExecution(name: string, result: any, startedAt: number | undefined, signal: AbortSignal): DenseCallUsage | undefined {
+  if (!isDenseToolName(name)) return undefined;
+  const details = result?.details ?? result?.result?.details ?? {};
+  const measured = details.codeIntelligence;
+  if (measured?.tool === name && typeof measured.durationMs === "number" && typeof measured.outputBytes === "number") {
+    return measured as DenseCallUsage;
+  }
+  const text = Array.isArray(result?.content) ? result.content.filter((part: any) => part?.type === "text").map((part: any) => String(part.text ?? "")).join("\n") : "";
+  const status = details.status;
+  const outcome: ToolOutcome = signal.aborted ? "cancelled" : status === "partial" ? "partial" : status === "unavailable" ? "unavailable" : result?.isError ? "error" : "ok";
+  return {
+    tool: name,
+    durationMs: Math.max(0, Math.round(performance.now() - (startedAt ?? performance.now()))),
+    outputBytes: Buffer.byteLength(text),
+    truncated: details.truncated === true,
+    outcome,
+    telemetryAvailable: false,
+    sources: {},
+  };
+}
+
+function attemptUsage(before: AgentUsage, session: AgentSession, tools: Record<string, number>, codeIntelligence: CodeIntelligenceUsage): AgentUsage | undefined {
   const delta = usageDelta(before, usageFrom(session, {}));
   if (!delta) return undefined;
-  return { ...delta, tools, contextTokens: usageFrom(session, {}).contextTokens };
+  return { ...delta, tools, contextTokens: usageFrom(session, {}).contextTokens, codeIntelligence: structuredClone(codeIntelligence) };
 }
 
 function usageFrom(session: AgentSession, tools: Record<string, number>): AgentUsage {

@@ -7,6 +7,7 @@ import { classifyProviderFailure } from "./fallback.ts";
 import { formatAgentLive } from "./present.ts";
 import { agentScope } from "./scope.ts";
 import type { AgentUiSnapshot } from "./ui.ts";
+import { codeIntelligenceDelta, formatCodeIntelligenceUsage, mergeCodeIntelligenceUsage, type CodeIntelligenceUsage } from "../code-intelligence/metrics.ts";
 import {
   activityKind,
   createActivity,
@@ -50,6 +51,22 @@ export interface AgentInstance {
   createdAt: string;
 }
 
+export interface PatchCallMetric {
+  targets: string[];
+  committed: string[];
+  pending: string[];
+  uncertain: string[];
+  changedFiles: number;
+  changedHunks: number;
+  inputBytes: number;
+  status: "success" | "failure";
+  phase: string;
+  errorCode: string | null;
+  elapsedMs: number;
+  retry: boolean;
+  truncated: boolean;
+}
+
 export interface AgentUsage {
   input: number;
   output: number;
@@ -61,6 +78,8 @@ export interface AgentUsage {
   toolCalls?: number;
   tools?: Record<string, number>;
   contextTokens?: number;
+  patches?: PatchCallMetric[];
+  codeIntelligence?: CodeIntelligenceUsage;
 }
 
 export interface WatchdogSnapshot {
@@ -79,6 +98,23 @@ export interface AgentRunResult {
   result: string;
   usage?: AgentUsage;
   watchdog?: WatchdogSnapshot;
+}
+
+export interface TeamExecutionSummary {
+  assignmentId: string;
+  selectedModel: string | null;
+  provider: string | null;
+  appliedReasoning: string;
+  elapsedMs: number | null;
+  turns: number | null;
+  toolCalls: number | null;
+  tools: Record<string, number> | null;
+  input: number | null;
+  output: number | null;
+  cacheRead: number | null;
+  cacheWrite: number | null;
+  contextTokens: number | null;
+  estimatedCost: number | null;
 }
 
 export interface Attempt {
@@ -104,7 +140,7 @@ export interface AttemptExecutor {
     target: ModelTarget;
     cwd: string;
     signal: AbortSignal;
-    onActivity?: (event: { type?: string; toolName?: string; assistantMessageEvent?: { type?: string } }) => void;
+    onActivity?: (event: ActivityEvent) => void;
     /** Fired only after setModel / session open succeeds. Not a second lifecycle. */
     onActivated?: (appliedReasoning: string) => void;
     /** Per attempt. Not stored on a shared executor. Pass undefined to clear. */
@@ -125,7 +161,7 @@ async function runAttempt(
     target: ModelTarget;
     cwd: string;
     signal: AbortSignal;
-    onActivity?: (event: { type?: string; toolName?: string; assistantMessageEvent?: { type?: string } }) => void;
+    onActivity?: (event: ActivityEvent) => void;
     onActivated?: (appliedReasoning: string) => void;
     bindActivityProbe?: (probe: (() => { name: string } | undefined) | undefined) => void;
   },
@@ -170,6 +206,7 @@ export function childInstructions(role: ResolvedRole, instanceId: string): strin
     "Publish shared findings on the Board. Board contents are not injected here.",
     "Your rpiv-todo list is private to this session.",
     "The model and reasoning for this run come from this role's ModelPolicy, not from the parent session.",
+    "Keep raw read, grep, LSP, CodeGraph, bash and edit available as the navigation baseline. Use dense queries for bounded code questions; fall back to raw when needed.",
     "",
     role.instructions,
   ].join("\n");
@@ -232,7 +269,7 @@ export async function runAgentInstance(input: {
   const activity = createActivity(acceptedAt);
   const view: { usage?: AgentUsage; error?: string } = {};
   const throughput = createThroughput();
-  const work: WorkCounts = { turns: 0, toolCalls: 0 };
+  const work: WorkCounts = { turns: 0, toolCalls: 0, patches: [] };
   let lastStable = "";
   let terminalAt: number | undefined;
   const present = () => {
@@ -319,7 +356,7 @@ export async function runAgentInstance(input: {
   };
   refresh();
   try {
-    return await agentScope.run({ instanceId: instance.id }, () =>
+    return await agentScope.run({ instanceId: instance.id, roleId: role.id }, () =>
       executeTargets(
         instance,
         role,
@@ -337,6 +374,7 @@ export async function runAgentInstance(input: {
         view,
         bindActivityProbe,
         throughput,
+        work,
         (at) => {
           terminalAt = at;
         },
@@ -365,6 +403,7 @@ async function executeTargets(
   view: { usage?: AgentUsage; error?: string },
   bindActivityProbe: (probe: (() => { name: string } | undefined) | undefined) => void,
   throughput: ThroughputState,
+  work: WorkCounts,
   markTerminal: (at: number) => void,
 ): Promise<AgentRunResult> {
   instance.status = "running";
@@ -379,6 +418,7 @@ async function executeTargets(
     index = 0,
     reason?: FallbackReason,
   ) => {
+    if (usage && work.patches.length > 0) usage = { ...usage, patches: work.patches.map((patch) => ({ ...patch })) };
     view.usage = usage;
     view.error = status === "completed" || result === "cancelled" ? undefined : result;
     markTerminal(now());
@@ -503,6 +543,9 @@ type ActivityEvent = {
   type?: string;
   toolName?: string;
   toolCallId?: string;
+  args?: unknown;
+  result?: unknown;
+  isError?: boolean;
   message?: { role?: string; usage?: { output?: number } };
   assistantMessageEvent?: {
     type?: string;
@@ -513,11 +556,49 @@ type ActivityEvent = {
 interface WorkCounts {
   turns: number;
   toolCalls: number;
+  patches: PatchCallMetric[];
 }
 
 function noteWork(counts: WorkCounts, event: ActivityEvent): void {
   if (event.type === "tool_execution_start") counts.toolCalls += 1;
   if (event.type === "message_end" && event.message?.role === "assistant") counts.turns += 1;
+  if (event.type === "tool_execution_end" && event.toolName === "apply_patch") {
+    const metric = patchMetric(event.result, event.isError, counts.patches);
+    if (metric) counts.patches.push(metric);
+  }
+}
+
+function patchMetric(result: unknown, isError: boolean | undefined, previous: PatchCallMetric[]): PatchCallMetric | undefined {
+  if (!result || typeof result !== "object" || !("details" in result)) return undefined;
+  const details = result.details;
+  if (!details || typeof details !== "object") return undefined;
+  const row = details as Record<string, unknown>;
+  const paths = (key: string) => Array.isArray(row[key]) ? row[key].filter((item): item is string => typeof item === "string") : [];
+  const committed = paths("committed");
+  const pending = paths("pending");
+  const uncertain = paths("uncertain");
+  const targets = [...new Set([...committed, ...pending, ...uncertain])];
+  const signature = [...targets].sort().join("\0");
+  // ponytail: same-target-after-failure proxy; capture task IDs if false positives matter.
+  return {
+    targets,
+    committed,
+    pending,
+    uncertain,
+    changedFiles: numberOrZero(row.filesChanged),
+    changedHunks: numberOrZero(row.hunksChanged),
+    inputBytes: numberOrZero(row.inputBytes),
+    status: row.ok === true && isError !== true ? "success" : "failure",
+    phase: typeof row.phase === "string" ? row.phase : "unknown",
+    errorCode: typeof row.errorCode === "string" ? row.errorCode : null,
+    elapsedMs: numberOrZero(row.elapsedMs),
+    retry: signature.length > 0 && previous.some((patch) => patch.status === "failure" && [...patch.targets].sort().join("\0") === signature),
+    truncated: row.truncated === true,
+  };
+}
+
+function numberOrZero(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
 interface ThroughputState {
@@ -606,6 +687,7 @@ function observationOf(
     streamMs,
     turns: turns > 0 ? turns : undefined,
     toolCalls: toolCalls > 0 ? toolCalls : undefined,
+    agentUsage: usage,
     inactivityMs: dog.inactivityMs,
     failureKind: status === "failed" ? dog.lastActivityKind : undefined,
   };
@@ -660,14 +742,50 @@ export function formatUsage(usage: AgentUsage): string {
   if (usage.cacheWrite !== undefined) lines.push(`  cached write: ${usage.cacheWrite}`);
   if (usage.cost !== undefined) lines.push(`  cost: ${usage.cost}`);
   lines.push(`  turns: ${usage.turns ?? "?"}`, `  tools: ${usage.toolCalls ?? "?"}`);
+  lines.push(`  mutations: edit ${usage.tools?.edit ?? 0}, write ${usage.tools?.write ?? 0}, apply_patch ${usage.tools?.apply_patch ?? 0}`);
   if (usage.contextTokens !== undefined) lines.push(`  context: ${usage.contextTokens}`);
+  if (usage.codeIntelligence) lines.push(formatCodeIntelligenceUsage(usage.codeIntelligence));
   return lines.join("\n");
+}
+
+export function teamExecutionSummary(assignmentId: string, result: AgentRunResult): TeamExecutionSummary {
+  const selectedModel = result.model.selectedModel === "unknown" ? null : result.model.selectedModel;
+  const separator = selectedModel?.indexOf("/") ?? -1;
+  const provider = selectedModel && separator > 0 && separator < selectedModel.length - 1 ? selectedModel.slice(0, separator) : null;
+  const usage = result.usage;
+  // Pi defaults unspecified model pricing to zero rates, so token-bearing $0 is not a reliable estimate.
+  const hasTokens = [usage?.input, usage?.output, usage?.cacheRead, usage?.cacheWrite].some((value) => value !== undefined && value > 0);
+  return {
+    assignmentId,
+    selectedModel,
+    provider,
+    appliedReasoning: result.model.appliedReasoning ?? "unknown",
+    elapsedMs: result.watchdog?.elapsedMs ?? null,
+    turns: usage?.turns ?? null,
+    toolCalls: usage?.toolCalls ?? null,
+    tools: usage?.tools === undefined ? null : { ...usage.tools },
+    input: usage?.input ?? null,
+    output: usage?.output ?? null,
+    cacheRead: usage?.cacheRead ?? null,
+    cacheWrite: usage?.cacheWrite ?? null,
+    contextTokens: usage?.contextTokens ?? null,
+    estimatedCost: usage?.cost === undefined || (usage.cost === 0 && hasTokens) ? null : usage.cost,
+  };
+}
+
+export function formatTeamExecutionSummary(summary: TeamExecutionSummary): string {
+  const value = (item: number | null) => item === null ? "unavailable" : String(item);
+  const tools = summary.tools === null
+    ? "unavailable"
+    : Object.entries(summary.tools).map(([name, count]) => `${name}:${count}`).join(",") || "none";
+  const cost = summary.estimatedCost === null ? "unavailable" : `$${summary.estimatedCost.toFixed(6)} (Pi estimate; not billing)`;
+  return `execution summary: assignment=${summary.assignmentId} selected_model=${summary.selectedModel ?? "unavailable"} provider=${summary.provider ?? "unavailable"} applied_reasoning=${summary.appliedReasoning} elapsed_ms=${value(summary.elapsedMs)} turns=${value(summary.turns)} tool_calls=${value(summary.toolCalls)} tools=${tools} input=${value(summary.input)} output=${value(summary.output)} cache_read=${value(summary.cacheRead)} cache_write=${value(summary.cacheWrite)} context_tokens=${value(summary.contextTokens)} estimated_cost=${cost}`;
 }
 
 /** Counters are subtracted. contextTokens is a gauge and keeps the later value. */
 export function usageDelta(before: AgentUsage | undefined, after: AgentUsage | undefined): AgentUsage | undefined {
   if (!after) return undefined;
-  if (!before) return { ...after, tools: after.tools ? { ...after.tools } : undefined };
+  if (!before) return { ...after, tools: after.tools ? { ...after.tools } : undefined, codeIntelligence: codeIntelligenceDelta(undefined, after.codeIntelligence) };
   const tools: Record<string, number> = {};
   for (const name of new Set([...Object.keys(before.tools ?? {}), ...Object.keys(after.tools ?? {})])) {
     const delta = (after.tools?.[name] ?? 0) - (before.tools?.[name] ?? 0);
@@ -684,12 +802,13 @@ export function usageDelta(before: AgentUsage | undefined, after: AgentUsage | u
     toolCalls: Math.max(0, (after.toolCalls ?? 0) - (before.toolCalls ?? 0)),
     tools,
     contextTokens: after.contextTokens,
+    codeIntelligence: codeIntelligenceDelta(before.codeIntelligence, after.codeIntelligence),
   };
 }
 
 export function mergeUsage(left: AgentUsage | undefined, right: AgentUsage | undefined): AgentUsage | undefined {
   if (!right) return left;
-  if (!left) return { ...right, tools: right.tools ? { ...right.tools } : undefined };
+  if (!left) return { ...right, tools: right.tools ? { ...right.tools } : undefined, codeIntelligence: mergeCodeIntelligenceUsage(undefined, right.codeIntelligence) };
   const tools = { ...(left.tools ?? {}) };
   for (const [name, count] of Object.entries(right.tools ?? {})) tools[name] = (tools[name] ?? 0) + count;
   return {
@@ -703,5 +822,6 @@ export function mergeUsage(left: AgentUsage | undefined, right: AgentUsage | und
     toolCalls: (left.toolCalls ?? 0) + (right.toolCalls ?? 0),
     tools,
     contextTokens: right.contextTokens ?? left.contextTokens,
+    codeIntelligence: mergeCodeIntelligenceUsage(left.codeIntelligence, right.codeIntelligence),
   };
 }
