@@ -50,6 +50,22 @@ export interface AgentInstance {
   createdAt: string;
 }
 
+export interface PatchCallMetric {
+  targets: string[];
+  committed: string[];
+  pending: string[];
+  uncertain: string[];
+  changedFiles: number;
+  changedHunks: number;
+  inputBytes: number;
+  status: "success" | "failure";
+  phase: string;
+  errorCode: string | null;
+  elapsedMs: number;
+  retry: boolean;
+  truncated: boolean;
+}
+
 export interface AgentUsage {
   input: number;
   output: number;
@@ -61,6 +77,7 @@ export interface AgentUsage {
   toolCalls?: number;
   tools?: Record<string, number>;
   contextTokens?: number;
+  patches?: PatchCallMetric[];
 }
 
 export interface WatchdogSnapshot {
@@ -104,7 +121,7 @@ export interface AttemptExecutor {
     target: ModelTarget;
     cwd: string;
     signal: AbortSignal;
-    onActivity?: (event: { type?: string; toolName?: string; assistantMessageEvent?: { type?: string } }) => void;
+    onActivity?: (event: ActivityEvent) => void;
     /** Fired only after setModel / session open succeeds. Not a second lifecycle. */
     onActivated?: (appliedReasoning: string) => void;
     /** Per attempt. Not stored on a shared executor. Pass undefined to clear. */
@@ -125,7 +142,7 @@ async function runAttempt(
     target: ModelTarget;
     cwd: string;
     signal: AbortSignal;
-    onActivity?: (event: { type?: string; toolName?: string; assistantMessageEvent?: { type?: string } }) => void;
+    onActivity?: (event: ActivityEvent) => void;
     onActivated?: (appliedReasoning: string) => void;
     bindActivityProbe?: (probe: (() => { name: string } | undefined) | undefined) => void;
   },
@@ -226,7 +243,7 @@ export async function runAgentInstance(input: {
   const activity = createActivity(acceptedAt);
   const view: { usage?: AgentUsage; error?: string } = {};
   const throughput = createThroughput();
-  const work: WorkCounts = { turns: 0, toolCalls: 0 };
+  const work: WorkCounts = { turns: 0, toolCalls: 0, patches: [] };
   let lastStable = "";
   let terminalAt: number | undefined;
   const present = () => {
@@ -313,7 +330,7 @@ export async function runAgentInstance(input: {
   };
   refresh();
   try {
-    return await agentScope.run({ instanceId: instance.id }, () =>
+    return await agentScope.run({ instanceId: instance.id, roleId: role.id }, () =>
       executeTargets(
         instance,
         role,
@@ -331,6 +348,7 @@ export async function runAgentInstance(input: {
         view,
         bindActivityProbe,
         throughput,
+        work,
         (at) => {
           terminalAt = at;
         },
@@ -359,6 +377,7 @@ async function executeTargets(
   view: { usage?: AgentUsage; error?: string },
   bindActivityProbe: (probe: (() => { name: string } | undefined) | undefined) => void,
   throughput: ThroughputState,
+  work: WorkCounts,
   markTerminal: (at: number) => void,
 ): Promise<AgentRunResult> {
   instance.status = "running";
@@ -373,6 +392,7 @@ async function executeTargets(
     index = 0,
     reason?: FallbackReason,
   ) => {
+    if (usage && work.patches.length > 0) usage = { ...usage, patches: work.patches.map((patch) => ({ ...patch })) };
     view.usage = usage;
     view.error = status === "completed" || result === "cancelled" ? undefined : result;
     markTerminal(now());
@@ -497,6 +517,9 @@ type ActivityEvent = {
   type?: string;
   toolName?: string;
   toolCallId?: string;
+  args?: unknown;
+  result?: unknown;
+  isError?: boolean;
   message?: { role?: string; usage?: { output?: number } };
   assistantMessageEvent?: {
     type?: string;
@@ -507,11 +530,49 @@ type ActivityEvent = {
 interface WorkCounts {
   turns: number;
   toolCalls: number;
+  patches: PatchCallMetric[];
 }
 
 function noteWork(counts: WorkCounts, event: ActivityEvent): void {
   if (event.type === "tool_execution_start") counts.toolCalls += 1;
   if (event.type === "message_end" && event.message?.role === "assistant") counts.turns += 1;
+  if (event.type === "tool_execution_end" && event.toolName === "apply_patch") {
+    const metric = patchMetric(event.result, event.isError, counts.patches);
+    if (metric) counts.patches.push(metric);
+  }
+}
+
+function patchMetric(result: unknown, isError: boolean | undefined, previous: PatchCallMetric[]): PatchCallMetric | undefined {
+  if (!result || typeof result !== "object" || !("details" in result)) return undefined;
+  const details = result.details;
+  if (!details || typeof details !== "object") return undefined;
+  const row = details as Record<string, unknown>;
+  const paths = (key: string) => Array.isArray(row[key]) ? row[key].filter((item): item is string => typeof item === "string") : [];
+  const committed = paths("committed");
+  const pending = paths("pending");
+  const uncertain = paths("uncertain");
+  const targets = [...new Set([...committed, ...pending, ...uncertain])];
+  const signature = [...targets].sort().join("\0");
+  // ponytail: same-target-after-failure proxy; capture task IDs if false positives matter.
+  return {
+    targets,
+    committed,
+    pending,
+    uncertain,
+    changedFiles: numberOrZero(row.filesChanged),
+    changedHunks: numberOrZero(row.hunksChanged),
+    inputBytes: numberOrZero(row.inputBytes),
+    status: row.ok === true && isError !== true ? "success" : "failure",
+    phase: typeof row.phase === "string" ? row.phase : "unknown",
+    errorCode: typeof row.errorCode === "string" ? row.errorCode : null,
+    elapsedMs: numberOrZero(row.elapsedMs),
+    retry: signature.length > 0 && previous.some((patch) => patch.status === "failure" && [...patch.targets].sort().join("\0") === signature),
+    truncated: row.truncated === true,
+  };
+}
+
+function numberOrZero(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
 interface ThroughputState {
@@ -654,6 +715,7 @@ export function formatUsage(usage: AgentUsage): string {
   if (usage.cacheWrite !== undefined) lines.push(`  cached write: ${usage.cacheWrite}`);
   if (usage.cost !== undefined) lines.push(`  cost: ${usage.cost}`);
   lines.push(`  turns: ${usage.turns ?? "?"}`, `  tools: ${usage.toolCalls ?? "?"}`);
+  lines.push(`  mutations: edit ${usage.tools?.edit ?? 0}, write ${usage.tools?.write ?? 0}, apply_patch ${usage.tools?.apply_patch ?? 0}`);
   if (usage.contextTokens !== undefined) lines.push(`  context: ${usage.contextTokens}`);
   return lines.join("\n");
 }

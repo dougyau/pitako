@@ -9,12 +9,13 @@ import { teamWorkerStatus } from "./agent/background.ts";
 import { bindAgentUi, listObservations, unbindAgentUi } from "./agent/observe.ts";
 import { formatAgentsDetail } from "./agent/ui.ts";
 import { childSessionNote, ORCHESTRATION_TOOLS, parseProfile, profileNote, toolsForProfile, type ProfileName } from "./profile.ts";
-import { currentInstanceId } from "./agent/scope.ts";
+import { currentInstanceId, currentRoleId } from "./agent/scope.ts";
 import { inspectPitako } from "./roles/format.ts";
 import { registerSupervisedSession, unregisterSupervisedSession } from "./herdr/author.ts";
 import { registerAgentSupervise } from "./herdr/supervise.ts";
 import { packageRoot, prepareRuntime } from "./stack.ts";
 import { planHeading, planInvocation, sessionNameAction } from "./session-name.ts";
+import { createApplyPatchToolDefinition } from "./apply-patch.ts";
 import { parsePlanDocument, planFile } from "./workflow.ts";
 import { readFileSync } from "node:fs";
 import path from "node:path";
@@ -25,12 +26,13 @@ function requestedProfile(pi: ExtensionAPI): ProfileName {
   return parseProfile(process.env.PITAKO_PROFILE);
 }
 
-function applyProfile(pi: ExtensionAPI, profile: ProfileName): string[] {
+function applyProfile(pi: ExtensionAPI, profile: ProfileName, roleId?: string): string[] {
   const available = pi.getAllTools().map((tool) => tool.name);
   const active = pi.getActiveTools();
   const next = toolsForProfile({
     available,
     profile,
+    roleId,
     includePowerShell: process.platform === "win32" || active.includes("powershell"),
   });
   pi.setActiveTools(next);
@@ -49,6 +51,7 @@ export default function pitako(pi: ExtensionAPI) {
   });
 
   registerAgentSupervise(pi);
+  pi.registerTool(createApplyPatchToolDefinition(process.cwd()));
 
   let profile: ProfileName = "coding";
 
@@ -100,6 +103,7 @@ export default function pitako(pi: ExtensionAPI) {
       const coding = toolsForProfile({
         available,
         profile: "coding",
+        roleId: currentRoleId(),
         includePowerShell: process.platform === "win32" || pi.getActiveTools().includes("powershell"),
       }).filter((name) => !ORCHESTRATION_TOOLS.includes(name as (typeof ORCHESTRATION_TOOLS)[number]));
       pi.setActiveTools(coding);
@@ -224,7 +228,7 @@ export default function pitako(pi: ExtensionAPI) {
       }
       if (command === "profile" && value) {
         profile = parseProfile(value);
-        const tools = applyProfile(pi, profile);
+        const tools = applyProfile(pi, profile, currentRoleId());
         if (ctx.hasUI) {
           ctx.ui.notify(`Pitako profile: ${profile} (${tools.length} tools)`, "info");
         }
@@ -232,8 +236,8 @@ export default function pitako(pi: ExtensionAPI) {
       }
       const lines = [
         `Pitako profile: ${profile}`,
-        "coding: read, bash, edit, write, grep, find, ls, LSP, CodeGraph, todo",
-        "analysis: read, bash, grep, find, ls, LSP, CodeGraph, todo; no edit, write, or lsp_rename",
+        "coding: read, bash, edit, write, grep, find, ls, LSP, CodeGraph, todo; apply_patch is Developer AgentInstance-only with task-scoped batch guidance.",
+        "analysis: read, bash, grep, find, ls, LSP, CodeGraph, todo; no edit, write, apply_patch, or lsp_rename",
         "Switch with /pitako profile analysis",
         "Session TODOs: todo tool and /todos (rpiv-todo). Shared knowledge: board_* tools and /board.",
         "Roles: /pitako roles, /pitako role <id>, /pitako policies, /pitako policy <id>. Definitions only.",
@@ -246,6 +250,7 @@ export default function pitako(pi: ExtensionAPI) {
   });
 
   pi.on("tool_result", async (event, ctx) => {
+    if (event.toolName === "apply_patch" && isApplyPatchFailure(event.details)) return { isError: true };
     if (event.isError || (event.toolName !== "write" && event.toolName !== "edit")) return undefined;
     const target = event.input.path;
     if (typeof target !== "string") return undefined;
@@ -337,6 +342,10 @@ function notify(
     return;
   }
   if (kind === "error") throw new Error(message);
+}
+
+function isApplyPatchFailure(details: unknown): boolean {
+  return Boolean(details && typeof details === "object" && "ok" in details && details.ok === false);
 }
 
 export { PitakoConfigError };

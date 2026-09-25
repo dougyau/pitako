@@ -55,6 +55,7 @@
     "@dietrichgebert/ponytail": "4.10.0",
     "@juicesharp/rpiv-todo": "2.11.0",
     "@vndv/pi-codegraph": "0.1.10",
+    "pi-codex-tools": "0.3.0",
     "pi-lsp-client": "github:code-yeongyu/pi-lsp-client#1c981dfcacc456fe4ce9f4120a2f0250b54d6844",
     "smol-toml": "1.8.0"
   },
@@ -62,7 +63,8 @@
     "@dietrichgebert/ponytail",
     "@juicesharp/rpiv-todo",
     "@vndv/pi-codegraph",
-    "pi-lsp-client"
+    "pi-lsp-client",
+    "pi-codex-tools"
   ],
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",

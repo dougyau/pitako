@@ -30,6 +30,7 @@ const READ_ONLY = new Set([
 const MUTATING = new Set([
   "edit",
   "write",
+  "apply_patch",
   "bash",
   "powershell",
   "lsp_rename",

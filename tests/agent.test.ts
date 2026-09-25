@@ -124,6 +124,46 @@ describe("agent instance", () => {
     expect(cleared.model.requestedReasoning).toBe("xhigh");
     expect(cleared.model.appliedReasoning).toBeUndefined();
   });
+  test("aggregates mutation calls and compact patch traces from session events", async () => {
+    const env = tempEnv();
+    const configured = { env, userConfigPath: path.join(env.PI_CODING_AGENT_DIR!, "pitako", "config.toml") };
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(path.dirname(configured.userConfigPath), { recursive: true });
+    writeFileSync(configured.userConfigPath, `[model_policies.architect.primary]\nmodel = "example/primary"\n`);
+    const success = {
+      ok: true, phase: "complete", errorCode: null, inputBytes: 90, plannedFiles: 1, plannedHunks: 2,
+      filesChanged: 1, hunksChanged: 2, committed: ["src/change.ts"], pending: [], uncertain: [], truncated: false, elapsedMs: 17,
+    };
+    const stale = {
+      ok: false, phase: "preflight", errorCode: "PATCH_STALE", inputBytes: 88, plannedFiles: 0, plannedHunks: 0,
+      filesChanged: 0, hunksChanged: 0, committed: [], pending: ["src/change.ts"], uncertain: [], truncated: false, elapsedMs: 9,
+    };
+    const executor: AttemptExecutor = {
+      async start({ onActivity }) {
+        const call = (toolName: string, details?: unknown, isError = false) => {
+          onActivity?.({ type: "tool_execution_start", toolName, args: { patch: "SENSITIVE-PATCH-BODY" } });
+          onActivity?.({ type: "tool_execution_end", toolName, result: details ? { details } : {}, isError });
+        };
+        call("edit");
+        call("write");
+        call("apply_patch", stale, true);
+        call("apply_patch", success);
+        return {
+          status: "completed", result: "done", sideEffects: true,
+          usage: { input: 12, output: 4, turns: 2, toolCalls: 4, tools: { edit: 1, write: 1, apply_patch: 2 } },
+        };
+      },
+    };
+    const result = await runAgentInstance({ roleId: "architect", task: "review the boundary", cwd: packageRoot(), executor, load: configured });
+    expect(result.usage?.tools).toEqual({ edit: 1, write: 1, apply_patch: 2 });
+    expect(result.usage?.patches).toMatchObject([
+      { targets: ["src/change.ts"], pending: ["src/change.ts"], changedFiles: 0, changedHunks: 0, inputBytes: 88, status: "failure", phase: "preflight", errorCode: "PATCH_STALE", elapsedMs: 9, retry: false },
+      { targets: ["src/change.ts"], committed: ["src/change.ts"], changedFiles: 1, changedHunks: 2, inputBytes: 90, status: "success", phase: "complete", elapsedMs: 17, retry: true },
+    ]);
+    expect(JSON.stringify(result.usage?.patches)).not.toContain("SENSITIVE-PATCH-BODY");
+    expect(formatAgentResult(result)).toContain("mutations: edit 1, write 1, apply_patch 2");
+  });
+
   test("resolves architect, isolates context, and does not replay side effects", async () => {
     const env = tempEnv();
     const cwd = packageRoot();
@@ -324,6 +364,8 @@ reasoning = "medium"
     expect(classifyProviderFailure("ECONNRESET")).toBe("unavailable");
     expect(classifyProviderFailure("AbortError: The operation was aborted")).toBeUndefined();
     expect(toolEffect("read")).toBe("read_only");
+    expect(toolEffect("apply_patch")).toBe("mutating");
+    expect(marksSideEffect("apply_patch")).toBe(true);
     expect(toolEffect("board_post")).toBe("mutating");
     expect(toolEffect("database_migrate")).toBe("potentially_mutating");
     expect(marksSideEffect("codegraph_search")).toBe(false);
@@ -448,15 +490,15 @@ reasoning = "medium"
     const windows = childActiveTools(["read", "bash", "powershell", "agent_run"], "win32");
     expect(windows).toContain("powershell");
     expect(windows).not.toContain("agent_run");
-    const before = { input: 100, output: 10, cacheRead: 5, cacheWrite: 1, total: 116, cost: 0.1, turns: 2, toolCalls: 3, tools: { grep: 2 }, contextTokens: 1000 };
-    const after = { input: 300, output: 40, cacheRead: 15, cacheWrite: 1, total: 356, cost: 0.4, turns: 5, toolCalls: 6, tools: { grep: 4, read: 1 }, contextTokens: 2000 };
+    const before = { input: 100, output: 10, cacheRead: 5, cacheWrite: 1, total: 116, cost: 0.1, turns: 2, toolCalls: 3, tools: { grep: 2, edit: 1, write: 1, apply_patch: 2 }, contextTokens: 1000 };
+    const after = { input: 300, output: 40, cacheRead: 15, cacheWrite: 1, total: 356, cost: 0.4, turns: 5, toolCalls: 6, tools: { grep: 4, read: 1, edit: 2, write: 3, apply_patch: 5 }, contextTokens: 2000 };
     const delta = usageDelta(before, after);
     expect(delta?.input).toBe(200);
     expect(delta?.cacheRead).toBe(10);
     expect(delta?.turns).toBe(3);
     expect(delta?.cost).toBeCloseTo(0.3);
     expect(delta?.contextTokens).toBe(2000);
-    expect(delta?.tools).toEqual({ grep: 2, read: 1 });
+    expect(delta?.tools).toEqual({ grep: 2, read: 1, edit: 1, write: 2, apply_patch: 3 });
 
     const parent = SessionManager.inMemory(packageRoot());
     const child = SessionManager.inMemory(packageRoot());

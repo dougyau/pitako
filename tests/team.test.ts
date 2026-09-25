@@ -380,7 +380,18 @@ describe("Team T1 ownership", () => {
     const agentResult = await invoke("agent_result", { id: developer!.instanceId });
     expect(agentResult.isError).toBe(true);
     idle = true;
-    workers[0]!.finish(completed("x".repeat(9000)));
+    workers[0]!.finish({
+      ...completed("x".repeat(9000)),
+      usage: {
+        input: 10, output: 4, turns: 2, toolCalls: 6,
+        tools: { edit: 1, write: 2, apply_patch: 3 },
+        patches: [{
+          targets: ["src/change.ts"], committed: ["src/change.ts"], pending: [], uncertain: [],
+          changedFiles: 1, changedHunks: 2, inputBytes: 90, status: "success", phase: "complete",
+          errorCode: null, elapsedMs: 17, retry: false, truncated: false,
+        }],
+      },
+    });
     workers[1]!.finish(completed("research done"));
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(wakes.some((text) => text.includes("plan plan-a unit unit-a"))).toBe(true);
@@ -390,6 +401,10 @@ describe("Team T1 ownership", () => {
     const result = await invoke("team_result", { assignmentId: developer!.id });
     expect(result.content[0].text.length).toBeLessThan(8100);
     expect((result.details as any).truncated).toBe(true);
+    expect((result.details as any).usage).toMatchObject({
+      tools: { edit: 1, write: 2, apply_patch: 3 },
+      patches: [{ targets: ["src/change.ts"], inputBytes: 90, changedHunks: 2 }],
+    });
     expect((await invoke("team_result", { assignmentId: teamAssignments(current)[3]?.current?.id })).content[0].text).toContain("research done");
     expect(wakes.some((text) => text.includes(`assignment ${developer!.id}`) && text.includes("Use team_result"))).toBe(true);
     expect(wakes.some((text) => text.includes("Use agent_result"))).toBe(false);

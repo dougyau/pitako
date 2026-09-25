@@ -3,8 +3,56 @@ import path from "node:path";
 import { describe, expect, test } from "bun:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import pitako from "../extensions/index.ts";
+import { agentScope } from "../extensions/agent/scope.ts";
 import { packageRoot } from "../extensions/stack.ts";
 import { loadPitako, registeredToolNames } from "../scripts/load-pitako.ts";
+
+function profileHarness(profileFlag?: string) {
+  const active = ["read", "bash", "edit", "write"];
+  const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
+  let profileCommand: ((args: string, ctx: unknown) => Promise<void>) | undefined;
+  const available = [
+    "read", "bash", "edit", "write", "apply_patch", "grep", "find", "ls",
+    "lsp_diagnostics", "lsp_rename", "codegraph_search",
+  ];
+  const context = {
+    cwd: packageRoot(),
+    hasUI: false,
+    ui: { notify() {}, setStatus() {} },
+    sessionManager: { getSessionId: () => `test-${profileFlag ?? "coding"}`, getEntries: () => [] },
+  };
+  const pi = {
+    registerFlag() {},
+    registerTool() {},
+    getFlag() { return profileFlag; },
+    on(event: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) { handlers.set(event, handler); },
+    registerCommand(_name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) {
+      profileCommand = command.handler;
+    },
+    getActiveTools() { return [...active]; },
+    getAllTools() { return available.map((name) => ({ name })); },
+    setActiveTools(names: string[]) { active.splice(0, active.length, ...names); },
+    getSessionName() { return undefined; },
+    setSessionName() {},
+  };
+  pitako(pi as unknown as ExtensionAPI);
+  return {
+    active,
+    context,
+    async start() {
+      const handler = handlers.get("session_start");
+      if (!handler) throw new Error("session_start was not registered");
+      await handler({}, context);
+    },
+    async selectProfile(value: string) {
+      if (!profileCommand) throw new Error("pitako command was not registered");
+      await profileCommand(`profile ${value}`, context);
+    },
+    async shutdown() {
+      await handlers.get("session_shutdown")?.({}, context);
+    },
+  };
+}
 
 describe("Pi package loading", () => {
   test("discovers Pitako, LSP, and CodeGraph from a relative package path", async () => {
@@ -14,6 +62,7 @@ describe("Pi package loading", () => {
     expect(loaded.extensions.errors).toEqual([]);
     const paths = loaded.extensions.extensions.map((extension) => extension.resolvedPath);
     expect(paths.some((file) => file.endsWith("extensions/index.ts"))).toBe(true);
+    expect(paths.some((file) => file.includes(`${path.sep}pi-codex-tools${path.sep}`))).toBe(false);
     expect(paths.some((file) => file.includes(`${path.sep}pi-lsp-client${path.sep}`))).toBe(true);
     expect(paths.some((file) => file.includes(`${path.sep}pi-codegraph${path.sep}`))).toBe(true);
     expect(paths.some((file) => file.includes(`${path.sep}rpiv-todo${path.sep}`))).toBe(true);
@@ -21,6 +70,7 @@ describe("Pi package loading", () => {
     for (const file of paths) expect(file.startsWith(root)).toBe(true);
 
     const names = registeredToolNames(loaded.extensions);
+    expect(names).toContain("apply_patch");
     for (const name of ["lsp_diagnostics", "lsp_goto_definition", "lsp_find_references", "lsp_symbols", "lsp_prepare_rename", "lsp_rename"]) {
       expect(names).toContain(name);
     }
@@ -45,13 +95,59 @@ describe("Pi package loading", () => {
     expect(prompts).toContain("explain");
   });
 
+  test("profile reloads and profile command never expose patch outside Developer AgentInstances", async () => {
+    const foreground = profileHarness();
+    await foreground.start();
+    expect(foreground.active).toContain("edit");
+    expect(foreground.active).toContain("write");
+    expect(foreground.active).not.toContain("apply_patch");
+    await foreground.selectProfile("coding");
+    expect(foreground.active).not.toContain("apply_patch");
+    await foreground.start();
+    expect(foreground.active).not.toContain("apply_patch");
+    await foreground.shutdown();
+
+    const analysis = profileHarness("analysis");
+    await analysis.start();
+    expect(analysis.active).not.toContain("apply_patch");
+    await analysis.selectProfile("coding");
+    expect(analysis.active).not.toContain("apply_patch");
+    await analysis.shutdown();
+
+    for (const roleId of ["architect", "reviewer", "researcher"]) {
+      const child = profileHarness();
+      await agentScope.run({ instanceId: "developer-looking-instance-id", roleId }, async () => {
+        await child.start();
+        expect(child.active).not.toContain("apply_patch");
+        await child.selectProfile("coding");
+        expect(child.active).not.toContain("apply_patch");
+        await child.start();
+        expect(child.active).not.toContain("apply_patch");
+      });
+      await child.shutdown();
+    }
+
+    const developer = profileHarness();
+    await agentScope.run({ instanceId: "not-role-derived-from-this-id", roleId: "developer" }, async () => {
+      await developer.start();
+      expect(developer.active).toContain("apply_patch");
+      await developer.selectProfile("analysis");
+      expect(developer.active).not.toContain("apply_patch");
+      await developer.selectProfile("coding");
+      expect(developer.active).toContain("apply_patch");
+      await developer.start();
+      expect(developer.active).toContain("apply_patch");
+    });
+    await developer.shutdown();
+  });
+
   test("analysis profile wiring excludes edit and write", async () => {
     const previous = process.env.PITAKO_PROFILE;
     process.env.PITAKO_PROFILE = "analysis";
     try {
       const active = ["read", "bash", "edit", "write"];
       const available = [
-        "read", "bash", "edit", "write", "grep", "find", "ls",
+        "read", "bash", "edit", "write", "apply_patch", "grep", "find", "ls",
         "lsp_diagnostics", "lsp_rename", "codegraph_search",
       ];
       const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
@@ -89,6 +185,7 @@ describe("Pi package loading", () => {
       expect(active).toContain("codegraph_search");
       expect(active).not.toContain("edit");
       expect(active).not.toContain("write");
+      expect(active).not.toContain("apply_patch");
       expect(active).not.toContain("lsp_rename");
     } finally {
       if (previous === undefined) delete process.env.PITAKO_PROFILE;
@@ -100,7 +197,7 @@ describe("Pi package loading", () => {
 describe("repository hygiene", () => {
   test("source does not embed absolute developer paths or credentials", () => {
     const root = packageRoot();
-    const skip = new Set(["node_modules", ".git", ".codegraph", "bun.lock"]);
+    const skip = new Set(["node_modules", ".git", ".codegraph", ".pitako", "bun.lock"]);
     const offenders: string[] = [];
     const walk = (directory: string) => {
       for (const name of readdirSync(directory)) {
