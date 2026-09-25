@@ -2,6 +2,8 @@
  * Pi ToolDefinition has no mutating/read-only flag (pi-coding-agent 0.87).
  * Unknown names are potentially mutating so a future extension cannot be replayed.
  */
+import { CODE_INTELLIGENCE_TOOL_NAMES } from "../code-intelligence/metrics.ts";
+
 export type ToolEffect = "read_only" | "mutating" | "potentially_mutating";
 
 const READ_ONLY = new Set([
@@ -25,6 +27,7 @@ const READ_ONLY = new Set([
   "board_topic_list",
   "board_topic_read",
   "board_query",
+  ...CODE_INTELLIGENCE_TOOL_NAMES,
 ]);
 
 const MUTATING = new Set([

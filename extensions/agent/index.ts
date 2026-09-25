@@ -19,7 +19,7 @@ import {
 import { listObservations, noteResultTaken, observationEpoch, publishObservation } from "./observe.ts";
 import { currentInstanceId } from "./scope.ts";
 import { createPiExecutor } from "./pi.ts";
-import { formatAgentResult, runAgentInstance } from "./run.ts";
+import { formatAgentResult, formatTeamExecutionSummary, runAgentInstance, teamExecutionSummary } from "./run.ts";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { openBoard } from "../board/store.ts";
@@ -232,11 +232,16 @@ function registerTeamTools(pi: ExtensionAPI): void {
         if (assignment.planId && assignment.unitId && assignment.boardTopicId !== undefined) {
           recordPlanTeamWork(ctx.cwd, assignment.planId, assignment.unitId, assignment.id, result.status);
         }
+        const summary = teamExecutionSummary(assignment.id, result);
+        const prefix = `${formatTeamExecutionSummary(summary)}\n\n`;
         const limit = 8000;
-        const truncated = result.result.length > limit;
-        return textResult(`${result.result.slice(0, limit)}${truncated ? "\n[truncated; use a narrower assignment]" : ""}`, {
+        const truncationNote = "\n[truncated; use a narrower assignment]";
+        const available = Math.max(0, limit - prefix.length);
+        const truncated = result.result.length > available;
+        const resultLimit = truncated ? Math.max(0, available - truncationNote.length) : available;
+        return textResult(`${prefix}${result.result.slice(0, resultLimit)}${truncated ? truncationNote : ""}`, {
           assignmentId: assignment.id, instanceId: result.instanceId, role: result.role,
-          status: result.status, model: result.model, usage: result.usage, truncated, resultLength: result.result.length,
+          status: result.status, model: result.model, usage: result.usage, summary, truncated, resultLength: result.result.length,
         }, result.status !== "completed");
       } catch (error) { return errorResult(error instanceof Error ? error.message : String(error)); }
     },

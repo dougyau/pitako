@@ -9,7 +9,7 @@ import { currentInstanceId, agentScope } from "../extensions/agent/scope.ts";
 import { marksSideEffect, toolEffect } from "../extensions/agent/effects.ts";
 import { classifyProviderFailure } from "../extensions/agent/fallback.ts";
 import { activateTarget, thinkingLevelFor } from "../extensions/agent/pi.ts";
-import { childInstructions, formatAgentResult, runAgentInstance, skillNamesForRole, usageDelta, type Attempt, type AttemptExecutor } from "../extensions/agent/run.ts";
+import { childInstructions, formatAgentResult, runAgentInstance, skillNamesForRole, teamExecutionSummary, usageDelta, type AgentRunResult, type Attempt, type AttemptExecutor } from "../extensions/agent/run.ts";
 import { childSessionNote } from "../extensions/profile.ts";
 import { registerExecution, resolveBoardAuthor, unregisterExecution } from "../extensions/execution-identity.ts";
 import { childActiveTools } from "../extensions/profile.ts";
@@ -20,6 +20,8 @@ import pitako from "../extensions/index.ts";
 import { resolveRole } from "../extensions/roles/load.ts";
 import { packageRoot } from "../extensions/stack.ts";
 import { loadPitako, registeredToolNames } from "../scripts/load-pitako.ts";
+import { completeTool, emptyCodeIntelligenceUsage } from "../extensions/code-intelligence/metrics.ts";
+import type { DenseCallUsage } from "../extensions/code-intelligence/metrics.ts";
 
 const tempDirs: string[] = [];
 afterEach(() => {
@@ -62,15 +64,40 @@ function scripted(attempts: Attempt[]): AttemptExecutor & { starts: string[]; no
 }
 
 describe("agent instance", () => {
+  test("execution summary distinguishes unavailable values from reported zero", () => {
+    const result: AgentRunResult = {
+      instanceId: "developer-summary", role: "developer", status: "completed", model: { selectedModel: "local/model" }, result: "done",
+      watchdog: { elapsedMs: 10, lastActivityKind: "turn", inactivityMs: 0, phase: "working" },
+    };
+    const unpriced = teamExecutionSummary("unpriced-assignment", { ...result, usage: { input: 5, output: 2, cost: 0 } });
+    expect(unpriced).toMatchObject({
+      assignmentId: "unpriced-assignment", selectedModel: "local/model", provider: "local", appliedReasoning: "unknown",
+      elapsedMs: 10, input: 5, output: 2, cacheRead: null, cacheWrite: null, turns: null, toolCalls: null, tools: null,
+      contextTokens: null, estimatedCost: null,
+    });
+    const zeros = teamExecutionSummary("zero-assignment", { ...result, usage: { input: 0, output: 0, cost: 0, turns: 0, toolCalls: 0, tools: {} } });
+    expect(zeros).toMatchObject({ input: 0, output: 0, estimatedCost: 0, turns: 0, toolCalls: 0, tools: {} });
+  });
+
   test("usage adds failed attempts and cancel keeps the last attempted target", async () => {
     const env = tempEnv();
     const configured = { env, userConfigPath: path.join(env.PI_CODING_AGENT_DIR!, "pitako", "config.toml") };
     const { mkdirSync, writeFileSync } = await import("node:fs");
     mkdirSync(path.dirname(configured.userConfigPath), { recursive: true });
     writeFileSync(configured.userConfigPath, `[model_policies.architect.primary]\nmodel = "example/primary"\nreasoning = "high"\n[[model_policies.architect.fallbacks]]\nmodel = "example/fallback-1"\nreasoning = "xhigh"\n`);
+    const failedMetrics = emptyCodeIntelligenceUsage();
+    const failedNavigation = { remaining: 0 };
+    const failedCall: DenseCallUsage = { tool: "project_report", durationMs: 10, outputBytes: 100, truncated: true, outcome: "partial", sources: { ast: { calls: 2, durationMs: 5 } }, graph: { states: { complete: 1 }, buildDurations: { "41": 8 }, failures: 1 } };
+    completeTool(failedMetrics, "project_report", failedCall, failedNavigation);
+    completeTool(failedMetrics, "read", undefined, failedNavigation);
+    const completedMetrics = emptyCodeIntelligenceUsage();
+    const completedNavigation = { remaining: 0 };
+    const completedCall: DenseCallUsage = { tool: "read_symbol", durationMs: 20, outputBytes: 200, truncated: false, outcome: "ok", sources: { ast: { calls: 1, durationMs: 7 } }, graph: { states: { complete: 1 }, buildDurations: { "42": 12 }, failures: 0 } };
+    completeTool(completedMetrics, "read_symbol", completedCall, completedNavigation);
+    completeTool(completedMetrics, "grep", undefined, completedNavigation);
     const executor = scripted([
-      { status: "failed", result: "", error: "429 rate limit", sideEffects: false, usage: { input: 10, output: 1, cacheRead: 4, cacheWrite: 2, cost: 0.2, turns: 1, toolCalls: 1 } },
-      { status: "completed", result: "ok", sideEffects: false, usage: { input: 20, output: 3, cacheRead: 5, cacheWrite: 1, cost: 0.3, turns: 2, toolCalls: 2 } },
+      { status: "failed", result: "", error: "429 rate limit", sideEffects: false, usage: { input: 10, output: 1, cacheRead: 4, cacheWrite: 2, cost: 0.2, turns: 1, toolCalls: 1, codeIntelligence: failedMetrics } },
+      { status: "completed", result: "ok", sideEffects: false, usage: { input: 20, output: 3, cacheRead: 5, cacheWrite: 1, cost: 0.3, turns: 2, toolCalls: 2, codeIntelligence: completedMetrics } },
     ]);
     const summed = await runAgentInstance({
       roleId: "architect",
@@ -80,8 +107,16 @@ describe("agent instance", () => {
       load: configured,
     });
     expect(summed.usage).toMatchObject({ input: 30, output: 4, cacheRead: 9, cacheWrite: 3, cost: 0.5, turns: 3, toolCalls: 3 });
+    expect(summed.usage?.codeIntelligence?.dense).toMatchObject({ project_report: { calls: 1, outputBytes: 100 }, read_symbol: { calls: 1, outputBytes: 200 } });
+    expect(summed.usage?.codeIntelligence?.sources.ast).toEqual({ calls: 3, durationMs: 12 });
+    expect(summed.usage?.codeIntelligence?.graph.buildDurations).toEqual({ "41": 8, "42": 12 });
+    expect(summed.usage?.codeIntelligence?.raw).toEqual({ read: 1, grep: 1 });
     expect(formatAgentResult(summed)).toContain("cached read: 9");
     expect(formatAgentResult(summed)).toContain("cost: 0.5");
+    expect(teamExecutionSummary("fallback-assignment", summed)).toMatchObject({
+      assignmentId: "fallback-assignment", selectedModel: "example/fallback-1", provider: "example",
+      input: 30, output: 4, cacheRead: 9, cacheWrite: 3, turns: 3, toolCalls: 3, estimatedCost: 0.5,
+    });
 
     const controller = new AbortController();
     const cancelling = {
@@ -162,6 +197,49 @@ describe("agent instance", () => {
     ]);
     expect(JSON.stringify(result.usage?.patches)).not.toContain("SENSITIVE-PATCH-BODY");
     expect(formatAgentResult(result)).toContain("mutations: edit 1, write 1, apply_patch 2");
+  });
+  test("continueWith usage deltas add once and keep context as a gauge", async () => {
+    const env = tempEnv();
+    const configured = { env, userConfigPath: path.join(env.PI_CODING_AGENT_DIR!, "pitako", "config.toml") };
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(path.dirname(configured.userConfigPath), { recursive: true });
+    writeFileSync(configured.userConfigPath, `[model_policies.architect.primary]\nmodel = "example/primary"\nreasoning = "high"\n[[model_policies.architect.fallbacks]]\nmodel = "example/fallback-1"\nreasoning = "xhigh"\n`);
+    let starts = 0;
+    let continued = 0;
+    const executor: AttemptExecutor = {
+      async start() {
+        starts += 1;
+        return {
+          status: "failed", result: "", error: "429 rate limit", sideEffects: true,
+          usage: { input: 10, output: 2, cacheRead: 4, cacheWrite: 1, total: 17, cost: 0.1, turns: 1, toolCalls: 1, tools: { read: 1, grep: 1 }, contextTokens: 128 },
+          session: {
+            async continueWith() {
+              continued += 1;
+              return {
+                status: "completed", result: "continued", sideEffects: true, appliedReasoning: "xhigh",
+                usage: { input: 3, output: 1, cacheRead: 2, cacheWrite: 1, total: 7, cost: 0.05, turns: 2, toolCalls: 2, tools: { grep: 2, bash: 1 }, contextTokens: 256 },
+              };
+            },
+            async dispose() {},
+          },
+        };
+      },
+    };
+    const result = await runAgentInstance({ roleId: "architect", task: "review the boundary", cwd: packageRoot(), executor, load: configured });
+    expect(starts).toBe(1);
+    expect(continued).toBe(1);
+    expect(result.usage).toMatchObject({
+      input: 13, output: 3, cacheRead: 6, cacheWrite: 2, total: 24,
+      turns: 3, toolCalls: 3, tools: { read: 1, grep: 3, bash: 1 }, contextTokens: 256, codeIntelligence: undefined,
+    });
+    expect(result.usage?.cost).toBeCloseTo(0.15);
+    const summary = teamExecutionSummary("continue-assignment", result);
+    expect(summary).toMatchObject({
+      assignmentId: "continue-assignment", selectedModel: "example/fallback-1", provider: "example", appliedReasoning: "xhigh",
+      input: 13, output: 3, cacheRead: 6, cacheWrite: 2, turns: 3, toolCalls: 3,
+      tools: { read: 1, grep: 3, bash: 1 }, contextTokens: 256,
+    });
+    expect(summary.estimatedCost).toBeCloseTo(0.15);
   });
 
   test("resolves architect, isolates context, and does not replay side effects", async () => {
@@ -369,11 +447,17 @@ reasoning = "medium"
     expect(toolEffect("board_post")).toBe("mutating");
     expect(toolEffect("database_migrate")).toBe("potentially_mutating");
     expect(marksSideEffect("codegraph_search")).toBe(false);
+    for (const name of ["project_report", "read_symbol", "read_enclosing", "module_report", "inspect_symbol", "review_surface"]) {
+      expect(toolEffect(name)).toBe("read_only");
+      expect(marksSideEffect(name)).toBe(false);
+    }
     expect(marksSideEffect("deploy")).toBe(true);
     expect(thinkingLevelFor(undefined)).toBeUndefined();
     expect(thinkingLevelFor("high")).toBe("high");
     expect(childSessionNote("architect-1")).not.toContain("whatever the user selected");
-    expect(childInstructions(resolveRole("architect", { env: tempEnv() }), "architect-1")).toContain("ModelPolicy");
+    const instructions = childInstructions(resolveRole("architect", { env: tempEnv() }), "architect-1");
+    expect(instructions).toContain("ModelPolicy");
+    expect(instructions).toContain("Use dense queries for bounded code questions; fall back to raw when needed.");
   });
 
   test("500 status code (no body) is unavailable", () => {

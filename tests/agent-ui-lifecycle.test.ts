@@ -276,10 +276,10 @@ describe("agent UI lifecycle", () => {
     publishObservation(baseRow({ id: "session-b-worker" }));
     expect(sessionB.statuses.get("pitako.agents")).toContain("● dev");
 
-    await sessionA.handlers.get("session_shutdown")?.();
+    await sessionA.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, sessionA.ctx);
 
     expect(sessionB.statuses.get("pitako.agents")).toContain("● dev");
-    await sessionB.handlers.get("session_shutdown")?.();
+    await sessionB.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, sessionB.ctx);
     expect(sessionB.statuses.has("pitako.agents")).toBe(false);
   });
 
@@ -393,7 +393,7 @@ describe("agent UI lifecycle", () => {
     expect(statuses.get("pitako")).toBe("pitako:coding");
     expect(statuses.get("pitako.agents")).toContain("● dev");
 
-    await shutdown?.();
+    await shutdown?.({ type: "session_shutdown", reason: "quit" }, ctx);
     expect(statuses.get("pitako")).toBe("pitako:coding");
     expect(statuses.has("pitako.agents")).toBe(false);
   });

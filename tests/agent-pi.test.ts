@@ -1,10 +1,11 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import { createAgentSession, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { classifyProviderFailure } from "../extensions/agent/fallback.ts";
-import { activateTarget, createPiExecutor, cursorProviderContext, DEFAULT_THINKING_LEVEL } from "../extensions/agent/pi.ts";
+import { activateTarget, CHILD_CODE_TOOLS, createPiExecutor, cursorProviderContext, DEFAULT_THINKING_LEVEL } from "../extensions/agent/pi.ts";
+import { runAgentInstance, teamExecutionSummary } from "../extensions/agent/run.ts";
 import { childActiveTools, ORCHESTRATION_TOOLS } from "../extensions/profile.ts";
 import type { ResolvedRole } from "../extensions/roles/types.ts";
 
@@ -40,14 +41,15 @@ describe("pi adapter boundary", () => {
       model,
       sessionManager: SessionManager.inMemory(cwd),
       modelRuntime: runtime,
+      customTools: [...CHILD_CODE_TOOLS],
       excludeTools: [...ORCHESTRATION_TOOLS],
     });
     try {
       const available = session.getAllTools().map((tool) => tool.name);
       session.setActiveToolsByName(childActiveTools(available));
       const active = session.getActiveToolNames();
-      expect(available).toEqual(expect.arrayContaining(["grep", "find", "ls", "read"]));
-      expect(active).toEqual(expect.arrayContaining(["grep", "find", "ls", "read"]));
+      expect(available).toEqual(expect.arrayContaining(["grep", "find", "ls", "read", "project_report", "read_symbol", "read_enclosing", "module_report", "inspect_symbol", "review_surface", "codegraph_search", "lsp_diagnostics"]));
+      expect(active).toEqual(expect.arrayContaining(["read", "grep", "bash", "edit", "find", "ls", "project_report", "read_symbol", "read_enclosing", "module_report", "inspect_symbol", "review_surface", "codegraph_search", "lsp_diagnostics"]));
       for (const tool of ORCHESTRATION_TOOLS) expect(active).not.toContain(tool);
     } finally {
       session.dispose();
@@ -165,6 +167,7 @@ describe("extension provider bind", () => {
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
     delete (globalThis as { __pitakoLateProvider?: unknown }).__pitakoLateProvider;
+    delete (globalThis as { __pitakoTelemetryProvider?: unknown }).__pitakoTelemetryProvider;
   });
 
   async function installLateProvider(): Promise<{ calls: string[]; cwd: string }> {
@@ -189,7 +192,7 @@ describe("extension provider bind", () => {
           name: "Late",
           reasoning: false,
           input: ["text"],
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          cost: { input: 100, output: 200, cacheRead: 50, cacheWrite: 100 },
           contextWindow: 1000,
           maxTokens: 64,
         },
@@ -206,12 +209,12 @@ describe("extension provider bind", () => {
           stopReason: "stop",
           timestamp: Date.now(),
           usage: {
-            input: 1,
-            output: 1,
-            cacheRead: 0,
-            cacheWrite: 0,
-            totalTokens: 2,
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            input: 10,
+            output: 3,
+            cacheRead: 4,
+            cacheWrite: 1,
+            totalTokens: 18,
+            cost: { input: 0.001, output: 0.0006, cacheRead: 0.0002, cacheWrite: 0.0001, total: 0.0019 },
           },
         };
         queueMicrotask(() => {
@@ -241,8 +244,175 @@ describe("extension provider bind", () => {
       expect(calls).toHaveLength(1);
       expect(calls[0]).toContain("late:");
       expect(calls[0]).toContain("say-pong-marker");
+      expect(existsSync(path.join(cwd, ".pitako"))).toBe(false);
     } finally {
       await attempt.session?.dispose();
+    }
+  }, 60_000);
+
+  test("a real Pi fallback continues on the same session", async () => {
+    const { calls, cwd } = await installLateProvider();
+    const agentDir = process.env.PI_CODING_AGENT_DIR!;
+    const provider = (globalThis as { __pitakoLateProvider?: any }).__pitakoLateProvider!;
+    provider.models.push({ ...provider.models[0], id: "fallback", name: "Fallback" });
+    const originalStream = provider.streamSimple;
+    const eventStreamModule: string = "@earendil-works/pi-ai/utils/event-stream.js";
+    const { createAssistantMessageEventStream } = await import(eventStreamModule);
+    provider.streamSimple = (model: { id: string }, context: { messages?: unknown[] }) => {
+      if (model.id !== "late") return originalStream(model, context);
+      calls.push(`late:${JSON.stringify(context.messages ?? [])}`);
+      const stream = createAssistantMessageEventStream();
+      const message = {
+        role: "assistant", content: [], api: "openai-completions", provider: "pitako-late", model: model.id,
+        stopReason: "error", errorMessage: "No API key for pitako-late/late", timestamp: Date.now(),
+        usage: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 1, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      };
+      queueMicrotask(() => { stream.push({ type: "done", reason: "error", message }); stream.end(message); });
+      return stream;
+    };
+    const userConfigPath = path.join(agentDir, "pitako", "config.toml");
+    mkdirSync(path.dirname(userConfigPath), { recursive: true });
+    writeFileSync(userConfigPath, [
+      "[model_policies.developer.primary]", 'model = "pitako-late/late"', 'reasoning = "off"',
+      "[[model_policies.developer.fallbacks]]", 'model = "pitako-late/fallback"', 'reasoning = "high"', "",
+    ].join("\n"));
+    const result = await runAgentInstance({
+      roleId: "developer", task: "say-pong-marker", cwd,
+      executor: createPiExecutor(), load: { env: { PI_CODING_AGENT_DIR: agentDir }, userConfigPath },
+    });
+    expect(result.status).toBe("completed");
+    expect(result.result).toBe("pong");
+    expect(result.model.fallbackOccurred).toBe(true);
+    expect(calls.map((call) => call.split(":")[0])).toEqual(["late", "fallback"]);
+    expect(calls[1]).toContain("say-pong-marker");
+  }, 60_000);
+
+  test("a real AgentInstance through Pi preserves observed model and usage", async () => {
+    const { cwd } = await installLateProvider();
+    const agentDir = process.env.PI_CODING_AGENT_DIR!;
+    const userConfigPath = path.join(agentDir, "pitako", "config.toml");
+    mkdirSync(path.dirname(userConfigPath), { recursive: true });
+    writeFileSync(userConfigPath, `[model_policies.developer.primary]\nmodel = "pitako-late/late"\nreasoning = "off"\n`);
+
+    const result = await runAgentInstance({
+      roleId: "developer", task: "say-pong-marker", cwd,
+      executor: createPiExecutor(),
+      load: { env: { PI_CODING_AGENT_DIR: agentDir }, userConfigPath },
+    });
+    expect(result.status).toBe("completed");
+    expect(result.model.selectedModel).toBe("pitako-late/late");
+    expect(result.model.appliedReasoning).toBe("off");
+    expect(result.watchdog?.elapsedMs).toBeGreaterThanOrEqual(0);
+    expect(result.usage).toMatchObject({ input: 10, output: 3, cacheRead: 4, cacheWrite: 1, cost: 0.0019, turns: 1, toolCalls: 0 });
+    expect(result.usage?.contextTokens).toBeGreaterThan(0);
+    const summary = teamExecutionSummary("pi-assignment", result);
+    expect(summary).toMatchObject({
+      assignmentId: "pi-assignment", selectedModel: "pitako-late/late", provider: "pitako-late", appliedReasoning: "off",
+      input: 10, output: 3, cacheRead: 4, cacheWrite: 1, turns: 1, toolCalls: 0,
+    });
+    expect(summary.estimatedCost).toBeCloseTo(0.0019);
+  }, 60_000);
+
+  test("concurrent child sessions account dense and raw tool events independently", async () => {
+    const agentDir = mkdtempSync(path.join(tmpdir(), "pitako-telemetry-agent-"));
+    const dirs = [mkdtempSync(path.join(tmpdir(), "pitako-telemetry-one-")), mkdtempSync(path.join(tmpdir(), "pitako-telemetry-two-"))];
+    tempDirs.push(agentDir, ...dirs);
+    mkdirSync(path.join(agentDir, "extensions"));
+    writeFileSync(path.join(agentDir, "extensions", "telemetry.js"), "export default function (pi) { pi.registerProvider('pitako-telemetry', globalThis.__pitakoTelemetryProvider); }\n");
+    const streamModule: string = "@earendil-works/pi-ai/utils/event-stream.js";
+    const { createAssistantMessageEventStream } = await import(streamModule);
+    let sequence = 0;
+    (globalThis as { __pitakoTelemetryProvider?: unknown }).__pitakoTelemetryProvider = {
+      baseUrl: "http://127.0.0.1",
+      apiKey: "test",
+      api: "openai-completions",
+      models: [{ id: "late", name: "Late", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000, maxTokens: 64 }],
+      streamSimple(model: { id: string }, context: { messages?: any[] }) {
+        const messages = context.messages ?? [];
+        const hasReport = messages.some((message) => message.role === "assistant" && message.content?.some((part: any) => part.type === "toolCall" && part.name === "project_report"));
+        const reads = messages.filter((message) => message.role === "toolResult" && message.toolName === "read").length;
+        const content = !hasReport
+          ? [{ type: "toolCall", id: `telemetry-${sequence++}`, name: "project_report", arguments: {} }]
+          : reads < 5
+            ? [{ type: "toolCall", id: `telemetry-${sequence++}`, name: "read", arguments: { path: "src/sample.ts" } }]
+            : [{ type: "text", text: "telemetry-complete" }];
+        const stream = createAssistantMessageEventStream();
+        const stopReason = content[0]?.type === "toolCall" ? "toolUse" : "stop";
+        const message = { role: "assistant", content, api: "openai-completions", provider: "pitako-telemetry", model: model.id, stopReason, timestamp: Date.now(), usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+        queueMicrotask(() => { stream.push({ type: "done", reason: stopReason, message }); stream.end(message); });
+        return stream;
+      },
+    };
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    for (const dir of dirs) {
+      mkdirSync(path.join(dir, "src"));
+      writeFileSync(path.join(dir, "src", "sample.ts"), "export const value = 1;\n");
+    }
+    const executor = createPiExecutor();
+    const attempts = await Promise.all(dirs.map((cwd, index) => executor.start({
+      instanceId: `developer-telemetry-${index}`,
+      role: lateRole,
+      task: `inspect-child-${index}`,
+      target: { model: "pitako-telemetry/late", reasoning: "off" },
+      cwd,
+      signal: new AbortController().signal,
+    })));
+    try {
+      for (const attempt of attempts) {
+        expect(attempt.status).toBe("completed");
+        expect(attempt.usage?.codeIntelligence?.dense.project_report?.calls).toBe(1);
+        expect(attempt.usage?.codeIntelligence?.raw.read).toBe(5);
+        expect(attempt.usage?.codeIntelligence?.navigation).toMatchObject({ completedCalls: 5, read: 5, grep: 0, remaining: 0 });
+        expect(attempt.usage?.codeIntelligence?.sources.git?.calls).toBeGreaterThan(0);
+        expect(attempt.usage?.tools?.project_report).toBe(1);
+      }
+      expect(sequence).toBe(12);
+    } finally {
+      await Promise.all(attempts.map((attempt) => attempt.session?.dispose()));
+    }
+  }, 60_000);
+
+  test("failed and cancelled dense child calls retain one attributed outcome", async () => {
+    const agentDir = mkdtempSync(path.join(tmpdir(), "pitako-telemetry-outcomes-agent-"));
+    const dirs = [mkdtempSync(path.join(tmpdir(), "pitako-telemetry-failed-")), mkdtempSync(path.join(tmpdir(), "pitako-telemetry-cancelled-"))];
+    tempDirs.push(agentDir, ...dirs);
+    mkdirSync(path.join(agentDir, "extensions"));
+    writeFileSync(path.join(agentDir, "extensions", "telemetry.js"), "export default function (pi) { pi.registerProvider('pitako-telemetry', globalThis.__pitakoTelemetryProvider); }\n");
+    const streamModule: string = "@earendil-works/pi-ai/utils/event-stream.js";
+    const { createAssistantMessageEventStream } = await import(streamModule);
+    let sequence = 0;
+    (globalThis as { __pitakoTelemetryProvider?: unknown }).__pitakoTelemetryProvider = {
+      baseUrl: "http://127.0.0.1", apiKey: "test", api: "openai-completions",
+      models: [{ id: "late", name: "Late", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000, maxTokens: 64 }],
+      streamSimple(model: { id: string }, context: { messages?: any[] }) {
+        const messages = context.messages ?? [];
+        const complete = messages.some((message) => message.role === "toolResult" && message.toolName === "read_enclosing");
+        const content = complete
+          ? [{ type: "text", text: "query-finished" }]
+          : [{ type: "toolCall", id: `failure-${sequence++}`, name: "read_enclosing", arguments: { file: "missing.ts", line: 1 } }];
+        const stream = createAssistantMessageEventStream();
+        const stopReason = content[0]?.type === "toolCall" ? "toolUse" : "stop";
+        const message = { role: "assistant", content, api: "openai-completions", provider: "pitako-telemetry", model: model.id, stopReason, timestamp: Date.now(), usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+        queueMicrotask(() => { stream.push({ type: "done", reason: stopReason, message }); stream.end(message); });
+        return stream;
+      },
+    };
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    const cancelledController = new AbortController();
+    const executor = createPiExecutor();
+    const [failed, cancelled] = await Promise.all([
+      executor.start({ instanceId: "developer-query-failed", role: lateRole, task: "failed query", target: { model: "pitako-telemetry/late", reasoning: "off" }, cwd: dirs[0]!, signal: new AbortController().signal }),
+      executor.start({ instanceId: "developer-query-cancelled", role: lateRole, task: "cancel query", target: { model: "pitako-telemetry/late", reasoning: "off" }, cwd: dirs[1]!, signal: cancelledController.signal, onActivity(event) { if (event.type === "tool_execution_start" && event.toolName === "read_enclosing") cancelledController.abort(); } }),
+    ]);
+    try {
+      expect(failed.status).toBe("completed");
+      expect(failed.usage?.codeIntelligence?.dense.read_enclosing).toMatchObject({ calls: 1, outcomes: { unavailable: 1 } });
+      expect(cancelled.status).toBe("cancelled");
+      expect(cancelled.usage?.codeIntelligence?.dense.read_enclosing).toMatchObject({ calls: 1, outcomes: { cancelled: 1 } });
+      expect(failed.usage?.codeIntelligence?.dense.read_enclosing?.calls).toBe(1);
+      expect(cancelled.usage?.codeIntelligence?.dense.read_enclosing?.calls).toBe(1);
+    } finally {
+      await Promise.all([failed.session?.dispose(), cancelled.session?.dispose()]);
     }
   }, 60_000);
 

@@ -1,6 +1,6 @@
 # Engineering layer
 
-Pitako 0.1 remains a Pi package. This note records the coding distribution, Board v0, role definitions, AgentInstance, one Herdr supervise tool, and `$plan` / `$execute`. Teams, a DAG, and a scheduler are still absent.
+Pitako 0.1 is a Pi package. This note records its dependency choices, Board, roles, AgentInstance, Team assignments, Code Intelligence, and `$plan` / `$execute`. There is no DAG scheduler.
 
 ## Decisions
 
@@ -8,7 +8,7 @@ Pitako 0.1 remains a Pi package. This note records the coding distribution, Boar
 
 `@juicesharp/rpiv-todo` 2.11.0 is a real Pi package (MIT). Pitako depends on it and loads `node_modules/@juicesharp/rpiv-todo/index.ts`. That is the session-local TODO layer: `todo`, `/todos`, overlay, `blockedBy`, `owner`, `metadata`, and branch replay.
 
-It is not Pitako Tasks or Memory. Do not overload it with Board semantics. Board v0 is a separate extension. Upstream keeps exactly one task `in_progress`. That is fine for single-agent Pitako. A later multi-agent policy may become one active task per owner; do not change it now.
+It is not Pitako Tasks or Memory. Do not overload it with Board semantics. The Board is a separate extension. Upstream keeps exactly one task `in_progress` per session. Team workers have separate sessions and separate TODO lists; do not turn one session's list into a shared roster.
 
 `@juicesharp/rpiv-i18n` stays optional. Users configure overlay size, collapse key, and guidance through rpiv-todo's own `~/.config/rpiv-todo/config.json`. Disable the extension with Pi package filters.
 
@@ -24,7 +24,7 @@ Caveman is not a Pi package. `skills/` is MIT. Engine, proxy, browse, MCP, and t
 
 ### pstack: vendor selected skills
 
-`@zenspc/pi-pstack` 0.6.0 is the current Pi-native port. It still loads poteto-mode, setup-pstack, and `pi-subagents`. Depending on it would activate orchestration this milestone forbids.
+`@zenspc/pi-pstack` 0.6.0 is the Pi-native port evaluated for the initial distribution. It loads poteto-mode, setup-pstack, and `pi-subagents`. Depending on it would add orchestration outside Pitako's AgentInstance and Team tools.
 
 Pitako vendors selected skills from the official pstack plugin (Lauren Tan, MIT, plugin revision `6ed0f7a9504f577d7529064103cecce9be7dfc5e`) and rewrites the orchestrated ones (`how`, `why`, `architect`, `blast-radius`, `show-me-your-work`, `reflect`, verification skills) for a single agent.
 
@@ -50,13 +50,13 @@ The Pitako extension injects `profileNote` only: profile, inspect-first, small d
 
 Use Pi's package filters or `pi config`. Examples live in the README. Pitako does not add a settings file.
 
-## Board v0
+## Board
 
 The Board is a workspace forum: topics hold posts of type INFO, FINDING, QUESTION, ANSWER, DECISION, BLOCKER, and HANDOFF. It is not a TODO list, a transcript, or memory.
 
-Storage is SQLite at `$PI_CODING_AGENT_DIR/pitako/board.db`, falling back to `~/.pi/agent/pitako/board.db`. Pi runs on Node, so the driver is built-in `node:sqlite` (`DatabaseSync`). That module is still experimental in Node 22 through 25, but it is present on Pi's Node 22.19 floor and needs no native addon. Bun 1.3.14 does not implement `node:sqlite`, so tests open `bun:sqlite` through `extensions/board/sqlite.ts`. The SQL is the same. Schema version is `PRAGMA user_version`. Version 1 is created once. Any other version fails without deleting data.
+Storage is SQLite at `$PI_CODING_AGENT_DIR/pitako/board.db`, falling back to `~/.pi/agent/pitako/board.db`. Pi runs on Node, so the driver is built-in `node:sqlite` (`DatabaseSync`). That module is still experimental in Node 22 through 25, but it is present on Pi's Node 22.19 floor and needs no native addon. Bun 1.3.14 does not implement `node:sqlite`, so tests open `bun:sqlite` through `extensions/board/sqlite.ts`. The SQL is the same. Schema version is `PRAGMA user_version`. New databases use v2. Existing v1 rows migrate to v2 without losing posts; incomplete or unsupported schemas fail without deleting data.
 
-Workspace is `git rev-parse --show-toplevel`, or the canonical cwd outside a repository. Tools do not accept a workspace argument. Scope is always `global`. Author is the string `pi`. Integer ids are SQLite row ids. There is no agent identity, team scope, or Thread table. A later schema version can add those without reading an unversioned file.
+Workspace is `git rev-parse --show-toplevel`, or the canonical cwd outside a repository. Tools do not accept a workspace argument. Scope is always `global`. Foreground posts use author `pi`; child posts use their AgentInstance id. Topics can be bound to a plan with `board_workflow_claim`; `board_workflow_lifecycle` changes the status of a bound topic after its plan checks. Integer ids are SQLite row ids. There is no team scope or Thread table.
 
 The extension registers tools and `/board`. It does not subscribe to agent events, so Board rows never enter the prompt unless a tool is called. List, read, and query results are capped.
 
@@ -68,7 +68,7 @@ User config is `$PI_CODING_AGENT_DIR/pitako/config.toml`. `smol-toml` parses it.
 
 Reasoning is Pi's `ThinkingLevel` plus `off`. The set is checked against the `ThinkingLevel` type so a new Pi level fails the build. Unsupported levels are rejected with `getSupportedThinkingLevels` only when the caller supplies models. Config load does not open Pi's model registry, so a named target can exist before auth does. Exact `provider/model` is required. Bare ids are rejected.
 
-Fallback is availability only. v0 does not select a fallback and does not accept `fallback_on`. Pi's retry classifier is string matching, not a stable category enum, so inventing a config taxonomy would pretend the errors are more structured than they are. `FallbackReason` is reserved on the resolved policy for the runner.
+Fallback is availability only. The runner tries the next configured target for recognized provider or model failures; it does not accept `fallback_on`. The classifier matches error text because Pi does not export a stable provider error taxonomy. Test failures and unknown errors do not trigger fallback.
 
 `getRole("architect")` and `resolveRole("architect")` return instructions, skills, principles, the policy id, the primary target, reasoning, and ordered fallbacks. If no primary is configured, resolution succeeds with a diagnostic instead of crashing.
 
@@ -76,7 +76,7 @@ Fallback is availability only. v0 does not select a fallback and does not accept
 
 `agent_run` stays synchronous. It creates one in-process Pi `AgentSession` with `SessionManager.inMemory`. That gives a new conversation and a new rpiv-todo session id without a child process. Pi's `setModel` keeps the same session when a provider fails after a mutating tool. A fresh session is used only when no mutating tool has run. Unknown errors and cancellation do not fall back. The child prompt is the role instructions plus the task. Parent messages are not passed in.
 
-Board author is resolved from a process-shared session registry, not AsyncLocalStorage. A child Pi session id maps to the instance id. The foreground session stays `pi`. The model cannot pass an author. Child tools are enabled with `setActiveToolsByName` at construction, including grep, find, and ls. `agent_run` stays excluded.
+Board author is resolved from a process-shared session registry, not AsyncLocalStorage. A child Pi session id maps to the instance id. The foreground session stays `pi`. The model cannot pass an author. Child tools are enabled with `setActiveToolsByName` at construction, including grep, find, ls, raw LSP and CodeGraph, and the six bounded Code Intelligence queries. Foreground orchestration tools stay excluded. Only Developer AgentInstances can use `apply_patch`.
 
 A policy model that an extension registers during session bind is resolved after that bind. A missing id is final only then, and the task is not sent until that model is active. Target activation is part of fallback. `setModel` throwing `No API key` is an auth failure, and the next target is tried. Unknown throws are not. Pi tools have no mutating flag. Known read-only names do not mark side effects. Every other name does. After that flag is set, fallback continues the same session and does not send the original task again. `reasoning = default` is not rewritten to `medium`.
 
@@ -87,6 +87,14 @@ AgentInstance has no 20-minute deadline. The stops at that mark came from the pa
 `agent_spawn` is the background scheduling path for that same `runAgentInstance`. It passes an owned `AbortController`, not the foreground tool signal. The registry is process-local (`Symbol.for("pitako.backgroundWorkers")`). It is not `ExecutionIdentity` and not SQLite. Status and result reads do not wait. A watched completion uses `pi.sendMessage` with `deliverAs: "followUp"` and `triggerTurn: true` only when the foreground owner is idle. Otherwise the line is held until the owner's idle boundary. `steer` is not used. A second extension evaluation does not flush or cancel those rows. `session_shutdown` on the foreground owner aborts them. Workers do not survive reload, `/new`, fork, resume, or process exit.
 
 `agent_supervise` stays a synchronous Herdr wait. It is not an AgentInstance path and it is not the background path. It requires Herdr presence and a current official Pi integration. The operator installs that integration with `herdr integration install pi`. Pitako does not install it. A supervised result is an instance id, a pane id, and a Herdr status. It is not an `AgentRunResult`.
+
+## Team assignments
+
+`team_assign` starts independent background AgentInstances from the foreground session. One assignment per role can run at a time. `team_status`, `team_result`, and `team_cancel` use assignment IDs, not worker instance IDs. Watched plan units wake the owning foreground session; child sessions cannot dispatch Team work. Team state is not a DAG scheduler or a Board scope.
+
+## Code Intelligence
+
+Six read-only queries supplement raw read, grep, LSP, and CodeGraph. Graph-backed dense queries use the CodeGraph SDK directly and build, reindex, or sync `.codegraph` under Node when needed. `project_report` only observes the index. Under the tested Bun runtime, graph-backed dense queries report unavailable because the SDK needs `node:sqlite`. Raw `codegraph_*` tools still use the CLI through `codegraph serve --mcp` and need an existing index. Query metrics are part of `AgentUsage` and `/pitako stats`; they do not imply that dense queries match raw coverage.
 
 ## Plan and execute
 
@@ -102,7 +110,7 @@ AgentInstance has no 20-minute deadline. The stops at that mark came from the pa
 
 rpiv-todo dogfood: `/pitako` now names the session TODO layer in one line, and `tests/todo.test.ts` drives the real `todo` tool (create, in_progress, complete, `blockedBy`, cycle rejection, branch isolation, replay). No Pitako Task system was added.
 
-Board v0 dogfood used topic `Board v0 dogfood` in `~/.pi/agent/pitako/board.db` for this repository. The follow-up was small: `scripts/smoke.ts` now requires the six Board tool names and still does not call them. `bun run smoke` passed. The open question, left unanswered, is whether smoke should set a temporary `PI_CODING_AGENT_DIR` before any future Board call.
+The initial Board dogfood used topic `Board v0 dogfood` in `~/.pi/agent/pitako/board.db` for this repository. The follow-up was small: `scripts/smoke.ts` requires the six basic Board tool names but does not call them. `bun run smoke` passed at the time. Smoke should set a temporary `PI_CODING_AGENT_DIR` before any future Board call.
 
 The TODO list stayed the execution checklist. The Board held the finding, the decision, and the handoff. That split was natural. Friction: a session started before the extension existed does not see `board_*` until reload, so the posts were made by executing the registered tools in a bun process. `node:sqlite` still prints an experimental warning, and Bun 1.3.14 cannot import it.
 

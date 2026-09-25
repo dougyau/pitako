@@ -16,9 +16,9 @@ It currently combines:
 - LSP (`pi-lsp-client`) and CodeGraph (`@vndv/pi-codegraph`)
 - [`@juicesharp/rpiv-todo`](https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-todo) for session-local TODOs
 
-Not every skill or principle is active all the time. Pi keeps names and descriptions in context and loads a skill body when the task matches. Principles are contextual. Later roles can use different subsets. This milestone does not implement teams. Board v0 is the shared forum.
+Not every skill or principle is active all the time. Pi keeps names and descriptions in context and loads a skill body when the task matches. Principles are contextual. Roles can use different subsets. Team assignments and the workspace Board are available to the foreground session.
 
-`pitako-coding` is the router: inspect the repo, prefer CodeGraph and LSP, keep diffs small, verify real behavior, and load a specialized skill only when it applies. It does not embed the full Ponytail, Caveman, or pstack bodies.
+`pitako-coding` is the router: inspect the repo, keep raw read, grep, LSP, and CodeGraph available, use bounded Code Intelligence queries when they fit, keep diffs small, verify real behavior, and load a specialized skill only when it applies. It does not embed the full Ponytail, Caveman, or pstack bodies.
 
 Disable Ponytail, Caveman, or any individual skill with `pi config` or package skill filters. See [Disable or override](#disable-or-override-an-extension). Attribution and pins are in [THIRD_PARTY.md](THIRD_PARTY.md). Decisions are in [docs/engineering.md](docs/engineering.md).
 
@@ -26,15 +26,17 @@ Disable Ponytail, Caveman, or any individual skill with `pi config` or package s
 
 - A Pi package (`keywords: pi-package`) with the Pitako extension, the Board extension, curated skills, and one prompt.
 - The **coding** profile: Pi's read, bash, edit, and write tools, plus grep, find, and ls, plus LSP and CodeGraph.
-- The **analysis** profile: the same read and search tools, without `edit`, `write`, or `lsp_rename`.
+- The **analysis** profile: the same read and search tools, without `edit`, `write`, `apply_patch`, or `lsp_rename`.
+- Six bounded, read-only Code Intelligence queries: `project_report`, `read_symbol`, `read_enclosing`, `module_report`, `inspect_symbol`, and `review_surface`. Graph-backed queries create or refresh their index when needed under Node; raw tools remain visible.
 - Startup checks that fail with a clear configuration error when a required extension file or the `codegraph` CLI is missing.
 - On-demand Ponytail, selected Caveman skills, and selected pstack practical skills and principles.
 - Session-local TODOs via `@juicesharp/rpiv-todo` (`todo`, `/todos`, overlay).
-- A workspace-scoped Board (`board_*` tools, `/board`) stored in SQLite.
+- A workspace-scoped Board (`board_*` tools, `/board`) stored in SQLite. Plans can bind and finalize their own topics.
 - Role definitions and model policies (`/pitako roles`). These are templates, not running agents.
 - `agent_run` for one synchronous in-process AgentInstance. It does not start a team.
 - `agent_spawn` for one background in-process AgentInstance. The Coordinator stays available. `agent_status`, `agent_result`, and `agent_cancel` inspect that worker. `/pitako agents` prints the same compact view.
-- `agent_supervise` for one synchronous visible sibling pane. It does not run in the background. It is not a team.
+- `agent_supervise` for one synchronous visible sibling pane. It does not run in the background or join the Team roster.
+- `team_assign`, `team_status`, `team_result`, and `team_cancel` for independent foreground Team assignments, with one active assignment per role.
 - `$plan` and `$execute`. Planning stops at `PLAN_FROZEN`. Execution is a separate invocation. Neither calls Herdr.
 
 ## Session TODOs
@@ -48,7 +50,7 @@ Pitako uses [`@juicesharp/rpiv-todo`](https://github.com/juicesharp/rpiv-mono/tr
 - `blockedBy` dependencies (cycles are rejected)
 - `owner` and `metadata` fields, unused by Pitako today and left for later Task/Board wiring
 
-This is not Pitako's Task system or Memory. The Board is a separate forum. See [Board](#board). Skip TODOs for questions and one-line edits. Configure overlay size, collapse key, and model guidance in rpiv-todo's own `~/.config/rpiv-todo/config.json`. Disable the extension with a package filter: `!node_modules/@juicesharp/rpiv-todo/index.ts`.
+This is not Pitako's Task system or Memory. The Board is a separate forum. See [Board](#board). Skip TODOs for trivial tasks and purely conversational requests. Configure overlay size, collapse key, and model guidance in rpiv-todo's own `~/.config/rpiv-todo/config.json`. Disable the extension with a package filter: `!node_modules/@juicesharp/rpiv-todo/index.ts`.
 
 ## Board
 
@@ -64,10 +66,12 @@ Post types are `INFO`, `FINDING`, `QUESTION`, `ANSWER`, `DECISION`, `BLOCKER`, a
 
 | Tool | Behavior |
 | --- | --- |
-| `board_topic_create` | Create a topic. Scope is `global`. Status starts `open`. Author is `pi`. |
+| `board_topic_create` | Create a topic. Scope is `global` and status starts `open`. The foreground author is `pi`; child authors use their AgentInstance id. |
 | `board_topic_list` | List topics in this workspace. Defaults to open, newest activity first. Default 20, max 50. |
 | `board_topic_read` | Read one topic and a page of posts, oldest to newest within the page. Default 40, max 100. Page with `beforePostId` or `afterPostId`. |
-| `board_topic_update` | Change title, description, or status (`open`, `resolved`, `closed`). |
+| `board_topic_update` | Change title, description, or status (`open`, `resolved`, `closed`). Plan-owned topic status uses `board_workflow_lifecycle`. |
+| `board_workflow_claim` | Bind an existing open topic to a draft plan. |
+| `board_workflow_lifecycle` | Resolve or close the bound plan topic from the foreground session after plan checks. |
 | `board_post` | Add a post. `replyTo` must be a post in the same topic. |
 | `board_query` | Filter current-workspace posts by topic, type, author, or text. Default 20, max 50. |
 
@@ -79,15 +83,15 @@ The database is `$PI_CODING_AGENT_DIR/pitako/board.db`. If `PI_CODING_AGENT_DIR`
 
 Agents pull the Board by calling the tools. Pitako does not inject topics or posts into every turn.
 
-Storage is SQLite schema version 1, with foreign keys and WAL. The driver is Node's built-in `node:sqlite`. Node still marks that module experimental. Scope is `global` only. Decisions are immutable posts. A later post can point at an earlier one with `replyTo` or metadata such as `{"supersedes": 17}`. There is no decision graph. A `DECISION` post does not resolve the topic. Set the status when the discussion is done or no longer relevant.
+Storage is SQLite schema version 2, with foreign keys and WAL. It migrates v1 data without deleting posts and rejects incomplete schemas. Node uses built-in `node:sqlite`; Bun tests use `bun:sqlite`. Scope is `global` only. Decisions are immutable posts. A later post can point at an earlier one with `replyTo` or metadata such as `{"supersedes": 17}`. There is no decision graph. A `DECISION` post does not resolve the topic. Set the status when the discussion is done or no longer relevant.
 
-Teams, private boards, memory, embeddings, and automatic summaries are not in this version. A later Pitako Thread may namespace topics. Schema version 1 is checked on open so that change does not have to guess at an old file.
+Private boards, memory, embeddings, and automatic summaries are not in this version. A later Pitako Thread may namespace topics.
 
 Disable the extension with a package filter: `!extensions/board/index.ts`.
 
 ## Roles and model policies
 
-A role is a reusable responsibility template. It is not a running agent. A later AgentInstance may use a role. This version does not spawn one.
+A role is a reusable responsibility template, not a running agent. AgentInstances use roles for synchronous runs, background workers, and Team assignments.
 
 ```
 RoleDefinition
@@ -139,7 +143,7 @@ Before a mutating or unknown tool runs, the next target may start a fresh sessio
 
 The result can include turns, input, output, cache tokens, cost, and tool-call counts when Pi reports them. Input tokens are cumulative across turns, not the size of one prompt.
 
-The child cannot call `agent_run`, `agent_supervise`, `agent_spawn`, `agent_status`, `agent_result`, or `agent_cancel`. There is no resume and no team.
+The child cannot call `agent_run`, `agent_supervise`, `agent_spawn`, `agent_status`, `agent_result`, `agent_cancel`, or the `team_*` orchestration tools. It cannot delegate. Same-session fallback can continue a child run; it does not expose a separate resume command.
 
 `agent_spawn` returns while the worker is still running. The worker has its own cancellation. A later Coordinator turn does not cancel it. Completion is one short signal. The result stays out of the Coordinator conversation until `agent_result`. A spawn with `plan` and `unit` can wake an idle `$execute` turn. A spawn without that pair only notifies the UI. Herdr background supervision is not in this milestone.
 
@@ -174,11 +178,11 @@ Artifacts live in the workspace (git root, or the current directory outside a re
 
 Six records stay separate. `todo` is the current session checklist. The Board holds shared findings, decisions, and handoffs. The plan is the frozen decision. The ledger is the resume checkpoint: plan id, revision, content hash, status, and rulings. Evidence is proof for one unit. The repository is the product change. Do not use one as a substitute for another.
 
-`$plan` and `$execute` are not Herdr callers. Teams, a DAG, and a scheduler are still absent.
+`$plan` and `$execute` are not Herdr callers. Team assignments can run independent work, but there is no DAG scheduler.
 
 ## What this is not yet
 
-Pitako does not implement teams, subteams, or Coordinator delegation. AgentInstance v0 runs one isolated role at a time. Session TODOs are local execution plans. The Board is not a team roster or a memory store.
+Pitako does not implement subteams or a DAG scheduler. Team assignments let independent roles run concurrently, with one assignment per role. Session TODOs are local execution plans. The Board is not a team roster or a memory store.
 
 Web search is not bundled. See [Web research](#web-research).
 
@@ -187,7 +191,7 @@ Web search is not bundled. See [Web research](#web-research).
 - Node.js 22.19 or newer (same floor as current Pi).
 - [Pi coding agent](https://github.com/earendil-works/pi) `@earendil-works/pi-coding-agent` 0.87 or newer.
 - Bun 1.3 if you are developing this repository. People who only install a published package do not need Bun.
-- A language server on `PATH` for the languages you want LSP to answer. TypeScript: `typescript-language-server` (and `typescript`). Pitako does not download language servers.
+- An installed language server for LSP. It can be resolved from `PATH`, a project-local `node_modules/.bin`, or an explicit command path. TypeScript defaults to `typescript-language-server`; `/lsp install <id>` offers explicit installation for supported servers.
 - CodeGraph CLI. This package depends on `@colbymchenry/codegraph` and will use `node_modules/.bin/codegraph` when `codegraph` is not already on `PATH`.
 
 Pitako does not set a provider or model. Use whatever you configured in Pi.
@@ -218,7 +222,7 @@ Development shortcut, using the Pi binary from this repo's dev dependency rather
 bun run pi
 ```
 
-Open a project that has a CodeGraph index (`codegraph init` in that project) and a language server available for its files.
+Open a project with source files and a language server for LSP. Dense graph queries build or refresh the CodeGraph index as needed under Node; raw `codegraph_*` queries need an existing index. Run `codegraph init` if you plan to use raw CodeGraph before any dense graph query.
 
 ## Development
 
@@ -235,8 +239,8 @@ bun run typecheck
 
 | Profile | Tools |
 | --- | --- |
-| `coding` (default) | `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, LSP, CodeGraph. On Windows, `powershell` is included when Pi registered it. |
-| `analysis` | `read`, `bash`, `grep`, `find`, `ls`, LSP, CodeGraph. No `edit`, `write`, or `lsp_rename`. |
+| `coding` (default) | `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, LSP, CodeGraph, and read-only Code Intelligence queries. Developer AgentInstances also get `apply_patch`. On Windows, `powershell` is included when Pi registered it. |
+| `analysis` | `read`, `bash`, `grep`, `find`, `ls`, LSP, CodeGraph, and read-only Code Intelligence queries. No `edit`, `write`, `apply_patch`, or `lsp_rename`. |
 
 Shell is still available in `analysis`. Restricting bash safely would be a separate sandbox, and this milestone does not add one.
 
@@ -248,7 +252,7 @@ Or, inside a session: `/pitako profile analysis`. `/pitako` prints the current p
 
 `PITAKO_PROFILE` is used when `--pitako-profile` is omitted. An unknown name fails startup with `PitakoConfigError`.
 
-`edit` and `write` are blocked for `.git/`, `node_modules/`, and `.env` files in either profile.
+`edit` and `write` are blocked for `.git/`, `node_modules/`, `.env`, and `.env.*` files. `analysis` does not enable either tool.
 
 An unnamed session takes its display name from the first user line, capped at 60 characters. `--name` and `/name` win. A `$plan` or `$execute` session is renamed from the plan heading when that file exists, as `plan: <heading>` or `execute: <heading>`. On resume, Pitako replaces the old `pitako:coding` or `pitako:analysis` placeholder. The footer cwd line and `pitako` status slot both show the display name; the profile is not written into the status slot. `/pitako` still prints the profile.
 
@@ -258,7 +262,8 @@ An unnamed session takes its display name from the first user line, capped at 60
 | --- | --- | --- |
 | LSP | [`pi-lsp-client`](https://github.com/code-yeongyu/pi-lsp-client) at `1c981dfcacc456fe4ce9f4120a2f0250b54d6844` | Pi-native tools for diagnostics, go to definition, references, symbols, prepare-rename, and rename. Not published on npm, so it is pinned as a git dependency. MIT. |
 | CodeGraph | [`@vndv/pi-codegraph`](https://github.com/vndv/pi-codegraph) `0.1.10` | Pi-native tools over the `codegraph` CLI: search, callers, callees, impact, explore, node, files, status. MIT. |
-| CodeGraph CLI | `@colbymchenry/codegraph` `1.6.0` | The index and `codegraph serve` process the extension talks to. MIT. |
+| CodeGraph CLI | `@colbymchenry/codegraph` `1.6.0` | The index and `codegraph serve` process the raw extension talks to. MIT. |
+| Code Intelligence | `extensions/code-intelligence/` | Six bounded queries using AST, LSP, Git, and the direct CodeGraph SDK. Graph-backed queries require Node. |
 | Profiles, protected paths, status | `extensions/index.ts` | Pitako-owned. |
 
 `@vndv/pi-codegraph` registers Pi tools. It spawns `codegraph serve --mcp` internally. You do not add an MCP server to Pi.
@@ -284,7 +289,7 @@ Or run `bun run smoke`, which loads Pitako through Pi's resource loader and call
 codegraph init
 ```
 
-Then ask Pi to use `codegraph_search` for a symbol and `codegraph_callers` for its callers. The smoke test does this on the tiny fixture.
+Then ask Pi to use the raw `codegraph_search` and `codegraph_callers` tools. The smoke test initializes the tiny fixture for these raw queries. Under Node, a graph-backed dense query can build the index instead; `project_report` only observes it. Under Bun, graph-backed dense queries report unavailable.
 
 ## Disable or override an extension
 
@@ -296,14 +301,14 @@ Pi can filter a package without editing Pitako. In `settings.json`:
     {
       "source": "/absolute/or/relative/path/to/pitako",
       "extensions": [
-        "!node_modules/@vndv/pi-codegraph/extensions/codegraph.ts"
+        "!extensions/code-intelligence/codegraph-raw.ts"
       ]
     }
   ]
 }
 ```
 
-`pi config` toggles individual resources from installed packages, including skills. Paths are relative to the package root. Filtering CodeGraph out of the loader does not remove the dependency; it only stops Pi from registering those tools.
+`pi config` toggles individual resources from installed packages, including skills. Paths are relative to the package root. Filtering the raw CodeGraph extension out of the loader does not remove the dependency or the dense queries; it only stops Pi from registering the raw `codegraph_*` tools.
 
 To drop Ponytail, Caveman, or one principle without editing Pitako:
 
@@ -343,7 +348,7 @@ Do not commit API keys, `auth.json`, or `~/.pi/agent/settings.json`.
 ```
 pitako/
 ├── package.json          # pi manifest and pinned dependencies
-├── extensions/           # Pitako extension, Board, and role resolution
+├── extensions/           # profiles, Board, roles, Team, and Code Intelligence
 ├── roles/                # role instruction markdown
 ├── skills/pitako-coding/ # router + baseline
 ├── skills/plan/          # $plan, stops at PLAN_FROZEN
@@ -360,7 +365,7 @@ pitako/
 └── tests/
 ```
 
-A later `pitako-team` or `pitako-model-policy` extension is a new file under `extensions/` plus a `pi.extensions` entry. No empty packages are created for them now.
+Team assignment and model policy code already live under `extensions/agent/`, `extensions/team.ts`, and `extensions/roles/`. No separate package is required.
 
 ## Smoke test
 
@@ -384,17 +389,17 @@ The script copies `fixtures/tiny-ts` to a temp directory, runs `codegraph init`,
 - Analysis mode does not sandbox `bash` or `powershell`.
 - Language servers are not installed automatically.
 - `pi-lsp-client` is consumed from git because it is not on npm. The commit is pinned.
-- Web research and teams are not implemented. Board scope is global only. Agent fallback does not rerun a task after side effects.
+- Web research is not bundled. Board scope is global only. Agent fallback does not rerun a task after side effects.
 - Local `pi install .` requires `bun install` (or `npm install`) in this directory first, so `node_modules` exists.
 
 ## Roadmap
 
 Not built yet:
 
-- Teams and Coordinator delegation
-- nested or background agents
-- private or team Board scopes
-- executing model fallback
+- Subteams and nested agent delegation
+- Background workers that survive process exit
+- Private or team Board scopes
+- Hover and `codegraph_context` tools
 
 ## License
 
