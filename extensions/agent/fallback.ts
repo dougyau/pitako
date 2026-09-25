@@ -42,6 +42,12 @@ const PATTERNS: Array<{ reason: FallbackReason; pattern: RegExp }> = [
   },
 ];
 
+/** Explicit service-tier rejection is a target configuration failure, not availability. */
+export function isServiceTierRejection(message: string | undefined): boolean {
+  if (!message || !/\bservice[_\s-]?tier\b/i.test(message)) return false;
+  return /unsupported|unrecognized|unrecognised|unknown|invalid|not supported|not allowed|not accepted|rejected|unexpected/i.test(message);
+}
+
 /** Infrastructure failures only. Unknown text does not fall back. */
 export function classifyProviderFailure(message: string | undefined): FallbackReason | undefined {
   if (!message || message.trim().length === 0) return undefined;

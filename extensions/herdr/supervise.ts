@@ -92,6 +92,9 @@ async function superviseOnce(input: {
     throw new PitakoConfigError(role.modelPolicy.diagnostic ?? `model policy "${role.modelPolicyId}" has no primary target`);
   }
   const target = role.modelPolicy.primary;
+  if (target.fast === true) {
+    throw new PitakoConfigError(`fast mode is not supported by agent_supervise for primary target "${target.model}"`);
+  }
   const instanceId = createInstanceId(role.id);
 
   const layout = await exec(run, ["pane", "layout", "--pane", presence.paneId], input.cwd, signal);

@@ -40,7 +40,12 @@ export function formatPolicyList(config: PitakoConfig): string {
 export function formatPolicy(policy: ResolvedModelPolicy): string {
   const lines = [`model policy: ${policy.id}`];
   if (policy.primary) {
-    lines.push("primary:", `  ${policy.primary.model}`, `  reasoning: ${policy.primary.reasoning ?? "unset"}`);
+    lines.push(
+      "primary:",
+      `  ${policy.primary.model}`,
+      `  reasoning: ${policy.primary.reasoning ?? "unset"}`,
+      `  fast: ${policy.primary.fast ?? false}`,
+    );
   } else {
     lines.push("primary:", "  not configured");
   }
@@ -48,11 +53,17 @@ export function formatPolicy(policy: ResolvedModelPolicy): string {
     lines.push("fallbacks:", "  none");
   } else {
     policy.fallbacks.forEach((target, index) => {
-      lines.push(`fallback ${index + 1}:`, `  ${target.model}`, `  reasoning: ${target.reasoning ?? "unset"}`);
+      lines.push(
+        `fallback ${index + 1}:`,
+        `  ${target.model}`,
+        `  reasoning: ${target.reasoning ?? "unset"}`,
+        `  fast: ${target.fast ?? false}`,
+      );
     });
   }
   if (policy.diagnostic) lines.push(policy.diagnostic);
   lines.push("Configured fallbacks are availability targets. This listing is the policy, not a run.");
+  lines.push("Fast is requested configuration, not a provider grant.");
   lines.push("agent_run reports the selected target and fallback reason separately.");
   return lines.join("\n");
 }

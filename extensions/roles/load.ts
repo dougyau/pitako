@@ -32,7 +32,7 @@ export interface LoadOptions {
 const ROOT_KEYS = new Set(["roles", "model_policies", "agent_runtime"]);
 const ROLE_KEYS = new Set(["name", "description", "instructions", "model_policy", "skills", "principles"]);
 const POLICY_KEYS = new Set(["primary", "fallbacks"]);
-const TARGET_KEYS = new Set(["model", "reasoning"]);
+const TARGET_KEYS = new Set(["model", "reasoning", "fast"]);
 const KNOWN_SKILLS = new Set<string>([...DEFAULT_SKILL_NAMES, ...OPTIONAL_LANGUAGE_SKILLS]);
 
 export function loadPitakoConfig(options: LoadOptions = {}): PitakoConfig {
@@ -186,7 +186,7 @@ function assertUniqueTargets(id: string, primary: ModelTarget | undefined, fallb
 }
 
 function targetKey(target: ModelTarget): string {
-  return `${target.model}\0${target.reasoning ?? ""}`;
+  return `${target.model}\0${target.reasoning ?? ""}\0${target.fast ?? false}`;
 }
 
 function validateAgainstModels(config: PitakoConfig, models: readonly ModelCapability[]): void {
@@ -368,7 +368,11 @@ function parseTarget(value: unknown, file: string, field: string): ModelTarget {
   if (table.model === undefined) throw new PitakoConfigError(`${file}: ${field}: empty fallback target`);
   const model = parseModelId(requiredString(table.model, file, `${field}.model`), file, `${field}.model`);
   const reasoning = table.reasoning === undefined ? undefined : parseReasoning(table.reasoning, file, `${field}.reasoning`);
-  return reasoning === undefined ? { model } : { model, reasoning };
+  const fast = table.fast === undefined ? undefined : parseFast(table.fast, file, `${field}.fast`);
+  const target: ModelTarget = { model };
+  if (reasoning !== undefined) target.reasoning = reasoning;
+  if (fast !== undefined) target.fast = fast;
+  return target;
 }
 
 export function parseModelId(value: string, file = "", field = "model"): string {
@@ -379,6 +383,11 @@ export function parseModelId(value: string, file = "", field = "model"): string 
     throw new PitakoConfigError(`${prefix}invalid model id "${value}". Expected provider/model.`);
   }
   return model;
+}
+
+function parseFast(value: unknown, file: string, field: string): boolean {
+  if (typeof value !== "boolean") throw new PitakoConfigError(`${file}: ${field}: expected boolean`);
+  return value;
 }
 
 function parseReasoning(value: unknown, file: string, field: string): ReasoningLevel | undefined {

@@ -3,7 +3,7 @@ import { currentWorkspace } from "../board/workspace.ts";
 import { PitakoConfigError } from "../errors.ts";
 import { loadPitakoConfig, resolveRoleFromConfig, type LoadOptions } from "../roles/load.ts";
 import type { FallbackReason, ModelTarget, ResolvedRole } from "../roles/types.ts";
-import { classifyProviderFailure } from "./fallback.ts";
+import { classifyProviderFailure, isServiceTierRejection } from "./fallback.ts";
 import { formatAgentLive } from "./present.ts";
 import { agentScope } from "./scope.ts";
 import type { AgentUiSnapshot } from "./ui.ts";
@@ -90,12 +90,23 @@ export interface WatchdogSnapshot {
   phase: WatchdogPhase;
 }
 
+export interface AgentRequestObservation {
+  model: string;
+  reasoning?: string;
+  fast_requested: boolean;
+  requested_service_tier?: "fast" | "priority";
+  returned_service_tier: "unavailable";
+  time_to_first_model_output_ms: number | "unavailable";
+  time_to_first_model_output_unavailable_reason?: "cancelled" | "failed";
+}
+
 export interface AgentRunResult {
   instanceId: string;
   role: string;
   status: Exclude<AgentStatus, "created" | "running">;
   model: AgentModelProvenance;
   result: string;
+  requests?: AgentRequestObservation[];
   usage?: AgentUsage;
   watchdog?: WatchdogSnapshot;
 }
@@ -121,7 +132,9 @@ export interface Attempt {
   status: "completed" | "failed" | "cancelled";
   result: string;
   error?: string;
+  failureKind?: "configuration";
   sideEffects: boolean;
+  requests?: AgentRequestObservation[];
   usage?: AgentUsage;
   appliedReasoning?: string;
   session?: AttemptSession;
@@ -184,10 +197,12 @@ async function runAttempt(
     if (input.signal.aborted) {
       return { status: "cancelled", result: "cancelled", sideEffects, session };
     }
+    const message = error instanceof Error ? error.message : String(error);
     return {
       status: "failed",
       result: "",
-      error: error instanceof Error ? error.message : String(error),
+      error: message,
+      failureKind: isServiceTierRejection(message) ? "configuration" : undefined,
       sideEffects,
       session,
     };
@@ -411,6 +426,7 @@ async function executeTargets(
   let sideEffects = false;
   let lastError = "no model target could be used";
   let usage: AgentUsage | undefined;
+  const requests: AgentRequestObservation[] = [];
   const done = (
     status: AgentRunResult["status"],
     result: string,
@@ -422,7 +438,7 @@ async function executeTargets(
     view.usage = usage;
     view.error = status === "completed" || result === "cancelled" ? undefined : result;
     markTerminal(now());
-    return finish(instance, status, result, target, index, reason, usage, snapshot(activity, now()), present);
+    return finish(instance, status, result, target, index, reason, requests, usage, snapshot(activity, now()), present);
   };
   try {
     for (let index = 0; index < targets.length; index += 1) {
@@ -450,13 +466,14 @@ async function executeTargets(
         bindActivityProbe,
       });
       bindActivityProbe(undefined);
+      usage = mergeUsage(usage, attempt.usage);
+      if (attempt.requests) requests.push(...attempt.requests);
       const stall = stalled();
       if (stall && !parentSignal?.aborted) {
         return done("failed", formatStall(stall), target, index);
       }
       session = attempt.session ?? session;
       sideEffects = sideEffects || attempt.sideEffects;
-      usage = mergeUsage(usage, attempt.usage);
       view.usage = usage;
       if (attempt.appliedReasoning !== undefined) instance.model.appliedReasoning = attempt.appliedReasoning;
       present();
@@ -464,6 +481,9 @@ async function executeTargets(
         return done("completed", attempt.result, target, index);
       }
       lastError = attempt.error ?? "agent failed";
+      if (attempt.failureKind === "configuration") {
+        return done("failed", lastError, target, index);
+      }
       const reason = classifyProviderFailure(attempt.status === "cancelled" ? undefined : lastError);
       if (reason) instance.model.lastFailure = reason;
       if (attempt.status === "cancelled" || parentSignal?.aborted || signal.aborted) {
@@ -506,6 +526,7 @@ function finish(
   target: ModelTarget | undefined,
   index = 0,
   reason?: FallbackReason,
+  requests?: AgentRequestObservation[],
   usage?: AgentUsage,
   watchdog?: WatchdogSnapshot,
   present?: () => void,
@@ -524,6 +545,7 @@ function finish(
     status,
     model: instance.model,
     result,
+    requests: requests?.length ? requests : undefined,
     usage,
     watchdog,
   };
@@ -720,6 +742,12 @@ export function formatAgentResult(result: AgentRunResult): string {
   const fallback = result.model.fallbackOccurred && result.model.fallbackReason
     ? `\nfallback: ${result.model.fallbackReason} from ${result.model.requestedModel ?? "primary"}`
     : "";
+  const requests = result.requests?.map((request) => {
+    const ttft = typeof request.time_to_first_model_output_ms === "number"
+      ? `${request.time_to_first_model_output_ms}ms`
+      : `unavailable (${request.time_to_first_model_output_unavailable_reason})`;
+    return `\nrequest: ${request.model}; reasoning: ${request.reasoning ?? "default"}; fast_requested: ${request.fast_requested}; requested_service_tier: ${request.requested_service_tier ?? "none"}; returned_service_tier: ${request.returned_service_tier}; time_to_first_model_output_ms: ${ttft}`;
+  }).join("") ?? "";
   const usage = result.usage ? `\n${formatUsage(result.usage)}` : "";
   return [
     `${result.instanceId} ${result.status}`,
@@ -730,6 +758,7 @@ export function formatAgentResult(result: AgentRunResult): string {
     `reasoning applied: ${result.model.appliedReasoning ?? "unknown"}`,
     stalled,
     fallback,
+    requests,
     usage,
     "",
     result.result,

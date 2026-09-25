@@ -109,6 +109,30 @@ Precedence is built-in defaults, then the user file. A scalar replaces that fiel
 
 Reasoning uses Pi's levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. `default`, or omitting the field, leaves the later runner on Pi's session default. Pitako does not clamp a level the model cannot do. When a model catalog is supplied, an unsupported level fails. Without a catalog, only the syntax of `provider/model` is checked, so a target can be named before that provider is authenticated.
 
+### Fast requests
+
+A target can set `fast = true` to request provider-specific service. Pitako maps that setting to `service_tier = "fast"` for `openai-codex/gpt-6-luna` and `service_tier = "priority"` for `xai/grok-4.7`. Omitting `fast` or setting it to `false` keeps normal service behavior.
+
+```toml
+[model_policies.developer.primary]
+model = "openai-codex/gpt-6-luna"
+reasoning = "max"
+fast = true
+```
+
+```toml
+[model_policies.reviewer.primary]
+model = "xai/grok-4.7"
+reasoning = "xhigh"
+fast = true
+```
+
+These settings request a tier; they do not guarantee account access or elevated service. An accepted request can still run at the standard tier. xAI `priority` means priority processing, not the separate Grok 4.7 Fast model variant.
+
+`agent_run` and `agent_result` include per-request summaries: `fast_requested`, `requested_service_tier`, `returned_service_tier`, and `time_to_first_model_output_ms`. Current Pi does not expose the response service tier to Pitako, so `returned_service_tier` is `unavailable`. Time to first model output is elapsed time from the Pi model-stream request start to the first non-empty text or thinking delta, or first tool-call start. Pi-reported cost is an estimate, not the provider's bill, and may not reflect fast-tier billing.
+
+Herdr has no fast-mode parity. `agent_supervise` rejects a `fast = true` primary before splitting a pane. A fast fallback is not selected by Herdr.
+
 Fallback means the preferred target could not be used because of provider or model availability: rate limit, quota, outage, or auth. It does not mean the code failed tests, the answer was weak, or the task got hard. `agent_run` may switch to the next target for those availability failures only. Pi does not export a stable error taxonomy, so `fallback_on` is not configurable.
 
 A fresh install still resolves a role. The model policy diagnostic says no primary target is configured. It does not crash the coding session.

@@ -27,6 +27,7 @@ export type FallbackReason = (typeof FALLBACK_REASONS)[number];
 export interface ModelTarget {
   model: string;
   reasoning?: ReasoningLevel;
+  fast?: boolean;
 }
 
 export interface ModelPolicy {

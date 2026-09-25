@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { agentScope } from "../extensions/agent/scope.ts";
+import { PitakoConfigError } from "../extensions/errors.ts";
 import pitako from "../extensions/index.ts";
 import { executionForSession, resolveBoardAuthor } from "../extensions/execution-identity.ts";
 import { unregisterSupervisedSession } from "../extensions/herdr/author.ts";
@@ -303,11 +304,13 @@ function scripted(overrides: Record<string, HerdrCommandResult | ((args: string[
   return { calls, run };
 }
 
-function developerLoad(reasoning?: string): LoadOptions {
+function developerLoad(reasoning?: string, options: { fast?: boolean; fallbackFast?: boolean } = {}): LoadOptions {
   const dir = mkdtempSync(path.join(tmpdir(), "pitako-supervise-"));
   const userConfigPath = path.join(dir, "config.toml");
   const reasoningLine = reasoning ? `reasoning = "${reasoning}"\n` : "";
-  writeFileSync(userConfigPath, `[model_policies.developer.primary]\nmodel = "example/coder"\n${reasoningLine}`);
+  const fastLine = options.fast === undefined ? "" : `fast = ${options.fast}\n`;
+  const fallback = options.fallbackFast === undefined ? "" : `\n[[model_policies.developer.fallbacks]]\nmodel = "example/fallback"\nfast = ${options.fallbackFast}\n`;
+  writeFileSync(userConfigPath, `[model_policies.developer.primary]\nmodel = "example/coder"\n${reasoningLine}${fastLine}${fallback}`);
   return { userConfigPath, packageRoot: packageRoot() };
 }
 
@@ -394,6 +397,27 @@ describe("agent_supervise", () => {
     const missing = path.join(mkdtempSync(path.join(tmpdir(), "pitako-supervise-")), "missing.toml");
     await expect(superviseAgent(superviseInput(run, { load: { userConfigPath: missing, packageRoot: packageRoot() } }))).rejects.toThrow(/no primary target/);
     expect(calls.some((args) => args[1] === "split")).toBe(false);
+  });
+
+  test("rejects a fast primary before pane layout, split, or agent start", async () => {
+    const { calls, run } = scripted();
+    const error = await superviseAgent(superviseInput(run, { load: developerLoad("max", { fast: true }) })).catch((value: unknown) => value);
+    expect(error).toBeInstanceOf(PitakoConfigError);
+    expect((error as Error).message).toMatch(/fast.*not supported|not supported.*fast/i);
+    expect(calls.map(commandKey)).toEqual(["integration", "status"]);
+    expect(calls.some((args) => args[1] === "split" || args[1] === "start" || args[1] === "layout")).toBe(false);
+  });
+
+  test("normal primary ignores a fast fallback and passes no speculative flag", async () => {
+    const { calls, run } = scripted();
+    const load = developerLoad("high", { fast: false, fallbackFast: true });
+    await superviseAgent(superviseInput(run, { load }));
+    const start = calls.find((args) => args[1] === "start");
+    expect(start).toContain("--model");
+    expect(start?.[start.indexOf("--model") + 1]).toBe("example/coder");
+    expect(start?.[start.indexOf("--thinking") + 1]).toBe("high");
+    expect(start).not.toContain("--fast");
+    expect(start).not.toContain("--priority");
   });
 
   test("refuses a child instance before any herdr command", async () => {
