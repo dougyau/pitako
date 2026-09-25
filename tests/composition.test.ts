@@ -22,6 +22,15 @@ function readRepo(relative: string): string {
 }
 
 describe("engineering-layer composition", () => {
+  test("loads standalone pre-pr skill without a frozen plan prerequisite", async () => {
+    const loaded = await loadPitako(packageRoot());
+    const prePr = loaded.loader.getSkills().skills.find((skill) => skill.name === "pre-pr");
+    expect(prePr).toMatchObject({
+      name: "pre-pr",
+      description: "Prepare the current worktree's branch diff for first or later publication without `$execute` or a frozen plan.",
+    });
+  });
+
   test("loads curated skills and keeps LSP plus CodeGraph", async () => {
     const loaded = await loadPitako(packageRoot());
     expect(loaded.extensions.errors).toEqual([]);

@@ -90,17 +90,27 @@ Do not start the next unit until this unit is verifiable.
 
 ## Cleanup
 
-Ponytail is the first defense. Run `remove-ai-slops` only when the change justifies it: multi-file work, a new abstraction, a refactor, repeated patterns, several workers, or a Reviewer note about needless complexity. Skip it for a tiny mechanical edit, not after every edit.
+Ponytail is the first defense. After all units are verified and material findings are resolved, make one deliberate Ponytail pass over the complete finished diff. This pass comes before `remove-ai-slops` and final gates; it does not replace Ponytail during implementation.
 
-Scope is files changed by this run. Do not clean unrelated history. Run it only after verification is green. Then verify again. If cleanup breaks a check, revert that cleanup and verify again. Do not escalate the model because cleanup failed once.
+Run affected focused checks after that pass. They must be green before `remove-ai-slops`.
+
+Run `remove-ai-slops` only when the change justifies it: multi-file work, a new abstraction, a refactor, repeated patterns, several workers, or a Reviewer note about needless complexity. Skip it for a tiny mechanical edit, not after every edit.
+
+Scope is files changed by this run. Do not clean unrelated history. Do not escalate the model because cleanup failed once.
 
 Write `evidence/<unit>/deslop.md` or `evidence/final/deslop.md` only for a dedicated pass. Keep the ledger to a pointer.
+
+After cleanup, rerun the same checks; if cleanup breaks a check, revert that cleanup and verify again. Run final gates after all edits: focused tests, then typecheck or lint or build when relevant, then the real surface when it is cheap.
 
 ## Review
 
 Skip Reviewer on trivial edits when deterministic checks cover the unit. Use Reviewer for boundaries, concurrency, persistence, security, external integration, lifecycle, or a wide blast radius. Use `blast-radius` only for those triggers, not for every unit.
 
-Before `EXECUTION_COMPLETED`, one final review against Goal, Scope, Invariants, acceptance criteria, rulings, amendments, and evidence. The reviewer gets the scoped artifacts, not the parent transcript.
+Classify cleanup and later edits against the complete final diff and evidence:
+- **A:** demonstrably nonsemantic subtraction. Identify what was removed and why, with checks or other evidence supporting unchanged behavior and contracts. Deletion alone does not prove A.
+- **B:** potentially semantic or uncertain, including changes to logic, state, lifecycle, concurrency, paths, security, privileges, output, or contracts. Treat uncertainty as B.
+
+Before `EXECUTION_COMPLETED`, the single final review must inspect the complete final diff after cleanup and final gates, against Goal, Scope, Invariants, acceptance criteria, rulings, amendments, and evidence. The reviewer gets the scoped artifacts, not the parent transcript. B or uncertain changes need an independent Reviewer on the complete final diff. Any B or uncertain edit after approval invalidates that approval: rerun affected checks and applicable final gates, then obtain an independent Reviewer assessment of the complete updated final diff. Repeat after any further B or uncertain edits. An evidenced A-only cleanup does not require a second review solely for cleanup when adequate independent review already covers it. This exception does not waive `$execute`'s required final review or any review required by risk.
 
 ## Records
 

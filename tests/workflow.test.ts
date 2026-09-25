@@ -167,6 +167,8 @@ describe("plan and execute contracts", () => {
   const plan = readFileSync(path.join(packageRoot(), "skills/plan/SKILL.md"), "utf8");
   const execute = readFileSync(path.join(packageRoot(), "skills/execute/SKILL.md"), "utf8");
   const deslop = readFileSync(path.join(packageRoot(), "skills/remove-ai-slops/SKILL.md"), "utf8");
+  const prePr = readFileSync(path.join(packageRoot(), "skills/pre-pr/SKILL.md"), "utf8");
+  const router = readFileSync(path.join(packageRoot(), "skills/pitako-coding/SKILL.md"), "utf8");
 
   test("plan freezes and does not grant implementation", () => {
     expect(plan).toContain("Never implement");
@@ -223,6 +225,96 @@ describe("plan and execute contracts", () => {
     expect(execute).not.toMatch(/openai-codex|anthropic\/|gpt-5|claude-/);
   });
 
+  test("execute and pre-pr order cleanup before final gates and review", () => {
+    const finalPonytail = execute.indexOf("one deliberate Ponytail pass over the complete finished diff");
+    const preCleanupChecks = execute.indexOf("Run affected focused checks after that pass", finalPonytail);
+    const deslopPass = execute.indexOf("Run `remove-ai-slops` only", preCleanupChecks);
+    const postCleanupChecks = execute.indexOf("After cleanup, rerun the same checks", deslopPass);
+    const finalGates = execute.indexOf("Run final gates after all edits", postCleanupChecks);
+    const finalReview = execute.indexOf("the single final review", finalGates);
+    expect(finalPonytail).toBeGreaterThanOrEqual(0);
+    expect(preCleanupChecks).toBeGreaterThan(finalPonytail);
+    expect(deslopPass).toBeGreaterThan(preCleanupChecks);
+    expect(postCleanupChecks).toBeGreaterThan(deslopPass);
+    expect(finalGates).toBeGreaterThan(postCleanupChecks);
+    expect(finalReview).toBeGreaterThan(finalGates);
+    expect(execute).toContain("must be green before `remove-ai-slops`");
+    expect(execute).toContain("complete final diff");
+    expect(execute).toContain("An evidenced A-only cleanup does not require a second review solely for cleanup when adequate independent review already covers it");
+    expect(execute).toContain("B or uncertain changes need an independent Reviewer on the complete final diff");
+    expect(execute).toContain("Any B or uncertain edit after approval invalidates that approval");
+    expect(execute).toContain("rerun affected checks and applicable final gates");
+
+    const prePrPonytail = prePr.indexOf("make one final Ponytail pass over the whole scoped diff");
+    const prePrChecks = prePr.indexOf("Run affected focused checks.", prePrPonytail);
+    const prePrDeslop = prePr.indexOf("apply `remove-ai-slops` selectively to durable prose", prePrChecks);
+    const prePrAfterChecks = prePr.indexOf("Rerun affected checks after prose edits", prePrDeslop);
+    const prePrGates = prePr.indexOf("Run applicable final gates", prePrAfterChecks);
+    expect(prePrPonytail).toBeGreaterThanOrEqual(0);
+    expect(prePrChecks).toBeGreaterThan(prePrPonytail);
+    expect(prePr.indexOf("Once they are green", prePrChecks)).toBeLessThan(prePrDeslop);
+    expect(prePrDeslop).toBeGreaterThan(prePrChecks);
+    expect(prePrAfterChecks).toBeGreaterThan(prePrDeslop);
+    expect(prePrGates).toBeGreaterThan(prePrAfterChecks);
+    expect(prePr).toContain("B requires an independent Reviewer to assess the whole final diff");
+    expect(prePr).toContain("An evidenced A does not require a second review solely for cleanup when adequate independent review already covers it");
+    expect(prePr).toContain("Any B or uncertain edit after approval invalidates that approval");
+    expect(prePr).toContain("rerun affected checks and applicable final gates");
+    expect(prePr).toContain("does not self-review or edit the scoped diff");
+    expect(prePr).toContain("If an independent Reviewer is unavailable, report `BLOCKED`");
+    expect(prePr).toContain("The Reviewer does not fix findings; the Developer resolves material findings.");
+    expect(prePr).toContain("This exception does not waive `$execute`'s required final review");
+    expect(deslop).toContain("Standalone `$pre-pr` invokes this skill only for durable prose touched by its diff");
+    expect(deslop).toContain("This prose-only restriction overrides the code cleanup ideas below");
+    expect(deslop).toContain("does not change `$execute` behavior");
+    expect(deslop).toContain("does not require an `$execute` ledger or `deslop.md`");
+    expect(router).toContain("Prepare a local diff for publication without `$execute`");
+  });
+
+  test("final review contract covers the full diff and execute cleanup classes", () => {
+    expect(execute).toContain("demonstrably nonsemantic subtraction");
+    expect(execute).toContain("checks or other evidence supporting unchanged behavior and contracts");
+    expect(execute).toContain("potentially semantic or uncertain");
+    expect(execute).toContain("logic, state, lifecycle, concurrency, paths, security, privileges, output, or contracts");
+
+    const prePrGates = prePr.indexOf("Run applicable final gates");
+    const prePrReview = prePr.indexOf("Before reporting readiness", prePrGates);
+    expect(prePrGates).toBeGreaterThanOrEqual(0);
+    expect(prePrReview).toBeGreaterThan(prePrGates);
+    expect(prePr).toContain("If no independent review covers the complete final diff, including when review is absent or inadequate, obtain one.");
+    expect(prePr).toContain("must not create a plan, ledger, or Board topic");
+  });
+
+  test("pre-pr comparison covers missing, empty, and uncommitted changes", () => {
+    expect(prePr).toContain("If the base is missing, ambiguous, unavailable locally, conflicts with other evidence, or has no merge-base with `HEAD`, ask for a base and report `BLOCKED`.");
+    expect(prePr).toContain("staged and unstaged edits, and relevant non-ignored untracked files");
+    expect(prePr).toContain("If the scoped diff is empty, report `BLOCKED`");
+    expect(prePr).toContain("A provisional base caps status at `READY_WITH_CAVEAT`");
+    expect(prePr).toContain("the base is unambiguous and non-provisional");
+    expect(prePr).toContain("git rev-list --left-right --count <base>...HEAD");
+    expect(prePr).toContain("report when `HEAD` is behind the base");
+    expect(prePr).toContain("Inspect staged and unstaged scoped changes and relevant untracked files during cleanup; do not omit them from review.");
+    expect(prePr).toContain("Any staged, unstaged, or relevant non-ignored untracked scoped changes, secrets, or generated residue block readiness.");
+
+    const readyStart = prePr.indexOf("- `READY_TO_PUSH`:");
+    const caveatStart = prePr.indexOf("- `READY_WITH_CAVEAT`:", readyStart);
+    const readyToPush = prePr.slice(readyStart, caveatStart);
+    expect(readyToPush).toContain("scoped Git status is clean");
+    expect(readyToPush).toContain("committed push payload (`git diff <base>...HEAD`) exactly matches the reviewed final diff");
+  });
+
+  test("pre-pr stays local, standalone, and blocks unmet gates", () => {
+    expect(prePr).toContain("requires no `$plan`, frozen plan, `$execute`, ledger, or Board topic");
+    expect(prePr).toContain("Work only in the top level of the current process cwd's worktree.");
+    expect(prePr).toContain("Do not inspect, create, add, or switch to another worktree or branch.");
+    expect(prePr).toContain("Keep changes within the current diff.");
+    expect(prePr).toContain("This is guidance, not enforcement.");
+    expect(prePr).toContain("Never commit, push, force-push, merge, fetch, use `gh`, read or write a remote PR, create or update a PR, or perform any other remote action.");
+    expect(prePr).toContain("Do not claim the skill technically prevents these actions.");
+    expect(prePr).toContain("- `BLOCKED`:");
+    expect(prePr).toContain("a required gate fails or is unavailable");
+  });
+
   test("economy, resume, and cleanup stay in the skills", () => {
     expect(execute).toContain("Caveman");
     expect(execute).toContain("not for ledger");
@@ -232,12 +324,13 @@ describe("plan and execute contracts", () => {
     expect(execute).toContain("remove-ai-slops");
     expect(execute).toContain("not after every edit");
     expect(execute).toContain("files changed by this run");
-    expect(execute).toContain("verification is green");
+    expect(execute).toContain("must be green before `remove-ai-slops`");
     expect(execute).toContain("verify again");
     expect(execute).toContain("read the plan and the ledger before evidence");
     expect(execute).toContain("stale conversation");
     expect(execute).toContain("Board is not a progress log");
-    expect(deslop).toContain("files changed by this execution");
+    expect(deslop).toContain("Default scope is files changed by this execution.");
+    expect(deslop).toContain("Standalone `$pre-pr` invokes this skill only for durable prose touched by its diff");
     expect(deslop).toContain("verified");
     expect(deslop).toContain("verify again");
     expect(deslop).not.toContain("250");
