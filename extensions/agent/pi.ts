@@ -14,7 +14,8 @@ import {
 import { registerExecution, unregisterExecution } from "../execution-identity.ts";
 import { childActiveTools, ORCHESTRATION_TOOLS } from "../profile.ts";
 import { marksSideEffect } from "./effects.ts";
-import { childInstructions, skillNamesForRole, usageDelta, type AgentUsage, type Attempt, type AttemptExecutor } from "./run.ts";
+import { isServiceTierRejection } from "./fallback.ts";
+import { childInstructions, skillNamesForRole, usageDelta, type AgentRequestObservation, type AgentUsage, type Attempt, type AttemptExecutor } from "./run.ts";
 import { completeTool, emptyCodeIntelligenceUsage, isDenseToolName, type CodeIntelligenceUsage, type DenseCallUsage, type ToolOutcome } from "../code-intelligence/metrics.ts";
 import { CODE_INTELLIGENCE_TOOLS } from "../code-intelligence/tools.ts";
 import { bindCodeIntelligenceApi } from "../code-intelligence/index.ts";
@@ -50,14 +51,16 @@ export function thinkingLevelFor(reasoning: ReasoningLevel | undefined): Thinkin
   return reasoning;
 }
 
-export function createPiExecutor(): AttemptExecutor {
+export function createPiExecutor(options: { now?: () => number } = {}): AttemptExecutor {
   return {
     async start(input) {
       // Do not bind the worker abort signal here. The session abort owns cancellation.
       // A signal on runtime create aborts Cursor auth before the child prompt starts.
       const runtime = await ModelRuntime.create({ allowModelNetwork: false, refreshOnCreate: false });
+      const selections = new WeakMap<object, RequestSelection>();
       keepCursorTools(runtime);
-      return runTarget(runtime, input.target, input.task, input);
+      installServiceTierTransport(runtime, selections);
+      return runTarget(runtime, selections, options.now ?? (() => performance.now()), input.target, input.task, input);
     },
   };
 }
@@ -66,6 +69,72 @@ export function createPiExecutor(): AttemptExecutor {
 export function cursorProviderContext(model: { provider?: string; api?: string }, context: Context): Context {
   if (model.provider !== "cursor" && model.api !== "cursor-native") return context;
   return { ...normalizeContext(context), tools: context.tools ?? [] };
+}
+
+type ServiceTier = "fast" | "priority";
+
+interface RequestSelection {
+  model: string;
+  reasoning?: string;
+  fastRequested: boolean;
+  serviceTier?: ServiceTier;
+}
+
+function installServiceTierTransport(runtime: ModelRuntime, selections: WeakMap<object, RequestSelection>): void {
+  const original = runtime.streamSimple.bind(runtime);
+  runtime.streamSimple = (model, context, options) => {
+    const selection = selections.get(model);
+    if (!selection) return original(model, context, options);
+    const onPayload = options?.onPayload;
+    const requestOptions = selection.serviceTier
+      ? {
+          ...options,
+          onPayload: async (payload: unknown, providerModel: Model<any>) => {
+            const transformed = await onPayload?.(payload, providerModel);
+            const body = transformed === undefined ? payload : transformed;
+            if (!body || typeof body !== "object" || Array.isArray(body)) {
+              throw new Error("unsupported service_tier payload: expected an object");
+            }
+            return { ...body, service_tier: selection.serviceTier };
+          },
+        }
+      : { ...options };
+    return original(model, context, requestOptions);
+  };
+}
+
+function prepareTargetModel(
+  model: Model<any>,
+  target: ModelTarget,
+  selections: WeakMap<object, RequestSelection>,
+): { model?: Model<any>; error?: string } {
+  let serviceTier: ServiceTier | undefined;
+  if (target.fast === true) {
+    if (model.provider === "openai-codex" && model.id === "gpt-6-luna" && model.api === "openai-codex-responses") {
+      serviceTier = "fast";
+    } else if (model.provider === "xai" && model.id === "grok-4.7" && model.api === "openai-responses") {
+      serviceTier = "priority";
+    } else {
+      return { error: `fast mode unsupported for ${target.model} (provider ${model.provider}, API ${model.api})` };
+    }
+  }
+  const activated = { ...model };
+  selections.set(activated, {
+    model: `${model.provider}/${model.id}`,
+    reasoning: target.reasoning,
+    fastRequested: target.fast === true,
+    serviceTier,
+  });
+  return { model: activated };
+}
+
+function recordAppliedReasoning(model: Model<any>, selections: WeakMap<object, RequestSelection>, reasoning: string): void {
+  const selection = selections.get(model);
+  if (selection) selections.set(model, { ...selection, reasoning });
+}
+
+function configurationFailure(error: string, sideEffects: boolean, session?: Attempt["session"]): Attempt {
+  return { status: "failed", result: "", error, failureKind: "configuration", sideEffects, session };
 }
 
 function keepCursorTools(runtime: ModelRuntime): void {
@@ -98,6 +167,8 @@ export function cursorStreamHold(session: {
 
 async function runTarget(
   runtime: ModelRuntime,
+  selections: WeakMap<object, RequestSelection>,
+  now: () => number,
   target: ModelTarget,
   prompt: string,
   input: {
@@ -112,35 +183,51 @@ async function runTarget(
   existing?: AgentSession,
 ): Promise<Attempt> {
   if (input.signal.aborted) return { status: "cancelled", result: "cancelled", sideEffects: false };
-  let model = findModel(runtime, target.model);
+  const model = findModel(runtime, target.model);
   // Extension providers register during AgentSession bind, not on a fresh runtime.
-  if (!model && !existing) {
-    return bindThenRun(runtime, target, prompt, input);
-  }
+  if (!model && !existing) return bindThenRun(runtime, selections, now, target, prompt, input);
   if (!model) {
-    return { status: "failed", result: "", error: `model unavailable: ${target.model}`, sideEffects: false };
+    return target.fast === true
+      ? configurationFailure(`fast mode unsupported: model unavailable after provider registration: ${target.model}`, true, resume(existing!, runtime, selections, now, input))
+      : { status: "failed", result: "", error: `model unavailable: ${target.model}`, sideEffects: false };
   }
   let session = existing;
   if (!session) {
     try {
       session = await openSession(runtime, model, target, input);
-      if (session.thinkingLevel) input.onActivated?.(session.thinkingLevel);
-      if (input.signal.aborted) {
-        await resume(session, runtime, input).dispose();
-        return { status: "cancelled", result: "cancelled", sideEffects: false };
-      }
     } catch (error) {
       if (input.signal.aborted) return { status: "cancelled", result: "cancelled", sideEffects: false };
       return { status: "failed", result: "", error: messageOf(error), sideEffects: false };
     }
-  } else {
-    const activationError = await activateTarget(session, model, target);
-    if (activationError) {
-      return { status: "failed", result: "", error: activationError, sideEffects: true, session: resume(session, runtime, input) };
-    }
-    if (session.thinkingLevel) input.onActivated?.(session.thinkingLevel);
   }
-  return drive(session, runtime, prompt, input);
+  if (input.signal.aborted) {
+    await resume(session, runtime, selections, now, input).dispose();
+    return { status: "cancelled", result: "cancelled", sideEffects: false };
+  }
+  // Provider registration can replace the runtime model while the session binds.
+  const boundModel = findModel(runtime, target.model);
+  if (!boundModel) {
+    const handle = resume(session, runtime, selections, now, input);
+    await handle.dispose();
+    return target.fast === true
+      ? configurationFailure(`fast mode unsupported: model unavailable after provider registration: ${target.model}`, false)
+      : { status: "failed", result: "", error: `model unavailable: ${target.model}`, sideEffects: false };
+  }
+  const activated = prepareTargetModel(boundModel, target, selections);
+  if (activated.error) {
+    const handle = resume(session, runtime, selections, now, input);
+    if (!existing) await handle.dispose();
+    return configurationFailure(activated.error, Boolean(existing), existing ? handle : undefined);
+  }
+  const activationError = await activateTarget(session, activated.model!, target);
+  if (activationError) {
+    return { status: "failed", result: "", error: activationError, sideEffects: Boolean(existing), session: resume(session, runtime, selections, now, input) };
+  }
+  if (session.thinkingLevel) {
+    recordAppliedReasoning(activated.model!, selections, session.thinkingLevel);
+    input.onActivated?.(session.thinkingLevel);
+  }
+  return drive(session, runtime, selections, now, prompt, input);
 }
 
 export async function activateTarget(
@@ -173,6 +260,8 @@ export async function activateTarget(
 
 async function bindThenRun(
   runtime: ModelRuntime,
+  selections: WeakMap<object, RequestSelection>,
+  now: () => number,
   target: ModelTarget,
   prompt: string,
   input: {
@@ -192,22 +281,33 @@ async function bindThenRun(
     if (input.signal.aborted) return { status: "cancelled", result: "cancelled", sideEffects: false };
     return { status: "failed", result: "", error: messageOf(error), sideEffects: false };
   }
+  const handle = () => resume(session, runtime, selections, now, input);
   if (input.signal.aborted) {
-    await resume(session, runtime, input).dispose();
+    await handle().dispose();
     return { status: "cancelled", result: "cancelled", sideEffects: false };
   }
   const model = findModel(runtime, target.model);
   if (!model) {
-    await resume(session, runtime, input).dispose();
-    return { status: "failed", result: "", error: `model unavailable: ${target.model}`, sideEffects: false };
+    await handle().dispose();
+    return target.fast === true
+      ? configurationFailure(`fast mode unsupported: model unavailable after provider registration: ${target.model}`, false)
+      : { status: "failed", result: "", error: `model unavailable: ${target.model}`, sideEffects: false };
   }
-  const activationError = await activateTarget(session, model, target);
+  const activated = prepareTargetModel(model, target, selections);
+  if (activated.error) {
+    await handle().dispose();
+    return configurationFailure(activated.error, false);
+  }
+  const activationError = await activateTarget(session, activated.model!, target);
   if (activationError) {
-    await resume(session, runtime, input).dispose();
+    await handle().dispose();
     return { status: "failed", result: "", error: activationError, sideEffects: false };
   }
-  if (session.thinkingLevel) input.onActivated?.(session.thinkingLevel);
-  return drive(session, runtime, prompt, input);
+  if (session.thinkingLevel) {
+    recordAppliedReasoning(activated.model!, selections, session.thinkingLevel);
+    input.onActivated?.(session.thinkingLevel);
+  }
+  return drive(session, runtime, selections, now, prompt, input);
 }
 
 async function openSession(
@@ -253,6 +353,8 @@ async function openSession(
 async function drive(
   session: AgentSession,
   runtime: ModelRuntime,
+  selections: WeakMap<object, RequestSelection>,
+  now: () => number,
   prompt: string,
   input: {
     instanceId: string;
@@ -273,7 +375,50 @@ async function drive(
     const navigation = navigationWindows.get(session) ?? { remaining: 0 };
     codeIntelligence.navigation.remaining = navigation.remaining;
     const toolStarts = new Map<string, number>();
+    const requests: AgentRequestObservation[] = [];
+    let activeRequest: { observation: AgentRequestObservation; startedAt: number } | undefined;
+    const finishRequest = (reason: "cancelled" | "failed") => {
+      if (!activeRequest) return;
+      if (activeRequest.observation.time_to_first_model_output_ms === "unavailable") {
+        activeRequest.observation.time_to_first_model_output_unavailable_reason = reason;
+      }
+      activeRequest = undefined;
+    };
+    const originalStreamFunction = session.agent.streamFunction;
+    session.agent.streamFunction = (model, context, options) => {
+      if (options?.sessionId !== undefined && options.sessionId !== session.sessionId) {
+        return originalStreamFunction(model, context, options);
+      }
+      const selection = selections.get(model);
+      const observation: AgentRequestObservation = {
+        model: selection?.model ?? `${model.provider}/${model.id}`,
+        reasoning: options?.reasoning ?? selection?.reasoning,
+        fast_requested: selection?.fastRequested ?? false,
+        ...(selection?.serviceTier ? { requested_service_tier: selection.serviceTier } : {}),
+        returned_service_tier: "unavailable",
+        time_to_first_model_output_ms: "unavailable",
+      };
+      const request = { observation, startedAt: now() };
+      requests.push(observation);
+      activeRequest = request;
+      try {
+        const stream = originalStreamFunction(model, context, options);
+        return Promise.resolve(stream).catch((error) => {
+          if (activeRequest === request) finishRequest("failed");
+          throw error;
+        });
+      } catch (error) {
+        if (activeRequest === request) finishRequest("failed");
+        throw error;
+      }
+    };
     const unsubscribe = session.subscribe((event) => {
+      if (event.type === "message_update" && activeRequest && activeRequest.observation.time_to_first_model_output_ms === "unavailable" && hasFirstModelOutput(event.assistantMessageEvent)) {
+        activeRequest.observation.time_to_first_model_output_ms = Math.max(0, now() - activeRequest.startedAt);
+        delete activeRequest.observation.time_to_first_model_output_unavailable_reason;
+      } else if (event.type === "message_end" && event.message?.role === "assistant") {
+        finishRequest(event.message.stopReason === "aborted" ? "cancelled" : "failed");
+      }
       input.onActivity?.(event);
       if (event.type === "tool_execution_start") {
         toolStarts.set(event.toolCallId, performance.now());
@@ -287,11 +432,16 @@ async function drive(
         navigationWindows.set(session, navigation);
       }
     });
-    const handle = resume(session, runtime, input);
+    const handle = resume(session, runtime, selections, now, input);
     const before = usageFrom(session, {});
     if (input.signal.aborted) {
-      await session.abort();
-      return { status: "cancelled", result: "cancelled", sideEffects, usage: attemptUsage(before, session, tools, codeIntelligence), session: handle };
+      try {
+        await session.abort();
+      } finally {
+        unsubscribe();
+        session.agent.streamFunction = originalStreamFunction;
+      }
+      return { status: "cancelled", result: "cancelled", sideEffects, requests: requests.length ? requests : undefined, usage: attemptUsage(before, session, tools, codeIntelligence), session: handle };
     }
     const stopWatch = watchAbort(input.signal, () => {
       void session.abort();
@@ -300,27 +450,30 @@ async function drive(
       await session.prompt(prompt, { expandPromptTemplates: false });
       const assistant = lastAssistant(session);
       if (input.signal.aborted) {
-        return { status: "cancelled", result: "cancelled", sideEffects, usage: attemptUsage(before, session, tools, codeIntelligence), appliedReasoning: session.thinkingLevel, session: handle };
+        return { status: "cancelled", result: "cancelled", sideEffects, requests: requests.length ? requests : undefined, usage: attemptUsage(before, session, tools, codeIntelligence), appliedReasoning: session.thinkingLevel, session: handle };
       }
       if (assistant?.stopReason === "aborted" || assistant?.stopReason === "error") {
-        return failedAttempt(assistant.errorMessage ?? assistant.stopReason ?? "provider error", sideEffects, handle, session, attemptUsage(before, session, tools, codeIntelligence));
+        return failedAttempt(assistant.errorMessage ?? assistant.stopReason ?? "provider error", sideEffects, handle, session, attemptUsage(before, session, tools, codeIntelligence), requests);
       }
       return {
         status: "completed",
         result: textOf(assistant),
         sideEffects,
+        requests: requests.length ? requests : undefined,
         usage: attemptUsage(before, session, tools, codeIntelligence),
         appliedReasoning: session.thinkingLevel,
         session: handle,
       };
     } catch (error) {
       if (input.signal.aborted) {
-        return { status: "cancelled", result: "cancelled", sideEffects, usage: attemptUsage(before, session, tools, codeIntelligence), session: handle };
+        return { status: "cancelled", result: "cancelled", sideEffects, requests: requests.length ? requests : undefined, usage: attemptUsage(before, session, tools, codeIntelligence), session: handle };
       }
-      return failedAttempt(messageOf(error), sideEffects, handle, session, attemptUsage(before, session, tools, codeIntelligence));
+      return failedAttempt(messageOf(error), sideEffects, handle, session, attemptUsage(before, session, tools, codeIntelligence), requests);
     } finally {
+      finishRequest(input.signal.aborted ? "cancelled" : "failed");
       stopWatch();
       unsubscribe();
+      session.agent.streamFunction = originalStreamFunction;
     }
   } finally {
     input.bindActivityProbe?.(undefined);
@@ -333,12 +486,15 @@ function failedAttempt(
   handle: NonNullable<Attempt["session"]>,
   session: AgentSession,
   usage: AgentUsage | undefined,
+  requests: AgentRequestObservation[],
 ): Attempt {
   return {
     status: "failed",
     result: "",
     error,
+    failureKind: isServiceTierRejection(error) ? "configuration" : undefined,
     sideEffects,
+    requests: requests.length ? requests : undefined,
     usage,
     appliedReasoning: session.thinkingLevel,
     session: handle,
@@ -348,6 +504,8 @@ function failedAttempt(
 function resume(
   session: AgentSession,
   runtime: ModelRuntime,
+  selections: WeakMap<object, RequestSelection>,
+  now: () => number,
   input: {
     instanceId: string;
     role: Parameters<AttemptExecutor["start"]>[0]["role"];
@@ -360,7 +518,7 @@ function resume(
   let disposed = false;
   return {
     async continueWith(target, note, signal) {
-      return runTarget(runtime, target, note, { ...input, signal }, session);
+      return runTarget(runtime, selections, now, target, note, { ...input, signal }, session);
     },
     async dispose() {
       if (disposed) return;
@@ -375,6 +533,22 @@ function findModel(runtime: ModelRuntime, ref: string) {
   const slash = ref.indexOf("/");
   if (slash <= 0) return undefined;
   return runtime.getModel(ref.slice(0, slash), ref.slice(slash + 1));
+}
+
+function hasFirstModelOutput(event: unknown): boolean {
+  if (!event || typeof event !== "object") return false;
+  const value = event as {
+    type?: string;
+    delta?: unknown;
+    contentIndex?: number;
+    partial?: { content?: Array<{ type?: string; id?: string; name?: string }> };
+  };
+  if ((value.type === "text_delta" || value.type === "thinking_delta") && typeof value.delta === "string" && value.delta.length > 0) {
+    return true;
+  }
+  if (value.type !== "toolcall_start" || !Number.isInteger(value.contentIndex)) return false;
+  const call = value.partial?.content?.[value.contentIndex!];
+  return call?.type === "toolCall" && Boolean(call.id && call.name);
 }
 
 function lastAssistant(session: AgentSession): { stopReason?: string; errorMessage?: string; content?: Array<{ type?: string; text?: string }> } | undefined {

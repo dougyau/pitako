@@ -7,6 +7,7 @@ import { getPitakoConfigPath } from "../extensions/board/paths.ts";
 import pitako from "../extensions/index.ts";
 import { PitakoConfigError } from "../extensions/errors.ts";
 import { getModelPolicy, getRole, loadPitakoConfig, resolveRole } from "../extensions/roles/load.ts";
+import { inspectPitako } from "../extensions/roles/format.ts";
 import { ROLE_IDS } from "../extensions/roles/types.ts";
 import { packageRoot } from "../extensions/stack.ts";
 import { loadPitako } from "../scripts/load-pitako.ts";
@@ -96,6 +97,63 @@ reasoning = "medium"
     expect(resolved.modelPolicy.selected).toEqual(resolved.modelPolicy.primary);
     expect(resolved.modelPolicy.fallbackIndex).toBeUndefined();
     expect(getRole("developer", { env }).skills).toContain("ponytail");
+  });
+
+  test("fast is a strict target setting and part of target identity", () => {
+    const { env, configPath } = tempAgent();
+    writeConfig(
+      configPath,
+      `[model_policies.architect.primary]
+model = "example/model"
+reasoning = "high"
+fast = true
+
+[[model_policies.architect.fallbacks]]
+model = "example/model"
+reasoning = "high"
+fast = false
+
+[[model_policies.architect.fallbacks]]
+model = "example/fallback"
+fast = true
+`,
+    );
+    const policy = resolveRole("architect", { env }).modelPolicy;
+    expect(policy.primary).toEqual({ model: "example/model", reasoning: "high", fast: true });
+    expect(policy.fallbacks).toEqual([
+      { model: "example/model", reasoning: "high", fast: false },
+      { model: "example/fallback", fast: true },
+    ]);
+
+    for (const command of ["role architect", "policy architect"]) {
+      const output = inspectPitako(command, { env });
+      expect(output).toContain("fast: true");
+      expect(output).toContain("fast: false");
+      expect(output).toContain("Fast is requested configuration, not a provider grant.");
+    }
+
+    writeConfig(
+      configPath,
+      `[model_policies.architect.primary]
+model = "example/model"
+reasoning = "high"
+
+[[model_policies.architect.fallbacks]]
+model = "example/model"
+reasoning = "high"
+fast = false
+`,
+    );
+    expect(() => loadPitakoConfig({ env })).toThrow(/model_policies\.architect\.fallbacks\[0\].*duplicate target/);
+  });
+
+  test("invalid and misplaced fast fields report their config paths", () => {
+    const { env, configPath } = tempAgent();
+    writeConfig(configPath, '[model_policies.architect.primary]\nmodel = "example/model"\nfast = "true"\n');
+    expect(() => loadPitakoConfig({ env })).toThrow(/model_policies\.architect\.primary\.fast: expected boolean/);
+
+    writeConfig(configPath, '[model_policies.architect]\nfast = true\n');
+    expect(() => loadPitakoConfig({ env })).toThrow(/unknown key model_policies\.architect\.fast/);
   });
 
   test("malformed config fails with the file and field", () => {

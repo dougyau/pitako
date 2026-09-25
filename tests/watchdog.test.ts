@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createPiExecutor, cursorStreamHold } from "../extensions/agent/pi.ts";
-import { runAgentInstance, type Attempt, type AttemptExecutor } from "../extensions/agent/run.ts";
+import { formatAgentResult, runAgentInstance, type Attempt, type AttemptExecutor } from "../extensions/agent/run.ts";
 import {
   WALL_CLOCK_TIMEOUT_SOURCE,
   activityKind,
@@ -172,15 +172,29 @@ describe("activity watchdog", () => {
 });
 
 describe("watchdog integration", () => {
-  test("confirmed idle stall fails without fallback or task replay", async () => {
+  test("confirmed idle stall keeps request observations without fallback or task replay", async () => {
     let clock = 0;
     let tick = () => {};
     const starts: string[] = [];
+    const request = {
+      model: "example/primary",
+      reasoning: "high",
+      fast_requested: true,
+      requested_service_tier: "priority" as const,
+      returned_service_tier: "unavailable" as const,
+      time_to_first_model_output_ms: 123,
+    };
     const executor: AttemptExecutor = {
       async start(input) {
         starts.push(input.target.model);
         await waitForAbort(input.signal);
-        return { status: "cancelled", result: "cancelled", sideEffects: false };
+        return {
+          status: "cancelled",
+          result: "cancelled",
+          sideEffects: false,
+          requests: [request],
+          usage: { input: 4, output: 9 },
+        };
       },
     };
     const pending = runAgentInstance({
@@ -206,6 +220,12 @@ describe("watchdog integration", () => {
     expect(result.model.fallbackOccurred).toBeFalsy();
     expect(starts).toEqual(["example/primary"]);
     expect(result.watchdog?.phase).toBe("stalled");
+    expect(result.requests).toEqual([request]);
+    expect(result.usage).toMatchObject({ input: 4, output: 9 });
+    const formatted = formatAgentResult(result);
+    expect(formatted).toContain("request: example/primary");
+    expect(formatted).toContain("requested_service_tier: priority");
+    expect(formatted).toContain("time_to_first_model_output_ms: 123ms");
   });
 
   test("an active tool inside the tool window is not an idle stall, and recent activity prevents abort", async () => {

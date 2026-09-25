@@ -420,6 +420,46 @@ reasoning = "medium"
     expect(switched.notes.some((note) => note.startsWith("example/fallback-2:"))).toBe(true);
   });
 
+  test("typed configuration failures do not enter availability fallback", async () => {
+    const env = tempEnv();
+    const configPath = path.join(env.PI_CODING_AGENT_DIR!, "pitako", "config.toml");
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(path.dirname(configPath), { recursive: true });
+    writeFileSync(
+      configPath,
+      `[model_policies.developer.primary]\nmodel = "example/primary"\n[[model_policies.developer.fallbacks]]\nmodel = "example/fallback"\n`,
+    );
+    const request = {
+      model: "example/primary",
+      fast_requested: true,
+      requested_service_tier: "priority" as const,
+      returned_service_tier: "unavailable" as const,
+      time_to_first_model_output_ms: "unavailable" as const,
+      time_to_first_model_output_unavailable_reason: "failed" as const,
+    };
+    const executor = scripted([
+      { status: "failed", result: "", error: "503 service unavailable: unsupported service_tier", failureKind: "configuration", requests: [request], sideEffects: false },
+      { status: "completed", result: "must not run", sideEffects: false },
+    ]);
+    const result = await runAgentInstance({
+      roleId: "developer",
+      task: "review the boundary",
+      cwd: packageRoot(),
+      executor,
+      load: { env, userConfigPath: configPath },
+    });
+    expect(result.status).toBe("failed");
+    expect(result.result).toContain("unsupported service_tier");
+    expect(executor.starts).toEqual(["example/primary"]);
+    expect(result.requests).toEqual([request]);
+    const formatted = formatAgentResult(result);
+    expect(formatted).toContain("request: example/primary");
+    expect(formatted).toContain("fast_requested: true");
+    expect(formatted).toContain("requested_service_tier: priority");
+    expect(formatted).toContain("returned_service_tier: unavailable");
+    expect(formatted).toContain("time_to_first_model_output_ms: unavailable (failed)");
+  });
+
   test("fallback classification is narrow", () => {
     expect(classifyProviderFailure("429 too many requests")).toBe("rate_limit");
     expect(classifyProviderFailure("insufficient_quota")).toBe("quota");
