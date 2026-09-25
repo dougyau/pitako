@@ -24,6 +24,7 @@
   ],
   "scripts": {
     "test": "bun test",
+    "test:code-intelligence-node": "node --test scripts/code-intelligence-node.mjs",
     "smoke": "bun scripts/smoke.ts",
     "pi": "pi --no-extensions --approve -e .",
     "typecheck": "tsc --noEmit"
@@ -31,7 +32,8 @@
   "pi": {
     "extensions": [
       "./node_modules/pi-lsp-client/src/index.ts",
-      "./node_modules/@vndv/pi-codegraph/extensions/codegraph.ts",
+      "./extensions/code-intelligence/codegraph-raw.ts",
+      "./extensions/code-intelligence/index.ts",
       "./node_modules/@juicesharp/rpiv-todo/index.ts",
       "./extensions/board/index.ts",
       "./extensions/agent/index.ts",
@@ -51,6 +53,7 @@
     "prompts": ["./prompts"]
   },
   "dependencies": {
+    "@ast-grep/napi": "0.45.3",
     "@colbymchenry/codegraph": "1.6.0",
     "@dietrichgebert/ponytail": "4.10.0",
     "@juicesharp/rpiv-todo": "2.11.0",
@@ -60,6 +63,7 @@
     "smol-toml": "1.8.0"
   },
   "bundledDependencies": [
+    "@ast-grep/napi",
     "@dietrichgebert/ponytail",
     "@juicesharp/rpiv-todo",
     "@vndv/pi-codegraph",

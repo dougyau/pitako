@@ -7,6 +7,7 @@ import { classifyProviderFailure } from "./fallback.ts";
 import { formatAgentLive } from "./present.ts";
 import { agentScope } from "./scope.ts";
 import type { AgentUiSnapshot } from "./ui.ts";
+import { codeIntelligenceDelta, formatCodeIntelligenceUsage, mergeCodeIntelligenceUsage, type CodeIntelligenceUsage } from "../code-intelligence/metrics.ts";
 import {
   activityKind,
   createActivity,
@@ -78,6 +79,7 @@ export interface AgentUsage {
   tools?: Record<string, number>;
   contextTokens?: number;
   patches?: PatchCallMetric[];
+  codeIntelligence?: CodeIntelligenceUsage;
 }
 
 export interface WatchdogSnapshot {
@@ -96,6 +98,23 @@ export interface AgentRunResult {
   result: string;
   usage?: AgentUsage;
   watchdog?: WatchdogSnapshot;
+}
+
+export interface TeamExecutionSummary {
+  assignmentId: string;
+  selectedModel: string | null;
+  provider: string | null;
+  appliedReasoning: string;
+  elapsedMs: number | null;
+  turns: number | null;
+  toolCalls: number | null;
+  tools: Record<string, number> | null;
+  input: number | null;
+  output: number | null;
+  cacheRead: number | null;
+  cacheWrite: number | null;
+  contextTokens: number | null;
+  estimatedCost: number | null;
 }
 
 export interface Attempt {
@@ -187,6 +206,7 @@ export function childInstructions(role: ResolvedRole, instanceId: string): strin
     "Publish shared findings on the Board. Board contents are not injected here.",
     "Your rpiv-todo list is private to this session.",
     "The model and reasoning for this run come from this role's ModelPolicy, not from the parent session.",
+    "Keep raw read, grep, LSP, CodeGraph, bash and edit available as the navigation baseline; dense code-intelligence queries are for explicit evaluation, not a default preference before matched dogfood.",
     "",
     role.instructions,
   ].join("\n");
@@ -661,6 +681,7 @@ function observationOf(
     streamMs,
     turns: turns > 0 ? turns : undefined,
     toolCalls: toolCalls > 0 ? toolCalls : undefined,
+    agentUsage: usage,
     inactivityMs: dog.inactivityMs,
     failureKind: status === "failed" ? dog.lastActivityKind : undefined,
   };
@@ -717,13 +738,48 @@ export function formatUsage(usage: AgentUsage): string {
   lines.push(`  turns: ${usage.turns ?? "?"}`, `  tools: ${usage.toolCalls ?? "?"}`);
   lines.push(`  mutations: edit ${usage.tools?.edit ?? 0}, write ${usage.tools?.write ?? 0}, apply_patch ${usage.tools?.apply_patch ?? 0}`);
   if (usage.contextTokens !== undefined) lines.push(`  context: ${usage.contextTokens}`);
+  if (usage.codeIntelligence) lines.push(formatCodeIntelligenceUsage(usage.codeIntelligence));
   return lines.join("\n");
+}
+
+export function teamExecutionSummary(assignmentId: string, result: AgentRunResult): TeamExecutionSummary {
+  const selectedModel = result.model.selectedModel === "unknown" ? null : result.model.selectedModel;
+  const separator = selectedModel?.indexOf("/") ?? -1;
+  const provider = selectedModel && separator > 0 && separator < selectedModel.length - 1 ? selectedModel.slice(0, separator) : null;
+  const usage = result.usage;
+  // Pi defaults unspecified model pricing to zero rates, so token-bearing $0 is not a reliable estimate.
+  const hasTokens = [usage?.input, usage?.output, usage?.cacheRead, usage?.cacheWrite].some((value) => value !== undefined && value > 0);
+  return {
+    assignmentId,
+    selectedModel,
+    provider,
+    appliedReasoning: result.model.appliedReasoning ?? "unknown",
+    elapsedMs: result.watchdog?.elapsedMs ?? null,
+    turns: usage?.turns ?? null,
+    toolCalls: usage?.toolCalls ?? null,
+    tools: usage?.tools === undefined ? null : { ...usage.tools },
+    input: usage?.input ?? null,
+    output: usage?.output ?? null,
+    cacheRead: usage?.cacheRead ?? null,
+    cacheWrite: usage?.cacheWrite ?? null,
+    contextTokens: usage?.contextTokens ?? null,
+    estimatedCost: usage?.cost === undefined || (usage.cost === 0 && hasTokens) ? null : usage.cost,
+  };
+}
+
+export function formatTeamExecutionSummary(summary: TeamExecutionSummary): string {
+  const value = (item: number | null) => item === null ? "unavailable" : String(item);
+  const tools = summary.tools === null
+    ? "unavailable"
+    : Object.entries(summary.tools).map(([name, count]) => `${name}:${count}`).join(",") || "none";
+  const cost = summary.estimatedCost === null ? "unavailable" : `$${summary.estimatedCost.toFixed(6)} (Pi estimate; not billing)`;
+  return `execution summary: assignment=${summary.assignmentId} selected_model=${summary.selectedModel ?? "unavailable"} provider=${summary.provider ?? "unavailable"} applied_reasoning=${summary.appliedReasoning} elapsed_ms=${value(summary.elapsedMs)} turns=${value(summary.turns)} tool_calls=${value(summary.toolCalls)} tools=${tools} input=${value(summary.input)} output=${value(summary.output)} cache_read=${value(summary.cacheRead)} cache_write=${value(summary.cacheWrite)} context_tokens=${value(summary.contextTokens)} estimated_cost=${cost}`;
 }
 
 /** Counters are subtracted. contextTokens is a gauge and keeps the later value. */
 export function usageDelta(before: AgentUsage | undefined, after: AgentUsage | undefined): AgentUsage | undefined {
   if (!after) return undefined;
-  if (!before) return { ...after, tools: after.tools ? { ...after.tools } : undefined };
+  if (!before) return { ...after, tools: after.tools ? { ...after.tools } : undefined, codeIntelligence: codeIntelligenceDelta(undefined, after.codeIntelligence) };
   const tools: Record<string, number> = {};
   for (const name of new Set([...Object.keys(before.tools ?? {}), ...Object.keys(after.tools ?? {})])) {
     const delta = (after.tools?.[name] ?? 0) - (before.tools?.[name] ?? 0);
@@ -740,12 +796,13 @@ export function usageDelta(before: AgentUsage | undefined, after: AgentUsage | u
     toolCalls: Math.max(0, (after.toolCalls ?? 0) - (before.toolCalls ?? 0)),
     tools,
     contextTokens: after.contextTokens,
+    codeIntelligence: codeIntelligenceDelta(before.codeIntelligence, after.codeIntelligence),
   };
 }
 
 export function mergeUsage(left: AgentUsage | undefined, right: AgentUsage | undefined): AgentUsage | undefined {
   if (!right) return left;
-  if (!left) return { ...right, tools: right.tools ? { ...right.tools } : undefined };
+  if (!left) return { ...right, tools: right.tools ? { ...right.tools } : undefined, codeIntelligence: mergeCodeIntelligenceUsage(undefined, right.codeIntelligence) };
   const tools = { ...(left.tools ?? {}) };
   for (const [name, count] of Object.entries(right.tools ?? {})) tools[name] = (tools[name] ?? 0) + count;
   return {
@@ -759,5 +816,6 @@ export function mergeUsage(left: AgentUsage | undefined, right: AgentUsage | und
     toolCalls: (left.toolCalls ?? 0) + (right.toolCalls ?? 0),
     tools,
     contextTokens: right.contextTokens ?? left.contextTokens,
+    codeIntelligence: mergeCodeIntelligenceUsage(left.codeIntelligence, right.codeIntelligence),
   };
 }

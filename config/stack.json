@@ -19,7 +19,7 @@
     {
       "id": "@vndv/pi-codegraph",
       "spec": "@vndv/pi-codegraph@0.1.10",
-      "entry": "node_modules/@vndv/pi-codegraph/extensions/codegraph.ts",
+      "entry": "extensions/code-intelligence/codegraph-raw.ts",
       "bin": "codegraph",
       "tools": [
         "codegraph_search",
@@ -31,6 +31,12 @@
         "codegraph_status",
         "codegraph_files"
       ]
+    },
+    {
+      "id": "pitako-code-intelligence",
+      "spec": "pitako",
+      "entry": "extensions/code-intelligence/index.ts",
+      "tools": ["project_report", "read_symbol", "read_enclosing", "module_report", "inspect_symbol", "review_surface"]
     },
     {
       "id": "@juicesharp/rpiv-todo",

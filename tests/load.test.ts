@@ -64,7 +64,7 @@ describe("Pi package loading", () => {
     expect(paths.some((file) => file.endsWith("extensions/index.ts"))).toBe(true);
     expect(paths.some((file) => file.includes(`${path.sep}pi-codex-tools${path.sep}`))).toBe(false);
     expect(paths.some((file) => file.includes(`${path.sep}pi-lsp-client${path.sep}`))).toBe(true);
-    expect(paths.some((file) => file.includes(`${path.sep}pi-codegraph${path.sep}`))).toBe(true);
+    expect(paths.some((file) => file.endsWith(`${path.sep}codegraph-raw.ts`))).toBe(true);
     expect(paths.some((file) => file.includes(`${path.sep}rpiv-todo${path.sep}`))).toBe(true);
     expect(paths.some((file) => file.endsWith(`${path.sep}extensions${path.sep}board${path.sep}index.ts`))).toBe(true);
     for (const file of paths) expect(file.startsWith(root)).toBe(true);
@@ -240,10 +240,13 @@ describe("repository hygiene", () => {
     const root = packageRoot();
     const skip = new Set(["node_modules", ".git", ".codegraph", ".pitako", "bun.lock"]);
     const offenders: string[] = [];
+    const rooted = (name: string) => `${path.sep}${name}${path.sep}`;
+    const isForbidden = (text: string) => text.includes(rooted("home")) || text.includes(rooted("Users")) || /sk-[A-Za-z0-9]{20,}/.test(text);
+    expect(isForbidden(`${path.sep}home${path.sep}developer${path.sep}source.ts`)).toBe(true);
     const walk = (directory: string) => {
       for (const name of readdirSync(directory)) {
-        if (skip.has(name)) continue;
         const file = path.join(directory, name);
+        if (skip.has(name) || path.relative(root, file) === path.join(".pitako", "runs")) continue;
         const stat = statSync(file);
         if (stat.isDirectory()) {
           walk(file);
@@ -251,8 +254,7 @@ describe("repository hygiene", () => {
         }
         if (stat.size > 1_000_000) continue;
         const text = readFileSync(file, "utf8");
-        const rooted = (name: string) => `${path.sep}${name}${path.sep}`;
-        if (text.includes(rooted("home")) || text.includes(rooted("Users")) || /sk-[A-Za-z0-9]{20,}/.test(text)) {
+        if (isForbidden(text)) {
           offenders.push(path.relative(root, file));
         }
       }

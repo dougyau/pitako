@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { cancelTeamWorker, cancelWorker, shutdownBackground, spawnBackground, teamWorkerStatus, workerResult, workerStatus } from "../extensions/agent/background.ts";
+import { cancelTeamWorker, cancelWorker, shutdownBackground, spawnBackground, teamWorkerResult, teamWorkerStatus, workerResult, workerStatus } from "../extensions/agent/background.ts";
 import type { Attempt, AttemptExecutor } from "../extensions/agent/run.ts";
 import { bindBackgroundOwner, clearBackgroundOwner } from "../extensions/agent/background.ts";
 import { listObservations, publishObservation } from "../extensions/agent/observe.ts";
@@ -302,7 +302,7 @@ describe("Team T1 ownership", () => {
     expect(sent[0]?.message.content).not.toContain(architect.id);
     expect(sent[0]?.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
     const consumed = await invoke("team_result", { assignmentId: researcher.id });
-    expect(consumed.content[0].text).toBe("research result");
+    expect(consumed.content[0].text).toContain("research result");
     handlers.get("agent_settled")?.();
     expect(sent).toHaveLength(1);
 
@@ -419,6 +419,72 @@ describe("Team T1 ownership", () => {
     workers.at(-1)!.finish({ status: "cancelled", result: "cancelled", sideEffects: false });
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(((await invoke("team_status", { assignmentId: reviewer.id })).details as any).roles[0].resultAvailable).toBe(true);
+  });
+
+  test("team_result returns stable per-assignment execution summaries after consumption", async () => {
+    const current = evaluation("team-execution-summary");
+    bindBackgroundOwner(owner(current.token));
+    const config = load();
+    previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = config.env.PI_CODING_AGENT_DIR;
+    writeFileSync(config.userConfigPath, `[model_policies.developer.primary]\nmodel = "provider-one/dev-model"\nreasoning = "high"\n[model_policies.researcher.primary]\nmodel = "provider-two/research-model"\nreasoning = "medium"\n`);
+
+    const workers: { role: string; model: string; finish: (attempt: Attempt) => void }[] = [];
+    setBackgroundExecutor({
+      start(input) {
+        if (input.role.id === "developer") input.onActivated?.("high");
+        return new Promise<Attempt>((resolve) => workers.push({ role: input.role.id, model: input.target.model, finish: resolve }));
+      },
+    });
+    const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
+    agentExtension({ registerTool: (tool: any) => tools.set(tool.name, tool) } as unknown as ExtensionAPI);
+    const cwd = mkdtempSync(path.join(tmpdir(), "pitako-team-summary-"));
+    tempDirs.push(cwd);
+    const ctx = { cwd, sessionManager: { getSessionId: () => current.sessionId } };
+    const invoke = (name: string, params: unknown) => tools.get(name)!.execute("call", params, new AbortController().signal, undefined, ctx);
+    const [developerResult, researcherResult] = await Promise.all([
+      invoke("team_assign", { role: "developer", task: "developer summary" }),
+      invoke("team_assign", { role: "researcher", task: "research summary" }),
+    ]);
+    const developer = developerResult.details as { id: string; instanceId: string };
+    const researcher = researcherResult.details as { id: string; instanceId: string };
+    expect(workers.map(({ role }) => role).sort()).toEqual(["developer", "researcher"]);
+    expect(workers.map(({ model }) => model).sort()).toEqual(["provider-one/dev-model", "provider-two/research-model"]);
+
+    workers.find((worker) => worker.role === "developer")!.finish({
+      status: "completed", result: "developer done", sideEffects: false, appliedReasoning: "high",
+      usage: { input: 12, output: 3, cacheRead: 4, cacheWrite: 1, cost: 0.25, turns: 2, toolCalls: 3, tools: { read: 1, grep: 2 }, contextTokens: 512 },
+    });
+    workers.find((worker) => worker.role === "researcher")!.finish({
+      status: "completed", result: "research done", sideEffects: false,
+      usage: { input: 20, output: 4 },
+    });
+    for (let i = 0; i < 50 && (teamWorkerStatus(current.token, developer.instanceId)[0]?.status !== "completed" || teamWorkerStatus(current.token, researcher.instanceId)[0]?.status !== "completed"); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    const exactRun = teamWorkerResult(current.token, developer.instanceId);
+    const developerRead = await invoke("team_result", { assignmentId: developer.id });
+    const devDetails = developerRead.details as any;
+    expect(devDetails.assignmentId).toBe(developer.id);
+    expect(devDetails.summary).toEqual({
+      assignmentId: developer.id, selectedModel: "provider-one/dev-model", provider: "provider-one", appliedReasoning: "high",
+      elapsedMs: exactRun.watchdog?.elapsedMs, turns: 2, toolCalls: 3, tools: { read: 1, grep: 2 },
+      input: 12, output: 3, cacheRead: 4, cacheWrite: 1, contextTokens: 512, estimatedCost: 0.25,
+    });
+    expect(developerRead.content[0].text).toContain(`execution summary: assignment=${developer.id}`);
+    expect(developerRead.content[0].text).toContain("estimated_cost=$0.250000 (Pi estimate; not billing)");
+    const developerReadAgain = await invoke("team_result", { assignmentId: developer.id });
+    expect((developerReadAgain.details as any).summary).toEqual(devDetails.summary);
+    expect(developerReadAgain.content[0].text).toBe(developerRead.content[0].text);
+
+    const researcherRead = await invoke("team_result", { assignmentId: researcher.id });
+    expect((researcherRead.details as any).summary).toMatchObject({
+      assignmentId: researcher.id, selectedModel: "provider-two/research-model", provider: "provider-two", appliedReasoning: "unknown",
+      input: 20, output: 4, cacheRead: null, cacheWrite: null, contextTokens: null, estimatedCost: null,
+      turns: null, toolCalls: null, tools: null,
+    });
+    expect(researcherRead.content[0].text).toContain("cache_read=unavailable");
   });
 
   test("watched Team assignments inherit only a validated plan topic", async () => {

@@ -80,7 +80,8 @@ export function toolsForProfile(options: {
 
 export function profileNote(profile: ProfileName): string {
   const shared = [
-    "Inspect the repository before editing. Prefer CodeGraph and LSP over broad grep.",
+    "Inspect the repository before editing. Keep raw read, grep, bash, LSP and CodeGraph visible; coding also keeps edit available. Use raw navigation as the baseline until matched dense-query dogfood is complete.",
+    "Six dense queries are for explicit evaluation, not a raw-navigation replacement.",
     "Keep diffs small. Reuse existing code. Do not add speculative machinery.",
     "Verify real behavior before claiming done. Load a specialized skill only when it applies.",
     "Research or design does not authorize implementation.",
@@ -107,7 +108,7 @@ export function childSessionNote(instanceId: string): string {
   return [
     `Pitako AgentInstance ${instanceId}.`,
     "The model and reasoning come from this role's ModelPolicy, not from the parent session.",
-    "Inspect the repository before editing. Prefer CodeGraph and LSP over broad grep.",
+    "Inspect the repository before editing. Keep raw read, grep, LSP and CodeGraph available as the navigation baseline; dense code-intelligence queries remain available for explicit evaluation.",
     "Keep diffs small. Verify real behavior before claiming done.",
     "Board tools are pull-only. rpiv-todo is private to this session. Do not spawn agents.",
   ].join(" ");

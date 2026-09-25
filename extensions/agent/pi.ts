@@ -8,31 +8,58 @@ import {
   SessionManager,
   SettingsManager,
   type AgentSession,
+  type ExtensionAPI,
+  type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { registerExecution, unregisterExecution } from "../execution-identity.ts";
 import { childActiveTools, ORCHESTRATION_TOOLS } from "../profile.ts";
 import { marksSideEffect } from "./effects.ts";
 import { childInstructions, skillNamesForRole, usageDelta, type AgentUsage, type Attempt, type AttemptExecutor } from "./run.ts";
+import { completeTool, emptyCodeIntelligenceUsage, isDenseToolName, type CodeIntelligenceUsage, type DenseCallUsage, type ToolOutcome } from "../code-intelligence/metrics.ts";
+import { CODE_INTELLIGENCE_TOOLS } from "../code-intelligence/tools.ts";
+import { bindCodeIntelligenceApi } from "../code-intelligence/index.ts";
+import codegraphRaw from "../code-intelligence/codegraph-raw.ts";
+import lspExtension from "pi-lsp-client/src/index.ts";
 import type { ModelTarget, ReasoningLevel } from "../roles/types.ts";
+import { createReplayCapture, type T6ReplaySpec } from "./replay.ts";
 
 // Package entry does not re-export this. Import the file next to the resolved entry.
 export const { DEFAULT_THINKING_LEVEL } = await import(
   new URL("./core/defaults.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href,
 ) as { DEFAULT_THINKING_LEVEL: ThinkingLevel };
 
+const navigationWindows = new WeakMap<AgentSession, { remaining: number }>();
+
+function captureExtensionTools(register: (pi: ExtensionAPI) => void): ToolDefinition[] {
+  const tools: ToolDefinition[] = [];
+  register({
+    registerTool(tool: ToolDefinition) { tools.push(tool); },
+    on() { return () => {}; },
+    registerCommand() {},
+  } as unknown as ExtensionAPI);
+  return tools;
+}
+
+const RAW_CHILD_TOOLS = [
+  ...captureExtensionTools(lspExtension),
+  ...captureExtensionTools(codegraphRaw),
+];
+export const CHILD_CODE_TOOLS = [...CODE_INTELLIGENCE_TOOLS, ...RAW_CHILD_TOOLS];
+
 /** Omitted reasoning is not forced to medium. Pi keeps its own default. */
 export function thinkingLevelFor(reasoning: ReasoningLevel | undefined): ThinkingLevel | undefined {
   return reasoning;
 }
 
-export function createPiExecutor(): AttemptExecutor {
+export function createPiExecutor(options: { replay?: T6ReplaySpec } = {}): AttemptExecutor {
+  const replayCaptures = new WeakMap<AgentSession, NonNullable<ReturnType<typeof createReplayCapture>>>();
   return {
     async start(input) {
       // Do not bind the worker abort signal here. The session abort owns cancellation.
       // A signal on runtime create aborts Cursor auth before the child prompt starts.
       const runtime = await ModelRuntime.create({ allowModelNetwork: false, refreshOnCreate: false });
       keepCursorTools(runtime);
-      return runTarget(runtime, input.target, input.task, input);
+      return runTarget(runtime, input.target, input.task, input, undefined, options.replay, replayCaptures);
     },
   };
 }
@@ -85,12 +112,14 @@ async function runTarget(
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
   },
   existing?: AgentSession,
+  replaySpec?: T6ReplaySpec,
+  replayCaptures?: WeakMap<AgentSession, NonNullable<ReturnType<typeof createReplayCapture>>>,
 ): Promise<Attempt> {
   if (input.signal.aborted) return { status: "cancelled", result: "cancelled", sideEffects: false };
   let model = findModel(runtime, target.model);
   // Extension providers register during AgentSession bind, not on a fresh runtime.
   if (!model && !existing) {
-    return bindThenRun(runtime, target, prompt, input);
+    return bindThenRun(runtime, target, prompt, input, replaySpec, replayCaptures);
   }
   if (!model) {
     return { status: "failed", result: "", error: `model unavailable: ${target.model}`, sideEffects: false };
@@ -98,10 +127,10 @@ async function runTarget(
   let session = existing;
   if (!session) {
     try {
-      session = await openSession(runtime, model, target, input);
+      session = await openSession(runtime, model, target, input, replaySpec, replayCaptures);
       if (session.thinkingLevel) input.onActivated?.(session.thinkingLevel);
       if (input.signal.aborted) {
-        await resume(session, runtime, input).dispose();
+        await resume(session, runtime, input, replayCaptures).dispose();
         return { status: "cancelled", result: "cancelled", sideEffects: false };
       }
     } catch (error) {
@@ -111,11 +140,11 @@ async function runTarget(
   } else {
     const activationError = await activateTarget(session, model, target);
     if (activationError) {
-      return { status: "failed", result: "", error: activationError, sideEffects: true, session: resume(session, runtime, input) };
+      return { status: "failed", result: "", error: activationError, sideEffects: true, session: resume(session, runtime, input, replayCaptures) };
     }
     if (session.thinkingLevel) input.onActivated?.(session.thinkingLevel);
   }
-  return drive(session, runtime, prompt, input);
+  return drive(session, runtime, prompt, input, replayCaptures);
 }
 
 export async function activateTarget(
@@ -159,30 +188,32 @@ async function bindThenRun(
     onActivated?: (appliedReasoning: string) => void;
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
   },
+  replaySpec?: T6ReplaySpec,
+  replayCaptures?: WeakMap<AgentSession, NonNullable<ReturnType<typeof createReplayCapture>>>,
 ): Promise<Attempt> {
   let session: AgentSession;
   try {
-    session = await openSession(runtime, undefined, target, input);
+    session = await openSession(runtime, undefined, target, input, replaySpec, replayCaptures);
   } catch (error) {
     if (input.signal.aborted) return { status: "cancelled", result: "cancelled", sideEffects: false };
     return { status: "failed", result: "", error: messageOf(error), sideEffects: false };
   }
   if (input.signal.aborted) {
-    await resume(session, runtime, input).dispose();
+    await resume(session, runtime, input, replayCaptures).dispose();
     return { status: "cancelled", result: "cancelled", sideEffects: false };
   }
   const model = findModel(runtime, target.model);
   if (!model) {
-    await resume(session, runtime, input).dispose();
+    await resume(session, runtime, input, replayCaptures).dispose();
     return { status: "failed", result: "", error: `model unavailable: ${target.model}`, sideEffects: false };
   }
   const activationError = await activateTarget(session, model, target);
   if (activationError) {
-    await resume(session, runtime, input).dispose();
+    await resume(session, runtime, input, replayCaptures).dispose();
     return { status: "failed", result: "", error: activationError, sideEffects: false };
   }
   if (session.thinkingLevel) input.onActivated?.(session.thinkingLevel);
-  return drive(session, runtime, prompt, input);
+  return drive(session, runtime, prompt, input, replayCaptures);
 }
 
 async function openSession(
@@ -190,8 +221,11 @@ async function openSession(
   model: NonNullable<ReturnType<ModelRuntime["getModel"]>> | undefined,
   target: ModelTarget,
   input: { instanceId: string; role: Parameters<AttemptExecutor["start"]>[0]["role"]; cwd: string },
+  replaySpec?: T6ReplaySpec,
+  replayCaptures?: WeakMap<AgentSession, NonNullable<ReturnType<typeof createReplayCapture>>>,
 ): Promise<AgentSession> {
   const agentDir = getAgentDir();
+  bindCodeIntelligenceApi();
   const settingsManager = SettingsManager.create(input.cwd, agentDir);
   const allowed = new Set(skillNamesForRole(input.role));
   const loader = new DefaultResourceLoader({
@@ -205,6 +239,7 @@ async function openSession(
     }),
   });
   await loader.reload();
+  const childTools = [...CHILD_CODE_TOOLS];
   const thinkingLevel = model ? thinkingLevelFor(target.reasoning) : undefined;
   const { session } = await createAgentSession({
     cwd: input.cwd,
@@ -214,10 +249,19 @@ async function openSession(
     sessionManager: SessionManager.inMemory(input.cwd),
     settingsManager,
     resourceLoader: loader,
+    customTools: childTools,
     modelRuntime: runtime,
     excludeTools: [...ORCHESTRATION_TOOLS],
   });
   session.setActiveToolsByName(childActiveTools(session.getAllTools().map((tool) => tool.name), process.platform, input.role.id));
+  if (input.role.id === "reviewer" && replaySpec && replayCaptures) {
+    const approvedStrings = new Set(replaySpec.approvedStrings ?? []);
+    for (const value of [replaySpec.assignmentId, input.instanceId, session.sessionId, session.model?.provider, session.model?.id, session.model?.api, ...session.getActiveToolNames()]) {
+      if (typeof value === "string") approvedStrings.add(value);
+    }
+    const capture = createReplayCapture({ ...replaySpec, approvedStrings }, input.instanceId, input.cwd);
+    if (capture) replayCaptures.set(session, capture);
+  }
   registerExecution({ instanceId: input.instanceId, roleId: input.role.id, sessionId: session.sessionId });
   return session;
 }
@@ -235,48 +279,65 @@ async function drive(
     onActivated?: (appliedReasoning: string) => void;
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
   },
+  replayCaptures?: WeakMap<AgentSession, NonNullable<ReturnType<typeof createReplayCapture>>>,
 ): Promise<Attempt> {
   // continueWith skips executor.start. The probe closes over this session only.
   input.bindActivityProbe?.(() => cursorStreamHold(session));
   try {
     let sideEffects = false;
     const tools: Record<string, number> = {};
+    const codeIntelligence = emptyCodeIntelligenceUsage();
+    const navigation = navigationWindows.get(session) ?? { remaining: 0 };
+    codeIntelligence.navigation.remaining = navigation.remaining;
+    const toolStarts = new Map<string, number>();
+    const replayCapture = replayCaptures?.get(session);
     const unsubscribe = session.subscribe((event) => {
+      replayCapture?.observe(session, event, event.type === "tool_execution_end" ? toolStarts.get(event.toolCallId) : undefined);
       input.onActivity?.(event);
-      if (event.type === "tool_execution_start" && marksSideEffect(event.toolName)) sideEffects = true;
-      if (event.type === "tool_execution_end") tools[event.toolName] = (tools[event.toolName] ?? 0) + 1;
+      if (event.type === "tool_execution_start") {
+        toolStarts.set(event.toolCallId, performance.now());
+        if (marksSideEffect(event.toolName)) sideEffects = true;
+      }
+      if (event.type === "tool_execution_end") {
+        tools[event.toolName] = (tools[event.toolName] ?? 0) + 1;
+        const started = toolStarts.get(event.toolCallId);
+        toolStarts.delete(event.toolCallId);
+        completeTool(codeIntelligence, event.toolName, denseCallFromExecution(event.toolName, event.result, started, input.signal), navigation);
+        navigationWindows.set(session, navigation);
+      }
     });
-    const handle = resume(session, runtime, input);
+    const handle = resume(session, runtime, input, replayCaptures);
     const before = usageFrom(session, {});
     if (input.signal.aborted) {
       await session.abort();
-      return { status: "cancelled", result: "cancelled", sideEffects, usage: attemptUsage(before, session, tools), session: handle };
+      return { status: "cancelled", result: "cancelled", sideEffects, usage: attemptUsage(before, session, tools, codeIntelligence), session: handle };
     }
     const stopWatch = watchAbort(input.signal, () => {
       void session.abort();
     });
     try {
+      replayCapture?.beginPrompt(session);
       await session.prompt(prompt, { expandPromptTemplates: false });
       const assistant = lastAssistant(session);
       if (input.signal.aborted) {
-        return { status: "cancelled", result: "cancelled", sideEffects, usage: attemptUsage(before, session, tools), appliedReasoning: session.thinkingLevel, session: handle };
+        return { status: "cancelled", result: "cancelled", sideEffects, usage: attemptUsage(before, session, tools, codeIntelligence), appliedReasoning: session.thinkingLevel, session: handle };
       }
       if (assistant?.stopReason === "aborted" || assistant?.stopReason === "error") {
-        return failedAttempt(assistant.errorMessage ?? assistant.stopReason ?? "provider error", sideEffects, handle, session, attemptUsage(before, session, tools));
+        return failedAttempt(assistant.errorMessage ?? assistant.stopReason ?? "provider error", sideEffects, handle, session, attemptUsage(before, session, tools, codeIntelligence));
       }
       return {
         status: "completed",
         result: textOf(assistant),
         sideEffects,
-        usage: attemptUsage(before, session, tools),
+        usage: attemptUsage(before, session, tools, codeIntelligence),
         appliedReasoning: session.thinkingLevel,
         session: handle,
       };
     } catch (error) {
       if (input.signal.aborted) {
-        return { status: "cancelled", result: "cancelled", sideEffects, usage: attemptUsage(before, session, tools), session: handle };
+        return { status: "cancelled", result: "cancelled", sideEffects, usage: attemptUsage(before, session, tools, codeIntelligence), session: handle };
       }
-      return failedAttempt(messageOf(error), sideEffects, handle, session, attemptUsage(before, session, tools));
+      return failedAttempt(messageOf(error), sideEffects, handle, session, attemptUsage(before, session, tools, codeIntelligence));
     } finally {
       stopWatch();
       unsubscribe();
@@ -315,17 +376,25 @@ function resume(
     onActivated?: (appliedReasoning: string) => void;
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
   },
+  replayCaptures?: WeakMap<AgentSession, NonNullable<ReturnType<typeof createReplayCapture>>>,
 ): NonNullable<Attempt["session"]> {
   let disposed = false;
   return {
     async continueWith(target, note, signal) {
-      return runTarget(runtime, target, note, { ...input, signal }, session);
+      return runTarget(runtime, target, note, { ...input, signal }, session, undefined, replayCaptures);
     },
     async dispose() {
       if (disposed) return;
       disposed = true;
-      unregisterExecution(session.sessionId);
-      await session.dispose();
+      try {
+        await replayCaptures?.get(session)?.export(session);
+      } catch {
+        // Diagnostic export must never change the child outcome.
+      } finally {
+        replayCaptures?.delete(session);
+        unregisterExecution(session.sessionId);
+        await session.dispose();
+      }
     },
   };
 }
@@ -365,10 +434,31 @@ export function watchAbort(signal: AbortSignal, onAbort: () => void): () => void
   return () => signal.removeEventListener("abort", listener);
 }
 
-function attemptUsage(before: AgentUsage, session: AgentSession, tools: Record<string, number>): AgentUsage | undefined {
+function denseCallFromExecution(name: string, result: any, startedAt: number | undefined, signal: AbortSignal): DenseCallUsage | undefined {
+  if (!isDenseToolName(name)) return undefined;
+  const details = result?.details ?? result?.result?.details ?? {};
+  const measured = details.codeIntelligence;
+  if (measured?.tool === name && typeof measured.durationMs === "number" && typeof measured.outputBytes === "number") {
+    return measured as DenseCallUsage;
+  }
+  const text = Array.isArray(result?.content) ? result.content.filter((part: any) => part?.type === "text").map((part: any) => String(part.text ?? "")).join("\n") : "";
+  const status = details.status;
+  const outcome: ToolOutcome = signal.aborted ? "cancelled" : status === "partial" ? "partial" : status === "unavailable" ? "unavailable" : result?.isError ? "error" : "ok";
+  return {
+    tool: name,
+    durationMs: Math.max(0, Math.round(performance.now() - (startedAt ?? performance.now()))),
+    outputBytes: Buffer.byteLength(text),
+    truncated: details.truncated === true,
+    outcome,
+    telemetryAvailable: false,
+    sources: {},
+  };
+}
+
+function attemptUsage(before: AgentUsage, session: AgentSession, tools: Record<string, number>, codeIntelligence: CodeIntelligenceUsage): AgentUsage | undefined {
   const delta = usageDelta(before, usageFrom(session, {}));
   if (!delta) return undefined;
-  return { ...delta, tools, contextTokens: usageFrom(session, {}).contextTokens };
+  return { ...delta, tools, contextTokens: usageFrom(session, {}).contextTokens, codeIntelligence: structuredClone(codeIntelligence) };
 }
 
 function usageFrom(session: AgentSession, tools: Record<string, number>): AgentUsage {

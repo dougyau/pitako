@@ -1,6 +1,6 @@
 ---
 name: pitako-coding
-description: Use Pitako's coding baseline. Router plus philosophy for a curated Pi coding session. Prefer CodeGraph and LSP, keep diffs small, and load specialized skills only when they apply. Use when navigating or changing code in a Pitako session.
+description: Use Pitako's coding baseline. Router plus philosophy for a curated Pi coding session. Keep raw LSP and CodeGraph visible, keep diffs small, and load specialized skills only when they apply. Use when navigating or changing code in a Pitako session.
 ---
 
 # Pitako coding
@@ -19,7 +19,7 @@ Switch with `/pitako profile analysis` or start Pi with `--pitako-profile analys
 ## Defaults
 
 1. Inspect the actual repository before editing.
-2. Prefer CodeGraph and LSP over broad grep or whole-tree reads.
+2. Keep raw read, grep, LSP, and CodeGraph available as the navigation baseline; dense code-intelligence queries are available for explicit evaluation, not a default preference before matched dogfood.
 3. Reuse what already exists. Question whether new code is needed.
 4. Keep the diff proportionate to the task. No speculative abstractions.
 5. Verify real behavior (diff, tests, command output) before claiming done.
@@ -28,13 +28,7 @@ Switch with `/pitako profile analysis` or start Pi with `--pitako-profile analys
 
 ## Tools
 
-Use these before broad grep when the question is structural:
-
-- `codegraph_search` for a symbol name
-- `codegraph_explore` for how an area fits together
-- `codegraph_callers` and `codegraph_callees` for call edges
-- `codegraph_impact` before changing a symbol
-- `codegraph_node` for one symbol's source and nearby edges
+For baseline and raw-first dogfood tasks, use the exposed raw read/grep, LSP, and CodeGraph tools; keep all of them visible, including `edit` and `bash` in the coding profile. The six dense queries (`project_report`, `read_symbol`, `read_enclosing`, `module_report`, `inspect_symbol`, `review_surface`) are available when a task explicitly requests the dense trial. They supplement rather than hide raw tools; retain raw access for literal searches, unsupported backends, follow-up, and comparison.
 
 The project needs a `.codegraph` index. From the project root: `codegraph init`.
 
