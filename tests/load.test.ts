@@ -141,6 +141,47 @@ describe("Pi package loading", () => {
     await developer.shutdown();
   });
 
+  test("supervised Herdr role controls patch across profile switches", async () => {
+    const previousId = process.env.PITAKO_INSTANCE_ID;
+    const previousRole = process.env.PITAKO_ROLE_ID;
+    try {
+      process.env.PITAKO_INSTANCE_ID = "herdr-child";
+      process.env.PITAKO_ROLE_ID = "developer";
+      const developer = profileHarness();
+      await developer.start();
+      expect(developer.active).toContain("apply_patch");
+      expect(developer.active).toContain("edit");
+      expect(developer.active).toContain("write");
+      await developer.selectProfile("analysis");
+      expect(developer.active).not.toContain("apply_patch");
+      await developer.selectProfile("coding");
+      expect(developer.active).toContain("apply_patch");
+      await developer.shutdown();
+
+      process.env.PITAKO_ROLE_ID = "reviewer";
+      const reviewer = profileHarness();
+      await reviewer.start();
+      expect(reviewer.active).not.toContain("apply_patch");
+      await reviewer.selectProfile("coding");
+      expect(reviewer.active).not.toContain("apply_patch");
+      await reviewer.shutdown();
+
+      delete process.env.PITAKO_INSTANCE_ID;
+      process.env.PITAKO_ROLE_ID = "developer";
+      const foreground = profileHarness();
+      await foreground.start();
+      expect(foreground.active).not.toContain("apply_patch");
+      await foreground.selectProfile("coding");
+      expect(foreground.active).not.toContain("apply_patch");
+      await foreground.shutdown();
+    } finally {
+      if (previousId === undefined) delete process.env.PITAKO_INSTANCE_ID;
+      else process.env.PITAKO_INSTANCE_ID = previousId;
+      if (previousRole === undefined) delete process.env.PITAKO_ROLE_ID;
+      else process.env.PITAKO_ROLE_ID = previousRole;
+    }
+  });
+
   test("analysis profile wiring excludes edit and write", async () => {
     const previous = process.env.PITAKO_PROFILE;
     process.env.PITAKO_PROFILE = "analysis";

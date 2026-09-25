@@ -26,6 +26,10 @@ function requestedProfile(pi: ExtensionAPI): ProfileName {
   return parseProfile(process.env.PITAKO_PROFILE);
 }
 
+function sessionRoleId(): string | undefined {
+  return currentRoleId() ?? (process.env.PITAKO_INSTANCE_ID ? process.env.PITAKO_ROLE_ID : undefined);
+}
+
 function applyProfile(pi: ExtensionAPI, profile: ProfileName, roleId?: string): string[] {
   const available = pi.getAllTools().map((tool) => tool.name);
   const active = pi.getActiveTools();
@@ -103,7 +107,7 @@ export default function pitako(pi: ExtensionAPI) {
       const coding = toolsForProfile({
         available,
         profile: "coding",
-        roleId: currentRoleId(),
+        roleId: sessionRoleId(),
         includePowerShell: process.platform === "win32" || pi.getActiveTools().includes("powershell"),
       }).filter((name) => !ORCHESTRATION_TOOLS.includes(name as (typeof ORCHESTRATION_TOOLS)[number]));
       pi.setActiveTools(coding);
@@ -228,7 +232,7 @@ export default function pitako(pi: ExtensionAPI) {
       }
       if (command === "profile" && value) {
         profile = parseProfile(value);
-        const tools = applyProfile(pi, profile, currentRoleId());
+        const tools = applyProfile(pi, profile, sessionRoleId());
         if (ctx.hasUI) {
           ctx.ui.notify(`Pitako profile: ${profile} (${tools.length} tools)`, "info");
         }

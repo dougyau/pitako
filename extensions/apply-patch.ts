@@ -135,7 +135,7 @@ class PatchFailure extends Error {
 
 const localFileSystem: PatchFileSystem = { lstat, realpath, readFile, open, rename, unlink, mkdir, rmdir };
 
-/** Build T2's strict patch tool. Profile registration remains a T3 concern. */
+/** Build the strict patch tool definition. */
 export function createApplyPatchToolDefinition(
   cwd: string,
   dependencies: ApplyPatchDependencies = {},
@@ -147,7 +147,7 @@ export function createApplyPatchToolDefinition(
       "Apply strict, exact Codex patches to coherent file batches. Use edit for one or a few local replacements. Move, fuzzy matches, and unsafe paths are rejected.",
     promptSnippet: "Apply one exact patch to a coherent file batch",
     promptGuidelines: [
-      "For a coherent multi-file batch, use apply_patch when the task explicitly calls for it; use edit for one or a few local replacements.",
+      "Use edit for one or a few local replacements; use apply_patch for coherent multi-hunk or multi-file changes. Do not batch unrelated changes.",
       "Reread and regenerate a patch after any stale or ambiguous match. Move is unsupported.",
     ],
     parameters: inputSchema,
@@ -220,6 +220,15 @@ export async function runApplyPatch(
       duplicates.add(target.relative);
     }
     state.pending = paths.map(({ display }) => display);
+    const seenPaths: typeof paths = [];
+    const isAncestor = (parent: (typeof paths)[number], child: (typeof paths)[number]) =>
+      parent.segments.length < child.segments.length &&
+      parent.segments.every((segment, index) => segment === child.segments[index]);
+    for (const target of paths) {
+      const conflict = seenPaths.find((previous) => isAncestor(previous, target) || isAncestor(target, previous));
+      if (conflict) throw new PatchFailure("PATCH_PATH_CONFLICT", `Targets '${conflict.display}' and '${target.display}' overlap as file paths.`);
+      seenPaths.push(target);
+    }
 
     throwIfAborted(options.signal);
     const requestedRoot = path.resolve(options.cwd);

@@ -37,6 +37,7 @@ describe("strict apply_patch core", () => {
     const tool = createApplyPatchToolDefinition(".");
     expect(tool.name).toBe("apply_patch");
     expect(tool.executionMode).toBe("sequential");
+    expect(tool.promptGuidelines?.[0]).toContain("Do not batch unrelated changes.");
     expect(tool.constrainedSampling).toEqual({ type: "grammar", variants: { openai_lark: APPLY_PATCH_GRAMMAR } });
     expect(Object.keys(tool.parameters.properties ?? {})).toEqual(["patch"]);
   });
@@ -105,6 +106,7 @@ describe("strict apply_patch core", () => {
       "*** Add File: same.txt\n+one\n*** Add File: ./same.txt\n+two\n",
     ), { cwd: "/unused", ...dependencies });
     expect(duplicate.details.errorCode).toBe("PATCH_DUPLICATE_PATH");
+    expect(duplicate.details.pending).toEqual(["same.txt", "./same.txt"]);
 
     const tooManyPaths = patch(Array.from({ length: 33 }, (_, index) => `*** Add File: file-${index}.txt\n+x\n`).join(""));
     expect((await runApplyPatch(tooManyPaths, { cwd: "/unused", ...dependencies })).details.errorCode).toBe("PATCH_LIMIT");
@@ -177,6 +179,26 @@ describe("strict apply_patch core", () => {
       expect(await readFile(path.join(root, "a.txt"), "utf8")).toBe("old-a\n");
       expect(await readFile(path.join(root, "b.txt"), "utf8")).toBe("new-b\n");
     });
+  });
+
+  test("rejects Add targets whose paths are ancestors of each other", async () => {
+    for (const targets of [["a", "a/b"], ["a/b", "a"]] as const) {
+      await withTempDir(async (root) => {
+        const result = await apply(root, patch(
+          `*** Add File: ${targets[0]}\n+x\n*** Add File: ${targets[1]}\n+y\n`,
+        ));
+        expect(result.details).toMatchObject({
+          ok: false,
+          phase: "preflight",
+          errorCode: "PATCH_PATH_CONFLICT",
+          committed: [],
+          uncertain: [],
+          pending: [...targets],
+        });
+        expect(output(result)).toContain(`Committed: none; pending: ${targets.join(", ")}; uncertain: none.`);
+        expect(await Bun.file(path.join(root, "a")).exists()).toBe(false);
+      });
+    }
   });
 
   test("rejects ambiguous, unanchored insertion, and non-suffix EOF hunks", async () => {
