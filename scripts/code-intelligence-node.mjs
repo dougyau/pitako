@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -9,7 +9,6 @@ import codegraph from "@colbymchenry/codegraph";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { CODE_INTELLIGENCE_TOOLS } from "../extensions/code-intelligence/tools.ts";
 import { withCodeGraph } from "../extensions/code-intelligence/graph.ts";
-import { createReplayCapture, t6ReplaySpec } from "../extensions/agent/replay.ts";
 
 const roots = [];
 const CodeGraph = codegraph.CodeGraph;
@@ -88,67 +87,6 @@ async function createPiSession(cwd) {
   });
   return session;
 }
-
-test("Node Pi loader captures the effective forced prompt and sanitized in-memory history", async () => {
-  const root = fixture();
-  const agentDir = mkdtempSync(path.join(os.tmpdir(), "pitako-node-replay-agent-"));
-  roots.push(agentDir);
-  mkdirSync(path.join(agentDir, "extensions"));
-  const forced = "node-forced π\r\nexact";
-  globalThis.__pitakoNodeReplayPrompt = forced;
-  const { createAssistantMessageEventStream } = await import("@earendil-works/pi-ai/utils/event-stream");
-  globalThis.__pitakoNodeReplayProvider = {
-    baseUrl: "http://127.0.0.1", apiKey: "synthetic", api: "openai-completions",
-    models: [{ id: "fixture", name: "Node replay fixture", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000, maxTokens: 64 }],
-    streamSimple(model) {
-      const stream = createAssistantMessageEventStream();
-      const message = { role: "assistant", content: [{ type: "text", text: "node-replay-result" }], api: "openai-completions", provider: "pitako-node-replay", model: model.id, stopReason: "stop", timestamp: Date.now(), usage: { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 3, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
-      queueMicrotask(() => { stream.push({ type: "done", reason: "stop", message }); stream.end(message); });
-      return stream;
-    },
-  };
-  const extension = path.join(agentDir, "replay.js");
-  writeFileSync(extension, "export default function (pi) { pi.registerProvider('pitako-node-replay', globalThis.__pitakoNodeReplayProvider); pi.on('before_agent_start', () => ({ systemPrompt: globalThis.__pitakoNodeReplayPrompt })); }\n");
-  const modelRuntime = await ModelRuntime.create({ authPath: path.join(agentDir, "auth.json"), modelsPath: null, allowModelNetwork: false, refreshOnCreate: false });
-  const settingsManager = SettingsManager.create(root, agentDir);
-  const resourceLoader = new DefaultResourceLoader({ cwd: root, agentDir, settingsManager, noExtensions: true, additionalExtensionPaths: [extension], noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true });
-  await resourceLoader.reload();
-  const { session } = await createAgentSession({ cwd: root, agentDir, modelRuntime, settingsManager, resourceLoader, sessionManager: SessionManager.inMemory(root) });
-  const model = modelRuntime.getModel("pitako-node-replay", "fixture");
-  assert.ok(model, "Pi loader registered the synthetic provider");
-  await session.setModel(model, { persist: false });
-  session.setThinkingLevel("off");
-  const replay = t6ReplaySpec("reviewer", "code-intelligence", "T6-replay-baseline", "66666666-6666-4666-8666-666666666666");
-  assert.ok(replay);
-  const approvedStrings = new Set([
-    replay.assignmentId, "reviewer-node-smoke", session.sessionId, forced, "node-replay-result",
-    session.model?.provider, session.model?.id, session.model?.api, ...session.getActiveToolNames(),
-  ].filter((value) => typeof value === "string"));
-  const capture = createReplayCapture({ ...replay, approvedStrings }, "reviewer-node-smoke", root);
-  assert.ok(capture);
-  const unsubscribe = session.subscribe((event) => capture.observe(session, event));
-  try {
-    capture.beginPrompt(session);
-    await session.prompt("node in-memory replay smoke");
-    unsubscribe();
-    assert.equal(await capture.export(session), true);
-    const directory = path.join(root, ".pitako", "runs", "code-intelligence", "evidence", "T6", "session-replay", replay.assignmentId);
-    const files = readdirSync(directory);
-    assert.equal(files.length, 1);
-    assert.equal(files.some((name) => name.endsWith(".jsonl")), false);
-    assert.equal(statSync(directory).mode & 0o777, 0o700);
-    assert.equal(statSync(path.join(directory, files[0])).mode & 0o777, 0o600);
-    const serialized = readFileSync(path.join(directory, files[0]), "utf8");
-    const artifact = JSON.parse(serialized);
-    assert.ok(artifact.checkpoints.some((checkpoint) => checkpoint.systemPrompt === forced));
-    assert.ok(artifact.entries.some((entry) => entry.type === "message" && entry.message.role === "assistant" && entry.message.content.some((part) => part.text === "node-replay-result")));
-  } finally {
-    unsubscribe();
-    await session.dispose();
-    delete globalThis.__pitakoNodeReplayPrompt;
-    delete globalThis.__pitakoNodeReplayProvider;
-  }
-});
 
 function sessionTool(session, cwd, name) {
   assert.ok(session.getActiveToolNames().includes(name), `${name} is active in the Pi AgentSession`);

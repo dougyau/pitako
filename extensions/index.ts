@@ -371,7 +371,7 @@ export default function pitako(pi: ExtensionAPI) {
         `Pitako profile: ${profile}`,
         "coding: read, bash, edit, write, grep, find, ls, LSP, CodeGraph, todo; apply_patch is Developer AgentInstance-only with task-scoped batch guidance.",
         "analysis: read, bash, grep, find, ls, LSP, CodeGraph, todo; no edit, write, apply_patch, or lsp_rename",
-        "Code intelligence (explicit evaluation): project_report, read_symbol, read_enclosing, module_report, inspect_symbol, review_surface; raw navigation remains available.",
+        "Code intelligence: project_report, read_symbol, read_enclosing, module_report, inspect_symbol, review_surface; raw navigation remains available.",
         "Switch with /pitako profile analysis",
         "Session TODOs: todo tool and /todos (rpiv-todo). Shared knowledge: board_* tools and /board.",
         "Roles: /pitako roles, /pitako role <id>, /pitako policies, /pitako policy <id>. Definitions only.",

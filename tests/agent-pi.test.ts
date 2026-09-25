@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -7,7 +7,6 @@ import { classifyProviderFailure } from "../extensions/agent/fallback.ts";
 import { activateTarget, CHILD_CODE_TOOLS, createPiExecutor, cursorProviderContext, DEFAULT_THINKING_LEVEL } from "../extensions/agent/pi.ts";
 import { runAgentInstance, teamExecutionSummary } from "../extensions/agent/run.ts";
 import { childActiveTools, ORCHESTRATION_TOOLS } from "../extensions/profile.ts";
-import { t6ReplaySpec } from "../extensions/agent/replay.ts";
 import type { ResolvedRole } from "../extensions/roles/types.ts";
 
 const tempDirs: string[] = [];
@@ -229,55 +228,6 @@ describe("extension provider bind", () => {
     return { calls, cwd };
   }
 
-  async function installReplayTool(failOnce = false) {
-    const { calls, cwd } = await installLateProvider();
-    const agentDir = process.env.PI_CODING_AGENT_DIR!;
-    writeFileSync(path.join(agentDir, "extensions", "replay.js"), `
-      import { Type } from "typebox";
-      export default function (pi) {
-        pi.on("before_agent_start", () => ({ systemPrompt: "forced-safe π\\r\\nexact" }));
-        pi.registerTool({
-          name: "replay_probe", label: "Replay probe", description: "Returns a fixed test result",
-          parameters: Type.Object({ query: Type.String() }),
-          async execute(_id, params) { return { content: [{ type: "text", text: \`result=\${params.query}\\r\\nline=π\` }], details: { hidden: "PITAKO-REPLAY-CANARY-details" } }; },
-        });
-      }
-    `);
-    const provider = (globalThis as { __pitakoLateProvider?: any }).__pitakoLateProvider!;
-    if (failOnce) provider.models.push({ ...provider.models[0], id: "fallback", name: "Fallback" });
-    const streamModule: string = "@earendil-works/pi-ai/utils/event-stream.js";
-    const { createAssistantMessageEventStream } = await import(streamModule);
-
-    provider.streamSimple = (model: { id: string }, context: { messages?: any[] }) => {
-      const messages = context.messages ?? [];
-      const hasResult = messages.some((message) => message.role === "toolResult" && message.toolName === "replay_probe");
-      let content: any[];
-      let stopReason: string;
-      let errorMessage: string | undefined;
-      if (!hasResult) {
-        content = [{ type: "toolCall", id: "replay-call-1", name: "replay_probe", arguments: { query: "café\r\nquery" } }];
-        stopReason = "toolUse";
-      } else if (failOnce && model.id === "late") {
-        content = [];
-        stopReason = "error";
-        errorMessage = "socket hang up";
-      } else {
-        content = [{ type: "text", text: "Replay captured." }];
-        stopReason = "stop";
-      }
-      const stream = createAssistantMessageEventStream();
-      const message = {
-        role: "assistant", content, api: "openai-completions", provider: "pitako-late", model: model.id,
-        stopReason, ...(errorMessage ? { errorMessage } : {}), timestamp: Date.now(),
-        usage: { input: 4, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: 6, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-      };
-      queueMicrotask(() => { stream.push({ type: "done", reason: stopReason, message }); stream.end(message); });
-      calls.push(`${model.id}:${stopReason}`);
-      return stream;
-    };
-    return { calls, cwd, agentDir };
-  }
-
   test("selects a model that appears only after session bind", async () => {
     const { calls, cwd } = await installLateProvider();
     const attempt = await createPiExecutor().start({
@@ -300,82 +250,41 @@ describe("extension provider bind", () => {
     }
   }, 60_000);
 
-  test("reserved Reviewer capture preserves the forced prompt and exact finalized tool result", async () => {
-    const { calls, cwd } = await installReplayTool();
-    const replay = {
-      ...t6ReplaySpec("reviewer", "code-intelligence", "T6-replay-baseline", "33333333-3333-4333-8333-333333333333")!,
-      approvedStrings: new Set(["forced-safe π\r\nexact", JSON.stringify({ query: "café\r\nquery" }), "result=café\r\nquery\r\nline=π"]),
+  test("a real Pi fallback continues on the same session", async () => {
+    const { calls, cwd } = await installLateProvider();
+    const agentDir = process.env.PI_CODING_AGENT_DIR!;
+    const provider = (globalThis as { __pitakoLateProvider?: any }).__pitakoLateProvider!;
+    provider.models.push({ ...provider.models[0], id: "fallback", name: "Fallback" });
+    const originalStream = provider.streamSimple;
+    const eventStreamModule: string = "@earendil-works/pi-ai/utils/event-stream.js";
+    const { createAssistantMessageEventStream } = await import(eventStreamModule);
+    provider.streamSimple = (model: { id: string }, context: { messages?: unknown[] }) => {
+      if (model.id !== "late") return originalStream(model, context);
+      calls.push(`late:${JSON.stringify(context.messages ?? [])}`);
+      const stream = createAssistantMessageEventStream();
+      const message = {
+        role: "assistant", content: [], api: "openai-completions", provider: "pitako-late", model: model.id,
+        stopReason: "error", errorMessage: "No API key for pitako-late/late", timestamp: Date.now(),
+        usage: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 1, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      };
+      queueMicrotask(() => { stream.push({ type: "done", reason: "error", message }); stream.end(message); });
+      return stream;
     };
-    const role = { ...lateRole, id: "reviewer", modelPolicyId: "reviewer" };
-    const attempt = await createPiExecutor({ replay }).start({
-      instanceId: "reviewer-replay-fixture", role, task: "capture a synthetic tool result",
-      target: { model: "pitako-late/late", reasoning: "off" }, cwd, signal: new AbortController().signal,
-    });
-    expect(attempt.status).toBe("completed");
-    expect(attempt.result).toBe("Replay captured.");
-    expect(calls).toHaveLength(2);
-    await attempt.session?.dispose();
-
-    const replayDir = path.join(cwd, ".pitako", "runs", "code-intelligence", "evidence", "T6", "session-replay", replay.assignmentId);
-    const files = readdirSync(replayDir);
-    expect(files).toHaveLength(1);
-    expect(files[0]).toMatch(/^session-[0-9a-f-]+\.json$/);
-    const serialized = readFileSync(path.join(replayDir, files[0]!), "utf8");
-    const artifact = JSON.parse(serialized);
-    expect(artifact.checkpoints[0].systemPrompt).toBe(`forced-safe π\r\nexact`);
-    const messages = artifact.entries.filter((entry: any) => entry.type === "message").map((entry: any) => entry.message);
-    const toolCall = messages.flatMap((message: any) => message.role === "assistant" ? message.content : []).find((part: any) => part.type === "toolCall");
-    expect(toolCall.arguments.query).toBe(`café\r\nquery`);
-    const result = messages.find((message: any) => message.role === "toolResult" && message.toolName === "replay_probe");
-    expect(result.content[0].text).toBe(`result=café\r\nquery\r\nline=π`);
-    expect(serialized).not.toContain("PITAKO-REPLAY-CANARY-details");
-  }, 60_000);
-
-  test("continuation exports one history; denied export does not change the child result", async () => {
-    const { calls, cwd, agentDir } = await installReplayTool(true);
-    const replay = t6ReplaySpec("reviewer", "code-intelligence", "T6-replay-dense", "44444444-4444-4444-8444-444444444444")!;
     const userConfigPath = path.join(agentDir, "pitako", "config.toml");
     mkdirSync(path.dirname(userConfigPath), { recursive: true });
     writeFileSync(userConfigPath, [
-      "[model_policies.reviewer.primary]", 'model = "pitako-late/late"', 'reasoning = "off"',
-      "[[model_policies.reviewer.fallbacks]]", 'model = "pitako-late/fallback"', 'reasoning = "high"', "",
+      "[model_policies.developer.primary]", 'model = "pitako-late/late"', 'reasoning = "off"',
+      "[[model_policies.developer.fallbacks]]", 'model = "pitako-late/fallback"', 'reasoning = "high"', "",
     ].join("\n"));
     const result = await runAgentInstance({
-      roleId: "reviewer", task: "continue from one synthetic tool result", cwd,
-      executor: createPiExecutor({ replay }), load: { env: { PI_CODING_AGENT_DIR: agentDir }, userConfigPath },
+      roleId: "developer", task: "say-pong-marker", cwd,
+      executor: createPiExecutor(), load: { env: { PI_CODING_AGENT_DIR: agentDir }, userConfigPath },
     });
     expect(result.status).toBe("completed");
+    expect(result.result).toBe("pong");
     expect(result.model.fallbackOccurred).toBe(true);
-    expect(calls[0]).toBe("late:toolUse");
-    expect(calls.some((call) => call === "late:error")).toBe(true);
-    expect(calls.at(-1)).toBe("fallback:stop");
-    const replayDir = path.join(cwd, ".pitako", "runs", "code-intelligence", "evidence", "T6", "session-replay", replay.assignmentId);
-    const files = readdirSync(replayDir);
-    expect(files).toHaveLength(1);
-    const artifact = JSON.parse(readFileSync(path.join(replayDir, files[0]!), "utf8"));
-    expect(artifact.status).toBe("redacted");
-    expect(artifact.checkpoints[0]?.systemPrompt?.type === "redacted" && artifact.checkpoints[0]?.systemPrompt?.reason === "privacy").toBe(true);
-    const messages = artifact.entries.filter((entry: any) => entry.type === "message").map((entry: any) => entry.message);
-    expect(messages.filter((message: any) => message.role === "toolResult" && message.toolName === "replay_probe")).toHaveLength(1);
-    expect(messages.flatMap((message: any) => message.role === "assistant" ? message.content : []).filter((part: any) => part.type === "toolCall" && part.name === "replay_probe")).toHaveLength(1);
-    expect(artifact.events.filter((event: any) => event.type === "prompt_start").map((event: any) => event.continuation)).toEqual([false, true]);
-
-    const denied = await installReplayTool();
-    const deniedSpec = t6ReplaySpec("reviewer", "code-intelligence", "T6-replay-baseline", "55555555-5555-4555-8555-555555555555")!;
-    const outside = path.join(denied.cwd, "outside");
-    mkdirSync(outside);
-    const parent = path.join(denied.cwd, ".pitako", "runs", "code-intelligence", "evidence", "T6", "session-replay");
-    mkdirSync(parent, { recursive: true });
-    symlinkSync(outside, path.join(parent, deniedSpec.assignmentId), "dir");
-    const deniedResult = await createPiExecutor({ replay: deniedSpec }).start({
-      instanceId: "reviewer-denied-fixture", role: { ...lateRole, id: "reviewer", modelPolicyId: "reviewer" },
-      task: "finish without a diagnostic export", target: { model: "pitako-late/late", reasoning: "off" },
-      cwd: denied.cwd, signal: new AbortController().signal,
-    });
-    expect(deniedResult.status).toBe("completed");
-    expect(deniedResult.result).toBe("Replay captured.");
-    await deniedResult.session?.dispose();
-    expect(readdirSync(outside)).toEqual([]);
+    expect(calls.map((call) => call.split(":")[0])).toEqual(["late", "fallback"]);
+    expect(calls[1]).toContain("say-pong-marker");
   }, 60_000);
 
   test("a real AgentInstance through Pi preserves observed model and usage", async () => {

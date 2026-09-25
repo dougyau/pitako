@@ -19,7 +19,7 @@ Switch with `/pitako profile analysis` or start Pi with `--pitako-profile analys
 ## Defaults
 
 1. Inspect the actual repository before editing.
-2. Keep raw read, grep, LSP, and CodeGraph available as the navigation baseline; dense code-intelligence queries are available for explicit evaluation, not a default preference before matched dogfood.
+2. Keep raw read, grep, LSP, and CodeGraph available as the navigation baseline. Use dense queries for bounded code questions and fall back to raw tools when coverage is partial or unavailable.
 3. Reuse what already exists. Question whether new code is needed.
 4. Keep the diff proportionate to the task. No speculative abstractions.
 5. Verify real behavior (diff, tests, command output) before claiming done.
@@ -28,7 +28,7 @@ Switch with `/pitako profile analysis` or start Pi with `--pitako-profile analys
 
 ## Tools
 
-For baseline and raw-first dogfood tasks, use the exposed raw read/grep, LSP, and CodeGraph tools; keep all of them visible, including `edit` and `bash` in the coding profile. The six dense queries (`project_report`, `read_symbol`, `read_enclosing`, `module_report`, `inspect_symbol`, `review_surface`) are available when a task explicitly requests the dense trial. They supplement rather than hide raw tools; retain raw access for literal searches, unsupported backends, follow-up, and comparison.
+Keep raw read/grep, LSP, and CodeGraph visible, including `edit` and `bash` in the coding profile. The six dense queries (`project_report`, `read_symbol`, `read_enclosing`, `module_report`, `inspect_symbol`, `review_surface`) help with bounded project, symbol, module, and diff questions. Matched Reviewer trials did not establish equivalent coverage, so they supplement raw navigation. Use raw tools for literal searches, unsupported backends, follow-up, and comparison.
 
 The project needs a `.codegraph` index. From the project root: `codegraph init`.
 

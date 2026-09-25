@@ -19,7 +19,6 @@ import {
 import { listObservations, noteResultTaken, observationEpoch, publishObservation } from "./observe.ts";
 import { currentInstanceId } from "./scope.ts";
 import { createPiExecutor } from "./pi.ts";
-import { t6ReplaySpec } from "./replay.ts";
 import { formatAgentResult, formatTeamExecutionSummary, runAgentInstance, teamExecutionSummary } from "./run.ts";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -133,7 +132,6 @@ function registerTeamTools(pi: ExtensionAPI): void {
         let durableWatch: { planId: string; unitId: string } | undefined;
         try {
           const watch = interestFrom(params.plan, params.unit);
-          const replay = t6ReplaySpec(params.role, params.plan, params.unit, id);
           const topic = await teamBoardTopic(params.boardTopicId, watch?.planId, ctx.cwd);
           if (watch && topic !== undefined && existsSync(planFile(watch.planId, ctx.cwd))) {
             durableWatch = watch;
@@ -150,7 +148,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
             cwd: ctx.cwd,
             foreground: signal,
             watch,
-            executor: replay ? createPiExecutor({ replay }) : backgroundExecutor(),
+            executor: backgroundExecutor(),
             teamOwner: {
               token: admission.token,
               assignmentId: id,

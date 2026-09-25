@@ -457,7 +457,7 @@ reasoning = "medium"
     expect(childSessionNote("architect-1")).not.toContain("whatever the user selected");
     const instructions = childInstructions(resolveRole("architect", { env: tempEnv() }), "architect-1");
     expect(instructions).toContain("ModelPolicy");
-    expect(instructions).toContain("dense code-intelligence queries are for explicit evaluation");
+    expect(instructions).toContain("Use dense queries for bounded code questions; fall back to raw when needed.");
   });
 
   test("500 status code (no body) is unavailable", () => {
