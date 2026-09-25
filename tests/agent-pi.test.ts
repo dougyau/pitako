@@ -634,7 +634,7 @@ describe("extension provider bind", () => {
       const message = fetchMode === "rate_limit" && tierRejected
         ? "429 rate limit"
         : tierRejected
-          ? "Unsupported value for service_tier"
+          ? "Unsupported service_tier: priority"
           : "Offline request intercepted";
       return new Response(JSON.stringify({ error: { message } }), {
         status,
@@ -655,13 +655,13 @@ describe("extension provider bind", () => {
         expect(codex.requests?.[0]).toMatchObject({
           model: "openai-codex/gpt-6-luna",
           fast_requested: true,
-          requested_service_tier: "fast",
+          requested_service_tier: "priority",
           returned_service_tier: "unavailable",
           time_to_first_model_output_ms: "unavailable",
           time_to_first_model_output_unavailable_reason: "failed",
         });
-        expect(websocketBodies[0]).toMatchObject({ type: "response.create", service_tier: "fast", pitako_payload_hook: "retained" });
-        expect(httpBodies[0]).toMatchObject({ service_tier: "fast", pitako_payload_hook: "retained" });
+        expect(websocketBodies[0]).toMatchObject({ type: "response.create", service_tier: "priority", pitako_payload_hook: "retained" });
+        expect(httpBodies[0]).toMatchObject({ service_tier: "priority", pitako_payload_hook: "retained" });
       } finally {
         await codex.session?.dispose();
       }

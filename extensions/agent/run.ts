@@ -481,7 +481,7 @@ async function executeTargets(
         return done("completed", attempt.result, target, index);
       }
       lastError = attempt.error ?? "agent failed";
-      if (attempt.failureKind === "configuration") {
+      if (attempt.failureKind === "configuration" || isServiceTierRejection(lastError)) {
         return done("failed", lastError, target, index);
       }
       const reason = classifyProviderFailure(attempt.status === "cancelled" ? undefined : lastError);
