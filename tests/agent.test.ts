@@ -15,7 +15,7 @@ import { registerExecution, resolveBoardAuthor, unregisterExecution } from "../e
 import { childActiveTools } from "../extensions/profile.ts";
 import boardExtension from "../extensions/board/index.ts";
 import { openBoard } from "../extensions/board/store.ts";
-import { currentWorkspace } from "../extensions/board/workspace.ts";
+import { currentWorkspace, repositoryIdentity } from "../extensions/board/workspace.ts";
 import pitako from "../extensions/index.ts";
 import { resolveRole } from "../extensions/roles/load.ts";
 import { packageRoot } from "../extensions/stack.ts";
@@ -551,7 +551,7 @@ reasoning = "medium"
       expect(posted.isError).toBeFalsy();
       expect(String(posted.content?.[0]?.text ?? "")).not.toContain("someone-else");
       const check = await openBoard(path.join(agent, "pitako", "board.db"));
-      const workspace = currentWorkspace(repo);
+      const workspace = repositoryIdentity(repo);
       expect(check.readTopic(workspace, topicId).topic.createdBy).toBe("architect-tool");
       expect(check.readTopic(workspace, topicId).posts[0]?.author).toBe("architect-tool");
       check.close();

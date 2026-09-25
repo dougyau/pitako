@@ -1,4 +1,5 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -26,6 +27,7 @@ import { agentScope } from "../extensions/agent/scope.ts";
 import pitako from "../extensions/index.ts";
 import { childActiveTools, ORCHESTRATION_TOOLS } from "../extensions/profile.ts";
 import { packageRoot } from "../extensions/stack.ts";
+import { ledgerFile, planFile } from "../extensions/workflow.ts";
 import type { LoadOptions } from "../extensions/roles/load.ts";
 
 const tempDirs: string[] = [];
@@ -348,7 +350,7 @@ describe("background tools", () => {
     await handlers.get("session_start")?.({}, { hasUI: true, isIdle: () => idle, ui: { notify() {}, setStatus() {} }, sessionManager: { getSessionId: () => "parent" } });
     const spawn = tools.get("agent_spawn");
     if (!spawn) throw new Error("agent_spawn missing");
-    const result = await spawn.execute("call", { role: "developer", task: "change the widget", plan: "background-agent-delegation", unit: "T3" }, new AbortController().signal, undefined, { cwd: packageRoot() });
+    const result = await spawn.execute("call", { role: "developer", task: "change the widget", plan: "background-agent-delegation-test-only", unit: "T3" }, new AbortController().signal, undefined, { cwd: packageRoot() });
     expect(result.content[0].text).toContain("status: running");
     expect(hanging.started).toBeInstanceOf(Promise);
     const status = tools.get("agent_status");
@@ -379,6 +381,47 @@ describe("background tools", () => {
     } as unknown as ExtensionAPI);
     childHandlers.get("agent_settled")?.();
     expect(sent.filter((item) => (item as { child?: boolean }).child)).toEqual([]);
+  });
+
+  test("watched low-level workers inherit the pinned execution worktree", async () => {
+    const base = mkdtempSync(path.join(tmpdir(), "pitako-bg-frozen-root-"));
+    tempDirs.push(base);
+    const source = path.join(base, "source");
+    const execution = path.join(base, "execution");
+    mkdirSync(source, { recursive: true });
+    execFileSync("git", ["init", "-q", "-b", "main"], { cwd: source, stdio: "ignore" });
+    execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "initial", "-q"], { cwd: source, stdio: "ignore" });
+    execFileSync("git", ["worktree", "add", "-q", "-b", "execution", execution], { cwd: source, stdio: "ignore" });
+    const plan = planFile("background-frozen-root", source);
+    mkdirSync(path.dirname(plan), { recursive: true });
+    writeFileSync(plan, "---\nid: background-frozen-root\nrevision: 1\nstatus: frozen\n---\n\nPlan.\n");
+    const config = load();
+    const agentDir = config.env?.PI_CODING_AGENT_DIR;
+    if (!agentDir) throw new Error("test agent directory missing");
+    const previous = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    let finish!: (attempt: Attempt) => void;
+    let workerCwd = "";
+    setBackgroundExecutor({ async start(input) {
+      workerCwd = input.cwd;
+      return new Promise<Attempt>((resolve) => (finish = resolve));
+    } });
+    const tools = new Map<string, { execute: Function }>();
+    agentInstance({ registerTool(tool: { name: string; execute: Function }) { tools.set(tool.name, tool); } } as unknown as ExtensionAPI);
+    try {
+      const result = await tools.get("agent_spawn")!.execute("call", {
+        role: "developer", task: "work in pinned tree", plan: "background-frozen-root", unit: "T3",
+      }, new AbortController().signal, undefined, { cwd: execution });
+      expect(result.isError).not.toBe(true);
+      expect(workerCwd).toBe(execution);
+      expect(existsSync(ledgerFile("background-frozen-root", execution))).toBe(true);
+      finish({ status: "completed", result: "done", sideEffects: false });
+      await waitFor(result.details.instanceId);
+      expect(workerResult(result.details.instanceId).result).toBe("done");
+    } finally {
+      if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previous;
+    }
   });
 
   test("childActiveTools drops orchestration tools", () => {

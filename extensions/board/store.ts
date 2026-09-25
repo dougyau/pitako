@@ -4,7 +4,7 @@ import { DEFAULT_BOARD_AUTHOR } from "./author.ts";
 import { getBoardDbPath } from "./paths.ts";
 import { openSqlite, type SqlDatabase } from "./sqlite.ts";
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 export const BOARD_AUTHOR = "pi";
 export const BOARD_SCOPE = "global";
 
@@ -41,6 +41,9 @@ export interface Topic {
   createdAt: string;
   updatedAt: string;
   ownerPlanId: string | null;
+  planRevision: number | null;
+  planHash: string | null;
+  executionRoot: string | null;
 }
 
 export interface TopicListItem {
@@ -95,6 +98,7 @@ export interface QueryResult {
 
 export interface Board {
   close(): void;
+  migrateLegacyWorkspaces(identity: string, physicalRoots: readonly string[]): void;
   createTopic(workspace: string, input: { title: string; description?: string }, author?: string): Topic;
   listTopics(workspace: string, filter?: { status?: TopicStatus; limit?: number }): TopicList;
   findTopicOwnedByPlan(workspace: string, planId: string): number | undefined;
@@ -121,7 +125,14 @@ export interface Board {
     author?: string,
   ): Post;
   claimTopic(workspace: string, topicId: number, planId: string): Topic;
-  transitionOwnedTopic(workspace: string, topicId: number, planId: string, status: "resolved" | "closed"): Topic;
+  claimTopicExecution(workspace: string, topicId: number, planId: string, binding: { revision: number; hash: string; executionRoot: string }): Topic;
+  transitionOwnedTopic(
+    workspace: string,
+    topicId: number,
+    planId: string,
+    status: "resolved" | "closed",
+    executionBinding?: { revision: number; hash: string; executionRoot: string },
+  ): Topic;
   query(
     workspace: string,
     filter?: { topicId?: number; type?: string; author?: string; text?: string; limit?: number },
@@ -139,7 +150,10 @@ const SCHEMA_STATEMENTS = [
     created_by TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    owner_plan_id TEXT
+    owner_plan_id TEXT,
+    plan_revision INTEGER,
+    plan_hash TEXT,
+    execution_root TEXT
   )`,
   `CREATE TABLE posts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -185,26 +199,32 @@ export async function openBoard(dbPath = getBoardDbPath()): Promise<Board> {
 function initialize(db: SqlDatabase, dbPath: string): void {
   db.exec("BEGIN IMMEDIATE");
   try {
-    const version = pragmaInteger(db, "user_version");
+    let version = pragmaInteger(db, "user_version");
     if (version === 0) {
       if (tableExists(db, "topics") || tableExists(db, "posts")) {
         throw initError(dbPath, "schema version is 0 but Board tables already exist. Refusing to guess or discard data.");
       }
       for (const statement of SCHEMA_STATEMENTS) db.exec(statement);
       db.exec("CREATE UNIQUE INDEX topics_workspace_owner_plan ON topics(workspace, owner_plan_id) WHERE owner_plan_id IS NOT NULL");
-      db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+      version = SCHEMA_VERSION;
+      db.exec(`PRAGMA user_version = ${version}`);
     } else if (version === 1) {
       if (!tableExists(db, "topics") || !tableExists(db, "posts")) throw initError(dbPath, "schema v1 is incomplete. Refusing to discard or recreate it.");
       db.exec("ALTER TABLE topics ADD COLUMN owner_plan_id TEXT");
       db.exec("CREATE UNIQUE INDEX topics_workspace_owner_plan ON topics(workspace, owner_plan_id) WHERE owner_plan_id IS NOT NULL");
+      version = 2;
       db.exec("PRAGMA user_version = 2");
-    } else if (version === SCHEMA_VERSION) {
-      const column = db.prepare("PRAGMA table_info(topics)").all().some((row) => row.name === "owner_plan_id");
-      const index = db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'topics_workspace_owner_plan'").get();
-      if (!tableExists(db, "topics") || !tableExists(db, "posts") || !column || !index) throw initError(dbPath, `schema v${version} is incomplete. Refusing to discard or recreate it.`);
-    } else {
-      throw initError(dbPath, `schema version ${version} is not supported (expected ${SCHEMA_VERSION}). Refusing to migrate or discard data.`);
     }
+    if (version === 2) {
+      validateV2(db, dbPath);
+      db.exec("ALTER TABLE topics ADD COLUMN plan_revision INTEGER");
+      db.exec("ALTER TABLE topics ADD COLUMN plan_hash TEXT");
+      db.exec("ALTER TABLE topics ADD COLUMN execution_root TEXT");
+      version = 3;
+      db.exec("PRAGMA user_version = 3");
+    }
+    if (version === SCHEMA_VERSION) validateV3(db, dbPath);
+    else throw initError(dbPath, `schema version ${version} is not supported (expected ${SCHEMA_VERSION}). Refusing to migrate or discard data.`);
     db.exec("COMMIT");
   } catch (error) {
     try {
@@ -216,11 +236,52 @@ function initialize(db: SqlDatabase, dbPath: string): void {
   }
 }
 
+function validateV2(db: SqlDatabase, dbPath: string): void {
+  const columns = new Set(db.prepare("PRAGMA table_info(topics)").all().map((row) => row.name));
+  const index = db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'topics_workspace_owner_plan'").get();
+  if (!tableExists(db, "topics") || !tableExists(db, "posts") || !columns.has("owner_plan_id") || !index) {
+    throw initError(dbPath, "schema v2 is incomplete. Refusing to discard or recreate it.");
+  }
+}
+
+function validateV3(db: SqlDatabase, dbPath: string): void {
+  const columns = new Set(db.prepare("PRAGMA table_info(topics)").all().map((row) => row.name));
+  const index = db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'topics_workspace_owner_plan'").get();
+  if (!tableExists(db, "topics") || !tableExists(db, "posts") || !index ||
+    !["owner_plan_id", "plan_revision", "plan_hash", "execution_root"].every((column) => columns.has(column))) {
+    throw initError(dbPath, "schema v3 is incomplete. Refusing to discard or recreate it.");
+  }
+}
+
 class SqliteBoard implements Board {
   constructor(private readonly db: SqlDatabase) {}
 
   close(): void {
     this.db.close();
+  }
+
+  migrateLegacyWorkspaces(identity: string, physicalRoots: readonly string[]): void {
+    const workspace = requireWorkspace(identity);
+    const roots = [...new Set(physicalRoots.map((root) => requireWorkspace(root)))].filter((root) => root !== workspace);
+    if (roots.length === 0) return;
+    const placeholders = roots.map(() => "?").join(", ");
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const owners = this.db.prepare(
+        `SELECT owner_plan_id FROM topics WHERE (workspace IN (${placeholders}) OR workspace = ?) AND owner_plan_id IS NOT NULL`,
+      ).all(...roots, workspace);
+      const seen = new Set<string>();
+      for (const row of owners) {
+        const owner = text(row.owner_plan_id, "owner_plan_id");
+        if (seen.has(owner)) throw new BoardError(`plan ${owner} owns topics in multiple physical workspaces; refusing family migration`);
+        seen.add(owner);
+      }
+      this.db.prepare(`UPDATE topics SET workspace = ? WHERE workspace IN (${placeholders})`).run(workspace, ...roots);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch { /* transaction already ended */ }
+      throw error instanceof BoardError ? error : new BoardError(`Board family migration failed: ${messageOf(error)}`);
+    }
   }
 
   createTopic(workspace: string, input: { title: string; description?: string }, author = DEFAULT_BOARD_AUTHOR): Topic {
@@ -347,6 +408,25 @@ class SqliteBoard implements Board {
     return this.requireTopic(workspace, topic.id);
   }
 
+  claimTopicExecution(
+    workspace: string,
+    topicId: number,
+    planId: string,
+    binding: { revision: number; hash: string; executionRoot: string },
+  ): Topic {
+    const id = requireId(topicId, "topicId");
+    const owner = requireText(planId, "planId");
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const topic = this.claimTopicExecutionInTransaction(workspace, id, owner, binding);
+      this.db.exec("COMMIT");
+      return topic;
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch { /* transaction already ended */ }
+      throw error;
+    }
+  }
+
   claimTopic(workspace: string, topicId: number, planId: string): Topic {
     const id = requireId(topicId, "topicId");
     const owner = requireText(planId, "planId");
@@ -369,17 +449,61 @@ class SqliteBoard implements Board {
     }
   }
 
-  transitionOwnedTopic(workspace: string, topicId: number, planId: string, status: "resolved" | "closed"): Topic {
+  transitionOwnedTopic(
+    workspace: string,
+    topicId: number,
+    planId: string,
+    status: "resolved" | "closed",
+    executionBinding?: { revision: number; hash: string; executionRoot: string },
+  ): Topic {
     const id = requireId(topicId, "topicId");
     const owner = requireText(planId, "planId");
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      if (executionBinding) this.claimTopicExecutionInTransaction(workspace, id, owner, executionBinding);
+      const topic = this.requireTopic(workspace, id);
+      if (topic.ownerPlanId !== owner) throw new BoardError(`topic ${id} is not owned by plan ${owner}`);
+      if (topic.status === status) {
+        this.db.exec("COMMIT");
+        return topic;
+      }
+      const allowed = status === "resolved" ? ["open"] : ["open", "resolved"];
+      if (!allowed.includes(topic.status)) throw new BoardError(`cannot transition ${topic.status} topic to ${status}`);
+      const placeholders = allowed.map(() => "?").join(", ");
+      const result = this.db.prepare(`UPDATE topics SET status = ?, updated_at = ? WHERE id = ? AND workspace = ? AND owner_plan_id = ? AND status IN (${placeholders})`).run(status, timestamp(), id, requireWorkspace(workspace), owner, ...allowed);
+      if (result.changes !== 1) throw new BoardError(`topic ${id} lifecycle transition failed`);
+      this.db.exec("COMMIT");
+      return this.requireTopic(workspace, id);
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch { /* transaction already ended */ }
+      throw error;
+    }
+  }
+
+  private claimTopicExecutionInTransaction(
+    workspace: string,
+    id: number,
+    owner: string,
+    binding: { revision: number; hash: string; executionRoot: string },
+  ): Topic {
+    const revision = requireId(binding.revision, "revision");
+    const hash = requireText(binding.hash, "hash");
+    const root = requireExecutionRoot(binding.executionRoot);
     const topic = this.requireTopic(workspace, id);
     if (topic.ownerPlanId !== owner) throw new BoardError(`topic ${id} is not owned by plan ${owner}`);
-    if (topic.status === status) return topic;
-    const allowed = status === "resolved" ? ["open"] : ["open", "resolved"];
-    if (!allowed.includes(topic.status)) throw new BoardError(`cannot transition ${topic.status} topic to ${status}`);
-    const placeholders = allowed.map(() => "?").join(", ");
-    const result = this.db.prepare(`UPDATE topics SET status = ?, updated_at = ? WHERE id = ? AND workspace = ? AND owner_plan_id = ? AND status IN (${placeholders})`).run(status, timestamp(), id, requireWorkspace(workspace), owner, ...allowed);
-    if (result.changes !== 1) throw new BoardError(`topic ${id} lifecycle transition failed`);
+    const hasRevision = topic.planRevision !== null;
+    const hasHash = topic.planHash !== null;
+    const hasRoot = topic.executionRoot !== null;
+    if (hasRevision || hasHash || hasRoot) {
+      if (!(hasRevision && hasHash && hasRoot)) throw new BoardError(`topic ${id} has an incomplete frozen execution claim`);
+      if (topic.executionRoot !== root) throw new BoardError(`topic ${id} is pinned to execution worktree ${topic.executionRoot}`);
+      if (topic.planRevision !== revision || topic.planHash !== hash) throw new BoardError(`topic ${id} frozen plan identity does not match revision ${revision} and hash ${hash}`);
+      return topic;
+    }
+    const result = this.db.prepare(
+      "UPDATE topics SET plan_revision = ?, plan_hash = ?, execution_root = ? WHERE id = ? AND workspace = ? AND owner_plan_id = ? AND plan_revision IS NULL AND plan_hash IS NULL AND execution_root IS NULL",
+    ).run(revision, hash, root, id, requireWorkspace(workspace), owner);
+    if (result.changes !== 1) throw new BoardError(`topic ${id} frozen execution claim changed concurrently`);
     return this.requireTopic(workspace, id);
   }
 
@@ -467,7 +591,8 @@ class SqliteBoard implements Board {
     const id = requireId(topicId, "topicId");
     const row = this.db
       .prepare(
-        `SELECT id, workspace, scope, title, description, status, created_by, created_at, updated_at, owner_plan_id
+        `SELECT id, workspace, scope, title, description, status, created_by, created_at, updated_at,
+                owner_plan_id, plan_revision, plan_hash, execution_root
          FROM topics WHERE id = ?`,
       )
       .get(id);
@@ -486,6 +611,9 @@ class SqliteBoard implements Board {
       createdAt: text(row.created_at, "created_at"),
       updatedAt: text(row.updated_at, "updated_at"),
       ownerPlanId: nullableText(row.owner_plan_id, "owner_plan_id"),
+      planRevision: nullableInteger(row.plan_revision, "plan_revision"),
+      planHash: nullableText(row.plan_hash, "plan_hash"),
+      executionRoot: nullableText(row.execution_root, "execution_root"),
     };
   }
 
@@ -591,6 +719,13 @@ function requireText(value: string, label: string): string {
   return trimmed;
 }
 
+function requireExecutionRoot(value: string): string {
+  if (typeof value !== "string" || value.length === 0 || !path.isAbsolute(value)) {
+    throw new BoardError("executionRoot must be a nonempty absolute path");
+  }
+  return value;
+}
+
 function optionalText(value: string | undefined): string | null {
   if (value === undefined) return null;
   if (typeof value !== "string") throw new BoardError("expected text");
@@ -644,6 +779,11 @@ function text(value: unknown, label: string): string {
 function nullableText(value: unknown, label: string): string | null {
   if (value === null || value === undefined) return null;
   return text(value, label);
+}
+
+function nullableInteger(value: unknown, label: string): number | null {
+  if (value === null || value === undefined) return null;
+  return integer(value, label);
 }
 
 function authorOrDefault(author: string): string {

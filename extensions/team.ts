@@ -1,6 +1,6 @@
 import { retireTeamWorkers, teamWorkerHasOutcome, teamWorkerStatus } from "./agent/background.ts";
 import { executionForSession } from "./execution-identity.ts";
-import { readLedgerTeamHolds, updateLedgerTeamHold } from "./workflow.ts";
+import { readLedgerTeamHolds, updateLedgerTeamHold, type ExecutionBinding } from "./workflow.ts";
 
 const KEY = Symbol.for("pitako.teamRegistry");
 const TEAM_ROLES = new Set(["architect", "developer", "reviewer", "researcher"]);
@@ -13,6 +13,7 @@ export interface TeamAssignment {
   planId?: string;
   unitId?: string;
   boardTopicId?: number;
+  execution?: ExecutionBinding;
 }
 
 interface Evaluation {
@@ -133,6 +134,15 @@ export function teamAssignments(evaluation: TeamEvaluation): readonly { current?
   return ["architect", "developer", "reviewer", "researcher"].map((role) => current.assignments.get(role) ?? {});
 }
 
+export function teamExecutionBinding(evaluation: TeamEvaluation | undefined, planId: string): ExecutionBinding | undefined {
+  if (!evaluation) return undefined;
+  for (const slot of teamAssignments(evaluation)) {
+    const assignment = slot.current?.planId === planId ? slot.current : slot.last?.planId === planId ? slot.last : undefined;
+    if (assignment?.execution) return assignment.execution;
+  }
+  return undefined;
+}
+
 export function hasTeamRoster(evaluation: TeamEvaluation | undefined): boolean {
   if (!evaluation) return false;
   const current = registry().evaluations.get(evaluation.sessionId);
@@ -148,12 +158,23 @@ export function teamRoleReservation(evaluation: TeamEvaluation | undefined, role
 type TeamWorkStatus = "pending" | "failed" | "cancelled";
 
 /** Record or reconcile exactly one accepted assignment in its bound plan ledger. */
-export function recordPlanTeamWork(cwd: string, planId: string, unitId: string, assignmentId: string, status: TeamWorkStatus | "completed" | undefined): void {
-  updateLedgerTeamHold(cwd, planId, { assignmentId, unitId, status: status === "completed" || status === undefined ? "pending" : status }, status === "completed" || status === undefined);
+export function recordPlanTeamWork(
+  cwd: string,
+  planId: string,
+  unitId: string,
+  assignmentId: string,
+  status: TeamWorkStatus | "completed" | undefined,
+  binding?: ExecutionBinding,
+): void {
+  updateLedgerTeamHold(binding?.executionRoot ?? cwd, planId,
+    { assignmentId, unitId, status: status === "completed" || status === undefined ? "pending" : status },
+    status === "completed" || status === undefined, binding);
 }
 
 /** A resolve must not mistake an unsettled or unsuccessful Team result for success. */
-export function hasUnsettledTeamWork(evaluation: TeamEvaluation | undefined, planId: string, cwd?: string): boolean {
+export function hasUnsettledTeamWork(evaluation: TeamEvaluation | undefined, planId: string, cwd?: string, expectedBinding?: ExecutionBinding): boolean {
+  const binding = teamExecutionBinding(evaluation, planId) ?? expectedBinding;
+  if (binding) return readLedgerTeamHolds(binding.executionRoot, planId, binding).length > 0;
   if (cwd) return readLedgerTeamHolds(cwd, planId).length > 0;
   if (!evaluation) return false;
   for (const slot of teamAssignments(evaluation)) {

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -9,8 +10,9 @@ import { listObservations, publishObservation } from "../extensions/agent/observ
 import { registerExecution, unregisterExecution } from "../extensions/execution-identity.ts";
 import { beginTeamEvaluation, hasTeamRoster, hasUnsettledTeamWork, recordPlanTeamWork, reserveTeamRole, retireTeamEvaluation, teamEvaluationForSession, teamRoleReservation, teamAssignments } from "../extensions/team.ts";
 import { openBoard } from "../extensions/board/store.ts";
+import { currentWorkspace, repositoryIdentity } from "../extensions/board/workspace.ts";
 import boardExtension from "../extensions/board/index.ts";
-import { ledgerFile, ledgerTemplate, planFile, readPlan, planHash } from "../extensions/workflow.ts";
+import { ledgerFile, ledgerTemplate, openExecutionPlan, planFile, readLedgerTeamHolds, readPlan, planHash } from "../extensions/workflow.ts";
 import { packageRoot } from "../extensions/stack.ts";
 import agentExtension from "../extensions/agent/index.ts";
 import { setBackgroundExecutor } from "../extensions/agent/background.ts";
@@ -70,6 +72,20 @@ function load() {
 
 function owner(token: symbol) {
   return { token, isIdle: () => false, hasUI: false, notify() {}, sendMessage() {} };
+}
+
+function git(cwd: string, args: string[]): string {
+  return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+}
+
+function initWorktreePair(base: string, executionName = "execution"): { source: string; execution: string } {
+  const source = path.join(base, "source");
+  const execution = path.join(base, executionName);
+  mkdirSync(source, { recursive: true });
+  git(source, ["init", "-q", "-b", "main"]);
+  git(source, ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "initial", "-q"]);
+  git(source, ["worktree", "add", "-q", "-b", "execution", execution]);
+  return { source, execution };
 }
 
 async function spawn(evaluation: NonNullable<ReturnType<typeof beginTeamEvaluation>>, role: string, id: string, worker: ReturnType<typeof hanging>, onSettled: () => void, watch?: { planId: string; unitId: string }) {
@@ -342,6 +358,9 @@ describe("Team T1 ownership", () => {
     });
     const cwd = mkdtempSync(path.join(tmpdir(), "pitako-team-public-"));
     tempDirs.push(cwd);
+    const draftPlan = planFile("plan-a", cwd);
+    mkdirSync(path.dirname(draftPlan), { recursive: true });
+    writeFileSync(draftPlan, "---\nid: plan-a\nrevision: 1\nstatus: draft\n---\n\nPlanning draft.\n");
     const ctx = { cwd, sessionManager: { getSessionId: () => current.sessionId } };
     const invoke = (name: string, params: unknown) => tools.get(name)!.execute("call", params, new AbortController().signal, undefined, ctx);
     const status = await invoke("team_status", {});
@@ -352,6 +371,7 @@ describe("Team T1 ownership", () => {
     expect((await invoke("team_assign", { role: "architect", task: "unrelated", boardTopicId: "1" })).isError).toBe(true);
     const firstAssignment = await invoke("team_assign", { role: "developer", task: "Inspect lease\nsecond line", plan: "plan-a", unit: "unit-a" });
     expect(firstAssignment.isError).toBe(false);
+    expect(existsSync(ledgerFile("plan-a", cwd))).toBe(false);
     expect((await invoke("team_assign", { role: "researcher", task: "Inspect evidence" })).isError).toBe(false);
     await Promise.all(workers.map((worker) => worker.started));
     expect(workers).toHaveLength(2);
@@ -550,11 +570,9 @@ describe("Team T1 ownership", () => {
     expect((await invoke({ role: "architect", task: "existing unbound explicit", plan: "empty-plan", unit: "x", boardTopicId: "3" })).isError).toBe(true);
     expect(tasks).toHaveLength(0);
     rmSync(boundLedger);
-    expect((await invoke({ role: "architect", task: "gate missing", plan: "bound-plan", unit: "T2", boardTopicId: "1" })).isError).toBe(true);
-    expect(tasks).toHaveLength(0);
-    writeFileSync(boundLedger, ledgerTemplate(boundMeta));
     const boundResult = await invoke({ role: "architect", task: "bound", plan: "bound-plan", unit: "T2", boardTopicId: "1" });
     expect(boundResult).toMatchObject({ isError: false });
+    expect(existsSync(boundLedger)).toBe(true);
     expect(tasks.at(-1)).toContain("Board topic 1");
     const assigned = boundResult.details as { id: string };
     await tools.get("team_cancel")!.execute("cancel", { assignmentId: assigned.id }, undefined, undefined, { cwd, sessionManager: { getSessionId: () => current.sessionId } });
@@ -576,6 +594,403 @@ describe("Team T1 ownership", () => {
     topicsAfterDispatch.close();
     finishes.forEach((finish) => finish(completed()));
     await new Promise((resolve) => setTimeout(resolve, 20));
+  });
+
+  test("all Team roles inherit the execution worktree from a sibling frozen plan", async () => {
+    const base = mkdtempSync(path.join(tmpdir(), "pitako-team-execution-root-"));
+    tempDirs.push(base);
+    const { source, execution } = initWorktreePair(base);
+    const id = "team-execution-root";
+    const sourcePlan = planFile(id, source);
+    mkdirSync(path.dirname(sourcePlan), { recursive: true });
+    writeFileSync(sourcePlan, `---\nid: ${id}\nrevision: 1\nstatus: frozen\n---\n\nSibling source.\n`);
+    const config = load();
+    previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = config.env.PI_CODING_AGENT_DIR;
+    const current = evaluation("team-four-roles-execution-root");
+    const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
+    agentExtension({ registerTool: (tool: any) => tools.set(tool.name, tool) } as unknown as ExtensionAPI);
+    const workers: { cwd: string; finish: (attempt: Attempt) => void }[] = [];
+    setBackgroundExecutor({ async start(input) {
+      return new Promise<Attempt>((resolve) => workers.push({ cwd: input.cwd, finish: resolve }));
+    } });
+    const ctx = { cwd: execution, sessionManager: { getSessionId: () => current.sessionId } };
+    for (const role of ["architect", "developer", "reviewer", "researcher"]) {
+      const result = await tools.get("team_assign")!.execute("call", {
+        role, task: `work as ${role}`, plan: id, unit: "T3",
+      }, new AbortController().signal, undefined, ctx);
+      expect(result.isError).toBe(false);
+      expect((result.details as { execution: { executionRoot: string } }).execution.executionRoot).toBe(execution);
+    }
+    for (let i = 0; i < 50 && workers.length !== 4; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(workers).toHaveLength(4);
+    expect(workers.map((worker) => worker.cwd)).toEqual([execution, execution, execution, execution]);
+    expect(existsSync(ledgerFile(id, execution))).toBe(true);
+    workers.forEach((worker) => worker.finish(completed()));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  });
+
+  test("cold concurrent watched assignments admit only one execution root", async () => {
+    const base = mkdtempSync(path.join(tmpdir(), "pitako-team-cold-admission-"));
+    tempDirs.push(base);
+    const { source, execution: executionA } = initWorktreePair(base);
+    const executionB = path.join(base, "execution-b");
+    git(source, ["worktree", "add", "-q", "-b", "execution-b", executionB]);
+    const id = "team-cold-admission";
+    const sourcePlan = planFile(id, source);
+    mkdirSync(path.dirname(sourcePlan), { recursive: true });
+    writeFileSync(sourcePlan, `---\nid: ${id}\nrevision: 1\nstatus: frozen\n---\n\nSibling source.\n`);
+    const config = load();
+    previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = config.env.PI_CODING_AGENT_DIR;
+    const first = evaluation("team-cold-admission-a");
+    const second = evaluation("team-cold-admission-b");
+    const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
+    agentExtension({ registerTool: (tool: any) => tools.set(tool.name, tool) } as unknown as ExtensionAPI);
+    const started: string[] = [];
+    setBackgroundExecutor({ async start(input) {
+      started.push(input.cwd);
+      return completed("started");
+    } });
+    const assign = (team: ReturnType<typeof evaluation>, role: string, cwd: string, planId = id) =>
+      tools.get("team_assign")!.execute("call", { role, task: `work in ${cwd}`, plan: planId, unit: "T3" }, new AbortController().signal, undefined, {
+        cwd, sessionManager: { getSessionId: () => team.sessionId },
+      });
+
+    const results = await Promise.all([
+      assign(first, "developer", executionA),
+      assign(second, "researcher", executionB),
+    ]);
+    const accepted = results.filter((result) => !result.isError);
+    const rejected = results.filter((result) => result.isError);
+    expect(accepted).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]!.content[0]!.text).toContain("competing ledger");
+    const assignment = accepted[0]!.details as { execution: { executionRoot: string } };
+    expect([executionA, executionB]).toContain(assignment.execution.executionRoot);
+    expect(started).toEqual([assignment.execution.executionRoot]);
+    expect(existsSync(ledgerFile(id, assignment.execution.executionRoot))).toBe(true);
+    const loser = assignment.execution.executionRoot === executionA ? executionB : executionA;
+    expect(existsSync(ledgerFile(id, loser))).toBe(false);
+
+    const sequentialId = "team-sequential-admission";
+    const sequentialPlan = planFile(sequentialId, source);
+    writeFileSync(sequentialPlan, `---\nid: ${sequentialId}\nrevision: 1\nstatus: frozen\n---\n\nSibling source.\n`);
+    const firstRoot = await assign(first, "architect", executionA, sequentialId);
+    const secondRoot = await assign(second, "reviewer", executionB, sequentialId);
+    expect(firstRoot.isError).toBe(false);
+    expect((firstRoot.details as { execution: { executionRoot: string } }).execution.executionRoot).toBe(executionA);
+    expect(secondRoot.isError).toBe(true);
+    expect(secondRoot.content[0]!.text).toContain("competing ledger");
+    expect(started).toEqual([assignment.execution.executionRoot, executionA]);
+    expect(existsSync(ledgerFile(sequentialId, executionA))).toBe(true);
+    expect(existsSync(ledgerFile(sequentialId, executionB))).toBe(false);
+  });
+
+  test("failed Team assignment leaves topic unpinned until ledger admission succeeds", async () => {
+    const base = mkdtempSync(path.join(tmpdir(), "pitako-team-topic-admission-"));
+    tempDirs.push(base);
+    const { source, execution: executionA } = initWorktreePair(base);
+    const executionB = path.join(base, "execution-b");
+    git(source, ["worktree", "add", "-q", "-b", "execution-b", executionB]);
+    const id = "team-topic-admission";
+    const config = load();
+    previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = config.env.PI_CODING_AGENT_DIR;
+
+    const board = await openBoard();
+    const topic = board.createTopic(repositoryIdentity(source), { title: "Unpinned execution" });
+    board.claimTopic(repositoryIdentity(source), topic.id, id);
+    board.close();
+    const sourcePlan = planFile(id, source);
+    mkdirSync(path.dirname(sourcePlan), { recursive: true });
+    writeFileSync(sourcePlan, `---\nid: ${id}\nrevision: 1\nstatus: frozen\nboard_topic_id: ${topic.id}\nexecution: expected\n---\n\nPlan.\n`);
+    openExecutionPlan(id, executionB);
+
+    const teamA = evaluation("team-topic-admission-a");
+    const teamB = evaluation("team-topic-admission-b");
+    const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
+    agentExtension({ registerTool: (tool: any) => tools.set(tool.name, tool) } as unknown as ExtensionAPI);
+    const started: string[] = [];
+    setBackgroundExecutor({ async start(input) { started.push(input.cwd); return completed(); } });
+    const assign = (team: ReturnType<typeof evaluation>, cwd: string) => tools.get("team_assign")!.execute("assign", {
+      role: "developer", task: "claim only after admission", plan: id, unit: "T4",
+    }, new AbortController().signal, undefined, { cwd, sessionManager: { getSessionId: () => team.sessionId } });
+
+    const rejected = await assign(teamA, executionA);
+    expect(rejected.isError).toBe(true);
+    expect(rejected.content[0]!.text).toContain("competing ledger");
+    expect(existsSync(ledgerFile(id, executionA))).toBe(false);
+    const afterReject = await openBoard();
+    expect(afterReject.readTopic(repositoryIdentity(executionA), topic.id).topic).toMatchObject({
+      planRevision: null, planHash: null, executionRoot: null,
+    });
+    afterReject.close();
+
+    const accepted = await assign(teamB, executionB);
+    expect(accepted.isError).toBe(false);
+    expect(started).toEqual([executionB]);
+    expect((accepted.details as { execution: { executionRoot: string } }).execution.executionRoot).toBe(executionB);
+    const afterAccept = await openBoard();
+    expect(afterAccept.readTopic(repositoryIdentity(executionB), topic.id).topic.executionRoot).toBe(executionB);
+    afterAccept.close();
+  });
+
+  test("Team result and lifecycle keep using captured execution ledger after cwd changes", async () => {
+    const base = mkdtempSync(path.join(tmpdir(), "pitako-team-result-root-"));
+    tempDirs.push(base);
+    const { source, execution } = initWorktreePair(base, "execution ");
+    const id = "team-result-root";
+    const config = load();
+    previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = config.env.PI_CODING_AGENT_DIR;
+    const workspace = currentWorkspace(execution);
+    const board = await openBoard();
+    const topic = board.createTopic(workspace, { title: "Bound execution" });
+    board.claimTopic(workspace, topic.id, id);
+    board.close();
+    const sourcePlan = planFile(id, source);
+    mkdirSync(path.dirname(sourcePlan), { recursive: true });
+    const planText = `---\nid: ${id}\nrevision: 1\nstatus: frozen\nboard_topic_id: ${topic.id}\nexecution: expected\n---\n\nSibling source.\n`;
+    writeFileSync(sourcePlan, planText);
+    const opened = openExecutionPlan(id, execution);
+    const current = evaluation("team-result-cwd-change");
+    const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
+    boardExtension({ registerTool: (tool: any) => tools.set(tool.name, tool), registerFlag() {}, registerCommand() {}, on() {} } as unknown as ExtensionAPI);
+    agentExtension({ registerTool: (tool: any) => tools.set(tool.name, tool) } as unknown as ExtensionAPI);
+    let finish!: (attempt: Attempt) => void;
+    let workerCwd = "";
+    setBackgroundExecutor({ async start(input) {
+      workerCwd = input.cwd;
+      return new Promise<Attempt>((resolve) => (finish = resolve));
+    } });
+    const executionCtx = { cwd: execution, sessionManager: { getSessionId: () => current.sessionId } };
+    const assigned = await tools.get("team_assign")!.execute("call", {
+      role: "developer", task: "edit execution tree", plan: id, unit: "T3",
+    }, new AbortController().signal, undefined, executionCtx);
+    expect(assigned.isError).toBe(false);
+    const assignment = assigned.details as { id: string; instanceId: string; execution: { executionRoot: string } };
+    expect(workerCwd).toBe(execution);
+    expect(assignment.execution.executionRoot).toBe(execution);
+    expect(readLedgerTeamHolds(execution, id, opened.binding)).toEqual([
+      { assignmentId: assignment.id, unitId: "T3", status: "pending" },
+    ]);
+    const ledger = ledgerFile(id, execution);
+    writeFileSync(ledger, readFileSync(ledger, "utf8").replace("status: running", "status: completed"));
+    const sourceCtx = { cwd: source, sessionManager: executionCtx.sessionManager };
+    const foreignRootLifecycle = await tools.get("board_workflow_lifecycle")!.execute("call", {
+      planId: id, status: "resolved",
+    }, undefined, undefined, sourceCtx);
+    expect(foreignRootLifecycle.isError).toBe(true);
+    expect(foreignRootLifecycle.content[0].text).toContain("does not match Board topic execution worktree");
+    const blockedLifecycle = await tools.get("board_workflow_lifecycle")!.execute("call", {
+      planId: id, status: "resolved",
+    }, undefined, undefined, executionCtx);
+    expect(blockedLifecycle.isError).toBe(true);
+    expect(blockedLifecycle.content[0].text).toContain("Team work for this plan is pending");
+
+    finish(completed("result"));
+    for (let i = 0; i < 50 && teamWorkerStatus(current.token, assignment.instanceId)[0]?.status !== "completed"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    const result = await tools.get("team_result")!.execute("call", { assignmentId: assignment.id }, undefined, undefined, sourceCtx);
+    expect(result.content[0].text).toContain(`execution summary: assignment=${assignment.id}`);
+    expect(result.content[0].text).toMatch(/\n\nresult$/);
+    expect(readLedgerTeamHolds(execution, id, opened.binding)).toEqual([]);
+    expect(existsSync(ledgerFile(id, source))).toBe(false);
+    const resolved = await tools.get("board_workflow_lifecycle")!.execute("call", {
+      planId: id, status: "resolved",
+    }, undefined, undefined, executionCtx);
+    expect(resolved.isError).not.toBe(true);
+    const finalBoard = await openBoard();
+    expect(finalBoard.readTopic(repositoryIdentity(execution), topic.id).topic.status).toBe("resolved");
+    finalBoard.close();
+  });
+
+  test("lifecycle rejects leave execution topic unpinned and allow execution from B", async () => {
+    const base = mkdtempSync(path.join(tmpdir(), "pitako-lifecycle-topic-preflight-"));
+    tempDirs.push(base);
+    const { source, execution } = initWorktreePair(base);
+    const id = "lifecycle-topic-preflight";
+    const config = load();
+    previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = config.env.PI_CODING_AGENT_DIR;
+
+    const board = await openBoard();
+    const topic = board.createTopic(repositoryIdentity(source), { title: "Expected execution" });
+    board.claimTopic(repositoryIdentity(source), topic.id, id);
+    board.close();
+    const sourcePlan = planFile(id, source);
+    mkdirSync(path.dirname(sourcePlan), { recursive: true });
+    writeFileSync(sourcePlan, `---\nid: ${id}\nrevision: 1\nstatus: frozen\nboard_topic_id: ${topic.id}\nexecution: expected\n---\n\nPlan.\n`);
+
+    const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
+    boardExtension({ registerTool: (tool: any) => tools.set(tool.name, tool), registerFlag() {}, registerCommand() {}, on() {} } as unknown as ExtensionAPI);
+    agentExtension({ registerTool: (tool: any) => tools.set(tool.name, tool) } as unknown as ExtensionAPI);
+    const lifecycle = tools.get("board_workflow_lifecycle")!;
+    const fromA = { cwd: source, sessionManager: { getSessionId: () => "lifecycle-preflight-a" } };
+    const noLedger = await lifecycle.execute("no-ledger", { planId: id, status: "resolved" }, undefined, undefined, fromA);
+    expect(noLedger.isError).toBe(true);
+    expect(noLedger.content[0]!.text).toContain("only after the ledger is completed");
+    const afterNoLedger = await openBoard();
+    expect(afterNoLedger.readTopic(repositoryIdentity(source), topic.id).topic).toMatchObject({
+      status: "open", planRevision: null, planHash: null, executionRoot: null,
+    });
+    afterNoLedger.close();
+
+    const meta = readPlan(id, source).meta;
+    const ledger = ledgerFile(id, source);
+    mkdirSync(path.dirname(ledger), { recursive: true });
+    writeFileSync(ledger, ledgerTemplate(meta));
+    recordPlanTeamWork(source, id, "T4", "pending-assignment", "pending");
+    writeFileSync(ledger, readFileSync(ledger, "utf8").replace("status: running", "status: completed"));
+    const pendingHold = await lifecycle.execute("pending-hold", { planId: id, status: "resolved" }, undefined, undefined, fromA);
+    expect(pendingHold.isError).toBe(true);
+    expect(pendingHold.content[0]!.text).toContain("Team work for this plan is pending");
+    const afterPendingHold = await openBoard();
+    expect(afterPendingHold.readTopic(repositoryIdentity(source), topic.id).topic).toMatchObject({
+      status: "open", planRevision: null, planHash: null, executionRoot: null,
+    });
+    afterPendingHold.close();
+    rmSync(ledger);
+
+    const current = evaluation("lifecycle-topic-preflight-b");
+    const started: string[] = [];
+    setBackgroundExecutor({ async start(input) { started.push(input.cwd); return completed(); } });
+    const assigned = await tools.get("team_assign")!.execute("assign", {
+      role: "developer", task: "continue from B", plan: id, unit: "T4",
+    }, new AbortController().signal, undefined, { cwd: execution, sessionManager: { getSessionId: () => current.sessionId } });
+    expect(assigned.isError).toBe(false);
+    expect(started).toEqual([execution]);
+    const afterB = await openBoard();
+    expect(afterB.readTopic(repositoryIdentity(execution), topic.id).topic.executionRoot).toBe(execution);
+    afterB.close();
+
+    const closeId = "lifecycle-close-no-pin";
+    const closeTopic = await openBoard();
+    const abandoned = closeTopic.createTopic(repositoryIdentity(source), { title: "Abandon without pin" });
+    closeTopic.claimTopic(repositoryIdentity(source), abandoned.id, closeId);
+    closeTopic.close();
+    const closePlan = planFile(closeId, source);
+    writeFileSync(closePlan, `---\nid: ${closeId}\nrevision: 1\nstatus: frozen\nboard_topic_id: ${abandoned.id}\n---\n\nPlan.\n`);
+    const closed = await lifecycle.execute("close", { planId: closeId, status: "closed" }, undefined, undefined, fromA);
+    expect(closed.isError).toBeFalsy();
+    const afterClose = await openBoard();
+    expect(afterClose.readTopic(repositoryIdentity(source), abandoned.id).topic).toMatchObject({
+      status: "closed", planRevision: null, planHash: null, executionRoot: null,
+    });
+    afterClose.close();
+  });
+
+  test("T4 migrates A topic into family, pins Team B, and lifecycle reload validates B ledger", async () => {
+    const base = mkdtempSync(path.join(tmpdir(), "pitako-team-family-lifecycle-"));
+    tempDirs.push(base);
+    const { source, execution } = initWorktreePair(base);
+    const id = "family-lifecycle";
+    const config = load();
+    previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = config.env.PI_CODING_AGENT_DIR;
+
+    const board = await openBoard();
+    const topic = board.createTopic(currentWorkspace(source), { title: "A-owned topic" });
+    board.claimTopic(currentWorkspace(source), topic.id, id);
+    const originalPost = board.post(currentWorkspace(source), { topicId: topic.id, type: "FINDING", content: "legacy post stays" });
+    board.close();
+    const sourcePlan = planFile(id, source);
+    mkdirSync(path.dirname(sourcePlan), { recursive: true });
+    writeFileSync(sourcePlan, `---\nid: ${id}\nrevision: 4\nstatus: frozen\nboard_topic_id: ${topic.id}\nexecution: expected\n---\n\nFrozen family plan.\n`);
+
+    const current = evaluation("team-family-admission");
+    const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
+    boardExtension({ registerTool: (tool: any) => tools.set(tool.name, tool), registerFlag() {}, registerCommand() {}, on() {} } as unknown as ExtensionAPI);
+    agentExtension({ registerTool: (tool: any) => tools.set(tool.name, tool) } as unknown as ExtensionAPI);
+    let finish!: (attempt: Attempt) => void;
+    setBackgroundExecutor({ async start() { return new Promise<Attempt>((resolve) => (finish = resolve)); } });
+    const context = { cwd: execution, sessionManager: { getSessionId: () => current.sessionId } };
+    const assigned = await tools.get("team_assign")!.execute("assign", {
+      role: "developer", task: "work from B", plan: id, unit: "T4",
+    }, new AbortController().signal, undefined, context);
+    expect(assigned.isError).toBe(false);
+    const assignment = assigned.details as { id: string; instanceId: string; execution: { executionRoot: string } };
+    expect(assignment.execution.executionRoot).toBe(execution);
+
+    const familyBoard = await openBoard();
+    const familyTopic = familyBoard.readTopic(repositoryIdentity(execution), topic.id);
+    expect(familyTopic.topic).toMatchObject({ ownerPlanId: id, planRevision: 4, executionRoot: execution });
+    expect(familyTopic.posts.map((post) => post.id)).toEqual([originalPost.id]);
+    expect(familyBoard.listTopics(repositoryIdentity(execution)).total).toBe(1);
+    familyBoard.close();
+
+    const ledger = ledgerFile(id, execution);
+    let completedLedger = readFileSync(ledger, "utf8").replace("status: running", "status: completed");
+    writeFileSync(ledger, completedLedger);
+    const reloadedContext = { cwd: execution, sessionManager: { getSessionId: () => "team-family-reloaded-without-roster" } };
+    const lifecycle = tools.get("board_workflow_lifecycle")!;
+    const pending = await lifecycle.execute("pending", { planId: id, status: "resolved" }, undefined, undefined, reloadedContext);
+    expect(pending.isError).toBe(true);
+    expect(pending.content[0].text).toContain("Team work for this plan is pending");
+
+    finish(completed("B result"));
+    for (let i = 0; i < 50 && teamWorkerStatus(current.token, assignment.instanceId)[0]?.status !== "completed"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    const result = await tools.get("team_result")!.execute("result", { assignmentId: assignment.id }, undefined, undefined, context);
+    expect(result.content[0].text).toContain(`execution summary: assignment=${assignment.id}`);
+    expect(result.content[0].text).toMatch(/\n\nB result$/);
+    completedLedger = readFileSync(ledger, "utf8");
+
+    mkdirSync(path.dirname(ledgerFile(id, source)), { recursive: true });
+    writeFileSync(ledgerFile(id, source), completedLedger);
+    rmSync(ledger);
+    const copied = await lifecycle.execute("copied", { planId: id, status: "resolved" }, undefined, undefined, reloadedContext);
+    expect(copied.isError).toBe(true);
+    expect(copied.content[0].text).toContain("competing ledger");
+    expect(existsSync(ledger)).toBe(false);
+
+    writeFileSync(ledger, completedLedger);
+    rmSync(ledgerFile(id, source));
+    const resolved = await lifecycle.execute("resolved", { planId: id, status: "resolved" }, undefined, undefined, reloadedContext);
+    expect(resolved.isError).not.toBe(true);
+    const finalBoard = await openBoard();
+    expect(finalBoard.readTopic(repositoryIdentity(execution), topic.id).topic.status).toBe("resolved");
+    finalBoard.close();
+  });
+
+  test("Team B refuses a Board topic already pinned to physical root A before ledger changes", async () => {
+    const base = mkdtempSync(path.join(tmpdir(), "pitako-team-foreign-root-"));
+    tempDirs.push(base);
+    const { source, execution } = initWorktreePair(base);
+    const id = "foreign-team-root";
+    const config = load();
+    previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = config.env.PI_CODING_AGENT_DIR;
+    const topicBoard = await openBoard();
+    const topic = topicBoard.createTopic(currentWorkspace(source), { title: "Pinned to A" });
+    topicBoard.claimTopic(currentWorkspace(source), topic.id, id);
+    const sourcePlan = planFile(id, source);
+    mkdirSync(path.dirname(sourcePlan), { recursive: true });
+    const planText = `---\nid: ${id}\nrevision: 1\nstatus: frozen\nboard_topic_id: ${topic.id}\nexecution: expected\n---\n\nPlan.\n`;
+    writeFileSync(sourcePlan, planText);
+    topicBoard.claimTopicExecution(currentWorkspace(source), topic.id, id, {
+      revision: 1, hash: planHash(planText), executionRoot: source,
+    });
+    topicBoard.close();
+
+    const current = evaluation("team-foreign-root-admission");
+    const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
+    agentExtension({ registerTool: (tool: any) => tools.set(tool.name, tool) } as unknown as ExtensionAPI);
+    let started = false;
+    setBackgroundExecutor({ async start() { started = true; return completed(); } });
+    const result = await tools.get("team_assign")!.execute("assign", {
+      role: "developer", task: "must not start", plan: id, unit: "T4",
+    }, new AbortController().signal, undefined, { cwd: execution, sessionManager: { getSessionId: () => current.sessionId } });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("pinned to execution worktree");
+    expect(started).toBe(false);
+    expect(existsSync(ledgerFile(id, execution))).toBe(false);
+    const checked = await openBoard();
+    expect(checked.readTopic(repositoryIdentity(execution), topic.id).topic.executionRoot).toBe(source);
+    checked.close();
   });
 
   test("/pitako team is compact, stable, session-scoped, and does not create a roster", async () => {

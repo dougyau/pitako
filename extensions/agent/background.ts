@@ -3,10 +3,12 @@ import { createPiExecutor } from "./pi.ts";
 import { clearObservations, noteResultTaken, observationEpoch, publishObservation, removeTeamObservations, removeUntaggedObservations } from "./observe.ts";
 import { runAgentInstance, type AgentRunResult, type AttemptExecutor } from "./run.ts";
 import type { LoadOptions } from "../roles/load.ts";
+import type { ExecutionBinding } from "../workflow.ts";
 
 export interface WorkerInterest {
   planId: string;
   unitId: string;
+  execution?: ExecutionBinding;
 }
 
 export interface WorkerHandle {
@@ -132,6 +134,7 @@ export async function spawnBackground(input: {
     roleId: input.roleId,
     task: input.task,
     cwd: input.cwd,
+    executionRoot: input.watch?.execution?.executionRoot,
     signal: controller.signal,
     executor: input.executor,
     load: input.load,

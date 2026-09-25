@@ -223,6 +223,8 @@ export async function runAgentInstance(input: {
   signal?: AbortSignal;
   executor: AttemptExecutor;
   load?: LoadOptions;
+  /** Physical root captured from the frozen execution ledger. */
+  executionRoot?: string;
   /** Test clock. Production uses Date.now. */
   now?: () => number;
   /** Test scheduler. Production uses setInterval and unref. */
@@ -237,6 +239,10 @@ export async function runAgentInstance(input: {
 }): Promise<AgentRunResult> {
   const task = input.task.trim();
   if (task.length === 0) throw new PitakoConfigError("agent_run task must not be empty");
+  const workspace = currentWorkspace(input.cwd);
+  if (input.executionRoot !== undefined && workspace !== input.executionRoot) {
+    throw new PitakoConfigError(`AgentInstance workspace drift: expected ${input.executionRoot}, got ${workspace}`);
+  }
   const loaded = loadPitakoConfig(input.load);
   const role = resolveRoleFromConfig(loaded, input.roleId);
   if (!role.modelPolicy.primary) {
@@ -246,7 +252,7 @@ export async function runAgentInstance(input: {
   const instance: AgentInstance = {
     id: createInstanceId(role.id),
     roleId: role.id,
-    workspace: currentWorkspace(input.cwd),
+    workspace,
     cwd: input.cwd,
     status: "created",
     model: {

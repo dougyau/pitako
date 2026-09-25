@@ -188,6 +188,8 @@ describe("plan and execute contracts", () => {
 
   test("execute is explicit, scoped, and does not replan", () => {
     expect(execute).toContain("status: frozen");
+    expect(execute).toContain("openExecutionPlan");
+    expect(execute).toContain("existing execution-root ledger first");
     expect(execute).toContain("USER_DECISION_REQUIRED");
     expect(execute).toContain("Persist `status: USER_DECISION_REQUIRED` in ledger frontmatter");
     expect(execute).toContain("execution: expected");
