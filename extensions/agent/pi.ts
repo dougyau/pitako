@@ -111,7 +111,7 @@ function prepareTargetModel(
   let serviceTier: ServiceTier | undefined;
   if (target.fast === true) {
     if (model.provider === "openai-codex" && model.id === "gpt-6-luna" && model.api === "openai-codex-responses") {
-      serviceTier = "fast";
+      serviceTier = "priority";
     } else if (model.provider === "xai" && model.id === "grok-4.7" && model.api === "openai-responses") {
       serviceTier = "priority";
     } else {

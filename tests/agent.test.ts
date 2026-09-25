@@ -420,7 +420,7 @@ reasoning = "medium"
     expect(switched.notes.some((note) => note.startsWith("example/fallback-2:"))).toBe(true);
   });
 
-  test("typed configuration failures do not enter availability fallback", async () => {
+  test("service-tier rejections do not enter availability fallback without a failure kind", async () => {
     const env = tempEnv();
     const configPath = path.join(env.PI_CODING_AGENT_DIR!, "pitako", "config.toml");
     const { mkdirSync, writeFileSync } = await import("node:fs");
@@ -438,7 +438,7 @@ reasoning = "medium"
       time_to_first_model_output_unavailable_reason: "failed" as const,
     };
     const executor = scripted([
-      { status: "failed", result: "", error: "503 service unavailable: unsupported service_tier", failureKind: "configuration", requests: [request], sideEffects: false },
+      { status: "failed", result: "", error: "503 service unavailable: unsupported service_tier: priority", requests: [request], sideEffects: false },
       { status: "completed", result: "must not run", sideEffects: false },
     ]);
     const result = await runAgentInstance({

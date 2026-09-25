@@ -111,7 +111,7 @@ Reasoning uses Pi's levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, 
 
 ### Fast requests
 
-A target can set `fast = true` to request provider-specific service. Pitako maps that setting to `service_tier = "fast"` for `openai-codex/gpt-6-luna` and `service_tier = "priority"` for `xai/grok-4.7`. Omitting `fast` or setting it to `false` keeps normal service behavior.
+A target can set `fast = true` to request provider-specific priority service. Pitako sends `service_tier = "priority"` for both `openai-codex/gpt-6-luna` and `xai/grok-4.7`. Omitting `fast` or setting it to `false` keeps normal service behavior. Pitako's `fast` flag is separate from Codex CLI's `fast_mode` option. See the [Codex Fast mode documentation](https://developers.openai.com/codex/agent-configuration/speed/) and the [Codex configuration reference](https://developers.openai.com/codex/config-file/config-reference/).
 
 ```toml
 [model_policies.developer.primary]
@@ -127,9 +127,9 @@ reasoning = "xhigh"
 fast = true
 ```
 
-These settings request a tier; they do not guarantee account access or elevated service. An accepted request can still run at the standard tier. xAI `priority` means priority processing, not the separate Grok 4.7 Fast model variant.
+These settings express request intent, not a granted tier. A provider endpoint can accept a request and still serve it at the standard tier. xAI `priority` means priority processing, not the separate Grok 4.7 Fast model variant.
 
-`agent_run` and `agent_result` include per-request summaries: `fast_requested`, `requested_service_tier`, `returned_service_tier`, and `time_to_first_model_output_ms`. Current Pi does not expose the response service tier to Pitako, so `returned_service_tier` is `unavailable`. Time to first model output is elapsed time from the Pi model-stream request start to the first non-empty text or thinking delta, or first tool-call start. Pi-reported cost is an estimate, not the provider's bill, and may not reflect fast-tier billing.
+`agent_run` and `agent_result` include per-request summaries: `fast_requested`, `requested_service_tier`, `returned_service_tier`, and `time_to_first_model_output_ms`. `requested_service_tier` records the request, not the tier served. Current Pi does not expose the response service tier, so `returned_service_tier` is `unavailable`. Time to first model output is elapsed time from the Pi model-stream request start to the first non-empty text or thinking delta, or first tool-call start. Pi-reported cost is an estimate, not the provider's bill. The requested tier, response time, and estimated cost do not establish that ChatGPT Fast was active.
 
 Herdr has no fast-mode parity. `agent_supervise` rejects a `fast = true` primary before splitting a pane. A fast fallback is not selected by Herdr.
 
