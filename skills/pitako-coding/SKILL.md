@@ -67,6 +67,7 @@ LSP needs an installed server for the file type. It can resolve a command on `PA
 | Hard finished work, what to keep | `reflect` |
 | Decision-complete plan, then stop | `plan` |
 | Implement one frozen plan | `execute` |
+| Prepare a local diff for publication without `$execute` | `pre-pr` |
 
 Do not load every skill. Do not load `caveman` at full or ultra unless the user asks. Do not load Ponytail and Caveman full bodies together.
 

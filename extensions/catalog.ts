@@ -17,6 +17,7 @@ export const DEFAULT_SKILL_NAMES = [
   "unslop",
   "plan",
   "execute",
+  "pre-pr",
   "remove-ai-slops",
   "principle-foundational-thinking",
   "principle-model-the-domain",

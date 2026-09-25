@@ -192,6 +192,8 @@ max_run_time = "0"
 
 `$execute <plan-id>` is the implementation authority for that frozen plan. Until that invocation, planning completion is not permission to change the product.
 
+`/skill:pre-pr [base=<local-ref>]` prepares the current worktree diff for first or later publication without `$plan`, a frozen plan, or `$execute`. It never commits or performs remote actions.
+
 Artifacts live in the workspace (git root, or the current directory outside a repository):
 
 ```
