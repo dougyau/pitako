@@ -26,6 +26,8 @@ export const ORCHESTRATION_TOOLS = [
 
 const ORCHESTRATION = new Set<string>(ORCHESTRATION_TOOLS);
 
+const NAVIGATION_GUIDANCE = "Inspect the repo first. Keep raw read/grep/bash/LSP/CodeGraph available. For bounded structural code questions, choose an appropriate supported dense query; use raw tools for literal, exhaustive or exact results; follow up with raw tools if a query/backend is partial or unavailable.";
+
 const BUILTIN_TOOLS = new Set([
   "read",
   "bash",
@@ -80,8 +82,7 @@ export function toolsForProfile(options: {
 
 export function profileNote(profile: ProfileName): string {
   const shared = [
-    "Inspect the repository before editing. Keep raw read, grep, bash, LSP and CodeGraph visible as the navigation baseline; coding keeps edit available.",
-    "Use dense queries for bounded code questions; fall back to raw when coverage is partial or unavailable.",
+    NAVIGATION_GUIDANCE,
     "Keep diffs small. Reuse existing code. Do not add speculative machinery.",
     "Verify real behavior before claiming done. Load a specialized skill only when it applies.",
     "Research or design does not authorize implementation.",
@@ -98,7 +99,7 @@ export function profileNote(profile: ProfileName): string {
   }
   return [
     "Pitako profile: coding.",
-    "Keep edit and write active. Use edit for one or a few local replacements.",
+    "Keep edit/write active: use edit for authorized local edits; write for new files or full rewrites.",
     ...shared,
   ].join(" ");
 }
@@ -108,7 +109,7 @@ export function childSessionNote(instanceId: string): string {
   return [
     `Pitako AgentInstance ${instanceId}.`,
     "The model and reasoning come from this role's ModelPolicy, not from the parent session.",
-    "Inspect the repository before editing. Keep raw read, grep, LSP and CodeGraph available as the navigation baseline; use dense queries for bounded code questions and fall back to raw when needed.",
+    NAVIGATION_GUIDANCE,
     "Keep diffs small. Verify real behavior before claiming done.",
     "Board tools are pull-only. rpiv-todo is private to this session. Do not spawn agents.",
   ].join(" ");
