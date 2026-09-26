@@ -20,7 +20,10 @@ import { packageRoot } from "../extensions/stack.ts";
 import type { LoadOptions } from "../extensions/roles/load.ts";
 
 const tempDirs: string[] = [];
+const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 afterEach(() => {
+  if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+  else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
   cancelAllWorkers();
   clearBackgroundOwner();
   setBackgroundExecutor(undefined);
@@ -237,6 +240,7 @@ describe("T2 observations", () => {
   });
 
   test("agent_status text still comes from formatWorkerViews only", async () => {
+    process.env.PI_CODING_AGENT_DIR = load().env?.PI_CODING_AGENT_DIR;
     let release!: (attempt: { status: "completed"; result: string; sideEffects: false }) => void;
     const gate = new Promise<{ status: "completed"; result: string; sideEffects: false }>((resolve) => {
       release = resolve;

@@ -1,4 +1,6 @@
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "bun:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -7,6 +9,33 @@ import { agentScope } from "../extensions/agent/scope.ts";
 import { packageRoot } from "../extensions/stack.ts";
 import { loadPitako, registeredToolNames } from "../scripts/load-pitako.ts";
 
+async function loadWithWebConfig(packagePath: string, configDir: string) {
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = configDir;
+  try {
+    return await loadPitako(packagePath);
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+  }
+}
+
+function loadInFreshProcess(packagePath: string, configDir: string) {
+  const runner = path.join(packagePath, "tests", "fixtures", "load-pitako.ts");
+  const child = spawnSync(process.execPath, [runner, packagePath], {
+    encoding: "utf8",
+    env: { ...process.env, PI_CODING_AGENT_DIR: configDir },
+  });
+  if (child.status !== 0) throw new Error(`${child.stderr}\n${child.stdout}`);
+  const marker = child.stdout.split(/\r?\n/).reverse().find((line) => line.startsWith("PITAKO_LOAD_RESULT="));
+  if (!marker) throw new Error(`Load runner did not return a result:\n${child.stdout}\n${child.stderr}`);
+  return JSON.parse(marker.slice("PITAKO_LOAD_RESULT=".length)) as {
+    errors: unknown[];
+    names: string[];
+    paths: string[];
+  };
+}
+
 function profileHarness(profileFlag?: string) {
   const active = ["read", "bash", "edit", "write"];
   const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
@@ -14,6 +43,7 @@ function profileHarness(profileFlag?: string) {
   const available = [
     "read", "bash", "edit", "write", "apply_patch", "grep", "find", "ls",
     "lsp_diagnostics", "lsp_rename", "codegraph_search", "project_report", "read_symbol",
+    "web_search", "fetch_content", "source_check", "get_search_content", "web_enable",
   ];
   const context = {
     cwd: packageRoot(),
@@ -61,18 +91,23 @@ function profileHarness(profileFlag?: string) {
 }
 
 describe("Pi package loading", () => {
-  test("discovers Pitako, LSP, and CodeGraph from a relative package path", async () => {
+  test("discovers the required extensions from a relative package path", async () => {
     const root = packageRoot();
-    const loaded = await loadPitako(root);
+    const isolatedConfig = mkdtempSync(path.join(tmpdir(), "pitako-web-config-empty-"));
+    const loaded = await loadWithWebConfig(root, isolatedConfig);
     expect(path.isAbsolute(loaded.relativePackagePath)).toBe(false);
     expect(loaded.extensions.errors).toEqual([]);
     const paths = loaded.extensions.extensions.map((extension) => extension.resolvedPath);
     expect(paths.some((file) => file.endsWith("extensions/index.ts"))).toBe(true);
+    const webExtensionIndex = paths.findIndex((file) => file.includes(`${path.sep}pi-web-access${path.sep}dist${path.sep}index.js`));
+    const pitakoExtensionIndex = paths.findIndex((file) => file.endsWith(`${path.sep}extensions${path.sep}index.ts`));
+    expect(webExtensionIndex).toBeLessThan(pitakoExtensionIndex);
     expect(paths.some((file) => file.includes(`${path.sep}pi-codex-tools${path.sep}`))).toBe(false);
     expect(paths.some((file) => file.includes(`${path.sep}pi-lsp-client${path.sep}`))).toBe(true);
     expect(paths.some((file) => file.endsWith(`${path.sep}codegraph-raw.ts`))).toBe(true);
     expect(paths.some((file) => file.includes(`${path.sep}rpiv-todo${path.sep}`))).toBe(true);
     expect(paths.some((file) => file.endsWith(`${path.sep}extensions${path.sep}board${path.sep}index.ts`))).toBe(true);
+    expect(paths.some((file) => file.includes(`${path.sep}pi-web-access${path.sep}dist${path.sep}index.js`))).toBe(true);
     for (const file of paths) expect(file.startsWith(root)).toBe(true);
 
     const names = registeredToolNames(loaded.extensions);
@@ -84,6 +119,9 @@ describe("Pi package loading", () => {
       expect(names).toContain(name);
     }
     expect(names).toContain("todo");
+    for (const name of ["web_search", "fetch_content", "source_check", "get_search_content", "web_enable"]) {
+      expect(names).toContain(name);
+    }
     for (const name of ["board_topic_create", "board_topic_list", "board_topic_read", "board_topic_update", "board_post", "board_query"]) {
       expect(names).toContain(name);
     }
@@ -109,7 +147,7 @@ describe("Pi package loading", () => {
     expect(prompt).toContain("bounded structural code questions");
     expect(prompt).toContain("literal, exhaustive or exact results");
     expect(prompt).toContain("partial or unavailable");
-    for (const name of ["read", "grep", "bash", "lsp_diagnostics", "codegraph_search", "project_report", "read_symbol", "edit", "write"]) {
+    for (const name of ["read", "grep", "bash", "lsp_diagnostics", "codegraph_search", "project_report", "read_symbol", "edit", "write", "web_search", "fetch_content", "source_check", "get_search_content", "web_enable"]) {
       expect(foreground.active).toContain(name);
     }
     expect(foreground.active).not.toContain("apply_patch");
@@ -120,12 +158,28 @@ describe("Pi package loading", () => {
     const analysisPrompt = await analysis.composePrompt("base system prompt");
     expect(analysisPrompt).toContain("bounded structural code questions");
     expect(analysisPrompt).toContain("edit, write, apply_patch, and lsp_rename are not");
-    for (const name of ["read", "grep", "bash", "lsp_diagnostics", "codegraph_search", "project_report", "read_symbol"]) {
+    for (const name of ["read", "grep", "bash", "lsp_diagnostics", "codegraph_search", "project_report", "read_symbol", "web_search", "fetch_content", "source_check", "get_search_content", "web_enable"]) {
       expect(analysis.active).toContain(name);
     }
     expect(analysis.active).not.toContain("edit");
     expect(analysis.active).not.toContain("write");
     await analysis.shutdown();
+  });
+
+  test("configuration can disable and rename web tools", () => {
+    const root = packageRoot();
+    const configDir = mkdtempSync(path.join(tmpdir(), "pitako-web-config-custom-"));
+    writeFileSync(path.join(configDir, "web-search.json"), JSON.stringify({
+      tools: { webSearch: { enabled: false } },
+      toolNames: { fetchContent: "fetch_page" },
+    }));
+    const loaded = loadInFreshProcess(root, configDir);
+    expect(loaded.errors).toEqual([]);
+    expect(loaded.names).not.toContain("web_search");
+    expect(loaded.names).toContain("fetch_page");
+    for (const name of ["source_check", "get_search_content", "web_enable", "lsp_diagnostics", "codegraph_search", "todo", "board_topic_create"]) {
+      expect(loaded.names).toContain(name);
+    }
   });
 
   test("profile reloads and profile command never expose patch outside Developer AgentInstances", async () => {

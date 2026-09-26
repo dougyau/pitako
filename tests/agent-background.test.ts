@@ -31,7 +31,10 @@ import { ledgerFile, planFile } from "../extensions/workflow.ts";
 import type { LoadOptions } from "../extensions/roles/load.ts";
 
 const tempDirs: string[] = [];
+const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 afterEach(() => {
+  if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+  else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
   cancelAllWorkers();
   clearBackgroundOwner();
   setBackgroundExecutor(undefined);
@@ -312,6 +315,7 @@ describe("background registry", () => {
 
 describe("background tools", () => {
   test("spawn tool returns before the executor finishes and does not steer", async () => {
+    process.env.PI_CODING_AGENT_DIR = load().env?.PI_CODING_AGENT_DIR;
     const hanging = hang();
     setBackgroundExecutor(hanging.executor);
     const tools = new Map<string, { execute: Function }>();
