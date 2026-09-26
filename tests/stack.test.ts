@@ -12,6 +12,7 @@ describe("stack configuration", () => {
     const manifest = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8")) as {
       pi: { extensions: string[]; skills: string[] };
       dependencies: Record<string, string>;
+      bundledDependencies: string[];
     };
     const expected = [
       ...stack.required.map((extension) => `./${extension.entry}`),
@@ -28,9 +29,17 @@ describe("stack configuration", () => {
     expect(manifest.dependencies["@vndv/pi-codegraph"]).toBe("0.1.10");
     expect(manifest.dependencies["@dietrichgebert/ponytail"]).toBe("4.10.0");
     expect(manifest.dependencies["@juicesharp/rpiv-todo"]).toBe("2.11.0");
+    expect(manifest.dependencies["pi-web-access"]).toBe("0.31.0");
+    expect(manifest.bundledDependencies).toContain("pi-web-access");
+    expect(stack.required.at(-1)).toEqual({
+      id: "pi-web-access",
+      spec: "pi-web-access@0.31.0",
+      entry: "node_modules/pi-web-access/dist/index.js",
+      tools: ["web_search", "fetch_content", "source_check", "get_search_content", "web_enable"],
+    });
     expect(manifest.pi.skills).toContain("./node_modules/@dietrichgebert/ponytail/skills/ponytail");
     expect(manifest.pi.skills).not.toContain("./skills");
-    expect(stack.optional[0]?.status).toBe("not-bundled");
+    expect(stack.optional).toEqual([]);
   });
 
   test("missing extension entry explains how to fix the install", () => {
@@ -47,6 +56,27 @@ describe("stack configuration", () => {
       expect(message).toContain("bun install");
       const homePrefix = ["", "home", ""].join("/");
       expect(message.includes(homePrefix)).toBe(false);
+    }
+  });
+
+  test("missing pi-web-access entry explains how to fix the install", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "pitako-missing-web-"));
+    mkdirSync(path.join(root, "config"), { recursive: true });
+    const stack = readStack(packageRoot());
+    writeFileSync(path.join(root, "config", "stack.json"), JSON.stringify(stack));
+    for (const extension of stack.required.filter(({ id }) => id !== "pi-web-access")) {
+      const entry = path.join(root, extension.entry);
+      mkdirSync(path.dirname(entry), { recursive: true });
+      writeFileSync(entry, "export {};\n");
+    }
+    expect(() => prepareRuntime(root, { PATH: "" })).toThrow(PitakoConfigError);
+    try {
+      prepareRuntime(root, { PATH: "" });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      expect(message).toContain('Required extension "pi-web-access"');
+      expect(message).toContain("node_modules/pi-web-access/dist/index.js");
+      expect(message).toContain("bun install");
     }
   });
 

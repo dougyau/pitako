@@ -63,8 +63,11 @@ async function executeTool(
 export async function runSmoke(root = packageRoot()): Promise<ToolText[]> {
   const fixture = path.join(root, "fixtures", "tiny-ts");
   const project = mkdtempSync(path.join(tmpdir(), "pitako-fixture-"));
-  cpSync(fixture, project, { recursive: true });
+  const webConfigDir = mkdtempSync(path.join(tmpdir(), "pitako-web-config-empty-"));
+  const previousWebConfigDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = webConfigDir;
   try {
+    cpSync(fixture, project, { recursive: true });
     await run("codegraph", ["init"], project);
     const loaded = await loadPitako(root, project);
     if (loaded.extensions.errors.length > 0) {
@@ -83,6 +86,11 @@ export async function runSmoke(root = packageRoot()): Promise<ToolText[]> {
       "board_topic_update",
       "board_post",
       "board_query",
+      "web_search",
+      "fetch_content",
+      "source_check",
+      "get_search_content",
+      "web_enable",
     ]) {
       if (!names.includes(required)) throw new Error(`Smoke expected ${required} to be registered`);
     }
@@ -126,6 +134,8 @@ export async function runSmoke(root = packageRoot()): Promise<ToolText[]> {
     ];
     return summary;
   } finally {
+    if (previousWebConfigDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousWebConfigDir;
     await disposeDefaultLspManager().catch(() => undefined);
     rmSync(project, { recursive: true, force: true });
   }

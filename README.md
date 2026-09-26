@@ -1,6 +1,6 @@
 # Pitako
 
-Pitako is a small, installable [Pi](https://github.com/earendil-works/pi) package. It gives you a curated coding session on top of the Pi you already run: normal coding tools, LSP, and CodeGraph, plus a read-only analysis profile.
+Pitako is a small, installable [Pi](https://github.com/earendil-works/pi) package. It gives you a curated coding session on top of the Pi you already run: normal coding tools, LSP, CodeGraph, and web research, plus a read-only analysis profile.
 
 It is an opinionated composition of Pi. It is not a fork, and it does not replace Pi's model or provider.
 
@@ -15,6 +15,7 @@ It currently combines:
 - selected [pstack](https://github.com/cursor/plugins/tree/main/pstack) practical skills and `principle-*` skills (Lauren Tan)
 - LSP (`pi-lsp-client`) and CodeGraph (`@vndv/pi-codegraph`)
 - [`@juicesharp/rpiv-todo`](https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-todo) for session-local TODOs
+- [`pi-web-access`](https://github.com/nicobailon/pi-web-access) for web search, source checks, and page extraction
 
 Not every skill or principle is active all the time. Pi keeps names and descriptions in context and loads a skill body when the task matches. Principles are contextual. Roles can use different subsets. Team assignments and the workspace Board are available to the foreground session.
 
@@ -24,7 +25,7 @@ Disable Ponytail, Caveman, or any individual skill with `pi config` or package s
 
 ## What this milestone is
 
-- A Pi package (`keywords: pi-package`) with the Pitako extension, the Board extension, curated skills, and one prompt.
+- A Pi package (`keywords: pi-package`) with the Pitako and web access extensions, the Board extension, curated skills, and one prompt.
 - The **coding** profile: Pi's read, bash, edit, and write tools, plus grep, find, and ls, plus LSP and CodeGraph.
 - The **analysis** profile: the same read and search tools, without `edit`, `write`, `apply_patch`, or `lsp_rename`.
 - Six bounded, read-only Code Intelligence queries: `project_report`, `read_symbol`, `read_enclosing`, `module_report`, `inspect_symbol`, and `review_surface`. Graph-backed queries create or refresh their index when needed under Node; raw tools remain visible.
@@ -210,8 +211,6 @@ Six records stay separate. `todo` is the current session checklist. The Board ho
 
 Pitako does not implement subteams or a DAG scheduler. Team assignments let independent roles run concurrently, with one assignment per role. Session TODOs are local execution plans. The Board is not a team roster or a memory store.
 
-Web search is not bundled. See [Web research](#web-research).
-
 ## Requirements
 
 - Node.js 22.19 or newer (same floor as current Pi).
@@ -265,8 +264,8 @@ bun run typecheck
 
 | Profile | Tools |
 | --- | --- |
-| `coding` (default) | `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, LSP, CodeGraph, and read-only Code Intelligence queries. Developer AgentInstances also get `apply_patch`. On Windows, `powershell` is included when Pi registered it. |
-| `analysis` | `read`, `bash`, `grep`, `find`, `ls`, LSP, CodeGraph, and read-only Code Intelligence queries. No `edit`, `write`, `apply_patch`, or `lsp_rename`. |
+| `coding` (default) | `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, LSP, CodeGraph, read-only Code Intelligence queries, and configured web research tools. Developer AgentInstances also get `apply_patch`. On Windows, `powershell` is included when Pi registered it. |
+| `analysis` | `read`, `bash`, `grep`, `find`, `ls`, LSP, CodeGraph, read-only Code Intelligence queries, and configured web research tools. No `edit`, `write`, `apply_patch`, or `lsp_rename`. |
 
 Shell is still available in `analysis`. Restricting bash safely would be a separate sandbox, and this milestone does not add one.
 
@@ -290,6 +289,7 @@ An unnamed session takes its display name from the first user line, capped at 60
 | CodeGraph | [`@vndv/pi-codegraph`](https://github.com/vndv/pi-codegraph) `0.1.10` | Pi-native tools over the `codegraph` CLI: search, callers, callees, impact, explore, node, files, status. MIT. |
 | CodeGraph CLI | `@colbymchenry/codegraph` `1.6.0` | The index and `codegraph serve` process the raw extension talks to. MIT. |
 | Code Intelligence | `extensions/code-intelligence/` | Six bounded queries using AST, LSP, Git, and the direct CodeGraph SDK. Graph-backed queries require Node. |
+| Web research | [`pi-web-access`](https://github.com/nicobailon/pi-web-access) `0.31.0` | `web_search`, `fetch_content`, `source_check`, `get_search_content`, and `web_enable`. MIT. |
 | Profiles, protected paths, status | `extensions/index.ts` | Pitako-owned. |
 
 `@vndv/pi-codegraph` registers Pi tools. It spawns `codegraph serve --mcp` internally. You do not add an MCP server to Pi.
@@ -334,7 +334,7 @@ Pi can filter a package without editing Pitako. In `settings.json`:
 }
 ```
 
-`pi config` toggles individual resources from installed packages, including skills. Paths are relative to the package root. Filtering the raw CodeGraph extension out of the loader does not remove the dependency or the dense queries; it only stops Pi from registering the raw `codegraph_*` tools.
+`pi config` toggles individual resources from installed packages, including skills. Paths are relative to the package root. Filtering the raw CodeGraph extension out of the loader does not remove the dependency or the dense queries; it only stops Pi from registering the raw `codegraph_*` tools. To disable web research, add `!node_modules/pi-web-access/dist/index.js` to the `extensions` list.
 
 To drop Ponytail, Caveman, or one principle without editing Pitako:
 
@@ -359,9 +359,11 @@ To drop Pitako entirely: `pi remove` with the same source you installed.
 
 ## Web research
 
-Not bundled. [`pi-web-access`](https://github.com/nicobailon/pi-web-access) (MIT, actively maintained) can search and fetch pages, but it also ships PDF extraction, YouTube, repository cloning, and several API-key providers. That should stay optional so a missing search key cannot block the coding baseline.
+Pitako bundles [`pi-web-access`](https://github.com/nicobailon/pi-web-access) `0.31.0`. It registers `web_search`, `fetch_content`, `source_check`, `get_search_content`, and `web_enable` by default. It does not set a model, provider, or API key.
 
-To add it later, depend on a pinned version and append its `pi.extensions` entry (currently `./dist`) in this package's `pi.extensions` and `config/stack.json`. The `web-research` slot in `config/stack.json` records that choice.
+Tool registration does not need API keys. Search needs network access and an available provider. Without a key, pi-web-access can use Exa MCP or DuckDuckGo, but provider availability depends on the network and service. Add optional credentials or settings to `web-search.json`. It defaults to `~/.pi/agent`; `PI_CODING_AGENT_DIR` and `XDG_CONFIG_HOME` can change the config directory. Do not commit credentials. See the [pi-web-access configuration guide](https://github.com/nicobailon/pi-web-access#configuration).
+
+`fetch_content` reads remote pages and supports GitHub repositories and PDFs. By default, GitHub URLs can clone repositories under `/tmp/pi-github-repos`. PDF extraction can save text under the operating system's temporary `pi-web-pdf` directory. Fetching sends requests to the target site, and configured extraction providers may receive the URL or page content.
 
 ## Configuration examples
 
@@ -415,7 +417,7 @@ The script copies `fixtures/tiny-ts` to a temp directory, runs `codegraph init`,
 - Analysis mode does not sandbox `bash` or `powershell`.
 - Language servers are not installed automatically.
 - `pi-lsp-client` is consumed from git because it is not on npm. The commit is pinned.
-- Web research is not bundled. Board scope is global only. Agent fallback does not rerun a task after side effects.
+- Web search depends on network access and provider availability. Board scope is global only. Agent fallback does not rerun a task after side effects.
 - Local `pi install .` requires `bun install` (or `npm install`) in this directory first, so `node_modules` exists.
 
 ## Roadmap

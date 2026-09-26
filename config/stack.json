@@ -62,14 +62,13 @@
       "spec": "pitako",
       "entry": "extensions/agent/index.ts",
       "tools": ["agent_run"]
+    },
+    {
+      "id": "pi-web-access",
+      "spec": "pi-web-access@0.31.0",
+      "entry": "node_modules/pi-web-access/dist/index.js",
+      "tools": ["web_search", "fetch_content", "source_check", "get_search_content", "web_enable"]
     }
   ],
-  "optional": [
-    {
-      "id": "web-research",
-      "status": "not-bundled",
-      "suggestedPackage": "pi-web-access",
-      "reason": "Maintained and capable, but it also pulls PDF extraction, YouTube, repo cloning, and several search-provider API keys. That is more than this coding baseline needs, and it should not be required to start Pitako."
-    }
-  ]
+  "optional": []
 }

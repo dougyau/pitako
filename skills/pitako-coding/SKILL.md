@@ -85,6 +85,10 @@ Do not use the Board as a transcript, scratchpad, TODO list, or progress log. `t
 
 `/pitako roles` and `/pitako role <id>` show role definitions. A role is a responsibility template; its `ModelPolicy` selects the instance's primary model and fallbacks. `agent_run` executes one isolated instance synchronously. The foreground session uses `team_assign`, `team_status`, `team_result`, and `team_cancel` for Team work; `/pitako team` inspects its roster. Use `team_assign` only for independent work. Child instances do not receive orchestration tools. If delegation fails, report the error; do not take over that specialist work.
 
+## Web access
+
+Use `web_search` for current external sources, `fetch_content` to read a URL, and `source_check` to collect cited evidence. Bundled `pi-web-access` needs network access and an available provider. `fetch_content` can clone GitHub repositories and save PDF text in a temporary directory.
+
 ## Not in this package
 
-Web search and poteto-mode are not bundled. `$plan` and `$execute` are skills, not a scheduler.
+Poteto-mode is not bundled. `$plan` and `$execute` are skills, not a scheduler.
