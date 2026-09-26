@@ -13,7 +13,7 @@ function profileHarness(profileFlag?: string) {
   let profileCommand: ((args: string, ctx: unknown) => Promise<void>) | undefined;
   const available = [
     "read", "bash", "edit", "write", "apply_patch", "grep", "find", "ls",
-    "lsp_diagnostics", "lsp_rename", "codegraph_search",
+    "lsp_diagnostics", "lsp_rename", "codegraph_search", "project_report", "read_symbol",
   ];
   const context = {
     cwd: packageRoot(),
@@ -47,6 +47,12 @@ function profileHarness(profileFlag?: string) {
     async selectProfile(value: string) {
       if (!profileCommand) throw new Error("pitako command was not registered");
       await profileCommand(`profile ${value}`, context);
+    },
+    async composePrompt(systemPrompt = "") {
+      const handler = handlers.get("before_agent_start");
+      if (!handler) throw new Error("before_agent_start was not registered");
+      const result = await handler({ systemPrompt }, context) as { systemPrompt?: string } | undefined;
+      return result?.systemPrompt ?? systemPrompt;
     },
     async shutdown() {
       await handlers.get("session_shutdown")?.({}, context);
@@ -93,6 +99,33 @@ describe("Pi package loading", () => {
     expect(skills).not.toContain("poteto-mode");
     const prompts = loaded.loader.getPrompts().prompts.map((prompt) => prompt.name);
     expect(prompts).toContain("explain");
+  });
+
+  test("profile guidance reaches the provider prompt without changing raw and dense tool access", async () => {
+    const foreground = profileHarness();
+    await foreground.start();
+    const prompt = await foreground.composePrompt("base system prompt");
+    expect(prompt).toContain("base system prompt");
+    expect(prompt).toContain("bounded structural code questions");
+    expect(prompt).toContain("literal, exhaustive or exact results");
+    expect(prompt).toContain("partial or unavailable");
+    for (const name of ["read", "grep", "bash", "lsp_diagnostics", "codegraph_search", "project_report", "read_symbol", "edit", "write"]) {
+      expect(foreground.active).toContain(name);
+    }
+    expect(foreground.active).not.toContain("apply_patch");
+    await foreground.shutdown();
+
+    const analysis = profileHarness("analysis");
+    await analysis.start();
+    const analysisPrompt = await analysis.composePrompt("base system prompt");
+    expect(analysisPrompt).toContain("bounded structural code questions");
+    expect(analysisPrompt).toContain("edit, write, apply_patch, and lsp_rename are not");
+    for (const name of ["read", "grep", "bash", "lsp_diagnostics", "codegraph_search", "project_report", "read_symbol"]) {
+      expect(analysis.active).toContain(name);
+    }
+    expect(analysis.active).not.toContain("edit");
+    expect(analysis.active).not.toContain("write");
+    await analysis.shutdown();
   });
 
   test("profile reloads and profile command never expose patch outside Developer AgentInstances", async () => {

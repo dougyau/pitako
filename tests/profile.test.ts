@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { isProtectedEditPath } from "../extensions/paths.ts";
-import { childActiveTools, parseProfile, profileNote, toolsForProfile } from "../extensions/profile.ts";
+import { childActiveTools, childSessionNote, parseProfile, profileNote, toolsForProfile } from "../extensions/profile.ts";
 
 const available = [
   "read",
@@ -56,9 +56,20 @@ describe("profiles", () => {
     expect(() => parseProfile("architect")).toThrow(/Unknown Pitako profile/);
   });
 
-  test("profile notes stay a short baseline and keep analysis restrictions", () => {
+  test("profile notes guide bounded navigation and keep profile restrictions", () => {
     const coding = profileNote("coding");
     const analysis = profileNote("analysis");
+    const child = childSessionNote("developer-1");
+    for (const note of [coding, analysis, child]) {
+      expect(note).toContain("bounded structural code questions");
+      expect(note).toContain("choose an appropriate supported dense query");
+      expect(note).toContain("literal, exhaustive or exact results");
+      expect(note).toContain("partial or unavailable");
+      expect(note).toContain("raw tools");
+      expect(note).not.toContain("navigation baseline");
+    }
+    expect(coding).toContain("Keep edit/write active");
+    expect(coding).toContain("use edit for authorized local edits; write for new files or full rewrites.");
     expect(coding).toContain("Keep diffs small");
     expect(coding).toContain("Board tools are pull-only");
     expect(coding).not.toContain("FINDING");

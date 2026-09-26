@@ -457,7 +457,8 @@ reasoning = "medium"
     expect(childSessionNote("architect-1")).not.toContain("whatever the user selected");
     const instructions = childInstructions(resolveRole("architect", { env: tempEnv() }), "architect-1");
     expect(instructions).toContain("ModelPolicy");
-    expect(instructions).toContain("Use dense queries for bounded code questions; fall back to raw when needed.");
+    expect(instructions).toContain("Your conversation is private");
+    expect(instructions).not.toContain("navigation baseline");
   });
 
   test("500 status code (no body) is unavailable", () => {
