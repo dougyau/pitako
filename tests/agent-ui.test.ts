@@ -826,6 +826,7 @@ describe("role abbreviations", () => {
   test("known roles abbreviate in footer; unknown short stays, long truncates to 4", () => {
     expect(formatFooter([row({ id: "1", roleId: "architect", appliedReasoning: "low", modelLabel: "M" })], NOW, 80)).toContain("arch");
     expect(formatFooter([row({ id: "1", roleId: "researcher", appliedReasoning: "low", modelLabel: "M" })], NOW, 80)).toContain("res");
+    expect(formatFooter([row({ id: "1", roleId: "scout", appliedReasoning: "low", modelLabel: "M" })], NOW, 80)).toContain("scout");
     expect(formatFooter([row({ id: "1", roleId: "coordinator", appliedReasoning: "low", modelLabel: "M" })], NOW, 80)).toContain("coord");
     expect(formatFooter([row({ id: "1", roleId: "ops", appliedReasoning: "low", modelLabel: "M" })], NOW, 80)).toContain("ops");
     expect(formatFooter([row({ id: "1", roleId: "specialist", appliedReasoning: "low", modelLabel: "M" })], NOW, 80)).toContain("spec");

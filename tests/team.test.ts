@@ -66,7 +66,7 @@ function load() {
   tempDirs.push(dir);
   const userConfigPath = path.join(dir, "pitako", "config.toml");
   mkdirSync(path.dirname(userConfigPath), { recursive: true });
-  writeFileSync(userConfigPath, `[model_policies.developer.primary]\nmodel = "example/primary"\nreasoning = "off"\n[model_policies.researcher.primary]\nmodel = "example/primary"\nreasoning = "off"\n[model_policies.architect.primary]\nmodel = "example/primary"\nreasoning = "off"\n[model_policies.reviewer.primary]\nmodel = "example/primary"\nreasoning = "off"\n`);
+  writeFileSync(userConfigPath, `[model_policies.developer.primary]\nmodel = "example/primary"\nreasoning = "off"\n[model_policies.researcher.primary]\nmodel = "example/primary"\nreasoning = "off"\n[model_policies.architect.primary]\nmodel = "example/primary"\nreasoning = "off"\n[model_policies.reviewer.primary]\nmodel = "example/primary"\nreasoning = "off"\n[model_policies.scout.primary]\nmodel = "example/primary"\nreasoning = "low"\n`);
   return { userConfigPath, env: { PI_CODING_AGENT_DIR: dir } };
 }
 
@@ -364,8 +364,9 @@ describe("Team T1 ownership", () => {
     const ctx = { cwd, sessionManager: { getSessionId: () => current.sessionId } };
     const invoke = (name: string, params: unknown) => tools.get(name)!.execute("call", params, new AbortController().signal, undefined, ctx);
     const status = await invoke("team_status", {});
-    expect((status.details as any).roles.map((row: any) => row.role)).toEqual(["architect", "developer", "reviewer", "researcher"]);
+    expect((status.details as any).roles.map((row: any) => row.role)).toEqual(["architect", "developer", "reviewer", "researcher", "scout"]);
     const assignTool = tools.get("team_assign") as any;
+    expect(assignTool.parameters.properties.role.enum).toEqual(["architect", "developer", "reviewer", "researcher", "scout"]);
     expect(assignTool.promptGuidelines.join(" ")).toContain("team_result");
     expect(assignTool.promptGuidelines.join(" ")).toContain("independent long work");
     expect((await invoke("team_assign", { role: "architect", task: "unrelated", boardTopicId: "1" })).isError).toBe(true);
@@ -373,15 +374,19 @@ describe("Team T1 ownership", () => {
     expect(firstAssignment.isError).toBe(false);
     expect(existsSync(ledgerFile("plan-a", cwd))).toBe(false);
     expect((await invoke("team_assign", { role: "researcher", task: "Inspect evidence" })).isError).toBe(false);
+    const scoutAssignment = await invoke("team_assign", { role: "scout", task: "Map local callers" });
+    expect(scoutAssignment.isError).toBe(false);
+    expect((await invoke("team_assign", { role: "scout", task: "Overlapping Scout" })).isError).toBe(true);
     await Promise.all(workers.map((worker) => worker.started));
-    expect(workers).toHaveLength(2);
+    expect(workers).toHaveLength(3);
     expect(workers[0]!.task).toContain(`Team ${current.sessionId}; role developer; assignment `);
     expect(workers[0]!.task).not.toContain("Board topic");
     expect(workers[0]!.task).toContain("WorkBrief:\nInspect lease");
     expect(teamAssignments(current)[1]?.current?.boardTopicId).toBeUndefined();
     expect((await invoke("team_assign", { role: "developer", task: "overlap" })).isError).toBe(true);
     const views = await invoke("team_status", {});
-    expect((views.details as any).roles.map((row: any) => row.status)).toEqual(["idle", "running", "idle", "running"]);
+    expect((views.details as any).roles.map((row: any) => row.status)).toEqual(["idle", "running", "idle", "running", "running"]);
+    expect((views.details as any).roles[4].role).toBe("scout");
     const developer = teamAssignments(current)[1]?.current;
     expect(developer).toBeDefined();
     publishObservation({
@@ -413,19 +418,29 @@ describe("Team T1 ownership", () => {
       },
     });
     workers[1]!.finish(completed("research done"));
+    workers[2]!.finish({ status: "completed", result: "scout map", sideEffects: false, usage: { input: 12, output: 5, turns: 1, toolCalls: 2 } });
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(wakes.some((text) => text.includes("plan plan-a unit unit-a"))).toBe(true);
     const ready = (await invoke("team_status", {})).details as any;
     expect(ready.roles[1]).toMatchObject({ status: "completed", resultAvailable: true });
     expect(ready.roles[0]).toMatchObject({ role: "architect", status: "idle" });
     const result = await invoke("team_result", { assignmentId: developer!.id });
-    expect(result.content[0].text.length).toBeLessThan(8100);
+    expect(result.content[0].text.length).toBe(8000);
     expect((result.details as any).truncated).toBe(true);
     expect((result.details as any).usage).toMatchObject({
       tools: { edit: 1, write: 2, apply_patch: 3 },
       patches: [{ targets: ["src/change.ts"], inputBytes: 90, changedHunks: 2 }],
     });
     expect((await invoke("team_result", { assignmentId: teamAssignments(current)[3]?.current?.id })).content[0].text).toContain("research done");
+    const scoutResult = await invoke("team_result", { assignmentId: (scoutAssignment.details as any).id });
+    expect(scoutResult.content[0].text).toContain("execution summary: assignment=");
+    expect(scoutResult.content[0].text.endsWith("\n\nscout map")).toBe(true);
+    expect(scoutResult.details).toMatchObject({ role: "scout", usage: { input: 12, output: 5, turns: 1, toolCalls: 2 } });
+    const scoutAgain = await invoke("team_assign", { role: "scout", task: "Confirm released slot" });
+    expect(scoutAgain.isError).toBe(false);
+    await workers[3]!.started;
+    workers[3]!.finish(completed("released"));
+    await new Promise((resolve) => setTimeout(resolve, 20));
     expect(wakes.some((text) => text.includes(`assignment ${developer!.id}`) && text.includes("Use team_result"))).toBe(true);
     expect(wakes.some((text) => text.includes("Use agent_result"))).toBe(false);
     expect((await invoke("team_assign", { role: "developer", task: "Next task" })).isError).toBe(false);
@@ -1013,7 +1028,9 @@ describe("Team T1 ownership", () => {
       { role: "developer", status: "idle" },
       { role: "reviewer", status: "idle" },
       { role: "researcher", status: "idle" },
+      { role: "scout", status: "idle" },
     ]);
+    expect(notes.join(" ")).not.toContain("usage");
     expect(hasTeamRoster(current)).toBe(false);
     expect(notes.join(" ")).not.toContain("transcript");
   });

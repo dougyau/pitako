@@ -40,6 +40,9 @@ describe("role and model policy resolution", () => {
     expect(config.userConfigPresent).toBe(false);
     expect(Object.keys(config.roles).sort()).toEqual([...ROLE_IDS].sort());
     const architect = getRole("architect", { env });
+    const researcher = getRole("researcher", { env });
+    expect(researcher.description).toContain("bounded local source fragments");
+    expect(researcher.description).not.toContain("repository maps");
     expect(architect.modelPolicy).toBe("architect");
     expect(architect.skills).toEqual(["architect", "how", "why", "blast-radius"]);
     expect(architect.principles).toContain("principle-foundational-thinking");
@@ -58,6 +61,34 @@ describe("role and model policy resolution", () => {
     expect(resolved.modelPolicy.diagnostic).toContain("no primary target");
     expect(resolved.modelPolicy.diagnostic).toContain(configPath);
     expect(getModelPolicy("developer", { env }).fallbacks).toEqual([]);
+  });
+
+  test("Scout resolves with an empty policy and accepts a user primary", () => {
+    const { env, configPath } = tempAgent();
+    expect(ROLE_IDS).toContain("scout");
+    const role = getRole("scout", { env });
+    expect(role.name).toBe("Scout");
+    expect(role.description).toContain("bounded local source fragments");
+    expect(role.skills).toEqual([]);
+    expect(role.principles).toEqual(["principle-guard-the-context-window", "principle-prove-it-works"]);
+    expect(role.instructions).toContain("evidence");
+    expect(role.instructions).toContain("Do not edit files");
+    expect(role.instructions).toContain("Do not post routine retrieval results");
+    const unresolved = resolveRole("scout", { env });
+    expect(unresolved.modelPolicy.primary).toBeUndefined();
+    expect(unresolved.modelPolicy.diagnostic).toContain(`in ${configPath}`);
+
+    writeConfig(configPath, `
+[model_policies.scout.primary]
+model = "example/scout"
+reasoning = "low"
+`);
+    expect(resolveRole("scout", { env }).modelPolicy.primary).toEqual({
+      model: "example/scout",
+      reasoning: "low",
+    });
+    expect(() => getRole("unknown", { env })).toThrow(/unknown role "unknown"/);
+    expect(() => getModelPolicy("unknown", { env })).toThrow(/unknown model policy "unknown"/);
   });
 
   test("user config replaces policy targets and explicit arrays, and preserves omitted fields", () => {
@@ -239,6 +270,10 @@ describe("pitako role commands", () => {
       `[model_policies.architect.primary]
 model = "example/architect"
 reasoning = "high"
+
+[model_policies.scout.primary]
+model = "example/scout"
+reasoning = "low"
 `,
     );
     try {
@@ -285,6 +320,19 @@ reasoning = "high"
       expect(text).toContain("Configured fallbacks are availability targets");
       expect(text).not.toContain("not selected in this version");
       expect(text).not.toContain("api_key");
+      await handler("role scout", {
+        hasUI: true,
+        ui: { notify(message: string) { notices.push(message); } },
+      });
+      expect(notices.at(-1)).toContain("Scout");
+      expect(notices.at(-1)).toContain("evidence");
+      expect(notices.at(-1)).toContain("reasoning: low");
+      await handler("policy scout", {
+        hasUI: true,
+        ui: { notify(message: string) { notices.push(message); } },
+      });
+      expect(notices.at(-1)).toContain("model policy: scout");
+      expect(notices.at(-1)).toContain("reasoning: low");
     } finally {
       if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previous;

@@ -9,6 +9,8 @@ Pitako is a Pi package. It does not replace Pi's model, provider, or built-in re
 
 This skill is the router. Do not paste the full bodies of Ponytail, Caveman, practical skills, or principle-* skills into the session. Load one specialized skill when its trigger matches.
 
+For Scout, the role instructions and active tool allowlist take precedence over this coding baseline. Scout must not modify files or use shell to bypass that limit.
+
 ## Profiles
 
 - `coding` (default): read, bash, edit, write, grep, find, ls, plus LSP and CodeGraph.
@@ -87,4 +89,4 @@ Do not use the Board as a transcript, scratchpad, TODO list, or progress log. `t
 
 ## Not in this package
 
-Web search and poteto-mode are not bundled. `$plan` and `$execute` are skills, not a scheduler.
+Web research is bundled for the foreground and non-Scout roles; Scout stays on local tools. Subteams, a DAG scheduler, and poteto-mode are not included. `$plan` and `$execute` are skills, not a scheduler.

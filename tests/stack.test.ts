@@ -12,6 +12,7 @@ describe("stack configuration", () => {
     const manifest = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8")) as {
       pi: { extensions: string[]; skills: string[] };
       dependencies: Record<string, string>;
+      bundledDependencies: string[];
     };
     const expected = [
       ...stack.required.map((extension) => `./${extension.entry}`),
@@ -28,9 +29,14 @@ describe("stack configuration", () => {
     expect(manifest.dependencies["@vndv/pi-codegraph"]).toBe("0.1.10");
     expect(manifest.dependencies["@dietrichgebert/ponytail"]).toBe("4.10.0");
     expect(manifest.dependencies["@juicesharp/rpiv-todo"]).toBe("2.11.0");
+    expect(manifest.dependencies["pi-web-access"]).toBe("0.31.0");
+    expect(manifest.bundledDependencies).toContain("pi-web-access");
+    expect(stack.required.find((entry) => entry.id === "pi-web-access")?.tools).toEqual([
+      "web_search", "fetch_content", "source_check", "get_search_content", "web_enable",
+    ]);
     expect(manifest.pi.skills).toContain("./node_modules/@dietrichgebert/ponytail/skills/ponytail");
     expect(manifest.pi.skills).not.toContain("./skills");
-    expect(stack.optional[0]?.status).toBe("not-bundled");
+    expect(stack.optional).toEqual([]);
   });
 
   test("missing extension entry explains how to fix the install", () => {

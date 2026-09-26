@@ -10,7 +10,7 @@ import { executionForSession, resolveBoardAuthor } from "../extensions/execution
 import { unregisterSupervisedSession } from "../extensions/herdr/author.ts";
 import { piIntegrationCurrent, readHerdrPresence } from "../extensions/herdr/presence.ts";
 import { superviseAgent, type HerdrCommandResult, type HerdrRunner } from "../extensions/herdr/supervise.ts";
-import { childActiveTools } from "../extensions/profile.ts";
+import { childActiveTools, ORCHESTRATION_TOOLS, WEB_TOOLS } from "../extensions/profile.ts";
 import { resolveRole, type LoadOptions } from "../extensions/roles/load.ts";
 import { packageRoot } from "../extensions/stack.ts";
 
@@ -304,23 +304,23 @@ function scripted(overrides: Record<string, HerdrCommandResult | ((args: string[
   return { calls, run };
 }
 
-function developerLoad(reasoning?: string, options: { fast?: boolean; fallbackFast?: boolean } = {}): LoadOptions {
+function roleLoad(roleId: string, reasoning?: string, options: { fast?: boolean; fallbackFast?: boolean } = {}): LoadOptions {
   const dir = mkdtempSync(path.join(tmpdir(), "pitako-supervise-"));
   const userConfigPath = path.join(dir, "config.toml");
   const reasoningLine = reasoning ? `reasoning = "${reasoning}"\n` : "";
   const fastLine = options.fast === undefined ? "" : `fast = ${options.fast}\n`;
-  const fallback = options.fallbackFast === undefined ? "" : `\n[[model_policies.developer.fallbacks]]\nmodel = "example/fallback"\nfast = ${options.fallbackFast}\n`;
-  writeFileSync(userConfigPath, `[model_policies.developer.primary]\nmodel = "example/coder"\n${reasoningLine}${fastLine}${fallback}`);
+  const fallback = options.fallbackFast === undefined ? "" : `\n[[model_policies.${roleId}.fallbacks]]\nmodel = "example/fallback"\nfast = ${options.fallbackFast}\n`;
+  writeFileSync(userConfigPath, `[model_policies.${roleId}.primary]\nmodel = "example/${roleId}"\n${reasoningLine}${fastLine}${fallback}`);
   return { userConfigPath, packageRoot: packageRoot() };
 }
 
-function superviseInput(run: HerdrRunner, extra: { env?: Record<string, string | undefined>; load?: LoadOptions; signal?: AbortSignal; task?: string } = {}) {
+function superviseInput(run: HerdrRunner, extra: { roleId?: string; env?: Record<string, string | undefined>; load?: LoadOptions; signal?: AbortSignal; task?: string } = {}) {
   return {
-    roleId: "developer",
+    roleId: extra.roleId ?? "developer",
     task: extra.task ?? "Inspect the diff",
     cwd: CALLER_CWD,
     env: extra.env ?? inside,
-    load: extra.load ?? developerLoad("high"),
+    load: extra.load ?? roleLoad("developer", "high"),
     signal: extra.signal,
     run,
   };
@@ -401,7 +401,7 @@ describe("agent_supervise", () => {
 
   test("rejects a fast primary before pane layout, split, or agent start", async () => {
     const { calls, run } = scripted();
-    const error = await superviseAgent(superviseInput(run, { load: developerLoad("max", { fast: true }) })).catch((value: unknown) => value);
+    const error = await superviseAgent(superviseInput(run, { load: roleLoad("developer", "max", { fast: true }) })).catch((value: unknown) => value);
     expect(error).toBeInstanceOf(PitakoConfigError);
     expect((error as Error).message).toMatch(/fast.*not supported|not supported.*fast/i);
     expect(calls.map(commandKey)).toEqual(["integration", "status"]);
@@ -410,11 +410,11 @@ describe("agent_supervise", () => {
 
   test("normal primary ignores a fast fallback and passes no speculative flag", async () => {
     const { calls, run } = scripted();
-    const load = developerLoad("high", { fast: false, fallbackFast: true });
+    const load = roleLoad("developer", "high", { fast: false, fallbackFast: true });
     await superviseAgent(superviseInput(run, { load }));
     const start = calls.find((args) => args[1] === "start");
     expect(start).toContain("--model");
-    expect(start?.[start.indexOf("--model") + 1]).toBe("example/coder");
+    expect(start?.[start.indexOf("--model") + 1]).toBe("example/developer");
     expect(start?.[start.indexOf("--thinking") + 1]).toBe("high");
     expect(start).not.toContain("--fast");
     expect(start).not.toContain("--priority");
@@ -432,7 +432,7 @@ describe("agent_supervise", () => {
   });
 
   test("happy path argv starts one named Pi and returns ids plus status", async () => {
-    const load = developerLoad("high");
+    const load = roleLoad("developer", "high");
     const role = resolveRole("developer", load);
     const { calls, run } = scripted();
     const result = await superviseAgent(superviseInput(run, { load }));
@@ -452,7 +452,7 @@ describe("agent_supervise", () => {
     expect(start[1]).toBe("start");
     expect(start).toContain("--kind");
     expect(start[start.indexOf("--kind") + 1]).toBe("pi");
-    expect(start[start.indexOf("--model") + 1]).toBe("example/coder");
+    expect(start[start.indexOf("--model") + 1]).toBe("example/developer");
     expect(start[start.indexOf("--thinking") + 1]).toBe("high");
     expect(start).toContain("--no-approve");
     expect(start).not.toContain("--approve");
@@ -470,15 +470,33 @@ describe("agent_supervise", () => {
     expect(JSON.stringify(result)).not.toContain("SECRET_TRANSCRIPT");
   });
 
+  test("Scout Herdr argv uses configured model, low reasoning, and Scout instructions", async () => {
+    const load = roleLoad("scout", "low");
+    const role = resolveRole("scout", load);
+    const { calls, run } = scripted();
+    await superviseAgent(superviseInput(run, { roleId: "scout", load }));
+    const split = calls.find((args) => args[1] === "split");
+    const start = calls.find((args) => args[1] === "start");
+    if (!split || !start) throw new Error("missing split or start");
+    const instanceId = start[2];
+    expect(instanceId).toMatch(/^scout-[0-9a-f]{6}$/);
+    expect(split).toContain(`PITAKO_INSTANCE_ID=${instanceId}`);
+    expect(split).toContain("PITAKO_ROLE_ID=scout");
+    expect(start[start.indexOf("--model") + 1]).toBe("example/scout");
+    expect(start[start.indexOf("--thinking") + 1]).toBe("low");
+    expect(start[start.indexOf("--append-system-prompt") + 1]).toContain(role.instructions);
+    expect(start[start.indexOf("--exclude-tools") + 1]).toBe([...ORCHESTRATION_TOOLS, ...WEB_TOOLS].join(","));
+  });
+
   test("omitted reasoning does not pass --thinking, and a tall pane splits down", async () => {
     const { calls, run } = scripted({ "pane layout": ok(layoutJson(40, 80)) });
-    await superviseAgent(superviseInput(run, { load: developerLoad() }));
+    await superviseAgent(superviseInput(run, { load: roleLoad("developer") }));
     const split = calls.find((args) => args[1] === "split") ?? [];
     const start = calls.find((args) => args[1] === "start") ?? [];
     expect(split[split.indexOf("--direction") + 1]).toBe("down");
     expect(start).not.toContain("--thinking");
     const equal = scripted({ "pane layout": ok(layoutJson(40, 40)) });
-    await superviseAgent(superviseInput(equal.run, { load: developerLoad() }));
+    await superviseAgent(superviseInput(equal.run, { load: roleLoad("developer") }));
     const equalSplit = equal.calls.find((args) => args[1] === "split") ?? [];
     expect(equalSplit[equalSplit.indexOf("--direction") + 1]).toBe("right");
   });

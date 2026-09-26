@@ -6,7 +6,7 @@ import { currentInstanceId } from "../agent/scope.ts";
 import { PitakoConfigError } from "../errors.ts";
 import { loadPitakoConfig, resolveRoleFromConfig, type LoadOptions } from "../roles/load.ts";
 import type { ResolvedRole } from "../roles/types.ts";
-import { ORCHESTRATION_TOOLS } from "../profile.ts";
+import { ORCHESTRATION_TOOLS, WEB_TOOLS } from "../profile.ts";
 import { piIntegrationCurrent, readHerdrPresence } from "./presence.ts";
 
 /** CLI seam. Not an AgentRuntime. */
@@ -122,7 +122,7 @@ async function superviseOnce(input: {
   try {
     const startArgs = ["agent", "start", instanceId, "--kind", "pi", "--pane", paneId, "--", "--model", target.model];
     if (target.reasoning) startArgs.push("--thinking", target.reasoning);
-    startArgs.push("--no-approve", "--append-system-prompt", preamble(role, instanceId), "--exclude-tools", ORCHESTRATION_TOOLS.join(","));
+    startArgs.push("--no-approve", "--append-system-prompt", preamble(role, instanceId), "--exclude-tools", [...ORCHESTRATION_TOOLS, ...(role.id === "scout" ? WEB_TOOLS : [])].join(","));
     const start = await exec(run, startArgs, input.cwd, signal);
     const startFailure = failureCode(start);
     if (startFailure) {

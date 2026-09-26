@@ -24,7 +24,10 @@ export const ORCHESTRATION_TOOLS = [
   "team_cancel",
 ] as const;
 
+export const WEB_TOOLS = ["web_search", "fetch_content", "source_check", "get_search_content", "web_enable"] as const;
+
 const ORCHESTRATION = new Set<string>(ORCHESTRATION_TOOLS);
+const WEB_TOOL_SET = new Set<string>(WEB_TOOLS);
 
 const NAVIGATION_GUIDANCE = "Inspect the repo first. Keep raw read/grep/bash/LSP/CodeGraph available. For bounded structural code questions, choose an appropriate supported dense query; use raw tools for literal, exhaustive or exact results; follow up with raw tools if a query/backend is partial or unavailable.";
 
@@ -47,15 +50,20 @@ export function parseProfile(value: unknown): ProfileName {
   );
 }
 
-/** Coding tools for a child session. PowerShell follows the platform, same as a fresh coding profile. */
+export function effectiveProfile(profile: ProfileName, roleId?: string): ProfileName {
+  return roleId === "scout" ? "analysis" : profile;
+}
+
+/** Profile tools for a child session. PowerShell follows the platform, same as a fresh coding profile. */
 export function childActiveTools(
   available: readonly string[],
   platform: NodeJS.Platform = process.platform,
   roleId?: string,
+  profile: ProfileName = "coding",
 ): string[] {
   return toolsForProfile({
     available,
-    profile: "coding",
+    profile,
     roleId,
     includePowerShell: platform === "win32" && available.includes("powershell"),
   }).filter((name) => !ORCHESTRATION.has(name));
@@ -68,13 +76,15 @@ export function toolsForProfile(options: {
   includePowerShell?: boolean;
 }): string[] {
   const available = new Set(options.available);
-  const builtins = options.profile === "coding" ? CODING_BUILTINS : ANALYSIS_BUILTINS;
+  const effective = effectiveProfile(options.profile, options.roleId);
+  const builtins = effective === "coding" ? CODING_BUILTINS : ANALYSIS_BUILTINS;
   const names: string[] = builtins.filter((name) => available.has(name));
   if (options.includePowerShell && available.has("powershell")) names.push("powershell");
   for (const name of options.available) {
     if (BUILTIN_TOOLS.has(name)) continue;
+    if (options.roleId === "scout" && WEB_TOOL_SET.has(name)) continue;
     if (name === "apply_patch" && options.roleId !== "developer") continue;
-    if (options.profile === "analysis" && MUTATING_TOOLS.has(name)) continue;
+    if (effective === "analysis" && MUTATING_TOOLS.has(name)) continue;
     names.push(name);
   }
   return names;
@@ -105,10 +115,16 @@ export function profileNote(profile: ProfileName): string {
 }
 
 /** True for an AgentInstance. Does not claim the user picked the model. */
-export function childSessionNote(instanceId: string): string {
+export function childSessionNote(instanceId: string, roleId?: string): string {
   return [
     `Pitako AgentInstance ${instanceId}.`,
     "The model and reasoning come from this role's ModelPolicy, not from the parent session.",
+    "Foreground orchestration tools are not enabled.",
+    ...(roleId === "scout" ? [
+      "Pitako profile: analysis.",
+      "Read and search tools are enabled. edit, write, apply_patch, and lsp_rename are not enabled.",
+      "Web tools are not enabled. Shell remains available; this profile is not a sandbox.",
+    ] : []),
     NAVIGATION_GUIDANCE,
     "Keep diffs small. Verify real behavior before claiming done.",
     "Board tools are pull-only. rpiv-todo is private to this session. Do not spawn agents.",

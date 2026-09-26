@@ -12,7 +12,7 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { registerExecution, unregisterExecution } from "../execution-identity.ts";
-import { childActiveTools, ORCHESTRATION_TOOLS } from "../profile.ts";
+import { childActiveTools, ORCHESTRATION_TOOLS, WEB_TOOLS } from "../profile.ts";
 import { marksSideEffect } from "./effects.ts";
 import { isServiceTierRejection } from "./fallback.ts";
 import { childInstructions, skillNamesForRole, usageDelta, type AgentRequestObservation, type AgentUsage, type Attempt, type AttemptExecutor } from "./run.ts";
@@ -343,7 +343,7 @@ async function openSession(
     resourceLoader: loader,
     customTools: childTools,
     modelRuntime: runtime,
-    excludeTools: [...ORCHESTRATION_TOOLS],
+    excludeTools: input.role.id === "scout" ? [...ORCHESTRATION_TOOLS, ...WEB_TOOLS] : [...ORCHESTRATION_TOOLS],
   });
   session.setActiveToolsByName(childActiveTools(session.getAllTools().map((tool) => tool.name), process.platform, input.role.id));
   registerExecution({ instanceId: input.instanceId, roleId: input.role.id, sessionId: session.sessionId });

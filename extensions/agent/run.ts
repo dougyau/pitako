@@ -214,6 +214,9 @@ export function createInstanceId(roleId: string): string {
 }
 
 export function childInstructions(role: ResolvedRole, instanceId: string): string {
+  const navigationInstruction = role.id === "scout"
+    ? "Keep raw read, grep, LSP, CodeGraph, and bash available. Use dense queries for bounded code questions; fall back to raw when needed."
+    : "Keep raw read, grep, LSP, CodeGraph, bash and edit available. Use dense queries for bounded code questions; fall back to raw when needed.";
   return [
     `You are Pitako AgentInstance ${instanceId}, role ${role.id}.`,
     "Your conversation is private. Do not assume you saw the parent session.",
@@ -221,6 +224,7 @@ export function childInstructions(role: ResolvedRole, instanceId: string): strin
     "Publish shared findings on the Board. Board contents are not injected here.",
     "Your rpiv-todo list is private to this session.",
     "The model and reasoning for this run come from this role's ModelPolicy, not from the parent session.",
+    navigationInstruction,
     "",
     role.instructions,
   ].join("\n");

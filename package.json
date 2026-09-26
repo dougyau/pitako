@@ -1,7 +1,7 @@
 {
   "name": "pitako",
   "version": "0.1.0",
-  "description": "Opinionated Pi coding baseline: LSP, CodeGraph, Ponytail, selected Caveman and pstack skills, and coding/analysis profiles.",
+  "description": "Opinionated Pi coding baseline: LSP, CodeGraph, web research, selected skills, and coding/analysis profiles.",
   "type": "module",
   "license": "MIT",
   "keywords": ["pi-package", "pi", "coding-agent", "pitako"],
@@ -35,6 +35,7 @@
       "./extensions/code-intelligence/codegraph-raw.ts",
       "./extensions/code-intelligence/index.ts",
       "./node_modules/@juicesharp/rpiv-todo/index.ts",
+      "./node_modules/pi-web-access/dist/index.js",
       "./extensions/board/index.ts",
       "./extensions/agent/index.ts",
       "./extensions/index.ts"
@@ -59,6 +60,7 @@
     "@dietrichgebert/ponytail": "4.10.0",
     "@juicesharp/rpiv-todo": "2.11.0",
     "@vndv/pi-codegraph": "0.1.10",
+    "pi-web-access": "0.31.0",
     "pi-codex-tools": "0.3.0",
     "pi-lsp-client": "github:code-yeongyu/pi-lsp-client#1c981dfcacc456fe4ce9f4120a2f0250b54d6844",
     "smol-toml": "1.8.0"
@@ -68,6 +70,7 @@
     "@dietrichgebert/ponytail",
     "@juicesharp/rpiv-todo",
     "@vndv/pi-codegraph",
+    "pi-web-access",
     "pi-lsp-client",
     "pi-codex-tools"
   ],

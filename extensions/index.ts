@@ -4,11 +4,11 @@ import { PitakoConfigError } from "./errors.ts";
 import { isProtectedEditPath } from "./paths.ts";
 import { canonicalPath } from "./board/paths.ts";
 import { bindBackgroundOwner, shutdownBackground, takeHeldCompletions } from "./agent/background.ts";
-import { beginTeamEvaluation, retireTeamEvaluation, teamEvaluationForSession, teamAssignments, type TeamEvaluation } from "./team.ts";
+import { TEAM_ROLES, beginTeamEvaluation, retireTeamEvaluation, teamEvaluationForSession, teamAssignments, type TeamEvaluation } from "./team.ts";
 import { teamWorkerStatus } from "./agent/background.ts";
 import { bindAgentUi, listObservations, unbindAgentUi } from "./agent/observe.ts";
 import { formatAgentsDetail } from "./agent/ui.ts";
-import { childSessionNote, ORCHESTRATION_TOOLS, parseProfile, profileNote, toolsForProfile, type ProfileName } from "./profile.ts";
+import { childActiveTools, childSessionNote, effectiveProfile, parseProfile, profileNote, toolsForProfile, type ProfileName } from "./profile.ts";
 import { currentInstanceId, currentRoleId } from "./agent/scope.ts";
 import { executionForSession } from "./execution-identity.ts";
 import { formatUsage, mergeUsage, type AgentUsage } from "./agent/run.ts";
@@ -39,12 +39,15 @@ function sessionRoleId(): string | undefined {
 function applyProfile(pi: ExtensionAPI, profile: ProfileName, roleId?: string): string[] {
   const available = pi.getAllTools().map((tool) => tool.name);
   const active = pi.getActiveTools();
-  const next = toolsForProfile({
-    available,
-    profile,
-    roleId,
-    includePowerShell: process.platform === "win32" || active.includes("powershell"),
-  });
+  const child = Boolean(currentInstanceId() || process.env.PITAKO_INSTANCE_ID);
+  const next = child
+    ? childActiveTools(available, process.platform, roleId, profile)
+    : toolsForProfile({
+        available,
+        profile,
+        roleId,
+        includePowerShell: process.platform === "win32" || active.includes("powershell"),
+      });
   pi.setActiveTools(next);
   return next;
 }
@@ -188,13 +191,7 @@ export default function pitako(pi: ExtensionAPI) {
     const instanceId = currentInstanceId();
     if (instanceId || process.env.PITAKO_INSTANCE_ID) {
       const available = pi.getAllTools().map((tool) => tool.name);
-      const coding = toolsForProfile({
-        available,
-        profile: "coding",
-        roleId: sessionRoleId(),
-        includePowerShell: process.platform === "win32" || pi.getActiveTools().includes("powershell"),
-      }).filter((name) => !ORCHESTRATION_TOOLS.includes(name as (typeof ORCHESTRATION_TOOLS)[number]));
-      pi.setActiveTools(coding);
+      pi.setActiveTools(childActiveTools(available, process.platform, sessionRoleId()));
     } else {
       applyProfile(pi, profile);
     }
@@ -261,8 +258,8 @@ export default function pitako(pi: ExtensionAPI) {
     if (action.set !== undefined) pi.setSessionName(action.set);
     if (ctx.hasUI) ctx.ui.setStatus("pitako", pi.getSessionName() || undefined);
 
-    const instanceId = currentInstanceId();
-    const note = instanceId ? childSessionNote(instanceId) : profileNote(profile);
+    const instanceId = currentInstanceId() ?? process.env.PITAKO_INSTANCE_ID;
+    const note = instanceId ? childSessionNote(instanceId, sessionRoleId()) : profileNote(profile);
     const current = event.systemPrompt ?? "";
     if (current.includes(note)) return undefined;
     return { systemPrompt: current.length > 0 ? `${current}\n\n${note}` : note };
@@ -289,13 +286,12 @@ export default function pitako(pi: ExtensionAPI) {
           notify(ctx, "Team unavailable for this session", "error");
           return;
         }
-        const roles = ["architect", "developer", "reviewer", "researcher"];
         const rows = teamAssignments(evaluation).map((slot, index) => {
           const assignment = slot.current ?? slot.last;
-          if (!assignment) return { role: roles[index], status: "idle" };
+          if (!assignment) return { role: TEAM_ROLES[index], status: "idle" };
           const view = teamWorkerStatus(evaluation.token, assignment.instanceId)[0];
           return {
-            role: roles[index],
+            role: TEAM_ROLES[index],
             assignmentId: assignment.id,
             instanceId: assignment.instanceId,
             status: view?.status ?? "settled",
@@ -362,12 +358,12 @@ export default function pitako(pi: ExtensionAPI) {
         profile = parseProfile(value);
         const tools = applyProfile(pi, profile, sessionRoleId());
         if (ctx.hasUI) {
-          ctx.ui.notify(`Pitako profile: ${profile} (${tools.length} tools)`, "info");
+          ctx.ui.notify(`Pitako profile: ${effectiveProfile(profile, sessionRoleId())} (${tools.length} tools)`, "info");
         }
         return;
       }
       const lines = [
-        `Pitako profile: ${profile}`,
+        `Pitako profile: ${effectiveProfile(profile, sessionRoleId())}`,
         "coding: read, bash, edit, write, grep, find, ls, LSP, CodeGraph, todo; apply_patch is Developer AgentInstance-only with task-scoped batch guidance.",
         "analysis: read, bash, grep, find, ls, LSP, CodeGraph, todo; no edit, write, apply_patch, or lsp_rename",
         "Code intelligence: project_report, read_symbol, read_enclosing, module_report, inspect_symbol, review_surface; raw navigation remains available.",

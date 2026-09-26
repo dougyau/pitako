@@ -1,6 +1,6 @@
 # Engineering layer
 
-Pitako 0.1 is a Pi package. This note records its dependency choices, Board, roles, AgentInstance, Team assignments, Code Intelligence, and `$plan` / `$execute`. There is no DAG scheduler.
+Pitako 0.1 is a Pi package. This note records its dependency choices, Board, roles, AgentInstance, Team assignments, Code Intelligence, Herdr supervision, and `$plan` / `$execute`. There is no DAG scheduler.
 
 ## Decisions
 
@@ -62,7 +62,7 @@ The extension registers tools and `/board`. It does not subscribe to agent event
 
 ## Roles and model policies
 
-A role is a template. It is not an AgentInstance. Built-in roles are coordinator, architect, developer, reviewer, and researcher. Instructions are markdown under `roles/`. `config/defaults.toml` holds names, skill lists, principle lists, and empty model policies. No concrete provider is shipped.
+A role is a template. It is not an AgentInstance. Built-in roles are coordinator, architect, developer, reviewer, researcher, and scout. Scout retrieves bounded local source fragments for caller-specified targets; the specialist interprets them. Researcher investigates external and upstream questions and may inspect the workspace for context. Bundled pi-web-access default tools (`web_search`, `fetch_content`, `source_check`, `get_search_content`, `web_enable`) may be available in the foreground Coordinator and in Architect, Developer, Reviewer, and Researcher child sessions; Scout excludes these default names but still has `bash`, so this is not a network sandbox. With active Pi provider `openai-codex`, auto search may use existing Pi Codex auth to send queries to OpenAI before no-key Exa MCP; GitHub repository fetches may run `gh repo clone` or `git clone` as the Pi process user. Use only in trusted environments because extensions run with the Pi process's permissions; do not commit credentials. Access to web tools does not authorize Researcher to edit files. Instructions are markdown under `roles/`. `config/defaults.toml` holds names, skill lists, principle lists, and empty model policies. No concrete provider is shipped.
 
 User config is `$PI_CODING_AGENT_DIR/pitako/config.toml`. `smol-toml` parses it. There was no TOML parser in the tree. Scalar overrides replace one field. Skill, principle, primary, and fallback arrays replace the whole list when present and stay when omitted.
 
