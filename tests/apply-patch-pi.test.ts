@@ -61,17 +61,30 @@ describe("apply_patch Pi result hook", () => {
       foreground.session.dispose();
     }
 
-    for (const roleId of ["architect", "reviewer", "researcher", "developer"]) {
+    for (const roleId of ["architect", "reviewer", "researcher", "developer", "scout"]) {
       const child = await create();
       try {
         const available = child.session.getAllTools().map((tool) => tool.name);
         expect(available).toContain("apply_patch");
         child.session.setActiveToolsByName(childActiveTools(available, process.platform, roleId));
         expect(child.session.getActiveToolNames().includes("apply_patch")).toBe(roleId === "developer");
+        if (roleId === "scout") {
+          for (const name of ["edit", "write", "apply_patch", "lsp_rename"]) expect(child.session.getActiveToolNames()).not.toContain(name);
+          expect(child.session.getActiveToolNames()).toEqual(expect.arrayContaining(["read", "bash"]));
+        }
         child.session.setActiveToolsByName(toolsForProfile({ available, profile: "coding", roleId }));
         expect(child.session.getActiveToolNames().includes("apply_patch")).toBe(roleId === "developer");
+        if (roleId === "scout") {
+          for (const name of ["edit", "write", "apply_patch", "lsp_rename"]) expect(child.session.getActiveToolNames()).not.toContain(name);
+          expect(child.session.getActiveToolNames()).toEqual(expect.arrayContaining(["read", "bash"]));
+        }
+        const activeBeforeModel = child.session.getActiveToolNames();
         await child.session.setModel(model, { persist: false });
         expect(child.session.getActiveToolNames().includes("apply_patch")).toBe(roleId === "developer");
+        if (roleId === "scout") {
+          expect(child.session.getActiveToolNames()).toEqual(activeBeforeModel);
+          for (const name of ["edit", "write", "apply_patch", "lsp_rename"]) expect(child.session.getActiveToolNames()).not.toContain(name);
+        }
       } finally {
         child.session.dispose();
       }

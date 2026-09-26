@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { isProtectedEditPath } from "../extensions/paths.ts";
-import { childActiveTools, childSessionNote, parseProfile, profileNote, toolsForProfile } from "../extensions/profile.ts";
+import { childActiveTools, childSessionNote, ORCHESTRATION_TOOLS, parseProfile, profileNote, toolsForProfile, WEB_TOOLS } from "../extensions/profile.ts";
 
 const available = [
   "read",
@@ -20,6 +20,8 @@ const available = [
   "todo",
   "board_post",
   "board_query",
+  ...WEB_TOOLS,
+  ...ORCHESTRATION_TOOLS,
 ];
 
 describe("profiles", () => {
@@ -45,6 +47,28 @@ describe("profiles", () => {
     for (const name of ["edit", "write", "apply_patch", "lsp_rename"]) {
       expect(tools).not.toContain(name);
     }
+  });
+
+  test("Scout keeps analysis tools across coding selection and child profiles exclude orchestration", () => {
+    const scout = childActiveTools(available, process.platform, "scout");
+    for (const name of ["read", "bash", "grep", "find", "ls", "lsp_diagnostics", "codegraph_callers"]) {
+      expect(scout).toContain(name);
+    }
+    for (const name of ["edit", "write", "apply_patch", "lsp_rename", ...ORCHESTRATION_TOOLS]) {
+      expect(scout).not.toContain(name);
+    }
+    const codingRequest = toolsForProfile({ available, profile: "coding", roleId: "scout" });
+    for (const name of ["read", "bash", "grep", "find", "ls", "lsp_diagnostics", "codegraph_callers"]) {
+      expect(codingRequest).toContain(name);
+    }
+    for (const name of ["edit", "write", "apply_patch", "lsp_rename"]) expect(codingRequest).not.toContain(name);
+    for (const name of WEB_TOOLS) {
+      expect(scout).not.toContain(name);
+      expect(codingRequest).not.toContain(name);
+      expect(childActiveTools(available, process.platform, "researcher")).toContain(name);
+      expect(toolsForProfile({ available, profile: "analysis" })).toContain(name);
+    }
+    expect(childActiveTools(available, process.platform, "developer")).toContain("apply_patch");
   });
 
   test("powershell is included only when requested", () => {
@@ -77,6 +101,12 @@ describe("profiles", () => {
     expect(analysis).toContain("edit, write, apply_patch, and lsp_rename are not");
     expect(analysis).toContain("this profile is not a sandbox");
     expect(coding.length).toBeLessThan(800);
+    const scout = childSessionNote("scout-instance", "scout");
+    expect(scout).toContain("Pitako profile: analysis.");
+    expect(scout).toContain("edit, write, apply_patch, and lsp_rename are not enabled");
+    expect(scout).toContain("Shell remains available; this profile is not a sandbox.");
+    expect(scout).toContain("Foreground orchestration tools are not enabled.");
+    expect(scout).not.toContain("Keep edit and write active");
   });
 });
 

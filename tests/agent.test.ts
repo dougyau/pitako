@@ -79,6 +79,40 @@ describe("agent instance", () => {
     expect(zeros).toMatchObject({ input: 0, output: 0, estimatedCost: 0, turns: 0, toolCalls: 0, tools: {} });
   });
 
+  test("Scout instructions and skills stay focused on retrieval without changing other roles", () => {
+    const env = tempEnv();
+    const scout = resolveRole("scout", { env });
+    const scoutSkills = skillNamesForRole(scout);
+    const scoutPrompt = childInstructions(scout, "scout-test");
+    expect(scoutSkills).not.toContain("how");
+    expect(scoutPrompt).toContain("at most three relevant hits");
+    expect(scoutPrompt).toContain("relative path");
+    expect(scoutPrompt).not.toContain("Keep raw read, grep, LSP, CodeGraph, bash and edit available as the navigation baseline.");
+
+    const architectPrompt = childInstructions(resolveRole("architect", { env }), "architect-test");
+    expect(architectPrompt).toContain("Keep raw read, grep, LSP, CodeGraph, bash and edit available. Use dense queries for bounded code questions; fall back to raw when needed.");
+  });
+
+  test("Scout runs through the normal role resolver", async () => {
+    const env = tempEnv();
+    const userConfigPath = path.join(env.PI_CODING_AGENT_DIR!, "pitako", "config.toml");
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(path.dirname(userConfigPath), { recursive: true });
+    writeFileSync(userConfigPath, `[model_policies.scout.primary]\nmodel = "example/scout"\nreasoning = "low"\n`);
+    const result = await runAgentInstance({
+      roleId: "scout",
+      task: "review the boundary",
+      cwd: packageRoot(),
+      executor: scripted([{ status: "completed", result: "repository map", sideEffects: false, appliedReasoning: "low" }]),
+      load: { env, userConfigPath },
+    });
+    expect(result.role).toBe("scout");
+    expect(result.instanceId).toMatch(/^scout-/);
+    expect(result.model.selectedModel).toBe("example/scout");
+    expect(result.model.appliedReasoning).toBe("low");
+    expect(result.result).toBe("repository map");
+  });
+
   test("usage adds failed attempts and cancel keeps the last attempted target", async () => {
     const env = tempEnv();
     const configured = { env, userConfigPath: path.join(env.PI_CODING_AGENT_DIR!, "pitako", "config.toml") };

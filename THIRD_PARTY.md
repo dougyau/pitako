@@ -11,6 +11,7 @@ Pitako composes and vendors MIT material. It does not ship BSL Caveman runtime.
 | [pi-lsp-client](https://github.com/code-yeongyu/pi-lsp-client) | MIT | LSP tools |
 | [pi-codex-tools](https://github.com/jvm/pi-mono/tree/main/packages/pi-codex-tools) 0.3.0 | Apache-2.0; OpenAI Codex attribution | Public parser and grammar exports only; extension and install telemetry are not loaded. |
 | [@vndv/pi-codegraph](https://github.com/vndv/pi-codegraph) | MIT | CodeGraph tools |
+| [pi-web-access](https://github.com/nicobailon/pi-web-access) 0.31.0 | MIT | Web search and content retrieval (also supports PDF, video, and cloning) |
 | [@colbymchenry/codegraph](https://github.com/colbymchenry/codegraph) | MIT | CodeGraph CLI |
 | [Pi](https://github.com/earendil-works/pi) | MIT | Host |
 

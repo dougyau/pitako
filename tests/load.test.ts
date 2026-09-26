@@ -4,21 +4,23 @@ import { describe, expect, test } from "bun:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import pitako from "../extensions/index.ts";
 import { agentScope } from "../extensions/agent/scope.ts";
+import { ORCHESTRATION_TOOLS, WEB_TOOLS } from "../extensions/profile.ts";
 import { packageRoot } from "../extensions/stack.ts";
 import { loadPitako, registeredToolNames } from "../scripts/load-pitako.ts";
 
 function profileHarness(profileFlag?: string) {
   const active = ["read", "bash", "edit", "write"];
+  const notices: string[] = [];
   const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
   let profileCommand: ((args: string, ctx: unknown) => Promise<void>) | undefined;
   const available = [
     "read", "bash", "edit", "write", "apply_patch", "grep", "find", "ls",
-    "lsp_diagnostics", "lsp_rename", "codegraph_search", "project_report", "read_symbol",
+    "lsp_diagnostics", "lsp_rename", "codegraph_search", "project_report", "read_symbol", ...WEB_TOOLS, ...ORCHESTRATION_TOOLS,
   ];
   const context = {
     cwd: packageRoot(),
-    hasUI: false,
-    ui: { notify() {}, setStatus() {} },
+    hasUI: true,
+    ui: { notify(message: string) { notices.push(message); }, setStatus() {} },
     sessionManager: { getSessionId: () => `test-${profileFlag ?? "coding"}`, getEntries: () => [] },
   };
   const pi = {
@@ -39,6 +41,7 @@ function profileHarness(profileFlag?: string) {
   return {
     active,
     context,
+    notices,
     async start() {
       const handler = handlers.get("session_start");
       if (!handler) throw new Error("session_start was not registered");
@@ -54,6 +57,15 @@ function profileHarness(profileFlag?: string) {
       const result = await handler({ systemPrompt }, context) as { systemPrompt?: string } | undefined;
       return result?.systemPrompt ?? systemPrompt;
     },
+    async showStatus() {
+      if (!profileCommand) throw new Error("pitako command was not registered");
+      await profileCommand("", context);
+    },
+    async beforeAgentStart(): Promise<{ systemPrompt?: string } | undefined> {
+      const handler = handlers.get("before_agent_start");
+      if (!handler) throw new Error("before_agent_start was not registered");
+      return await handler({ prompt: "Inspect the repository", systemPrompt: "" }, context) as { systemPrompt?: string } | undefined;
+    },
     async shutdown() {
       await handlers.get("session_shutdown")?.({}, context);
     },
@@ -61,7 +73,7 @@ function profileHarness(profileFlag?: string) {
 }
 
 describe("Pi package loading", () => {
-  test("discovers Pitako, LSP, and CodeGraph from a relative package path", async () => {
+  test("discovers Pitako, LSP, CodeGraph, and web tools from a relative package path", async () => {
     const root = packageRoot();
     const loaded = await loadPitako(root);
     expect(path.isAbsolute(loaded.relativePackagePath)).toBe(false);
@@ -72,6 +84,7 @@ describe("Pi package loading", () => {
     expect(paths.some((file) => file.includes(`${path.sep}pi-lsp-client${path.sep}`))).toBe(true);
     expect(paths.some((file) => file.endsWith(`${path.sep}codegraph-raw.ts`))).toBe(true);
     expect(paths.some((file) => file.includes(`${path.sep}rpiv-todo${path.sep}`))).toBe(true);
+    expect(paths.some((file) => file.endsWith(`${path.sep}pi-web-access${path.sep}dist${path.sep}index.js`))).toBe(true);
     expect(paths.some((file) => file.endsWith(`${path.sep}extensions${path.sep}board${path.sep}index.ts`))).toBe(true);
     for (const file of paths) expect(file.startsWith(root)).toBe(true);
 
@@ -84,6 +97,7 @@ describe("Pi package loading", () => {
       expect(names).toContain(name);
     }
     expect(names).toContain("todo");
+    for (const name of WEB_TOOLS) expect(names).toContain(name);
     for (const name of ["board_topic_create", "board_topic_list", "board_topic_read", "board_topic_update", "board_post", "board_query"]) {
       expect(names).toContain(name);
     }
@@ -135,6 +149,9 @@ describe("Pi package loading", () => {
     expect(foreground.active).toContain("write");
     expect(foreground.active).not.toContain("apply_patch");
     await foreground.selectProfile("coding");
+    expect(foreground.active).toContain("edit");
+    expect(foreground.active).toContain("write");
+    expect(foreground.notices.at(-1)).toContain("Pitako profile: coding");
     expect(foreground.active).not.toContain("apply_patch");
     await foreground.start();
     expect(foreground.active).not.toContain("apply_patch");
@@ -152,10 +169,13 @@ describe("Pi package loading", () => {
       await agentScope.run({ instanceId: "developer-looking-instance-id", roleId }, async () => {
         await child.start();
         expect(child.active).not.toContain("apply_patch");
+        for (const name of ORCHESTRATION_TOOLS) expect(child.active).not.toContain(name);
         await child.selectProfile("coding");
         expect(child.active).not.toContain("apply_patch");
+        for (const name of ORCHESTRATION_TOOLS) expect(child.active).not.toContain(name);
         await child.start();
         expect(child.active).not.toContain("apply_patch");
+        for (const name of ORCHESTRATION_TOOLS) expect(child.active).not.toContain(name);
       });
       await child.shutdown();
     }
@@ -164,10 +184,12 @@ describe("Pi package loading", () => {
     await agentScope.run({ instanceId: "not-role-derived-from-this-id", roleId: "developer" }, async () => {
       await developer.start();
       expect(developer.active).toContain("apply_patch");
+      for (const name of ORCHESTRATION_TOOLS) expect(developer.active).not.toContain(name);
       await developer.selectProfile("analysis");
       expect(developer.active).not.toContain("apply_patch");
       await developer.selectProfile("coding");
       expect(developer.active).toContain("apply_patch");
+      for (const name of ORCHESTRATION_TOOLS) expect(developer.active).not.toContain(name);
       await developer.start();
       expect(developer.active).toContain("apply_patch");
     });
@@ -207,6 +229,53 @@ describe("Pi package loading", () => {
       await foreground.selectProfile("coding");
       expect(foreground.active).not.toContain("apply_patch");
       await foreground.shutdown();
+    } finally {
+      if (previousId === undefined) delete process.env.PITAKO_INSTANCE_ID;
+      else process.env.PITAKO_INSTANCE_ID = previousId;
+      if (previousRole === undefined) delete process.env.PITAKO_ROLE_ID;
+      else process.env.PITAKO_ROLE_ID = previousRole;
+    }
+  });
+
+  test("Scout stays on analysis tools and gets correct SDK and Herdr notes", async () => {
+    const forbidden = ["edit", "write", "apply_patch", "lsp_rename", "agent_run", "agent_supervise", "agent_spawn", "team_assign", ...WEB_TOOLS];
+    const sdk = profileHarness();
+    await agentScope.run({ instanceId: "scout-sdk", roleId: "scout" }, async () => {
+      await sdk.start();
+      for (const name of forbidden) expect(sdk.active).not.toContain(name);
+      expect(sdk.active).toContain("read");
+      expect(sdk.active).toContain("bash");
+      await sdk.selectProfile("coding");
+      for (const name of forbidden) expect(sdk.active).not.toContain(name);
+      expect(sdk.notices.at(-1)).toContain("Pitako profile: analysis (");
+      await sdk.showStatus();
+      expect(sdk.notices.at(-1)).toContain("Pitako profile: analysis\n");
+      const note = await sdk.beforeAgentStart();
+      expect(note?.systemPrompt).toContain("Pitako profile: analysis.");
+      expect(note?.systemPrompt).toContain("this profile is not a sandbox");
+    });
+    await sdk.shutdown();
+
+    const previousId = process.env.PITAKO_INSTANCE_ID;
+    const previousRole = process.env.PITAKO_ROLE_ID;
+    try {
+      process.env.PITAKO_INSTANCE_ID = "scout-herdr";
+      process.env.PITAKO_ROLE_ID = "scout";
+      const herdr = profileHarness();
+      await herdr.start();
+      for (const name of forbidden) expect(herdr.active).not.toContain(name);
+      expect(herdr.active).toContain("read");
+      expect(herdr.active).toContain("bash");
+      await herdr.selectProfile("coding");
+      for (const name of forbidden) expect(herdr.active).not.toContain(name);
+      expect(herdr.notices.at(-1)).toContain("Pitako profile: analysis (");
+      await herdr.showStatus();
+      expect(herdr.notices.at(-1)).toContain("Pitako profile: analysis\n");
+      const note = await herdr.beforeAgentStart();
+      expect(note?.systemPrompt).toContain("Pitako AgentInstance scout-herdr.");
+      expect(note?.systemPrompt).toContain("Pitako profile: analysis.");
+      expect(note?.systemPrompt).toContain("this profile is not a sandbox");
+      await herdr.shutdown();
     } finally {
       if (previousId === undefined) delete process.env.PITAKO_INSTANCE_ID;
       else process.env.PITAKO_INSTANCE_ID = previousId;

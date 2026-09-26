@@ -3,7 +3,8 @@ import { executionForSession } from "./execution-identity.ts";
 import { readLedgerTeamHolds, updateLedgerTeamHold, type ExecutionBinding } from "./workflow.ts";
 
 const KEY = Symbol.for("pitako.teamRegistry");
-const TEAM_ROLES = new Set(["architect", "developer", "reviewer", "researcher"]);
+export const TEAM_ROLES = ["architect", "developer", "reviewer", "researcher", "scout"] as const;
+const TEAM_ROLE_SET = new Set<string>(TEAM_ROLES);
 
 export interface TeamAssignment {
   id: string;
@@ -71,7 +72,7 @@ export function reserveTeamRole(
   const state = registry();
   const current = state.evaluations.get(evaluation.sessionId);
   if (!current || current.token !== evaluation.token) throw new Error("stale Team evaluation");
-  if (!TEAM_ROLES.has(roleId)) throw new Error(`unsupported Team role ${roleId}`);
+  if (!TEAM_ROLE_SET.has(roleId)) throw new Error(`unsupported Team role ${roleId}`);
   if (current.roles.has(roleId)) throw new Error(`Team role ${roleId} is already reserved`);
   current.roles.set(roleId, assignmentId);
   let committed = false;
@@ -131,7 +132,7 @@ export function recordTeamAssignment(evaluation: TeamEvaluation, roleId: string,
 export function teamAssignments(evaluation: TeamEvaluation): readonly { current?: TeamAssignment; last?: TeamAssignment }[] {
   const current = registry().evaluations.get(evaluation.sessionId);
   if (current?.token !== evaluation.token) throw new Error("stale Team evaluation");
-  return ["architect", "developer", "reviewer", "researcher"].map((role) => current.assignments.get(role) ?? {});
+  return TEAM_ROLES.map((role) => current.assignments.get(role) ?? {});
 }
 
 export function teamExecutionBinding(evaluation: TeamEvaluation | undefined, planId: string): ExecutionBinding | undefined {

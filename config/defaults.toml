@@ -69,13 +69,24 @@ principles = [
 
 [roles.researcher]
 name = "Researcher"
-description = "Investigates unfamiliar systems and reports evidence."
+description = "Investigates external and upstream questions, using local context as needed; Scout can retrieve bounded local source fragments, while specialists interpret them."
 instructions = "roles/researcher.md"
 model_policy = "researcher"
 skills = [
   "how",
   "why",
 ]
+principles = [
+  "principle-guard-the-context-window",
+  "principle-prove-it-works",
+]
+
+[roles.scout]
+name = "Scout"
+description = "Retrieves bounded local source fragments for caller-specified targets; specialists interpret the evidence."
+instructions = "roles/scout.md"
+model_policy = "scout"
+skills = []
 principles = [
   "principle-guard-the-context-window",
   "principle-prove-it-works",
@@ -91,3 +102,4 @@ max_run_time = "0"
 [model_policies.developer]
 [model_policies.reviewer]
 [model_policies.researcher]
+[model_policies.scout]

@@ -53,7 +53,7 @@ The `architect` skill continues into implementation when the user asked to build
 
 During `$plan`, call the Architect role with `agent_run`. The task must be design-only: inspect, reason, model, propose, critique. It must say not to modify product files. If `agent_run` fails, report the error. Do not do that role yourself.
 
-Use the Researcher role only for a real external or knowledge gap. Use the Reviewer role for one independent critique of an architectural plan. The reviewer is adversarial by definition: challenge passing tests and probe violated invariants, negative paths, lifecycle, concurrency, identity/path assumptions, stale state, mocks, coverage, and frozen criteria. The reviewer reports findings and never fixes or implements.
+Use Scout for substantial local source-fragment retrieval when the target, roots, exclusions, and needed evidence can be bounded; the caller interprets the fragments. Trivial lookups do not need delegation. Use Researcher for external documentation, releases, APIs, or upstream questions; it may inspect the workspace to contextualize them. Keep local interpretation and repository maps with the relevant specialist. Refer upstream version questions from Scout to Researcher. Use the Reviewer role for one independent critique of an architectural plan. The reviewer is adversarial by definition: challenge passing tests and probe violated invariants, negative paths, lifecycle, concurrency, identity/path assumptions, stale state, mocks, coverage, and frozen criteria. The reviewer reports findings and never fixes or implements.
 
 Use Caveman for ephemeral child communication: Architect lite, Reviewer lite, Researcher full. Do not write Caveman grammar into the plan file.
 

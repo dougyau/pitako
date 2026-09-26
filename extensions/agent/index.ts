@@ -25,7 +25,7 @@ import { existsSync } from "node:fs";
 import { openBoard } from "../board/store.ts";
 import { boardWorkspace, currentWorkspace } from "../board/workspace.ts";
 import { ledgerFile, openExecutionPlan, planFile, readFrozenPlan, readPlan, type ExecutionBinding, type PlanMeta } from "../workflow.ts";
-import { teamEvaluationForSession, reserveTeamRole, recordTeamAssignment, recordPlanTeamWork, teamAssignments, type TeamAssignment } from "../team.ts";
+import { TEAM_ROLES, teamEvaluationForSession, reserveTeamRole, recordTeamAssignment, recordPlanTeamWork, teamAssignments, type TeamAssignment } from "../team.ts";
 
 const noExtra = { additionalProperties: false } as const;
 
@@ -96,7 +96,6 @@ export default function agentInstance(pi: ExtensionAPI): void {
 }
 
 function registerTeamTools(pi: ExtensionAPI): void {
-  const roles = ["architect", "developer", "reviewer", "researcher"] as const;
   const evaluationFor = (ctx: { sessionManager?: { getSessionId?: () => string | undefined } }) =>
     teamEvaluationForSession(
       typeof ctx.sessionManager?.getSessionId === "function" ? ctx.sessionManager.getSessionId() : undefined,
@@ -117,7 +116,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
     promptSnippet: "Assign independent work to a Team role",
     promptGuidelines: ["Use team_assign for independent long work. Keep task scoped. Do not wait or poll; on a watched plan/unit completion wake, resume and fetch it with team_result using the assignment ID."],
     parameters: Type.Object({
-      role: Type.String({ enum: [...roles] }),
+      role: Type.String({ enum: [...TEAM_ROLES] }),
       task: Type.String({ minLength: 1, description: "Scoped WorkBrief for this role" }),
       plan: Type.Optional(Type.String()),
       unit: Type.Optional(Type.String()),
@@ -202,7 +201,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
         const evaluation = evaluationFor(ctx);
         if (!evaluation) throw new Error("Team requires a foreground session identity");
         const slots = teamAssignments(evaluation);
-        const rows = roles.map((role, index) => {
+        const rows = TEAM_ROLES.map((role, index) => {
           const assignment = slots[index]?.current;
           const last = slots[index]?.last;
           const selected = params.assignmentId ? [assignment, last].find((item) => item?.id === params.assignmentId) : assignment;

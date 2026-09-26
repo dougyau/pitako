@@ -43,7 +43,7 @@ function load(): LoadOptions {
   tempDirs.push(dir);
   const userConfigPath = path.join(dir, "pitako", "config.toml");
   mkdirSync(path.dirname(userConfigPath), { recursive: true });
-  writeFileSync(userConfigPath, `[model_policies.developer.primary]\nmodel = "example/primary"\nreasoning = "off"\n`);
+  writeFileSync(userConfigPath, `[model_policies.developer.primary]\nmodel = "example/primary"\nreasoning = "off"\n[model_policies.scout.primary]\nmodel = "example/scout"\nreasoning = "low"\n`);
   return { env: { PI_CODING_AGENT_DIR: dir }, userConfigPath };
 }
 
@@ -172,6 +172,22 @@ describe("background registry", () => {
     const result = workerResult(handle.instanceId);
     expect(result.result).toBe("SECRET-RESULT");
     expect(workerResult(handle.instanceId).result).toBe("SECRET-RESULT");
+  });
+
+  test("background registry accepts Scout through normal role resolution", async () => {
+    const scout = hang();
+    const handle = await spawnBackground({
+      roleId: "scout",
+      task: "map local callers",
+      cwd: packageRoot(),
+      executor: scout.executor,
+      load: load(),
+    });
+    expect(handle.instanceId).toMatch(/^scout-/);
+    await scout.started;
+    scout.release({ status: "completed", result: "caller map", sideEffects: false });
+    await waitFor(handle.instanceId);
+    expect(workerResult(handle.instanceId)).toMatchObject({ role: "scout", result: "caller map" });
   });
 
   test("pre-abort starts nothing", async () => {

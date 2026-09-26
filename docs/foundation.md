@@ -43,7 +43,6 @@ No provider or model is set. `config/presets.example.json` is documentation only
 | `@zzz210s/pi-codegraph` | MIT and self-contained, but it needs native tree-sitter and better-sqlite3, supports a shorter language list, and stores its index in `.codegraph/`, which collides with colbymchenry/codegraph. |
 | `picassio/pi-code-graph` | MIT, but it needs Docker Memgraph, embeddings, and a model provider. That is a new service, not a Pi coding baseline. |
 | `pi-codegraph-extension` (gripebomb) | MIT MCP wrapper, last published 2026-06-05, and it is the pattern this milestone said not to prefer. |
-| `pi-web-access` 0.30.0 | MIT and maintained (2026-09-19). Search and fetch are real, but so are PDF, YouTube, repo clone, and many API keys. Left as an optional slot in `config/stack.json`. |
 | `@vanillagreen/pi-web-tools` 3.0.1 | Ties search to specific providers, including OpenAI-native web search. That assumes an account Pitako must not assume. |
 | Official `preset.ts` | Hardcodes example providers and models. Pitako ships an example JSON without those fields instead of loading the extension. |
 | Official `dirty-repo-guard.ts` | Cancels session switch and fork when the repo is dirty, including non-interactive runs. Too disruptive for a baseline. |
@@ -74,7 +73,6 @@ Pi reports an extension that throws while loading as a startup error. A language
 
 - Subteams and nested agent delegation
 - Remote agents and process-persistent background workers
-- Private or team Board scopes
-- Web research until a small extension is worth requiring
+- Private or Team Board scopes
 - Bash sandbox and plan-mode command allowlists
 - Hover, and `codegraph_context` if a maintained Pi wrapper exposes it without private imports

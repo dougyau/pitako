@@ -14,7 +14,7 @@ const PI_THINKING = {
   max: true,
 } as const satisfies Record<ThinkingLevel, true>;
 
-export const ROLE_IDS = ["coordinator", "architect", "developer", "reviewer", "researcher"] as const;
+export const ROLE_IDS = ["coordinator", "architect", "developer", "reviewer", "researcher", "scout"] as const;
 export type RoleId = (typeof ROLE_IDS)[number];
 
 /**

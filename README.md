@@ -16,7 +16,7 @@ It currently combines:
 - LSP (`pi-lsp-client`) and CodeGraph (`@vndv/pi-codegraph`)
 - [`@juicesharp/rpiv-todo`](https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-todo) for session-local TODOs
 
-Not every skill or principle is active all the time. Pi keeps names and descriptions in context and loads a skill body when the task matches. Principles are contextual. Roles can use different subsets. Team assignments and the workspace Board are available to the foreground session.
+Not every skill or principle is active all the time. Pi keeps names and descriptions in context and loads a skill body when the task matches. Principles are contextual. Roles can use different subsets. The foreground Team roster assigns independent work to one instance per role; the workspace Board is a shared forum.
 
 `pitako-coding` is the router: inspect the repo, keep raw read, grep, LSP, and CodeGraph available, use bounded Code Intelligence queries when they fit, keep diffs small, verify real behavior, and load a specialized skill only when it applies. It does not embed the full Ponytail, Caveman, or pstack bodies.
 
@@ -36,7 +36,7 @@ Disable Ponytail, Caveman, or any individual skill with `pi config` or package s
 - `agent_run` for one synchronous in-process AgentInstance. It does not start a team.
 - `agent_spawn` for one background in-process AgentInstance. The Coordinator stays available. `agent_status`, `agent_result`, and `agent_cancel` inspect that worker. `/pitako agents` prints the same compact view.
 - `agent_supervise` for one synchronous visible sibling pane. It does not run in the background or join the Team roster.
-- `team_assign`, `team_status`, `team_result`, and `team_cancel` for independent foreground Team assignments, with one active assignment per role.
+- `team_assign`, `team_status`, `team_result`, and `team_cancel` for independent foreground work across the Architect, Developer, Reviewer, Researcher, and Scout roster, with one active assignment per role. `/pitako team` shows the slots.
 - `$plan` and `$execute`. Planning stops at `PLAN_FROZEN`. Execution is a separate invocation. Neither calls Herdr.
 
 ## Session TODOs
@@ -85,7 +85,7 @@ Agents pull the Board by calling the tools. Pitako does not inject topics or pos
 
 Storage is SQLite schema version 2, with foreign keys and WAL. It migrates v1 data without deleting posts and rejects incomplete schemas. Node uses built-in `node:sqlite`; Bun tests use `bun:sqlite`. Scope is `global` only. Decisions are immutable posts. A later post can point at an earlier one with `replyTo` or metadata such as `{"supersedes": 17}`. There is no decision graph. A `DECISION` post does not resolve the topic. Set the status when the discussion is done or no longer relevant.
 
-Private boards, memory, embeddings, and automatic summaries are not in this version. A later Pitako Thread may namespace topics.
+Private boards, memory, embeddings, and automatic summaries are not in this version. Team assignments do not add private or Team Board scopes. A later Pitako Thread may namespace topics.
 
 Disable the extension with a package filter: `!extensions/board/index.ts`.
 
@@ -101,7 +101,7 @@ RoleDefinition
 
 The role carries instructions, skills, and principles. The model policy carries an ordered list of model targets. A target is a Pi model id (`provider/model`) plus an optional reasoning level. The role is not a model.
 
-Built-in roles are `coordinator`, `architect`, `developer`, `reviewer`, and `researcher`. Instructions live in `roles/*.md`. Structured defaults live in `config/defaults.toml`. Concrete models are not shipped, because installations do not share subscriptions.
+Built-in roles are `coordinator`, `architect`, `developer`, `reviewer`, `researcher`, and `scout`. Scout retrieves bounded local source fragments for caller-specified targets; the specialist interprets them. Researcher investigates external and upstream questions and may inspect the workspace for context. Instructions live in `roles/*.md`. Structured defaults live in `config/defaults.toml`. Concrete models are not shipped, because installations do not share subscriptions.
 
 User overrides go in `$PI_CODING_AGENT_DIR/pitako/config.toml`. If `PI_CODING_AGENT_DIR` is unset, that path is `~/.pi/agent/pitako/config.toml`. Do not edit the package to change models.
 
@@ -167,7 +167,7 @@ Before a mutating or unknown tool runs, the next target may start a fresh sessio
 
 The result can include turns, input, output, cache tokens, cost, and tool-call counts when Pi reports them. Input tokens are cumulative across turns, not the size of one prompt.
 
-The child cannot call `agent_run`, `agent_supervise`, `agent_spawn`, `agent_status`, `agent_result`, `agent_cancel`, or the `team_*` orchestration tools. It cannot delegate. Same-session fallback can continue a child run; it does not expose a separate resume command.
+The child cannot call `agent_run`, `agent_supervise`, `agent_spawn`, `agent_status`, `agent_result`, `agent_cancel`, or the `team_*` orchestration tools. Team assignments are foreground-only and do not nest. Same-session fallback can continue a child run; it does not expose a separate resume command.
 
 `agent_spawn` returns while the worker is still running. The worker has its own cancellation. A later Coordinator turn does not cancel it. Completion is one short signal. The result stays out of the Coordinator conversation until `agent_result`. A spawn with `plan` and `unit` can wake an idle `$execute` turn. A spawn without that pair only notifies the UI. Herdr background supervision is not in this milestone.
 
@@ -208,9 +208,9 @@ Six records stay separate. `todo` is the current session checklist. The Board ho
 
 ## What this is not yet
 
-Pitako does not implement subteams or a DAG scheduler. Team assignments let independent roles run concurrently, with one assignment per role. Session TODOs are local execution plans. The Board is not a team roster or a memory store.
+Pitako does not implement subteams, a DAG scheduler, or automatic Coordinator routing. Team assignments run independent roles, with one active assignment per role in a foreground session. Coordinator delegation remains prompt-guided. Session TODOs are local execution plans. The Board is not a team roster or a memory store.
 
-Web search is not bundled. See [Web research](#web-research).
+Web tools are bundled. See [Web research](#web-research).
 
 ## Requirements
 
@@ -359,9 +359,11 @@ To drop Pitako entirely: `pi remove` with the same source you installed.
 
 ## Web research
 
-Not bundled. [`pi-web-access`](https://github.com/nicobailon/pi-web-access) (MIT, actively maintained) can search and fetch pages, but it also ships PDF extraction, YouTube, repository cloning, and several API-key providers. That should stay optional so a missing search key cannot block the coding baseline.
+Pitako bundles [`pi-web-access`](https://github.com/nicobailon/pi-web-access) 0.31.0. Its default tools—`web_search`, `fetch_content`, `source_check`, `get_search_content`, and `web_enable`—may be available in the foreground Coordinator and in Architect, Developer, Reviewer, and Researcher child sessions. `web_enable` exposes configured tools on the next model request. Scout excludes these default web-tool names, but its `bash` access is not a network sandbox.
 
-To add it later, depend on a pinned version and append its `pi.extensions` entry (currently `./dist`) in this package's `pi.extensions` and `config/stack.json`. The `web-research` slot in `config/stack.json` records that choice.
+In `auto` search routing, an active `openai-codex` provider may send queries through existing Pi Codex auth to OpenAI before trying Exa MCP, which needs no API key. GitHub repository fetches may invoke `gh repo clone` or `git clone` as the Pi process user. Other providers may need credentials in `~/.pi/agent/web-search.json`; see the [upstream configuration](https://github.com/nicobailon/pi-web-access#configuration). Use web access only in a trusted environment because extensions run with the Pi process's permissions; do not commit credentials.
+
+The extension also supports PDF extraction and video.
 
 ## Configuration examples
 
@@ -415,16 +417,16 @@ The script copies `fixtures/tiny-ts` to a temp directory, runs `codegraph init`,
 - Analysis mode does not sandbox `bash` or `powershell`.
 - Language servers are not installed automatically.
 - `pi-lsp-client` is consumed from git because it is not on npm. The commit is pinned.
-- Web research is not bundled. Board scope is global only. Agent fallback does not rerun a task after side effects.
+- Board scope is global only; there are no private or Team Board scopes. Agent fallback does not rerun a task after side effects.
 - Local `pi install .` requires `bun install` (or `npm install`) in this directory first, so `node_modules` exists.
 
 ## Roadmap
 
 Not built yet:
 
-- Subteams and nested agent delegation
+- Subteams, nested agent delegation, and automatic Coordinator routing
 - Background workers that survive process exit
-- Private or team Board scopes
+- Private or Team Board scopes
 - Hover and `codegraph_context` tools
 
 ## License

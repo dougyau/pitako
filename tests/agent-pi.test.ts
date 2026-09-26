@@ -51,6 +51,12 @@ describe("pi adapter boundary", () => {
       expect(available).toEqual(expect.arrayContaining(["grep", "find", "ls", "read", "project_report", "read_symbol", "read_enclosing", "module_report", "inspect_symbol", "review_surface", "codegraph_search", "lsp_diagnostics"]));
       expect(active).toEqual(expect.arrayContaining(["read", "grep", "bash", "edit", "find", "ls", "project_report", "read_symbol", "read_enclosing", "module_report", "inspect_symbol", "review_surface", "codegraph_search", "lsp_diagnostics"]));
       for (const tool of ORCHESTRATION_TOOLS) expect(active).not.toContain(tool);
+
+      session.setActiveToolsByName(childActiveTools(available, process.platform, "scout"));
+      const scout = session.getActiveToolNames();
+      expect(scout).toEqual(expect.arrayContaining(["read", "bash", "grep", "find", "ls"]));
+      for (const name of ["edit", "write", "apply_patch", "lsp_rename"]) expect(scout).not.toContain(name);
+      for (const tool of ORCHESTRATION_TOOLS) expect(scout).not.toContain(tool);
     } finally {
       session.dispose();
     }
