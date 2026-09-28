@@ -29,6 +29,14 @@ describe("stack configuration", () => {
     expect(manifest.dependencies["@vndv/pi-codegraph"]).toBe("0.1.10");
     expect(manifest.dependencies["@dietrichgebert/ponytail"]).toBe("4.10.0");
     expect(manifest.dependencies["@juicesharp/rpiv-todo"]).toBe("2.11.0");
+    expect(manifest.dependencies["pi-hermes-memory"]).toBe("0.9.9");
+    expect(manifest.bundledDependencies).toContain("pi-hermes-memory");
+    expect(stack.required.find(({ id }) => id === "pi-hermes-memory")).toEqual({
+      id: "pi-hermes-memory",
+      spec: "pi-hermes-memory@0.9.9",
+      entry: "node_modules/pi-hermes-memory/src/index.ts",
+      tools: ["memory_add", "memory_replace", "memory_remove", "memory_search", "session_search", "skill_manage"],
+    });
     expect(manifest.dependencies["pi-web-access"]).toBe("0.31.0");
     expect(manifest.bundledDependencies).toContain("pi-web-access");
     expect(stack.required.at(-1)).toEqual({

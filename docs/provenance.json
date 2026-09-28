@@ -9,6 +9,15 @@
     "notLoaded": ["@juicesharp/rpiv-i18n"],
     "reason": "Official Pi package. Session-local TODO overlay, tool, and /todos. Pitako does not vendor the reducer, overlay, or schemas. i18n remains an optional peer."
   },
+  "pi-hermes-memory": {
+    "decision": "dependency",
+    "package": "pi-hermes-memory",
+    "version": "0.9.9",
+    "repository": "https://github.com/chandra447/pi-hermes-memory",
+    "license": "MIT",
+    "loaded": ["src/index.ts"],
+    "reason": "Bundle the upstream extension unchanged for persistent learning and conversation search. Independent of the Board, with no synchronization or post promotion."
+  },
   "pi-codex-tools": {
     "decision": "dependency",
     "package": "pi-codex-tools",

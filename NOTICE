@@ -10,6 +10,7 @@ Dependencies (not copied into this repository's source):
 - @dietrichgebert/ponytail is MIT. Pitako loads the ponytail skill only.
 - @juicesharp/rpiv-todo is MIT. Pitako loads the extension as the session TODO layer.
 - pi-web-access 0.31.0 (Nico Bailon) is MIT. Pitako bundles it for web search and page extraction. The license is docs/licenses/pi-web-access-LICENSE.
+- pi-hermes-memory 0.9.9 (Chandra Teja) is MIT. Pitako bundles it unchanged for persistent memory and conversation search, separate from the Board. The license is docs/licenses/pi-hermes-memory-LICENSE.
 - Pi (@earendil-works/pi-coding-agent) is MIT.
 - pi-codex-tools 0.3.0 is Apache-2.0 and includes parser/grammar behavior derived from OpenAI Codex, Copyright 2025 OpenAI. Its attribution is retained in docs/licenses/pi-codex-tools-NOTICE; the license is docs/licenses/pi-codex-tools-LICENSE.
 

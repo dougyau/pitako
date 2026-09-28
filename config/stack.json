@@ -64,6 +64,12 @@
       "tools": ["agent_run"]
     },
     {
+      "id": "pi-hermes-memory",
+      "spec": "pi-hermes-memory@0.9.9",
+      "entry": "node_modules/pi-hermes-memory/src/index.ts",
+      "tools": ["memory_add", "memory_replace", "memory_remove", "memory_search", "session_search", "skill_manage"]
+    },
+    {
       "id": "pi-web-access",
       "spec": "pi-web-access@0.31.0",
       "entry": "node_modules/pi-web-access/dist/index.js",

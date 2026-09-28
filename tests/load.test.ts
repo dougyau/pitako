@@ -7,6 +7,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import pitako from "../extensions/index.ts";
 import { agentScope } from "../extensions/agent/scope.ts";
 import { packageRoot } from "../extensions/stack.ts";
+import { childActiveTools, toolsForProfile } from "../extensions/profile.ts";
 import { loadPitako, registeredToolNames } from "../scripts/load-pitako.ts";
 
 async function loadWithWebConfig(packagePath: string, configDir: string) {
@@ -106,6 +107,7 @@ describe("Pi package loading", () => {
     expect(paths.some((file) => file.includes(`${path.sep}pi-lsp-client${path.sep}`))).toBe(true);
     expect(paths.some((file) => file.endsWith(`${path.sep}codegraph-raw.ts`))).toBe(true);
     expect(paths.some((file) => file.includes(`${path.sep}rpiv-todo${path.sep}`))).toBe(true);
+    expect(paths.some((file) => file.includes(`${path.sep}pi-hermes-memory${path.sep}src${path.sep}index.ts`))).toBe(true);
     expect(paths.some((file) => file.endsWith(`${path.sep}extensions${path.sep}board${path.sep}index.ts`))).toBe(true);
     expect(paths.some((file) => file.includes(`${path.sep}pi-web-access${path.sep}dist${path.sep}index.js`))).toBe(true);
     for (const file of paths) expect(file.startsWith(root)).toBe(true);
@@ -119,6 +121,12 @@ describe("Pi package loading", () => {
       expect(names).toContain(name);
     }
     expect(names).toContain("todo");
+    const memoryTools = ["memory_add", "memory_replace", "memory_remove", "memory_search", "session_search", "skill_manage"];
+    expect(names).toEqual(expect.arrayContaining(memoryTools));
+    expect(childActiveTools(names)).toEqual(expect.arrayContaining(memoryTools));
+    for (const profile of ["coding", "analysis"] as const) {
+      expect(toolsForProfile({ available: names, profile })).toEqual(expect.arrayContaining(memoryTools));
+    }
     for (const name of ["web_search", "fetch_content", "source_check", "get_search_content", "web_enable"]) {
       expect(names).toContain(name);
     }

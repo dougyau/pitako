@@ -37,6 +37,7 @@
       "./node_modules/@juicesharp/rpiv-todo/index.ts",
       "./extensions/board/index.ts",
       "./extensions/agent/index.ts",
+      "./node_modules/pi-hermes-memory/src/index.ts",
       "./node_modules/pi-web-access/dist/index.js",
       "./extensions/index.ts"
     ],
@@ -61,6 +62,7 @@
     "@juicesharp/rpiv-todo": "2.11.0",
     "@vndv/pi-codegraph": "0.1.10",
     "pi-codex-tools": "0.3.0",
+    "pi-hermes-memory": "0.9.9",
     "pi-lsp-client": "github:code-yeongyu/pi-lsp-client#1c981dfcacc456fe4ce9f4120a2f0250b54d6844",
     "pi-web-access": "0.31.0",
     "smol-toml": "1.8.0"
@@ -72,6 +74,7 @@
     "@vndv/pi-codegraph",
     "pi-lsp-client",
     "pi-codex-tools",
+    "pi-hermes-memory",
     "pi-web-access"
   ],
   "peerDependencies": {

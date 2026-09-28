@@ -16,6 +16,7 @@ It currently combines:
 - LSP (`pi-lsp-client`) and CodeGraph (`@vndv/pi-codegraph`)
 - [`@juicesharp/rpiv-todo`](https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-todo) for session-local TODOs
 - [`pi-web-access`](https://github.com/nicobailon/pi-web-access) for web search, source checks, and page extraction
+- [`pi-hermes-memory`](https://github.com/chandra447/pi-hermes-memory) for persistent learning and conversation search, separate from the Board
 
 Not every skill or principle is active all the time. Pi keeps names and descriptions in context and loads a skill body when the task matches. Principles are contextual. Roles can use different subsets. Team assignments and the workspace Board are available to the foreground session.
 
@@ -25,7 +26,7 @@ Disable Ponytail, Caveman, or any individual skill with `pi config` or package s
 
 ## What this milestone is
 
-- A Pi package (`keywords: pi-package`) with the Pitako and web access extensions, the Board extension, curated skills, and one prompt.
+- A Pi package (`keywords: pi-package`) with the Pitako, web access, Hermes memory, and Board extensions, curated skills, and one prompt.
 - The **coding** profile: Pi's read, bash, edit, and write tools, plus grep, find, and ls, plus LSP and CodeGraph.
 - The **analysis** profile: the same read and search tools, without `edit`, `write`, `apply_patch`, or `lsp_rename`.
 - Six bounded, read-only Code Intelligence queries: `project_report`, `read_symbol`, `read_enclosing`, `module_report`, `inspect_symbol`, and `review_surface`. Graph-backed queries create or refresh their index when needed under Node; raw tools remain visible.
@@ -86,9 +87,19 @@ Agents pull the Board by calling the tools. Pitako does not inject topics or pos
 
 Storage is SQLite schema version 2, with foreign keys and WAL. It migrates v1 data without deleting posts and rejects incomplete schemas. Node uses built-in `node:sqlite`; Bun tests use `bun:sqlite`. Scope is `global` only. Decisions are immutable posts. A later post can point at an earlier one with `replyTo` or metadata such as `{"supersedes": 17}`. There is no decision graph. A `DECISION` post does not resolve the topic. Set the status when the discussion is done or no longer relevant.
 
-Private boards, memory, embeddings, and automatic summaries are not in this version. A later Pitako Thread may namespace topics.
+Private boards, embeddings, and automatic Board summaries are not in this version. A later Pitako Thread may namespace topics. Persistent memory is provided separately by Hermes.
 
 Disable the extension with a package filter: `!extensions/board/index.ts`.
+
+## Memory and conversation search
+
+Pitako bundles [`pi-hermes-memory`](https://github.com/chandra447/pi-hermes-memory) `0.9.9` unchanged. The Board holds knowledge agents deliberately share for a task. Hermes retains lessons, corrections, and searchable conversations across sessions. Pitako does not synchronize the two stores or promote Board posts into memory.
+
+Hermes provides `memory_add`, `memory_replace`, `memory_remove`, `memory_search`, `session_search`, and `skill_manage`. Its default `policy-only` mode retrieves memories on demand instead of injecting the full store. Background learning uses additional model calls and follows Hermes configuration.
+
+Configuration lives in `$PI_CODING_AGENT_DIR/hermes-memory-config.json`, defaulting to `~/.pi/agent/hermes-memory-config.json`. See the [Hermes configuration reference](https://github.com/chandra447/pi-hermes-memory#configuration). Use `/memory-index-sessions` to index older conversations and `/memory-preview-context` to inspect prompt additions.
+
+Disable Hermes with the package filter `!node_modules/pi-hermes-memory/src/index.ts`. This does not disable the Board.
 
 ## Roles and model policies
 
@@ -230,6 +241,8 @@ bun install
 pi install .
 ```
 
+If Bun 1.3.14 fails with `node-gyp: command not found` while installing Hermes's `better-sqlite3` dependency, rerun `bun install --ignore-scripts`. That dependency ships prebuilt binaries for supported platforms; this avoids Bun's unnecessary rebuild.
+
 `pi install .` writes the package into Pi settings. Add `-l` to install it for the current project instead of your user settings.
 
 Try it once without saving settings:
@@ -289,6 +302,7 @@ An unnamed session takes its display name from the first user line, capped at 60
 | CodeGraph | [`@vndv/pi-codegraph`](https://github.com/vndv/pi-codegraph) `0.1.10` | Pi-native tools over the `codegraph` CLI: search, callers, callees, impact, explore, node, files, status. MIT. |
 | CodeGraph CLI | `@colbymchenry/codegraph` `1.6.0` | The index and `codegraph serve` process the raw extension talks to. MIT. |
 | Code Intelligence | `extensions/code-intelligence/` | Six bounded queries using AST, LSP, Git, and the direct CodeGraph SDK. Graph-backed queries require Node. |
+| Memory and conversation search | [`pi-hermes-memory`](https://github.com/chandra447/pi-hermes-memory) `0.9.9` | Persistent lessons, corrections, and session search. Independent of the Board. MIT. |
 | Web research | [`pi-web-access`](https://github.com/nicobailon/pi-web-access) `0.31.0` | `web_search`, `fetch_content`, `source_check`, `get_search_content`, and `web_enable`. MIT. |
 | Profiles, protected paths, status | `extensions/index.ts` | Pitako-owned. |
 
