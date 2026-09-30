@@ -31,6 +31,8 @@ The official Codex entry invokes installation reporting to `https://mocito.dev/a
 | [Caveman](https://github.com/JuliusBrussee/caveman) skills | `ae26f3a4775574bd49dc8bdb61c0287bbc3cd268` | MIT | `skills/caveman`, `skills/investigate-first` |
 | [pstack](https://github.com/cursor/plugins/tree/main/pstack) (Lauren Tan) | plugin `6ed0f7a9504f577d7529064103cecce9be7dfc5e` | MIT | `skills/practical/*`, `skills/principles/*`, `skills/language/typescript-best-practices` |
 
+`skills/practical/verify-behavior` adapts the useful responsibilities of three retired pstack skills into one Pitako contract. It retains the pstack attribution above. The source mapping and local modifications are in `docs/provenance.json`.
+
 License texts: `docs/licenses/caveman-LICENSE`, `docs/licenses/pstack-LICENSE`.
 
 Caveman engine, proxy, browse, MCP, compression, and memory backends are not included.

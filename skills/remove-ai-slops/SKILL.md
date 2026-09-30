@@ -42,6 +42,6 @@ Do not impose a line-count limit. Do not split a file because it is long.
 
 ## After
 
-Verify again with the same checks that were green. If a cleanup change fails, revert that change and verify again. Do not widen the cleanup to make the failure go away.
+Use `verify-behavior` to rerun checks invalidated by cleanup and any applicable mandatory gates. Reuse evidence that remains valid instead of repeating every earlier check. If a cleanup change fails, revert that change and verify again. Do not widen the cleanup to make the failure go away.
 
 For a dedicated `$execute` pass, write a short `deslop.md` in unit evidence or in `evidence/final/`: scope, simplifications that matter, risky candidates you kept, and the verification result. Standalone `$pre-pr` uses its report instead. Do not list every deleted comment.

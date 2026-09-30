@@ -26,7 +26,17 @@ Caveman is not a Pi package. `skills/` is MIT. Engine, proxy, browse, MCP, and t
 
 `@zenspc/pi-pstack` 0.6.0 is the Pi-native port evaluated for the initial distribution. It loads poteto-mode, setup-pstack, and `pi-subagents`. Depending on it would add orchestration outside Pitako's AgentInstance and Team tools.
 
-Pitako vendors selected skills from the official pstack plugin (Lauren Tan, MIT, plugin revision `6ed0f7a9504f577d7529064103cecce9be7dfc5e`) and rewrites the orchestrated ones (`how`, `why`, `architect`, `blast-radius`, `show-me-your-work`, `reflect`, verification skills) for a single agent.
+Pitako vendors selected skills from the official pstack plugin (Lauren Tan, MIT, plugin revision `6ed0f7a9504f577d7529064103cecce9be7dfc5e`) and rewrites the orchestrated ones (`how`, `why`, `architect`, `blast-radius`, `reflect`, verification procedures) for a single agent.
+
+Pitako's `verify-behavior` consolidates the useful responsibilities of the retired `tdd`, `show-me-your-work`, and `principle-prove-it-works`. It loads from the existing `skills/practical` package location. Its modes select checks, review the complete agreed diff read-only, or recommend test simplification. Edits require explicit authorization and an editing role. See [Verify behavior](../README.md#verify-behavior) for usage and manual override migration.
+
+The catalog and role defaults select `verify-behavior` once for Developer, Reviewer, Coordinator, and Researcher. Architect, ModelPolicy, resource filtering, and whole-array override semantics are unchanged. Retired override names fail with the existing `unknown skill` error.
+
+`scripts/vendor-engineering-layer.py` no longer selects the retired principle. Reapply the verification-policy adaptations after vendoring: `principle-build-the-lever`, `principle-sequence-verifiable-units`, `principle-outcome-oriented-execution`, `create-verification-skill`, and `maintain-verification-skill`. The exact changes and other retained local edits are in `docs/provenance.json`. The consolidated skill retains pstack attribution and its MIT license.
+
+Roles and workflows route evidence selection and test quality to `verify-behavior` within their existing passes. Developer and Reviewer inspect the complete relevant diff, including test infrastructure and deleted guarantees. Review findings need an affected contract or concrete risk and a plausible reachable path; a missing new test alone is not a defect. Evidence reuse does not cancel mandatory gates, final approval, or independent review.
+
+Creating or maintaining a project verification procedure requires an explicitly authorized task. Missing or stale guidance during routine verification does not authorize a new skill, feature map, or tree audit.
 
 `typescript-best-practices` lives under `skills/language/` and is not in the default `pi.skills` list.
 
@@ -46,7 +56,7 @@ The ACP entry loads before Hermes so a cancelled compaction does not trigger Her
 
 | Tension | Resolution |
 | --- | --- |
-| Ponytail "code first, three lines" vs prove-it-works | Ponytail sizes the implementation. Evidence skills size the proof. Architectural explanations are in scope when the change crosses a boundary. |
+| Ponytail artifact prescription vs repository checks | Ponytail governs simplicity of implementation and verification. `verify-behavior` governs evidence validity and sufficiency. Developer child instructions clarify that existing frameworks and fixtures are valid and distinct contracts may need distinct checks. No dependency edit or hook enforces this instruction. |
 | Ponytail "never stall" vs research ≠ implement | Profile note and `pitako-coding`: design does not authorize implementation. |
 | Caveman full dialect vs clear architecture | Default lite. Full/ultra/wenyan only if the user asks. |
 | pstack architect implements by default | Pitako architect stops at the sketch. |
@@ -128,4 +138,4 @@ The TODO list stayed the execution checklist. The Board held the finding, the de
 
 Roles v0 dogfood wrote a local `~/.pi/agent/pitako/config.toml` for the authenticated providers on this machine. That file is not in the repository. `resolveRole("architect")` returned the markdown instructions, the skill and principle lists, the primary target, reasoning, and ordered fallbacks. Nothing was spawned.
 
-Influenced by `ponytail` (compose the package, do not reimplement), `principle-experience-first` (install Pitako and TODOs are there), and `principle-prove-it-works` (the tool execute results are the proof).
+The original dogfood used `ponytail` to compose rather than reimplement, `principle-experience-first` for install behavior, and the now-retired `principle-prove-it-works` for direct tool results. `verify-behavior` now owns the evidence policy.

@@ -229,7 +229,7 @@ describe("plan and execute contracts", () => {
     const finalPonytail = execute.indexOf("one deliberate Ponytail pass over the complete finished diff");
     const preCleanupChecks = execute.indexOf("Run affected focused checks after that pass", finalPonytail);
     const deslopPass = execute.indexOf("Run `remove-ai-slops` only", preCleanupChecks);
-    const postCleanupChecks = execute.indexOf("After cleanup, rerun the same checks", deslopPass);
+    const postCleanupChecks = execute.indexOf("After cleanup, rerun checks invalidated by the edits", deslopPass);
     const finalGates = execute.indexOf("Run final gates after all edits", postCleanupChecks);
     const finalReview = execute.indexOf("the single final review", finalGates);
     expect(finalPonytail).toBeGreaterThanOrEqual(0);

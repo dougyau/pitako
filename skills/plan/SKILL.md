@@ -41,6 +41,7 @@ Load these skills when they apply. Do not paste their bodies into the plan.
 
 - `investigate-first` for an unknown cause
 - `how` and `why` for current behavior and rationale
+- `verify-behavior` for proportional expected evidence, not permission to run product checks during planning
 - `technical-writing`, then `unslop`, for the plan file
 
 Use `principle-foundational-thinking`, `principle-model-the-domain`, `principle-boundary-discipline`, `principle-subtract-before-you-add`, `principle-minimize-reader-load`, `principle-guard-the-context-window`, and `principle-sequence-verifiable-units` when the decision needs them.
@@ -53,7 +54,7 @@ The `architect` skill continues into implementation when the user asked to build
 
 During `$plan`, call the Architect role with `agent_run`. The task must be design-only: inspect, reason, model, propose, critique. It must say not to modify product files. If `agent_run` fails, report the error. Do not do that role yourself.
 
-Use the Researcher role only for a real external or knowledge gap. Use the Reviewer role for one independent critique of an architectural plan. The reviewer is adversarial by definition: challenge passing tests and probe violated invariants, negative paths, lifecycle, concurrency, identity/path assumptions, stale state, mocks, coverage, and frozen criteria. The reviewer reports findings and never fixes or implements.
+Use the Researcher role only for a real external or knowledge gap. Use the Reviewer role for one independent critique of an architectural plan. The reviewer challenges affected contracts, relevant risks, and proposed acceptance criteria. Probe plausible counterexamples where they matter, not a universal test matrix. The reviewer reports findings and never fixes or implements.
 
 Use Caveman for ephemeral child communication: Architect lite, Reviewer lite, Researcher full. Do not write Caveman grammar into the plan file.
 
@@ -125,7 +126,7 @@ Likely relevant files/systems:
 
 Decision-complete, not line-prescriptive. The Developer keeps local implementation freedom.
 
-Every meaningful unit needs observable acceptance criteria. Name expected evidence when it stops the executor from inventing "done".
+Every meaningful unit needs acceptance criteria that name observable behavior and affected guarantees. Name proportional expected evidence using `verify-behavior` when it stops the executor from inventing "done". Do not prescribe a test per function or a universal case matrix.
 
 ## Critique and freeze
 

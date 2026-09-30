@@ -61,16 +61,14 @@ ACP loads before Hermes, and the official Codex entry loads before Pitako policy
 | Shared API, type, or module change | `blast-radius` |
 | Cross-module design before code | `architect` |
 | Novel architecture with no precedent | `principle-exhaust-the-design-space` |
-| Cheap regression path, user asked for TDD | `tdd` |
-| Need inspectable evidence | `show-me-your-work` |
-| After a completed non-trivial change | `principle-prove-it-works` |
+| Verify behavior, review test quality in a diff, or simplify tests within authorized scope | `verify-behavior` |
 | Debugging | `principle-fix-root-causes` |
 | Stateful or domain-heavy feature | `principle-foundational-thinking`, `principle-model-the-domain` |
 | Config, API, or validation work | `principle-boundary-discipline` |
 | Large exploration | `principle-guard-the-context-window` |
 | Same correction keeps appearing | `principle-encode-lessons-in-structure` |
-| Repo has no repeatable proof path | `create-verification-skill` |
-| Verification guidance is stale | `maintain-verification-skill` |
+| Explicitly authorized task to create a verification procedure | `create-verification-skill` |
+| Explicitly authorized task to maintain or audit a verification procedure | `maintain-verification-skill` |
 | Docs, README, PR prose | `technical-writing`, then `unslop` |
 | Hard finished work, what to keep | `reflect` |
 | Decision-complete plan, then stop | `plan` |
@@ -79,7 +77,7 @@ ACP loads before Hermes, and the official Codex entry loads before Pitako policy
 
 Do not load every skill. Do not load `caveman` at full or ultra unless the user asks. Do not load Ponytail and Caveman full bodies together.
 
-Ponytail governs implementation size. It does not waive validation, security, accessibility, or required error handling. Caveman lite governs noise, not architecture. `principle-prove-it-works` and `show-me-your-work` govern evidence.
+Ponytail governs simplicity of implementation and verification. `verify-behavior` governs evidence validity and sufficiency, including optional TDD. Its Pitako clarification permits existing frameworks and fixtures instead of Ponytail's prescribed self-check artifact. Neither skill waives validation, security, accessibility, or required error handling. Caveman lite governs noise, not architecture.
 
 ## Board
 

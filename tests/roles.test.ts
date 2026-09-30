@@ -46,9 +46,15 @@ describe("role and model policy resolution", () => {
     expect(architect.instructions).toContain("You own system structure");
     expect(architect.instructionsPath.endsWith(`${path.sep}roles${path.sep}architect.md`)).toBe(true);
     for (const id of ROLE_IDS) {
-      const role = getRole(id, { env });
+      const role = resolveRole(id, { env });
       expect(role.instructions.length).toBeGreaterThan(0);
       expect(role.instructions).toContain("## Boundaries");
+      expect(role.skills.filter((name) => name === "verify-behavior")).toHaveLength(id === "architect" ? 0 : 1);
+      const names = [...role.skills, ...role.principles];
+      for (const retired of ["tdd", "show-me-your-work", "principle-prove-it-works"]) {
+        expect(names).not.toContain(retired);
+      }
+      expect(role.principles).not.toContain("verify-behavior");
     }
     const resolved = resolveRole("architect", { env });
     expect(resolved.modelPolicyId).toBe("architect");
@@ -67,6 +73,10 @@ describe("role and model policy resolution", () => {
       `
 [roles.architect]
 skills = ["how"]
+
+[roles.developer]
+skills = ["ponytail", "verify-behavior"]
+principles = ["principle-fix-root-causes"]
 
 [model_policies.architect.primary]
 model = "openai-codex/gpt-5.6-sol"
@@ -96,7 +106,9 @@ reasoning = "medium"
     expect(resolved.modelPolicy.requested).toEqual(resolved.modelPolicy.primary);
     expect(resolved.modelPolicy.selected).toEqual(resolved.modelPolicy.primary);
     expect(resolved.modelPolicy.fallbackIndex).toBeUndefined();
-    expect(getRole("developer", { env }).skills).toContain("ponytail");
+    expect(getRole("developer", { env }).skills).toEqual(["ponytail", "verify-behavior"]);
+    expect(getRole("developer", { env }).principles).toEqual(["principle-fix-root-causes"]);
+    expect(getRole("reviewer", { env }).skills).toEqual(["blast-radius", "verify-behavior"]);
   });
 
   test("fast is a strict target setting and part of target identity", () => {
@@ -170,6 +182,15 @@ fast = false
 
     writeConfig(configPath, "[roles.architect]\ninstructions = \"missing.md\"\n");
     expect(() => loadPitakoConfig({ env })).toThrow(/missing role instruction file/);
+
+    for (const field of ["skills", "principles"]) {
+      for (const retired of ["tdd", "show-me-your-work", "principle-prove-it-works"]) {
+        writeConfig(configPath, `[roles.developer]\n${field} = ["${retired}"]\n`);
+        expect(() => loadPitakoConfig({ env })).toThrow(`roles.developer.${field}[0]: unknown skill "${retired}"`);
+      }
+    }
+    writeConfig(configPath, '[roles.developer]\nskills = ["verify-behavior", "verify-behavior"]\n');
+    expect(() => loadPitakoConfig({ env })).toThrow(/duplicate "verify-behavior"/);
 
     writeConfig(
       configPath,

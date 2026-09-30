@@ -264,7 +264,7 @@ reasoning = "medium"
     expect(resolved.modelPolicy.fallbacks.map((target) => target.model)).toEqual(["example/fallback-1", "example/fallback-2"]);
     expect(skillNamesForRole(resolved)).toContain("architect");
     expect(skillNamesForRole(resolved)).toContain("ponytail");
-    expect(skillNamesForRole(resolved)).not.toContain("tdd");
+    expect(skillNamesForRole(resolved)).not.toContain("verify-behavior");
     const prompt = childInstructions(resolved, "architect-abc123");
     expect(prompt).toContain("You own system structure");
     expect(prompt).not.toContain("PARENT-TRANSCRIPT");
@@ -699,6 +699,14 @@ reasoning = "medium"
 
   test("agent_run is registered, refused inside an instance, and Pitako still loads", async () => {
     const loaded = await loadPitako(packageRoot());
+    const env = tempEnv();
+    for (const id of ["developer", "reviewer", "coordinator", "researcher", "architect"]) {
+      const role = resolveRole(id, { env });
+      const allowed = new Set(skillNamesForRole(role));
+      const skills = loaded.loader.getSkills().skills.filter((skill) => allowed.has(skill.name));
+      expect(skills.filter((skill) => skill.name === "verify-behavior")).toHaveLength(id === "architect" ? 0 : 1);
+      expect(childInstructions(role, `${id}-test`)).toContain(role.instructions);
+    }
     expect(registeredToolNames(loaded.extensions)).toEqual(expect.arrayContaining([
       "agent_run", "team_assign", "team_status", "team_result", "team_cancel",
     ]));

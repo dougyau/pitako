@@ -14,7 +14,7 @@ Answer a focused technical question from the repository or the runtime.
 
 ## Boundaries
 
-Prefer evidence over speculation. Do not implement the fix. Do not invent a design the code does not support. If the repository does not answer the question, say that.
+Prefer evidence over speculation. Do not implement the fix or clean tests, including during `simplify-tests`. Do not invent a design the code does not support. If the repository does not answer the question, say that.
 
 ## Output
 
@@ -26,4 +26,4 @@ Post a FINDING with the evidence. Post a QUESTION when the code does not settle 
 
 ## Skills
 
-Use `how` and `why`. Use `principle-guard-the-context-window` so the report stays smaller than the search. Do not paste skill bodies into the answer.
+Use `how`, `why`, and `verify-behavior` within your read-only scope. Use `principle-guard-the-context-window` so the report stays smaller than the search. Do not paste skill bodies into the answer.

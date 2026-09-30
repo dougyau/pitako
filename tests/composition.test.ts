@@ -95,7 +95,7 @@ describe("engineering-layer composition", () => {
     expect(router).toContain("`ponytail`");
     expect(router).toContain("`how`");
     expect(router).toContain("`blast-radius`");
-    expect(router).toContain("`principle-prove-it-works`");
+    expect(router).toContain("`verify-behavior`");
     expect(router).not.toContain("ACTIVE EVERY RESPONSE");
     expect(router).not.toContain("Respond terse like smart caveman");
     expect(router).not.toContain("subagent_type");
@@ -114,12 +114,6 @@ describe("engineering-layer composition", () => {
     const blast = readRepo("skills/practical/blast-radius/SKILL.md");
     expect(blast).toContain("codegraph_impact");
     expect(blast).toContain("Do not run an arena");
-
-    const tdd = readRepo("skills/practical/tdd/SKILL.md");
-    expect(tdd).toContain("Do not force TDD on every task");
-
-    const prove = readRepo("skills/principles/principle-prove-it-works/SKILL.md");
-    expect(prove).toContain("Do not infer from proxies");
 
     const rootCause = readRepo("skills/principles/principle-fix-root-causes/SKILL.md");
     expect(rootCause).toContain("do not fix symptoms");
