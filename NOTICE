@@ -11,6 +11,13 @@ Dependencies (not copied into this repository's source):
 - @juicesharp/rpiv-todo is MIT. Pitako loads the extension as the session TODO layer.
 - pi-web-access 0.31.0 (Nico Bailon) is MIT. Pitako bundles it for web search and page extraction. The license is docs/licenses/pi-web-access-LICENSE.
 - pi-hermes-memory 0.9.9 (Chandra Teja) is MIT. Pitako bundles it unchanged for persistent memory and conversation search, separate from the Board. The license is docs/licenses/pi-hermes-memory-LICENSE.
+- billion-context-pi 0.1.83 (ranxianglei) is MIT. Pitako uses it for ACP context
+  compression: https://github.com/ranxianglei/billion-context-pi. Its license is
+  docs/licenses/billion-context-pi-LICENSE.
+- Pitako uses acp-kernel 0.0.98 (ranxianglei), bundled inline by billion-context-pi:
+  https://github.com/ranxianglei/acp-kernel. Its MIT license includes an additional
+  Attribution on Product Surfaces term, retained in docs/licenses/acp-kernel-LICENSE.
+  Visible attribution is also in README.md and THIRD_PARTY.md.
 - Pi (@earendil-works/pi-coding-agent) is MIT.
 - pi-codex-tools 0.3.0 is Apache-2.0 and includes parser/grammar behavior derived from OpenAI Codex, Copyright 2025 OpenAI. Its attribution is retained in docs/licenses/pi-codex-tools-NOTICE; the license is docs/licenses/pi-codex-tools-LICENSE.
 

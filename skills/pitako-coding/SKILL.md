@@ -11,8 +11,10 @@ This skill is the router. Do not paste the full bodies of Ponytail, Caveman, pra
 
 ## Profiles
 
-- `coding` (default): read, bash, edit, write, grep, find, ls, plus LSP and CodeGraph.
-- `analysis`: the same read and search tools, without `edit`, `write`, `apply_patch`, or `lsp_rename`. Shell is still available. This is not a sandbox.
+- `coding` (default): read, bash, grep, find, ls, LSP, CodeGraph, and ACP context tools. All coding roles use `apply_patch` on supported models, otherwise `edit` and `write`.
+- `analysis`: the same read and search tools, without `edit`, `write`, `apply_patch`, or `lsp_rename`. Shell and ACP temporary output are still available. This is not a sandbox.
+
+Official `pi-codex-tools` registers `apply_patch` and owns its grammar capability. Pitako selects it through the public `supportsOpenAIGrammarTools` helper for `openai-responses` or `openai-codex-responses` models with `compat.supportsOpenAIGrammarTools === true`. On these models, `edit` and `write` are inactive. Pitako reapplies the policy after startup, model changes, and profile changes, including same-model child activation. Children start in `coding` independently of the parent profile.
 
 Switch with `/pitako profile analysis` or start Pi with `--pitako-profile analysis`. `PITAKO_PROFILE` is the fallback when the flag is omitted.
 
@@ -28,7 +30,7 @@ Switch with `/pitako profile analysis` or start Pi with `--pitako-profile analys
 
 ## Tools
 
-Keep raw read/grep, LSP, and CodeGraph visible, including `edit` and `bash` in the coding profile. The six dense queries (`project_report`, `read_symbol`, `read_enclosing`, `module_report`, `inspect_symbol`, `review_surface`) help with bounded project, symbol, module, and diff questions. Matched Reviewer trials did not establish equivalent coverage, so they supplement raw navigation. Use raw tools for literal searches, unsupported backends, follow-up, and comparison.
+Keep raw read/grep, LSP, and CodeGraph visible, with `bash` and the model-compatible editing tools in the coding profile. The six dense queries (`project_report`, `read_symbol`, `read_enclosing`, `module_report`, `inspect_symbol`, `review_surface`) help with bounded project, symbol, module, and diff questions. Matched Reviewer trials did not establish equivalent coverage, so they supplement raw navigation. Use raw tools for literal searches, unsupported backends, follow-up, and comparison.
 
 Graph-backed dense queries create or refresh a `.codegraph` index as needed under Node. `project_report` only observes it; AST-only queries need no index. Raw `codegraph_*` tools use the CodeGraph CLI and need an existing index; use `codegraph init` for raw-only use. Under Bun, graph-backed dense queries report unavailable.
 
@@ -39,7 +41,13 @@ Graph-backed dense queries create or refresh a `.codegraph` index as needed unde
 
 LSP needs an installed server for the file type. It can resolve a command on `PATH`, in the project's `node_modules/.bin`, or at an explicit path. TypeScript defaults to `typescript-language-server`. Servers are not installed automatically; `/lsp install <id>` installs supported recipes. A registered tool does not guarantee that a server or its requested operation is available.
 
-`edit` and `write` are blocked for `.git/`, `node_modules/`, `.env`, and `.env.*` files. Do not bypass that with shell unless the user explicitly asks. `apply_patch` is available only to Developer AgentInstances for coherent multi-hunk or multi-file changes; use `edit` for a few local replacements.
+`edit` and `write` are blocked for `.git/`, `node_modules/`, `.env`, and `.env.*` files. Do not bypass that with shell unless the user explicitly asks. Those guards do not protect upstream `apply_patch`, which accepts absolute paths, symlinks, moves, and fuzzy matching. The old strict-path, exact-match engine and structured failures are gone. No sandbox is added; future bwrap or OpenShell work does not protect this version.
+
+ACP is the only compressor; `pi-codex-compaction` is not loaded. Use `compress`, `search_context`, `decompress`, and `/acp` for blocks. Original entries remain available. Persistent sessions reload `<sessionFile>.acp.json`; in-memory children retain state only for their session's lifetime. With ACP active, native `/compact` reports `Compaction cancelled` and automatic compaction creates no native summary. Disabled ACP or a refused `bili` proxy leaves native compaction available.
+
+Pitako's ACP factory defaults to `{ delegate: false, autoUpdate: false }`. Explicit `~/.pi/acp.json` and project `.pi/acp.json` override these defaults, with project settings winning. They can enable delegates or updates, or set `enabled:false`. Preserve user files. The factory reads the master switch from `process.cwd()`; runtime options use `ctx.cwd`. A different child cwd does not change the factory's master-switch location. Children cannot use Pitako orchestration, but explicit ACP configuration can enable ACP delegates.
+
+ACP loads before Hermes, and the official Codex entry loads before Pitako policy, once each in main and SDK child sessions. The Codex entry invokes upstream install telemetry. Disable it with `PI_OFFLINE=1` or Pi's `enableInstallTelemetry:false` setting.
 
 ## Load when it applies
 

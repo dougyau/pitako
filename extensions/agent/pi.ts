@@ -8,19 +8,14 @@ import {
   SessionManager,
   SettingsManager,
   type AgentSession,
-  type ExtensionAPI,
-  type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { registerExecution, unregisterExecution } from "../execution-identity.ts";
-import { childActiveTools, ORCHESTRATION_TOOLS } from "../profile.ts";
+import { reconcileChildTools, ORCHESTRATION_TOOLS } from "../profile.ts";
+import { packageRoot } from "../stack.ts";
 import { marksSideEffect } from "./effects.ts";
 import { isServiceTierRejection } from "./fallback.ts";
 import { childInstructions, skillNamesForRole, usageDelta, type AgentRequestObservation, type AgentUsage, type Attempt, type AttemptExecutor } from "./run.ts";
 import { completeTool, emptyCodeIntelligenceUsage, isDenseToolName, type CodeIntelligenceUsage, type DenseCallUsage, type ToolOutcome } from "../code-intelligence/metrics.ts";
-import { CODE_INTELLIGENCE_TOOLS } from "../code-intelligence/tools.ts";
-import { bindCodeIntelligenceApi } from "../code-intelligence/index.ts";
-import codegraphRaw from "../code-intelligence/codegraph-raw.ts";
-import lspExtension from "pi-lsp-client/src/index.ts";
 import type { ModelTarget, ReasoningLevel } from "../roles/types.ts";
 
 // Package entry does not re-export this. Import the file next to the resolved entry.
@@ -29,22 +24,22 @@ export const { DEFAULT_THINKING_LEVEL } = await import(
 ) as { DEFAULT_THINKING_LEVEL: ThinkingLevel };
 
 const navigationWindows = new WeakMap<AgentSession, { remaining: number }>();
+const childLifecycles = new WeakMap<AgentSession, { bound: boolean; disposal?: Promise<void> }>();
 
-function captureExtensionTools(register: (pi: ExtensionAPI) => void): ToolDefinition[] {
-  const tools: ToolDefinition[] = [];
-  register({
-    registerTool(tool: ToolDefinition) { tools.push(tool); },
-    on() { return () => {}; },
-    registerCommand() {},
-  } as unknown as ExtensionAPI);
-  return tools;
+function disposeChildSession(session: AgentSession): Promise<void> {
+  const lifecycle = childLifecycles.get(session)!;
+  return lifecycle.disposal ??= (async () => {
+    try {
+      if (lifecycle.bound) await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+    } finally {
+      try {
+        await session.dispose();
+      } finally {
+        unregisterExecution(session.sessionId);
+      }
+    }
+  })();
 }
-
-const RAW_CHILD_TOOLS = [
-  ...captureExtensionTools(lspExtension),
-  ...captureExtensionTools(codegraphRaw),
-];
-export const CHILD_CODE_TOOLS = [...CODE_INTELLIGENCE_TOOLS, ...RAW_CHILD_TOOLS];
 
 /** Omitted reasoning is not forced to medium. Pi keeps its own default. */
 export function thinkingLevelFor(reasoning: ReasoningLevel | undefined): ThinkingLevel | undefined {
@@ -221,19 +216,31 @@ async function runTarget(
   }
   const activationError = await activateTarget(session, activated.model!, target);
   if (activationError) {
-    return { status: "failed", result: "", error: activationError, sideEffects: Boolean(existing), session: resume(session, runtime, selections, now, input) };
+    const handle = resume(session, runtime, selections, now, input);
+    if (!existing) await handle.dispose();
+    return { status: "failed", result: "", error: activationError, sideEffects: Boolean(existing), session: existing ? handle : undefined };
   }
-  if (session.thinkingLevel) {
-    recordAppliedReasoning(activated.model!, selections, session.thinkingLevel);
-    input.onActivated?.(session.thinkingLevel);
+  try {
+    if (session.thinkingLevel) {
+      recordAppliedReasoning(activated.model!, selections, session.thinkingLevel);
+      input.onActivated?.(session.thinkingLevel);
+    }
+    return await drive(session, runtime, selections, now, prompt, input);
+  } catch (error) {
+    const handle = resume(session, runtime, selections, now, input);
+    if (!existing) await handle.dispose();
+    return { status: "failed", result: "", error: messageOf(error), sideEffects: Boolean(existing), session: existing ? handle : undefined };
   }
-  return drive(session, runtime, selections, now, prompt, input);
 }
 
 export async function activateTarget(
   session: {
     setModel(model: NonNullable<ReturnType<ModelRuntime["getModel"]>>, options?: { persist?: boolean }): Promise<void>;
     setThinkingLevel(level: ThinkingLevel): void;
+    sessionManager?: AgentSession["sessionManager"];
+    model?: AgentSession["model"];
+    getAllTools?: AgentSession["getAllTools"];
+    setActiveToolsByName?: AgentSession["setActiveToolsByName"];
     settingsManager?: {
       getModelThinkingLevel(provider: string, modelId: string): ThinkingLevel | undefined;
       getDefaultThinkingLevel(): ThinkingLevel | undefined;
@@ -244,6 +251,14 @@ export async function activateTarget(
 ): Promise<string | undefined> {
   try {
     await session.setModel(model, { persist: false });
+    if (session.sessionManager && session.getAllTools && session.setActiveToolsByName) {
+      reconcileChildTools({
+        sessionManager: session.sessionManager,
+        model: session.model,
+        getAllTools: () => session.getAllTools!(),
+        setActiveToolsByName: (names) => session.setActiveToolsByName!(names),
+      });
+    }
     // setModel keeps the previous level when settings have no default.
     const settings = session.settingsManager;
     session.setThinkingLevel(
@@ -303,11 +318,16 @@ async function bindThenRun(
     await handle().dispose();
     return { status: "failed", result: "", error: activationError, sideEffects: false };
   }
-  if (session.thinkingLevel) {
-    recordAppliedReasoning(activated.model!, selections, session.thinkingLevel);
-    input.onActivated?.(session.thinkingLevel);
+  try {
+    if (session.thinkingLevel) {
+      recordAppliedReasoning(activated.model!, selections, session.thinkingLevel);
+      input.onActivated?.(session.thinkingLevel);
+    }
+    return await drive(session, runtime, selections, now, prompt, input);
+  } catch (error) {
+    await handle().dispose();
+    return { status: "failed", result: "", error: messageOf(error), sideEffects: false };
   }
-  return drive(session, runtime, selections, now, prompt, input);
 }
 
 async function openSession(
@@ -317,13 +337,13 @@ async function openSession(
   input: { instanceId: string; role: Parameters<AttemptExecutor["start"]>[0]["role"]; cwd: string },
 ): Promise<AgentSession> {
   const agentDir = getAgentDir();
-  bindCodeIntelligenceApi();
   const settingsManager = SettingsManager.create(input.cwd, agentDir);
   const allowed = new Set(skillNamesForRole(input.role));
   const loader = new DefaultResourceLoader({
     cwd: input.cwd,
     agentDir,
     settingsManager,
+    additionalExtensionPaths: [packageRoot()],
     appendSystemPrompt: [childInstructions(input.role, input.instanceId)],
     skillsOverride: (base) => ({
       skills: base.skills.filter((skill) => allowed.has(skill.name)),
@@ -331,7 +351,6 @@ async function openSession(
     }),
   });
   await loader.reload();
-  const childTools = [...CHILD_CODE_TOOLS];
   const thinkingLevel = model ? thinkingLevelFor(target.reasoning) : undefined;
   const { session } = await createAgentSession({
     cwd: input.cwd,
@@ -341,13 +360,21 @@ async function openSession(
     sessionManager: SessionManager.inMemory(input.cwd),
     settingsManager,
     resourceLoader: loader,
-    customTools: childTools,
     modelRuntime: runtime,
     excludeTools: [...ORCHESTRATION_TOOLS],
   });
-  session.setActiveToolsByName(childActiveTools(session.getAllTools().map((tool) => tool.name), process.platform, input.role.id));
+  const lifecycle = { bound: false };
+  childLifecycles.set(session, lifecycle);
   registerExecution({ instanceId: input.instanceId, roleId: input.role.id, sessionId: session.sessionId });
-  return session;
+  try {
+    await session.bindExtensions({});
+    lifecycle.bound = true;
+    reconcileChildTools(session);
+    return session;
+  } catch (error) {
+    await disposeChildSession(session);
+    throw error;
+  }
 }
 
 async function drive(
@@ -515,16 +542,12 @@ function resume(
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
   },
 ): NonNullable<Attempt["session"]> {
-  let disposed = false;
   return {
     async continueWith(target, note, signal) {
       return runTarget(runtime, selections, now, target, note, { ...input, signal }, session);
     },
     async dispose() {
-      if (disposed) return;
-      disposed = true;
-      unregisterExecution(session.sessionId);
-      await session.dispose();
+      await disposeChildSession(session);
     },
   };
 }

@@ -60,7 +60,7 @@ describe("pi-codex-tools public parser and grammar contract", () => {
     ]);
   });
 
-  test("grammar sampling uses Pi's OpenAI Lark shape; Move remains explicit for rejection", () => {
+  test("grammar sampling uses Pi's OpenAI Lark shape, including supported moves", () => {
     expect(createOpenAILarkSampling(APPLY_PATCH_GRAMMAR)).toEqual({
       type: "grammar",
       variants: { openai_lark: APPLY_PATCH_GRAMMAR },

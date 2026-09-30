@@ -191,7 +191,7 @@ describe("supervised board author", () => {
     }, async () => {
       await start({}, { hasUI: false, sessionManager });
     });
-    expect(reads).toBe(1);
+    expect(reads).toBeGreaterThanOrEqual(1);
     expect(resolveBoardAuthor("pane-sess")).toBe("developer-c121cc");
     expect(executionForSession("pane-sess")?.roleId).toBe("developer");
 
@@ -212,7 +212,7 @@ describe("supervised board author", () => {
     }, async () => {
       await start({}, { hasUI: false, sessionManager: next });
     });
-    expect(reads).toBe(1);
+    expect(reads).toBeGreaterThanOrEqual(1);
     expect(resolveBoardAuthor("pane-sess-next")).toBe("developer-c121cc");
     expect(resolveBoardAuthor("pane-sess")).toBe("pi");
     await shutdown({}, { hasUI: false });

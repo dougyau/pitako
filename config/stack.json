@@ -64,6 +64,12 @@
       "tools": ["agent_run"]
     },
     {
+      "id": "billion-context-pi",
+      "spec": "billion-context-pi@0.1.83",
+      "entry": "extensions/acp.ts",
+      "tools": ["compress", "search_context", "decompress", "acp_status", "acp_cache"]
+    },
+    {
       "id": "pi-hermes-memory",
       "spec": "pi-hermes-memory@0.9.9",
       "entry": "node_modules/pi-hermes-memory/src/index.ts",
@@ -74,6 +80,12 @@
       "spec": "pi-web-access@0.31.0",
       "entry": "node_modules/pi-web-access/dist/index.js",
       "tools": ["web_search", "fetch_content", "source_check", "get_search_content", "web_enable"]
+    },
+    {
+      "id": "pi-codex-tools",
+      "spec": "pi-codex-tools@0.3.0",
+      "entry": "node_modules/pi-codex-tools/index.ts",
+      "tools": ["apply_patch"]
     }
   ],
   "optional": []

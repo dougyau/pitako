@@ -4,9 +4,11 @@ import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import { createAgentSession, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { classifyProviderFailure } from "../extensions/agent/fallback.ts";
-import { activateTarget, CHILD_CODE_TOOLS, createPiExecutor, cursorProviderContext, DEFAULT_THINKING_LEVEL } from "../extensions/agent/pi.ts";
+import { activateTarget, createPiExecutor, cursorProviderContext, DEFAULT_THINKING_LEVEL } from "../extensions/agent/pi.ts";
 import { runAgentInstance, teamExecutionSummary, type Attempt } from "../extensions/agent/run.ts";
 import { childActiveTools, ORCHESTRATION_TOOLS } from "../extensions/profile.ts";
+import { loadPitako } from "../scripts/load-pitako.ts";
+import { packageRoot } from "../extensions/stack.ts";
 import type { ResolvedRole } from "../extensions/roles/types.ts";
 
 const tempDirs: string[] = [];
@@ -35,13 +37,15 @@ describe("pi adapter boundary", () => {
     const runtime = await ModelRuntime.create({ authPath: path.join(agentDir, "auth.json"), modelsPath: null, allowModelNetwork: false });
     const model = runtime.getModels()[0];
     if (!model) throw new Error("Pi static catalog has no model");
+    const loaded = await loadPitako(packageRoot(), cwd);
+    tempDirs.push(loaded.agentDir);
     const { session } = await createAgentSession({
       cwd,
       agentDir,
       model,
       sessionManager: SessionManager.inMemory(cwd),
       modelRuntime: runtime,
-      customTools: [...CHILD_CODE_TOOLS],
+      resourceLoader: loaded.loader,
       excludeTools: [...ORCHESTRATION_TOOLS],
     });
     try {
@@ -335,7 +339,7 @@ describe("extension provider bind", () => {
         const content = !hasReport
           ? [{ type: "toolCall", id: `telemetry-${sequence++}`, name: "project_report", arguments: {} }]
           : reads < 5
-            ? [{ type: "toolCall", id: `telemetry-${sequence++}`, name: "read", arguments: { path: "src/sample.ts" } }]
+            ? [{ type: "toolCall", id: `telemetry-${sequence++}`, name: "read", arguments: { path: `src/sample-${reads}.ts` } }]
             : [{ type: "text", text: "telemetry-complete" }];
         const stream = createAssistantMessageEventStream();
         const stopReason = content[0]?.type === "toolCall" ? "toolUse" : "stop";
@@ -347,7 +351,7 @@ describe("extension provider bind", () => {
     process.env.PI_CODING_AGENT_DIR = agentDir;
     for (const dir of dirs) {
       mkdirSync(path.join(dir, "src"));
-      writeFileSync(path.join(dir, "src", "sample.ts"), "export const value = 1;\n");
+      for (let index = 0; index < 5; index++) writeFileSync(path.join(dir, "src", `sample-${index}.ts`), "export const value = 1;\n");
     }
     const executor = createPiExecutor();
     const attempts = await Promise.all(dirs.map((cwd, index) => executor.start({
@@ -360,7 +364,7 @@ describe("extension provider bind", () => {
     })));
     try {
       for (const attempt of attempts) {
-        expect(attempt.status).toBe("completed");
+        expect(attempt.status, attempt.error).toBe("completed");
         expect(attempt.usage?.codeIntelligence?.dense.project_report?.calls).toBe(1);
         expect(attempt.usage?.codeIntelligence?.raw.read).toBe(5);
         expect(attempt.usage?.codeIntelligence?.navigation).toMatchObject({ completedCalls: 5, read: 5, grep: 0, remaining: 0 });

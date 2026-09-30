@@ -23,7 +23,7 @@ const available = [
 ];
 
 describe("profiles", () => {
-  test("coding profile keeps edit/write but hides apply_patch outside Developer AgentInstances", () => {
+  test("coding defaults to edit/write on models without grammar capability", () => {
     const tools = toolsForProfile({ available, profile: "coding" });
     for (const name of ["read", "bash", "edit", "write", "grep", "find", "ls", "lsp_rename", "codegraph_search", "todo", "board_post"]) {
       expect(tools).toContain(name);
@@ -31,10 +31,24 @@ describe("profiles", () => {
     expect(tools).not.toContain("apply_patch");
     expect(tools).not.toContain("powershell");
     expect(childActiveTools(available)).not.toContain("apply_patch");
-    for (const roleId of ["architect", "reviewer", "researcher"]) {
-      expect(childActiveTools(available, process.platform, roleId)).not.toContain("apply_patch");
+  });
+
+  test("grammar-capable OpenAI APIs replace edit/write in every coding session", () => {
+    for (const api of ["openai-responses", "openai-codex-responses"]) {
+      const model = { api, compat: { supportsOpenAIGrammarTools: true } } as never;
+      for (const tools of [toolsForProfile({ available, profile: "coding", model }), childActiveTools(available, process.platform, model)]) {
+        expect(tools).toContain("apply_patch");
+        expect(tools).not.toContain("edit");
+        expect(tools).not.toContain("write");
+      }
+      expect(toolsForProfile({ available: available.filter((name) => name !== "apply_patch"), profile: "coding", model })).toContain("edit");
     }
-    expect(childActiveTools(available, process.platform, "developer")).toContain("apply_patch");
+    for (const model of [undefined, { api: "openai-responses" }, { api: "openai-responses", compat: { supportsOpenAIGrammarTools: false } }, { api: "anthropic-messages", compat: { supportsOpenAIGrammarTools: true } }]) {
+      const tools = toolsForProfile({ available, profile: "coding", model: model as never });
+      expect(tools).toContain("edit");
+      expect(tools).toContain("write");
+      expect(tools).not.toContain("apply_patch");
+    }
   });
 
   test("analysis removes file-mutating tools and keeps LSP and CodeGraph reads", () => {
@@ -45,6 +59,13 @@ describe("profiles", () => {
     for (const name of ["edit", "write", "apply_patch", "lsp_rename"]) {
       expect(tools).not.toContain(name);
     }
+  });
+
+  test("children exclude Pitako orchestration but respect explicitly enabled upstream delegates", () => {
+    const tools = childActiveTools([...available, "agent_run", "team_assign", "acp_delegate", "acp_delegate_wait", "compress"]);
+    expect(tools).not.toContain("agent_run");
+    expect(tools).not.toContain("team_assign");
+    expect(tools).toEqual(expect.arrayContaining(["acp_delegate", "acp_delegate_wait", "compress"]));
   });
 
   test("powershell is included only when requested", () => {
@@ -68,12 +89,10 @@ describe("profiles", () => {
       expect(note).toContain("raw tools");
       expect(note).not.toContain("navigation baseline");
     }
-    expect(coding).toContain("Keep edit/write active");
-    expect(coding).toContain("use edit for authorized local edits; write for new files or full rewrites.");
+    expect(coding).toContain("Use apply_patch when available; otherwise edit");
     expect(coding).toContain("Keep diffs small");
     expect(coding).toContain("Board tools are pull-only");
     expect(coding).not.toContain("FINDING");
-    expect(coding).not.toContain("apply_patch");
     expect(analysis).toContain("edit, write, apply_patch, and lsp_rename are not");
     expect(analysis).toContain("this profile is not a sandbox");
     expect(coding.length).toBeLessThan(800);
