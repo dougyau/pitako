@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { skillStatusLines } from "./catalog.ts";
 import { PitakoConfigError } from "./errors.ts";
 import { isProtectedEditPath } from "./paths.ts";
@@ -8,8 +8,8 @@ import { beginTeamEvaluation, retireTeamEvaluation, teamEvaluationForSession, te
 import { teamWorkerStatus } from "./agent/background.ts";
 import { bindAgentUi, listObservations, unbindAgentUi } from "./agent/observe.ts";
 import { formatAgentsDetail } from "./agent/ui.ts";
-import { childSessionNote, ORCHESTRATION_TOOLS, parseProfile, profileNote, toolsForProfile, type ProfileName } from "./profile.ts";
-import { currentInstanceId, currentRoleId } from "./agent/scope.ts";
+import { childSessionNote, parseProfile, profileNote, setSessionProfile, toolsForProfile, type ProfileName } from "./profile.ts";
+import { currentInstanceId } from "./agent/scope.ts";
 import { executionForSession } from "./execution-identity.ts";
 import { formatUsage, mergeUsage, type AgentUsage } from "./agent/run.ts";
 import { completeTool, emptyCodeIntelligenceUsage, formatCodeIntelligenceUsage, isDenseToolName, type CodeIntelligenceUsage, type DenseCallUsage, type ToolOutcome } from "./code-intelligence/metrics.ts";
@@ -18,9 +18,9 @@ import { registerSupervisedSession, unregisterSupervisedSession } from "./herdr/
 import { registerAgentSupervise } from "./herdr/supervise.ts";
 import { packageRoot, prepareRuntime } from "./stack.ts";
 import { planHeading, planInvocation, sessionNameAction } from "./session-name.ts";
-import { createApplyPatchToolDefinition } from "./apply-patch.ts";
 import { planFile, readFrozenPlan, readPlan } from "./workflow.ts";
 import path from "node:path";
+import type { ApplyPatchResult } from "pi-codex-tools";
 
 const foregroundCodeUsage = new Map<string, CodeIntelligenceUsage>();
 const foregroundToolStarts = new Map<string, Map<string, { name: string; startedAt: number }>>();
@@ -32,19 +32,21 @@ function requestedProfile(pi: ExtensionAPI): ProfileName {
   return parseProfile(process.env.PITAKO_PROFILE);
 }
 
-function sessionRoleId(): string | undefined {
-  return currentRoleId() ?? (process.env.PITAKO_INSTANCE_ID ? process.env.PITAKO_ROLE_ID : undefined);
+function isChildSession(ctx: ExtensionContext): boolean {
+  return Boolean(executionForSession(ctx.sessionManager?.getSessionId()) || currentInstanceId() || process.env.PITAKO_INSTANCE_ID);
 }
 
-function applyProfile(pi: ExtensionAPI, profile: ProfileName, roleId?: string): string[] {
+function applyProfile(pi: ExtensionAPI, profile: ProfileName, ctx: ExtensionContext): string[] {
   const available = pi.getAllTools().map((tool) => tool.name);
   const active = pi.getActiveTools();
   const next = toolsForProfile({
     available,
     profile,
-    roleId,
+    model: ctx.model,
+    child: isChildSession(ctx),
     includePowerShell: process.platform === "win32" || active.includes("powershell"),
   });
+  if (ctx.sessionManager) setSessionProfile(ctx.sessionManager, profile);
   pi.setActiveTools(next);
   return next;
 }
@@ -119,7 +121,6 @@ export default function pitako(pi: ExtensionAPI) {
   const root = packageRoot();
   // Fail during extension load so Pi surfaces a configuration error at startup.
   prepareRuntime(root);
-  parseProfile(process.env.PITAKO_PROFILE);
 
   pi.registerFlag("pitako-profile", {
     description: 'Pitako profile: "coding" (default) or "analysis"',
@@ -127,7 +128,6 @@ export default function pitako(pi: ExtensionAPI) {
   });
 
   registerAgentSupervise(pi);
-  pi.registerTool(createApplyPatchToolDefinition(process.cwd()));
 
   let profile: ProfileName = "coding";
 
@@ -153,11 +153,11 @@ export default function pitako(pi: ExtensionAPI) {
     ownerToken = Symbol("pitako.foreground");
     teamEvaluation = beginTeamEvaluation(
       sessionId,
-      Boolean(currentInstanceId() || process.env.PITAKO_INSTANCE_ID),
+      isChildSession(ctx),
       ownerToken,
     );
     registerSupervisedSession(sessionId);
-    if (!currentInstanceId() && !process.env.PITAKO_INSTANCE_ID && typeof ctx.isIdle === "function") {
+    if (!isChildSession(ctx) && typeof ctx.isIdle === "function") {
       bindBackgroundOwner({
         token: ownerToken,
         isIdle: () => ctx.isIdle(),
@@ -179,25 +179,13 @@ export default function pitako(pi: ExtensionAPI) {
       });
     }
     try {
-      profile = requestedProfile(pi);
+      profile = isChildSession(ctx) ? "coding" : requestedProfile(pi);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (ctx.hasUI) ctx.ui.notify(message, "error");
       throw error;
     }
-    const instanceId = currentInstanceId();
-    if (instanceId || process.env.PITAKO_INSTANCE_ID) {
-      const available = pi.getAllTools().map((tool) => tool.name);
-      const coding = toolsForProfile({
-        available,
-        profile: "coding",
-        roleId: sessionRoleId(),
-        includePowerShell: process.platform === "win32" || pi.getActiveTools().includes("powershell"),
-      }).filter((name) => !ORCHESTRATION_TOOLS.includes(name as (typeof ORCHESTRATION_TOOLS)[number]));
-      pi.setActiveTools(coding);
-    } else {
-      applyProfile(pi, profile);
-    }
+    applyProfile(pi, profile, ctx);
     const entries = ctx.sessionManager?.getEntries?.() ?? [];
     const existingUserText = firstUserText(entries);
     const invocation = latestPlanInvocation(entries);
@@ -212,6 +200,10 @@ export default function pitako(pi: ExtensionAPI) {
         modelLookup: (provider, id) => ctx.modelRegistry?.find(provider, id),
       });
     }
+  });
+
+  pi.on("model_select", (_event, ctx) => {
+    applyProfile(pi, profile, ctx);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
@@ -261,7 +253,7 @@ export default function pitako(pi: ExtensionAPI) {
     if (action.set !== undefined) pi.setSessionName(action.set);
     if (ctx.hasUI) ctx.ui.setStatus("pitako", pi.getSessionName() || undefined);
 
-    const instanceId = currentInstanceId();
+    const instanceId = executionForSession(ctx.sessionManager?.getSessionId())?.instanceId ?? currentInstanceId() ?? process.env.PITAKO_INSTANCE_ID;
     const note = instanceId ? childSessionNote(instanceId) : profileNote(profile);
     const current = event.systemPrompt ?? "";
     if (current.includes(note)) return undefined;
@@ -283,7 +275,7 @@ export default function pitako(pi: ExtensionAPI) {
       if (command === "team") {
         const evaluation = teamEvaluationForSession(
           ctx.sessionManager?.getSessionId?.(),
-          Boolean(currentInstanceId() || process.env.PITAKO_INSTANCE_ID),
+          isChildSession(ctx),
         );
         if (!evaluation) {
           notify(ctx, "Team unavailable for this session", "error");
@@ -360,7 +352,7 @@ export default function pitako(pi: ExtensionAPI) {
       }
       if (command === "profile" && value) {
         profile = parseProfile(value);
-        const tools = applyProfile(pi, profile, sessionRoleId());
+        const tools = applyProfile(pi, profile, ctx);
         if (ctx.hasUI) {
           ctx.ui.notify(`Pitako profile: ${profile} (${tools.length} tools)`, "info");
         }
@@ -368,7 +360,7 @@ export default function pitako(pi: ExtensionAPI) {
       }
       const lines = [
         `Pitako profile: ${profile}`,
-        "coding: read, bash, edit, write, grep, find, ls, LSP, CodeGraph, todo; apply_patch is Developer AgentInstance-only with task-scoped batch guidance.",
+        "coding: read, bash, grep, find, ls, LSP, CodeGraph, todo; apply_patch for grammar-capable OpenAI models, otherwise edit/write.",
         "analysis: read, bash, grep, find, ls, LSP, CodeGraph, todo; no edit, write, apply_patch, or lsp_rename",
         "Code intelligence: project_report, read_symbol, read_enclosing, module_report, inspect_symbol, review_surface; raw navigation remains available.",
         "Switch with /pitako profile analysis",
@@ -384,29 +376,32 @@ export default function pitako(pi: ExtensionAPI) {
 
   pi.on("tool_result", async (event, ctx) => {
     recordForegroundResult(event, ctx.sessionManager?.getSessionId(), Boolean(ctx.signal?.aborted));
-    if (event.toolName === "apply_patch" && isApplyPatchFailure(event.details)) return { isError: true };
-    if (event.isError || (event.toolName !== "write" && event.toolName !== "edit")) return undefined;
-    const target = event.input.path;
-    if (typeof target !== "string") return undefined;
-    const filename = path.basename(path.resolve(ctx.cwd, target));
-    if (!filename.endsWith(".md")) return undefined;
-    const id = filename.slice(0, -3);
-    let file: string;
-    try {
-      file = planFile(id, ctx.cwd);
-    } catch {
-      return undefined;
+    if (event.isError) return undefined;
+    const targets = event.toolName === "apply_patch"
+      ? (event.details as ApplyPatchResult | undefined)?.changes?.filter((change) => change.kind !== "deleted").map((change) => change.moveTo ?? change.path) ?? []
+      : event.toolName === "write" || event.toolName === "edit" ? [event.input.path] : [];
+    for (const target of targets) {
+      if (typeof target !== "string") continue;
+      const filename = path.basename(path.resolve(ctx.cwd, target));
+      if (!filename.endsWith(".md")) continue;
+      const id = filename.slice(0, -3);
+      let file: string;
+      try {
+        file = planFile(id, ctx.cwd);
+      } catch {
+        continue;
+      }
+      if (canonicalPath(target, ctx.cwd) !== file) continue;
+      const workflow = readWorkflowTitle("plan", id, ctx.cwd);
+      if (!workflow) continue;
+      const action = sessionNameAction({
+        current: pi.getSessionName(),
+        existingUserText: firstUserText(ctx.sessionManager?.getEntries?.() ?? []),
+        workflow: { ...workflow, fromPlanWrite: true },
+      });
+      if (action.set !== undefined) pi.setSessionName(action.set);
+      if (ctx.hasUI) ctx.ui.setStatus("pitako", pi.getSessionName() || undefined);
     }
-    if (canonicalPath(target, ctx.cwd) !== file) return undefined;
-    const workflow = readWorkflowTitle("plan", id, ctx.cwd);
-    if (!workflow) return undefined;
-    const action = sessionNameAction({
-      current: pi.getSessionName(),
-      existingUserText: firstUserText(ctx.sessionManager?.getEntries?.() ?? []),
-      workflow: { ...workflow, fromPlanWrite: true },
-    });
-    if (action.set !== undefined) pi.setSessionName(action.set);
-    if (ctx.hasUI) ctx.ui.setStatus("pitako", pi.getSessionName() || undefined);
     return undefined;
   });
 
@@ -476,10 +471,6 @@ function notify(
     return;
   }
   if (kind === "error") throw new Error(message);
-}
-
-function isApplyPatchFailure(details: unknown): boolean {
-  return Boolean(details && typeof details === "object" && "ok" in details && details.ok === false);
 }
 
 export { PitakoConfigError };

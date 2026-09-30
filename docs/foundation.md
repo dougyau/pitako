@@ -32,9 +32,23 @@ MIT. Entry `node_modules/pi-web-access/dist/index.js`. Pitako bundles the packag
 
 Pitako selected this version so Researcher and other roles can search for sources and read pages. The package also includes PDF extraction, YouTube analysis, and GitHub cloning. `fetch_content` can save PDF text under a temporary directory and clone GitHub repositories. It sends requests to target sites, and configured extraction providers can receive URLs or page content. Pi package filters can disable the entry without changing the package manifest.
 
+### pi-codex-tools 0.3.0
+
+The official `node_modules/pi-codex-tools/index.ts` entry registers `apply_patch` and owns the grammar capability. Pitako uses its public `supportsOpenAIGrammarTools` helper, not a patch parser or executor of its own. The entry invokes upstream install telemetry. `PI_OFFLINE=1` or Pi's `enableInstallTelemetry:false` setting disables it.
+
+Upstream accepts absolute paths, symlinks, moves, and fuzzy matching. Pitako's old strict-path, exact-match semantics and structured patch failures no longer apply. The protected-path guards for `edit` and `write` do not cover `apply_patch`. No sandbox is added.
+
+### billion-context-pi 0.1.83
+
+`extensions/acp.ts` uses the public `createAcpExtension({ delegate: false, autoUpdate: false })` factory. ACP is the only compressor; `pi-codex-compaction` is not loaded. Explicit global and project `acp.json` settings retain upstream precedence and can enable delegation, enable the updater, or disable ACP. Pitako preserves user files. See [Context compression](../README.md#context-compression) for tools, storage, and native compaction behavior.
+
+The package bundles acp-kernel 0.0.98 inline. Its license adds a visible-attribution requirement to MIT. Both license texts and the attribution are included in [THIRD_PARTY.md](../THIRD_PARTY.md).
+
 ### Profiles
 
-Pi's default active built-ins are `read`, `bash`, `edit`, and `write`. `grep`, `find`, and `ls` are registered but inactive until something enables them. The coding profile turns those three on. The analysis profile calls `pi.setActiveTools` without `edit`, `write`, `apply_patch`, or `lsp_rename`.
+Pi's default active built-ins are `read`, `bash`, `edit`, and `write`. `grep`, `find`, and `ls` are registered but inactive until something enables them. The coding profile enables those three and selects editing tools by model capability for all roles. Models using `openai-responses` or `openai-codex-responses` with `compat.supportsOpenAIGrammarTools === true` get registered `apply_patch` instead of `edit` and `write`. Others get `edit` and `write` without `apply_patch`.
+
+The analysis profile calls `pi.setActiveTools` without `edit`, `write`, `apply_patch`, or `lsp_rename`. It does not sandbox shell or ACP temporary output.
 
 No provider or model is set. `config/presets.example.json` is documentation only.
 

@@ -159,20 +159,13 @@ describe("agent instance", () => {
     expect(cleared.model.requestedReasoning).toBe("xhigh");
     expect(cleared.model.appliedReasoning).toBeUndefined();
   });
-  test("aggregates mutation calls and compact patch traces from session events", async () => {
+  test("keeps generic mutation counts without patch-specific metrics", async () => {
     const env = tempEnv();
     const configured = { env, userConfigPath: path.join(env.PI_CODING_AGENT_DIR!, "pitako", "config.toml") };
     const { mkdirSync, writeFileSync } = await import("node:fs");
     mkdirSync(path.dirname(configured.userConfigPath), { recursive: true });
     writeFileSync(configured.userConfigPath, `[model_policies.architect.primary]\nmodel = "example/primary"\n`);
-    const success = {
-      ok: true, phase: "complete", errorCode: null, inputBytes: 90, plannedFiles: 1, plannedHunks: 2,
-      filesChanged: 1, hunksChanged: 2, committed: ["src/change.ts"], pending: [], uncertain: [], truncated: false, elapsedMs: 17,
-    };
-    const stale = {
-      ok: false, phase: "preflight", errorCode: "PATCH_STALE", inputBytes: 88, plannedFiles: 0, plannedHunks: 0,
-      filesChanged: 0, hunksChanged: 0, committed: [], pending: ["src/change.ts"], uncertain: [], truncated: false, elapsedMs: 9,
-    };
+    const success = { changes: [{ kind: "updated", path: "src/change.ts" }] };
     const executor: AttemptExecutor = {
       async start({ onActivity }) {
         const call = (toolName: string, details?: unknown, isError = false) => {
@@ -181,7 +174,7 @@ describe("agent instance", () => {
         };
         call("edit");
         call("write");
-        call("apply_patch", stale, true);
+        call("apply_patch", undefined, true);
         call("apply_patch", success);
         return {
           status: "completed", result: "done", sideEffects: true,
@@ -191,11 +184,8 @@ describe("agent instance", () => {
     };
     const result = await runAgentInstance({ roleId: "architect", task: "review the boundary", cwd: packageRoot(), executor, load: configured });
     expect(result.usage?.tools).toEqual({ edit: 1, write: 1, apply_patch: 2 });
-    expect(result.usage?.patches).toMatchObject([
-      { targets: ["src/change.ts"], pending: ["src/change.ts"], changedFiles: 0, changedHunks: 0, inputBytes: 88, status: "failure", phase: "preflight", errorCode: "PATCH_STALE", elapsedMs: 9, retry: false },
-      { targets: ["src/change.ts"], committed: ["src/change.ts"], changedFiles: 1, changedHunks: 2, inputBytes: 90, status: "success", phase: "complete", elapsedMs: 17, retry: true },
-    ]);
-    expect(JSON.stringify(result.usage?.patches)).not.toContain("SENSITIVE-PATCH-BODY");
+    expect(result.usage).not.toHaveProperty("patches");
+    expect(JSON.stringify(result.usage)).not.toContain("SENSITIVE-PATCH-BODY");
     expect(formatAgentResult(result)).toContain("mutations: edit 1, write 1, apply_patch 2");
   });
   test("continueWith usage deltas add once and keep context as a gauge", async () => {

@@ -51,22 +51,6 @@ export interface AgentInstance {
   createdAt: string;
 }
 
-export interface PatchCallMetric {
-  targets: string[];
-  committed: string[];
-  pending: string[];
-  uncertain: string[];
-  changedFiles: number;
-  changedHunks: number;
-  inputBytes: number;
-  status: "success" | "failure";
-  phase: string;
-  errorCode: string | null;
-  elapsedMs: number;
-  retry: boolean;
-  truncated: boolean;
-}
-
 export interface AgentUsage {
   input: number;
   output: number;
@@ -78,7 +62,6 @@ export interface AgentUsage {
   toolCalls?: number;
   tools?: Record<string, number>;
   contextTokens?: number;
-  patches?: PatchCallMetric[];
   codeIntelligence?: CodeIntelligenceUsage;
 }
 
@@ -283,7 +266,7 @@ export async function runAgentInstance(input: {
   const activity = createActivity(acceptedAt);
   const view: { usage?: AgentUsage; error?: string } = {};
   const throughput = createThroughput();
-  const work: WorkCounts = { turns: 0, toolCalls: 0, patches: [] };
+  const work: WorkCounts = { turns: 0, toolCalls: 0 };
   let lastStable = "";
   let terminalAt: number | undefined;
   const present = () => {
@@ -433,7 +416,6 @@ async function executeTargets(
     index = 0,
     reason?: FallbackReason,
   ) => {
-    if (usage && work.patches.length > 0) usage = { ...usage, patches: work.patches.map((patch) => ({ ...patch })) };
     view.usage = usage;
     view.error = status === "completed" || result === "cancelled" ? undefined : result;
     markTerminal(now());
@@ -577,49 +559,11 @@ type ActivityEvent = {
 interface WorkCounts {
   turns: number;
   toolCalls: number;
-  patches: PatchCallMetric[];
 }
 
 function noteWork(counts: WorkCounts, event: ActivityEvent): void {
   if (event.type === "tool_execution_start") counts.toolCalls += 1;
   if (event.type === "message_end" && event.message?.role === "assistant") counts.turns += 1;
-  if (event.type === "tool_execution_end" && event.toolName === "apply_patch") {
-    const metric = patchMetric(event.result, event.isError, counts.patches);
-    if (metric) counts.patches.push(metric);
-  }
-}
-
-function patchMetric(result: unknown, isError: boolean | undefined, previous: PatchCallMetric[]): PatchCallMetric | undefined {
-  if (!result || typeof result !== "object" || !("details" in result)) return undefined;
-  const details = result.details;
-  if (!details || typeof details !== "object") return undefined;
-  const row = details as Record<string, unknown>;
-  const paths = (key: string) => Array.isArray(row[key]) ? row[key].filter((item): item is string => typeof item === "string") : [];
-  const committed = paths("committed");
-  const pending = paths("pending");
-  const uncertain = paths("uncertain");
-  const targets = [...new Set([...committed, ...pending, ...uncertain])];
-  const signature = [...targets].sort().join("\0");
-  // ponytail: same-target-after-failure proxy; capture task IDs if false positives matter.
-  return {
-    targets,
-    committed,
-    pending,
-    uncertain,
-    changedFiles: numberOrZero(row.filesChanged),
-    changedHunks: numberOrZero(row.hunksChanged),
-    inputBytes: numberOrZero(row.inputBytes),
-    status: row.ok === true && isError !== true ? "success" : "failure",
-    phase: typeof row.phase === "string" ? row.phase : "unknown",
-    errorCode: typeof row.errorCode === "string" ? row.errorCode : null,
-    elapsedMs: numberOrZero(row.elapsedMs),
-    retry: signature.length > 0 && previous.some((patch) => patch.status === "failure" && [...patch.targets].sort().join("\0") === signature),
-    truncated: row.truncated === true,
-  };
-}
-
-function numberOrZero(value: unknown): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
 interface ThroughputState {

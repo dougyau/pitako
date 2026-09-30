@@ -1,4 +1,6 @@
 import { PitakoConfigError } from "./errors.ts";
+import type { Model } from "@earendil-works/pi-ai";
+import { supportsOpenAIGrammarTools } from "pi-codex-tools";
 
 export const PROFILES = ["coding", "analysis"] as const;
 export type ProfileName = (typeof PROFILES)[number];
@@ -25,6 +27,30 @@ export const ORCHESTRATION_TOOLS = [
 ] as const;
 
 const ORCHESTRATION = new Set<string>(ORCHESTRATION_TOOLS);
+// SDK imports and Pi's extension loader can create separate module copies.
+const PROFILE_KEY = Symbol.for("pitako.sessionProfiles");
+const host = globalThis as typeof globalThis & { [PROFILE_KEY]?: WeakMap<object, ProfileName> };
+const sessionProfiles = host[PROFILE_KEY] ??= new WeakMap<object, ProfileName>();
+
+export function setSessionProfile(manager: object, profile: ProfileName): void {
+  sessionProfiles.set(manager, profile);
+}
+
+/** Reconcile explicitly: same-model setModel does not emit model_select. */
+export function reconcileChildTools(session: {
+  sessionManager: object;
+  model: Model<any> | undefined;
+  getAllTools(): Array<{ name: string }>;
+  setActiveToolsByName(names: string[]): void;
+}): void {
+  session.setActiveToolsByName(toolsForProfile({
+    available: session.getAllTools().map((tool) => tool.name),
+    profile: sessionProfiles.get(session.sessionManager) ?? "coding",
+    model: session.model,
+    child: true,
+    includePowerShell: process.platform === "win32",
+  }));
+}
 
 const NAVIGATION_GUIDANCE = "Inspect the repo first. Keep raw read/grep/bash/LSP/CodeGraph available. For bounded structural code questions, choose an appropriate supported dense query; use raw tools for literal, exhaustive or exact results; follow up with raw tools if a query/backend is partial or unavailable.";
 
@@ -51,29 +77,33 @@ export function parseProfile(value: unknown): ProfileName {
 export function childActiveTools(
   available: readonly string[],
   platform: NodeJS.Platform = process.platform,
-  roleId?: string,
+  model?: Model<any>,
 ): string[] {
   return toolsForProfile({
     available,
     profile: "coding",
-    roleId,
+    model,
+    child: true,
     includePowerShell: platform === "win32" && available.includes("powershell"),
-  }).filter((name) => !ORCHESTRATION.has(name));
+  });
 }
 
 export function toolsForProfile(options: {
   available: readonly string[];
   profile: ProfileName;
-  roleId?: string;
+  model?: Model<any>;
+  child?: boolean;
   includePowerShell?: boolean;
 }): string[] {
   const available = new Set(options.available);
   const builtins = options.profile === "coding" ? CODING_BUILTINS : ANALYSIS_BUILTINS;
-  const names: string[] = builtins.filter((name) => available.has(name));
+  const patch = options.profile === "coding" && available.has("apply_patch") && supportsOpenAIGrammarTools(options.model);
+  const names: string[] = builtins.filter((name) => available.has(name) && !(patch && (name === "edit" || name === "write")));
   if (options.includePowerShell && available.has("powershell")) names.push("powershell");
   for (const name of options.available) {
     if (BUILTIN_TOOLS.has(name)) continue;
-    if (name === "apply_patch" && options.roleId !== "developer") continue;
+    if (name === "apply_patch" && !patch) continue;
+    if (options.child && ORCHESTRATION.has(name)) continue;
     if (options.profile === "analysis" && MUTATING_TOOLS.has(name)) continue;
     names.push(name);
   }
@@ -99,7 +129,7 @@ export function profileNote(profile: ProfileName): string {
   }
   return [
     "Pitako profile: coding.",
-    "Keep edit/write active: use edit for authorized local edits; write for new files or full rewrites.",
+    "Use apply_patch when available; otherwise edit for local edits and write for new files.",
     ...shared,
   ].join(" ");
 }

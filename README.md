@@ -1,6 +1,6 @@
 # Pitako
 
-Pitako is a small, installable [Pi](https://github.com/earendil-works/pi) package. It gives you a curated coding session on top of the Pi you already run: normal coding tools, LSP, CodeGraph, and web research, plus a read-only analysis profile.
+Pitako is a small, installable [Pi](https://github.com/earendil-works/pi) package. It gives you a curated coding session on top of the Pi you already run: normal coding tools, LSP, CodeGraph, and web research, plus a tool-gated analysis profile.
 
 It is an opinionated composition of Pi. It is not a fork, and it does not replace Pi's model or provider.
 
@@ -26,8 +26,8 @@ Disable Ponytail, Caveman, or any individual skill with `pi config` or package s
 
 ## What this milestone is
 
-- A Pi package (`keywords: pi-package`) with the Pitako, web access, Hermes memory, and Board extensions, curated skills, and one prompt.
-- The **coding** profile: Pi's read, bash, edit, and write tools, plus grep, find, and ls, plus LSP and CodeGraph.
+- A Pi package (`keywords: pi-package`) with Pitako, official Codex tools, ACP context compression, web access, Hermes memory, and Board extensions, curated skills, and one prompt.
+- The **coding** profile: Pi's read and bash tools, model-compatible editing tools, grep, find, ls, LSP, and CodeGraph.
 - The **analysis** profile: the same read and search tools, without `edit`, `write`, `apply_patch`, or `lsp_rename`.
 - Six bounded, read-only Code Intelligence queries: `project_report`, `read_symbol`, `read_enclosing`, `module_report`, `inspect_symbol`, and `review_surface`. Graph-backed queries create or refresh their index when needed under Node; raw tools remain visible.
 - Startup checks that fail with a clear configuration error when a required extension file or the `codegraph` CLI is missing.
@@ -179,7 +179,7 @@ Before a mutating or unknown tool runs, the next target may start a fresh sessio
 
 The result can include turns, input, output, cache tokens, cost, and tool-call counts when Pi reports them. Input tokens are cumulative across turns, not the size of one prompt.
 
-The child cannot call `agent_run`, `agent_supervise`, `agent_spawn`, `agent_status`, `agent_result`, `agent_cancel`, or the `team_*` orchestration tools. It cannot delegate. Same-session fallback can continue a child run; it does not expose a separate resume command.
+The child cannot call `agent_run`, `agent_supervise`, `agent_spawn`, `agent_status`, `agent_result`, `agent_cancel`, or the `team_*` orchestration tools. ACP delegates are off by default, but explicit ACP configuration can enable them in children too. Children start in `coding`, independently of the parent's profile. Same-session fallback can continue a child run; it does not expose a separate resume command.
 
 `agent_spawn` returns while the worker is still running. The worker has its own cancellation. A later Coordinator turn does not cancel it. Completion is one short signal. The result stays out of the Coordinator conversation until `agent_result`. A spawn with `plan` and `unit` can wake an idle `$execute` turn. A spawn without that pair only notifies the UI. Herdr background supervision is not in this milestone.
 
@@ -241,7 +241,7 @@ bun install
 pi install .
 ```
 
-If Bun 1.3.14 fails with `node-gyp: command not found` while installing Hermes's `better-sqlite3` dependency, rerun `bun install --ignore-scripts`. That dependency ships prebuilt binaries for supported platforms; this avoids Bun's unnecessary rebuild.
+If Bun fails with `node-gyp: command not found` while installing Hermes's `better-sqlite3` dependency, make `node-gyp` available on `PATH` and retry. `--ignore-scripts` skips native installation; it does not prove that the installed binary works.
 
 `pi install .` writes the package into Pi settings. Add `-l` to install it for the current project instead of your user settings.
 
@@ -277,10 +277,12 @@ bun run typecheck
 
 | Profile | Tools |
 | --- | --- |
-| `coding` (default) | `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, LSP, CodeGraph, read-only Code Intelligence queries, and configured web research tools. Developer AgentInstances also get `apply_patch`. On Windows, `powershell` is included when Pi registered it. |
+| `coding` (default) | `read`, `bash`, `grep`, `find`, `ls`, LSP, CodeGraph, read-only Code Intelligence queries, context tools, and configured web research tools. Editing uses `apply_patch` on supported models, otherwise `edit` and `write`. On Windows, `powershell` is included when Pi registered it. |
 | `analysis` | `read`, `bash`, `grep`, `find`, `ls`, LSP, CodeGraph, read-only Code Intelligence queries, and configured web research tools. No `edit`, `write`, `apply_patch`, or `lsp_rename`. |
 
-Shell is still available in `analysis`. Restricting bash safely would be a separate sandbox, and this milestone does not add one.
+Official `pi-codex-tools` registers `apply_patch` and owns its grammar capability. Pitako uses its public `supportsOpenAIGrammarTools` helper for every coding role, including the foreground session. Models using `openai-responses` or `openai-codex-responses` with `compat.supportsOpenAIGrammarTools === true` get `apply_patch` instead of `edit` and `write`. Other models get `edit` and `write`, not `apply_patch`. Pitako reapplies this policy after startup, model changes, and profile changes, including same-model child activation.
+
+Shell is still available in `analysis`, and ACP's `decompress` can write output to temporary paths allowed by upstream. This profile is not a sandbox.
 
 ```bash
 pi --no-extensions --approve -e . --pitako-profile analysis
@@ -290,9 +292,21 @@ Or, inside a session: `/pitako profile analysis`. `/pitako` prints the current p
 
 `PITAKO_PROFILE` is used when `--pitako-profile` is omitted. An unknown name fails startup with `PitakoConfigError`.
 
-`edit` and `write` are blocked for `.git/`, `node_modules/`, `.env`, and `.env.*` files. `analysis` does not enable either tool.
+`edit` and `write` are blocked for `.git/`, `node_modules/`, `.env`, and `.env.*` files. These guards do not protect `apply_patch`. The old Pitako strict-path, exact-match patch engine and its structured failures are gone. Upstream accepts absolute paths, symlinks, moves, and fuzzy matching. There is no sandbox; future bwrap or OpenShell isolation does not protect this version.
 
 An unnamed session takes its display name from the first user line, capped at 60 characters. `--name` and `/name` win. A `$plan` or `$execute` session is renamed from the plan heading when that file exists, as `plan: <heading>` or `execute: <heading>`. On resume, Pitako replaces the old `pitako:coding` or `pitako:analysis` placeholder. The footer cwd line and `pitako` status slot both show the display name; the profile is not written into the status slot. `/pitako` still prints the profile.
+
+## Context compression
+
+Pitako bundles `billion-context-pi@0.1.83` as its only compressor. It uses [acp-kernel](https://github.com/ranxianglei/acp-kernel) inline. Pitako does not load `pi-codex-compaction` or add another scheduler.
+
+The public factory starts with `{ delegate: false, autoUpdate: false }`. With clean configuration, `compress`, `search_context`, `decompress`, `acp_status`, and `acp_cache` are available after session start, but ACP delegates and updater are off. `/acp` displays block status. Use `compress` to create blocks and `search_context` and `decompress` to recover their contents.
+
+Explicit `~/.pi/acp.json` and project `.pi/acp.json` settings override those defaults, with project settings taking precedence. They can enable delegates or the updater, or disable ACP with `enabled:false`. Pitako does not rewrite these files. The factory reads the master switch from `process.cwd()`, not an arbitrary child's cwd. Runtime options use upstream `ctx.cwd`.
+
+ACP keeps the original session entries. Persistent block state reloads from `<sessionFile>.acp.json`; copy that sidecar with the transcript when moving a session. In-memory child state lasts only as long as its session.
+
+With ACP active, native manual `/compact` reports `Compaction cancelled`, and automatic compaction produces no native summary. Use ACP's block tools instead. When ACP is disabled or refuses a `bili` proxy, native compaction remains available.
 
 ## Included extensions
 
@@ -302,6 +316,8 @@ An unnamed session takes its display name from the first user line, capped at 60
 | CodeGraph | [`@vndv/pi-codegraph`](https://github.com/vndv/pi-codegraph) `0.1.10` | Pi-native tools over the `codegraph` CLI: search, callers, callees, impact, explore, node, files, status. MIT. |
 | CodeGraph CLI | `@colbymchenry/codegraph` `1.6.0` | The index and `codegraph serve` process the raw extension talks to. MIT. |
 | Code Intelligence | `extensions/code-intelligence/` | Six bounded queries using AST, LSP, Git, and the direct CodeGraph SDK. Graph-backed queries require Node. |
+| Codex patch tools | [`pi-codex-tools`](https://github.com/jvm/pi-mono/tree/main/packages/pi-codex-tools) `0.3.0` | Official entry registers `apply_patch` and invokes upstream install telemetry. Disable telemetry with `PI_OFFLINE=1` or Pi's `enableInstallTelemetry:false` setting. Apache-2.0. |
+| Context compression | [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi) `0.1.83` | Public factory with delegation and updater off by default. MIT, with additional attribution terms for its inline acp-kernel. |
 | Memory and conversation search | [`pi-hermes-memory`](https://github.com/chandra447/pi-hermes-memory) `0.9.9` | Persistent lessons, corrections, and session search. Independent of the Board. MIT. |
 | Web research | [`pi-web-access`](https://github.com/nicobailon/pi-web-access) `0.31.0` | `web_search`, `fetch_content`, `source_check`, `get_search_content`, and `web_enable`. MIT. |
 | Profiles, protected paths, status | `extensions/index.ts` | Pitako-owned. |
@@ -428,7 +444,7 @@ The script copies `fixtures/tiny-ts` to a temp directory, runs `codegraph init`,
 
 - No hover tool. `pi-lsp-client` does not provide one.
 - `codegraph_context` is not wrapped. `codegraph_explore` and `codegraph_node` cover relevant source and call edges.
-- Analysis mode does not sandbox `bash` or `powershell`.
+- Analysis mode does not sandbox shell or ACP temporary output. Protected-path guards for `edit` and `write` do not cover upstream `apply_patch`.
 - Language servers are not installed automatically.
 - `pi-lsp-client` is consumed from git because it is not on npm. The commit is pinned.
 - Web search depends on network access and provider availability. Board scope is global only. Agent fallback does not rerun a task after side effects.

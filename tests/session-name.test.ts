@@ -111,6 +111,10 @@ describe("session name handlers", () => {
       for (const [current, result, expected] of [
         ["$plan topic-naming", { toolName: "write", input: { path: file }, isError: false }, ["plan: Session display name"]],
         ["$plan topic-naming", { toolName: "edit", input: { path: file }, isError: false }, ["plan: Session display name"]],
+        ["$plan topic-naming", { toolName: "apply_patch", details: { changes: [{ kind: "added", path: file }] }, isError: false }, ["plan: Session display name"]],
+        ["$plan topic-naming", { toolName: "apply_patch", details: { changes: [{ kind: "updated", path: "old.md", moveTo: file }] }, isError: false }, ["plan: Session display name"]],
+        ["$plan topic-naming", { toolName: "apply_patch", details: { changes: [{ kind: "updated", path: file }] }, isError: true }, []],
+        ["$plan topic-naming", { toolName: "apply_patch", details: { changes: [{ kind: "deleted", path: file }] }, isError: false }, []],
         ["$plan topic-naming", { toolName: "edit", input: { path: file }, isError: true }, []],
         ["execute: Session display name", { toolName: "write", input: { path: file }, isError: false }, []],
         ["auth-refactor", { toolName: "write", input: { path: file }, isError: false }, []],

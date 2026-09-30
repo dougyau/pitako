@@ -31,6 +31,13 @@ describe("stack configuration", () => {
     expect(manifest.dependencies["@juicesharp/rpiv-todo"]).toBe("2.11.0");
     expect(manifest.dependencies["pi-hermes-memory"]).toBe("0.9.9");
     expect(manifest.bundledDependencies).toContain("pi-hermes-memory");
+    expect(manifest.dependencies["billion-context-pi"]).toBe("0.1.83");
+    expect(manifest.bundledDependencies).toContain("billion-context-pi");
+    expect(stack.required.find(({ id }) => id === "billion-context-pi")).toEqual({
+      id: "billion-context-pi", spec: "billion-context-pi@0.1.83", entry: "extensions/acp.ts",
+      tools: ["compress", "search_context", "decompress", "acp_status", "acp_cache"],
+    });
+    expect(stack.required.findIndex(({ id }) => id === "billion-context-pi")).toBeLessThan(stack.required.findIndex(({ id }) => id === "pi-hermes-memory"));
     expect(stack.required.find(({ id }) => id === "pi-hermes-memory")).toEqual({
       id: "pi-hermes-memory",
       spec: "pi-hermes-memory@0.9.9",
@@ -39,12 +46,18 @@ describe("stack configuration", () => {
     });
     expect(manifest.dependencies["pi-web-access"]).toBe("0.31.0");
     expect(manifest.bundledDependencies).toContain("pi-web-access");
-    expect(stack.required.at(-1)).toEqual({
+    expect(stack.required.find(({ id }) => id === "pi-web-access")).toEqual({
       id: "pi-web-access",
       spec: "pi-web-access@0.31.0",
       entry: "node_modules/pi-web-access/dist/index.js",
       tools: ["web_search", "fetch_content", "source_check", "get_search_content", "web_enable"],
     });
+    expect(stack.required.at(-1)).toEqual({
+      id: "pi-codex-tools", spec: "pi-codex-tools@0.3.0",
+      entry: "node_modules/pi-codex-tools/index.ts", tools: ["apply_patch"],
+    });
+    expect(manifest.dependencies["pi-codex-tools"]).toBe("0.3.0");
+    expect(manifest.bundledDependencies).toContain("pi-codex-tools");
     expect(manifest.pi.skills).toContain("./node_modules/@dietrichgebert/ponytail/skills/ponytail");
     expect(manifest.pi.skills).not.toContain("./skills");
     expect(stack.optional).toEqual([]);

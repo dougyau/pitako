@@ -30,6 +30,18 @@ Pitako vendors selected skills from the official pstack plugin (Lauren Tan, MIT,
 
 `typescript-best-practices` lives under `skills/language/` and is not in the default `pi.skills` list.
 
+### Codex tools and ACP: upstream entries, Pitako policy
+
+`pi-codex-tools@0.3.0` owns `apply_patch` registration and grammar capability. `extensions/profile.ts` uses the public `supportsOpenAIGrammarTools` helper to select patch editing for supported OpenAI Responses and Codex models, or `edit` and `write` for other models. This applies to every coding role. Pitako reconciles the full tool set after startup, model events, profile changes, and child `setModel`, even when the selected model is unchanged. `analysis` excludes `edit`, `write`, `apply_patch`, and `lsp_rename` throughout.
+
+Pitako no longer has a strict-path, exact-match patch engine or structured patch failures. Upstream accepts absolute paths, symlinks, moves, and fuzzy matching. Existing `edit` and `write` protected-path guards do not protect `apply_patch`. Shell and ACP temporary output also remain available in `analysis`. No sandbox, bwrap, or OpenShell isolation is shipped.
+
+`billion-context-pi@0.1.83` is the only compressor. `extensions/acp.ts` calls `createAcpExtension({ delegate: false, autoUpdate: false })`. Explicit `~/.pi/acp.json` and project `.pi/acp.json` retain upstream precedence, with project settings winning. Users can enable delegation or updates, or set `enabled:false`; Pitako does not rewrite their files. The factory reads the master switch using `process.cwd()`, while runtime options use `ctx.cwd`. A different child cwd is not a separate factory master-switch location.
+
+`compress`, `search_context`, `decompress`, and `/acp` manage and recover blocks while keeping original session entries. Persistent sessions reload `<sessionFile>.acp.json`; in-memory children have no persistent sidecar. Active ACP cancels native manual `/compact` with `Compaction cancelled` and prevents automatic native summaries. Disabled ACP or a refused `bili` proxy leaves native compaction available. Pitako does not add `pi-codex-compaction`, a custom compactor, or a second scheduler.
+
+The ACP entry loads before Hermes so a cancelled compaction does not trigger Hermes's flush. The official Codex entry loads before Pitako's profile policy. The main loader and SDK child loader each load every entry once, including children of `pi -e .`. Codex's official entry invokes upstream install telemetry; `PI_OFFLINE=1` or Pi's `enableInstallTelemetry:false` disables it.
+
 ## Conflicts
 
 | Tension | Resolution |
@@ -76,7 +88,7 @@ Fallback is availability only. The runner tries the next configured target for r
 
 `agent_run` stays synchronous. It creates one in-process Pi `AgentSession` with `SessionManager.inMemory`. That gives a new conversation and a new rpiv-todo session id without a child process. Pi's `setModel` keeps the same session when a provider fails after a mutating tool. A fresh session is used only when no mutating tool has run. Unknown errors and cancellation do not fall back. The child prompt is the role instructions plus the task. Parent messages are not passed in.
 
-Board author is resolved from a process-shared session registry, not AsyncLocalStorage. A child Pi session id maps to the instance id. The foreground session stays `pi`. The model cannot pass an author. Child tools are enabled with `setActiveToolsByName` at construction, including grep, find, ls, raw LSP and CodeGraph, and the six bounded Code Intelligence queries. Foreground orchestration tools stay excluded. Only Developer AgentInstances can use `apply_patch`.
+Board author is resolved from a process-shared session registry, not AsyncLocalStorage. A child Pi session id maps to the instance id. The foreground session stays `pi`. The model cannot pass an author. Child identity is registered before `bindExtensions({})`, which starts already-loaded extensions. Tool policy is reconciled after binding and after `setModel`, including same-model activation. Children start in `coding` independently of the parent profile and keep an explicit profile change of their own. Foreground Pitako orchestration stays excluded; explicit ACP configuration can still enable ACP delegates. A completed bind receives one `session_shutdown` before disposal and identity release. Failures before bind dispose without a fictitious shutdown. Role ModelPolicy selection is unchanged.
 
 A policy model that an extension registers during session bind is resolved after that bind. A missing id is final only then, and the task is not sent until that model is active. Target activation is part of fallback. `setModel` throwing `No API key` is an auth failure, and the next target is tried. Unknown throws are not. Pi tools have no mutating flag. Known read-only names do not mark side effects. Every other name does. After that flag is set, fallback continues the same session and does not send the original task again. `reasoning = default` is not rewritten to `medium`.
 

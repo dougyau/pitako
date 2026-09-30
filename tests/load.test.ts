@@ -103,11 +103,18 @@ describe("Pi package loading", () => {
     const webExtensionIndex = paths.findIndex((file) => file.includes(`${path.sep}pi-web-access${path.sep}dist${path.sep}index.js`));
     const pitakoExtensionIndex = paths.findIndex((file) => file.endsWith(`${path.sep}extensions${path.sep}index.ts`));
     expect(webExtensionIndex).toBeLessThan(pitakoExtensionIndex);
-    expect(paths.some((file) => file.includes(`${path.sep}pi-codex-tools${path.sep}`))).toBe(false);
+    expect(paths.filter((file) => file.includes(`${path.sep}pi-codex-tools${path.sep}`))).toHaveLength(1);
+    expect(paths.findIndex((file) => file.includes(`${path.sep}pi-codex-tools${path.sep}`))).toBeLessThan(pitakoExtensionIndex);
     expect(paths.some((file) => file.includes(`${path.sep}pi-lsp-client${path.sep}`))).toBe(true);
     expect(paths.some((file) => file.endsWith(`${path.sep}codegraph-raw.ts`))).toBe(true);
     expect(paths.some((file) => file.includes(`${path.sep}rpiv-todo${path.sep}`))).toBe(true);
-    expect(paths.some((file) => file.includes(`${path.sep}pi-hermes-memory${path.sep}src${path.sep}index.ts`))).toBe(true);
+    const hermesIndex = paths.findIndex((file) => file.includes(`${path.sep}pi-hermes-memory${path.sep}src${path.sep}index.ts`));
+    expect(hermesIndex).toBeGreaterThan(-1);
+    const acpIndex = paths.findIndex((file) => file.endsWith(`${path.sep}extensions${path.sep}acp.ts`));
+    expect(acpIndex).toBeGreaterThan(-1);
+    expect(acpIndex).toBeLessThan(hermesIndex);
+    expect(paths.filter((file) => file.endsWith(`${path.sep}extensions${path.sep}acp.ts`))).toHaveLength(1);
+    expect(paths.some((file) => file.includes(`${path.sep}billion-context-pi${path.sep}dist${path.sep}index.js`))).toBe(false);
     expect(paths.some((file) => file.endsWith(`${path.sep}extensions${path.sep}board${path.sep}index.ts`))).toBe(true);
     expect(paths.some((file) => file.includes(`${path.sep}pi-web-access${path.sep}dist${path.sep}index.js`))).toBe(true);
     for (const file of paths) expect(file.startsWith(root)).toBe(true);
@@ -190,7 +197,7 @@ describe("Pi package loading", () => {
     }
   });
 
-  test("profile reloads and profile command never expose patch outside Developer AgentInstances", async () => {
+  test("profile reloads keep edit/write for unsupported models in all roles", async () => {
     const foreground = profileHarness();
     await foreground.start();
     expect(foreground.active).toContain("edit");
@@ -225,18 +232,18 @@ describe("Pi package loading", () => {
     const developer = profileHarness();
     await agentScope.run({ instanceId: "not-role-derived-from-this-id", roleId: "developer" }, async () => {
       await developer.start();
-      expect(developer.active).toContain("apply_patch");
+      expect(developer.active).not.toContain("apply_patch");
       await developer.selectProfile("analysis");
       expect(developer.active).not.toContain("apply_patch");
       await developer.selectProfile("coding");
-      expect(developer.active).toContain("apply_patch");
+      expect(developer.active).not.toContain("apply_patch");
       await developer.start();
-      expect(developer.active).toContain("apply_patch");
+      expect(developer.active).not.toContain("apply_patch");
     });
     await developer.shutdown();
   });
 
-  test("supervised Herdr role controls patch across profile switches", async () => {
+  test("supervised Herdr roles keep edit/write on unsupported models", async () => {
     const previousId = process.env.PITAKO_INSTANCE_ID;
     const previousRole = process.env.PITAKO_ROLE_ID;
     try {
@@ -244,13 +251,13 @@ describe("Pi package loading", () => {
       process.env.PITAKO_ROLE_ID = "developer";
       const developer = profileHarness();
       await developer.start();
-      expect(developer.active).toContain("apply_patch");
+      expect(developer.active).not.toContain("apply_patch");
       expect(developer.active).toContain("edit");
       expect(developer.active).toContain("write");
       await developer.selectProfile("analysis");
       expect(developer.active).not.toContain("apply_patch");
       await developer.selectProfile("coding");
-      expect(developer.active).toContain("apply_patch");
+      expect(developer.active).not.toContain("apply_patch");
       await developer.shutdown();
 
       process.env.PITAKO_ROLE_ID = "reviewer";
