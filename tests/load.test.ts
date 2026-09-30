@@ -141,7 +141,10 @@ describe("Pi package loading", () => {
     expect(skills).toContain("pitako-coding");
     expect(skills).toContain("ponytail");
     expect(skills).toContain("how");
-    expect(skills).toContain("principle-prove-it-works");
+    expect(skills).toContain("verify-behavior");
+    for (const retired of ["tdd", "show-me-your-work", "principle-prove-it-works"]) {
+      expect(skills).not.toContain(retired);
+    }
     expect(skills).not.toContain("poteto-mode");
     const prompts = loaded.loader.getPrompts().prompts.map((prompt) => prompt.name);
     expect(prompts).toContain("explain");

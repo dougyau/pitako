@@ -41,6 +41,36 @@ Disable Ponytail, Caveman, or any individual skill with `pi config` or package s
 - `team_assign`, `team_status`, `team_result`, and `team_cancel` for independent foreground Team assignments, with one active assignment per role.
 - `$plan` and `$execute`. Planning stops at `PLAN_FROZEN`. Execution is a separate invocation. Neither calls Herdr.
 
+## Verify behavior
+
+`verify-behavior` selects evidence by observable behavior and contract-derived expectations, not by function coverage or test count. A unit test can prove a domain rule. A mock cannot prove the real dependency or an integration it replaces. Reuse existing checks and add only what a concrete missing guarantee needs.
+
+```text
+/skill:verify-behavior verify the authorized change
+/skill:verify-behavior review-diff base=<agreed-local-ref>
+/skill:verify-behavior simplify-tests tests/<agreed-module>
+```
+
+- `verify` checks the authorized task and reports the behavior, check, observed result, and limits.
+- `review-diff` is read-only. It covers the complete agreed diff, including tests, helpers, fixtures, and configuration. A branch review includes commits since the agreed base, staged and unstaged edits, and relevant new files. It does not assume `main` or fetch a base.
+- `simplify-tests` recommends changes in the agreed paths, even without a diff. Applying changes requires explicit edit authorization and an editing role. Reviewer and Researcher remain read-only. Before deletion, identify where the guarantee remains demonstrated or why the contract no longer applies. Preserve uncertain cases and distinct guarantees. Green after deletion is not proof of safety.
+
+These modes are natural-language requests, not a new API. Ponytail governs simplicity of implementation and verification. `verify-behavior` governs evidence validity and sufficiency. Pitako permits existing frameworks and fixtures rather than requiring Ponytail's prescribed self-check artifact. Neither skill relaxes mandatory gates or independent review.
+
+Roles, `$plan`, `$execute`, and `pre-pr` use this policy within their existing passes. Acceptance criteria describe observable behavior and proportional expected evidence. Review includes deleted guarantees; absence of a new test is not itself a defect. Cleanup reruns invalidated checks and applicable mandatory gates, not every prior check merely because the role changed. Creating or maintaining a project-specific verification skill requires an explicitly authorized task; routine verification does not require a feature map or tree audit.
+
+### Migrate role overrides
+
+`verify-behavior` replaces the retired `tdd`, `show-me-your-work`, and `principle-prove-it-works` skills. Developer, Reviewer, Coordinator, and Researcher include it once in their default `skills` arrays. Architect is unchanged.
+
+Old names in a personal `skills` or `principles` array now produce the existing `unknown skill` error and block config loading. No aliases or automatic migration are provided. To migrate `$PI_CODING_AGENT_DIR/pitako/config.toml` manually:
+
+1. Remove all three retired names wherever they appear in `skills` or `principles`.
+2. Add `verify-behavior` once in `skills`, not once in each array.
+3. Preserve your other choices. Every supplied array replaces the whole corresponding default array; omitted arrays retain their defaults.
+
+The old defaults put `tdd` and `show-me-your-work` in `skills`, and `principle-prove-it-works` in `principles`. Do not replace all three names blindly in both arrays. Pitako does not rewrite personal config.
+
 ## Session TODOs
 
 Pitako uses [`@juicesharp/rpiv-todo`](https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-todo) (juicesharp, MIT) as the tactical plan for the current Pi session.
@@ -397,7 +427,7 @@ pitako/
 ├── skills/execute/       # explicit implementation authority
 ├── skills/remove-ai-slops/
 ├── skills/caveman/       # vendored MIT Caveman skill
-├── skills/practical/     # selected pstack workflows
+├── skills/practical/     # selected pstack workflows and verify-behavior
 ├── skills/principles/    # selected pstack principles
 ├── skills/language/      # optional; not loaded by default
 ├── prompts/explain.md

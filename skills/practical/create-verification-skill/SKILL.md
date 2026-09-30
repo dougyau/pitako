@@ -1,11 +1,11 @@
 ---
 name: create-verification-skill
-description: "Generate a project-local verification skill that drives the app the way a user does. Use when a repository has no repeatable way for an agent to prove real UI, CLI, or service behavior."
+description: "Generate a project-local verification skill that drives the app the way a user does. Use only for an explicitly authorized task to create such a procedure, not routine verification."
 ---
 
 # Create a verification skill
 
-Generate a project-local skill that launches the real app, exercises a feature the way a user would, and captures evidence. Write it for the next agent, not for a human.
+For an explicitly authorized creation task, generate a project-local skill that launches the real app, exercises a feature the way a user would, and captures evidence. Write it for the next agent, not for a human. A missing proof path alone does not authorize creation. Using `verify-behavior` does not require this skill or a feature map.
 
 Pi loads project skills from `.pi/skills/` (and `.agents/skills/` when present). Do not write `.cursor/skills/` unless this repository already uses that layout.
 

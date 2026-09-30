@@ -37,7 +37,6 @@ PRINCIPLES = [
     "principle-foundational-thinking",
     "principle-model-the-domain",
     "principle-boundary-discipline",
-    "principle-prove-it-works",
     "principle-fix-root-causes",
     "principle-guard-the-context-window",
     "principle-subtract-before-you-add",

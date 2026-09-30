@@ -64,7 +64,7 @@ Build a WorkBrief for the current unit only:
 
 Do not send the parent transcript, unrelated units, old evidence, or every Board topic.
 
-Developer implements. Reviewer is adversarial by definition: challenge passing tests and probe violated invariants, negative paths, lifecycle, concurrency, identity/path assumptions, stale state, mocks, coverage, and frozen criteria. Reviewer reports findings and never fixes. Architect answers only an architecture question. Researcher fills only a real knowledge gap. If any delegation fails, report the error; failure never transfers specialist authority to the Coordinator. Do not perform that role yourself. Keep at most one Developer role active, without exception.
+Developer implements. Reviewer adversarially challenges the complete relevant diff and evidence against affected contracts, concrete risks, and frozen criteria using `verify-behavior`. Reviewer reports findings and never fixes. Architect answers only an architecture question. Researcher fills only a real knowledge gap. If any delegation fails, report the error; failure never transfers specialist authority to the Coordinator. Do not perform that role yourself. Keep at most one Developer role active, without exception.
 
 When neither `agent_run` nor `team_assign` nor `agent_spawn` is registered, implement inline with the same plan, ledger, evidence, and verification rules. A failed, stalled, cancelled, or lost delegation does not authorize inline specialist work.
 
@@ -80,7 +80,9 @@ For each unit: load the WorkBrief, implement, verify, then checkpoint.
 
 Developer implementation uses Ponytail full. There is no separate Ponytail agent. Ponytail may simplify how a requirement is implemented. It may not drop an acceptance criterion, invariant, trust-boundary check, security behavior, or necessary error handling. Record a `RULING` when that simplification is architectural.
 
-Verification order: focused tests, then typecheck or lint or build when relevant, then the real surface when it is cheap. A worker saying "done" is not proof. "Compiles" is not enough when the real path is cheap.
+Use `verify-behavior` for check selection, stopping, and test quality within this unit's existing implementation and review passes. Inspect tests and their infrastructure, including removed guarantees, without adding a separate mandatory audit. Ponytail governs simplicity of implementation and verification, not an artifact quota. Follow the skill's Pitako clarification to reuse existing frameworks and fixtures instead of creating a prescribed self-check.
+
+Apply that policy within the plan's required gates. A worker saying "done" is not proof. Compilation does not prove unobserved behavior. Reuse valid evidence. Rerun checks invalidated by subsequent edits, relevant environment changes, or insufficient evidence. A role change alone does not require repetition. Mandatory gates remain required.
 
 If verification fails, reproduce, find the root cause, make the smallest correction, and verify again. First failure stays with the same Developer. Do not ask the user, call Architect, or switch to a stronger model because one check failed.
 
@@ -90,7 +92,7 @@ Do not start the next unit until this unit is verifiable.
 
 ## Cleanup
 
-Ponytail is the first defense. After all units are verified and material findings are resolved, make one deliberate Ponytail pass over the complete finished diff. This pass comes before `remove-ai-slops` and final gates; it does not replace Ponytail during implementation.
+Ponytail is the first defense. After all units are verified and material findings are resolved, make one deliberate Ponytail pass over the complete finished diff. This pass comes before `remove-ai-slops` and final gates; it does not replace Ponytail during implementation. Apply `verify-behavior`'s deletion rule to tests and their infrastructure: identify the guarantee and where it remains demonstrated, or why the contract no longer applies. Preserve uncertain cases and distinct guarantees.
 
 Run affected focused checks after that pass. They must be green before `remove-ai-slops`.
 
@@ -100,7 +102,7 @@ Scope is files changed by this run. Do not clean unrelated history. Do not escal
 
 Write `evidence/<unit>/deslop.md` or `evidence/final/deslop.md` only for a dedicated pass. Keep the ledger to a pointer.
 
-After cleanup, rerun the same checks; if cleanup breaks a check, revert that cleanup and verify again. Run final gates after all edits: focused tests, then typecheck or lint or build when relevant, then the real surface when it is cheap.
+After cleanup, rerun checks invalidated by the edits using `verify-behavior`; if cleanup breaks a check, revert that cleanup and verify again. Run final gates after all edits: focused tests, then typecheck or lint or build when relevant, then the real surface when it is cheap. Evidence reuse never cancels a mandatory gate.
 
 ## Review
 

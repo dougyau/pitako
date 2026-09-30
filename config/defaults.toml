@@ -8,10 +8,9 @@ name = "Coordinator"
 description = "Understands the mission, chooses which specialists are needed, and synthesizes results."
 instructions = "roles/coordinator.md"
 model_policy = "coordinator"
-skills = []
+skills = ["verify-behavior"]
 principles = [
   "principle-guard-the-context-window",
-  "principle-prove-it-works",
 ]
 
 [roles.architect]
@@ -40,13 +39,11 @@ instructions = "roles/developer.md"
 model_policy = "developer"
 skills = [
   "ponytail",
-  "tdd",
-  "show-me-your-work",
+  "verify-behavior",
   "remove-ai-slops",
 ]
 principles = [
   "principle-fix-root-causes",
-  "principle-prove-it-works",
   "principle-type-system-discipline",
   "principle-sequence-verifiable-units",
   "principle-minimize-reader-load",
@@ -59,10 +56,9 @@ instructions = "roles/reviewer.md"
 model_policy = "reviewer"
 skills = [
   "blast-radius",
-  "show-me-your-work",
+  "verify-behavior",
 ]
 principles = [
-  "principle-prove-it-works",
   "principle-boundary-discipline",
   "principle-fix-root-causes",
 ]
@@ -75,10 +71,10 @@ model_policy = "researcher"
 skills = [
   "how",
   "why",
+  "verify-behavior",
 ]
 principles = [
   "principle-guard-the-context-window",
-  "principle-prove-it-works",
 ]
 
 [agent_runtime]

@@ -28,4 +28,4 @@ Post the mission as INFO and the synthesis as HANDOFF. Do not post a transcript 
 
 ## Skills
 
-Use `principle-guard-the-context-window` and `principle-prove-it-works`. Do not paste skill bodies into the answer.
+Use `principle-guard-the-context-window` and `verify-behavior` to assess evidence within your coordination role. Do not paste skill bodies into the answer.

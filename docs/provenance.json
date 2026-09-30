@@ -81,8 +81,6 @@
       "how",
       "why",
       "blast-radius",
-      "tdd",
-      "show-me-your-work",
       "create-verification-skill",
       "maintain-verification-skill",
       "reflect",
@@ -93,7 +91,6 @@
       "principle-foundational-thinking",
       "principle-model-the-domain",
       "principle-boundary-discipline",
-      "principle-prove-it-works",
       "principle-fix-root-causes",
       "principle-guard-the-context-window",
       "principle-subtract-before-you-add",
@@ -110,6 +107,14 @@
       "principle-separate-before-serializing-shared-state",
       "principle-experience-first"
     ],
+    "adapted": [
+      {
+        "name": "verify-behavior",
+        "path": "skills/practical/verify-behavior/SKILL.md",
+        "consolidatesRetired": ["tdd", "show-me-your-work", "principle-prove-it-works"],
+        "reason": "Compact Pitako contract for observable evidence, read-only diff review, and explicitly authorized test simplification; retains pstack MIT attribution."
+      }
+    ],
     "excluded": [
       "poteto-mode",
       "setup-pstack",
@@ -124,9 +129,14 @@
       "architect stops after the sketch unless the user asked to implement",
       "Removed disable-model-invocation so skills stay discoverable",
       "unslop limited to prose",
-      "create-verification-skill writes .pi/skills/",
+      "create-verification-skill writes .pi/skills/ and triggers only for explicitly authorized creation; routine verify-behavior use does not require a feature map; reapply after vendoring",
+      "maintain-verification-skill triggers only for explicitly authorized maintenance or audit, limits feature-map work to that scope, and routes checks to verify-behavior; reapply after vendoring",
       "principle-guard-the-context-window no longer routes bulk work to subagents",
-      "principle-build-the-lever no longer links principle-laziness-protocol"
+      "principle-build-the-lever no longer links principle-laziness-protocol",
+      "principle-build-the-lever reuses existing tools, removes verification artifact mandates, and links ../../practical/verify-behavior/SKILL.md; reapply after vendoring",
+      "principle-sequence-verifiable-units verifies meaningful units through verify-behavior, not every edit, and makes test-first sequencing optional; branch guidance unchanged; reapply after vendoring",
+      "principle-outcome-oriented-execution requires relevant final verification and mandatory migration gates through verify-behavior, not unrelated full static/runtime checks; reapply after vendoring",
+      "verify-behavior consolidates three retired skills; role defaults, router, and workflow entries reference the common evidence contract"
     ],
     "update": "Clone the pstack tree from cursor/plugins, set PSTACK_CHECKOUT, CAVEMAN_CHECKOUT, and PONYTAIL_CHECKOUT, then run scripts/vendor-engineering-layer.py. Re-apply the local modifications documented here. Bump docs/provenance.json."
   }

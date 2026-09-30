@@ -18,7 +18,7 @@ Optimize for the intended, verifiable end state rather than preserving smooth in
 - Use this for planned rewrites and migrations with explicit phase boundaries
 - Declare where temporary breakage is acceptable
 - Keep high-signal checks for actively touched areas while migrating
-- Require full static and runtime verification at plan completion
+- At plan completion, run relevant final verification and all required migration gates. Select sufficient evidence through [Verify behavior](../../practical/verify-behavior/SKILL.md), not unrelated static or runtime checks.
 
 ## Pitako
 
