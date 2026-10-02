@@ -56,9 +56,12 @@ function profileHarness(profileFlag?: string) {
     registerFlag() {},
     registerTool() {},
     getFlag() { return profileFlag; },
-    on(event: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) { handlers.set(event, handler); },
-    registerCommand(_name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) {
-      profileCommand = command.handler;
+    on(event: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) {
+      const previous = handlers.get(event);
+      handlers.set(event, async (event, ctx) => { await previous?.(event, ctx); return handler(event, ctx); });
+    },
+    registerCommand(name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) {
+      if (name === "pitako") profileCommand = command.handler;
     },
     getActiveTools() { return [...active]; },
     getAllTools() { return available.map((name) => ({ name })); },
@@ -304,7 +307,8 @@ describe("Pi package loading", () => {
           return undefined;
         },
         on(event: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) {
-          handlers.set(event, handler);
+          const previous = handlers.get(event);
+          handlers.set(event, async (event, ctx) => { await previous?.(event, ctx); return handler(event, ctx); });
         },
         registerCommand() {},
         getActiveTools() {

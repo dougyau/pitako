@@ -245,7 +245,10 @@ describe("agent UI lifecycle", () => {
         registerFlag() {},
         registerCommand() {},
         registerTool() {},
-        on(event: string, handler: Function) { handlers.set(event, handler); },
+        on(event: string, handler: Function) {
+          const previous = handlers.get(event);
+          handlers.set(event, async (...args: unknown[]) => { await previous?.(...args); return handler(...args); });
+        },
         getFlag() { return undefined; },
         getAllTools() { return [{ name: "read" }]; },
         getActiveTools() { return ["read"]; },
@@ -347,7 +350,10 @@ describe("agent UI lifecycle", () => {
       registerFlag() {},
       registerCommand(name: string, command: { handler: Function }) { commands.set(name, command.handler); },
       registerTool() {},
-      on(event: string, handler: Function) { handlers.set(event, handler); },
+      on(event: string, handler: Function) {
+        const previous = handlers.get(event);
+        handlers.set(event, async (...args: unknown[]) => { await previous?.(...args); return handler(...args); });
+      },
       getFlag() { return undefined; },
       getAllTools() { return [{ name: "read" }]; },
       getActiveTools() { return ["read"]; },

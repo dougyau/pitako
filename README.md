@@ -246,11 +246,23 @@ Artifacts live in the workspace (git root, or the current directory outside a re
 
 Six records stay separate. `todo` is the current session checklist. The Board holds shared findings, decisions, and handoffs. The plan is the frozen decision. The ledger is the resume checkpoint: plan id, revision, content hash, status, and rulings. Evidence is proof for one unit. The repository is the product change. Do not use one as a substitute for another.
 
-`$plan` and `$execute` are not Herdr callers. Team assignments can run independent work, but there is no DAG scheduler.
+`$plan` and `$execute` are not Herdr callers. Ad-hoc Team assignments remain independent work, not durable mission units.
+
+## Durable missions (opt-in)
+
+`/mission` is the operator-console entry point for a frozen mission definition.
+Preparation validates its DAG, bounded role policies and budget before any worker
+starts. Activation journals intent before managed SDK tools run; candidates,
+artifacts and receipts persist outside the source checkout. A result is delivered
+without automatically changing source, committing or publishing it.
+
+See [durable missions](docs/missions.md) for commands, recovery limitations,
+Linux sandbox prerequisites and the separate effectiveness measurement protocol.
+An engine-completed mission is **not** independently assessed product success.
 
 ## What this is not yet
 
-Pitako does not implement subteams or a DAG scheduler. Team assignments let independent roles run concurrently, with one assignment per role. Session TODOs are local execution plans. The Board is not a team roster or a memory store.
+Pitako does not implement subteams. Ad-hoc Team assignments let independent roles run concurrently, with one assignment per role; they do not become durable missions. Session TODOs are local execution plans. The Board is not a team roster or a memory store.
 
 ## Requirements
 
@@ -322,7 +334,7 @@ Or, inside a session: `/pitako profile analysis`. `/pitako` prints the current p
 
 `PITAKO_PROFILE` is used when `--pitako-profile` is omitted. An unknown name fails startup with `PitakoConfigError`.
 
-`edit` and `write` are blocked for `.git/`, `node_modules/`, `.env`, and `.env.*` files. These guards do not protect `apply_patch`. The old Pitako strict-path, exact-match patch engine and its structured failures are gone. Upstream accepts absolute paths, symlinks, moves, and fuzzy matching. There is no sandbox; future bwrap or OpenShell isolation does not protect this version.
+`edit` and `write` are blocked for `.git/`, `node_modules/`, `.env`, and `.env.*` files. These foreground guards do not protect `apply_patch`. The old Pitako strict-path, exact-match patch engine and its structured failures are gone. Upstream accepts absolute paths, symlinks, moves, and fuzzy matching. Foreground and ad hoc sessions are not sandboxed. Managed missions separately use the fenced Linux candidate boundary described in [missions](docs/missions.md).
 
 An unnamed session takes its display name from the first user line, capped at 60 characters. `--name` and `/name` win. A `$plan` or `$execute` session is renamed from the plan heading when that file exists, as `plan: <heading>` or `execute: <heading>`. On resume, Pitako replaces the old `pitako:coding` or `pitako:analysis` placeholder. The footer cwd line and `pitako` status slot both show the display name; the profile is not written into the status slot. `/pitako` still prints the profile.
 

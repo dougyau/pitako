@@ -515,6 +515,7 @@ export function initLedger(file: string, meta: PlanMeta): "created" | "exists" {
 }
 
 export function parseLedgerBinding(text: string): LedgerBinding {
+  rejectGeneratedLedger(text);
   const fields = frontmatter(text, "ledger");
   const planId = fields.get("plan_id");
   const revision = Number(fields.get("revision"));
@@ -537,7 +538,32 @@ export function parseLedgerBinding(text: string): LedgerBinding {
   };
 }
 
+function rejectGeneratedLedger(text: string): void {
+  if (isGeneratedMissionLedger(text)) {
+    throw new PitakoConfigError("generated mission ledger is not legacy execution authority");
+  }
+}
+
+export function isGeneratedMissionLedger(text: string): boolean {
+  const header = text.match(/^\uFEFF?---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/)?.[1];
+  if (!header) return false;
+  return header.split(/\r?\n/).some((line) => {
+    const content = line.trim();
+    if (!content || content.startsWith("#")) return false;
+    const separator = line.indexOf(":");
+    if (separator < 1) return true;
+    const key = line.slice(0, separator).trim().replace(/^(['"])(.*)\1$/, "$2");
+    const normalizedKey = normalizeLedgerToken(key);
+    return normalizedKey === "format" || !/^[\p{L}\p{N}_.-]+$/u.test(normalizedKey);
+  });
+}
+
+function normalizeLedgerToken(value: string): string {
+  return value.normalize("NFKC").replace(/\p{Default_Ignorable_Code_Point}/gu, "").trim().toLowerCase();
+}
+
 export function parseLedgerStatus(text: string): string | undefined {
+  rejectGeneratedLedger(text);
   return frontmatter(text, "ledger").get("status");
 }
 
@@ -545,6 +571,7 @@ const HOLD_START = "<!-- pitako-team-holds:v1 -->";
 const HOLD_END = "<!-- /pitako-team-holds -->";
 
 export function ledgerTeamHolds(text: string): TeamHold[] {
+  rejectGeneratedLedger(text);
   const matches = [...text.matchAll(/^<!-- pitako-team-holds:v1 -->\r?\n([\s\S]*?)\r?\n<!-- \/pitako-team-holds -->$/gm)];
   if (matches.length !== 1 || text.split(HOLD_START).length !== 2 || text.split(HOLD_END).length !== 2) {
     throw new PitakoConfigError("ledger Team hold gate is missing or malformed");

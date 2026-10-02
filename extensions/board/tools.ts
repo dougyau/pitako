@@ -17,11 +17,15 @@ import {
 import { resolveBoardAuthor } from "./author.ts";
 import { boardWorkspace } from "./workspace.ts";
 import { currentInstanceId } from "../agent/scope.ts";
-import { bindPlanTopic, ledgerFile, openExecutionPlan, parseLedgerBinding, parseLedgerStatus, readFrozenPlan, readPlan, bindingMismatch, verifyExecutionBinding, withLedgerTeamHoldLock } from "../workflow.ts";
+import { bindPlanTopic, ledgerFile, openExecutionPlan, parseLedgerBinding, parseLedgerStatus, readFrozenPlan, readPlan, parsePlanDocument, bindingMismatch, verifyExecutionBinding, withLedgerTeamHoldLock } from "../workflow.ts";
 import { teamEvaluationForSession, teamExecutionBinding, hasUnsettledTeamWork } from "../team.ts";
 import { executionForSession } from "../execution-identity.ts";
 import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
 import { getBoardDbPath } from "./paths.ts";
+import { authorizeRoleDispatch } from "../agent/managed-mission.ts";
+import { missionCompletionCertificate } from "../mission/completion.ts";
+import { openMissionStore, type MissionInspection } from "../mission/store.ts";
 
 const PostTypeSchema = StringEnum(POST_TYPES);
 const TopicStatusSchema = StringEnum(TOPIC_STATUSES);
@@ -167,8 +171,18 @@ export function registerBoard(pi: ExtensionAPI): void {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       if (isChildSession(ctx)) return toolError("workflow Board lifecycle cannot be called from a child session");
       try {
+        const authorization = { planId: params.planId, purpose: "board-lifecycle" as const };
+        const managed = await authorizeRoleDispatch(ctx.cwd, authorization);
+        if (managed) {
+          const confirmed = await authorizeRoleDispatch(ctx.cwd, authorization);
+          if (!confirmed || confirmed.mission.id !== managed.mission.id) throw new BoardError("managed Board lifecycle target changed during authorization");
+          return await managedBoardLifecycle(ctx.cwd, confirmed.mission, params.status);
+        }
         const evaluation = teamEvaluationForSession(ctx.sessionManager?.getSessionId?.(), false);
         const captured = teamExecutionBinding(evaluation, params.planId);
+        const resolvedRoot = captured?.executionRoot ?? ctx.cwd;
+        const resolvedManaged = await authorizeRoleDispatch(resolvedRoot, authorization);
+        if (resolvedManaged) return await managedBoardLifecycle(resolvedRoot, resolvedManaged.mission, params.status);
         const initialPlan = captured ? verifyExecutionBinding(captured) : lifecyclePlan(params.planId, ctx.cwd);
         if (initialPlan.meta.boardTopicId === undefined && !existsSync(getBoardDbPath())) {
           return toolSuccess("Plan has no Board topic; no Board changes made.", { noTopic: true });
@@ -256,6 +270,8 @@ export function registerBoard(pi: ExtensionAPI): void {
             );
             return toolSuccess(formatTopicCreated(updated), { topicId: updated.id, status: updated.status });
           };
+          const finalAuthorization = await authorizeRoleDispatch(executionRoot, authorization);
+          if (finalAuthorization) return await managedBoardLifecycle(executionRoot, finalAuthorization.mission, params.status);
           return params.status === "resolved" ? withLedgerTeamHoldLock(executionRoot, plan.meta.id, transition) : transition();
         } finally {
           board.close();
@@ -401,6 +417,42 @@ function workflowRun(
 ) {
   if (isChildSession(ctx)) return Promise.resolve(toolError("workflow Board operations cannot be called from a child session"));
   return run(ctx, action);
+}
+
+async function managedBoardLifecycle(cwd: string, mission: MissionInspection, status: "resolved" | "closed") {
+  const plan = parsePlanDocument(mission.planBytes.toString("utf8"));
+  const topicId = plan.boardTopicId;
+  if (topicId === undefined) return toolSuccess("Managed mission has no Board topic; no Board changes made.", { missionId: mission.id, noTopic: true });
+  const location = boardWorkspace(cwd);
+  const executionRoot = boardWorkspace(path.dirname(mission.snapshot.sourcePath)).physicalRoot;
+  if (location.physicalRoot !== executionRoot) throw new BoardError("caller worktree does not match managed mission execution root");
+  if (!existsSync(getBoardDbPath())) throw new BoardError(`managed mission Board topic ${topicId} is not present`);
+  const board = await openBoard();
+  try {
+    const topic = board.readTopic(location.identity, topicId).topic;
+    if (topic.ownerPlanId !== mission.planId) throw new BoardError(`Board topic ${topic.id} is not owned by managed mission plan ${mission.planId}`);
+    if (topic.planRevision !== null && topic.planRevision !== mission.snapshot.revision) throw new BoardError(`Board topic ${topic.id} revision does not match the managed mission`);
+    if (topic.planHash !== null && topic.planHash !== mission.snapshot.planHash) throw new BoardError(`Board topic ${topic.id} plan hash does not match the managed mission`);
+    if (topic.executionRoot !== null && path.resolve(topic.executionRoot) !== executionRoot) throw new BoardError(`Board topic ${topic.id} execution root does not match the managed mission`);
+    const store = await openMissionStore({ readOnly: true });
+    let certificate;
+    try {
+      const fresh = store.inspectMission(mission.id);
+      if (fresh.planId !== mission.planId || fresh.repositoryId !== mission.repositoryId ||
+        fresh.snapshot.planHash !== mission.snapshot.planHash || fresh.snapshot.definitionHash !== mission.snapshot.definitionHash ||
+        fresh.snapshot.sourcePath !== mission.snapshot.sourcePath || fresh.latestSeq !== mission.latestSeq) {
+        throw new BoardError("managed mission changed since Board authorization; inspect it again");
+      }
+      if (store.verifyRepositoryAssociation(executionRoot) !== fresh.repositoryId) throw new BoardError("managed mission execution root lost its repository association");
+      if (status === "resolved") certificate = missionCompletionCertificate(fresh, store);
+    } finally { store.close(); }
+    if (status === "resolved" && !certificate) throw new BoardError(`managed mission ${mission.id} has no valid completion certificate; Board topic remains ${topic.status}`);
+    const binding = certificate ? { revision: certificate.revision, hash: mission.snapshot.planHash, executionRoot } : undefined;
+    const updated = board.transitionOwnedTopic(location.identity, topic.id, mission.planId, status, binding);
+    return toolSuccess(formatTopicCreated(updated), { missionId: mission.id, topicId: updated.id, status: updated.status, ...(certificate ? { completionCertificate: certificate } : {}) });
+  } finally {
+    board.close();
+  }
 }
 
 function toolSuccess(text: string, details: Record<string, unknown>) {

@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import { createAgentSession, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { extensionPaths, loadPitako } from "../../../scripts/load-pitako.ts";
 import { packageRoot } from "../../../extensions/stack.ts";
+import { parseApplyPatch } from "pi-codex-tools";
 
 type Arm = "baseline" | "patch";
 type Manifest = {
@@ -42,7 +43,7 @@ const bunVersion = await commandOutput(["bun", "--version"], repo);
 const packagePiCliVersion = await commandOutput([path.join(repo, "node_modules/.bin/pi"), "--version"], repo);
 const hostPiCliVersion = await commandOutput([path.join(process.env.HOME ?? homedir(), ".bun", "bin", "pi"), "--version"], repo);
 const head = await commandOutput(["git", "rev-parse", "HEAD"], repo);
-const implementationFiles = ["extensions/apply-patch.ts", "extensions/agent/effects.ts", "extensions/agent/index.ts", "extensions/agent/run.ts", "extensions/index.ts", "extensions/profile.ts", "package.json", "bun.lock", "tests/apply-patch.test.ts", "tests/apply-patch-pi.test.ts", "tests/codex-contract.test.ts"];
+const implementationFiles = ["node_modules/pi-codex-tools/src/index.ts", "node_modules/pi-codex-tools/src/apply-patch.ts", "extensions/agent/effects.ts", "extensions/agent/index.ts", "extensions/agent/run.ts", "extensions/index.ts", "extensions/profile.ts", "package.json", "bun.lock", "tests/codex-contract.test.ts"];
 const implementationSnapshotHash = await hashFiles(repo, implementationFiles);
 
 for (const file of manifest.files) {
@@ -151,7 +152,7 @@ async function runArm(arm: Arm, run: number): Promise<void> {
   loaded.loader.getAppendSystemPrompt().push(roleInstructions);
 
   let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
-  const calls: Array<{ tool: string; path?: string; editCount?: number; targets?: string[]; failed?: boolean; errorCode?: string }> = [];
+  const calls: Array<{ tool: string; path?: string; editCount?: number; targets?: string[]; failed?: boolean }> = [];
   const patches: Array<Record<string, unknown>> = [];
   let gateToolCalls = 0;
   const toolCounts: Record<string, number> = {};
@@ -208,14 +209,13 @@ async function runArm(arm: Arm, run: number): Promise<void> {
       }
       if (event.type === "tool_execution_end") {
         const name = event.toolName ?? "unknown";
-        if (event.isError) failures.push({ tool: name, ...(name === "apply_patch" ? { errorCode: patchDetails(event.result)?.errorCode } : {}) });
+        if (event.isError) failures.push({ tool: name, result: event.result });
         if (name === "apply_patch") {
           const details = patchDetails(event.result);
           if (details) patches.push(compactPatch(details));
           const prior = calls.at(-1);
           if (prior?.tool === name) {
             prior.failed = Boolean(event.isError);
-            prior.errorCode = typeof details?.errorCode === "string" ? details.errorCode : undefined;
           }
         }
       }
@@ -416,7 +416,10 @@ function repeatedEditCalls(calls: Array<{ tool: string; path?: string }>): numbe
 
 function patchTargets(value: unknown): string[] {
   if (typeof value !== "string") return [];
-  return [...value.matchAll(/^\*\*\* (?:Update|Add|Delete) File: (.+)$/gm)].map((match) => match[1]!);
+  try {
+    return parseApplyPatch(value).flatMap((hunk) =>
+      hunk.kind === "update" && hunk.moveTo ? [hunk.path, hunk.moveTo] : [hunk.path]);
+  } catch { return []; }
 }
 
 function patchDetails(result: unknown): Record<string, unknown> | undefined {
@@ -426,8 +429,7 @@ function patchDetails(result: unknown): Record<string, unknown> | undefined {
 }
 
 function compactPatch(details: Record<string, unknown>): Record<string, unknown> {
-  const keys = ["targets", "committed", "pending", "uncertain", "plannedFiles", "plannedHunks", "filesChanged", "hunksChanged", "inputBytes", "status", "phase", "errorCode", "elapsedMs"];
-  return Object.fromEntries(keys.filter((key) => details[key] !== undefined).map((key) => [key, details[key]]));
+  return { changes: details.changes };
 }
 
 function stable(value: unknown): unknown {
@@ -455,7 +457,8 @@ async function commandOutput(command: string[], cwd: string, allowFailure = fals
 
 function guardSource(writableFiles: string[]): string {
   const writable = JSON.stringify(writableFiles);
-  return `const writable = new Set(${writable});
+  return `import { parseApplyPatch } from "pi-codex-tools";
+const writable = new Set(${writable});
 const profileGuidance = ${JSON.stringify("Keep edit and write active. Use edit for one or a few local replacements; use apply_patch for coherent multi-file batches.")};
 const baselineGuidance = "Keep edit and write active. Use edit for one or a few local replacements; use write for new files. Do not use tools that are not active.";
 const patchBatchGuidance = "For this task's three-file batch, use apply_patch once to update src/index.ts, src/session-name.ts, and tests/session-name.test.ts. Do not use edit or write for the batch.";
@@ -488,8 +491,12 @@ export default function(pi) {
     }
     if (name === "apply_patch") {
       const patch = input.patch;
-      const targets = typeof patch === "string" ? [...patch.matchAll(/^\\*\\*\\* (?:Update|Add|Delete) File: (.+)$/gm)].map((match) => match[1]) : [];
-      if (targets.length > 0 && !patch.includes("*** Move to:") && targets.every((target) => writable.has(target))) return undefined;
+      let targets = [];
+      try {
+        targets = parseApplyPatch(patch).flatMap((hunk) =>
+          hunk.kind === "update" && hunk.moveTo ? [hunk.path, hunk.moveTo] : [hunk.path]);
+      } catch {}
+      if (targets.length > 0 && targets.every((target) => writable.has(target))) return undefined;
       return { block: true, reason: "Dogfood patch targets must be manifest-listed writable files." };
     }
     if (name === "bash" && !validBash(input.command)) {

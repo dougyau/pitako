@@ -98,7 +98,8 @@ function sessionHooks(): {
       return undefined;
     },
     on(event: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) {
-      handlers.set(event, handler);
+      const previous = handlers.get(event);
+      handlers.set(event, async (event, ctx) => { await previous?.(event, ctx); return handler(event, ctx); });
     },
     registerCommand() {},
     getActiveTools() {

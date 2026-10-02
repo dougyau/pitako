@@ -19,6 +19,8 @@ import { registerAgentSupervise } from "./herdr/supervise.ts";
 import { packageRoot, prepareRuntime } from "./stack.ts";
 import { planHeading, planInvocation, sessionNameAction } from "./session-name.ts";
 import { planFile, readFrozenPlan, readPlan } from "./workflow.ts";
+import { shutdownManagedMissions } from "./mission/lifecycle.ts";
+import { registerMissionExtension } from "./mission/index.ts";
 import path from "node:path";
 import type { ApplyPatchResult } from "pi-codex-tools";
 
@@ -206,8 +208,9 @@ export default function pitako(pi: ExtensionAPI) {
     applyProfile(pi, profile, ctx);
   });
 
-  pi.on("session_shutdown", async (_event, ctx) => {
+  pi.on("session_shutdown", async (event, ctx) => {
     const sessionId = ctx.sessionManager?.getSessionId();
+    await shutdownManagedMissions(sessionId, event.reason);
     if (foregroundSession(sessionId)) {
       foregroundCodeUsage.delete(sessionId);
       foregroundToolStarts.delete(sessionId);
@@ -259,6 +262,8 @@ export default function pitako(pi: ExtensionAPI) {
     if (current.includes(note)) return undefined;
     return { systemPrompt: current.length > 0 ? `${current}\n\n${note}` : note };
   });
+
+  registerMissionExtension(pi);
 
   pi.registerCommand("pitako", {
     description: "Pitako status, telemetry, profile, roles, and model policies",

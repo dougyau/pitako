@@ -15,6 +15,7 @@ const PATTERNS: Array<{ reason: FallbackReason; pattern: RegExp }> = [
         "unknown model",
         "no such model",
         "provider unavailable",
+        "\\bmodel (?:is )?(?:currently )?at capacity\\b",
         "overloaded",
         "service unavailable",
         "internal server error",

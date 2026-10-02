@@ -36,7 +36,7 @@ Pitako selected this version so Researcher and other roles can search for source
 
 The official `node_modules/pi-codex-tools/index.ts` entry registers `apply_patch` and owns the grammar capability. Pitako uses its public `supportsOpenAIGrammarTools` helper, not a patch parser or executor of its own. The entry invokes upstream install telemetry. `PI_OFFLINE=1` or Pi's `enableInstallTelemetry:false` setting disables it.
 
-Upstream accepts absolute paths, symlinks, moves, and fuzzy matching. Pitako's old strict-path, exact-match semantics and structured patch failures no longer apply. The protected-path guards for `edit` and `write` do not cover `apply_patch`. No sandbox is added.
+Upstream accepts absolute paths, symlinks, moves, and fuzzy matching. Pitako's old strict-path, exact-match semantics and structured patch failures no longer apply. The foreground protected-path guards for `edit` and `write` do not cover `apply_patch`; foreground and ad hoc sessions are not sandboxed. Managed missions use their separate fenced candidate boundary.
 
 ### billion-context-pi 0.1.83
 
@@ -93,7 +93,7 @@ Pi reports an extension that throws while loading as a startup error. A language
 ## Still deferred
 
 - Subteams and nested agent delegation
-- Remote agents and process-persistent background workers
+- Remote agents and process-persistent ad-hoc background workers (durable mission recovery is a separate opt-in path)
 - Private or team Board scopes
 - Bash sandbox and plan-mode command allowlists
 - Hover, and `codegraph_context` if a maintained Pi wrapper exposes it without private imports

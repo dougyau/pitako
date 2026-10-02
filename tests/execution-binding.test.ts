@@ -3,7 +3,7 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symli
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
-import { initLedger, ledgerFile, ledgerTemplate, openExecutionPlan, planFile, planHash, readFrozenPlan } from "../extensions/workflow.ts";
+import { initLedger, ledgerFile, ledgerTeamHolds, ledgerTemplate, openExecutionPlan, parseLedgerBinding, parseLedgerStatus, planFile, planHash, readFrozenPlan } from "../extensions/workflow.ts";
 import { runAgentInstance } from "../extensions/agent/run.ts";
 
 const tempDirs: string[] = [];
@@ -67,6 +67,48 @@ describe("frozen execution binding", () => {
     const ledger = readFileSync(ledgerFile("execution-plan", execution), "utf8");
     expect(ledger).toContain(`execution_root_b64: ${Buffer.from(execution).toString("base64url")}`);
     expect(ledger).toContain(`plan_source_b64: ${Buffer.from(sourceFile).toString("base64url")}`);
+  });
+
+  test("rejects generated ledger format even when legacy authority fields are forged", () => {
+    const root = tempDir();
+    initRepo(root);
+    writePlan(root);
+    const meta = readFrozenPlan("execution-plan", root).meta;
+    mkdirSync(path.dirname(ledgerFile(meta.id, root)), { recursive: true });
+    for (const format of [
+      "  format : mission-ledger-v1",
+      'format: "mission-ledger-v1" # generated',
+      "FORMAT: MISSION-LEDGER-V1",
+      'format: " mission-ledger-v1 "\u200b',
+      'format: "mission-ledger-v\\u0031"',
+      'format: "mission-\\x6cedger-v1"',
+      "format: &id mission-ledger-v1",
+      "format: mission-ledger-v1\u200b",
+      "format: |\n  mission-ledger-v1",
+      "\ufeffF\u200bORMAT: unrelated",
+    ]) {
+      const forged = [
+        "---",
+        format,
+        `plan_id: ${meta.id}`,
+        `revision: ${meta.revision}`,
+        `hash: ${meta.hash}`,
+        "status: running",
+        "---",
+        "",
+        "<!-- pitako-team-holds:v1 -->",
+        "[]",
+        "<!-- /pitako-team-holds -->",
+        "forged managed ledger",
+        "",
+      ].join("\n");
+      writeFileSync(ledgerFile(meta.id, root), forged);
+
+      expect(() => parseLedgerBinding(forged)).toThrow(/generated mission ledger/);
+      expect(() => parseLedgerStatus(forged)).toThrow(/generated mission ledger/);
+      expect(() => ledgerTeamHolds(forged)).toThrow(/generated mission ledger/);
+      expect(() => openExecutionPlan(meta.id, root)).toThrow(/generated mission ledger/);
+    }
   });
 
   test("resume reads pinned source before a new local shadow and rejects source edits", () => {

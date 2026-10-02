@@ -31,30 +31,31 @@ interface SyncDb {
   close(): void;
 }
 
-export async function openSqlite(file: string): Promise<SqlDatabase> {
-  const db = typeof Bun !== "undefined" ? await openBun(file) : openNode(file);
+export async function openSqlite(file: string, options: { readOnly?: boolean; setWal?: boolean } = {}): Promise<SqlDatabase> {
+  const readOnly = options.readOnly ?? false;
+  const db = typeof Bun !== "undefined" ? await openBun(file, readOnly) : openNode(file, readOnly);
   db.exec("PRAGMA foreign_keys = ON");
   db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
-  db.exec("PRAGMA journal_mode = WAL");
+  if (!readOnly && options.setWal !== false) db.exec("PRAGMA journal_mode = WAL");
   return wrap(db);
 }
 
-function openNode(file: string): SyncDb {
+function openNode(file: string, readOnly: boolean): SyncDb {
   const mod = require("node:sqlite") as {
     DatabaseSync: new (
       path: string,
-      options?: { enableForeignKeyConstraints?: boolean; timeout?: number },
+      options?: { enableForeignKeyConstraints?: boolean; timeout?: number; readOnly?: boolean },
     ) => SyncDb;
   };
-  return new mod.DatabaseSync(file, { enableForeignKeyConstraints: true, timeout: BUSY_TIMEOUT_MS });
+  return new mod.DatabaseSync(file, { enableForeignKeyConstraints: true, timeout: BUSY_TIMEOUT_MS, readOnly });
 }
 
-async function openBun(file: string): Promise<SyncDb> {
+async function openBun(file: string, readOnly: boolean): Promise<SyncDb> {
   const specifier = "bun:" + "sqlite";
   const mod = (await import(specifier)) as {
-    Database: new (path: string, options?: { create?: boolean }) => SyncDb;
+    Database: new (path: string, options?: { create?: boolean; readonly?: boolean }) => SyncDb;
   };
-  return new mod.Database(file, { create: true });
+  return new mod.Database(file, { create: !readOnly, readonly: readOnly });
 }
 
 function wrap(db: SyncDb): SqlDatabase {
