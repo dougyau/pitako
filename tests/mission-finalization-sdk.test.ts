@@ -1,10 +1,10 @@
 import { expect, test } from "bun:test";
 import { execFileSync, spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { createPiExecutor } from "../extensions/agent/pi.ts";
-import { createPiMissionRunner, MissionEngine } from "../extensions/mission/engine.ts";
+import { createPiMissionRunner, MissionEngine, type MissionAttemptBinding } from "../extensions/mission/engine.ts";
 import { FINALIZATION_PHASES, currentWholeResultApproval, observeSourceMutation, sourceWitnessCurrent } from "../extensions/mission/finalization.ts";
 import { captureWorkspaceImage } from "../extensions/mission/workspace.ts";
 import { assessMissionCompletion, missionCompletionCertificate } from "../extensions/mission/completion.ts";
@@ -77,6 +77,39 @@ async function runCase(name: string, changed = false) {
       managedWorkspace: { sourceRoot: sample.root, candidateParent: path.join(sample.base, "candidates") },
       runRole: async (...args: Parameters<typeof runner>) => {
         const [input, durable] = args;
+        expect(createHash("sha256").update(JSON.stringify(input.brief)).digest("hex")).toBe(input.binding.briefHash);
+        const reservation = store.inspectMission(mission.id).events.find(({ kind, attemptId }) =>
+          kind === "attempt.reserved" && attemptId === input.binding.attemptId)!;
+        expect((reservation.payload.binding as MissionAttemptBinding).briefHash).toBe(input.binding.briefHash);
+        if (input.binding.finalization) {
+          // Parse the complete reserved string, not one JSON line that could hide a trailing ordinary brief.
+          const brief = JSON.parse(input.brief);
+          expect(input.brief).toBe(JSON.stringify(brief));
+          expect(Object.keys(brief)).toEqual(["format", "target", "goal", "criteria", "changedScope", "instructions",
+            ...(input.binding.finalization.phase === "whole-review" ? ["manifest"] : []), "expectedResponse"]);
+          expect(brief.format).toBe("mission-finalization-brief-v1");
+          expect(brief.target).toEqual(input.binding.finalization);
+          expect(brief.goal).toBe(definition.goal);
+          expect(brief.criteria).toEqual(definition.units.map(({ id, acceptance }) => ({ id, acceptance })));
+          expect(brief.changedScope).toEqual(["src/a"]);
+          if (input.binding.finalization.phase === "whole-review") {
+            const manifest = JSON.parse(store.readArtifact(input.binding.finalization.manifestHash!).toString());
+            expect(brief.manifest).toEqual(manifest);
+            expect(brief.expectedResponse).toEqual({ format: "mission-whole-result-response-v1", scope: "whole-result",
+              missionId: mission.id, revision: input.binding.revision, generation: input.binding.finalization.generation,
+              manifestHash: input.binding.finalization.manifestHash, rolePolicyHash: input.binding.rolePolicyHash,
+              evidenceHashes: manifest.phaseReceiptHashes });
+          } else expect(brief.expectedResponse).toEqual({ format: "mission-finalization-cleanup-v1",
+            phase: input.binding.finalization.phase, inputArtifactHash: input.binding.finalization.inputArtifactHash,
+            scope: ["src/a"], steps: input.binding.finalization.phase === "cleanup" ? ["Unslop", "remove-ai-slops"] : ["Ponytail"] });
+          expect(brief.instructions).toBe(input.binding.finalization.phase === "whole-review"
+            ? "Read-only independent review of the complete result, integrated delta, criteria, cleanup receipts and gates. Return only the exact structured response with verdict approve/reject/inconclusive."
+            : input.binding.finalization.phase === "cleanup"
+              ? "Perform Unslop, then remove-ai-slops, scoped to changedScope. Return ordered steps with changedPaths or a non-empty scope-bound no-op reason for each."
+              : "Apply Ponytail full to changedScope. Preserve behavior. Return steps with changedPaths or a non-empty scope-bound no-op reason.");
+          expect(input.brief).not.toContain("Mission goal:");
+          expect(input.brief).not.toContain("Previous observations:");
+        }
         if (!input.binding.finalization || changed && input.binding.finalization.phase === "cleanup") {
           const receipt = await durable.effects!.invoke("write", { path: "src/a", content: failedGate && input.binding.finalization ?
             "broken\n" : changed && input.binding.finalization ? "product\n# simplified\n" : "product\n" });
@@ -88,6 +121,7 @@ async function runCase(name: string, changed = false) {
           expect(denied.status).toBe("denied");
         }
         const result = await runner(...args);
+        expect(provider.trace.find(({ sessionId }) => sessionId === input.binding.attemptId)!.prompt).toContain(input.brief);
         if (input.binding.finalization?.phase === "ponytail" && name === "ordered") {
           await expect(Promise.resolve().then(() => durable.onProviderDispatch({
             requestId: randomUUID(), provider: provider.provider, model: provider.model,

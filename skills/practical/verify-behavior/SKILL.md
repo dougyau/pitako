@@ -33,6 +33,20 @@ Use an appropriate timeout for checks that spawn processes. Use the existing run
 
 TDD is optional when requested or when it makes a cheap local regression easier. Reproduce the exact reported failure when feasible. Keep a new regression test when it adds useful, proportional protection, not merely because a correction occurred. Report when the prior failure could not be demonstrated.
 
+## Distinguish diagnosis from final gates
+
+Diagnose a concrete failure with a focused reproduction. After the correction, run affected regression checks before repeating a broad final gate. Diagnosis explains the failure. Affected regression checks the corrected behavior and affected guarantees. Final gates establish the plan's required finished-state evidence. Diagnostic success does not waive final gates or independent review.
+
+Check relevant environment prerequisites when evidence makes them material, such as runtime dependency visibility, platform support, or fixture isolation. A failed prerequisite leaves dependent checks unproven. Useful independent checks may still run. Do not impose universal fail-fast behavior, arbitrary run caps, or a preflight framework.
+
+## Reuse evidence only for the obligation it covers
+
+A wrapper can satisfy a required gate when its observed execution covers that obligation. Trace the actual checks it launches and compare arguments, inputs, environment, completeness, and required phase or binding. Record the coverage in existing workflow evidence rather than running a covered check again by default.
+
+Partial logs, skipped checks, interrupted output, stale artifacts, or the same command string alone are insufficient. A host predicate and a worker diagnostic command can be different obligations even when their command strings match. Evidence from one binding does not satisfy a different required binding merely because the command is identical.
+
+Reuse completed evidence while its inputs, environment, contract, and required phase or binding remain compatible. Do not discard valid evidence solely because it is old. Relevant edits after a pass invalidate affected conclusions, not every independent observation. Rerun checks whose conclusions are invalidated. Valid reuse satisfies an obligation only through demonstrated coverage. It never cancels a mandatory gate or independent review.
+
 ## Simplify without losing guarantees
 
 Before recommending or deleting a test, identify its guarantee and where that guarantee remains demonstrated, or why the contract no longer applies. Preserve uncertain cases, distinct guarantees, and current regressions. Age, slowness, size, or mocks do not prove a test useless. Green after deletion is not proof that deletion was safe.

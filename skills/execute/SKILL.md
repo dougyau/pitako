@@ -56,13 +56,18 @@ Inline implementation is allowed only when neither `agent_run` nor `team_assign`
 Build a WorkBrief for the current unit only:
 
 - plan id and revision
-- unit id and objective
+- frozen unit id, outcome, and objective
 - relevant scope and invariants
 - acceptance criteria and expected evidence
-- relevant rulings
+- relevant prerequisites and rulings
+- upstream contracts or evidence references needed by this unit
+- current unresolved obligations, including relevant prior failures
+- consequential premise conclusions from the actual caller or integration path
 - relevant files or systems
 
-Do not send the parent transcript, unrelated units, old evidence, or every Board topic.
+Label evidence as accepted, advisory, failed, or unavailable according to its actual source. A worker claim is not accepted evidence. Keep relevant valid evidence even when it is old. Exclude obsolete or unrelated context. Do not send the parent transcript or every Board topic.
+
+Local subdivision stays local. A future Developer Team head may choose implementation steps and assignments inside the unit. Those assignments do not replace global acceptance or authorize replanning. Preserve the frozen envelope and the Level 1 and Level 2 decision rules.
 
 Developer implements. Reviewer adversarially challenges the complete relevant diff and evidence against affected contracts, concrete risks, and frozen criteria using `verify-behavior`. Reviewer reports findings and never fixes. Architect answers only an architecture question. Researcher fills only a real knowledge gap. If any delegation fails, report the error; failure never transfers specialist authority to the Coordinator. Do not perform that role yourself. Keep at most one Developer role active, without exception.
 
@@ -82,7 +87,7 @@ Developer implementation uses Ponytail full. There is no separate Ponytail agent
 
 Use `verify-behavior` for check selection, stopping, and test quality within this unit's existing implementation and review passes. Inspect tests and their infrastructure, including removed guarantees, without adding a separate mandatory audit. Ponytail governs simplicity of implementation and verification, not an artifact quota. Follow the skill's Pitako clarification to reuse existing frameworks and fixtures instead of creating a prescribed self-check.
 
-Apply that policy within the plan's required gates. A worker saying "done" is not proof. Compilation does not prove unobserved behavior. Reuse valid evidence. Rerun checks invalidated by subsequent edits, relevant environment changes, or insufficient evidence. A role change alone does not require repetition. Mandatory gates remain required.
+Apply that policy within the plan's required gates. Use `verify-behavior` for diagnosis, affected regression, final gates, relevant environment prerequisites, wrapper coverage, and valid evidence reuse. A worker saying "done" is not proof. Compilation does not prove unobserved behavior. Mandatory gates and independent review remain required.
 
 If verification fails, reproduce, find the root cause, make the smallest correction, and verify again. First failure stays with the same Developer. Do not ask the user, call Architect, or switch to a stronger model because one check failed.
 

@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
@@ -319,6 +320,10 @@ test.each(sdkPauseCases.filter((scenario) => (!process.env.PITAKO_PAUSE_CASE || 
     if (scenario === "capacity-writable") definition.units.push({
       ...definition.units[0]!, id: "independent", acceptance: [{ id: "independent", kind: "manual", target: "host" }],
     });
+    if (scenario === "resume-writable") definition.units[0]!.acceptance[0] = {
+      id: "snapshot-present", kind: "command_exit", target: "result",
+      command: "test -s src/target.txt", expected: "0", timeoutMs: 3000,
+    };
     definition.authority.rolePolicies.developer = { hash: "a".repeat(64), provider: provider.provider, model: provider.model, fallbacks: [] };
     const launches = scenario === "budget-writable" ? 14 : scenario === "capacity-writable" ? 15 : 40;
     definition.budget = { roleLaunches: launches, providerRequests: launches, tokens: launches * 1000,
@@ -356,6 +361,25 @@ test.each(sdkPauseCases.filter((scenario) => (!process.env.PITAKO_PAUSE_CASE || 
         ...(rejectionCapture ? { captureRejection: rejectionCapture.captureRejection } : {}),
         ...(scenario === "capacity-writable" ? { maxConcurrent: 1 } : {}),
         runRole: async (input, durable) => {
+          expect(createHash("sha256").update(JSON.stringify(input.brief)).digest("hex")).toBe(input.binding.briefHash);
+          const reservation = store.inspectMission(mission.id).events.find(({ kind, attemptId }) =>
+            kind === "attempt.reserved" && attemptId === input.binding.attemptId)!;
+          expect((reservation.payload.binding as MissionAttemptBinding).briefHash).toBe(input.binding.briefHash);
+          if (!input.binding.teamBundleHash) {
+            expect(input.brief).toContain(`Mission goal: ${definition.goal}`);
+            expect(input.brief).toContain(`Acceptance: ${JSON.stringify(input.unit.acceptance)}`);
+            expect(input.brief).toContain("Commands are descriptive, not instructions to repeat effects.");
+            if (input.binding.continuationOf) {
+              const appendix = JSON.parse(input.brief.split("\n").at(-1)!);
+              expect(appendix).toMatchObject({ format: "mission-singleton-continuation-v1",
+                sourceAttemptId: input.binding.continuationOf, childResultHash: input.binding.childResultHash });
+              expect(Object.keys(appendix)).toEqual(["format", "sourceAttemptId", "checkpointHash", "childTargetId",
+                "childResultHash", "childResult", ...(appendix.retryOf ? ["retryOf"] : []), "instruction"]);
+              expect(appendix.checkpointHash).toBe(input.binding.checkpointHash);
+              expect(appendix.childResult).toBe(store.readArtifact(input.binding.childResultHash!).toString());
+              expect(appendix.instruction).toBe("Continue on the fresh private candidate. Child synthesis is advice, not acceptance.");
+            }
+          }
           if ((scenario === "corrected-writable" || scenario === "repair-cap-writable") && input.binding.attemptNo === 1 && !input.binding.teamBundleHash)
             return { instanceId: input.binding.attemptId, role: "developer", status: "failed", model: { selectedModel: "fixture/local" }, result: "actual ordinary failure" };
           if (scenario === "unknown-usage-writable" && input.binding.continuationOf && !input.binding.recoveryOf)
@@ -365,6 +389,14 @@ test.each(sdkPauseCases.filter((scenario) => (!process.env.PITAKO_PAUSE_CASE || 
             expect(effect.status).toBe("completed");
           }
           if (input.binding.recoveryOf || input.binding.recoveryMode === "repair") {
+            if (kind === "writable" && input.binding.recoveryMode === "verify") {
+              expect(input.brief).toContain("Do not repeat the original effect or modify candidate files; use read-only checks and report the actual result.");
+              const previous = JSON.parse(input.brief.split("\n").find((line) => line.startsWith("Previous attempt: "))!.slice(18));
+              expect(previous).toEqual({ attemptId: input.binding.recoveryOf, revision: input.binding.revision, status: "interrupted" });
+              const before = captureWorkspaceImage(durable.cwd!).manifest.hash;
+              expect((await durable.effects!.invoke("write", { path: "src/target.txt", content: "unauthorized recovery\n" })).status).toBe("denied");
+              expect(captureWorkspaceImage(durable.cwd!).manifest.hash).toBe(before);
+            }
             if (kind === "writable") {
               expect(readFileSync(path.join(durable.cwd!, "src/parent-marker.txt"), "utf8")).toBe("parent\n");
               expect(readFileSync(path.join(durable.cwd!, "src/target.txt"), "utf8")).toBe("continued\n");
@@ -391,7 +423,13 @@ test.each(sdkPauseCases.filter((scenario) => (!process.env.PITAKO_PAUSE_CASE || 
               heldAttempts.set(input.binding.attemptId, { started: secondMark, released: secondHold });
             }
           }
-          return runner(input, durable);
+          const before = kind === "writable" && input.binding.recoveryMode === "verify"
+            ? captureWorkspaceImage(durable.cwd!).manifest.hash : undefined;
+          const result = await runner(input, durable);
+          if (scenario !== "provider-source-writable")
+            expect(provider.trace.find(({ sessionId }) => sessionId === input.binding.attemptId)!.prompt).toContain(input.brief);
+          if (before) expect(captureWorkspaceImage(durable.cwd!).manifest.hash).toBe(before);
+          return result;
         },
         assessPredicate: async ({ result }) => {
           const binding = engine!.snapshot().attempts[result.instanceId]?.binding;

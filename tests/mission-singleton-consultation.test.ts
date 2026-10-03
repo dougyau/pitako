@@ -28,9 +28,13 @@ for (const scenario of ["accepted", "source-drift", "child-invalid", "child-self
     mkdirSync(path.dirname(config), { recursive: true }); writeFileSync(config, "");
     mkdirSync(path.join(sample.root, "src")); writeFileSync(path.join(sample.root, "src", "target.txt"), "source\n");
     process.env.PI_CODING_AGENT_DIR = agentDir;
+    let ordinaryResponses = 0;
     const provider = await installMissionLocalProvider({ agentDir, responseForPrompt: (prompt) => {
       if (prompt.includes('"format":"mission-singleton-continuation-v1"')) return "continuation result";
-      if (!prompt.startsWith("Read-only ")) return request;
+      if (!prompt.startsWith("Read-only ")) {
+        ordinaryResponses++;
+        return scenario === "bounded-retry" && ordinaryResponses === 1 ? "initial failed result" : request;
+      }
       const bundle = JSON.parse(prompt.slice(prompt.indexOf("\n") + 1).split("\n", 1)[0]!);
       if (bundle.round === "synthesis") return JSON.stringify({ format: "mission-team-response-v1", phase: bundle.phase,
         round: bundle.round, memberId: bundle.memberId, classifications: (scenario === "child-invalid" ? [] : bundle.priorFindings)
@@ -60,9 +64,14 @@ for (const scenario of ["accepted", "source-drift", "child-invalid", "child-self
     const runner = createPiMissionRunner({ cwd: sample.root, executor: createPiExecutor(),
       load: { env: { PI_CODING_AGENT_DIR: agentDir }, userConfigPath: config } });
     const assessed: string[] = [];
+    const ordinaryBriefs = new Map<string, string>();
     engine = new MissionEngine({ store, missionId: mission.id, sessionsDirectory: path.join(sample.base, "sessions"),
       managedWorkspace: { sourceRoot: sample.root, candidateParent: path.join(sample.base, "candidates") },
       runRole: async (input, durable) => {
+        expect(hash(Buffer.from(JSON.stringify(input.brief)))).toBe(input.binding.briefHash);
+        const reservation = store!.inspectMission(mission.id).events.find(({ kind, attemptId }) =>
+          kind === "attempt.reserved" && attemptId === input.binding.attemptId)!;
+        expect((reservation.payload.binding as MissionAttemptBinding).briefHash).toBe(input.binding.briefHash);
         if (input.binding.teamBundleHash) {
           expect(durable.readOnly).toBe(true); expect(durable.effects).toBeUndefined();
           const result = await runner(input, durable);
@@ -70,12 +79,35 @@ for (const scenario of ["accepted", "source-drift", "child-invalid", "child-self
             writeFileSync(path.join(sample.root, "src", "target.txt"), "external drift\n");
           return result;
         } else {
+          ordinaryBriefs.set(input.binding.attemptId, input.brief);
+          const acceptance = JSON.parse(input.brief.split("\n").find((line) => line.startsWith("Acceptance: "))!.slice(12));
+          expect(acceptance).toEqual(definition.units[0]!.acceptance);
+          expect(input.brief).toContain("Return findings only. Do not claim completion, evidence, or budget authority.");
+          expect(input.brief).toContain("all predicates remain current host obligations");
+          if (input.binding.continuationOf) {
+            const events = store!.inspectMission(mission.id).events;
+            const admission = events.find(({ kind, payload }) => kind === "team.consultation.admitted" &&
+              payload.parentAttemptId === input.binding.continuationOf)!;
+            const previous = events.filter(({ kind, attemptId, payload }) => kind === "attempt.reserved" &&
+              attemptId !== input.binding.attemptId &&
+              (payload.binding as MissionAttemptBinding).continuationOf === input.binding.continuationOf).at(-1);
+            expect(input.brief.split("\n").at(-1)).toBe(JSON.stringify({
+              format: "mission-singleton-continuation-v1", sourceAttemptId: input.binding.continuationOf,
+              checkpointHash: input.binding.checkpointHash, childTargetId: admission.payload.targetId,
+              childResultHash: input.binding.childResultHash,
+              childResult: store!.readArtifact(input.binding.childResultHash!).toString(),
+              ...(previous ? { retryOf: previous.attemptId } : {}),
+              instruction: "Continue on the fresh private candidate. Child synthesis is advice, not acceptance.",
+            }));
+          }
           expect(durable.readOnly).toBe(false);
           const effect = await durable.effects!.invoke("write", { path: "src/target.txt",
             content: input.binding.continuationOf ? "continued\n" : "private candidate\n" });
           expect(effect.status).toBe("completed");
         }
-        return runner(input, durable);
+        const result = await runner(input, durable);
+        expect(provider.trace.find(({ sessionId }) => sessionId === input.binding.attemptId)!.prompt).toContain(input.brief);
+        return result;
       }, assessPredicate: ({ resultArtifact }) => {
         assessed.push(resultArtifact.toString());
         if (scenario === "predicate-drift") writeFileSync(path.join(sample.root, "src", "target.txt"), "drift during assessment\n");
@@ -85,7 +117,8 @@ for (const scenario of ["accepted", "source-drift", "child-invalid", "child-self
           expect(engine!.cancelAttempt(source.attemptId!)).toBe(true);
         }
         return { verdict: resultArtifact.toString() === "continuation result" &&
-          (!["bounded-retry", "retry-no-slack"].includes(scenario) || assessed.length === 2) ? "pass" : "fail", method: "host verification" };
+          (!["bounded-retry", "retry-no-slack"].includes(scenario) ||
+            assessed.length === (scenario === "bounded-retry" ? 3 : 2)) ? "pass" : "fail", method: "host verification" };
       } });
     engine.start(); await engine.waitForIdle();
     const missionEvents = store.inspectMission(mission.id).events;
@@ -158,8 +191,27 @@ for (const scenario of ["accepted", "source-drift", "child-invalid", "child-self
     if (scenario === "bounded-retry") {
       const continuations = reserved.filter(({ payload }) => (payload.binding as MissionAttemptBinding).continuationOf === parent.attemptId);
       expect(continuations).toHaveLength(2);
-      expect(assessed).toEqual(["continuation result", "continuation result"]);
-      expect(continuations.map(({ payload }) => (payload.binding as MissionAttemptBinding).attemptNo)).toEqual([2, 3]);
+      expect(assessed).toEqual(["initial failed result", "continuation result", "continuation result"]);
+      expect(continuations.map(({ payload }) => (payload.binding as MissionAttemptBinding).attemptNo)).toEqual([3, 4]);
+      const failed = reserved.find(({ attemptId }) => ordinaryBriefs.has(attemptId!) && attemptId !== parent.attemptId &&
+        !continuations.some((continuation) => continuation.attemptId === attemptId))!;
+      expect(failed.attemptId).not.toBe(parent.attemptId);
+      for (const [index, predecessor] of [failed, continuations[0]!].entries()) {
+        const brief = ordinaryBriefs.get(continuations[index]!.attemptId!)!;
+        const json = (label: string) => JSON.parse(brief.split("\n").find((line) => line.startsWith(`${label}: `))!.slice(label.length + 2));
+        expect(json("Previous attempt")).toEqual({ attemptId: predecessor.attemptId, revision: 1, status: "failed" });
+        const rows = engine.snapshot().evidence.filter((row) => row.attemptId === predecessor.attemptId);
+        expect(rows).toHaveLength(1);
+        expect(json("Previous observations")).toEqual(rows.map((row) => ({
+          predicateId: row.predicateId, observations: [{ revision: row.revision, verdict: row.verdict,
+            method: row.method, evidenceId: row.id, artifactHash: row.artifactHash }],
+        })));
+        const appendix = JSON.parse(brief.split("\n").at(-1)!);
+        expect(appendix).toMatchObject({ format: "mission-singleton-continuation-v1", sourceAttemptId: parent.attemptId,
+          childResultHash: resolved.payload.resultHash,
+          instruction: "Continue on the fresh private candidate. Child synthesis is advice, not acceptance." });
+        expect(appendix.retryOf).toBe(index === 0 ? undefined : continuations[0]!.attemptId);
+      }
       expect((continuations[0]!.payload.binding as MissionAttemptBinding).candidateRoot)
         .not.toBe((continuations[1]!.payload.binding as MissionAttemptBinding).candidateRoot);
       expect(missionEvents.find(({ kind }) => kind === "unit.accepted")?.attemptId).toBe(continuations[1]!.attemptId);

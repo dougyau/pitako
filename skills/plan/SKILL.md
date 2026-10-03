@@ -52,7 +52,7 @@ Do not invoke every skill or role because it exists.
 
 The `architect` skill continues into implementation when the user asked to build. Do not use that path here.
 
-During `$plan`, call the Architect role with `agent_run`. The task must be design-only: inspect, reason, model, propose, critique. It must say not to modify product files. If `agent_run` fails, report the error. Do not do that role yourself.
+During an architectural `$plan`, call the Architect role with `agent_run`. The task must be design-only: inspect, reason, model, propose, critique. Ask that existing pass to check unit partition and ordering for coupled contracts and consequential uncertainty. It must say not to modify product files. If `agent_run` fails, report the error. Do not do that role yourself.
 
 Use the Researcher role only for a real external or knowledge gap. Use the Reviewer role for one independent critique of an architectural plan. The reviewer challenges affected contracts, relevant risks, and proposed acceptance criteria. Probe plausible counterexamples where they matter, not a universal test matrix. The reviewer reports findings and never fixes or implements.
 
@@ -100,9 +100,21 @@ Include, when they carry a decision:
 - Verification strategy
 - Success criteria
 
+## Consequential premises
+
+Before freezing a premise that could change architecture, scope, acceptance, or verification, inspect the actual caller or integration path. A signature alone does not establish what values reach the callee.
+
+Distinguish repository facts from user guarantees and optional technical restrictions. Record the evidence and conclusion only for decision-changing premises. Do not turn a chosen restriction into a user requirement. For example, logical nonmutation does not imply that every SQLite sidecar byte must remain unchanged.
+
+This is a bounded premise check, not an exhaustive assumption register or a permission checkpoint for ordinary technical decisions.
+
 ## Work units
 
 Ordered units only. No DAG.
+
+Decompose by material uncertainty, prerequisites, contract cohesion, and early meaningful feedback. Resolve an uncertain compatibility premise before work that depends on it. Keep coupled readers and writers together when they establish one contract. Leave a stable cohesive change unsplit when subdivision adds no independently meaningful feedback.
+
+The goal is implementation correctness, not smaller units. Do not split by file counts, time caps, commit counts, or worker count, and do not impose a unit quota.
 
 ```markdown
 ## T1 — title
@@ -125,6 +137,8 @@ Likely relevant files/systems:
 ```
 
 Decision-complete, not line-prescriptive. The Developer keeps local implementation freedom.
+
+Define global outcomes and constraints, not a future Developer Team head's local task allocation.
 
 Every meaningful unit needs acceptance criteria that name observable behavior and affected guarantees. Name proportional expected evidence using `verify-behavior` when it stops the executor from inventing "done". Do not prescribe a test per function or a universal case matrix.
 

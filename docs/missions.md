@@ -4,6 +4,31 @@ Missions are opt-in. They do not replace session TODOs, Board, the frozen plan,
 execution ledger, evidence, or the source repository. Legacy `agent_run`,
 `agent_spawn`, and `team_assign` remain ad-hoc SDK paths.
 
+Ordinary coordinator execution uses the frozen plan and scoped WorkBrief
+handoffs. It does not require a managed mission or compile a plan into one.
+Managed missions use an explicit `.mission.json` definition and the mission
+engine described below.
+
+## Worker brief context
+
+Ordinary managed worker briefs include the mission context, unit inputs and
+outputs, complete declared acceptance predicates, and current engine obligations.
+Predicate commands describe acceptance; they do not instruct workers to repeat
+effects. The engine reserves and delivers the same brief string. Its hash covers
+the JSON-encoded string, not additional SDK prompt context.
+
+Previous attempt observations are advisory, including passes. Each observation
+retains its originating revision. Dependencies show their current projected
+status and available passing evidence referenced by an accepted dependency.
+Missing or invalidated observations do not become evidence. The host still
+assesses every current predicate; brief text and worker claims grant no authority.
+
+Singleton continuations keep their advice-only JSON appendix after the ordinary
+context. Team and finalization briefs keep their separate protocols without
+ordinary sections. Recovery verification retains the instruction not to repeat
+the original effect or modify candidate files. Context does not change recovery
+mode selection, effect authorization, or independent completion checks.
+
 ## Compatibility and safety
 
 The Pi package loads `extensions/index.ts`, which registers `/mission` and the
@@ -73,6 +98,15 @@ the complete stage set. `bun run test:mission-node` runs the production-Node
 durability suite (not the stage verifier). The fixture uses real Node Pi SDK sessions and managed
 tools but a local deterministic model transport: it exercises engine wiring,
 not model quality, paid-provider behavior or a live autonomous success rate.
+
+The workflow and brief-context change uses focused dispatch, local SDK,
+continuation, recovery, checker, and finalization regressions. Its final gates
+are `bun test` and `bun run typecheck`, followed by independent review, not a
+required T1–T7 stage-verifier sweep. Local-provider observations prove delivered
+context and the exercised authority boundaries, not better model decisions.
+An observed denied recovery write and unchanged candidate prove that path, not
+universal filesystem immutability. Skipped or unavailable checks leave their
+behavior unproven.
 
 `mission-metrics-v1` is a pure, versioned projection of an explicit cohort captured
 at event sequence/time cutoffs. Revisions are not extra missions. The report

@@ -1,9 +1,9 @@
 import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { afterEach, describe, expect, test } from "bun:test";
 import { createPiExecutor } from "../extensions/agent/pi.ts";
-import { createPiMissionRunner, MissionEngine } from "../extensions/mission/engine.ts";
+import { createPiMissionRunner, MissionEngine, type MissionAttemptBinding } from "../extensions/mission/engine.ts";
 import type { MissionUnit } from "../extensions/mission/model.ts";
 import { createMissionFixture, missionDefinition, missionInput, openFixtureStore, type MissionFixture } from "./mission-fixtures.ts";
 import { installMissionLocalProvider, type LocalProviderFixture } from "./mission-local-provider.ts";
@@ -72,7 +72,27 @@ describe("persistent Pi mission runner", () => {
       store,
       missionId: record.id,
       sessionsDirectory: path.join(sample.stateDir, "pitako", "sessions"),
-      runRole: runner,
+      runRole: async (input, durable) => {
+        expect(createHash("sha256").update(JSON.stringify(input.brief)).digest("hex")).toBe(input.binding.briefHash);
+        const reservation = store.inspectMission(record.id).events.find(({ kind, attemptId }) =>
+          kind === "attempt.reserved" && attemptId === input.binding.attemptId)!;
+        expect((reservation.payload.binding as MissionAttemptBinding).briefHash).toBe(input.binding.briefHash);
+        const json = (label: string) => JSON.parse(input.brief.split("\n").find((line) => line.startsWith(`${label}: `))!.slice(label.length + 2));
+        expect(json("Acceptance")).toEqual(input.unit.acceptance);
+        expect(json("Previous attempt")).toBeNull();
+        expect(input.brief).toContain("all predicates remain current host obligations");
+        if (input.unit.id === "second") {
+          const first = engine.snapshot().units.first!;
+          expect(json("Dependencies")).toEqual([{ unitId: "first", status: "accepted",
+            evidence: first.evidenceIds.map((evidenceId) => ({ evidenceId, revision: 1 })) }]);
+        } else expect(json("Dependencies")).toEqual([]);
+        const result = await runner(input, durable);
+        const prompt = provider.trace.find(({ sessionId }) => sessionId === input.binding.attemptId)!.prompt;
+        expect(prompt).toContain(input.brief);
+        expect(prompt).toContain(`Mission goal: ${record.definition.goal}`);
+        expect(prompt).toContain("Return findings only. Do not claim completion, evidence, or budget authority.");
+        return result;
+      },
       assessPredicate: ({ predicate, resultArtifact }) => ({
         verdict: resultArtifact.length > 0 ? "pass" : "fail",
         method: `host fixture check for ${predicate.target}`,
