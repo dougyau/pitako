@@ -15,7 +15,7 @@ import { assessMissionPredicate, MISSION_CHECK_IDENTITY, type BoundPredicateSubj
 import { pendingMissionQuestions, pendingQuestionClosure } from "./admission.ts";
 import { registerMissionOwner } from "./lifecycle.ts";
 import { currentProcessIdentity, ownerProcessState, type ProcessIdentity } from "./workspace.ts";
-import { authorizeRoleDispatch, mintEngineRoleDispatchAdmission } from "../agent/managed-mission.ts";
+import { authorizeRoleDispatch, mintEngineRoleDispatchAdmission, registerManagedHistory, managedHistoryAdmission } from "../agent/managed-mission.ts";
 import { TEAM_ROUNDS, parseConsultationRequest, parseTeamResponse, type ConsultationRequest, type TeamBundle, type TeamFinding, type TeamRound } from "./team-contract.ts";
 import { FINALIZATION_OWNER, FINALIZATION_PHASES, acceptedFinalizationInput, compileFinalizationGrants, finalizationInputIdentity,
   observeSourceMutation, sourceWitnessCurrent, parseWholeResultResponse, type FinalizationTarget, type FinalizationPhaseReceipt,
@@ -457,6 +457,7 @@ export class MissionEngine {
   private readonly externalEffectProbes: MissionEngineOptions["externalEffectProbes"];
   private readonly verifyLegacyHold: MissionEngineOptions["verifyLegacyHold"];
   private readonly ownerSessionId?: string;
+  private readonly historyGroupId: string;
   private readonly attemptControllers = new Map<string, AbortController>();
   private readonly effectRunners = new Set<MissionEffects>();
   private readonly attemptEffects = new Map<string, MissionEffects>();
@@ -491,6 +492,8 @@ export class MissionEngine {
     this.externalEffectProbes = options.externalEffectProbes;
     this.verifyLegacyHold = options.verifyLegacyHold;
     this.ownerSessionId = options.ownerSessionId;
+    this.historyGroupId = registerManagedHistory(this.store, this.missionId, this.sessionsDirectory,
+      this.managedWorkspace?.sourceRoot ?? this.store.storageRoot).groupId;
     if (this.ownerSessionId) this.unregisterOwner = registerMissionOwner(this.ownerSessionId, this.missionId, this);
     this.maxConcurrent = Math.min(3, Math.max(1, Math.floor(options.maxConcurrent ?? 3)));
     this.now = options.now ?? (() => performance.now());
@@ -1731,6 +1734,9 @@ export class MissionEngine {
         sessionDir: path.join(this.sessionsDirectory, this.missionId, input.diagnosisId),
         sessionId: input.diagnosisId,
         readOnly: true,
+        history: { groupId: this.historyGroupId,
+          admission: managedHistoryAdmission(inspection, binding, this.ownerSessionId,
+            { roleId: role, sourceAttemptId: input.attemptId }) },
         rolePolicy: missionPolicyTargets(inspection.definition, role),
         signal: controller.signal,
         onProviderDispatch: (request) => this.dispatchProviderRequest(binding, request),
@@ -2211,6 +2217,8 @@ export class MissionEngine {
       sessionDir,
       sessionId: binding.attemptId,
       readOnly: !runtime || runtime.verificationOnly,
+      history: { groupId: this.historyGroupId,
+        admission: managedHistoryAdmission(this.store.inspectMission(this.missionId), binding, this.ownerSessionId) },
       ...(runtime ? { cwd: runtime.workspace.candidateRoot, effects: runtime.effects } : {}),
       rolePolicy,
       onProviderDispatch: (request) => this.dispatchProviderRequest(binding, request),

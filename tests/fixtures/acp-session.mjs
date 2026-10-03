@@ -250,7 +250,9 @@ if (mode === "default") {
       assert.equal(paths.filter((entry) => entry.endsWith("/extensions/acp.ts")).length, 1);
       assert.equal(paths.filter((entry) => entry.endsWith("/pi-codex-tools/index.ts")).length, 1);
       assert.equal(globalThis[Symbol.for("pitako.backgroundWorkers")].owner.token, parentOwner);
-      assert.equal(child.sessionFile, undefined);
+      assert.ok(child.sessionFile && existsSync(child.sessionFile));
+      assert.equal(path.dirname(path.dirname(child.sessionFile)), path.join(agentDir, "sessions"));
+      assert.equal(SessionManager.open(child.sessionFile).getSessionId(), child.sessionId);
       for (const name of acpTools) assert.ok(child.getActiveToolNames().includes(name));
       assert.ok(child.getActiveToolNames().includes("apply_patch"));
       assert.ok(!child.getActiveToolNames().some((name) => /^(agent_|team_|acp_delegate)/.test(name)));

@@ -35,7 +35,7 @@ for (const cut of ["recorded", "barrier", "resolved", "reserved", "continuation-
     writeFileSync(sample.definitionFile, JSON.stringify(definition));
     store = await openFixtureStore(sample);
     const mission = store.createMission(missionInput(sample));
-    await new MissionEngine({ store, missionId: mission.id, sessionsDirectory: path.join(sample.base, "sessions"),
+    await new MissionEngine({ store, missionId: mission.id, sessionsDirectory: path.join(path.dirname(sample.dbPath), "sessions"),
       runRole: async () => { throw new Error("prepared owner cannot launch"); } }).retireForShutdown("quit");
     store = undefined;
     const run = (runtime: string, script: string, args: string[], expected: "SIGKILL" | "success") => {
@@ -67,7 +67,7 @@ for (const cut of ["recorded", "barrier", "resolved", "reserved", "continuation-
           expect(admitted.impact).toEqual(["downstream"]);
         } else {
           const engine = new MissionEngine({ store: owner, missionId: mission.id,
-            sessionsDirectory: path.join(sample.base, "sessions"), ownerSessionId: "singleton-restart-owner",
+            sessionsDirectory: path.join(path.dirname(sample.dbPath), "sessions"), ownerSessionId: "singleton-restart-owner",
             managedWorkspace: { sourceRoot: sample.root }, runRole: async () => { throw new Error("cancel must not launch"); } });
           if (cut === "paused") await engine.control("pause", { id: "operator-pause", text: "/mission pause" });
           else {
@@ -82,7 +82,7 @@ for (const cut of ["recorded", "barrier", "resolved", "reserved", "continuation-
           process.env.PI_CODING_AGENT_DIR = agentDir;
         }
         if (cut === "revision") await new MissionEngine({ store: owner, missionId: mission.id,
-          sessionsDirectory: path.join(sample.base, "sessions"), runRole: async () => { throw new Error("no launch"); } }).retireForShutdown("quit");
+          sessionsDirectory: path.join(path.dirname(sample.dbPath), "sessions"), runRole: async () => { throw new Error("no launch"); } }).retireForShutdown("quit");
       } finally { owner.close(); }
       run("node", "scripts/mission-singleton-recovery-node.mjs", ["run"], "success");
     } else if (cut === "unproven-chain") {

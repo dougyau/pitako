@@ -27,7 +27,7 @@ for (const condition of ["failed-receipt", "source-drift"] as const) test(`seale
     writeFileSync(sample.definitionFile, JSON.stringify(definition));
     store = await openFixtureStore(sample);
     const mission = store.createMission(missionInput(sample));
-    await new MissionEngine({ store, missionId: mission.id, sessionsDirectory: path.join(sample.base, "sessions"),
+    await new MissionEngine({ store, missionId: mission.id, sessionsDirectory: path.join(path.dirname(sample.dbPath), "sessions"),
       runRole: async () => { throw new Error("prepared owner cannot launch"); } }).retireForShutdown("quit");
     store = undefined;
     const child = spawnSync(process.execPath, ["tests/fixtures/mission-singleton-crash-child.mjs",

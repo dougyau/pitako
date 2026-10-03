@@ -1,6 +1,6 @@
 import { randomUUID, createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { closeSync, existsSync, fsyncSync, lstatSync, linkSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, fsyncSync, lstatSync, linkSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { getPitakoDataDir } from "../board/paths.ts";
@@ -82,6 +82,8 @@ export interface MissionStoreOptions {
   dbPath?: string;
   objectDir?: string;
   readOnly?: boolean;
+  /** Foreground history snapshot only. Never applies to the engine/writer. */
+  historyReadBudget?: { databaseBytes: number; objectBytes: number };
   /** Test-only process-crash seam. Production callers must not set this. */
   onDurabilityBoundary?: (boundary: CrashBoundary) => void;
 }
@@ -300,11 +302,20 @@ const SCHEMA = [
 ];
 
 export async function openMissionStore(options: MissionStoreOptions = {}): Promise<MissionStore> {
+  if (options.historyReadBudget && !options.readOnly) throw new MissionStoreError("history budget requires read-only store");
   const dataDir = getPitakoDataDir();
   const dbPath = path.resolve(options.dbPath ?? path.join(dataDir, "missions.db"));
   const objectDir = path.resolve(options.objectDir ?? path.join(dataDir, "missions", "objects"));
   const existed = existsSync(dbPath);
   if (options.readOnly && !existed) throw new MissionStoreError(`mission database does not exist: ${dbPath}`);
+  if (options.historyReadBudget) {
+    let size = 0;
+    for (const file of [dbPath, `${dbPath}-wal`]) {
+      try { size += statSync(file).size; }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    }
+    if (size > options.historyReadBudget.databaseBytes) throw new MissionStoreError("history_authority_limit");
+  }
   if (!options.readOnly) ensureDirectory(path.dirname(dbPath));
   if (existed) validateSqliteFile(dbPath);
 
@@ -313,12 +324,12 @@ export async function openMissionStore(options: MissionStoreOptions = {}): Promi
     if (options.readOnly) {
       db = await openSqlite(dbPath, { readOnly: true });
       validateExistingDatabase(db, dbPath);
-      return new MissionStore(db, objectDir, options.onDurabilityBoundary);
+      return new MissionStore(db, objectDir, options.onDurabilityBoundary, undefined, dbPath, options.historyReadBudget?.objectBytes);
     }
     if (existed) {
       db = await openSqlite(dbPath, { readOnly: true });
       validateExistingDatabase(db, dbPath);
-      if (!canAttemptWriterClaim(db)) return new MissionStore(db, objectDir, options.onDurabilityBoundary);
+      if (!canAttemptWriterClaim(db)) return new MissionStore(db, objectDir, options.onDurabilityBoundary, undefined, dbPath);
       db.close();
       db = await openSqlite(dbPath, { setWal: false });
       db.exec("PRAGMA synchronous = FULL");
@@ -334,11 +345,11 @@ export async function openMissionStore(options: MissionStoreOptions = {}): Promi
       db.close();
       db = await openSqlite(dbPath, { readOnly: true });
       validateExistingDatabase(db, dbPath);
-      return new MissionStore(db, objectDir, options.onDurabilityBoundary);
+      return new MissionStore(db, objectDir, options.onDurabilityBoundary, undefined, dbPath);
     }
     db.exec("PRAGMA journal_mode = WAL");
     ensureDirectory(objectDir);
-    return new MissionStore(db, objectDir, options.onDurabilityBoundary, claim);
+    return new MissionStore(db, objectDir, options.onDurabilityBoundary, claim, dbPath);
   } catch (error) {
     try { db!.close(); } catch { /* database may already be closed */ }
     if (error instanceof MissionStoreError) throw error;
@@ -353,12 +364,21 @@ export class MissionStore {
   private readonly onDurabilityBoundary?: (boundary: CrashBoundary) => void;
   private readonly writerClaim?: WriterClaim;
   private closed = false;
+  private historyObjectBytes?: number;
+  private historyObjectLimited = false;
 
-  constructor(db: SqlDatabase, objectDir: string, onDurabilityBoundary?: (boundary: CrashBoundary) => void, writerClaim?: WriterClaim) {
+  get historyReadLimitReached(): boolean { return this.historyObjectLimited; }
+
+  readonly dbPath?: string;
+
+  constructor(db: SqlDatabase, objectDir: string, onDurabilityBoundary?: (boundary: CrashBoundary) => void, writerClaim?: WriterClaim,
+    dbPath?: string, historyObjectBytes?: number) {
+    this.dbPath = dbPath;
     this.db = db;
     this.objectDir = objectDir;
     this.onDurabilityBoundary = onDurabilityBoundary;
     this.writerClaim = writerClaim;
+    this.historyObjectBytes = historyObjectBytes;
   }
 
   close(): void {
@@ -380,6 +400,11 @@ export class MissionStore {
 
   get storageRoot(): string {
     return path.dirname(path.dirname(this.objectDir));
+  }
+
+  get historyLocator(): { dbPath: string; objectDir: string } {
+    if (!this.dbPath) throw new MissionStoreError("mission store has no known database locator");
+    return { dbPath: this.dbPath, objectDir: this.objectDir };
   }
 
   get ownerAcquisitionProof(): Record<string, unknown> | undefined {
@@ -698,6 +723,12 @@ export class MissionStore {
     requireUuid(missionId, "missionId");
     this.db.exec("BEGIN");
     try {
+      if (this.historyObjectBytes !== undefined) {
+        const size = this.db.prepare(`SELECT COUNT(*) AS count, COALESCE(SUM(length(CAST(payload_json AS BLOB))), 0) AS bytes
+          FROM mission_events WHERE mission_id = ?`).get(missionId)!;
+        if (Number(size.count) > 5000 || Number(size.bytes) > 8 * 1024 * 1024)
+          throw new MissionStoreError("history_authority_limit");
+      }
       const inspection = this.inspectWithinTransaction(missionId);
       this.db.exec("COMMIT");
       return inspection;
@@ -1473,7 +1504,25 @@ export class MissionStore {
     try { state = lstatSync(target); }
     catch (error) { throw new MissionStoreError(`mission object ${hash} is missing: ${messageOf(error)}`); }
     if (!state.isFile() || state.isSymbolicLink()) throw new MissionStoreError(`mission object ${hash} is not a regular file`);
-    const bytes = readFileSync(target);
+    let bytes: Buffer;
+    if (this.historyObjectBytes !== undefined) {
+      if (state.size > this.historyObjectBytes) {
+        this.historyObjectLimited = true;
+        throw new MissionStoreError("history_authority_limit");
+      }
+      this.historyObjectBytes -= state.size;
+      const fd = openSync(target, "r");
+      try {
+        bytes = Buffer.alloc(state.size);
+        let offset = 0;
+        while (offset < bytes.length) {
+          const count = readSync(fd, bytes, offset, Math.min(4096, bytes.length - offset), offset);
+          if (!count) throw new MissionStoreError("history authority object changed while reading");
+          offset += count;
+        }
+        if (fstatSync(fd).size !== state.size) throw new MissionStoreError("history authority object changed while reading");
+      } finally { closeSync(fd); }
+    } else bytes = readFileSync(target);
     if (sha256(bytes) !== hash) throw new MissionStoreError(`mission object ${hash} failed its SHA-256 check`);
     return bytes;
   }

@@ -9,6 +9,7 @@ import { agentScope } from "./scope.ts";
 import type { AgentUiSnapshot } from "./ui.ts";
 import { codeIntelligenceDelta, formatCodeIntelligenceUsage, mergeCodeIntelligenceUsage, type CodeIntelligenceUsage } from "../code-intelligence/metrics.ts";
 import type { MissionEffects } from "../mission/effects.ts";
+import { InvocationHistory, type HistoryOrigin, type HistoryAdmission } from "./history.ts";
 import {
   activityKind,
   createActivity,
@@ -150,6 +151,7 @@ export interface DurableAttemptContext {
   sessionDir: string;
   sessionId: string;
   readOnly: boolean;
+  history?: { groupId: string; admission: HistoryAdmission };
   cwd?: string;
   effects?: MissionEffects;
   signal?: AbortSignal;
@@ -160,6 +162,7 @@ export interface DurableAttemptContext {
 }
 
 export interface AttemptExecutor {
+  capturesHistory?: boolean;
   start(input: {
     instanceId: string;
     role: ResolvedRole;
@@ -167,6 +170,7 @@ export interface AttemptExecutor {
     target: ModelTarget;
     cwd: string;
     signal: AbortSignal;
+    history?: InvocationHistory;
     durable?: DurableAttemptContext;
     onActivity?: (event: ActivityEvent) => void;
     /** Fired only after setModel / session open succeeds. Not a second lifecycle. */
@@ -190,6 +194,7 @@ async function runAttempt(
     cwd: string;
     signal: AbortSignal;
     durable?: DurableAttemptContext;
+    history?: InvocationHistory;
     onActivity?: (event: ActivityEvent) => void;
     onActivated?: (appliedReasoning: string) => void;
     bindActivityProbe?: (probe: (() => { name: string } | undefined) | undefined) => void;
@@ -255,6 +260,7 @@ export async function runAgentInstance(input: {
   load?: LoadOptions;
   /** Physical root captured from the frozen execution ledger. */
   executionRoot?: string;
+  historyOrigin?: HistoryOrigin;
   /** Test clock. Production uses Date.now. */
   now?: () => number;
   /** Test scheduler. Production uses setInterval and unref. */
@@ -302,6 +308,8 @@ export async function runAgentInstance(input: {
     createdAt: new Date().toISOString(),
   };
   input.onAccepted?.(instance);
+  const history = input.executor.capturesHistory && !input.durable
+    ? new InvocationHistory(instance.cwd, input.historyOrigin, input.task) : undefined;
   const now = input.now ?? Date.now;
   const acceptedAt = now();
   const activity = createActivity(acceptedAt);
@@ -417,9 +425,15 @@ export async function runAgentInstance(input: {
           terminalAt = at;
         },
         input.durable,
+        history,
       ),
     );
     input.durable?.onOutcome?.(result);
+    if (history && !history.admitted) history.admit(instance.id, role.id, targets[0]!).result({
+      status: result.status, result: result.result,
+      error: result.status === "failed" ? result.result : undefined, sideEffects: false,
+    });
+    history?.settled();
     return result;
   } finally {
     timer.stop();
@@ -447,6 +461,7 @@ async function executeTargets(
   work: WorkCounts,
   markTerminal: (at: number) => void,
   durable?: DurableAttemptContext,
+  history?: InvocationHistory,
 ): Promise<AgentRunResult> {
   instance.status = "running";
   let session: AttemptSession | undefined;
@@ -491,6 +506,7 @@ async function executeTargets(
         onActivated,
         bindActivityProbe,
         durable,
+        history,
       });
       bindActivityProbe(undefined);
       usage = mergeUsage(usage, attempt.usage);
