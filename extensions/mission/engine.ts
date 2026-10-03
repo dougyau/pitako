@@ -5,7 +5,7 @@ import type { AttemptExecutor, AgentRunResult, DurableAttemptContext, ProviderRe
 import { runAgentInstance } from "../agent/run.ts";
 import type { LoadOptions } from "../roles/load.ts";
 import type { ModelTarget } from "../roles/types.ts";
-import type { MissionEvent, MissionMeasurement, MissionUnit } from "./model.ts";
+import type { MissionDefinition, MissionEvent, MissionMeasurement, MissionUnit } from "./model.ts";
 import type { MissionEventDraft, MissionStore, Reservation } from "./store.ts";
 import { captureWorkspaceImage, captureWorkspacePaths, createMissionWorkspace, filterWorkspaceImage, preflightContainment, quarantineWorkspace, registerCandidateWorkspace, restoreWorkspaceImage, verifyPrivateCandidate, type CandidateRegistration, type ManifestPath, type MissionWorkspace } from "./workspace.ts";
 import { readAcceptedWorkspaceContribution, readContributionInput, type ContributionInput, canonicalDeliveryManifest, integrateAcceptedMissionOutputs, assertCompleteWorkspaceImage, pauseRecoveryCurrent, importedHoldReconciled, mergeWorkspaceImages, missionEffectProcessesQuiescent, missionHasUnresolvedEffects, readSealedWorkspaceImage, reconcileLegacyHolds, reconcileMission, recoveryDiagnosisBrief, recoveryObservationCurrent, sealWorkspaceImage, serializeRecoveryOverlapAnswer, sensitiveArtifactPath, type LegacyHoldVerificationInput, type LegacyHoldVerificationProof, type RecoveryDiagnosisAdmission, type RecoveryReport, type RecoveryOverlapAnswer, type RecoveryOverlapRequest } from "./reconcile.ts";
@@ -982,7 +982,7 @@ export class MissionEngine {
           const interrupted = Object.values(dispatchState.attempts).find((attempt) => attempt.binding.unitId === unit.id &&
             attempt.status === "interrupted" && this.pauseContinuation(dispatchInspection, attempt.binding));
           const attempt = await this.reserveAttempt(dispatchInspection, unit, dispatchState, undefined, undefined, interrupted?.binding);
-          this.launchAttempt(unit, attempt.binding, attempt.runtime);
+          this.launchAttempt(unit, attempt.binding, attempt.runtime, attempt.brief);
           launched += 1;
         } catch (error) {
           if (error instanceof RecoveryAdmissionError) continue;
@@ -1529,7 +1529,7 @@ export class MissionEngine {
           ...(recovery ? { continuationOf: interrupted!.binding.continuationOf, consultationId: interrupted!.binding.consultationId }
             : prior ? { continuationOf: prior.binding.attemptId, consultationId: String(consultation!.payload.requestId) } : {}),
         }, undefined, recovery ? interrupted!.binding : undefined);
-        this.launchAttempt(assigned, attempt.binding, undefined, brief);
+        this.launchAttempt(assigned, attempt.binding, undefined, attempt.brief);
         launched++;
       } catch (error) {
         if (error instanceof RecoveryAdmissionError) break;
@@ -1576,18 +1576,16 @@ export class MissionEngine {
         throw new Error("singleton checkpoint or child result is stale");
       const childResultHash = String(resolved.payload.resultHash);
       const childResult = this.store.readArtifact(childResultHash);
-      const brief = `${createBrief(fresh.definition.goal, unit, reduceMissionEvents(fresh), recovery ? "verify" :
-        previousAttempt?.binding.recoveryContinuationId ? "repair" : undefined)}\n` +
-        JSON.stringify({ format: "mission-singleton-continuation-v1",
+      const appendix = JSON.stringify({ format: "mission-singleton-continuation-v1",
           sourceAttemptId: admitted.payload.parentAttemptId, checkpointHash: admitted.payload.checkpointHash,
           childTargetId: admitted.payload.targetId, childResultHash, childResult: childResult.toString("utf8"),
           ...(previous ? { retryOf: previous.attemptId } : {}),
           instruction: "Continue on the fresh private candidate. Child synthesis is advice, not acceptance." });
       const attempt = await this.reserveAttempt(fresh, unit, reduceMissionEvents(fresh), undefined, {
         sourceAttemptId: String(admitted.payload.parentAttemptId), checkpointHash: String(admitted.payload.checkpointHash),
-        childResultHash, consultationId: String(admitted.payload.requestId), brief,
+        childResultHash, consultationId: String(admitted.payload.requestId), appendix,
       }, previousAttempt?.binding.recoveryContinuationId || recovery ? previousAttempt?.binding : undefined);
-      this.launchAttempt(unit, attempt.binding, attempt.runtime, brief);
+      this.launchAttempt(unit, attempt.binding, attempt.runtime, attempt.brief);
       return 1;
     } catch (error) {
       if (error instanceof ComputeSlotBusyError) return 0;
@@ -1953,9 +1951,9 @@ export class MissionEngine {
 
   private async reserveAttempt(inspection: ReturnType<MissionStore["inspectMission"]>, unit: MissionUnit, state: MissionEngineSnapshot,
     team?: { bundle: TeamBundle; brief: string; targetId: string; continuationOf?: string; consultationId?: string },
-    singleton?: { sourceAttemptId: string; checkpointHash: string; childResultHash: string; consultationId: string; brief: string },
+    singleton?: { sourceAttemptId: string; checkpointHash: string; childResultHash: string; consultationId: string; appendix: string },
     recovery?: MissionAttemptBinding,
-  ): Promise<{ binding: MissionAttemptBinding; runtime?: ManagedAttemptRuntime }> {
+  ): Promise<{ binding: MissionAttemptBinding; runtime?: ManagedAttemptRuntime; brief: string }> {
     if (this.attemptControllers.size >= this.sessionLimit(inspection))
       throw new ComputeSlotBusyError("root simultaneous-session limit reached");
     if (this.managedWorkspace && !team && unit.role === "developer" &&
@@ -2007,7 +2005,9 @@ export class MissionEngine {
     const dependenciesComplete = unit.dependencies.every((dependencyId) => state.units[dependencyId]?.status === "accepted" &&
       (state.units[dependencyId]?.evidenceIds.length ?? 0) > 0 && (state.units[dependencyId]?.evidenceIds ?? []).every((evidenceId) =>
         state.evidence.some((evidence) => evidence.id === evidenceId)));
-    const brief = team?.brief ?? singleton?.brief ?? createBrief(inspection.definition.goal, unit, state, runtime?.recoveryMode);
+    const brief = team?.brief ?? createBrief(inspection.definition, unit, state, {
+      recoveryMode: runtime?.recoveryMode, previousAttemptId: predecessor?.attemptId,
+    }) + (singleton ? `\n${singleton.appendix}` : "");
     const inputBindings = team ? [] : capturePredicateInputBindings(
       inspection.definition.finalization.contractVersion === 1 ? this.managedWorkspace?.sourceRoot : runtime?.workspace.candidateRoot ?? this.managedWorkspace?.sourceRoot,
       unit,
@@ -2202,10 +2202,10 @@ export class MissionEngine {
       this.activeWindow = openedWindow;
       this.armActiveCheckpoint();
     }
-    return { binding, runtime };
+    return { binding, runtime, brief };
   }
 
-  private launchAttempt(unit: MissionUnit, binding: MissionAttemptBinding, runtime?: ManagedAttemptRuntime, teamBrief?: string): void {
+  private launchAttempt(unit: MissionUnit, binding: MissionAttemptBinding, runtime: ManagedAttemptRuntime | undefined, brief: string): void {
     const startedAt = this.now();
     this.attemptStarted.set(binding.attemptId, startedAt);
     let callbackOutcome: AgentRunResult | undefined;
@@ -2225,7 +2225,6 @@ export class MissionEngine {
       onProviderReceipt: (receipt) => this.recordProviderReceipt(binding, receipt),
       onOutcome: (result) => { callbackOutcome ??= result; },
     };
-    const brief = teamBrief ?? createBrief(this.store.inspectMission(this.missionId).definition.goal, unit, this.snapshot(), runtime?.recoveryMode);
     const controller = new AbortController();
     durable.signal = controller.signal;
     this.attemptControllers.set(binding.attemptId, controller);
@@ -4387,20 +4386,53 @@ function allRequiredPredicatesAccepted(state: MissionEngineSnapshot): boolean {
     state.evidence.some((evidence) => evidence.predicateId === id && evidence.verdict === "pass"));
 }
 
-function createBrief(goal: string, unit: MissionUnit, state: MissionEngineSnapshot, recoveryMode?: "verify" | "repair"): string {
+type MissionBriefContext = {
+  recoveryMode?: "verify" | "repair";
+  previousAttemptId?: string;
+};
+
+function createBrief(
+  definition: Pick<MissionDefinition, "goal" | "scope" | "nonGoals" | "invariants">,
+  unit: MissionUnit,
+  state: MissionEngineSnapshot,
+  context?: MissionBriefContext,
+): string {
   const dependencies = unit.dependencies.map((id) => {
     const result = state.units[id];
-    return `${id}: accepted evidence ${result?.evidenceIds.join(", ") || "unavailable"}`;
+    const evidence = result?.status === "accepted" ? state.evidence.filter((row) =>
+      row.unitId === id && row.verdict === "pass" && result.evidenceIds.includes(row.id))
+      .map((row) => ({ evidenceId: row.id, revision: row.revision })) : [];
+    return { unitId: id, status: result?.status ?? "unavailable", evidence };
   });
+  const previous = context?.previousAttemptId ? state.attempts[context.previousAttemptId] : undefined;
+  const observations = previous ? unit.acceptance.map((predicate) => ({
+    predicateId: predicate.id,
+    observations: state.evidence.filter((row) => row.attemptId === previous.binding.attemptId &&
+      row.unitId === unit.id && row.predicateId === predicate.id).map((row) => ({
+        revision: row.revision, verdict: row.verdict, method: row.method,
+        evidenceId: row.id, artifactHash: row.artifactHash,
+      })),
+  })) : [];
   return [
-    `Mission goal: ${goal}`,
+    `Mission goal: ${definition.goal}`,
+    `Scope: ${JSON.stringify(definition.scope)}`,
+    `Non-goals: ${JSON.stringify(definition.nonGoals)}`,
+    `Invariants: ${JSON.stringify(definition.invariants)}`,
+    `Revision: ${state.revision}`,
     `Unit: ${unit.id} (${unit.kind})`,
-    ...(recoveryMode === "verify" ? ["Recovery mode: verify the observed recovered candidate first. Do not repeat the original effect or modify candidate files; use read-only checks and report the actual result."] : []),
-    ...(recoveryMode === "repair" ? ["Recovery mode: the recovered candidate failed verification. Make only the bounded correction needed for the current predicate, on this fresh candidate. Use existing allowed paths and operations; never repeat the original effect or any external operation."] : []),
+    ...(context?.recoveryMode === "verify" ? ["Recovery mode: verify the observed recovered candidate first. Do not repeat the original effect or modify candidate files; use read-only checks and report the actual result."] : []),
+    ...(context?.recoveryMode === "repair" ? ["Recovery mode: the recovered candidate failed verification. Make only the bounded correction needed for the current predicate, on this fresh candidate. Use existing allowed paths and operations; never repeat the original effect or any external operation."] : []),
     `Role: ${unit.role}`,
-    `Inputs: ${unit.inputs.join(", ") || "none"}`,
-    `Dependencies: ${dependencies.join("; ") || "none"}`,
-    `Outputs: ${unit.outputs.join(", ") || "none"}`,
+    `Inputs: ${JSON.stringify(unit.inputs)}`,
+    `Dependencies: ${JSON.stringify(dependencies)}`,
+    `Outputs: ${JSON.stringify(unit.outputs)}`,
+    "Declared acceptance: all predicates remain current host obligations. Commands are descriptive, not instructions to repeat effects.",
+    `Acceptance: ${JSON.stringify(unit.acceptance)}`,
+    "Previous attempt observations are advisory, including passes; they do not satisfy current acceptance. Empty observations are unavailable.",
+    `Previous attempt: ${JSON.stringify(previous ? {
+      attemptId: previous.binding.attemptId, revision: previous.binding.revision, status: previous.status,
+    } : null)}`,
+    `Previous observations: ${JSON.stringify(observations)}`,
     "Return findings only. Do not claim completion, evidence, or budget authority.",
   ].join("\n");
 }

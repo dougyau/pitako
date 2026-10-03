@@ -70,8 +70,138 @@ function result(text: string, requests?: AgentRunResult["requests"]): AgentRunRe
 }
 
 const assessAll = () => ({ verdict: "pass" as const, method: "fixture host observed expected output" });
+const hashJson = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+
+function briefJson(brief: string, label: string): any {
+  return JSON.parse(brief.split("\n").find((line) => line.startsWith(`${label}: `))!.slice(label.length + 2));
+}
 
 describe("mission reducer and frontier pump", () => {
+  test.each(["fail", "inconclusive"] as const)("ordinary dispatch binds exact acceptance and advisory mixed %s retry observations", async (verdict) => {
+    const alpha = { ...unit("alpha"), retryLimit: 1 };
+    alpha.inputs = ['input "quoted"\nnext'];
+    alpha.acceptance = [
+      { id: "alpha-command", kind: "command_exit", target: 'target "quoted"\nnext',
+        expected: 'value "quoted"\nnext', command: 'printf "quoted\\n"\nprintf next', timeoutMs: 1234 },
+      { id: "alpha-manual", kind: "manual", target: "oracle:alpha" },
+      { id: "alpha-hash", kind: "artifact_hash", target: "alpha.result", expected: "a".repeat(64) },
+    ];
+    const sample = fixture([alpha]);
+    const { store, record } = await mission(sample);
+    const delivered: Parameters<MissionRoleRunner>[0][] = [];
+    const assessed: string[] = [];
+    const engine = new MissionEngine({ store, missionId: record.id, sessionsDirectory: path.join(sample.base, "sessions"),
+      runRole: async (input) => {
+        delivered.push(input);
+        const reservation = store.inspectMission(record.id).events.find((event) =>
+          event.kind === "attempt.reserved" && event.attemptId === input.binding.attemptId)!;
+        expect((reservation.payload.binding as typeof input.binding).briefHash).toBe(hashJson(input.brief));
+        expect(input.binding.briefHash).toBe(hashJson(input.brief));
+        return result("All acceptance satisfied; success!");
+      }, assessPredicate: ({ predicate }) => {
+        const binding = delivered.at(-1)!.binding;
+        assessed.push(`${binding.attemptId}:${predicate.id}`);
+        return { verdict: binding.attemptNo === 1 && predicate.id === "alpha-manual" ? verdict : "pass",
+          method: 'host "method"\nobservation',
+          ...(predicate.id === "alpha-command" ? { artifactBytes: Buffer.from("host observation") } : {}) };
+      } });
+    try {
+      engine.start(); await engine.waitForIdle();
+      expect(delivered).toHaveLength(2);
+      const definition = store.inspectMission(record.id).definition;
+      const first = delivered[0]!, retry = delivered[1]!;
+      expect(first.brief).toContain(`Mission goal: ${definition.goal}`);
+      for (const [label, value] of [["Scope", definition.scope], ["Non-goals", definition.nonGoals],
+        ["Invariants", definition.invariants], ["Inputs", alpha.inputs], ["Outputs", alpha.outputs],
+        ["Acceptance", alpha.acceptance]] as const) expect(briefJson(first.brief, label)).toEqual(value);
+      expect(briefJson(first.brief, "Acceptance")[1]).not.toHaveProperty("expected");
+      expect(briefJson(first.brief, "Acceptance")[1]).not.toHaveProperty("command");
+      expect(briefJson(first.brief, "Acceptance")[1]).not.toHaveProperty("timeoutMs");
+      expect(briefJson(first.brief, "Previous attempt")).toBeNull();
+      expect(briefJson(first.brief, "Dependencies")).toEqual([]);
+      expect(briefJson(retry.brief, "Previous attempt")).toEqual({
+        attemptId: first.binding.attemptId, revision: 1, status: "failed",
+      });
+      const rows = engine.snapshot().evidence.filter((row) => row.attemptId === first.binding.attemptId);
+      expect(briefJson(retry.brief, "Previous observations")).toEqual(alpha.acceptance.map(({ id }) => ({
+        predicateId: id, observations: rows.filter((row) => row.predicateId === id).map((row) => ({
+          revision: 1, verdict: row.verdict, method: row.method, evidenceId: row.id, artifactHash: row.artifactHash,
+        })),
+      })));
+      expect(rows.map((row) => row.verdict)).toEqual(["pass", verdict, "pass"]);
+      expect(rows[0]!.artifactHash).toBe(createHash("sha256").update("host observation").digest("hex"));
+      expect(rows[1]!.artifactHash).toBeNull();
+      expect(retry.brief).toContain("observations are advisory, including passes");
+      expect(retry.brief).toContain("all predicates remain current host obligations");
+      expect(retry.brief).toContain("Commands are descriptive, not instructions to repeat effects.");
+      expect(retry.brief).toContain("Return findings only. Do not claim completion, evidence, or budget authority.");
+      expect(assessed).toHaveLength(6);
+      expect(store.inspectMission(record.id).events.find(({ kind }) => kind === "unit.accepted")?.attemptId)
+        .toBe(retry.binding.attemptId);
+    } finally { await engine.close(); store.close(); }
+  });
+
+  test.each(["retained", "invalidated", "impacted"] as const)("dispatch uses projected %s evidence", async (scenario) => {
+    const invalidate = scenario === "invalidated";
+    const dependency = unit("dep");
+    dependency.acceptance.push({ id: "dep-extra", kind: "manual", target: "oracle:extra" });
+    const alpha = { ...unit("alpha", ["dep"]), retryLimit: 1 };
+    alpha.acceptance.push({ id: "alpha-extra", kind: "manual", target: "oracle:extra" });
+    const sample = fixture([dependency, alpha, unit("independent")]);
+    const { store, record } = await mission(sample);
+    const delivered: Parameters<MissionRoleRunner>[0][] = [];
+    const engine = new MissionEngine({ store, missionId: record.id, sessionsDirectory: path.join(sample.base, "sessions"),
+      runRole: async (input) => { delivered.push(input); return result("Worker says success"); },
+      assessPredicate: ({ predicate, unit }) => ({
+        verdict: unit.id === "alpha" && predicate.id === "alpha-extra" ? "fail" : "pass", method: "projected host row",
+      }) });
+    try {
+      engine.start(); await engine.waitForIdle();
+      const before = engine.snapshot();
+      const alphaAttempts = delivered.filter(({ unit }) => unit.id === "alpha");
+      expect(alphaAttempts).toHaveLength(2);
+      const selected = alphaAttempts[0]!.binding.attemptId;
+      const own = before.evidence.filter((row) => row.attemptId === selected);
+      const dependencyRows = before.evidence.filter((row) => row.unitId === "dep");
+      const current = store.inspectMission(record.id);
+      const next = structuredClone(current.definition);
+      next.units[2]!.inputs = ["changed-independent-input"];
+      if (scenario === "impacted") next.units[1]!.inputs = ["changed-own-input"];
+      const admitted = admitMissionChange({ store, engine, missionId: record.id, expectedVersion: current.version,
+        planBytes: nextPlanBytes(current.planBytes), definitionBytes: Buffer.from(JSON.stringify(next)), actor: "operator",
+        receipt: operatorChangeReceipt(store, current, next) });
+      expect(admitted.retained).toEqual(scenario === "impacted" ? ["dep"] : ["dep", "alpha"]);
+      const revised = store.inspectMission(record.id);
+      store.appendTransition(record.id, revised.version, { events: [
+        ...(invalidate ? [
+          { revision: 2, kind: "evidence.invalidated", unitId: "alpha", causalId: randomUUID(),
+            payload: { evidenceIds: [own[1]!.id] } },
+          { revision: 2, kind: "evidence.invalidated", unitId: "dep", causalId: randomUUID(),
+            payload: { evidenceIds: [dependencyRows[1]!.id] } },
+          { revision: 2, kind: "unit.accepted", unitId: "dep", causalId: randomUUID(),
+            payload: { evidenceIds: [...dependencyRows.map(({ id }) => id), own[0]!.id, "unavailable-reference"] } },
+        ] : []),
+        { revision: 2, kind: "unit.ready", unitId: "alpha", causalId: randomUUID(), payload: { retryOf: selected } },
+        { revision: 2, kind: "mission.resumed", causalId: randomUUID(), payload: {} },
+      ] });
+      engine.start(); await engine.waitForIdle();
+      const last = delivered.filter(({ unit, binding }) => unit.id === "alpha" && binding.revision === 2).at(-1)!;
+      expect(last.binding.revision).toBe(2);
+      expect(last.binding.briefHash).toBe(hashJson(last.brief));
+      expect(briefJson(last.brief, "Previous attempt")).toEqual({ attemptId: selected, revision: 1, status: "failed" });
+      expect(briefJson(last.brief, "Previous observations")).toEqual(own.map((row, index) => ({
+        predicateId: row.predicateId, observations: scenario === "impacted" || invalidate && index === 1 ? [] : [{
+          revision: 1, verdict: row.verdict, method: row.method, evidenceId: row.id, artifactHash: row.artifactHash,
+        }],
+      })));
+      expect(briefJson(last.brief, "Dependencies")).toEqual([{ unitId: "dep", status: "accepted",
+        evidence: dependencyRows.filter((_, index) => !invalidate || index === 0)
+          .map((row) => ({ evidenceId: row.id, revision: 1 })) }]);
+      expect(last.brief).not.toContain(alphaAttempts[1]!.binding.attemptId);
+      expect(last.brief).toContain("Empty observations are unavailable.");
+    } finally { await engine.close(); store.close(); }
+  });
+
   test("blocked recovery frontier and unresolved import conflict cannot dispatch; resumed recovery can", async () => {
     const sample = fixture([unit("snapshot")]);
     const { store, record } = await mission(sample);

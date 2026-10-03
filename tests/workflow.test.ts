@@ -169,6 +169,95 @@ describe("plan and execute contracts", () => {
   const deslop = readFileSync(path.join(packageRoot(), "skills/remove-ai-slops/SKILL.md"), "utf8");
   const prePr = readFileSync(path.join(packageRoot(), "skills/pre-pr/SKILL.md"), "utf8");
   const router = readFileSync(path.join(packageRoot(), "skills/pitako-coding/SKILL.md"), "utf8");
+  const sequencing = readFileSync(path.join(packageRoot(), "skills/principles/principle-sequence-verifiable-units/SKILL.md"), "utf8");
+  const architect = readFileSync(path.join(packageRoot(), "roles/architect.md"), "utf8");
+  const verify = readFileSync(path.join(packageRoot(), "skills/practical/verify-behavior/SKILL.md"), "utf8");
+
+  // Static policy contracts, not tests of model compliance or implementation effectiveness.
+  test("planning decomposes for correctness and preserves proportional acceptance", () => {
+    for (const policy of [plan, sequencing, architect]) {
+      for (const criterion of ["uncertainty", "prerequisites", "contract cohesion", "meaningful feedback"]) {
+        expect(policy).toContain(criterion);
+      }
+      expect(policy).toContain("unit quota");
+    }
+    expect(plan).toContain("not smaller units");
+    expect(sequencing).toContain("Smallness is not the goal");
+    for (const policy of [plan, sequencing]) {
+      expect(policy).toContain("coupled readers and writers together");
+      expect(policy).toContain("stable cohesive change");
+      expect(policy).toContain("file counts, time caps, commit counts, or worker count");
+    }
+    expect(plan).toContain("Every meaningful unit needs acceptance criteria that name observable behavior and affected guarantees");
+    expect(plan).toContain("proportional expected evidence");
+    expect(sequencing).toContain("observable acceptance and affected guarantees");
+    expect(sequencing).toContain("proportional evidence");
+    expect(sequencing).toContain("grants no Git authority");
+    expect(sequencing).not.toContain("Rebase onto clean trunk first");
+  });
+
+  test("existing architectural pass checks consequential premises without expanding authority", () => {
+    expect(plan).toContain("During an architectural `$plan`");
+    expect(plan).toContain("existing pass to check unit partition and ordering");
+    expect(plan).toContain("Do not call Architect or Researcher for trivial work");
+    expect(plan).toContain("one Architect pass");
+    expect(plan).toContain("one independent Reviewer critique");
+    expect(architect).toContain("existing architectural planning pass");
+    expect(architect).toContain("do not require another role pass or Architect involvement in trivial work");
+    for (const policy of [plan, architect]) {
+      expect(policy).toContain("actual caller or integration path");
+      expect(policy).toContain("repository facts");
+      expect(policy).toContain("user guarantees");
+      expect(policy).toContain("optional technical restrictions");
+      expect(policy).toContain("architecture, scope, acceptance, or verification");
+      expect(policy).toContain("not a future Developer Team head's local task allocation");
+    }
+    expect(plan).toContain("not an exhaustive assumption register or a permission checkpoint");
+    expect(plan).toContain("logical nonmutation does not imply that every SQLite sidecar byte must remain unchanged");
+    expect(architect).toContain("Research or design does not authorize implementation");
+  });
+
+  test("ordinary handoffs preserve frozen intent and bounded current obligations", () => {
+    const brief = execute.slice(execute.indexOf("Build a WorkBrief"), execute.indexOf("Developer implements."));
+    for (const field of [
+      "plan id and revision", "frozen unit id, outcome, and objective", "relevant scope and invariants",
+      "acceptance criteria and expected evidence", "relevant prerequisites and rulings",
+      "upstream contracts or evidence references", "current unresolved obligations",
+      "relevant prior failures", "consequential premise conclusions", "actual caller or integration path",
+    ]) expect(brief).toContain(field);
+    expect(brief).toContain("accepted, advisory, failed, or unavailable according to its actual source");
+    expect(brief).toContain("A worker claim is not accepted evidence");
+    expect(brief).toContain("Keep relevant valid evidence even when it is old");
+    expect(brief).toContain("Exclude obsolete or unrelated context");
+    expect(brief).toContain("Do not send the parent transcript");
+    expect(brief).toContain("Local subdivision stays local");
+    expect(brief).toContain("future Developer Team head");
+    expect(brief).toContain("do not replace global acceptance or authorize replanning");
+    expect(brief).toContain("Level 1 and Level 2 decision rules");
+    expect(execute).toContain("Never ask the user to make a Level 1 or Level 2 decision");
+    expect(execute).toContain("Use `verify-behavior` for diagnosis, affected regression, final gates");
+    expect(execute).toContain("Mandatory gates and independent review remain required");
+  });
+
+  test("verification owns diagnosis, wrapper coverage, and compatible evidence reuse", () => {
+    expect(verify).toContain("Diagnose a concrete failure with a focused reproduction");
+    expect(verify).toContain("run affected regression checks before repeating a broad final gate");
+    expect(verify).toContain("Diagnostic success does not waive final gates or independent review");
+    expect(verify).toContain("Check relevant environment prerequisites when evidence makes them material");
+    expect(verify).toContain("A failed prerequisite leaves dependent checks unproven");
+    expect(verify).toContain("Useful independent checks may still run");
+    expect(verify).toContain("Do not impose universal fail-fast behavior, arbitrary run caps, or a preflight framework");
+    expect(verify).toContain("its observed execution covers that obligation");
+    expect(verify).toContain("arguments, inputs, environment, completeness, and required phase or binding");
+    expect(verify).toContain("Partial logs, skipped checks, interrupted output, stale artifacts, or the same command string alone are insufficient");
+    expect(verify).toContain("A host predicate and a worker diagnostic command can be different obligations");
+    expect(verify).toContain("Evidence from one binding does not satisfy a different required binding");
+    expect(verify).toContain("inputs, environment, contract, and required phase or binding remain compatible");
+    expect(verify).toContain("Do not discard valid evidence solely because it is old");
+    expect(verify).toContain("Relevant edits after a pass invalidate affected conclusions, not every independent observation");
+    expect(verify).toContain("It never cancels a mandatory gate or independent review");
+    expect(verify).toContain("Do not run a cycle that re-enters the same verification stage or suite");
+  });
 
   test("plan freezes and does not grant implementation", () => {
     expect(plan).toContain("Never implement");

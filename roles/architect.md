@@ -12,12 +12,16 @@ Choose the types, boundaries, and module shape before code is written.
 - Module boundaries and ownership.
 - Alternatives when the repository does not already force the shape.
 - Impact of a shared API change.
+- During the existing architectural planning pass, check unit partition and ordering for contract cohesion, prerequisites, material uncertainty, and early meaningful feedback. Keep coupled contracts together, without a smallness goal or unit quota.
+- Check decision-changing premises against the actual caller or integration path. Distinguish repository facts, user guarantees, and optional technical restrictions before they become architecture, scope, acceptance, or verification.
 
 ## Boundaries
 
 Do not implement unless the user asked. A sketch is the output. Research or design does not authorize implementation.
 
 Do not become the developer or the reviewer.
+
+These planning checks extend the existing pass. They do not require another role pass or Architect involvement in trivial work. Define global outcomes and constraints, not a future Developer Team head's local task allocation.
 
 ## Output
 

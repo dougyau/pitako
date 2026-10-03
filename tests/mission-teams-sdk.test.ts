@@ -1,8 +1,9 @@
 import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { expect, test } from "bun:test";
 import { createPiExecutor } from "../extensions/agent/pi.ts";
-import { createPiMissionRunner, MissionEngine } from "../extensions/mission/engine.ts";
+import { createPiMissionRunner, MissionEngine, type MissionAttemptBinding } from "../extensions/mission/engine.ts";
 import { createMissionFixture, missionDefinition, missionInput, openFixtureStore } from "./mission-fixtures.ts";
 import { installMissionLocalProvider } from "./mission-local-provider.ts";
 
@@ -48,9 +49,20 @@ for (const soloFinding of [false, true]) test.serial(`real SDK dispatches ten te
     writeFileSync(sample.definitionFile, JSON.stringify(definition));
     store = await openFixtureStore(sample);
     const mission = store.createMission(missionInput(sample));
+    const runner = createPiMissionRunner({ cwd: sample.root, executor: createPiExecutor(),
+      load: { env: { PI_CODING_AGENT_DIR: agentDir }, userConfigPath: config } });
     engine = new MissionEngine({ store, missionId: mission.id, sessionsDirectory: path.join(sample.base, "sessions"),
-      runRole: createPiMissionRunner({ cwd: sample.root, executor: createPiExecutor(),
-        load: { env: { PI_CODING_AGENT_DIR: agentDir }, userConfigPath: config } }),
+      runRole: async (input, durable) => {
+        const bundle = store!.readArtifact(input.binding.teamBundleHash!).toString();
+        expect(input.brief).toBe(`Read-only review team judgment. Do not implement or invoke mutating tools. Return mission-team-response-v1 JSON or a terminal mission-consultation-request-v1 JSON. Votes are not evidence.\n${bundle}`);
+        expect(createHash("sha256").update(JSON.stringify(input.brief)).digest("hex")).toBe(input.binding.briefHash);
+        const reservation = store!.inspectMission(mission.id).events.find(({ kind, attemptId }) =>
+          kind === "attempt.reserved" && attemptId === input.binding.attemptId)!;
+        expect((reservation.payload.binding as MissionAttemptBinding).briefHash).toBe(input.binding.briefHash);
+        const result = await runner(input, durable);
+        expect(provider.trace.find(({ sessionId }) => sessionId === input.binding.attemptId)!.prompt).toContain(input.brief);
+        return result;
+      },
       assessPredicate: () => ({ verdict: "pass", method: "fixture host assessment" }) });
     engine.start(); await engine.waitForIdle();
     const events = store.inspectMission(mission.id).events;
