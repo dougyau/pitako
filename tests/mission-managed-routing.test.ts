@@ -4,7 +4,7 @@ import path from "node:path";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import agentExtension from "../extensions/agent/index.ts";
 import { inspectManagedAttempt, inspectManagedMission } from "../extensions/agent/managed-mission.ts";
-import { setBackgroundExecutor } from "../extensions/agent/background.ts";
+import { bindBackgroundOwner, setBackgroundExecutor, shutdownBackground } from "../extensions/agent/background.ts";
 import { openBoard } from "../extensions/board/store.ts";
 import { registerBoard } from "../extensions/board/tools.ts";
 import { repositoryIdentity } from "../extensions/board/workspace.ts";
@@ -211,6 +211,11 @@ describe("managed Team and Board routing reads", () => {
       started.push(input.cwd);
       return { status: "completed", result: "ad hoc completed", sideEffects: false, appliedReasoning: "off" };
     } });
+    const ownerToken = Symbol("ad-hoc-routing-test");
+    const settled = new Promise<void>((resolve) => bindBackgroundOwner({
+      token: ownerToken, isIdle: () => true, hasUI: true,
+      notify: () => resolve(), sendMessage: () => resolve(),
+    }));
     try {
       const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
       agentExtension({ registerTool: (tool: any) => tools.set(tool.name, tool) } as any);
@@ -219,10 +224,16 @@ describe("managed Team and Board routing reads", () => {
       }, new AbortController().signal, undefined, { cwd: unrelated.root });
       expect(result.isError).toBeFalsy();
       expect(started).toEqual([unrelated.root]);
+      await settled;
+      const consumed = await tools.get("agent_result")!.execute("result", { id: result.details.instanceId },
+        new AbortController().signal, undefined, { cwd: unrelated.root });
+      expect(consumed.isError).toBeFalsy();
+      expect(consumed.content[0].text).toContain("ad hoc completed");
       recordT4Observation(`ad-hoc-routing-${randomUUID()}`, {
         format: "mission-t4-ad-hoc-routing-v1", dispatched: !result.isError, target: unrelated.root, started,
       });
     } finally {
+      shutdownBackground(ownerToken);
       setBackgroundExecutor(undefined);
       if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previous;

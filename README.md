@@ -131,6 +131,14 @@ Configuration lives in `$PI_CODING_AGENT_DIR/hermes-memory-config.json`, default
 
 Disable Hermes with the package filter `!node_modules/pi-hermes-memory/src/index.ts`. This does not disable the Board.
 
+SDK worker transcripts remain native Pi history. Foreground `agent_history` and
+`/pitako history` provide bounded list and read access after restart, even without
+Hermes. Durable attempts and diagnosis sessions keep their canonical private
+directories and expose owned shallow discovery aliases to ordinary Hermes
+backfill. Search is a secondary index, not transcript or retention authority.
+See [Worker history](docs/worker-history.md) for pagination, retention defaults,
+capture gaps, sensitive raw records, and the manual indexing root difference.
+
 ## Roles and model policies
 
 A role is a reusable responsibility template, not a running agent. AgentInstances use roles for synchronous runs, background workers, and Team assignments.

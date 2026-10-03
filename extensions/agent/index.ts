@@ -27,10 +27,62 @@ import { boardWorkspace, currentWorkspace } from "../board/workspace.ts";
 import { ledgerFile, openExecutionPlan, planFile, readFrozenPlan, readPlan, type ExecutionBinding, type PlanMeta } from "../workflow.ts";
 import { teamEvaluationForSession, reserveTeamRole, recordTeamAssignment, recordPlanTeamWork, teamAssignments, type TeamAssignment } from "../team.ts";
 import { authorizeRoleDispatch, cancelManagedAttempt, inspectManagedAttempt, inspectManagedMission, managedAttemptRows, readManagedAttemptArtifact } from "./managed-mission.ts";
+import type { HistoryOrigin } from "./history.ts";
+import { queryHistory } from "./history-query.ts";
+import { executionForSession } from "../execution-identity.ts";
 
 const noExtra = { additionalProperties: false } as const;
 
+function historyOrigin(
+  source: HistoryOrigin["source"],
+  ctx: { sessionManager?: { getSessionId?: () => string | undefined; getSessionFile?: () => string | undefined } },
+  workbrief: string,
+  execution?: ExecutionBinding,
+  assignmentId?: string,
+): HistoryOrigin {
+  return {
+    source, workbrief, assignmentId,
+    coordinatorSessionId: ctx.sessionManager?.getSessionId?.(),
+    coordinatorSessionFile: ctx.sessionManager?.getSessionFile?.(),
+    ...(execution ? { execution: {
+      executionRoot: execution.executionRoot,
+      executionRef: `${execution.planId}@${execution.revision}:${execution.hash}`,
+    } } : {}),
+  };
+}
+
 export default function agentInstance(pi: ExtensionAPI): void {
+  pi.registerTool({
+    name: "agent_history",
+    label: "Worker history",
+    description: "Read-only local native worker histories, including all recorded branches and tool results. list defaults to this coordinator; explicit identity filters or scope all discover older groups. Members carry group identity and historyId. read returns lossless base64 byte fragments in physical append order, not active context. Default 50, max 200 items, max 32KiB per page. Use the returned cursor until null; upstream truncation and external artifacts remain limits. No prune action or file/store paths.",
+    parameters: Type.Union([
+      Type.Object({
+        action: Type.Literal("list"),
+        scope: Type.Optional(Type.Literal("all")),
+        coordinatorSessionId: Type.Optional(Type.String()),
+        missionId: Type.Optional(Type.String()),
+        assignmentId: Type.Optional(Type.String()),
+        instanceId: Type.Optional(Type.String()),
+        roleId: Type.Optional(Type.String()),
+        cursor: Type.Optional(Type.String()),
+        limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
+      }, noExtra),
+      Type.Object({
+        action: Type.Literal("read"),
+        historyId: Type.String(),
+        cursor: Type.Optional(Type.String()),
+        limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
+      }, noExtra),
+    ]),
+    async execute(_id, params, _signal, _update, ctx) {
+      const blocked = childBlocked("agent_history");
+      if (blocked) return blocked;
+      if (executionForSession(ctx.sessionManager?.getSessionId?.())) return errorResult("agent_history cannot be called from an AgentInstance");
+      const page = await queryHistory(params, ctx.sessionManager?.getSessionId?.());
+      return textResult(JSON.stringify(page), page);
+    },
+  });
   registerBackgroundTools(pi);
   registerTeamTools(pi);
   pi.registerTool({
@@ -64,6 +116,7 @@ export default function agentInstance(pi: ExtensionAPI): void {
           cwd: ctx.cwd,
           signal,
           executor: createPiExecutor(),
+          historyOrigin: historyOrigin("agent_run", ctx, params.task),
           onPresent(text) {
             live = text;
             onUpdate?.({
@@ -168,6 +221,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
             foreground: signal,
             watch: watch ? { ...watch, execution } : undefined,
             executor: backgroundExecutor(),
+            historyOrigin: historyOrigin("team_assign", ctx, params.task, execution, id),
             teamOwner: {
               token: admission.token,
               assignmentId: id,
@@ -476,6 +530,7 @@ function registerBackgroundTools(pi: ExtensionAPI): void {
           foreground: signal,
           watch: watch ? { ...watch, execution } : undefined,
           executor: backgroundExecutor(),
+          historyOrigin: historyOrigin("agent_spawn", ctx, params.task, execution),
         });
         return textResult(formatWorkerHandle(handle), handle);
       } catch (error) {

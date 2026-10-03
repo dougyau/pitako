@@ -75,6 +75,7 @@ export interface PitakoConfig {
   roles: Readonly<Record<string, RoleDefinition>>;
   policies: Readonly<Record<string, ModelPolicy>>;
   watchdog: WatchdogConfig;
+  workerHistory: { ttlDays: number | false };
 }
 
 /** Fields Pi's `getSupportedThinkingLevels` reads. Not a second model registry. */

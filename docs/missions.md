@@ -59,6 +59,12 @@ Inspect the integrated report and completion manifest before deliberately
 applying anything yourself. There is no automatic source apply, commit, push,
 publication or privileged same-UID hardening guarantee.
 
+Durable worker and diagnosis transcripts remain in canonical private native
+directories. Foreground `agent_history` and `/pitako history` consult those records
+after restart. Registered shallow aliases make them discoverable by ordinary
+Hermes backfill without moving transcripts. See [Worker history](worker-history.md)
+for consultation, protected groups, retention, capture gaps, and search limits.
+
 ## Engine verification versus effectiveness
 
 `bun run verify:mission -- T7 --evidence-dir <directory>` is the deterministic

@@ -3,6 +3,9 @@
 # A supplied skills or principles array replaces the built-in list. Omitted arrays stay.
 # A supplied primary or fallbacks array replaces that policy field. Omitted fields stay.
 
+[worker_history]
+ttl_days = 180
+
 [roles.coordinator]
 name = "Coordinator"
 description = "Understands the mission, chooses which specialists are needed, and synthesizes results."

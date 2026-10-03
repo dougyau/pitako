@@ -24,8 +24,10 @@ export async function installMissionLocalProvider(options: {
   agentDir: string;
   provider?: string;
   model?: string;
+  additionalModels?: string[];
   responseForPrompt?: (prompt: string) => string;
-  responseGate?: (prompt: string) => Promise<void>;
+  responseGate?: (prompt: string, signal?: AbortSignal) => Promise<void>;
+  errorForRequest?: (prompt: string, model: string, afterTool: boolean, signal?: AbortSignal) => string | undefined;
   toolForPrompt?: (prompt: string) => { name: string; arguments: Record<string, unknown> } | undefined;
   modelFromJson?: { cost?: Model<"openai-completions">["cost"] };
   usage?: Partial<Usage>;
@@ -58,13 +60,13 @@ export async function installMissionLocalProvider(options: {
     baseUrl: "http://127.0.0.1",
     apiKey: "local-fixture",
     api: "openai-completions",
-    ...(options.modelFromJson ? {} : { models: [{
-      ...modelDefinition, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    }] }),
+    ...(options.modelFromJson ? {} : { models: [model, ...options.additionalModels ?? []].map((id) => ({
+      ...modelDefinition, id, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    })) }),
     streamSimple(
       selected: Model<"openai-completions">,
       context: { messages?: Array<{ role?: string; content?: Array<{ type?: string; text?: string }> }>; tools?: unknown[] },
-      request: { sessionId?: string } = {},
+      request: { sessionId?: string; signal?: AbortSignal } = {},
     ) {
       const prompt = [...(context.messages ?? [])].reverse().find((message) => message.role === "user")?.content
         ?.filter((part) => part.type === "text").map((part) => part.text ?? "").join("\n") ?? "";
@@ -96,7 +98,14 @@ export async function installMissionLocalProvider(options: {
         usage: options.omitUsage ? undefined : usage,
       };
       queueMicrotask(async () => {
-        await options.responseGate?.(prompt);
+        await options.responseGate?.(prompt, request.signal);
+        const failure = options.errorForRequest?.(prompt, selected.id, context.messages?.at(-1)?.role === "toolResult", request.signal);
+        if (failure) {
+          const error = { ...message, content: [], stopReason: request.signal?.aborted ? "aborted" : "error", errorMessage: failure };
+          stream.push({ type: "error", reason: error.stopReason, error } as never);
+          stream.end(error as never);
+          return;
+        }
         const partial = { ...message, content: [{ type: "text", text: "" }] };
         stream.push({ type: "start", partial } as never);
         stream.push({ type: "text_start", contentIndex: 0, partial } as never);

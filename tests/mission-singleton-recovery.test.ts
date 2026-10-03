@@ -28,7 +28,7 @@ test("Node owner-death recovery preserves an SDK-produced completed Bash receipt
     writeFileSync(sample.definitionFile, JSON.stringify(definition));
     store = await openFixtureStore(sample);
     const mission = store.createMission(missionInput(sample));
-    await new MissionEngine({ store, missionId: mission.id, sessionsDirectory: path.join(sample.base, "sessions"),
+    await new MissionEngine({ store, missionId: mission.id, sessionsDirectory: path.join(path.dirname(sample.dbPath), "sessions"),
       runRole: async () => { throw new Error("prepared owner cannot launch"); } }).retireForShutdown("quit");
     store = undefined;
     const traceFile = path.join(sample.base, "provider-trace.json");

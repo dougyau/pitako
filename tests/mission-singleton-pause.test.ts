@@ -6,6 +6,8 @@ import { createPiExecutor } from "../extensions/agent/pi.ts";
 import { createPiMissionRunner, MissionEngine, type MissionAttemptBinding } from "../extensions/mission/engine.ts";
 import { createMissionFixture, missionDefinition, missionInput, openFixtureStore } from "./mission-fixtures.ts";
 import { installMissionLocalProvider } from "./mission-local-provider.ts";
+import { WorkerHistory } from "../extensions/agent/history.ts";
+import { projectManagedHistory } from "../extensions/agent/managed-mission.ts";
 
 const request = JSON.stringify({ format: "mission-consultation-request-v1", question: "Review private candidate",
   evidenceRefs: ["evidence:a"], members: ["one", "two", "three"].map((id) => ({ id, role: "developer", perspective: id })),
@@ -109,12 +111,27 @@ for (const mode of ["live", "node", "drift"] as const) test.serial(`paused singl
     const protectedIds = paused.events.filter(({ kind, payload }) => kind === "reservation.created" && payload.purpose === "protected")
       .map(({ payload }) => payload.reservationId);
     expect(provider.trace).toHaveLength(paid);
+    const histories = new WorkerHistory().list().filter((group) => group.identity.kind === "mission" && group.identity.missionId === mission.id);
+    expect(histories).toHaveLength(1);
+    const history = histories[0]!;
+    expect(history.coverage).toBe("complete");
+    expect(history.members).toHaveLength(launches);
+    const successor = history.members.find((member) => member.attemptId === continuation.attemptId)!;
+    expect(successor.continuationOf).toBe((continuation.payload.binding as MissionAttemptBinding).continuationOf);
+    expect(successor.retryOf).toBeUndefined();
+    expect(new Set(history.members.filter((member) => member.memberId !== "singleton").map((member) => member.memberId)).size)
+      .toBeGreaterThan(2);
+    expect(history.members.every((member) => member.native.state === "allocated" &&
+      member.native.sessionId === member.attemptId && member.native.disposition.state === "disposed")).toBe(true);
+    const seqBeforeHistory = store.inspectMission(mission.id).latestSeq;
+    expect((await projectManagedHistory(history)).protected).toBe(true);
+    expect(store.inspectMission(mission.id).latestSeq).toBe(seqBeforeHistory);
     if (mode === "drift") writeFileSync(path.join(sample.root, "src", "target.txt"), "external drift\n");
     if (mode === "node") {
       await engine.retireForShutdown("quit");
       const node = spawnSync("node", ["scripts/mission-singleton-pause-node.mjs", sample.dbPath, sample.objectDir,
         mission.id, sample.root, String(continuation.attemptId), String(paid), String(effects), String(launches)],
-        { cwd: process.cwd(), encoding: "utf8", timeout: 45000 });
+        { cwd: process.cwd(), env: { ...process.env, PI_CODING_AGENT_DIR: agentDir }, encoding: "utf8", timeout: 45000 });
       expect(node.status, node.stderr + node.stdout).toBe(0);
     } else {
       await engine.control("resume", { id: "operator-resume", text: "/mission resume" });

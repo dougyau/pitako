@@ -1,8 +1,14 @@
 import assert from "node:assert/strict";
 import { openMissionStore } from "../extensions/mission/store.ts";
 import { MissionEngine } from "../extensions/mission/engine.ts";
+import { WorkerHistory } from "../extensions/agent/history.ts";
+import { projectManagedHistory } from "../extensions/agent/managed-mission.ts";
 
 const [dbPath, objectDir, missionId, root, continuationId, paid, effects, launches] = process.argv.slice(2);
+const history = new WorkerHistory().list().find((group) => group.identity.kind === "mission" && group.identity.missionId === missionId);
+assert.ok(history);
+assert.equal((await projectManagedHistory(history)).protected, true);
+assert.equal(history.members.length, Number(launches));
 const store = await openMissionStore({ dbPath, objectDir });
 try {
   const paused = store.inspectMission(missionId);

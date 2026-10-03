@@ -28,7 +28,7 @@ test("receipt-before-seal denies singleton without relaunch while independent un
     writeFileSync(sample.definitionFile, JSON.stringify(definition));
     store = await openFixtureStore(sample);
     const mission = store.createMission(missionInput(sample));
-    await new MissionEngine({ store, missionId: mission.id, sessionsDirectory: path.join(sample.base, "sessions"),
+    await new MissionEngine({ store, missionId: mission.id, sessionsDirectory: path.join(path.dirname(sample.dbPath), "sessions"),
       runRole: async () => { throw new Error("prepared owner cannot launch"); } }).retireForShutdown("quit");
     store = undefined;
     const trace = path.join(sample.base, "trace.json");

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, readdirSync } from "node:fs";
 import path from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { lazyStream, normalizeContext, type AssistantMessageEvent, type Context, type Model } from "@earendil-works/pi-ai";
+import { getCurrentSystemPrompt, lazyStream, normalizeContext, type AssistantMessageEvent, type Context, type Model } from "@earendil-works/pi-ai";
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -21,6 +21,7 @@ import { isServiceTierRejection } from "./fallback.ts";
 import { childInstructions, skillNamesForRole, usageDelta, type AgentRequestObservation, type AgentUsage, type Attempt, type AttemptExecutor, type DurableAttemptContext } from "./run.ts";
 import { completeTool, emptyCodeIntelligenceUsage, isDenseToolName, type CodeIntelligenceUsage, type DenseCallUsage, type ToolOutcome } from "../code-intelligence/metrics.ts";
 import type { ModelTarget, ReasoningLevel } from "../roles/types.ts";
+import { InvocationHistory, type SessionHistory } from "./history.ts";
 
 // Package entry does not re-export this. Import the file next to the resolved entry.
 export let DEFAULT_THINKING_LEVEL: ThinkingLevel;
@@ -32,19 +33,27 @@ const sdkDefaultsReady = import(
 });
 
 const navigationWindows = new WeakMap<AgentSession, { remaining: number }>();
-const childLifecycles = new WeakMap<AgentSession, { bound: boolean; disposal?: Promise<void> }>();
+const childLifecycles = new WeakMap<AgentSession, { bound: boolean; disposal?: Promise<void>; history?: SessionHistory }>();
 
 function disposeChildSession(session: AgentSession): Promise<void> {
   const lifecycle = childLifecycles.get(session)!;
   return lifecycle.disposal ??= (async () => {
+    let failure: unknown;
     try {
-      if (lifecycle.bound) await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
-    } finally {
       try {
-        await session.dispose();
+        if (lifecycle.bound) await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
       } finally {
-        unregisterExecution(session.sessionId);
+        try {
+          await session.dispose();
+        } finally {
+          unregisterExecution(session.sessionId);
+        }
       }
+    } catch (error) {
+      failure = error;
+      throw error;
+    } finally {
+      lifecycle.history?.disposition(failure);
     }
   })();
 }
@@ -56,14 +65,25 @@ export function thinkingLevelFor(reasoning: ReasoningLevel | undefined): Thinkin
 
 export function createPiExecutor(options: { now?: () => number } = {}): AttemptExecutor {
   return {
+    capturesHistory: true,
     async start(input) {
-      // Do not bind the worker abort signal here. The session abort owns cancellation.
-      // A signal on runtime create aborts Cursor auth before the child prompt starts.
-      const runtime = await ModelRuntime.create({ allowModelNetwork: false, refreshOnCreate: false });
-      const selections = new WeakMap<object, RequestSelection>();
-      keepCursorTools(runtime);
-      installServiceTierTransport(runtime, selections);
-      return runTarget(runtime, selections, options.now ?? (() => performance.now()), input.target, input.task, input);
+      const history = input.durable ? input.durable.history &&
+        new InvocationHistory(input.cwd, undefined, input.task, false, input.durable.history).admit(input.instanceId, input.role.id, input.target) :
+        (input.history ?? new InvocationHistory(input.cwd, undefined, input.task, true)).admit(input.instanceId, input.role.id, input.target);
+      try {
+        // Do not bind the worker abort signal here. The session abort owns cancellation.
+        // A signal on runtime create aborts Cursor auth before the child prompt starts.
+        const runtime = await ModelRuntime.create({ allowModelNetwork: false, refreshOnCreate: false });
+        const selections = new WeakMap<object, RequestSelection>();
+        keepCursorTools(runtime);
+        installServiceTierTransport(runtime, selections);
+        const result = await runTarget(runtime, selections, options.now ?? (() => performance.now()), input.target, input.task,
+          { ...input, sessionHistory: history });
+        return history?.result(result) ?? result;
+      } catch (error) {
+        history?.result({ status: input.signal.aborted ? "cancelled" : "failed", result: "", error: messageOf(error), sideEffects: false });
+        throw error;
+      }
     },
   };
 }
@@ -194,6 +214,7 @@ async function runTarget(
     onActivated?: (appliedReasoning: string) => void;
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
     durable?: DurableAttemptContext;
+    sessionHistory?: SessionHistory;
   },
   existing?: AgentSession,
 ): Promise<Attempt> {
@@ -315,6 +336,7 @@ async function bindThenRun(
     onActivated?: (appliedReasoning: string) => void;
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
     durable?: DurableAttemptContext;
+    sessionHistory?: SessionHistory;
   },
 ): Promise<Attempt> {
   let session: AgentSession;
@@ -362,7 +384,7 @@ async function openSession(
   runtime: ModelRuntime,
   model: NonNullable<ReturnType<ModelRuntime["getModel"]>> | undefined,
   target: ModelTarget,
-  input: { instanceId: string; role: Parameters<AttemptExecutor["start"]>[0]["role"]; cwd: string; durable?: DurableAttemptContext },
+  input: { instanceId: string; role: Parameters<AttemptExecutor["start"]>[0]["role"]; cwd: string; durable?: DurableAttemptContext; sessionHistory?: SessionHistory },
 ): Promise<AgentSession> {
   const agentDir = getAgentDir();
   const settingsManager = input.durable ? managedSettingsManager() : SettingsManager.create(input.cwd, agentDir);
@@ -386,8 +408,11 @@ async function openSession(
     ...(model ? { model } : {}),
     ...(thinkingLevel ? { thinkingLevel } : {}),
     sessionManager: input.durable
-      ? persistentAttemptSession(input.cwd, input.durable)
-      : SessionManager.inMemory(input.cwd),
+      ? (() => {
+        const manager = persistentAttemptSession(input.cwd, input.durable!);
+        return input.sessionHistory?.associate(manager) ?? manager;
+      })()
+      : input.sessionHistory!.create(),
     settingsManager,
     resourceLoader: loader,
     // SDK admission filters extension tools too; profiles cannot enable unfenced tools.
@@ -396,8 +421,12 @@ async function openSession(
     modelRuntime: runtime,
     excludeTools: [...ORCHESTRATION_TOOLS],
   });
-  const lifecycle = { bound: false };
+  const lifecycle = { bound: false, history: input.sessionHistory };
   childLifecycles.set(session, lifecycle);
+  lifecycle.history?.attached();
+  if (lifecycle.history) session.subscribe((event) => {
+    if (event.type === "message_end" && event.message.role === "assistant") lifecycle.history!.assistantObserved();
+  });
   if (input.durable) {
     session.setAutoRetryEnabled(false);
     session.setAutoCompactionEnabled(false);
@@ -460,6 +489,14 @@ async function drive(
         return originalStreamFunction(model, context, options);
       }
       const selection = selections.get(model);
+      const history = childLifecycles.get(session)?.history;
+      history?.instructions(getCurrentSystemPrompt(context.messages), getCurrentSystemPrompt(
+        session.sessionManager.getEntries().flatMap((entry) => entry.type === "message" ? [entry.message] : []),
+      ));
+      history?.append("selection", {
+        model: `${model.provider}/${model.id}`, requested: selection,
+        appliedReasoning: options?.reasoning, continuation: session.messages.some((message) => message.role === "assistant"),
+      });
       const requestId = randomUUID();
       const observation: AgentRequestObservation = {
         model: selection?.model ?? `${model.provider}/${model.id}`,
@@ -646,9 +683,12 @@ function resume(
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
   },
 ): NonNullable<Attempt["session"]> {
+  const history = childLifecycles.get(session)?.history;
   return {
     async continueWith(target, note, signal) {
-      return runTarget(runtime, selections, now, target, note, { ...input, signal }, session);
+      history?.append("continuation", { target, note });
+      const result = await runTarget(runtime, selections, now, target, note, { ...input, signal, sessionHistory: history }, session);
+      return history?.result(result) ?? result;
     },
     async dispose() {
       await disposeChildSession(session);

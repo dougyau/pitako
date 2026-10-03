@@ -23,6 +23,10 @@ import { shutdownManagedMissions } from "./mission/lifecycle.ts";
 import { registerMissionExtension } from "./mission/index.ts";
 import path from "node:path";
 import type { ApplyPatchResult } from "pi-codex-tools";
+import { parseHistoryCommand, queryHistory } from "./agent/history-query.ts";
+import { WorkerHistory } from "./agent/history.ts";
+import { pruneWorkerHistory } from "./agent/history-retention.ts";
+import { loadPitakoConfig } from "./roles/load.ts";
 
 const foregroundCodeUsage = new Map<string, CodeIntelligenceUsage>();
 const foregroundToolStarts = new Map<string, Map<string, { name: string; startedAt: number }>>();
@@ -140,6 +144,18 @@ export default function pitako(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     const sessionId = ctx.sessionManager?.getSessionId();
     if (foregroundSession(sessionId)) {
+      // Cooperative history maintenance never waits for or cancels a worker.
+      try {
+        const result = await pruneWorkerHistory(new WorkerHistory(undefined, { initialize: false }), loadPitakoConfig({ cwd: ctx.cwd }).workerHistory.ttlDays);
+        const failures = result.groups.filter((group) => group.state === "failed");
+        if (failures.length) {
+          const message = `Worker history maintenance failed: ${JSON.stringify(failures)}`;
+          if (ctx.hasUI) ctx.ui.notify(message, "error"); else console.error(message);
+        }
+      } catch (error) {
+        const message = `Worker history maintenance failed: ${String(error)}`;
+        if (ctx.hasUI) ctx.ui.notify(message, "error"); else console.error(message);
+      }
       for (const previous of foregroundCodeUsage.keys()) {
         if (previous !== sessionId) {
           foregroundCodeUsage.delete(previous);
@@ -269,6 +285,24 @@ export default function pitako(pi: ExtensionAPI) {
     description: "Pitako status, telemetry, profile, roles, and model policies",
     handler: async (args, ctx) => {
       const [command, value] = args.trim().split(/\s+/, 2);
+      if (command === "history") {
+        if (isChildSession(ctx)) { notify(ctx, "history cannot be called from an AgentInstance", "error"); return; }
+        try {
+          const historyArgs = args.trim().slice("history".length).trim();
+          if (historyArgs.split(/\s+/)[0] === "prune") {
+            if (!/^prune(?:\s+--dry-run)?$/.test(historyArgs)) throw new Error("usage: /pitako history prune [--dry-run]");
+            const page = await pruneWorkerHistory(new WorkerHistory(undefined, { initialize: false }), loadPitakoConfig({ cwd: ctx.cwd }).workerHistory.ttlDays,
+              { dryRun: historyArgs.includes("--dry-run") });
+            notify(ctx, JSON.stringify(page));
+            return;
+          }
+          const page = await queryHistory(parseHistoryCommand(historyArgs), ctx.sessionManager?.getSessionId?.());
+          notify(ctx, JSON.stringify(page));
+        } catch (error) {
+          notify(ctx, error instanceof Error ? error.message : String(error), "error");
+        }
+        return;
+      }
       if (command === "roles" || command === "role" || command === "policies" || command === "policy") {
         try {
           notify(ctx, inspectPitako(args));
@@ -372,6 +406,7 @@ export default function pitako(pi: ExtensionAPI) {
         "Session TODOs: todo tool and /todos (rpiv-todo). Shared knowledge: board_* tools and /board.",
         "Roles: /pitako roles, /pitako role <id>, /pitako policies, /pitako policy <id>. Definitions only.",
         "Background workers: /pitako agents; telemetry: /pitako stats [instance-id]; Team roster: /pitako team",
+        "Native histories: /pitako history list [--scope all | --role-id ID | --mission-id ID | --coordinator-session-id ID | --assignment-id ID | --instance-id ID] [--cursor TOKEN] [--limit N]; /pitako history read HISTORY_ID [--cursor TOKEN] [--limit N].",
 
         ...skillStatusLines(),
       ];
