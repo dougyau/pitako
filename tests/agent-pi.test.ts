@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import { createAgentSession, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { classifyProviderFailure } from "../extensions/agent/fallback.ts";
-import { activateTarget, createPiExecutor, cursorProviderContext, DEFAULT_THINKING_LEVEL } from "../extensions/agent/pi.ts";
+import { activateTarget, createPiExecutor, cursorProviderContext, DEFAULT_THINKING_LEVEL, managedSettingsManager, shouldBypassProviderAdmission } from "../extensions/agent/pi.ts";
 import { runAgentInstance, teamExecutionSummary, type Attempt } from "../extensions/agent/run.ts";
 import { childActiveTools, ORCHESTRATION_TOOLS } from "../extensions/profile.ts";
 import { loadPitako } from "../scripts/load-pitako.ts";
@@ -17,6 +17,20 @@ afterEach(() => {
 });
 
 describe("cursor request", () => {
+  test("managed provider retry and automatic compaction are disabled", () => {
+    const settings = managedSettingsManager();
+    expect(settings.getRetrySettings()).toMatchObject({ enabled: false, maxRetries: 0 });
+    expect(settings.getProviderRetrySettings().maxRetries).toBe(0);
+    expect(settings.getCompactionSettings().enabled).toBe(false);
+  });
+
+  test("managed requests with alternate SDK session ids still require provider admission", () => {
+    expect(shouldBypassProviderAdmission(true, "compaction-session", "attempt-session")).toBe(false);
+    expect(shouldBypassProviderAdmission(true, "retry-session", "attempt-session")).toBe(false);
+    expect(shouldBypassProviderAdmission(false, "other-session", "attempt-session")).toBe(true);
+    expect(shouldBypassProviderAdmission(true, undefined, "attempt-session")).toBe(false);
+  });
+
   test("keeps session tools on the provider context", () => {
     const tools = [{ name: "bash", description: "run", parameters: { type: "object" } }];
     const context = cursorProviderContext(
@@ -25,6 +39,33 @@ describe("cursor request", () => {
     );
     expect(context.tools).toEqual(tools);
     expect(cursorProviderContext({ provider: "xai" }, { messages: [], tools: tools as never }).tools).toEqual(tools);
+  });
+
+  test("managed attempts refuse Cursor-native execution before provider invocation", async () => {
+    const cwd = mkdtempSync(path.join(tmpdir(), "pitako-managed-cursor-"));
+    tempDirs.push(cwd);
+    const effects = {} as never;
+    const durable = {
+      attemptId: "22345678-1234-4234-8234-123456789abc",
+      sessionDir: path.join(cwd, "session"),
+      sessionId: "managed-attempt",
+      readOnly: false,
+      effects,
+      rolePolicy: { primary: { model: "cursor/native" }, fallbacks: [] },
+      onProviderDispatch() { throw new Error("native provider must not dispatch"); },
+      onProviderReceipt() { throw new Error("native provider must not return a receipt"); },
+    };
+    const result = await createPiExecutor().start({
+      instanceId: "managed-cursor-denied",
+      role: lateRole,
+      task: "attempt native bypass",
+      target: { model: "cursor/native" },
+      cwd,
+      signal: new AbortController().signal,
+      durable: durable as never,
+    });
+    expect(result.status).toBe("failed");
+    expect(result.result).toContain("bypasses fenced local adapters");
   });
 });
 

@@ -267,7 +267,7 @@ describe("Team T1 ownership", () => {
     const pi = {
       registerTool(tool: any) { tools.set(tool.name, tool); },
       registerFlag() {}, registerCommand() {},
-      on(event: string, handler: Function) { handlers.set(event, handler); },
+      on(event: string, handler: Function) { if (!handlers.has(event)) handlers.set(event, handler); },
       getFlag() { return undefined; }, getAllTools() { return []; }, getActiveTools() { return []; },
       setActiveTools() {}, getSessionName() { return undefined; }, setSessionName() {},
       sendMessage(message: any, options: any) { sent.push({ message, options }); },

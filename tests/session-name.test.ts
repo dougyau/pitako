@@ -176,7 +176,10 @@ function createHandlerHarness(current: string | undefined, entries: unknown[], c
   };
   const api = {
     registerFlag() {}, registerTool() {}, getFlag() { return undefined; },
-    on(name: string, handler: (event: any, ctx: any) => Promise<unknown>) { events.set(name, handler); },
+    on(name: string, handler: (event: any, ctx: any) => Promise<unknown>) {
+      const previous = events.get(name);
+      events.set(name, async (event, ctx) => { await previous?.(event, ctx); return handler(event, ctx); });
+    },
     registerCommand(name: string, definition: { handler: (args: string, ctx: any) => Promise<void> }) { commands.set(name, definition.handler); },
     getActiveTools() { return []; }, getAllTools() { return []; }, setActiveTools() {},
     getSessionName() { return name; }, setSessionName(value: string) { setNames.push(value); name = value || undefined; },

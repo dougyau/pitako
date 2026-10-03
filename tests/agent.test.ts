@@ -410,6 +410,39 @@ reasoning = "medium"
     expect(switched.notes.some((note) => note.startsWith("example/fallback-2:"))).toBe(true);
   });
 
+  test("model capacity failure tries the configured reviewer fallback without side effects", async () => {
+    const env = tempEnv();
+    const configPath = path.join(env.PI_CODING_AGENT_DIR!, "pitako", "config.toml");
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(path.dirname(configPath), { recursive: true });
+    writeFileSync(configPath, `[model_policies.reviewer.primary]\nmodel = "xai/grok-4.7"\nreasoning = "high"\n[[model_policies.reviewer.fallbacks]]\nmodel = "cursor/grok-4.7"\nreasoning = "medium"\n[[model_policies.reviewer.fallbacks]]\nmodel = "openai-codex/gpt-6-astra"\n`);
+    const capacity = "The model is currently at capacity due to high demand. Please try again in a few minutes, or use a higher service tier for priority processing";
+    expect(classifyProviderFailure(capacity)).toBe("unavailable");
+    expect(classifyProviderFailure("application capacity exceeded in tests")).toBeUndefined();
+    expect(classifyProviderFailure("model usage limit reached")).toBe("quota");
+    const executor = scripted([
+      { status: "failed", result: "", error: capacity, sideEffects: false },
+      { status: "completed", result: "reviewed", sideEffects: false, appliedReasoning: "medium" },
+    ]);
+    const result = await runAgentInstance({
+      roleId: "reviewer",
+      task: "review the boundary",
+      cwd: packageRoot(),
+      executor,
+      load: { env, userConfigPath: configPath },
+    });
+    expect(executor.starts).toEqual(["xai/grok-4.7", "cursor/grok-4.7"]);
+    expect(executor.notes).toEqual([]);
+    expect(result.status).toBe("completed");
+    expect(result.result).toBe("reviewed");
+    expect(result.model).toMatchObject({
+      policyId: "reviewer", requestedModel: "xai/grok-4.7", selectedModel: "cursor/grok-4.7",
+      requestedReasoning: "medium", appliedReasoning: "medium", fallbackOccurred: true,
+      fallbackIndex: 0, fallbackReason: "unavailable", lastFailure: "unavailable",
+    });
+    expect(formatAgentResult(result)).toContain("fallback: unavailable from xai/grok-4.7");
+  });
+
   test("service-tier rejections do not enter availability fallback without a failure kind", async () => {
     const env = tempEnv();
     const configPath = path.join(env.PI_CODING_AGENT_DIR!, "pitako", "config.toml");

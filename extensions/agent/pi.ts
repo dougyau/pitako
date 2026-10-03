@@ -1,3 +1,6 @@
+import { randomUUID } from "node:crypto";
+import { mkdirSync, readdirSync } from "node:fs";
+import path from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { lazyStream, normalizeContext, type AssistantMessageEvent, type Context, type Model } from "@earendil-works/pi-ai";
 import {
@@ -13,15 +16,20 @@ import { registerExecution, unregisterExecution } from "../execution-identity.ts
 import { reconcileChildTools, ORCHESTRATION_TOOLS } from "../profile.ts";
 import { packageRoot } from "../stack.ts";
 import { marksSideEffect } from "./effects.ts";
+import { createMissionToolAdapters } from "../mission/effects.ts";
 import { isServiceTierRejection } from "./fallback.ts";
-import { childInstructions, skillNamesForRole, usageDelta, type AgentRequestObservation, type AgentUsage, type Attempt, type AttemptExecutor } from "./run.ts";
+import { childInstructions, skillNamesForRole, usageDelta, type AgentRequestObservation, type AgentUsage, type Attempt, type AttemptExecutor, type DurableAttemptContext } from "./run.ts";
 import { completeTool, emptyCodeIntelligenceUsage, isDenseToolName, type CodeIntelligenceUsage, type DenseCallUsage, type ToolOutcome } from "../code-intelligence/metrics.ts";
 import type { ModelTarget, ReasoningLevel } from "../roles/types.ts";
 
 // Package entry does not re-export this. Import the file next to the resolved entry.
-export const { DEFAULT_THINKING_LEVEL } = await import(
+export let DEFAULT_THINKING_LEVEL: ThinkingLevel;
+const sdkDefaultsReady = import(
   new URL("./core/defaults.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href,
-) as { DEFAULT_THINKING_LEVEL: ThinkingLevel };
+).then((defaults: { DEFAULT_THINKING_LEVEL: ThinkingLevel }) => {
+  DEFAULT_THINKING_LEVEL = defaults.DEFAULT_THINKING_LEVEL;
+  return defaults;
+});
 
 const navigationWindows = new WeakMap<AgentSession, { remaining: number }>();
 const childLifecycles = new WeakMap<AgentSession, { bound: boolean; disposal?: Promise<void> }>();
@@ -64,6 +72,17 @@ export function createPiExecutor(options: { now?: () => number } = {}): AttemptE
 export function cursorProviderContext(model: { provider?: string; api?: string }, context: Context): Context {
   if (model.provider !== "cursor" && model.api !== "cursor-native") return context;
   return { ...normalizeContext(context), tools: context.tools ?? [] };
+}
+
+export function shouldBypassProviderAdmission(durable: boolean, requestSessionId: string | undefined, sessionId: string): boolean {
+  return !durable && requestSessionId !== undefined && requestSessionId !== sessionId;
+}
+
+export function managedSettingsManager(): SettingsManager {
+  const settings = SettingsManager.inMemory({ retry: { enabled: false, maxRetries: 0 }, compaction: { enabled: false } });
+  const providerRetrySettings = settings.getProviderRetrySettings.bind(settings);
+  settings.getProviderRetrySettings = () => ({ ...providerRetrySettings(), maxRetries: 0 });
+  return settings;
 }
 
 type ServiceTier = "fast" | "priority";
@@ -174,11 +193,15 @@ async function runTarget(
     onActivity?: Parameters<AttemptExecutor["start"]>[0]["onActivity"];
     onActivated?: (appliedReasoning: string) => void;
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
+    durable?: DurableAttemptContext;
   },
   existing?: AgentSession,
 ): Promise<Attempt> {
   if (input.signal.aborted) return { status: "cancelled", result: "cancelled", sideEffects: false };
   const model = findModel(runtime, target.model);
+  if (input.durable?.effects && (/^cursor\//i.test(target.model) || model?.provider === "cursor" || model?.api === "cursor-native")) {
+    return { status: "failed", result: "managed missions deny Cursor/provider-native execution because it bypasses fenced local adapters", failureKind: "configuration", sideEffects: false };
+  }
   // Extension providers register during AgentSession bind, not on a fresh runtime.
   if (!model && !existing) return bindThenRun(runtime, selections, now, target, prompt, input);
   if (!model) {
@@ -214,7 +237,7 @@ async function runTarget(
     if (!existing) await handle.dispose();
     return configurationFailure(activated.error, Boolean(existing), existing ? handle : undefined);
   }
-  const activationError = await activateTarget(session, activated.model!, target);
+  const activationError = await activateTarget(session, activated.model!, target, input.durable);
   if (activationError) {
     const handle = resume(session, runtime, selections, now, input);
     if (!existing) await handle.dispose();
@@ -248,10 +271,13 @@ export async function activateTarget(
   },
   model: NonNullable<ReturnType<ModelRuntime["getModel"]>>,
   target: ModelTarget,
+  durable?: DurableAttemptContext,
 ): Promise<string | undefined> {
   try {
     await session.setModel(model, { persist: false });
-    if (session.sessionManager && session.getAllTools && session.setActiveToolsByName) {
+    if (durable) {
+      session.setActiveToolsByName?.(durable.effects ? ["bash", "edit", "write", "apply_patch"] : []);
+    } else if (session.sessionManager && session.getAllTools && session.setActiveToolsByName) {
       reconcileChildTools({
         sessionManager: session.sessionManager,
         model: session.model,
@@ -259,13 +285,14 @@ export async function activateTarget(
         setActiveToolsByName: (names) => session.setActiveToolsByName!(names),
       });
     }
+    const defaults = await sdkDefaultsReady;
     // setModel keeps the previous level when settings have no default.
     const settings = session.settingsManager;
     session.setThinkingLevel(
       thinkingLevelFor(target.reasoning)
         ?? settings?.getModelThinkingLevel(model.provider, model.id)
         ?? settings?.getDefaultThinkingLevel()
-        ?? DEFAULT_THINKING_LEVEL,
+        ?? defaults.DEFAULT_THINKING_LEVEL,
     );
     return undefined;
   } catch (error) {
@@ -287,6 +314,7 @@ async function bindThenRun(
     onActivity?: Parameters<AttemptExecutor["start"]>[0]["onActivity"];
     onActivated?: (appliedReasoning: string) => void;
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
+    durable?: DurableAttemptContext;
   },
 ): Promise<Attempt> {
   let session: AgentSession;
@@ -313,7 +341,7 @@ async function bindThenRun(
     await handle().dispose();
     return configurationFailure(activated.error, false);
   }
-  const activationError = await activateTarget(session, activated.model!, target);
+  const activationError = await activateTarget(session, activated.model!, target, input.durable);
   if (activationError) {
     await handle().dispose();
     return { status: "failed", result: "", error: activationError, sideEffects: false };
@@ -334,10 +362,10 @@ async function openSession(
   runtime: ModelRuntime,
   model: NonNullable<ReturnType<ModelRuntime["getModel"]>> | undefined,
   target: ModelTarget,
-  input: { instanceId: string; role: Parameters<AttemptExecutor["start"]>[0]["role"]; cwd: string },
+  input: { instanceId: string; role: Parameters<AttemptExecutor["start"]>[0]["role"]; cwd: string; durable?: DurableAttemptContext },
 ): Promise<AgentSession> {
   const agentDir = getAgentDir();
-  const settingsManager = SettingsManager.create(input.cwd, agentDir);
+  const settingsManager = input.durable ? managedSettingsManager() : SettingsManager.create(input.cwd, agentDir);
   const allowed = new Set(skillNamesForRole(input.role));
   const loader = new DefaultResourceLoader({
     cwd: input.cwd,
@@ -357,19 +385,33 @@ async function openSession(
     agentDir,
     ...(model ? { model } : {}),
     ...(thinkingLevel ? { thinkingLevel } : {}),
-    sessionManager: SessionManager.inMemory(input.cwd),
+    sessionManager: input.durable
+      ? persistentAttemptSession(input.cwd, input.durable)
+      : SessionManager.inMemory(input.cwd),
     settingsManager,
     resourceLoader: loader,
+    // SDK admission filters extension tools too; profiles cannot enable unfenced tools.
+    ...(input.durable ? { tools: input.durable.effects ? ["bash", "edit", "write", "apply_patch"] : [] } : {}),
+    ...(input.durable?.effects ? { customTools: createMissionToolAdapters(input.durable.effects) } : {}),
     modelRuntime: runtime,
     excludeTools: [...ORCHESTRATION_TOOLS],
   });
   const lifecycle = { bound: false };
   childLifecycles.set(session, lifecycle);
+  if (input.durable) {
+    session.setAutoRetryEnabled(false);
+    session.setAutoCompactionEnabled(false);
+    session.setActiveToolsByName(input.durable?.effects ? ["bash", "edit", "write", "apply_patch"] : []);
+  }
   registerExecution({ instanceId: input.instanceId, roleId: input.role.id, sessionId: session.sessionId });
   try {
     await session.bindExtensions({});
     lifecycle.bound = true;
-    reconcileChildTools(session);
+    if (input.durable) {
+      session.setActiveToolsByName(input.durable.effects ? ["bash", "edit", "write", "apply_patch"] : []);
+    } else {
+      reconcileChildTools(session);
+    }
     return session;
   } catch (error) {
     await disposeChildSession(session);
@@ -391,6 +433,7 @@ async function drive(
     onActivity?: (event: { type?: string; toolName?: string; assistantMessageEvent?: { type?: string } }) => void;
     onActivated?: (appliedReasoning: string) => void;
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
+    durable?: DurableAttemptContext;
   },
 ): Promise<Attempt> {
   // continueWith skips executor.start. The probe closes over this session only.
@@ -413,12 +456,14 @@ async function drive(
     };
     const originalStreamFunction = session.agent.streamFunction;
     session.agent.streamFunction = (model, context, options) => {
-      if (options?.sessionId !== undefined && options.sessionId !== session.sessionId) {
+      if (shouldBypassProviderAdmission(Boolean(input.durable), options?.sessionId, session.sessionId)) {
         return originalStreamFunction(model, context, options);
       }
       const selection = selections.get(model);
+      const requestId = randomUUID();
       const observation: AgentRequestObservation = {
         model: selection?.model ?? `${model.provider}/${model.id}`,
+        ...(input.durable ? { requestId, provider: model.provider } : {}),
         reasoning: options?.reasoning ?? selection?.reasoning,
         fast_requested: selection?.fastRequested ?? false,
         ...(selection?.serviceTier ? { requested_service_tier: selection.serviceTier } : {}),
@@ -428,16 +473,63 @@ async function drive(
       const request = { observation, startedAt: now() };
       requests.push(observation);
       activeRequest = request;
-      try {
-        const stream = originalStreamFunction(model, context, options);
-        return Promise.resolve(stream).catch((error) => {
+      return lazyStream(model, async () => {
+        let ticket: unknown;
+        let dispatched = false;
+        let recorded = false;
+        const receipt = async (event?: AssistantMessageEvent, failure?: unknown) => {
+          if (!input.durable || !dispatched || recorded) return;
+          recorded = true;
+          const usage = event?.type === "done" ? event.message.usage : event?.type === "error" ? event.error.usage : undefined;
+          const inputTokens = tokenValue(usage?.input);
+          const outputTokens = tokenValue(usage?.output);
+          const cost = usage?.cost?.total;
+          // SDK zero rates also represent omitted pricing; only fully observed zero use proves zero exposure.
+          const zeroConsumption = [inputTokens, outputTokens, tokenValue(usage?.cacheRead), tokenValue(usage?.cacheWrite)]
+            .every((value) => value === 0);
+          const estimatedCost = typeof cost === "number" && Number.isFinite(cost) && (cost > 0 || cost === 0 && zeroConsumption)
+            ? cost : null;
+          observation.inputTokens = inputTokens;
+          observation.outputTokens = outputTokens;
+          await input.durable.onProviderReceipt({
+            requestId, provider: model.provider, model: model.id, inputTokens, outputTokens,
+            estimatedCost,
+            pricingBasis: estimatedCost === null
+              ? "unknown pricing: SDK cost absent, invalid, or zero without fully observed zero consumption"
+              : "SDK model pricing estimate (USD), not invoiced spend",
+            ...(inputTokens === null || outputTokens === null ? { usageUnknownReason: failure ? messageOf(failure) : "provider response omitted token usage" } : {}),
+            ticket,
+          });
+        };
+        try {
+          if (input.durable) {
+            ticket = await input.durable.onProviderDispatch({ requestId, provider: model.provider, model: model.id });
+            dispatched = true;
+          }
+          const stream = await originalStreamFunction(model, context, options);
+          if (!input.durable) return stream;
+          return (async function* () {
+            let terminal = false;
+            try {
+              for await (const event of stream) {
+                if (event.type === "done" || event.type === "error") {
+                  await receipt(event);
+                  terminal = true;
+                }
+                yield event;
+              }
+              if (!terminal) await receipt(undefined, new Error("provider stream ended without a terminal response"));
+            } catch (error) {
+              await receipt(undefined, error);
+              throw error;
+            }
+          })();
+        } catch (error) {
+          await receipt(undefined, error);
           if (activeRequest === request) finishRequest("failed");
           throw error;
-        });
-      } catch (error) {
-        if (activeRequest === request) finishRequest("failed");
-        throw error;
-      }
+        }
+      });
     };
     const unsubscribe = session.subscribe((event) => {
       if (event.type === "message_update" && activeRequest && activeRequest.observation.time_to_first_model_output_ms === "unavailable" && hasFirstModelOutput(event.assistantMessageEvent)) {
@@ -505,6 +597,18 @@ async function drive(
   } finally {
     input.bindActivityProbe?.(undefined);
   }
+}
+
+function persistentAttemptSession(cwd: string, durable: DurableAttemptContext): SessionManager {
+  mkdirSync(durable.sessionDir, { recursive: true });
+  const files = readdirSync(durable.sessionDir).filter((name) => name === `${durable.sessionId}.jsonl` || name.endsWith(`_${durable.sessionId}.jsonl`));
+  if (files.length > 1) throw new Error(`multiple Pi SDK sessions exist for attempt ${durable.attemptId}`);
+  if (files.length === 1) return SessionManager.open(path.join(durable.sessionDir, files[0]!), durable.sessionDir, cwd);
+  return SessionManager.create(cwd, durable.sessionDir, { id: durable.sessionId });
+}
+
+function tokenValue(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 
 function failedAttempt(
@@ -650,4 +754,3 @@ function usageFrom(session: AgentSession, tools: Record<string, number>): AgentU
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
-

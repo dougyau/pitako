@@ -1,6 +1,6 @@
 # Engineering layer
 
-Pitako 0.1 is a Pi package. This note records its dependency choices, Board, roles, AgentInstance, Team assignments, Code Intelligence, and `$plan` / `$execute`. There is no DAG scheduler.
+Pitako 0.1 is a Pi package. This note records its dependency choices, Board, roles, AgentInstance, Team assignments, Code Intelligence, and `$plan` / `$execute`. Opt-in [durable missions](missions.md) add a separate DAG engine; existing ad-hoc paths remain unchanged.
 
 ## Decisions
 
@@ -44,7 +44,7 @@ Creating or maintaining a project verification procedure requires an explicitly 
 
 `pi-codex-tools@0.3.0` owns `apply_patch` registration and grammar capability. `extensions/profile.ts` uses the public `supportsOpenAIGrammarTools` helper to select patch editing for supported OpenAI Responses and Codex models, or `edit` and `write` for other models. This applies to every coding role. Pitako reconciles the full tool set after startup, model events, profile changes, and child `setModel`, even when the selected model is unchanged. `analysis` excludes `edit`, `write`, `apply_patch`, and `lsp_rename` throughout.
 
-Pitako no longer has a strict-path, exact-match patch engine or structured patch failures. Upstream accepts absolute paths, symlinks, moves, and fuzzy matching. Existing `edit` and `write` protected-path guards do not protect `apply_patch`. Shell and ACP temporary output also remain available in `analysis`. No sandbox, bwrap, or OpenShell isolation is shipped.
+Pitako no longer has a strict-path, exact-match patch engine or structured patch failures. Upstream accepts absolute paths, symlinks, moves, and fuzzy matching. Foreground `edit` and `write` protected-path guards do not protect `apply_patch`. Shell and ACP temporary output also remain available in `analysis`. Foreground and ad hoc sessions are not sandboxed; managed missions separately require the fenced Linux candidate boundary.
 
 `billion-context-pi@0.1.83` is the only compressor. `extensions/acp.ts` calls `createAcpExtension({ delegate: false, autoUpdate: false })`. Explicit `~/.pi/acp.json` and project `.pi/acp.json` retain upstream precedence, with project settings winning. Users can enable delegation or updates, or set `enabled:false`; Pitako does not rewrite their files. The factory reads the master switch using `process.cwd()`, while runtime options use `ctx.cwd`. A different child cwd is not a separate factory master-switch location.
 
@@ -112,7 +112,7 @@ AgentInstance has no 20-minute deadline. The stops at that mark came from the pa
 
 ## Team assignments
 
-`team_assign` starts independent background AgentInstances from the foreground session. One assignment per role can run at a time. `team_status`, `team_result`, and `team_cancel` use assignment IDs, not worker instance IDs. Watched plan units wake the owning foreground session; child sessions cannot dispatch Team work. Team state is not a DAG scheduler or a Board scope.
+`team_assign` starts independent background AgentInstances from the foreground session. One assignment per role can run at a time. `team_status`, `team_result`, and `team_cancel` use assignment IDs, not worker instance IDs. Watched plan units wake the owning foreground session; child sessions cannot dispatch Team work. Ad-hoc Team state is not a durable mission or a Board scope.
 
 ## Code Intelligence
 

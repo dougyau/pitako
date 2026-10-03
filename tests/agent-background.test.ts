@@ -330,7 +330,10 @@ describe("background tools", () => {
         sent.push({ message, options });
       },
       on(event: string, handler: Function) {
-        handlers.set(event, handler);
+        const previous = handlers.get(event);
+        handlers.set(event, previous
+          ? async (...args: unknown[]) => { await previous(...args); return handler(...args); }
+          : handler);
       },
       registerFlag() {},
       registerCommand() {},
@@ -377,7 +380,10 @@ describe("background tools", () => {
     pitako({
       ...pi,
       on(event: string, handler: Function) {
-        childHandlers.set(event, handler);
+        const previous = childHandlers.get(event);
+        childHandlers.set(event, previous
+          ? async (...args: unknown[]) => { await previous(...args); return handler(...args); }
+          : handler);
       },
       sendMessage(message: unknown, options: unknown) {
         sent.push({ message, options, child: true });

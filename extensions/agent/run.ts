@@ -8,6 +8,7 @@ import { formatAgentLive } from "./present.ts";
 import { agentScope } from "./scope.ts";
 import type { AgentUiSnapshot } from "./ui.ts";
 import { codeIntelligenceDelta, formatCodeIntelligenceUsage, mergeCodeIntelligenceUsage, type CodeIntelligenceUsage } from "../code-intelligence/metrics.ts";
+import type { MissionEffects } from "../mission/effects.ts";
 import {
   activityKind,
   createActivity,
@@ -75,6 +76,10 @@ export interface WatchdogSnapshot {
 
 export interface AgentRequestObservation {
   model: string;
+  provider?: string;
+  requestId?: string;
+  inputTokens?: number | null;
+  outputTokens?: number | null;
   reasoning?: string;
   fast_requested: boolean;
   requested_service_tier?: "fast" | "priority";
@@ -128,6 +133,32 @@ export interface AttemptSession {
   dispose(): Promise<void>;
 }
 
+export interface ProviderRequestReceipt {
+  requestId: string;
+  provider: string;
+  model: string;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  estimatedCost?: number | null;
+  pricingBasis?: string;
+  usageUnknownReason?: string;
+  ticket?: unknown;
+}
+
+export interface DurableAttemptContext {
+  attemptId: string;
+  sessionDir: string;
+  sessionId: string;
+  readOnly: boolean;
+  cwd?: string;
+  effects?: MissionEffects;
+  signal?: AbortSignal;
+  rolePolicy: { primary: ModelTarget; fallbacks: readonly ModelTarget[] };
+  onProviderDispatch: (request: { requestId: string; provider: string; model: string }) => Promise<unknown> | unknown;
+  onProviderReceipt: (receipt: ProviderRequestReceipt) => Promise<void> | void;
+  onOutcome?: (result: AgentRunResult) => void;
+}
+
 export interface AttemptExecutor {
   start(input: {
     instanceId: string;
@@ -136,6 +167,7 @@ export interface AttemptExecutor {
     target: ModelTarget;
     cwd: string;
     signal: AbortSignal;
+    durable?: DurableAttemptContext;
     onActivity?: (event: ActivityEvent) => void;
     /** Fired only after setModel / session open succeeds. Not a second lifecycle. */
     onActivated?: (appliedReasoning: string) => void;
@@ -157,6 +189,7 @@ async function runAttempt(
     target: ModelTarget;
     cwd: string;
     signal: AbortSignal;
+    durable?: DurableAttemptContext;
     onActivity?: (event: ActivityEvent) => void;
     onActivated?: (appliedReasoning: string) => void;
     bindActivityProbe?: (probe: (() => { name: string } | undefined) | undefined) => void;
@@ -233,6 +266,8 @@ export async function runAgentInstance(input: {
   onObserve?: (snapshot: AgentUiSnapshot) => void;
   /** Synchronous accept hook. Runs before watchdog setup and the first await. */
   onAccepted?: (instance: AgentInstance) => void;
+  /** Engine-owned context. Omitted for unchanged ad hoc execution. */
+  durable?: DurableAttemptContext;
 }): Promise<AgentRunResult> {
   const task = input.task.trim();
   if (task.length === 0) throw new PitakoConfigError("agent_run task must not be empty");
@@ -241,7 +276,13 @@ export async function runAgentInstance(input: {
     throw new PitakoConfigError(`AgentInstance workspace drift: expected ${input.executionRoot}, got ${workspace}`);
   }
   const loaded = loadPitakoConfig(input.load);
-  const role = resolveRoleFromConfig(loaded, input.roleId);
+  let role = resolveRoleFromConfig(loaded, input.roleId);
+  if (input.durable) {
+    role = {
+      ...role,
+      modelPolicy: { id: role.modelPolicyId, primary: input.durable.rolePolicy.primary, fallbacks: input.durable.rolePolicy.fallbacks },
+    };
+  }
   if (!role.modelPolicy.primary) {
     throw new PitakoConfigError(role.modelPolicy.diagnostic ?? `model policy "${role.modelPolicyId}" has no primary target`);
   }
@@ -353,7 +394,7 @@ export async function runAgentInstance(input: {
   };
   refresh();
   try {
-    return await agentScope.run({ instanceId: instance.id, roleId: role.id }, () =>
+    const result = await agentScope.run({ instanceId: instance.id, roleId: role.id }, () =>
       executeTargets(
         instance,
         role,
@@ -375,8 +416,11 @@ export async function runAgentInstance(input: {
         (at) => {
           terminalAt = at;
         },
+        input.durable,
       ),
     );
+    input.durable?.onOutcome?.(result);
+    return result;
   } finally {
     timer.stop();
     stopParent();
@@ -402,6 +446,7 @@ async function executeTargets(
   throughput: ThroughputState,
   work: WorkCounts,
   markTerminal: (at: number) => void,
+  durable?: DurableAttemptContext,
 ): Promise<AgentRunResult> {
   instance.status = "running";
   let session: AttemptSession | undefined;
@@ -445,6 +490,7 @@ async function executeTargets(
         onActivity,
         onActivated,
         bindActivityProbe,
+        durable,
       });
       bindActivityProbe(undefined);
       usage = mergeUsage(usage, attempt.usage);

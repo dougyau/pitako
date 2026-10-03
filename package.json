@@ -13,6 +13,7 @@
     "extensions",
     "skills",
     "prompts",
+    "scripts/mission-console.ts",
     "config",
     "roles",
     "fixtures",
@@ -25,6 +26,8 @@
   "scripts": {
     "test": "bun test",
     "test:code-intelligence-node": "node --test scripts/code-intelligence-node.mjs",
+    "test:mission-node": "node --test scripts/mission-durability-node.mjs",
+    "verify:mission": "bun scripts/verify-mission.ts",
     "smoke": "bun scripts/smoke.ts",
     "pi": "pi --no-extensions --approve -e .",
     "typecheck": "tsc --noEmit"
@@ -90,6 +93,7 @@
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.87.0",
+    "@juicesharp/rpiv-i18n": "2.11.0",
     "@types/bun": "1.3.14",
     "typescript": "5.9.3"
   }
