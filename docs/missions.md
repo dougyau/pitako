@@ -92,16 +92,17 @@ for consultation, protected groups, retention, capture gaps, and search limits.
 
 ## Engine verification versus effectiveness
 
-`bun run verify:mission -- T7 --evidence-dir <directory>` is the deterministic
-integration stage. Run T1–T7 individually into distinct evidence directories for
-the complete stage set. `bun run test:mission-node` runs the production-Node
-durability suite (not the stage verifier). The fixture uses real Node Pi SDK sessions and managed
+Use [GATES.md](../GATES.md) for routine verification and stage-specific wrapper
+selection. [scripts/verify-mission.ts](../scripts/verify-mission.ts) owns the
+reachable commands and coverage for each required stage. T7 is the deterministic
+integration stage, not proof of every T1–T6 obligation. Preserve any required
+stage-specific evidence in distinct directories. The fixture uses real Node Pi SDK sessions and managed
 tools but a local deterministic model transport: it exercises engine wiring,
 not model quality, paid-provider behavior or a live autonomous success rate.
 
 The workflow and brief-context change uses focused dispatch, local SDK,
-continuation, recovery, checker, and finalization regressions. Its final gates
-are `bun test` and `bun run typecheck`, followed by independent review, not a
+continuation, recovery, checker, and finalization regressions. Its routine final
+procedure is in [GATES.md](../GATES.md), followed by independent review, not a
 required T1–T7 stage-verifier sweep. Local-provider observations prove delivered
 context and the exercised authority boundaries, not better model decisions.
 An observed denied recovery write and unchanged candidate prove that path, not

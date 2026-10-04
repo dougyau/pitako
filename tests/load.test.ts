@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "bun:test";
@@ -34,6 +34,9 @@ function loadInFreshProcess(packagePath: string, configDir: string) {
     errors: unknown[];
     names: string[];
     paths: string[];
+    skills: { name: string; filePath: string; disableModelInvocation: boolean; body: string }[];
+    skillPrompt: string;
+    skillDiagnostics: { path: string }[];
   };
 }
 
@@ -95,6 +98,21 @@ function profileHarness(profileFlag?: string) {
 }
 
 describe("Pi package loading", () => {
+  test("discovers explicit-only gates from the edited package in a fresh loader", () => {
+    const root = packageRoot();
+    const loaded = loadInFreshProcess(root, mkdtempSync(path.join(tmpdir(), "pitako-gates-config-")));
+    expect(loaded.errors).toEqual([]);
+    const gates = loaded.skills.filter((skill) => skill.name === "gates");
+    expect(gates).toHaveLength(1);
+    const file = path.join(root, "skills/practical/gates/SKILL.md");
+    expect(gates[0]).toMatchObject({ filePath: file, disableModelInvocation: true });
+    expect(gates[0]!.body).toBe(readFileSync(file, "utf8"));
+    expect(gates[0]!.body).toContain("Write only `<selected-project-root>/GATES.md`");
+    expect(loaded.skillDiagnostics.filter((diagnostic) => diagnostic.path === file)).toEqual([]);
+    expect(loaded.skillPrompt).not.toContain("<name>gates</name>");
+    expect(loaded.skillPrompt).toContain("<name>verify-behavior</name>");
+  });
+
   test("discovers the required extensions from a relative package path", async () => {
     const root = packageRoot();
     const isolatedConfig = mkdtempSync(path.join(tmpdir(), "pitako-web-config-empty-"));
@@ -344,31 +362,124 @@ describe("Pi package loading", () => {
   });
 });
 
+function sourceHygieneOffenders(root: string): string[] {
+  root = realpathSync(root);
+  const git = (args: string[]) => {
+    const result = spawnSync("git", ["-C", root, "-c", "core.excludesFile=/dev/null", "-c", "core.fsmonitor=false", ...args], {
+      cwd: root,
+      env: { PATH: process.env.PATH, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" },
+    });
+    if (result.error || result.signal || result.status !== 0) {
+      throw new Error(`Source inventory Git failure: ${result.error ?? result.signal ?? result.status}; ${result.stderr}`);
+    }
+    return new TextDecoder("utf-8", { fatal: true }).decode(result.stdout);
+  };
+  if (git(["rev-parse", "--show-toplevel"]) !== `${root}\n`) throw new Error("Source inventory Git root mismatch");
+  const inventory = git(["ls-files", "--cached", "--others", "--exclude-standard", "-z"]);
+  if (inventory && !inventory.endsWith("\0")) throw new Error("Malformed source inventory");
+  const skip = new Set(["node_modules", ".git", ".codegraph", ".pitako", "bun.lock"]);
+  const rooted = (name: string) => `${path.sep}${name}${path.sep}`;
+  const isForbidden = (text: string) => text.includes(rooted("home")) || text.includes(rooted("Users")) || /sk-[A-Za-z0-9]{20,}/.test(text);
+  const offenders: string[] = [];
+  for (const name of new Set(inventory ? inventory.slice(0, -1).split("\0") : [])) {
+    const components = name.split("/");
+    if (path.isAbsolute(name) || components.some((part) => !part || part === "." || part === "..")) {
+      throw new Error("Malformed source inventory path");
+    }
+    if (components.some((part) => skip.has(part))) continue;
+    let file = root;
+    let current;
+    for (const component of components) {
+      file = path.join(file, component);
+      current = lstatSync(file, { throwIfNoEntry: false });
+      if (!current) break; // A deleted worktree path has no current bytes.
+      if (current.isSymbolicLink()) current = statSync(file); // Broken links must fail, not disappear.
+    }
+    if (!current || current.size > 1_000_000) continue;
+    if (isForbidden(readFileSync(file, "utf8"))) offenders.push(name);
+  }
+  return offenders;
+}
+
 describe("repository hygiene", () => {
   test("source does not embed absolute developer paths or credentials", () => {
-    const root = packageRoot();
-    const skip = new Set(["node_modules", ".git", ".codegraph", ".pitako", "bun.lock"]);
-    const offenders: string[] = [];
-    const rooted = (name: string) => `${path.sep}${name}${path.sep}`;
-    const isForbidden = (text: string) => text.includes(rooted("home")) || text.includes(rooted("Users")) || /sk-[A-Za-z0-9]{20,}/.test(text);
-    expect(isForbidden(`${path.sep}home${path.sep}developer${path.sep}source.ts`)).toBe(true);
-    const walk = (directory: string) => {
-      for (const name of readdirSync(directory)) {
-        const file = path.join(directory, name);
-        if (skip.has(name) || path.relative(root, file) === path.join(".pitako", "runs")) continue;
-        const stat = statSync(file);
-        if (stat.isDirectory()) {
-          walk(file);
-          continue;
-        }
-        if (stat.size > 1_000_000) continue;
-        const text = readFileSync(file, "utf8");
-        if (isForbidden(text)) {
-          offenders.push(path.relative(root, file));
-        }
-      }
+    expect(sourceHygieneOffenders(packageRoot())).toEqual([]);
+  });
+
+  test("Git source inventory includes ignored tracked and visible untracked current bytes", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "pitako-source-inventory-"));
+    const git = (...args: string[]) => {
+      const result = spawnSync("git", ["-C", root, ...args], {
+        encoding: "utf8",
+        env: { PATH: process.env.PATH, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" },
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.signal).toBeNull();
+      expect(result.status).toBe(0);
     };
-    walk(root);
-    expect(offenders).toEqual([]);
+    const put = (name: string, text: string) => {
+      mkdirSync(path.dirname(path.join(root, name)), { recursive: true });
+      writeFileSync(path.join(root, name), text);
+    };
+    const forbidden = [
+      ["", "home", "developer", "source.ts"].join(path.sep),
+      ["", "Users", "developer", "source.ts"].join(path.sep),
+      ["sk", "A".repeat(20)].join("-"),
+    ];
+    const tracked = "ignored-tracked.ts";
+    const visible = "not-published/visible\nwith\ttab.ts";
+    try {
+      git("init", "--quiet");
+      put(".gitignore", "ignored-*.ts\n");
+      put("package.json", JSON.stringify({ files: ["published"] }));
+      put(tracked, "safe indexed bytes");
+      put("deleted.ts", forbidden[0]!);
+      git("add", "-f", "--", tracked, "deleted.ts");
+      put(tracked, forbidden[0]!); // Scan the worktree, not the indexed blob.
+      rmSync(path.join(root, "deleted.ts"));
+      put(visible, forbidden[1]!);
+      put("credential.ts", forbidden[2]!);
+      put("ignored-generated.ts", forbidden.join("\n"));
+      for (const name of ["node_modules/source.ts", ".codegraph/source.ts", ".pitako/runs/source.ts", "nested/bun.lock", "nested/.git/source.ts"]) {
+        put(name, forbidden.join("\n"));
+      }
+      git("add", "-f", "--", "node_modules/source.ts", ".codegraph/source.ts", ".pitako/runs/source.ts", "nested/bun.lock");
+      put("oversized.ts", forbidden[0]! + " ".repeat(1_000_001));
+      const expected = [tracked, visible, "credential.ts"].sort();
+      expect(sourceHygieneOffenders(root).sort()).toEqual(expected);
+
+      // Exercise inherited redirection in a child, never mutate the parallel runner's environment.
+      put("ignored-global", `${visible}\ncredential.ts\n`);
+      put("ambient-config", `[core]\nexcludesFile = ${path.join(root, "ignored-global")}\n`);
+      const redirected = spawnSync(process.execPath, ["--eval", `
+        import { spawnSync } from "node:child_process";
+        import { lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
+        import path from "node:path";
+        const scan = ${sourceHygieneOffenders.toString()};
+        console.log(JSON.stringify(scan(process.env.HYGIENE_ROOT).sort()));
+      `], {
+        encoding: "utf8",
+        cwd: root,
+        env: { ...process.env, HYGIENE_ROOT: root, GIT_DIR: "/nonexistent", GIT_WORK_TREE: "/nonexistent", GIT_INDEX_FILE: "/nonexistent",
+          GIT_CONFIG_GLOBAL: path.join(root, "ambient-config"), GIT_CONFIG_SYSTEM: path.join(root, "ambient-config"),
+          GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "core.excludesFile", GIT_CONFIG_VALUE_0: path.join(root, "ignored-global") },
+      });
+      expect(redirected.error).toBeUndefined();
+      expect(redirected.signal).toBeNull();
+      expect(redirected.status).toBe(0);
+      expect(JSON.parse(redirected.stdout)).toEqual(expected);
+
+      symlinkSync("missing-target", path.join(root, "broken.ts"));
+      expect(() => sourceHygieneOffenders(root)).toThrow();
+      rmSync(path.join(root, "broken.ts"));
+      put("unreadable.ts/child", "safe");
+      git("add", "--", "unreadable.ts/child");
+      rmSync(path.join(root, "unreadable.ts"), { recursive: true });
+      put("unreadable.ts", "not a directory");
+      expect(() => sourceHygieneOffenders(root)).toThrow();
+      expect(() => sourceHygieneOffenders(tmpdir())).toThrow();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

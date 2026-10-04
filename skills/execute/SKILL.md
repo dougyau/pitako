@@ -25,6 +25,26 @@ Then inspect the repository and only the evidence for the current unit. Reconcil
 
 Paths come from `planFile`, `ledgerFile`, and `evidenceFile`. Do not construct them by string concatenation.
 
+## Prepare the captured checkout
+
+After validating the binding, reconcile `## Workers` and unresolved `Team Holds` before setup or other mutation. Use the handle-specific resume rules below: a running worker ends the turn; unknown or unreconciled ownership blocks setup. Unresolved holds block setup until their existing recovery requirements are met.
+
+Inspect `binding.executionRoot`'s optional `scripts/setup.sh` and relevant prerequisites, not the pinned plan-source worktree or installed Pitako package. Read the script before running it. If it is an external symlink, stop automatic preparation and apply the existing authority decision rules rather than executing another checkout's code. An unreadable script is a blocker, not a missing hook.
+
+When the workspace is quiescent, the script's effects fit existing authority, and compatible successful setup evidence is absent, run:
+
+```sh
+(cd "$executionRoot" && bash ./scripts/setup.sh </dev/null)
+```
+
+Here `executionRoot` is the captured binding field, not an environment variable that can redirect setup. Ordinary local dependency preparation needs no additional permission round. A script grants no authority for credentials, global installs, destructive resets, publication, settings changes, or other out-of-scope effects; use Level 1/2/3 decisions.
+
+Missing setup is supported: continue existing prerequisite discovery without creating a script or claiming preparation success. A failed or interrupted invocation leaves dependent work blocked; useful read-only diagnosis may continue. Inspect the actual result and record command, cwd, relevant input identity, runtime paths/versions, outcome, and limits through `evidenceFile` before delegating dependent work.
+
+Reuse successful evidence while the root, script, dependency declarations/lockfile, runtime, and installed dependencies remain compatible. Missing dependencies or relevant changes invalidate it. Diagnose and retry invalidated or failed preparation without an arbitrary retry budget. Do not add runtime hooks, a persistent setup cache, or readiness markers.
+
+Do not run setup during `$plan`, plan discovery, `/reload`, worker startup, or merely because of a wake. On resume, reconcile workers and holds first. A completion wake may prepare the quiescent workspace before dependent work when compatible evidence is absent. Include relevant setup outcomes and evidence references in the WorkBrief so workers do not repeat preparation by default. Setup success does not prove all gate-specific prerequisites.
+
 ## Decisions
 
 Do not build an authority framework. Apply these three levels.
@@ -88,6 +108,8 @@ Developer implementation uses Ponytail full. There is no separate Ponytail agent
 Use `verify-behavior` for check selection, stopping, and test quality within this unit's existing implementation and review passes. Inspect tests and their infrastructure, including removed guarantees, without adding a separate mandatory audit. Ponytail governs simplicity of implementation and verification, not an artifact quota. Follow the skill's Pitako clarification to reuse existing frameworks and fixtures instead of creating a prescribed self-check.
 
 Apply that policy within the plan's required gates. Use `verify-behavior` for diagnosis, affected regression, final gates, relevant environment prerequisites, wrapper coverage, and valid evidence reuse. A worker saying "done" is not proof. Compilation does not prove unobserved behavior. Mandatory gates and independent review remain required.
+
+Route project procedures through `verify-behavior`'s shared root `GATES.md` interpretation using `binding.executionRoot`. Reference the guide and relevant obligations in the WorkBrief, not its whole body. Cross-check consequential claims and use existing discovery for uncovered obligations; frozen requirements remain controlling.
 
 If verification fails, reproduce, find the root cause, make the smallest correction, and verify again. First failure stays with the same Developer. Do not ask the user, call Architect, or switch to a stronger model because one check failed.
 

@@ -21,6 +21,22 @@ Modes are natural-language requests, not a new tool or API. For example:
 - `review-diff`: read only. Inspect the complete agreed diff, including product code, tests, helpers, fixtures, scripts, dependencies, and relevant configuration. For a branch, include commits since the agreed base, staged and unstaged changes, and relevant new files. For a local diff, say so. Reuse the base and scope supplied by `pre-pr` or `execute`. Do not assume `main`, fetch, or invent an ambiguous base. Consult unchanged code as context, not as cleanup scope. Inspect removed guarantees as well as added complexity.
 - `simplify-tests`: analyze existing tests in the agreed paths, even without a diff. Recommend by default. Edit only with explicit authorization and an editing role. Reviewer and Researcher remain read-only. For a large tree, work by behavior or module in verifiable units. Report out-of-scope issues without cleaning them.
 
+## Read the project's verification guide
+
+Read one root `GATES.md` for the active project. Use existing workspace resolution through `workflowWorkspace` in `extensions/workflow.ts`, which selects the Git worktree root or canonical cwd outside Git:
+
+- `$execute` uses `binding.executionRoot` captured by `openExecutionPlan`, not the pinned plan source.
+- `$plan` uses the project being planned. Read guidance only; do not run setup or checks.
+- Standalone verification and `$pre-pr` use the current canonical project/worktree root.
+
+Read `<active-project-root>/GATES.md`, never the installed Pitako package, plan-source checkout, or substitute ancestors. A mixed repository uses one root guide that may name component-specific command working directories.
+
+Treat the guide as ordinary Markdown. Require no fixed headings, frontmatter, schema, parser, timestamp, generated stamp, or cache. Generic verification does not require `package.json` or any particular stack or runner. Use the guide's relevant prerequisites, focused and complete procedures, exact commands and cwd, order, supported concurrency, wrapper coverage, expected observations, and failure or skip interpretation.
+
+Cross-check consequential claims against manifests, CI, wrappers, or test sources before relying on them. Missing, stale, or incomplete guidance falls back to existing discovery for the uncovered obligation. Do not automatically create or maintain the guide. A guide cannot waive a frozen gate, authorize product changes, replace independent review, or turn a skipped or unrun check into a pass.
+
+The frozen plan and user authority control a genuine conflict. Apply existing execution decision rules rather than silently replacing the requirement. Fresh focused diagnostics remain allowed. Preserve phase- and binding-compatible evidence reuse below. Reference the root guide and relevant obligations in a WorkBrief rather than copying the whole guide into every brief.
+
 ## Select and observe evidence
 
 1. Name the input or action, observable result, and affected guarantees that must remain true. Derive expectations from the contract or requirement, not from a copy of the implementation.

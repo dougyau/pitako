@@ -19,7 +19,7 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-test("pinned ast-grep NAPI parses, finds nodes, reports ranges, and parses multiple files", async () => {
+test.serial("pinned ast-grep NAPI parses, finds nodes, reports ranges, and parses multiple files", async () => {
   const tree = parse(Lang.TypeScript, "const alpha = 1;\nfunction beta() { return alpha; }\n");
   const root = tree.root();
   const first = root.find(kind(Lang.TypeScript, "function_declaration"));
@@ -64,7 +64,7 @@ test("language, physical workspace path, and response budgets fail closed", () =
   expect(QUERY_BUDGETS).toEqual({ responseBytes: 12288, candidates: 8, relations: 8, sourceLines: 120 });
 });
 
-test("Pi grep and installed LSP tool definitions are directly callable contracts", async () => {
+test.serial("Pi grep and installed LSP tool definitions are directly callable contracts", async () => {
   const dir = tempDir();
   mkdirSync(dir, { recursive: true });
   writeFileSync(path.join(dir, "sample.ts"), "const needle = 42;\nconsole.log(needle);\n");

@@ -128,8 +128,8 @@ export interface MissionFixture {
   receiptId: string;
 }
 
-export function createMissionFixture(prefix = "pitako-mission-"): MissionFixture {
-  const base = mkdtempSync(path.join(tmpdir(), prefix));
+export function createMissionFixture(prefix = "pitako-mission-", parentDirectory = tmpdir()): MissionFixture {
+  const base = mkdtempSync(path.join(parentDirectory, prefix));
   const root = path.join(base, "repo");
   const planDirectory = path.join(root, ".pitako", "plans");
   mkdirSync(planDirectory, { recursive: true });

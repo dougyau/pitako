@@ -67,8 +67,9 @@ ACP loads before Hermes, and the official Codex entry loads before Pitako policy
 | Config, API, or validation work | `principle-boundary-discipline` |
 | Large exploration | `principle-guard-the-context-window` |
 | Same correction keeps appearing | `principle-encode-lessons-in-structure` |
-| Explicitly authorized task to create a verification procedure | `create-verification-skill` |
-| Explicitly authorized task to maintain or audit a verification procedure | `maintain-verification-skill` |
+| Explicit request to create or bounded-update root `GATES.md` | `/skill:gates` only |
+| Explicitly authorized task to create an app-driving verification skill and feature map | `create-verification-skill` |
+| Explicitly authorized task to maintain or audit an app-driving verification skill and feature map | `maintain-verification-skill` |
 | Docs, README, PR prose | `technical-writing`, then `unslop` |
 | Hard finished work, what to keep | `reflect` |
 | Decision-complete plan, then stop | `plan` |
@@ -76,6 +77,8 @@ ACP loads before Hermes, and the official Codex entry loads before Pitako policy
 | Prepare a local diff for publication without `$execute` | `pre-pr` |
 
 Do not load every skill. Do not load `caveman` at full or ultra unless the user asks. Do not load Ponytail and Caveman full bodies together.
+
+Ordinary verification uses `verify-behavior`; it does not invoke `gates` maintenance. `/skill:gates` writes only the selected project's root guide within the user's requested scope. The app-driving skills are not alternative project-wide gate recipes.
 
 Ponytail governs simplicity of implementation and verification. `verify-behavior` governs evidence validity and sufficiency, including optional TDD. Its Pitako clarification permits existing frameworks and fixtures instead of Ponytail's prescribed self-check artifact. Neither skill waives validation, security, accessibility, or required error handling. Caveman lite governs noise, not architecture.
 

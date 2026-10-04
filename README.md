@@ -276,7 +276,7 @@ Pitako does not implement subteams. Ad-hoc Team assignments let independent role
 
 - Node.js 22.19 or newer (same floor as current Pi).
 - [Pi coding agent](https://github.com/earendil-works/pi) `@earendil-works/pi-coding-agent` 0.87 or newer.
-- Bun 1.3 if you are developing this repository. People who only install a published package do not need Bun.
+- The Bun version declared in `package.json` (`bun@1.3.14`) for checkout preparation. People who only install a published package do not need Bun.
 - An installed language server for LSP. It can be resolved from `PATH`, a project-local `node_modules/.bin`, or an explicit command path. TypeScript defaults to `typescript-language-server`; `/lsp install <id>` offers explicit installation for supported servers.
 - CodeGraph CLI. This package depends on `@colbymchenry/codegraph` and will use `node_modules/.bin/codegraph` when `codegraph` is not already on `PATH`.
 
@@ -287,18 +287,20 @@ Pitako does not set a provider or model. Use whatever you configured in Pi.
 From a checkout, install dependencies first. A local path install does not run `npm install` for you.
 
 ```bash
-bun install
+bash ./scripts/setup.sh
 pi install .
 ```
 
-If Bun fails with `node-gyp: command not found` while installing Hermes's `better-sqlite3` dependency, make `node-gyp` available on `PATH` and retry. `--ignore-scripts` skips native installation; it does not prove that the installed binary works.
+`scripts/setup.sh` selects its checkout from the script directory, independently of caller cwd. It checks declared runtimes, installs with `bun install --frozen-lockfile`, and uses actual Node to resolve Hermes's native SQLite dependency and construct/query/close both SQLite implementations. It does not run gates, install global tools, initialize CodeGraph, or write Pi settings. You can also invoke it directly by absolute path.
+
+If installation or native loading fails, preserve the original error and resolve the reported host prerequisite before retrying. A working prebuilt needs no `node-gyp`; compilation may need a local toolchain. `--ignore-scripts` does not prove that the installed binary works. Setup success does not supply language servers or every gate-specific facility.
 
 `pi install .` writes the package into Pi settings. Add `-l` to install it for the current project instead of your user settings.
 
 Try it once without saving settings:
 
 ```bash
-bun install
+bash ./scripts/setup.sh
 pi --no-extensions --approve -e .
 ```
 
@@ -314,14 +316,20 @@ Open a project with source files and a language server for LSP. Dense graph quer
 
 ## Development
 
-```bash
-bun install
-bun test
-bun run smoke
-bun run typecheck
+Prepare the checkout with `bash ./scripts/setup.sh`. Use [GATES.md](GATES.md) for prerequisites, focused checks, and the complete routine procedure. It covers file parallelism, isolated todo tests, separate Node suites, and stage-wrapper evidence.
+
+`verify-behavior` reads the active project's root `GATES.md`, not the installed Pitako package's guide. Planning reads it without running checks. Missing or stale guidance falls back to existing discovery for uncovered obligations; frozen requirements and independent review remain controlling. Routine verification does not automatically author the guide.
+
+To create or update the guide explicitly, use Pi's native skill command with a natural-language scope:
+
+```text
+/skill:gates create GATES.md for the current project
+/skill:gates update only the API test commands in this worktree's GATES.md
 ```
 
-`bun test` includes the smoke test. `bun run smoke` is the same check, printed on the console.
+The shipped `gates` skill is explicit-only through `disable-model-invocation: true`. Pi discovers it recursively under the package's `skills/practical` directory. It inspects executable sources and writes only the selected root `GATES.md`, preserving accurate unrelated content and labeling unresolved prerequisites. Source-confirmed commands are not claims of observed execution. Authoring does not authorize setup, installs, broad runs, product fixes, new test infrastructure, settings changes, or feature maps.
+
+`create-verification-skill` and `maintain-verification-skill` retain their app-driving verification and feature-map tasks. They are not alternative project gate recipes, and ordinary role skills do not include `gates`. If Pi currently loads a different package checkout, activate the edited package and reload or start a fresh quiescent session before claiming its policy is in use.
 
 ## Profiles
 
@@ -478,7 +486,7 @@ Team assignment and model policy code already live under `extensions/agent/`, `e
 ## Smoke test
 
 ```bash
-bun install
+bash ./scripts/setup.sh
 bun run smoke
 ```
 
@@ -498,7 +506,7 @@ The script copies `fixtures/tiny-ts` to a temp directory, runs `codegraph init`,
 - Language servers are not installed automatically.
 - `pi-lsp-client` is consumed from git because it is not on npm. The commit is pinned.
 - Web search depends on network access and provider availability. Board scope is global only. Agent fallback does not rerun a task after side effects.
-- Local `pi install .` requires `bun install` (or `npm install`) in this directory first, so `node_modules` exists.
+- Local `pi install .` requires checkout preparation first; use `bash ./scripts/setup.sh`. Missing optional setup in another project is not preparation success.
 
 ## Roadmap
 
