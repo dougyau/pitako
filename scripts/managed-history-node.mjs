@@ -12,6 +12,7 @@ import { createMissionFixture, missionDefinition, missionInput, openFixtureStore
 import { installMissionLocalProvider } from "../tests/mission-local-provider.ts";
 import { pruneWorkerHistory } from "../extensions/agent/history-retention.ts";
 import { queryHistory } from "../extensions/agent/history-query.ts";
+import { openHistoryChild } from "../tests/fixtures/history-fixture-ownership.ts";
 
 const hash = (file) => createHash("sha256").update(readFileSync(file)).digest("hex");
 if (process.argv[2] === "read") {
@@ -23,48 +24,74 @@ if (process.argv[2] === "read") {
   assert.deepEqual(history.list(), before);
   console.log(JSON.stringify(projections));
 } else if (process.argv.includes("--reuse-fallback")) {
-  const sample = createMissionFixture("pitako-managed-reuse-");
-  const agentDir = path.join(sample.base, "agent");
-  process.env.PI_CODING_AGENT_DIR = agentDir;
-  const config = path.join(agentDir, "pitako/config.toml");
-  mkdirSync(path.dirname(config), { recursive: true });
-  writeFileSync(config, "");
-  mkdirSync(path.join(sample.root, "src"));
-  writeFileSync(path.join(sample.root, "src", "target.txt"), "source\n");
-  const provider = await installMissionLocalProvider({ agentDir, errorForRequest: () => "429 rate limit exceeded" });
-  const definition = missionDefinition();
-  definition.units[0].retryLimit = 0;
-  definition.units[0].kind = "check";
-  definition.authority.allowedPaths = ["src/**"];
-  definition.budget = { roleLaunches: 4, providerRequests: 4, tokens: 10000, activeTimeMs: 600000, artifactBytes: 2500000 };
-  definition.authority.rolePolicies.developer = {
-    hash: "a".repeat(64), provider: provider.provider, model: provider.model, fallbacks: ["cursor/composer"],
+  const argument = process.argv.indexOf("--reuse-fallback");
+  const owned = openHistoryChild(process.argv[argument + 1], process.argv[argument + 2]);
+  const errors = [];
+  const record = (phase) => {
+    owned.receipt.phase = phase;
+    try { owned.record(); } catch (error) {
+      errors.push(error);
+      owned.receipt.errors.push(`receipt: ${String(error)}`);
+    }
   };
-  writeFileSync(sample.definitionFile, JSON.stringify(definition));
-  const store = await openFixtureStore(sample);
-  const sdk = createPiExecutor();
-  const history = new WorkerHistory(agentDir);
-  const starts = [];
-  const executor = { ...sdk, async start(input) {
-    const before = history.list()[0]?.members[0]?.native;
-    const result = await sdk.start(input);
-    starts.push({ attemptId: input.durable.attemptId, target: input.target.model,
-      hasEffects: Boolean(input.durable.effects), before, after: history.list()[0].members[0].native,
-      status: result.status, error: result.error, result: result.result, failureKind: result.failureKind,
-      sideEffects: result.sideEffects, hasSession: Boolean(result.session) });
-    return result;
-  } };
-  const mission = store.createMission(missionInput(sample));
-  const runner = createPiMissionRunner({ cwd: sample.root, executor,
-    load: { env: { PI_CODING_AGENT_DIR: agentDir }, userConfigPath: config } });
-  let runnerResult;
-  const engine = new MissionEngine({
-    store, missionId: mission.id, sessionsDirectory: path.join(sample.base, "sessions"),
-    managedWorkspace: { sourceRoot: sample.root, candidateParent: path.join(sample.base, "candidates") },
-    runRole: async (...args) => { runnerResult = await runner(...args); return runnerResult; },
-    assessPredicate: async () => ({ verdict: "fail", method: "fallback fixture does not accept" }),
-  });
+  let store;
+  let engine;
   try {
+    record("fixture-acquisition");
+    const sample = createMissionFixture("pitako-managed-reuse-", process.argv[argument + 1]);
+    owned.receipt.fixtureBase = sample.base;
+    owned.receipt.resources = { repository: sample.root, agent: path.join(sample.base, "agent"),
+      database: sample.dbPath, objects: sample.objectDir, sessions: path.join(sample.base, "sessions"),
+      candidates: path.join(sample.base, "candidates") };
+    record("fixture-acquired");
+    const agentDir = path.join(sample.base, "agent");
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    const config = path.join(agentDir, "pitako/config.toml");
+    mkdirSync(path.dirname(config), { recursive: true });
+    writeFileSync(config, "");
+    mkdirSync(path.join(sample.root, "src"));
+    writeFileSync(path.join(sample.root, "src", "target.txt"), "source\n");
+    record("provider-acquisition");
+    const provider = await installMissionLocalProvider({ agentDir, errorForRequest: () => "429 rate limit exceeded" });
+    const definition = missionDefinition();
+    definition.units[0].retryLimit = 0;
+    definition.units[0].kind = "check";
+    definition.authority.allowedPaths = ["src/**"];
+    definition.budget = { roleLaunches: 4, providerRequests: 4, tokens: 10000, activeTimeMs: 600000, artifactBytes: 2500000 };
+    definition.authority.rolePolicies.developer = {
+      hash: "a".repeat(64), provider: provider.provider, model: provider.model, fallbacks: ["cursor/composer"],
+    };
+    writeFileSync(sample.definitionFile, JSON.stringify(definition));
+    record("store-acquisition");
+    store = await openFixtureStore(sample);
+    owned.receipt.storeClose = "pending";
+    record("store-acquired");
+    const sdk = createPiExecutor();
+    const history = new WorkerHistory(agentDir);
+    const starts = [];
+    const executor = { ...sdk, async start(input) {
+      record(`sdk-start:${starts.length}`);
+      const before = history.list()[0]?.members[0]?.native;
+      const result = await sdk.start(input);
+      starts.push({ attemptId: input.durable.attemptId, target: input.target.model,
+        hasEffects: Boolean(input.durable.effects), before, after: history.list()[0].members[0].native,
+        status: result.status, error: result.error, result: result.result, failureKind: result.failureKind,
+        sideEffects: result.sideEffects, hasSession: Boolean(result.session) });
+      return result;
+    } };
+    const mission = store.createMission(missionInput(sample));
+    const runner = createPiMissionRunner({ cwd: sample.root, executor,
+      load: { env: { PI_CODING_AGENT_DIR: agentDir }, userConfigPath: config } });
+    let runnerResult;
+    record("engine-acquisition");
+    engine = new MissionEngine({
+      store, missionId: mission.id, sessionsDirectory: path.join(sample.base, "sessions"),
+      managedWorkspace: { sourceRoot: sample.root, candidateParent: path.join(sample.base, "candidates") },
+      runRole: async (...args) => { runnerResult = await runner(...args); return runnerResult; },
+      assessPredicate: async () => ({ verdict: "fail", method: "fallback fixture does not accept" }),
+    });
+    owned.receipt.engineClose = "pending";
+    record("engine-start");
     engine.start();
     await engine.waitForIdle();
     assert.equal(starts.length, 2);
@@ -103,11 +130,36 @@ if (process.argv[2] === "read") {
     console.log(JSON.stringify({ starts, receipt: receipt.payload, reasons: projection.reasons, localRequests: provider.trace.length }));
     assert.deepEqual(second.after, second.before, "no-association start preserves canonical allocation and exact disposal timestamp");
     assert(!projection.reasons.includes(`SDK disposal not confirmed: ${first.attemptId}`));
+    owned.receipt.assertions = "ok";
+    record("assertions-complete");
+  } catch (error) {
+    errors.push(error);
+    owned.receipt.assertions = "failed";
+    owned.receipt.errors.push(`primary: ${String(error)}`);
   } finally {
-    await engine.close();
-    store.close();
-    rmSync(sample.base, { recursive: true, force: true });
+    if (engine) {
+      record("engine-close");
+      try { await engine.close(); owned.receipt.engineClose = "ok"; }
+      catch (error) {
+        errors.push(error);
+        owned.receipt.engineClose = "failed";
+        owned.receipt.errors.push(`engine.close: ${String(error)}`);
+      }
+    }
+    // Do not race a pending engine.close; a rejection still permits independent store cleanup.
+    if (store) {
+      record("store-close");
+      try { store.close(); owned.receipt.storeClose = "ok"; }
+      catch (error) {
+        errors.push(error);
+        owned.receipt.storeClose = "failed";
+        owned.receipt.errors.push(`store.close: ${String(error)}`);
+      }
+    }
+    record("complete");
+    // The parent alone deletes the fixture, after native result and receipt validation.
   }
+  if (errors.length) throw new AggregateError(errors, "History fixture primary/cleanup failure");
 } else {
   const data = mkdtempSync(path.join(tmpdir(), "pitako-managed-history-data-"));
   const sample = createMissionFixture("pitako-managed-history-node-");

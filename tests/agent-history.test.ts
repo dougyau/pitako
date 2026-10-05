@@ -1,11 +1,138 @@
-import { afterEach, expect, test } from "bun:test";
-import { spawnSync } from "node:child_process";
-import { existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { spawnSync, type SpawnSyncReturns } from "node:child_process";
+import * as fs from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { InvocationHistory, WorkerHistory, nativeHistoryStatus } from "../extensions/agent/history.ts";
+import { acquireHistoryFixture, finishHistoryFixture, requireReleasedHistoryFixture,
+  type HistoryChildReceipt, type HistoryFixtureOwner, type HistoryNativeOutcome } from "./fixtures/history-fixture-ownership.ts";
+
+let historyOwner: HistoryFixtureOwner | undefined;
+beforeEach(() => requireReleasedHistoryFixture(historyOwner));
+
+test("history ownership finalizer retains uncertainty and guards teardown/next-case admission", () => {
+  const stopped = new Error("test stop sink");
+  const stops: number[] = [];
+  const stop = (code: number): never => { stops.push(code); throw stopped; };
+  const setup = () => {
+    const owner = acquireHistoryFixture(() => {});
+    const child: HistoryChildReceipt = { attemptId: owner.attemptId, rootIdentity: owner.identity!,
+      child: { ...owner.parent!, pid: 12345, ppid: process.pid }, phase: "complete",
+      resources: {}, assertions: "ok", engineClose: "ok", storeClose: "ok", errors: [] };
+    const result: SpawnSyncReturns<string> = { pid: 12345, status: 0, signal: null,
+      stdout: '{"misleading":"success"}', stderr: "", output: [null, '{"misleading":"success"}', ""] };
+    return { owner, child, result };
+  };
+  const cases: Array<{ name: string; change: (sample: ReturnType<typeof setup>) => void; missing?: boolean }> = [
+    { name: "native error despite exit zero", change: ({ result }) => { result.error = new Error("native ETIMEDOUT"); } },
+    { name: "native signal despite exit zero", change: ({ result }) => { result.signal = "SIGKILL"; } },
+    { name: "nonzero status", change: ({ result }) => { result.status = 1; } },
+    { name: "missing status", change: ({ result }) => { result.status = null; } },
+    { name: "missing early ready", change: () => {}, missing: true },
+    { name: "pending lifecycle", change: ({ child }) => { child.phase = "sdk-start:0"; } },
+    { name: "pending assertions", change: ({ child }) => { child.assertions = "pending"; } },
+    { name: "failed assertions", change: ({ child }) => { child.assertions = "failed"; } },
+    { name: "pending engine cleanup", change: ({ child }) => { child.engineClose = "pending"; } },
+    { name: "failed engine cleanup", change: ({ child }) => { child.engineClose = "failed"; } },
+    { name: "pending store cleanup", change: ({ child }) => { child.storeClose = "pending"; } },
+    { name: "failed store cleanup", change: ({ child }) => { child.storeClose = "failed"; } },
+    { name: "child errors", change: ({ child }) => { child.errors.push("primary and cleanup errors"); } },
+    { name: "attempt mismatch", change: ({ child }) => { child.attemptId = "other"; } },
+    { name: "child root mismatch", change: ({ child }) => { child.rootIdentity = { device: "0", inode: "0" }; } },
+    { name: "child PID mismatch", change: ({ child }) => { child.child.pid++; } },
+    { name: "child parent mismatch", change: ({ child }) => { child.child.ppid++; } },
+    { name: "child boot mismatch", change: ({ child }) => { child.child.bootId = "other"; } },
+    { name: "missing birth identity", change: ({ child }) => { child.child.startTicks = ""; } },
+  ];
+  for (const scenario of cases) {
+    const sample = setup();
+    try {
+      scenario.change(sample);
+      if (!scenario.missing) writeFileSync(path.join(sample.owner.root, "child.json"), JSON.stringify(sample.child));
+      expect(() => finishHistoryFixture(sample.owner, { kind: "returned", result: sample.result },
+        () => {}, stop), scenario.name).toThrow(stopped);
+      expect(sample.owner.state, scenario.name).toBe("owned");
+      expect(existsSync(sample.owner.root), scenario.name).toBe(true);
+      expect(sample.owner.errors.length, scenario.name).toBeGreaterThan(0);
+      expect(JSON.parse(readFileSync(path.join(sample.owner.root, "parent.json"), "utf8")).native.stdout)
+        .toBe(sample.result.stdout);
+      let deleted = false;
+      let nextCase = false;
+      expect(() => { requireReleasedHistoryFixture(sample.owner, stop); deleted = true; }).toThrow(stopped);
+      expect(() => { requireReleasedHistoryFixture(sample.owner, stop); nextCase = true; }).toThrow(stopped);
+      expect([deleted, nextCase]).toEqual([false, false]);
+    } finally { rmSync(sample.owner.root, { recursive: true }); }
+  }
+  for (const failure of ["threw", "assertion", "combined-causes", "interrupted", "truncated", "root-replaced", "removal", "receipt-output"] as const) {
+    const { owner, child, result } = setup();
+    const originalRoot = `${owner.root}-original`;
+    const output = failure === "receipt-output"
+      ? spyOn(fs, "writeSync").mockImplementation(() => { throw new Error("receipt output cause"); }) : undefined;
+    try {
+      if (failure === "combined-causes") {
+        result.error = new Error("original native cause");
+        child.engineClose = "failed"; child.storeClose = "failed";
+        child.errors = ["primary child cause", "engine cleanup cause", "store cleanup cause"];
+      }
+      writeFileSync(path.join(owner.root, "child.json"), JSON.stringify(child));
+      if (failure === "truncated") writeFileSync(path.join(owner.root, "child.json"), "{");
+      if (failure === "root-replaced") {
+        renameSync(owner.root, originalRoot);
+        mkdirSync(owner.root);
+        writeFileSync(path.join(owner.root, "child.json"), JSON.stringify(child));
+      }
+      if (failure === "removal") {
+        // Allow receipt renames but forbid recursive removal of an acquired resource.
+        const locked = path.join(owner.root, "locked");
+        mkdirSync(locked); writeFileSync(path.join(locked, "resource"), "retained");
+        chmodSync(locked, 0o500);
+      }
+      const outcome: HistoryNativeOutcome = failure === "threw"
+        ? { kind: "threw", error: new Error("original native cause") } : { kind: "returned", result };
+      expect(() => {
+        if (failure === "interrupted") requireReleasedHistoryFixture(owner, stop);
+        else finishHistoryFixture(owner, outcome, () => {
+          if (failure === "assertion" || failure === "combined-causes") throw new Error("original assertion cause");
+        }, stop);
+      }, failure).toThrow(stopped);
+      expect(owner.state, failure).toBe("owned");
+      expect(existsSync(owner.root), failure).toBe(true);
+      if (failure === "threw" || failure === "assertion")
+        expect(owner.errors.join("\n")).toContain(`original ${failure === "threw" ? "native" : "assertion"} cause`);
+      if (failure === "interrupted") expect(owner.native).toEqual({ kind: "pending" });
+      if (failure === "combined-causes") {
+        expect(owner.errors.join("\n")).toContain("original native cause");
+        expect(owner.errors.join("\n")).toContain("original assertion cause");
+        expect(owner.child?.errors).toEqual(child.errors);
+      }
+      if (failure === "removal") {
+        expect(owner.errors.join("\n")).toContain("EACCES");
+        expect(JSON.parse(readFileSync(path.join(owner.root, "child.json"), "utf8"))).toEqual(child);
+        expect(existsSync(path.join(owner.root, "locked", "resource"))).toBe(true);
+      }
+      if (failure === "receipt-output") expect(owner.errors.join("\n")).toContain("receipt output cause");
+      expect(() => requireReleasedHistoryFixture(owner, stop)).toThrow(stopped);
+    } finally {
+      output?.mockRestore();
+      const locked = path.join(owner.root, "locked");
+      if (existsSync(locked)) chmodSync(locked, 0o700);
+      rmSync(owner.root, { recursive: true });
+      if (existsSync(originalRoot)) rmSync(originalRoot, { recursive: true });
+    }
+  }
+  const { owner, child, result } = setup();
+  writeFileSync(path.join(owner.root, "child.json"), JSON.stringify(child));
+  let asserted = false;
+  finishHistoryFixture(owner, { kind: "returned", result }, () => { asserted = true; }, stop);
+  expect(asserted).toBe(true);
+  expect(owner.state).toBe("released");
+  expect(existsSync(owner.root)).toBe(false);
+  requireReleasedHistoryFixture(owner, stop);
+  expect(stops.every((code) => code === 1)).toBe(true);
+});
 
 test("public Node setup rejection records the original error before and after persisted discovery intent", () => {
   const child = spawnSync("node", ["--experimental-transform-types", "--import", "./scripts/sdk-node-loader.mjs",
@@ -18,14 +145,23 @@ test("public Node setup rejection records the original error before and after pe
 });
 
 test("managed no-side-effect fallback preserves actual SDK disposal on a fresh no-association start", () => {
-  const child = spawnSync("node", ["--experimental-transform-types", "--import", "./scripts/sdk-node-loader.mjs",
-    "scripts/managed-history-node.mjs", "--reuse-fallback"],
-  { cwd: path.resolve(import.meta.dir, ".."), encoding: "utf8", timeout: 30000, env: { ...process.env, PI_OFFLINE: "1" } });
-  expect(child.status, child.stderr + child.stdout).toBe(0);
-});
+  const owner = acquireHistoryFixture((acquired) => { historyOwner = acquired; });
+  let outcome: HistoryNativeOutcome;
+  try {
+    outcome = { kind: "returned", result: spawnSync(owner.command.executable, owner.command.arguments,
+      { cwd: path.resolve(import.meta.dir, ".."), encoding: "utf8", timeout: 30000, killSignal: "SIGKILL",
+        env: { ...process.env, PI_OFFLINE: "1", TMPDIR: owner.temporaryDirectory } }) };
+  } catch (error) { outcome = { kind: "threw", error }; }
+  finishHistoryFixture(owner, outcome, (child) => {
+    expect(child.status, child.stderr + child.stdout).toBe(0);
+  });
+}, 35000);
 
 const roots: string[] = [];
-afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+afterEach(() => {
+  requireReleasedHistoryFixture(historyOwner);
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
 function fixture() {
   const root = mkdtempSync(path.join(tmpdir(), "pitako-history-"));
   roots.push(root);

@@ -96,6 +96,9 @@ describe("engineering-layer composition", () => {
     expect(router).toContain("`how`");
     expect(router).toContain("`blast-radius`");
     expect(router).toContain("`verify-behavior`");
+    expect(router).toContain("`/skill:gates` only");
+    expect(router).toContain("app-driving verification skill and feature map");
+    expect(router).toContain("does not invoke `gates` maintenance");
     expect(router).not.toContain("ACTIVE EVERY RESPONSE");
     expect(router).not.toContain("Respond terse like smart caveman");
     expect(router).not.toContain("subagent_type");

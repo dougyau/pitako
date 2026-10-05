@@ -41,7 +41,7 @@ Load these skills when they apply. Do not paste their bodies into the plan.
 
 - `investigate-first` for an unknown cause
 - `how` and `why` for current behavior and rationale
-- `verify-behavior` for proportional expected evidence, not permission to run product checks during planning
+- `verify-behavior` for shared root `GATES.md` discovery in the project being planned and proportional expected evidence. Read only; do not run setup or product checks during planning.
 - `technical-writing`, then `unslop`, for the plan file
 
 Use `principle-foundational-thinking`, `principle-model-the-domain`, `principle-boundary-discipline`, `principle-subtract-before-you-add`, `principle-minimize-reader-load`, `principle-guard-the-context-window`, and `principle-sequence-verifiable-units` when the decision needs them.

@@ -12,6 +12,7 @@ import {
   preflightContainment, processBirthTicks, processNamespaceId, processParentPid, processesInNamespace, readOwnedNamespaceInit, type MissionWorkspace,
 } from "../extensions/mission/workspace.ts";
 import { missionEffectProcessesQuiescent } from "../extensions/mission/reconcile.ts";
+import { workspaceCrashOwnership } from "./fixtures/workspace-crash-ownership.ts";
 
 test("owned init lifetime refuses live, unknown, malformed, mismatched and legacy identities", () => {
   const owner = currentProcessIdentity("lifetime-check", 1);
@@ -49,7 +50,11 @@ test("unproved namespace PID1 capture rejects before release", () => {
 });
 
 const fixtures: string[] = [];
-afterEach(() => { for (const fixture of fixtures.splice(0)) rmSync(fixture, { recursive: true, force: true }); });
+const crashOwnership = workspaceCrashOwnership(fixtures);
+afterEach(() => {
+  crashOwnership.requireReleased();
+  for (const fixture of fixtures.splice(0)) rmSync(fixture, { recursive: true, force: true });
+});
 
 function preserveCrashEvents(name: string, source: string): void {
   const directory = process.env.MISSION_T3_ARTIFACT_DIR;
@@ -387,11 +392,11 @@ describe("managed mission candidate containment", () => {
     expect(ownerProcessState(identity)).toBe("dead");
   });
 
-  test("process crashes at intent, invocation, registration and release boundaries leave no released write", async () => {
-    if (!canContain) return;
-    const node = execFileSync("/bin/sh", ["-c", "command -v node"], { encoding: "utf8" }).trim();
-    const script = path.resolve("tests/fixtures/mission-effect-crash-child.mjs");
-    for (const holdKind of ["effect.intent", "effect.invoking", "effect.process.registered", "effect.released"]) {
+  for (const holdKind of ["effect.intent", "effect.invoking", "effect.process.registered", "effect.released"]) {
+    test.serial(`process crash at ${holdKind} leaves no released write`, crashOwnership.ownedCase(holdKind, async () => {
+      if (!canContain) return;
+      const node = execFileSync("/bin/sh", ["-c", "command -v node"], { encoding: "utf8" }).trim();
+      const script = path.resolve("tests/fixtures/mission-effect-crash-child.mjs");
       const { sample, missionId, attemptId, storeRoot, candidateParent } = await crashFixture();
       const eventLog = path.join(sample.base, "effect-events.jsonl");
       const metadataFile = path.join(sample.base, "candidate.json");
@@ -403,40 +408,44 @@ describe("managed mission candidate containment", () => {
           T3_LOG: eventLog, T3_META: metadataFile, T3_CRASH_AFTER_KIND: holdKind,
         },
       });
-      const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
-        child.once("close", (code, signal) => resolve({ code, signal }));
-      });
+      const observed = crashOwnership.observeChild(child);
       const until = async (predicate: () => boolean) => {
         const deadline = Date.now() + 20_000;
         while (!predicate() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
         expect(predicate()).toBe(true);
       };
       let reopened: Awaited<ReturnType<typeof openFixtureStore>> | undefined;
-      try {
-        await until(() => existsSync(metadataFile) && existsSync(eventLog)
-          && readFileSync(eventLog, "utf8").trim().split("\n").filter(Boolean).some((line) => JSON.parse(line).kind === holdKind));
-        const { candidateRoot } = JSON.parse(readFileSync(metadataFile, "utf8")) as { candidateRoot: string };
+      crashOwnership.cleanup(async () => { await observed.settled; reopened?.close(); });
+      crashOwnership.cleanup(async () => {
+        await observed.settled;
+        if (!existsSync(eventLog)) return;
         const events = readFileSync(eventLog, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as {
           kind: string; payload: { identity?: { pidNamespace?: string } };
         });
         const namespace = events.find(({ kind }) => kind === "effect.process.registered")?.payload.identity?.pidNamespace;
-        preserveCrashEvents(`t3-${holdKind.replace(/[^a-z]+/g, "-")}.jsonl`, eventLog);
-        expect(events.map(({ kind }) => kind)).toContain(holdKind);
-        expect((await closed).signal).toBe("SIGKILL");
         if (namespace) await until(() => processesInNamespace(namespace).length === 0);
-        expect(existsSync(path.join(candidateRoot, "src", "started"))).toBe(false);
-        reopened = await openFixtureStore(sample);
-        const persisted = reopened.inspectMission(missionId).events.filter(({ kind }) => kind.startsWith("effect."));
-        expect(persisted.map(({ kind }) => kind)).toContain(holdKind);
-        if (holdKind === "effect.released") expect(persisted.map(({ kind }) => kind)).toContain("effect.released");
-        else expect(persisted.map(({ kind }) => kind)).not.toContain("effect.released");
-        expect(persisted.map(({ kind }) => kind)).not.toContain("effect.receipt");
-      } finally {
-        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-        reopened?.close();
-      }
-    }
-  });
+      });
+      await observed.spawned;
+      await until(() => existsSync(metadataFile) && existsSync(eventLog)
+        && readFileSync(eventLog, "utf8").trim().split("\n").filter(Boolean).some((line) => JSON.parse(line).kind === holdKind));
+      const { candidateRoot } = JSON.parse(readFileSync(metadataFile, "utf8")) as { candidateRoot: string };
+      const events = readFileSync(eventLog, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as {
+        kind: string; payload: { identity?: { pidNamespace?: string } };
+      });
+      const namespace = events.find(({ kind }) => kind === "effect.process.registered")?.payload.identity?.pidNamespace;
+      preserveCrashEvents(`t3-${holdKind.replace(/[^a-z]+/g, "-")}.jsonl`, eventLog);
+      expect(events.map(({ kind }) => kind)).toContain(holdKind);
+      expect((await observed.closed()).signal).toBe("SIGKILL");
+      if (namespace) await until(() => processesInNamespace(namespace).length === 0);
+      expect(existsSync(path.join(candidateRoot, "src", "started"))).toBe(false);
+      reopened = await openFixtureStore(sample);
+      const persisted = reopened.inspectMission(missionId).events.filter(({ kind }) => kind.startsWith("effect."));
+      expect(persisted.map(({ kind }) => kind)).toContain(holdKind);
+      if (holdKind === "effect.released") expect(persisted.map(({ kind }) => kind)).toContain("effect.released");
+      else expect(persisted.map(({ kind }) => kind)).not.toContain("effect.released");
+      expect(persisted.map(({ kind }) => kind)).not.toContain("effect.receipt");
+    }));
+  }
 
   test("process crash before receipt commit retains completed candidate bytes as an unresolved effect", async () => {
     if (!canContain) return;

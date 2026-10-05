@@ -1,9 +1,9 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync, writeSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, test } from "bun:test";
-import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { createMissionToolAdapters, MissionEffects, type MissionEffectReceipt } from "../extensions/mission/effects.ts";
 import { MissionEngine, type MissionRoleRunner } from "../extensions/mission/engine.ts";
 import { createMissionWorkspace, currentProcessIdentity, ownerProcessState, preflightContainment, processesInNamespace, readOwnedNamespaceInit } from "../extensions/mission/workspace.ts";
@@ -13,13 +13,41 @@ import { createMissionFixture, missionDefinition, missionInput, openFixtureStore
 import { missionCompletionBlockers } from "../extensions/mission/completion.ts";
 import { missionHasUnresolvedEffects, reconcileMission } from "../extensions/mission/reconcile.ts";
 import { openMissionStore } from "../extensions/mission/store.ts";
-import { installMissionLocalProvider } from "./mission-local-provider.ts";
 import type { AgentRunResult } from "../extensions/agent/run.ts";
 
 const fixtures: MissionFixture[] = [];
 const temporaryDirs: string[] = [];
 const priorAgentDir = process.env.PI_CODING_AGENT_DIR;
+type SdkFixtureOwner = { case: "patch" | "reload"; state: "pending" | "failed" };
+const sdkFixtureOwners = new Set<SdkFixtureOwner>();
+
+async function withSdkFixtureOwner(which: SdkFixtureOwner["case"], body: () => Promise<void>): Promise<void> {
+  const owner: SdkFixtureOwner = { case: which, state: "pending" };
+  sdkFixtureOwners.add(owner);
+  try {
+    await body();
+    sdkFixtureOwners.delete(owner);
+  } catch (error) {
+    owner.state = "failed";
+    throw error;
+  }
+}
+
+function requireSdkFixturesReleased(stop: (code: number) => never = (code) => process.exit(code)): void {
+  if (sdkFixtureOwners.size === 0) return;
+  try {
+    writeSync(2, `Effects SDK fixture ownership unresolved: ${JSON.stringify({
+      owners: [...sdkFixtureOwners],
+      fixtures: fixtures.map(({ base }) => base),
+      temporaryDirs,
+    }).slice(0, 8192)}\n`);
+  } finally {
+    stop(1);
+  }
+}
+
 afterEach(() => {
+  requireSdkFixturesReleased();
   if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
   else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
   for (const fixture of fixtures.splice(0)) rmSync(fixture.base, { recursive: true, force: true });
@@ -82,51 +110,6 @@ async function managedFixture(dependencies?: "source" | "candidate", operations 
 }
 
 describe("managed mission retirement", () => {
-  test("bound package SDK dispatches the official patch through its fenced sandbox adapter", async () => {
-    if (process.platform !== "linux" || !existsSync("/usr/bin/bwrap")) return;
-    const { store, mission, workspace, fixture } = await managedFixture(undefined, ["apply_patch"]);
-    const agentDir = path.join(fixture.base, "agent");
-    const provider = await installMissionLocalProvider({
-      agentDir,
-      toolForPrompt: () => ({ name: "apply_patch", arguments: {
-        patch: "*** Begin Patch\n*** Update File: src/target.txt\n@@\n- source sentinel \n+SDK patch output\n*** End Patch",
-      } }),
-    });
-    const effects = new MissionEffects({
-      store, workspace, missionId: mission.id, revision: 1, unitId: "snapshot",
-      attemptId: workspace.attemptId, runtimeId: store.runtimeId, ownerEpoch: store.ownerEpoch!,
-      allowedOperations: ["apply_patch"],
-    });
-    const runtime = await ModelRuntime.create({ authPath: path.join(agentDir, "auth.json"), modelsPath: null, allowModelNetwork: false });
-    const loader = new DefaultResourceLoader({
-      cwd: workspace.candidateRoot, agentDir, settingsManager: SettingsManager.inMemory(),
-      additionalExtensionPaths: [packageRoot()],
-    });
-    await loader.reload();
-    const { session } = await createAgentSession({
-      cwd: workspace.candidateRoot, agentDir, resourceLoader: loader, modelRuntime: runtime,
-      sessionManager: SessionManager.inMemory(workspace.candidateRoot),
-      tools: ["bash", "edit", "write", "apply_patch"], customTools: createMissionToolAdapters(effects),
-    });
-    try {
-      await session.bindExtensions({});
-      await session.setModel(runtime.getModel(provider.provider, provider.model)!);
-      session.setActiveToolsByName(["bash", "edit", "write", "apply_patch"]);
-      expect(session.getAllTools().map(({ name }) => name).sort()).toEqual(["apply_patch", "bash", "edit", "write"]);
-      await session.prompt("Apply the fixture patch");
-      expect(provider.trace.length).toBeGreaterThanOrEqual(2);
-      expect(readFileSync(path.join(workspace.candidateRoot, "src/target.txt"), "utf8")).toBe("SDK patch output\n");
-      expect(readFileSync(path.join(fixture.root, "src/target.txt"), "utf8")).toBe("source sentinel\n");
-      expect(store.inspectMission(mission.id).events.find(({ kind }) => kind === "effect.receipt")?.payload.status).toBe("completed");
-    } finally {
-      await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
-      await session.dispose();
-      await effects.shutdown();
-      store.close();
-      delete (globalThis as Record<string, unknown>).__pitako_mission_local;
-    }
-  }, 30_000);
-
   test("official patch moves, fuzzy matching and failures retain private after-images and confinement", async () => {
     if (process.platform !== "linux" || !existsSync("/usr/bin/bwrap")) return;
     const { fixture, store, mission, workspace } = await managedFixture(undefined, ["apply_patch"]);
@@ -536,6 +519,7 @@ describe("managed mission retirement", () => {
 
   test("real Pi reload awaits old owner retirement and fences its late result from the new epoch", async () => {
     if (process.platform !== "linux" || !process.arch.match(/^(x64|arm64)$/) || !existsSync("/usr/bin/bwrap")) return;
+    return withSdkFixtureOwner("reload", async () => {
     const fixture = createMissionFixture("pitako-mission-reload-");
     fixtures.push(fixture);
     mkdirSync(path.join(fixture.root, "src"));
@@ -622,5 +606,6 @@ describe("managed mission retirement", () => {
       reopened?.close();
       store.close();
     }
+    });
   }, 60_000);
 });

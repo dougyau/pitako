@@ -174,6 +174,83 @@ describe("plan and execute contracts", () => {
   const verify = readFileSync(path.join(packageRoot(), "skills/practical/verify-behavior/SKILL.md"), "utf8");
 
   // Static policy contracts, not tests of model compliance or implementation effectiveness.
+  test("explicit GATES authoring bounds writes and preserves evidence distinctions", () => {
+    const author = readFileSync(path.join(packageRoot(), "skills/practical/gates/SKILL.md"), "utf8");
+    for (const contract of [
+      "disable-model-invocation: true", "natural-language request",
+      "creation or a bounded update", "Write only `<selected-project-root>/GATES.md`",
+      "Preserve accurate content outside the requested scope", "external symlink",
+      "manifests and lockfiles, CI, project documentation, wrappers, tests, and runner capabilities",
+      "targeted read-only help or version probe", "label the unresolved procedure",
+      "exact native commands and working directories", "source-confirmed commands from observed executions",
+      "unrun or skipped check is not a pass", "No fixed headings",
+      "setup, dependency or toolchain installs, broad test runs, product fixes, new test infrastructure, settings changes, or feature maps",
+      "app-driving verification skills and feature maps, not project-wide gate recipes",
+    ]) expect(author).toContain(contract);
+    expect(verify).toContain("Do not automatically create or maintain the guide");
+  });
+
+  test("shared GATES guidance selects the active root and preserves authority", () => {
+    const guidePolicy = verify.slice(verify.indexOf("## Read the project's verification guide"), verify.indexOf("## Select and observe evidence"));
+    for (const contract of [
+      "workflowWorkspace", "canonical cwd outside Git", "`binding.executionRoot`",
+      "project being planned", "Read guidance only", "current canonical project/worktree root",
+      "never the installed Pitako package, plan-source checkout, or substitute ancestors",
+      "component-specific command working directories", "ordinary Markdown",
+      "does not require `package.json`", "Cross-check consequential claims",
+      "Missing, stale, or incomplete guidance", "uncovered obligation",
+      "Do not automatically create or maintain", "frozen plan and user authority",
+      "phase- and binding-compatible evidence reuse", "rather than copying the whole guide",
+    ]) expect(guidePolicy).toContain(contract);
+    expect(plan).toContain("shared root `GATES.md` discovery");
+    expect(plan).toContain("do not run setup or product checks during planning");
+    expect(execute).toContain("shared root `GATES.md` interpretation using `binding.executionRoot`");
+    expect(prePr).toContain("shared root `GATES.md` interpretation for the current canonical worktree");
+    expect(prePr).toContain("run `git diff --check` for publication readiness");
+  });
+
+  test("Pitako GATES preserves routine populations and separate runtime obligations", () => {
+    const gates = readFileSync(path.join(packageRoot(), "GATES.md"), "utf8");
+    const commands = [
+      "bun run typecheck",
+      "bun test",
+      "bun run test:code-intelligence-node",
+      "bun run test:mission-node",
+    ];
+    const routine = gates.split("## Run the complete routine procedure")[1]!.split("## Use stage-specific")[0]!;
+    let previous = -1;
+    for (const command of commands) {
+      const current = routine.indexOf(command);
+      expect(current).toBeGreaterThan(previous);
+      previous = current;
+    }
+    expect(routine).not.toContain("--concurrent");
+    expect(routine).toContain("Do not add `bun run smoke` again by default");
+    expect(routine).toContain("without `MISSION_DURABILITY_PHASE` filtering");
+    expect(gates).toContain("Setup success does not prove every gate prerequisite");
+    expect(gates).toContain("An omitted-command manifest is not success");
+    expect(gates).toContain("T1's filtered Node phases do not replace the unfiltered durability suite");
+  });
+
+  test("execute prepares only a reconciled captured checkout before dependent work", () => {
+    const setup = execute.slice(execute.indexOf("## Prepare the captured checkout"), execute.indexOf("## Decisions"));
+    expect(execute.indexOf("openExecutionPlan")).toBeLessThan(execute.indexOf("## Prepare the captured checkout"));
+    expect(setup.indexOf("reconcile `## Workers`")).toBeLessThan(setup.indexOf("Inspect `binding.executionRoot`"));
+    expect(setup.indexOf("Read the script")).toBeLessThan(setup.indexOf('bash ./scripts/setup.sh </dev/null'));
+    for (const contract of [
+      "running worker ends the turn", "unknown or unreconciled ownership blocks setup",
+      "Unresolved holds block setup", "external symlink", "unreadable script",
+      "Missing setup is supported", "failed or interrupted invocation leaves dependent work blocked",
+      "root, script, dependency declarations/lockfile, runtime, and installed dependencies",
+      "Missing dependencies or relevant changes invalidate it", "without an arbitrary retry budget",
+      "Do not run setup during `$plan`, plan discovery, `/reload`, worker startup",
+      "completion wake", "WorkBrief", "Setup success does not prove all gate-specific prerequisites",
+    ]) expect(setup).toContain(contract);
+    expect(setup).toContain('(cd "$executionRoot" && bash ./scripts/setup.sh </dev/null)');
+    expect(setup).toContain("not an environment variable");
+    expect(setup).toContain("before delegating dependent work");
+  });
+
   test("planning decomposes for correctness and preserves proportional acceptance", () => {
     for (const policy of [plan, sequencing, architect]) {
       for (const criterion of ["uncertainty", "prerequisites", "contract cohesion", "meaningful feedback"]) {

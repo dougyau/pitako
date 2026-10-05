@@ -9,6 +9,7 @@ export const DEFAULT_SKILL_NAMES = [
   "why",
   "blast-radius",
   "verify-behavior",
+  "gates",
   "create-verification-skill",
   "maintain-verification-skill",
   "reflect",
