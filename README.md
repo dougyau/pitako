@@ -316,7 +316,7 @@ Open a project with source files and a language server for LSP. Dense graph quer
 
 ## Development
 
-Prepare the checkout with `bash ./scripts/setup.sh`. Use [GATES.md](GATES.md) for prerequisites, focused checks, and the complete routine procedure. It covers file parallelism, isolated todo tests, separate Node suites, and stage-wrapper evidence.
+Prepare the checkout with `bash ./scripts/setup.sh`. Use [GATES.md](GATES.md) for prerequisites, focused checks, and the complete routine procedure. It covers the full serial Bun suite, separate Node suites, and stage-wrapper evidence.
 
 `verify-behavior` reads the active project's root `GATES.md`, not the installed Pitako package's guide. Planning reads it without running checks. Missing or stale guidance falls back to existing discovery for uncovered obligations; frozen requirements and independent review remain controlling. Routine verification does not automatically author the guide.
 

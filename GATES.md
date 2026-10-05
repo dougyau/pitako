@@ -32,13 +32,12 @@ Run these commands in order from the root:
 
 ```sh
 bun run typecheck
-bun test --parallel=4 --path-ignore-patterns 'tests/todo.test.ts'
-bun test ./tests/todo.test.ts
+bun test
 bun run test:code-intelligence-node
 bun run test:mission-node
 ```
 
-The script definitions are in [package.json](package.json). `--parallel=4` uses file parallelism and isolated workers, not blanket test-case concurrency. Keep `tests/todo.test.ts` isolated. The ignored population and the isolated file must together cover Bun's discovered test files once, with no omissions or duplicates. Recheck discovery and filtering when test paths or runner behavior change. Serialize only an affected group if an actual conflict is demonstrated and recorded; do not weaken assertions.
+The script definitions are in [package.json](package.json). Plain `bun test` runs the full discovered suite with the default serial runner, including `tests/todo.test.ts`, with no omitted files or duplicate runs. Keep intended concurrency within test cases and do not weaken assertions.
 
 Full Bun coverage includes `tests/smoke.test.ts`. Do not add `bun run smoke` again by default. The Node `.mjs` suites are separate observations, not part of Bun discovery. Run the mission Node suite without `MISSION_DURABILITY_PHASE` filtering for the complete obligation.
 
@@ -52,8 +51,8 @@ For an affected stage obligation, use a distinct evidence directory:
 bun run verify:mission -- <stage> --evidence-dir <distinct-directory>
 ```
 
-[scripts/verify-mission.ts](scripts/verify-mission.ts) owns the stage's reachable commands and current coverage. Trace that wrapper before executing it or reusing its evidence. Do not copy its exception list into generic policy or run a T1–T7 sweep for routine skill/setup changes.
+[scripts/verify-mission.ts](scripts/verify-mission.ts) owns the stage's reachable commands and current coverage. Trace that wrapper before executing it or reusing its evidence. Do not run a T1–T7 sweep for routine skill/setup changes.
 
-T3 includes T1 and T2 regressions. T7 uses case concurrency with file parallelism, a separate file-parallel exception group, and isolated todo tests. It starts broad commands only after SDK integration and owner-denial checks. An omitted-command manifest is not success. T7 does not establish every T1–T6 stage-specific obligation. T1's filtered Node phases do not replace the unfiltered durability suite.
+T3 includes T1 and T2 regressions. T7 runs the full discovered Bun suite once with the default serial runner. It starts broad commands only after SDK integration and owner-denial checks. An omitted-command manifest is not success. T7 does not establish every T1–T6 stage-specific obligation. T1's filtered Node phases do not replace the unfiltered durability suite.
 
 Reuse equivalent complete wrapper evidence only when actual commands, inputs, environment, completeness, and required phase or binding remain compatible under [verify-behavior](skills/practical/verify-behavior/SKILL.md). Frozen plan and user requirements control conflicts. This guide grants no new authority and does not replace independent review or [pre-pr publication checks](skills/pre-pr/SKILL.md).

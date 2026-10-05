@@ -213,8 +213,7 @@ describe("plan and execute contracts", () => {
     const gates = readFileSync(path.join(packageRoot(), "GATES.md"), "utf8");
     const commands = [
       "bun run typecheck",
-      "bun test --parallel=4 --path-ignore-patterns 'tests/todo.test.ts'",
-      "bun test ./tests/todo.test.ts",
+      "bun test",
       "bun run test:code-intelligence-node",
       "bun run test:mission-node",
     ];

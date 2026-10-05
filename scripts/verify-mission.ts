@@ -1485,42 +1485,15 @@ async function verifyT5Stage(stage: string, runDir: string, evidenceDir: string,
   if (!complete) process.exitCode = 1;
 }
 
-// File workers isolate globals across files, not across tests within a file.
-// These files have awaited cases sharing cleanup registries, hooks or SDK globals.
-const T7_SERIAL_TEST_FILES = [
-  "agent-background", "agent-observe", "agent-pi", "agent-ui-lifecycle", "agent",
-  "apply-patch-pi", "board", "code-intelligence-adapters", "code-intelligence-telemetry", "code-intelligence-tools",
-  "execution-binding", "herdr", "load", "mission-accounting", "mission-admission",
-  "mission-consultation", "mission-effects", "mission-engine", "mission-finalization-sdk", "mission-finalization",
-  "mission-host", "mission-import", "mission-managed-routing", "mission-output-sdk", "mission-pause-interruption",
-  "mission-pi", "mission-recovery", "mission-runner", "mission-singleton-checkpoint", "mission-singleton-consultation",
-  "mission-store", "mission-teams", "mission-workspace", "roles", "team", "todo",
-  "tool-worktree-scope", "watchdog", "workflow",
-].map((name) => `tests/${name}.test.ts`);
-
-function t7TestArguments(serialFiles: string[] = T7_SERIAL_TEST_FILES): { concurrent: string[]; serial: string[]; todo: string[] } {
-  const parallelSerialFiles = serialFiles.filter((file) => file !== "tests/todo.test.ts");
-  if (parallelSerialFiles.length === 0 || serialFiles.some((file) => !existsSync(file)) ||
-      !serialFiles.includes("tests/todo.test.ts")) {
-    throw new Error("T7 requires a nonempty, present serial exception population");
-  }
-  return {
-    concurrent: ["test", "--concurrent", "--parallel=4", "--path-ignore-patterns", `{${serialFiles.join(",")}}`],
-    serial: ["test", "--parallel=4", ...parallelSerialFiles.map((file) => `./${file}`)],
-    todo: ["test", "./tests/todo.test.ts"],
-  };
-}
-
 async function verifyT7Stage(runDir: string, evidenceDir: string, commands: CommandResult[]): Promise<void> {
   const sdkDir = path.join(runDir, "sdk"), cohortDir = path.join(runDir, "metrics");
   const identity = implementationDiffIdentity();
-  const mandatoryIds = ["sdk-integration", "tests", "tests-todo", "typecheck", "smoke", "code-intelligence-node", "mission-node"];
+  const mandatoryIds = ["sdk-integration", "tests", "typecheck", "smoke", "code-intelligence-node", "mission-node"];
   const read = (file: string): any => readJson(file);
-  const passed = (id: string) => (id === "tests" ? ["tests", "tests-serial", "tests-todo"] : [id])
-    .every((required) => {
-      const row = commands.find((row) => row.id === required);
-      return row?.exitCode === 0 && existsSync(path.join(evidenceDir, row.logPath));
-    });
+  const passed = (id: string) => {
+    const row = commands.find((row) => row.id === id);
+    return row?.exitCode === 0 && existsSync(path.join(evidenceDir, row.logPath));
+  };
   runCommand(runDir, evidenceDir, commands, "sdk-integration", "node", ["--input-type=module", "-e",
     'import{createJiti}from"jiti";process.argv[2]=process.env.OUT;await createJiti(import.meta.url,{tryNative:false}).import("./scripts/mission-integration-sdk-node.mjs");'],
   { OUT: sdkDir, PITAKO_ENGINE_COMMIT: identity });
@@ -1542,12 +1515,8 @@ async function verifyT7Stage(runDir: string, evidenceDir: string, commands: Comm
     Number.isInteger(observed?.contenderPid) && observed.contenderPid > 0 && observed.ownerPid !== observed.contenderPid;
   if (integration && ownerDenied) {
     // No nested stage calls. The unknown-stage regression uses T8, never this stage.
-    const tests = t7TestArguments();
-    runCommand(runDir, evidenceDir, commands, "tests", "bun", tests.concurrent,
+    runCommand(runDir, evidenceDir, commands, "tests", "bun", ["test"],
       { MISSION_T7_METRICS_EVIDENCE: cohortDir });
-    runCommand(runDir, evidenceDir, commands, "tests-serial", "bun", tests.serial,
-      { MISSION_T7_METRICS_EVIDENCE: cohortDir });
-    runCommand(runDir, evidenceDir, commands, "tests-todo", "bun", tests.todo);
     runCommand(runDir, evidenceDir, commands, "typecheck", "bun", ["run", "typecheck"]);
     runCommand(runDir, evidenceDir, commands, "smoke", "bun", ["run", "smoke"]);
     runCommand(runDir, evidenceDir, commands, "code-intelligence-node", "bun", ["run", "test:code-intelligence-node"]);
@@ -1587,7 +1556,7 @@ async function verifyT7Stage(runDir: string, evidenceDir: string, commands: Comm
     `Empty live cohort remains unmeasured with undefined rates; deterministic cohort is not paid/live effectiveness. ` +
     `Baseline protocol ${protocolFile} SHA256 ${sha256(protocolBytes)}:\n${protocol}\n` +
     `Protocol adequacy requires coordinator's semantic independent review; no workflow acceptance granted.`;
-  const omittedCommands = [...mandatoryIds, "tests-serial"].filter((id) => !commands.some((row) => row.id === id));
+  const omittedCommands = mandatoryIds.filter((id) => !commands.some((row) => row.id === id));
   const allGatesPassed = mandatoryIds.every(passed);
   persistFile(path.join(runDir, "review-handoff.json"), JSON.stringify({
     format: "mission-t7-review-handoff-v1", implementationIdentity: identity,
@@ -1603,7 +1572,7 @@ async function verifyT7Stage(runDir: string, evidenceDir: string, commands: Comm
     ["live-owner-denied", "Second real SDK process cannot take over the live owner; source/evidence retained",
       ownerDenied, [path.join(sdkDir, "contender.json"), path.join(sdkDir, "operator-inputs.json")]],
     ["compatibility-reads", "Ad-hoc regression paths, package command load and non-scheduling managed reads",
-      integration && passed("tests") && passed("smoke"), [path.join(runDir, "tests.log"), path.join(runDir, "tests-serial.log"), path.join(runDir, "tests-todo.log"), path.join(runDir, "smoke.log")]],
+      integration && passed("tests") && passed("smoke"), [path.join(runDir, "tests.log"), path.join(runDir, "smoke.log")]],
     ["mandatory-gates", "All mandatory final integration gates",
       allGatesPassed, commands.map((row) => path.join(evidenceDir, row.logPath))],
     ["independent-review-handoff", "Complete evidence prepared for coordinator's final independent review, not acceptance",
@@ -1614,7 +1583,7 @@ async function verifyT7Stage(runDir: string, evidenceDir: string, commands: Comm
     ["cohort-counterexamples", "Full denominators, unknown exposure, correction cutoff, zero success and empty cohort",
       passed("tests") && cohort?.missions?.length === 6 && report?.counts?.admitted === 6 && report?.counts?.passed === 1 &&
         report?.counts?.unassessed === 3 && report?.costs?.unknownCost === 1,
-      [path.join(cohortDir, "cohort.json"), path.join(cohortDir, "report.json"), path.join(runDir, "tests.log"), path.join(runDir, "tests-serial.log"), path.join(runDir, "tests-todo.log")]],
+      [path.join(cohortDir, "cohort.json"), path.join(cohortDir, "report.json"), path.join(runDir, "tests.log")]],
     ["baseline-and-failure-isolation", "Baseline protocol, explicit unmeasured live status, metric failure leaves execution untouched",
       passed("tests") && isolationObserved && protocol.length > 0 &&
         baseline?.population === "live-evaluation" && baseline?.missions?.length === 0 &&
