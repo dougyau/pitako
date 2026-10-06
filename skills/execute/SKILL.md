@@ -49,13 +49,15 @@ Do not run setup during `$plan`, plan discovery, `/reload`, worker startup, or m
 
 Do not build an authority framework. Apply these three levels.
 
-Level 1, technical and reversible: helper placement, local structure, names, ordinary errors, test layout, equivalent stdlib use. Decide, record a short `RULING` in the ledger when resume or review needs it, and continue.
+Level 1, technical and reversible: helper placement, local structure, names, ordinary errors, test layout, equivalent stdlib use, or another equivalent technical choice within the accepted contract. Decide, record a short `RULING` in the ledger when resume or review needs it, and continue.
 
 Level 2, architectural but inside the accepted envelope: the planned internal shape is inadequate, and another internal design still preserves Goal, Non-goals, Scope, Invariants, user-visible intent, the safety boundary, and acceptance criteria. Consult Architect through `agent_run` only when that uncertainty is real. That answer is required before the next action, so it stays a synchronous call. Record an `EXECUTION AMENDMENT` or `RULING`. Continue. The frozen plan stays immutable.
 
 Level 3, user-owned: stop with `USER_DECISION_REQUIRED` only when evidence cannot decide for the user. That includes a Goal change, a Non-goal becoming a goal, material scope expansion, an invariant change, two materially different user-visible outcomes, a change in security or privacy risk appetite, or an unauthorized destructive or external side effect. Persist `status: USER_DECISION_REQUIRED` in ledger frontmatter before stopping. Include the exact decision, evidence already gathered, options, consequences, and a recommendation when evidence supports one.
 
 Never ask the user to make a Level 1 or Level 2 decision.
+
+A coordinator's technical suggestion does not create a new permission requirement. Preserve explicit frozen invariants and acceptance conditions regardless of who authored them. Removing a binding condition still requires its existing authority.
 
 ## Workers
 
@@ -82,8 +84,12 @@ Build a WorkBrief for the current unit only:
 - relevant prerequisites and rulings
 - upstream contracts or evidence references needed by this unit
 - current unresolved obligations, including relevant prior failures
-- consequential premise conclusions from the actual caller or integration path
+- consequential premise conclusions from the actual caller or integration path, including decisive sources, producers, consumers, and capability or authority limits
 - relevant files or systems
+
+Carry the source and force of consequential restrictions within these fields. User requirements, product contracts, frozen invariants, acceptance conditions, and actual authorization limits remain binding. Repository observations remain evidence with their limits and unresolved uncertainty. Technical suggestions remain choices where the frozen contract permits alternatives.
+
+Before dispatch, compare the brief with the frozen unit and relevant rulings. Do not omit obligations or turn an optional technical restriction into a binding prohibition. Do not relabel a frozen invariant or acceptance condition as advisory because its author was the planner.
 
 Label evidence as accepted, advisory, failed, or unavailable according to its actual source. A worker claim is not accepted evidence. Keep relevant valid evidence even when it is old. Exclude obsolete or unrelated context. Do not send the parent transcript or every Board topic.
 
@@ -116,6 +122,8 @@ If verification fails, reproduce, find the root cause, make the smallest correct
 If the same underlying failure class repeats, ask Reviewer. If that evidence shows the implementation shape is wrong but the plan envelope still holds, ask Architect, record a Level 2 amendment, and continue. If no solution preserves the envelope, return `USER_DECISION_REQUIRED`. Unrelated failures do not count as the same loop.
 
 Do not start the next unit until this unit is verifiable.
+
+Design-time ordering guidance does not authorize skipping or reordering frozen units. After a verification prerequisite failure, continue only useful independent checks permitted inside the current unit. Do not bypass ownership, unresolved Team holds, or setup restrictions. Failed or interrupted setup permits only non-dependent read-only diagnosis, not implementation writes or dependent checks. Independent checks do not accept the incomplete unit or waive required evidence, final gates, or review.
 
 ## Cleanup
 

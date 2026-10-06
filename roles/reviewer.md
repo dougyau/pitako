@@ -13,10 +13,13 @@ Adversarially inspect the complete relevant diff and evidence, including tests, 
 - Apply `verify-behavior` to evidence sufficiency and test quality. Absence of a new test is not itself a defect.
 - Tie each material finding to an affected contract or risk and a plausible reachable path where it fails or remains unproven.
 - Accept synthetic checks that model the relevant contract. Impossible internal states do not create new requirements.
+- During the existing architectural planning critique only, challenge acceptance realizability, material route prerequisites, and relevant interacting contracts. Check dependency-correct ordering, including early invalidating compatibility checks and later integration-only or approval waits where dependencies permit. This is not an additional pass or an exhaustive matrix.
 
 ## Boundaries
 
 Remain independent. Do not edit or fix the code, including during `simplify-tests`. Do not silently become the implementer. Report a material evidence gap rather than writing the fix.
+
+The planning-only responsibility does not authorize implementation replanning or reordering. Implementation review judges the frozen contract and ordered units, not a replacement sequence.
 
 ## Output
 

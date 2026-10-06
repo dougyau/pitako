@@ -171,6 +171,7 @@ describe("plan and execute contracts", () => {
   const router = readFileSync(path.join(packageRoot(), "skills/pitako-coding/SKILL.md"), "utf8");
   const sequencing = readFileSync(path.join(packageRoot(), "skills/principles/principle-sequence-verifiable-units/SKILL.md"), "utf8");
   const architect = readFileSync(path.join(packageRoot(), "roles/architect.md"), "utf8");
+  const reviewer = readFileSync(path.join(packageRoot(), "roles/reviewer.md"), "utf8");
   const verify = readFileSync(path.join(packageRoot(), "skills/practical/verify-behavior/SKILL.md"), "utf8");
 
   // Static policy contracts, not tests of model compliance or implementation effectiveness.
@@ -294,6 +295,25 @@ describe("plan and execute contracts", () => {
     expect(architect).toContain("Research or design does not authorize implementation");
   });
 
+  test("planning resolves consequential producers instead of asserting guarantees", () => {
+    const premises = plan.slice(plan.indexOf("## Consequential premises"), plan.indexOf("## Work units"));
+    const responsibility = architect.slice(architect.indexOf("## Responsibility"), architect.indexOf("## Boundaries"));
+    for (const policy of [premises, responsibility]) {
+      expect(policy).toContain("source, producer, consumer, and capability or authority");
+      expect(policy).toContain("supported way to produce and observe");
+      expect(policy).toContain("independent completeness");
+      expect(policy).toContain("contained worker");
+      expect(policy).toContain("outside its permitted root");
+      expect(policy).toMatch(/Resolve[\s\S]*before[\s\S]*dependent implementation/);
+      expect(policy).toContain("early bounded");
+      expect(policy).toContain("downstream decision it informs");
+      expect(policy).toContain("known missing architecture decision");
+    }
+    expect(premises).toContain("failed check leaves dependent acceptance unproven");
+    expect(premises).toContain("only for decision-changing premises in existing plan prose");
+    expect(premises).toContain("not an exhaustive assumption register or a permission checkpoint");
+  });
+
   test("ordinary handoffs preserve frozen intent and bounded current obligations", () => {
     const brief = execute.slice(execute.indexOf("Build a WorkBrief"), execute.indexOf("Developer implements."));
     for (const field of [
@@ -311,9 +331,35 @@ describe("plan and execute contracts", () => {
     expect(brief).toContain("future Developer Team head");
     expect(brief).toContain("do not replace global acceptance or authorize replanning");
     expect(brief).toContain("Level 1 and Level 2 decision rules");
+    for (const contract of [
+      "decisive sources, producers, consumers, and capability or authority limits",
+      "source and force of consequential restrictions within these fields",
+      "User requirements, product contracts, frozen invariants, acceptance conditions, and actual authorization limits remain binding",
+      "evidence with their limits and unresolved uncertainty",
+      "Technical suggestions remain choices where the frozen contract permits alternatives",
+      "compare the brief with the frozen unit and relevant rulings",
+      "Do not omit obligations or turn an optional technical restriction into a binding prohibition",
+      "Do not relabel a frozen invariant or acceptance condition as advisory because its author was the planner",
+    ]) expect(brief).toContain(contract);
     expect(execute).toContain("Never ask the user to make a Level 1 or Level 2 decision");
     expect(execute).toContain("Use `verify-behavior` for diagnosis, affected regression, final gates");
     expect(execute).toContain("Mandatory gates and independent review remain required");
+  });
+
+  test("decision levels preserve equivalent choices and genuine binding authority", () => {
+    const decisions = execute.slice(execute.indexOf("\n## Decisions\n"), execute.indexOf("\n## Workers\n"));
+    expect(decisions).toContain("another equivalent technical choice within the accepted contract");
+    expect(decisions).toContain("another internal design still preserves Goal, Non-goals, Scope, Invariants");
+    expect(decisions).toContain("Consult Architect through `agent_run` only when that uncertainty is real");
+    expect(decisions).toContain("a change in security or privacy risk appetite");
+    expect(decisions).toContain("unauthorized destructive or external side effect");
+    expect(decisions).toContain("A coordinator's technical suggestion does not create a new permission requirement");
+    expect(decisions).toContain("Preserve explicit frozen invariants and acceptance conditions regardless of who authored them");
+    expect(decisions).toContain("Removing a binding condition still requires its existing authority");
+    const loop = execute.slice(execute.indexOf("## Loop"), execute.indexOf("## Cleanup"));
+    expect(loop).toContain("First failure stays with the same Developer");
+    expect(loop).toContain("If the same underlying failure class repeats, ask Reviewer");
+    expect(loop).toContain("ask Architect, record a Level 2 amendment");
   });
 
   test("verification owns diagnosis, wrapper coverage, and compatible evidence reuse", () => {
@@ -334,6 +380,84 @@ describe("plan and execute contracts", () => {
     expect(verify).toContain("Relevant edits after a pass invalidate affected conclusions, not every independent observation");
     expect(verify).toContain("It never cancels a mandatory gate or independent review");
     expect(verify).toContain("Do not run a cycle that re-enters the same verification stage or suite");
+  });
+
+  test("acceptance traces a permitted route without inventing isolation or permissions", () => {
+    const units = plan.slice(plan.indexOf("## Work units"), plan.indexOf("## Critique and freeze"));
+    const selection = verify.slice(verify.indexOf("## Select and observe evidence"), verify.indexOf("## Distinguish diagnosis"));
+    for (const policy of [units, selection]) {
+      expect(policy).toContain("compact permitted positive route from the actual entry point to the required observation");
+      expect(policy).toContain("only material prerequisites: interaction driver, effective state and resource sharing, configuration, credentials, effect owner, authorization, and cleanup");
+    }
+    for (const contract of [
+      "A worktree does not prove global-state isolation",
+      "Private state is not inherently prohibited",
+      "credentials symlink does not prove immutable credentials",
+      "PTY or private-state route is permitted only if it preserves the required actual entry point, authorization, and resource constraints",
+      "Preserve an explicit prohibition on credential persistence; do not invent one when absent",
+      "Direct internal receipt creation cannot prove a native path it bypasses",
+    ]) expect(selection).toContain(contract);
+  });
+
+  test("verification separates host, provider, advisory, and diagnostic claims", () => {
+    const selection = verify.slice(verify.indexOf("## Select and observe evidence"), verify.indexOf("## Distinguish diagnosis"));
+    for (const contract of [
+      "Deterministic host checks prove their host contract or local mechanism, not an external model's completion",
+      "Preserve a separately required real-provider demonstration",
+      "Advisory managed observations, including passes, do not satisfy current host acceptance predicates",
+      "grants no spending, external-effect, reset, or budget authority",
+      "Managed workers retain findings-only authority and current host predicates",
+      "Standalone consumers retain their existing scope and authority",
+      "requires no plan, setup, or new evidence artifact",
+    ]) expect(selection).toContain(contract);
+    const diagnosis = verify.slice(verify.indexOf("## Distinguish diagnosis"), verify.indexOf("## Reuse evidence"));
+    for (const contract of [
+      "early reachable evidence for consequential interactions",
+      "persistence and fallback before the first assistant",
+      "does not replace a separately required real-provider demonstration or establish that a dependency caused the defect",
+      "Diagnose a dependency only as needed to locate the failing boundary of the authorized objective",
+      "Report out-of-scope findings and whether they block required acceptance",
+      "do not turn diagnosis into dependency maintenance",
+    ]) expect(diagnosis).toContain(contract);
+  });
+
+  test("design ordering and independent checks do not change frozen execution authority", () => {
+    const units = plan.slice(plan.indexOf("## Work units"), plan.indexOf("## Critique and freeze"));
+    const sequenceDesign = sequencing.slice(0, sequencing.indexOf("**Execution.**"));
+    for (const policy of [units, sequenceDesign]) {
+      expect(policy).toContain("integration-only or approval waits after independently verifiable implementation outcomes when real dependencies permit");
+      expect(policy).toContain("Do not postpone a compatibility check that could invalidate those outcomes");
+    }
+    expect(units).toContain("does not permit skipping or reordering frozen units during execution");
+    const loop = execute.slice(execute.indexOf("## Loop"), execute.indexOf("## Cleanup"));
+    const sequenceExecution = sequencing.slice(sequencing.indexOf("**Execution.**"), sequencing.indexOf("**Delivery.**"));
+    const diagnosis = verify.slice(verify.indexOf("## Distinguish diagnosis"), verify.indexOf("## Reuse evidence"));
+    for (const policy of [loop, sequenceExecution, diagnosis]) {
+      expect(policy).toMatch(/useful independent (?:current-unit )?checks/i);
+      expect(policy).toMatch(/ownership, unresolved Team holds, (?:and|or) setup restrictions/);
+      expect(policy).toContain("Failed or interrupted setup permits only non-dependent read-only diagnosis, not implementation writes or dependent checks");
+    }
+    expect(loop).toContain("Do not start the next unit until this unit is verifiable");
+    expect(loop).toContain("Independent checks do not accept the incomplete unit");
+    expect(sequenceExecution).toContain("An incomplete unit still blocks the next unit");
+    expect(sequenceExecution).toContain("grants no replanning, reordering, or workflow authority");
+    expect(diagnosis).toContain("do not accept an incomplete unit, start a later unit, skip a required check, or waive final review");
+  });
+
+  test("realizability and interacting-contract critique stays planning-only", () => {
+    const delegation = plan.slice(plan.indexOf("## Architect and Reviewer"), plan.indexOf("## Artifact"));
+    expect(delegation).toContain("In that planning critique");
+    expect(delegation).toContain("acceptance realizability and relevant interacting contracts, including dependency-correct ordering");
+    expect(delegation).toContain("does not authorize implementation replanning or reordering");
+    const responsibility = reviewer.slice(reviewer.indexOf("## Responsibility"), reviewer.indexOf("## Boundaries"));
+    expect(responsibility).toContain("During the existing architectural planning critique only");
+    expect(responsibility).toContain("acceptance realizability, material route prerequisites, and relevant interacting contracts");
+    expect(responsibility).toContain("early invalidating compatibility checks");
+    expect(responsibility).toContain("not an additional pass or an exhaustive matrix");
+    const boundaries = reviewer.slice(reviewer.indexOf("## Boundaries"), reviewer.indexOf("## Output"));
+    expect(boundaries).toContain("does not authorize implementation replanning or reordering");
+    expect(boundaries).toContain("Implementation review judges the frozen contract and ordered units, not a replacement sequence");
+    expect(boundaries).toContain("Do not edit or fix");
   });
 
   test("plan freezes and does not grant implementation", () => {

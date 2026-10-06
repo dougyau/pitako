@@ -13,7 +13,8 @@ Choose the types, boundaries, and module shape before code is written.
 - Alternatives when the repository does not already force the shape.
 - Impact of a shared API change.
 - During the existing architectural planning pass, check unit partition and ordering for contract cohesion, prerequisites, material uncertainty, and early meaningful feedback. Keep coupled contracts together, without a smallness goal or unit quota.
-- Check decision-changing premises against the actual caller or integration path. Distinguish repository facts, user guarantees, and optional technical restrictions before they become architecture, scope, acceptance, or verification.
+- Check decision-changing premises against the actual caller or integration path. Identify the decisive source, producer, consumer, and capability or authority. Distinguish repository facts, user guarantees, and optional technical restrictions before they become architecture, scope, acceptance, or verification.
+- Require a supported way to produce and observe a guarantee. Resolve known missing producers, authority boundaries, and unsupported guarantees before dependent implementation is frozen. An author's own inventory cannot establish independent completeness. Assigning a contained worker setup outside its permitted root supplies no authority. For an unavailable compatibility experiment, name an early bounded check and the downstream decision it informs. Do not use it to defer a known missing architecture decision.
 
 ## Boundaries
 

@@ -9,7 +9,9 @@ Order work by material uncertainty, prerequisites, contract cohesion, and early 
 
 Resolve uncertain compatibility before dependent work. Keep coupled readers and writers together when they establish one contract. Do not split a stable cohesive change when subdivision adds no independently meaningful feedback.
 
-**Execution.** Group related edits into units with observable acceptance and affected guarantees. Use [Verify behavior](../../practical/verify-behavior/SKILL.md) to choose sufficient evidence before dependent work advances. A unit may contain several edits. Do not require a check after each edit or defer all verification to a final batch. Independent work need not wait for an unrelated check.
+Before freezing the order, place integration-only or approval waits after independently verifiable implementation outcomes when real dependencies permit. Do not postpone a compatibility check that could invalidate those outcomes.
+
+**Execution.** Group related edits into units with observable acceptance and affected guarantees. Use [Verify behavior](../../practical/verify-behavior/SKILL.md) to choose sufficient evidence before dependent work advances. A unit may contain several edits. Do not require a check after each edit or defer all verification to a final batch. Useful independent current-unit checks need not wait for an unrelated verification prerequisite, but only within existing authority. Under `$execute`, preserve ordered frozen units, ownership, unresolved Team holds, and setup restrictions. Failed or interrupted setup permits only non-dependent read-only diagnosis, not implementation writes or dependent checks. An incomplete unit still blocks the next unit. This principle grants no replanning, reordering, or workflow authority.
 
 **Delivery.** When commits or PRs are already authorized, order them to expose useful evidence before dependent changes. A failing test before the fix can help when TDD fits. It is not the universal sequence. This principle grants no Git authority, including rebase, commit, or publication.
 
