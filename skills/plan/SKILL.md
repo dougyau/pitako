@@ -54,7 +54,7 @@ The `architect` skill continues into implementation when the user asked to build
 
 During an architectural `$plan`, call the Architect role with `agent_run`. The task must be design-only: inspect, reason, model, propose, critique. Ask that existing pass to check unit partition and ordering for coupled contracts and consequential uncertainty. It must say not to modify product files. If `agent_run` fails, report the error. Do not do that role yourself.
 
-Use the Researcher role only for a real external or knowledge gap. Use the Reviewer role for one independent critique of an architectural plan. The reviewer challenges affected contracts, relevant risks, and proposed acceptance criteria. Probe plausible counterexamples where they matter, not a universal test matrix. The reviewer reports findings and never fixes or implements.
+Use the Researcher role only for a real external or knowledge gap. Use the Reviewer role for one independent critique of an architectural plan. In that planning critique, the reviewer challenges acceptance realizability and relevant interacting contracts, including dependency-correct ordering. Probe plausible counterexamples where they matter, not a universal test matrix. This planning responsibility does not authorize implementation replanning or reordering. The reviewer reports findings and never fixes or implements.
 
 Use Caveman for ephemeral child communication: Architect lite, Reviewer lite, Researcher full. Do not write Caveman grammar into the plan file.
 
@@ -102,9 +102,13 @@ Include, when they carry a decision:
 
 ## Consequential premises
 
-Before freezing a premise that could change architecture, scope, acceptance, or verification, inspect the actual caller or integration path. A signature alone does not establish what values reach the callee.
+Before freezing a premise that could change architecture, scope, acceptance, or verification, inspect the actual caller or integration path. Follow it far enough to identify the decisive source, producer, consumer, and capability or authority. A signature alone does not establish what values reach the callee.
 
-Distinguish repository facts from user guarantees and optional technical restrictions. Record the evidence and conclusion only for decision-changing premises. Do not turn a chosen restriction into a user requirement. For example, logical nonmutation does not imply that every SQLite sidecar byte must remain unchanged.
+A guarantee needs a supported way to produce and observe it. An author's own obligations inventory does not establish independent completeness. A contained worker cannot supply setup outside its permitted root merely because the plan assigns it.
+
+Resolve a known missing producer, authority boundary, or unsupported guarantee before freezing dependent implementation. If a material compatibility experiment is unavailable during planning, specify an early bounded execution check, the conclusion it must establish, and the downstream decision it informs. A failed check leaves dependent acceptance unproven. Do not use that check to defer a known missing architecture decision.
+
+Distinguish repository facts from user guarantees and optional technical restrictions. Record the decisive evidence and conclusion only for decision-changing premises in existing plan prose. Do not turn a chosen restriction into a user requirement. For example, logical nonmutation does not imply that every SQLite sidecar byte must remain unchanged.
 
 This is a bounded premise check, not an exhaustive assumption register or a permission checkpoint for ordinary technical decisions.
 
@@ -113,6 +117,8 @@ This is a bounded premise check, not an exhaustive assumption register or a perm
 Ordered units only. No DAG.
 
 Decompose by material uncertainty, prerequisites, contract cohesion, and early meaningful feedback. Resolve an uncertain compatibility premise before work that depends on it. Keep coupled readers and writers together when they establish one contract. Leave a stable cohesive change unsplit when subdivision adds no independently meaningful feedback.
+
+Before freeze, place integration-only or approval waits after independently verifiable implementation outcomes when real dependencies permit. Do not postpone a compatibility check that could invalidate those outcomes merely because the full demonstration belongs near the end. This design-time ordering does not permit skipping or reordering frozen units during execution.
 
 The goal is implementation correctness, not smaller units. Do not split by file counts, time caps, commit counts, or worker count, and do not impose a unit quota.
 
@@ -140,7 +146,7 @@ Decision-complete, not line-prescriptive. The Developer keeps local implementati
 
 Define global outcomes and constraints, not a future Developer Team head's local task allocation.
 
-Every meaningful unit needs acceptance criteria that name observable behavior and affected guarantees. Name proportional expected evidence using `verify-behavior` when it stops the executor from inventing "done". Do not prescribe a test per function or a universal case matrix.
+Every meaningful unit needs acceptance criteria that name observable behavior and affected guarantees. Name proportional expected evidence using `verify-behavior` when it stops the executor from inventing "done". For new, costly, privileged, or integration-dependent acceptance, describe a compact permitted positive route from the actual entry point to the required observation. Resolve only material prerequisites: interaction driver, effective state and resource sharing, configuration, credentials, effect owner, authorization, and cleanup. Do not prescribe a test per function or a universal case matrix.
 
 ## Critique and freeze
 
