@@ -595,6 +595,73 @@ phaseTest("schema", "unknown and corrupt Node SQLite stores never become empty m
   finish();
 });
 
+phaseTest("identity", "pre-claim association observation never mints a missing store id", async () => {
+  const sample = fixture();
+  const paths = dbPaths(sample.stateDir);
+  let freshObserved = false;
+  const owner = await openMissionStore({ ...paths, admitWriter: (observation) => {
+    if (!observation) return;
+    freshObserved = true;
+    assert.equal(observation.ownerEpoch, null);
+    assert.equal(observation.findManagedMission(sample.root), undefined);
+    assert.throws(() => observation.ensureRepositoryIdentity(sample.root), /read-only.*writer reservation/);
+  } });
+  const mission = owner.createMission({
+    repositoryRoot: sample.root, planId: "durable-fixture", planFile: sample.planFile,
+    definitionFile: sample.definitionFile, commandId: sample.commandId, admissionReceiptId: sample.receiptId,
+  });
+  const markerFile = path.join(sample.root, ".git", "pitako", "repository-id");
+  const marker = readFileSync(markerFile);
+  const foreign = dbPaths(path.join(sample.base, "foreign-state"));
+  let callbackError;
+  try {
+    await assert.rejects(openMissionStore({ ...foreign, admitWriter: (observation) => {
+      if (!observation) return;
+      assert.equal(observation.ownerEpoch, null);
+      assert.deepEqual(observation.ownershipIdentity, { epoch: 0, claimId: "" });
+      observation.findManagedMission(sample.root);
+    } }), (error) => {
+      callbackError = error.message;
+      return error.message === "repository marker does not prove this repository association";
+    });
+    const db = new DatabaseSync(foreign.dbPath, { readOnly: true });
+    try {
+      assert.equal(db.prepare("SELECT value FROM store_meta WHERE key = 'store_instance_id'").get(), undefined);
+      assert.equal(db.prepare("SELECT value FROM store_meta WHERE key = 'owner_epoch'").get().value, "0");
+      assert.equal(db.prepare("SELECT value FROM store_meta WHERE key = 'owner_claim_id'").get().value, "");
+      assert.equal(db.prepare("SELECT value FROM store_meta WHERE key = 'owner_acquisition_proof'").get().value, "");
+      assert.deepEqual(db.prepare("SELECT * FROM mission_events").all(), []);
+      assert.deepEqual(db.prepare("SELECT * FROM missions").all(), []);
+    } finally { db.close(); }
+    const claimed = await openMissionStore(foreign);
+    try {
+      assert.equal(claimed.ownerEpoch, 1);
+      assert.throws(() => claimed.ensureRepositoryIdentity(sample.root), /repository marker belongs to a different mission store/);
+      assert.deepEqual(readFileSync(markerFile), marker);
+      assert.equal(owner.verifyRepositoryAssociation(sample.root), mission.repositoryId);
+    } finally { claimed.close(); }
+  } finally { acknowledgeRetirement(owner, mission.id); owner.close(); }
+  const reader = await openMissionStore({ ...paths, readOnly: true });
+  try {
+    assert.equal(reader.ownerEpoch, null);
+    assert.equal(reader.findManagedMission(sample.root).id, mission.id);
+    assert.equal(reader.verifyRepositoryAssociation(sample.root), mission.repositoryId);
+    assert.throws(() => reader.ensureRepositoryIdentity(sample.root), /read-only.*writer reservation/);
+  } finally { reader.close(); }
+  const reopened = await openMissionStore({ ...paths, admitWriter: (observation) => {
+    if (observation) assert.equal(observation.findManagedMission(sample.root).id, mission.id);
+  } });
+  try {
+    assert.equal(reopened.ownerEpoch, 2);
+    assert.equal(reopened.ensureRepositoryIdentity(sample.root), mission.repositoryId);
+    assert.equal(freshObserved, true);
+    observe("preclaim-association-read-only", {
+      callbackError, freshAcquisition: true, ownedAssociationReopen: true,
+      foreignMarkerPreserved: true, preclaimStoreIdAbsent: true,
+    })();
+  } finally { acknowledgeRetirement(reopened, mission.id); reopened.close(); }
+});
+
 phaseTest("identity", "rejects copied cross-host and same-path replacement identities", async () => {
   const sample = fixture();
   const { dbPath, objectDir } = dbPaths(sample.stateDir);

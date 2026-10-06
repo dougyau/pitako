@@ -1,4 +1,5 @@
 import { randomUUID, createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { execFileSync } from "node:child_process";
 import { closeSync, existsSync, fstatSync, fsyncSync, lstatSync, linkSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -6,7 +7,7 @@ import path from "node:path";
 import { getPitakoDataDir } from "../board/paths.ts";
 import { currentWorkspace, registeredWorktrees, repositoryIdentity } from "../board/workspace.ts";
 import { openSqlite, type SqlDatabase } from "../board/sqlite.ts";
-import { assertPlanId, isGeneratedMissionLedger, parsePlanDocument, planHash } from "../workflow.ts";
+import { assertPlanId, isGeneratedMissionLedger, parsePlanDocument, planHash, verifyExecutionBinding } from "../workflow.ts";
 import {
   isUuid,
   sha256,
@@ -24,6 +25,8 @@ import { currentProcessIdentity, ownerProcessState, verifyPrivateCandidate, type
 import { missionCorrectionNo, reduceMissionEvent, reduceMissionEvents, type MissionAttemptBinding } from "./engine.ts";
 import { assessMissionCompletion, missionCompletionBlockers } from "./completion.ts";
 import { importedHoldReconciled, validLegacyHoldProof } from "./reconcile.ts";
+import { assertPreparedAdmission, consumePreparedAdmission, type PreparedMission } from "./preparation.ts";
+import { setupRequiredBy } from "./setup.ts";
 
 export const MISSION_STORE_SCHEMA_VERSION = 2;
 const EVENT_SCHEMA_VERSION = 1;
@@ -42,6 +45,7 @@ export const EVENT_KINDS = new Set([
   "resource.wait", "dispatch.observed",
   "effect.denied", "effect.intent", "effect.invoking", "effect.process.registered", "effect.released", "effect.receipt", "effect.unknown", "effect.observation.recorded",
   "attempt.interrupted", "mission.owner.released",
+  "mission.setup.intent", "mission.setup.invoking", "mission.setup.receipt", "mission.setup.reconciled", "mission.setup.reused",
   "workspace.snapshot.sealed", "workspace.candidate.registered", "workspace.candidate.relocated",
   "mission.recovery.recorded", "mission.recovery.diagnosed", "mission.recovery.continuation",
   "mission.recovery.continuation.recorded", "mission.recovery.repair.authorized", "mission.recovery.repair.started", "mission.recovery.repair.settled",
@@ -82,25 +86,31 @@ export interface MissionStoreOptions {
   dbPath?: string;
   objectDir?: string;
   readOnly?: boolean;
+  /** Host admission recheck at writer acquisition, before any ownership mutation. */
+  admitWriter?: (observation?: MissionStore) => void;
   /** Foreground history snapshot only. Never applies to the engine/writer. */
   historyReadBudget?: { databaseBytes: number; objectBytes: number };
   /** Test-only process-crash seam. Production callers must not set this. */
   onDurabilityBoundary?: (boundary: CrashBoundary) => void;
 }
 
-export interface MissionCreateInput {
+interface MissionCreateBase {
   repositoryRoot: string;
   planId: string;
-  planFile: string;
-  definitionFile: string;
   commandId: string;
   admissionReceiptId: string;
   operatorText?: string;
+  operatorReceipt?: import("./admission.ts").OperatorReceipt;
   missionId?: string;
   occurredAt?: string;
 }
+export type MissionCreateInput = MissionCreateBase & (
+  { planFile: string; definitionFile: string; prepared?: never } |
+  { prepared: PreparedMission; planFile?: never; definitionFile?: never }
+);
 
 export interface MissionInspection extends MissionRecord {
+  prepared?: PreparedMission;
   planBytes: Buffer;
   definitionBytes: Buffer;
   events: MissionEvent[];
@@ -335,12 +345,15 @@ export async function openMissionStore(options: MissionStoreOptions = {}): Promi
       db.exec("PRAGMA synchronous = FULL");
       validateExistingDatabase(db, dbPath);
     } else {
+      options.admitWriter?.();
       db = await openSqlite(dbPath, { setWal: false });
+      options.admitWriter?.();
       db.exec("PRAGMA synchronous = FULL");
       initializeNewDatabase(db, dbPath);
     }
 
-    const claim = claimWriterReservation(db);
+    const claim = claimWriterReservation(db, options.admitWriter
+      ? () => options.admitWriter!(new MissionStore(db, objectDir, undefined, undefined, dbPath)) : undefined);
     if (!claim) {
       db.close();
       db = await openSqlite(dbPath, { readOnly: true });
@@ -398,6 +411,14 @@ export class MissionStore {
     return this.writerClaim?.epoch ?? null;
   }
 
+  /** Observation only; unlike ownerEpoch this also describes a remote writer. */
+  get ownershipIdentity(): { epoch: number; claimId: string } {
+    return {
+      epoch: Number(this.db.prepare("SELECT value FROM store_meta WHERE key = 'owner_epoch'").get()?.value),
+      claimId: String(this.db.prepare("SELECT value FROM store_meta WHERE key = 'owner_claim_id'").get()?.value ?? ""),
+    };
+  }
+
   get storageRoot(): string {
     return path.dirname(path.dirname(this.objectDir));
   }
@@ -425,7 +446,7 @@ export class MissionStore {
     const marker = readRepositoryMarker(path.join(workspace.commonDir, "pitako", "repository-id"));
     if (!marker) throw new MissionStoreError("repository marker is missing; repository association is unproven");
     if (marker.hostId !== machineIdentity() || marker.commonDir !== workspace.commonDir ||
-      marker.gitDirectoryId !== gitDirectoryIdentity(workspace.commonDir) || marker.storeInstanceId !== this.requireStoreInstanceId()) {
+      marker.gitDirectoryId !== gitDirectoryIdentity(workspace.commonDir) || marker.storeInstanceId !== this.readStoreInstanceId()) {
       throw new MissionStoreError("repository marker does not prove this repository association");
     }
     const location = this.db.prepare("SELECT repository_id FROM repository_locations WHERE canonical_path = ? AND kind = 'common'").get(workspace.commonDir);
@@ -586,18 +607,24 @@ export class MissionStore {
       }
     }
 
-    const planPath = realpathSync(path.resolve(input.planFile));
-    const definitionPath = realpathSync(path.resolve(input.definitionFile));
-    if (repositoryIdentity(path.dirname(planPath)) !== workspace.commonDir || repositoryIdentity(path.dirname(definitionPath)) !== workspace.commonDir) {
+    const preparedHash = input.prepared ? assertPreparedAdmission(input.prepared) : undefined;
+    if (input.prepared && (input.prepared.binding.executionRoot !== workspace.root ||
+      input.prepared.repositoryFamily !== workspace.commonDir))
+      throw new MissionStoreError("prepared source binding has a different execution root or repository family");
+    const planPath = input.prepared?.binding.planSource ?? realpathSync(path.resolve(input.planFile!));
+    const definitionPath = input.prepared ? undefined : realpathSync(path.resolve(input.definitionFile!));
+    if (repositoryIdentity(path.dirname(planPath)) !== workspace.commonDir || definitionPath && repositoryIdentity(path.dirname(definitionPath)) !== workspace.commonDir) {
       throw new MissionStoreError("plan and definition must belong to the verified repository family");
     }
-    const planBytes = readFileSync(planPath);
-    const definitionBytes = readFileSync(definitionPath);
+    const planBytes = input.prepared ? Buffer.from(input.prepared.originalSource) : readFileSync(planPath);
+    const definitionBytes = input.prepared ? Buffer.from(JSON.stringify(input.prepared.definition)) : readFileSync(definitionPath!);
     const planText = decodeUtf8(planBytes, "plan");
     const plan = parsePlanDocument(planText);
     if (plan.id !== planId) throw new MissionStoreError(`plan id ${plan.id} does not match requested ${planId}`);
     if (plan.status !== "frozen") throw new MissionStoreError(`plan ${planId} is ${plan.status}, not frozen`);
     const validated = validateMissionDefinitionBytes(definitionBytes);
+    if (!input.prepared && validated.definition.schemaVersion !== 1)
+      throw new MissionStoreError("generated definitions require host preparation; local JSON cannot bypass validation");
     const currentHash = planHash(planText);
     if (currentHash !== plan.hash) throw new MissionStoreError("plan hash changed during snapshot validation");
     const familyId = repositoryId ?? this.ensureRepositoryIdentity(input.repositoryRoot);
@@ -607,10 +634,19 @@ export class MissionStore {
       return this.requireMission(text(prior.mission_id, "mission_id"));
     }
 
+    if (input.prepared) {
+      if (!input.operatorReceipt || input.operatorReceipt.id !== input.admissionReceiptId ||
+        input.operatorReceipt.id !== input.commandId || input.operatorText !== input.operatorReceipt.text)
+        throw new MissionStoreError("generated admission requires exact prepared confirmation provenance");
+      consumePreparedAdmission(input.prepared, input.operatorReceipt);
+    }
     const planObject = this.writeObject(planBytes, "text/markdown; charset=utf-8");
     const definitionObject = this.writeObject(definitionBytes, "application/json");
+    const preparedObject = input.prepared ? this.writeObject(Buffer.from(JSON.stringify(input.prepared)), "application/json") : undefined;
+    if (preparedObject && preparedObject.hash !== preparedHash) throw new MissionStoreError("prepared object identity changed");
     const snapshot: PlanSnapshot = {
-      schemaVersion: 1,
+      schemaVersion: input.prepared ? 2 : 1,
+      ...(input.prepared ? { preparedHash, sourceBinding: input.prepared.binding } : {}),
       planId,
       revision: plan.revision,
       sourcePath: planPath,
@@ -633,6 +669,7 @@ export class MissionStore {
       definitionHash: definitionObject.hash,
       unitIds: validated.definition.units.map(({ id }) => id),
       ...(input.operatorText ? { operatorInputId: input.admissionReceiptId, operatorText: input.operatorText, intervention: "operator_choice" } : {}),
+      ...(input.operatorReceipt ? { operatorReceipt: input.operatorReceipt } : {}),
     };
     const event = makeEvent({ eventId, missionId: requestedId, revision: plan.revision, seq: 1, kind: "mission.created", causalId, occurredAt, runtimeId, payload });
 
@@ -653,12 +690,15 @@ export class MissionStore {
       if (this.db.prepare("SELECT mission_id FROM missions WHERE mission_id = ?").get(requestedId)) throw new MissionStoreError("mission UUID already exists");
       this.insertObject(planObject);
       this.insertObject(definitionObject);
+      if (preparedObject) this.insertObject(preparedObject);
       this.db.prepare(`INSERT INTO missions (mission_id, command_id, repository_id, plan_id, revision, state, version, latest_seq, created_at)
         VALUES (?, ?, ?, ?, ?, 'prepared', 1, 1, ?)`)
         .run(requestedId, input.commandId, familyId, planId, plan.revision, occurredAt);
       this.db.prepare(`INSERT INTO revisions (mission_id, revision, schema_version, plan_hash, definition_hash, source_path, parent_revision, admission_json, unit_mapping_json)
-        VALUES (?, ?, 1, ?, ?, ?, NULL, ?, ?)`)
-        .run(requestedId, plan.revision, planObject.hash, definitionObject.hash, planPath, json(snapshot.admissionProvenance), json(snapshot.units));
+        VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)`)
+        .run(requestedId, plan.revision, 1, planObject.hash, definitionObject.hash, planPath,
+          json(snapshot.schemaVersion === 2 ? { schemaVersion: 2, provenance: snapshot.admissionProvenance, preparedHash, sourceBinding: snapshot.sourceBinding } : snapshot.admissionProvenance),
+          json(snapshot.units));
       const insertUnit = this.db.prepare("INSERT INTO units (mission_id, revision, unit_id, parent_id, definition_json) VALUES (?, ?, ?, ?, ?)");
       for (const unit of validated.definition.units) insertUnit.run(requestedId, plan.revision, unit.id, unit.parentId ?? null, json(unit));
       this.insertEvent(event);
@@ -677,18 +717,46 @@ export class MissionStore {
     requireUuid(input.receiptId, "revision receiptId");
     const current = this.inspectMission(input.missionId);
     if (current.version !== input.expectedVersion) throw new MissionStoreError("revision version conflict");
+    if (current.prepared) verifyExecutionBinding(current.prepared.binding);
     const plan = parsePlanDocument(decodeUtf8(Buffer.from(input.planBytes), "revised plan"));
     if (plan.id !== current.planId || plan.revision !== current.revision + 1 || plan.status !== "frozen") {
       throw new MissionStoreError("revision must be the next frozen revision of this plan");
     }
     const definition = validateMissionDefinitionBytes(input.definitionBytes).definition;
+    if (definition.schemaVersion !== current.definition.schemaVersion) throw new MissionStoreError("revision cannot change executable contract version");
+    if (current.prepared) {
+      for (const original of current.prepared.definition.units) {
+        const revised = definition.units.find(({ id }) => id === original.id);
+        if (!revised || json(revised.originalIntent) !== json(original.originalIntent))
+          throw new MissionStoreError("revision cannot silently shrink or replace original unit intent");
+        for (const criterion of original.originalIntent!.criteria)
+          for (const id of criterion.predicateIds) if (!revised.acceptance.some((predicate) => predicate.id === id))
+            throw new MissionStoreError("revision cannot silently omit an original criterion predicate");
+      }
+      for (const mapping of current.prepared.mappings)
+        for (const id of mapping.predicateIds) if (!definition.units.some((unit) => unit.acceptance.some((predicate) => predicate.id === id)))
+          throw new MissionStoreError("revision cannot silently omit an original source obligation");
+      for (const edge of current.prepared.inventory.dependencies)
+        if (!definition.units.find(({ id }) => id === edge.unitId)?.dependencies.includes(edge.requires))
+          throw new MissionStoreError("revision cannot omit an original ordered dependency");
+      for (const phase of ["ordinary", "integrated", "affected", "final"] as const)
+        if (current.definition.finalization.selections![phase].some((id) => !definition.finalization.selections![phase].includes(id)))
+          throw new MissionStoreError("revision cannot silently omit a frozen phase selection");
+      if (definition.units.some((unit) => unit.acceptance.some(({ kind }) => kind === "manual")))
+        throw new MissionStoreError("revision cannot introduce unsupported observers");
+    }
     const planObject = this.writeObject(input.planBytes, "text/markdown; charset=utf-8");
     const definitionObject = this.writeObject(input.definitionBytes, "application/json");
+    const preparedObject = current.prepared ? this.writeObject(Buffer.from(json({ ...current.prepared, definition,
+      ...(current.prepared.setup ? { setup: { ...current.prepared.setup,
+        requiredBy: setupRequiredBy(current.prepared.setup.identity, definition) } } : {}),
+    })), "application/json") : undefined;
     if (plan.hash !== planObject.hash) throw new MissionStoreError("revision plan hash mismatch");
     const revision = plan.revision;
     const units = definition.units.map(({ id, parentId }) => ({ id, ...(parentId ? { parentId } : {}) }));
     const snapshot: PlanSnapshot = {
-      schemaVersion: 1, planId: current.planId, revision, sourcePath: current.snapshot.sourcePath,
+      schemaVersion: current.snapshot.schemaVersion, planId: current.planId, revision, sourcePath: current.snapshot.sourcePath,
+      ...(preparedObject ? { preparedHash: preparedObject.hash, sourceBinding: current.snapshot.sourceBinding } : {}),
       planHash: planObject.hash, definitionHash: definitionObject.hash, parentRevision: current.revision,
       admissionProvenance: { kind: input.actor, receiptId: input.receiptId }, units,
     };
@@ -696,7 +764,7 @@ export class MissionStore {
       seq: current.latestSeq + 1, kind: "mission.revised", causalId: input.receiptId,
       occurredAt: new Date().toISOString(), runtimeId: this.runtimeId,
       payload: { snapshot, impact: input.impact, retained: input.retained, parentRevision: current.revision,
-        requiredPredicates: definition.finalization.requiredPredicates, questionMappings: input.questionMappings ?? [],
+        requiredPredicates: definition.finalization.selections?.ordinary ?? definition.finalization.requiredPredicates, questionMappings: input.questionMappings ?? [],
         ...(input.operatorText ? { operatorText: input.operatorText, operatorInputId: input.receiptId, intervention: "operator_choice" } : {}),
         ...(input.operatorInstruction ? { operatorInstruction: input.operatorInstruction } : {}),
         ...(input.operatorReceipt ? { operatorReceipt: input.operatorReceipt } : {}),
@@ -705,9 +773,11 @@ export class MissionStore {
       this.requireVersion(input.missionId, input.expectedVersion);
       this.insertObject(planObject);
       this.insertObject(definitionObject);
+      if (preparedObject) this.insertObject(preparedObject);
       this.db.prepare(`INSERT INTO revisions (mission_id, revision, schema_version, plan_hash, definition_hash, source_path, parent_revision, admission_json, unit_mapping_json)
-        VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)`).run(input.missionId, revision, planObject.hash, definitionObject.hash,
-          snapshot.sourcePath, current.revision, json(snapshot.admissionProvenance), json(units));
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(input.missionId, revision, 1, planObject.hash, definitionObject.hash,
+          snapshot.sourcePath, current.revision, json(preparedObject ? { schemaVersion: 2, provenance: snapshot.admissionProvenance,
+            preparedHash: snapshot.preparedHash, sourceBinding: snapshot.sourceBinding } : snapshot.admissionProvenance), json(units));
       const insert = this.db.prepare("INSERT INTO units (mission_id, revision, unit_id, parent_id, definition_json) VALUES (?, ?, ?, ?, ?)");
       for (const unit of definition.units) insert.run(input.missionId, revision, unit.id, unit.parentId ?? null, json(unit));
       this.insertEvent(event);
@@ -1076,7 +1146,7 @@ export class MissionStore {
     const base = latest ? { ...created.payload, revision: latest.revision,
       snapshot: latest.payload.snapshot, unitIds: (latest.payload.snapshot as PlanSnapshot).units.map(({ id }) => id) } : created.payload;
     if (previousRevision !== inspection.revision || base.repositoryId !== inspection.repositoryId || base.planId !== inspection.planId ||
-      base.revision !== inspection.revision || reduceMissionEvents(inspection).state !== inspection.state || json(base.snapshot) !== json(inspection.snapshot) ||
+      base.revision !== inspection.revision || reduceMissionEvents(inspection).state !== inspection.state || !isDeepStrictEqual(base.snapshot, inspection.snapshot) ||
       json(base.unitIds) !== json(inspection.definition.units.map(({ id }) => id)) ||
       inspection.latestSeq !== events.length || inspection.version !== events.length) {
       throw new MissionStoreError("event replay does not match mission projection");
@@ -1357,16 +1427,22 @@ export class MissionStore {
     const mission = this.requireMissionRow(missionId);
     const revision = this.db.prepare("SELECT * FROM revisions WHERE mission_id = ? AND revision = ?").get(missionId, mission.revision);
     if (!revision) throw new MissionStoreError("mission revision projection is missing");
-    if (number(revision.schema_version, "revision schema_version") !== 1) throw new MissionStoreError("mission snapshot revision schema is unsupported");
+    if (number(revision.schema_version, "revision schema_version") !== 1) throw new MissionStoreError("mission revision storage schema is unsupported");
+    const envelope = parseJson(revision.admission_json, "admission provenance");
+    const schemaVersion = envelope.schemaVersion === 2 ? 2 : 1;
+    const admission = schemaVersion === 2
+      ? parseJson<{ provenance: PlanSnapshot["admissionProvenance"]; preparedHash: string; sourceBinding: NonNullable<PlanSnapshot["sourceBinding"]> }>(
+        revision.admission_json, "generated admission provenance") : undefined;
     const snapshot: PlanSnapshot = {
-      schemaVersion: 1,
+      schemaVersion,
+      ...(admission ? { preparedHash: admission.preparedHash, sourceBinding: admission.sourceBinding } : {}),
       planId: text(mission.plan_id, "plan_id"),
       revision: number(mission.revision, "revision"),
       sourcePath: text(revision.source_path, "source_path"),
       planHash: text(revision.plan_hash, "plan_hash"),
       definitionHash: text(revision.definition_hash, "definition_hash"),
       parentRevision: revision.parent_revision === null ? null : number(revision.parent_revision, "parent_revision"),
-      admissionProvenance: parseJson(revision.admission_json, "admission provenance"),
+      admissionProvenance: admission?.provenance ?? parseJson<PlanSnapshot["admissionProvenance"]>(revision.admission_json, "admission provenance"),
       units: parseJson(revision.unit_mapping_json, "unit mapping"),
     };
     if (!OBJECT_HASH.test(snapshot.planHash) || !OBJECT_HASH.test(snapshot.definitionHash)) throw new MissionStoreError("mission snapshot contains an invalid object hash");
@@ -1382,6 +1458,18 @@ export class MissionStore {
       throw new MissionStoreError("stored plan bytes do not match immutable snapshot metadata");
     }
     const definition = validateMissionDefinitionBytes(definitionBytes).definition;
+    let prepared: PreparedMission | undefined;
+    if (schemaVersion === 2) {
+      if (!snapshot.preparedHash || !OBJECT_HASH.test(snapshot.preparedHash) || !snapshot.sourceBinding)
+        throw new MissionStoreError("generated snapshot lacks prepared source identity");
+      prepared = JSON.parse(this.readObject(snapshot.preparedHash).toString()) as PreparedMission;
+      if (prepared.format !== "prepared-mission-v1" || prepared.inventory.sourceHash !== sha256(Buffer.from(prepared.originalSource)) ||
+        json(prepared.binding) !== json(snapshot.sourceBinding) || json(prepared.definition) !== json(definition) ||
+        prepared.binding.hash !== prepared.inventory.sourceHash || prepared.binding.planSource !== snapshot.sourcePath ||
+        repositoryIdentity(prepared.binding.executionRoot) !== prepared.repositoryFamily)
+        throw new MissionStoreError("immutable prepared inputs do not match generated snapshot");
+    }
+    if (definition.schemaVersion !== schemaVersion) throw new MissionStoreError("executable definition and snapshot versions differ");
     const unitMapping = definition.units.map(({ id, parentId }) => ({ id, ...(parentId ? { parentId } : {}) }));
     if (json(snapshot.units) !== json(unitMapping)) throw new MissionStoreError("stored unit mapping does not match executable snapshot");
     const unitRows = this.db.prepare("SELECT definition_json FROM units WHERE mission_id = ? AND revision = ? ORDER BY rowid").all(missionId, snapshot.revision)
@@ -1405,6 +1493,7 @@ export class MissionStore {
       latestSeq: number(mission.latest_seq, "latest_seq"),
       snapshot,
       definition,
+      ...(prepared ? { prepared } : {}),
       planBytes,
       definitionBytes,
       events,
@@ -1562,9 +1651,14 @@ export class MissionStore {
     verifyRepositoryContinuityProof(proof, workspace);
   }
 
-  private requireStoreInstanceId(): string {
+  private readStoreInstanceId(): string | undefined {
     const existing = this.db.prepare("SELECT value FROM store_meta WHERE key = 'store_instance_id'").get();
-    if (existing) return requireUuid(text(existing.value, "store_instance_id"), "store instance id");
+    return existing ? requireUuid(text(existing.value, "store_instance_id"), "store instance id") : undefined;
+  }
+
+  private requireStoreInstanceId(): string {
+    const existing = this.readStoreInstanceId();
+    if (existing) return existing;
     const created = randomUUID();
     this.withTransaction(() => {
       this.db.prepare("INSERT OR IGNORE INTO store_meta (key, value) VALUES ('store_instance_id', ?)").run(created);
@@ -1697,9 +1791,15 @@ function canAttemptWriterClaim(db: SqlDatabase): boolean {
   catch { return false; }
 }
 
-function claimWriterReservation(db: SqlDatabase): WriterClaim | undefined {
+function claimWriterReservation(db: SqlDatabase, admit?: () => void): WriterClaim | undefined {
+  // The callback may open its own read snapshots. No valid mission writer can change
+  // their contents without a claim; compare that claim again under the write lock.
+  const observedOwner = admit ? db.prepare("SELECT key, value FROM store_meta WHERE key IN ('owner_epoch', 'owner_claim_id') ORDER BY key").all() : undefined;
+  admit?.();
   db.exec("BEGIN IMMEDIATE");
   try {
+    if (observedOwner && json(observedOwner) !== json(db.prepare("SELECT key, value FROM store_meta WHERE key IN ('owner_epoch', 'owner_claim_id') ORDER BY key").all()))
+      throw new MissionStoreError("ownership changed during writer admission; repeat /mission action");
     const epochRow = db.prepare("SELECT value FROM store_meta WHERE key = 'owner_epoch'").get();
     const claimRow = db.prepare("SELECT value FROM store_meta WHERE key = 'owner_claim_id'").get();
     const current = Number(epochRow?.value);

@@ -7,6 +7,7 @@ import { auditCompletionEvidence, classifyNoEffect } from "./completion-evidence
 import type { LegacyImportArchive, MissionEventDraft, MissionStore } from "./store.ts";
 import type { MissionEvent } from "./model.ts";
 import type { MissionAttemptBinding } from "./engine.ts";
+import { missionInputIdentity } from "./inputs.ts";
 import {
   captureWorkspaceImage,
   captureWorkspacePaths,
@@ -61,7 +62,8 @@ export interface RecoveryReport {
   };
   status: "resumed" | "blocked";
   owner: { source: string; epoch: number | null; previousEpoch: number | null };
-  plan: { status: "unchanged" | "changed" | "missing" | "malformed" | "unavailable"; storedHash: string; observedHash: string | null };
+  plan: { status: "unchanged" | "changed" | "missing" | "malformed" | "unavailable"; storedHash: string; observedHash: string | null;
+    inputIdentityHash?: string; inputIdentity?: ReturnType<typeof missionInputIdentity> };
   source: {
     root: string;
     manifest: WorkspaceManifest | null;
@@ -1087,7 +1089,15 @@ export async function reconcileMission(options: ReconcileMissionOptions): Promis
 
   const storedPlanHash = initial.snapshot.planHash;
   let plan: RecoveryReport["plan"] = { status: "unavailable", storedHash: storedPlanHash, observedHash: null };
-  if (options.planFile) {
+  if (initial.prepared) {
+    try {
+      const identity = missionInputIdentity(initial, options.sourceRoot);
+      plan = { status: "unchanged", storedHash: storedPlanHash, observedHash: identity.pinHash,
+        inputIdentityHash: sha256(Buffer.from(JSON.stringify(identity))), inputIdentity: identity };
+    } catch {
+      plan = { status: "malformed", storedHash: storedPlanHash, observedHash: null };
+    }
+  } else if (options.planFile) {
     try {
       const bytes = readFileSync(options.planFile);
       const observedHash = sha256(bytes);
@@ -1098,6 +1108,16 @@ export async function reconcileMission(options: ReconcileMissionOptions): Promis
       plan = { status: (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "malformed", storedHash: storedPlanHash, observedHash: null };
     }
   }
+  const planCurrent = () => {
+    try {
+      if (initial.prepared) return plan.inputIdentityHash ===
+        sha256(Buffer.from(JSON.stringify(missionInputIdentity(store.inspectMission(options.missionId), options.sourceRoot))));
+      return !options.planFile || sha256(readFileSync(options.planFile)) === plan.observedHash;
+    } catch (error) {
+      return !initial.prepared && !!options.planFile && plan.status === "missing" &&
+        (error as NodeJS.ErrnoException).code === "ENOENT";
+    }
+  };
 
   const attempts = initial.events.filter((event) => event.kind === "attempt.reserved").map((event) => ({
     event,
@@ -1425,7 +1445,7 @@ export async function reconcileMission(options: ReconcileMissionOptions): Promis
               !current.events.some((event) => event.kind === "mission.cancelled") &&
               store.verifyRepositoryAssociation(options.sourceRoot) === sourceAssociation &&
               captureWorkspaceImage(options.sourceRoot).manifest.hash === sourceImage.manifest.hash &&
-              (!options.planFile || plan.observedHash !== null && sha256(readFileSync(options.planFile)) === plan.observedHash);
+              planCurrent();
           };
           if (!currentUse()) {
             overlapAttempts.add(attempt.attemptId);
@@ -1501,7 +1521,7 @@ export async function reconcileMission(options: ReconcileMissionOptions): Promis
           () => (!currentUse || currentUse()) && store.ownerEpoch === owner.epoch &&
             recoveryObservationCurrent(store.inspectMission(missionId).events, initial.latestSeq, localObservations) &&
             captureWorkspaceImage(options.sourceRoot).manifest.hash === sourceImage.manifest.hash &&
-            (!options.planFile || plan.observedHash !== null && sha256(readFileSync(options.planFile)) === plan.observedHash));
+            planCurrent());
         localObservations.add(snapshotEvent.causalId);
         if (lifecycle) lifecycleAdmissions.push(lifecycle);
         frontier.push(String(attempt.binding.unitId));
@@ -1751,7 +1771,7 @@ export async function reconcileMission(options: ReconcileMissionOptions): Promis
     ...(patch ? [{ bytes: Buffer.from(JSON.stringify(patch)), mediaType: "application/octet-stream" }] : []),
   ], () => store.ownerEpoch === owner.epoch && recoveryObservationCurrent(store.inspectMission(missionId).events, initial.latestSeq, localObservations) &&
     (!sourceImage || captureWorkspaceImage(options.sourceRoot).manifest.hash === sourceImage.manifest.hash) &&
-    (!options.planFile || !plan.observedHash || sha256(readFileSync(options.planFile)) === plan.observedHash));
+    planCurrent());
   return report;
 }
 
@@ -1859,7 +1879,7 @@ function fingerprintOverlap(
   return sha256(Buffer.from(JSON.stringify({
     attemptId, revision, rolePolicies: Object.entries(rolePolicies).map(([name, policy]) => [name, policy.hash]).sort(),
     base: base.manifest.hash, mission: mission.manifest.hash, source: source.manifest.hash,
-    plan: [plan.status, plan.storedHash, plan.observedHash],
+    plan: [plan.status, plan.storedHash, plan.observedHash, ...(plan.inputIdentityHash ? [plan.inputIdentityHash] : [])],
     conflicts: conflicts.map(({ path: name, base: before, mission: proposed, current }) => [name, fileHash(before), fileHash(proposed), fileHash(current)]),
   })));
 }

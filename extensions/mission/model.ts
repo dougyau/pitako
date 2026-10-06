@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { isReasoningLevel, type ModelTarget } from "../roles/types.ts";
+import type { ExecutionBinding } from "../workflow.ts";
 
 export const MISSION_SCHEMA_VERSION = 1;
 const ID = /^[a-z0-9][a-z0-9_-]*$/;
@@ -13,6 +15,7 @@ export type AcceptancePredicate = {
   expected?: string;
   command?: string;
   timeoutMs?: number;
+  inputPaths?: string[];
 };
 
 export interface MissionUnit {
@@ -32,10 +35,11 @@ export interface MissionUnit {
   acceptance: AcceptancePredicate[];
   risk: "low" | "medium" | "high" | "critical";
   retryLimit: number;
+  originalIntent?: { sourceId: string; objective: string; workBrief: string; criteria: Array<{ sourceId: string; text: string; predicateIds: string[] }> };
 }
 
 export interface MissionDefinition {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   goal: string;
   scope: string[];
   nonGoals: string[];
@@ -44,7 +48,8 @@ export interface MissionDefinition {
     allowedPaths: string[];
     operations: string[];
     externalEffects: string[];
-    rolePolicies: Record<string, { hash: string; provider: string; model: string; fallbacks: string[] }>;
+    rolePolicies: Record<string, { hash: string; provider: string; model: string; fallbacks: string[];
+      primaryTarget?: ModelTarget; fallbackTargets?: ModelTarget[] }>;
     allowTechnicalAmendments: boolean;
     resumeAfterClose: boolean;
   };
@@ -55,12 +60,15 @@ export interface MissionDefinition {
     activeTimeMs: number;
     artifactBytes: number;
   };
-  finalization: { requiredPredicates: string[]; independentReview: boolean; contractVersion?: 1 };
+  finalization: { requiredPredicates: string[]; independentReview: boolean; contractVersion?: 1;
+    selections?: { ordinary: string[]; integrated: string[]; affected: string[]; final: string[] } };
   units: MissionUnit[];
 }
 
 export interface PlanSnapshot {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
+  preparedHash?: string;
+  sourceBinding?: ExecutionBinding;
   planId: string;
   revision: number;
   sourcePath: string;
@@ -167,7 +175,7 @@ export function validateMissionDefinitionBytes(bytes: Uint8Array): { definition:
 export function validateMissionDefinition(value: unknown): MissionDefinition {
   const root = object(value, "mission definition");
   exactKeys(root, ["schemaVersion", "goal", "scope", "nonGoals", "invariants", "authority", "budget", "finalization", "units"], "mission definition");
-  if (root.schemaVersion !== MISSION_SCHEMA_VERSION) throw new MissionValidationError(`mission definition schema ${String(root.schemaVersion)} is not supported`);
+  if (root.schemaVersion !== 1 && root.schemaVersion !== 2) throw new MissionValidationError(`mission definition schema ${String(root.schemaVersion)} is not supported`);
   const goal = text(root.goal, "goal");
   const scope = textList(root.scope, "scope");
   const nonGoals = textList(root.nonGoals, "nonGoals");
@@ -179,7 +187,8 @@ export function validateMissionDefinition(value: unknown): MissionDefinition {
   for (const [roleKey, entry] of Object.entries(rolePolicyRows)) {
     const role = identifier(roleKey, "role policy id");
     const policy = object(entry, `role policy ${role}`);
-    exactKeys(policy, ["hash", "provider", "model", "fallbacks"], `role policy ${role}`);
+    exactKeys(policy, ["hash", "provider", "model", "fallbacks"], `role policy ${role}`,
+      root.schemaVersion === 2 ? ["primaryTarget", "fallbackTargets"] : []);
     const hash = text(policy.hash, `${role}.hash`);
     if (!SHA256.test(hash)) throw new MissionValidationError(`${role}.hash must be a lowercase SHA-256 digest`);
     rolePolicies[role] = {
@@ -187,6 +196,10 @@ export function validateMissionDefinition(value: unknown): MissionDefinition {
       provider: text(policy.provider, `${role}.provider`),
       model: text(policy.model, `${role}.model`),
       fallbacks: textList(policy.fallbacks, `${role}.fallbacks`),
+      ...(root.schemaVersion === 2 ? {
+        primaryTarget: validateModelTarget(policy.primaryTarget),
+        fallbackTargets: modelTargetList(policy.fallbackTargets),
+      } : {}),
     };
   }
   const authority = {
@@ -209,20 +222,22 @@ export function validateMissionDefinition(value: unknown): MissionDefinition {
   };
 
   const finalizationValue = object(root.finalization, "finalization");
-  exactKeys(finalizationValue, ["requiredPredicates", "independentReview"], "finalization", ["contractVersion"]);
+  exactKeys(finalizationValue, ["requiredPredicates", "independentReview"], "finalization",
+    ["contractVersion", ...(root.schemaVersion === 2 ? ["selections"] : [])]);
   if (finalizationValue.contractVersion !== undefined && finalizationValue.contractVersion !== 1)
     throw new MissionValidationError("unsupported finalization contract version");
   const finalization = {
     requiredPredicates: textList(finalizationValue.requiredPredicates, "finalization.requiredPredicates"),
     independentReview: boolean(finalizationValue.independentReview, "finalization.independentReview"),
     ...(finalizationValue.contractVersion === 1 ? { contractVersion: 1 as const } : {}),
+    ...(root.schemaVersion === 2 ? { selections: validateSelections(finalizationValue.selections) } : {}),
   };
   if (finalization.contractVersion === 1 && !finalization.independentReview)
     throw new MissionValidationError("completion contract version 1 requires whole-result independent review");
   if (finalization.requiredPredicates.length === 0) throw new MissionValidationError("finalization.requiredPredicates must not be empty");
 
   if (!Array.isArray(root.units) || root.units.length === 0) throw new MissionValidationError("units must be a non-empty array");
-  const units = root.units.map((entry, index) => validateUnit(entry, index));
+  const units = root.units.map((entry, index) => validateUnit(entry, index, root.schemaVersion));
   validateUnitGraph(units);
   for (const unit of units) {
     if (!rolePolicies[unit.role]) throw new MissionValidationError(`${unit.id} references missing role policy ${unit.role}`);
@@ -233,7 +248,14 @@ export function validateMissionDefinition(value: unknown): MissionDefinition {
   for (const id of finalization.requiredPredicates) {
     if (!predicateIds.has(id)) throw new MissionValidationError(`finalization references unknown predicate ${id}`);
   }
-  return { schemaVersion: 1, goal, scope, nonGoals, invariants, authority, budget, finalization, units };
+  if (root.schemaVersion === 2) {
+    if (finalization.contractVersion !== 1) throw new MissionValidationError("generated missions require finalization contract 1");
+    for (const ids of Object.values(finalization.selections!))
+      for (const id of ids) if (!predicateIds.has(id)) throw new MissionValidationError(`phase selection references unknown predicate ${id}`);
+    if (JSON.stringify([...finalization.selections!.final].sort()) !== JSON.stringify([...finalization.requiredPredicates].sort()))
+      throw new MissionValidationError("final selection must preserve all required final predicates");
+  }
+  return { schemaVersion: root.schemaVersion, goal, scope, nonGoals, invariants, authority, budget, finalization, units };
 }
 
 export function validateEvaluationObservation(value: unknown, missionId: string): EvaluationObservation {
@@ -319,9 +341,10 @@ export function isUuid(value: unknown): value is string {
   return typeof value === "string" && UUID.test(value);
 }
 
-function validateUnit(value: unknown, index: number): MissionUnit {
+function validateUnit(value: unknown, index: number, schemaVersion: 1 | 2): MissionUnit {
   const row = object(value, `units[${index}]`);
-  exactKeys(row, ["id", "dependencies", "kind", "role", "inputs", "outputs", "acceptance", "risk", "retryLimit"], `units[${index}]`, ["parentId", "team"]);
+  exactKeys(row, ["id", "dependencies", "kind", "role", "inputs", "outputs", "acceptance", "risk", "retryLimit"], `units[${index}]`,
+    ["parentId", "team", ...(schemaVersion === 2 ? ["originalIntent"] : [])]);
   const id = identifier(row.id, `units[${index}].id`);
   if (row.kind !== "team" && row.team !== undefined) throw new MissionValidationError(`${id} team contract requires kind team`);
   let team: MissionUnit["team"];
@@ -343,7 +366,8 @@ function validateUnit(value: unknown, index: number): MissionUnit {
   if (!Array.isArray(row.acceptance)) throw new MissionValidationError(`${id}.acceptance must be an array`);
   const acceptance = row.acceptance.map((entry, predicateIndex): AcceptancePredicate => {
     const predicate = object(entry, `${id}.acceptance[${predicateIndex}]`);
-    exactKeys(predicate, ["id", "kind", "target"], `${id} predicate`, ["expected", "command", "timeoutMs"]);
+    exactKeys(predicate, ["id", "kind", "target"], `${id} predicate`, ["expected", "command", "timeoutMs",
+      ...(schemaVersion === 2 ? ["inputPaths"] : [])]);
     const kind = oneOf(predicate.kind, ["command_exit", "artifact_hash", "manual"], `${id}.predicate.kind`);
     return {
       id: identifier(predicate.id, `${id}.predicate.id`),
@@ -352,6 +376,7 @@ function validateUnit(value: unknown, index: number): MissionUnit {
       ...(predicate.expected === undefined ? {} : { expected: text(predicate.expected, `${id}.predicate.expected`) }),
       ...(predicate.command === undefined ? {} : { command: text(predicate.command, `${id}.predicate.command`) }),
       ...(predicate.timeoutMs === undefined ? {} : { timeoutMs: positiveInteger(predicate.timeoutMs, `${id}.predicate.timeoutMs`) }),
+      ...(predicate.inputPaths === undefined ? {} : { inputPaths: textList(predicate.inputPaths, `${id}.predicate.inputPaths`) }),
     };
   });
   if (acceptance.length === 0) throw new MissionValidationError(`${id}.acceptance must not be empty`);
@@ -369,7 +394,39 @@ function validateUnit(value: unknown, index: number): MissionUnit {
     acceptance,
     risk: oneOf(row.risk, ["low", "medium", "high", "critical"], `${id}.risk`),
     retryLimit,
+    ...(schemaVersion === 2 ? { originalIntent: validateOriginalIntent(row.originalIntent) } : {}),
   };
+}
+
+function validateModelTarget(value: unknown): ModelTarget {
+  const row = object(value, "model target");
+  exactKeys(row, ["model"], "model target", ["reasoning", "fast"]);
+  if (row.reasoning !== undefined && (typeof row.reasoning !== "string" || !isReasoningLevel(row.reasoning)))
+    throw new MissionValidationError("unsupported model reasoning");
+  return { model: text(row.model, "target model"), ...(row.reasoning === undefined ? {} : { reasoning: row.reasoning }),
+    ...(row.fast === undefined ? {} : { fast: boolean(row.fast, "target fast") }) };
+}
+function modelTargetList(value: unknown): ModelTarget[] {
+  if (!Array.isArray(value)) throw new MissionValidationError("fallback targets must be an array");
+  return value.map(validateModelTarget);
+}
+function validateSelections(value: unknown): NonNullable<MissionDefinition["finalization"]["selections"]> {
+  const row = object(value, "phase selections");
+  exactKeys(row, ["ordinary", "integrated", "affected", "final"], "phase selections");
+  return { ordinary: identifierList(row.ordinary, "ordinary selections"), integrated: identifierList(row.integrated, "integrated selections"),
+    affected: identifierList(row.affected, "affected selections"), final: identifierList(row.final, "final selections") };
+}
+function validateOriginalIntent(value: unknown): NonNullable<MissionUnit["originalIntent"]> {
+  const row = object(value, "original unit intent");
+  exactKeys(row, ["sourceId", "objective", "workBrief", "criteria"], "original unit intent");
+  if (!Array.isArray(row.criteria)) throw new MissionValidationError("original criteria must be an array");
+  return { sourceId: text(row.sourceId, "source id"), objective: text(row.objective, "original objective"),
+    workBrief: text(row.workBrief, "original WorkBrief"), criteria: row.criteria.map((value) => {
+      const criterion = object(value, "original criterion");
+      exactKeys(criterion, ["sourceId", "text", "predicateIds"], "original criterion");
+      return { sourceId: text(criterion.sourceId, "criterion source id"), text: text(criterion.text, "original criterion"),
+        predicateIds: identifierList(criterion.predicateIds, "criterion predicates") };
+    }) };
 }
 
 function validateUnitGraph(units: MissionUnit[]): void {

@@ -9,7 +9,7 @@ import { missionDefinition, missionInput, createMissionFixture, openFixtureStore
 import type { MissionFixture } from "./mission-fixtures.ts";
 import {
   captureWorkspacePaths, createMissionWorkspace, currentProcessIdentity, ownerProcessState,
-  preflightContainment, processBirthTicks, processNamespaceId, processParentPid, processesInNamespace, readOwnedNamespaceInit, type MissionWorkspace,
+  preflightContainment, processBirthTicks, processNamespaceId, processParentPid, processesInNamespace, readOwnedNamespaceInit, spawnContained, type MissionWorkspace,
 } from "../extensions/mission/workspace.ts";
 import { missionEffectProcessesQuiescent } from "../extensions/mission/reconcile.ts";
 import { workspaceCrashOwnership } from "./fixtures/workspace-crash-ownership.ts";
@@ -104,7 +104,7 @@ function workspace(sample: ReturnType<typeof fixture>): MissionWorkspace {
 
 const canContain = process.platform === "linux" && existsSync("/usr/bin/bwrap") && ["x64", "arm64"].includes(process.arch);
 
-async function crashFixture(operations = ["bash"]): Promise<{ sample: MissionFixture; missionId: string; attemptId: string; storeRoot: string; candidateParent: string }> {
+async function crashFixture(operations = ["bash"], allowedPaths = ["src/**"]): Promise<{ sample: MissionFixture; missionId: string; attemptId: string; storeRoot: string; candidateParent: string }> {
   const sample = createMissionFixture("pitako-effect-crash-");
   fixtures.push(sample.base);
   const git = (args: string[]) => execFileSync("git", args, { cwd: sample.root, stdio: "ignore" });
@@ -113,7 +113,7 @@ async function crashFixture(operations = ["bash"]): Promise<{ sample: MissionFix
   git(["add", "src/target.txt"]);
   git(["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "workspace", "-q"]);
   const definition = missionDefinition();
-  definition.authority.allowedPaths = ["src/**"];
+  definition.authority.allowedPaths = allowedPaths;
   definition.authority.operations = operations;
   sample.definitionBytes = Buffer.from(`${JSON.stringify(definition, null, 2)}\n`);
   writeFileSync(sample.definitionFile, sample.definitionBytes);
@@ -146,6 +146,116 @@ async function crashFixture(operations = ["bash"]): Promise<{ sample: MissionFix
 }
 
 describe("managed mission candidate containment", () => {
+  test("production Node contains the admitted exact-file shell grant and persists quiescent receipts", async () => {
+    if (!canContain) throw new Error("exact-file Node regression requires Linux bwrap containment");
+    const { sample, missionId, attemptId, storeRoot, candidateParent } =
+      await crashFixture(["read", "edit", "bash"], ["src/greeting.mjs"]);
+    writeFileSync(path.join(sample.root, "src/greeting.mjs"), "export const greeting = 'before';\n");
+    const node = execFileSync("/bin/sh", ["-c", "command -v node"], { encoding: "utf8" }).trim();
+    const eventLog = path.join(sample.base, "exact-file-events.jsonl");
+    const metadataFile = path.join(sample.base, "exact-file-candidate.json");
+    execFileSync(node, [path.resolve("tests/fixtures/mission-effect-crash-child.mjs")], {
+      cwd: process.cwd(), timeout: 20_000,
+      env: {
+        ...process.env, T3_SOURCE: sample.root, T3_STORE: storeRoot, T3_CANDIDATES: candidateParent,
+        T3_DB: sample.dbPath, T3_OBJECTS: sample.objectDir, T3_MISSION: missionId, T3_ATTEMPT: attemptId,
+        T3_LOG: eventLog, T3_META: metadataFile, T3_COMMAND: [
+          "set -e", "cat src/greeting.mjs",
+          "printf \"export const greeting = 'node';\\n\" > src/greeting.mjs",
+          "if printf bad > src/target.txt; then exit 81; fi",
+          "if printf bad > .git/index; then exit 82; fi",
+          "if printf bad > /tmp/pitako/source/src/greeting.mjs; then exit 83; fi",
+        ].join("; "),
+      },
+    });
+    const { candidateRoot } = JSON.parse(readFileSync(metadataFile, "utf8"));
+    const store = await openFixtureStore(sample);
+    try {
+      const receipt = store.inspectMission(missionId).events.find(({ kind }) => kind === "effect.receipt")!;
+      expect(receipt.payload.status).toBe("completed");
+      expect((receipt.payload.process as { descendantsQuiescent: boolean }).descendantsQuiescent).toBe(true);
+      expect(processesInNamespace(String((receipt.payload.process as { pidNamespace: string }).pidNamespace))).toEqual([]);
+      expect(readFileSync(path.join(candidateRoot, "src/greeting.mjs"), "utf8")).toContain("'node'");
+      expect(readFileSync(path.join(candidateRoot, "src/target.txt"), "utf8")).toBe("source sentinel\n");
+      expect(readFileSync(path.join(sample.root, "src/greeting.mjs"), "utf8")).toContain("'before'");
+      preserveCrashEvents("exact-file-node-events.jsonl", eventLog);
+    } finally { store.close(); }
+  }, 30_000);
+
+  test("exact-file mounts reject symlinks, missing paths and directories without creating broader write authority", () => {
+    if (!canContain) throw new Error("exact-file rejection regression requires Linux bwrap containment");
+    const sample = fixture();
+    const candidate = workspace(sample);
+    for (const grant of ["src/link.txt", "src/missing.txt", "src", "src/target.txt/**"]) {
+      expect(() => spawnContained(candidate, "bash", ["-c", "true"], { writablePaths: [grant] })).toThrow();
+    }
+    expect(existsSync(path.join(candidate.candidateRoot, "src/missing.txt"))).toBe(false);
+    const moved = path.join(candidate.candidateRoot, "src-original");
+    renameSync(path.join(candidate.candidateRoot, "src"), moved);
+    symlinkSync(sample.sourceRoot, path.join(candidate.candidateRoot, "src"));
+    expect(() => spawnContained(candidate, "bash", ["-c", "true"], { writablePaths: ["src/target.txt"] })).toThrow();
+    expect(() => spawnContained(candidate, "bash", ["-c", "true"], { writablePaths: ["../source/src/target.txt"] })).toThrow();
+    candidate.candidateIdentity = "replaced";
+    expect(() => spawnContained(candidate, "bash", ["-c", "true"])).toThrow(/identity changed/);
+  });
+
+  test("exact-file authority permits first shell read and edit without sibling or metadata writes", async () => {
+    if (!canContain) throw new Error("exact-file regression requires Linux bwrap containment");
+    const sample = fixture();
+    writeFileSync(path.join(sample.sourceRoot, "src/greeting.mjs"), "export const greeting = 'before';\n");
+    const candidate = createMissionWorkspace({
+      missionId: randomUUID(), attemptId: randomUUID(), sourceRoot: sample.sourceRoot,
+      storeRoot: sample.storeRoot, candidateParent: sample.candidateParent,
+      allowedPaths: ["src/greeting.mjs"], otherCandidates: [sample.otherCandidate],
+    });
+    await preflightContainment(candidate);
+    const gitBefore = readFileSync(path.join(candidate.candidateGitDir, "index"));
+    let version = 0;
+    const events: Array<{ kind: string; payload: Record<string, unknown> }> = [];
+    const effects = new MissionEffects({
+      store: {
+        runtimeId: "exact-file-test",
+        inspectMission() { return { version }; },
+        appendTransition(_id: string, expected: number, transition: { events: typeof events }) {
+          expect(expected).toBe(version);
+          version += transition.events.length;
+          events.push(...transition.events);
+          return [];
+        },
+      } as never,
+      workspace: candidate, missionId: candidate.missionId, revision: 1, unitId: "unit",
+      attemptId: candidate.attemptId, runtimeId: "exact-file-test", ownerEpoch: 1,
+      allowedOperations: ["read", "edit", "bash"],
+    });
+    const first = await effects.invoke("bash", { command: "cat src/greeting.mjs" });
+    expect(first.status).toBe("completed");
+    expect(first.stdout).toContain("before");
+    const edit = await effects.invoke("edit", { path: "src/greeting.mjs", oldText: "'before'", newText: "'after'" });
+    expect(edit.status).toBe("completed");
+    const shell = await effects.invoke("bash", { command: [
+      "set -e",
+      "grep after src/greeting.mjs",
+      "printf \"export const greeting = 'shell';\\n\" > src/greeting.mjs",
+      "if printf bad > src/target.txt; then exit 81; fi",
+      "if printf bad > src/new.txt; then exit 82; fi",
+      "if printf bad > .git/index; then exit 83; fi",
+      "if printf bad > /tmp/pitako/source/src/greeting.mjs; then exit 84; fi",
+      "if printf bad > /tmp/pitako/store/sentinel; then exit 85; fi",
+      "if printf bad > /tmp/pitako/other-0/sentinel; then exit 86; fi",
+    ].join("; ") });
+    expect(shell.status).toBe("completed");
+    expect(shell.process?.descendantsQuiescent).toBe(true);
+    expect(readFileSync(path.join(candidate.candidateRoot, "src/greeting.mjs"), "utf8")).toContain("'shell'");
+    expect(readFileSync(path.join(candidate.candidateRoot, "src/target.txt"), "utf8")).toBe("dirty worktree\n");
+    expect(existsSync(path.join(candidate.candidateRoot, "src/new.txt"))).toBe(false);
+    expect(readFileSync(path.join(candidate.candidateGitDir, "index"))).toEqual(gitBefore);
+    expect(readFileSync(path.join(sample.sourceRoot, "src/greeting.mjs"), "utf8")).toContain("'before'");
+    expect(readFileSync(path.join(sample.storeRoot, "sentinel"), "utf8")).toBe("sealed state\n");
+    expect(readFileSync(path.join(sample.otherCandidate, "sentinel"), "utf8")).toBe("other candidate state\n");
+    expect(events.filter(({ kind }) => kind === "effect.receipt")).toHaveLength(3);
+    await effects.shutdown();
+  }, 30_000);
+
   test("production Node persists official patch preflight and sandbox Move receipts", async () => {
     if (!canContain) return;
     const { sample, missionId, attemptId, storeRoot, candidateParent } = await crashFixture(["apply_patch"]);

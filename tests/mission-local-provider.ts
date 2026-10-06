@@ -24,11 +24,14 @@ export async function installMissionLocalProvider(options: {
   agentDir: string;
   provider?: string;
   model?: string;
+  reasoning?: boolean;
+  contextWindow?: number;
   additionalModels?: string[];
   responseForPrompt?: (prompt: string) => string;
   responseGate?: (prompt: string, signal?: AbortSignal) => Promise<void>;
   errorForRequest?: (prompt: string, model: string, afterTool: boolean, signal?: AbortSignal) => string | undefined;
-  toolForPrompt?: (prompt: string) => { name: string; arguments: Record<string, unknown> } | undefined;
+  toolForPrompt?: (prompt: string, completedTools: number) => { name: string; arguments: Record<string, unknown> } | undefined;
+  toolTurns?: number;
   modelFromJson?: { cost?: Model<"openai-completions">["cost"] };
   usage?: Partial<Usage>;
   terminalCost?: number;
@@ -37,8 +40,8 @@ export async function installMissionLocalProvider(options: {
   const provider = options.provider ?? "pitako-mission-local";
   const model = options.model ?? "fixture";
   const modelDefinition = {
-    id: model, name: "Mission fixture", reasoning: false, input: ["text"],
-    contextWindow: 2048, maxTokens: 64,
+    id: model, name: "Mission fixture", reasoning: options.reasoning ?? false, input: ["text"],
+    contextWindow: options.contextWindow ?? 2048, maxTokens: 64,
   };
   if (options.modelFromJson) {
     mkdirSync(options.agentDir, { recursive: true });
@@ -71,7 +74,9 @@ export async function installMissionLocalProvider(options: {
       const prompt = [...(context.messages ?? [])].reverse().find((message) => message.role === "user")?.content
         ?.filter((part) => part.type === "text").map((part) => part.text ?? "").join("\n") ?? "";
       const text = options.responseForPrompt?.(prompt) ?? "Local fixture response. No product files changed.";
-      const tool = context.messages?.at(-1)?.role === "user" ? options.toolForPrompt?.(prompt) : undefined;
+      const completedTools = context.messages?.filter((message) => message.role === "toolResult").length ?? 0;
+      const tool = context.messages?.at(-1)?.role === "user" || completedTools < (options.toolTurns ?? 1) &&
+        context.messages?.at(-1)?.role === "toolResult" ? options.toolForPrompt?.(prompt, completedTools) : undefined;
       const cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
       const usage = { input: 17, output: 8, cacheRead: 2, cacheWrite: 0, totalTokens: 27, cost, ...options.usage };
       calculateCost(selected, usage);

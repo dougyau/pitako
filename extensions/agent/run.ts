@@ -130,6 +130,7 @@ export interface Attempt {
 }
 
 export interface AttemptSession {
+  retryBeforePrompt?(target: ModelTarget, signal: AbortSignal): Promise<Attempt>;
   continueWith(target: ModelTarget, note: string, signal: AbortSignal): Promise<Attempt>;
   dispose(): Promise<void>;
 }
@@ -212,6 +213,7 @@ async function runAttempt(
       }
       return await session.continueWith(input.target, SIDE_EFFECT_NOTE, input.signal);
     }
+    if (session?.retryBeforePrompt) return await session.retryBeforePrompt(input.target, input.signal);
     await session?.dispose();
     return await executor.start(input);
   } catch (error) {
@@ -275,8 +277,8 @@ export async function runAgentInstance(input: {
   /** Engine-owned context. Omitted for unchanged ad hoc execution. */
   durable?: DurableAttemptContext;
 }): Promise<AgentRunResult> {
-  const task = input.task.trim();
-  if (task.length === 0) throw new PitakoConfigError("agent_run task must not be empty");
+  const task = input.durable ? input.task : input.task.trim();
+  if (task.trim().length === 0) throw new PitakoConfigError("agent_run task must not be empty");
   const workspace = currentWorkspace(input.cwd);
   if (input.executionRoot !== undefined && workspace !== input.executionRoot) {
     throw new PitakoConfigError(`AgentInstance workspace drift: expected ${input.executionRoot}, got ${workspace}`);
@@ -511,11 +513,11 @@ async function executeTargets(
       bindActivityProbe(undefined);
       usage = mergeUsage(usage, attempt.usage);
       if (attempt.requests) requests.push(...attempt.requests);
+      session = attempt.session ?? session;
       const stall = stalled();
       if (stall && !parentSignal?.aborted) {
         return done("failed", formatStall(stall), target, index);
       }
-      session = attempt.session ?? session;
       sideEffects = sideEffects || attempt.sideEffects;
       view.usage = usage;
       if (attempt.appliedReasoning !== undefined) instance.model.appliedReasoning = attempt.appliedReasoning;
@@ -537,7 +539,7 @@ async function executeTargets(
         return done("failed", lastError, target, index, reason);
       }
       instance.model.lastFailure = reason;
-      if (!sideEffects) {
+      if (!sideEffects && !session?.retryBeforePrompt) {
         await session?.dispose();
         session = undefined;
       }

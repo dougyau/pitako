@@ -2,11 +2,24 @@ import { afterEach, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { admitMissionChange, askMissionChoice, classifyIntervention, classifyMissionInput, nextPlanBytes, pendingMissionQuestions, recordOperatorChoice, recordOperatorInput, revisionImpact, withdrawMissionChoice } from "../extensions/mission/admission.ts";
+import { admitMissionChange, askMissionChoice, classifyIntervention, classifyMissionInput, consumeOperatorInput, nextPlanBytes, pendingMissionQuestions, recordOperatorChoice, recordOperatorInput, revisionImpact, withdrawMissionChoice } from "../extensions/mission/admission.ts";
 import { MissionEngine, reduceMissionEvents } from "../extensions/mission/engine.ts";
 import { missionHasUnresolvedEffects } from "../extensions/mission/reconcile.ts";
 import { createMissionFixture, missionDefinition, missionInput, openFixtureStore, operatorChangeReceipt } from "./mission-fixtures.ts";
 import type { MissionDefinition } from "../extensions/mission/model.ts";
+
+test.each(["console", "native-confirmation"] as const)("host %s receipt preserves identity, session, payload and one-use admission", (source) => {
+  const text = "/mission pause durable-fixture";
+  const receipt = recordOperatorInput(source, "principal", text)!;
+  expect(receipt.source).toBe(source);
+  expect(Object.isFrozen(receipt)).toBe(true);
+  expect(() => consumeOperatorInput({ ...receipt }, "principal", text)).toThrow("host-issued");
+  expect(() => consumeOperatorInput(JSON.parse(JSON.stringify(receipt)), "principal", text)).toThrow("host-issued");
+  expect(() => consumeOperatorInput(receipt, "worker", text)).toThrow("host-issued");
+  expect(() => consumeOperatorInput(receipt, "principal", "/mission cancel durable-fixture")).toThrow("host-issued");
+  consumeOperatorInput(receipt, "principal", text);
+  expect(() => consumeOperatorInput(receipt, "principal", text)).toThrow("one-use");
+});
 
 const dirs: string[] = [];
 function withdrawReceipt(store: Awaited<ReturnType<typeof openFixtureStore>>, missionId: string, questionId: string) {

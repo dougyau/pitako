@@ -9,9 +9,11 @@ import { captureWorkspaceImage } from "./workspace.ts";
 import { sha256 } from "./model.ts";
 import { boardWorkspace } from "../board/workspace.ts";
 import { FINALIZATION_PHASES, acceptedFinalizationInput, currentWholeResultApproval, finalizationInputIdentity,
-  finalizationHash, type FinalizationPhaseReceipt, type MissionFinalManifest } from "./finalization.ts";
+  finalizationHash, parseFinalizationResponse, type FinalizationPhaseReceipt, type MissionFinalManifest } from "./finalization.ts";
 import { MISSION_CHECK_IDENTITY, missionCheckRuntime } from "./checks.ts";
 import { TEAM_ROUNDS } from "./team-contract.ts";
+import { MissionSetup } from "./setup.ts";
+import { missionInputIdentity } from "./inputs.ts";
 
 export interface MissionCompletionCertificate {
   schemaVersion: 1;
@@ -28,6 +30,7 @@ export interface MissionCompletionCertificate {
   generation: number;
   runtimeIdentity: string;
   certificateHash: string;
+  sourceIdentity?: ReturnType<typeof missionInputIdentity>;
 }
 
 /** Read-only artifact access is required: event payloads alone cannot prove stored results or effects. */
@@ -37,6 +40,11 @@ export function assessMissionCompletion(inspection: MissionInspection, store: Mi
   const { events, definition } = inspection;
   const state = reduceMissionEvents(inspection);
   const blockers: string[] = [];
+  if (!new MissionSetup(store, inspection.id).quiescentFor(inspection)) blockers.push("setup:unresolved-mutation");
+  if (inspection.prepared?.setup) {
+    const setup = new MissionSetup(store, inspection.id).observe(inspection);
+    if (setup.state === "blocked") blockers.push(`setup:${setup.reason}`);
+  }
   if (state.revision !== inspection.revision || ["paused", "cancelled", "blocked"].includes(state.state)) blockers.push("mission:not-finalizable");
   if (state.admissionFenced) blockers.push("mission:resource-fenced");
   for (const question of pendingMissionQuestions(events, store)) blockers.push(`question:${question.id}`);
@@ -108,8 +116,9 @@ export function assessMissionCompletion(inspection: MissionInspection, store: Mi
       attempt.receipt?.status === "completed");
   })) blockers.push("recovery:unproven");
   if (!definition.units.length || Object.values(state.units).some(({ status }) => status !== "accepted")) blockers.push("unit:incomplete");
-  const predicateIds = new Set(definition.units.flatMap(({ acceptance }) => acceptance.map(({ id }) => id)));
-  for (const predicateId of new Set([...predicateIds, ...definition.finalization.requiredPredicates])) {
+  const predicateIds = definition.finalization.selections?.ordinary ??
+    [...new Set(definition.units.flatMap(({ acceptance }) => acceptance.map(({ id }) => id)))];
+  for (const predicateId of new Set([...predicateIds, ...(definition.schemaVersion === 1 ? definition.finalization.requiredPredicates : [])])) {
     const unit = definition.units.find(({ acceptance }) => acceptance.some(({ id }) => id === predicateId));
     const accepted = [...events].reverse().find((event) => event.kind === "unit.accepted" && event.revision === inspection.revision &&
       (event.unitId ?? event.payload.unitId) === unit?.id);
@@ -141,7 +150,7 @@ export function assessMissionCompletion(inspection: MissionInspection, store: Mi
     if (store.verifyRepositoryAssociation(witness.root) !== inspection.repositoryId ||
       boardWorkspace(witness.root).physicalRoot !== witness.root) throw new Error("source-association");
     const approval = currentWholeResultApproval(inspection, store, witness.root);
-    const identity = finalizationInputIdentity(inspection, captureWorkspaceImage(witness.root).manifest, witness.root);
+    const identity = finalizationInputIdentity(inspection, captureWorkspaceImage(witness.root).manifest, witness.root, store);
     if (!approval || approval.manifestHash !== manifestHash || manifest.format !== "mission-final-manifest-v1" ||
       manifest.missionId !== inspection.id || manifest.revision !== inspection.revision ||
       manifest.planHash !== inspection.snapshot.planHash || manifest.definitionHash !== inspection.snapshot.definitionHash ||
@@ -175,7 +184,10 @@ export function assessMissionCompletion(inspection: MissionInspection, store: Mi
           try { return JSON.parse(store.readArtifact(hash).toString()); } catch { return {}; }
         })
           .filter((value) => value.format === "mission-predicate-observation-v1");
-        for (const id of definition.finalization.requiredPredicates) {
+        const selected = definition.finalization.selections?.[phase.target.phase === "integrated-checks" ? "integrated" :
+          phase.target.phase === "affected-checks" ? "affected" : "final"] ?? definition.finalization.requiredPredicates;
+        if (observations.length !== selected.length) throw new Error("phase-selection");
+        for (const id of selected) {
           const predicate = definition.units.flatMap((unit) => unit.acceptance).find((item) => item.id === id);
           const matches = observations.filter((item) => item.predicate?.id === id);
           if (matches.length !== 1 || matches[0].verdict !== "pass" ||
@@ -187,7 +199,7 @@ export function assessMissionCompletion(inspection: MissionInspection, store: Mi
         }
       }
       if (["ponytail", "cleanup"].includes(phase.target.phase)) {
-        const response = JSON.parse(store.readArtifact(String(attempt.receipt?.artifactHash)).toString());
+        const response = parseFinalizationResponse(store.readArtifact(String(attempt.receipt?.artifactHash)).toString());
         const expected = phase.target.phase === "ponytail" ? ["Ponytail"] : ["Unslop", "remove-ai-slops"];
         if (response.format !== "mission-finalization-cleanup-v1" || response.phase !== phase.target.phase ||
           response.inputArtifactHash !== phase.target.inputArtifactHash || !Array.isArray(response.scope) ||
@@ -229,6 +241,8 @@ export function assessMissionCompletion(inspection: MissionInspection, store: Mi
     eventSequence: completion?.seq ?? (publication?.seq ?? inspection.latestSeq + 1) + 1, finalEvidence,
     manifestHash, approvalHash, resultImageHash: manifest.resultImageHash, generation: manifest.generation,
     runtimeIdentity: missionCheckRuntime(),
+    ...(inspection.prepared && inspection.revision !== inspection.prepared.binding.revision ?
+      { sourceIdentity: missionInputIdentity(inspection, inspection.prepared.binding.executionRoot) } : {}),
     unresolvedHolds: [], unresolvedEffects: [],
   };
   const certificate = { ...unsigned, certificateHash: createHash("sha256").update(JSON.stringify(unsigned)).digest("hex") };

@@ -75,6 +75,7 @@ export interface MissionWorkspace {
   runtimeBun?: string;
   containmentProof?: ContainmentProof;
   quarantined: boolean;
+  setupIndependent?: boolean;
 }
 
 export interface CandidateRegistration {
@@ -123,6 +124,7 @@ export function createMissionWorkspace(input: {
   allowedPaths?: string[];
   productRoot?: string;
   bwrapPath?: string;
+  setupIndependent?: boolean;
 }): MissionWorkspace {
   if (process.platform !== "linux") throw new Error(`managed workspace containment is unsupported on ${process.platform}; no writer launched`);
   if (!UUID.test(input.missionId) || !UUID.test(input.attemptId)) throw new Error("mission and attempt ids must be UUIDs");
@@ -189,9 +191,12 @@ export function createMissionWorkspace(input: {
       runtimeNode: resolveRuntime("node"),
       runtimeBun: optionalRuntime("bun"),
       quarantined: false,
+      setupIndependent: input.setupIndependent,
     };
     const dependencies = path.join(sourceRoot, "node_modules");
-    if (existsSync(dependencies) && !existsSync(path.join(candidateRoot, "node_modules"))) {
+    if (input.setupIndependent && existsSync(path.join(candidateRoot, "node_modules")))
+      throw new Error("independent candidate contains unresolved setup output");
+    if (!input.setupIndependent && existsSync(dependencies) && !existsSync(path.join(candidateRoot, "node_modules"))) {
       const state = lstatSync(dependencies);
       if (!state.isDirectory() || state.isSymbolicLink()) throw new Error("source dependency backing must be a physical directory");
       dependencyBackings.set(workspace, { root: dependencies, identity: identity(dependencies) });
@@ -495,6 +500,9 @@ export function filterWorkspaceImage(image: WorkspaceImage, allowedPaths: readon
 
 export function restoreWorkspaceImage(workspace: MissionWorkspace, files: readonly WorkspaceImageFile[]): void {
   assertWorkspaceIdentity(workspace);
+  if (workspace.setupIndependent && files.some(({ path: name, kind }) =>
+    kind !== "missing" && (name === "node_modules" || name.startsWith("node_modules/"))))
+    throw new Error("independent recovery image contains unresolved setup output");
   applyWorkspaceImageToRoot(workspace.candidateRoot, files);
   if (files.some(({ path: name, kind }) => kind !== "missing" && (name === "node_modules" || name.startsWith("node_modules/")))) {
     dependencyBackings.delete(workspace);
@@ -731,11 +739,14 @@ function baseBwrapPlan(workspace: MissionWorkspace, writablePaths: string[], ver
   try {
     for (const grant of writablePaths) {
       const target = writableMountTarget(workspace, grant);
-      const fd = openSync(target.hostPath, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+      const fd = openSync(target.hostPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW |
+        (target.directory ? fsConstants.O_DIRECTORY : 0));
       descriptors.push(fd);
       const opened = fstatSync(fd);
       const observed = lstatSync(target.hostPath);
-      if (opened.dev !== observed.dev || opened.ino !== observed.ino || !observed.isDirectory() || observed.isSymbolicLink()) {
+      if (target.identity !== `${opened.dev}:${opened.ino}` ||
+        opened.dev !== observed.dev || opened.ino !== observed.ino || observed.isSymbolicLink() ||
+        (target.directory ? !observed.isDirectory() : !observed.isFile())) {
         throw new Error(`managed write mount changed during setup: ${grant}`);
       }
       args.push("--bind-fd", String(3 + descriptors.length), target.sandboxPath);
@@ -789,11 +800,16 @@ function normalizeAllowedPath(value: string): string {
   return subtree ? `${relative}/**` : relative;
 }
 
-function writableMountTarget(workspace: MissionWorkspace, input: string): { hostPath: string; sandboxPath: string } {
+function writableMountTarget(workspace: MissionWorkspace, input: string): { hostPath: string; sandboxPath: string; directory: boolean; identity: string } {
   const grant = normalizeAllowedPath(input);
-  if (grant === ".") return { hostPath: workspace.candidateRoot, sandboxPath: WORKSPACE_MOUNT };
-  const relative = grant.endsWith("/**") ? grant.slice(0, -3) : grant;
+  if (grant === ".") return { hostPath: workspace.candidateRoot, sandboxPath: WORKSPACE_MOUNT, directory: true, identity: workspace.candidateIdentity };
+  const directory = grant.endsWith("/**");
+  const relative = directory ? grant.slice(0, -3) : grant;
   const stat = safeLstatAt(workspace.candidateRoot, relative);
+  if (!directory) {
+    if (!stat?.isFile() || stat.isSymbolicLink()) throw new Error(`managed exact-file write mount requires an existing regular file: ${grant}`);
+    return { hostPath: path.join(workspace.candidateRoot, relative), sandboxPath: `${WORKSPACE_MOUNT}/${relative}`, directory: false, identity: `${stat.dev}:${stat.ino}` };
+  }
   if (stat && (!stat.isDirectory() || stat.isSymbolicLink())) {
     throw new Error(`managed shell write grant must name a directory subtree: ${grant}`);
   }
@@ -801,7 +817,7 @@ function writableMountTarget(workspace: MissionWorkspace, input: string): { host
   const hostPath = path.join(workspace.candidateRoot, relative);
   const opened = lstatSync(hostPath);
   if (!opened.isDirectory() || opened.isSymbolicLink()) throw new Error(`managed write mount is not a real directory: ${grant}`);
-  return { hostPath, sandboxPath: `${WORKSPACE_MOUNT}/${relative}` };
+  return { hostPath, sandboxPath: `${WORKSPACE_MOUNT}/${relative}`, directory: true, identity: `${opened.dev}:${opened.ino}` };
 }
 
 function assertWorkspaceIdentity(workspace: MissionWorkspace): void {
@@ -993,7 +1009,7 @@ function namespaceId(name: "pid" | "net"): string {
   return readlinkSync(`/proc/self/ns/${name}`);
 }
 
-function openSeccompFilter(): number {
+export function openSeccompFilter(): number {
   const syscalls = syscallTable();
   const rules: Array<[number, number]> = [];
   const instruction = (code: number, jumpTrue = 0, jumpFalse = 0, value = 0) => rules.push([code | (jumpTrue << 8) | (jumpFalse << 16), value]);

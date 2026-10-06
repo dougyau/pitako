@@ -258,9 +258,20 @@ Six records stay separate. `todo` is the current session checklist. The Board ho
 
 ## Durable missions (opt-in)
 
-`/mission` is the operator-console entry point for a frozen mission definition.
-Preparation validates its DAG, bounded role policies and budget before any worker
-starts. Activation journals intent before managed SDK tools run; candidates,
+`/mission prepare <plan-id>` reads the frozen Markdown, execution root and configured
+role policies, then queues assisted authoring to the **current principal coordinator**.
+Busy work continues; no worker or second coordinator is launched. The coordinator
+submits an untrusted proposal through `mission_prepare`; native questions bind genuine
+source ambiguities, explicit permissions and all five budgets. Estimates are not approval.
+An exact source-bound preview and native confirmation admit only that prepared object.
+No `.mission.json` is required, and preparation starts no setup or implementation.
+
+`/mission start <plan-id>` separately confirms activation/setup; native
+`pause|resume|cancel` commands control execution. Dismissed or invalidated drafts
+require preparation again; admitted preparation survives reload. This boundary trusts
+the Pi host and installed extensions to handle confirmation, **not** to attest human
+origin. Headless/RPC/child sessions cannot auto-approve; the console is optional.
+Activation journals intent before managed SDK tools run; candidates,
 artifacts and receipts persist outside the source checkout. A result is delivered
 without automatically changing source, committing or publishing it.
 
