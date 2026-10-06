@@ -303,6 +303,14 @@ function executionBinding(
   return { planId: plan.meta.id, revision: plan.meta.revision, hash: plan.meta.hash, executionRoot, planSource };
 }
 
+/** Mission discovery must never open or normalize a legacy execution ledger. */
+export function resolveFrozenPlanBinding(id: string, cwd = process.cwd()): {
+  binding: ExecutionBinding; file: string; text: string; meta: PlanMeta;
+} {
+  const binding = executionBinding(readFrozenPlan(id, cwd), currentWorkspace(cwd));
+  return { binding, ...verifyExecutionBinding(binding) };
+}
+
 function readPinnedPlan(
   binding: ExecutionBinding,
   commonDir: string,

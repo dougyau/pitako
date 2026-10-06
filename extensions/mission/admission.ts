@@ -9,7 +9,8 @@ type ChoiceTarget = { kind: "predicate" | "unit" | "mission"; id?: string; field
 type ChoiceEdit = { target: ChoiceTarget; before: unknown; after: unknown };
 export type OperatorChoice = { kind: "revise" | "answer"; questionId?: string; edits: ChoiceEdit[] } |
   { kind: "withdraw"; questionId: string };
-export type OperatorReceipt = Readonly<{ id: string; source: "console"; sessionId: string; text: string; instruction: string; receivedAt: number;
+export type OperatorSource = "console" | "native-confirmation";
+export type OperatorReceipt = Readonly<{ id: string; source: OperatorSource; sessionId: string; text: string; instruction: string; receivedAt: number;
   missionId?: string; ownerEpoch?: number; base?: Readonly<{ revision: number; planHash: string; definitionHash: string }>; choice?: Readonly<OperatorChoice>; format?: "mission-operator-choice-v1" }>;
 const issued = new WeakSet<OperatorReceipt>();
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -24,12 +25,18 @@ function freezeDeep<T>(value: T): T {
   return value;
 }
 
-/** Mint only after the local operator console verifies a submission; Pi input is advisory. */
-export function recordOperatorInput(source: "console", sessionId: string, text: string, causalId: ReturnType<typeof randomUUID> = randomUUID(), instruction = text): OperatorReceipt | undefined {
-  if (source !== "console" || !sessionId || !text.trim()) return undefined;
+/** Host adapter only: authenticated console submission or an exact native UI confirmation. */
+export function recordOperatorInput(source: OperatorSource, sessionId: string, text: string, causalId: ReturnType<typeof randomUUID> = randomUUID(), instruction = text): OperatorReceipt | undefined {
+  if (!["console", "native-confirmation"].includes(source) || !sessionId || !text.trim()) return undefined;
   const receipt = Object.freeze({ id: causalId, source, sessionId, text, instruction, receivedAt: performance.now() });
   issued.add(receipt);
   return receipt;
+}
+
+export function consumeOperatorInput(receipt: OperatorReceipt, sessionId: string, text: string): void {
+  if (!issued.has(receipt) || receipt.sessionId !== sessionId || receipt.text !== text)
+    throw new Error("current one-use host-issued operator receipt required");
+  issued.delete(receipt);
 }
 
 function editSource(definition: MissionDefinition, target: ChoiceTarget): unknown {
@@ -48,7 +55,7 @@ function editSource(definition: MissionDefinition, target: ChoiceTarget): unknow
   return predicates[0];
 }
 
-function editValue(definition: MissionDefinition, target: ChoiceTarget): unknown {
+export function editValue(definition: MissionDefinition, target: ChoiceTarget): unknown {
   const segments = target.field.split("/");
   if (target.kind === "mission" && segments[0] === "units" && segments.length !== 1 ||
     target.kind === "unit" && segments[0] === "acceptance" && segments.length !== 1 ||
@@ -62,11 +69,11 @@ function editValue(definition: MissionDefinition, target: ChoiceTarget): unknown
   return value;
 }
 
-function parseChoice(detail: string, definition: MissionDefinition): OperatorChoice {
+export function parseChoice(detail: string, definition: MissionDefinition): OperatorChoice {
   const withdraw = /^withdraw\s+([0-9a-f-]{36})$/i.exec(detail);
   if (withdraw && uuid.test(withdraw[1]!)) return { kind: "withdraw", questionId: withdraw[1]! };
   const command = /^(?:set\s+([\s\S]+)|answer\s+([0-9a-f-]{36})\s+([\s\S]+))$/.exec(detail);
-  const natural = /^Change (predicate|unit|mission) ([a-z0-9_-]+) ([a-zA-Z0-9_/-]+) to ([\s\S]+)$/.exec(detail);
+  const natural = /^Change (predicate|unit|mission) ([a-z0-9_-]+) ([a-zA-Z0-9_/-]+) to ([\s\S]+)$/.exec(command?.[2] ? command[3]! : detail);
   if (!command && !natural) throw new Error("operator choice requires exact typed command: set <edits-json> or answer <question-id> <edits-json>");
   if (command?.[2] && !uuid.test(command[2])) throw new Error("invalid question ID");
   let edits: unknown;
@@ -100,13 +107,13 @@ function parseChoice(detail: string, definition: MissionDefinition): OperatorCho
   return command?.[2] ? { kind: "answer", questionId: command[2], edits } : { kind: "revise", edits };
 }
 
-/** Only the authenticated console calls this with its current mission snapshot. */
+/** Only a host admission adapter calls this with its revalidated mission snapshot. */
 export function recordOperatorChoice(store: MissionStore, mission: MissionInspection, sessionId: string, text: string,
-  detail: string, causalId: ReturnType<typeof randomUUID> = randomUUID()): OperatorReceipt {
+  detail: string, causalId: ReturnType<typeof randomUUID> = randomUUID(), source: OperatorSource = "console"): OperatorReceipt {
   if (!sessionId || store.ownerEpoch === null || text !== `/mission revise ${mission.planId} ${detail}`)
-    throw new Error("operator console and exact mission command required");
+    throw new Error("host admission and exact mission command required; use /mission revise <plan-id> in this session");
   const choice = parseChoice(detail, mission.definition);
-  const receipt = freezeDeep({ id: causalId, source: "console" as const, sessionId, text, instruction: detail,
+  const receipt = freezeDeep({ id: causalId, source, sessionId, text, instruction: detail,
     receivedAt: performance.now(), format: "mission-operator-choice-v1" as const, missionId: mission.id,
     ownerEpoch: store.ownerEpoch, base: { revision: mission.revision, planHash: mission.snapshot.planHash,
       definitionHash: mission.snapshot.definitionHash }, choice: structuredClone(choice) });
@@ -213,7 +220,7 @@ function choiceRoots(question: PendingChoice, old: MissionDefinition, next: Miss
 
 function receiptValid(receipt: Record<string, unknown>, event: MissionEvent, snapshot: unknown): boolean {
   if (!object(snapshot) || !object(receipt.base)) return false;
-  return receipt.format === "mission-operator-choice-v1" && receipt.source === "console" &&
+  return receipt.format === "mission-operator-choice-v1" && (receipt.source === "console" || receipt.source === "native-confirmation") &&
     receipt.id === event.causalId && receipt.id === event.payload.operatorInputId &&
     receipt.missionId === event.missionId && typeof receipt.sessionId === "string" && !!receipt.sessionId &&
     typeof receipt.ownerEpoch === "number" && typeof receipt.receivedAt === "number" &&
@@ -248,6 +255,35 @@ export function revisionImpact(old: MissionDefinition, next: MissionDefinition):
   return [...changed].sort();
 }
 
+function selectChoiceQuestions(current: MissionDefinition, definition: MissionDefinition,
+  choice: Readonly<OperatorChoice> | undefined, pending: PendingChoice[]): PendingChoice[] {
+  const edits = choice && choice.kind !== "withdraw" ? choice.edits : [];
+  if (choice?.kind === "answer" && !pending.some(({ id }) => id === choice.questionId)) throw new Error("no pending question with this ID");
+  const covered = pending.filter((question) => questionTargets(question, edits) && choiceCovered(question, current, definition));
+  const selected = choice?.kind === "answer" ? covered.filter(({ id }) => id === choice.questionId) : covered;
+  if (choice?.kind === "answer" && (selected.length !== 1 || !exactAnswer(selected[0]!, edits)))
+    throw new Error("operator answer must cover exactly its question bindings");
+  if (choice?.kind === "revise" && selected.length > 1) throw new Error("ambiguous operator choice: name the question ID");
+  if (choice && pending.some((question) => choiceCovered(question, current, definition) &&
+    !selected.some((chosen) => chosen.id === question.id ||
+      chosen.bindings.length === question.bindings.length && questionTargets(question, edits)) &&
+    question.bindings.every((binding) => bindingValue(binding, definition) !== undefined)))
+    throw new Error("operator choice changes an unresolved field without exact selection");
+  return selected;
+}
+
+/** Read-only preflight shared by confirmation and committing choice admission. */
+export function validateOperatorChoice(store: MissionStore, mission: MissionInspection, choice: Readonly<OperatorChoice>) {
+  const pending = pendingMissionQuestions(mission.events, store);
+  if (choice.kind === "withdraw") {
+    if (!pending.some(({ id }) => id === choice.questionId)) throw new Error("no pending question with this ID");
+    return { definition: mission.definition, pending };
+  }
+  const definition = chosenDefinition(mission.definition, choice.edits);
+  selectChoiceQuestions(mission.definition, definition, choice, pending);
+  return { definition, pending };
+}
+
 export function admitMissionChange(input: {
   store: MissionStore; engine?: MissionEngine; missionId: string; expectedVersion: number;
   planBytes: Uint8Array; definitionBytes: Uint8Array; receipt?: OperatorReceipt;
@@ -280,19 +316,7 @@ export function admitMissionChange(input: {
   const impact = revisionImpact(current.definition, definition);
   const pending = pendingMissionQuestions(current.events, input.store);
   const choice = input.actor === "operator" ? input.receipt!.choice! : undefined;
-  const edits = choice && choice.kind !== "withdraw" ? choice.edits : [];
-  if (choice?.kind === "answer" && !pending.some(({ id }) => id === choice.questionId)) throw new Error("no pending question with this ID");
-  const covered = pending.filter((question) => questionTargets(question, edits) && choiceCovered(question, current.definition, definition));
-  const selected = choice?.kind === "answer" ? covered.filter(({ id }) => id === choice.questionId) : covered;
-  if (choice?.kind === "answer" && (selected.length !== 1 || !exactAnswer(selected[0]!, edits)))
-    throw new Error("operator answer must cover exactly its question bindings");
-  if (choice?.kind === "revise" && selected.length > 1) throw new Error("ambiguous operator choice: name the question ID");
-  if (input.actor === "operator" && pending.some((question) => choiceCovered(question, current.definition, definition) &&
-    !selected.some((chosen) => chosen.id === question.id ||
-      chosen.bindings.length === question.bindings.length && questionTargets(question, edits)) &&
-    question.bindings.every((binding) => bindingValue(binding, definition) !== undefined))) {
-    throw new Error("operator choice changes an unresolved field without exact selection");
-  }
+  const selected = selectChoiceQuestions(current.definition, definition, choice, pending);
   const resolutions = selected.map(({ id }) => id);
   const questionMappings = pending.filter(({ id }) => !resolutions.includes(id)).map((question) => {
     const roots = choiceRoots(question, current.definition, definition);

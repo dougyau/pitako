@@ -4,10 +4,13 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { connect } from "node:net";
 import path from "node:path";
-import { createMissionFixture, missionDefinition, openFixtureStore } from "./mission-fixtures.ts";
+import { createMissionFixture, missionDefinition, type MissionFixture } from "./mission-fixtures.ts";
+import { openMissionStore } from "../extensions/mission/store.ts";
 import { packageRoot } from "../extensions/stack.ts";
 
 const fixtures: string[] = [];
+const openFixtureStore = (fixture: MissionFixture) =>
+  openMissionStore({ dbPath: fixture.dbPath, objectDir: fixture.objectDir, readOnly: true });
 afterEach(() => { for (const base of fixtures.splice(0)) rmSync(base, { recursive: true, force: true }); });
 
 function installSlowProvider(agentDir: string, abortReleaseFile?: string) {
@@ -80,6 +83,9 @@ function rpc(cwd: string, agentDir: string) {
   };
   return {
     child, events, wait,
+    async console() {
+      return this.request("prompt", { message: "/mission console" });
+    },
     async request(type: string, extra: Record<string, unknown> = {}) {
       const id = randomUUID();
       child.stdin.write(JSON.stringify({ type, ...extra, id }) + "\n");
@@ -107,7 +113,7 @@ async function consoleInput(socket: string, text: string, proof = readFileSync(`
   });
 }
 
-test("real Pi 0.87 TUI keeps an active worker while console answers and fences a revised dependency", async () => {
+test("real Pi 0.87 TUI confirms native actions while optional console holds and revision fences an active worker", async () => {
   const fixture = createMissionFixture("pitako-t5-tui-"); fixtures.push(fixture.base);
   mkdirSync(path.join(fixture.stateDir, "pitako"), { recursive: true });
   writeFileSync(path.join(fixture.stateDir, "pitako", "config.toml"), "");
@@ -145,13 +151,38 @@ test("real Pi 0.87 TUI keeps an active worker while console answers and fences a
   const socketDir = path.join(fixture.stateDir, "pitako", "console");
   let store: Awaited<ReturnType<typeof openFixtureStore>> | undefined;
   try {
+    await wait(() => output.includes("Pi") || output.includes("pi v"));
+    expect(existsSync(socketDir)).toBe(false);
+    const native = async (verb: string, accepted = true, payload = "") => {
+      const since = output.length;
+      child.stdin.write(`/mission ${verb === "prepare" ? "prepare-file" : verb} durable-fixture${payload ? ` ${payload}` : ""}\r`);
+      await wait(() => output.slice(since).includes(`Confirm mission ${verb}`));
+      if (verb === "revise") {
+        await wait(() => output.slice(since).includes('"before"') && output.slice(since).includes('"after"') &&
+          output.slice(since).includes('"native revised predicate"'));
+      }
+      child.stdin.write(accepted ? "\r" : "\x1b");
+      if (!accepted) await wait(() => output.slice(since).includes("Confirmation declined or dismissed"));
+    };
+    await native("prepare", false);
+    await wait(() => output.includes("Confirmation declined or dismissed"));
+    expect(existsSync(path.join(fixture.stateDir, "pitako", "missions.db"))).toBe(false);
+    await native("prepare");
+    await wait(() => output.includes("Prepared "));
+    store = await openFixtureStore(fixture);
+    const preparedNative = store.findManagedMission(fixture.root)!;
+    expect(preparedNative.events[0]?.payload.operatorReceipt).toMatchObject({ source: "native-confirmation" });
+    expect(preparedNative.events.some(({ kind }) => kind === "attempt.started")).toBe(false);
+    await native("start", false);
+    expect(store.inspectMission(preparedNative.id).state).toBe("prepared");
+    expect(store.inspectMission(preparedNative.id).events.some(({ kind }) => kind === "mission.activated")).toBe(false);
+    await native("start");
+    await wait(() => store!.inspectMission(preparedNative.id).events.some(({ kind }) => kind === "mission.activated"));
+    child.stdin.write("/mission console\r");
     await wait(() => output.includes("Mission operator console:") && existsSync(socketDir) && readdirSync(socketDir).some((name) => name.endsWith(".sock")));
     const socket = path.join(socketDir, readdirSync(socketDir).find((name) => name.endsWith(".sock"))!);
-    const prepare = await consoleInput(socket, "/mission prepare durable-fixture");
-    const start = await consoleInput(socket, "/mission start durable-fixture");
-    expect(prepare.ok).toBe(true);
-    expect(start.ok).toBe(true);
-    store = await openFixtureStore(fixture);
+    const prepare = preparedNative.events[0]?.payload.operatorReceipt;
+    const start = store.inspectMission(preparedNative.id).events.find(({ kind }) => kind === "mission.activated")?.payload;
     const missionId = store.findManagedMission(fixture.root)!.id;
     await wait(() => store!.inspectMission(missionId).events.some(({ kind }) => kind === "attempt.started"));
     const before = store.inspectMission(missionId);
@@ -184,22 +215,42 @@ test("real Pi 0.87 TUI keeps an active worker while console answers and fences a
     expect(revise.ok).toBe(true);
     expect(revise.message).toContain("impacted: consumer, snapshot");
     const after = store.inspectMission(missionId);
+    const revisedEvent = after.events.find(({ kind }) => kind === "mission.revised")!;
     expect(after.revision).toBe(2);
     expect(after.definition.units[0]!.acceptance[0]).toEqual(changed);
     expect(after.events.some(({ kind, revision }) => kind === "unit.accepted" && revision === 1)).toBe(false);
-    expect(after.events.some(({ kind }) => kind === "attempt.receipt")).toBe(false);
+    expect(after.events.filter(({ kind }) => kind === "attempt.receipt")).toEqual([]);
     expect(store.readArtifact(before.snapshot.definitionHash).equals(before.definitionBytes)).toBe(true);
     writeFileSync(abortReleaseFile, "release");
     await wait(() => store!.inspectMission(missionId).events.some(({ kind }) => kind === "attempt.receipt" || kind === "attempt.interrupted"));
     const settled = store.inspectMission(missionId);
     expect(settled.events.some(({ kind, revision }) => kind === "unit.accepted" && revision === 1)).toBe(false);
-    const revisedEvent = after.events.find(({ kind }) => kind === "mission.revised")!;
     expect(revisedEvent.payload.operatorInputId).toBe(revise.causalId);
+    // Native UI is a distinct admission path. Keep the active-worker console invariant above;
+    // now exercise actual typed native revision after its deliberately delayed SDK receipt settles.
+    await native("revise", true, 'Change predicate snapshot-present target to "native revised predicate"');
+    await wait(() => store!.inspectMission(missionId).revision === 3);
+    const nativeRevision = store.inspectMission(missionId).events.find(({ kind, revision }) => kind === "mission.revised" && revision === 3)!;
+    expect(nativeRevision.payload.operatorReceipt).toMatchObject({ source: "native-confirmation",
+      text: '/mission revise durable-fixture Change predicate snapshot-present target to "native revised predicate"' });
+    await native("pause");
+    await wait(() => store!.inspectMission(missionId).state === "paused");
+    await native("resume");
+    await wait(() => store!.inspectMission(missionId).events.some(({ kind, payload }) =>
+      kind === "mission.resumed" && payload.operatorSource === "native-confirmation"));
+    await native("cancel", false);
+    expect(store.inspectMission(missionId).events.some(({ kind }) => kind === "mission.cancelled")).toBe(false);
+    await native("cancel");
+    await wait(() => store!.inspectMission(missionId).state === "cancelled");
+    expect(store.inspectMission(missionId).events.find(({ kind }) => kind === "mission.cancelled")?.payload.operatorSource)
+      .toBe("native-confirmation");
     if (process.env.MISSION_T5_ARTIFACT_DIR) {
       mkdirSync(process.env.MISSION_T5_ARTIFACT_DIR, { recursive: true });
       writeFileSync(path.join(process.env.MISSION_T5_ARTIFACT_DIR, "host-tui-worker-observed.json"), JSON.stringify({
         runtime: "Pi 0.87.0 TUI under PTY", pid: child.pid, missionId,
-        input: { prepare, start, question, hypothetical, ambiguous, instruction, revise },
+        input: { prepare, start, question, hypothetical, ambiguous, instruction, revise, nativeRevision,
+          nativeControls: store.inspectMission(missionId).events.filter(({ kind, payload }) =>
+            ["mission.paused", "mission.resumed", "mission.cancelled"].includes(kind) && payload.operatorSource === "native-confirmation") },
         ambiguousHold: { choice, revision: held.revision,
           priorAccepted: held.events.filter(({ kind, revision }) => kind === "unit.accepted" && revision === 1).length },
         worker: { attemptStartedSeq: active.seq, activeAtQuestion: !unchanged.events.some(({ kind }) => kind === "attempt.receipt"),
@@ -215,6 +266,109 @@ test("real Pi 0.87 TUI keeps an active worker while console answers and fences a
     }
   } finally {
     writeFileSync(abortReleaseFile, "release");
+    store?.close();
+    if (child.pid && child.exitCode === null) {
+      try { process.kill(-child.pid, "SIGKILL"); } catch { /* already exited */ }
+      await new Promise<void>((resolve) => child.once("close", () => resolve()));
+    }
+  }
+}, 60_000);
+
+test.each(["current", "switch"] as const)("real Pi TUI pending native resume rechecks %s session after SDK drain", async (scenario) => {
+  const fixture = createMissionFixture("p4-drain-"); fixtures.push(fixture.base);
+  mkdirSync(path.join(fixture.stateDir, "pitako"), { recursive: true });
+  writeFileSync(path.join(fixture.stateDir, "pitako", "config.toml"), "");
+  const release = path.join(fixture.stateDir, "release-provider-abort");
+  const switched = path.join(fixture.stateDir, "switch-observed");
+  installSlowProvider(fixture.stateDir, release);
+  const probe = path.join(fixture.base, "switch-probe.js");
+  // Observe actual host dispatch, not a synthetic lifecycle event.
+  writeFileSync(probe, `import { writeFileSync } from "node:fs";
+export default function(pi) { pi.on("session_before_switch", () => writeFileSync(${JSON.stringify(switched)}, "observed")); }\n`);
+  const definition = missionDefinition();
+  definition.units[0]!.kind = "consultation";
+  definition.authority.rolePolicies.developer = { hash: "a".repeat(64), provider: "mission-slow-local", model: "fixture", fallbacks: [] };
+  definition.budget = { roleLaunches: 6, providerRequests: 8, tokens: 1600, activeTimeMs: 120000, artifactBytes: 1024 * 1024 };
+  writeFileSync(fixture.definitionFile, JSON.stringify(definition));
+  const child = spawn("script", ["-q", "-e", "-c",
+    `${JSON.stringify(path.join(packageRoot(), "node_modules/.bin/pi"))} --no-extensions --approve --no-session -e ${JSON.stringify(packageRoot())} -e ${JSON.stringify(probe)}`,
+    "/dev/null"], {
+    cwd: fixture.root, detached: true,
+    env: { ...process.env, PI_CODING_AGENT_DIR: fixture.stateDir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", TERM: "xterm-256color" },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let output = "";
+  child.stdout.on("data", (chunk) => { output += chunk.toString(); });
+  child.stderr.on("data", (chunk) => { output += chunk.toString(); });
+  const wait = async (predicate: () => boolean) => {
+    for (let i = 0; i < 1500; i++) {
+      if (predicate()) return;
+      if (child.exitCode !== null) throw new Error(`Pi TUI exited ${child.exitCode}: ${output.slice(-2000)}`);
+      await Bun.sleep(20);
+    }
+    throw new Error(`Pi TUI timed out: ${output.slice(-2000)}`);
+  };
+  const native = async (verb: string) => {
+    const since = output.length;
+    child.stdin.write(`/mission ${verb === "prepare" ? "prepare-file" : verb} durable-fixture\r`);
+    await wait(() => output.slice(since).includes(`Confirm mission ${verb}`));
+    child.stdin.write("\r");
+  };
+  let store: Awaited<ReturnType<typeof openFixtureStore>> | undefined;
+  let pausing: ReturnType<typeof consoleInput> | undefined;
+  let pauseSettled = false;
+  try {
+    await wait(() => output.includes("No models available"));
+    await native("prepare");
+    await wait(() => output.includes("Prepared "));
+    store = await openFixtureStore(fixture);
+    const id = store.findManagedMission(fixture.root)!.id;
+    await native("start");
+    await wait(() => store!.inspectMission(id).events.some(({ kind }) => kind === "provider.request.dispatched"));
+    child.stdin.write("/mission console\r");
+    const socketDir = path.join(fixture.stateDir, "pitako", "console");
+    await wait(() => existsSync(socketDir) && readdirSync(socketDir).some((name) => name.endsWith(".sock")));
+    const socket = path.join(socketDir, readdirSync(socketDir).find((name) => name.endsWith(".sock"))!);
+    // Explicit compatible console can pause while the foreground remains available.
+    // Pause's allSettled precedes its timeout: it cannot return a fenced error yet.
+    pausing = consoleInput(socket, "/mission pause durable-fixture").finally(() => { pauseSettled = true; });
+    await wait(() => store!.inspectMission(id).state === "paused");
+    await Bun.sleep(5_500);
+    expect(pauseSettled).toBe(false);
+    const paused = store.inspectMission(id);
+    expect(paused.events.some(({ kind }) => kind === "attempt.receipt")).toBe(false);
+    expect(paused.events.find(({ kind }) => kind === "mission.paused")?.payload.operatorSource).toBe("console");
+    await native("resume");
+    // The UI callback returns to the normal editor before the engine's drain settles.
+    await Bun.sleep(200);
+    expect(store.inspectMission(id).events.some(({ kind }) => kind === "mission.resumed")).toBe(false);
+    if (scenario === "switch") {
+      child.stdin.write("/new\r");
+      await wait(() => existsSync(switched));
+    }
+    writeFileSync(release, "release");
+    await pausing;
+    await wait(() => store!.inspectMission(id).events.some(({ kind }) => kind === "attempt.receipt"));
+    if (scenario === "switch") {
+      await wait(() => output.includes("confirmation expired") || store!.inspectMission(id).events.some(({ kind }) => kind === "mission.resumed"));
+      expect(store.inspectMission(id).events.filter(({ kind }) => kind === "mission.resumed")).toHaveLength(0);
+      expect(store.inspectMission(id).state).toBe("paused");
+    } else {
+      await wait(() => store!.inspectMission(id).events.some(({ kind }) => kind === "mission.resumed"));
+      expect(store.inspectMission(id).events.find(({ kind }) => kind === "mission.resumed")?.payload.operatorSource).toBe("native-confirmation");
+    }
+    if (process.env.MISSION_T5_ARTIFACT_DIR) {
+      mkdirSync(process.env.MISSION_T5_ARTIFACT_DIR, { recursive: true });
+      writeFileSync(path.join(process.env.MISSION_T5_ARTIFACT_DIR, `host-native-resume-${scenario}.json`), JSON.stringify({
+        runtime: "Pi 0.87.0 TUI under PTY", scenario, id, pausePendingAfter5500ms: true,
+        switchObservedBeforeRelease: existsSync(switched), pauseReply: await pausing,
+        events: store.inspectMission(id).events.filter(({ kind }) =>
+          ["mission.paused", "mission.resumed", "attempt.receipt", "attempt.interrupted"].includes(kind)),
+      }, null, 2));
+    }
+  } finally {
+    writeFileSync(release, "release");
+    await pausing?.catch(() => {});
     store?.close();
     if (child.pid && child.exitCode === null) {
       try { process.kill(-child.pid, "SIGKILL"); } catch { /* already exited */ }
@@ -239,6 +393,7 @@ test("real Pi RPC never transfers active worker on /new; startup reconciles save
   let second: ReturnType<typeof rpc> | undefined;
   try {
     await first.request("get_commands");
+    await first.console();
     await first.wait(() => existsSync(socketDir) && readdirSync(socketDir).some((name) => name.endsWith(".sock")));
     const prepared = await consoleInput(activeSocket(), "/mission prepare durable-fixture");
     expect(prepared.ok).toBe(true);
@@ -259,6 +414,7 @@ test("real Pi RPC never transfers active worker on /new; startup reconciles save
     const switched = await first.request("new_session");
     expect(switched.success).toBe(true);
     await first.wait(() => store.inspectMission(id).events.some(({ kind }) => kind === "mission.owner.released"));
+    await first.console();
     await first.wait(() => readdirSync(socketDir).some((name) => name.endsWith(".sock")));
     const after = store.inspectMission(id);
     expect(after.events.filter(({ kind }) => kind === "attempt.reserved")).toHaveLength(1);
@@ -270,6 +426,7 @@ test("real Pi RPC never transfers active worker on /new; startup reconciles save
     store.close();
     second = rpc(fixture.root, fixture.stateDir);
     await second.request("get_commands");
+    await second.console();
     await second.wait(() => existsSync(socketDir) && readdirSync(socketDir).some((name) => name.endsWith(".sock")));
     const reopened = await openFixtureStore(fixture);
     expect(reopened.inspectMission(id).state).toBe("paused");
@@ -307,6 +464,7 @@ test("real Pi RPC SIGKILL of active worker reconciles on startup without operato
   let second: ReturnType<typeof rpc> | undefined;
   try {
     await first.request("get_commands");
+    await first.console();
     await first.wait(() => existsSync(socketDir) && readdirSync(socketDir).some((name) => name.endsWith(".sock")));
     const socket = path.join(socketDir, readdirSync(socketDir).find((name) => name.endsWith(".sock"))!);
     expect((await consoleInput(socket, "/mission prepare durable-fixture")).ok).toBe(true);
@@ -355,6 +513,7 @@ test("real Pi RPC admits authenticated console actions, not forged prompts, acro
   let second: ReturnType<typeof rpc> | undefined;
   try {
     await first.request("get_commands");
+    await first.console();
     await first.wait(() => existsSync(sockets) && readdirSync(sockets).some((file) => file.endsWith(".sock")));
     const socket = path.join(sockets, readdirSync(sockets).find((file) => file.endsWith(".sock"))!);
     const forged = await first.request("prompt", { message: "/mission start durable-fixture" });
@@ -371,6 +530,7 @@ test("real Pi RPC admits authenticated console actions, not forged prompts, acro
     await first.close("SIGKILL");
     second = rpc(fixture.root, fixture.stateDir);
     await second.request("get_commands");
+    await second.console();
     await second.wait(() => existsSync(sockets) && readdirSync(sockets).some((file) => file.endsWith(".sock") && file !== path.basename(socket)));
     const reloadedSocket = path.join(sockets, readdirSync(sockets).find((file) => file.endsWith(".sock") && file !== path.basename(socket))!);
     const attached = await consoleInput(reloadedSocket, "/mission attach durable-fixture");
@@ -379,6 +539,7 @@ test("real Pi RPC admits authenticated console actions, not forged prompts, acro
     expect(status.ok).toBe(true);
     expect(JSON.parse(status.message).id).toBe(mission.id);
     const switched = await second.request("new_session");
+    await second.console();
     await second.wait(() => readdirSync(sockets).some((file) => file.endsWith(".sock.key") && file !== `${path.basename(socket)}.key` && file !== `${path.basename(reloadedSocket)}.key`));
     const switchedSocket = path.join(sockets, readdirSync(sockets).find((file) => file.endsWith(".sock.key") && file !== `${path.basename(socket)}.key` && file !== `${path.basename(reloadedSocket)}.key`)!.slice(0, -4));
     const afterSwitch = await consoleInput(switchedSocket, "/mission attach durable-fixture");
@@ -431,6 +592,7 @@ test("real Pi RPC clean close drains active owner, startup resumes saved authori
   let store: Awaited<ReturnType<typeof openFixtureStore>> | undefined;
   try {
     await first.request("get_commands");
+    await first.console();
     await first.wait(() => existsSync(socketDir) && readdirSync(socketDir).some((name) => name.endsWith(".sock")));
     expect((await consoleInput(socket(), "/mission prepare durable-fixture")).ok).toBe(true);
     const start = await consoleInput(socket(), "/mission start durable-fixture");
@@ -459,6 +621,7 @@ test("real Pi RPC clean close drains active owner, startup resumes saved authori
     const nextEpoch = (nextAttempt.payload.binding as { ownerEpoch: number }).ownerEpoch;
     expect(nextEpoch).toBeGreaterThan(oldEpoch);
     expect(resumed.events.some(({ kind, attemptId }) => ["attempt.settled", "attempt.interrupted"].includes(kind) && attemptId === oldAttempt.attemptId)).toBe(true);
+    await second.console();
     await second.wait(() => existsSync(socketDir) && readdirSync(socketDir).some((name) => name.endsWith(".sock")));
     const paused = await consoleInput(socket(), "/mission pause durable-fixture");
     expect(store.inspectMission(id).events.some(({ kind, payload }) => kind === "mission.paused" && payload.operatorInputId === paused.causalId)).toBe(true);
@@ -471,9 +634,10 @@ test("real Pi RPC clean close drains active owner, startup resumes saved authori
     const stillPaused = store.inspectMission(id);
     expect(stillPaused.state).toBe("paused");
     expect(stillPaused.events.filter(({ kind }) => kind === "attempt.reserved")).toHaveLength(pausedCount);
+    await third.console();
     await third.wait(() => existsSync(socketDir) && readdirSync(socketDir).some((name) => name.endsWith(".sock")));
     const cancelled = await consoleInput(socket(), "/mission cancel durable-fixture");
-    expect(cancelled.ok).toBe(true);
+    expect(cancelled).toMatchObject({ ok: true });
     await third.graceful();
     store.close(); store = undefined;
     fourth = rpc(fixture.root, fixture.stateDir);
@@ -524,6 +688,7 @@ test("real Pi RPC fork does not acquire a running mission or launch a replacemen
   let store: Awaited<ReturnType<typeof openFixtureStore>> | undefined;
   try {
     await host.request("get_commands");
+    await host.console();
     await host.wait(() => existsSync(socketDir) && readdirSync(socketDir).some((name) => name.endsWith(".sock")));
     const socket = () => path.join(socketDir, readdirSync(socketDir).find((name) => name.endsWith(".sock"))!);
     const model = await host.request("set_model", { provider: "mission-slow-local", modelId: "fixture" });
@@ -548,6 +713,7 @@ test("real Pi RPC fork does not acquire a running mission or launch a replacemen
     expect(after.events.filter(({ kind }) => kind === "attempt.reserved")).toHaveLength(1);
     expect(after.events.some(({ kind, payload }) => kind === "mission.owner.released" && payload.reason === "fork")).toBe(true);
     const releasedEpoch = (before.events.find(({ kind }) => kind === "attempt.reserved")!.payload.binding as { ownerEpoch: number }).ownerEpoch;
+    await host.console();
     await host.wait(() => existsSync(socketDir) && readdirSync(socketDir).some((name) => name.endsWith(".sock")));
     const attached = await consoleInput(socket(), "/mission attach durable-fixture");
     expect(attached.ok).toBe(true);
@@ -601,6 +767,8 @@ test("real Pi TUI reload retires active owner before restarting saved work", asy
   let store: Awaited<ReturnType<typeof openFixtureStore>> | undefined;
   try {
     const socketDir = path.join(fixture.stateDir, "pitako", "console");
+    await wait(() => screen.includes("Pi") || screen.includes("pi v"));
+    host.stdin!.write("/mission console\r");
     await wait(() => screen.includes("Mission operator console:") && existsSync(socketDir) &&
       readdirSync(socketDir).some((name) => name.endsWith(".sock")));
     const socket = path.join(socketDir, readdirSync(socketDir).find((name) => name.endsWith(".sock"))!);
@@ -670,6 +838,7 @@ test("real Pi console records display only after PTY render; missed UI and dupli
   let store: Awaited<ReturnType<typeof openFixtureStore>> | undefined;
   try {
     await host.request("get_commands");
+    await host.console();
     await host.wait(() => existsSync(socketDir) && readdirSync(socketDir).some((name) => name.endsWith(".sock")));
     const socket = path.join(socketDir, readdirSync(socketDir).find((name) => name.endsWith(".sock"))!);
     expect((await consoleInput(socket, "/mission prepare durable-fixture")).ok).toBe(true);

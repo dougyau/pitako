@@ -37,7 +37,8 @@ describe("mission domain schemas", () => {
 
   test("fails closed for malformed UTF-8, unknown schema fields, and incomplete definitions", () => {
     expect(() => validateMissionDefinitionBytes(Buffer.from([0xff, 0xfe]))).toThrow(/UTF-8 JSON/);
-    expect(() => validateMissionDefinition({ ...missionDefinition(), schemaVersion: 2 })).toThrow(/schema 2 is not supported/);
+    expect(() => validateMissionDefinition({ ...missionDefinition(), schemaVersion: 3 })).toThrow(/schema 3 is not supported/);
+    expect(() => validateMissionDefinition({ ...missionDefinition(), schemaVersion: 2 })).toThrow(/model target must be an object/);
     expect(() => validateMissionDefinition({ ...missionDefinition(), injectedExecutor: "run()" })).toThrow(/unknown: injectedExecutor/);
     expect(() => validateMissionDefinition({ ...missionDefinition(), units: [] })).toThrow(/non-empty array/);
   });

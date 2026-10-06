@@ -33,7 +33,7 @@ const sdkDefaultsReady = import(
 });
 
 const navigationWindows = new WeakMap<AgentSession, { remaining: number }>();
-const childLifecycles = new WeakMap<AgentSession, { bound: boolean; disposal?: Promise<void>; history?: SessionHistory }>();
+const childLifecycles = new WeakMap<AgentSession, { bound: boolean; disposal?: Promise<void>; history?: SessionHistory; prePrompt?: NonNullable<Attempt["session"]> }>();
 
 function disposeChildSession(session: AgentSession): Promise<void> {
   const lifecycle = childLifecycles.get(session)!;
@@ -73,13 +73,18 @@ export function createPiExecutor(options: { now?: () => number } = {}): AttemptE
       try {
         // Do not bind the worker abort signal here. The session abort owns cancellation.
         // A signal on runtime create aborts Cursor auth before the child prompt starts.
-        const runtime = await ModelRuntime.create({ allowModelNetwork: false, refreshOnCreate: false });
+        const runtime = await ModelRuntime.create({ allowModelNetwork: false });
         const selections = new WeakMap<object, RequestSelection>();
         keepCursorTools(runtime);
         installServiceTierTransport(runtime, selections);
         const result = await runTarget(runtime, selections, options.now ?? (() => performance.now()), input.target, input.task,
           { ...input, sessionHistory: history });
-        return history?.result(result) ?? result;
+        try {
+          return history?.result(result) ?? result;
+        } catch (error) {
+          await result.session?.dispose();
+          throw error;
+        }
       } catch (error) {
         history?.result({ status: input.signal.aborted ? "cancelled" : "failed", result: "", error: messageOf(error), sideEffects: false });
         throw error;
@@ -216,21 +221,24 @@ async function runTarget(
     durable?: DurableAttemptContext;
     sessionHistory?: SessionHistory;
   },
-  existing?: AgentSession,
+  existing?: { session: AgentSession; mode: "pre-prompt" | "continuation" },
 ): Promise<Attempt> {
-  if (input.signal.aborted) return { status: "cancelled", result: "cancelled", sideEffects: false };
+  const continuation = existing?.mode === "continuation";
+  const existingHandle = existing && resume(existing.session, runtime, selections, now, input,
+    !continuation && input.durable ? prompt : undefined);
+  if (input.signal.aborted) return { status: "cancelled", result: "cancelled", sideEffects: continuation, session: existingHandle };
   const model = findModel(runtime, target.model);
   if (input.durable?.effects && (/^cursor\//i.test(target.model) || model?.provider === "cursor" || model?.api === "cursor-native")) {
-    return { status: "failed", result: "managed missions deny Cursor/provider-native execution because it bypasses fenced local adapters", failureKind: "configuration", sideEffects: false };
+    return { status: "failed", result: "managed missions deny Cursor/provider-native execution because it bypasses fenced local adapters", failureKind: "configuration", sideEffects: continuation, session: existingHandle };
   }
   // Extension providers register during AgentSession bind, not on a fresh runtime.
   if (!model && !existing) return bindThenRun(runtime, selections, now, target, prompt, input);
   if (!model) {
     return target.fast === true
-      ? configurationFailure(`fast mode unsupported: model unavailable after provider registration: ${target.model}`, true, resume(existing!, runtime, selections, now, input))
-      : { status: "failed", result: "", error: `model unavailable: ${target.model}`, sideEffects: false };
+      ? configurationFailure(`fast mode unsupported: model unavailable after provider registration: ${target.model}`, continuation, existingHandle)
+      : { status: "failed", result: "", error: `model unavailable: ${target.model}`, sideEffects: continuation, session: existingHandle };
   }
-  let session = existing;
+  let session = existing?.session;
   if (!session) {
     try {
       session = await openSession(runtime, model, target, input);
@@ -239,41 +247,42 @@ async function runTarget(
       return { status: "failed", result: "", error: messageOf(error), sideEffects: false };
     }
   }
+  const handle = resume(session, runtime, selections, now, input, !continuation && input.durable ? prompt : undefined);
+  const beforeDrive = async (result: Attempt): Promise<Attempt> => {
+    if (input.durable || continuation) return { ...result, session: handle };
+    await handle.dispose();
+    return result;
+  };
   if (input.signal.aborted) {
-    await resume(session, runtime, selections, now, input).dispose();
-    return { status: "cancelled", result: "cancelled", sideEffects: false };
+    return beforeDrive({ status: "cancelled", result: "cancelled", sideEffects: continuation });
   }
   // Provider registration can replace the runtime model while the session binds.
   const boundModel = findModel(runtime, target.model);
   if (!boundModel) {
-    const handle = resume(session, runtime, selections, now, input);
-    await handle.dispose();
-    return target.fast === true
-      ? configurationFailure(`fast mode unsupported: model unavailable after provider registration: ${target.model}`, false)
-      : { status: "failed", result: "", error: `model unavailable: ${target.model}`, sideEffects: false };
+    return beforeDrive(target.fast === true
+      ? configurationFailure(`fast mode unsupported: model unavailable after provider registration: ${target.model}`, continuation)
+      : { status: "failed", result: "", error: `model unavailable: ${target.model}`, sideEffects: continuation });
   }
   const activated = prepareTargetModel(boundModel, target, selections);
   if (activated.error) {
-    const handle = resume(session, runtime, selections, now, input);
-    if (!existing) await handle.dispose();
-    return configurationFailure(activated.error, Boolean(existing), existing ? handle : undefined);
+    return beforeDrive(configurationFailure(activated.error, continuation));
   }
   const activationError = await activateTarget(session, activated.model!, target, input.durable);
   if (activationError) {
-    const handle = resume(session, runtime, selections, now, input);
-    if (!existing) await handle.dispose();
-    return { status: "failed", result: "", error: activationError, sideEffects: Boolean(existing), session: existing ? handle : undefined };
+    return beforeDrive({ status: "failed", result: "", error: activationError, sideEffects: continuation });
   }
   try {
     if (session.thinkingLevel) {
       recordAppliedReasoning(activated.model!, selections, session.thinkingLevel);
       input.onActivated?.(session.thinkingLevel);
     }
+    // Retire the caller's retained wrapper too: drive can throw before returning a new handle.
+    delete handle.retryBeforePrompt;
+    childLifecycles.get(session)!.prePrompt = undefined;
     return await drive(session, runtime, selections, now, prompt, input);
   } catch (error) {
-    const handle = resume(session, runtime, selections, now, input);
-    if (!existing) await handle.dispose();
-    return { status: "failed", result: "", error: messageOf(error), sideEffects: Boolean(existing), session: existing ? handle : undefined };
+    if (!continuation && !input.durable) await handle.dispose();
+    return { status: "failed", result: "", error: messageOf(error), sideEffects: continuation, session: continuation || input.durable ? handle : undefined };
   }
 }
 
@@ -346,37 +355,14 @@ async function bindThenRun(
     if (input.signal.aborted) return { status: "cancelled", result: "cancelled", sideEffects: false };
     return { status: "failed", result: "", error: messageOf(error), sideEffects: false };
   }
-  const handle = () => resume(session, runtime, selections, now, input);
-  if (input.signal.aborted) {
-    await handle().dispose();
-    return { status: "cancelled", result: "cancelled", sideEffects: false };
-  }
-  const model = findModel(runtime, target.model);
-  if (!model) {
-    await handle().dispose();
-    return target.fast === true
-      ? configurationFailure(`fast mode unsupported: model unavailable after provider registration: ${target.model}`, false)
-      : { status: "failed", result: "", error: `model unavailable: ${target.model}`, sideEffects: false };
-  }
-  const activated = prepareTargetModel(model, target, selections);
-  if (activated.error) {
-    await handle().dispose();
-    return configurationFailure(activated.error, false);
-  }
-  const activationError = await activateTarget(session, activated.model!, target, input.durable);
-  if (activationError) {
-    await handle().dispose();
-    return { status: "failed", result: "", error: activationError, sideEffects: false };
-  }
+  const handle = resume(session, runtime, selections, now, input, input.durable ? prompt : undefined);
   try {
-    if (session.thinkingLevel) {
-      recordAppliedReasoning(activated.model!, selections, session.thinkingLevel);
-      input.onActivated?.(session.thinkingLevel);
-    }
-    return await drive(session, runtime, selections, now, prompt, input);
+    const result = await runTarget(runtime, selections, now, target, prompt, input, { session, mode: "pre-prompt" });
+    if (!input.durable && !result.session) await handle.dispose();
+    return result;
   } catch (error) {
-    await handle().dispose();
-    return { status: "failed", result: "", error: messageOf(error), sideEffects: false };
+    await handle.dispose();
+    throw error;
   }
 }
 
@@ -681,19 +667,37 @@ function resume(
     onActivity?: Parameters<AttemptExecutor["start"]>[0]["onActivity"];
     onActivated?: (appliedReasoning: string) => void;
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
+    durable?: DurableAttemptContext;
   },
+  pendingPrompt?: string,
 ): NonNullable<Attempt["session"]> {
   const history = childLifecycles.get(session)?.history;
-  return {
+  const lifecycle = childLifecycles.get(session)!;
+  if (pendingPrompt !== undefined && lifecycle.prePrompt) return lifecycle.prePrompt;
+  const handle: NonNullable<Attempt["session"]> = {
     async continueWith(target, note, signal) {
       history?.append("continuation", { target, note });
-      const result = await runTarget(runtime, selections, now, target, note, { ...input, signal, sessionHistory: history }, session);
+      const result = await runTarget(runtime, selections, now, target, note, { ...input, signal, sessionHistory: history }, { session, mode: "continuation" });
       return history?.result(result) ?? result;
     },
     async dispose() {
       await disposeChildSession(session);
     },
   };
+  if (pendingPrompt !== undefined) {
+    handle.retryBeforePrompt = async (target, signal) => {
+      const result = await runTarget(runtime, selections, now, target, pendingPrompt,
+        { ...input, signal, sessionHistory: history }, { session, mode: "pre-prompt" });
+      try {
+        return history?.result(result) ?? result;
+      } catch (error) {
+        await handle.dispose();
+        throw error;
+      }
+    };
+    lifecycle.prePrompt = handle;
+  }
+  return handle;
 }
 
 function findModel(runtime: ModelRuntime, ref: string) {

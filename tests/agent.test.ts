@@ -18,6 +18,7 @@ import { openBoard } from "../extensions/board/store.ts";
 import { currentWorkspace, repositoryIdentity } from "../extensions/board/workspace.ts";
 import pitako from "../extensions/index.ts";
 import { resolveRole } from "../extensions/roles/load.ts";
+import type { ModelTarget } from "../extensions/roles/types.ts";
 import { packageRoot } from "../extensions/stack.ts";
 import { loadPitako, registeredToolNames } from "../scripts/load-pitako.ts";
 import { completeTool, emptyCodeIntelligenceUsage } from "../extensions/code-intelligence/metrics.ts";
@@ -64,6 +65,62 @@ function scripted(attempts: Attempt[]): AttemptExecutor & { starts: string[]; no
 }
 
 describe("agent instance", () => {
+  test("pre-prompt capability routes complete targets without restart or continuation", async () => {
+    const targets: ModelTarget[] = [{ model: "offline/primary", reasoning: "high", fast: false },
+      { model: "offline/fallback", reasoning: "off", fast: true }];
+    const task = " \nexact reserved task\n ";
+    let starts = 0, retries = 0, continuations = 0, disposals = 0;
+    const session = {
+      async retryBeforePrompt(target: ModelTarget) {
+        retries++;
+        expect(target).toEqual(targets[1]);
+        delete (session as Partial<typeof session>).retryBeforePrompt;
+        return { status: "completed" as const, result: "offline", sideEffects: false, session,
+          usage: { input: 3, output: 4 } };
+      },
+      async continueWith() { continuations++; throw new Error("must not continue before prompt"); },
+      async dispose() { disposals++; },
+    };
+    const result = await runAgentInstance({
+      roleId: "developer", cwd: process.cwd(), load: { env: tempEnv() }, task,
+      durable: { attemptId: "offline", sessionId: "offline", sessionDir: "/unused",
+        readOnly: true, onProviderDispatch() { throw new Error("must not dispatch"); }, onProviderReceipt() { throw new Error("must not receipt"); },
+        rolePolicy: { primary: targets[0]!, fallbacks: [targets[1]!] } },
+      executor: { async start(input) {
+        starts++;
+        expect(input.task).toBe(task);
+        expect(input.target).toEqual(targets[0]);
+        return { status: "failed", result: "", error: "model unavailable: offline/primary", sideEffects: false, session,
+          usage: { input: 1, output: 2 } };
+      } },
+    });
+    expect(result.status).toBe("completed");
+    expect(result.model).toMatchObject({ selectedModel: "offline/fallback", requestedReasoning: "off",
+      fallbackOccurred: true, fallbackReason: "unavailable" });
+    expect(result.usage).toMatchObject({ input: 4, output: 6 });
+    expect({ starts, retries, continuations, disposals }).toEqual({ starts: 1, retries: 1, continuations: 0, disposals: 1 });
+  });
+
+  test("watchdog terminal return still disposes newly returned attempt ownership", async () => {
+    let clock = 0, tick: (() => void) | undefined, disposed = 0;
+    const result = await runAgentInstance({
+      roleId: "developer", cwd: process.cwd(), load: { env: tempEnv() }, task: "offline",
+      durable: { attemptId: "offline-watchdog", sessionId: "offline-watchdog", sessionDir: "/unused",
+        readOnly: true, onProviderDispatch() { throw new Error("must not dispatch"); }, onProviderReceipt() { throw new Error("must not receipt"); },
+        rolePolicy: { primary: { model: "offline/primary" }, fallbacks: [] } },
+      now: () => clock, watchdog: { idleTimeoutMs: 100, toolStallTimeoutMs: 100, maxRunTimeMs: 1 },
+      schedule(fn) { tick = fn; return { unref() {} }; },
+      executor: { async start() {
+        clock = 2;
+        tick!();
+        return { status: "failed", result: "", error: "unavailable", sideEffects: false,
+          session: { async continueWith() { throw new Error("must not continue"); }, async dispose() { disposed++; } } };
+      } },
+    });
+    expect(result.status).toBe("failed");
+    expect(result.result).toContain("max runtime");
+    expect(disposed).toBe(1);
+  });
   test("execution summary distinguishes unavailable values from reported zero", () => {
     const result: AgentRunResult = {
       instanceId: "developer-summary", role: "developer", status: "completed", model: { selectedModel: "local/model" }, result: "done",

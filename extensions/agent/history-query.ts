@@ -8,8 +8,8 @@ import { catalogValues, checkJson, fileCut, HISTORY_BYTES, HISTORY_FRAGMENT, jso
 
 export type HistoryQuery =
   | { action: "list"; scope?: "all"; coordinatorSessionId?: string; missionId?: string;
-      assignmentId?: string; instanceId?: string; roleId?: string; cursor?: string; limit?: number }
-  | { action: "read"; historyId: string; cursor?: string; limit?: number };
+      assignmentId?: string; instanceId?: string; roleId?: string; unitId?: string; attemptId?: string; cursor?: string; limit?: number }
+  | { action: "read"; historyId: string; groupId?: string; cursor?: string; limit?: number };
 export interface HistoryPage {
   items: unknown[];
   diagnostics: Array<{ code: string; detail?: string }>;
@@ -18,7 +18,7 @@ export interface HistoryPage {
 type Cursor = { version: 1; action: "list" | "read"; identity: string; groupId: string;
   index: number; entryOffset?: number; cut: FileCut; json?: JsonState };
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const selectors = ["coordinatorSessionId", "missionId", "assignmentId", "instanceId", "roleId"] as const;
+const selectors = ["coordinatorSessionId", "missionId", "assignmentId", "instanceId", "roleId", "unitId", "attemptId"] as const;
 const encode = (cursor: Cursor) => Buffer.from(JSON.stringify(cursor)).toString("base64url");
 
 function decode(token: string | undefined, action: Cursor["action"], identity: string): Cursor | undefined {
@@ -132,6 +132,7 @@ async function list(query: Extract<HistoryQuery, { action: "list" }>, page: Hist
       const cut = fileCut(fd);
       if (previous?.groupId === groupId) validateCut(fd, previous.cut);
       const group = metadata(fd, groupId);
+      if (query.missionId && (group.identity.kind !== "mission" || group.identity.missionId !== query.missionId)) continue;
       let catalogCount = 0;
       for (const row of members(fd)) catalogCount = row.index + 1;
       const start = previous?.groupId === groupId ? previous.index : 0;
@@ -205,8 +206,8 @@ function sidecar(file: string): { code: string } {
   }
 }
 
-async function locate(directory: string, historyId: string): Promise<{ member: HistoryMember; groupId: string; deleting?: boolean } | undefined> {
-  for (const groupId of groupIds(directory)) {
+async function locate(directory: string, historyId: string, selectedGroup?: string): Promise<{ member: HistoryMember; groupId: string; deleting?: boolean } | undefined> {
+  for (const groupId of selectedGroup ? [selectedGroup] : groupIds(directory)) {
     const fd = catalog(directory, groupId);
     try {
       const group = metadata(fd, groupId);
@@ -224,8 +225,9 @@ async function locate(directory: string, historyId: string): Promise<{ member: H
 
 async function read(query: Extract<HistoryQuery, { action: "read" }>, page: HistoryPage, directory: string, limit: number) {
   if (!UUID.test(query.historyId)) throw new Error("invalid_history_id");
+  if (query.groupId !== undefined && !UUID.test(query.groupId)) throw new Error("invalid_group_id");
   const previous = decode(query.cursor, "read", query.historyId);
-  const found = await locate(directory, query.historyId);
+  const found = await locate(directory, query.historyId, query.groupId);
   if (!found) throw new Error(previous ? "stale_cursor" : "history_not_found");
   const { member, groupId } = found;
   if (previous && previous.groupId !== groupId) throw new Error("stale_cursor");
@@ -299,7 +301,7 @@ export async function queryHistory(input: HistoryQuery, coordinatorSessionId?: s
   const page: HistoryPage = { items: [], diagnostics: [], cursor: null };
   try {
     const limit = input.limit ?? 50;
-    const allowed = input.action === "list" ? ["action", "scope", ...selectors, "cursor", "limit"] : ["action", "historyId", "cursor", "limit"];
+    const allowed = input.action === "list" ? ["action", "scope", ...selectors, "cursor", "limit"] : ["action", "historyId", "groupId", "cursor", "limit"];
     if (Object.keys(input).some((key) => !allowed.includes(key))) throw new Error("invalid_parameter");
     if (!Number.isInteger(limit) || limit < 1 || limit > 200) throw new Error("invalid_limit");
     if (input.action === "list") {

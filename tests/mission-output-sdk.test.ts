@@ -38,6 +38,7 @@ async function runCase(name: string, predicates: AcceptancePredicate[][], overla
   const entered = Promise.withResolvers<void>();
   let held = false;
   let rootResponses = 0;
+  let clock = 0;
   const provider = await installMissionLocalProvider({ agentDir, responseForPrompt: (prompt) => {
     if (!lineage || mixedLineage && prompt.includes("Unit: first (")) return "PASS";
     if (prompt.includes("mission-singleton-continuation-v1")) return "PASS";
@@ -73,6 +74,7 @@ async function runCase(name: string, predicates: AcceptancePredicate[][], overla
       load: { env: { PI_CODING_AGENT_DIR: agentDir }, userConfigPath: config } });
     engine = new MissionEngine({ store, missionId: mission.id, sessionsDirectory: path.join(sample.base, "sessions"),
       managedWorkspace: { sourceRoot: sample.root, candidateParent: path.join(sample.base, "candidates") },
+      ...(name.startsWith("command-window-renewal") ? { now: () => clock } : {}),
       ...(rejectionCapture ? { captureRejection: rejectionCapture.captureRejection } : {}),
       ...(name === "injected" ? { assessPredicate: () => ({ verdict: "pass" as const, method: "injected PASS", authority: "production-checker" as const }) } : {}),
       runRole: async (input, durable) => {
@@ -92,6 +94,7 @@ async function runCase(name: string, predicates: AcceptancePredicate[][], overla
           expect(readFileSync(path.join(durable.cwd!, "src/b"), "utf8")).toBe("second\n");
         }
         const result = await runner(input, durable);
+        if (name.startsWith("command-window-renewal")) clock = name.endsWith("near-expiry") ? 55_001 : 60_001;
         if (name === "source-drift" && input.unit.id === "second") {
           writeFileSync(path.join(sample.root, "untracked"), "current user bytes\n");
           writeFileSync(path.join(sample.root, "operator.txt"), "staged current input\n");
@@ -287,5 +290,15 @@ test("production contained command pass, failure and timeout retain real receipt
     const result = await runCase(name, [[{ id: "a", kind: "command_exit", target: "result", command, expected: "0", timeoutMs }]]);
     expect(result.observations[0]).toMatchObject({ verdict, receipt: { termination } });
     expect(result.accepted).toBe(verdict === "pass" ? 1 : 0);
+  }
+}, 90000);
+
+test("production command renews an insufficient ordinary grant after SDK disposal", async () => {
+  for (const name of ["command-window-renewal", "command-window-renewal-near-expiry"]) {
+    const result = await runCase(name, [[{
+      id: "a", kind: "command_exit", target: "result", command: 'test "$(cat src/a)" = first', expected: "0", timeoutMs: 10000,
+    }]]);
+    expect(result.observations[0]).toMatchObject({ verdict: "pass", receipt: { termination: "exit" } });
+    expect(result.accepted).toBe(1);
   }
 }, 90000);

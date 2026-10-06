@@ -22,6 +22,8 @@ export const COMPLETION_AUDIT_POLICY: Record<string, "ordinary" | "attempt" | "e
     "resource.wait", "dispatch.observed", "workspace.candidate.registered", "workspace.candidate.relocated",
     "mission.recovery.diagnosed", "mission.recovery.continuation", "mission.recovery.continuation.recorded",
     "mission.recovery.repair.authorized", "mission.recovery.repair.started", "mission.recovery.repair.settled",
+    // Root setup has its own physical-disposal/input/output audit in assessMissionCompletion.
+    "mission.setup.intent", "mission.setup.invoking", "mission.setup.receipt", "mission.setup.reconciled", "mission.setup.reused",
   ].map((kind) => [kind, "ordinary"]),
   ...["attempt.reserved", "attempt.started", "attempt.interrupted", "attempt.receipt", "attempt.settled"].map((kind) => [kind, "attempt"]),
   ...["effect.denied", "effect.intent", "effect.invoking", "effect.process.registered", "effect.released",

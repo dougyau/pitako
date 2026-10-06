@@ -31,6 +31,84 @@ function result(text: string, requests?: AgentRunResult["requests"]): AgentRunRe
 const pass = () => ({ verdict: "pass" as const, method: "independent fixture check" });
 
 describe("mission resource accounting", () => {
+  test("ordinary requests cannot spend the extra protected Ponytail slot", async () => {
+    const fixture = createMissionFixture("pitako-accounting-ponytail-slot-");
+    fixtures.push(fixture);
+    const definition = missionDefinition();
+    definition.finalization.contractVersion = 1;
+    definition.budget = { roleLaunches: 6, providerRequests: 32, tokens: 200000, activeTimeMs: 900000, artifactBytes: 67108864 };
+    writeFileSync(fixture.definitionFile, JSON.stringify(definition));
+    const store = await openFixtureStore(fixture);
+    const mission = store.createMission(missionInput(fixture));
+    let rejected = false;
+    const engine = new MissionEngine({
+      store, missionId: mission.id, sessionsDirectory: path.join(fixture.stateDir, "sessions"),
+      runRole: async (_input, durable) => {
+        for (let index = 0; index < 28; index++) {
+          const requestId = randomUUID();
+          const ticket = await durable.onProviderDispatch({ requestId, provider: "fixture", model: "local" });
+          await durable.onProviderReceipt({ requestId, provider: "fixture", model: "local", inputTokens: 1, outputTokens: 1, ticket });
+        }
+        await expect(durable.onProviderDispatch({ requestId: randomUUID(), provider: "fixture", model: "local" }))
+          .rejects.toThrow();
+        rejected = true;
+        return { ...result("intentional stop"), status: "failed", error: "no completion claim" };
+      },
+    });
+    try {
+      engine.start(); await engine.waitForIdle();
+      expect(rejected).toBe(true);
+      const inspection = store.inspectMission(mission.id);
+      expect(inspection.events.filter(row => row.kind === "provider.request.dispatched")).toHaveLength(28);
+      expect(inspection.reservations.find(row => row.resource === "provider-requests" && row.purpose === "protected")?.amount).toBe(4);
+    } finally { await engine.close(); store.close(); }
+  });
+
+  test.each([false, true])("reserves ordinary token slack without borrowing finalization (versioned %s)", async (versioned) => {
+    const fixture = createMissionFixture("pitako-accounting-token-slack-");
+    fixtures.push(fixture);
+    const definition = missionDefinition();
+    if (versioned) definition.finalization.contractVersion = 1;
+    definition.budget = { roleLaunches: 6, providerRequests: 12, tokens: 200000, activeTimeMs: 900000, artifactBytes: 67108864 };
+    fixture.definitionBytes = Buffer.from(JSON.stringify(definition));
+    writeFileSync(fixture.definitionFile, fixture.definitionBytes);
+    const store = await openFixtureStore(fixture);
+    const mission = store.createMission(missionInput(fixture));
+    const engine = new MissionEngine({
+      store, missionId: mission.id, sessionsDirectory: path.join(fixture.stateDir, "sessions"),
+      runRole: async (_input, durable) => {
+        for (const [inputTokens, outputTokens] of [[14994, 299], [15801, 1186]]) {
+          const requestId = randomUUID();
+          const ticket = await durable.onProviderDispatch({ requestId, provider: "fixture", model: "local" });
+          await durable.onProviderReceipt({ requestId, provider: "fixture", model: "local", inputTokens, outputTokens, ticket });
+        }
+        const requestId = randomUUID();
+        const ticket = await durable.onProviderDispatch({ requestId, provider: "fixture", model: "local" });
+        await durable.onProviderReceipt({ requestId, provider: "fixture", model: "local", inputTokens: null, outputTokens: null, ticket });
+        return { ...result("intentional stop"), status: "failed", error: "no completion claim" };
+      },
+    });
+    try {
+      engine.start();
+      await engine.waitForIdle();
+      const inspection = store.inspectMission(mission.id);
+      const ordinary = inspection.reservations.filter(row => row.resource === "tokens" && row.purpose === "ordinary");
+      const protectedTokens = versioned ? 66668 : 33334;
+      expect(ordinary.map(row => row.knownCharge)).toEqual([15293, 16987, 0]);
+      for (const row of ordinary) {
+        expect(row.grantAmount).toBeGreaterThan(16987);
+        expect(row.grantAmount).toBeLessThanOrEqual(200000 - protectedTokens);
+      }
+      expect(ordinary.every(row => row.overage === 0)).toBe(true);
+      expect(ordinary[2]!.unknownCharge).toBe(ordinary[2]!.grantAmount);
+      expect(inspection.reservations.find(row => row.resource === "tokens" && row.purpose === "protected")?.amount).toBe(protectedTokens);
+      expect(inspection.events.some(row => row.kind === "budget.admission.fenced")).toBe(false);
+    } finally {
+      await engine.close();
+      store.close();
+    }
+  });
+
   test("reconciles runner usage claims without rebilling or rejecting the attempt receipt", async () => {
     const fixture = createMissionFixture("pitako-accounting-usage-");
     fixtures.push(fixture);

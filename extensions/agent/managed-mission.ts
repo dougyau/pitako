@@ -178,6 +178,17 @@ export async function inspectManagedMission(root: string, planId?: string): Prom
   return withMissionStore(async (store) => store.findManagedMission(root, planId));
 }
 
+/** Exact retained mission and verified repository family; no execution-owner admission. */
+export async function consultManagedMission<T>(root: string, missionId: string,
+  action: (store: MissionStore, mission: MissionInspection) => Promise<T>): Promise<T | undefined> {
+  return withMissionStore(async (store) => {
+    const repositoryId = store.verifyRepositoryAssociation(root);
+    const mission = store.inspectMission(missionId);
+    if (mission.repositoryId !== repositoryId) return undefined;
+    return action(store, mission);
+  }, true);
+}
+
 export async function authorizeRoleDispatch(root: string, options: {
   planId?: string;
   purpose?: "role" | "board-lifecycle";
@@ -284,10 +295,11 @@ export function managedAttemptStatus(mission: MissionInspection, attemptId: stri
   return "reserved";
 }
 
-async function withMissionStore<T>(action: (store: Awaited<ReturnType<typeof openMissionStore>>) => Promise<T>): Promise<T | undefined> {
+async function withMissionStore<T>(action: (store: Awaited<ReturnType<typeof openMissionStore>>) => Promise<T>, bounded = false): Promise<T | undefined> {
   const dbPath = path.join(getPitakoDataDir(), "missions.db");
   if (!existsSync(dbPath)) return undefined;
-  const store = await openMissionStore({ readOnly: true });
+  const store = await openMissionStore({ readOnly: true,
+    ...(bounded ? { historyReadBudget: { databaseBytes: 8 * 1024 * 1024, objectBytes: 2 * 1024 * 1024 } } : {}) });
   try {
     return await action(store);
   } catch (error) {

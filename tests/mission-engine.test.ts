@@ -806,8 +806,9 @@ describe("mission reducer and frontier pump", () => {
 
   test.each([
     { providerRequests: 4, tokens: 200, retryAdmitted: false, denial: "provider-requests" },
-    { providerRequests: 5, tokens: 201, retryAdmitted: false, denial: "tokens" },
+    { providerRequests: 5, tokens: 201, retryAdmitted: true, denial: "" },
     { providerRequests: 5, tokens: 200, retryAdmitted: true, denial: "" },
+    { providerRequests: 5, tokens: 4, retryAdmitted: false, denial: "tokens" },
   ])("root retry preserves beta's first provider/token grant ($providerRequests requests, $tokens tokens)",
     async ({ providerRequests, tokens, retryAdmitted, denial }) => {
       const alpha = { ...unit("alpha"), retryLimit: 1 };
@@ -829,7 +830,7 @@ describe("mission reducer and frontier pump", () => {
             const ticket = await durable.onProviderDispatch({ requestId, provider: "fixture", model: "local" });
             admitted = true;
             if (current.id === "beta") await durable.onProviderReceipt({
-              requestId, provider: "fixture", model: "local", inputTokens: 1, outputTokens: 1, ticket,
+              requestId, provider: "fixture", model: "local", inputTokens: 1, outputTokens: tokens === 4 ? 0 : 1, ticket,
             });
           } catch (caught) { error = String(caught); }
           calls.push({ unit: current.id, attemptNo: binding.attemptNo, admitted, error, requestId });
@@ -850,6 +851,11 @@ describe("mission reducer and frontier pump", () => {
         expect(dispatched.map(({ payload }) => payload.requestId)).toContain(beta?.requestId);
         expect(dispatched.some(({ payload }) => payload.requestId === retry?.requestId)).toBe(retryAdmitted);
         expect(dispatched).toHaveLength(retryAdmitted ? 3 : 2);
+        const betaDispatch = dispatched.find(({ payload }) => payload.requestId === beta?.requestId)!;
+        const betaGrant = inspection.events.find(({ kind, payload }) => kind === "reservation.created" &&
+          payload.reservationId === betaDispatch.payload.tokenReservationId)!;
+        expect(betaGrant.payload.amount).toBeGreaterThanOrEqual(Math.ceil(tokens / providerRequests));
+        expect(engine.snapshot().admissionFenced).toBe(false);
         expect(engine.snapshot().units.beta?.status).toBe("accepted");
         expect(inspection.reservations.filter(({ purpose }) => purpose === "protected").map(({ amount }) => amount))
           .toEqual([2, 2, 2 * Math.ceil(tokens / providerRequests), 120000, 2000]);

@@ -5,6 +5,8 @@ import { sha256, type MissionDefinition } from "./model.ts";
 import type { MissionInspection, MissionStore } from "./store.ts";
 import { captureWorkspaceImage, type WorkspaceManifest } from "./workspace.ts";
 import { MISSION_CHECK_IDENTITY, missionCheckRuntime } from "./checks.ts";
+import { missionInputIdentity } from "./inputs.ts";
+import { verifyExecutionBinding, type ExecutionBinding } from "../workflow.ts";
 
 // Binding.finalization distinguishes this engine-owned target from user units.
 export const FINALIZATION_OWNER = "mission-finalization";
@@ -76,22 +78,26 @@ export function compileFinalizationGrants(definition: MissionDefinition) {
   const launches = definition.units.reduce((sum, unit) => sum + (unit.team ? unit.team.members.length * 3 + 1 : 1), 0);
   const versioned = definition.finalization.contractVersion === 1;
   const roleLaunches = versioned ? 3 : 1 + Number(definition.finalization.independentReview);
+  const providerRequests = roleLaunches + Number(versioned);
   const stages = versioned ? 7 : roleLaunches;
-  const tokens = Math.max(1, Math.ceil(definition.budget.tokens / definition.budget.providerRequests));
+  const requestTokens = Math.max(1, Math.ceil(definition.budget.tokens / definition.budget.providerRequests));
+  // Two shares per launch is an allocation convention, not a provider input estimate.
+  const tokens = versioned ? Math.max(requestTokens, Math.ceil(definition.budget.tokens / (2 * definition.budget.roleLaunches))) : requestTokens;
   const active = Math.max(1, Math.floor(definition.budget.activeTimeMs / (definition.budget.roleLaunches + (versioned ? 4 : 0))));
   const artifacts = Math.max(1, Math.floor(definition.budget.artifactBytes / (definition.budget.roleLaunches + (versioned ? 4 : 0))));
-  const protectedAmounts = { "role-launches": roleLaunches, "provider-requests": roleLaunches,
-    tokens: roleLaunches * tokens, "active-time-ms": stages * active, "artifact-bytes": stages * artifacts };
+  const protectedAmounts = { "role-launches": roleLaunches, "provider-requests": providerRequests,
+    tokens: providerRequests * tokens, "active-time-ms": stages * active, "artifact-bytes": stages * artifacts };
   const ordinary = { "role-launches": launches, "provider-requests": launches,
-    tokens: launches * tokens, "active-time-ms": launches * active, "artifact-bytes": launches * artifacts };
+    tokens: launches * requestTokens, "active-time-ms": launches * active, "artifact-bytes": launches * artifacts };
   const caps = { "role-launches": definition.budget.roleLaunches, "provider-requests": definition.budget.providerRequests,
     tokens: definition.budget.tokens, "active-time-ms": definition.budget.activeTimeMs, "artifact-bytes": definition.budget.artifactBytes };
   for (const resource of Object.keys(caps) as Array<keyof typeof caps>)
     if (ordinary[resource] + protectedAmounts[resource] > caps[resource])
       throw new Error(`mandatory path plus protected finalization needs ${ordinary[resource] + protectedAmounts[resource]} ${resource}; budget allows ${caps[resource]}`);
-  return { protectedAmounts, active, artifacts, tokens,
+  return { protectedAmounts, active, artifacts, tokens, requestTokens,
     stages: FINALIZATION_PHASES.map((phase) => ({ phase, activeTimeMs: active, artifactBytes: artifacts,
-      roleLaunches: Number(["ponytail", "cleanup", "whole-review"].includes(phase)) })) };
+      roleLaunches: Number(["ponytail", "cleanup", "whole-review"].includes(phase)),
+      providerRequests: phase === "ponytail" ? 2 : Number(["cleanup", "whole-review"].includes(phase)) })) };
 }
 
 export function acceptedFinalizationInput(inspection: MissionInspection): string {
@@ -107,15 +113,20 @@ export interface SourceMutationWitness {
   format: "mission-linux-source-witness-v1";
   root: string;
   planId?: string;
+  sourceBinding?: ExecutionBinding;
   manifestHash: string;
   paths: Array<{ path: string; present: boolean; dev?: string; ino?: string; ctimeNs?: string; mode?: string; target?: string }>;
 }
 
 /** Separate from byte identity: Linux ctime detects ordinary edit-then-restore. No watcher or same-UID forgery promise. */
-export function observeSourceMutation(root: string, manifest: WorkspaceManifest, planId?: string): SourceMutationWitness {
+export function observeSourceMutation(root: string, manifest: WorkspaceManifest, planId?: string, sourceBinding?: ExecutionBinding): SourceMutationWitness {
   if (process.platform !== "linux") throw new Error("reliable Linux lstat mutation witness unavailable");
   const names = new Set<string>([".", ".git"]);
-  if (planId) for (const name of [".pitako", ".pitako/plans", `.pitako/plans/${planId}.md`, `.pitako/plans/${planId}.mission.json`]) names.add(name);
+  if (sourceBinding) {
+    verifyExecutionBinding(sourceBinding);
+    if (sourceBinding.executionRoot !== path.resolve(root)) throw new Error("source witness execution root differs from pin");
+    names.add(sourceBinding.planSource);
+  } else if (planId) for (const name of [".pitako", ".pitako/plans", `.pitako/plans/${planId}.md`, `.pitako/plans/${planId}.mission.json`]) names.add(name);
   for (const entry of [...manifest.tracked, ...manifest.untracked]) {
     names.add(entry.path);
     for (let parent = path.dirname(entry.path); parent !== "."; parent = path.dirname(parent)) names.add(parent);
@@ -145,7 +156,8 @@ export function observeSourceMutation(root: string, manifest: WorkspaceManifest,
       throw error;
     }
   });
-  return { format: "mission-linux-source-witness-v1", root: path.resolve(root), ...(planId ? { planId } : {}), manifestHash: manifest.hash, paths: rows };
+  return { format: "mission-linux-source-witness-v1", root: path.resolve(root), ...(planId ? { planId } : {}),
+    ...(sourceBinding ? { sourceBinding } : {}), manifestHash: manifest.hash, paths: rows };
 }
 
 export function sourceWitnessCurrent(store: MissionStore, hash: string, root: string): boolean {
@@ -153,21 +165,27 @@ export function sourceWitnessCurrent(store: MissionStore, hash: string, root: st
     const saved = JSON.parse(store.readArtifact(hash).toString()) as SourceMutationWitness;
     const current = captureWorkspaceImage(root).manifest;
     return saved.format === "mission-linux-source-witness-v1" &&
-      finalizationHash(observeSourceMutation(root, current, saved.planId)) === hash;
+      finalizationHash(observeSourceMutation(root, current, saved.planId, saved.sourceBinding)) === hash;
   } catch { return false; }
 }
 
-export function finalizationInputIdentity(inspection: MissionInspection, source: WorkspaceManifest, sourceRoot: string) {
-  const planHash = sha256(readFileSync(path.join(sourceRoot, ".pitako/plans", `${inspection.planId}.md`)));
-  const definitionHash = sha256(readFileSync(path.join(sourceRoot, ".pitako/plans", `${inspection.planId}.mission.json`)));
-  if (planHash !== inspection.snapshot.planHash || definitionHash !== inspection.snapshot.definitionHash)
-    throw new Error("current plan or definition bytes differ from the frozen revision");
+export function finalizationInputIdentity(inspection: MissionInspection, source: WorkspaceManifest, sourceRoot: string, store: MissionStore) {
+  const { planHash, definitionHash, ...pin } = missionInputIdentity(inspection, sourceRoot);
+  const setup = inspection.prepared?.setup ? new MissionSetup(store, inspection.id).observe(inspection) : undefined;
+  if (setup?.state === "blocked") throw new Error(`setup prerequisite: ${setup.reason}`);
   return { source, predicates: inspection.definition.units.map(({ id, inputs, acceptance }) => ({ id, inputs, acceptance })),
-    planHash, definitionHash, rolePolicies: inspection.definition.authority.rolePolicies, checkerIdentity: MISSION_CHECK_IDENTITY, runtimeIdentity: missionCheckRuntime() };
+    planHash, definitionHash, ...(inspection.prepared ? { pin, prepared: inspection.prepared } : {}), ...(setup ? { setup } : {}),
+    rolePolicies: inspection.definition.authority.rolePolicies, checkerIdentity: MISSION_CHECK_IDENTITY, runtimeIdentity: missionCheckRuntime() };
+}
+
+export function parseFinalizationResponse(text: string) {
+  const body = text.trim();
+  const fence = /^```json\r?\n([\s\S]*?)\r?\n```$/.exec(body);
+  return JSON.parse(fence ? fence[1]! : body);
 }
 
 export function parseWholeResultResponse(text: string, expected: Omit<WholeResultResponse, "verdict">): WholeResultResponse {
-  const value = JSON.parse(text) as WholeResultResponse;
+  const value = parseFinalizationResponse(text) as WholeResultResponse;
   if (!value || Object.keys(value).sort().join() !== [...Object.keys(expected), "verdict"].sort().join() ||
     !["approve", "reject", "inconclusive"].includes(value.verdict) ||
     Object.entries(expected).some(([key, item]) => finalizationHash(value[key as keyof WholeResultResponse]) !== finalizationHash(item)))
@@ -193,7 +211,8 @@ export function currentWholeResultApproval(inspection: MissionInspection, store:
     const manifest = JSON.parse(store.readArtifact(approval.manifestHash).toString()) as MissionFinalManifest;
     if (manifest.acceptedInputHash !== acceptedFinalizationInput(inspection) ||
       manifest.generation !== approval.generation || manifest.sourceWitnessHash !== approval.sourceWitnessHash ||
-      finalizationHash(manifest.inputIdentity) !== finalizationHash(finalizationInputIdentity(inspection, captureWorkspaceImage(sourceRoot).manifest, sourceRoot))) return;
+      finalizationHash(manifest.inputIdentity) !== finalizationHash(finalizationInputIdentity(inspection, captureWorkspaceImage(sourceRoot).manifest, sourceRoot, store))) return;
     return approval;
   } catch { return; }
 }
+import { MissionSetup } from "./setup.ts";

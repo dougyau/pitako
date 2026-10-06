@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { missionInputIdentity } from "./inputs.ts";
 import path from "node:path";
 import type { AttemptExecutor, AgentRunResult, DurableAttemptContext, ProviderRequestReceipt } from "../agent/run.ts";
 import { runAgentInstance } from "../agent/run.ts";
@@ -18,7 +19,7 @@ import { currentProcessIdentity, ownerProcessState, type ProcessIdentity } from 
 import { authorizeRoleDispatch, mintEngineRoleDispatchAdmission, registerManagedHistory, managedHistoryAdmission } from "../agent/managed-mission.ts";
 import { TEAM_ROUNDS, parseConsultationRequest, parseTeamResponse, type ConsultationRequest, type TeamBundle, type TeamFinding, type TeamRound } from "./team-contract.ts";
 import { FINALIZATION_OWNER, FINALIZATION_PHASES, acceptedFinalizationInput, compileFinalizationGrants, finalizationInputIdentity,
-  observeSourceMutation, sourceWitnessCurrent, parseWholeResultResponse, type FinalizationTarget, type FinalizationPhaseReceipt,
+  observeSourceMutation, sourceWitnessCurrent, parseFinalizationResponse, parseWholeResultResponse, type FinalizationTarget, type FinalizationPhaseReceipt,
   type MissionFinalManifest, type WholeResultApproval } from "./finalization.ts";
 
 export type MissionState = "prepared" | "running" | "blocked" | "completing" | "completed" | "paused" | "cancelled";
@@ -50,6 +51,7 @@ export interface MissionAttemptBinding {
   workspaceManifestHash?: string;
   inputManifestHash: string;
   briefHash: string;
+  briefArtifactHash?: string;
   rolePolicyHash: string;
   role?: string;
   targetId?: string;
@@ -419,6 +421,10 @@ export function missionCorrectionNo(events: readonly MissionEvent[], binding: Mi
 export function missionPolicyTargets(definition: ReturnType<MissionStore["inspectMission"]>["definition"], roleId: string): { primary: ModelTarget; fallbacks: ModelTarget[] } {
   const policy = definition.authority.rolePolicies[roleId];
   if (!policy) throw new Error(`mission has no frozen role policy for ${roleId}`);
+  if (definition.schemaVersion === 2) {
+    if (!policy.primaryTarget || !policy.fallbackTargets) throw new Error("generated role policy lacks complete targets");
+    return { primary: { ...policy.primaryTarget }, fallbacks: policy.fallbackTargets.map((target) => ({ ...target })) };
+  }
   const qualify = (name: string) => name.includes("/") ? name : `${policy.provider}/${name}`;
   return {
     primary: { model: `${policy.provider}/${policy.model}` },
@@ -445,6 +451,8 @@ export function createPiMissionRunner(options: {
     return result;
   };
 }
+
+import { assertSetupRequirements, MissionSetup, type SetupStartAdmission } from "./setup.ts";
 
 export class MissionEngine {
   private readonly store: MissionStore;
@@ -480,10 +488,13 @@ export class MissionEngine {
   private recoveryChecked = false;
   private readonly engineId = randomUUID();
   private closed = false;
+  private readonly setup: MissionSetup;
+  private setupAdmission?: SetupStartAdmission;
 
   constructor(options: MissionEngineOptions) {
     this.store = options.store;
     this.missionId = options.missionId;
+    this.setup = new MissionSetup(this.store, this.missionId);
     this.sessionsDirectory = path.resolve(options.sessionsDirectory);
     this.runRole = options.runRole;
     this.assessPredicate = options.assessPredicate;
@@ -504,13 +515,16 @@ export class MissionEngine {
     return reduceMissionEvents(this.store.inspectMission(this.missionId));
   }
 
+  invalidateSetupAdmission(): void { this.setupAdmission = undefined; this.setup.fence(); }
+
   /** Records activation and starts the pump; caller receives no worker result. */
-  start(operator?: { id: string; text: string }): void {
+  start(operator?: { id: string; text: string; source?: import("./admission.ts").OperatorSource }, setupAdmission?: SetupStartAdmission): void {
     if (this.closed) throw new Error("mission engine is closed");
     const inspection = this.store.inspectMission(this.missionId);
     const snapshot = reduceMissionEvents(inspection);
     if (snapshot.state === "prepared") this.activate(inspection, operator);
     else if (["paused", "cancelled", "completed"].includes(snapshot.state)) throw new Error(`mission ${snapshot.state} cannot start`);
+    if (setupAdmission) this.setupAdmission = setupAdmission;
     if (!this.pumpPromise) {
       if (snapshot.state === "blocked") this.recoveryChecked = false;
       const run = this.pump();
@@ -519,12 +533,13 @@ export class MissionEngine {
     }
   }
 
-  async control(action: "pause" | "resume" | "cancel", operator?: { id: string; text: string }): Promise<void> {
+  async control(action: "pause" | "resume" | "cancel", operator?: { id: string; text: string; source?: import("./admission.ts").OperatorSource },
+    admitResume?: () => void): Promise<void> {
     const inspection = this.store.inspectMission(this.missionId);
     const state = reduceMissionEvents(inspection);
     if (state.state === "cancelled" || state.state === "completed") throw new Error("terminal mission cannot be controlled");
     if (action === "resume") {
-      await this.resumePaused("explicit operator resume", operator);
+      await this.resumePaused("explicit operator resume", operator, admitResume);
       return;
     }
     const latestPause = [...inspection.events].reverse().find((event) => event.kind === "mission.paused");
@@ -536,12 +551,13 @@ export class MissionEngine {
     const committed = this.emit([this.event(inspection.revision, action === "pause" ? "mission.paused" : "mission.cancelled",
       `${this.missionId}:${action}:${inspection.version}`, {
         reason: `explicit operator ${action}`, resumeAfterClose: false,
-        ...(operator ? { operatorInputId: operator.id, operatorText: operator.text, intervention: "operator_choice" } : {}),
+        ...(operator ? { operatorInputId: operator.id, operatorText: operator.text, operatorSource: operator.source, intervention: "operator_choice" } : {}),
         ...(action === "pause" ? {
           ...this.pauseBindings(stopping), controlOrigin: "operator",
         } : {}),
       })]);
     const pauseEvent = committed.find((event) => event.kind === "mission.paused");
+    this.setup.fence();
     for (const effects of this.effectRunners) effects.fence();
     if (action === "pause" && pauseEvent) {
       for (const target of stopping) target.controller.abort(new HostPauseAbort(pauseEvent.eventId, target.attemptId));
@@ -571,7 +587,8 @@ export class MissionEngine {
     await this.resumePaused("saved automatic resume after orderly close");
   }
 
-  private async resumePaused(reason: string, operator?: { id: string; text: string }): Promise<void> {
+  private async resumePaused(reason: string, operator?: { id: string; text: string; source?: import("./admission.ts").OperatorSource },
+    admitResume?: () => void): Promise<void> {
     const inspection = this.store.inspectMission(this.missionId);
     if (reduceMissionEvents(inspection).state !== "paused") throw new Error("only a paused mission can resume");
     await Promise.allSettled([...this.inFlight.values()]);
@@ -579,8 +596,9 @@ export class MissionEngine {
     const current = this.store.inspectMission(this.missionId);
     if (current.revision !== inspection.revision || reduceMissionEvents(current).state !== "paused")
       throw new Error("pause or revision changed before resume");
+    admitResume?.();
     this.emit([this.event(inspection.revision, "mission.resumed", `${this.missionId}:resume:${inspection.version}`, {
-      reason, ...(operator ? { operatorInputId: operator.id, operatorText: operator.text, intervention: "operator_choice" } : {}),
+      reason, ...(operator ? { operatorInputId: operator.id, operatorText: operator.text, operatorSource: operator.source, intervention: "operator_choice" } : {}),
     })]);
     this.recoveryChecked = false;
     this.start();
@@ -591,6 +609,7 @@ export class MissionEngine {
   }
 
   fenceRevisedUnits(impact: readonly string[]): void {
+    this.setup.fence();
     this.recoveryChecked = false;
     const affected = new Set(impact);
     for (const [attemptId, controller] of this.attemptControllers) {
@@ -693,12 +712,14 @@ export class MissionEngine {
 
   async close(): Promise<void> {
     if (this.closed) return;
+    this.setup.fence();
     await this.pumpPromise;
     if (this.activeTimer) clearInterval(this.activeTimer);
     this.activeTimer = undefined;
     await this.activeCheckpoint;
     await this.closeActiveWindow();
     this.closed = true;
+    this.setup.fence();
   }
 
   async retireForShutdown(reason: string): Promise<void> {
@@ -719,11 +740,13 @@ export class MissionEngine {
         resumeAfterClose: !navigation && initial.definition.authority.resumeAfterClose,
       })])[0] : undefined;
     this.closed = true;
+    this.setup.fence();
     for (const effects of this.effectRunners) effects.fence();
     for (const [attemptId, controller] of this.attemptControllers)
       controller.abort(pause && stopping.some((target) => target.attemptId === attemptId)
         ? new HostPauseAbort(pause.eventId, attemptId) : new Error(`Pi session ${reason}`));
     await this.closeActiveWindow();
+    await this.setup.stop();
     const roleJobs = () => Promise.allSettled([...this.inFlight.values()]);
     let settled = await waitForSettlement(roleJobs(), 5_000);
     if (!settled) {
@@ -778,7 +801,7 @@ export class MissionEngine {
     this.unregisterOwner = undefined;
   }
 
-  private activate(inspection: ReturnType<MissionStore["inspectMission"]>, operator?: { id: string; text: string }): void {
+  private activate(inspection: ReturnType<MissionStore["inspectMission"]>, operator?: { id: string; text: string; source?: import("./admission.ts").OperatorSource }): void {
     const { definition } = inspection;
     const launches = definition.units.reduce((total, unit) => total + (unit.team ? unit.team.members.length * 3 + 1 : 1), 0);
     const finalizationLaunches = definition.finalization.contractVersion === 1 ? 3 : 1 + Number(definition.finalization.independentReview);
@@ -816,7 +839,7 @@ export class MissionEngine {
     ));
     events.push(this.event(inspection.revision, "mission.activated", `${this.missionId}:activated`, {
       missionId: this.missionId, ...(definition.finalization.contractVersion === 1 ? { finalizationGrants: compiled.stages } : {}),
-      rootLimits: { maxSessions: this.maxConcurrent, maxMutatingDevelopers: 1, maxDepth: 2 }, ...(operator ? { operatorInputId: operator.id, operatorText: operator.text, intervention: "operator_choice" } : {}),
+      rootLimits: { maxSessions: this.maxConcurrent, maxMutatingDevelopers: 1, maxDepth: 2 }, ...(operator ? { operatorInputId: operator.id, operatorText: operator.text, operatorSource: operator.source, intervention: "operator_choice" } : {}),
     }));
     this.store.appendTransition(this.missionId, inspection.version, { events });
   }
@@ -830,9 +853,18 @@ export class MissionEngine {
   private async pump(): Promise<void> {
     while (!this.closed) {
       if (!this.recoveryChecked) {
+        this.setup.reconcile();
         const beforeRecovery = this.store.inspectMission(this.missionId);
+        if (!this.setup.quiescent) {
+          this.emit([this.event(beforeRecovery.revision, "mission.blocked", `${this.missionId}:setup-disposal:${beforeRecovery.version}`, {
+            reason: "unfinished setup physical disposal is unproved; recovery workers and dispatch fenced",
+          })]);
+          return;
+        }
         const root = this.managedWorkspace?.sourceRoot;
-        const planFile = root ? path.join(root, ".pitako", "plans", `${beforeRecovery.planId}.md`) : undefined;
+        const planFile = beforeRecovery.snapshot.sourceBinding?.planSource ??
+          (root ? path.join(root, ".pitako", "plans", `${beforeRecovery.planId}.md`) : undefined);
+        if (root && beforeRecovery.prepared) missionInputIdentity(beforeRecovery, root);
         if (this.managedWorkspace && root && planFile && !this.canReuseFinalization(beforeRecovery) &&
           missionNeedsRecovery(this.store, beforeRecovery, root, planFile)) {
           const imported = [...beforeRecovery.events].reverse().find((event) => event.kind === "mission.imported");
@@ -886,6 +918,13 @@ export class MissionEngine {
             return;
           }
           const observed = this.store.inspectMission(this.missionId);
+          if (observed.revision !== beforeRecovery.revision || report.revision !== observed.revision ||
+            report.owner.epoch !== this.store.ownerEpoch) {
+            this.emit([this.event(observed.revision, "mission.blocked", `${this.missionId}:recovery-await-fenced:${observed.version}`, {
+              reason: "recovery observation crossed a revision or owner boundary; no dispatch authorized",
+            })]);
+            return;
+          }
           if (pause && (pause.payload.stoppedAttempts as Array<{ attemptId: string }>).some(({ attemptId }) =>
             !observed.events.some((event) => event.kind === "attempt.reserved" &&
               (event.payload.binding as MissionAttemptBinding).recoveryOf === attemptId) &&
@@ -905,6 +944,7 @@ export class MissionEngine {
       }
       await this.reconcileReceipts();
       const inspection = this.store.inspectMission(this.missionId);
+      if (inspection.prepared && this.managedWorkspace) missionInputIdentity(inspection, this.managedWorkspace.sourceRoot);
       const state = reduceMissionEvents(inspection);
       if (state.state === "completed" || state.state === "paused" || state.state === "cancelled") return;
       const recoveryScope = recoveryBlockedUnits(this.store, inspection, this.managedWorkspace?.sourceRoot);
@@ -917,8 +957,34 @@ export class MissionEngine {
           })]);
         return;
       }
+      let setupBlock: string | undefined;
+      if (inspection.prepared?.setup) {
+        assertSetupRequirements(inspection.prepared.setup, inspection.definition);
+        let readiness = this.setup.reconcile();
+        if (readiness.state === "blocked" && this.setupAdmission) {
+          if (this.inFlight.size) { await Promise.race(this.inFlight.values()); continue; }
+          readiness = await this.setup.ensure(this.setupAdmission, () => {
+            const current = this.store.inspectMission(this.missionId);
+            return !this.closed && !this.retired && this.inFlight.size === 0 && this.attemptControllers.size === 0 &&
+              [...this.effectRunners].every((effects) => effects.quiescent) &&
+              !missionHasUnresolvedEffects(this.store, current.events) &&
+              recoveryBlockedUnits(this.store, current, this.managedWorkspace?.sourceRoot)?.size === 0 &&
+              Object.values(reduceMissionEvents(current).attempts).every((attempt) =>
+                attempt.settled && missionEffectProcessesQuiescent(current.events, attempt.binding.attemptId));
+          });
+          if (readiness.state === "ready" && !readiness.reused) continue;
+        }
+        if (readiness.state === "blocked") {
+          const current = this.store.inspectMission(this.missionId);
+          if (["paused", "cancelled", "completed"].includes(reduceMissionEvents(current).state)) return;
+          if (!this.setup.quiescent) return;
+          setupBlock = readiness.reason;
+        }
+      }
       let launched = 0;
-      for (const unit of state.admissionFenced ? [] : inspection.definition.units.filter(({ id }) => !recoveryScope.has(id) && !questionUnits.has(id))) {
+      for (const unit of state.admissionFenced ? [] : inspection.definition.units.filter(({ id }) =>
+        !recoveryScope.has(id) && !questionUnits.has(id) &&
+        (!setupBlock || !inspection.prepared!.setup!.requiredBy.unitIds.includes(id)))) {
         if (this.attemptControllers.size >= this.sessionLimit(inspection)) break;
         const current = state.units[unit.id]!;
         if (current.status === "accepted" || current.status === "blocked" || current.status === "verifying") continue;
@@ -977,6 +1043,7 @@ export class MissionEngine {
           const dispatchState = reduceMissionEvents(dispatchInspection);
           const dispatchScope = recoveryBlockedUnits(this.store, dispatchInspection, this.managedWorkspace?.sourceRoot);
           if (!["running", "blocked"].includes(dispatchState.state) || dispatchScope === null || dispatchScope.has(unit.id) ||
+            !this.setupAllows(dispatchInspection, unit.id) ||
             dispatchState.units[unit.id]?.status !== "ready" ||
             pendingQuestionUnits(dispatchInspection.events, dispatchInspection.definition, this.store).has(unit.id)) continue;
           const interrupted = Object.values(dispatchState.attempts).find((attempt) => attempt.binding.unitId === unit.id &&
@@ -1007,6 +1074,13 @@ export class MissionEngine {
         continue;
       }
       const integrationInput = this.store.inspectMission(this.missionId);
+      if (setupBlock) {
+        this.emit([this.event(integrationInput.revision, "mission.blocked", `${this.missionId}:setup:${integrationInput.version}`, {
+          reason: `setup prerequisite: ${setupBlock}; dependent obligations remain unproven`,
+        })]);
+        await this.finishActiveInterval();
+        return;
+      }
       if (integrationInput.definition.finalization.contractVersion === 1 && !this.assessPredicate && this.managedWorkspace &&
         Object.values(reduceMissionEvents(integrationInput).units).every(({ status }) => status === "accepted")) {
         try {
@@ -1081,7 +1155,7 @@ export class MissionEngine {
       generation?.revision === inspection.revision && generation.payload.generation === target.generation &&
       !inspection.events.some((event) => event.kind === "mission.finalization.invalidated" && event.seq > started.seq) &&
       !!this.managedWorkspace && sourceWitnessCurrent(this.store, target.sourceWitnessHash, this.managedWorkspace.sourceRoot) &&
-      target.inputIdentityHash === hashJson(finalizationInputIdentity(inspection, captureWorkspaceImage(this.managedWorkspace.sourceRoot).manifest, this.managedWorkspace.sourceRoot)) &&
+      target.inputIdentityHash === hashJson(finalizationInputIdentity(inspection, captureWorkspaceImage(this.managedWorkspace.sourceRoot).manifest, this.managedWorkspace.sourceRoot, this.store)) &&
       acceptedFinalizationInput(inspection) === target.acceptedInputHash;
   }
 
@@ -1102,15 +1176,22 @@ export class MissionEngine {
     } catch { return false; }
   }
 
-  private requireFinalizationCapacity(inspection: ReturnType<MissionStore["inspectMission"]>, resource: BudgetResource,
-    amount: number, phase: FinalizationTarget["phase"]): void {
+  private remainingFinalizationCapacity(inspection: ReturnType<MissionStore["inspectMission"]>, resource: BudgetResource,
+    phase: FinalizationTarget["phase"]): number {
     const compiled = compileFinalizationGrants(inspection.definition);
     const use = budgetAmounts(inspection.events, resource);
     const later = FINALIZATION_PHASES.slice(FINALIZATION_PHASES.indexOf(phase) + 1);
-    const roles = later.filter((item) => ["ponytail", "cleanup", "whole-review"].includes(item)).length;
-    const retained = resource === "role-launches" || resource === "provider-requests" ? roles :
-      resource === "tokens" ? roles * compiled.tokens : later.length * (resource === "active-time-ms" ? compiled.active : compiled.artifacts);
-    if (use.protected - use.finalization - amount < retained)
+    const stages = compiled.stages.filter(({ phase }) => later.includes(phase));
+    const roles = stages.reduce((sum, stage) => sum + stage.roleLaunches, 0);
+    const requests = stages.reduce((sum, stage) => sum + stage.providerRequests, 0);
+    const retained = resource === "role-launches" ? roles : resource === "provider-requests" ? requests :
+      resource === "tokens" ? requests * compiled.tokens : later.length * (resource === "active-time-ms" ? compiled.active : compiled.artifacts);
+    return use.protected - use.finalization - retained;
+  }
+
+  private requireFinalizationCapacity(inspection: ReturnType<MissionStore["inspectMission"]>, resource: BudgetResource,
+    amount: number, phase: FinalizationTarget["phase"]): void {
+    if (this.remainingFinalizationCapacity(inspection, resource, phase) < amount)
       throw new Error(`protected ${resource} cannot fund ${phase} while retaining remaining mandatory stages`);
   }
 
@@ -1133,7 +1214,9 @@ export class MissionEngine {
   }
 
   private openFinalizationWindow(inspection: ReturnType<MissionStore["inspectMission"]>, phase: FinalizationTarget["phase"], id: string): MissionEventDraft[] {
-    const quantum = compileFinalizationGrants(inspection.definition).active;
+    const quantum = this.remainingFinalizationCapacity(inspection, "active-time-ms", phase);
+    if (quantum < compileFinalizationGrants(inspection.definition).active)
+      throw new Error(`protected active-time-ms cannot fund ${phase} while retaining remaining mandatory stages`);
     this.requireFinalizationCapacity(inspection, "active-time-ms", quantum, phase);
     const windowId = randomUUID();
     const reservationId = stableId(`${id}:active-time`);
@@ -1153,7 +1236,65 @@ export class MissionEngine {
     const state = reduceMissionEvents(inspection);
     if (!["running", "completing"].includes(state.state) || state.admissionFenced ||
       pendingMissionQuestions(inspection.events, this.store).length || Object.values(state.attempts).some((attempt) => !attempt.settled) ||
+      Object.values(state.units).some(({ status }) => status !== "accepted") ||
       [...this.effectRunners].some((runner) => !runner.quiescent)) return false;
+    // Once ordinary work is terminal, pair its unused root slack into new protected grants.
+    // Never enlarge the immutable activate grants or borrow a later mandatory stage's minimum.
+    const slackId = stableId(`${this.missionId}:finalization-paired-slack`);
+    const tokenSlackId = stableId(`${this.missionId}:finalization-token-slack`);
+    const timeSlackId = stableId(`${this.missionId}:finalization-time-slack`);
+    if (!inspection.events.some((row) => row.causalId === timeSlackId) &&
+      !inspection.events.some((row) => row.kind === "mission.finalization.phase.started")) {
+      const held = inspection.reservations
+        .filter((row) => row.resource === "active-time-ms" && row.purpose !== "finalization")
+        .reduce((sum, row) => sum + row.amount, 0);
+      const extra = inspection.definition.budget.activeTimeMs - held;
+      if (extra > 0) {
+        this.emit([this.event(inspection.revision, "reservation.created", timeSlackId, {
+          reservationId: timeSlackId, revision: inspection.revision,
+          resource: "active-time-ms", amount: extra, purpose: "protected",
+        })]);
+        inspection = this.store.inspectMission(this.missionId);
+      }
+    }
+    if (!inspection.events.some((row) => row.causalId === slackId) &&
+      !inspection.events.some((row) => row.kind === "mission.finalization.phase.started")) {
+      const held = (resource: BudgetResource) => inspection.reservations
+        .filter((row) => row.resource === resource && row.purpose !== "finalization")
+        .reduce((sum, row) => sum + row.amount, 0);
+      const quantum = compileFinalizationGrants(inspection.definition).requestTokens;
+      const extra = Math.min(inspection.definition.budget.providerRequests - held("provider-requests"),
+        Math.floor((inspection.definition.budget.tokens - held("tokens")) / quantum));
+      if (extra > 0) {
+        this.emit([
+          this.event(inspection.revision, "reservation.created", slackId, {
+            reservationId: stableId(`${slackId}:requests`), revision: inspection.revision,
+            resource: "provider-requests", amount: extra, purpose: "protected",
+          }),
+          this.event(inspection.revision, "reservation.created", `${slackId}:tokens`, {
+            reservationId: stableId(`${slackId}:tokens`), revision: inspection.revision,
+            resource: "tokens", amount: extra * quantum, purpose: "protected",
+          }),
+        ]);
+        inspection = this.store.inspectMission(this.missionId);
+      }
+    }
+    // Existing protected requests can use tokens below a full request quantum.
+    if (inspection.definition.finalization.contractVersion === 1 &&
+      !inspection.events.some((row) => row.causalId === tokenSlackId) &&
+      !inspection.events.some((row) => row.kind === "mission.finalization.phase.started")) {
+      const held = inspection.reservations
+        .filter((row) => row.resource === "tokens" && row.purpose !== "finalization")
+        .reduce((sum, row) => sum + row.amount, 0);
+      const extra = inspection.definition.budget.tokens - held;
+      if (extra > 0) {
+        this.emit([this.event(inspection.revision, "reservation.created", tokenSlackId, {
+          reservationId: tokenSlackId, revision: inspection.revision,
+          resource: "tokens", amount: extra, purpose: "protected",
+        })]);
+        inspection = this.store.inspectMission(this.missionId);
+      }
+    }
     const currentRows = inspection.events.filter((event) => event.revision === inspection.revision);
     if (currentRows.some((event) => event.kind === "mission.finalization.invalidated")) return false;
     const receipts = currentRows.filter((event) => event.kind === "mission.finalization.phase.receipted");
@@ -1177,12 +1318,13 @@ export class MissionEngine {
     if (["integrate", "ponytail", "cleanup"].includes(phase)) generation++;
     const source = captureWorkspaceImage(this.managedWorkspace!.sourceRoot);
     assertCompleteWorkspaceImage(source);
-    const witnessBytes = Buffer.from(JSON.stringify(observeSourceMutation(this.managedWorkspace!.sourceRoot, source.manifest, inspection.planId)));
+    const witnessBytes = Buffer.from(JSON.stringify(observeSourceMutation(this.managedWorkspace!.sourceRoot, source.manifest,
+      inspection.prepared ? undefined : inspection.planId, inspection.snapshot.sourceBinding)));
     const witnessHash = sha256(witnessBytes);
     const acceptedInputHash = acceptedFinalizationInput(inspection);
     const target: FinalizationTarget = { version: 1, kind: "finalization", generation, phase,
       inputArtifactHash: previous?.outputArtifactHash ?? acceptedInputHash, acceptedInputHash, sourceWitnessHash: previous?.target.sourceWitnessHash ?? witnessHash,
-      inputIdentityHash: hashJson(finalizationInputIdentity(inspection, source.manifest, this.managedWorkspace!.sourceRoot)) };
+      inputIdentityHash: hashJson(finalizationInputIdentity(inspection, source.manifest, this.managedWorkspace!.sourceRoot, this.store)) };
     let manifestBytes: Buffer | undefined;
     if (phase === "whole-review") {
       const integrated = currentRows.find((event) => event.kind === "mission.result.integrated")!;
@@ -1192,7 +1334,7 @@ export class MissionEngine {
         revision: inspection.revision, generation, planHash: inspection.snapshot.planHash, definitionHash: inspection.snapshot.definitionHash,
         originalBaseImageHash: report.originalBaseImageHash, deliveryBaseImageHash: report.deliveryBaseImageHash,
         resultImageHash: target.inputArtifactHash, resultManifestHash: image.manifest.hash, acceptedInputHash,
-        sourceWitnessHash: target.sourceWitnessHash, inputIdentity: finalizationInputIdentity(inspection, source.manifest, this.managedWorkspace!.sourceRoot),
+        sourceWitnessHash: target.sourceWitnessHash, inputIdentity: finalizationInputIdentity(inspection, source.manifest, this.managedWorkspace!.sourceRoot, this.store),
         phaseReceiptHashes: receipts.map((event) => String(event.payload.receiptHash)),
         producerAttempts: inspection.events.filter((event) => event.kind === "attempt.reserved" &&
           !(event.payload.binding as MissionAttemptBinding).finalization).map((event) => event.attemptId!) };
@@ -1224,12 +1366,22 @@ export class MissionEngine {
       evidenceHashes: receipts.map((event) => String(event.payload.receiptHash)) };
     const brief = JSON.stringify({ format: "mission-finalization-brief-v1", target, goal: inspection.definition.goal,
       criteria: inspection.definition.units.map(({ id, acceptance }) => ({ id, acceptance })), changedScope,
-      instructions: phase === "whole-review" ? "Read-only independent review of the complete result, integrated delta, criteria, cleanup receipts and gates. Return only the exact structured response with verdict approve/reject/inconclusive." :
+      ...(inspection.prepared ? { originalSource: inspection.prepared.originalSource,
+        sourceInventory: inspection.prepared.inventory, evidenceMappings: inspection.prepared.mappings,
+         procedure: inspection.prepared.gates } : {}),
+      ...(inspection.prepared?.setup ? { setup: { readiness: this.setup.observe(), contract: inspection.prepared.setup,
+        instruction: "Verify the host setup provenance and installed prerequisite backing; do not repeat installation." } } : {}),
+      ...(inspection.prepared && phase === "whole-review" ? { resultFiles:
+        readSealedWorkspaceImage(this.store, target.inputArtifactHash).files.map(({ path, kind, mode, bytes }) =>
+          ({ path, kind, mode, bytesBase64: bytes?.toString("base64") ?? null })) } : {}),
+      instructions: (phase === "whole-review" ? "Read-only independent review of the complete result, integrated delta, criteria, cleanup receipts and gates. Return only the exact structured response with verdict approve/reject/inconclusive." :
         phase === "cleanup" ? "Perform Unslop, then remove-ai-slops, scoped to changedScope. Return ordered steps with changedPaths or a non-empty scope-bound no-op reason for each." :
-        "Apply Ponytail full to changedScope. Preserve behavior. Return steps with changedPaths or a non-empty scope-bound no-op reason.",
-      ...(phase === "whole-review" ? { manifest: JSON.parse(manifestBytes!.toString()), expectedResponse: expectedReview } :
+        "Apply Ponytail full to changedScope. Preserve behavior. Return steps with changedPaths or a non-empty scope-bound no-op reason.") +
+        " Return raw JSON only, without Markdown fences or surrounding prose.",
+      ...(phase === "whole-review" ? { manifest: JSON.parse(manifestBytes!.toString()), expectedResponse: { ...expectedReview, verdict: "inconclusive" } } :
         { expectedResponse: { format: "mission-finalization-cleanup-v1", phase, inputArtifactHash: target.inputArtifactHash,
-          scope: changedScope, steps: phase === "cleanup" ? ["Unslop", "remove-ai-slops"] : ["Ponytail"] } }) });
+          scope: changedScope, steps: (phase === "cleanup" ? ["Unslop", "remove-ai-slops"] : ["Ponytail"]).map((skill) =>
+            ({ skill, changedPaths: [], noOpReason: "Replace with the actual scope-bound no-op justification, or report actual changedPaths." })) } }) });
     const descriptor: MissionUnit = { id: FINALIZATION_OWNER, kind: "implementation", role, dependencies: [], inputs: ["."],
       outputs: [], acceptance: [], risk: "high", retryLimit: 0 };
     const binding: MissionAttemptBinding = { missionId: this.missionId, revision: inspection.revision, unitId: FINALIZATION_OWNER,
@@ -1275,8 +1427,10 @@ export class MissionEngine {
           artifactLimit: grants.artifacts - artifactGrant });
         outputArtifactHash = report.resultImageHash;
       } else {
+        const selected = inspection.definition.finalization.selections?.[phase === "integrated-checks" ? "integrated" :
+          phase === "affected-checks" ? "affected" : "final"] ?? inspection.definition.finalization.requiredPredicates;
         for (const predicate of inspection.definition.units.flatMap((unit) => unit.acceptance)
-          .filter((predicate) => inspection.definition.finalization.requiredPredicates.includes(predicate.id))) {
+          .filter((predicate) => selected.includes(predicate.id))) {
           // Command assessment shuts down its runner; each command owns a fresh fenced lifecycle.
           const effects = predicate.kind === "command_exit" ? new MissionEffects({ store: this.store, workspace: runtime!.workspace,
             missionId: this.missionId, revision: binding.revision, unitId: binding.unitId, attemptId: binding.attemptId,
@@ -1381,7 +1535,7 @@ export class MissionEngine {
           sessionId: binding.attemptId, instanceId: String(attempt.receipt!.instanceId),
           reviewArtifactHash: String(attempt.receipt!.artifactHash), sourceWitnessHash: target.sourceWitnessHash };
       } else {
-        const response = JSON.parse(result.toString());
+        const response = parseFinalizationResponse(result.toString());
         const expected = target.phase === "cleanup" ? ["Unslop", "remove-ai-slops"] : ["Ponytail"];
         const integrated = inspection.events.find((row) => row.kind === "mission.result.integrated" && row.revision === binding.revision)!;
         const report = JSON.parse(this.store.readArtifact(String(integrated.payload.reportHash)).toString());
@@ -1845,6 +1999,7 @@ export class MissionEngine {
         missionId: this.missionId, attemptId, sourceRoot: config.sourceRoot, storeRoot, candidateParent,
         allowedPaths: inspection.definition.authority.allowedPaths, otherCandidates,
         productRoot: config.productRoot, bwrapPath: config.bwrapPath,
+        setupIndependent: !!inspection.prepared?.setup && !inspection.prepared.setup.requiredBy.unitIds.includes(unit.id),
       });
       await preflightContainment(workspace);
       if (inspection.definition.finalization.contractVersion === 1 && unit.dependencies.length && !checkpoint && !recovery) {
@@ -1968,9 +2123,14 @@ export class MissionEngine {
       binding.roundId === team.bundle.round && binding.memberId === team.bundle.memberId).length + 1
       : this.nextAttemptNo(state, unit.id);
     const attemptId = randomUUID();
+    const admittedOwner = this.store.ownerEpoch;
     const runtime = this.managedWorkspace && !team ? await this.prepareManagedAttempt(inspection, unit, attemptId, singleton && {
       sourceAttemptId: singleton.sourceAttemptId, checkpointHash: singleton.checkpointHash,
     }, recovery) : undefined;
+    const current = this.store.inspectMission(this.missionId);
+    if (current.revision !== inspection.revision || this.store.ownerEpoch !== admittedOwner ||
+      !["running", "blocked"].includes(reduceMissionEvents(current).state) || !this.setupAllows(current, unit.id))
+      throw new RecoveryAdmissionError("attempt inputs or recovery changed during workspace admission");
     const pauseRecovery = recovery && state.attempts[recovery.attemptId]?.status === "interrupted"
       ? this.pauseContinuation(inspection, recovery) : undefined;
     if (recovery && state.attempts[recovery.attemptId]?.status === "interrupted" && !pauseRecovery)
@@ -2007,7 +2167,12 @@ export class MissionEngine {
         state.evidence.some((evidence) => evidence.id === evidenceId)));
     const brief = team?.brief ?? createBrief(inspection.definition, unit, state, {
       recoveryMode: runtime?.recoveryMode, previousAttemptId: predecessor?.attemptId,
-    }) + (singleton ? `\n${singleton.appendix}` : "");
+    }) + (inspection.prepared ? `\nOriginal frozen source and procedure: ${JSON.stringify({
+      source: inspection.prepared.originalSource, inventory: inspection.prepared.inventory,
+      mappings: inspection.prepared.mappings, gates: inspection.prepared.gates,
+      setup: inspection.prepared.setup ? { readiness: this.setup.observe(), contract: inspection.prepared.setup,
+        instruction: "Setup is host-owned. Do not repeat installation; dependency backing stays read-only." } : null,
+    })}` : "") + (singleton ? `\n${singleton.appendix}` : "");
     const inputBindings = team ? [] : capturePredicateInputBindings(
       inspection.definition.finalization.contractVersion === 1 ? this.managedWorkspace?.sourceRoot : runtime?.workspace.candidateRoot ?? this.managedWorkspace?.sourceRoot,
       unit,
@@ -2044,6 +2209,7 @@ export class MissionEngine {
       predicateInputBindingsComplete: inputBindings.every(({ complete }) => complete),
       inputManifestHash,
       briefHash: hashJson(brief),
+      ...(inspection.prepared ? { briefArtifactHash: sha256(Buffer.from(brief)) } : {}),
       rolePolicyHash: policy.hash,
       role: unit.role,
       ...(singleton ? { continuationOf: singleton.sourceAttemptId, checkpointHash: singleton.checkpointHash,
@@ -2084,6 +2250,7 @@ export class MissionEngine {
     ));
     const artifacts: Array<{ bytes: Uint8Array; mediaType: string }> = [
       { bytes: inputBindingsBytes, mediaType: "application/json" },
+      ...(inspection.prepared ? [{ bytes: Buffer.from(brief), mediaType: "text/plain; charset=utf-8" }] : []),
       ...(team ? [{ bytes: Buffer.from(JSON.stringify(team.bundle)), mediaType: "application/json" }] : []),
     ];
     if (runtime) {
@@ -2193,6 +2360,7 @@ export class MissionEngine {
     const latest = this.store.inspectMission(this.missionId);
     const scope = recoveryBlockedUnits(this.store, latest, this.managedWorkspace?.sourceRoot);
     if (latest.version !== inspection.version || scope === null || scope.has(unit.id) ||
+      !this.setupAllows(latest, unit.id) || this.store.ownerEpoch !== admittedOwner ||
       (team && latest.events.some((event) => event.kind === "team.consultation.cancelled" && event.unitId === unit.id)) ||
       !["running", "blocked"].includes(reduceMissionEvents(latest).state) ||
       binding.recoveryContinuationId && !this.recoveryBindingCurrent(binding, latest))
@@ -2206,6 +2374,11 @@ export class MissionEngine {
   }
 
   private launchAttempt(unit: MissionUnit, binding: MissionAttemptBinding, runtime: ManagedAttemptRuntime | undefined, brief: string): void {
+    if (binding.briefArtifactHash) {
+      const reserved = this.store.readArtifact(binding.briefArtifactHash).toString("utf8");
+      if (hashJson(reserved) !== binding.briefHash || reserved !== brief) throw new Error("reserved WorkBrief bytes changed before SDK dispatch");
+      brief = reserved;
+    }
     const startedAt = this.now();
     this.attemptStarted.set(binding.attemptId, startedAt);
     let callbackOutcome: AgentRunResult | undefined;
@@ -2229,7 +2402,8 @@ export class MissionEngine {
     durable.signal = controller.signal;
     this.attemptControllers.set(binding.attemptId, controller);
     const finalizationTimer = binding.finalization ? setTimeout(() => controller.abort("finalization phase active-time grant expired"),
-      compileFinalizationGrants(this.store.inspectMission(this.missionId).definition).active) : undefined;
+      Math.max(0, this.activeWindow!.grantAmount - this.activeWindow!.knownCharge -
+        Math.max(0, this.now() - this.activeWindow!.lastCheckpointAt))) : undefined;
     if (runtime) {
       this.effectRunners.add(runtime.effects);
       this.attemptEffects.set(binding.attemptId, runtime.effects);
@@ -3462,6 +3636,7 @@ export class MissionEngine {
     const processes: Record<string, unknown>[] = [];
     let scopeFailure = !input ? "predicate-input-binding" : attempt.receipt!.sdkDisposed !== true ? "sdk-disposal" : undefined;
     try {
+      if (!this.setupAllows(inspection, binding.unitId, [predicate.id])) throw new Error("setup predicate prerequisite is unproven");
       this.outputLineage(inspection, binding);
       if (binding.candidate === "managed") {
         if (!attempt.receipt!.terminalOutputHash) throw new Error("terminal output seal is missing");
@@ -3486,6 +3661,16 @@ export class MissionEngine {
     } catch (error) { scopeEstablished = false; scopeFailure = error instanceof Error ? error.message : String(error); }
     const time = budgetAmounts(inspection.events, "active-time-ms");
     if (effects) this.effectRunners.add(effects);
+    if (effects && predicate.kind === "command_exit") {
+      // SDK disposal can outlast the current ordinary window. Settle it and
+      // admit a fresh grant when the whole frozen command no longer fits.
+      await this.checkActiveTimeBeforeEffect();
+      if (this.activeWindow && predicate.timeoutMs !== undefined && predicate.timeoutMs > this.activeWindow.grantAmount - this.activeWindow.knownCharge -
+        this.activeWindow.unknownCharge - this.activeWindow.released - Math.ceil(this.now() - this.activeWindow.lastCheckpointAt)) {
+        await this.closeActiveWindow();
+        this.openNextActiveWindow();
+      }
+    }
     const observation = await assessMissionPredicate({ predicate, subject }, { store: this.store,
       inputBindingHash: input?.inputBindingHash ?? binding.inputManifestHash, scopeEstablished, effects,
       timeoutLimitMs: this.activeWindow ? Math.max(0, this.activeWindow.grantAmount - this.activeWindow.knownCharge -
@@ -3539,12 +3724,14 @@ export class MissionEngine {
     const artifacts: Array<{ bytes: Uint8Array; mediaType: string }> = [];
     const evidenceIds: string[] = [];
     let evidenceArtifactBytes = 0;
-    let accepted = status === "completed" && unit.acceptance.length > 0 && !unresolvedBeforeReport;
+    const ordinary = inspection.definition.finalization.selections?.ordinary;
+    const acceptance = ordinary ? unit.acceptance.filter(({ id }) => ordinary.includes(id)) : unit.acceptance;
+    let accepted = status === "completed" && acceptance.length > 0 && !unresolvedBeforeReport;
     if (status === "completed" && !unresolvedBeforeReport) {
       events.push(this.event(inspection.revision, "unit.verifying", `${attempt.binding.attemptId}:verifying`, {
         unitId: unit.id, attemptId: attempt.binding.attemptId,
       }, unit.id, attempt.binding.attemptId));
-      for (const predicate of unit.acceptance) {
+      for (const predicate of acceptance) {
         const observation = this.assessPredicate ? await this.assessPredicate({ unit, predicate,
           result: resultFromReceipt(attempt), resultArtifact, inputManifestHash: attempt.binding.inputManifestHash })
           : await this.assessProductionPredicate(inspection, attempt, predicate, artifactHash);
@@ -3768,24 +3955,12 @@ export class MissionEngine {
     const tokenReservationId = stableId(`${request.requestId}:tokens`);
     const startedAt = this.attemptStarted.get(binding.attemptId);
     const requestDuration = startedAt === undefined ? null : Math.max(0, this.now() - startedAt);
-    const events = [
-      this.event(binding.revision, "reservation.created", `reservation:${request.requestId}:provider`, {
-        reservationId: requestReservationId, revision: binding.revision, resource: "provider-requests", amount: 1, purpose: binding.finalization ? "finalization" : "ordinary",
-      }, binding.unitId, binding.attemptId),
-      this.event(binding.revision, "reservation.created", `reservation:${request.requestId}:tokens`, {
-        reservationId: tokenReservationId, revision: binding.revision, resource: "tokens", amount: tokensPerRequest, purpose: binding.finalization ? "finalization" : "ordinary",
-      }, binding.unitId, binding.attemptId),
-      this.event(binding.revision, "provider.request.dispatched", `${request.requestId}:dispatched`, {
-        requestId: request.requestId, attemptId: binding.attemptId, unitId: binding.unitId,
-        provider: request.provider, model: request.model, tokenReservationId, ownerEpoch: binding.ownerEpoch,
-      }, binding.unitId, binding.attemptId, undefined, requestDuration ?? undefined),
-    ];
     const firstRequest = !inspection.events.some((event) =>
       event.kind === "provider.request.dispatched" && event.attemptId === binding.attemptId);
     const releasedProvider = binding.consultationId && firstRequest
       ? Math.min(1, this.consultationHold(inspection, binding.consultationId, "provider-requests")) : 0;
     const releasedTokens = binding.consultationId && firstRequest
-      ? Math.min(tokensPerRequest, this.consultationHold(inspection, binding.consultationId, "tokens")) : 0;
+      ? this.consultationHold(inspection, binding.consultationId, "tokens") : 0;
     const pendingRootRequest = firstRequest && !binding.consultationId && !binding.continuationOf &&
       (binding.targetId ?? binding.unitId) === binding.unitId && binding.roundId !== "recovery" &&
       !Object.values(state.attempts).some(({ binding: prior }) => prior.revision === binding.revision &&
@@ -3793,15 +3968,45 @@ export class MissionEngine {
         prior.roundId === binding.roundId && prior.memberId === binding.memberId && !prior.continuationOf &&
         inspection.events.some((event) => event.kind === "provider.request.dispatched" && event.attemptId === prior.attemptId)) ? 1 : 0;
     const remainingRequests = this.remainingRootSlots(inspection, "request") - pendingRootRequest;
+    // Reject exhausted request capacity before calculating its prospective token grant.
+    if (!binding.finalization)
+      this.requireRootSlack(inspection, "provider-requests", 1, releasedProvider, remainingRequests);
+    const tokenUse = budgetAmounts(inspection.events, "tokens");
+    // Reserve available slack, not an equal-share usage estimate. Actual/unknown usage still settles immutably.
+    const availableTokens = binding.finalization
+      ? this.remainingFinalizationCapacity(inspection, "tokens", binding.finalization.phase)
+      : inspection.definition.budget.tokens - tokenUse.ordinary - tokenUse.protected + releasedTokens -
+        remainingRequests * tokensPerRequest;
+    // Leave half of ordinary slack for concurrent/fallback requests; protected phases execute serially.
+    // Ponytail shares its slack while retaining the later phases' protected minima.
+    const tokenGrant = binding.finalization ? binding.finalization.phase === "ponytail"
+      ? Math.min(availableTokens, Math.max(compileFinalizationGrants(inspection.definition).tokens, Math.ceil(availableTokens / 2))) : availableTokens
+      : Math.min(availableTokens, Math.max(tokensPerRequest, Math.ceil(availableTokens / 2)));
+    if (tokenGrant < 1) {
+      if (!binding.finalization)
+        this.requireRootSlack(inspection, "tokens", 1, releasedTokens, remainingRequests);
+      throw new RecoveryAdmissionError("no token slack remains for provider request");
+    }
+    const events = [
+      this.event(binding.revision, "reservation.created", `reservation:${request.requestId}:provider`, {
+        reservationId: requestReservationId, revision: binding.revision, resource: "provider-requests", amount: 1, purpose: binding.finalization ? "finalization" : "ordinary",
+      }, binding.unitId, binding.attemptId),
+      this.event(binding.revision, "reservation.created", `reservation:${request.requestId}:tokens`, {
+        reservationId: tokenReservationId, revision: binding.revision, resource: "tokens", amount: tokenGrant, purpose: binding.finalization ? "finalization" : "ordinary",
+      }, binding.unitId, binding.attemptId),
+      this.event(binding.revision, "provider.request.dispatched", `${request.requestId}:dispatched`, {
+        requestId: request.requestId, attemptId: binding.attemptId, unitId: binding.unitId,
+        provider: request.provider, model: request.model, tokenReservationId, ownerEpoch: binding.ownerEpoch,
+      }, binding.unitId, binding.attemptId, undefined, requestDuration ?? undefined),
+    ];
     if (binding.finalization) {
       this.requireFinalizationCapacity(inspection, "provider-requests", 1, binding.finalization.phase);
-      this.requireFinalizationCapacity(inspection, "tokens", tokensPerRequest, binding.finalization.phase);
+      this.requireFinalizationCapacity(inspection, "tokens", tokenGrant, binding.finalization.phase);
     } else {
-      this.requireRootSlack(inspection, "provider-requests", 1, releasedProvider, remainingRequests);
-      this.requireRootSlack(inspection, "tokens", tokensPerRequest, releasedTokens, remainingRequests);
+      this.requireRootSlack(inspection, "tokens", tokenGrant, releasedTokens, remainingRequests);
     }
     if (binding.consultationId && firstRequest) events.unshift(...this.releaseConsultationMinimum(inspection, binding.consultationId,
-      { "provider-requests": 1, tokens: tokensPerRequest }, binding.unitId, binding.attemptId));
+      { "provider-requests": 1, tokens: tokenGrant }, binding.unitId, binding.attemptId));
     this.store.appendTransition(this.missionId, inspection.version, { events });
     this.requestStarted.set(request.requestId, this.now());
     return { tokenReservationId };
@@ -3856,6 +4061,7 @@ export class MissionEngine {
   ): boolean {
     if (this.closed || this.retired || (!currentCheckpointUse && this.store.ownerEpoch !== binding.ownerEpoch) ||
       this.store.ownerEpoch === null || inspection.revision !== binding.revision) return false;
+    if (!this.setupAllows(inspection, binding.unitId)) return false;
     const state = reduceMissionEvents(inspection);
     // An admitted effect's own prepared/invoking stamps are not a new recovery cause for itself.
     const observed = invokingEffectId ? { ...inspection, events: inspection.events.filter((event) =>
@@ -3877,6 +4083,19 @@ export class MissionEngine {
       !pendingQuestionUnits(inspection.events, inspection.definition, this.store).has(binding.unitId) &&
       state.units[binding.unitId]?.status === "running" &&
       !!state.attempts[binding.attemptId] && !state.attempts[binding.attemptId]!.settled;
+  }
+
+  private setupAllows(inspection: ReturnType<MissionStore["inspectMission"]>, unitId: string, predicateIds: string[] = []): boolean {
+    try {
+      if (inspection.prepared && this.managedWorkspace) missionInputIdentity(inspection, this.managedWorkspace.sourceRoot);
+      const setup = inspection.prepared?.setup;
+      if (!setup) return true;
+      assertSetupRequirements(setup, inspection.definition);
+      if (!this.setup.quiescent) return false;
+      if (this.setup.observe(inspection).state !== "blocked") return true;
+      return !setup.requiredBy.unitIds.includes(unitId) &&
+        !predicateIds.some((id) => setup.requiredBy.predicateIds.includes(id)) && unitId !== FINALIZATION_OWNER;
+    } catch { return false; }
   }
 
   private recordProviderReceipt(binding: MissionAttemptBinding, receipt: ProviderRequestReceipt): void {
@@ -4319,7 +4538,7 @@ function initialSnapshot(missionId: string, revision: number, definition: Return
     activeTimeMs: 0,
     admissionFenced: false,
     canFinalize: false,
-    requiredPredicates: [...definition.finalization.requiredPredicates],
+    requiredPredicates: [...(definition.finalization.selections?.ordinary ?? definition.finalization.requiredPredicates)],
   };
 }
 
@@ -4420,6 +4639,11 @@ function createBrief(
     `Invariants: ${JSON.stringify(definition.invariants)}`,
     `Revision: ${state.revision}`,
     `Unit: ${unit.id} (${unit.kind})`,
+    ...(unit.originalIntent ? [
+      `Original objective (source ${unit.originalIntent.sourceId}):\n${unit.originalIntent.objective}`,
+      `Original WorkBrief:\n${unit.originalIntent.workBrief}`,
+      `Original criteria and evidence mappings: ${JSON.stringify(unit.originalIntent.criteria)}`,
+    ] : []),
     ...(context?.recoveryMode === "verify" ? ["Recovery mode: verify the observed recovered candidate first. Do not repeat the original effect or modify candidate files; use read-only checks and report the actual result."] : []),
     ...(context?.recoveryMode === "repair" ? ["Recovery mode: the recovered candidate failed verification. Make only the bounded correction needed for the current predicate, on this fresh candidate. Use existing allowed paths and operations; never repeat the original effect or any external operation."] : []),
     `Role: ${unit.role}`,
@@ -4530,8 +4754,10 @@ function recoveryBlockedUnits(
     !sourceRoot || !["unchanged", "changed"].includes(report.plan.status) ||
     report.plan.storedHash !== inspection.snapshot.planHash || !report.source.manifest) return null;
   try {
-    if (captureWorkspaceImage(sourceRoot).manifest.hash !== report.source.manifest.hash ||
-      sha256(readFileSync(path.join(sourceRoot, ".pitako", "plans", `${inspection.planId}.md`))) !== report.plan.observedHash) return null;
+    if (captureWorkspaceImage(sourceRoot).manifest.hash !== report.source.manifest.hash) return null;
+    if (inspection.prepared) {
+      if (hashJson(missionInputIdentity(inspection, sourceRoot)) !== report.plan.inputIdentityHash) return null;
+    } else if (sha256(readFileSync(path.join(sourceRoot, ".pitako", "plans", `${inspection.planId}.md`))) !== report.plan.observedHash) return null;
   } catch { return null; }
   if (events.some((event) => event.seq > disposition.observedSeq && event.seq !== reportEvent.seq &&
     (event.kind === "effect.observation.recorded" && event.payload.episodeId !== report.episodeId ||
@@ -4623,9 +4849,10 @@ function missionNeedsRecovery(
   try {
     const report = JSON.parse(store.readArtifact(String(prior.payload.reportHash)).toString("utf8")) as {
       source?: { manifest?: { hash?: string } | null };
-      plan?: { observedHash?: string | null };
+      plan?: { observedHash?: string | null; inputIdentityHash?: string };
     };
     if (report.source?.manifest?.hash !== captureWorkspaceImage(sourceRoot).manifest.hash) return true;
+    if (inspection.prepared) return report.plan?.inputIdentityHash !== hashJson(missionInputIdentity(inspection, sourceRoot));
     const currentPlanHash = existsSync(planFile) ? sha256(readFileSync(planFile)) : null;
     return report.plan?.observedHash !== currentPlanHash;
   } catch { return true; }
@@ -4673,7 +4900,8 @@ function capturePredicateInputBindings(
   } catch { complete = false; }
   return unit.acceptance.map((predicate) => {
     const production = assessmentToolIdentity === MISSION_CHECK_IDENTITY;
-    const inputPatterns = [...new Set(production && !unit.inputs.length ? ["."] : unit.inputs)].sort();
+    const inputPatterns = [...new Set([...(production && !unit.inputs.length ? ["."] : unit.inputs),
+      ...(predicate.inputPaths ?? [])])].sort();
     const inScope = (name: string) => inputPatterns.some((pattern) => missionPathMatches(pattern, name)) &&
       (production || allowedPaths.some((pattern) => missionPathMatches(pattern, name)));
     const inputPaths = complete ? paths.filter(({ path: name }) => inScope(name)) : [];

@@ -1,8 +1,10 @@
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, test } from "bun:test";
-import { createAgentSession, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { AgentSession, createAgentSession, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
+import { WorkerHistory, SessionHistory, nativeHistoryStatus } from "../extensions/agent/history.ts";
+import { executionForSession } from "../extensions/execution-identity.ts";
 import { classifyProviderFailure } from "../extensions/agent/fallback.ts";
 import { activateTarget, createPiExecutor, cursorProviderContext, DEFAULT_THINKING_LEVEL, managedSettingsManager, shouldBypassProviderAdmission } from "../extensions/agent/pi.ts";
 import { runAgentInstance, teamExecutionSummary } from "../extensions/agent/run.ts";
@@ -70,6 +72,92 @@ describe("cursor request", () => {
 });
 
 describe("pi adapter boundary", () => {
+  test.serial("restores persisted catalogs before primary and fallback child activation offline", fixture.ownedCase("restores persisted catalogs before primary and fallback child activation offline", async () => {
+    const agentDir = mkdtempSync(path.join(tmpdir(), "pitako-cached-agent-"));
+    const cwd = mkdtempSync(path.join(tmpdir(), "pitako-cached-cwd-"));
+    tempDirs.push(agentDir, cwd);
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    const cachedModel = (provider: string, id: string) => ({
+      provider, id, name: id, api: "openai-responses", baseUrl: "http://127.0.0.1:1",
+      reasoning: true, input: ["text"], contextWindow: 10000, maxTokens: 1000,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    });
+    const cachePath = path.join(agentDir, "models-store.json");
+    writeFileSync(cachePath, JSON.stringify({
+      openai: { models: [cachedModel("openai", "pitako-cache-only")], checkedAt: 1, lastModified: Date.now() },
+      xai: { models: [cachedModel("xai", "grok-4.7")], checkedAt: 1, lastModified: Date.now() },
+    }));
+    writeFileSync(path.join(agentDir, "auth.json"), JSON.stringify({
+      openai: { type: "api_key", key: "fixture-only" },
+      xai: { type: "api_key", key: "fixture-only" },
+    }));
+    const cacheBefore = readFileSync(cachePath, "utf8");
+    const authBefore = readFileSync(path.join(agentDir, "auth.json"), "utf8");
+    let networkCalls = 0;
+    Object.defineProperty(globalThis, "fetch", { configurable: true,
+      value: async () => { networkCalls++; throw new Error("cache fixture forbids network"); } });
+    const staticRuntime = await ModelRuntime.create({ allowModelNetwork: false, refreshOnCreate: false });
+    expect(staticRuntime.getModel("openai", "pitako-cache-only")).toBeUndefined();
+    expect(staticRuntime.getModel("xai", "grok-4.7")).toBeUndefined();
+    const activations: Array<{ model: string; reasoning: string }> = [];
+    let stop = new AbortController();
+    let child: AgentSession;
+    let binds = 0, prompts = 0, disposals = 0;
+    const bind = AgentSession.prototype.bindExtensions;
+    const binding = spyOn(AgentSession.prototype, "bindExtensions").mockImplementation(async function (this: AgentSession, ...args) {
+      await bind.apply(this, args);
+      binds++;
+      child = this;
+      this.prompt = async () => { prompts++; throw new Error("cache fixture must not prompt"); };
+      const dispose = this.dispose.bind(this);
+      this.dispose = async () => { disposals++; await dispose(); };
+    });
+    const telemetry = process.env.PI_TELEMETRY;
+    // Synthetic cache-only activation must not report installed extensions.
+    process.env.PI_TELEMETRY = "0";
+    try {
+      for (const fallback of [false, true]) {
+        stop = new AbortController();
+        const target = fallback ? { model: "xai/grok-4.7", reasoning: "high" as const, fast: true }
+          : { model: "openai/pitako-cache-only", reasoning: "medium" as const, fast: false };
+        const attemptId = fallback ? "32345678-1234-4234-8234-123456789abc" : "22345678-1234-4234-8234-123456789abc";
+        const result = await fixture.run(runAgentInstance({
+          roleId: "developer", cwd, task: "exact cache-only task", signal: stop.signal,
+          executor: {
+            capturesHistory: true,
+            start(input) {
+              return createPiExecutor().start({ ...input, onActivated(reasoning) {
+                input.onActivated?.(reasoning);
+                activations.push({ model: `${child.model!.provider}/${child.model!.id}`, reasoning });
+                stop.abort();
+              } });
+            },
+          },
+          durable: {
+            attemptId, sessionId: attemptId, sessionDir: path.join(agentDir, attemptId), readOnly: true,
+            rolePolicy: { primary: fallback ? { model: "pitako-absent/primary" } : target, fallbacks: fallback ? [target] : [] },
+            onProviderDispatch() { throw new Error("cache fixture must not dispatch"); },
+            onProviderReceipt() { throw new Error("cache fixture must not receipt"); },
+          },
+        }));
+        console.log("offline cached child", JSON.stringify({ fallback, status: result.status, model: result.model, activations, binds, prompts, disposals, networkCalls }));
+        expect(result.status).toBe("cancelled");
+        expect(result.model).toMatchObject({ selectedModel: target.model, fallbackOccurred: fallback, requestedReasoning: target.reasoning });
+      }
+      expect(activations).toEqual([
+        { model: "openai/pitako-cache-only", reasoning: "medium" },
+        { model: "xai/grok-4.7", reasoning: "high" },
+      ]);
+      expect({ binds, prompts, disposals, networkCalls }).toEqual({ binds: 2, prompts: 0, disposals: 2, networkCalls: 0 });
+      expect(readFileSync(cachePath, "utf8")).toBe(cacheBefore);
+      expect(readFileSync(path.join(agentDir, "auth.json"), "utf8")).toBe(authBefore);
+    } finally {
+      binding.mockRestore();
+      if (telemetry === undefined) delete process.env.PI_TELEMETRY;
+      else process.env.PI_TELEMETRY = telemetry;
+    }
+  }), 60_000);
+
   test.serial("construction enables grep, find, and ls without session_start", fixture.ownedCase("construction enables grep, find, and ls without session_start", async () => {
     const agentDir = mkdtempSync(path.join(tmpdir(), "pitako-agent-tools-"));
     tempDirs.push(agentDir);
@@ -257,6 +345,85 @@ describe("extension provider bind", () => {
     return { calls, cwd, provider };
   }
 
+  test.serial("durable pre-prompt fallback retains real native identity without provider requests", fixture.ownedCase("durable pre-prompt fallback retains real native identity without provider requests", async () => {
+    const { cwd, provider, calls } = await installLateProvider();
+    provider.streamSimple = () => { calls.push("FORBIDDEN"); throw new Error("offline fixture must not stream"); };
+    const history = new WorkerHistory();
+    const missionId = "12345678-1234-4234-8234-123456789abc";
+    const attemptId = "22345678-1234-4234-8234-123456789abc";
+    const sessionsDirectory = path.join(history.agentDir, "pitako", "sessions");
+    const group = history.createGroup(cwd, { kind: "mission", storeRoot: path.join(history.agentDir, "pitako"), missionId },
+      { missionStore: { dbPath: path.join(history.agentDir, "pitako", "mission.db"), objectDir: path.join(history.agentDir, "pitako", "objects"), sessionsDirectory } });
+    const sessionDir = path.join(sessionsDirectory, missionId, attemptId);
+    const stop = new AbortController();
+    const managers: SessionManager[] = [];
+    let binds = 0, prompts = 0, shutdowns = 0, disposals = 0, activations = 0, dispatches = 0, receipts = 0;
+    const bind = AgentSession.prototype.bindExtensions;
+    const binding = spyOn(AgentSession.prototype, "bindExtensions").mockImplementation(async function (this: AgentSession, ...args) {
+      binds++;
+      managers.push(this.sessionManager);
+      expect(executionForSession(this.sessionId)?.roleId).toBe("developer");
+      await bind.apply(this, args);
+      this.prompt = async () => { prompts++; throw new Error("offline fixture must not prompt"); };
+      const setModel = this.setModel.bind(this);
+      this.setModel = async (model, options) => {
+        await setModel(model, options);
+        if (model.provider === "pitako-late") {
+          activations++;
+          expect(this.sessionManager).toBe(managers[0]);
+          expect(existsSync(this.sessionManager.getSessionFile()!)).toBe(false);
+          expect(executionForSession(this.sessionId)?.roleId).toBe("developer");
+          stop.abort();
+        }
+      };
+      const emit = this.extensionRunner.emit.bind(this.extensionRunner);
+      this.extensionRunner.emit = async (event) => {
+        if (event.type === "session_shutdown") shutdowns++;
+        return emit(event);
+      };
+      const dispose = this.dispose.bind(this);
+      this.dispose = async () => { disposals++; await dispose(); };
+    });
+    try {
+      const result = await fixture.run(runAgentInstance({
+        roleId: "developer", cwd, task: "  exact reserved task\n", signal: stop.signal, executor: createPiExecutor(),
+        durable: {
+          attemptId, sessionId: attemptId, sessionDir, readOnly: true,
+          history: { groupId: group.groupId, admission: { roleId: "developer", attemptId, unitId: "unit" } },
+          rolePolicy: { primary: { model: "pitako-absent/primary" }, fallbacks: [{ model: "pitako-late/late", reasoning: "off" }] },
+          onProviderDispatch() { dispatches++; throw new Error("offline fixture must not dispatch"); },
+          onProviderReceipt() { receipts++; throw new Error("offline fixture must not receipt"); },
+        },
+      }));
+      console.log("offline durable fallback", JSON.stringify({ status: result.status, result: result.result, model: result.model,
+        binds, prompts, shutdowns, disposals, activations, dispatches, receipts }));
+      expect(result.status).toBe("cancelled");
+      expect(result.model).toMatchObject({ selectedModel: "pitako-late/late", fallbackOccurred: true, fallbackReason: "unavailable" });
+      expect({ binds, prompts, shutdowns, disposals, activations, dispatches, receipts }).toEqual({
+        binds: 1, prompts: 0, shutdowns: 1, disposals: 1, activations: 1, dispatches: 0, receipts: 0,
+      });
+      expect(calls).toEqual([]);
+      const catalog = history.read(group.groupId);
+      expect(catalog.members).toHaveLength(1);
+      const member = catalog.members[0]!;
+      expect(member.native).toMatchObject({ state: "allocated", sessionId: attemptId, path: managers[0]!.getSessionFile(), disposition: { state: "disposed" } });
+      expect(path.dirname(managers[0]!.getSessionFile()!)).toBe(sessionDir);
+      expect(executionForSession(attemptId)).toBeUndefined();
+      expect(nativeHistoryStatus(member)).toEqual({ state: "not-persisted-before-assistant" });
+      expect(catalog.closure.state).toBe("unclosed");
+      const alias = catalog.aliases;
+      const otherId = SessionManager.create(cwd, sessionDir);
+      const otherPath = SessionManager.create(cwd, path.join(cwd, "different-path"), { id: attemptId });
+      for (const other of [otherId, otherPath]) {
+        expect(() => history.associateSession(group.groupId, member.historyId, other)).toThrow("managed attempt changed native session identity");
+      }
+      expect(history.read(group.groupId).members[0]!.native).toEqual(member.native);
+      expect(history.read(group.groupId).aliases).toEqual(alias);
+    } finally {
+      binding.mockRestore();
+    }
+  }), 60_000);
+
   test.serial("selects a model that appears only after session bind", fixture.ownedCase("selects a model that appears only after session bind", async () => {
     const { calls, cwd } = await installLateProvider();
     const attempt = await fixture.acquire(createPiExecutor().start({
@@ -273,6 +440,98 @@ describe("extension provider bind", () => {
     expect(calls[0]).toContain("late:");
     expect(calls[0]).toContain("say-pong-marker");
     expect(existsSync(path.join(cwd, ".pitako"))).toBe(false);
+  }), 60_000);
+
+  test.serial("durable bound terminal routes retain ownership and retire capability at drive", fixture.ownedCase("durable bound terminal routes retain ownership and retire capability at drive", async () => {
+    const { cwd, provider, calls } = await installLateProvider();
+    provider.streamSimple = () => { calls.push("FORBIDDEN"); throw new Error("offline fixture must not stream"); };
+    const modes = ["missing", "fast", "cancel", "disappeared", "activation", "drive", "retry-drive", "transfer"] as const;
+    const bind = AgentSession.prototype.bindExtensions;
+    const lookup = ModelRuntime.prototype.getModel;
+    for (const mode of modes) {
+      const history = new WorkerHistory();
+      const group = history.createGroup(cwd);
+      const attemptId = crypto.randomUUID();
+      const sessionDir = path.join(history.agentDir, "owned-terminal", attemptId);
+      const stop = new AbortController();
+      let bound = false, binds = 0, prompts = 0, shutdowns = 0, disposals = 0;
+      const binding = spyOn(AgentSession.prototype, "bindExtensions").mockImplementation(async function (this: AgentSession, ...args) {
+        binds++;
+        await bind.apply(this, args);
+        bound = true;
+        if (mode === "cancel") stop.abort();
+        this.prompt = async (task) => {
+          prompts++;
+          expect(task).toBe(" \nreserved bytes\n ");
+          throw new Error("offline drive rejection");
+        };
+        if (mode === "activation") this.setModel = async () => { throw new Error("No API key for pitako-late"); };
+        const emit = this.extensionRunner.emit.bind(this.extensionRunner);
+        this.extensionRunner.emit = async (event) => {
+          if (event.type === "session_shutdown") shutdowns++;
+          return emit(event);
+        };
+        const dispose = this.dispose.bind(this);
+        this.dispose = async () => { disposals++; await dispose(); };
+      });
+      const looking = spyOn(ModelRuntime.prototype, "getModel").mockImplementation(function (this: ModelRuntime, ...args) {
+        if (mode === "disappeared" && bound && args[0] === "pitako-late") return undefined;
+        if (mode === "disappeared" && !bound && args[0] === "pitako-late") {
+          this.registerProvider("pitako-late", {
+            baseUrl: provider.baseUrl, apiKey: provider.apiKey, api: "openai-completions",
+            models: provider.models.map((model) => ({ ...model, input: ["text"] })),
+            streamSimple() { throw new Error("must not stream"); },
+          });
+        }
+        return lookup.apply(this, args);
+      });
+      const recording = mode === "transfer" ? spyOn(SessionHistory.prototype, "result").mockImplementation(() => {
+        throw new Error("offline history transfer rejection");
+      }) : undefined;
+      try {
+        const pending = createPiExecutor().start({
+          instanceId: "developer-terminal", role: lateRole, task: " \nreserved bytes\n ",
+          target: { model: ["missing", "retry-drive", "transfer"].includes(mode) ? "pitako-absent/primary" : "pitako-late/late", fast: mode === "fast" },
+          cwd, signal: stop.signal,
+          durable: { attemptId, sessionId: attemptId, sessionDir, readOnly: true,
+            rolePolicy: { primary: { model: "pitako-late/late" }, fallbacks: [] },
+            history: { groupId: group.groupId, admission: { roleId: "developer", attemptId } },
+            onProviderDispatch() { throw new Error("must not dispatch"); },
+            onProviderReceipt() { throw new Error("must not receipt"); } },
+        });
+        if (mode === "transfer") {
+          await expect(pending).rejects.toThrow("offline history transfer rejection");
+          expect({ binds, prompts, shutdowns, disposals }).toEqual({ binds: 1, prompts: 0, shutdowns: 1, disposals: 1 });
+          expect(executionForSession(attemptId)).toBeUndefined();
+          continue;
+        }
+        let attempt = await fixture.acquire(pending);
+        if (mode === "retry-drive") {
+          const retained = attempt.session!;
+          attempt = await retained.retryBeforePrompt!({ model: "pitako-late/late", reasoning: "off" }, stop.signal);
+          expect(retained.retryBeforePrompt).toBeUndefined();
+        }
+        expect(attempt.status).toBe(mode === "cancel" ? "cancelled" : "failed");
+        expect(Boolean(attempt.session?.retryBeforePrompt)).toBe(mode !== "drive" && mode !== "retry-drive");
+        if (mode === "fast") expect(attempt.failureKind).toBe("configuration");
+        if (mode === "activation") expect(attempt.error).toContain("No API key");
+        if (mode === "disappeared" || mode === "missing") expect(attempt.error).toContain("model unavailable");
+        expect(binds).toBe(1);
+        expect(prompts).toBe(mode === "drive" || mode === "retry-drive" ? 1 : 0);
+        expect(disposals).toBe(0);
+        await attempt.session!.dispose();
+        await attempt.session!.dispose();
+        expect({ shutdowns, disposals }).toEqual({ shutdowns: 1, disposals: 1 });
+        expect(executionForSession(attemptId)).toBeUndefined();
+        expect(history.read(group.groupId).closure.state).toBe("unclosed");
+        expect(nativeHistoryStatus(history.read(group.groupId).members[0]!)).toEqual({ state: "not-persisted-before-assistant" });
+      } finally {
+        recording?.mockRestore();
+        looking.mockRestore();
+        binding.mockRestore();
+      }
+    }
+    expect(calls).toEqual([]);
   }), 60_000);
 
   test.serial("a real Pi fallback continues on the same session", fixture.ownedCase("a real Pi fallback continues on the same session", async () => {

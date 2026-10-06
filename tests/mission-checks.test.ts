@@ -27,6 +27,8 @@ test("unreceipted actor cannot turn matching worker text into production accepta
   const definition = missionDefinition();
   definition.finalization.contractVersion = 1;
   definition.budget.roleLaunches = 4;
+  // Ordinary request + Ponytail's two requests + cleanup + whole-result review.
+  definition.budget.providerRequests = 5;
   definition.budget.artifactBytes = 3_000_000;
   definition.units[0]!.role = "reviewer";
   definition.units[0]!.acceptance[0] = { id: "snapshot-present", kind: "artifact_hash", target: "result", expected: sha256(Buffer.from("PASS")) };

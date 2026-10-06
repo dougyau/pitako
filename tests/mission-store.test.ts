@@ -6,7 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { openSqlite } from "../extensions/board/sqlite.ts";
 import { ledgerTeamHolds, parseLedgerBinding, parseLedgerStatus } from "../extensions/workflow.ts";
-import { renderGeneratedLedger } from "../extensions/mission/store.ts";
+import { openMissionStore, renderGeneratedLedger } from "../extensions/mission/store.ts";
 import { currentProcessIdentity } from "../extensions/mission/workspace.ts";
 import type { EvaluationObservation, MissionMeasurement } from "../extensions/mission/model.ts";
 import {
@@ -89,6 +89,70 @@ function evaluation(missionId: string, id = randomUUID(), supersedesId: string |
 }
 
 describe("durable mission store", () => {
+  test("pre-claim observation of a canonical foreign marker never mints a local store id", async () => {
+    const sample = fixture();
+    const owner = await openFixtureStore(sample);
+    const mission = owner.createMission(missionInput(sample));
+    const markerFile = path.join(sample.root, ".git", "pitako", "repository-id");
+    const marker = readFileSync(markerFile);
+    const foreign = { dbPath: path.join(sample.base, "foreign.db"), objectDir: path.join(sample.base, "foreign-objects") };
+    try {
+      await expect(openMissionStore({ ...foreign, admitWriter: (observation) => {
+        if (!observation) return;
+        expect(observation.ownerEpoch).toBeNull();
+        expect(observation.ownershipIdentity).toEqual({ epoch: 0, claimId: "" });
+        observation.findManagedMission(sample.root);
+      } })).rejects.toThrow("repository marker does not prove this repository association");
+      const db = await openSqlite(foreign.dbPath, { readOnly: true });
+      try {
+        expect(db.prepare("SELECT value FROM store_meta WHERE key = 'store_instance_id'").get()).toBeUndefined();
+        expect(db.prepare("SELECT value FROM store_meta WHERE key = 'owner_epoch'").get()?.value).toBe("0");
+        expect(db.prepare("SELECT value FROM store_meta WHERE key = 'owner_claim_id'").get()?.value).toBe("");
+        expect(db.prepare("SELECT value FROM store_meta WHERE key = 'owner_acquisition_proof'").get()?.value).toBe("");
+        expect(db.prepare("SELECT * FROM mission_events").all()).toEqual([]);
+        expect(db.prepare("SELECT * FROM missions").all()).toEqual([]);
+      } finally { db.close(); }
+      const claimed = await openMissionStore(foreign);
+      try {
+        expect(claimed.ownerEpoch).toBe(1);
+        expect(() => claimed.createMission(missionInput(sample))).toThrow("repository marker belongs to a different mission store");
+        expect(readFileSync(markerFile)).toEqual(marker);
+        expect(owner.verifyRepositoryAssociation(sample.root)).toBe(mission.repositoryId);
+      } finally { claimed.close(); }
+    } finally { acknowledgeOwnerRetirement(owner, mission.id); owner.close(); }
+  });
+
+  test("pre-claim observation preserves fresh acquisition and previously owned read-only association", async () => {
+    const sample = fixture();
+    let observed = false;
+    const store = await openMissionStore({ dbPath: sample.dbPath, objectDir: sample.objectDir, admitWriter: (observation) => {
+      if (!observation) return;
+      observed = true;
+      expect(observation.ownerEpoch).toBeNull();
+      expect(observation.findManagedMission(sample.root)).toBeUndefined();
+      expect(() => observation.ensureRepositoryIdentity(sample.root)).toThrow(/read-only.*writer reservation/);
+    } });
+    const mission = store.createMission(missionInput(sample));
+    expect(observed).toBe(true);
+    expect(store.ownerEpoch).toBe(1);
+    acknowledgeOwnerRetirement(store, mission.id);
+    store.close();
+    const reader = await openMissionStore({ dbPath: sample.dbPath, objectDir: sample.objectDir, readOnly: true });
+    try {
+      expect(reader.ownerEpoch).toBeNull();
+      expect(reader.findManagedMission(sample.root)?.id).toBe(mission.id);
+      expect(reader.verifyRepositoryAssociation(sample.root)).toBe(mission.repositoryId);
+      expect(() => reader.ensureRepositoryIdentity(sample.root)).toThrow(/read-only.*writer reservation/);
+    } finally { reader.close(); }
+    const reopened = await openMissionStore({ dbPath: sample.dbPath, objectDir: sample.objectDir, admitWriter: (observation) => {
+      if (observation) expect(observation.findManagedMission(sample.root)?.id).toBe(mission.id);
+    } });
+    try {
+      expect(reopened.ownerEpoch).toBe(2);
+      expect(reopened.ensureRepositoryIdentity(sample.root)).toBe(mission.repositoryId);
+    } finally { acknowledgeOwnerRetirement(reopened, mission.id); reopened.close(); }
+  });
+
   test("pins exact plan and executable bytes, ignores later source edits, and replays command ids", async () => {
     const sample = fixture();
     const store = await openFixtureStore(sample);
