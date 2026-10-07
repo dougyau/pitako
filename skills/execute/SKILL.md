@@ -117,9 +117,9 @@ Apply that policy within the plan's required gates. Use `verify-behavior` for di
 
 Route project procedures through `verify-behavior`'s shared root `GATES.md` interpretation using `binding.executionRoot`. Reference the guide and relevant obligations in the WorkBrief, not its whole body. Cross-check consequential claims and use existing discovery for uncovered obligations; frozen requirements remain controlling.
 
-If verification fails, reproduce, find the root cause, make the smallest correction, and verify again. First failure stays with the same Developer. Do not ask the user, call Architect, or switch to a stronger model because one check failed.
+If verification fails, the same Developer reproduces, finds the root cause, makes the smallest correction, and verifies again. Do not ask the user, call Architect, or switch to a stronger model merely because a check failed.
 
-If the same underlying failure class repeats, ask Reviewer. If that evidence shows the implementation shape is wrong but the plan envelope still holds, ask Architect, record a Level 2 amendment, and continue. If no solution preserves the envelope, return `USER_DECISION_REQUIRED`. Unrelated failures do not count as the same loop.
+Known focused diagnosis and correction remain with the Developer, regardless of failure count. Consult for an identified design, knowledge, authority or correctness question: Architect resolves a missing design decision; Reviewer assesses an existing proposal. Resolve missing context through focused inspection. When useful, `verify-behavior` offers optional JEV consultation orientation using the assigned result, scope, proposal, established evidence, remaining uncertainty and actual specialist question when known. Advice is not a WorkBrief, dispatch or authority. Missing advice creates no installation task or mandatory consultation. If evidence shows the implementation shape is wrong but the plan envelope still holds, ask Architect, record a Level 2 amendment, and continue. If no solution preserves the envelope, return `USER_DECISION_REQUIRED`. Independent final review remains required and is never waived by advice.
 
 Do not start the next unit until this unit is verifiable.
 

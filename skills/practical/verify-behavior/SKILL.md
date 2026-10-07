@@ -57,6 +57,32 @@ TDD is optional when requested or when it makes a cheap local regression easier.
 
 ## Distinguish diagnosis from final gates
 
+### Optional JEV orientation
+
+When interpreting evidence would be useful, optionally request `failure`, `test-audit` or `consultation` advice. It is not needed for every assertion, failure or role decision. Known focused diagnosis/correction remains Developer work. An identified missing design decision goes to Architect; a correctness question about an existing proposal goes to Reviewer. Focused inspection can resolve missing context. Consultation context includes the assigned result, scope, existing proposal, established evidence, remaining uncertainty and the actual specialist question when known, not a failure counter.
+
+Find `jev-advice.js` beside this skill's **advertised installed `SKILL.md` path**, not in the project checkout or a planning-machine path. In actual codemode, call `tools.read({path: helperPath})` for the entire source (no offset/limit). Reject a failed read, non-string result, or a read containing a truncation/continuation notice; never evaluate a partial source. Evaluate that complete expression and require `version === 1`. For example, with `helperPath` resolved from the advertised skill directory:
+
+```js
+const source = await tools.read({path: helperPath});
+if (typeof source !== "string" ||
+    /\[(?:Showing |.*more lines in file|Line .*exceeds)/.test(source))
+  throw new Error("Incomplete advisory source read");
+const helper = eval(source);
+if (helper.version !== 1) throw new Error("Unsupported advisory helper");
+return await helper.advise({subject: "consultation", context: selectedContext, evidenceRefs: refs});
+```
+
+Pass only selected bounded non-secret JSON context, never an entire transcript or raw log. References are provenance strings, not permission to read files. Questions/categories are fixed by the helper; supply no executable prompts, questions or policy. Use one `advise` call per short invocation and finish it before gates or unrelated operations.
+
+The helper checks available classifiers for `opencode/jev-1.13-free` on each use. Pi owns principal registration; its built-in codemode must already be active through normal Pi tool selection (`--tools`, `defaultTools` or `setActiveTools`), not another factory. Missing helper, codemode or JEV leaves normal verification usable: no credentials, retry, alternative model, installation task or mandatory consult. Explicit unavailable, malformed, error and aborted outcomes do not change deterministic evidence.
+
+Advice gives orientation/model estimates, not calibrated certainty, gate selection/execution, edits, role dispatch, approvals, permissions or a generated WorkBrief. Do not normalize, round or threshold probabilities. An audit label cannot delete a check; a failure cannot become a pass. The coordinator retains dispatch and ModelPolicy. Neither `continue_developer` nor unavailable advice waives or postpones mandatory independent final review.
+
+The `pitako.jev.latest` slot stages a complete record with a distinct ID/time, exact state/questions/criteria/references and full public response (including unknown labels, choice/confidence, bool probability, score/confidence, usage/status/errors). Unsent attempts have no request/response. Oversized input is rejected, never truncated. A complete-record storage failure is **incomplete advisory evidence**, not permission to drop probabilities or add another writer. Pi limits each JSON value to 262144 characters and active values to 1048576.
+
+`evidence: "staged"` is not a commitment receipt: require enclosing `Script completed`, and inspect the physical native `codemode-store` entry when retention matters. Failed, interrupted or uncommitted invocations remain incomplete unless that entry exists. Later invocations overwrite the active slot, but post-mortems use the existing retained history and physical entries, not only `load()`/latest state. Keep the private native agent directory outside disposable cwd; no local export or direct journal writer is needed.
+
 Diagnose a concrete failure with a focused reproduction. Seek early reachable evidence for consequential interactions, such as persistence and fallback before the first assistant, before repeating an expensive demonstration. A focused local reproduction does not replace a separately required real-provider demonstration or establish that a dependency caused the defect. Diagnose a dependency only as needed to locate the failing boundary of the authorized objective. Report out-of-scope findings and whether they block required acceptance; do not turn diagnosis into dependency maintenance.
 
 After the correction, run affected regression checks before repeating a broad final gate. Diagnosis explains the failure. Affected regression checks the corrected behavior and affected guarantees. Final gates establish the plan's required finished-state evidence. Diagnostic success does not waive final gates or independent review.

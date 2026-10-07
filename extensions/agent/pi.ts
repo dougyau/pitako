@@ -5,6 +5,7 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { getCurrentSystemPrompt, lazyStream, normalizeContext, type AssistantMessageEvent, type Context, type Model } from "@earendil-works/pi-ai";
 import {
   createAgentSession,
+  createCodemodeExtension,
   DefaultResourceLoader,
   getAgentDir,
   ModelRuntime,
@@ -380,6 +381,7 @@ async function openSession(
     agentDir,
     settingsManager,
     additionalExtensionPaths: [packageRoot()],
+    ...(!input.durable ? { extensionFactories: [createCodemodeExtension({ mode: "on" })] } : {}),
     appendSystemPrompt: [childInstructions(input.role, input.instanceId)],
     skillsOverride: (base) => ({
       skills: base.skills.filter((skill) => allowed.has(skill.name)),

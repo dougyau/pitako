@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
@@ -72,6 +73,25 @@ describe("cursor request", () => {
 });
 
 describe("pi adapter boundary", () => {
+  test.serial("ordinary production child runs public codemode and retains native history under Node offline", fixture.ownedCase("ordinary public codemode under Node", async () => {
+    const temporaryDirectory = mkdtempSync(path.join(tmpdir(), "pitako-codemode-node-"));
+    tempDirs.push(temporaryDirectory);
+    const child = spawnSync("node", ["--experimental-transform-types", "--import", "./scripts/sdk-node-loader.mjs",
+      "scripts/agent-history-sdk-node.mjs"], {
+      cwd: packageRoot(), encoding: "utf8", timeout: 60_000,
+      env: { ...process.env, PI_OFFLINE: "1", PI_TELEMETRY: "0", TMPDIR: temporaryDirectory },
+    });
+    expect(child.status, child.stderr + child.stdout).toBe(0);
+    const observed = JSON.parse(child.stdout);
+    expect(observed.ordinaryChild).toMatchObject({
+      providerCalls: 6, codemodeCalls: 3, actualReadBash: true, hooks: true,
+      validation: true, orchestrationExcluded: true, disposedIdentity: true,
+    });
+    expect(observed.recovered.preassistant).toBe("cancelled-with-retained-user");
+    expect(observed.removedWorktree).toBe(true);
+    expect(observed.paidCalls).toBe(0);
+  }), 90_000);
+
   test.serial("restores persisted catalogs before primary and fallback child activation offline", fixture.ownedCase("restores persisted catalogs before primary and fallback child activation offline", async () => {
     const agentDir = mkdtempSync(path.join(tmpdir(), "pitako-cached-agent-"));
     const cwd = mkdtempSync(path.join(tmpdir(), "pitako-cached-cwd-"));
@@ -98,7 +118,8 @@ describe("pi adapter boundary", () => {
       value: async () => { networkCalls++; throw new Error("cache fixture forbids network"); } });
     const staticRuntime = await ModelRuntime.create({ allowModelNetwork: false, refreshOnCreate: false });
     expect(staticRuntime.getModel("openai", "pitako-cache-only")).toBeUndefined();
-    expect(staticRuntime.getModel("xai", "grok-4.7")).toBeUndefined();
+    // Pi 1.0.4 also ships Grok in the static catalog; the cached definition
+    // below must still win when the production runtime restores catalogs.
     const activations: Array<{ model: string; reasoning: string }> = [];
     let stop = new AbortController();
     let child: AgentSession;
@@ -129,6 +150,7 @@ describe("pi adapter boundary", () => {
               return createPiExecutor().start({ ...input, onActivated(reasoning) {
                 input.onActivated?.(reasoning);
                 activations.push({ model: `${child.model!.provider}/${child.model!.id}`, reasoning });
+                expect(child.model!.baseUrl).toBe("http://127.0.0.1:1");
                 stop.abort();
               } });
             },
@@ -364,6 +386,7 @@ describe("extension provider bind", () => {
       managers.push(this.sessionManager);
       expect(executionForSession(this.sessionId)?.roleId).toBe("developer");
       await bind.apply(this, args);
+      expect(this.getAllTools().map(tool => tool.name)).not.toContain("codemode");
       this.prompt = async () => { prompts++; throw new Error("offline fixture must not prompt"); };
       const setModel = this.setModel.bind(this);
       this.setModel = async (model, options) => {

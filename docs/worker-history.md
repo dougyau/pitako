@@ -54,10 +54,11 @@ their private canonical directories. Their catalog stores the canonical path.
 History list and read recover those records without Hermes, including after
 restart or when Hermes excludes a session from indexing.
 
-Pi delays writing a native file until the first assistant message. Pitako uses
-the public SDK and does not force a pre-assistant write. An admitted worker can
-therefore have catalog evidence but no persisted transcript. A confirmed
-pre-assistant failure is different from an unexplained missing native file.
+Pi 1.0.4 writes a native file once a user or assistant message exists. Pitako
+uses the public SDK without forcing persistence. An admitted worker can have
+catalog evidence but no persisted transcript, or a cancelled pre-assistant
+session can retain a user message. File existence is not lifecycle completion.
+A confirmed pre-assistant failure is different from an unexplained missing file.
 
 Custom native entries record host provenance and observed selection, result, and
 disposal conditions. They do not make the transcript complete. Cancellation,
