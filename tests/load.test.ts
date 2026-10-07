@@ -98,6 +98,28 @@ function profileHarness(profileFlag?: string) {
 }
 
 describe("Pi package loading", () => {
+  test.serial("installed advice is discoverable in principal and ordinary codemode and retained outside cwd", () => {
+    const root = packageRoot();
+    const child = spawnSync("node", ["--experimental-transform-types", "--import",
+      path.join(root, "scripts/sdk-node-loader.mjs"), "scripts/jev-advice-sdk-node.mjs"], {
+      cwd: root, encoding: "utf8", timeout: 90_000,
+      env: { ...process.env, PI_OFFLINE: "1", PI_TELEMETRY: "0" },
+    });
+    expect(child.status, child.stderr + child.stdout).toBe(0);
+    const observed = JSON.parse(child.stdout);
+    expect(observed.advertisedDiscovery).toEqual(["principal CLI/Pi-owned builtin", "production ordinary child"]);
+    expect(observed.installedLayout).toBe(true);
+    expect(observed.unrelatedCwdWithoutCheckoutOrGates).toBe(true);
+    expect(observed.branchEvidence.subjects).toEqual(["failure", "test-audit", "consultation"]);
+    expect(observed.principalUnavailable).toBe("retained; zero classify calls");
+    expect(observed.ordinaryClassifyCalls).toBe(3);
+    expect(observed.paidCalls).toBe(0);
+    expect(observed.recovery).toEqual({
+      existingHistoryReader: true, physicalAndNativeRecords: 2, exactInputsAndResponses: true,
+      removedOnlyCwd: true, principalUnavailableRetained: true, failedStagedInvocationNotCommitted: true,
+    });
+  }, 120_000);
+
   test("discovers explicit-only gates from the edited package in a fresh loader", () => {
     const root = packageRoot();
     const loaded = loadInFreshProcess(root, mkdtempSync(path.join(tmpdir(), "pitako-gates-config-")));

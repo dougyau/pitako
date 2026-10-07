@@ -2,7 +2,7 @@
 
 This note records package choices and rejected alternatives. For the current AgentInstance, Team, Board, and Code Intelligence behavior, see [engineering.md](engineering.md).
 
-Pitako 0.1 composes current Pi (`@earendil-works/pi-coding-agent` 0.87.0). Packages declare resources under `package.json` `pi` (`extensions`, `skills`, `prompts`). Pi installs npm and git packages with `pi install` and runs `npm install` in that package. A local path is not copied and does not install dependencies, so a checkout needs `bun install` first.
+Pitako 0.1 composes Pi (`@earendil-works/pi-coding-agent` tested and supported public API floor 1.0.4). Packages declare resources under `package.json` `pi` (`extensions`, `skills`, `prompts`). Pi installs npm and git packages with `pi install` and runs `npm install` in that package. A local path is not copied and does not install dependencies, so a checkout needs `bun install` first.
 
 Third-party Pi packages are dependencies. Their entry files are listed in `pi.extensions` and `config/stack.json`. Pi's own docs require those nested packages to be in `dependencies` and `bundledDependencies` so the published tarball contains them. Pitako does not vendor their source.
 
@@ -73,7 +73,7 @@ No provider or model is set. `config/presets.example.json` is documentation only
 
 ## Upstream patterns kept small
 
-From the current Pi examples (package 0.87.0):
+From the Pi examples (package 1.0.4):
 
 - **Tool gating:** `pi.getActiveTools` / `pi.setActiveTools`. Used by the profiles.
 - **Protected paths:** `tool_call` can return `{ block: true, reason }`. Pitako blocks `.git/`, `node_modules/`, `.env`, and `.env.*` files for `edit` and `write`.

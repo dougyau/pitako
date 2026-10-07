@@ -357,9 +357,28 @@ describe("plan and execute contracts", () => {
     expect(decisions).toContain("Preserve explicit frozen invariants and acceptance conditions regardless of who authored them");
     expect(decisions).toContain("Removing a binding condition still requires its existing authority");
     const loop = execute.slice(execute.indexOf("## Loop"), execute.indexOf("## Cleanup"));
-    expect(loop).toContain("First failure stays with the same Developer");
-    expect(loop).toContain("If the same underlying failure class repeats, ask Reviewer");
+    expect(loop).toContain("Known focused diagnosis and correction remain with the Developer, regardless of failure count");
+    expect(loop).toContain("Architect resolves a missing design decision; Reviewer assesses an existing proposal");
+    expect(loop).not.toContain("If the same underlying failure class repeats, ask Reviewer");
     expect(loop).toContain("ask Architect, record a Level 2 amendment");
+  });
+
+  test("optional advice preserves uncertainty routing, installed discovery and final authority", () => {
+    const advice = verify.slice(verify.indexOf("### Optional JEV orientation"), verify.indexOf("Diagnose a concrete failure"));
+    for (const boundary of [
+      "advertised installed `SKILL.md` path", "tools.read({path: helperPath})",
+      'helper.version !== 1',
+    ]) expect(advice).toContain(boundary);
+    expect(advice).toContain("Reject a failed read");
+    expect(advice).toContain("Questions/categories are fixed by the helper");
+    expect(advice).toContain("coordinator retains dispatch and ModelPolicy");
+    expect(advice).toContain("waives or postpones mandatory independent final review");
+    expect(advice).toContain("Unsent attempts have no request/response");
+    expect(advice).toContain('`evidence: "staged"` is not a commitment receipt');
+    expect(advice).toContain("physical native `codemode-store` entry");
+    expect(advice).toContain("no credentials, retry, alternative model, installation task or mandatory consult");
+    expect(execute).toContain("actual specialist question when known");
+    expect(execute).toContain("Independent final review remains required and is never waived by advice");
   });
 
   test("verification owns diagnosis, wrapper coverage, and compatible evidence reuse", () => {
