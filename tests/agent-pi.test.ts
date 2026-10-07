@@ -849,11 +849,15 @@ describe("extension provider bind", () => {
     const codexToken = `header.${account}.signature`;
     writeFileSync(path.join(agentDir, "models.json"), JSON.stringify({
       providers: {
-        "openai-codex": {
+        openai: {
           api: "openai-codex-responses",
           apiKey: codexToken,
           baseUrl: "https://chatgpt.com/backend-api",
-          models: [{ id: "gpt-6-luna", name: "Luna", reasoning: true, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000, maxTokens: 64 }],
+          models: [
+            { id: "gpt-6-luna", name: "Luna", reasoning: true, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000, maxTokens: 64 },
+            { id: "fixture-responses", name: "Responses", api: "openai-responses", baseUrl: "https://api.openai.com/v1", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000, maxTokens: 64 },
+            { id: "fixture-completions", name: "Completions", api: "openai-completions", baseUrl: "https://api.openai.com/v1", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000, maxTokens: 64 },
+          ],
         },
         xai: {
           api: "openai-responses",
@@ -908,19 +912,19 @@ describe("extension provider bind", () => {
     return { agentDir, cwd, websocketBodies, httpBodies, payloadInputs };
   }
 
-  test.serial("sends exact Codex tiers through WebSocket/SSE", fixture.ownedCase("sends exact Codex tiers through WebSocket/SSE", async () => {
+  test.serial("sends OpenAI priority through Codex WebSocket/SSE", fixture.ownedCase("sends OpenAI priority through Codex WebSocket/SSE", async () => {
     const { cwd, websocketBodies, httpBodies, payloadInputs } = installTierFixture();
     const codex = await fixture.acquire(createPiExecutor().start({
       instanceId: "developer-codex-fast",
       role: lateRole,
       task: "send codex request",
-      target: { model: "openai-codex/gpt-6-luna", reasoning: "max", fast: true },
+      target: { model: "openai/gpt-6-luna", reasoning: "max", fast: true },
       cwd,
       signal: new AbortController().signal,
     }));
     expect(codex.status).toBe("failed");
     expect(codex.requests?.[0]).toMatchObject({
-      model: "openai-codex/gpt-6-luna",
+      model: "openai/gpt-6-luna",
       fast_requested: true,
       requested_service_tier: "priority",
       returned_service_tier: "unavailable",
@@ -929,6 +933,31 @@ describe("extension provider bind", () => {
     });
     expect(websocketBodies[0]).toMatchObject({ type: "response.create", service_tier: "priority", pitako_payload_hook: "retained" });
     expect(httpBodies[0]).toMatchObject({ service_tier: "priority", pitako_payload_hook: "retained" });
+    expect(payloadInputs.every((payload) => !Object.hasOwn(payload as object, "service_tier"))).toBe(true);
+  }), 60_000);
+
+  test.serial("sends OpenAI priority for arbitrary models through Responses and Completions", fixture.ownedCase("sends OpenAI priority for arbitrary models through Responses and Completions", async () => {
+    const { cwd, httpBodies, payloadInputs } = installTierFixture();
+    for (const id of ["fixture-responses", "fixture-completions"]) {
+      const attempt = await fixture.acquire(createPiExecutor().start({
+        instanceId: `developer-${id}-fast`,
+        role: lateRole,
+        task: "send OpenAI request",
+        target: { model: `openai/${id}`, fast: true },
+        cwd,
+        signal: new AbortController().signal,
+      }));
+      expect(attempt.failureKind).toBe("configuration");
+      expect(attempt.requests?.[0]).toMatchObject({
+        model: `openai/${id}`,
+        fast_requested: true,
+        requested_service_tier: "priority",
+      });
+    }
+    expect(httpBodies).toHaveLength(2);
+    for (const body of httpBodies) {
+      expect(body).toMatchObject({ service_tier: "priority", pitako_payload_hook: "retained" });
+    }
     expect(payloadInputs.every((payload) => !Object.hasOwn(payload as object, "service_tier"))).toBe(true);
   }), 60_000);
 

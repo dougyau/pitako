@@ -161,11 +161,11 @@ Reasoning uses Pi's levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, 
 
 ### Fast requests
 
-A target can set `fast = true` to request provider-specific priority service. Pitako sends `service_tier = "priority"` for both `openai-codex/gpt-6-luna` and `xai/grok-4.7`. Omitting `fast` or setting it to `false` keeps normal service behavior. Pitako's `fast` flag is separate from Codex CLI's `fast_mode` option. See the [Codex Fast mode documentation](https://developers.openai.com/codex/agent-configuration/speed/) and the [Codex configuration reference](https://developers.openai.com/codex/config-file/config-reference/).
+A target can set `fast = true` to request provider-specific priority service. Pitako sends `service_tier = "priority"` for any model from the `openai` provider and for `xai/grok-4.7`. Omitting `fast` or setting it to `false` keeps normal service behavior. Pitako's `fast` flag is separate from Codex CLI's `fast_mode` option. See the [Codex Fast mode documentation](https://developers.openai.com/codex/agent-configuration/speed/) and the [Codex configuration reference](https://developers.openai.com/codex/config-file/config-reference/).
 
 ```toml
 [model_policies.developer.primary]
-model = "openai-codex/gpt-6-luna"
+model = "openai/gpt-6-luna"
 reasoning = "max"
 fast = true
 ```
