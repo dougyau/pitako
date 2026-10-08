@@ -9,7 +9,7 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { MissionEventDraft, MissionStore } from "./store.ts";
 import {
   captureWorkspaceImage, captureWorkspacePaths, captureWorkspacePath, currentProcessIdentity, filterWorkspaceImage, hasContainmentProof, processBirthTicks, processIsDescendantOf, processesInNamespace, processNamespaceId,
-  quarantineWorkspace, readOwnedNamespaceInit, sandboxProductPath, spawnContained, ownerProcessState, observeNestedVerificationBoundary, type ManifestPath, type MissionWorkspace,
+  quarantineWorkspace, readOwnedNamespaceInit, sandboxProductPath, spawnContained, ContainedLaunchPreparationError, ownerProcessState, observeNestedVerificationBoundary, type ManifestPath, type MissionWorkspace,
 } from "./workspace.ts";
 import { sealWorkspaceImage } from "./reconcile.ts";
 import { loadCodexTools } from "./codex-tools.ts";
@@ -268,9 +268,29 @@ export class MissionEffects {
       return remainingInvocation > 0 && remainingInvocation <= remainingGrant;
     };
     try {
-      const child = operation === "bash"
-        ? spawnContained(this.context.workspace, "bash", ["-c", bashScript, "pitako-effect", String(input.command ?? "")], { signal, writablePaths, verificationSubject: this.verificationSubject, nestedAdmission: this.nestedAdmission, checkerTransport: transport, beforeSpawn, canSpawn })
-        : spawnContained(this.context.workspace, operation === "apply_patch" ? "bun" : "node", [sandboxProductPath(this.context.workspace, this.context.workspace.adapterScript)], { signal, writablePaths, verificationSubject: this.verificationSubject, canSpawn });
+      let child: ChildProcess | undefined;
+      try {
+        child = operation === "bash"
+          ? spawnContained(this.context.workspace, "bash", ["-c", bashScript, "pitako-effect", String(input.command ?? "")], { signal, writablePaths, verificationSubject: this.verificationSubject, nestedAdmission: this.nestedAdmission, checkerTransport: transport, beforeSpawn, canSpawn })
+          : spawnContained(this.context.workspace, operation === "apply_patch" ? "bun" : "node", [sandboxProductPath(this.context.workspace, this.context.workspace.adapterScript)], { signal, writablePaths, verificationSubject: this.verificationSubject, canSpawn });
+      } catch (error) {
+        if (!(error instanceof ContainedLaunchPreparationError)) throw error;
+        // No child is not proof of no effect: preparing directory mounts can mutate the candidate.
+        const unchanged = hashJson(captureWorkspacePaths(this.workspace.candidateRoot, true)) === candidateManifestHash;
+        if (!unchanged) {
+          this.fenced = true;
+          await this.appendEffectEvent("effect.unknown", effectId, {
+            effectId, operation, requestHash, owner,
+            reason: `candidate changed during prelaunch preparation: ${error.message}`,
+          });
+          throw error;
+        }
+        const receipt: MissionEffectReceipt = { effectId, operation, status: "denied", paths: [], reason: error.message };
+        await this.appendEffectEvent("effect.receipt", effectId, {
+          effectId, operation, status: receipt.status, paths: [], requestHash, owner, reason: receipt.reason, process: null,
+        });
+        return receipt;
+      }
       if (!child) {
         const reason = "command timeout exceeds current remaining effect time grant";
         const receipt: MissionEffectReceipt = { effectId, operation, status: "denied", paths: [], reason };

@@ -364,7 +364,7 @@ export function assertPreparedAdmission(prepared: PreparedMission): string {
   return issued.digest;
 }
 
-/** Final native confirmation is distinct from approving preparation's authority values. */
+/** Exact admission binding; native consent may group admission and authority values in one dialog. */
 export function preparedAdmissionText(prepared: PreparedMission): string {
   const hash = assertPreparedAdmission(prepared);
   return JSON.stringify({ action: "admit-prepared-mission", requestId: preparedObjects.get(prepared)!.request.id,

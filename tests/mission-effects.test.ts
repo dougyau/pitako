@@ -110,6 +110,44 @@ async function managedFixture(dependencies?: "source" | "candidate", operations 
 }
 
 describe("managed mission retirement", () => {
+  test("mount preparation failure records a resolved denial and permits the next effect", async () => {
+    if (process.platform !== "linux" || !existsSync("/usr/bin/bwrap")) return;
+    const { store, mission, workspace } = await managedFixture();
+    symlinkSync("target.txt", path.join(workspace.candidateRoot, "src", "alias.txt"));
+    workspace.allowedPaths = ["src/alias.txt"];
+    const effects = new MissionEffects({
+      store, workspace, missionId: mission.id, revision: 1, unitId: "snapshot",
+      attemptId: workspace.attemptId, runtimeId: store.runtimeId, ownerEpoch: store.ownerEpoch!,
+      allowedOperations: ["bash"], commandTime: fixtureCommandTime(),
+    });
+    try {
+      const denied = await effects.invoke("bash", { command: "cat src/target.txt" });
+      expect(denied.status).toBe("denied");
+      expect(denied.reason).toContain("existing regular file");
+      const inspection = store.inspectMission(mission.id);
+      const rows = inspection.events.filter(({ effectId }) => effectId === denied.effectId);
+      expect(rows.map(({ kind }) => kind)).toEqual(["effect.intent", "effect.invoking", "effect.receipt"]);
+      expect(rows.at(-1)?.payload.process).toBeNull();
+      expect(missionHasUnresolvedEffects(store, inspection.events)).toBe(false);
+      workspace.allowedPaths = ["src/future.txt"];
+      const read = await effects.invoke("bash", { command: "cat src/target.txt" });
+      expect(read.status).toBe("completed");
+      expect(read.stdout).toBe("source sentinel\n");
+      expect(existsSync(path.join(workspace.candidateRoot, "src/future.txt"))).toBe(false);
+
+      // A directory grant is prepared before the invalid grant; that mutation must remain unresolved.
+      workspace.allowedPaths = ["src/new/**", "src/alias.txt"];
+      await expect(effects.invoke("bash", { command: "true" })).rejects.toThrow("existing regular file");
+      const changed = store.inspectMission(mission.id);
+      expect(existsSync(path.join(workspace.candidateRoot, "src/new"))).toBe(true);
+      expect(changed.events.at(-1)?.kind).toBe("effect.unknown");
+      expect(missionHasUnresolvedEffects(store, changed.events)).toBe(true);
+    } finally {
+      await effects.shutdown();
+      store.close();
+    }
+  }, 30_000);
+
   test("official patch moves, fuzzy matching and failures retain private after-images and confinement", async () => {
     if (process.platform !== "linux" || !existsSync("/usr/bin/bwrap")) return;
     const { fixture, store, mission, workspace } = await managedFixture(undefined, ["apply_patch"]);

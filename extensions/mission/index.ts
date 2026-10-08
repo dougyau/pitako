@@ -508,6 +508,16 @@ Make supported technical choices autonomously. Propose explicit permissions and 
     const proposal = structuredClone(params.proposal);
     current.proposal = proposal as object;
     const check = () => { live(); if (current.proposal !== proposal) throw new PreparationBindingError("proposal replaced; confirmation expired"); };
+    const captureOwnership = (db?: MissionStore) => {
+      check();
+      const existing = db?.findManagedMission(current.root);
+      return { ownership: db?.ownershipIdentity ?? { epoch: 0, claimId: "" },
+        existing: existing ? { id: existing.id, revision: existing.revision, state: existing.state,
+          planHash: existing.snapshot.planHash, definitionHash: existing.snapshot.definitionHash, preparedHash: existing.snapshot.preparedHash } : null };
+    };
+    const observeOwnership = () => existsSync(path.join(getPitakoDataDir(), "missions.db"))
+      ? read(captureOwnership) : Promise.resolve(captureOwnership());
+    let approvedObservation: ReturnType<typeof captureOwnership> | undefined;
     let result = validatePreparation({ request: current.request, proposal, setup: params.setup });
     if (result.state === "needs-input") {
       const definition = (proposal as { definition?: MissionDefinition })?.definition;
@@ -539,22 +549,25 @@ Make supported technical choices autonomously. Propose explicit permissions and 
           issues: [issue], nextAction: issue.nextAction };
       }
       if (!decisions.length) return { ...result, authority: "proposal-only", message: "Restore missing mappings or resolve specific unsupported issues; no confirmation or admission." };
+      const before = await observeOwnership();
+      check();
       if (current.exactDetails) display(current.ctx, JSON.stringify({ context: preparationContext(current.request),
-        issues: result.issues, decisions: decisions.map((text) => JSON.parse(text)) }, null, 2));
+        proposal, issues: result.issues, decisions: decisions.map((text) => JSON.parse(text)), observed: before }, null, 2));
       const accepted = await confirmMissionAction(current.ctx.ui, {
-        title: "Preparation questions — explicit decisions, not estimate approval by default",
-        acceptLabel: "Authorize preparation",
-        summary: preparationView({ action: "preparation-authority / source-meaning / setup effects",
+        title: "Prepare mission — not start",
+        acceptLabel: "Prepare mission",
+        summary: preparationView({ action: "admit-prepared-mission",
           context: preparationContext(current.request), definition: definition!, setup: params.setup,
           interpretations: params.interpretations }),
-        details: () => JSON.stringify({ context: preparationContext(current.request),
-          issues: result.issues, decisions: decisions.map((text) => JSON.parse(text)) }, null, 2),
+        details: () => JSON.stringify({ context: preparationContext(current.request), proposal,
+          issues: result.issues, decisions: decisions.map((text) => JSON.parse(text)), observed: before }, null, 2),
         check,
       });
       check();
       if (accepted !== true) { discardDraft(); return { state: "dismissed", authority: "proposal-only", message: "Nothing admitted; repeat /mission prepare to reauthor." }; }
       if (JSON.stringify(decisions) !== JSON.stringify(decisionTexts()))
         throw new PreparationBindingError("preparation decision inputs changed; repeat /mission prepare");
+      approvedObservation = before;
       if (authority) bindPreparationAuthority(current.request, authority,
         recordOperatorInput("native-confirmation", current.sessionId, preparationAuthorityText(current.request, authority))!);
       for (const { sourceId, disposition } of params.interpretations ?? [])
@@ -569,17 +582,16 @@ Make supported technical choices autonomously. Propose explicit permissions and 
     const capture = (db?: MissionStore) => {
       check();
       if (preparedAdmissionText(prepared) !== text) throw new Error("prepared inputs changed");
-      const existing = db?.findManagedMission(current.root);
-      return { ownership: db?.ownershipIdentity ?? { epoch: 0, claimId: "" },
-        existing: existing ? { id: existing.id, revision: existing.revision, state: existing.state,
-          planHash: existing.snapshot.planHash, definitionHash: existing.snapshot.definitionHash, preparedHash: existing.snapshot.preparedHash } : null };
+      return captureOwnership(db);
     };
-    const before = existsSync(path.join(getPitakoDataDir(), "missions.db")) ? await read(capture) : capture();
+    const before = approvedObservation ?? await observeOwnership();
     check();
     if (current.exactDetails) display(current.ctx, JSON.stringify({ action: JSON.parse(text), preparedHash: result.digest,
       prepared, observed: before }, null, 2));
-    const accepted = await confirmMissionAction(current.ctx.ui, {
-      title: "Confirm exact prepared mission — not start", acceptLabel: "Prepare mission",
+    // The grouped decision already authorized admission and setup for this unchanged proposal.
+    // A request whose decisions were bound earlier still needs its own admission confirmation.
+    const accepted = approvedObservation !== undefined || await confirmMissionAction(current.ctx.ui, {
+      title: "Prepare mission — not start", acceptLabel: "Prepare mission",
       summary: preparationView({ action: "admit-prepared-mission", context: preparationContext(current.request),
         definition: prepared.definition, setup: prepared.setup?.decision.values,
       }),

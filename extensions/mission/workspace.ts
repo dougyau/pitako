@@ -369,26 +369,34 @@ interface ContainedSpawnOptions {
   beforeSpawn?: () => void;
   canSpawn?: () => boolean;
 }
+/** Raised only when native preparation failed before spawn returned a child. */
+export class ContainedLaunchPreparationError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = "ContainedLaunchPreparationError";
+  }
+}
 export function spawnContained(workspace: MissionWorkspace, commandName: string, args: string[],
   options?: ContainedSpawnOptions & { canSpawn?: never }): ReturnType<typeof spawn>;
 export function spawnContained(workspace: MissionWorkspace, commandName: string, args: string[],
   options: ContainedSpawnOptions): ReturnType<typeof spawn> | undefined;
 export function spawnContained(workspace: MissionWorkspace, commandName: string, args: string[], options: ContainedSpawnOptions = {}) {
-  const commandPath = commandName === "node" ? sandboxRuntimePath(workspace.runtimeNode)
-    : commandName === "bun" && workspace.runtimeBun
-      ? (path.basename(path.dirname(workspace.runtimeBun)) === "bin"
-        ? `${SANDBOX_ROOT}/runtime/bun-prefix/bin/${path.basename(workspace.runtimeBun)}`
-        : `${SANDBOX_ROOT}/runtime/bun`)
-      : commandName;
-  if (!commandPath) throw new Error(`contained runtime is unavailable: ${commandName}`);
-  if (options.nestedAdmission !== undefined) readNestedVerificationAdmission(options.nestedAdmission, workspace);
-  if ((options.nestedAdmission !== undefined) !== (options.checkerTransport !== undefined))
-    throw new Error("nested checker requires its owned native transport");
-  const seccompFd = openSeccompFilter(options.nestedAdmission !== undefined ? NESTED_PROFILE : undefined);
+  let seccompFd: number | undefined;
   let plan: { args: string[]; descriptors: number[] } | undefined;
   let createdMountpoint: string | undefined;
   let launched = false;
   try {
+    const commandPath = commandName === "node" ? sandboxRuntimePath(workspace.runtimeNode)
+      : commandName === "bun" && workspace.runtimeBun
+        ? (path.basename(path.dirname(workspace.runtimeBun)) === "bin"
+          ? `${SANDBOX_ROOT}/runtime/bun-prefix/bin/${path.basename(workspace.runtimeBun)}`
+          : `${SANDBOX_ROOT}/runtime/bun`)
+        : commandName;
+    if (!commandPath) throw new Error(`contained runtime is unavailable: ${commandName}`);
+    if (options.nestedAdmission !== undefined) readNestedVerificationAdmission(options.nestedAdmission, workspace);
+    if ((options.nestedAdmission !== undefined) !== (options.checkerTransport !== undefined))
+      throw new Error("nested checker requires its owned native transport");
+    seccompFd = openSeccompFilter(options.nestedAdmission !== undefined ? NESTED_PROFILE : undefined);
     if (options.nestedAdmission !== undefined &&
       createHash("sha256").update(readFileSync(`/proc/self/fd/${seccompFd}`)).digest("hex") !==
         readNestedVerificationAdmission(options.nestedAdmission, workspace).binding.policyIdentity)
@@ -425,8 +433,11 @@ export function spawnContained(workspace: MissionWorkspace, commandName: string,
     const child = spawn(bwrapPath, spawnArgs, spawnOptions);
     launched = true;
     return child;
+  } catch (error) {
+    if (launched) throw error;
+    throw new ContainedLaunchPreparationError(error);
   } finally {
-    closeSync(seccompFd);
+    if (seccompFd !== undefined) closeSync(seccompFd);
     for (const fd of plan?.descriptors ?? []) closeSync(fd);
     // No child or asynchronous work can own this host-created empty directory yet.
     if (createdMountpoint && !launched) rmdirSync(createdMountpoint);
@@ -896,6 +907,8 @@ function baseBwrapPlan(workspace: MissionWorkspace, writablePaths: string[], ver
   try {
     for (const grant of writablePaths) {
       const target = writableMountTarget(workspace, grant);
+      // A future exact file stays read-only/absent; never mount its parent writable.
+      if (!target) continue;
       const fd = openSync(target.hostPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW |
         (target.directory ? fsConstants.O_DIRECTORY : 0));
       descriptors.push(fd);
@@ -957,14 +970,15 @@ function normalizeAllowedPath(value: string): string {
   return subtree ? `${relative}/**` : relative;
 }
 
-function writableMountTarget(workspace: MissionWorkspace, input: string): { hostPath: string; sandboxPath: string; directory: boolean; identity: string } {
+function writableMountTarget(workspace: MissionWorkspace, input: string): { hostPath: string; sandboxPath: string; directory: boolean; identity: string } | undefined {
   const grant = normalizeAllowedPath(input);
   if (grant === ".") return { hostPath: workspace.candidateRoot, sandboxPath: WORKSPACE_MOUNT, directory: true, identity: workspace.candidateIdentity };
   const directory = grant.endsWith("/**");
   const relative = directory ? grant.slice(0, -3) : grant;
   const stat = safeLstatAt(workspace.candidateRoot, relative);
   if (!directory) {
-    if (!stat?.isFile() || stat.isSymbolicLink()) throw new Error(`managed exact-file write mount requires an existing regular file: ${grant}`);
+    if (!stat) return undefined;
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`managed exact-file write mount requires an existing regular file: ${grant}`);
     return { hostPath: path.join(workspace.candidateRoot, relative), sandboxPath: `${WORKSPACE_MOUNT}/${relative}`, directory: false, identity: `${stat.dev}:${stat.ino}` };
   }
   if (stat && (!stat.isDirectory() || stat.isSymbolicLink())) {

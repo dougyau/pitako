@@ -182,11 +182,11 @@ describe("managed mission candidate containment", () => {
     } finally { store.close(); }
   }, 30_000);
 
-  test("exact-file mounts reject symlinks, missing paths and directories without creating broader write authority", () => {
+  test("exact-file mounts reject symlinks and directories without creating broader write authority", () => {
     if (!canContain) throw new Error("exact-file rejection regression requires Linux bwrap containment");
     const sample = fixture();
     const candidate = workspace(sample);
-    for (const grant of ["src/link.txt", "src/missing.txt", "src", "src/target.txt/**"]) {
+    for (const grant of ["src/link.txt", "src", "src/target.txt/**"]) {
       expect(() => spawnContained(candidate, "bash", ["-c", "true"], { writablePaths: [grant] })).toThrow();
     }
     expect(existsSync(path.join(candidate.candidateRoot, "src/missing.txt"))).toBe(false);
@@ -206,7 +206,7 @@ describe("managed mission candidate containment", () => {
     const candidate = createMissionWorkspace({
       missionId: randomUUID(), attemptId: randomUUID(), sourceRoot: sample.sourceRoot,
       storeRoot: sample.storeRoot, candidateParent: sample.candidateParent,
-      allowedPaths: ["src/greeting.mjs"], otherCandidates: [sample.otherCandidate],
+      allowedPaths: ["src/greeting.mjs", "src/future.txt"], otherCandidates: [sample.otherCandidate],
     });
     await preflightContainment(candidate);
     const gitBefore = readFileSync(path.join(candidate.candidateGitDir, "index"));
@@ -243,12 +243,14 @@ describe("managed mission candidate containment", () => {
       "if printf bad > /tmp/pitako/source/src/greeting.mjs; then exit 84; fi",
       "if printf bad > /tmp/pitako/store/sentinel; then exit 85; fi",
       "if printf bad > /tmp/pitako/other-0/sentinel; then exit 86; fi",
+      "if printf bad > src/future.txt; then exit 87; fi",
     ].join("; ") });
     expect(shell.status).toBe("completed");
     expect(shell.process?.descendantsQuiescent).toBe(true);
     expect(readFileSync(path.join(candidate.candidateRoot, "src/greeting.mjs"), "utf8")).toContain("'shell'");
     expect(readFileSync(path.join(candidate.candidateRoot, "src/target.txt"), "utf8")).toBe("dirty worktree\n");
     expect(existsSync(path.join(candidate.candidateRoot, "src/new.txt"))).toBe(false);
+    expect(existsSync(path.join(candidate.candidateRoot, "src/future.txt"))).toBe(false);
     expect(readFileSync(path.join(candidate.candidateGitDir, "index"))).toEqual(gitBefore);
     expect(readFileSync(path.join(sample.sourceRoot, "src/greeting.mjs"), "utf8")).toContain("'before'");
     expect(readFileSync(path.join(sample.storeRoot, "sentinel"), "utf8")).toBe("sealed state\n");

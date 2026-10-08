@@ -58,7 +58,7 @@ test("mission confirmation shows concise actions; viewing details is not consent
     Object.assign(h.ctx.ui, {
       select: async (title: string, options: string[]) => {
         views.push(title);
-        expect(options).toEqual([selections < 2 ? "Authorize preparation" : "Prepare mission", "View details", "Cancel"]);
+        expect(options).toEqual(["Prepare mission", "View details", "Cancel"]);
         return ++selections === 1 ? "View details" : options[0];
       },
       editor: async (_title: string, text: string) => {
@@ -70,6 +70,7 @@ test("mission confirmation shows concise actions; viewing details is not consent
     const result = JSON.parse((await h.submit({ id: "durable-fixture", requestId: context.requestId, proposal })).content[0].text);
     expect(result.status).toBe("ready");
     expect(details).toHaveLength(1);
+    expect(selections).toBe(2); // Details, then one approval; no second confirmation.
     expect(JSON.parse(details[0]!).decisions[0].values.budget).toEqual(proposal.definition.budget);
     expect(views.every((view) => view.length < 1600 && !view.includes("definitionHash"))).toBe(true);
     const db = await openMissionStore({ dbPath: f.dbPath, objectDir: f.objectDir, readOnly: true });
@@ -143,7 +144,7 @@ test.each(["request", "session", "root", "source", "config", "omission", "replac
     if (scenario === "omission") params.proposal.mappings.pop();
     let admissionPrompts = 0;
     h.confirm(async (title) => {
-      if (title.startsWith("Confirm exact")) {
+      if (title.startsWith("Prepare mission")) {
         admissionPrompts++;
         if (scenario === "shutdown") await h.emit("session_shutdown");
         if (scenario === "switch") await h.emit("session_before_switch");
@@ -183,7 +184,7 @@ test("authority refusal is no grant; grouped source interpretation is explicitly
     const params = () => ({ id: "durable-fixture", requestId: context.requestId, proposal: authoringProposal(context),
       interpretations: context.inventory.unresolved.map(({ id }: { id: string }) => ({ sourceId: id, disposition: "context" })) });
     h.confirm(async (title, text) => {
-      expect(title).toContain("Preparation questions");
+      expect(title).toContain("Prepare mission");
       expect(text).toContain("Preserve diagnostics unless incompatible");
       expect(text).toContain("Source decision");
       expect(text).toContain("provider requests");
@@ -196,6 +197,7 @@ test("authority refusal is no grant; grouped source interpretation is explicitly
     const prompts: string[] = [];
     h.confirm(async (_title, text) => { prompts.push(text); return true; });
     const diagnostic = JSON.parse((await h.submit(params())).content[0].text);
+    expect(prompts).toHaveLength(1);
     expect(diagnostic.authority).toBe("proposal-only");
     expect(diagnostic.operatorReceipt).toBeUndefined();
     const db = await openMissionStore({ dbPath: f.dbPath, objectDir: f.objectDir, readOnly: true });
@@ -267,15 +269,16 @@ test("readable native view preserves exact finite budgets and optional canonical
     const result = JSON.parse((await h.submit({ id: "durable-fixture", requestId: context.requestId, proposal })).content[0].text);
     expect(result.status).toBe("ready");
     expect(result.nextAction).toContain("/mission start durable-fixture");
+    expect(prompts).toHaveLength(1);
     for (const text of prompts) {
       expect(text).not.toStartWith("{");
       expect(text).toContain(`Execution root: ${f.root}`);
       const budget = proposal.definition.budget;
-      expect(text).toContain(`${budget.roleLaunches} role launches`);
+      expect(text).toContain(`${budget.roleLaunches} launches`);
       expect(text).toContain(`${budget.providerRequests} provider requests`);
-      expect(text).toContain(`${budget.tokens} tokens`);
+      expect(text).toContain(`${budget.tokens.toLocaleString("en-US")} tokens`);
       expect(text).toContain(`${budget.activeTimeMs / 60000} min`);
-      expect(text).toContain(`${budget.artifactBytes} bytes`);
+      expect(text).toContain("stored output: 64 MiB");
       expect(text).toContain("Setup: none");
       expect(text).toContain("no nested checker");
       expect(text).toContain("no setup, provider or worker runs");
@@ -307,7 +310,7 @@ test.each(["grant-only", "selected", "cancelled", "stale"] as const)(
       const prompts: string[] = [];
       h.confirm(async (title, text) => {
         prompts.push(text);
-        if (title.startsWith("Confirm exact")) {
+        if (title.startsWith("Prepare mission")) {
           if (scenario === "cancelled") return false;
           if (scenario === "stale") writeFileSync(f.planFile, authoringSource + "\nchanged");
         }
@@ -319,7 +322,7 @@ test.each(["grant-only", "selected", "cancelled", "stale"] as const)(
         const result = JSON.parse((await submit()).content[0].text);
         expect(scenario === "cancelled" ? result.state : result.status).toBe(scenario === "cancelled" ? "dismissed" : "ready");
       }
-      expect(prompts.length).toBeGreaterThan(0);
+      expect(prompts).toHaveLength(1);
       for (const text of prompts) {
         expect(text).toContain("Offline nested checker authorized");
         expect(text).toContain("no host writes, credentials or network");
@@ -401,8 +404,8 @@ test.each(["valid", "infeasible", "malformed"] as const)("proposed %s setup dist
     let prompts = 0;
     h.confirm(async (_title, text) => {
       prompts++;
-      expect(text).toContain("Setup: writes node_modules");
-      expect(text).toContain("16384 bytes, within mission limits");
+      expect(text).toContain("Setup: prepare node_modules");
+      expect(text).toContain("16 KiB, within the mission budget");
       return true;
     });
     const result = JSON.parse((await h.submit({ id: "durable-fixture", requestId: context.requestId, proposal,
@@ -414,7 +417,7 @@ test.each(["valid", "infeasible", "malformed"] as const)("proposed %s setup dist
       code: mode === "valid" ? "unresolved-setup" : mode === "infeasible" ? "insufficient-grant" : "invalid-proposal",
       owner: mode === "valid" ? "runtime" : "author",
     }));
-    expect(prompts).toBe(mode === "valid" ? 2 : 0);
+    expect(prompts).toBe(mode === "valid" ? 1 : 0);
     expect(existsSync(path.join(f.root, "node_modules/dependency"))).toBe(false);
     if (mode === "valid") {
       expect(result.state).toBe("prepared");
@@ -434,12 +437,14 @@ test("native copied setup confirms exact bounds/destination and settles while pr
   mkdirSync(path.join(f.root, "scripts"));
   writeFileSync(path.join(f.root, "scripts/setup.sh"), "printf installed > node_modules/dependency\n");
   let destination: string | undefined;
+  let prompts = 0;
   try {
     await h.command("prepare durable-fixture");
     const context = contextFromMessage(h.messages[0]!);
     const proposal = authoringProposal(context);
     proposal.definition.budget = { ...proposal.definition.budget, roleLaunches: 100, providerRequests: 100, artifactBytes: 8000000000 };
     h.confirm(async (_title, text) => {
+      prompts++;
       expect(existsSync(path.join(f.root, "node_modules"))).toBe(false);
       expect(text).toContain("Setup: prepare node_modules");
       expect(text).not.toContain("bytes/file");
@@ -452,6 +457,7 @@ test("native copied setup confirms exact bounds/destination and settles while pr
         artifactBytes: 600000000, copy: { bounds: { paths: 20, largestFileBytes: 100, totalBytes: 100 },
           seeds: [{ source: seed, destination: "node_modules", bounds: { paths: 2, largestFileBytes: 1, totalBytes: 1 } }] } } })).content[0].text);
     expect(result).toMatchObject({ state: "prepared", status: "ready" });
+    expect(prompts).toBe(1);
     expect(result.nextAction).toContain("rechecked and reused");
     await h.command("status");
     expect(JSON.parse(h.notices.at(-1)!)).toMatchObject({ preparationStatus: "ready" });
@@ -525,9 +531,12 @@ test("supported busy SDK command → queued foreground provider → author tool 
   const { session } = await createAgentSession({ cwd: f.root, agentDir: f.stateDir, resourceLoader: loader,
     sessionManager: SessionManager.inMemory(f.root), noTools: "builtin" });
   const previews: string[] = [], notices: string[] = [];
-  const ui = { notify: (text: string) => notices.push(text), confirm: async (_title: string, text: string) => {
-    previews.push(text); return true;
-  } };
+  const ui = {
+    notify: (text: string) => notices.push(text),
+    select: async (title: string, options: string[]) => { previews.push(title); return options[0]; },
+    editor: async () => undefined,
+    confirm: async () => { throw new Error("Unexpected legacy confirmation"); },
+  };
   try {
     await session.bindExtensions({ mode: "tui", uiContext: ui as any });
     await session.setModel(session.modelRuntime.getModel(provider.provider, provider.model)!);
@@ -543,9 +552,8 @@ test("supported busy SDK command → queued foreground provider → author tool 
     await session.waitForIdle();
     if (!provider.trace.length) throw new Error(`foreground message not dispatched: ${JSON.stringify(notices)}`);
     expect(provider.trace.some(({ prompt }) => prompt.startsWith("Mission preparation request"))).toBe(true);
-    expect(previews).toHaveLength(2);
-    expect(previews[0]).toContain("preparation-authority");
-    expect(previews[1]).toContain("Exact binding:");
+    expect(previews).toHaveLength(1);
+    expect(previews[0]).toContain("Prepare now: validate and register");
     const db = await openMissionStore({ dbPath: f.dbPath, objectDir: f.objectDir, readOnly: true });
     try {
       const mission = db.findManagedMission(f.root)!;
@@ -585,8 +593,10 @@ test("supported SDK reload invalidates a pending exact confirmation callback bef
   let answer!: (accepted: boolean) => void;
   try {
     await session.bindExtensions({ mode: "tui", uiContext: {
-      notify: () => {}, confirm: async (title: string) => title.startsWith("Confirm exact")
-        ? new Promise<boolean>((resolve) => { answer = resolve; }) : true,
+      notify: () => {}, editor: async () => undefined,
+      select: async (title: string, options: string[]) => title.startsWith("Prepare mission")
+        ? new Promise<string>((resolve) => { answer = (accepted) => resolve(accepted ? options[0]! : "Cancel"); }) : options[0],
+      confirm: async () => { throw new Error("Unexpected legacy confirmation"); },
     } as any });
     await session.setModel(session.modelRuntime.getModel(provider.provider, provider.model)!);
     await session.prompt("/mission prepare durable-fixture");
@@ -603,7 +613,7 @@ test("supported SDK reload invalidates a pending exact confirmation callback bef
   }
 }, 60000);
 
-test("actual Pi PTY foreground author tool receives native questions and exact prepared confirmation", async () => {
+test("actual Pi PTY foreground author tool prepares with one native confirmation", async () => {
   const f = fixture(), extension = path.join(f.stateDir, "authoring.ts");
   writeFileSync(extension, `
 import { registerMissionExtension } from ${JSON.stringify(path.join(packageRoot(), "extensions/mission/index.ts"))};
@@ -646,10 +656,7 @@ export default function(pi) {
   try {
     await wait(() => output.includes("Pi") || output.includes("pi v"));
     child.stdin.write("/mission prepare durable-fixture\r");
-    await wait(() => output.includes("Preparation questions"));
-    expect(existsSync(f.dbPath)).toBe(false);
-    child.stdin.write("\r");
-    await wait(() => output.includes("Confirm exact prepared mission"));
+    await wait(() => output.includes("Prepare mission — not start"));
     expect(existsSync(f.dbPath)).toBe(false);
     child.stdin.write("\r");
     await wait(() => output.includes("Prepared "));
