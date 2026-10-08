@@ -95,7 +95,9 @@ A wrapper can satisfy a required gate when its observed execution covers that ob
 
 Partial logs, skipped checks, interrupted output, stale artifacts, or the same command string alone are insufficient. A host predicate and a worker diagnostic command can be different obligations even when their command strings match. Evidence from one binding does not satisfy a different required binding merely because the command is identical.
 
-Reuse completed evidence while its inputs, environment, contract, and required phase or binding remain compatible. Do not discard valid evidence solely because it is old. Relevant edits after a pass invalidate affected conclusions, not every independent observation. Rerun checks whose conclusions are invalidated. Valid reuse satisfies an obligation only through demonstrated coverage. It never cancels a mandatory gate or independent review.
+Reuse underlying completed evidence while its inputs, environment, contract, completeness, and required phase or binding remain compatible. Inspect the artifact, not a prior worker's summary. Check the identity facts needed for the conclusion, not every historical fact. Do not discard valid evidence solely because it is old. A handoff, role change, or no-op cleanup does not itself invalidate evidence or require a replacement report. Relevant edits after a pass invalidate affected conclusions, not every independent observation. Missing, conflicting, incomplete, or invalidated evidence requires the appropriate check. Rerun checks whose conclusions are invalidated. Valid reuse satisfies an obligation only through demonstrated coverage. It never cancels a mandatory gate or independent review.
+
+Managed contracts still require findings-only authority, structured responses and receipts, affected-checks phases, and current phase and binding evidence. Reuse cannot bypass containment, ownership, disposal, host acceptance, completion checks, or final independent review.
 
 ## Simplify without losing guarantees
 
@@ -109,7 +111,7 @@ Ponytail governs simplicity of implementation and all verification artifacts. `v
 
 Pitako does not treat Ponytail's `ONE runnable check`, `demo()` or `test_*.py`, and no-frameworks/no-fixtures paragraph as an artifact mandate. Reuse the repository's existing frameworks and fixtures when they observe the contract. One existing check may suffice; distinct contracts may require distinct checks. Do not add an alternative self-check just to satisfy that paragraph.
 
-Stop when acceptance criteria are demonstrated, concrete risks introduced by the change are checked, and mandatory gates pass. Expand verification only for new evidence or a specific risk connected to the change, not an invented list of nearby cases. Report an out-of-scope failure without silently taking it on. State whether it blocks a mandatory gate.
+Stop when the assigned outcome and its evidence obligations are complete. For implementation acceptance, demonstrate acceptance criteria, check concrete risks introduced by the change, and pass mandatory gates. Completing an assigned observation or consultation is not acceptance of a unit, final diff, or mission. Verification-only work does not add semantic-review duties. Diagnosis-only work does not authorize repair. A missing fact alone does not require stopping or user escalation. Continue useful authorized diagnosis and escalate genuine architecture, scope, or authority decisions through the existing workflow. Expand verification only for new evidence or a specific risk connected to the change, not an invented list of nearby cases. Report an out-of-scope failure without silently taking it on. State whether it blocks a mandatory gate.
 
 Do not rerun solely because the role changed. Repeat when changes, a relevant environment difference, or insufficient evidence invalidate the conclusion, or when a mandatory gate requires it. Independent review remains required where applicable.
 
