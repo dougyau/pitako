@@ -4,7 +4,7 @@ Run commands from this checkout's root. Select focused checks while implementing
 
 ## Check prerequisites
 
-Use the versions declared in [package.json](package.json): Bun 1.3.14 and Node >=22.19.0. Preparation through [scripts/setup.sh](scripts/setup.sh) installs frozen-lock dependencies and observes both Node SQLite paths. Reuse compatible setup evidence. Setup success does not prove every gate prerequisite.
+Use the versions declared in [package.json](package.json): Bun 1.4.2 and Node >=22.19.0. Preparation through [scripts/setup.sh](scripts/setup.sh) installs frozen-lock dependencies and observes both Node SQLite paths. Reuse compatible setup evidence. Setup success does not prove every gate prerequisite.
 
 - The smoke test needs the CodeGraph CLI on PATH and an installed TypeScript language server with its `typescript` runtime. The LSP resolver can use PATH or project binaries. See [scripts/smoke.ts](scripts/smoke.ts) and [tests/smoke.test.ts](tests/smoke.test.ts).
 - Node checks need checkout dependencies visible to the actual Node executable, including CodeGraph's native SQLite path and production `node:sqlite`. See [scripts/code-intelligence-node.mjs](scripts/code-intelligence-node.mjs) and [scripts/mission-durability-node.mjs](scripts/mission-durability-node.mjs).

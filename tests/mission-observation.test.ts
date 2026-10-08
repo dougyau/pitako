@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, test as nativeTest } from "bun:test";
 import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
@@ -11,11 +11,24 @@ import { agentScope } from "../extensions/agent/scope.ts";
 
 const original = process.env.PI_CODING_AGENT_DIR;
 const fixtures: Awaited<ReturnType<typeof observationFixture>>[] = [];
-afterEach(() => {
-  for (const sample of fixtures.splice(0)) { sample.store.close(); rmSync(sample.fixture.base, { recursive: true, force: true }); }
+// Native timeout does not settle an async callback or transfer fixture ownership.
+const callbacks = new Set<Promise<void>>();
+function test(name: string, body: () => Promise<void>, timeout?: number) {
+  nativeTest(name, async () => {
+    const callback = body();
+    callbacks.add(callback);
+    try { await callback; }
+    finally { callbacks.delete(callback); }
+  }, timeout);
+}
+afterEach(async () => {
+  await Promise.allSettled([...callbacks]);
+  for (const sample of fixtures.splice(0)) {
+    sample.store.close(); rmSync(sample.fixture.base, { recursive: true, force: true });
+  }
   if (original === undefined) delete process.env.PI_CODING_AGENT_DIR;
   else process.env.PI_CODING_AGENT_DIR = original;
-});
+}, 15000);
 async function sample() {
   const value = await observationFixture(); fixtures.push(value); return value;
 }
@@ -89,6 +102,7 @@ test("assignment observation preserves principal-only worker-history disclosure"
   expect(observationFiles(f.fixture.base)).toEqual(before);
 });
 
+// Lossless tool/command pagination of the 72811-byte brief exceeds the 5s default.
 test("principal tool/inspect retain earlier assignment, revision, full brief, raw actions/results and host evidence across reload without writes", async () => {
   const f = await sample(), api = observationAdapters(f.executionRoot);
   const before = observationFiles(f.fixture.base), ownerEpoch = f.store.ownerEpoch;
@@ -127,7 +141,7 @@ test("principal tool/inspect retain earlier assignment, revision, full brief, ra
   expect(f.store.ownerEpoch).toBe(ownerEpoch);
   expect(observationFiles(f.fixture.base)).toEqual(before);
   expect(JSON.stringify(earlier)).not.toContain("writable-handle-not-returned");
-});
+}, 15000);
 
 test("observation diagnoses missing/pruned/not-created/incomplete separately and preserves private native text", async () => {
   const f = await sample(), api = observationAdapters(f.executionRoot);

@@ -12,7 +12,7 @@ import { openMissionStore } from "../extensions/mission/store.ts";
 import { MissionEngine, missionAssessmentToolIdentity, missionRuntimeIdentity } from "../extensions/mission/engine.ts";
 import { captureWorkspaceImage, createMissionWorkspace, currentProcessIdentity, filterWorkspaceImage, preflightContainment, processNamespaceId, processesInNamespace, registerCandidateWorkspace } from "../extensions/mission/workspace.ts";
 import type { MissionEventDraft } from "../extensions/mission/store.ts";
-import { createMissionFixture, missionInput, openFixtureStore, operatorChangeReceipt, type MissionFixture } from "./mission-fixtures.ts";
+import { fixtureCommandTime, createMissionFixture, missionInput, openFixtureStore, operatorChangeReceipt, type MissionFixture } from "./mission-fixtures.ts";
 
 const fixtures: MissionFixture[] = [];
 afterEach(() => {
@@ -83,7 +83,7 @@ async function createInterruptedAttempt(sample: MissionFixture, containedWrite =
   if (containedWrite) {
     await preflightContainment(workspace);
     const effects = new MissionEffects({ store, workspace, missionId: mission.id, revision: mission.revision, unitId: "snapshot",
-      attemptId, runtimeId: store.runtimeId, ownerEpoch: epoch, allowedOperations: ["write", "bash"] });
+      attemptId, runtimeId: store.runtimeId, ownerEpoch: epoch, allowedOperations: ["write", "bash"], commandTime: fixtureCommandTime() });
     const result = await effects.invoke("write", { path: "src/app.ts", content: "export const mission = 'partial mission write';\n" });
     if (result.status !== "completed") throw new Error(`contained fixture write failed: ${result.status}: ${result.reason ?? ""}`);
     await effects.shutdown();
@@ -810,7 +810,7 @@ describe("durable mission reconciliation", () => {
     const intent = events.find((event) => event.kind === "effect.intent" && event.effectId === interrupted.effectId)!;
     const plan = JSON.parse(store.readArtifact(String(intent.payload.effectPlanHash)).toString("utf8"));
     expect(plan.format).toBe("mission-effect-plan-v1");
-    expect(plan.request).toEqual({ path: "src/app.ts", content: "export const mission = 'partial mission write';\n" });
+    expect(plan.request).toEqual({ path: "src/app.ts", content: "export const mission = 'partial mission write';\n", timeoutMs: 120_000 });
     expect(plan.preconditions.some((row: { path: string }) => row.path === "src/app.ts")).toBe(true);
     expect(Buffer.from(plan.beforeFiles[0].bytesBase64, "base64").toString("utf8")).toContain("base");
     expect(Buffer.from(plan.expectedAfterFiles[0].bytesBase64, "base64").toString("utf8")).toContain("partial mission write");

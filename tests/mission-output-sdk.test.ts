@@ -286,11 +286,22 @@ test("injected PASS cannot mint production output even when it claims checker au
 
 test("production contained command pass, failure and timeout retain real receipts", async () => {
   for (const [name, command, timeoutMs, verdict, termination] of [["command-pass", "test \"$(cat src/a)\" = first", 2000, "pass", "exit"],
-    ["command-fail", "exit 7", 2000, "inconclusive", "exit"], ["command-timeout", "sleep 2", 20, "inconclusive", "timeout"]] as const) {
+    ["command-fail", "exit 7", 2000, "inconclusive", "exit"], ["command-timeout", "sleep 3", 2000, "inconclusive", "timeout"]] as const) {
     const result = await runCase(name, [[{ id: "a", kind: "command_exit", target: "result", command, expected: "0", timeoutMs }]]);
     expect(result.observations[0]).toMatchObject({ verdict, receipt: { termination } });
     expect(result.accepted).toBe(verdict === "pass" ? 1 : 0);
   }
+}, 90000);
+
+test("production command cannot release GO after its whole-invocation bound expires during preparation", async () => {
+  const result = await runCase("command-preparation-expiry", [[{
+    id: "a", kind: "command_exit", target: "result", command: "sleep 2", expected: "0", timeoutMs: 20,
+  }]]);
+  expect(result.observations[0]).toMatchObject({
+    verdict: "inconclusive",
+    receipt: { status: "denied", reason: "command timeout exceeds current remaining effect time grant" },
+  });
+  expect(result.accepted).toBe(0);
 }, 90000);
 
 test("production command renews an insufficient ordinary grant after SDK disposal", async () => {

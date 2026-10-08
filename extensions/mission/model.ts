@@ -16,6 +16,7 @@ export type AcceptancePredicate = {
   command?: string;
   timeoutMs?: number;
   inputPaths?: string[];
+  profile?: "sealed-nested-verification-v1";
 };
 
 export interface MissionUnit {
@@ -52,6 +53,7 @@ export interface MissionDefinition {
       primaryTarget?: ModelTarget; fallbackTargets?: ModelTarget[] }>;
     allowTechnicalAmendments: boolean;
     resumeAfterClose: boolean;
+    verificationProfiles?: ["sealed-nested-verification-v1"];
   };
   budget: {
     roleLaunches: number;
@@ -181,7 +183,10 @@ export function validateMissionDefinition(value: unknown): MissionDefinition {
   const nonGoals = textList(root.nonGoals, "nonGoals");
   const invariants = textList(root.invariants, "invariants");
   const authorityValue = object(root.authority, "authority");
-  exactKeys(authorityValue, ["allowedPaths", "operations", "externalEffects", "rolePolicies", "allowTechnicalAmendments", "resumeAfterClose"], "authority");
+  exactKeys(authorityValue, ["allowedPaths", "operations", "externalEffects", "rolePolicies", "allowTechnicalAmendments", "resumeAfterClose"], "authority", ["verificationProfiles"]);
+  if (authorityValue.verificationProfiles !== undefined &&
+    JSON.stringify(authorityValue.verificationProfiles) !== '["sealed-nested-verification-v1"]')
+    throw new MissionValidationError("unsupported verification profile authority");
   const rolePolicyRows = object(authorityValue.rolePolicies, "authority.rolePolicies");
   const rolePolicies: MissionDefinition["authority"]["rolePolicies"] = {};
   for (const [roleKey, entry] of Object.entries(rolePolicyRows)) {
@@ -209,6 +214,8 @@ export function validateMissionDefinition(value: unknown): MissionDefinition {
     rolePolicies,
     allowTechnicalAmendments: boolean(authorityValue.allowTechnicalAmendments, "authority.allowTechnicalAmendments"),
     resumeAfterClose: boolean(authorityValue.resumeAfterClose, "authority.resumeAfterClose"),
+    ...(authorityValue.verificationProfiles === undefined ? {} :
+      { verificationProfiles: ["sealed-nested-verification-v1"] as ["sealed-nested-verification-v1"] }),
   };
 
   const budgetValue = object(root.budget, "budget");
@@ -366,9 +373,11 @@ function validateUnit(value: unknown, index: number, schemaVersion: 1 | 2): Miss
   if (!Array.isArray(row.acceptance)) throw new MissionValidationError(`${id}.acceptance must be an array`);
   const acceptance = row.acceptance.map((entry, predicateIndex): AcceptancePredicate => {
     const predicate = object(entry, `${id}.acceptance[${predicateIndex}]`);
-    exactKeys(predicate, ["id", "kind", "target"], `${id} predicate`, ["expected", "command", "timeoutMs",
+    exactKeys(predicate, ["id", "kind", "target"], `${id} predicate`, ["expected", "command", "timeoutMs", "profile",
       ...(schemaVersion === 2 ? ["inputPaths"] : [])]);
     const kind = oneOf(predicate.kind, ["command_exit", "artifact_hash", "manual"], `${id}.predicate.kind`);
+    if (predicate.profile !== undefined && (kind !== "command_exit" || predicate.profile !== "sealed-nested-verification-v1"))
+      throw new MissionValidationError(`${id} unsupported command verification profile`);
     return {
       id: identifier(predicate.id, `${id}.predicate.id`),
       kind,
@@ -377,6 +386,7 @@ function validateUnit(value: unknown, index: number, schemaVersion: 1 | 2): Miss
       ...(predicate.command === undefined ? {} : { command: text(predicate.command, `${id}.predicate.command`) }),
       ...(predicate.timeoutMs === undefined ? {} : { timeoutMs: positiveInteger(predicate.timeoutMs, `${id}.predicate.timeoutMs`) }),
       ...(predicate.inputPaths === undefined ? {} : { inputPaths: textList(predicate.inputPaths, `${id}.predicate.inputPaths`) }),
+      ...(predicate.profile === undefined ? {} : { profile: "sealed-nested-verification-v1" as const }),
     };
   });
   if (acceptance.length === 0) throw new MissionValidationError(`${id}.acceptance must not be empty`);

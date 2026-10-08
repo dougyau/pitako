@@ -43,7 +43,7 @@ async function wait(check, label, interval = 25) {
   throw new Error(`timed out: ${label}`);
 }
 async function foreground(root, agentDir) {
-  if (!loaded) loaded = await loadPitako(packageRoot, root);
+  if (!loaded) loaded = await loadPitako(packageRoot, root, agentDir);
   if (agentDir) loaded.agentDir = agentDir;
   process.env.PI_CODING_AGENT_DIR = loaded.agentDir;
   await loaded.loader.reload();
@@ -51,6 +51,7 @@ async function foreground(root, agentDir) {
   session = (await createAgentSession({ cwd: root, agentDir: loaded.agentDir, resourceLoader: loaded.loader,
     sessionManager: SessionManager.inMemory(root), modelRuntime: runtime })).session;
   await session.bindExtensions({ mode: "rpc" });
+  await session.prompt("/mission console");
   return await wait(() => readdirSync(path.join(loaded.agentDir, "pitako/console")).find((name) =>
     name.startsWith(`operator-${process.pid}-`) && name.endsWith(".sock")), "operator socket");
 }
@@ -89,18 +90,18 @@ try {
     const denied = await submit(socket, `/mission start ${missionId}`, false);
     assert.match(denied.message, /writer is owned elsewhere/);
     const inspection = await submit(socket, "/mission inspect");
-    assert.equal(JSON.parse(inspection.message).owner, "read-only");
+    assert.equal(JSON.parse(inspection.message).authority, "read-only");
     await closePi();
     console.log(JSON.stringify({ pid: process.pid, denied, inspection }));
     scenarioDone = true;
   } else {
-    sample = createMissionFixture("pitako-t7-sdk-");
+    sample = createMissionFixture("t7-s-", "/tmp");
     mkdirSync(path.join(sample.root, "src"));
     writeFileSync(path.join(sample.root, "src/a"), "original\n");
     writeFileSync(path.join(sample.root, "src/user"), "user-before\n");
     execFileSync("git", ["add", "src"], { cwd: sample.root });
     execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "source"], { cwd: sample.root });
-    loaded = await loadPitako(packageRoot, sample.root);
+    loaded = await loadPitako(packageRoot, sample.root, sample.stateDir);
     provider = await installMissionLocalProvider({ agentDir: loaded.agentDir,
       responseGate: (prompt) => phase === "interrupt" && !prompt.includes("mission-finalization-brief-v1") ? providerGate : Promise.resolve(),
       toolForPrompt(prompt) {
@@ -138,6 +139,8 @@ try {
     save("initial-plan.md", readFileSync(sample.planFile));
     save("source-original.json", { "src/a": "original\n", "src/user": "user-before\n" });
     let socket = path.join(loaded.agentDir, "pitako/console", await foreground(sample.root));
+    save("console-activation.json", { command: "/mission console", socket, endpointBytes: Buffer.byteLength(socket) + 1,
+      ownerPid: process.pid, fixtureBase: sample.base });
     await submit(socket, "/mission prepare durable-fixture");
     reader = await openMissionStore({ readOnly: true });
     const mission = reader.findManagedMission(sample.root);
@@ -209,6 +212,7 @@ try {
     save("stopped-effect-receipt.json", effectReceipt);
     save("interruption-proof.json", interruptionProof);
     if (process.env.PITAKO_T7_CLOSE_ONLY) {
+      await reader.exportMission(mission.id, path.join(evidence, "mission-export"));
       provider.flush(path.join(evidence, "provider.json"));
       save("operator-inputs.json", calls);
       console.log("T7 actual SDK orderly close bound interruption passed");
@@ -349,6 +353,7 @@ try {
   reader?.close();
   if (session) await closePi().catch(() => {});
   // Retain exported durable artifacts, not an unmanaged writable temporary result.
-  if (sample) rmSync(sample.base, { recursive: true, force: true });
+  if (sample && scenarioDone) rmSync(sample.base, { recursive: true, force: true });
+  else if (sample) save("retained-fixture.json", { base: sample.base, disposition: "retained; unfinished scenario" });
   if (prior === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = prior;
 }

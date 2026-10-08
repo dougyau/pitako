@@ -7,6 +7,11 @@ import { openMissionStore, type MissionInspection, type MissionStore } from "../
 import { recordOperatorChoice } from "../extensions/mission/admission.ts";
 import type { MissionDefinition } from "../extensions/mission/model.ts";
 
+// Explicit fixture-local allocation for effects exercised without a running engine.
+export function fixtureCommandTime(capacityMs = 120_000) {
+  return { admit: async (requestedMs?: number) => requestedMs ?? capacityMs, remaining: () => capacityMs };
+}
+
 type RejectionCaptureOutcome =
   | { status: "written"; path: string }
   | { status: "failed"; error: string };

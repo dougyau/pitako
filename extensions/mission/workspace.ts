@@ -2,13 +2,16 @@ import { createHash, randomUUID } from "node:crypto";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import {
   accessSync, chmodSync, closeSync, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, mkdtempSync,
-  openSync, readFileSync, readlinkSync, realpathSync, readdirSync, rmSync, symlinkSync, writeFileSync,
+  openSync, readFileSync, readlinkSync, realpathSync, readdirSync, rmdirSync, rmSync, symlinkSync, writeFileSync,
 } from "node:fs";
 import { constants as fsConstants } from "node:fs";
 import type { Stats } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { readNestedVerificationAdmission } from "./checks.ts";
+import { NESTED_EVIDENCE, NESTED_SCRATCH, NESTED_PROFILE } from "./nested-verification.ts";
+import { observeCheckerEndpoints, type CheckerTransport } from "./checker-transport.ts";
 
 const PRODUCT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const SANDBOX_ROOT = "/tmp/pitako";
@@ -105,10 +108,19 @@ export interface ContainmentProof {
   readonly candidateGitReadOnly: true;
   readonly networkDisabled: true;
   readonly privateHomeAndTemp: true;
+  readonly protectedInputOrigins: ReadonlyArray<ReturnType<typeof observeProtectedInputOrigin>>;
 }
 
 const validProofs = new WeakSet<object>();
-const dependencyBackings = new WeakMap<MissionWorkspace, { root: string; identity: string }>();
+const dependencyBackings = new WeakMap<MissionWorkspace, { root: string; identity: string; recheck?: () => void }>();
+
+export function missionWorkspaceDependencyBacking(workspace: MissionWorkspace): string | undefined {
+  const backing = dependencyBackings.get(workspace);
+  backing?.recheck?.();
+  if (backing && identity(backing.root) !== backing.identity) throw new Error("dependency backing identity changed");
+  const root = backing?.root ?? path.join(workspace.candidateRoot, "node_modules");
+  return existsSync(root) ? root : undefined;
+}
 
 export function hasContainmentProof(workspace: MissionWorkspace): workspace is MissionWorkspace & { containmentProof: ContainmentProof } {
   return Boolean(workspace.containmentProof && validProofs.has(workspace.containmentProof) && !workspace.quarantined);
@@ -125,6 +137,7 @@ export function createMissionWorkspace(input: {
   productRoot?: string;
   bwrapPath?: string;
   setupIndependent?: boolean;
+  dependencyBacking?: { root: string; identity: string; recheck?: () => void };
 }): MissionWorkspace {
   if (process.platform !== "linux") throw new Error(`managed workspace containment is unsupported on ${process.platform}; no writer launched`);
   if (!UUID.test(input.missionId) || !UUID.test(input.attemptId)) throw new Error("mission and attempt ids must be UUIDs");
@@ -193,13 +206,18 @@ export function createMissionWorkspace(input: {
       quarantined: false,
       setupIndependent: input.setupIndependent,
     };
-    const dependencies = path.join(sourceRoot, "node_modules");
+    const dependencies = input.dependencyBacking?.root ?? path.join(sourceRoot, "node_modules");
+    input.dependencyBacking?.recheck?.();
+    if (input.dependencyBacking && (realpathSync(dependencies) !== dependencies ||
+      identity(dependencies) !== input.dependencyBacking.identity))
+      throw new Error("bound copied dependency identity changed");
     if (input.setupIndependent && existsSync(path.join(candidateRoot, "node_modules")))
       throw new Error("independent candidate contains unresolved setup output");
     if (!input.setupIndependent && existsSync(dependencies) && !existsSync(path.join(candidateRoot, "node_modules"))) {
       const state = lstatSync(dependencies);
       if (!state.isDirectory() || state.isSymbolicLink()) throw new Error("source dependency backing must be a physical directory");
-      dependencyBackings.set(workspace, { root: dependencies, identity: identity(dependencies) });
+      dependencyBackings.set(workspace, { root: dependencies, identity: identity(dependencies),
+        ...(input.dependencyBacking?.recheck ? { recheck: input.dependencyBacking.recheck } : {}) });
     }
     return workspace;
   } catch (error) {
@@ -228,8 +246,9 @@ export async function preflightContainment(workspace: MissionWorkspace): Promise
   const storeMarker = `${STORE_MOUNT}/${marker}`;
   const otherMarkers = workspace.otherCandidates.map((_, index) => `${SANDBOX_ROOT}/other-${index}/${marker}-${index}`);
   const paths = [sourceMarkerHost, productMarkerHost, path.join(workspace.sourceGitDir, marker), storeMarkerHost, ...otherMarkersHost];
+  const protectedInputOrigins = [];
   for (const target of [workspace.sourceRoot, workspace.productRoot, workspace.sourceGitDir, workspace.storeRoot, ...workspace.otherCandidates]) {
-    try { accessSync(target, fsConstants.W_OK); } catch { throw new Error(`cannot prove read-only mount for host-writable path ${target}`); }
+    protectedInputOrigins.push(observeProtectedInputOrigin(target));
   }
   const shell = [
     "set -eu",
@@ -270,10 +289,67 @@ export async function preflightContainment(workspace: MissionWorkspace): Promise
     candidateGitIdentity: workspace.candidateGitIdentity, pidNamespace, networkNamespace,
     sourceReadOnly: true, storeReadOnly: true, candidateGitReadOnly: true,
     networkDisabled: true, privateHomeAndTemp: true,
+    protectedInputOrigins: Object.freeze(protectedInputOrigins),
   });
   validProofs.add(proof);
   workspace.containmentProof = proof;
   return proof;
+}
+
+/** Mount provenance is native and pinned; writable permission bits alone are not evidence. */
+export function observeProtectedInputOrigin(target: string): {
+  identity: string; mountId: number; origin: "enclosing-writable" | "inherited-read-only";
+} {
+  const fd = openSync(target, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+  try {
+    const before = fstatSync(fd);
+    const info = readFileSync(`/proc/self/fdinfo/${fd}`, "utf8");
+    const mountId = Number(/^mnt_id:\s+(\d+)$/m.exec(info)?.[1]);
+    const rows = readFileSync("/proc/self/mountinfo", "utf8").split("\n");
+    const mount = rows.find((row) => Number(row.split(" ")[0]) === mountId)?.split(" ");
+    if (!Number.isSafeInteger(mountId) || !mount) throw new Error(`protected input mount origin is unobservable: ${target}`);
+    const flags = mount[5]!.split(",");
+    const after = lstatSync(target);
+    if (before.dev !== after.dev || before.ino !== after.ino || after.isSymbolicLink() || !after.isDirectory())
+      throw new Error(`protected input identity changed: ${target}`);
+    if (flags.includes("ro")) return { identity: `${before.dev}:${before.ino}`, mountId, origin: "inherited-read-only" };
+    if (!flags.includes("rw")) throw new Error(`protected input mount origin is inconclusive: ${target}`);
+    try { accessSync(`/proc/self/fd/${fd}`, fsConstants.W_OK); }
+    catch { throw new Error(`protected writable-origin input permission is inconclusive: ${target}`); }
+    return { identity: `${before.dev}:${before.ino}`, mountId, origin: "enclosing-writable" };
+  } finally { closeSync(fd); }
+}
+
+export function observeNestedVerificationBoundary(namespace: string, containedPid: number, transport: CheckerTransport): Record<string, unknown> {
+  const processes = processesInNamespace(namespace);
+  const matching = processes.filter(({ pid }) => {
+    const status = readFileSync(`/proc/${pid}/status`, "utf8");
+    return Number(/^NSpid:\s+(.+)$/m.exec(status)?.[1]?.trim().split(/\s+/).at(-1)) === containedPid;
+  });
+  if (matching.length !== 1) throw new Error("nested verification code process identity is unobservable");
+  const process = matching[0]!;
+  const status = readFileSync(`/proc/${process.pid}/status`, "utf8");
+  if (!/^NoNewPrivs:\s+1$/m.test(status) ||
+    ["CapEff", "CapPrm", "CapInh", "CapAmb"].some((name) => !new RegExp(`^${name}:\\s+0+$`, "m").test(status)))
+    throw new Error("nested verification inherited privileges are unproved");
+  const namespaces: Record<string, string> = {};
+  for (const name of ["user", "mnt", "pid", "net", "ipc", "uts"]) {
+    const observed = readlinkSync(`/proc/${process.pid}/ns/${name}`);
+    if (observed === readlinkSync(`/proc/self/ns/${name}`)) throw new Error(`nested verification ${name} namespace is not private`);
+    namespaces[name] = observed;
+  }
+  const interfaces = readFileSync(`/proc/${process.pid}/net/dev`, "utf8");
+  const routes = readFileSync(`/proc/${process.pid}/net/route`, "utf8");
+  if (interfaces.split("\n").slice(2).filter((row) => row.trim()).some((row) => row.split(":")[0]!.trim() !== "lo") ||
+    routes.split("\n").slice(1).some((row) => row.trim()))
+    throw new Error("nested verification exposes non-private interfaces or routes");
+  const descriptors = readdirSync(`/proc/${process.pid}/fd`).map((fd) => ({ fd: Number(fd), target: readlinkSync(`/proc/${process.pid}/fd/${fd}`) }));
+  if (descriptors.length !== 3 || descriptors.some(({ fd }) => fd > 2))
+    throw new Error("launcher-only descriptors or host capabilities survived code release");
+  const endpoints = observeCheckerEndpoints(process.pid, transport.endpoints);
+  if (processBirthTicks(process.pid) !== process.birthTicks || processNamespaceId(process.pid) !== namespace)
+    throw new Error("nested verification boundary process changed during observation");
+  return { process, namespaces, interfaces, routes, descriptors, endpoints, noNewPrivileges: true, effectiveCapabilities: "0" };
 }
 
 export function sandboxProductPath(workspace: MissionWorkspace, target: string): string {
@@ -283,12 +359,21 @@ export function sandboxProductPath(workspace: MissionWorkspace, target: string):
   return relative ? `${PRODUCT_MOUNT}/${relative}` : PRODUCT_MOUNT;
 }
 
-export function spawnContained(workspace: MissionWorkspace, commandName: string, args: string[], options: {
+interface ContainedSpawnOptions {
   signal?: AbortSignal;
   timeoutMs?: number;
   writablePaths?: string[];
   verificationSubject?: boolean;
-} = {}) {
+  nestedAdmission?: unknown;
+  checkerTransport?: CheckerTransport;
+  beforeSpawn?: () => void;
+  canSpawn?: () => boolean;
+}
+export function spawnContained(workspace: MissionWorkspace, commandName: string, args: string[],
+  options?: ContainedSpawnOptions & { canSpawn?: never }): ReturnType<typeof spawn>;
+export function spawnContained(workspace: MissionWorkspace, commandName: string, args: string[],
+  options: ContainedSpawnOptions): ReturnType<typeof spawn> | undefined;
+export function spawnContained(workspace: MissionWorkspace, commandName: string, args: string[], options: ContainedSpawnOptions = {}) {
   const commandPath = commandName === "node" ? sandboxRuntimePath(workspace.runtimeNode)
     : commandName === "bun" && workspace.runtimeBun
       ? (path.basename(path.dirname(workspace.runtimeBun)) === "bin"
@@ -296,20 +381,91 @@ export function spawnContained(workspace: MissionWorkspace, commandName: string,
         : `${SANDBOX_ROOT}/runtime/bun`)
       : commandName;
   if (!commandPath) throw new Error(`contained runtime is unavailable: ${commandName}`);
-  const seccompFd = openSeccompFilter();
+  if (options.nestedAdmission !== undefined) readNestedVerificationAdmission(options.nestedAdmission, workspace);
+  if ((options.nestedAdmission !== undefined) !== (options.checkerTransport !== undefined))
+    throw new Error("nested checker requires its owned native transport");
+  const seccompFd = openSeccompFilter(options.nestedAdmission !== undefined ? NESTED_PROFILE : undefined);
   let plan: { args: string[]; descriptors: number[] } | undefined;
+  let createdMountpoint: string | undefined;
+  let launched = false;
   try {
-    plan = baseBwrapPlan(workspace, options.writablePaths ?? workspace.allowedPaths, options.verificationSubject);
-    return spawn(workspace.bwrapPath, [
-      ...plan.args, "--chdir", WORKSPACE_MOUNT, "--", commandPath, ...args,
-    ], {
-      stdio: ["pipe", "pipe", "pipe", seccompFd, ...plan.descriptors],
+    if (options.nestedAdmission !== undefined &&
+      createHash("sha256").update(readFileSync(`/proc/self/fd/${seccompFd}`)).digest("hex") !==
+        readNestedVerificationAdmission(options.nestedAdmission, workspace).binding.policyIdentity)
+      throw new Error("nested verification profile policy proof mismatch");
+    plan = options.nestedAdmission !== undefined ? nestedBwrapPlan(workspace, options.nestedAdmission) :
+      baseBwrapPlan(workspace, options.writablePaths ?? workspace.allowedPaths, options.verificationSubject);
+    const closeDescriptors = Array.from({ length: plan.descriptors.length + 1 }, (_, i) => `exec ${i + 3}<&-`).join("; ");
+    const spawnArgs = [
+      ...plan.args, "--chdir", WORKSPACE_MOUNT, "--",
+      ...(options.nestedAdmission !== undefined ? ["/bin/bash", "-c", `${closeDescriptors}; exec "$@"`, "pitako-launcher"] : []),
+      commandPath, ...args,
+    ];
+    const spawnOptions = {
+      stdio: [...(options.checkerTransport?.childEnds ?? ["pipe", "pipe", "pipe"] as const), seccompFd, ...plan.descriptors],
       env: cleanLauncherEnvironment(),
       signal: options.signal,
-    });
+    } satisfies import("node:child_process").SpawnOptions;
+    const bwrapPath = workspace.bwrapPath;
+    // Host observation only, after synchronous preparation; it grants no new authority.
+    options.beforeSpawn?.();
+    if (options.canSpawn?.() === false) return undefined;
+    if (options.nestedAdmission !== undefined) {
+      const mountpoint = path.join(workspace.candidateRoot, "node_modules");
+      if (!existsSync(mountpoint)) {
+        mkdirSync(mountpoint, { mode: 0o700 });
+        createdMountpoint = mountpoint;
+      }
+      const target = lstatSync(mountpoint);
+      if (!target.isDirectory() || target.isSymbolicLink() || readdirSync(mountpoint).length)
+        throw new Error("source dependency mountpoint contains unexpected candidate content");
+      // Mountpoint preparation is part of the original invocation, never a renewed grant.
+      if (options.canSpawn?.() === false) return undefined;
+    }
+    const child = spawn(bwrapPath, spawnArgs, spawnOptions);
+    launched = true;
+    return child;
   } finally {
     closeSync(seccompFd);
     for (const fd of plan?.descriptors ?? []) closeSync(fd);
+    // No child or asynchronous work can own this host-created empty directory yet.
+    if (createdMountpoint && !launched) rmdirSync(createdMountpoint);
+  }
+}
+
+function nestedBwrapPlan(workspace: MissionWorkspace, token: unknown): { args: string[]; descriptors: number[] } {
+  assertWorkspaceIdentity(workspace);
+  const { capsule } = readNestedVerificationAdmission(token, workspace);
+  const descriptors: number[] = [];
+  const args = ["--tmpfs", "/", "--unshare-user", "--unshare-pid", "--unshare-net", "--unshare-ipc", "--unshare-uts",
+    "--die-with-parent", "--new-session", "--cap-drop", "ALL", "--seccomp", "3", "--dev", "/dev", "--proc", "/proc",
+    "--tmpfs", "/tmp", "--tmpfs", "/home", "--tmpfs", "/root", "--tmpfs", "/run"];
+  const mount = (source: string, target: string, writable = false) => {
+    const fd = openSync(source, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+    descriptors.push(fd);
+    const stat = fstatSync(fd);
+    if (identity(source) !== `${stat.dev}:${stat.ino}`) throw new Error("nested mount identity changed before release");
+    args.push("--dir", target, writable ? "--bind-fd" : "--ro-bind-fd", String(3 + descriptors.length), target);
+  };
+  try {
+    for (const name of ["usr", "bin", "sbin", "lib", "lib64", "etc"]) mount(path.join(capsule.root, "closure", name), `/${name}`);
+    for (const target of [WORKSPACE_MOUNT, SOURCE_MOUNT, PRODUCT_MOUNT]) mount(workspace.candidateRoot, target);
+    mount(workspace.candidateGitDir, SOURCE_GIT_MOUNT);
+    mount(workspace.candidateGitDir, `${WORKSPACE_MOUNT}/.git`);
+    mount(path.join(capsule.root, "store"), STORE_MOUNT);
+    mount(path.join(capsule.root, "closure/runtime"), `${SANDBOX_ROOT}/runtime`);
+    mount(path.join(capsule.root, "closure/dependencies"), `${WORKSPACE_MOUNT}/node_modules`);
+    mount(path.join(capsule.root, "scratch"), NESTED_SCRATCH, true);
+    mount(path.join(capsule.root, "evidence"), NESTED_EVIDENCE, true);
+    args.push("--clearenv", "--setenv", "PATH",
+      `${SANDBOX_ROOT}/runtime/node-prefix/bin:${SANDBOX_ROOT}/runtime/bun-prefix/bin:/usr/bin:/bin`,
+      "--setenv", "HOME", NESTED_SCRATCH, "--setenv", "TMPDIR", "/tmp",
+      "--setenv", "LANG", "C.UTF-8", "--setenv", "GIT_CONFIG_NOSYSTEM", "1",
+      "--setenv", "GIT_CONFIG_GLOBAL", "/dev/null", "--setenv", "GIT_TERMINAL_PROMPT", "0");
+    return { args, descriptors };
+  } catch (error) {
+    for (const fd of descriptors) closeSync(fd);
+    throw error;
   }
 }
 
@@ -706,6 +862,7 @@ function baseBwrapPlan(workspace: MissionWorkspace, writablePaths: string[], ver
   assertWorkspaceIdentity(workspace);
   const backing = dependencyBackings.get(workspace);
   if (backing) {
+    backing.recheck?.();
     const state = lstatSync(backing.root);
     if (!state.isDirectory() || state.isSymbolicLink() || identity(backing.root) !== backing.identity) {
       throw new Error("source dependency backing identity changed");
@@ -1009,12 +1166,18 @@ function namespaceId(name: "pid" | "net"): string {
   return readlinkSync(`/proc/self/ns/${name}`);
 }
 
-export function openSeccompFilter(): number {
+export function openSeccompFilter(profile?: typeof NESTED_PROFILE): number {
   const syscalls = syscallTable();
   const rules: Array<[number, number]> = [];
   const instruction = (code: number, jumpTrue = 0, jumpFalse = 0, value = 0) => rules.push([code | (jumpTrue << 8) | (jumpFalse << 16), value]);
   instruction(0x20, 0, 0, 0); // BPF_LD | BPF_W | BPF_ABS, seccomp_data.nr
-  for (const syscall of syscalls.blocked) {
+  const nestedOperations: Record<string, number[]> = {
+    x64: [41, 42, 43, 44, 46, 48, 49, 50, 53, 288, 299, 307,
+      155, 165, 166, 272, 308, 105, 106, 113, 114, 116, 117, 119, 122, 123, 126],
+    arm64: [198, 199, 200, 201, 202, 203, 206, 210, 211,
+      39, 40, 41, 97, 146, 147, 149, 151, 152, 159, 217, 268],
+  };
+  for (const syscall of syscalls.blocked.filter((nr) => profile !== NESTED_PROFILE || !nestedOperations[process.arch]?.includes(nr))) {
     instruction(0x15, 0, 1, syscall); // BPF_JMP | BPF_JEQ | BPF_K
     instruction(0x06, 0, 0, 0x00050001); // BPF_RET | SECCOMP_RET_ERRNO | EPERM
   }

@@ -49,7 +49,7 @@ export function authoringProposal(context: ReturnType<typeof preparationContext>
         sourceId: id, text, predicateIds: mappings.find(({ sourceId }) => sourceId === id)!.predicateIds,
       })) },
     acceptance: mappings.map(({ predicateIds }) => ({ id: predicateIds[0]!, kind: "command_exit",
-      target: "discriminating Node check", command: "node --check src/a" })),
+      target: "discriminating Node check", command: "node --check src/a", timeoutMs: 1000 })),
   }));
   const final = mappings.flatMap(({ predicateIds }) => predicateIds);
   definition.finalization = { contractVersion: 1, independentReview: true, requiredPredicates: final,

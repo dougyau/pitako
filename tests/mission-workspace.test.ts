@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import { MissionEffects } from "../extensions/mission/effects.ts";
-import { missionDefinition, missionInput, createMissionFixture, openFixtureStore } from "./mission-fixtures.ts";
+import { fixtureCommandTime, missionDefinition, missionInput, createMissionFixture, openFixtureStore } from "./mission-fixtures.ts";
 import type { MissionFixture } from "./mission-fixtures.ts";
 import {
   captureWorkspacePaths, createMissionWorkspace, currentProcessIdentity, ownerProcessState,
@@ -226,6 +226,7 @@ describe("managed mission candidate containment", () => {
       workspace: candidate, missionId: candidate.missionId, revision: 1, unitId: "unit",
       attemptId: candidate.attemptId, runtimeId: "exact-file-test", ownerEpoch: 1,
       allowedOperations: ["read", "edit", "bash"],
+      commandTime: fixtureCommandTime(),
     });
     const first = await effects.invoke("bash", { command: "cat src/greeting.mjs" });
     expect(first.status).toBe("completed");
@@ -342,6 +343,7 @@ describe("managed mission candidate containment", () => {
       runtimeId: "test-runtime",
       ownerEpoch: 1,
       allowedOperations: ["write", "edit", "apply_patch", "bash"],
+      commandTime: fixtureCommandTime(),
     });
     const write = await effects.invoke("write", { path: "src/target.txt", content: "candidate write\n" });
     expect(write.status).toBe("completed");
@@ -433,6 +435,7 @@ describe("managed mission candidate containment", () => {
       store: store as never, workspace: candidate, missionId: candidate.missionId, revision: 1,
       unitId: "unit", attemptId: candidate.attemptId, runtimeId: "test-runtime", ownerEpoch: 1,
       allowedOperations: ["bash"],
+      commandTime: fixtureCommandTime(),
     });
     try {
       const receipt = await effects.invoke("bash", {
@@ -472,6 +475,7 @@ describe("managed mission candidate containment", () => {
       store: store as never, workspace: candidate, missionId: candidate.missionId, revision: 1,
       unitId: "unit", attemptId: candidate.attemptId, runtimeId: "test-runtime", ownerEpoch: 1,
       allowedOperations: ["write"],
+      commandTime: fixtureCommandTime(),
     });
     expect((await uncontained.invoke("write", { path: "src/target.txt", content: "must not start" })).status).toBe("denied");
     expect(readFileSync(path.join(candidate.candidateRoot, "src/target.txt"), "utf8")).toBe("dirty worktree\n");

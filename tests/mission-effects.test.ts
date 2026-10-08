@@ -9,7 +9,7 @@ import { MissionEngine, type MissionRoleRunner } from "../extensions/mission/eng
 import { createMissionWorkspace, currentProcessIdentity, ownerProcessState, preflightContainment, processesInNamespace, readOwnedNamespaceInit } from "../extensions/mission/workspace.ts";
 import { loadPitako } from "../scripts/load-pitako.ts";
 import { packageRoot } from "../extensions/stack.ts";
-import { createMissionFixture, missionDefinition, missionInput, openFixtureStore, type MissionFixture } from "./mission-fixtures.ts";
+import { fixtureCommandTime, createMissionFixture, missionDefinition, missionInput, openFixtureStore, type MissionFixture } from "./mission-fixtures.ts";
 import { missionCompletionBlockers } from "../extensions/mission/completion.ts";
 import { missionHasUnresolvedEffects, reconcileMission } from "../extensions/mission/reconcile.ts";
 import { openMissionStore } from "../extensions/mission/store.ts";
@@ -117,6 +117,7 @@ describe("managed mission retirement", () => {
       store, workspace, missionId: mission.id, revision: 1, unitId: "snapshot",
       attemptId: workspace.attemptId, runtimeId: store.runtimeId, ownerEpoch: store.ownerEpoch!,
       allowedOperations: ["apply_patch"],
+      commandTime: fixtureCommandTime(),
     });
     const adapter = createMissionToolAdapters(effects).find(({ name }) => name === "apply_patch")!;
     try {
@@ -185,6 +186,7 @@ describe("managed mission retirement", () => {
       store: {} as never, workspace: {} as never, missionId: "12345678-1234-4234-8234-123456789abc",
       revision: 1, unitId: "unit", attemptId: "22345678-1234-4234-8234-123456789abc",
       runtimeId: "runtime", ownerEpoch: 1, allowedOperations: ["bash", "edit", "write", "apply_patch"],
+      commandTime: fixtureCommandTime(),
     });
     const { session } = await createAgentSession({
       cwd, agentDir, sessionManager: manager, modelRuntime: runtime, customTools: createMissionToolAdapters(effects),
@@ -286,6 +288,7 @@ describe("managed mission retirement", () => {
     effects = new MissionEffects({
       store: journal as never, workspace, missionId: mission.id, revision: 1, unitId: "snapshot",
       attemptId: workspace.attemptId, runtimeId: store.runtimeId, ownerEpoch: store.ownerEpoch!, allowedOperations: ["write"],
+      commandTime: fixtureCommandTime(),
     });
     try {
       const invocation = effects.invoke("write", { path: "src/target.txt", content: "must not launch" });
@@ -322,6 +325,7 @@ describe("managed mission retirement", () => {
     effects = new MissionEffects({
       store: journal as never, workspace, missionId: mission.id, revision: 1, unitId: "snapshot",
       attemptId: workspace.attemptId, runtimeId: store.runtimeId, ownerEpoch: store.ownerEpoch!, allowedOperations: ["write"],
+      commandTime: fixtureCommandTime(),
     });
     try {
       const receipt = await effects.invoke("write", { path: "src/target.txt", content: "must not launch" });
@@ -367,6 +371,7 @@ describe("managed mission retirement", () => {
     const effects = new MissionEffects({
       store, workspace, missionId: mission.id, revision: 1, unitId: "snapshot", attemptId: workspace.attemptId,
       runtimeId: store.runtimeId, ownerEpoch: store.ownerEpoch!, allowedOperations: ["bash"],
+      commandTime: fixtureCommandTime(),
     });
     const controller = new AbortController();
     try {
@@ -428,6 +433,7 @@ describe("managed mission retirement", () => {
       store: unbacked.store, workspace: unbacked.workspace, missionId: unbacked.mission.id, revision: 1,
       unitId: "snapshot", attemptId: unbacked.workspace.attemptId, runtimeId: unbacked.store.runtimeId,
       ownerEpoch: unbacked.store.ownerEpoch!, allowedOperations: ["bash"],
+      commandTime: fixtureCommandTime(),
     });
     let recoveredStore: Awaited<ReturnType<typeof openFixtureStore>> | undefined;
     try {
@@ -494,6 +500,7 @@ describe("managed mission retirement", () => {
       store: journal as never, workspace, missionId: mission.id, revision: 1, unitId: "snapshot",
       attemptId: workspace.attemptId, runtimeId: store.runtimeId, ownerEpoch: store.ownerEpoch!,
       allowedOperations: ["write"],
+      commandTime: fixtureCommandTime(),
     });
     try {
       const receipt = await effects.invoke("write", { path: "src/target.txt", content: "must not finish" }, controller.signal);
@@ -515,6 +522,75 @@ describe("managed mission retirement", () => {
       await effects.shutdown();
       store.close();
     }
+  });
+
+  for (const exhausted of ["invocation", "enclosing-zero", "enclosing-insufficient"] as const) {
+    test(`pre-child launch denies ${exhausted} authority with a durable null-process receipt`, async () => {
+      const { store, mission, workspace } = await managedFixture(undefined, ["bash"]);
+      const bwrapPath = workspace.bwrapPath;
+      let prepared = false;
+      Object.defineProperty(workspace, "bwrapPath", { get() {
+        prepared = true;
+        if (exhausted === "invocation") {
+          const until = performance.now() + 80;
+          while (performance.now() < until) { /* synchronous launcher preparation */ }
+        }
+        return bwrapPath;
+      } });
+      const effects = new MissionEffects({ store, workspace, missionId: mission.id, revision: 1, unitId: "snapshot",
+        attemptId: workspace.attemptId, runtimeId: store.runtimeId, ownerEpoch: store.ownerEpoch!,
+        allowedOperations: ["bash"], commandTime: {
+          admit: async (requested) => requested!,
+          remaining: () => exhausted === "invocation" ? 20000 : exhausted === "enclosing-zero" ? 0 : 1,
+        } });
+      try {
+        const receipt = await effects.invoke("bash", { command: "printf must-not-run > src/not-launched", timeoutMs: exhausted === "invocation" ? 50 : 10000 });
+        expect(prepared).toBe(true);
+        expect(receipt).toMatchObject({ status: "denied", paths: [], reason: "command timeout exceeds current remaining effect time grant" });
+        const events = store.inspectMission(mission.id).events.filter(row => row.effectId === receipt.effectId);
+        expect(events.map(row => row.kind)).toEqual(["effect.intent", "effect.invoking", "effect.receipt"]);
+        expect(events.at(-1)!.payload.process).toBeNull();
+        expect(existsSync(path.join(workspace.candidateRoot, "src/not-launched"))).toBe(false);
+        expect(effects.quiescent).toBe(true);
+        if (process.env.MISSION_TIME_EVIDENCE) {
+          mkdirSync(process.env.MISSION_TIME_EVIDENCE, { recursive: true });
+          writeFileSync(path.join(process.env.MISSION_TIME_EVIDENCE, `pre-child-${exhausted}.json`), JSON.stringify({ receipt, events }, null, 2));
+        }
+      } finally { await effects.shutdown(); store.close(); }
+    });
+  }
+
+  test("T3 real executing command cancellation retires owned init and cannot become completed", async () => {
+    const { store, mission, workspace } = await managedFixture(undefined, ["bash"]);
+    const controller = new AbortController();
+    const append = store.appendTransition.bind(store);
+    store.appendTransition = (id, version, transition) => {
+      const result = append(id, version, transition);
+      if (transition.events.some(row => row.kind === "effect.released"))
+        setTimeout(() => controller.abort("fixture command cancellation"), 150);
+      return result;
+    };
+    const effects = new MissionEffects({ store, workspace, missionId: mission.id, revision: 1, unitId: "snapshot",
+      attemptId: workspace.attemptId, runtimeId: store.runtimeId, ownerEpoch: store.ownerEpoch!,
+      allowedOperations: ["bash"], commandTime: fixtureCommandTime(4000) });
+    try {
+      const receipt = await effects.invoke("bash", { command: "printf 'started\\n'; sleep 5", timeoutMs: 3000 }, controller.signal);
+      expect(receipt).toMatchObject({ status: "failed", termination: "signal", stdout: "started\n",
+        process: { descendantsQuiescent: true, namespaceEmptyAfterExit: true } });
+      const events = store.inspectMission(mission.id).events;
+      const registered = events.find(row => row.kind === "effect.process.registered")!.payload.identity as
+        ReturnType<typeof currentProcessIdentity> & { namespaceInit: { pid: number; birthTicks: number }; pidNamespace: string };
+      expect(processesInNamespace(registered.pidNamespace)).toEqual([]);
+      expect(ownerProcessState({ ...registered, ...registered.namespaceInit })).toBe("dead");
+      expect(effects.quiescent).toBe(true);
+      expect(events.some(row => row.kind === "unit.accepted" || row.kind === "mission.completed")).toBe(false);
+      if (process.env.MISSION_TIME_EVIDENCE) {
+        mkdirSync(process.env.MISSION_TIME_EVIDENCE, { recursive: true });
+        writeFileSync(path.join(process.env.MISSION_TIME_EVIDENCE, "command-cancel.json"), JSON.stringify({
+          receipt, events, ownedInitState: "dead", namespaceProcesses: [],
+        }, null, 2));
+      }
+    } finally { await effects.shutdown(); store.close(); }
   });
 
   test("real Pi reload awaits old owner retirement and fences its late result from the new epoch", async () => {

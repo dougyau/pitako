@@ -1,4 +1,8 @@
 // Disposable native Node/installed SDK evidence. All confirmations are fixture authority, NOT user approval.
+if (process.argv[3] === "--composed") {
+  await import("./mission-native-composed-node.mjs");
+  process.exit(0);
+}
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";

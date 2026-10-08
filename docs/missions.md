@@ -99,8 +99,10 @@ original objective/WorkBrief/criteria, mappings, scope and verification obligati
 Only native confirmation admits that exact validated object. Tool results remain
 proposal diagnostics, not transferable confirmation receipts.
 
-Preparation persists only after confirmation and starts no setup or worker.
-Explicit `/mission start` separately confirms activation/setup. Unadmitted drafts
+Preparation persists only after confirmation and starts no worker.
+Explicit `/mission start` separately confirms worker activation. Copied setup
+can run during preparation under its own exact native consent, as described below.
+Legacy setup runs only after separate start consent. Unadmitted drafts
 are request data: wrong request/session/root, source/configuration drift, replacement,
 dismissal, shutdown, reload or session switching require reauthoring. Admitted
 preparation survives reload through immutable mission storage. For deliberate
@@ -108,6 +110,53 @@ existing-file compatibility use `/mission prepare-file <plan-id>`.
 Help and status require
 neither execution ownership nor a console, and do not recover work or acknowledge
 notification delivery.
+
+### Preparation status and setup
+
+`mission_prepare` reports `decision-required` for genuine user decisions,
+`technical-unresolved` for author corrections or unavailable inputs, and `ready`
+when the current preparation is usable. Each result includes a next action.
+Malformed mappings, unsupported evidence, and insufficient current command capacity
+are technical problems. They do not become permission questions or manual passes.
+`/mission status` reports unresolved setup separately from a ready prepared mission.
+A prepared mission still needs explicit `/mission start`.
+
+The optional `execution-root-local-copy-v1` contract copies bounded local inputs
+to an exclusive temporary destination before running the admitted setup hook.
+The preview names the destination, hook, writable directories, input seeds or cache,
+and finite time and artifact limits. The hook runs in the managed capsule without
+network access or global installation. Source and cache inputs stay unchanged.
+The host publishes only the current owned output after complete observation.
+Candidate consumers mount that dependency output read-only.
+
+Start reuses this observed output and its existing protected reservations.
+It does not run a second bootstrap. Copied setup cannot replay after restart,
+and an unknown owner or incomplete observation leaves setup unresolved.
+A changed destination or source needs fresh consent. The older
+`execution-root-local-v1` contract retains its separate start-scoped behavior.
+
+### Optional offline verification profile
+
+`sealed-nested-verification-v1` is an explicit schema-2 verification profile,
+not a shell flag or an ordinary worker capability. Native confirmation binds the
+profile and copied runtime inputs. The host issues the checker capability for each
+current predicate, subject, input binding, owner, and finite allocation.
+Ordinary acceptance and finalization use the same profile.
+
+The checker reads sealed subject code and the copied runtime without write access.
+It can create scratch candidates and bounded evidence inside its disposable capsule.
+Nested tools remain offline, and host services remain unavailable.
+Ordinary workers keep their namespace, socket, and tool restrictions.
+Unavailable inputs or sandbox capabilities reject the checker instead of using
+host execution.
+
+A checker exit code or child success message is not completion proof.
+The host requires complete bounded output import, unchanged input identities,
+retirement of the registered outer init, an empty namespace, and quiescent descendants.
+Unknown or live ownership retains and fences the capsule. It does not authorize
+cleanup, replay, or publication.
+
+### Native decisions and recovery
 
 For a named pending question, native `answer <question-id>` prompts for each
 bounded field's new JSON value and derives exact preimages from the current
@@ -198,6 +247,13 @@ integration stage, not proof of every T1–T6 obligation. Preserve any required
 stage-specific evidence in distinct directories. The fixture uses real Node Pi SDK sessions and managed
 tools but a local deterministic model transport: it exercises engine wiring,
 not model quality, paid-provider behavior or a live autonomous success rate.
+
+The credential-free composed fixture uses the native preparation and confirmation
+handlers, a fixture-owned local setup hook, separate native start, and an actual
+contained checker observation. Its finalization checks the product with the same
+profile and copied dependency. The deterministic provider proves SDK wiring,
+not classifier intelligence, real-provider performance, or P6 completion.
+It does not replace the required final candidate gates or independent review.
 
 The workflow and brief-context change uses focused dispatch, local SDK,
 continuation, recovery, checker, and finalization regressions. Its routine final

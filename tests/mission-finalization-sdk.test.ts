@@ -6,7 +6,7 @@ import path from "node:path";
 import { createPiExecutor } from "../extensions/agent/pi.ts";
 import { createPiMissionRunner, MissionEngine, type MissionAttemptBinding } from "../extensions/mission/engine.ts";
 import { FINALIZATION_PHASES, currentWholeResultApproval, observeSourceMutation, sourceWitnessCurrent, parseFinalizationResponse, parseWholeResultResponse, type FinalizationTarget } from "../extensions/mission/finalization.ts";
-import { captureWorkspaceImage, processesInNamespace } from "../extensions/mission/workspace.ts";
+import { captureWorkspaceImage, currentProcessIdentity, ownerProcessState, processesInNamespace } from "../extensions/mission/workspace.ts";
 import { assessMissionCompletion, missionCompletionCertificate } from "../extensions/mission/completion.ts";
 import { readSealedWorkspaceImage, reconcileMission } from "../extensions/mission/reconcile.ts";
 import { createMissionFixture, missionDefinition, missionInput, openFixtureStore } from "./mission-fixtures.ts";
@@ -41,6 +41,12 @@ test("finalization transport accepts the retained whole-body receipt and rejects
 });
 
 async function runCase(name: string, changed = false) {
+  const nested = name === "generated-nested-production";
+  const commandTime = name.startsWith("command-time-");
+  const commandRemaining = name === "command-time-remaining";
+  const commandExpired = name === "command-time-expired";
+  const commandTimerRange = name === "command-time-timer-range";
+  const commandBound = commandExpired ? 500 : commandTimerRange ? 2_147_483_647 : 1_860_000;
   const timed = name.startsWith("phase-time");
   const remainder = name.startsWith("token-remainder");
   const tokenExhausted = name === "token-remainder-exhausted";
@@ -62,7 +68,7 @@ async function runCase(name: string, changed = false) {
   const brokenProduct = name === "generated-failing-product" || name === "generated-setup-failing-product";
   const pausedReview = name.endsWith("paused-review");
   const cancelledReview = name.endsWith("cancelled-review");
-  const twoCommands = ["two-commands", "failed-second-gate"].includes(name);
+  const twoCommands = ["two-commands", "failed-second-gate"].includes(name) || commandRemaining;
   const failedGate = ["failed-gate", "failed-second-gate"].includes(name);
   const sample = createMissionFixture(`pitako-finalization-${name}-`);
   const pinRoot = sample.root;
@@ -108,6 +114,9 @@ async function runCase(name: string, changed = false) {
     })) }) + "\n```";
   } });
   const definition = missionDefinition();
+  // Setup-backed launch validates current setup inputs before GO; this time belongs
+  // to the invocation, not just the grep after release.
+  const predicateTime = setup ? 10000 : 3000;
   definition.finalization.contractVersion = 1;
   definition.authority.allowedPaths = ["src/**"];
   definition.authority.operations = ["write", "bash"];
@@ -115,9 +124,9 @@ async function runCase(name: string, changed = false) {
   definition.authority.rolePolicies.reviewer = { hash: "b".repeat(64), provider: provider.provider, model: provider.model, fallbacks: [] };
   definition.units = [{ id: "product", role: "developer", kind: "implementation", dependencies: [], inputs: ["."], outputs: ["src/a"],
     acceptance: twoCommands ? [
-      { id: "nonempty", kind: "command_exit", target: "result", command: "printf 'first-command\\n'; test -s src/a", expected: "0", timeoutMs: 3000 },
-      { id: "product-present", kind: "command_exit", target: "result", command: "printf 'second-command\\n'; grep -q product src/a", expected: "0", timeoutMs: 3000 },
-    ] : [{ id: "product-present", kind: "command_exit", target: "result", command: "grep -q product src/a", expected: "0", timeoutMs: 3000 }],
+      { id: "nonempty", kind: "command_exit", target: "result", command: "printf 'first-command\\n'; test -s src/a", expected: "0", timeoutMs: predicateTime },
+      { id: "product-present", kind: "command_exit", target: "result", command: "printf 'second-command\\n'; grep -q product src/a", expected: "0", timeoutMs: predicateTime },
+    ] : [{ id: "product-present", kind: "command_exit", target: "result", command: "grep -q product src/a", expected: "0", timeoutMs: predicateTime }],
     risk: "low", retryLimit: 0 }];
   if (selective) definition.units.unshift({ id: "diagnostic", role: "developer", kind: "implementation", dependencies: [],
     inputs: ["src/diagnostic-input"], outputs: ["src/diagnosis"],
@@ -125,10 +134,27 @@ async function runCase(name: string, changed = false) {
       inputPaths: ["src/diagnostic-input", "src/diagnosis"], expected: "0", timeoutMs: 3000 }], risk: "low", retryLimit: 0 });
   if (oneUnit) definition.units.pop();
   if (selectedPhases) definition.units[0]!.acceptance.push(
-    { id: "nonempty", kind: "command_exit", target: "result", command: "test -s src/a", expected: "0", timeoutMs: 3000 },
-    { id: "final-product", kind: "command_exit", target: "result", command: "test \"$(cat src/a)\" = product", expected: "0", timeoutMs: 3000 });
+    { id: "nonempty", kind: "command_exit", target: "result", command: "test -s src/a", expected: "0", timeoutMs: predicateTime },
+    { id: "final-product", kind: "command_exit", target: "result", command: "test \"$(cat src/a)\" = product", expected: "0", timeoutMs: predicateTime });
   definition.finalization.requiredPredicates = definition.units.flatMap(({ acceptance }) => acceptance.map(({ id }) => id));
   definition.budget = { roleLaunches: 4, providerRequests: 5, tokens: 10000, activeTimeMs: 120000, artifactBytes: 32_000_000 };
+  if (nested) {
+    definition.authority.verificationProfiles = ["sealed-nested-verification-v1"];
+    definition.budget = { roleLaunches: 6, providerRequests: 12, tokens: 100000,
+      activeTimeMs: 1800000, artifactBytes: 16000000000 };
+    for (const predicate of definition.units[0]!.acceptance) {
+      predicate.profile = "sealed-nested-verification-v1";
+      predicate.timeoutMs = 60000;
+      predicate.command = "IFS= read -r product < src/a; test \"$product\" = product";
+    }
+  }
+  if (commandTime) {
+    definition.budget.activeTimeMs = commandTimerRange ? 40_000_000_000 : 40_000_000;
+    for (const predicate of definition.units[0]!.acceptance) {
+      predicate.timeoutMs = commandBound;
+      if (commandExpired) predicate.command = "printf started; sleep 3";
+    }
+  }
   if (setup) definition.budget.roleLaunches = 5;
   // Explicit disposable grant, not authority inferred for a real mission.
   if (name === "generated-setup-selective" || selectedPhases)
@@ -167,7 +193,7 @@ Expected evidence: a contained command reads the real output.
     sample.root = path.join(sample.base, "execution");
     execFileSync("git", ["worktree", "add", "-q", "-b", "execution", sample.root], { cwd: pinRoot });
     // Temporary worktrees do not inherit this checkout's ignore policy.
-    writeFileSync(path.join(sample.root, ".gitignore"), `.pitako/\n${selective ? "node_modules/\n" : ""}`);
+    writeFileSync(path.join(sample.root, ".gitignore"), `.pitako/\n${selective || nested ? "node_modules/\n" : ""}`);
     execFileSync("git", ["add", ".gitignore"], { cwd: sample.root });
     mkdirSync(path.join(sample.root, "src"), { recursive: true });
     writeFileSync(path.join(sample.root, "src/a"), "original\n");
@@ -255,8 +281,10 @@ fallbacks = [{ model = "${provider.provider}/${provider.model}", reasoning = "me
   } else writeFileSync(sample.definitionFile, JSON.stringify(definition));
   let store = await openFixtureStore(sample);
   let engine: MissionEngine | undefined;
-  const timers = timed ? spyOn(globalThis, "setTimeout") : undefined;
+  const timers = timed || commandTime ? spyOn(globalThis, "setTimeout") : undefined;
   const observerErrors: unknown[] = [];
+  let primaryError: unknown;
+  let missionId: string | undefined;
   let reviewReady!: () => void;
   let releaseReview!: () => void;
   const ready = new Promise<void>((resolve) => { reviewReady = resolve; });
@@ -269,7 +297,22 @@ fallbacks = [{ model = "${provider.provider}/${provider.model}", reasoning = "me
       commandId: admission!.id, admissionReceiptId: admission!.id,
       operatorText: admissionText!, operatorReceipt: admission!,
     } : missionInput(sample));
+    missionId = mission.id;
     const originalPin = readFileSync(sample.planFile);
+    if (commandRemaining) {
+      const append = store.appendTransition.bind(store);
+      store.appendTransition = (id, version, transition) => {
+        const result = append(id, version, transition);
+        if (transition.events.some(row => row.kind === "effect.receipt" && row.payload.operation === "bash")) {
+          const current = store.inspectMission(id);
+          const stage = current.events.filter(row => row.kind === "mission.finalization.phase.started").at(-1);
+          const window = current.events.filter(row => row.kind === "mission.active.window.opened").at(-1)!;
+          if ((stage?.payload.target as FinalizationTarget | undefined)?.phase === "integrated-checks")
+            clock += Number(window.payload.grantAmount) - commandBound + 1;
+        }
+        return result;
+      };
+    }
     if (timed) {
       const append = store.appendTransition.bind(store);
       store.appendTransition = (id, version, transition) => {
@@ -295,11 +338,23 @@ fallbacks = [{ model = "${provider.provider}/${provider.model}", reasoning = "me
     const runner = createPiMissionRunner({ cwd: sample.root, executor: createPiExecutor(),
       load: { env: { PI_CODING_AGENT_DIR: agentDir }, userConfigPath: config } });
     const options = { store, missionId: mission.id, sessionsDirectory: path.join(sample.base, "sessions"),
-      ...(timed ? { now: () => clock } : {}),
+      ...(timed || commandRemaining ? { now: () => clock } : {}),
       managedWorkspace: { sourceRoot: sample.root, candidateParent: path.join(sample.base, "candidates") },
       runRole: async (...args: Parameters<typeof runner>) => {
         try {
         const [input, durable] = args;
+        if (commandTime && !input.binding.finalization && !commandExpired) {
+          const invalid = await durable.effects!.invoke("bash", { command: "exit 0", timeoutMs: 2_147_483_648 });
+          expect(invalid.status).toBe("denied");
+          if (!commandTimerRange) {
+            const insufficient = await durable.effects!.invoke("bash", { command: "printf forbidden-borrow", timeoutMs: 5_000_001 });
+            expect(insufficient).toMatchObject({ status: "denied", reason: expect.stringContaining("ordinary active-time capacity") });
+          }
+          const receipt = await durable.effects!.invoke("bash", { command: "printf managed-command", timeoutMs: commandBound });
+          expect(receipt).toMatchObject({ status: "completed", stdout: "managed-command", exitCode: 0 });
+          const omitted = await durable.effects!.invoke("bash", { command: "printf omitted-command" });
+          expect(omitted).toMatchObject({ status: "completed", stdout: "omitted-command", exitCode: 0 });
+        }
         if (timed && input.binding.finalization) {
           const admitted = store.inspectMission(mission.id).events.filter(row =>
             row.kind === "mission.active.window.opened").at(-1)!;
@@ -441,6 +496,15 @@ fallbacks = [{ model = "${provider.provider}/${provider.model}", reasoning = "me
           }
         }
         const result = await runner(...args);
+        if (generated && evidenceRoot) {
+          const out = path.join(evidenceRoot, name, "sdk");
+          mkdirSync(out, { recursive: true });
+          writeFileSync(path.join(out, `${input.binding.attemptId}.json`), JSON.stringify({
+            observedAt: performance.now(), binding: input.binding, brief: input.brief,
+            policy: durable.rolePolicy, result, requestsUndefined: result.requests === undefined,
+            inspection: store.inspectMission(mission.id), providerTrace: provider.trace,
+          }, null, 2));
+        }
         if (timeExhausted && input.binding.finalization?.phase === "cleanup") return result;
         if (timed) expect(store.inspectMission(mission.id).events.filter(row =>
           row.kind === "budget.admission.fenced").map(row => row.payload.reason)).toEqual([]);
@@ -474,13 +538,6 @@ fallbacks = [{ model = "${provider.provider}/${provider.model}", reasoning = "me
             expect(request.reasoning).toBe("high");
             expect(request.fast_requested).toBe(false);
           }
-          if (evidenceRoot) {
-            const out = path.join(evidenceRoot, name, "sdk");
-            mkdirSync(out, { recursive: true });
-            writeFileSync(path.join(out, `${input.binding.attemptId}.json`), JSON.stringify({
-              binding: input.binding, brief: input.brief, policy: durable.rolePolicy, result,
-            }, null, 2));
-          }
         }
         expect(provider.trace.find(({ sessionId }) => sessionId === input.binding.attemptId)!.prompt).toContain(input.brief);
         if (generated && !input.binding.finalization && prepared?.state === "ready") {
@@ -504,7 +561,23 @@ fallbacks = [{ model = "${provider.provider}/${provider.model}", reasoning = "me
           reviewReady(); await released;
         }
         return result;
-        } catch (error) { observerErrors.push(error); throw error; }
+        } catch (error) {
+          observerErrors.push(error);
+          if (generated && evidenceRoot) {
+            try {
+              const out = path.join(evidenceRoot, name, "sdk");
+              mkdirSync(out, { recursive: true });
+              writeFileSync(path.join(out, `${args[0].binding.attemptId}-error.json`), JSON.stringify({
+                observedAt: performance.now(), binding: args[0].binding,
+                error: error instanceof Error ? { name: error.name, message: error.message, stack: error.stack } : String(error),
+                inspection: store.inspectMission(mission.id), providerTrace: provider.trace,
+              }, null, 2));
+            } catch (captureError) {
+              throw new AggregateError([error, captureError], "SDK observer failed; evidence capture also failed");
+            }
+          }
+          throw error;
+        }
       } };
     engine = new MissionEngine({ ...options, managedWorkspace: { ...options.managedWorkspace,
       sourceRoot: name.endsWith("wrong-root") ? pinRoot : sample.root } });
@@ -693,14 +766,125 @@ fallbacks = [{ model = "${provider.provider}/${provider.model}", reasoning = "me
       }
     }
     await engine.waitForIdle();
-    expect(observerErrors).toEqual([]);
     let inspection = store.inspectMission(mission.id);
     if (evidenceRoot) {
       const out = path.join(evidenceRoot, name); mkdirSync(out, { recursive: true });
       writeFileSync(path.join(out, "journal-initial.json"), JSON.stringify(inspection, null, 2));
       provider.flush(path.join(out, "provider-initial.json")); await store.exportMission(mission.id, path.join(out, "export-initial"));
     }
+    expect(observerErrors).toEqual([]);
     const phases = inspection.events.filter((event) => event.kind === "mission.finalization.phase.receipted");
+    if (nested) {
+      expect(inspection.events.filter(row => row.kind === "unit.accepted").map(row => row.unitId)).toEqual([definition.units[0]!.id]);
+      expect(phases.map(row => (row.payload.target as FinalizationTarget).phase)).toEqual([...FINALIZATION_PHASES]);
+      const hashes = [
+        ...inspection.events.filter(row => row.kind === "evidence.recorded").map(row => String(row.payload.artifactHash)),
+        ...phases.flatMap(row => JSON.parse(store.readArtifact(String(row.payload.receiptHash)).toString()).evidenceHashes as string[]),
+      ];
+      const observations = hashes.map(hash => {
+        try {
+          const bytes = store.readArtifact(hash);
+          expect(createHash("sha256").update(bytes).digest("hex")).toBe(hash);
+          const proof = JSON.parse(bytes.toString());
+          if (evidenceRoot && proof.format === "mission-predicate-observation-v1") {
+            const out = path.join(evidenceRoot, name, "bound-artifacts");
+            mkdirSync(out, { recursive: true });
+            writeFileSync(path.join(out, hash), bytes);
+            const intent = inspection.events.find(row => row.kind === "effect.intent" && row.effectId === proof.receipt.effectId)!;
+            const planHash = String(intent.payload.effectPlanHash);
+            const planBytes = store.readArtifact(planHash);
+            expect(createHash("sha256").update(planBytes).digest("hex")).toBe(planHash);
+            writeFileSync(path.join(out, planHash), planBytes);
+          }
+          return proof;
+        } catch { return undefined; }
+      }).filter(row => row?.format === "mission-predicate-observation-v1");
+      expect(observations).toHaveLength(4);
+      for (const proof of observations) {
+        expect(proof.verdict).toBe("pass");
+        expect(proof.nestedVerification.profile).toBe("sealed-nested-verification-v1");
+        expect(proof.nestedVerification.preparedHash).toBe(inspection.snapshot.preparedHash);
+        expect(proof.executionOutputIdentity.unchanged).toBe(true);
+        expect(proof.cleanupWitness.outerInitRetired).toBe(true);
+        expect(proof.receipt).toMatchObject({ status: "completed", exitCode: 0 });
+      }
+      const seals = inspection.events.filter(row => row.kind === "workspace.snapshot.sealed" && row.payload.purpose === "terminal-output");
+      expect(seals.length).toBeGreaterThan(0);
+      expect(inspection.events.some(row => row.kind === "unit.verifying" &&
+        String(row.payload.reason).includes("disposal is unproven"))).toBe(false);
+      if (evidenceRoot) writeFileSync(path.join(evidenceRoot, name, "both-callers.json"),
+        JSON.stringify({ fixtureRoot: sample.base, observations, seals, certificate: missionCompletionCertificate(inspection, store),
+          reservations: inspection.reservations, phases }, null, 2));
+      expect(missionCompletionCertificate(inspection, store)).toBeDefined();
+      return;
+    }
+    if (commandTime) {
+      const invocations = inspection.events.filter(row => row.kind === "effect.released" && row.payload.operation === "bash");
+      const commands = invocations.map(row => {
+        const intent = inspection.events.find(event => event.effectId === row.effectId && event.kind === "effect.intent")!;
+        const plan = JSON.parse(store.readArtifact(String(intent.payload.effectPlanHash)).toString());
+        expect(row.payload.timeoutMs).toBe(plan.request.timeoutMs);
+        const window = inspection.events.filter(event => event.kind === "mission.active.window.opened" && event.seq < row.seq).at(-1)!;
+        expect(Number(window.payload.grantAmount)).toBeGreaterThanOrEqual(plan.request.timeoutMs);
+        const process = inspection.events.find(event => event.effectId === row.effectId && event.kind === "effect.process.registered")!;
+        const identity = process.payload.identity as ReturnType<typeof currentProcessIdentity> & {
+          pidNamespace: string; namespaceInit: { pid: number; birthTicks: number };
+        };
+        const namespace = identity.pidNamespace;
+        expect(namespace).toMatch(/^pid:\[\d+\]$/);
+        expect(processesInNamespace(namespace)).toEqual([]);
+        expect(ownerProcessState({ ...identity, ...identity.namespaceInit })).toBe("dead");
+        const receipt = inspection.events.find(event => event.effectId === row.effectId && event.kind === "effect.receipt")!;
+        expect(receipt.payload.process).toMatchObject({ descendantsQuiescent: true, namespaceEmptyAfterExit: true });
+        return { attemptId: row.attemptId, phase: inspection.events.find(event => event.kind === "mission.finalization.phase.started" &&
+          event.attemptId === row.attemptId)?.payload.target, request: plan.request, released: row.payload,
+          window: window.payload, receipt: receipt.payload, ownedInitState: "dead", namespaceProcesses: [] };
+      });
+      const delays = timers!.mock.calls.filter(([callback]) => String(callback).includes('resolve("timeout")')).map(([, delay]) => delay);
+      const releases = inspection.events.filter(row => row.kind === "effect.released");
+      expect(delays.length).toBe(releases.length);
+      for (const [index, delay] of delays.entries()) {
+        const bound = Number(releases[index]!.payload.timeoutMs);
+        expect(Number(delay)).toBeLessThanOrEqual(bound);
+        expect(Number(delay)).toBeGreaterThan(bound - 2000);
+      }
+      expect(timers!.mock.calls.every(([, delay]) => Number(delay) <= 2_147_483_647)).toBe(true);
+      if (!commandExpired) {
+        expect(delays.every(delay => Number(delay) > 30 * 60_000)).toBe(true);
+        expect(commands.filter(row => row.request.command === "printf omitted-command")[0]!.request.timeoutMs).toBeGreaterThan(30 * 60_000);
+      }
+      if (evidenceRoot) writeFileSync(path.join(evidenceRoot, name, "command-times.json"), JSON.stringify({
+        rootActiveTimeMs: definition.budget.activeTimeMs, commandBound, commands, timerDelaysMs: delays,
+        reservations: inspection.reservations, phases: phases.map(row => row.payload),
+      }, null, 2));
+      if (commandRemaining || commandExpired) {
+        expect(missionCompletionCertificate(inspection, store)).toBeUndefined();
+        const observations = inspection.events.filter(row => row.kind === "evidence.recorded").map(row =>
+          JSON.parse(store.readArtifact(String(row.payload.artifactHash)).toString()));
+        if (commandExpired) {
+          expect(phases).toHaveLength(0);
+          expect(commands).toHaveLength(1);
+          expect(commands[0]!.receipt).toMatchObject({ status: "failed", termination: "timeout" });
+          expect(observations.some(row => row.verdict !== "pass")).toBe(true);
+        } else {
+          expect(phases).toHaveLength(1);
+          const unsettled = inspection.events.find(row => row.kind === "attempt.settled" && row.unitId === "mission-finalization" &&
+            !phases.some(phase => phase.attemptId === row.attemptId))!;
+          const hashes = unsettled.payload.evidenceHashes as string[];
+          const assessments = hashes.map(hash => {
+            try { return JSON.parse(store.readArtifact(hash).toString()); } catch { return undefined; }
+          }).filter(row => row?.format === "mission-predicate-observation-v1");
+          expect(assessments.map(row => row.verdict)).toEqual(["pass", "inconclusive"]);
+          expect(assessments[1]!.reason).toContain("remaining admitted active-time capacity");
+          expect(commands.filter(row => (row.phase as FinalizationTarget | undefined)?.phase === "integrated-checks")).toHaveLength(1);
+        }
+        return;
+      }
+      expect(commands.filter(row => row.phase).map(row => (row.phase as FinalizationTarget).phase)).toEqual(
+        ["integrated-checks", "affected-checks", "final-gates"]);
+      expect(commands.filter(row => row.request.command !== "printf omitted-command").every(row =>
+        row.request.timeoutMs === commandBound)).toBe(true);
+    }
     if (remainder) {
       expect(inspection.reservations.filter(row => row.resource === "tokens" && row.purpose === "ordinary")
         .reduce((sum, row) => sum + row.amount, 0)).toBe(35348);
@@ -1023,17 +1207,46 @@ fallbacks = [{ model = "${provider.provider}/${provider.model}", reasoning = "me
       writeFileSync(path.join(out, "journal.json"), JSON.stringify(inspection, null, 2));
       provider.flush(path.join(out, "provider.json")); await store.exportMission(mission.id, path.join(out, "export"));
     }
+  } catch (error) {
+    primaryError = error;
+    if (generated && evidenceRoot) {
+      try {
+        const out = path.join(evidenceRoot, name);
+        mkdirSync(out, { recursive: true });
+        writeFileSync(path.join(out, "fixture-error.json"), JSON.stringify({
+          observedAt: performance.now(), fixtureBase: sample.base, executionRoot: sample.root,
+          error: error instanceof Error ? { name: error.name, message: error.message, stack: error.stack } : String(error),
+          inspection: missionId ? store.inspectMission(missionId) : undefined, providerTrace: provider.trace,
+        }, null, 2));
+        if (missionId) await store.exportMission(missionId, path.join(out, "export-error"));
+      } catch (captureError) {
+        throw new AggregateError([error, captureError], "SDK fixture failed; evidence capture also failed");
+      }
+    }
+    throw error;
   } finally {
     releaseReview();
-    try { await engine?.retireForShutdown("quit"); }
+    let retired = false;
+    try {
+      await engine?.retireForShutdown("quit");
+      retired = true;
+    } catch (error) {
+      if (primaryError !== undefined) throw new AggregateError([primaryError, error], "SDK fixture failed; retirement also failed");
+      throw error;
+    }
     finally {
       timers?.mockRestore();
-      store.close(); rmSync(sample.base, { recursive: true, force: true });
-      if (prior === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = prior;
-      delete (globalThis as Record<string, unknown>)[`__${provider.provider.replace(/\W/g, "_")}`];
+      if (retired) {
+        store.close();
+        if (!nested) rmSync(sample.base, { recursive: true, force: true });
+        if (prior === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = prior;
+        delete (globalThis as Record<string, unknown>)[`__${provider.provider.replace(/\W/g, "_")}`];
+      }
     }
   }
 }
+
+test("genuine disposed SDK output drives both nested production checker callers", () => runCase("generated-nested-production"), 240000);
 
 test("production SDK schedules exact current seven phases, no-op cleanup, distinct Reviewer, restart reuse and ignored frozen-plan edit-restore invalidation", () => runCase("ordered"), 90000);
 test("production SDK completes finalization using the admitted token rounding remainder for the reached review charge", () => runCase("token-remainder"), 90000);
@@ -1048,16 +1261,26 @@ test("durable completed SDK review held by pause is ingested once on explicit va
 test("cancellation during real Reviewer lifecycle blocks completed receipt approval", () => runCase("cancelled-review"), 90000);
 test("failed post-cleanup production gate preserves its actual inconclusive receipt and never launches Reviewer", () => runCase("failed-gate", true), 90000);
 test("production SDK assesses two distinct required commands through every host gate before whole review", () => runCase("two-commands"), 90000);
+test("T3 production ordinary and finalization commands honor finite bounds above thirty minutes through actual subprocess timers", () =>
+  runCase("command-time-large"), 90000);
+test("T3 production finalization rejects a second command above its actual remaining stage allocation despite a large root", () =>
+  runCase("command-time-remaining"), 90000);
+test("T3 production short command expiry drains owned processes without acceptance or completion", () =>
+  runCase("command-time-expired"), 90000);
+test("T3 production supports the finite JS timer boundary without overflowing enclosing stage timers", () =>
+  runCase("command-time-timer-range"), 90000);
 test("production SDK retains genuine failing second-command evidence without final gate receipt or approval", () => runCase("failed-second-gate", true), 90000);
 test("clean production recovery report permits contained checks, completion and quiescent reopen", () => runCase("clean-report"), 90000);
 test("generated setup production SDK consumes installed backing through managed bash and real seven-phase certificate", () => runCase("generated-setup"), 90000);
 test("real contained setup failure still permits generated independent SDK diagnosis at unchanged fixture caps", () =>
   runCase("generated-setup-selective-diagnostic"), 90000);
-test("generated setup revised recovery keeps physical pin and reuses original producer through production terminal acceptance", () => runCase("generated-setup-revised-recovery"), 90000);
+// Observe the unchanged 120s mission grant plus 30s for terminal assertions and owned retirement.
+test("generated setup revised recovery keeps physical pin and reuses original producer through production terminal acceptance", () => runCase("generated-setup-revised-recovery"), 150000);
 test("generated setup production SDK success cannot mask failing managed product predicate", () => runCase("generated-setup-failing-product"), 90000);
 test("generated setup production SDK retirement disposes detached descendants before owner release and dispatch", () => runCase("generated-setup-stop"), 30000);
 test("failed generated setup permits isolated unrelated production SDK diagnosis, not dependent approval", () => runCase("generated-setup-selective"), 90000);
-test("generated healthy setup selects distinct production ordinary integrated affected and complete final predicates", () => runCase("generated-setup-selected-phases"), 90000);
+// This fixture admits 600s; the outer observer also covers terminal assertions and owned retirement.
+test("generated healthy setup selects distinct production ordinary integrated affected and complete final predicates", () => runCase("generated-setup-selected-phases"), 630000);
 test("generated production finalization retains a separate Ponytail quantum under unknown usage", () => runCase("generated-token-slack"), 90000);
 test("generated production finalization pairs request slack only with tokens remaining after ordinary unknown holds", () => runCase("generated-token-pairing"), 90000);
 for (const boundary of ["missing-pin", "changed-pin", "retargeted-pin", "wrong-root"]) {

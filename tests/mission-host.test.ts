@@ -9,9 +9,19 @@ import { openMissionStore } from "../extensions/mission/store.ts";
 import { packageRoot } from "../extensions/stack.ts";
 
 const fixtures: string[] = [];
+// These native fixtures use compact /tmp roots: the console adds a PID and UUID to its Unix socket path.
 const openFixtureStore = (fixture: MissionFixture) =>
   openMissionStore({ dbPath: fixture.dbPath, objectDir: fixture.objectDir, readOnly: true });
-afterEach(() => { for (const base of fixtures.splice(0)) rmSync(base, { recursive: true, force: true }); });
+afterEach(() => {
+  for (const base of fixtures.splice(0)) {
+    if (process.env.MISSION_T5_ARTIFACT_DIR) {
+      mkdirSync(process.env.MISSION_T5_ARTIFACT_DIR, { recursive: true });
+      // Diagnostics retain owned state; process exit alone is not a disposal certificate.
+      writeFileSync(path.join(process.env.MISSION_T5_ARTIFACT_DIR, `retained-${path.basename(base)}.json`),
+        JSON.stringify({ base, disposition: "retained; retirement and quiescence not certified" }, null, 2));
+    } else rmSync(base, { recursive: true, force: true });
+  }
+});
 
 function installSlowProvider(agentDir: string, abortReleaseFile?: string) {
   const dir = path.join(agentDir, "extensions");
@@ -73,6 +83,13 @@ function rpc(cwd: string, agentDir: string) {
       try { events.push(JSON.parse(line)); } catch { /* only JSON frames are protocol events */ }
     }
   });
+  child.once("close", (code, signal) => {
+    if (process.env.MISSION_T5_ARTIFACT_DIR) {
+      mkdirSync(process.env.MISSION_T5_ARTIFACT_DIR, { recursive: true });
+      writeFileSync(path.join(process.env.MISSION_T5_ARTIFACT_DIR, `rpc-${child.pid}.json`),
+        JSON.stringify({ cwd, agentDir, code, signal, events, stderr, unfinishedFrame: buffer }, null, 2));
+    }
+  });
   const wait = async (predicate: () => boolean) => {
     for (let i = 0; i < 1500; i++) {
       if (predicate()) return;
@@ -114,7 +131,7 @@ async function consoleInput(socket: string, text: string, proof = readFileSync(`
 }
 
 test("real Pi 0.87 TUI confirms native actions while optional console holds and revision fences an active worker", async () => {
-  const fixture = createMissionFixture("pitako-t5-tui-"); fixtures.push(fixture.base);
+  const fixture = createMissionFixture("t5-t-", "/tmp"); fixtures.push(fixture.base);
   mkdirSync(path.join(fixture.stateDir, "pitako"), { recursive: true });
   writeFileSync(path.join(fixture.stateDir, "pitako", "config.toml"), "");
   const abortReleaseFile = path.join(fixture.stateDir, "release-provider-abort");
@@ -275,7 +292,7 @@ test("real Pi 0.87 TUI confirms native actions while optional console holds and 
 }, 60_000);
 
 test.each(["current", "switch"] as const)("real Pi TUI pending native resume rechecks %s session after SDK drain", async (scenario) => {
-  const fixture = createMissionFixture("p4-drain-"); fixtures.push(fixture.base);
+  const fixture = createMissionFixture("t5-p-", "/tmp"); fixtures.push(fixture.base);
   mkdirSync(path.join(fixture.stateDir, "pitako"), { recursive: true });
   writeFileSync(path.join(fixture.stateDir, "pitako", "config.toml"), "");
   const release = path.join(fixture.stateDir, "release-provider-abort");
@@ -378,7 +395,7 @@ export default function(pi) { pi.on("session_before_switch", () => writeFileSync
 }, 60_000);
 
 test("real Pi RPC never transfers active worker on /new; startup reconciles saved authority", async () => {
-  const fixture = createMissionFixture("pitako-t5-active-"); fixtures.push(fixture.base);
+  const fixture = createMissionFixture("t5-a-", "/tmp"); fixtures.push(fixture.base);
   mkdirSync(path.join(fixture.stateDir, "pitako"), { recursive: true });
   writeFileSync(path.join(fixture.stateDir, "pitako", "config.toml"), "");
   installSlowProvider(fixture.stateDir);
@@ -450,7 +467,7 @@ test("real Pi RPC never transfers active worker on /new; startup reconciles save
 }, 90_000);
 
 test("real Pi RPC SIGKILL of active worker reconciles on startup without operator retry", async () => {
-  const fixture = createMissionFixture("pitako-t5-crash-"); fixtures.push(fixture.base);
+  const fixture = createMissionFixture("t5-k-", "/tmp"); fixtures.push(fixture.base);
   mkdirSync(path.join(fixture.stateDir, "pitako"), { recursive: true });
   writeFileSync(path.join(fixture.stateDir, "pitako", "config.toml"), "");
   installSlowProvider(fixture.stateDir);
@@ -505,7 +522,7 @@ test("real Pi RPC SIGKILL of active worker reconciles on startup without operato
 }, 90_000);
 
 test("real Pi RPC admits authenticated console actions, not forged prompts, across crash and reload", async () => {
-  const fixture = createMissionFixture("pitako-t5-host-"); fixtures.push(fixture.base);
+  const fixture = createMissionFixture("t5-h-", "/tmp"); fixtures.push(fixture.base);
   mkdirSync(path.join(fixture.stateDir, "pitako"), { recursive: true });
   writeFileSync(path.join(fixture.stateDir, "pitako", "config.toml"), "");
   const sockets = path.join(fixture.stateDir, "pitako", "console");
@@ -574,7 +591,7 @@ test("real Pi RPC admits authenticated console actions, not forged prompts, acro
 }, 60_000);
 
 test("real Pi RPC clean close drains active owner, startup resumes saved authority, manual controls stay terminal", async () => {
-  const fixture = createMissionFixture("t5-c-"); fixtures.push(fixture.base);
+  const fixture = createMissionFixture("t5-c-", "/tmp"); fixtures.push(fixture.base);
   mkdirSync(path.join(fixture.stateDir, "pitako"), { recursive: true });
   writeFileSync(path.join(fixture.stateDir, "pitako", "config.toml"), "");
   installSlowProvider(fixture.stateDir);
@@ -674,7 +691,7 @@ test("real Pi RPC clean close drains active owner, startup resumes saved authori
 }, 90_000);
 
 test("real Pi RPC fork does not acquire a running mission or launch a replacement", async () => {
-  const fixture = createMissionFixture("t5-f-"); fixtures.push(fixture.base);
+  const fixture = createMissionFixture("t5-f-", "/tmp"); fixtures.push(fixture.base);
   mkdirSync(path.join(fixture.stateDir, "pitako"), { recursive: true });
   writeFileSync(path.join(fixture.stateDir, "pitako", "config.toml"), "");
   installSlowProvider(fixture.stateDir);
@@ -739,7 +756,7 @@ test("real Pi RPC fork does not acquire a running mission or launch a replacemen
 }, 60_000);
 
 test("real Pi TUI reload retires active owner before restarting saved work", async () => {
-  const fixture = createMissionFixture("t5-r-"); fixtures.push(fixture.base);
+  const fixture = createMissionFixture("t5-r-", "/tmp"); fixtures.push(fixture.base);
   mkdirSync(path.join(fixture.stateDir, "pitako"), { recursive: true });
   writeFileSync(path.join(fixture.stateDir, "pitako", "config.toml"), "");
   installSlowProvider(fixture.stateDir);
@@ -814,6 +831,10 @@ test("real Pi TUI reload retires active owner before restarting saved work", asy
     }
     throw error;
   } finally {
+    if (process.env.MISSION_T5_ARTIFACT_DIR) {
+      mkdirSync(process.env.MISSION_T5_ARTIFACT_DIR, { recursive: true });
+      writeFileSync(path.join(process.env.MISSION_T5_ARTIFACT_DIR, "host-tui-reload-screen.log"), screen);
+    }
     store?.close();
     if (host.pid && host.exitCode === null) {
       try { process.kill(-host.pid, "SIGKILL"); } catch { /* already exited */ }
@@ -823,7 +844,7 @@ test("real Pi TUI reload retires active owner before restarting saved work", asy
 }, 60_000);
 
 test("real Pi console records display only after PTY render; missed UI and duplicate acknowledgement do not dispatch", async () => {
-  const fixture = createMissionFixture("t5-d-"); fixtures.push(fixture.base);
+  const fixture = createMissionFixture("t5-d-", "/tmp"); fixtures.push(fixture.base);
   mkdirSync(path.join(fixture.stateDir, "pitako"), { recursive: true });
   writeFileSync(path.join(fixture.stateDir, "pitako", "config.toml"), "");
   installSlowProvider(fixture.stateDir);

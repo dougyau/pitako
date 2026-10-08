@@ -7,6 +7,7 @@ import { captureWorkspaceImage, type WorkspaceManifest } from "./workspace.ts";
 import { MISSION_CHECK_IDENTITY, missionCheckRuntime } from "./checks.ts";
 import { missionInputIdentity } from "./inputs.ts";
 import { verifyExecutionBinding, type ExecutionBinding } from "../workflow.ts";
+import { assertCommandTime } from "./command-time.ts";
 
 // Binding.finalization distinguishes this engine-owned target from user units.
 export const FINALIZATION_OWNER = "mission-finalization";
@@ -94,6 +95,18 @@ export function compileFinalizationGrants(definition: MissionDefinition) {
   for (const resource of Object.keys(caps) as Array<keyof typeof caps>)
     if (ordinary[resource] + protectedAmounts[resource] > caps[resource])
       throw new Error(`mandatory path plus protected finalization needs ${ordinary[resource] + protectedAmounts[resource]} ${resource}; budget allows ${caps[resource]}`);
+  if (versioned) {
+    for (const phase of ["integrated-checks", "affected-checks", "final-gates"] as const) {
+      const selected = definition.finalization.selections?.[phase === "integrated-checks" ? "integrated" :
+        phase === "affected-checks" ? "affected" : "final"] ?? definition.finalization.requiredPredicates;
+      for (const predicate of definition.units.flatMap((unit) => unit.acceptance)
+        .filter((predicate) => predicate.kind === "command_exit" && selected.includes(predicate.id))) {
+        assertCommandTime(predicate.timeoutMs);
+        if (predicate.timeoutMs! > active)
+          throw new Error(`${phase}:${predicate.id} command timeout ${predicate.timeoutMs} ms exceeds compiled protected stage allocation ${active} ms`);
+      }
+    }
+  }
   return { protectedAmounts, active, artifacts, tokens, requestTokens,
     stages: FINALIZATION_PHASES.map((phase) => ({ phase, activeTimeMs: active, artifactBytes: artifacts,
       roleLaunches: Number(["ponytail", "cleanup", "whole-review"].includes(phase)),

@@ -8,6 +8,7 @@ import type { LegacyImportArchive, MissionEventDraft, MissionStore } from "./sto
 import type { MissionEvent } from "./model.ts";
 import type { MissionAttemptBinding } from "./engine.ts";
 import { missionInputIdentity } from "./inputs.ts";
+import { MissionSetup } from "./setup.ts";
 import {
   captureWorkspaceImage,
   captureWorkspacePaths,
@@ -787,6 +788,7 @@ export async function integrateAcceptedMissionOutputs(options: {
     causalId: reservationId, payload: { reservationId, revision: inspection.revision, resource: "artifact-bytes", amount: grant, purpose: "finalization" } }] });
   inspection = store.inspectMission(missionId);
   const workspace = createMissionWorkspace({ ...options, attemptId: stableUuid(`integration:${missionId}:${inspection.revision}:${inspection.latestSeq}`),
+    dependencyBacking: new MissionSetup(store, missionId).dependencyBacking(),
     storeRoot: store.storageRoot, allowedPaths: inspection.definition.authority.allowedPaths });
   const originalBaseImageHash = inspection.events.find((event) => event.kind === "workspace.snapshot.sealed" && event.payload.phase === "base")?.payload.imageHash;
   const contributions: Array<Record<string, unknown>> = [];
@@ -826,6 +828,7 @@ export async function integrateAcceptedMissionOutputs(options: {
     const baseSeal = sealWorkspaceImage(deliveryBase);
     const patch = createConditionalMissionPatch(deliveryBase, result);
     const disposable = createMissionWorkspace({ ...options, attemptId: stableUuid(`patch-proof:${missionId}:${inspection.revision}:${inspection.latestSeq}`),
+      dependencyBacking: new MissionSetup(store, missionId).dependencyBacking(),
       storeRoot: store.storageRoot, allowedPaths: [] });
     const reproduced = applyConditionalMissionPatch(patch, disposable);
     if (reproduced.hash !== patch.acceptedManifestHash || captureWorkspaceImage(options.sourceRoot).manifest.hash !== deliveryBase.manifest.hash)
@@ -1486,6 +1489,7 @@ export async function reconcileMission(options: ReconcileMissionOptions): Promis
       try {
         const parent = options.candidateParent ?? path.join(path.dirname(store.storageRoot), `${path.basename(store.storageRoot)}-candidates`);
         const workspace = createMissionWorkspace({
+          dependencyBacking: new MissionSetup(store, missionId).dependencyBacking(),
           missionId, attemptId: stableUuid(`${attempt.attemptId}:recovery-candidate`),
           sourceRoot: options.sourceRoot, storeRoot: store.storageRoot, candidateParent: parent,
           allowedPaths: initial.definition.authority.allowedPaths, productRoot: options.productRoot, bwrapPath: options.bwrapPath,
