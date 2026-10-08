@@ -89,6 +89,36 @@ function evaluation(missionId: string, id = randomUUID(), supersedesId: string |
 }
 
 describe("durable mission store", () => {
+  test("notification reads expose recovery blockers without loading acceptance artifacts", async () => {
+    const sample = fixture();
+    const store = await openFixtureStore(sample);
+    const mission = store.createMission(missionInput(sample));
+    try {
+      const blocked = store.appendTransition(mission.id, mission.version, { events: [{
+        revision: 1, kind: "mission.recovery.recorded", causalId: randomUUID(),
+        payload: { status: "blocked", blockers: ["unproved stopped attempt"] },
+      }] }).at(-1)!;
+      const artifact = path.join(sample.objectDir, mission.snapshot.planHash.slice(0, 2), mission.snapshot.planHash);
+      const bytes = readFileSync(artifact);
+      try {
+        rmSync(artifact);
+        expect(store.readNotifications(mission.id, 0)).toEqual([blocked]);
+        expect(store.readNotifications(mission.id, blocked.seq)).toEqual([]);
+        expect(() => store.inspectMission(mission.id)).toThrow("is missing");
+      } finally {
+        writeFileSync(artifact, bytes);
+      }
+      store.appendTransition(mission.id, store.inspectMission(mission.id).version, { events: [{
+        revision: 1, kind: "mission.notification.delivered", causalId: randomUUID(),
+        payload: { throughSeq: blocked.seq },
+      }] });
+      expect(store.readNotifications(mission.id, 0)).toEqual([]);
+    } finally {
+      acknowledgeOwnerRetirement(store, mission.id);
+      store.close();
+    }
+  });
+
   test("pre-claim observation of a canonical foreign marker never mints a local store id", async () => {
     const sample = fixture();
     const owner = await openFixtureStore(sample);

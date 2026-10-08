@@ -43,7 +43,7 @@ function fixture(): MissionFixture {
   return value;
 }
 
-async function createInterruptedAttempt(sample: MissionFixture, containedWrite = false) {
+async function createInterruptedAttempt(sample: MissionFixture, containedWrite = false, interruptedClose = false) {
   const store = await openFixtureStore(sample);
   const mission = store.createMission(missionInput(sample));
   const attemptId = randomUUID();
@@ -90,6 +90,18 @@ async function createInterruptedAttempt(sample: MissionFixture, containedWrite =
   } else {
     writeFileSync(path.join(workspace.candidateRoot, "src", "app.ts"), "export const mission = 'partial mission write';\n");
   }
+  let pauseEventId: string | undefined;
+  if (interruptedClose) {
+    const current = store.inspectMission(mission.id);
+    [pauseEventId] = store.appendTransition(mission.id, current.version, { events: [{
+      revision: mission.revision, kind: "mission.paused", causalId: randomUUID(),
+      payload: {
+        controlOrigin: "lifecycle", resumeAfterClose: true,
+        ownerEpoch: epoch, runtimeId: store.runtimeId, owner: currentProcessIdentity(store.runtimeId, epoch),
+        stoppedAttempts: [{ attemptId, bindingHash: createHash("sha256").update(JSON.stringify(binding)).digest("hex") }],
+      },
+    }] }).map(({ eventId }) => eventId);
+  }
   const current = store.inspectMission(mission.id);
   store.appendTransition(mission.id, current.version, { events: [{
     revision: mission.revision, kind: "attempt.interrupted", causalId: randomUUID(), unitId: "snapshot", attemptId,
@@ -98,7 +110,7 @@ async function createInterruptedAttempt(sample: MissionFixture, containedWrite =
   const interrupted = store.inspectMission(mission.id);
   store.appendTransition(mission.id, interrupted.version, { events: [{
     revision: mission.revision, kind: "mission.owner.released", causalId: randomUUID(),
-    payload: { owner: currentProcessIdentity(store.runtimeId, epoch), reason: "fixture process retirement", effectsQuiescent: true, resumablePause: true, interruptedAttempts: [attemptId] },
+    payload: { owner: currentProcessIdentity(store.runtimeId, epoch), reason: "fixture process retirement", effectsQuiescent: true, resumablePause: true, interruptedAttempts: [attemptId], ...(pauseEventId ? { pauseEventId } : {}) },
   }] });
   const effectId = store.inspectMission(mission.id).events.find((event) => event.kind === "effect.intent" && event.attemptId === attemptId)?.effectId ?? null;
   store.close();
@@ -204,17 +216,37 @@ async function crashUnreceiptedWrite(sample: MissionFixture, content: string) {
 }
 
 describe("durable mission reconciliation", () => {
-  test("MissionEngine restart discovers a relocated partial candidate without a caller hint", async () => {
+  test.each(["none", "interrupted", "failed-recovery"] as const)(
+    "MissionEngine restart discovers a relocated partial candidate, close %s", async (close) => {
+    const interruptedClose = close !== "none";
     const sample = fixture();
     const definition = JSON.parse(sample.definitionBytes.toString("utf8"));
     definition.budget.artifactBytes = 3 * 1024 * 1024;
     sample.definitionBytes = Buffer.from(`${JSON.stringify(definition, null, 2)}\n`);
     writeFileSync(sample.definitionFile, sample.definitionBytes);
-    const interrupted = await createInterruptedAttempt(sample);
+    const interrupted = await createInterruptedAttempt(sample, false, interruptedClose);
     const candidateArena = path.join(sample.base, "candidates");
     const relocatedRoot = path.join(candidateArena, "renamed-after-crash");
     renameSync(interrupted.candidateRoot, relocatedRoot);
     const store = await openFixtureStore(sample);
+    if (close === "failed-recovery") {
+      const sourceFile = path.join(sample.root, "src", "app.ts");
+      const sourceBytes = readFileSync(sourceFile);
+      try {
+        writeFileSync(sourceFile, "export const mission = 'conflicting source edit';\n");
+        const firstRecovery = await reconcileMission({
+          store, missionId: interrupted.missionId, sourceRoot: sample.root,
+          planFile: sample.planFile, candidateParent: candidateArena, trigger: "engine-restart",
+        });
+        expect(firstRecovery.status).toBe("blocked");
+      } finally {
+        writeFileSync(sourceFile, sourceBytes);
+      }
+      expect(store.inspectMission(interrupted.missionId).events.some((event) =>
+        event.kind === "attempt.settled" && event.attemptId === interrupted.attemptId &&
+        event.payload.recoveryDisposition === "interrupted-without-worker-result",
+      )).toBe(true);
+    }
     let checkedCandidate = "";
     let checkStatus = "";
     let checkOutput = "";
@@ -239,29 +271,44 @@ describe("durable mission reconciliation", () => {
         method: "bash grep inspected recovered candidate bytes",
       }),
     });
-    engine.start();
-    await engine.waitForIdle();
-    expect(checkedCandidate).not.toBe(relocatedRoot);
-    expect(checkedCandidate.startsWith(`${candidateArena}${path.sep}`)).toBe(true);
-    expect(readFileText(path.join(checkedCandidate, "src", "app.ts"))).toContain("partial mission write");
-    expect(readFileText(path.join(relocatedRoot, "src", "app.ts"))).toContain("partial mission write");
-    expect(engine.snapshot().units.snapshot?.status).toBe("accepted");
-    const recoveryEvents = store.inspectMission(interrupted.missionId).events;
-    const recovery = recoveryEvents.find((event) => event.kind === "mission.recovery.recorded");
-    expect(recovery).toBeDefined();
-    const recoveryReport = JSON.parse(store.readArtifact(String(recovery!.payload.reportHash)).toString("utf8"));
-    const relocation = recoveryEvents.find((event) => event.kind === "workspace.candidate.relocated" && event.attemptId === interrupted.attemptId);
-    recordT4Case(`engine-relocated-${interrupted.missionId}`, {
-      candidateRelocated: relocation?.payload.toRoot === relocatedRoot,
-      actionReport: recoveryReport,
-      exitReport: {
-        checkStatus, checkOutput,
-        preservedPartial: readFileText(path.join(checkedCandidate, "src", "app.ts")).includes("partial mission write"),
-        unitAccepted: engine.snapshot().units.snapshot?.status === "accepted",
-      },
-    });
-    await engine.close();
-    store.close();
+    try {
+      if (interruptedClose) await engine.control("resume", { id: "fixture-resume", text: "/mission resume durable-fixture" });
+      else engine.start();
+      await engine.waitForIdle();
+      const recoveryEvents = store.inspectMission(interrupted.missionId).events;
+      const blockers = recoveryEvents.filter((event) =>
+        ["mission.blocked", "mission.recovery.recorded"].includes(event.kind),
+      ).map(({ payload }) => ({ reason: payload.reason, status: payload.status, blockers: payload.blockers }));
+      expect(checkedCandidate).not.toBe(relocatedRoot);
+      expect(checkedCandidate.startsWith(`${candidateArena}${path.sep}`), JSON.stringify(blockers)).toBe(true);
+      expect(readFileText(path.join(checkedCandidate, "src", "app.ts"))).toContain("partial mission write");
+      expect(readFileText(path.join(relocatedRoot, "src", "app.ts"))).toContain("partial mission write");
+      expect(engine.snapshot().units.snapshot?.status).toBe("accepted");
+      if (close === "failed-recovery") {
+        const oldSettlements = recoveryEvents.filter((event) =>
+          event.kind === "attempt.settled" && event.attemptId === interrupted.attemptId);
+        expect(oldSettlements).toHaveLength(1);
+        expect(oldSettlements[0]!.payload.recoveryDisposition).toBe("interrupted-without-worker-result");
+        expect(missionCompletionBlockers(store.inspectMission(interrupted.missionId), store))
+          .toContain(`writer:${interrupted.attemptId}`);
+      }
+      const recovery = recoveryEvents.find((event) => event.kind === "mission.recovery.recorded");
+      expect(recovery).toBeDefined();
+      const recoveryReport = JSON.parse(store.readArtifact(String(recovery!.payload.reportHash)).toString("utf8"));
+      const relocation = recoveryEvents.find((event) => event.kind === "workspace.candidate.relocated" && event.attemptId === interrupted.attemptId);
+      recordT4Case(`engine-relocated-${interrupted.missionId}`, {
+        candidateRelocated: relocation?.payload.toRoot === relocatedRoot,
+        actionReport: recoveryReport,
+        exitReport: {
+          checkStatus, checkOutput,
+          preservedPartial: readFileText(path.join(checkedCandidate, "src", "app.ts")).includes("partial mission write"),
+          unitAccepted: engine.snapshot().units.snapshot?.status === "accepted",
+        },
+      });
+    } finally {
+      await engine.close();
+      store.close();
+    }
   }, 30_000);
 
   test.each(["applied", "partial"] as const)("MissionEngine recovers renamed missing-receipt %s image without candidate hints", async (mode) => {

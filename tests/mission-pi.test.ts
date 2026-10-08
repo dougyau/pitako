@@ -219,9 +219,9 @@ test("replacement confirmation invalidates prior prompt; native prepare and type
       expect(revised.revision).toBe(2);
       expect(revised.definition.units[0]!.acceptance[0]!.target).toBe("native target");
       expect(revised.events.find(({ kind }) => kind === "mission.revised")?.payload.operatorReceipt).toMatchObject({ source: "native-confirmation" });
-      const preview = JSON.parse(host.prompts.at(-1)!);
-      expect(preview.choice.edits[0]).toEqual({ target: { kind: "predicate", id: "snapshot-present", field: "target" },
-        before: mission.definition.units[0]!.acceptance[0]!.target, after: "native target" });
+      const preview = host.prompts.at(-1)!;
+      expect(preview).toContain(`predicate snapshot-present.target: ${JSON.stringify(mission.definition.units[0]!.acceptance[0]!.target)} → "native target"`);
+      expect(preview).not.toContain("definitionHash");
       await host.command("pause durable-fixture");
       expect(reader.inspectMission(mission.id).state).toBe("paused");
       await host.command("cancel durable-fixture");

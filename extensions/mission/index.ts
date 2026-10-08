@@ -21,7 +21,7 @@ import { loadPitakoConfig } from "../roles/load.ts";
 import { bindPreparationAnswer, bindPreparationAuthority, bindPreparationSetup, invalidatePreparationRequest,
   openPreparationRequest, preparationAnswerText, preparationAuthorityText, preparationContext, preparationSetupText,
   preparedAdmissionText, validatePreparation, preparationIssue, PreparationBindingError, type PreparationRequest } from "./preparation.ts";
-import { preparationView } from "./preparation-view.ts";
+import { confirmMissionAction, missionActionView, preparationView } from "./preparation-view.ts";
 import type { MissionDefinition } from "./model.ts";
 import type { SetupAllocation } from "./setup.ts";
 import { inspectManagedMission } from "../agent/managed-mission.ts";
@@ -63,6 +63,7 @@ export function registerMissionExtension(pi: ExtensionAPI) {
   let consoleSocket: Awaited<ReturnType<typeof openMissionConsole>> | undefined;
   let store: MissionStore | undefined;
   let engine: MissionEngine | undefined;
+  let attachedMission: { id: string; planId: string } | undefined;
   let session: string | undefined;
   let ticker: ReturnType<typeof setInterval> | undefined;
   const pendingDisplay = new Map<string, { missionId: string; throughSeq: number; eventIds: string[] }>();
@@ -99,6 +100,7 @@ export function registerMissionExtension(pi: ExtensionAPI) {
       runRole: createPiMissionRunner({ cwd: ctx.cwd, executor: createPiExecutor() }),
       // No injectable assessor: MissionEngine uses the bound production checker.
       managedWorkspace: { sourceRoot: ctx.cwd } });
+    attachedMission = { id: mission.id, planId: mission.planId };
     return { mission, engine };
   };
   const status = (ctx: { cwd: string }, db: MissionStore) => {
@@ -132,19 +134,20 @@ export function registerMissionExtension(pi: ExtensionAPI) {
     return JSON.stringify(await readMissionObservation({ ...query, missionId }, root));
   };
   const notifications = (ctx: { cwd: string; hasUI: boolean; ui: { notify(text: string, kind?: "info" | "error"): void } }) => {
-    if (!ctx.hasUI || !store || store.ownerEpoch === null) return;
-    const mission = store.findManagedMission(ctx.cwd);
-    if (!mission) return;
+    if (!ctx.hasUI || !store || store.ownerEpoch === null || !attachedMission) return;
+    const mission = attachedMission;
     if (uiMissionId !== mission.id) { uiMissionId = mission.id; uiCursor = 0; }
     const sessionId = idOf(ctx as { sessionManager?: { getSessionId(): string } });
     if (!sessionId) return;
-    const cursor = Math.max(uiCursor, mission.events.filter((event) => event.kind === "mission.notification.delivered")
-      .reduce((seq, event) => Math.max(seq, Number(event.payload.throughSeq)), 0));
-    const latest = mission.events.filter((event) => event.seq > cursor &&
-      ["unit.accepted", "unit.blocked", "mission.completed", "mission.revised", "mission.blocked"].includes(event.kind));
+    const latest = store.readNotifications(mission.id, uiCursor);
     if (!latest.length) return;
     const visible = latest.filter((event) => event.kind !== "unit.blocked" || !latest.some((later) => later.kind === "mission.blocked" && later.seq > event.seq));
-    ctx.ui.notify(visible.map((event) => `${event.kind}: ${event.unitId ?? mission.planId} @${event.revision}`).join("\n"), "info");
+    ctx.ui.notify(visible.map((event) => {
+      const reason = typeof event.payload.reason === "string" ? event.payload.reason :
+        Array.isArray(event.payload.blockers) ? event.payload.blockers.join("; ") : undefined;
+      const recovery = event.kind === "mission.recovery.recorded" ? ` (${event.payload.status})` : "";
+      return `${event.kind}: ${event.unitId ?? mission.planId} @${event.revision}${recovery}${reason ? ` — ${reason}` : ""}`;
+    }).join("\n"), "info");
     // Pi notify has no display acknowledgement; only the console's post-render receipt advances the durable cursor.
     uiCursor = latest.at(-1)!.seq;
   };
@@ -214,6 +217,7 @@ export function registerMissionExtension(pi: ExtensionAPI) {
     if (engine) await engine.retireForShutdown(event.reason);
     else store?.close();
     engine = undefined;
+    attachedMission = undefined;
     session = undefined;
     store = undefined;
   });
@@ -368,7 +372,7 @@ export function registerMissionExtension(pi: ExtensionAPI) {
       if (verb === "prepare") {
         const parsed = validateMissionFiles(root, id!);
         const existing = db?.findManagedMission(root);
-        return { ownership, physical, root, text, source: realpathSync(parsed.plan), sourceHash: sha256(parsed.planBytes),
+        return { ownership, physical, root, text, planId: id!, source: realpathSync(parsed.plan), sourceHash: sha256(parsed.planBytes),
           sourceRevision: parsed.metadata.revision, definitionSource: realpathSync(parsed.definition),
           sourceIdentity: identity(parsed.plan), definitionIdentity: identity(parsed.definition),
           definitionHash: sha256(parsed.definitionBytes), definition: JSON.parse(parsed.definitionBytes.toString("utf8")),
@@ -386,7 +390,7 @@ export function registerMissionExtension(pi: ExtensionAPI) {
       const names = files(root, mission.planId);
       const pin = mission.prepared ? missionInputIdentity(mission, root) : undefined;
       if (verb === "start" && mission.prepared?.setup) assertSetupInputs(mission.prepared.setup);
-      return { ownership, physical, root, text, missionId: mission.id, revision: mission.revision,
+      return { ownership, physical, root, text, planId: mission.planId, missionId: mission.id, revision: mission.revision,
         currentConfigHash: sha256(Buffer.from(JSON.stringify(loadPitakoConfig({ cwd: root })))),
         planHash: mission.snapshot.planHash, definitionHash: mission.snapshot.definitionHash, state,
         preparedHash: mission.snapshot.preparedHash, pin,
@@ -404,8 +408,15 @@ export function registerMissionExtension(pi: ExtensionAPI) {
     try {
       const before = await observe();
       live();
-      const accepted = await ctx.ui.confirm(`Confirm mission ${verb}`, JSON.stringify({ action: verb,
-        ...("choice" in before ? { typedPayload: before.choice } : {}), ...before }, null, 2));
+      const accepted = await confirmMissionAction(ctx.ui, {
+        title: `Confirm mission ${verb}`,
+        summary: missionActionView({ action: verb!, planId: before.planId,
+          revision: "revision" in before ? before.revision : before.sourceRevision, root,
+          definition: before.definition, ...("state" in before ? { state: before.state, choice: before.choice } : {}) }),
+        acceptLabel: `${verb === "start" ? "Start" : verb === "resume" ? "Resume" : verb === "pause" ? "Pause" :
+          verb === "cancel" ? "Cancel" : verb === "revise" ? "Revise" : "Prepare"} mission`,
+        details: () => JSON.stringify({ action: verb, ...before }, null, 2), check: live,
+      });
       live();
       if (accepted !== true) return "Confirmation declined or dismissed; nothing changed.";
       const after = await observe();
@@ -434,7 +445,14 @@ export function registerMissionExtension(pi: ExtensionAPI) {
         const mission = db.findManagedMission(root)!;
         if (mission.prepared?.setup && !mission.prepared.setup.identity.copy) {
           const setupText = setupStartText(db, mission.id, sessionId);
-          const confirmed = await ctx.ui.confirm("Confirm exact setup execution", setupText);
+          const allocation = mission.prepared.setup.decision.values;
+          const confirmed = await confirmMissionAction(ctx.ui, {
+            title: "Confirm exact setup execution", acceptLabel: "Run setup",
+            summary: `Plan: ${mission.planId} @${mission.revision}\nExecution root: ${root}\n` +
+              `Run scripts/setup.sh before dispatching workers.\nWrites: ${allocation.writableDirectories.join(", ")}\n` +
+              `Setup limits: ${allocation.activeTimeMs / 60000} min; ${allocation.artifactBytes} bytes (within mission limits).`,
+            details: () => setupText, check: () => { live(); recheck(db); },
+          });
           live();
           recheck(db);
           if (confirmed !== true) return "Setup execution declined; no setup or worker started.";
@@ -523,12 +541,16 @@ Make supported technical choices autonomously. Propose explicit permissions and 
       if (!decisions.length) return { ...result, authority: "proposal-only", message: "Restore missing mappings or resolve specific unsupported issues; no confirmation or admission." };
       if (current.exactDetails) display(current.ctx, JSON.stringify({ context: preparationContext(current.request),
         issues: result.issues, decisions: decisions.map((text) => JSON.parse(text)) }, null, 2));
-      const accepted = await current.ctx.ui.confirm("Preparation questions — explicit decisions, not estimate approval by default",
-        preparationView({ action: "preparation-authority / source-meaning / setup effects",
+      const accepted = await confirmMissionAction(current.ctx.ui, {
+        title: "Preparation questions — explicit decisions, not estimate approval by default",
+        acceptLabel: "Authorize preparation",
+        summary: preparationView({ action: "preparation-authority / source-meaning / setup effects",
           context: preparationContext(current.request), definition: definition!, setup: params.setup,
-          setupDestination: decisions.map((text) => JSON.parse(text)).find(({ action }) => action === "preparation-setup-effects")
-            ?.identity.copy?.destination,
-          issues: result.issues, interpretations: params.interpretations }));
+          interpretations: params.interpretations }),
+        details: () => JSON.stringify({ context: preparationContext(current.request),
+          issues: result.issues, decisions: decisions.map((text) => JSON.parse(text)) }, null, 2),
+        check,
+      });
       check();
       if (accepted !== true) { discardDraft(); return { state: "dismissed", authority: "proposal-only", message: "Nothing admitted; repeat /mission prepare to reauthor." }; }
       if (JSON.stringify(decisions) !== JSON.stringify(decisionTexts()))
@@ -556,11 +578,15 @@ Make supported technical choices autonomously. Propose explicit permissions and 
     check();
     if (current.exactDetails) display(current.ctx, JSON.stringify({ action: JSON.parse(text), preparedHash: result.digest,
       prepared, observed: before }, null, 2));
-    const accepted = await current.ctx.ui.confirm("Confirm exact prepared mission — not start",
-      preparationView({ action: "admit-prepared-mission", context: preparationContext(current.request),
+    const accepted = await confirmMissionAction(current.ctx.ui, {
+      title: "Confirm exact prepared mission — not start", acceptLabel: "Prepare mission",
+      summary: preparationView({ action: "admit-prepared-mission", context: preparationContext(current.request),
         definition: prepared.definition, setup: prepared.setup?.decision.values,
-        setupDestination: prepared.setup?.identity.copy?.destination, issues: result.issues }) +
-      `\nStatus: ${result.status}\nNext action: ${result.nextAction}\nExact binding: ${result.digest}\nOptional JSON: /mission prepare-details before submitting a proposal.`);
+      }),
+      details: () => JSON.stringify({ action: JSON.parse(text), preparedHash: result.digest,
+        prepared, observed: before }, null, 2),
+      check,
+    });
     check();
     if (accepted !== true) { discardDraft(); return { state: "dismissed", authority: "proposal-only", message: "Nothing admitted; repeat /mission prepare." }; }
     let claimValidated = false;

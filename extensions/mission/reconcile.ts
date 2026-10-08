@@ -1008,6 +1008,12 @@ export function readMissionLocator(repositoryRoot: string, planId: string): Miss
 export async function reconcileMission(options: ReconcileMissionOptions): Promise<RecoveryReport> {
   const { store, missionId } = options;
   const initial = store.inspectMission(missionId);
+  // Recovery can account for a lost result without proving a terminal SDK pause.
+  const lostResultSettlements = new Set(initial.events.filter((event) =>
+    event.kind === "attempt.settled" && event.payload.status === "failed" &&
+    event.payload.resultHash === null &&
+    event.payload.recoveryDisposition === "interrupted-without-worker-result",
+  ).map((event) => event.eventId));
   const scopedImage = (image: WorkspaceImage) => initial.definition.finalization.contractVersion === 1
     ? image : filterWorkspaceImage(image, initial.definition.authority.allowedPaths);
   const ownerProof = store.ownerAcquisitionProof;
@@ -1031,6 +1037,13 @@ export async function reconcileMission(options: ReconcileMissionOptions): Promis
         initial.events.some((row) => row.kind === "mission.recovery.continuation.recorded" &&
           row.payload.continuationId === (event.payload.binding as MissionAttemptBinding).recoveryContinuationId &&
           (row.payload.lifecycle as LifecycleRecovery | undefined)?.sourceAttemptId === stopped.attemptId)))) continue;
+    // A close intent is not a completed SDK pause. A successor with an acquired
+    // owner proof must reconcile an unreceipted attempt through crash recovery.
+    if (pauseTargets?.payload.controlOrigin === "lifecycle" &&
+      ["owner-death", "retirement"].includes(owner.source) &&
+        !initial.events.some((event) => event.attemptId === stopped.attemptId &&
+          (event.kind === "attempt.receipt" ||
+            event.kind === "attempt.settled" && !lostResultSettlements.has(event.eventId)))) continue;
     try {
       const reserved = initial.events.find((event) => event.kind === "attempt.reserved" && event.attemptId === stopped.attemptId);
       if (initial.definition.finalization.contractVersion === 1 && pauseTargets?.payload.controlOrigin === "lifecycle" &&
@@ -1129,7 +1142,8 @@ export async function reconcileMission(options: ReconcileMissionOptions): Promis
   }));
   const pending = attempts.filter(({ attemptId }) => {
     const relevant = initial.events.filter((event) => event.attemptId === attemptId || event.payload.attemptId === attemptId);
-    return !relevant.some((event) => event.kind === "attempt.settled") && (
+    return !relevant.some((event) => event.kind === "attempt.settled" &&
+      !lostResultSettlements.has(event.eventId)) && (
       relevant.some((event) => event.kind === "attempt.interrupted") ||
       (relevant.some((event) => event.kind === "attempt.started") && !relevant.some((event) => event.kind === "attempt.receipt"))
     );
@@ -1712,7 +1726,9 @@ export async function reconcileMission(options: ReconcileMissionOptions): Promis
       });
     }
   }
-  for (const attempt of ordinaryPending) drafts.push({
+  for (const attempt of ordinaryPending.filter(({ attemptId }) => !initial.events.some((event) =>
+    event.attemptId === attemptId && event.kind === "attempt.settled",
+  ))) drafts.push({
     revision: initial.revision, kind: "attempt.settled", attemptId: attempt.attemptId,
     unitId: attempt.event.unitId ?? undefined,
     causalId: stableUuid(`attempt-recovered-without-result:${episodeId}:${attempt.attemptId}`),

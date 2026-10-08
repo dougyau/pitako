@@ -789,7 +789,31 @@ export class MissionStore {
     return this.inspectMission(input.missionId);
   }
 
+  /** Display-only events; admission still requires inspectMission and its artifact checks. */
+  readNotifications(missionId: string, afterSeq: number): MissionEvent[] {
+    requireUuid(missionId, "missionId");
+    return this.db.prepare(`SELECT * FROM mission_events
+      WHERE mission_id = ? AND seq > MAX(?, COALESCE((
+        SELECT MAX(CAST(json_extract(payload_json, '$.throughSeq') AS INTEGER))
+        FROM mission_events WHERE mission_id = ? AND kind = 'mission.notification.delivered'
+      ), 0)) AND kind IN (
+        'attempt.started', 'unit.accepted', 'unit.blocked', 'mission.completed',
+        'mission.revised', 'mission.blocked', 'mission.recovery.recorded'
+      ) ORDER BY seq`).all(missionId, afterSeq, missionId).map(readEvent);
+  }
+
   inspectMission(missionId: string): MissionInspection {
+    return this.readInspection(missionId, true);
+  }
+
+  /** Accounting only: this projection is not evidence for dispatch, effects or acceptance. */
+  readActiveTimeAccounting(missionId: string): Pick<MissionInspection, "revision" | "version" | "state" | "reservations"> {
+    const inspection = this.readInspection(missionId, false);
+    return { revision: inspection.revision, version: inspection.version,
+      state: reduceMissionEvents(inspection).state, reservations: inspection.reservations };
+  }
+
+  private readInspection(missionId: string, hydratePrepared: boolean): MissionInspection {
     requireUuid(missionId, "missionId");
     this.db.exec("BEGIN");
     try {
@@ -799,7 +823,7 @@ export class MissionStore {
         if (Number(size.count) > 5000 || Number(size.bytes) > 8 * 1024 * 1024)
           throw new MissionStoreError("history_authority_limit");
       }
-      const inspection = this.inspectWithinTransaction(missionId);
+      const inspection = this.inspectWithinTransaction(missionId, hydratePrepared);
       this.db.exec("COMMIT");
       return inspection;
     } catch (error) {
@@ -853,7 +877,12 @@ export class MissionStore {
 
     const row = this.requireMissionRow(missionId);
     if (number(row.version, "version") !== expectedVersion) throw new MissionStoreError(`mission version conflict: expected ${expectedVersion}, observed ${String(row.version)}`);
-    const inspection = this.inspectMission(missionId);
+    // Only an existing window's measured charge can avoid reloading setup proof.
+    // Any mixed transition, new grant, effect or acceptance keeps full inspection.
+    const checkpointOnly = !artifacts.length && drafts.length === 2 &&
+      drafts[0]!.kind === "budget.reservation.settled" && drafts[1]!.kind === "mission.active.window.checkpointed";
+    const inspection = checkpointOnly ? this.readInspection(missionId, false) : this.inspectMission(missionId);
+    if (checkpointOnly) this.assertActiveTimeCheckpoint(inspection, drafts);
     const budget = inspection.definition.budget;
     let projected = reduceMissionEvents(inspection);
     const newDrafts = drafts.filter((_, index) => !existing[index]);
@@ -969,7 +998,10 @@ export class MissionStore {
       if (newDrafts.some((draft) => draft.kind === "mission.completed")) this.onDurabilityBoundary?.("completion.before-commit");
     });
     if (drafts.some((draft) => draft.kind === "mission.completed")) this.onDurabilityBoundary?.("completion.after-commit");
-    return this.inspectMission(missionId).events.slice(number(row.latest_seq, "latest_seq"));
+    return checkpointOnly
+      ? this.db.prepare("SELECT * FROM mission_events WHERE mission_id = ? AND seq > ? ORDER BY seq")
+        .all(missionId, number(row.latest_seq, "latest_seq")).map(readEvent)
+      : this.inspectMission(missionId).events.slice(number(row.latest_seq, "latest_seq"));
   }
 
   completeMission(missionId: string, expectedVersion: number): void {
@@ -1423,7 +1455,30 @@ export class MissionStore {
     }
   }
 
-  private inspectWithinTransaction(missionId: string): MissionInspection {
+  private assertActiveTimeCheckpoint(inspection: MissionInspection, drafts: MissionEventDraft[]): void {
+    const [settlement, checkpoint] = drafts;
+    const charge = settlement!.payload;
+    const tick = checkpoint!.payload;
+    const window = [...inspection.events].reverse().find((event) =>
+      event.kind === "mission.active.window.opened" || event.kind === "mission.active.window.closed");
+    const reservation = inspection.reservations.find(({ id }) => id === tick.reservationId);
+    if (!window || window.kind !== "mission.active.window.opened" ||
+      window.payload.windowId !== tick.windowId || window.payload.reservationId !== tick.reservationId ||
+      window.payload.runtimeId !== this.runtimeId || window.payload.ownerEpoch !== this.ownerEpoch ||
+      reduceMissionEvents(inspection).state === "paused" ||
+      drafts.some((draft) => draft.revision !== inspection.revision) ||
+      !reservation || reservation.resource !== "active-time-ms" || reservation.purpose !== "ordinary" ||
+      charge.resource !== reservation.resource ||
+      charge.reservationId !== reservation.id || !Number.isSafeInteger(tick.durationMs) || Number(tick.durationMs) < 1 ||
+      tick.cumulativeKnownMs !== reservation.knownCharge + Number(tick.durationMs) ||
+      charge.knownCharge !== tick.cumulativeKnownMs || charge.unknownCharge !== reservation.unknownCharge ||
+      charge.released !== reservation.released || tick.measured !== true ||
+      Number(charge.knownCharge) + reservation.unknownCharge + reservation.released >= reservation.grantAmount) {
+      throw new MissionStoreError("active-time checkpoint must charge the current owned window without renewing authority");
+    }
+  }
+
+  private inspectWithinTransaction(missionId: string, hydratePrepared = true): MissionInspection {
     const mission = this.requireMissionRow(missionId);
     const revision = this.db.prepare("SELECT * FROM revisions WHERE mission_id = ? AND revision = ?").get(missionId, mission.revision);
     if (!revision) throw new MissionStoreError("mission revision projection is missing");
@@ -1462,12 +1517,14 @@ export class MissionStore {
     if (schemaVersion === 2) {
       if (!snapshot.preparedHash || !OBJECT_HASH.test(snapshot.preparedHash) || !snapshot.sourceBinding)
         throw new MissionStoreError("generated snapshot lacks prepared source identity");
-      prepared = JSON.parse(this.readObject(snapshot.preparedHash).toString()) as PreparedMission;
-      if (prepared.format !== "prepared-mission-v1" || prepared.inventory.sourceHash !== sha256(Buffer.from(prepared.originalSource)) ||
-        json(prepared.binding) !== json(snapshot.sourceBinding) || json(prepared.definition) !== json(definition) ||
-        prepared.binding.hash !== prepared.inventory.sourceHash || prepared.binding.planSource !== snapshot.sourcePath ||
-        repositoryIdentity(prepared.binding.executionRoot) !== prepared.repositoryFamily)
-        throw new MissionStoreError("immutable prepared inputs do not match generated snapshot");
+      if (hydratePrepared) {
+        prepared = JSON.parse(this.readObject(snapshot.preparedHash).toString()) as PreparedMission;
+        if (prepared.format !== "prepared-mission-v1" || prepared.inventory.sourceHash !== sha256(Buffer.from(prepared.originalSource)) ||
+          json(prepared.binding) !== json(snapshot.sourceBinding) || json(prepared.definition) !== json(definition) ||
+          prepared.binding.hash !== prepared.inventory.sourceHash || prepared.binding.planSource !== snapshot.sourcePath ||
+          repositoryIdentity(prepared.binding.executionRoot) !== prepared.repositoryFamily)
+          throw new MissionStoreError("immutable prepared inputs do not match generated snapshot");
+      }
     }
     if (definition.schemaVersion !== schemaVersion) throw new MissionStoreError("executable definition and snapshot versions differ");
     const unitMapping = definition.units.map(({ id, parentId }) => ({ id, ...(parentId ? { parentId } : {}) }));

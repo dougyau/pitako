@@ -920,6 +920,96 @@ describe("mission reducer and frontier pump", () => {
     store.close();
   });
 
+  test("periodic active-time checkpoint charges the running window and retains its grant", async () => {
+    const sample = fixture([unit("only")]);
+    const { store, record } = await mission(sample);
+    let clock = 0;
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const engine = new MissionEngine({
+      store, missionId: record.id, sessionsDirectory: path.join(sample.stateDir, "pitako", "sessions"),
+      now: () => clock, assessPredicate: assessAll,
+      runRole: async () => {
+        entered.resolve();
+        await release.promise;
+        return result("local worker completed");
+      },
+    });
+    try {
+      engine.start();
+      await entered.promise;
+      const before = store.readActiveTimeAccounting(record.id).reservations.find(({ resource, purpose }) =>
+        resource === "active-time-ms" && purpose === "ordinary")!;
+      clock = 100;
+      for (let turn = 0; turn < 50; turn++) {
+        if (store.readActiveTimeAccounting(record.id).reservations.find(({ id }) => id === before.id)?.knownCharge === 100) break;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      const inspection = store.inspectMission(record.id);
+      expect(inspection.events.find(({ kind }) => kind === "mission.active.window.checkpointed")?.payload)
+        .toMatchObject({ reservationId: before.id, durationMs: 100, cumulativeKnownMs: 100, measured: true });
+      expect(inspection.reservations.find(({ id }) => id === before.id)).toMatchObject({
+        grantAmount: before.grantAmount, knownCharge: 100, unknownCharge: 0, released: 0,
+        remainingHold: before.grantAmount - 100,
+      });
+      expect(engine.snapshot().admissionFenced).toBe(false);
+      release.resolve();
+      await engine.waitForIdle();
+    } finally {
+      release.resolve();
+      await engine.close();
+      store.close();
+    }
+  }, 10000);
+
+  test.each([
+    { elapsed: 2500, exhausted: false },
+    { elapsed: 9500, exhausted: true }, // Fits the root ceiling, but would borrow beta's minimum.
+    { elapsed: 12000, exhausted: true },
+  ])("pause charges $elapsed ms without mistaking a quantum for the root budget", async ({ elapsed, exhausted }) => {
+    const sample = fixture([unit("alpha"), unit("beta", ["alpha"])]);
+    const { store, record } = await mission(sample);
+    const entered = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    let clock = 0;
+    const engine = new MissionEngine({
+      store, missionId: record.id, sessionsDirectory: path.join(sample.stateDir, "pitako", "sessions"),
+      now: () => clock, assessPredicate: assessAll,
+      runRole: async (_input, { signal }) => {
+        signal!.addEventListener("abort", () => finish.resolve(), { once: true });
+        entered.resolve();
+        await finish.promise;
+        return result("stopped");
+      },
+    });
+    try {
+      engine.start();
+      await entered.promise;
+      const before = store.inspectMission(record.id);
+      const original = before.reservations.find(({ resource, purpose }) => resource === "active-time-ms" && purpose === "ordinary")!;
+      const protectedTime = before.reservations.filter(({ resource, purpose }) => resource === "active-time-ms" && purpose === "protected");
+      expect(original.grantAmount).toBe(1000);
+      clock = elapsed;
+      await engine.control("pause");
+      const after = store.inspectMission(record.id);
+      expect(engine.snapshot().activeTimeMs).toBe(elapsed);
+      expect(engine.snapshot().admissionFenced).toBe(exhausted);
+      expect(after.reservations.find(({ id }) => id === original.id)?.grantAmount).toBe(original.grantAmount);
+      expect(after.reservations.filter(({ resource, purpose }) => resource === "active-time-ms" && purpose === "protected")).toEqual(protectedTime);
+      expect(after.reservations.filter(({ resource, purpose }) => resource === "active-time-ms" && purpose === "ordinary")
+        .reduce((sum, row) => sum + row.knownCharge, 0)).toBe(elapsed);
+      expect(after.events.filter(({ kind }) => kind === "attempt.reserved")).toHaveLength(1);
+      expect(store.replayMission(record.id).reservations).toEqual(after.reservations);
+      clock += 60000;
+      await engine.close();
+      expect(engine.snapshot().activeTimeMs).toBe(elapsed);
+    } finally {
+      finish.resolve();
+      await engine.close();
+      store.close();
+    }
+  });
+
   test("reserves one short active-time quantum then persists measured duration through reopen", async () => {
     const sample = fixture([unit("only")], { activeTimeMs: 12000, roleLaunches: 12 });
     const { store, record } = await mission(sample);

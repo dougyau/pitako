@@ -10,6 +10,7 @@ import { createMissionFixture } from "./mission-fixtures.ts";
 import { installMissionLocalProvider } from "./mission-local-provider.ts";
 import { createAgentSession, DefaultResourceLoader, SessionManager } from "@earendil-works/pi-coding-agent";
 import { packageRoot } from "../extensions/stack.ts";
+import { confirmMissionAction, missionActionView } from "../extensions/mission/preparation-view.ts";
 
 const oldDir = process.env.PI_CODING_AGENT_DIR, bases: string[] = [];
 afterEach(() => {
@@ -45,6 +46,86 @@ function host(f: ReturnType<typeof fixture>) {
     emit: async (name: string) => { for (const fn of handlers.get(name) ?? []) await fn({ reason: "reload" }, ctx); },
     submit: (params: unknown) => tools.get("mission_prepare").execute("author", params, undefined, undefined, ctx) };
 }
+
+test("mission confirmation shows concise actions; viewing details is not consent", async () => {
+  const f = fixture(), h = host(f);
+  try {
+    await h.command("prepare durable-fixture");
+    const context = contextFromMessage(h.messages[0]!);
+    const proposal = authoringProposal(context);
+    const views: string[] = [], details: string[] = [];
+    let selections = 0;
+    Object.assign(h.ctx.ui, {
+      select: async (title: string, options: string[]) => {
+        views.push(title);
+        expect(options).toEqual([selections < 2 ? "Authorize preparation" : "Prepare mission", "View details", "Cancel"]);
+        return ++selections === 1 ? "View details" : options[0];
+      },
+      editor: async (_title: string, text: string) => {
+        details.push(text);
+        expect(existsSync(f.dbPath)).toBe(false);
+        return '{"budget":{"tokens":1}}'; // Viewer edits must not alter the bound proposal.
+      },
+    });
+    const result = JSON.parse((await h.submit({ id: "durable-fixture", requestId: context.requestId, proposal })).content[0].text);
+    expect(result.status).toBe("ready");
+    expect(details).toHaveLength(1);
+    expect(JSON.parse(details[0]!).decisions[0].values.budget).toEqual(proposal.definition.budget);
+    expect(views.every((view) => view.length < 1600 && !view.includes("definitionHash"))).toBe(true);
+    const db = await openMissionStore({ dbPath: f.dbPath, objectDir: f.objectDir, readOnly: true });
+    try {
+      const mission = db.findManagedMission(f.root)!;
+      expect(mission.definition.budget).toEqual(proposal.definition.budget);
+      expect(mission.events.some(({ kind }) => kind === "mission.activated")).toBe(false);
+    } finally { db.close(); }
+  } finally { await h.emit("session_shutdown"); }
+});
+
+test("cancel or expired details cannot approve a mission action", async () => {
+  let live = true, selections = 0;
+  const ui: Parameters<typeof confirmMissionAction>[0] = {
+    select: async () => ++selections === 1 ? "View details" : "Cancel",
+    editor: async () => undefined,
+    confirm: async () => { throw new Error("Unexpected legacy confirmation"); },
+  };
+  const input = { title: "Confirm mission start", summary: "Start the prepared mission", acceptLabel: "Start mission",
+    details: () => '{"exact":"payload"}', check: () => { if (!live) throw new Error("expired"); } };
+  expect(await confirmMissionAction(ui, input)).toBe(false);
+  selections = 0;
+  ui.editor = async () => { live = false; return undefined; };
+  await expect(confirmMissionAction(ui, input)).rejects.toThrow("expired");
+  expect(selections).toBe(1);
+});
+
+test("start and resume summaries disclose effects and limits without dumping the definition", async () => {
+  const f = fixture(), h = host(f);
+  try {
+    await h.command("prepare durable-fixture");
+    const context = contextFromMessage(h.messages[0]!);
+    const definition = authoringProposal(context).definition;
+    definition.budget.tokens = 64000000;
+    definition.budget.activeTimeMs = 24960 * 60000;
+    definition.budget.artifactBytes = 208 * 1024 ** 3;
+    const original = JSON.stringify(definition);
+    for (const action of ["start", "resume"]) {
+      const text = missionActionView({ action, planId: "durable-fixture", revision: 7, root: f.root,
+        state: action === "start" ? "prepared" : "paused", definition });
+      expect(text).toContain("Plan: durable-fixture @7");
+      expect(text).toContain(f.root);
+      expect(text).toContain("provider requests");
+      expect(text).toContain("64M tokens");
+      expect(text).toContain("17 d 8 h");
+      expect(text).toContain("208 GiB");
+      expect(text).toContain("ceilings, not estimates");
+      expect(text).toContain("current inputs are rechecked");
+      expect(text.length).toBeLessThan(1400);
+      expect(text).not.toContain("rolePolicies");
+      expect(text).not.toContain("definitionHash");
+      expect(text).toContain(action === "start" ? "Start implementation workers" : "Continue unfinished work");
+    }
+    expect(JSON.stringify(definition)).toBe(original);
+  } finally { await h.emit("session_shutdown"); }
+});
 
 test.each(["request", "session", "root", "source", "config", "omission", "replace", "dismiss", "shutdown", "switch",
   "reload", "source-wait", "config-wait", "source-identity"] as const)(
@@ -104,8 +185,8 @@ test("authority refusal is no grant; grouped source interpretation is explicitly
     h.confirm(async (title, text) => {
       expect(title).toContain("Preparation questions");
       expect(text).toContain("Preserve diagnostics unless incompatible");
-      expect(text).toContain("preparation-interpretation");
-      expect(text).toContain("providerRequests");
+      expect(text).toContain("Source decision");
+      expect(text).toContain("provider requests");
       return false;
     });
     expect(JSON.parse((await h.submit(params())).content[0].text).state).toBe("dismissed");
@@ -121,8 +202,8 @@ test("authority refusal is no grant; grouped source interpretation is explicitly
     try {
       expect(db.findManagedMission(f.root)?.prepared?.answers).toHaveLength(context.inventory.unresolved.length);
       const preview = prompts.at(-1)!;
-      expect(preview).toStartWith("Action: admit-prepared-mission");
-      expect(preview).toContain(JSON.stringify(context.roles.developer.primary));
+      expect(preview).toStartWith("Plan: durable-fixture @");
+      expect(preview).toContain("no setup, provider or worker runs");
       expect(db.findManagedMission(f.root)?.prepared?.originalSource).toContain("Preserve diagnostics unless incompatible");
     } finally { db.close(); }
   } finally { await h.emit("session_shutdown"); }
@@ -188,14 +269,18 @@ test("readable native view preserves exact finite budgets and optional canonical
     expect(result.nextAction).toContain("/mission start durable-fixture");
     for (const text of prompts) {
       expect(text).not.toStartWith("{");
-      expect(text).toContain(`Source: ${context.binding.planSource}`);
       expect(text).toContain(`Execution root: ${f.root}`);
-      for (const [key, value] of Object.entries(proposal.definition.budget)) expect(text).toContain(`${key}=${value}`);
-      expect(text).toContain("Setup allocation: none proposed");
-      expect(text).toContain("Role developer:");
-      expect(text).toContain("nested verification not granted");
-      expect(text).toContain("ordinary contained command only; nested verification not selected");
-      expect(text).toContain("no setup, command, provider or worker runs");
+      const budget = proposal.definition.budget;
+      expect(text).toContain(`${budget.roleLaunches} role launches`);
+      expect(text).toContain(`${budget.providerRequests} provider requests`);
+      expect(text).toContain(`${budget.tokens} tokens`);
+      expect(text).toContain(`${budget.activeTimeMs / 60000} min`);
+      expect(text).toContain(`${budget.artifactBytes} bytes`);
+      expect(text).toContain("Setup: none");
+      expect(text).toContain("no nested checker");
+      expect(text).toContain("no setup, provider or worker runs");
+      expect(text).not.toContain("rolePolicies");
+      expect(text).not.toContain(proposal.definition.authority.rolePolicies.developer!.hash);
     }
     const details = h.notices.filter((text) => text.startsWith("{")).map((text) => JSON.parse(text));
     expect(details.at(-1).prepared.definition).toEqual(proposal.definition);
@@ -236,19 +321,16 @@ test.each(["grant-only", "selected", "cancelled", "stale"] as const)(
       }
       expect(prompts.length).toBeGreaterThan(0);
       for (const text of prompts) {
-        expect(text).toContain("sealed-nested-verification-v1 granted; used only by commands explicitly selecting");
-        for (const [key, value] of Object.entries(proposal.definition.budget)) expect(text).toContain(`${key}=${value}`);
-        expect(text).toContain("no setup, command, provider or worker runs");
+        expect(text).toContain("Offline nested checker authorized");
+        expect(text).toContain("no host writes, credentials or network");
+        expect(text).toContain("Workers remain restricted");
+        expect(text).toContain("Mission budget:");
+        expect(text).toContain("no setup, provider or worker runs");
         expect(text).toContain("separate execution consent");
         if (scenario === "grant-only") {
-          expect(text).toContain("ordinary contained command only; nested verification not selected");
-          expect(text).not.toContain("sealed-nested-verification-v1 selected:");
+          expect(text).toContain("0 selected checks only");
         } else {
-          expect(text).toContain("sealed-nested-verification-v1 selected: nested namespaces and private IPC");
-          expect(text).toContain("no host writes, host credentials or external connectivity");
-          expect(text).toContain("extra kernel capability relative to workers");
-          expect(text).not.toContain("proof-0: command_exit (node --check src/a) — ordinary contained command only");
-          expect(text).toContain("proof-1: command_exit (node --check src/a) — ordinary contained command only");
+          expect(text).toContain("1 selected checks only");
         }
       }
       if (scenario === "cancelled" || scenario === "stale") expect(existsSync(f.dbPath)).toBe(false);
@@ -319,8 +401,8 @@ test.each(["valid", "infeasible", "malformed"] as const)("proposed %s setup dist
     let prompts = 0;
     h.confirm(async (_title, text) => {
       prompts++;
-      expect(text).toContain("Setup allocation (inside root budgets)");
-      expect(text).toContain("artifactBytes=16384");
+      expect(text).toContain("Setup: writes node_modules");
+      expect(text).toContain("16384 bytes, within mission limits");
       return true;
     });
     const result = JSON.parse((await h.submit({ id: "durable-fixture", requestId: context.requestId, proposal,
@@ -359,9 +441,10 @@ test("native copied setup confirms exact bounds/destination and settles while pr
     proposal.definition.budget = { ...proposal.definition.budget, roleLaunches: 100, providerRequests: 100, artifactBytes: 8000000000 };
     h.confirm(async (_title, text) => {
       expect(existsSync(path.join(f.root, "node_modules"))).toBe(false);
-      expect(text).toContain("Output bounds (exact): paths=20; largestFileBytes=100; totalBytes=100");
-      expect(text).toContain(`Private setup destination: ${path.join(realpathSync(os.tmpdir()), "pitako-setup-")}`);
-      expect(text).toContain(seed);
+      expect(text).toContain("Setup: prepare node_modules");
+      expect(text).not.toContain("bytes/file");
+      expect(text).not.toContain("Setup output limits");
+      expect(text).toContain("Private copies, network denied");
       return true;
     });
     const result = JSON.parse((await h.submit({ id: "durable-fixture", requestId: context.requestId, proposal,

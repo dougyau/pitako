@@ -1057,8 +1057,9 @@ test("cancel before start fences copied setup; cancellation is not cleanup or su
   }
 }, 60000);
 
-async function setupMission(script: string | undefined) {
+async function setupMission(script: string | undefined, kind: "implementation" | "check" = "implementation") {
   const sample = preparedFixture(script);
+  for (const unit of sample.proposal.definition.units) unit.kind = kind;
   if (script === undefined) {
     mkdirSync(path.join(sample.executionRoot, "node_modules"));
     writeFileSync(path.join(sample.executionRoot, "node_modules/dependency"), "preexisting");
@@ -1081,6 +1082,98 @@ async function setupMission(script: string | undefined) {
   };
   return { ...sample, store, mission, producer, start };
 }
+
+test("active-time checkpoints do not hydrate setup proof or authorize work without it", async () => {
+  const sample = await setupMission(undefined);
+  const { store, mission } = sample;
+  const reservationId = crypto.randomUUID();
+  const windowId = crypto.randomUUID();
+  const preparedHash = mission.snapshot.preparedHash!;
+  const object = path.join(sample.fixture.objectDir, preparedHash.slice(0, 2), preparedHash);
+  const bytes = readFileSync(object);
+  try {
+    store.appendTransition(mission.id, store.inspectMission(mission.id).version, { events: [
+      { revision: 1, kind: "reservation.created", causalId: crypto.randomUUID(), payload: {
+        reservationId, resource: "active-time-ms", amount: 1000, purpose: "ordinary", phase: "active",
+        expiresAt: "2099-01-01T00:00:00.000Z",
+      } },
+      { revision: 1, kind: "mission.active.window.opened", causalId: crypto.randomUUID(), payload: {
+        windowId, reservationId, runtimeId: store.runtimeId, ownerEpoch: store.ownerEpoch,
+      } },
+    ] });
+    writeFileSync(object, "corrupt prepared proof");
+    const charge = (durationMs: number, selectedWindow = windowId) => [
+      { revision: 1, kind: "budget.reservation.settled", causalId: crypto.randomUUID(), payload: {
+        reservationId, resource: "active-time-ms", knownCharge: durationMs, unknownCharge: 0, released: 0,
+      } },
+      { revision: 1, kind: "mission.active.window.checkpointed", causalId: crypto.randomUUID(), payload: {
+        windowId: selectedWindow, reservationId, durationMs, cumulativeKnownMs: durationMs, measured: true,
+      } },
+    ];
+    const before = store.readActiveTimeAccounting(mission.id);
+    expect(() => store.appendTransition(mission.id, before.version, { events: charge(10, crypto.randomUUID()) }))
+      .toThrow(/current owned window/);
+    expect(() => store.appendTransition(mission.id, before.version, { events: charge(1000) }))
+      .toThrow(/current owned window/);
+    const recorded = store.appendTransition(mission.id, before.version, { events: charge(10) });
+    expect(recorded.map(({ kind }) => kind)).toEqual(["budget.reservation.settled", "mission.active.window.checkpointed"]);
+    const after = store.readActiveTimeAccounting(mission.id);
+    expect(after.reservations.find(({ id }) => id === reservationId)).toMatchObject({
+      grantAmount: 1000, knownCharge: 10, unknownCharge: 0, released: 0, remainingHold: 990,
+    });
+    expect(() => store.appendTransition(mission.id, before.version, { events: charge(20) })).toThrow(/version conflict/);
+    expect(() => store.inspectMission(mission.id)).toThrow(/SHA-256 check/);
+    expect(() => store.appendTransition(mission.id, after.version, { events: [
+      { revision: 1, kind: "mission.input.visible", causalId: crypto.randomUUID(), payload: {} },
+    ] })).toThrow(/SHA-256 check/);
+    expect(store.readActiveTimeAccounting(mission.id).version).toBe(after.version);
+    writeFileSync(object, bytes);
+    expect(store.inspectMission(mission.id).snapshot.preparedHash).toBe(preparedHash);
+  } finally {
+    writeFileSync(object, bytes);
+    store.close();
+    rmSync(sample.fixture.base, { recursive: true, force: true });
+  }
+});
+
+test("reserved worker brief retains setup instructions and proof reference, not the host manifest", async () => {
+  const sample = await setupMission(undefined, "check");
+  const delivered: string[] = [];
+  const engine = new MissionEngine({
+    store: sample.store, missionId: sample.mission.id,
+    sessionsDirectory: path.join(sample.fixture.base, "sessions"),
+    runRole: async ({ brief }) => {
+      delivered.push(brief);
+      throw new Error("fixture stops after observing the reserved brief; no provider request");
+    },
+  });
+  try {
+    engine.start();
+    await engine.waitForIdle();
+    expect(delivered.length).toBeGreaterThan(0);
+    const inspection = sample.store.inspectMission(sample.mission.id);
+    const binding = inspection.events.find(({ kind }) => kind === "attempt.reserved")!.payload.binding as {
+      briefArtifactHash: string; briefHash: string;
+    };
+    expect(sample.store.readArtifact(binding.briefArtifactHash).toString()).toBe(delivered[0]!);
+    expect(sha256(Buffer.from(JSON.stringify(delivered[0]!)))).toBe(binding.briefHash);
+    const contextLine = delivered[0]!.split("\n").find((line) => line.startsWith("Original frozen source and procedure: "))!;
+    const context = JSON.parse(contextLine.slice("Original frozen source and procedure: ".length));
+    expect(context.setup.preparedHash).toBe(inspection.snapshot.preparedHash);
+    expect(context.setup.requiredBy).toEqual(inspection.prepared!.setup!.requiredBy);
+    expect(context.setup.readiness.state).toBe("missing-script");
+    expect(context.setup.instruction).toContain("Setup is host-owned");
+    expect(context.setup.instruction).toContain("Do not repeat installation");
+    expect(context.setup.contract).toBeUndefined();
+    expect(context.source).toBe(inspection.prepared!.originalSource);
+    expect(context.gates).toEqual(inspection.prepared!.gates);
+    expect(JSON.stringify(context.setup).length).toBeLessThan(2000);
+  } finally {
+    await engine.close();
+    sample.store.close();
+    rmSync(sample.fixture.base, { recursive: true, force: true });
+  }
+}, 30000);
 
 test("setup authority is separately host issued; no proposal/bash/replayed/alias authority", () => {
   const sample = preparedFixture("printf installed > node_modules/dependency\n");

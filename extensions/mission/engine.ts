@@ -2202,7 +2202,8 @@ export class MissionEngine {
     }) + (inspection.prepared ? `\nOriginal frozen source and procedure: ${JSON.stringify({
       source: inspection.prepared.originalSource, inventory: inspection.prepared.inventory,
       mappings: inspection.prepared.mappings, gates: inspection.prepared.gates,
-      setup: inspection.prepared.setup ? { readiness: this.setup.observe(), contract: inspection.prepared.setup,
+      setup: inspection.prepared.setup ? { readiness: this.setup.observe(inspection),
+        preparedHash: inspection.snapshot.preparedHash, requiredBy: inspection.prepared.setup.requiredBy,
         instruction: "Setup is host-owned. Do not repeat installation; dependency backing stays read-only." } : null,
     })}` : "") + (singleton ? `\n${singleton.appendix}` : "");
     const inputBindings = team ? [] : capturePredicateInputBindings(
@@ -4391,7 +4392,9 @@ export class MissionEngine {
 
   private async checkActiveTime(): Promise<void> {
     const window = this.activeWindow;
-    if (!window || this.snapshot().state === "paused") return;
+    if (!window) return;
+    const accounting = this.store.readActiveTimeAccounting(this.missionId);
+    if (accounting.state === "paused") return;
     const now = this.now();
     const elapsed = window.fractionalMs + Math.max(0, now - window.lastCheckpointAt);
     const duration = Math.floor(elapsed);
@@ -4402,24 +4405,23 @@ export class MissionEngine {
     }
     const remaining = window.grantAmount - window.knownCharge - window.unknownCharge - window.released;
     if (duration < remaining) {
-      const inspection = this.store.inspectMission(this.missionId);
-      const reservation = inspection.reservations.find(({ id }) => id === window.reservationId);
+      const reservation = accounting.reservations.find(({ id }) => id === window.reservationId);
       if (!reservation) throw new Error(`active-time reservation disappeared for window ${window.id}`);
-      this.emit([
-        this.reservationSettlement(inspection.revision, reservation, {
+      this.store.appendTransition(this.missionId, accounting.version, { events: [
+        this.reservationSettlement(accounting.revision, reservation, {
           knownCharge: window.knownCharge + duration,
           unknownCharge: window.unknownCharge,
           released: window.released,
           source: "mission active-time checkpoint",
         }, `${window.id}:checkpoint:${window.knownCharge + duration}`),
-        this.event(inspection.revision, "mission.active.window.checkpointed", `${window.id}:checkpoint:${window.knownCharge + duration}`, {
+        this.event(accounting.revision, "mission.active.window.checkpointed", `${window.id}:checkpoint:${window.knownCharge + duration}`, {
           windowId: window.id,
           reservationId: window.reservationId,
           durationMs: duration,
           cumulativeKnownMs: window.knownCharge + duration,
           measured: true,
         }),
-      ]);
+      ] });
       window.knownCharge += duration;
       window.fractionalMs = elapsed - duration;
       window.lastCheckpointAt = now;
@@ -4458,9 +4460,39 @@ export class MissionEngine {
     const inspection = this.store.inspectMission(this.missionId);
     const reservation = inspection.reservations.find(({ id }) => id === window.reservationId);
     if (!reservation) throw new Error(`active-time reservation disappeared for window ${window.id}`);
-    const knownCharge = window.knownCharge + measuredDuration;
+    const tail = Math.max(0, measuredDuration - (window.grantAmount - window.knownCharge - window.unknownCharge - window.released));
+    const events: MissionEventDraft[] = [];
+    let fundedTail = 0;
+    if (tail > 0 && reservation.purpose === "ordinary") {
+      try {
+        // A quantum is a checkpoint interval, not a new deadline. Closing does
+        // not start work; finance already measured time without borrowing floors.
+        this.requireRootSlack(inspection, "active-time-ms", tail);
+        fundedTail = tail;
+      } catch (error) {
+        if (!(error instanceof RecoveryAdmissionError)) throw error;
+        // No capacity: preserve the actual overage rather than dropping time.
+      }
+    }
+    if (fundedTail) {
+      const reservationId = stableId(`${window.id}:closing-tail`);
+      events.push(
+        this.event(inspection.revision, "reservation.created", `${window.id}:closing-tail-grant`, {
+          reservationId, revision: inspection.revision, resource: "active-time-ms", amount: fundedTail, purpose: "ordinary",
+        }),
+        this.event(inspection.revision, "budget.reservation.settled", `${window.id}:closing-tail-settlement`, {
+          reservationId, resource: "active-time-ms", knownCharge: fundedTail, unknownCharge: 0, released: 0,
+          source: "measured active-time tail at close",
+        }),
+        this.event(inspection.revision, "mission.active.duration", `${window.id}:closing-tail-duration`, {
+          windowId: window.id, reservationId, durationMs: fundedTail, measured: true,
+        }, undefined, undefined, undefined, fundedTail),
+      );
+    }
+    const knownCharge = window.knownCharge + measuredDuration - fundedTail;
     const released = Math.max(0, window.grantAmount - knownCharge - window.unknownCharge);
     this.emit([
+      ...events,
       this.reservationSettlement(inspection.revision, reservation, {
         knownCharge,
         unknownCharge: window.unknownCharge,
@@ -4470,7 +4502,7 @@ export class MissionEngine {
       this.event(inspection.revision, "mission.active.window.closed", `${window.id}:closed`, {
         windowId: window.id,
         reservationId: window.reservationId,
-        durationMs: measuredDuration,
+        durationMs: measuredDuration - fundedTail,
         knownCharge,
         unknownCharge: window.unknownCharge,
         measured: true,
