@@ -32,6 +32,42 @@ function writeConfig(configPath: string, text: string): void {
 }
 
 describe("role and model policy resolution", () => {
+  test("shipped roles distinguish assignment completion from independent acceptance", () => {
+    const { env } = tempAgent();
+    const developer = resolveRole("developer", { env }).instructions;
+    for (const contract of [
+      "Do not hand back an ordinary implementation problem you can resolve",
+      "Verification-only work establishes the requested observations and relevant bindings",
+      "not another complete semantic review",
+      "Diagnosis-only work does not authorize repair",
+      "cleanup may conclude with no useful edits",
+      "Debugging guidance cannot turn diagnosis into permission to edit",
+      "requested outcome, necessary cleanup, and evidence recording are complete",
+    ]) expect(developer).toContain(contract);
+    const reviewer = resolveRole("reviewer", { env }).instructions;
+    for (const contract of [
+      "An explicit consultation answers its question",
+      "prior finding, intervening change, and affected contracts",
+      "Neither is final approval",
+      "unspecified change-review request requires the complete relevant diff",
+      "complete agreed final diff, underlying evidence, and relevant effects",
+      "does not automatically authorize causal investigation",
+      "Inspect available relevant evidence before declaring a gap",
+      "indispensable missing observation, its effect on the decision, and the next feasible authorized capture",
+      "An inconclusive consultation does not accept an incomplete implementation",
+      "A material final-review gap remains a finding",
+    ]) expect(reviewer).toContain(contract);
+  });
+
+  test("user instructions replace built-ins without rewriting an already resolved role", () => {
+    const { env, configPath } = tempAgent();
+    const delivered = resolveRole("developer", { env });
+    writeConfig(configPath, '[roles.developer]\ninstructions = "custom.md"\n');
+    writeFileSync(path.join(path.dirname(configPath), "custom.md"), "User-defined instructions");
+    expect(resolveRole("developer", { env }).instructions).toBe("User-defined instructions");
+    expect(delivered.instructions).toContain("Verification-only work");
+  });
+
   test("built-in roles resolve without a user config and do not read the home config", () => {
     expect(getPitakoConfigPath({})).toBe(path.join(homedir(), ".pi", "agent", "pitako", "config.toml"));
     const { env, configPath } = tempAgent();

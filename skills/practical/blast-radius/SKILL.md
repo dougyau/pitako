@@ -21,19 +21,19 @@ Then look where those tools stop: wire formats, DB columns, generated names, ano
 
 ## How sure are you
 
-For each safety fact, get as far down this list as is cheap, and say where it stopped.
+Choose evidence appropriate to the stated claim using `verify-behavior`'s shared evidence policy.
 
 1. You said so. Worthless on its own.
 2. You pointed at the line. A real `file:line`, or the library's own source.
-3. You walked the failure and it cannot reach.
-4. You ran it. A script or test that calls the real code and fails loud if you are wrong.
+3. You walked the failure and it cannot reach. A bounded static reachability argument supports that static claim.
+4. You ran it. A script or test that calls the real code and fails loud if you are wrong. Compatible prior execution supports what it actually observed.
 
-Any safety fact that does not reach step 4 is unproven. Say so.
+Neither static reachability nor prior execution proves unobserved dynamic behavior. Require new execution for a concrete dynamic uncertainty or required gate, not every safety assertion. State what the evidence establishes and what remains unproven.
 
 ## Output
 
 - **What it does.** Including the part the diff does not spell out.
-- **The one fact it is safe because of.** State it, say which step you reached, show the proof or mark it unproven.
+- **The one fact it is safe because of.** State the claim, show its evidence, and name its limits.
 - **Risks.** Real ones only. Each names how it breaks, a `file:line`, likelihood, cost, and how to check.
 - **Cleared.** What you checked and why it is fine.
 - **Before you merge.** The cheapest test or repro that would catch the real bug.

@@ -79,6 +79,8 @@ Build a WorkBrief for the current unit only:
 
 - plan id and revision
 - frozen unit id, outcome, and objective
+- assigned purpose, requested result, and completion condition, distinct from broader unit or final acceptance
+- relevant candidate and base identity, and permitted effects
 - relevant scope and invariants
 - acceptance criteria and expected evidence
 - relevant prerequisites and rulings
@@ -87,15 +89,19 @@ Build a WorkBrief for the current unit only:
 - consequential premise conclusions from the actual caller or integration path, including decisive sources, producers, consumers, and capability or authority limits
 - relevant files or systems
 
+Distinguish implementation, diagnosis, verification-only work, cleanup, consultation, correction review, and final review when the distinction changes responsibility. These are natural-language descriptions, not dispatch modes or a mandatory form. Keep genuinely coupled questions together; calling a multi-contract assignment bounded does not make it narrow.
+
 Carry the source and force of consequential restrictions within these fields. User requirements, product contracts, frozen invariants, acceptance conditions, and actual authorization limits remain binding. Repository observations remain evidence with their limits and unresolved uncertainty. Technical suggestions remain choices where the frozen contract permits alternatives.
 
 Before dispatch, compare the brief with the frozen unit and relevant rulings. Do not omit obligations or turn an optional technical restriction into a binding prohibition. Do not relabel a frozen invariant or acceptance condition as advisory because its author was the planner.
 
 Label evidence as accepted, advisory, failed, or unavailable according to its actual source. A worker claim is not accepted evidence. Keep relevant valid evidence even when it is old. Exclude obsolete or unrelated context. Do not send the parent transcript or every Board topic.
 
+Supply resolved references to actual reusable evidence and identify what remains uncovered under `verify-behavior`'s shared policy. Do not require rediscovery of artifacts, reconciliation of every earlier report, or a replacement report merely for a handoff. Existing required reports, identity checks, and managed receipts remain required.
+
 Local subdivision stays local. A future Developer Team head may choose implementation steps and assignments inside the unit. Those assignments do not replace global acceptance or authorize replanning. Preserve the frozen envelope and the Level 1 and Level 2 decision rules.
 
-Developer implements. Reviewer adversarially challenges the complete relevant diff and evidence against affected contracts, concrete risks, and frozen criteria using `verify-behavior`. Reviewer reports findings and never fixes. Architect answers only an architecture question. Researcher fills only a real knowledge gap. If any delegation fails, report the error; failure never transfers specialist authority to the Coordinator. Do not perform that role yourself. Keep at most one Developer role active, without exception.
+Developer implements and owns ordinary in-scope diagnosis and correction for implementation assignments. Verification-only work does not add a semantic review; diagnosis-only work does not authorize repair; cleanup can be a no-op. Return after the assigned outcome, necessary cleanup, and evidence recording. Reviewer independently judges the assigned consultation or change using `verify-behavior`, reports findings, and never fixes. Consultation and correction review are not final approval; unspecified change review covers the complete relevant diff, and final review covers the complete agreed final diff, underlying evidence, and relevant effects. Architect answers only an architecture question. Researcher fills only a real knowledge gap. If any delegation fails, report the error; failure never transfers specialist authority to the Coordinator. Do not perform that role yourself. Keep at most one Developer role active, without exception.
 
 When neither `agent_run` nor `team_assign` nor `agent_spawn` is registered, implement inline with the same plan, ledger, evidence, and verification rules. A failed, stalled, cancelled, or lost delegation does not authorize inline specialist work.
 
@@ -117,7 +123,7 @@ Apply that policy within the plan's required gates. Use `verify-behavior` for di
 
 Route project procedures through `verify-behavior`'s shared root `GATES.md` interpretation using `binding.executionRoot`. Reference the guide and relevant obligations in the WorkBrief, not its whole body. Cross-check consequential claims and use existing discovery for uncovered obligations; frozen requirements remain controlling.
 
-If verification fails, the same Developer reproduces, finds the root cause, makes the smallest correction, and verifies again. Do not ask the user, call Architect, or switch to a stronger model merely because a check failed.
+If verification fails in an implementation assignment, the same Developer reproduces, finds the root cause, makes the smallest in-scope correction, and verifies again. Diagnosis-only and verification-only assignments retain their permitted effects. Do not ask the user, call Architect, or switch to a stronger model merely because a check failed.
 
 Known focused diagnosis and correction remain with the Developer, regardless of failure count. Consult for an identified design, knowledge, authority or correctness question: Architect resolves a missing design decision; Reviewer assesses an existing proposal. Resolve missing context through focused inspection. When useful, `verify-behavior` offers optional JEV consultation orientation using the assigned result, scope, proposal, established evidence, remaining uncertainty and actual specialist question when known. Advice is not a WorkBrief, dispatch or authority. Missing advice creates no installation task or mandatory consultation. If evidence shows the implementation shape is wrong but the plan envelope still holds, ask Architect, record a Level 2 amendment, and continue. If no solution preserves the envelope, return `USER_DECISION_REQUIRED`. Independent final review remains required and is never waived by advice.
 
@@ -129,7 +135,7 @@ Design-time ordering guidance does not authorize skipping or reordering frozen u
 
 Ponytail is the first defense. After all units are verified and material findings are resolved, make one deliberate Ponytail pass over the complete finished diff. This pass comes before `remove-ai-slops` and final gates; it does not replace Ponytail during implementation. Apply `verify-behavior`'s deletion rule to tests and their infrastructure: identify the guarantee and where it remains demonstrated, or why the contract no longer applies. Preserve uncertain cases and distinct guarantees.
 
-Run affected focused checks after that pass. They must be green before `remove-ai-slops`.
+Require current sufficient passing affected-check evidence after that pass. Affected checks must be green before `remove-ai-slops`. Apply `verify-behavior`'s reuse policy: rerun only when edits or other relevant changes invalidate evidence, or an applicable gate requires a new observation. A no-op pass alone does not require duplicate checks.
 
 Run `remove-ai-slops` only when the change justifies it: multi-file work, a new abstraction, a refactor, repeated patterns, several workers, or a Reviewer note about needless complexity. Skip it for a tiny mechanical edit, not after every edit.
 

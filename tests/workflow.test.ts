@@ -315,18 +315,30 @@ describe("plan and execute contracts", () => {
   });
 
   test("ordinary handoffs preserve frozen intent and bounded current obligations", () => {
-    const brief = execute.slice(execute.indexOf("Build a WorkBrief"), execute.indexOf("Developer implements."));
+    const briefStart = execute.indexOf("Build a WorkBrief");
+    const briefEnd = execute.indexOf("Developer implements");
+    expect(briefStart).toBeGreaterThanOrEqual(0);
+    expect(briefEnd).toBeGreaterThan(briefStart);
+    const brief = execute.slice(briefStart, briefEnd);
     for (const field of [
       "plan id and revision", "frozen unit id, outcome, and objective", "relevant scope and invariants",
       "acceptance criteria and expected evidence", "relevant prerequisites and rulings",
       "upstream contracts or evidence references", "current unresolved obligations",
       "relevant prior failures", "consequential premise conclusions", "actual caller or integration path",
+      "assigned purpose, requested result, and completion condition",
+      "distinct from broader unit or final acceptance",
+      "candidate and base identity, and permitted effects",
     ]) expect(brief).toContain(field);
     expect(brief).toContain("accepted, advisory, failed, or unavailable according to its actual source");
     expect(brief).toContain("A worker claim is not accepted evidence");
     expect(brief).toContain("Keep relevant valid evidence even when it is old");
     expect(brief).toContain("Exclude obsolete or unrelated context");
     expect(brief).toContain("Do not send the parent transcript");
+    expect(brief).toContain("natural-language descriptions, not dispatch modes or a mandatory form");
+    expect(brief).toContain("resolved references to actual reusable evidence");
+    expect(brief).toContain("identify what remains uncovered");
+    expect(brief).toContain("replacement report merely for a handoff");
+    expect(brief).toContain("Existing required reports, identity checks, and managed receipts remain required");
     expect(brief).toContain("Local subdivision stays local");
     expect(brief).toContain("future Developer Team head");
     expect(brief).toContain("do not replace global acceptance or authorize replanning");
@@ -394,7 +406,7 @@ describe("plan and execute contracts", () => {
     expect(verify).toContain("Partial logs, skipped checks, interrupted output, stale artifacts, or the same command string alone are insufficient");
     expect(verify).toContain("A host predicate and a worker diagnostic command can be different obligations");
     expect(verify).toContain("Evidence from one binding does not satisfy a different required binding");
-    expect(verify).toContain("inputs, environment, contract, and required phase or binding remain compatible");
+    expect(verify).toContain("inputs, environment, contract, completeness, and required phase or binding remain compatible");
     expect(verify).toContain("Do not discard valid evidence solely because it is old");
     expect(verify).toContain("Relevant edits after a pass invalidate affected conclusions, not every independent observation");
     expect(verify).toContain("It never cancels a mandatory gate or independent review");
@@ -536,7 +548,7 @@ describe("plan and execute contracts", () => {
 
   test("execute and pre-pr order cleanup before final gates and review", () => {
     const finalPonytail = execute.indexOf("one deliberate Ponytail pass over the complete finished diff");
-    const preCleanupChecks = execute.indexOf("Run affected focused checks after that pass", finalPonytail);
+    const preCleanupChecks = execute.indexOf("Require current sufficient passing affected-check evidence", finalPonytail);
     const deslopPass = execute.indexOf("Run `remove-ai-slops` only", preCleanupChecks);
     const postCleanupChecks = execute.indexOf("After cleanup, rerun checks invalidated by the edits", deslopPass);
     const finalGates = execute.indexOf("Run final gates after all edits", postCleanupChecks);
@@ -548,6 +560,14 @@ describe("plan and execute contracts", () => {
     expect(finalGates).toBeGreaterThan(postCleanupChecks);
     expect(finalReview).toBeGreaterThan(finalGates);
     expect(execute).toContain("must be green before `remove-ai-slops`");
+    for (const policy of [execute, prePr]) {
+      expect(policy).toContain("current sufficient passing affected-check evidence");
+      expect(policy.toLowerCase()).toContain("rerun only when edits or other relevant changes invalidate evidence");
+      expect(policy).toContain("an applicable gate requires a new observation");
+      expect(policy).toContain("A no-op pass alone does not require duplicate checks");
+    }
+    expect(execute).not.toContain("Run affected focused checks after that pass");
+    expect(prePr).not.toContain("5. Run affected focused checks.");
     expect(execute).toContain("complete final diff");
     expect(execute).toContain("An evidenced A-only cleanup does not require a second review solely for cleanup when adequate independent review already covers it");
     expect(execute).toContain("B or uncertain changes need an independent Reviewer on the complete final diff");
@@ -555,13 +575,13 @@ describe("plan and execute contracts", () => {
     expect(execute).toContain("rerun affected checks and applicable final gates");
 
     const prePrPonytail = prePr.indexOf("make one final Ponytail pass over the whole scoped diff");
-    const prePrChecks = prePr.indexOf("Run affected focused checks.", prePrPonytail);
+    const prePrChecks = prePr.indexOf("Require current sufficient passing affected-check evidence", prePrPonytail);
     const prePrDeslop = prePr.indexOf("apply `remove-ai-slops` selectively to durable prose", prePrChecks);
-    const prePrAfterChecks = prePr.indexOf("Rerun affected checks after prose edits", prePrDeslop);
+    const prePrAfterChecks = prePr.indexOf("Rerun checks invalidated by prose edits", prePrDeslop);
     const prePrGates = prePr.indexOf("Run applicable final gates", prePrAfterChecks);
     expect(prePrPonytail).toBeGreaterThanOrEqual(0);
     expect(prePrChecks).toBeGreaterThan(prePrPonytail);
-    expect(prePr.indexOf("Once they are green", prePrChecks)).toBeLessThan(prePrDeslop);
+    expect(prePr.indexOf("Once affected checks are green", prePrChecks)).toBeLessThan(prePrDeslop);
     expect(prePrDeslop).toBeGreaterThan(prePrChecks);
     expect(prePrAfterChecks).toBeGreaterThan(prePrDeslop);
     expect(prePrGates).toBeGreaterThan(prePrAfterChecks);

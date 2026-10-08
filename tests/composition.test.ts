@@ -117,6 +117,11 @@ describe("engineering-layer composition", () => {
     const blast = readRepo("skills/practical/blast-radius/SKILL.md");
     expect(blast).toContain("codegraph_impact");
     expect(blast).toContain("Do not run an arena");
+    expect(blast).toContain("bounded static reachability argument supports that static claim");
+    expect(blast).toContain("Compatible prior execution supports what it actually observed");
+    expect(blast).toContain("Neither static reachability nor prior execution proves unobserved dynamic behavior");
+    expect(blast).toContain("new execution for a concrete dynamic uncertainty or required gate");
+    expect(blast).not.toContain("Any safety fact that does not reach step 4 is unproven");
 
     const rootCause = readRepo("skills/principles/principle-fix-root-causes/SKILL.md");
     expect(rootCause).toContain("do not fix symptoms");
@@ -124,6 +129,23 @@ describe("engineering-layer composition", () => {
     const caveman = readRepo("skills/caveman/SKILL.md");
     expect(caveman).toContain("Use **lite** unless the user asks");
     expect(caveman).not.toContain("Must always apply.");
+  });
+
+  test("loaded shared evidence policy preserves assignment and managed boundaries", async () => {
+    const loaded = await loadPitako(packageRoot());
+    const skill = loaded.loader.getSkills().skills.find((entry) => entry.name === "verify-behavior");
+    expect(skill).toBeDefined();
+    const verify = readFileSync(skill!.filePath, "utf8");
+    for (const contract of [
+      "Inspect the artifact, not a prior worker's summary",
+      "A handoff, role change, or no-op cleanup does not itself invalidate evidence",
+      "Missing, conflicting, incomplete, or invalidated evidence requires the appropriate check",
+      "findings-only authority, structured responses and receipts, affected-checks phases",
+      "current phase and binding evidence",
+      "containment, ownership, disposal, host acceptance, completion checks, or final independent review",
+      "Completing an assigned observation or consultation is not acceptance",
+      "Continue useful authorized diagnosis",
+    ]) expect(verify).toContain(contract);
   });
 
   test("/pitako status lists the catalog without loading the Ponytail extension", async () => {
