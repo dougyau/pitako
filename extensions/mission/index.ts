@@ -15,12 +15,13 @@ import { parsePlanDocument } from "../workflow.ts";
 import { packageRoot } from "../stack.ts";
 import { metricCommand } from "./metrics.ts";
 import { getPitakoDataDir } from "../board/paths.ts";
-import { admitSetupStart, assertSetupInputs, setupStartText, type SetupStartAdmission } from "./setup.ts";
+import { admitSetupStart, assertSetupInputs, MissionSetup, setupStartText, type SetupStartAdmission } from "./setup.ts";
 import { missionInputIdentity } from "./inputs.ts";
 import { loadPitakoConfig } from "../roles/load.ts";
 import { bindPreparationAnswer, bindPreparationAuthority, bindPreparationSetup, invalidatePreparationRequest,
   openPreparationRequest, preparationAnswerText, preparationAuthorityText, preparationContext, preparationSetupText,
-  preparedAdmissionText, validatePreparation, type PreparationRequest } from "./preparation.ts";
+  preparedAdmissionText, validatePreparation, preparationIssue, PreparationBindingError, type PreparationRequest } from "./preparation.ts";
+import { preparationView } from "./preparation-view.ts";
 import type { MissionDefinition } from "./model.ts";
 import type { SetupAllocation } from "./setup.ts";
 import { inspectManagedMission } from "../agent/managed-mission.ts";
@@ -33,11 +34,14 @@ const usage = `Use /mission prepare|start|pause|resume|cancel <plan-id>
 /mission revise <plan-id> answer <question-id> (prompt for bounded values)
 /mission revise <plan-id> withdraw <question-id>
 /mission status; /mission inspect [mission-id|plan-id] [--unit <id>] [--attempt <id>] [--cursor <token>]
+/mission prepare-details (show exact JSON alongside the next preparation confirmation)
 /mission metrics; /mission export [directory]
 /mission console (explicit optional compatibility socket)
-Prepare queues assisted Markdown authoring to this coordinator. The mission_prepare tool submits an untrusted mapped proposal; grouped authority/semantic questions precede an exact preview and confirmation. No mission JSON is required. Confirmation leaves it prepared; start is separate and confirms execution/setup. Dismissed or stale drafts require prepare again.
+Prepare queues assisted Markdown authoring to this coordinator. The mission_prepare tool submits an untrusted mapped proposal; grouped authority/semantic questions precede an exact preview and confirmation. No mission JSON is required. Confirmation leaves it prepared and runs admitted copied setup, if required; start is separate and confirms worker execution. Legacy v1 setup remains start-scoped. Dismissed or stale drafts require prepare again.
 /mission prepare-file <plan-id> (explicit legacy Markdown/JSON compatibility)
-Changes require native confirmation in this principal TUI session. Prepare starts no setup or worker. Pi and installed extensions are trusted to receive confirmation, not to attest human origin.`;
+Changes require native confirmation in this principal TUI session. A copied local setup contract runs its hook during prepare after exact native consent; prepare starts no worker. Legacy v1 setup remains start-scoped. Pi and installed extensions are trusted to receive confirmation, not to attest human origin.
+Preparation reports a status and next action. Technical errors need author correction, not user permission; unavailable setup or verification inputs remain unresolved.
+The optional sealed-nested-verification-v1 profile permits an offline checker with read-only subject and copied runtime inputs. Ordinary worker namespace, socket and tool restrictions remain unchanged. Start reuses observed copied setup; it does not bootstrap again.`;
 
 function files(root: string, id: string) {
   if (!/^[a-z0-9][a-z0-9_-]*$/.test(id)) throw new Error("invalid mission plan id");
@@ -67,7 +71,7 @@ export function registerMissionExtension(pi: ExtensionAPI) {
   let lifecycle = 0;
   let pending: string | undefined;
   let executionAction: string | undefined;
-  let draft: { request: PreparationRequest; ctx: ExtensionCommandContext; sessionId: string; root: string; epoch: number; proposal?: object } | undefined;
+  let draft: { request: PreparationRequest; ctx: ExtensionCommandContext; sessionId: string; root: string; epoch: number; proposal?: object; exactDetails?: boolean } | undefined;
   const discardDraft = () => { if (draft) invalidatePreparationRequest(draft.request); draft = undefined; };
   const invalidate = () => { discardDraft(); lifecycle++; pending = undefined; executionAction = undefined; engine?.invalidateSetupAdmission(); };
   const read = async <T>(operation: (db: MissionStore) => T | Promise<T>): Promise<T> => {
@@ -108,7 +112,12 @@ export function registerMissionExtension(pi: ExtensionAPI) {
       resultImageHash: result.resultImageHash, deliveryBaseManifestHash: result.deliveryBaseManifestHash,
       acceptedManifestHash: result.acceptedManifestHash, conditionalPatchHash: result.patchHash,
     } : undefined;
+    const setup = state.state === "prepared" && mission.prepared?.setup ? new MissionSetup(db, mission.id).observe(mission) : undefined;
+    const preparationStatus = state.state === "prepared" ? setup && setup.state !== "ready" ? "technical-unresolved" : "ready" : undefined;
     return { id: mission.id, revision: mission.revision, state: state.state, privateResult,
+      ...(preparationStatus ? { preparationStatus, nextAction: setup && setup.state !== "ready"
+        ? `Setup unresolved: ${setup.reason} ${mission.prepared?.setup?.identity.copy ? "Copied setup must settle during prepare; start cannot replay it." : `Separate /mission start ${mission.planId} consent is required by the legacy setup route; no preparation proof exists.`}`
+        : `Use /mission start ${mission.planId} for separate execution consent.` } : {}),
       units: state.units, resumeAfterClose: mission.definition.authority.resumeAfterClose,
       owner: "read-only", latestSeq: mission.latestSeq };
   };
@@ -423,7 +432,7 @@ export function registerMissionExtension(pi: ExtensionAPI) {
         const db = await open(recheck);
         recheck(db);
         const mission = db.findManagedMission(root)!;
-        if (mission.prepared?.setup) {
+        if (mission.prepared?.setup && !mission.prepared.setup.identity.copy) {
           const setupText = setupStartText(db, mission.id, sessionId);
           const confirmed = await ctx.ui.confirm("Confirm exact setup execution", setupText);
           live();
@@ -468,37 +477,62 @@ Make supported technical choices autonomously. Propose explicit permissions and 
   const authorPreparation = async (params: { id: string; requestId?: string; proposal?: unknown;
     interpretations?: Array<{ sourceId: string; disposition: "context" | "criterion" }>; setup?: SetupAllocation }, ctx: ExtensionCommandContext) => {
     const current = draft;
-    if (!current || params.requestId !== current.request.id) throw new Error("current host request required; use /mission prepare <plan-id>");
+    if (!current || params.requestId !== current.request.id) throw new PreparationBindingError("current host request required; use /mission prepare <plan-id>");
     const live = () => {
       if (draft !== current || current.epoch !== lifecycle || idOf(ctx) !== current.sessionId ||
         idOf(current.ctx) !== current.sessionId || !eligible(ctx) || ctx.mode !== "tui" || !ctx.hasUI ||
         realpathSync(ctx.cwd) !== current.root || realpathSync(current.ctx.cwd) !== current.root ||
         preparationContext(current.request).binding.planId !== params.id)
-        throw new Error("preparation expired; reauthor with /mission prepare <plan-id>");
+        throw new PreparationBindingError("preparation expired; reauthor with /mission prepare <plan-id>");
     };
     live();
     if (params.proposal === undefined) return { authority: "proposal-only", context: preparationContext(current.request) };
     const proposal = structuredClone(params.proposal);
     current.proposal = proposal as object;
-    const check = () => { live(); if (current.proposal !== proposal) throw new Error("proposal replaced; confirmation expired"); };
-    let result = validatePreparation({ request: current.request, proposal });
+    const check = () => { live(); if (current.proposal !== proposal) throw new PreparationBindingError("proposal replaced; confirmation expired"); };
+    let result = validatePreparation({ request: current.request, proposal, setup: params.setup });
     if (result.state === "needs-input") {
       const definition = (proposal as { definition?: MissionDefinition })?.definition;
       // Only decisions with independently bound texts can be asked; structural/proof errors stay author corrections.
-      const authority = definition && result.issues.some(({ message }) =>
-        message === "explicit host-bound permission and five-budget decision required" ||
-        message === "proposal does not preserve exact approved authority/budgets")
+      if (result.status === "technical-unresolved") return { ...result, authority: "proposal-only" };
+      const authority = definition && result.issues.some(({ code }) => code === "authority-choice")
         ? { authority: definition.authority, budget: definition.budget } : undefined;
-      const decisions = [
+      const inventory = preparationContext(current.request).inventory;
+      const invalidInterpretation = (params.interpretations ?? []).find(({ sourceId, disposition }) =>
+        !inventory.unresolved.some(({ id }) => id === sourceId) || !["context", "criterion"].includes(disposition));
+      if (invalidInterpretation) {
+        const issue = preparationIssue("invalid-proposal", "source",
+          `Interpretation requires a current unresolved source ID and context/criterion disposition: ${JSON.stringify(invalidInterpretation)}`);
+        return { state: "needs-input", status: "technical-unresolved", authority: "proposal-only",
+          issues: [issue], nextAction: issue.nextAction };
+      }
+      const decisionTexts = () => [
         ...(authority ? [preparationAuthorityText(current.request, authority)] : []),
         ...(params.interpretations ?? []).map(({ sourceId, disposition }) => preparationAnswerText(current.request, sourceId, disposition)),
         ...(params.setup ? [preparationSetupText(current.request, params.setup)] : []),
       ];
+      let decisions: string[];
+      try {
+        decisions = decisionTexts();
+      } catch (error) {
+        check();
+        const issue = preparationIssue("missing-local-input", "prerequisite", String(error));
+        return { state: "needs-input", status: "technical-unresolved", authority: "proposal-only",
+          issues: [issue], nextAction: issue.nextAction };
+      }
       if (!decisions.length) return { ...result, authority: "proposal-only", message: "Restore missing mappings or resolve specific unsupported issues; no confirmation or admission." };
+      if (current.exactDetails) display(current.ctx, JSON.stringify({ context: preparationContext(current.request),
+        issues: result.issues, decisions: decisions.map((text) => JSON.parse(text)) }, null, 2));
       const accepted = await current.ctx.ui.confirm("Preparation questions — explicit decisions, not estimate approval by default",
-        JSON.stringify({ context: preparationContext(current.request), issues: result.issues, decisions: decisions.map((text) => JSON.parse(text)) }, null, 2));
+        preparationView({ action: "preparation-authority / source-meaning / setup effects",
+          context: preparationContext(current.request), definition: definition!, setup: params.setup,
+          setupDestination: decisions.map((text) => JSON.parse(text)).find(({ action }) => action === "preparation-setup-effects")
+            ?.identity.copy?.destination,
+          issues: result.issues, interpretations: params.interpretations }));
       check();
       if (accepted !== true) { discardDraft(); return { state: "dismissed", authority: "proposal-only", message: "Nothing admitted; repeat /mission prepare to reauthor." }; }
+      if (JSON.stringify(decisions) !== JSON.stringify(decisionTexts()))
+        throw new PreparationBindingError("preparation decision inputs changed; repeat /mission prepare");
       if (authority) bindPreparationAuthority(current.request, authority,
         recordOperatorInput("native-confirmation", current.sessionId, preparationAuthorityText(current.request, authority))!);
       for (const { sourceId, disposition } of params.interpretations ?? [])
@@ -506,7 +540,7 @@ Make supported technical choices autonomously. Propose explicit permissions and 
           recordOperatorInput("native-confirmation", current.sessionId, preparationAnswerText(current.request, sourceId, disposition))!);
       if (params.setup) bindPreparationSetup(current.request, params.setup,
         recordOperatorInput("native-confirmation", current.sessionId, preparationSetupText(current.request, params.setup))!);
-      result = validatePreparation({ request: current.request, proposal });
+      result = validatePreparation({ request: current.request, proposal, setup: params.setup });
     }
     if (result.state !== "ready") return { ...result, authority: "proposal-only" };
     const prepared = result.prepared, text = preparedAdmissionText(prepared);
@@ -520,10 +554,13 @@ Make supported technical choices autonomously. Propose explicit permissions and 
     };
     const before = existsSync(path.join(getPitakoDataDir(), "missions.db")) ? await read(capture) : capture();
     check();
+    if (current.exactDetails) display(current.ctx, JSON.stringify({ action: JSON.parse(text), preparedHash: result.digest,
+      prepared, observed: before }, null, 2));
     const accepted = await current.ctx.ui.confirm("Confirm exact prepared mission — not start",
-      JSON.stringify({ action: JSON.parse(text), preparedHash: result.digest,
-        admittedPlanHash: sha256(Buffer.from(prepared.originalSource)), admittedDefinitionHash: sha256(Buffer.from(JSON.stringify(prepared.definition))),
-        prepared, observed: before }, null, 2));
+      preparationView({ action: "admit-prepared-mission", context: preparationContext(current.request),
+        definition: prepared.definition, setup: prepared.setup?.decision.values,
+        setupDestination: prepared.setup?.identity.copy?.destination, issues: result.issues }) +
+      `\nStatus: ${result.status}\nNext action: ${result.nextAction}\nExact binding: ${result.digest}\nOptional JSON: /mission prepare-details before submitting a proposal.`);
     check();
     if (accepted !== true) { discardDraft(); return { state: "dismissed", authority: "proposal-only", message: "Nothing admitted; repeat /mission prepare." }; }
     let claimValidated = false;
@@ -531,7 +568,7 @@ Make supported technical choices autonomously. Propose explicit permissions and 
       const now = capture(db);
       if (claimValidated && db === store && db?.ownerEpoch === before.ownership.epoch + 1 &&
         now.ownership.claimId === db.ownerAcquisitionProof?.claimId) now.ownership = before.ownership;
-      if (JSON.stringify(now) !== JSON.stringify(before)) throw new Error("preparation ownership or mission changed; repeat /mission prepare");
+      if (JSON.stringify(now) !== JSON.stringify(before)) throw new PreparationBindingError("preparation ownership or mission changed; repeat /mission prepare");
       if (db && db !== store) claimValidated = true;
     };
     if (store) recheck(store);
@@ -540,11 +577,24 @@ Make supported technical choices autonomously. Propose explicit permissions and 
     const receipt = recordOperatorInput("native-confirmation", current.sessionId, text)!;
     const mission = db.createMission({ repositoryRoot: current.root, planId: params.id, prepared,
       commandId: receipt.id, admissionReceiptId: receipt.id, operatorText: text, operatorReceipt: receipt });
-    attach(current.ctx, mission.id);
+    const active = attach(current.ctx, mission.id);
+    let setupOutcome: import("./setup.ts").SetupReadiness | undefined;
+    if (prepared.setup?.identity.copy) {
+      const writer = db.ownershipIdentity;
+      setupOutcome = await active.engine.prepareSetup(() => {
+        check();
+        if (JSON.stringify(db.ownershipIdentity) !== JSON.stringify(writer) ||
+          preparedAdmissionText(prepared) !== text) throw new PreparationBindingError("prepare setup binding changed");
+      });
+    }
     discardDraft();
-    display(current.ctx, `Prepared ${mission.id} @${mission.revision}; use /mission start ${params.id}. No setup or worker started.`);
+    const status = setupOutcome ? setupOutcome.state === "ready" ? "ready" : "technical-unresolved" : result.status;
+    const nextAction = setupOutcome ? setupOutcome.state === "ready" ? `Use /mission start ${params.id}; setup will be rechecked and reused.`
+      : `Setup unresolved: ${setupOutcome.reason}; no worker started, no automatic replay.` : result.nextAction;
+    display(current.ctx, `Prepared ${mission.id} @${mission.revision}; status: ${status}. ${nextAction} No worker started.`);
     // Tool output is diagnostic, never a transferable operator receipt.
-    return { state: "prepared", authority: "proposal-only", missionId: mission.id, preparedHash: result.digest,
+    return { state: "prepared", status, nextAction, issues: setupOutcome?.state === "ready" ? result.issues.filter(({ code }) => code !== "unresolved-setup") : result.issues,
+      authority: "proposal-only", missionId: mission.id, preparedHash: result.digest,
       message: "Host native admission recorded; this tool result is not a confirmation receipt. Start requires /mission start." };
   };
 
@@ -570,6 +620,12 @@ Make supported technical choices autonomously. Propose explicit permissions and 
             if (!mission) throw new Error("mission not found");
             return JSON.stringify(await db.exportMission(mission.id, id));
           }));
+        } else if (verb === "prepare-details") {
+          if (!draft || args.trim() !== "prepare-details" || idOf(ctx) !== draft.sessionId)
+            throw new Error("Use /mission prepare first in this session.");
+          preparationContext(draft.request);
+          draft.exactDetails = true;
+          display(ctx, "Exact host-owned JSON will accompany the next preparation confirmation; it does not grant consent.");
         } else if (verb === "prepare") {
           if (!id || args.trim() !== `prepare ${id}`) throw new Error(usage);
           display(ctx, queuePreparation(ctx, id));
@@ -609,8 +665,11 @@ Make supported technical choices autonomously. Propose explicit permissions and 
   tool("mission_prepare", Type.Object({ id: Type.String(), requestId: Type.Optional(Type.String()),
     proposal: Type.Optional(Type.Unknown()), interpretations: Type.Optional(Type.Array(Type.Object({
       sourceId: Type.String(), disposition: Type.Union([Type.Literal("context"), Type.Literal("criterion")]),
-    }))), setup: Type.Optional(Type.Object({ effectProfile: Type.Literal("execution-root-local-v1"),
-      writableDirectories: Type.Array(Type.String()), activeTimeMs: Type.Number(), artifactBytes: Type.Number() })) }),
+    }))), setup: Type.Optional(Type.Object({ effectProfile: Type.Union([Type.Literal("execution-root-local-v1"), Type.Literal("execution-root-local-copy-v1")]),
+      writableDirectories: Type.Array(Type.String()), activeTimeMs: Type.Number(), artifactBytes: Type.Number(),
+      copy: Type.Optional(Type.Object({ bounds: Type.Object({ paths: Type.Number(), largestFileBytes: Type.Number(), totalBytes: Type.Number() }),
+        seeds: Type.Array(Type.Object({ source: Type.String(), destination: Type.String(),
+          bounds: Type.Object({ paths: Type.Number(), largestFileBytes: Type.Number(), totalBytes: Type.Number() }) })) })) })) }),
   async (params, ctx) => {
     try { return await authorPreparation(params, ctx); }
     catch (error) { discardDraft(); throw error; }

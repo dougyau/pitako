@@ -261,12 +261,16 @@ Six records stay separate. `todo` is the current session checklist. The Board ho
 `/mission prepare <plan-id>` reads the frozen Markdown, execution root and configured
 role policies, then queues assisted authoring to the **current principal coordinator**.
 Busy work continues; no worker or second coordinator is launched. The coordinator
-submits an untrusted proposal through `mission_prepare`; native questions bind genuine
-source ambiguities, explicit permissions and all five budgets. Estimates are not approval.
+submits an untrusted proposal through `mission_prepare`. Native questions bind genuine
+source ambiguities, explicit permissions, and all five budgets. Technical errors return
+to the author for correction, not to the user for permission. Estimates are not approval.
 An exact source-bound preview and native confirmation admit only that prepared object.
-No `.mission.json` is required, and preparation starts no setup or implementation.
+No `.mission.json` is required, and preparation starts no worker. An admitted
+`execution-root-local-copy-v1` setup runs its hook on a bounded disposable copy during
+preparation. Start reuses the observed read-only dependency output rather than running
+the hook again. Legacy `execution-root-local-v1` setup remains start-scoped.
 
-`/mission start <plan-id>` separately confirms activation/setup; native
+`/mission start <plan-id>` separately confirms worker activation; native
 `pause|resume|cancel` commands control execution. Dismissed or invalidated drafts
 require preparation again; admitted preparation survives reload. This boundary trusts
 the Pi host and installed extensions to handle confirmation, **not** to attest human
@@ -274,6 +278,11 @@ origin. Headless/RPC/child sessions cannot auto-approve; the console is optional
 Activation journals intent before managed SDK tools run; candidates,
 artifacts and receipts persist outside the source checkout. A result is delivered
 without automatically changing source, committing or publishing it.
+
+An optional `sealed-nested-verification-v1` profile permits an offline checker
+inside a sealed disposable capsule. It does not relax ordinary worker namespace,
+socket, or tool restrictions. Missing runtime inputs, sandbox capabilities, or
+current setup proof remain explicit technical failures, not successful preparation.
 
 See [durable missions](docs/missions.md) for commands, recovery limitations,
 Linux sandbox prerequisites and the separate effectiveness measurement protocol.
@@ -287,7 +296,7 @@ Pitako does not implement subteams. Ad-hoc Team assignments let independent role
 
 - Node.js 22.19 or newer (same floor as current Pi).
 - [Pi coding agent](https://github.com/earendil-works/pi) `@earendil-works/pi-coding-agent` 0.87 or newer.
-- The Bun version declared in `package.json` (`bun@1.3.14`) for checkout preparation. People who only install a published package do not need Bun.
+- The Bun version declared in `package.json` (`bun@1.4.2`) for checkout preparation. People who only install a published package do not need Bun.
 - An installed language server for LSP. It can be resolved from `PATH`, a project-local `node_modules/.bin`, or an explicit command path. TypeScript defaults to `typescript-language-server`; `/lsp install <id>` offers explicit installation for supported servers.
 - CodeGraph CLI. This package depends on `@colbymchenry/codegraph` and will use `node_modules/.bin/codegraph` when `codegraph` is not already on `PATH`.
 

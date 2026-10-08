@@ -80,6 +80,7 @@ const effects = new MissionEffects({
   runtimeId: durableStore.runtimeId,
   ownerEpoch,
   allowedOperations: [operation],
+  commandTime: { admit: async (requestedMs) => requestedMs ?? 120_000, remaining: () => 120_000 },
 });
 const input = operation === "bash"
   ? { command: process.env.T3_COMMAND ?? "printf started > /tmp/pitako/workspace/src/started; sleep 30; printf finished > /tmp/pitako/workspace/src/finished", timeoutMs: 60_000 }

@@ -11,6 +11,7 @@ import type { MissionEventDraft, MissionStore, Reservation } from "./store.ts";
 import { captureWorkspaceImage, captureWorkspacePaths, createMissionWorkspace, filterWorkspaceImage, preflightContainment, quarantineWorkspace, registerCandidateWorkspace, restoreWorkspaceImage, verifyPrivateCandidate, type CandidateRegistration, type ManifestPath, type MissionWorkspace } from "./workspace.ts";
 import { readAcceptedWorkspaceContribution, readContributionInput, type ContributionInput, canonicalDeliveryManifest, integrateAcceptedMissionOutputs, assertCompleteWorkspaceImage, pauseRecoveryCurrent, importedHoldReconciled, mergeWorkspaceImages, missionEffectProcessesQuiescent, missionHasUnresolvedEffects, readSealedWorkspaceImage, reconcileLegacyHolds, reconcileMission, recoveryDiagnosisBrief, recoveryObservationCurrent, sealWorkspaceImage, serializeRecoveryOverlapAnswer, sensitiveArtifactPath, type LegacyHoldVerificationInput, type LegacyHoldVerificationProof, type RecoveryDiagnosisAdmission, type RecoveryReport, type RecoveryOverlapAnswer, type RecoveryOverlapRequest } from "./reconcile.ts";
 import { MissionEffects } from "./effects.ts";
+import { assertCommandTime, MAX_COMMAND_TIME_MS } from "./command-time.ts";
 import { lifecycleRecoveryCurrent } from "./reconcile.ts";
 import { assessMissionPredicate, MISSION_CHECK_IDENTITY, type BoundPredicateSubject } from "./checks.ts";
 import { pendingMissionQuestions, pendingQuestionClosure } from "./admission.ts";
@@ -452,7 +453,7 @@ export function createPiMissionRunner(options: {
   };
 }
 
-import { assertSetupRequirements, MissionSetup, type SetupStartAdmission } from "./setup.ts";
+import { admitPreparedSetup, assertSetupRequirements, MissionSetup, type SetupStartAdmission } from "./setup.ts";
 
 export class MissionEngine {
   private readonly store: MissionStore;
@@ -801,7 +802,23 @@ export class MissionEngine {
     this.unregisterOwner = undefined;
   }
 
+  async prepareSetup(recheck: () => void): Promise<import("./setup.ts").SetupReadiness> {
+    const inspection = this.store.inspectMission(this.missionId);
+    if (inspection.state !== "prepared" || !inspection.prepared?.setup?.identity.copy)
+      throw new Error("prepare setup requires prepared copied admission");
+    const admission = admitPreparedSetup(this.store, this.missionId, recheck);
+    this.initializeCapacity(inspection);
+    return this.setup.ensure(admission, () => !this.pumpPromise && this.snapshot().state === "prepared");
+  }
+
   private activate(inspection: ReturnType<MissionStore["inspectMission"]>, operator?: { id: string; text: string; source?: import("./admission.ts").OperatorSource }): void {
+    if (inspection.prepared?.setup?.identity.copy && this.setup.observe(inspection).state !== "ready")
+      throw new Error("copied setup has no current settled preparation proof; start cannot replay it");
+    this.initializeCapacity(inspection, operator, true);
+  }
+
+  private initializeCapacity(inspection: ReturnType<MissionStore["inspectMission"]>,
+    operator?: { id: string; text: string; source?: import("./admission.ts").OperatorSource }, activate = false): void {
     const { definition } = inspection;
     const launches = definition.units.reduce((total, unit) => total + (unit.team ? unit.team.members.length * 3 + 1 : 1), 0);
     const finalizationLaunches = definition.finalization.contractVersion === 1 ? 3 : 1 + Number(definition.finalization.independentReview);
@@ -829,19 +846,27 @@ export class MissionEngine {
       "artifact-bytes": launches * artifactPerLaunch,
     };
     const caps = budgetMap(definition.budget);
+    if (inspection.prepared?.setup?.identity.copy && !activate) {
+      const setup = inspection.prepared.setup.decision.values;
+      if (launches * compiled.active + protectedAmounts["active-time-ms"] + setup.activeTimeMs > caps["active-time-ms"] ||
+        launches * compiled.artifacts + protectedAmounts["artifact-bytes"] + setup.artifactBytes > caps["artifact-bytes"])
+        throw new Error("setup allocation must preserve mandatory path and protected finalization capacity");
+    }
     for (const resource of RESOURCE_KEYS) {
       if (definition.finalization.contractVersion !== 1 && pathAmounts[resource] + protectedAmounts[resource] > caps[resource]) {
         throw new Error(`mandatory path plus protected finalization needs ${pathAmounts[resource] + protectedAmounts[resource]} ${resource}; budget allows ${caps[resource]}`);
       }
     }
-    const events: MissionEventDraft[] = RESOURCE_KEYS.map((resource) => reservationDraft(
+    const events: MissionEventDraft[] = RESOURCE_KEYS.filter((resource) => !inspection.events.some((event) =>
+      event.kind === "reservation.created" && event.payload.reservationId === stableId(`${this.missionId}:protected:${resource}`)))
+      .map((resource) => reservationDraft(
       this.missionId, inspection.revision, stableId(`${this.missionId}:protected:${resource}`), resource, protectedAmounts[resource], "protected", this.wallNow(),
     ));
-    events.push(this.event(inspection.revision, "mission.activated", `${this.missionId}:activated`, {
+    if (activate) events.push(this.event(inspection.revision, "mission.activated", `${this.missionId}:activated`, {
       missionId: this.missionId, ...(definition.finalization.contractVersion === 1 ? { finalizationGrants: compiled.stages } : {}),
       rootLimits: { maxSessions: this.maxConcurrent, maxMutatingDevelopers: 1, maxDepth: 2 }, ...(operator ? { operatorInputId: operator.id, operatorText: operator.text, operatorSource: operator.source, intervention: "operator_choice" } : {}),
     }));
-    this.store.appendTransition(this.missionId, inspection.version, { events });
+    if (events.length) this.store.appendTransition(this.missionId, inspection.version, { events });
   }
 
   private sessionLimit(inspection: ReturnType<MissionStore["inspectMission"]>): number {
@@ -1199,6 +1224,7 @@ export class MissionEngine {
     const input = readSealedWorkspaceImage(this.store, imageHash);
     assertCompleteWorkspaceImage(input);
     const workspace = createMissionWorkspace({ ...this.managedWorkspace!, missionId: this.missionId, attemptId,
+      dependencyBacking: this.setup.dependencyBacking(),
       candidateParent: this.managedWorkspace!.candidateParent ?? path.join(path.dirname(this.store.storageRoot), `${path.basename(this.store.storageRoot)}-candidates`),
       storeRoot: this.store.storageRoot, allowedPaths: inspection.definition.authority.allowedPaths });
     restoreWorkspaceImage(workspace, input.files);
@@ -1208,6 +1234,7 @@ export class MissionEngine {
     const effects = new MissionEffects({ store: this.store, workspace, missionId: this.missionId, revision: inspection.revision,
       unitId: FINALIZATION_OWNER, attemptId, runtimeId: this.store.runtimeId, ownerEpoch,
       allowedOperations: inspection.definition.authority.operations,
+      commandTime: this.effectCommandTime(inspection.revision),
       canInvoke: (effectId) => this.attemptAdmitted({ revision: inspection.revision, ownerEpoch, unitId: FINALIZATION_OWNER, attemptId }, undefined, effectId) });
     if (readOnly) effects.enableVerificationOnly(true);
     return { workspace, effects, verificationOnly: readOnly, baseImage: input, dependencyOutputs: [] };
@@ -1435,10 +1462,13 @@ export class MissionEngine {
           const effects = predicate.kind === "command_exit" ? new MissionEffects({ store: this.store, workspace: runtime!.workspace,
             missionId: this.missionId, revision: binding.revision, unitId: binding.unitId, attemptId: binding.attemptId,
             runtimeId: this.store.runtimeId, ownerEpoch: binding.ownerEpoch, allowedOperations: inspection.definition.authority.operations,
+            commandTime: this.effectCommandTime(binding.revision),
             canInvoke: (effectId) => this.attemptAdmitted(binding, undefined, effectId) }) : undefined;
           if (effects) this.effectRunners.add(effects);
+          await this.checkActiveTimeBeforeEffect();
           const observation = await assessMissionPredicate({ predicate, subject: { kind: "workspace", imageHash: target.inputArtifactHash } },
             { store: this.store, inputBindingHash: hashJson(target), scopeEstablished: true, effects,
+              artifactLimitBytes: Math.max(0, grants.artifacts - artifacts.reduce((n, row) => n + row.bytes.byteLength, 0)),
               timeoutLimitMs: Math.max(0, this.activeWindow!.grantAmount - this.activeWindow!.knownCharge -
                 this.activeWindow!.unknownCharge - this.activeWindow!.released - Math.ceil(this.now() - this.activeWindow!.lastCheckpointAt)) });
           artifacts.push(...(observation.artifacts ?? []), ...(observation.artifactBytes ? [{ bytes: observation.artifactBytes, mediaType: "application/json" }] : []));
@@ -1996,6 +2026,7 @@ export class MissionEngine {
     };
     try {
       workspace = createMissionWorkspace({
+        dependencyBacking: this.setup.dependencyBacking(),
         missionId: this.missionId, attemptId, sourceRoot: config.sourceRoot, storeRoot, candidateParent,
         allowedPaths: inspection.definition.authority.allowedPaths, otherCandidates,
         productRoot: config.productRoot, bwrapPath: config.bwrapPath,
@@ -2093,6 +2124,7 @@ export class MissionEngine {
       store: this.store, workspace, missionId: this.missionId, revision: inspection.revision,
       unitId: unit.id, attemptId, runtimeId: this.store.runtimeId, ownerEpoch,
       allowedOperations: inspection.definition.authority.operations,
+      commandTime: this.effectCommandTime(inspection.revision),
       recoveryMode, recoveryImageHash, repairAuthorizationId,
       canInvoke: (effectId) => this.attemptAdmitted({ revision: inspection.revision, ownerEpoch, unitId: unit.id, attemptId }, undefined, effectId),
     });
@@ -2401,9 +2433,17 @@ export class MissionEngine {
     const controller = new AbortController();
     durable.signal = controller.signal;
     this.attemptControllers.set(binding.attemptId, controller);
-    const finalizationTimer = binding.finalization ? setTimeout(() => controller.abort("finalization phase active-time grant expired"),
-      Math.max(0, this.activeWindow!.grantAmount - this.activeWindow!.knownCharge -
-        Math.max(0, this.now() - this.activeWindow!.lastCheckpointAt))) : undefined;
+    let finalizationTimer: ReturnType<typeof setTimeout> | undefined;
+    if (binding.finalization) {
+      const reservationId = this.activeWindow?.reservationId;
+      const expire = () => {
+        const remaining = this.remainingActiveTime();
+        if (this.activeWindow?.reservationId !== reservationId || remaining <= 0)
+          controller.abort("finalization phase active-time grant expired");
+        else finalizationTimer = setTimeout(expire, Math.min(MAX_COMMAND_TIME_MS, remaining));
+      };
+      finalizationTimer = setTimeout(expire, Math.min(MAX_COMMAND_TIME_MS, this.remainingActiveTime()));
+    }
     if (runtime) {
       this.effectRunners.add(runtime.effects);
       this.attemptEffects.set(binding.attemptId, runtime.effects);
@@ -3627,7 +3667,7 @@ export class MissionEngine {
   }
 
   private async assessProductionPredicate(inspection: ReturnType<MissionStore["inspectMission"]>, attempt: MissionAttemptProjection,
-    predicate: MissionUnit["acceptance"][number], artifactHash: string): Promise<MissionPredicateObservation> {
+    predicate: MissionUnit["acceptance"][number], artifactHash: string, artifactLimitBytes: number): Promise<MissionPredicateObservation> {
     const binding = attempt.binding;
     const input = readPredicateInputBinding(this.store, binding, predicate.id);
     let subject: BoundPredicateSubject = { kind: "artifact", artifactHash };
@@ -3649,6 +3689,7 @@ export class MissionEngine {
         if (runtime && predicate.kind === "command_exit") effects = new MissionEffects({ store: this.store, workspace: runtime.workspace,
           missionId: this.missionId, revision: binding.revision, unitId: binding.unitId, attemptId: binding.attemptId,
           runtimeId: this.store.runtimeId, ownerEpoch: binding.ownerEpoch, allowedOperations: inspection.definition.authority.operations,
+          commandTime: this.effectCommandTime(binding.revision),
           canInvoke: (effectId) => this.attemptAdmitted(binding, undefined, effectId) });
       }
       if (missionHasUnresolvedEffects(this.store, inspection.events, binding.attemptId)) {
@@ -3659,23 +3700,16 @@ export class MissionEngine {
         scopeEstablished = false;
       }
     } catch (error) { scopeEstablished = false; scopeFailure = error instanceof Error ? error.message : String(error); }
-    const time = budgetAmounts(inspection.events, "active-time-ms");
     if (effects) this.effectRunners.add(effects);
     if (effects && predicate.kind === "command_exit") {
       // SDK disposal can outlast the current ordinary window. Settle it and
       // admit a fresh grant when the whole frozen command no longer fits.
-      await this.checkActiveTimeBeforeEffect();
-      if (this.activeWindow && predicate.timeoutMs !== undefined && predicate.timeoutMs > this.activeWindow.grantAmount - this.activeWindow.knownCharge -
-        this.activeWindow.unknownCharge - this.activeWindow.released - Math.ceil(this.now() - this.activeWindow.lastCheckpointAt)) {
-        await this.closeActiveWindow();
-        this.openNextActiveWindow();
-      }
+      try { await this.admitEffectTime(predicate.timeoutMs); }
+      catch (error) { scopeEstablished = false; scopeFailure = messageOf(error); }
     }
     const observation = await assessMissionPredicate({ predicate, subject }, { store: this.store,
-      inputBindingHash: input?.inputBindingHash ?? binding.inputManifestHash, scopeEstablished, effects,
-      timeoutLimitMs: this.activeWindow ? Math.max(0, this.activeWindow.grantAmount - this.activeWindow.knownCharge -
-        this.activeWindow.unknownCharge - this.activeWindow.released - Math.ceil(this.now() - this.activeWindow.lastCheckpointAt)) :
-        Math.max(0, inspection.definition.budget.activeTimeMs - time.ordinary - time.protected) });
+      inputBindingHash: input?.inputBindingHash ?? binding.inputManifestHash, scopeEstablished, effects, artifactLimitBytes,
+      timeoutLimitMs: this.remainingActiveTime() });
     if (observation.verdict !== "pass") {
       try { this.captureRejection?.({ boundary: "production-predicate", missionId: this.missionId,
         attemptId: binding.attemptId, predicate, scopeEstablished, scopeFailure, processes,
@@ -3734,7 +3768,8 @@ export class MissionEngine {
       for (const predicate of acceptance) {
         const observation = this.assessPredicate ? await this.assessPredicate({ unit, predicate,
           result: resultFromReceipt(attempt), resultArtifact, inputManifestHash: attempt.binding.inputManifestHash })
-          : await this.assessProductionPredicate(inspection, attempt, predicate, artifactHash);
+          : await this.assessProductionPredicate(inspection, attempt, predicate, artifactHash,
+            Math.max(0, (artifactReservation?.amount ?? 0) - resultArtifact.byteLength - evidenceArtifactBytes));
         for (const artifact of observation.artifacts ?? []) {
           artifacts.push(artifact);
           evidenceArtifactBytes += artifact.bytes.byteLength;
@@ -4063,9 +4098,10 @@ export class MissionEngine {
       this.store.ownerEpoch === null || inspection.revision !== binding.revision) return false;
     if (!this.setupAllows(inspection, binding.unitId)) return false;
     const state = reduceMissionEvents(inspection);
-    // An admitted effect's own prepared/invoking stamps are not a new recovery cause for itself.
+    // An admitted effect's own launch stamps are not a new recovery cause for itself.
     const observed = invokingEffectId ? { ...inspection, events: inspection.events.filter((event) =>
-      event.effectId !== invokingEffectId || !["effect.intent", "effect.invoking"].includes(event.kind)) } : inspection;
+      event.effectId !== invokingEffectId ||
+      !["effect.intent", "effect.invoking", "effect.process.registered", "effect.released"].includes(event.kind)) } : inspection;
     const continuation = inspection.events.find((event) => event.kind === "attempt.reserved" &&
       event.attemptId === binding.attemptId)?.payload.binding as MissionAttemptBinding | undefined;
     if (continuation?.finalization)
@@ -4301,6 +4337,58 @@ export class MissionEngine {
     if (this.activeTimeFailure) throw new Error(`active-time renewal failed; effects are fenced: ${this.activeTimeFailure}`);
   }
 
+  private remainingActiveTime(): number {
+    const window = this.activeWindow;
+    if (!window || window.ownerEpoch !== this.store.ownerEpoch || window.runtimeId !== this.store.runtimeId) return 0;
+    return Math.max(0, window.grantAmount - window.knownCharge - window.unknownCharge - window.released -
+      Math.ceil(Math.max(0, window.fractionalMs + this.now() - window.lastCheckpointAt)));
+  }
+
+  private async admitEffectTime(requestedMs?: number): Promise<number> {
+    if (requestedMs !== undefined) assertCommandTime(requestedMs);
+    await this.checkActiveTimeBeforeEffect();
+    if (requestedMs !== undefined && requestedMs > this.remainingActiveTime()) {
+      const inspection = this.store.inspectMission(this.missionId);
+      if (Object.values(reduceMissionEvents(inspection).attempts).some((attempt) => !attempt.settled && attempt.binding.finalization))
+        throw new Error("command timeout exceeds remaining protected finalization stage allocation");
+      const time = budgetAmounts(inspection.events, "active-time-ms");
+      const available = inspection.definition.budget.activeTimeMs - time.ordinary - time.protected - time.finalization + this.remainingActiveTime();
+      if (requestedMs > available) throw new Error("command timeout exceeds available ordinary active-time capacity");
+      await this.closeActiveWindow();
+      this.openNextActiveWindow(requestedMs);
+    }
+    const bound = requestedMs ?? Math.min(MAX_COMMAND_TIME_MS, this.remainingActiveTime());
+    assertCommandTime(bound);
+    if (requestedMs !== undefined && bound > this.remainingActiveTime())
+      throw new Error("command timeout exceeds remaining ordinary active-time capacity");
+    return bound;
+  }
+
+  private effectCommandTime(revision: number): NonNullable<ConstructorParameters<typeof MissionEffects>[0]["commandTime"]> {
+    let reservationId: string | undefined;
+    return {
+      admit: async (requestedMs) => {
+        const inspection = this.store.inspectMission(this.missionId);
+        if (inspection.revision !== revision) throw new Error("effect time revision changed");
+        if (inspection.prepared && this.managedWorkspace) missionInputIdentity(inspection, this.managedWorkspace.sourceRoot);
+        const bound = await this.admitEffectTime(requestedMs);
+        reservationId = this.activeWindow?.reservationId;
+        return bound;
+      },
+      remaining: () => {
+        const inspection = this.store.inspectMission(this.missionId);
+        if (inspection.prepared && this.managedWorkspace) missionInputIdentity(inspection, this.managedWorkspace.sourceRoot);
+        const window = this.activeWindow;
+        const reservation = inspection.reservations.find((row) => row.id === reservationId);
+        if (inspection.revision !== revision || this.snapshot().admissionFenced ||
+          !window || window.reservationId !== reservationId || !reservation ||
+          reservation.grantAmount !== window.grantAmount || reservation.knownCharge !== window.knownCharge ||
+          reservation.unknownCharge !== window.unknownCharge || reservation.released !== window.released) return 0;
+        return this.remainingActiveTime();
+      },
+    };
+  }
+
   private async checkActiveTime(): Promise<void> {
     const window = this.activeWindow;
     if (!window || this.snapshot().state === "paused") return;
@@ -4391,7 +4479,7 @@ export class MissionEngine {
     this.activeWindow = undefined;
   }
 
-  private openNextActiveWindow(): void {
+  private openNextActiveWindow(commandMs?: number): void {
     const inspection = this.store.inspectMission(this.missionId);
     const state = reduceMissionEvents(inspection);
     if (state.admissionFenced || ["paused", "cancelled", "completed"].includes(state.state)) return;
@@ -4409,13 +4497,14 @@ export class MissionEngine {
           event.attemptId === binding.attemptId && event.payload.resource === "active-time-ms"));
     const remaining = inspection.definition.budget.activeTimeMs - usage.ordinary - usage.protected - usage.finalization +
       (child ? this.consultationHold(inspection, child.consultationId!, "active-time-ms") : 0);
-    const quantum = Math.min(
+    const quantum = commandMs === undefined ? Math.min(
       ACTIVE_TIME_QUANTUM_MS,
       inspection.definition.finalization.contractVersion === 1 ? compileFinalizationGrants(inspection.definition).active :
         Math.max(1, Math.ceil(inspection.definition.budget.activeTimeMs / inspection.definition.budget.roleLaunches)),
       remaining,
-    );
-    if (quantum < 1) {
+    ) : Math.min(commandMs + ACTIVE_TIME_QUANTUM_MS, remaining);
+    // The extra idle quantum funds admission/observation overhead, not command time.
+    if (quantum < 1 || (commandMs !== undefined && quantum < commandMs)) {
       this.emit([this.event(inspection.revision, "budget.admission.fenced", `${this.missionId}:active-time-exhausted`, {
         reason: "active-time-ms quantum renewal failed; no ordinary capacity remains",
       })]);

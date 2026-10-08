@@ -3,6 +3,7 @@ import type { MissionStore } from "./store.ts";
 import { assertCompleteWorkspaceImage, readHistoricalPauseInterruption, readSealedWorkspaceImage,
   recoveryEffectObservationIsBound } from "./reconcile.ts";
 import type { MissionAttemptBinding } from "./engine.ts";
+import { NESTED_PROFILE } from "./nested-verification.ts";
 
 // This is a completion-only audit, not the operational effect resolver. Keep this
 // catalog exhaustive with store.EVENT_KINDS; an unfamiliar persisted row fails closed.
@@ -59,6 +60,25 @@ function containedEffect(rows: readonly CompletionRow[], store: MissionStore): b
     const plan = JSON.parse(store.readArtifact(String(p.effectPlanHash)).toString());
     const identity = object(registered!.payload.identity);
     const process = object(terminal!.payload.process);
+    const terminalIdentity: Record<string, unknown> = { ...process, descendantsQuiescent: undefined, namespaceEmptyAfterExit: undefined };
+    if (plan.nestedVerification !== undefined) {
+      const binding = object(plan.nestedVerification);
+      const owner = object(p.owner);
+      const init = object(identity.namespaceInit);
+      if (binding.profile !== NESTED_PROFILE || plan.operation !== "bash" ||
+        binding.missionId !== intent!.missionId || binding.revision !== intent!.revision ||
+        binding.runtimeId !== owner.runtimeId || binding.ownerEpoch !== owner.epoch ||
+        identity.runtimeId !== binding.runtimeId || identity.epoch !== binding.ownerEpoch ||
+        binding.candidateIdentity !== p.candidateIdentity || binding.candidateGitIdentity !== p.candidateGitIdentity ||
+        binding.timeoutMs !== plan.request.timeoutMs || released!.payload.timeoutMs !== binding.timeoutMs ||
+        !identity.nestedBoundary || !Number.isSafeInteger(init.pid) || Number(init.pid) <= 0 ||
+        !Number.isSafeInteger(init.birthTicks) || Number(init.birthTicks) < 0 || init.pid === identity.pid ||
+        !Array.isArray(identity.ancestry) || !identity.ancestry.some((member) =>
+          member?.pid === init.pid && member.birthTicks === init.birthTicks && member.parentPid === identity.pid) ||
+        process.outerInitRetired !== true) return false;
+      // Only this bound native profile adds retirement observation to the exact identity.
+      delete terminalIdentity.outerInitRetired;
+    }
     if (plan.format !== "mission-effect-plan-v1" || plan.operation !== p.operation ||
       hash(plan.request) !== p.requestHash || invoking!.payload.requestHash !== p.requestHash ||
       invoking!.payload.effectPlanHash !== p.effectPlanHash ||
@@ -67,7 +87,7 @@ function containedEffect(rows: readonly CompletionRow[], store: MissionStore): b
       terminal!.payload.requestHash !== p.requestHash || terminal!.payload.operation !== p.operation ||
       hash(terminal!.payload.owner) !== hash(p.owner) || !["completed", "failed"].includes(String(terminal!.payload.status)) ||
       process?.descendantsQuiescent !== true ||
-      process.namespaceEmptyAfterExit !== true || hash({ ...process, descendantsQuiescent: undefined, namespaceEmptyAfterExit: undefined }) !== hash(identity) ||
+      process.namespaceEmptyAfterExit !== true || hash(terminalIdentity) !== hash(identity) ||
       !Number.isSafeInteger(identity.pid) || !Number.isSafeInteger(identity.birthTicks) ||
       typeof identity.pidNamespace !== "string" || !identity.pidNamespace ||
       snapshot!.payload.phase !== "effect" || hash(snapshot!.payload.candidateIdentity) !== hash(p.candidateIdentity) ||

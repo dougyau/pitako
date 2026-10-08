@@ -10,6 +10,7 @@ import { missionInputIdentity } from "./inputs.ts";
 import { sha256, type MissionDefinition } from "./model.ts";
 import type { MissionInspection, MissionStore } from "./store.ts";
 import { currentProcessIdentity, openSeccompFilter, ownerProcessState, processBirthTicks, processNamespaceId, processParentPid, processesInNamespace, readOwnedNamespaceInit, type ProcessIdentity } from "./workspace.ts";
+import { assertCopyInputs, captureCopyIdentity, captureCopyOutputs, copyStorageBytes, initializeCopy, launchCopy, publishCopy, type CopyContract } from "./setup-copy.ts";
 
 const hash = (value: unknown) => sha256(Buffer.from(JSON.stringify(value)));
 const PRODUCER_FILE = fileURLToPath(import.meta.url);
@@ -20,10 +21,11 @@ const ENV = { PATH: "/tmp/setup-runtime:/usr/bin:/bin", HOME: "/tmp/setup-home",
 const LAUNCH = `printf '{"pidNamespace":"%s","networkNamespace":"%s"}\\n' "$(readlink /proc/self/ns/pid)" "$(readlink /proc/self/ns/net)"; IFS= read -r gate || exit 94; [ "$gate" = GO ] || exit 94; exec /bin/bash ./scripts/setup.sh </dev/null`;
 
 export interface SetupAllocation {
-  effectProfile: "execution-root-local-v1";
+  effectProfile: "execution-root-local-v1" | "execution-root-local-copy-v1";
   writableDirectories: string[];
   activeTimeMs: number;
   artifactBytes: number;
+  copy?: CopyContract;
 }
 interface PathRow {
   path: string;
@@ -32,9 +34,12 @@ interface PathRow {
   identity?: string;
   hash?: string;
   target?: string;
+  size?: number;
+  nlink?: number;
+  mtimeMs?: number;
 }
 export interface SetupIdentity {
-  format: "mission-setup-input-v1";
+  format: "mission-setup-input-v1" | "mission-setup-input-v2";
   binding: ExecutionBinding;
   repositoryFamily: string;
   rootIdentity: string;
@@ -46,6 +51,8 @@ export interface SetupIdentity {
   platform: { os: string; arch: string; abi: string };
   environment: typeof ENV;
   producerHash: string;
+  copy?: { destination: string; seeds: Array<{ source: string; destination: string; rootIdentity: string; rows: PathRow[] }>;
+    bounds: CopyContract["bounds"] };
 }
 export interface PreparedSetup {
   identity: SetupIdentity;
@@ -102,6 +109,7 @@ interface StartAuthority {
   preparedHash: string | undefined;
   definitionHash: string;
   recheck: () => void;
+  scope: "start" | "prepare";
 }
 const starts = new WeakMap<SetupStartAdmission, StartAuthority>();
 
@@ -127,7 +135,21 @@ export function admitSetupStart(store: MissionStore, missionId: string, sessionI
   const admission = Object.freeze({ id: receipt.id });
   starts.set(admission, { store, missionId, revision: inspection.revision, ownerEpoch: store.ownerEpoch,
     writerIdentity: store.ownershipIdentity,
-    preparedHash: inspection.snapshot.preparedHash, definitionHash: inspection.snapshot.definitionHash, recheck });
+    preparedHash: inspection.snapshot.preparedHash, definitionHash: inspection.snapshot.definitionHash, recheck, scope: "start" });
+  return admission;
+}
+
+/** The exact prepared native payload already authorizes this recipe, not activation. */
+export function admitPreparedSetup(store: MissionStore, missionId: string, recheck: () => void): SetupStartAdmission {
+  recheck();
+  const inspection = store.inspectMission(missionId);
+  if (inspection.state !== "prepared" || !inspection.prepared?.setup?.identity.copy ||
+    inspection.prepared.setup.decision.source !== "native-confirmation" || store.ownerEpoch === null)
+    throw new Error("prepare setup requires a current native-approved copied contract");
+  const admission = Object.freeze({ id: inspection.prepared.setup.decision.receiptId });
+  starts.set(admission, { store, missionId, revision: inspection.revision, ownerEpoch: store.ownerEpoch,
+    writerIdentity: store.ownershipIdentity, preparedHash: inspection.snapshot.preparedHash,
+    definitionHash: inspection.snapshot.definitionHash, recheck, scope: "prepare" });
   return admission;
 }
 
@@ -217,6 +239,7 @@ function libraries(runtimes: SetupIdentity["runtimes"]): SetupIdentity["librarie
 }
 
 export function captureSetupIdentity(binding: ExecutionBinding, values: SetupAllocation): SetupIdentity {
+  if (values.effectProfile === "execution-root-local-copy-v1") return captureCopyIdentity(binding, values);
   verifyExecutionBinding(binding);
   const root = binding.executionRoot;
   if (realpathSync(root) !== root || !lstatSync(root).isDirectory()) throw new Error("setup needs exact physical execution root");
@@ -241,6 +264,7 @@ export function captureSetupIdentity(binding: ExecutionBinding, values: SetupAll
     environment: ENV, producerHash: hash([sha256(readFileSync(PRODUCER_FILE)), sha256(readFileSync(CONTAINMENT_FILE))]) };
 }
 export function captureSetupOutputs(setup: Pick<PreparedSetup, "identity" | "decision">): PathRow[] {
+  if (setup.identity.copy) return captureCopyOutputs(setup.identity);
   return setup.decision.values.writableDirectories.flatMap((name) => {
     const target = path.join(setup.identity.binding.executionRoot, name);
     return [{ path: name, kind: "directory" as const, identity: physical(target), mode: lstatSync(target).mode },
@@ -248,6 +272,7 @@ export function captureSetupOutputs(setup: Pick<PreparedSetup, "identity" | "dec
   });
 }
 export function assertSetupInputs(setup: Pick<PreparedSetup, "identity" | "decision">): void {
+  if (setup.identity.copy) { assertCopyInputs(setup); return; }
   if (hash(captureSetupIdentity(setup.identity.binding, setup.decision.values)) !== hash(setup.identity))
     throw new Error("approved setup source/runtime/procedure identity changed");
   captureSetupOutputs(setup);
@@ -287,7 +312,7 @@ export class MissionSetup {
           const bytes = this.store.readArtifact(String(event.payload.receiptHash ?? event.payload.observationHash));
           const proof = JSON.parse(bytes.toString());
           return proof.intentId === intent.eventId && proof.missionId === this.missionId && proof.disposed === true &&
-            (event.kind === "mission.setup.receipt" ? proof.format === "mission-setup-receipt-v1" &&
+            (event.kind === "mission.setup.receipt" ? proof.format === (input.setup.identity.copy ? "mission-setup-receipt-v2" : "mission-setup-receipt-v1") &&
               proof.revision === intent.revision && proof.status === event.payload.status &&
               proof.admissionId === input.admissionId &&
               proof.preparedHash === input.preparedHash && proof.definitionHash === input.definitionHash &&
@@ -358,7 +383,12 @@ export class MissionSetup {
       obligationsHash: hash(inspection.definition.units), receiptHash };
   }
   observe(inspection = this.store.inspectMission(this.missionId)): SetupReadiness {
-    const readiness = this.compatibleSuccess(inspection);
+    let readiness: SetupReadiness;
+    try { readiness = this.compatibleSuccess(inspection); }
+    catch (error) {
+      if (!inspection.prepared?.setup?.identity.copy) throw error;
+      return { state: "blocked", reason: String(error) };
+    }
     if (readiness.state === "ready" && readiness.reuseHash) {
       const reference = inspection.events.find((event) => event.kind === "mission.setup.reused" &&
         event.revision === inspection.revision && event.payload.reuseHash === readiness.reuseHash &&
@@ -367,6 +397,16 @@ export class MissionSetup {
         return { state: "blocked", reason: "compatible setup success needs a current durable reuse reference" };
     }
     return readiness;
+  }
+  dependencyBacking(): { root: string; identity: string; recheck: () => void } | undefined {
+    const setup = this.store.inspectMission(this.missionId).prepared?.setup;
+    if (!setup?.identity.copy) return undefined;
+    if (this.observe().state !== "ready") throw new Error("copied dependency consumer requires current settled proof");
+    const root = path.join(setup.identity.copy.destination, "published/node_modules");
+    const stat = lstatSync(root);
+    return { root, identity: `${stat.dev}:${stat.ino}`, recheck: () => {
+      if (this.observe().state !== "ready") throw new Error("copied setup proof is no longer current");
+    } };
   }
   private compatibleSuccess(inspection = this.store.inspectMission(this.missionId)): SetupReadiness {
     const setup = inspection.prepared?.setup;
@@ -383,7 +423,7 @@ export class MissionSetup {
     const input = JSON.parse(this.store.readArtifact(String(intent.payload.inputHash)).toString());
     const released = inspection.events.find((row) => row.kind === "mission.setup.invoking" &&
       row.payload.intentId === intent.eventId && row.payload.released === true);
-    if (!this.quiescentFor(inspection) || receipt.format !== "mission-setup-receipt-v1" || receipt.missionId !== this.missionId ||
+    if (!this.quiescentFor(inspection) || receipt.format !== (setup.identity.copy ? "mission-setup-receipt-v2" : "mission-setup-receipt-v1") || receipt.missionId !== this.missionId ||
       receipt.intentId !== intent.eventId || receipt.revision !== intent.revision || receipt.preparedHash !== input.preparedHash ||
       receipt.definitionHash !== input.definitionHash || hash(input.setup) !== hash(setup) ||
       input.revision > inspection.revision ||
@@ -392,10 +432,13 @@ export class MissionSetup {
       hash(JSON.parse(this.store.readArtifact(input.definitionHash).toString()).authority) !== hash(inspection.definition.authority) ||
       !released || hash(released.payload.process) !== hash(receipt.process) || receipt.released !== true ||
       receipt.exitCode !== 0 || receipt.truncated !== false || receipt.timedOut !== false ||
-      receipt.cwd !== setup.identity.binding.executionRoot || hash(receipt.argv) !== hash(["/bin/bash", "./scripts/setup.sh"]) ||
+      receipt.cwd !== (setup.identity.copy ? "/capsule" : setup.identity.binding.executionRoot) || hash(receipt.argv) !== hash(["/bin/bash", "./scripts/setup.sh"]) ||
       receipt.status !== "completed" || receipt.disposed !== true || receipt.inputHash !== hash(setup.identity) ||
       receipt.decisionHash !== hash(setup.decision) || hash(receipt.after) !== hash(captureSetupOutputs(setup)))
       return { state: "blocked", reason: "setup success/input/output compatibility is absent" };
+    if (setup.identity.copy && (!receipt.after.length || hash(receipt.copy) !== hash(setup.identity.copy) ||
+      receipt.capsuleIdentityHash !== sha256(readFileSync(path.join(setup.identity.copy.destination, "identity.json")))))
+      return { state: "blocked", reason: "copied setup capsule/output binding changed" };
     missionInputIdentity(inspection, setup.identity.binding.executionRoot);
     const receiptHash = String(event.payload.receiptHash);
     return { state: "ready", receiptHash, reused: true,
@@ -410,7 +453,13 @@ export class MissionSetup {
     if (starts.has(admission) && this.quiescent) this.fenced = false;
     const job = this.run(admission, consumersQuiescent);
     this.job = job;
-    return job.finally(() => { this.job = undefined; });
+    return job.finally(() => { this.job = undefined; }).then((result) => {
+      if (inspection.prepared?.setup?.identity.copy && result.state === "ready") {
+        const observed = this.observe();
+        return observed.state === "ready" ? { ...observed, reused: false } : observed;
+      }
+      return result;
+    });
   }
   private check(admission: SetupStartAdmission, quiescent: () => boolean): MissionInspection {
     const authority = starts.get(admission);
@@ -421,7 +470,8 @@ export class MissionSetup {
     authority.recheck();
     const inspection = this.store.inspectMission(this.missionId);
     if (inspection.revision !== authority.revision || inspection.snapshot.preparedHash !== authority.preparedHash ||
-      inspection.snapshot.definitionHash !== authority.definitionHash || !["running", "blocked"].includes(inspection.state))
+      inspection.snapshot.definitionHash !== authority.definitionHash ||
+      !(authority.scope === "prepare" ? inspection.state === "prepared" : ["running", "blocked"].includes(inspection.state)))
       throw new Error("setup admitted revision/state changed");
     if (inspection.events.some(({ kind }) => kind === "budget.admission.fenced"))
       throw new Error("setup admission fenced by existing resource budget");
@@ -468,7 +518,8 @@ export class MissionSetup {
     let processIdentity: Record<string, unknown> | undefined;
     try {
       this.check(admission, quiescent);
-      this.child = launch(setup);
+      if (setup.identity.copy) initializeCopy(setup);
+      this.child = setup.identity.copy ? launchCopy(setup) : launch(setup);
       this.disposed = false;
       const child = this.child;
       child.stdin!.on("error", () => this.fence());
@@ -525,9 +576,14 @@ export class MissionSetup {
       status = this.disposed ? "stopped" : "unknown";
     } finally { if (timer) clearTimeout(timer); }
     let after: PathRow[] = [], outputError: string | undefined;
-    try { after = captureSetupOutputs(setup); } catch (error) {
+    let copiedBytes = 0;
+    try {
+      if (setup.identity.copy && status === "completed") publishCopy(setup);
+      after = captureSetupOutputs(setup);
+    } catch (error) {
       outputError = String(error); status = this.disposed ? "failed" : "unknown"; reason += `; ${outputError}`;
     }
+    if (setup.identity.copy) copiedBytes = copyStorageBytes(setup.identity);
     if (status === "completed") {
       try { this.check(admission, quiescent); }
       catch (error) { status = this.disposed ? "stopped" : "unknown"; reason = String(error); }
@@ -536,16 +592,21 @@ export class MissionSetup {
     if (duration >= values.activeTimeMs && status === "completed") {
       status = "failed"; timedOut = true; reason = "setup allocation exhausted before success commit";
     }
-    const detail = { format: "mission-setup-receipt-v1", intentId: intent.eventId,
+    const detail = { format: setup.identity.copy ? "mission-setup-receipt-v2" : "mission-setup-receipt-v1", intentId: intent.eventId,
       missionId: this.missionId, revision: inspection.revision, preparedHash: inspection.snapshot.preparedHash,
       definitionHash: inspection.snapshot.definitionHash, inputHash: hash(setup.identity), decisionHash: hash(setup.decision),
       admissionId: admission.id, owner, process: processIdentity, status, reason, exitCode, released, timedOut, truncated,
       duration, disposed: this.disposed, before, after, outputError,
-      argv: ["/bin/bash", "./scripts/setup.sh"], cwd: setup.identity.binding.executionRoot,
+      ...(setup.identity.copy ? { copy: setup.identity.copy, copiedBytes,
+        capsuleIdentityHash: existsSync(path.join(setup.identity.copy.destination, "identity.json")) ?
+          sha256(readFileSync(path.join(setup.identity.copy.destination, "identity.json"))) : null,
+        measuredOutput: { paths: after.length, largestFileBytes: after.reduce((n, row) => Math.max(n, row.size ?? 0), 0),
+          totalBytes: after.reduce((n, row) => n + (row.size ?? 0), 0) } } : {}),
+      argv: ["/bin/bash", "./scripts/setup.sh"], cwd: setup.identity.copy ? "/capsule" : setup.identity.binding.executionRoot,
       stdout: stdout.toString("utf8"), stderr: stderr.toString("utf8"),
       stdoutBase64: stdout.toString("base64"), stderrBase64: stderr.toString("base64") };
     let receipt = Buffer.from(JSON.stringify(detail));
-    if (input.length + receipt.length > values.artifactBytes) {
+    if (copiedBytes + input.length + receipt.length > values.artifactBytes) {
       status = this.disposed ? "failed" : "unknown";
       Object.assign(detail, { status, reason: "setup evidence exceeds allocation; manifests/logs omitted, no reusable success",
         outputError: "evidence allocation exhausted", truncated: true, before: [], after: [],
@@ -562,11 +623,11 @@ export class MissionSetup {
         payload: { intentId: intent.eventId, receiptHash: sha256(receipt), status, disposed: this.disposed } },
         ...reservations.map((reservation) => ({ revision: inspection.revision, kind: "budget.reservation.settled" as const,
           causalId: randomUUID(), payload: { reservationId: reservation.id, resource: reservation.resource,
-            knownCharge: reservation.resource === "active-time-ms" ? duration : input.length + receipt.length,
+            knownCharge: reservation.resource === "active-time-ms" ? duration : copiedBytes + input.length + receipt.length,
             unknownCharge: this.disposed ? 0 : Math.max(0, reservation.amount -
-              (reservation.resource === "active-time-ms" ? duration : input.length + receipt.length)),
+              (reservation.resource === "active-time-ms" ? duration : copiedBytes + input.length + receipt.length)),
             released: !this.disposed ? 0 : reservation.resource === "active-time-ms" ? Math.max(0, reservation.amount - duration) :
-              Math.max(0, reservation.amount - input.length - receipt.length), remainingHold: 0 } }))] });
+              Math.max(0, reservation.amount - copiedBytes - input.length - receipt.length), remainingHold: 0 } }))] });
     return status === "completed" ? { state: "ready", receiptHash: sha256(receipt), reused: false } : { state: "blocked", reason };
   }
   private async drain(): Promise<void> {

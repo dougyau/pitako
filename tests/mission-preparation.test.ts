@@ -1,9 +1,13 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, linkSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { createHash } from "node:crypto";
 import { admitMissionChange, nextPlanBytes, recordOperatorChoice, recordOperatorInput } from "../extensions/mission/admission.ts";
-import { missionPolicyTargets } from "../extensions/mission/engine.ts";
+import { MissionEngine, missionPolicyTargets } from "../extensions/mission/engine.ts";
+import { missionCompletionCertificate } from "../extensions/mission/completion.ts";
+import { auditCompletionEvidence } from "../extensions/mission/completion-evidence.ts";
 import { missionInputIdentity } from "../extensions/mission/inputs.ts";
 import { sha256, type MissionDefinition } from "../extensions/mission/model.ts";
 import {
@@ -11,9 +15,812 @@ import {
   preparationContext, preparedAdmissionText, validatePreparation, type EvidenceMapping,
   bindPreparationSetup, preparationSetupText,
 } from "../extensions/mission/preparation.ts";
-import { admitSetupStart, assertSetupRequirements, MissionSetup, setupRequiredBy, setupStartText, type SetupAllocation } from "../extensions/mission/setup.ts";
+import { admitSetupStart, assertSetupRequirements, captureSetupOutputs, MissionSetup, setupRequiredBy, setupStartText, type SetupAllocation } from "../extensions/mission/setup.ts";
 import { createMissionWorkspace, preflightContainment, processesInNamespace, spawnContained } from "../extensions/mission/workspace.ts";
 import { createMissionFixture, missionDefinition, openFixtureStore } from "./mission-fixtures.ts";
+import { fixtureCommandTime } from "./mission-fixtures.ts";
+import { assessMissionPredicate, readNestedVerificationAdmission } from "../extensions/mission/checks.ts";
+import * as workspaceModule from "../extensions/mission/workspace.ts";
+import { MissionEffects } from "../extensions/mission/effects.ts";
+import { captureWorkspaceImage } from "../extensions/mission/workspace.ts";
+import { missionEffectProcessesQuiescent, reconcileMission, sealWorkspaceImage } from "../extensions/mission/reconcile.ts";
+
+test("nested profile permission requires exact native confirmation, not console or proposal text", () => {
+  const sample = preparedFixture();
+  try {
+    sample.proposal.definition.authority.verificationProfiles = ["sealed-nested-verification-v1"];
+    const values = { authority: sample.proposal.definition.authority, budget: sample.proposal.definition.budget };
+    const text = preparationAuthorityText(sample.request, values);
+    expect(() => bindPreparationAuthority(sample.request, values, recordOperatorInput("console", "principal", text)!))
+      .toThrow(/explicit native confirmation/);
+    expect(validatePreparation({ request: sample.request, proposal: sample.proposal }).state).not.toBe("ready");
+    bindPreparationAuthority(sample.request, values, recordOperatorInput("native-confirmation", "principal", text)!);
+    expect(validatePreparation({ request: sample.request, proposal: sample.proposal }).state).toBe("ready");
+  } finally { rmSync(sample.fixture.base, { recursive: true, force: true }); }
+});
+
+test("native checker admits sealed nested containment and ordinary SDK in one offline effect", async () => {
+  const sample = preparedFixture();
+  let store: Awaited<ReturnType<typeof openFixtureStore>> | undefined;
+  let effects: MissionEffects | undefined;
+  try {
+    for (const dir of ["extensions", "scripts", "roles"]) cpSync(path.join(process.cwd(), dir), path.join(sample.executionRoot, dir), { recursive: true });
+    rmSync(path.join(sample.executionRoot, "scripts/setup.sh"));
+    cpSync(path.join(process.cwd(), "package.json"), path.join(sample.executionRoot, "package.json"));
+    for (const file of ["tests/mission-local-provider.ts", "tests/fixtures/nested-verification-case.ts"]) {
+      mkdirSync(path.dirname(path.join(sample.executionRoot, file)), { recursive: true });
+      cpSync(path.join(process.cwd(), file), path.join(sample.executionRoot, file));
+    }
+    cpSync(path.join(process.cwd(), "node_modules"), path.join(sample.executionRoot, "node_modules"), { recursive: true, verbatimSymlinks: true });
+    writeFileSync(path.join(sample.executionRoot, ".gitignore"), "node_modules/\n");
+    const definition = sample.proposal.definition;
+    definition.authority.verificationProfiles = ["sealed-nested-verification-v1"];
+    definition.budget.artifactBytes = 16000000000;
+    const selected = definition.units[0]!.acceptance[0]!;
+    Object.assign(selected, { target: "result", expected: "0", profile: "sealed-nested-verification-v1",
+      command: `bun tests/fixtures/nested-verification-case.ts '${path.join(homedir(), ".ssh").replaceAll("'", "'\\''")}'`, timeoutMs: 60000 });
+    const text = preparationAuthorityText(sample.request, { authority: definition.authority, budget: definition.budget });
+    bindPreparationAuthority(sample.request, { authority: definition.authority, budget: definition.budget },
+      recordOperatorInput("native-confirmation", "principal", text)!);
+    const prepared = validatePreparation({ request: sample.request, proposal: sample.proposal });
+    if (prepared.state !== "ready") throw new Error(JSON.stringify(prepared));
+    store = await openFixtureStore(sample.fixture);
+    const admissionText = preparedAdmissionText(prepared.prepared);
+    const receipt = recordOperatorInput("native-confirmation", "principal", admissionText)!;
+    const mission = store.createMission({ repositoryRoot: sample.executionRoot, planId: "durable-fixture", prepared: prepared.prepared,
+      commandId: receipt.id, admissionReceiptId: receipt.id, operatorText: admissionText, operatorReceipt: receipt });
+    const workspace = createMissionWorkspace({ missionId: mission.id, attemptId: crypto.randomUUID(), sourceRoot: sample.executionRoot,
+      productRoot: sample.executionRoot, storeRoot: store.storageRoot, candidateParent: path.join(sample.fixture.base, "candidates"), allowedPaths: ["."] });
+    await preflightContainment(workspace);
+    const sealed = sealWorkspaceImage(captureWorkspaceImage(workspace.candidateRoot));
+    store.appendTransition(mission.id, store.inspectMission(mission.id).version, { events: [{
+      revision: 1, kind: "mission.input.visible", causalId: crypto.randomUUID(), payload: {},
+    }], artifacts: sealed.artifacts });
+    effects = new MissionEffects({ store, workspace, missionId: mission.id, revision: 1, unitId: definition.units[0]!.id,
+      attemptId: workspace.attemptId, runtimeId: store.runtimeId, ownerEpoch: store.ownerEpoch!, allowedOperations: ["bash"],
+      commandTime: fixtureCommandTime(120000) });
+    const predicate = store.inspectMission(mission.id).definition.units[0]!.acceptance[0]!;
+    const insufficient = await assessMissionPredicate({ predicate, subject: { kind: "workspace", imageHash: sealed.imageHash } },
+      { store, effects, scopeEstablished: true, inputBindingHash: "a".repeat(64), timeoutLimitMs: 120000, artifactLimitBytes: 2000000 });
+    expect(insufficient.verdict).toBe("inconclusive");
+    expect(insufficient.method).toContain("insufficient finite artifact grant");
+    expect(store.inspectMission(mission.id).events.some(({ kind }) => kind === "effect.invoking")).toBe(false);
+    const observation = await assessMissionPredicate({ predicate, subject: { kind: "workspace", imageHash: sealed.imageHash } },
+      { store, effects, scopeEstablished: true, inputBindingHash: "a".repeat(64), timeoutLimitMs: 120000, artifactLimitBytes: 2000000000 });
+    const proof = JSON.parse(Buffer.from(observation.artifactBytes!).toString());
+    const evidence = process.env.MISSION_T4_ARTIFACT_DIR;
+    if (evidence) {
+      mkdirSync(evidence, { recursive: true });
+      writeFileSync(path.join(evidence, "native-observation.json"), JSON.stringify(proof, null, 2));
+      for (const [index, artifact] of (observation.artifacts ?? []).entries())
+        writeFileSync(path.join(evidence, `artifact-${index}`), artifact.bytes);
+      writeFileSync(path.join(evidence, "events.json"), JSON.stringify(store.inspectMission(mission.id).events, null, 2));
+    }
+    expect(proof.reason).toBe("contained exact command passed");
+    expect(observation.verdict).toBe("pass");
+    expect(proof.receipt.stdoutSummary).toContain("NESTED_AND_SDK_PASS");
+    expect(proof.receipt.stderrSummary).toContain("NESTED_TRAILING_STDERR");
+    expect(proof.cleanupWitness.outerInitRetired).toBe(true);
+    expect(proof.exportManifest.length).toBeGreaterThanOrEqual(3);
+    expect(effects.quiescent).toBe(true);
+  } finally {
+    store?.close();
+    if (!effects || effects.quiescent) rmSync(sample.fixture.base, { recursive: true, force: true });
+  }
+}, 120000);
+
+for (const backing of ["absent", "denied", "denied-after-mkdir", "symlink", "populated",
+  "forged-predicate", "forged-authority", "stale-grant", "policy-mismatch", "cancel-after-go"] as const)
+test(`native nested launcher validates ${backing} dependency mountpoint before child`, async () => {
+  const sample = preparedFixture();
+  let store: Awaited<ReturnType<typeof openFixtureStore>> | undefined;
+  let effects: MissionEffects | undefined;
+  let restoreFilter: (() => void) | undefined;
+  let cancellationPoll: ReturnType<typeof setInterval> | undefined;
+  let cancellationLimit: ReturnType<typeof setTimeout> | undefined;
+  let cancellationObserved: Record<string, unknown> | undefined;
+  let recoveryObservation: Promise<unknown> | undefined;
+  let restoreInspection: (() => void) | undefined;
+  try {
+    const definition = sample.proposal.definition;
+    definition.authority.verificationProfiles = ["sealed-nested-verification-v1"];
+    definition.budget.artifactBytes = 16000000000;
+    const selected = { id: `mountpoint-${backing}`, kind: "command_exit" as const,
+      target: "result", expected: "0", profile: "sealed-nested-verification-v1" as const,
+      command: "printf MOUNTPOINT_READY; printf TRAILING >&2", timeoutMs: 60000 };
+    definition.units[0]!.acceptance.push(selected);
+    if (backing === "cancel-after-go") selected.command = `node -e 'const cp=require("child_process"),fs=require("fs"); const marker="/verification/scratch/detached-started"; const child=cp.spawn("/usr/bin/bwrap",["--unshare-user","--unshare-pid","--ro-bind","/","/","--bind","/verification/scratch","/verification/scratch","--proc","/proc","--","/bin/bash","-c","printf started > "+marker+"; exec /usr/bin/sleep 1000"],{detached:true,stdio:"ignore"});child.unref();setInterval(()=>{},1000);'`;
+    const values = { authority: definition.authority, budget: definition.budget };
+    bindPreparationAuthority(sample.request, values,
+      recordOperatorInput("native-confirmation", "principal", preparationAuthorityText(sample.request, values))!);
+    const prepared = validatePreparation({ request: sample.request, proposal: sample.proposal });
+    if (prepared.state !== "ready") throw new Error(JSON.stringify(prepared));
+    store = await openFixtureStore(sample.fixture);
+    const text = preparedAdmissionText(prepared.prepared);
+    const admission = recordOperatorInput("native-confirmation", "principal", text)!;
+    const mission = store.createMission({ repositoryRoot: sample.executionRoot, planId: "durable-fixture",
+      prepared: prepared.prepared, commandId: admission.id, admissionReceiptId: admission.id,
+      operatorText: text, operatorReceipt: admission });
+    const workspace = createMissionWorkspace({ missionId: mission.id, attemptId: crypto.randomUUID(),
+      sourceRoot: sample.executionRoot, productRoot: sample.executionRoot, storeRoot: store.storageRoot,
+      candidateParent: path.join(sample.fixture.base, "candidates"), allowedPaths: ["."] });
+    const sourceBefore = sealWorkspaceImage(captureWorkspaceImage(sample.executionRoot)).imageHash;
+    expect(existsSync(path.join(sample.executionRoot, "node_modules"))).toBe(false);
+    await preflightContainment(workspace);
+    expect(existsSync(path.join(workspace.candidateRoot, "node_modules"))).toBe(false);
+    const mountpoint = path.join(workspace.candidateRoot, "node_modules");
+    if (backing === "symlink") {
+      const target = path.join(sample.fixture.base, "empty-link-target");
+      mkdirSync(target, { mode: 0o700 });
+      symlinkSync(target, mountpoint);
+    }
+    if (backing === "populated") {
+      mkdirSync(mountpoint, { mode: 0o700 });
+      writeFileSync(path.join(mountpoint, "candidate-content"), "must not overlay");
+    }
+    let launcherPrepared = false;
+    const launcher = workspace.bwrapPath;
+    Object.defineProperty(workspace, "bwrapPath", { get() {
+      launcherPrepared = true;
+      return launcher;
+    } });
+    const sealed = sealWorkspaceImage(captureWorkspaceImage(workspace.candidateRoot));
+    store.appendTransition(mission.id, store.inspectMission(mission.id).version, { events: [{
+      revision: 1, kind: "mission.input.visible", causalId: crypto.randomUUID(), payload: {},
+    }], artifacts: sealed.artifacts });
+    effects = new MissionEffects({ store, workspace, missionId: mission.id, revision: 1,
+      unitId: definition.units[0]!.id, attemptId: workspace.attemptId, runtimeId: store.runtimeId,
+      ownerEpoch: store.ownerEpoch!, allowedOperations: ["bash"], commandTime: {
+        admit: async requested => requested!,
+        remaining: () => launcherPrepared && (backing === "denied" ||
+          backing === "denied-after-mkdir" && existsSync(mountpoint)) ? 0 : 120000,
+      } });
+    const controller = new AbortController();
+    if (backing === "stale-grant" || backing === "cancel-after-go") {
+      const enable = effects.enableNestedVerification.bind(effects);
+      effects.enableNestedVerification = token => {
+        enable(token);
+        const grant = readNestedVerificationAdmission(token, workspace);
+        if (backing === "stale-grant") {
+          const current = store!.inspectMission(mission.id);
+          store!.appendTransition(mission.id, current.version, { events: [{
+            revision: current.revision, kind: "mission.cancelled", causalId: crypto.randomUUID(), payload: { reason: "fixture cancellation fences issued grant" },
+          }] });
+        } else {
+          cancellationPoll = setInterval(() => {
+            const marker = path.join(grant.capsule.root, "scratch/detached-started");
+            if (!existsSync(marker)) return;
+            const rows = store!.inspectMission(mission.id).events;
+            cancellationObserved = { marker: readFileSync(marker, "utf8"), registered: rows.some(row => row.kind === "effect.process.registered"),
+              released: rows.some(row => row.kind === "effect.released"),
+              liveProcessesQuiescent: missionEffectProcessesQuiescent(rows, workspace.attemptId) };
+            clearInterval(cancellationPoll);
+            recoveryObservation = (async () => {
+              const liveLifetime: Record<string, unknown>[] = [];
+              expect(missionEffectProcessesQuiescent(rows, workspace.attemptId, liveLifetime)).toBe(false);
+              const live = await reconcileMission({ store: store!, missionId: mission.id,
+                sourceRoot: sample.executionRoot, trigger: "nested-live-owner" });
+              const inspect = store!.inspectMission.bind(store);
+              // Negative observation: the same native registration belongs to an unobservable host.
+              store!.inspectMission = (...args) => {
+                const current = inspect(...args);
+                for (const row of current.events.filter(row => row.attemptId === workspace.attemptId))
+                  for (const key of ["owner", "identity", "processIdentity"])
+                    if (row.payload[key]) (row.payload[key] as Record<string, unknown>).hostId = "unobservable-host";
+                return current;
+              };
+              let unknown;
+              const unknownLifetime: Record<string, unknown>[] = [];
+              try {
+                expect(missionEffectProcessesQuiescent(store!.inspectMission(mission.id).events,
+                  workspace.attemptId, unknownLifetime)).toBe(false);
+                unknown = await reconcileMission({ store: store!, missionId: mission.id,
+                  sourceRoot: sample.executionRoot, trigger: "nested-unknown-owner" });
+              } finally { store!.inspectMission = inspect; }
+              return { live: { report: live, lifetime: liveLifetime }, unknown: { report: unknown, lifetime: unknownLifetime } };
+            })().finally(() => controller.abort("native nested fixture cancellation after detached startup"));
+            void recoveryObservation.catch(() => {});
+          }, 10);
+          cancellationLimit = setTimeout(() => controller.abort("detached startup not observed within fixture bound"), 20000);
+        }
+      };
+      if (backing === "cancel-after-go") {
+        const invoke = effects.invoke.bind(effects);
+        effects.invoke = (operation, input) => invoke(operation, input, controller.signal);
+      }
+    }
+    if (backing === "policy-mismatch") {
+      const original = workspaceModule.openSeccompFilter;
+      let opened = 0;
+      const filter = spyOn(workspaceModule, "openSeccompFilter").mockImplementation(profile =>
+        original(++opened === 2 ? undefined : profile));
+      restoreFilter = () => filter.mockRestore();
+    }
+    const admittedPredicate = store.inspectMission(mission.id).definition.units[0]!.acceptance.find(row => row.id === selected.id)!;
+    const predicate = backing === "forged-predicate" ? { ...admittedPredicate, command: "printf forged" } : admittedPredicate;
+    if (backing === "forged-authority") {
+      // Corrupt only the bytes presented to the production checker, never issue new authority.
+      const inspect = store.inspectMission.bind(store);
+      store.inspectMission = (...args) => {
+        const current = inspect(...args);
+        const authority = JSON.parse(current.prepared!.authorityDecision.text);
+        authority.values.budget.activeTimeMs += 1;
+        current.prepared!.authorityDecision.text = JSON.stringify(authority);
+        return current;
+      };
+      restoreInspection = () => { store!.inspectMission = inspect; };
+    }
+    const observation = await assessMissionPredicate({ predicate, subject: { kind: "workspace", imageHash: sealed.imageHash } },
+      { store, effects, scopeEstablished: true, inputBindingHash: "c".repeat(64),
+        timeoutLimitMs: 120000, artifactLimitBytes: 2000000000 });
+    const recoveryProof = await recoveryObservation;
+    const proof = JSON.parse(Buffer.from(observation.artifactBytes!).toString());
+    const identities = { sourceBefore, sourceAfter: sealWorkspaceImage(captureWorkspaceImage(sample.executionRoot)).imageHash,
+      sealedBefore: sealed.imageHash, sealedAfter: sealWorkspaceImage(captureWorkspaceImage(workspace.candidateRoot)).imageHash };
+    if (process.env.MISSION_T4_ARTIFACT_DIR) {
+      const root = process.env.MISSION_T4_ARTIFACT_DIR;
+      mkdirSync(root, { recursive: true });
+      writeFileSync(path.join(root, `mountpoint-${backing}.json`), JSON.stringify({ proof, identities, workspace,
+        mountpoint: existsSync(mountpoint) ? { mode: lstatSync(mountpoint).mode & 0o777,
+          symlink: lstatSync(mountpoint).isSymbolicLink() } : null,
+        fixtureRoot: sample.fixture.base, quiescent: effects.quiescent, cancellationObserved, recoveryProof }, null, 2));
+      writeFileSync(path.join(root, `mountpoint-${backing}-events.json`), JSON.stringify(store.inspectMission(mission.id).events, null, 2));
+      for (const [index, artifact] of (observation.artifacts ?? []).entries())
+        writeFileSync(path.join(root, `mountpoint-${backing}-artifact-${index}`), artifact.bytes);
+    }
+    if (backing !== "absent") {
+      expect(observation.verdict).toBe("inconclusive");
+      const rows = store.inspectMission(mission.id).events;
+      if (backing === "cancel-after-go") {
+        expect(cancellationObserved).toEqual({ marker: "started", registered: true, released: true, liveProcessesQuiescent: false });
+        for (const [state, observation] of Object.entries(recoveryProof as Record<string, {
+          report: Awaited<ReturnType<typeof reconcileMission>>; lifetime: Record<string, unknown>[];
+        }>)) {
+          expect(observation.lifetime).toEqual([expect.objectContaining({ effectId: proof.receipt.effectId,
+            namespaceInitState: state, quiescent: false })]);
+          expect(observation.report.blockers).toContain("prior mission owner release or positive death proof is missing");
+          expect(observation.report.status).toBe("blocked");
+          expect(observation.report.effects).toEqual([]);
+        }
+        expect(store.ownerEpoch).toBe(1);
+        expect(rows.some(row => row.kind === "effect.reconciled" || row.kind === "mission.owner.released")).toBe(false);
+        const terminal = rows.filter(row => row.kind === "effect.receipt").at(-1)!;
+        expect(terminal.payload.status).toBe("failed");
+        expect(terminal.payload.termination).toBe("signal");
+        expect(terminal.payload.process).toMatchObject({ outerInitRetired: true });
+        expect(effects.quiescent).toBe(true);
+        return;
+      }
+      expect(rows.some(row => row.kind === "effect.process.registered" || row.kind === "effect.released")).toBe(false);
+      if (backing === "forged-predicate" || backing === "forged-authority" || backing === "stale-grant" || backing === "policy-mismatch") {
+        expect(proof.reason).toBe(backing === "forged-predicate" ? "explicit native nested verification authority is missing" :
+          backing === "forged-authority" ? "native nested verification authority does not match the frozen definition" :
+          backing === "stale-grant" ? "nested verification grant is stale or fenced" : "nested verification profile policy proof mismatch");
+        expect(existsSync(mountpoint)).toBe(false);
+        return;
+      }
+      if (backing === "denied" || backing === "denied-after-mkdir") {
+        expect(existsSync(mountpoint)).toBe(false);
+        expect(proof.receipt).toMatchObject({ status: "denied", paths: [],
+          reason: "command timeout exceeds current remaining effect time grant" });
+        expect(rows.filter(row => row.kind === "effect.receipt").at(-1)!.payload.process).toBeNull();
+      } else {
+        expect(proof.reason).toBe("source dependency mountpoint contains unexpected candidate content");
+        if (backing === "symlink") expect(lstatSync(mountpoint).isSymbolicLink()).toBe(true);
+        else expect(readFileSync(path.join(mountpoint, "candidate-content"), "utf8")).toBe("must not overlay");
+      }
+      return;
+    }
+    expect(proof.reason).toBe("contained exact command passed");
+    expect(observation.verdict).toBe("pass");
+    expect(proof.receipt.stdoutSummary).toBe("MOUNTPOINT_READY");
+    expect(proof.receipt.stderrSummary).toBe("TRAILING");
+    expect(proof.cleanupWitness.outerInitRetired).toBe(true);
+    expect(identities.sourceAfter).toBe(sourceBefore);
+    expect(identities.sealedAfter).toBe(sealed.imageHash);
+    expect(effects.quiescent).toBe(true);
+    const events = store.inspectMission(mission.id).events;
+    const effectId = proof.receipt.effectId;
+    expect(auditCompletionEvidence(events, store).effects).toEqual([]);
+    const auditRefusals: Record<string, string[]> = {};
+    for (const alteration of ["missing-retirement", "false-retirement", "changed-identity", "changed-registration",
+      "unknown-field", "unbound-profile", "mismatched-binding", "unknown-profile"] as const) {
+      const changed = structuredClone(events);
+      const terminal = changed.find(row => row.kind === "effect.receipt" && row.effectId === effectId)!;
+      const process = terminal.payload.process as Record<string, unknown>;
+      if (alteration === "missing-retirement") delete process.outerInitRetired;
+      if (alteration === "false-retirement") process.outerInitRetired = false;
+      if (alteration === "changed-identity") process.birthTicks = Number(process.birthTicks) + 1;
+      if (alteration === "changed-registration")
+        (changed.find(row => row.kind === "effect.process.registered")!.payload.identity as Record<string, unknown>).birthTicks = -1;
+      if (alteration === "unknown-field") process.unrecognizedRetirement = true;
+      if (alteration === "unbound-profile" || alteration === "mismatched-binding" || alteration === "unknown-profile") {
+        const intent = changed.find(row => row.kind === "effect.intent" && row.effectId === effectId)!;
+        const plan = JSON.parse(store.readArtifact(String(intent.payload.effectPlanHash)).toString());
+        if (alteration === "unbound-profile") delete plan.nestedVerification;
+        else if (alteration === "mismatched-binding") plan.nestedVerification.ownerEpoch += 1;
+        else plan.nestedVerification.profile = "unknown-profile";
+        const bytes = Buffer.from(JSON.stringify(plan));
+        store.appendTransition(mission.id, store.inspectMission(mission.id).version, { events: [{
+          revision: 1, kind: "mission.input.visible", causalId: crypto.randomUUID(), payload: {},
+        }], artifacts: [{ bytes, mediaType: "application/json" }] });
+        for (const row of changed.filter(row => row.effectId === effectId && ["effect.intent", "effect.invoking"].includes(row.kind)))
+          row.payload.effectPlanHash = sha256(bytes);
+      }
+      auditRefusals[alteration] = auditCompletionEvidence(changed, store).effects;
+      expect(auditRefusals[alteration]).toContain(`effect:${effectId}`);
+    }
+    const ordinary = new MissionEffects({ store, workspace, missionId: mission.id, revision: 1, unitId: definition.units[0]!.id,
+      attemptId: workspace.attemptId, runtimeId: store.runtimeId, ownerEpoch: store.ownerEpoch!, allowedOperations: ["bash"],
+      commandTime: fixtureCommandTime(120000) });
+    const legacy = await ordinary.invoke("bash", { command: "printf LEGACY_IDENTITY" });
+    await ordinary.shutdown();
+    expect(legacy.status).toBe("completed");
+    const legacyRows = store.inspectMission(mission.id).events.filter(row => row.effectId === legacy.effectId);
+    expect(auditCompletionEvidence(legacyRows, store).effects).toEqual([]);
+    for (const extra of [{ outerInitRetired: true }, { unknownObservation: true }, { birthTicks: -1 }]) {
+      const changed = structuredClone(legacyRows);
+      Object.assign(changed.find(row => row.kind === "effect.receipt")!.payload.process as object, extra);
+      expect(auditCompletionEvidence(changed, store).effects).toContain(`effect:${legacy.effectId}`);
+    }
+    if (process.env.MISSION_T4_ARTIFACT_DIR) {
+      const intent = events.find(row => row.kind === "effect.intent" && row.effectId === effectId)!;
+      writeFileSync(path.join(process.env.MISSION_T4_ARTIFACT_DIR, "completion-audit.json"), JSON.stringify({
+        effectId, planHash: intent.payload.effectPlanHash,
+        plan: JSON.parse(store.readArtifact(String(intent.payload.effectPlanHash)).toString()),
+        nativeRows: events.filter(row => row.effectId === effectId),
+        positive: auditCompletionEvidence(events, store).effects, auditRefusals,
+        legacyRows, legacyPositive: auditCompletionEvidence(legacyRows, store).effects,
+      }, null, 2));
+    }
+    expect(lstatSync(mountpoint).mode & 0o777).toBe(0o700);
+    expect(readdirSync(mountpoint)).toEqual([]);
+  } finally {
+    restoreFilter?.();
+    restoreInspection?.();
+    clearInterval(cancellationPoll);
+    clearTimeout(cancellationLimit);
+    store?.close();
+    if (!effects || effects.quiescent) rmSync(sample.fixture.base, { recursive: true, force: true });
+  }
+}, 120000);
+
+test("native nested checker rejects expired invocation, incomplete output and unsafe export after owned settlement", async () => {
+  const sample = preparedFixture();
+  let store: Awaited<ReturnType<typeof openFixtureStore>> | undefined;
+  let effects: MissionEffects | undefined;
+  const nativeEvents: Array<Record<string, unknown>> = [];
+  const note = (event: string, facts: Record<string, unknown> = {}) =>
+    nativeEvents.push({ event, at: performance.now(), ...facts });
+  const realSpawn = workspaceModule.spawnContained;
+  type SpawnOptions = NonNullable<Parameters<typeof realSpawn>[3]>;
+  function observedSpawn(workspace: Parameters<typeof realSpawn>[0], command: string, args: string[],
+    options?: SpawnOptions & { canSpawn?: never }): ReturnType<typeof spawn>;
+  function observedSpawn(workspace: Parameters<typeof realSpawn>[0], command: string, args: string[],
+    options: SpawnOptions): ReturnType<typeof spawn> | undefined;
+  function observedSpawn(workspace: Parameters<typeof realSpawn>[0], command: string, args: string[],
+    options: SpawnOptions = {}): ReturnType<typeof spawn> | undefined {
+    const transport = options.checkerTransport;
+    note("spawn.begin", { command, args });
+    if (transport) {
+      for (const method of ["release", "drain"] as const) {
+        const original = transport[method].bind(transport);
+        transport[method] = async (timeoutMs) => {
+          note(`${method}.begin`, { timeoutMs });
+          try { await original(timeoutMs); note(`${method}.end`); }
+          catch (error) { note(`${method}.error`, { error: String(error) }); throw error; }
+        };
+      }
+      for (const [name, stream] of [["stdout", transport.stdout], ["stderr", transport.stderr]] as const)
+        stream.once("end", () => note("output.end", { name }));
+    }
+    const child = realSpawn(workspace, command, args, options);
+    note("spawn.return", { pid: child?.pid });
+    if (child) {
+      const kill = child.kill.bind(child);
+      child.kill = (signal) => { note("signal", { signal }); return kill(signal); };
+      child.once("exit", (code, signal) => note("exit", { code, signal }));
+      child.once("close", (code, signal) => note("close", { code, signal }));
+    }
+    return child;
+  }
+  const spawnObserver = spyOn(workspaceModule, "spawnContained").mockImplementation(observedSpawn);
+  try {
+    const cases = [
+      { id: "diagnostic-timeout", command: "exec /usr/bin/sleep 10", timeoutMs: 3000 },
+      { id: "current-post-go-timeout", command: "printf POST_GO_STARTED; exec /usr/bin/sleep 1000", timeoutMs: 30000 },
+      { id: "current-output", command: "printf '%02000000d' 1", timeoutMs: 60000 },
+      { id: "current-export", command: "node -e 'require(\"fs\").symlinkSync(\"/tmp\", \"/verification/evidence/escape\"); console.log(\"EXPORT_COMMAND_RAN\")'", timeoutMs: 60000 },
+    ];
+    const definition = sample.proposal.definition;
+    definition.authority.verificationProfiles = ["sealed-nested-verification-v1"];
+    definition.budget.artifactBytes = 16000000000;
+    definition.units[0]!.acceptance.push(...cases.map((row) => ({ ...row, kind: "command_exit" as const,
+      target: "result", expected: row.id === "current-post-go-timeout" ? "124" : "0",
+      profile: "sealed-nested-verification-v1" as const })));
+    const values = { authority: definition.authority, budget: definition.budget };
+    bindPreparationAuthority(sample.request, values,
+      recordOperatorInput("native-confirmation", "principal", preparationAuthorityText(sample.request, values))!);
+    const prepared = validatePreparation({ request: sample.request, proposal: sample.proposal });
+    if (prepared.state !== "ready") throw new Error(JSON.stringify(prepared));
+    store = await openFixtureStore(sample.fixture);
+    const text = preparedAdmissionText(prepared.prepared);
+    const receipt = recordOperatorInput("native-confirmation", "principal", text)!;
+    const mission = store.createMission({ repositoryRoot: sample.executionRoot, planId: "durable-fixture",
+      prepared: prepared.prepared, commandId: receipt.id, admissionReceiptId: receipt.id,
+      operatorText: text, operatorReceipt: receipt });
+    const workspace = createMissionWorkspace({ missionId: mission.id, attemptId: crypto.randomUUID(),
+      sourceRoot: sample.executionRoot, productRoot: sample.executionRoot, storeRoot: store.storageRoot,
+      candidateParent: path.join(sample.fixture.base, "candidates"), allowedPaths: ["."] });
+    await preflightContainment(workspace);
+    const sealed = sealWorkspaceImage(captureWorkspaceImage(workspace.candidateRoot));
+    store.appendTransition(mission.id, store.inspectMission(mission.id).version, { events: [{
+      revision: 1, kind: "mission.input.visible", causalId: crypto.randomUUID(), payload: {},
+    }], artifacts: sealed.artifacts });
+    for (const predicate of store.inspectMission(mission.id).definition.units[0]!.acceptance.filter(
+      (row) => cases.some(({ id }) => id === row.id))) {
+      effects = new MissionEffects({ store, workspace, missionId: mission.id, revision: 1,
+        unitId: definition.units[0]!.id, attemptId: workspace.attemptId, runtimeId: store.runtimeId,
+        ownerEpoch: store.ownerEpoch!, allowedOperations: ["bash"],
+        commandTime: fixtureCommandTime(predicate.id === "diagnostic-timeout" ? 20000 : 120000) });
+      note("predicate.begin", { id: predicate.id, timeoutMs: predicate.timeoutMs });
+      const observation = await assessMissionPredicate({ predicate, subject: { kind: "workspace", imageHash: sealed.imageHash } },
+        { store, effects, scopeEstablished: true, inputBindingHash: "b".repeat(64),
+          timeoutLimitMs: predicate.id === "diagnostic-timeout" ? 20000 : 120000, artifactLimitBytes: 2000000000 });
+      const proof = JSON.parse(Buffer.from(observation.artifactBytes!).toString());
+      note("predicate.end", { id: predicate.id, quiescent: effects.quiescent });
+      const evidence = process.env.MISSION_T4_ARTIFACT_DIR;
+      if (evidence) {
+        mkdirSync(evidence, { recursive: true });
+        writeFileSync(path.join(evidence, `${predicate.id}.json`), JSON.stringify(proof, null, 2));
+        writeFileSync(path.join(evidence, `${predicate.id}-events.json`), JSON.stringify(
+          store.inspectMission(mission.id).events, null, 2));
+        writeFileSync(path.join(evidence, "native-events.json"), JSON.stringify(nativeEvents, null, 2));
+        writeFileSync(path.join(evidence, "fixture-root.txt"), sample.fixture.base);
+        for (const [index, artifact] of (observation.artifacts ?? []).entries())
+          writeFileSync(path.join(evidence, `${predicate.id}-artifact-${index}`), artifact.bytes);
+      }
+      expect(observation.verdict).toBe("inconclusive");
+      expect(effects.quiescent).toBe(true);
+      const terminal = store.inspectMission(mission.id).events.filter(({ kind }) => kind === "effect.receipt").at(-1)!;
+      if (predicate.id === "diagnostic-timeout") {
+        expect(proof.reason).toBe("command termination, image or effect settlement is inconclusive");
+        expect(terminal.payload.status).toBe("denied");
+        expect(terminal.payload.process).toBeNull();
+        expect(terminal.payload.reason).toBe("command timeout exceeds current remaining effect time grant");
+        expect(store.inspectMission(mission.id).events.filter(row => row.effectId === terminal.effectId)
+          .some(row => row.kind === "effect.process.registered" || row.kind === "effect.released")).toBe(false);
+      } else expect(terminal.payload.process).toMatchObject({ outerInitRetired: true });
+      if (predicate.id === "current-post-go-timeout") {
+        expect(terminal.payload.termination).toBe("timeout");
+        expect(terminal.payload.exitCode).toBe(124);
+        expect(proof.reason).toBe("command termination, image or effect settlement is inconclusive");
+        expect(proof.receipt.stdoutSummary).toBe("POST_GO_STARTED");
+        const rows = store.inspectMission(mission.id).events.filter(row => row.effectId === terminal.effectId);
+        expect(rows.some(row => row.kind === "effect.process.registered")).toBe(true);
+        expect(rows.some(row => row.kind === "effect.released")).toBe(true);
+        expect(terminal.payload.outputDrained).not.toBe(true);
+        expect(terminal.payload.outputIncomplete).toBe(true);
+        expect(terminal.payload.captureFailure).toBe("checker output drain exceeded finite deadline");
+      }
+      if (predicate.id === "current-output") {
+        expect(proof.reason).toBe("command termination, image or effect settlement is inconclusive");
+        expect(terminal.payload.outputTruncated).toBe(true);
+      }
+      if (predicate.id === "current-export") {
+        expect(proof.reason).toBe("verification export is a link");
+        expect(terminal.payload.termination).toBe("exit");
+        expect(proof.receipt.exitCode).toBe(0);
+        expect(proof.receipt.stdoutSummary).toContain("EXPORT_COMMAND_RAN");
+      }
+    }
+  } finally {
+    spawnObserver.mockRestore();
+    store?.close();
+    if (!effects || effects.quiescent) rmSync(sample.fixture.base, { recursive: true, force: true });
+  }
+}, 240000);
+
+test("production engine denies expired pre-child invocation and rejects undisposed offline role", async () => {
+  const sample = preparedFixture();
+  let store: Awaited<ReturnType<typeof openFixtureStore>> | undefined;
+  let engine: MissionEngine | undefined;
+  try {
+    const definition = sample.proposal.definition;
+    definition.authority.verificationProfiles = ["sealed-nested-verification-v1"];
+    definition.budget.activeTimeMs = 1800000;
+    definition.budget.artifactBytes = 16000000000;
+    for (const unit of definition.units) for (const predicate of unit.acceptance)
+      Object.assign(predicate, { target: "result", expected: "0", profile: "sealed-nested-verification-v1",
+        command: "printf CURRENT_ENGINE_ROUTE; test -s input.mjs", timeoutMs: 60000 });
+    const values = { authority: definition.authority, budget: definition.budget };
+    bindPreparationAuthority(sample.request, values,
+      recordOperatorInput("native-confirmation", "principal", preparationAuthorityText(sample.request, values))!);
+    const prepared = validatePreparation({ request: sample.request, proposal: sample.proposal });
+    if (prepared.state !== "ready") throw new Error(JSON.stringify(prepared));
+    store = await openFixtureStore(sample.fixture);
+    const text = preparedAdmissionText(prepared.prepared);
+    const admission = recordOperatorInput("native-confirmation", "principal", text)!;
+    const mission = store.createMission({ repositoryRoot: sample.executionRoot, planId: "durable-fixture",
+      prepared: prepared.prepared, commandId: admission.id, admissionReceiptId: admission.id,
+      operatorText: text, operatorReceipt: admission });
+    engine = new MissionEngine({ store, missionId: mission.id, managedWorkspace: { sourceRoot: sample.executionRoot },
+      sessionsDirectory: path.join(sample.fixture.base, "sessions"),
+      runRole: async (input, durable) => {
+        expect(input.binding.finalization).toBeUndefined();
+        if (!input.binding.finalization) {
+          expect((await durable.effects!.invoke("write", { path: "input.mjs", content: "export const value = 1;\n" })).status)
+            .toBe("completed");
+          expect((await durable.effects!.invoke("write", { path: "check.mjs", content: "export const check = true;\n" })).status)
+            .toBe("completed");
+          const workspace = durable.effects!.workspace;
+          const launcher = workspace.bwrapPath;
+          Object.defineProperty(workspace, "bwrapPath", { configurable: true, get() {
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+            return launcher;
+          } });
+          try {
+            expect(await durable.effects!.invoke("bash", {
+              command: "printf MUST_NOT_EXECUTE", timeoutMs: 50,
+            })).toMatchObject({ status: "denied", reason: "command timeout exceeds current remaining effect time grant" });
+          } finally { Object.defineProperty(workspace, "bwrapPath", { configurable: true, value: launcher }); }
+        }
+        return { instanceId: input.binding.attemptId, role: input.binding.memberId, status: "completed",
+          result: "offline producer settled", requests: [], model: { policyId: input.binding.memberId,
+            requestedModel: "test/child", selectedModel: "test/child" } };
+      } });
+    engine.start();
+    await engine.waitForIdle();
+    const current = store.inspectMission(mission.id);
+    const root = process.env.MISSION_T4_ARTIFACT_DIR;
+    if (root) {
+      mkdirSync(root, { recursive: true });
+      writeFileSync(path.join(root, "engine-current.json"), JSON.stringify(current, null, 2));
+      writeFileSync(path.join(root, "engine-fixture-root.txt"), sample.fixture.base);
+      for (const row of current.events) if (typeof row.payload.artifactHash === "string")
+        writeFileSync(path.join(root, row.payload.artifactHash), store.readArtifact(row.payload.artifactHash));
+    }
+    expect(current.state).not.toBe("completed");
+    const receipts = current.events.filter(row => row.kind === "effect.receipt" && row.payload.operation === "bash");
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0]!.payload).toMatchObject({ status: "denied", process: null,
+      reason: "command timeout exceeds current remaining effect time grant" });
+    const rows = current.events.filter(row => row.effectId === receipts[0]!.effectId);
+    expect(rows.some(row => row.kind === "effect.invoking")).toBe(true);
+    expect(rows.some(row => row.kind === "effect.process.registered" || row.kind === "effect.released")).toBe(false);
+    expect(current.events.some(row => row.kind === "unit.verifying" &&
+      row.payload.reason === "output seal inconclusive: terminal SDK disposal is unproven")).toBe(true);
+    const observations = current.events.filter(row => row.kind === "evidence.recorded");
+    expect(observations.length).toBeGreaterThan(0);
+    expect(observations.every(row => row.payload.verdict === "inconclusive" &&
+      row.payload.assessmentAuthority === "production-checker" &&
+      row.payload.method === "check input scope is unestablished")).toBe(true);
+    expect(current.events.some(row => row.kind === "mission.active.window.opened")).toBe(true);
+    expect(current.events.some(row => row.kind === "budget.reservation.settled" &&
+      row.payload.resource === "active-time-ms" && Number(row.payload.knownCharge) >= 100)).toBe(true);
+    expect(missionCompletionCertificate(current, store)).toBeUndefined();
+    await engine.close();
+  } finally {
+    store?.close();
+    // The ordinary write receipts do not carry the nested outer-init retirement proof.
+    // Retain this owned fixture rather than treating wrapper exit as cleanup authority.
+  }
+}, 240000);
+
+function physicalWitness(root: string): string {
+  const hash = createHash("sha256");
+  const visit = (file: string) => {
+    const stat = lstatSync(file);
+    hash.update(JSON.stringify([path.relative(root, file), stat.dev, stat.ino, stat.mode, stat.size, stat.mtimeMs, stat.nlink]));
+    if (stat.isDirectory()) for (const name of readdirSync(file).sort()) visit(path.join(file, name));
+    else if (stat.isFile()) hash.update(readFileSync(file));
+  };
+  visit(root);
+  return hash.digest("hex");
+}
+
+test("copied setup prepares a genuinely missing dependency directory using disclosed hardlinked seeds and real hook", async () => {
+  // This is the actual checkout hook and native closure, not a receipt-producing double.
+  const evidence = process.env.MISSION_SETUP_EVIDENCE;
+  const started = performance.now();
+  const stage = (name: string, details: unknown = {}) => {
+    if (!evidence) return;
+    mkdirSync(evidence, { recursive: true });
+    writeFileSync(path.join(evidence, "stages.jsonl"),
+      JSON.stringify({ stage: name, elapsedMs: performance.now() - started, details }) + "\n", { flag: "a" });
+  };
+  stage("fixture-start");
+  const sample = preparedFixture();
+  stage("fixture-created", { root: sample.fixture.base });
+  let engine: MissionEngine | undefined;
+  let store: Awaited<ReturnType<typeof openFixtureStore>> | undefined;
+  let destination: string | undefined;
+  let producer: MissionSetup | undefined;
+  let missionId: string | undefined;
+  let primaryError: unknown;
+  const witnesses: Array<{ path: string; before: string }> = [];
+  const capture = () => {
+    if (!evidence) return;
+    if (store && missionId) {
+      const current = store.inspectMission(missionId);
+      writeFileSync(path.join(evidence, "live-events.json"), JSON.stringify(current, null, 2));
+      for (const row of current.events.filter(({ kind }) => kind === "mission.setup.receipt"))
+        writeFileSync(path.join(evidence, `${row.payload.receiptHash}.json`), store.readArtifact(String(row.payload.receiptHash)));
+    }
+    writeFileSync(path.join(evidence, "witnesses.json"), JSON.stringify(witnesses.map(row => ({
+      ...row, after: physicalWitness(row.path),
+    })), null, 2));
+  };
+  try {
+    mkdirSync(path.join(sample.executionRoot, "scripts"), { recursive: true });
+    for (const name of ["scripts/setup.sh", "package.json", "bun.lock"])
+      cpSync(path.join(process.cwd(), name), path.join(sample.executionRoot, name));
+    const originalDependencies = physicalWitness(path.join(process.cwd(), "node_modules"));
+    stage("dependencies-witnessed");
+    expect(existsSync(path.join(sample.executionRoot, "node_modules"))).toBe(false);
+    const seed = path.join(sample.fixture.base, "installed-seed");
+    cpSync(path.join(process.cwd(), "node_modules"), seed, { recursive: true, verbatimSymlinks: true });
+    stage("seed-copied");
+    rmSync(path.join(seed, "smol-toml"), { recursive: true });
+    // Cache-hardlinked input is permitted; publication must still have no aliases.
+    const hardlinkCache = path.join(sample.fixture.base, "hardlink-cache");
+    mkdirSync(hardlinkCache);
+    cpSync(path.join(seed, "pi-hermes-memory/package.json"), path.join(hardlinkCache, "package.json"));
+    rmSync(path.join(seed, "pi-hermes-memory/package.json"));
+    linkSync(path.join(hardlinkCache, "package.json"), path.join(seed, "pi-hermes-memory/package.json"));
+    const cache = path.join(process.env.BUN_INSTALL_CACHE_DIR ?? path.join(homedir(), ".bun/install/cache"), "smol-toml@1.8.0@@@1");
+    const originalCache = physicalWitness(cache);
+    const originalSeed = physicalWitness(seed);
+    witnesses.push({ path: path.join(process.cwd(), "node_modules"), before: originalDependencies },
+      { path: cache, before: originalCache }, { path: seed, before: originalSeed });
+    stage("inputs-witnessed");
+    const limits = { paths: 30000, largestFileBytes: 123438592, totalBytes: 550000000 };
+    const values: SetupAllocation = { effectProfile: "execution-root-local-copy-v1", writableDirectories: ["node_modules"],
+      activeTimeMs: 120000, artifactBytes: 2000000000, copy: { bounds: limits, seeds: [
+        { source: seed, destination: "node_modules", bounds: limits },
+        { source: cache, destination: "cache/smol-toml@1.8.0@@@1", bounds: { paths: 100, largestFileBytes: 1000000, totalBytes: 1000000 } },
+      ] } };
+    expect(() => preparationSetupText(sample.request, { ...values, artifactBytes: 100000000 })).toThrow("allocation");
+    expect(() => preparationSetupText(sample.request, { ...values, copy: { ...values.copy!,
+      seeds: [{ ...values.copy!.seeds[0]!, bounds: { ...limits, largestFileBytes: 64 * 1024 * 1024 } }] } })).toThrow("byte bound");
+    const definition = sample.proposal.definition;
+    definition.budget = { ...definition.budget, roleLaunches: 100, providerRequests: 100, artifactBytes: 8000000000 };
+    const authorityText = preparationAuthorityText(sample.request, { authority: definition.authority, budget: definition.budget });
+    bindPreparationAuthority(sample.request, { authority: definition.authority, budget: definition.budget },
+      recordOperatorInput("native-confirmation", "principal", authorityText)!);
+    const text = preparationSetupText(sample.request, values);
+    stage("setup-preview-captured");
+    bindPreparationSetup(sample.request, values, recordOperatorInput("native-confirmation", "principal", text)!);
+    const result = validatePreparation({ request: sample.request, proposal: sample.proposal });
+    expect(result.state).toBe("ready");
+    if (result.state !== "ready") throw new Error(JSON.stringify(result));
+    destination = result.prepared.setup!.identity.copy!.destination;
+    stage("prepared", { destination });
+    store = await openFixtureStore(sample.fixture);
+    const admissionText = preparedAdmissionText(result.prepared);
+    const receipt = recordOperatorInput("native-confirmation", "principal", admissionText)!;
+    const mission = store.createMission({ repositoryRoot: sample.executionRoot, planId: "durable-fixture", prepared: result.prepared,
+      commandId: receipt.id, admissionReceiptId: receipt.id, operatorText: admissionText, operatorReceipt: receipt });
+    missionId = mission.id;
+    producer = new MissionSetup(store, mission.id);
+    let dispatches = 0;
+    engine = new MissionEngine({ store, missionId: mission.id, sessionsDirectory: path.join(sample.fixture.base, "sessions"),
+      runRole: async () => { dispatches++; throw new Error("prepare cannot dispatch"); } });
+    stage("producer-start", { missionId: mission.id });
+    const readiness = await engine.prepareSetup(() => {});
+    stage("producer-settled", readiness);
+    if (evidence) {
+      const settled = store.inspectMission(mission.id);
+      writeFileSync(path.join(evidence, "settled-events.json"), JSON.stringify(settled.events, null, 2));
+      for (const row of settled.events.filter(({ kind }) => kind === "mission.setup.receipt"))
+        writeFileSync(path.join(evidence, `${row.payload.receiptHash}.json`), store.readArtifact(String(row.payload.receiptHash)));
+    }
+    expect(readiness.state).toBe("ready");
+    if (readiness.state !== "ready") throw new Error(readiness.reason);
+    const current = store.inspectMission(mission.id);
+    expect(current.state).toBe("prepared");
+    expect(dispatches).toBe(0);
+    expect(current.events.some(({ kind }) => kind === "mission.activated" || kind === "attempt.reserved")).toBe(false);
+    const protectedRows = current.events.filter(({ kind, payload }) => kind === "reservation.created" && payload.purpose === "protected");
+    expect(protectedRows).toHaveLength(5);
+    const intent = current.events.find(({ kind }) => kind === "mission.setup.intent")!;
+    expect(protectedRows.every(({ seq }) => seq < intent.seq)).toBe(true);
+    const proof = JSON.parse(store.readArtifact(readiness.receiptHash).toString());
+    expect(proof).toMatchObject({ format: "mission-setup-receipt-v2", status: "completed", disposed: true,
+      released: true, exitCode: 0, truncated: false, timedOut: false });
+    expect(proof.stdout).toContain("+ smol-toml@1.8.0");
+    expect(proof.stdout).toContain("better-sqlite3: SELECT 42 = 42");
+    expect(proof.stdout).toContain("node:sqlite: closed");
+    expect(proof.measuredOutput.largestFileBytes).toBe(123438592);
+    expect(proof.copy.bounds).toEqual(limits);
+    const boundSetup = current.prepared!.setup!;
+    expect(() => captureSetupOutputs({ ...boundSetup, identity: { ...boundSetup.identity,
+      copy: { ...boundSetup.identity.copy!, bounds: { ...limits, largestFileBytes: 64 * 1024 * 1024 } } } }))
+      .toThrow("byte bound exceeded");
+    expect(physicalWitness(path.join(process.cwd(), "node_modules"))).toBe(originalDependencies);
+    expect(physicalWitness(cache)).toBe(originalCache);
+    expect(physicalWitness(seed)).toBe(originalSeed);
+    expect(existsSync(path.join(sample.executionRoot, "node_modules"))).toBe(false);
+    expect(await engine.prepareSetup(() => {})).toMatchObject({ state: "ready", reused: true });
+    stage("reuse-verified");
+    expect(store.inspectMission(mission.id).events.filter(({ kind }) => kind === "mission.setup.intent")).toHaveLength(1);
+    const workspace = createMissionWorkspace({ missionId: mission.id, attemptId: crypto.randomUUID(),
+      sourceRoot: sample.executionRoot, storeRoot: store.storageRoot, candidateParent: path.join(sample.fixture.base, "candidates"),
+      dependencyBacking: producer.dependencyBacking() });
+    await preflightContainment(workspace);
+    const child = spawnContained(workspace, "node", ["--input-type=module", "-e",
+      `import fs from "node:fs"; import net from "node:net"; console.log(JSON.parse(fs.readFileSync("node_modules/smol-toml/package.json")).version); try { fs.writeFileSync("node_modules/forbidden","x"); process.exit(3); } catch(e) { console.log(e.code); } const s=net.connect(443,"1.1.1.1"); s.on("error",e=>{console.log(e.code);process.exit(e.code==="EPERM"?0:4)});`], { writablePaths: [] });
+    child.stdin!.end();
+    child.stderr!.resume();
+    let output = "";
+    child.stdout!.on("data", (data) => { output += data; });
+    const exit = await new Promise((resolve) => child.once("close", resolve));
+    stage("consumer-closed", { exit, output });
+    expect(exit).toBe(0);
+    expect(output).toContain("1.8.0");
+    expect(output).toContain("EROFS");
+    expect(output).toContain("EPERM");
+    const alias = path.join(destination, "published/node_modules/alias");
+    symlinkSync(path.join(hardlinkCache, "package.json"), alias);
+    expect(producer.observe().state).toBe("blocked");
+    rmSync(alias);
+    linkSync(path.join(hardlinkCache, "package.json"), alias);
+    expect(producer.observe().state).toBe("blocked");
+    rmSync(alias);
+    const publishedPackage = path.join(destination, "published/node_modules/smol-toml/package.json");
+    const packageBytes = readFileSync(publishedPackage);
+    writeFileSync(publishedPackage, "{}");
+    expect(producer.observe().state).toBe("blocked");
+    expect(() => spawnContained(workspace, "node", ["-e", "process.exit(0)"], { writablePaths: [] })).toThrow("no longer current");
+    expect(() => engine!.start()).toThrow("current settled");
+    writeFileSync(publishedPackage, packageBytes);
+    expect(producer.observe().state).toBe("ready");
+    stage("publication-tamper-rejected-and-restored");
+    engine.start();
+    await engine.control("pause");
+    const started = store.inspectMission(mission.id);
+    expect(started.events.filter(({ kind, payload }) => kind === "reservation.created" && payload.purpose === "protected")).toHaveLength(5);
+    expect(started.events.filter(({ kind }) => kind === "mission.setup.intent")).toHaveLength(1);
+    if (process.env.MISSION_SETUP_EVIDENCE) {
+      const evidence = process.env.MISSION_SETUP_EVIDENCE;
+      mkdirSync(evidence, { recursive: true });
+      writeFileSync(path.join(evidence, "production-input.json"), store.readArtifact(String(intent.payload.inputHash)));
+      writeFileSync(path.join(evidence, "production-prepared.json"), JSON.stringify(current.prepared, null, 2));
+      writeFileSync(path.join(evidence, "production-receipt.json"), JSON.stringify(proof, null, 2));
+      writeFileSync(path.join(evidence, "production-observations.json"), JSON.stringify({
+        originalDependencies, originalCache, originalSeed, originalsUnchanged: true,
+        sourceDependenciesAbsent: !existsSync(path.join(sample.executionRoot, "node_modules")),
+        candidateOutput: output, dispatchesBeforeStart: 0, protectedBeforeSetup: true,
+        protectedReservationsAfterStart: 5, setupIntentsAfterStart: 1,
+        events: started.events.map(({ kind, seq, payload }) => ({ kind, seq, payload })),
+      }, null, 2));
+    }
+    stage("assertions-completed");
+  } catch (error) {
+    primaryError = error;
+    stage("error", { error: String(error), stack: error instanceof Error ? error.stack : undefined });
+    throw error;
+  } finally {
+    stage("retirement-start");
+    try {
+      capture();
+      // Successful retirement awaits setup.stop(), proves effect quiescence,
+      // releases the owner and closes the store. Do not query it after close.
+      await engine?.retireForShutdown("quit");
+      stage("retirement-settled", { retired: true });
+      store?.close();
+    } catch (error) {
+      stage("retirement-error", { error: String(error), stack: error instanceof Error ? error.stack : undefined });
+      if (primaryError !== undefined) throw new AggregateError([primaryError, error], "copied hook failed; retirement also failed");
+      throw error;
+    }
+    if (destination) rmSync(destination, { recursive: true, force: true });
+    rmSync(sample.fixture.base, { recursive: true, force: true });
+    stage("fixture-removed");
+  }
+// Observer includes source/seed witnesses, native consent, reuse/tamper/consumer
+// checks and retirement: 119s observed outside the unchanged 120s producer grant.
+}, 360000);
 
 const source = `---
 id: durable-fixture
@@ -55,6 +862,8 @@ test("setup input provenance is conservative and preserves predicate and transit
       recordOperatorInput("native-confirmation", "principal", preparationSetupText(sample.request, values))!);
     const admitted = validatePreparation({ request: sample.request, proposal: sample.proposal });
     expect(admitted.state).toBe("ready");
+    expect(admitted.status).toBe("technical-unresolved");
+    expect(admitted.issues).toContainEqual(expect.objectContaining({ code: "unresolved-setup", owner: "runtime" }));
     if (admitted.state !== "ready") return;
     const setup = structuredClone(admitted.prepared.setup!);
     const definition = structuredClone(admitted.prepared.definition);
@@ -117,7 +926,7 @@ function preparedFixture(setupScript?: string) {
     acceptance: context.inventory.criteria.filter(({ owner }) => owner === unit.engineId ||
       unit.ordinal === 0 && owner === "mission").map((criterion) => ({
       id: mappings.find(({ sourceId }) => sourceId === criterion.id)!.predicateIds[0]!, kind: "command_exit",
-      target: "Node discriminating check", command: "node check.mjs" })),
+      target: "Node discriminating check", command: "node check.mjs", timeoutMs: 3000 })),
   }));
   const ordinary = mappings.filter((mapping) => context.inventory.criteria.find(({ id }) => id === mapping.sourceId)!.owner !== "mission")
     .flatMap(({ predicateIds }) => predicateIds);
@@ -130,12 +939,124 @@ function preparedFixture(setupScript?: string) {
   return { fixture, executionRoot, request, context, proposal: { definition, mappings } };
 }
 
+test("T3 preparation rejects infeasible protected command stages and unsupported timer bounds before readiness", () => {
+  for (const [rootMs, commandMs, reason] of [
+    [40_000_000, 4_000_001, "protected stage allocation"],
+    [40_000_000_000, 2_147_483_648, "2147483647"],
+  ] as const) {
+    const sample = preparedFixture();
+    try {
+      const definition = sample.proposal.definition;
+      definition.budget.activeTimeMs = rootMs;
+      definition.units[0]!.acceptance[0]!.timeoutMs = commandMs;
+      const values = { authority: definition.authority, budget: definition.budget };
+      bindPreparationAuthority(sample.request, values, recordOperatorInput("native-confirmation", "principal",
+        preparationAuthorityText(sample.request, values))!);
+      const result = validatePreparation({ request: sample.request, proposal: sample.proposal });
+      expect(result.state).not.toBe("ready");
+      expect(result.status).toBe("technical-unresolved");
+      expect(result.issues).toContainEqual(expect.objectContaining({ code: "insufficient-grant", owner: "author",
+        message: expect.stringContaining(reason) }));
+      if (process.env.MISSION_TIME_EVIDENCE) {
+        mkdirSync(process.env.MISSION_TIME_EVIDENCE, { recursive: true });
+        writeFileSync(path.join(process.env.MISSION_TIME_EVIDENCE, `preparation-${commandMs}.json`), JSON.stringify(result, null, 2));
+      }
+    } finally { rmSync(sample.fixture.base, { recursive: true, force: true }); }
+  }
+});
+
 const allocation: SetupAllocation = { effectProfile: "execution-root-local-v1", writableDirectories: ["node_modules"],
   activeTimeMs: 10000, artifactBytes: 1024 * 1024 };
 function approveSetup(request: Parameters<typeof preparationSetupText>[0]) {
   const text = preparationSetupText(request, allocation);
   bindPreparationSetup(request, allocation, recordOperatorInput("native-confirmation", "principal", text)!);
 }
+async function copiedMission(script: string, values: SetupAllocation) {
+  const sample = preparedFixture(script);
+  rmSync(path.join(sample.executionRoot, "node_modules"), { recursive: true });
+  const seed = path.join(sample.fixture.base, "seed");
+  mkdirSync(seed);
+  writeFileSync(path.join(seed, "seed"), "1");
+  values = { ...values, copy: { ...values.copy!, seeds: [{ source: seed, destination: "node_modules",
+    bounds: { paths: 2, largestFileBytes: 1, totalBytes: 1 } }] } };
+  const definition = sample.proposal.definition;
+  definition.budget = { ...definition.budget, roleLaunches: 100, providerRequests: 100, artifactBytes: 8000000000 };
+  const authority = { authority: definition.authority, budget: definition.budget };
+  bindPreparationAuthority(sample.request, authority,
+    recordOperatorInput("native-confirmation", "principal", preparationAuthorityText(sample.request, authority))!);
+  bindPreparationSetup(sample.request, values,
+    recordOperatorInput("native-confirmation", "principal", preparationSetupText(sample.request, values))!);
+  const result = validatePreparation({ request: sample.request, proposal: sample.proposal });
+  if (result.state !== "ready") throw new Error(JSON.stringify(result.issues));
+  const store = await openFixtureStore(sample.fixture);
+  const text = preparedAdmissionText(result.prepared);
+  const receipt = recordOperatorInput("native-confirmation", "principal", text)!;
+  const mission = store.createMission({ repositoryRoot: sample.executionRoot, planId: "durable-fixture", prepared: result.prepared,
+    commandId: receipt.id, admissionReceiptId: receipt.id, operatorText: text, operatorReceipt: receipt });
+  const engine = new MissionEngine({ store, missionId: mission.id, sessionsDirectory: path.join(sample.fixture.base, "sessions"),
+    runRole: async () => { throw new Error("prepare must not dispatch"); } });
+  return { ...sample, store, mission, engine, destination: result.prepared.setup!.identity.copy!.destination };
+}
+
+test("copied setup refuses excess output without enlarging bounds, publishing or claiming readiness", async () => {
+  const values: SetupAllocation = { effectProfile: "execution-root-local-copy-v1", writableDirectories: ["node_modules"],
+    activeTimeMs: 15000, artifactBytes: 600000000, copy: { bounds: { paths: 10, largestFileBytes: 4, totalBytes: 4 }, seeds: [] } };
+  const sample = await copiedMission("printf installed > node_modules/dependency\n", values);
+  try {
+    expect((await sample.engine.prepareSetup(() => {})).state).toBe("blocked");
+    const events = sample.store.inspectMission(sample.mission.id).events;
+    const receipt = events.find(({ kind }) => kind === "mission.setup.receipt")!;
+    const proof = JSON.parse(sample.store.readArtifact(String(receipt.payload.receiptHash)).toString());
+    expect(proof).toMatchObject({ format: "mission-setup-receipt-v2", status: "failed", disposed: true, exitCode: 0 });
+    expect(proof.copy.bounds).toEqual(values.copy!.bounds);
+    expect(proof.outputError).toContain("byte bound exceeded");
+    expect(existsSync(path.join(sample.destination, "published/node_modules"))).toBe(false);
+    expect(existsSync(path.join(sample.executionRoot, "node_modules"))).toBe(false);
+    expect((await sample.engine.prepareSetup(() => {})).state).toBe("blocked");
+    expect(sample.store.inspectMission(sample.mission.id).events.filter(({ kind }) => kind === "mission.setup.intent")).toHaveLength(1);
+    expect(() => sample.engine.start()).toThrow("current settled");
+  } finally {
+    await sample.engine.retireForShutdown("quit");
+    sample.store.close();
+    rmSync(sample.destination, { recursive: true, force: true });
+    rmSync(sample.fixture.base, { recursive: true, force: true });
+  }
+}, 60000);
+
+test("cancel before start fences copied setup; cancellation is not cleanup or successful preparation proof", async () => {
+  const sample = await copiedMission("printf begun > node_modules/dependency\nwhile :; do :; done\n", {
+    effectProfile: "execution-root-local-copy-v1", writableDirectories: ["node_modules"], activeTimeMs: 15000,
+    artifactBytes: 600000000, copy: { bounds: { paths: 20, largestFileBytes: 100, totalBytes: 100 }, seeds: [] },
+  });
+  const job = sample.engine.prepareSetup(() => {});
+  try {
+    for (let turn = 0; turn < 1000 && !existsSync(path.join(sample.destination, "capsule/node_modules/dependency")); turn++)
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(readFileSync(path.join(sample.destination, "capsule/node_modules/dependency"), "utf8")).toBe("begun");
+    await sample.engine.control("cancel");
+    const cancelled = sample.store.inspectMission(sample.mission.id);
+    expect(cancelled.state).toBe("cancelled");
+    expect(missionCompletionCertificate(cancelled, sample.store)).toBeUndefined();
+    expect((await job).state).toBe("blocked");
+    const producer = new MissionSetup(sample.store, sample.mission.id);
+    expect(producer.quiescent).toBe(true);
+    expect(producer.observe().state).toBe("blocked");
+    expect(existsSync(path.join(sample.destination, "published/node_modules"))).toBe(false);
+    const stopped = sample.store.inspectMission(sample.mission.id);
+    expect(stopped.events.some(({ kind }) => kind === "mission.activated" || kind === "attempt.reserved")).toBe(false);
+    const receipt = stopped.events.find(({ kind }) => kind === "mission.setup.receipt")!;
+    expect(JSON.parse(sample.store.readArtifact(String(receipt.payload.receiptHash)).toString()))
+      .toMatchObject({ format: "mission-setup-receipt-v2", status: "stopped", disposed: true });
+    expect(() => sample.engine.start()).toThrow("cancelled");
+  } finally {
+    await sample.engine.retireForShutdown("quit");
+    await job;
+    sample.store.close();
+    rmSync(sample.destination, { recursive: true, force: true });
+    rmSync(sample.fixture.base, { recursive: true, force: true });
+  }
+}, 60000);
+
 async function setupMission(script: string | undefined) {
   const sample = preparedFixture(script);
   if (script === undefined) {
@@ -279,13 +1200,16 @@ test("bounded real producer logs are explicit incomplete evidence, never reusabl
 }, 30000);
 
 test("actual producer crash leaves durable invocation; physical recovery stops it without replay or success", async () => {
-  const evidence = path.join("/tmp", `pitako-setup-interrupt-${crypto.randomUUID()}`);
+  const evidence = path.join(tmpdir(), `pitako-setup-interrupt-${crypto.randomUUID()}`);
   const child = spawn(process.execPath, [path.resolve("scripts/mission-setup-local.mjs"), evidence, "--interrupt"],
-    { stdio: "ignore" });
+    { stdio: ["ignore", "ignore", "pipe"] });
+  let errors = "";
+  child.stderr!.on("data", (data) => { errors = (errors + data).slice(0, 16384); });
   const code = await new Promise((resolve) => child.once("close", resolve));
-  expect(code).toBe(74);
+  expect(code, errors).toBe(74);
   const interrupted = JSON.parse(readFileSync(path.join(evidence, "interrupted.json"), "utf8"));
   const store = await openFixtureStore(interrupted.fixture);
+  let recoveredQuiescent = false;
   try {
     for (let turn = 0; turn < 200 && processesInNamespace(interrupted.process.namespace).length; turn++)
       await new Promise((resolve) => setTimeout(resolve, 10));
@@ -294,16 +1218,78 @@ test("actual producer crash leaves durable invocation; physical recovery stops i
     expect(producer.quiescent).toBe(false);
     expect(producer.reconcile().state).toBe("blocked");
     expect(producer.quiescent).toBe(true);
+    recoveredQuiescent = true;
     expect((await producer.ensure({ id: "fake" }, () => true)).state).toBe("blocked");
     const events = store.inspectMission(interrupted.missionId).events;
     expect(events.filter(({ kind }) => kind === "mission.setup.intent")).toHaveLength(1);
     expect(events.filter(({ kind }) => kind === "mission.setup.receipt")).toHaveLength(0);
     expect(events.filter(({ kind }) => kind === "mission.setup.reconciled")).toHaveLength(1);
+    if (process.env.MISSION_T4_ARTIFACT_DIR) {
+      mkdirSync(process.env.MISSION_T4_ARTIFACT_DIR, { recursive: true });
+      writeFileSync(path.join(process.env.MISSION_T4_ARTIFACT_DIR, "setup-crash-recovery.json"), JSON.stringify({
+        childExit: code, interrupted, namespaceProcesses: processesInNamespace(interrupted.process.namespace),
+        quiescent: producer.quiescent, events,
+      }, null, 2));
+    }
   } finally {
-    store.close(); rmSync(interrupted.fixture.base, { recursive: true, force: true });
-    rmSync(evidence, { recursive: true, force: true });
+    store.close();
+    if (recoveredQuiescent) {
+      rmSync(interrupted.fixture.base, { recursive: true, force: true });
+      rmSync(evidence, { recursive: true, force: true });
+    }
   }
 }, 30000);
+
+test("copied prepare interruption recovers owned processes without replay, publication or false readiness", async () => {
+  const evidence = path.join(tmpdir(), `pitako-copy-interrupt-${crypto.randomUUID()}`);
+  const child = spawn(process.execPath, [path.resolve("scripts/mission-setup-local.mjs"), evidence, "--copy-interrupt"],
+    { stdio: ["ignore", "ignore", "pipe"] });
+  let errors = "";
+  child.stderr!.on("data", (data) => { errors = (errors + data).slice(0, 16384); });
+  const code = await new Promise((resolve) => child.once("close", resolve));
+  expect(code, errors).toBe(74);
+  const interrupted = JSON.parse(readFileSync(path.join(evidence, "interrupted.json"), "utf8"));
+  const store = await openFixtureStore(interrupted.fixture);
+  let recoveredQuiescent = false;
+  try {
+    for (let turn = 0; turn < 200 && processesInNamespace(interrupted.process.namespace).length; turn++)
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(processesInNamespace(interrupted.process.namespace)).toHaveLength(0);
+    const producer = new MissionSetup(store, interrupted.missionId);
+    expect(producer.quiescent).toBe(false);
+    expect(producer.reconcile().state).toBe("blocked");
+    expect(producer.quiescent).toBe(true);
+    recoveredQuiescent = true;
+    const engine = new MissionEngine({ store, missionId: interrupted.missionId,
+      sessionsDirectory: path.join(interrupted.fixture.base, "sessions"), runRole: async () => { throw new Error("no dispatch"); } });
+    expect((await engine.prepareSetup(() => {})).state).toBe("blocked");
+    expect(() => engine.start()).toThrow("current settled");
+    const current = store.inspectMission(interrupted.missionId);
+    expect(current.state).toBe("prepared");
+    expect(current.events.filter(({ kind }) => kind === "mission.setup.intent")).toHaveLength(1);
+    expect(current.events.filter(({ kind }) => kind === "mission.setup.receipt")).toHaveLength(0);
+    expect(current.events.filter(({ kind }) => kind === "mission.setup.reconciled")).toHaveLength(1);
+    expect(existsSync(path.join(interrupted.destination, "published/node_modules"))).toBe(false);
+    expect(current.events.some(({ kind }) => kind === "mission.activated" || kind === "attempt.reserved")).toBe(false);
+    if (process.env.MISSION_T4_ARTIFACT_DIR) {
+      mkdirSync(process.env.MISSION_T4_ARTIFACT_DIR, { recursive: true });
+      writeFileSync(path.join(process.env.MISSION_T4_ARTIFACT_DIR, "copied-setup-recovery.json"), JSON.stringify({
+        childExit: code, interrupted, setup: current.prepared?.setup,
+        namespaceProcesses: processesInNamespace(interrupted.process.namespace),
+        quiescent: producer.quiescent, state: current.state, events: current.events,
+        published: existsSync(path.join(interrupted.destination, "published/node_modules")),
+      }, null, 2));
+    }
+    await engine.retireForShutdown("quit");
+  } finally {
+    store.close();
+    if (recoveredQuiescent) {
+      rmSync(interrupted.fixture.base, { recursive: true, force: true });
+      rmSync(interrupted.destination, { recursive: true, force: true });
+      rmSync(evidence, { recursive: true, force: true });
+    }
+  }
+}, 60000);
 
 test("real setup profile denies protected, sentinel, credentials and socket access", async () => {
   const sample = await setupMission(`set -e
@@ -446,11 +1432,13 @@ test("unsupported observer and infeasible mandatory path do not become ready", (
     manual.definition.units[0]!.acceptance[0] = { id: "proof-0", kind: "manual", target: "just explain PASS" };
     const result = validatePreparation({ request, proposal: manual });
     expect(result.state).toBe("needs-input");
-    if (result.state === "needs-input") expect(result.issues.some(({ message }) => message.includes("unsupported observer"))).toBe(true);
+    expect(result.status).toBe("technical-unresolved");
+    expect(result.issues).toContainEqual(expect.objectContaining({ code: "unsupported-observer", owner: "author" }));
     const budget = structuredClone(proposal);
     budget.definition.budget.roleLaunches = 1;
     const blocked = validatePreparation({ request, proposal: budget });
     expect(blocked.state).toBe("needs-input");
-    if (blocked.state === "needs-input") expect(blocked.issues.some(({ kind }) => kind === "budget")).toBe(true);
+    expect(blocked.status).toBe("technical-unresolved");
+    expect(blocked.issues).toContainEqual(expect.objectContaining({ code: "insufficient-grant", owner: "author" }));
   } finally { rmSync(fixture.base, { recursive: true, force: true }); }
 });

@@ -13,8 +13,8 @@ export interface LoadedPitako {
 }
 
 /** Load Pitako the way Pi loads a local package path from project settings. */
-export async function loadPitako(packageRoot: string, cwd = mkdtempSync(path.join(tmpdir(), "pitako-project-"))): Promise<LoadedPitako> {
-  const agentDir = mkdtempSync(path.join(tmpdir(), "pitako-agent-"));
+export async function loadPitako(packageRoot: string, cwd = mkdtempSync(path.join(tmpdir(), "pitako-project-")),
+  agentDir = mkdtempSync(path.join(tmpdir(), "pitako-agent-"))): Promise<LoadedPitako> {
   const settingsDir = path.join(cwd, ".pi");
   mkdirSync(settingsDir, { recursive: true });
   const relativePackagePath = path.relative(settingsDir, packageRoot);

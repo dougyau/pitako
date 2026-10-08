@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { registerMissionExtension } from "../extensions/mission/index.ts";
@@ -119,12 +120,304 @@ test("authority refusal is no grant; grouped source interpretation is explicitly
     const db = await openMissionStore({ dbPath: f.dbPath, objectDir: f.objectDir, readOnly: true });
     try {
       expect(db.findManagedMission(f.root)?.prepared?.answers).toHaveLength(context.inventory.unresolved.length);
-      const preview = JSON.parse(prompts.at(-1)!);
-      expect(preview.prepared.definition.authority.rolePolicies.developer.primaryTarget).toEqual(context.roles.developer.primary);
-      expect(preview.prepared.originalSource).toContain("Preserve diagnostics unless incompatible");
+      const preview = prompts.at(-1)!;
+      expect(preview).toStartWith("Action: admit-prepared-mission");
+      expect(preview).toContain(JSON.stringify(context.roles.developer.primary));
+      expect(db.findManagedMission(f.root)?.prepared?.originalSource).toContain("Preserve diagnostics unless incompatible");
     } finally { db.close(); }
   } finally { await h.emit("session_shutdown"); }
 });
+
+test.each(["mapping", "observer", "proposal"] as const)("technical %s repair never becomes a permission dialog", async (problem) => {
+  const f = fixture(), h = host(f);
+  try {
+    await h.command("prepare durable-fixture");
+    const context = contextFromMessage(h.messages[0]!);
+    expect(context.producers.find(({ id }: { id: string }) => id === "command_exit").proof).toContain("descriptor only");
+    const proposal = authoringProposal(context);
+    if (problem === "mapping") proposal.mappings.pop();
+    if (problem === "observer") {
+      proposal.definition.units[0]!.acceptance[0]!.kind = "manual";
+      delete proposal.definition.units[0]!.acceptance[0]!.command;
+    }
+    let prompts = 0;
+    h.confirm(async () => { prompts++; return true; });
+    const result = JSON.parse((await h.submit({ id: "durable-fixture", requestId: context.requestId,
+      proposal: problem === "proposal" ? { definition: proposal.definition } : proposal })).content[0].text);
+    expect(result.status).toBe("technical-unresolved");
+    expect(result.issues).toContainEqual(expect.objectContaining({
+      code: problem === "mapping" ? "missing-mapping" : problem === "observer" ? "unsupported-observer" : "invalid-proposal",
+      owner: "author",
+    }));
+    expect(result.nextAction).toBeTruthy();
+    expect(prompts).toBe(0);
+    expect(existsSync(f.dbPath)).toBe(false);
+  } finally { await h.emit("session_shutdown"); }
+});
+
+test("existing stage producer informs authoring without importing executable stage code", async () => {
+  const f = fixture(), h = host(f);
+  mkdirSync(path.join(f.root, "scripts"));
+  writeFileSync(path.join(f.root, "scripts/verify-mission.ts"), 'throw new Error("stage execution is not preparation");\n');
+  try {
+    await h.command("prepare durable-fixture");
+    const context = contextFromMessage(h.messages[0]!);
+    const descriptor = context.producers.find(({ id }: { id: string }) => id === "verify:mission");
+    expect(descriptor.route).toBe("scripts/verify-mission.ts");
+    expect(descriptor.requirements).toContain("independent source mapping");
+    expect(descriptor.proof).toContain("nested verification capability is not established");
+    expect(existsSync(f.dbPath)).toBe(false);
+  } finally { await h.emit("session_shutdown"); }
+});
+
+test("readable native view preserves exact finite budgets and optional canonical details without starting", async () => {
+  const f = fixture(), h = host(f);
+  try {
+    await h.command("help");
+    expect(h.notices.at(-1)).toContain("Technical errors need author correction, not user permission");
+    expect(h.notices.at(-1)).toContain("sealed-nested-verification-v1");
+    expect(h.notices.at(-1)).toContain("Ordinary worker namespace, socket and tool restrictions remain unchanged");
+    await h.command("prepare durable-fixture");
+    await h.command("prepare-details");
+    const context = contextFromMessage(h.messages[0]!);
+    const proposal = authoringProposal(context);
+    const prompts: string[] = [];
+    h.confirm(async (_title, text) => { prompts.push(text); return true; });
+    const result = JSON.parse((await h.submit({ id: "durable-fixture", requestId: context.requestId, proposal })).content[0].text);
+    expect(result.status).toBe("ready");
+    expect(result.nextAction).toContain("/mission start durable-fixture");
+    for (const text of prompts) {
+      expect(text).not.toStartWith("{");
+      expect(text).toContain(`Source: ${context.binding.planSource}`);
+      expect(text).toContain(`Execution root: ${f.root}`);
+      for (const [key, value] of Object.entries(proposal.definition.budget)) expect(text).toContain(`${key}=${value}`);
+      expect(text).toContain("Setup allocation: none proposed");
+      expect(text).toContain("Role developer:");
+      expect(text).toContain("nested verification not granted");
+      expect(text).toContain("ordinary contained command only; nested verification not selected");
+      expect(text).toContain("no setup, command, provider or worker runs");
+    }
+    const details = h.notices.filter((text) => text.startsWith("{")).map((text) => JSON.parse(text));
+    expect(details.at(-1).prepared.definition).toEqual(proposal.definition);
+    expect(details.at(-1).preparedHash).toBe(result.preparedHash);
+    const db = await openMissionStore({ dbPath: f.dbPath, objectDir: f.objectDir, readOnly: true });
+    try {
+      const mission = db.findManagedMission(f.root)!;
+      expect(mission.events.some(({ kind }) => /setup|attempt|activated|provider/.test(kind))).toBe(false);
+      expect(mission.prepared?.authorityDecision.text).toBe(JSON.stringify(details[0].decisions[0]));
+    } finally { db.close(); }
+  } finally { await h.emit("session_shutdown"); }
+});
+
+test.each(["grant-only", "selected", "cancelled", "stale"] as const)(
+  "readable nested confirmation discloses capability and preserves %s admission", async (scenario) => {
+    const f = fixture(), h = host(f);
+    try {
+      await h.command("prepare durable-fixture");
+      const context = contextFromMessage(h.messages[0]!);
+      const proposal = authoringProposal(context);
+      proposal.definition.authority.verificationProfiles = ["sealed-nested-verification-v1"];
+      if (scenario !== "grant-only")
+        proposal.definition.units[0]!.acceptance[0]!.profile = "sealed-nested-verification-v1";
+      const prompts: string[] = [];
+      h.confirm(async (title, text) => {
+        prompts.push(text);
+        if (title.startsWith("Confirm exact")) {
+          if (scenario === "cancelled") return false;
+          if (scenario === "stale") writeFileSync(f.planFile, authoringSource + "\nchanged");
+        }
+        return true;
+      });
+      const submit = () => h.submit({ id: "durable-fixture", requestId: context.requestId, proposal });
+      if (scenario === "stale") await expect(submit()).rejects.toThrow();
+      else {
+        const result = JSON.parse((await submit()).content[0].text);
+        expect(scenario === "cancelled" ? result.state : result.status).toBe(scenario === "cancelled" ? "dismissed" : "ready");
+      }
+      expect(prompts.length).toBeGreaterThan(0);
+      for (const text of prompts) {
+        expect(text).toContain("sealed-nested-verification-v1 granted; used only by commands explicitly selecting");
+        for (const [key, value] of Object.entries(proposal.definition.budget)) expect(text).toContain(`${key}=${value}`);
+        expect(text).toContain("no setup, command, provider or worker runs");
+        expect(text).toContain("separate execution consent");
+        if (scenario === "grant-only") {
+          expect(text).toContain("ordinary contained command only; nested verification not selected");
+          expect(text).not.toContain("sealed-nested-verification-v1 selected:");
+        } else {
+          expect(text).toContain("sealed-nested-verification-v1 selected: nested namespaces and private IPC");
+          expect(text).toContain("no host writes, host credentials or external connectivity");
+          expect(text).toContain("extra kernel capability relative to workers");
+          expect(text).not.toContain("proof-0: command_exit (node --check src/a) — ordinary contained command only");
+          expect(text).toContain("proof-1: command_exit (node --check src/a) — ordinary contained command only");
+        }
+      }
+      if (scenario === "cancelled" || scenario === "stale") expect(existsSync(f.dbPath)).toBe(false);
+      else {
+        const db = await openMissionStore({ dbPath: f.dbPath, objectDir: f.objectDir, readOnly: true });
+        try {
+          const mission = db.findManagedMission(f.root)!;
+          expect(mission.definition.authority.verificationProfiles).toEqual(["sealed-nested-verification-v1"]);
+          expect(mission.events.some(({ kind }) => /setup|attempt|activated|provider/.test(kind))).toBe(false);
+        } finally { db.close(); }
+      }
+    } finally { await h.emit("session_shutdown"); }
+  });
+
+test("missing setup input names runtime repair, never asks for broader setup permission", async () => {
+  const f = fixture(), h = host(f);
+  mkdirSync(path.join(f.root, "scripts"));
+  writeFileSync(path.join(f.root, "scripts/setup.sh"), "exit 0\n");
+  try {
+    await h.command("prepare durable-fixture");
+    const context = contextFromMessage(h.messages[0]!);
+    let prompts = 0;
+    h.confirm(async () => { prompts++; return true; });
+    const result = JSON.parse((await h.submit({ id: "durable-fixture", requestId: context.requestId,
+      proposal: authoringProposal(context), setup: { effectProfile: "execution-root-local-v1",
+        writableDirectories: ["node_modules"], activeTimeMs: 1000, artifactBytes: 16384 } })).content[0].text);
+    expect(result.status).toBe("technical-unresolved");
+    const issue = result.issues.find(({ code }: { code: string }) => code === "missing-local-input");
+    expect(issue).toMatchObject({ owner: "runtime" });
+    expect(issue.message).toContain("node_modules");
+    expect(prompts).toBe(0);
+    expect(existsSync(f.dbPath)).toBe(false);
+  } finally { await h.emit("session_shutdown"); }
+});
+
+test("setup input changes during the native decision invalidate the original exact payload", async () => {
+  const f = fixture(), h = host(f);
+  mkdirSync(path.join(f.root, "scripts"));
+  mkdirSync(path.join(f.root, "node_modules"));
+  const hook = path.join(f.root, "scripts/setup.sh");
+  writeFileSync(hook, "exit 0\n");
+  try {
+    await h.command("prepare durable-fixture");
+    const context = contextFromMessage(h.messages[0]!);
+    h.confirm(async () => { writeFileSync(hook, "exit 23\n"); return true; });
+    try {
+      await h.submit({ id: "durable-fixture", requestId: context.requestId, proposal: authoringProposal(context),
+        setup: { effectProfile: "execution-root-local-v1", writableDirectories: ["node_modules"],
+          activeTimeMs: 1000, artifactBytes: 16384 } });
+      throw new Error("changed setup input was admitted");
+    } catch (error) {
+      expect(error).toMatchObject({ issue: { code: "stale-binding", owner: "runtime" } });
+    }
+    expect(existsSync(f.dbPath)).toBe(false);
+    expect(existsSync(path.join(f.root, "node_modules/dependency"))).toBe(false);
+  } finally { await h.emit("session_shutdown"); }
+});
+
+test.each(["valid", "infeasible", "malformed"] as const)("proposed %s setup distinguishes admission from ready-to-start", async (mode) => {
+  const f = fixture(), h = host(f);
+  mkdirSync(path.join(f.root, "scripts"));
+  mkdirSync(path.join(f.root, "node_modules"));
+  writeFileSync(path.join(f.root, "scripts/setup.sh"), "printf installed > node_modules/dependency\n");
+  try {
+    await h.command("prepare durable-fixture");
+    const context = contextFromMessage(h.messages[0]!);
+    const proposal = authoringProposal(context);
+    let prompts = 0;
+    h.confirm(async (_title, text) => {
+      prompts++;
+      expect(text).toContain("Setup allocation (inside root budgets)");
+      expect(text).toContain("artifactBytes=16384");
+      return true;
+    });
+    const result = JSON.parse((await h.submit({ id: "durable-fixture", requestId: context.requestId, proposal,
+      setup: { effectProfile: "execution-root-local-v1", writableDirectories: ["node_modules"],
+        activeTimeMs: mode === "infeasible" ? proposal.definition.budget.activeTimeMs : mode === "malformed" ? -1 : 1000,
+        artifactBytes: 16384 } })).content[0].text);
+    expect(result.status).toBe("technical-unresolved");
+    expect(result.issues).toContainEqual(expect.objectContaining({
+      code: mode === "valid" ? "unresolved-setup" : mode === "infeasible" ? "insufficient-grant" : "invalid-proposal",
+      owner: mode === "valid" ? "runtime" : "author",
+    }));
+    expect(prompts).toBe(mode === "valid" ? 2 : 0);
+    expect(existsSync(path.join(f.root, "node_modules/dependency"))).toBe(false);
+    if (mode === "valid") {
+      expect(result.state).toBe("prepared");
+      await h.command("status");
+      const observed = JSON.parse(h.notices.at(-1)!);
+      expect(observed.preparationStatus).toBe("technical-unresolved");
+      expect(observed.nextAction).toContain("no successful receipt");
+      expect(observed.nextAction).toContain("/mission start");
+    } else expect(existsSync(f.dbPath)).toBe(false);
+  } finally { await h.emit("session_shutdown"); }
+}, 30000);
+
+test("native copied setup confirms exact bounds/destination and settles while prepared, without activation", async () => {
+  const f = fixture(), h = host(f);
+  const seed = path.join(f.base, "seed");
+  mkdirSync(seed); writeFileSync(path.join(seed, "seed"), "1");
+  mkdirSync(path.join(f.root, "scripts"));
+  writeFileSync(path.join(f.root, "scripts/setup.sh"), "printf installed > node_modules/dependency\n");
+  let destination: string | undefined;
+  try {
+    await h.command("prepare durable-fixture");
+    const context = contextFromMessage(h.messages[0]!);
+    const proposal = authoringProposal(context);
+    proposal.definition.budget = { ...proposal.definition.budget, roleLaunches: 100, providerRequests: 100, artifactBytes: 8000000000 };
+    h.confirm(async (_title, text) => {
+      expect(existsSync(path.join(f.root, "node_modules"))).toBe(false);
+      expect(text).toContain("Output bounds (exact): paths=20; largestFileBytes=100; totalBytes=100");
+      expect(text).toContain(`Private setup destination: ${path.join(realpathSync(os.tmpdir()), "pitako-setup-")}`);
+      expect(text).toContain(seed);
+      return true;
+    });
+    const result = JSON.parse((await h.submit({ id: "durable-fixture", requestId: context.requestId, proposal,
+      setup: { effectProfile: "execution-root-local-copy-v1", writableDirectories: ["node_modules"], activeTimeMs: 60000,
+        artifactBytes: 600000000, copy: { bounds: { paths: 20, largestFileBytes: 100, totalBytes: 100 },
+          seeds: [{ source: seed, destination: "node_modules", bounds: { paths: 2, largestFileBytes: 1, totalBytes: 1 } }] } } })).content[0].text);
+    expect(result).toMatchObject({ state: "prepared", status: "ready" });
+    expect(result.nextAction).toContain("rechecked and reused");
+    await h.command("status");
+    expect(JSON.parse(h.notices.at(-1)!)).toMatchObject({ preparationStatus: "ready" });
+    const reader = await openMissionStore({ dbPath: f.dbPath, objectDir: f.objectDir, readOnly: true });
+    try {
+      const mission = reader.findManagedMission(f.root)!;
+      destination = mission.prepared!.setup!.identity.copy!.destination;
+      expect(mission.state).toBe("prepared");
+      expect(mission.events.filter(({ kind }) => kind === "mission.setup.intent")).toHaveLength(1);
+      expect(mission.events.some(({ kind }) => ["mission.activated", "attempt.reserved", "provider.request"].includes(kind))).toBe(false);
+      expect(readFileSync(path.join(destination, "published/node_modules/dependency"), "utf8")).toBe("installed");
+      expect(existsSync(path.join(f.root, "node_modules"))).toBe(false);
+    } finally { reader.close(); }
+  } finally {
+    await h.emit("session_shutdown");
+    if (destination) rmSync(destination, { recursive: true, force: true });
+  }
+}, 120000);
+
+test.each(["stale-seed", "infeasible-root"] as const)("copied native setup rejects %s before effects", async (mode) => {
+  const f = fixture(), h = host(f), seed = path.join(f.base, "seed");
+  mkdirSync(seed); writeFileSync(path.join(seed, "seed"), "1");
+  mkdirSync(path.join(f.root, "scripts"));
+  writeFileSync(path.join(f.root, "scripts/setup.sh"), "printf installed > node_modules/dependency\n");
+  try {
+    await h.command("prepare durable-fixture");
+    const context = contextFromMessage(h.messages[0]!);
+    const proposal = authoringProposal(context);
+    proposal.definition.budget = { ...proposal.definition.budget, roleLaunches: 100, providerRequests: 100, artifactBytes: 8000000000 };
+    let prompts = 0;
+    h.confirm(async () => { prompts++; writeFileSync(path.join(seed, "seed"), "2"); return true; });
+    const submit = () => h.submit({ id: "durable-fixture", requestId: context.requestId, proposal,
+      setup: { effectProfile: "execution-root-local-copy-v1", writableDirectories: ["node_modules"],
+        activeTimeMs: mode === "infeasible-root" ? proposal.definition.budget.activeTimeMs : 15000, artifactBytes: 600000000,
+        copy: { bounds: { paths: 20, largestFileBytes: 100, totalBytes: 100 },
+          seeds: [{ source: seed, destination: "node_modules", bounds: { paths: 2, largestFileBytes: 1, totalBytes: 1 } }] } } });
+    if (mode === "stale-seed") {
+      try { await submit(); throw new Error("stale copied seed admitted"); }
+      catch (error) { expect(error).toMatchObject({ issue: { code: "stale-binding", owner: "runtime" } }); }
+      expect(prompts).toBe(1);
+    } else {
+      const result = JSON.parse((await submit()).content[0].text);
+      expect(result.issues).toContainEqual(expect.objectContaining({ code: "insufficient-grant", owner: "author" }));
+      expect(prompts).toBe(0);
+    }
+    expect(existsSync(f.dbPath)).toBe(false);
+    expect(existsSync(path.join(f.root, "node_modules"))).toBe(false);
+  } finally { await h.emit("session_shutdown"); }
+}, 30000);
 
 test("supported busy SDK command → queued foreground provider → author tool → native decisions → immutable prepared reload", async () => {
   const f = fixture();
@@ -169,7 +462,7 @@ test("supported busy SDK command → queued foreground provider → author tool 
     expect(provider.trace.some(({ prompt }) => prompt.startsWith("Mission preparation request"))).toBe(true);
     expect(previews).toHaveLength(2);
     expect(previews[0]).toContain("preparation-authority");
-    expect(previews[1]).toContain("preparedHash");
+    expect(previews[1]).toContain("Exact binding:");
     const db = await openMissionStore({ dbPath: f.dbPath, objectDir: f.objectDir, readOnly: true });
     try {
       const mission = db.findManagedMission(f.root)!;
@@ -186,7 +479,7 @@ test("supported busy SDK command → queued foreground provider → author tool 
         mkdirSync(process.env.MISSION_T3_ARTIFACT_DIR, { recursive: true });
         writeFileSync(path.join(process.env.MISSION_T3_ARTIFACT_DIR, "sdk-authoring.json"), JSON.stringify({
           fixtureAuthority: true, userApproval: false, provider: provider.provider, model: provider.model,
-          mission, previews: previews.map((text) => JSON.parse(text)), notices, trace: provider.trace,
+          mission, previews, notices, trace: provider.trace,
         }, null, 2));
       }
     } finally { db.close(); }

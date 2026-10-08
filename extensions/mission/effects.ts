@@ -9,10 +9,13 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { MissionEventDraft, MissionStore } from "./store.ts";
 import {
   captureWorkspaceImage, captureWorkspacePaths, captureWorkspacePath, currentProcessIdentity, filterWorkspaceImage, hasContainmentProof, processBirthTicks, processIsDescendantOf, processesInNamespace, processNamespaceId,
-  quarantineWorkspace, readOwnedNamespaceInit, sandboxProductPath, spawnContained, type ManifestPath, type MissionWorkspace,
+  quarantineWorkspace, readOwnedNamespaceInit, sandboxProductPath, spawnContained, ownerProcessState, observeNestedVerificationBoundary, type ManifestPath, type MissionWorkspace,
 } from "./workspace.ts";
 import { sealWorkspaceImage } from "./reconcile.ts";
 import { loadCodexTools } from "./codex-tools.ts";
+import { assertCommandTime, MAX_COMMAND_TIME_MS } from "./command-time.ts";
+import { readNestedVerificationAdmission } from "./checks.ts";
+import { createCheckerTransport, type CheckerTransport } from "./checker-transport.ts";
 
 const EFFECT_TOOLS = ["bash", "edit", "write", "apply_patch"] as const;
 const DENIED_TOOLS = new Set(["powershell", "lsp_rename"]);
@@ -32,7 +35,13 @@ export interface MissionEffectContext {
   recoveryMode?: "verify" | "repair";
   recoveryImageHash?: string;
   repairAuthorizationId?: string;
+  // Host-only factual diagnosis; effect arguments cannot enable it.
+  diagnosticTrace?: true;
   canInvoke?: (effectId: string) => boolean;
+  commandTime?: {
+    admit: (requestedMs?: number) => Promise<number>;
+    remaining: () => number;
+  };
 }
 
 export interface MissionEffectReceipt {
@@ -54,6 +63,7 @@ interface RunningEffect {
   child: ChildProcess;
   namespace?: string;
   namespaceRootPid?: number;
+  namespaceInit?: { pid: number; birthTicks: number };
   workspace: MissionWorkspace;
   promise?: Promise<MissionEffectReceipt>;
   quiescent: boolean;
@@ -67,6 +77,7 @@ export class MissionEffects {
   private fenced = false;
   private verificationOnly = false;
   private verificationSubject = false;
+  private nestedAdmission?: unknown;
 
   constructor(context: MissionEffectContext) {
     this.context = context;
@@ -87,6 +98,12 @@ export class MissionEffects {
   enableVerificationOnly(sealedSubject = false): void {
     this.verificationOnly = true;
     this.verificationSubject ||= sealedSubject;
+  }
+
+  enableNestedVerification(admission: unknown): void {
+    readNestedVerificationAdmission(admission, this.workspace);
+    this.enableVerificationOnly(true);
+    this.nestedAdmission = admission;
   }
 
   async invoke(operation: string, input: EffectInput, signal?: AbortSignal): Promise<MissionEffectReceipt> {
@@ -135,11 +152,23 @@ export class MissionEffects {
         if (!running.namespaceRootPid) throw new Error(`effect ${running.effectId} has no verified namespace root`);
         await terminateNamespace(running.namespace, running.namespaceRootPid);
       }
+      this.requireOuterInitRetirement(running.namespaceInit);
       try { running.child.kill("SIGKILL"); } catch { /* process may already be gone */ }
     }
     if (!await settlesWithin(Promise.allSettled([...this.jobs]), 5_000) || !this.quiescent) {
       throw new Error("contained effects did not quiesce within shutdown budget; owner release is unsafe");
     }
+  }
+
+  private requireOuterInitRetirement(init?: { pid: number; birthTicks: number }): true | undefined {
+    if (this.nestedAdmission === undefined) return undefined;
+    const owner = currentProcessIdentity(this.context.runtimeId, this.context.ownerEpoch);
+    if (!init || ownerProcessState({ ...owner, ...init }) !== "dead") {
+      this.fenced = true;
+      quarantineWorkspace(this.workspace, "outer namespace init ownership is unresolved");
+      throw new Error("outer namespace init retirement is unproved; nested descendants remain fenced");
+    }
+    return true;
   }
 
   private async serialized<T extends MissionEffectReceipt>(run: () => Promise<T>): Promise<T> {
@@ -158,6 +187,26 @@ export class MissionEffects {
   }
 
   private async run(effectId: string, operation: string, input: EffectInput, signal?: AbortSignal): Promise<MissionEffectReceipt> {
+    const admittedAt = performance.now();
+    const traceEvents: Array<Record<string, unknown>> = [];
+    const trace = this.nestedAdmission === undefined || !this.context.diagnosticTrace ? undefined :
+      (event: string, facts?: Record<string, unknown>) => {
+        if (traceEvents.length < 64)
+          traceEvents.push({ event, at: performance.now(), ...facts });
+      };
+    trace?.("invocation.begin", { admittedAt, wallClock: Date.now(), requestedTimeoutMs: input.timeoutMs });
+    let timeoutMs: number;
+    try {
+      if (input.timeoutMs !== undefined) assertCommandTime(input.timeoutMs);
+      if (!this.context.commandTime) throw new Error("current finite effect time grant is missing");
+      timeoutMs = await this.context.commandTime.admit(input.timeoutMs as number | undefined);
+      assertCommandTime(timeoutMs);
+      if (input.timeoutMs !== undefined && timeoutMs !== input.timeoutMs) throw new Error("explicit command timeout changed during admission");
+    } catch (error) {
+      return this.recordDenied(effectId, operation, error instanceof Error ? error.message : String(error));
+    }
+    input = { ...input, timeoutMs };
+    trace?.("invocation.admitted", { timeoutMs, deadline: admittedAt + timeoutMs });
     const requestHash = hashJson(input);
     let beforePaths: ManifestPath[];
     try { beforePaths = captureWorkspacePaths(this.context.workspace.candidateRoot, true); }
@@ -167,8 +216,12 @@ export class MissionEffects {
     const candidateManifestHash = hashJson(beforePaths);
     const owner = currentProcessIdentity(this.context.runtimeId, this.context.ownerEpoch);
     const plan = await createEffectPlan(this.context.workspace, operation, input, requestHash, beforePaths);
-    if (this.verificationOnly) plan.verification = { writablePaths: [], network: "disabled",
+    const nested = this.nestedAdmission === undefined ? undefined :
+      readNestedVerificationAdmission(this.nestedAdmission, this.workspace, String(input.command), effectId);
+    if (nested && (operation !== "bash" || timeoutMs !== nested.timeoutMs)) throw new Error("nested verification operation or time grant mismatch");
+    if (this.verificationOnly) plan.verification = { writablePaths: [], network: nested ? "private-ipc-no-host-or-external-connectivity" : "disabled",
       sourceView: this.verificationSubject ? "sealed-subject" : "source", privateGitView: this.verificationSubject };
+    if (nested) plan.nestedVerification = nested.binding;
     const planBytes = Buffer.from(JSON.stringify(plan));
     const effectPlanHash = createHash("sha256").update(planBytes).digest("hex");
     const intent = {
@@ -202,18 +255,50 @@ export class MissionEffects {
 
     const writablePaths = this.verificationOnly ? [] : operation === "bash" || operation === "apply_patch" ? this.context.workspace.allowedPaths : ["."];
     const bashScript = `printf '{"kind":"ready","pid":%s,"namespace":"%s","networkNamespace":"%s"}\\n' "$$" "$(readlink /proc/self/ns/pid)" "$(readlink /proc/self/ns/net)"; IFS= read -r gate || exit 94; [ "$gate" = GO ] || exit 94; exec /bin/bash -c "$1"`;
-    const child = operation === "bash"
-      ? spawnContained(this.context.workspace, "bash", ["-c", bashScript, "pitako-effect", String(input.command ?? "")], { signal, writablePaths, verificationSubject: this.verificationSubject })
-      : spawnContained(this.context.workspace, operation === "apply_patch" ? "bun" : "node", [sandboxProductPath(this.context.workspace, this.context.workspace.adapterScript)], { signal, writablePaths, verificationSubject: this.verificationSubject });
-    const running: RunningEffect = { effectId, child, workspace: this.context.workspace, quiescent: false };
-    this.inFlight.set(effectId, running);
-    const job = this.observeChild(effectId, operation, input, beforePaths, child, owner, requestHash, signal, (ns, rootPid) => {
-      running.namespace = ns;
-      running.namespaceRootPid = rootPid;
-    });
-    running.promise = job;
-    try { return await job; }
-    finally { if (running.quiescent) this.inFlight.delete(effectId); }
+    const transport = nested ? createCheckerTransport(trace) : undefined;
+    const beforeSpawn = trace ? () => {
+      const now = performance.now();
+      trace("native.beforeSpawn", { observedAt: now, admittedAt, timeoutMs, deadline: admittedAt + timeoutMs,
+        invocationRemainingMs: timeoutMs - Math.ceil(now - admittedAt),
+        grantRemainingMs: this.context.commandTime!.remaining() });
+    } : undefined;
+    const canSpawn = () => {
+      const remainingGrant = this.context.commandTime!.remaining();
+      const remainingInvocation = timeoutMs - Math.ceil(performance.now() - admittedAt);
+      return remainingInvocation > 0 && remainingInvocation <= remainingGrant;
+    };
+    try {
+      const child = operation === "bash"
+        ? spawnContained(this.context.workspace, "bash", ["-c", bashScript, "pitako-effect", String(input.command ?? "")], { signal, writablePaths, verificationSubject: this.verificationSubject, nestedAdmission: this.nestedAdmission, checkerTransport: transport, beforeSpawn, canSpawn })
+        : spawnContained(this.context.workspace, operation === "apply_patch" ? "bun" : "node", [sandboxProductPath(this.context.workspace, this.context.workspace.adapterScript)], { signal, writablePaths, verificationSubject: this.verificationSubject, canSpawn });
+      if (!child) {
+        const reason = "command timeout exceeds current remaining effect time grant";
+        const receipt: MissionEffectReceipt = { effectId, operation, status: "denied", paths: [], reason };
+        await this.appendEffectEvent("effect.receipt", effectId, {
+          effectId, operation, status: receipt.status, paths: [], requestHash, owner, reason, process: null,
+        });
+        return receipt;
+      }
+      trace?.("native.spawnReturned", { pid: child.pid ?? null });
+      if (trace) child.once("spawn", () => trace("native.spawn", { pid: child.pid ?? null }));
+      transport?.spawned();
+      const running: RunningEffect = { effectId, child, workspace: this.context.workspace, quiescent: false };
+      this.inFlight.set(effectId, running);
+      const job = this.observeChild(effectId, operation, input, beforePaths, child, owner, requestHash, admittedAt, signal, (ns, rootPid) => {
+        running.namespace = ns;
+        running.namespaceRootPid = rootPid;
+      }, transport, trace, traceEvents);
+      running.promise = job;
+      try { return await job; }
+      finally { if (running.quiescent) this.inFlight.delete(effectId); }
+    } finally {
+      try { await transport?.dispose(); }
+      catch (error) {
+        this.fenced = true;
+        quarantineWorkspace(this.workspace, "checker endpoint closure is unresolved");
+        throw error;
+      }
+    }
   }
 
   private async observeChild(
@@ -224,28 +309,50 @@ export class MissionEffects {
     child: ChildProcess,
     owner: ReturnType<typeof currentProcessIdentity>,
     requestHash: string,
+    admittedAt: number,
     signal: AbortSignal | undefined,
     onNamespace: (namespace: string, rootPid: number) => void,
+    transport?: CheckerTransport,
+    trace?: (event: string, facts?: Record<string, unknown>) => void,
+    traceEvents?: Array<Record<string, unknown>>,
   ): Promise<MissionEffectReceipt> {
+    const running = this.inFlight.get(effectId);
+    if (!running) throw new Error("effect process is not registered with its owner");
     let namespace: string | undefined;
     let namespaceRootPid: number | undefined;
     let identity: Record<string, unknown> | undefined;
     let observedPaths: Array<Record<string, unknown>> = [];
     let closed = false;
-    const lines = createInterface({ input: child.stdout!, crlfDelay: Infinity });
+    const stdin = transport?.stdin ?? child.stdin!;
+    const stdout = transport?.stdout ?? child.stdout!;
+    const stderr = transport?.stderr ?? child.stderr!;
+    const lines = createInterface({ input: stdout, crlfDelay: Infinity });
     const iterator = lines[Symbol.asyncIterator]();
     const exit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
       // AbortError reports a requested stop, not physical process disposal.
-      child.once("error", () => {});
-      child.once("close", (code, childSignal) => { closed = true; resolve({ code, signal: childSignal }); });
+      child.once("error", (error) => { trace?.("native.error", { name: error.name, error: error.message }); });
+      if (trace) child.once("exit", (code, childSignal) => trace("native.exit", { code, signal: childSignal }));
+      child.once("close", (code, childSignal) => {
+        closed = true;
+        trace?.("native.close", { code, signal: childSignal });
+        resolve({ code, signal: childSignal });
+      });
     });
+    const boundedExit = waitForExit(exit, child, Number(input.timeoutMs), admittedAt, trace);
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
     let stdoutBytes = 0;
     let stderrBytes = 0;
     let stdoutTruncated = false;
     let stderrTruncated = false;
-    child.stdout!.on("data", (chunk: Buffer) => {
+    let timedOut = false;
+    let validatedReadyPrefix: Buffer | undefined;
+    const commandOutput = () => {
+      const output = Buffer.concat(stdoutChunks);
+      return validatedReadyPrefix && output.subarray(0, validatedReadyPrefix.length).equals(validatedReadyPrefix)
+        ? output.subarray(validatedReadyPrefix.length) : output;
+    };
+    stdout.on("data", (chunk: Buffer) => {
       if (stdoutBytes + chunk.length > OUTPUT_LIMIT) stdoutTruncated = true;
       if (stdoutBytes < OUTPUT_LIMIT) {
         const bounded = chunk.subarray(0, OUTPUT_LIMIT - stdoutBytes);
@@ -253,7 +360,7 @@ export class MissionEffects {
         stdoutBytes += bounded.length;
       }
     });
-    child.stderr!.on("data", (chunk: Buffer) => {
+    stderr.on("data", (chunk: Buffer) => {
       if (stderrBytes + chunk.length > OUTPUT_LIMIT) stderrTruncated = true;
       if (stderrBytes < OUTPUT_LIMIT) {
         const bounded = chunk.subarray(0, OUTPUT_LIMIT - stderrBytes);
@@ -264,13 +371,15 @@ export class MissionEffects {
     try {
       if (operation !== "bash") {
         const request = { ...input, operation, hostCandidateRoot: this.context.workspace.candidateRoot, allowedPaths: this.context.workspace.allowedPaths };
-        child.stdin!.write(`${JSON.stringify(request)}\n`);
+        stdin.write(`${JSON.stringify(request)}\n`);
       }
-      const readyRow = await nextLine(iterator, 10_000);
+      const readyRow = await nextLine(iterator, Math.min(10_000, Math.max(1, Number(input.timeoutMs) - Math.ceil(performance.now() - admittedAt))), trace);
+      trace?.("protocol.readyRow");
       const ready = parseProtocol(readyRow);
       if (ready.kind !== "ready" || !Number.isSafeInteger(ready.pid) || ready.pid < 1 || typeof ready.namespace !== "string" || typeof ready.networkNamespace !== "string") {
         throw new Error("contained process returned an invalid launch handshake");
       }
+      validatedReadyPrefix = Buffer.from(`${readyRow}\n`);
       namespace = ready.namespace;
       if (namespace === processNamespaceId(process.pid) || ready.networkNamespace === this.context.workspace.containmentProof!.networkNamespace) {
         throw new Error("contained process did not enter private PID and network namespaces");
@@ -290,37 +399,58 @@ export class MissionEffects {
         containedPid: ready.pid, pidNamespace: namespace, networkNamespace: ready.networkNamespace,
         ancestry, runtimeId: this.context.runtimeId, epoch: this.context.ownerEpoch,
       };
+      running.namespaceInit = namespaceInit;
+      if (transport)
+        identity.nestedBoundary = observeNestedVerificationBoundary(namespace, ready.pid, transport);
       await this.appendEffectEvent("effect.process.registered", effectId, { effectId, operation, owner, identity });
       if (signal?.aborted || this.fenced) throw new Error("effect fenced before launch release");
       readOwnedNamespaceInit(namespace, namespaceRoot, launcher);
-      await this.appendEffectEvent("effect.released", effectId, { effectId, requestHash, processIdentity: identity });
-      if (signal?.aborted || this.fenced) throw new Error("effect fenced before launch release");
+      await this.appendEffectEvent("effect.released", effectId, { effectId, operation, requestHash, processIdentity: identity,
+        timeoutMs: input.timeoutMs });
+      if (signal?.aborted || this.fenced || this.context.canInvoke?.(effectId) === false) throw new Error("effect fenced before launch release");
+      assertCommandTime(input.timeoutMs);
+      const remainingInvocation = input.timeoutMs - Math.ceil(performance.now() - admittedAt);
+      if (remainingInvocation <= 0 || remainingInvocation > this.context.commandTime!.remaining())
+        throw new Error("command timeout exceeds current remaining effect time grant");
       readOwnedNamespaceInit(namespace, namespaceRoot, launcher);
-      child.stdin!.end("GO\n");
+      if (this.nestedAdmission !== undefined)
+        readNestedVerificationAdmission(this.nestedAdmission, this.workspace, String(input.command), effectId);
+      if (transport && JSON.stringify(observeNestedVerificationBoundary(namespace, ready.pid, transport)) !==
+        JSON.stringify(identity.nestedBoundary))
+        throw new Error("nested verification boundary changed before GO");
+      if (transport) await transport.release(remainingInvocation);
+      else stdin.end("GO\n");
+      if (operation === "bash" && transport) {
+        lines.close();
+        // readline.close() pauses its input; the independent raw capture must keep draining.
+        stdout.resume();
+      }
 
       let receipt: Record<string, any>;
-      let timedOut = false;
       if (operation === "bash") {
-        const timeoutMs = Number.isSafeInteger(input.timeoutMs) ? Math.max(1, Math.min(Number(input.timeoutMs), 30 * 60_000)) : 120_000;
-        const waited = await waitForExit(exit, child, timeoutMs);
+        const waited = await boundedExit;
         timedOut = waited.timedOut;
-        const output = Buffer.concat(stdoutChunks);
-        const handshakeEnd = output.indexOf(10);
-        const stdout = output.subarray(handshakeEnd < 0 ? output.length : handshakeEnd + 1).toString("utf8");
-        const stderr = Buffer.concat(stderrChunks).toString("utf8");
+        if (transport) await transport.drain(input.timeoutMs - Math.ceil(performance.now() - admittedAt));
+        const rawStdout = commandOutput();
+        const rawStderr = Buffer.concat(stderrChunks);
+        const stdout = rawStdout.toString("utf8");
+        const stderr = rawStderr.toString("utf8");
         receipt = {
           kind: "receipt", status: !timedOut && waited.ended.code === 0 ? "completed" : "failed",
           exitCode: timedOut ? 124 : waited.ended.code ?? 1, stdout, stderr,
           termination: timedOut ? "timeout" : waited.ended.signal ? "signal" : "exit",
           outputTruncated: stdoutTruncated || stderrTruncated,
+          ...(this.nestedAdmission === undefined ? {} : {
+            outputIncomplete: !Buffer.from(stdout).equals(rawStdout) || !Buffer.from(stderr).equals(rawStderr),
+          }),
           paths: [],
           process: { descendantsQuiescent: true },
         };
       } else {
-        const receiptRow = await nextLine(iterator, 30 * 60_000);
+        const receiptRow = await nextLine(iterator, Math.max(1, input.timeoutMs - Math.ceil(performance.now() - admittedAt)));
         receipt = parseProtocol(receiptRow);
       }
-      const ended = await exit;
+      const ended = (await boundedExit).ended;
       const remaining = namespaceProcesses(namespace);
       if (remaining.length > 0) {
         if (!namespaceRootPid) throw new Error("contained process namespace has no registered ancestry root");
@@ -328,6 +458,7 @@ export class MissionEffects {
       }
       const stillAlive = namespaceProcesses(namespace);
       if (stillAlive.length > 0) throw new Error("contained process namespace could not be emptied");
+      const outerInitRetired = this.requireOuterInitRetirement(running.namespaceInit);
       const afterPaths: ManifestPath[] = [];
       try { captureWorkspacePaths(this.context.workspace.candidateRoot, true, afterPaths); }
       catch (error) {
@@ -355,8 +486,18 @@ export class MissionEffects {
         effectId, operation, status: receipt.status === "completed" ? "completed" : "failed",
         exitCode: Number(receipt.exitCode), termination: receipt.termination ?? (ended.signal ? "signal" : "exit"), stdout: String(receipt.stdout ?? ""),
         stderr: String(receipt.stderr ?? ""), paths: receipt.paths,
-        process: { ...identity, descendantsQuiescent: true, namespaceEmptyAfterExit: true },
+        process: { ...identity, descendantsQuiescent: true, namespaceEmptyAfterExit: true,
+          ...(outerInitRetired ? { outerInitRetired } : {}) },
       };
+      // Exit is not settlement: drain, retirement and candidate capture consume the same admitted deadline.
+      const enforceInvocationDeadline = () => {
+        if (performance.now() - admittedAt >= Number(input.timeoutMs)) {
+          completed.status = "failed";
+          completed.exitCode = 124;
+          completed.termination = "timeout";
+        }
+      };
+      enforceInvocationDeadline();
       let snapshot: { draft: MissionEventDraft; artifacts: Array<{ bytes: Uint8Array; mediaType: string }> };
       try { snapshot = this.effectSnapshot(effectId, observedPaths); }
       catch (snapshotError) {
@@ -379,44 +520,74 @@ export class MissionEffects {
         runningQuiescent(this.inFlight.get(effectId));
         return unknown;
       }
+      enforceInvocationDeadline();
       await this.appendEffectEvent("effect.receipt", effectId, {
         effectId, operation, status: completed.status, exitCode: completed.exitCode,
         stdoutHash: hashText(completed.stdout ?? ""), stderrHash: hashText(completed.stderr ?? ""),
         stdoutBytes: Buffer.byteLength(completed.stdout ?? ""), stderrBytes: Buffer.byteLength(completed.stderr ?? ""),
         outputTruncated: receipt.outputTruncated === true, paths: completed.paths, process: completed.process,
+        ...(this.nestedAdmission === undefined ? {} : { outputIncomplete: receipt.outputIncomplete === true, outputDrained: true }),
         requestHash, owner, termination: completed.termination,
       }, snapshot);
       runningQuiescent(this.inFlight.get(effectId));
       return completed;
     } catch (error) {
-      if (!closed) {
-        try { child.kill("SIGKILL"); } catch { /* process already ended */ }
-        if (!await settlesWithin(exit, 5_000)) {
-          this.fenced = true;
-          quarantineWorkspace(this.context.workspace, "effect process could not be reaped");
-          throw new Error("effect process could not be reaped; owner release is unsafe");
+      const reason = error instanceof Error ? error.message : String(error);
+      trace?.("observation.failure", { reason, endpoints: transport?.endpointState() });
+      let outerInitRetired: true | undefined;
+      try {
+        if (!closed) {
+          trace?.("signal.attempt", { signal: "SIGKILL", source: "observation.cleanup" });
+          try { child.kill("SIGKILL"); } catch { /* process already ended */ }
+          if (!await settlesWithin(exit, 5_000)) {
+            this.fenced = true;
+            quarantineWorkspace(this.context.workspace, "effect process could not be reaped");
+            throw new Error("effect process could not be reaped; owner release is unsafe");
+          }
         }
-      }
-      if (namespace && namespaceRootPid) await terminateNamespace(namespace, namespaceRootPid);
-      const remaining = namespace ? namespaceProcesses(namespace) : [];
-      if (remaining.length > 0) {
+        if (namespace && namespaceRootPid) await terminateNamespace(namespace, namespaceRootPid);
+        const remaining = namespace ? namespaceProcesses(namespace) : [];
+        if (remaining.length > 0) {
+          this.fenced = true;
+          quarantineWorkspace(this.context.workspace, "effect namespace could not be emptied");
+          throw new Error("effect namespace could not be emptied; owner release is unsafe");
+        }
+        outerInitRetired = this.requireOuterInitRetirement(running.namespaceInit);
+      } catch (cleanupError) {
+        if (this.nestedAdmission === undefined) throw cleanupError;
         this.fenced = true;
-        quarantineWorkspace(this.context.workspace, "effect namespace could not be emptied");
-        throw new Error("effect namespace could not be emptied; owner release is unsafe");
+        const cleanupFailure = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+        quarantineWorkspace(this.context.workspace, cleanupFailure);
+        const unknown = {
+          ...this.unknownReceipt(effectId, operation, reason, {
+            ...identity, closed, namespace: namespace ?? null, namespaceInit: running.namespaceInit ?? null,
+            childPid: child.pid ?? null, exitCode: child.exitCode, signal: child.signalCode, cleanupFailure,
+            ...(trace ? { trace: traceEvents, endpoints: transport?.endpointState() } : {}),
+          }, observedPaths),
+          stdout: commandOutput().toString("utf8"),
+          stderr: Buffer.concat(stderrChunks).toString("utf8"),
+        };
+        await this.appendEffectEvent("effect.unknown", effectId, unknown as unknown as Record<string, unknown>);
+        return unknown;
       }
       const ended = await exit;
+      if (transport) {
+        try { await transport.drain(5_000); }
+        catch { /* failed capture cannot produce an accepted checker observation */ }
+      }
       runningQuiescent(this.inFlight.get(effectId));
-      const reason = error instanceof Error ? error.message : String(error);
       const afterPaths: ManifestPath[] = [];
       try {
         captureWorkspacePaths(this.context.workspace.candidateRoot, true, afterPaths);
         const paths = diffPathRows(beforePaths, afterPaths);
         observedPaths = paths;
         const failed: MissionEffectReceipt = {
-          effectId, operation, status: "failed", exitCode: ended.code ?? 1,
-          termination: ended.signal ? "signal" : ended.code !== null ? "exit" : "unknown", stdout: "",
+          effectId, operation, status: "failed", exitCode: timedOut ? 124 : ended.code ?? 1,
+          termination: timedOut ? "timeout" : ended.signal ? "signal" : ended.code !== null ? "exit" : "unknown",
+          stdout: transport ? commandOutput().toString("utf8") : "", reason,
           stderr: Buffer.concat(stderrChunks).toString("utf8") || reason, paths,
-          process: identity && namespace ? { ...identity, descendantsQuiescent: true, namespaceEmptyAfterExit: true } : undefined,
+          process: identity && namespace ? { ...identity, descendantsQuiescent: true, namespaceEmptyAfterExit: true,
+            ...(outerInitRetired ? { outerInitRetired } : {}) } : undefined,
         };
         let snapshot: { draft: MissionEventDraft; artifacts: Array<{ bytes: Uint8Array; mediaType: string }> };
         try { snapshot = this.effectSnapshot(effectId, paths); }
@@ -440,6 +611,7 @@ export class MissionEffects {
         await this.appendEffectEvent("effect.receipt", effectId, {
           effectId, operation, status: failed.status, exitCode: failed.exitCode, paths,
           stderrHash: hashText(failed.stderr ?? ""), requestHash, owner,
+          ...(transport ? { outputIncomplete: true, captureFailure: reason } : {}),
           process: failed.process, outputTruncated: stdoutTruncated || stderrTruncated, termination: failed.termination,
         }, snapshot);
         return failed;
@@ -701,7 +873,7 @@ function hashBytes(bytes: Uint8Array): string {
 }
 
 export function createMissionToolAdapters(effects: MissionEffects): ToolDefinition[] {
-  const bash = Type.Object({ command: Type.String({ minLength: 1 }), timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 30 * 60_000 })) }, { additionalProperties: false });
+  const bash = Type.Object({ command: Type.String({ minLength: 1 }), timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_COMMAND_TIME_MS })) }, { additionalProperties: false });
   const edit = Type.Object({ path: Type.String({ minLength: 1 }), oldText: Type.String({ minLength: 1 }), newText: Type.String() }, { additionalProperties: false });
   const write = Type.Object({ path: Type.String({ minLength: 1 }), content: Type.String() }, { additionalProperties: false });
   const patch = Type.Object({ patch: Type.String({ minLength: 1 }) }, { additionalProperties: false });
@@ -728,10 +900,15 @@ export function createMissionToolAdapters(effects: MissionEffects): ToolDefiniti
   } as ToolDefinition));
 }
 
-async function nextLine(iterator: AsyncIterator<string>, timeoutMs: number): Promise<string> {
+async function nextLine(iterator: AsyncIterator<string>, timeoutMs: number,
+  trace?: (event: string, facts?: Record<string, unknown>) => void): Promise<string> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error("contained process handshake or receipt timed out")), timeoutMs);
+    trace?.("protocol.timerArmed", { timeoutMs, deadline: performance.now() + timeoutMs });
+    timer = setTimeout(() => {
+      trace?.("protocol.timerFired");
+      reject(new Error("contained process handshake or receipt timed out"));
+    }, timeoutMs);
   });
   const next = iterator.next().then((row) => {
     if (row.done) throw new Error("contained process exited before protocol receipt");
@@ -808,14 +985,22 @@ async function waitForExit(
   exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>,
   child: ChildProcess,
   timeoutMs: number,
+  admittedAt: number,
+  trace?: (event: string, facts?: Record<string, unknown>) => void,
 ): Promise<{ ended: { code: number | null; signal: NodeJS.Signals | null }; timedOut: boolean }> {
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<"timeout">((resolve) => { timer = setTimeout(() => resolve("timeout"), timeoutMs); });
+  const timeout = new Promise<"timeout">((resolve) => {
+    const delay = Math.max(0, timeoutMs - Math.ceil(performance.now() - admittedAt));
+    trace?.("exit.timerArmed", { delay, deadline: performance.now() + delay, invocationDeadline: admittedAt + timeoutMs });
+    timer = setTimeout(() => { trace?.("exit.timerFired"); resolve("timeout"); }, delay);
+  });
   try {
     const first = await Promise.race([exit.then((ended) => ({ ended, timedOut: false as const })), timeout]);
     if (first !== "timeout") return first;
+    trace?.("signal.attempt", { signal: "SIGTERM", source: "exit.timeout" });
     try { child.kill("SIGTERM"); } catch { /* already exited */ }
     if (await settlesWithin(exit, 250)) return { ended: await exit, timedOut: true };
+    trace?.("signal.attempt", { signal: "SIGKILL", source: "exit.timeout" });
     try { child.kill("SIGKILL"); } catch { /* already exited */ }
     return { ended: await exit, timedOut: true };
   } finally { if (timer) clearTimeout(timer); }
