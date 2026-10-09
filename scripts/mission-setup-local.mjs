@@ -136,7 +136,7 @@ Expected evidence: contained command reads actual installed bytes.
   }
   assert.equal((await setupJob).state, "ready");
   assert.equal((await producer.ensure(admission, () => true)).reused, true);
-  const workspace = createMissionWorkspace({ missionId: mission.id, attemptId: approval.id,
+  const workspace = await createMissionWorkspace({ missionId: mission.id, attemptId: approval.id,
     sourceRoot: root, storeRoot: store.storageRoot, candidateParent: path.join(fixture.base, "candidates") });
   await preflightContainment(workspace);
   const child = spawnContained(workspace, "bash", ["-c",

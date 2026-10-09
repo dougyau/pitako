@@ -6,8 +6,9 @@ execution ledger, evidence, or the source repository. Legacy `agent_run`,
 
 Ordinary coordinator execution uses the frozen plan and scoped WorkBrief
 handoffs. It does not require a managed mission or compile a plan into one.
-Managed missions use the explicit prepared definition authored and validated
-through the native flow below. User-authored `.mission.json` is only a legacy
+For managed execution, freeze the Markdown plan, then run `/mission start <plan-id>`.
+The native flow authors and validates the prepared definition before asking for
+start consent. User-authored `.mission.json` is only a legacy
 compatibility path, not a prerequisite for ordinary preparation.
 
 ## Worker brief context
@@ -58,8 +59,8 @@ SQLite journaling, content-addressed artifacts, sealed output manifests and
 managed candidate workspaces are different authorities, not substitutes.
 
 ```text
-/mission prepare <plan-id>
 /mission start <plan-id>
+/mission prepare <plan-id>  # advanced preparation-only
 /mission status
 /mission inspect
 /mission pause <plan-id>
@@ -81,17 +82,21 @@ Native mutations require confirmation of the exact action, physical root,
 source, admitted revision/definition, ownership and typed payload in the
 principal TUI session. Revise presents exact before/after values; omitting its
 payload opens an input prompt for a typed choice rather than requiring engine
-edits JSON. Prepare queues a single non-authoritative request to the current
+edits JSON. For a newly frozen Markdown plan, `/mission start <plan-id>` queues a
+single non-authoritative authoring request to the current
 coordinator through Pi foreground `followUp` messaging. Busy work is not cancelled
 and the command does not wait for it or launch another coordinator. The host reads
 the source pin, execution root, configuration and root GATES independently.
 The coordinator uses `mission_prepare` with that request ID to author a mapped
-schema-2 proposal and supported technical choices, not an admission receipt.
+schema-3 proposal and supported technical choices, not an admission receipt.
+The author retrieves the host context through native codemode before submitting.
 
-The native questions view groups missing permissions, **all five engine budgets**,
-resume policy, any separate setup-effect allocation and genuine source ambiguities
+One readable start consent groups effect authority, explicit resource limits,
+resume policy, finite setup allocation and genuine source ambiguities
 with the original excerpts. Proposed estimates and configured role policies do not
-approve any effects or budgets. Unsupported evidence/prerequisites and ambiguous
+approve effects or limits. Omitted time/token limits are genuinely metered, not
+derived from estimates; unsupported requested hard token caps require author
+correction and are never silently removed. Unsupported evidence/prerequisites and ambiguous
 mappings remain specific unresolved issues, never manual passes or omitted gates.
 The subsequent exact preview includes roots, physical source revision/pin, admitted
 and prepared hashes, complete primary/fallback/reasoning/fast role policies,
@@ -99,10 +104,13 @@ original objective/WorkBrief/criteria, mappings, scope and verification obligati
 Only native confirmation admits that exact validated object. Tool results remain
 proposal diagnostics, not transferable confirmation receipts.
 
-Preparation persists only after confirmation and starts no worker.
-Explicit `/mission start` separately confirms worker activation. Copied setup
-can run during preparation under its own exact native consent, as described below.
-Legacy setup runs only after separate start consent. Unadmitted drafts
+After this single consent the host rechecks the bindings, persists prepared
+authority, runs admitted setup and activates the existing engine. Refusal starts
+neither setup nor workers. There is no second prompt for this unchanged proposal.
+`/mission prepare` remains advanced preparation-only: it persists after
+confirmation and starts no worker; its later `/mission start` separately confirms
+execution. Already admitted legacy contracts retain their original setup and
+execution consent. Unadmitted drafts
 are request data: wrong request/session/root, source/configuration drift, replacement,
 dismissal, shutdown, reload or session switching require reauthoring. Admitted
 preparation survives reload through immutable mission storage. For deliberate
@@ -118,8 +126,25 @@ notification delivery.
 when the current preparation is usable. Each result includes a next action.
 Malformed mappings, unsupported evidence, and insufficient current command capacity
 are technical problems. They do not become permission questions or manual passes.
-`/mission status` reports unresolved setup separately from a ready prepared mission.
-A prepared mission still needs explicit `/mission start`.
+`/mission status` and the namespaced `pitako.mission` UI status use cached
+preparation observations and bounded event tails, without setup validation,
+filesystem scans or full-ledger reduction during repaint. They show phase/current
+unit, accepted outcomes for the current revision, elapsed and observed active time,
+actual/unknown tokens, labelled estimates, explicit caps and actionable stop reasons.
+Neither elapsed time nor tokens are a completion percentage. Pending-request
+provider usage is unknown when the public adapter cannot attribute it; session
+totals are not subtracted. Read-only reattachment seeds its cache once and then reads bounded journal tails;
+`/mission inspect` remains the retained-history query. A prepared advanced/legacy
+mission still needs explicit `/mission start`.
+
+Schema 3 separates labelled estimates, observed usage, and explicit limits.
+An estimate does not cap a setup hook, worker request, checker, or finalization
+phase. Omitting a mission-wide time limit does not permit an unbounded command.
+Each command still has a finite timeout; the execution clock starts at launch
+release, after separately bounded preparation and bootstrap. Explicit time limits
+also constrain remaining command capacity. Schema 1 and 2 retain their original
+budgets and hashes. A new schema-3 admission does not refill or convert an
+existing legacy grant.
 
 The optional `execution-root-local-copy-v1` contract copies bounded local inputs
 to an exclusive temporary destination before running the admitted setup hook.
@@ -137,7 +162,7 @@ A changed destination or source needs fresh consent. The older
 
 ### Optional offline verification profile
 
-`sealed-nested-verification-v1` is an explicit schema-2 verification profile,
+`sealed-nested-verification-v1` is an explicit schema-2 or schema-3 verification profile,
 not a shell flag or an ordinary worker capability. Native confirmation binds the
 profile and copied runtime inputs. The host issues the checker capability for each
 current predicate, subject, input binding, owner, and finite allocation.
@@ -190,6 +215,18 @@ filesystem/effect evidence before dispatch: uncertain effects are quarantined or
 blocked, not retried as if nothing happened. Explicit pause drains admitted work;
 quit/navigation retire the owner. Unproven shutdowns can require reconciliation,
 not automatic successful continuation.
+
+`/mission resume <plan-id>` asks for fresh confirmation of the paused mission.
+That permission is distinct from the original start consent. When the admitted
+`resumeAfterClose` policy permits recovery, a new Pi process rediscovers the
+immutable mission and reconciles its retained work. Settled setup and product
+effects are not repeated. Unknown effects remain unresolved rather than replayed.
+
+An accepted unit is not a completed mission. The host still integrates the
+result, runs the declared checks and cleanup phases, and obtains an independent
+whole-result review. The production completion certificate binds the current
+revision, original source, result manifest, and review. Worker prose and an
+effect's successful exit cannot replace those obligations.
 
 Results stay in managed product/candidate roots and content-addressed artifacts.
 Inspect the integrated report and completion manifest before deliberately

@@ -15,17 +15,19 @@ import { parsePlanDocument } from "../workflow.ts";
 import { packageRoot } from "../stack.ts";
 import { metricCommand } from "./metrics.ts";
 import { getPitakoDataDir } from "../board/paths.ts";
-import { admitSetupStart, assertSetupInputs, MissionSetup, setupStartText, type SetupStartAdmission } from "./setup.ts";
+import { admitFrozenSetupStart, admitSetupStart, MissionSetup, setupStartText, type SetupStartAdmission } from "./setup.ts";
+import { PhysicalObservation } from "./physical-observation.ts";
 import { missionInputIdentity } from "./inputs.ts";
 import { loadPitakoConfig } from "../roles/load.ts";
 import { bindPreparationAnswer, bindPreparationAuthority, bindPreparationSetup, invalidatePreparationRequest,
-  openPreparationRequest, preparationAnswerText, preparationAuthorityText, preparationContext, preparationSetupText,
-  preparedAdmissionText, validatePreparation, preparationIssue, PreparationBindingError, type PreparationRequest } from "./preparation.ts";
+  openPreparationRequest, observePreparationSetup, preparationAnswerText, preparationAuthorityText, preparationContext, preparationSetupText,
+  preparedAdmissionText, previewFrozenStart, validatePreparation, preparationIssue, PreparationBindingError, type PreparationRequest } from "./preparation.ts";
 import { confirmMissionAction, missionActionView, preparationView } from "./preparation-view.ts";
 import type { MissionDefinition } from "./model.ts";
 import type { SetupAllocation } from "./setup.ts";
 import { inspectManagedMission } from "../agent/managed-mission.ts";
 import { parseMissionInspect, readMissionObservation } from "./observation.ts";
+import { MissionProgress } from "./progress.ts";
 
 const usage = `Use /mission prepare|start|pause|resume|cancel <plan-id>
 /mission revise <plan-id> Change predicate|unit <id> <field> to <JSON value>
@@ -37,7 +39,7 @@ const usage = `Use /mission prepare|start|pause|resume|cancel <plan-id>
 /mission prepare-details (show exact JSON alongside the next preparation confirmation)
 /mission metrics; /mission export [directory]
 /mission console (explicit optional compatibility socket)
-Prepare queues assisted Markdown authoring to this coordinator. The mission_prepare tool submits an untrusted mapped proposal; grouped authority/semantic questions precede an exact preview and confirmation. No mission JSON is required. Confirmation leaves it prepared and runs admitted copied setup, if required; start is separate and confirms worker execution. Legacy v1 setup remains start-scoped. Dismissed or stale drafts require prepare again.
+Normal flow: freeze the Markdown plan, then /mission start <plan-id>. For a new mission this queues foreground schema3 authoring and one readable combined native consent for exact source/effects/setup/limits/resume decisions; refusal starts neither setup nor workers. Omitted time/token limits are metered; estimates are not ceilings. No mission JSON or manual bootstrap is required. /mission prepare remains advanced preparation-only; legacy admitted contracts keep separate execution consent. Dismissed or stale drafts require a fresh request.
 /mission prepare-file <plan-id> (explicit legacy Markdown/JSON compatibility)
 Changes require native confirmation in this principal TUI session. A copied local setup contract runs its hook during prepare after exact native consent; prepare starts no worker. Legacy v1 setup remains start-scoped. Pi and installed extensions are trusted to receive confirmation, not to attest human origin.
 Preparation reports a status and next action. Technical errors need author correction, not user permission; unavailable setup or verification inputs remain unresolved.
@@ -66,15 +68,44 @@ export function registerMissionExtension(pi: ExtensionAPI) {
   let attachedMission: { id: string; planId: string } | undefined;
   let session: string | undefined;
   let ticker: ReturnType<typeof setInterval> | undefined;
+  let progress: MissionProgress | undefined;
+  let progressReader: MissionStore | undefined;
+  let progressUI: { setStatus(key: string, text: string | undefined): void } | undefined;
+  let preparationProgress: string | undefined;
+  let preparationStartedAt = 0;
+  const progressText = () => preparationProgress
+    ? `${preparationProgress} · elapsed ${Date.now() - preparationStartedAt}ms · active unknown · tokens unknown (pending request attribution unavailable)`
+    : progress?.text();
+  const repaint = () => {
+    if (preparationProgress) {
+      progressUI?.setStatus("pitako.mission", progressText());
+      return;
+    }
+    if (attachedMission && progress) {
+      const db = store ?? progressReader;
+      if (db) progress.accept(db.readProgressEvents(attachedMission.id, progress.cursor));
+    }
+    progressUI?.setStatus("pitako.mission", progressText());
+  };
   const pendingDisplay = new Map<string, { missionId: string; throughSeq: number; eventIds: string[] }>();
   let uiCursor = 0;
   let uiMissionId: string | undefined;
   let lifecycle = 0;
   let pending: string | undefined;
   let executionAction: string | undefined;
-  let draft: { request: PreparationRequest; ctx: ExtensionCommandContext; sessionId: string; root: string; epoch: number; proposal?: object; exactDetails?: boolean } | undefined;
-  const discardDraft = () => { if (draft) invalidatePreparationRequest(draft.request); draft = undefined; };
-  const invalidate = () => { discardDraft(); lifecycle++; pending = undefined; executionAction = undefined; engine?.invalidateSetupAdmission(); };
+  let draft: { request: PreparationRequest; ctx: ExtensionCommandContext; sessionId: string; root: string; epoch: number; start?: boolean; proposal?: object; exactDetails?: boolean } | undefined;
+  const discardDraft = () => { if (draft) invalidatePreparationRequest(draft.request); draft = undefined; preparationProgress = undefined; };
+  const invalidate = () => {
+    discardDraft(); lifecycle++; pending = undefined; executionAction = undefined; engine?.invalidateSetupAdmission();
+    if (ticker) clearInterval(ticker);
+    ticker = undefined;
+    progressUI?.setStatus("pitako.mission", undefined);
+    progressUI = undefined;
+    progressReader?.close();
+    progressReader = undefined;
+    progress = undefined;
+    attachedMission = undefined;
+  };
   const read = async <T>(operation: (db: MissionStore) => T | Promise<T>): Promise<T> => {
     const db = await openMissionStore({ readOnly: true });
     try { return await operation(db); } finally { db.close(); }
@@ -101,6 +132,8 @@ export function registerMissionExtension(pi: ExtensionAPI) {
       // No injectable assessor: MissionEngine uses the bound production checker.
       managedWorkspace: { sourceRoot: ctx.cwd } });
     attachedMission = { id: mission.id, planId: mission.planId };
+    progress = new MissionProgress(mission.planId, mission.definition);
+    progress.accept(mission.events);
     return { mission, engine };
   };
   const status = (ctx: { cwd: string }, db: MissionStore) => {
@@ -182,9 +215,15 @@ export function registerMissionExtension(pi: ExtensionAPI) {
     try {
       if (!existsSync(path.join(ctx.cwd, ".git"))) return;
       // Read first. Only previously admitted lifecycle authority may acquire a writer here.
-      const mission = existsSync(path.join(getPitakoDataDir(), "missions.db"))
-        ? await read((db) => db.findManagedMission(ctx.cwd)) : undefined;
+      if (existsSync(path.join(getPitakoDataDir(), "missions.db")))
+        progressReader = await openMissionStore({ readOnly: true });
+      const mission = progressReader?.findManagedMission(ctx.cwd);
       const state = mission && reduceMissionEvents(mission).state;
+      if (mission) {
+        attachedMission = { id: mission.id, planId: mission.planId };
+        progress = new MissionProgress(mission.planId, mission.definition);
+        progress.accept(mission.events);
+      }
       const release = mission && [...mission.events].reverse().find(({ kind }) => kind === "mission.owner.released");
       const lastBlock = mission && [...mission.events].reverse().find(({ kind }) => kind === "mission.blocked");
       const shutdownBlocked = state === "blocked" && ["quit", "reload"].includes(String(release?.payload.reason)) &&
@@ -198,12 +237,13 @@ export function registerMissionExtension(pi: ExtensionAPI) {
         if (store!.ownerEpoch === null) return;
         const attached = attach(ctx, mission.id);
         if (orderlyClose) await attached.engine.resumeAfterClose();
-        else attached.engine.start();
+        else await attached.engine.start();
       }
       uiCursor = 0;
       uiMissionId = undefined;
       if (ctx.hasUI) {
-        ticker = setInterval(() => { try { notifications(ctx); } catch { /* display cannot stop execution */ } }, 250);
+        progressUI = ctx.ui;
+        ticker = setInterval(() => { try { notifications(ctx); repaint(); } catch { /* display cannot stop execution */ } }, 250);
         ticker.unref?.();
       }
     } catch (error) { if (ctx.hasUI) ctx.ui.notify(String(error), "error"); }
@@ -218,6 +258,7 @@ export function registerMissionExtension(pi: ExtensionAPI) {
     else store?.close();
     engine = undefined;
     attachedMission = undefined;
+    progress = undefined;
     session = undefined;
     store = undefined;
   });
@@ -302,7 +343,8 @@ export function registerMissionExtension(pi: ExtensionAPI) {
         store!.appendTransition(mission.id, mission.version, { events: [{ revision: mission.revision,
           kind: "mission.input.recorded", causalId, payload: { operatorText: text, operatorInputId: causalId, intervention: "operational_rescue" } }] });
       }
-      active.engine.start(verb === "start" ? operator : undefined, setupAdmission);
+      await active.engine.start(verb === "start" ? operator : undefined, setupAdmission,
+        admitWriter ? () => admitWriter(store!) : undefined);
       return `${verb}: ${active.mission.id}; resumeAfterClose: ${active.mission.definition.authority.resumeAfterClose}`;
     }
     if (verb === "attach") return `Attached ${active.mission.id}; ${JSON.stringify(status(ctx, store!))}`;
@@ -389,7 +431,6 @@ export function registerMissionExtension(pi: ExtensionAPI) {
       const choiceValidation = choice && validateOperatorChoice(db!, mission, choice);
       const names = files(root, mission.planId);
       const pin = mission.prepared ? missionInputIdentity(mission, root) : undefined;
-      if (verb === "start" && mission.prepared?.setup) assertSetupInputs(mission.prepared.setup);
       return { ownership, physical, root, text, planId: mission.planId, missionId: mission.id, revision: mission.revision,
         currentConfigHash: sha256(Buffer.from(JSON.stringify(loadPitakoConfig({ cwd: root })))),
         planHash: mission.snapshot.planHash, definitionHash: mission.snapshot.definitionHash, state,
@@ -404,7 +445,23 @@ export function registerMissionExtension(pi: ExtensionAPI) {
           kind === "mission.finalization.generation" || kind === "mission.result.integrated")?.eventId : undefined,
         definition: mission.definition, choice };
     };
-    const observe = async () => existsSync(path.join(getPitakoDataDir(), "missions.db")) ? read(capture) : capture();
+    const observe = async () => {
+      const value = existsSync(path.join(getPitakoDataDir(), "missions.db")) ? await read(capture) : capture();
+      live();
+      if (verb === "start") {
+        await read(async db => {
+          const mission = db.findManagedMission(root);
+          if (!mission?.prepared?.setup) return;
+          const observer = new PhysicalObservation();
+          try { await observer.request("setupInputs", mission.prepared.setup); }
+          finally { await observer.dispose(); }
+          live();
+          if (JSON.stringify(value) !== JSON.stringify(capture(db)))
+            throw new Error("mission changed during physical observation");
+        });
+      }
+      return value;
+    };
     try {
       const before = await observe();
       live();
@@ -475,20 +532,24 @@ export function registerMissionExtension(pi: ExtensionAPI) {
     } finally { if (pending === nonce) pending = undefined; }
   };
 
-  const queuePreparation = (ctx: ExtensionCommandContext, id: string) => {
+  const queuePreparation = (ctx: ExtensionCommandContext, id: string, start = false) => {
     if (!eligible(ctx) || ctx.mode !== "tui" || !ctx.hasUI || typeof ctx.ui.confirm !== "function")
       throw new Error("native preparation needs the principal TUI session and usable UI; use /mission help");
     discardDraft();
     pending = undefined;
     const root = realpathSync(ctx.cwd), sessionId = idOf(ctx)!;
-    const request = openPreparationRequest(id, root, sessionId);
-    draft = { request, ctx, sessionId, root, epoch: lifecycle };
+    const request = openPreparationRequest(id, root, sessionId, {}, true);
+    draft = { request, ctx, sessionId, root, epoch: lifecycle, start };
     const context = preparationContext(request);
+    preparationStartedAt = Date.now();
+    preparationProgress = `Mission ${id} · preparation / authoring · observed ${context.inventory.units.length} units, ${context.inventory.criteria.length} criteria, ${context.inventory.unresolved.length} source choices · no admission`;
+    progressUI = ctx.ui;
+    repaint();
     // Supported foreground delivery queues behind busy work; never wait for idle or create another coordinator.
     pi.sendUserMessage(`Mission preparation request (non-authoritative):\n${JSON.stringify(context)}
-Author a schemaVersion 2 {definition,mappings} proposal using mission_prepare with id ${JSON.stringify(id)} and requestId ${JSON.stringify(request.id)}.
+Author a schemaVersion 3 {definition,mappings} proposal using native codemode tools.mission_prepare with id ${JSON.stringify(id)} and requestId ${JSON.stringify(request.id)}. Retrieve the current preparation context through that tool before submitting.
 Read repository context and extensions/mission/model.ts for the executable contract. Preserve every host source ID, full original objective/WorkBrief/criterion bytes, required dependencies and complete role targets (reasoning/fast/fallbacks). Select supported discriminating command/hash proofs and ordinary/integrated/affected/final obligations; unsupported proofs/prerequisites remain specific issues, never manual or false-PASS. GATES is source context, not a compiler.
-Make supported technical choices autonomously. Propose explicit permissions and all five engine budgets, resume policy and (if needed) setup allocation; these are estimates, NOT approval. Group genuine source ambiguities with exact excerpts and proposed interpretations. The host will ask for exact native decisions and preview/admission; no implementation, setup, start, credentials, configuration edit or worker launch is authorized by this request.`, { deliverAs: "followUp" });
+Make supported technical choices autonomously. Use resourcePolicy {limits:{},estimates:{}}; time/token limits are omitted unless explicitly requested by the principal, genuinely metered and never inferred from estimates. Estimates are labelled information, not ceilings. Propose concrete write/operation/external-effect authority, resume policy and (if needed) finite setup allocation. Preserve any principal-requested explicit cap; unsupported hard caps require a concrete author correction, never silent removal. Group genuine source ambiguities with exact excerpts and proposed interpretations. ${start ? "The host will offer one combined native start consent for these exact source/effect/setup/limit/execution decisions." : "The host will offer native preparation consent; execution remains separate."} This authoring request authorizes no implementation, setup, credentials, configuration edit or worker launch.`, { deliverAs: "followUp" });
     return `Preparation ${request.id} queued to this coordinator; no mission admitted, setup or worker started.`;
   };
 
@@ -499,9 +560,14 @@ Make supported technical choices autonomously. Propose explicit permissions and 
     const live = () => {
       if (draft !== current || current.epoch !== lifecycle || idOf(ctx) !== current.sessionId ||
         idOf(current.ctx) !== current.sessionId || !eligible(ctx) || ctx.mode !== "tui" || !ctx.hasUI ||
-        realpathSync(ctx.cwd) !== current.root || realpathSync(current.ctx.cwd) !== current.root ||
-        preparationContext(current.request).binding.planId !== params.id)
+        realpathSync(ctx.cwd) !== current.root || realpathSync(current.ctx.cwd) !== current.root) {
+        if (draft === current) discardDraft();
         throw new PreparationBindingError("preparation expired; reauthor with /mission prepare <plan-id>");
+      }
+      let context: ReturnType<typeof preparationContext>;
+      try { context = preparationContext(current.request); }
+      catch (error) { discardDraft(); throw error; }
+      if (context.binding.planId !== params.id) throw new PreparationBindingError("proposal needs the current plan ID");
     };
     live();
     if (params.proposal === undefined) return { authority: "proposal-only", context: preparationContext(current.request) };
@@ -518,13 +584,112 @@ Make supported technical choices autonomously. Propose explicit permissions and 
     const observeOwnership = () => existsSync(path.join(getPitakoDataDir(), "missions.db"))
       ? read(captureOwnership) : Promise.resolve(captureOwnership());
     let approvedObservation: ReturnType<typeof captureOwnership> | undefined;
+    const physical = params.setup ? new PhysicalObservation() : undefined;
+    const observeSetup = async () => {
+      if (params.setup) await observePreparationSetup(current.request, params.setup, physical);
+      check();
+    };
+    try {
+    try { await observeSetup(); }
+    catch (error) {
+      check(); // A stale request is rejection, not an author correction.
+      const diagnosis = validatePreparation({ request: current.request, proposal, setup: params.setup });
+      if (diagnosis.state === "needs-input") {
+        if (!diagnosis.issues.some(({ code }) => code === "invalid-proposal")) {
+          const issue = preparationIssue("missing-local-input", "prerequisite", String(error));
+          diagnosis.issues = [issue, ...diagnosis.issues.filter(({ code }) => code !== "missing-local-input")];
+          diagnosis.status = "technical-unresolved";
+          diagnosis.nextAction = issue.nextAction;
+        }
+        preparationProgress = `Mission ${params.id} · preparation / correction · ${diagnosis.nextAction}`;
+        repaint();
+        return { ...diagnosis, authority: "proposal-only" };
+      }
+      const issue = preparationIssue("missing-local-input", "prerequisite", String(error));
+      return { state: "needs-input", status: "technical-unresolved", issues: [issue],
+        nextAction: issue.nextAction, authority: "proposal-only" };
+    }
+    if (current.start) {
+      const receiptId = randomUUID();
+      const preview = () => previewFrozenStart({ request: current.request, proposal, setup: params.setup,
+        interpretations: params.interpretations, receiptId });
+      const result = preview();
+      if (result.state !== "ready") {
+        preparationProgress = `Mission ${params.id} · preparation / author correction · ${result.status}: ${result.nextAction}`;
+        repaint();
+        return { ...result, authority: "proposal-only" };
+      }
+      preparationProgress = `Mission ${params.id} · preparation / native consent · observed ${result.prepared.definition.units.length} units · no admission`;
+      repaint();
+      const prepared = result.prepared, text = preparedAdmissionText(prepared);
+      const before = await observeOwnership();
+      const accepted = await confirmMissionAction(current.ctx.ui, {
+        title: "Start frozen mission", acceptLabel: "Start mission",
+        summary: preparationView({ action: "admit-and-start-frozen-mission-v1",
+          context: preparationContext(current.request), definition: prepared.definition,
+          setup: params.setup, interpretations: params.interpretations }),
+        details: () => JSON.stringify({ action: JSON.parse(text), prepared, observed: before }, null, 2),
+        check,
+      });
+      check();
+      if (!accepted) { discardDraft(); return { state: "dismissed", authority: "proposal-only", message: "No setup or worker started." }; }
+      await observeSetup();
+      const refreshed = preview();
+      if (refreshed.state !== "ready" || preparedAdmissionText(refreshed.prepared) !== text)
+        throw new PreparationBindingError("start proposal or physical inputs changed; reauthor");
+      let claimValidated = false;
+      const recheck = (db?: MissionStore) => {
+        const now = captureOwnership(db);
+        if (claimValidated && db === store && db?.ownerEpoch === before.ownership.epoch + 1 &&
+          now.ownership.claimId === db.ownerAcquisitionProof?.claimId) now.ownership = before.ownership;
+        if (JSON.stringify(now) !== JSON.stringify(before))
+          throw new PreparationBindingError("start ownership or existing mission changed; reauthor");
+        if (db && db !== store) claimValidated = true;
+      };
+      if (store) recheck(store);
+      const db = await open(recheck);
+      await observeSetup();
+      recheck(db);
+      const receipt = recordOperatorInput("native-confirmation", current.sessionId, text, receiptId)!;
+      const mission = db.createMission({ repositoryRoot: current.root, planId: params.id, prepared,
+        commandId: receipt.id, admissionReceiptId: receipt.id, operatorText: text, operatorReceipt: receipt });
+      const active = attach(current.ctx, mission.id);
+      preparationProgress = undefined;
+      repaint();
+      const writer = db.ownershipIdentity;
+      const executionCheck = () => {
+        check();
+        if (JSON.stringify(db.ownershipIdentity) !== JSON.stringify(writer) || preparedAdmissionText(prepared) !== text)
+          throw new PreparationBindingError("frozen start requester or owner changed");
+      };
+      if (prepared.setup?.identity.copy) {
+        const outcome = await active.engine.prepareSetup(executionCheck);
+        executionCheck();
+        if (outcome.state !== "ready") {
+          discardDraft();
+          if (progress) {
+            progress.phase = "prepared";
+            progress.reason = `Setup unresolved: ${outcome.reason}; uncertain effects are not replayed`;
+          }
+          return { state: "prepared", status: "technical-unresolved", authority: "proposal-only",
+            missionId: mission.id, nextAction: `Setup unresolved: ${outcome.reason}; uncertain effects are not replayed.` };
+        }
+      }
+      executionCheck();
+      const setupAdmission = prepared.setup && !prepared.setup.identity.copy
+        ? admitFrozenSetupStart(db, mission.id, receipt.id, executionCheck) : undefined;
+      await active.engine.start({ id: receipt.id, text, source: receipt.source }, setupAdmission, executionCheck);
+      discardDraft();
+      return { state: "started", authority: "proposal-only", missionId: mission.id, preparedHash: result.digest,
+        message: "Native combined admission recorded; existing engine activated. This result is not a transferable receipt." };
+    }
     let result = validatePreparation({ request: current.request, proposal, setup: params.setup });
     if (result.state === "needs-input") {
       const definition = (proposal as { definition?: MissionDefinition })?.definition;
       // Only decisions with independently bound texts can be asked; structural/proof errors stay author corrections.
       if (result.status === "technical-unresolved") return { ...result, authority: "proposal-only" };
       const authority = definition && result.issues.some(({ code }) => code === "authority-choice")
-        ? { authority: definition.authority, budget: definition.budget } : undefined;
+        ? resourceAuthority(definition) : undefined;
       const inventory = preparationContext(current.request).inventory;
       const invalidInterpretation = (params.interpretations ?? []).find(({ sourceId, disposition }) =>
         !inventory.unresolved.some(({ id }) => id === sourceId) || !["context", "criterion"].includes(disposition));
@@ -565,6 +730,7 @@ Make supported technical choices autonomously. Propose explicit permissions and 
       });
       check();
       if (accepted !== true) { discardDraft(); return { state: "dismissed", authority: "proposal-only", message: "Nothing admitted; repeat /mission prepare to reauthor." }; }
+      await observeSetup();
       if (JSON.stringify(decisions) !== JSON.stringify(decisionTexts()))
         throw new PreparationBindingError("preparation decision inputs changed; repeat /mission prepare");
       approvedObservation = before;
@@ -601,6 +767,7 @@ Make supported technical choices autonomously. Propose explicit permissions and 
     });
     check();
     if (accepted !== true) { discardDraft(); return { state: "dismissed", authority: "proposal-only", message: "Nothing admitted; repeat /mission prepare." }; }
+    await observeSetup();
     let claimValidated = false;
     const recheck = (db?: MissionStore) => {
       const now = capture(db);
@@ -611,6 +778,7 @@ Make supported technical choices autonomously. Propose explicit permissions and 
     };
     if (store) recheck(store);
     const db = await open(recheck);
+    await observeSetup();
     recheck(db);
     const receipt = recordOperatorInput("native-confirmation", current.sessionId, text)!;
     const mission = db.createMission({ repositoryRoot: current.root, planId: params.id, prepared,
@@ -629,11 +797,13 @@ Make supported technical choices autonomously. Propose explicit permissions and 
     const status = setupOutcome ? setupOutcome.state === "ready" ? "ready" : "technical-unresolved" : result.status;
     const nextAction = setupOutcome ? setupOutcome.state === "ready" ? `Use /mission start ${params.id}; setup will be rechecked and reused.`
       : `Setup unresolved: ${setupOutcome.reason}; no worker started, no automatic replay.` : result.nextAction;
+    if (progress && status !== "ready") progress.reason = nextAction;
     display(current.ctx, `Prepared ${mission.id} @${mission.revision}; status: ${status}. ${nextAction} No worker started.`);
     // Tool output is diagnostic, never a transferable operator receipt.
     return { state: "prepared", status, nextAction, issues: setupOutcome?.state === "ready" ? result.issues.filter(({ code }) => code !== "unresolved-setup") : result.issues,
       authority: "proposal-only", missionId: mission.id, preparedHash: result.digest,
       message: "Host native admission recorded; this tool result is not a confirmation receipt. Start requires /mission start." };
+    } finally { await physical?.dispose(); }
   };
 
   pi.registerCommand("mission", {
@@ -651,7 +821,7 @@ Make supported technical choices autonomously. Propose explicit permissions and 
             throw new Error("mission inspect requires a principal session");
           display(ctx, await observe(args, ctx.cwd));
         }
-        else if (verb === "status") { display(ctx, await read((db) => JSON.stringify(status(ctx, db)))); }
+        else if (verb === "status") { repaint(); display(ctx, progressText() ?? "No cached mission observation; /mission inspect for retained history."); }
         else if (verb === "export") {
           display(ctx, await read(async (db) => {
             const mission = db.findManagedMission(ctx.cwd);
@@ -664,6 +834,13 @@ Make supported technical choices autonomously. Propose explicit permissions and 
           preparationContext(draft.request);
           draft.exactDetails = true;
           display(ctx, "Exact host-owned JSON will accompany the next preparation confirmation; it does not grant consent.");
+        } else if (verb === "start") {
+          if (!id || args.trim() !== `start ${id}`) throw new Error(usage);
+          const existing = existsSync(path.join(getPitakoDataDir(), "missions.db"))
+            ? await read((db) => db.findManagedMission(ctx.cwd)) : undefined;
+          if (!existing || ["completed", "cancelled"].includes(existing.state))
+            display(ctx, queuePreparation(ctx, id, true));
+          else { discardDraft(); display(ctx, await confirmNative(ctx, args)); }
         } else if (verb === "prepare") {
           if (!id || args.trim() !== `prepare ${id}`) throw new Error(usage);
           display(ctx, queuePreparation(ctx, id));
@@ -694,7 +871,7 @@ Make supported technical choices autonomously. Propose explicit permissions and 
 
   const tool = (name: string, parameters: any, execute: (params: any, ctx: any) => Promise<unknown>) => {
     pi.registerTool({ name, label: name, description: name === "mission_prepare"
-      ? "Submit an untrusted {definition,mappings} authoring proposal for the current host requestId from /mission prepare, or retrieve its source context. Optional source interpretations/setup are proposed native decisions, not approval. Questions, exact preview and native confirmation leave the mission prepared; /mission start is separate. Output is never a confirmation receipt."
+      ? "Retrieve current host context or submit an untrusted schema3 {definition,mappings} proposal for the pending native /mission start (or advanced /mission prepare) requestId. Source interpretations/setup are proposals, never approval. Only the host's native confirmation admits or starts. Output is never a confirmation receipt."
       : `Durable mission ${name.slice(8)}`, parameters,
       execute: async (_id, params, _signal, _update, ctx) => ({
         content: [{ type: "text", text: JSON.stringify(await execute(params, ctx)) }], details: undefined,
@@ -712,7 +889,11 @@ Make supported technical choices autonomously. Propose explicit permissions and 
     try { return await authorPreparation(params, ctx); }
     catch (error) { discardDraft(); throw error; }
   });
-  tool("mission_status", Type.Object({}), async (_params, ctx) => read((db) => status(ctx, db)));
+  tool("mission_status", Type.Object({}), async () => {
+    repaint();
+    return { observation: progressText() ?? "No cached mission; use mission_observe for history.",
+      throughSeq: progress?.cursor, authority: "display-only" };
+  });
   tool("mission_start", Type.Object({ id: Type.String() }), async () => {
     throw new Error("model tool cannot mint start authority; use /mission start <plan-id> in this principal session");
   });
@@ -728,3 +909,4 @@ Make supported technical choices autonomously. Propose explicit permissions and 
     throw new Error("worker identity requires a host-bound managed attempt; submission is unavailable outside one");
   });
 }
+import { resourceAuthority } from "./resources.ts";

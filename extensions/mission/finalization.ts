@@ -8,6 +8,7 @@ import { MISSION_CHECK_IDENTITY, missionCheckRuntime } from "./checks.ts";
 import { missionInputIdentity } from "./inputs.ts";
 import { verifyExecutionBinding, type ExecutionBinding } from "../workflow.ts";
 import { assertCommandTime } from "./command-time.ts";
+import { resourceAllocations, resourceLimit, ARTIFACT_OPERATION_BYTES } from "./resources.ts";
 
 // Binding.finalization distinguishes this engine-owned target from user units.
 export const FINALIZATION_OWNER = "mission-finalization";
@@ -81,19 +82,25 @@ export function compileFinalizationGrants(definition: MissionDefinition) {
   const roleLaunches = versioned ? 3 : 1 + Number(definition.finalization.independentReview);
   const providerRequests = roleLaunches + Number(versioned);
   const stages = versioned ? 7 : roleLaunches;
-  const requestTokens = Math.max(1, Math.ceil(definition.budget.tokens / definition.budget.providerRequests));
+  const requestTokens = resourceLimit(definition, "tokens") === undefined ? 0 :
+    Math.max(1, Math.ceil(resourceAllocations(definition).tokens / resourceAllocations(definition).providerRequests));
   // Two shares per launch is an allocation convention, not a provider input estimate.
-  const tokens = versioned ? Math.max(requestTokens, Math.ceil(definition.budget.tokens / (2 * definition.budget.roleLaunches))) : requestTokens;
-  const active = Math.max(1, Math.floor(definition.budget.activeTimeMs / (definition.budget.roleLaunches + (versioned ? 4 : 0))));
-  const artifacts = Math.max(1, Math.floor(definition.budget.artifactBytes / (definition.budget.roleLaunches + (versioned ? 4 : 0))));
+  const tokens = resourceLimit(definition, "tokens") === undefined ? 0 :
+    versioned ? Math.max(requestTokens, Math.ceil(resourceAllocations(definition).tokens / (2 * resourceAllocations(definition).roleLaunches))) : requestTokens;
+  const active = resourceLimit(definition, "active-time-ms") === undefined ? 0 :
+    Math.max(1, Math.floor(resourceAllocations(definition).activeTimeMs / (resourceAllocations(definition).roleLaunches + (versioned ? 4 : 0))));
+  const artifacts = resourceLimit(definition, "artifact-bytes") === undefined ? ARTIFACT_OPERATION_BYTES :
+    Math.max(1, Math.floor(resourceAllocations(definition).artifactBytes / (resourceAllocations(definition).roleLaunches + (versioned ? 4 : 0))));
   const protectedAmounts = { "role-launches": roleLaunches, "provider-requests": providerRequests,
     tokens: providerRequests * tokens, "active-time-ms": stages * active, "artifact-bytes": stages * artifacts };
+  for (const resource of Object.keys(protectedAmounts) as Array<keyof typeof protectedAmounts>)
+    if (resourceLimit(definition, resource) === undefined) protectedAmounts[resource] = 0;
   const ordinary = { "role-launches": launches, "provider-requests": launches,
     tokens: launches * requestTokens, "active-time-ms": launches * active, "artifact-bytes": launches * artifacts };
-  const caps = { "role-launches": definition.budget.roleLaunches, "provider-requests": definition.budget.providerRequests,
-    tokens: definition.budget.tokens, "active-time-ms": definition.budget.activeTimeMs, "artifact-bytes": definition.budget.artifactBytes };
+  const caps = { "role-launches": resourceAllocations(definition).roleLaunches, "provider-requests": resourceAllocations(definition).providerRequests,
+    tokens: resourceAllocations(definition).tokens, "active-time-ms": resourceAllocations(definition).activeTimeMs, "artifact-bytes": resourceAllocations(definition).artifactBytes };
   for (const resource of Object.keys(caps) as Array<keyof typeof caps>)
-    if (ordinary[resource] + protectedAmounts[resource] > caps[resource])
+    if (resourceLimit(definition, resource) !== undefined && ordinary[resource] + protectedAmounts[resource] > caps[resource])
       throw new Error(`mandatory path plus protected finalization needs ${ordinary[resource] + protectedAmounts[resource]} ${resource}; budget allows ${caps[resource]}`);
   if (versioned) {
     for (const phase of ["integrated-checks", "affected-checks", "final-gates"] as const) {
@@ -102,7 +109,7 @@ export function compileFinalizationGrants(definition: MissionDefinition) {
       for (const predicate of definition.units.flatMap((unit) => unit.acceptance)
         .filter((predicate) => predicate.kind === "command_exit" && selected.includes(predicate.id))) {
         assertCommandTime(predicate.timeoutMs);
-        if (predicate.timeoutMs! > active)
+        if (resourceLimit(definition, "active-time-ms") !== undefined && predicate.timeoutMs! > active)
           throw new Error(`${phase}:${predicate.id} command timeout ${predicate.timeoutMs} ms exceeds compiled protected stage allocation ${active} ms`);
       }
     }
@@ -184,7 +191,7 @@ export function sourceWitnessCurrent(store: MissionStore, hash: string, root: st
 
 export function finalizationInputIdentity(inspection: MissionInspection, source: WorkspaceManifest, sourceRoot: string, store: MissionStore) {
   const { planHash, definitionHash, ...pin } = missionInputIdentity(inspection, sourceRoot);
-  const setup = inspection.prepared?.setup ? new MissionSetup(store, inspection.id).observe(inspection) : undefined;
+  const setup = inspection.prepared?.setup ? new MissionSetup(store, inspection.id).observePhysical(inspection) : undefined;
   if (setup?.state === "blocked") throw new Error(`setup prerequisite: ${setup.reason}`);
   return { source, predicates: inspection.definition.units.map(({ id, inputs, acceptance }) => ({ id, inputs, acceptance })),
     planHash, definitionHash, ...(inspection.prepared ? { pin, prepared: inspection.prepared } : {}), ...(setup ? { setup } : {}),

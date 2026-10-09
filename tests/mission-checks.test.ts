@@ -22,7 +22,7 @@ test.each(["capture", "snapshot"] as const)(
   let effects: MissionEffects | undefined;
   try {
     const mission = store.createMission(missionInput(fixture));
-    const workspace = createMissionWorkspace({ missionId: mission.id, attemptId: randomUUID(), sourceRoot: fixture.root,
+    const workspace = await createMissionWorkspace({ missionId: mission.id, attemptId: randomUUID(), sourceRoot: fixture.root,
       storeRoot: store.storageRoot, candidateParent: path.join(fixture.base, "candidates"), allowedPaths: ["."] });
     await preflightContainment(workspace);
     const sealed = sealWorkspaceImage(captureWorkspaceImage(workspace.candidateRoot));
@@ -71,7 +71,7 @@ test("ordinary production checker cannot admit nested bubblewrap", async () => {
   let effects: MissionEffects | undefined;
   try {
     const mission = store.createMission(missionInput(fixture));
-    const workspace = createMissionWorkspace({ missionId: mission.id, attemptId: randomUUID(), sourceRoot: fixture.root,
+    const workspace = await createMissionWorkspace({ missionId: mission.id, attemptId: randomUUID(), sourceRoot: fixture.root,
       storeRoot: store.storageRoot, candidateParent: path.join(fixture.base, "candidates"), allowedPaths: ["."] });
     await preflightContainment(workspace);
     const sealed = sealWorkspaceImage(captureWorkspaceImage(workspace.candidateRoot));
@@ -204,7 +204,7 @@ test("production checker binds immutable result bytes, not worker PASS or manual
     store.appendTransition(mission.id, store.inspectMission(mission.id).version, { events: [{ revision: 1, kind: "mission.input.visible", causalId: randomUUID(), payload: {} }], artifacts: sealed.artifacts });
     expect((await assessMissionPredicate({ predicate: { id: "partial", kind: "artifact_hash", target: "result", expected: sealed.imageHash },
       subject: { kind: "workspace", imageHash: sealed.imageHash } }, context)).verdict).toBe("inconclusive");
-    const workspace = createMissionWorkspace({ missionId: mission.id, attemptId: randomUUID(), sourceRoot: fixture.root,
+    const workspace = await createMissionWorkspace({ missionId: mission.id, attemptId: randomUUID(), sourceRoot: fixture.root,
       storeRoot: store.storageRoot, candidateParent: path.join(fixture.base, "candidates"), allowedPaths: ["."] });
     const effects = new MissionEffects({ store, workspace, missionId: mission.id, revision: 1, unitId: "snapshot",
       attemptId: workspace.attemptId, runtimeId: store.runtimeId, ownerEpoch: store.ownerEpoch!, allowedOperations: ["bash"] });

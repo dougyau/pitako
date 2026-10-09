@@ -6,7 +6,7 @@ import type { MissionInspection } from "./store.ts";
 
 /** Original physical pin and current admitted store revision are distinct identities. */
 export function missionInputIdentity(inspection: MissionInspection, sourceRoot: string) {
-  if (inspection.snapshot.schemaVersion === 2) {
+  if (inspection.snapshot.schemaVersion !== 1) {
     const binding = inspection.snapshot.sourceBinding;
     if (!binding || !inspection.prepared || realpathSync(sourceRoot) !== binding.executionRoot)
       throw new Error("generated mission execution root does not match physical source binding");

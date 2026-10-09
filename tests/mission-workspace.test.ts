@@ -90,7 +90,7 @@ function fixture() {
   return { base, sourceRoot, storeRoot, candidateParent, otherCandidate, git };
 }
 
-function workspace(sample: ReturnType<typeof fixture>): MissionWorkspace {
+async function workspace(sample: ReturnType<typeof fixture>): Promise<MissionWorkspace> {
   return createMissionWorkspace({
     missionId: "12345678-1234-4234-8234-123456789abc",
     attemptId: "22345678-1234-4234-8234-123456789abc",
@@ -182,10 +182,10 @@ describe("managed mission candidate containment", () => {
     } finally { store.close(); }
   }, 30_000);
 
-  test("exact-file mounts reject symlinks and directories without creating broader write authority", () => {
+  test("exact-file mounts reject symlinks and directories without creating broader write authority", async () => {
     if (!canContain) throw new Error("exact-file rejection regression requires Linux bwrap containment");
     const sample = fixture();
-    const candidate = workspace(sample);
+    const candidate = await workspace(sample);
     for (const grant of ["src/link.txt", "src", "src/target.txt/**"]) {
       expect(() => spawnContained(candidate, "bash", ["-c", "true"], { writablePaths: [grant] })).toThrow();
     }
@@ -203,7 +203,7 @@ describe("managed mission candidate containment", () => {
     if (!canContain) throw new Error("exact-file regression requires Linux bwrap containment");
     const sample = fixture();
     writeFileSync(path.join(sample.sourceRoot, "src/greeting.mjs"), "export const greeting = 'before';\n");
-    const candidate = createMissionWorkspace({
+    const candidate = await createMissionWorkspace({
       missionId: randomUUID(), attemptId: randomUUID(), sourceRoot: sample.sourceRoot,
       storeRoot: sample.storeRoot, candidateParent: sample.candidateParent,
       allowedPaths: ["src/greeting.mjs", "src/future.txt"], otherCandidates: [sample.otherCandidate],
@@ -293,13 +293,13 @@ describe("managed mission candidate containment", () => {
     } finally { store.close(); }
   }, 30_000);
 
-  test("copies tracked, staged, dirty and untracked inputs without shared Git state", () => {
+  test("copies tracked, staged, dirty and untracked inputs without shared Git state", async () => {
     if (process.platform !== "linux") {
-      expect(() => workspace(fixture())).toThrow(/unsupported on/);
+      await expect(workspace(fixture())).rejects.toThrow(/unsupported on/);
       return;
     }
     const sample = fixture();
-    const candidate = workspace(sample);
+    const candidate = await workspace(sample);
     expect(readFileSync(path.join(candidate.candidateRoot, "src/target.txt"), "utf8")).toBe("dirty worktree\n");
     expect(readFileSync(path.join(candidate.candidateRoot, "src/untracked.txt"), "utf8")).toBe("untracked\n");
     expect(lstatSync(path.join(candidate.candidateRoot, "src/link.txt")).isSymbolicLink()).toBe(true);
@@ -314,7 +314,7 @@ describe("managed mission candidate containment", () => {
   test("gates contained write, edit, patch and bash tools; preserves source/store/Git sentinels", async () => {
     if (!canContain) return;
     const sample = fixture();
-    const candidate = workspace(sample);
+    const candidate = await workspace(sample);
     const indexBefore = readFileSync(path.join(sample.sourceRoot, ".git", "index"));
     const sourceBefore = readFileSync(path.join(sample.sourceRoot, "src", "target.txt"));
     const sealedBefore = readFileSync(path.join(sample.storeRoot, "sentinel"));
@@ -395,7 +395,7 @@ describe("managed mission candidate containment", () => {
   test("keeps directory-FD writes inside the candidate during concurrent symlink replacement", async () => {
     if (!canContain) return;
     const sample = fixture();
-    const candidate = workspace(sample);
+    const candidate = await workspace(sample);
     await preflightContainment(candidate);
     const original = readFileSync(path.join(sample.sourceRoot, "src", "target.txt"));
     let version = 0;
@@ -461,7 +461,7 @@ describe("managed mission candidate containment", () => {
 
   test("rejects symlink-parent writes and denies tools before successful preflight", async () => {
     const sample = fixture();
-    const candidate = workspace(sample);
+    const candidate = await workspace(sample);
     let version = 0;
     const events: Array<{ kind: string }> = [];
     const store = {

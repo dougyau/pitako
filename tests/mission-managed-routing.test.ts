@@ -81,7 +81,7 @@ describe("managed Team and Board routing reads", () => {
       const mission = store.createMission(missionInput(sample));
       const attemptId = randomUUID();
       const attemptEpoch = store.ownerEpoch!;
-      const candidate = createMissionWorkspace({
+      const candidate = await createMissionWorkspace({
         missionId: mission.id, attemptId, sourceRoot: sample.root, storeRoot: store.storageRoot,
         candidateParent: path.join(sample.base, "candidates"), allowedPaths: [],
       });

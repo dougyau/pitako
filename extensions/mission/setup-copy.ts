@@ -2,6 +2,7 @@ import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { constants, closeSync, copyFileSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readlinkSync, realpathSync, chmodSync, symlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { chmod, copyFile, mkdir, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { repositoryIdentity } from "../board/workspace.ts";
 import { verifyExecutionBinding, type ExecutionBinding } from "../workflow.ts";
@@ -142,16 +143,19 @@ export function assertCopyInputs(setup: Pick<PreparedSetup, "identity" | "decisi
   current.copy!.destination = setup.identity.copy!.destination;
   if (digest(current) !== digest(setup.identity)) throw new Error("approved copied setup source/seed/runtime identity changed");
 }
-function copyRows(source: string, destination: string, rows: Row[]): void {
-  mkdirSync(destination, { recursive: true, mode: 0o700 });
+async function copyRows(source: string, destination: string, rows: Row[], recheck: () => void): Promise<void> {
+  await mkdir(destination, { recursive: true, mode: 0o700 });
   for (const row of rows) {
+    recheck();
     const target = path.join(destination, row.path);
     if (!safe(row.path)) throw new Error("unsafe copied setup path");
-    mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
-    if (row.kind === "directory") mkdirSync(target, { recursive: true, mode: (row.mode ?? 0o700) & 0o777 });
-    else if (row.kind === "file") { copyFileSync(path.join(source, row.path), target, constants.COPYFILE_EXCL); chmodSync(target, row.mode! & 0o777); }
-    else if (row.kind === "link") symlinkSync(row.target!, target);
+    await mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
+    recheck();
+    if (row.kind === "directory") await mkdir(target, { recursive: true, mode: (row.mode ?? 0o700) & 0o777 });
+    else if (row.kind === "file") { await copyFile(path.join(source, row.path), target, constants.COPYFILE_EXCL); recheck(); await chmod(target, row.mode! & 0o777); }
+    else if (row.kind === "link") await symlink(row.target!, target);
   }
+  recheck();
 }
 function owned(identity: SetupIdentity): string {
   const root = identity.copy!.destination;
@@ -167,39 +171,44 @@ function owned(identity: SetupIdentity): string {
   }
   return root;
 }
-export function initializeCopy(setup: PreparedSetup): void {
-  assertCopyInputs(setup);
+/** Caller owns fresh input observation and rechecks authority across these host writes. */
+export async function initializeCopy(setup: PreparedSetup, recheck: () => void): Promise<void> {
+  recheck();
   const identity = setup.identity, root = identity.copy!.destination;
-  mkdirSync(root, { mode: 0o700 }); // exclusive: a stale or pre-created destination cannot acquire authority
-  for (const name of ["capsule", "cache", "runtime", "libraries", "published"]) mkdirSync(path.join(root, name), { mode: 0o700 });
-  copyRows(identity.binding.executionRoot, path.join(root, "capsule"), identity.source);
+  await mkdir(root, { mode: 0o700 }); // exclusive: a stale or pre-created destination cannot acquire authority
+  for (const name of ["capsule", "cache", "runtime", "libraries", "published"]) { recheck(); await mkdir(path.join(root, name), { mode: 0o700 }); }
+  await copyRows(identity.binding.executionRoot, path.join(root, "capsule"), identity.source, recheck);
   for (const seed of identity.copy!.seeds)
-    copyRows(seed.source, path.join(root, seed.destination === "node_modules" ? "capsule/node_modules" : seed.destination), seed.rows);
+    await copyRows(seed.source, path.join(root, seed.destination === "node_modules" ? "capsule/node_modules" : seed.destination), seed.rows, recheck);
   for (const seed of identity.copy!.seeds.filter(({ destination }) => destination.startsWith("cache/"))) {
     const name = seed.destination.slice("cache/".length);
     const match = /^(.*)@([^@]+@@@.*)$/.exec(name);
     if (match && !name.startsWith("@GH@")) {
       const aliases = path.join(root, "cache", match[1]!);
-      mkdirSync(aliases, { recursive: true, mode: 0o700 });
-      symlinkSync(path.relative(aliases, path.join(root, "cache", name)), path.join(aliases, match[2]!));
+      recheck();
+      await mkdir(aliases, { recursive: true, mode: 0o700 });
+      recheck();
+      await symlink(path.relative(aliases, path.join(root, "cache", name)), path.join(aliases, match[2]!));
     }
   }
   for (const executable of identity.runtimes) {
+    recheck();
     const target = path.join(root, "runtime", path.basename(executable.path));
-    copyFileSync(executable.path, target, constants.COPYFILE_EXCL); chmodSync(target, 0o500);
+    await copyFile(executable.path, target, constants.COPYFILE_EXCL); recheck(); await chmod(target, 0o500);
   }
-  for (const [index, library] of identity.libraries.entries()) copyFileSync(library.path, path.join(root, "libraries", String(index)));
-  writeFileSync(path.join(root, "identity.json"), JSON.stringify({
+  for (const [index, library] of identity.libraries.entries()) { recheck(); await copyFile(library.path, path.join(root, "libraries", String(index))); }
+  recheck();
+  await writeFile(path.join(root, "identity.json"), JSON.stringify({
     directories: Object.fromEntries(["", "capsule", "capsule/node_modules", "cache", "runtime", "libraries", "published"]
       .map((name) => [name, physical(path.join(root, name))])),
     files: Object.fromEntries([...identity.source.filter((row) => row.kind === "file").map((row) => `capsule/${row.path}`),
       ...identity.runtimes.map((row) => `runtime/${path.basename(row.path)}`),
       ...identity.libraries.map((_row, index) => `libraries/${index}`)].map((name) => [name, physical(path.join(root, name))])),
   }), { flag: "wx", mode: 0o400 });
-  assertCopyInputs(setup);
+  recheck();
 }
 export function launchCopy(setup: PreparedSetup): ChildProcess {
-  assertCopyInputs(setup);
+  // runObserved owns the immediately preceding physical input proof.
   const root = owned(setup.identity), descriptors: number[] = [], filter = openSeccompFilter();
   const pin = (file: string) => {
     const fd = openSync(file, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
@@ -245,18 +254,19 @@ export function captureCopyOutputs(identity: SetupIdentity): Row[] {
   return [{ path: "node_modules", kind: "directory", identity: physical(output), mode: lstatSync(output).mode },
     ...rows.map((row) => ({ ...row, path: `node_modules/${row.path}` }))];
 }
-export function publishCopy(setup: PreparedSetup): number {
+/** Read-only publication observation. The observer never performs the copy. */
+export function copyPublication(setup: PreparedSetup): Row[] {
   const root = owned(setup.identity), limit = setup.identity.copy!.bounds;
   // Raw staging may contain cache hardlinks; the byte-copied publication cannot.
   const source = path.join(root, "capsule/node_modules"), rows = tree(source, limit);
   if (rows.length + 1 > limit.paths) throw new Error("copied setup manifest path bound exceeded");
   if (copyStorageBytes(setup.identity) + rows.reduce((n, row) => n + (row.size ?? 0), 0) > setup.decision.values.artifactBytes)
     throw new Error("copied setup storage exceeds admitted artifact allocation");
-  copyRows(source, path.join(root, "published/node_modules"), rows);
-  captureCopyOutputs(setup.identity);
-  const bytes = copyStorageBytes(setup.identity);
-  if (bytes > setup.decision.values.artifactBytes) throw new Error("copied setup storage exceeds admitted artifact allocation");
-  return bytes;
+  return rows;
+}
+export async function publishCopy(setup: PreparedSetup, rows: Row[], recheck: () => void): Promise<void> {
+  const root = setup.identity.copy!.destination;
+  await copyRows(path.join(root, "capsule/node_modules"), path.join(root, "published/node_modules"), rows, recheck);
 }
 export function copyStorageBytes(identity: SetupIdentity): number {
   const root = identity.copy!.destination;

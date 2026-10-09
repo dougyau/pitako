@@ -30,12 +30,17 @@ function bytes(value: number): string {
   return `${quantity(value)} B`;
 }
 
-function authorityView({ authority, budget, units }: MissionDefinition): string[] {
+function authorityView(definition: MissionDefinition): string[] {
+  const { authority, budget, units } = definition;
+  const resources = definition.schemaVersion === 3 ?
+    [`Resource limits: ${JSON.stringify(definition.resourcePolicy.limits)}; omitted dimensions are metered.`,
+      `Estimates (not ceilings): ${JSON.stringify(definition.resourcePolicy.estimates)}.`] :
+    [`Mission budget: ${quantity(budget!.roleLaunches)} launches; ${quantity(budget!.providerRequests)} provider requests; ${quantity(budget!.tokens)} tokens.`,
+      `Active time: ${duration(budget!.activeTimeMs)}; stored output: ${bytes(budget!.artifactBytes)}. These are ceilings, not estimates.`];
   return [
     `Writes: ${list(authority.allowedPaths)}`,
     `Operations: ${list(authority.operations)}; external effects: ${list(authority.externalEffects)}`,
-    `Mission budget: ${quantity(budget.roleLaunches)} launches; ${quantity(budget.providerRequests)} provider requests; ${quantity(budget.tokens)} tokens.`,
-    `Active time: ${duration(budget.activeTimeMs)}; stored output: ${bytes(budget.artifactBytes)}. These are ceilings, not estimates.`,
+    ...resources,
     authority.verificationProfiles?.includes("sealed-nested-verification-v1")
       ? `Offline nested checker authorized for ${units.flatMap(({ acceptance }) => acceptance)
         .filter(({ profile }) => profile === "sealed-nested-verification-v1").length} selected checks only: no host writes, credentials or network. Workers remain restricted.`
@@ -100,17 +105,19 @@ export function preparationView(input: {
 }): string {
   const { action, context, definition, setup } = input;
   const { binding } = context;
+  const starting = action === "admit-and-start-frozen-mission-v1";
   return [
     `Plan: ${binding.planId} @${binding.revision}`,
     `Execution root: ${binding.executionRoot}`,
-    action !== "admit-prepared-mission"
+    starting ? "Start now: admit this exact frozen proposal, run required bounded setup, then start workers. Refusal starts neither."
+      : action !== "admit-prepared-mission"
       ? "Authorize preparation permissions and source decisions; no setup, provider or worker runs yet."
       : setup?.effectProfile === "execution-root-local-copy-v1"
       ? "Prepare now: run scripts/setup.sh on private copies; host inputs stay read-only, network denied. No workers start."
       : "Prepare now: validate and register; no setup, provider or worker runs.",
-    `Work planned: ${definition.units.length} units.`,
+    `Work planned: ${definition.units.length} units.${starting ? ` Workers starting: ${list(definition.units.filter(({ dependencies }) => !dependencies.length).map(({ id, role }) => `${id} (${role})`))}; independent verification follows.` : ""}`,
     ...authorityView(definition),
-    setup ? `Setup: prepare ${list(setup.writableDirectories)}; budget ${duration(setup.activeTimeMs)} / ${bytes(setup.artifactBytes)}, within the mission budget.${setup.copy ? " Private copies, network denied." : " Runs only after separate start consent."}`
+    setup ? `${starting || definition.schemaVersion === 3 ? `Setup: ${list(setup.writableDirectories)}; finite allocation ${duration(setup.activeTimeMs)} / ${bytes(setup.artifactBytes)}.` : `Setup: prepare ${list(setup.writableDirectories)}; budget ${duration(setup.activeTimeMs)} / ${bytes(setup.artifactBytes)}, within the mission budget.`}${setup.copy ? ` Private copies, network denied.${starting ? ` Seeds: ${list(setup.copy.seeds.map(({ source, destination }) => `${source} → ${destination}`))}.` : ""}` : starting ? " Runs under this consent." : " Runs only after separate start consent."}`
       : "Setup: none.",
     ...(input.interpretations ?? []).slice(0, 3).map(({ sourceId, disposition }) => {
       const region = context.inventory.unresolved.find(({ id }) => id === sourceId);
@@ -118,6 +125,7 @@ export function preparationView(input: {
       return `Source decision: ${sourceId} → ${disposition}\n${text.length > 180 ? `${text.slice(0, 177)}… (full excerpt in View details)` : text}`;
     }),
     ...((input.interpretations?.length ?? 0) > 3 ? [`${input.interpretations!.length - 3} additional source decisions — View details for every exact excerpt.`] : []),
-    `Next: /mission start ${binding.planId} — separate execution consent.${setup?.copy ? " Reuses settled setup; does not bootstrap again." : ""}`,
+    starting ? `Resume after closing Pi: ${definition.authority.resumeAfterClose ? "enabled" : "disabled"}; technical amendments: ${definition.authority.allowTechnicalAmendments ? "allowed" : "not allowed"}. New material effects or source choices require new consent.`
+      : `Next: /mission start ${binding.planId} — separate execution consent.${setup?.copy ? " Reuses settled setup; does not bootstrap again." : ""}`,
   ].join("\n");
 }

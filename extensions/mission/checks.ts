@@ -4,6 +4,7 @@ import type { MissionStore } from "./store.ts";
 import type { MissionPredicateObservation } from "./engine.ts";
 import { MissionEffects } from "./effects.ts";
 import { assertCommandTime } from "./command-time.ts";
+import { resourceAllocations, resourceLimit, resourceAuthority } from "./resources.ts";
 import { captureWorkspaceImage, captureWorkspacePaths, hasContainmentProof } from "./workspace.ts";
 import { assertCompleteWorkspaceImage, canonicalDeliveryManifest, missionEffectProcessesQuiescent, missionHasUnresolvedEffects, readSealedWorkspaceImage, sealWorkspaceImage } from "./reconcile.ts";
 import { assertNestedCapsule, copyNestedCapsule, importNestedEvidence, NESTED_PROFILE, type NestedCapsule } from "./nested-verification.ts";
@@ -84,7 +85,9 @@ export async function assessMissionPredicate(
         Number(predicate.expected) > 255 || !effects || !hasContainmentProof(effects.workspace))
         throw new Error("command identity or verification containment is missing");
       assertCommandTime(timeoutMs);
-      if (!context.timeoutLimitMs || timeoutMs > context.timeoutLimitMs)
+      const mission = context.store.inspectMission(effects.workspace.missionId);
+      if (resourceLimit(mission.definition, "active-time-ms") !== undefined &&
+        (!context.timeoutLimitMs || timeoutMs > context.timeoutLimitMs))
         throw new Error(`command timeout ${timeoutMs} ms exceeds remaining admitted active-time capacity ${context.timeoutLimitMs ?? 0} ms`);
       const observeSubject = () => {
         const observed = captureWorkspaceImage(effects.workspace.candidateRoot);
@@ -104,11 +107,13 @@ export async function assessMissionPredicate(
           !current.definition.units.some((unit) => unit.acceptance.some((row) => JSON.stringify(row) === JSON.stringify(predicate))))
           throw new Error("explicit native nested verification authority is missing");
         const authority = JSON.parse(prepared.authorityDecision.text);
-        if (authority.action !== "preparation-authority" ||
-          JSON.stringify(authority.values) !== JSON.stringify({ authority: current.definition.authority, budget: current.definition.budget }))
+        const values = authority.action === "preparation-authority" ? authority.values :
+          authority.action === "frozen-start-decisions-v1" ? authority.authority : undefined;
+        if (JSON.stringify(values) !== JSON.stringify(resourceAuthority(current.definition)))
           throw new Error("native nested verification authority does not match the frozen definition");
         const artifactBytes = context.artifactLimitBytes;
-        if (!artifactBytes || artifactBytes > current.definition.budget.artifactBytes)
+        if (!artifactBytes || resourceLimit(current.definition, "artifact-bytes") !== undefined &&
+          artifactBytes > resourceAllocations(current.definition).artifactBytes)
           throw new Error("current finite nested verification artifact grant is missing");
         const filter = openSeccompFilter(NESTED_PROFILE);
         let policyIdentity: string;

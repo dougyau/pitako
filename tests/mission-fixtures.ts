@@ -48,7 +48,7 @@ export function createFixtureRejectionCapture(directory: string | undefined, cas
   };
 }
 
-export function missionDefinition(): MissionDefinition {
+export function missionDefinition(): Extract<MissionDefinition, { schemaVersion: 1 | 2 }> {
   return {
     schemaVersion: 1,
     goal: "Verify durable snapshots",

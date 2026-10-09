@@ -10,6 +10,8 @@ import { assertCommandTime } from "./command-time.ts";
 import { sha256, validateMissionDefinition, type MissionDefinition } from "./model.ts";
 import { inventoryFrozenSource, type SourceInventory } from "./source-inventory.ts";
 import { assertSetupInputs, captureSetupIdentity, setupRequiredBy, type PreparedSetup, type SetupAllocation } from "./setup.ts";
+import { PhysicalObservation } from "./physical-observation.ts";
+import { resourceAllocations, resourceLimit, resourceAuthority, assertSupportedResourcePolicy } from "./resources.ts";
 
 export interface PreparationIssue {
   code: "invalid-proposal" | "missing-mapping" | "source-meaning" | "authority-choice" | "setup-choice" |
@@ -85,12 +87,14 @@ interface HostRequest {
   gates: PreparedMission["gates"];
   inventory: SourceInventory;
   physical: ReturnType<typeof physicalIdentity>;
-  authority?: { values: Pick<MissionDefinition, "authority" | "budget">; receiptId: string; text: string };
+  authority?: { values: Pick<MissionDefinition, "authority" | "budget" | "resourcePolicy">; receiptId: string; text: string };
   answers: PreparedMission["answers"];
   setup?: Omit<PreparedSetup, "requiredBy">;
+  asyncPhysical: boolean;
+  observedSetup?: { valuesHash: string; identity: PreparedSetup["identity"] };
 }
 const requests = new WeakMap<PreparationRequest, HostRequest>();
-const preparedObjects = new WeakMap<PreparedMission, { request: PreparationRequest; digest: string }>();
+const preparedObjects = new WeakMap<PreparedMission, { request: PreparationRequest; digest: string; startText?: string; receiptId?: string }>();
 const digest = (value: unknown) => sha256(Buffer.from(JSON.stringify(value)));
 function freeze<T>(value: T): T {
   if (value && typeof value === "object") {
@@ -120,14 +124,44 @@ function physicalIdentity(binding: ExecutionBinding) {
 }
 
 /** Host adapter entry: independently reads pinned source, configuration and GATES. No setup or writer. */
-export function openPreparationRequest(id: string, cwd: string, sessionId: string, load: LoadOptions = {}): PreparationRequest {
+export function openPreparationRequest(id: string, cwd: string, sessionId: string, load: LoadOptions = {}, asyncPhysical = false): PreparationRequest {
   if (!sessionId) throw new Error("preparation requires a principal-session identity");
   const source = resolveFrozenPlanBinding(id, cwd);
   const request = Object.freeze({ id: randomUUID() });
   requests.set(request, { request, sessionId, source, load: { ...load, cwd: source.binding.executionRoot },
     config: captureConfig({ ...load, cwd: source.binding.executionRoot }), gates: readGates(source.binding.executionRoot),
-    inventory: inventoryFrozenSource(source.text), physical: physicalIdentity(source.binding), answers: [] });
+    inventory: inventoryFrozenSource(source.text), physical: physicalIdentity(source.binding), answers: [], asyncPhysical });
   return request;
+}
+/** Host-owned physical witness. The worker reads only; consent remains in this request's WeakMap. */
+export async function observePreparationSetup(request: PreparationRequest, values: SetupAllocation, physical?: PhysicalObservation): Promise<void> {
+  const host = hostRequest(request);
+  const observer = physical ?? new PhysicalObservation();
+  try {
+    if (host.observedSetup?.valuesHash === digest(values)) {
+      const matches = await observer.request<boolean>("setupIdentityMatches", {
+        binding: host.source.binding, values, hash: digest(host.observedSetup.identity),
+      });
+      if (hostRequest(request) !== host || !matches) throw new PreparationBindingError("setup physical inputs changed");
+      return;
+    }
+    const identity = await observer.request<PreparedSetup["identity"]>("setupIdentity", { binding: host.source.binding, values });
+    if (hostRequest(request) !== host) throw new PreparationBindingError("preparation request replaced during observation");
+    host.observedSetup = { valuesHash: digest(values), identity };
+  } finally { if (!physical) await observer.dispose(); }
+}
+function setupIdentity(host: HostRequest, values: SetupAllocation): PreparedSetup["identity"] {
+  if (host.asyncPhysical) {
+    if (host.observedSetup?.valuesHash !== digest(values)) throw new Error("current preparation physical observation required");
+    return host.observedSetup.identity;
+  }
+  return captureSetupIdentity(host.source.binding, values);
+}
+function setupInputs(host: HostRequest, setup: Pick<PreparedSetup, "identity" | "decision">): void {
+  if (host.asyncPhysical) {
+    if (digest(setupIdentity(host, setup.decision.values)) !== digest(setup.identity))
+      throw new Error("setup physical inputs changed");
+  } else assertSetupInputs(setup);
 }
 function hostRequest(request: PreparationRequest): HostRequest {
   const host = requests.get(request);
@@ -174,20 +208,20 @@ export function invalidatePreparationRequest(request: PreparationRequest): void 
 export function preparationSetupText(request: PreparationRequest, values: SetupAllocation): string {
   const host = hostRequest(request);
   return JSON.stringify({ action: "preparation-setup-effects", requestId: request.id, sessionId: host.sessionId,
-    configIdentity: host.config.identity, identity: captureSetupIdentity(host.source.binding, values), values });
+    configIdentity: host.config.identity, identity: setupIdentity(host, values), values });
 }
 export function bindPreparationSetup(request: PreparationRequest, values: SetupAllocation, receipt: OperatorReceipt): void {
   const host = hostRequest(request);
   const text = preparationSetupText(request, values);
   if (receipt.source !== "native-confirmation") throw new Error("setup effects require separate native confirmation");
   consumeOperatorInput(receipt, host.sessionId, text);
-  host.setup = { identity: captureSetupIdentity(host.source.binding, values),
+  host.setup = { identity: setupIdentity(host, values),
     decision: { values: structuredClone(values), receiptId: receipt.id, source: receipt.source, text } };
 }
 
 /** Exact host receipt, not a proposal's approval flag. T3 supplies its UI adapter. */
 export function bindPreparationAuthority(request: PreparationRequest,
-  values: Pick<MissionDefinition, "authority" | "budget">, receipt: OperatorReceipt): void {
+  values: Pick<MissionDefinition, "authority" | "budget" | "resourcePolicy">, receipt: OperatorReceipt): void {
   const host = hostRequest(request);
   const text = preparationAuthorityText(request, values);
   if (values.authority.verificationProfiles && receipt.source !== "native-confirmation")
@@ -195,7 +229,7 @@ export function bindPreparationAuthority(request: PreparationRequest,
   consumeOperatorInput(receipt, host.sessionId, text);
   host.authority = { values: structuredClone(values), receiptId: receipt.id, text };
 }
-export function preparationAuthorityText(request: PreparationRequest, values: Pick<MissionDefinition, "authority" | "budget">): string {
+export function preparationAuthorityText(request: PreparationRequest, values: Pick<MissionDefinition, "authority" | "budget" | "resourcePolicy">): string {
   const host = hostRequest(request);
   return JSON.stringify({ action: "preparation-authority", requestId: request.id,
     binding: host.source.binding, configIdentity: host.config.identity, values });
@@ -217,7 +251,48 @@ export function preparationAnswerText(request: PreparationRequest, sourceId: str
 
 /** Validate proposal relationships against independently owned source, never its inventory. */
 export function validatePreparation(input: PreparationInput): PreparationResult {
-  const host = hostRequest(input.request);
+  return validateWithHost(input, hostRequest(input.request));
+}
+
+/** Preview every decision together; no receipt is issued or consumed by authoring. */
+export function previewFrozenStart(input: PreparationInput & {
+  interpretations?: Array<{ sourceId: string; disposition: "context" | "criterion" }>;
+  receiptId: string;
+}): PreparationResult {
+  const original = hostRequest(input.request);
+  let definition: MissionDefinition;
+  try { definition = validateMissionDefinition((input.proposal as { definition?: unknown })?.definition); }
+  catch (error) { return unresolved(original.source.binding, [preparationIssue("invalid-proposal", "evidence", String(error))]); }
+  if (definition.schemaVersion !== 3)
+    return unresolved(original.source.binding, [preparationIssue("invalid-proposal", "budget", "New frozen starts require schemaVersion 3 resourcePolicy; estimates are not budgets.")]);
+  const interpretations = input.interpretations ?? [];
+  const ids = new Set<string>();
+  for (const answer of interpretations) {
+    if (ids.has(answer.sourceId) || !original.inventory.unresolved.some(({ id }) => id === answer.sourceId) ||
+      !["context", "criterion"].includes(answer.disposition))
+      return unresolved(original.source.binding, [preparationIssue("invalid-proposal", "source", "Interpretations require distinct current unresolved source IDs.")]);
+    ids.add(answer.sourceId);
+  }
+  const decisions = JSON.stringify({ action: "frozen-start-decisions-v1", requestId: input.request.id,
+    binding: original.source.binding, configIdentity: original.config.identity,
+    authority: resourceAuthority(definition), interpretations, setup: input.setup ?? null });
+  const host: HostRequest = { ...original,
+    authority: { values: resourceAuthority(definition), receiptId: input.receiptId, text: decisions },
+    answers: interpretations.map((answer) => ({ ...answer, receiptId: input.receiptId, text: decisions })),
+    setup: input.setup ? { identity: setupIdentity(original, input.setup),
+      decision: { values: structuredClone(input.setup), receiptId: input.receiptId, source: "native-confirmation", text: decisions } } : undefined };
+  const result = validateWithHost(input, host);
+  if (result.state === "ready") {
+    const issued = preparedObjects.get(result.prepared)!;
+    issued.receiptId = input.receiptId;
+    issued.startText = JSON.stringify({ action: "admit-and-start-frozen-mission-v1",
+      requestId: input.request.id, sessionId: original.sessionId, receiptId: input.receiptId,
+      preparedHash: result.digest, binding: result.prepared.binding });
+  }
+  return result;
+}
+
+function validateWithHost(input: PreparationInput, host: HostRequest): PreparationResult {
   const binding = host.source.binding;
   const issues: PreparationIssue[] = [];
   const issue = (kind: PreparationIssue["kind"], message: string, row?: { id: string; text: string },
@@ -236,7 +311,9 @@ export function validatePreparation(input: PreparationInput): PreparationResult 
   let definition: MissionDefinition;
   try { definition = validateMissionDefinition(row.definition); }
   catch (error) { return unresolved(binding, [...issues, preparationIssue("invalid-proposal", "evidence", String(error))]); }
-  if (definition.schemaVersion !== 2) issue("source", "generated preparation requires executable schema 2");
+  if (definition.schemaVersion === 1) issue("source", "generated preparation requires executable schema 2 or 3");
+  try { assertSupportedResourcePolicy(definition); }
+  catch (error) { issue("budget", String(error), undefined, "insufficient-grant"); }
   const inventory = inventoryFrozenSource(host.source.text);
   for (const region of inventory.unresolved) {
     if (!host.answers.some(({ sourceId }) => sourceId === region.id)) issue("source", region.issue, region, "source-meaning");
@@ -281,8 +358,8 @@ export function validatePreparation(input: PreparationInput): PreparationResult 
     issue("source", `executable unit ${unit.id} has no original unit`);
   for (const edge of inventory.dependencies) if (!definition.units.find(({ id }) => id === edge.unitId)?.dependencies.includes(edge.requires))
     issue("source", `required ${edge.basis} dependency missing: ${edge.unitId} -> ${edge.requires}`);
-  if (!host.authority) issue("authority", "explicit host-bound permission and five-budget decision required", undefined, "authority-choice");
-  else if (digest(host.authority.values) !== digest({ authority: definition.authority, budget: definition.budget }))
+  if (!host.authority) issue("authority", "explicit host-bound permission and resource policy decision required", undefined, "authority-choice");
+  else if (digest(host.authority.values) !== digest(resourceAuthority(definition)))
     issue("authority", "proposal does not preserve exact approved authority/budgets", undefined, "authority-choice");
   const setupPath = path.join(binding.executionRoot, "scripts/setup.sh");
   // lstat observation must not turn a dangling hook into optional absence.
@@ -299,14 +376,14 @@ export function validatePreparation(input: PreparationInput): PreparationResult 
         undefined, "invalid-proposal");
     else {
       if (!host.setup || digest(values) !== digest(host.setup.decision.values)) {
-        try { captureSetupIdentity(binding, values); }
+        try { setupIdentity(host, values); }
         catch (error) { issue("prerequisite", String(error), undefined, "missing-local-input"); }
         issue("authority", "proposed setup allocation requires exact native setup-effect decision", undefined, "setup-choice");
       }
     }
   }
   if (host.setup) {
-    try { assertSetupInputs(host.setup); } catch (error) { issue("prerequisite", String(error), undefined, "missing-local-input"); }
+    try { setupInputs(host, host.setup); } catch (error) { issue("prerequisite", String(error), undefined, "missing-local-input"); }
   }
   for (const [role, policy] of Object.entries(definition.authority.rolePolicies)) {
     const frozen = host.config.roles[role];
@@ -333,8 +410,10 @@ export function validatePreparation(input: PreparationInput): PreparationResult 
     const setupAllocation = input.setup ?? host.setup?.decision.values;
     if (setupAllocation) {
       const ordinary = definition.units.reduce((sum, unit) => sum + (unit.team ? unit.team.members.length * 3 + 1 : 1), 0);
-      if (ordinary * grants.active + grants.protectedAmounts["active-time-ms"] + setupAllocation.activeTimeMs > definition.budget.activeTimeMs ||
-        ordinary * grants.artifacts + grants.protectedAmounts["artifact-bytes"] + setupAllocation.artifactBytes > definition.budget.artifactBytes)
+      if (resourceLimit(definition, "active-time-ms") !== undefined &&
+        ordinary * grants.active + grants.protectedAmounts["active-time-ms"] + setupAllocation.activeTimeMs > resourceAllocations(definition).activeTimeMs ||
+        resourceLimit(definition, "artifact-bytes") !== undefined &&
+        ordinary * grants.artifacts + grants.protectedAmounts["artifact-bytes"] + setupAllocation.artifactBytes > resourceAllocations(definition).artifactBytes)
         issue("budget", "setup allocation must preserve mandatory path and protected finalization capacity", undefined, "insufficient-grant");
     }
   } catch (error) { issue("budget", String(error), undefined, "insufficient-grant"); }
@@ -359,20 +438,25 @@ export function validatePreparation(input: PreparationInput): PreparationResult 
 export function assertPreparedAdmission(prepared: PreparedMission): string {
   const issued = preparedObjects.get(prepared);
   if (!issued || issued.digest !== digest(prepared)) throw new Error("host-validated prepared object required");
-  hostRequest(issued.request);
-  if (prepared.setup) assertSetupInputs(prepared.setup);
+  const host = hostRequest(issued.request);
+  if (prepared.setup) setupInputs(host, prepared.setup);
   return issued.digest;
 }
 
 /** Exact admission binding; native consent may group admission and authority values in one dialog. */
 export function preparedAdmissionText(prepared: PreparedMission): string {
   const hash = assertPreparedAdmission(prepared);
+  const startText = preparedObjects.get(prepared)!.startText;
+  if (startText) return startText;
   return JSON.stringify({ action: "admit-prepared-mission", requestId: preparedObjects.get(prepared)!.request.id,
     preparedHash: hash, binding: prepared.binding });
 }
 
 export function consumePreparedAdmission(prepared: PreparedMission, receipt: OperatorReceipt): void {
   const text = preparedAdmissionText(prepared);
-  const host = hostRequest(preparedObjects.get(prepared)!.request);
+  const issued = preparedObjects.get(prepared)!;
+  const host = hostRequest(issued.request);
+  if (issued.receiptId && (receipt.id !== issued.receiptId || receipt.source !== "native-confirmation"))
+    throw new Error("exact frozen-start native admission required");
   consumeOperatorInput(receipt, host.sessionId, text);
 }

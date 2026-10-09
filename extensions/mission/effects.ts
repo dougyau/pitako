@@ -16,6 +16,7 @@ import { loadCodexTools } from "./codex-tools.ts";
 import { assertCommandTime, MAX_COMMAND_TIME_MS } from "./command-time.ts";
 import { readNestedVerificationAdmission } from "./checks.ts";
 import { createCheckerTransport, type CheckerTransport } from "./checker-transport.ts";
+import { PhysicalObservation, PREPARATION_TIME_MS, BOOTSTRAP_TIME_MS } from "./physical-observation.ts";
 
 const EFFECT_TOOLS = ["bash", "edit", "write", "apply_patch"] as const;
 const DENIED_TOOLS = new Set(["powershell", "lsp_rename"]);
@@ -38,9 +39,14 @@ export interface MissionEffectContext {
   // Host-only factual diagnosis; effect arguments cannot enable it.
   diagnosticTrace?: true;
   canInvoke?: (effectId: string) => boolean;
+  observeFrontier?: (observer: PhysicalObservation, signal?: AbortSignal) => Promise<void>;
   commandTime?: {
-    admit: (requestedMs?: number) => Promise<number>;
+    contract?: "launch-release-v2" | "launch-release-v3";
+    admit: (requestedMs?: number) => Promise<number | undefined>;
+    begin?: (requestedMs?: number) => Promise<{ timeoutMs: number; reservationId?: string;
+      timeAdmission?: TimeAdmission; executionAt: number }>;
     remaining: () => number;
+    authority?: () => TimeAdmission;
   };
 }
 
@@ -69,6 +75,8 @@ interface RunningEffect {
   quiescent: boolean;
 }
 
+import { timeAllows, type TimeAdmission } from "./resources.ts";
+
 export class MissionEffects {
   private readonly context: MissionEffectContext;
   private readonly inFlight = new Map<string, RunningEffect>();
@@ -78,6 +86,7 @@ export class MissionEffects {
   private verificationOnly = false;
   private verificationSubject = false;
   private nestedAdmission?: unknown;
+  private readonly observations = new Set<AbortController>();
 
   constructor(context: MissionEffectContext) {
     this.context = context;
@@ -93,6 +102,7 @@ export class MissionEffects {
 
   fence(): void {
     this.fenced = true;
+    for (const controller of this.observations) controller.abort();
   }
 
   enableVerificationOnly(sealedSubject = false): void {
@@ -187,7 +197,37 @@ export class MissionEffects {
   }
 
   private async run(effectId: string, operation: string, input: EffectInput, signal?: AbortSignal): Promise<MissionEffectReceipt> {
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) controller.abort();
+    this.observations.add(controller);
+    const observer = new PhysicalObservation(performance.now() +
+       (this.context.commandTime?.contract ? PREPARATION_TIME_MS : MAX_COMMAND_TIME_MS));
+    try { return await this.runObserved(effectId, operation, input, controller.signal, observer); }
+    finally {
+      this.observations.delete(controller);
+      signal?.removeEventListener("abort", abort);
+      await observer.dispose();
+    }
+  }
+  private currentTimeAdmission(): TimeAdmission {
+    const clock = this.context.commandTime;
+    if (!clock) return { kind: "revoked", reason: "effect time authority is missing" };
+    if (clock.contract === "launch-release-v3")
+      return clock.authority?.() ?? { kind: "revoked", reason: "typed effect time authority is missing" };
+    const remainingMs = clock.remaining();
+    return remainingMs > 0 ? { kind: "capped", reservationId: "legacy", remainingMs } :
+      { kind: "revoked", reason: "legacy effect time reservation is missing or exhausted" };
+  }
+
+  private assertCurrent(effectId: string, signal?: AbortSignal): void {
+    if (this.fenced || signal?.aborted || this.context.canInvoke?.(effectId) === false)
+      throw new Error("effect physical observation or authority became stale");
+  }
+  private async runObserved(effectId: string, operation: string, input: EffectInput, signal: AbortSignal, observer: PhysicalObservation): Promise<MissionEffectReceipt> {
     const admittedAt = performance.now();
+    const launchClock = Boolean(this.context.commandTime?.contract);
     const traceEvents: Array<Record<string, unknown>> = [];
     const trace = this.nestedAdmission === undefined || !this.context.diagnosticTrace ? undefined :
       (event: string, facts?: Record<string, unknown>) => {
@@ -195,27 +235,37 @@ export class MissionEffects {
           traceEvents.push({ event, at: performance.now(), ...facts });
       };
     trace?.("invocation.begin", { admittedAt, wallClock: Date.now(), requestedTimeoutMs: input.timeoutMs });
-    let timeoutMs: number;
+    const requestedMs = input.timeoutMs as number | undefined;
+    let timeoutMs: number | undefined;
     try {
       if (input.timeoutMs !== undefined) assertCommandTime(input.timeoutMs);
       if (!this.context.commandTime) throw new Error("current finite effect time grant is missing");
       timeoutMs = await this.context.commandTime.admit(input.timeoutMs as number | undefined);
-      assertCommandTime(timeoutMs);
+      this.assertCurrent(effectId, signal);
+      if (!launchClock || timeoutMs !== undefined) assertCommandTime(timeoutMs);
       if (input.timeoutMs !== undefined && timeoutMs !== input.timeoutMs) throw new Error("explicit command timeout changed during admission");
+      if (!launchClock) observer.bindExecutionDeadline(admittedAt + timeoutMs!);
     } catch (error) {
       return this.recordDenied(effectId, operation, error instanceof Error ? error.message : String(error));
     }
-    input = { ...input, timeoutMs };
-    trace?.("invocation.admitted", { timeoutMs, deadline: admittedAt + timeoutMs });
+    if (!launchClock) input = { ...input, timeoutMs };
+    trace?.("invocation.admitted", { timeoutMs, deadline: timeoutMs === undefined ? undefined : admittedAt + timeoutMs });
     const requestHash = hashJson(input);
+    const preparationDeadline = admittedAt + (launchClock ? PREPARATION_TIME_MS : timeoutMs!);
     let beforePaths: ManifestPath[];
-    try { beforePaths = captureWorkspacePaths(this.context.workspace.candidateRoot, true); }
+    try {
+      beforePaths = await observer.paths(this.context.workspace.candidateRoot, signal, preparationDeadline);
+      this.assertCurrent(effectId, signal);
+    }
     catch (error) {
       return this.recordDenied(effectId, operation, `candidate baseline observation failed: ${error instanceof Error ? error.message : String(error)}`);
     }
     const candidateManifestHash = hashJson(beforePaths);
     const owner = currentProcessIdentity(this.context.runtimeId, this.context.ownerEpoch);
-    const plan = await createEffectPlan(this.context.workspace, operation, input, requestHash, beforePaths);
+    const plan = await createEffectPlan(this.context.workspace, operation, input, requestHash, beforePaths, observer, signal);
+    this.assertCurrent(effectId, signal);
+    await this.context.observeFrontier?.(observer, signal);
+    this.assertCurrent(effectId, signal);
     const nested = this.nestedAdmission === undefined ? undefined :
       readNestedVerificationAdmission(this.nestedAdmission, this.workspace, String(input.command), effectId);
     if (nested && (operation !== "bash" || timeoutMs !== nested.timeoutMs)) throw new Error("nested verification operation or time grant mismatch");
@@ -233,6 +283,9 @@ export class MissionEffects {
       inputManifestHash: this.context.workspace.manifest.hash, candidateManifestHash, recovery: "local-observation-required",
       recoveryMode: this.context.recoveryMode, recoveryImageHash: this.context.recoveryImageHash,
       repairAuthorizationId: this.context.repairAuthorizationId,
+      ...(launchClock ? { commandLifetime: { version: 2, timeoutBinding: "release-selection-v1",
+        request: requestedMs === undefined ? { kind: "default" } : { kind: "explicit", timeoutMs: requestedMs },
+        preparationTimeoutMs: PREPARATION_TIME_MS, bootstrapTimeoutMs: BOOTSTRAP_TIME_MS } } : {}),
     };
     if (this.fenced || this.context.canInvoke?.(effectId) === false)
       return this.recordDenied(effectId, operation, "mission effects are fenced by current admission");
@@ -258,14 +311,16 @@ export class MissionEffects {
     const transport = nested ? createCheckerTransport(trace) : undefined;
     const beforeSpawn = trace ? () => {
       const now = performance.now();
-      trace("native.beforeSpawn", { observedAt: now, admittedAt, timeoutMs, deadline: admittedAt + timeoutMs,
-        invocationRemainingMs: timeoutMs - Math.ceil(now - admittedAt),
+      trace("native.beforeSpawn", { observedAt: now, admittedAt, timeoutMs, deadline: timeoutMs === undefined ? undefined : admittedAt + timeoutMs,
+        invocationRemainingMs: timeoutMs === undefined ? undefined : timeoutMs - Math.ceil(now - admittedAt),
         grantRemainingMs: this.context.commandTime!.remaining() });
     } : undefined;
     const canSpawn = () => {
-      const remainingGrant = this.context.commandTime!.remaining();
-      const remainingInvocation = timeoutMs - Math.ceil(performance.now() - admittedAt);
-      return remainingInvocation > 0 && remainingInvocation <= remainingGrant;
+      const authority = this.currentTimeAdmission();
+      const remainingInvocation = launchClock ? MAX_COMMAND_TIME_MS : timeoutMs! - Math.ceil(performance.now() - admittedAt);
+      if (performance.now() >= preparationDeadline || signal.aborted || this.fenced) return false;
+      return launchClock ? authority.kind === "metered" || authority.kind === "capped" && authority.remainingMs > 0
+        : timeAllows(authority, remainingInvocation);
     };
     try {
       let child: ChildProcess | undefined;
@@ -276,7 +331,8 @@ export class MissionEffects {
       } catch (error) {
         if (!(error instanceof ContainedLaunchPreparationError)) throw error;
         // No child is not proof of no effect: preparing directory mounts can mutate the candidate.
-        const unchanged = hashJson(captureWorkspacePaths(this.workspace.candidateRoot, true)) === candidateManifestHash;
+        const unchanged = await observer.request("pathsMatch", { root: this.workspace.candidateRoot, hash: candidateManifestHash }, signal);
+        this.assertCurrent(effectId, signal);
         if (!unchanged) {
           this.fenced = true;
           await this.appendEffectEvent("effect.unknown", effectId, {
@@ -304,7 +360,7 @@ export class MissionEffects {
       transport?.spawned();
       const running: RunningEffect = { effectId, child, workspace: this.context.workspace, quiescent: false };
       this.inFlight.set(effectId, running);
-      const job = this.observeChild(effectId, operation, input, beforePaths, child, owner, requestHash, admittedAt, signal, (ns, rootPid) => {
+      const job = this.observeChild(effectId, operation, input, beforePaths, child, owner, requestHash, admittedAt, signal, observer, (ns, rootPid) => {
         running.namespace = ns;
         running.namespaceRootPid = rootPid;
       }, transport, trace, traceEvents);
@@ -331,11 +387,18 @@ export class MissionEffects {
     requestHash: string,
     admittedAt: number,
     signal: AbortSignal | undefined,
+    observer: PhysicalObservation,
     onNamespace: (namespace: string, rootPid: number) => void,
     transport?: CheckerTransport,
     trace?: (event: string, facts?: Record<string, unknown>) => void,
     traceEvents?: Array<Record<string, unknown>>,
   ): Promise<MissionEffectReceipt> {
+    const launchClock = Boolean(this.context.commandTime?.contract);
+    const bootstrapDeadline = Math.min(admittedAt + PREPARATION_TIME_MS, performance.now() + BOOTSTRAP_TIME_MS);
+    const bootstrapTimer = launchClock ? setTimeout(() => child.kill("SIGKILL"),
+      Math.max(1, bootstrapDeadline - performance.now())) : undefined;
+    let executionAt = admittedAt;
+    let observationDeadline = admittedAt + (launchClock ? PREPARATION_TIME_MS : Number(input.timeoutMs));
     const running = this.inFlight.get(effectId);
     if (!running) throw new Error("effect process is not registered with its owner");
     let namespace: string | undefined;
@@ -358,7 +421,8 @@ export class MissionEffects {
         resolve({ code, signal: childSignal });
       });
     });
-    const boundedExit = waitForExit(exit, child, Number(input.timeoutMs), admittedAt, trace);
+    let boundedExit: ReturnType<typeof waitForExit> | undefined = launchClock ? undefined :
+      waitForExit(exit, child, Number(input.timeoutMs), admittedAt, trace);
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
     let stdoutBytes = 0;
@@ -393,7 +457,9 @@ export class MissionEffects {
         const request = { ...input, operation, hostCandidateRoot: this.context.workspace.candidateRoot, allowedPaths: this.context.workspace.allowedPaths };
         stdin.write(`${JSON.stringify(request)}\n`);
       }
-      const readyRow = await nextLine(iterator, Math.min(10_000, Math.max(1, Number(input.timeoutMs) - Math.ceil(performance.now() - admittedAt))), trace);
+      const readyRow = await nextLine(iterator, Math.min(BOOTSTRAP_TIME_MS, Math.max(1,
+        (launchClock ? PREPARATION_TIME_MS : Number(input.timeoutMs)) - Math.ceil(performance.now() - admittedAt))), trace);
+      this.assertCurrent(effectId, signal);
       trace?.("protocol.readyRow");
       const ready = parseProtocol(readyRow);
       if (ready.kind !== "ready" || !Number.isSafeInteger(ready.pid) || ready.pid < 1 || typeof ready.namespace !== "string" || typeof ready.networkNamespace !== "string") {
@@ -423,14 +489,33 @@ export class MissionEffects {
       if (transport)
         identity.nestedBoundary = observeNestedVerificationBoundary(namespace, ready.pid, transport);
       await this.appendEffectEvent("effect.process.registered", effectId, { effectId, operation, owner, identity });
-      if (signal?.aborted || this.fenced) throw new Error("effect fenced before launch release");
+      this.assertCurrent(effectId, signal);
+      await this.context.observeFrontier?.(observer, signal);
+      this.assertCurrent(effectId, signal);
       readOwnedNamespaceInit(namespace, namespaceRoot, launcher);
+      let release: { timeoutMs: number; reservationId?: string; timeAdmission?: TimeAdmission; executionAt: number } | undefined;
+      if (launchClock) {
+        if (!this.context.commandTime!.begin) throw new Error("launch-release command grant is missing");
+        if (performance.now() >= admittedAt + PREPARATION_TIME_MS) throw new Error("effect preparation expired before launch release");
+        release = await this.context.commandTime!.begin(input.timeoutMs as number | undefined);
+        this.assertCurrent(effectId, signal);
+        if (performance.now() >= bootstrapDeadline) throw new Error("effect bootstrap expired before launch release");
+        input = { ...input, timeoutMs: release.timeoutMs };
+        executionAt = release.executionAt;
+        observationDeadline = executionAt + release.timeoutMs;
+      }
+      if (launchClock) observer.bindExecutionDeadline(executionAt + Number(input.timeoutMs));
+      const executionStartedAt = Date.now() - Math.ceil(performance.now() - executionAt);
       await this.appendEffectEvent("effect.released", effectId, { effectId, operation, requestHash, processIdentity: identity,
-        timeoutMs: input.timeoutMs });
+        timeoutMs: input.timeoutMs, ...(launchClock ? { commandLifetimeVersion: 2, executionStartedAt,
+          executionDeadline: executionStartedAt + Number(input.timeoutMs),
+          ...(release!.timeAdmission ? { timeAdmission: release!.timeAdmission } : { reservationId: release!.reservationId }) } : {}) });
+      if (launchClock && performance.now() >= bootstrapDeadline) throw new Error("effect bootstrap expired before GO");
       if (signal?.aborted || this.fenced || this.context.canInvoke?.(effectId) === false) throw new Error("effect fenced before launch release");
       assertCommandTime(input.timeoutMs);
-      const remainingInvocation = input.timeoutMs - Math.ceil(performance.now() - admittedAt);
-      if (remainingInvocation <= 0 || remainingInvocation > this.context.commandTime!.remaining())
+      const authority = this.currentTimeAdmission();
+      const remainingInvocation = input.timeoutMs - Math.ceil(performance.now() - executionAt);
+      if (!timeAllows(authority, remainingInvocation))
         throw new Error("command timeout exceeds current remaining effect time grant");
       readOwnedNamespaceInit(namespace, namespaceRoot, launcher);
       if (this.nestedAdmission !== undefined)
@@ -438,8 +523,13 @@ export class MissionEffects {
       if (transport && JSON.stringify(observeNestedVerificationBoundary(namespace, ready.pid, transport)) !==
         JSON.stringify(identity.nestedBoundary))
         throw new Error("nested verification boundary changed before GO");
-      if (transport) await transport.release(remainingInvocation);
+      boundedExit ??= waitForExit(exit, child, Number(input.timeoutMs), executionAt, trace);
+      if (transport) {
+        await transport.release(remainingInvocation);
+        this.assertCurrent(effectId, signal);
+      }
       else stdin.end("GO\n");
+      if (bootstrapTimer) clearTimeout(bootstrapTimer);
       if (operation === "bash" && transport) {
         lines.close();
         // readline.close() pauses its input; the independent raw capture must keep draining.
@@ -450,7 +540,7 @@ export class MissionEffects {
       if (operation === "bash") {
         const waited = await boundedExit;
         timedOut = waited.timedOut;
-        if (transport) await transport.drain(input.timeoutMs - Math.ceil(performance.now() - admittedAt));
+        if (transport) await transport.drain(input.timeoutMs - Math.ceil(performance.now() - executionAt));
         const rawStdout = commandOutput();
         const rawStderr = Buffer.concat(stderrChunks);
         const stdout = rawStdout.toString("utf8");
@@ -467,7 +557,7 @@ export class MissionEffects {
           process: { descendantsQuiescent: true },
         };
       } else {
-        const receiptRow = await nextLine(iterator, Math.max(1, input.timeoutMs - Math.ceil(performance.now() - admittedAt)));
+        const receiptRow = await nextLine(iterator, Math.max(1, input.timeoutMs - Math.ceil(performance.now() - executionAt)));
         receipt = parseProtocol(receiptRow);
       }
       const ended = (await boundedExit).ended;
@@ -480,7 +570,10 @@ export class MissionEffects {
       if (stillAlive.length > 0) throw new Error("contained process namespace could not be emptied");
       const outerInitRetired = this.requireOuterInitRetirement(running.namespaceInit);
       const afterPaths: ManifestPath[] = [];
-      try { captureWorkspacePaths(this.context.workspace.candidateRoot, true, afterPaths); }
+      try {
+        afterPaths.push(...await observer.paths(this.context.workspace.candidateRoot, undefined, observationDeadline));
+        if (receipt.status === "completed") this.assertCurrent(effectId, signal);
+      }
       catch (error) {
         const visited = new Set(afterPaths.map(({ path: name }) => name));
         observedPaths = diffPathRows(beforePaths.filter(({ path: name }) => visited.has(name)), afterPaths);
@@ -511,7 +604,7 @@ export class MissionEffects {
       };
       // Exit is not settlement: drain, retirement and candidate capture consume the same admitted deadline.
       const enforceInvocationDeadline = () => {
-        if (performance.now() - admittedAt >= Number(input.timeoutMs)) {
+        if (performance.now() - executionAt >= Number(input.timeoutMs)) {
           completed.status = "failed";
           completed.exitCode = 124;
           completed.termination = "timeout";
@@ -519,7 +612,10 @@ export class MissionEffects {
       };
       enforceInvocationDeadline();
       let snapshot: { draft: MissionEventDraft; artifacts: Array<{ bytes: Uint8Array; mediaType: string }> };
-      try { snapshot = this.effectSnapshot(effectId, observedPaths); }
+      try {
+        snapshot = await this.effectSnapshot(effectId, observedPaths, observer, observationDeadline);
+        if (completed.status === "completed") this.assertCurrent(effectId, signal);
+      }
       catch (snapshotError) {
         const reason = `effect completed but its private candidate image could not be safely sealed: ${snapshotError instanceof Error ? snapshotError.message : String(snapshotError)}`;
         if (completed.status === "failed" && observedPaths.length === 0 && identity && namespace && namespaceProcesses(namespace).length === 0) {
@@ -598,7 +694,7 @@ export class MissionEffects {
       runningQuiescent(this.inFlight.get(effectId));
       const afterPaths: ManifestPath[] = [];
       try {
-        captureWorkspacePaths(this.context.workspace.candidateRoot, true, afterPaths);
+        afterPaths.push(...await observer.paths(this.context.workspace.candidateRoot, undefined, observationDeadline));
         const paths = diffPathRows(beforePaths, afterPaths);
         observedPaths = paths;
         const failed: MissionEffectReceipt = {
@@ -610,7 +706,7 @@ export class MissionEffects {
             ...(outerInitRetired ? { outerInitRetired } : {}) } : undefined,
         };
         let snapshot: { draft: MissionEventDraft; artifacts: Array<{ bytes: Uint8Array; mediaType: string }> };
-        try { snapshot = this.effectSnapshot(effectId, paths); }
+        try { snapshot = await this.effectSnapshot(effectId, paths, observer, observationDeadline); }
         catch (snapshotError) {
           const reason = `effect outcome is uncertain because its partial candidate could not be safely sealed: ${snapshotError instanceof Error ? snapshotError.message : String(snapshotError)}`;
           if (paths.length === 0 && identity && namespace && namespaceProcesses(namespace).length === 0) {
@@ -649,6 +745,7 @@ export class MissionEffects {
         return { ...unknown, stderr: Buffer.concat(stderrChunks).toString("utf8") };
       }
     } finally {
+      if (bootstrapTimer) clearTimeout(bootstrapTimer);
       lines.close();
     }
   }
@@ -667,8 +764,9 @@ export class MissionEffects {
     return { effectId, operation, status: "unknown", reason, process: process as Record<string, unknown> | undefined, paths: paths as Array<Record<string, unknown>> };
   }
 
-  private effectSnapshot(effectId: string, paths: Array<Record<string, unknown>>): { draft: MissionEventDraft; artifacts: Array<{ bytes: Uint8Array; mediaType: string }> } {
-    const image = filterWorkspaceImage(captureWorkspaceImage(this.context.workspace.candidateRoot), this.context.workspace.allowedPaths);
+  private async effectSnapshot(effectId: string, paths: Array<Record<string, unknown>>, observer: PhysicalObservation, deadline: number): Promise<{ draft: MissionEventDraft; artifacts: Array<{ bytes: Uint8Array; mediaType: string }> }> {
+    const captured = await observer.image(this.context.workspace.candidateRoot, undefined, deadline);
+    const image = filterWorkspaceImage(captured, this.context.workspace.allowedPaths);
     for (const row of paths) {
       const after = row.after as ManifestPath;
       if (after.kind === "directory") continue;
@@ -730,6 +828,8 @@ async function createEffectPlan(
   input: EffectInput,
   requestHash: string,
   beforePaths: ManifestPath[],
+  observer: PhysicalObservation,
+  signal: AbortSignal,
 ): Promise<Record<string, unknown>> {
   const preconditions = beforePaths.filter(({ path: name }) => pathAllowed(name, workspace.allowedPaths));
   const candidate = {
@@ -775,7 +875,7 @@ async function createEffectPlan(
       else after.set(row.path, { path: row.path, kind: row.kind, mode: row.mode, hash: row.hash });
     }
     const expectedAfter = [...after.values()].sort((left, right) => left.path.localeCompare(right.path));
-    const currentAfter = captureWorkspacePaths(workspace.candidateRoot, true)
+    const currentAfter = (await observer.paths(workspace.candidateRoot, signal))
       .filter(({ path: name }) => pathAllowed(name, workspace.allowedPaths));
     if (hashJson(currentAfter) !== hashJson(preconditions)) throw new Error("candidate changed during after-image preparation");
     plan.deterministic = true;
