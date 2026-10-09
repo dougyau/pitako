@@ -9,7 +9,7 @@ import { WorkerHistory, nativeHistoryStatus } from "../extensions/agent/history.
 import "./sdk-node-loader.mjs";
 const { createPiExecutor } = await import("../extensions/agent/pi.ts");
 import { runAgentInstance } from "../extensions/agent/run.ts";
-import { installMissionLocalProvider } from "../tests/mission-local-provider.ts";
+import { installLocalProvider } from "../tests/local-provider.ts";
 
 const script = fileURLToPath(import.meta.url);
 const packageRoot = path.resolve(path.dirname(script), "..");
@@ -75,7 +75,7 @@ if (mode === "--read") {
   }));
   let foreground;
   try {
-    const provider = await installMissionLocalProvider({
+    const provider = await installLocalProvider({
       agentDir, provider: "pitako-history-local", additionalModels: ["replacement"],
       responseForPrompt: () => "Offline worker completed.",
       toolForPrompt(prompt) {

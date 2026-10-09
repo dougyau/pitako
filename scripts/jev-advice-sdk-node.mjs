@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import vm from "node:vm";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { getSystemMessageText } from "@earendil-works/pi-ai";
-import { installMissionLocalProvider } from "../tests/mission-local-provider.ts";
+import { installLocalProvider } from "../tests/local-provider.ts";
 
 const script = fileURLToPath(import.meta.url);
 const checkout = path.resolve(path.dirname(script), "..");
@@ -176,14 +176,14 @@ function advertisedHelper(context, installed) {
 
 async function localChat(agentDir, installed, inputs) {
   let helperPath;
-  const provider = await installMissionLocalProvider({
+  const provider = await installLocalProvider({
     agentDir, toolTurns: inputs.length, responseForPrompt: () => "advice fixture settled",
     toolForPrompt(_prompt, completed) {
       return completed < inputs.length ? { name: "codemode",
         arguments: { code: invocation(helperPath, inputs[completed]) } } : undefined;
     },
   });
-  const driver = globalThis.__pitako_mission_local;
+  const driver = globalThis.__pitako_local;
   const original = driver.streamSimple;
   driver.streamSimple = (selected, context, options) => {
     helperPath = advertisedHelper(context, installed);
@@ -348,7 +348,7 @@ if (process.argv[2] === "--principal") {
       recovery: { ...evidence.recovery, records: undefined } }));
   } finally {
     await child?.session?.dispose();
-    delete globalThis.__pitako_mission_local;
+    delete globalThis.__pitako_local;
     delete globalThis.__jev_owned_classifier;
     rmSync(root, { recursive: true, force: true });
   }

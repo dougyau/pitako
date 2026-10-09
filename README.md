@@ -254,43 +254,15 @@ Artifacts live in the workspace (git root, or the current directory outside a re
 
 Six records stay separate. `todo` is the current session checklist. The Board holds shared findings, decisions, and handoffs. The plan is the frozen decision. The ledger is the resume checkpoint: plan id, revision, content hash, status, and rulings. Evidence is proof for one unit. The repository is the product change. Do not use one as a substitute for another.
 
-`$plan` and `$execute` are not Herdr callers. Ad-hoc Team assignments remain independent work, not durable mission units.
+`$plan` and `$execute` are not Herdr callers. Team assignments remain independent work.
 
-## Durable missions (opt-in)
-
-`/mission prepare <plan-id>` reads the frozen Markdown, execution root and configured
-role policies, then queues assisted authoring to the **current principal coordinator**.
-Busy work continues; no worker or second coordinator is launched. The coordinator
-submits an untrusted proposal through `mission_prepare`. Native questions bind genuine
-source ambiguities, explicit permissions, and all five budgets. Technical errors return
-to the author for correction, not to the user for permission. Estimates are not approval.
-An exact source-bound preview and native confirmation admit only that prepared object.
-No `.mission.json` is required, and preparation starts no worker. An admitted
-`execution-root-local-copy-v1` setup runs its hook on a bounded disposable copy during
-preparation. Start reuses the observed read-only dependency output rather than running
-the hook again. Legacy `execution-root-local-v1` setup remains start-scoped.
-
-`/mission start <plan-id>` separately confirms worker activation; native
-`pause|resume|cancel` commands control execution. Dismissed or invalidated drafts
-require preparation again; admitted preparation survives reload. This boundary trusts
-the Pi host and installed extensions to handle confirmation, **not** to attest human
-origin. Headless/RPC/child sessions cannot auto-approve; the console is optional.
-Activation journals intent before managed SDK tools run; candidates,
-artifacts and receipts persist outside the source checkout. A result is delivered
-without automatically changing source, committing or publishing it.
-
-An optional `sealed-nested-verification-v1` profile permits an offline checker
-inside a sealed disposable capsule. It does not relax ordinary worker namespace,
-socket, or tool restrictions. Missing runtime inputs, sandbox capabilities, or
-current setup proof remain explicit technical failures, not successful preparation.
-
-See [durable missions](docs/missions.md) for commands, recovery limitations,
-Linux sandbox prerequisites and the separate effectiveness measurement protocol.
-An engine-completed mission is **not** independently assessed product success.
+The managed `/mission` runtime is retired. Use `$execute` for frozen ordinary plans.
+Recorded managed-worker catalogs remain protected, read-only archives through
+`agent_history`; see [worker history](docs/worker-history.md) for coverage limits.
 
 ## What this is not yet
 
-Pitako does not implement subteams. Ad-hoc Team assignments let independent roles run concurrently, with one assignment per role; they do not become durable missions. Session TODOs are local execution plans. The Board is not a team roster or a memory store.
+Pitako does not implement subteams. Ad-hoc Team assignments let independent roles run concurrently, with one assignment per role; they do not become a durable scheduler. Session TODOs are local execution plans. The Board is not a team roster or a memory store.
 
 ## Requirements
 
@@ -370,7 +342,7 @@ Or, inside a session: `/pitako profile analysis`. `/pitako` prints the current p
 
 `PITAKO_PROFILE` is used when `--pitako-profile` is omitted. An unknown name fails startup with `PitakoConfigError`.
 
-`edit` and `write` are blocked for `.git/`, `node_modules/`, `.env`, and `.env.*` files. These foreground guards do not protect `apply_patch`. The old Pitako strict-path, exact-match patch engine and its structured failures are gone. Upstream accepts absolute paths, symlinks, moves, and fuzzy matching. Foreground and ad hoc sessions are not sandboxed. Managed missions separately use the fenced Linux candidate boundary described in [missions](docs/missions.md).
+`edit` and `write` are blocked for `.git/`, `node_modules/`, `.env`, and `.env.*` files. These foreground guards do not protect `apply_patch`. The old Pitako strict-path, exact-match patch engine and its structured failures are gone. Upstream accepts absolute paths, symlinks, moves, and fuzzy matching. Foreground and ad hoc sessions are not sandboxed.
 
 An unnamed session takes its display name from the first user line, capped at 60 characters. `--name` and `/name` win. A `$plan` or `$execute` session is renamed from the plan heading when that file exists, as `plan: <heading>` or `execute: <heading>`. On resume, Pitako replaces the old `pitako:coding` or `pitako:analysis` placeholder. The footer cwd line and `pitako` status slot both show the display name; the profile is not written into the status slot. `/pitako` still prints the profile.
 

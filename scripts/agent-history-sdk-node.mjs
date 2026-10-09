@@ -10,7 +10,7 @@ import { WorkerHistory, nativeHistoryStatus } from "../extensions/agent/history.
 import { createPiExecutor } from "../extensions/agent/pi.ts";
 import { executionForSession } from "../extensions/execution-identity.ts";
 import { ORCHESTRATION_TOOLS } from "../extensions/profile.ts";
-import { installMissionLocalProvider } from "../tests/mission-local-provider.ts";
+import { installLocalProvider } from "../tests/local-provider.ts";
 
 const script = fileURLToPath(import.meta.url);
 if (process.argv[2] === "--read") {
@@ -56,7 +56,7 @@ if (process.argv[2] === "--read") {
     const member = history.admit(group.groupId, { roleId: "developer", coordinatorSessionId: "fixture-coordinator" });
     const manager = history.createSession(group.groupId, member.historyId, cwd);
     assert.equal(existsSync(manager.getSessionFile()), false);
-    const provider = await installMissionLocalProvider({ agentDir, responseForPrompt: () => "T1 offline native assistant" });
+    const provider = await installLocalProvider({ agentDir, responseForPrompt: () => "T1 offline native assistant" });
     const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false } });
     const loader = new DefaultResourceLoader({
       cwd, agentDir, settingsManager, noContextFiles: true, noThemes: true,
@@ -116,7 +116,7 @@ if (process.argv[2] === "--read") {
        }`,
       `await tools.read({path:"missing.txt"});`,
     ];
-    const ordinaryProvider = await installMissionLocalProvider({
+    const ordinaryProvider = await installLocalProvider({
       agentDir, responseForPrompt: () => "ordinary child completed",
       toolTurns: 5,
       toolForPrompt(_prompt, completed) {
@@ -125,7 +125,7 @@ if (process.argv[2] === "--read") {
           : { name: "bash", arguments: { command: "printf direct-shell" } };
       },
     });
-    const driver = globalThis.__pitako_mission_local;
+    const driver = globalThis.__pitako_local;
     const stream = driver.streamSimple;
     driver.streamSimple = (model, context, options) => {
       const names = getCurrentTools(context.messages).map(tool => tool.name);
@@ -195,7 +195,7 @@ if (process.argv[2] === "--read") {
     await session?.dispose();
     await child?.session?.dispose();
     delete globalThis.__ordinaryChildHooks;
-    delete globalThis.__pitako_mission_local;
+    delete globalThis.__pitako_local;
     rmSync(root, { recursive: true, force: true });
   }
 }

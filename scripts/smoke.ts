@@ -94,8 +94,8 @@ export async function runSmoke(root = packageRoot()): Promise<ToolText[]> {
     ]) {
       if (!names.includes(required)) throw new Error(`Smoke expected ${required} to be registered`);
     }
-    if (!loaded.extensions.extensions.some((extension) => extension.commands.has("mission")))
-      throw new Error("Smoke expected /mission to be registered");
+    if (loaded.extensions.extensions.some((extension) => extension.commands.has("mission")))
+      throw new Error("Smoke must not register retired /mission");
     const tools = new Map<string, ToolRunner>();
     for (const extension of loaded.extensions.extensions) {
       for (const [name, registered] of extension.tools) {

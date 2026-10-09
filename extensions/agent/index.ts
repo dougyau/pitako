@@ -26,7 +26,6 @@ import { openBoard } from "../board/store.ts";
 import { boardWorkspace, currentWorkspace } from "../board/workspace.ts";
 import { ledgerFile, openExecutionPlan, planFile, readFrozenPlan, readPlan, type ExecutionBinding, type PlanMeta } from "../workflow.ts";
 import { teamEvaluationForSession, reserveTeamRole, recordTeamAssignment, recordPlanTeamWork, teamAssignments, type TeamAssignment } from "../team.ts";
-import { authorizeRoleDispatch, cancelManagedAttempt, inspectManagedAttempt, inspectManagedMission, managedAttemptRows, readManagedAttemptArtifact } from "./managed-mission.ts";
 import type { HistoryOrigin } from "./history.ts";
 import { queryHistory } from "./history-query.ts";
 import { executionForSession } from "../execution-identity.ts";
@@ -106,10 +105,8 @@ export default function agentInstance(pi: ExtensionAPI): void {
         return errorResult("agent_run cannot be called from an AgentInstance");
       }
       try {
-        await authorizeRoleDispatch(ctx.cwd);
         let live = "";
         const epoch = observationEpoch();
-        await authorizeRoleDispatch(ctx.cwd);
         const result = await runAgentInstance({
           roleId: params.role,
           task: params.task,
@@ -181,7 +178,6 @@ function registerTeamTools(pi: ExtensionAPI): void {
     }, noExtra),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
-        await authorizeRoleDispatch(ctx.cwd, { planId: params.plan });
         const evaluation = evaluationFor(ctx);
         const id = randomUUID();
         const admission = reserveTeamRole(evaluation, params.role, id);
@@ -213,7 +209,6 @@ function registerTeamTools(pi: ExtensionAPI): void {
             params.task.trim(),
           ].join("\n");
           const launchRoot = execution?.executionRoot ?? ctx.cwd;
-          await authorizeRoleDispatch(launchRoot, { planId: params.plan });
           const handle = await spawnBackground({
             roleId: params.role,
             task,
@@ -259,18 +254,6 @@ function registerTeamTools(pi: ExtensionAPI): void {
     parameters: Type.Object({ assignmentId: Type.Optional(Type.String()) }, noExtra),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       try {
-        const managed = typeof params.assignmentId === "string" ? await inspectManagedAttempt(ctx.cwd, params.assignmentId) : undefined;
-        const activeManaged = managed ? undefined : await inspectManagedMission(ctx.cwd);
-        if (managed) {
-          const assignments = managedAttemptRows(managed, params.assignmentId);
-          if (assignments.length === 0) throw new Error(`unknown managed assignment ${params.assignmentId} in mission ${managed.id}`);
-          return textResult(JSON.stringify(assignments), { missionId: managed.id, assignments });
-        }
-        if (activeManaged) {
-          const assignments = managedAttemptRows(activeManaged, params.assignmentId);
-          if (params.assignmentId && assignments.length === 0) throw new Error(`unknown managed assignment ${params.assignmentId} in mission ${activeManaged.id}`);
-          return textResult(JSON.stringify(assignments), { missionId: activeManaged.id, assignments });
-        }
         const evaluation = evaluationFor(ctx);
         if (!evaluation) throw new Error("Team requires a foreground session identity");
         const slots = teamAssignments(evaluation);
@@ -310,23 +293,6 @@ function registerTeamTools(pi: ExtensionAPI): void {
     parameters: Type.Object({ assignmentId: Type.String() }, noExtra),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       try {
-        const managed = await inspectManagedAttempt(ctx.cwd, params.assignmentId);
-        if (managed) {
-          const row = managedAttemptRows(managed, params.assignmentId)[0]!;
-          const receipt = managed.events.find((event) => event.kind === "attempt.receipt" && event.attemptId === params.assignmentId);
-          if (!row.resultAvailable || !receipt || typeof receipt.payload.artifactHash !== "string") {
-            return textResult(`Managed assignment ${params.assignmentId} has no durable worker result; no result was fabricated. Consultation requests and unsettled receipts are not results.`, {
-              ...row, resultAvailable: false,
-            }, true);
-          }
-          const bytes = await readManagedAttemptArtifact(ctx.cwd, params.assignmentId, receipt.payload.artifactHash);
-          if (!bytes) throw new Error("managed mission result artifact is unavailable");
-          return textResult(`${row.advisory ? "Advisory child synthesis; not unit acceptance:\n" : ""}${bytes.toString("utf8").slice(0, 8000)}`, {
-            ...row, resultAvailable: true,
-          }, row.status !== "completed");
-        }
-        const activeManaged = await inspectManagedMission(ctx.cwd);
-        if (activeManaged) throw new Error(`unknown managed assignment ${params.assignmentId} in mission ${activeManaged.id}; legacy Team results are not consulted`);
         const evaluation = evaluationFor(ctx);
         if (!evaluation) throw new Error("Team requires a foreground session identity");
         const assignment = findAssignment(evaluation, params.assignmentId);
@@ -357,19 +323,6 @@ function registerTeamTools(pi: ExtensionAPI): void {
     parameters: Type.Object({ assignmentId: Type.String() }, noExtra),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       try {
-        const managed = await inspectManagedAttempt(ctx.cwd, params.assignmentId);
-        if (managed) {
-          if (!cancelManagedAttempt(managed.id, params.assignmentId)) throw new Error(`managed assignment ${params.assignmentId} is not live in this process; cancellation cannot be confirmed`);
-          const status = managedAttemptRows(managed, params.assignmentId)[0]?.status;
-          const yielded = ["waiting-child", "child-complete-awaiting-continuation", "continued"].includes(status ?? "");
-          return textResult(yielded
-            ? `Managed consultation ${params.assignmentId} cancelled through its live owner; child and continuation fenced. Uncertain effects still need reconciliation.`
-            : `Cancellation requested for managed assignment ${params.assignmentId}; await its durable receipt before treating it as settled.`, {
-            missionId: managed.id, assignmentId: params.assignmentId, status: yielded ? "cancelled" : "cancellation-requested",
-          });
-        }
-        const activeManaged = await inspectManagedMission(ctx.cwd);
-        if (activeManaged) throw new Error(`legacy team_cancel cannot target unknown assignment ${params.assignmentId} while mission ${activeManaged.id} owns the repository`);
         const evaluation = evaluationFor(ctx);
         if (!evaluation) throw new Error("Team requires a foreground session identity");
         const assignment = findAssignment(evaluation, params.assignmentId);
@@ -518,11 +471,9 @@ function registerBackgroundTools(pi: ExtensionAPI): void {
       const blocked = childBlocked("agent_spawn");
       if (blocked) return blocked;
       try {
-        await authorizeRoleDispatch(ctx.cwd, { planId: params.plan });
         const watch = interestFrom(params.plan, params.unit);
         const execution = watch ? watchedExecutionBinding(watch.planId, ctx.cwd) : undefined;
         const launchRoot = execution?.executionRoot ?? ctx.cwd;
-        await authorizeRoleDispatch(launchRoot, { planId: params.plan });
         const handle = await spawnBackground({
           roleId: params.role,
           task: params.task,

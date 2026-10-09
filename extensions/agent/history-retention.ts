@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, realpathSync, readlinkSync, rmdirSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import type { HistoryGroup, WorkerHistory } from "./history.ts";
-import { projectManagedHistory } from "./managed-mission.ts";
 import { nativeHeader } from "./history-native.ts";
 
 /** Cooperative, fail-closed exclusion. An abandoned lock is never reclaimed by PID inference. */
@@ -38,13 +37,7 @@ function ownedFiles(history: WorkerHistory, group: HistoryGroup): NonNullable<Hi
   for (const member of group.members) {
     if (member.native.state !== "allocated") continue;
     const native = member.native;
-    const root = group.identity.kind === "mission"
-      ? canonicalDirectory(group.missionStore!.sessionsDirectory)
-      : canonicalDirectory(path.join(history.agentDir, "sessions", `--pitako-workers--${group.groupId}`));
-    const directory = group.identity.kind === "mission"
-      ? path.join(root, group.identity.missionId, native.sessionId) : root;
-    canonicalDirectory(directory);
-    if (group.identity.kind === "mission" && native.sessionId !== member.attemptId) throw new Error("managed native identity mismatch");
+    const directory = canonicalDirectory(path.join(history.agentDir, "sessions", `--pitako-workers--${group.groupId}`));
     if (path.dirname(native.path) !== directory ||
       !(path.basename(native.path) === `${native.sessionId}.jsonl` || path.basename(native.path).endsWith(`_${native.sessionId}.jsonl`)))
       throw new Error("native file outside registered ownership");
@@ -75,6 +68,7 @@ function validateAlias(file: string, target: string): void {
 }
 
 async function closure(group: HistoryGroup) {
+  if (group.identity.kind === "mission") return { reason: "archived/catalog-only; current closure unknown" };
   if (group.prunedAt) return { reason: "already pruned" };
   if (group.coverage !== "complete") return { reason: "membership coverage is partial" };
   if (!group.members.length) return { reason: "no demonstrated member lifecycle" };
@@ -82,7 +76,7 @@ async function closure(group: HistoryGroup) {
   if (group.members.some((member) => !member.terminal ||
     member.native.state === "allocated" && member.native.disposition.state !== "disposed"))
     return { reason: "terminal lifecycle or SDK disposal unconfirmed" };
-  const observed = group.identity.kind === "mission" ? (await projectManagedHistory(group)).closure : group.closure;
+  const observed = group.closure;
   if (observed.state !== "closed") return { reason: observed.state === "unknown" ? observed.reason : "group is not closed" };
   const dates = [observed.closedAt, ...group.members.flatMap((member) => [
     member.terminal!.at, ...(member.native.state === "allocated" && member.native.disposition.state === "disposed" ? [member.native.disposition.at] : []),
@@ -146,7 +140,7 @@ export async function pruneWorkerHistory(history: WorkerHistory, ttlDays: number
           result.groups.push({ groupId, state: "busy", reason: "history exclusion is held or uncertain" }); continue;
         }
         // This is rejection only, not deletion authority. A closed invocation cannot reopen;
-        // terminal managed authority prohibits live dispatch. Refresh both again under exclusion.
+        // refresh ordinary closure again under exclusion.
         const observed = await closure(history.read(groupId));
         if (!observed.closedAt || now - Date.parse(observed.closedAt) < ttlDays * DAY) {
           result.groups.push({ groupId, state: "protected", reason: observed.reason ?? "TTL not elapsed" }); continue;

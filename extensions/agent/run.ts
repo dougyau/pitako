@@ -8,8 +8,7 @@ import { formatAgentLive } from "./present.ts";
 import { agentScope } from "./scope.ts";
 import type { AgentUiSnapshot } from "./ui.ts";
 import { codeIntelligenceDelta, formatCodeIntelligenceUsage, mergeCodeIntelligenceUsage, type CodeIntelligenceUsage } from "../code-intelligence/metrics.ts";
-import type { MissionEffects } from "../mission/effects.ts";
-import { InvocationHistory, type HistoryOrigin, type HistoryAdmission } from "./history.ts";
+import { InvocationHistory, type HistoryOrigin } from "./history.ts";
 import {
   activityKind,
   createActivity,
@@ -135,36 +134,6 @@ export interface AttemptSession {
   dispose(): Promise<void>;
 }
 
-export type ProviderAdmissionTicket = import("../mission/resources.ts").MeteredTicket |
-  { kind: "capped"; tokenReservationId: string };
-
-export interface ProviderRequestReceipt {
-  requestId: string;
-  provider: string;
-  model: string;
-  inputTokens: number | null;
-  outputTokens: number | null;
-  estimatedCost?: number | null;
-  pricingBasis?: string;
-  usageUnknownReason?: string;
-  ticket?: ProviderAdmissionTicket;
-}
-
-export interface DurableAttemptContext {
-  attemptId: string;
-  sessionDir: string;
-  sessionId: string;
-  readOnly: boolean;
-  history?: { groupId: string; admission: HistoryAdmission };
-  cwd?: string;
-  effects?: MissionEffects;
-  signal?: AbortSignal;
-  rolePolicy: { primary: ModelTarget; fallbacks: readonly ModelTarget[] };
-  onProviderDispatch: (request: { requestId: string; provider: string; model: string }) => Promise<ProviderAdmissionTicket> | ProviderAdmissionTicket;
-  onProviderReceipt: (receipt: ProviderRequestReceipt) => Promise<void> | void;
-  onOutcome?: (result: AgentRunResult) => void;
-}
-
 export interface AttemptExecutor {
   capturesHistory?: boolean;
   start(input: {
@@ -175,7 +144,6 @@ export interface AttemptExecutor {
     cwd: string;
     signal: AbortSignal;
     history?: InvocationHistory;
-    durable?: DurableAttemptContext;
     onActivity?: (event: ActivityEvent) => void;
     /** Fired only after setModel / session open succeeds. Not a second lifecycle. */
     onActivated?: (appliedReasoning: string) => void;
@@ -197,7 +165,6 @@ async function runAttempt(
     target: ModelTarget;
     cwd: string;
     signal: AbortSignal;
-    durable?: DurableAttemptContext;
     history?: InvocationHistory;
     onActivity?: (event: ActivityEvent) => void;
     onActivated?: (appliedReasoning: string) => void;
@@ -277,23 +244,15 @@ export async function runAgentInstance(input: {
   onObserve?: (snapshot: AgentUiSnapshot) => void;
   /** Synchronous accept hook. Runs before watchdog setup and the first await. */
   onAccepted?: (instance: AgentInstance) => void;
-  /** Engine-owned context. Omitted for unchanged ad hoc execution. */
-  durable?: DurableAttemptContext;
 }): Promise<AgentRunResult> {
-  const task = input.durable ? input.task : input.task.trim();
+  const task = input.task.trim();
   if (task.trim().length === 0) throw new PitakoConfigError("agent_run task must not be empty");
   const workspace = currentWorkspace(input.cwd);
   if (input.executionRoot !== undefined && workspace !== input.executionRoot) {
     throw new PitakoConfigError(`AgentInstance workspace drift: expected ${input.executionRoot}, got ${workspace}`);
   }
   const loaded = loadPitakoConfig(input.load);
-  let role = resolveRoleFromConfig(loaded, input.roleId);
-  if (input.durable) {
-    role = {
-      ...role,
-      modelPolicy: { id: role.modelPolicyId, primary: input.durable.rolePolicy.primary, fallbacks: input.durable.rolePolicy.fallbacks },
-    };
-  }
+  const role = resolveRoleFromConfig(loaded, input.roleId);
   if (!role.modelPolicy.primary) {
     throw new PitakoConfigError(role.modelPolicy.diagnostic ?? `model policy "${role.modelPolicyId}" has no primary target`);
   }
@@ -313,7 +272,7 @@ export async function runAgentInstance(input: {
     createdAt: new Date().toISOString(),
   };
   input.onAccepted?.(instance);
-  const history = input.executor.capturesHistory && !input.durable
+  const history = input.executor.capturesHistory
     ? new InvocationHistory(instance.cwd, input.historyOrigin, input.task) : undefined;
   const now = input.now ?? Date.now;
   const acceptedAt = now();
@@ -429,11 +388,9 @@ export async function runAgentInstance(input: {
         (at) => {
           terminalAt = at;
         },
-        input.durable,
         history,
       ),
     );
-    input.durable?.onOutcome?.(result);
     if (history && !history.admitted) history.admit(instance.id, role.id, targets[0]!).result({
       status: result.status, result: result.result,
       error: result.status === "failed" ? result.result : undefined, sideEffects: false,
@@ -465,7 +422,6 @@ async function executeTargets(
   throughput: ThroughputState,
   work: WorkCounts,
   markTerminal: (at: number) => void,
-  durable?: DurableAttemptContext,
   history?: InvocationHistory,
 ): Promise<AgentRunResult> {
   instance.status = "running";
@@ -510,7 +466,6 @@ async function executeTargets(
         onActivity,
         onActivated,
         bindActivityProbe,
-        durable,
         history,
       });
       bindActivityProbe(undefined);

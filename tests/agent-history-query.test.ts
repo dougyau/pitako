@@ -1,7 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, truncateSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { spawnSync } from "node:child_process";
 import path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import agentInstance from "../extensions/agent/index.ts";
@@ -9,6 +8,7 @@ import pitako from "../extensions/index.ts";
 import { WorkerHistory } from "../extensions/agent/history.ts";
 import { agentScope } from "../extensions/agent/scope.ts";
 import type { HistoryPage, HistoryQuery } from "../extensions/agent/history-query.ts";
+import { pruneWorkerHistory } from "../extensions/agent/history-retention.ts";
 import { childActiveTools, toolsForProfile } from "../extensions/profile.ts";
 
 const roots: string[] = [];
@@ -62,13 +62,83 @@ function fixture(coordinator = "current") {
 }
 function codes(page: HistoryPage) { return page.diagnostics.map((row) => row.code); }
 
-test("registered queries consult cold and committed WAL authority through Bun without logical mutation", () => {
-  const result = spawnSync(process.execPath, ["scripts/agent-history-query-node.mjs", "--authority-only"], {
-    cwd: path.resolve(import.meta.dir, ".."), encoding: "utf8", timeout: 30000,
-  });
-  expect(result.status, result.stderr).toBe(0);
-  expect(JSON.parse(result.stdout.trim()).logicalAndMainBytesUnchanged).toBe(true);
-}, 40000);
+test("managed archives are recorded-only, immutable and protected with compatible physical continuation", async () => {
+  const { root, history, group, member, file } = fixture();
+  writeFileSync(file, '{"type":"session","id":"native-id"}\n' +
+    '{"type":"message","message":{"role":"user","content":"' + "x".repeat(40000) + '"}}\n');
+  const physical = Buffer.from(readFileSync(file));
+  const api = adapters();
+  const firstRead = await api.query({ action: "read", historyId: member.historyId, limit: 1 });
+  expect(firstRead.cursor).not.toBeNull();
+  const alias = path.join(root, "recorded-alias");
+  symlinkSync(path.dirname(file), alias);
+  const catalog = path.join(history.catalogDir, `${group.groupId}.json`);
+  const recorded = history.read(group.groupId);
+  recorded.identity = { kind: "mission", missionId: "old-managed-id", storeRoot: root };
+  // Deliberately not SQLite: querying this file as authority would fail.
+  const dbPath = path.join(root, "mission.db");
+  writeFileSync(dbPath, "unreadable legacy authority");
+  const preserved = [file, dbPath, `${dbPath}-wal`, `${dbPath}-shm`, `${file}.acp.json`,
+    path.join(root, "candidate"), path.join(root, "output"), path.join(root, "generated-ledger")];
+  for (const item of preserved.slice(2)) writeFileSync(item, `untouched ${item}`);
+  recorded.missionStore = { dbPath, objectDir: root, sessionsDirectory: root };
+  recorded.closure = { state: "closed", closedAt: "2000-01-01T00:00:00Z", evidenceRef: "old authority" };
+  recorded.aliases = [{ path: alias, target: root }];
+  recorded.members[0]!.attemptId = "old-attempt";
+  recorded.members.push({ ...recorded.members[0]!, historyId: "00000000-0000-4000-8000-000000000001",
+    native: { state: "pruned" } });
+  writeFileSync(catalog, JSON.stringify(recorded));
+  const closedBytes = readFileSync(catalog);
+  for (const dryRun of [true, false]) {
+    expect((await pruneWorkerHistory(history, 1, { dryRun })).groups[0]!.state).toBe("protected");
+    expect(readFileSync(catalog)).toEqual(closedBytes);
+    expect(readFileSync(file)).toEqual(physical);
+    expect(readlinkSync(alias)).toBe(root);
+  }
+  recorded.cleanup = { state: "deleting", owner: "old-owner", closedAt: "2000-01-01T00:00:00Z",
+    files: [{ path: file, kind: "file" }, { path: alias, kind: "alias", target: root }] };
+  writeFileSync(catalog, JSON.stringify(recorded));
+  const before = [catalog, ...preserved].map(item => readFileSync(item));
+  const listed = await api.query({ action: "list", missionId: "old-managed-id", limit: 1 });
+  expect(listed.items).toHaveLength(1);
+  expect(listed.items[0]).toMatchObject({ historyState: "deleting", group: {
+    archive: "archived/catalog-only", protected: true, closure: { state: "unknown" },
+    recordedCoverage: "complete", recordedClosure: recorded.closure,
+  } });
+  expect(listed.items[0]).not.toHaveProperty("group.coverage");
+  const legacy = JSON.parse(Buffer.from(listed.cursor!, "base64url").toString());
+  delete legacy.catalogOnly;
+  expect(codes(await api.query({ action: "list", missionId: "old-managed-id",
+    cursor: Buffer.from(JSON.stringify(legacy)).toString("base64url") }))).toContain("legacy_projection_cursor");
+  expect((await api.query({ action: "list", missionId: "old-managed-id", cursor: listed.cursor! })).items).toHaveLength(1);
+  expect((await api.query({ action: "list", missionId: "old-managed-id", attemptId: "db-only-attempt" })).items).toEqual([]);
+  const nextRead = await api.query({ action: "read", historyId: member.historyId, cursor: firstRead.cursor!, limit: 1 });
+  expect(codes(nextRead)).not.toContain("invalid_cursor");
+  expect(nextRead.items.length).toBeGreaterThan(0);
+  expect(await reconstruct(api, member.historyId)).toEqual(physical);
+  for (const mutate of [
+    () => history.mutate(group.groupId, () => { throw new Error("must not enter"); }),
+    () => history.admit(group.groupId, { roleId: "developer" }),
+    () => history.createSession(group.groupId, member.historyId, root),
+    () => history.closeInvocation(group.groupId),
+    // @ts-expect-error Runtime rejection also protects callers outside typed source.
+    () => history.createGroup(root, recorded.identity),
+  ]) expect(mutate).toThrow("archived worker history is catalog-only");
+  await expect(history.exclusive(group.groupId, async () => { throw new Error("must not enter"); }))
+    .rejects.toThrow("archived worker history is catalog-only");
+  for (const dryRun of [true, false]) {
+    const report = await pruneWorkerHistory(history, 1, { dryRun, now: Date.now() });
+    expect(report.groups[0]).toMatchObject({ state: "protected", reason: "archived/catalog-only; current closure unknown" });
+  }
+  expect([catalog, ...preserved].map(item => readFileSync(item))).toEqual(before);
+  expect(readlinkSync(alias)).toBe(root);
+  // Database absence remains irrelevant to bounded native catalog reads.
+  rmSync(dbPath);
+  expect(await reconstruct(api, member.historyId)).toEqual(physical);
+  expect(existsSync(dbPath)).toBe(false);
+  expect(readFileSync(catalog)).toEqual(before[0]);
+});
+
 async function reconstruct(api: ReturnType<typeof adapters>, historyId: string, limit = 50) {
   const chunks: Buffer[] = [];
   let cursor: string | undefined;

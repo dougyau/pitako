@@ -216,7 +216,6 @@ describe("plan and execute contracts", () => {
       "bun run typecheck",
       "bun test",
       "bun run test:code-intelligence-node",
-      "bun run test:mission-node",
     ];
     const routine = gates.split("## Run the complete routine procedure")[1]!.split("## Use stage-specific")[0]!;
     let previous = -1;
@@ -227,10 +226,10 @@ describe("plan and execute contracts", () => {
     }
     expect(routine).not.toContain("--concurrent");
     expect(routine).toContain("Do not add `bun run smoke` again by default");
-    expect(routine).toContain("without `MISSION_DURABILITY_PHASE` filtering");
+    expect(routine).not.toContain("test:mission-node");
     expect(gates).toContain("Setup success does not prove every gate prerequisite");
-    expect(gates).toContain("An omitted-command manifest is not success");
-    expect(gates).toContain("T1's filtered Node phases do not replace the unfiltered durability suite");
+    expect(gates).toContain("unrun checks separately from passes");
+    expect(gates).not.toContain("verify:mission");
   });
 
   test("execute prepares only a reconciled captured checkout before dependent work", () => {

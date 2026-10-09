@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -68,7 +68,11 @@ describe("agent instance", () => {
   test("pre-prompt capability routes complete targets without restart or continuation", async () => {
     const targets: ModelTarget[] = [{ model: "offline/primary", reasoning: "high", fast: false },
       { model: "offline/fallback", reasoning: "off", fast: true }];
-    const task = " \nexact reserved task\n ";
+    const task = "ordinary task";
+    const env = tempEnv();
+    const userConfigPath = path.join(env.PI_CODING_AGENT_DIR!, "pitako", "config.toml");
+    mkdirSync(path.dirname(userConfigPath), { recursive: true });
+    writeFileSync(userConfigPath, '[model_policies.developer]\nprimary = { model = "offline/primary", reasoning = "high", fast = false }\nfallbacks = [{ model = "offline/fallback", reasoning = "off", fast = true }]\n');
     let starts = 0, retries = 0, continuations = 0, disposals = 0;
     const session = {
       async retryBeforePrompt(target: ModelTarget) {
@@ -82,10 +86,7 @@ describe("agent instance", () => {
       async dispose() { disposals++; },
     };
     const result = await runAgentInstance({
-      roleId: "developer", cwd: process.cwd(), load: { env: tempEnv() }, task,
-      durable: { attemptId: "offline", sessionId: "offline", sessionDir: "/unused",
-        readOnly: true, onProviderDispatch() { throw new Error("must not dispatch"); }, onProviderReceipt() { throw new Error("must not receipt"); },
-        rolePolicy: { primary: targets[0]!, fallbacks: [targets[1]!] } },
+      roleId: "developer", cwd: process.cwd(), load: { env, userConfigPath }, task,
       executor: { async start(input) {
         starts++;
         expect(input.task).toBe(task);
@@ -94,7 +95,7 @@ describe("agent instance", () => {
           usage: { input: 1, output: 2 } };
       } },
     });
-    expect(result.status).toBe("completed");
+    expect(result.status, result.result).toBe("completed");
     expect(result.model).toMatchObject({ selectedModel: "offline/fallback", requestedReasoning: "off",
       fallbackOccurred: true, fallbackReason: "unavailable" });
     expect(result.usage).toMatchObject({ input: 4, output: 6 });
@@ -103,11 +104,12 @@ describe("agent instance", () => {
 
   test("watchdog terminal return still disposes newly returned attempt ownership", async () => {
     let clock = 0, tick: (() => void) | undefined, disposed = 0;
+    const env = tempEnv();
+    const userConfigPath = path.join(env.PI_CODING_AGENT_DIR!, "pitako", "config.toml");
+    mkdirSync(path.dirname(userConfigPath), { recursive: true });
+    writeFileSync(userConfigPath, '[model_policies.developer.primary]\nmodel = "offline/primary"\n');
     const result = await runAgentInstance({
-      roleId: "developer", cwd: process.cwd(), load: { env: tempEnv() }, task: "offline",
-      durable: { attemptId: "offline-watchdog", sessionId: "offline-watchdog", sessionDir: "/unused",
-        readOnly: true, onProviderDispatch() { throw new Error("must not dispatch"); }, onProviderReceipt() { throw new Error("must not receipt"); },
-        rolePolicy: { primary: { model: "offline/primary" }, fallbacks: [] } },
+      roleId: "developer", cwd: process.cwd(), load: { env, userConfigPath }, task: "offline",
       now: () => clock, watchdog: { idleTimeoutMs: 100, toolStallTimeoutMs: 100, maxRunTimeMs: 1 },
       schedule(fn) { tick = fn; return { unref() {} }; },
       executor: { async start() {

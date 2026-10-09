@@ -3,7 +3,6 @@ import { closeSync, lstatSync, openSync, opendirSync } from "node:fs";
 import path from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { HistoryGroup, HistoryMember } from "./history.ts";
-import { projectManagedHistory } from "./managed-mission.ts";
 import { catalogValues, checkJson, fileCut, HISTORY_BYTES, HISTORY_FRAGMENT, jsonState, validateCut, window, type FileCut, type JsonState } from "./history-native.ts";
 
 export type HistoryQuery =
@@ -16,7 +15,7 @@ export interface HistoryPage {
   cursor: string | null;
 }
 type Cursor = { version: 1; action: "list" | "read"; identity: string; groupId: string;
-  index: number; entryOffset?: number; cut: FileCut; json?: JsonState };
+  index: number; entryOffset?: number; cut: FileCut; json?: JsonState; catalogOnly?: true };
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const selectors = ["coordinatorSessionId", "missionId", "assignmentId", "instanceId", "roleId", "unitId", "attemptId"] as const;
 const encode = (cursor: Cursor) => Buffer.from(JSON.stringify(cursor)).toString("base64url");
@@ -136,44 +135,32 @@ async function list(query: Extract<HistoryQuery, { action: "list" }>, page: Hist
       let catalogCount = 0;
       for (const row of members(fd)) catalogCount = row.index + 1;
       const start = previous?.groupId === groupId ? previous.index : 0;
-      const legacyOffset = Math.max(0, start - catalogCount);
-      let legacyTotal = 0;
-      const catalogMembers = function* () { for (const row of members(fd)) yield row.member; };
-      let authority: Record<string, unknown> = { closure: group.closure, protected: group.closure.state !== "closed" };
-      if (group.identity.kind === "mission" && !group.prunedAt) {
-        const projected = await projectManagedHistory(group, { consultation: true, catalogMembers, legacyOffset });
-        authority = { closure: projected.closure, executionState: projected.executionState, protected: projected.protected,
-          reasons: projected.reasons };
-        // Legacy admissions are provided by the bounded projection alongside catalog membership.
-        group.members = projected.group.members;
-        group.coverage = projected.group.coverage;
-        legacyTotal = projected.legacyTotal ?? 0;
-      }
-      const current = (index: number): Cursor => ({ version: 1, action: "list", identity, groupId, cut, index });
+      if (previous?.groupId === groupId && group.identity.kind === "mission" && !previous.catalogOnly)
+        throw new Error("legacy_projection_cursor");
+      const authority = group.identity.kind === "mission"
+        ? { archive: "archived/catalog-only", closure: { state: "unknown", reason: "retired runtime; catalog provenance only" },
+            protected: true, recordedCoverage: group.coverage, recordedClosure: group.closure }
+        : { closure: group.closure, protected: group.closure.state !== "closed" };
+      const current = (index: number): Cursor => ({ version: 1, action: "list", identity, groupId, cut, index, catalogOnly: true });
       let last = start;
       const matchesEmpty = !selectors.filter((key) => key !== "missionId").some((key) => query[key] !== undefined) &&
         (!query.missionId || group.identity.kind === "mission" && group.identity.missionId === query.missionId);
-      if (!catalogCount && !legacyTotal && start === 0 && matchesEmpty) {
+      if (!catalogCount && start === 0 && matchesEmpty) {
         const item = { kind: "group", groupId, identity: group.identity, workspace: group.workspace,
-          coverage: group.coverage, ...authority, historyState: "no_member_record" };
+          ...(group.identity.kind === "mission" ? {} : { coverage: group.coverage }), ...authority, historyState: "no_member_record" };
         if (page.items.length >= limit || !add(page, item, current(1))) {
           if (!page.items.length) throw new Error("summary_limit");
           page.cursor = encode(current(0)); return;
         }
         last = 1;
       }
-      const all = function* () {
-        yield* members(fd);
-        let index = catalogCount + legacyOffset;
-        for (const member of group.members) yield { member, index: index++ };
-      };
-      for (const { member, index } of all()) {
+      for (const { member, index } of members(fd)) {
         if (index < start) continue;
         last = index;
         if (!matches(query, group, member)) continue;
         const item = { ...summary(group, member), ...(group.prunedAt ? { historyState: "pruned" } : group.cleanup ? { historyState: "deleting" } : {}),
           group: { groupId, identity: group.identity, workspace: group.workspace,
-          coverage: group.coverage, ...authority } };
+          ...(group.identity.kind === "mission" ? {} : { coverage: group.coverage }), ...authority } };
         if (page.items.length >= limit || !add(page, item, current(index + 1))) {
           // A single summary that cannot fit is explicit, not an endless cursor.
           if (!page.items.length)
@@ -183,9 +170,6 @@ async function list(query: Extract<HistoryQuery, { action: "list" }>, page: Hist
         last = index + 1;
       }
       validateCut(fd, cut);
-      if (legacyOffset + group.members.length < legacyTotal) {
-        page.cursor = encode(current(Math.max(last, catalogCount + legacyOffset + group.members.length))); return;
-      }
       if (++scans >= 200) {
         page.diagnostics.push({ code: "catalog_scan_limit" });
         page.cursor = encode(current(last)); return;
@@ -212,12 +196,6 @@ async function locate(directory: string, historyId: string, selectedGroup?: stri
     try {
       const group = metadata(fd, groupId);
       for (const { member } of members(fd)) if (member.historyId === historyId) return { member, groupId, deleting: Boolean(group.cleanup) };
-      if (group.identity.kind === "mission" && !group.prunedAt) {
-        const catalogMembers = function* () { for (const row of members(fd)) yield row.member; };
-        const projected = await projectManagedHistory(group, { consultation: true, historyId, catalogMembers });
-        const member = projected.group.members.find((row) => row.historyId === historyId);
-        if (member) return { member, groupId };
-      }
     } finally { closeSync(fd); }
   }
   return undefined;

@@ -1,7 +1,8 @@
 # Worker history
 
 Worker history records admitted SDK AgentInstances, including background and Team
-workers, durable attempts, and durable diagnosis sessions. The native Pi JSONL is
+workers. Historical managed attempts and diagnosis sessions remain readable as
+protected, catalog-only archives. The native Pi JSONL is
 the transcript authority. The host catalog records identities, lifecycle evidence,
 known capture gaps, and exact cleanup ownership. Neither Hermes search results nor
 worker text establish execution closure.
@@ -44,13 +45,13 @@ unreadable records, missing files, and incomplete deletion.
 
 History consultation and maintenance are foreground-only. Child role tools do
 not grant `agent_history`, and `/pitako history` rejects child callers.
-The history commands do not grant source-write or mission-control authority.
+The history commands do not grant source-write or retired mission-control authority.
 
 ## Persistence and gaps
 
 Catalogs live in `<agentDir>/pitako/worker-history`. Ad-hoc native sessions live
-in shallow directories under `<agentDir>/sessions`. Durable native sessions keep
-their private canonical directories. Their catalog stores the canonical path.
+in shallow directories under `<agentDir>/sessions`. Archived native sessions keep
+their recorded private canonical directories. Their catalog stores the canonical path.
 History list and read recover those records without Hermes, including after
 restart or when Hermes excludes a session from indexing.
 
@@ -87,9 +88,9 @@ TTL starts at authoritative group closure, not at the last transcript write.
 Maintenance protects active, paused, interrupted, unknown, and uncertain groups.
 Standalone invocations close only after host settlement and observed disposal.
 Execution-bound groups remain protected: there is currently no durable execution
-closure proof used by retention. Durable groups use fresh mission authority and
-admission checks. Missing or unreadable authority protects history rather than
-treating the group as closed.
+closure proof used by retention. Archived managed groups are always protected, even if recorded as closed or with
+interrupted cleanup. Recorded coverage and closure are historical evidence only;
+current closure is unknown. No cleanup is resumed and no aliases are removed.
 
 Deletion covers only validated owned native JSONL files, their known ACP
 sidecars, and registered exact-target discovery aliases. It does not delete
@@ -106,12 +107,10 @@ retention, not protection against a hostile process with the same user identity.
 
 ## Hermes secondary discovery
 
-Pitako bundles unmodified `pi-hermes-memory` 0.9.9. Durable session allocation
-registers one owned directory symlink per canonical native directory beneath
-`<agentDir>/sessions`, including diagnosis sessions. The link exposes that exact
-directory to Hermes's shallow ordinary backfill. No transcript is copied or
-moved, and no recursive transcript search is added. Native read and cleanup use
-canonical paths, not these links.
+Pitako bundles unmodified `pi-hermes-memory` 0.9.9. Ordinary producers use standard
+native directories. Historical exact-target directory aliases remain untouched;
+no new managed aliases are created. Native reads use recorded canonical paths,
+not these links.
 
 Ordinary Hermes startup backfill discovers the standard `<agentDir>/sessions`
 directories. Its public `session_search` tool searches the independent secondary
@@ -141,4 +140,13 @@ tool results, model output, and paths. Restrictive permissions and retention do
 not redact that content. Existing telemetry redaction does not promise transcript
 redaction. Hermes's omission of tool results does not make its index free of
 sensitive text, and native pruning does not purge Hermes's independent index.
+
+Archived groups expose only recorded catalog members. Mission SQLite is never
+opened or inspected: missing or unavailable databases do not block physical reads.
+DB-only projected members are no longer discoverable; preserved bytes do not imply
+complete catalog coverage. New archive mutation is rejected. Legacy projection-bearing
+list cursors are rejected; identity-valid bounded physical read cursors still continue.
+Old databases, sidecars, objects, outputs, ACP, aliases, and generated ledgers are
+not migrated, recovered, or normalized.
+
 This feature adds no privacy system or cross-store deletion guarantee.

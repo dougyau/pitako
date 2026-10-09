@@ -13,7 +13,6 @@
     "extensions",
     "skills",
     "prompts",
-    "scripts/mission-console.ts",
     "config",
     "roles",
     "fixtures",
@@ -26,8 +25,6 @@
   "scripts": {
     "test": "bun test",
     "test:code-intelligence-node": "node --test scripts/code-intelligence-node.mjs",
-    "test:mission-node": "node --test scripts/mission-durability-node.mjs",
-    "verify:mission": "bun scripts/verify-mission.ts",
     "smoke": "bun scripts/smoke.ts",
     "pi": "pi --no-extensions --approve -e .",
     "typecheck": "tsc --noEmit"
