@@ -3,7 +3,7 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symli
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
-import { initLedger, ledgerFile, ledgerTeamHolds, ledgerTemplate, openExecutionPlan, parseLedgerBinding, parseLedgerStatus, planFile, planHash, readFrozenPlan, resolveFrozenPlanBinding, verifyExecutionBinding } from "../extensions/workflow.ts";
+import { initLedger, ledgerFile, ledgerTeamHolds, ledgerTemplate, openExecutionPlan, parseLedgerBinding, parseLedgerStatus, planFile, planHash, readFrozenPlan, verifyExecutionBinding } from "../extensions/workflow.ts";
 import { runAgentInstance } from "../extensions/agent/run.ts";
 
 const tempDirs: string[] = [];
@@ -53,44 +53,6 @@ function child(command: string, args: string[]): Promise<{ code: number | null; 
 }
 
 describe("frozen execution binding", () => {
-  test("mission discovery resolves a sibling pin without creating or normalizing ledgers", () => {
-    const base = tempDir();
-    const source = path.join(base, "source");
-    const execution = path.join(base, "execution");
-    initRepo(source);
-    addWorktree(source, execution, "execution");
-    const sourceFile = writePlan(source);
-    const found = resolveFrozenPlanBinding("execution-plan", execution);
-    expect(found.binding).toEqual({ planId: "execution-plan", revision: 1,
-      hash: planHash(readFileSync(sourceFile, "utf8")), executionRoot: execution, planSource: sourceFile });
-    expect(existsSync(ledgerFile("execution-plan", execution))).toBe(false);
-    const legacy = `${ledgerTemplate(found.meta)}\nlegacy evidence remains\n`;
-    for (const root of [source, execution]) {
-      mkdirSync(path.dirname(ledgerFile("execution-plan", root)), { recursive: true });
-      writeFileSync(ledgerFile("execution-plan", root), legacy);
-    }
-    expect(resolveFrozenPlanBinding("execution-plan", execution)).toEqual(found);
-    for (const root of [source, execution])
-      expect(readFileSync(ledgerFile("execution-plan", root), "utf8")).toBe(legacy);
-    writePlan(execution, "execution-plan", "non-authoritative local shadow");
-    expect(verifyExecutionBinding(found.binding).file).toBe(sourceFile);
-    writePlan(source, "execution-plan", "changed actual pin");
-    expect(() => verifyExecutionBinding(found.binding)).toThrow(/hash does not match/);
-  });
-
-  test("mission discovery refuses a bad local candidate rather than adopting a valid sibling", () => {
-    const base = tempDir();
-    const source = path.join(base, "source");
-    const execution = path.join(base, "execution");
-    initRepo(source);
-    addWorktree(source, execution, "execution");
-    writePlan(source);
-    const local = writePlan(execution);
-    writeFileSync(local, readFileSync(local, "utf8").replace("status: frozen", "status: draft"));
-    expect(() => resolveFrozenPlanBinding("execution-plan", execution)).toThrow(/not frozen/);
-    expect(existsSync(ledgerFile("execution-plan", execution))).toBe(false);
-  });
-
   test("pins source and physical execution root using path-safe ledger fields", () => {
     const base = tempDir();
     const source = path.join(base, "source");

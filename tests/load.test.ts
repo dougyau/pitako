@@ -163,6 +163,12 @@ describe("Pi package loading", () => {
     for (const file of paths) expect(file.startsWith(root)).toBe(true);
 
     const names = registeredToolNames(loaded.extensions);
+    expect(names.filter((name) => name.startsWith("mission_"))).toEqual([]);
+    const commands = loaded.extensions.extensions.flatMap((extension) => [...extension.commands.keys()]);
+    expect(commands).not.toContain("mission");
+    for (const name of ["agent_run", "agent_spawn", "agent_history", "team_assign", "team_status", "team_result",
+      "board_workflow_claim", "board_workflow_lifecycle"]) expect(names).toContain(name);
+    expect(commands).toContain("pitako");
     expect(names).toContain("apply_patch");
     for (const name of ["lsp_diagnostics", "lsp_goto_definition", "lsp_find_references", "lsp_symbols", "lsp_prepare_rename", "lsp_rename"]) {
       expect(names).toContain(name);

@@ -1,9 +1,8 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import { spawnSync, type SpawnSyncReturns } from "node:child_process";
+import type { SpawnSyncReturns } from "node:child_process";
 import * as fs from "node:fs";
-import { chmodSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { InvocationHistory, WorkerHistory, nativeHistoryStatus } from "../extensions/agent/history.ts";
@@ -134,29 +133,6 @@ test("history ownership finalizer retains uncertainty and guards teardown/next-c
   expect(stops.every((code) => code === 1)).toBe(true);
 });
 
-test("public Node setup rejection records the original error before and after persisted discovery intent", () => {
-  const child = spawnSync("node", ["--experimental-transform-types", "--import", "./scripts/sdk-node-loader.mjs",
-    "scripts/agent-history-hermes-node.mjs", "--setup-rejection"],
-  { cwd: path.resolve(import.meta.dir, ".."), encoding: "utf8", timeout: 30000, env: { ...process.env, PI_OFFLINE: "1" } });
-  expect(child.status, child.stderr + child.stdout).toBe(0);
-  const result = JSON.parse(child.stdout);
-  expect(result.observations.map((row: { boundary: string }) => row.boundary))
-    .toEqual(["unsafe-root", "foreign-alias", "persisted-intent", "inherited-pending"]);
-});
-
-test("managed no-side-effect fallback preserves actual SDK disposal on a fresh no-association start", () => {
-  const owner = acquireHistoryFixture((acquired) => { historyOwner = acquired; });
-  let outcome: HistoryNativeOutcome;
-  try {
-    outcome = { kind: "returned", result: spawnSync(owner.command.executable, owner.command.arguments,
-      { cwd: path.resolve(import.meta.dir, ".."), encoding: "utf8", timeout: 30000, killSignal: "SIGKILL",
-        env: { ...process.env, PI_OFFLINE: "1", TMPDIR: owner.temporaryDirectory } }) };
-  } catch (error) { outcome = { kind: "threw", error }; }
-  finishHistoryFixture(owner, outcome, (child) => {
-    expect(child.status, child.stderr + child.stdout).toBe(0);
-  });
-}, 35000);
-
 const roots: string[] = [];
 afterEach(() => {
   requireReleasedHistoryFixture(historyOwner);
@@ -222,8 +198,6 @@ test("preparation fails closed, leaves admission, and does not overwrite an allo
 
 test("group references canonical authorities and rejects invalid locators and uncertain locks", () => {
   const { root, workspace, history, group } = fixture();
-  expect(history.createGroup(workspace, { kind: "mission", storeRoot: root, missionId: "mission" }).identity)
-    .toEqual({ kind: "mission", storeRoot: root, missionId: "mission" });
   expect(history.createGroup(workspace, { kind: "execution", executionRoot: root, executionRef: "execution" }).identity)
     .toEqual({ kind: "execution", executionRoot: root, executionRef: "execution" });
   expect(() => history.read("../other")).toThrow();
@@ -238,6 +212,34 @@ test("group references canonical authorities and rejects invalid locators and un
   expect(() => history.admit(independent.groupId, { roleId: "developer" })).toThrow();
   writeFileSync(file, JSON.stringify({ ...independent, version: 2 }));
   expect(() => history.read(independent.groupId)).toThrow("unsupported or invalid");
+});
+
+test("recorded historical aliases remain native-readable without managed production", () => {
+  const { root, workspace, history, group, member } = fixture();
+  const directory = path.join(root, "historical-sessions");
+  mkdirSync(directory);
+  const manager = SessionManager.create(workspace, directory);
+  manager.appendMessage({ role: "user", content: "historical alias input", timestamp: Date.now() });
+  const alias = path.join(history.agentDir, "sessions", "recorded-discovery-alias");
+  mkdirSync(path.dirname(alias), { recursive: true });
+  symlinkSync(directory, alias);
+  const catalog = path.join(history.catalogDir, `${group.groupId}.json`);
+  const recorded = history.read(group.groupId);
+  recorded.identity = { kind: "mission", storeRoot: root, missionId: "historical" };
+  recorded.missionStore = { dbPath: path.join(root, "absent-mission.db"), objectDir: root, sessionsDirectory: directory };
+  recorded.aliases = [{ path: alias, target: directory }];
+  recorded.members[0]!.native = { state: "allocated", sessionId: manager.getSessionId(),
+    path: path.join(alias, path.basename(manager.getSessionFile()!)), disposition: { state: "disposed", at: "historical" } };
+  writeFileSync(catalog, JSON.stringify(recorded));
+  const before = readFileSync(catalog);
+  const recovered = new WorkerHistory(history.agentDir).read(group.groupId);
+  expect(recovered.aliases).toEqual(recorded.aliases);
+  expect(recovered.members[0]!.historyId).toBe(member.historyId);
+  expect(nativeHistoryStatus(recovered.members[0]!)).toMatchObject({ state: "present" });
+  expect(SessionManager.open(recovered.members[0]!.native.state === "allocated"
+    ? recovered.members[0]!.native.path : "").getEntries()).toEqual(manager.getEntries());
+  expect(readFileSync(catalog)).toEqual(before);
+  expect(existsSync(recorded.missionStore.dbPath)).toBe(false);
 });
 
 test("execution grouping is shared by authoritative root/ref while independent invocations stay separate", () => {
@@ -279,61 +281,4 @@ test("a live handle can continue despite an attempt without a handle; terminal r
     if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previous;
   }
-});
-
-test("durable and diagnosis aliases are registered exact-target discovery only; no forced native write", () => {
-  const sample = fixture();
-  const sessionsDirectory = path.join(sample.root, "private-sessions");
-  const dbPath = path.join(sample.root, "mission.db");
-  writeFileSync(dbPath, "locator");
-  const group = sample.history.missionGroup(sample.workspace, "mission", { dbPath, objectDir: sample.root, sessionsDirectory }, false);
-  for (const diagnosis of [false, true]) {
-    const id = randomUUID();
-    const member = sample.history.admit(group.groupId, { roleId: diagnosis ? "architect" : "developer",
-      attemptId: id, ...(diagnosis ? { diagnosisId: id, diagnosisOf: "prior" } : {}) });
-    const directory = path.join(sessionsDirectory, "mission", id);
-    mkdirSync(directory, { recursive: true });
-    const manager = SessionManager.create(sample.workspace, directory, { id });
-    sample.history.associateSession(group.groupId, member.historyId, manager);
-    const saved = sample.history.read(group.groupId);
-    const alias = saved.aliases!.at(-1)!;
-    expect(path.dirname(alias.path)).toBe(path.join(sample.history.agentDir, "sessions"));
-    expect(readlinkSync(alias.path)).toBe(directory);
-    expect(alias.target).toBe(directory);
-    expect(saved.members.at(-1)!.native).toMatchObject({ path: manager.getSessionFile() });
-    expect(statSync(directory).mode & 0o777).toBe(0o700);
-    expect(existsSync(manager.getSessionFile()!)).toBe(false);
-    sample.history.associateSession(group.groupId, member.historyId, manager);
-    expect(sample.history.read(group.groupId).aliases).toHaveLength(diagnosis ? 2 : 1);
-    rmSync(alias.path);
-    symlinkSync(sample.workspace, alias.path);
-    expect(() => sample.history.associateSession(group.groupId, member.historyId, manager)).toThrow("unsafe worker discovery alias");
-    expect(readlinkSync(alias.path)).toBe(sample.workspace);
-  }
-});
-
-test("an unregistered alias collision is not adopted; sealed or busy groups cannot create discovery", () => {
-  const sample = fixture();
-  const dbPath = path.join(sample.root, "mission.db"); writeFileSync(dbPath, "locator");
-  const sessionsDirectory = path.join(sample.root, "private-sessions");
-  const group = sample.history.missionGroup(sample.workspace, "mission", { dbPath, objectDir: sample.root, sessionsDirectory }, false);
-  const id = randomUUID();
-  const member = sample.history.admit(group.groupId, { roleId: "developer", attemptId: id });
-  const directory = path.join(sessionsDirectory, "mission", id); mkdirSync(directory, { recursive: true });
-  const manager = SessionManager.create(sample.workspace, directory, { id });
-  const alias = path.join(sample.history.agentDir, "sessions", `--pitako-workers--${group.groupId}-${id}`);
-  mkdirSync(path.dirname(alias), { recursive: true });
-  symlinkSync(directory, alias);
-  expect(() => sample.history.associateSession(group.groupId, member.historyId, manager)).toThrow("unsafe worker discovery alias");
-  expect(sample.history.read(group.groupId).aliases).toBeUndefined();
-  expect(sample.history.read(group.groupId).members[0]!.native.state).toBe("not-created");
-  expect(lstatSync(alias).isSymbolicLink()).toBe(true);
-  rmSync(alias);
-  const lock = path.join(sample.history.catalogDir, `${group.groupId}.json.lock`); mkdirSync(lock);
-  expect(() => sample.history.associateSession(group.groupId, member.historyId, manager)).toThrow();
-  expect(existsSync(alias)).toBe(false);
-  rmSync(lock, { recursive: true });
-  sample.history.mutate(group.groupId, (saved) => { saved.closure = { state: "closed", closedAt: "now", evidenceRef: "fixture" }; });
-  expect(() => sample.history.associateSession(group.groupId, member.historyId, manager)).toThrow("sealed");
-  expect(existsSync(alias)).toBe(false);
 });

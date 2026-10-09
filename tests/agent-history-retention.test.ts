@@ -142,15 +142,14 @@ test("closed preassistant failure is eligible; uncreated native stays distinct f
   expect((await queryHistory({ action: "read", historyId: member.historyId })).diagnostics[0]!.code).toBe("native_not_created");
 });
 
-test("maintenance first yields to live admission and association without changing native bytes", async () => {
+test("maintenance first yields to live admission and allocation without changing native bytes", async () => {
   const sample = fixture();
   sample.history.mutate(sample.group.groupId, (saved) => { saved.closure = { state: "unclosed" }; });
   const before = readFileSync(sample.file);
   // Starting production prune reaches its first await before these synchronous catalog mutations.
   const maintenance = pruneWorkerHistory(sample.history, 180, { now: later });
   const member = sample.history.admit(sample.group.groupId, { roleId: "reviewer", instanceId: "live-worker" });
-  const manager = SessionManager.create(sample.root, path.dirname(sample.file));
-  sample.history.associateSession(sample.group.groupId, member.historyId, manager);
+  const manager = sample.history.createSession(sample.group.groupId, member.historyId, sample.root);
   const report = await maintenance;
   expect(report.groups[0]!.state).toBe("protected");
   const saved = sample.history.read(sample.group.groupId);

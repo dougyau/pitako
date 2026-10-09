@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { getAgentDir, SessionManager } from "@earendil-works/pi-coding-agent";
 import type { Attempt } from "./run.ts";
@@ -21,7 +21,7 @@ export type HistoryClosure =
   | { state: "unknown"; reason: string }
   | { state: "closed"; closedAt: string; evidenceRef: string };
 
-/** Grouping references come from the host's execution/mission authorities, not tool paths. */
+/** New groups use host invocation/execution authority; mission identities remain archive provenance. */
 export type HistoryIdentity =
   | { kind: "invocation"; invocationId: string }
   | { kind: "execution"; executionRoot: string; executionRef: string }
@@ -161,6 +161,7 @@ export class WorkerHistory {
   }
 
   private write(group: HistoryGroup): void {
+    if (group.identity.kind === "mission") throw new Error("archived worker history is catalog-only");
     const destination = this.file(group.groupId);
     const temporary = `${destination}.${randomUUID()}.tmp`;
     try {
@@ -172,9 +173,11 @@ export class WorkerHistory {
   }
 
   mutate<T>(groupId: string, action: (group: HistoryGroup) => T): T {
+    if (this.read(groupId).identity.kind === "mission") throw new Error("archived worker history is catalog-only");
     const release = acquireHistoryExclusion(this.file(groupId));
     try {
       const group = this.read(groupId);
+      if (group.identity.kind === "mission") throw new Error("archived worker history is catalog-only");
       if (group.cleanup || group.prunedAt) throw new Error("worker history group is sealed");
       const result = action(group);
       this.write(group);
@@ -186,15 +189,17 @@ export class WorkerHistory {
 
   /** Async authority refresh and cleanup share the admission exclusion; no provider request runs here. */
   async exclusive<T>(groupId: string, action: (group: HistoryGroup, save: () => void) => Promise<T>): Promise<T> {
+    if (this.read(groupId).identity.kind === "mission") throw new Error("archived worker history is catalog-only");
     const release = acquireHistoryExclusion(this.file(groupId));
     try {
       const group = this.read(groupId);
+      if (group.identity.kind === "mission") throw new Error("archived worker history is catalog-only");
       return await action(group, () => this.write(group));
     } finally { release(); }
   }
 
-  createGroup(workspace: string, identity?: HistoryIdentity,
-    metadata: Partial<Pick<HistoryGroup, "missionStore" | "coverage">> = {}): HistoryGroup {
+  createGroup(workspace: string, identity?: Exclude<HistoryIdentity, { kind: "mission" }>,
+    metadata: Partial<Pick<HistoryGroup, "coverage">> = {}): HistoryGroup {
     const group: HistoryGroup = {
       version: 1, groupId: randomUUID(), workspace: realpathSync(workspace),
       identity: identity ?? { kind: "invocation", invocationId: randomUUID() },
@@ -203,8 +208,6 @@ export class WorkerHistory {
     };
     if (group.identity.kind === "execution") {
       group.identity = { ...group.identity, executionRoot: realpathSync(group.identity.executionRoot) };
-    } else if (group.identity.kind === "mission") {
-      group.identity = { ...group.identity, storeRoot: realpathSync(group.identity.storeRoot) };
     }
     this.write(group);
     return group;
@@ -222,60 +225,6 @@ export class WorkerHistory {
     } finally {
       rmSync(lock, { recursive: true });
     }
-  }
-
-  missionGroup(workspace: string, missionId: string, locator: NonNullable<HistoryGroup["missionStore"]>, legacy: boolean): HistoryGroup {
-    const dbPath = realpathSync(locator.dbPath);
-    const key = createHash("sha256").update(JSON.stringify([dbPath, missionId])).digest("hex");
-    const lock = path.join(this.catalogDir, `mission-${key}.lock`);
-    mkdirSync(lock, { mode: 0o700 });
-    try {
-      const existing = this.list().find((group) => group.identity.kind === "mission" &&
-        group.identity.missionId === missionId && group.missionStore?.dbPath === dbPath);
-      if (existing) return existing;
-      return this.createGroup(workspace, { kind: "mission", storeRoot: path.dirname(dbPath), missionId },
-        { missionStore: { ...locator, dbPath }, coverage: legacy ? "partial" : "complete" });
-    } finally { rmSync(lock, { recursive: true }); }
-  }
-
-  associateSession(groupId: string, historyId: string, manager: SessionManager, onIntentPersisted?: () => void): void {
-    this.mutate(groupId, (group) => {
-      if (group.closure.state !== "unclosed" || group.cleanup || group.prunedAt) throw new Error("worker history group is sealed");
-      const member = this.member(group, historyId);
-      const file = manager.getSessionFile();
-      if (!file) throw new Error("managed history requires a persistent session");
-      if (member.native.state === "allocated" &&
-        (member.native.sessionId !== manager.getSessionId() || member.native.path !== file)) {
-        throw new Error("managed attempt changed native session identity");
-      }
-      member.native = { state: "allocated", sessionId: manager.getSessionId(), path: file, disposition: { state: "pending" } };
-      if (group.identity.kind === "mission") {
-        const target = path.join(group.missionStore!.sessionsDirectory, group.identity.missionId, manager.getSessionId());
-        if (manager.getSessionId() !== member.attemptId || path.dirname(file) !== target ||
-          !lstatSync(target).isDirectory() || realpathSync(target) !== target) {
-          throw new Error("managed discovery requires canonical native ownership");
-        }
-        chmodSync(target, 0o700);
-        const root = path.join(this.agentDir, "sessions");
-        mkdirSync(root, { recursive: true, mode: 0o700 });
-        if (realpathSync(root) !== root) throw new Error("unsafe worker discovery root");
-        privateDirectory(root);
-        const alias = path.join(root, `--pitako-workers--${group.groupId}-${manager.getSessionId()}`);
-        const registered = group.aliases?.find((entry) => entry.path === alias);
-        if (registered && registered.target !== target) throw new Error("worker discovery registration changed");
-        if (lstatExists(alias)) {
-          if (!registered || !lstatSync(alias).isSymbolicLink() ||
-            path.resolve(root, readlinkSync(alias)) !== target) throw new Error("unsafe worker discovery alias");
-        } else {
-          if (!registered) {
-            (group.aliases ??= []).push({ path: alias, target });
-            this.write(group); // Intent and canonical allocation survive interruption before symlink creation.
-            onIntentPersisted?.();
-          }
-          symlinkSync(target, alias, "dir");
-        }
-      }
-    });
   }
 
   closeInvocation(groupId: string): void {
@@ -328,7 +277,7 @@ export class WorkerHistory {
   recordTerminal(groupId: string, historyId: string, terminal: Omit<NonNullable<HistoryMember["terminal"]>, "at">): void {
     this.mutate(groupId, (group) => {
       const member = this.member(group, historyId);
-      if (member.terminal && group.identity.kind !== "mission") throw new Error("worker history terminal result already recorded");
+      if (member.terminal) throw new Error("worker history terminal result already recorded");
       member.terminal = { ...terminal, at: new Date().toISOString() };
     });
   }
@@ -359,30 +308,24 @@ export class InvocationHistory {
   readonly standalone: boolean;
   private admissions = 0;
 
-  constructor(cwd: string, origin: HistoryOrigin | undefined, task: string, standalone = false,
-    managed?: { groupId: string; admission: HistoryAdmission }) {
+  constructor(cwd: string, origin: HistoryOrigin | undefined, task: string, standalone = false) {
     this.cwd = cwd;
     this.origin = origin;
     this.task = task;
     this.standalone = standalone;
-    this.managed = managed;
-    this.group = managed ? this.store.read(managed.groupId) : origin?.execution
+    this.group = origin?.execution
       ? this.store.executionGroup(cwd, { kind: "execution", ...origin.execution })
       : this.store.createGroup(cwd);
   }
-
-  private readonly managed?: { groupId: string; admission: HistoryAdmission };
 
   admit(instanceId: string, roleId: string, target: ModelTarget): SessionHistory {
     const admission = {
       instanceId, roleId, coordinatorSessionId: this.origin?.coordinatorSessionId,
       coordinatorSessionFile: this.origin?.coordinatorSessionFile, assignmentId: this.origin?.assignmentId,
-      ...this.managed?.admission,
     };
     const current = this.store.read(this.group.groupId);
     if (current.closure.state !== "unclosed" || current.cleanup || current.prunedAt) throw new Error("worker history group is not open");
-    const existing = this.managed && current.members.find((row) => row.attemptId === admission.attemptId);
-    const member = existing ?? this.store.admit(this.group.groupId, admission);
+    const member = this.store.admit(this.group.groupId, admission);
     this.admissions += 1;
     return new SessionHistory(this, member.historyId, target);
   }
@@ -396,7 +339,7 @@ export class InvocationHistory {
   }
 }
 
-/** Captured by the session handle, including continuation that intentionally omits durable. */
+/** Captured by the session handle, including continuation after side effects. */
 export class SessionHistory {
   readonly invocation: InvocationHistory;
   readonly historyId: string;
@@ -404,7 +347,6 @@ export class SessionHistory {
   manager?: SessionManager;
   private last?: Attempt;
   private disposalObserved = false;
-  private retainedAssociation = false;
   private live = false;
   private terminal = false;
   private observedAssistant = false;
@@ -426,15 +368,6 @@ export class SessionHistory {
     this.append("origin", { groupId: group.groupId, historyId: this.historyId, identity: group.identity,
       origin, workbrief: origin?.workbrief ?? task, initialTarget: this.target });
     return this.manager;
-  }
-
-  associate(manager: SessionManager): SessionManager {
-    const { store, group, task } = this.invocation;
-    store.associateSession(group.groupId, this.historyId, manager, () => { this.retainedAssociation = true; });
-    this.manager = manager;
-    this.append("origin", { groupId: group.groupId, historyId: this.historyId, identity: group.identity,
-      workbrief: task, initialTarget: this.target });
-    return manager;
   }
 
   assistantObserved(): void {
@@ -464,7 +397,7 @@ export class SessionHistory {
       if (!this.disposalObserved) {
         const { store, group } = this.invocation;
         const member = store.read(group.groupId).members.find((entry) => entry.historyId === this.historyId);
-        if (member?.native.state === "allocated" && (this.manager || this.retainedAssociation)) store.recordDisposition(group.groupId, this.historyId,
+        if (member?.native.state === "allocated" && this.manager) store.recordDisposition(group.groupId, this.historyId,
           { state: "unknown", reason: "setup returned no live session handle; disposal not established" });
       }
       this.finish();

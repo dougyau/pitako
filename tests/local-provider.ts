@@ -20,7 +20,7 @@ export interface LocalProviderFixture {
   flush(file: string): void;
 }
 
-export async function installMissionLocalProvider(options: {
+export async function installLocalProvider(options: {
   agentDir: string;
   provider?: string;
   model?: string;
@@ -37,10 +37,10 @@ export async function installMissionLocalProvider(options: {
   terminalCost?: number;
   omitUsage?: boolean;
 }): Promise<LocalProviderFixture> {
-  const provider = options.provider ?? "pitako-mission-local";
+  const provider = options.provider ?? "pitako-local";
   const model = options.model ?? "fixture";
   const modelDefinition = {
-    id: model, name: "Mission fixture", reasoning: options.reasoning ?? false, input: ["text"],
+    id: model, name: "Local fixture", reasoning: options.reasoning ?? false, input: ["text"],
     contextWindow: options.contextWindow ?? 2048, maxTokens: 64,
   };
   if (options.modelFromJson) {
@@ -52,7 +52,7 @@ export async function installMissionLocalProvider(options: {
   }
   mkdirSync(path.join(options.agentDir, "extensions"), { recursive: true });
   writeFileSync(
-    path.join(options.agentDir, "extensions", "mission-local-provider.js"),
+    path.join(options.agentDir, "extensions", "local-provider.js"),
     `export default function (pi) { pi.registerProvider(${JSON.stringify(provider)}, globalThis[${JSON.stringify(`__${provider.replace(/\W/g, "_")}`)}]); }\n`,
   );
   const trace: LocalProviderTraceRow[] = [];
@@ -129,7 +129,7 @@ export async function installMissionLocalProvider(options: {
     trace,
     flush(file) {
       mkdirSync(path.dirname(file), { recursive: true });
-      writeFileSync(file, `${JSON.stringify({ format: "mission-local-provider-trace-v1", trace }, null, 2)}\n`);
+      writeFileSync(file, `${JSON.stringify({ format: "local-provider-trace-v1", trace }, null, 2)}\n`);
     },
   };
 }

@@ -1,6 +1,3 @@
-import { randomUUID } from "node:crypto";
-import { mkdirSync, readdirSync } from "node:fs";
-import path from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { getCurrentSystemPrompt, lazyStream, normalizeContext, type AssistantMessageEvent, type Context, type Model } from "@earendil-works/pi-ai";
 import {
@@ -9,7 +6,6 @@ import {
   DefaultResourceLoader,
   getAgentDir,
   ModelRuntime,
-  SessionManager,
   SettingsManager,
   type AgentSession,
 } from "@earendil-works/pi-coding-agent";
@@ -17,9 +13,8 @@ import { registerExecution, unregisterExecution } from "../execution-identity.ts
 import { reconcileChildTools, ORCHESTRATION_TOOLS } from "../profile.ts";
 import { packageRoot } from "../stack.ts";
 import { marksSideEffect } from "./effects.ts";
-import { createMissionToolAdapters } from "../mission/effects.ts";
 import { isServiceTierRejection } from "./fallback.ts";
-import { childInstructions, skillNamesForRole, usageDelta, type AgentRequestObservation, type AgentUsage, type Attempt, type AttemptExecutor, type DurableAttemptContext } from "./run.ts";
+import { childInstructions, skillNamesForRole, usageDelta, type AgentRequestObservation, type AgentUsage, type Attempt, type AttemptExecutor } from "./run.ts";
 import { completeTool, emptyCodeIntelligenceUsage, isDenseToolName, type CodeIntelligenceUsage, type DenseCallUsage, type ToolOutcome } from "../code-intelligence/metrics.ts";
 import type { ModelTarget, ReasoningLevel } from "../roles/types.ts";
 import { InvocationHistory, type SessionHistory } from "./history.ts";
@@ -34,7 +29,7 @@ const sdkDefaultsReady = import(
 });
 
 const navigationWindows = new WeakMap<AgentSession, { remaining: number }>();
-const childLifecycles = new WeakMap<AgentSession, { bound: boolean; disposal?: Promise<void>; history?: SessionHistory; prePrompt?: NonNullable<Attempt["session"]> }>();
+const childLifecycles = new WeakMap<AgentSession, { bound: boolean; disposal?: Promise<void>; history?: SessionHistory }>();
 
 function disposeChildSession(session: AgentSession): Promise<void> {
   const lifecycle = childLifecycles.get(session)!;
@@ -68,9 +63,7 @@ export function createPiExecutor(options: { now?: () => number } = {}): AttemptE
   return {
     capturesHistory: true,
     async start(input) {
-      const history = input.durable ? input.durable.history &&
-        new InvocationHistory(input.cwd, undefined, input.task, false, input.durable.history).admit(input.instanceId, input.role.id, input.target) :
-        (input.history ?? new InvocationHistory(input.cwd, undefined, input.task, true)).admit(input.instanceId, input.role.id, input.target);
+      const history = (input.history ?? new InvocationHistory(input.cwd, undefined, input.task, true)).admit(input.instanceId, input.role.id, input.target);
       try {
         // Do not bind the worker abort signal here. The session abort owns cancellation.
         // A signal on runtime create aborts Cursor auth before the child prompt starts.
@@ -98,17 +91,6 @@ export function createPiExecutor(options: { now?: () => number } = {}): AttemptE
 export function cursorProviderContext(model: { provider?: string; api?: string }, context: Context): Context {
   if (model.provider !== "cursor" && model.api !== "cursor-native") return context;
   return { ...normalizeContext(context), tools: context.tools ?? [] };
-}
-
-export function shouldBypassProviderAdmission(durable: boolean, requestSessionId: string | undefined, sessionId: string): boolean {
-  return !durable && requestSessionId !== undefined && requestSessionId !== sessionId;
-}
-
-export function managedSettingsManager(): SettingsManager {
-  const settings = SettingsManager.inMemory({ retry: { enabled: false, maxRetries: 0 }, compaction: { enabled: false } });
-  const providerRetrySettings = settings.getProviderRetrySettings.bind(settings);
-  settings.getProviderRetrySettings = () => ({ ...providerRetrySettings(), maxRetries: 0 });
-  return settings;
 }
 
 type ServiceTier = "fast" | "priority";
@@ -219,19 +201,14 @@ async function runTarget(
     onActivity?: Parameters<AttemptExecutor["start"]>[0]["onActivity"];
     onActivated?: (appliedReasoning: string) => void;
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
-    durable?: DurableAttemptContext;
     sessionHistory?: SessionHistory;
   },
   existing?: { session: AgentSession; mode: "pre-prompt" | "continuation" },
 ): Promise<Attempt> {
   const continuation = existing?.mode === "continuation";
-  const existingHandle = existing && resume(existing.session, runtime, selections, now, input,
-    !continuation && input.durable ? prompt : undefined);
+  const existingHandle = existing && resume(existing.session, runtime, selections, now, input);
   if (input.signal.aborted) return { status: "cancelled", result: "cancelled", sideEffects: continuation, session: existingHandle };
   const model = findModel(runtime, target.model);
-  if (input.durable?.effects && (/^cursor\//i.test(target.model) || model?.provider === "cursor" || model?.api === "cursor-native")) {
-    return { status: "failed", result: "managed missions deny Cursor/provider-native execution because it bypasses fenced local adapters", failureKind: "configuration", sideEffects: continuation, session: existingHandle };
-  }
   // Extension providers register during AgentSession bind, not on a fresh runtime.
   if (!model && !existing) return bindThenRun(runtime, selections, now, target, prompt, input);
   if (!model) {
@@ -248,9 +225,9 @@ async function runTarget(
       return { status: "failed", result: "", error: messageOf(error), sideEffects: false };
     }
   }
-  const handle = resume(session, runtime, selections, now, input, !continuation && input.durable ? prompt : undefined);
+  const handle = resume(session, runtime, selections, now, input);
   const beforeDrive = async (result: Attempt): Promise<Attempt> => {
-    if (input.durable || continuation) return { ...result, session: handle };
+    if (continuation) return { ...result, session: handle };
     await handle.dispose();
     return result;
   };
@@ -268,7 +245,7 @@ async function runTarget(
   if (activated.error) {
     return beforeDrive(configurationFailure(activated.error, continuation));
   }
-  const activationError = await activateTarget(session, activated.model!, target, input.durable);
+  const activationError = await activateTarget(session, activated.model!, target);
   if (activationError) {
     return beforeDrive({ status: "failed", result: "", error: activationError, sideEffects: continuation });
   }
@@ -279,11 +256,10 @@ async function runTarget(
     }
     // Retire the caller's retained wrapper too: drive can throw before returning a new handle.
     delete handle.retryBeforePrompt;
-    childLifecycles.get(session)!.prePrompt = undefined;
     return await drive(session, runtime, selections, now, prompt, input);
   } catch (error) {
-    if (!continuation && !input.durable) await handle.dispose();
-    return { status: "failed", result: "", error: messageOf(error), sideEffects: continuation, session: continuation || input.durable ? handle : undefined };
+    if (!continuation) await handle.dispose();
+    return { status: "failed", result: "", error: messageOf(error), sideEffects: continuation, session: continuation ? handle : undefined };
   }
 }
 
@@ -302,13 +278,10 @@ export async function activateTarget(
   },
   model: NonNullable<ReturnType<ModelRuntime["getModel"]>>,
   target: ModelTarget,
-  durable?: DurableAttemptContext,
 ): Promise<string | undefined> {
   try {
     await session.setModel(model, { persist: false });
-    if (durable) {
-      session.setActiveToolsByName?.(durable.effects ? ["bash", "edit", "write", "apply_patch"] : []);
-    } else if (session.sessionManager && session.getAllTools && session.setActiveToolsByName) {
+    if (session.sessionManager && session.getAllTools && session.setActiveToolsByName) {
       reconcileChildTools({
         sessionManager: session.sessionManager,
         model: session.model,
@@ -345,7 +318,6 @@ async function bindThenRun(
     onActivity?: Parameters<AttemptExecutor["start"]>[0]["onActivity"];
     onActivated?: (appliedReasoning: string) => void;
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
-    durable?: DurableAttemptContext;
     sessionHistory?: SessionHistory;
   },
 ): Promise<Attempt> {
@@ -356,10 +328,10 @@ async function bindThenRun(
     if (input.signal.aborted) return { status: "cancelled", result: "cancelled", sideEffects: false };
     return { status: "failed", result: "", error: messageOf(error), sideEffects: false };
   }
-  const handle = resume(session, runtime, selections, now, input, input.durable ? prompt : undefined);
+  const handle = resume(session, runtime, selections, now, input);
   try {
     const result = await runTarget(runtime, selections, now, target, prompt, input, { session, mode: "pre-prompt" });
-    if (!input.durable && !result.session) await handle.dispose();
+    if (!result.session) await handle.dispose();
     return result;
   } catch (error) {
     await handle.dispose();
@@ -371,17 +343,17 @@ async function openSession(
   runtime: ModelRuntime,
   model: NonNullable<ReturnType<ModelRuntime["getModel"]>> | undefined,
   target: ModelTarget,
-  input: { instanceId: string; role: Parameters<AttemptExecutor["start"]>[0]["role"]; cwd: string; durable?: DurableAttemptContext; sessionHistory?: SessionHistory },
+  input: { instanceId: string; role: Parameters<AttemptExecutor["start"]>[0]["role"]; cwd: string; sessionHistory?: SessionHistory },
 ): Promise<AgentSession> {
   const agentDir = getAgentDir();
-  const settingsManager = input.durable ? managedSettingsManager() : SettingsManager.create(input.cwd, agentDir);
+  const settingsManager = SettingsManager.create(input.cwd, agentDir);
   const allowed = new Set(skillNamesForRole(input.role));
   const loader = new DefaultResourceLoader({
     cwd: input.cwd,
     agentDir,
     settingsManager,
     additionalExtensionPaths: [packageRoot()],
-    ...(!input.durable ? { extensionFactories: [createCodemodeExtension({ mode: "on" })] } : {}),
+    extensionFactories: [createCodemodeExtension({ mode: "on" })],
     appendSystemPrompt: [childInstructions(input.role, input.instanceId)],
     skillsOverride: (base) => ({
       skills: base.skills.filter((skill) => allowed.has(skill.name)),
@@ -395,17 +367,9 @@ async function openSession(
     agentDir,
     ...(model ? { model } : {}),
     ...(thinkingLevel ? { thinkingLevel } : {}),
-    sessionManager: input.durable
-      ? (() => {
-        const manager = persistentAttemptSession(input.cwd, input.durable!);
-        return input.sessionHistory?.associate(manager) ?? manager;
-      })()
-      : input.sessionHistory!.create(),
+    sessionManager: input.sessionHistory!.create(),
     settingsManager,
     resourceLoader: loader,
-    // SDK admission filters extension tools too; profiles cannot enable unfenced tools.
-    ...(input.durable ? { tools: input.durable.effects ? ["bash", "edit", "write", "apply_patch"] : [] } : {}),
-    ...(input.durable?.effects ? { customTools: createMissionToolAdapters(input.durable.effects) } : {}),
     modelRuntime: runtime,
     excludeTools: [...ORCHESTRATION_TOOLS],
   });
@@ -415,20 +379,11 @@ async function openSession(
   if (lifecycle.history) session.subscribe((event) => {
     if (event.type === "message_end" && event.message.role === "assistant") lifecycle.history!.assistantObserved();
   });
-  if (input.durable) {
-    session.setAutoRetryEnabled(false);
-    session.setAutoCompactionEnabled(false);
-    session.setActiveToolsByName(input.durable?.effects ? ["bash", "edit", "write", "apply_patch"] : []);
-  }
   registerExecution({ instanceId: input.instanceId, roleId: input.role.id, sessionId: session.sessionId });
   try {
     await session.bindExtensions({});
     lifecycle.bound = true;
-    if (input.durable) {
-      session.setActiveToolsByName(input.durable.effects ? ["bash", "edit", "write", "apply_patch"] : []);
-    } else {
-      reconcileChildTools(session);
-    }
+    reconcileChildTools(session);
     return session;
   } catch (error) {
     await disposeChildSession(session);
@@ -450,7 +405,6 @@ async function drive(
     onActivity?: (event: { type?: string; toolName?: string; assistantMessageEvent?: { type?: string } }) => void;
     onActivated?: (appliedReasoning: string) => void;
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
-    durable?: DurableAttemptContext;
   },
 ): Promise<Attempt> {
   // continueWith skips executor.start. The probe closes over this session only.
@@ -473,7 +427,7 @@ async function drive(
     };
     const originalStreamFunction = session.agent.streamFunction;
     session.agent.streamFunction = (model, context, options) => {
-      if (shouldBypassProviderAdmission(Boolean(input.durable), options?.sessionId, session.sessionId)) {
+      if (options?.sessionId !== undefined && options.sessionId !== session.sessionId) {
         return originalStreamFunction(model, context, options);
       }
       const selection = selections.get(model);
@@ -485,10 +439,8 @@ async function drive(
         model: `${model.provider}/${model.id}`, requested: selection,
         appliedReasoning: options?.reasoning, continuation: session.messages.some((message) => message.role === "assistant"),
       });
-      const requestId = randomUUID();
       const observation: AgentRequestObservation = {
         model: selection?.model ?? `${model.provider}/${model.id}`,
-        ...(input.durable ? { requestId, provider: model.provider } : {}),
         reasoning: options?.reasoning ?? selection?.reasoning,
         fast_requested: selection?.fastRequested ?? false,
         ...(selection?.serviceTier ? { requested_service_tier: selection.serviceTier } : {}),
@@ -499,58 +451,9 @@ async function drive(
       requests.push(observation);
       activeRequest = request;
       return lazyStream(model, async () => {
-        let ticket: import("./run.ts").ProviderAdmissionTicket | undefined;
-        let dispatched = false;
-        let recorded = false;
-        const receipt = async (event?: AssistantMessageEvent, failure?: unknown) => {
-          if (!input.durable || !dispatched || recorded) return;
-          recorded = true;
-          const usage = event?.type === "done" ? event.message.usage : event?.type === "error" ? event.error.usage : undefined;
-          const inputTokens = tokenValue(usage?.input);
-          const outputTokens = tokenValue(usage?.output);
-          const cost = usage?.cost?.total;
-          // SDK zero rates also represent omitted pricing; only fully observed zero use proves zero exposure.
-          const zeroConsumption = [inputTokens, outputTokens, tokenValue(usage?.cacheRead), tokenValue(usage?.cacheWrite)]
-            .every((value) => value === 0);
-          const estimatedCost = typeof cost === "number" && Number.isFinite(cost) && (cost > 0 || cost === 0 && zeroConsumption)
-            ? cost : null;
-          observation.inputTokens = inputTokens;
-          observation.outputTokens = outputTokens;
-          await input.durable.onProviderReceipt({
-            requestId, provider: model.provider, model: model.id, inputTokens, outputTokens,
-            estimatedCost,
-            pricingBasis: estimatedCost === null
-              ? "unknown pricing: SDK cost absent, invalid, or zero without fully observed zero consumption"
-              : "SDK model pricing estimate (USD), not invoiced spend",
-            ...(inputTokens === null || outputTokens === null ? { usageUnknownReason: failure ? messageOf(failure) : "provider response omitted token usage" } : {}),
-            ticket,
-          });
-        };
         try {
-          if (input.durable) {
-            ticket = await input.durable.onProviderDispatch({ requestId, provider: model.provider, model: model.id });
-            dispatched = true;
-          }
-          const stream = await originalStreamFunction(model, context, options);
-          if (!input.durable) return stream;
-          return (async function* () {
-            let terminal = false;
-            try {
-              for await (const event of stream) {
-                if (event.type === "done" || event.type === "error") {
-                  await receipt(event);
-                  terminal = true;
-                }
-                yield event;
-              }
-              if (!terminal) await receipt(undefined, new Error("provider stream ended without a terminal response"));
-            } catch (error) {
-              await receipt(undefined, error);
-              throw error;
-            }
-          })();
+          return await originalStreamFunction(model, context, options);
         } catch (error) {
-          await receipt(undefined, error);
           if (activeRequest === request) finishRequest("failed");
           throw error;
         }
@@ -624,18 +527,6 @@ async function drive(
   }
 }
 
-function persistentAttemptSession(cwd: string, durable: DurableAttemptContext): SessionManager {
-  mkdirSync(durable.sessionDir, { recursive: true });
-  const files = readdirSync(durable.sessionDir).filter((name) => name === `${durable.sessionId}.jsonl` || name.endsWith(`_${durable.sessionId}.jsonl`));
-  if (files.length > 1) throw new Error(`multiple Pi SDK sessions exist for attempt ${durable.attemptId}`);
-  if (files.length === 1) return SessionManager.open(path.join(durable.sessionDir, files[0]!), durable.sessionDir, cwd);
-  return SessionManager.create(cwd, durable.sessionDir, { id: durable.sessionId });
-}
-
-function tokenValue(value: unknown): number | null {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
-}
-
 function failedAttempt(
   error: string,
   sideEffects: boolean,
@@ -669,14 +560,10 @@ function resume(
     onActivity?: Parameters<AttemptExecutor["start"]>[0]["onActivity"];
     onActivated?: (appliedReasoning: string) => void;
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
-    durable?: DurableAttemptContext;
   },
-  pendingPrompt?: string,
 ): NonNullable<Attempt["session"]> {
   const history = childLifecycles.get(session)?.history;
-  const lifecycle = childLifecycles.get(session)!;
-  if (pendingPrompt !== undefined && lifecycle.prePrompt) return lifecycle.prePrompt;
-  const handle: NonNullable<Attempt["session"]> = {
+  return {
     async continueWith(target, note, signal) {
       history?.append("continuation", { target, note });
       const result = await runTarget(runtime, selections, now, target, note, { ...input, signal, sessionHistory: history }, { session, mode: "continuation" });
@@ -686,20 +573,6 @@ function resume(
       await disposeChildSession(session);
     },
   };
-  if (pendingPrompt !== undefined) {
-    handle.retryBeforePrompt = async (target, signal) => {
-      const result = await runTarget(runtime, selections, now, target, pendingPrompt,
-        { ...input, signal, sessionHistory: history }, { session, mode: "pre-prompt" });
-      try {
-        return history?.result(result) ?? result;
-      } catch (error) {
-        await handle.dispose();
-        throw error;
-      }
-    };
-    lifecycle.prePrompt = handle;
-  }
-  return handle;
 }
 
 function findModel(runtime: ModelRuntime, ref: string) {
