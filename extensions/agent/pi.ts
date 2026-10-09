@@ -499,7 +499,7 @@ async function drive(
       requests.push(observation);
       activeRequest = request;
       return lazyStream(model, async () => {
-        let ticket: unknown;
+        let ticket: import("./run.ts").ProviderAdmissionTicket | undefined;
         let dispatched = false;
         let recorded = false;
         const receipt = async (event?: AssistantMessageEvent, failure?: unknown) => {

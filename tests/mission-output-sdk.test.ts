@@ -186,7 +186,7 @@ async function runCase(name: string, predicates: AcceptancePredicate[][], overla
       }
       expect(report.inputIdentity.source.indexHash).toBe(deliverySource.manifest.indexHash);
       expect(report.inputIdentity.source.indexEntries).toEqual(deliverySource.manifest.indexEntries);
-      const disposable = createMissionWorkspace({ missionId: mission.id, attemptId: crypto.randomUUID(), sourceRoot: sample.root,
+      const disposable = await createMissionWorkspace({ missionId: mission.id, attemptId: crypto.randomUUID(), sourceRoot: sample.root,
         storeRoot: store.storageRoot, candidateParent: path.join(sample.base, "copies"), allowedPaths: [] });
       const patch = JSON.parse(store.readArtifact(report.patchHash).toString());
       expect(applyConditionalMissionPatch(patch, disposable).hash).toBe(report.acceptedManifestHash);

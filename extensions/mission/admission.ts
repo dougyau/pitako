@@ -245,7 +245,7 @@ export function revisionImpact(old: MissionDefinition, next: MissionDefinition):
   const all = new Set([...before.keys(), ...after.keys()]);
   if (!same(old.goal, next.goal) || !same(old.scope, next.scope) || !same(old.nonGoals, next.nonGoals) ||
     !same(old.invariants, next.invariants) || !same(old.authority, next.authority) ||
-    !same(old.budget, next.budget) || !same(old.finalization, next.finalization)) return [...all].sort();
+    !same(old.budget, next.budget) || !same(old.resourcePolicy, next.resourcePolicy) || !same(old.finalization, next.finalization)) return [...all].sort();
   const changed = new Set([...all].filter((id) => !same(before.get(id), after.get(id))));
   let prior = -1;
   while (prior !== changed.size) {
@@ -306,7 +306,7 @@ export function admitMissionChange(input: {
       throw new Error("operator choice does not equal complete revision bytes");
   } else {
     if (!current.definition.authority.allowTechnicalAmendments) throw new Error("technical amendments are not authorized");
-    for (const key of ["goal", "scope", "nonGoals", "invariants", "authority", "budget", "finalization"] as const) {
+    for (const key of ["goal", "scope", "nonGoals", "invariants", "authority", "budget", "resourcePolicy", "finalization"] as const) {
       if (!same(current.definition[key], definition[key])) throw new Error(`model amendment cannot change ${key}`);
     }
     // The v1 executable schema has no separate method/substep field. Do not infer permission to edit gates or DAG edges.

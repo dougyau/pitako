@@ -39,8 +39,15 @@ export interface MissionUnit {
   originalIntent?: { sourceId: string; objective: string; workBrief: string; criteria: Array<{ sourceId: string; text: string; predicateIds: string[] }> };
 }
 
-export interface MissionDefinition {
-  schemaVersion: 1 | 2;
+export interface ResourceAmounts {
+  roleLaunches: number;
+  providerRequests: number;
+  tokens: number;
+  activeTimeMs: number;
+  artifactBytes: number;
+}
+
+interface MissionDefinitionBase {
   goal: string;
   scope: string[];
   nonGoals: string[];
@@ -55,20 +62,20 @@ export interface MissionDefinition {
     resumeAfterClose: boolean;
     verificationProfiles?: ["sealed-nested-verification-v1"];
   };
-  budget: {
-    roleLaunches: number;
-    providerRequests: number;
-    tokens: number;
-    activeTimeMs: number;
-    artifactBytes: number;
-  };
   finalization: { requiredPredicates: string[]; independentReview: boolean; contractVersion?: 1;
     selections?: { ordinary: string[]; integrated: string[]; affected: string[]; final: string[] } };
   units: MissionUnit[];
 }
 
+export type MissionDefinition = MissionDefinitionBase & (
+  { schemaVersion: 1 | 2; budget: ResourceAmounts; resourcePolicy?: never } |
+  { schemaVersion: 3; budget?: never; resourcePolicy: {
+    estimates: Partial<ResourceAmounts>; limits: Partial<ResourceAmounts>;
+  } }
+);
+
 export interface PlanSnapshot {
-  schemaVersion: 1 | 2;
+  schemaVersion: 1 | 2 | 3;
   preparedHash?: string;
   sourceBinding?: ExecutionBinding;
   planId: string;
@@ -176,8 +183,10 @@ export function validateMissionDefinitionBytes(bytes: Uint8Array): { definition:
 
 export function validateMissionDefinition(value: unknown): MissionDefinition {
   const root = object(value, "mission definition");
-  exactKeys(root, ["schemaVersion", "goal", "scope", "nonGoals", "invariants", "authority", "budget", "finalization", "units"], "mission definition");
-  if (root.schemaVersion !== 1 && root.schemaVersion !== 2) throw new MissionValidationError(`mission definition schema ${String(root.schemaVersion)} is not supported`);
+  if (root.schemaVersion !== 1 && root.schemaVersion !== 2 && root.schemaVersion !== 3)
+    throw new MissionValidationError(`mission definition schema ${String(root.schemaVersion)} is not supported`);
+  exactKeys(root, ["schemaVersion", "goal", "scope", "nonGoals", "invariants", "authority",
+    root.schemaVersion === 3 ? "resourcePolicy" : "budget", "finalization", "units"], "mission definition");
   const goal = text(root.goal, "goal");
   const scope = textList(root.scope, "scope");
   const nonGoals = textList(root.nonGoals, "nonGoals");
@@ -193,7 +202,7 @@ export function validateMissionDefinition(value: unknown): MissionDefinition {
     const role = identifier(roleKey, "role policy id");
     const policy = object(entry, `role policy ${role}`);
     exactKeys(policy, ["hash", "provider", "model", "fallbacks"], `role policy ${role}`,
-      root.schemaVersion === 2 ? ["primaryTarget", "fallbackTargets"] : []);
+      root.schemaVersion !== 1 ? ["primaryTarget", "fallbackTargets"] : []);
     const hash = text(policy.hash, `${role}.hash`);
     if (!SHA256.test(hash)) throw new MissionValidationError(`${role}.hash must be a lowercase SHA-256 digest`);
     rolePolicies[role] = {
@@ -201,7 +210,7 @@ export function validateMissionDefinition(value: unknown): MissionDefinition {
       provider: text(policy.provider, `${role}.provider`),
       model: text(policy.model, `${role}.model`),
       fallbacks: textList(policy.fallbacks, `${role}.fallbacks`),
-      ...(root.schemaVersion === 2 ? {
+      ...(root.schemaVersion !== 1 ? {
         primaryTarget: validateModelTarget(policy.primaryTarget),
         fallbackTargets: modelTargetList(policy.fallbackTargets),
       } : {}),
@@ -218,26 +227,30 @@ export function validateMissionDefinition(value: unknown): MissionDefinition {
       { verificationProfiles: ["sealed-nested-verification-v1"] as ["sealed-nested-verification-v1"] }),
   };
 
-  const budgetValue = object(root.budget, "budget");
-  exactKeys(budgetValue, ["roleLaunches", "providerRequests", "tokens", "activeTimeMs", "artifactBytes"], "budget");
-  const budget = {
-    roleLaunches: positiveInteger(budgetValue.roleLaunches, "budget.roleLaunches"),
-    providerRequests: positiveInteger(budgetValue.providerRequests, "budget.providerRequests"),
-    tokens: positiveInteger(budgetValue.tokens, "budget.tokens"),
-    activeTimeMs: positiveInteger(budgetValue.activeTimeMs, "budget.activeTimeMs"),
-    artifactBytes: positiveInteger(budgetValue.artifactBytes, "budget.artifactBytes"),
+  const resourceKeys = ["roleLaunches", "providerRequests", "tokens", "activeTimeMs", "artifactBytes"];
+  const amounts = (value: unknown, label: string, optional: boolean): Partial<ResourceAmounts> => {
+    const row = object(value, label);
+    exactKeys(row, optional ? [] : resourceKeys, label, optional ? resourceKeys : []);
+    return Object.fromEntries((optional ? Object.keys(row) : resourceKeys)
+      .map(key => [key, positiveInteger(row[key], `${label}.${key}`)]));
   };
+  const resourcePolicy = root.schemaVersion === 3 ? object(root.resourcePolicy, "resourcePolicy") : undefined;
+  if (resourcePolicy) exactKeys(resourcePolicy, ["estimates", "limits"], "resourcePolicy");
+  const resources = resourcePolicy
+    ? { resourcePolicy: { estimates: amounts(resourcePolicy.estimates, "resourcePolicy.estimates", true),
+      limits: amounts(resourcePolicy.limits, "resourcePolicy.limits", true) } }
+    : { budget: amounts(root.budget, "budget", false) as ResourceAmounts };
 
   const finalizationValue = object(root.finalization, "finalization");
   exactKeys(finalizationValue, ["requiredPredicates", "independentReview"], "finalization",
-    ["contractVersion", ...(root.schemaVersion === 2 ? ["selections"] : [])]);
+    ["contractVersion", ...(root.schemaVersion !== 1 ? ["selections"] : [])]);
   if (finalizationValue.contractVersion !== undefined && finalizationValue.contractVersion !== 1)
     throw new MissionValidationError("unsupported finalization contract version");
   const finalization = {
     requiredPredicates: textList(finalizationValue.requiredPredicates, "finalization.requiredPredicates"),
     independentReview: boolean(finalizationValue.independentReview, "finalization.independentReview"),
     ...(finalizationValue.contractVersion === 1 ? { contractVersion: 1 as const } : {}),
-    ...(root.schemaVersion === 2 ? { selections: validateSelections(finalizationValue.selections) } : {}),
+    ...(root.schemaVersion !== 1 ? { selections: validateSelections(finalizationValue.selections) } : {}),
   };
   if (finalization.contractVersion === 1 && !finalization.independentReview)
     throw new MissionValidationError("completion contract version 1 requires whole-result independent review");
@@ -255,14 +268,16 @@ export function validateMissionDefinition(value: unknown): MissionDefinition {
   for (const id of finalization.requiredPredicates) {
     if (!predicateIds.has(id)) throw new MissionValidationError(`finalization references unknown predicate ${id}`);
   }
-  if (root.schemaVersion === 2) {
+  if (root.schemaVersion !== 1) {
     if (finalization.contractVersion !== 1) throw new MissionValidationError("generated missions require finalization contract 1");
     for (const ids of Object.values(finalization.selections!))
       for (const id of ids) if (!predicateIds.has(id)) throw new MissionValidationError(`phase selection references unknown predicate ${id}`);
     if (JSON.stringify([...finalization.selections!.final].sort()) !== JSON.stringify([...finalization.requiredPredicates].sort()))
       throw new MissionValidationError("final selection must preserve all required final predicates");
   }
-  return { schemaVersion: root.schemaVersion, goal, scope, nonGoals, invariants, authority, budget, finalization, units };
+  return root.schemaVersion === 3
+    ? { schemaVersion: 3, goal, scope, nonGoals, invariants, authority, resourcePolicy: resources.resourcePolicy!, finalization, units }
+    : { schemaVersion: root.schemaVersion, goal, scope, nonGoals, invariants, authority, budget: resources.budget!, finalization, units };
 }
 
 export function validateEvaluationObservation(value: unknown, missionId: string): EvaluationObservation {
@@ -348,10 +363,10 @@ export function isUuid(value: unknown): value is string {
   return typeof value === "string" && UUID.test(value);
 }
 
-function validateUnit(value: unknown, index: number, schemaVersion: 1 | 2): MissionUnit {
+function validateUnit(value: unknown, index: number, schemaVersion: 1 | 2 | 3): MissionUnit {
   const row = object(value, `units[${index}]`);
   exactKeys(row, ["id", "dependencies", "kind", "role", "inputs", "outputs", "acceptance", "risk", "retryLimit"], `units[${index}]`,
-    ["parentId", "team", ...(schemaVersion === 2 ? ["originalIntent"] : [])]);
+    ["parentId", "team", ...(schemaVersion !== 1 ? ["originalIntent"] : [])]);
   const id = identifier(row.id, `units[${index}].id`);
   if (row.kind !== "team" && row.team !== undefined) throw new MissionValidationError(`${id} team contract requires kind team`);
   let team: MissionUnit["team"];
@@ -374,7 +389,7 @@ function validateUnit(value: unknown, index: number, schemaVersion: 1 | 2): Miss
   const acceptance = row.acceptance.map((entry, predicateIndex): AcceptancePredicate => {
     const predicate = object(entry, `${id}.acceptance[${predicateIndex}]`);
     exactKeys(predicate, ["id", "kind", "target"], `${id} predicate`, ["expected", "command", "timeoutMs", "profile",
-      ...(schemaVersion === 2 ? ["inputPaths"] : [])]);
+      ...(schemaVersion !== 1 ? ["inputPaths"] : [])]);
     const kind = oneOf(predicate.kind, ["command_exit", "artifact_hash", "manual"], `${id}.predicate.kind`);
     if (predicate.profile !== undefined && (kind !== "command_exit" || predicate.profile !== "sealed-nested-verification-v1"))
       throw new MissionValidationError(`${id} unsupported command verification profile`);
@@ -404,7 +419,7 @@ function validateUnit(value: unknown, index: number, schemaVersion: 1 | 2): Miss
     acceptance,
     risk: oneOf(row.risk, ["low", "medium", "high", "critical"], `${id}.risk`),
     retryLimit,
-    ...(schemaVersion === 2 ? { originalIntent: validateOriginalIntent(row.originalIntent) } : {}),
+    ...(schemaVersion !== 1 ? { originalIntent: validateOriginalIntent(row.originalIntent) } : {}),
   };
 }
 

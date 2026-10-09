@@ -7,6 +7,7 @@ import { createPiExecutor } from "../extensions/agent/pi.ts";
 import agentExtension from "../extensions/agent/index.ts";
 import { createPiMissionRunner, MissionEngine } from "../extensions/mission/engine.ts";
 import { readSealedWorkspaceImage } from "../extensions/mission/reconcile.ts";
+import { PhysicalObservation } from "../extensions/mission/physical-observation.ts";
 import { currentProcessIdentity } from "../extensions/mission/workspace.ts";
 import { createMissionFixture, missionDefinition, missionInput, openFixtureStore } from "./mission-fixtures.ts";
 import { installMissionLocalProvider } from "./mission-local-provider.ts";
@@ -16,7 +17,8 @@ const request = JSON.stringify({ format: "mission-consultation-request-v1", ques
   evidenceRefs: ["evidence:a"], members: ["one", "two", "three"].map((id) => ({ id, role: "developer", perspective: id })),
   synthesisRole: "developer" });
 
-test("SDK-disposed managed Developer write seals a terminal checkpoint without admitting consultation or acceptance", async () => {
+test.each(["current-ticks", "control-during-await", "result-during-await"] as const)(
+  "SDK-disposed managed Developer write seals a terminal checkpoint without admitting consultation or acceptance: %s", async (scenario) => {
   if (process.platform !== "linux" || !existsSync("/usr/bin/bwrap")) return;
   const sample = createMissionFixture("pitako-singleton-checkpoint-");
   const previous = process.env.PI_CODING_AGENT_DIR;
@@ -24,6 +26,9 @@ test("SDK-disposed managed Developer write seals a terminal checkpoint without a
   const config = path.join(agentDir, "pitako", "config.toml");
   let store: Awaited<ReturnType<typeof openFixtureStore>> | undefined;
   let engine: MissionEngine | undefined;
+  const observe = PhysicalObservation.prototype.request;
+  let terminalObservations = 0;
+  let markers = 0;
   try {
     mkdirSync(path.dirname(config), { recursive: true }); writeFileSync(config, "");
     mkdirSync(path.join(sample.root, "src")); writeFileSync(path.join(sample.root, "src", "target.txt"), "source sentinel\n");
@@ -38,6 +43,25 @@ test("SDK-disposed managed Developer write seals a terminal checkpoint without a
     writeFileSync(sample.definitionFile, JSON.stringify(definition));
     store = await openFixtureStore(sample);
     const mission = store.createMission(missionInput(sample));
+    PhysicalObservation.prototype.request = async function<T>(operation: string, input: unknown,
+      signal?: AbortSignal, deadline?: number): Promise<T> {
+      if (operation !== "seal" || terminalObservations ||
+        !store!.inspectMission(mission.id).events.some(({ kind }) => kind === "attempt.receipt"))
+        return (observe<T>).call(this, operation, input, signal, deadline);
+      terminalObservations++;
+      const timer = setInterval(() => { markers++; }, 1);
+      try {
+        const result = await (observe<T>).call(this, operation, input, signal, deadline);
+        const current = store!.inspectMission(mission.id);
+        store!.appendTransition(mission.id, current.version, { events: [{
+          revision: current.revision, kind: scenario === "current-ticks" ? "mission.notification.delivered" :
+            scenario === "control-during-await" ? "mission.import.conflict" : "mission.finalization.generation",
+          causalId: randomUUID(), payload: scenario === "result-during-await"
+            ? { generation: 1, reason: "concurrent result generation" } : { reason: "concurrent frontier observation" },
+        }] });
+        return result;
+      } finally { clearInterval(timer); }
+    };
     const runner = createPiMissionRunner({ cwd: sample.root, executor: createPiExecutor(),
       load: { env: { PI_CODING_AGENT_DIR: agentDir }, userConfigPath: config } });
     engine = new MissionEngine({ store, missionId: mission.id, sessionsDirectory: path.join(sample.base, "sessions"),
@@ -52,8 +76,18 @@ test("SDK-disposed managed Developer write seals a terminal checkpoint without a
     const inspection = store.inspectMission(mission.id);
     const receipt = inspection.events.find(({ kind }) => kind === "attempt.receipt")!;
     const seal = inspection.events.find(({ kind, payload }) => kind === "workspace.snapshot.sealed" && payload.purpose === "consultation")!;
+    expect(terminalObservations).toBe(1);
+    expect(markers).toBeGreaterThan(0);
     expect(provider.trace).toHaveLength(1);
     expect(receipt.payload).toMatchObject({ status: "completed", quiescent: false });
+    if (scenario !== "current-ticks") {
+      expect(seal).toBeUndefined();
+      expect(inspection.events.some(({ kind }) => kind === "team.consultation.admitted" ||
+        kind === "unit.accepted" || kind === "mission.completed")).toBe(false);
+      expect(String(inspection.events.find(({ kind }) => kind === "team.consultation.denied")?.payload.reason))
+        .toContain("workspace observation owner, control or result changed during await");
+      return;
+    }
     expect(seal).toBeDefined();
     const proofBytes = store.readArtifact(String(seal.payload.checkpointHash));
     expect(sha(proofBytes)).toBe(String(seal.payload.checkpointHash));
@@ -94,6 +128,7 @@ test("SDK-disposed managed Developer write seals a terminal checkpoint without a
       expect(persisted.events.some(({ kind }) => kind === "unit.accepted")).toBe(false);
     } finally { reopened.close(); }
   } finally {
+    PhysicalObservation.prototype.request = observe;
     await engine?.retireForShutdown("quit"); store?.close();
     if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previous;

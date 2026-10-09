@@ -199,7 +199,7 @@ phaseTest("recovery", "a hard owner crash restores partial candidate work, merge
   const patchHash = report.delivery.patchHash;
   assert.ok(reportEvent && patchHash);
   const patch = JSON.parse(store.readArtifact(patchHash).toString("utf8"));
-  const deliveryCopy = createMissionWorkspace({
+  const deliveryCopy = await createMissionWorkspace({
     missionId, attemptId: randomUUID(), sourceRoot: sample.root, storeRoot: store.storageRoot,
     candidateParent: path.join(sample.base, "delivery-copy"), allowedPaths: ["src/**"],
   });
@@ -849,7 +849,7 @@ async function command(args) {
     const store = await openMissionStore(dbPaths(stateDir));
     const mission = store.createMission({ repositoryRoot: root, planId: "durable-fixture", planFile, definitionFile, commandId, admissionReceiptId: receiptId, missionId });
     const attemptId = randomUUID();
-    const workspace = createMissionWorkspace({
+    const workspace = await createMissionWorkspace({
       missionId, attemptId, sourceRoot: root, storeRoot: store.storageRoot, candidateParent,
       allowedPaths: store.inspectMission(missionId).definition.authority.allowedPaths,
     });

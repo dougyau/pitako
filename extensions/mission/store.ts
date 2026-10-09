@@ -4,6 +4,7 @@ import { execFileSync } from "node:child_process";
 import { closeSync, existsSync, fstatSync, fsyncSync, lstatSync, linkSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { resourceAllocations, resourceLimit, assertSupportedResourcePolicy, RESOURCE_FIELDS, meteredConsumptions } from "./resources.ts";
 import { getPitakoDataDir } from "../board/paths.ts";
 import { currentWorkspace, registeredWorktrees, repositoryIdentity } from "../board/workspace.ts";
 import { openSqlite, type SqlDatabase } from "../board/sqlite.ts";
@@ -23,7 +24,7 @@ import {
 } from "./model.ts";
 import { currentProcessIdentity, ownerProcessState, verifyPrivateCandidate, type ProcessIdentity } from "./workspace.ts";
 import { missionCorrectionNo, reduceMissionEvent, reduceMissionEvents, type MissionAttemptBinding } from "./engine.ts";
-import { assessMissionCompletion, missionCompletionBlockers } from "./completion.ts";
+import { assessMissionCompletion, missionCompletionBlockers, physicalResultBinding } from "./completion.ts";
 import { importedHoldReconciled, validLegacyHoldProof } from "./reconcile.ts";
 import { assertPreparedAdmission, consumePreparedAdmission, type PreparedMission } from "./preparation.ts";
 import { setupRequiredBy } from "./setup.ts";
@@ -41,6 +42,7 @@ export const EVENT_KINDS = new Set([
   "attempt.reserved", "attempt.started", "attempt.receipt", "attempt.settled",
   "provider.request.dispatched", "provider.request.receipt", "budget.reservation.adjusted",
   "budget.reservation.settled", "budget.admission.fenced", "provider.usage.claimed",
+  "resource.metered.admitted", "resource.metered.settled",
   "mission.active.window.opened", "mission.active.window.checkpointed", "mission.active.window.closed",
   "resource.wait", "dispatch.observed",
   "effect.denied", "effect.intent", "effect.invoking", "effect.process.registered", "effect.released", "effect.receipt", "effect.unknown", "effect.observation.recorded",
@@ -373,7 +375,7 @@ export async function openMissionStore(options: MissionStoreOptions = {}): Promi
 export class MissionStore {
   readonly runtimeId = PROCESS_RUNTIME_ID;
   private readonly db: SqlDatabase;
-  private readonly objectDir: string;
+  readonly objectDir: string;
   private readonly onDurabilityBoundary?: (boundary: CrashBoundary) => void;
   private readonly writerClaim?: WriterClaim;
   private closed = false;
@@ -623,6 +625,7 @@ export class MissionStore {
     if (plan.id !== planId) throw new MissionStoreError(`plan id ${plan.id} does not match requested ${planId}`);
     if (plan.status !== "frozen") throw new MissionStoreError(`plan ${planId} is ${plan.status}, not frozen`);
     const validated = validateMissionDefinitionBytes(definitionBytes);
+    assertSupportedResourcePolicy(validated.definition);
     if (!input.prepared && validated.definition.schemaVersion !== 1)
       throw new MissionStoreError("generated definitions require host preparation; local JSON cannot bypass validation");
     const currentHash = planHash(planText);
@@ -645,7 +648,7 @@ export class MissionStore {
     const preparedObject = input.prepared ? this.writeObject(Buffer.from(JSON.stringify(input.prepared)), "application/json") : undefined;
     if (preparedObject && preparedObject.hash !== preparedHash) throw new MissionStoreError("prepared object identity changed");
     const snapshot: PlanSnapshot = {
-      schemaVersion: input.prepared ? 2 : 1,
+      schemaVersion: input.prepared ? validated.definition.schemaVersion : 1,
       ...(input.prepared ? { preparedHash, sourceBinding: input.prepared.binding } : {}),
       planId,
       revision: plan.revision,
@@ -697,7 +700,7 @@ export class MissionStore {
       this.db.prepare(`INSERT INTO revisions (mission_id, revision, schema_version, plan_hash, definition_hash, source_path, parent_revision, admission_json, unit_mapping_json)
         VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)`)
         .run(requestedId, plan.revision, 1, planObject.hash, definitionObject.hash, planPath,
-          json(snapshot.schemaVersion === 2 ? { schemaVersion: 2, provenance: snapshot.admissionProvenance, preparedHash, sourceBinding: snapshot.sourceBinding } : snapshot.admissionProvenance),
+          json(snapshot.schemaVersion !== 1 ? { schemaVersion: snapshot.schemaVersion, provenance: snapshot.admissionProvenance, preparedHash, sourceBinding: snapshot.sourceBinding } : snapshot.admissionProvenance),
           json(snapshot.units));
       const insertUnit = this.db.prepare("INSERT INTO units (mission_id, revision, unit_id, parent_id, definition_json) VALUES (?, ?, ?, ?, ?)");
       for (const unit of validated.definition.units) insertUnit.run(requestedId, plan.revision, unit.id, unit.parentId ?? null, json(unit));
@@ -724,6 +727,7 @@ export class MissionStore {
     }
     const definition = validateMissionDefinitionBytes(input.definitionBytes).definition;
     if (definition.schemaVersion !== current.definition.schemaVersion) throw new MissionStoreError("revision cannot change executable contract version");
+    assertSupportedResourcePolicy(definition);
     if (current.prepared) {
       for (const original of current.prepared.definition.units) {
         const revised = definition.units.find(({ id }) => id === original.id);
@@ -776,7 +780,7 @@ export class MissionStore {
       if (preparedObject) this.insertObject(preparedObject);
       this.db.prepare(`INSERT INTO revisions (mission_id, revision, schema_version, plan_hash, definition_hash, source_path, parent_revision, admission_json, unit_mapping_json)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(input.missionId, revision, 1, planObject.hash, definitionObject.hash,
-          snapshot.sourcePath, current.revision, json(preparedObject ? { schemaVersion: 2, provenance: snapshot.admissionProvenance,
+          snapshot.sourcePath, current.revision, json(preparedObject ? { schemaVersion: snapshot.schemaVersion, provenance: snapshot.admissionProvenance,
             preparedHash: snapshot.preparedHash, sourceBinding: snapshot.sourceBinding } : snapshot.admissionProvenance), json(units));
       const insert = this.db.prepare("INSERT INTO units (mission_id, revision, unit_id, parent_id, definition_json) VALUES (?, ?, ?, ?, ?)");
       for (const unit of definition.units) insert.run(input.missionId, revision, unit.id, unit.parentId ?? null, json(unit));
@@ -802,15 +806,31 @@ export class MissionStore {
       ) ORDER BY seq`).all(missionId, afterSeq, missionId).map(readEvent);
   }
 
+  /** Bounded display tail only; no inspection, source/setup validation or replay reduction. */
+  readProgressEvents(missionId: string, afterSeq: number): MissionEvent[] {
+    requireUuid(missionId, "missionId");
+    return this.db.prepare("SELECT * FROM mission_events WHERE mission_id = ? AND seq > ? ORDER BY seq LIMIT 128")
+      .all(missionId, afterSeq).map(readEvent);
+  }
+
   inspectMission(missionId: string): MissionInspection {
     return this.readInspection(missionId, true);
   }
 
   /** Accounting only: this projection is not evidence for dispatch, effects or acceptance. */
-  readActiveTimeAccounting(missionId: string): Pick<MissionInspection, "revision" | "version" | "state" | "reservations"> {
+  /** Cheap invalidation of hydration within a single physical write frontier. */
+  readMissionControl(missionId: string): Pick<MissionInspection, "revision" | "version" | "state"> {
+    requireUuid(missionId, "missionId");
+    const row = this.db.prepare("SELECT revision, version, state FROM missions WHERE mission_id = ?").get(missionId);
+    if (!row) throw new MissionStoreError("mission not found");
+    return { revision: number(row.revision, "revision"), version: number(row.version, "version"),
+      state: text(row.state, "state") as MissionInspection["state"] };
+  }
+  readActiveTimeAccounting(missionId: string): Pick<MissionInspection, "revision" | "version" | "state" | "reservations"> &
+    { metered: ReturnType<typeof meteredConsumptions> } {
     const inspection = this.readInspection(missionId, false);
     return { revision: inspection.revision, version: inspection.version,
-      state: reduceMissionEvents(inspection).state, reservations: inspection.reservations };
+      state: reduceMissionEvents(inspection).state, reservations: inspection.reservations, metered: meteredConsumptions(inspection.events) };
   }
 
   private readInspection(missionId: string, hydratePrepared: boolean): MissionInspection {
@@ -869,7 +889,7 @@ export class MissionStore {
     }
     if (existing.every(Boolean)) {
       if (drafts.some(({ kind }) => kind === "mission.completed")) {
-        const blockers = missionCompletionBlockers(this.inspectMission(missionId), this);
+        const blockers = this.currentCompletionObservation(missionId, expectedVersion).blockers;
         if (blockers.length) throw new MissionStoreError(`mission completion blocked: ${blockers.join(", ")}`);
       }
       return existing.map((row) => readEvent(row!));
@@ -880,10 +900,11 @@ export class MissionStore {
     // Only an existing window's measured charge can avoid reloading setup proof.
     // Any mixed transition, new grant, effect or acceptance keeps full inspection.
     const checkpointOnly = !artifacts.length && drafts.length === 2 &&
-      drafts[0]!.kind === "budget.reservation.settled" && drafts[1]!.kind === "mission.active.window.checkpointed";
+      ["budget.reservation.settled", "resource.metered.settled"].includes(drafts[0]!.kind) &&
+      drafts[1]!.kind === "mission.active.window.checkpointed";
     const inspection = checkpointOnly ? this.readInspection(missionId, false) : this.inspectMission(missionId);
     if (checkpointOnly) this.assertActiveTimeCheckpoint(inspection, drafts);
-    const budget = inspection.definition.budget;
+    const definition = inspection.definition;
     let projected = reduceMissionEvents(inspection);
     const newDrafts = drafts.filter((_, index) => !existing[index]);
     this.withTransaction(() => {
@@ -892,7 +913,7 @@ export class MissionStore {
       const priorEvents = this.db.prepare("SELECT * FROM mission_events WHERE mission_id = ? ORDER BY seq").all(missionId).map(readEvent);
       const inserted = [...priorEvents];
       if (drafts.some((draft, index) => draft.kind === "mission.completed" && existing[index])) {
-        const blockers = missionCompletionBlockers({ ...inspection, events: inserted }, this);
+        const blockers = this.currentCompletionObservation(missionId, expectedVersion).blockers;
         if (blockers.length) throw new MissionStoreError(`mission completion blocked: ${blockers.join(", ")}`);
       }
       const reservationRows = new Map<string, Reservation>();
@@ -902,7 +923,7 @@ export class MissionStore {
           if (draft.revision !== inspection.revision || draft !== newDrafts.at(-1) ||
             inserted.some((event) => event.kind === "mission.completed"))
             throw new MissionStoreError("mission completion blocked: stale or duplicate completion");
-          const assessment = assessMissionCompletion({ ...inspection, events: inserted }, this);
+          const assessment = this.currentCompletionObservation(missionId, expectedVersion);
           if (assessment.blockers.length) throw new MissionStoreError(`mission completion blocked: ${assessment.blockers.join(", ")}`);
           const publication = inserted.at(-1);
           const certificateHash = sha256(Buffer.from(json(assessment.certificate)));
@@ -916,11 +937,16 @@ export class MissionStore {
         }
         if (draft.kind === "attempt.reserved") assertAttemptSlotAvailable(inserted, draft.payload);
         if (draft.kind === "attempt.settled") assertAttemptIsActive(inserted, draft.payload);
+        if (draft.kind === "resource.metered.admitted" && (fenceReason || draft.revision !== inspection.revision ||
+          ["paused", "cancelled", "completed"].includes(projected.state)))
+          throw new MissionStoreError("metered admission needs current unfenced revision and control authority");
         if (draft.kind === "reservation.created") {
           if (fenceReason || inserted.some((event) => event.kind === "budget.admission.fenced")) {
             throw new MissionStoreError(`mission admission is fenced: ${fenceReason ?? "prior resource overage"}`);
           }
           const reservation = reservationFromEvent(missionId, draft);
+          if (resourceLimit(definition, reservation.resource as import("./resources.ts").Resource) === undefined)
+            throw new MissionStoreError("numeric reservation requires an explicit cap");
           if (reservationRows.has(reservation.id) || inserted.some((event) => event.kind === "reservation.created" && event.payload.reservationId === reservation.id) ||
             this.db.prepare("SELECT reservation_id FROM reservations WHERE reservation_id = ?").get(reservation.id)) {
             throw new MissionStoreError("reservation id is already committed by another event");
@@ -939,11 +965,13 @@ export class MissionStore {
         });
         inserted.push(event);
         projected = reduceMissionEvent(projected, event);
+        if (draft.kind === "resource.metered.admitted" || draft.kind === "resource.metered.settled")
+          validateMeteredEvent(inserted, event, definition, this.ownerEpoch);
         if (draft.kind === "reservation.created" || draft.kind === "budget.reservation.adjusted") {
-          validateBudgetReservations(missionId, inserted, budget);
+          validateBudgetReservations(missionId, inserted, definition);
         } else if (draft.kind === "budget.reservation.settled") {
           validateReservationSettlement(missionId, inserted, draft.payload);
-          fenceReason ??= budgetOverrunReason(missionId, inserted, budget);
+          fenceReason ??= budgetOverrunReason(missionId, inserted, definition);
         }
       }
       if (fenceReason && !inserted.some((event) => event.kind === "budget.admission.fenced")) {
@@ -1004,22 +1032,44 @@ export class MissionStore {
       : this.inspectMission(missionId).events.slice(number(row.latest_seq, "latest_seq"));
   }
 
-  completeMission(missionId: string, expectedVersion: number): void {
+  private completionObservation?: { missionId: string; version: number; assessment: ReturnType<typeof assessMissionCompletion> };
+  private currentCompletionObservation(missionId: string, version: number): ReturnType<typeof assessMissionCompletion> {
+    const proof = this.completionObservation;
+    if (!proof || proof.missionId !== missionId || proof.version !== version)
+      throw new MissionStoreError("mission completion blocked: fresh completion observation required");
+    return proof.assessment;
+  }
+
+  async completeMission(missionId: string, expectedVersion: number): Promise<void> {
     this.assertWriterClaim();
     const inspection = this.inspectMission(missionId);
     if (inspection.version !== expectedVersion) throw new MissionStoreError("mission completion version conflict");
-    const assessment = assessMissionCompletion(inspection, this);
+    const owner = this.ownershipIdentity;
+    const { PhysicalObservation } = await import("./physical-observation.ts");
+    const observer = new PhysicalObservation();
+    let assessment: ReturnType<typeof assessMissionCompletion>;
+    try { assessment = await observer.request("completion",
+      { ...this.historyLocator, missionId, binding: physicalResultBinding(inspection) }); }
+    finally { await observer.dispose(); }
+    this.assertWriterClaim();
+    const current = this.inspectMission(missionId);
+    if (json(owner) !== json(this.ownershipIdentity) || physicalResultBinding(current) !== physicalResultBinding(inspection))
+      throw new MissionStoreError("mission completion observation became stale");
     if (assessment.blockers.length || !assessment.certificate)
       throw new MissionStoreError(`mission completion blocked: ${assessment.blockers.join(", ")}`);
     if (inspection.events.some((event) => event.kind === "mission.completed")) return;
+    const { certificateHash: _observedHash, ...observed } = assessment.certificate;
+    const unsigned = { ...observed, eventSequence: current.latestSeq + 2 };
+    assessment.certificate = { ...unsigned, certificateHash: sha256(Buffer.from(JSON.stringify(unsigned))) };
     const bytes = Buffer.from(json(assessment.certificate));
     const certificateArtifactHash = sha256(bytes);
     const payload = { manifestHash: assessment.certificate.manifestHash, approvalHash: assessment.certificate.approvalHash,
       certificateArtifactHash };
-    this.appendTransition(missionId, expectedVersion, { artifacts: [{ bytes, mediaType: "application/json" }], events: [
+    this.completionObservation = { missionId, version: current.version, assessment };
+    try { this.appendTransition(missionId, current.version, { artifacts: [{ bytes, mediaType: "application/json" }], events: [
       { revision: inspection.revision, kind: "mission.finalization.published", causalId: randomUUID(), payload },
       { revision: inspection.revision, kind: "mission.completed", causalId: randomUUID(), payload },
-    ] });
+    ] }); } finally { this.completionObservation = undefined; }
   }
 
   reserve(
@@ -1461,6 +1511,20 @@ export class MissionStore {
     const tick = checkpoint!.payload;
     const window = [...inspection.events].reverse().find((event) =>
       event.kind === "mission.active.window.opened" || event.kind === "mission.active.window.closed");
+    if (settlement!.kind === "resource.metered.settled") {
+      const ticket = meteredConsumptions(inspection.events).find(row => row.ticketId === tick.ticketId);
+      if (!window || window.kind !== "mission.active.window.opened" ||
+        window.payload.windowId !== tick.windowId || window.payload.ticketId !== tick.ticketId ||
+        window.payload.runtimeId !== this.runtimeId || window.payload.ownerEpoch !== this.ownerEpoch ||
+        reduceMissionEvents(inspection).state === "paused" || drafts.some(draft => draft.revision !== inspection.revision) ||
+        !ticket?.outstanding || ticket.resource !== "active-time-ms" || ticket.ownerEpoch !== this.ownerEpoch ||
+        charge.ticketId !== ticket.ticketId || charge.resource !== ticket.resource ||
+        !Number.isSafeInteger(tick.durationMs) || Number(tick.durationMs) < 1 ||
+        tick.cumulativeKnownMs !== ticket.knownCharge + Number(tick.durationMs) ||
+        charge.knownCharge !== tick.cumulativeKnownMs || charge.unknown !== false || charge.outstanding !== true || tick.measured !== true)
+        throw new MissionStoreError("metered checkpoint must charge the current owned interval");
+      return;
+    }
     const reservation = inspection.reservations.find(({ id }) => id === tick.reservationId);
     if (!window || window.kind !== "mission.active.window.opened" ||
       window.payload.windowId !== tick.windowId || window.payload.reservationId !== tick.reservationId ||
@@ -1484,8 +1548,8 @@ export class MissionStore {
     if (!revision) throw new MissionStoreError("mission revision projection is missing");
     if (number(revision.schema_version, "revision schema_version") !== 1) throw new MissionStoreError("mission revision storage schema is unsupported");
     const envelope = parseJson(revision.admission_json, "admission provenance");
-    const schemaVersion = envelope.schemaVersion === 2 ? 2 : 1;
-    const admission = schemaVersion === 2
+    const schemaVersion = envelope.schemaVersion === 3 ? 3 : envelope.schemaVersion === 2 ? 2 : 1;
+    const admission = schemaVersion !== 1
       ? parseJson<{ provenance: PlanSnapshot["admissionProvenance"]; preparedHash: string; sourceBinding: NonNullable<PlanSnapshot["sourceBinding"]> }>(
         revision.admission_json, "generated admission provenance") : undefined;
     const snapshot: PlanSnapshot = {
@@ -1514,7 +1578,7 @@ export class MissionStore {
     }
     const definition = validateMissionDefinitionBytes(definitionBytes).definition;
     let prepared: PreparedMission | undefined;
-    if (schemaVersion === 2) {
+    if (schemaVersion !== 1) {
       if (!snapshot.preparedHash || !OBJECT_HASH.test(snapshot.preparedHash) || !snapshot.sourceBinding)
         throw new MissionStoreError("generated snapshot lacks prepared source identity");
       if (hydratePrepared) {
@@ -2503,6 +2567,32 @@ function readReservation(row: Record<string, unknown>): Reservation {
   };
 }
 
+function validateMeteredEvent(events: MissionEvent[], event: MissionEvent, definition: MissionDefinition, ownerEpoch: number | null): void {
+  if (definition.schemaVersion !== 3) throw new MissionStoreError("legacy missions require capped reservations");
+  if (event.kind === "resource.metered.admitted") {
+    const ticket = event.payload.ticket as import("./resources.ts").MeteredTicket | undefined;
+    if (!ticket || ticket.kind !== "metered" || !isUuid(ticket.ticketId) || !isUuid(ticket.operationId) ||
+      ticket.revision !== event.revision || ticket.ownerEpoch !== ownerEpoch ||
+      !Object.hasOwn(RESOURCE_FIELDS, ticket.resource) || resourceLimit(definition, ticket.resource) !== undefined ||
+      Object.keys(ticket).sort().join() !== ["kind", "ticketId", "operationId", "resource", "revision", "ownerEpoch"].sort().join() ||
+      event.payload.knownCharge !== undefined && (typeof event.payload.knownCharge !== "number" ||
+        !Number.isSafeInteger(event.payload.knownCharge) || event.payload.knownCharge < 0) ||
+      event.payload.outstanding !== undefined && typeof event.payload.outstanding !== "boolean" ||
+      events.slice(0, -1).some(row => row.kind === "resource.metered.admitted" &&
+        (row.payload.ticket as import("./resources.ts").MeteredTicket).ticketId === ticket.ticketId) ||
+      events.some(row => row.kind === "budget.admission.fenced"))
+      throw new MissionStoreError("invalid, capped, duplicate or fenced metered ticket");
+    return;
+  }
+  const charge = event.payload;
+  const ticket = meteredConsumptions(events.slice(0, -1)).find(row => row.ticketId === charge.ticketId);
+  if (!ticket || ticket.revision !== event.revision || charge.resource !== ticket.resource ||
+    !Number.isSafeInteger(charge.knownCharge) || Number(charge.knownCharge) < ticket.knownCharge ||
+    typeof charge.unknown !== "boolean" || typeof charge.outstanding !== "boolean" ||
+    ticket.unknown && charge.unknown !== true || !ticket.outstanding)
+    throw new MissionStoreError("metered settlement needs a current ticket and monotonic known/unknown consumption");
+}
+
 function reservationPurpose(value: unknown): NonNullable<Reservation["purpose"]> {
   const purpose = value === undefined ? "ordinary" : text(value, "reservation purpose");
   if (purpose !== "ordinary" && purpose !== "protected" && purpose !== "finalization") throw new MissionStoreError(`unsupported reservation purpose ${purpose}`);
@@ -2573,11 +2663,7 @@ function assertAttemptIsActive(events: MissionEvent[], payload: Record<string, u
   if (!active) throw new MissionStoreError(`attempt is not active: ${attemptId}`);
 }
 
-function validateBudgetReservations(missionId: string, events: MissionEvent[], budget: MissionDefinition["budget"]): void {
-  const limits: Record<string, number> = {
-    "role-launches": budget.roleLaunches, "provider-requests": budget.providerRequests,
-    tokens: budget.tokens, "active-time-ms": budget.activeTimeMs, "artifact-bytes": budget.artifactBytes,
-  };
+function validateBudgetReservations(missionId: string, events: MissionEvent[], definition: MissionDefinition): void {
   const reservations = events.filter(({ kind }) => kind === "reservation.created")
     .map((event) => reservationProjection(missionId, events, event.payload.reservationId)!)
     .filter(({ amount }) => amount > 0);
@@ -2585,7 +2671,7 @@ function validateBudgetReservations(missionId: string, events: MissionEvent[], b
   if (overGrant) throw new MissionStoreError(`${overGrant.resource} settlement exceeds immutable grant by ${overGrant.overage}`);
   const resources = new Set(reservations.map(({ resource }) => resource));
   for (const resource of resources) {
-    const limit = limits[resource];
+    const limit = resourceLimit(definition, resource as import("./resources.ts").Resource);
     if (limit === undefined) throw new MissionStoreError(`unknown mission budget resource ${resource}`);
     const rows = reservations.filter((reservation) => reservation.resource === resource);
     const ordinary = rows.filter(({ purpose }) => purpose === "ordinary").reduce((sum, { amount }) => sum + amount, 0);
@@ -2653,11 +2739,7 @@ function validateReservationAdjustment(missionId: string, events: MissionEvent[]
   }
 }
 
-function budgetOverrunReason(missionId: string, events: MissionEvent[], budget: MissionDefinition["budget"]): string | undefined {
-  const limits: Record<string, number> = {
-    "role-launches": budget.roleLaunches, "provider-requests": budget.providerRequests,
-    tokens: budget.tokens, "active-time-ms": budget.activeTimeMs, "artifact-bytes": budget.artifactBytes,
-  };
+function budgetOverrunReason(missionId: string, events: MissionEvent[], definition: MissionDefinition): string | undefined {
   const reservations = events.filter(({ kind }) => kind === "reservation.created")
     .map((event) => reservationProjection(missionId, events, event.payload.reservationId)!)
     .filter(({ amount }) => amount > 0);
@@ -2668,7 +2750,8 @@ function budgetOverrunReason(missionId: string, events: MissionEvent[], budget: 
     const ordinary = rows.filter(({ purpose }) => purpose === "ordinary").reduce((sum, { amount }) => sum + amount, 0);
     const protectedCapacity = rows.filter(({ purpose }) => purpose === "protected").reduce((sum, { amount }) => sum + amount, 0);
     const finalization = rows.filter(({ purpose }) => purpose === "finalization").reduce((sum, { amount }) => sum + amount, 0);
-    const limit = limits[resource]!;
+    const limit = resourceLimit(definition, resource as import("./resources.ts").Resource);
+    if (limit === undefined) return `numeric reservation without explicit ${resource} cap`;
     if (ordinary + protectedCapacity > limit) return `${resource} occupancy exceeds root budget (${ordinary + protectedCapacity} > ${limit})`;
     if (finalization > protectedCapacity) return `${resource} finalization occupancy exceeds protected capacity (${finalization} > ${protectedCapacity})`;
   }

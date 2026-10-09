@@ -38,7 +38,7 @@ export interface CapturedMission {
   identity: {
     planId: string; repositoryId: string; engineCommit: string; runtime: string;
     revisions: Array<{ revision: number; planHash: string; definitionHash: string; authorityHash: string;
-      budget: unknown; policies: unknown; criteria: unknown }>;
+      budget: unknown; resourcePolicy?: unknown; policies: unknown; criteria: unknown }>;
   };
   facts: MetricFact[];
   observations: Array<{ seq: number; observation: EvaluationObservation; provenance: EvaluationProvenance }>;
@@ -56,7 +56,8 @@ const DATA_FIELDS = ["requestId", "inputTokens", "outputTokens", "estimatedCost"
   "elapsedMs", "queueWaitMs", "responseMs", "windowId", "unknownReason", "unknownInterval", "status",
   "manifestHash", "acceptedManifestHash", "inputManifestHash", "outputManifestHash", "artifactHash", "reportHash",
   "provider", "model", "requestedReasoning", "appliedReasoning", "intervention", "pauseEventId",
-  "recoveryOf", "correctionNo", "continuationOf", "round", "memberId", "resumedFrom", "checkpointHash", "ownerEpoch"];
+  "recoveryOf", "correctionNo", "continuationOf", "round", "memberId", "resumedFrom", "checkpointHash", "ownerEpoch",
+  "ticketId", "operationId", "resource", "knownCharge", "unknown", "outstanding"];
 
 function provenance(store: MissionStore, observation: EvaluationObservation): EvaluationProvenance {
   const docs = observation.evidenceRefs.filter((hash) => /^[a-f0-9]{64}$/.test(hash)).flatMap((hash) => {
@@ -140,7 +141,8 @@ export function captureMetricMission(store: MissionStore, mission: MissionInspec
     const snapshot = e.payload.snapshot as MissionInspection["snapshot"];
     const definition = JSON.parse(store.readArtifact(snapshot.definitionHash).toString("utf8"));
     return { revision: e.revision, planHash: snapshot.planHash, definitionHash: snapshot.definitionHash,
-      authorityHash: sha256(Buffer.from(JSON.stringify(definition.authority))), budget: definition.budget,
+      authorityHash: sha256(Buffer.from(JSON.stringify(definition.authority))), budget: definition.budget ?? null,
+      ...(definition.schemaVersion === 3 ? { resourcePolicy: definition.resourcePolicy } : {}),
       policies: definition.authority.rolePolicies,
       criteria: definition.units.map((u: { id: string; acceptance: unknown }) => ({
         unitId: u.id, criterionHash: sha256(Buffer.from(JSON.stringify(u.acceptance))) })) };
@@ -151,6 +153,7 @@ export function captureMetricMission(store: MissionStore, mission: MissionInspec
     facts: events.map((e) => {
       const binding = e.payload.binding as Record<string, unknown> | undefined;
       const data = Object.fromEntries(DATA_FIELDS.filter((key) => e.payload[key] !== undefined).map((key) => [key, e.payload[key]]));
+      if (e.kind === "resource.metered.admitted") Object.assign(data, e.payload.ticket);
       if (binding) {
         data.effort = binding.teamBundleHash || binding.consultationId ? "team" : binding.recoveryOf || binding.recoveryMode || binding.roundId === "recovery" ? "recovery" :
           binding.finalization ? "verification" : "implementation";

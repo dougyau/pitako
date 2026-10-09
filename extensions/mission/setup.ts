@@ -11,6 +11,8 @@ import { sha256, type MissionDefinition } from "./model.ts";
 import type { MissionInspection, MissionStore } from "./store.ts";
 import { currentProcessIdentity, openSeccompFilter, ownerProcessState, processBirthTicks, processNamespaceId, processParentPid, processesInNamespace, readOwnedNamespaceInit, type ProcessIdentity } from "./workspace.ts";
 import { assertCopyInputs, captureCopyIdentity, captureCopyOutputs, copyStorageBytes, initializeCopy, launchCopy, publishCopy, type CopyContract } from "./setup-copy.ts";
+import { PhysicalObservation } from "./physical-observation.ts";
+import { resourceLimit } from "./resources.ts";
 
 const hash = (value: unknown) => sha256(Buffer.from(JSON.stringify(value)));
 const PRODUCER_FILE = fileURLToPath(import.meta.url);
@@ -150,6 +152,25 @@ export function admitPreparedSetup(store: MissionStore, missionId: string, reche
   starts.set(admission, { store, missionId, revision: inspection.revision, ownerEpoch: store.ownerEpoch,
     writerIdentity: store.ownershipIdentity, preparedHash: inspection.snapshot.preparedHash,
     definitionHash: inspection.snapshot.definitionHash, recheck, scope: "prepare" });
+  return admission;
+}
+
+/** Derive setup execution from the one durable combined native admission, never a second receipt. */
+export function admitFrozenSetupStart(store: MissionStore, missionId: string, receiptId: string,
+  recheck: () => void): SetupStartAdmission {
+  recheck();
+  const inspection = store.inspectMission(missionId);
+  const receipt = inspection.events[0]?.payload.operatorReceipt as OperatorReceipt | undefined;
+  const action = receipt && JSON.parse(receipt.text);
+  if (inspection.state !== "prepared" || !inspection.prepared?.setup || store.ownerEpoch === null ||
+    receipt?.source !== "native-confirmation" || receipt.id !== receiptId ||
+    action?.action !== "admit-and-start-frozen-mission-v1" || action.preparedHash !== inspection.snapshot.preparedHash ||
+    inspection.prepared.setup.decision.receiptId !== receiptId)
+    throw new Error("current combined frozen-start setup admission required");
+  const admission = Object.freeze({ id: receiptId });
+  starts.set(admission, { store, missionId, revision: inspection.revision, ownerEpoch: store.ownerEpoch,
+    writerIdentity: store.ownershipIdentity, preparedHash: inspection.snapshot.preparedHash,
+    definitionHash: inspection.snapshot.definitionHash, recheck, scope: "start" });
   return admission;
 }
 
@@ -294,6 +315,7 @@ export class MissionSetup {
   private disposed = true;
   private readonly store: MissionStore;
   private readonly missionId: string;
+  private witnessed?: { generation: string; readiness: SetupReadiness };
   constructor(store: MissionStore, missionId: string) { this.store = store; this.missionId = missionId; }
   get quiescent(): boolean {
     return this.quiescentFor(this.store.inspectMission(this.missionId));
@@ -347,7 +369,7 @@ export class MissionSetup {
   }
   async stop(): Promise<void> { this.fence(); await this.job; if (!this.quiescent) throw new Error("setup disposal unproved; owner release forbidden"); }
   /** Recovery observes registered physical processes; never synthesizes success or reruns the hook. */
-  reconcile(): SetupReadiness {
+  async reconcile(): Promise<SetupReadiness> {
     const inspection = this.store.inspectMission(this.missionId);
     for (const intent of inspection.events.filter(({ kind }) => kind === "mission.setup.intent")) {
       if (inspection.events.some((event) => ["mission.setup.receipt", "mission.setup.reconciled"].includes(event.kind) &&
@@ -364,7 +386,7 @@ export class MissionSetup {
         observedBy: currentProcessIdentity(this.store.runtimeId, this.store.ownerEpoch!), reason: "registered launcher dead and owned namespace empty" }));
       this.append("mission.setup.reconciled", { intentId: intent.eventId, observationHash: sha256(bytes), disposed: true }, bytes);
     }
-    const readiness = this.compatibleSuccess();
+    const readiness = await this.refresh();
     if (readiness.state === "ready" && readiness.reuseHash &&
       !inspection.events.some((event) => event.kind === "mission.setup.reused" &&
         event.revision === inspection.revision && event.payload.reuseHash === readiness.reuseHash)) {
@@ -382,7 +404,8 @@ export class MissionSetup {
       inputIdentity: missionInputIdentity(inspection, inspection.prepared!.binding.executionRoot),
       obligationsHash: hash(inspection.definition.units), receiptHash };
   }
-  observe(inspection = this.store.inspectMission(this.missionId)): SetupReadiness {
+  /** Read-only observer entry; never use on the native/UI thread. */
+  observePhysical(inspection = this.store.inspectMission(this.missionId)): SetupReadiness {
     let readiness: SetupReadiness;
     try { readiness = this.compatibleSuccess(inspection); }
     catch (error) {
@@ -397,6 +420,40 @@ export class MissionSetup {
         return { state: "blocked", reason: "compatible setup success needs a current durable reuse reference" };
     }
     return readiness;
+  }
+  private generation(inspection: MissionInspection): string {
+    return hash([inspection.revision, inspection.snapshot.preparedHash, inspection.snapshot.definitionHash,
+      inspection.events.filter(event => event.kind.startsWith("mission.setup.") ||
+        ["mission.paused", "mission.cancelled", "mission.resumed", "mission.owner.claimed"].includes(event.kind)).map(event => event.eventId)]);
+  }
+  /** Projection-only. Physical freshness is established explicitly at an effect frontier. */
+  observe(inspection = this.store.inspectMission(this.missionId)): SetupReadiness {
+    if (!inspection.prepared?.setup) return { state: "missing-script", reason: "no separately admitted setup contract" };
+    if (this.witnessed?.generation === this.generation(inspection)) return this.witnessed.readiness;
+    return { state: "blocked", reason: "setup physical observation is required at the current frontier" };
+  }
+  async refresh(observer?: PhysicalObservation, signal?: AbortSignal): Promise<SetupReadiness> {
+    const inspection = this.store.inspectMission(this.missionId);
+    if (!inspection.prepared?.setup) return { state: "missing-script", reason: "no separately admitted setup contract" };
+    const physical = observer ?? new PhysicalObservation();
+    const generation = this.generation(inspection);
+    const ownerEpoch = this.store.ownerEpoch;
+    try {
+      if (!this.store.dbPath) throw new Error("setup observation requires a persisted read-only store");
+      const readiness = await physical.request<SetupReadiness>("setupReadiness", {
+        dbPath: this.store.dbPath, objectDir: this.store.objectDir, missionId: this.missionId,
+      }, signal);
+      const current = this.store.inspectMission(this.missionId);
+      if (signal?.aborted || this.fenced || ownerEpoch !== this.store.ownerEpoch || generation !== this.generation(current))
+        throw new Error("setup physical observation became stale");
+      missionInputIdentity(current, current.prepared!.binding.executionRoot);
+      this.witnessed = { generation, readiness };
+      return readiness;
+    } finally { if (!observer) await physical.dispose(); }
+  }
+  async observeDependencyBacking(): Promise<ReturnType<MissionSetup["dependencyBacking"]>> {
+    if (this.store.inspectMission(this.missionId).prepared?.setup?.identity.copy) await this.refresh();
+    return this.dependencyBacking();
   }
   dependencyBacking(): { root: string; identity: string; recheck: () => void } | undefined {
     const setup = this.store.inspectMission(this.missionId).prepared?.setup;
@@ -444,18 +501,19 @@ export class MissionSetup {
     return { state: "ready", receiptHash, reused: true,
       ...(input.revision < inspection.revision ? { reuseHash: hash(this.reuseReference(inspection, receiptHash)) } : {}) };
   }
-  ensure(admission: SetupStartAdmission, consumersQuiescent: () => boolean): Promise<SetupReadiness> {
+  async ensure(admission: SetupStartAdmission, consumersQuiescent: () => boolean): Promise<SetupReadiness> {
     if (this.job) throw new Error("setup mutation already active");
-    const ready = this.observe();
+    if (starts.has(admission) && this.quiescent) this.fenced = false;
+    const ready = await this.refresh();
     if (ready.state !== "blocked") return Promise.resolve(ready);
     const inspection = this.store.inspectMission(this.missionId);
     if (inspection.events.some((event) => event.kind === "mission.setup.intent")) return Promise.resolve(ready);
     if (starts.has(admission) && this.quiescent) this.fenced = false;
     const job = this.run(admission, consumersQuiescent);
     this.job = job;
-    return job.finally(() => { this.job = undefined; }).then((result) => {
+    return job.finally(() => { this.job = undefined; }).then(async (result) => {
       if (inspection.prepared?.setup?.identity.copy && result.state === "ready") {
-        const observed = this.observe();
+        const observed = await this.refresh();
         return observed.state === "ready" ? { ...observed, reused: false } : observed;
       }
       return result;
@@ -478,7 +536,6 @@ export class MissionSetup {
     const setup = inspection.prepared?.setup;
     if (!setup) throw new Error("setup effect decision absent");
     missionInputIdentity(inspection, setup.identity.binding.executionRoot);
-    assertSetupInputs(setup);
     return inspection;
   }
   private append(kind: "mission.setup.intent" | "mission.setup.invoking" | "mission.setup.receipt" | "mission.setup.reconciled" | "mission.setup.reused", payload: Record<string, unknown>, artifact?: Buffer) {
@@ -488,22 +545,50 @@ export class MissionSetup {
       events: [{ revision: inspection.revision, kind, causalId: randomUUID(), payload }] })[0]!;
   }
   private async run(admission: SetupStartAdmission, quiescent: () => boolean): Promise<SetupReadiness> {
+    const observer = new PhysicalObservation();
+    try { return await this.runObserved(admission, quiescent, observer); }
+    catch (error) { return { state: "blocked", reason: error instanceof Error ? error.message : String(error) }; }
+    finally { await observer.dispose(); }
+  }
+  private async runObserved(admission: SetupStartAdmission, quiescent: () => boolean, observer: PhysicalObservation): Promise<SetupReadiness> {
     const started = performance.now();
     const inspection = this.check(admission, quiescent);
     const setup = inspection.prepared!.setup!;
     const values = setup.decision.values;
-    const before = captureSetupOutputs(setup);
+    // Reuse hydration only inside this write frontier. The current version and
+    // live authority are still checked after every awaited filesystem write.
+    let writeInspection = inspection;
+    const recheckWrite = () => {
+      const authority = starts.get(admission);
+      if (!authority || this.fenced || this.store.ownerEpoch !== authority.ownerEpoch || !quiescent() ||
+        hash(this.store.ownershipIdentity) !== hash(authority.writerIdentity))
+        throw new Error("setup live write admission expired");
+      authority.recheck();
+      if (this.store.readMissionControl(this.missionId).version !== writeInspection.version)
+        writeInspection = this.check(admission, quiescent);
+      const binding = setup.identity.binding;
+      if (physical(binding.executionRoot) !== setup.identity.rootIdentity ||
+        readFileSync(binding.planSource, "utf8") !== writeInspection.prepared!.originalSource)
+        throw new Error("setup physical source pin changed during copy");
+      if (performance.now() - started >= values.activeTimeMs) throw new Error("setup allocation expired during copy");
+    };
+    const before = await observer.request<PathRow[]>("setupOutputs", setup);
+    this.check(admission, quiescent);
     const owner = currentProcessIdentity(this.store.runtimeId, this.store.ownerEpoch!);
-    const reservations = [
+    const reservations: Array<{ id: string; resource: "active-time-ms" | "artifact-bytes"; amount: number }> = [
       { id: randomUUID(), resource: "active-time-ms", amount: values.activeTimeMs },
       { id: randomUUID(), resource: "artifact-bytes", amount: values.artifactBytes },
     ];
     const input = Buffer.from(JSON.stringify({ setup, before, admissionId: admission.id, revision: inspection.revision,
       preparedHash: inspection.snapshot.preparedHash, definitionHash: inspection.snapshot.definitionHash, owner }));
     if (input.length > values.artifactBytes / 2) throw new Error("setup identity exceeds approved evidence allocation");
-    const intent = this.store.appendTransition(this.missionId, inspection.version, {
+    const intent = this.store.appendTransition(this.missionId, this.check(admission, quiescent).version, {
       artifacts: [{ bytes: input, mediaType: "application/json" }],
-      events: [...reservations.map((reservation) => ({ revision: inspection.revision,
+      events: [...reservations.map((reservation) => resourceLimit(inspection.definition, reservation.resource) === undefined ?
+        { revision: inspection.revision, kind: "resource.metered.admitted", causalId: randomUUID(),
+          payload: { ticket: { kind: "metered", ticketId: reservation.id, operationId: admission.id,
+            resource: reservation.resource, revision: inspection.revision, ownerEpoch: this.store.ownerEpoch } } } :
+        ({ revision: inspection.revision,
         kind: "reservation.created" as const, causalId: randomUUID(),
         payload: { reservationId: reservation.id, revision: inspection.revision, resource: reservation.resource,
           amount: reservation.amount, purpose: "ordinary" } })),
@@ -517,8 +602,13 @@ export class MissionSetup {
     let status = "unknown", reason = "", exitCode: number | null = null;
     let processIdentity: Record<string, unknown> | undefined;
     try {
+      await observer.request("setupInputs", setup);
       this.check(admission, quiescent);
-      if (setup.identity.copy) initializeCopy(setup);
+      if (setup.identity.copy) {
+        await initializeCopy(setup, recheckWrite);
+        await observer.request("setupInputs", setup);
+        this.check(admission, quiescent);
+      }
       this.child = setup.identity.copy ? launchCopy(setup) : launch(setup);
       this.disposed = false;
       const child = this.child;
@@ -549,6 +639,7 @@ export class MissionSetup {
       timer = setTimeout(() => { timedOut = true; rejectReady(new Error("setup allocation expired")); this.fence(); },
         Math.max(1, values.activeTimeMs - (performance.now() - started)));
       const row = await Promise.race([ready, exited.then(() => { throw new Error("setup launcher exited before GO"); })]);
+      await observer.request("setupInputs", setup);
       this.check(admission, quiescent);
       if (typeof row.pidNamespace !== "string" || typeof row.networkNamespace !== "string" ||
         row.pidNamespace === processNamespaceId(process.pid) || row.networkNamespace === readlinkSync("/proc/self/ns/net"))
@@ -574,18 +665,39 @@ export class MissionSetup {
       this.fence();
       try { await this.drain(); } catch (disposalError) { reason += `; ${String(disposalError)}`; }
       status = this.disposed ? "stopped" : "unknown";
-    } finally { if (timer) clearTimeout(timer); }
+    } finally { if (timer) clearTimeout(timer); await observer.dispose(); }
     let after: PathRow[] = [], outputError: string | undefined;
     let copiedBytes = 0;
     try {
-      if (setup.identity.copy && status === "completed") publishCopy(setup);
-      after = captureSetupOutputs(setup);
+      const resultObserver = new PhysicalObservation();
+      try {
+        if (setup.identity.copy && status === "completed") {
+          const rows = await resultObserver.request<PathRow[]>("copyPublication", setup);
+          this.check(admission, quiescent);
+          await publishCopy(setup, rows, recheckWrite);
+        }
+        after = await resultObserver.request<PathRow[]>("setupOutputs", setup);
+        if (setup.identity.copy) {
+          copiedBytes = await resultObserver.request<number>("copyStorage", setup.identity);
+          if (copiedBytes > values.artifactBytes) throw new Error("copied setup storage exceeds admitted artifact allocation");
+        }
+      }
+      finally { await resultObserver.dispose(); }
     } catch (error) {
       outputError = String(error); status = this.disposed ? "failed" : "unknown"; reason += `; ${outputError}`;
     }
-    if (setup.identity.copy) copiedBytes = copyStorageBytes(setup.identity);
+    if (setup.identity.copy && !copiedBytes) {
+      const storageObserver = new PhysicalObservation();
+      try { copiedBytes = await storageObserver.request<number>("copyStorage", setup.identity); }
+      finally { await storageObserver.dispose(); }
+    }
     if (status === "completed") {
-      try { this.check(admission, quiescent); }
+      try {
+        const resultObserver = new PhysicalObservation();
+        try { await resultObserver.request("setupInputs", setup); }
+        finally { await resultObserver.dispose(); }
+        this.check(admission, quiescent);
+      }
       catch (error) { status = this.disposed ? "stopped" : "unknown"; reason = String(error); }
     }
     const duration = Math.ceil(performance.now() - started);
@@ -621,7 +733,12 @@ export class MissionSetup {
       artifacts: [{ bytes: receipt, mediaType: "application/json" }],
       events: [{ revision: inspection.revision, kind: "mission.setup.receipt", causalId: randomUUID(),
         payload: { intentId: intent.eventId, receiptHash: sha256(receipt), status, disposed: this.disposed } },
-        ...reservations.map((reservation) => ({ revision: inspection.revision, kind: "budget.reservation.settled" as const,
+        ...reservations.map((reservation) => resourceLimit(inspection.definition, reservation.resource) === undefined ?
+          { revision: inspection.revision, kind: "resource.metered.settled", causalId: randomUUID(),
+            payload: { ticketId: reservation.id, resource: reservation.resource,
+              knownCharge: reservation.resource === "active-time-ms" ? duration : copiedBytes + input.length + receipt.length,
+              unknown: !this.disposed, outstanding: !this.disposed, source: "bounded setup" } } :
+          ({ revision: inspection.revision, kind: "budget.reservation.settled" as const,
           causalId: randomUUID(), payload: { reservationId: reservation.id, resource: reservation.resource,
             knownCharge: reservation.resource === "active-time-ms" ? duration : copiedBytes + input.length + receipt.length,
             unknownCharge: this.disposed ? 0 : Math.max(0, reservation.amount -

@@ -9,6 +9,8 @@ import type { MissionEvent } from "./model.ts";
 import type { MissionAttemptBinding } from "./engine.ts";
 import { missionInputIdentity } from "./inputs.ts";
 import { MissionSetup } from "./setup.ts";
+import { resourceLimit, ARTIFACT_OPERATION_BYTES } from "./resources.ts";
+import { PhysicalObservation, hydrateWorkspaceImage } from "./physical-observation.ts";
 import {
   captureWorkspaceImage,
   captureWorkspacePaths,
@@ -20,7 +22,7 @@ import {
   processBirthTicks,
   processNamespaceId,
   processesInNamespace,
-  restoreWorkspaceImage,
+  restoreWorkspaceImageAsync,
   verifyPrivateCandidate,
   quarantineCandidateRoot,
   discoverPrivateCandidate,
@@ -136,9 +138,10 @@ export function recoveryObservationCurrent(
 ): boolean {
   return events.every((event) => event.seq <= observedSeq || localObservations.has(event.causalId) ||
     ["mission.recovery.diagnosed", "reservation.created", "budget.reservation.settled", "budget.reservation.adjusted",
+      "resource.metered.admitted", "resource.metered.settled",
       "provider.request.dispatched", "provider.request.receipt", "provider.usage.claimed", "measurement.recorded",
       "mission.input.visible", "mission.notification.delivered",
-      "mission.active.window.opened", "mission.active.window.checkpointed", "mission.active.window.closed"].includes(event.kind));
+      "mission.active.duration", "mission.active.window.opened", "mission.active.window.checkpointed", "mission.active.window.closed"].includes(event.kind));
 }
 
 export function recoveryDiagnosisBrief(role: string, input: RecoveryOverlapRequest & { developerDiagnosis?: RecoveryOverlapAnswer }): string {
@@ -228,7 +231,7 @@ export interface ReconcileMissionOptions {
 /** A terminal host stop is authority only for this physical predecessor. */
 export function readHistoricalPauseInterruption(
   store: MissionStore, inspection: ReturnType<MissionStore["inspectMission"]>, attemptId: string,
-  pauseEventId?: string,
+  pauseEventId?: string, observeImages = true,
 ) {
   const hash = (value: unknown) => sha256(Buffer.from(JSON.stringify(value)));
   const reserved = inspection.events.find((event) => event.kind === "attempt.reserved" && event.attemptId === attemptId);
@@ -302,7 +305,8 @@ export function readHistoricalPauseInterruption(
   const witnessed = proof.effects.flatMap(({ effectId, witnesses }) => witnesses.map((row) => ({ effectId, ...row })));
   const ids = new Set(proof.effects.map(({ effectId }) => effectId));
   if (ids.size !== proof.effects.length || JSON.stringify(witnessed.sort((a, b) => a.seq - b.seq)) !== JSON.stringify(prefix) ||
-    missionHasUnresolvedEffects(store, inspection.events.filter((event) => event.seq <= proof.journalWatermark), attemptId) ||
+    (observeImages ? missionHasUnresolvedEffects : missionHasUnresolvedEffectBindings)(
+      store, inspection.events.filter((event) => event.seq <= proof.journalWatermark), attemptId) ||
     !missionEffectProcessesQuiescent(inspection.events, attemptId))
     throw new Error("pause effect prefix or recovery-only suffix is unresolved");
   if (binding.candidate === "managed") {
@@ -319,9 +323,9 @@ export function readHistoricalPauseInterruption(
       start.payload.sourceBaseCausalId !== base?.causalId || start.payload.sourceBaseImageHash !== base?.payload.imageHash ||
       start.payload.checkpointHash !== (binding.checkpointHash ?? null) ||
       start.payload.recoveryImageHash !== (binding.recoveryImageHash ?? null) ||
-      readSealedWorkspaceImage(store, proof.baseImageHash).manifest.hash !== start.payload.manifestHash)
+      observeImages && readSealedWorkspaceImage(store, proof.baseImageHash).manifest.hash !== start.payload.manifestHash)
       throw new Error("pause execution-start or candidate registration changed");
-    readSealedWorkspaceImage(store, proof.observedImageHash);
+    if (observeImages) readSealedWorkspaceImage(store, proof.observedImageHash);
     if (binding.checkpointHash) {
       const checkpoint = JSON.parse(store.readArtifact(binding.checkpointHash).toString("utf8"));
       const seal = inspection.events.find((event) => event.eventId === proof.checkpointEventId);
@@ -336,7 +340,7 @@ export function readHistoricalPauseInterruption(
       proof.baseImageHash !== proof.observedImageHash) throw new Error("pause read-only image changed");
   }
   const historical = { binding, proof, proofHash: interruption.proofHash, settled, receipt: receipt!, pause: pause!, definition };
-  validateInterruptionSuffix(store, inspection, historical);
+  validateInterruptionSuffix(store, inspection, historical, observeImages);
   return historical;
 }
 
@@ -345,13 +349,22 @@ export function pauseInterruption(
   store: MissionStore, inspection: ReturnType<MissionStore["inspectMission"]>, attemptId: string,
   sourceRoot: string, pauseEventId?: string,
 ) {
-  const source = readHistoricalPauseInterruption(store, inspection, attemptId, pauseEventId);
+  const source = pauseInterruptionBinding(store, inspection, attemptId, sourceRoot, pauseEventId);
+  if (captureWorkspaceImage(sourceRoot).manifest.hash !== source.proof.sourceManifestHash)
+    throw new Error("pause source, input, definition, policy, receipt or control changed");
+  return source;
+}
+
+function pauseInterruptionBinding(
+  store: MissionStore, inspection: ReturnType<MissionStore["inspectMission"]>, attemptId: string,
+  sourceRoot: string, pauseEventId?: string, observeImages = true,
+) {
+  const source = readHistoricalPauseInterruption(store, inspection, attemptId, pauseEventId, observeImages);
   const { binding, proof } = source;
   if (binding.revision !== inspection.revision || proof.definitionHash !== inspection.snapshot.definitionHash ||
     inspection.events.some((event) => event.kind === "mission.cancelled" ||
       event.kind === "team.consultation.cancelled" && event.unitId === binding.unitId) ||
-    store.verifyRepositoryAssociation(sourceRoot) !== inspection.repositoryId ||
-    captureWorkspaceImage(sourceRoot).manifest.hash !== proof.sourceManifestHash)
+    store.verifyRepositoryAssociation(sourceRoot) !== inspection.repositoryId)
     throw new Error("pause source, input, definition, policy, receipt or control changed");
   return source;
 }
@@ -360,11 +373,22 @@ export function pauseRecoveryCurrent(
   store: MissionStore, inspection: ReturnType<MissionStore["inspectMission"]>,
   continuationId: string, sourceRoot: string,
 ) {
+  const source = pauseRecoveryBindingCurrent(store, inspection, continuationId, sourceRoot, true);
+  if (captureWorkspaceImage(sourceRoot).manifest.hash !== source.proof.sourceManifestHash)
+    throw new Error("pause source, input, definition, policy, receipt or control changed");
+  return source;
+}
+
+/** Projection checks only; the engine observes source freshly at each consuming frontier. */
+export function pauseRecoveryBindingCurrent(
+  store: MissionStore, inspection: ReturnType<MissionStore["inspectMission"]>,
+  continuationId: string, sourceRoot: string, observeImages = false,
+) {
   const event = inspection.events.find((row) => row.kind === "mission.recovery.continuation.recorded" &&
     row.payload.continuationId === continuationId && row.payload.pauseEventId);
   if (!event) throw new Error("pause recovery observation is missing");
-  const source = pauseInterruption(store, inspection, String(event.payload.sourceAttemptId), sourceRoot,
-    String(event.payload.pauseEventId));
+  const source = pauseInterruptionBinding(store, inspection, String(event.payload.sourceAttemptId), sourceRoot,
+    String(event.payload.pauseEventId), observeImages);
   if (event.revision !== inspection.revision || event.payload.ownerEpoch !== store.ownerEpoch ||
     event.payload.proofHash !== source.proofHash ||
     event.payload.acquisitionProofHash !== sha256(Buffer.from(JSON.stringify(store.ownerAcquisitionProof))) ||
@@ -377,8 +401,8 @@ export function pauseRecoveryCurrent(
 }
 
 /** Lifecycle provenance is historical; it cannot itself admit a current worker. */
-export function lifecycleInterruption(store: MissionStore, inspection: ReturnType<MissionStore["inspectMission"]>, attemptId: string) {
-  const source = readHistoricalPauseInterruption(store, inspection, attemptId);
+export function lifecycleInterruption(store: MissionStore, inspection: ReturnType<MissionStore["inspectMission"]>, attemptId: string, observeImages = true) {
+  const source = readHistoricalPauseInterruption(store, inspection, attemptId, undefined, observeImages);
   const release = inspection.events.find((row) => row.kind === "mission.owner.released" &&
     row.payload.pauseEventId === source.pause.eventId);
   if (source.pause.payload.controlOrigin !== "lifecycle" || source.binding.candidate !== "managed" ||
@@ -392,6 +416,7 @@ function validateInterruptionSuffix(
   store: MissionStore, inspection: ReturnType<MissionStore["inspectMission"]>,
   source: { binding: MissionAttemptBinding; proof: { journalWatermark: number; effects: Array<{ effectId: string }>;
     observedImageHash: string; sourceManifestHash: string; pauseEventId: string }; proofHash: string; settled: MissionEvent },
+  observeImages = true,
 ): void {
   const ids = new Set(source.proof.effects.map(({ effectId }) => effectId));
   const reports = inspection.events.filter((row) => row.kind === "mission.recovery.recorded").map((row) => {
@@ -420,7 +445,7 @@ function validateInterruptionSuffix(
         claim.disposition === row.payload.disposition && JSON.stringify(claim.probe ?? null) === JSON.stringify(row.payload.probe ?? null) &&
         (["unstarted"].includes(claim.disposition) ? classifyNoEffect(rows) === "unstarted" :
           effectReconciliationEventIsBound(rows, intent, row.payload) &&
-          ((row.payload.probe as Record<string, unknown> | undefined)?.proofKind !== "candidate-after-image-v1" || storedEffectReconciliationIsProven(store, rows, intent, row.payload))))
+          (!observeImages || (row.payload.probe as Record<string, unknown> | undefined)?.proofKind !== "candidate-after-image-v1" || storedEffectReconciliationIsProven(store, rows, intent, row.payload))))
         continue;
       // Opaque local Bash observations have no deterministic probe. They must link
       // to the exact stopped receipt/image, not make a new outcome assertion.
@@ -433,7 +458,7 @@ function validateInterruptionSuffix(
       const lifecycle = found?.report.lifecycle?.find(({ sourceAttemptId }) => sourceAttemptId === source.binding.attemptId);
       if (lifecycle && JSON.stringify(lifecycle) === JSON.stringify(row.payload.lifecycle) &&
         found!.report.candidate.imageHash === row.payload.imageHash) {
-        validateLifecycleImage(store, inspection, lifecycle, row);
+        if (observeImages) validateLifecycleImage(store, inspection, lifecycle, row);
         continue;
       }
       if (row.payload.pauseEventId && reports.some(({ report }) => report.frontier.includes(source.binding.unitId)) &&
@@ -524,11 +549,20 @@ function validateLifecycleImage(store: MissionStore, inspection: ReturnType<Miss
 
 export function lifecycleRecoveryCurrent(store: MissionStore, inspection: ReturnType<MissionStore["inspectMission"]>,
   continuationId: string, sourceRoot: string, consumingAttemptId?: string) {
+  const source = lifecycleRecoveryBindingCurrent(store, inspection, continuationId, sourceRoot, consumingAttemptId, true);
+  if (captureWorkspaceImage(sourceRoot).manifest.hash !== source.lifecycle.sourceManifestHash)
+    throw new Error("lifecycle recovery current owner, source, control or consumption changed");
+  return source;
+}
+
+/** Projection checks only; physical source evidence belongs to the consuming operation. */
+export function lifecycleRecoveryBindingCurrent(store: MissionStore, inspection: ReturnType<MissionStore["inspectMission"]>,
+  continuationId: string, sourceRoot: string, consumingAttemptId?: string, observeImages = false) {
   const event = inspection.events.find((row) => row.kind === "mission.recovery.continuation.recorded" &&
     row.payload.continuationId === continuationId);
   const lifecycle = event?.payload.lifecycle as LifecycleRecovery | undefined;
   if (!event || !lifecycle) throw new Error("lifecycle recovery observation is missing");
-  const source = lifecycleInterruption(store, inspection, lifecycle.sourceAttemptId);
+  const source = lifecycleInterruption(store, inspection, lifecycle.sourceAttemptId, observeImages);
   const snapshot = inspection.events.find((row) => row.kind === "workspace.snapshot.sealed" &&
     row.attemptId === lifecycle.sourceAttemptId && row.payload.imageHash === event.payload.sourceImageHash &&
     JSON.stringify(row.payload.lifecycle) === JSON.stringify(lifecycle));
@@ -545,17 +579,41 @@ export function lifecycleRecoveryCurrent(store: MissionStore, inspection: Return
     inspection.events.some((row) => row.kind === "mission.cancelled" ||
       row.kind === "team.consultation.cancelled" && row.unitId === source.binding.unitId) ||
     store.verifyRepositoryAssociation(sourceRoot) !== inspection.repositoryId ||
-    captureWorkspaceImage(sourceRoot).manifest.hash !== lifecycle.sourceManifestHash ||
     consumers.some((row) => row.attemptId !== consumingAttemptId &&
       (row.payload.binding as MissionAttemptBinding).recoveryMode !== "repair"))
     throw new Error("lifecycle recovery current owner, source, control or consumption changed");
+  if (observeImages) validateLifecycleImage(store, inspection, lifecycle, snapshot);
+  for (const dependency of lifecycle.dependencyOutputs) {
+    const current = [...inspection.events].reverse().find(row => row.kind === "unit.accepted" &&
+      row.revision === inspection.revision && row.unitId === dependency.unitId);
+    if (current?.payload.outputBindingHash !== dependency.outputBindingHash || current.attemptId !== dependency.attemptId)
+      throw new Error("lifecycle recovery current dependency changed");
+    if (observeImages) readAcceptedWorkspaceContribution(store, inspection, dependency.unitId);
+  }
+  return { ...source, event, lifecycle };
+}
+
+/** Immutable lineage/image validation for the read-only observation frontier, without writer authority. */
+export function validateRecoveryImages(store: MissionStore, inspection: ReturnType<MissionStore["inspectMission"]>, continuationId: string): void {
+  const event = inspection.events.find(row => row.kind === "mission.recovery.continuation.recorded" &&
+    row.payload.continuationId === continuationId);
+  if (!event) throw new Error("recovery image observation is missing");
+  const lifecycle = event.payload.lifecycle as LifecycleRecovery | undefined;
+  if (!lifecycle) {
+    readHistoricalPauseInterruption(store, inspection, String(event.payload.sourceAttemptId), String(event.payload.pauseEventId));
+    return;
+  }
+  lifecycleInterruption(store, inspection, lifecycle.sourceAttemptId);
+  const snapshot = inspection.events.find(row => row.kind === "workspace.snapshot.sealed" &&
+    row.attemptId === lifecycle.sourceAttemptId && row.payload.imageHash === event.payload.sourceImageHash &&
+    JSON.stringify(row.payload.lifecycle) === JSON.stringify(lifecycle));
+  if (!snapshot) throw new Error("recovery image snapshot is missing");
   validateLifecycleImage(store, inspection, lifecycle, snapshot);
   for (const dependency of lifecycle.dependencyOutputs) {
     const current = readAcceptedWorkspaceContribution(store, inspection, dependency.unitId);
     if (current.outputHash !== dependency.outputBindingHash || current.output.attemptId !== dependency.attemptId)
       throw new Error("lifecycle recovery current dependency changed");
   }
-  return { ...source, event, lifecycle };
 }
 
 export function mergeWorkspaceImages(base: WorkspaceImage, mission: WorkspaceImage, current: WorkspaceImage): {
@@ -763,6 +821,7 @@ export async function integrateAcceptedMissionOutputs(options: {
   artifactLimit?: number;
 }) {
   const { store, missionId } = options;
+  const owner = JSON.stringify(store.ownershipIdentity);
   let inspection = store.inspectMission(missionId);
   if (inspection.definition.finalization.contractVersion !== 1) throw new Error("legacy definition is completion-ineligible");
   const accepted = new Map(inspection.definition.units.map((unit) => [unit.id, [...inspection.events].reverse().find((event) =>
@@ -775,34 +834,45 @@ export async function integrateAcceptedMissionOutputs(options: {
   };
   for (const id of [...accepted.keys()].sort()) visit(id);
   if ([...accepted.values()].some((event) => !event?.payload.outputBindingHash)) throw new Error("current accepted host output is missing; injected PASS is not delivery authority");
-  if (missionHasUnresolvedEffects(store, inspection.events)) throw new Error("integration has unresolved effects");
-  const deliveryBase = captureWorkspaceImage(options.sourceRoot);
-  assertCompleteWorkspaceImage(deliveryBase);
+  if (await observeRecovery<boolean>(options, "unresolvedEffects", { ...store.historyLocator, missionId }))
+    throw new Error("integration has unresolved effects");
+  const deliveryBase = await observeRecoveryImage(options, options.sourceRoot, true);
   if (store.verifyRepositoryAssociation(options.sourceRoot) !== inspection.repositoryId) throw new Error("delivery repository identity changed");
   const protectedBytes = inspection.reservations.filter((row) => row.resource === "artifact-bytes" && row.purpose === "protected").reduce((sum, row) => sum + row.amount, 0);
   const usedFinalizationBytes = inspection.reservations.filter((row) => row.resource === "artifact-bytes" && row.purpose === "finalization").reduce((sum, row) => sum + row.amount, 0);
-  const grant = Math.min(protectedBytes - usedFinalizationBytes, options.artifactLimit ?? Infinity);
+  const metered = resourceLimit(inspection.definition, "artifact-bytes") === undefined;
+  const grant = metered ? Math.min(ARTIFACT_OPERATION_BYTES, options.artifactLimit ?? ARTIFACT_OPERATION_BYTES) :
+    Math.min(protectedBytes - usedFinalizationBytes, options.artifactLimit ?? protectedBytes);
   if (grant < 1) throw new Error("integration has no admitted protected artifact capacity");
   const reservationId = stableUuid(`integration-artifacts:${missionId}:${inspection.revision}:${inspection.latestSeq}`);
-  store.appendTransition(missionId, inspection.version, { events: [{ revision: inspection.revision, kind: "reservation.created",
+  store.appendTransition(missionId, store.inspectMission(missionId).version, { events: [metered ?
+    { revision: inspection.revision, kind: "resource.metered.admitted", causalId: reservationId,
+      payload: { ticket: { kind: "metered", ticketId: reservationId, operationId: reservationId,
+        revision: inspection.revision, ownerEpoch: store.ownerEpoch, resource: "artifact-bytes" } } } :
+    { revision: inspection.revision, kind: "reservation.created",
     causalId: reservationId, payload: { reservationId, revision: inspection.revision, resource: "artifact-bytes", amount: grant, purpose: "finalization" } }] });
   inspection = store.inspectMission(missionId);
-  const workspace = createMissionWorkspace({ ...options, attemptId: stableUuid(`integration:${missionId}:${inspection.revision}:${inspection.latestSeq}`),
-    dependencyBacking: new MissionSetup(store, missionId).dependencyBacking(),
+  const settle = (knownCharge: number, source: string) => metered ?
+    { revision: inspection.revision, kind: "resource.metered.settled", causalId: stableUuid(`${reservationId}:settled`),
+      payload: { ticketId: reservationId, resource: "artifact-bytes", knownCharge, unknown: false, outstanding: false, source } } :
+    { revision: inspection.revision, kind: "budget.reservation.settled", causalId: stableUuid(`${reservationId}:settled`),
+      payload: { reservationId, resource: "artifact-bytes", knownCharge, unknownCharge: 0, released: grant - knownCharge, source } };
+  const workspace = await createMissionWorkspace({ ...options, attemptId: stableUuid(`integration:${missionId}:${inspection.revision}:${inspection.latestSeq}`),
+    dependencyBacking: await new MissionSetup(store, missionId).observeDependencyBacking(),
     storeRoot: store.storageRoot, allowedPaths: inspection.definition.authority.allowedPaths });
   const originalBaseImageHash = inspection.events.find((event) => event.kind === "workspace.snapshot.sealed" && event.payload.phase === "base")?.payload.imageHash;
   const contributions: Array<Record<string, unknown>> = [];
   let retainedArtifactBytes = 0;
   try {
     for (const unitId of ordered) {
-      const { outputHash, output, proof, base, terminal, input } = readAcceptedWorkspaceContribution(store, inspection, unitId);
+      const { outputHash, output, proof, base, terminal, input } = await observeAcceptedContribution(options, unitId);
       if (base && terminal && proof && input) {
         // Exclude accepted dependency inputs, but retain this unit's full checkpoint/recovery delta.
-        const current = captureWorkspaceImage(workspace.candidateRoot);
+        const current = (await observeRecoveryImage(options, workspace.candidateRoot));
         const merged = mergeWorkspaceImages(base, terminal, current);
         if (merged.conflicts.length) {
-          const currentSeal = sealWorkspaceImage(current);
-          const deliverySeal = sealWorkspaceImage(deliveryBase);
+          const currentSeal = await observeRecovery<ReturnType<typeof sealWorkspaceImage>>(options, "sealImage", { image: current });
+          const deliverySeal = await observeRecovery<ReturnType<typeof sealWorkspaceImage>>(options, "sealImage", { image: deliveryBase });
           const reason = `accepted contribution overlap: ${merged.conflicts.map(({ path }) => path).join(", ")}`;
           const bytes = Buffer.from(JSON.stringify({ format: "mission-integration-conflict-v1", missionId, revision: inspection.revision,
             unitId, outputHash, reason, paths: merged.conflicts.map(({ path }) => path), sourceBaseImageHash: proof.sourceBaseImageHash,
@@ -810,28 +880,27 @@ export async function integrateAcceptedMissionOutputs(options: {
           const conflictArtifacts = [...currentSeal.artifacts, ...deliverySeal.artifacts, { bytes, mediaType: "application/json" }];
           const conflictBytes = conflictArtifacts.reduce((sum, artifact) => sum + artifact.bytes.byteLength, 0);
           if (conflictBytes > grant) throw new Error(`${reason}; conflict artifacts exceed admitted capacity`);
-          store.appendTransition(missionId, inspection.version, { events: [{ revision: inspection.revision, kind: "mission.blocked",
+          store.appendTransition(missionId, store.inspectMission(missionId).version, { events: [{ revision: inspection.revision, kind: "mission.blocked",
             causalId: stableUuid(`integration-conflict:${missionId}:${inspection.revision}:${inspection.latestSeq}`),
             payload: { reason, integrationConflictHash: sha256(bytes) } }],
             artifacts: conflictArtifacts });
           retainedArtifactBytes = conflictBytes;
           throw new Error(reason);
         }
-        restoreWorkspaceImage(workspace, merged.files);
+        await restoreRecoveryImage(options, workspace, merged.files);
         contributions.push({ unitId, outputHash, sourceBaseImageHash: proof.sourceBaseImageHash,
           executionStartImageHash: proof.executionStartImageHash, contributionInput: input, terminalImageHash: proof.terminalImageHash, lineage: output.lineage });
       } else contributions.push({ unitId, outputHash, resultArtifactHash: output.resultArtifactHash });
     }
-    const result = captureWorkspaceImage(workspace.candidateRoot);
-    assertCompleteWorkspaceImage(result);
-    const resultSeal = sealWorkspaceImage(result);
-    const baseSeal = sealWorkspaceImage(deliveryBase);
+    const result = await observeRecoveryImage(options, workspace.candidateRoot, true);
+    const resultSeal = await observeRecovery<ReturnType<typeof sealWorkspaceImage>>(options, "sealImage", { image: result });
+    const baseSeal = await observeRecovery<ReturnType<typeof sealWorkspaceImage>>(options, "sealImage", { image: deliveryBase });
     const patch = createConditionalMissionPatch(deliveryBase, result);
-    const disposable = createMissionWorkspace({ ...options, attemptId: stableUuid(`patch-proof:${missionId}:${inspection.revision}:${inspection.latestSeq}`),
-      dependencyBacking: new MissionSetup(store, missionId).dependencyBacking(),
+    const disposable = await createMissionWorkspace({ ...options, attemptId: stableUuid(`patch-proof:${missionId}:${inspection.revision}:${inspection.latestSeq}`),
+      dependencyBacking: await new MissionSetup(store, missionId).observeDependencyBacking(),
       storeRoot: store.storageRoot, allowedPaths: [] });
-    const reproduced = applyConditionalMissionPatch(patch, disposable);
-    if (reproduced.hash !== patch.acceptedManifestHash || captureWorkspaceImage(options.sourceRoot).manifest.hash !== deliveryBase.manifest.hash)
+    const reproduced = await applyConditionalMissionPatchAsync(options, patch, disposable);
+    if (reproduced.hash !== patch.acceptedManifestHash || (await observeRecoveryImage(options, options.sourceRoot)).manifest.hash !== deliveryBase.manifest.hash)
       throw new Error("conditional patch or delivery base changed during integration");
     const patchBytes = Buffer.from(JSON.stringify(patch));
     const report = { format: "mission-integrated-result-v1", missionId, revision: inspection.revision,
@@ -850,13 +919,12 @@ export async function integrateAcceptedMissionOutputs(options: {
             runtimeIdentity: event.payload.runtimeIdentity, rolePolicyHash: event.payload.rolePolicyHash, artifactHash: event.payload.artifactHash })) },
     };
     const reportBytes = Buffer.from(JSON.stringify(report));
-    if (store.inspectMission(missionId).version !== inspection.version) throw new Error("integration inputs changed before publication");
+    if (!recoveryObservationCurrent(store.inspectMission(missionId).events, inspection.latestSeq) ||
+      JSON.stringify(store.ownershipIdentity) !== owner) throw new Error("integration inputs changed before publication");
     const artifacts = [...resultSeal.artifacts, ...baseSeal.artifacts, { bytes: patchBytes, mediaType: "application/json" }, { bytes: reportBytes, mediaType: "application/json" }];
     const artifactBytes = artifacts.reduce((sum, artifact) => sum + artifact.bytes.byteLength, 0);
     if (artifactBytes > grant) throw new Error(`integration artifacts need ${artifactBytes} bytes; admitted grant is ${grant}`);
-    store.appendTransition(missionId, inspection.version, { events: [{ revision: inspection.revision, kind: "budget.reservation.settled",
-      causalId: stableUuid(`${reservationId}:settled`), payload: { reservationId, resource: "artifact-bytes", knownCharge: artifactBytes,
-        unknownCharge: 0, released: grant - artifactBytes, source: "host integrated images, conditional patch and report" } },
+    store.appendTransition(missionId, store.inspectMission(missionId).version, { events: [settle(artifactBytes, "host integrated images, conditional patch and report"),
       { revision: inspection.revision, kind: "mission.result.integrated",
       causalId: stableUuid(`integrated:${missionId}:${inspection.revision}:${inspection.latestSeq}`), payload: { reportHash: sha256(reportBytes),
         resultImageHash: resultSeal.imageHash, deliveryBaseManifestHash: deliveryBase.manifest.hash, acceptedInputHash: report.acceptedInputHash } }],
@@ -864,13 +932,91 @@ export async function integrateAcceptedMissionOutputs(options: {
     return report;
   } catch (error) {
     const current = store.inspectMission(missionId);
-    if (current.revision === inspection.revision && !current.events.some((event) => event.kind === "budget.reservation.settled" && event.payload.reservationId === reservationId))
-      store.appendTransition(missionId, current.version, { events: [{ revision: inspection.revision, kind: "budget.reservation.settled",
-        causalId: stableUuid(`${reservationId}:failed`), payload: { reservationId, resource: "artifact-bytes", knownCharge: retainedArtifactBytes,
-          unknownCharge: 0, released: grant - retainedArtifactBytes, source: "integration inconclusive before immutable output publication" } }] });
+    if (current.revision === inspection.revision && !current.events.some((event) =>
+      event.kind === "budget.reservation.settled" && event.payload.reservationId === reservationId ||
+      event.kind === "resource.metered.settled" && event.payload.ticketId === reservationId))
+      store.appendTransition(missionId, current.version, { events: [settle(retainedArtifactBytes, "integration inconclusive before immutable output publication")] });
     quarantineCandidateRoot(workspace.candidateRoot, workspace.sourceRoot, workspace.candidateIdentity, workspace.candidateGitIdentity, `integration inconclusive: ${error instanceof Error ? error.message : String(error)}`);
     throw error;
   }
+}
+
+async function observeRecovery<T>(options: { store: MissionStore; missionId: string }, operation: string, input: unknown): Promise<T> {
+  const { store, missionId } = options;
+  const initial = store.inspectMission(missionId);
+  const owner = store.ownershipIdentity;
+  const observer = new PhysicalObservation();
+  try {
+    const value = await observer.request<T>(operation, input);
+    await observer.dispose();
+    const current = store.inspectMission(missionId);
+    if (JSON.stringify(owner) !== JSON.stringify(store.ownershipIdentity) || current.revision !== initial.revision ||
+      current.snapshot.preparedHash !== initial.snapshot.preparedHash ||
+      !recoveryObservationCurrent(current.events, initial.latestSeq))
+      throw new Error("recovery physical observation owner, control or result changed during await");
+    return value;
+  } finally { await observer.dispose(); }
+}
+
+async function restoreRecoveryImage(options: { store: MissionStore; missionId: string }, workspace: MissionWorkspace,
+  files: Parameters<typeof restoreWorkspaceImageAsync>[1]): Promise<void> {
+  const { store, missionId } = options;
+  const initial = store.inspectMission(missionId);
+  const owner = JSON.stringify(store.ownershipIdentity);
+  try {
+    await restoreWorkspaceImageAsync(workspace, files, () => {
+      const current = store.inspectMission(missionId);
+      if (owner !== JSON.stringify(store.ownershipIdentity) || current.revision !== initial.revision ||
+        current.snapshot.preparedHash !== initial.snapshot.preparedHash ||
+        !recoveryObservationCurrent(current.events, initial.latestSeq))
+        throw new Error("recovery restoration owner, control or result changed during await");
+    });
+  } catch (error) {
+    workspace.quarantined = true;
+    throw error;
+  }
+}
+
+async function observeRecoveryImage(options: { store: MissionStore; missionId: string }, root: string, complete = false): Promise<WorkspaceImage> {
+  return hydrateWorkspaceImage(await observeRecovery<WorkspaceImage>(options, "image", { root, complete }));
+}
+
+async function observeRecoverySealed(options: { store: MissionStore; missionId: string }, hash: string): Promise<WorkspaceImage> {
+  return hydrateWorkspaceImage(await observeRecovery<WorkspaceImage>(options, "sealedImage", { ...options.store.historyLocator, hash }));
+}
+
+async function observeAcceptedContribution(options: { store: MissionStore; missionId: string }, unitId: string) {
+  const contribution = await observeRecovery<ReturnType<typeof readAcceptedWorkspaceContribution>>(options,
+    "acceptedContribution", { ...options.store.historyLocator, missionId: options.missionId, unitId });
+  return { ...contribution, base: contribution.base && hydrateWorkspaceImage(contribution.base),
+    terminal: contribution.terminal && hydrateWorkspaceImage(contribution.terminal) };
+}
+
+async function applyConditionalMissionPatchAsync(options: { store: MissionStore; missionId: string },
+  patch: ConditionalMissionPatch, workspace: MissionWorkspace): Promise<WorkspaceManifest> {
+  if (patch.format !== "mission-conditional-patch-v1") throw new Error("unsupported mission patch format");
+  const identity = await observeRecovery<ReturnType<typeof verifyPrivateCandidate>>(options, "candidateIdentity",
+    { root: workspace.candidateRoot, sourceRoot: workspace.sourceRoot });
+  if (identity.identity !== workspace.candidateIdentity || identity.gitIdentity !== workspace.candidateGitIdentity)
+    throw new Error("conditional patch target is not the verified private delivery copy");
+  const observedSource = (await observeRecoveryImage(options, workspace.sourceRoot)).manifest;
+  if (observedSource.hash !== patch.deliveryBaseManifestHash || workspace.manifest.hash !== patch.deliveryBaseManifestHash)
+    throw new Error(`mission patch precondition mismatch: expected ${patch.deliveryBaseManifestHash}, observed ${observedSource.hash}`);
+  const candidateImage = await observeRecoveryImage(options, workspace.candidateRoot);
+  if (canonicalDeliveryManifest(candidateImage.manifest, workspace.manifest).hash !== patch.deliveryBaseManifestHash)
+    throw new Error("mission patch preimage mismatch for private delivery copy");
+  const files = new Map(candidateImage.files.map((file) => [file.path, file]));
+  for (const { path: name, before, after } of patch.changes) {
+    const observed = files.get(name) ?? missingImage(name);
+    if (!sameImage(observed, hydratePatchFile(before))) throw new Error(`mission patch preimage mismatch at ${name}`);
+    if (after.kind === "missing") files.delete(name);
+    else files.set(name, hydratePatchFile(after));
+  }
+  await restoreRecoveryImage(options, workspace, [...files.values()].sort((a, b) => a.path.localeCompare(b.path)));
+  const accepted = canonicalDeliveryManifest((await observeRecoveryImage(options, workspace.candidateRoot)).manifest, workspace.manifest);
+  if (accepted.hash !== patch.acceptedManifestHash)
+    throw new Error(`mission patch result mismatch: expected ${patch.acceptedManifestHash}, observed ${accepted.hash}`);
+  return accepted;
 }
 
 export function applyConditionalMissionPatch(patch: ConditionalMissionPatch, workspace: MissionWorkspace): WorkspaceManifest {
@@ -1048,10 +1194,13 @@ export async function reconcileMission(options: ReconcileMissionOptions): Promis
       const reserved = initial.events.find((event) => event.kind === "attempt.reserved" && event.attemptId === stopped.attemptId);
       if (initial.definition.finalization.contractVersion === 1 && pauseTargets?.payload.controlOrigin === "lifecycle" &&
         (reserved?.payload.binding as MissionAttemptBinding | undefined)?.candidate === "managed") {
-        lifecycleSources.set(stopped.attemptId, lifecycleInterruption(store, initial, stopped.attemptId));
+        lifecycleSources.set(stopped.attemptId, await observeRecovery<ReturnType<typeof lifecycleInterruption>>(options,
+          "lifecycleInterruption", { ...store.historyLocator, missionId, attemptId: stopped.attemptId, root: options.sourceRoot }));
         continue;
       }
-      const interruption = pauseInterruption(store, initial, stopped.attemptId, options.sourceRoot, options.orderlyPause!.pauseEventId);
+      const interruption = await observeRecovery<ReturnType<typeof pauseInterruption>>(options, "pauseInterruption",
+        { ...store.historyLocator, missionId, attemptId: stopped.attemptId, root: options.sourceRoot,
+          pauseEventId: options.orderlyPause!.pauseEventId });
       if (interruption.binding.ownerEpoch === store.ownerEpoch) {
         if (ownerProcessState(interruption.proof.owner) !== "live" ||
           interruption.proof.runtimeId !== store.runtimeId) throw new Error("same-owner pause stop identity is not current");
@@ -1098,7 +1247,7 @@ export async function reconcileMission(options: ReconcileMissionOptions): Promis
   try {
     sourceAssociation = store.verifyRepositoryAssociation(options.sourceRoot);
     if (sourceAssociation !== initial.repositoryId) throw new Error("proposed source root belongs to a different repository family");
-    sourceImage = captureWorkspaceImage(options.sourceRoot);
+    sourceImage = (await observeRecoveryImage(options, options.sourceRoot));
   } catch (error) {
     blockers.push(`source identity or inventory is unproven: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -1107,7 +1256,7 @@ export async function reconcileMission(options: ReconcileMissionOptions): Promis
   let plan: RecoveryReport["plan"] = { status: "unavailable", storedHash: storedPlanHash, observedHash: null };
   if (initial.prepared) {
     try {
-      const identity = missionInputIdentity(initial, options.sourceRoot);
+      const identity = await observeRecovery<ReturnType<typeof missionInputIdentity>>(options, "inputIdentity", { ...store.historyLocator, missionId, root: options.sourceRoot });
       plan = { status: "unchanged", storedHash: storedPlanHash, observedHash: identity.pinHash,
         inputIdentityHash: sha256(Buffer.from(JSON.stringify(identity))), inputIdentity: identity };
     } catch {
@@ -1124,10 +1273,10 @@ export async function reconcileMission(options: ReconcileMissionOptions): Promis
       plan = { status: (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "malformed", storedHash: storedPlanHash, observedHash: null };
     }
   }
-  const planCurrent = () => {
+  const planCurrent = async () => {
     try {
       if (initial.prepared) return plan.inputIdentityHash ===
-        sha256(Buffer.from(JSON.stringify(missionInputIdentity(store.inspectMission(options.missionId), options.sourceRoot))));
+        sha256(Buffer.from(JSON.stringify(await observeRecovery(options, "inputIdentity", { ...store.historyLocator, missionId, root: options.sourceRoot }))));
       return !options.planFile || sha256(readFileSync(options.planFile)) === plan.observedHash;
     } catch (error) {
       return !initial.prepared && !!options.planFile && plan.status === "missing" &&
@@ -1155,7 +1304,7 @@ export async function reconcileMission(options: ReconcileMissionOptions): Promis
       missionId, repositoryId: initial.repositoryId, ownerEpoch: Number(binding.ownerEpoch),
     });
     if (!registration) continue;
-    const root = discoverPrivateCandidate(registration, options.sourceRoot);
+    const root = await observeRecovery<string | undefined>(options, "candidateDiscovery", { registration, sourceRoot: options.sourceRoot });
     if (!root) continue;
     candidateRoots.set(attemptId, root);
     const history = candidateLocationHistory(initial.events, attemptId, registration.root);
@@ -1230,13 +1379,14 @@ export async function reconcileMission(options: ReconcileMissionOptions): Promis
     archiveHashes: Array.isArray(event.payload.archiveHashes) ? event.payload.archiveHashes.map(String) : [],
   }));
   if (legacyConflicts.length) blockers.push("conflicting legacy ledger bytes are archived but unresolved; no second mission was created");
-  const candidateEvidence = attempts.map(({ attemptId }) => {
+  const candidateEvidence = await Promise.all(attempts.map(async ({ attemptId }) => {
     const identitySnapshot = initial.events.find((event) => event.kind === "workspace.snapshot.sealed" &&
       event.attemptId === attemptId && event.payload.phase === "base");
     const candidateRoot = candidateRoots.get(attemptId) ?? "";
     let currentManifestHash: string | null = null;
-    if (identitySnapshot && candidateRoot && candidateIdentityMatches(candidateRoot, identitySnapshot.payload, options.sourceRoot)) {
-      try { currentManifestHash = captureWorkspaceImage(candidateRoot).manifest.hash; } catch { /* missing candidates use sealed observations */ }
+    if (identitySnapshot && candidateRoot && await observeRecovery<boolean>(options, "candidateMatches",
+      { root: candidateRoot, payload: identitySnapshot.payload, sourceRoot: options.sourceRoot })) {
+      try { currentManifestHash = (await observeRecoveryImage(options, candidateRoot)).manifest.hash; } catch { /* missing candidates use sealed observations */ }
     }
     return {
       attemptId,
@@ -1246,7 +1396,7 @@ export async function reconcileMission(options: ReconcileMissionOptions): Promis
       effects: initial.events.filter((event) => event.attemptId === attemptId && event.effectId && event.kind !== "effect.reconciled")
         .map((event) => [event.kind, event.effectId, sha256(Buffer.from(JSON.stringify(event.payload)))]),
     };
-  });
+  }));
   const episodeId = sha256(Buffer.from(JSON.stringify({
     missionId, trigger: options.trigger ?? "startup", revision: initial.revision,
     source: sourceImage?.manifest.hash ?? null, plan: [plan.status, plan.observedHash], ownerEpoch: store.ownerEpoch,
@@ -1284,7 +1434,7 @@ export async function reconcileMission(options: ReconcileMissionOptions): Promis
   let originalBaseImage: WorkspaceImage | undefined;
   const firstBaseSnapshot = initial.events.find((event) => event.kind === "workspace.snapshot.sealed" && event.payload.phase === "base");
   if (firstBaseSnapshot && typeof firstBaseSnapshot.payload.imageHash === "string") {
-    try { originalBaseImage = readSealedWorkspaceImage(store, firstBaseSnapshot.payload.imageHash); }
+    try { originalBaseImage = (await observeRecoverySealed(options, firstBaseSnapshot.payload.imageHash)); }
     catch (error) { blockers.push(`sealed source baseline is unavailable: ${error instanceof Error ? error.message : String(error)}`); }
   }
 
@@ -1298,13 +1448,13 @@ export async function reconcileMission(options: ReconcileMissionOptions): Promis
           if (!missionEffectProcessesQuiescent(store.inspectMission(missionId).events, attempt.attemptId))
             throw new Error("pause effect namespace is not freshly quiescent");
           if (pauseRecovery.binding.candidate === "managed") {
-            const image = readSealedWorkspaceImage(store, pauseRecovery.proof.observedImageHash);
+            const image = (await observeRecoverySealed(options, pauseRecovery.proof.observedImageHash));
             const root = candidateRoots.get(attempt.attemptId);
             if (root) {
-              const stopped = captureWorkspaceImage(root);
+              const stopped = (await observeRecoveryImage(options, root));
               const observed = initial.definition.finalization.contractVersion === 1
                 ? { ...stopped, manifest: canonicalDeliveryManifest(stopped.manifest, image.manifest) } : scopedImage(stopped);
-              if (sealWorkspaceImage(observed).imageHash !== pauseRecovery.proof.observedImageHash)
+              if ((await observeRecovery<ReturnType<typeof sealWorkspaceImage>>(options, "sealImage", { image: observed })).imageHash !== pauseRecovery.proof.observedImageHash)
                 throw new Error("stopped candidate changed since pause image");
             }
             const observation: MissionEventDraft = {
@@ -1315,9 +1465,10 @@ export async function reconcileMission(options: ReconcileMissionOptions): Promis
                 manifestHash: image.manifest.hash, candidateRoot: null, pauseEventId: pauseRecovery.proof.pauseEventId,
                 proofHash: pauseRecovery.proofHash },
             };
-            await appendRecoveryEvents(store, missionId, initial.revision, [observation], [], () =>
+            await appendRecoveryEvents(store, missionId, initial.revision, [observation], [], async () =>
               store.ownerEpoch === owner.epoch && recoveryObservationCurrent(store.inspectMission(missionId).events, initial.latestSeq, localObservations) &&
-              !!pauseInterruption(store, store.inspectMission(missionId), attempt.attemptId, options.sourceRoot, pauseRecovery.proof.pauseEventId));
+              !!await observeRecovery(options, "pauseInterruption", { ...store.historyLocator, missionId,
+                attemptId: attempt.attemptId, root: options.sourceRoot, pauseEventId: pauseRecovery.proof.pauseEventId }));
             localObservations.add(observation.causalId);
           }
           frontier.push(String(attempt.binding.unitId));
@@ -1331,7 +1482,7 @@ export async function reconcileMission(options: ReconcileMissionOptions): Promis
         continue;
       }
       const diagnosisUses: Array<{ resultHash: string; fingerprint: string; revision: number; ownerEpoch: number; observedSeq: number; sourceEventId: string; sourceProofHash: string }> = [];
-      let currentUse: (() => boolean) | undefined;
+      let currentUse: (() => Promise<boolean>) | undefined;
       const lifecycleSource = lifecycleSources.get(attempt.attemptId);
       const baseSnapshot = initial.events.find((event) => event.kind === "workspace.snapshot.sealed" &&
         event.attemptId === attempt.attemptId && event.payload.phase === "base");
@@ -1339,10 +1490,9 @@ export async function reconcileMission(options: ReconcileMissionOptions): Promis
         blockers.push(`attempt ${attempt.attemptId} has no sealed source baseline; safe three-way recovery is unavailable`);
         continue;
       }
-      const historicalInput = lifecycleSource && readContributionInput(store, {
-        ...initial, revision: lifecycleSource.binding.revision, definition: lifecycleSource.definition,
-      }, lifecycleSource.binding);
-      const baseImage = readSealedWorkspaceImage(store, historicalInput?.baseImageHash ?? baseSnapshot.payload.imageHash);
+      const historicalInput = lifecycleSource && await observeRecovery<ContributionInput>(options, "historicalContribution",
+        { ...store.historyLocator, missionId, attemptId: attempt.attemptId, root: options.sourceRoot });
+      const baseImage = (await observeRecoverySealed(options, historicalInput?.baseImageHash ?? baseSnapshot.payload.imageHash));
       originalBaseImage ??= baseImage;
       const recordedRoot = String(attempt.binding.candidateRoot ?? "");
       const proposedRoot = candidateRoots.get(attempt.attemptId) ?? "";
@@ -1350,18 +1500,19 @@ export async function reconcileMission(options: ReconcileMissionOptions): Promis
       let liveRoot: string | undefined;
       const identitySnapshot = initial.events.find((event) => event.kind === "workspace.snapshot.sealed" &&
         event.attemptId === attempt.attemptId && event.payload.phase === "base");
-      if (!lifecycleSource && proposedRoot && isPrivateCandidate(proposedRoot, options.sourceRoot) && identitySnapshot &&
-        candidateIdentityMatches(proposedRoot, identitySnapshot.payload, options.sourceRoot)) {
+      if (!lifecycleSource && proposedRoot && identitySnapshot &&
+        await observeRecovery<boolean>(options, "candidateMatches",
+          { root: proposedRoot, payload: identitySnapshot.payload, sourceRoot: options.sourceRoot })) {
         liveRoot = proposedRoot;
-        try { missionImage = scopedImage(captureWorkspaceImage(proposedRoot)); }
+        try { missionImage = scopedImage((await observeRecoveryImage(options, proposedRoot))); }
         catch { missionImage = undefined; }
       }
-      if (lifecycleSource) missionImage = readSealedWorkspaceImage(store, lifecycleSource.proof.observedImageHash);
+      if (lifecycleSource) missionImage = (await observeRecoverySealed(options, lifecycleSource.proof.observedImageHash));
       if (!missionImage) {
         const latest = [...initial.events].reverse().find((event) => event.kind === "workspace.snapshot.sealed" &&
           event.attemptId === attempt.attemptId && event.payload.phase !== "base" &&
           event.payload.purpose !== "execution-start" && typeof event.payload.imageHash === "string");
-        if (latest) missionImage = readSealedWorkspaceImage(store, String(latest.payload.imageHash));
+        if (latest) missionImage = (await observeRecoverySealed(options, String(latest.payload.imageHash)));
       }
       if (!missionImage) {
         blockers.push(recordedRoot
@@ -1374,7 +1525,7 @@ export async function reconcileMission(options: ReconcileMissionOptions): Promis
         String(identitySnapshot.payload.candidateIdentity), String(identitySnapshot.payload.candidateGitIdentity),
         `recovered partial effect ${partialEffect.effectId}; fresh-candidate repair only`);
       if (!liveRoot && !lifecycleSource) {
-        const sealed = sealWorkspaceImage(missionImage);
+        const sealed = await observeRecovery<ReturnType<typeof sealWorkspaceImage>>(options, "sealImage", { image: missionImage });
         const observationId = stableUuid(`recovery-observation:${attempt.attemptId}:${sealed.imageHash}`);
         await appendRecoveryEvent(store, missionId, initial.revision, {
           revision: initial.revision, kind: "workspace.snapshot.sealed", causalId: observationId,
@@ -1415,7 +1566,7 @@ export async function reconcileMission(options: ReconcileMissionOptions): Promis
           }
         };
         for (const id of unit.dependencies.slice().sort()) restoreDependency(id);
-        const basis = sealWorkspaceImage(allowedSourceImage);
+        const basis = await observeRecovery<ReturnType<typeof sealWorkspaceImage>>(options, "sealImage", { image: allowedSourceImage });
         basisArtifacts = basis.artifacts;
         lifecycle = {
           sourceAttemptId: attempt.attemptId, proofHash: lifecycleSource.proofHash,
@@ -1447,7 +1598,7 @@ export async function reconcileMission(options: ReconcileMissionOptions): Promis
           dispositionHash = expert.resultHash;
         }
         if (disposition.disposition === "compatible" && disposition.resolutions) {
-          currentUse = () => {
+          currentUse = async () => {
             const current = store.inspectMission(missionId);
             const affectsUnit = (unitId: string, target = request.unitId): boolean => unitId === target ||
               Boolean(initial.definition.units.find((unit) => unit.id === target)?.dependencies.some((dependency) => affectsUnit(unitId, dependency)));
@@ -1461,10 +1612,10 @@ export async function reconcileMission(options: ReconcileMissionOptions): Promis
               [...current.events].reverse().find((event) => ["mission.paused", "mission.resumed", "mission.cancelled"].includes(event.kind))?.kind !== "mission.paused" &&
               !current.events.some((event) => event.kind === "mission.cancelled") &&
               store.verifyRepositoryAssociation(options.sourceRoot) === sourceAssociation &&
-              captureWorkspaceImage(options.sourceRoot).manifest.hash === sourceImage.manifest.hash &&
-              planCurrent();
+              (await observeRecoveryImage(options, options.sourceRoot)).manifest.hash === sourceImage.manifest.hash &&
+              await planCurrent();
           };
-          if (!currentUse()) {
+          if (!await currentUse()) {
             overlapAttempts.add(attempt.attemptId);
             const reason = `compatible diagnosis cannot apply until recovery causes are reclassified for ${request.unitId}`;
             blockers.push(reason);
@@ -1502,20 +1653,20 @@ export async function reconcileMission(options: ReconcileMissionOptions): Promis
       };
       try {
         const parent = options.candidateParent ?? path.join(path.dirname(store.storageRoot), `${path.basename(store.storageRoot)}-candidates`);
-        const workspace = createMissionWorkspace({
-          dependencyBacking: new MissionSetup(store, missionId).dependencyBacking(),
+        const workspace = await createMissionWorkspace({
+          dependencyBacking: await new MissionSetup(store, missionId).observeDependencyBacking(),
           missionId, attemptId: stableUuid(`${attempt.attemptId}:recovery-candidate`),
           sourceRoot: options.sourceRoot, storeRoot: store.storageRoot, candidateParent: parent,
           allowedPaths: initial.definition.authority.allowedPaths, productRoot: options.productRoot, bwrapPath: options.bwrapPath,
         });
         await preflightContainment(workspace);
-        if (currentUse && !currentUse()) {
+        if (currentUse && !await currentUse()) {
           throw new Error("recovery observation changed before recovered snapshot publication");
         }
-        restoreWorkspaceImage(workspace, image.files);
-        finalCandidateImage = captureWorkspaceImage(workspace.candidateRoot);
+        await restoreRecoveryImage(options, workspace, image.files);
+        finalCandidateImage = (await observeRecoveryImage(options, workspace.candidateRoot));
         candidateRoot = workspace.candidateRoot;
-        const sealed = sealWorkspaceImage(scopedImage(finalCandidateImage));
+        const sealed = await observeRecovery<ReturnType<typeof sealWorkspaceImage>>(options, "sealImage", { image: scopedImage(finalCandidateImage) });
         candidateImageHash = sealed.imageHash;
         candidateWorkspaceManifestHash = finalCandidateImage.manifest.hash;
         restored = true;
@@ -1536,10 +1687,10 @@ export async function reconcileMission(options: ReconcileMissionOptions): Promis
         };
         await appendRecoveryEvents(store, missionId, initial.revision, [snapshotEvent], [...basisArtifacts, ...sealed.artifacts,
           { bytes: Buffer.from(JSON.stringify(patch)), mediaType: "application/octet-stream" }],
-          () => (!currentUse || currentUse()) && store.ownerEpoch === owner.epoch &&
+          async () => (!currentUse || await currentUse()) && store.ownerEpoch === owner.epoch &&
             recoveryObservationCurrent(store.inspectMission(missionId).events, initial.latestSeq, localObservations) &&
-            captureWorkspaceImage(options.sourceRoot).manifest.hash === sourceImage.manifest.hash &&
-            planCurrent());
+            (await observeRecoveryImage(options, options.sourceRoot)).manifest.hash === sourceImage.manifest.hash &&
+            await planCurrent());
         localObservations.add(snapshotEvent.causalId);
         if (lifecycle) lifecycleAdmissions.push(lifecycle);
         frontier.push(String(attempt.binding.unitId));
@@ -1550,9 +1701,12 @@ export async function reconcileMission(options: ReconcileMissionOptions): Promis
   }
   if (sourceImage) {
     const observedEvidenceImage = scopedImage(finalCandidateImage ?? sourceImage);
+    const observedEvidencePaths = await observeRecovery<{ paths: ManifestPath[] }>(options, "predicatePaths",
+      { root: candidateRoot ?? options.sourceRoot });
     if (originalBaseImage) stale = staleEvidence(store, initial.events, initial.definition.units, initial.definition.authority.rolePolicies,
-      initial.definition.authority.allowedPaths, originalBaseImage, observedEvidenceImage, plan.status !== "unchanged",
-      options.assessmentToolIdentity, options.runtimeIdentity);
+      initial.definition.finalization.contractVersion === 1 ? ["."] : initial.definition.authority.allowedPaths,
+      originalBaseImage, observedEvidenceImage, plan.status !== "unchanged",
+      options.assessmentToolIdentity, options.runtimeIdentity, observedEvidencePaths.paths);
     else stale = { retained: [], invalidated: initial.events.filter((event) => event.kind === "evidence.recorded")
       .map((event) => String(event.payload.id ?? event.payload.evidenceId ?? "")).filter(Boolean) };
   } else {
@@ -1789,9 +1943,9 @@ export async function reconcileMission(options: ReconcileMissionOptions): Promis
   await appendRecoveryEvents(store, missionId, initial.revision, drafts, [
     { bytes: reportBytes, mediaType: "application/json" },
     ...(patch ? [{ bytes: Buffer.from(JSON.stringify(patch)), mediaType: "application/octet-stream" }] : []),
-  ], () => store.ownerEpoch === owner.epoch && recoveryObservationCurrent(store.inspectMission(missionId).events, initial.latestSeq, localObservations) &&
-    (!sourceImage || captureWorkspaceImage(options.sourceRoot).manifest.hash === sourceImage.manifest.hash) &&
-    planCurrent());
+  ], async () => store.ownerEpoch === owner.epoch && recoveryObservationCurrent(store.inspectMission(missionId).events, initial.latestSeq, localObservations) &&
+    (!sourceImage || (await observeRecoveryImage(options, options.sourceRoot)).manifest.hash === sourceImage.manifest.hash) &&
+    await planCurrent());
   return report;
 }
 
@@ -2020,6 +2174,7 @@ function evidenceInputBindingIsCurrent(
   allowedPaths: readonly string[],
   assessmentToolIdentity: string | undefined,
   runtimeIdentity: string | undefined,
+  observedPaths: ManifestPath[],
 ): boolean {
   const predicateId = String(evidence.predicateId ?? "");
   const predicate = unit.acceptance?.find((row) => row.id === predicateId);
@@ -2064,9 +2219,8 @@ function evidenceInputBindingIsCurrent(
         dependencyEvent.payload.predicateId !== dependency.predicateId || dependencyEvent.payload.verdict !== "pass" ||
         dependencyEvent.payload.outputManifestHash !== dependency.outputManifestHash) return false;
     }
-    const currentPaths = currentImage.files.filter((file) => patterns.some((pattern) => pathMatches(pattern, file.path)) &&
+    const currentPaths = observedPaths.filter((file) => patterns.some((pattern) => pathMatches(pattern, file.path)) &&
       allowedPaths.some((pattern) => pathMatches(pattern, file.path)))
-      .map((file) => ({ path: file.path, kind: file.kind, mode: file.mode, hash: file.bytes === null ? null : sha256(file.bytes) }))
       .sort((left, right) => left.path.localeCompare(right.path));
     const currentIndexEntries = currentImage.manifest.indexEntries.filter((entry) => patterns.some((pattern) => pathMatches(pattern, entry.path)) &&
       allowedPaths.some((pattern) => pathMatches(pattern, entry.path)));
@@ -2086,6 +2240,7 @@ function staleEvidence(
   planChanged: boolean,
   assessmentToolIdentity: string | undefined,
   runtimeIdentity: string | undefined,
+  observedPaths: ManifestPath[],
 ): RecoveryReport["evidence"] {
   const changed = changedImagePaths(base, finalImage);
   const byId = new Map(units.map((unit) => [unit.id, unit]));
@@ -2098,7 +2253,7 @@ function staleEvidence(
     const id = String(event.payload.id ?? event.payload.evidenceId ?? "");
     const unit = byId.get(String(event.payload.unitId ?? event.unitId ?? ""));
     const stale = !unit || !evidenceInputBindingIsCurrent(store, events, event.payload, unit, finalImage, planChanged, changed,
-      rolePolicies[unit.role]?.hash, invalidatedEvidenceIds, allowedPaths, assessmentToolIdentity, runtimeIdentity);
+      rolePolicies[unit.role]?.hash, invalidatedEvidenceIds, allowedPaths, assessmentToolIdentity, runtimeIdentity, observedPaths);
     (stale ? invalidated : retained).push(id || `${event.unitId ?? "unknown"}:${event.payload.predicateId ?? "predicate"}`);
     if (stale && id) invalidatedEvidenceIds.add(id);
   }
@@ -2133,7 +2288,8 @@ async function observeEffects(
     }
     const external = operation.startsWith("external:") || intent.payload.recovery === "external-probe-required";
     if (external) {
-      if (reconciled && effectOutcomeResolved(options.store, events, effectId)) {
+      if (reconciled && !await observeRecovery<boolean>(options, "unresolvedEffects",
+        { ...options.store.historyLocator, missionId: options.missionId, effectId })) {
         output.push({ effectId, attemptId, operation,
           disposition: reconciled.payload.disposition as EffectDisposition,
           reason: String(reconciled.payload.reason ?? "prior exact host probe was reused"),
@@ -2222,13 +2378,15 @@ async function observeEffects(
             ["effect.invoking", "effect.process.registered", "effect.released"].includes(event.kind) && rows.indexOf(event) > rows.indexOf(receipt)) &&
           plan && effectPlanMatchesIntent(plan, intent.payload) && effectImage &&
           rows.indexOf(effectImage) === rows.indexOf(receipt) + 1 && effectImage.payload.manifestHash ===
-            readSealedWorkspaceImage(options.store, String(effectImage.payload.imageHash)).manifest.hash &&
-          effectOutcomeResolved(options.store, events, effectId)) {
+            (await observeRecoverySealed(options, String(effectImage.payload.imageHash))).manifest.hash &&
+          !await observeRecovery<boolean>(options, "unresolvedEffects",
+            { ...options.store.historyLocator, missionId: options.missionId, effectId })) {
           disposition = "applied";
           reason = "bound completed Bash receipt and sealed effect image survive empty process namespace observation";
         } else if (receiptRow?.status === "failed" && receiptRow.termination === "signal" && attemptId &&
           plan && effectPlanMatchesIntent(plan, intent.payload) && effectImage) {
-          const stopped = readHistoricalPauseInterruption(options.store, options.store.inspectMission(options.missionId), attemptId);
+          const stopped = await observeRecovery<ReturnType<typeof readHistoricalPauseInterruption>>(options, "historicalInterruption",
+            { ...options.store.historyLocator, missionId: options.missionId, attemptId, root: options.sourceRoot });
           if (!stopped.proof.effects.some((row) => row.effectId === effectId)) throw new Error("Bash is outside stop proof");
           disposition = "partial";
           reason = "exact stopped failed/signal Bash receipt and sealed image preserve interrupted bytes; not execution success";
@@ -2237,18 +2395,17 @@ async function observeEffects(
     } else if (baseSnapshot && plan && effectPlanMatchesIntent(plan, intent.payload)) {
       try {
         const allowedPaths = Array.isArray(plan.allowedPaths) ? plan.allowedPaths.map(String) : [];
-        const liveCandidate = observedRoot && candidateIdentityMatches(observedRoot, baseSnapshot.payload, options.sourceRoot) &&
-          candidateMatchesEffectPlan(observedRoot, plan, options.sourceRoot);
+        const candidatePaths = observedRoot ? await observeRecovery<ManifestPath[] | null>(options, "effectCandidatePaths",
+          { root: observedRoot, sourceRoot: options.sourceRoot, payload: baseSnapshot.payload, plan }) : null;
         let observed: ManifestPath[];
-        if (liveCandidate) {
-          observed = captureWorkspacePaths(observedRoot, true).filter(({ path: name }) => allowedPathMatches(name, allowedPaths));
-          assertCompleteWorkspaceImage(captureWorkspaceImage(observedRoot), observed);
+        if (candidatePaths) {
+          observed = candidatePaths;
         } else {
           const sealedEffect = [...rows].reverse().find((event) => event.kind === "workspace.snapshot.sealed" &&
             event.attemptId === attemptId && event.payload.effectId === effectId && event.payload.phase === "effect" &&
             typeof event.payload.imageHash === "string");
           if (!sealedEffect) throw new Error("candidate is unavailable and no host-sealed effect after-image exists");
-          const image = readSealedWorkspaceImage(options.store, String(sealedEffect.payload.imageHash));
+          const image = await observeRecoverySealed(options, String(sealedEffect.payload.imageHash));
           if (image.manifest.hash !== sealedEffect.payload.manifestHash) throw new Error("sealed effect after-image manifest does not match its event");
           observed = image.files.filter(({ path: name }) => allowedPathMatches(name, allowedPaths)).map(({ path: name, kind, mode, bytes }) => ({
             path: name, kind, mode, hash: bytes ? sha256(bytes) : null,
@@ -2277,7 +2434,7 @@ async function observeEffects(
           candidateIdentity: plan.candidate.rootIdentity, candidateGitIdentity: plan.candidate.gitIdentity,
           processIdentity: { ...registered, descendantsQuiescent: true, namespaceEmptyAfterExit: true },
           observedImageHash: observedHash, beforeImageHash: beforeHash,
-          expectedAfterHash: afterHash, imageSource: liveCandidate ? "live-candidate" : "sealed-effect-snapshot",
+          expectedAfterHash: afterHash, imageSource: candidatePaths ? "live-candidate" : "sealed-effect-snapshot",
         };
       } catch (error) {
         reason = `candidate image observation is incomplete: ${error instanceof Error ? error.message : String(error)}`;
@@ -2320,6 +2477,17 @@ export function missionHasUnresolvedEffects(
 }
 
 // Completion requires independently stored outcome proof; operational recovery may reuse host probe observations.
+/** Cheap journal guard only. Actual result/admission frontiers independently read stored effect proof in the observer. */
+export function missionHasUnresolvedEffectBindings(
+  _store: MissionStore,
+  events: readonly { kind: string; effectId: string | null; attemptId: string | null; payload: Record<string, any> }[],
+  attemptId?: string,
+): boolean {
+  const ids = new Set(events.filter(event => event.effectId && (!attemptId || event.attemptId === attemptId))
+    .map(event => event.effectId!));
+  return [...ids].some(id => !effectOutcomeResolvedFromEvents(events.filter(event => event.effectId === id), id));
+}
+
 export function missionHasUnprovenCompletionEffects(
   store: MissionStore,
   events: readonly { kind: string; effectId: string | null; attemptId: string | null; payload: Record<string, any> }[],
@@ -2486,6 +2654,17 @@ function candidateMatchesEffectPlan(root: string, plan: Record<string, any>, sou
   } catch { return false; }
 }
 
+export function observeEffectCandidatePaths(input: {
+  root: string; sourceRoot: string; payload: Record<string, unknown>; plan: Record<string, any>;
+}): ManifestPath[] | null {
+  if (!candidateIdentityMatches(input.root, input.payload, input.sourceRoot) ||
+    !candidateMatchesEffectPlan(input.root, input.plan, input.sourceRoot)) return null;
+  const allowedPaths = Array.isArray(input.plan.allowedPaths) ? input.plan.allowedPaths.map(String) : [];
+  const paths = captureWorkspacePaths(input.root, true).filter(({ path: name }) => allowedPathMatches(name, allowedPaths));
+  assertCompleteWorkspaceImage(captureWorkspaceImage(input.root), paths);
+  return paths;
+}
+
 function effectProcessMatchesIntent(intent: Record<string, any>, process: unknown): boolean {
   const owner = intent.owner;
   if (!isProcessIdentity(process) || !owner || typeof owner !== "object") return false;
@@ -2579,11 +2758,16 @@ async function appendRecoveryEvent(store: MissionStore, missionId: string, revis
   return appendRecoveryEvents(store, missionId, revision, [event], artifacts);
 }
 
-async function appendRecoveryEvents(store: MissionStore, missionId: string, revision: number, events: MissionEventDraft[], artifacts: Array<{ bytes: Uint8Array; mediaType: string }> = [], currentObservation?: () => boolean): Promise<void> {
+async function appendRecoveryEvents(store: MissionStore, missionId: string, revision: number, events: MissionEventDraft[], artifacts: Array<{ bytes: Uint8Array; mediaType: string }> = [], currentObservation?: () => boolean | Promise<boolean>): Promise<void> {
   for (let restart = 0; restart <= 2; restart += 1) {
+    const before = store.inspectMission(missionId);
+    const owner = store.ownershipIdentity;
+    if (currentObservation && !await currentObservation()) throw new Error("recovery observation changed; rerun bounded reconciliation");
     const current = store.inspectMission(missionId);
+    if (JSON.stringify(owner) !== JSON.stringify(store.ownershipIdentity) ||
+      !recoveryObservationCurrent(current.events, before.latestSeq))
+      throw new Error("recovery authority changed during observation");
     if (current.revision !== revision) throw new Error("mission revision changed during recovery; rerun bounded reconciliation");
-    if (currentObservation && !currentObservation()) throw new Error("recovery observation changed; rerun bounded reconciliation");
     try {
       store.appendTransition(missionId, current.version, { events: events.map((event) => ({ ...event, revision })), artifacts });
       return;
@@ -2779,7 +2963,7 @@ function candidateLocationHistory(
   return history;
 }
 
-function candidateIdentityMatches(root: string, payload: Record<string, unknown>, sourceRoot: string): boolean {
+export function candidateIdentityMatches(root: string, payload: Record<string, unknown>, sourceRoot: string): boolean {
   try {
     const candidate = verifyPrivateCandidate(root, sourceRoot);
     const rootIdentity = payload.candidateIdentity ?? payload.rootIdentity;

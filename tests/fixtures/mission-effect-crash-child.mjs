@@ -18,7 +18,7 @@ const durableStore = await openMissionStore({ dbPath, objectDir });
 const ownerEpoch = durableStore.ownerEpoch;
 if (ownerEpoch === null) throw new Error("crash child failed to claim mission writer");
 
-const workspace = createMissionWorkspace({ missionId, attemptId, sourceRoot, storeRoot, candidateParent,
+const workspace = await createMissionWorkspace({ missionId, attemptId, sourceRoot, storeRoot, candidateParent,
   allowedPaths: durableStore.inspectMission(missionId).definition.authority.allowedPaths });
 await preflightContainment(workspace);
 writeFileSync(metadataFile, JSON.stringify({ candidateRoot: workspace.candidateRoot, attemptId }));

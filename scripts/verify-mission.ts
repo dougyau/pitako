@@ -1035,7 +1035,7 @@ async function runT3ContainedScenario(runDir: string): Promise<Record<string, an
     writeFileSync(storeSentinel, "store sentinel\n");
     writeFileSync(otherSentinel, "other candidate sentinel\n");
     const attemptId = randomUUID();
-    const workspace = createMissionWorkspace({
+    const workspace = await createMissionWorkspace({
       missionId: mission.id, attemptId, sourceRoot: fixture.root, storeRoot: store.storageRoot,
       candidateParent: path.join(fixture.stateDir, "pitako-candidates"), otherCandidates: [otherCandidate],
       allowedPaths: ["src/**"], productRoot,
@@ -1098,7 +1098,7 @@ async function runT3ContainedScenario(runDir: string): Promise<Record<string, an
     const registeredCountAfterDenial = afterDenialEvents.filter(({ kind }) => kind === "effect.process.registered").length;
 
     const shutdownAttemptId = randomUUID();
-    const shutdownWorkspace = createMissionWorkspace({
+    const shutdownWorkspace = await createMissionWorkspace({
       missionId: mission.id, attemptId: shutdownAttemptId, sourceRoot: fixture.root, storeRoot: store.storageRoot,
       candidateParent: path.join(fixture.stateDir, "shutdown-candidates"), otherCandidates: [workspace.candidateRoot, otherCandidate],
       allowedPaths: ["src/**"], productRoot,

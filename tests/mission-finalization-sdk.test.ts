@@ -18,6 +18,9 @@ import { bindPreparationAuthority, bindPreparationSetup, openPreparationRequest,
   preparationContext, preparedAdmissionText, validatePreparation } from "../extensions/mission/preparation.ts";
 import { admitSetupStart, MissionSetup, setupStartText } from "../extensions/mission/setup.ts";
 import { registerMissionExtension } from "../extensions/mission/index.ts";
+import { PhysicalObservation } from "../extensions/mission/physical-observation.ts";
+import { validateMissionDefinition } from "../extensions/mission/model.ts";
+import { meteredConsumptions, resourceAuthority } from "../extensions/mission/resources.ts";
 
 const evidenceRoot = process.env.PITAKO_SLICE4B_EVIDENCE;
 
@@ -41,6 +44,9 @@ test("finalization transport accepts the retained whole-body receipt and rejects
 });
 
 async function runCase(name: string, changed = false) {
+  const physicalRequest = PhysicalObservation.prototype.request;
+  const metered = name === "generated-metered";
+  let finalizationTicks = 0, completionTicks = 0;
   const nested = name === "generated-nested-production";
   const commandTime = name.startsWith("command-time-");
   const commandRemaining = name === "command-time-remaining";
@@ -84,7 +90,7 @@ async function runCase(name: string, changed = false) {
   execFileSync("git", ["add", "src"], { cwd: sample.root });
   process.env.PI_CODING_AGENT_DIR = agentDir;
   const provider = await installMissionLocalProvider({ agentDir, reasoning: generated,
-    usage: name === "generated-token-slack" ? { input: 13000, output: 617, cacheRead: 0 } : undefined,
+    usage: name === "generated-token-slack" || metered ? { input: 13000, output: 617, cacheRead: 0 } : undefined,
     contextWindow: slackCase ? 32768 : undefined,
     toolTurns: name === "generated-token-slack" ? 3 : 1,
     toolForPrompt: generated ? (prompt, completedTools) => prompt.includes('"format":"mission-finalization-brief-v1"')
@@ -95,6 +101,7 @@ async function runCase(name: string, changed = false) {
           "test ! -e node_modules/dependency && cat src/diagnostic-input > src/diagnosis" } } :
         setup ? { name: "bash", arguments: { command:
           `test "$(cat node_modules/dependency)" = installed && printf '${brokenProduct ? "broken" : "product"}\\n' > src/a` } } :
+        metered ? { name: "bash", arguments: { command: "printf 'product\\n' > src/a", timeoutMs: 3000 } } :
         { name: "write", arguments: { path: "src/a", content: brokenProduct ? "broken\n" : "product\n" } } : undefined,
     responseForPrompt(prompt) {
     if (!prompt.includes('"format":"mission-finalization-brief-v1"')) return "producer response";
@@ -249,10 +256,13 @@ fallbacks = [{ model = "${provider.provider}/${provider.model}", reasoning = "me
       ordinary: ["product-present", "nonempty"], integrated: ["nonempty"], affected: ["product-present"],
       final: [...definition.finalization.requiredPredicates],
     };
-    const values = { authority: definition.authority, budget: definition.budget };
+    const { budget: _legacyBudget, ...common } = definition;
+    const admittedDefinition = metered ? validateMissionDefinition({ ...common, schemaVersion: 3,
+      resourcePolicy: { estimates: { tokens: 1, activeTimeMs: 1 }, limits: {} } }) : definition;
+    const values = resourceAuthority(admittedDefinition);
     const text = preparationAuthorityText(request, values);
     bindPreparationAuthority(request, values, recordOperatorInput("native-confirmation", "principal", text)!);
-    prepared = validatePreparation({ request, proposal: { definition, mappings } });
+    prepared = validatePreparation({ request, proposal: { definition: admittedDefinition, mappings } });
     if (prepared.state !== "ready") throw new Error(JSON.stringify(prepared.issues));
     if (name === "generated-setup-selective") {
       const insufficient = structuredClone(definition);
@@ -272,7 +282,7 @@ fallbacks = [{ model = "${provider.provider}/${provider.model}", reasoning = "me
         writeFileSync(path.join(evidenceRoot, name, "insufficient-grant.json"), JSON.stringify(denied, null, 2));
       }
     }
-    if (!revised) {
+    if (!revised && !metered) {
       const competing = path.join(sample.root, ".pitako/plans");
       mkdirSync(competing, { recursive: true });
       writeFileSync(path.join(competing, "durable-fixture.md"), "not the pinned source");
@@ -434,6 +444,10 @@ fallbacks = [{ model = "${provider.provider}/${provider.model}", reasoning = "me
         if (!generated && !input.binding.finalization || changed && input.binding.finalization?.phase === "cleanup") {
           const receipt = await durable.effects!.invoke("write", { path: "src/a", content: failedGate && input.binding.finalization ?
             "broken\n" : changed && input.binding.finalization ? "product\n# simplified\n" : "product\n" });
+          if (evidenceRoot && receipt.status !== "completed") {
+            const out = path.join(evidenceRoot, name); mkdirSync(out, { recursive: true });
+            writeFileSync(path.join(out, "failed-write-receipt.json"), JSON.stringify(receipt, null, 2));
+          }
           expect(receipt.status).toBe("completed");
         }
         if (input.binding.finalization?.phase === "whole-review") {
@@ -581,6 +595,28 @@ fallbacks = [{ model = "${provider.provider}/${provider.model}", reasoning = "me
       } };
     engine = new MissionEngine({ ...options, managedWorkspace: { ...options.managedWorkspace,
       sourceRoot: name.endsWith("wrong-root") ? pinRoot : sample.root } });
+    if (name === "ordered") PhysicalObservation.prototype.request = async function<T>(
+      operation: string, input: unknown, signal?: AbortSignal, deadline?: number): Promise<T> {
+      const tick = () => {
+        const current = store.inspectMission(mission.id);
+        store.appendTransition(mission.id, current.version, { events: [{
+          revision: current.revision, kind: "measurement.recorded", causalId: randomUUID(), payload: {
+            schemaVersion: 1, id: randomUUID(), missionId: mission.id, revision: current.revision, causalId: randomUUID(),
+            metric: "active-time", value: 1, unit: "ms", source: "ordered observation overlap",
+            occurredAt: new Date().toISOString(), runtimeId: store.runtimeId, durationMs: 1,
+            inputTokens: 0, outputTokens: 0,
+          },
+        }] });
+      };
+      // Also tick before the worker reads its database: bootstrap must not demand a raw version match.
+      if (operation === "completion") tick();
+      const proof = await (physicalRequest<T>).call(this, operation, input, signal, deadline);
+      if (operation === "finalization" || operation === "completion") {
+        operation === "finalization" ? finalizationTicks++ : completionTicks++;
+        tick();
+      }
+      return proof;
+    };
     const setupAdmission = setup ? admitSetupStart(store, mission.id, "principal",
       recordOperatorInput("native-confirmation", "principal", setupStartText(store, mission.id, "principal"))!, () => {}) : undefined;
     if (inputNegative) {
@@ -607,7 +643,7 @@ fallbacks = [{ model = "${provider.provider}/${provider.model}", reasoning = "me
       revisionOne = store.inspectMission(mission.id);
       expect(revisionOne.state).toBe("paused");
       expect(revisionOne.events.some(({ kind }) => kind === "attempt.reserved")).toBe(false);
-      expect(new MissionSetup(store, mission.id).observe().state).toBe("ready");
+      expect((await new MissionSetup(store, mission.id).refresh()).state).toBe("ready");
       revisionOneRecovery = await reconcileMission({ store, missionId: mission.id, sourceRoot: sample.root, planFile: sample.planFile });
       await engine.retireForShutdown("quit");
       const handlers = new Map<string, Function[]>();
@@ -649,25 +685,25 @@ fallbacks = [{ model = "${provider.provider}/${provider.model}", reasoning = "me
       expect(admitted.snapshot.definitionHash).not.toBe(revisionOne.snapshot.definitionHash);
       expect(admitted.snapshot.planHash).not.toBe(revisionOne.snapshot.planHash);
       expect(readFileSync(sample.planFile).equals(originalPin)).toBe(true);
-      expect(new MissionSetup(store, mission.id).observe()).toMatchObject({ state: "blocked",
+      expect(await new MissionSetup(store, mission.id).refresh()).toMatchObject({ state: "blocked",
         reason: "compatible setup success needs a current durable reuse reference" });
       const setupObserver = new MissionSetup(store, mission.id);
-      setupObserver.reconcile();
+      await setupObserver.reconcile();
       expect(setupObserver.observe().state).toBe("ready");
       const negativeCases: string[] = [];
-      const checkPin = (caseName: string, mutate: () => void, restore: () => void) => {
+      const checkPin = async (caseName: string, mutate: () => void, restore: () => void) => {
         mutate();
         try {
           expect(() => missionInputIdentity(admitted, sample.root)).toThrow();
-          expect(setupObserver.reconcile().state).toBe("blocked");
+          expect((await setupObserver.reconcile()).state).toBe("blocked");
           negativeCases.push(caseName);
         } finally { restore(); }
       };
-      checkPin("missing physical pin", () => renameSync(sample.planFile, `${sample.planFile}.saved`),
+      await checkPin("missing physical pin", () => renameSync(sample.planFile, `${sample.planFile}.saved`),
         () => renameSync(`${sample.planFile}.saved`, sample.planFile));
-      checkPin("changed physical pin", () => writeFileSync(sample.planFile, "changed"),
+      await checkPin("changed physical pin", () => writeFileSync(sample.planFile, "changed"),
         () => writeFileSync(sample.planFile, originalPin));
-      checkPin("retargeted physical pin", () => {
+      await checkPin("retargeted physical pin", () => {
         renameSync(sample.planFile, `${sample.planFile}.saved`);
         symlinkSync(`${sample.planFile}.saved`, sample.planFile);
       }, () => { rmSync(sample.planFile); renameSync(`${sample.planFile}.saved`, sample.planFile); });
@@ -679,20 +715,20 @@ fallbacks = [{ model = "${provider.provider}/${provider.model}", reasoning = "me
       ]) {
         const bytes = readFileSync(file!);
         writeFileSync(file!, "incompatible");
-        expect(setupObserver.observe().state).toBe("blocked");
+        expect((await setupObserver.refresh()).state).toBe("blocked");
         expect((await setupObserver.ensure(setupAdmission!, () => true)).state).toBe("blocked");
         writeFileSync(file!, bytes);
         negativeCases.push(caseName!);
       }
       const wrongAuthority = structuredClone(admitted);
       wrongAuthority.definition.authority.operations = ["bash"];
-      expect(setupObserver.observe(wrongAuthority).state).toBe("blocked");
+      expect(setupObserver.observePhysical(wrongAuthority).state).toBe("blocked");
       negativeCases.push("changed execution authority");
       const unknownPrerequisite = structuredClone(admitted);
       unknownPrerequisite.prepared!.setup!.requiredBy.predicateIds = [];
-      expect(setupObserver.observe(unknownPrerequisite).state).toBe("blocked");
+      expect(setupObserver.observePhysical(unknownPrerequisite).state).toBe("blocked");
       negativeCases.push("incomplete prerequisite references");
-      expect(setupObserver.observe().state).toBe("ready");
+      expect((await setupObserver.refresh()).state).toBe("ready");
       expect(store.inspectMission(mission.id).events.filter(({ kind }) => kind === "mission.setup.intent")).toHaveLength(1);
       const revisedRecovery = await reconcileMission({ store, missionId: mission.id, sourceRoot: sample.root, planFile: sample.planFile });
       expect(revisedRecovery.revision).toBe(2);
@@ -734,7 +770,7 @@ fallbacks = [{ model = "${provider.provider}/${provider.model}", reasoning = "me
       const receipt = JSON.parse(store.readArtifact(String(receiptRow.payload.receiptHash)).toString());
       expect(receipt).toMatchObject({ status: "stopped", disposed: true });
       expect(stopped.events.find(({ kind }) => kind === "mission.owner.released")!.seq).toBeGreaterThan(receiptRow.seq);
-      expect(new MissionSetup(store, mission.id).observe().state).toBe("blocked");
+      expect((await new MissionSetup(store, mission.id).refresh()).state).toBe("blocked");
       if (evidenceRoot) {
         const out = path.join(evidenceRoot, name); mkdirSync(out, { recursive: true });
         writeFileSync(path.join(out, "journal-stopped.json"), JSON.stringify(stopped, null, 2));
@@ -937,7 +973,7 @@ fallbacks = [{ model = "${provider.provider}/${provider.model}", reasoning = "me
       expect(inspection.events.filter(({ kind }) => kind === "unit.accepted").map(({ unitId }) => unitId)).toEqual([definition.units[0]!.id]);
       expect(inspection.events.some(({ kind, payload }) => kind === "evidence.recorded" &&
         payload.predicateId === "diagnosis-present" && payload.verdict === "pass" && payload.assessmentAuthority === "production-checker")).toBe(true);
-      expect(new MissionSetup(store, mission.id).observe().state).toBe("blocked");
+      expect((await new MissionSetup(store, mission.id).refresh()).state).toBe("blocked");
       expect(readFileSync(path.join(sample.root, "node_modules/dependency"), "utf8")).toBe("incomplete");
       const terminal = inspection.events.find(({ kind, payload }) =>
         kind === "workspace.snapshot.sealed" && payload.purpose === "terminal-output")!;
@@ -961,7 +997,7 @@ fallbacks = [{ model = "${provider.provider}/${provider.model}", reasoning = "me
     }
     if (setup) {
       expect(inspection.events.filter(({ kind }) => kind === "mission.setup.intent")).toHaveLength(1);
-      expect(new MissionSetup(store, mission.id).observe().state).toBe("ready");
+      expect((await new MissionSetup(store, mission.id).refresh()).state).toBe("ready");
       const setupRow = inspection.events.find(({ kind }) => kind === "mission.setup.receipt")!;
       expect(inspection.events.findIndex(({ kind }) => kind === "attempt.reserved")).toBeGreaterThan(
         inspection.events.findIndex(({ eventId }) => eventId === setupRow.eventId));
@@ -1098,12 +1134,35 @@ fallbacks = [{ model = "${provider.provider}/${provider.model}", reasoning = "me
       expect(result.files.find((row) => row.path === "src/a")?.bytes?.toString()).toBe(changed ? "product\n# simplified\n" : "product\n");
       const sessions = provider.trace.map((row) => row.sessionId);
       expect(new Set(sessions).size).toBe(4);
-      expect(inspection.reservations.filter((row) => row.resource === "role-launches" && row.purpose === "finalization")).toHaveLength(3);
+      expect(inspection.reservations.filter((row) => row.resource === "role-launches" && row.purpose === "finalization")).toHaveLength(metered ? 0 : 3);
       const extra = remainder ? 4 : slackCase ? pairing ? 2 : 4 : name === "ordered" ? 1 : 0;
-      expect(inspection.reservations.filter((row) => row.resource === "provider-requests" && row.purpose === "finalization")).toHaveLength(3 + extra);
+      expect(inspection.reservations.filter((row) => row.resource === "provider-requests" && row.purpose === "finalization")).toHaveLength(metered ? 0 : 3 + extra);
+      if (metered) {
+        expect(inspection.reservations).toHaveLength(0);
+        const usage = meteredConsumptions(inspection.events);
+        expect(usage.filter(row => row.resource === "tokens").reduce((sum, row) => sum + row.knownCharge, 0)).toBeGreaterThan(1);
+        expect(usage.filter(row => row.resource === "active-time-ms").reduce((sum, row) => sum + row.knownCharge, 0)).toBeGreaterThan(1);
+        expect(usage.every(row => !row.outstanding)).toBe(true);
+        const releases = inspection.events.filter(row => row.kind === "effect.released");
+        expect(releases.length).toBeGreaterThan(0);
+        expect(releases.every(row => {
+          const time = row.payload.timeAdmission;
+          return row.payload.reservationId === undefined && time && typeof time === "object" && "kind" in time &&
+            time.kind === "metered" && Number(row.payload.executionDeadline) > Number(row.payload.executionStartedAt);
+        })).toBe(true);
+        expect(inspection.events.some(row => row.kind === "budget.admission.fenced")).toBe(false);
+      }
       expect(inspection.events.filter((row) => row.kind === "provider.request.dispatched")).toHaveLength((generated ? 5 : 4) + extra +
         (slackCase ? 3 : remainder ? 1 : 0));
       const launches = inspection.events.filter((row) => row.kind === "attempt.reserved").length;
+      if (name === "ordered") {
+        expect(finalizationTicks).toBeGreaterThan(0);
+        expect(completionTicks).toBe(1);
+        expect(missionCompletionCertificate(inspection, store)?.eventSequence)
+          .toBe(inspection.events.find(row => row.kind === "mission.completed")!.seq);
+        if (evidenceRoot) writeFileSync(path.join(evidenceRoot, name, "physical-ticks.json"),
+          JSON.stringify({ finalizationTicks, completionTicks, currentCertificate: true }));
+      }
       await engine.retireForShutdown("quit");
       store = name === "clean-report"
         ? await openMissionStore({ dbPath: sample.dbPath, objectDir: sample.objectDir, readOnly: true })
@@ -1136,11 +1195,18 @@ fallbacks = [{ model = "${provider.provider}/${provider.model}", reasoning = "me
       if (remainder) expect(inspection.reservations.filter(row => row.resource === "tokens" &&
         row.purpose === "protected").map(row => row.grantAmount)).toEqual([66668, 93750, 4234]);
       expect(currentWholeResultApproval(inspection, store, sample.root)?.manifestHash).toBe(approval!.manifestHash);
+      if (metered) {
+        expect(missionCompletionCertificate({ ...inspection,
+          events: inspection.events.filter(row => row.kind !== "mission.finalization.reviewed") }, store)).toBeUndefined();
+        expect(missionCompletionCertificate({ ...inspection,
+          events: inspection.events.filter(row => row.kind !== "evidence.recorded") }, store)).toBeUndefined();
+        return;
+      }
       if (setup) {
-        expect(new MissionSetup(store, mission.id).observe()).toMatchObject({ state: "ready", reused: true });
+        expect(await new MissionSetup(store, mission.id).refresh()).toMatchObject({ state: "ready", reused: true });
         expect(inspection.events.filter(({ kind }) => kind === "mission.setup.intent")).toHaveLength(1);
         writeFileSync(path.join(sample.root, "node_modules/dependency"), "changed");
-        expect(new MissionSetup(store, mission.id).observe().state).toBe("blocked");
+        expect((await new MissionSetup(store, mission.id).refresh()).state).toBe("blocked");
         expect(currentWholeResultApproval(inspection, store, sample.root)).toBeUndefined();
         expect(missionCompletionCertificate(inspection, store)).toBeUndefined();
         return; // setup-only slice; native full-terminal/revision and existing ignored-copy fences are separate evidence
@@ -1225,6 +1291,7 @@ fallbacks = [{ model = "${provider.provider}/${provider.model}", reasoning = "me
     }
     throw error;
   } finally {
+    PhysicalObservation.prototype.request = physicalRequest;
     releaseReview();
     let retired = false;
     try {
@@ -1288,5 +1355,6 @@ for (const boundary of ["missing-pin", "changed-pin", "retargeted-pin", "wrong-r
     () => runCase(`generated-setup-selective-${boundary}`), 30000);
 }
 test("generated sibling-only proposal dispatches exact source bytes and produces a production terminal certificate", () => runCase("generated-product"), 90000);
+test("schema 3 metered SDK command exceeds estimates and completes mandatory seven phases and independent review", () => runCase("generated-metered"), 90000);
 test("generated passing prose cannot replace failing production output evidence", () => runCase("generated-failing-product"), 90000);
 test("generated SDK pause and reload retain physical pin and admitted prepared identity through resume and finalization", () => runCase("generated-paused-review"), 90000);

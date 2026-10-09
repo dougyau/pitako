@@ -18,7 +18,7 @@ writeFileSync(path.join(store, "sentinel"), "fixture-store");
 const git = (args: string[]) => execFileSync("/usr/bin/git", args, { cwd: source });
 git(["init", "-q"]); git(["add", "."]);
 git(["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture"]);
-const workspace = createMissionWorkspace({ missionId: crypto.randomUUID(), attemptId: crypto.randomUUID(),
+const workspace = await createMissionWorkspace({ missionId: crypto.randomUUID(), attemptId: crypto.randomUUID(),
   sourceRoot: source, storeRoot: store, candidateParent: path.join(root, "candidates"), otherCandidates: [other],
   allowedPaths: ["src/**"] });
 const proof = await preflightContainment(workspace);

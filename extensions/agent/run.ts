@@ -135,6 +135,9 @@ export interface AttemptSession {
   dispose(): Promise<void>;
 }
 
+export type ProviderAdmissionTicket = import("../mission/resources.ts").MeteredTicket |
+  { kind: "capped"; tokenReservationId: string };
+
 export interface ProviderRequestReceipt {
   requestId: string;
   provider: string;
@@ -144,7 +147,7 @@ export interface ProviderRequestReceipt {
   estimatedCost?: number | null;
   pricingBasis?: string;
   usageUnknownReason?: string;
-  ticket?: unknown;
+  ticket?: ProviderAdmissionTicket;
 }
 
 export interface DurableAttemptContext {
@@ -157,7 +160,7 @@ export interface DurableAttemptContext {
   effects?: MissionEffects;
   signal?: AbortSignal;
   rolePolicy: { primary: ModelTarget; fallbacks: readonly ModelTarget[] };
-  onProviderDispatch: (request: { requestId: string; provider: string; model: string }) => Promise<unknown> | unknown;
+  onProviderDispatch: (request: { requestId: string; provider: string; model: string }) => Promise<ProviderAdmissionTicket> | ProviderAdmissionTicket;
   onProviderReceipt: (receipt: ProviderRequestReceipt) => Promise<void> | void;
   onOutcome?: (result: AgentRunResult) => void;
 }

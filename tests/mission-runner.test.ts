@@ -158,7 +158,8 @@ describe("persistent Pi mission runner", () => {
       sessionId: firstAttempt.binding.attemptId,
       readOnly: true,
       rolePolicy: { primary: { model: `${provider.provider}/${provider.model}` }, fallbacks: [] },
-      onProviderDispatch: ({ requestId }) => requestId,
+      onProviderDispatch: ({ requestId }) => ({ kind: "metered", ticketId: requestId, operationId: requestId,
+        resource: "tokens", revision: firstAttempt.binding.revision, ownerEpoch: firstAttempt.binding.ownerEpoch }),
       onProviderReceipt: () => {},
       onOutcome: () => {},
     });

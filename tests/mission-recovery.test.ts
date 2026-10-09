@@ -47,7 +47,7 @@ async function createInterruptedAttempt(sample: MissionFixture, containedWrite =
   const store = await openFixtureStore(sample);
   const mission = store.createMission(missionInput(sample));
   const attemptId = randomUUID();
-  const workspace = createMissionWorkspace({
+  const workspace = await createMissionWorkspace({
     missionId: mission.id, attemptId, sourceRoot: sample.root, storeRoot: store.storageRoot,
     candidateParent: path.join(sample.base, "candidates"), allowedPaths: ["src/**"],
   });
@@ -145,7 +145,7 @@ test("clean recovered continuation discharges actual effects without erasing the
     return result;
   };
   try {
-    engine.start(); await engine.waitForIdle();
+    await engine.start(); await engine.waitForIdle();
     const inspection = store.inspectMission(interrupted.missionId);
     const row = inspection.events.find((event) => event.kind === "mission.recovery.recorded")!;
     const report = JSON.parse(store.readArtifact(String(row.payload.reportHash)).toString());
@@ -214,6 +214,47 @@ async function crashUnreceiptedWrite(sample: MissionFixture, content: string) {
   if (!attemptId || !effectId) throw new Error("crash fixture omitted its bound attempt or effect");
   return { missionId: mission.id, attemptId, effectId, candidateRoot, candidateParent, store: await openFixtureStore(sample), durableEvents };
 }
+
+test("recovered source admission keeps binding checks cheap and rejects a fresh provider and effect after drift", async () => {
+  const sample = fixture();
+  const definition = JSON.parse(sample.definitionBytes.toString());
+  definition.budget.artifactBytes = 30_000_000;
+  writeFileSync(sample.definitionFile, JSON.stringify(definition));
+  const interrupted = await createInterruptedAttempt(sample);
+  const store = await openFixtureStore(sample);
+  let checked = false;
+  const engine = new MissionEngine({ store, missionId: interrupted.missionId,
+    sessionsDirectory: path.join(sample.base, "sessions"),
+    managedWorkspace: { sourceRoot: sample.root, candidateParent: path.join(sample.base, "candidates") },
+    runRole: async ({ unit, binding }, durable) => {
+      const requestId = randomUUID();
+      const ticket = await durable.onProviderDispatch({ requestId, provider: "fixture", model: "local" });
+      await durable.onProviderReceipt({ requestId, provider: "fixture", model: "local", inputTokens: 2, outputTokens: 1, ticket });
+      const receipt = await durable.effects!.invoke("bash", { command: "printf CURRENT_SOURCE" });
+      expect(receipt.status).toBe("completed");
+      writeFileSync(path.join(sample.root, "src", "user.ts"), "changed after independent effect frontier\n");
+      // Projection refresh is not physical authorization; only the next owned frontier reads source.
+      expect(engine.snapshot().attempts[binding.attemptId]?.status).toBe("running");
+      const host = engine as unknown as { attemptAdmitted(attempt: typeof binding): boolean };
+      expect(host.attemptAdmitted(binding)).toBe(true);
+      await expect(durable.onProviderDispatch({ requestId: randomUUID(), provider: "fixture", model: "local" }))
+        .rejects.toThrow("physical source or inputs changed");
+      await expect(durable.effects!.invoke("bash", { command: "touch src/MUST_NOT_EXIST" }))
+        .rejects.toThrow("physical source or inputs changed");
+      expect(existsSync(path.join(binding.candidateRoot!, "src", "MUST_NOT_EXIST"))).toBe(false);
+      checked = true;
+      return { instanceId: randomUUID(), role: unit.role, status: "failed" as const,
+        model: { selectedModel: "fixture/local" }, result: "source drift observed and denied" };
+    },
+  });
+  try {
+    await engine.start(); await engine.waitForIdle();
+    expect(checked).toBe(true);
+    const events = store.inspectMission(interrupted.missionId).events;
+    expect(events.filter(event => event.kind === "provider.request.dispatched")).toHaveLength(1);
+    expect(events.filter(event => event.kind === "effect.intent")).toHaveLength(1);
+  } finally { await engine.retireForShutdown("quit"); store.close(); }
+}, 30_000);
 
 describe("durable mission reconciliation", () => {
   test.each(["none", "interrupted", "failed-recovery"] as const)(
@@ -504,7 +545,7 @@ describe("durable mission reconciliation", () => {
     if (!patchHash || !acceptedHash) throw new Error("recovery report omitted its conditional patch identity");
     const patchBytes = store.readArtifact(patchHash);
     const patch = JSON.parse(patchBytes.toString("utf8"));
-    const deliveryCopy = createMissionWorkspace({
+    const deliveryCopy = await createMissionWorkspace({
       missionId: interrupted.missionId, attemptId: randomUUID(), sourceRoot: sample.root, storeRoot: store.storageRoot,
       candidateParent: path.join(sample.base, "delivery-copies"), allowedPaths: ["src/**"],
     });
@@ -647,7 +688,7 @@ describe("durable mission reconciliation", () => {
     definition.budget.providerRequests = 8;
     definition.budget.tokens = 2000;
     definition.budget.activeTimeMs = 120000;
-    definition.units[0].inputs = ["src/app.ts"];
+    definition.units[0].inputs = ["src"];
     definition.units.push({
       ...definition.units[0], id: "user-check", inputs: ["src/user.ts"],
       acceptance: [{ id: "user-proof", kind: "manual", target: "fixture:user" }],
@@ -675,8 +716,15 @@ describe("durable mission reconciliation", () => {
     await engine.retireForShutdown("predicate binding test complete");
     store.close();
 
-    writeFileSync(path.join(sample.root, "src", "app.ts"), "export const mission = 'changed app';\n");
     const resumed = await openFixtureStore(sample);
+    const unchanged = await reconcileMission({
+      store: resumed, missionId: mission.id, sourceRoot: sample.root,
+      candidateParent: path.join(sample.base, "recovered-candidates"), planFile: sample.planFile, trigger: "predicate-input-unchanged",
+      assessmentToolIdentity: missionAssessmentToolIdentity(assessPredicate), runtimeIdentity: missionRuntimeIdentity(),
+    });
+    expect(unchanged.evidence.invalidated).toEqual([]);
+    expect([...unchanged.evidence.retained].sort()).toEqual(evidence.map((event) => String(event.payload.id)).sort());
+    writeFileSync(path.join(sample.root, "src", "app.ts"), "export const mission = 'changed app';\n");
     const report = await reconcileMission({
       store: resumed, missionId: mission.id, sourceRoot: sample.root,
       candidateParent: path.join(sample.base, "recovered-candidates"), planFile: sample.planFile, trigger: "predicate-input-drift",
@@ -762,7 +810,7 @@ describe("durable mission reconciliation", () => {
     expect(diagnosisEvents.filter(({ payload }) => payload.status === "completed")).toHaveLength(2);
     if (!report.delivery.patchHash || !report.delivery.acceptedManifestHash) throw new Error("recovery report omitted its conditional patch identity");
     const patch = JSON.parse(store.readArtifact(report.delivery.patchHash).toString("utf8"));
-    const deliveryCopy = createMissionWorkspace({
+    const deliveryCopy = await createMissionWorkspace({
       missionId: interrupted.missionId, attemptId: randomUUID(), sourceRoot: sample.root, storeRoot: store.storageRoot,
       candidateParent: path.join(sample.base, "delivery-copies"), allowedPaths: ["src/**"],
     });
@@ -1313,6 +1361,64 @@ describe("durable mission reconciliation", () => {
       } finally { await engine.close(); store.close(); }
     }, 30_000);
 
+  test.each(["current-ticks", "source-change", "control-during-await"] as const)(
+    "source admission frontier %s uses fresh physical evidence for actual provider dispatch", async (scenario) => {
+      const sample = fixture();
+      const interrupted = await createInterruptedAttempt(sample);
+      const store = await openFixtureStore(sample);
+      const input = { missionId: interrupted.missionId, fingerprint: "d".repeat(64), diagnosisId: randomUUID(),
+        attemptId: interrupted.attemptId, unitId: "snapshot", conflicts: [],
+        sourceManifestHash: captureWorkspaceImage(sample.root).manifest.hash, planStatus: "unchanged" as const };
+      let ticks = 0, dispatched = false, denied = "";
+      let controlTimer: ReturnType<typeof setTimeout> | undefined;
+      const engine = new MissionEngine({ store, missionId: interrupted.missionId,
+        sessionsDirectory: path.join(sample.base, "sessions"), managedWorkspace: { sourceRoot: sample.root },
+        runRole: async (_role, durable) => {
+          if (scenario === "source-change") writeFileSync(path.join(sample.root, "src", "user.ts"), "changed after role admission\n");
+          if (scenario === "control-during-await") controlTimer = setTimeout(() => {
+            const current = store.inspectMission(interrupted.missionId);
+            store.appendTransition(interrupted.missionId, current.version, { events: [{
+              revision: current.revision, kind: "mission.import.conflict", causalId: randomUUID(),
+              payload: { importKey: "changed-during-source-observation", archiveHashes: [] },
+            }] });
+          }, 0);
+          try {
+            const requestId = randomUUID();
+            const ticket = await durable.onProviderDispatch({ requestId, provider: "fixture", model: "local" });
+            dispatched = true;
+            await durable.onProviderReceipt({ requestId, provider: "fixture", model: "local", inputTokens: 2, outputTokens: 1, ticket });
+          } catch (error) { denied = String(error); }
+          return { instanceId: randomUUID(), role: "developer", status: "completed", model: { selectedModel: "fixture/local" },
+            result: JSON.stringify({ disposition: "compatible", reason: "Current classified source", resolutions: [] }) };
+        },
+      });
+      startRecoveryConsultation(store, input, "developer");
+      const ticker = setInterval(() => {
+        const current = store.inspectMission(interrupted.missionId);
+        store.appendTransition(interrupted.missionId, current.version, { events: [{
+          revision: current.revision, kind: "mission.active.duration", causalId: randomUUID(), payload: { durationMs: 0 },
+        }] });
+        ticks++;
+      }, 20);
+      try {
+        const answer = await (engine as unknown as {
+          consultRecoveryOverlap(role: string, request: RecoveryOverlapRequest & { diagnosisId: string }): Promise<RecoveryOverlapAnswer>;
+        }).consultRecoveryOverlap("developer", input);
+        console.log(JSON.stringify({ sourceAdmission: scenario, ticks, dispatched, denied, answer }));
+        expect(ticks).toBeGreaterThan(0);
+        expect(dispatched).toBe(scenario === "current-ticks");
+        expect(answer.disposition).toBe(scenario === "current-ticks" ? "compatible" : "unresolved");
+        if (scenario === "source-change") expect(denied).toContain("physical source or inputs changed");
+        if (scenario === "control-during-await") expect(denied).toContain("control or result changed during observation");
+        expect(store.inspectMission(interrupted.missionId).events.filter(event => event.kind === "provider.request.dispatched"))
+          .toHaveLength(scenario === "current-ticks" ? 1 : 0);
+      } finally {
+        clearInterval(ticker);
+        if (controlTimer) clearTimeout(controlTimer);
+        await engine.close(); store.close();
+      }
+    }, 30_000);
+
   test("real overlap reconciliation admits bounded Developer and expert provider requests", async () => {
     const sample = fixture();
     const definition = JSON.parse(sample.definitionBytes.toString("utf8"));
@@ -1561,7 +1667,7 @@ describe("durable mission reconciliation", () => {
     const sample = fixture();
     const store = await openFixtureStore(sample);
     const mission = store.createMission(missionInput(sample));
-    const workspace = createMissionWorkspace({
+    const workspace = await createMissionWorkspace({
       missionId: mission.id, attemptId: randomUUID(), sourceRoot: sample.root, storeRoot: store.storageRoot,
       candidateParent: path.join(sample.base, "candidates"), allowedPaths: ["."],
     });

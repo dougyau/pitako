@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync, writeSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync, writeSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { tmpdir } from "node:os";
@@ -6,7 +6,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { createAgentSession, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { createMissionToolAdapters, MissionEffects, type MissionEffectReceipt } from "../extensions/mission/effects.ts";
 import { MissionEngine, type MissionRoleRunner } from "../extensions/mission/engine.ts";
-import { createMissionWorkspace, currentProcessIdentity, ownerProcessState, preflightContainment, processesInNamespace, readOwnedNamespaceInit } from "../extensions/mission/workspace.ts";
+import { createMissionWorkspace, currentProcessIdentity, ownerProcessState, preflightContainment, processesInNamespace, readOwnedNamespaceInit, restoreWorkspaceImageAsync } from "../extensions/mission/workspace.ts";
 import { loadPitako } from "../scripts/load-pitako.ts";
 import { packageRoot } from "../extensions/stack.ts";
 import { fixtureCommandTime, createMissionFixture, missionDefinition, missionInput, openFixtureStore, type MissionFixture } from "./mission-fixtures.ts";
@@ -14,6 +14,7 @@ import { missionCompletionBlockers } from "../extensions/mission/completion.ts";
 import { missionHasUnresolvedEffects, reconcileMission } from "../extensions/mission/reconcile.ts";
 import { openMissionStore } from "../extensions/mission/store.ts";
 import type { AgentRunResult } from "../extensions/agent/run.ts";
+import { PhysicalObservation } from "../extensions/mission/physical-observation.ts";
 
 const fixtures: MissionFixture[] = [];
 const temporaryDirs: string[] = [];
@@ -97,7 +98,7 @@ async function managedFixture(dependencies?: "source" | "candidate", operations 
   writeFileSync(fixture.definitionFile, fixture.definitionBytes);
   const store = await openFixtureStore(fixture);
   const mission = store.createMission(missionInput(fixture));
-  const workspace = createMissionWorkspace({
+  const workspace = await createMissionWorkspace({
     missionId: mission.id,
     attemptId: "32345678-1234-4234-8234-123456789abc",
     sourceRoot: fixture.root,
@@ -110,6 +111,177 @@ async function managedFixture(dependencies?: "source" | "candidate", operations 
 }
 
 describe("managed mission retirement", () => {
+  test("awaited host restoration preserves image modes/index and fences partial revoked work", async () => {
+    const { store, workspace } = await managedFixture();
+    const index = readFileSync(path.join(workspace.candidateGitDir, "index"));
+    let markers = 0;
+    const timer = setInterval(() => markers++, 1);
+    try {
+      await restoreWorkspaceImageAsync(workspace, [
+        { path: "src/target.txt", kind: "missing", mode: null, bytes: null },
+        { path: "src/nested", kind: "directory", mode: 0o700, bytes: null },
+        { path: "src/nested/executable", kind: "file", mode: 0o755, bytes: Buffer.from("restored") },
+        { path: "src/link", kind: "symlink", mode: 0o777, bytes: Buffer.from("nested/executable") },
+      ], () => {});
+      expect(markers).toBeGreaterThan(0);
+      expect(existsSync(path.join(workspace.candidateRoot, "src/target.txt"))).toBe(false);
+      expect(readFileSync(path.join(workspace.candidateRoot, "src/nested/executable"), "utf8")).toBe("restored");
+      expect(lstatSync(path.join(workspace.candidateRoot, "src/nested/executable")).mode & 0o777).toBe(0o755);
+      expect(readlinkSync(path.join(workspace.candidateRoot, "src/link"))).toBe("nested/executable");
+      expect(readFileSync(path.join(workspace.candidateGitDir, "index")).equals(index)).toBe(true);
+      await expect(restoreWorkspaceImageAsync(workspace, [
+        { path: "src/link/escape", kind: "file", mode: 0o600, bytes: Buffer.from("no") },
+      ], () => {})).rejects.toThrow();
+      workspace.setupIndependent = true;
+      await expect(restoreWorkspaceImageAsync(workspace, [
+        { path: "node_modules/output", kind: "file", mode: 0o600, bytes: Buffer.from("no") },
+      ], () => {})).rejects.toThrow("unresolved setup output");
+      let checks = 0;
+      await expect(restoreWorkspaceImageAsync(workspace, [
+        { path: "src/a", kind: "file", mode: 0o600, bytes: Buffer.from("first") },
+        { path: "src/z", kind: "file", mode: 0o600, bytes: Buffer.from("must not publish") },
+      ], () => { if (++checks > 8) throw new Error("fixture authority revoked"); }))
+        .rejects.toThrow("fixture authority revoked");
+      expect(existsSync(path.join(workspace.candidateRoot, "src/z"))).toBe(false);
+    } finally { clearInterval(timer); store.close(); }
+  });
+
+  test.each(["explicit-consumed", "missing", "mismatched", "revoked"] as const)(
+    "production finite release rejects %s without GO or replacement authority", async scenario => {
+    const { fixture, store, mission, workspace } = await managedFixture(undefined, ["bash"]);
+    let clock = 0;
+    let receipt: MissionEffectReceipt | undefined;
+    let candidateRoot = "";
+    let reservationsAtRegistration = 0;
+    const engine = new MissionEngine({ store, missionId: mission.id, now: () => clock,
+      sessionsDirectory: path.join(fixture.base, "sessions"),
+      managedWorkspace: { sourceRoot: fixture.root, candidateParent: path.join(fixture.base, "production-candidates") },
+      runRole: async (_input, durable) => {
+        candidateRoot = durable.cwd!;
+        receipt = await durable.effects!.invoke("bash", { command: "printf forbidden > src/release.txt",
+          ...(scenario === "explicit-consumed" ? { timeoutMs: 1000 } : {}) });
+        engine["activeWindow"] = undefined;
+        return cancelledResult();
+      } });
+    const append = store.appendTransition.bind(store);
+    store.appendTransition = (id, version, transition) => {
+      const result = append(id, version, transition);
+      if (transition.events.some(row => row.kind === "effect.process.registered")) {
+        reservationsAtRegistration = store.inspectMission(mission.id).events
+          .filter(row => row.kind === "reservation.created" && row.payload.resource === "active-time-ms").length;
+        const grant = engine["activeWindow"]!;
+        if (scenario === "explicit-consumed") clock = grant.grantAmount - 100;
+        if (scenario === "missing") {
+          const current = store.inspectMission(mission.id);
+          append(mission.id, current.version, { events: [{
+            revision: 1, kind: "budget.reservation.settled", causalId: randomUUID(), payload: {
+              reservationId: grant.reservationId, resource: "active-time-ms", knownCharge: 0,
+              unknownCharge: 0, released: grant.grantAmount, source: "fixture removes current reservation",
+            },
+          }] });
+          expect(store.inspectMission(mission.id).reservations.some(row => row.id === grant.reservationId)).toBe(false);
+        } else if (scenario !== "explicit-consumed") {
+          const current = store.inspectMission(mission.id);
+          append(mission.id, current.version, { events: [{
+            revision: 1, kind: "budget.reservation.settled", causalId: randomUUID(), payload: {
+              reservationId: grant.reservationId, resource: "active-time-ms",
+              knownCharge: scenario === "mismatched" ? 1 : 0, unknownCharge: 0,
+              released: scenario === "revoked" ? grant.grantAmount - 1 : 0, source: "fixture authority withdrawal",
+            },
+          }] });
+        }
+      }
+      return result;
+    };
+    try {
+      engine.start(); await engine.waitForIdle();
+      expect(receipt?.status, JSON.stringify(receipt)).toBe("failed");
+      expect(receipt?.reason).toContain(scenario === "explicit-consumed" ? "available ordinary active-time capacity" : "reservation revoked");
+      const current = store.inspectMission(mission.id);
+      expect(current.events.some(row => row.kind === "effect.process.registered")).toBe(true);
+      expect(current.events.some(row => row.kind === "effect.released")).toBe(false);
+      expect(reservationsAtRegistration).toBeGreaterThan(0);
+      const registered = current.events.find(row => row.kind === "effect.process.registered")!;
+      expect(current.events.filter(row => row.seq > registered.seq &&
+        row.kind === "reservation.created" && row.payload.resource === "active-time-ms")).toHaveLength(0);
+      expect(existsSync(path.join(candidateRoot, "src/release.txt"))).toBe(false);
+      expect(missionHasUnresolvedEffects(store, current.events)).toBe(true);
+    } finally {
+      // This intentionally damaged reservation fixture cannot settle its accounting normally.
+      engine["activeWindow"] = undefined;
+      await engine.retireForShutdown("quit");
+      store.close();
+    }
+  }, 30000);
+
+  test.each(["control", "result", "ticks"] as const)(
+    "production finalization and completion consumers fence %s during physical observation", async scenario => {
+    const { fixture, store, mission } = await managedFixture(undefined, ["bash"]);
+    const engine = new MissionEngine({ store, missionId: mission.id,
+      sessionsDirectory: path.join(fixture.base, "sessions"),
+      managedWorkspace: { sourceRoot: fixture.root, candidateParent: path.join(fixture.base, "candidates") },
+      runRole: async () => cancelledResult() });
+    const request = PhysicalObservation.prototype.request;
+    let observations = 0;
+    PhysicalObservation.prototype.request = async function<T>(operation: string, input: unknown,
+      signal?: AbortSignal, deadline?: number): Promise<T> {
+      const proof = await (request<T>).call(this, operation, input, signal, deadline);
+      if (operation === "finalization" || operation === "completion") {
+        observations++;
+        const current = store.inspectMission(mission.id);
+        store.appendTransition(mission.id, current.version, { events: [{
+          revision: 1, kind: scenario === "control" ? "mission.import.conflict" :
+            scenario === "result" ? "mission.finalization.generation" : "measurement.recorded",
+          causalId: randomUUID(), payload: scenario === "ticks" ? {
+            schemaVersion: 1, id: randomUUID(), missionId: mission.id, revision: 1, causalId: randomUUID(),
+            metric: "active-time", value: 1, unit: "ms", source: "fixture tick",
+            occurredAt: new Date().toISOString(), runtimeId: store.runtimeId, durationMs: 1,
+            inputTokens: 0, outputTokens: 0,
+          } : { generation: observations, reason: "concurrent relevant change" },
+        }] });
+      }
+      return proof;
+    };
+    try {
+      const finalization = engine["observeFinalization"](store.inspectMission(mission.id));
+      if (scenario === "ticks") await finalization;
+      else await expect(finalization).rejects.toThrow("finalization physical observation became stale");
+      const completion = store.completeMission(mission.id, store.inspectMission(mission.id).version);
+      await expect(completion).rejects.toThrow(scenario === "ticks" ?
+        "mission completion blocked:" : "mission completion observation became stale");
+      expect(observations).toBe(2);
+      expect(store.inspectMission(mission.id).events.some(row => row.kind === "mission.completed")).toBe(false);
+    } finally {
+      PhysicalObservation.prototype.request = request;
+      await engine.retireForShutdown("quit");
+      store.close();
+    }
+  }, 30000);
+
+  test("launch-release clock gives a short command its full interval after preparation", async () => {
+    const { store, mission, workspace } = await managedFixture(undefined, ["bash"]);
+    let released = false;
+    const effects = new MissionEffects({
+      store, workspace, missionId: mission.id, revision: 1, unitId: "snapshot",
+      attemptId: workspace.attemptId, runtimeId: store.runtimeId, ownerEpoch: store.ownerEpoch!,
+      allowedOperations: ["bash"],
+      observeFrontier: async () => { await new Promise(resolve => setTimeout(resolve, 700)); },
+      commandTime: { contract: "launch-release-v2", admit: async requested => requested!,
+        begin: async requested => { released = true; return { timeoutMs: requested!, reservationId: "fixture", executionAt: performance.now() }; }, remaining: () => 5000 },
+    });
+    try {
+      const receipt = await effects.invoke("bash", { command: "sleep 0.12; printf released", timeoutMs: 500 });
+      expect(released).toBe(true);
+      expect(receipt).toMatchObject({ status: "completed", stdout: "released" });
+      const rows = store.inspectMission(mission.id).events;
+      expect(rows.find(row => row.kind === "effect.intent")!.payload.commandLifetime).toMatchObject({
+        version: 2, timeoutBinding: "release-selection-v1", request: { kind: "explicit", timeoutMs: 500 },
+        preparationTimeoutMs: 60000, bootstrapTimeoutMs: 10000,
+      });
+      expect(rows.find(row => row.kind === "effect.released")!.payload.commandLifetimeVersion).toBe(2);
+    } finally { await effects.shutdown(); store.close(); }
+  });
+
   test("mount preparation failure records a resolved denial and permits the next effect", async () => {
     if (process.platform !== "linux" || !existsSync("/usr/bin/bwrap")) return;
     const { store, mission, workspace } = await managedFixture();
@@ -146,6 +318,31 @@ describe("managed mission retirement", () => {
       await effects.shutdown();
       store.close();
     }
+  }, 30_000);
+
+  test("default launch release rejects revoked capacity without GO and retains registered-effect uncertainty", async () => {
+    const { store, mission, workspace } = await managedFixture(undefined, ["bash"]);
+    const effects = new MissionEffects({
+      store, workspace, missionId: mission.id, revision: 1, unitId: "snapshot",
+      attemptId: workspace.attemptId, runtimeId: store.runtimeId, ownerEpoch: store.ownerEpoch!,
+      allowedOperations: ["bash"], commandTime: {
+        contract: "launch-release-v2", admit: async requested => requested,
+        begin: async () => {
+          throw new Error("effect time reservation revoked before launch release");
+        },
+        remaining: () => 10000,
+      },
+    });
+    try {
+      const rejected = await effects.invoke("bash", { command: "printf forbidden > src/revoked.txt" });
+      expect(rejected.status).toBe("failed");
+      expect(rejected.reason).toContain("reservation revoked");
+      expect(existsSync(path.join(workspace.candidateRoot, "src/revoked.txt"))).toBe(false);
+      const inspection = store.inspectMission(mission.id);
+      expect(inspection.events.some(row => row.effectId === rejected.effectId && row.kind === "effect.released")).toBe(false);
+      // Registration occurred, so this is not the closed process-null no-effect grammar.
+      expect(missionHasUnresolvedEffects(store, inspection.events)).toBe(true);
+    } finally { await effects.shutdown(); store.close(); }
   }, 30_000);
 
   test("official patch moves, fuzzy matching and failures retain private after-images and confinement", async () => {
@@ -566,11 +763,14 @@ describe("managed mission retirement", () => {
     test(`pre-child launch denies ${exhausted} authority with a durable null-process receipt`, async () => {
       const { store, mission, workspace } = await managedFixture(undefined, ["bash"]);
       const bwrapPath = workspace.bwrapPath;
+      // Reach launcher preparation after the real off-thread physical reads, then
+      // expire the legacy invocation there rather than racing those reads.
+      const invocationTimeMs = 2000;
       let prepared = false;
       Object.defineProperty(workspace, "bwrapPath", { get() {
         prepared = true;
         if (exhausted === "invocation") {
-          const until = performance.now() + 80;
+          const until = performance.now() + invocationTimeMs + 50;
           while (performance.now() < until) { /* synchronous launcher preparation */ }
         }
         return bwrapPath;
@@ -582,7 +782,7 @@ describe("managed mission retirement", () => {
           remaining: () => exhausted === "invocation" ? 20000 : exhausted === "enclosing-zero" ? 0 : 1,
         } });
       try {
-        const receipt = await effects.invoke("bash", { command: "printf must-not-run > src/not-launched", timeoutMs: exhausted === "invocation" ? 50 : 10000 });
+        const receipt = await effects.invoke("bash", { command: "printf must-not-run > src/not-launched", timeoutMs: exhausted === "invocation" ? invocationTimeMs : 10000 });
         expect(prepared).toBe(true);
         expect(receipt).toMatchObject({ status: "denied", paths: [], reason: "command timeout exceeds current remaining effect time grant" });
         const events = store.inspectMission(mission.id).events.filter(row => row.effectId === receipt.effectId);

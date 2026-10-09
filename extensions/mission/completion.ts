@@ -33,6 +33,16 @@ export interface MissionCompletionCertificate {
   sourceIdentity?: ReturnType<typeof missionInputIdentity>;
 }
 
+/** Accounting changes current capacity, not the independently observed physical result. */
+export function physicalResultBinding(inspection: MissionInspection): string {
+  return sha256(Buffer.from(JSON.stringify([inspection.revision, inspection.snapshot,
+    inspection.events.filter(event => !["resource.metered.admitted", "resource.metered.settled",
+      "measurement.recorded", "budget.reservation.settled",
+      "budget.reservation.adjusted", "mission.active.duration", "mission.active.window.checkpointed",
+      "mission.active.window.closed", "mission.active.window.opened", "reservation.created"].includes(event.kind))
+      .map(event => event.eventId)])));
+}
+
 /** Read-only artifact access is required: event payloads alone cannot prove stored results or effects. */
 export function assessMissionCompletion(inspection: MissionInspection, store: MissionStore): {
   blockers: string[]; certificate?: MissionCompletionCertificate;
@@ -42,7 +52,7 @@ export function assessMissionCompletion(inspection: MissionInspection, store: Mi
   const blockers: string[] = [];
   if (!new MissionSetup(store, inspection.id).quiescentFor(inspection)) blockers.push("setup:unresolved-mutation");
   if (inspection.prepared?.setup) {
-    const setup = new MissionSetup(store, inspection.id).observe(inspection);
+    const setup = new MissionSetup(store, inspection.id).observePhysical(inspection);
     if (setup.state === "blocked") blockers.push(`setup:${setup.reason}`);
   }
   if (state.revision !== inspection.revision || ["paused", "cancelled", "blocked"].includes(state.state)) blockers.push("mission:not-finalizable");

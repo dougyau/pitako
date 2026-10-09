@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { execFile, execFileSync, spawn, spawnSync } from "node:child_process";
+import { chmod, mkdir, open, rm, symlink } from "node:fs/promises";
 import {
   accessSync, chmodSync, closeSync, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, mkdtempSync,
   openSync, readFileSync, readlinkSync, realpathSync, readdirSync, rmdirSync, rmSync, symlinkSync, writeFileSync,
@@ -126,7 +127,7 @@ export function hasContainmentProof(workspace: MissionWorkspace): workspace is M
   return Boolean(workspace.containmentProof && validProofs.has(workspace.containmentProof) && !workspace.quarantined);
 }
 
-export function createMissionWorkspace(input: {
+export async function createMissionWorkspace(input: {
   missionId: string;
   attemptId: string;
   sourceRoot: string;
@@ -138,7 +139,8 @@ export function createMissionWorkspace(input: {
   bwrapPath?: string;
   setupIndependent?: boolean;
   dependencyBacking?: { root: string; identity: string; recheck?: () => void };
-}): MissionWorkspace {
+  recheck?: () => void;
+}): Promise<MissionWorkspace> {
   if (process.platform !== "linux") throw new Error(`managed workspace containment is unsupported on ${process.platform}; no writer launched`);
   if (!UUID.test(input.missionId) || !UUID.test(input.attemptId)) throw new Error("mission and attempt ids must be UUIDs");
   const sourceRoot = verifiedGitRoot(input.sourceRoot);
@@ -156,20 +158,47 @@ export function createMissionWorkspace(input: {
     // The tool adapter is read-only-mounted separately; this alias is intentional.
   }
 
-  const manifest = createWorkspaceManifest(sourceRoot);
+  const { PhysicalObservation, PREPARATION_TIME_MS } = await import("./physical-observation.ts");
+  const deadline = performance.now() + PREPARATION_TIME_MS;
+  const observer = new PhysicalObservation(deadline);
+  const recheck = () => {
+    input.recheck?.();
+    if (performance.now() >= deadline) throw new Error("candidate preparation expired");
+  };
+  let image: WorkspaceImage;
+  try { image = await observer.image(sourceRoot, undefined, deadline); }
+  catch (error) { await observer.dispose(); throw error; }
+  const manifest = image.manifest;
   const candidateRoot = mkdtempSync(path.join(candidateParent, `${input.missionId}-${input.attemptId}-`));
   chmodSync(candidateRoot, 0o700);
   try {
-    git(sourceRoot, ["-c", "core.hooksPath=/dev/null", "clone", "--no-hardlinks", "--no-local", "--no-checkout", "--", sourceRoot, candidateRoot]);
-    git(candidateRoot, ["-c", "core.hooksPath=/dev/null", "checkout", "--force", ...(manifest.branch ? ["-B", manifest.branch] : ["--detach"]), manifest.head]);
-    try { git(candidateRoot, ["remote", "remove", "origin"]); } catch { /* clone may not create a remote */ }
+    recheck();
+    await gitAsync(sourceRoot, ["-c", "core.hooksPath=/dev/null", "clone", "--no-hardlinks", "--no-local", "--no-checkout", "--", sourceRoot, candidateRoot], deadline);
+    recheck();
+    await gitAsync(candidateRoot, ["-c", "core.hooksPath=/dev/null", "checkout", "--force", ...(manifest.branch ? ["-B", manifest.branch] : ["--detach"]), manifest.head], deadline);
+    recheck();
+    try { await gitAsync(candidateRoot, ["remote", "remove", "origin"], deadline); } catch { /* clone may not create a remote */ }
     if (gitlinks(manifest.indexEntries).length) throw new Error("managed candidates with Git submodules are not supported");
-    copyIndexObjects(sourceRoot, candidateRoot, manifest.indexEntries);
-    for (const entry of [...manifest.tracked, ...manifest.untracked]) copyInputPath(sourceRoot, candidateRoot, entry.path);
-    const candidateInputs = [...manifest.tracked, ...manifest.untracked].map(({ path: name }) => fileManifest(candidateRoot, name));
-    if (JSON.stringify(candidateInputs) !== JSON.stringify([...manifest.tracked, ...manifest.untracked])) {
-      throw new Error("candidate input files differ from the source manifest; candidate quarantined");
+    await copyIndexObjects(sourceRoot, candidateRoot, manifest.indexEntries, deadline, recheck);
+    for (const file of image.files) {
+      recheck();
+      assertSafePath(candidateRoot, file.path);
+      ensureParentDirectories(candidateRoot, path.dirname(file.path));
+      const to = path.join(candidateRoot, file.path);
+      await rm(to, { recursive: true, force: true });
+      recheck();
+      if (file.kind === "missing") continue;
+      if (file.kind === "directory") throw new Error(`directory input is unsupported: ${file.path}`);
+      if (file.kind === "symlink") await symlink(Buffer.from(file.bytes!).toString(), to);
+      else {
+        const fd = await open(to, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW, file.mode!);
+        try { recheck(); await fd.writeFile(file.bytes!); recheck(); await chmod(to, file.mode!); await fd.sync(); }
+        finally { await fd.close(); }
+      }
     }
+    await observer.request("candidatePrepared", { sourceRoot, candidateRoot, manifest });
+    await observer.dispose();
+    recheck();
     const candidateGitDir = realpathSync(path.join(candidateRoot, ".git"));
     if (candidateGitDir !== path.join(candidateRoot, ".git") || !lstatSync(candidateGitDir).isDirectory()) {
       throw new Error("candidate Git directory is not private to the candidate");
@@ -180,8 +209,6 @@ export function createMissionWorkspace(input: {
     const candidateTop = git(candidateRoot, ["rev-parse", "--show-toplevel"]);
     const candidateCommon = git(candidateRoot, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
     if (candidateTop !== candidateRoot || candidateCommon !== candidateGitDir) throw new Error("candidate Git discovery escaped its private root");
-    assertNoSharedInodes(sourceRoot, sourceGitDir, candidateRoot, [...manifest.tracked, ...manifest.untracked]);
-    if (createWorkspaceManifest(sourceRoot).hash !== manifest.hash) throw new Error("source changed while candidate was being constructed; candidate quarantined");
     const workspace: MissionWorkspace = {
       missionId: input.missionId,
       attemptId: input.attemptId,
@@ -224,7 +251,18 @@ export function createMissionWorkspace(input: {
     // Keep failed candidates for reconciliation. Never reuse this writable path.
     try { writeFileSync(path.join(candidateRoot, ".pitako-quarantined"), String(error), { mode: 0o600 }); } catch { /* candidate may already be inaccessible */ }
     throw error;
-  }
+  } finally { await observer.dispose(); }
+}
+
+/** Read-only independent verification after the host constructs a private clone. */
+export function assertPreparedCandidate(input: { sourceRoot: string; candidateRoot: string; manifest: WorkspaceManifest }): void {
+  const { sourceRoot, candidateRoot, manifest } = input;
+  verifyPrivateCandidate(candidateRoot, sourceRoot);
+  const candidateInputs = [...manifest.tracked, ...manifest.untracked].map(({ path: name }) => fileManifest(candidateRoot, name));
+  if (JSON.stringify(candidateInputs) !== JSON.stringify([...manifest.tracked, ...manifest.untracked]))
+    throw new Error("candidate input files differ from the source manifest; candidate quarantined");
+  if (createWorkspaceManifest(sourceRoot).hash !== manifest.hash)
+    throw new Error("source changed while candidate was being constructed; candidate quarantined");
 }
 
 export async function preflightContainment(workspace: MissionWorkspace): Promise<ContainmentProof> {
@@ -676,6 +714,69 @@ export function restoreWorkspaceImage(workspace: MissionWorkspace, files: readon
   }
 }
 
+export async function restoreWorkspaceImageAsync(workspace: MissionWorkspace, files: readonly WorkspaceImageFile[],
+  recheck: () => void): Promise<void> {
+  const check = () => { recheck(); assertWorkspaceIdentity(workspace); };
+  check();
+  if (workspace.setupIndependent && files.some(({ path: name, kind }) =>
+    kind !== "missing" && (name === "node_modules" || name.startsWith("node_modules/"))))
+    throw new Error("independent recovery image contains unresolved setup output");
+  const root = workspace.candidateRoot;
+  const seen = new Set<string>();
+  for (const entry of [...files].sort((a, b) => a.path.localeCompare(b.path))) {
+    check();
+    safeGitPath(entry.path);
+    assertSafePath(root, entry.path);
+    if (seen.has(entry.path)) throw new Error(`workspace image contains duplicate path ${entry.path}`);
+    seen.add(entry.path);
+    if (entry.kind !== "missing" && entry.kind !== "directory" && !entry.bytes)
+      throw new Error(`workspace image has no bytes for ${entry.path}`);
+    // Validate every parent before removal, including tombstones. Never traverse an image symlink.
+    // Pin each directory through NOFOLLOW handles so an awaited write cannot traverse a swapped parent.
+    const rootHandle = await open(root, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+    const parents = [rootHandle];
+    try {
+      check();
+      const rootStat = await rootHandle.stat();
+      check();
+      if (`${rootStat.dev}:${rootStat.ino}` !== workspace.candidateIdentity)
+        throw new Error("candidate identity changed during restoration");
+      let cursor = `/proc/self/fd/${rootHandle.fd}`;
+      for (const segment of path.dirname(entry.path).split(path.sep).filter(part => part && part !== ".")) {
+        check();
+        const directory = path.join(cursor, segment);
+        const stat = lstatMaybe(directory);
+        if (!stat) { await mkdir(directory, { mode: 0o700 }); check(); }
+        else if (!stat.isDirectory() || stat.isSymbolicLink())
+          throw new Error(`candidate parent is not a real directory: ${directory}`);
+        const parent = await open(directory, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+        parents.push(parent);
+        check();
+        cursor = `/proc/self/fd/${parent.fd}`;
+      }
+      const destination = path.join(cursor, path.basename(entry.path));
+      check();
+      await rm(destination, { recursive: true, force: true });
+      check();
+      if (entry.kind === "directory") await mkdir(destination, { mode: entry.mode ?? 0o700 });
+      else if (entry.kind === "symlink") await symlink(entry.bytes!.toString("utf8"), destination);
+      else if (entry.kind === "file") {
+        const fd = await open(destination,
+          fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW, entry.mode ?? 0o600);
+        try {
+          check(); await fd.writeFile(entry.bytes!);
+          check(); await fd.chmod(entry.mode ?? 0o600);
+          check(); await fd.sync();
+        } finally { await fd.close(); }
+      }
+    } finally { for (const parent of parents.reverse()) await parent.close(); }
+    check();
+  }
+  check();
+  if (files.some(({ path: name, kind }) => kind !== "missing" && (name === "node_modules" || name.startsWith("node_modules/"))))
+    dependencyBackings.delete(workspace);
+}
+
 export function applyWorkspaceImageToRoot(root: string, files: readonly WorkspaceImageFile[]): void {
   const candidateRoot = realpathSync(root);
   const seen = new Set<string>();
@@ -1054,19 +1155,31 @@ function gitlinks(entries: WorkspaceManifest["indexEntries"]): string[] {
   return entries.filter(({ mode }) => mode === "160000").map(({ path: name }) => name);
 }
 
-function copyIndexObjects(source: string, candidate: string, entries: WorkspaceManifest["indexEntries"]): void {
+async function copyIndexObjects(source: string, candidate: string, entries: WorkspaceManifest["indexEntries"], deadline: number, recheck: () => void): Promise<void> {
   const objectIds = new Set(entries.map(({ objectId }) => objectId).filter((oid) => !/^0+$/.test(oid)));
   for (const objectId of objectIds) {
-    const bytes = gitBytes(source, ["cat-file", "blob", objectId]);
-    const copied = decodeUtf8(gitBytes(candidate, ["hash-object", "-w", "--stdin"], bytes)).trim();
+    recheck();
+    const bytes = await gitAsync(source, ["cat-file", "blob", objectId], deadline);
+    recheck();
+    const copied = decodeUtf8(await gitAsync(candidate, ["hash-object", "-w", "--stdin"], deadline, bytes)).trim();
     if (copied !== objectId) throw new Error(`candidate staged blob differs from source index object ${objectId}`);
   }
   const indexInfo = Buffer.concat(entries.map(({ mode, objectId, stage, path: name }) =>
     Buffer.from(`${mode} ${objectId} ${stage}\t${name}\0`)));
-  gitBytes(candidate, ["read-tree", "--empty"]);
-  gitBytes(candidate, ["update-index", "-z", "--index-info"], indexInfo);
+  recheck();
+  await gitAsync(candidate, ["read-tree", "--empty"], deadline);
+  recheck();
+  await gitAsync(candidate, ["update-index", "-z", "--index-info"], deadline, indexInfo);
 }
 
+function gitAsync(cwd: string, args: string[], deadline: number, input?: Uint8Array): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const child = execFile("git", args, { cwd, encoding: "buffer", env: cleanGitEnvironment(),
+      timeout: Math.max(1, Math.ceil(deadline - performance.now())), maxBuffer: 32 * 1024 * 1024 },
+    (error, stdout) => error ? reject(error) : resolve(stdout));
+    child.stdin!.end(input);
+  });
+}
 function git(cwd: string, args: string[]): string {
   return decodeUtf8(gitBytes(cwd, args)).trimEnd();
 }

@@ -1,16 +1,18 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { registerMissionExtension } from "../extensions/mission/index.ts";
-import { openMissionStore } from "../extensions/mission/store.ts";
+import { MissionStore, openMissionStore } from "../extensions/mission/store.ts";
 import { authoringProposal, authoringSource } from "./mission-authoring-fixture.ts";
 import { createMissionFixture } from "./mission-fixtures.ts";
 import { installMissionLocalProvider } from "./mission-local-provider.ts";
 import { createAgentSession, DefaultResourceLoader, SessionManager } from "@earendil-works/pi-coding-agent";
 import { packageRoot } from "../extensions/stack.ts";
 import { confirmMissionAction, missionActionView } from "../extensions/mission/preparation-view.ts";
+import { previewFrozenStart, openPreparationRequest, preparedAdmissionText, consumePreparedAdmission } from "../extensions/mission/preparation.ts";
+import { recordOperatorInput } from "../extensions/mission/admission.ts";
 
 const oldDir = process.env.PI_CODING_AGENT_DIR, bases: string[] = [];
 afterEach(() => {
@@ -40,12 +42,116 @@ function host(f: ReturnType<typeof fixture>) {
   } as any);
   let session = "principal";
   const ctx = { mode: "tui", hasUI: true, cwd: f.root, sessionManager: { getSessionId: () => session },
-    ui: { notify: (text: string) => notices.push(text), confirm: (title: string, text: string) => confirm(title, text) } };
+    ui: { notify: (text: string) => notices.push(text), setStatus: (_key: string, _text: string | undefined) => {},
+      confirm: (title: string, text: string) => confirm(title, text) } };
   return { ctx, messages, notices, tools, command: (text: string) => command(text, ctx), session: (id: string) => { session = id; },
     confirm: (fn: typeof confirm) => { confirm = fn; },
     emit: async (name: string) => { for (const fn of handlers.get(name) ?? []) await fn({ reason: "reload" }, ctx); },
     submit: (params: unknown) => tools.get("mission_prepare").execute("author", params, undefined, undefined, ctx) };
 }
+
+function meteredProposal(context: Parameters<typeof authoringProposal>[0]) {
+  const proposal = authoringProposal(context);
+  const { budget: _budget, schemaVersion: _schema, resourcePolicy: _policy, ...definition } = proposal.definition;
+  return { ...proposal, definition: { ...definition, schemaVersion: 3 as const,
+    resourcePolicy: { limits: {}, estimates: { tokens: 1, activeTimeMs: 1 } } } };
+}
+
+test.each(["refuse", "source", "shutdown", "switch", "replace", "session", "cancel"] as const)(
+  "frozen start %s cannot resume stale consent or start setup/workers", async (scenario) => {
+    const f = fixture(), h = host(f);
+    try {
+      await h.command("start durable-fixture");
+      expect(h.messages[0]).toContain("schemaVersion 3");
+      expect(h.messages[0]).toContain("Retrieve the current preparation context");
+      const context = contextFromMessage(h.messages[0]!);
+      const params = { id: "durable-fixture", requestId: context.requestId, proposal: meteredProposal(context) };
+      await expect(h.tools.get("mission_start").execute("model", { id: params.id }, undefined, undefined, h.ctx))
+        .rejects.toThrow("model tool cannot mint start authority");
+      expect(existsSync(f.dbPath)).toBe(false);
+      let prompts = 0;
+      h.confirm(async (title, text) => {
+        prompts++;
+        expect(title).toBe("Start frozen mission");
+        expect(text).toContain("Refusal starts neither");
+        expect(text).toContain("Workers starting: t1 (developer)");
+        expect(text).toContain("omitted dimensions are metered");
+        expect(text).toContain("Estimates (not ceilings)");
+        if (scenario === "source") writeFileSync(f.planFile, authoringSource + "\nchanged");
+        if (scenario === "shutdown") await h.emit("session_shutdown");
+        if (scenario === "switch") await h.emit("session_before_switch");
+        if (scenario === "session") h.session("other");
+        if (scenario === "replace") {
+          await h.submit({ ...params, proposal: { ...params.proposal, mappings: [] } });
+        }
+        if (scenario === "cancel") await h.command("cancel durable-fixture");
+        return scenario !== "refuse";
+      });
+      if (scenario === "refuse") expect(JSON.parse((await h.submit(params)).content[0].text).state).toBe("dismissed");
+      else await expect(h.submit(params)).rejects.toThrow();
+      expect(prompts).toBe(1);
+      expect(existsSync(f.dbPath)).toBe(false);
+      if (scenario === "session") h.session("principal"); // Restoring an ID does not resurrect lost requester authority.
+      if (scenario !== "replace") await expect(h.submit({ id: params.id, requestId: params.requestId })).rejects.toThrow();
+    } finally { await h.emit("session_shutdown"); }
+  });
+
+test("combined frozen admission is one-use and binds the entire schema3 proposal", async () => {
+  const f = fixture(), h = host(f);
+  try {
+    await h.command("start durable-fixture");
+    const context = contextFromMessage(h.messages[0]!);
+    const request = openPreparationRequest("durable-fixture", f.root, "principal");
+    const proposal = meteredProposal(context);
+    const receiptId = crypto.randomUUID();
+    const result = previewFrozenStart({ request, proposal, receiptId });
+    if (result.state !== "ready") throw new Error(JSON.stringify(result));
+    const text = preparedAdmissionText(result.prepared);
+    const receipt = recordOperatorInput("native-confirmation", "principal", text, receiptId)!;
+    const db = await openMissionStore({ dbPath: f.dbPath, objectDir: f.objectDir });
+    try {
+      const input = { repositoryRoot: f.root, planId: "durable-fixture", prepared: result.prepared,
+        commandId: receiptId, admissionReceiptId: receiptId, operatorText: text, operatorReceipt: receipt };
+      const created = db.createMission(input);
+      expect(created.definition.resourcePolicy).toEqual(proposal.definition.resourcePolicy);
+      expect(db.inspectMission(created.id).prepared?.authorityDecision.receiptId).toBe(receiptId);
+      expect(JSON.parse(text).action).toBe("admit-and-start-frozen-mission-v1");
+      expect(db.createMission(input).id).toBe(created.id); // Exact command retry is idempotent, not a new admission.
+      expect(db.inspectMission(created.id).events).toHaveLength(1);
+      expect(() => consumePreparedAdmission(result.prepared, receipt)).toThrow();
+      expect(() => result.prepared.definition.authority.externalEffects.push("expanded")).toThrow();
+      const forged = structuredClone(result.prepared);
+      forged.definition.authority.externalEffects.push("expanded");
+      expect(() => preparedAdmissionText(forged)).toThrow("host-validated");
+    } finally { db.close(); }
+  } finally { await h.emit("session_shutdown"); }
+});
+
+test("native cached status observes preparation, owns only namespaced status, and does not hydrate on repaint", async () => {
+  const f = fixture(), h = host(f), statuses: Array<[string, string | undefined]> = [];
+  h.ctx.ui.setStatus = (key, text) => { statuses.push([key, text]); };
+  try {
+    await h.command("prepare durable-fixture");
+    await h.command("status");
+    expect(h.notices.at(-1)).toContain("observed 1 units");
+    expect(statuses.at(-1)![1]).toContain("pending request attribution unavailable");
+    const context = contextFromMessage(h.messages[0]!);
+    await h.submit({ id: "durable-fixture", requestId: context.requestId, proposal: authoringProposal(context) });
+    await h.emit("session_start"); // Matching admitted preparation is rediscovered, not reconsented or activated.
+    const inspection = spyOn(MissionStore.prototype, "inspectMission").mockImplementation(() => { throw new Error("status hydrated"); });
+    const artifacts = spyOn(MissionStore.prototype, "readArtifact").mockImplementation(() => { throw new Error("status hydrated"); });
+    try {
+      await h.command("status");
+      expect(h.notices.at(-1)).toContain("accepted 0/1");
+      const result = JSON.parse((await h.tools.get("mission_status").execute("status", {}, undefined, undefined, h.ctx)).content[0].text);
+      expect(result.authority).toBe("display-only");
+      expect(result.observation).toContain("caps:");
+    } finally { inspection.mockRestore(); artifacts.mockRestore(); }
+    await h.emit("session_before_switch");
+    expect(statuses.at(-1)).toEqual(["pitako.mission", undefined]);
+    expect(statuses.every(([key]) => key === "pitako.mission")).toBe(true);
+  } finally { await h.emit("session_shutdown"); }
+});
 
 test("mission confirmation shows concise actions; viewing details is not consent", async () => {
   const f = fixture(), h = host(f);
@@ -422,10 +528,10 @@ test.each(["valid", "infeasible", "malformed"] as const)("proposed %s setup dist
     if (mode === "valid") {
       expect(result.state).toBe("prepared");
       await h.command("status");
-      const observed = JSON.parse(h.notices.at(-1)!);
-      expect(observed.preparationStatus).toBe("technical-unresolved");
-      expect(observed.nextAction).toContain("no successful receipt");
-      expect(observed.nextAction).toContain("/mission start");
+      const observed = h.notices.at(-1)!;
+      expect(observed).toContain("prepared");
+      expect(observed).toContain("Setup has not executed");
+      expect(observed).toContain("/mission start");
     } else expect(existsSync(f.dbPath)).toBe(false);
   } finally { await h.emit("session_shutdown"); }
 }, 30000);
