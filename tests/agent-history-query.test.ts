@@ -299,3 +299,44 @@ test("missing stores/capture do not create directories; direct child and console
   expect((await api.query({ action: "list", scope: "all" })).items).toEqual([]);
   expect(existsSync(process.env.PI_CODING_AGENT_DIR)).toBe(false);
 });
+
+test("coordinator reads bind captured identity and file cut; missing/header/source diagnostics stay explicit", async () => {
+  const { root, history, group, member, file } = fixture();
+  const coordinatorFile = path.join(root, "coordinator.jsonl");
+  const native = '{"type":"session","id":"current","version":3}\n' +
+    '{"type":"custom","id":"inactive","parentId":null}\n{"type":"custom","id":"active","parentId":null}\n';
+  const api = adapters();
+  const query = { action: "read" as const, historyId: member.historyId, source: "coordinator" as const };
+  expect(codes(await api.query(query))).toContain("coordinator_locator_unavailable");
+  history.mutate(group.groupId, saved => { saved.members[0]!.coordinatorSessionFile = coordinatorFile; });
+  expect(codes(await api.query(query))).toContain("coordinator_native_missing");
+  writeFileSync(coordinatorFile, native);
+  writeFileSync(file, '{"type":"session","id":"native-id"}\n');
+  const first = await api.query({ ...query, limit: 1 });
+  expect(first.cursor).not.toBeNull();
+  expect(codes(await api.query({ action: "read", historyId: member.historyId, cursor: first.cursor! }))).toEqual(["invalid_cursor"]);
+  expect(JSON.parse(await api.command(`history read ${member.historyId} --source coordinator --limit 1`))).toEqual(first);
+  appendFileSync(coordinatorFile, '{"type":"custom","id":"later"}\n');
+  const rest = await api.query({ ...query, cursor: first.cursor! });
+  const decoded = Buffer.concat([...first.items, ...rest.items].map((item: any) => Buffer.from(item.data, "base64"))).toString();
+  expect(decoded).toBe(native);
+  const fresh = await api.query(query);
+  expect(Buffer.concat(fresh.items.map((item: any) => Buffer.from(item.data, "base64"))).toString()).toContain("later");
+  history.mutate(group.groupId, saved => { saved.members[0]!.coordinatorSessionId = "replacement"; });
+  expect(codes(await api.query({ ...query, cursor: first.cursor! }))).toEqual(["invalid_cursor"]);
+  expect(codes(await api.query(query))).toEqual(["coordinator_native_header_mismatch"]);
+  history.mutate(group.groupId, saved => { saved.members[0]!.coordinatorSessionId = "current"; });
+  const next = await api.query({ ...query, limit: 1 });
+  truncateSync(coordinatorFile, 1);
+  expect(codes(await api.query({ ...query, cursor: next.cursor! }))).toEqual(["stale_cursor"]);
+  expect(codes(await api.query(query))).toEqual(["coordinator_native_header_invalid"]);
+  writeFileSync(coordinatorFile, '{"type":"session","id":"wrong"}\n');
+  expect(codes(await api.query(query))).toEqual(["coordinator_native_header_mismatch"]);
+  rmSync(coordinatorFile);
+  expect(codes(await api.query({ ...query, cursor: first.cursor! }))).toEqual(["stale_cursor"]);
+  expect(codes(await api.query(query))).toContain("coordinator_native_missing");
+  expect(codes(await api.query({ ...query, source: "arbitrary" } as unknown as HistoryQuery))).toEqual(["invalid_source"]);
+  const rejected = await api.tool.execute("paths", { ...query, path: file }, undefined, undefined, {});
+  expect(rejected.details.items).toEqual([]);
+  expect(rejected.details.diagnostics).toEqual([{ code: "invalid_parameter" }]);
+});

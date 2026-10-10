@@ -47,6 +47,52 @@ History consultation and maintenance are foreground-only. Child role tools do
 not grant `agent_history`, and `/pitako history` rejects child callers.
 The history commands do not grant source-write or retired mission-control authority.
 
+`read` accepts `source: "worker"` by default, or `source: "coordinator"`.
+The coordinator source uses the session identity and file captured in the worker
+catalog. It accepts no arbitrary path. It exposes recorded coordinator decisions
+and tool calls alongside worker evidence, including older keyed advice records.
+Worker pruning does not own coordinator bytes or delete that locator.
+
+## Live observation and input
+
+Foreground `agent_observe` selects one exact active target:
+
+```json
+{ "target": { "kind": "background", "instanceId": "INSTANCE_ID" } }
+{ "target": { "kind": "team", "assignmentId": "ASSIGNMENT_ID" } }
+```
+
+The result includes the original WorkBrief, native `historyId` and `sessionId`,
+ordered coalesced activity, interaction receipts, and capture gaps. `after` uses
+the returned event cursor. `briefOffset` pages the original WorkBrief. The default
+limit is 50 events, the maximum is 200, and each page is at most 32 KiB.
+Activity is event evidence, not proof that every event persisted.
+
+`agent_input` accepts that target and observed native identity:
+
+```json
+{
+  "target": { "kind": "background", "instanceId": "INSTANCE_ID" },
+  "historyId": "HISTORY_ID",
+  "sessionId": "SESSION_ID",
+  "intent": "query",
+  "text": "What missing context explains the dependency-debugging detour?"
+}
+```
+
+`query` requests context. `steer` requests an in-scope correction relative to the
+original WorkBrief. Input is a note, never a command or a replacement prompt.
+It enters only at a later native steering boundary, after current tools finish.
+It does not interrupt a running command. Native replacement requires a fresh
+observation. Synchronous `agent_run` is not a live target.
+
+The receipt is not an answer. `queued` means admitted, `handled` means an input
+hook consumed the note, and `rejected` means submission was not accepted.
+`unconfirmed` reports closure without delivery or answer proof. A candidate
+answer mentions the interaction ID, but the host does not judge its adequacy.
+Subsequent activity must establish correction. Optional `decisionId` links a
+coordinator decision without turning it into authorization or result acceptance.
+
 ## Persistence and gaps
 
 Catalogs live in `<agentDir>/pitako/worker-history`. Ad-hoc native sessions live

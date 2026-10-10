@@ -135,8 +135,8 @@ export function validateCut(fd: number, cut: FileCut): void {
 }
 
 /** Discovery never reads the body. Oversized, partial or invalid headers stay uncertain. */
-export function nativeHeader(file: string): { type?: string; id?: string; version?: number } {
-  const fd = openSync(file, "r");
+export function nativeHeader(file: string | number): { type?: string; id?: string; version?: number } {
+  const fd = typeof file === "number" ? file : openSync(file, "r");
   try {
     const chunks: Buffer[] = [];
     for (let offset = 0; offset < 16 * 1024; offset += HISTORY_WINDOW) {
@@ -147,7 +147,7 @@ export function nativeHeader(file: string): { type?: string; id?: string; versio
       if (bytes.length < HISTORY_WINDOW) throw new Error("partial_header");
     }
     throw new Error("header_limit");
-  } finally { closeSync(fd); }
+  } finally { if (typeof file !== "number") closeSync(fd); }
 }
 
 /** Incremental catalog scanner: a member is a value, never the entire members array.

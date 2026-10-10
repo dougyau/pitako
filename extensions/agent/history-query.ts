@@ -3,12 +3,12 @@ import { closeSync, lstatSync, openSync, opendirSync } from "node:fs";
 import path from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { HistoryGroup, HistoryMember } from "./history.ts";
-import { catalogValues, checkJson, fileCut, HISTORY_BYTES, HISTORY_FRAGMENT, jsonState, validateCut, window, type FileCut, type JsonState } from "./history-native.ts";
+import { catalogValues, checkJson, fileCut, HISTORY_BYTES, HISTORY_FRAGMENT, jsonState, nativeHeader, validateCut, window, type FileCut, type JsonState } from "./history-native.ts";
 
 export type HistoryQuery =
   | { action: "list"; scope?: "all"; coordinatorSessionId?: string; missionId?: string;
       assignmentId?: string; instanceId?: string; roleId?: string; unitId?: string; attemptId?: string; cursor?: string; limit?: number }
-  | { action: "read"; historyId: string; groupId?: string; cursor?: string; limit?: number };
+  | { action: "read"; historyId: string; source?: "worker" | "coordinator"; groupId?: string; cursor?: string; limit?: number };
 export interface HistoryPage {
   items: unknown[];
   diagnostics: Array<{ code: string; detail?: string }>;
@@ -204,23 +204,33 @@ async function locate(directory: string, historyId: string, selectedGroup?: stri
 async function read(query: Extract<HistoryQuery, { action: "read" }>, page: HistoryPage, directory: string, limit: number) {
   if (!UUID.test(query.historyId)) throw new Error("invalid_history_id");
   if (query.groupId !== undefined && !UUID.test(query.groupId)) throw new Error("invalid_group_id");
-  const previous = decode(query.cursor, "read", query.historyId);
+  const source = query.source ?? "worker";
+  if (source !== "worker" && source !== "coordinator") throw new Error("invalid_source");
   const found = await locate(directory, query.historyId, query.groupId);
-  if (!found) throw new Error(previous ? "stale_cursor" : "history_not_found");
+  if (!found) throw new Error(query.cursor ? "stale_cursor" : "history_not_found");
   const { member, groupId } = found;
+  const identity = source === "worker" ? query.historyId : createHash("sha256")
+    .update(JSON.stringify([query.historyId, source, member.coordinatorSessionId, member.coordinatorSessionFile])).digest("hex");
+  const previous = decode(query.cursor, "read", identity);
   if (previous && previous.groupId !== groupId) throw new Error("stale_cursor");
   if (found.deleting) page.diagnostics.push({ code: "history_deletion_incomplete" });
-  if (member.native.state === "pruned") {
+  if (source === "worker" && member.native.state === "pruned") {
     if (previous) throw new Error("stale_cursor");
     page.diagnostics.push({ code: "history_pruned" }); return;
   }
   if (member.gaps?.length) page.diagnostics.push({ code: "capture_gaps",
     detail: `${member.gaps.join("; ").slice(0, 1024)} (catalog diagnostics; detail limited to 1024 characters)` });
-  if (member.native.state === "not-created") {
+  if (source === "worker" && member.native.state === "not-created") {
     if (previous) throw new Error("stale_cursor");
     page.diagnostics.push({ code: "native_not_created", detail: "No allocated native locator was recorded; this is not proof of no worker activity." }); return;
   }
-  const file = member.native.path;
+  if (source === "coordinator" && (!member.coordinatorSessionId || !member.coordinatorSessionFile ||
+      !path.isAbsolute(member.coordinatorSessionFile))) {
+    if (previous) throw new Error("stale_cursor");
+    page.diagnostics.push({ code: "coordinator_locator_unavailable" }); return;
+  }
+  const file = source === "coordinator" ? member.coordinatorSessionFile! :
+    member.native.state === "allocated" ? member.native.path : "";
   page.diagnostics.push(sidecar(file));
   let fd: number;
   try {
@@ -229,12 +239,19 @@ async function read(query: Extract<HistoryQuery, { action: "read" }>, page: Hist
   } catch (error) {
     if (previous) throw new Error("stale_cursor");
     page.diagnostics.push({ code: (error as NodeJS.ErrnoException).code === "ENOENT"
-      ? member.terminal?.beforeFirstAssistant ? "native_not_persisted_before_assistant" : "native_missing" : "native_unreadable" });
+      ? source === "coordinator" ? "coordinator_native_missing" :
+        member.terminal?.beforeFirstAssistant ? "native_not_persisted_before_assistant" : "native_missing" : "native_unreadable" });
     return;
   }
   try {
     if (previous) validateCut(fd, previous.cut);
     const cut = previous?.cut ?? fileCut(fd);
+    if (source === "coordinator") {
+      let header;
+      try { header = nativeHeader(fd); } catch { throw new Error("coordinator_native_header_invalid"); }
+      if (header?.type !== "session" || header.id !== member.coordinatorSessionId)
+        throw new Error("coordinator_native_header_mismatch");
+    }
     let offset = previous?.index ?? 0;
     let entryOffset = previous?.entryOffset ?? 0;
     let json = previous?.json ?? jsonState();
@@ -258,9 +275,9 @@ async function read(query: Extract<HistoryQuery, { action: "read" }>, page: Hist
       checkJson(nextJson, bytes, end);
       const validation = nextJson.limited ? "validation_limit" : nextJson.corrupt ? "corrupt" : end ? "json" : "fragment";
       const nextOffset = offset + length;
-      const cursor: Cursor = { version: 1, action: "read", identity: query.historyId, groupId, cut,
+      const cursor: Cursor = { version: 1, action: "read", identity, groupId, cut,
         index: nextOffset, entryOffset: end ? nextOffset : entryOffset, json: end ? jsonState() : nextJson };
-      const item = { historyId: query.historyId, entryOffset, byteOffset: offset, endsEntry: end,
+      const item = { historyId: query.historyId, source, entryOffset, byteOffset: offset, endsEntry: end,
         encoding: "base64", data: bytes.toString("base64"), validation };
       if (!add(page, item, cursor)) break;
       if ((nextJson.corrupt || nextJson.limited) && page.diagnostics.length < 32)
@@ -270,7 +287,7 @@ async function read(query: Extract<HistoryQuery, { action: "read" }>, page: Hist
       json = end ? jsonState() : nextJson;
     }
     validateCut(fd, cut);
-    if (offset < cut.size) page.cursor = encode({ version: 1, action: "read", identity: query.historyId, groupId,
+    if (offset < cut.size) page.cursor = encode({ version: 1, action: "read", identity, groupId,
       cut, index: offset, entryOffset, json });
   } finally { closeSync(fd); }
 }
@@ -279,7 +296,7 @@ export async function queryHistory(input: HistoryQuery, coordinatorSessionId?: s
   const page: HistoryPage = { items: [], diagnostics: [], cursor: null };
   try {
     const limit = input.limit ?? 50;
-    const allowed = input.action === "list" ? ["action", "scope", ...selectors, "cursor", "limit"] : ["action", "historyId", "groupId", "cursor", "limit"];
+    const allowed = input.action === "list" ? ["action", "scope", ...selectors, "cursor", "limit"] : ["action", "historyId", "source", "groupId", "cursor", "limit"];
     if (Object.keys(input).some((key) => !allowed.includes(key))) throw new Error("invalid_parameter");
     if (!Number.isInteger(limit) || limit < 1 || limit > 200) throw new Error("invalid_limit");
     if (input.action === "list") {
@@ -322,7 +339,7 @@ export function parseHistoryCommand(args: string): HistoryQuery {
   while (parts.length) {
     const flag = parts.shift()!;
     const key = flag.slice(2).replace(/-([a-z])/g, (_match, letter: string) => letter.toUpperCase());
-    if (!flag.startsWith("--") || !["cursor", "limit", ...(action === "list" ? ["scope", ...selectors] : [])].includes(key) ||
+    if (!flag.startsWith("--") || !["cursor", "limit", ...(action === "list" ? ["scope", ...selectors] : ["source", "groupId"])].includes(key) ||
         input[key] !== undefined) throw new Error("invalid history flag");
     const value = parts.shift();
     if (!value || value.startsWith("--")) throw new Error(`missing ${flag} value`);

@@ -149,6 +149,7 @@ export interface AttemptExecutor {
     onActivated?: (appliedReasoning: string) => void;
     /** Per attempt. Not stored on a shared executor. Pass undefined to clear. */
     bindActivityProbe?: (probe: (() => { name: string } | undefined) | undefined) => void;
+    bindLive?: (handle: import("./live.ts").LiveHandle) => (() => void);
   }): Promise<Attempt>;
 }
 
@@ -210,7 +211,7 @@ export function childInstructions(role: ResolvedRole, instanceId: string): strin
   return [
     `You are Pitako AgentInstance ${instanceId}, role ${role.id}.`,
     "Your conversation is private. Do not assume you saw the parent session.",
-    "Do not spawn other agents. agent_run, agent_supervise, agent_spawn, agent_status, agent_result, agent_cancel, team_assign, team_status, team_result, and team_cancel are not available.",
+    "Do not spawn other agents. agent_run, agent_supervise, agent_spawn, agent_status, agent_result, agent_observe, agent_input, agent_cancel, team_assign, team_status, team_result, and team_cancel are not available.",
     "Publish shared findings on the Board. Board contents are not injected here.",
     "Your rpiv-todo list is private to this session.",
     "The model and reasoning for this run come from this role's ModelPolicy, not from the parent session.",

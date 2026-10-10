@@ -59,6 +59,62 @@
     if (answer.type === "score") return Number.isFinite(answer.score) && Number.isFinite(answer.confidence);
     return false;
   };
+  const key = (kind, id) => `pitako.jev.${kind}.${id}`;
+  const validId = id => typeof id === "string" && /^[\w-]{1,200}$/.test(id);
+  const refs = value => Array.isArray(value) && value.every(ref => typeof ref === "string");
+  const stage = (kind, record) => {
+    const summary = { id: record.id, slot: key(kind, record.id), outcome: record.outcome, evidence: "staged" };
+    const latest = kind === "advice" ? slot : `pitako.jev.${kind}.latest`;
+    let retained = false;
+    try {
+      if (JSON.stringify(record).length > 262144) throw new Error("Complete advisory record exceeds native value limit");
+      store(summary.slot, record);
+      retained = true;
+      store(latest, record);
+    } catch (error) {
+      // Native store validates before changing a value. Undo the earlier write
+      // if the latest slot failed; incomplete staging must not retain this ID.
+      if (retained) store(summary.slot, undefined);
+      return { ...summary, evidence: "incomplete", error: String(error?.message ?? error) };
+    }
+    return summary;
+  };
+  const retrieve = (kind, id) => {
+    if (!validId(id)) throw new Error(`Invalid ${kind} ID`);
+    const record = load(key(kind, id));
+    if (!object(record) || record.id !== id) throw new Error(`${kind} record unavailable on this native branch`);
+    return record;
+  };
+  function linked(kind, input) {
+    try {
+      const selected = json(input);
+      const fields = kind === "decision"
+        ? ["adviceId", "target", "selectedAction", "reason", "evidenceRefs"]
+        : ["decisionId", "interactionReceipt", "observedOutcome", "evidenceRefs"];
+      if (!object(selected) || Object.keys(selected).some(field => !fields.includes(field)) ||
+          !refs(selected.evidenceRefs)) throw new Error(`Invalid ${kind} input`);
+      if (kind === "decision") {
+        retrieve("advice", selected.adviceId);
+        const target = selected.target;
+        const identity = target?.kind === "background" ? "instanceId" : target?.kind === "team" ? "assignmentId" : undefined;
+        if (!identity || !object(target) ||
+            Object.keys(target).some(field => !["kind", identity, "historyId", "sessionId"].includes(field)) ||
+            ![target[identity], target.historyId, target.sessionId].every(validId) ||
+            !object(selected.selectedAction) || !Object.keys(selected.selectedAction).length ||
+            typeof selected.reason !== "string" || !selected.reason.trim()) throw new Error("Invalid decision target/action/reason");
+      } else {
+        retrieve("decision", selected.decisionId);
+        if (!Object.hasOwn(selected, "observedOutcome") ||
+            !(typeof selected.observedOutcome === "string" || object(selected.observedOutcome)) ||
+            selected.interactionReceipt !== undefined && !object(selected.interactionReceipt))
+          throw new Error("Invalid observation outcome/receipt");
+      }
+      return stage(kind, { id: `jev-${kind}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        time: new Date().toISOString(), helperVersion: version, ...selected, outcome: kind });
+    } catch (error) {
+      return { outcome: "rejected", evidence: "incomplete", error: String(error?.message ?? error) };
+    }
+  }
   async function advise(input) {
     let selected;
     try {
@@ -111,18 +167,13 @@
         record.error = String(error?.message ?? error);
       }
     }
-    const summary = { id: record.id, slot, outcome: record.outcome, evidence: "staged" };
-    try {
-      if (JSON.stringify(record).length > 262144) throw new Error("Complete advisory record exceeds native value limit");
-      store(slot, record);
-    } catch (error) {
-      return { ...summary, evidence: "incomplete", error: String(error?.message ?? error) };
-    }
+    const summary = stage("advice", record);
     if (record.outcome === "advice") {
       summary.orientation = record.response.answers.orientation.choice;
       summary.advice = record.response.answers.orientation;
     }
     return summary;
   }
-  return { version, advise };
+  return { version, advise, recordDecision: input => linked("decision", input),
+    recordObservation: input => linked("observation", input) };
 })()
