@@ -123,6 +123,7 @@ export async function spawnBackground(input: {
   task: string;
   cwd: string;
   historyOrigin?: import("./history.ts").HistoryOrigin;
+  dispatch?: import("./routing.ts").DispatchSnapshot;
   foreground?: AbortSignal;
   watch?: WorkerInterest;
   executor: AttemptExecutor;
@@ -142,6 +143,7 @@ export async function spawnBackground(input: {
     cwd: input.cwd,
     executionRoot: input.watch?.execution?.executionRoot,
     historyOrigin: input.historyOrigin,
+    dispatch: input.dispatch,
     signal: controller.signal,
     executor: {
       ...input.executor,

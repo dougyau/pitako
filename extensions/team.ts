@@ -14,6 +14,7 @@ export interface TeamAssignment {
   unitId?: string;
   boardTopicId?: number;
   execution?: ExecutionBinding;
+  dispatchId?: string;
 }
 
 interface Evaluation {
@@ -66,7 +67,7 @@ export function reserveTeamRole(
   evaluation: TeamEvaluation | undefined,
   roleId: string,
   assignmentId: string,
-): { token: symbol; commit: () => void; rollback: () => void; settled: () => void } {
+): { token: symbol; owns: () => boolean; commit: () => void; rollback: () => void; settled: () => void } {
   if (!evaluation) throw new Error("Team requires a foreground session identity");
   const state = registry();
   const current = state.evaluations.get(evaluation.sessionId);
@@ -85,6 +86,10 @@ export function reserveTeamRole(
   };
   return {
     token: evaluation.token,
+    owns() {
+      const live = state.evaluations.get(evaluation.sessionId);
+      return !finished && live?.token === evaluation.token && live.roles.get(roleId) === assignmentId;
+    },
     commit() {
       if (finished) return;
       committed = true;

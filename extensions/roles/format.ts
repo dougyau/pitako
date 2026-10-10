@@ -39,6 +39,12 @@ export function formatPolicyList(config: PitakoConfig): string {
 
 export function formatPolicy(policy: ResolvedModelPolicy): string {
   const lines = [`model policy: ${policy.id}`];
+  if (policy.provenance) lines.push(
+    `configuration: ${policy.provenance.configPath}`,
+    `compatibility policy: ${policy.provenance.legacyPolicy}`,
+    `primary source: ${policy.provenance.primary}`,
+    `fallbacks source: ${policy.provenance.fallbacks}`,
+  );
   if (policy.primary) {
     lines.push(
       "primary:",

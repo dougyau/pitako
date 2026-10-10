@@ -88,6 +88,36 @@ A role is a template. It is not an AgentInstance. Built-in roles are coordinator
 
 User config is `$PI_CODING_AGENT_DIR/pitako/config.toml`. `smol-toml` parses it. There was no TOML parser in the tree. Scalar overrides replace one field. Skill, principle, primary, and fallback arrays replace the whole list when present and stay when omitted.
 
+Developer has one responsibility and three capacity policies: `developer_senior`,
+`developer_mid`, and `developer_junior`. They share the same instructions, skills,
+tools, permissions and review contract. Explicit profile fields override explicitly
+configured fields in the legacy policy named by `roles.developer.model_policy`;
+omitted fields inherit, including reasoning, fast mode and provider fallbacks.
+Bundled profiles have no concrete model. See
+[developer-profiles.example.toml](../config/developer-profiles.example.toml) for
+optional starting targets, not installed settings or quality claims.
+Use `/pitako policies`, `/pitako policy developer_mid` (or senior/junior), and
+`/pitako role developer` to inspect the resolved target and configuration sources.
+
+Ordinary `agent_run` Developer dispatch uses the public host classifier APIs to
+ask available `opencode/jev-1.13-free` one fixed capacity question about the exact
+submitted WorkBrief. Submit non-secret context. Missing, indeterminate, failed or
+malformed advice selects mid; cancellation never selects a replacement. Native
+recording unavailable skips classification explicitly. The runner consumes an
+immutable configuration/policy snapshot and never reclassifies; direct runner
+callers use mid. Provider fallbacks stay within the selected policy. Other roles
+and the principal model are unchanged.
+
+The native `pitako.developer-routing` entry retains dispatch/advice/tool-call
+identity, exact submitted context, complete public response and policy provenance.
+Worker origin metadata carries this record through ordinary HistoryOrigin.
+`agent_run` returns `dispatchId` plus the existing instance/history IDs. Classifier
+usage is in the advice response, separately from worker usage. Native append can
+be pending before a first assistant, not a persistence receipt; the returned
+`routingEvidence` names that gap. Non-retained coordinators skip advice, and a
+failed recording falls back to mid without a second writer or a claim of retained
+probabilities.
+
 Reasoning is Pi's `ThinkingLevel` plus `off`. The set is checked against the `ThinkingLevel` type so a new Pi level fails the build. Unsupported levels are rejected with `getSupportedThinkingLevels` only when the caller supplies models. Config load does not open Pi's model registry, so a named target can exist before auth does. Exact `provider/model` is required. Bare ids are rejected.
 
 Fallback is availability only. The runner tries the next configured target for recognized provider or model failures; it does not accept `fallback_on`. The classifier matches error text because Pi does not export a stable provider error taxonomy. Test failures and unknown errors do not trigger fallback.

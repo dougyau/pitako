@@ -234,6 +234,7 @@ export async function runAgentInstance(input: {
   /** Physical root captured from the frozen execution ledger. */
   executionRoot?: string;
   historyOrigin?: HistoryOrigin;
+  dispatch?: import("./routing.ts").DispatchSnapshot;
   /** Test clock. Production uses Date.now. */
   now?: () => number;
   /** Test scheduler. Production uses setInterval and unref. */
@@ -252,8 +253,9 @@ export async function runAgentInstance(input: {
   if (input.executionRoot !== undefined && workspace !== input.executionRoot) {
     throw new PitakoConfigError(`AgentInstance workspace drift: expected ${input.executionRoot}, got ${workspace}`);
   }
-  const loaded = loadPitakoConfig(input.load);
-  const role = resolveRoleFromConfig(loaded, input.roleId);
+  const loaded = input.dispatch?.config ?? loadPitakoConfig(input.load);
+  const role = input.dispatch?.role ?? resolveRoleFromConfig(loaded, input.roleId);
+  if (role.id !== input.roleId) throw new PitakoConfigError("dispatch snapshot role does not match runner role");
   if (!role.modelPolicy.primary) {
     throw new PitakoConfigError(role.modelPolicy.diagnostic ?? `model policy "${role.modelPolicyId}" has no primary target`);
   }

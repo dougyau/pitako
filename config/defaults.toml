@@ -6,6 +6,10 @@
 [worker_history]
 ttl_days = 180
 
+[model_policies.developer_senior]
+[model_policies.developer_mid]
+[model_policies.developer_junior]
+
 [roles.coordinator]
 name = "Coordinator"
 description = "Understands the mission, chooses which specialists are needed, and synthesizes results."

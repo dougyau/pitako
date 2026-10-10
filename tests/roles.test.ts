@@ -6,9 +6,9 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getPitakoConfigPath } from "../extensions/board/paths.ts";
 import pitako from "../extensions/index.ts";
 import { PitakoConfigError } from "../extensions/errors.ts";
-import { getModelPolicy, getRole, loadPitakoConfig, resolveRole } from "../extensions/roles/load.ts";
+import { getModelPolicy, getRole, loadPitakoConfig, resolveRole, resolveRoleFromConfig } from "../extensions/roles/load.ts";
 import { inspectPitako } from "../extensions/roles/format.ts";
-import { ROLE_IDS } from "../extensions/roles/types.ts";
+import { ROLE_IDS, DEVELOPER_PROFILES } from "../extensions/roles/types.ts";
 import { packageRoot } from "../extensions/stack.ts";
 import { loadPitako } from "./fixtures/owned-pitako.ts";
 
@@ -32,6 +32,45 @@ function writeConfig(configPath: string, text: string): void {
 }
 
 describe("role and model policy resolution", () => {
+  test("Developer capacity policies inherit explicit legacy fields, not a second role contract", () => {
+    const { env, configPath } = tempAgent();
+    writeConfig(configPath, `
+[roles.developer]
+model_policy = "architect"
+[model_policies.architect.primary]
+model = "fixture/legacy"
+reasoning = "medium"
+fast = true
+[[model_policies.architect.fallbacks]]
+model = "fixture/fallback"
+reasoning = "low"
+[model_policies.developer_senior.primary]
+model = "fixture/senior"
+reasoning = "high"
+[model_policies.developer_junior]
+fallbacks = []
+`);
+    const config = loadPitakoConfig({ env });
+    const developer = getRole("developer", { env });
+    for (const profile of DEVELOPER_PROFILES) {
+      const role = resolveRoleFromConfig(config, "developer", profile);
+      expect(role.instructions).toBe(developer.instructions);
+      expect(role.skills).toEqual(developer.skills);
+      expect(role.principles).toEqual(developer.principles);
+      expect(role.id).toBe("developer");
+      expect(role.modelPolicyId).toBe(profile);
+    }
+    const mid = resolveRole("developer", { env });
+    expect(mid.modelPolicy.primary).toEqual({ model: "fixture/legacy", reasoning: "medium", fast: true });
+    expect(mid.modelPolicy.fallbacks).toEqual([{ model: "fixture/fallback", reasoning: "low" }]);
+    expect(mid.modelPolicy.provenance?.primary).toBe("architect");
+    expect(config.policies.developer_senior?.primary).toEqual({ model: "fixture/senior", reasoning: "high" });
+    expect(config.policies.developer_senior?.fallbacks).toEqual(mid.modelPolicy.fallbacks);
+    expect(config.policies.developer_junior?.fallbacks).toEqual([]);
+    expect(inspectPitako("policy developer_senior", { env })).toContain("primary source: developer_senior");
+    expect(inspectPitako("policy developer_senior", { env })).toContain("fallbacks source: architect");
+    expect(resolveRole("architect", { env }).modelPolicyId).toBe("architect");
+  });
   test("shipped roles distinguish assignment completion from independent acceptance", () => {
     const { env } = tempAgent();
     const developer = resolveRole("developer", { env }).instructions;
