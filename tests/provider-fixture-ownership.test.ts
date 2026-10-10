@@ -14,7 +14,7 @@ test("provider fixture fails stop before unsafe restoration and permits safe cle
   const receipts: unknown[] = [];
   try {
     // Timeout first: a failed consequential guard check stops all further checks.
-    for (const mode of ["timeout", "complete", "disposal-failure", "start-failure", "run-rejection"]) {
+    for (const mode of ["timeout", "complete", "disposal-failure", "start-failure", "run-rejection", "directory-failure"]) {
       const cwd = path.join(root, mode);
       mkdirSync(cwd);
       const entry = path.join(cwd, "ownership.test.ts");
@@ -45,6 +45,7 @@ test("provider fixture fails stop before unsafe restoration and permits safe cle
         expect(markers).not.toContain("RESTORATION");
         expect(markers).not.toContain("AFTER_GUARD");
         expect(markers).not.toContain("BODY_FINALLY");
+        expect(markers).not.toContain("DIRECTORY_RELEASE");
         expect(retained).toBe(true);
         if (mode === "timeout") expect(markers).toContain("ENTER_UNSETTLED");
         if (mode === "disposal-failure") {
@@ -54,12 +55,25 @@ test("provider fixture fails stop before unsafe restoration and permits safe cle
           expect(output).toContain("original assertion failure");
         }
         if (mode === "run-rejection") expect(output).toContain("run-owned disposal failed");
+      } else if (mode === "directory-failure") {
+        expect(result.status).toBe(1);
+        expect(output).toContain("PROVIDER FIXTURE FAIL-STOP");
+        expect(output).toContain("owned directory release failed");
+        expect(markers).toContain("DISPOSE_COMPLETE");
+        expect(markers).toContain("RESTORATION");
+        expect(markers).toContain("DIRECTORY_RELEASE");
+        expect(markers).not.toContain("AFTER_GUARD");
+        expect(markers).not.toContain("NEXT_CASE");
+        expect(retained).toBe(true);
       } else {
         expect(result.status).toBe(mode === "complete" ? 0 : 1);
         expect(output).not.toContain("PROVIDER FIXTURE FAIL-STOP");
         expect(markers).toContain("RESTORATION");
         expect(markers).toContain("AFTER_GUARD");
         expect(markers).toContain("NEXT_CASE");
+        expect(markers).toContain("DIRECTORY_RELEASE");
+        const disposal = mode === "complete" ? "DISPOSE_COMPLETE" : "DISPOSE_LATE_HANDLE";
+        expect(markers.indexOf("DIRECTORY_RELEASE")).toBeGreaterThan(markers.indexOf(disposal));
         expect(retained).toBe(false);
         expect(markers).toContain(mode === "complete" ? "DISPOSE_COMPLETE" : "DISPOSE_LATE_HANDLE");
         if (mode === "start-failure") expect(output).toContain("first start failed");

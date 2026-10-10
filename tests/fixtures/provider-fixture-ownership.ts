@@ -1,19 +1,31 @@
 import { rmSync, writeSync } from "node:fs";
 
 // Test-only ownership: a runner timeout cannot safely cancel SDK initialization.
-export function providerFixtureOwnership() {
+export function providerFixtureOwnership({ deferDirectories = false } = {}) {
   const directories: string[] = [];
   let released = true;
   let label = "";
   let unsafeErrors: unknown[] = [];
   let starts: Promise<unknown>[] = [];
   let disposals: Array<() => unknown> = [];
+  let directoryReleases: Array<{ release(): void; roots: string[] }> = [];
+  let beforeRelease: Array<() => unknown> = [];
+
+  function releaseDirectories() {
+    requireReleasedFixture();
+    released = false;
+    for (const item of directoryReleases) item.release();
+    directoryReleases = [];
+    for (const dir of directories) rmSync(dir, { recursive: true, force: true });
+    directories.length = 0;
+    released = true;
+  }
 
   function requireReleasedFixture() {
     if (released) return;
     const diagnostic = JSON.stringify({
       case: label,
-      retainedDirectories: directories,
+      retainedDirectories: [...directories, ...directoryReleases.flatMap((item) => item.roots)],
       errors: unsafeErrors.map((error) => String(error)),
     }).slice(0, 16_384);
     writeSync(2, `PROVIDER FIXTURE FAIL-STOP: unreleased callback or uncertain disposal; ${diagnostic}\n`);
@@ -32,6 +44,7 @@ export function providerFixtureOwnership() {
 
   async function run<T>(pending: Promise<T>): Promise<T> {
     // runAgentInstance owns its sessions. A rejection may include failed disposal.
+    starts.push(pending);
     try {
       return await pending;
     } catch (error) {
@@ -48,7 +61,9 @@ export function providerFixtureOwnership() {
       unsafeErrors = [];
       starts = [];
       disposals = [];
-      const globals = ["fetch", "WebSocket", "setTimeout", "__pitakoLateProvider", "__pitakoTelemetryProvider", "__pitakoPayloadInputs"];
+      beforeRelease = [];
+      const globals = ["fetch", "WebSocket", "setTimeout", "__pitakoLateProvider", "__pitakoTelemetryProvider", "__pitakoPayloadInputs",
+        "__pitakoHangProvider", "__pitako_cursor", "__pitako_other", "__pitako_pitako-probe"];
       const descriptors = globals.map((key) => Object.getOwnPropertyDescriptor(globalThis, key));
       const agentDir = process.env.PI_CODING_AGENT_DIR;
       const errors: unknown[] = [];
@@ -56,6 +71,9 @@ export function providerFixtureOwnership() {
         await body();
       } catch (error) {
         errors.push(error);
+      }
+      for (const cleanup of beforeRelease) {
+        try { await cleanup(); } catch (error) { unsafeErrors.push(error); }
       }
       // This is callback cleanup, not an asynchronous teardown/drain hook.
       const acquisitions = await Promise.allSettled(starts);
@@ -69,6 +87,12 @@ export function providerFixtureOwnership() {
       if (unsafeErrors.length) {
         throw new AggregateError([...errors, ...unsafeErrors], "Provider fixture release is uncertain");
       }
+      if (process.env.PITAKO_FIXTURE_WITNESS) {
+        writeSync(2, `PROVIDER FIXTURE SETTLED: ${JSON.stringify({
+          case: label, starts: acquisitions.map((result) => result.status),
+          disposals: cleanup.map((result) => result.status), directories,
+        })}\n`);
+      }
       // Nothing below runs while a start, callback, or disposal is still pending.
       globals.forEach((key, index) => {
         const descriptor = descriptors[index];
@@ -77,12 +101,14 @@ export function providerFixtureOwnership() {
       });
       if (agentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = agentDir;
-      for (const dir of directories) rmSync(dir, { recursive: true, force: true });
-      directories.length = 0;
       released = true;
+      if (!deferDirectories) releaseDirectories();
       if (errors.length) throw new AggregateError(errors, "Provider fixture callback failed");
     };
   }
 
-  return { directories, requireReleasedFixture, acquire, run, ownedCase };
+  return { directories, requireReleasedFixture, acquire, run, ownedCase, releaseDirectories,
+    beforeRelease(cleanup: () => unknown) { beforeRelease.push(cleanup); },
+    releaseDirectoriesAfterDisposal(release: () => void, roots: string[]) { directoryReleases.push({ release, roots }); },
+  };
 }

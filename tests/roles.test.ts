@@ -10,7 +10,7 @@ import { getModelPolicy, getRole, loadPitakoConfig, resolveRole } from "../exten
 import { inspectPitako } from "../extensions/roles/format.ts";
 import { ROLE_IDS } from "../extensions/roles/types.ts";
 import { packageRoot } from "../extensions/stack.ts";
-import { loadPitako } from "../scripts/load-pitako.ts";
+import { loadPitako } from "./fixtures/owned-pitako.ts";
 
 const tempDirs: string[] = [];
 

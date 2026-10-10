@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -13,6 +13,17 @@ import { superviseAgent, type HerdrCommandResult, type HerdrRunner } from "../ex
 import { childActiveTools } from "../extensions/profile.ts";
 import { resolveRole, type LoadOptions } from "../extensions/roles/load.ts";
 import { packageRoot } from "../extensions/stack.ts";
+
+const roots: string[] = [];
+function fixtureRoot(): string {
+  const root = mkdtempSync(path.join(tmpdir(), "pitako-supervise-"));
+  roots.push(root);
+  return root;
+}
+afterEach(() => {
+  for (const root of roots) rmSync(root, { recursive: true, force: true });
+  roots.length = 0;
+});
 
 const inside = {
   HERDR_ENV: "1",
@@ -306,7 +317,7 @@ function scripted(overrides: Record<string, HerdrCommandResult | ((args: string[
 }
 
 function developerLoad(reasoning?: string, options: { fast?: boolean; fallbackFast?: boolean } = {}): LoadOptions {
-  const dir = mkdtempSync(path.join(tmpdir(), "pitako-supervise-"));
+  const dir = fixtureRoot();
   const userConfigPath = path.join(dir, "config.toml");
   const reasoningLine = reasoning ? `reasoning = "${reasoning}"\n` : "";
   const fastLine = options.fast === undefined ? "" : `fast = ${options.fast}\n`;
@@ -395,7 +406,7 @@ describe("agent_supervise", () => {
 
   test("no primary target is a PitakoConfigError before split", async () => {
     const { calls, run } = scripted();
-    const missing = path.join(mkdtempSync(path.join(tmpdir(), "pitako-supervise-")), "missing.toml");
+    const missing = path.join(fixtureRoot(), "missing.toml");
     await expect(superviseAgent(superviseInput(run, { load: { userConfigPath: missing, packageRoot: packageRoot() } }))).rejects.toThrow(/no primary target/);
     expect(calls.some((args) => args[1] === "split")).toBe(false);
   });

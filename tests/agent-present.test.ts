@@ -1,13 +1,16 @@
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
+import { agentFixtureOwnership } from "./fixtures/agent-fixture-ownership.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import agentInstance from "../extensions/agent/index.ts";
 import { formatAgentLive, formatElapsed, summarizeTask } from "../extensions/agent/present.ts";
 import { formatAgentResult, runAgentInstance, type AgentInstance, type AttemptExecutor } from "../extensions/agent/run.ts";
 import { activityKind } from "../extensions/agent/watchdog.ts";
 import { packageRoot } from "../extensions/stack.ts";
+const fixture = agentFixtureOwnership();
+afterEach(fixture.requireReleasedFixture);
 
 function instance(patch: Partial<Omit<AgentInstance, "model">> & { model?: Partial<AgentInstance["model"]> } = {}): AgentInstance {
   return {
@@ -36,7 +39,7 @@ const watchdog = {
 };
 
 describe("agent live view", () => {
-  test("identity, bounded task, and coarse elapsed", () => {
+  test("identity, bounded task, and coarse elapsed", fixture.ownedCase("identity, bounded task, and coarse elapsed", () => {
     expect(summarizeTask("\n\n  review \t the   boundary  \nSECRET-SECOND-LINE")).toBe("review the boundary");
     const long = `${"A".repeat(120)}\nSECRET-SECOND-LINE`;
     expect(summarizeTask(long)).toBe("A".repeat(100));
@@ -58,9 +61,9 @@ describe("agent live view", () => {
     expect(text).not.toContain("SECRET-SECOND-LINE");
     expect(text).toContain("elapsed: 4s");
     expect(text).not.toContain("blocked");
-  });
+  }));
 
-  test("requested model is immediate; active model waits for activation", () => {
+  test("requested model is immediate; active model waits for activation", fixture.ownedCase("requested model is immediate; active model waits for activation", () => {
     const pending = formatAgentLive({
       instance: instance({
         model: {
@@ -100,9 +103,9 @@ describe("agent live view", () => {
     expect(active).toContain("reasoning applied: xhigh");
     expect(active).not.toContain("activation pending");
     expect(active).not.toContain("active model: example/primary");
-  });
+  }));
 
-  test("fallback stays hidden until it occurred, including an unused configured target", () => {
+  test("fallback stays hidden until it occurred, including an unused configured target", fixture.ownedCase("fallback stays hidden until it occurred, including an unused configured target", () => {
     const hidden = formatAgentLive({
       instance: instance({
         model: {
@@ -118,9 +121,9 @@ describe("agent live view", () => {
     expect(hidden).not.toContain("fallback:");
     expect(hidden).not.toContain("example/unused");
     expect(hidden).not.toContain("rate_limit");
-  });
+  }));
 
-  test("tool name beats tool_progress; cache warming is not activity", () => {
+  test("tool name beats tool_progress; cache warming is not activity", fixture.ownedCase("tool name beats tool_progress; cache warming is not activity", () => {
     expect(activityKind({ type: "cache_warming_decision" })).toBeUndefined();
     const text = formatAgentLive({
       instance: instance(),
@@ -131,9 +134,9 @@ describe("agent live view", () => {
     expect(text).not.toContain("tool_progress");
     expect(text).not.toContain("cache");
     expect(text).toContain("watchdog: working, inactive 45s, tool bash");
-  });
+  }));
 
-  test("status is derived, not guessed from elapsed time", () => {
+  test("status is derived, not guessed from elapsed time", fixture.ownedCase("status is derived, not guessed from elapsed time", () => {
     const cases = [
       { status: "created" as const, phase: "working" as const, label: "starting" },
       { status: "running" as const, phase: "working" as const, label: "working" },
@@ -195,9 +198,9 @@ describe("agent live view", () => {
     });
     expect(stalled).toContain("input:");
     expect(stalled).not.toContain(child);
-  });
+  }));
 
-  test("schema stays role and task, and renderResult keeps the compact view", () => {
+  test("schema stays role and task, and renderResult keeps the compact view", fixture.ownedCase("schema stays role and task, and renderResult keeps the compact view", () => {
     const tools = new Map<string, {
       parameters: { properties: Record<string, unknown>; additionalProperties?: boolean };
       renderCall: Function;
@@ -230,12 +233,13 @@ describe("agent live view", () => {
     expect(collapsed.join("\n")).toContain("architect-abc123 working");
     expect(collapsed.join("\n")).toContain("line 11");
     expect(collapsed.join("\n")).not.toContain("CHILD-TRANSCRIPT");
-  });
+  }));
 });
 
 describe("agent live updates", () => {
-  test("presents material states and hides unused fallback, cache warming, and the child result", async () => {
+  test("presents material states and hides unused fallback, cache warming, and the child result", fixture.ownedCase("presents material states and hides unused fallback, cache warming, and the child result", async () => {
     const envDir = mkdtempSync(path.join(tmpdir(), "pitako-present-"));
+    fixture.directories.push(envDir);
     const userConfigPath = path.join(envDir, "config.toml");
     writeFileSync(userConfigPath, `
 [roles.architect]
@@ -297,9 +301,9 @@ fallbacks = [
     expect(result.result).toContain("CHILD-TRANSCRIPT");
     expect(formatAgentResult(result)).toContain("fallback: rate_limit from example/primary");
     expect(formatAgentResult(result)).toContain(result.result);
-  });
+  }));
 
-  test("watchdog phase changes present, and a throwing callback does not change the stall", async () => {
+  test("watchdog phase changes present, and a throwing callback does not change the stall", fixture.ownedCase("watchdog phase changes present, and a throwing callback does not change the stall", async () => {
     let clock = 0;
     let tick = () => {};
     const texts: string[] = [];
@@ -313,6 +317,7 @@ fallbacks = [
       },
     };
     const envDir = mkdtempSync(path.join(tmpdir(), "pitako-present-stall-"));
+    fixture.directories.push(envDir);
     const userConfigPath = path.join(envDir, "config.toml");
     writeFileSync(userConfigPath, `
 [roles.architect]
@@ -348,5 +353,5 @@ primary = { model = "example/primary", reasoning = "high" }
     expect(result.status).toBe("failed");
     expect(result.result).toContain("stalled");
     expect(result.model.fallbackOccurred).toBeFalsy();
-  });
+  }));
 });

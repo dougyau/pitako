@@ -23,7 +23,7 @@
     "THIRD_PARTY.md"
   ],
   "scripts": {
-    "test": "bun test",
+    "test": "bun test --parallel",
     "test:code-intelligence-node": "node --test scripts/code-intelligence-node.mjs",
     "smoke": "bun scripts/smoke.ts",
     "pi": "pi --no-extensions --approve -e .",

@@ -97,7 +97,7 @@ Before dispatch, compare the brief with the frozen unit and relevant rulings. Do
 
 Label evidence as accepted, advisory, failed, or unavailable according to its actual source. A worker claim is not accepted evidence. Keep relevant valid evidence even when it is old. Exclude obsolete or unrelated context. Do not send the parent transcript or every Board topic.
 
-Supply resolved references to actual reusable evidence and identify what remains uncovered under `verify-behavior`'s shared policy. Do not require rediscovery of artifacts, reconciliation of every earlier report, or a replacement report merely for a handoff. Existing required reports, identity checks, and managed receipts remain required.
+Supply resolved references to actual reusable evidence and identify what remains uncovered under `verify-behavior`'s shared policy. Do not require rediscovery of artifacts, reconciliation of every earlier report, or a replacement report merely for a handoff. Existing required reports and identity checks remain required.
 
 Local subdivision stays local. A future Developer Team head may choose implementation steps and assignments inside the unit. Those assignments do not replace global acceptance or authorize replanning. Preserve the frozen envelope and the Level 1 and Level 2 decision rules.
 
@@ -122,6 +122,10 @@ Use `verify-behavior` for check selection, stopping, and test quality within thi
 Apply that policy within the plan's required gates. Use `verify-behavior` for diagnosis, affected regression, final gates, relevant environment prerequisites, wrapper coverage, and valid evidence reuse. A worker saying "done" is not proof. Compilation does not prove unobserved behavior. Mandatory gates and independent review remain required.
 
 Route project procedures through `verify-behavior`'s shared root `GATES.md` interpretation using `binding.executionRoot`. Reference the guide and relevant obligations in the WorkBrief, not its whole body. Cross-check consequential claims and use existing discovery for uncovered obligations; frozen requirements remain controlling.
+
+When the guide provides `scripts/verification-recipe-v1.js`, load the complete source from `binding.executionRoot` through actual `tools.read` in ordinary built-in codemode, before evaluation and the v1 check. Obtain a unique absolute invocation directory with `evidenceFile(planId, uniqueRelative, binding.executionRoot)` in the ordinary workflow context and pass the resolved values into QuickJS. Reject failed, non-string or truncated/continuation source reads; record source identity and binding. The optional advisory helper stays beside verify-behavior's advertised installed `SKILL.md` path, separate from the repository recipe. Projects without the asset retain ordinary discovery.
+
+The principal coordinator owns the final complete procedure directly. Never delegate that full invocation to an AgentInstance or Team subject to the 45-minute tool-stall watchdog. Leave routine bash timeout and codemode `timeout_ms` unset and await nested calls; this removes those deadlines, not every caller constraint. Workers may run focused checks with fixture-appropriate bounds. Keep raw logs and observed exits, tool errors, interruption and capture failure; stop at the first failed, interrupted or unavailable command and name remaining obligations as unrun. Preserve partial evidence and establish prior owned invocation settlement before replacement. No detached runner, heartbeat or settings change. This coordinator check ownership does not transfer failed specialist authority or replace independent final review.
 
 If verification fails in an implementation assignment, the same Developer reproduces, finds the root cause, makes the smallest in-scope correction, and verifies again. Diagnosis-only and verification-only assignments retain their permitted effects. Do not ask the user, call Architect, or switch to a stronger model merely because a check failed.
 

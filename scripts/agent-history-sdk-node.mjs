@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,7 +24,10 @@ if (process.argv[2] === "--read") {
   assert.equal(ordinary.native.disposition.state, "disposed");
   const ordinaryEntries = SessionManager.open(ordinary.native.path).getEntries();
   assert.equal(ordinaryEntries.filter(entry => entry.type === "message" && entry.message.role === "toolResult" &&
-    entry.message.toolName === "codemode").length, 3);
+    entry.message.toolName === "codemode").length, 4);
+  assert(ordinaryEntries.some(entry => entry.type === "message" && entry.message.role === "toolResult" &&
+    entry.message.toolName === "codemode" && entry.message.content.some(part =>
+      part.type === "text" && part.text.includes('"status":"failed"') && part.text.includes('"status":"passed"'))));
   assert.equal(nativeHistoryStatus(persisted).state, "present");
   assert.equal(nativeHistoryStatus(preassistant).state, "present");
   assert.equal(preassistant.terminal.status, "cancelled");
@@ -43,7 +47,7 @@ if (process.argv[2] === "--read") {
 } else {
   const root = mkdtempSync(path.join(tmpdir(), "pitako-history-sdk-"));
   const agentDir = path.join(root, "agent");
-  const cwd = path.join(root, "worktree");
+  const cwd = path.join(root, "worktree's fixture");
   mkdirSync(cwd);
   process.env.PI_CODING_AGENT_DIR = agentDir;
   process.env.PI_OFFLINE = "1";
@@ -96,16 +100,40 @@ if (process.argv[2] === "--read") {
     history.recordTerminal(group.groupId, early.historyId, { status: "cancelled", beforeFirstAssistant: true });
     history.recordDisposition(group.groupId, early.historyId, { state: "disposed", at: new Date().toISOString() });
     writeFileSync(path.join(cwd, "sample.txt"), "owned child text\n");
+    mkdirSync(path.join(cwd, "scripts"));
+    mkdirSync(path.join(cwd, "tests"));
+    const recipeSource = readFileSync(new URL("./verification-recipe-v1.js", import.meta.url), "utf8");
+    writeFileSync(path.join(cwd, "scripts", "verification-recipe-v1.js"), recipeSource);
+    writeFileSync(path.join(cwd, "scripts", "truncated.js"), '// owned partial source\n'.repeat(2100) + '({version:1})');
+    writeFileSync(path.join(cwd, "tests", "success.test.ts"), `import { test, expect } from "bun:test";
+import { writeFileSync } from "node:fs";
+test("owned recipe success", async () => {
+  console.log("recipe raw success"); writeFileSync("success.pid", String(process.pid));
+  await Bun.sleep(30); expect(6 * 7).toBe(42);
+});\n`);
+    writeFileSync(path.join(cwd, "tests", "parallel.test.ts"), `import { test, expect } from "bun:test";
+import { writeFileSync } from "node:fs";
+test("owned second process", async () => {
+  writeFileSync("parallel.pid", String(process.pid)); await Bun.sleep(30); expect(true).toBe(true);
+});\n`);
+    writeFileSync(path.join(cwd, "tests", "failure.test.ts"), `import { test, expect } from "bun:test";
+test("owned recipe failure", () => { console.error("recipe raw failure"); expect(1).toBe(2); });\n`);
+    writeFileSync(path.join(root, "outside.test.ts"), 'throw Error("must not execute outside tests scope");\n');
+    symlinkSync(path.join(root, "outside.test.ts"), path.join(cwd, "tests", "escape.test.ts"));
+    const recipeEvidence = path.join(root, "recipe evidence's");
     const hooks = [];
     globalThis.__ordinaryChildHooks = hooks;
     writeFileSync(path.join(agentDir, "extensions", "child-hooks.js"), `export default function (pi) {
       pi.on("tool_call", event => {
         globalThis.__ordinaryChildHooks.push({ type: "call", name: event.toolName, input: event.input });
         if (event.toolName === "read" && event.input.path === "blocked.txt") return { block: true, reason: "owned hook denial" };
+        if (event.toolName === "bash" && event.input.command?.includes("./tests/denied.test.ts"))
+          return { block: true, reason: "owned recipe tool denial" };
       });
       pi.on("tool_result", event => {
         globalThis.__ordinaryChildHooks.push({ type: "result", name: event.toolName, content: event.content });
-        if (event.toolName === "read" && !event.isError) return { content: [{ type: "text", text: "hook transformed read" }] };
+        if (event.toolName === "read" && event.input.path === "sample.txt" && !event.isError)
+          return { content: [{ type: "text", text: "hook transformed read" }] };
       });
     }\n`);
     const scripts = [
@@ -115,13 +143,38 @@ if (process.argv[2] === "--read") {
          try { await call(); text("unexpected success"); } catch (error) { text(error.message); }
        }`,
       `await tools.read({path:"missing.txt"});`,
+      `const executionRoot = ${JSON.stringify(cwd)};
+       const evaluate = source => {
+         if (typeof source !== "string" || /\\[(?:Showing |.*more lines in file|Line .*exceeds)/.test(source))
+           throw Error("Incomplete verification recipe source");
+         const recipe = eval(source);
+         if (recipe.version !== 1 || typeof recipe.run !== "function") throw Error("Unsupported verification recipe");
+         return recipe;
+       };
+       const rejected = [];
+       for (const candidate of [null, {type:"image"}, "({version:2})"]) {
+         try { evaluate(candidate); throw Error("unexpected source admission"); }
+         catch (error) { if (error.message === "unexpected source admission") throw error; rejected.push(error.message); }
+       }
+       for (const file of ["truncated.js", "absent.js"]) {
+         try { evaluate(await tools.read({path: executionRoot + "/scripts/" + file})); throw Error("unexpected source admission"); }
+         catch (error) { if (error.message === "unexpected source admission") throw error; rejected.push(error.message); }
+       }
+       const source = await tools.read({path: executionRoot + "/scripts/verification-recipe-v1.js"});
+       const recipe = evaluate(source);
+       const results = [];
+       for (const file of ["success", "failure", "denied", "escape"]) {
+         results.push(await recipe.run({root: executionRoot, evidenceDir: ${JSON.stringify(recipeEvidence)},
+           selection: {kind:"focused", files:["tests/" + file + ".test.ts"]}}));
+       }
+       text({recipe: results, rejected});`,
     ];
     const ordinaryProvider = await installLocalProvider({
       agentDir, responseForPrompt: () => "ordinary child completed",
-      toolTurns: 5,
+      toolTurns: 6,
       toolForPrompt(_prompt, completed) {
-        return completed < 3 ? { name: "codemode", arguments: { code: scripts[completed] } }
-          : completed === 3 ? { name: "read", arguments: { path: "sample.txt" } }
+        return completed < 4 ? { name: "codemode", arguments: { code: scripts[completed] } }
+          : completed === 4 ? { name: "read", arguments: { path: "sample.txt" } }
           : { name: "bash", arguments: { command: "printf direct-shell" } };
       },
     });
@@ -147,7 +200,7 @@ if (process.argv[2] === "--read") {
     assert.equal(child.status, "completed", child.error);
     assert.equal(child.result, "ordinary child completed");
     const codeResults = events.filter(event => event.toolName === "codemode");
-    assert.equal(codeResults.length, 3);
+    assert.equal(codeResults.length, 4);
     const output = event => event.result.content.filter(part => part.type === "text").map(part => part.text).join("\n");
     assert.match(output(codeResults[0]), /Script completed/);
     assert.match(output(codeResults[0]), /hook transformed read/);
@@ -159,6 +212,41 @@ if (process.argv[2] === "--read") {
     assert(!output(codeResults[1]).includes("unexpected success"));
     assert.match(output(codeResults[2]), /Script failed/);
     assert.match(output(codeResults[2]), /missing.txt/);
+    assert.match(output(codeResults[3]), /Script completed/);
+    const recipeOutput = JSON.parse(output(codeResults[3]).split("\n").find(line => line.startsWith('{"recipe":')));
+    const recipeRuns = recipeOutput.recipe;
+    assert.equal(recipeOutput.rejected.length, 5);
+    assert.match(recipeOutput.rejected[3], /Incomplete verification recipe source/);
+    assert.match(recipeOutput.rejected[4], /absent.js/);
+    assert.deepEqual(recipeRuns.map(run => run.status), ["passed", "failed", "incomplete", "incomplete"]);
+    assert.equal(recipeRuns[0].results[0].exitCode, 0);
+    assert.equal(recipeRuns[1].results[0].exitCode, 1);
+    assert.match(recipeRuns[2].results[0].error, /owned recipe tool denial/);
+    assert.match(recipeRuns[3].results[0].error, /Missing or invalid terminal/);
+    assert.equal(existsSync(recipeRuns[3].results[0].log), false);
+    const recipeLogs = recipeRuns.slice(0, 2).map(run => {
+      const result = run.results[0];
+      const raw = readFileSync(result.log, "utf8");
+      assert.equal(Number(readFileSync(path.join(result.evidenceDir, "exit-code.txt"), "utf8")), result.exitCode);
+      assert.match(readFileSync(path.join(result.evidenceDir, "start.txt"), "utf8"), /^\d{4}-/);
+      assert.match(readFileSync(path.join(result.evidenceDir, "end.txt"), "utf8"), /^\d{4}-/);
+      const invocation = JSON.parse(readFileSync(path.join(result.evidenceDir, "invocation.json"), "utf8"));
+      assert.equal(invocation.root, cwd);
+      assert.deepEqual(invocation.selection, run.selection);
+      return { status: run.status, exitCode: result.exitCode, raw, invocation,
+        environment: readFileSync(path.join(result.evidenceDir, "environment.txt"), "utf8") };
+    });
+    assert.match(recipeLogs[0].raw, /recipe raw success/);
+    assert.match(recipeLogs[1].raw, /recipe raw failure/);
+    assert(hooks.some(event => event.type === "call" && event.name === "read" &&
+      event.input.path === path.join(cwd, "scripts", "verification-recipe-v1.js")));
+    const parallel = spawnSync("bun", ["test", "--parallel", "./tests/success.test.ts", "./tests/parallel.test.ts"], {
+      cwd, encoding: "utf8", timeout: 10000,
+    });
+    assert.equal(parallel.status, 0, parallel.stdout + parallel.stderr);
+    const workerPids = ["success", "parallel"].map(name => readFileSync(path.join(cwd, `${name}.pid`), "utf8"));
+    assert.notEqual(workerPids[0], workerPids[1]);
+    assert(workerPids.every(pid => Number(pid) !== process.pid));
     assert(hooks.some(event => event.type === "call" && event.name === "read" && event.input.path === "blocked.txt"));
     assert(!hooks.some(event => event.type === "call" && event.name === "bash" && !event.input.command));
     assert(hooks.some(event => event.type === "result" && event.name === "read" &&
@@ -187,9 +275,16 @@ if (process.argv[2] === "--read") {
       removedWorktree: true, nativeDirectoryMode: "0700",
       catalogMode: (statSync(path.join(history.catalogDir, `${group.groupId}.json`)).mode & 0o777).toString(8),
       ordinaryChild: { providerCalls: ordinaryProvider.trace.length, codemodeCalls: codeResults.length,
-        actualReadBash: true, hooks: true, validation: true, orchestrationExcluded: true, disposedIdentity: true },
+        actualReadBash: true, hooks: true, validation: true, orchestrationExcluded: true, disposedIdentity: true,
+        recipe: { sourceHash: createHash("sha256").update(recipeSource).digest("hex"), logs: recipeLogs,
+          toolError: recipeRuns[2].status, scopeEscape: recipeRuns[3].status, rejectedSources: recipeOutput.rejected },
+        parallel: { command: "bun test --parallel ./tests/success.test.ts ./tests/parallel.test.ts",
+          exitCode: parallel.status, workerPids, raw: parallel.stdout + parallel.stderr } },
     };
-    if (process.argv[2]) writeFileSync(process.argv[2], `${JSON.stringify(observations, null, 2)}\n`);
+    if (process.argv[2]) {
+      writeFileSync(process.argv[2], `${JSON.stringify(observations, null, 2)}\n`);
+      cpSync(recipeEvidence, process.argv[2] + ".raw", { recursive: true });
+    }
     console.log(JSON.stringify(observations));
   } finally {
     await session?.dispose();

@@ -6,24 +6,40 @@ import { afterEach, describe, expect, test } from "bun:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import board from "../extensions/board/index.ts";
 import { getBoardDbPath, getPiAgentDir, getPitakoDataDir } from "../extensions/board/paths.ts";
-import { openSqlite } from "../extensions/board/sqlite.ts";
+import { openSqlite as openSqliteUnowned } from "../extensions/board/sqlite.ts";
 import {
   BOARD_AUTHOR,
   BOARD_SCOPE,
   LIMITS,
   POST_TYPES,
   SCHEMA_VERSION,
-  openBoard,
+  openBoard as openBoardUnowned,
 } from "../extensions/board/store.ts";
 import { boardWorkspace, currentWorkspace, repositoryIdentity } from "../extensions/board/workspace.ts";
 import { ledgerFile, openExecutionPlan, planFile, readPlan } from "../extensions/workflow.ts";
 import { registerExecution, unregisterExecution } from "../extensions/execution-identity.ts";
 import { recordPlanTeamWork } from "../extensions/team.ts";
 import { packageRoot } from "../extensions/stack.ts";
+import { workspaceCrashOwnership } from "./fixtures/workspace-crash-ownership.ts";
 
 const tempDirs: string[] = [];
+const fixture = workspaceCrashOwnership(tempDirs);
+function ownDatabase<T extends { close(): void }>(db: T): T {
+  const close = db.close.bind(db);
+  let closed = false;
+  db.close = () => {
+    if (closed) return;
+    close();
+    closed = true;
+  };
+  fixture.cleanup(() => db.close());
+  return db;
+}
+const openBoard: typeof openBoardUnowned = async (...args) => ownDatabase(await openBoardUnowned(...args));
+const openSqlite: typeof openSqliteUnowned = async (...args) => ownDatabase(await openSqliteUnowned(...args));
 
 afterEach(() => {
+  fixture.requireReleased();
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -44,6 +60,7 @@ function claimInChild(file: string, topicId: number, root: string): Promise<{ co
   const source = `import { openBoard } from ${JSON.stringify(moduleUrl)}; const board = await openBoard(${JSON.stringify(file)}); try { board.claimTopicExecution("/repo", ${topicId}, "race-plan", { revision: 1, hash: "race-hash", executionRoot: ${JSON.stringify(root)} }); console.log("claimed"); } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; } finally { board.close(); }`;
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, ["-e", source], { stdio: ["ignore", "pipe", "pipe"] });
+    fixture.observeChild(child);
     let stdout = "";
     let stderr = "";
     child.stdout.setEncoding("utf8").on("data", (text) => (stdout += text));
@@ -59,6 +76,7 @@ function transitionInChild(file: string, topicId: number, status: "resolved" | "
   const source = `import { openBoard } from ${JSON.stringify(moduleUrl)}; const board = await openBoard(${JSON.stringify(file)}); try { board.transitionOwnedTopic("/repo", ${topicId}, "race-plan", ${JSON.stringify(status)}, ${JSON.stringify(binding)} ?? undefined); console.log("transitioned"); } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; } finally { board.close(); }`;
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, ["-e", source], { stdio: ["ignore", "pipe", "pipe"] });
+    fixture.observeChild(child);
     let stdout = "";
     let stderr = "";
     child.stdout.setEncoding("utf8").on("data", (text) => (stdout += text));
@@ -80,15 +98,15 @@ function gitWorktreePair(executionName = "execution"): { source: string; executi
 }
 
 describe("board paths", () => {
-  test("default path is ~/.pi/agent/pitako/board.db and does not create it", () => {
+  test("default path is ~/.pi/agent/pitako/board.db and does not create it", fixture.ownedCase("default path is ~/.pi/agent/pitako/board.db and does not create it", () => {
     const env = {} as NodeJS.ProcessEnv;
     expect(getPiAgentDir(env)).toBe(path.join(homedir(), ".pi", "agent"));
     expect(getPitakoDataDir(env)).toBe(path.join(homedir(), ".pi", "agent", "pitako"));
     expect(getBoardDbPath(env)).toBe(path.join(homedir(), ".pi", "agent", "pitako", "board.db"));
     expect(getBoardDbPath(env)).not.toContain(tmpdir());
-  });
+  }));
 
-  test("PI_CODING_AGENT_DIR wins, including relative and tilde paths", () => {
+  test("PI_CODING_AGENT_DIR wins, including relative and tilde paths", fixture.ownedCase("PI_CODING_AGENT_DIR wins, including relative and tilde paths", () => {
     const agent = tempDir("pitako-board-agent-");
     expect(getBoardDbPath({ PI_CODING_AGENT_DIR: agent })).toBe(path.join(agent, "pitako", "board.db"));
 
@@ -99,11 +117,11 @@ describe("board paths", () => {
 
     const tilde = getPiAgentDir({ PI_CODING_AGENT_DIR: "~/pitako-board-tilde" });
     expect(tilde).toBe(path.join(homedir(), "pitako-board-tilde"));
-  });
+  }));
 });
 
 describe("workspace", () => {
-  test("uses the git root, including from a subdirectory, and isolates other directories", () => {
+  test("uses the git root, including from a subdirectory, and isolates other directories", fixture.ownedCase("uses the git root, including from a subdirectory, and isolates other directories", () => {
     const repo = gitRepo();
     const nested = path.join(repo, "src");
     mkdirSync(nested);
@@ -118,17 +136,17 @@ describe("workspace", () => {
     expect(currentWorkspace(link)).toBe(currentWorkspace(repo));
     expect(repositoryIdentity(repo)).toBe(path.join(repo, ".git"));
     expect(repositoryIdentity(repo)).not.toBe(repositoryIdentity(other));
-  });
+  }));
 
-  test("rejects unresolved registered worktrees before Board family migration", () => {
+  test("rejects unresolved registered worktrees before Board family migration", fixture.ownedCase("rejects unresolved registered worktrees before Board family migration", () => {
     const { source, execution } = gitWorktreePair();
     rmSync(execution, { recursive: true, force: true });
     expect(() => boardWorkspace(source)).toThrow(/registered worktree .* is unavailable/);
-  });
+  }));
 });
 
 describe("board store", () => {
-  test("initializes schema v3, migrates v1 data, and refuses incomplete schemas", async () => {
+  test("initializes schema v3, migrates v1 data, and refuses incomplete schemas", fixture.ownedCase("initializes schema v3, migrates v1 data, and refuses incomplete schemas", async () => {
     const file = path.join(tempDir("pitako-board-db-"), "board.db");
     const boardDb = await openBoard(file);
     const other = await openSqlite(file);
@@ -162,9 +180,9 @@ describe("board store", () => {
     writeFileSync(corrupt, "not sqlite");
     await expect(openBoard(corrupt)).rejects.toThrow(/initialization failed/);
     expect(readFileSync(corrupt, "utf8")).toBe("not sqlite");
-  });
+  }));
 
-  test("migrates v1 rows and serializes competing claims", async () => {
+  test("migrates v1 rows and serializes competing claims", fixture.ownedCase("migrates v1 rows and serializes competing claims", async () => {
     const file = path.join(tempDir("pitako-board-migrate-"), "board.db");
     const initial = await openBoard(file);
     const topic = initial.createTopic("/repo", { title: "legacy" });
@@ -205,9 +223,9 @@ describe("board store", () => {
     expect(() => left.transitionOwnedTopic("/repo", topic.id, owner!, "resolved")).toThrow(/cannot transition closed/);
     left.close();
     right.close();
-  });
+  }));
 
-  test("migrates v2 topic identity columns without losing owners or posts", async () => {
+  test("migrates v2 topic identity columns without losing owners or posts", fixture.ownedCase("migrates v2 topic identity columns without losing owners or posts", async () => {
     const file = path.join(tempDir("pitako-board-v2-"), "board.db");
     const initial = await openBoard(file);
     const topic = initial.createTopic("/legacy", { title: "v2" });
@@ -230,9 +248,9 @@ describe("board store", () => {
     expect(page.topic.executionRoot).toBeNull();
     expect(page.posts.map((post) => post.content)).toEqual(["kept"]);
     migrated.close();
-  });
+  }));
 
-  test("family migration preserves topic IDs and rolls back owner collisions", async () => {
+  test("family migration preserves topic IDs and rolls back owner collisions", fixture.ownedCase("family migration preserves topic IDs and rolls back owner collisions", async () => {
     const { source, execution } = gitWorktreePair();
     const other = gitRepo();
     const board = await openBoard(path.join(tempDir("pitako-board-family-"), "board.db"));
@@ -259,9 +277,9 @@ describe("board store", () => {
     expect(migrated.posts.map((item) => item.content)).toEqual(["preserve"]);
     expect(clean.readTopic(currentWorkspace(other), 2).topic.workspace).toBe(currentWorkspace(other));
     clean.close();
-  });
+  }));
 
-  test("claims one frozen execution identity with idempotent same-root retries", async () => {
+  test("claims one frozen execution identity with idempotent same-root retries", fixture.ownedCase("claims one frozen execution identity with idempotent same-root retries", async () => {
     const file = path.join(tempDir("pitako-board-execution-claim-"), "board.db");
     const left = await openBoard(file);
     const right = await openBoard(file);
@@ -277,9 +295,9 @@ describe("board store", () => {
     expect(() => right.claimTopicExecution("/repo", topic.id, "plan", { revision: 2, hash: "frozen-hash", executionRoot: "/execution-b" })).toThrow(/pinned to execution worktree/);
     left.close();
     right.close();
-  });
+  }));
 
-  test("preserves trailing spaces in a real Git worktree execution root", async () => {
+  test("preserves trailing spaces in a real Git worktree execution root", fixture.ownedCase("preserves trailing spaces in a real Git worktree execution root", async () => {
     const { execution } = gitWorktreePair("execution ");
     expect(currentWorkspace(execution)).toBe(execution);
     const board = await openBoard(path.join(tempDir("pitako-board-trailing-root-"), "board.db"));
@@ -302,9 +320,9 @@ describe("board store", () => {
       planRevision: null, planHash: null, executionRoot: null,
     });
     board.close();
-  });
+  }));
 
-  test("concurrent processes can claim one physical execution root only", async () => {
+  test("concurrent processes can claim one physical execution root only", fixture.ownedCase("concurrent processes can claim one physical execution root only", async () => {
     const file = path.join(tempDir("pitako-board-claim-race-"), "board.db");
     const board = await openBoard(file);
     const topic = board.createTopic("/repo", { title: "concurrent claim" });
@@ -321,9 +339,9 @@ describe("board store", () => {
     const checked = await openBoard(file);
     expect(["/execution-a", "/execution-b"].includes(checked.readTopic("/repo", topic.id).topic.executionRoot ?? "")).toBe(true);
     checked.close();
-  });
+  }));
 
-  test("cross-process close and resolve leave no claim when resolution loses the race", async () => {
+  test("cross-process close and resolve leave no claim when resolution loses the race", fixture.ownedCase("cross-process close and resolve leave no claim when resolution loses the race", async () => {
     const file = path.join(tempDir("pitako-board-lifecycle-race-"), "board.db");
     const board = await openBoard(file);
     const topic = board.createTopic("/repo", { title: "lifecycle race" });
@@ -345,9 +363,9 @@ describe("board store", () => {
       expect(result).toMatchObject({ planRevision: null, planHash: null, executionRoot: null });
     }
     checked.close();
-  });
+  }));
 
-  test("isolates workspaces, pages posts, and round-trips every post type", async () => {
+  test("isolates workspaces, pages posts, and round-trips every post type", fixture.ownedCase("isolates workspaces, pages posts, and round-trips every post type", async () => {
     const file = path.join(tempDir("pitako-board-work-"), "board.db");
     const db = await openBoard(file);
     const topic = db.createTopic("/repo-a", { title: "Board persistence", description: "where the file lives" });
@@ -421,9 +439,9 @@ describe("board store", () => {
       note: "later",
     });
     reopened.close();
-  });
+  }));
 
-  test("bounds list, read, and query results and pages a long topic", async () => {
+  test("bounds list, read, and query results and pages a long topic", fixture.ownedCase("bounds list, read, and query results and pages a long topic", async () => {
     expect(LIMITS).toEqual({ listDefault: 20, listMax: 50, readDefault: 40, readMax: 100, queryDefault: 20, queryMax: 50 });
     const db = await openBoard(path.join(tempDir("pitako-board-page-"), "board.db"));
     for (let index = 0; index < LIMITS.listDefault + 1; index += 1) {
@@ -469,9 +487,9 @@ describe("board store", () => {
     expect(found.capped).toBe(true);
     expect(found.total).toBe(LIMITS.queryMax + 1);
     db.close();
-  });
+  }));
 
-  test("two connections can write and a new process can read the same file", async () => {
+  test("two connections can write and a new process can read the same file", fixture.ownedCase("two connections can write and a new process can read the same file", async () => {
     const file = path.join(tempDir("pitako-board-concurrent-"), "board.db");
     const left = await openBoard(file);
     const right = await openBoard(file);
@@ -509,7 +527,7 @@ describe("board store", () => {
       encoding: "utf8",
     });
     expect(JSON.parse(child)).toEqual(["from the other connection", "from the first connection"]);
-  });
+  }));
 });
 
 interface ToolResult {
@@ -572,7 +590,7 @@ describe("board tools", () => {
     else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
   });
 
-  test("rejected frozen resolution leaves an unclaimed closed topic unchanged", async () => {
+  test("rejected frozen resolution leaves an unclaimed closed topic unchanged", fixture.ownedCase("rejected frozen resolution leaves an unclaimed closed topic unchanged", async () => {
     process.env.PI_CODING_AGENT_DIR = tempDir("pitako-board-lifecycle-rollback-");
     const repo = gitRepo();
     const planId = "closed-frozen-topic";
@@ -602,9 +620,9 @@ describe("board tools", () => {
     verified.close();
     expect(readFileSync(plan, "utf8")).toBe(planBefore);
     expect(readFileSync(opened.ledger, "utf8")).toBe(ledgerBefore);
-  });
+  }));
 
-  test("workflow claim and lifecycle require exact plan binding and foreground ownership", async () => {
+  test("workflow claim and lifecycle require exact plan binding and foreground ownership", fixture.ownedCase("workflow claim and lifecycle require exact plan binding and foreground ownership", async () => {
     const agentDir = tempDir("pitako-board-workflow-tools-");
     process.env.PI_CODING_AGENT_DIR = agentDir;
     const repo = gitRepo();
@@ -750,9 +768,9 @@ describe("board tools", () => {
     writeFileSync(expectedLedger, `---\nplan_id: expected-plan\nrevision: 1\nhash: ${expectedMeta.hash}\nstatus: completed\n---\n\n## Team Holds\n\n<!-- pitako-team-holds:v1 -->\n[]\n<!-- /pitako-team-holds -->\n`);
     const completed = await lifecycle.execute("completed", { planId: "expected-plan", status: "resolved" }, undefined, undefined, { cwd: repo });
     expect(completed.details?.status).toBe("resolved");
-  });
+  }));
 
-  test("board post guidance defines every type and rejects progress logging", () => {
+  test("board post guidance defines every type and rejects progress logging", fixture.ownedCase("board post guidance defines every type and rejects progress logging", () => {
     const { guidance } = registeredBoard();
     const post = guidance.get("board_post");
     const text = `${post?.description ?? ""} ${(post?.promptGuidelines ?? []).join(" ")}`;
@@ -767,9 +785,9 @@ describe("board tools", () => {
       "Ledger and evidence own progress",
       "Board stays pull-based",
     ]) expect(text).toContain(expected);
-  });
+  }));
 
-  test("sibling worktree sees legacy topic and posts under same ID without copying", async () => {
+  test("sibling worktree sees legacy topic and posts under same ID without copying", fixture.ownedCase("sibling worktree sees legacy topic and posts under same ID without copying", async () => {
     agentDir = tempDir("pitako-board-family-tools-");
     process.env.PI_CODING_AGENT_DIR = agentDir;
     const { source, execution } = gitWorktreePair();
@@ -798,9 +816,9 @@ describe("board tools", () => {
     expect(verify.readTopic(repositoryIdentity(source), legacy.id).posts.map((item) => item.id)).toEqual([post.id]);
     expect(verify.readTopic(currentWorkspace(unrelated), other.id).topic.workspace).toBe(currentWorkspace(unrelated));
     verify.close();
-  });
+  }));
 
-  test("tools stay pull-based and cannot see another workspace", async () => {
+  test("tools stay pull-based and cannot see another workspace", fixture.ownedCase("tools stay pull-based and cannot see another workspace", async () => {
     agentDir = tempDir("pitako-board-tools-");
     if (!agentDir.startsWith(tmpdir())) throw new Error(`refusing to use agent dir ${agentDir}`);
     process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -903,13 +921,13 @@ describe("board tools", () => {
     });
     expect(notices.join("\n")).toContain("[resolved] Board persistence");
     expect(notices.join("\n")).toContain("DECISION");
-  });
+  }));
 });
 
 function startPi(cwd: string, agentDir: string): {
   child: ChildProcessWithoutNullStreams;
   request(command: Record<string, unknown>): Promise<unknown[]>;
-  stop(): void;
+  stop(): Promise<void>;
 } {
   const child = spawn(
     "pi",
@@ -925,6 +943,7 @@ function startPi(cwd: string, agentDir: string): {
       stdio: ["pipe", "pipe", "pipe"],
     },
   );
+  const observed = fixture.observeChild(child);
   let stderr = "";
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk: string) => {
@@ -980,14 +999,15 @@ function startPi(cwd: string, agentDir: string): {
       }
       throw new Error(`pi rpc produced no response\n${JSON.stringify(events)}\nstderr:\n${stderr}`);
     },
-    stop() {
+    async stop() {
       child.kill("SIGTERM");
+      await observed.closed();
     },
   };
 }
 
 describe("pi process", () => {
-  test("a real Pi session exposes /board and still sees the topic after reload", async () => {
+  test("a real Pi session exposes /board and still sees the topic after reload", fixture.ownedCase("a real Pi session exposes /board and still sees the topic after reload", async () => {
     const agentDir = tempDir("pitako-board-pi-");
     const previous = process.env.PI_CODING_AGENT_DIR;
     process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -1015,7 +1035,7 @@ describe("pi process", () => {
         const listed = await first.request({ type: "prompt", message: "/board" });
         expect(JSON.stringify(listed)).toContain("Reload proof");
       } finally {
-        first.stop();
+        await first.stop();
       }
 
       const second = startPi(repo, agentDir);
@@ -1025,11 +1045,11 @@ describe("pi process", () => {
         expect(body).toContain("Reload proof");
         expect(body).toContain("sqlite file survives a new Pi process");
       } finally {
-        second.stop();
+        await second.stop();
       }
     } finally {
       if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previous;
     }
-  }, 60_000);
+  }), 60_000);
 });

@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { agentFixtureOwnership } from "./fixtures/agent-fixture-ownership.ts";
+import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -19,11 +20,17 @@ import { setBackgroundExecutor } from "../extensions/agent/background.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import pitako from "../extensions/index.ts";
 
+// File-local integration bound: parallel Git/agent setup must finish before
+// Bun interrupts subprocesses; callback ownership still governs cleanup.
+setDefaultTimeout(30_000);
+
 const evaluations = new Set<ReturnType<typeof beginTeamEvaluation>>();
-const tempDirs: string[] = [];
+const fixture = agentFixtureOwnership();
+const tempDirs = fixture.directories;
 let previousAgentDir: string | undefined;
 
 afterEach(() => {
+  fixture.requireReleasedFixture();
   for (const evaluation of evaluations) retireTeamEvaluation(evaluation);
   evaluations.clear();
   clearBackgroundOwner();
@@ -45,7 +52,7 @@ function hanging(): { executor: AttemptExecutor; started: Promise<void>; finish:
   let start!: () => void;
   let finish!: (attempt: Attempt) => void;
   const started = new Promise<void>((resolve) => (start = resolve));
-  const result = new Promise<Attempt>((resolve) => (finish = resolve));
+  const result = fixture.pendingAttempt((resolve) => (finish = resolve));
   const state: { signal?: AbortSignal } = {};
   return {
     started,
@@ -103,7 +110,7 @@ async function spawn(evaluation: NonNullable<ReturnType<typeof beginTeamEvaluati
 const completed = (result = "done"): Attempt => ({ status: "completed", result, sideEffects: false });
 
 describe("Team T1 ownership", () => {
-  test("ledger holds are exact, durable, and fail closed", () => {
+  test("ledger holds are exact, durable, and fail closed", fixture.ownedCase("ledger holds are exact, durable, and fail closed", () => {
     const cwd = mkdtempSync(path.join(tmpdir(), "pitako-team-holds-"));
     tempDirs.push(cwd);
     const plan = planFile("persisted-plan", cwd);
@@ -128,9 +135,9 @@ describe("Team T1 ownership", () => {
     rmSync(ledger);
     expect(() => hasUnsettledTeamWork(undefined, "persisted-plan", cwd)).toThrow("ledger is missing");
     expect(() => recordPlanTeamWork(cwd, "persisted-plan", "unit-e", "blocked", "pending")).toThrow("ledger is missing");
-  });
+  }));
 
-  test("no-topic plans do not create a ledger or sidecar", () => {
+  test("no-topic plans do not create a ledger or sidecar", fixture.ownedCase("no-topic plans do not create a ledger or sidecar", () => {
     const cwd = mkdtempSync(path.join(tmpdir(), "pitako-team-no-topic-"));
     tempDirs.push(cwd);
     const plan = planFile("no-topic", cwd);
@@ -139,8 +146,8 @@ describe("Team T1 ownership", () => {
     recordPlanTeamWork(cwd, "no-topic", "unit", "assignment", "pending");
     expect(existsSync(path.join(path.dirname(ledgerFile("no-topic", cwd)), "team-state.json"))).toBe(false);
     expect(existsSync(ledgerFile("no-topic", cwd))).toBe(false);
-  });
-  test("reserves one assignment per role, allows other roles, and keeps cancellation occupied until settle", async () => {
+  }));
+  test("reserves one assignment per role, allows other roles, and keeps cancellation occupied until settle", fixture.ownedCase("reserves one assignment per role, allows other roles, and keeps cancellation occupied until settle", async () => {
     const current = evaluation("team-session-race");
     bindBackgroundOwner(owner(current.token));
     const developer = reserveTeamRole(current, "developer", "assignment-dev");
@@ -170,9 +177,9 @@ describe("Team T1 ownership", () => {
     reused.rollback();
     expect(workerStatus()).toEqual([]);
     expect(() => teamWorkerStatus(Symbol("foreign"), dev.instanceId)).toThrow("unknown Team worker");
-  });
+  }));
 
-  test("overlapping foreground leases deliver Team wakes only to their owning session", async () => {
+  test("overlapping foreground leases deliver Team wakes only to their owning session", fixture.ownedCase("overlapping foreground leases deliver Team wakes only to their owning session", async () => {
     const first = evaluation("team-overlap-one");
     const second = evaluation("team-overlap-two");
     const firstMessages: string[] = [];
@@ -196,9 +203,9 @@ describe("Team T1 ownership", () => {
     expect(secondMessages[0]).toContain("Use team_result");
     expect(firstMessages[0]).not.toContain(secondHandle.instanceId);
     expect(secondMessages[0]).not.toContain(firstHandle.instanceId);
-  });
+  }));
 
-  test("same-session reload retires only old Team rows and makes late settlement inert", async () => {
+  test("same-session reload retires only old Team rows and makes late settlement inert", fixture.ownedCase("same-session reload retires only old Team rows and makes late settlement inert", async () => {
     const old = evaluation("team-session-reload");
     bindBackgroundOwner(owner(old.token));
     const admission = reserveTeamRole(old, "developer", "old-assignment");
@@ -218,9 +225,9 @@ describe("Team T1 ownership", () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(teamRoleReservation(fresh, "developer")).toBeUndefined();
     expect(listObservations()).toEqual([]);
-  });
+  }));
 
-  test("session leases and tagged rows cannot cross session boundaries", async () => {
+  test("session leases and tagged rows cannot cross session boundaries", fixture.ownedCase("session leases and tagged rows cannot cross session boundaries", async () => {
     const first = evaluation("team-session-one");
     const second = evaluation("team-session-two");
     const admission = reserveTeamRole(first, "architect", "first-assignment");
@@ -245,9 +252,9 @@ describe("Team T1 ownership", () => {
     worker.finish(completed());
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(teamWorkerStatus(first.token)).toEqual([]);
-  });
+  }));
 
-  test("watched planning assignments deliver isolated completion wakes across busy and idle turns", async () => {
+  test("watched planning assignments deliver isolated completion wakes across busy and idle turns", fixture.ownedCase("watched planning assignments deliver isolated completion wakes across busy and idle turns", async () => {
     const config = load();
     previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     process.env.PI_CODING_AGENT_DIR = config.env.PI_CODING_AGENT_DIR;
@@ -255,7 +262,7 @@ describe("Team T1 ownership", () => {
     setBackgroundExecutor({
       async start(input) {
         let finish!: (attempt: Attempt) => void;
-        const result = new Promise<Attempt>((resolve) => (finish = resolve));
+        const result = fixture.pendingAttempt((resolve) => (finish = resolve));
         workers.push({ task: input.task, finish });
         return result;
       },
@@ -332,9 +339,9 @@ describe("Team T1 ownership", () => {
     expect(architectWakes[0]?.message.content).not.toContain(researcher.id);
     expect(architectWakes[0]?.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
     expect(sent).toHaveLength(2);
-  });
+  }));
 
-  test("public Team tools accept concurrent roles, isolate low-level controls, and cap results", async () => {
+  test("public Team tools accept concurrent roles, isolate low-level controls, and cap results", fixture.ownedCase("public Team tools accept concurrent roles, isolate low-level controls, and cap results", async () => {
     const current = evaluation("team-public-tools");
     let idle = false;
     const wakes: string[] = [];
@@ -350,7 +357,7 @@ describe("Team T1 ownership", () => {
         let start!: () => void;
         let finish!: (attempt: Attempt) => void;
         const started = new Promise<void>((resolve) => (start = resolve));
-        const result = new Promise<Attempt>((resolve) => (finish = resolve));
+        const result = fixture.pendingAttempt((resolve) => (finish = resolve));
         workers.push({ task: input.task, started, finish });
         start();
         return result;
@@ -433,9 +440,9 @@ describe("Team T1 ownership", () => {
     workers.at(-1)!.finish({ status: "cancelled", result: "cancelled", sideEffects: false });
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(((await invoke("team_status", { assignmentId: reviewer.id })).details as any).roles[0].resultAvailable).toBe(true);
-  });
+  }));
 
-  test("team_result returns stable per-assignment execution summaries after consumption", async () => {
+  test("team_result returns stable per-assignment execution summaries after consumption", fixture.ownedCase("team_result returns stable per-assignment execution summaries after consumption", async () => {
     const current = evaluation("team-execution-summary");
     bindBackgroundOwner(owner(current.token));
     const config = load();
@@ -447,7 +454,7 @@ describe("Team T1 ownership", () => {
     setBackgroundExecutor({
       start(input) {
         if (input.role.id === "developer") input.onActivated?.("high");
-        return new Promise<Attempt>((resolve) => workers.push({ role: input.role.id, model: input.target.model, finish: resolve }));
+        return fixture.pendingAttempt((resolve) => workers.push({ role: input.role.id, model: input.target.model, finish: resolve }));
       },
     });
     const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
@@ -499,9 +506,9 @@ describe("Team T1 ownership", () => {
       turns: null, toolCalls: null, tools: null,
     });
     expect(researcherRead.content[0].text).toContain("cache_read=unavailable");
-  });
+  }));
 
-  test("watched Team assignments inherit only a validated plan topic", async () => {
+  test("watched Team assignments inherit only a validated plan topic", fixture.ownedCase("watched Team assignments inherit only a validated plan topic", async () => {
     const cwd = mkdtempSync(path.join(tmpdir(), "pitako-team-binding-"));
     tempDirs.push(cwd);
     const config = load();
@@ -550,7 +557,7 @@ describe("Team T1 ownership", () => {
     const finishes: ((attempt: Attempt) => void)[] = [];
     setBackgroundExecutor({ async start(input) {
       tasks.push(input.task);
-      return new Promise<Attempt>((resolve) => finishes.push(resolve));
+      return fixture.pendingAttempt((resolve) => finishes.push(resolve));
     } });
     const invoke = (params: unknown) => tools.get("team_assign")!.execute("call", params, new AbortController().signal, undefined, {
       cwd, sessionManager: { getSessionId: () => current.sessionId },
@@ -588,9 +595,9 @@ describe("Team T1 ownership", () => {
     topicsAfterDispatch.close();
     finishes.forEach((finish) => finish(completed()));
     await new Promise((resolve) => setTimeout(resolve, 20));
-  });
+  }));
 
-  test("all Team roles inherit the execution worktree from a sibling frozen plan", async () => {
+  test("all Team roles inherit the execution worktree from a sibling frozen plan", fixture.ownedCase("all Team roles inherit the execution worktree from a sibling frozen plan", async () => {
     const base = mkdtempSync(path.join(tmpdir(), "pitako-team-execution-root-"));
     tempDirs.push(base);
     const { source, execution } = initWorktreePair(base);
@@ -606,7 +613,7 @@ describe("Team T1 ownership", () => {
     agentExtension({ registerTool: (tool: any) => tools.set(tool.name, tool) } as unknown as ExtensionAPI);
     const workers: { cwd: string; finish: (attempt: Attempt) => void }[] = [];
     setBackgroundExecutor({ async start(input) {
-      return new Promise<Attempt>((resolve) => workers.push({ cwd: input.cwd, finish: resolve }));
+      return fixture.pendingAttempt((resolve) => workers.push({ cwd: input.cwd, finish: resolve }));
     } });
     const ctx = { cwd: execution, sessionManager: { getSessionId: () => current.sessionId } };
     for (const role of ["architect", "developer", "reviewer", "researcher"]) {
@@ -622,9 +629,9 @@ describe("Team T1 ownership", () => {
     expect(existsSync(ledgerFile(id, execution))).toBe(true);
     workers.forEach((worker) => worker.finish(completed()));
     await new Promise((resolve) => setTimeout(resolve, 20));
-  });
+  }));
 
-  test("cold concurrent watched assignments admit only one execution root", async () => {
+  test("cold concurrent watched assignments admit only one execution root", fixture.ownedCase("cold concurrent watched assignments admit only one execution root", async () => {
     const base = mkdtempSync(path.join(tmpdir(), "pitako-team-cold-admission-"));
     tempDirs.push(base);
     const { source, execution: executionA } = initWorktreePair(base);
@@ -679,9 +686,9 @@ describe("Team T1 ownership", () => {
     expect(started).toEqual([assignment.execution.executionRoot, executionA]);
     expect(existsSync(ledgerFile(sequentialId, executionA))).toBe(true);
     expect(existsSync(ledgerFile(sequentialId, executionB))).toBe(false);
-  });
+  }));
 
-  test("failed Team assignment leaves topic unpinned until ledger admission succeeds", async () => {
+  test("failed Team assignment leaves topic unpinned until ledger admission succeeds", fixture.ownedCase("failed Team assignment leaves topic unpinned until ledger admission succeeds", async () => {
     const base = mkdtempSync(path.join(tmpdir(), "pitako-team-topic-admission-"));
     tempDirs.push(base);
     const { source, execution: executionA } = initWorktreePair(base);
@@ -728,9 +735,9 @@ describe("Team T1 ownership", () => {
     const afterAccept = await openBoard();
     expect(afterAccept.readTopic(repositoryIdentity(executionB), topic.id).topic.executionRoot).toBe(executionB);
     afterAccept.close();
-  });
+  }));
 
-  test("Team result and lifecycle keep using captured execution ledger after cwd changes", async () => {
+  test("Team result and lifecycle keep using captured execution ledger after cwd changes", fixture.ownedCase("Team result and lifecycle keep using captured execution ledger after cwd changes", async () => {
     const base = mkdtempSync(path.join(tmpdir(), "pitako-team-result-root-"));
     tempDirs.push(base);
     const { source, execution } = initWorktreePair(base, "execution ");
@@ -756,7 +763,7 @@ describe("Team T1 ownership", () => {
     let workerCwd = "";
     setBackgroundExecutor({ async start(input) {
       workerCwd = input.cwd;
-      return new Promise<Attempt>((resolve) => (finish = resolve));
+      return fixture.pendingAttempt((resolve) => (finish = resolve));
     } });
     const executionCtx = { cwd: execution, sessionManager: { getSessionId: () => current.sessionId } };
     const assigned = await tools.get("team_assign")!.execute("call", {
@@ -799,9 +806,9 @@ describe("Team T1 ownership", () => {
     const finalBoard = await openBoard();
     expect(finalBoard.readTopic(repositoryIdentity(execution), topic.id).topic.status).toBe("resolved");
     finalBoard.close();
-  });
+  }));
 
-  test("lifecycle rejects leave execution topic unpinned and allow execution from B", async () => {
+  test("lifecycle rejects leave execution topic unpinned and allow execution from B", fixture.ownedCase("lifecycle rejects leave execution topic unpinned and allow execution from B", async () => {
     const base = mkdtempSync(path.join(tmpdir(), "pitako-lifecycle-topic-preflight-"));
     tempDirs.push(base);
     const { source, execution } = initWorktreePair(base);
@@ -874,9 +881,9 @@ describe("Team T1 ownership", () => {
       status: "closed", planRevision: null, planHash: null, executionRoot: null,
     });
     afterClose.close();
-  });
+  }));
 
-  test("T4 migrates A topic into family, pins Team B, and lifecycle reload validates B ledger", async () => {
+  test("T4 migrates A topic into family, pins Team B, and lifecycle reload validates B ledger", fixture.ownedCase("T4 migrates A topic into family, pins Team B, and lifecycle reload validates B ledger", async () => {
     const base = mkdtempSync(path.join(tmpdir(), "pitako-team-family-lifecycle-"));
     tempDirs.push(base);
     const { source, execution } = initWorktreePair(base);
@@ -899,7 +906,7 @@ describe("Team T1 ownership", () => {
     boardExtension({ registerTool: (tool: any) => tools.set(tool.name, tool), registerFlag() {}, registerCommand() {}, on() {} } as unknown as ExtensionAPI);
     agentExtension({ registerTool: (tool: any) => tools.set(tool.name, tool) } as unknown as ExtensionAPI);
     let finish!: (attempt: Attempt) => void;
-    setBackgroundExecutor({ async start() { return new Promise<Attempt>((resolve) => (finish = resolve)); } });
+    setBackgroundExecutor({ async start() { return fixture.pendingAttempt((resolve) => (finish = resolve)); } });
     const context = { cwd: execution, sessionManager: { getSessionId: () => current.sessionId } };
     const assigned = await tools.get("team_assign")!.execute("assign", {
       role: "developer", task: "work from B", plan: id, unit: "T4",
@@ -948,9 +955,9 @@ describe("Team T1 ownership", () => {
     const finalBoard = await openBoard();
     expect(finalBoard.readTopic(repositoryIdentity(execution), topic.id).topic.status).toBe("resolved");
     finalBoard.close();
-  });
+  }));
 
-  test("Team B refuses a Board topic already pinned to physical root A before ledger changes", async () => {
+  test("Team B refuses a Board topic already pinned to physical root A before ledger changes", fixture.ownedCase("Team B refuses a Board topic already pinned to physical root A before ledger changes", async () => {
     const base = mkdtempSync(path.join(tmpdir(), "pitako-team-foreign-root-"));
     tempDirs.push(base);
     const { source, execution } = initWorktreePair(base);
@@ -985,9 +992,9 @@ describe("Team T1 ownership", () => {
     const checked = await openBoard();
     expect(checked.readTopic(repositoryIdentity(execution), topic.id).topic.executionRoot).toBe(source);
     checked.close();
-  });
+  }));
 
-  test("/pitako team is compact, stable, session-scoped, and does not create a roster", async () => {
+  test("/pitako team is compact, stable, session-scoped, and does not create a roster", fixture.ownedCase("/pitako team is compact, stable, session-scoped, and does not create a roster", async () => {
     const current = evaluation("team-command-inspect");
     let handler: ((args: string, ctx: any) => Promise<void>) | undefined;
     pitako({
@@ -1010,9 +1017,9 @@ describe("Team T1 ownership", () => {
     ]);
     expect(hasTeamRoster(current)).toBe(false);
     expect(notes.join(" ")).not.toContain("transcript");
-  });
+  }));
 
-  test("missing and child identities fail closed; preaccept rollback leaves no roster", () => {
+  test("missing and child identities fail closed; preaccept rollback leaves no roster", fixture.ownedCase("missing and child identities fail closed; preaccept rollback leaves no roster", () => {
     expect(beginTeamEvaluation(undefined, false)).toBeUndefined();
     expect(beginTeamEvaluation("team-child", true)).toBeUndefined();
     registerExecution({ instanceId: "developer-child", roleId: "developer", sessionId: "registered-child-session" });
@@ -1024,5 +1031,5 @@ describe("Team T1 ownership", () => {
     expect(hasTeamRoster(current)).toBe(false);
     expect(teamRoleReservation(current, "reviewer")).toBeUndefined();
     expect(() => reserveTeamRole({ ...current, token: Symbol("stale") }, "reviewer", "stale")).toThrow("stale Team evaluation");
-  });
+  }));
 });

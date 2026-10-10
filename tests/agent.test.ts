@@ -1,4 +1,5 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { agentFixtureOwnership } from "./fixtures/agent-fixture-ownership.ts";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -20,13 +21,15 @@ import pitako from "../extensions/index.ts";
 import { resolveRole } from "../extensions/roles/load.ts";
 import type { ModelTarget } from "../extensions/roles/types.ts";
 import { packageRoot } from "../extensions/stack.ts";
-import { loadPitako, registeredToolNames } from "../scripts/load-pitako.ts";
+import { registeredToolNames } from "../scripts/load-pitako.ts";
+import { loadPitako } from "./fixtures/owned-pitako.ts";
 import { completeTool, emptyCodeIntelligenceUsage } from "../extensions/code-intelligence/metrics.ts";
 import type { DenseCallUsage } from "../extensions/code-intelligence/metrics.ts";
 
-const tempDirs: string[] = [];
+const fixture = agentFixtureOwnership();
+const tempDirs = fixture.directories;
 afterEach(() => {
-  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  fixture.requireReleasedFixture();
 });
 
 function envFor(dir: string): NodeJS.ProcessEnv {
@@ -65,7 +68,7 @@ function scripted(attempts: Attempt[]): AttemptExecutor & { starts: string[]; no
 }
 
 describe("agent instance", () => {
-  test("pre-prompt capability routes complete targets without restart or continuation", async () => {
+  test("pre-prompt capability routes complete targets without restart or continuation", fixture.ownedCase("pre-prompt capability routes complete targets without restart or continuation", async () => {
     const targets: ModelTarget[] = [{ model: "offline/primary", reasoning: "high", fast: false },
       { model: "offline/fallback", reasoning: "off", fast: true }];
     const task = "ordinary task";
@@ -100,9 +103,9 @@ describe("agent instance", () => {
       fallbackOccurred: true, fallbackReason: "unavailable" });
     expect(result.usage).toMatchObject({ input: 4, output: 6 });
     expect({ starts, retries, continuations, disposals }).toEqual({ starts: 1, retries: 1, continuations: 0, disposals: 1 });
-  });
+  }));
 
-  test("watchdog terminal return still disposes newly returned attempt ownership", async () => {
+  test("watchdog terminal return still disposes newly returned attempt ownership", fixture.ownedCase("watchdog terminal return still disposes newly returned attempt ownership", async () => {
     let clock = 0, tick: (() => void) | undefined, disposed = 0;
     const env = tempEnv();
     const userConfigPath = path.join(env.PI_CODING_AGENT_DIR!, "pitako", "config.toml");
@@ -122,8 +125,8 @@ describe("agent instance", () => {
     expect(result.status).toBe("failed");
     expect(result.result).toContain("max runtime");
     expect(disposed).toBe(1);
-  });
-  test("execution summary distinguishes unavailable values from reported zero", () => {
+  }));
+  test("execution summary distinguishes unavailable values from reported zero", fixture.ownedCase("execution summary distinguishes unavailable values from reported zero", () => {
     const result: AgentRunResult = {
       instanceId: "developer-summary", role: "developer", status: "completed", model: { selectedModel: "local/model" }, result: "done",
       watchdog: { elapsedMs: 10, lastActivityKind: "turn", inactivityMs: 0, phase: "working" },
@@ -136,9 +139,9 @@ describe("agent instance", () => {
     });
     const zeros = teamExecutionSummary("zero-assignment", { ...result, usage: { input: 0, output: 0, cost: 0, turns: 0, toolCalls: 0, tools: {} } });
     expect(zeros).toMatchObject({ input: 0, output: 0, estimatedCost: 0, turns: 0, toolCalls: 0, tools: {} });
-  });
+  }));
 
-  test("usage adds failed attempts and cancel keeps the last attempted target", async () => {
+  test("usage adds failed attempts and cancel keeps the last attempted target", fixture.ownedCase("usage adds failed attempts and cancel keeps the last attempted target", async () => {
     const env = tempEnv();
     const configured = { env, userConfigPath: path.join(env.PI_CODING_AGENT_DIR!, "pitako", "config.toml") };
     const { mkdirSync, writeFileSync } = await import("node:fs");
@@ -217,8 +220,8 @@ describe("agent instance", () => {
     expect(cleared.model.selectedModel).toBe("example/fallback-1");
     expect(cleared.model.requestedReasoning).toBe("xhigh");
     expect(cleared.model.appliedReasoning).toBeUndefined();
-  });
-  test("keeps generic mutation counts without patch-specific metrics", async () => {
+  }));
+  test("keeps generic mutation counts without patch-specific metrics", fixture.ownedCase("keeps generic mutation counts without patch-specific metrics", async () => {
     const env = tempEnv();
     const configured = { env, userConfigPath: path.join(env.PI_CODING_AGENT_DIR!, "pitako", "config.toml") };
     const { mkdirSync, writeFileSync } = await import("node:fs");
@@ -246,8 +249,8 @@ describe("agent instance", () => {
     expect(result.usage).not.toHaveProperty("patches");
     expect(JSON.stringify(result.usage)).not.toContain("SENSITIVE-PATCH-BODY");
     expect(formatAgentResult(result)).toContain("mutations: edit 1, write 1, apply_patch 2");
-  });
-  test("continueWith usage deltas add once and keep context as a gauge", async () => {
+  }));
+  test("continueWith usage deltas add once and keep context as a gauge", fixture.ownedCase("continueWith usage deltas add once and keep context as a gauge", async () => {
     const env = tempEnv();
     const configured = { env, userConfigPath: path.join(env.PI_CODING_AGENT_DIR!, "pitako", "config.toml") };
     const { mkdirSync, writeFileSync } = await import("node:fs");
@@ -289,9 +292,9 @@ describe("agent instance", () => {
       tools: { read: 1, grep: 3, bash: 1 }, contextTokens: 256,
     });
     expect(summary.estimatedCost).toBeCloseTo(0.15);
-  });
+  }));
 
-  test("resolves architect, isolates context, and does not replay side effects", async () => {
+  test("resolves architect, isolates context, and does not replay side effects", fixture.ownedCase("resolves architect, isolates context, and does not replay side effects", async () => {
     const env = tempEnv();
     const cwd = packageRoot();
     const role = resolveRole("architect", { env });
@@ -467,9 +470,9 @@ reasoning = "medium"
     expect(afterSwitch.model.selectedModel).toBe("example/fallback-2");
     expect(switched.starts).toEqual(["example/primary"]);
     expect(switched.notes.some((note) => note.startsWith("example/fallback-2:"))).toBe(true);
-  });
+  }));
 
-  test("model capacity failure tries the configured reviewer fallback without side effects", async () => {
+  test("model capacity failure tries the configured reviewer fallback without side effects", fixture.ownedCase("model capacity failure tries the configured reviewer fallback without side effects", async () => {
     const env = tempEnv();
     const configPath = path.join(env.PI_CODING_AGENT_DIR!, "pitako", "config.toml");
     const { mkdirSync, writeFileSync } = await import("node:fs");
@@ -500,9 +503,9 @@ reasoning = "medium"
       fallbackIndex: 0, fallbackReason: "unavailable", lastFailure: "unavailable",
     });
     expect(formatAgentResult(result)).toContain("fallback: unavailable from xai/grok-4.7");
-  });
+  }));
 
-  test("service-tier rejections do not enter availability fallback without a failure kind", async () => {
+  test("service-tier rejections do not enter availability fallback without a failure kind", fixture.ownedCase("service-tier rejections do not enter availability fallback without a failure kind", async () => {
     const env = tempEnv();
     const configPath = path.join(env.PI_CODING_AGENT_DIR!, "pitako", "config.toml");
     const { mkdirSync, writeFileSync } = await import("node:fs");
@@ -540,9 +543,9 @@ reasoning = "medium"
     expect(formatted).toContain("requested_service_tier: priority");
     expect(formatted).toContain("returned_service_tier: unavailable");
     expect(formatted).toContain("time_to_first_model_output_ms: unavailable (failed)");
-  });
+  }));
 
-  test("fallback classification is narrow", () => {
+  test("fallback classification is narrow", fixture.ownedCase("fallback classification is narrow", () => {
     expect(classifyProviderFailure("429 too many requests")).toBe("rate_limit");
     expect(classifyProviderFailure("insufficient_quota")).toBe("quota");
     expect(classifyProviderFailure("Codex error: The usage limit has been reached")).toBe("quota");
@@ -581,51 +584,51 @@ reasoning = "medium"
     expect(instructions).toContain("ModelPolicy");
     expect(instructions).toContain("Your conversation is private");
     expect(instructions).not.toContain("navigation baseline");
-  });
+  }));
 
-  test("500 status code (no body) is unavailable", () => {
+  test("500 status code (no body) is unavailable", fixture.ownedCase("500 status code (no body) is unavailable", () => {
     expect(classifyProviderFailure("500 status code (no body)")).toBe("unavailable");
     expect(classifyProviderFailure("502 status code (no body)")).toBe("unavailable");
     expect(classifyProviderFailure("503 status code (no body)")).toBe("unavailable");
     expect(classifyProviderFailure("504 status code (no body)")).toBe("unavailable");
     expect(classifyProviderFailure("520 status code (no body)")).toBe("unavailable");
     expect(classifyProviderFailure("524 status code (no body)")).toBe("unavailable");
-  });
+  }));
 
-  test("prefix (500): ... is unavailable", () => {
+  test("prefix (500): ... is unavailable", fixture.ownedCase("prefix (500): ... is unavailable", () => {
     expect(classifyProviderFailure("prefix (500): ...")).toBe("unavailable");
     expect(classifyProviderFailure("prefix (502): ...")).toBe("unavailable");
     expect(classifyProviderFailure("prefix (503): ...")).toBe("unavailable");
     expect(classifyProviderFailure("prefix (504): ...")).toBe("unavailable");
     expect(classifyProviderFailure("prefix (520): ...")).toBe("unavailable");
     expect(classifyProviderFailure("prefix (524): ...")).toBe("unavailable");
-  });
+  }));
 
-  test("500: body is unavailable", () => {
+  test("500: body is unavailable", fixture.ownedCase("500: body is unavailable", () => {
     expect(classifyProviderFailure("500: body")).toBe("unavailable");
     expect(classifyProviderFailure("502: body")).toBe("unavailable");
     expect(classifyProviderFailure("503: body")).toBe("unavailable");
     expect(classifyProviderFailure("504: body")).toBe("unavailable");
     expect(classifyProviderFailure("520: body")).toBe("unavailable");
     expect(classifyProviderFailure("524: body")).toBe("unavailable");
-  });
+  }));
 
-  test("HTTP/1.1 500 is unavailable", () => {
+  test("HTTP/1.1 500 is unavailable", fixture.ownedCase("HTTP/1.1 500 is unavailable", () => {
     expect(classifyProviderFailure("HTTP/1.1 500")).toBe("unavailable");
     expect(classifyProviderFailure("HTTP/1.1 502")).toBe("unavailable");
     expect(classifyProviderFailure("HTTP/1.1 503")).toBe("unavailable");
     expect(classifyProviderFailure("HTTP/1.1 504")).toBe("unavailable");
     expect(classifyProviderFailure("HTTP/1.1 520")).toBe("unavailable");
     expect(classifyProviderFailure("HTTP/1.1 524")).toBe("unavailable");
-  });
+  }));
 
-  test("500 tokens does not classify", () => {
+  test("500 tokens does not classify", fixture.ownedCase("500 tokens does not classify", () => {
     expect(classifyProviderFailure("500 tokens")).toBeUndefined();
     expect(classifyProviderFailure("see 500")).toBeUndefined();
     expect(classifyProviderFailure("500")).toBeUndefined();
-  });
+  }));
 
-  test("Board author follows the instance and todos stay on the session id", async () => {
+  test("Board author follows the instance and todos stay on the session id", fixture.ownedCase("Board author follows the instance and todos stay on the session id", async () => {
     const dir = mkdtempSync(path.join(tmpdir(), "pitako-agent-board-"));
     tempDirs.push(dir);
     const db = path.join(dir, "board.db");
@@ -711,9 +714,9 @@ reasoning = "medium"
     const child = SessionManager.inMemory(packageRoot());
     expect(parent.getSessionId()).not.toBe(child.getSessionId());
     expect(currentWorkspace(packageRoot())).toBe(currentWorkspace(packageRoot()));
-  });
+  }));
 
-  test("onAccepted publishes instance id before executor start", async () => {
+  test("onAccepted publishes instance id before executor start", fixture.ownedCase("onAccepted publishes instance id before executor start", async () => {
     const env = tempEnv();
     const configured = { env, userConfigPath: path.join(env.PI_CODING_AGENT_DIR!, "pitako", "config.toml") };
     const { mkdirSync, writeFileSync } = await import("node:fs");
@@ -753,9 +756,9 @@ reasoning = "medium"
     expect(acceptedId).toMatch(/^architect-/);
     expect(started).toBe(false);
     await pending;
-  });
+  }));
 
-  test("throwing onAccepted rejects without starting executor or watchdog", async () => {
+  test("throwing onAccepted rejects without starting executor or watchdog", fixture.ownedCase("throwing onAccepted rejects without starting executor or watchdog", async () => {
     const env = tempEnv();
     const configured = { env, userConfigPath: path.join(env.PI_CODING_AGENT_DIR!, "pitako", "config.toml") };
     const { mkdirSync, writeFileSync } = await import("node:fs");
@@ -787,9 +790,9 @@ reasoning = "medium"
     ).rejects.toThrow("accept failed");
     expect(started).toBe(false);
     expect(scheduled).toBe(false);
-  });
+  }));
 
-  test("agent_run is registered, refused inside an instance, and Pitako still loads", async () => {
+  test("agent_run is registered, refused inside an instance, and Pitako still loads", fixture.ownedCase("agent_run is registered, refused inside an instance, and Pitako still loads", async () => {
     const loaded = await loadPitako(packageRoot());
     const env = tempEnv();
     for (const id of ["developer", "reviewer", "coordinator", "researcher", "architect"]) {
@@ -849,5 +852,5 @@ reasoning = "medium"
     );
     expect(nested.isError).toBe(true);
     expect(nested.details.error).toMatch(/cannot be called/);
-  });
+  }));
 });

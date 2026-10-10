@@ -21,6 +21,12 @@ afterEach(() => {
 test.serial("owned callback", fixture.ownedCase("network-free ownership control", async () => {
   mkdirSync(directory);
   fixture.directories.push(directory);
+  fixture.releaseDirectoriesAfterDisposal(() => {
+    expect(globalThis.fetch).toBe(originalFetch);
+    expect(process.env.PI_CODING_AGENT_DIR).toBe(originalAgentDir);
+    mark("DIRECTORY_RELEASE");
+    if (mode === "directory-failure") throw new Error("owned directory release failed");
+  }, [directory]);
   Object.defineProperty(globalThis, "fetch", {
     configurable: true,
     value: () => { throw new Error("No network permitted"); },
