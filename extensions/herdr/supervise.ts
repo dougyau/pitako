@@ -1,5 +1,10 @@
 import { spawn } from "node:child_process";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { randomUUID } from "node:crypto";
+import { mkdirSync } from "node:fs";
+import path from "node:path";
+import { developerPreflight, type DispatchSnapshot } from "../agent/routing.ts";
+import { ownedDispatch } from "../agent/dispatch.ts";
 import { Type } from "typebox";
 import { createInstanceId } from "../agent/run.ts";
 import { currentInstanceId } from "../agent/scope.ts";
@@ -26,6 +31,9 @@ export type SuperviseResult = {
   paneId: string;
   agent_status: string;
   excerpt?: string;
+  dispatchId?: string;
+  sessionId?: string;
+  sessionDir?: string;
 };
 
 const noExtra = { additionalProperties: false } as const;
@@ -43,6 +51,8 @@ export async function superviseAgent(input: {
   env?: Readonly<Record<string, string | undefined>>;
   load?: LoadOptions;
   run?: HerdrRunner;
+  preflight?: () => Promise<DispatchSnapshot>;
+  check?: () => void;
 }): Promise<SuperviseResult> {
   if (inFlight) throw new Error("agent_supervise is already in flight");
   inFlight = true;
@@ -61,6 +71,8 @@ async function superviseOnce(input: {
   env?: Readonly<Record<string, string | undefined>>;
   load?: LoadOptions;
   run?: HerdrRunner;
+  preflight?: () => Promise<DispatchSnapshot>;
+  check?: () => void;
 }): Promise<SuperviseResult> {
   const env = input.env ?? process.env;
   const run = input.run ?? defaultRun;
@@ -78,16 +90,22 @@ async function superviseOnce(input: {
   }
 
   const integration = await exec(run, ["integration", "status"], input.cwd, signal);
+  input.check?.();
   if (integration.code !== 0 || !piIntegrationCurrent(`${integration.stdout}\n${integration.stderr}`)) {
     throw new Error("Pi integration is not current. Install it with `herdr integration install pi`. Pitako will not install it.");
   }
 
   const status = await exec(run, ["status", "--json"], input.cwd, signal);
+  input.check?.();
   if (status.code !== 0 || !serverReady(status.stdout)) {
     throw new Error("herdr server is not running or not endpoint-compatible. Stop. Do not upgrade or restart.");
   }
 
-  const role = resolveRoleFromConfig(loadPitakoConfig(input.load), input.roleId);
+  const dispatch = input.roleId === "developer" ? await input.preflight?.() : undefined;
+  throwIfAborted(signal);
+  input.check?.();
+  const role = dispatch?.role ?? resolveRoleFromConfig(loadPitakoConfig(input.load), input.roleId,
+    input.roleId === "developer" ? "developer_mid" : undefined);
   if (!role.modelPolicy.primary) {
     throw new PitakoConfigError(role.modelPolicy.diagnostic ?? `model policy "${role.modelPolicyId}" has no primary target`);
   }
@@ -96,13 +114,24 @@ async function superviseOnce(input: {
     throw new PitakoConfigError(`fast mode is not supported by agent_supervise for primary target "${target.model}"`);
   }
   const instanceId = createInstanceId(role.id);
+  const sessionId = dispatch ? randomUUID() : undefined;
+  const sessionDir = dispatch ? path.join(getAgentDir(), "sessions", `--pitako-supervised--${dispatch.routing.dispatchId}`) : undefined;
+  if (sessionDir) {
+    const relative = path.relative(input.cwd, sessionDir);
+    if (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative)) {
+      throw new Error("agent_supervise native session directory must be outside the execution worktree");
+    }
+    mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
+  }
+  const identity = dispatch ? { dispatchId: dispatch.routing.dispatchId, sessionId, sessionDir } : {};
 
   const layout = await exec(run, ["pane", "layout", "--pane", presence.paneId], input.cwd, signal);
+  input.check?.();
   if (layout.code !== 0) throw new Error(commandError("pane layout", layout));
   const size = paneSize(layout.stdout, presence.paneId);
   const direction = size.width >= size.height ? "right" : "down";
 
-  const split = await exec(run, [
+  const splitArgs = [
     "pane",
     "split",
     "--current",
@@ -115,18 +144,26 @@ async function superviseOnce(input: {
     `PITAKO_INSTANCE_ID=${instanceId}`,
     "--env",
     `PITAKO_ROLE_ID=${role.id}`,
-  ], input.cwd, signal);
+  ];
+  if (dispatch) splitArgs.push("--env", `PITAKO_DISPATCH_ID=${dispatch.routing.dispatchId}`,
+    "--env", `PITAKO_NATIVE_SESSION_ID=${sessionId}`, "--env", `PITAKO_DEVELOPER_PROFILE=${dispatch.routing.profile}`);
+  throwIfAborted(signal);
+  const split = await run(splitArgs, { cwd: input.cwd, signal });
   if (split.code !== 0) throw new Error(commandError("pane split", split));
   let paneId: string | undefined = paneIdFromSplit(split.stdout);
   let live = false;
   try {
+    throwIfAborted(signal);
+    input.check?.();
     const startArgs = ["agent", "start", instanceId, "--kind", "pi", "--pane", paneId, "--", "--model", target.model];
+    if (sessionId && sessionDir) startArgs.push("--session-id", sessionId, "--session-dir", sessionDir);
     if (target.reasoning) startArgs.push("--thinking", target.reasoning);
     startArgs.push("--no-approve", "--append-system-prompt", preamble(role, instanceId), "--exclude-tools", ORCHESTRATION_TOOLS.join(","));
     const start = await exec(run, startArgs, input.cwd, signal);
+    input.check?.();
     const startFailure = failureCode(start);
     if (startFailure) {
-      if (OPEN_START.has(startFailure)) return { instanceId, paneId, agent_status: startFailure };
+      if (OPEN_START.has(startFailure)) return { instanceId, paneId, agent_status: startFailure, ...identity };
       await closeQuiet(run, paneId, input.cwd);
       paneId = undefined;
       throw new Error(`herdr agent start failed: ${startFailure}`);
@@ -134,6 +171,7 @@ async function superviseOnce(input: {
     live = true;
 
     const prompt = await exec(run, ["agent", "prompt", instanceId, task, "--wait"], input.cwd, signal);
+    input.check?.();
     const agent_status = agentStatusFrom(prompt.stdout) ?? failureCode(prompt) ?? "unknown";
     let excerpt: string | undefined;
     if (READ_STATUS.has(agent_status)) {
@@ -141,8 +179,8 @@ async function superviseOnce(input: {
       excerpt = read.stdout;
     }
     return excerpt === undefined
-      ? { instanceId, paneId, agent_status }
-      : { instanceId, paneId, agent_status, excerpt };
+      ? { instanceId, paneId, agent_status, ...identity }
+      : { instanceId, paneId, agent_status, excerpt, ...identity };
   } catch (error) {
     if (paneId && signal?.aborted) {
       await abortClose(run, instanceId, paneId, input.cwd);
@@ -172,7 +210,17 @@ export function registerAgentSupervise(pi: ExtensionAPI): void {
     ),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
-        const result = await superviseAgent({ roleId: params.role, task: params.task, cwd: ctx.cwd, signal });
+        const result = await ownedDispatch(ctx, signal, () => true, async (signal, check) => {
+          check();
+          return superviseAgent({ roleId: params.role, task: params.task, cwd: ctx.cwd, signal, check,
+            preflight: async () => {
+              const snapshot = await developerPreflight({ task: params.task, toolCallId: _toolCallId,
+                source: "agent_supervise", ctx, pi, signal, owns: () => { check(); return true; } });
+              check();
+              return snapshot;
+            },
+          });
+        });
         const settled = result.agent_status === "idle" || result.agent_status === "done" || READ_STATUS.has(result.agent_status);
         return {
           content: [{ type: "text" as const, text: formatSuperviseResult(result) }],
@@ -219,21 +267,17 @@ function defaultRun(args: readonly string[], options: { cwd: string; signal?: Ab
     const child = spawn("herdr", [...args], { cwd: options.cwd, signal: options.signal });
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
-    let settled = false;
-    const finish = (fn: () => void) => {
-      if (settled) return;
-      settled = true;
-      fn();
-    };
+    let failure: Error | undefined;
     child.stdout?.on("data", (chunk: Buffer) => stdout.push(chunk));
     child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk));
-    child.on("error", (error) => finish(() => reject(error)));
+    child.on("error", (error) => { failure = error; });
     child.on("close", (code) => {
-      finish(() => resolve({
+      if (failure) { reject(failure); return; }
+      resolve({
         code: code ?? 1,
         stdout: Buffer.concat(stdout).toString("utf8"),
         stderr: Buffer.concat(stderr).toString("utf8"),
-      }));
+      });
     });
   });
 }

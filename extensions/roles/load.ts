@@ -9,6 +9,8 @@ import { DEFAULT_WATCHDOG, mergeWatchdog, parseWatchdogConfig } from "../agent/w
 import { packageRoot } from "../stack.ts";
 import {
   ROLE_IDS,
+  DEVELOPER_PROFILES,
+  type DeveloperProfile,
   isReasoningLevel,
   type ModelCapability,
   type ModelPolicy,
@@ -61,9 +63,10 @@ export function resolveModelPolicy(id: string, options?: LoadOptions): ResolvedM
   return resolvePolicy(requirePolicy(config, id), config.userConfigPath);
 }
 
-export function resolveRoleFromConfig(config: PitakoConfig, id: string): ResolvedRole {
+export function resolveRoleFromConfig(config: PitakoConfig, id: string, profile: DeveloperProfile = "developer_mid"): ResolvedRole {
   const role = requireRole(config, id);
-  const modelPolicy = resolvePolicy(requirePolicy(config, role.modelPolicy), config.userConfigPath);
+  const policyId = id === "developer" ? profile : role.modelPolicy;
+  const modelPolicy = resolvePolicy(requirePolicy(config, policyId), config.userConfigPath);
   return freeze({
     id: role.id,
     name: role.name,
@@ -72,7 +75,7 @@ export function resolveRoleFromConfig(config: PitakoConfig, id: string): Resolve
     instructions: role.instructions,
     skills: Object.freeze([...role.skills]),
     principles: Object.freeze([...role.principles]),
-    modelPolicyId: role.modelPolicy,
+    modelPolicyId: policyId,
     modelPolicy,
   });
 }
@@ -125,13 +128,27 @@ function mergeConfig(
   }
   const policies: Record<string, ModelPolicy> = {};
   for (const [id, policy] of Object.entries(builtin.policies)) {
-    policies[id] = mergePolicy(policy, user.policies[id], userConfigPath);
+    policies[id] = (DEVELOPER_PROFILES as readonly string[]).includes(id) ? policy : mergePolicy(policy, user.policies[id], userConfigPath);
   }
   for (const role of Object.values(roles)) {
     if (!policies[role.modelPolicy]) {
       const file = user.roles[role.id]?.modelPolicy !== undefined ? userConfigPath : builtin.defaultsPath;
       throw new PitakoConfigError(`${file}: roles.${role.id}.model_policy: unknown model policy "${role.modelPolicy}"`);
     }
+  }
+  const legacyId = roles.developer!.modelPolicy;
+  const legacy = user.policies[legacyId];
+  for (const id of DEVELOPER_PROFILES) {
+    const base = mergePolicy(builtin.policies[id]!, legacy, userConfigPath);
+    const explicit = user.policies[id];
+    policies[id] = {
+      ...mergePolicy(base, explicit, userConfigPath),
+      provenance: {
+        legacyPolicy: legacyId, configPath: userConfigPath,
+        primary: explicit?.primary !== undefined ? id : legacy?.primary !== undefined ? legacyId : "bundled-empty",
+        fallbacks: explicit?.fallbacks !== undefined ? id : legacy?.fallbacks !== undefined ? legacyId : "bundled-empty",
+      },
+    };
   }
   const config: PitakoConfig = {
     defaultsPath: builtin.defaultsPath,
@@ -221,6 +238,7 @@ function resolvePolicy(policy: ModelPolicy, userConfigPath: string): ResolvedMod
     fallbacks: Object.freeze([...policy.fallbacks]),
     requested: policy.primary,
     selected: policy.primary,
+    provenance: policy.provenance,
   };
   if (!policy.primary) {
     resolved.diagnostic = `model policy "${policy.id}" has no primary target. Set [model_policies.${policy.id}.primary] in ${userConfigPath}.`;

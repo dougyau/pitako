@@ -16,6 +16,8 @@ const PI_THINKING = {
 
 export const ROLE_IDS = ["coordinator", "architect", "developer", "reviewer", "researcher"] as const;
 export type RoleId = (typeof ROLE_IDS)[number];
+export const DEVELOPER_PROFILES = ["developer_senior", "developer_mid", "developer_junior"] as const;
+export type DeveloperProfile = (typeof DEVELOPER_PROFILES)[number];
 
 /**
  * Future AgentInstance classification. Not read from config in v0.
@@ -34,6 +36,7 @@ export interface ModelPolicy {
   id: string;
   primary?: ModelTarget;
   fallbacks: readonly ModelTarget[];
+  provenance?: { primary: string; fallbacks: string; legacyPolicy: string; configPath: string };
 }
 
 /** Fields a later AgentInstance can fill. v0 selects the primary and does not execute fallback. */

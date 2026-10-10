@@ -25,6 +25,7 @@ import { parseHistoryCommand, queryHistory } from "./agent/history-query.ts";
 import { WorkerHistory } from "./agent/history.ts";
 import { pruneWorkerHistory } from "./agent/history-retention.ts";
 import { loadPitakoConfig } from "./roles/load.ts";
+import { settlePendingDispatches } from "./agent/dispatch.ts";
 
 const foregroundCodeUsage = new Map<string, CodeIntelligenceUsage>();
 const foregroundToolStarts = new Map<string, Map<string, { name: string; startedAt: number }>>();
@@ -140,6 +141,7 @@ export default function pitako(pi: ExtensionAPI) {
   let teamEvaluation: TeamEvaluation | undefined;
 
   pi.on("session_start", async (_event, ctx) => {
+    await settlePendingDispatches(teamEvaluation?.sessionId ?? ctx.sessionManager?.getSessionId());
     const sessionId = ctx.sessionManager?.getSessionId();
     if (foregroundSession(sessionId)) {
       // Cooperative history maintenance never waits for or cancels a worker.
@@ -172,7 +174,7 @@ export default function pitako(pi: ExtensionAPI) {
       isChildSession(ctx),
       ownerToken,
     );
-    registerSupervisedSession(sessionId);
+    registerSupervisedSession(sessionId, process.env, pi, ctx.model);
     if (!isChildSession(ctx) && typeof ctx.isIdle === "function") {
       bindBackgroundOwner({
         token: ownerToken,
@@ -223,6 +225,7 @@ export default function pitako(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (event, ctx) => {
+    await settlePendingDispatches(teamEvaluation?.sessionId ?? ctx.sessionManager?.getSessionId());
     const sessionId = ctx.sessionManager?.getSessionId();
     if (foregroundSession(sessionId)) {
       foregroundCodeUsage.delete(sessionId);

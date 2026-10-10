@@ -2,7 +2,9 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { developerPreflight } from "../extensions/agent/routing.ts";
+import { ownedDispatch, settlePendingDispatches } from "../extensions/agent/dispatch.ts";
 import { agentScope } from "../extensions/agent/scope.ts";
 import { PitakoConfigError } from "../extensions/errors.ts";
 import pitako from "../extensions/index.ts";
@@ -339,6 +341,67 @@ function superviseInput(run: HerdrRunner, extra: { env?: Record<string, string |
 }
 
 describe("agent_supervise", () => {
+  test("routing waits before pane creation; cancellation settles classifier and keeps single-flight ownership", async () => {
+    const previous = process.env.PI_CODING_AGENT_DIR;
+    const root = fixtureRoot();
+    process.env.PI_CODING_AGENT_DIR = root;
+    const load = developerLoad("medium");
+    writeFileSync(load.userConfigPath!, readFileSync(load.userConfigPath!, "utf8") + `
+[model_policies.developer_senior.primary]
+model = "example/senior"
+reasoning = "high"
+`);
+    let finish!: (value: unknown) => void, entered!: () => void, classifierSignal: AbortSignal | undefined;
+    let classifications = 0;
+    const gate = new Promise(resolve => { finish = resolve; });
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const ctx = { sessionManager: { getSessionId: () => "supervised-owned",
+      getSessionFile: () => path.join(root, "coordinator.jsonl") }, modelRegistry: {
+      async getAvailableOfType() { return [{ provider: "opencode", id: "jev-1.13-free", type: "classifier", contextWindow: 8192 }]; },
+      async classify(_model: unknown, _request: unknown, options: { signal: AbortSignal }) {
+        classifications++; classifierSignal = options.signal; entered(); return gate;
+      },
+    } } as unknown as ExtensionContext;
+    const pi = { appendEntry() {} } as unknown as ExtensionAPI;
+    const response = { stopReason: "stop", answers: { capacity: { type: "choice", choice: "developer_senior",
+      probabilities: { developer_senior: 0.7, developer_mid: 0.1, developer_junior: 0.1, indeterminate: 0.1 } } } };
+    const scriptedRun = scripted();
+    const first = ownedDispatch(ctx, undefined, () => true, (signal, check) =>
+      superviseAgent({ ...superviseInput(scriptedRun.run, { load }), signal, check,
+        preflight: () => developerPreflight({ task: "Inspect the diff", toolCallId: "supervised-call",
+          source: "agent_supervise", ctx, pi, load, signal, owns: () => { check(); return true; } }) }));
+    // Attach rejection observation before issuing cancellation.
+    const cancelled = first.then(() => "unexpected success", error => String(error));
+    try {
+      await Promise.race([started, cancelled.then(message => { throw new Error(message); })]);
+      expect(scriptedRun.calls.map(commandKey)).toEqual(["integration", "status"]);
+      await expect(superviseAgent(superviseInput(scripted().run))).rejects.toThrow(/already in flight/);
+      let settled = false;
+      const shutdown = settlePendingDispatches("supervised-owned").then(() => { settled = true; });
+      expect(classifierSignal?.aborted).toBe(true);
+      await Promise.resolve(); expect(settled).toBe(false);
+      finish(response);
+      expect(await cancelled).toMatch(/cancel/); await shutdown;
+      expect(classifications).toBe(1);
+      expect(scriptedRun.calls.some(args => args[1] === "split")).toBe(false);
+      const next = scripted();
+      const result = await superviseAgent({ ...superviseInput(next.run, { load }),
+        preflight: () => developerPreflight({ task: "Inspect the diff", toolCallId: "next-call",
+          source: "agent_supervise", ctx, pi, load, owns: () => true }) });
+      const start = next.calls.find(args => args[1] === "start")!;
+      expect(start[start.indexOf("--model") + 1]).toBe("example/senior");
+      expect(start[start.indexOf("--thinking") + 1]).toBe("high");
+      expect(start[start.indexOf("--session-id") + 1]).toBe(result.sessionId!);
+      expect(start[start.indexOf("--session-dir") + 1]).toBe(result.sessionDir!);
+      expect(next.calls.find(args => args[1] === "split")).toContain(`PITAKO_DISPATCH_ID=${result.dispatchId}`);
+      expect(result.sessionDir?.startsWith(root + path.sep)).toBe(true);
+    } finally {
+      finish(response); await Promise.allSettled([first]); await settlePendingDispatches("supervised-owned");
+      if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previous;
+    }
+  });
+
   test("registers the tool", () => {
     const names: string[] = [];
     pitako({
@@ -469,7 +532,7 @@ describe("agent_supervise", () => {
     expect(start).toContain("--no-approve");
     expect(start).not.toContain("--approve");
     expect(start[start.indexOf("--exclude-tools") + 1]).toBe(
-      "agent_run,agent_supervise,agent_spawn,agent_status,agent_result,agent_history,agent_cancel,team_assign,team_status,team_result,team_cancel",
+      "agent_run,agent_supervise,agent_spawn,agent_status,agent_result,agent_history,agent_observe,agent_input,agent_cancel,team_assign,team_status,team_result,team_cancel",
     );
     const preamble = start[start.indexOf("--append-system-prompt") + 1] ?? "";
     expect(preamble).not.toContain("AgentInstance");

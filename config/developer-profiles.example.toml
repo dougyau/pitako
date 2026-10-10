@@ -1,0 +1,13 @@
+# Example only: copy deliberately into your private Pitako config, not defaults.
+# These profiles change capacity, never Developer responsibility or authority.
+[model_policies.developer_senior.primary]
+model = "openai/gpt-6.1-sol"
+reasoning = "high"
+
+[model_policies.developer_mid.primary]
+model = "openai/gpt-6.1-sol"
+reasoning = "medium"
+
+[model_policies.developer_junior.primary]
+model = "openai/gpt-6-luna"
+reasoning = "medium"

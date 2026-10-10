@@ -14,6 +14,8 @@ export interface HistoryOrigin {
   assignmentId?: string;
   workbrief?: string;
   execution?: { executionRoot: string; executionRef: string };
+  routing?: import("./routing.ts").DispatchSnapshot["routing"];
+  routingEvidence?: { state: import("./routing.ts").DispatchSnapshot["evidence"]; gap?: string };
 }
 
 export type HistoryClosure =

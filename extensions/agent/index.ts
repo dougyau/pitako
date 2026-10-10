@@ -30,6 +30,8 @@ import { teamEvaluationForSession, reserveTeamRole, recordTeamAssignment, record
 import type { HistoryOrigin } from "./history.ts";
 import { queryHistory } from "./history-query.ts";
 import { executionForSession } from "../execution-identity.ts";
+import { developerPreflight } from "./routing.ts";
+import { ownedDispatch, settlePendingDispatches } from "./dispatch.ts";
 
 const noExtra = { additionalProperties: false } as const;
 
@@ -52,6 +54,14 @@ function historyOrigin(
 }
 
 export default function agentInstance(pi: ExtensionAPI): void {
+  let dispatchSessionId: string | undefined;
+  pi.on?.("session_shutdown", async (_event, ctx) => {
+    await settlePendingDispatches(dispatchSessionId ?? ctx?.sessionManager?.getSessionId?.());
+  });
+  pi.on?.("session_start", async (_event, ctx) => {
+    await settlePendingDispatches(dispatchSessionId ?? ctx.sessionManager?.getSessionId?.());
+    dispatchSessionId = ctx.sessionManager?.getSessionId?.();
+  });
   const liveTarget = Type.Union([
     Type.Object({ kind: Type.Literal("background"), instanceId: Type.String({ maxLength: 256 }) }, noExtra),
     Type.Object({ kind: Type.Literal("team"), assignmentId: Type.String({ maxLength: 256 }) }, noExtra),
@@ -148,13 +158,31 @@ export default function agentInstance(pi: ExtensionAPI): void {
       try {
         let live = "";
         const epoch = observationEpoch();
+        let dispatch;
+        let checkDispatch: (() => void) | undefined;
+        if (params.role === "developer") {
+          dispatch = await ownedDispatch(ctx, signal, () => true, async (signal, check) => {
+            checkDispatch = check;
+            const snapshot = await developerPreflight({ task: params.task, toolCallId: _toolCallId,
+              source: "agent_run", ctx, pi, signal, owns: () => { check(); return true; } });
+            check();
+            return snapshot;
+          });
+        }
+        const origin = historyOrigin("agent_run", ctx, params.task);
+        if (dispatch) {
+          origin.routing = dispatch.routing;
+          origin.routingEvidence = { state: dispatch.evidence, gap: dispatch.evidenceGap };
+        }
+        checkDispatch?.();
         const result = await runAgentInstance({
           roleId: params.role,
           task: params.task,
           cwd: ctx.cwd,
           signal,
           executor: createPiExecutor(),
-          historyOrigin: historyOrigin("agent_run", ctx, params.task),
+          historyOrigin: origin,
+          dispatch,
           onPresent(text) {
             live = text;
             onUpdate?.({
@@ -169,7 +197,8 @@ export default function agentInstance(pi: ExtensionAPI): void {
         noteResultTaken(result.instanceId);
         return {
           content: [{ type: "text", text: formatAgentResult(result) }],
-          details: { ...result, live },
+          details: { ...result, live, ...(dispatch ? { dispatchId: dispatch.routing.dispatchId,
+            routingEvidence: origin.routingEvidence } : {}) },
           isError: result.status !== "completed",
         };
       } catch (error) {
@@ -224,7 +253,9 @@ function registerTeamTools(pi: ExtensionAPI): void {
         const admission = reserveTeamRole(evaluation, params.role, id);
         let accepted = false;
         let durableWatch: { planId: string; unitId: string; execution?: ExecutionBinding } | undefined;
+        return await ownedDispatch(ctx, signal, admission.owns, async (signal, check) => {
         try {
+          check();
           const watch = interestFrom(params.plan, params.unit);
           let plan: { file: string; text: string; meta: PlanMeta } | undefined;
           let execution: ExecutionBinding | undefined;
@@ -233,12 +264,19 @@ function registerTeamTools(pi: ExtensionAPI): void {
               ? openExecutionPlan(watch.planId, ctx.cwd, { createLedger: false })
               : assignmentPlan(watch.planId, ctx.cwd);
           }
-          const topic = await teamBoardTopic(params.boardTopicId, watch?.planId, ctx.cwd, plan?.meta);
+          const topic = await teamBoardTopic(params.boardTopicId, watch?.planId, ctx.cwd, plan?.meta, check);
+          check();
+          const dispatch = params.role === "developer" ? await developerPreflight({
+            task: params.task, toolCallId: _toolCallId, source: "team_assign", ctx, pi, signal,
+            owns: () => { check(); return true; },
+          }) : undefined;
+          check();
           if (watch && plan?.meta.status === "frozen") {
             const opened = openExecutionPlan(watch.planId, ctx.cwd, { createLedger: true, source: plan });
             plan = opened;
             execution = opened.binding;
-            if (topic !== undefined) await claimTeamBoardTopicExecution(topic, opened.meta, ctx.cwd, opened.binding.executionRoot);
+            if (topic !== undefined) await claimTeamBoardTopicExecution(topic, opened.meta, ctx.cwd, opened.binding.executionRoot, check);
+            check();
           }
           if (watch && topic !== undefined && plan) {
             durableWatch = { ...watch, execution };
@@ -250,6 +288,12 @@ function registerTeamTools(pi: ExtensionAPI): void {
             params.task.trim(),
           ].join("\n");
           const launchRoot = execution?.executionRoot ?? ctx.cwd;
+          const origin = historyOrigin("team_assign", ctx, params.task, execution, id);
+          if (dispatch) {
+            origin.routing = dispatch.routing;
+            origin.routingEvidence = { state: dispatch.evidence, gap: dispatch.evidenceGap };
+          }
+          check();
           const handle = await spawnBackground({
             roleId: params.role,
             task,
@@ -257,7 +301,8 @@ function registerTeamTools(pi: ExtensionAPI): void {
             foreground: signal,
             watch: watch ? { ...watch, execution } : undefined,
             executor: backgroundExecutor(),
-            historyOrigin: historyOrigin("team_assign", ctx, params.task, execution, id),
+            historyOrigin: origin,
+            dispatch,
             teamOwner: {
               token: admission.token,
               assignmentId: id,
@@ -269,6 +314,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
           const assignment: TeamAssignment = {
             id, instanceId: handle.instanceId, roleId: params.role, task: params.task.trim(),
             planId: watch?.planId, unitId: watch?.unitId, boardTopicId: topic, execution,
+            dispatchId: dispatch?.routing.dispatchId,
           };
           recordTeamAssignment(evaluation!, params.role, assignment);
           return textResult(`assignment_id: ${id}\nrole: ${params.role}\ninstance_id: ${handle.instanceId}\nstatus: running`, assignment);
@@ -281,6 +327,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
           }
           throw error;
         }
+        });
       } catch (error) {
         return errorResult(error instanceof Error ? error.message : String(error));
       }
@@ -396,6 +443,7 @@ async function teamBoardTopic(
   planId: string | undefined,
   cwd: string,
   plan?: PlanMeta,
+  check?: () => void,
 ): Promise<number | undefined> {
   let explicitId: number | undefined;
   if (explicit !== undefined) {
@@ -417,6 +465,7 @@ async function teamBoardTopic(
 
   const board = await openBoard();
   try {
+    check?.();
     const location = boardWorkspace(cwd);
     board.migrateLegacyWorkspaces(location.identity, location.legacyRoots);
     const topic = board.readTopic(location.identity, topicId).topic;
@@ -451,9 +500,11 @@ async function claimTeamBoardTopicExecution(
   plan: PlanMeta,
   cwd: string,
   executionRoot: string,
+  check: () => void = () => {},
 ): Promise<void> {
   const board = await openBoard();
   try {
+    check();
     const location = boardWorkspace(cwd);
     board.migrateLegacyWorkspaces(location.identity, location.legacyRoots);
     board.claimTopicExecution(location.identity, topicId, plan.id, {
@@ -515,6 +566,17 @@ function registerBackgroundTools(pi: ExtensionAPI): void {
         const watch = interestFrom(params.plan, params.unit);
         const execution = watch ? watchedExecutionBinding(watch.planId, ctx.cwd) : undefined;
         const launchRoot = execution?.executionRoot ?? ctx.cwd;
+        return await ownedDispatch(ctx, signal, () => true, async (signal, check) => {
+        const dispatch = params.role === "developer" ? await developerPreflight({
+          task: params.task, toolCallId: _toolCallId, source: "agent_spawn", ctx, pi, signal,
+          owns: () => { check(); return true; },
+        }) : undefined;
+        check();
+        const origin = historyOrigin("agent_spawn", ctx, params.task, execution);
+        if (dispatch) {
+          origin.routing = dispatch.routing;
+          origin.routingEvidence = { state: dispatch.evidence, gap: dispatch.evidenceGap };
+        }
         const handle = await spawnBackground({
           roleId: params.role,
           task: params.task,
@@ -522,9 +584,11 @@ function registerBackgroundTools(pi: ExtensionAPI): void {
           foreground: signal,
           watch: watch ? { ...watch, execution } : undefined,
           executor: backgroundExecutor(),
-          historyOrigin: historyOrigin("agent_spawn", ctx, params.task, execution),
+          historyOrigin: origin,
+          dispatch,
         });
-        return textResult(formatWorkerHandle(handle), handle);
+        return textResult(formatWorkerHandle(handle), { ...handle, ...(dispatch ? { dispatchId: dispatch.routing.dispatchId } : {}) });
+        });
       } catch (error) {
         const message = error instanceof PitakoConfigError || error instanceof Error ? error.message : String(error);
         return errorResult(message);
