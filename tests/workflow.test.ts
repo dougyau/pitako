@@ -214,7 +214,7 @@ describe("plan and execute contracts", () => {
     const gates = readFileSync(path.join(packageRoot(), "GATES.md"), "utf8");
     const commands = [
       "bun run typecheck",
-      "bun test",
+      "bun run test",
       "bun run test:code-intelligence-node",
     ];
     const routine = gates.split("## Run the complete routine procedure")[1]!.split("## Use stage-specific")[0]!;
@@ -225,11 +225,38 @@ describe("plan and execute contracts", () => {
       previous = current;
     }
     expect(routine).not.toContain("--concurrent");
+    expect(JSON.parse(readFileSync(path.join(packageRoot(), "package.json"), "utf8")).scripts.test)
+      .toBe("bun test --parallel");
+    expect(routine).toContain("CPU-derived file parallelism");
+    expect(routine).toContain("including `tests/todo.test.ts`");
     expect(routine).toContain("Do not add `bun run smoke` again by default");
     expect(routine).not.toContain("test:mission-node");
     expect(gates).toContain("Setup success does not prove every gate prerequisite");
     expect(gates).toContain("unrun checks separately from passes");
     expect(gates).not.toContain("verify:mission");
+  });
+
+  test("recipe routing binds source and evidence while the principal owns full checks", () => {
+    const gates = readFileSync(path.join(packageRoot(), "GATES.md"), "utf8");
+    for (const instruction of [gates, verify, execute]) {
+      for (const contract of [
+        "scripts/verification-recipe-v1.js", "binding.executionRoot",
+        "evidenceFile(planId, uniqueRelative, binding.executionRoot)",
+        "tools.read", "before evaluation", "source identity",
+        "advertised installed `SKILL.md` path", "45-minute tool-stall watchdog",
+        "bash timeout and codemode `timeout_ms` unset", "await nested calls",
+        "first failed, interrupted or unavailable command",
+        "capture failure", "unrun", "prior owned invocation",
+        "detached runner, heartbeat or settings change",
+      ]) expect(instruction).toContain(contract);
+      expect(instruction).not.toContain("Managed workers retain findings-only authority");
+    }
+    expect(gates.indexOf("const source = await tools.read")).toBeLessThan(gates.indexOf("const recipe = eval(source)"));
+    expect(gates.indexOf("Incomplete verification recipe source read")).toBeLessThan(gates.indexOf("const recipe = eval(source)"));
+    expect(gates).toContain("recipe.version !== 1");
+    expect(verify).toContain("Projects without the asset retain ordinary discovery");
+    expect(execute).toContain("Projects without the asset retain ordinary discovery");
+    expect(execute).toContain("does not transfer failed specialist authority or replace independent final review");
   });
 
   test("execute prepares only a reconciled captured checkout before dependent work", () => {
@@ -337,7 +364,7 @@ describe("plan and execute contracts", () => {
     expect(brief).toContain("resolved references to actual reusable evidence");
     expect(brief).toContain("identify what remains uncovered");
     expect(brief).toContain("replacement report merely for a handoff");
-    expect(brief).toContain("Existing required reports, identity checks, and managed receipts remain required");
+    expect(brief).toContain("Existing required reports and identity checks remain required");
     expect(brief).toContain("Local subdivision stays local");
     expect(brief).toContain("future Developer Team head");
     expect(brief).toContain("do not replace global acceptance or authorize replanning");
@@ -403,7 +430,7 @@ describe("plan and execute contracts", () => {
     expect(verify).toContain("its observed execution covers that obligation");
     expect(verify).toContain("arguments, inputs, environment, completeness, and required phase or binding");
     expect(verify).toContain("Partial logs, skipped checks, interrupted output, stale artifacts, or the same command string alone are insufficient");
-    expect(verify).toContain("A host predicate and a worker diagnostic command can be different obligations");
+    expect(verify).toContain("A final gate and a worker diagnostic command can be different obligations");
     expect(verify).toContain("Evidence from one binding does not satisfy a different required binding");
     expect(verify).toContain("inputs, environment, contract, completeness, and required phase or binding remain compatible");
     expect(verify).toContain("Do not discard valid evidence solely because it is old");
@@ -434,9 +461,10 @@ describe("plan and execute contracts", () => {
     for (const contract of [
       "Deterministic host checks prove their host contract or local mechanism, not an external model's completion",
       "Preserve a separately required real-provider demonstration",
-      "Advisory managed observations, including passes, do not satisfy current host acceptance predicates",
+      "Advisory observations, including passes, do not satisfy required acceptance checks",
       "grants no spending, external-effect, reset, or budget authority",
-      "Managed workers retain findings-only authority and current host predicates",
+      "Workers retain their assigned purpose, permitted effects and completion conditions",
+      "a worker result is not coordinator acceptance",
       "Standalone consumers retain their existing scope and authority",
       "requires no plan, setup, or new evidence artifact",
     ]) expect(selection).toContain(contract);

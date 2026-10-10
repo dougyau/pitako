@@ -12,7 +12,8 @@ import {
 import pitako from "../extensions/index.ts";
 import { profileNote } from "../extensions/profile.ts";
 import { packageRoot } from "../extensions/stack.ts";
-import { loadPitako, registeredToolNames } from "../scripts/load-pitako.ts";
+import { registeredToolNames } from "../scripts/load-pitako.ts";
+import { loadPitako } from "./fixtures/owned-pitako.ts";
 import codegraphRaw from "../extensions/code-intelligence/codegraph-raw.ts";
 import { CODE_INTELLIGENCE_TOOL_NAMES } from "../extensions/code-intelligence/metrics.ts";
 import { toolsForProfile } from "../extensions/profile.ts";
@@ -131,18 +132,25 @@ describe("engineering-layer composition", () => {
     expect(caveman).not.toContain("Must always apply.");
   });
 
-  test("loaded shared evidence policy preserves assignment and managed boundaries", async () => {
+  test("loaded shared evidence policy preserves assignment and required boundaries", async () => {
     const loaded = await loadPitako(packageRoot());
     const skill = loaded.loader.getSkills().skills.find((entry) => entry.name === "verify-behavior");
     expect(skill).toBeDefined();
     const verify = readFileSync(skill!.filePath, "utf8");
     for (const contract of [
+      "scripts/verification-recipe-v1.js",
+      "binding.executionRoot",
+      "evidenceFile(planId, uniqueRelative, binding.executionRoot)",
+      "advertised installed `SKILL.md` path",
+      "principal coordinator owns the final complete invocation directly",
+      "never delegate it to an AgentInstance or Team",
+      "Projects without the asset retain ordinary discovery",
       "Inspect the artifact, not a prior worker's summary",
       "A handoff, role change, or no-op cleanup does not itself invalidate evidence",
       "Missing, conflicting, incomplete, or invalidated evidence requires the appropriate check",
-      "findings-only authority, structured responses and receipts, affected-checks phases",
+      "assigned authority and any required structured responses, receipts, affected-checks phases",
       "current phase and binding evidence",
-      "containment, ownership, disposal, host acceptance, completion checks, or final independent review",
+      "isolation, ownership, disposal, coordinator acceptance, completion checks, or final independent review",
       "Completing an assigned observation or consultation is not acceptance",
       "Continue useful authorized diagnosis",
     ]) expect(verify).toContain(contract);

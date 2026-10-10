@@ -31,13 +31,44 @@ Run these commands in order from the root:
 
 ```sh
 bun run typecheck
-bun test
+bun run test
 bun run test:code-intelligence-node
 ```
 
-The script definitions are in [package.json](package.json). Plain `bun test` runs the full discovered suite with the default serial runner, including `tests/todo.test.ts`, with no omitted files or duplicate runs. Keep intended concurrency within test cases and do not weaken assertions.
+The canonical `test` script in [package.json](package.json) is `bun test --parallel`. It runs the full discovered suite, including `tests/todo.test.ts`, with CPU-derived file parallelism and no omitted files, arbitrary worker cap or exclusion list. Keep intended concurrency within test cases and do not weaken assertions.
 
-Full Bun coverage includes `tests/smoke.test.ts`. Do not add `bun run smoke` again by default. The Node `.mjs` suites are separate observations, not part of Bun discovery.
+Full Bun coverage includes `tests/smoke.test.ts`. Do not add `bun run smoke` again by default. Ordinary SDK, retention and JEV Node fixtures are already reached by Bun callers; do not repeat them by default. The separate CodeGraph Node suite remains required. Standalone ad-hoc, query and Hermes history observers remain affected-only checks when their contracts change; do not sweep every `.mjs` file.
+
+### Use the repository recipe through ordinary codemode
+
+Use [scripts/verification-recipe-v1.js](scripts/verification-recipe-v1.js), not a new SDK driver or codemode factory. Pi's built-in codemode must already be active through normal tool selection. Under `$execute`, reopen with `openExecutionPlan` and reconcile the ledger and Team holds first. In the ordinary Node/Bun workflow context, obtain a fresh absolute invocation directory with `evidenceFile(planId, uniqueRelative, binding.executionRoot)` from `extensions/workflow.ts`. Choose a unique relative name for each invocation. Pass that returned directory and the captured `binding.executionRoot` into QuickJS; do not import the Node helper there or concatenate `.pitako/runs` paths.
+
+In actual codemode, with those resolved `executionRoot` and `evidenceDir` values:
+
+```js
+const source = await tools.read({
+  path: executionRoot + "/scripts/verification-recipe-v1.js",
+});
+if (typeof source !== "string" ||
+    /\[(?:Showing |.*more lines in file|Line .*exceeds)/.test(source))
+  throw new Error("Incomplete verification recipe source read");
+const recipe = eval(source);
+if (recipe.version !== 1 || typeof recipe.run !== "function")
+  throw new Error("Unsupported verification recipe");
+text(await recipe.run({
+  root: executionRoot,
+  evidenceDir,
+  selection: {kind: "focused", files: ["tests/workflow.test.ts"]},
+}));
+```
+
+Read the complete source before evaluation: no offset/limit, failed read, non-string result or truncation/continuation notice. Record current source identity with the execution binding; version 1 alone does not identify the bytes. The optional JEV helper is separate: resolve `jev-advice.js` beside verify-behavior's advertised installed `SKILL.md` path, not beside this repository recipe. Finish any short advisory call before checks. No classifier or provider is required.
+
+Use `{kind: "focused", files: [...]}` for explicit `tests/**/*.test.ts` paths, or `{kind: "gate", gate: "typecheck" | "bun" | "code-intelligence-node"}` for a fixed gate. The final `{kind: "full"}` selection runs exactly the three commands above in order. The principal coordinator owns that final complete invocation directly. Never delegate it to an AgentInstance or Team subject to the 45-minute tool-stall watchdog. Workers may run focused checks with bounds appropriate to their fixtures.
+
+Leave routine bash timeout and codemode `timeout_ms` unset and await nested calls. This removes those deadlines, not every caller constraint. Use no detached runner, heartbeat or settings change. The thin shell capture retains raw logs, start metadata, child environment choices and observed exits below `evidenceDir`; bounded results name those paths. `BUN_OPTIONS=''` removes inherited runner flags only for the child; `NO_COLOR=1 FORCE_COLOR=0` makes its logs readable. The principal environment is unchanged.
+
+Stop the full procedure at the first failed, interrupted or unavailable command and name remaining obligations as unrun. Tool errors, malformed results, capture failure or missing terminal observation are incomplete, never passes. Preserve partial and failed logs. Establish prior owned invocation settlement before launching a replacement; no automatic retry or hidden resume.
 
 Inspect actual output and exits for each command. Record failures, early-return or skipped cases, interrupted runs, and unrun checks separately from passes. Preserve relevant prerequisite and environment details. A successful typecheck does not prove runtime behavior.
 

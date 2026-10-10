@@ -810,11 +810,29 @@ test("unsupported AST languages use LSP symbols or report unavailable", async ()
   expect((await invoke("read_enclosing", dir, { file: "sample.unknown", line: 1 })).status).toBe("ambiguous");
   expect((await invoke("module_report", dir, { file: "sample.unknown" })).status).toBe("ambiguous");
 
-  if (findServerForExtension(".rs").status !== "found") return;
   const rustFile = path.join(dir, "src", "lib.rs");
   mkdirSync(path.dirname(rustFile), { recursive: true });
   writeFileSync(path.join(dir, "Cargo.toml"), '[package]\nname = "lsp_symbols_fixture"\nversion = "0.1.0"\nedition = "2021"\n');
   writeFileSync(rustFile, "pub fn hello() {\n    println!(\"hello\");\n}\n");
+  bindTestLsp(() => dir, () => ({
+    documentSymbols: async () => { throw new Error("fixture symbols unavailable"); },
+  }));
+  expect(await invoke("module_report", dir, { file: "src/lib.rs", language: "Rust" })).toMatchObject({
+    status: "unavailable", source: "LSP documentSymbols", reason: "Error: fixture symbols unavailable",
+  });
+  let resolveSlow!: (symbols: unknown[]) => void;
+  let enteredSlow!: () => void;
+  const slowEntered = new Promise<void>((resolve) => { enteredSlow = resolve; });
+  const slowSymbols = new Promise<unknown[]>((resolve) => { resolveSlow = resolve; });
+  bindTestLsp(() => dir, (file) => ({
+    documentSymbols: async () => {
+      if (path.basename(file) === "slow.rs") {
+        enteredSlow();
+        return slowSymbols;
+      }
+      return [{ name: "hello", kind: 12, range: { start: { line: 0, character: 0 }, end: { line: 2, character: 1 } } }];
+    },
+  }));
   const module = await invoke("module_report", dir, { file: "src/lib.rs", language: "Rust" });
   expect(module.source).toBe("LSP documentSymbols");
   expect(module.importsStatus.status).toBe("unavailable");
@@ -829,13 +847,18 @@ test("unsupported AST languages use LSP symbols or report unavailable", async ()
   const tool = CODE_INTELLIGENCE_TOOLS.find((item) => item.name === "read_enclosing")!;
   const startedAt = Date.now();
   const pending = tool.execute("cancel-lsp", { file: "src/slow.rs", line: 1, language: "Rust" }, controller.signal, () => {}, { cwd: dir });
-  await new Promise((resolve) => setTimeout(resolve, 50));
-  controller.abort();
-  const cancelled = await pending;
-  expect(cancelled.isError).toBe(true);
-  expect(cancelled.content[0]!.text).toMatch(/abort/i);
-  expect(Date.now() - startedAt).toBeLessThan(500);
-  await new Promise((resolve) => setTimeout(resolve, 1_050));
+  try {
+    await slowEntered;
+    controller.abort();
+    const cancelled = await pending;
+    expect(cancelled.isError).toBe(true);
+    expect(cancelled.content[0]!.text).toMatch(/abort/i);
+    expect(Date.now() - startedAt).toBeLessThan(500);
+  } finally {
+    resolveSlow([]);
+    await slowSymbols;
+    await (await globals[lspRegistryKey]!).queues.get(dir);
+  }
 });
 
 test("tool execution aborts instead of returning success", async () => {

@@ -35,9 +35,12 @@ if (process.argv[2] === "writer") {
   const history = new WorkerHistory();
   const group = history.createGroup(root);
   let writer;
+  let writerClosed;
   try {
     writer = spawn("node", [...args, "writer", group.groupId, root], { env: process.env, stdio: ["pipe", "pipe", "pipe"] });
-    const exited = once(writer, "exit");
+    // Install once, before any await; failure cleanup must not await an event
+    // that already fired, and close includes the owned stdio handles.
+    writerClosed = once(writer, "close");
     let errors = ""; writer.stderr.on("data", (bytes) => { errors += bytes; });
     const [ready] = await once(writer.stdout, "data");
     const member = JSON.parse(ready.toString().trim());
@@ -45,7 +48,7 @@ if (process.argv[2] === "writer") {
     assert.equal((await pruneWorkerHistory(history, 180, { now })).groups[0].state, "busy");
     assert.deepEqual(readFileSync(member.file), bytes, "prune cannot unlink an admitted writer");
     writer.stdin.end("release\n");
-    assert.equal((await exited)[0], 0, errors);
+    assert.equal((await writerClosed)[0], 0, errors);
     writer = undefined;
     const sentinel = path.join(root, "contract-sentinel"); writeFileSync(sentinel, "protected evidence");
     const crash = spawnSync("node", [...args, "crash"], { env: process.env, encoding: "utf8", timeout: 10000 });
@@ -64,7 +67,10 @@ if (process.argv[2] === "writer") {
     assert.equal(readFileSync(sentinel, "utf8"), "protected evidence");
     console.log("admitted writer protected; crash intent and uncertain lock preserved");
   } finally {
-    if (writer) { writer.kill("SIGKILL"); await once(writer, "exit"); }
+    if (writer) {
+      if (writer.exitCode === null && writer.signalCode === null) writer.kill("SIGKILL");
+      await writerClosed;
+    }
     rmSync(root, { recursive: true, force: true });
   }
 }

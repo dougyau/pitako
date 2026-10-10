@@ -2,7 +2,7 @@ import { describe, expect, test, beforeEach } from "bun:test";
 import { replayFromBranch } from "../node_modules/@juicesharp/rpiv-todo/state/replay.ts";
 import { __resetState, replaceState } from "../node_modules/@juicesharp/rpiv-todo/state/store.ts";
 import { packageRoot } from "../extensions/stack.ts";
-import { loadPitako } from "../scripts/load-pitako.ts";
+import { loadPitako } from "./fixtures/owned-pitako.ts";
 
 interface ToolResult {
   content?: Array<{ type?: string; text?: string }>;

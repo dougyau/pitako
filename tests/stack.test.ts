@@ -1,9 +1,20 @@
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { PitakoConfigError } from "../extensions/errors.ts";
 import { commandOnPath, packageRoot, prepareRuntime, readStack } from "../extensions/stack.ts";
+
+const roots: string[] = [];
+function fixtureRoot(prefix: string): string {
+  const root = mkdtempSync(path.join(tmpdir(), prefix));
+  roots.push(root);
+  return root;
+}
+afterEach(() => {
+  for (const root of roots) rmSync(root, { recursive: true, force: true });
+  roots.length = 0;
+});
 
 describe("stack configuration", () => {
   test("package manifest entries match config/stack.json and stay relative", () => {
@@ -64,7 +75,7 @@ describe("stack configuration", () => {
   });
 
   test("missing extension entry explains how to fix the install", () => {
-    const root = mkdtempSync(path.join(tmpdir(), "pitako-missing-"));
+    const root = fixtureRoot("pitako-missing-");
     mkdirSync(path.join(root, "config"), { recursive: true });
     const stack = readStack(packageRoot());
     writeFileSync(path.join(root, "config", "stack.json"), JSON.stringify(stack));
@@ -81,7 +92,7 @@ describe("stack configuration", () => {
   });
 
   test("missing pi-web-access entry explains how to fix the install", () => {
-    const root = mkdtempSync(path.join(tmpdir(), "pitako-missing-web-"));
+    const root = fixtureRoot("pitako-missing-web-");
     mkdirSync(path.join(root, "config"), { recursive: true });
     const stack = readStack(packageRoot());
     writeFileSync(path.join(root, "config", "stack.json"), JSON.stringify(stack));
@@ -102,7 +113,7 @@ describe("stack configuration", () => {
   });
 
   test("codegraph on PATH is accepted without a bundled binary", () => {
-    const root = mkdtempSync(path.join(tmpdir(), "pitako-bin-"));
+    const root = fixtureRoot("pitako-bin-");
     mkdirSync(path.join(root, "config"), { recursive: true });
     const stack = readStack(packageRoot());
     writeFileSync(path.join(root, "config", "stack.json"), JSON.stringify(stack));
@@ -111,7 +122,7 @@ describe("stack configuration", () => {
       mkdirSync(path.dirname(entry), { recursive: true });
       writeFileSync(entry, "export {};\n");
     }
-    const binDir = mkdtempSync(path.join(tmpdir(), "pitako-path-"));
+    const binDir = fixtureRoot("pitako-path-");
     writeFileSync(path.join(binDir, "codegraph"), "");
     const env = { PATH: binDir };
     const prepared = prepareRuntime(root, env);

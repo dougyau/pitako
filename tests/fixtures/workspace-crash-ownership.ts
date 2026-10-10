@@ -40,7 +40,7 @@ export function workspaceCrashOwnership(directories: string[]) {
     return { spawned, closed: result, settled: closed };
   }
 
-  function ownedCase(name: string, body: () => Promise<void>) {
+  function ownedCase(name: string, body: () => void | Promise<void>) {
     return async () => {
       requireReleased();
       released = false;
@@ -54,6 +54,11 @@ export function workspaceCrashOwnership(directories: string[]) {
       for (const result of results) if (result.status === "rejected") cleanupErrors.push(result.reason);
       if (cleanupErrors.length) {
         throw new AggregateError([...errors, ...cleanupErrors], "Workspace crash release is uncertain");
+      }
+      if (process.env.PITAKO_FIXTURE_WITNESS) {
+        writeSync(2, `WORKSPACE FIXTURE SETTLED: ${JSON.stringify({
+          case: label, cleanups: results.map((result) => result.status), directories,
+        })}\n`);
       }
       released = true;
       if (errors.length) throw new AggregateError(errors, "Workspace crash callback failed");

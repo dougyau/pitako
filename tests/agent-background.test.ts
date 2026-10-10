@@ -1,3 +1,4 @@
+import { agentFixtureOwnership } from "./fixtures/agent-fixture-ownership.ts";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -30,9 +31,11 @@ import { packageRoot } from "../extensions/stack.ts";
 import { ledgerFile, planFile } from "../extensions/workflow.ts";
 import type { LoadOptions } from "../extensions/roles/load.ts";
 
-const tempDirs: string[] = [];
+const fixture = agentFixtureOwnership();
+const tempDirs = fixture.directories;
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 afterEach(() => {
+  fixture.requireReleasedFixture();
   if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
   else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
   cancelAllWorkers();
@@ -56,7 +59,7 @@ function hang(): { executor: AttemptExecutor; started: Promise<void>; release: (
   const started = new Promise<void>((resolve) => {
     markStarted = resolve;
   });
-  const gate = new Promise<Attempt>((resolve) => {
+  const gate = fixture.pendingAttempt((resolve) => {
     finish = resolve;
   });
   let seen: AbortSignal | undefined;
@@ -89,7 +92,7 @@ function owner(idle: boolean): BackgroundOwner & { notes: string[]; wakes: strin
 }
 
 describe("pitako agents command", () => {
-  test("empty list, running row, id filter, and unknown id", async () => {
+  test("empty list, running row, id filter, and unknown id", fixture.ownedCase("empty list, running row, id filter, and unknown id", async () => {
     const cmd = pitakoAgentsCommand();
     const empty = await cmd.run("agents");
     expect(empty.threw).toBe(false);
@@ -131,11 +134,11 @@ describe("pitako agents command", () => {
     cancelWorker(handle.instanceId);
     hanging.release({ status: "cancelled", result: "SECRET-RESULT", sideEffects: false });
     await waitFor(handle.instanceId);
-  });
+  }));
 });
 
 describe("cancel before settle", () => {
-  test("status is cancelled and result stays unavailable until the executor settles", async () => {
+  test("status is cancelled and result stays unavailable until the executor settles", fixture.ownedCase("status is cancelled and result stays unavailable until the executor settles", async () => {
     const hanging = hang();
     const handle = await spawnBackground({
       roleId: "developer",
@@ -152,11 +155,11 @@ describe("cancel before settle", () => {
     hanging.release({ status: "cancelled", result: "cancelled", sideEffects: false });
     await waitFor(handle.instanceId);
     expect(workerResult(handle.instanceId).status).toBe("cancelled");
-  });
+  }));
 });
 
 describe("background registry", () => {
-  test("spawn returns while the executor is pending", async () => {
+  test("spawn returns while the executor is pending", fixture.ownedCase("spawn returns while the executor is pending", async () => {
     const hanging = hang();
     const handle = await spawnBackground({
       roleId: "developer",
@@ -175,9 +178,9 @@ describe("background registry", () => {
     const result = workerResult(handle.instanceId);
     expect(result.result).toBe("SECRET-RESULT");
     expect(workerResult(handle.instanceId).result).toBe("SECRET-RESULT");
-  });
+  }));
 
-  test("pre-abort starts nothing", async () => {
+  test("pre-abort starts nothing", fixture.ownedCase("pre-abort starts nothing", async () => {
     const hanging = hang();
     const foreground = new AbortController();
     foreground.abort();
@@ -192,9 +195,9 @@ describe("background registry", () => {
       }),
     ).rejects.toThrow("agent_spawn cancelled");
     expect(workerStatus()).toEqual([]);
-  });
+  }));
 
-  test("foreground abort after accept does not cancel the worker", async () => {
+  test("foreground abort after accept does not cancel the worker", fixture.ownedCase("foreground abort after accept does not cancel the worker", async () => {
     const hanging = hang();
     const foreground = new AbortController();
     const handle = await spawnBackground({
@@ -211,9 +214,9 @@ describe("background registry", () => {
     expect(workerStatus(handle.instanceId)[0]?.status).toBe("running");
     cancelWorker(handle.instanceId);
     expect(hanging.signal()?.aborted).toBe(true);
-  });
+  }));
 
-  test("two workers stay independent", async () => {
+  test("two workers stay independent", fixture.ownedCase("two workers stay independent", async () => {
     const a = hang();
     const b = hang();
     const first = await spawnBackground({
@@ -239,9 +242,9 @@ describe("background registry", () => {
     await waitFor(second.instanceId);
     expect(workerResult(second.instanceId).result).toBe("B");
     expect(workerResult(second.instanceId).instanceId).toBe(second.instanceId);
-  });
+  }));
 
-  test("completion is one compact signal and shutdown drops a late settle", async () => {
+  test("completion is one compact signal and shutdown drops a late settle", fixture.ownedCase("completion is one compact signal and shutdown drops a late settle", async () => {
     const bound = owner(true);
     bindBackgroundOwner(bound);
     const hanging = hang();
@@ -285,9 +288,9 @@ describe("background registry", () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(held.notes).toEqual([]);
     expect(() => workerStatus(running.instanceId)).toThrow(/unknown worker/);
-  });
+  }));
 
-  test("a foreign token does not flush or cancel", async () => {
+  test("a foreign token does not flush or cancel", fixture.ownedCase("a foreign token does not flush or cancel", async () => {
     const bound = owner(false);
     bindBackgroundOwner(bound);
     const hanging = hang();
@@ -310,11 +313,11 @@ describe("background registry", () => {
     expect(text).toContain(handle.instanceId);
     expect(text).not.toContain("SECRET-RESULT");
     expect(takeHeldCompletions(bound.token)).toBeUndefined();
-  });
+  }));
 });
 
 describe("background tools", () => {
-  test("spawn tool returns before the executor finishes and does not steer", async () => {
+  test("spawn tool returns before the executor finishes and does not steer", fixture.ownedCase("spawn tool returns before the executor finishes and does not steer", async () => {
     process.env.PI_CODING_AGENT_DIR = load().env?.PI_CODING_AGENT_DIR;
     const hanging = hang();
     setBackgroundExecutor(hanging.executor);
@@ -391,9 +394,9 @@ describe("background tools", () => {
     } as unknown as ExtensionAPI);
     childHandlers.get("agent_settled")?.();
     expect(sent.filter((item) => (item as { child?: boolean }).child)).toEqual([]);
-  });
+  }));
 
-  test("watched low-level workers inherit the pinned execution worktree", async () => {
+  test("watched low-level workers inherit the pinned execution worktree", fixture.ownedCase("watched low-level workers inherit the pinned execution worktree", async () => {
     const base = mkdtempSync(path.join(tmpdir(), "pitako-bg-frozen-root-"));
     tempDirs.push(base);
     const source = path.join(base, "source");
@@ -408,39 +411,33 @@ describe("background tools", () => {
     const config = load();
     const agentDir = config.env?.PI_CODING_AGENT_DIR;
     if (!agentDir) throw new Error("test agent directory missing");
-    const previous = process.env.PI_CODING_AGENT_DIR;
     process.env.PI_CODING_AGENT_DIR = agentDir;
     let finish!: (attempt: Attempt) => void;
     let workerCwd = "";
     setBackgroundExecutor({ async start(input) {
       workerCwd = input.cwd;
-      return new Promise<Attempt>((resolve) => (finish = resolve));
+      return fixture.pendingAttempt((resolve) => (finish = resolve));
     } });
     const tools = new Map<string, { execute: Function }>();
     agentInstance({ registerTool(tool: { name: string; execute: Function }) { tools.set(tool.name, tool); } } as unknown as ExtensionAPI);
-    try {
-      const result = await tools.get("agent_spawn")!.execute("call", {
-        role: "developer", task: "work in pinned tree", plan: "background-frozen-root", unit: "T3",
-      }, new AbortController().signal, undefined, { cwd: execution });
-      expect(result.isError).not.toBe(true);
-      expect(workerCwd).toBe(execution);
-      expect(existsSync(ledgerFile("background-frozen-root", execution))).toBe(true);
-      finish({ status: "completed", result: "done", sideEffects: false });
-      await waitFor(result.details.instanceId);
-      expect(workerResult(result.details.instanceId).result).toBe("done");
-    } finally {
-      if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
-      else process.env.PI_CODING_AGENT_DIR = previous;
-    }
-  });
+    const result = await tools.get("agent_spawn")!.execute("call", {
+      role: "developer", task: "work in pinned tree", plan: "background-frozen-root", unit: "T3",
+    }, new AbortController().signal, undefined, { cwd: execution });
+    expect(result.isError).not.toBe(true);
+    expect(workerCwd).toBe(execution);
+    expect(existsSync(ledgerFile("background-frozen-root", execution))).toBe(true);
+    finish({ status: "completed", result: "done", sideEffects: false });
+    await waitFor(result.details.instanceId);
+    expect(workerResult(result.details.instanceId).result).toBe("done");
+  }));
 
-  test("childActiveTools drops orchestration tools", () => {
+  test("childActiveTools drops orchestration tools", fixture.ownedCase("childActiveTools drops orchestration tools", () => {
     const names = childActiveTools(["read", ...ORCHESTRATION_TOOLS]);
     for (const name of ORCHESTRATION_TOOLS) expect(names).not.toContain(name);
     expect(names).toContain("read");
-  });
+  }));
 
-  test("agent_spawn is refused inside an instance", async () => {
+  test("agent_spawn is refused inside an instance", fixture.ownedCase("agent_spawn is refused inside an instance", async () => {
     const tools = new Map<string, { execute: Function }>();
     agentInstance({
       registerTool(def: { name: string; execute: Function }) {
@@ -452,7 +449,7 @@ describe("background tools", () => {
     );
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("cannot be called");
-  });
+  }));
 });
 
 describe("parent turn during child prompt", () => {
@@ -464,7 +461,7 @@ describe("parent turn during child prompt", () => {
     delete (globalThis as { __pitakoHangProvider?: unknown }).__pitakoHangProvider;
   });
 
-  test("a parent prompt completes while the child prompt is pending", async () => {
+  test("a parent prompt completes while the child prompt is pending", fixture.ownedCase("a parent prompt completes while the child prompt is pending", async () => {
     const agentDir = mkdtempSync(path.join(tmpdir(), "pitako-hang-agent-"));
     const cwd = mkdtempSync(path.join(tmpdir(), "pitako-hang-cwd-"));
     tempDirs.push(agentDir, cwd);
@@ -487,9 +484,16 @@ describe("parent turn during child prompt", () => {
         { id: "hang", name: "Hang", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000, maxTokens: 64 },
         { id: "fast", name: "Fast", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000, maxTokens: 64 },
       ],
-      streamSimple(model: { id: string }) {
+      streamSimple(model: { id: string }, _context: unknown, options?: { signal?: AbortSignal }) {
         const stream = createAssistantMessageEventStream();
         if (model.id === "hang") {
+          const abort = () => {
+            const message = { ...assistant(model.id, ""), stopReason: "aborted" as const, errorMessage: "Request was aborted" };
+            stream.push({ type: "error", reason: "aborted", error: message });
+            stream.end(message);
+          };
+          if (options?.signal?.aborted) abort();
+          else options?.signal?.addEventListener("abort", abort, { once: true });
           started();
           return stream;
         }
@@ -515,12 +519,12 @@ describe("parent turn during child prompt", () => {
     await childPromptStarted;
     expect(workerStatus(handle.instanceId)[0]?.status).toBe("running");
     const runtime = await ModelRuntime.create({ authPath: path.join(agentDir, "auth.json"), modelsPath: null, allowModelNetwork: false });
-    const { session } = await createAgentSession({
+    const { session } = await fixture.acquire(createAgentSession({
       cwd,
       agentDir,
       sessionManager: SessionManager.inMemory(cwd),
       modelRuntime: runtime,
-    });
+    }));
     try {
       const model = runtime.getModel("pitako-hang", "fast");
       if (!model) throw new Error("fast model missing");
@@ -532,7 +536,7 @@ describe("parent turn during child prompt", () => {
       cancelWorker(handle.instanceId);
       await session.dispose();
     }
-  }, 60_000);
+  }), 60_000);
 });
 
 function assistant(model: string, text: string) {

@@ -8,10 +8,21 @@ import { openBoard } from "../extensions/board/store.ts";
 import { repositoryIdentity } from "../extensions/board/workspace.ts";
 import { runAgentInstance } from "../extensions/agent/run.ts";
 import { ledgerFile, openExecutionPlan, planFile } from "../extensions/workflow.ts";
+import { settleOwnedCodeGraph } from "../scripts/owned-codegraph.ts";
 
 const tempDirs: string[] = [];
 
-afterEach(() => {
+afterEach(async () => {
+  // Roots stay until both native daemons and their watchdog children terminate.
+  for (const dir of tempDirs) {
+    if (!path.basename(dir).startsWith("pitako-intelligence-worktree-")) continue;
+    for (const name of ["A", "B"]) {
+      const project = path.join(dir, name);
+      if (!existsSync(project)) continue;
+      const receipt = await settleOwnedCodeGraph(project);
+      console.error(`PITAKO_WORKTREE_SETTLED=${JSON.stringify(receipt)}`);
+    }
+  }
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 

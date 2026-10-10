@@ -19,14 +19,17 @@ export function bindLspApi(binding: LspBinding): void {
   const global = globalThis as LspRegistry;
   const extensionRegistry = globalThis as typeof globalThis & { [key: symbol]: ExtensionLookup | undefined };
   extensionRegistry[EXTENSION_LOOKUP] ??= binding.findServerForExtension;
-  const shared = Promise.resolve().then(() => ({
+  if (global[REGISTRY]) return;
+  let manager: SharedLsp["manager"];
+  const shared = Promise.resolve({
     findWorkspaceRoot: binding.findWorkspaceRoot,
     withLspClient: binding.withLspClient,
-    manager: binding.createManager(),
+    // Registration alone must not start the manager's reaper or exit listeners.
+    get manager() { return manager ??= binding.createManager(); },
     queues: new Map(),
-  })) as RegisteredLsp;
+  }) as RegisteredLsp;
   shared.findServerForExtension = binding.findServerForExtension;
-  global[REGISTRY] ??= shared;
+  global[REGISTRY] = shared;
 }
 
 export function hasLspServerForExtension(extension: string): boolean {

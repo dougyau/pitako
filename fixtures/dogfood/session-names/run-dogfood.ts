@@ -131,6 +131,8 @@ async function runArm(arm: Arm, run: number): Promise<void> {
   if (copiedFixtureHash !== fixtureHash) throw new Error("Copied arm does not match frozen fixture");
 
   const loaded = await loadPitako(packageRoot(), armRoot);
+  let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
+  try {
   const controlPath = path.join(loaded.agentDir, "dogfood-control.mjs");
   await writeFile(controlPath, guardSource(manifest.writableFiles));
   const mutableLoader = loaded.loader as unknown as {
@@ -151,7 +153,6 @@ async function runArm(arm: Arm, run: number): Promise<void> {
   if (!extensionOrder.at(-1)?.endsWith("dogfood-control.mjs")) throw new Error("Dogfood guard is not last in extension order");
   loaded.loader.getAppendSystemPrompt().push(roleInstructions);
 
-  let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
   const calls: Array<{ tool: string; path?: string; editCount?: number; targets?: string[]; failed?: boolean }> = [];
   const patches: Array<Record<string, unknown>> = [];
   let gateToolCalls = 0;
@@ -341,8 +342,13 @@ async function runArm(arm: Arm, run: number): Promise<void> {
     await saveEvidence("running");
   } finally {
     session?.dispose();
+    session = undefined;
     delete (globalThis as typeof globalThis & { __pitakoDogfoodArm?: string; __pitakoDogfoodPrompt?: Record<string, unknown> }).__pitakoDogfoodArm;
     delete (globalThis as typeof globalThis & { __pitakoDogfoodArm?: string; __pitakoDogfoodPrompt?: Record<string, unknown> }).__pitakoDogfoodPrompt;
+  }
+  } finally {
+    // A failed session disposal retains the loader roots for diagnosis.
+    if (!session) loaded.releaseOwnedDirectories();
   }
 }
 

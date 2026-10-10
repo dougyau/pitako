@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, spyOn, test } from "bun:test";
 import { AgentSession, createAgentSession, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { WorkerHistory, SessionHistory, nativeHistoryStatus } from "../extensions/agent/history.ts";
 import { executionForSession } from "../extensions/execution-identity.ts";
@@ -15,9 +15,12 @@ import { packageRoot } from "../extensions/stack.ts";
 import { providerFixtureOwnership } from "./fixtures/provider-fixture-ownership.ts";
 import type { ResolvedRole } from "../extensions/roles/types.ts";
 
-const fixture = providerFixtureOwnership();
+// Hermes captures AGENT_ROOT at import time. Later sessions reuse that storage
+// even after PI_CODING_AGENT_DIR changes; its owner is this file, not one case.
+const fixture = providerFixtureOwnership({ deferDirectories: true });
 const tempDirs = fixture.directories;
 afterEach(fixture.requireReleasedFixture);
+afterAll(fixture.releaseDirectories);
 
 describe("cursor request", () => {
   test("keeps session tools on the provider context", () => {
@@ -45,9 +48,13 @@ describe("pi adapter boundary", () => {
     expect(child.status, child.stderr + child.stdout).toBe(0);
     const observed = JSON.parse(child.stdout);
     expect(observed.ordinaryChild).toMatchObject({
-      providerCalls: 6, codemodeCalls: 3, actualReadBash: true, hooks: true,
+      providerCalls: 7, codemodeCalls: 4, actualReadBash: true, hooks: true,
       validation: true, orchestrationExcluded: true, disposedIdentity: true,
     });
+    expect(observed.ordinaryChild.recipe.logs.map((log: { status: string }) => log.status)).toEqual(["passed", "failed"]);
+    expect(observed.ordinaryChild.recipe.toolError).toBe("incomplete");
+    expect(observed.ordinaryChild.parallel.exitCode).toBe(0);
+    expect(new Set(observed.ordinaryChild.parallel.workerPids).size).toBe(2);
     expect(observed.recovered.preassistant).toBe("cancelled-with-retained-user");
     expect(observed.removedWorktree).toBe(true);
     expect(observed.paidCalls).toBe(0);
@@ -161,7 +168,7 @@ describe("pi adapter boundary", () => {
     const model = runtime.getModels()[0];
     if (!model) throw new Error("Pi static catalog has no model");
     const loaded = await loadPitako(packageRoot(), cwd);
-    tempDirs.push(loaded.agentDir);
+    fixture.releaseDirectoriesAfterDisposal(loaded.releaseOwnedDirectories, [loaded.agentDir]);
     const { session } = await fixture.acquire(createAgentSession({
       cwd,
       agentDir,

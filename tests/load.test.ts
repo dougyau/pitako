@@ -2,13 +2,25 @@ import { spawnSync } from "node:child_process";
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import pitako from "../extensions/index.ts";
 import { agentScope } from "../extensions/agent/scope.ts";
 import { packageRoot } from "../extensions/stack.ts";
 import { childActiveTools, toolsForProfile } from "../extensions/profile.ts";
-import { loadPitako, registeredToolNames } from "../scripts/load-pitako.ts";
+import { registeredToolNames } from "../scripts/load-pitako.ts";
+import { loadPitako } from "./fixtures/owned-pitako.ts";
+
+const configDirs: string[] = [];
+function configDirectory(prefix: string) {
+  const dir = mkdtempSync(path.join(tmpdir(), prefix));
+  configDirs.push(dir);
+  return dir;
+}
+afterEach(() => {
+  for (const dir of configDirs) rmSync(dir, { recursive: true, force: true });
+  configDirs.length = 0;
+});
 
 async function loadWithWebConfig(packagePath: string, configDir: string) {
   const previous = process.env.PI_CODING_AGENT_DIR;
@@ -122,7 +134,7 @@ describe("Pi package loading", () => {
 
   test("discovers explicit-only gates from the edited package in a fresh loader", () => {
     const root = packageRoot();
-    const loaded = loadInFreshProcess(root, mkdtempSync(path.join(tmpdir(), "pitako-gates-config-")));
+    const loaded = loadInFreshProcess(root, configDirectory("pitako-gates-config-"));
     expect(loaded.errors).toEqual([]);
     const gates = loaded.skills.filter((skill) => skill.name === "gates");
     expect(gates).toHaveLength(1);
@@ -137,7 +149,7 @@ describe("Pi package loading", () => {
 
   test("discovers the required extensions from a relative package path", async () => {
     const root = packageRoot();
-    const isolatedConfig = mkdtempSync(path.join(tmpdir(), "pitako-web-config-empty-"));
+    const isolatedConfig = configDirectory("pitako-web-config-empty-");
     const loaded = await loadWithWebConfig(root, isolatedConfig);
     expect(path.isAbsolute(loaded.relativePackagePath)).toBe(false);
     expect(loaded.extensions.errors).toEqual([]);
@@ -235,7 +247,7 @@ describe("Pi package loading", () => {
 
   test("configuration can disable and rename web tools", () => {
     const root = packageRoot();
-    const configDir = mkdtempSync(path.join(tmpdir(), "pitako-web-config-custom-"));
+    const configDir = configDirectory("pitako-web-config-custom-");
     writeFileSync(path.join(configDir, "web-search.json"), JSON.stringify({
       tools: { webSearch: { enabled: false } },
       toolNames: { fetchContent: "fetch_page" },

@@ -1,3 +1,4 @@
+import { agentFixtureOwnership } from "./fixtures/agent-fixture-ownership.ts";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -19,9 +20,11 @@ import { formatFooter } from "../extensions/agent/ui.ts";
 import { packageRoot } from "../extensions/stack.ts";
 import type { LoadOptions } from "../extensions/roles/load.ts";
 
-const tempDirs: string[] = [];
+const fixture = agentFixtureOwnership();
+const tempDirs = fixture.directories;
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 afterEach(() => {
+  fixture.requireReleasedFixture();
   if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
   else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
   cancelAllWorkers();
@@ -53,9 +56,9 @@ async function waitSettled(instanceId: string): Promise<void> {
 }
 
 describe("T2 observations", () => {
-  test("accepted background worker observation has role, task, running", async () => {
+  test("accepted background worker observation has role, task, running", fixture.ownedCase("accepted background worker observation has role, task, running", async () => {
     let release!: (attempt: { status: "completed"; result: string; sideEffects: false }) => void;
-    const gate = new Promise<{ status: "completed"; result: string; sideEffects: false }>((resolve) => {
+    const gate = fixture.pendingAttempt((resolve) => {
       release = resolve;
     });
     let started!: () => void;
@@ -86,9 +89,9 @@ describe("T2 observations", () => {
     expect(typeof row?.acceptedAt).toBe("number");
     release({ status: "completed", result: "ok", sideEffects: false });
     await waitSettled(handle.instanceId);
-  });
+  }));
 
-  test("message_update usage.output updates tokens without changing watchdog phase", async () => {
+  test("message_update usage.output updates tokens without changing watchdog phase", fixture.ownedCase("message_update usage.output updates tokens without changing watchdog phase", async () => {
     let clock = 0;
     const phases: string[] = [];
     const tokens: Array<number | undefined> = [];
@@ -120,9 +123,9 @@ describe("T2 observations", () => {
     expect(tokens.some((value) => value === 42)).toBe(true);
     expect(phases.every((phase) => phase === "working")).toBe(true);
     expect(result.watchdog?.phase).toBe("working");
-  });
+  }));
 
-  test("fallbackOccurred observation keeps selected model gated on appliedReasoning", async () => {
+  test("fallbackOccurred observation keeps selected model gated on appliedReasoning", fixture.ownedCase("fallbackOccurred observation keeps selected model gated on appliedReasoning", async () => {
     const snaps: Array<{ selectedModel: string; appliedReasoning?: string; fallbackOccurred?: boolean }> = [];
     const executor: AttemptExecutor = {
       async start(input) {
@@ -202,11 +205,11 @@ describe("T2 observations", () => {
       120,
     );
     expect(footerApplied).toContain("fallback-1");
-  });
+  }));
 
-  test("agent_result text unchanged and observation becomes taken", async () => {
+  test("agent_result text unchanged and observation becomes taken", fixture.ownedCase("agent_result text unchanged and observation becomes taken", async () => {
     let release!: (attempt: { status: "completed"; result: string; sideEffects: false }) => void;
-    const gate = new Promise<{ status: "completed"; result: string; sideEffects: false }>((resolve) => {
+    const gate = fixture.pendingAttempt((resolve) => {
       release = resolve;
     });
     const handle = await spawnBackground({
@@ -237,12 +240,12 @@ describe("T2 observations", () => {
     // Second read still same result object fields.
     expect(workerResult(handle.instanceId).result).toBe("SECRET-BODY");
     expect(formatAgentResult(workerResult(handle.instanceId))).toBe(text);
-  });
+  }));
 
-  test("agent_status text still comes from formatWorkerViews only", async () => {
+  test("agent_status text still comes from formatWorkerViews only", fixture.ownedCase("agent_status text still comes from formatWorkerViews only", async () => {
     process.env.PI_CODING_AGENT_DIR = load().env?.PI_CODING_AGENT_DIR;
     let release!: (attempt: { status: "completed"; result: string; sideEffects: false }) => void;
-    const gate = new Promise<{ status: "completed"; result: string; sideEffects: false }>((resolve) => {
+    const gate = fixture.pendingAttempt((resolve) => {
       release = resolve;
     });
     let started!: () => void;
@@ -285,9 +288,9 @@ describe("T2 observations", () => {
 
     release({ status: "completed", result: "ok", sideEffects: false });
     await waitSettled(spawnResult.details.instanceId);
-  });
+  }));
 
-  test("model_stream samples accumulate streamMs and tool freezes the clock", async () => {
+  test("model_stream samples accumulate streamMs and tool freezes the clock", fixture.ownedCase("model_stream samples accumulate streamMs and tool freezes the clock", async () => {
     let clock = 0;
     let lastStreamMs: number | undefined;
     const executor: AttemptExecutor = {
@@ -336,9 +339,9 @@ describe("T2 observations", () => {
       },
     });
     expect(lastStreamMs).toBe(1100);
-  });
+  }));
 
-  test("cursor-native hold freezes stream clock and publishes activeTool", async () => {
+  test("cursor-native hold freezes stream clock and publishes activeTool", fixture.ownedCase("cursor-native hold freezes stream clock and publishes activeTool", async () => {
     let clock = 0;
     let tick = () => {};
     let holding = false;
@@ -408,5 +411,5 @@ describe("T2 observations", () => {
     expect(held.every((h) => h.lastKind === "model_stream")).toBe(true);
     // 100→1200 freeze at hold (1100) + 3400→3900 (500) = 1600; held 1200→3300 excluded.
     expect(finalStreamMs).toBe(1600);
-  });
+  }));
 });

@@ -157,6 +157,9 @@ async function reconstruct(api: ReturnType<typeof adapters>, historyId: string, 
 test("registered tool and console share explicit/default filters and paginated member/group identity", async () => {
   const { history, group, member } = fixture("old-coordinator");
   history.mutate(group.groupId, (saved) => {
+    // This case measures item pagination, not repeated physical-path payloads.
+    // Keep the recorded workspace compact under arbitrary owned TMPDIR roots.
+    saved.workspace = "/recorded-workspace";
     for (let index = 0; index < 450; index++) saved.members.push({
       ...member, historyId: `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
       coordinatorSessionId: index % 2 ? "current" : "old-coordinator",
