@@ -4,6 +4,7 @@ import { clearObservations, noteResultTaken, observationEpoch, publishObservatio
 import { runAgentInstance, type AgentRunResult, type AttemptExecutor } from "./run.ts";
 import type { LoadOptions } from "../roles/load.ts";
 import type { ExecutionBinding } from "../workflow.ts";
+import type { LiveHandle } from "./live.ts";
 
 export interface WorkerInterest {
   planId: string;
@@ -50,6 +51,9 @@ interface Row {
   teamAssignmentId?: string;
   onTeamSettled?: (status: WorkerStatus) => void;
   teamDeliveryOwner?: BackgroundOwner;
+  ownerToken?: symbol;
+  coordinatorSessionId?: string;
+  live?: LiveHandle;
 }
 
 interface Bag {
@@ -130,6 +134,7 @@ export async function spawnBackground(input: {
   const controller = new AbortController();
   const now = input.now ?? Date.now;
   const epoch = observationEpoch();
+  const ownerToken = bag().owner?.token;
   let row: Row | undefined;
   const pending = runAgentInstance({
     roleId: input.roleId,
@@ -138,7 +143,22 @@ export async function spawnBackground(input: {
     executionRoot: input.watch?.execution?.executionRoot,
     historyOrigin: input.historyOrigin,
     signal: controller.signal,
-    executor: input.executor,
+    executor: {
+      ...input.executor,
+      start(attempt) {
+        return input.executor.start({ ...attempt, bindLive(handle) {
+          const accepted = row;
+          if (!accepted || bag().rows.get(accepted.instanceId) !== accepted || accepted.controller.signal.aborted) {
+            void handle.close();
+            return () => {};
+          }
+          const previous = accepted.live;
+          if (previous && previous !== handle) void previous.close();
+          accepted.live = handle;
+          return () => { if (accepted.live === handle) accepted.live = undefined; };
+        } });
+      },
+    },
     load: input.load,
     now,
     onAccepted(instance) {
@@ -154,6 +174,8 @@ export async function spawnBackground(input: {
         teamAssignmentId: input.teamOwner?.assignmentId,
         onTeamSettled: input.teamOwner?.onSettled,
         teamDeliveryOwner: input.teamOwner ? bag().teamOwners?.get(input.teamOwner.token) : undefined,
+        ownerToken,
+        coordinatorSessionId: input.historyOrigin?.coordinatorSessionId,
       };
       bag().rows.set(instance.id, row);
     },
@@ -192,6 +214,25 @@ export async function spawnBackground(input: {
     status: "running",
     watch: accepted.interest !== undefined,
   };
+}
+
+export type LiveTarget = { kind: "background"; instanceId: string } | { kind: "team"; assignmentId: string };
+
+/** Resolve admission from the row and current foreground generation, never a role. */
+export function resolveLiveTarget(target: LiveTarget, coordinatorSessionId: string | undefined, teamToken?: symbol): LiveHandle {
+  const state = bag();
+  const row = target.kind === "background" ? state.rows.get(target.instanceId)
+    : [...state.rows.values()].find(item => item.teamAssignmentId === target.assignmentId && item.teamOwnerToken === teamToken);
+  if (!row || (target.kind === "background" && row.teamOwnerToken)) throw new Error("unknown live target");
+  if (!coordinatorSessionId || row.coordinatorSessionId !== coordinatorSessionId || !row.ownerToken || state.owner?.token !== row.ownerToken) {
+    throw new Error("live target belongs to a different foreground owner");
+  }
+  if (target.kind === "team" && (!teamToken || row.teamOwnerToken !== teamToken || !state.teamOwners?.has(teamToken))) {
+    throw new Error("Team evaluation is retired");
+  }
+  if (statusOf(row) !== "running" || row.signal === "dropped") throw new Error("live target is terminal");
+  if (!row.live) throw new Error("live target has no native session binding");
+  return row.live;
 }
 
 export function workerStatus(instanceId?: string, now: () => number = Date.now): WorkerView[] {

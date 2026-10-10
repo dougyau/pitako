@@ -15,6 +15,7 @@ import {
   teamWorkerResult,
   teamWorkerHasOutcome,
   cancelTeamWorker,
+  resolveLiveTarget,
 } from "./background.ts";
 import { listObservations, noteResultTaken, observationEpoch, publishObservation } from "./observe.ts";
 import { currentInstanceId } from "./scope.ts";
@@ -51,10 +52,48 @@ function historyOrigin(
 }
 
 export default function agentInstance(pi: ExtensionAPI): void {
+  const liveTarget = Type.Union([
+    Type.Object({ kind: Type.Literal("background"), instanceId: Type.String({ maxLength: 256 }) }, noExtra),
+    Type.Object({ kind: Type.Literal("team"), assignmentId: Type.String({ maxLength: 256 }) }, noExtra),
+  ]);
+  const liveFor = (target: import("./background.ts").LiveTarget, ctx: { sessionManager?: { getSessionId?: () => string | undefined } }) => {
+    const sessionId = ctx.sessionManager?.getSessionId?.();
+    if (currentInstanceId() || process.env.PITAKO_INSTANCE_ID || executionForSession(sessionId)) throw new Error("live control cannot be called from an AgentInstance");
+    const evaluation = target.kind === "team" ? teamEvaluationForSession(sessionId, false) : undefined;
+    return resolveLiveTarget(target, sessionId, evaluation?.token);
+  };
+  pi.registerTool({
+    name: "agent_observe", label: "Observe live worker",
+    description: "Observe one exact active background instance or Team assignment: original WorkBrief, bounded ordered coalesced event activity, native history/session identity, interactions and persistence gaps. Default 50, max 200 events, 32KiB/page. after is the returned event cursor; briefOffset pages oversized WorkBriefs. Use agent_history for persisted native entries. Not a synchronous agent_run target.",
+    parameters: Type.Object({ target: liveTarget, after: Type.Optional(Type.Integer({ minimum: 0 })),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })), briefOffset: Type.Optional(Type.Integer({ minimum: 0 })) }, noExtra),
+    async execute(_id, params, _signal, _update, ctx) {
+      try {
+        const page = { target: params.target, ...liveFor(params.target, ctx).observe(params) };
+        return textResult(JSON.stringify(page), page);
+      } catch (error) { return errorResult(String(error)); }
+    },
+  });
+  pi.registerTool({
+    name: "agent_input", label: "Input to live worker",
+    description: "Foreground only: queue missing-context queries or in-scope steering through public steer on an observed exact historyId/sessionId. Delivered only at a later native steering boundary; never interrupts a running command. Returns a receipt, not an answer: queued is admission, handled is hook consumption, rejected is no accepted submission, unconfirmed preserves closure uncertainty. No commands, replacement, prompt stream or follow-up. Reobserve after native replacement. Candidate replies mention interactionId; adequacy is not judged.",
+    parameters: Type.Object({ target: liveTarget, historyId: Type.String({ maxLength: 256 }), sessionId: Type.String({ maxLength: 256 }),
+      intent: Type.Union([Type.Literal("query"), Type.Literal("steer")]), text: Type.String({ minLength: 1 }),
+      decisionId: Type.Optional(Type.String({ maxLength: 256 })) }, noExtra),
+    async execute(_id, params, _signal, _update, ctx) {
+      try {
+        const receipt = { target: params.target, ...await liveFor(params.target, ctx).input(params) };
+        return textResult(JSON.stringify(receipt), receipt);
+      } catch (error) {
+        const receipt = { target: params.target, historyId: params.historyId, sessionId: params.sessionId, status: "rejected", reason: String(error) };
+        return { ...textResult(JSON.stringify(receipt), receipt), isError: true };
+      }
+    },
+  });
   pi.registerTool({
     name: "agent_history",
-    label: "Worker history",
-    description: "Read-only local native worker histories, including all recorded branches and tool results. list defaults to this coordinator; explicit identity filters or scope all discover older groups. Members carry group identity and historyId. read returns lossless base64 byte fragments in physical append order, not active context. Default 50, max 200 items, max 32KiB per page. Use the returned cursor until null; upstream truncation and external artifacts remain limits. No prune action or file/store paths.",
+    label: "Agent history",
+    description: "Read-only local native histories, including all recorded branches and tool results. list defaults to this coordinator; explicit identity filters or scope all discover older groups. Members carry group identity and historyId. read source defaults to worker; coordinator resolves only its captured catalog session. Returns lossless base64 byte fragments in physical append order, not active context. Default 50, max 200 items, max 32KiB per page. Use the returned cursor until null; upstream truncation and external artifacts remain limits. No prune action or file/store paths.",
     parameters: Type.Union([
       Type.Object({
         action: Type.Literal("list"),
@@ -70,6 +109,8 @@ export default function agentInstance(pi: ExtensionAPI): void {
       Type.Object({
         action: Type.Literal("read"),
         historyId: Type.String(),
+        source: Type.Optional(Type.Union([Type.Literal("worker"), Type.Literal("coordinator")])),
+        groupId: Type.Optional(Type.String()),
         cursor: Type.Optional(Type.String()),
         limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
       }, noExtra),

@@ -156,6 +156,32 @@ describe("engineering-layer composition", () => {
     ]) expect(verify).toContain(contract);
   });
 
+  test("loaded execute and evidence guidance distinguish observation, input, and optional advice", async () => {
+    const loaded = await loadPitako(packageRoot());
+    const skillText = (name: string) => {
+      const skill = loaded.loader.getSkills().skills.find(entry => entry.name === name);
+      expect(skill).toBeDefined();
+      return readFileSync(skill!.filePath, "utf8");
+    };
+    const execute = skillText("execute");
+    expect(execute).not.toContain("There is no steer into a running worker");
+    for (const contract of [
+      "Keep at most one Developer role active, without exception",
+      "original WorkBrief", "foreground-only", 'intent: "query"', 'intent: "steer"',
+      "historyId", "sessionId", "never interrupts a running command",
+      "queued", "handled", "rejected", "unconfirmed", "not a live controllable target",
+      "does not settle a Team hold", "waive independent final review", "change ModelPolicy",
+    ]) expect(execute).toContain(contract);
+    const verify = skillText("verify-behavior");
+    for (const contract of [
+      "for the entire source (no offset/limit)", "require `version === 1`", "proposal you had before advice",
+      "Keep the original probabilities", "separate invocations", "recordDecision", "recordObservation",
+      "staged decision is not dispatch", "exact retained advice ID", "Retain older IDs",
+      "never block ordinary action, gates, or review", 'source: "coordinator"',
+      "Worker retention does not own or delete coordinator bytes", "record no sample or unavailable advice",
+    ]) expect(verify).toContain(contract);
+  });
+
   test("/pitako status lists the catalog without loading the Ponytail extension", async () => {
     const notifications: string[] = [];
     const commands = new Map<string, (args: string, ctx: unknown) => Promise<unknown>>();

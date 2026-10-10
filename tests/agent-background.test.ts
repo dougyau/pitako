@@ -20,6 +20,8 @@ import {
   takeHeldCompletions,
   workerResult,
   workerStatus,
+  resolveLiveTarget,
+  retireTeamWorkers,
   type BackgroundOwner,
 } from "../extensions/agent/background.ts";
 import { createPiExecutor } from "../extensions/agent/pi.ts";
@@ -92,6 +94,62 @@ function owner(idle: boolean): BackgroundOwner & { notes: string[]; wakes: strin
 }
 
 describe("pitako agents command", () => {
+  test("live bindings require dispatch owner and exact Team lease; old cleanup preserves replacement", fixture.ownedCase("live binding authority", async () => {
+    const foreground = owner(true);
+    bindBackgroundOwner(foreground);
+    const hanging = hang();
+    let bind: NonNullable<Parameters<AttemptExecutor["start"]>[0]["bindLive"]> | undefined;
+    const executor: AttemptExecutor = { async start(input) { bind = input.bindLive; return hanging.executor.start(input); } };
+    const accepted = await spawnBackground({ roleId: "developer", task: "original", cwd: packageRoot(), executor, load: load(),
+      historyOrigin: { source: "agent_spawn", workbrief: "original", coordinatorSessionId: "coordinator" } });
+    await hanging.started;
+    const live = (id: string) => ({
+      historyId: id, sessionId: id, observe: () => ({ id }), input: async () => ({ status: "queued" }), close: async () => {},
+    });
+    const first = live("first"), second = live("second");
+    const cleanFirst = bind!(first);
+    bind!(second);
+    cleanFirst();
+    const target = { kind: "background" as const, instanceId: accepted.instanceId };
+    expect(resolveLiveTarget(target, "coordinator")).toBe(second);
+    expect(() => resolveLiveTarget(target, "other")).toThrow("foreground owner");
+    const tools = new Map<string, { execute: Function }>();
+    agentInstance({ registerTool(tool: { name: string; execute: Function }) { tools.set(tool.name, tool); } } as unknown as ExtensionAPI);
+    const ctx = { sessionManager: { getSessionId: () => "coordinator" } };
+    const observed = await tools.get("agent_observe")!.execute("observe", { target }, undefined, undefined, ctx);
+    expect(observed.details).toMatchObject({ target, id: "second" });
+    for (const intent of ["query", "steer"]) {
+      const params = { target, historyId: "second", sessionId: "second", intent, text: "original" };
+      const receipt = await tools.get("agent_input")!.execute("input", params, undefined, undefined, ctx);
+      expect(receipt.details).toMatchObject({ target, status: "queued" });
+      const denied = await tools.get("agent_input")!.execute("input", params, undefined, undefined,
+        { sessionManager: { getSessionId: () => "other" } });
+      expect(denied.details).toMatchObject({ target, historyId: "second", sessionId: "second", status: "rejected" });
+      expect(denied.details.reason).toContain("foreground owner");
+    }
+    const nextOwner = owner(true);
+    bindBackgroundOwner(nextOwner);
+    shutdownBackground(foreground.token);
+    expect(() => resolveLiveTarget(target, "coordinator")).toThrow("foreground owner");
+
+    const team = hang();
+    let teamBind: typeof bind;
+    const assigned = await spawnBackground({ roleId: "developer", task: "Team wrapper\nWorkBrief:\noriginal", cwd: packageRoot(), load: load(),
+      executor: { async start(input) { teamBind = input.bindLive; return team.executor.start(input); } },
+      historyOrigin: { source: "team_assign", workbrief: "original", coordinatorSessionId: "coordinator", assignmentId: "assignment" },
+      teamOwner: { token: nextOwner.token, assignmentId: "assignment", onSettled() {} } });
+    await team.started;
+    const teamLive = live("team");
+    teamBind!(teamLive);
+    const teamTarget = { kind: "team" as const, assignmentId: "assignment" };
+    expect(resolveLiveTarget(teamTarget, "coordinator", nextOwner.token)).toBe(teamLive);
+    expect(() => resolveLiveTarget({ kind: "background", instanceId: assigned.instanceId }, "coordinator")).toThrow("unknown live target");
+    expect(() => resolveLiveTarget(teamTarget, "coordinator", Symbol("retired"))).toThrow("unknown live target");
+    retireTeamWorkers(nextOwner.token);
+    expect(() => resolveLiveTarget(teamTarget, "coordinator", nextOwner.token)).toThrow("unknown live target");
+    cancelWorker(accepted.instanceId);
+    expect(() => resolveLiveTarget(target, "coordinator")).toThrow();
+  }));
   test("empty list, running row, id filter, and unknown id", fixture.ownedCase("empty list, running row, id filter, and unknown id", async () => {
     const cmd = pitakoAgentsCommand();
     const empty = await cmd.run("agents");

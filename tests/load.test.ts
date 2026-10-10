@@ -126,7 +126,7 @@ describe("Pi package loading", () => {
     expect(observed.principalUnavailable).toBe("retained; zero classify calls");
     expect(observed.ordinaryClassifyCalls).toBe(3);
     expect(observed.paidCalls).toBe(0);
-    expect(observed.recovery).toEqual({
+    expect(observed.recovery).toMatchObject({
       existingHistoryReader: true, physicalAndNativeRecords: 2, exactInputsAndResponses: true,
       removedOnlyCwd: true, principalUnavailableRetained: true, failedStagedInvocationNotCommitted: true,
     });

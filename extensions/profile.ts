@@ -20,6 +20,8 @@ export const ORCHESTRATION_TOOLS = [
   "agent_status",
   "agent_result",
   "agent_history",
+  "agent_observe",
+  "agent_input",
   "agent_cancel",
   "team_assign",
   "team_status",

@@ -803,7 +803,7 @@ reasoning = "medium"
       expect(childInstructions(role, `${id}-test`)).toContain(role.instructions);
     }
     expect(registeredToolNames(loaded.extensions)).toEqual(expect.arrayContaining([
-      "agent_run", "team_assign", "team_status", "team_result", "team_cancel",
+      "agent_run", "agent_observe", "agent_input", "team_assign", "team_status", "team_result", "team_cancel",
     ]));
     expect(registeredToolNames(loaded.extensions)).toContain("board_post");
     expect(registeredToolNames(loaded.extensions)).toContain("todo");
@@ -827,10 +827,10 @@ reasoning = "medium"
       },
       registerCommand() {},
       getActiveTools() {
-        return ["agent_run", "read"];
+        return ["agent_run", "agent_observe", "agent_input", "read"];
       },
       getAllTools() {
-        return [{ name: "agent_run" }, { name: "agent_supervise" }, { name: "read" }];
+        return ["agent_run", "agent_supervise", "agent_observe", "agent_input", "read"].map(name => ({ name }));
       },
       setActiveTools(names: string[]) {
         active.splice(0, active.length, ...names);
@@ -844,6 +844,8 @@ reasoning = "medium"
     agentInstance(pi as unknown as ExtensionAPI);
     expect(active.includes("agent_run")).toBe(false);
     expect(active.includes("agent_supervise")).toBe(false);
+    expect(active.includes("agent_observe")).toBe(false);
+    expect(active.includes("agent_input")).toBe(false);
     expect(currentInstanceId()).toBeUndefined();
     const tool = tools.get("agent_run");
     if (!tool) throw new Error("agent_run missing");
@@ -852,5 +854,15 @@ reasoning = "medium"
     );
     expect(nested.isError).toBe(true);
     expect(nested.details.error).toMatch(/cannot be called/);
+    for (const name of ["agent_observe", "agent_input"]) {
+      const liveTool = tools.get(name);
+      if (!liveTool) throw new Error(`${name} missing`);
+      const denied = await agentScope.run({ instanceId: "architect-test" }, () =>
+        liveTool.execute("live", { target: { kind: "background", instanceId: "worker" } },
+          undefined, undefined, { cwd: packageRoot() }),
+      );
+      expect(denied.isError).toBe(true);
+      expect(denied.details.error ?? denied.details.reason).toMatch(/cannot be called/);
+    }
   }));
 });

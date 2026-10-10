@@ -37,6 +37,7 @@ Disable Ponytail, Caveman, or any individual skill with `pi config` or package s
 - Role definitions and model policies (`/pitako roles`). These are templates, not running agents.
 - `agent_run` for one synchronous in-process AgentInstance. It does not start a team.
 - `agent_spawn` for one background in-process AgentInstance. The Coordinator stays available. `agent_status`, `agent_result`, and `agent_cancel` inspect that worker. `/pitako agents` prints the same compact view.
+- Foreground `agent_observe` and `agent_input` for bounded observation, context queries, and in-scope steering of exact active background or Team targets. Input waits for a later native boundary and never interrupts a command. A receipt is not an answer. See [worker history and input](docs/worker-history.md).
 - `agent_supervise` for one synchronous visible sibling pane. It does not run in the background or join the Team roster.
 - `team_assign`, `team_status`, `team_result`, and `team_cancel` for independent foreground Team assignments, with one active assignment per role.
 - `$plan` and `$execute`. Planning stops at `PLAN_FROZEN`. Execution is a separate invocation. Neither calls Herdr.

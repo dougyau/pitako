@@ -88,6 +88,26 @@ test("TTL uses latest settlement; disabled captures; config rejects unsupported 
   expect((await pruneWorkerHistory(sample.history, 180, { now: later + 180 * DAY })).groups.find((row) => row.groupId === sample.group.groupId)!.state).toBe("pruned");
 });
 
+test("worker pruning preserves coordinator native bytes and its captured locator for public reading", async () => {
+  const sample = fixture();
+  const coordinatorFile = path.join(sample.root, "coordinator.jsonl");
+  const bytes = Buffer.from('{"type":"session","id":"operator","version":3}\n{"type":"custom","id":"retained-advice"}\n');
+  writeFileSync(coordinatorFile, bytes);
+  sample.history.mutate(sample.group.groupId, saved => { saved.members[0]!.coordinatorSessionFile = coordinatorFile; });
+  const before = await queryHistory({ action: "read", historyId: sample.member.historyId, source: "coordinator", limit: 1 });
+  expect(before.cursor).not.toBeNull();
+  const pruned = await pruneWorkerHistory(sample.history, 180, { now: later });
+  expect(pruned.groups[0]!.state).toBe("pruned");
+  expect(existsSync(sample.file)).toBe(false);
+  expect(readFileSync(coordinatorFile)).toEqual(bytes);
+  expect(sample.history.read(sample.group.groupId).members[0]!.coordinatorSessionFile).toBe(coordinatorFile);
+  const continuation = await queryHistory({ action: "read", historyId: sample.member.historyId, source: "coordinator", cursor: before.cursor! });
+  expect(continuation.diagnostics.map(row => row.code)).not.toContain("history_pruned");
+  expect(Buffer.concat([...before.items, ...continuation.items].map((item: any) => Buffer.from(item.data, "base64")))).toEqual(bytes);
+  const worker = await queryHistory({ action: "read", historyId: sample.member.historyId });
+  expect(worker.diagnostics.map(row => row.code)).toContain("history_pruned");
+});
+
 test("dry-run unchanged; prune only native, ACP and exact own alias; marker readable and sealed", async () => {
   const sample = fixture();
   const sentinel = path.join(path.dirname(sample.file), "foreign.jsonl");

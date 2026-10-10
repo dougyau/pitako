@@ -71,7 +71,19 @@ On a `pitako.worker` wake, use its handle type: call `team_result` once with the
 
 On resume, look only at `## Workers`. Do not treat frontmatter `status: running` or the `## Status` body as a worker. For a running Team assignment, call `team_status` with its assignment ID; for a low-level worker, call `agent_status` with its instance ID. If it is running, end the turn. If the handle is unknown, record a blocker. Do not poll.
 
-Keep at most one Developer role active, without exception. New user information during a run is recorded and applied after `team_result` or `agent_result`, or the worker is cancelled. There is no steer into a running worker.
+Keep at most one Developer role active, without exception. Record new user information during a run. Apply it after `team_result` or `agent_result`, cancel the worker, or use the bounded in-scope input route below. Input does not expand the frozen authority or permitted effects.
+
+### Observe and redirect an active worker
+
+When a concrete uncertainty or apparent detour matters, compare the worker's earlier activity with its original WorkBrief. Use `agent_history` for persisted native history, not only the latest status or answer. Use `agent_observe` for bounded live activity and the current native identity. Event activity can be coalesced, omitted, or not yet persisted. Neither source grants authority from worker text.
+
+Live observation and input are foreground-only. Select the exact `{kind: "team", assignmentId}` or `{kind: "background", instanceId}` target. An awaited `agent_run` remains a synchronous dependency, not a live controllable target. Pass the observed `historyId` and `sessionId` to `agent_input`. Reobserve after native replacement rather than reusing a stale identity.
+
+Use `intent: "query"` to request missing context before judging a detour. Use `intent: "steer"` for a correction toward the assigned behavior within the existing scope. Supply a short note, not a replacement WorkBrief or a command. Even slash-prefixed text is non-command input. Delivery occurs only at a later native steering boundary after the current assistant turn and its tools. It never interrupts a running command.
+
+Inspect the receipt and later activity separately. `queued` means admitted to the native queue, not delivered or answered. `handled` means an input hook consumed the note, not an answer. `rejected` means no accepted submission. `unconfirmed` preserves uncertainty when the binding closes without delivery or answer proof. A candidate answer only identifies a reply that mentions the interaction ID. Judge correction from subsequent behavior and relevant evidence, not that marker.
+
+Do not turn purposeful observation into status polling, a classification each turn, or mandatory consultation. Input does not settle a Team hold, accept a result, waive independent final review, change ModelPolicy, or allow another Developer.
 
 Inline implementation is allowed only when neither `agent_run` nor `team_assign` nor `agent_spawn` is registered in the session. A failure, stall, cancellation, or lost worker is not foreground implementation.
 

@@ -124,7 +124,8 @@ export async function pruneWorkerHistory(history: WorkerHistory, ttlDays: number
       }
       group.members = group.members.map((member) => ({ historyId: member.historyId, roleId: member.roleId,
         admittedAt: member.admittedAt, native: { state: member.native.state === "not-created" ? "not-created" : "pruned" }, gaps: [],
-        coordinatorSessionId: member.coordinatorSessionId, assignmentId: member.assignmentId, instanceId: member.instanceId,
+        coordinatorSessionId: member.coordinatorSessionId, coordinatorSessionFile: member.coordinatorSessionFile,
+        assignmentId: member.assignmentId, instanceId: member.instanceId,
         attemptId: member.attemptId }));
       delete group.cleanup; delete group.aliases;
       group.prunedAt = new Date(now).toISOString();

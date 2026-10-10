@@ -18,6 +18,7 @@ import { childInstructions, skillNamesForRole, usageDelta, type AgentRequestObse
 import { completeTool, emptyCodeIntelligenceUsage, isDenseToolName, type CodeIntelligenceUsage, type DenseCallUsage, type ToolOutcome } from "../code-intelligence/metrics.ts";
 import type { ModelTarget, ReasoningLevel } from "../roles/types.ts";
 import { InvocationHistory, type SessionHistory } from "./history.ts";
+import { createLiveHandle } from "./live.ts";
 
 // Package entry does not re-export this. Import the file next to the resolved entry.
 export let DEFAULT_THINKING_LEVEL: ThinkingLevel;
@@ -29,7 +30,8 @@ const sdkDefaultsReady = import(
 });
 
 const navigationWindows = new WeakMap<AgentSession, { remaining: number }>();
-const childLifecycles = new WeakMap<AgentSession, { bound: boolean; disposal?: Promise<void>; history?: SessionHistory }>();
+const childLifecycles = new WeakMap<AgentSession, { bound: boolean; disposal?: Promise<void>; history?: SessionHistory;
+  live?: ReturnType<typeof createLiveHandle>; unbindLive?: () => void }>();
 
 function disposeChildSession(session: AgentSession): Promise<void> {
   const lifecycle = childLifecycles.get(session)!;
@@ -37,12 +39,17 @@ function disposeChildSession(session: AgentSession): Promise<void> {
     let failure: unknown;
     try {
       try {
-        if (lifecycle.bound) await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+        await lifecycle.live?.handle.close();
       } finally {
+        lifecycle.unbindLive?.();
         try {
-          await session.dispose();
+          if (lifecycle.bound) await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
         } finally {
-          unregisterExecution(session.sessionId);
+          try {
+            await session.dispose();
+          } finally {
+            unregisterExecution(session.sessionId);
+          }
         }
       }
     } catch (error) {
@@ -201,6 +208,7 @@ async function runTarget(
     onActivity?: Parameters<AttemptExecutor["start"]>[0]["onActivity"];
     onActivated?: (appliedReasoning: string) => void;
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
+    bindLive?: Parameters<AttemptExecutor["start"]>[0]["bindLive"];
     sessionHistory?: SessionHistory;
   },
   existing?: { session: AgentSession; mode: "pre-prompt" | "continuation" },
@@ -318,6 +326,7 @@ async function bindThenRun(
     onActivity?: Parameters<AttemptExecutor["start"]>[0]["onActivity"];
     onActivated?: (appliedReasoning: string) => void;
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
+    bindLive?: Parameters<AttemptExecutor["start"]>[0]["bindLive"];
     sessionHistory?: SessionHistory;
   },
 ): Promise<Attempt> {
@@ -343,17 +352,22 @@ async function openSession(
   runtime: ModelRuntime,
   model: NonNullable<ReturnType<ModelRuntime["getModel"]>> | undefined,
   target: ModelTarget,
-  input: { instanceId: string; role: Parameters<AttemptExecutor["start"]>[0]["role"]; cwd: string; sessionHistory?: SessionHistory },
+  input: { instanceId: string; role: Parameters<AttemptExecutor["start"]>[0]["role"]; cwd: string; sessionHistory?: SessionHistory;
+    bindLive?: Parameters<AttemptExecutor["start"]>[0]["bindLive"] },
 ): Promise<AgentSession> {
   const agentDir = getAgentDir();
   const settingsManager = SettingsManager.create(input.cwd, agentDir);
   const allowed = new Set(skillNamesForRole(input.role));
+  let live: ReturnType<typeof createLiveHandle> | undefined;
   const loader = new DefaultResourceLoader({
     cwd: input.cwd,
     agentDir,
     settingsManager,
     additionalExtensionPaths: [packageRoot()],
-    extensionFactories: [createCodemodeExtension({ mode: "on" })],
+    extensionFactories: [createCodemodeExtension({ mode: "on" }), pi => {
+      pi.on("turn_start", () => { live?.open(); });
+      pi.on("agent_before_settle", () => live?.settle());
+    }],
     appendSystemPrompt: [childInstructions(input.role, input.instanceId)],
     skillsOverride: (base) => ({
       skills: base.skills.filter((skill) => allowed.has(skill.name)),
@@ -373,9 +387,11 @@ async function openSession(
     modelRuntime: runtime,
     excludeTools: [...ORCHESTRATION_TOOLS],
   });
-  const lifecycle = { bound: false, history: input.sessionHistory };
+  live = input.bindLive ? createLiveHandle(session, input.sessionHistory!) : undefined;
+  const lifecycle = { bound: false, history: input.sessionHistory, live, unbindLive: live ? input.bindLive!(live.handle) : undefined };
   childLifecycles.set(session, lifecycle);
   lifecycle.history?.attached();
+  if (live) session.subscribe(event => live!.event(event));
   if (lifecycle.history) session.subscribe((event) => {
     if (event.type === "message_end" && event.message.role === "assistant") lifecycle.history!.assistantObserved();
   });
@@ -491,6 +507,8 @@ async function drive(
       return { status: "cancelled", result: "cancelled", sideEffects, requests: requests.length ? requests : undefined, usage: attemptUsage(before, session, tools, codeIntelligence), session: handle };
     }
     const stopWatch = watchAbort(input.signal, () => {
+      // Disposal joins this same close promise and propagates persistence failures.
+      void childLifecycles.get(session)?.live?.handle.close().catch(() => {});
       void session.abort();
     });
     try {
@@ -517,6 +535,7 @@ async function drive(
       }
       return failedAttempt(messageOf(error), sideEffects, handle, session, attemptUsage(before, session, tools, codeIntelligence), requests);
     } finally {
+      await childLifecycles.get(session)?.live?.settle();
       finishRequest(input.signal.aborted ? "cancelled" : "failed");
       stopWatch();
       unsubscribe();
