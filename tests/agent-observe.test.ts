@@ -2,7 +2,7 @@ import { agentFixtureOwnership } from "./fixtures/agent-fixture-ownership.ts";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import agentInstance from "../extensions/agent/index.ts";
 import {
@@ -25,6 +25,7 @@ const tempDirs = fixture.directories;
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 afterEach(() => {
   fixture.requireReleasedFixture();
+  setSystemTime();
   if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
   else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
   cancelAllWorkers();
@@ -277,6 +278,7 @@ describe("T2 observations", () => {
       { cwd: packageRoot() },
     );
     await startedP;
+    setSystemTime(Date.now());
     const status = await tools.get("agent_status")?.execute("call", {}, undefined, undefined, { cwd: packageRoot() });
     const views = workerStatus();
     expect(status.content[0].text).toBe(formatWorkerViews(views));

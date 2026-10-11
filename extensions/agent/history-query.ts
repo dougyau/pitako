@@ -116,9 +116,9 @@ function matches(query: Extract<HistoryQuery, { action: "list" }>, group: Histor
     : member[key] === query[key]));
 }
 
-function add(page: HistoryPage, item: unknown, cursor: Cursor): boolean {
+function add(page: HistoryPage, item: unknown, cursor: Cursor, byteBudget: number): boolean {
   // Reserve room for diagnostics and the continuation, measuring bytes rather than JS characters.
-  if (Buffer.byteLength(JSON.stringify({ ...page, items: [...page.items, item], cursor: encode(cursor) })) > HISTORY_BYTES - 4096)
+  if (Buffer.byteLength(JSON.stringify({ ...page, items: [...page.items, item], cursor: encode(cursor) })) > byteBudget - 4096)
     return false;
   page.items.push(item);
   return true;
@@ -131,7 +131,7 @@ function summary(group: HistoryGroup, member: HistoryMember) {
     gaps };
 }
 
-async function list(query: Extract<HistoryQuery, { action: "list" }>, page: HistoryPage, directory: string, limit: number, scope?: HistoryScope) {
+async function list(query: Extract<HistoryQuery, { action: "list" }>, page: HistoryPage, directory: string, limit: number, scope: HistoryScope | undefined, byteBudget: number) {
   const identity = createHash("sha256").update(JSON.stringify(selectors.map((key) => query[key] ?? null))).digest("hex");
   const previous = decode(query.cursor, "list", identity);
   let scans = 0;
@@ -167,7 +167,7 @@ async function list(query: Extract<HistoryQuery, { action: "list" }>, page: Hist
       if (!catalogCount && start === 0 && matchesEmpty) {
         const item = { kind: "group", groupId, identity: group.identity, workspace: group.workspace,
           ...(group.identity.kind === "mission" ? {} : { coverage: group.coverage }), ...authority, historyState: "no_member_record" };
-        if (page.items.length >= limit || !add(page, item, current(1))) {
+        if (page.items.length >= limit || !add(page, item, current(1), byteBudget)) {
           if (!page.items.length) throw new Error("summary_limit");
           page.cursor = encode(current(0)); return;
         }
@@ -180,7 +180,7 @@ async function list(query: Extract<HistoryQuery, { action: "list" }>, page: Hist
         const item = { ...summary(group, member), ...(group.prunedAt ? { historyState: "pruned" } : group.cleanup ? { historyState: "deleting" } : {}),
           group: { groupId, identity: group.identity, workspace: group.workspace,
           ...(group.identity.kind === "mission" ? {} : { coverage: group.coverage }), ...authority } };
-        if (page.items.length >= limit || !add(page, item, current(index + 1))) {
+        if (page.items.length >= limit || !add(page, item, current(index + 1), byteBudget)) {
           // A single summary that cannot fit is explicit, not an endless cursor.
           if (!page.items.length)
             throw new Error("summary_limit");
@@ -220,7 +220,7 @@ async function locate(directory: string, historyId: string, selectedGroup?: stri
   return undefined;
 }
 
-async function read(query: Extract<HistoryQuery, { action: "read" }>, page: HistoryPage, directory: string, limit: number, scope?: HistoryScope) {
+async function read(query: Extract<HistoryQuery, { action: "read" }>, page: HistoryPage, directory: string, limit: number, scope: HistoryScope | undefined, byteBudget: number) {
   if (!UUID.test(query.historyId)) throw new Error("invalid_history_id");
   if (query.groupId !== undefined && !UUID.test(query.groupId)) throw new Error("invalid_group_id");
   const source = query.source ?? "worker";
@@ -300,7 +300,7 @@ async function read(query: Extract<HistoryQuery, { action: "read" }>, page: Hist
         index: nextOffset, entryOffset: end ? nextOffset : entryOffset, json: end ? jsonState() : nextJson };
       const item = { historyId: query.historyId, source, entryOffset, byteOffset: offset, endsEntry: end,
         encoding: "base64", data: bytes.toString("base64"), validation };
-      if (!add(page, item, cursor)) break;
+      if (!add(page, item, cursor, byteBudget)) break;
       if ((nextJson.corrupt || nextJson.limited) && page.diagnostics.length < 32)
         page.diagnostics.push({ code: nextJson.limited ? "json_validation_limit" : "corrupt_entry", detail: `byte ${entryOffset}` });
       offset = nextOffset;
@@ -313,9 +313,10 @@ async function read(query: Extract<HistoryQuery, { action: "read" }>, page: Hist
   } finally { closeSync(fd); }
 }
 
-export async function queryHistory(input: HistoryQuery, coordinatorSessionId?: string, agentDir = getAgentDir(), scope?: HistoryScope): Promise<HistoryPage> {
+export async function queryHistory(input: HistoryQuery, coordinatorSessionId?: string, agentDir = getAgentDir(), scope?: HistoryScope, byteBudget = HISTORY_BYTES): Promise<HistoryPage> {
   const page: HistoryPage = { items: [], diagnostics: [], cursor: null };
   try {
+    if (!Number.isSafeInteger(byteBudget) || byteBudget < 16 * 1024 || byteBudget > HISTORY_BYTES) throw new Error("invalid_budget");
     const limit = input.limit ?? 50;
     const allowed = input.action === "list" ? ["action", "scope", ...selectors, "cursor", "limit"] : ["action", "historyId", "source", "groupId", "cursor", "limit"];
     if (Object.keys(input).some((key) => !allowed.includes(key))) throw new Error("invalid_parameter");
@@ -340,8 +341,8 @@ export async function queryHistory(input: HistoryQuery, coordinatorSessionId?: s
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         page.diagnostics.push({ code: "catalog_missing" }); return page;
       }
-      await list(query, page, directory, limit, scope);
-    } else if (input.action === "read") await read(input, page, path.join(agentDir, "pitako", "worker-history"), limit, scope);
+      await list(query, page, directory, limit, scope, byteBudget);
+    } else if (input.action === "read") await read(input, page, path.join(agentDir, "pitako", "worker-history"), limit, scope, byteBudget);
     else throw new Error("invalid_action");
     if (!page.diagnostics.length) page.diagnostics.push({ code: "ok" });
   } catch (error) {

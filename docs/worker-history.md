@@ -7,6 +7,11 @@ the transcript authority. The host catalog records identities, lifecycle evidenc
 known capture gaps, and exact cleanup ownership. Neither Hermes search results nor
 worker text establish execution closure.
 
+Local foreground RPC hosts can use the [Agent bridge host reference](agent-bridge.md)
+for non-consuming worker reads and scoped history. The bridge requires fresh
+acknowledgement for raw history and routing, and explicit activation for controls.
+Its history scope is narrower than the foreground tools described below.
+
 ## List and read
 
 The foreground `agent_history` tool supports these requests:

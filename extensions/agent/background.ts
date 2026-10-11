@@ -1,6 +1,8 @@
 import { PitakoConfigError } from "../errors.ts";
 import { createPiExecutor } from "./pi.ts";
-import { clearObservations, noteResultTaken, observationEpoch, publishObservation, removeObservation, removeTeamObservations } from "./observe.ts";
+import { clearObservations, noteResultTaken, observationEpoch, publishObservation, removeObservation, removeTeamObservations,
+  publishActivityBinding, retainTerminalActivity, noteTerminalActivityUnavailable, terminalActivityKey,
+  removeOwnerTerminalActivity, touchObservation, type TerminalActivityKey } from "./observe.ts";
 import { runAgentInstance, type AgentRunResult, type AttemptExecutor } from "./run.ts";
 import type { LoadOptions } from "../roles/load.ts";
 import type { ExecutionBinding } from "../workflow.ts";
@@ -55,6 +57,7 @@ interface Row {
   coordinatorSessionId?: string;
   live?: LiveHandle;
   generation: number;
+  attemptId?: string;
 }
 
 interface Bag {
@@ -94,6 +97,7 @@ export function clearBackgroundOwner(): void {
 /** Retire admission authority without aborting or pretending to join workers. */
 export function revokeBackgroundOwner(token: symbol): void {
   const state = bag();
+  removeOwnerTerminalActivity(token);
   if (state.owner?.token === token) state.owner = undefined;
   state.teamOwners?.delete(token);
 }
@@ -166,7 +170,31 @@ export async function spawnBackground(input: {
           if (previous && previous !== handle) void previous.close();
           accepted.live = handle;
           accepted.generation++;
-          return () => { if (accepted.live === handle) accepted.live = undefined; };
+          const generation = accepted.generation;
+          const { historyId, sessionId } = handle;
+          const key = () => {
+            if (!currentReadRow(accepted, epoch) || accepted.live !== handle || accepted.generation !== generation ||
+                handle.historyId !== historyId || handle.sessionId !== sessionId || !accepted.attemptId) return undefined;
+            return activityKey(accepted, handle);
+          };
+          const initial = key();
+          if (initial) publishActivityBinding(initial, epoch);
+          handle.onChange = () => { if (key()) touchObservation(accepted.instanceId, epoch); };
+          handle.onTerminalCapture = snapshot => {
+            const current = key();
+            if (current) retainTerminalActivity(current, snapshot, epoch);
+          };
+          handle.onTerminalCaptureFailed = reason => {
+            const current = key();
+            if (current) noteTerminalActivityUnavailable(current, reason, epoch);
+          };
+          return () => {
+            if (accepted.live !== handle) return;
+            const valid = key();
+            accepted.live = undefined;
+            handle.onChange = undefined;
+            if (valid) touchObservation(accepted.instanceId, epoch);
+          };
         } });
       },
     },
@@ -192,16 +220,21 @@ export async function spawnBackground(input: {
       bag().rows.set(instance.id, row);
     },
     onObserve(snapshot) {
-      if (row?.signal === "dropped") return;
+      if (!row || bag().rows.get(row.instanceId) !== row || row.signal === "dropped" ||
+          epoch !== observationEpoch() || row.ownerToken && bag().owner?.token !== row.ownerToken ||
+          row.teamOwnerToken && !bag().teamOwners?.has(row.teamOwnerToken)) return;
+      row.attemptId = snapshot.attemptId;
       publishObservation(
         {
           ...snapshot,
           planId: input.watch?.planId,
           unitId: input.watch?.unitId,
           teamOwnerToken: input.teamOwner?.token,
+          ownerToken,
         },
         epoch,
       );
+      if (row.live && row.attemptId && currentReadRow(row, epoch)) publishActivityBinding(activityKey(row, row.live), epoch);
     },
   });
   if (!row) {
@@ -210,7 +243,7 @@ export async function spawnBackground(input: {
   }
   const accepted = row;
   pending.then(
-    (result) => settle(accepted, result),
+    (result) => settle(accepted, result, epoch),
     (error: unknown) =>
       settle(accepted, {
         instanceId: accepted.instanceId,
@@ -218,7 +251,7 @@ export async function spawnBackground(input: {
         status: "failed",
         model: { selectedModel: "unknown" },
         result: error instanceof Error ? error.message : String(error),
-      }),
+      }, epoch),
   );
   return {
     instanceId: accepted.instanceId,
@@ -229,6 +262,103 @@ export async function spawnBackground(input: {
 }
 
 export type LiveTarget = { kind: "background"; instanceId: string } | { kind: "team"; assignmentId: string };
+
+export interface WorkerReadScope {
+  coordinatorSessionId: string;
+  ownerToken: symbol;
+  teamToken?: symbol;
+}
+
+function currentReadRow(row: Row, epoch: number): boolean {
+  const state = bag();
+  return observationEpoch() === epoch && state.rows.get(row.instanceId) === row && row.signal !== "dropped" &&
+    !!row.ownerToken && state.owner?.token === row.ownerToken && !!row.coordinatorSessionId &&
+    (!row.teamOwnerToken || !!state.teamOwners?.has(row.teamOwnerToken));
+}
+
+function activityKey(row: Row, handle: LiveHandle): TerminalActivityKey {
+  return { ownerToken: row.ownerToken!, coordinatorSessionId: row.coordinatorSessionId!,
+    teamOwnerToken: row.teamOwnerToken, assignmentId: row.teamAssignmentId, instanceId: row.instanceId,
+    generation: row.generation, attemptId: row.attemptId!, historyId: handle.historyId, sessionId: handle.sessionId };
+}
+
+/** Borrow the handle only for this synchronous read; terminal reads retain plain identity, never the handle. */
+export function resolveWorkerReadBinding(target: LiveTarget, scope: WorkerReadScope) {
+  const state = bag();
+  if (!scope.ownerToken || !scope.coordinatorSessionId || state.owner?.token !== scope.ownerToken ||
+      target.kind === "team" && (!scope.teamToken || !state.teamOwners?.has(scope.teamToken)))
+    throw new Error("stale_owner");
+  const row = target.kind === "background" ? state.rows.get(target.instanceId)
+    : [...state.rows.values()].find(item => item.teamAssignmentId === target.assignmentId && item.teamOwnerToken === scope.teamToken);
+  if (!row || row.signal === "dropped" || row.ownerToken !== scope.ownerToken ||
+      row.coordinatorSessionId !== scope.coordinatorSessionId || target.kind === "background" && row.teamOwnerToken)
+    throw new Error("unknown_target");
+  const key = terminalActivityKey(row.instanceId, scope.ownerToken, scope.coordinatorSessionId,
+    target.kind === "team" ? scope.teamToken : undefined);
+  return { instanceId: row.instanceId, generation: row.generation, attemptId: row.attemptId,
+    key, handle: row.live };
+}
+
+export interface ResultTextPage {
+  text: string;
+  offset: number;
+  nextOffset: number | null;
+}
+
+export interface WorkerResultOptions {
+  offset?: number;
+  metadataOffset?: number;
+}
+
+export type WorkerResultRead =
+  | { state: "ready"; instanceId: string; generation: number; status: AgentRunResult["status"];
+      text: ResultTextPage; metadata: ResultTextPage }
+  | { state: "pending"; instanceId: string; generation: number }
+  | { state: "unavailable"; reason: "unknown_target" | "outcome_missing" | "unsupported_kind" }
+  | { state: "stale_owner" }
+  | { state: "invalid_cursor" };
+
+/** Inspect the authoritative outcome without consuming it or admitting native input. */
+export function readWorkerResult(target: LiveTarget, scope: WorkerReadScope, options: WorkerResultOptions = {}): WorkerResultRead {
+  const state = bag();
+  if (!scope.ownerToken || !scope.coordinatorSessionId || state.owner?.token !== scope.ownerToken) {
+    return { state: "stale_owner" };
+  }
+  if (target.kind !== "background" && target.kind !== "team") {
+    return { state: "unavailable", reason: "unsupported_kind" };
+  }
+  if (target.kind === "team" && (!scope.teamToken || !state.teamOwners?.has(scope.teamToken))) {
+    return { state: "stale_owner" };
+  }
+  const row = target.kind === "background" ? state.rows.get(target.instanceId)
+    : [...state.rows.values()].find(item => item.teamAssignmentId === target.assignmentId && item.teamOwnerToken === scope.teamToken);
+  if (!row) return { state: "unavailable", reason: "unknown_target" };
+  // Foreign or incompletely scoped rows are indistinguishable from absent targets.
+  if (row.ownerToken !== scope.ownerToken || row.coordinatorSessionId !== scope.coordinatorSessionId) {
+    return { state: "unavailable", reason: "unknown_target" };
+  }
+  if (target.kind === "background" && row.teamOwnerToken) return { state: "unavailable", reason: "unknown_target" };
+  if (!row.outcome) {
+    return row.signal === "pending" && statusOf(row) === "running"
+      ? { state: "pending", instanceId: row.instanceId, generation: row.generation }
+      : { state: "unavailable", reason: "outcome_missing" };
+  }
+  const { result, requests: _requests, ...metadata } = row.outcome;
+  const text = resultTextPage(result, options.offset ?? 0);
+  const metadataPage = resultTextPage(JSON.stringify(metadata), options.metadataOffset ?? 0);
+  if (!text || !metadataPage) return { state: "invalid_cursor" };
+  return {
+    state: "ready", instanceId: row.instanceId, generation: row.generation, status: row.outcome.status,
+    text, metadata: metadataPage,
+  };
+}
+
+function resultTextPage(value: string, offset: number): ResultTextPage | undefined {
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > value.length) return undefined;
+  const text = value.slice(offset, offset + 1024);
+  const end = offset + text.length;
+  return { text, offset, nextOffset: end < value.length ? end : null };
+}
 
 /** Resolve admission from the row and current foreground generation, never a role. */
 export function resolveLiveTarget(target: LiveTarget, coordinatorSessionId: string | undefined, teamToken?: symbol): LiveHandle {
@@ -388,12 +518,13 @@ export function interestFrom(plan: string | undefined, unit: string | undefined)
   return { planId, unitId };
 }
 
-function settle(row: Row, result: AgentRunResult): void {
+function settle(row: Row, result: AgentRunResult, epoch: number): void {
   const state = bag();
   const current = state.rows.get(row.instanceId);
-  if (!current || current.signal === "dropped" || current.signal === "sent") return;
+  if (current !== row || current.signal === "dropped" || current.signal === "sent") return;
   current.outcome = result;
   current.onTeamSettled?.(result.status);
+  if (currentReadRow(current, epoch)) touchObservation(current.instanceId, epoch);
   if (current.teamOwnerToken && current.teamDeliveryOwner?.token !== current.teamOwnerToken) {
     current.signal = "dropped";
     return;

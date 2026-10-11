@@ -31,6 +31,8 @@ import { openAgentScreen } from "./agent/screen.ts";
 import { createPaneSession } from "./herdr/agents-ui/session.ts";
 import { readHerdrPresence } from "./herdr/presence.ts";
 import { registerCodexTools } from "./codex.ts";
+import { createAgentBridge } from "./agent/bridge/broker.ts";
+import { isGrants } from "./agent/bridge/protocol.js";
 
 const foregroundCodeUsage = new Map<string, CodeIntelligenceUsage>();
 const foregroundToolStarts = new Map<string, Map<string, { name: string; startedAt: number }>>();
@@ -138,6 +140,14 @@ export default function pitako(pi: ExtensionAPI) {
     description: 'Pitako profile: "coding" (default) or "analysis"',
     type: "string",
   });
+  pi.registerFlag("pitako-agent-bridge", {
+    description: "Optional foreground RPC agent bridge in a host-owned absolute private directory",
+    type: "string",
+  });
+  pi.registerFlag("pitako-agent-bridge-grants", {
+    description: "Agent bridge ceiling: comma-separated history,route,control (default: none)",
+    type: "string",
+  });
 
   registerAgentSupervise(pi);
 
@@ -148,16 +158,19 @@ export default function pitako(pi: ExtensionAPI) {
   let teamEvaluation: TeamEvaluation | undefined;
   let agentController: ReturnType<typeof createAgentController> | undefined;
   let agentPane: ReturnType<typeof createPaneSession> | undefined;
+  let agentBridge: ReturnType<typeof createAgentBridge> | undefined;
   let foregroundRevision = 0;
 
   const revokeForeground = () => {
     ++foregroundRevision;
-    const retired = { controller: agentController, pane: agentPane, token: ownerToken, evaluation: teamEvaluation };
+    const retired = { controller: agentController, pane: agentPane, bridge: agentBridge, token: ownerToken, evaluation: teamEvaluation };
     retired.controller?.revoke();
     retired.pane?.revoke();
+    retired.bridge?.revoke();
     revokeBackgroundOwner(retired.token);
     agentController = undefined;
     agentPane = undefined;
+    agentBridge = undefined;
     if (agentUiBindingToken) unbindAgentUi(agentUiBindingToken);
     agentUiBindingToken = undefined;
     return retired;
@@ -177,6 +190,7 @@ export default function pitako(pi: ExtensionAPI) {
       await settlePendingDispatches(retired.evaluation?.sessionId ?? ctx.sessionManager?.getSessionId());
       await retired.controller?.settle();
       await retired.pane?.close();
+      await retired.bridge?.settle();
       retireTeamEvaluation(retired.evaluation);
       shutdownBackground(retired.token);
       if (revision !== foregroundRevision) return;
@@ -266,6 +280,22 @@ export default function pitako(pi: ExtensionAPI) {
           modelLookup: (provider, id) => ctx.modelRegistry?.find(provider, id),
         });
       }
+      // Upstream failure still reconciles the final profile above, but cannot
+      // publish or admit a replacement bridge for this failed transition.
+      const bridgeRoot = pi.getFlag("pitako-agent-bridge");
+      const grantFlag = pi.getFlag("pitako-agent-bridge-grants");
+      if (!isChildSession(ctx) && ctx.mode === "rpc" && bridgeRoot !== undefined) {
+        if (typeof bridgeRoot !== "string" || !bridgeRoot.length)
+          throw new Error("Agent bridge requires an absolute private directory");
+        const grants: unknown = grantFlag === undefined || grantFlag === "" ? [] :
+          typeof grantFlag === "string" ? grantFlag.split(",") : undefined;
+        if (!isGrants(grants)) throw new Error("Agent bridge grants must be a unique comma-separated list of history,route,control");
+        if (!upstreamFailure && agentController && revision === foregroundRevision) {
+          const lifetime = createAgentBridge(agentController, bridgeRoot, grants, () => revision === foregroundRevision);
+          agentBridge = lifetime;
+          await lifetime.ready;
+        }
+      }
     } finally {
       reopenDispatches();
       // Upstream failure must not skip retirement, profile reconciliation, or
@@ -284,6 +314,7 @@ export default function pitako(pi: ExtensionAPI) {
     await settlePendingDispatches(retired.evaluation?.sessionId ?? ctx.sessionManager?.getSessionId());
     await retired.controller?.settle();
     await retired.pane?.close();
+    await retired.bridge?.settle();
     const sessionId = ctx.sessionManager?.getSessionId();
     if (foregroundSession(sessionId)) {
       foregroundCodeUsage.delete(sessionId);

@@ -39,7 +39,22 @@ function disposeChildSession(session: AgentSession): Promise<void> {
     let failure: unknown;
     try {
       try {
-        await lifecycle.live?.handle.close();
+        const live = lifecycle.live;
+        const captureFailed = (reason: "close_failed" | "capture_failed") => {
+          try { live?.handle.onTerminalCaptureFailed?.(reason); } catch { /* Observation cannot obstruct native cleanup. */ }
+        };
+        try {
+          await live?.handle.close();
+        } catch (error) {
+          captureFailed("close_failed");
+          throw error;
+        }
+        if (live) {
+          try {
+            const snapshot = live.capture();
+            live.handle.onTerminalCapture?.(snapshot);
+          } catch { captureFailed("capture_failed"); }
+        }
       } finally {
         lifecycle.unbindLive?.();
         try {
