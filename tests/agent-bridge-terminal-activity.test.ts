@@ -1,3 +1,4 @@
+import { controlledPi } from "./fixtures/pi-factories.ts";
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -411,7 +412,6 @@ test("terminal leaf: row removals and owner retirement release capacity and fenc
 for (const mode of ["success", "close_failed", "capture_failed", "callback_throws", "failure_callback_throws"] as const) {
   test(`terminal adapter (serial barrier): capture/unbind/disposal ordering and ${mode}`,
     adapterOwnership.ownedCase(`terminal adapter ${mode}`, async () => {
-      const { AgentSession } = await import("@earendil-works/pi-coding-agent");
       const { InvocationHistory } = await import("../extensions/agent/history.ts");
       const { createPiExecutor } = await import("../extensions/agent/pi.ts");
       const { executionForSession } = await import("../extensions/execution-identity.ts");
@@ -426,30 +426,17 @@ for (const mode of ["success", "close_failed", "capture_failed", "callback_throw
       const disposeGate = deferred<void>(), disposeStarted = deferred<void>();
       const timeline: string[] = [];
       const closeError = new Error("terminal fixture native close rejected");
-      let native: InstanceType<typeof AgentSession> | undefined;
+      let native: ReturnType<typeof controlledPi>["sessions"][number] | undefined;
       let nativeDisposed = false;
       let currentKey: TerminalActivityKey | undefined;
       let restoreLeaf: (() => void) | undefined;
       let callbacks = 0, failures = 0;
-      const originalBind = AgentSession.prototype.bindExtensions;
-      const binding = spyOn(AgentSession.prototype, "bindExtensions").mockImplementation(async function (this: InstanceType<typeof AgentSession>, ...args) {
-        native = this;
-        const dispose = this.dispose.bind(this);
-        this.dispose = async () => {
-          timeline.push("native-dispose");
-          disposeStarted.resolve();
-          await disposeGate.promise;
-          await dispose();
-          nativeDisposed = true;
-          timeline.push("native-disposed");
-        };
-        await originalBind.apply(this, args);
-        this.prompt = async () => { throw new Error("terminal adapter fixture must never prompt a provider"); };
-        const emit = this.extensionRunner.emit.bind(this.extensionRunner);
-        this.extensionRunner.emit = async event => {
-          if (event.type === "session_shutdown") timeline.push("shutdown");
-          return emit(event);
-        };
+      const host = controlledPi(root, {
+        bind(session) { native = session; session.extensionRunner.emit = async event => { if (event.type === "session_shutdown") timeline.push("shutdown"); }; },
+        async dispose() {
+          timeline.push("native-dispose"); disposeStarted.resolve();
+          await disposeGate.promise; nativeDisposed = true; timeline.push("native-disposed");
+        },
       });
       let attemptForCleanup: Promise<unknown> | undefined;
       // Register before history/start: setup failure owns roots, globals and the spy too.
@@ -458,13 +445,12 @@ for (const mode of ["success", "close_failed", "capture_failed", "callback_throw
         await attemptForCleanup;
         if (native && !nativeDisposed) throw new Error(`Native terminal adapter release uncertain; retain ${root} and ${agentDir}`);
         restoreLeaf?.();
-        binding.mockRestore();
         if (offline === undefined) delete process.env.PI_OFFLINE; else process.env.PI_OFFLINE = offline;
         if (telemetry === undefined) delete process.env.PI_TELEMETRY; else process.env.PI_TELEMETRY = telemetry;
       });
       const invocation = new InvocationHistory(root, { source: "agent_spawn", coordinatorSessionId: "coordinator",
         workbrief: "exact original" }, "invocation task");
-      const attempt = createPiExecutor().start({
+      const attempt = createPiExecutor({ factories: host.factories }).start({
         instanceId: "adapter", role: { id: "developer", name: "Developer", description: "terminal adapter",
           instructionsPath: "roles/developer.md", instructions: "No provider call.", skills: [], principles: [],
           modelPolicyId: "developer", modelPolicy: { id: "developer", fallbacks: [] } },

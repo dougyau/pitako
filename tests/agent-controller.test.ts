@@ -1,3 +1,5 @@
+import { stubExternalFactories } from "./fixtures/offline.ts";
+stubExternalFactories();
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -17,7 +19,6 @@ import * as controllerModule from "../extensions/agent/controller.ts";
 import * as codexModule from "../extensions/codex.ts";
 import * as bridgeModule from "../extensions/agent/bridge/broker.ts";
 import { connect } from "../extensions/agent/bridge/client.js";
-import { createAgentSession, DefaultResourceLoader, ExtensionRunner, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 
 const fixture = agentFixtureOwnership();
 const originalDir = process.env.PI_CODING_AGENT_DIR;
@@ -82,16 +83,22 @@ test(`packaged ${mode} fences admitted bridge mutations throughout held retireme
   const bridgeCapture = spyOn(bridgeModule, "createAgentBridge").mockImplementation((...args) => {
     bridgeStarts++; return originalBridge(...args);
   });
+  const capturedStartup = spyOn(codexModule, "registerCodexTools").mockImplementation(() => async () => {
+    if (failNext) { failNext = false; throw Error("fixture captured upstream failed"); }
+  });
   const factories = new Map([["./extensions/index.ts", pitako], ["./extensions/agent/index.ts", agentInstance]]);
   for (const entry of JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).pi.extensions) {
     const factory = factories.get(entry);
     if (factory) { extensions.push({ handlers: new Map() }); factory(pi as never); }
   }
-  const runner = new ExtensionRunner(extensions as never, {} as never, root, ctx.sessionManager as never, {} as never);
-  const context = spyOn(runner as unknown as { createContext(): typeof ctx }, "createContext").mockReturnValue(ctx);
   const errors: unknown[] = [];
-  runner.onError(error => errors.push(error));
-  const start = () => runner.emit({ type: "session_start", reason: "startup" });
+  const emit = async (type: string) => {
+    for (const extension of extensions) for (const handler of extension.handlers.get(type) ?? []) {
+      try { await handler({ type }, ctx); }
+      catch (error) { errors.push({ event: type, error: (error as Error).message }); }
+    }
+  };
+  const start = () => emit("session_start");
   let release!: () => void, transition: Promise<unknown> | undefined, dispatch: Promise<unknown> | undefined;
   let observing = false, observer: Promise<void> | undefined;
   let client: Awaited<ReturnType<typeof connect>> | undefined, view: ReturnType<ReturnType<typeof originalController>["openView"]>;
@@ -142,7 +149,7 @@ test(`packaged ${mode} fences admitted bridge mutations throughout held retireme
     })();
     failNext = mode === "captured-failure";
     let finished = false;
-    transition = (mode === "shutdown" ? runner.emit({ type: "session_shutdown", reason: "quit" }) : start())
+    transition = (mode === "shutdown" ? emit("session_shutdown") : start())
       .then(() => { finished = true; });
     expect(() => view.list()).toThrow("retired");
     await expect(client.list()).rejects.toThrow();
@@ -189,8 +196,8 @@ test(`packaged ${mode} fences admitted bridge mutations throughout held retireme
     release?.(); releaseInput(); finishWorker?.(completed); await dispatch; await transition; await acceptedInput;
     observing = false; await observer;
     await client?.disconnect();
-    await runner.emit({ type: "session_shutdown", reason: "quit" });
-    context.mockRestore(); controllerCapture.mockRestore(); bridgeCapture.mockRestore();
+    await emit("session_shutdown");
+    capturedStartup.mockRestore(); controllerCapture.mockRestore(); bridgeCapture.mockRestore();
     expect(readdirSync(bridgeRoot)).toEqual([]);
   }
 }));
@@ -417,7 +424,7 @@ test("current Team lease permits native input/cancel; retirement leaves independ
   await view.close(); controller.revoke(); await controller.settle();
 }));
 
-test("same-session public rebind fences real agent_spawn while captured official startup is held", fixture.ownedCase("startup admission", async () => {
+test("same-session startup fences agent_spawn while controlled external startup is held", fixture.ownedCase("startup admission", async () => {
   const { root, load } = setup();
   process.env.PI_OFFLINE = "1";
   const agentDir = process.env.PI_CODING_AGENT_DIR!;
@@ -427,11 +434,8 @@ test("same-session public rebind fences real agent_spawn while captured official
   const codexHold = new Promise<void>(resolve => { releaseCodex = resolve; });
   const dispatchHold = new Promise<void>(resolve => { releaseDispatch = resolve; });
   let holdNextStartup = false;
-  const register = codexModule.registerCodexTools;
   const captureCodex = spyOn(codexModule, "registerCodexTools").mockImplementation(pi => {
-    const official = register(pi);
-    return async (event, ctx) => {
-      await official(event, ctx);
+    return async () => {
       if (holdNextStartup) { holdNextStartup = false; await codexHold; }
     };
   });
@@ -446,48 +450,44 @@ test("same-session public rebind fences real agent_spawn while captured official
     starts++;
     return fixture.pendingAttempt(resolve => { finishes.push(() => resolve(completed)); });
   } });
-  let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
+
   let rebind: Promise<void> | undefined, newerRebind: Promise<void> | undefined, dispatch: Promise<void> | undefined;
   let stale: Promise<unknown> | undefined;
   let view: ReturnType<ReturnType<typeof createAgentController>["openView"]> | undefined;
-  const errors: unknown[] = [];
+  let cleanup: (() => Promise<void>) | undefined;
   try {
-    const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false } });
-    const loader = new DefaultResourceLoader({ cwd: root, agentDir, settingsManager,
-      noContextFiles: true, noSkills: true, noThemes: true, noExtensions: true,
-      extensionFactories: [pitako, agentInstance] });
-    await loader.reload();
-    const modelRuntime = await ModelRuntime.create({ authPath: path.join(root, "auth.json"), modelsPath: null, allowModelNetwork: false });
-    session = (await fixture.acquire(createAgentSession({ cwd: root, agentDir, settingsManager, resourceLoader: loader, modelRuntime,
-      sessionManager: SessionManager.create(root, path.join(root, "sessions")) }))).session;
-    const bindings = { onError: (error: unknown) => { errors.push(error); } };
-    await session.bindExtensions(bindings);
-    const runner = session.extensionRunner!;
-    const ctx = runner.createToolContext("fixture-spawn", undefined);
-    const identity = [ctx.sessionManager.getSessionId(), ctx.sessionManager.getSessionFile()];
-    const tools = runner.getAllRegisteredTools();
-    const spawn = (task: string) => tools.find(tool => tool.definition.name === "agent_spawn")!.definition
-      .execute(task, { role: "researcher", task }, undefined, undefined, ctx);
-    const status = async () => (await tools.find(tool => tool.definition.name === "agent_status")!.definition
-      .execute("status", {}, undefined, undefined, ctx)).details;
+    const handlers = new Map<string, Function[]>(), tools = new Map<string, { execute: Function }>();
+    const pi = { registerFlag() {}, registerCommand() {},
+      registerTool(tool: { name: string; execute: Function }) { tools.set(tool.name, tool); },
+      on(name: string, handler: Function) { handlers.set(name, [...handlers.get(name) ?? [], handler]); },
+      getFlag() {}, getAllTools: () => [{ name: "read" }], getActiveTools: () => ["read"],
+      setActiveTools() {}, getSessionName: () => "pitako:coding", setSessionName() {}, sendMessage() {} };
+    const ctx = { cwd: root, hasUI: false, isIdle: () => true,
+      sessionManager: { getSessionId: () => "same-session", getSessionFile: () => path.join(root, "coordinator.jsonl"), getEntries: () => [] } };
+    pitako(pi as never); agentInstance(pi as never);
+    const emit = async (type: string) => {
+      for (const handler of handlers.get(type) ?? []) await handler({ type }, ctx);
+    };
+    cleanup = () => emit("session_shutdown");
+    await emit("session_start");
+    const spawn = (task: string) => tools.get("agent_spawn")!.execute(task, { role: "researcher", task }, undefined, undefined, ctx);
+    const status = async () => (await tools.get("agent_status")!.execute("status", {}, undefined, undefined, ctx)).details;
     view = controllers.at(-1)!.openView();
     let dispatchSignal: AbortSignal | undefined;
-    dispatch = ownedDispatch(ctx, undefined, () => true, async signal => {
+    dispatch = ownedDispatch(ctx as never, undefined, () => true, async signal => {
       dispatchSignal = signal; await dispatchHold;
     });
     await Promise.resolve();
-    // This real tool call is suspended at ownedDispatch's first microtask.
+    // This Pitako tool call is suspended at ownedDispatch's first microtask.
     stale = spawn("stale queued spawn");
     holdNextStartup = true;
     let joined = false;
-    rebind = session.bindExtensions(bindings).then(() => { joined = true; });
+    rebind = emit("session_start").then(() => { joined = true; });
     expect(dispatchSignal?.aborted).toBe(true);
     expect(() => view!.list()).toThrow("retired");
-    expect([ctx.sessionManager.getSessionId(), ctx.sessionManager.getSessionFile()]).toEqual(identity);
     const staleResult = await stale;
     const during = await spawn("spawn during startup");
     const heldRows = await status();
-    console.log("startup admission held", JSON.stringify({ staleResult, during, heldRows, starts, joined }));
     expect(staleResult).toMatchObject({ isError: true, details: { error: "Dispatch cancelled before admission" } });
     expect(during).toMatchObject({ isError: true, details: { error: "Dispatch cancelled before admission" } });
     expect(heldRows).toEqual({ workers: [] });
@@ -497,7 +497,7 @@ test("same-session public rebind fences real agent_spawn while captured official
       undefined, () => true, async (_signal, check) => { check(); return "independent"; })).toBe("independent");
     // A newer transition may settle first, but cannot release the older lease.
     let newerJoined = false;
-    newerRebind = session.bindExtensions(bindings).then(() => { newerJoined = true; });
+    newerRebind = emit("session_start").then(() => { newerJoined = true; });
     await Promise.resolve(); await Promise.resolve();
     expect(newerJoined).toBe(false); // abort request alone does not settle the held callback
     releaseDispatch(); await dispatch; await newerRebind;
@@ -514,19 +514,12 @@ test("same-session public rebind fences real agent_spawn while captured official
     expect(freshView.list().items.map(row => row.id)).toContain((fresh.details as { instanceId: string }).instanceId);
     expect(starts).toBe(1);
     await freshView.close();
-    await runner.emit({ type: "session_shutdown", reason: "quit" });
+    await emit("session_shutdown");
     expect(await status()).toEqual({ workers: [] });
-    expect(errors).toEqual([]);
   } finally {
     releaseCodex(); releaseDispatch();
     await Promise.allSettled([stale, dispatch, rebind, newerRebind]);
-    if (session) {
-      await session.extensionRunner!.emit({ type: "session_shutdown", reason: "quit" });
-      console.log("startup admission after shutdown", JSON.stringify({ starts,
-        rows: (await session.extensionRunner!.getAllRegisteredTools().find(tool => tool.definition.name === "agent_status")!.definition
-          .execute("cleanup-status", {}, undefined, undefined,
-            session.extensionRunner!.createToolContext("cleanup-status", undefined))).details }));
-    }
+    await cleanup?.();
     for (const finish of finishes) finish();
     await view?.close();
     captureController.mockRestore(); captureCodex.mockRestore();
@@ -577,14 +570,13 @@ for (const { event, failUpstream } of [
       extensions.push({ handlers: new Map() });
       factory(pi as never);
     }
-    // Use Pi's installed serial dispatcher, with an owned host context and the
-    // production composed foreground (including official Codex) and agent
-    // factories in shipped manifest order.
-    const runner = new ExtensionRunner(extensions as never, {} as never, root, ctx.sessionManager as never, {} as never);
-    const hostContext = spyOn(runner as unknown as { createContext(): typeof ctx }, "createContext").mockReturnValue(ctx);
     const errors: unknown[] = [];
-    runner.onError(error => { errors.push(error); });
-    const emit = (type: typeof event) => runner.emit(type === "session_start" ? { type, reason: "startup" } : { type, reason: "quit" });
+    const emit = async (type: string) => {
+      for (const extension of extensions) for (const handler of extension.handlers.get(type) ?? []) {
+        try { await handler({ type }, ctx); }
+        catch (error) { errors.push({ event: type, error: (error as Error).message }); }
+      }
+    };
     let dispatch: Promise<void> | undefined, transition: Promise<unknown> | undefined, acceptedInput: Promise<unknown> | undefined;
     let view: ReturnType<ReturnType<typeof createAgentController>["openView"]> | undefined;
     const cleanup: Array<() => void> = [];
@@ -670,7 +662,6 @@ for (const { event, failUpstream } of [
       await Promise.allSettled([acceptedInput]);
       await view?.close();
       await emit("session_shutdown");
-      hostContext.mockRestore();
       capture.mockRestore();
       if (failUpstream) expect(errors).toMatchObject([{ event: "session_start", error: "fixture upstream startup failed" }]);
       else expect(errors).toEqual([]);

@@ -175,6 +175,40 @@ describe("plan and execute contracts", () => {
   const verify = readFileSync(path.join(packageRoot(), "skills/practical/verify-behavior/SKILL.md"), "utf8");
 
   // Static policy contracts, not tests of model compliance or implementation effectiveness.
+  test("guidance selects owned behavior without reviving external certification", () => {
+    const author = readFileSync(path.join(packageRoot(), "skills/practical/gates/SKILL.md"), "utf8");
+    const readme = readFileSync(path.join(packageRoot(), "README.md"), "utf8");
+    const engineering = readFileSync(path.join(packageRoot(), "docs/engineering.md"), "utf8");
+    for (const instruction of [verify, router, plan, execute, prePr, deslop, author, readme, engineering]) {
+      expect(instruction).toContain("declared testing scope");
+      expect(instruction).toContain("active project");
+    }
+    for (const instruction of [verify, router, plan, execute, prePr, author, readme, engineering]) {
+      expect(instruction).toContain("scope, contracts, and active guide");
+      expect(instruction).toMatch(/not (?:from )?Pitako's distributed stack/);
+    }
+    for (const instruction of [verify, router, plan, execute, author, readme, engineering]) {
+      expect(instruction).toMatch(/Reading (?:an external boundary|a dependency)/);
+      expect(instruction).toMatch(/(?:grants no|does not authorize) (?:dependency )?certification or repair/);
+    }
+    for (const instruction of [plan, execute, author]) {
+      expect(instruction).toContain("out-of-scope external checks into acceptance, preflight, or final gates");
+    }
+    expect(verify).toContain("Reviewer must not demand that runtime solely because a double was used");
+    expect(verify).toContain("does not create a requirement to exercise that runtime");
+    expect(verify).toContain("when it belongs to the authorized testing scope");
+    expect(deslop).toContain("does not add dependency certification or revive retired external checks");
+    expect(prePr).toContain("Do not add external certification as an independent default");
+    expect(prePr).not.toContain("package/load or smoke obligations where warranted");
+    expect(execute).not.toContain("then the real surface when it is cheap");
+    for (const instruction of [readme, engineering]) {
+      expect(instruction).toContain("not future model compliance");
+      expect(instruction).toContain("asynchronous settlement before cleanup");
+      expect(instruction).not.toMatch(/bun run smoke|scripts\/smoke\.ts|tests\/todo\.test\.ts|fixtures\/tiny-ts/);
+    }
+    expect(readme).not.toContain("full serial Bun suite, separate Node suites");
+  });
+
   test("explicit GATES authoring bounds writes and preserves evidence distinctions", () => {
     const author = readFileSync(path.join(packageRoot(), "skills/practical/gates/SKILL.md"), "utf8");
     for (const contract of [
@@ -210,30 +244,20 @@ describe("plan and execute contracts", () => {
     expect(prePr).toContain("run `git diff --check` for publication readiness");
   });
 
-  test("Pitako GATES preserves routine populations and separate runtime obligations", () => {
+  test("Pitako gates retain the discovered owned suite in fixed order", () => {
     const gates = readFileSync(path.join(packageRoot(), "GATES.md"), "utf8");
-    const commands = [
-      "bun run typecheck",
-      "bun run test",
-      "bun run test:code-intelligence-node",
-    ];
-    const routine = gates.split("## Run the complete routine procedure")[1]!.split("## Use stage-specific")[0]!;
-    let previous = -1;
-    for (const command of commands) {
-      const current = routine.indexOf(command);
-      expect(current).toBeGreaterThan(previous);
-      previous = current;
-    }
+    const routine = gates.split("## Run the complete routine procedure")[1]!.split("### Use")[0]!;
+    expect(routine.indexOf("bun run typecheck")).toBeGreaterThan(-1);
+    expect(routine.indexOf("bun run test")).toBeGreaterThan(routine.indexOf("bun run typecheck"));
     expect(routine).not.toContain("--concurrent");
-    expect(JSON.parse(readFileSync(path.join(packageRoot(), "package.json"), "utf8")).scripts.test)
-      .toBe("bun test --parallel");
-    expect(routine).toContain("CPU-derived file parallelism");
-    expect(routine).toContain("including `tests/todo.test.ts`");
-    expect(routine).toContain("Do not add `bun run smoke` again by default");
-    expect(routine).not.toContain("test:mission-node");
-    expect(gates).toContain("Setup success does not prove every gate prerequisite");
+    const scripts = JSON.parse(readFileSync(path.join(packageRoot(), "package.json"), "utf8")).scripts;
+    expect(scripts.test).toBe("bun test --parallel");
+    expect(scripts.smoke).toBeUndefined();
+    expect(scripts["test:code-intelligence-node"]).toBeUndefined();
+    expect(gates).not.toContain("test:code-intelligence-node");
+    expect(gates).toContain("CPU-derived file parallelism");
+    expect(gates).toContain("Setup success does not prove");
     expect(gates).toContain("unrun checks separately from passes");
-    expect(gates).not.toContain("verify:mission");
   });
 
   test("recipe routing binds source and evidence while the principal owns full checks", () => {
@@ -578,7 +602,7 @@ describe("plan and execute contracts", () => {
     const preCleanupChecks = execute.indexOf("Require current sufficient passing affected-check evidence", finalPonytail);
     const deslopPass = execute.indexOf("Run `remove-ai-slops` only", preCleanupChecks);
     const postCleanupChecks = execute.indexOf("After cleanup, rerun checks invalidated by the edits", deslopPass);
-    const finalGates = execute.indexOf("Run final gates after all edits", postCleanupChecks);
+    const finalGates = execute.indexOf("Run applicable final gates after all edits", postCleanupChecks);
     const finalReview = execute.indexOf("the single final review", finalGates);
     expect(finalPonytail).toBeGreaterThanOrEqual(0);
     expect(preCleanupChecks).toBeGreaterThan(finalPonytail);

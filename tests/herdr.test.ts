@@ -1,4 +1,5 @@
-import "./fixtures/offline.ts";
+import { stubExternalFactories } from "./fixtures/offline.ts";
+stubExternalFactories();
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -10,7 +11,7 @@ import { agentScope } from "../extensions/agent/scope.ts";
 import { PitakoConfigError } from "../extensions/errors.ts";
 import pitako from "../extensions/index.ts";
 import { executionForSession, resolveBoardAuthor } from "../extensions/execution-identity.ts";
-import { unregisterSupervisedSession } from "../extensions/herdr/author.ts";
+import { registerSupervisedSession, unregisterSupervisedSession } from "../extensions/herdr/author.ts";
 import { piIntegrationCurrent, readHerdrPresence } from "../extensions/herdr/presence.ts";
 import { superviseAgent, type HerdrCommandResult, type HerdrRunner } from "../extensions/herdr/supervise.ts";
 import { childActiveTools } from "../extensions/profile.ts";
@@ -645,4 +646,45 @@ reasoning = "high"
     await first;
     expect(calls.filter((args) => args[1] === "split")).toHaveLength(1);
   });
+});
+
+test("supervised-origin records exact controlled identity and rejects a mismatched native id", () => {
+  const entries: unknown[] = [];
+  const env = { ...inside, PITAKO_INSTANCE_ID: "developer-controlled", PITAKO_ROLE_ID: "developer",
+    PITAKO_DISPATCH_ID: "dispatch-controlled", PITAKO_NATIVE_SESSION_ID: "native-controlled",
+    PITAKO_DEVELOPER_PROFILE: "developer_senior" };
+  const pi = { appendEntry: (type: string, data: unknown) => entries.push({ type, data }), getThinkingLevel: () => "high" as const };
+  try {
+    registerSupervisedSession("different", env, pi);
+    expect(entries).toEqual([]);
+    unregisterSupervisedSession();
+    registerSupervisedSession("native-controlled", env, pi, { provider: "fixture", id: "selected" } as never);
+    expect(entries).toEqual([{ type: "pitako.supervised-origin", data: { version: 1, dispatchId: "dispatch-controlled",
+      instanceId: "developer-controlled", roleId: "developer", sessionId: "native-controlled",
+      profile: "developer_senior", model: { provider: "fixture", id: "selected" }, reasoning: "high" } }]);
+  } finally { unregisterSupervisedSession(); }
+});
+
+test("supervised dispatch emits captured profile, native identity and selected model without running Pi", async () => {
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  const root = fixtureRoot(); process.env.PI_CODING_AGENT_DIR = root;
+  const load = developerLoad("high");
+  const ctx = { sessionManager: { getSessionId: () => "origin-coordinator", getSessionFile: () => undefined },
+    modelRegistry: { async getAvailableOfType() { return []; } } } as unknown as ExtensionContext;
+  try {
+    const { calls, run } = scripted();
+    const result = await superviseAgent({ ...superviseInput(run, { load }),
+      preflight: () => developerPreflight({ task: "Inspect the diff", toolCallId: "origin-call",
+        source: "agent_supervise", ctx, pi: { appendEntry() {} }, load, owns: () => true }) });
+    if (!result.sessionId || !result.sessionDir) throw new Error("supervised dispatch identity absent");
+    const split = calls.find(args => args[1] === "split")!, start = calls.find(args => args[1] === "start")!;
+    expect(result.sessionId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(split).toContain(`PITAKO_NATIVE_SESSION_ID=${result.sessionId}`);
+    expect(split).toContain("PITAKO_DEVELOPER_PROFILE=developer_mid");
+    expect(split).toContain(`PITAKO_DISPATCH_ID=${result.dispatchId}`);
+    expect(start[start.indexOf("--session-id") + 1]).toBe(result.sessionId);
+    expect(start[start.indexOf("--model") + 1]).toBe("example/coder");
+    expect(start[start.indexOf("--session-dir") + 1]).toBe(result.sessionDir);
+    expect(result.sessionDir).toStartWith(root + path.sep);
+  } finally { if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous; }
 });

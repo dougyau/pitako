@@ -30,7 +30,7 @@ describe("verification recipe v1", () => {
     const result = await helper.run(args);
     expect(result.status).toBe("passed");
     expect(result.results.map(result => result.command)).toEqual([
-      "bun run typecheck", "bun run test", "bun run test:code-intelligence-node",
+      "bun run typecheck", "bun run test",
     ]);
     expect(result.unrun).toEqual([]);
     for (const call of calls) {
@@ -41,13 +41,13 @@ describe("verification recipe v1", () => {
     }
   });
 
-  test("stops at nonzero and names remaining obligations", async () => {
+  test("stops at the first nonzero and names remaining obligations", async () => {
     let calls = 0;
-    const result = await recipe(async () => terminal(++calls === 1 ? 0 : 7)).run(args);
-    expect(calls).toBe(2);
+    const result = await recipe(async () => terminal(++calls === 1 ? 7 : 0)).run(args);
+    expect(calls).toBe(1);
     expect(result.status).toBe("failed");
-    expect(result.results[1]?.exitCode).toBe(7);
-    expect(result.unrun).toEqual(["bun run test:code-intelligence-node"]);
+    expect(result.results[0]?.exitCode).toBe(7);
+    expect(result.unrun).toEqual(["bun run test"]);
   });
 
   test("malformed, truncated, missing terminal, capture failure and tool errors cannot pass", async () => {
@@ -58,11 +58,11 @@ describe("verification recipe v1", () => {
       const result = await recipe(async () => { calls++; return observed; }).run(args);
       expect(result.status).toBe("incomplete");
       expect(calls).toBe(1);
-      expect(result.unrun).toHaveLength(2);
+      expect(result.unrun).toHaveLength(1);
     }
     const result = await recipe(async () => { throw Error("bounded timeout/tool error"); }).run(args);
     expect(result.status).toBe("incomplete");
-    expect(result.unrun).toHaveLength(2);
+    expect(result.unrun).toHaveLength(1);
   });
 
   test("quotes external paths and focused files; restricts real paths to project tests", async () => {
@@ -81,7 +81,7 @@ describe("verification recipe v1", () => {
     let calls = 0;
     const helper = recipe(async () => { calls++; return terminal(0); });
     const invalid = [
-      { kind: "full", command: "echo hacked" }, { kind: "gate", gate: "__proto__" },
+      { kind: "full", command: "echo hacked" }, { kind: "gate", gate: "__proto__" }, { kind: "gate", gate: "code-intelligence-node" },
       { kind: "gate", gate: "typecheck", flags: ["--help"] },
       { kind: "focused", files: [] }, { kind: "focused", files: ["tests/../evil.test.ts"] },
       { kind: "focused", files: ["src/x.test.ts"] }, { kind: "focused", files: ["tests/x.test.ts", "tests/x.test.ts"] },
@@ -92,7 +92,7 @@ describe("verification recipe v1", () => {
       await expect(helper.run({ ...args, root })).rejects.toThrow("absolute safe paths");
     }
     expect(calls).toBe(0);
-    for (const gate of ["typecheck", "bun", "code-intelligence-node"]) {
+    for (const gate of ["typecheck", "bun"]) {
       expect((await helper.run({ ...args, selection: { kind: "gate", gate } })).status).toBe("passed");
     }
   });

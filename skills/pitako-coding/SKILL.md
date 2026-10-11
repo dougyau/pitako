@@ -24,7 +24,7 @@ Switch with `/pitako profile analysis` or start Pi with `--pitako-profile analys
 2. Keep raw read, grep, LSP, and CodeGraph available as the navigation baseline. Use dense queries for bounded code questions and fall back to raw tools when coverage is partial or unavailable.
 3. Reuse what already exists. Question whether new code is needed.
 4. Keep the diff proportionate to the task. No speculative abstractions.
-5. Verify real behavior (diff, tests, command output) before claiming done.
+5. Verify real behavior (diff, tests, command output) before claiming done. Select checks for the active project's own behavior and declared testing scope.
 6. Research or design does not authorize implementation.
 7. For meaningful multi-step work, use the `todo` tool. Keep the current step `in_progress`. Complete a step only after the work is actually done. Skip TODOs for trivial tasks and purely conversational requests.
 
@@ -79,6 +79,8 @@ ACP loads before Hermes, and the official Codex entry loads before Pitako policy
 Do not load every skill. Do not load `caveman` at full or ultra unless the user asks. Do not load Ponytail and Caveman full bodies together.
 
 Ordinary verification uses `verify-behavior`; it does not invoke `gates` maintenance. `/skill:gates` writes only the selected project's root guide within the user's requested scope. The app-driving skills are not alternative project-wide gate recipes.
+
+Use the active project's `GATES.md`, not the installed Pitako checkout as a universal guide. Reading a dependency to understand a call does not authorize certification or repair. Pitako checks its own rules through controlled external boundaries, not the operation of its distributed dependencies. Other projects retain authorized integration requirements from their scope, contracts, and active guide, not Pitako's distributed stack.
 
 Ponytail governs simplicity of implementation and verification. `verify-behavior` governs evidence validity and sufficiency, including optional TDD. Its Pitako clarification permits existing frameworks and fixtures instead of Ponytail's prescribed self-check artifact. Neither skill waives validation, security, accessibility, or required error handling. Caveman lite governs noise, not architecture.
 

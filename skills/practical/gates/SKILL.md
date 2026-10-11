@@ -22,6 +22,8 @@ Inspect relevant manifests and lockfiles, CI, project documentation, wrappers, t
 
 Cross-check consequential claims against those sources. A targeted read-only help or version probe is allowed for a material uncertainty. Do not run setup or a complete suite merely to document its command. If sources disagree or a prerequisite is unknown, label the unresolved procedure and what must be confirmed instead of inventing a command or claiming readiness.
 
+Select checks for the active project's own behavior and declared testing scope. Reading an external boundary does not authorize dependency certification or repair. Document authorized integration requirements from the project's scope, contracts, and active guide, not Pitako's distributed stack. Do not turn out-of-scope external checks into acceptance, preflight, or final gates.
+
 ## Write the guide
 
 Use ordinary Markdown suited to the project. No fixed headings, frontmatter, schema, timestamps, or generated stamp are required. Explain the relevant:

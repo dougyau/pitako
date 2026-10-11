@@ -1,4 +1,5 @@
-import "./fixtures/offline.ts";
+import { stubExternalFactories } from "./fixtures/offline.ts";
+stubExternalFactories();
 import { afterEach, expect, test } from "bun:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {

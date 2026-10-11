@@ -1,4 +1,5 @@
-import "./fixtures/offline.ts";
+import { stubExternalFactories } from "./fixtures/offline.ts";
+stubExternalFactories();
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import {
   bindAgentUi,

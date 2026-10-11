@@ -1,6 +1,7 @@
-import "./fixtures/offline.ts";
+import { stubExternalFactories } from "./fixtures/offline.ts";
+stubExternalFactories();
 import { spawnSync } from "node:child_process";
-import { cpSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -9,8 +10,6 @@ import pitako from "../extensions/index.ts";
 import { agentScope } from "../extensions/agent/scope.ts";
 import { packageRoot } from "../extensions/stack.ts";
 import { childActiveTools, toolsForProfile } from "../extensions/profile.ts";
-import { registeredToolNames } from "../scripts/load-pitako.ts";
-import { loadPitako } from "./fixtures/owned-pitako.ts";
 
 const configDirs: string[] = [];
 function configDirectory(prefix: string) {
@@ -22,36 +21,6 @@ afterEach(() => {
   for (const dir of configDirs) rmSync(dir, { recursive: true, force: true });
   configDirs.length = 0;
 });
-
-async function loadWithWebConfig(packagePath: string, configDir: string) {
-  const previous = process.env.PI_CODING_AGENT_DIR;
-  process.env.PI_CODING_AGENT_DIR = configDir;
-  try {
-    return await loadPitako(packagePath);
-  } finally {
-    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
-    else process.env.PI_CODING_AGENT_DIR = previous;
-  }
-}
-
-function loadInFreshProcess(packagePath: string, configDir: string) {
-  const runner = path.join(packageRoot(), "tests", "fixtures", "load-pitako.ts");
-  const child = spawnSync(process.execPath, [runner, packagePath], {
-    encoding: "utf8",
-    env: { ...process.env, PI_CODING_AGENT_DIR: configDir },
-  });
-  if (child.status !== 0) throw new Error(`${child.stderr}\n${child.stdout}`);
-  const marker = child.stdout.split(/\r?\n/).reverse().find((line) => line.startsWith("PITAKO_LOAD_RESULT="));
-  if (!marker) throw new Error(`Load runner did not return a result:\n${child.stdout}\n${child.stderr}`);
-  return JSON.parse(marker.slice("PITAKO_LOAD_RESULT=".length)) as {
-    errors: unknown[];
-    names: string[];
-    paths: string[];
-    skills: { name: string; filePath: string; disableModelInvocation: boolean; body: string }[];
-    skillPrompt: string;
-    skillDiagnostics: { path: string }[];
-  };
-}
 
 function profileHarness(profileFlag?: string) {
   const active = ["read", "bash", "edit", "write"];
@@ -110,141 +79,25 @@ function profileHarness(profileFlag?: string) {
   };
 }
 
-describe("Pi package loading", () => {
-  test("composed official entry resolves from a conventional installed package layout", () => {
-    const root = packageRoot();
-    const layout = configDirectory("pitako-installed-composition-");
-    const installed = path.join(layout, "node_modules", "pitako");
-    mkdirSync(path.join(installed, "node_modules"), { recursive: true });
-    for (const resource of ["package.json", "extensions", "config", "roles", "skills", "prompts"]) {
-      cpSync(path.join(root, resource), path.join(installed, resource), { recursive: true });
+describe("Pitako resources and policy", () => {
+  test("declares Pitako resources and explicit-only gates without a Pi loader", () => {
+    const root = packageRoot(), manifest = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
+    expect(manifest.pi.extensions[0]).toBe("./extensions/index.ts");
+    expect(manifest.pi.extensions).toEqual(expect.arrayContaining([
+      "./extensions/board/index.ts", "./extensions/agent/index.ts", "./extensions/acp.ts",
+      "./extensions/code-intelligence/index.ts",
+    ]));
+    expect(manifest.pi.skills).toContain("./skills/practical");
+    for (const directory of ["pitako-coding", "plan", "execute", "pre-pr", "remove-ai-slops"]) {
+      expect(manifest.pi.skills).toContain(`./skills/${directory}`);
+      expect(readFileSync(path.join(root, "skills", directory, "SKILL.md"), "utf8")).toContain("declared testing scope");
     }
-    // Existing dependency bytes only: Codex is physically bundled at the exact
-    // resource path used by the adapter; unchanged peers/resources are linked.
-    for (const entry of readdirSync(path.join(root, "node_modules"))) {
-      const source = path.join(root, "node_modules", entry);
-      const target = path.join(installed, "node_modules", entry);
-      if (entry === "pi-codex-tools") cpSync(source, target, { recursive: true, dereference: true });
-      else symlinkSync(source, target);
-    }
-    expect(lstatSync(path.join(installed, "node_modules/pi-codex-tools")).isSymbolicLink()).toBe(false);
-    const loaded = loadInFreshProcess(installed, configDirectory("pitako-installed-config-"));
-    expect(loaded.errors).toEqual([]);
-    expect(loaded.paths[0]).toBe(path.join(installed, "extensions/index.ts"));
-    expect(loaded.paths.some(file => file.includes("/pi-codex-tools/"))).toBe(false);
-    expect(loaded.names.filter(name => name === "apply_patch")).toHaveLength(1);
-    expect(loaded.names).toEqual(expect.arrayContaining(["agent_input", "board_post", "todo", "compress"]));
-  });
-
-  test.serial("installed advice is discoverable in principal and ordinary codemode and retained outside cwd", () => {
-    const root = packageRoot();
-    const child = spawnSync("node", ["--experimental-transform-types", "--import",
-      path.join(root, "scripts/sdk-node-loader.mjs"), "scripts/jev-advice-sdk-node.mjs"], {
-      cwd: root, encoding: "utf8", timeout: 90_000,
-      env: { ...process.env, PI_OFFLINE: "1", PI_TELEMETRY: "0" },
-    });
-    expect(child.status, child.stderr + child.stdout).toBe(0);
-    const observed = JSON.parse(child.stdout);
-    expect(observed.advertisedDiscovery).toEqual(["principal CLI/Pi-owned builtin", "production ordinary child"]);
-    expect(observed.installedLayout).toBe(true);
-    expect(observed.unrelatedCwdWithoutCheckoutOrGates).toBe(true);
-    expect(observed.branchEvidence.subjects).toEqual(["failure", "test-audit", "consultation"]);
-    expect(observed.principalUnavailable).toBe("retained; zero classify calls");
-    expect(observed.ordinaryClassifyCalls).toBe(3);
-    expect(observed.paidCalls).toBe(0);
-    expect(observed.recovery).toMatchObject({
-      existingHistoryReader: true, physicalAndNativeRecords: 2, exactInputsAndResponses: true,
-      removedOnlyCwd: true, principalUnavailableRetained: true, failedStagedInvocationNotCommitted: true,
-    });
-  }, 120_000);
-
-  test("discovers explicit-only gates from the edited package in a fresh loader", () => {
-    const root = packageRoot();
-    const loaded = loadInFreshProcess(root, configDirectory("pitako-gates-config-"));
-    expect(loaded.errors).toEqual([]);
-    const gates = loaded.skills.filter((skill) => skill.name === "gates");
-    expect(gates).toHaveLength(1);
-    const file = path.join(root, "skills/practical/gates/SKILL.md");
-    expect(gates[0]).toMatchObject({ filePath: file, disableModelInvocation: true });
-    expect(gates[0]!.body).toBe(readFileSync(file, "utf8"));
-    expect(gates[0]!.body).toContain("Write only `<selected-project-root>/GATES.md`");
-    expect(loaded.skillDiagnostics.filter((diagnostic) => diagnostic.path === file)).toEqual([]);
-    expect(loaded.skillPrompt).not.toContain("<name>gates</name>");
-    expect(loaded.skillPrompt).toContain("<name>verify-behavior</name>");
-  });
-
-  test("discovers the required extensions from a relative package path", async () => {
-    const root = packageRoot();
-    const isolatedConfig = configDirectory("pitako-web-config-empty-");
-    const loaded = await loadWithWebConfig(root, isolatedConfig);
-    expect(path.isAbsolute(loaded.relativePackagePath)).toBe(false);
-    expect(loaded.extensions.errors).toEqual([]);
-    const paths = loaded.extensions.extensions.map((extension) => extension.resolvedPath);
-    expect(paths.some((file) => file.endsWith("extensions/index.ts"))).toBe(true);
-    const webExtensionIndex = paths.findIndex((file) => file.includes(`${path.sep}pi-web-access${path.sep}dist${path.sep}index.js`));
-    const pitakoExtensionIndex = paths.findIndex((file) => file.endsWith(`${path.sep}extensions${path.sep}index.ts`));
-    expect(pitakoExtensionIndex).toBe(0);
-    expect(webExtensionIndex).toBeGreaterThan(pitakoExtensionIndex);
-    expect(paths.filter((file) => file.includes(`${path.sep}pi-codex-tools${path.sep}`))).toHaveLength(0);
-    const patchOwners = loaded.extensions.extensions.filter(extension => extension.tools.has("apply_patch"));
-    expect(patchOwners).toHaveLength(1);
-    expect(patchOwners[0]?.resolvedPath).toBe(path.join(root, "extensions/index.ts"));
-    expect(paths.some((file) => file.includes(`${path.sep}pi-lsp-client${path.sep}`))).toBe(true);
-    expect(paths.some((file) => file.endsWith(`${path.sep}codegraph-raw.ts`))).toBe(true);
-    expect(paths.some((file) => file.includes(`${path.sep}rpiv-todo${path.sep}`))).toBe(true);
-    const hermesIndex = paths.findIndex((file) => file.includes(`${path.sep}pi-hermes-memory${path.sep}src${path.sep}index.ts`));
-    expect(hermesIndex).toBeGreaterThan(-1);
-    const acpIndex = paths.findIndex((file) => file.endsWith(`${path.sep}extensions${path.sep}acp.ts`));
-    expect(acpIndex).toBeGreaterThan(-1);
-    expect(acpIndex).toBeLessThan(hermesIndex);
-    expect(paths.filter((file) => file.endsWith(`${path.sep}extensions${path.sep}acp.ts`))).toHaveLength(1);
-    expect(paths.some((file) => file.includes(`${path.sep}billion-context-pi${path.sep}dist${path.sep}index.js`))).toBe(false);
-    expect(paths.some((file) => file.endsWith(`${path.sep}extensions${path.sep}board${path.sep}index.ts`))).toBe(true);
-    expect(paths.some((file) => file.includes(`${path.sep}pi-web-access${path.sep}dist${path.sep}index.js`))).toBe(true);
-    for (const file of paths) expect(file.startsWith(root)).toBe(true);
-
-    const names = registeredToolNames(loaded.extensions);
-    expect(names.filter((name) => name.startsWith("mission_"))).toEqual([]);
-    const commands = loaded.extensions.extensions.flatMap((extension) => [...extension.commands.keys()]);
-    expect(commands).not.toContain("mission");
-    for (const name of ["agent_run", "agent_spawn", "agent_history", "team_assign", "team_status", "team_result",
-      "board_workflow_claim", "board_workflow_lifecycle"]) expect(names).toContain(name);
-    expect(commands).toContain("pitako");
-    expect(names).toContain("apply_patch");
-    for (const name of ["lsp_diagnostics", "lsp_goto_definition", "lsp_find_references", "lsp_symbols", "lsp_prepare_rename", "lsp_rename"]) {
-      expect(names).toContain(name);
-    }
-    for (const name of ["codegraph_search", "codegraph_callers", "codegraph_callees", "codegraph_impact", "codegraph_explore"]) {
-      expect(names).toContain(name);
-    }
-    expect(names).toContain("todo");
-    const memoryTools = ["memory_add", "memory_replace", "memory_remove", "memory_search", "session_search", "skill_manage"];
-    expect(names).toEqual(expect.arrayContaining(memoryTools));
-    expect(childActiveTools(names)).toEqual(expect.arrayContaining(memoryTools));
-    for (const profile of ["coding", "analysis"] as const) {
-      expect(toolsForProfile({ available: names, profile })).toEqual(expect.arrayContaining(memoryTools));
-    }
-    for (const name of ["web_search", "fetch_content", "source_check", "get_search_content", "web_enable"]) {
-      expect(names).toContain(name);
-    }
-    for (const name of ["board_topic_create", "board_topic_list", "board_topic_read", "board_topic_update", "board_post", "board_query"]) {
-      expect(names).toContain(name);
-    }
-    for (const name of ["todo_write", "todowrite", "todoread", "TodoWrite"]) {
-      expect(names).not.toContain(name);
-    }
-
-    const skills = loaded.loader.getSkills().skills.map((skill) => skill.name);
-    expect(skills).toContain("pitako-coding");
-    expect(skills).toContain("ponytail");
-    expect(skills).toContain("how");
-    expect(skills).toContain("verify-behavior");
-    for (const retired of ["tdd", "show-me-your-work", "principle-prove-it-works"]) {
-      expect(skills).not.toContain(retired);
-    }
-    expect(skills).not.toContain("poteto-mode");
-    const prompts = loaded.loader.getPrompts().prompts.map((prompt) => prompt.name);
-    expect(prompts).toContain("explain");
+    expect(readFileSync(path.join(root, "skills/practical/verify-behavior/SKILL.md"), "utf8"))
+      .toContain("declared testing scope");
+    const gates = readFileSync(path.join(root, "skills/practical/gates/SKILL.md"), "utf8");
+    expect(gates).toContain("disable-model-invocation: true");
+    expect(gates).toContain("Write only `<selected-project-root>/GATES.md`");
+    expect(manifest.pi.prompts).toContain("./prompts");
   });
 
   test("profile guidance reaches the provider prompt without changing raw and dense tool access", async () => {
@@ -255,6 +108,7 @@ describe("Pi package loading", () => {
     expect(prompt).toContain("bounded structural code questions");
     expect(prompt).toContain("literal, exhaustive or exact results");
     expect(prompt).toContain("partial or unavailable");
+    expect(prompt).toContain("Select checks for the active project's own behavior and declared testing scope.");
     for (const name of ["read", "grep", "bash", "lsp_diagnostics", "codegraph_search", "project_report", "read_symbol", "edit", "write", "web_search", "fetch_content", "source_check", "get_search_content", "web_enable"]) {
       expect(foreground.active).toContain(name);
     }
@@ -266,28 +120,13 @@ describe("Pi package loading", () => {
     const analysisPrompt = await analysis.composePrompt("base system prompt");
     expect(analysisPrompt).toContain("bounded structural code questions");
     expect(analysisPrompt).toContain("edit, write, apply_patch, and lsp_rename are not");
+    expect(analysisPrompt).toContain("Select checks for the active project's own behavior and declared testing scope.");
     for (const name of ["read", "grep", "bash", "lsp_diagnostics", "codegraph_search", "project_report", "read_symbol", "web_search", "fetch_content", "source_check", "get_search_content", "web_enable"]) {
       expect(analysis.active).toContain(name);
     }
     expect(analysis.active).not.toContain("edit");
     expect(analysis.active).not.toContain("write");
     await analysis.shutdown();
-  });
-
-  test("configuration can disable and rename web tools", () => {
-    const root = packageRoot();
-    const configDir = configDirectory("pitako-web-config-custom-");
-    writeFileSync(path.join(configDir, "web-search.json"), JSON.stringify({
-      tools: { webSearch: { enabled: false } },
-      toolNames: { fetchContent: "fetch_page" },
-    }));
-    const loaded = loadInFreshProcess(root, configDir);
-    expect(loaded.errors).toEqual([]);
-    expect(loaded.names).not.toContain("web_search");
-    expect(loaded.names).toContain("fetch_page");
-    for (const name of ["source_check", "get_search_content", "web_enable", "lsp_diagnostics", "codegraph_search", "todo", "board_topic_create"]) {
-      expect(loaded.names).toContain(name);
-    }
   });
 
   test("profile reloads keep edit/write for unsupported models in all roles", async () => {

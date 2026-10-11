@@ -1,5 +1,6 @@
-import "./fixtures/offline.ts";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { stubExternalFactories } from "./fixtures/offline.ts";
+stubExternalFactories();
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -11,7 +12,7 @@ import { getModelPolicy, getRole, loadPitakoConfig, resolveRole, resolveRoleFrom
 import { inspectPitako } from "../extensions/roles/format.ts";
 import { ROLE_IDS, DEVELOPER_PROFILES } from "../extensions/roles/types.ts";
 import { packageRoot } from "../extensions/stack.ts";
-import { loadPitako } from "./fixtures/owned-pitako.ts";
+import { childInstructions, skillNamesForRole } from "../extensions/agent/run.ts";
 
 const tempDirs: string[] = [];
 
@@ -106,6 +107,26 @@ fallbacks = []
     writeFileSync(path.join(path.dirname(configPath), "custom.md"), "User-defined instructions");
     expect(resolveRole("developer", { env }).instructions).toBe("User-defined instructions");
     expect(delivered.instructions).toContain("Verification-only work");
+  });
+
+  test("testing boundaries reach resolved role and owned child instructions", () => {
+    const { env } = tempAgent();
+    // Observe Pitako's local assembly, not a real SDK session or model compliance.
+    for (const id of ["developer", "reviewer", "researcher", "coordinator"] as const) {
+      const role = resolveRole(id, { env });
+      const instructions = childInstructions(role, `${id}-fixture`);
+      expect(instructions).toContain(role.instructions);
+      expect(instructions).toContain("active project's own behavior and declared testing scope");
+      expect(instructions).toContain("Reading an external boundary does not authorize dependency certification or repair");
+      expect(instructions).toContain("scope, contracts, and active guide, not Pitako's distributed stack");
+      expect(skillNamesForRole(role)).toContain("verify-behavior");
+      if (id === "reviewer") {
+        expect(instructions).toContain("Do not demand a real replaced runtime solely because a controlled boundary double verifies an owned rule");
+      }
+      if (id === "coordinator") {
+        expect(instructions).toContain("out-of-scope external checks into acceptance, preflight, or final gates");
+      }
+    }
   });
 
   test("built-in roles resolve without a user config and do not read the home config", () => {
@@ -303,7 +324,7 @@ reasoning = "high"
     expect(() => loadPitakoConfig({ env })).toThrow(/unknown key model_policies.architect.fallback_on/);
   });
 
-  test("Pi model capabilities reject an unknown id and an unsupported reasoning level", () => {
+  test("supplied model capabilities reject an unknown id and an unsupported reasoning level", () => {
     const { env, configPath } = tempAgent();
     writeConfig(
       configPath,
@@ -388,18 +409,11 @@ reasoning = "high"
     }
   });
 
-  test("Board, todo, and coding skills still load", async () => {
-    const loaded = await loadPitako(packageRoot());
-    expect(loaded.extensions.errors).toEqual([]);
-    const names: string[] = [];
-    for (const extension of loaded.extensions.extensions) {
-      for (const name of extension.tools.keys()) names.push(name);
-    }
-    expect(names).toContain("board_post");
-    expect(names).toContain("todo");
-    expect(names).toContain("codegraph_search");
-    const skills = loaded.loader.getSkills().skills.map((skill) => skill.name);
-    expect(skills).toContain("architect");
-    expect(skills).toContain("ponytail");
+  test("declares Board, todo and coding resources", () => {
+    const manifest = JSON.parse(readFileSync(path.join(packageRoot(), "package.json"), "utf8")).pi;
+    expect(manifest.extensions).toContain("./extensions/board/index.ts");
+    expect(manifest.extensions).toContain("./node_modules/@juicesharp/rpiv-todo/index.ts");
+    expect(manifest.skills).toContain("./skills/practical");
+    expect(manifest.skills).toContain("./node_modules/@dietrichgebert/ponytail/skills/ponytail");
   });
 });

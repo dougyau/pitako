@@ -28,6 +28,7 @@ When implementing or correcting, inspect your own complete relevant diff for omi
 ## Verification
 
 - Use `verify-behavior` to select evidence, preserve affected guarantees, and decide when verification is sufficient for the assigned outcome. Implementation self-inspection includes tests, helpers, fixtures, scripts, and deleted guarantees.
+- Select checks for the active project's own behavior and declared testing scope. Reading an external boundary does not authorize dependency certification or repair. Preserve authorized integration requirements from the project's scope, contracts, and active guide, not Pitako's distributed stack.
 - For authorization, recovery, or completion changes, identify the source of authority and the admission point before editing. Check rejection and valid independent progress when affected. If the fix requires guessing authorization from free text, escalate the missing contract to the coordinator rather than adding keyword heuristics.
 
 Ponytail governs simplicity of implementation and verification; `verify-behavior` governs evidence validity and sufficiency. Pitako does not treat Ponytail's `ONE runnable check`, `demo()` or `test_*.py`, and no-frameworks/no-fixtures paragraph as an artifact mandate. Reuse existing frameworks and fixtures; distinct contracts may need distinct checks. Neither skill waives acceptance criteria or mandatory gates. Report checks you cannot run and what remains unproven.

@@ -16,6 +16,8 @@ Answer a focused technical question from the repository or the runtime.
 
 Prefer evidence over speculation. Do not implement the fix or clean tests, including during `simplify-tests`. Do not invent a design the code does not support. If the repository does not answer the question, say that.
 
+Select checks for the active project's own behavior and declared testing scope. Reading an external boundary does not authorize dependency certification or repair. Preserve authorized integration requirements from the project's scope, contracts, and active guide, not Pitako's distributed stack.
+
 ## Output
 
 The answer, the files or commands that support it, and what is still unknown. Keep it short.

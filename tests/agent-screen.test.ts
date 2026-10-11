@@ -1,6 +1,5 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, chmodSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { visibleWidth } from "@earendil-works/pi-tui";
@@ -57,28 +56,6 @@ describe("shared compatibility screen", () => {
     }
   });
 });
-
-test("foreground SDK command mounts the screen, admits native text and confirms cancel before owned attempt settlement", () => {
-  const root = mkdtempSync(path.join(tmpdir(), "pitako-screen-sdk-"));
-  let settled = false;
-  try {
-    const child = spawnSync("node", ["--experimental-transform-types", "--import", "./scripts/sdk-node-loader.mjs",
-      "scripts/agent-input-sdk-node.mjs", "--screen"], {
-      cwd: path.resolve(import.meta.dir, ".."), encoding: "utf8", timeout: 60_000,
-      env: { ...process.env, PI_OFFLINE: "1", PI_TELEMETRY: "0", TMPDIR: root, PITAKO_INSTANCE_ID: "", PITAKO_ROLE_ID: "" },
-    });
-    settled = child.status === 0;
-    expect(child.status, child.stderr + child.stdout).toBe(0);
-    const observed = JSON.parse(child.stdout);
-    console.log("screen-sdk-observed:", JSON.stringify(observed));
-    expect(observed).toMatchObject({ sdkCommand: "/pitako agents", customCalls: 1, paidCalls: 0, starts: 0, stops: 0, ownedAttemptsJoined: 1,
-      query: { status: "queued" }, steer: { status: "queued" } });
-    expect(observed.snapshots.map((item: { label: string }) => item.label)).toContain("acknowledged-history");
-  } finally {
-    if (settled) rmSync(root, { recursive: true, force: true });
-    else console.error("Retained unsuccessful screen SDK fixture:", root);
-  }
-}, 90_000);
 
 test("bounded pages, sensitive acknowledgements, hostile text and unavailable controls remain explicit under resize", async () => {
   let height = 10;

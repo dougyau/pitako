@@ -1,3 +1,4 @@
+import { controlledPi, controlledModel } from "./fixtures/pi-factories.ts";
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { agentFixtureOwnership } from "./fixtures/agent-fixture-ownership.ts";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
@@ -579,10 +580,10 @@ describe("cursor stream hold", () => {
   }));
 
   test("drive and continueWith bind a per-attempt probe", fixture.ownedCase("drive and continueWith bind a per-attempt probe", async () => {
-    const dirs: string[] = [];
-    const { cwd } = await installProbeProviders(dirs, () => {}, Promise.resolve());
+    const cwd = mkdtempSync(path.join(tmpdir(), "pitako-probe-")); fixture.directories.push(cwd);
+    const host = controlledPi(cwd, { models: [controlledModel("pitako-probe", "late")] });
     const events: string[] = [];
-    const attempt = await fixture.acquire(createPiExecutor().start({
+    const attempt = await fixture.acquire(createPiExecutor({ factories: host.factories }).start({
       instanceId: "developer-probe",
       role: probeRole,
       task: "say-pong-marker",
@@ -621,11 +622,15 @@ describe("cursor stream hold", () => {
       bothEntered = resolve;
     });
     const probes: { a?: () => { name: string } | undefined; b?: () => { name: string } | undefined } = {};
-    const { cwd } = await installSplitProviders(dirs, () => {
-      entered += 1;
-      if (entered === 2) bothEntered();
-    }, hungA, hungB);
-    const executor = createPiExecutor();
+    const cwd = mkdtempSync(path.join(tmpdir(), "pitako-split-probe-")); fixture.directories.push(cwd);
+    const host = controlledPi(cwd, { models: [controlledModel("cursor", "late"), controlledModel("other", "late")],
+      async prompt(session) {
+        session.isStreaming = true; entered++; if (entered === 2) bothEntered();
+        await (session.model?.provider === "cursor" ? hungA : hungB);
+        session.isStreaming = false;
+        session.messages.push({ role: "assistant", content: [{ type: "text", text: "pong" }], stopReason: "stop" });
+      } });
+    const executor = createPiExecutor({ factories: host.factories });
     const pendingA = fixture.acquire(executor.start({
       instanceId: "developer-a",
       role: probeRole,
@@ -662,7 +667,6 @@ describe("cursor stream hold", () => {
   }), 60_000);
 });
 
-const eventStreamSpecifier = "@earendil-works/pi-ai/utils/event-stream.js";
 
 const probeRole: ResolvedRole = {
   id: "developer",
@@ -675,99 +679,6 @@ const probeRole: ResolvedRole = {
   modelPolicyId: "developer",
   modelPolicy: { id: "developer", fallbacks: [] },
 };
-
-async function installProbeProviders(
-  dirs: string[],
-  onStream: () => void,
-  release: Promise<void>,
-): Promise<{ cwd: string }> {
-  const { createAssistantMessageEventStream } = await import(eventStreamSpecifier);
-  return installProviders(dirs, {
-    "pitako-probe": fakeProvider("pitako-probe", onStream, release, createAssistantMessageEventStream),
-  });
-}
-
-async function installSplitProviders(
-  dirs: string[],
-  onStream: () => void,
-  releaseA: Promise<void>,
-  releaseB: Promise<void>,
-): Promise<{ cwd: string }> {
-  const { createAssistantMessageEventStream } = await import(eventStreamSpecifier);
-  return installProviders(dirs, {
-    cursor: fakeProvider("cursor", onStream, releaseA, createAssistantMessageEventStream),
-    other: fakeProvider("other", onStream, releaseB, createAssistantMessageEventStream),
-  });
-}
-
-function installProviders(dirs: string[], providers: Record<string, unknown>): { cwd: string } {
-  const agentDir = mkdtempSync(path.join(tmpdir(), "pitako-probe-agent-"));
-  const cwd = mkdtempSync(path.join(tmpdir(), "pitako-probe-cwd-"));
-  dirs.push(agentDir, cwd);
-  fixture.directories.push(agentDir, cwd);
-  mkdirSync(path.join(agentDir, "extensions"));
-  const names = Object.keys(providers);
-  const body = names.map((name) => `pi.registerProvider(${JSON.stringify(name)}, globalThis[${JSON.stringify(`__pitako_${name}`)}]);`).join("");
-  writeFileSync(path.join(agentDir, "extensions", "probe.js"), `export default function (pi) { ${body} }\n`);
-  for (const name of names) {
-    (globalThis as Record<string, unknown>)[`__pitako_${name}`] = providers[name];
-  }
-  process.env.PI_CODING_AGENT_DIR = agentDir;
-  return { cwd };
-}
-
-function fakeProvider(
-  provider: string,
-  onStream: () => void,
-  release: Promise<void>,
-  createAssistantMessageEventStream: () => {
-    push(event: unknown): void;
-    end(message: unknown): void;
-  },
-) {
-  return {
-    baseUrl: "http://127.0.0.1",
-    apiKey: "test",
-    api: "openai-completions",
-    models: [
-      {
-        id: "late",
-        name: provider,
-        reasoning: false,
-        input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 1000,
-        maxTokens: 64,
-      },
-    ],
-    streamSimple() {
-      onStream();
-      const stream = createAssistantMessageEventStream();
-      release.then(() => {
-        const message = {
-          role: "assistant",
-          content: [{ type: "text", text: "pong" }],
-          api: "openai-completions",
-          provider,
-          model: "late",
-          stopReason: "stop",
-          timestamp: Date.now(),
-          usage: {
-            input: 1,
-            output: 1,
-            cacheRead: 0,
-            cacheWrite: 0,
-            totalTokens: 2,
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-          },
-        };
-        stream.push({ type: "done", reason: "stop", message });
-        stream.end(message);
-      });
-      return stream;
-    },
-  };
-}
 
 function waitForAbort(signal: AbortSignal): Promise<void> {
   if (signal.aborted) return Promise.resolve();

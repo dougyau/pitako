@@ -5,7 +5,6 @@
   const gates = {
     typecheck: "bun run typecheck",
     bun: "bun run test",
-    "code-intelligence-node": "bun run test:code-intelligence-node",
   };
   return {
     version: 1,

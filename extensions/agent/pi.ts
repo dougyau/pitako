@@ -81,7 +81,25 @@ export function thinkingLevelFor(reasoning: ReasoningLevel | undefined): Thinkin
   return reasoning;
 }
 
-export function createPiExecutor(options: { now?: () => number } = {}): AttemptExecutor {
+type PiFactories = {
+  createRuntime: typeof ModelRuntime.create;
+  getAgentDir: typeof getAgentDir;
+  createSettings: typeof SettingsManager.create;
+  createLoader: (options: ConstructorParameters<typeof DefaultResourceLoader>[0]) => DefaultResourceLoader;
+  createCodemode: typeof createCodemodeExtension;
+  createSession: typeof createAgentSession;
+};
+const piFactories: PiFactories = {
+  createRuntime: options => ModelRuntime.create(options),
+  getAgentDir,
+  createSettings: (cwd, agentDir) => SettingsManager.create(cwd, agentDir),
+  createLoader: options => new DefaultResourceLoader(options),
+  createCodemode: createCodemodeExtension,
+  createSession: createAgentSession,
+};
+
+export function createPiExecutor(options: { now?: () => number; factories?: Partial<PiFactories> } = {}): AttemptExecutor {
+  const factories = { ...piFactories, ...options.factories };
   return {
     capturesHistory: true,
     async start(input) {
@@ -89,12 +107,12 @@ export function createPiExecutor(options: { now?: () => number } = {}): AttemptE
       try {
         // Do not bind the worker abort signal here. The session abort owns cancellation.
         // A signal on runtime create aborts Cursor auth before the child prompt starts.
-        const runtime = await ModelRuntime.create({ allowModelNetwork: false });
+        const runtime = await factories.createRuntime({ allowModelNetwork: false });
         const selections = new WeakMap<object, RequestSelection>();
         keepCursorTools(runtime);
         installServiceTierTransport(runtime, selections);
         const result = await runTarget(runtime, selections, options.now ?? (() => performance.now()), input.target, input.task,
-          { ...input, sessionHistory: history });
+          { ...input, sessionHistory: history, factories });
         try {
           return history?.result(result) ?? result;
         } catch (error) {
@@ -226,6 +244,7 @@ async function runTarget(
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
     bindLive?: Parameters<AttemptExecutor["start"]>[0]["bindLive"];
     sessionHistory?: SessionHistory;
+    factories: PiFactories;
   },
   existing?: { session: AgentSession; mode: "pre-prompt" | "continuation" },
 ): Promise<Attempt> {
@@ -345,6 +364,7 @@ async function bindThenRun(
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
     bindLive?: Parameters<AttemptExecutor["start"]>[0]["bindLive"];
     sessionHistory?: SessionHistory;
+    factories: PiFactories;
   },
 ): Promise<Attempt> {
   let session: AgentSession;
@@ -369,19 +389,19 @@ async function openSession(
   runtime: ModelRuntime,
   model: NonNullable<ReturnType<ModelRuntime["getModel"]>> | undefined,
   target: ModelTarget,
-  input: { instanceId: string; role: Parameters<AttemptExecutor["start"]>[0]["role"]; cwd: string; sessionHistory?: SessionHistory;
+  input: { instanceId: string; role: Parameters<AttemptExecutor["start"]>[0]["role"]; cwd: string; sessionHistory?: SessionHistory; factories: PiFactories;
     bindLive?: Parameters<AttemptExecutor["start"]>[0]["bindLive"] },
 ): Promise<AgentSession> {
-  const agentDir = getAgentDir();
-  const settingsManager = SettingsManager.create(input.cwd, agentDir);
+  const agentDir = input.factories.getAgentDir();
+  const settingsManager = input.factories.createSettings(input.cwd, agentDir);
   const allowed = new Set(skillNamesForRole(input.role));
   let live: ReturnType<typeof createLiveHandle> | undefined;
-  const loader = new DefaultResourceLoader({
+  const loader = input.factories.createLoader({
     cwd: input.cwd,
     agentDir,
     settingsManager,
     additionalExtensionPaths: [packageRoot()],
-    extensionFactories: [createCodemodeExtension({ mode: "on" }), pi => {
+    extensionFactories: [input.factories.createCodemode({ mode: "on" }), pi => {
       pi.on("turn_start", () => { live?.open(); });
       pi.on("agent_before_settle", () => live?.settle());
     }],
@@ -393,7 +413,7 @@ async function openSession(
   });
   await loader.reload();
   const thinkingLevel = model ? thinkingLevelFor(target.reasoning) : undefined;
-  const { session } = await createAgentSession({
+  const { session } = await input.factories.createSession({
     cwd: input.cwd,
     agentDir,
     ...(model ? { model } : {}),
@@ -439,6 +459,7 @@ async function drive(
     onActivated?: (appliedReasoning: string) => void;
     onRequest?: (request: AgentRequestObservation) => void;
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
+    factories: PiFactories;
   },
 ): Promise<Attempt> {
   // continueWith skips executor.start. The probe closes over this session only.
@@ -606,6 +627,7 @@ function resume(
     onActivated?: (appliedReasoning: string) => void;
     onRequest?: (request: AgentRequestObservation) => void;
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
+    factories: PiFactories;
   },
 ): NonNullable<Attempt["session"]> {
   const history = childLifecycles.get(session)?.history;
