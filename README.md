@@ -36,7 +36,7 @@ Disable Ponytail, Caveman, or any individual skill with `pi config` or package s
 - A workspace-scoped Board (`board_*` tools, `/board`) stored in SQLite. Plans can bind and finalize their own topics.
 - Role definitions and model policies (`/pitako roles`). These are templates, not running agents.
 - `agent_run` for one synchronous in-process AgentInstance. It does not start a team.
-- `agent_spawn` for one background in-process AgentInstance. The Coordinator stays available. `agent_status`, `agent_result`, and `agent_cancel` inspect that worker. `/pitako agents` prints the same compact view.
+- `agent_spawn` for one background in-process AgentInstance. The Coordinator stays available. `agent_status`, `agent_result`, and `agent_cancel` inspect that worker. `/pitako agents [instance-id]` opens the native list/detail screen in Pi's terminal and retains bounded text in non-TUI modes. See [the screen controls](docs/worker-history.md#native-agent-screen).
 - Foreground `agent_observe` and `agent_input` for bounded observation, context queries, and in-scope steering of exact active background or Team targets. Input waits for a later native boundary and never interrupts a command. A receipt is not an answer. See [worker history and input](docs/worker-history.md).
 - `agent_supervise` for one synchronous visible sibling pane. It does not run in the background or join the Team roster.
 - `team_assign`, `team_status`, `team_result`, and `team_cancel` for independent foreground Team assignments, with one active assignment per role.
@@ -237,6 +237,15 @@ max_run_time = "0"
 
 `agent_supervise` is a separate tool. It requires Herdr presence and a current official Pi integration. The operator installs that integration with `herdr integration install pi`. Pitako does not install it. The result is an instance id, a pane id, and a Herdr status. It is not an `AgentRunResult`.
 
+### Optional agent inspection pane
+
+On Linux with Herdr 0.9.3 and Bun 1.4.2, an explicit foreground
+`/pitako agents pane` opens the same agent screen in a read-only plugin pane.
+It inspects existing workers; it does not create a worker or replace Pi's terminal.
+Installation, access flags, reconnect and sensitive-data limits are in
+[Optional Herdr pane](docs/worker-history.md#optional-herdr-pane).
+Pi-only, RPC and child sessions do not start the pane broker.
+
 ## Plans
 
 `$plan` investigates, writes a decision-complete plan, and stops at `PLAN_FROZEN`. It does not implement, and it does not invoke `$execute`.
@@ -334,6 +343,8 @@ The shipped `gates` skill is explicit-only through `disable-model-invocation: tr
 Official `pi-codex-tools` registers `apply_patch` and owns its grammar capability. Pitako uses its public `supportsOpenAIGrammarTools` helper for every coding role, including the foreground session. Models using `openai-responses` or `openai-codex-responses` with `compat.supportsOpenAIGrammarTools === true` get `apply_patch` instead of `edit` and `write`. Other models get `edit` and `write`, not `apply_patch`. Pitako reapplies this policy after startup, model changes, and profile changes, including same-model child activation.
 
 Shell is still available in `analysis`, and ACP's `decompress` can write output to temporary paths allowed by upstream. This profile is not a sandbox.
+
+The first shipped entry, `extensions/index.ts`, composes the official Codex factory. Foreground startup synchronously revokes the old worker-control epoch before awaiting upstream startup; Pitako's profile policy runs after upstream tool synchronization. There is no separate Codex activation in the manifest, but its bundled files remain required. Consequently `!node_modules/pi-codex-tools/index.ts` no longer filters Codex out of foreground. Do not manually add that entry alongside foreground: Pi does not deduplicate the composed registration. Official Codex alone and standalone agent tools still work independently. Pitako cannot guarantee priority over arbitrary caller-owned extensions loaded earlier.
 
 ```bash
 pi --no-extensions --approve -e . --pitako-profile analysis

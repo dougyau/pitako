@@ -603,15 +603,18 @@ describe("extension provider bind", () => {
     expect(attempt.status).toBe("completed");
     expect(calls).toHaveLength(1);
     expect(payloads).toEqual([{ model: "late" }]);
-    expect(attempt.requests).toEqual([
+    expect(attempt.requests).toMatchObject([
       {
         model: "pitako-late/late",
-        reasoning: "off",
+        reasoning: undefined,
+        sdkOptions: { reasoning: undefined },
         fast_requested: false,
         returned_service_tier: "unavailable",
         time_to_first_model_output_ms: 50,
       },
     ]);
+    expect(attempt.requests?.[0]?.historyId).toBeString();
+    expect(attempt.requests?.[0]?.sessionId).toBeString();
   }), 60_000);
 
   test.serial("marks request without output unavailable on cancellation", fixture.ownedCase("marks request without output unavailable on cancellation", async () => {

@@ -1,3 +1,4 @@
+import "./fixtures/offline.ts";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, test } from "bun:test";
@@ -48,6 +49,12 @@ describe("engineering-layer composition", () => {
     const active = toolsForProfile({ available: [...registered, "read", "grep", "bash", "edit", "write"], profile: "coding" });
     expect(active).toEqual(expect.arrayContaining([...CODE_INTELLIGENCE_TOOL_NAMES, "read", "grep", "bash", "edit", "write"]));
     expect(extensionPaths.some((file) => file.includes("pstack"))).toBe(false);
+    // Pi awaits handlers serially. Owner revocation must be the first packaged
+    // lifecycle handler, not just precede the agent tool entrypoint.
+    for (const event of ["session_start", "session_shutdown"]) {
+      const first = loaded.extensions.extensions.find(extension => extension.handlers.get(event)?.length);
+      expect(first?.resolvedPath).toBe(path.join(packageRoot(), "extensions/index.ts"));
+    }
 
     const skills = loaded.loader.getSkills().skills.map((skill) => skill.name).sort();
     for (const name of DEFAULT_SKILL_NAMES) {

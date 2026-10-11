@@ -70,15 +70,19 @@ test("revocation joins admitted input and preserves explicit hook consumption wi
 test("observation bounds serialized pages, pages original brief and reports ring and persistence gaps", async () => {
   const brief = "😀\u0000".repeat(7000);
   const live = setup(brief);
-  for (let i = 0; i < 205; i++) live.event({ type: "message_end", message: { role: "user", content: `${i}:${"\u0000".repeat(1000)}`, timestamp: i } });
+  // Overflow the ring with cheap events; only the tail needs to force JSON-escaped page trimming.
+  for (let i = 0; i < 205; i++) live.event({ type: "message_end", message: { role: "user", content: `${i}:${i >= 193 ? "\u0000".repeat(1000) : "event"}`, timestamp: i } });
   type Page = { workbrief: { text: string; nextOffset: number | null }; activity: Array<{ sequence: number; source: string }>; gaps: string[]; cursor: number; more: boolean };
   const first = live.handle.observe() as Page;
-  expect(first.activity.length).toBeLessThanOrEqual(50);
+  expect(first.activity.length).toBeLessThan(50);
+  expect(first.more).toBe(true);
+  expect(Buffer.byteLength(JSON.stringify(first))).toBeLessThanOrEqual(32 * 1024);
   expect(first.gaps.join("\n")).toContain("No first assistant");
   expect(first.gaps.join("\n")).toContain("ring dropped 5");
   let offset: number | null = 0, reconstructed = "";
   while (offset !== null) {
-    const page = live.handle.observe({ briefOffset: offset }) as Page;
+    // Page the brief independently of activity already available through its own cursor.
+    const page = live.handle.observe({ briefOffset: offset, after: 205 }) as Page;
     expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(32 * 1024);
     reconstructed += page.workbrief.text;
     offset = page.workbrief.nextOffset;

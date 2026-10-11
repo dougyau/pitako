@@ -26,8 +26,9 @@ describe("stack configuration", () => {
       bundledDependencies: string[];
     };
     const expected = [
-      ...stack.required.map((extension) => `./${extension.entry}`),
       `./${stack.pitakoExtension}`,
+      // Codex is physically required, but registered by the foreground factory.
+      ...stack.required.filter(({ id }) => id !== "pi-codex-tools").map((extension) => `./${extension.entry}`),
     ];
     expect(manifest.pi.extensions).toEqual(expected);
     const rooted = (name: string) => `${path.sep}${name}${path.sep}`;

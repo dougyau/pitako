@@ -1,3 +1,4 @@
+import "./fixtures/offline.ts";
 import { describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";

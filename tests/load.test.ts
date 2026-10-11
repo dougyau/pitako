@@ -1,5 +1,6 @@
+import "./fixtures/offline.ts";
 import { spawnSync } from "node:child_process";
-import { lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -34,7 +35,7 @@ async function loadWithWebConfig(packagePath: string, configDir: string) {
 }
 
 function loadInFreshProcess(packagePath: string, configDir: string) {
-  const runner = path.join(packagePath, "tests", "fixtures", "load-pitako.ts");
+  const runner = path.join(packageRoot(), "tests", "fixtures", "load-pitako.ts");
   const child = spawnSync(process.execPath, [runner, packagePath], {
     encoding: "utf8",
     env: { ...process.env, PI_CODING_AGENT_DIR: configDir },
@@ -110,6 +111,31 @@ function profileHarness(profileFlag?: string) {
 }
 
 describe("Pi package loading", () => {
+  test("composed official entry resolves from a conventional installed package layout", () => {
+    const root = packageRoot();
+    const layout = configDirectory("pitako-installed-composition-");
+    const installed = path.join(layout, "node_modules", "pitako");
+    mkdirSync(path.join(installed, "node_modules"), { recursive: true });
+    for (const resource of ["package.json", "extensions", "config", "roles", "skills", "prompts"]) {
+      cpSync(path.join(root, resource), path.join(installed, resource), { recursive: true });
+    }
+    // Existing dependency bytes only: Codex is physically bundled at the exact
+    // resource path used by the adapter; unchanged peers/resources are linked.
+    for (const entry of readdirSync(path.join(root, "node_modules"))) {
+      const source = path.join(root, "node_modules", entry);
+      const target = path.join(installed, "node_modules", entry);
+      if (entry === "pi-codex-tools") cpSync(source, target, { recursive: true, dereference: true });
+      else symlinkSync(source, target);
+    }
+    expect(lstatSync(path.join(installed, "node_modules/pi-codex-tools")).isSymbolicLink()).toBe(false);
+    const loaded = loadInFreshProcess(installed, configDirectory("pitako-installed-config-"));
+    expect(loaded.errors).toEqual([]);
+    expect(loaded.paths[0]).toBe(path.join(installed, "extensions/index.ts"));
+    expect(loaded.paths.some(file => file.includes("/pi-codex-tools/"))).toBe(false);
+    expect(loaded.names.filter(name => name === "apply_patch")).toHaveLength(1);
+    expect(loaded.names).toEqual(expect.arrayContaining(["agent_input", "board_post", "todo", "compress"]));
+  });
+
   test.serial("installed advice is discoverable in principal and ordinary codemode and retained outside cwd", () => {
     const root = packageRoot();
     const child = spawnSync("node", ["--experimental-transform-types", "--import",
@@ -157,9 +183,12 @@ describe("Pi package loading", () => {
     expect(paths.some((file) => file.endsWith("extensions/index.ts"))).toBe(true);
     const webExtensionIndex = paths.findIndex((file) => file.includes(`${path.sep}pi-web-access${path.sep}dist${path.sep}index.js`));
     const pitakoExtensionIndex = paths.findIndex((file) => file.endsWith(`${path.sep}extensions${path.sep}index.ts`));
-    expect(webExtensionIndex).toBeLessThan(pitakoExtensionIndex);
-    expect(paths.filter((file) => file.includes(`${path.sep}pi-codex-tools${path.sep}`))).toHaveLength(1);
-    expect(paths.findIndex((file) => file.includes(`${path.sep}pi-codex-tools${path.sep}`))).toBeLessThan(pitakoExtensionIndex);
+    expect(pitakoExtensionIndex).toBe(0);
+    expect(webExtensionIndex).toBeGreaterThan(pitakoExtensionIndex);
+    expect(paths.filter((file) => file.includes(`${path.sep}pi-codex-tools${path.sep}`))).toHaveLength(0);
+    const patchOwners = loaded.extensions.extensions.filter(extension => extension.tools.has("apply_patch"));
+    expect(patchOwners).toHaveLength(1);
+    expect(patchOwners[0]?.resolvedPath).toBe(path.join(root, "extensions/index.ts"));
     expect(paths.some((file) => file.includes(`${path.sep}pi-lsp-client${path.sep}`))).toBe(true);
     expect(paths.some((file) => file.endsWith(`${path.sep}codegraph-raw.ts`))).toBe(true);
     expect(paths.some((file) => file.includes(`${path.sep}rpiv-todo${path.sep}`))).toBe(true);

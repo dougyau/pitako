@@ -1,3 +1,4 @@
+import "./fixtures/offline.ts";
 import { agentFixtureOwnership } from "./fixtures/agent-fixture-ownership.ts";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -130,7 +131,7 @@ describe("pitako agents command", () => {
     const nextOwner = owner(true);
     bindBackgroundOwner(nextOwner);
     shutdownBackground(foreground.token);
-    expect(() => resolveLiveTarget(target, "coordinator")).toThrow("foreground owner");
+    expect(() => resolveLiveTarget(target, "coordinator")).toThrow("unknown live target");
 
     const team = hang();
     let teamBind: typeof bind;
@@ -147,7 +148,7 @@ describe("pitako agents command", () => {
     expect(() => resolveLiveTarget(teamTarget, "coordinator", Symbol("retired"))).toThrow("unknown live target");
     retireTeamWorkers(nextOwner.token);
     expect(() => resolveLiveTarget(teamTarget, "coordinator", nextOwner.token)).toThrow("unknown live target");
-    cancelWorker(accepted.instanceId);
+    expect(hanging.signal()?.aborted).toBe(true);
     expect(() => resolveLiveTarget(target, "coordinator")).toThrow();
   }));
   test("empty list, running row, id filter, and unknown id", fixture.ownedCase("empty list, running row, id filter, and unknown id", async () => {
@@ -160,6 +161,7 @@ describe("pitako agents command", () => {
     const handle = await spawnBackground({
       roleId: "developer",
       task: "change the widget\nSECRET-SECOND-LINE",
+      historyOrigin: { source: "agent_spawn", coordinatorSessionId: "command-coordinator" },
       cwd: packageRoot(),
       executor: hanging.executor,
       load: load(),
@@ -341,6 +343,8 @@ describe("background registry", () => {
       load: load(),
     });
     shutdownBackground(held.token);
+    expect(workerStatus().map(row => row.instanceId)).toEqual([handle.instanceId]);
+    shutdownBackground(bound.token);
     expect(workerStatus()).toEqual([]);
     late.release({ status: "completed", result: "LATE", sideEffects: false });
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -653,6 +657,7 @@ function pitakoAgentsCommand(): {
       try {
         await handler?.(args, {
           hasUI: true,
+          sessionManager: { getSessionId: () => "command-coordinator" },
           ui: {
             notify(message: string, kind?: string) {
               if (kind === "error") errors.push(message);

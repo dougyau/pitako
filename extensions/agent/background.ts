@@ -1,6 +1,6 @@
 import { PitakoConfigError } from "../errors.ts";
 import { createPiExecutor } from "./pi.ts";
-import { clearObservations, noteResultTaken, observationEpoch, publishObservation, removeTeamObservations, removeUntaggedObservations } from "./observe.ts";
+import { clearObservations, noteResultTaken, observationEpoch, publishObservation, removeObservation, removeTeamObservations } from "./observe.ts";
 import { runAgentInstance, type AgentRunResult, type AttemptExecutor } from "./run.ts";
 import type { LoadOptions } from "../roles/load.ts";
 import type { ExecutionBinding } from "../workflow.ts";
@@ -54,6 +54,7 @@ interface Row {
   ownerToken?: symbol;
   coordinatorSessionId?: string;
   live?: LiveHandle;
+  generation: number;
 }
 
 interface Bag {
@@ -88,6 +89,13 @@ export function clearBackgroundOwner(): void {
   const state = bag();
   state.owner = undefined;
   state.teamOwners?.clear();
+}
+
+/** Retire admission authority without aborting or pretending to join workers. */
+export function revokeBackgroundOwner(token: symbol): void {
+  const state = bag();
+  if (state.owner?.token === token) state.owner = undefined;
+  state.teamOwners?.delete(token);
 }
 
 export function setBackgroundExecutor(executor: AttemptExecutor | undefined): void {
@@ -157,6 +165,7 @@ export async function spawnBackground(input: {
           const previous = accepted.live;
           if (previous && previous !== handle) void previous.close();
           accepted.live = handle;
+          accepted.generation++;
           return () => { if (accepted.live === handle) accepted.live = undefined; };
         } });
       },
@@ -178,6 +187,7 @@ export async function spawnBackground(input: {
         teamDeliveryOwner: input.teamOwner ? bag().teamOwners?.get(input.teamOwner.token) : undefined,
         ownerToken,
         coordinatorSessionId: input.historyOrigin?.coordinatorSessionId,
+        generation: 0,
       };
       bag().rows.set(instance.id, row);
     },
@@ -222,6 +232,12 @@ export type LiveTarget = { kind: "background"; instanceId: string } | { kind: "t
 
 /** Resolve admission from the row and current foreground generation, never a role. */
 export function resolveLiveTarget(target: LiveTarget, coordinatorSessionId: string | undefined, teamToken?: symbol): LiveHandle {
+  return resolveLiveBinding(target, coordinatorSessionId, teamToken).handle;
+}
+
+export function resolveLiveBinding(target: LiveTarget, coordinatorSessionId: string | undefined, teamToken?: symbol): {
+  handle: LiveHandle; instanceId: string; generation: number;
+} {
   const state = bag();
   const row = target.kind === "background" ? state.rows.get(target.instanceId)
     : [...state.rows.values()].find(item => item.teamAssignmentId === target.assignmentId && item.teamOwnerToken === teamToken);
@@ -234,7 +250,7 @@ export function resolveLiveTarget(target: LiveTarget, coordinatorSessionId: stri
   }
   if (statusOf(row) !== "running" || row.signal === "dropped") throw new Error("live target is terminal");
   if (!row.live) throw new Error("live target has no native session binding");
-  return row.live;
+  return { handle: row.live, instanceId: row.instanceId, generation: row.generation };
 }
 
 export function workerStatus(instanceId?: string, now: () => number = Date.now): WorkerView[] {
@@ -293,6 +309,7 @@ export function retireTeamWorkers(token: symbol): void {
     row.signal = "dropped";
     if (!row.controller.signal.aborted) row.controller.abort();
     state.rows.delete(id);
+    removeObservation(id);
   }
   removeTeamObservations(token);
 }
@@ -310,18 +327,17 @@ export function cancelAllWorkers(): void {
 
 export function shutdownBackground(token: symbol): void {
   const state = bag();
-  if (state.owner?.token !== token) return;
   for (const [id, row] of state.rows) {
-    if (row.teamOwnerToken && row.teamOwnerToken !== token) continue;
+    if (row.ownerToken !== token) continue;
     row.signal = "dropped";
     if (!row.controller.signal.aborted) row.controller.abort();
     state.rows.delete(id);
+    removeObservation(id);
   }
   state.held = state.held.filter((item) => item.ownerToken !== token);
   state.teamOwners?.delete(token);
-  removeUntaggedObservations();
   removeTeamObservations(token);
-  state.owner = undefined;
+  if (state.owner?.token === token) state.owner = undefined;
 }
 
 export function takeHeldCompletions(token: symbol): string | undefined {

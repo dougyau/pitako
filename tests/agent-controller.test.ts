@@ -1,0 +1,527 @@
+import { afterEach, expect, spyOn, test } from "bun:test";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { createAgentController } from "../extensions/agent/controller.ts";
+import { bindBackgroundOwner, clearBackgroundOwner, spawnBackground, setBackgroundExecutor } from "../extensions/agent/background.ts";
+import { createLiveHandle } from "../extensions/agent/live.ts";
+import { clearObservations, publishObservation } from "../extensions/agent/observe.ts";
+import { runAgentInstance, type Attempt } from "../extensions/agent/run.ts";
+import { beginTeamEvaluation, retireTeamEvaluation } from "../extensions/team.ts";
+import { agentFixtureOwnership } from "./fixtures/agent-fixture-ownership.ts";
+import { queryHistory } from "../extensions/agent/history-query.ts";
+import { ownedDispatch } from "../extensions/agent/dispatch.ts";
+import pitako from "../extensions/index.ts";
+import agentInstance from "../extensions/agent/index.ts";
+import * as controllerModule from "../extensions/agent/controller.ts";
+import * as codexModule from "../extensions/codex.ts";
+import { createAgentSession, DefaultResourceLoader, ExtensionRunner, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+
+const fixture = agentFixtureOwnership();
+const originalDir = process.env.PI_CODING_AGENT_DIR;
+const originalOffline = process.env.PI_OFFLINE;
+afterEach(() => {
+  fixture.requireReleasedFixture();
+  clearBackgroundOwner();
+  clearObservations();
+  setBackgroundExecutor(undefined);
+  if (originalDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+  else process.env.PI_CODING_AGENT_DIR = originalDir;
+  if (originalOffline === undefined) delete process.env.PI_OFFLINE;
+  else process.env.PI_OFFLINE = originalOffline;
+  for (const root of fixture.directories.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+function setup(sessionId = "coordinator") {
+  const root = mkdtempSync(path.join(tmpdir(), "pitako-controller-"));
+  fixture.directories.push(root);
+  process.env.PI_CODING_AGENT_DIR = path.join(root, "agent");
+  const config = path.join(root, "config.toml");
+  writeFileSync(config, '[model_policies.researcher.primary]\nmodel = "fixture/selected"\nreasoning = "off"\n');
+  const token = Symbol(sessionId);
+  const owner = { sessionId, token };
+  bindBackgroundOwner({ token, isIdle: () => false, hasUI: false, notify() {}, sendMessage() {} });
+  const controller = createAgentController(owner, () => owner);
+  return { root, owner, controller, load: { userConfigPath: config, env: { PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR } } };
+}
+const completed: Attempt = { status: "completed", result: "done", sideEffects: false };
+
+test("scoped list/detail excludes legacy and foreign rows; sync preserves the original brief", fixture.ownedCase("scoped sync", async () => {
+  const { root, controller, load } = setup();
+  const brief = " \n unmodified original WorkBrief \n ";
+  await runAgentInstance({ roleId: "researcher", task: brief, cwd: root, load,
+    historyOrigin: { source: "agent_run", coordinatorSessionId: "coordinator", workbrief: brief },
+    onObserve: row => publishObservation(row),
+    executor: { async start() { return completed; } } });
+  for (const [id, parent] of [["legacy", undefined], ["foreign", "other"]]) {
+    publishObservation({ id: id!, roleId: "researcher", task: "hidden", selectedModel: "fixture/selected", lastActivityKind: "start", status: "running", phase: "working", acceptedAt: 1,
+      ...(parent ? { origin: { source: "agent_spawn", coordinatorSessionId: parent } } : {}) });
+  }
+  publishObservation({ id: "missing-Team-lease", roleId: "researcher", task: "hidden",
+    selectedModel: "fixture/selected", lastActivityKind: "start", status: "running", phase: "working", acceptedAt: 1,
+    origin: { source: "team_assign", coordinatorSessionId: "coordinator", assignmentId: "assignment" } });
+  const view = controller.openView();
+  expect(view.list().items).toHaveLength(1);
+  const detail = view.detail(String(view.list().items[0]!.id));
+  expect(detail.workbrief.text).toBe(brief);
+  expect(detail.identity.source).toBe("agent_run");
+  expect(detail.controls).toMatchObject({ available: false, reason: expect.stringContaining("synchronous") });
+  expect(detail.sdkRequest).toBeNull();
+  expect(detail.route.state).toBe("not-routed");
+  expect(() => view.detail("legacy")).toThrow("unknown scoped worker");
+  expect(() => view.detail("foreign")).toThrow("unknown scoped worker");
+  expect(() => view.list("foreign")).toThrow("invalid list cursor");
+  const second = controller.openView();
+  view.acknowledge("route");
+  expect(view.route(detail.id).text).toBe("null");
+  expect(() => second.route(detail.id)).toThrow("acknowledgement");
+  await view.close();
+  expect(() => view.detail(detail.id)).toThrow("disconnected");
+  expect(second.list().items).toHaveLength(1);
+  await second.close();
+  controller.revoke(); await controller.settle();
+}));
+
+test("controller fences parent, epoch, generation, Team retirement and native replacement, and joins accepted hooks", fixture.ownedCase("control fences", async () => {
+  const { root, owner, controller, load } = setup();
+  let finish!: (attempt: Attempt) => void, release!: () => void, started!: () => void;
+  const start = new Promise<void>(resolve => { started = resolve; });
+  const attempt = fixture.pendingAttempt(resolve => { finish = resolve; });
+  const hook = new Promise<void>(resolve => { release = resolve; });
+  fixture.finishOnCleanup(release);
+  let live!: ReturnType<typeof createLiveHandle>;
+  let nativeSession!: { sessionId: string };
+  let inputs = 0;
+  const worker = await spawnBackground({ roleId: "researcher", task: "original", cwd: root, load,
+    historyOrigin: { source: "agent_spawn", coordinatorSessionId: owner.sessionId, workbrief: "original" },
+    executor: { capturesHistory: true, async start(input) {
+      const history = input.history!.admit(input.instanceId, input.role.id, input.target);
+      const manager = history.create();
+      const session = { sessionManager: manager, sessionId: manager.getSessionId(), sessionFile: manager.getSessionFile(),
+        async steer() { inputs++; await hook; return "queued" as const; } };
+      nativeSession = session;
+      live = createLiveHandle(session, history); live.open(); const unbind = input.bindLive?.(live.handle); started();
+      const result = await attempt;
+      await live.settle(); await live.handle.close(); unbind?.(); history.result(result); history.disposition(); return result;
+    } } });
+  await start;
+  const view = controller.openView();
+  const selection = view.detail(worker.instanceId).controls.selection!;
+  for (const bad of [{ ...selection, coordinatorSessionId: "other" }, { ...selection, epoch: "old" },
+    { ...selection, generation: selection.generation + 1 }, { ...selection, sessionId: "replaced" }]) {
+    await expect(view.input(bad, { intent: "query", text: "forbidden" })).rejects.toThrow();
+    expect(() => view.cancel(bad)).toThrow();
+  }
+  expect(inputs).toBe(0);
+  const accepted = view.input(selection, { intent: "query", text: "literal /not-command" });
+  await Promise.resolve(); await Promise.resolve();
+  expect(inputs).toBe(1);
+  controller.revoke();
+  let joined = false;
+  const settlement = controller.settle().then(() => { joined = true; });
+  expect(() => view.cancel(selection)).toThrow("retired");
+  expect(joined).toBe(false);
+  release();
+  await expect(accepted).rejects.toThrow("retired"); // receipt cannot be delivered into a disconnected view
+  await settlement;
+  const entries = live.handle.observe();
+  expect(entries.active).toBe(true); // revocation does not cancel the worker
+  const next = createAgentController(owner, () => owner), nextView = next.openView();
+  expect(() => nextView.cancel(selection)).toThrow("stale controller selection");
+  const currentSelection = nextView.detail(worker.instanceId).controls.selection!;
+  const originalSessionId = nativeSession.sessionId;
+  nativeSession.sessionId = "native-replacement";
+  await expect(nextView.input(currentSelection, { intent: "query", text: "wrong native session" })).rejects.toThrow("closed or stale");
+  expect(() => nextView.cancel(currentSelection)).toThrow("closed or stale");
+  nativeSession.sessionId = originalSessionId;
+  expect(nextView.cancel(currentSelection)).toMatchObject({ status: "requested" });
+  expect(live.handle.observe().active).toBe(true); // request is not settlement
+  await nextView.close(); next.revoke(); await next.settle();
+  finish(completed);
+  await view.close();
+
+  // A new Team evaluation cannot inherit a captured Team row or binding.
+  const team = beginTeamEvaluation(owner.sessionId, false)!;
+  publishObservation({ id: "team", roleId: "researcher", task: "wrapped", selectedModel: "fixture/selected", lastActivityKind: "start", status: "running", phase: "working", acceptedAt: 1,
+    teamOwnerToken: team.token, origin: { source: "team_assign", coordinatorSessionId: owner.sessionId, assignmentId: "assignment", workbrief: "original" } });
+  const teamController = createAgentController(owner, () => owner), teamView = teamController.openView();
+  expect(teamView.list().items.some(row => row.id === "team")).toBe(true);
+  retireTeamEvaluation(team);
+  expect(() => teamView.detail("team")).toThrow("unknown scoped worker");
+  await teamView.close(); teamController.revoke(); await teamController.settle();
+}));
+
+test("UI history authorizes refs and cursors, bounded raw acknowledgement remains per view", fixture.ownedCase("history scope", async () => {
+  const { root, controller, load } = setup();
+  for (const parent of ["coordinator", "coordinator", "foreign", "foreign"]) {
+    await runAgentInstance({ roleId: "researcher", task: parent, cwd: root, load,
+      historyOrigin: { source: "agent_run", coordinatorSessionId: parent, workbrief: parent },
+      executor: { capturesHistory: true, async start(input) {
+        const history = input.history!.admit(input.instanceId, input.role.id, input.target), manager = history.create();
+        manager.appendMessage({ role: "user", content: parent, timestamp: Date.now() });
+        manager.appendCustomEntry("fixture", { parent }); history.result(completed); history.disposition(); return completed; } } });
+  }
+  const view = controller.openView();
+  const listing = await view.history({ action: "list", limit: 1 });
+  expect(listing.items).toHaveLength(1);
+  expect(listing.cursor).not.toBeNull();
+  const more = await view.history({ action: "list", cursor: listing.cursor! });
+  expect(more.items).toHaveLength(1);
+  const id = (listing.items[0] as { historyId: string }).historyId;
+  await expect(view.history({ action: "read", historyId: id })).rejects.toThrow("acknowledgement");
+  view.acknowledge("history");
+  const first = await view.history({ action: "read", historyId: id, limit: 1 });
+  expect(first.items).toHaveLength(1);
+  expect(first.cursor).not.toBeNull();
+  const next = await view.history({ action: "read", historyId: id, cursor: first.cursor! });
+  expect(next.items.length).toBeGreaterThan(0);
+  const denied = await view.history({ action: "list", scope: "all" });
+  expect(denied.diagnostics.some(row => row.code === "history_outside_scope")).toBe(true);
+  const invalid = await view.history({ action: "read", historyId: "foreign" });
+  expect(invalid.items).toHaveLength(0);
+  const foreignList = await queryHistory({ action: "list", coordinatorSessionId: "foreign", limit: 1 }, "foreign");
+  const foreignMember = foreignList.items[0] as { historyId: string; groupId: string };
+  const foreignRead = await view.history({ action: "read", historyId: foreignMember.historyId, groupId: foreignMember.groupId });
+  expect(foreignRead.diagnostics.some(row => row.code === "history_outside_scope")).toBe(true);
+  const forged = JSON.parse(Buffer.from(foreignList.cursor!, "base64url").toString());
+  forged.identity = JSON.parse(Buffer.from(listing.cursor!, "base64url").toString()).identity;
+  const foreignCursor = await view.history({ action: "list", cursor: Buffer.from(JSON.stringify(forged)).toString("base64url") });
+  expect(foreignCursor.items).toHaveLength(0);
+  expect(foreignCursor.diagnostics.some(row => row.code === "history_outside_scope")).toBe(true);
+  const other = controller.openView();
+  await expect(other.history({ action: "read", historyId: id })).rejects.toThrow("acknowledgement");
+  const acceptedRead = other.history({ action: "list" });
+  await Promise.resolve();
+  let closed = false;
+  const close = other.close().then(() => { closed = true; });
+  expect(closed).toBe(false);
+  expect(() => other.list()).toThrow("disconnected");
+  await expect(acceptedRead).rejects.toThrow("disconnected");
+  await close;
+  expect(closed).toBe(true);
+  expect(view.list().items).toEqual([]); // closing a read lease does not revoke another view
+  await view.close(); controller.revoke(); await controller.settle();
+}));
+
+test("selected, activated and observed requests stay distinct across attempt changes", fixture.ownedCase("request provenance", async () => {
+  const { root, controller, load } = setup();
+  writeFileSync(load.userConfigPath, '[model_policies.researcher.primary]\nmodel = "fixture/selected"\nreasoning = "high"\n[[model_policies.researcher.fallbacks]]\nmodel = "fixture/fallback"\nreasoning = "medium"\n');
+  const view = controller.openView();
+  let calls = 0;
+  const result = await runAgentInstance({ roleId: "researcher", task: "original", cwd: root, load,
+    historyOrigin: { source: "agent_run", coordinatorSessionId: "coordinator" }, onObserve: publishObservation,
+    executor: { async start(input) {
+      calls++;
+      const before = view.detail(input.instanceId);
+      expect(before.activated).toBeNull();
+      expect(before.sdkRequest).toBeNull(); // prior attempt request is not this attempt's actual setting
+      input.onActivated?.("off");
+      expect(view.detail(input.instanceId).activated?.reasoning).toBe("off");
+      expect(view.detail(input.instanceId).sdkRequest).toBeNull();
+      input.onRequest?.({ model: "fixture/observed", reasoning: "off", sdkOptions: { reasoning: "off", temperature: 0.25 },
+        fast_requested: false, returned_service_tier: "unavailable", time_to_first_model_output_ms: "unavailable" });
+      const observed = view.detail(input.instanceId);
+      expect(observed.selected.model).toBe(input.target.model);
+      expect(observed.sdkRequest).toMatchObject({ model: "fixture/observed", attemptId: observed.selected.attemptId,
+        sdkOptions: { temperature: 0.25 } });
+      return calls === 1 ? { status: "failed", result: "", error: "503 service unavailable", sideEffects: false } : completed;
+    } } });
+  expect(calls).toBe(2);
+  expect(view.detail(result.instanceId).selected.requestedModel).toBe("fixture/selected");
+  expect(view.detail(result.instanceId).workbrief.text).toBe("original");
+  await view.close(); controller.revoke(); await controller.settle();
+}));
+
+test("current Team lease permits native input/cancel; retirement leaves independent reads available", fixture.ownedCase("Team controls", async () => {
+  const { root, owner, controller, load } = setup();
+  const evaluation = beginTeamEvaluation(owner.sessionId, false, owner.token)!;
+  let finish!: (attempt: Attempt) => void, started!: () => void;
+  const attempt = fixture.pendingAttempt(resolve => { finish = resolve; });
+  const start = new Promise<void>(resolve => { started = resolve; });
+  const wrapper = "Team fixture\nWorkBrief:\n unmodified original ";
+  const worker = await spawnBackground({ roleId: "researcher", task: wrapper, cwd: root, load,
+    historyOrigin: { source: "team_assign", coordinatorSessionId: owner.sessionId, assignmentId: "assignment", workbrief: " unmodified original " },
+    teamOwner: { token: evaluation.token, assignmentId: "assignment", onSettled() {} },
+    executor: { capturesHistory: true, async start(input) {
+      const history = input.history!.admit(input.instanceId, input.role.id, input.target), manager = history.create();
+      const live = createLiveHandle({ sessionManager: manager, sessionId: manager.getSessionId(), sessionFile: manager.getSessionFile(),
+        async steer() { return "queued"; } }, history);
+      live.open(); const unbind = input.bindLive!(live.handle); started();
+      const result = await attempt;
+      await live.settle(); await live.handle.close(); unbind(); history.result(result); history.disposition(); return result;
+    } } });
+  await start;
+  const view = controller.openView(), detail = view.detail(worker.instanceId), selection = detail.controls.selection!;
+  expect(detail.workbrief.text).toBe(" unmodified original ");
+  expect(detail.teamWrapper).toBe("Team fixture");
+  expect(await view.input(selection, { intent: "steer", text: "literal correction" })).toMatchObject({ status: "queued" });
+  expect(view.cancel(selection)).toMatchObject({ status: "requested" });
+  retireTeamEvaluation(evaluation);
+  await expect(view.input(selection, { intent: "query", text: "retired Team" })).rejects.toThrow("unknown scoped worker");
+  publishObservation({ id: "independent-sync", roleId: "researcher", status: "completed", phase: "idle", task: "independent",
+    selectedModel: "fixture/selected", acceptedAt: 1, lastActivityKind: "start",
+    origin: { source: "agent_run", coordinatorSessionId: owner.sessionId, workbrief: "independent" } });
+  expect(view.detail("independent-sync").workbrief.text).toBe("independent");
+  finish(completed);
+  await view.close(); controller.revoke(); await controller.settle();
+}));
+
+test("same-session public rebind fences real agent_spawn while captured official startup is held", fixture.ownedCase("startup admission", async () => {
+  const { root, load } = setup();
+  process.env.PI_OFFLINE = "1";
+  const agentDir = process.env.PI_CODING_AGENT_DIR!;
+  mkdirSync(path.join(agentDir, "pitako"), { recursive: true });
+  writeFileSync(path.join(agentDir, "pitako/config.toml"), readFileSync(load.userConfigPath));
+  let releaseCodex!: () => void, releaseDispatch!: () => void;
+  const codexHold = new Promise<void>(resolve => { releaseCodex = resolve; });
+  const dispatchHold = new Promise<void>(resolve => { releaseDispatch = resolve; });
+  let holdNextStartup = false;
+  const register = codexModule.registerCodexTools;
+  const captureCodex = spyOn(codexModule, "registerCodexTools").mockImplementation(pi => {
+    const official = register(pi);
+    return async (event, ctx) => {
+      await official(event, ctx);
+      if (holdNextStartup) { holdNextStartup = false; await codexHold; }
+    };
+  });
+  const controllers: ReturnType<typeof createAgentController>[] = [];
+  const create = controllerModule.createAgentController;
+  const captureController = spyOn(controllerModule, "createAgentController").mockImplementation((...args) => {
+    const controller = create(...args); controllers.push(controller); return controller;
+  });
+  let starts = 0;
+  const finishes: Array<() => void> = [];
+  setBackgroundExecutor({ async start() {
+    starts++;
+    return fixture.pendingAttempt(resolve => { finishes.push(() => resolve(completed)); });
+  } });
+  let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
+  let rebind: Promise<void> | undefined, newerRebind: Promise<void> | undefined, dispatch: Promise<void> | undefined;
+  let stale: Promise<unknown> | undefined;
+  let view: ReturnType<ReturnType<typeof createAgentController>["openView"]> | undefined;
+  const errors: unknown[] = [];
+  try {
+    const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false } });
+    const loader = new DefaultResourceLoader({ cwd: root, agentDir, settingsManager,
+      noContextFiles: true, noSkills: true, noThemes: true, noExtensions: true,
+      extensionFactories: [pitako, agentInstance] });
+    await loader.reload();
+    const modelRuntime = await ModelRuntime.create({ authPath: path.join(root, "auth.json"), modelsPath: null, allowModelNetwork: false });
+    session = (await fixture.acquire(createAgentSession({ cwd: root, agentDir, settingsManager, resourceLoader: loader, modelRuntime,
+      sessionManager: SessionManager.create(root, path.join(root, "sessions")) }))).session;
+    const bindings = { onError: (error: unknown) => { errors.push(error); } };
+    await session.bindExtensions(bindings);
+    const runner = session.extensionRunner!;
+    const ctx = runner.createToolContext("fixture-spawn", undefined);
+    const identity = [ctx.sessionManager.getSessionId(), ctx.sessionManager.getSessionFile()];
+    const tools = runner.getAllRegisteredTools();
+    const spawn = (task: string) => tools.find(tool => tool.definition.name === "agent_spawn")!.definition
+      .execute(task, { role: "researcher", task }, undefined, undefined, ctx);
+    const status = async () => (await tools.find(tool => tool.definition.name === "agent_status")!.definition
+      .execute("status", {}, undefined, undefined, ctx)).details;
+    view = controllers.at(-1)!.openView();
+    let dispatchSignal: AbortSignal | undefined;
+    dispatch = ownedDispatch(ctx, undefined, () => true, async signal => {
+      dispatchSignal = signal; await dispatchHold;
+    });
+    await Promise.resolve();
+    // This real tool call is suspended at ownedDispatch's first microtask.
+    stale = spawn("stale queued spawn");
+    holdNextStartup = true;
+    let joined = false;
+    rebind = session.bindExtensions(bindings).then(() => { joined = true; });
+    expect(dispatchSignal?.aborted).toBe(true);
+    expect(() => view!.list()).toThrow("retired");
+    expect([ctx.sessionManager.getSessionId(), ctx.sessionManager.getSessionFile()]).toEqual(identity);
+    const staleResult = await stale;
+    const during = await spawn("spawn during startup");
+    const heldRows = await status();
+    console.log("startup admission held", JSON.stringify({ staleResult, during, heldRows, starts, joined }));
+    expect(staleResult).toMatchObject({ isError: true, details: { error: "Dispatch cancelled before admission" } });
+    expect(during).toMatchObject({ isError: true, details: { error: "Dispatch cancelled before admission" } });
+    expect(heldRows).toEqual({ workers: [] });
+    expect(starts).toBe(0);
+    expect(joined).toBe(false);
+    expect(await ownedDispatch({ ...ctx, sessionManager: { getSessionId: () => "independent" } } as never,
+      undefined, () => true, async (_signal, check) => { check(); return "independent"; })).toBe("independent");
+    // A newer transition may settle first, but cannot release the older lease.
+    let newerJoined = false;
+    newerRebind = session.bindExtensions(bindings).then(() => { newerJoined = true; });
+    await Promise.resolve(); await Promise.resolve();
+    expect(newerJoined).toBe(false); // abort request alone does not settle the held callback
+    releaseDispatch(); await dispatch; await newerRebind;
+    expect(joined).toBe(false);
+    const newestController = controllers.at(-1)!;
+    expect(await spawn("older startup still held")).toMatchObject({
+      isError: true, details: { error: "Dispatch cancelled before admission" },
+    });
+    releaseCodex(); await rebind;
+    expect(controllers.at(-1)).toBe(newestController);
+    const fresh = await spawn("fresh authorized spawn");
+    expect(fresh).toMatchObject({ details: { status: "running" }, isError: false });
+    const freshView = controllers.at(-1)!.openView();
+    expect(freshView.list().items.map(row => row.id)).toContain((fresh.details as { instanceId: string }).instanceId);
+    expect(starts).toBe(1);
+    await freshView.close();
+    await runner.emit({ type: "session_shutdown", reason: "quit" });
+    expect(await status()).toEqual({ workers: [] });
+    expect(errors).toEqual([]);
+  } finally {
+    releaseCodex(); releaseDispatch();
+    await Promise.allSettled([stale, dispatch, rebind, newerRebind]);
+    if (session) {
+      await session.extensionRunner!.emit({ type: "session_shutdown", reason: "quit" });
+      console.log("startup admission after shutdown", JSON.stringify({ starts,
+        rows: (await session.extensionRunner!.getAllRegisteredTools().find(tool => tool.definition.name === "agent_status")!.definition
+          .execute("cleanup-status", {}, undefined, undefined,
+            session.extensionRunner!.createToolContext("cleanup-status", undefined))).details }));
+    }
+    for (const finish of finishes) finish();
+    await view?.close();
+    captureController.mockRestore(); captureCodex.mockRestore();
+  }
+}));
+
+for (const { event, failUpstream } of [
+  { event: "session_start", failUpstream: false },
+  { event: "session_shutdown", failUpstream: false },
+  { event: "session_start", failUpstream: true },
+] as const) {
+  const name = `composed ${event}${failUpstream ? " with upstream failure" : ""}`;
+  test(`${name} revokes native and controller admissions before its first await`, fixture.ownedCase(name, async () => {
+    const { root, load } = setup();
+    process.env.PI_OFFLINE = "1";
+    const extensions: Array<{ handlers: Map<string, Function[]> }> = [];
+    const statuses = new Map<string, string>();
+    const tools = new Map<string, { execute: Function }>();
+    let failNextUpstream = false;
+    const pi = { registerFlag() {}, registerCommand() {}, registerTool(tool: { name: string; execute: Function }) { tools.set(tool.name, tool); },
+      on(name: string, handler: Function) {
+        const handlers = extensions.at(-1)!.handlers;
+        handlers.set(name, [...handlers.get(name) ?? [], handler]);
+      },
+      getFlag() {}, getAllTools() { return [{ name: "read" }]; }, getActiveTools() {
+        if (failNextUpstream) { failNextUpstream = false; throw new Error("fixture upstream startup failed"); }
+        return ["read"];
+      },
+      setActiveTools() {}, getSessionName() { return "pitako:coding"; }, setSessionName() {}, sendMessage() {} };
+    const ctx = { cwd: root, hasUI: true, isIdle: () => true,
+      sessionManager: { getSessionId: () => "coordinator", getEntries: () => [] },
+      ui: { notify() {}, setStatus(key: string, text?: string) { if (text) statuses.set(key, text); else statuses.delete(key); } } };
+    const controllers: ReturnType<typeof createAgentController>[] = [];
+    const originalCreate = controllerModule.createAgentController;
+    const capture = spyOn(controllerModule, "createAgentController").mockImplementation((...args) => {
+      const controller = originalCreate(...args);
+      controllers.push(controller);
+      return controller;
+    });
+    const factories = new Map([
+      ["./extensions/index.ts", pitako],
+      ["./extensions/agent/index.ts", agentInstance],
+    ]);
+    const manifest = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+    for (const entry of manifest.pi.extensions) {
+      const factory = factories.get(entry);
+      if (!factory) continue;
+      extensions.push({ handlers: new Map() });
+      factory(pi as never);
+    }
+    // Use Pi's installed serial dispatcher, with an owned host context and the
+    // production composed foreground (including official Codex) and agent
+    // factories in shipped manifest order.
+    const runner = new ExtensionRunner(extensions as never, {} as never, root, ctx.sessionManager as never, {} as never);
+    const hostContext = spyOn(runner as unknown as { createContext(): typeof ctx }, "createContext").mockReturnValue(ctx);
+    const errors: unknown[] = [];
+    runner.onError(error => { errors.push(error); });
+    const emit = (type: typeof event) => runner.emit(type === "session_start" ? { type, reason: "startup" } : { type, reason: "quit" });
+    let dispatch: Promise<void> | undefined, transition: Promise<unknown> | undefined, acceptedInput: Promise<unknown> | undefined;
+    let view: ReturnType<ReturnType<typeof createAgentController>["openView"]> | undefined;
+    const cleanup: Array<() => void> = [];
+    try {
+      await emit("session_start");
+      view = controllers.at(-1)!.openView();
+      let release!: () => void, releaseInput!: () => void, inputStarted!: () => void;
+      const hold = new Promise<void>(resolve => { release = resolve; });
+      const inputHold = new Promise<void>(resolve => { releaseInput = resolve; });
+      const inputStart = new Promise<void>(resolve => { inputStarted = resolve; });
+      cleanup.push(release, releaseInput);
+      const startWorker = async () => {
+        let finish!: (attempt: Attempt) => void, started!: () => void;
+        const attempt = fixture.pendingAttempt(resolve => { finish = resolve; });
+        cleanup.push(() => finish(completed));
+        const start = new Promise<void>(resolve => { started = resolve; });
+        const worker = await spawnBackground({ roleId: "researcher", task: "held", cwd: root, load,
+          historyOrigin: { source: "agent_spawn", coordinatorSessionId: "coordinator", workbrief: "held" },
+          executor: { capturesHistory: true, async start(input) {
+            const history = input.history!.admit(input.instanceId, input.role.id, input.target), manager = history.create();
+            const live = createLiveHandle({ sessionManager: manager, sessionId: manager.getSessionId(), sessionFile: manager.getSessionFile(),
+              async steer(text) {
+                if (text.includes("accepted held input")) { inputStarted(); await inputHold; }
+                return "queued";
+              } }, history);
+            live.open(); const unbind = input.bindLive!(live.handle); started();
+            const result = await attempt;
+            await live.settle(); await live.handle.close(); unbind(); history.result(result); history.disposition(); return result;
+          } } });
+        await start;
+        return { ...worker, finish };
+      };
+      const worker = await startWorker();
+      const { resolveOwnedLive } = await import("../extensions/agent/owner.ts");
+      const target = { kind: "background" as const, instanceId: worker.instanceId };
+      expect(resolveOwnedLive(target, "coordinator").handle.observe().active).toBe(true);
+      const selection = view.detail(worker.instanceId).controls.selection!;
+      expect(await view.input(selection, { intent: "query", text: "before retirement" })).toMatchObject({ status: "queued" });
+      acceptedInput = view.input(selection, { intent: "query", text: "accepted held input" });
+      // The native hook has admitted work, but its result must not paint a retired view.
+      void acceptedInput.catch(() => {});
+      await inputStart;
+      dispatch = ownedDispatch(ctx as never, undefined, () => true, async () => hold);
+      await Promise.resolve();
+      let settled = false;
+      failNextUpstream = failUpstream;
+      transition = emit(event).then(() => { settled = true; });
+      expect(() => resolveOwnedLive(target, "coordinator")).toThrow("foreground owner");
+      expect(() => view!.list()).toThrow("retired");
+      expect(() => view!.detail(worker.instanceId)).toThrow("retired");
+      expect(() => view!.acknowledge("history")).toThrow("retired");
+      expect(() => view!.cancel(selection)).toThrow("retired");
+      expect(() => view!.input(selection, { intent: "steer", text: "during retirement" })).toThrow("retired");
+      expect(await tools.get("agent_input")!.execute("during", {
+        target, historyId: selection.historyId, sessionId: selection.sessionId, intent: "query", text: "during retirement",
+      }, undefined, undefined, ctx)).toMatchObject({ isError: true, details: { status: "rejected" } });
+      expect(statuses.has("pitako.agents")).toBe(false);
+      expect(settled).toBe(false);
+      release(); await dispatch;
+      await Promise.resolve();
+      expect(settled).toBe(false); // accepted controller work is still held
+      releaseInput(); await expect(acceptedInput).rejects.toThrow("retired"); await transition;
+      worker.finish(completed);
+      if (event === "session_shutdown") await emit("session_start");
+      const freshView = controllers.at(-1)!.openView();
+      expect(freshView.list().items).toEqual([]);
+      expect(() => view!.list()).toThrow("retired");
+      const freshWorker = await startWorker();
+      const freshSelection = freshView.detail(freshWorker.instanceId).controls.selection!;
+      expect(freshView.list().items.map(row => row.id)).toContain(freshWorker.instanceId);
+      expect(await freshView.input(freshSelection, { intent: "steer", text: "fresh owner" })).toMatchObject({ status: "queued" });
+      expect(await tools.get("agent_input")!.execute("fresh", {
+        target: freshSelection.target, historyId: freshSelection.historyId, sessionId: freshSelection.sessionId, intent: "query", text: "fresh native owner",
+      }, undefined, undefined, ctx)).toMatchObject({ details: { status: "queued" } });
+      expect(freshView.cancel(freshSelection)).toMatchObject({ status: "requested" });
+      freshWorker.finish(completed);
+      await freshView.close();
+    } finally {
+      // Settlement is owned even when the synchronous regression assertion fails.
+      for (const finish of cleanup) finish();
+      await dispatch;
+      await transition;
+      await Promise.allSettled([acceptedInput]);
+      await view?.close();
+      await emit("session_shutdown");
+      hostContext.mockRestore();
+      capture.mockRestore();
+      if (failUpstream) expect(errors).toMatchObject([{ event: "session_start", error: "fixture upstream startup failed" }]);
+      else expect(errors).toEqual([]);
+    }
+  }));
+}

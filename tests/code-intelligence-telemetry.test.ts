@@ -1,3 +1,4 @@
+import "./fixtures/offline.ts";
 import { afterEach, expect, test } from "bun:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
@@ -175,12 +176,14 @@ test("/pitako stats reads foreground events and reports role and instance usage"
     status: "running",
     phase: "working",
     task: "stats fixture",
+    origin: { source: "agent_run", coordinatorSessionId: sessionId },
     acceptedAt: Date.now(),
     selectedModel: "test/model",
     lastActivityKind: "tool_end",
     agentUsage: workerUsage,
   } as AgentUiSnapshot;
   publishObservation(worker);
+  publishObservation({ ...worker, id: "foreign-stats", origin: { source: "agent_run", coordinatorSessionId: "other-coordinator" } });
 
   await commands.get("pitako")?.("stats", context);
   const sessionStats = notifications.at(-1)!;
@@ -190,6 +193,7 @@ test("/pitako stats reads foreground events and reports role and instance usage"
   expect(sessionStats).toContain("raw navigation: read=1, grep=0");
   expect(sessionStats).toContain("role developer:");
   expect(sessionStats).toContain("instance developer-t4-stats");
+  expect(sessionStats).not.toContain("foreign-stats");
 
   await commands.get("pitako")?.("stats developer-t4-stats", context);
   expect(notifications.at(-1)).toContain("instance: developer-t4-stats");

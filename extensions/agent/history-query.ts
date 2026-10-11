@@ -14,6 +14,17 @@ export interface HistoryPage {
   diagnostics: Array<{ code: string; detail?: string }>;
   cursor: string | null;
 }
+/** Internal UI authority, never accepted from public tool parameters. */
+export interface HistoryScope {
+  coordinatorSessionId: string;
+  instanceId?: string;
+  assignmentId?: string;
+}
+function permitted(member: HistoryMember, scope: HistoryScope): boolean {
+  return member.coordinatorSessionId === scope.coordinatorSessionId &&
+    (scope.instanceId === undefined || member.instanceId === scope.instanceId) &&
+    (scope.assignmentId === undefined || member.assignmentId === scope.assignmentId);
+}
 type Cursor = { version: 1; action: "list" | "read"; identity: string; groupId: string;
   index: number; entryOffset?: number; cut: FileCut; json?: JsonState; catalogOnly?: true };
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -120,7 +131,7 @@ function summary(group: HistoryGroup, member: HistoryMember) {
     gaps };
 }
 
-async function list(query: Extract<HistoryQuery, { action: "list" }>, page: HistoryPage, directory: string, limit: number) {
+async function list(query: Extract<HistoryQuery, { action: "list" }>, page: HistoryPage, directory: string, limit: number, scope?: HistoryScope) {
   const identity = createHash("sha256").update(JSON.stringify(selectors.map((key) => query[key] ?? null))).digest("hex");
   const previous = decode(query.cursor, "list", identity);
   let scans = 0;
@@ -131,6 +142,14 @@ async function list(query: Extract<HistoryQuery, { action: "list" }>, page: Hist
       const cut = fileCut(fd);
       if (previous?.groupId === groupId) validateCut(fd, previous.cut);
       const group = metadata(fd, groupId);
+      if (scope) {
+        let authorized = false;
+        for (const { member } of members(fd)) if (permitted(member, scope)) { authorized = true; break; }
+        if (!authorized) {
+          if (previous?.groupId === groupId) throw new Error("history_outside_scope");
+          continue;
+        }
+      }
       if (query.missionId && (group.identity.kind !== "mission" || group.identity.missionId !== query.missionId)) continue;
       let catalogCount = 0;
       for (const row of members(fd)) catalogCount = row.index + 1;
@@ -201,7 +220,7 @@ async function locate(directory: string, historyId: string, selectedGroup?: stri
   return undefined;
 }
 
-async function read(query: Extract<HistoryQuery, { action: "read" }>, page: HistoryPage, directory: string, limit: number) {
+async function read(query: Extract<HistoryQuery, { action: "read" }>, page: HistoryPage, directory: string, limit: number, scope?: HistoryScope) {
   if (!UUID.test(query.historyId)) throw new Error("invalid_history_id");
   if (query.groupId !== undefined && !UUID.test(query.groupId)) throw new Error("invalid_group_id");
   const source = query.source ?? "worker";
@@ -209,7 +228,9 @@ async function read(query: Extract<HistoryQuery, { action: "read" }>, page: Hist
   const found = await locate(directory, query.historyId, query.groupId);
   if (!found) throw new Error(query.cursor ? "stale_cursor" : "history_not_found");
   const { member, groupId } = found;
-  const identity = source === "worker" ? query.historyId : createHash("sha256")
+  if (scope && !permitted(member, scope)) throw new Error("history_outside_scope");
+  const identity = scope ? createHash("sha256").update(JSON.stringify([query.historyId, scope])).digest("hex")
+    : source === "worker" ? query.historyId : createHash("sha256")
     .update(JSON.stringify([query.historyId, source, member.coordinatorSessionId, member.coordinatorSessionFile])).digest("hex");
   const previous = decode(query.cursor, "read", identity);
   if (previous && previous.groupId !== groupId) throw new Error("stale_cursor");
@@ -292,18 +313,23 @@ async function read(query: Extract<HistoryQuery, { action: "read" }>, page: Hist
   } finally { closeSync(fd); }
 }
 
-export async function queryHistory(input: HistoryQuery, coordinatorSessionId?: string, agentDir = getAgentDir()): Promise<HistoryPage> {
+export async function queryHistory(input: HistoryQuery, coordinatorSessionId?: string, agentDir = getAgentDir(), scope?: HistoryScope): Promise<HistoryPage> {
   const page: HistoryPage = { items: [], diagnostics: [], cursor: null };
   try {
     const limit = input.limit ?? 50;
     const allowed = input.action === "list" ? ["action", "scope", ...selectors, "cursor", "limit"] : ["action", "historyId", "source", "groupId", "cursor", "limit"];
     if (Object.keys(input).some((key) => !allowed.includes(key))) throw new Error("invalid_parameter");
     if (!Number.isInteger(limit) || limit < 1 || limit > 200) throw new Error("invalid_limit");
+    if (scope && (!scope.coordinatorSessionId || input.action === "read" && input.source && input.source !== "worker" ||
+      input.action === "list" && (input.scope || selectors.some(key =>
+        input[key] !== undefined && input[key] !== scope[key as keyof HistoryScope]))))
+      throw new Error("history_outside_scope");
     if (input.action === "list") {
       if (input.scope !== undefined && input.scope !== "all") throw new Error("invalid_scope");
       for (const key of selectors) if (input[key] !== undefined && (typeof input[key] !== "string" || !input[key] || input[key]!.length > 200))
         throw new Error("invalid_selector");
       const query = { ...input };
+      if (scope) Object.assign(query, scope);
       if (!query.scope && !selectors.some((key) => query[key] !== undefined)) {
         if (!coordinatorSessionId) throw new Error("coordinator_identity_unavailable");
         query.coordinatorSessionId = coordinatorSessionId;
@@ -314,8 +340,8 @@ export async function queryHistory(input: HistoryQuery, coordinatorSessionId?: s
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         page.diagnostics.push({ code: "catalog_missing" }); return page;
       }
-      await list(query, page, directory, limit);
-    } else if (input.action === "read") await read(input, page, path.join(agentDir, "pitako", "worker-history"), limit);
+      await list(query, page, directory, limit, scope);
+    } else if (input.action === "read") await read(input, page, path.join(agentDir, "pitako", "worker-history"), limit, scope);
     else throw new Error("invalid_action");
     if (!page.diagnostics.length) page.diagnostics.push({ code: "ok" });
   } catch (error) {
