@@ -8,6 +8,8 @@ import { runAgentInstance } from "../extensions/agent/run.ts";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ClassifierResult } from "@earendil-works/pi-ai";
 import { packageRoot } from "../extensions/stack.ts";
+import { createAgentController } from "../extensions/agent/controller.ts";
+import { clearObservations, publishObservation } from "../extensions/agent/observe.ts";
 
 function response(choice: string, probabilities: Record<string, number>): ClassifierResult {
   return { api: "fixture", provider: "fixture", model: "fixture", timestamp: 1, stopReason: "stop",
@@ -21,7 +23,7 @@ describe("Developer routing", () => {
     const content = (model: string) => `[model_policies.developer.primary]\nmodel = "fixture/${model}"\nreasoning = "medium"\n`;
     mkdirSync(root, { recursive: true });
     writeFileSync(config, content("mid"));
-    const full = response("developer_senior", base);
+    const full = response("developer_senior", { ...base, developer_senior: 0.6012345678901234 });
     const model = { type: "classifier", provider: "opencode", id: "jev-1.13-free", api: "fixture", contextWindow: 8192 };
     let discoveries = 0, classifications = 0, writes = 0, owned = true, recordingFails = false;
     let sessionId = "coordinator";
@@ -42,13 +44,26 @@ describe("Developer routing", () => {
       expect(snapshot.evidence).toBe("pending-native-persistence");
       expect(Object.isFrozen(snapshot.config.policies.developer_mid?.primary)).toBe(true);
       writeFileSync(config, content("changed"));
+      const owner = { sessionId, token: Symbol("routing view") };
+      const controller = createAgentController(owner, () => owner), view = controller.openView();
       const result = await runAgentInstance({ roleId: "developer", task: input.task, cwd: root, dispatch: snapshot,
+        historyOrigin: { source: "agent_run", coordinatorSessionId: sessionId, workbrief: input.task,
+          routing: snapshot.routing, routingEvidence: { state: snapshot.evidence, gap: snapshot.evidenceGap } },
+        onObserve: publishObservation,
         executor: { async start(request) {
           expect(request.target.model).toBe("fixture/mid");
           expect(request.role.modelPolicyId).toBe("developer_senior");
           return { status: "completed", result: "observed immutable target", sideEffects: false };
         } } });
       expect(result.status).toBe("completed");
+      const detail = view.detail(result.instanceId);
+      expect(detail.route).toMatchObject({ state: "captured", profile: "developer_senior",
+        evidence: { state: "pending-native-persistence" }, recommendation: { choice: "developer_senior",
+          probabilities: { ...base, developer_senior: 0.6012345678901234 } } });
+      detail.route.recommendation!.probabilities.developer_senior = 0;
+      expect(view.detail(result.instanceId).route.recommendation?.probabilities.developer_senior).toBe(0.6012345678901234);
+      expect(() => view.route(result.instanceId)).toThrow("acknowledgement");
+      await view.close(); controller.revoke(); await controller.settle();
       expect(classifications).toBe(1); // Runner consumption has no second classifier call.
       recordingFails = true;
       const gap = await developerPreflight(input);
@@ -81,7 +96,7 @@ describe("Developer routing", () => {
       ctx.modelRegistry.classify = async () => ({ ...full, stopReason: "aborted" });
       await expect(developerPreflight(input)).rejects.toThrow("aborted before admission");
       expect(writes).toBe(beforeLost);
-    } finally { rmSync(root, { recursive: true, force: true }); }
+    } finally { clearObservations(); rmSync(root, { recursive: true, force: true }); }
   });
   test("choice must agree with unique winner across complete unnormalized probabilities", () => {
     expect(classifyProfile(response("developer_senior", base)).profile).toBe("developer_senior");

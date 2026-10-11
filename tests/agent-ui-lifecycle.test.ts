@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import "./fixtures/offline.ts";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import {
   bindAgentUi,
   clearObservations,
@@ -10,6 +11,7 @@ import {
 } from "../extensions/agent/observe.ts";
 import type { AgentUiSnapshot } from "../extensions/agent/ui.ts";
 import pitako from "../extensions/index.ts";
+import { registerExecution, unregisterExecution } from "../extensions/execution-identity.ts";
 
 type StatusCall = { key: string; text: string | undefined };
 
@@ -276,7 +278,7 @@ describe("agent UI lifecycle", () => {
     const sessionB = makeSession();
     await sessionA.handlers.get("session_start")?.({}, sessionA.ctx);
     await sessionB.handlers.get("session_start")?.({}, sessionB.ctx);
-    publishObservation(baseRow({ id: "session-b-worker" }));
+    publishObservation(baseRow({ id: "session-b-worker", origin: { source: "agent_spawn", coordinatorSessionId: "same-session-id" } }));
     expect(sessionB.statuses.get("pitako.agents")).toContain("● dev");
 
     await sessionA.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, sessionA.ctx);
@@ -346,6 +348,7 @@ describe("agent UI lifecycle", () => {
     const statuses = new Map<string, string>();
     const handlers = new Map<string, Function>();
     const commands = new Map<string, Function>();
+    const notices: string[] = [];
     const pi = {
       registerFlag() {},
       registerCommand(name: string, command: { handler: Function }) { commands.set(name, command.handler); },
@@ -364,8 +367,11 @@ describe("agent UI lifecycle", () => {
     };
     const ctx = {
       hasUI: true,
+      mode: "rpc",
+      sessionManager: { getSessionId: () => "production-session", getEntries: () => [] },
       ui: {
-        notify() {},
+        notify(text: string) { notices.push(text); },
+        custom() { throw new Error("RPC must preserve text instead of mounting the terminal screen"); },
         setStatus(key: string, text: string | undefined) {
           if (text === undefined) statuses.delete(key);
           else statuses.set(key, text);
@@ -379,7 +385,22 @@ describe("agent UI lifecycle", () => {
     await start?.({}, ctx);
     expect(statuses.get("pitako")).toBe("pitako:coding");
 
-    publishObservation(baseRow({ id: "production-worker" }));
+    publishObservation(baseRow({ id: "production-worker", origin: { source: "agent_spawn", coordinatorSessionId: "production-session" } }));
+    await commands.get("pitako")?.("agents production-worker", ctx);
+    expect(notices.at(-1)).toContain("production-worker");
+    await commands.get("pitako")?.("agents not-a-worker", ctx);
+    expect(notices.at(-1)).toContain("unknown worker not-a-worker");
+    const output = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await commands.get("pitako")?.("agents", { ...ctx, hasUI: false, mode: "print", sessionManager: { getSessionId: () => "empty-parent" } });
+      expect(output).toHaveBeenCalledWith("no workers");
+    } finally { output.mockRestore(); }
+    registerExecution({ instanceId: "ui-child", roleId: "researcher", sessionId: "ui-child-session" });
+    try {
+      await commands.get("pitako")?.("agents production-worker", { ...ctx, mode: "tui",
+        sessionManager: { getSessionId: () => "ui-child-session" } });
+      expect(notices.at(-1)).toBe("agents cannot be called from an AgentInstance");
+    } finally { unregisterExecution("ui-child-session"); }
     expect(statuses.get("pitako")).toBe("pitako:coding");
     expect(statuses.get("pitako.agents")).toContain("● dev");
     const visibleStatusLine = [...statuses.entries()]
@@ -392,7 +413,7 @@ describe("agent UI lifecycle", () => {
 
     await commands.get("pitako")?.("profile analysis", ctx);
     expect(statuses.get("pitako")).toBe("pitako:coding");
-    publishObservation(baseRow({ id: "production-worker", task: "Still running" }));
+    publishObservation(baseRow({ id: "production-worker", task: "Still running", origin: { source: "agent_spawn", coordinatorSessionId: "production-session" } }));
     expect(statuses.get("pitako")).toBe("pitako:coding");
 
     await start?.({}, ctx);

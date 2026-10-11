@@ -207,6 +207,7 @@ async function runTarget(
     signal: AbortSignal;
     onActivity?: Parameters<AttemptExecutor["start"]>[0]["onActivity"];
     onActivated?: (appliedReasoning: string) => void;
+    onRequest?: (request: AgentRequestObservation) => void;
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
     bindLive?: Parameters<AttemptExecutor["start"]>[0]["bindLive"];
     sessionHistory?: SessionHistory;
@@ -325,6 +326,7 @@ async function bindThenRun(
     signal: AbortSignal;
     onActivity?: Parameters<AttemptExecutor["start"]>[0]["onActivity"];
     onActivated?: (appliedReasoning: string) => void;
+    onRequest?: (request: AgentRequestObservation) => void;
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
     bindLive?: Parameters<AttemptExecutor["start"]>[0]["bindLive"];
     sessionHistory?: SessionHistory;
@@ -420,6 +422,7 @@ async function drive(
     signal: AbortSignal;
     onActivity?: (event: { type?: string; toolName?: string; assistantMessageEvent?: { type?: string } }) => void;
     onActivated?: (appliedReasoning: string) => void;
+    onRequest?: (request: AgentRequestObservation) => void;
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
   },
 ): Promise<Attempt> {
@@ -456,8 +459,15 @@ async function drive(
         appliedReasoning: options?.reasoning, continuation: session.messages.some((message) => message.role === "assistant"),
       });
       const observation: AgentRequestObservation = {
-        model: selection?.model ?? `${model.provider}/${model.id}`,
-        reasoning: options?.reasoning ?? selection?.reasoning,
+        model: `${model.provider}/${model.id}`,
+        reasoning: options?.reasoning,
+        historyId: history?.historyId,
+        sessionId: session.sessionId,
+        sdkOptions: {
+          reasoning: options?.reasoning,
+          temperature: options?.temperature,
+          maxTokens: options?.maxTokens,
+        },
         fast_requested: selection?.fastRequested ?? false,
         ...(selection?.serviceTier ? { requested_service_tier: selection.serviceTier } : {}),
         returned_service_tier: "unavailable",
@@ -465,6 +475,7 @@ async function drive(
       };
       const request = { observation, startedAt: now() };
       requests.push(observation);
+      try { input.onRequest?.(observation); } catch { /* Observers cannot change a request. */ }
       activeRequest = request;
       return lazyStream(model, async () => {
         try {
@@ -578,6 +589,7 @@ function resume(
     cwd: string;
     onActivity?: Parameters<AttemptExecutor["start"]>[0]["onActivity"];
     onActivated?: (appliedReasoning: string) => void;
+    onRequest?: (request: AgentRequestObservation) => void;
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
   },
 ): NonNullable<Attempt["session"]> {

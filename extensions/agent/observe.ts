@@ -50,6 +50,7 @@ export type BindAgentUiOptions = {
   columns?: () => number | undefined;
   scheduler?: AgentUiScheduler;
   ownerToken?: symbol;
+  coordinatorSessionId?: string;
 };
 
 type AgentUiSlot = {
@@ -72,12 +73,20 @@ export function noteResultTaken(id: string): void {
   notify();
 }
 
-export function listObservations(ownerToken?: symbol): AgentUiSnapshot[] {
-  return [...observations().rows.values()].filter((row) => !row.teamOwnerToken || row.teamOwnerToken === ownerToken);
+export function listObservations(ownerToken?: symbol, coordinatorSessionId?: string): AgentUiSnapshot[] {
+  return [...observations().rows.values()].filter((row) =>
+    (!row.teamOwnerToken || row.teamOwnerToken === ownerToken) &&
+    (coordinatorSessionId === undefined || row.origin?.coordinatorSessionId === coordinatorSessionId &&
+      (row.origin.source === "agent_run" || row.origin.source === "agent_spawn" ||
+        row.origin.source === "team_assign" && Boolean(row.origin.assignmentId && row.teamOwnerToken && row.teamOwnerToken === ownerToken))));
 }
 
 export function removeTeamObservations(ownerToken: symbol): void {
   removeObservations((row) => row.teamOwnerToken === ownerToken);
+}
+
+export function removeObservation(instanceId: string): void {
+  removeObservations((row) => row.id === instanceId);
 }
 
 export function removeUntaggedObservations(): void {
@@ -187,9 +196,11 @@ export function bindAgentUi(options: BindAgentUiOptions): symbol {
     const now = nowFn();
     let labeled: AgentUiSnapshot[] = [];
     try {
-      labeled = labelModels(listObservations(options.ownerToken), lookup);
+      labeled = labelModels(options.ownerToken && !options.coordinatorSessionId ? []
+        : listObservations(options.ownerToken, options.coordinatorSessionId), lookup);
     } catch {
-      labeled = listObservations(options.ownerToken);
+      labeled = options.ownerToken && !options.coordinatorSessionId ? []
+        : listObservations(options.ownerToken, options.coordinatorSessionId);
     }
     let text = "";
     try {

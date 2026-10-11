@@ -68,10 +68,10 @@ async function create(id, child = false) {
   assert.deepEqual(loaded.errors, []);
   const paths = loaded.extensions.map((extension) => extension.resolvedPath);
   assert.equal(new Set(paths).size, paths.length);
-  const codexIndex = paths.findIndex((entry) => entry.endsWith("/pi-codex-tools/index.ts"));
-  assert.ok(codexIndex >= 0 && codexIndex < paths.findIndex((entry) => entry === path.join(root, "extensions/index.ts")));
+  assert.equal(paths[0], path.join(root, "extensions/index.ts"));
+  assert.ok(!paths.some((entry) => entry.endsWith("/pi-codex-tools/index.ts")));
   assert.equal(loaded.extensions.filter((extension) => extension.tools.has("apply_patch")).length, 1);
-  assert.ok(loaded.extensions.find((extension) => extension.tools.has("apply_patch")).resolvedPath.endsWith("/pi-codex-tools/index.ts"));
+  assert.equal(loaded.extensions.find((extension) => extension.tools.has("apply_patch")).resolvedPath, paths[0]);
   const { session } = await createAgentSession({ cwd, agentDir, model: model(id), modelRuntime: runtime, resourceLoader: loader, sessionManager: SessionManager.inMemory(cwd), settingsManager });
   if (child) registerExecution({ instanceId: "reviewer-fixture", roleId: "reviewer", sessionId: session.sessionId });
   await session.bindExtensions({}); // T2 owns this production lifecycle step.

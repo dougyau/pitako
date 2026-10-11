@@ -7,9 +7,12 @@ import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager
 import { installLocalProvider } from "../tests/local-provider.ts";
 import { createPiExecutor } from "../extensions/agent/pi.ts";
 import { createLiveHandle } from "../extensions/agent/live.ts";
-import { InvocationHistory } from "../extensions/agent/history.ts";
+import { InvocationHistory, WorkerHistory } from "../extensions/agent/history.ts";
 import agentInstance from "../extensions/agent/index.ts";
-import { bindBackgroundOwner, cancelAllWorkers, cancelWorker, clearBackgroundOwner, resolveLiveTarget, spawnBackground } from "../extensions/agent/background.ts";
+import pitako from "../extensions/index.ts";
+import { TuiMainScreen, visibleWidth } from "@earendil-works/pi-tui";
+import { bindBackgroundOwner, cancelAllWorkers, cancelWorker, clearBackgroundOwner, resolveLiveTarget, spawnBackground, setBackgroundExecutor } from "../extensions/agent/background.ts";
+import { createAgentController } from "../extensions/agent/controller.ts";
 
 const deferred = () => {
   let resolve;
@@ -17,6 +20,147 @@ const deferred = () => {
   return { promise, resolve };
 };
 
+// Public SDK command dispatch and custom UI host, driven through the component's public input.
+// No ProcessTerminal or real pane is needed: T1 owns terminal restoration evidence.
+async function screenFixture(root) {
+  const firstHeld = deferred(), releaseFirst = deferred(), secondHeld = deferred(), releaseSecond = deferred();
+  const attempts = [], notices = [], statuses = [], snapshots = [];
+  let coordinator, screen, command, worker;
+  const mounted = deferred(), hostDone = deferred();
+  const flush = () => new Promise(resolve => setImmediate(resolve));
+  globalThis.__screenFixture = { firstHeld, releaseFirst, secondHeld, releaseSecond };
+  try {
+    writeFileSync(path.join(root, "settings.json"), JSON.stringify({ retry: { enabled: false }, compaction: { enabled: false } }));
+    mkdirSync(path.join(root, "pitako"), { recursive: true });
+    writeFileSync(path.join(root, "pitako", "config.toml"), '[model_policies.researcher.primary]\nmodel = "pitako-local/fixture"\nreasoning = "off"\n');
+    const workerProvider = await installLocalProvider({
+      agentDir: root, toolTurns: 2, toolForPrompt: (_prompt, completed) => completed < 2
+        ? { name: "read", arguments: { path: completed === 0 ? "first.txt" : "second.txt" } } : undefined,
+      responseForPrompt: prompt => `candidate reply mentioning ${prompt}`,
+    });
+    writeFileSync(path.join(root, "first.txt"), "first worker context\n");
+    writeFileSync(path.join(root, "second.txt"), "second worker context\n");
+    writeFileSync(path.join(root, "extensions", "screen-hooks.js"), `export default function(pi) {
+      pi.on("tool_call", async event => {
+        if(event.toolName !== "read") return;
+        const f = globalThis.__screenFixture;
+        if(event.input.path === "first.txt") { f.firstHeld.resolve(); await f.releaseFirst.promise; }
+        if(event.input.path === "second.txt") { f.secondHeld.resolve(); await f.releaseSecond.promise; }
+      });
+    }`);
+    const foreground = await installLocalProvider({ agentDir: root, provider: "pitako-coordinator",
+      toolForPrompt: (_prompt, completed) => completed === 0 ? { name: "agent_spawn", arguments: { role: "researcher", task: "Original screen WorkBrief" } } : undefined });
+    writeFileSync(path.join(root, "extensions", "local-provider.js"),
+      'export default function(pi) { pi.registerProvider("pitako-local", globalThis.__pitako_local); }\n');
+    const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false } });
+    const loader = new DefaultResourceLoader({ cwd: root, agentDir: root, settingsManager, noContextFiles: true, noSkills: true, noThemes: true,
+      extensionFactories: [pitako, agentInstance, pi => pi.registerProvider(foreground.provider, globalThis.__pitako_coordinator)] });
+    await loader.reload();
+    const runtime = await ModelRuntime.create({ authPath: path.join(root, "auth.json"), modelsPath: null, allowModelNetwork: false });
+    coordinator = (await createAgentSession({ cwd: root, agentDir: root, resourceLoader: loader, settingsManager,
+      modelRuntime: runtime, sessionManager: SessionManager.create(root, path.join(root, "foreground-native")) })).session;
+    let height = 32, width = 110, paints = 0, starts = 0, stops = 0, customCalls = 0;
+    const terminal = { get rows() { return height; }, get columns() { return width; }, start() { starts++; }, stop() { stops++; }, write() {}, hideCursor() {}, showCursor() {} };
+    const tui = new TuiMainScreen(terminal);
+    tui.requestRender = () => { paints++; };
+    const ui = { ...coordinator.extensionRunner.getUIContext(), notify(text) { notices.push(text); },
+      setStatus(key, text) { statuses.push({ key, text }); },
+      setFooter() { throw Error("screen replaced Pi footer"); },
+      custom(factory) {
+        customCalls++;
+        screen = factory(tui, undefined, undefined, () => hostDone.resolve());
+        mounted.resolve();
+        return hostDone.promise;
+      } };
+    await coordinator.bindExtensions({ mode: "tui", uiContext: ui });
+    await coordinator.setModel(runtime.getModel(foreground.provider, foreground.model));
+    coordinator.setActiveToolsByName(["agent_spawn"]);
+    const driver = createPiExecutor();
+    setBackgroundExecutor({ capturesHistory: driver.capturesHistory,
+      start(input) { const accepted = driver.start(input); attempts.push(accepted); return accepted; } });
+    coordinator.subscribe(event => { if (event.type === "message_end" && event.message.role === "toolResult" && event.message.toolName === "agent_spawn") worker = event.message.details; });
+    await coordinator.prompt("dispatch screen fixture");
+    assert(worker?.instanceId);
+    await firstHeld.promise;
+    const native = resolveLiveTarget({ kind: "background", instanceId: worker.instanceId }, coordinator.sessionId).observe();
+    command = coordinator.prompt("/pitako agents");
+    await mounted.promise;
+    const snapshot = label => {
+      const lines = screen.render(width);
+      assert(lines.length <= height && lines.every(line => visibleWidth(line) <= width));
+      snapshots.push({ label, width, height, lines }); return lines.join("\n");
+    };
+    assert(snapshot("list").includes(worker.instanceId));
+    screen.handleInput("\r");
+    assert(snapshot("brief").includes("Original screen WorkBrief"));
+    screen.handleInput("2");
+    assert(snapshot("activity").includes("event-only"));
+    screen.handleInput("3");
+    assert(snapshot("identity").includes("pitako-local/fixture"));
+    screen.handleInput("q"); screen.handleInput("query from actual screen"); screen.handleInput("\r");
+    await flush();
+    const afterQuery = resolveLiveTarget({ kind: "background", instanceId: worker.instanceId }, coordinator.sessionId).observe();
+    const query = structuredClone(afterQuery.interactions.at(-1));
+    assert.equal(query.status, "queued");
+    screen.handleInput("s"); screen.handleInput("steer from actual screen"); screen.handleInput("\r");
+    await flush();
+    const afterSteer = resolveLiveTarget({ kind: "background", instanceId: worker.instanceId }, coordinator.sessionId).observe();
+    const steer = structuredClone(afterSteer.interactions.at(-1));
+    assert.equal(steer.status, "queued"); assert.notEqual(steer.interactionId, query.interactionId);
+    releaseFirst.resolve();
+    await Promise.race([secondHeld.promise, attempts[0].then(() => {
+      throw Error("Screen worker settled before cancel hold: " + JSON.stringify(workerProvider.trace));
+    })]);
+    screen.handleInput("r"); screen.handleInput("4");
+    snapshot("qualified-receipts");
+    const consumed = structuredClone(resolveLiveTarget({ kind: "background", instanceId: worker.instanceId }, coordinator.sessionId).observe());
+    assert(workerProvider.trace.some(row => row.prompt.includes(query.interactionId)));
+    screen.handleInput("5"); await flush();
+    snapshot("history-metadata");
+    screen.handleInput("\r");
+    assert(snapshot("history-ack-form").includes("type yes"));
+    screen.handleInput("yes"); screen.handleInput("\r"); await flush();
+    snapshot("acknowledged-history");
+    width = 13; height = 7; snapshot("narrow");
+    screen.handleInput("\x1b[6~"); snapshot("narrow-scrolled");
+    width = 110; height = 32;
+    screen.handleInput("c"); screen.handleInput("no"); screen.handleInput("\r");
+    assert.equal(resolveLiveTarget({ kind: "background", instanceId: worker.instanceId }, coordinator.sessionId).observe().active, true);
+    screen.handleInput("c"); screen.handleInput("yes"); screen.handleInput("\r");
+    const cancelText = snapshot("cancel-request");
+    assert(cancelText.includes("requested"), cancelText);
+    releaseSecond.resolve();
+    await Promise.allSettled(attempts);
+    screen.handleInput("3"); // separately inspect the settled lifecycle; do not bypass refresh cadence
+    assert(snapshot("settled").includes("terminal worker"));
+    screen.handleInput("\x1b"); screen.handleInput("\x1b");
+    await command; command = undefined;
+    const paintsAtClose = paints;
+    screen.handleInput("r"); assert.equal(paints, paintsAtClose);
+    assert.equal(customCalls, 1); assert.equal(starts, 0); assert.equal(stops, 0);
+    const member = new WorkerHistory(root, { initialize: false }).list().flatMap(group => group.members)
+      .find(member => member.native.state === "allocated" && member.native.sessionId === native.sessionId);
+    assert(member);
+    const entries = SessionManager.open(member.native.path).getEntries();
+    const markers = entries.filter(entry => entry.type === "custom" && entry.customType === "pitako.worker-history" && entry.data.event === "interaction");
+    assert(markers.some(entry => entry.data.data.interactionId === query.interactionId && entry.data.data.status === "queued"));
+    assert(markers.some(entry => entry.data.data.interactionId === steer.interactionId && entry.data.data.status === "queued"));
+    assert(entries.some(entry => entry.type === "message" && entry.message.role === "user" && JSON.stringify(entry).includes(query.interactionId)));
+    return { sdkCommand: "/pitako agents", worker, native, query, steer, consumed, markers, snapshots, customCalls, starts, stops,
+      ownedAttemptsJoined: attempts.length, notices, statuses, trace: workerProvider.trace, paidCalls: 0,
+      limits: ["Offline scripted provider; candidate adequacy is not judged. Query reaches native input/provider; cancellation may leave steer unconfirmed.",
+        "Injected public custom host, no new PTY or Herdr proof."] };
+  } finally {
+    releaseFirst.resolve(); releaseSecond.resolve();
+    if (worker) { try { cancelWorker(worker.instanceId); } catch {} }
+    await Promise.allSettled(attempts);
+    if (screen) await screen.finish();
+    await command;
+    await coordinator?.dispose();
+    setBackgroundExecutor(undefined); cancelAllWorkers(); clearBackgroundOwner();
+    delete globalThis.__screenFixture; delete globalThis.__pitako_coordinator;
+  }
+}
 // The coordinator uses shipped tools in an ordinary foreground SDK session.
 // The offline provider scripts the detour and correction; it is not a utility sample.
 async function reconductionFixture(root) {
@@ -182,10 +326,20 @@ async function reconductionFixture(root) {
 const root = mkdtempSync(path.join(tmpdir(), "pitako-input-sdk-"));
 process.env.PI_CODING_AGENT_DIR = root;
 process.env.PI_OFFLINE = "1";
+if (process.argv.includes("--screen")) {
+  try {
+    const observed = await screenFixture(root);
+    if (process.argv[2] && process.argv[2] !== "--screen") writeFileSync(process.argv[2], JSON.stringify(observed, null, 2) + "\n");
+    console.log(JSON.stringify(observed));
+  } finally { delete globalThis.__pitako_local; rmSync(root, { recursive: true, force: true }); }
+  process.exit(0);
+}
 const held = deferred(), release = deferred(), hook = deferred(), releaseHook = deferred(), boundary = deferred();
 const workerHeld = deferred(), releaseWorker = deferred(), replacementHeld = deferred(), releaseReplacement = deferred(), settled = deferred();
 const order = [];
 let session, run, raceLive, backgroundId;
+const sdkAttempts = [];
+let controller;
 try {
   const provider = await installLocalProvider({
     agentDir: root,
@@ -278,28 +432,66 @@ try {
   const config = path.join(root, "pitako", "config.toml");
   mkdirSync(path.dirname(config), { recursive: true });
   writeFileSync(config, `[model_policies.developer.primary]\nmodel = "pitako-local/fixture"\nreasoning = "off"\n[[model_policies.developer.fallbacks]]\nmodel = "pitako-local/replacement"\nreasoning = "off"\n`);
-  bindBackgroundOwner({ token: Symbol("foreground"), isIdle: () => true, hasUI: true, notify() { settled.resolve(); }, sendMessage() { settled.resolve(); } });
+  const ownerToken = Symbol("foreground");
+  bindBackgroundOwner({ token: ownerToken, isIdle: () => true, hasUI: true, notify() { settled.resolve(); }, sendMessage() { settled.resolve(); } });
+  controller = createAgentController({ sessionId: "coordinator", token: ownerToken }, () => ({ sessionId: "coordinator", token: ownerToken }));
+  const view = controller.openView(), otherView = controller.openView();
   const driver = createPiExecutor();
   const handle = await spawnBackground({ roleId: "developer", task: "original production WorkBrief", cwd: root,
     historyOrigin: { source: "agent_spawn", workbrief: "original production WorkBrief", coordinatorSessionId: "coordinator" },
     load: { env: { PI_CODING_AGENT_DIR: root }, userConfigPath: config },
-    executor: driver,
+    executor: {
+      capturesHistory: driver.capturesHistory,
+      start(input) { const pending = driver.start(input); sdkAttempts.push(pending); return pending; },
+    },
   });
   const target = { kind: "background", instanceId: handle.instanceId };
   backgroundId = handle.instanceId;
   await workerHeld.promise;
   const live = resolveLiveTarget(target, "coordinator");
   const first = live.observe();
+  const firstDetail = view.detail(handle.instanceId);
+  const selection = firstDetail.controls.selection;
+  assert.equal(firstDetail.identity.coordinatorSessionId, "coordinator");
+  assert.equal(firstDetail.workbrief.text, "original production WorkBrief");
+  assert.equal(firstDetail.activated.model, "pitako-local/fixture");
+  assert.equal(firstDetail.sdkRequest.model, "pitako-local/fixture");
+  assert.equal(firstDetail.sdkRequest.attemptId, firstDetail.selected.attemptId);
+  assert.equal(firstDetail.sdkRequest.sessionId, first.sessionId);
+  assert.equal(firstDetail.sdkRequest.historyId, first.historyId);
+  assert(view.list().items.some(row => row.id === handle.instanceId));
+  assert.deepEqual(view.observe(selection).workbrief, first.workbrief);
+  const historyList = await view.history({ action: "list" }, { instanceId: handle.instanceId });
+  assert(historyList.items.length > 0);
+  await assert.rejects(async () => view.history({ action: "read", historyId: first.historyId }), /acknowledgement/);
+  view.acknowledge("history");
+  await assert.rejects(async () => otherView.history({ action: "read", historyId: first.historyId }), /acknowledgement/);
+  const foreign = await view.history({ action: "read", historyId: history.historyId });
+  assert.equal(foreign.diagnostics[0].code, "history_outside_scope");
+  const broad = await view.history({ action: "list", scope: "all" });
+  assert.equal(broad.diagnostics[0].code, "history_outside_scope");
+  const coordinatorHistory = await view.history({ action: "read", historyId: first.historyId, source: "coordinator" });
+  assert.equal(coordinatorHistory.diagnostics[0].code, "history_outside_scope");
   assert.equal(first.workbrief.text, "original production WorkBrief");
   assert.throws(() => resolveLiveTarget(target, "wrong-owner"), /foreground owner/);
-  const query = await live.input({ historyId: first.historyId, sessionId: first.sessionId, intent: "query", text: "/not-a-command query" });
-  const steer = await live.input({ historyId: first.historyId, sessionId: first.sessionId, intent: "steer", text: "keep the WorkBrief" });
+  await assert.rejects(view.input({ ...selection, generation: selection.generation + 1 }, { intent: "query", text: "bad generation" }), /binding changed/);
+  await assert.rejects(view.input({ ...selection, coordinatorSessionId: "foreign" }, { intent: "steer", text: "bad parent" }), /stale controller/);
+  const query = await view.input(selection, { intent: "query", text: "/not-a-command query" });
+  const steer = await view.input(selection, { intent: "steer", text: "keep the WorkBrief" });
   assert.equal(query.status, "queued"); assert.equal(steer.status, "queued");
   workerReleased = true;
   releaseWorker.resolve();
   await replacementHeld.promise;
   const replacement = resolveLiveTarget(target, "coordinator");
   const second = replacement.observe();
+  await assert.rejects(view.input(selection, { intent: "steer", text: "stale controller replacement" }), /binding changed/);
+  assert.throws(() => view.cancel(selection), /binding changed/);
+  const secondDetail = view.detail(handle.instanceId);
+  assert.equal(secondDetail.selected.model, "pitako-local/replacement");
+  assert.equal(secondDetail.activated.model, "pitako-local/replacement");
+  assert.equal(secondDetail.sdkRequest.model, "pitako-local/replacement");
+  assert.notEqual(secondDetail.selected.attemptId, firstDetail.selected.attemptId);
+  assert.equal(secondDetail.sdkRequest.attemptId, secondDetail.selected.attemptId);
   assert.notEqual(second.sessionId, first.sessionId);
   assert.notEqual(second.historyId, first.historyId);
   const stale = await replacement.input({ historyId: first.historyId, sessionId: first.sessionId, intent: "query", text: "stale" });
@@ -309,6 +501,29 @@ try {
   assert.equal(next.status, "queued");
   releaseReplacement.resolve();
   await settled.promise;
+  await Promise.allSettled(sdkAttempts);
+  assert.equal(view.detail(handle.instanceId).controls.available, false);
+  await assert.rejects(view.input(secondDetail.controls.selection, { intent: "steer", text: "closed view mutation" }), /terminal/);
+  const scopedNative = await view.history({ action: "read", historyId: first.historyId }, { instanceId: handle.instanceId });
+  assert.equal(scopedNative.diagnostics[0].code, "sidecar_present_not_consulted");
+  const nativeFragments = scopedNative.items.map(item => Buffer.from(item.data, "base64"));
+  let nativeCursor = scopedNative.cursor;
+  while (nativeCursor) {
+    const page = await view.history({ action: "read", historyId: first.historyId, cursor: nativeCursor }, { instanceId: handle.instanceId });
+    assert.equal(page.diagnostics[0].code, "sidecar_present_not_consulted");
+    nativeFragments.push(...page.items.map(item => Buffer.from(item.data, "base64")));
+    nativeCursor = page.cursor;
+  }
+  const firstEntries = Buffer.concat(nativeFragments).toString().trim().split("\n").map(JSON.parse);
+  const markers = firstEntries.filter(entry => entry.type === "custom" && entry.customType === "pitako.worker-history" && entry.data.event === "interaction");
+  assert(markers.some(entry => entry.data.data.interactionId === query.interactionId && entry.data.data.status === "pending"));
+  assert(markers.some(entry => entry.data.data.interactionId === query.interactionId && entry.data.data.status === "queued"));
+  assert(!markers.some(entry => JSON.stringify(entry).includes("bad generation")));
+  observed.controller = { firstDetail, secondDetail, historyList, foreign, broad, coordinatorHistory, scopedNative, markers,
+    requestProvenance: view.requests(handle.instanceId), workerSettlement: sdkAttempts.length };
+  controller.revoke();
+  assert.throws(() => view.detail(handle.instanceId), /retired/);
+  await Promise.all([controller.settle(), view.close(), otherView.close()]);
   const closed = await replacement.input({ historyId: second.historyId, sessionId: second.sessionId, intent: "steer", text: "closed" });
   assert.equal(closed.status, "rejected");
   assert.throws(() => resolveLiveTarget(target, "coordinator"), /terminal|no native session binding/);
@@ -331,6 +546,9 @@ try {
     try { cancelWorker(backgroundId); } catch { /* successful case already cleared rows */ }
     await settled.promise;
   }
+  controller?.revoke();
+  await controller?.settle();
+  await Promise.allSettled(sdkAttempts);
   cancelAllWorkers(); clearBackgroundOwner();
   delete globalThis.__liveFixture;
   delete globalThis.__pitako_local;

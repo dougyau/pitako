@@ -38,6 +38,12 @@ export interface AgentUiSnapshot {
   agentUsage?: AgentUsage;
   /** Internal foreground lease; omitted for untagged AgentInstances. */
   teamOwnerToken?: symbol;
+  /** Admission provenance, not display-derived authority. */
+  origin?: import("./history.ts").HistoryOrigin;
+  attemptId?: string;
+  activated?: { attemptId: string; model: string; reasoning: string };
+  sdkRequests?: import("./run.ts").AgentRequestObservation[];
+  sdkRequestsDropped?: number;
 }
 
 const ROLE_ABBREV: Record<string, string> = {

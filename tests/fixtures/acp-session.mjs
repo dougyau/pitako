@@ -154,7 +154,10 @@ if (mode === "default") {
   assert.equal(new Set(paths).size, paths.length);
   const acpIndex = paths.indexOf(path.join(root, "extensions/acp.ts"));
   assert.ok(acpIndex >= 0 && acpIndex < paths.findIndex((entry) => entry.includes("/pi-hermes-memory/")));
-  assert.equal(paths.filter((entry) => entry.endsWith("/pi-codex-tools/index.ts")).length, 1);
+  assert.equal(paths.filter((entry) => entry.endsWith("/pi-codex-tools/index.ts")).length, 0);
+  const loaded = main.resourceLoader.getExtensions();
+  assert.equal(loaded.extensions.filter((extension) => extension.tools.has("apply_patch")).length, 1);
+  assert.equal(loaded.extensions.find((extension) => extension.tools.has("apply_patch")).resolvedPath, path.join(root, "extensions/index.ts"));
   await seed(main, "amber");
   await compress(main, "amber");
   const sessionFile = main.sessionFile;
@@ -248,7 +251,10 @@ if (mode === "default") {
       const paths = child.extensionRunner.getExtensionPaths();
       assert.equal(new Set(paths).size, paths.length);
       assert.equal(paths.filter((entry) => entry.endsWith("/extensions/acp.ts")).length, 1);
-      assert.equal(paths.filter((entry) => entry.endsWith("/pi-codex-tools/index.ts")).length, 1);
+      assert.equal(paths.filter((entry) => entry.endsWith("/pi-codex-tools/index.ts")).length, 0);
+      const loaded = child.resourceLoader.getExtensions();
+      assert.equal(loaded.extensions.filter((extension) => extension.tools.has("apply_patch")).length, 1);
+      assert.equal(loaded.extensions.find((extension) => extension.tools.has("apply_patch")).resolvedPath, path.join(root, "extensions/index.ts"));
       assert.equal(globalThis[Symbol.for("pitako.backgroundWorkers")].owner.token, parentOwner);
       assert.ok(child.sessionFile && existsSync(child.sessionFile));
       assert.equal(path.dirname(path.dirname(child.sessionFile)), path.join(agentDir, "sessions"));

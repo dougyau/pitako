@@ -75,6 +75,11 @@ export interface WatchdogSnapshot {
 }
 
 export interface AgentRequestObservation {
+  attemptId?: string;
+  historyId?: string;
+  sessionId?: string;
+  /** Actual SDK stream input, not provider-internal execution. */
+  sdkOptions?: { reasoning?: string; temperature?: number; maxTokens?: number; serviceTier?: string };
   model: string;
   provider?: string;
   requestId?: string;
@@ -147,6 +152,7 @@ export interface AttemptExecutor {
     onActivity?: (event: ActivityEvent) => void;
     /** Fired only after setModel / session open succeeds. Not a second lifecycle. */
     onActivated?: (appliedReasoning: string) => void;
+    onRequest?: (request: AgentRequestObservation) => void;
     /** Per attempt. Not stored on a shared executor. Pass undefined to clear. */
     bindActivityProbe?: (probe: (() => { name: string } | undefined) | undefined) => void;
     bindLive?: (handle: import("./live.ts").LiveHandle) => (() => void);
@@ -169,6 +175,7 @@ async function runAttempt(
     history?: InvocationHistory;
     onActivity?: (event: ActivityEvent) => void;
     onActivated?: (appliedReasoning: string) => void;
+    onRequest?: (request: AgentRequestObservation) => void;
     bindActivityProbe?: (probe: (() => { name: string } | undefined) | undefined) => void;
   },
 ): Promise<Attempt> {
@@ -274,15 +281,20 @@ export async function runAgentInstance(input: {
     },
     createdAt: new Date().toISOString(),
   };
+  const origin = input.historyOrigin ? structuredClone({ ...input.historyOrigin, workbrief: input.historyOrigin.workbrief ?? input.task }) : undefined;
   input.onAccepted?.(instance);
   const history = input.executor.capturesHistory
-    ? new InvocationHistory(instance.cwd, input.historyOrigin, input.task) : undefined;
+    ? new InvocationHistory(instance.cwd, origin, input.task) : undefined;
   const now = input.now ?? Date.now;
   const acceptedAt = now();
   const activity = createActivity(acceptedAt);
   const view: { usage?: AgentUsage; error?: string } = {};
   const throughput = createThroughput();
   const work: WorkCounts = { turns: 0, toolCalls: 0 };
+  let attemptId: string | undefined;
+  let activated: AgentUiSnapshot["activated"];
+  const sdkRequests: AgentRequestObservation[] = [];
+  let sdkRequestsDropped = 0;
   let lastStable = "";
   let terminalAt: number | undefined;
   const present = () => {
@@ -306,7 +318,8 @@ export async function runAgentInstance(input: {
   const observe = () => {
     if (!input.onObserve) return;
     try {
-      input.onObserve(observationOf(instance, task, activity, throughput, work, acceptedAt, terminalAt, now(), view.usage));
+      input.onObserve({ ...observationOf(instance, task, activity, throughput, work, acceptedAt, terminalAt, now(), view.usage),
+        origin, attemptId, activated, sdkRequests: sdkRequests.map(request => ({ ...request })), sdkRequestsDropped });
     } catch {
       // Observation must not change fallback, cancellation, or stall behavior.
     }
@@ -365,6 +378,13 @@ export async function runAgentInstance(input: {
   };
   const onActivated = (appliedReasoning: string) => {
     instance.model.appliedReasoning = appliedReasoning;
+    activated = { attemptId: attemptId!, model: instance.model.selectedModel, reasoning: appliedReasoning };
+    refresh();
+  };
+  const onRequest = (request: AgentRequestObservation) => {
+    request.attemptId = attemptId;
+    sdkRequests.push(request);
+    if (sdkRequests.length > 50) { sdkRequests.shift(); sdkRequestsDropped++; }
     refresh();
   };
   refresh();
@@ -383,6 +403,8 @@ export async function runAgentInstance(input: {
         () => stall,
         onActivity,
         onActivated,
+        onRequest,
+        (index) => { attemptId = `${instance.id}:${index + 1}`; activated = undefined; },
         refresh,
         view,
         bindActivityProbe,
@@ -419,6 +441,8 @@ async function executeTargets(
   stalled: () => StallInfo | undefined,
   onActivity: (event: ActivityEvent) => void,
   onActivated: (appliedReasoning: string) => void,
+  onRequest: (request: AgentRequestObservation) => void,
+  onAttempt: (index: number) => void,
   present: () => void,
   view: { usage?: AgentUsage; error?: string },
   bindActivityProbe: (probe: (() => { name: string } | undefined) | undefined) => void,
@@ -455,6 +479,7 @@ async function executeTargets(
       if (index > 0) noteActivity(activity, "fallback", now());
       noteActivity(activity, "prompt", now());
       const target = targets[index]!;
+      onAttempt(index);
       instance.model = provenance(instance, target, index);
       resetThroughput(throughput);
       view.error = undefined;
@@ -468,6 +493,7 @@ async function executeTargets(
         signal,
         onActivity,
         onActivated,
+        onRequest,
         bindActivityProbe,
         history,
       });

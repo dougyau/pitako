@@ -3,7 +3,7 @@ import { skillStatusLines } from "./catalog.ts";
 import { PitakoConfigError } from "./errors.ts";
 import { isProtectedEditPath } from "./paths.ts";
 import { canonicalPath } from "./board/paths.ts";
-import { bindBackgroundOwner, shutdownBackground, takeHeldCompletions } from "./agent/background.ts";
+import { bindBackgroundOwner, revokeBackgroundOwner, shutdownBackground, takeHeldCompletions } from "./agent/background.ts";
 import { beginTeamEvaluation, retireTeamEvaluation, teamEvaluationForSession, teamAssignments, type TeamEvaluation } from "./team.ts";
 import { teamWorkerStatus } from "./agent/background.ts";
 import { bindAgentUi, listObservations, unbindAgentUi } from "./agent/observe.ts";
@@ -25,7 +25,12 @@ import { parseHistoryCommand, queryHistory } from "./agent/history-query.ts";
 import { WorkerHistory } from "./agent/history.ts";
 import { pruneWorkerHistory } from "./agent/history-retention.ts";
 import { loadPitakoConfig } from "./roles/load.ts";
-import { settlePendingDispatches } from "./agent/dispatch.ts";
+import { closeDispatchAdmissions, settlePendingDispatches } from "./agent/dispatch.ts";
+import { createAgentController } from "./agent/controller.ts";
+import { openAgentScreen } from "./agent/screen.ts";
+import { createPaneSession } from "./herdr/agents-ui/session.ts";
+import { readHerdrPresence } from "./herdr/presence.ts";
+import { registerCodexTools } from "./codex.ts";
 
 const foregroundCodeUsage = new Map<string, CodeIntelligenceUsage>();
 const foregroundToolStarts = new Map<string, Map<string, { name: string; startedAt: number }>>();
@@ -127,6 +132,8 @@ export default function pitako(pi: ExtensionAPI) {
   // Fail during extension load so Pi surfaces a configuration error at startup.
   prepareRuntime(root);
 
+  const startCodex = registerCodexTools(pi);
+
   pi.registerFlag("pitako-profile", {
     description: 'Pitako profile: "coding" (default) or "analysis"',
     type: "string",
@@ -139,84 +146,131 @@ export default function pitako(pi: ExtensionAPI) {
   let ownerToken = Symbol("pitako.foreground");
   let agentUiBindingToken: symbol | undefined;
   let teamEvaluation: TeamEvaluation | undefined;
+  let agentController: ReturnType<typeof createAgentController> | undefined;
+  let agentPane: ReturnType<typeof createPaneSession> | undefined;
+  let foregroundRevision = 0;
 
-  pi.on("session_start", async (_event, ctx) => {
-    await settlePendingDispatches(teamEvaluation?.sessionId ?? ctx.sessionManager?.getSessionId());
-    const sessionId = ctx.sessionManager?.getSessionId();
-    if (foregroundSession(sessionId)) {
-      // Cooperative history maintenance never waits for or cancels a worker.
+  const revokeForeground = () => {
+    ++foregroundRevision;
+    const retired = { controller: agentController, pane: agentPane, token: ownerToken, evaluation: teamEvaluation };
+    retired.controller?.revoke();
+    retired.pane?.revoke();
+    revokeBackgroundOwner(retired.token);
+    agentController = undefined;
+    agentPane = undefined;
+    if (agentUiBindingToken) unbindAgentUi(agentUiBindingToken);
+    agentUiBindingToken = undefined;
+    return retired;
+  };
+
+  pi.on("session_start", async (event, ctx) => {
+    const retired = revokeForeground();
+    const revision = foregroundRevision;
+    const reopenDispatches = closeDispatchAdmissions(retired.evaluation?.sessionId ?? ctx.sessionManager?.getSessionId());
+    let upstreamFailure: { error: unknown } | undefined;
+    try {
       try {
-        const result = await pruneWorkerHistory(new WorkerHistory(undefined, { initialize: false }), loadPitakoConfig({ cwd: ctx.cwd }).workerHistory.ttlDays);
-        const failures = result.groups.filter((group) => group.state === "failed");
-        if (failures.length) {
-          const message = `Worker history maintenance failed: ${JSON.stringify(failures)}`;
+        await startCodex(event, ctx);
+      } catch (error) {
+        upstreamFailure = { error };
+      }
+      await settlePendingDispatches(retired.evaluation?.sessionId ?? ctx.sessionManager?.getSessionId());
+      await retired.controller?.settle();
+      await retired.pane?.close();
+      retireTeamEvaluation(retired.evaluation);
+      shutdownBackground(retired.token);
+      if (revision !== foregroundRevision) return;
+      const sessionId = ctx.sessionManager?.getSessionId();
+      if (foregroundSession(sessionId)) {
+        // Cooperative history maintenance never waits for or cancels a worker.
+        try {
+          const result = await pruneWorkerHistory(new WorkerHistory(undefined, { initialize: false }), loadPitakoConfig({ cwd: ctx.cwd }).workerHistory.ttlDays);
+          const failures = result.groups.filter((group) => group.state === "failed");
+          if (failures.length) {
+            const message = `Worker history maintenance failed: ${JSON.stringify(failures)}`;
+            if (ctx.hasUI) ctx.ui.notify(message, "error"); else console.error(message);
+          }
+        } catch (error) {
+          const message = `Worker history maintenance failed: ${String(error)}`;
           if (ctx.hasUI) ctx.ui.notify(message, "error"); else console.error(message);
         }
-      } catch (error) {
-        const message = `Worker history maintenance failed: ${String(error)}`;
-        if (ctx.hasUI) ctx.ui.notify(message, "error"); else console.error(message);
-      }
-      for (const previous of foregroundCodeUsage.keys()) {
-        if (previous !== sessionId) {
-          foregroundCodeUsage.delete(previous);
-          foregroundToolStarts.delete(previous);
-          foregroundNavigation.delete(previous);
+        if (revision !== foregroundRevision) return;
+        for (const previous of foregroundCodeUsage.keys()) {
+          if (previous !== sessionId) {
+            foregroundCodeUsage.delete(previous);
+            foregroundToolStarts.delete(previous);
+            foregroundNavigation.delete(previous);
+          }
         }
+        foregroundCodeUsage.set(sessionId, emptyCodeIntelligenceUsage());
+        foregroundToolStarts.set(sessionId, new Map());
+        foregroundNavigation.set(sessionId, { remaining: 0 });
       }
-      foregroundCodeUsage.set(sessionId, emptyCodeIntelligenceUsage());
-      foregroundToolStarts.set(sessionId, new Map());
-      foregroundNavigation.set(sessionId, { remaining: 0 });
-    }
-    if (teamEvaluation && teamEvaluation.sessionId !== sessionId) retireTeamEvaluation(teamEvaluation);
-    ownerToken = Symbol("pitako.foreground");
-    teamEvaluation = beginTeamEvaluation(
-      sessionId,
-      isChildSession(ctx),
-      ownerToken,
-    );
-    registerSupervisedSession(sessionId, process.env, pi, ctx.model);
-    if (!isChildSession(ctx) && typeof ctx.isIdle === "function") {
-      bindBackgroundOwner({
-        token: ownerToken,
-        isIdle: () => ctx.isIdle(),
-        hasUI: ctx.hasUI,
-        notify: (message) => {
-          if (ctx.hasUI) ctx.ui.notify(message, "info");
-        },
-        sendMessage: (content) => {
-          pi.sendMessage(
-            {
-              customType: "pitako.worker",
-              content,
-              display: true,
-              details: { source: "pitako.worker" },
-            },
-            { deliverAs: "followUp", triggerTurn: true },
-          );
-        },
-      });
-    }
-    try {
-      profile = isChildSession(ctx) ? "coding" : requestedProfile(pi);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (ctx.hasUI) ctx.ui.notify(message, "error");
-      throw error;
-    }
-    applyProfile(pi, profile, ctx);
-    const entries = ctx.sessionManager?.getEntries?.() ?? [];
-    const existingUserText = firstUserText(entries);
-    const invocation = latestPlanInvocation(entries);
-    const workflow = invocation && readWorkflowTitle(invocation.activity, invocation.id, ctx.cwd);
-    const action = sessionNameAction({ current: pi.getSessionName(), existingUserText, workflow });
-    if (action.set !== undefined) pi.setSessionName(action.set);
-    if (ctx.hasUI) {
-      ctx.ui.setStatus("pitako", pi.getSessionName() || undefined);
-      agentUiBindingToken = bindAgentUi({
+      if (teamEvaluation && teamEvaluation.sessionId !== sessionId) retireTeamEvaluation(teamEvaluation);
+      ownerToken = Symbol("pitako.foreground");
+      teamEvaluation = beginTeamEvaluation(
+        sessionId,
+        isChildSession(ctx),
         ownerToken,
-        setStatus: (key, text) => ctx.ui.setStatus(key, text),
-        modelLookup: (provider, id) => ctx.modelRegistry?.find(provider, id),
-      });
+      );
+      if (!isChildSession(ctx) && sessionId) {
+        const token = ownerToken;
+        agentController = createAgentController({ sessionId, token }, () => {
+          const currentId = ctx.sessionManager?.getSessionId();
+          return currentId ? { sessionId: currentId, token: ownerToken } : undefined;
+        });
+        agentPane = createPaneSession(agentController, readHerdrPresence(), path.join(packageRoot(), "extensions/herdr/agents-ui"));
+      }
+      registerSupervisedSession(sessionId, process.env, pi, ctx.model);
+      if (!isChildSession(ctx) && typeof ctx.isIdle === "function") {
+        bindBackgroundOwner({
+          token: ownerToken,
+          isIdle: () => ctx.isIdle(),
+          hasUI: ctx.hasUI,
+          notify: (message) => {
+            if (ctx.hasUI) ctx.ui.notify(message, "info");
+          },
+          sendMessage: (content) => {
+            pi.sendMessage(
+              {
+                customType: "pitako.worker",
+                content,
+                display: true,
+                details: { source: "pitako.worker" },
+              },
+              { deliverAs: "followUp", triggerTurn: true },
+            );
+          },
+        });
+      }
+      try {
+        profile = isChildSession(ctx) ? "coding" : requestedProfile(pi);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (ctx.hasUI) ctx.ui.notify(message, "error");
+        throw error;
+      }
+      applyProfile(pi, profile, ctx);
+      const entries = ctx.sessionManager?.getEntries?.() ?? [];
+      const existingUserText = firstUserText(entries);
+      const invocation = latestPlanInvocation(entries);
+      const workflow = invocation && readWorkflowTitle(invocation.activity, invocation.id, ctx.cwd);
+      const action = sessionNameAction({ current: pi.getSessionName(), existingUserText, workflow });
+      if (action.set !== undefined) pi.setSessionName(action.set);
+      if (ctx.hasUI) {
+        ctx.ui.setStatus("pitako", pi.getSessionName() || undefined);
+        agentUiBindingToken = bindAgentUi({
+          ownerToken,
+          coordinatorSessionId: sessionId,
+          setStatus: (key, text) => ctx.ui.setStatus(key, text),
+          modelLookup: (provider, id) => ctx.modelRegistry?.find(provider, id),
+        });
+      }
+    } finally {
+      reopenDispatches();
+      // Upstream failure must not skip retirement, profile reconciliation, or
+      // the revision fence, but remains visible to Pi under this extension.
+      if (upstreamFailure) throw upstreamFailure.error;
     }
   });
 
@@ -225,18 +279,20 @@ export default function pitako(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (event, ctx) => {
-    await settlePendingDispatches(teamEvaluation?.sessionId ?? ctx.sessionManager?.getSessionId());
+    const retired = revokeForeground();
+    const revision = foregroundRevision;
+    await settlePendingDispatches(retired.evaluation?.sessionId ?? ctx.sessionManager?.getSessionId());
+    await retired.controller?.settle();
+    await retired.pane?.close();
     const sessionId = ctx.sessionManager?.getSessionId();
     if (foregroundSession(sessionId)) {
       foregroundCodeUsage.delete(sessionId);
       foregroundToolStarts.delete(sessionId);
       foregroundNavigation.delete(sessionId);
     }
-    if (agentUiBindingToken) unbindAgentUi(agentUiBindingToken);
-    agentUiBindingToken = undefined;
-    retireTeamEvaluation(teamEvaluation);
-    shutdownBackground(ownerToken);
-    unregisterSupervisedSession();
+    retireTeamEvaluation(retired.evaluation);
+    shutdownBackground(retired.token);
+    if (revision === foregroundRevision) unregisterSupervisedSession();
   });
 
   const flush = () => {
@@ -334,15 +390,39 @@ export default function pitako(pi: ExtensionAPI) {
         return;
       }
       if (command === "agents") {
+        if (isChildSession(ctx)) { notify(ctx, "agents cannot be called from an AgentInstance", "error"); return; }
         try {
-          let rows = listObservations();
+          const agentArgs = args.trim().slice("agents".length).trim();
+          if (agentArgs.split(/\s+/)[0] === "pane") {
+            if (!ctx.hasUI || ctx.mode !== "tui") throw new Error("Agent pane requires an interactive foreground Pi terminal");
+            if (!agentPane) throw new Error("Agent pane controller unavailable");
+            const args = agentArgs.split(/\s+/).slice(1);
+            if (args.length === 1 && args[0] === "close") await agentPane.close();
+            else {
+              if (new Set(args).size !== args.length || args.some(arg => arg !== "--control" && arg !== "--raw-history"))
+                throw new Error("Use /pitako agents pane [--control] [--raw-history] or /pitako agents pane close");
+              await agentPane.launch({ control: args.includes("--control"), rawHistory: args.includes("--raw-history") });
+            }
+            return;
+          }
+          if (ctx.hasUI && ctx.mode === "tui") {
+            if (!agentController) throw new Error("Agent controller unavailable for this foreground session");
+            await openAgentScreen(ctx, agentController, value);
+            return;
+          }
+          const coordinator = ctx.sessionManager?.getSessionId();
+          let rows = coordinator ? listObservations(undefined, coordinator) : [];
           if (value) {
             const one = rows.find((row) => row.id === value);
             if (!one) throw new Error(`unknown worker ${value}`);
             rows = [one];
           }
-          const detail = formatAgentsDetail(rows, Date.now());
-          notify(ctx, detail.length === 0 ? "no workers" : detail);
+          const detail = formatAgentsDetail(rows.slice(0, 50), Date.now());
+          const bytes = Buffer.from(detail);
+          const text = detail.length === 0 ? "no workers" : bytes.subarray(0, 30 * 1024).toString("utf8") +
+            (rows.length > 50 || bytes.length > 30 * 1024 ? "\n[clipped; use screen pages]" : "");
+          if (ctx.hasUI) notify(ctx, text);
+          else console.log(text);
         } catch (error) {
           notify(ctx, error instanceof Error ? error.message : String(error), "error");
         }
@@ -350,7 +430,8 @@ export default function pitako(pi: ExtensionAPI) {
       }
       if (command === "stats") {
         try {
-          const rows = listObservations(teamEvaluation?.token);
+          const coordinator = ctx.sessionManager?.getSessionId();
+          const rows = coordinator ? listObservations(teamEvaluation?.token, coordinator) : [];
           if (value) {
             const row = rows.find((item) => item.id === value);
             if (!row) throw new Error(`unknown instance ${value}`);

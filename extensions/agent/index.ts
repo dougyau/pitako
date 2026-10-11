@@ -15,7 +15,6 @@ import {
   teamWorkerResult,
   teamWorkerHasOutcome,
   cancelTeamWorker,
-  resolveLiveTarget,
 } from "./background.ts";
 import { listObservations, noteResultTaken, observationEpoch, publishObservation } from "./observe.ts";
 import { currentInstanceId } from "./scope.ts";
@@ -32,6 +31,7 @@ import { queryHistory } from "./history-query.ts";
 import { executionForSession } from "../execution-identity.ts";
 import { developerPreflight } from "./routing.ts";
 import { ownedDispatch, settlePendingDispatches } from "./dispatch.ts";
+import { resolveOwnedLive } from "./owner.ts";
 
 const noExtra = { additionalProperties: false } as const;
 
@@ -67,10 +67,7 @@ export default function agentInstance(pi: ExtensionAPI): void {
     Type.Object({ kind: Type.Literal("team"), assignmentId: Type.String({ maxLength: 256 }) }, noExtra),
   ]);
   const liveFor = (target: import("./background.ts").LiveTarget, ctx: { sessionManager?: { getSessionId?: () => string | undefined } }) => {
-    const sessionId = ctx.sessionManager?.getSessionId?.();
-    if (currentInstanceId() || process.env.PITAKO_INSTANCE_ID || executionForSession(sessionId)) throw new Error("live control cannot be called from an AgentInstance");
-    const evaluation = target.kind === "team" ? teamEvaluationForSession(sessionId, false) : undefined;
-    return resolveLiveTarget(target, sessionId, evaluation?.token);
+    return resolveOwnedLive(target, ctx.sessionManager?.getSessionId?.()).handle;
   };
   pi.registerTool({
     name: "agent_observe", label: "Observe live worker",
@@ -353,7 +350,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
           const row = selected ?? assignment ?? last;
           if (!row) return { role, status: "idle" };
           const view = teamWorkerStatus(evaluation.token, row.instanceId)[0];
-          const observation = listObservations(evaluation.token).find((item) => item.id === row.instanceId);
+          const observation = listObservations(evaluation.token, evaluation.sessionId).find((item) => item.id === row.instanceId);
           return {
             role,
             assignmentId: row.id,

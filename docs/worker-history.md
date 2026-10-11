@@ -93,6 +93,97 @@ answer mentions the interaction ID, but the host does not judge its adequacy.
 Subsequent activity must establish correction. Optional `decisionId` links a
 coordinator decision without turning it into authorization or result acceptance.
 
+## Native agent screen
+
+In Pi's interactive terminal, `/pitako agents` opens the scoped worker list.
+`/pitako agents INSTANCE_ID` opens that exact worker; unknown IDs remain errors.
+Enter opens detail, and Esc backs out of a form or detail before closing the screen.
+Closing does not cancel workers. Pi retains its own terminal, footer and status.
+RPC/print callers receive bounded text; child callers cannot inspect the parent.
+
+Detail keys `1`–`5` select Brief, Activity, Identity & route, Receipts and Native history.
+Arrow keys and Page Up/Down scroll; `n` fetches the next page, `p` restarts the current
+section's pages, and `r` refreshes. Live detail refreshes at most once a second.
+The original WorkBrief is separate from a Team wrapper. Selected/requested,
+activated and observed SDK request facts remain separate; unknown is not inferred.
+Route probabilities are displayed as captured, without rerouting or rounding.
+
+`q` opens a context query and `s` opens in-scope steering. Both accept text, not
+commands. Input receipts retain their qualified meanings above. `c` requires
+typing `yes` and reports a cancellation request, not settled completion.
+Unavailable controls report the native/owner reason.
+
+Native history first lists worker metadata. Use `j`/`k` to select a history and Enter
+to acknowledge sensitive raw content with `yes`. In Identity & route, `a` requests
+the analogous raw-route acknowledgment. Consent belongs to this view, not future
+views. Only the current bounded page is retained; there is no background history
+stream or transcript cache. Native reads retain physical ordering, branches,
+partial-entry and external-artifact limitations. Activity is coalesced event
+evidence, not a persistence claim. Without a live binding, Activity explicitly
+reports the gap; acknowledged native history remains the transcript authority.
+
+## Optional Herdr pane
+
+The optional target is Linux, Herdr **0.9.3**, Bun **1.4.2**, and the compatible
+declared Pi peers (tested with **1.0.4**). Install Pitako and its declared peers in
+a conventional `node_modules` tree, not via a checkout/Pi alias fallback. For
+example, with an existing installation rooted at `/absolute/installation`:
+
+```sh
+herdr plugin link /absolute/installation/node_modules/pitako/extensions/herdr/agents-ui
+```
+
+That is the **installed package's plugin directory**, not the project cwd or
+the package root. Its entrypoint runs Bun from this directory and resolves
+`@earendil-works/pi-tui` and other declared peers through the conventional tree.
+Herdr and Bun must already be on PATH (or the existing Herdr presence must supply
+its executable). Run foreground Pi inside the existing Herdr session. Missing
+Herdr, plugin, executable or peer prerequisites produce errors; Pitako does not
+install them or start a Herdr server.
+
+```text
+/pitako agents pane
+/pitako agents pane --control
+/pitako agents pane --control --raw-history
+/pitako agents pane close
+```
+
+Default access is read-only. `--control` grants context query, in-scope steering
+and cancellation requests; it is not completion or authorization from a human.
+`--raw-history` grants sensitive native history and raw route reads, still requiring
+acknowledgment in each view. Either flag may be used independently. Ordinary local
+Pi screen authority is unchanged. Repeat with identical flags focuses only the
+exact owned returned panel. Changing flags requires explicit close/reopen; client
+requests cannot upgrade server-owned grants. Close only targets that owned panel,
+including an already gracefully exited panel, and never cancels workers.
+
+Only this explicit interactive foreground command starts the private Unix broker.
+Imports, status, child, RPC and Pi-only paths do not start sockets or terminals.
+The coordinator captures its Herdr caller/socket, never the currently focused pane.
+Launch targets that caller with a right split and no focus. The pane receives only
+an absolute descriptor path, not prompts, history or a capability in argv/env/title.
+The random runtime directory is mode 0700; descriptor and socket are mode 0600.
+The bounded owned descriptor carries a 256-bit capability and owner epoch. This
+protects against cross-binding/other users, not hostile same-UID processes or root.
+Files and displayed/raw content remain sensitive; permissions do not redact them.
+
+Disconnect retains labeled stale data (owner, last reply time) and disables controls.
+An admitted mutation whose acknowledgment is lost has an **unknown outcome**:
+neither rejection nor delivery/answer confirmation. Nothing reconnects, retries or
+replays automatically. `R` explicitly reconnects to the unchanged descriptor and
+reobserves current identities; markers may clarify an outcome, but their absence
+is not non-delivery. Retired owners, changed descriptors and restarted epochs require
+a new launch, not reuse of stale native selections. There is no exactly-once log.
+
+Frames are bounded to 64KiB, list pages to 50 rows/32KiB, input to 16KiB, and native
+history, original brief, route and SDK provenance use bounded on-demand pages.
+There is one outstanding request per connection and no outbound transcript stream.
+Pane closure settles its screen/read work and restores its own terminal, not Pi's.
+Foreground restart/shutdown revokes authority before its first await; accepted
+controller, broker and launcher work joins before private files are removed. Failed
+launcher settlement retains diagnostics. A disconnected pane can remain visible but
+has no authority. Worker settlement and history persistence remain separate facts.
+
 ## Persistence and gaps
 
 Catalogs live in `<agentDir>/pitako/worker-history`. Ad-hoc native sessions live

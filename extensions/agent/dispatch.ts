@@ -12,9 +12,22 @@ function closing(): Map<string | undefined, number> {
   return host[CLOSING] ??= new Map();
 }
 
+/** Hold admission closed across lifecycle awaits; nested transitions own separate leases. */
+export function closeDispatchAdmissions(sessionId?: string): () => void {
+  closing().set(sessionId, (closing().get(sessionId) ?? 0) + 1);
+  for (const [controller, work] of pending()) {
+    if (sessionId === undefined || work.sessionId === sessionId) controller.abort();
+  }
+  return () => {
+    const remaining = closing().get(sessionId)! - 1;
+    if (remaining) closing().set(sessionId, remaining);
+    else closing().delete(sessionId);
+  };
+}
+
 /** Transitions wait for the actual admission work, including callbacks and rollback. */
 export async function settlePendingDispatches(sessionId?: string): Promise<void> {
-  closing().set(sessionId, (closing().get(sessionId) ?? 0) + 1);
+  const reopen = closeDispatchAdmissions(sessionId);
   try {
     for (;;) {
       const work = [...pending()].filter(([, work]) => sessionId === undefined || work.sessionId === sessionId);
@@ -23,9 +36,7 @@ export async function settlePendingDispatches(sessionId?: string): Promise<void>
       await Promise.allSettled(work.map(([, work]) => work.operation));
     }
   } finally {
-    const remaining = closing().get(sessionId)! - 1;
-    if (remaining) closing().set(sessionId, remaining);
-    else closing().delete(sessionId);
+    reopen();
   }
 }
 

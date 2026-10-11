@@ -1,3 +1,4 @@
+import "./fixtures/offline.ts";
 import { agentFixtureOwnership } from "./fixtures/agent-fixture-ownership.ts";
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { execFileSync } from "node:child_process";
@@ -396,6 +397,7 @@ describe("Team T1 ownership", () => {
       task: "Inspect lease", acceptedAt: Date.now() - 2500, selectedModel: "example/model",
       appliedReasoning: "high", lastActivityKind: "tool", activeTool: { name: "grep", startedAt: Date.now() - 500 },
       teamOwnerToken: current.token,
+      origin: { source: "team_assign", coordinatorSessionId: current.sessionId, assignmentId: developer!.id, workbrief: "Inspect lease\nsecond line" },
     });
     const devStatus = (await invoke("team_status", {})).details as any;
     expect(devStatus.roles[1]).toMatchObject({

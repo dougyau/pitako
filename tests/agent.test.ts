@@ -1,3 +1,4 @@
+import "./fixtures/offline.ts";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { agentFixtureOwnership } from "./fixtures/agent-fixture-ownership.ts";
 import { tmpdir } from "node:os";
@@ -808,6 +809,7 @@ reasoning = "medium"
     expect(registeredToolNames(loaded.extensions)).toContain("board_post");
     expect(registeredToolNames(loaded.extensions)).toContain("todo");
 
+    const startup: Array<(event: unknown, ctx: { hasUI: boolean; ui: { notify(): void; setStatus(): void } }) => Promise<void>> = [];
     const tools = new Map<string, { execute: Function }>();
     const active: string[] = [];
     const pi = {
@@ -819,11 +821,7 @@ reasoning = "medium"
         return undefined;
       },
       on(event: string, handler: (event: unknown, ctx: { hasUI: boolean; ui: { notify(): void; setStatus(): void } }) => Promise<void>) {
-        if (event === "session_start") {
-          void agentScope.run({ instanceId: "architect-test" }, () =>
-            handler({}, { hasUI: false, ui: { notify() {}, setStatus() {} } }),
-          );
-        }
+        if (event === "session_start") startup.push(handler);
       },
       registerCommand() {},
       getActiveTools() {
@@ -842,6 +840,9 @@ reasoning = "medium"
     };
     pitako(pi as unknown as ExtensionAPI);
     agentInstance(pi as unknown as ExtensionAPI);
+    await agentScope.run({ instanceId: "architect-test" }, async () => {
+      for (const handler of startup) await handler({}, { hasUI: false, ui: { notify() {}, setStatus() {} } });
+    });
     expect(active.includes("agent_run")).toBe(false);
     expect(active.includes("agent_supervise")).toBe(false);
     expect(active.includes("agent_observe")).toBe(false);
