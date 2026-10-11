@@ -38,6 +38,7 @@ Disable Ponytail, Caveman, or any individual skill with `pi config` or package s
 - `agent_run` for one synchronous in-process AgentInstance. It does not start a team.
 - `agent_spawn` for one background in-process AgentInstance. The Coordinator stays available. `agent_status`, `agent_result`, and `agent_cancel` inspect that worker. `/pitako agents [instance-id]` opens the native list/detail screen in Pi's terminal and retains bounded text in non-TUI modes. See [the screen controls](docs/worker-history.md#native-agent-screen).
 - Foreground `agent_observe` and `agent_input` for bounded observation, context queries, and in-scope steering of exact active background or Team targets. Input waits for a later native boundary and never interrupts a command. A receipt is not an answer. See [worker history and input](docs/worker-history.md).
+- An opt-in local agent bridge for foreground native RPC hosts. Its passive Node client provides non-consuming reads, change hints, and explicitly granted worker controls. See [Agent bridge host reference](docs/agent-bridge.md) for launch flags, permissions, receipts, and reconnect limits.
 - `agent_supervise` for one synchronous visible sibling pane. It does not run in the background or join the Team roster.
 - `team_assign`, `team_status`, `team_result`, and `team_cancel` for independent foreground Team assignments, with one active assignment per role.
 - `$plan` and `$execute`. Planning stops at `PLAN_FROZEN`. Execution is a separate invocation. Neither calls Herdr.

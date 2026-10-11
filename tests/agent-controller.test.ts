@@ -1,5 +1,5 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createAgentController } from "../extensions/agent/controller.ts";
@@ -15,6 +15,8 @@ import pitako from "../extensions/index.ts";
 import agentInstance from "../extensions/agent/index.ts";
 import * as controllerModule from "../extensions/agent/controller.ts";
 import * as codexModule from "../extensions/codex.ts";
+import * as bridgeModule from "../extensions/agent/bridge/broker.ts";
+import { connect } from "../extensions/agent/bridge/client.js";
 import { createAgentSession, DefaultResourceLoader, ExtensionRunner, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 
 const fixture = agentFixtureOwnership();
@@ -42,6 +44,156 @@ function setup(sessionId = "coordinator") {
   bindBackgroundOwner({ token, isIdle: () => false, hasUI: false, notify() {}, sendMessage() {} });
   const controller = createAgentController(owner, () => owner);
   return { root, owner, controller, load: { userConfigPath: config, env: { PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR } } };
+}
+
+for (const mode of ["replacement", "shutdown", "captured-failure"] as const) {
+test(`packaged ${mode} fences admitted bridge mutations throughout held retirement`, fixture.ownedCase(`bridge ${mode}`, async () => {
+  const { root, load } = setup();
+  process.env.PI_OFFLINE = "1";
+  const bridgeRoot = path.join(root, "bridge");
+  mkdirSync(bridgeRoot, { mode: 0o700 });
+  const descriptor = path.join(bridgeRoot, "descriptor.json");
+  const extensions: Array<{ handlers: Map<string, Function[]> }> = [];
+  let failNext = false, activeTools = ["read", "edit", "write"];
+  const pi = { registerFlag() {}, registerCommand() {}, registerTool() {},
+    on(name: string, handler: Function) {
+      const handlers = extensions.at(-1)!.handlers;
+      handlers.set(name, [...handlers.get(name) ?? [], handler]);
+    },
+    getFlag(name: string) { return name === "pitako-agent-bridge" ? bridgeRoot :
+      name === "pitako-agent-bridge-grants" ? "control" : undefined; },
+    getAllTools() { return ["read", "edit", "write", "apply_patch"].map(name => ({ name })); },
+    getActiveTools() {
+      if (failNext) { failNext = false; throw Error("fixture captured upstream failed"); }
+      return activeTools;
+    },
+    setActiveTools(tools: string[]) { activeTools = tools; }, getSessionName() { return "pitako:coding"; },
+    setSessionName() {}, sendMessage() {} };
+  const ctx = { cwd: root, hasUI: false, mode: "rpc", isIdle: () => true,
+    model: { api: "openai-responses", compat: { supportsOpenAIGrammarTools: true } },
+    sessionManager: { getSessionId: () => "coordinator", getEntries: () => [] },
+    ui: { notify() {}, setStatus() {} } };
+  const controllers: ReturnType<typeof createAgentController>[] = [];
+  const originalController = controllerModule.createAgentController, originalBridge = bridgeModule.createAgentBridge;
+  const controllerCapture = spyOn(controllerModule, "createAgentController").mockImplementation((...args) => {
+    const controller = originalController(...args); controllers.push(controller); return controller;
+  });
+  let bridgeStarts = 0;
+  const bridgeCapture = spyOn(bridgeModule, "createAgentBridge").mockImplementation((...args) => {
+    bridgeStarts++; return originalBridge(...args);
+  });
+  const factories = new Map([["./extensions/index.ts", pitako], ["./extensions/agent/index.ts", agentInstance]]);
+  for (const entry of JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).pi.extensions) {
+    const factory = factories.get(entry);
+    if (factory) { extensions.push({ handlers: new Map() }); factory(pi as never); }
+  }
+  const runner = new ExtensionRunner(extensions as never, {} as never, root, ctx.sessionManager as never, {} as never);
+  const context = spyOn(runner as unknown as { createContext(): typeof ctx }, "createContext").mockReturnValue(ctx);
+  const errors: unknown[] = [];
+  runner.onError(error => errors.push(error));
+  const start = () => runner.emit({ type: "session_start", reason: "startup" });
+  let release!: () => void, transition: Promise<unknown> | undefined, dispatch: Promise<unknown> | undefined;
+  let observing = false, observer: Promise<void> | undefined;
+  let client: Awaited<ReturnType<typeof connect>> | undefined, view: ReturnType<ReturnType<typeof originalController>["openView"]>;
+  let attempts = 0, admissions = 0, effects = 0, finishWorker!: (value: Attempt) => void, releaseInput!: () => void;
+  let inputStarted!: () => void, acceptedInput: Promise<unknown> | undefined;
+  const inputStart = new Promise<void>(resolve => { inputStarted = resolve; });
+  const inputHold = new Promise<void>(resolve => { releaseInput = resolve; });
+  try {
+    await start();
+    expect(bridgeStarts).toBe(1);
+    view = controllers.at(-1)!.openView();
+    client = await connect(descriptor, { expectedSessionId: "coordinator" });
+    let started!: () => void;
+    const startedWorker = new Promise<void>(resolve => { started = resolve; });
+    const attempt = fixture.pendingAttempt(resolve => { finishWorker = resolve; });
+    const worker = await spawnBackground({ roleId: "researcher", task: "packaged admitted bridge input", cwd: root, load,
+      historyOrigin: { source: "agent_spawn", coordinatorSessionId: "coordinator" },
+      executor: { capturesHistory: true, async start(input) {
+        const history = input.history!.admit(input.instanceId, input.role.id, input.target), manager = history.create();
+        const live = createLiveHandle({ sessionManager: manager, sessionId: manager.getSessionId(), sessionFile: manager.getSessionFile(),
+          async steer() { effects++; inputStarted(); await inputHold; return "handled"; } }, history);
+        live.open(); const unbind = input.bindLive!(live.handle); started();
+        const outcome = await attempt;
+        await live.settle(); await live.handle.close(); unbind(); history.result(outcome); history.disposition(); return outcome;
+      } } });
+    await startedWorker;
+    const selection = view.detail(worker.instanceId).controls.selection!;
+    await client.grant("control", true, selection);
+    const lease = client.lease;
+    acceptedInput = client.input(selection, { intent: "query", text: "one admitted mutation" }, 1).catch(error => error);
+    await inputStart;
+    expect(effects).toBe(1);
+    const hold = new Promise<void>(resolve => { release = resolve; });
+    dispatch = ownedDispatch(ctx as never, undefined, () => true, async () => hold);
+    await Promise.resolve();
+    observing = true;
+    observer = (async () => {
+      while (observing) {
+        if (existsSync(descriptor)) {
+          attempts++;
+          try {
+            const candidate = await connect(descriptor, { expectedSessionId: "coordinator" });
+            admissions++; await candidate.disconnect();
+          } catch {}
+        }
+        await new Promise<void>(resolve => setImmediate(resolve));
+      }
+    })();
+    failNext = mode === "captured-failure";
+    let finished = false;
+    transition = (mode === "shutdown" ? runner.emit({ type: "session_shutdown", reason: "quit" }) : start())
+      .then(() => { finished = true; });
+    expect(() => view.list()).toThrow("retired");
+    await expect(client.list()).rejects.toThrow();
+    await expect(client.input(selection, { intent: "query", text: "obsolete mutation" }, 2)).rejects.toThrow();
+    await expect(client.cancel(selection, 3)).rejects.toThrow();
+    await expect(client.requestStatus(1)).rejects.toThrow();
+    // For captured-failure this is post-failure inside the SAME handler, not a later handler.
+    expect(failNext).toBe(false);
+    expect(finished).toBe(false);
+    expect(bridgeStarts).toBe(1);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(attempts).toBeGreaterThan(0);
+    expect(admissions).toBe(0);
+    release(); await dispatch;
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(finished).toBe(false); // closure must also join the admitted native operation
+    expect(bridgeStarts).toBe(1); expect(admissions).toBe(0);
+    releaseInput();
+    expect(await acceptedInput).toMatchObject({ code: "disconnected" });
+    await transition;
+    // Keep the observer active through all remaining foreground reconciliation.
+    await new Promise<void>(resolve => setImmediate(resolve));
+    observing = false; await observer;
+    expect(bridgeStarts).toBe(mode === "replacement" ? 2 : 1);
+    expect(effects).toBe(1);
+    if (mode === "replacement") {
+      const fresh = await connect(descriptor, { expectedSessionId: "coordinator" });
+      try {
+        await expect(connect(descriptor, { expectedSessionId: "coordinator", resume: lease })).rejects.toMatchObject({ code: "lease_expired" });
+        await expect(fresh.grant("control", true, selection)).rejects.toThrow();
+        expect(await fresh.requestStatus(1)).toEqual({ state: "not_admitted", sequence: 1 });
+      } finally { await fresh.disconnect(); }
+    } else {
+      expect(admissions).toBe(0);
+      expect(existsSync(descriptor)).toBe(false);
+    }
+    expect(activeTools).toContain("apply_patch");
+    expect(activeTools).not.toContain("edit"); expect(activeTools).not.toContain("write");
+    if (mode === "captured-failure") expect(errors).toMatchObject([{ event: "session_start", error: "fixture captured upstream failed" }]);
+    else expect(errors).toEqual([]);
+    console.log("BRIDGE_PACKAGED_MUTATION_FENCE", JSON.stringify({ mode, effects, bridgeStarts, attempts, admissions,
+      profile: activeTools, error: errors, heldDispatchAndMutationJoined: true, observedThroughRemainder: true }));
+  } finally {
+    release?.(); releaseInput(); finishWorker?.(completed); await dispatch; await transition; await acceptedInput;
+    observing = false; await observer;
+    await client?.disconnect();
+    await runner.emit({ type: "session_shutdown", reason: "quit" });
+    context.mockRestore(); controllerCapture.mockRestore(); bridgeCapture.mockRestore();
+    expect(readdirSync(bridgeRoot)).toEqual([]);
+  }
+}));
 }
 const completed: Attempt = { status: "completed", result: "done", sideEffects: false };
 

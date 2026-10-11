@@ -38,6 +38,8 @@ export interface AgentUiSnapshot {
   agentUsage?: AgentUsage;
   /** Internal foreground lease; omitted for untagged AgentInstances. */
   teamOwnerToken?: symbol;
+  /** Authenticated foreground lease for background observations. Never serialized. */
+  ownerToken?: symbol;
   /** Admission provenance, not display-derived authority. */
   origin?: import("./history.ts").HistoryOrigin;
   attemptId?: string;

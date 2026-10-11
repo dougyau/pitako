@@ -8,7 +8,11 @@ import { formatUiClock } from "./ui.ts";
 import type { HistoryPage } from "./history-query.ts";
 import type { PaneView } from "../herdr/agents-ui/protocol.ts";
 
-export type AgentView = ReturnType<ReturnType<typeof createAgentController>["openView"]>;
+type ControllerView = ReturnType<ReturnType<typeof createAgentController>["openView"]>;
+export type AgentView = Omit<ControllerView,
+  "readDetail" | "readRequests" | "readActivity" | "readResult" | "subscribe" | "list"> & {
+  list(after?: string): Omit<ReturnType<ControllerView["list"]>, "revision">;
+};
 type Detail = ReturnType<AgentView["detail"]>;
 type List = ReturnType<AgentView["list"]>;
 type Section = "Brief" | "Activity" | "Identity & route" | "Receipts" | "Native history";

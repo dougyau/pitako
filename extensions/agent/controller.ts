@@ -1,10 +1,11 @@
-import { randomUUID } from "node:crypto";
-import { cancelTeamWorker, cancelWorker, type LiveTarget } from "./background.ts";
-import { listObservations } from "./observe.ts";
-import { resolveOwnedLive } from "./owner.ts";
+import { createHash, randomUUID } from "node:crypto";
+import { cancelTeamWorker, cancelWorker, readWorkerResult, type LiveTarget } from "./background.ts";
+import { listObservations, readTerminalActivity, subscribeChanges } from "./observe.ts";
+import { resolveOwnedLive, resolveOwnedWorkerRead } from "./owner.ts";
 import { queryHistory, type HistoryQuery } from "./history-query.ts";
 import { teamEvaluationForSession } from "../team.ts";
 import type { AgentUiSnapshot } from "./ui.ts";
+import type { WorkerReadReference, WorkerReadCursor } from "./bridge/protocol.js";
 
 export interface AgentSelection {
   processId: string;
@@ -43,7 +44,10 @@ const currentRequest = (row: AgentUiSnapshot) => [...row.sdkRequests ?? []].reve
 /** One foreground closure owns this controller. No shared controller registry or worker runtime. */
 export function createAgentController(owner: AgentControllerOwner, current: () => AgentControllerOwner | undefined) {
   const processId = `${process.pid}:${randomUUID()}`, epoch = randomUUID();
+  let teamIdentity: { token: symbol; id: string } | undefined;
   let active = true;
+  let revision = 0;
+  const listeners = new Set<(revision: number) => void>();
   const views = new Set<{ revoke(): void }>();
   const pending = new Set<Promise<unknown>>();
   const check = () => {
@@ -54,8 +58,27 @@ export function createAgentController(owner: AgentControllerOwner, current: () =
   const rows = () => {
     check();
     const evaluation = teamEvaluationForSession(owner.sessionId, false);
-    return listObservations(evaluation?.token, owner.sessionId);
+    return listObservations(evaluation?.token, owner.sessionId).filter(row =>
+      row.ownerToken === undefined || row.ownerToken === owner.token);
   };
+  const unwatch = subscribeChanges(row => {
+    const live = current();
+    if (!active || live?.sessionId !== owner.sessionId || live.token !== owner.token ||
+        row.origin?.coordinatorSessionId !== owner.sessionId ||
+        row.ownerToken !== undefined && row.ownerToken !== owner.token ||
+        !["agent_run", "agent_spawn", "team_assign"].includes(row.origin.source) ||
+        row.teamOwnerToken && row.teamOwnerToken !== teamEvaluationForSession(owner.sessionId, false)?.token ||
+        row.origin.source === "team_assign" && (!row.teamOwnerToken || !row.origin.assignmentId)) return;
+    if (revision === Number.MAX_SAFE_INTEGER) {
+      active = false; unwatch();
+      for (const view of views) view.revoke();
+      return;
+    }
+    revision++;
+    for (const listener of listeners) {
+      try { listener(revision); } catch { /* A host listener cannot affect worker execution. */ }
+    }
+  });
   const rowFor = (id: string) => {
     const row = rows().find(row => row.id === id);
     if (!row) throw new Error("unknown scoped worker");
@@ -89,19 +112,64 @@ export function createAgentController(owner: AgentControllerOwner, current: () =
       throw new Error("live binding changed; reobserve");
     return binding;
   };
+  const readScope = () => ({ coordinatorSessionId: owner.sessionId, ownerToken: owner.token,
+    teamToken: teamEvaluationForSession(owner.sessionId, false)?.token });
+  const referenceFor = (row: AgentUiSnapshot): WorkerReadReference => {
+    const source = row.origin?.source;
+    if (source !== "agent_run" && source !== "agent_spawn" && source !== "team_assign") throw new Error("unknown_target");
+    let evaluationId: string | undefined;
+    if (source === "team_assign") {
+      const token = readScope().teamToken;
+      if (!token || token !== row.teamOwnerToken) throw new Error("unknown_target");
+      if (teamIdentity?.token !== token) teamIdentity = { token, id: randomUUID() };
+      evaluationId = teamIdentity.id;
+    }
+    const binding = source === "agent_run" ? undefined : resolveOwnedWorkerRead(targetFor(row), readScope());
+    const key = binding?.key;
+    return { kind: "read", processId, coordinatorSessionId: owner.sessionId, epoch, instanceId: row.id, source,
+      ...(source === "team_assign" ? { assignmentId: row.origin!.assignmentId!, evaluationId } : {}),
+      ...(row.attemptId ? { attemptId: row.attemptId } : {}),
+      ...(key ? { native: { generation: key.generation, historyId: key.historyId, sessionId: key.sessionId } } : {}) };
+  };
+  const readRow = (ref: WorkerReadReference) => {
+    check();
+    if (ref.kind !== "read" || ref.processId !== processId || ref.coordinatorSessionId !== owner.sessionId || ref.epoch !== epoch)
+      throw new Error("stale_reference");
+    const row = rowFor(ref.instanceId);
+    const now = referenceFor(row);
+    if (now.source !== ref.source || now.assignmentId !== ref.assignmentId || now.evaluationId !== ref.evaluationId ||
+        now.attemptId !== ref.attemptId || now.native?.generation !== ref.native?.generation ||
+        now.native?.historyId !== ref.native?.historyId || now.native?.sessionId !== ref.native?.sessionId)
+      throw new Error("stale_reference");
+    return row;
+  };
+  const offsetFor = (ref: WorkerReadReference, cursor: WorkerReadCursor | undefined, section: WorkerReadCursor["section"]) => {
+    if (!cursor) return 0;
+    readRow(cursor.ref);
+    if (JSON.stringify(cursor.ref) !== JSON.stringify(ref) || cursor.section !== section ||
+        !("offset" in cursor) || !Number.isSafeInteger(cursor.offset) || cursor.offset < 0) throw new Error("invalid_cursor");
+    return cursor.offset;
+  };
+  const nextText = (ref: WorkerReadReference, section: "brief" | "detail_metadata" | "result_text" | "result_metadata",
+    page: ReturnType<typeof textPage>): WorkerReadCursor | null =>
+    page.nextOffset === null ? null : { ref, section, offset: page.nextOffset };
   return {
     revoke() {
       active = false; // before any caller's cleanup await
+      unwatch();
       for (const view of views) view.revoke();
     },
     async settle() { await Promise.allSettled([...pending]); },
-    openView() {
+    openView(options: { control?: boolean; bindControl?: (activate: (selection: AgentSelection) => void) => void } = {}) {
       check();
       let connected = true, sensitiveHistory = false, sensitiveRoute = false, busy = false;
+      let control = options.control !== false;
       const work = new Set<Promise<unknown>>();
-      const lease = { revoke() { connected = false; } };
+      let unsubscribe: (() => void) | undefined;
+      const lease = { revoke() { connected = false; unsubscribe?.(); } };
       views.add(lease);
       const ready = () => { check(); if (!connected) throw new Error("view is disconnected"); };
+      options.bindControl?.(selection => { ready(); admit(selection); control = true; });
       const own = <T>(operation: () => Promise<T>): Promise<T> => {
         ready();
         if (busy) throw new Error("view has outstanding work");
@@ -113,6 +181,99 @@ export function createAgentController(owner: AgentControllerOwner, current: () =
         return accepted.then(result => { ready(); return result; });
       };
       return {
+        subscribe(listener: (revision: number) => void) {
+          ready();
+          if (unsubscribe || listeners.size >= 8) throw new Error("busy");
+          const receive = (revision: number) => listener(revision);
+          listeners.add(receive);
+          let installed = true;
+          const dispose = () => {
+            if (!installed) return;
+            installed = false;
+            listeners.delete(receive); unsubscribe = undefined;
+          };
+          unsubscribe = dispose;
+          try {
+            // No await between installation and projection. A later change is a hint.
+            // Subscription replies encode the owner twice (envelope and snapshot).
+            return { snapshot: this.list(undefined, undefined, 24 * 1024), get active() { return installed; }, dispose };
+          } catch (error) { dispose(); throw error; }
+        },
+        readDetail(id: string, cursor?: WorkerReadCursor) {
+          ready();
+          const row = cursor ? readRow(cursor.ref) : rowFor(id);
+          if (row.id !== id) throw new Error("invalid_cursor");
+          const ref = referenceFor(row);
+          if (cursor && cursor.section !== "brief" && cursor.section !== "detail_metadata") throw new Error("invalid_cursor");
+          const outcome = row.origin?.source === "agent_run" ? { state: "unavailable" as const, reason: "unsupported_kind" }
+            : readWorkerResult(targetFor(row), readScope());
+          let selection: AgentSelection | undefined;
+          let reason: string | undefined;
+          try { selection = selectionFor(row); } catch (error) { reason = String(error); }
+          const metadata = textPage(JSON.stringify({ id: row.id, roleId: row.roleId, source: row.origin?.source,
+            assignmentId: row.origin?.assignmentId, task: row.task,
+            selected: { model: row.selectedModel, requestedModel: row.requestedModel, reasoning: row.requestedReasoning,
+              fast: { state: "unavailable", reason: "Fast intent is not retained in the selected-settings observation" } },
+            activated: row.activated ?? { state: "unavailable", reason: "No observed activation for this attempt" },
+            sdkRequest: currentRequest(row) ?? { state: "unavailable", reason: "No SDK-observed request for this attempt" },
+            routeSummary: routeSummary(row), routing: { raw: "denied" }, history: { raw: "denied" },
+            diagnostics: outcome.state === "ready" && outcome.status !== row.status
+              ? ["Authoritative settled outcome differs from earlier display observation; close/disposal may have failed."] : [],
+          }), cursor?.section === "detail_metadata" ? offsetFor(ref, cursor, "detail_metadata") : 0);
+          const workbrief = { ...textPage(row.origin?.workbrief ?? row.task,
+            cursor?.section === "brief" ? offsetFor(ref, cursor, "brief") : 0),
+            source: row.origin?.workbrief === undefined ? "invocation task" : "original WorkBrief" };
+          return { state: "ready" as const, ref, status: outcome.state === "ready" ? outcome.status : row.status,
+            observedStatus: row.status, result: outcome.state,
+            activity: ref.native ? "observed_binding" : "unavailable",
+            metadata, workbrief, nextMetadata: nextText(ref, "detail_metadata", metadata),
+            nextBrief: nextText(ref, "brief", workbrief), controls: { selection, reason, grant: control ? "enabled" : "denied" } };
+        },
+        readRequests(id: string, cursor?: WorkerReadCursor) {
+          ready();
+          const row = cursor ? readRow(cursor.ref) : rowFor(id);
+          if (row.id !== id) throw new Error("invalid_cursor");
+          const ref = referenceFor(row);
+          const projection = JSON.stringify({ requests: row.sdkRequests ?? [], dropped: row.sdkRequestsDropped ?? 0,
+            missingReason: row.sdkRequests?.length ? undefined : "No SDK-observed request; selected settings are not observations.",
+            returnedServiceTier: "unavailable", coverage: "SDK options only; provider internals are unavailable" });
+          const digest = createHash("sha256").update(projection).digest("hex");
+          const offset = offsetFor(ref, cursor, "requests");
+          if (cursor && (!("digest" in cursor) || cursor.digest !== digest)) throw new Error("stale_cursor");
+          const page = textPage(projection, offset);
+          return { state: "ready" as const, ref, page,
+            next: page.nextOffset === null ? null : { ref, section: "requests" as const, offset: page.nextOffset, digest } };
+        },
+        readActivity(ref: WorkerReadReference, cursor?: WorkerReadCursor) {
+          ready();
+          const row = readRow(ref);
+          if (cursor) {
+            readRow(cursor.ref);
+            if (JSON.stringify(cursor.ref) !== JSON.stringify(ref) || cursor.section !== "activity" ||
+                !Number.isSafeInteger(cursor.after) || cursor.after < 0) throw new Error("invalid_cursor");
+          }
+          if (row.origin?.source === "agent_run") return { state: "unavailable" as const, reason: "unsupported_kind" };
+          const binding = resolveOwnedWorkerRead(targetFor(row), readScope());
+          if (!binding.key) return { state: "unavailable" as const, reason: "not_captured" };
+          const options = { after: cursor?.section === "activity" ? cursor.after : undefined, limit: 50 };
+          const result = binding.handle ? { state: "ready" as const, page: binding.handle.observe(options) }
+            : readTerminalActivity(binding.key, options);
+          if (result.state !== "ready") return result;
+          return { ...result, ref, next: { ref, section: "activity" as const, after: result.page.cursor as number } };
+        },
+        readResult(ref: WorkerReadReference, cursor?: WorkerReadCursor) {
+          ready();
+          const row = readRow(ref);
+          if (cursor && cursor.section !== "result_text" && cursor.section !== "result_metadata") throw new Error("invalid_cursor");
+          if (row.origin?.source === "agent_run") return { state: "unavailable" as const, reason: "unsupported_kind" };
+          const result = readWorkerResult(targetFor(row), readScope(), {
+            offset: cursor?.section === "result_text" ? offsetFor(ref, cursor, "result_text") : 0,
+            metadataOffset: cursor?.section === "result_metadata" ? offsetFor(ref, cursor, "result_metadata") : 0,
+          });
+          if (result.state !== "ready") return result;
+          return { ...result, ref, nextText: nextText(ref, "result_text", result.text),
+            nextMetadata: nextText(ref, "result_metadata", result.metadata) };
+        },
         async close() {
           lease.revoke();
           await Promise.allSettled([...work]);
@@ -124,8 +285,9 @@ export function createAgentController(owner: AgentControllerOwner, current: () =
           else if (kind === "route") sensitiveRoute = true;
           else throw new Error("unknown sensitive content kind");
         },
-        list(after?: string) {
+        list(after?: string, expectedRevision?: number, byteBudget = 30 * 1024) {
           ready();
+          if (expectedRevision !== undefined && expectedRevision !== revision) throw new Error("stale_cursor");
           if (after !== undefined && !rows().some(row => row.id === after)) throw new Error("invalid list cursor");
           const items = [];
           const sorted = rows().sort((a, b) => a.id.localeCompare(b.id));
@@ -137,10 +299,14 @@ export function createAgentController(owner: AgentControllerOwner, current: () =
               activated: row.activated, sdkRequest: currentRequest(row), acceptedAt: row.acceptedAt,
               terminalAt: row.terminalAt, activity: row.lastActivityKind, phase: row.phase,
               profile: row.origin?.routing?.profile };
-            if (items.length === 50 || Buffer.byteLength(JSON.stringify([...items, item])) > 30 * 1024) break;
+            if (items.length === 50) break;
+            if (Buffer.byteLength(JSON.stringify([...items, item])) > byteBudget) {
+              if (!items.length) throw new RangeError("worker metadata exceeds list page budget");
+              break;
+            }
             items.push(item);
           }
-          return { items: structuredClone(items), cursor: items.length < remaining.length ? String(items.at(-1)?.id) : null,
+          return { revision, items: structuredClone(items), cursor: items.length < remaining.length ? String(items.at(-1)?.id) : null,
             owner: { processId, coordinatorSessionId: owner.sessionId, epoch } };
         },
         detail(id: string, briefOffset = 0, activityAfter?: number) {
@@ -176,28 +342,37 @@ export function createAgentController(owner: AgentControllerOwner, current: () =
           ready();
           return textPage(JSON.stringify({ requests: rowFor(id).sdkRequests ?? [], dropped: rowFor(id).sdkRequestsDropped ?? 0 }), offset);
         },
-        route(id: string, offset = 0) {
+        route(id: string, offset = 0, includeState = false) {
           ready();
           if (!sensitiveRoute) throw new Error("raw route requires this view's acknowledgement");
-          return textPage(JSON.stringify(rowFor(id).origin?.routing ?? null), offset);
+          const row = rowFor(id);
+          return { ...textPage(JSON.stringify(row.origin?.routing ?? null), offset),
+            ...(includeState ? { state: routeSummary(row).state } : {}) };
         },
-        history(query: HistoryQuery, worker?: { instanceId: string }) {
+        history(query: HistoryQuery, worker?: { instanceId: string }, byteBudget?: number) {
           return own(async () => {
             if (query.action === "read" && !sensitiveHistory) throw new Error("raw history requires this view's acknowledgement");
             const row = worker ? rowFor(worker.instanceId) : undefined;
             const scope = { coordinatorSessionId: owner.sessionId, ...(row ? { instanceId: row.id,
               ...(row.origin?.assignmentId ? { assignmentId: row.origin.assignmentId } : {}) } : {}) };
-            return queryHistory(query, owner.sessionId, undefined, scope);
+            return queryHistory(query, owner.sessionId, undefined, scope, byteBudget);
           });
         },
-        input(selection: AgentSelection, input: { intent: "query" | "steer"; text: string; decisionId?: string }) {
+        input(selection: AgentSelection, input: { intent: "query" | "steer"; text: string; decisionId?: string },
+          receipt?: (result: Record<string, unknown>) => void) {
           return own(async () => {
+            if (!control) throw new Error("forbidden");
             const binding = admit(selection); // no await between owner/native fence and local admission
-            return binding.handle.input({ ...input, historyId: selection.historyId, sessionId: selection.sessionId });
+            const result = await binding.handle.input({ ...input, historyId: selection.historyId, sessionId: selection.sessionId });
+            // Native evidence survives a disconnected view; own() still fences the caller's return.
+            receipt?.(result);
+            return result;
           });
         },
         cancel(selection: AgentSelection) {
           ready();
+          if (!control) throw new Error("forbidden");
+          if (busy) throw new Error("view has outstanding work");
           const binding = admit(selection);
           const target = binding.target;
           if (target.kind === "team") {

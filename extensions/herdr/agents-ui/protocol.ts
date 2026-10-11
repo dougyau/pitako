@@ -2,8 +2,12 @@ import type { createAgentController, AgentSelection } from "../../agent/controll
 import type { HistoryQuery } from "../../agent/history-query.ts";
 
 export const descriptorEnv = "PITAKO_AGENTS_UI_DESCRIPTOR";
-export const frameBytes = 64 * 1024;
-export type LocalView = ReturnType<ReturnType<typeof createAgentController>["openView"]>;
+export { frameBytes, frame, frames } from "../../agent/framing.js";
+type ControllerView = ReturnType<ReturnType<typeof createAgentController>["openView"]>;
+export type LocalView = Omit<ControllerView,
+  "readDetail" | "readRequests" | "readActivity" | "readResult" | "subscribe" | "list"> & {
+  list(after?: string): Omit<ReturnType<ControllerView["list"]>, "revision">;
+};
 export type PaneView = { [K in keyof LocalView]: (...args: Parameters<LocalView[K]>) =>
   ReturnType<LocalView[K]> | Promise<Awaited<ReturnType<LocalView[K]>>> } & {
   connection?(): string;
@@ -81,27 +85,4 @@ export function isReply(v: unknown): v is Reply {
   return object(v) && v.version === 1 && number(v.id) &&
     (keys(v, ["version", "id", "error"]) && str(v.error, 4096) ||
       keys(v, ["version", "id", "result"]) && Object.hasOwn(v, "result"));
-}
-export function frame(value: unknown): string {
-  const data = JSON.stringify(value) + "\n";
-  if (Buffer.byteLength(data) > frameBytes) throw new Error("Agent pane frame exceeds 64KiB");
-  return data;
-}
-/** Byte accounting happens before UTF-8 decoding; neither peers nor JSON can allocate an unbounded frame. */
-export function frames(receive: (value: unknown) => void) {
-  let pending = Buffer.alloc(0);
-  return (chunk: Buffer) => {
-    // Socket high-water marks are not an inbound security bound.
-    while (chunk.length) {
-      const end = chunk.indexOf(10);
-      const part = end < 0 ? chunk : chunk.subarray(0, end + 1);
-      if (pending.length + part.length > frameBytes) throw new Error("Agent pane frame exceeds 64KiB");
-      pending = Buffer.concat([pending, part]);
-      if (end < 0) return;
-      const value: unknown = JSON.parse(pending.toString("utf8"));
-      pending = Buffer.alloc(0);
-      receive(value);
-      chunk = chunk.subarray(end + 1);
-    }
-  };
 }
