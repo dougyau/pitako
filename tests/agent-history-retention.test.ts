@@ -1,12 +1,11 @@
-import "./fixtures/offline.ts";
+import { stubExternalFactories } from "./fixtures/offline.ts";
+stubExternalFactories();
 import { afterEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { spawnSync } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { WorkerHistory, type HistoryGroup } from "../extensions/agent/history.ts";
 import { pruneWorkerHistory } from "../extensions/agent/history-retention.ts";
 import { queryHistory } from "../extensions/agent/history-query.ts";
@@ -218,6 +217,30 @@ test("symlinks and retargeted aliases preserve targets; partial deletion require
   expect(readFileSync(target, "utf8")).toBe("user sentinel");
 });
 
+test("persisted cleanup intent without its owner fails closed and retains remaining evidence", async () => {
+  const sample = fixture();
+  expect((await pruneWorkerHistory(sample.history, 180, { now: later, dryRun: true })).groups[0]!.state).toBe("eligible");
+  const cleanup: NonNullable<HistoryGroup["cleanup"]> = {
+    state: "deleting", owner: "foreign-cleanup-owner", closedAt,
+    files: [{ path: sample.file, kind: "file" }, { path: `${sample.file}.acp.json`, kind: "file" }],
+  };
+  sample.history.mutate(sample.group.groupId, (saved) => { saved.cleanup = cleanup; });
+  // Model a prior owner's partial deletion without registering authority in this process.
+  rmSync(sample.file);
+  expect(existsSync(path.join(sample.history.catalogDir, `${sample.group.groupId}.json.lock`))).toBe(false);
+  const before = tree(sample.root);
+  const report = await pruneWorkerHistory(sample.history, 180, { now: later });
+  expect(report.groups).toEqual([{ groupId: sample.group.groupId, state: "failed", reason: "Error: cleanup ownership uncertain" }]);
+  expect(tree(sample.root)).toEqual(before);
+  const saved = sample.history.read(sample.group.groupId);
+  expect(saved.prunedAt).toBeUndefined();
+  expect(saved.cleanup).toEqual(cleanup);
+  expect(readFileSync(`${sample.file}.acp.json`, "utf8")).toBe("ACP sensitive sidecar");
+  const page = await queryHistory({ action: "read", historyId: sample.member.historyId });
+  expect(page.diagnostics).toContainEqual({ code: "history_deletion_incomplete" });
+  expect(page.diagnostics.map((row) => row.code)).not.toContain("history_pruned");
+});
+
 test("public command/startup prune and dry-run remain foreground-only; busy maintenance skips", async () => {
   const sample = fixture();
   delete process.env.PITAKO_INSTANCE_ID;
@@ -264,10 +287,3 @@ test("public command/startup prune and dry-run remain foreground-only; busy main
   await command("history prune --dry-run", ctx);
   expect(existsSync(process.env.PI_CODING_AGENT_DIR)).toBe(false);
 });
-
-test("Node multiprocess admission/prune race and crash leave honest state", () => {
-  const child = spawnSync("node", ["--import", "./scripts/sdk-node-loader.mjs", "scripts/agent-history-retention-node.mjs"],
-    { cwd: path.resolve(import.meta.dir, ".."), encoding: "utf8", timeout: 30000 });
-  expect(child.status, child.stderr).toBe(0);
-  expect(child.stdout).toContain("admitted writer protected; crash intent and uncertain lock preserved");
-}, 40000);

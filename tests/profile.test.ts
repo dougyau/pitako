@@ -87,6 +87,8 @@ describe("profiles", () => {
       expect(note).toContain("literal, exhaustive or exact results");
       expect(note).toContain("partial or unavailable");
       expect(note).toContain("raw tools");
+      expect(note).toContain("Verify real behavior before claiming done.");
+      expect(note).toContain("Select checks for the active project's own behavior and declared testing scope.");
       expect(note).not.toContain("navigation baseline");
     }
     expect(coding).toContain("Use apply_patch when available; otherwise edit");

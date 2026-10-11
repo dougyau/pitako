@@ -19,6 +19,11 @@ const BUILD_SEQUENCE = Symbol.for("pitako.code-intelligence.graph-build-sequence
 const BUILD_FAILURES = new WeakMap<object, { id: number; durationMs: number }>();
 let sdkPromise: Promise<any> | undefined;
 
+export type GraphDependencies = {
+  sdk?: () => Promise<any>;
+  unsupportedRuntime?: () => string | undefined;
+};
+
 export function graphBuildFailure(value: unknown): { id: number; durationMs: number } | undefined {
   return value && typeof value === "object" ? BUILD_FAILURES.get(value) : undefined;
 }
@@ -189,10 +194,10 @@ async function prepareGraph(sdk: any, root: string, entry: GraphEntry, signal: A
   };
 }
 
-async function acquireGraph(root: string, signal: AbortSignal) {
+async function acquireGraph(root: string, signal: AbortSignal, deps: GraphDependencies) {
   throwIfAborted(signal);
   root = canonicalPath(root);
-  const sdk = await graphSdk();
+  const sdk = await (deps.sdk ?? graphSdk)();
   throwIfAborted(signal);
   const key = dataKey(sdk, root);
   const entries = registry();
@@ -275,13 +280,14 @@ export async function withCodeGraph<T extends Record<string, unknown>>(
   root: string,
   signal: AbortSignal,
   query: (graph: any) => T,
+  deps: GraphDependencies = {},
 ): Promise<GraphValue<T>> {
   throwIfAborted(signal);
-  const runtime = unsupportedRuntime();
+  const runtime = (deps.unsupportedRuntime ?? unsupportedRuntime)();
   if (runtime) return { unavailable: runtime };
   let lease: Awaited<ReturnType<typeof acquireGraph>> | undefined;
   try {
-    lease = await acquireGraph(root, signal);
+    lease = await acquireGraph(root, signal, deps);
     throwIfAborted(signal);
     return { value: Object.assign({}, query(lease.graph), { freshness: lease.freshness }) };
   } catch (error) {
@@ -300,14 +306,15 @@ export async function withExistingCodeGraph<T extends Record<string, unknown>>(
   root: string,
   signal: AbortSignal,
   query: (graph: any) => T,
+  deps: GraphDependencies = {},
 ): Promise<GraphValue<T>> {
   throwIfAborted(signal);
-  const runtime = unsupportedRuntime();
+  const runtime = (deps.unsupportedRuntime ?? unsupportedRuntime)();
   if (runtime) return { unavailable: runtime };
   let graph: any;
   try {
     root = canonicalPath(root);
-    const sdk = await graphSdk();
+    const sdk = await (deps.sdk ?? graphSdk)();
     throwIfAborted(signal);
     if (!sdk.CodeGraph.isInitialized(root)) return { unavailable: "index absent" };
     graph = await sdk.CodeGraph.open(root, { sync: false });

@@ -38,6 +38,10 @@ Roles and workflows route evidence selection and test quality to `verify-behavio
 
 Creating or maintaining a project verification procedure requires an explicitly authorized task. Missing or stale guidance during routine verification does not authorize a new skill, feature map, or tree audit.
 
+Check selection starts from behavior owned by the active project and its declared testing scope. The active project's root `GATES.md` controls its procedure, not the installed Pitako checkout. Reading an external boundary to understand a call does not authorize dependency certification or repair. A Reviewer cannot require the real replaced runtime solely because a controlled boundary double verifies an owned rule. Other projects retain authorized integration requirements from their scope, contracts, and active guide, not Pitako's distributed stack.
+
+Pitako acceptance covers its own rules, adapters, resource declarations, and instruction assembly through controlled external boundaries. It does not certify installation or operation of Pi, SDK, ACP, third-party extensions, providers, classifiers, CodeGraph, LSP, or Herdr. The complete checkout procedure is `bun run typecheck`, then `bun run test`, with normal file-parallel discovery. External certification checks are retired, not deferred gates. Local text and assembly checks observe policy availability, not future model compliance. Isolation, asynchronous settlement before cleanup, evidence limits, and independent review remain required.
+
 `typescript-best-practices` lives under `skills/language/` and is not in the default `pi.skills` list.
 
 ### Codex tools and ACP: upstream entries, Pitako policy
@@ -162,9 +166,7 @@ Six read-only queries supplement raw read, grep, LSP, and CodeGraph. Graph-backe
 
 ## Dogfood
 
-rpiv-todo dogfood: `/pitako` now names the session TODO layer in one line, and `tests/todo.test.ts` drives the real `todo` tool (create, in_progress, complete, `blockedBy`, cycle rejection, branch isolation, replay). No Pitako Task system was added.
-
-The initial Board dogfood used topic `Board v0 dogfood` in `~/.pi/agent/pitako/board.db` for this repository. The follow-up was small: `scripts/smoke.ts` requires the six basic Board tool names but does not call them. `bun run smoke` passed at the time. Smoke should set a temporary `PI_CODING_AGENT_DIR` before any future Board call.
+The original rpiv-todo dogfood exercised the real upstream tool. The original Board dogfood used topic `Board v0 dogfood` in `~/.pi/agent/pitako/board.db`, followed by external loader checks. Those dependency checks and their exclusive scripts are retired. Current tests observe Pitako's resource declarations and Board behavior without certifying the external runtime. No Pitako Task system was added.
 
 The TODO list stayed the execution checklist. The Board held the finding, the decision, and the handoff. That split was natural. Friction: a session started before the extension existed does not see `board_*` until reload, so the posts were made by executing the registered tools in a bun process. `node:sqlite` still prints an experimental warning, and Bun 1.3.14 cannot import it.
 

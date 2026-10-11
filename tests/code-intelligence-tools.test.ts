@@ -4,15 +4,16 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { disposeDefaultLspManager } from "pi-lsp-client/src/lsp/manager.js";
 import { findServerForExtension } from "pi-lsp-client/src/lsp/server-resolution.js";
 import { CODE_INTELLIGENCE_TOOLS } from "../extensions/code-intelligence/tools.ts";
-import codeIntelligence from "../extensions/code-intelligence/index.ts";
 
 const lspRegistryKey = Symbol.for("pitako.code-intelligence.lsp-registry");
+const lookupKey = Symbol.for("pitako.code-intelligence.lsp-extension-lookup");
+const lookups = globalThis as typeof globalThis & { [key: symbol]: typeof findServerForExtension | undefined };
 const globals = globalThis as typeof globalThis & { [key: symbol]: Promise<any> | undefined };
-beforeEach(() => codeIntelligence({ registerTool() {} } as never));
+beforeEach(() => bindTestLsp(file => path.dirname(file), () => ({ documentSymbols: async () => [], references: async () => [], definition: async () => [] })));
 const bindTestLsp = (findWorkspaceRoot: (file: string) => string, clientForFile: (file: string) => Record<string, unknown>) => {
+  lookups[lookupKey] = findServerForExtension;
   globals[lspRegistryKey] = Object.assign(Promise.resolve({
     findWorkspaceRoot,
     withLspClient: async (file: string, run: (client: any) => Promise<unknown>) => run(clientForFile(file)),
@@ -33,7 +34,7 @@ afterEach(async () => {
     await (await sharedLsp).manager.stopAll();
     delete globals[lspRegistryKey];
   }
-  await disposeDefaultLspManager();
+  delete lookups[lookupKey];
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 

@@ -319,9 +319,13 @@ Open a project with source files and a language server for LSP. Dense graph quer
 
 ## Development
 
-Prepare the checkout with `bash ./scripts/setup.sh`. Use [GATES.md](GATES.md) for prerequisites, focused checks, and the complete routine procedure. It covers the full serial Bun suite, separate Node suites, and stage-wrapper evidence.
+Prepare the checkout with `bash ./scripts/setup.sh`. Use [GATES.md](GATES.md) for prerequisites, focused checks, and the complete routine procedure. Run `bun run typecheck`, then `bun run test` from the root. The test script uses `bun test --parallel` with normal discovery.
+
+Acceptance covers behavior implemented by Pitako, including its rules, adapters, declared resources, and instruction assembly. Tests use controlled external boundaries. They do not certify installation or operation of Pi, SDK, ACP, third-party extensions, providers, classifiers, CodeGraph, LSP, or Herdr. Those external certification checks are retired, not optional gates. Local instruction assertions observe content and availability, not future model compliance.
 
 `verify-behavior` reads the active project's root `GATES.md`, not the installed Pitako package's guide. Planning reads it without running checks. Missing or stale guidance falls back to existing discovery for uncovered obligations; frozen requirements and independent review remain controlling. Routine verification does not automatically author the guide.
+
+Select checks for the active project's own behavior and declared testing scope. Reading an external boundary does not authorize dependency certification or repair. Other projects retain authorized integration requirements from their scope, contracts, and active guide, not Pitako's distributed stack. A controlled boundary double can verify an owned rule without proving the replaced runtime. That limit alone does not require a real-runtime check. Preserve isolation, asynchronous settlement before cleanup, sufficient evidence, and independent review.
 
 To create or update the guide explicitly, use Pi's native skill command with a natural-language scope:
 
@@ -391,7 +395,7 @@ Hover is not part of `pi-lsp-client`. This package does not add a second LSP cli
 
 Selection notes and rejected packages are in [docs/foundation.md](docs/foundation.md).
 
-### Verify LSP
+### Use LSP
 
 In a TypeScript project, with `typescript-language-server` on `PATH`:
 
@@ -400,15 +404,13 @@ Use lsp_diagnostics on src/main.ts.
 Use lsp_goto_definition on the greet call in src/main.ts.
 ```
 
-Or run `bun run smoke`, which loads Pitako through Pi's resource loader and calls `lsp_goto_definition` and `lsp_find_references` on `fixtures/tiny-ts`.
-
-### Verify CodeGraph
+### Use CodeGraph
 
 ```bash
 codegraph init
 ```
 
-Then ask Pi to use the raw `codegraph_search` and `codegraph_callers` tools. The smoke test initializes the tiny fixture for these raw queries. Under Node, a graph-backed dense query can build the index instead; `project_report` only observes it. Under Bun, graph-backed dense queries report unavailable.
+Then ask Pi to use the raw `codegraph_search` and `codegraph_callers` tools. Under Node, a graph-backed dense query can build the index instead; `project_report` only observes it. Under Bun, graph-backed dense queries report unavailable. These are operator usage instructions, not Pitako acceptance checks.
 
 ## Disable or override an extension
 
@@ -481,27 +483,22 @@ pitako/
 ├── skills/language/      # optional; not loaded by default
 ├── prompts/explain.md
 ├── config/stack.json
-├── fixtures/tiny-ts/     # smoke fixture
-├── scripts/              # loader and smoke runner
+├── fixtures/             # retained examples and records
+├── scripts/              # setup, verification recipe, and vendoring
 └── tests/
 ```
 
 Team assignment and model policy code already live under `extensions/agent/`, `extensions/team.ts`, and `extensions/roles/`. No separate package is required.
 
-## Smoke test
+## Checkout checks
 
 ```bash
 bash ./scripts/setup.sh
-bun run smoke
+bun run typecheck
+bun run test
 ```
 
-The script copies `fixtures/tiny-ts` to a temp directory, runs `codegraph init`, loads this package the way Pi loads a project package path, and checks:
-
-- `codegraph_search` finds `greet`
-- `codegraph_callers` finds `run`
-- `lsp_goto_definition` resolves into `greet.ts`
-- `lsp_find_references` mentions `greet`
-- Board tools are registered. The smoke test does not call them.
+Follow [GATES.md](GATES.md) for focused selections, capture, failure interpretation, and evidence reuse. Keep file-owned mutable resources isolated and await owned asynchronous work before cleanup. The discovered suite observes Pitako-owned behavior without launching external runtimes to certify them.
 
 ## Current limitations
 

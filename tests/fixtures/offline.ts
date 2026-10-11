@@ -1,10 +1,15 @@
-import { afterAll, beforeAll } from "bun:test";
+import { afterAll, beforeAll, spyOn } from "bun:test";
+import * as codex from "../../extensions/codex.ts";
 
-// Direct foreground registration invokes official install telemetry. Each file
-// owns its opt-out until its cases and settlement hooks have finished.
-const previous = process.env.PI_OFFLINE;
-beforeAll(() => { process.env.PI_OFFLINE = "1"; });
-afterAll(() => {
-  if (previous === undefined) delete process.env.PI_OFFLINE;
-  else process.env.PI_OFFLINE = previous;
-});
+// The calling file owns its stub and hooks; this module owns no shared mock.
+// Pitako's handlers still run, but not the external factory or official tools.
+export function stubExternalFactories(): void {
+  let registration: ReturnType<typeof spyOn>;
+  beforeAll(() => {
+    registration = spyOn(codex, "registerCodexTools").mockImplementation(pi => {
+      pi.registerTool({ name: "apply_patch", description: "controlled external tool", parameters: {} } as never);
+      return async () => {};
+    });
+  });
+  afterAll(() => registration.mockRestore());
+}

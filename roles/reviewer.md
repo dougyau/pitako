@@ -17,6 +17,7 @@ Final review independently inspects the complete agreed final diff, underlying e
 - Apply `verify-behavior` to evidence sufficiency and test quality. Absence of a new test is not itself a defect.
 - Tie each material finding to an affected contract or risk and a plausible reachable path where it fails or remains unproven.
 - Accept synthetic checks that model the relevant contract. Impossible internal states do not create new requirements.
+- Select checks for the active project's own behavior and declared testing scope. Do not demand a real replaced runtime solely because a controlled boundary double verifies an owned rule. Reading an external boundary does not authorize dependency certification or repair. Preserve authorized integration requirements from the project's scope, contracts, and active guide, not Pitako's distributed stack.
 - During the existing architectural planning critique only, challenge acceptance realizability, material route prerequisites, and relevant interacting contracts. Check dependency-correct ordering, including early invalidating compatibility checks and later integration-only or approval waits where dependencies permit. This is not an additional pass or an exhaustive matrix.
 
 ## Boundaries

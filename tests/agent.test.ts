@@ -1,4 +1,5 @@
-import "./fixtures/offline.ts";
+import { stubExternalFactories } from "./fixtures/offline.ts";
+stubExternalFactories();
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { agentFixtureOwnership } from "./fixtures/agent-fixture-ownership.ts";
 import { tmpdir } from "node:os";
@@ -22,8 +23,6 @@ import pitako from "../extensions/index.ts";
 import { resolveRole } from "../extensions/roles/load.ts";
 import type { ModelTarget } from "../extensions/roles/types.ts";
 import { packageRoot } from "../extensions/stack.ts";
-import { registeredToolNames } from "../scripts/load-pitako.ts";
-import { loadPitako } from "./fixtures/owned-pitako.ts";
 import { completeTool, emptyCodeIntelligenceUsage } from "../extensions/code-intelligence/metrics.ts";
 import type { DenseCallUsage } from "../extensions/code-intelligence/metrics.ts";
 
@@ -793,22 +792,14 @@ reasoning = "medium"
     expect(scheduled).toBe(false);
   }));
 
-  test("agent_run is registered, refused inside an instance, and Pitako still loads", fixture.ownedCase("agent_run is registered, refused inside an instance, and Pitako still loads", async () => {
-    const loaded = await loadPitako(packageRoot());
+  test("agent_run is registered, refused inside an instance, through the controlled ExtensionAPI", fixture.ownedCase("agent_run is registered, refused inside an instance, through the controlled ExtensionAPI", async () => {
     const env = tempEnv();
     for (const id of ["developer", "reviewer", "coordinator", "researcher", "architect"]) {
       const role = resolveRole(id, { env });
       const allowed = new Set(skillNamesForRole(role));
-      const skills = loaded.loader.getSkills().skills.filter((skill) => allowed.has(skill.name));
-      expect(skills.filter((skill) => skill.name === "verify-behavior")).toHaveLength(id === "architect" ? 0 : 1);
+      expect(allowed.has("verify-behavior")).toBe(id !== "architect");
       expect(childInstructions(role, `${id}-test`)).toContain(role.instructions);
     }
-    expect(registeredToolNames(loaded.extensions)).toEqual(expect.arrayContaining([
-      "agent_run", "agent_observe", "agent_input", "team_assign", "team_status", "team_result", "team_cancel",
-    ]));
-    expect(registeredToolNames(loaded.extensions)).toContain("board_post");
-    expect(registeredToolNames(loaded.extensions)).toContain("todo");
-
     const startup: Array<(event: unknown, ctx: { hasUI: boolean; ui: { notify(): void; setStatus(): void } }) => Promise<void>> = [];
     const tools = new Map<string, { execute: Function }>();
     const active: string[] = [];

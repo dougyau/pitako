@@ -9,7 +9,7 @@ import { hasLspServerForExtension } from "./lsp.ts";
 import { parse, Lang, type SgNode } from "@ast-grep/napi";
 import { workspacePath, resolveLanguage, QUERY_BUDGETS, type Language } from "./contracts.ts";
 import { canonicalPath } from "../board/paths.ts";
-import { graphBuildFailure, withCodeGraph as withGraph, withExistingCodeGraph } from "./graph.ts";
+import { graphBuildFailure, withCodeGraph as withGraph, withExistingCodeGraph, type GraphDependencies } from "./graph.ts";
 import { lspWorkspaceRoot, queryLsp } from "./lsp.ts";
 import { CODE_SOURCES, type CodeSource, type DenseCallUsage, type GraphCallUsage, type SourceUsage, type ToolOutcome } from "./metrics.ts";
 
@@ -28,7 +28,7 @@ const LANG_TO_AST: Record<Language, Lang> = {
 
 type Result = { content: [{ type: "text"; text: string }]; details: Record<string, unknown>; isError?: boolean };
 type QueryMetrics = { sources: Partial<Record<CodeSource, SourceUsage>>; graph: GraphCallUsage & { states: Record<string, number> } };
-type ToolContext = { cwd: string; queryMetrics?: QueryMetrics; nestedCodeQuery?: boolean };
+type ToolContext = { cwd: string; queryMetrics?: QueryMetrics; nestedCodeQuery?: boolean; graphDependencies?: GraphDependencies };
 type Ctx = ToolContext & { signal: AbortSignal; queryMetrics: QueryMetrics };
 const errorResult = (error: unknown): Result => ({ content: [{ type: "text", text: `unavailable: ${error instanceof Error ? error.message : String(error)}` }], details: { status: "unavailable" }, isError: true });
 function newQueryMetrics(): QueryMetrics {
@@ -310,7 +310,7 @@ function graphFileConsumers(g: any, relative: string) {
 }
 async function moduleGraph(root: string, file: string, ctx: Ctx) {
   const relative = path.relative(root, file);
-  const graph = await graphQuery(ctx, () => withGraph(root, ctx.signal, (g) => graphFileConsumers(g, relative)));
+  const graph = await graphQuery(ctx, () => withGraph(root, ctx.signal, (g) => graphFileConsumers(g, relative), ctx.graphDependencies));
   return graph.value ?? { status: "unavailable", reason: graph.unavailable, consumers: null };
 }
 function sourceFor(root: string, input: string): { file: string; source: string } {
@@ -504,7 +504,7 @@ export const project_report = tool("project_report", "Bounded project, worktree 
   const packageData = manifests.filter((f) => path.basename(f) === "package.json").slice(0, 8).map((f) => {
     try { const pkg = JSON.parse(readFileSync(workspacePath(root, f), "utf8")); return { file: f, name: pkg.name, scripts: pkg.scripts ?? {} }; } catch { return { file: f, status: "unreadable" }; }
   });
-  const graph = await graphQuery(ctx, () => withExistingCodeGraph(root, ctx.signal, (g) => ({ indexedFiles: g.getFiles().length })));
+  const graph = await graphQuery(ctx, () => withExistingCodeGraph(root, ctx.signal, (g) => ({ indexedFiles: g.getFiles().length }), ctx.graphDependencies));
   const freshness = graph.value?.freshness;
   const graphReady = freshness?.indexState === "complete" && !freshness.engineStale && !Object.values(freshness.changedFiles).some((items) => items.length > 0);
   const graphReport = graph.value
@@ -930,7 +930,7 @@ export const review_surface = tool("review_surface", "Summarize bounded changes 
     const truncated = totalChangedLines > showingChangedLines || (needsBase && baseSource === undefined);
     surfaces.push({ file: relative, status: deleted ? "deleted" : entry?.renamedFrom ? "renamed" : "parsed", change, renamedFrom: entry?.renamedFrom, changedLines: totalChangedLines, showingChangedLines, lineCoverage, truncated, ...(baseSourceStatus ? { baseSourceStatus } : {}), ...(content ? { content } : {}), enclosures });
   }
-  const graph = await graphQuery(ctx, () => withGraph(root, ctx.signal, (g) => ({ files: Object.fromEntries(files.map((relative) => [relative, graphFileConsumers(g, relative)])) })));
+  const graph = await graphQuery(ctx, () => withGraph(root, ctx.signal, (g) => ({ files: Object.fromEntries(files.map((relative) => [relative, graphFileConsumers(g, relative)])) }), ctx.graphDependencies));
   const freshness = graph.value?.freshness;
   const graphChanged = !!freshness && (freshness.engineStale || Object.values(freshness.changedFiles).some((changedFiles) => changedFiles.length > 0));
   const graphFiles = graph.value ? Object.fromEntries(Object.entries(graph.value.files).map(([file, evidence]: [string, any]) => [file, evidence.status === "available" && graphChanged ? { ...evidence, status: "partial", reason: "index changed during query" } : evidence])) : undefined;

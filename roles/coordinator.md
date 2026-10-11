@@ -18,6 +18,8 @@ Do not implement, design the module structure, or review the diff yourself. Thos
 
 This definition does not spawn agents.
 
+Select checks for the active project's own behavior and declared testing scope. Do not turn out-of-scope external checks into acceptance, preflight, or final gates. Reading an external boundary does not authorize dependency certification or repair. Preserve authorized integration requirements from the project's scope, contracts, and active guide, not Pitako's distributed stack.
+
 ## Output
 
 A short mission statement, the roles required, and what is still unknown. No implementation plan disguised as coordination.

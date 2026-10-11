@@ -1,4 +1,5 @@
-import "./fixtures/offline.ts";
+import { stubExternalFactories } from "./fixtures/offline.ts";
+stubExternalFactories();
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, test } from "bun:test";
@@ -13,8 +14,6 @@ import {
 import pitako from "../extensions/index.ts";
 import { profileNote } from "../extensions/profile.ts";
 import { packageRoot } from "../extensions/stack.ts";
-import { registeredToolNames } from "../scripts/load-pitako.ts";
-import { loadPitako } from "./fixtures/owned-pitako.ts";
 import codegraphRaw from "../extensions/code-intelligence/codegraph-raw.ts";
 import { CODE_INTELLIGENCE_TOOL_NAMES } from "../extensions/code-intelligence/metrics.ts";
 import { toolsForProfile } from "../extensions/profile.ts";
@@ -24,51 +23,20 @@ function readRepo(relative: string): string {
 }
 
 describe("engineering-layer composition", () => {
-  test("loads standalone pre-pr skill without a frozen plan prerequisite", async () => {
-    const loaded = await loadPitako(packageRoot());
-    const prePr = loaded.loader.getSkills().skills.find((skill) => skill.name === "pre-pr");
-    expect(prePr).toMatchObject({
-      name: "pre-pr",
-      description: "Prepare the current worktree's branch diff for first or later publication without `$execute` or a frozen plan.",
-    });
-  });
-
-  test("loads curated skills and keeps LSP plus CodeGraph", async () => {
-    const loaded = await loadPitako(packageRoot());
-    expect(loaded.extensions.errors).toEqual([]);
-
-    const extensionPaths = loaded.extensions.extensions.map((extension) => extension.resolvedPath);
-    expect(extensionPaths.some((file) => file.endsWith("extensions/index.ts"))).toBe(true);
-    expect(extensionPaths.some((file) => file.includes(`${path.sep}pi-lsp-client${path.sep}`))).toBe(true);
-    expect(extensionPaths.some((file) => file.endsWith(`${path.sep}codegraph-raw.ts`))).toBe(true);
-    expect(extensionPaths.some((file) => file.includes(`${path.sep}rpiv-todo${path.sep}`))).toBe(true);
-    expect(extensionPaths.some((file) => file.endsWith(`${path.sep}extensions${path.sep}board${path.sep}index.ts`))).toBe(true);
-    expect(extensionPaths.some((file) => file.includes(`${path.sep}ponytail${path.sep}pi-extension${path.sep}`))).toBe(false);
-    const registered = registeredToolNames(loaded.extensions);
-    expect(registered).toEqual(expect.arrayContaining([...CODE_INTELLIGENCE_TOOL_NAMES, "codegraph_search", "lsp_diagnostics"]));
-    const active = toolsForProfile({ available: [...registered, "read", "grep", "bash", "edit", "write"], profile: "coding" });
+  test("declares curated resources without executing external extensions", () => {
+    const manifest = JSON.parse(readRepo("package.json")).pi;
+    expect(readRepo("skills/pre-pr/SKILL.md")).toContain("Prepare the current worktree");
+    expect(manifest.extensions[0]).toBe("./extensions/index.ts");
+    for (const entry of ["./extensions/board/index.ts", "./extensions/agent/index.ts",
+      "./extensions/code-intelligence/codegraph-raw.ts", "./node_modules/pi-lsp-client/src/index.ts",
+      "./node_modules/@juicesharp/rpiv-todo/index.ts"]) expect(manifest.extensions).toContain(entry);
+    expect(manifest.extensions.some((entry: string) => entry.includes("ponytail"))).toBe(false);
+    const skills = manifest.skills.filter((entry: string) => !entry.includes("node_modules"));
+    expect(skills).toEqual(expect.arrayContaining(["./skills/pitako-coding", "./skills/practical", "./skills/principles"]));
+    for (const name of ["pitako-coding", "ponytail", "caveman", "verify-behavior"]) expect(DEFAULT_SKILL_NAMES as readonly string[]).toContain(name);
+    for (const name of [...EXCLUDED_SKILL_NAMES, ...OPTIONAL_LANGUAGE_SKILLS]) expect(DEFAULT_SKILL_NAMES as readonly string[]).not.toContain(name);
+    const active = toolsForProfile({ available: [...CODE_INTELLIGENCE_TOOL_NAMES, "read", "grep", "bash", "edit", "write"], profile: "coding" });
     expect(active).toEqual(expect.arrayContaining([...CODE_INTELLIGENCE_TOOL_NAMES, "read", "grep", "bash", "edit", "write"]));
-    expect(extensionPaths.some((file) => file.includes("pstack"))).toBe(false);
-    // Pi awaits handlers serially. Owner revocation must be the first packaged
-    // lifecycle handler, not just precede the agent tool entrypoint.
-    for (const event of ["session_start", "session_shutdown"]) {
-      const first = loaded.extensions.extensions.find(extension => extension.handlers.get(event)?.length);
-      expect(first?.resolvedPath).toBe(path.join(packageRoot(), "extensions/index.ts"));
-    }
-
-    const skills = loaded.loader.getSkills().skills.map((skill) => skill.name).sort();
-    for (const name of DEFAULT_SKILL_NAMES) {
-      expect(skills).toContain(name);
-    }
-    for (const name of EXCLUDED_SKILL_NAMES) {
-      expect(skills).not.toContain(name);
-    }
-    for (const name of OPTIONAL_LANGUAGE_SKILLS) {
-      expect(skills).not.toContain(name);
-    }
-    expect(skills).toContain("pitako-coding");
-    expect(skills).toContain("ponytail");
-    expect(skills).toContain("caveman");
   });
 
   test("CodeGraph facade keeps raw tools but skips only its conflicting prompt hook", () => {
@@ -140,10 +108,7 @@ describe("engineering-layer composition", () => {
   });
 
   test("loaded shared evidence policy preserves assignment and required boundaries", async () => {
-    const loaded = await loadPitako(packageRoot());
-    const skill = loaded.loader.getSkills().skills.find((entry) => entry.name === "verify-behavior");
-    expect(skill).toBeDefined();
-    const verify = readFileSync(skill!.filePath, "utf8");
+    const verify = readRepo("skills/practical/verify-behavior/SKILL.md");
     for (const contract of [
       "scripts/verification-recipe-v1.js",
       "binding.executionRoot",
@@ -164,12 +129,8 @@ describe("engineering-layer composition", () => {
   });
 
   test("loaded execute and evidence guidance distinguish observation, input, and optional advice", async () => {
-    const loaded = await loadPitako(packageRoot());
-    const skillText = (name: string) => {
-      const skill = loaded.loader.getSkills().skills.find(entry => entry.name === name);
-      expect(skill).toBeDefined();
-      return readFileSync(skill!.filePath, "utf8");
-    };
+    const skillText = (name: string) => readRepo(name === "verify-behavior"
+      ? "skills/practical/verify-behavior/SKILL.md" : `skills/${name}/SKILL.md`);
     const execute = skillText("execute");
     expect(execute).not.toContain("There is no steer into a running worker");
     for (const contract of [

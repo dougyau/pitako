@@ -56,6 +56,7 @@ export function reconcileChildTools(session: {
 }
 
 const NAVIGATION_GUIDANCE = "Inspect the repo first. Keep raw read/grep/bash/LSP/CodeGraph available. For bounded structural code questions, choose an appropriate supported dense query; use raw tools for literal, exhaustive or exact results; follow up with raw tools if a query/backend is partial or unavailable.";
+const VERIFICATION_GUIDANCE = "Verify real behavior before claiming done. Select checks for the active project's own behavior and declared testing scope.";
 
 const BUILTIN_TOOLS = new Set([
   "read",
@@ -116,11 +117,12 @@ export function toolsForProfile(options: {
 export function profileNote(profile: ProfileName): string {
   const shared = [
     NAVIGATION_GUIDANCE,
-    "Keep diffs small. Reuse existing code. Do not add speculative machinery.",
-    "Verify real behavior before claiming done. Load a specialized skill only when it applies.",
+    "Keep diffs small. Reuse code; avoid speculation.",
+    VERIFICATION_GUIDANCE,
+    "Load a specialized skill only when it applies.",
     "Research or design does not authorize implementation.",
-    "The model and provider are whatever the user selected in Pi.",
-    "Board tools are pull-only shared knowledge. rpiv-todo is the session plan. Do not paste Board posts into the turn.",
+    "Pi owns model and provider selection.",
+    "Board tools are pull-only; do not paste posts into the turn. rpiv-todo is the session plan.",
   ];
   if (profile === "analysis") {
     return [
@@ -143,7 +145,8 @@ export function childSessionNote(instanceId: string): string {
     `Pitako AgentInstance ${instanceId}.`,
     "The model and reasoning come from this role's ModelPolicy, not from the parent session.",
     NAVIGATION_GUIDANCE,
-    "Keep diffs small. Verify real behavior before claiming done.",
+    "Keep diffs small.",
+    VERIFICATION_GUIDANCE,
     "Board tools are pull-only. rpiv-todo is private to this session. Do not spawn agents.",
   ].join(" ");
 }

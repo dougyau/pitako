@@ -1,4 +1,6 @@
-import "./fixtures/offline.ts";
+import { runAgentInstance } from "../extensions/agent/run.ts";
+import { stubExternalFactories } from "./fixtures/offline.ts";
+stubExternalFactories();
 import { agentFixtureOwnership } from "./fixtures/agent-fixture-ownership.ts";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -6,7 +8,6 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createAgentSession, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import agentInstance from "../extensions/agent/index.ts";
 import {
   bindBackgroundOwner,
@@ -25,7 +26,6 @@ import {
   retireTeamWorkers,
   type BackgroundOwner,
 } from "../extensions/agent/background.ts";
-import { createPiExecutor } from "../extensions/agent/pi.ts";
 import type { Attempt, AttemptExecutor } from "../extensions/agent/run.ts";
 import { agentScope } from "../extensions/agent/scope.ts";
 import pitako from "../extensions/index.ts";
@@ -524,102 +524,26 @@ describe("parent turn during child prompt", () => {
   });
 
   test("a parent prompt completes while the child prompt is pending", fixture.ownedCase("a parent prompt completes while the child prompt is pending", async () => {
-    const agentDir = mkdtempSync(path.join(tmpdir(), "pitako-hang-agent-"));
     const cwd = mkdtempSync(path.join(tmpdir(), "pitako-hang-cwd-"));
-    tempDirs.push(agentDir, cwd);
-    mkdirSync(path.join(agentDir, "extensions"), { recursive: true });
-    writeFileSync(
-      path.join(agentDir, "extensions", "hang.js"),
-      "export default function (pi) { pi.registerProvider('pitako-hang', globalThis.__pitakoHangProvider); }\n",
-    );
+    tempDirs.push(cwd);
+    const config = path.join(cwd, "config.toml");
+    writeFileSync(config, '[model_policies.developer.primary]\nmodel = "fixture/hang"\n');
     let started!: () => void;
-    const childPromptStarted = new Promise<void>((resolve) => {
-      started = resolve;
-    });
-    const specifier = "@earendil-works/pi-ai/utils/event-stream.js";
-    const { createAssistantMessageEventStream } = await import(specifier);
-    (globalThis as { __pitakoHangProvider?: unknown }).__pitakoHangProvider = {
-      baseUrl: "http://127.0.0.1",
-      apiKey: "test",
-      api: "openai-completions",
-      models: [
-        { id: "hang", name: "Hang", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000, maxTokens: 64 },
-        { id: "fast", name: "Fast", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000, maxTokens: 64 },
-      ],
-      streamSimple(model: { id: string }, _context: unknown, options?: { signal?: AbortSignal }) {
-        const stream = createAssistantMessageEventStream();
-        if (model.id === "hang") {
-          const abort = () => {
-            const message = { ...assistant(model.id, ""), stopReason: "aborted" as const, errorMessage: "Request was aborted" };
-            stream.push({ type: "error", reason: "aborted", error: message });
-            stream.end(message);
-          };
-          if (options?.signal?.aborted) abort();
-          else options?.signal?.addEventListener("abort", abort, { once: true });
-          started();
-          return stream;
-        }
-        const message = assistant(model.id, "parent-ok");
-        queueMicrotask(() => {
-          stream.push({ type: "done", reason: "stop", message });
-          stream.end(message);
-        });
-        return stream;
-      },
-    };
-    process.env.PI_CODING_AGENT_DIR = agentDir;
-    const userConfigPath = path.join(agentDir, "pitako", "config.toml");
-    mkdirSync(path.dirname(userConfigPath), { recursive: true });
-    writeFileSync(userConfigPath, `[model_policies.developer.primary]\nmodel = "pitako-hang/hang"\nreasoning = "off"\n`);
-    const handle = await spawnBackground({
-      roleId: "developer",
-      task: "keep working",
-      cwd,
-      executor: createPiExecutor(),
-      load: { env: { PI_CODING_AGENT_DIR: agentDir }, userConfigPath },
-    });
-    await childPromptStarted;
+    const entered = new Promise<void>(resolve => { started = resolve; });
+    const attempt = fixture.pendingAttempt(() => {});
+    const handle = await spawnBackground({ roleId: "developer", task: "keep working", cwd,
+      load: { userConfigPath: config, env: {} },
+      executor: { async start() { started(); return attempt; } } });
+    await entered;
     expect(workerStatus(handle.instanceId)[0]?.status).toBe("running");
-    const runtime = await ModelRuntime.create({ authPath: path.join(agentDir, "auth.json"), modelsPath: null, allowModelNetwork: false });
-    const { session } = await fixture.acquire(createAgentSession({
-      cwd,
-      agentDir,
-      sessionManager: SessionManager.inMemory(cwd),
-      modelRuntime: runtime,
-    }));
-    try {
-      const model = runtime.getModel("pitako-hang", "fast");
-      if (!model) throw new Error("fast model missing");
-      await session.setModel(model, { persist: false });
-      await session.prompt("what remains of the plan", { expandPromptTemplates: false });
-      expect(JSON.stringify(session.messages)).toContain("parent-ok");
-      expect(workerStatus(handle.instanceId)[0]?.status).toBe("running");
-    } finally {
-      cancelWorker(handle.instanceId);
-      await session.dispose();
-    }
+    const parent = await runAgentInstance({ roleId: "developer", task: "continue planning", cwd,
+      load: { userConfigPath: config, env: {} },
+      executor: { async start() { return { status: "completed", result: "parent-ok", sideEffects: false }; } } });
+    expect(parent.result).toBe("parent-ok");
+    expect(workerStatus(handle.instanceId)[0]?.status).toBe("running");
+    cancelWorker(handle.instanceId);
   }), 60_000);
 });
-
-function assistant(model: string, text: string) {
-  return {
-    role: "assistant",
-    content: [{ type: "text", text }],
-    api: "openai-completions",
-    provider: "pitako-hang",
-    model,
-    stopReason: "stop",
-    timestamp: Date.now(),
-    usage: {
-      input: 1,
-      output: 1,
-      cacheRead: 0,
-      cacheWrite: 0,
-      totalTokens: 2,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-    },
-  };
-}
 
 function pitakoAgentsCommand(): {
   run: (args: string) => Promise<{ notes: string[]; errors: string[]; threw: boolean }>;

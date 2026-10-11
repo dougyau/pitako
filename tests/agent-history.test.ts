@@ -1,9 +1,9 @@
 import { afterEach, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { InvocationHistory, WorkerHistory, nativeHistoryStatus } from "../extensions/agent/history.ts";
+import { queryHistory } from "../extensions/agent/history-query.ts";
 const roots: string[] = [];
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -52,14 +52,6 @@ test("preparation fails closed, leaves admission, and does not overwrite an allo
   writeFileSync(file, "sentinel");
   expect(() => history.createSession(group.groupId, member.historyId, workspace)).toThrow();
   expect(readFileSync(file, "utf8")).toBe("sentinel");
-  // Native public API itself refuses collision on its first persistence.
-  expect(() => manager.appendMessage({
-    role: "assistant", content: [{ type: "text", text: "offline" }], api: "openai-completions",
-    provider: "fixture", model: "fixture", stopReason: "stop", timestamp: Date.now(),
-    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-  })).toThrow();
-  expect(readFileSync(file, "utf8")).toBe("sentinel");
   expect(nativeHistoryStatus({ ...history.read(group.groupId).members[0]!,
     native: { state: "allocated", path: path.join(root, "lost.jsonl"), sessionId: "lost", disposition: { state: "pending" } },
     terminal: { status: "failed", at: "now", beforeFirstAssistant: false },
@@ -84,12 +76,14 @@ test("group references canonical authorities and rejects invalid locators and un
   expect(() => history.read(independent.groupId)).toThrow("unsupported or invalid");
 });
 
-test("recorded historical aliases remain native-readable without managed production", () => {
+test("recorded historical aliases remain readable by Pitako without managed production", async () => {
   const { root, workspace, history, group, member } = fixture();
   const directory = path.join(root, "historical-sessions");
   mkdirSync(directory);
-  const manager = SessionManager.create(workspace, directory);
-  manager.appendMessage({ role: "user", content: "historical alias input", timestamp: Date.now() });
+  const nativeId = "recorded-native", nativeFile = path.join(directory, "recorded.jsonl");
+  const bytes = '{"type":"session","id":"recorded-native"}\n' +
+    '{"type":"message","message":{"role":"user","content":"historical alias input"}}\n';
+  writeFileSync(nativeFile, bytes);
   const alias = path.join(history.agentDir, "sessions", "recorded-discovery-alias");
   mkdirSync(path.dirname(alias), { recursive: true });
   symlinkSync(directory, alias);
@@ -98,16 +92,18 @@ test("recorded historical aliases remain native-readable without managed product
   recorded.identity = { kind: "mission", storeRoot: root, missionId: "historical" };
   recorded.missionStore = { dbPath: path.join(root, "absent-mission.db"), objectDir: root, sessionsDirectory: directory };
   recorded.aliases = [{ path: alias, target: directory }];
-  recorded.members[0]!.native = { state: "allocated", sessionId: manager.getSessionId(),
-    path: path.join(alias, path.basename(manager.getSessionFile()!)), disposition: { state: "disposed", at: "historical" } };
+  recorded.members[0]!.native = { state: "allocated", sessionId: nativeId,
+    path: path.join(alias, path.basename(nativeFile)), disposition: { state: "disposed", at: "historical" } };
   writeFileSync(catalog, JSON.stringify(recorded));
   const before = readFileSync(catalog);
   const recovered = new WorkerHistory(history.agentDir).read(group.groupId);
   expect(recovered.aliases).toEqual(recorded.aliases);
   expect(recovered.members[0]!.historyId).toBe(member.historyId);
   expect(nativeHistoryStatus(recovered.members[0]!)).toMatchObject({ state: "present" });
-  expect(SessionManager.open(recovered.members[0]!.native.state === "allocated"
-    ? recovered.members[0]!.native.path : "").getEntries()).toEqual(manager.getEntries());
+  const page = await queryHistory({ action: "read", historyId: member.historyId }, undefined, history.agentDir);
+  expect(page.diagnostics.map(row => row.code)).toContain("native_physical_order");
+  expect(page.cursor).toBeNull();
+  expect(page.items.map(item => Buffer.from((item as { data: string }).data, "base64").toString()).join("")).toBe(bytes);
   expect(readFileSync(catalog)).toEqual(before);
   expect(existsSync(recorded.missionStore.dbPath)).toBe(false);
 });

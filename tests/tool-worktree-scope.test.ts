@@ -3,31 +3,19 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
-import { createBashTool, createEditTool, createGrepTool, createReadTool } from "@earendil-works/pi-coding-agent";
+import { project_report, read_enclosing } from "../extensions/code-intelligence/tools.ts";
+import { bindLspApi } from "../extensions/code-intelligence/lsp.ts";
 import { openBoard } from "../extensions/board/store.ts";
 import { repositoryIdentity } from "../extensions/board/workspace.ts";
 import { runAgentInstance } from "../extensions/agent/run.ts";
 import { ledgerFile, openExecutionPlan, planFile } from "../extensions/workflow.ts";
-import { settleOwnedCodeGraph } from "../scripts/owned-codegraph.ts";
 
 const tempDirs: string[] = [];
 
-afterEach(async () => {
-  // Roots stay until both native daemons and their watchdog children terminate.
-  for (const dir of tempDirs) {
-    if (!path.basename(dir).startsWith("pitako-intelligence-worktree-")) continue;
-    for (const name of ["A", "B"]) {
-      const project = path.join(dir, name);
-      if (!existsSync(project)) continue;
-      const receipt = await settleOwnedCodeGraph(project);
-      console.error(`PITAKO_WORKTREE_SETTLED=${JSON.stringify(receipt)}`);
-    }
-  }
-  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
-});
+afterEach(() => { for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 describe("tool worktree defaults", () => {
-  test("keeps frozen source and Board owner in A while Pi tools and child actions use B", async () => {
+  test("keeps frozen source and Board owner in A while Pitako child dispatch uses B", async () => {
     const base = mkdtempSync(path.join(tmpdir(), "pitako-physical-worktree-"));
     tempDirs.push(base);
     const source = path.join(base, "A");
@@ -67,16 +55,6 @@ describe("tool worktree defaults", () => {
     expect(family.readTopic(repositoryIdentity(execution), topic.id).topic.ownerPlanId).toBe(planId);
     family.close();
 
-    const execute = async (tool: { execute: (...args: any[]) => Promise<any> }, params: unknown) =>
-      tool.execute("physical-worktree", params, undefined, undefined);
-    const read = await execute(createReadTool(execution), { path: "src/scope.ts" });
-    expect(resultText(read)).toContain("onlyInB");
-    const grep = await execute(createGrepTool(execution), { pattern: "onlyInB", path: "src", literal: true });
-    expect(resultText(grep)).toContain("onlyInB");
-    const edit = createEditTool(execution);
-    await execute(edit, { path: "src/scope.ts", edits: [{ oldText: 'return "B"', newText: 'return "B edited"' }] });
-    await execute(edit, { path: "test/scope.test.ts", edits: [{ oldText: 'toBe("B")', newText: 'toBe("B edited")' }] });
-
     const configFile = path.join(base, "pitako.toml");
     writeFileSync(configFile, '[model_policies.developer]\nprimary = { model = "test/child" }\n');
     const child = await runAgentInstance({
@@ -87,10 +65,9 @@ describe("tool worktree defaults", () => {
       load: { cwd: execution, userConfigPath: configFile, env: {} },
       executor: {
         async start({ cwd }) {
-          const result = await execute(createBashTool(cwd), { command: 'printf child-B > child-action.txt' });
-          return result.isError
-            ? { status: "failed", result: "", error: resultText(result), sideEffects: true }
-            : { status: "completed", result: "child action used B", sideEffects: true };
+          expect(cwd).toBe(execution);
+          writeFileSync(path.join(cwd, "child-action.txt"), "child-B");
+          return { status: "completed", result: "child action used B", sideEffects: true };
         },
       },
     });
@@ -98,116 +75,51 @@ describe("tool worktree defaults", () => {
     expect(existsSync(path.join(execution, "child-action.txt"))).toBe(true);
     expect(existsSync(path.join(source, "child-action.txt"))).toBe(false);
 
-    const testRun = await execute(createBashTool(execution), { command: "bun test", timeout: 120_000 });
-    expect(testRun.isError).not.toBe(true);
-    expect(resultText(testRun)).toContain("1 pass");
-    const diff = await execute(createBashTool(execution), { command: "git diff -- src/scope.ts test/scope.test.ts" });
-    expect(resultText(diff)).toContain('return "B edited"');
-    expect(git(source, ["diff", "--", "src/scope.ts", "test/scope.test.ts"])).toBe("");
     expect(readFileSync(path.join(source, "src/scope.ts"), "utf8")).toContain("onlyInA");
   }, 120_000);
 
-  test("CodeGraph and LSP use B when Pi launches in B", async () => {
-    const base = mkdtempSync(path.join(tmpdir(), "pitako-intelligence-worktree-"));
-    tempDirs.push(base);
-    const source = path.join(base, "A");
-    const execution = path.join(base, "B");
-    mkdirSync(path.join(source, "src"), { recursive: true });
-    writeFileSync(path.join(source, ".gitignore"), ".codegraph/\n.pi/\n");
-    writeFileSync(path.join(source, "src", "scope.ts"), 'export function onlyInA() { return "A"; }\n');
-    execFileSync("git", ["init", "-q", "-b", "A"], { cwd: source, stdio: "ignore" });
-    git(source, ["add", "."]);
-    git(source, ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial", "-q"]);
-    mkdirSync(path.dirname(execution), { recursive: true });
-    git(source, ["worktree", "add", "-q", "-b", "B", execution]);
-    writeFileSync(path.join(execution, "src", "scope.ts"), 'export function onlyInB() { return "B"; }\n');
-    mkdirSync(path.join(source, ".pi"), { recursive: true });
-    writeFileSync(path.join(source, ".pi", "lsp-client.json"), JSON.stringify({ lsp: { onlyAConfig: { command: ["unused-a"], extensions: [".onlya"] } } }));
-    mkdirSync(path.join(execution, ".pi"), { recursive: true });
-    writeFileSync(path.join(execution, ".pi", "lsp-client.json"), JSON.stringify({ lsp: { onlyBConfig: { command: ["unused-b"], extensions: [".onlyb"] } } }));
-    execFileSync("codegraph", ["init"], { cwd: source, stdio: "pipe", timeout: 120_000 });
-    execFileSync("codegraph", ["init"], { cwd: execution, stdio: "pipe", timeout: 120_000 });
-
-    const imports = {
-      pitako: new URL("../extensions/index.ts", import.meta.url).href,
-      codegraph: new URL("../node_modules/@vndv/pi-codegraph/extensions/codegraph.ts", import.meta.url).href,
-      lsp: new URL("../node_modules/pi-lsp-client/src/index.ts", import.meta.url).href,
-      manager: new URL("../node_modules/pi-lsp-client/src/lsp/manager.ts", import.meta.url).href,
-      configLoader: new URL("../node_modules/pi-lsp-client/src/lsp/config-loader.ts", import.meta.url).href,
-    };
-    const script = `
-      const tools = new Map();
-      const handlers = [];
-      const pi = {
-        registerFlag() {}, registerTool(tool) { tools.set(tool.name, tool); }, registerCommand() {},
-        on(name, handler) { if (name === "tool_call") handlers.push(handler); return () => {}; },
-        getFlag() {}, getActiveTools() { return []; }, getAllTools() { return []; }, setActiveTools() {},
-        getSessionName() {}, setSessionName() {},
-      };
-      const { default: codegraph } = await import(${JSON.stringify(imports.codegraph)});
-      const { default: lsp } = await import(${JSON.stringify(imports.lsp)});
-      const { default: pitako } = await import(${JSON.stringify(imports.pitako)});
-      const { getLspManager, disposeDefaultLspManager } = await import(${JSON.stringify(imports.manager)});
-      const { getConfigPaths, getMergedServers } = await import(${JSON.stringify(imports.configLoader)});
-      codegraph(pi); lsp(pi); pitako(pi);
-      const call = async (name, input, cwd) => {
-        const event = { toolName: name, input };
-        for (const handler of handlers) {
-          const blocked = await handler(event, { cwd, hasUI: false, ui: { notify() {} } });
-          if (blocked?.block) return { blocked: true, reason: blocked.reason, input: event.input };
-        }
-        const result = await tools.get(name).execute(name, event.input, undefined, undefined, { cwd });
-        return {
-          blocked: false,
-          input: event.input,
-          text: result.content.filter((part) => part.type === "text").map((part) => part.text).join("\\n"),
-          details: result.details,
-        };
-      };
-      try {
-        const a = await call("codegraph_search", { query: "onlyInA", projectPath: process.env.PITAKO_SCOPE_A }, process.cwd());
-        const b = await call("codegraph_search", { query: "onlyInB" }, process.cwd());
-        const lsp = await call("lsp_symbols", { filePath: "src/scope.ts", scope: "document" }, process.cwd());
-        const roots = getLspManager().getSnapshot().map((client) => client.root);
-        const projectConfig = getConfigPaths().project;
-        const projectServers = getMergedServers().filter((server) => server.source === "project");
-        console.log(JSON.stringify({ cwd: process.cwd(), a, b, lsp, roots, projectConfig, projectServers }));
-      } finally {
-        await disposeDefaultLspManager();
-      }
-    `;
-    const stdout = execFileSync(process.execPath, ["-e", script], {
-      cwd: execution,
-      encoding: "utf8",
-      timeout: 120_000,
-      env: { ...process.env, PITAKO_SCOPE_A: source },
-      stdio: ["ignore", "pipe", "pipe"],
+  test("Pitako routes graph and LSP adapter inputs to execution B and rejects outside files", async () => {
+    const base = mkdtempSync(path.join(tmpdir(), "pitako-intelligence-worktree-")); tempDirs.push(base);
+    const source = path.join(base, "A"), execution = path.join(base, "B");
+    for (const dir of [source, execution]) { mkdirSync(dir); writeFileSync(path.join(dir, "README.md"), "# Guide\n"); }
+    const key = Symbol.for("pitako.code-intelligence.lsp-registry"), lookup = Symbol.for("pitako.code-intelligence.lsp-extension-lookup");
+    const globals = globalThis as typeof globalThis & { [key: symbol]: any };
+    const previous = globals[key], previousLookup = globals[lookup];
+    delete globals[key]; delete globals[lookup];
+    const queried: string[] = [], graphRoots: string[] = [];
+    bindLspApi({
+      findWorkspaceRoot: file => path.dirname(file),
+      createManager: () => ({ stopAll: async () => {} }),
+      findServerForExtension: () => ({ status: "configured" }),
+      async withLspClient(file, run) { queried.push(file); return run({ documentSymbols: async () => [
+        { name: "Guide", kind: 12, range: { start: { line: 0, character: 0 }, end: { line: 0, character: 7 } } },
+      ] }); },
     });
-    const result = JSON.parse(stdout.trim().split("\n").at(-1)!) as {
-      cwd: string;
-      a: { input: { projectPath?: string }; text: string };
-      b: { input: { projectPath?: string }; text: string };
-      lsp: { input: { filePath?: string }; text: string; details?: { filePath?: string } };
-      roots: string[];
-      projectConfig: string;
-      projectServers: Array<{ id: string; source: string }>;
-    };
-    expect(result.cwd).toBe(execution);
-    expect(result.a.input.projectPath).toBe(source);
-    expect(result.a.text).toContain("onlyInA");
-    expect(result.a.text).not.toContain("onlyInB");
-    expect(result.b.input).not.toHaveProperty("projectPath");
-    expect(result.b.text).toContain("onlyInB");
-    expect(result.b.text).not.toContain("onlyInA");
-    expect(result.lsp.input.filePath).toBe("src/scope.ts");
-    expect(result.lsp.text).toContain("onlyInB");
-    expect(result.lsp.text).not.toContain("onlyInA");
-    expect(result.lsp.details?.filePath).toBe("src/scope.ts");
-    expect(result.roots).toContain(execution);
-    expect(result.projectConfig).toBe(path.join(execution, ".pi", "lsp-client.json"));
-    expect(result.projectServers).toContainEqual(expect.objectContaining({ id: "onlyBConfig", source: "project" }));
-    expect(result.projectServers.map((server) => server.id)).not.toContain("onlyAConfig");
-  }, 150_000);
+    const graphDependencies = { unsupportedRuntime: () => undefined, sdk: async () => ({
+      getCodeGraphDir: (dir: string) => path.join(dir, ".controlled"),
+      CodeGraph: { isInitialized(dir: string) { graphRoots.push(dir); return false; } },
+    }) };
+    try {
+      await project_report.execute("B", {}, new AbortController().signal, undefined, { cwd: execution, graphDependencies });
+      expect(graphRoots).toEqual([execution]);
+      for (const file of ["README.md", path.join(execution, "README.md")]) {
+        const result = await read_enclosing.execute("scope", { file, line: 1 }, new AbortController().signal, undefined, { cwd: execution });
+        expect(result.details.status, JSON.stringify(result.content)).toBe("ok");
+      }
+      const outside = await read_enclosing.execute("outside", { file: path.join(source, "README.md"), line: 1 },
+        new AbortController().signal, undefined, { cwd: execution });
+      expect(outside.details.status).toBe("unavailable");
+      expect(outside.content[0]?.text).toContain("path escapes workspace");
+      expect(queried).toEqual([path.join(execution, "README.md"), path.join(execution, "README.md")]);
+    } finally {
+      const shared = await globals[key];
+      await Promise.all([...shared.queues.values()]);
+      await shared.manager.stopAll();
+      if (previous === undefined) delete globals[key]; else globals[key] = previous;
+      if (previousLookup === undefined) delete globals[lookup]; else globals[lookup] = previousLookup;
+    }
+  });
+
 });
 
 function git(cwd: string, args: string[]): string {

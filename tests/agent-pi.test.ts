@@ -1,1055 +1,270 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterAll, afterEach, describe, expect, spyOn, test } from "bun:test";
-import { AgentSession, createAgentSession, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
-import { WorkerHistory, SessionHistory, nativeHistoryStatus } from "../extensions/agent/history.ts";
-import { executionForSession } from "../extensions/execution-identity.ts";
-import { classifyProviderFailure } from "../extensions/agent/fallback.ts";
+import { afterEach, describe, expect, test } from "bun:test";
 import { activateTarget, createPiExecutor, cursorProviderContext, DEFAULT_THINKING_LEVEL } from "../extensions/agent/pi.ts";
+import { classifyProviderFailure } from "../extensions/agent/fallback.ts";
+import { executionForSession } from "../extensions/execution-identity.ts";
 import { runAgentInstance, teamExecutionSummary } from "../extensions/agent/run.ts";
-import { childActiveTools, ORCHESTRATION_TOOLS } from "../extensions/profile.ts";
-import { loadPitako } from "../scripts/load-pitako.ts";
-import { packageRoot } from "../extensions/stack.ts";
+import { ORCHESTRATION_TOOLS } from "../extensions/profile.ts";
 import { providerFixtureOwnership } from "./fixtures/provider-fixture-ownership.ts";
-import type { ResolvedRole } from "../extensions/roles/types.ts";
+import { controlledModel, controlledPi, controlledRole } from "./fixtures/pi-factories.ts";
 
-// Hermes captures AGENT_ROOT at import time. Later sessions reuse that storage
-// even after PI_CODING_AGENT_DIR changes; its owner is this file, not one case.
-const fixture = providerFixtureOwnership({ deferDirectories: true });
-const tempDirs = fixture.directories;
+const fixture = providerFixtureOwnership();
 afterEach(fixture.requireReleasedFixture);
-afterAll(fixture.releaseDirectories);
+function setup(options: Parameters<typeof controlledPi>[1] = {}) {
+  const root = mkdtempSync(path.join(tmpdir(), "pitako-pi-policy-"));
+  fixture.directories.push(root);
+  process.env.PI_CODING_AGENT_DIR = root;
+  const host = controlledPi(root, options);
+  const input = { instanceId: "developer-controlled", role: controlledRole, cwd: root, task: "exact task",
+    target: { model: "fixture/selected" }, signal: new AbortController().signal };
+  const executor = createPiExecutor({ factories: host.factories });
+  return { root, host, input, executor };
+}
 
-describe("cursor request", () => {
-  test("keeps session tools on the provider context", () => {
-    const tools = [{ name: "bash", description: "run", parameters: { type: "object" } }];
-    const context = cursorProviderContext(
-      { provider: "cursor", api: "cursor-native" },
-      { systemPrompt: "Pitako", messages: [], tools: tools as never },
-    );
-    expect(context.tools).toEqual(tools);
-    expect(cursorProviderContext({ provider: "xai" }, { messages: [], tools: tools as never }).tools).toEqual(tools);
-  });
-
-
+test("cursor context preserves session tools without changing other providers", () => {
+  const tools = [{ name: "bash", description: "run", parameters: { type: "object" } }];
+  const context = { messages: [], tools: tools as never };
+  expect(cursorProviderContext({ provider: "cursor", api: "cursor-native" }, context).tools).toEqual(tools);
+  expect(cursorProviderContext({ provider: "xai" }, context)).toBe(context);
 });
 
-describe("pi adapter boundary", () => {
-  test.serial("ordinary production child runs public codemode and retains native history under Node offline", fixture.ownedCase("ordinary public codemode under Node", async () => {
-    const temporaryDirectory = mkdtempSync(path.join(tmpdir(), "pitako-codemode-node-"));
-    tempDirs.push(temporaryDirectory);
-    const child = spawnSync("node", ["--experimental-transform-types", "--import", "./scripts/sdk-node-loader.mjs",
-      "scripts/agent-history-sdk-node.mjs"], {
-      cwd: packageRoot(), encoding: "utf8", timeout: 60_000,
-      env: { ...process.env, PI_OFFLINE: "1", PI_TELEMETRY: "0", TMPDIR: temporaryDirectory },
-    });
-    expect(child.status, child.stderr + child.stdout).toBe(0);
-    const observed = JSON.parse(child.stdout);
-    expect(observed.ordinaryChild).toMatchObject({
-      providerCalls: 7, codemodeCalls: 4, actualReadBash: true, hooks: true,
-      validation: true, orchestrationExcluded: true, disposedIdentity: true,
-    });
-    expect(observed.ordinaryChild.recipe.logs.map((log: { status: string }) => log.status)).toEqual(["passed", "failed"]);
-    expect(observed.ordinaryChild.recipe.toolError).toBe("incomplete");
-    expect(observed.ordinaryChild.parallel.exitCode).toBe(0);
-    expect(new Set(observed.ordinaryChild.parallel.workerPids).size).toBe(2);
-    expect(observed.recovered.preassistant).toBe("cancelled-with-retained-user");
-    expect(observed.removedWorktree).toBe(true);
-    expect(observed.paidCalls).toBe(0);
-  }), 90_000);
+test("activation preserves auth classification and explicit, per-model, global and SDK reasoning defaults", async () => {
+  const model = controlledModel();
+  const error = await activateTarget({ async setModel() { throw new Error("No API key for fixture/selected"); },
+    setThinkingLevel() { throw new Error("must not activate"); } }, model, { model: "fixture/selected" });
+  expect(classifyProviderFailure(error)).toBe("auth");
+  let level: string | undefined;
+  const session = { async setModel() {}, setThinkingLevel(next: string) { level = next; },
+    settingsManager: { getModelThinkingLevel: () => "low" as const, getDefaultThinkingLevel: () => "medium" as const } };
+  await activateTarget(session, model, { model: "fixture/selected", reasoning: "high" });
+  expect(level).toBe("high");
+  await activateTarget(session, model, { model: "fixture/selected" });
+  expect(level).toBe("low");
+  await activateTarget({ ...session, settingsManager: { getModelThinkingLevel() { return undefined; }, getDefaultThinkingLevel: () => "medium" as const } },
+    model, { model: "fixture/selected" });
+  expect(level).toBe("medium");
+  await activateTarget({ ...session, settingsManager: undefined }, model, { model: "fixture/selected" });
+  expect(level).toBe(DEFAULT_THINKING_LEVEL);
+});
 
-  test.serial("restores persisted catalogs before primary and fallback child activation offline", fixture.ownedCase("restores persisted catalogs before primary and fallback child activation offline", async () => {
-    const agentDir = mkdtempSync(path.join(tmpdir(), "pitako-cached-agent-"));
-    const cwd = mkdtempSync(path.join(tmpdir(), "pitako-cached-cwd-"));
-    tempDirs.push(agentDir, cwd);
-    process.env.PI_CODING_AGENT_DIR = agentDir;
-    const cachedModel = (provider: string, id: string) => ({
-      provider, id, name: id, api: "openai-responses", baseUrl: "http://127.0.0.1:1",
-      reasoning: true, input: ["text"], contextWindow: 10000, maxTokens: 1000,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    });
-    const cachePath = path.join(agentDir, "models-store.json");
-    writeFileSync(cachePath, JSON.stringify({
-      openai: { models: [cachedModel("openai", "pitako-cache-only")], checkedAt: 1, lastModified: Date.now() },
-      xai: { models: [cachedModel("xai", "grok-4.7")], checkedAt: 1, lastModified: Date.now() },
-    }));
-    writeFileSync(path.join(agentDir, "auth.json"), JSON.stringify({
-      openai: { type: "api_key", key: "fixture-only" },
-      xai: { type: "api_key", key: "fixture-only" },
-    }));
-    const cacheBefore = readFileSync(cachePath, "utf8");
-    const authBefore = readFileSync(path.join(agentDir, "auth.json"), "utf8");
-    let networkCalls = 0;
-    Object.defineProperty(globalThis, "fetch", { configurable: true,
-      value: async () => { networkCalls++; throw new Error("cache fixture forbids network"); } });
-    const staticRuntime = await ModelRuntime.create({ allowModelNetwork: false, refreshOnCreate: false });
-    expect(staticRuntime.getModel("openai", "pitako-cache-only")).toBeUndefined();
-    // Pi 1.0.4 also ships Grok in the static catalog; the cached definition
-    // below must still win when the production runtime restores catalogs.
-    const activations: Array<{ model: string; reasoning: string }> = [];
-    let stop = new AbortController();
-    let child: AgentSession;
-    let binds = 0, prompts = 0, disposals = 0;
-    const bind = AgentSession.prototype.bindExtensions;
-    const binding = spyOn(AgentSession.prototype, "bindExtensions").mockImplementation(async function (this: AgentSession, ...args) {
-      await bind.apply(this, args);
-      binds++;
-      child = this;
-      this.prompt = async () => { prompts++; throw new Error("cache fixture must not prompt"); };
-      const dispose = this.dispose.bind(this);
-      this.dispose = async () => { disposals++; await dispose(); };
-    });
-    const telemetry = process.env.PI_TELEMETRY;
-    // Synthetic cache-only activation must not report installed extensions.
-    process.env.PI_TELEMETRY = "0";
-    try {
-      for (const fallback of [false, true]) {
-        stop = new AbortController();
-        const target = fallback ? { model: "xai/grok-4.7", reasoning: "high" as const, fast: true }
-          : { model: "openai/pitako-cache-only", reasoning: "medium" as const, fast: false };
-        const config = path.join(agentDir, "cache-policy.toml");
-        const selected = `{ model = "${target.model}", reasoning = "${target.reasoning}", fast = ${target.fast} }`;
-        writeFileSync(config, `[model_policies.developer]\nprimary = ${fallback
-          ? '{ model = "pitako-absent/primary" }' : selected}\n` +
-          (fallback ? `fallbacks = [${selected}]\n` : ""));
-        const result = await fixture.run(runAgentInstance({
-          roleId: "developer", cwd, task: "exact cache-only task", signal: stop.signal,
-          load: { userConfigPath: config },
-          executor: {
-            capturesHistory: true,
-            start(input) {
-              return createPiExecutor().start({ ...input, onActivated(reasoning) {
-                input.onActivated?.(reasoning);
-                activations.push({ model: `${child.model!.provider}/${child.model!.id}`, reasoning });
-                expect(child.model!.baseUrl).toBe("http://127.0.0.1:1");
-                stop.abort();
-              } });
-            },
-          },
-        }));
-        console.log("offline cached child", JSON.stringify({ fallback, status: result.status, model: result.model, activations, binds, prompts, disposals, networkCalls }));
-        expect(result.status).toBe("cancelled");
-        expect(result.model).toMatchObject({ selectedModel: target.model, fallbackOccurred: fallback, requestedReasoning: target.reasoning });
-        const members = new WorkerHistory().list().flatMap(group => group.members)
-          .filter(member => member.instanceId === result.instanceId);
-        expect(members).toHaveLength(fallback ? 2 : 1);
-        expect(members.every(member => member.native.state === "allocated" &&
-          member.native.disposition.state === "disposed")).toBe(true);
-        if (fallback) expect(members[0]!.terminal).toMatchObject({ status: "failed", beforeFirstAssistant: true });
-        const member = members.find(member => member.native.state === "allocated" &&
-          member.native.sessionId === child!.sessionId)!;
-        expect(member.native).toMatchObject({ state: "allocated", sessionId: child!.sessionId,
-          disposition: { state: "disposed" } });
-        expect(member.terminal).toMatchObject({ status: "cancelled", beforeFirstAssistant: true });
-        expect(executionForSession(child!.sessionId)).toBeUndefined();
-      }
-      expect(activations).toEqual([
-        { model: "openai/pitako-cache-only", reasoning: "medium" },
-        { model: "xai/grok-4.7", reasoning: "high" },
-      ]);
-      expect({ binds, prompts, disposals, networkCalls }).toEqual({ binds: 3, prompts: 0, disposals: 3, networkCalls: 0 });
-      expect(readFileSync(cachePath, "utf8")).toBe(cacheBefore);
-      expect(readFileSync(path.join(agentDir, "auth.json"), "utf8")).toBe(authBefore);
-    } finally {
-      binding.mockRestore();
-      if (telemetry === undefined) delete process.env.PI_TELEMETRY;
-      else process.env.PI_TELEMETRY = telemetry;
-    }
-  }), 60_000);
-
-  test.serial("construction enables grep, find, and ls without session_start", fixture.ownedCase("construction enables grep, find, and ls without session_start", async () => {
-    const agentDir = mkdtempSync(path.join(tmpdir(), "pitako-agent-tools-"));
-    tempDirs.push(agentDir);
-    const cwd = mkdtempSync(path.join(tmpdir(), "pitako-agent-tools-cwd-"));
-    tempDirs.push(cwd);
-    const runtime = await ModelRuntime.create({ authPath: path.join(agentDir, "auth.json"), modelsPath: null, allowModelNetwork: false });
-    const model = runtime.getModels()[0];
-    if (!model) throw new Error("Pi static catalog has no model");
-    const loaded = await loadPitako(packageRoot(), cwd);
-    fixture.releaseDirectoriesAfterDisposal(loaded.releaseOwnedDirectories, [loaded.agentDir]);
-    const { session } = await fixture.acquire(createAgentSession({
-      cwd,
-      agentDir,
-      model,
-      sessionManager: SessionManager.inMemory(cwd),
-      modelRuntime: runtime,
-      resourceLoader: loaded.loader,
-      excludeTools: [...ORCHESTRATION_TOOLS],
-    }));
-    const available = session.getAllTools().map((tool) => tool.name);
-    session.setActiveToolsByName(childActiveTools(available));
-    const active = session.getActiveToolNames();
-    expect(available).toEqual(expect.arrayContaining(["grep", "find", "ls", "read", "project_report", "read_symbol", "read_enclosing", "module_report", "inspect_symbol", "review_surface", "codegraph_search", "lsp_diagnostics"]));
-    expect(active).toEqual(expect.arrayContaining(["read", "grep", "bash", "edit", "find", "ls", "project_report", "read_symbol", "read_enclosing", "module_report", "inspect_symbol", "review_surface", "codegraph_search", "lsp_diagnostics"]));
-    for (const tool of ORCHESTRATION_TOOLS) expect(active).not.toContain(tool);
-  }), 60_000);
-  test.serial("in-memory session starts empty, setModel auth failure is fallback-worthy, and reasoning is not forced", fixture.ownedCase("in-memory session starts empty, setModel auth failure is fallback-worthy, and reasoning is not forced", async () => {
-    const agentDir = mkdtempSync(path.join(tmpdir(), "pitako-agent-pi-"));
-    tempDirs.push(agentDir);
-    const cwd = mkdtempSync(path.join(tmpdir(), "pitako-agent-cwd-"));
-    tempDirs.push(cwd);
-    const runtime = await ModelRuntime.create({
-      authPath: path.join(agentDir, "auth.json"),
-      modelsPath: null,
-      allowModelNetwork: false,
-    });
-    const model = runtime.getModels()[0];
-    if (!model) throw new Error("Pi static catalog has no model");
-    const parent = SessionManager.inMemory(cwd);
-    const child = SessionManager.inMemory(cwd);
-    expect(parent.getSessionId()).not.toBe(child.getSessionId());
-    const { session } = await fixture.acquire(createAgentSession({
-      cwd,
-      agentDir,
-      model,
-      sessionManager: child,
-      modelRuntime: runtime,
-      excludeTools: [...ORCHESTRATION_TOOLS],
-      noTools: "builtin",
-    }));
-    expect(session.messages).toEqual([]);
-    session.setActiveToolsByName(childActiveTools(session.getAllTools().map((tool) => tool.name)));
-    const active = session.getActiveToolNames();
-    for (const name of ["grep", "find", "ls", "read"]) {
-      if (session.getAllTools().some((tool) => tool.name === name)) expect(active).toContain(name);
-    }
-    for (const tool of ORCHESTRATION_TOOLS) expect(active).not.toContain(tool);
-    await expect(session.setModel(model, { persist: false })).rejects.toThrow(/No API key/);
-    const thrown = await activateTarget(
-      {
-        async setModel() {
-          throw new Error("No API key for cursor/grok-4.7");
-        },
-        setThinkingLevel() {
-          throw new Error("should not set reasoning when activation fails");
-        },
-      },
-      model,
-      { model: "cursor/grok-4.7" },
-    );
-    expect(thrown).toMatch(/No API key/);
-    expect(classifyProviderFailure(thrown)).toBe("auth");
-    const levels: string[] = [];
-    await activateTarget(
-      {
-        async setModel() {},
-        setThinkingLevel(level: string) {
-          levels.push(level);
-        },
-      },
-      model,
-      { model: "example/explicit", reasoning: "high" },
-    );
-    expect(levels).toEqual(["high"]);
-    levels.length = 0;
-    await activateTarget(
-      {
-        async setModel() {},
-        setThinkingLevel(level: string) {
-          levels.push(level);
-        },
-      },
-      model,
-      { model: "example/default" },
-    );
-    expect(levels).toEqual([DEFAULT_THINKING_LEVEL]);
-  }), 60_000);
-
-  test.serial("continue without reasoning does not inherit xhigh", fixture.ownedCase("continue without reasoning does not inherit xhigh", async () => {
-    let level = "xhigh";
-    await activateTarget(
-      {
-        async setModel() {},
-        setThinkingLevel(next: string) {
-          level = next;
-        },
-      },
-      { provider: "example", id: "continue" } as never,
-      { model: "example/continue" },
-    );
-    expect(level).not.toBe("xhigh");
-    expect(level).toBe(DEFAULT_THINKING_LEVEL);
+test("construction selects offline runtime, role resources and child tools before prompt; disposal retires identity once",
+  fixture.ownedCase("construction", async () => {
+    const { host, executor, input } = setup();
+    const result = await fixture.acquire(executor.start(input));
+    expect(result).toMatchObject({ status: "completed", result: "controlled result", sideEffects: false });
+    expect(host.runtimeInputs).toEqual([{ allowModelNetwork: false }]);
+    expect(host.sessionInputs[0]).toMatchObject({ excludeTools: [...ORCHESTRATION_TOOLS], cwd: input.cwd });
+    expect(host.loaderInputs[0].appendSystemPrompt[0]).toContain(input.instanceId);
+    expect(host.loaderInputs[0].skillsOverride({ skills: [{ name: "unexpected" }], diagnostics: [] }).skills).toEqual([]);
+    const session = host.sessions[0]!;
+    expect(session.prompts).toEqual(["exact task"]);
+    expect(session.active).toEqual(expect.arrayContaining(["read", "grep", "find", "ls"]));
+    for (const name of ORCHESTRATION_TOOLS) expect(session.active).not.toContain(name);
+    expect(executionForSession(session.sessionId)).toMatchObject({ instanceId: input.instanceId });
+    await result.session!.dispose(); await result.session!.dispose();
+    expect(session.events).toEqual(["bind", "session_shutdown", "dispose"]);
+    expect(executionForSession(session.sessionId)).toBeUndefined();
   }));
-});
 
-const lateRole: ResolvedRole = {
-  id: "developer",
-  name: "Developer",
-  description: "test",
-  instructionsPath: "roles/developer.md",
-  instructions: "Reply exactly.",
-  skills: [],
-  principles: [],
-  modelPolicyId: "developer",
-  modelPolicy: { id: "developer", fallbacks: [] },
-};
+test("late registration is selected after bind; missing and unsupported targets never prompt; continuation stays on one session",
+  fixture.ownedCase("availability", async () => {
+    const late = controlledModel();
+    const { host, input, executor } = setup({ models: [], bind() { host.models.push(late); } });
+    const result = await fixture.acquire(executor.start(input));
+    expect(result.status).toBe("completed");
+    const next = await result.session!.continueWith({ model: "fixture/missing" }, "do not prompt", input.signal);
+    expect(next).toMatchObject({ status: "failed", error: "model unavailable: fixture/missing", sideEffects: true });
+    const unsupported = await result.session!.continueWith({ model: "fixture/selected", fast: true }, "do not prompt", input.signal);
+    expect(unsupported).toMatchObject({ status: "failed", failureKind: "configuration", sideEffects: true });
+    const continued = await result.session!.continueWith({ model: "fixture/selected" }, "literal continuation", input.signal);
+    expect(continued.status).toBe("completed");
+    expect(host.sessions).toHaveLength(1);
+    expect(host.sessions[0]!.prompts).toEqual(["exact task", "literal continuation"]);
+    expect(host.sessions[0]!.thinkingLevel).toBe(DEFAULT_THINKING_LEVEL);
+    const absent = setup({ models: [] });
+    const missing = await fixture.acquire(absent.executor.start(absent.input));
+    expect(missing).toMatchObject({ status: "failed", error: "model unavailable: fixture/selected", sideEffects: false });
+    expect(absent.host.sessions[0]!.prompts).toEqual([]);
+    await missing.session!.dispose();
+    expect(absent.host.sessions[0]!.events).toEqual(["bind", "session_shutdown", "dispose"]);
+  }));
 
-describe("extension provider bind", () => {
-  async function installLateProvider() {
-    const agentDir = mkdtempSync(path.join(tmpdir(), "pitako-late-agent-"));
-    const cwd = mkdtempSync(path.join(tmpdir(), "pitako-late-cwd-"));
-    tempDirs.push(agentDir, cwd);
-    mkdirSync(path.join(agentDir, "extensions"));
-    writeFileSync(
-      path.join(agentDir, "extensions", "late.js"),
-      "export default function (pi) { pi.registerProvider('pitako-late', globalThis.__pitakoLateProvider); }\n",
-    );
-    const calls: string[] = [];
-    const specifier = "@earendil-works/pi-ai/utils/event-stream.js";
-    const { createAssistantMessageEventStream } = await import(specifier);
-    const provider = {
-      baseUrl: "http://127.0.0.1",
-      apiKey: "test",
-      api: "openai-completions",
-      models: [
-        {
-          id: "late",
-          name: "Late",
-          reasoning: false,
-          input: ["text"],
-          cost: { input: 100, output: 200, cacheRead: 50, cacheWrite: 100 },
-          contextWindow: 1000,
-          maxTokens: 64,
-        },
-      ],
-      streamSimple(model: { id: string }, context: { messages?: unknown[] }, _options?: { onPayload?: (body: unknown, model: unknown) => unknown }) {
-        calls.push(`${model.id}:${JSON.stringify(context.messages ?? [])}`);
-        const stream = createAssistantMessageEventStream();
-        const message = {
-          role: "assistant",
-          content: [{ type: "text", text: "pong" }],
-          api: "openai-completions",
-          provider: "pitako-late",
-          model: model.id,
-          stopReason: "stop",
-          timestamp: Date.now(),
-          usage: {
-            input: 10,
-            output: 3,
-            cacheRead: 4,
-            cacheWrite: 1,
-            totalTokens: 18,
-            cost: { input: 0.001, output: 0.0006, cacheRead: 0.0002, cacheWrite: 0.0001, total: 0.0019 },
-          },
-        };
-        queueMicrotask(() => {
-          stream.push({ type: "done", reason: "stop", message });
-          stream.end(message);
-        });
-        return stream;
-      },
-    };
-    (globalThis as { __pitakoLateProvider?: unknown }).__pitakoLateProvider = provider;
-    process.env.PI_CODING_AGENT_DIR = agentDir;
-    return { calls, cwd, provider };
-  }
+test("bind failure and cancellation before prompt dispose controlled sessions", fixture.ownedCase("failure cleanup", async () => {
+  const broken = setup({ bind() { throw new Error("bind failure"); } });
+  expect(await fixture.acquire(broken.executor.start(broken.input))).toMatchObject({ status: "failed", error: "bind failure" });
+  expect(broken.host.sessions[0]!.events).toEqual(["bind", "dispose"]);
+  const stop = new AbortController();
+  const cancelled = setup({ bind() { stop.abort(); } });
+  expect(await fixture.acquire(cancelled.executor.start({ ...cancelled.input, signal: stop.signal }))).toMatchObject({ status: "cancelled" });
+  expect(cancelled.host.sessions[0]!.prompts).toEqual([]);
+  expect(cancelled.host.sessions[0]!.events).toEqual(["bind", "session_shutdown", "dispose"]);
+}));
 
-  test.serial("selects a model that appears only after session bind", fixture.ownedCase("selects a model that appears only after session bind", async () => {
-    const { calls, cwd } = await installLateProvider();
-    const attempt = await fixture.acquire(createPiExecutor().start({
-      instanceId: "developer-late",
-      role: lateRole,
-      task: "say-pong-marker",
-      target: { model: "pitako-late/late", reasoning: "off" },
-      cwd,
-      signal: new AbortController().signal,
-    }));
-    expect(attempt.status).toBe("completed");
-    expect(attempt.result).toContain("pong");
-    expect(calls).toHaveLength(1);
-    expect(calls[0]).toContain("late:");
-    expect(calls[0]).toContain("say-pong-marker");
-    expect(existsSync(path.join(cwd, ".pitako"))).toBe(false);
-  }), 60_000);
-
-  test.serial("a real Pi fallback continues on the same session", fixture.ownedCase("a real Pi fallback continues on the same session", async () => {
-    const { calls, cwd } = await installLateProvider();
-    const agentDir = process.env.PI_CODING_AGENT_DIR!;
-    const provider = (globalThis as { __pitakoLateProvider?: any }).__pitakoLateProvider!;
-    provider.models.push({ ...provider.models[0], id: "fallback", name: "Fallback" });
-    const originalStream = provider.streamSimple;
-    const eventStreamModule: string = "@earendil-works/pi-ai/utils/event-stream.js";
-    const { createAssistantMessageEventStream } = await import(eventStreamModule);
-    provider.streamSimple = (model: { id: string }, context: { messages?: unknown[] }) => {
-      if (model.id !== "late") return originalStream(model, context);
-      calls.push(`late:${JSON.stringify(context.messages ?? [])}`);
-      const stream = createAssistantMessageEventStream();
-      const message = {
-        role: "assistant", content: [], api: "openai-completions", provider: "pitako-late", model: model.id,
-        stopReason: "error", errorMessage: "No API key for pitako-late/late", timestamp: Date.now(),
-        usage: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 1, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+for (const target of [
+  { model: "openai/arbitrary", fast: true },
+  { model: "xai/grok-4.7", fast: true },
+  { model: "xai/grok-4.7", fast: false },
+]) {
+  test("transport preserves payload hook and maps only selected target tier: " + JSON.stringify(target),
+    fixture.ownedCase("target tier", async () => {
+      const [provider, id] = target.model.split("/");
+      const model = controlledModel(provider!, id!, "openai-responses");
+      const { host, input, executor } = setup({ models: [model], async prompt(session) {
+        await session.agent.streamFunction(session.model, { messages: [] }, { sessionId: session.sessionId,
+          onPayload: (payload: any) => ({ ...payload, hook: "retained" }) }).result();
+      } });
+      const bodies: unknown[] = [];
+      host.runtime.streamSimple = (_model, _context, options) => {
+        return (async function* () {
+          bodies.push(await options?.onPayload?.({ model: id }, model));
+          yield { type: "done", reason: "stop", message: { role: "assistant", content: [], stopReason: "stop" } };
+        })();
       };
-      queueMicrotask(() => { stream.push({ type: "done", reason: "error", message }); stream.end(message); });
-      return stream;
-    };
-    const userConfigPath = path.join(agentDir, "pitako", "config.toml");
-    mkdirSync(path.dirname(userConfigPath), { recursive: true });
-    writeFileSync(userConfigPath, [
-      "[model_policies.developer.primary]", 'model = "pitako-late/late"', 'reasoning = "off"',
-      "[[model_policies.developer.fallbacks]]", 'model = "pitako-late/fallback"', 'reasoning = "high"', "",
-    ].join("\n"));
-    const result = await fixture.run(runAgentInstance({
-      roleId: "developer", task: "say-pong-marker", cwd,
-      executor: createPiExecutor(), load: { env: { PI_CODING_AGENT_DIR: agentDir }, userConfigPath },
+      const attempt = await fixture.acquire(executor.start({ ...input, target }));
+      expect(bodies).toEqual([{ model: id, hook: "retained", ...(target.fast ? { service_tier: "priority" } : {}) }]);
+      expect(attempt.requests).toMatchObject([{ fast_requested: target.fast, returned_service_tier: "unavailable",
+        ...(target.fast ? { requested_service_tier: "priority" } : {}) }]);
     }));
-    expect(result.status).toBe("completed");
-    expect(result.result).toBe("pong");
-    expect(result.model.fallbackOccurred).toBe(true);
-    expect(calls.map((call) => call.split(":")[0])).toEqual(["late", "fallback"]);
-    expect(calls[1]).toContain("say-pong-marker");
-  }), 60_000);
+}
 
-  test.serial("a real AgentInstance through Pi preserves observed model and usage", fixture.ownedCase("a real AgentInstance through Pi preserves observed model and usage", async () => {
-    const { cwd } = await installLateProvider();
-    const agentDir = process.env.PI_CODING_AGENT_DIR!;
-    const userConfigPath = path.join(agentDir, "pitako", "config.toml");
-    mkdirSync(path.dirname(userConfigPath), { recursive: true });
-    writeFileSync(userConfigPath, `[model_policies.developer.primary]\nmodel = "pitako-late/late"\nreasoning = "off"\n`);
+test("unsupported fast models fail before prompt and tier rejection does not fall back", fixture.ownedCase("tier failure", async () => {
+  for (const model of [controlledModel(), controlledModel("xai", "other", "openai-responses"), controlledModel("xai", "grok-4.7")]) {
+    const f = setup({ models: [model] });
+    const result = await fixture.acquire(f.executor.start({ ...f.input, target: { model: model.provider + "/" + model.id, fast: true } }));
+    expect(result).toMatchObject({ status: "failed", failureKind: "configuration", sideEffects: false });
+    expect(f.host.sessions[0]!.prompts).toEqual([]);
+  }
+  const f = setup({ models: [controlledModel("xai", "grok-4.7", "openai-responses")],
+    prompt() { throw new Error("Unsupported service_tier: priority"); } });
+  const config = path.join(f.root, "policy.toml");
+  writeFileSync(config, '[model_policies.developer]\nprimary = { model = "xai/grok-4.7", fast = true }\nfallbacks = [{ model = "xai/grok-4.7", fast = false }]\n');
+  const result = await fixture.run(runAgentInstance({ roleId: "developer", cwd: f.root, task: "no fallback", executor: f.executor, load: { userConfigPath: config } }));
+  expect(result.status).toBe("failed");
+  expect(result.model.fallbackOccurred).toBeFalsy();
+  expect(f.host.sessions[0]!.prompts).toHaveLength(1);
+}));
 
-    const result = await fixture.run(runAgentInstance({
-      roleId: "developer", task: "say-pong-marker", cwd,
-      executor: createPiExecutor(),
-      load: { env: { PI_CODING_AGENT_DIR: agentDir }, userConfigPath },
-    }));
-    expect(result.status).toBe("completed");
-    expect(result.model.selectedModel).toBe("pitako-late/late");
-    expect(result.model.appliedReasoning).toBe("off");
-    expect(result.watchdog?.elapsedMs).toBeGreaterThanOrEqual(0);
-    expect(result.usage).toMatchObject({ input: 10, output: 3, cacheRead: 4, cacheWrite: 1, cost: 0.0019, turns: 1, toolCalls: 0 });
-    expect(result.usage?.contextTokens).toBeGreaterThan(0);
-    const summary = teamExecutionSummary("pi-assignment", result);
-    expect(summary).toMatchObject({
-      assignmentId: "pi-assignment", selectedModel: "pitako-late/late", provider: "pitako-late", appliedReasoning: "off",
-      input: 10, output: 3, cacheRead: 4, cacheWrite: 1, turns: 1, toolCalls: 0,
-    });
-    expect(summary.estimatedCost).toBeCloseTo(0.0019);
-  }), 60_000);
-
-  test.serial("concurrent child sessions account dense and raw tool events independently", fixture.ownedCase("concurrent child sessions account dense and raw tool events independently", async () => {
-    const agentDir = mkdtempSync(path.join(tmpdir(), "pitako-telemetry-agent-"));
-    const dirs = [mkdtempSync(path.join(tmpdir(), "pitako-telemetry-one-")), mkdtempSync(path.join(tmpdir(), "pitako-telemetry-two-"))];
-    tempDirs.push(agentDir, ...dirs);
-    mkdirSync(path.join(agentDir, "extensions"));
-    writeFileSync(path.join(agentDir, "extensions", "telemetry.js"), "export default function (pi) { pi.registerProvider('pitako-telemetry', globalThis.__pitakoTelemetryProvider); }\n");
-    const streamModule: string = "@earendil-works/pi-ai/utils/event-stream.js";
-    const { createAssistantMessageEventStream } = await import(streamModule);
-    let sequence = 0;
-    (globalThis as { __pitakoTelemetryProvider?: unknown }).__pitakoTelemetryProvider = {
-      baseUrl: "http://127.0.0.1",
-      apiKey: "test",
-      api: "openai-completions",
-      models: [{ id: "late", name: "Late", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000, maxTokens: 64 }],
-      streamSimple(model: { id: string }, context: { messages?: any[] }) {
-        const messages = context.messages ?? [];
-        const hasReport = messages.some((message) => message.role === "assistant" && message.content?.some((part: any) => part.type === "toolCall" && part.name === "project_report"));
-        const reads = messages.filter((message) => message.role === "toolResult" && message.toolName === "read").length;
-        const content = !hasReport
-          ? [{ type: "toolCall", id: `telemetry-${sequence++}`, name: "project_report", arguments: {} }]
-          : reads < 5
-            ? [{ type: "toolCall", id: `telemetry-${sequence++}`, name: "read", arguments: { path: `src/sample-${reads}.ts` } }]
-            : [{ type: "text", text: "telemetry-complete" }];
-        const stream = createAssistantMessageEventStream();
-        const stopReason = content[0]?.type === "toolCall" ? "toolUse" : "stop";
-        const message = { role: "assistant", content, api: "openai-completions", provider: "pitako-telemetry", model: model.id, stopReason, timestamp: Date.now(), usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
-        queueMicrotask(() => { stream.push({ type: "done", reason: stopReason, message }); stream.end(message); });
-        return stream;
-      },
-    };
-    process.env.PI_CODING_AGENT_DIR = agentDir;
-    for (const dir of dirs) {
-      mkdirSync(path.join(dir, "src"));
-      for (let index = 0; index < 5; index++) writeFileSync(path.join(dir, "src", `sample-${index}.ts`), "export const value = 1;\n");
-    }
-    const executor = createPiExecutor();
-    const attempts = await Promise.all(dirs.map((cwd, index) => fixture.acquire(executor.start({
-      instanceId: `developer-telemetry-${index}`,
-      role: lateRole,
-      task: `inspect-child-${index}`,
-      target: { model: "pitako-telemetry/late", reasoning: "off" },
-      cwd,
-      signal: new AbortController().signal,
-    }))));
-    for (const attempt of attempts) {
-      expect(attempt.status, attempt.error).toBe("completed");
-      expect(attempt.usage?.codeIntelligence?.dense.project_report?.calls).toBe(1);
-      expect(attempt.usage?.codeIntelligence?.raw.read).toBe(5);
-      expect(attempt.usage?.codeIntelligence?.navigation).toMatchObject({ completedCalls: 5, read: 5, grep: 0, remaining: 0 });
-      expect(attempt.usage?.codeIntelligence?.sources.git?.calls).toBeGreaterThan(0);
-      expect(attempt.usage?.tools?.project_report).toBe(1);
-    }
-    expect(sequence).toBe(12);
-  }), 60_000);
-
-  test.serial("failed and cancelled dense child calls retain one attributed outcome", fixture.ownedCase("failed and cancelled dense child calls retain one attributed outcome", async () => {
-    const agentDir = mkdtempSync(path.join(tmpdir(), "pitako-telemetry-outcomes-agent-"));
-    const dirs = [mkdtempSync(path.join(tmpdir(), "pitako-telemetry-failed-")), mkdtempSync(path.join(tmpdir(), "pitako-telemetry-cancelled-"))];
-    tempDirs.push(agentDir, ...dirs);
-    mkdirSync(path.join(agentDir, "extensions"));
-    writeFileSync(path.join(agentDir, "extensions", "telemetry.js"), "export default function (pi) { pi.registerProvider('pitako-telemetry', globalThis.__pitakoTelemetryProvider); }\n");
-    const streamModule: string = "@earendil-works/pi-ai/utils/event-stream.js";
-    const { createAssistantMessageEventStream } = await import(streamModule);
-    let sequence = 0;
-    (globalThis as { __pitakoTelemetryProvider?: unknown }).__pitakoTelemetryProvider = {
-      baseUrl: "http://127.0.0.1", apiKey: "test", api: "openai-completions",
-      models: [{ id: "late", name: "Late", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000, maxTokens: 64 }],
-      streamSimple(model: { id: string }, context: { messages?: any[] }) {
-        const messages = context.messages ?? [];
-        const complete = messages.some((message) => message.role === "toolResult" && message.toolName === "read_enclosing");
-        const content = complete
-          ? [{ type: "text", text: "query-finished" }]
-          : [{ type: "toolCall", id: `failure-${sequence++}`, name: "read_enclosing", arguments: { file: "missing.ts", line: 1 } }];
-        const stream = createAssistantMessageEventStream();
-        const stopReason = content[0]?.type === "toolCall" ? "toolUse" : "stop";
-        const message = { role: "assistant", content, api: "openai-completions", provider: "pitako-telemetry", model: model.id, stopReason, timestamp: Date.now(), usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
-        queueMicrotask(() => { stream.push({ type: "done", reason: stopReason, message }); stream.end(message); });
-        return stream;
-      },
-    };
-    process.env.PI_CODING_AGENT_DIR = agentDir;
-    const cancelledController = new AbortController();
-    const executor = createPiExecutor();
-    const [failed, cancelled] = await Promise.all([
-      fixture.acquire(executor.start({ instanceId: "developer-query-failed", role: lateRole, task: "failed query", target: { model: "pitako-telemetry/late", reasoning: "off" }, cwd: dirs[0]!, signal: new AbortController().signal })),
-      fixture.acquire(executor.start({ instanceId: "developer-query-cancelled", role: lateRole, task: "cancel query", target: { model: "pitako-telemetry/late", reasoning: "off" }, cwd: dirs[1]!, signal: cancelledController.signal, onActivity(event) { if (event.type === "tool_execution_start" && event.toolName === "read_enclosing") cancelledController.abort(); } })),
-    ]);
-    expect(failed.status).toBe("completed");
-    expect(failed.usage?.codeIntelligence?.dense.read_enclosing).toMatchObject({ calls: 1, outcomes: { unavailable: 1 } });
-    expect(cancelled.status).toBe("cancelled");
-    expect(cancelled.usage?.codeIntelligence?.dense.read_enclosing).toMatchObject({ calls: 1, outcomes: { cancelled: 1 } });
-    expect(failed.usage?.codeIntelligence?.dense.read_enclosing?.calls).toBe(1);
-    expect(cancelled.usage?.codeIntelligence?.dense.read_enclosing?.calls).toBe(1);
-  }), 60_000);
-
-  test.serial("a model still missing after bind is unavailable and is not prompted", fixture.ownedCase("a model still missing after bind is unavailable and is not prompted", async () => {
-    const { calls, cwd } = await installLateProvider();
-    const attempt = await fixture.acquire(createPiExecutor().start({
-      instanceId: "developer-missing",
-      role: lateRole,
-      task: "say-pong-marker",
-      target: { model: "pitako-late/missing", reasoning: "off" },
-      cwd,
-      signal: new AbortController().signal,
-    }));
-    expect(attempt.status).toBe("failed");
-    expect(attempt.error).toBe("model unavailable: pitako-late/missing");
-    expect(attempt.sideEffects).toBe(false);
-    expect(calls).toEqual([]);
-  }), 60_000);
-
-  test.serial("fast request to an unsupported late model fails as configuration before prompt", fixture.ownedCase("fast request to an unsupported late model fails as configuration before prompt", async () => {
-    const { calls, cwd } = await installLateProvider();
-    const attempt = await fixture.acquire(createPiExecutor().start({
-      instanceId: "developer-fast-unsupported",
-      role: lateRole,
-      task: "do not prompt",
-      target: { model: "pitako-late/late", fast: true },
-      cwd,
-      signal: new AbortController().signal,
-    }));
-    expect(attempt.status).toBe("failed");
-    expect(attempt.failureKind).toBe("configuration");
-    expect(attempt.error).toMatch(/fast.*unsupported|unsupported.*fast/i);
-    expect(calls).toEqual([]);
-  }), 60_000);
-
-  test.serial("records only the first model output per request", fixture.ownedCase("records only the first model output per request", async () => {
+test("request attribution records first output only, ignores other session requests and reports observed usage",
+  fixture.ownedCase("request attribution", async () => {
     let clock = 100;
-    const { calls, cwd, provider } = await installLateProvider();
-    const specifier = "@earendil-works/pi-ai/utils/event-stream.js";
-    const payloads: Array<Record<string, unknown>> = [];
-    Object.assign(provider, { streamSimple: async (model: { id: string }, _context: unknown, options?: { onPayload?: (body: unknown, model: unknown) => unknown }) => {
-      calls.push(`${model.id}:observed`);
-      const body = { model: model.id };
-      const transformed = await options?.onPayload?.(body, model);
-      payloads.push((transformed ?? body) as Record<string, unknown>);
+    const f = setup({ prompt(session) {
+      session.agent.streamFunction(session.model, { messages: [] }, { sessionId: "other-session" });
+      session.agent.streamFunction(session.model, { messages: [] }, { sessionId: session.sessionId, reasoning: "high", temperature: 0.2, maxTokens: 31 });
       clock = 150;
-      const { createAssistantMessageEventStream } = await import(specifier);
-      const stream = createAssistantMessageEventStream();
-      const message = {
-        role: "assistant",
-        content: [{ type: "text", text: "pong" }],
-        api: "openai-completions",
-        provider: "pitako-late",
-        model: model.id,
-        stopReason: "stop",
-        timestamp: Date.now(),
-        usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-      };
-      queueMicrotask(() => {
-        const partial = { ...message, content: [{ type: "text", text: "" }] };
-        stream.push({ type: "start", partial } as never);
-        partial.content[0]!.text = "po";
-        stream.push({ type: "text_delta", contentIndex: 0, delta: "po", partial } as never);
-        partial.content[0]!.text = "pong";
-        stream.push({ type: "text_delta", contentIndex: 0, delta: "ng", partial } as never);
-        stream.push({ type: "done", reason: "stop", message } as never);
-        stream.end(message as never);
-      });
-      return stream;
+      session.emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "" } });
+      session.emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "first" } });
+      clock = 400;
+      session.emit({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", delta: "later" } });
+      session.messages.push({ role: "assistant", content: [{ type: "text", text: "observed" }], stopReason: "stop" });
+      session.stats.tokens = { input: 10, output: 3, cacheRead: 4, cacheWrite: 1, total: 18 };
+      session.stats.cost = 0.0019; session.stats.assistantMessages = 1;
     } });
-    const attempt = await fixture.acquire(createPiExecutor({ now: () => clock }).start({
-      instanceId: "developer-observe-request",
-      role: lateRole,
-      task: "say-pong-marker",
-      target: { model: "pitako-late/late", reasoning: "high", fast: false },
-      cwd,
-      signal: new AbortController().signal,
-      onActivity: (event) => {
-        if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") clock = 400;
-      },
-    }));
-    expect(attempt.status).toBe("completed");
-    expect(calls).toHaveLength(1);
-    expect(payloads).toEqual([{ model: "late" }]);
-    expect(attempt.requests).toMatchObject([
-      {
-        model: "pitako-late/late",
-        reasoning: undefined,
-        sdkOptions: { reasoning: undefined },
-        fast_requested: false,
-        returned_service_tier: "unavailable",
-        time_to_first_model_output_ms: 50,
-      },
-    ]);
-    expect(attempt.requests?.[0]?.historyId).toBeString();
-    expect(attempt.requests?.[0]?.sessionId).toBeString();
-  }), 60_000);
+    const result = await fixture.acquire(createPiExecutor({ factories: f.host.factories, now: () => clock }).start(f.input));
+    expect(result.requests).toHaveLength(1);
+    expect(result.requests?.[0]).toMatchObject({ model: "fixture/selected", sdkOptions: { reasoning: "high", temperature: 0.2, maxTokens: 31 },
+      sessionId: f.host.sessions[0]!.sessionId, time_to_first_model_output_ms: 50, returned_service_tier: "unavailable" });
+    expect(result.requests?.[0]?.historyId).toBeString();
+    expect(result.usage).toMatchObject({ input: 10, output: 3, cacheRead: 4, cacheWrite: 1, cost: 0.0019, contextTokens: 17 });
+    const config = path.join(f.root, "policy.toml");
+    writeFileSync(config, '[model_policies.developer]\nprimary = { model = "fixture/selected" }\n');
+    const run = await fixture.run(runAgentInstance({ roleId: "developer", cwd: f.root, task: "usage", executor: f.executor, load: { userConfigPath: config } }));
+    expect(teamExecutionSummary("assignment", run)).toMatchObject({ selectedModel: "fixture/selected", provider: "fixture", input: 10, output: 3 });
+  }));
 
-  test.serial("marks request without output unavailable on cancellation", fixture.ownedCase("marks request without output unavailable on cancellation", async () => {
-    let clock = 10;
-    const { cwd, provider } = await installLateProvider();
-    const specifier = "@earendil-works/pi-ai/utils/event-stream.js";
-    let started!: () => void;
-    const requestStarted = new Promise<void>((resolve) => {
-      started = resolve;
-    });
-    Object.assign(provider, { streamSimple: async (model: { id: string }, _context: unknown, options?: { signal?: AbortSignal }) => {
-      const { createAssistantMessageEventStream } = await import(specifier);
-      const stream = createAssistantMessageEventStream();
-      started();
-      options?.signal?.addEventListener("abort", () => {
-        const message = {
-          role: "assistant",
-          content: [],
-          api: "openai-completions",
-          provider: "pitako-late",
-          model: model.id,
-          stopReason: "aborted",
-          errorMessage: "Request was aborted",
-          timestamp: Date.now(),
-          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-        };
-        stream.push({ type: "error", reason: "aborted", error: message } as never);
-        stream.end(message as never);
-      }, { once: true });
-      return stream;
-    } });
-    const controller = new AbortController();
-    const pending = fixture.acquire(createPiExecutor({ now: () => clock }).start({
-      instanceId: "developer-cancel-request",
-      role: lateRole,
-      task: "wait for cancellation",
-      target: { model: "pitako-late/late" },
-      cwd,
-      signal: controller.signal,
-    }));
-    await requestStarted;
-    clock = 40;
-    controller.abort();
-    const attempt = await pending;
-    expect(attempt.status).toBe("cancelled");
-    expect(attempt.requests?.[0]).toMatchObject({
-      fast_requested: false,
-      returned_service_tier: "unavailable",
-      time_to_first_model_output_ms: "unavailable",
-      time_to_first_model_output_unavailable_reason: "cancelled",
-    });
-  }), 60_000);
-
-  function installTierFixture(fetchMode: "reject_tier" | "rate_limit" = "reject_tier") {
-    const agentDir = mkdtempSync(path.join(tmpdir(), "pitako-tier-agent-"));
-    const cwd = mkdtempSync(path.join(tmpdir(), "pitako-tier-cwd-"));
-    tempDirs.push(agentDir, cwd);
-    mkdirSync(path.join(agentDir, "extensions"), { recursive: true });
-    writeFileSync(
-      path.join(agentDir, "extensions", "payload.js"),
-      "export default function (pi) { pi.on('before_provider_request', event => { (globalThis.__pitakoPayloadInputs ||= []).push(event.payload); return { ...event.payload, pitako_payload_hook: 'retained' }; }); }\n",
-    );
-    const payloadInputs = (globalThis as { __pitakoPayloadInputs?: unknown[] }).__pitakoPayloadInputs = [];
-    const account = Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "acct-test" } })).toString("base64url");
-    const codexToken = `header.${account}.signature`;
-    writeFileSync(path.join(agentDir, "models.json"), JSON.stringify({
-      providers: {
-        openai: {
-          api: "openai-codex-responses",
-          apiKey: codexToken,
-          baseUrl: "https://chatgpt.com/backend-api",
-          models: [
-            { id: "gpt-6-luna", name: "Luna", reasoning: true, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000, maxTokens: 64 },
-            { id: "fixture-responses", name: "Responses", api: "openai-responses", baseUrl: "https://api.openai.com/v1", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000, maxTokens: 64 },
-            { id: "fixture-completions", name: "Completions", api: "openai-completions", baseUrl: "https://api.openai.com/v1", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000, maxTokens: 64 },
-          ],
-        },
-        xai: {
-          api: "openai-responses",
-          apiKey: "test-xai",
-          baseUrl: "https://api.x.ai/v1",
-          models: [{ id: "grok-4.7", name: "Grok", reasoning: true, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000, maxTokens: 64 }],
-        },
-      },
-    }));
-    process.env.PI_CODING_AGENT_DIR = agentDir;
-    const websocketBodies: Array<Record<string, unknown>> = [];
-    const httpBodies: Array<Record<string, unknown>> = [];
-    const globalSocket = globalThis as unknown as { WebSocket?: unknown };
-    class OfflineWebSocket extends EventTarget {
-      readyState = 0;
-      binaryType = "arraybuffer";
-      constructor() {
-        super();
-        queueMicrotask(() => {
-          this.readyState = 1;
-          this.dispatchEvent(new Event("open"));
-        });
-      }
-      send(data: string) {
-        websocketBodies.push(JSON.parse(data) as Record<string, unknown>);
-        setTimeout(() => this.dispatchEvent(new Event("error")), 0);
-      }
-      close() {
-        this.readyState = 3;
-      }
-    }
-    globalSocket.WebSocket = OfflineWebSocket;
-    Object.defineProperty(globalThis, "fetch", { configurable: true, value: async (_input: RequestInfo | URL, init?: RequestInit) => {
-      const body = init?.body;
-      const bytes = typeof body === "string" ? Buffer.from(body) : Buffer.from(body as Uint8Array);
-      const encoded = new Headers(init?.headers).get("content-encoding") === "zstd";
-      const text = encoded ? Bun.zstdDecompressSync(bytes).toString() : bytes.toString();
-      const parsed = JSON.parse(text) as Record<string, unknown>;
-      httpBodies.push(parsed);
-      const tierRejected = Object.hasOwn(parsed, "service_tier");
-      const status = fetchMode === "rate_limit" && tierRejected ? 429 : 400;
-      const message = fetchMode === "rate_limit" && tierRejected
-        ? "429 rate limit"
-        : tierRejected
-          ? "Unsupported service_tier: priority"
-          : "Offline request intercepted";
-      return new Response(JSON.stringify({ error: { message } }), {
-        status,
-        headers: { "content-type": "application/json" },
-      });
-    } });
-    return { agentDir, cwd, websocketBodies, httpBodies, payloadInputs };
-  }
-
-  test.serial("sends OpenAI priority through Codex WebSocket/SSE", fixture.ownedCase("sends OpenAI priority through Codex WebSocket/SSE", async () => {
-    const { cwd, websocketBodies, httpBodies, payloadInputs } = installTierFixture();
-    const codex = await fixture.acquire(createPiExecutor().start({
-      instanceId: "developer-codex-fast",
-      role: lateRole,
-      task: "send codex request",
-      target: { model: "openai/gpt-6-luna", reasoning: "max", fast: true },
-      cwd,
-      signal: new AbortController().signal,
-    }));
-    expect(codex.status).toBe("failed");
-    expect(codex.requests?.[0]).toMatchObject({
-      model: "openai/gpt-6-luna",
-      fast_requested: true,
-      requested_service_tier: "priority",
-      returned_service_tier: "unavailable",
-      time_to_first_model_output_ms: "unavailable",
-      time_to_first_model_output_unavailable_reason: "failed",
-    });
-    expect(websocketBodies[0]).toMatchObject({ type: "response.create", service_tier: "priority", pitako_payload_hook: "retained" });
-    expect(httpBodies[0]).toMatchObject({ service_tier: "priority", pitako_payload_hook: "retained" });
-    expect(payloadInputs.every((payload) => !Object.hasOwn(payload as object, "service_tier"))).toBe(true);
-  }), 60_000);
-
-  test.serial("sends OpenAI priority for arbitrary models through Responses and Completions", fixture.ownedCase("sends OpenAI priority for arbitrary models through Responses and Completions", async () => {
-    const { cwd, httpBodies, payloadInputs } = installTierFixture();
-    for (const id of ["fixture-responses", "fixture-completions"]) {
-      const attempt = await fixture.acquire(createPiExecutor().start({
-        instanceId: `developer-${id}-fast`,
-        role: lateRole,
-        task: "send OpenAI request",
-        target: { model: `openai/${id}`, fast: true },
-        cwd,
-        signal: new AbortController().signal,
-      }));
-      expect(attempt.failureKind).toBe("configuration");
-      expect(attempt.requests?.[0]).toMatchObject({
-        model: `openai/${id}`,
-        fast_requested: true,
-        requested_service_tier: "priority",
-      });
-    }
-    expect(httpBodies).toHaveLength(2);
-    for (const body of httpBodies) {
-      expect(body).toMatchObject({ service_tier: "priority", pitako_payload_hook: "retained" });
-    }
-    expect(payloadInputs.every((payload) => !Object.hasOwn(payload as object, "service_tier"))).toBe(true);
-  }), 60_000);
-
-  test.serial("sends exact xAI priority through Responses", fixture.ownedCase("sends exact xAI priority through Responses", async () => {
-    const { cwd, httpBodies, payloadInputs } = installTierFixture();
-    const xai = await fixture.acquire(createPiExecutor().start({
-      instanceId: "reviewer-xai-priority",
-      role: { ...lateRole, id: "reviewer" },
-      task: "send xai request",
-      target: { model: "xai/grok-4.7", reasoning: "xhigh", fast: true },
-      cwd,
-      signal: new AbortController().signal,
-    }));
-    expect(xai.failureKind).toBe("configuration");
-    expect(xai.requests?.[0]).toMatchObject({
-      model: "xai/grok-4.7",
-      fast_requested: true,
-      requested_service_tier: "priority",
-      returned_service_tier: "unavailable",
-      time_to_first_model_output_ms: "unavailable",
-      time_to_first_model_output_unavailable_reason: "failed",
-    });
-    expect(httpBodies[0]).toMatchObject({ service_tier: "priority", pitako_payload_hook: "retained" });
-    expect(payloadInputs.every((payload) => !Object.hasOwn(payload as object, "service_tier"))).toBe(true);
-  }), 60_000);
-
-  test.serial("keeps concurrent fast and normal provider tiers independent", fixture.ownedCase("keeps concurrent fast and normal provider tiers independent", async () => {
-    const { cwd, httpBodies, payloadInputs } = installTierFixture();
-    const concurrentExecutor = createPiExecutor();
-    const [concurrentFast, concurrentNormal] = await Promise.all([
-      fixture.acquire(concurrentExecutor.start({
-        instanceId: "reviewer-concurrent-fast",
-        role: { ...lateRole, id: "reviewer" },
-        task: "fast request",
-        target: { model: "xai/grok-4.7", reasoning: "xhigh", fast: true },
-        cwd,
-        signal: new AbortController().signal,
-      })),
-      fixture.acquire(concurrentExecutor.start({
-        instanceId: "reviewer-concurrent-normal",
-        role: { ...lateRole, id: "reviewer" },
-        task: "normal request",
-        target: { model: "xai/grok-4.7", reasoning: "xhigh", fast: false },
-        cwd,
-        signal: new AbortController().signal,
-      })),
-    ]);
-    const concurrentBodies = httpBodies.slice(0);
-    expect(concurrentBodies).toHaveLength(2);
-    expect(concurrentBodies.filter((body) => body.service_tier === "priority")).toHaveLength(1);
-    expect(concurrentBodies.filter((body) => !Object.hasOwn(body, "service_tier"))).toHaveLength(1);
-    expect(concurrentFast.requests?.[0]?.requested_service_tier).toBe("priority");
-    expect(concurrentNormal.requests?.[0]?.requested_service_tier).toBeUndefined();
-    expect(payloadInputs.every((payload) => !Object.hasOwn(payload as object, "service_tier"))).toBe(true);
-  }), 60_000);
-
-  function tierPolicy(agentDir: string) {
-    const configPath = path.join(agentDir, "pitako", "config.toml");
-    mkdirSync(path.dirname(configPath), { recursive: true });
-    writeFileSync(configPath, `[model_policies.developer.primary]\nmodel = "xai/grok-4.7"\nfast = true\n[[model_policies.developer.fallbacks]]\nmodel = "xai/grok-4.7"\nfast = false\n`);
-    writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ retry: { enabled: false } }));
-    return { env: { PI_CODING_AGENT_DIR: agentDir }, userConfigPath: configPath };
-  }
-
-  test.serial("rejects provider tier configuration without fallback", fixture.ownedCase("rejects provider tier configuration without fallback", async () => {
-    const { agentDir, cwd, httpBodies, payloadInputs } = installTierFixture();
-    const load = tierPolicy(agentDir);
-    const rejectionBody = httpBodies.length;
-    const rejectedTier = await fixture.run(runAgentInstance({
-      roleId: "developer",
-      task: "tier rejection",
-      cwd,
-      executor: createPiExecutor(),
-      load,
-    }));
-    expect(rejectedTier.status).toBe("failed");
-    expect(rejectedTier.model.fallbackOccurred).toBeFalsy();
-    expect(httpBodies.slice(rejectionBody)).toHaveLength(1);
-    expect(rejectedTier.requests?.[0]?.requested_service_tier).toBe("priority");
-    expect(payloadInputs.every((payload) => !Object.hasOwn(payload as object, "service_tier"))).toBe(true);
-  }), 60_000);
-
-  test.serial("keeps returned tier unavailable when xAI response reports default", fixture.ownedCase("keeps returned tier unavailable when xAI response reports default", async () => {
-    const agentDir = mkdtempSync(path.join(tmpdir(), "pitako-default-tier-agent-"));
-    const cwd = mkdtempSync(path.join(tmpdir(), "pitako-default-tier-cwd-"));
-    tempDirs.push(agentDir, cwd);
-    writeFileSync(path.join(agentDir, "models.json"), JSON.stringify({
-      providers: {
-        xai: {
-          api: "openai-responses",
-          apiKey: "fake-xai-key",
-          baseUrl: "https://api.x.ai/v1",
-          models: [{ id: "grok-4.7", name: "Grok", reasoning: true, input: ["text"], cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000, maxTokens: 64 }],
-        },
-      },
-    }));
-    process.env.PI_CODING_AGENT_DIR = agentDir;
-    const outputMessage = {
-      id: "msg_test",
-      type: "message",
-      role: "assistant",
-      status: "completed",
-      content: [{ type: "output_text", text: "ok", annotations: [] }],
-    };
-    const response = {
-      id: "resp_test",
-      status: "completed",
-      output: [outputMessage],
-      service_tier: "default",
-      usage: {
-        input_tokens: 1,
-        input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 },
-        output_tokens: 1,
-        output_tokens_details: { reasoning_tokens: 0 },
-        total_tokens: 2,
-      },
-    };
-    const events = [
-      { type: "response.created", response: { id: response.id } },
-      { type: "response.output_item.added", output_index: 0, item: { ...outputMessage, content: [] } },
-      { type: "response.output_text.delta", output_index: 0, content_index: 0, delta: "ok" },
-      { type: "response.output_item.done", output_index: 0, item: outputMessage },
-      { type: "response.completed", response },
-    ];
-    const sse = `${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`;
-    Object.defineProperty(globalThis, "fetch", {
-      configurable: true,
-      value: async () => new Response(sse, { headers: { "content-type": "text/event-stream" } }),
-    });
-    const attempt = await fixture.acquire(createPiExecutor().start({
-      instanceId: "developer-default-tier",
-      role: lateRole,
-      task: "return ok",
-      target: { model: "xai/grok-4.7", reasoning: "xhigh", fast: true },
-      cwd,
-      signal: new AbortController().signal,
-    }));
-    expect(attempt.status).toBe("completed");
-    expect(attempt.result).toBe("ok");
-    expect(attempt.requests).toMatchObject([{
-      fast_requested: true,
-      requested_service_tier: "priority",
-      returned_service_tier: "unavailable",
-    }]);
-  }), 60_000);
-
-  test.serial("cache warmer reuses its immutable active-target tier", fixture.ownedCase("cache warmer reuses its immutable active-target tier", async () => {
-    const agentDir = mkdtempSync(path.join(tmpdir(), "pitako-warm-agent-"));
-    const cwd = mkdtempSync(path.join(tmpdir(), "pitako-warm-cwd-"));
-    tempDirs.push(agentDir, cwd);
-    mkdirSync(path.join(agentDir, "extensions"), { recursive: true });
-    writeFileSync(
-      path.join(agentDir, "extensions", "warm.js"),
-      "export default function (pi) { pi.on('cache_warming_decision', () => ({ action: 'warm' })); }\n",
-    );
-    writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ cacheWarming: "idle", retry: { enabled: false } }));
-    writeFileSync(path.join(agentDir, "models.json"), JSON.stringify({
-      providers: {
-        xai: {
-          api: "openai-responses",
-          apiKey: "test-xai",
-          baseUrl: "https://api.x.ai/v1",
-          models: [{
-            id: "grok-4.7",
-            name: "Grok",
-            reasoning: true,
-            input: ["text"],
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-            promptCache: { short: 60 },
-            contextWindow: 1000,
-            maxTokens: 64,
-          }],
-        },
-      },
-    }));
-    process.env.PI_CODING_AGENT_DIR = agentDir;
-    const bodies: Array<Record<string, unknown>> = [];
-    const previousSetTimeout = globalThis.setTimeout;
-    const warmTimers: Array<() => void> = [];
-    Object.defineProperty(globalThis, "setTimeout", {
-      configurable: true,
-      value: (callback: (...args: unknown[]) => void, delay = 0, ...args: unknown[]) => {
-        if (delay === 50_000) {
-          warmTimers.push(() => callback(...args));
-          return { unref() {} };
+test("fallback after an owned mutation continues on one controlled session and resets reasoning",
+  fixture.ownedCase("same-session fallback", async () => {
+    const activations: string[] = [];
+    const f = setup({ models: [controlledModel(), controlledModel("fixture", "fallback")],
+      prompt(session) {
+        activations.push(session.thinkingLevel);
+        if (session.model?.id === "selected") {
+          session.emit({ type: "tool_execution_start", toolName: "write", toolCallId: "mutation" });
+          throw new Error("No API key for fixture/selected");
         }
-        return previousSetTimeout(callback, delay, ...args);
-      },
-    });
-    Object.defineProperty(globalThis, "fetch", {
-      configurable: true,
-      value: async (_input: RequestInfo | URL, init?: RequestInit) => {
-        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-        bodies.push(body);
-        const message = Object.hasOwn(body, "service_tier")
-          ? "Unsupported value for service_tier"
-          : "Offline request intercepted";
-        return new Response(JSON.stringify({ error: { message } }), {
-          status: 400,
-          headers: { "content-type": "application/json" },
-        });
-      },
-    });
-    const attempt = await fixture.acquire(createPiExecutor().start({
-      instanceId: "reviewer-cache-warm",
-      role: { ...lateRole, id: "reviewer" },
-      task: "start warmable request",
-      target: { model: "xai/grok-4.7", reasoning: "xhigh", fast: true },
-      cwd,
-      signal: new AbortController().signal,
-    }));
-    expect(attempt.status).toBe("failed");
-    expect(bodies).toHaveLength(1);
-    expect(bodies[0]).toMatchObject({ service_tier: "priority" });
-    expect(warmTimers).toHaveLength(1);
-    const continued = await attempt.session!.continueWith(
-      { model: "xai/grok-4.7", reasoning: "xhigh", fast: false },
-      "continue at normal priority",
-      new AbortController().signal,
-    );
-    expect(continued.status).toBe("failed");
-    expect(bodies).toHaveLength(2);
-    expect(Object.hasOwn(bodies[1]!, "service_tier")).toBe(false);
-    expect(warmTimers).toHaveLength(2);
-    warmTimers[0]!();
-    await new Promise((resolve) => previousSetTimeout(resolve, 5));
-    expect(bodies).toHaveLength(2);
-    warmTimers[1]!();
-    for (let i = 0; i < 50 && bodies.length < 3; i += 1) {
-      await new Promise((resolve) => previousSetTimeout(resolve, 5));
-    }
-    expect(bodies).toHaveLength(3);
-    expect(Object.hasOwn(bodies[2]!, "service_tier")).toBe(false);
-  }), 60_000);
+        session.messages.push({ role: "assistant", content: [{ type: "text", text: "continued result" }], stopReason: "stop" });
+      } });
+    const config = path.join(f.root, "policy.toml");
+    writeFileSync(config, '[model_policies.developer]\nprimary = { model = "fixture/selected", reasoning = "xhigh" }\nfallbacks = [{ model = "fixture/fallback" }]\n');
+    const result = await fixture.run(runAgentInstance({ roleId: "developer", cwd: f.root, task: "original work",
+      executor: f.executor, load: { userConfigPath: config } }));
+    expect(result).toMatchObject({ status: "completed", result: "continued result", model: {
+      selectedModel: "fixture/fallback", fallbackOccurred: true, appliedReasoning: DEFAULT_THINKING_LEVEL,
+    } });
+    expect(f.host.sessions).toHaveLength(1);
+    expect(activations).toEqual(["xhigh", DEFAULT_THINKING_LEVEL]);
+    expect(f.host.sessions[0]!.prompts).toHaveLength(2);
+    expect(f.host.sessions[0]!.prompts[1]).not.toBe("original work");
+    expect(f.host.sessions[0]!.events).toEqual(["bind", "session_shutdown", "dispose"]);
+  }));
 
-  test.serial("same-session continue does not prompt a missing model", fixture.ownedCase("same-session continue does not prompt a missing model", async () => {
-    const { calls, cwd } = await installLateProvider();
-    const attempt = await fixture.acquire(createPiExecutor().start({
-      instanceId: "developer-continue",
-      role: lateRole,
-      task: "say-pong-marker",
-      target: { model: "pitako-late/late", reasoning: "off" },
-      cwd,
-      signal: new AbortController().signal,
-    }));
-    expect(attempt.status).toBe("completed");
-    const next = await attempt.session!.continueWith(
-      { model: "pitako-late/missing" },
-      "continue",
-      new AbortController().signal,
-    );
-    expect(next.status).toBe("failed");
-    expect(next.error).toBe("model unavailable: pitako-late/missing");
-    const unsupported = await attempt.session!.continueWith(
-      { model: "pitako-late/late", fast: true },
-      "must not prompt",
-      new AbortController().signal,
-    );
-    expect(unsupported.failureKind).toBe("configuration");
-    expect(calls).toHaveLength(1);
-  }), 60_000);
-});
+test("overlapping fast and normal attempts keep payload tiers independent",
+  fixture.ownedCase("concurrent tiers", async () => {
+    let release!: () => void, entered!: () => void, count = 0;
+    const hold = new Promise<void>(resolve => { release = resolve; });
+    const both = new Promise<void>(resolve => { entered = resolve; });
+    const bodies: any[] = [];
+    const f = setup({ models: [controlledModel("xai", "grok-4.7", "openai-responses")],
+      async prompt(session, text) {
+        if (++count === 2) entered();
+        await hold;
+        await session.agent.streamFunction(session.model, { messages: [] }, { sessionId: session.sessionId,
+          onPayload: (payload: any) => ({ ...payload, attempt: text }) }).result();
+      } });
+    f.host.runtime.streamSimple = (_model, _context, options) => (async function* () {
+      bodies.push(await options?.onPayload?.({}, _model));
+      yield { type: "done", reason: "stop", message: { role: "assistant", content: [], stopReason: "stop" } };
+    })();
+    const pending = [true, false].map(fast => fixture.acquire(f.executor.start({ ...f.input, task: String(fast),
+      instanceId: String(fast), target: { model: "xai/grok-4.7", fast } })));
+    try {
+      await both;
+      expect(bodies).toEqual([]);
+      release();
+      const results = await Promise.all(pending);
+      expect(results.map(result => result.status)).toEqual(["completed", "completed"]);
+      expect(bodies).toContainEqual({ attempt: "true", service_tier: "priority" });
+      expect(bodies).toContainEqual({ attempt: "false" });
+      expect(bodies).toHaveLength(2);
+      expect(results[0]!.requests?.[0]?.requested_service_tier).toBe("priority");
+      expect(results[1]!.requests?.[0]?.requested_service_tier).toBeUndefined();
+    } finally { release(); await Promise.allSettled(pending); }
+  }));
+
+test("concurrent child tool events retain independent dense outcomes, raw counts and side effects",
+  fixture.ownedCase("telemetry", async () => {
+    const stop = new AbortController();
+    const f = setup({ prompt(session, text) {
+      session.stats.tokens.total = 1; session.stats.assistantMessages = 1;
+      session.emit({ type: "tool_execution_start", toolName: "project_report", toolCallId: "dense" });
+      if (text === "cancel") stop.abort();
+      session.emit({ type: "tool_execution_end", toolName: "project_report", toolCallId: "dense",
+        result: { content: [{ type: "text", text: "report" }], details: { status: text === "failed" ? "unavailable" : "ok" } } });
+      for (let index = 0; index < 5; index++) session.emit({ type: "tool_execution_end", toolName: "read", toolCallId: String(index), result: {} });
+      if (text === "failed") session.emit({ type: "tool_execution_start", toolName: "write", toolCallId: "write" });
+    } });
+    const results = await Promise.all(["failed", "cancel"].map(task => fixture.acquire(f.executor.start({ ...f.input, task,
+      instanceId: task, signal: task === "cancel" ? stop.signal : f.input.signal }))));
+    expect(results[0]!.sideEffects).toBe(true);
+    expect(results[1]!.status).toBe("cancelled");
+    for (const [index, result] of results.entries()) {
+      expect(result.usage?.codeIntelligence?.dense.project_report).toMatchObject({ calls: 1, outcomes: { [index ? "cancelled" : "unavailable"]: 1 } });
+      expect(result.usage?.codeIntelligence?.raw.read).toBe(5);
+      expect(result.usage?.tools?.project_report).toBe(1);
+    }
+  }));
+
+test("cancellation marks a request with no output unavailable and clears activity probe", fixture.ownedCase("cancel observation", async () => {
+  const stop = new AbortController(), events: string[] = [];
+  const f = setup({ prompt(session) {
+    session.agent.streamFunction(session.model, { messages: [] }, { sessionId: session.sessionId });
+    stop.abort();
+  } });
+  const result = await fixture.acquire(f.executor.start({ ...f.input, signal: stop.signal,
+    bindActivityProbe(probe) { events.push(probe ? "bind" : "clear"); } }));
+  expect(result.status).toBe("cancelled");
+  expect(result.requests?.[0]).toMatchObject({ time_to_first_model_output_ms: "unavailable",
+    time_to_first_model_output_unavailable_reason: "cancelled" });
+  expect(events).toEqual(["bind", "clear"]);
+}));

@@ -148,6 +148,8 @@ Define global outcomes and constraints, not a future Developer Team head's local
 
 Every meaningful unit needs acceptance criteria that name observable behavior and affected guarantees. Name proportional expected evidence using `verify-behavior` when it stops the executor from inventing "done". For new, costly, privileged, or integration-dependent acceptance, describe a compact permitted positive route from the actual entry point to the required observation. Resolve only material prerequisites: interaction driver, effective state and resource sharing, configuration, credentials, effect owner, authorization, and cleanup. Do not prescribe a test per function or a universal case matrix.
 
+Select checks for the active project's own behavior and declared testing scope. Reading an external boundary does not authorize dependency certification or repair. Do not turn out-of-scope external checks into acceptance, preflight, or final gates. Preserve authorized integration requirements from the project's scope, contracts, and active guide, not Pitako's distributed stack.
+
 ## Critique and freeze
 
 Integrate findings that change a decision, a boundary, or an acceptance criterion. If only optional hardening remains, do not grow the plan.

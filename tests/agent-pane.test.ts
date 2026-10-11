@@ -1,6 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -155,37 +154,3 @@ test("cross-binding, forged authority and bounded frames are rejected before eff
     await one.close(); await two.close();
   }
 }));
-
-test("real offline SDK worker admits IPC input before lost acknowledgment; explicit reconnect observes without replay", () => {
-  const root = mkdtempSync(path.join(tmpdir(), "pitako-pane-native-"));
-  let settled = false;
-  try {
-    const result = spawnSync("node", ["--experimental-transform-types", "--import", "./scripts/sdk-node-loader.mjs",
-      "tests/fixtures/agent-pane-native.mjs", path.join(root, "worker")], {
-      cwd: path.resolve(import.meta.dir, ".."), encoding: "utf8", timeout: 60_000,
-      env: { ...process.env, PI_OFFLINE: "1", PI_TELEMETRY: "0", PITAKO_INSTANCE_ID: "", PITAKO_ROLE_ID: "", TMPDIR: root },
-    });
-    settled = result.status !== null && existsSync(path.join(root, "worker/closure.json"));
-    expect(result.status, result.stderr + result.stdout).toBe(0);
-    const observed = JSON.parse(result.stdout);
-    console.log("native-ipc-observed:", JSON.stringify(observed));
-    expect(observed).toMatchObject({ positive: { status: "queued" }, lostResponse: expect.stringContaining("Unknown mutation outcome"),
-      queuedLost: { status: "queued" }, noReplay: true, paidCalls: 0, joinedAttempts: 1 });
-    const native = JSON.parse(readFileSync(path.join(root, "worker/native-ipc.json"), "utf8"));
-    expect(native.admitted.interactions.at(-1).status).toBe("queued");
-    expect(native.withheld.result.interactionId).toBe(native.admitted.interactions.at(-1).interactionId);
-    expect(native.reobserved.observation.interactions).toHaveLength(2);
-    expect(native.trace.some((row: { prompt: string }) => row.prompt.includes(native.queuedLost.interactionId))).toBe(true);
-    expect(native.snapshots.map((row: { label: string }) => row.label)).toEqual([
-      "live", "post-error-refresh", "visible-refresh", "explicit-reconnect",
-    ]);
-    for (const row of native.snapshots.slice(1)) {
-      expect(row.lines.join("\n")).toContain("Unknown mutation outcome");
-      expect(row.lines.join("\n")).toContain("do not replay");
-    }
-    expect(native.snapshots[2].lines.join("\n")).toContain("controls disabled");
-    expect(native.snapshots[3].lines.join("\n")).not.toContain("STALE");
-  } finally {
-    if (settled) rmSync(root, { recursive: true, force: true }); else console.error("Retained unproven native pane root:", root);
-  }
-}, 90_000);

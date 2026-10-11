@@ -107,6 +107,8 @@ Carry the source and force of consequential restrictions within these fields. Us
 
 Before dispatch, compare the brief with the frozen unit and relevant rulings. Do not omit obligations or turn an optional technical restriction into a binding prohibition. Do not relabel a frozen invariant or acceptance condition as advisory because its author was the planner.
 
+Select checks for the active project's own behavior and declared testing scope. WorkBriefs must not turn out-of-scope external checks into acceptance, preflight, or final gates. Reading an external boundary does not authorize dependency certification or repair. Preserve authorized integration requirements from the project's scope, contracts, and active guide, not Pitako's distributed stack.
+
 Label evidence as accepted, advisory, failed, or unavailable according to its actual source. A worker claim is not accepted evidence. Keep relevant valid evidence even when it is old. Exclude obsolete or unrelated context. Do not send the parent transcript or every Board topic.
 
 Supply resolved references to actual reusable evidence and identify what remains uncovered under `verify-behavior`'s shared policy. Do not require rediscovery of artifacts, reconciliation of every earlier report, or a replacement report merely for a handoff. Existing required reports and identity checks remain required.
@@ -159,7 +161,7 @@ Scope is files changed by this run. Do not clean unrelated history. Do not escal
 
 Write `evidence/<unit>/deslop.md` or `evidence/final/deslop.md` only for a dedicated pass. Keep the ledger to a pointer.
 
-After cleanup, rerun checks invalidated by the edits using `verify-behavior`; if cleanup breaks a check, revert that cleanup and verify again. Run final gates after all edits: focused tests, then typecheck or lint or build when relevant, then the real surface when it is cheap. Evidence reuse never cancels a mandatory gate.
+After cleanup, rerun checks invalidated by the edits using `verify-behavior`; if cleanup breaks a check, revert that cleanup and verify again. Run applicable final gates after all edits, using the active project's complete procedure and order within the authorized testing scope. Cheap access to an external runtime does not make it a gate. Evidence reuse never cancels a mandatory gate.
 
 ## Review
 

@@ -110,13 +110,4 @@ describe("Developer routing", () => {
     expect(classifyProfile(response("developer_senior", { ...base, indeterminate: 0.9 })).profile).toBe("developer_mid");
     expect(classifyProfile(response("developer_junior", { ...base, developer_junior: 0.9 })).profile).toBe("developer_junior");
   });
-  test("real Node SDK registered tool, public classifier HTTP and native linkage", () => {
-    const root = packageRoot();
-    const child = spawnSync("node", ["--experimental-transform-types", "--import",
-      path.join(root, "scripts/sdk-node-loader.mjs"), "scripts/developer-routing-sdk-node.mjs"], {
-      cwd: root, encoding: "utf8", timeout: 90_000, maxBuffer: 4 * 1048576,
-      env: { ...process.env, PI_OFFLINE: "1", PI_TELEMETRY: "0" },
-    });
-    expect(child.status, child.stderr + child.stdout).toBe(0);
-  }, 100_000);
 });

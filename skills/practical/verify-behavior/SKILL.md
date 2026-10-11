@@ -23,6 +23,12 @@ Modes are natural-language requests, not a new tool or API. For example:
 
 ## Read the project's verification guide
 
+Start check selection from behavior owned by the active project and its declared testing scope. Requirements for authorized product integrations come from that project's scope, contracts, and active guide, not from Pitako's distributed stack.
+
+In the Pitako checkout, acceptance covers Pitako's rules, adapters, resource declarations, and instruction assembly with controlled external boundaries. It does not certify installation or operation of Pi, SDK, ACP, third-party extensions, providers, classifiers, CodeGraph, LSP, or Herdr. External certification checks are retired, not deferred acceptance work.
+
+Reading an external boundary to understand a call grants no certification or repair task. A controlled boundary double can verify an owned rule without proving the replaced runtime. Reviewer must not demand that runtime solely because a double was used. Preserve separately authorized integration requirements in projects that implement those integrations, and report what local evidence does not prove.
+
 Read one root `GATES.md` for the active project. Use existing workspace resolution through `workflowWorkspace` in `extensions/workflow.ts`, which selects the Git worktree root or canonical cwd outside Git:
 
 - `$execute` uses `binding.executionRoot` captured by `openExecutionPlan`, not the pinned plan source.
@@ -47,11 +53,11 @@ Use explicit focused selections during implementation. The principal coordinator
 
 ## Select and observe evidence
 
-1. Name the input or action, observable result, and affected guarantees that must remain true. Derive expectations from the contract or requirement, not from a copy of the implementation.
+1. Identify the active project's owned behavior and declared testing scope. Name the input or action, observable result, and affected guarantees that must remain true. Derive expectations from the contract or requirement, not from a copy of the implementation.
 2. Reuse existing checks. Choose the smallest check that observes the relevant contract, whether a domain rule, public library API, command, service, or user interaction. For new, costly, privileged, or integration-dependent evidence, trace a compact permitted positive route from the actual entry point to the required observation. Resolve only material prerequisites: interaction driver, effective state and resource sharing, configuration, credentials, effect owner, authorization, and cleanup. A call to `save()` does not prove persistence. Retrieve the data through the relevant path. Intention logs, compilation, a diff, or a mock that supplies the expected answer do not replace that observation.
 3. Before adding a test, ask what plausible wrong implementation it would reject and what it adds beyond existing evidence. This is a brief technical decision, not a written justification per test or a mutation-testing requirement. Reject copied algorithms, mock-stipulated results, internal details without a contract, and duplicate guarantees without a meaningful distinct case. An interaction can be observable when it is the contract. A different parameter can represent a distinct behavior class.
 4. Before running checks that launch other checks, trace their reachable commands through suites, fixtures, and wrappers. Use the actual arguments and environment. Do not run a cycle that re-enters the same verification stage or suite. When enabling a stage, update unsupported-stage cases whose contract no longer applies. Keep valid verifier integration tests outside the suites they launch.
-5. Run the check and inspect the actual result. A double can isolate a dependency, but proves neither that dependency's real behavior nor an integration it replaces. Deterministic host checks prove their host contract or local mechanism, not an external model's completion of the real workflow. Preserve a separately required real-provider demonstration. Advisory observations, including passes, do not satisfy required acceptance checks. Report only what the exercised path observes. Internal refactors that preserve the contract should not break tests through implementation details.
+5. Run the check and inspect the actual result. A double can isolate a dependency, but proves neither that dependency's real behavior nor an integration it replaces. This limit does not create a requirement to exercise that runtime. Deterministic host checks prove their host contract or local mechanism, not an external model's completion of the real workflow. Preserve a separately required real-provider demonstration when it belongs to the authorized testing scope. Advisory observations, including passes, do not satisfy required acceptance checks. Report only what the exercised path observes. Internal refactors that preserve the contract should not break tests through implementation details.
 
 Inspect the actual path before choosing a restriction. A worktree does not prove global-state isolation. Private state is not inherently prohibited, and a credentials symlink does not prove immutable credentials.
 
