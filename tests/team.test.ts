@@ -9,7 +9,7 @@ import path from "node:path";
 import { cancelTeamWorker, cancelWorker, observeWorkerResults, shutdownBackground, spawnBackground, teamWorkerResult, teamWorkerStatus, workerResult, workerStatus, type ResultMessage } from "../extensions/agent/background.ts";
 import type { Attempt, AttemptExecutor } from "../extensions/agent/run.ts";
 import { bindBackgroundOwner, clearBackgroundOwner } from "../extensions/agent/background.ts";
-import { listObservations, publishObservation } from "../extensions/agent/observe.ts";
+import { listObservations, publishObservation, subscribeChanges } from "../extensions/agent/observe.ts";
 import { registerExecution, unregisterExecution } from "../extensions/execution-identity.ts";
 import { beginTeamEvaluation, hasTeamRoster, hasUnsettledTeamWork, latestTeamAssignment, recordPlanTeamWork, reserveTeamRole, retireTeamEvaluation, teamEvaluationForSession, teamRoleReservation, teamAssignments } from "../extensions/team.ts";
 import { openBoard } from "../extensions/board/store.ts";
@@ -321,7 +321,10 @@ describe("Team T1 ownership", () => {
       setActiveTools() {}, getSessionName() { return undefined; }, setSessionName() {},
       sendMessage(message: any, options: any) {
         sent.push({ message, options });
-        if (options.triggerTurn === false) branch.push({ type: "custom_message", ...message });
+        if (options.triggerTurn === false) {
+          const cloned = structuredClone(message);
+          branch.push({ type: "custom_message", ...cloned });
+        }
       },
     };
     pitako(pi as unknown as ExtensionAPI);
@@ -355,39 +358,96 @@ describe("Team T1 ownership", () => {
     expect(architect.unitId).not.toBe(researcher.unitId);
     expect(workers).toHaveLength(2);
 
-    workers.find((worker) => worker.task.includes("Research planning task"))!.finish(completed("research result"));
-    for (let i = 0; i < 50 && teamWorkerStatus(current.token, researcher.instanceId)[0]?.status !== "completed"; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    }
+    const researchText = " \nresearch 🧬漢字\u0000e\u0301 \"quoted\"\\path\t\n ";
+    const architectText = " \narchitect 🧬漢字\u0000e\u0301 \"quoted\"\\path\t\n ";
+    let collected!: () => void;
+    const researchReady = new Promise<void>(resolve => { collected = resolve; });
+    const unsubscribe = subscribeChanges(row => {
+      if (row.id === researcher.instanceId && row.handoff?.collection === "collected") collected();
+    });
+    fixture.beforeRelease(unsubscribe);
+    workers.find((worker) => worker.task.includes("Research planning task"))!.finish(completed(researchText));
+    await researchReady;
+    unsubscribe();
     expect(teamWorkerStatus(current.token, researcher.instanceId)[0]?.status).toBe("completed");
     expect(sent).toEqual([]);
     const boundary = handlers.get("agent_before_settle")?.({ outcome: "completed", context: { canContinue: false } }, hostContext);
-    expect(boundary).toMatchObject({ continue: true, entries: [{ content: "research result", details: { assignmentId: researcher.id } }] });
+    const cloned = structuredClone(boundary.entries);
+    expect(cloned).toEqual(boundary.entries);
+    expect(cloned[0].details).not.toBe(boundary.entries[0].details);
+    const restored = JSON.parse(JSON.stringify(boundary.entries));
+    expect(boundary).toMatchObject({ continue: true, entries: [{ content: researchText, details: {
+      instanceId: researcher.instanceId, assignmentId: researcher.id, ownerSessionId: sessionId,
+      status: "completed", roleId: "researcher",
+      planId: "plan-frozen-a", unitId: "research-evidence",
+    } }] });
+    expect(restored[0].content).toBe(researchText);
+    expect(boundary.entries[0].details.deliveryId).toBeString();
+    expect(typeof boundary.entries[0].details.foregroundRevision).toBe("number");
+    expect(Object.hasOwn(boundary.entries[0].details, "ownerToken")).toBe(false);
+    expect(Object.hasOwn(boundary.entries[0].details, "teamToken")).toBe(false);
+    for (const [key, value] of Object.entries(boundary.entries[0].details)) {
+      if (value !== undefined) expect(restored[0].details[key]).toEqual(value);
+    }
+    expect(listObservations(current.token).find(row => row.id === researcher.instanceId)?.teamOwnerToken).toBe(current.token);
     expect(listObservations(current.token).find(row => row.id === researcher.instanceId)?.resultTaken).not.toBe(true);
-    branch.push(...boundary.entries);
+    branch.push(...restored);
     handlers.get("context")?.({}, hostContext);
     expect(listObservations(current.token).find(row => row.id === researcher.instanceId)?.handoff?.delivery).toBe("incorporated");
+    expect(listObservations(current.token).find(row => row.id === researcher.instanceId)?.handoff?.continuation).toBe("requested");
+    expect(listObservations(current.token).find(row => row.id === researcher.instanceId)?.resultTaken).not.toBe(true);
     handlers.get("turn_start")?.({}, hostContext);
+    expect(listObservations(current.token).find(row => row.id === researcher.instanceId)?.handoff?.continuation).toBe("observed");
     expect(listObservations(current.token).find(row => row.id === researcher.instanceId)?.resultTaken).toBe(true);
     idle = true;
     handlers.get("agent_settled")?.({}, hostContext);
     expect(sent).toEqual([]);
     const consumed = await invoke("team_result", { assignmentId: researcher.id });
-    expect(consumed.content[0].text).toContain("research result");
+    expect(consumed.content[0].text).toContain(researchText);
     handlers.get("agent_settled")?.({}, hostContext);
     expect(sent).toEqual([]);
 
-    workers.find((worker) => worker.task.includes("Architect planning task"))!.finish(completed("architect result"));
-    for (let i = 0; i < 50 && teamWorkerStatus(current.token, architect.instanceId)[0]?.status !== "completed"; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    }
+    workers.find((worker) => worker.task.includes("Architect planning task"))!.finish(completed(architectText));
+    await fixture.settleRuns();
     expect(teamWorkerStatus(current.token, architect.instanceId)[0]?.status).toBe("completed");
     const architectResults = sent.filter((item) => item.message.customType === "pitako.worker.result");
     expect(architectResults).toHaveLength(1);
-    expect(architectResults[0]?.message).toMatchObject({ content: "architect result", details: { assignmentId: architect.id } });
+    const original = architectResults[0]!.message;
+    expect(structuredClone(original)).toEqual(original);
+    const json = JSON.parse(JSON.stringify(original));
+    expect(json.content).toBe(architectText);
+    for (const [key, value] of Object.entries(original.details)) {
+      if (value !== undefined) expect(json.details[key]).toEqual(value);
+    }
+    const committed = branch.find((entry: any) => entry.details?.instanceId === architect.instanceId) as ResultMessage;
+    expect(committed.content).toBe(architectText);
+    expect(committed.details).toEqual(original.details);
+    expect(committed.details).not.toBe(original.details);
+    expect(original).toMatchObject({ content: architectText, details: {
+      instanceId: architect.instanceId, assignmentId: architect.id, ownerSessionId: sessionId,
+      status: "completed", roleId: "architect",
+      planId: "plan-frozen-a", unitId: "architect-review",
+    } });
+    expect(original.details.deliveryId).toBeString();
+    expect(typeof original.details.foregroundRevision).toBe("number");
+    expect(Object.hasOwn(original.details, "ownerToken")).toBe(false);
+    expect(Object.hasOwn(original.details, "teamToken")).toBe(false);
     expect(architectResults[0]?.options).toEqual({ triggerTurn: false });
     expect(sent[1]?.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
     expect(sent[1]?.message.content).toContain("already supplied");
+    expect(sent).toHaveLength(2);
+    expect(listObservations(current.token).find(row => row.id === architect.instanceId)?.teamOwnerToken).toBe(current.token);
+    expect(listObservations(current.token).find(row => row.id === architect.instanceId)?.handoff).toMatchObject({
+      bookkeeping: "inapplicable", delivery: "incorporated", continuation: "requested",
+    });
+    expect(listObservations(current.token).find(row => row.id === architect.instanceId)?.resultTaken).not.toBe(true);
+    handlers.get("turn_start")?.({}, hostContext);
+    expect(listObservations(current.token).find(row => row.id === architect.instanceId)?.handoff?.continuation).toBe("observed");
+    expect(listObservations(current.token).find(row => row.id === architect.instanceId)?.resultTaken).toBe(true);
+    const reread = await invoke("team_result", { assignmentId: architect.id });
+    expect(reread.content[0].text).toContain(architectText);
+    handlers.get("agent_settled")?.({}, hostContext);
+    handlers.get("agent_settled")?.({}, hostContext);
     expect(sent).toHaveLength(2);
   }));
 

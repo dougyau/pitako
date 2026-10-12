@@ -234,9 +234,16 @@ describe("background registry", () => {
     const bound = owner(true);
     bound.hasUI = false;
     let appended!: () => void;
-    const ready = new Promise<void>(resolve => { appended = resolve; });
-    const append = bound.appendResult!;
-    bound.appendResult = message => { append(message); appended(); };
+    let cloneFailed!: (error: unknown) => void;
+    const ready = new Promise<void>((resolve, reject) => { appended = resolve; cloneFailed = reject; });
+    bound.appendResult = message => {
+      bound.results.push(message);
+      try {
+        const cloned = structuredClone(message);
+        bound.branch.push({ type: "custom_message", ...cloned });
+        appended();
+      } catch (error) { cloneFailed(error); }
+    };
     bindBackgroundOwner(bound);
     const hanging = hang();
     const handle = await spawnBackground({ roleId: "developer", task: "work", cwd: packageRoot(),
@@ -244,15 +251,29 @@ describe("background registry", () => {
     const complete = " \n🧬漢字\u0000e\u0301 ".repeat(4000) + "\n ";
     hanging.release({ status: "completed", result: complete, sideEffects: false });
     await ready;
+    await fixture.settleRuns();
     expect(bound.results).toHaveLength(1);
-    expect(bound.results[0]?.content).toBe(complete);
+    const original = bound.results[0]!;
+    const committed = bound.branch[0] as ResultMessage;
+    expect(original.content).toBe(complete);
+    expect(committed.content).toBe(complete);
+    expect(committed.details).toEqual(original.details);
+    expect(committed.details).not.toBe(original.details);
+    expect(original.details).toMatchObject({ instanceId: handle.instanceId, status: "completed", roleId: "developer" });
+    expect(original.details.deliveryId).toBeString();
+    expect(Object.hasOwn(original.details, "ownerToken")).toBe(false);
+    expect(Object.hasOwn(original.details, "teamToken")).toBe(false);
     expect(bound.wakes).toHaveLength(1);
     expect(bound.wakes[0]).not.toContain("agent_result");
     expect(workerHandoff(handle.instanceId)).toMatchObject({
       collection: "collected", bookkeeping: "inapplicable", delivery: "incorporated", continuation: "requested",
     });
+    expect(listObservations().find(row => row.id === handle.instanceId)?.resultTaken).not.toBe(true);
     observeWorkerResults(bound.token, true);
     expect(workerHandoff(handle.instanceId)?.continuation).toBe("observed");
+    expect(listObservations().find(row => row.id === handle.instanceId)?.resultTaken).toBe(true);
+    observeWorkerResults(bound.token, true);
+    settleWorkerResults(bound.token, true);
     bound.branch.length = 0;
     observeWorkerResults(bound.token);
     expect(workerHandoff(handle.instanceId)?.delivery).toBe("incorporated");
@@ -268,22 +289,47 @@ describe("background registry", () => {
     const handle = await spawnBackground({ roleId: "developer", task: "work", cwd: packageRoot(),
       executor: hanging.executor, load: load() });
     hanging.release({ status: "completed", result: "complete text", sideEffects: false });
-    await waitFor(handle.instanceId);
+    await fixture.settleRuns();
     expect(bound.results).toEqual([]);
     const offered = draftWorkerResults(bound.token, "completed")!;
+    const cloned = structuredClone(offered.entries);
+    expect(cloned).toEqual(offered.entries);
+    expect(cloned[0]?.details).not.toBe(offered.entries[0]?.details);
+    const restored = JSON.parse(JSON.stringify(offered.entries));
+    const original = offered.entries[0]!;
+    expect(original.details).toMatchObject({ instanceId: handle.instanceId, status: "completed", roleId: "developer" });
+    expect(original.details.deliveryId).toBeString();
+    expect(Object.hasOwn(original.details, "ownerToken")).toBe(false);
+    expect(Object.hasOwn(original.details, "teamToken")).toBe(false);
+    for (const [key, value] of Object.entries(original.details)) {
+      if (value !== undefined) expect(restored[0].details[key]).toEqual(value);
+    }
+    expect(restored[0].content).toBe(original.content);
     expect(offered.continue).toBe(true);
     expect(offered.entries[0]?.content).toBe("complete text");
     expect(workerHandoff(handle.instanceId)?.delivery).toBe("offered");
+    expect(workerHandoff(handle.instanceId)?.continuation).toBe("requested");
+    expect(listObservations().find(row => row.id === handle.instanceId)?.resultTaken).not.toBe(true);
     expect(draftWorkerResults(bound.token, "completed")).toBeUndefined();
     observeWorkerResults(bound.token, true);
     expect(workerHandoff(handle.instanceId)?.continuation).toBe("requested");
-    bound.branch.push(...offered.entries);
+    bound.branch.push(...restored);
+    const foreign = Symbol("foreign");
+    observeWorkerResults(foreign, true);
+    expect(workerHandoff(handle.instanceId)?.delivery).toBe("offered");
+    expect(listObservations().find(row => row.id === handle.instanceId)?.resultTaken).not.toBe(true);
     observeWorkerResults(bound.token);
     expect(workerHandoff(handle.instanceId)?.delivery).toBe("incorporated");
     expect(workerHandoff(handle.instanceId)?.continuation).toBe("requested");
+    expect(listObservations().find(row => row.id === handle.instanceId)?.resultTaken).not.toBe(true);
+    observeWorkerResults(foreign, true);
+    expect(workerHandoff(handle.instanceId)?.continuation).toBe("requested");
     observeWorkerResults(bound.token, true);
     expect(workerHandoff(handle.instanceId)?.continuation).toBe("observed");
+    expect(listObservations().find(row => row.id === handle.instanceId)?.resultTaken).toBe(true);
     settleWorkerResults(bound.token, true);
+    expect(draftWorkerResults(bound.token, "completed")).toBeUndefined();
+    expect(bound.results).toEqual([]);
     expect(bound.wakes).toEqual([]);
   }));
 
