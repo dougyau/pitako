@@ -15,7 +15,6 @@ import { packageRoot } from "../stack.ts";
 import { marksSideEffect } from "./effects.ts";
 import { isServiceTierRejection } from "./fallback.ts";
 import { childInstructions, skillNamesForRole, usageDelta, type AgentRequestObservation, type AgentUsage, type Attempt, type AttemptExecutor } from "./run.ts";
-import { completeTool, emptyCodeIntelligenceUsage, isDenseToolName, type CodeIntelligenceUsage, type DenseCallUsage, type ToolOutcome } from "../code-intelligence/metrics.ts";
 import type { ModelTarget, ReasoningLevel } from "../roles/types.ts";
 import { InvocationHistory, type SessionHistory } from "./history.ts";
 import { createLiveHandle } from "./live.ts";
@@ -29,7 +28,6 @@ const sdkDefaultsReady = import(
   return defaults;
 });
 
-const navigationWindows = new WeakMap<AgentSession, { remaining: number }>();
 const childLifecycles = new WeakMap<AgentSession, { bound: boolean; disposal?: Promise<void>; history?: SessionHistory;
   live?: ReturnType<typeof createLiveHandle>; unbindLive?: () => void }>();
 
@@ -467,10 +465,6 @@ async function drive(
   try {
     let sideEffects = false;
     const tools: Record<string, number> = {};
-    const codeIntelligence = emptyCodeIntelligenceUsage();
-    const navigation = navigationWindows.get(session) ?? { remaining: 0 };
-    codeIntelligence.navigation.remaining = navigation.remaining;
-    const toolStarts = new Map<string, number>();
     const requests: AgentRequestObservation[] = [];
     let activeRequest: { observation: AgentRequestObservation; startedAt: number } | undefined;
     const finishRequest = (reason: "cancelled" | "failed") => {
@@ -531,15 +525,10 @@ async function drive(
       }
       input.onActivity?.(event);
       if (event.type === "tool_execution_start") {
-        toolStarts.set(event.toolCallId, performance.now());
         if (marksSideEffect(event.toolName)) sideEffects = true;
       }
       if (event.type === "tool_execution_end") {
         tools[event.toolName] = (tools[event.toolName] ?? 0) + 1;
-        const started = toolStarts.get(event.toolCallId);
-        toolStarts.delete(event.toolCallId);
-        completeTool(codeIntelligence, event.toolName, denseCallFromExecution(event.toolName, event.result, started, input.signal), navigation);
-        navigationWindows.set(session, navigation);
       }
     });
     const handle = resume(session, runtime, selections, now, input);
@@ -551,7 +540,7 @@ async function drive(
         unsubscribe();
         session.agent.streamFunction = originalStreamFunction;
       }
-      return { status: "cancelled", result: "cancelled", sideEffects, requests: requests.length ? requests : undefined, usage: attemptUsage(before, session, tools, codeIntelligence), session: handle };
+      return { status: "cancelled", result: "cancelled", sideEffects, requests: requests.length ? requests : undefined, usage: attemptUsage(before, session, tools), session: handle };
     }
     const stopWatch = watchAbort(input.signal, () => {
       // Disposal joins this same close promise and propagates persistence failures.
@@ -562,25 +551,25 @@ async function drive(
       await session.prompt(prompt, { expandPromptTemplates: false });
       const assistant = lastAssistant(session);
       if (input.signal.aborted) {
-        return { status: "cancelled", result: "cancelled", sideEffects, requests: requests.length ? requests : undefined, usage: attemptUsage(before, session, tools, codeIntelligence), appliedReasoning: session.thinkingLevel, session: handle };
+        return { status: "cancelled", result: "cancelled", sideEffects, requests: requests.length ? requests : undefined, usage: attemptUsage(before, session, tools), appliedReasoning: session.thinkingLevel, session: handle };
       }
       if (assistant?.stopReason === "aborted" || assistant?.stopReason === "error") {
-        return failedAttempt(assistant.errorMessage ?? assistant.stopReason ?? "provider error", sideEffects, handle, session, attemptUsage(before, session, tools, codeIntelligence), requests);
+        return failedAttempt(assistant.errorMessage ?? assistant.stopReason ?? "provider error", sideEffects, handle, session, attemptUsage(before, session, tools), requests);
       }
       return {
         status: "completed",
         result: textOf(assistant),
         sideEffects,
         requests: requests.length ? requests : undefined,
-        usage: attemptUsage(before, session, tools, codeIntelligence),
+        usage: attemptUsage(before, session, tools),
         appliedReasoning: session.thinkingLevel,
         session: handle,
       };
     } catch (error) {
       if (input.signal.aborted) {
-        return { status: "cancelled", result: "cancelled", sideEffects, requests: requests.length ? requests : undefined, usage: attemptUsage(before, session, tools, codeIntelligence), session: handle };
+        return { status: "cancelled", result: "cancelled", sideEffects, requests: requests.length ? requests : undefined, usage: attemptUsage(before, session, tools), session: handle };
       }
-      return failedAttempt(messageOf(error), sideEffects, handle, session, attemptUsage(before, session, tools, codeIntelligence), requests);
+      return failedAttempt(messageOf(error), sideEffects, handle, session, attemptUsage(before, session, tools), requests);
     } finally {
       await childLifecycles.get(session)?.live?.settle();
       finishRequest(input.signal.aborted ? "cancelled" : "failed");
@@ -694,31 +683,10 @@ export function watchAbort(signal: AbortSignal, onAbort: () => void): () => void
   return () => signal.removeEventListener("abort", listener);
 }
 
-function denseCallFromExecution(name: string, result: any, startedAt: number | undefined, signal: AbortSignal): DenseCallUsage | undefined {
-  if (!isDenseToolName(name)) return undefined;
-  const details = result?.details ?? result?.result?.details ?? {};
-  const measured = details.codeIntelligence;
-  if (measured?.tool === name && typeof measured.durationMs === "number" && typeof measured.outputBytes === "number") {
-    return measured as DenseCallUsage;
-  }
-  const text = Array.isArray(result?.content) ? result.content.filter((part: any) => part?.type === "text").map((part: any) => String(part.text ?? "")).join("\n") : "";
-  const status = details.status;
-  const outcome: ToolOutcome = signal.aborted ? "cancelled" : status === "partial" ? "partial" : status === "unavailable" ? "unavailable" : result?.isError ? "error" : "ok";
-  return {
-    tool: name,
-    durationMs: Math.max(0, Math.round(performance.now() - (startedAt ?? performance.now()))),
-    outputBytes: Buffer.byteLength(text),
-    truncated: details.truncated === true,
-    outcome,
-    telemetryAvailable: false,
-    sources: {},
-  };
-}
-
-function attemptUsage(before: AgentUsage, session: AgentSession, tools: Record<string, number>, codeIntelligence: CodeIntelligenceUsage): AgentUsage | undefined {
+function attemptUsage(before: AgentUsage, session: AgentSession, tools: Record<string, number>): AgentUsage | undefined {
   const delta = usageDelta(before, usageFrom(session, {}));
   if (!delta) return undefined;
-  return { ...delta, tools, contextTokens: usageFrom(session, {}).contextTokens, codeIntelligence: structuredClone(codeIntelligence) };
+  return { ...delta, tools, contextTokens: usageFrom(session, {}).contextTokens };
 }
 
 function usageFrom(session: AgentSession, tools: Record<string, number>): AgentUsage {

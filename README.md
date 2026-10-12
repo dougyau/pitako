@@ -20,7 +20,7 @@ It currently combines:
 
 Not every skill or principle is active all the time. Pi keeps names and descriptions in context and loads a skill body when the task matches. Principles are contextual. Roles can use different subsets. Team assignments and the workspace Board are available to the foreground session.
 
-`pitako-coding` is the router: inspect the repo, keep raw read, grep, LSP, and CodeGraph available, use bounded Code Intelligence queries when they fit, keep diffs small, verify real behavior, and load a specialized skill only when it applies. It does not embed the full Ponytail, Caveman, or pstack bodies.
+`pitako-coding` is the router: inspect the repo, keep read, grep, LSP, and CodeGraph available, choose supported tools for bounded structural questions, keep diffs small, verify real behavior, and load a specialized skill only when it applies. It does not embed the full Ponytail, Caveman, or pstack bodies.
 
 Disable Ponytail, Caveman, or any individual skill with `pi config` or package skill filters. See [Disable or override](#disable-or-override-an-extension). Attribution and pins are in [THIRD_PARTY.md](THIRD_PARTY.md). Decisions are in [docs/engineering.md](docs/engineering.md).
 
@@ -29,7 +29,6 @@ Disable Ponytail, Caveman, or any individual skill with `pi config` or package s
 - A Pi package (`keywords: pi-package`) with Pitako, official Codex tools, ACP context compression, web access, Hermes memory, and Board extensions, curated skills, and one prompt.
 - The **coding** profile: Pi's read and bash tools, model-compatible editing tools, grep, find, ls, LSP, and CodeGraph.
 - The **analysis** profile: the same read and search tools, without `edit`, `write`, `apply_patch`, or `lsp_rename`.
-- Six bounded, read-only Code Intelligence queries: `project_report`, `read_symbol`, `read_enclosing`, `module_report`, `inspect_symbol`, and `review_surface`. Graph-backed queries create or refresh their index when needed under Node; raw tools remain visible.
 - Startup checks that fail with a clear configuration error when a required extension file or the `codegraph` CLI is missing.
 - On-demand Ponytail, selected Caveman skills, and selected pstack practical skills and principles.
 - Session-local TODOs via `@juicesharp/rpiv-todo` (`todo`, `/todos`, overlay).
@@ -294,7 +293,7 @@ bash ./scripts/setup.sh
 pi install .
 ```
 
-`scripts/setup.sh` selects its checkout from the script directory, independently of caller cwd. It checks declared runtimes, installs with `bun install --frozen-lockfile`, and uses actual Node to resolve Hermes's native SQLite dependency and construct/query/close both SQLite implementations. It does not run gates, install global tools, initialize CodeGraph, or write Pi settings. You can also invoke it directly by absolute path.
+`scripts/setup.sh` selects its checkout from the script directory, independently of caller cwd. It checks declared runtimes, installs with `bun install --frozen-lockfile`, and uses actual Node to resolve Hermes's native SQLite dependency and construct/query/close both SQLite implementations. After those prerequisites pass, it initializes a missing CodeGraph index best-effort, respecting a valid `CODEGRAPH_DIR` override. An existing index is left untouched; an unavailable CLI or initialization failure warns and allows LSP/read/grep use. It does not run gates, install global tools or Git hooks, or write Pi settings. You can also invoke it directly by absolute path.
 
 If installation or native loading fails, preserve the original error and resolve the reported host prerequisite before retrying. A working prebuilt needs no `node-gyp`; compilation may need a local toolchain. `--ignore-scripts` does not prove that the installed binary works. Setup success does not supply language servers or every gate-specific facility.
 
@@ -315,7 +314,7 @@ Development shortcut, using the Pi binary from this repo's dev dependency rather
 bun run pi
 ```
 
-Open a project with source files and a language server for LSP. Dense graph queries build or refresh the CodeGraph index as needed under Node; raw `codegraph_*` queries need an existing index. Run `codegraph init` if you plan to use raw CodeGraph before any dense graph query.
+Open a project with source files and a language server for LSP. The `codegraph_*` runtime tools need an existing index and do not initialize or refresh it. This checkout's setup attempts missing-index initialization best-effort; for other projects, use their preparation procedure or run `codegraph init` explicitly when you want CodeGraph navigation.
 
 ## Development
 
@@ -342,8 +341,8 @@ The shipped `gates` skill is explicit-only through `disable-model-invocation: tr
 
 | Profile | Tools |
 | --- | --- |
-| `coding` (default) | `read`, `bash`, `grep`, `find`, `ls`, LSP, CodeGraph, read-only Code Intelligence queries, context tools, and configured web research tools. Editing uses `apply_patch` on supported models, otherwise `edit` and `write`. On Windows, `powershell` is included when Pi registered it. |
-| `analysis` | `read`, `bash`, `grep`, `find`, `ls`, LSP, CodeGraph, read-only Code Intelligence queries, and configured web research tools. No `edit`, `write`, `apply_patch`, or `lsp_rename`. |
+| `coding` (default) | `read`, `bash`, `grep`, `find`, `ls`, LSP, CodeGraph, context tools, and configured web research tools. Editing uses `apply_patch` on supported models, otherwise `edit` and `write`. On Windows, `powershell` is included when Pi registered it. |
+| `analysis` | `read`, `bash`, `grep`, `find`, `ls`, LSP, CodeGraph, and configured web research tools. No `edit`, `write`, `apply_patch`, or `lsp_rename`. |
 
 Official `pi-codex-tools` registers `apply_patch` and owns its grammar capability. Pitako uses its public `supportsOpenAIGrammarTools` helper for every coding role, including the foreground session. Models using `openai-responses` or `openai-codex-responses` with `compat.supportsOpenAIGrammarTools === true` get `apply_patch` instead of `edit` and `write`. Other models get `edit` and `write`, not `apply_patch`. Pitako reapplies this policy after startup, model changes, and profile changes, including same-model child activation.
 
@@ -382,7 +381,6 @@ With ACP active, native manual `/compact` reports `Compaction cancelled`, and au
 | LSP | [`pi-lsp-client`](https://github.com/code-yeongyu/pi-lsp-client) at `1c981dfcacc456fe4ce9f4120a2f0250b54d6844` | Pi-native tools for diagnostics, go to definition, references, symbols, prepare-rename, and rename. Not published on npm, so it is pinned as a git dependency. MIT. |
 | CodeGraph | [`@vndv/pi-codegraph`](https://github.com/vndv/pi-codegraph) `0.1.10` | Pi-native tools over the `codegraph` CLI: search, callers, callees, impact, explore, node, files, status. MIT. |
 | CodeGraph CLI | `@colbymchenry/codegraph` `1.6.0` | The index and `codegraph serve` process the raw extension talks to. MIT. |
-| Code Intelligence | `extensions/code-intelligence/` | Six bounded queries using AST, LSP, Git, and the direct CodeGraph SDK. Graph-backed queries require Node. |
 | Codex patch tools | [`pi-codex-tools`](https://github.com/jvm/pi-mono/tree/main/packages/pi-codex-tools) `0.3.0` | Official entry registers `apply_patch` and invokes upstream install telemetry. Disable telemetry with `PI_OFFLINE=1` or Pi's `enableInstallTelemetry:false` setting. Apache-2.0. |
 | Context compression | [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi) `0.1.83` | Public factory with delegation and updater off by default. MIT, with additional attribution terms for its inline acp-kernel. |
 | Memory and conversation search | [`pi-hermes-memory`](https://github.com/chandra447/pi-hermes-memory) `0.9.9` | Persistent lessons, corrections, and session search. Independent of the Board. MIT. |
@@ -410,7 +408,7 @@ Use lsp_goto_definition on the greet call in src/main.ts.
 codegraph init
 ```
 
-Then ask Pi to use the raw `codegraph_search` and `codegraph_callers` tools. Under Node, a graph-backed dense query can build the index instead; `project_report` only observes it. Under Bun, graph-backed dense queries report unavailable. These are operator usage instructions, not Pitako acceptance checks.
+Then ask Pi to use `codegraph_search` and `codegraph_callers`. Pitako loads the CodeGraph extension directly, including its navigation prompt hook. These are operator usage instructions, not Pitako acceptance checks.
 
 ## Disable or override an extension
 
@@ -422,14 +420,14 @@ Pi can filter a package without editing Pitako. In `settings.json`:
     {
       "source": "/absolute/or/relative/path/to/pitako",
       "extensions": [
-        "!extensions/code-intelligence/codegraph-raw.ts"
+        "!node_modules/@vndv/pi-codegraph/extensions/codegraph.ts"
       ]
     }
   ]
 }
 ```
 
-`pi config` toggles individual resources from installed packages, including skills. Paths are relative to the package root. Filtering the raw CodeGraph extension out of the loader does not remove the dependency or the dense queries; it only stops Pi from registering the raw `codegraph_*` tools. To disable web research, add `!node_modules/pi-web-access/dist/index.js` to the `extensions` list.
+`pi config` toggles individual resources from installed packages, including skills. Paths are relative to the package root. Filtering CodeGraph out of the loader stops Pi from registering its `codegraph_*` tools and prompt hook; it does not remove the dependency. If your private settings excluded `extensions/code-intelligence/codegraph-raw.ts`, replace that filter with the direct path above. Pitako does not migrate private settings. To disable web research, add `!node_modules/pi-web-access/dist/index.js` to the `extensions` list.
 
 To drop Ponytail, Caveman, or one principle without editing Pitako:
 
@@ -471,7 +469,7 @@ Do not commit API keys, `auth.json`, or `~/.pi/agent/settings.json`.
 ```
 pitako/
 ├── package.json          # pi manifest and pinned dependencies
-├── extensions/           # profiles, Board, roles, Team, and Code Intelligence
+├── extensions/           # profiles, Board, roles, and Team
 ├── roles/                # role instruction markdown
 ├── skills/pitako-coding/ # router + baseline
 ├── skills/plan/          # $plan, stops at PLAN_FROZEN

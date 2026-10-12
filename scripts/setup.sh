@@ -55,3 +55,28 @@ for (const [name, Database] of [
   console.log(`${name}: closed`);
 }
 NODE
+
+# Optional navigation preparation, only after all dependency prerequisites pass.
+# Match CodeGraph's single-segment CODEGRAPH_DIR override without loading its SDK.
+if graph_dir="$(node -p '
+  const raw = process.env.CODEGRAPH_DIR?.trim();
+  !raw || raw === "." || raw.includes("..") || raw.includes("/") ||
+    raw.includes("\\") || require("node:path").isAbsolute(raw) ? ".codegraph" : raw
+')"; then
+  if [[ ! -d "$graph_dir" || ! -e "$graph_dir/codegraph.db" ]]; then
+    codegraph="$(command -v codegraph || true)"
+    if [[ -z "$codegraph" && -x "$PWD/node_modules/.bin/codegraph" ]]; then
+      codegraph="$PWD/node_modules/.bin/codegraph"
+    fi
+    if [[ -z "$codegraph" ]]; then
+      echo "Warning: CodeGraph CLI unavailable; continue with LSP/read/grep." >&2
+    # init does not start a watcher; these child-only flags suppress its Git-hook
+    # offer, platform download fallback, and telemetry/update network calls.
+    elif ! CODEGRAPH_NO_WATCH=0 CODEGRAPH_FORCE_WATCH=1 CODEGRAPH_NO_DOWNLOAD=1 DO_NOT_TRACK=1 \
+      "$codegraph" init "$PWD" --yes; then
+      echo "Warning: CodeGraph initialization failed; continue with LSP/read/grep." >&2
+    fi
+  fi
+else
+  echo "Warning: CodeGraph index check failed; continue with LSP/read/grep." >&2
+fi

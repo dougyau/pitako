@@ -23,8 +23,6 @@ import pitako from "../extensions/index.ts";
 import { resolveRole } from "../extensions/roles/load.ts";
 import type { ModelTarget } from "../extensions/roles/types.ts";
 import { packageRoot } from "../extensions/stack.ts";
-import { completeTool, emptyCodeIntelligenceUsage } from "../extensions/code-intelligence/metrics.ts";
-import type { DenseCallUsage } from "../extensions/code-intelligence/metrics.ts";
 
 const fixture = agentFixtureOwnership();
 const tempDirs = fixture.directories;
@@ -147,19 +145,9 @@ describe("agent instance", () => {
     const { mkdirSync, writeFileSync } = await import("node:fs");
     mkdirSync(path.dirname(configured.userConfigPath), { recursive: true });
     writeFileSync(configured.userConfigPath, `[model_policies.architect.primary]\nmodel = "example/primary"\nreasoning = "high"\n[[model_policies.architect.fallbacks]]\nmodel = "example/fallback-1"\nreasoning = "xhigh"\n`);
-    const failedMetrics = emptyCodeIntelligenceUsage();
-    const failedNavigation = { remaining: 0 };
-    const failedCall: DenseCallUsage = { tool: "project_report", durationMs: 10, outputBytes: 100, truncated: true, outcome: "partial", sources: { ast: { calls: 2, durationMs: 5 } }, graph: { states: { complete: 1 }, buildDurations: { "41": 8 }, failures: 1 } };
-    completeTool(failedMetrics, "project_report", failedCall, failedNavigation);
-    completeTool(failedMetrics, "read", undefined, failedNavigation);
-    const completedMetrics = emptyCodeIntelligenceUsage();
-    const completedNavigation = { remaining: 0 };
-    const completedCall: DenseCallUsage = { tool: "read_symbol", durationMs: 20, outputBytes: 200, truncated: false, outcome: "ok", sources: { ast: { calls: 1, durationMs: 7 } }, graph: { states: { complete: 1 }, buildDurations: { "42": 12 }, failures: 0 } };
-    completeTool(completedMetrics, "read_symbol", completedCall, completedNavigation);
-    completeTool(completedMetrics, "grep", undefined, completedNavigation);
     const executor = scripted([
-      { status: "failed", result: "", error: "429 rate limit", sideEffects: false, usage: { input: 10, output: 1, cacheRead: 4, cacheWrite: 2, cost: 0.2, turns: 1, toolCalls: 1, codeIntelligence: failedMetrics } },
-      { status: "completed", result: "ok", sideEffects: false, usage: { input: 20, output: 3, cacheRead: 5, cacheWrite: 1, cost: 0.3, turns: 2, toolCalls: 2, codeIntelligence: completedMetrics } },
+      { status: "failed", result: "", error: "429 rate limit", sideEffects: false, usage: { input: 10, output: 1, cacheRead: 4, cacheWrite: 2, cost: 0.2, turns: 1, toolCalls: 1, tools: { read: 1 }, contextTokens: 128 } },
+      { status: "completed", result: "ok", sideEffects: false, usage: { input: 20, output: 3, cacheRead: 5, cacheWrite: 1, cost: 0.3, turns: 2, toolCalls: 2, tools: { read: 1, codegraph_search: 1 }, contextTokens: 256 } },
     ]);
     const summed = await runAgentInstance({
       roleId: "architect",
@@ -169,10 +157,8 @@ describe("agent instance", () => {
       load: configured,
     });
     expect(summed.usage).toMatchObject({ input: 30, output: 4, cacheRead: 9, cacheWrite: 3, cost: 0.5, turns: 3, toolCalls: 3 });
-    expect(summed.usage?.codeIntelligence?.dense).toMatchObject({ project_report: { calls: 1, outputBytes: 100 }, read_symbol: { calls: 1, outputBytes: 200 } });
-    expect(summed.usage?.codeIntelligence?.sources.ast).toEqual({ calls: 3, durationMs: 12 });
-    expect(summed.usage?.codeIntelligence?.graph.buildDurations).toEqual({ "41": 8, "42": 12 });
-    expect(summed.usage?.codeIntelligence?.raw).toEqual({ read: 1, grep: 1 });
+    expect(summed.usage?.tools).toEqual({ read: 2, codegraph_search: 1 });
+    expect(summed.usage?.contextTokens).toBe(256);
     expect(formatAgentResult(summed)).toContain("cached read: 9");
     expect(formatAgentResult(summed)).toContain("cost: 0.5");
     expect(teamExecutionSummary("fallback-assignment", summed)).toMatchObject({
@@ -282,7 +268,7 @@ describe("agent instance", () => {
     expect(continued).toBe(1);
     expect(result.usage).toMatchObject({
       input: 13, output: 3, cacheRead: 6, cacheWrite: 2, total: 24,
-      turns: 3, toolCalls: 3, tools: { read: 1, grep: 3, bash: 1 }, contextTokens: 256, codeIntelligence: undefined,
+      turns: 3, toolCalls: 3, tools: { read: 1, grep: 3, bash: 1 }, contextTokens: 256,
     });
     expect(result.usage?.cost).toBeCloseTo(0.15);
     const summary = teamExecutionSummary("continue-assignment", result);
@@ -573,8 +559,8 @@ reasoning = "medium"
     expect(toolEffect("database_migrate")).toBe("potentially_mutating");
     expect(marksSideEffect("codegraph_search")).toBe(false);
     for (const name of ["project_report", "read_symbol", "read_enclosing", "module_report", "inspect_symbol", "review_surface"]) {
-      expect(toolEffect(name)).toBe("read_only");
-      expect(marksSideEffect(name)).toBe(false);
+      expect(toolEffect(name)).toBe("potentially_mutating");
+      expect(marksSideEffect(name)).toBe(true);
     }
     expect(marksSideEffect("deploy")).toBe(true);
     expect(thinkingLevelFor(undefined)).toBeUndefined();

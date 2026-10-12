@@ -21,7 +21,7 @@ Switch with `/pitako profile analysis` or start Pi with `--pitako-profile analys
 ## Defaults
 
 1. Inspect the actual repository before editing.
-2. Keep raw read, grep, LSP, and CodeGraph available as the navigation baseline. Use dense queries for bounded code questions and fall back to raw tools when coverage is partial or unavailable.
+2. Keep read, grep, LSP, and CodeGraph available. Choose a supported LSP or CodeGraph tool for bounded structural questions; use read, grep, or bash for literal, exhaustive, or exact results. Follow up with those tools when a backend is partial or unavailable.
 3. Reuse what already exists. Question whether new code is needed.
 4. Keep the diff proportionate to the task. No speculative abstractions.
 5. Verify real behavior (diff, tests, command output) before claiming done. Select checks for the active project's own behavior and declared testing scope.
@@ -30,9 +30,9 @@ Switch with `/pitako profile analysis` or start Pi with `--pitako-profile analys
 
 ## Tools
 
-Keep raw read/grep, LSP, and CodeGraph visible, with `bash` and the model-compatible editing tools in the coding profile. The six dense queries (`project_report`, `read_symbol`, `read_enclosing`, `module_report`, `inspect_symbol`, `review_surface`) help with bounded project, symbol, module, and diff questions. Matched Reviewer trials did not establish equivalent coverage, so they supplement raw navigation. Use raw tools for literal searches, unsupported backends, follow-up, and comparison.
+Keep read/grep, LSP, and CodeGraph visible, with `bash` and the model-compatible editing tools in the coding profile. Choose supported LSP or CodeGraph tools for bounded structural questions. Use read, grep, or bash for literal searches, exhaustive or exact results, unsupported backends, and follow-up.
 
-Graph-backed dense queries create or refresh a `.codegraph` index as needed under Node. `project_report` only observes it; AST-only queries need no index. Raw `codegraph_*` tools use the CodeGraph CLI and need an existing index; use `codegraph init` for raw-only use. Under Bun, graph-backed dense queries report unavailable.
+The `codegraph_*` runtime tools use the CodeGraph CLI and need an existing index; they do not initialize or refresh it. This checkout's `scripts/setup.sh` attempts missing-index initialization best-effort after dependencies are ready. Other projects own their optional preparation; use it or run `codegraph init` explicitly when you want CodeGraph navigation. If initialization is unavailable or fails, continue with LSP/read/grep.
 
 - `lsp_diagnostics` for server diagnostics
 - `lsp_goto_definition` and `lsp_find_references` for navigation

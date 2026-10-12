@@ -18,6 +18,7 @@ import {
   readPlan,
   requireFrozen,
   workflowWorkspace,
+  readLedgerTeamHolds,
   updateLedgerTeamHold,
 } from "../extensions/workflow.ts";
 
@@ -41,6 +42,46 @@ function gitRepo(): string {
 
 function planText(status = "frozen", body = "body"): string {
   return `---\nid: herdr-integration\nrevision: 2\nstatus: ${status}\n---\n\n# Herdr integration\n\n${body}\n`;
+}
+
+async function runHoldWorkers(cwd: string, source: (worker: number) => string, children: ReturnType<typeof spawn>[] = []): Promise<void> {
+  const workers: { child: ReturnType<typeof spawn>; ready: Promise<void>; closed: Promise<void> }[] = [];
+  try {
+    for (let worker = 0; worker < 4; worker++) {
+      // Release all four live processes together, leaving stdin open for controlled cancellation.
+      const script = `console.log("ready"); await new Promise(resolve => process.stdin.once("data", resolve)); ${source(worker)}; process.exit(0);`;
+      const child = spawn(process.execPath, ["-e", script], {
+        cwd, env: { ...process.env }, stdio: ["pipe", "pipe", "pipe"],
+      });
+      children.push(child);
+      let error: Error | undefined;
+      let stderr = "";
+      child.on("error", value => { error = value; });
+      child.stderr!.on("data", chunk => { stderr += chunk; });
+      const ready = new Promise<void>((resolve, reject) => {
+        child.stdout!.once("data", () => resolve());
+        child.once("close", () => reject(error ?? new Error("hold worker closed before release")));
+      });
+      const closed = new Promise<void>((resolve, reject) => {
+        child.once("close", (code, signal) => {
+          if (error || code !== 0 || signal) reject(error ?? new Error(`hold worker exited ${code}/${signal}: ${stderr}`));
+          else resolve();
+        });
+      });
+      // Observe rejections immediately; finally still awaits actual close of every child.
+      void ready.catch(() => {});
+      void closed.catch(() => {});
+      workers.push({ child, ready, closed });
+    }
+    await Promise.all(workers.map(worker => worker.ready));
+    for (const { child } of workers) child.stdin!.write("go\n");
+    await Promise.all(workers.map(worker => worker.closed));
+  } finally {
+    for (const { child } of workers) {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    }
+    await Promise.allSettled(workers.map(worker => worker.closed));
+  }
 }
 
 describe("workflow paths", () => {
@@ -134,16 +175,45 @@ describe("ledger Team hold locking", () => {
     const meta = readPlan("hold-plan", cwd).meta;
     initLedger(ledgerFile("hold-plan", cwd), meta);
     const moduleUrl = new URL("../extensions/workflow.ts", import.meta.url).href;
-    const source = `import { updateLedgerTeamHold } from ${JSON.stringify(moduleUrl)}; for (let i = 0; i < 100; i++) updateLedgerTeamHold(${JSON.stringify(cwd)}, "hold-plan", { assignmentId: process.pid + "-" + i, unitId: "unit", status: "pending" });`;
-    const workers = Array.from({ length: 4 }, () => new Promise<void>((resolve, reject) => {
-      const child = spawn(process.execPath, ["-e", source], { stdio: "ignore" });
-      child.once("error", reject);
-      child.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`hold worker exited ${code}`)));
-    }));
-    await Promise.all(workers);
-    const ledger = readFileSync(ledgerFile("hold-plan", cwd), "utf8");
-    expect(ledger).toContain('"assignmentId"');
-    expect(ledger.match(/"status":"pending"/g)).toHaveLength(400);
+    const children: ReturnType<typeof spawn>[] = [];
+    // Ten distinct entries per worker retain repeated contention without a 400-write stress workload.
+    await runHoldWorkers(cwd, worker => `
+      import { updateLedgerTeamHold } from ${JSON.stringify(moduleUrl)};
+      for (const status of ["pending", "failed"]) {
+        for (let i = 0; i < 10; i++) {
+          if (!updateLedgerTeamHold(${JSON.stringify(cwd)}, "hold-plan", {
+            assignmentId: ${JSON.stringify(`worker-${worker}-`)} + i, unitId: "unit", status,
+          })) throw new Error("hold was not updated");
+        }
+      }
+    `, children);
+    expect(children).toHaveLength(4);
+    for (const child of children) expect(child.exitCode).toBe(0);
+    const expected = Array.from({ length: 4 }, (_, worker) =>
+      Array.from({ length: 10 }, (_, i) => ({ assignmentId: `worker-${worker}-${i}`, unitId: "unit", status: "failed" as const })),
+    ).flat().sort((a, b) => a.assignmentId.localeCompare(b.assignmentId));
+    expect(readLedgerTeamHolds(cwd, "hold-plan").sort((a, b) => a.assignmentId.localeCompare(b.assignmentId))).toEqual(expected);
+    expect(existsSync(`${ledgerFile("hold-plan", cwd)}.lock`)).toBe(false);
+  });
+
+  test("settles every hold worker before releasing a failed fixture", async () => {
+    const cwd = tempDir("pitako-hold-worker-failure-");
+    const children: ReturnType<typeof spawn>[] = [];
+    await expect(runHoldWorkers(cwd, worker => worker === 0
+      ? `throw new Error("controlled worker failure")`
+      : `await new Promise(resolve => process.stdin.once("end", resolve)); throw new Error("unexpected release")`,
+      children,
+    )).rejects.toThrow(/controlled worker failure/);
+    expect(children).toHaveLength(4);
+    for (const child of children) {
+      try {
+        process.kill(child.pid!, 0);
+        throw new Error("hold worker survived settlement");
+      } catch (error) {
+        expect(error).toMatchObject({ code: "ESRCH" });
+      }
+    }
+    expect(existsSync(cwd)).toBe(true);
   });
 
   test("fails closed on a planted lock without deleting it", () => {
@@ -300,6 +370,13 @@ describe("plan and execute contracts", () => {
     expect(setup).toContain('(cd "$executionRoot" && bash ./scripts/setup.sh </dev/null)');
     expect(setup).toContain("not an environment variable");
     expect(setup).toContain("before delegating dependent work");
+    for (const contract of [
+      "Project-owned setup", "missing CodeGraph index best-effort",
+      "after dependency prerequisites pass", "Do not require CodeGraph, install it universally",
+      "refresh an existing index", "optional CodeGraph warning in preparation evidence and the WorkBrief",
+      "dependencies are ready and setup completed successfully",
+      "does not relax failed or interrupted setup, evidence, or ownership rules",
+    ]) expect(setup).toContain(contract);
   });
 
   test("planning decomposes for correctness and preserves proportional acceptance", () => {

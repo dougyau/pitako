@@ -2,7 +2,7 @@ import { stubExternalFactories } from "./fixtures/offline.ts";
 stubExternalFactories();
 import { spawnSync } from "node:child_process";
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -28,7 +28,7 @@ function profileHarness(profileFlag?: string) {
   let profileCommand: ((args: string, ctx: unknown) => Promise<void>) | undefined;
   const available = [
     "read", "bash", "edit", "write", "apply_patch", "grep", "find", "ls",
-    "lsp_diagnostics", "lsp_rename", "codegraph_search", "project_report", "read_symbol",
+    "lsp_diagnostics", "lsp_rename", "codegraph_search", "lsp_symbols",
     "web_search", "fetch_content", "source_check", "get_search_content", "web_enable",
   ];
   const context = {
@@ -85,7 +85,7 @@ describe("Pitako resources and policy", () => {
     expect(manifest.pi.extensions[0]).toBe("./extensions/index.ts");
     expect(manifest.pi.extensions).toEqual(expect.arrayContaining([
       "./extensions/board/index.ts", "./extensions/agent/index.ts", "./extensions/acp.ts",
-      "./extensions/code-intelligence/index.ts",
+      "./node_modules/@vndv/pi-codegraph/extensions/codegraph.ts", "./node_modules/pi-lsp-client/src/index.ts",
     ]));
     expect(manifest.pi.skills).toContain("./skills/practical");
     for (const directory of ["pitako-coding", "plan", "execute", "pre-pr", "remove-ai-slops"]) {
@@ -100,7 +100,7 @@ describe("Pitako resources and policy", () => {
     expect(manifest.pi.prompts).toContain("./prompts");
   });
 
-  test("profile guidance reaches the provider prompt without changing raw and dense tool access", async () => {
+  test("profile guidance reaches the provider prompt without changing direct tool access", async () => {
     const foreground = profileHarness();
     await foreground.start();
     const prompt = await foreground.composePrompt("base system prompt");
@@ -109,7 +109,7 @@ describe("Pitako resources and policy", () => {
     expect(prompt).toContain("literal, exhaustive or exact results");
     expect(prompt).toContain("partial or unavailable");
     expect(prompt).toContain("Select checks for the active project's own behavior and declared testing scope.");
-    for (const name of ["read", "grep", "bash", "lsp_diagnostics", "codegraph_search", "project_report", "read_symbol", "edit", "write", "web_search", "fetch_content", "source_check", "get_search_content", "web_enable"]) {
+    for (const name of ["read", "grep", "bash", "lsp_diagnostics", "codegraph_search", "lsp_symbols", "edit", "write", "web_search", "fetch_content", "source_check", "get_search_content", "web_enable"]) {
       expect(foreground.active).toContain(name);
     }
     expect(foreground.active).not.toContain("apply_patch");
@@ -121,7 +121,7 @@ describe("Pitako resources and policy", () => {
     expect(analysisPrompt).toContain("bounded structural code questions");
     expect(analysisPrompt).toContain("edit, write, apply_patch, and lsp_rename are not");
     expect(analysisPrompt).toContain("Select checks for the active project's own behavior and declared testing scope.");
-    for (const name of ["read", "grep", "bash", "lsp_diagnostics", "codegraph_search", "project_report", "read_symbol", "web_search", "fetch_content", "source_check", "get_search_content", "web_enable"]) {
+    for (const name of ["read", "grep", "bash", "lsp_diagnostics", "codegraph_search", "lsp_symbols", "web_search", "fetch_content", "source_check", "get_search_content", "web_enable"]) {
       expect(analysis.active).toContain(name);
     }
     expect(analysis.active).not.toContain("edit");
@@ -314,10 +314,11 @@ describe("repository hygiene", () => {
     expect(sourceHygieneOffenders(packageRoot())).toEqual([]);
   });
 
-  test("Git source inventory includes ignored tracked and visible untracked current bytes", () => {
-    const root = mkdtempSync(path.join(tmpdir(), "pitako-source-inventory-"));
+  test.each([tmpdir(), homedir()])("Git source inventory includes ignored tracked and visible untracked current bytes at %s", (parent) => {
+    const root = mkdtempSync(path.join(parent, "pitako-source-inventory-"));
     const git = (...args: string[]) => {
       const result = spawnSync("git", ["-C", root, ...args], {
+        cwd: root,
         encoding: "utf8",
         env: { PATH: process.env.PATH, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" },
       });
@@ -357,8 +358,11 @@ describe("repository hygiene", () => {
       expect(sourceHygieneOffenders(root).sort()).toEqual(expected);
 
       // Exercise inherited redirection in a child, never mutate the parallel runner's environment.
-      put("ignored-global", `${visible}\ncredential.ts\n`);
-      put("ambient-config", `[core]\nexcludesFile = ${path.join(root, "ignored-global")}\n`);
+      // Ambient configuration is fixture metadata, not source inventory.
+      const ignoredGlobal = path.join(root, ".git", "ignored-global");
+      const ambientConfig = path.join(root, ".git", "ambient-config");
+      put(".git/ignored-global", `${visible}\ncredential.ts\n`);
+      put(".git/ambient-config", `[core]\nexcludesFile = ${ignoredGlobal}\n`);
       const redirected = spawnSync(process.execPath, ["--eval", `
         import { spawnSync } from "node:child_process";
         import { lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
@@ -369,8 +373,8 @@ describe("repository hygiene", () => {
         encoding: "utf8",
         cwd: root,
         env: { ...process.env, HYGIENE_ROOT: root, GIT_DIR: "/nonexistent", GIT_WORK_TREE: "/nonexistent", GIT_INDEX_FILE: "/nonexistent",
-          GIT_CONFIG_GLOBAL: path.join(root, "ambient-config"), GIT_CONFIG_SYSTEM: path.join(root, "ambient-config"),
-          GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "core.excludesFile", GIT_CONFIG_VALUE_0: path.join(root, "ignored-global") },
+          GIT_CONFIG_GLOBAL: ambientConfig, GIT_CONFIG_SYSTEM: ambientConfig,
+          GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "core.excludesFile", GIT_CONFIG_VALUE_0: ignoredGlobal },
       });
       expect(redirected.error).toBeUndefined();
       expect(redirected.signal).toBeNull();

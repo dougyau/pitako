@@ -41,6 +41,8 @@ Here `executionRoot` is the captured binding field, not an environment variable 
 
 Missing setup is supported: continue existing prerequisite discovery without creating a script or claiming preparation success. A failed or interrupted invocation leaves dependent work blocked; useful read-only diagnosis may continue. Inspect the actual result and record command, cwd, relevant input identity, runtime paths/versions, outcome, and limits through `evidenceFile` before delegating dependent work.
 
+Project-owned setup may initialize a missing CodeGraph index best-effort after dependency prerequisites pass. Do not require CodeGraph, install it universally, refresh an existing index, or add runtime hooks. Record any optional CodeGraph warning in preparation evidence and the WorkBrief; continue with LSP/read/grep when dependencies are ready and setup completed successfully. This does not relax failed or interrupted setup, evidence, or ownership rules.
+
 Reuse successful evidence while the root, script, dependency declarations/lockfile, runtime, and installed dependencies remain compatible. Missing dependencies or relevant changes invalidate it. Diagnose and retry invalidated or failed preparation without an arbitrary retry budget. Do not add runtime hooks, a persistent setup cache, or readiness markers.
 
 Do not run setup during `$plan`, plan discovery, `/reload`, worker startup, or merely because of a wake. On resume, reconcile workers and holds first. A completion wake may prepare the quiescent workspace before dependent work when compatible evidence is absent. Include relevant setup outcomes and evidence references in the WorkBrief so workers do not repeat preparation by default. Setup success does not prove all gate-specific prerequisites.

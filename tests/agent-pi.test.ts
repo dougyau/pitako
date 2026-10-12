@@ -232,14 +232,14 @@ test("overlapping fast and normal attempts keep payload tiers independent",
     } finally { release(); await Promise.allSettled(pending); }
   }));
 
-test("concurrent child tool events retain independent dense outcomes, raw counts and side effects",
-  fixture.ownedCase("telemetry", async () => {
+test("concurrent child tool events retain independent counts, cancellation and side effects",
+  fixture.ownedCase("tool events", async () => {
     const stop = new AbortController();
     const f = setup({ prompt(session, text) {
       session.stats.tokens.total = 1; session.stats.assistantMessages = 1;
-      session.emit({ type: "tool_execution_start", toolName: "project_report", toolCallId: "dense" });
+      session.emit({ type: "tool_execution_start", toolName: "codegraph_search", toolCallId: "graph" });
       if (text === "cancel") stop.abort();
-      session.emit({ type: "tool_execution_end", toolName: "project_report", toolCallId: "dense",
+      session.emit({ type: "tool_execution_end", toolName: "codegraph_search", toolCallId: "graph",
         result: { content: [{ type: "text", text: "report" }], details: { status: text === "failed" ? "unavailable" : "ok" } } });
       for (let index = 0; index < 5; index++) session.emit({ type: "tool_execution_end", toolName: "read", toolCallId: String(index), result: {} });
       if (text === "failed") session.emit({ type: "tool_execution_start", toolName: "write", toolCallId: "write" });
@@ -248,10 +248,10 @@ test("concurrent child tool events retain independent dense outcomes, raw counts
       instanceId: task, signal: task === "cancel" ? stop.signal : f.input.signal }))));
     expect(results[0]!.sideEffects).toBe(true);
     expect(results[1]!.status).toBe("cancelled");
-    for (const [index, result] of results.entries()) {
-      expect(result.usage?.codeIntelligence?.dense.project_report).toMatchObject({ calls: 1, outcomes: { [index ? "cancelled" : "unavailable"]: 1 } });
-      expect(result.usage?.codeIntelligence?.raw.read).toBe(5);
-      expect(result.usage?.tools?.project_report).toBe(1);
+    expect(results[1]!.sideEffects).toBe(false);
+    for (const result of results) {
+      expect(result.usage?.tools).toEqual({ codegraph_search: 1, read: 5 });
+      expect(result.usage).not.toHaveProperty("codeIntelligence");
     }
   }));
 
