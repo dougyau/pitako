@@ -40,7 +40,7 @@ Upstream accepts absolute paths, symlinks, moves, and fuzzy matching. Pitako's o
 
 ### billion-context-pi 0.1.83
 
-`extensions/acp.ts` uses the public `createAcpExtension({ delegate: false, autoUpdate: false })` factory. ACP is the only compressor; `pi-codex-compaction` is not loaded. Explicit global and project `acp.json` settings retain upstream precedence and can enable delegation, enable the updater, or disable ACP. Pitako preserves user files. See [Context compression](../README.md#context-compression) for tools, storage, and native compaction behavior.
+`extensions/acp.ts` uses the public `createAcpExtension({ delegate: false, autoUpdate: false, toolBashDefaultTimeout: 0 })` factory. ACP does not add a default timeout to bash calls; explicit call timeouts still apply. ACP is the only compressor; `pi-codex-compaction` is not loaded. Explicit global and project `acp.json` settings retain upstream precedence and can enable delegation, enable the updater, or disable ACP. Pitako preserves user files. See [Context compression](../README.md#context-compression) for tools, storage, and native compaction behavior.
 
 The package bundles acp-kernel 0.0.98 inline. Its license adds a visible-attribution requirement to MIT. Both license texts and the attribution are included in [THIRD_PARTY.md](../THIRD_PARTY.md).
 

@@ -39,7 +39,7 @@ Disable Ponytail, Caveman, or any individual skill with `pi config` or package s
 - Foreground `agent_observe` and `agent_input` for bounded observation, context queries, and in-scope steering of exact active background or Team targets. Input waits for a later native boundary and never interrupts a command. A receipt is not an answer. See [worker history and input](docs/worker-history.md).
 - An opt-in local agent bridge for foreground native RPC hosts. Its passive Node client provides non-consuming reads, change hints, and explicitly granted worker controls. See [Agent bridge host reference](docs/agent-bridge.md) for launch flags, permissions, receipts, and reconnect limits.
 - `agent_supervise` for one synchronous visible sibling pane. It does not run in the background or join the Team roster.
-- `team_assign`, `team_status`, `team_result`, and `team_cancel` for independent foreground Team assignments, with one active assignment per role.
+- `team_assign`, `team_status`, `team_result`, and `team_cancel` for background Team assignments from the foreground session, with one active assignment per role. `$plan` and `$execute` use them for Architect/Reviewer dependencies too.
 - `$plan` and `$execute`. Planning stops at `PLAN_FROZEN`. Execution is a separate invocation. Neither calls Herdr.
 
 ## Verify behavior
@@ -266,7 +266,7 @@ Artifacts live in the workspace (git root, or the current directory outside a re
 
 Six records stay separate. `todo` is the current session checklist. The Board holds shared findings, decisions, and handoffs. The plan is the frozen decision. The ledger is the resume checkpoint: plan id, revision, content hash, status, and rulings. Evidence is proof for one unit. The repository is the product change. Do not use one as a substitute for another.
 
-`$plan` and `$execute` are not Herdr callers. Team assignments remain independent work.
+`$plan` and `$execute` are not Herdr callers. Their Architect/Reviewer consultations and reviews run in background, preferably through Team; `agent_spawn` is used only when Team is not registered. This workflow policy supersedes generic independent-work and `agent_run` guidance for those dependencies. The coordinator can handle user input while the judgment is pending, but must interpret the complete automatic result before freezing, accepting dependent work, or completing execution. Without background tools, a required consultation or review is blocked, not run synchronously, performed inline, or waived. Ad hoc `agent_run` remains synchronous.
 
 The managed `/mission` runtime is retired. Use `$execute` for frozen ordinary plans.
 Recorded managed-worker catalogs remain protected, read-only archives through
@@ -368,7 +368,7 @@ An unnamed session takes its display name from the first user line, capped at 60
 
 Pitako bundles `billion-context-pi@0.1.83` as its only compressor. It uses [acp-kernel](https://github.com/ranxianglei/acp-kernel) inline. Pitako does not load `pi-codex-compaction` or add another scheduler.
 
-The public factory starts with `{ delegate: false, autoUpdate: false }`. With clean configuration, `compress`, `search_context`, `decompress`, `acp_status`, and `acp_cache` are available after session start, but ACP delegates and updater are off. `/acp` displays block status. Use `compress` to create blocks and `search_context` and `decompress` to recover their contents.
+The public factory starts with `{ delegate: false, autoUpdate: false, toolBashDefaultTimeout: 0 }`. ACP does not add a default timeout to bash calls; explicit call timeouts still apply. With clean configuration, `compress`, `search_context`, `decompress`, `acp_status`, and `acp_cache` are available after session start, but ACP delegates and updater are off. `/acp` displays block status. Use `compress` to create blocks and `search_context` and `decompress` to recover their contents.
 
 Explicit `~/.pi/acp.json` and project `.pi/acp.json` settings override those defaults, with project settings taking precedence. They can enable delegates or the updater, or disable ACP with `enabled:false`. Pitako does not rewrite these files. The factory reads the master switch from `process.cwd()`, not an arbitrary child's cwd. Runtime options use upstream `ctx.cwd`.
 
