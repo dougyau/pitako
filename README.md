@@ -318,6 +318,20 @@ bun run pi
 
 Open a project with source files and a language server for LSP. The `codegraph_*` runtime tools need an existing index and do not initialize or refresh it. This checkout's setup attempts missing-index initialization best-effort; for other projects, use their preparation procedure or run `codegraph init` explicitly when you want CodeGraph navigation.
 
+### Prepare new worktrees in T3 Code
+
+Import the **Setup worktree** script from [t3.json](t3.json) into the project's effective T3 Code settings. Check that `runOnWorktreeCreate` is enabled and `async` is `false`. The file is a shared declaration, not an active hook by itself. `async: false` waits for the command to finish. Whether T3 prevents an agent from starting after a failed hook is unverified.
+
+The hook runs `bash scripts/setup-worktree.sh` in the new worktree. The script first runs `scripts/setup.sh --skip-codegraph`, retaining dependency installation and runtime checks. After setup succeeds, it finds the principal checkout through Git and prepares CodeGraph:
+
+- If the target already has `codegraph.db`, it preserves the DB and runs `codegraph sync`. Retries and runs in the principal checkout follow this rule.
+- If only the principal has a DB, it copies a consistent SQLite snapshot and reusable index files, then runs `codegraph sync` in the target. It excludes process state and SQLite sidecars.
+- If neither checkout has a DB, it runs `codegraph init` in the target with `--yes`.
+
+Both checkouts use the same valid single-segment `CODEGRAPH_DIR` override, or `.codegraph` by default. The script resolves the CLI from `PATH` first, then the target's `node_modules/.bin/codegraph`. It does not install global tools.
+
+Unlike ordinary setup's optional CodeGraph preparation, this hook requires CodeGraph success. Setup, discovery, corruption, copy, initialization, and synchronization errors fail the command. A corrupt DB is not replaced with a new index. The hook does not run verification gates.
+
 ## Development
 
 Prepare the checkout with `bash ./scripts/setup.sh`. Use [GATES.md](GATES.md) for prerequisites, focused checks, and the complete routine procedure. Run `bun run typecheck`, then `bun run test` from the root. The test script uses `bun test --parallel` with normal discovery.

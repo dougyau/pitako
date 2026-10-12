@@ -42,9 +42,9 @@ esac
 `);
       chmodSync(path.join(bin, command), 0o755);
     }
-    function run(overrides: Record<string, string | undefined> = {}) {
+    function run(overrides: Record<string, string | undefined> = {}, args: string[] = []) {
       writeFileSync(log, "");
-      const result = spawnSync("/bin/bash", [path.join(checkout, "scripts/setup.sh")], {
+      const result = spawnSync("/bin/bash", [path.join(checkout, "scripts/setup.sh"), ...args], {
         cwd: root, env: {
           ...process.env, PATH: `${bin}:/usr/bin:/bin`, CALL_LOG: log, REAL_NODE: realNode,
           CODEGRAPH_DIR: "", CODEGRAPH_NO_WATCH: "1", CODEGRAPH_FORCE_WATCH: "0",
@@ -63,6 +63,15 @@ esac
     expect(success.calls.indexOf("codegraph|")).toBeGreaterThan(success.calls.lastIndexOf("node|"));
     expect(success.calls.split("\n").filter(Boolean).every(line => line.split("|")[1] === checkout)).toBe(true);
     expect(success.calls).not.toMatch(/test|smoke|typecheck|--ignore-scripts/);
+    const skipped = run({ INDEX_CHECK_EXIT: "17", CODEGRAPH_EXIT: "16" }, ["--skip-codegraph"]);
+    expect(skipped.status).toBe(0);
+    expect(skipped.stderr).not.toContain("Warning:");
+    expect(skipped.calls).toContain("install --frozen-lockfile");
+    expect(skipped.calls.match(/node\|.*\|--input-type=module/g)).toHaveLength(2);
+    expect(skipped.calls.match(/\|-p/g)).toHaveLength(1); // Keep package-manager lookup, omit graph-directory lookup.
+    expect(skipped.calls).not.toContain("codegraph|");
+    expect(run({ INSTALL_EXIT: "14" }, ["--skip-codegraph"]).status).toBe(14);
+    expect(run({ NATIVE_EXIT: "15" }, ["--skip-codegraph"]).status).toBe(15);
     for (const overrides of [{ GIT_EXIT: "12" }, { NODE_EXIT: "13" }, { BUN_VERSION: "1.0.0" }]) {
       const failed = run(overrides);
       expect(failed.status).not.toBe(0);
