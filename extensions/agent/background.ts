@@ -55,8 +55,6 @@ export interface ResultMessage {
     assignmentId?: string;
     ownerSessionId?: string;
     foregroundRevision?: number;
-    ownerToken: symbol;
-    teamToken?: symbol;
     status: AgentRunResult["status"];
     roleId: string;
     planId?: string;
@@ -566,7 +564,7 @@ function collectResult(row: Row): void {
   const details = Object.freeze({
     deliveryId: randomUUID(), instanceId: row.instanceId, assignmentId: row.teamAssignmentId,
     ownerSessionId: owner.sessionId ?? row.coordinatorSessionId, foregroundRevision: owner.revision,
-    ownerToken: owner.token, teamToken: row.teamOwnerToken, status: row.outcome.status,
+    status: row.outcome.status,
     roleId: row.roleId, planId: row.interest?.planId, unitId: row.interest?.unitId,
   });
   row.handoff = {
