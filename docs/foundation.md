@@ -1,6 +1,6 @@
 # Foundation notes
 
-This note records package choices and rejected alternatives. For the current AgentInstance, Team, Board, and Code Intelligence behavior, see [engineering.md](engineering.md).
+This note records package choices and rejected alternatives. For the current AgentInstance, Team, Board, and tool behavior, see [engineering.md](engineering.md).
 
 Pitako 0.1 composes Pi (`@earendil-works/pi-coding-agent` tested and supported public API floor 1.0.4). Packages declare resources under `package.json` `pi` (`extensions`, `skills`, `prompts`). Pi installs npm and git packages with `pi install` and runs `npm install` in that package. A local path is not copied and does not install dependencies, so a checkout needs `bun install` first.
 
@@ -22,7 +22,7 @@ MIT. Last commit reviewed: 2026-08-11. Entry `extensions/codegraph.ts`. Peer dep
 
 Native Pi tools: `codegraph_search`, `codegraph_callers`, `codegraph_callees`, `codegraph_impact`, `codegraph_explore`, `codegraph_node`, `codegraph_files`, `codegraph_status`. Each call spawns `codegraph serve --mcp` for the project path. That is the CLI's interface, not a Pi MCP adapter the user has to configure.
 
-`codegraph_explore` is the relevant-context tool. The CLI's separate `codegraph_context` tool is not wrapped. Pitako keeps the vendor's raw tool registrations but omits its prompt hook that prioritizes raw CodeGraph over read and grep. Dense Code Intelligence queries use the SDK directly, not this CLI adapter.
+`codegraph_explore` is the relevant-context tool. The CLI's separate `codegraph_context` tool is not wrapped. Pitako loads the vendor entry directly, including its prompt hook that prioritizes CodeGraph navigation. Pitako adds no wrapper or hook suppression.
 
 Requires Node >= 22.19, matching Pi. Tested here against CodeGraph CLI 1.6.0, which this package depends on. If `codegraph` is already on `PATH`, that binary wins. Otherwise Pitako prepends its own `node_modules/.bin` for the process.
 

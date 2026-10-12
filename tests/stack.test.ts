@@ -39,6 +39,15 @@ describe("stack configuration", () => {
     }
     expect(manifest.dependencies["pi-lsp-client"]).toBe(stack.required[0]?.spec);
     expect(manifest.dependencies["@vndv/pi-codegraph"]).toBe("0.1.10");
+    expect(manifest.dependencies["@colbymchenry/codegraph"]).toBe("1.6.0");
+    expect(stack.required.find(({ id }) => id === "@vndv/pi-codegraph")).toMatchObject({
+      entry: "node_modules/@vndv/pi-codegraph/extensions/codegraph.ts",
+      bin: "codegraph",
+    });
+    expect(stack.required.some(({ id }) => id === "pitako-code-intelligence")).toBe(false);
+    expect(manifest.pi.extensions.some((entry) => entry.includes("extensions/code-intelligence/"))).toBe(false);
+    expect(manifest.dependencies["@ast-grep/napi"]).toBeUndefined();
+    expect(manifest.bundledDependencies).not.toContain("@ast-grep/napi");
     expect(manifest.dependencies["@dietrichgebert/ponytail"]).toBe("4.10.0");
     expect(manifest.dependencies["@juicesharp/rpiv-todo"]).toBe("2.11.0");
     expect(manifest.dependencies["pi-hermes-memory"]).toBe("0.9.9");

@@ -83,7 +83,7 @@ describe("profiles", () => {
     const child = childSessionNote("developer-1");
     for (const note of [coding, analysis, child]) {
       expect(note).toContain("bounded structural code questions");
-      expect(note).toContain("choose an appropriate supported dense query");
+      expect(note).toContain("choose a supported LSP or CodeGraph tool");
       expect(note).toContain("literal, exhaustive or exact results");
       expect(note).toContain("partial or unavailable");
       expect(note).toContain("raw tools");

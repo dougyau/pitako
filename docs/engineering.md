@@ -1,6 +1,6 @@
 # Engineering layer
 
-Pitako 0.1 is a Pi package. This note records its dependency choices, Board, roles, AgentInstance, Team assignments, Code Intelligence, and `$plan` / `$execute`.
+Pitako 0.1 is a Pi package. This note records its dependency choices, Board, roles, AgentInstance, Team assignments, direct navigation tools, and `$plan` / `$execute`.
 
 ## Decisions
 
@@ -150,9 +150,9 @@ AgentInstance has no 20-minute deadline. The stops at that mark came from the pa
 
 `team_assign` starts independent background AgentInstances from the foreground session. One assignment per role can run at a time. `team_status`, `team_result`, and `team_cancel` use assignment IDs, not worker instance IDs. Watched plan units wake the owning foreground session; child sessions cannot dispatch Team work. Ad-hoc Team state is not a durable scheduler or a Board scope.
 
-## Code Intelligence
+## Direct navigation tools
 
-Six read-only queries supplement raw read, grep, LSP, and CodeGraph. Graph-backed dense queries use the CodeGraph SDK directly and build, reindex, or sync `.codegraph` under Node when needed. `project_report` only observes the index. Under the tested Bun runtime, graph-backed dense queries report unavailable because the SDK needs `node:sqlite`. Raw `codegraph_*` tools still use the CLI through `codegraph serve --mcp` and need an existing index. Query metrics are part of `AgentUsage` and `/pitako stats`; they do not imply that dense queries match raw coverage.
+Pitako loads LSP and CodeGraph through their direct extension entries. CodeGraph retains its upstream navigation prompt hook and uses the CLI through `codegraph serve --mcp`. Runtime tools do not initialize or refresh the index. This checkout's `scripts/setup.sh` attempts missing-index initialization best-effort after dependency/native prerequisites, using a CLI on PATH or in the checkout's `node_modules/.bin` and respecting a valid `CODEGRAPH_DIR` override. Existing indexes are untouched; missing CLI or initialization errors warn and continue. The noninteractive init child suppresses Git-hook offers, platform downloads, and telemetry/update network calls; it adds no runtime or startup hook. Other projects own their preparation. Read, grep, find, ls, and bash remain available for inspection, literal searches, and follow-up when a backend is partial or unavailable. `/pitako stats` reports general model and AgentInstance usage, not query-specific metrics.
 
 ## Plan and execute
 

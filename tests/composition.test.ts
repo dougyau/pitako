@@ -14,8 +14,6 @@ import {
 import pitako from "../extensions/index.ts";
 import { profileNote } from "../extensions/profile.ts";
 import { packageRoot } from "../extensions/stack.ts";
-import codegraphRaw from "../extensions/code-intelligence/codegraph-raw.ts";
-import { CODE_INTELLIGENCE_TOOL_NAMES } from "../extensions/code-intelligence/metrics.ts";
 import { toolsForProfile } from "../extensions/profile.ts";
 
 function readRepo(relative: string): string {
@@ -28,27 +26,16 @@ describe("engineering-layer composition", () => {
     expect(readRepo("skills/pre-pr/SKILL.md")).toContain("Prepare the current worktree");
     expect(manifest.extensions[0]).toBe("./extensions/index.ts");
     for (const entry of ["./extensions/board/index.ts", "./extensions/agent/index.ts",
-      "./extensions/code-intelligence/codegraph-raw.ts", "./node_modules/pi-lsp-client/src/index.ts",
+      "./node_modules/@vndv/pi-codegraph/extensions/codegraph.ts", "./node_modules/pi-lsp-client/src/index.ts",
       "./node_modules/@juicesharp/rpiv-todo/index.ts"]) expect(manifest.extensions).toContain(entry);
     expect(manifest.extensions.some((entry: string) => entry.includes("ponytail"))).toBe(false);
     const skills = manifest.skills.filter((entry: string) => !entry.includes("node_modules"));
     expect(skills).toEqual(expect.arrayContaining(["./skills/pitako-coding", "./skills/practical", "./skills/principles"]));
     for (const name of ["pitako-coding", "ponytail", "caveman", "verify-behavior"]) expect(DEFAULT_SKILL_NAMES as readonly string[]).toContain(name);
     for (const name of [...EXCLUDED_SKILL_NAMES, ...OPTIONAL_LANGUAGE_SKILLS]) expect(DEFAULT_SKILL_NAMES as readonly string[]).not.toContain(name);
-    const active = toolsForProfile({ available: [...CODE_INTELLIGENCE_TOOL_NAMES, "read", "grep", "bash", "edit", "write"], profile: "coding" });
-    expect(active).toEqual(expect.arrayContaining([...CODE_INTELLIGENCE_TOOL_NAMES, "read", "grep", "bash", "edit", "write"]));
-  });
-
-  test("CodeGraph facade keeps raw tools but skips only its conflicting prompt hook", () => {
-    const hooks: string[] = [];
-    const tools: string[] = [];
-    codegraphRaw({
-      on(event: string) { hooks.push(event); return () => {}; },
-      registerTool(tool: { name: string }) { tools.push(tool.name); },
-    } as never);
-    expect(hooks).not.toContain("before_agent_start");
-    expect(tools).toContain("codegraph_search");
-    expect(tools).toContain("codegraph_impact");
+    const tools = ["codegraph_search", "codegraph_impact", "lsp_symbols", "read", "grep", "bash", "edit", "write"];
+    const active = toolsForProfile({ available: tools, profile: "coding" });
+    expect(active).toEqual(expect.arrayContaining(tools));
   });
 
   test("always-on profile note stays small and does not embed third-party bodies", () => {

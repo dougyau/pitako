@@ -55,7 +55,7 @@ export function reconcileChildTools(session: {
   }));
 }
 
-const NAVIGATION_GUIDANCE = "Inspect the repo first. Keep raw read/grep/bash/LSP/CodeGraph available. For bounded structural code questions, choose an appropriate supported dense query; use raw tools for literal, exhaustive or exact results; follow up with raw tools if a query/backend is partial or unavailable.";
+const NAVIGATION_GUIDANCE = "Inspect the repo first. Keep read/grep/bash/LSP/CodeGraph available. For bounded structural code questions, choose a supported LSP or CodeGraph tool; use raw tools for literal, exhaustive or exact results; follow up with raw tools if a query/backend is partial or unavailable.";
 const VERIFICATION_GUIDANCE = "Verify real behavior before claiming done. Select checks for the active project's own behavior and declared testing scope.";
 
 const BUILTIN_TOOLS = new Set([

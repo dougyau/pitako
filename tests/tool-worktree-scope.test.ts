@@ -3,8 +3,6 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
-import { project_report, read_enclosing } from "../extensions/code-intelligence/tools.ts";
-import { bindLspApi } from "../extensions/code-intelligence/lsp.ts";
 import { openBoard } from "../extensions/board/store.ts";
 import { repositoryIdentity } from "../extensions/board/workspace.ts";
 import { runAgentInstance } from "../extensions/agent/run.ts";
@@ -77,55 +75,8 @@ describe("tool worktree defaults", () => {
 
     expect(readFileSync(path.join(source, "src/scope.ts"), "utf8")).toContain("onlyInA");
   }, 120_000);
-
-  test("Pitako routes graph and LSP adapter inputs to execution B and rejects outside files", async () => {
-    const base = mkdtempSync(path.join(tmpdir(), "pitako-intelligence-worktree-")); tempDirs.push(base);
-    const source = path.join(base, "A"), execution = path.join(base, "B");
-    for (const dir of [source, execution]) { mkdirSync(dir); writeFileSync(path.join(dir, "README.md"), "# Guide\n"); }
-    const key = Symbol.for("pitako.code-intelligence.lsp-registry"), lookup = Symbol.for("pitako.code-intelligence.lsp-extension-lookup");
-    const globals = globalThis as typeof globalThis & { [key: symbol]: any };
-    const previous = globals[key], previousLookup = globals[lookup];
-    delete globals[key]; delete globals[lookup];
-    const queried: string[] = [], graphRoots: string[] = [];
-    bindLspApi({
-      findWorkspaceRoot: file => path.dirname(file),
-      createManager: () => ({ stopAll: async () => {} }),
-      findServerForExtension: () => ({ status: "configured" }),
-      async withLspClient(file, run) { queried.push(file); return run({ documentSymbols: async () => [
-        { name: "Guide", kind: 12, range: { start: { line: 0, character: 0 }, end: { line: 0, character: 7 } } },
-      ] }); },
-    });
-    const graphDependencies = { unsupportedRuntime: () => undefined, sdk: async () => ({
-      getCodeGraphDir: (dir: string) => path.join(dir, ".controlled"),
-      CodeGraph: { isInitialized(dir: string) { graphRoots.push(dir); return false; } },
-    }) };
-    try {
-      await project_report.execute("B", {}, new AbortController().signal, undefined, { cwd: execution, graphDependencies });
-      expect(graphRoots).toEqual([execution]);
-      for (const file of ["README.md", path.join(execution, "README.md")]) {
-        const result = await read_enclosing.execute("scope", { file, line: 1 }, new AbortController().signal, undefined, { cwd: execution });
-        expect(result.details.status, JSON.stringify(result.content)).toBe("ok");
-      }
-      const outside = await read_enclosing.execute("outside", { file: path.join(source, "README.md"), line: 1 },
-        new AbortController().signal, undefined, { cwd: execution });
-      expect(outside.details.status).toBe("unavailable");
-      expect(outside.content[0]?.text).toContain("path escapes workspace");
-      expect(queried).toEqual([path.join(execution, "README.md"), path.join(execution, "README.md")]);
-    } finally {
-      const shared = await globals[key];
-      await Promise.all([...shared.queues.values()]);
-      await shared.manager.stopAll();
-      if (previous === undefined) delete globals[key]; else globals[key] = previous;
-      if (previousLookup === undefined) delete globals[lookup]; else globals[lookup] = previousLookup;
-    }
-  });
-
 });
 
 function git(cwd: string, args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-}
-
-function resultText(result: { content?: Array<{ type?: string; text?: string }> }): string {
-  return (result.content ?? []).filter((part) => part.type === "text").map((part) => part.text ?? "").join("\n");
 }

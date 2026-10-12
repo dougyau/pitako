@@ -7,7 +7,6 @@ import { classifyProviderFailure, isServiceTierRejection } from "./fallback.ts";
 import { formatAgentLive } from "./present.ts";
 import { agentScope } from "./scope.ts";
 import type { AgentUiSnapshot } from "./ui.ts";
-import { codeIntelligenceDelta, formatCodeIntelligenceUsage, mergeCodeIntelligenceUsage, type CodeIntelligenceUsage } from "../code-intelligence/metrics.ts";
 import { InvocationHistory, type HistoryOrigin } from "./history.ts";
 import {
   activityKind,
@@ -63,7 +62,6 @@ export interface AgentUsage {
   toolCalls?: number;
   tools?: Record<string, number>;
   contextTokens?: number;
-  codeIntelligence?: CodeIntelligenceUsage;
 }
 
 export interface WatchdogSnapshot {
@@ -767,7 +765,6 @@ export function formatUsage(usage: AgentUsage): string {
   lines.push(`  turns: ${usage.turns ?? "?"}`, `  tools: ${usage.toolCalls ?? "?"}`);
   lines.push(`  mutations: edit ${usage.tools?.edit ?? 0}, write ${usage.tools?.write ?? 0}, apply_patch ${usage.tools?.apply_patch ?? 0}`);
   if (usage.contextTokens !== undefined) lines.push(`  context: ${usage.contextTokens}`);
-  if (usage.codeIntelligence) lines.push(formatCodeIntelligenceUsage(usage.codeIntelligence));
   return lines.join("\n");
 }
 
@@ -808,7 +805,7 @@ export function formatTeamExecutionSummary(summary: TeamExecutionSummary): strin
 /** Counters are subtracted. contextTokens is a gauge and keeps the later value. */
 export function usageDelta(before: AgentUsage | undefined, after: AgentUsage | undefined): AgentUsage | undefined {
   if (!after) return undefined;
-  if (!before) return { ...after, tools: after.tools ? { ...after.tools } : undefined, codeIntelligence: codeIntelligenceDelta(undefined, after.codeIntelligence) };
+  if (!before) return { ...after, tools: after.tools ? { ...after.tools } : undefined };
   const tools: Record<string, number> = {};
   for (const name of new Set([...Object.keys(before.tools ?? {}), ...Object.keys(after.tools ?? {})])) {
     const delta = (after.tools?.[name] ?? 0) - (before.tools?.[name] ?? 0);
@@ -825,13 +822,12 @@ export function usageDelta(before: AgentUsage | undefined, after: AgentUsage | u
     toolCalls: Math.max(0, (after.toolCalls ?? 0) - (before.toolCalls ?? 0)),
     tools,
     contextTokens: after.contextTokens,
-    codeIntelligence: codeIntelligenceDelta(before.codeIntelligence, after.codeIntelligence),
   };
 }
 
 export function mergeUsage(left: AgentUsage | undefined, right: AgentUsage | undefined): AgentUsage | undefined {
   if (!right) return left;
-  if (!left) return { ...right, tools: right.tools ? { ...right.tools } : undefined, codeIntelligence: mergeCodeIntelligenceUsage(undefined, right.codeIntelligence) };
+  if (!left) return { ...right, tools: right.tools ? { ...right.tools } : undefined };
   const tools = { ...(left.tools ?? {}) };
   for (const [name, count] of Object.entries(right.tools ?? {})) tools[name] = (tools[name] ?? 0) + count;
   return {
@@ -845,6 +841,5 @@ export function mergeUsage(left: AgentUsage | undefined, right: AgentUsage | und
     toolCalls: (left.toolCalls ?? 0) + (right.toolCalls ?? 0),
     tools,
     contextTokens: right.contextTokens ?? left.contextTokens,
-    codeIntelligence: mergeCodeIntelligenceUsage(left.codeIntelligence, right.codeIntelligence),
   };
 }

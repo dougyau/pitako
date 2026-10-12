@@ -22,7 +22,7 @@ bun test ./tests/composition.test.ts ./tests/load.test.ts
 
 Use workflow and binding checks for instruction routing, setup checks for shell orchestration, and composition/load checks for shipped resources. These observe different contracts. Static instruction assertions do not prove model compliance.
 
-For code-intelligence or worker-history changes, select existing owned adapter, mapping, cancellation, catalog and retention tests. Use controlled external boundaries rather than real SDK sessions, indexes or language servers. Focused success does not waive the complete owned procedure.
+For worker-history changes, select existing owned mapping, cancellation, catalog and retention tests. Use controlled external boundaries rather than real SDK sessions, indexes or language servers. Focused success does not waive the complete owned procedure.
 
 ## Run the complete routine procedure
 

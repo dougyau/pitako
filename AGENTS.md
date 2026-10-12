@@ -6,7 +6,7 @@ This guide applies to this checkout. Pitako is a TypeScript ESM package that com
 
 Start with [README.md](README.md) for project orientation and [Engineering layer](docs/engineering.md) for design decisions. The main directories are:
 
-- [extensions/](extensions/) contains the implementation, including profiles, Board, agents, roles, Team, and Code Intelligence.
+- [extensions/](extensions/) contains the implementation, including profiles, Board, agents, roles, and Team.
 - [roles/](roles/) contains role instructions.
 - [skills/](skills/) contains the coding baseline, workflows, and contextual skills.
 - [config/](config/) contains structured defaults and configuration examples.
