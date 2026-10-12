@@ -51,9 +51,8 @@ reasoning = "high"
       } } } as unknown as ExtensionContext;
   agentInstance(pi);
   const evaluation = beginTeamEvaluation(sessionId, false)!;
-  let completed = deferred<void>();
   bindBackgroundOwner({ token: evaluation.token, isIdle: () => false, hasUI: true,
-    notify() { completed.resolve(); }, sendMessage() { completed.resolve(); } });
+    notify() {}, sendMessage() {} });
   setBackgroundExecutor({ async start(input) {
     starts++;
     expect(input.target.model).toBe("fixture/senior");
@@ -73,7 +72,8 @@ reasoning = "high"
     expect(spawned.isError).not.toBe(true);
     expect(starts).toBe(1);
     expect(classifications).toBe(1);
-    await completed.promise;
+    await fixture.settleRuns();
+    expect(workerStatus(spawned.details.instanceId)[0]?.status).toBe("completed");
 
     gate = deferred(); entered = deferred();
     const frozen = planFile("pending-route", root);
@@ -105,15 +105,15 @@ reasoning = "high"
     expect(existsSync(ledgerFile("pending-route", root))).toBe(false);
 
     gate = deferred(); entered = deferred();
-    completed = deferred();
     const valid = execute("team_assign");
     await entered.promise;
     gate.resolve(result());
     const accepted = await valid;
     expect(accepted.isError).not.toBe(true);
     expect(accepted.details.dispatchId).toBeDefined();
-    await completed.promise;
+    await fixture.settleRuns();
     expect(teamWorkerResult(evaluation.token, accepted.details.instanceId).status).toBe("completed");
+    expect(teamRoleReservation(evaluation, "developer")).toBeUndefined();
     expect(starts).toBe(2);
     expect(records).toHaveLength(2);
 

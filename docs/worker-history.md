@@ -12,6 +12,32 @@ for non-consuming worker reads and scoped history. The bridge requires fresh
 acknowledgement for raw history and routing, and explicit activation for controls.
 Its history scope is narrower than the foreground tools described below.
 
+## Automatic settled results
+
+Background and Team workers supply their complete captured result automatically
+to the live owning conversation after physical settlement, including failed and
+cancelled outcomes. Plan/unit and watch metadata are correlation, not delivery
+permission. The Coordinator interprets the supplied result; `agent_result` and
+`team_result` are optional complete, idempotent diagnostic re-reads. Passive
+screen and bridge reads retain their existing bounded pagination and never
+acknowledge handoff.
+
+The live motor tracks collection, bookkeeping, delivery, and continuation
+separately. An exact committed custom result in the owning active branch proves
+incorporation; a subsequent owning turn with it in the branch proves a turn
+opportunity, not model processing. Only these observations plus reconciled or
+inapplicable bookkeeping set handoff acknowledgement. No read, draft, or void
+send supplies that authority. Ledger failure does not hide the full result.
+Outstanding failed/cancelled handoffs remain visible beyond ordinary terminal
+linger, as pending or blocked rather than waiting for a model fetch.
+
+Recovery is event-driven and bounded to one later attempt per failed operation.
+Incorporated content is not resent to recover continuation, and parent abort/error
+does not force a new turn. Session retirement fences late effects without
+redirecting results. Full text may pressure context or later be compacted;
+handoff is not restart recovery, work acceptance, unit completion, or Board
+resolution. Historical native worker reads remain independent of this live state.
+
 ## List and read
 
 The foreground `agent_history` tool supports these requests:

@@ -15,6 +15,7 @@ import {
   teamWorkerResult,
   teamWorkerHasOutcome,
   cancelTeamWorker,
+  workerHandoff,
 } from "./background.ts";
 import { listObservations, noteResultTaken, observationEpoch, publishObservation } from "./observe.ts";
 import { currentInstanceId } from "./scope.ts";
@@ -25,7 +26,7 @@ import { existsSync } from "node:fs";
 import { openBoard } from "../board/store.ts";
 import { boardWorkspace, currentWorkspace } from "../board/workspace.ts";
 import { ledgerFile, openExecutionPlan, planFile, readFrozenPlan, readPlan, type ExecutionBinding, type PlanMeta } from "../workflow.ts";
-import { teamEvaluationForSession, reserveTeamRole, recordTeamAssignment, recordPlanTeamWork, teamAssignments, type TeamAssignment } from "../team.ts";
+import { teamEvaluationForSession, reserveTeamRole, recordTeamAssignment, recordPlanTeamWork, teamAssignments, latestTeamAssignment } from "../team.ts";
 import type { HistoryOrigin } from "./history.ts";
 import { queryHistory } from "./history-query.ts";
 import { executionForSession } from "../execution-identity.ts";
@@ -222,10 +223,8 @@ function registerTeamTools(pi: ExtensionAPI): void {
       typeof ctx.sessionManager?.getSessionId === "function" ? ctx.sessionManager.getSessionId() : undefined,
       Boolean(currentInstanceId() || process.env.PITAKO_INSTANCE_ID),
     );
-  const assignmentsFor = (evaluation: NonNullable<ReturnType<typeof teamEvaluationForSession>>) =>
-    teamAssignments(evaluation).flatMap((slot) => [slot.current, slot.last].filter((item): item is TeamAssignment => Boolean(item)));
   const findAssignment = (evaluation: NonNullable<ReturnType<typeof teamEvaluationForSession>>, id: string) => {
-    const assignment = assignmentsFor(evaluation).find((item) => item.id === id);
+    const assignment = teamAssignments(evaluation).find((item) => item.id === id);
     if (!assignment) throw new Error(`unknown Team assignment ${id}`);
     return assignment;
   };
@@ -235,7 +234,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
     label: "Assign Team role",
     description: "Start one isolated Team role. Returns immediately. One assignment per role may run at a time.",
     promptSnippet: "Assign independent work to a Team role",
-    promptGuidelines: ["Use team_assign for independent long work. Keep task scoped. Do not wait or poll; on a watched plan/unit completion wake, resume and fetch it with team_result using the assignment ID."],
+    promptGuidelines: ["Use team_assign for independent long work. Keep task scoped. Do not wait or poll; interpret complete results automatically supplied in context. team_result is an optional diagnostic re-read, not a transport or acknowledgement."],
     parameters: Type.Object({
       role: Type.String({ enum: [...roles] }),
       task: Type.String({ minLength: 1, description: "Scoped WorkBrief for this role" }),
@@ -305,10 +304,13 @@ function registerTeamTools(pi: ExtensionAPI): void {
               assignmentId: id,
               onSettled() { admission.settled(); },
             },
+            reconcileBookkeeping: watch && topic !== undefined
+              ? result => recordPlanTeamWork(launchRoot, watch.planId, watch.unitId, id, result.status, execution)
+              : undefined,
           });
           accepted = true;
           admission.commit();
-          const assignment: TeamAssignment = {
+          const assignment = {
             id, instanceId: handle.instanceId, roleId: params.role, task: params.task.trim(),
             planId: watch?.planId, unitId: watch?.unitId, boardTopicId: topic, execution,
             dispatchId: dispatch?.routing.dispatchId,
@@ -341,13 +343,11 @@ function registerTeamTools(pi: ExtensionAPI): void {
       try {
         const evaluation = evaluationFor(ctx);
         if (!evaluation) throw new Error("Team requires a foreground session identity");
-        const slots = teamAssignments(evaluation);
-        const rows = roles.map((role, index) => {
-          const assignment = slots[index]?.current;
-          const last = slots[index]?.last;
-          const selected = params.assignmentId ? [assignment, last].find((item) => item?.id === params.assignmentId) : assignment;
+        const rows = roles.map((role) => {
+          const assignment = latestTeamAssignment(evaluation, role);
+          const selected = params.assignmentId ? teamAssignments(evaluation).find(item => item.roleId === role && item.id === params.assignmentId) : assignment;
           if (params.assignmentId && !selected) return undefined;
-          const row = selected ?? assignment ?? last;
+          const row = selected ?? assignment;
           if (!row) return { role, status: "idle" };
           const view = teamWorkerStatus(evaluation.token, row.instanceId)[0];
           const observation = listObservations(evaluation.token, evaluation.sessionId).find((item) => item.id === row.instanceId);
@@ -362,6 +362,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
             activity: observation?.activeTool,
             elapsedMs: view?.elapsedMs,
             resultAvailable: teamWorkerHasOutcome(evaluation.token, row.instanceId),
+            handoff: workerHandoff(row.instanceId),
           };
         }).filter((row) => row !== undefined);
         if (params.assignmentId && rows.length === 0) throw new Error(`unknown Team assignment ${params.assignmentId}`);
@@ -373,8 +374,8 @@ function registerTeamTools(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "team_result",
     label: "Team result",
-    description: "Return one settled Team result, capped at 8000 characters. Does not wait.",
-    promptSnippet: "Fetch a finished Team assignment result",
+    description: "Optional complete diagnostic re-read of one settled Team result. Idempotent; does not wait or acknowledge automatic handoff.",
+    promptSnippet: "Inspect a settled Team assignment result",
     parameters: Type.Object({ assignmentId: Type.String() }, noExtra),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       try {
@@ -382,20 +383,14 @@ function registerTeamTools(pi: ExtensionAPI): void {
         if (!evaluation) throw new Error("Team requires a foreground session identity");
         const assignment = findAssignment(evaluation, params.assignmentId);
         const result = teamWorkerResult(evaluation.token, assignment.instanceId);
-        if (assignment.planId && assignment.unitId && assignment.boardTopicId !== undefined) {
-          recordPlanTeamWork(ctx.cwd, assignment.planId, assignment.unitId, assignment.id, result.status, assignment.execution);
-        }
+        const handoff = workerHandoff(assignment.instanceId);
         const summary = teamExecutionSummary(assignment.id, result);
         const prefix = `${formatTeamExecutionSummary(summary)}\n\n`;
-        const limit = 8000;
-        const truncationNote = "\n[truncated; use a narrower assignment]";
-        const available = Math.max(0, limit - prefix.length);
-        const truncated = result.result.length > available;
-        const resultLimit = truncated ? Math.max(0, available - truncationNote.length) : available;
-        return textResult(`${prefix}${result.result.slice(0, resultLimit)}${truncated ? truncationNote : ""}`, {
+        const diagnostic = handoff?.bookkeepingDiagnostic ? `\n\nBookkeeping blocked: ${handoff.bookkeepingDiagnostic}` : "";
+        return textResult(`${prefix}${result.result}${diagnostic}`, {
           assignmentId: assignment.id, instanceId: result.instanceId, role: result.role,
-          status: result.status, model: result.model, usage: result.usage, summary, truncated, resultLength: result.result.length,
-        }, result.status !== "completed");
+          status: result.status, model: result.model, usage: result.usage, summary, handoff, resultLength: result.result.length,
+        }, result.status !== "completed" || handoff?.bookkeeping === "blocked");
       } catch (error) { return errorResult(error instanceof Error ? error.message : String(error)); }
     },
   });
@@ -545,13 +540,13 @@ function registerBackgroundTools(pi: ExtensionAPI): void {
       "Start one Pitako role in the background and return its instance id while it is still running. Does not wait for the result. A failure is not permission to do that role in the parent.",
     promptSnippet: "Start a background Pitako role and return before it finishes",
     promptGuidelines: [
-      "Use agent_spawn for long specialist work that can continue while you stay available. Do not call agent_result in the same turn. If it fails, report the error. Do not do that role yourself.",
+      "Use agent_spawn for long specialist work while you stay available. Interpret complete results automatically supplied in context; agent_result is an optional diagnostic re-read. Do not poll. If it fails, report the error. Do not do that role yourself.",
     ],
     parameters: Type.Object(
       {
         role: Type.String({ description: "Role id, for example developer" }),
         task: Type.String({ description: "Explicit task for the isolated agent" }),
-        plan: Type.Optional(Type.String({ description: "Plan id when an execution workflow should wake on completion" })),
+        plan: Type.Optional(Type.String({ description: "Optional execution correlation; all settled results are delivered automatically" })),
         unit: Type.Optional(Type.String({ description: "Unit id paired with plan" })),
       },
       noExtra,
@@ -619,9 +614,9 @@ function registerBackgroundTools(pi: ExtensionAPI): void {
     name: "agent_result",
     label: "Agent result",
     description:
-      "Return one finished background worker result. Errors if it is still running. Does not wait. A failure is not permission to do that role in the parent.",
-    promptSnippet: "Fetch a finished background worker result",
-    promptGuidelines: ["Call agent_result only after a completion signal or a terminal agent_status. Do not poll."],
+      "Optional complete, idempotent diagnostic re-read of a settled background worker result. Does not acknowledge automatic handoff or wait. A failure is not permission to do that role in the parent.",
+    promptSnippet: "Inspect a settled background worker result",
+    promptGuidelines: ["Interpret automatically supplied results. Use agent_result only for diagnostics; do not poll or acknowledge collection."],
     parameters: Type.Object({ id: Type.String({ description: "Instance id" }) }, noExtra),
     async execute(_toolCallId, params) {
       const blocked = childBlocked("agent_result");

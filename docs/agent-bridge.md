@@ -87,8 +87,11 @@ print or rewrite the descriptor to connect.
 ## Ordinary worker reads
 
 These reads are scoped to the current owner. They do not consume results, release
-Team roles, accept workflow completion, or modify native history. Ordinary
-`agent_result` and `team_result` remain separate consuming operations.
+Team roles, accept workflow completion, or modify native history. Physical
+settlement, not a read, releases roster occupancy and activates automatic result
+handoff. `agent_result` and `team_result` are optional complete diagnostic re-reads,
+not consuming acknowledgements. List rows and detail metadata expose collection,
+bookkeeping, delivery, continuation, and observed handoff acknowledgement separately.
 
 | Client operation | Returned data and continuation |
 | --- | --- |

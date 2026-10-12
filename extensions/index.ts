@@ -3,8 +3,9 @@ import { skillStatusLines } from "./catalog.ts";
 import { PitakoConfigError } from "./errors.ts";
 import { isProtectedEditPath } from "./paths.ts";
 import { canonicalPath } from "./board/paths.ts";
-import { bindBackgroundOwner, revokeBackgroundOwner, shutdownBackground, takeHeldCompletions } from "./agent/background.ts";
-import { beginTeamEvaluation, retireTeamEvaluation, teamEvaluationForSession, teamAssignments, type TeamEvaluation } from "./team.ts";
+import { bindBackgroundOwner, revokeBackgroundOwner, shutdownBackground, observeWorkerResults,
+  draftWorkerResults, settleWorkerResults, restrictWorkerContinuation, externallyStartedWorkerOwner } from "./agent/background.ts";
+import { beginTeamEvaluation, retireTeamEvaluation, teamEvaluationForSession, latestTeamAssignment, type TeamEvaluation } from "./team.ts";
 import { teamWorkerStatus } from "./agent/background.ts";
 import { bindAgentUi, listObservations, unbindAgentUi } from "./agent/observe.ts";
 import { formatAgentsDetail } from "./agent/ui.ts";
@@ -183,14 +184,20 @@ export default function pitako(pi: ExtensionAPI) {
       }
       registerSupervisedSession(sessionId, process.env, pi, ctx.model);
       if (!isChildSession(ctx) && typeof ctx.isIdle === "function") {
+        const token = ownerToken;
+        const evaluationToken = teamEvaluation?.token;
+        const owns = () => revision === foregroundRevision && token === ownerToken &&
+          sessionId === ctx.sessionManager?.getSessionId() && evaluationToken === teamEvaluation?.token &&
+          (!evaluationToken || teamEvaluationForSession(sessionId, false)?.token === evaluationToken);
         bindBackgroundOwner({
-          token: ownerToken,
+          token, sessionId, revision, owns,
           isIdle: () => ctx.isIdle(),
           hasUI: ctx.hasUI,
           notify: (message) => {
             if (ctx.hasUI) ctx.ui.notify(message, "info");
           },
           sendMessage: (content) => {
+            if (!owns()) return;
             pi.sendMessage(
               {
                 customType: "pitako.worker",
@@ -201,6 +208,10 @@ export default function pitako(pi: ExtensionAPI) {
               { deliverAs: "followUp", triggerTurn: true },
             );
           },
+          appendResult: message => {
+            if (owns()) pi.sendMessage(message, { triggerTurn: false });
+          },
+          getBranch: () => owns() ? ctx.sessionManager.getBranch() : [],
         });
       }
       try {
@@ -266,25 +277,58 @@ export default function pitako(pi: ExtensionAPI) {
     if (revision === foregroundRevision) unregisterSupervisedSession();
   });
 
-  const flush = () => {
-    const content = takeHeldCompletions(ownerToken);
-    if (!content) return;
-    pi.sendMessage(
-      {
-        customType: "pitako.worker",
-        content,
-        display: true,
-        details: { source: "pitako.worker" },
-      },
-      { deliverAs: "followUp", triggerTurn: true },
-    );
+  const ownsEvent = (ctx: ExtensionContext) => foregroundSession(ctx?.sessionManager?.getSessionId()) &&
+    ctx.sessionManager.getSessionId() === teamEvaluation?.sessionId &&
+    teamEvaluationForSession(teamEvaluation.sessionId, false)?.token === teamEvaluation.token &&
+    teamEvaluation.token === ownerToken;
+  const terminal = (_event: unknown, ctx: ExtensionContext) => {
+    if (ownsEvent(ctx)) settleWorkerResults(ownerToken, true);
   };
-  pi.on("agent_settled", flush);
-  pi.on("session_compact", flush);
-  pi.on("session_compact_failed", flush);
-  pi.on("session_tree", flush);
+  pi.on("agent_before_settle", (event, ctx) => {
+    if (ownsEvent(ctx)) return draftWorkerResults(ownerToken, event.outcome);
+  });
+  pi.on("agent_settled", terminal);
+  pi.on("session_compact", (event, ctx) => {
+    if (!ownsEvent(ctx)) return;
+    if (event.reason === "manual") settleWorkerResults(ownerToken, true, false);
+    else observeWorkerResults(ownerToken);
+  });
+  pi.on("session_compact_failed", (event, ctx) => {
+    if (!ownsEvent(ctx)) return;
+    if (event.reason === "manual") settleWorkerResults(ownerToken, true, false);
+    else observeWorkerResults(ownerToken);
+  });
+  pi.on("session_tree", (_event, ctx) => {
+    if (ownsEvent(ctx)) settleWorkerResults(ownerToken, true, false);
+  });
+  pi.on("turn_start", (_event, ctx) => {
+    if (ownsEvent(ctx)) observeWorkerResults(ownerToken, true);
+  });
+  pi.on("context", (_event, ctx) => {
+    if (ownsEvent(ctx)) observeWorkerResults(ownerToken);
+  });
+  pi.on("message_end", (event, ctx) => {
+    if (!ownsEvent(ctx)) return;
+    if (event.message.role === "assistant") {
+      if (event.message.stopReason === "aborted") restrictWorkerContinuation(ownerToken, "aborted");
+      if (event.message.stopReason === "error") restrictWorkerContinuation(ownerToken, "error");
+    }
+    observeWorkerResults(ownerToken);
+  });
+  pi.on("agent_end", (event, ctx) => {
+    if (!ownsEvent(ctx)) return;
+    const last = [...event.messages].reverse().find(message => message.role === "assistant");
+    if (last?.role === "assistant" && (last.stopReason === "aborted" || last.stopReason === "error"))
+      restrictWorkerContinuation(ownerToken, last.stopReason);
+    if (ctx.signal?.aborted) restrictWorkerContinuation(ownerToken, "aborted");
+    observeWorkerResults(ownerToken);
+  });
 
   pi.on("before_agent_start", async (event, ctx) => {
+    if (ownsEvent(ctx)) {
+      externallyStartedWorkerOwner(ownerToken);
+      observeWorkerResults(ownerToken);
+    }
     const entries = ctx.sessionManager?.getEntries?.() ?? [];
     const existingUserText = firstUserText(entries);
     const pendingPrompt = existingUserText ? undefined : event.prompt;
@@ -345,8 +389,8 @@ export default function pitako(pi: ExtensionAPI) {
           return;
         }
         const roles = ["architect", "developer", "reviewer", "researcher"];
-        const rows = teamAssignments(evaluation).map((slot, index) => {
-          const assignment = slot.current ?? slot.last;
+        const rows = roles.map((role, index) => {
+          const assignment = latestTeamAssignment(evaluation, role!);
           if (!assignment) return { role: roles[index], status: "idle" };
           const view = teamWorkerStatus(evaluation.token, assignment.instanceId)[0];
           return {

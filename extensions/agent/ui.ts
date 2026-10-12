@@ -31,6 +31,7 @@ export interface AgentUiSnapshot {
   /** Tool starts seen so far. Omit when unknown. */
   toolCalls?: number;
   resultTaken?: boolean;
+  handoff?: import("./background.ts").WorkerHandoff;
   failureKind?: string;
   /** Watchdog inactivity; used for `no stream · mm:ss`. */
   inactivityMs?: number;
@@ -93,7 +94,7 @@ function elapsedMs(row: AgentUiSnapshot, now: number): number {
 }
 
 function isResultReady(row: AgentUiSnapshot): boolean {
-  return row.status === "completed" && !row.resultTaken;
+  return row.status === "completed" && !row.resultTaken && !row.handoff;
 }
 
 function isGrouped(row: AgentUiSnapshot): boolean {
@@ -143,6 +144,7 @@ export function projectSnapshots(rows: readonly AgentUiSnapshot[], now: number):
   );
   const relevant = rows.filter((row) => {
     if (row.status === "running") return true;
+    if (row.handoff && !row.resultTaken) return true;
     if (row.status === "completed" && !row.resultTaken) return true;
     if (
       (row.status === "completed" || row.status === "failed" || row.status === "cancelled") &&
@@ -263,6 +265,10 @@ function toolDisplayName(name: string): string {
 }
 
 function activityText(row: AgentUiSnapshot, now: number): string {
+  if (row.handoff) {
+    const h = row.handoff;
+    return `delivery ${h.delivery} · bookkeeping ${h.bookkeeping} · continuation ${h.continuation}`;
+  }
   if (isResultReady(row)) return "result ready";
 
   if (row.activeTool) {
@@ -332,6 +338,11 @@ function workFooter(row: AgentUiSnapshot): string {
 
 /** Explicit state word. Waiting is model-start with no tokens and no tool, not a guessed stall. */
 export function statusWord(row: AgentUiSnapshot): string {
+  if (row.handoff && !row.resultTaken) {
+    const h = row.handoff;
+    return h.delivery === "blocked" || h.bookkeeping === "blocked" || h.continuation === "blocked-unconfirmed"
+      ? "handoff blocked" : "handoff pending";
+  }
   if (row.status === "cancelled") return "cancelled";
   if (row.status === "failed") return "failed";
   if (row.status === "completed") return isResultReady(row) ? "ready" : "done";
@@ -492,7 +503,7 @@ type DetailEntry = AgentUiSnapshot | { compact: true; roleId: string; count: num
 function compactFailures(rows: readonly AgentUiSnapshot[]): DetailEntry[] {
   const failed = new Map<string, AgentUiSnapshot[]>();
   for (const row of rows) {
-    if (row.status !== "failed" || !row.failureKind) continue;
+    if (row.status !== "failed" || !row.failureKind || row.handoff && !row.resultTaken) continue;
     const key = `${row.roleId}\0${row.failureKind}`;
     const list = failed.get(key) ?? [];
     list.push(row);
@@ -502,7 +513,7 @@ function compactFailures(rows: readonly AgentUiSnapshot[]): DetailEntry[] {
   const out: DetailEntry[] = [];
   const emitted = new Set<string>();
   for (const row of rows) {
-    if (row.status === "failed" && row.failureKind) {
+    if (row.status === "failed" && row.failureKind && (!row.handoff || row.resultTaken)) {
       const key = `${row.roleId}\0${row.failureKind}`;
       const list = failed.get(key)!;
       if (list.length >= 2) {

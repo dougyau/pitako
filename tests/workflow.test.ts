@@ -655,9 +655,12 @@ describe("plan and execute contracts", () => {
     expect(execute).toContain("same Developer");
     expect(execute).toContain("prefer `team_assign` when available");
     expect(execute).toContain("Team assignment ID for Team");
-    expect(execute).toContain("call `team_result` once with the Team assignment ID");
+    expect(execute).toContain("Interpret complete `pitako.worker.result` messages supplied automatically in context");
+    expect(execute).toContain("optional, complete, idempotent diagnostic re-reads");
+    expect(execute).toContain("They neither transport the automatic result nor acknowledge incorporation");
+    expect(execute).not.toContain("call `team_result` once");
     expect(execute).toContain("call `team_status` with its assignment ID");
-    expect(execute).toContain("`agent_result` once with the low-level worker instance ID");
+    expect(execute).not.toContain("`agent_result` once");
     expect(execute).toContain("call `agent_status` with its instance ID");
     expect(execute).toContain("Keep at most one Developer role active, without exception.");
     expect(execute).not.toContain("unless the frozen plan already assigns non-overlapping work");
@@ -672,6 +675,20 @@ describe("plan and execute contracts", () => {
     expect(execute).not.toContain("When `agent_run` is available, you coordinate");
     expect(execute).toContain("bindingMismatch");
     expect(execute).not.toMatch(/openai-codex|anthropic\/|gpt-5|claude-/);
+  });
+
+  test("active orchestration guidance interprets supplied results without fetching or accepting work", () => {
+    const coordinator = readFileSync(path.join(packageRoot(), "roles/coordinator.md"), "utf8");
+    expect(plan).toContain("complete settled results automatically supplied in context");
+    expect(plan).toContain("optional exact-assignment diagnostic re-read");
+    expect(plan).not.toContain("on each watched completion wake, call");
+    expect(execute).toContain("Automatic collection reconciles only a successful assignment's own result hold");
+    expect(execute).toContain("it does not accept work or complete a unit");
+    expect(execute).toContain("Bookkeeping failure is reported separately and never hides the full result");
+    expect(router).toContain("do not poll or acknowledge collection");
+    expect(router).toContain("Automatic handoff is not work acceptance or unit completion");
+    expect(coordinator).toContain("not transport or acknowledgement");
+    expect(coordinator).toContain("does not accept the work or expand specialist authority");
   });
 
   test("execute and pre-pr order cleanup before final gates and review", () => {

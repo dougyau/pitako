@@ -79,6 +79,21 @@ describe("projectSnapshots / empty footer", () => {
     expect(projectSnapshots([failed, running], NOW).map((r) => r.id)).toEqual(["run"]);
   });
 
+  test("outstanding failed/cancelled handoffs outlive linger and display motor state, not a model fetch", () => {
+    const handoff = { collection: "collected", bookkeeping: "blocked", delivery: "incorporated", continuation: "blocked-unconfirmed" } as const;
+    const failed = row({ id: "f1", status: "failed", terminalAt: NOW - 60_000, failureKind: "model_stream", handoff });
+    const cancelled = row({ id: "c1", status: "cancelled", terminalAt: NOW - 60_000,
+      handoff: { ...handoff, bookkeeping: "inapplicable", delivery: "pending", continuation: "not-requested" } });
+    expect(projectSnapshots([failed, cancelled], NOW).map(item => item.id).sort()).toEqual(["c1", "f1"]);
+    const text = formatAgentsDetail([failed, cancelled], NOW);
+    expect(text).toContain("handoff blocked");
+    expect(text).toContain("handoff pending");
+    expect(text).toContain("bookkeeping blocked");
+    expect(text).not.toContain("result ready");
+    expect(text).not.toContain("agent_result");
+    expect(projectSnapshots([{ ...failed, resultTaken: true }, { ...cancelled, resultTaken: true }], NOW)).toEqual([]);
+  });
+
   test("compacted failure stays past 8s while running sibling shares group", () => {
     const f1 = row({
       id: "f1",

@@ -14,12 +14,18 @@ import {
   cancelAllWorkers,
   cancelWorker,
   clearBackgroundOwner,
-  completionText,
-  deliveryFor,
   setBackgroundExecutor,
   shutdownBackground,
   spawnBackground,
-  takeHeldCompletions,
+  draftWorkerResults,
+  observeWorkerResults,
+  settleWorkerResults,
+  deliverWorkerResults,
+  restrictWorkerContinuation,
+  externallyStartedWorkerOwner,
+  revokeBackgroundOwner,
+  workerHandoff,
+  type ResultMessage,
   workerResult,
   workerStatus,
   resolveLiveTarget,
@@ -33,6 +39,7 @@ import { childActiveTools, ORCHESTRATION_TOOLS } from "../extensions/profile.ts"
 import { packageRoot } from "../extensions/stack.ts";
 import { ledgerFile, planFile } from "../extensions/workflow.ts";
 import type { LoadOptions } from "../extensions/roles/load.ts";
+import { listObservations } from "../extensions/agent/observe.ts";
 
 const fixture = agentFixtureOwnership();
 const tempDirs = fixture.directories;
@@ -80,17 +87,21 @@ function hang(): { executor: AttemptExecutor; started: Promise<void>; release: (
   };
 }
 
-function owner(idle: boolean): BackgroundOwner & { notes: string[]; wakes: string[] } {
+function owner(idle: boolean): BackgroundOwner & { notes: string[]; wakes: string[]; results: ResultMessage[]; branch: unknown[] } {
   const notes: string[] = [];
   const wakes: string[] = [];
+  const results: ResultMessage[] = [], branch: unknown[] = [];
   return {
     token: Symbol("test-owner"),
     isIdle: () => idle,
     hasUI: true,
     notify: (message) => notes.push(message),
     sendMessage: (content) => wakes.push(content),
+    appendResult(message) { results.push(message); branch.push({ type: "custom_message", ...message }); },
+    getBranch: () => branch,
     notes,
     wakes,
+    results, branch,
   };
 }
 
@@ -219,6 +230,301 @@ describe("cancel before settle", () => {
 });
 
 describe("background registry", () => {
+  test("ad hoc idle worker automatically supplies complete Unicode without UI or a getter", fixture.ownedCase("idle automatic handoff", async () => {
+    const bound = owner(true);
+    bound.hasUI = false;
+    let appended!: () => void;
+    const ready = new Promise<void>(resolve => { appended = resolve; });
+    const append = bound.appendResult!;
+    bound.appendResult = message => { append(message); appended(); };
+    bindBackgroundOwner(bound);
+    const hanging = hang();
+    const handle = await spawnBackground({ roleId: "developer", task: "work", cwd: packageRoot(),
+      executor: hanging.executor, load: load() });
+    const complete = " \n🧬漢字\u0000e\u0301 ".repeat(4000) + "\n ";
+    hanging.release({ status: "completed", result: complete, sideEffects: false });
+    await ready;
+    expect(bound.results).toHaveLength(1);
+    expect(bound.results[0]?.content).toBe(complete);
+    expect(bound.wakes).toHaveLength(1);
+    expect(bound.wakes[0]).not.toContain("agent_result");
+    expect(workerHandoff(handle.instanceId)).toMatchObject({
+      collection: "collected", bookkeeping: "inapplicable", delivery: "incorporated", continuation: "requested",
+    });
+    observeWorkerResults(bound.token, true);
+    expect(workerHandoff(handle.instanceId)?.continuation).toBe("observed");
+    bound.branch.length = 0;
+    observeWorkerResults(bound.token);
+    expect(workerHandoff(handle.instanceId)?.delivery).toBe("incorporated");
+    settleWorkerResults(bound.token, true);
+    expect(bound.results).toHaveLength(1);
+    expect(bound.wakes).toHaveLength(1);
+  }));
+
+  test("busy full draft is not a receipt and requests continuation only after new context", fixture.ownedCase("busy draft commitment", async () => {
+    const bound = owner(false);
+    bindBackgroundOwner(bound);
+    const hanging = hang();
+    const handle = await spawnBackground({ roleId: "developer", task: "work", cwd: packageRoot(),
+      executor: hanging.executor, load: load() });
+    hanging.release({ status: "completed", result: "complete text", sideEffects: false });
+    await waitFor(handle.instanceId);
+    expect(bound.results).toEqual([]);
+    const offered = draftWorkerResults(bound.token, "completed")!;
+    expect(offered.continue).toBe(true);
+    expect(offered.entries[0]?.content).toBe("complete text");
+    expect(workerHandoff(handle.instanceId)?.delivery).toBe("offered");
+    expect(draftWorkerResults(bound.token, "completed")).toBeUndefined();
+    observeWorkerResults(bound.token, true);
+    expect(workerHandoff(handle.instanceId)?.continuation).toBe("requested");
+    bound.branch.push(...offered.entries);
+    observeWorkerResults(bound.token);
+    expect(workerHandoff(handle.instanceId)?.delivery).toBe("incorporated");
+    expect(workerHandoff(handle.instanceId)?.continuation).toBe("requested");
+    observeWorkerResults(bound.token, true);
+    expect(workerHandoff(handle.instanceId)?.continuation).toBe("observed");
+    settleWorkerResults(bound.token, true);
+    expect(bound.wakes).toEqual([]);
+  }));
+
+  test("void sends and preview-only or mismatched entries never acknowledge; recovery is bounded and late receipt still works", fixture.ownedCase("uncertain delivery and late receipt", async () => {
+    const bound = owner(true);
+    bound.appendResult = message => { bound.results.push(message); };
+    bindBackgroundOwner(bound);
+    const hanging = hang();
+    const handle = await spawnBackground({ roleId: "developer", task: "work", cwd: packageRoot(),
+      executor: hanging.executor, load: load() });
+    hanging.release({ status: "completed", result: " \n😀\ud800 unchanged \t", sideEffects: false });
+    await fixture.settleRuns();
+    const original = bound.results[0]!;
+    expect(workerHandoff(handle.instanceId)).toMatchObject({ delivery: "offered", continuation: "not-requested" });
+    expect(bound.wakes).toEqual([]);
+    bound.branch.push({ type: "message", message: { role: "custom", ...original } },
+      { type: "custom_message", ...original, content: original.content.trim() },
+      { type: "custom_message", ...original, details: { deliveryId: "foreign" } });
+    for (let i = 0; i < 3; ++i) {
+      observeWorkerResults(bound.token, true);
+      deliverWorkerResults(bound.token);
+      draftWorkerResults(bound.token, "completed");
+    }
+    expect(bound.results).toHaveLength(1);
+    expect(listObservations().find(row => row.id === handle.instanceId)?.resultTaken).not.toBe(true);
+    // Closing an unresolved operation does not retry it within that callback.
+    settleWorkerResults(bound.token, true);
+    expect(bound.results).toHaveLength(1);
+    settleWorkerResults(bound.token, true);
+    expect(bound.results).toHaveLength(2);
+    expect(bound.results[1]).toBe(original);
+    for (let i = 0; i < 5; ++i) settleWorkerResults(bound.token, true);
+    expect(bound.results).toHaveLength(2);
+    expect(workerHandoff(handle.instanceId)?.delivery).toBe("blocked");
+    expect(bound.wakes).toEqual([]);
+    bound.branch.push({ type: "custom_message", ...original });
+    observeWorkerResults(bound.token);
+    expect(workerHandoff(handle.instanceId)?.delivery).toBe("incorporated");
+    expect(listObservations().find(row => row.id === handle.instanceId)?.resultTaken).not.toBe(true);
+    observeWorkerResults(bound.token, true);
+    expect(listObservations().find(row => row.id === handle.instanceId)?.resultTaken).toBe(true);
+    expect(bound.results).toHaveLength(2);
+  }));
+
+  test("rejected appends recover once at a later boundary; failed wakes never resend incorporated text", fixture.ownedCase("rejected operations", async () => {
+    const bound = owner(true);
+    let appends = 0, wakes = 0;
+    const commit = bound.appendResult!;
+    bound.appendResult = message => { if (++appends === 1) throw new Error("append rejected"); commit(message); };
+    bound.sendMessage = () => { ++wakes; throw new Error("wake rejected"); };
+    bindBackgroundOwner(bound);
+    const hanging = hang();
+    const handle = await spawnBackground({ roleId: "developer", task: "work", cwd: packageRoot(),
+      executor: hanging.executor, load: load() });
+    hanging.release({ status: "completed", result: "still complete", sideEffects: false });
+    await fixture.settleRuns();
+    expect(appends).toBe(1);
+    expect(workerHandoff(handle.instanceId)).toMatchObject({ delivery: "blocked", continuation: "not-requested" });
+    settleWorkerResults(bound.token, true);
+    expect(appends).toBe(2);
+    expect(wakes).toBe(1);
+    expect(workerHandoff(handle.instanceId)).toMatchObject({ delivery: "incorporated", continuation: "blocked-unconfirmed" });
+    for (let i = 0; i < 5; ++i) settleWorkerResults(bound.token, true);
+    expect(wakes).toBe(2);
+    expect(appends).toBe(2);
+    expect(bound.results).toHaveLength(1);
+    expect(workerResult(handle.instanceId).result).toBe("still complete");
+    expect(listObservations().find(row => row.id === handle.instanceId)?.resultTaken).not.toBe(true);
+    observeWorkerResults(bound.token, true);
+    expect(listObservations().find(row => row.id === handle.instanceId)?.resultTaken).toBe(true);
+  }));
+
+  test("an idle void wake is requested, not accepted; duplicate boundaries cannot replenish recovery", fixture.ownedCase("unobserved idle continuation", async () => {
+    const bound = owner(true);
+    bindBackgroundOwner(bound);
+    const hanging = hang();
+    const handle = await spawnBackground({ roleId: "developer", task: "work", cwd: packageRoot(),
+      executor: hanging.executor, load: load(), reconcileBookkeeping() { throw new Error("ledger unavailable"); } });
+    hanging.release({ status: "completed", result: "retained complete result", sideEffects: false });
+    await fixture.settleRuns();
+    for (let i = 0; i < 5; ++i) settleWorkerResults(bound.token, true);
+    expect(bound.results).toHaveLength(1);
+    expect(bound.wakes).toHaveLength(2);
+    expect(workerHandoff(handle.instanceId)).toMatchObject({
+      delivery: "incorporated", continuation: "requested", bookkeeping: "blocked",
+    });
+    expect(listObservations().find(row => row.id === handle.instanceId)?.resultTaken).not.toBe(true);
+    observeWorkerResults(bound.token, true);
+    expect(workerHandoff(handle.instanceId)?.continuation).toBe("observed");
+    expect(listObservations().find(row => row.id === handle.instanceId)?.resultTaken).not.toBe(true);
+  }));
+
+  test("busy commitment without a subsequent turn stays blocked and never falls back to idle wake", fixture.ownedCase("rejected busy continuation", async () => {
+    const bound = owner(false);
+    bindBackgroundOwner(bound);
+    const hanging = hang();
+    const handle = await spawnBackground({ roleId: "developer", task: "work", cwd: packageRoot(),
+      executor: hanging.executor, load: load() });
+    hanging.release({ status: "completed", result: "complete", sideEffects: false });
+    await fixture.settleRuns();
+    const drafts = draftWorkerResults(bound.token, "completed")!;
+    bound.branch.push(...drafts.entries);
+    bound.isIdle = () => true;
+    for (let i = 0; i < 5; ++i) settleWorkerResults(bound.token, true);
+    expect(workerHandoff(handle.instanceId)).toMatchObject({ delivery: "incorporated", continuation: "blocked-unconfirmed" });
+    expect(bound.results).toEqual([]);
+    expect(bound.wakes).toEqual([]);
+    expect(listObservations().find(row => row.id === handle.instanceId)?.resultTaken).not.toBe(true);
+    observeWorkerResults(bound.token, true);
+    expect(listObservations().find(row => row.id === handle.instanceId)?.resultTaken).toBe(true);
+  }));
+
+  test("a valid live-handle rebind changes worker generation but preserves its foreground handoff", fixture.ownedCase("handoff after live rebind", async () => {
+    const bound = owner(true);
+    bound.sessionId = "coordinator";
+    bound.revision = 12;
+    bindBackgroundOwner(bound);
+    const hanging = hang();
+    const handle = await spawnBackground({ roleId: "developer", task: "work", cwd: packageRoot(), load: load(),
+      historyOrigin: { source: "agent_spawn", coordinatorSessionId: "coordinator" },
+      executor: { async start(input) {
+        const live = (id: string) => ({ sessionId: id, historyId: id, observe: () => ({}), input: async () => ({}), close: async () => {} });
+        const old = input.bindLive!(live("old"));
+        const latest = input.bindLive!(live("latest"));
+        old();
+        const attempt = await hanging.executor.start(input);
+        return { ...attempt, session: { continueWith: async () => { throw new Error("unexpected continuation"); }, async dispose() { latest(); } } };
+      } } });
+    hanging.release({ status: "completed", result: "rebound result", sideEffects: false });
+    await fixture.settleRuns();
+    expect(bound.results).toMatchObject([{ content: "rebound result", details: {
+      instanceId: handle.instanceId, ownerSessionId: "coordinator", foregroundRevision: 12,
+    } }]);
+    expect(bound.wakes).toHaveLength(1);
+    observeWorkerResults(bound.token, true);
+    expect(listObservations().find(row => row.id === handle.instanceId)?.resultTaken).toBe(true);
+  }));
+
+  test("partial bookkeeping retains delivery and concurrent diagnostic re-reads share the same collection", fixture.ownedCase("independent bookkeeping recovery", async () => {
+    const bound = owner(true);
+    bindBackgroundOwner(bound);
+    let attempts = 0, applied = false;
+    const hanging = hang();
+    const handle = await spawnBackground({ roleId: "developer", task: "work", cwd: packageRoot(),
+      executor: hanging.executor, load: load(), reconcileBookkeeping() {
+        ++attempts;
+        applied = true;
+        if (attempts === 1) throw new Error("partial ledger failure after update");
+      } });
+    hanging.release({ status: "completed", result: "full result despite ledger failure", sideEffects: false });
+    await fixture.settleRuns();
+    expect(applied).toBe(true);
+    const reads = await Promise.all([Promise.resolve().then(() => workerResult(handle.instanceId)),
+      Promise.resolve().then(() => workerResult(handle.instanceId))]);
+    expect(reads[0]).toBe(reads[1]);
+    expect(attempts).toBe(1);
+    const envelope = bound.results[0];
+    observeWorkerResults(bound.token, true);
+    expect(workerHandoff(handle.instanceId)).toMatchObject({ bookkeeping: "blocked", delivery: "incorporated", continuation: "observed" });
+    expect(listObservations().find(row => row.id === handle.instanceId)?.resultTaken).not.toBe(true);
+    settleWorkerResults(bound.token, true);
+    expect(attempts).toBe(2);
+    expect(bound.results).toEqual([envelope!]);
+    expect(workerHandoff(handle.instanceId)?.bookkeeping).toBe("reconciled");
+    expect(listObservations().find(row => row.id === handle.instanceId)?.resultTaken).toBe(true);
+    for (let i = 0; i < 3; ++i) settleWorkerResults(bound.token, true);
+    expect(attempts).toBe(2);
+  }));
+
+  for (const outcome of ["aborted", "error"] as const) {
+    test(`parent ${outcome} permits result drafts but no forced continuation until an external run`, fixture.ownedCase(`parent ${outcome}`, async () => {
+      const bound = owner(false);
+      bindBackgroundOwner(bound);
+      const hanging = hang();
+      const handle = await spawnBackground({ roleId: "developer", task: "work", cwd: packageRoot(),
+        executor: hanging.executor, load: load() });
+      restrictWorkerContinuation(bound.token, outcome);
+      hanging.release({ status: "completed", result: "settled after parent termination", sideEffects: false });
+      await fixture.settleRuns();
+      const drafts = draftWorkerResults(bound.token, outcome)!;
+      expect(drafts.continue).toBe(false);
+      bound.branch.push(...drafts.entries);
+      settleWorkerResults(bound.token, true);
+      expect(workerHandoff(handle.instanceId)).toMatchObject({ delivery: "incorporated", continuation: "blocked-unconfirmed" });
+      expect(bound.wakes).toEqual([]);
+      expect(listObservations().find(row => row.id === handle.instanceId)?.resultTaken).not.toBe(true);
+      externallyStartedWorkerOwner(bound.token);
+      observeWorkerResults(bound.token, true);
+      expect(listObservations().find(row => row.id === handle.instanceId)?.resultTaken).toBe(true);
+      expect(bound.results).toEqual([]);
+    }));
+  }
+
+  test("captured lease retirement fences pending results and callbacks without retargeting", fixture.ownedCase("handoff lease retirement", async () => {
+    const old = owner(false);
+    let live = true, books = 0, releases = 0;
+    old.owns = () => live;
+    bindBackgroundOwner(old);
+    const first = hang(), late = hang();
+    const firstHandle = await spawnBackground({ roleId: "developer", task: "first", cwd: packageRoot(),
+      executor: first.executor, load: load(), reconcileBookkeeping() { ++books; } });
+    await spawnBackground({ roleId: "developer", task: "late", cwd: packageRoot(),
+      executor: late.executor, load: load(), reconcileBookkeeping() { ++books; },
+      teamOwner: { token: old.token, assignmentId: "late-assignment", onSettled() { ++releases; } } });
+    first.release({ status: "completed", result: "first", sideEffects: false });
+    // Await the settled result while the independently owned late attempt remains active.
+    await waitFor(firstHandle.instanceId);
+    expect(books).toBe(1);
+    expect(releases).toBe(0);
+    live = false;
+    revokeBackgroundOwner(old.token);
+    const fresh = owner(true);
+    bindBackgroundOwner(fresh);
+    late.release({ status: "completed", result: "late", sideEffects: false });
+    await fixture.settleRuns();
+    settleWorkerResults(old.token, true);
+    settleWorkerResults(fresh.token, true);
+    expect(books).toBe(1);
+    expect(releases).toBe(0);
+    expect(old.results).toEqual([]);
+    expect(fresh.results).toEqual([]);
+    expect(fresh.wakes).toEqual([]);
+  }));
+  test("receipt observation cannot admit effects after its branch callback retires the captured lease", fixture.ownedCase("receipt callback retirement", async () => {
+    const bound = owner(false);
+    bindBackgroundOwner(bound);
+    const hanging = hang();
+    const handle = await spawnBackground({ roleId: "developer", task: "work", cwd: packageRoot(),
+      executor: hanging.executor, load: load() });
+    hanging.release({ status: "completed", result: "captured result", sideEffects: false });
+    await fixture.settleRuns();
+    const draft = draftWorkerResults(bound.token, "completed")!;
+    bound.getBranch = () => {
+      revokeBackgroundOwner(bound.token);
+      return draft.entries;
+    };
+    observeWorkerResults(bound.token, true);
+    expect(workerHandoff(handle.instanceId)).toMatchObject({ delivery: "offered", continuation: "requested" });
+    expect(listObservations().find(row => row.id === handle.instanceId)?.resultTaken).not.toBe(true);
+    expect(bound.wakes).toEqual([]);
+  }));
   test("spawn returns while the executor is pending", fixture.ownedCase("spawn returns while the executor is pending", async () => {
     const hanging = hang();
     const handle = await spawnBackground({
@@ -304,7 +610,7 @@ describe("background registry", () => {
     expect(workerResult(second.instanceId).instanceId).toBe(second.instanceId);
   }));
 
-  test("completion is one compact signal and shutdown drops a late settle", fixture.ownedCase("completion is one compact signal and shutdown drops a late settle", async () => {
+  test("completion is one full result and shutdown drops a late settle", fixture.ownedCase("completion and shutdown", async () => {
     const bound = owner(true);
     bindBackgroundOwner(bound);
     const hanging = hang();
@@ -318,19 +624,11 @@ describe("background registry", () => {
     });
     hanging.release({ status: "completed", result: "SECRET-RESULT", sideEffects: false });
     await waitFor(handle.instanceId);
-    expect(bound.wakes).toEqual([
-      completionText({
-        instanceId: handle.instanceId,
-        roleId: "developer",
-        status: "completed",
-        interest: { planId: "background-agent-delegation", unitId: "T2" },
-        channel: "wake",
-      }),
-    ]);
+    expect(bound.results).toHaveLength(1);
+    expect(bound.results[0]?.content).toBe("SECRET-RESULT");
+    expect(bound.results[0]?.details.planId).toBe("background-agent-delegation");
+    expect(bound.wakes).toHaveLength(1);
     expect(bound.wakes[0]).not.toContain("SECRET-RESULT");
-    expect(deliveryFor(false, true)).toBe("notify");
-    expect(deliveryFor(true, false)).toBe("hold");
-    expect(deliveryFor(true, true)).toBe("wake");
 
     const late = hang();
     const held = owner(false);
@@ -364,21 +662,86 @@ describe("background registry", () => {
       load: load(),
       watch: { planId: "background-agent-delegation", unitId: "T3" },
     });
-    hanging.release({ status: "failed", result: "SECRET-RESULT", sideEffects: false });
+    hanging.release({ status: "failed", result: "SECRET-RESULT", error: "SECRET-RESULT", sideEffects: false });
     await waitFor(handle.instanceId);
-    expect(takeHeldCompletions(Symbol("other"))).toBeUndefined();
+    settleWorkerResults(Symbol("other"), true);
+    expect(bound.results).toEqual([]);
     expect(workerStatus(handle.instanceId)).toHaveLength(1);
     shutdownBackground(Symbol("other"));
     expect(workerStatus(handle.instanceId)[0]?.status).toBe("failed");
     bound.isIdle = () => true;
-    const text = takeHeldCompletions(bound.token);
-    expect(text).toContain(handle.instanceId);
-    expect(text).not.toContain("SECRET-RESULT");
-    expect(takeHeldCompletions(bound.token)).toBeUndefined();
+    settleWorkerResults(bound.token, true);
+    expect(bound.results[0]?.content).toBe("SECRET-RESULT");
+    observeWorkerResults(bound.token, true);
+    settleWorkerResults(bound.token, true);
+    expect(bound.results).toHaveLength(1);
   }));
 });
 
 describe("background tools", () => {
+  test("public terminal boundaries handle stale-idle compaction/tree and post-snapshot completion without restarting aborted/error parents", fixture.ownedCase("terminal adapter boundaries", async () => {
+    const handlers = new Map<string, Function>(), branch: unknown[] = [], sent: { message: ResultMessage | { customType: string; content: string }; options: { triggerTurn: boolean } }[] = [];
+    const pi = {
+      registerFlag() {}, registerCommand() {}, registerTool() {}, getFlag() {}, getAllTools: () => [],
+      getActiveTools: () => [], setActiveTools() {}, getSessionName() {}, setSessionName() {},
+      on(name: string, handler: Function) { handlers.set(name, handler); },
+      sendMessage(message: ResultMessage, options: { triggerTurn: boolean }) {
+        sent.push({ message, options });
+        if (!options.triggerTurn) branch.push({ type: "custom_message", ...message });
+      },
+    };
+    pitako(pi as unknown as ExtensionAPI);
+    const ctx = { cwd: packageRoot(), hasUI: false, isIdle: () => false, signal: undefined as AbortSignal | undefined,
+      ui: { notify() {}, setStatus() {} }, sessionManager: { getSessionId: () => "terminal-parent", getBranch: () => branch } };
+    await handlers.get("session_start")!({}, ctx);
+    const finish = async (text: string) => {
+      const hanging = hang();
+      const handle = await spawnBackground({ roleId: "developer", task: text, cwd: packageRoot(), load: load(), executor: hanging.executor });
+      hanging.release({ status: "completed", result: text, sideEffects: false });
+      await fixture.settleRuns();
+      return handle.instanceId;
+    };
+    const compacted = await finish("manual compaction result");
+    await handlers.get("session_compact")!({ reason: "threshold" }, ctx);
+    expect(sent).toEqual([]);
+    await handlers.get("session_compact")!({ reason: "manual" }, ctx);
+    expect(sent.map(item => item.options.triggerTurn)).toEqual([false, true]);
+    await handlers.get("turn_start")!({}, ctx);
+    expect(workerHandoff(compacted)?.continuation).toBe("observed");
+    const tree = await finish("tree result");
+    await handlers.get("session_tree")!({}, ctx);
+    expect(sent.map(item => item.options.triggerTurn)).toEqual([false, true, false, true]);
+    await handlers.get("turn_start")!({}, ctx);
+    expect(workerHandoff(tree)?.continuation).toBe("observed");
+    // The worker finishes after the final pre-settlement snapshot.
+    expect(await handlers.get("agent_before_settle")!({ outcome: "completed", context: { canContinue: false } }, ctx)).toBeUndefined();
+    const late = await finish("post-snapshot result");
+    await handlers.get("agent_settled")!({}, ctx);
+    expect(workerHandoff(late)).toMatchObject({ delivery: "incorporated", continuation: "requested" });
+    expect(sent).toHaveLength(6);
+    await handlers.get("turn_start")!({}, ctx);
+    // Abort skips the pre-settle boundary; the public final events still fence wakes.
+    const abort = new AbortController();
+    abort.abort();
+    ctx.signal = abort.signal;
+    await handlers.get("agent_end")!({ messages: [] }, ctx);
+    const aborted = await finish("settled after skipped parent abort");
+    await handlers.get("agent_settled")!({}, ctx);
+    expect(sent).toHaveLength(7);
+    expect(workerHandoff(aborted)).toMatchObject({ delivery: "incorporated", continuation: "blocked-unconfirmed" });
+    ctx.signal = undefined;
+    await handlers.get("before_agent_start")!({ prompt: "new authorized run", systemPrompt: "" }, ctx);
+    await handlers.get("turn_start")!({}, ctx);
+    expect(workerHandoff(aborted)?.continuation).toBe("observed");
+    await handlers.get("message_end")!({ message: { role: "assistant", stopReason: "error" } }, ctx);
+    const failed = await finish("settled after parent error");
+    await handlers.get("agent_settled")!({}, ctx);
+    expect(sent).toHaveLength(8);
+    expect(workerHandoff(failed)).toMatchObject({ delivery: "incorporated", continuation: "blocked-unconfirmed" });
+    expect(listObservations().find(row => row.id === failed)?.resultTaken).not.toBe(true);
+    await handlers.get("session_shutdown")!({}, ctx);
+  }));
+
   test("spawn tool returns before the executor finishes and does not steer", fixture.ownedCase("spawn tool returns before the executor finishes and does not steer", async () => {
     process.env.PI_CODING_AGENT_DIR = load().env?.PI_CODING_AGENT_DIR;
     const hanging = hang();
@@ -386,6 +749,7 @@ describe("background tools", () => {
     const tools = new Map<string, { execute: Function }>();
     const sent: unknown[] = [];
     const handlers = new Map<string, Function>();
+    const branch: unknown[] = [];
     let idle = false;
     const pi = {
       registerTool(def: { name: string; execute: Function }) {
@@ -393,6 +757,8 @@ describe("background tools", () => {
       },
       sendMessage(message: unknown, options: unknown) {
         sent.push({ message, options });
+        if (!(options as { triggerTurn?: boolean }).triggerTurn)
+          branch.push({ type: "custom_message", ...(message as object) });
       },
       on(event: string, handler: Function) {
         const previous = handlers.get(event);
@@ -419,7 +785,9 @@ describe("background tools", () => {
     };
     agentInstance(pi as unknown as ExtensionAPI);
     pitako(pi as unknown as ExtensionAPI);
-    await handlers.get("session_start")?.({}, { hasUI: true, isIdle: () => idle, ui: { notify() {}, setStatus() {} }, sessionManager: { getSessionId: () => "parent" } });
+    const ctx = { cwd: packageRoot(), hasUI: false, isIdle: () => idle, ui: { notify() {}, setStatus() {} },
+      sessionManager: { getSessionId: () => "parent", getBranch: () => branch } };
+    await handlers.get("session_start")?.({}, ctx);
     const spawn = tools.get("agent_spawn");
     if (!spawn) throw new Error("agent_spawn missing");
     const result = await spawn.execute("call", { role: "developer", task: "change the widget", plan: "background-agent-delegation-test-only", unit: "T3" }, new AbortController().signal, undefined, { cwd: packageRoot() });
@@ -435,12 +803,20 @@ describe("background tools", () => {
     hanging.release({ status: "completed", result: "SECRET-RESULT", sideEffects: false });
     await waitFor(result.details.instanceId);
     expect(sent).toEqual([]);
+    const drafted = await handlers.get("agent_before_settle")?.({ outcome: "completed", context: { canContinue: false } }, ctx);
+    expect(drafted.continue).toBe(true);
+    expect(drafted.entries[0].content).toBe("SECRET-RESULT");
+    expect(sent).toHaveLength(0);
+    expect(workerHandoff(result.details.instanceId)?.delivery).toBe("offered");
+    branch.push(...drafted.entries);
+    await handlers.get("context")?.({ messages: [] }, ctx);
+    expect(workerHandoff(result.details.instanceId)?.delivery).toBe("incorporated");
+    expect(workerHandoff(result.details.instanceId)?.continuation).toBe("requested");
+    await handlers.get("turn_start")?.({}, ctx);
+    expect(workerHandoff(result.details.instanceId)?.continuation).toBe("observed");
     idle = true;
-    handlers.get("agent_settled")?.();
-    expect(sent).toHaveLength(1);
-    expect(JSON.stringify(sent[0])).not.toContain("steer");
-    expect(JSON.stringify(sent[0])).toContain("followUp");
-    expect(JSON.stringify(sent[0])).not.toContain("SECRET-RESULT");
+    await handlers.get("agent_settled")?.({}, ctx);
+    expect(sent).toHaveLength(0);
     const childHandlers = new Map<string, Function>();
     pitako({
       ...pi,

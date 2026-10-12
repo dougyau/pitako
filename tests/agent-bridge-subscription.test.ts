@@ -7,7 +7,7 @@ import { createAgentController } from "../extensions/agent/controller.ts";
 import { createAgentBridge } from "../extensions/agent/bridge/broker.ts";
 import { connect, type ChangeHint } from "../extensions/agent/bridge/client.js";
 import { isNotification, isReply, isRequest, replyBytes } from "../extensions/agent/bridge/protocol.js";
-import { clearObservations, noteResultTaken, observationEpoch, publishObservation, removeObservation,
+import { clearObservations, noteHandoff, noteResultTaken, observationEpoch, publishObservation, removeObservation,
   touchObservation } from "../extensions/agent/observe.ts";
 import { beginTeamEvaluation, retireTeamEvaluation } from "../extensions/team.ts";
 
@@ -82,10 +82,18 @@ test("only current owner/Team rows drive revisions; retained removal and consump
       const first = await subscription.refresh();
       expect(first.items.map(item => item.id)).toEqual(["owned", "team"]);
       expect(first.revision).toBe(2);
+      noteHandoff("owned", { collection: "collected", bookkeeping: "blocked", delivery: "incorporated",
+        continuation: "requested", bookkeepingDiagnostic: "private diagnostic" });
+      const retained = await subscription.refresh();
+      expect(retained.items[0]?.handoff).toEqual({
+        collection: "collected", bookkeeping: "blocked", delivery: "incorporated", continuation: "requested",
+      });
+      expect(retained.items[0]?.resultTaken).not.toBe(true);
+      expect(retained.items[0]?.handoff).not.toHaveProperty("bookkeepingDiagnostic");
       noteResultTaken("owned"); removeObservation("owned");
       const second = await subscription.refresh();
       expect(second.items.map(item => item.id)).toEqual(["team"]);
-      expect(second.revision).toBe(4);
+      expect(second.revision).toBe(5);
       retireTeamEvaluation(evaluation);
       expect((await subscription.refresh()).items).toEqual([]);
       const captured = observationEpoch();
@@ -297,4 +305,16 @@ test("v1 subscription shapes bound complete envelopes, reject malformed revision
     result: { subscriptionId: hint.subscriptionId, snapshot: { revision: 0, owner, items: [], cursor: null } } };
   expect(isReply(reply, "subscribe")).toBe(true);
   expect(Buffer.byteLength(JSON.stringify(reply) + "\n")).toBeLessThan(replyBytes);
+  const item = { id: "worker", roleId: "developer", status: "failed", task: "ordinary",
+    selectedModel: "fixture/local", sdkRequest: null, acceptedAt: 1, activity: "end", phase: "idle",
+    resultTaken: false, handoff: {
+      collection: "collected", bookkeeping: "blocked", delivery: "incorporated", continuation: "blocked-unconfirmed",
+    } };
+  const withItem = (value: unknown) => ({ ...reply,
+    result: { ...reply.result, snapshot: { ...reply.result.snapshot, items: [value] } } });
+  expect(isReply(withItem(item), "subscribe")).toBe(true);
+  for (const changed of [{ collection: "uncollected" }, { bookkeeping: "accepted" }, { delivery: "preview" },
+    { continuation: "processed" }, { result: "private text" }])
+    expect(isReply(withItem({ ...item, handoff: { ...item.handoff, ...changed } }), "subscribe")).toBe(false);
+  expect(isReply(withItem({ ...item, resultTaken: "yes" }), "subscribe")).toBe(false);
 });

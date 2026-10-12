@@ -211,7 +211,7 @@ export function createAgentController(owner: AgentControllerOwner, current: () =
           let reason: string | undefined;
           try { selection = selectionFor(row); } catch (error) { reason = String(error); }
           const metadata = textPage(JSON.stringify({ id: row.id, roleId: row.roleId, source: row.origin?.source,
-            assignmentId: row.origin?.assignmentId, task: row.task,
+            assignmentId: row.origin?.assignmentId, task: row.task, handoff: row.handoff, resultTaken: row.resultTaken,
             selected: { model: row.selectedModel, requestedModel: row.requestedModel, reasoning: row.requestedReasoning,
               fast: { state: "unavailable", reason: "Fast intent is not retained in the selected-settings observation" } },
             activated: row.activated ?? { state: "unavailable", reason: "No observed activation for this attempt" },
@@ -298,7 +298,9 @@ export function createAgentController(owner: AgentControllerOwner, current: () =
               requestedModel: row.requestedModel, requestedReasoning: row.requestedReasoning,
               activated: row.activated, sdkRequest: currentRequest(row), acceptedAt: row.acceptedAt,
               terminalAt: row.terminalAt, activity: row.lastActivityKind, phase: row.phase,
-              profile: row.origin?.routing?.profile };
+              profile: row.origin?.routing?.profile, resultTaken: row.resultTaken,
+              handoff: row.handoff && { collection: row.handoff.collection, bookkeeping: row.handoff.bookkeeping,
+                delivery: row.handoff.delivery, continuation: row.handoff.continuation } };
             if (items.length === 50) break;
             if (Buffer.byteLength(JSON.stringify([...items, item])) > byteBudget) {
               if (!items.length) throw new RangeError("worker metadata exceeds list page budget");
@@ -326,7 +328,7 @@ export function createAgentController(owner: AgentControllerOwner, current: () =
           }
           return structuredClone({ id: row.id, roleId: row.roleId, status: row.status, observation,
             identity: { coordinatorSessionId: owner.sessionId, source: row.origin?.source, assignmentId: row.origin?.assignmentId },
-            workbrief: original,
+            workbrief: original, resultTaken: row.resultTaken, handoff: row.handoff,
             teamWrapper: row.origin?.source === "team_assign" ? row.task.split("\nWorkBrief:")[0]!.slice(0, 1024) : undefined,
             route: routeSummary(row), selected: { model: row.selectedModel, reasoning: row.requestedReasoning,
               requestedModel: row.requestedModel, attemptId: row.attemptId },

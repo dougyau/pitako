@@ -7,10 +7,13 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import agentInstance from "../extensions/agent/index.ts";
 import {
   cancelAllWorkers,
+  bindBackgroundOwner,
   clearBackgroundOwner,
   formatWorkerViews,
   setBackgroundExecutor,
   spawnBackground,
+  observeWorkerResults,
+  type ResultMessage,
   workerResult,
   workerStatus,
 } from "../extensions/agent/background.ts";
@@ -208,7 +211,11 @@ describe("T2 observations", () => {
     expect(footerApplied).toContain("fallback-1");
   }));
 
-  test("agent_result text unchanged and observation becomes taken", fixture.ownedCase("agent_result text unchanged and observation becomes taken", async () => {
+  test("agent_result is complete and idempotent but only the owning turn acknowledges handoff", fixture.ownedCase("result read versus handoff", async () => {
+    const token = Symbol("observation owner"), branch: unknown[] = [];
+    bindBackgroundOwner({ token, isIdle: () => true, hasUI: false, notify() {}, sendMessage() {},
+      appendResult(message: ResultMessage) { branch.push({ type: "custom_message", ...message }); },
+      getBranch: () => branch });
     let release!: (attempt: { status: "completed"; result: string; sideEffects: false }) => void;
     const gate = fixture.pendingAttempt((resolve) => {
       release = resolve;
@@ -225,7 +232,7 @@ describe("T2 observations", () => {
       },
     });
     release({ status: "completed", result: "SECRET-BODY", sideEffects: false });
-    await waitSettled(handle.instanceId);
+    await fixture.settleRuns();
     const before = listObservations().find((item) => item.id === handle.instanceId);
     expect(before?.status).toBe("completed");
     expect(before?.resultTaken).toBeFalsy();
@@ -237,10 +244,13 @@ describe("T2 observations", () => {
     expect(outcome.result).toBe("SECRET-BODY");
 
     const after = listObservations().find((item) => item.id === handle.instanceId);
-    expect(after?.resultTaken).toBe(true);
+    expect(after?.resultTaken).toBeFalsy();
+    expect(after?.handoff).toMatchObject({ collection: "collected", delivery: "incorporated", continuation: "requested" });
     // Second read still same result object fields.
     expect(workerResult(handle.instanceId).result).toBe("SECRET-BODY");
     expect(formatAgentResult(workerResult(handle.instanceId))).toBe(text);
+    observeWorkerResults(token, true);
+    expect(listObservations().find(item => item.id === handle.instanceId)?.resultTaken).toBe(true);
   }));
 
   test("agent_status text still comes from formatWorkerViews only", fixture.ownedCase("agent_status text still comes from formatWorkerViews only", async () => {
