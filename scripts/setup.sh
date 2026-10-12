@@ -4,6 +4,13 @@
 set -euo pipefail
 cd -- "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 
+skip_codegraph=false
+case "$#:${1:-}" in
+  0:) ;;
+  1:--skip-codegraph) skip_codegraph=true ;;
+  *) echo "Usage: bash scripts/setup.sh [--skip-codegraph]" >&2; exit 1 ;;
+esac
+
 for runtime in git node bun; do
   command -v "$runtime" >/dev/null || { echo "setup requires $runtime on PATH" >&2; exit 1; }
 done
@@ -55,6 +62,8 @@ for (const [name, Database] of [
   console.log(`${name}: closed`);
 }
 NODE
+
+if "$skip_codegraph"; then exit 0; fi
 
 # Optional navigation preparation, only after all dependency prerequisites pass.
 # Match CodeGraph's single-segment CODEGRAPH_DIR override without loading its SDK.
