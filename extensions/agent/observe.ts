@@ -2,6 +2,7 @@
 
 import { formatFooter, nextFooterRefreshMs, type AgentUiSnapshot } from "./ui.ts";
 import { readActivitySnapshot, type ActivityPage, type ActivityReadOptions, type TerminalActivitySnapshot } from "./live.ts";
+import type { WorkerHandoff } from "./background.ts";
 
 export interface TerminalActivityKey {
   ownerToken: symbol;
@@ -107,7 +108,8 @@ export function publishObservation(row: AgentUiSnapshot, epoch = observationEpoc
     activity.state = "unavailable";
     activity.reason = "not_captured";
   }
-  state.rows.set(row.id, { ...row });
+  const previous = state.rows.get(row.id);
+  state.rows.set(row.id, { ...row, ...(previous?.handoff ? { handoff: previous.handoff, resultTaken: previous.resultTaken } : {}) });
   changed(row);
   notify();
 }
@@ -118,6 +120,15 @@ export function noteResultTaken(id: string): void {
   if (!row || row.resultTaken) return;
   state.rows.set(id, { ...row, resultTaken: true });
   changed(state.rows.get(id)!);
+  notify();
+}
+
+export function noteHandoff(id: string, handoff: WorkerHandoff): void {
+  const state = observations(), row = state.rows.get(id);
+  if (!row) return;
+  const next = { ...row, handoff };
+  state.rows.set(id, next);
+  changed(next);
   notify();
 }
 

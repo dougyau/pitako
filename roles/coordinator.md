@@ -11,6 +11,7 @@ Understand what the user wants, decide which roles are needed, and synthesize th
 - State the mission in concrete terms.
 - Name the specialist roles that should eventually handle parts of it.
 - Keep the shared record short enough to read.
+- Interpret complete background results automatically supplied in context. `team_result` and `agent_result` are optional diagnostic re-reads, not transport or acknowledgement. Do not poll. Handoff does not accept the work or expand specialist authority.
 
 ## Boundaries
 

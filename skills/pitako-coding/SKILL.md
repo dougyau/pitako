@@ -94,7 +94,7 @@ Do not use the Board as a transcript, scratchpad, TODO list, or progress log. `t
 
 ## Roles
 
-`/pitako roles` and `/pitako role <id>` show role definitions. A role is a responsibility template; its `ModelPolicy` selects the instance's primary model and fallbacks. `agent_run` executes one isolated instance synchronously. The foreground session uses `team_assign`, `team_status`, `team_result`, and `team_cancel` for Team work; `/pitako team` inspects its roster. Use `team_assign` only for independent work. Child instances do not receive orchestration tools. If delegation fails, report the error; do not take over that specialist work.
+`/pitako roles` and `/pitako role <id>` show role definitions. A role is a responsibility template; its `ModelPolicy` selects the instance's primary model and fallbacks. `agent_run` executes one isolated instance synchronously. The foreground session uses `team_assign`, `team_status`, `team_result`, and `team_cancel` for Team work; `/pitako team` inspects its roster. Use `team_assign` only for independent work. Complete background results are supplied automatically in the owning context, with or without plan/unit correlation. Interpret them; do not poll or acknowledge collection. `team_result` and `agent_result` are optional complete diagnostic re-reads. Automatic handoff is not work acceptance or unit completion. Child instances do not receive orchestration tools. If delegation fails, report the error; do not take over that specialist work.
 
 ## Web access
 

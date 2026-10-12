@@ -21,7 +21,8 @@ interface Evaluation {
   sessionId: string;
   token: symbol;
   roles: Map<string, string>;
-  assignments: Map<string, { current?: TeamAssignment; last?: TeamAssignment }>;
+  assignments: Map<string, TeamAssignment>;
+  latest: Map<string, string>;
   hasRoster: boolean;
 }
 
@@ -48,7 +49,7 @@ export function beginTeamEvaluation(sessionId: string | undefined, child: boolea
     retireTeamWorkers(previous.token);
     state.evaluations.delete(sessionId);
   }
-  const evaluation = { sessionId, token, roles: new Map(), assignments: new Map(), hasRoster: false };
+  const evaluation = { sessionId, token, roles: new Map(), assignments: new Map(), latest: new Map(), hasRoster: false };
   state.evaluations.set(sessionId, evaluation);
   return evaluation;
 }
@@ -127,23 +128,27 @@ export function teamEvaluationForSession(sessionId: string | undefined, child: b
 export function recordTeamAssignment(evaluation: TeamEvaluation, roleId: string, assignment: TeamAssignment): void {
   const current = registry().evaluations.get(evaluation.sessionId);
   if (current?.token !== evaluation.token) throw new Error("stale Team evaluation");
-  const slot = current.assignments.get(roleId) ?? {};
-  slot.last = slot.current;
-  slot.current = assignment;
-  current.assignments.set(roleId, slot);
+  current.assignments.set(assignment.id, assignment);
+  current.latest.set(roleId, assignment.id);
 }
 
-export function teamAssignments(evaluation: TeamEvaluation): readonly { current?: TeamAssignment; last?: TeamAssignment }[] {
+export function teamAssignments(evaluation: TeamEvaluation): readonly TeamAssignment[] {
   const current = registry().evaluations.get(evaluation.sessionId);
   if (current?.token !== evaluation.token) throw new Error("stale Team evaluation");
-  return ["architect", "developer", "reviewer", "researcher"].map((role) => current.assignments.get(role) ?? {});
+  return [...current.assignments.values()];
+}
+
+export function latestTeamAssignment(evaluation: TeamEvaluation, role: string): TeamAssignment | undefined {
+  const current = registry().evaluations.get(evaluation.sessionId);
+  if (current?.token !== evaluation.token) throw new Error("stale Team evaluation");
+  const id = current.latest.get(role);
+  return id ? current.assignments.get(id) : undefined;
 }
 
 export function teamExecutionBinding(evaluation: TeamEvaluation | undefined, planId: string): ExecutionBinding | undefined {
   if (!evaluation) return undefined;
-  for (const slot of teamAssignments(evaluation)) {
-    const assignment = slot.current?.planId === planId ? slot.current : slot.last?.planId === planId ? slot.last : undefined;
-    if (assignment?.execution) return assignment.execution;
+  for (const assignment of [...teamAssignments(evaluation)].reverse()) {
+    if (assignment.planId === planId && assignment.execution) return assignment.execution;
   }
   return undefined;
 }
@@ -178,13 +183,17 @@ export function recordPlanTeamWork(
 
 /** A resolve must not mistake an unsettled or unsuccessful Team result for success. */
 export function hasUnsettledTeamWork(evaluation: TeamEvaluation | undefined, planId: string, cwd?: string, expectedBinding?: ExecutionBinding): boolean {
+  // Older assignments remain authoritative under their captured execution binding.
+  for (const assignment of evaluation ? teamAssignments(evaluation) : []) {
+    if (assignment.planId === planId && assignment.execution &&
+        readLedgerTeamHolds(assignment.execution.executionRoot, planId, assignment.execution).length > 0) return true;
+  }
   const binding = teamExecutionBinding(evaluation, planId) ?? expectedBinding;
   if (binding) return readLedgerTeamHolds(binding.executionRoot, planId, binding).length > 0;
   if (cwd) return readLedgerTeamHolds(cwd, planId).length > 0;
   if (!evaluation) return false;
-  for (const slot of teamAssignments(evaluation)) {
-    const assignment = slot.current?.planId === planId ? slot.current : slot.last?.planId === planId ? slot.last : undefined;
-    if (!assignment) continue;
+  for (const assignment of teamAssignments(evaluation)) {
+    if (assignment.planId !== planId) continue;
     try {
       if (!teamWorkerHasOutcome(evaluation.token, assignment.instanceId)) return true;
       if (teamWorkerStatus(evaluation.token, assignment.instanceId)[0]?.status !== "completed") return true;

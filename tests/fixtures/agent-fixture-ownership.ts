@@ -11,8 +11,10 @@ export function agentFixtureOwnership(options: { deferDirectories?: boolean } = 
   const run = agentRun.runAgentInstance;
   let finishers: Array<() => void> = [];
   let controllers: AbortController[] = [];
+  let runs: Promise<unknown>[] = [];
   return {
     ...fixture,
+    async settleRuns() { await Promise.all(runs); },
     finishOnCleanup(finish: () => void) { finishers.push(finish); },
     pendingAttempt(register: (finish: (attempt: agentRun.Attempt) => void) => void) {
       return new Promise<agentRun.Attempt>((resolve) => {
@@ -34,16 +36,19 @@ export function agentFixtureOwnership(options: { deferDirectories?: boolean } = 
           } });
           // Validation or the synchronous accept hook rejects before any SDK owner.
           // Preserve that rejection for the caller's negative-path assertions.
-          void fixture.run(pending.catch((error) => {
+          const tracked = fixture.run(pending.catch((error) => {
             if (!accepted && (error instanceof PitakoConfigError || error === acceptError)) return;
             throw error;
-          })).catch(() => {});
+          }));
+          runs.push(tracked);
+          void tracked.catch(() => {});
           return pending;
         });
         try {
           await fixture.ownedCase(name, async () => {
             finishers = [];
             controllers = [];
+            runs = [];
             fixture.beforeRelease(() => {
               cancelAllWorkers();
               for (const controller of controllers) controller.abort();

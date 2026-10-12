@@ -274,7 +274,8 @@ export class AgentScreen implements Component, Focusable {
       `${index === this.selected ? ">" : " "} ${row.id} · ${row.roleId} · ${row.profile ?? (row.roleId === "developer" ? "profile unavailable" : "profile not applicable")} · ${row.status}\n` +
       `  selected: ${row.selectedModel ?? "unknown"} · requested: ${row.requestedModel ?? "unknown"} / ${row.requestedReasoning ?? "unknown"}\n` +
       `  activated: ${json(row.activated)} · SDK request: ${json(row.sdkRequest)}\n` +
-      `  elapsed ${formatUiClock((row.terminalAt ?? Date.now()) - row.acceptedAt)} · ${row.phase} · ${row.activity} · ${row.task}`)
+      `  elapsed ${formatUiClock((row.terminalAt ?? Date.now()) - row.acceptedAt)} · ${row.phase} · ${row.activity} · ${row.task}` +
+      (row.handoff ? `\n  collected · delivery ${row.handoff.delivery} · bookkeeping ${row.handoff.bookkeeping} · continuation ${row.handoff.continuation}` : ""))
       : ["No workers"];
     const detail = this.detail;
     switch (sections[this.section]) {
@@ -288,7 +289,8 @@ export class AgentScreen implements Component, Focusable {
         "Captured route (no rerouting)", json(detail.route), ...(this.routePage ? ["Acknowledged raw route", json(this.routePage)] : ["a: acknowledge raw route"])];
       case "Receipts": return ["pending = attempt; queued = admission; handled = input hook consumption, not answer.",
         "candidateAnswer is a candidate only; adequacy not evaluated. unconfirmed/rejected are not delivery.",
-        json(detail.observation?.interactions), "SDK request provenance pages", json(this.requestPage)];
+        json(detail.observation?.interactions), "Worker result handoff (context and owning-turn observations, not work acceptance)",
+        json({ handoff: detail.handoff, resultTaken: detail.resultTaken }), "SDK request provenance pages", json(this.requestPage)];
       case "Native history": return ["Native worker source only; all branches/actions in physical order.",
         "Partial entries, persistence gaps, upstream truncation and unavailable external artifacts remain limits.",
         "Decoded fragment previews may split UTF-8; byteOffset/endsEntry and original base64 pages remain authoritative.",
@@ -359,12 +361,13 @@ export function compatibilityView(agents: readonly { id: string; role: string; s
   return {
     list: () => ({ items: agents.map(row => ({ id: row.id, roleId: row.role, status: "running", source: undefined,
       assignmentId: undefined, task: "", selectedModel: "unknown", requestedModel: undefined, requestedReasoning: undefined, activated: undefined, sdkRequest: null,
-      acceptedAt: Date.now(), terminalAt: undefined, activity: row.state, phase: "working", profile: undefined })),
+      acceptedAt: Date.now(), terminalAt: undefined, activity: row.state, phase: "working", profile: undefined,
+      resultTaken: undefined, handoff: undefined })),
     cursor: null, owner: { processId: "fixture", coordinatorSessionId: "fixture", epoch: "00000000-0000-0000-0000-000000000000" } }),
     detail: id => {
       const row = agents.find(row => row.id === id);
       if (!row) throw new Error(`unknown worker ${id}`);
-      return { id, roleId: row.role, status: "running", observation: null,
+      return { id, roleId: row.role, status: "running", observation: null, resultTaken: undefined, handoff: undefined,
         identity: { coordinatorSessionId: "fixture", source: undefined, assignmentId: undefined },
         workbrief: { text: `Identity: ${id}\nRole: ${row.role}\nState: ${row.state}`, offset: 0, nextOffset: null, source: "original WorkBrief" },
         teamWrapper: undefined, route: { state: "unavailable" }, selected: { model: "unknown", reasoning: undefined, requestedModel: undefined, attemptId: undefined },

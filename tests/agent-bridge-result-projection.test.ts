@@ -1,7 +1,7 @@
 import { stubExternalFactories } from "./fixtures/offline.ts";
 stubExternalFactories();
 import { afterEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { SessionManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -9,8 +9,8 @@ import { agentFixtureOwnership } from "./fixtures/agent-fixture-ownership.ts";
 import agentExtension from "../extensions/agent/index.ts";
 import {
   bindBackgroundOwner, cancelWorker, clearBackgroundOwner, readWorkerResult,
-  revokeBackgroundOwner, spawnBackground, takeHeldCompletions,
-  type BackgroundOwner, type LiveTarget, type WorkerReadScope, type WorkerResultRead,
+  deliverWorkerResults, observeWorkerResults, revokeBackgroundOwner, settleWorkerResults, spawnBackground,
+  type BackgroundOwner, type LiveTarget, type ResultMessage, type WorkerReadScope, type WorkerResultRead,
 } from "../extensions/agent/background.ts";
 import { listObservations } from "../extensions/agent/observe.ts";
 import { createAgentController } from "../extensions/agent/controller.ts";
@@ -42,15 +42,18 @@ function setup(idle = true, token = Symbol("projection-owner")) {
   writeFileSync(userConfigPath, '[model_policies.developer.primary]\nmodel = "example/primary"\nreasoning = "off"\n');
   const settled = deferred<void>();
   const notes: string[] = [], wakes: string[] = [];
+  const branch: unknown[] = [];
   const foreground: BackgroundOwner = {
     token, hasUI: true,
     // This callback runs from completion delivery after the outcome is stored.
     isIdle() { settled.resolve(); return idle; },
     notify(text) { notes.push(text); }, sendMessage(text) { wakes.push(text); },
+    appendResult(message: ResultMessage) { branch.push({ type: "custom_message", ...message }); },
+    getBranch: () => branch,
   };
   bindBackgroundOwner(foreground);
   return {
-    root, foreground, notes, wakes, settled,
+    root, foreground, notes, wakes, settled, branch,
     load: { userConfigPath, env: { PI_CODING_AGENT_DIR: root } },
     scope: { ownerToken: token, coordinatorSessionId: "projection-coordinator" },
   };
@@ -127,7 +130,8 @@ test("terminal observation is not an outcome; abort without settlement is explic
   expect(view.list().revision).toBeGreaterThan(displayRevision);
   expect(hints.at(-1)?.state).toBe("ready");
   expect(ready(readWorkerResult(target, env.scope))).toMatchObject({ status: "completed", text: { text: "not settled yet" } });
-  expect(env.notes).toHaveLength(1);
+  expect(env.notes).toEqual([]);
+  expect(env.branch).toMatchObject([{ content: "not settled yet" }]);
 }));
 
 test("a failed settled outcome is readable as failure, never fabricated empty success", fixture.ownedCase("projection failed outcome", async () => {
@@ -141,7 +145,7 @@ test("a failed settled outcome is readable as failure, never fabricated empty su
     .toMatchObject({ status: "failed", text: { text: "controlled failure" } });
 }));
 
-test("exact bounded UTF-16 pages survive held/sent/consumed states without history or completion writes", fixture.ownedCase("projection pages and consumption", async () => {
+test("exact bounded UTF-16 pages survive pending/incorporated/acknowledged states without passive writes", fixture.ownedCase("projection pages and handoff", async () => {
   const env = setup(false);
   const worker = hanging();
   const manager = SessionManager.create(env.root, path.join(env.root, "native"));
@@ -219,25 +223,28 @@ test("exact bounded UTF-16 pages survive held/sent/consumed states without histo
   expect(env.wakes).toEqual([]);
   expect(readFileSync(manager.getSessionFile()!)).toEqual(historyBefore);
   env.foreground.isIdle = () => true;
-  expect(takeHeldCompletions(env.foreground.token)).toContain(handle.instanceId);
-  expect(takeHeldCompletions(env.foreground.token)).toBeUndefined();
+  deliverWorkerResults(env.foreground.token);
+  expect(env.branch).toMatchObject([{ content: result }]);
   expect(ready(readWorkerResult(target, env.scope)).text.text).toBe(result.slice(0, 1024));
   const tool = tools().get("agent_result")!;
   const consumed = await tool.execute("result", { id: handle.instanceId }, new AbortController().signal, undefined,
     { cwd: env.root } as Parameters<typeof tool.execute>[4]);
   expect(consumed).not.toHaveProperty("isError", true);
-  const outcome = consumed.details as AgentRunResult;
-  const { result: _result, requests: _requests, ...expectedMetadata } = outcome;
+  const outcome = consumed.details as AgentRunResult & { handoff: unknown };
+  const { result: _result, requests: _requests, handoff: _handoff, ...expectedMetadata } = outcome;
   expect(metadata).toBe(JSON.stringify(expectedMetadata));
+  expect(listObservations().find(row => row.id === handle.instanceId)?.resultTaken).not.toBe(true);
+  observeWorkerResults(env.foreground.token, true);
   expect(listObservations().find(row => row.id === handle.instanceId)?.resultTaken).toBe(true);
   const consumedObservation = listObservations();
   for (let i = 0; i < 3; i++) expect(reconstruct("text")).toBe(result);
   expect(listObservations()).toEqual(consumedObservation);
-  expect(takeHeldCompletions(env.foreground.token)).toBeUndefined();
+  deliverWorkerResults(env.foreground.token);
+  expect(env.branch).toHaveLength(1);
   expect(readFileSync(manager.getSessionFile()!)).toEqual(historyBefore);
 }));
 
-test("Team reads preserve occupancy, assignments, workflow hold and normal result-tool consumption", fixture.ownedCase("projection Team contracts", async () => {
+test("Team reads preserve occupancy and assignments; automatic bookkeeping is independent of passive reads", fixture.ownedCase("projection Team contracts", async () => {
   const evaluation = beginTeamEvaluation("projection-coordinator", false)!;
   evaluations.push(evaluation);
   const env = setup(true, evaluation.token);
@@ -256,6 +263,7 @@ test("Team reads preserve occupancy, assignments, workflow hold and normal resul
     historyOrigin: { source: "team_assign", coordinatorSessionId: env.scope.coordinatorSessionId, assignmentId: "assignment" },
     watch: { planId: "projection", unitId: "T2" },
     teamOwner: { token: evaluation.token, assignmentId: "assignment", onSettled: admission.settled },
+    reconcileBookkeeping: result => recordPlanTeamWork(env.root, "projection", "T2", "assignment", result.status),
   });
   admission.commit();
   recordTeamAssignment(evaluation, "developer", {
@@ -287,6 +295,8 @@ test("Team reads preserve occupancy, assignments, workflow hold and normal resul
   expect(teamRoleReservation(evaluation, "developer")).toBeUndefined();
   expect(env.wakes).toHaveLength(1);
   const settledObservation = listObservations(evaluation.token);
+  const reconciledLedger = readFileSync(ledger);
+  expect(readLedgerTeamHolds(env.root, "projection")).toEqual([]);
   const wakesBefore = [...env.wakes];
   const unrelatedTeam = Symbol("registered unrelated Team");
   bindBackgroundOwner({ ...env.foreground, token: unrelatedTeam });
@@ -296,13 +306,15 @@ test("Team reads preserve occupancy, assignments, workflow hold and normal resul
   for (let i = 0; i < 3; i++) expect(ready(readWorkerResult(target, scope)).text.text).toBe("Team result");
   expect(teamRoleReservation(evaluation, "developer")).toBeUndefined();
   expect(teamAssignments(evaluation)).toEqual(slots);
-  expect(readFileSync(ledger)).toEqual(ledgerBefore);
+  expect(readFileSync(ledger)).toEqual(reconciledLedger);
   expect(listObservations(evaluation.token)).toEqual(settledObservation);
   expect(env.wakes).toEqual(wakesBefore);
   const tool = tools().get("team_result")!;
   const consumed = await tool.execute("result", { assignmentId: "assignment" }, new AbortController().signal, undefined,
     { cwd: env.root, sessionManager: { getSessionId: () => evaluation.sessionId } } as Parameters<typeof tool.execute>[4]);
   expect(consumed).not.toHaveProperty("isError", true);
+  expect(listObservations(evaluation.token).find(row => row.id === handle.instanceId)?.resultTaken).not.toBe(true);
+  observeWorkerResults(evaluation.token, true);
   expect(listObservations(evaluation.token).find(row => row.id === handle.instanceId)?.resultTaken).toBe(true);
   expect(readLedgerTeamHolds(env.root, "projection")).toEqual([]);
   const consumedLedger = readFileSync(ledger);
@@ -344,6 +356,57 @@ test("owner/coordinator fences deny foreign, missing and retired authority witho
   expect(listObservations().find(row => row.id === handle.instanceId)?.resultTaken).not.toBe(true);
 }));
 
+test("automatic ledger failure never hides the full tool result; captured bookkeeping recovers without another delivery or acceptance", fixture.ownedCase("projection partial ledger failure", async () => {
+  const evaluation = beginTeamEvaluation("projection-coordinator", false)!;
+  evaluations.push(evaluation);
+  const env = setup(true, evaluation.token);
+  const plan = planFile("projection", env.root), ledger = ledgerFile("projection", env.root);
+  mkdirSync(path.dirname(plan), { recursive: true });
+  mkdirSync(path.dirname(ledger), { recursive: true });
+  const planText = "---\nid: projection\nrevision: 1\nstatus: frozen\nboard_topic_id: 1\n---\nOwned ledger.\n";
+  writeFileSync(plan, planText);
+  writeFileSync(ledger, `---\nplan_id: projection\nrevision: 1\nhash: ${planHash(planText)}\nstatus: running\n---\n\n## Team Holds\n\n<!-- pitako-team-holds:v1 -->\n[]\n<!-- /pitako-team-holds -->\n`);
+  recordPlanTeamWork(env.root, "projection", "T2", "assignment", "pending");
+  const retainedLedger = readFileSync(ledger);
+  const admission = reserveTeamRole(evaluation, "developer", "assignment"), worker = hanging();
+  const handle = await spawnBackground({ roleId: "developer", task: "work", cwd: env.root, load: env.load, executor: worker.executor,
+    historyOrigin: { source: "team_assign", coordinatorSessionId: evaluation.sessionId, assignmentId: "assignment" },
+    teamOwner: { token: evaluation.token, assignmentId: "assignment", onSettled: admission.settled },
+    reconcileBookkeeping: result => recordPlanTeamWork(env.root, "projection", "T2", "assignment", result.status) });
+  admission.commit();
+  recordTeamAssignment(evaluation, "developer", { id: "assignment", instanceId: handle.instanceId, roleId: "developer", task: "work",
+    planId: "projection", unitId: "T2", boardTopicId: 1 });
+  rmSync(ledger);
+  const full = "\n漢😀e\u0301 ".repeat(3000) + "\n";
+  worker.finish({ status: "completed", result: full, sideEffects: false });
+  await fixture.settleRuns();
+  expect(teamRoleReservation(evaluation, "developer")).toBeUndefined();
+  const envelope = env.branch[0];
+  const resultTool = tools().get("team_result")!;
+  const context = { cwd: env.root, sessionManager: { getSessionId: () => evaluation.sessionId } } as Parameters<typeof resultTool.execute>[4];
+  const reads = await Promise.all([resultTool.execute("one", { assignmentId: "assignment" }, undefined, undefined, context),
+    resultTool.execute("two", { assignmentId: "assignment" }, undefined, undefined, context)]);
+  for (const read of reads) {
+    expect(read.isError).toBe(true);
+    const text = read.content.find(part => part.type === "text")!.text;
+    expect(text).toContain(full);
+    expect(text).toContain("Bookkeeping blocked:");
+  }
+  observeWorkerResults(evaluation.token, true);
+  expect(listObservations(evaluation.token).find(row => row.id === handle.instanceId)).toMatchObject({
+    handoff: { bookkeeping: "blocked", delivery: "incorporated", continuation: "observed" },
+  });
+  expect(listObservations(evaluation.token).find(row => row.id === handle.instanceId)?.resultTaken).not.toBe(true);
+  writeFileSync(ledger, retainedLedger);
+  settleWorkerResults(evaluation.token, true);
+  expect(readLedgerTeamHolds(env.root, "projection")).toEqual([]);
+  expect(readFileSync(ledger, "utf8")).toContain("status: running");
+  expect(listObservations(evaluation.token).find(row => row.id === handle.instanceId)?.resultTaken).toBe(true);
+  expect(env.branch).toEqual([envelope]);
+  expect(env.wakes).toHaveLength(1);
+  expect((await resultTool.execute("again", { assignmentId: "assignment" }, undefined, undefined, context)).isError).toBe(false);
+}));
+
 for (const missing of ["owner", "coordinator"] as const) {
   test(`a row missing captured ${missing} identity cannot expose its outcome`, fixture.ownedCase(`projection missing ${missing}`, async () => {
     const env = setup();
@@ -358,7 +421,7 @@ for (const missing of ["owner", "coordinator"] as const) {
     const target: LiveTarget = { kind: "background", instanceId: handle.instanceId };
     expect(readWorkerResult(target, env.scope)).toEqual({ state: "unavailable", reason: "unknown_target" });
     worker.finish({ status: "completed", result: "private", sideEffects: false });
-    await env.settled.promise;
+    await fixture.settleRuns();
     expect(readWorkerResult(target, env.scope)).toEqual({ state: "unavailable", reason: "unknown_target" });
     expect(listObservations().find(row => row.id === handle.instanceId)?.resultTaken).not.toBe(true);
   }));

@@ -6,12 +6,12 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { cancelTeamWorker, cancelWorker, shutdownBackground, spawnBackground, teamWorkerResult, teamWorkerStatus, workerResult, workerStatus } from "../extensions/agent/background.ts";
+import { cancelTeamWorker, cancelWorker, observeWorkerResults, shutdownBackground, spawnBackground, teamWorkerResult, teamWorkerStatus, workerResult, workerStatus, type ResultMessage } from "../extensions/agent/background.ts";
 import type { Attempt, AttemptExecutor } from "../extensions/agent/run.ts";
 import { bindBackgroundOwner, clearBackgroundOwner } from "../extensions/agent/background.ts";
 import { listObservations, publishObservation } from "../extensions/agent/observe.ts";
 import { registerExecution, unregisterExecution } from "../extensions/execution-identity.ts";
-import { beginTeamEvaluation, hasTeamRoster, hasUnsettledTeamWork, recordPlanTeamWork, reserveTeamRole, retireTeamEvaluation, teamEvaluationForSession, teamRoleReservation, teamAssignments } from "../extensions/team.ts";
+import { beginTeamEvaluation, hasTeamRoster, hasUnsettledTeamWork, latestTeamAssignment, recordPlanTeamWork, reserveTeamRole, retireTeamEvaluation, teamEvaluationForSession, teamRoleReservation, teamAssignments } from "../extensions/team.ts";
 import { openBoard } from "../extensions/board/store.ts";
 import { currentWorkspace, repositoryIdentity } from "../extensions/board/workspace.ts";
 import boardExtension from "../extensions/board/index.ts";
@@ -80,7 +80,10 @@ function load() {
 }
 
 function owner(token: symbol) {
-  return { token, isIdle: () => false, hasUI: false, notify() {}, sendMessage() {} };
+  const branch: (ResultMessage & { type: "custom_message" })[] = [];
+  return { token, isIdle: () => false, hasUI: false, notify() {}, sendMessage() {},
+    appendResult(message: ResultMessage) { branch.push({ type: "custom_message", ...message }); },
+    getBranch: () => branch };
 }
 
 function git(cwd: string, args: string[]): string {
@@ -112,6 +115,42 @@ async function spawn(evaluation: NonNullable<ReturnType<typeof beginTeamEvaluati
 const completed = (result = "done"): Attempt => ({ status: "completed", result, sideEffects: false });
 
 describe("Team T1 ownership", () => {
+  test("four successive role assignments remain exact-ID accessible while default status uses only the latest", fixture.ownedCase("exact assignment catalog", async () => {
+    const current = evaluation("team-exact-catalog");
+    bindBackgroundOwner(owner(current.token));
+    const config = load();
+    previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = config.env.PI_CODING_AGENT_DIR;
+    const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
+    agentExtension({ registerTool: (tool: any) => tools.set(tool.name, tool) } as unknown as ExtensionAPI);
+    let finish!: (attempt: Attempt) => void;
+    setBackgroundExecutor({ async start() { return fixture.pendingAttempt(resolve => { finish = resolve; }); } });
+    const root = mkdtempSync(path.join(tmpdir(), "pitako-team-catalog-"));
+    tempDirs.push(root);
+    const context = { cwd: root, sessionManager: { getSessionId: () => current.sessionId } };
+    const invoke = (name: string, params: unknown) => tools.get(name)!.execute("call", params, undefined, undefined, context);
+    const ids: string[] = [];
+    for (const [index, status] of (["completed", "failed", "cancelled", "completed"] as const).entries()) {
+      const accepted = await invoke("team_assign", { role: "researcher", task: `assignment ${index}`, plan: "catalog-plan", unit: `T${index}` });
+      expect(accepted.isError).toBe(false);
+      ids.push(accepted.details.id);
+      finish({ status, result: `result ${index}`, error: status === "failed" ? `result ${index}` : undefined, sideEffects: false });
+      await fixture.settleRuns();
+      expect(teamRoleReservation(current, "researcher")).toBeUndefined();
+    }
+    expect(teamAssignments(current).map(assignment => assignment.id)).toEqual(ids);
+    expect(latestTeamAssignment(current, "researcher")?.id).toBe(ids[3]);
+    expect((await invoke("team_status", {})).details.roles[3]).toMatchObject({ assignmentId: ids[3], status: "completed" });
+    for (const [index, id] of ids.entries()) {
+      const read = await invoke("team_result", { assignmentId: id });
+      expect(read.content[0].text).toContain(`result ${index}`);
+      expect(read.isError).toBe(index === 1 || index === 2);
+      expect((await invoke("team_status", { assignmentId: id })).details.roles[0]).toMatchObject({ assignmentId: id, resultAvailable: true });
+    }
+    expect(hasUnsettledTeamWork(current, "catalog-plan")).toBe(true);
+    expect((await invoke("team_result", { assignmentId: "foreign" })).isError).toBe(true);
+  }));
+
   test("ledger holds are exact, durable, and fail closed", fixture.ownedCase("ledger holds are exact, durable, and fail closed", () => {
     const cwd = mkdtempSync(path.join(tmpdir(), "pitako-team-holds-"));
     tempDirs.push(cwd);
@@ -186,12 +225,13 @@ describe("Team T1 ownership", () => {
     const second = evaluation("team-overlap-two");
     const firstMessages: string[] = [];
     const secondMessages: string[] = [];
-    bindBackgroundOwner({ ...owner(first.token), isIdle: () => true, sendMessage: (text) => firstMessages.push(text) });
+    const firstOwner = owner(first.token), secondOwner = owner(second.token);
+    bindBackgroundOwner({ ...firstOwner, isIdle: () => true, sendMessage: (text) => firstMessages.push(text) });
     const firstAdmission = reserveTeamRole(first, "developer", "first-assignment");
     const firstWorker = hanging();
     const firstHandle = await spawn(first, "developer", "first-assignment", firstWorker, firstAdmission.settled, { planId: "p", unitId: "u" });
     firstAdmission.commit();
-    bindBackgroundOwner({ ...owner(second.token), isIdle: () => true, sendMessage: (text) => secondMessages.push(text) });
+    bindBackgroundOwner({ ...secondOwner, isIdle: () => true, sendMessage: (text) => secondMessages.push(text) });
     const secondAdmission = reserveTeamRole(second, "researcher", "second-assignment");
     const secondWorker = hanging();
     const secondHandle = await spawn(second, "researcher", "second-assignment", secondWorker, secondAdmission.settled, { planId: "p", unitId: "u" });
@@ -199,12 +239,11 @@ describe("Team T1 ownership", () => {
     firstWorker.finish(completed());
     secondWorker.finish(completed());
     await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(firstMessages).toEqual([expect.stringContaining("first-assignment")]);
-    expect(secondMessages).toEqual([expect.stringContaining("second-assignment")]);
-    expect(firstMessages[0]).toContain("Use team_result");
-    expect(secondMessages[0]).toContain("Use team_result");
-    expect(firstMessages[0]).not.toContain(secondHandle.instanceId);
-    expect(secondMessages[0]).not.toContain(firstHandle.instanceId);
+    expect(firstMessages).toHaveLength(1);
+    expect(secondMessages).toHaveLength(1);
+    expect(firstOwner.getBranch()).toMatchObject([{ content: "done", details: { assignmentId: "first-assignment", instanceId: firstHandle.instanceId } }]);
+    expect(secondOwner.getBranch()).toMatchObject([{ content: "done", details: { assignmentId: "second-assignment", instanceId: secondHandle.instanceId } }]);
+    expect(firstMessages[0]).not.toContain("Use team_result");
   }));
 
   test("same-session reload retires only old Team rows and makes late settlement inert", fixture.ownedCase("same-session reload retires only old Team rows and makes late settlement inert", async () => {
@@ -273,21 +312,26 @@ describe("Team T1 ownership", () => {
     const tools = new Map<string, { execute: (...args: any[]) => Promise<any>; promptGuidelines?: string[] }>();
     const handlers = new Map<string, Function>();
     const sent: { message: any; options: any }[] = [];
+    const branch: unknown[] = [];
     const pi = {
       registerTool(tool: any) { tools.set(tool.name, tool); },
       registerFlag() {}, registerCommand() {},
       on(event: string, handler: Function) { if (!handlers.has(event)) handlers.set(event, handler); },
       getFlag() { return undefined; }, getAllTools() { return []; }, getActiveTools() { return []; },
       setActiveTools() {}, getSessionName() { return undefined; }, setSessionName() {},
-      sendMessage(message: any, options: any) { sent.push({ message, options }); },
+      sendMessage(message: any, options: any) {
+        sent.push({ message, options });
+        if (options.triggerTurn === false) branch.push({ type: "custom_message", ...message });
+      },
     };
     pitako(pi as unknown as ExtensionAPI);
     agentExtension(pi as unknown as ExtensionAPI);
     const sessionId = "team-plan-concurrent-wakes";
-    await handlers.get("session_start")?.({}, {
+    const hostContext = {
       hasUI: false, isIdle: () => idle, ui: { notify() {}, setStatus() {} },
-      sessionManager: { getSessionId: () => sessionId },
-    });
+      sessionManager: { getSessionId: () => sessionId, getBranch: () => branch },
+    };
+    await handlers.get("session_start")?.({}, hostContext);
     const current = teamEvaluationForSession(sessionId, false)!;
     evaluations.add(current);
     const cwd = mkdtempSync(path.join(tmpdir(), "pitako-team-planning-"));
@@ -296,7 +340,7 @@ describe("Team T1 ownership", () => {
       cwd, sessionManager: { getSessionId: () => sessionId },
     });
     const guidelines = tools.get("team_assign")?.promptGuidelines?.join(" ") ?? "";
-    expect(guidelines).toContain("plan");
+    expect(guidelines).toContain("automatically supplied");
     expect(guidelines).toContain("team_result");
     const architectResult = await invoke("team_assign", {
       role: "architect", task: "Architect planning task", plan: "plan-frozen-a", unit: "architect-review",
@@ -317,33 +361,37 @@ describe("Team T1 ownership", () => {
     }
     expect(teamWorkerStatus(current.token, researcher.instanceId)[0]?.status).toBe("completed");
     expect(sent).toEqual([]);
-    handlers.get("agent_settled")?.();
-    expect(sent).toEqual([]);
-
+    const boundary = handlers.get("agent_before_settle")?.({ outcome: "completed", context: { canContinue: false } }, hostContext);
+    expect(boundary).toMatchObject({ continue: true, entries: [{ content: "research result", details: { assignmentId: researcher.id } }] });
+    expect(listObservations(current.token).find(row => row.id === researcher.instanceId)?.resultTaken).not.toBe(true);
+    branch.push(...boundary.entries);
+    handlers.get("context")?.({}, hostContext);
+    expect(listObservations(current.token).find(row => row.id === researcher.instanceId)?.handoff?.delivery).toBe("incorporated");
+    handlers.get("turn_start")?.({}, hostContext);
+    expect(listObservations(current.token).find(row => row.id === researcher.instanceId)?.resultTaken).toBe(true);
     idle = true;
-    handlers.get("agent_settled")?.();
-    expect(sent).toHaveLength(1);
-    expect(sent[0]?.message.content).toContain(`assignment ${researcher.id}`);
-    expect(sent[0]?.message.content).not.toContain(architect.id);
-    expect(sent[0]?.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    handlers.get("agent_settled")?.({}, hostContext);
+    expect(sent).toEqual([]);
     const consumed = await invoke("team_result", { assignmentId: researcher.id });
     expect(consumed.content[0].text).toContain("research result");
-    handlers.get("agent_settled")?.();
-    expect(sent).toHaveLength(1);
+    handlers.get("agent_settled")?.({}, hostContext);
+    expect(sent).toEqual([]);
 
     workers.find((worker) => worker.task.includes("Architect planning task"))!.finish(completed("architect result"));
     for (let i = 0; i < 50 && teamWorkerStatus(current.token, architect.instanceId)[0]?.status !== "completed"; i++) {
       await new Promise((resolve) => setTimeout(resolve, 0));
     }
     expect(teamWorkerStatus(current.token, architect.instanceId)[0]?.status).toBe("completed");
-    const architectWakes = sent.filter((item) => item.message.content.includes(`assignment ${architect.id}`));
-    expect(architectWakes).toHaveLength(1);
-    expect(architectWakes[0]?.message.content).not.toContain(researcher.id);
-    expect(architectWakes[0]?.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    const architectResults = sent.filter((item) => item.message.customType === "pitako.worker.result");
+    expect(architectResults).toHaveLength(1);
+    expect(architectResults[0]?.message).toMatchObject({ content: "architect result", details: { assignmentId: architect.id } });
+    expect(architectResults[0]?.options).toEqual({ triggerTurn: false });
+    expect(sent[1]?.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    expect(sent[1]?.message.content).toContain("already supplied");
     expect(sent).toHaveLength(2);
   }));
 
-  test("public Team tools accept concurrent roles, isolate low-level controls, and cap results", fixture.ownedCase("public Team tools accept concurrent roles, isolate low-level controls, and cap results", async () => {
+  test("public Team tools accept concurrent roles, isolate low-level controls, and retain complete results", fixture.ownedCase("public Team tools and complete results", async () => {
     const current = evaluation("team-public-tools");
     let idle = false;
     const wakes: string[] = [];
@@ -387,11 +435,11 @@ describe("Team T1 ownership", () => {
     expect(workers[0]!.task).toContain(`Team ${current.sessionId}; role developer; assignment `);
     expect(workers[0]!.task).not.toContain("Board topic");
     expect(workers[0]!.task).toContain("WorkBrief:\nInspect lease");
-    expect(teamAssignments(current)[1]?.current?.boardTopicId).toBeUndefined();
+    expect(latestTeamAssignment(current, "developer")?.boardTopicId).toBeUndefined();
     expect((await invoke("team_assign", { role: "developer", task: "overlap" })).isError).toBe(true);
     const views = await invoke("team_status", {});
     expect((views.details as any).roles.map((row: any) => row.status)).toEqual(["idle", "running", "idle", "running"]);
-    const developer = teamAssignments(current)[1]?.current;
+    const developer = latestTeamAssignment(current, "developer");
     expect(developer).toBeDefined();
     publishObservation({
       id: developer!.instanceId, roleId: "developer", status: "running", phase: "working",
@@ -419,23 +467,23 @@ describe("Team T1 ownership", () => {
     });
     workers[1]!.finish(completed("research done"));
     await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(wakes.some((text) => text.includes("plan plan-a unit unit-a"))).toBe(true);
+    expect(wakes).toHaveLength(2);
     const ready = (await invoke("team_status", {})).details as any;
     expect(ready.roles[1]).toMatchObject({ status: "completed", resultAvailable: true });
     expect(ready.roles[0]).toMatchObject({ role: "architect", status: "idle" });
     const result = await invoke("team_result", { assignmentId: developer!.id });
-    expect(result.content[0].text.length).toBeLessThan(8100);
-    expect((result.details as any).truncated).toBe(true);
+    expect(result.content[0].text).toContain("x".repeat(9000));
+    expect(result.details).not.toHaveProperty("truncated");
     expect((result.details as any).usage).toMatchObject({
       tools: { edit: 1, write: 2, apply_patch: 3 },
     });
-    expect((await invoke("team_result", { assignmentId: teamAssignments(current)[3]?.current?.id })).content[0].text).toContain("research done");
-    expect(wakes.some((text) => text.includes(`assignment ${developer!.id}`) && text.includes("Use team_result"))).toBe(true);
+    expect((await invoke("team_result", { assignmentId: latestTeamAssignment(current, "researcher")?.id })).content[0].text).toContain("research done");
+    expect(wakes.every((text) => text.includes("already supplied"))).toBe(true);
     expect(wakes.some((text) => text.includes("Use agent_result"))).toBe(false);
     expect((await invoke("team_assign", { role: "developer", task: "Next task" })).isError).toBe(false);
     const cancelled = await invoke("team_assign", { role: "architect", task: "Cancel test", plan: "plan-a", unit: "cancel-test" });
     expect(cancelled.isError).toBe(false);
-    const reviewer = teamAssignments(current)[0]?.current!;
+    const reviewer = latestTeamAssignment(current, "architect")!;
     await workers.at(-1)!.started;
     expect((await invoke("team_cancel", { assignmentId: reviewer.id })).isError).toBe(false);
     const cancelledStatus = await invoke("team_status", { assignmentId: reviewer.id });
@@ -445,7 +493,7 @@ describe("Team T1 ownership", () => {
     expect(((await invoke("team_status", { assignmentId: reviewer.id })).details as any).roles[0].resultAvailable).toBe(true);
   }));
 
-  test("team_result returns stable per-assignment execution summaries after consumption", fixture.ownedCase("team_result returns stable per-assignment execution summaries after consumption", async () => {
+  test("team_result returns stable per-assignment execution summaries on diagnostic re-reads", fixture.ownedCase("Team diagnostic summaries", async () => {
     const current = evaluation("team-execution-summary");
     bindBackgroundOwner(owner(current.token));
     const config = load();
@@ -759,6 +807,7 @@ describe("Team T1 ownership", () => {
     writeFileSync(sourcePlan, planText);
     const opened = openExecutionPlan(id, execution);
     const current = evaluation("team-result-cwd-change");
+    bindBackgroundOwner(owner(current.token));
     const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
     boardExtension({ registerTool: (tool: any) => tools.set(tool.name, tool), registerFlag() {}, registerCommand() {}, on() {} } as unknown as ExtensionAPI);
     agentExtension({ registerTool: (tool: any) => tools.set(tool.name, tool) } as unknown as ExtensionAPI);
@@ -794,9 +843,8 @@ describe("Team T1 ownership", () => {
     expect(blockedLifecycle.content[0].text).toContain("Team work for this plan is pending");
 
     finish(completed("result"));
-    for (let i = 0; i < 50 && teamWorkerStatus(current.token, assignment.instanceId)[0]?.status !== "completed"; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    }
+    await fixture.settleRuns();
+    expect(readLedgerTeamHolds(execution, id, opened.binding)).toEqual([]);
     const result = await tools.get("team_result")!.execute("call", { assignmentId: assignment.id }, undefined, undefined, sourceCtx);
     expect(result.content[0].text).toContain(`execution summary: assignment=${assignment.id}`);
     expect(result.content[0].text).toMatch(/\n\nresult$/);
@@ -905,6 +953,7 @@ describe("Team T1 ownership", () => {
     writeFileSync(sourcePlan, `---\nid: ${id}\nrevision: 4\nstatus: frozen\nboard_topic_id: ${topic.id}\nexecution: expected\n---\n\nFrozen family plan.\n`);
 
     const current = evaluation("team-family-admission");
+    bindBackgroundOwner(owner(current.token));
     const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
     boardExtension({ registerTool: (tool: any) => tools.set(tool.name, tool), registerFlag() {}, registerCommand() {}, on() {} } as unknown as ExtensionAPI);
     agentExtension({ registerTool: (tool: any) => tools.set(tool.name, tool) } as unknown as ExtensionAPI);
@@ -935,9 +984,7 @@ describe("Team T1 ownership", () => {
     expect(pending.content[0].text).toContain("Team work for this plan is pending");
 
     finish(completed("B result"));
-    for (let i = 0; i < 50 && teamWorkerStatus(current.token, assignment.instanceId)[0]?.status !== "completed"; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    }
+    await fixture.settleRuns();
     const result = await tools.get("team_result")!.execute("result", { assignmentId: assignment.id }, undefined, undefined, context);
     expect(result.content[0].text).toContain(`execution summary: assignment=${assignment.id}`);
     expect(result.content[0].text).toMatch(/\n\nB result$/);
