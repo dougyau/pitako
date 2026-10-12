@@ -2,7 +2,8 @@ import { stubExternalFactories } from "./fixtures/offline.ts";
 stubExternalFactories();
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import * as acp from "billion-context-pi";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   DEFAULT_SKILL_NAMES,
@@ -21,6 +22,21 @@ function readRepo(relative: string): string {
 }
 
 describe("engineering-layer composition", () => {
+  test("ACP defaults disable implicit bash deadlines without starting the external runtime", async () => {
+    const factory = () => {};
+    const registration = spyOn(acp, "createAcpExtension").mockReturnValue(factory);
+    try {
+      const extension = await import("../extensions/acp.ts");
+      expect(registration).toHaveBeenCalledTimes(1);
+      expect(registration).toHaveBeenCalledWith({
+        delegate: false, autoUpdate: false, toolBashDefaultTimeout: 0,
+      });
+      expect(extension.default).toBe(factory);
+    } finally {
+      registration.mockRestore();
+    }
+  });
+
   test("declares curated resources without executing external extensions", () => {
     const manifest = JSON.parse(readRepo("package.json")).pi;
     expect(readRepo("skills/pre-pr/SKILL.md")).toContain("Prepare the current worktree");
@@ -115,16 +131,26 @@ describe("engineering-layer composition", () => {
     ]) expect(verify).toContain(contract);
   });
 
-  test("loaded execute and evidence guidance distinguish observation, input, and optional advice", async () => {
+  test("loaded workflows and evidence guidance distinguish background dependencies, input, and optional advice", async () => {
     const skillText = (name: string) => readRepo(name === "verify-behavior"
       ? "skills/practical/verify-behavior/SKILL.md" : `skills/${name}/SKILL.md`);
     const execute = skillText("execute");
     expect(execute).not.toContain("There is no steer into a running worker");
+    for (const workflow of [skillText("plan"), execute]) {
+      for (const contract of [
+        "use background dispatch", "supersedes generic tool prompts",
+        "use `agent_spawn` only when Team is not registered",
+        "No synchronous fallback, inline specialist work, or waived review",
+        "original WorkBrief", "foreground-only", 'intent: "query"', 'intent: "steer"',
+        "historyId", "sessionId", "never interrupts a running command",
+        "queued", "handled", "rejected", "unconfirmed",
+        "Neither `queued` nor `handled` proves correction or replaces a new consultation",
+      ]) expect(workflow).toContain(contract);
+      expect(workflow).toMatch(/reobserve after native replacement/i);
+    }
     for (const contract of [
       "Keep at most one Developer role active, without exception",
-      "original WorkBrief", "foreground-only", 'intent: "query"', 'intent: "steer"',
-      "historyId", "sessionId", "never interrupts a running command",
-      "queued", "handled", "rejected", "unconfirmed", "not a live controllable target",
+      "not a live controllable target",
       "does not settle a Team hold", "waive independent final review", "change ModelPolicy",
     ]) expect(execute).toContain(contract);
     const verify = skillText("verify-behavior");

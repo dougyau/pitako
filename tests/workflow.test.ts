@@ -489,7 +489,8 @@ describe("plan and execute contracts", () => {
     const decisions = execute.slice(execute.indexOf("\n## Decisions\n"), execute.indexOf("\n## Workers\n"));
     expect(decisions).toContain("another equivalent technical choice within the accepted contract");
     expect(decisions).toContain("another internal design still preserves Goal, Non-goals, Scope, Invariants");
-    expect(decisions).toContain("Consult Architect through `agent_run` only when that uncertainty is real");
+    expect(decisions).toContain("Consult Architect in background only when that uncertainty is real");
+    expect(decisions).toContain("dependent decision pending until the required current-object answer is interpreted");
     expect(decisions).toContain("a change in security or privacy risk appetite");
     expect(decisions).toContain("unauthorized destructive or external side effect");
     expect(decisions).toContain("A coordinator's technical suggestion does not create a new permission requirement");
@@ -653,7 +654,7 @@ describe("plan and execute contracts", () => {
     expect(execute).toContain("Level 2");
     expect(execute).toContain("Level 3");
     expect(execute).toContain("same Developer");
-    expect(execute).toContain("prefer `team_assign` when available");
+    expect(execute).toContain("Prefer `team_assign` when registered");
     expect(execute).toContain("Team assignment ID for Team");
     expect(execute).toContain("Interpret complete `pitako.worker.result` messages supplied automatically in context");
     expect(execute).toContain("optional, complete, idempotent diagnostic re-reads");
@@ -671,10 +672,101 @@ describe("plan and execute contracts", () => {
     expect(execute).toContain("neither `agent_run` nor `team_assign` nor `agent_spawn` is registered");
     expect(execute).not.toContain("`agent_run` unavailable still means implement inline");
     expect(execute).not.toContain("If `agent_run` is unavailable, implement inline");
-    expect(execute).toContain("Consult Architect through `agent_run`");
+    expect(execute).toContain("Consult Architect in background");
     expect(execute).not.toContain("When `agent_run` is available, you coordinate");
     expect(execute).toContain("bindingMismatch");
     expect(execute).not.toMatch(/openai-codex|anthropic\/|gpt-5|claude-/);
+  });
+
+  test("Architect and Reviewer dependencies release the turn without synchronous fallback", () => {
+    for (const policy of [plan, execute]) {
+      for (const contract of [
+        "use background dispatch", "`team_assign` when registered",
+        "use `agent_spawn` only when Team is not registered",
+        "supersedes generic tool prompts", '"independent work"', "Do not change those prompts",
+        "If only `agent_run` exists", "blocked",
+        "No synchronous fallback, inline specialist work, or waived review",
+        "complete WorkBrief can run autonomously even when a coordinator decision depends on its answer",
+        "assignment turn", "keep a call open", "end the turn",
+      ]) expect(policy).toContain(contract);
+      expect(policy).not.toContain("A sync dependency uses `agent_run`");
+      expect(policy).not.toContain("stays a synchronous call");
+      expect(policy).not.toContain("call the Architect role with `agent_run`");
+    }
+    expect(plan).toContain("including a critique needed before freeze");
+    expect(plan).toContain("Do not freeze before interpreting the required current-object judgment");
+    expect(execute).toContain("including Level 2 questions, judgments needed for the next action, and final independent review");
+    expect(execute).toContain("Do not decide a Level 2 amendment, accept a unit, start a dependent unit, or declare `EXECUTION_COMPLETED` before interpreting");
+    expect(execute).toContain("does not authorize later units or waive ordered units, independent critique, final review, or gates");
+    expect(execute).toContain("frozen `plan` and relevant `unit`, preserving the existing binding and execution root");
+  });
+
+  test("planning correlation and operational checkpoints do not create or bypass Team Holds", () => {
+    for (const contract of [
+      "check the draft's explicit Board binding and existing ledger",
+      "For a bound draft without a ledger, call `team_assign` without `plan` or `unit`",
+      "do not pass an explicit topic to bypass this rule",
+      "For an unbound draft or a compatible existing ledger",
+      "prospective, validated `plan` ID", "distinct, scoped `unit` ID per consultation",
+      "incompatible ledger or real Team hold remains a blocker",
+      "omitting correlation must not bypass it",
+      "Do not create an execution ledger during planning",
+      "Record role, purpose, handle type and exact ID, pending decision, and consulted object",
+      "Team assignment ID for Team", "worker instance ID for `agent_spawn`",
+      "with or without correlation", "operational checkpoint, not a Team Hold or acceptance evidence",
+      "Exclude `## Planning workers` from the consulted object",
+      "explicitly instruct the worker to ignore that section",
+    ]) expect(plan).toContain(contract);
+    const freeze = plan.slice(plan.indexOf("## Critique and freeze"));
+    expect(freeze.indexOf("required results are interpreted")).toBeLessThan(freeze.indexOf("remove `## Planning workers`"));
+    expect(freeze.indexOf("remove `## Planning workers`")).toBeLessThan(freeze.indexOf("Set `status: frozen`"));
+    expect(freeze).toContain("removal does not invalidate critique");
+    expect(freeze).toContain("operational section was excluded from the consulted object");
+    expect(freeze).toContain("Integrating corrections requested by critique does not itself require another consultation");
+    expect(freeze).toContain("material blocker or a change outside the reviewed object");
+  });
+
+  test("background checkpoints interpret full results and distinguish planning loss from execution recovery", () => {
+    for (const policy of [plan, execute]) {
+      for (const contract of [
+        "Handles are session-local", "check each recorded handle once by type",
+        "`team_status`", "assignment ID", "`agent_status`", "instance ID",
+        "A wake, terminal status, steering receipt, or bookkeeping result is not the required judgment",
+      ]) expect(policy.toLowerCase()).toContain(contract.toLowerCase());
+    }
+    expect(plan).toContain("If still active in the same session, end the turn");
+    expect(plan).toContain("Only in planning, an unknown handle after reload or process loss permits one replacement consultation");
+    expect(plan).toContain("record the loss, then assign a fresh current-object WorkBrief");
+    expect(plan).toContain("A known failure is not an unknown handle");
+    expect(plan).toContain("does not recover Team Holds or authorize execution");
+    expect(plan).toContain("real holds and incompatible ledgers retain their existing recovery requirements");
+    expect(execute).toContain("If the handle is unknown, record a blocker");
+    expect(execute).toContain("planning-only lost-consultation replacement does not apply in execution");
+    expect(execute).toContain("preserve Team Hold reconciliation and recovery");
+  });
+
+  test("object changes and Team occupancy cannot reuse stale judgments or bypass reservations", () => {
+    for (const policy of [plan, execute]) {
+      for (const contract of [
+        "Compare new user information with the consulted object and original WorkBrief",
+        "If information changes the object outside the WorkBrief",
+        "inapplicable to the pending decision",
+        "Interpret its automatic result when supplied, but do not use it to close that decision",
+        "or apply the change after accepting the old judgment",
+        "Cancel the exact still-active target with `team_cancel` or `agent_cancel` according to handle type",
+        "End the turn while settlement and role release are pending",
+        "Only after settlement and role release, assign a fresh WorkBrief against the current object",
+        "If Team rejects a reserved role, distinguish occupancy from an unknown handle",
+        "End the turn without polling or fallback",
+        "After that reservation settles and releases the role, retry `team_assign`",
+        "Another assignment's result does not answer this consultation",
+        "Do not use `agent_spawn` or `agent_run` to evade occupancy or admission rejection",
+        "Cancellation alone proves neither settlement nor role release",
+        "Neither `queued` nor `handled` proves correction or replaces a new consultation",
+      ]) expect(policy).toContain(contract);
+      expect(policy).not.toContain("Apply it after interpreting the supplied result, cancel the worker");
+    }
+    expect(execute).toContain("a new assignment does not clear a blocking hold");
   });
 
   test("active orchestration guidance interprets supplied results without fetching or accepting work", () => {
@@ -689,6 +781,22 @@ describe("plan and execute contracts", () => {
     expect(router).toContain("Automatic handoff is not work acceptance or unit completion");
     expect(coordinator).toContain("not transport or acknowledgement");
     expect(coordinator).toContain("does not accept the work or expand specialist authority");
+  });
+
+  test("published Team guidance agrees with workflow dependencies and preserves synchronous ad hoc runs", () => {
+    const readme = readFileSync(path.join(packageRoot(), "README.md"), "utf8");
+    const engineering = readFileSync(path.join(packageRoot(), "docs/engineering.md"), "utf8");
+    for (const policy of [router, readme, engineering]) {
+      expect(policy).toContain("supersedes generic");
+      expect(policy).toContain("only when Team is not registered");
+      expect(policy).toMatch(/block(?:ed)?/);
+      expect(policy).toMatch(/automat(?:ic|ically)/);
+      expect(policy).not.toContain("Use `team_assign` only for independent work");
+      expect(policy).not.toContain("Team assignments remain independent work");
+    }
+    expect(readme).toContain("Ad hoc `agent_run` remains synchronous");
+    expect(engineering).toContain("`agent_run` stays synchronous");
+    expect(router).toContain("`agent_run` executes one isolated instance synchronously");
   });
 
   test("execute and pre-pr order cleanup before final gates and review", () => {
