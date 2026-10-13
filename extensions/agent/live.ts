@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import type { AgentSession, AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import type { SessionHistory } from "./history.ts";
+import type { createPublicProducer } from "./public-conversation.ts";
 
 export interface ActivityReadOptions {
   after?: number;
@@ -37,6 +38,7 @@ export interface ActivityPage {
 }
 
 export interface LiveHandle {
+  publicConversation?: ReturnType<typeof createPublicProducer>;
   historyId: string;
   sessionId: string;
   observe(options?: ActivityReadOptions): Record<string, unknown>;

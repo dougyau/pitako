@@ -32,7 +32,6 @@ import { createPaneSession } from "./herdr/agents-ui/session.ts";
 import { readHerdrPresence } from "./herdr/presence.ts";
 import { registerCodexTools } from "./codex.ts";
 import { createAgentBridge } from "./agent/bridge/broker.ts";
-import { isGrants } from "./agent/bridge/protocol.js";
 
 function requestedProfile(pi: ExtensionAPI): ProfileName {
   const flag = pi.getFlag("pitako-profile");
@@ -99,10 +98,6 @@ export default function pitako(pi: ExtensionAPI) {
   });
   pi.registerFlag("pitako-agent-bridge", {
     description: "Optional foreground RPC agent bridge in a host-owned absolute private directory",
-    type: "string",
-  });
-  pi.registerFlag("pitako-agent-bridge-grants", {
-    description: "Agent bridge ceiling: comma-separated history,route,control (default: none)",
     type: "string",
   });
 
@@ -240,15 +235,11 @@ export default function pitako(pi: ExtensionAPI) {
       // Upstream failure still reconciles the final profile above, but cannot
       // publish or admit a replacement bridge for this failed transition.
       const bridgeRoot = pi.getFlag("pitako-agent-bridge");
-      const grantFlag = pi.getFlag("pitako-agent-bridge-grants");
       if (!isChildSession(ctx) && ctx.mode === "rpc" && bridgeRoot !== undefined) {
         if (typeof bridgeRoot !== "string" || !bridgeRoot.length)
           throw new Error("Agent bridge requires an absolute private directory");
-        const grants: unknown = grantFlag === undefined || grantFlag === "" ? [] :
-          typeof grantFlag === "string" ? grantFlag.split(",") : undefined;
-        if (!isGrants(grants)) throw new Error("Agent bridge grants must be a unique comma-separated list of history,route,control");
         if (!upstreamFailure && agentController && revision === foregroundRevision) {
-          const lifetime = createAgentBridge(agentController, bridgeRoot, grants, () => revision === foregroundRevision);
+          const lifetime = createAgentBridge(agentController, bridgeRoot, () => revision === foregroundRevision);
           agentBridge = lifetime;
           await lifetime.ready;
         }

@@ -48,7 +48,7 @@ function setup(sessionId = "coordinator") {
 }
 
 for (const mode of ["replacement", "shutdown", "captured-failure"] as const) {
-test(`packaged ${mode} fences admitted bridge mutations throughout held retirement`, fixture.ownedCase(`bridge ${mode}`, async () => {
+test(`packaged ${mode} fences bridge reads and joins ordinary native control throughout held retirement`, fixture.ownedCase(`bridge ${mode}`, async () => {
   const { root, load } = setup();
   process.env.PI_OFFLINE = "1";
   const bridgeRoot = path.join(root, "bridge");
@@ -61,8 +61,7 @@ test(`packaged ${mode} fences admitted bridge mutations throughout held retireme
       const handlers = extensions.at(-1)!.handlers;
       handlers.set(name, [...handlers.get(name) ?? [], handler]);
     },
-    getFlag(name: string) { return name === "pitako-agent-bridge" ? bridgeRoot :
-      name === "pitako-agent-bridge-grants" ? "control" : undefined; },
+    getFlag(name: string) { return name === "pitako-agent-bridge" ? bridgeRoot : undefined; },
     getAllTools() { return ["read", "edit", "write", "apply_patch"].map(name => ({ name })); },
     getActiveTools() {
       if (failNext) { failNext = false; throw Error("fixture captured upstream failed"); }
@@ -126,9 +125,8 @@ test(`packaged ${mode} fences admitted bridge mutations throughout held retireme
       } } });
     await startedWorker;
     const selection = view.detail(worker.instanceId).controls.selection!;
-    await client.grant("control", true, selection);
     const lease = client.lease;
-    acceptedInput = client.input(selection, { intent: "query", text: "one admitted mutation" }, 1).catch(error => error);
+    acceptedInput = view.input(selection, { intent: "query", text: "one admitted coordinator mutation" }).catch(error => error);
     await inputStart;
     expect(effects).toBe(1);
     const hold = new Promise<void>(resolve => { release = resolve; });
@@ -153,9 +151,8 @@ test(`packaged ${mode} fences admitted bridge mutations throughout held retireme
       .then(() => { finished = true; });
     expect(() => view.list()).toThrow("retired");
     await expect(client.list()).rejects.toThrow();
-    await expect(client.input(selection, { intent: "query", text: "obsolete mutation" }, 2)).rejects.toThrow();
-    await expect(client.cancel(selection, 3)).rejects.toThrow();
-    await expect(client.requestStatus(1)).rejects.toThrow();
+    expect(() => view.input(selection, { intent: "query", text: "obsolete mutation" })).toThrow();
+    expect(() => view.cancel(selection)).toThrow();
     // For captured-failure this is post-failure inside the SAME handler, not a later handler.
     expect(failNext).toBe(false);
     expect(finished).toBe(false);
@@ -168,7 +165,7 @@ test(`packaged ${mode} fences admitted bridge mutations throughout held retireme
     expect(finished).toBe(false); // closure must also join the admitted native operation
     expect(bridgeStarts).toBe(1); expect(admissions).toBe(0);
     releaseInput();
-    expect(await acceptedInput).toMatchObject({ code: "disconnected" });
+    expect((await acceptedInput as Error).message).toContain("retired");
     await transition;
     // Keep the observer active through all remaining foreground reconciliation.
     await new Promise<void>(resolve => setImmediate(resolve));
@@ -179,8 +176,8 @@ test(`packaged ${mode} fences admitted bridge mutations throughout held retireme
       const fresh = await connect(descriptor, { expectedSessionId: "coordinator" });
       try {
         await expect(connect(descriptor, { expectedSessionId: "coordinator", resume: lease })).rejects.toMatchObject({ code: "lease_expired" });
-        await expect(fresh.grant("control", true, selection)).rejects.toThrow();
-        expect(await fresh.requestStatus(1)).toEqual({ state: "not_admitted", sequence: 1 });
+        expect(fresh).not.toHaveProperty("grant");
+        expect(fresh).not.toHaveProperty("requestStatus");
       } finally { await fresh.disconnect(); }
     } else {
       expect(admissions).toBe(0);

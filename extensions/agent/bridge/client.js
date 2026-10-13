@@ -31,7 +31,7 @@ function readDescriptor(file, expectedSessionId) {
   } finally { closeSync(fd); }
 }
 
-/** Explicit connect only. No automatic discovery, reconnect, grants, Pi imports or startup. */
+/** Explicit connect only. No automatic discovery, reconnect, Pi imports or startup. */
 export async function connect(descriptorPath, { expectedSessionId, resume } = {}) {
   let descriptor;
   try { descriptor = readDescriptor(descriptorPath, expectedSessionId); }
@@ -73,7 +73,7 @@ export async function connect(descriptorPath, { expectedSessionId, resume } = {}
       return;
     }
     const request = pending.get(value?.id);
-    if (!request || !isReply(value, request.method) || !sameOwner(value.owner, descriptor.owner) ||
+    if (!request || !isReply(value, request.method, request.format) || !sameOwner(value.owner, descriptor.owner) ||
         value.clientId !== clientId || Buffer.byteLength(JSON.stringify(value)) + 1 > replyBytes)
       throw new BridgeError("invalid_reply", "Invalid bridge reply");
     pending.delete(value.id); clearTimeout(request.timer);
@@ -98,7 +98,7 @@ export async function connect(descriptorPath, { expectedSessionId, resume } = {}
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => fail(new BridgeError("disconnected", "Bridge request timed out; explicit connect required")), 15_000);
       timer.unref();
-      pending.set(envelope.id, { method, resolve: result => { accepted?.(result); resolve(result); }, reject, timer });
+      pending.set(envelope.id, { method, format: params.format, resolve: result => { accepted?.(result); resolve(result); }, reject, timer });
       socket.write(data);
     });
   };
@@ -144,18 +144,17 @@ export async function connect(descriptorPath, { expectedSessionId, resume } = {}
       });
     },
     detail: (id, cursor) => request("workers.detail", { id, ...(cursor === undefined ? {} : { cursor }) }),
+    publicDetail: (id, cursor) => request("workers.detail", { id, format: "public-v1", ...(cursor === undefined ? {} : { cursor }) }),
+    publicActivity: (ref, cursor, recovery = false) => request("workers.activity", { ref, format: "public-v1", recovery,
+      ...(cursor === undefined ? {} : { cursor }) }),
+    publicResult: (ref, cursor) => request("workers.result", { ref, format: "public-v1",
+      ...(cursor === undefined ? {} : { cursor }) }),
     requests: (id, cursor) => request("workers.requests", { id, ...(cursor === undefined ? {} : { cursor }) }),
     activity: (ref, cursor) => request("workers.activity", { ref, ...(cursor === undefined ? {} : { cursor }) }),
     result: (ref, cursor) => request("workers.result", { ref, ...(cursor === undefined ? {} : { cursor }) }),
     historyList: (options = {}) => request("history.list", options),
     historyRead: options => request("history.read", options),
     routeRead: (id, offset) => request("route.read", { id, ...(offset === undefined ? {} : { offset }) }),
-    grant: (grant, acknowledged, selection) => request("view.grant", { grant, acknowledged,
-      ...(selection === undefined ? {} : { selection }) }),
-    // The caller chooses each mutation sequence. No reconnect, resubmission or later decision is inferred.
-    input: (selection, input, sequence) => request("input", { selection, input, sequence }),
-    cancel: (selection, sequence) => request("cancel", { selection, sequence }),
-    requestStatus: sequence => request("request.status", { sequence }),
     async disconnect() {
       fail(new BridgeError("disconnected", "Bridge client disconnected"));
       await closed;

@@ -66,24 +66,18 @@ test("factory-only and disabled/interactive/print/child foregrounds create no br
   } finally { capture.mockRestore(); }
 }));
 
-test("foreground validates unique launch ceilings without activating controls", fixture.ownedCase("bridge ceiling flags", async () => {
-  for (const grants of ["history,history", "unknown", "history,", " history", 42]) {
-    await foreground(async ({ root, flags, hooks, ctx }) => {
-      flags.set("pitako-agent-bridge", root); flags.set("pitako-agent-bridge-grants", grants);
-      await expect(hooks.get("session_start")!({ type: "session_start", reason: "startup" }, ctx)).rejects.toThrow("grants");
-      expect(readdirSync(root).some(name => name.endsWith(".sock") || name === "descriptor.json")).toBe(false);
-    });
-  }
+test("foreground publishes protocol 2 without permission flags or mutation capabilities", fixture.ownedCase("bridge read-only flags", async () => {
   await foreground(async ({ root, flags, hooks, ctx }) => {
     flags.set("pitako-agent-bridge", root);
-    flags.set("pitako-agent-bridge-grants", "history,route,control");
     await hooks.get("session_start")!({ type: "session_start", reason: "startup" }, ctx);
     const file = path.join(root, "descriptor.json");
-    expect(JSON.parse(readFileSync(file, "utf8")).grants).toEqual(["history", "route", "control"]);
+    const descriptor = JSON.parse(readFileSync(file, "utf8"));
+    expect(descriptor.version).toBe(2);
+    expect(descriptor).not.toHaveProperty("grants");
     const client = await connect(file, { expectedSessionId: "owner" });
     try {
       expect(client.capabilities).toEqual(["workers.list", "workers.detail", "workers.requests", "workers.activity", "workers.result", "subscribe", "unsubscribe",
-        "history.list", "history.read", "route.read", "view.grant", "input", "cancel", "request.status"]);
+        "history.list", "history.read", "route.read", "workers.detail.public-v1", "workers.activity.public-v1", "workers.result.public-v1"]);
       expect((await client.list()).items).toEqual([]);
     }
     finally { await client.disconnect(); }

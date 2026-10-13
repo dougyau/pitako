@@ -24,7 +24,7 @@ async function owned(run: (fixture: { controller: ReturnType<typeof createAgentC
   chmodSync(root, 0o700);
   const owner = { sessionId: session, token: Symbol() };
   const controller = createAgentController(owner, () => owner);
-  const bridge = createAgentBridge(controller, root, [], () => true);
+  const bridge = createAgentBridge(controller, root, () => true);
   let client: Awaited<ReturnType<typeof connect>> | undefined;
   try {
     await bridge.ready;
@@ -154,7 +154,7 @@ test("maximally escaped owner and cursor fit complete initial subscription pages
     try {
       let snapshot = subscription.snapshot;
       expect(snapshot.cursor).not.toBeNull();
-      const envelope = { version: 1, id: "\x01".repeat(128), clientId: "\x01".repeat(128), owner: client.owner,
+      const envelope = { version: 2, id: "\x01".repeat(128), clientId: "\x01".repeat(128), owner: client.owner,
         ok: true, result: { subscriptionId: subscription.subscriptionId, snapshot } };
       expect(Buffer.byteLength(JSON.stringify(envelope) + "\n")).toBeLessThanOrEqual(replyBytes);
       console.log("escaped initial subscription complete envelope bytes", Buffer.byteLength(JSON.stringify(envelope) + "\n"));
@@ -289,19 +289,19 @@ test("bounded subscriptions, repeated disposal, disconnect/reconnect and owner r
     } finally { await reconnected.disconnect(); }
   }));
 
-test("v1 subscription shapes bound complete envelopes, reject malformed revisions and foreign fields", () => {
+test("v2 subscription shapes bound complete envelopes, reject malformed revisions and foreign fields", () => {
   const owner = { processId: '"'.repeat(1024), coordinatorSessionId: '"'.repeat(1024), epoch: '"'.repeat(1024) };
-  const hint = { version: 1, method: "changed", owner, clientId: '"'.repeat(128),
+  const hint = { version: 2, method: "changed", owner, clientId: '"'.repeat(128),
     subscriptionId: '"'.repeat(128), revision: Number.MAX_SAFE_INTEGER, refreshRequired: true };
   expect(isNotification(hint)).toBe(true);
   expect(Buffer.byteLength(JSON.stringify(hint) + "\n")).toBeLessThan(replyBytes);
   for (const changed of [{ revision: -1 }, { revision: Number.MAX_SAFE_INTEGER + 1 }, { transcript: "secret" },
     { subscriptionId: "x".repeat(129) }, { refreshRequired: false }])
     expect(isNotification({ ...hint, ...changed })).toBe(false);
-  const request = { version: 1, id: '"'.repeat(128), clientId: '"'.repeat(128), owner, method: "subscribe", params: {} };
+  const request = { version: 2, id: '"'.repeat(128), clientId: '"'.repeat(128), owner, method: "subscribe", params: {} };
   expect(isRequest(request)).toBe(true);
   expect(isRequest({ ...request, params: { replay: true } })).toBe(false);
-  const reply = { version: 1, id: request.id, clientId: request.clientId, owner, ok: true,
+  const reply = { version: 2, id: request.id, clientId: request.clientId, owner, ok: true,
     result: { subscriptionId: hint.subscriptionId, snapshot: { revision: 0, owner, items: [], cursor: null } } };
   expect(isReply(reply, "subscribe")).toBe(true);
   expect(Buffer.byteLength(JSON.stringify(reply) + "\n")).toBeLessThan(replyBytes);

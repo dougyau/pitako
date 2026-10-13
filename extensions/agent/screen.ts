@@ -10,7 +10,8 @@ import type { PaneView } from "../herdr/agents-ui/protocol.ts";
 
 type ControllerView = ReturnType<ReturnType<typeof createAgentController>["openView"]>;
 export type AgentView = Omit<ControllerView,
-  "readDetail" | "readRequests" | "readActivity" | "readResult" | "subscribe" | "list"> & {
+  "readDetail" | "readPublicDetail" | "readPublicActivity" | "readPublicResult" |
+  "readRequests" | "readActivity" | "readResult" | "subscribe" | "list"> & {
   list(after?: string): Omit<ReturnType<ControllerView["list"]>, "revision">;
 };
 type Detail = ReturnType<AgentView["detail"]>;

@@ -18,6 +18,7 @@ import { childInstructions, skillNamesForRole, usageDelta, type AgentRequestObse
 import type { ModelTarget, ReasoningLevel } from "../roles/types.ts";
 import { InvocationHistory, type SessionHistory } from "./history.ts";
 import { createLiveHandle } from "./live.ts";
+import { createPublicProducer } from "./public-conversation.ts";
 
 // Package entry does not re-export this. Import the file next to the resolved entry.
 export let DEFAULT_THINKING_LEVEL: ThinkingLevel;
@@ -35,6 +36,7 @@ function disposeChildSession(session: AgentSession): Promise<void> {
   const lifecycle = childLifecycles.get(session)!;
   return lifecycle.disposal ??= (async () => {
     let failure: unknown;
+    let shutdownSettled = !lifecycle.bound, disposalSettled = false;
     try {
       try {
         const live = lifecycle.live;
@@ -57,9 +59,11 @@ function disposeChildSession(session: AgentSession): Promise<void> {
         lifecycle.unbindLive?.();
         try {
           if (lifecycle.bound) await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+          shutdownSettled = true;
         } finally {
           try {
             await session.dispose();
+            disposalSettled = true;
           } finally {
             unregisterExecution(session.sessionId);
           }
@@ -69,7 +73,14 @@ function disposeChildSession(session: AgentSession): Promise<void> {
       failure = error;
       throw error;
     } finally {
-      lifecycle.history?.disposition(failure);
+      let historySettled = false;
+      try {
+        lifecycle.history?.disposition(failure);
+        historySettled = true;
+      } finally {
+        // Include native history disposition in the settled head, after all SDK producers.
+        await lifecycle.live?.handle.publicConversation?.close(!shutdownSettled || !disposalSettled || !historySettled);
+      }
     }
   })();
 }
@@ -100,6 +111,7 @@ export function createPiExecutor(options: { now?: () => number; factories?: Part
   const factories = { ...piFactories, ...options.factories };
   return {
     capturesHistory: true,
+    capturesPublicConversation: true,
     async start(input) {
       const history = (input.history ?? new InvocationHistory(input.cwd, undefined, input.task, true)).admit(input.instanceId, input.role.id, input.target);
       try {
@@ -402,6 +414,8 @@ async function openSession(
     extensionFactories: [input.factories.createCodemode({ mode: "on" }), pi => {
       pi.on("turn_start", () => { live?.open(); });
       pi.on("agent_before_settle", () => live?.settle());
+      pi.on("session_tree", event => live?.handle.publicConversation?.reconcile(event.oldLeafId));
+      pi.on("session_start", () => live?.handle.publicConversation?.reconcile());
     }],
     appendSystemPrompt: [childInstructions(input.role, input.instanceId)],
     skillsOverride: (base) => ({
@@ -423,10 +437,14 @@ async function openSession(
     excludeTools: [...ORCHESTRATION_TOOLS],
   });
   live = input.bindLive ? createLiveHandle(session, input.sessionHistory!) : undefined;
+  if (live) live.handle.publicConversation = createPublicProducer(session, input.sessionHistory!);
   const lifecycle = { bound: false, history: input.sessionHistory, live, unbindLive: live ? input.bindLive!(live.handle) : undefined };
   childLifecycles.set(session, lifecycle);
   lifecycle.history?.attached();
-  if (live) session.subscribe(event => live!.event(event));
+  if (live) session.subscribe(event => {
+    live!.event(event);
+    live!.handle.publicConversation?.event(event);
+  });
   if (lifecycle.history) session.subscribe((event) => {
     if (event.type === "message_end" && event.message.role === "assistant") lifecycle.history!.assistantObserved();
   });

@@ -7,7 +7,7 @@ import net from "node:net";
 import { createAgentController } from "../extensions/agent/controller.ts";
 import { createAgentBridge } from "../extensions/agent/bridge/broker.ts";
 import { connect } from "../extensions/agent/bridge/client.js";
-import { isRequest, isReply, replyBytes, capabilities, type Envelope, type Owner, type Grant } from "../extensions/agent/bridge/protocol.js";
+import { isRequest, isReply, replyBytes, capabilities, type Envelope, type Owner } from "../extensions/agent/bridge/protocol.js";
 import { publishObservation, clearObservations } from "../extensions/agent/observe.ts";
 import type { RoutingRecord } from "../extensions/agent/routing.ts";
 import * as historyModule from "../extensions/agent/history-query.ts";
@@ -27,10 +27,10 @@ const route: RoutingRecord = {
 };
 
 // Only catalog and physical files are synthetic. These checks exercise the real scoped controller and socket broker.
-async function owned(grants: Grant[], body: (value: {
+async function owned(body: (value: {
   controller: ReturnType<typeof createAgentController>; descriptor: string; owner: Owner;
   groupId: string; historyId: string; foreignId: string; catalogFile: string;
-  client(): ReturnType<typeof connect>;
+  client(resume?: Awaited<ReturnType<typeof connect>>["lease"]): ReturnType<typeof connect>;
 }) => Promise<void>, maximalOwner = false) {
   const root = mkdtempSync(path.join(tmpdir(), "pitako-bridge-history-"));
   const originalDir = process.env.PI_CODING_AGENT_DIR;
@@ -64,8 +64,8 @@ async function owned(grants: Grant[], body: (value: {
     // Legal maximum protocol identities/correlation, not a native-host identity claim.
     const maximalEpoch: ReturnType<typeof randomUUID> =
       `${"\u0001".repeat(200)}-${"\u0001".repeat(200)}-${"\u0001".repeat(200)}-${"\u0001".repeat(200)}-${"\u0001".repeat(220)}`;
-    const brokerController = maximalOwner ? { ...controller, openView() {
-      const view = controller.openView();
+    const brokerController = maximalOwner ? { ...controller, openView(options: Parameters<typeof controller.openView>[0]) {
+      const view = controller.openView(options);
       return { ...view, list(...args: Parameters<typeof view.list>) {
         return { ...view.list(...args), owner: { processId: "\u0001".repeat(1024), epoch: maximalEpoch,
           coordinatorSessionId: owner.sessionId } };
@@ -73,13 +73,13 @@ async function owned(grants: Grant[], body: (value: {
     } } : controller;
     const bridgeRoot = path.join(root, "bridge");
     mkdirSync(bridgeRoot, { mode: 0o700 });
-    bridge = createAgentBridge(brokerController, bridgeRoot, grants, () => true);
+    bridge = createAgentBridge(brokerController, bridgeRoot, () => true);
     await bridge.ready;
     const descriptor = path.join(bridgeRoot, "descriptor.json");
     const discovery = JSON.parse(readFileSync(descriptor, "utf8"));
     await body({ controller, descriptor, owner: discovery.owner, groupId, historyId, foreignId,
       catalogFile,
-      async client() { const client = await connect(descriptor, { expectedSessionId: owner.sessionId }); clients.push(client); return client; } });
+      async client(resume) { const client = await connect(descriptor, { expectedSessionId: owner.sessionId, resume }); clients.push(client); return client; } });
     expect(JSON.parse(readFileSync(catalogFile, "utf8"))).toEqual(group);
     expect(readFileSync(nativeFile)).toEqual(nativeBytes);
   } finally {
@@ -91,58 +91,42 @@ async function owned(grants: Grant[], body: (value: {
   }
 }
 
-test("startup ceiling is immutable; explicit sensitive acknowledgements cannot activate control or elevate", () => {
-  const ceilings: Grant[] = ["control"];
-  return owned(ceilings, async ({ client, historyId }) => {
-    ceilings.push("history", "route");
-    const view = await client();
-    expect((await view.historyList()).items).toHaveLength(1);
-    await expect(view.historyRead({ historyId })).rejects.toMatchObject({ code: "forbidden" });
-    await expect(view.routeRead("owned")).rejects.toMatchObject({ code: "forbidden" });
-    await expect(view.grant("history", true)).rejects.toMatchObject({ code: "forbidden" });
-    await expect(view.grant("route", true)).rejects.toMatchObject({ code: "forbidden" });
-    await expect(Reflect.apply(view.grant, view, ["control", true])).rejects.toMatchObject({ code: "invalid_request" });
-    expect(capabilities).toContain("input");
-    expect(capabilities).toContain("request.status");
-  });
-});
-
-test("acknowledgements are per fresh view and grant; foreign references/scopes/cursors remain rejected", () =>
-  owned(["history", "route"], async ({ client, historyId, foreignId, groupId, controller }) => {
+test("bridge raw reads need no acknowledgement; screen policy, foreign scopes and cursors remain fenced", () =>
+  owned(async ({ client, historyId, foreignId, groupId, controller }) => {
     const first = await client(), independent = await client();
-    await expect(Reflect.apply(first.grant, first, ["history"])).rejects.toMatchObject({ code: "invalid_request" });
-    await expect(Reflect.apply(first.grant, first, ["history", false])).rejects.toMatchObject({ code: "invalid_request" });
-    await first.grant("route", true);
-    await expect(first.historyRead({ historyId })).rejects.toMatchObject({ code: "forbidden" });
-    await first.grant("history", true);
+    const screen = controller.openView();
+    try {
+      await expect(screen.history({ action: "read", historyId })).rejects.toThrow("acknowledgement");
+      expect(() => screen.route("owned")).toThrow("acknowledgement");
+      screen.acknowledge("history"); screen.acknowledge("route");
+      expect((await screen.history({ action: "read", historyId, limit: 1 })).items).toHaveLength(1);
+      expect(screen.route("owned").text).not.toBe("");
+    } finally { await screen.close(); }
     expect((await first.historyRead({ historyId, limit: 1 })).items).toHaveLength(1);
-    await expect(independent.historyRead({ historyId })).rejects.toMatchObject({ code: "forbidden" });
-    await expect(independent.routeRead("owned")).rejects.toMatchObject({ code: "forbidden" });
+    expect((await independent.historyRead({ historyId, limit: 1 })).items).toHaveLength(1);
+    expect((await independent.routeRead("owned")).state).toBe("captured");
     await expect(first.historyList({ workerId: "foreign" })).rejects.toMatchObject({ code: "unknown_target" });
     await expect(first.routeRead("foreign")).rejects.toMatchObject({ code: "unknown_target" });
-    const foreign = await first.historyRead({ historyId: foreignId, groupId });
-    expect(foreign).toMatchObject({ items: [], cursor: null, diagnostics: [{ code: "history_outside_scope" }] });
+    expect(await first.historyRead({ historyId: foreignId, groupId })).toMatchObject({
+      items: [], cursor: null, diagnostics: [{ code: "history_outside_scope" }] });
     const source = await first.historyRead({ historyId, limit: 1 });
-    const differentScope = await first.historyRead({ historyId, workerId: "owned", cursor: source.cursor! });
-    expect(differentScope).toMatchObject({ items: [], diagnostics: [{ code: "invalid_cursor" }] });
+    expect(await first.historyRead({ historyId, workerId: "owned", cursor: source.cursor! })).toMatchObject({
+      items: [], diagnostics: [{ code: "invalid_cursor" }] });
     for (const params of [{ scope: "all" }, { coordinatorSessionId: "foreign" }, { source: "coordinator" },
-      { directory: "/tmp" }, { historyId: "/tmp/private" }, { limit: 201 }, { cursor: "x".repeat(2049) }]) {
+      { directory: "/tmp" }, { historyId: "/tmp/private" }, { limit: 201 }, { cursor: "x".repeat(2049) }])
       await expect(Reflect.apply(first.historyList, first, [params])).rejects.toMatchObject({ code: "invalid_request" });
-    }
+    const resume = first.lease;
     await first.disconnect();
-    const reconnected = await client();
-    await expect(reconnected.historyRead({ historyId, cursor: source.cursor! })).rejects.toMatchObject({ code: "forbidden" });
-    await expect(reconnected.routeRead("owned")).rejects.toMatchObject({ code: "forbidden" });
-    await reconnected.grant("history", true);
+    const reconnected = await client(resume);
     expect((await reconnected.historyRead({ historyId, cursor: source.cursor! })).items.length).toBeGreaterThan(0);
+    expect((await reconnected.routeRead("owned")).state).toBe("captured");
     controller.revoke();
     await expect(reconnected.historyRead({ historyId })).rejects.toMatchObject({ code: "stale_owner" });
   }));
 
 test("raw route pages preserve captured data without claiming a native routing invocation", () =>
-  owned(["route"], async ({ client }) => {
+  owned(async ({ client }) => {
     const view = await client();
-    await view.grant("route", true);
     let offset: number | undefined, text = "";
     do {
       const result = await view.routeRead("owned", offset);
@@ -155,7 +139,7 @@ test("raw route pages preserve captured data without claiming a native routing i
   }));
 
 test("broker does not queue around controller busy; independent views progress and disconnect joins accepted history", () =>
-  owned(["history"], async ({ client, historyId }) => {
+  owned(async ({ client, historyId }) => {
     const first = await client(), independent = await client();
     let release!: () => void, entered!: () => void;
     const hold = new Promise<void>(resolve => { release = resolve; });
@@ -176,7 +160,6 @@ test("broker does not queue around controller busy; independent views progress a
       await start;
       await expect(first.historyList()).rejects.toMatchObject({ code: "busy" });
       expect((await independent.historyList()).items).toHaveLength(1);
-      await independent.grant("history", true);
       expect((await independent.historyRead({ historyId, limit: 1 })).items).toHaveLength(1);
       await first.disconnect();
       await expect(pending).rejects.toThrow("disconnected");
@@ -189,9 +172,8 @@ test("broker does not queue around controller busy; independent views progress a
   }));
 
 test("missing/pruned and unknown histories have diagnostics; no fabricated empty success", () =>
-  owned(["history"], async ({ client, historyId, catalogFile }) => {
+  owned(async ({ client, historyId, catalogFile }) => {
     const view = await client();
-    await view.grant("history", true);
     const unknown = await view.historyRead({ historyId: randomUUID() });
     expect(unknown).toMatchObject({ items: [], cursor: null, diagnostics: [{ code: "history_not_found" }] });
     const catalog = JSON.parse(readFileSync(catalogFile, "utf8"));
@@ -230,7 +212,7 @@ async function peer(descriptor: string) {
     request(method: string, params: Record<string, unknown>, owner = discovery.owner) {
       return new Promise<{ value: any; bytes: number }>((resolve, failure) => {
         respond = resolve; reject = failure;
-        socket.write(JSON.stringify({ version: 1, id: "\u0001".repeat(128), clientId: "\u0001".repeat(128), owner, method, params }) + "\n");
+        socket.write(JSON.stringify({ version: 2, id: "\u0001".repeat(128), clientId: "\u0001".repeat(128), owner, method, params }) + "\n");
       });
     },
     async close() {
@@ -242,16 +224,14 @@ async function peer(descriptor: string) {
 }
 
 test("maximum encoded raw replies include envelope/LF; exact bytes/cursors/diagnostics survive subdivision and reused identity", () =>
-  owned(["history", "route"], async ({ descriptor, historyId, owner, catalogFile }) => {
+  owned(async ({ descriptor, historyId, owner, catalogFile }) => {
     let wire = await peer(descriptor);
     const catalogText = readFileSync(catalogFile, "utf8");
     try {
       const authenticated = await wire.request("connect", { token: JSON.parse(readFileSync(descriptor, "utf8")).token,
         expectedSessionId: owner.coordinatorSessionId });
       expect(authenticated.value.ok).toBe(true);
-      expect((await wire.request("input", {})).value).toMatchObject({ ok: false, error: { code: "invalid_request" } });
-      await wire.request("view.grant", { grant: "history", acknowledged: true });
-      await wire.request("view.grant", { grant: "route", acknowledged: true });
+      expect((await wire.request("input", {})).value).toMatchObject({ ok: false, error: { code: "unsupported_method" } });
       let cursor: string | undefined, offset = 0, pages = 0, maximum = 0;
       const fragments: Buffer[] = [];
       const validation = new Set<string>(), diagnostics = new Set<string>();
@@ -311,26 +291,25 @@ test("maximum encoded raw replies include envelope/LF; exact bytes/cursors/diagn
         maximumRouteReplyBytes: maximumRoute, replyBudget: replyBytes, includesEnvelopeAndLF: true } }));
       const wrongOwner = await wire.request("history.read", { historyId }, { ...owner, epoch: "wrong" });
       expect(wrongOwner.value).toMatchObject({ ok: false, error: { code: "stale_owner" } });
-      // Fresh transport reuses the exact same identity; authentication does not recover acknowledgements.
+      // Fresh transport reuses the exact same identity; read access needs no acknowledgement.
       await wire.close(); wire = await peer(descriptor);
       expect((await wire.request("connect", { token: JSON.parse(readFileSync(descriptor, "utf8")).token,
         expectedSessionId: owner.coordinatorSessionId, resumeToken: authenticated.value.result.lease.resumeToken })).value.ok).toBe(true);
-      expect((await wire.request("history.read", { historyId })).value).toMatchObject({ ok: false, error: { code: "forbidden" } });
-      expect((await wire.request("route.read", { id: "owned" })).value).toMatchObject({ ok: false, error: { code: "forbidden" } });
-      await wire.request("view.grant", { grant: "history", acknowledged: true });
+      expect((await wire.request("history.read", { historyId })).value.ok).toBe(true);
+      expect((await wire.request("route.read", { id: "owned" })).value.ok).toBe(true);
       expect((await wire.request("history.read", { historyId, limit: 1 })).value.ok).toBe(true);
     } finally { await wire.close(); writeFileSync(catalogFile, catalogText); }
   }, true));
 
 test("public protocol rejects invented authority, unconstrained requests and malformed raw replies", () => {
   const owner = { processId: "process", coordinatorSessionId: "coordinator", epoch: "epoch" };
-  const request: Envelope = { version: 1, id: "id", clientId: "client", owner, method: "history.read", params: { historyId: randomUUID() } };
+  const request: Envelope = { version: 2, id: "id", clientId: "client", owner, method: "history.read", params: { historyId: randomUUID() } };
   expect(isRequest(request)).toBe(true);
   for (const extra of [{ scope: "all" }, { path: "/tmp/native" }, { source: "coordinator" }, { groupId: "not-uuid" }])
     expect(isRequest({ ...request, params: { ...request.params, ...extra } })).toBe(false);
   const fragment = { historyId: randomUUID(), source: "worker", entryOffset: 0, byteOffset: 0,
     encoding: "base64", endsEntry: true, data: "AA==", validation: "corrupt" };
-  const reply = { version: 1, id: "id", clientId: "client", owner, ok: true, result: {
+  const reply = { version: 2, id: "id", clientId: "client", owner, ok: true, result: {
     items: [fragment], diagnostics: [{ code: "native_physical_order" }], cursor: null } };
   expect(isReply(reply, "history.read")).toBe(true);
   const groupId = randomUUID();

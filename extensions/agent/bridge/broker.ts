@@ -1,37 +1,24 @@
-import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer, type Socket } from "node:net";
 import { chmodSync, lstatSync, readdirSync, realpathSync, linkSync, unlinkSync, writeFileSync, type Stats } from "node:fs";
 import path from "node:path";
-import type { createAgentController, AgentSelection } from "../controller.ts";
+import type { createAgentController } from "../controller.ts";
 import { frame, frames } from "../framing.js";
 import { capabilities, failure, isEnvelope, isRequest, outstandingRequests, queueBytes, replyBytes,
-  sameOwner, success, errors, isReply, isNotification, isMutationStatus,
-  type Descriptor, type Grant, type Request, type ErrorCode, type MutationStatus } from "./protocol.js";
+  sameOwner, success, errors, isReply, isNotification, version,
+  type Descriptor, type Request, type ErrorCode } from "./protocol.js";
 
 type Controller = ReturnType<typeof createAgentController>;
 type View = ReturnType<Controller["openView"]>;
-type Mutation = Extract<Request, { method: "input" | "cancel" }>;
-type Admission = { digest: string; status: MutationStatus };
-type Lease = { token: string; socket?: Socket; idleAt: number; pending: number; highWater: number; receipts: Map<number, Admission> };
+type Lease = { token: string; socket?: Socket; idleAt: number };
 const errorCode = (error: unknown): ErrorCode => {
   const message = error instanceof Error ? error.message : "";
   return Object.hasOwn(errors, message) ? message as ErrorCode
     : message === "unknown scoped worker" ? "unknown_target"
     : message === "view has outstanding work" ? "busy"
     : message === "controller owner epoch is retired" || message === "view is disconnected" ? "stale_owner"
-    : message === "raw history requires this view's acknowledgement" || message === "raw route requires this view's acknowledgement" ? "forbidden"
     : error instanceof RangeError ? "oversized"
-    : ["stale controller selection", "live binding changed; reobserve", "live instance changed", "native binding is closed or stale",
-      "synchronous run is read-only", "terminal worker is read-only", "Team evaluation is retired"].includes(message) ? "stale_selection"
     : "invalid_cursor";
-};
-// Hash semantic fields, not JSON property order or transport correlation IDs.
-const mutationDigest = (request: Mutation) => {
-  const s = request.params.selection;
-  return createHash("sha256").update(JSON.stringify([request.method, s.processId, s.coordinatorSessionId, s.epoch,
-    s.target.kind, s.target.kind === "team" ? s.target.assignmentId : s.target.instanceId,
-    s.instanceId, s.generation, s.historyId, s.sessionId,
-    request.method === "input" ? [request.params.input.intent, request.params.input.text, request.params.input.decisionId ?? null] : null])).digest("hex");
 };
 const identity = (a: Stats, b: Stats) => a.dev === b.dev && a.ino === b.ino;
 const stat = (file: string) => {
@@ -52,14 +39,13 @@ function privateRoot(root: string) {
 }
 
 /** The foreground owns this lifetime BEFORE its first readiness await. */
-export function createAgentBridge(controller: Controller, root: string, grants: Grant[], current: () => boolean) {
-  const ceilings = [...grants];
+export function createAgentBridge(controller: Controller, root: string, current: () => boolean) {
   let active = true, rootIdentity: Stats | undefined;
   const owned = new Map<string, Stats>();
   const sockets = new Set<Socket>(), closing = new Set<Promise<unknown>>(), work = new Set<Promise<unknown>>();
   const subscriptions = new Set<() => void>();
   const leases = new Map<string, Lease>();
-  const expired = (lease: Lease) => !lease.socket && lease.pending === 0 && Date.now() - lease.idleAt >= 5 * 60_000;
+  const expired = (lease: Lease) => !lease.socket && Date.now() - lease.idleAt >= 5 * 60_000;
   const socketPath = path.join(root, `b-${randomBytes(6).toString("hex")}.sock`);
   const descriptorPath = path.join(root, "descriptor.json");
   const tempPath = path.join(root, `.descriptor-${randomUUID()}`);
@@ -81,8 +67,7 @@ export function createAgentBridge(controller: Controller, root: string, grants: 
     if (!live() || sockets.size >= 4) { socket.destroy(); return; }
     sockets.add(socket);
     join(closing, new Promise<void>(resolve => socket.once("close", () => { sockets.delete(socket); resolve(); })));
-    let view: View | undefined, clientId: string | undefined, lease: Lease | undefined, control = false, outstanding = 0;
-    let activateControl: (selection: AgentSelection) => void = () => { throw new Error("forbidden"); };
+    let view: View | undefined, clientId: string | undefined, lease: Lease | undefined, outstanding = 0;
     let subscription: { id: string; dispose(): void } | undefined;
     const stop = () => { subscription?.dispose(); subscription = undefined; };
     const ids = new Set<string>();
@@ -131,12 +116,12 @@ export function createAgentBridge(controller: Controller, root: string, grants: 
           } else {
             if (leases.has(request.clientId)) { send(failure(request, "unauthorized")); return; }
             if (leases.size >= 16) { send(failure(request, "busy")); return; }
-            lease = { token: randomBytes(32).toString("hex"), idleAt: Date.now(), pending: 0, highWater: 0, receipts: new Map() };
+            lease = { token: randomBytes(32).toString("hex"), idleAt: Date.now() };
             leases.set(request.clientId, lease);
           }
-          view = controller.openView({ control: false, bindControl: activate => { activateControl = activate; } });
+          view = controller.openView({ control: false, policy: "bridge-read" });
           clientId = request.clientId; lease.socket = socket;
-          send(success(request, { capabilities, grants: [], lease: { clientId, resumeToken: lease.token, highWater: lease.highWater } }));
+          send(success(request, { capabilities, lease: { clientId, resumeToken: lease.token } }));
         } else {
           if (!view || request.clientId !== clientId) { send(failure(request, "unauthorized")); return; }
           let installedSubscription = false;
@@ -153,7 +138,7 @@ export function createAgentBridge(controller: Controller, root: string, grants: 
                   queued ??= setImmediate(() => {
                     queued = undefined;
                     if (subscription?.id !== id || !installed.active || revision <= installed.snapshot.revision) return;
-                    const hint = { version: 1, method: "changed", owner: descriptor!.owner,
+                    const hint = { version, method: "changed", owner: descriptor!.owner,
                       clientId, subscriptionId: id, revision, refreshRequired: true };
                     if (isNotification(hint)) send(hint);
                     else socket.destroy();
@@ -174,61 +159,23 @@ export function createAgentBridge(controller: Controller, root: string, grants: 
               case "unsubscribe":
                 if (subscription?.id !== request.params.subscriptionId) throw new Error("stale_reference");
                 stop(); page = { subscriptionId: request.params.subscriptionId }; break;
-              case "workers.detail": page = view.readDetail(request.params.id, request.params.cursor); break;
+              case "workers.detail": page = request.params.format === "public-v1"
+                ? view.readPublicDetail(request.params.id, request.params.cursor)
+                : view.readDetail(request.params.id, request.params.cursor); break;
               case "workers.requests": page = view.readRequests(request.params.id, request.params.cursor); break;
-              case "workers.activity": page = view.readActivity(request.params.ref, request.params.cursor); break;
-              case "workers.result": page = view.readResult(request.params.ref, request.params.cursor); break;
-              case "view.grant":
-                if (!ceilings.includes(request.params.grant)) throw new Error("forbidden");
-                if (request.params.grant === "control") { activateControl(request.params.selection); control = true; }
-                else view.acknowledge(request.params.grant);
-                page = { grant: request.params.grant, acknowledged: true }; break;
-              case "request.status":
-                page = lease!.receipts.get(request.params.sequence)?.status ?? {
-                  state: request.params.sequence <= lease!.highWater ? "outcome_unknown" : "not_admitted", sequence: request.params.sequence };
-                break;
-              case "input":
-              case "cancel": {
-                const client = lease!, sequence = request.params.sequence, digest = mutationDigest(request);
-                const previous = client.receipts.get(sequence);
-                // Lookup/duplicate handling never performs another effect, even on a resumed read-only view.
-                if (previous) {
-                  if (previous.digest !== digest) throw new Error("sequence_conflict");
-                  page = previous.status; break;
-                }
-                if (sequence <= client.highWater) { page = { state: "outcome_unknown", sequence }; break; }
-                if (!ceilings.includes("control") || !control) throw new Error("forbidden");
-                const alreadyPending = client.pending > 0;
-                const admission: Admission = { digest, status: { state: "pending", sequence } };
-                client.highWater = sequence; client.receipts.set(sequence, admission); client.pending++;
-                if (client.receipts.size > 32) client.receipts.delete(client.receipts.keys().next().value!);
-                const record = (receipt: unknown) => {
-                  const result = { state: "recorded", sequence, receipt };
-                  // Never truncate native evidence, and never resurrect an evicted callback.
-                  admission.status = isMutationStatus(result) &&
-                    Buffer.byteLength(JSON.stringify(success(request, result))) + 1 <= replyBytes
-                    ? structuredClone(result) : { state: "outcome_unknown", sequence };
-                };
-                try {
-                  if (alreadyPending) throw new Error("busy");
-                  if (request.method === "input") {
-                    await view.input(request.params.selection, request.params.input, native => record({ kind: "input", native }));
-                  } else record({ kind: "cancel", native: view.cancel(request.params.selection) });
-                } catch (error) {
-                  // own() may reject the return after disconnect/retirement, but cannot erase an admitted native receipt.
-                  if (admission.status.state === "pending") record({ kind: "error", code: errorCode(error) });
-                } finally { client.pending--; if (!client.socket) client.idleAt = Date.now(); }
-                page = admission.status;
-                break;
-              }
+              case "workers.activity": page = request.params.format === "public-v1"
+                ? view.readPublicActivity(request.params.ref, typeof request.params.cursor === "string" ? request.params.cursor : undefined,
+                  request.params.recovery, replyBytes - Buffer.byteLength(JSON.stringify(success(request, null))) - 1)
+                : view.readActivity(request.params.ref, typeof request.params.cursor === "string" ? undefined : request.params.cursor); break;
+              case "workers.result": page = request.params.format === "public-v1"
+                ? view.readPublicResult(request.params.ref, request.params.cursor)
+                : view.readResult(request.params.ref, request.params.cursor); break;
               case "route.read": {
-                if (!ceilings.includes("route")) throw new Error("forbidden");
                 const { state, ...raw } = view.route(request.params.id, request.params.offset, true);
                 page = { state, page: raw }; break;
               }
               case "history.list":
               case "history.read": {
-                if (request.method === "history.read" && !ceilings.includes("history")) throw new Error("forbidden");
                 const { workerId, cursor, limit } = request.params;
                 // Account for this exact complete envelope, retaining the smaller native page ceiling.
                 const budget = Math.min(32 * 1024, replyBytes - Buffer.byteLength(JSON.stringify(success(request, null))) - 1);
@@ -239,7 +186,8 @@ export function createAgentBridge(controller: Controller, root: string, grants: 
               }
             }
             const reply = success(request, page);
-            if (!isReply(reply, request.method)) throw new RangeError("worker read identity or projection exceeds wire contract");
+            if (!isReply(reply, request.method, "format" in request.params ? request.params.format : undefined))
+              throw new RangeError("worker read identity or projection exceeds wire contract");
             const bytes = Buffer.byteLength(JSON.stringify(reply)) + 1; // complete LF record
             if (request.method === "subscribe" && bytes > replyBytes) stop();
             send(bytes <= replyBytes ? reply : failure(request, "oversized"));
@@ -266,10 +214,10 @@ export function createAgentBridge(controller: Controller, root: string, grants: 
       rootIdentity = privateRoot(root);
       if (Buffer.byteLength(socketPath) > 103)
         throw new Error("Agent bridge Unix socket path exceeds the OS limit; choose a shorter private directory");
-      const view = controller.openView();
+      const view = controller.openView({ control: false, policy: "bridge-read" });
       try {
-        descriptor = { version: 1, transport: "unix", socket: socketPath, token: randomBytes(32).toString("hex"),
-          owner: view.list().owner, grants: ceilings, capabilities };
+        descriptor = { version, transport: "unix", socket: socketPath, token: randomBytes(32).toString("hex"),
+          owner: view.list().owner, capabilities };
       } finally { await view.close(); }
       if (!live()) return;
       await new Promise<void>((resolve, reject) => {
