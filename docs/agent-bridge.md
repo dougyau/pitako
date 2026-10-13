@@ -12,8 +12,8 @@ import { connect } from "pitako/extensions/agent/bridge/client.js";
 
 Import is passive. It does not load extension factories, read settings, start Pi,
 or open a socket. The host client needs no Bun, Jiti, TypeScript loader, or runtime
-compilation. The package declares Node `>=22.19.0`. The installed native client
-observations used Node v25.2.1, not every supported Node version.
+compilation. The package declares Node `>=22.19.0`. The composed offline worker
+journeys used Node v26.11.1, not every supported Node version.
 
 ## Launch and connect
 
@@ -30,11 +30,10 @@ directory with mode `0700`, owned by the current OS user, with no symlinked path
 The generated socket path must fit 103 UTF-8 bytes. A short root avoids the Unix
 socket path limit.
 
-The optional launch flag
-`--pitako-agent-bridge-grants=history,route,control` sets immutable permission
-ceilings. Its value is a unique comma-separated subset of those names. Omission
-or an empty value permits none. A ceiling alone enables neither raw reads nor
-control. Each connection starts with a fresh read-only view.
+The launch flag is the bridge configuration. No TOML grant or control setting is
+required. Each connection is read-only. There are no grant flags, ceilings,
+activation requests, consent prompts, or permission handshakes.
+Authentication allows scoped reads, never worker control.
 
 The bridge starts only during foreground RPC `session_start` when its flag is
 present and startup succeeds. Factory loading alone, child sessions, and non-RPC
@@ -43,10 +42,11 @@ Bridge messages use a separate authenticated Unix socket.
 
 On readiness, the broker atomically publishes `descriptor.json` in the private
 root without overwriting an existing file. The descriptor and generated socket
-have mode `0600`. Descriptor version 1 contains `transport: "unix"`, `socket`,
-`token`, `owner`, `grants`, and `capabilities`. The owner contains `processId`,
+have mode `0600`. Descriptor version 2 contains `transport: "unix"`, `socket`,
+`token`, `owner`, and `capabilities`. The owner contains `processId`,
 `coordinatorSessionId`, and `epoch`. Capabilities name implemented operations,
-not permissions already activated.
+not control authority. Protocol 1 is incompatible; there is no fallback decoder
+or compatibility mode.
 
 The host correlates this native Pi RPC request with its successful response:
 
@@ -96,7 +96,10 @@ bookkeeping, delivery, continuation, and observed handoff acknowledgement separa
 | Client operation | Returned data and continuation |
 | --- | --- |
 | `list(after?, revision?)` | `WorkerList` with `owner`, `revision`, `items`, and nullable `cursor`. Continuation uses `cursor` as `after` and carries the first page's `revision`. |
-| `detail(id, cursor?)` | Ready detail with `ref`, authoritative `status`, earlier `observedStatus`, separate `workbrief` and `metadata` text pages, `nextBrief`, `nextMetadata`, and `controls`. Unknown targets reject. |
+| `detail(id, cursor?)` | Ready diagnostic detail with `ref`, authoritative `status`, earlier `observedStatus`, separate `workbrief` and `metadata` text pages, `nextBrief`, and `nextMetadata`. Unknown targets reject. |
+| `publicDetail(id, cursor?)` | `public-v1` launch metadata for `agent_spawn` and `team_assign`, distinct from diagnostic detail and event activity. |
+| `publicActivity(ref, cursor?, recovery?)` | Public native conversation snapshot and signed continuation, with scoped binding, immutable revisions, explicit gaps and optional persisted recovery. |
+| `publicResult(ref, cursor?)` | Authoritative, non-consuming public outcome text; independent from conversation capture closure. |
 | `requests(id, cursor?)` | SDK-observed request metadata as a JSON text page, with `ref` and nullable `next`. A changed projection invalidates its digest-bound cursor. |
 | `activity(ref, cursor?)` | Availability or a ready event page with `ref` and `next`. The cursor's `after` follows the returned event sequence. `page.more` indicates more retained events. |
 | `result(ref, cursor?)` | Availability or a non-consuming terminal result with text and metadata pages, `nextText`, and `nextMetadata`. |
@@ -175,6 +178,191 @@ reads can reject with `BridgeError`. Synchronous `agent_run` has no supported
 retained activity or result producer and reports `unsupported_kind`.
 A terminal display status alone does not establish a ready settled result.
 
+### Early public launch metadata
+
+`publicDetail` requests `workers.detail` with `format: "public-v1"` over
+protocol 2. Its `worker` identifies source, instance, role, coordinator session,
+actual launch `toolCallId`, acceptance time, and native Team `assignmentId` when
+applicable. Internal callers without a tool-call ID report `toolCallId: null`
+and `linkage: "unlinked"`; identity is not reconstructed from routing or output.
+`workbrief` preserves the original task with a separate `nextBrief` cursor.
+Selected/requested settings and observed activation remain separate.
+
+Accepted identity and the local revision are published before launch resolves,
+even before history or native session allocation. Setup failure updates that
+same worker. Socket delivery is scheduled independently; launch does not wait
+for host acknowledgement. A host adapter must register the accepted child
+before finalizing its parent turn. Handler return does not prove that the
+adapter has received the child or finished its translation.
+
+Execution, result availability and capture are independent. Native SDK capture
+starts `opening`, becomes `open` once a genuine session is bound, and closes
+only after shutdown, disposal, reconciliation and worker metadata settle.
+Absent producers report `incomplete`/`not_captured`; projection failures report
+`incomplete`/`capture_failed` without changing the authoritative worker outcome.
+One invocation remains one worker. `bindings` distinguish native sessions and
+generations, attempts and activated models; same-session fallback adds attempts,
+while replacement sessions retain historical bindings. `nextBindings` pages
+bounded binding metadata separately from `nextBrief`.
+Public launch metadata contains no raw history, routing record or managed
+transport secret. `agent_run` returns `unsupported_kind` from this format;
+its ordinary result, history and observations remain unchanged.
+
+### Public conversation continuation
+
+Use a `publicDetail.bindings[i].ref` with `publicActivity`. The first call fixes
+a snapshot cut at the available beginning. Drain `next` while `more` is true;
+retain the final non-null `next` for future changes, including after launch
+return, missed `changed` hints and reconnect under the same owner. Metadata
+revisions are not conversation sequences. Owner replacement and process restart
+invalidate in-memory capture cursors. Foreign workers, bindings and epochs are
+rejected; historical captured references do not select the current generation.
+
+Apply changes by record `id` and immutable `revision`. Native user/assistant
+messages expose genuine entry and parent IDs; tools upsert by the genuine
+`toolCallId` across start/update/end/persisted result. `order`, `nativeOrder`,
+native time and `observedAt` are separate. `branch_changed` gives genuine old/new
+heads; prior records remain historical, not another session's active branch.
+Public `order` is allocated by the conversation owner for the available
+projection, not copied from journal sequence or native file ordinal. Recovery
+reserves insertion ranges around known placements; it may publish newer
+revisions to rebase them. An issued revision or cut does not change.
+
+Every wire reply including its JSON envelope is at most 48 KiB; each page has at
+most 50 records. Large upserts use `kind: "fragment"`, `encoding: "base64-json"`,
+record ID/revision, UTF-8 byte offsets and total bytes. Concatenate and decode the
+entire record before interpreting its arguments: a partial JSON fragment is not
+valid tool arguments. Retry/replay does not create another record.
+
+Changes **and snapshots** are bounded to 4 MiB per worker and 32 MiB per owner,
+counted as UTF-8 JSON bytes. Eviction reports lost ranges and `resync_required`.
+Take an available fresh snapshot or explicitly call `publicActivity(ref,
+undefined, true)` to recover registered persisted messages using positional
+reads. Recovery never opens a new SDK session or scans unrelated archives.
+Unpersisted intermediate tool updates cannot be recovered. Missing, pruned and
+unsupported sources remain explicit gaps; recovery is not proof of completeness.
+Placement metadata and immutable recovery recipes count against these same
+budgets. Recovery's first page reads only the header. Its next page makes one
+positional reservation pass over that registered file cut, keeping only bounded
+placement anchors/ranges, then streams individual lines. Live updates,
+reconciliation and continuation do not reread the complete file.
+
+After `resync_required`, finish a **fresh read without a cursor** before choosing
+its sort domain: `state: "ready", more: false` closes that available cut; its
+non-null `next` is for later changes, not another snapshot page. Sort IDs present
+in the closed cut plus placeable recovery upserts, applying revisions within
+each binding. Keep previously imported IDs absent from that set for consultation,
+outside this sort domain; do not delete their copies or guess their interleaving.
+Snapshot-present transient tools remain sortable. Recovery's `not_persisted`
+means lost transient content cannot be reconstructed natively, not exclusion
+of present tools. If a cut or its placement recipe is lost while paging, honor
+the new `resync_required` rather than treating a partial cut as closed. This
+partition uses the existing pagination facts; there is no eternal cross-loss
+order guarantee or durable placement journal.
+
+Public fields exclude thinking/signatures, instructions, Team wrappers, custom
+private entries, routing, managed auth, leases and control selections. Original
+WorkBrief and ordinary public text/tool arguments remain public; this is not a
+universal scanner for arbitrary secrets written into those fields. Images and
+binary/unknown content are represented as explicit omissions.
+
+### Node page assembly and follow reads
+
+This example keeps copies for one binding. It assembles UTF-8 fragments before
+applying upserts, and returns the IDs observed in each finished traversal.
+The host owns the lifetime and storage of `copies`.
+
+```js
+async function readAvailable(client, ref, copies, cursor, recovery = false) {
+	const parts = new Map();
+	const present = new Set();
+	const gaps = new Set();
+	let capture;
+	for (;;) {
+		const page = await client.publicActivity(ref, cursor, recovery);
+		if (!("changes" in page)) throw new Error(`Unavailable: ${page.state}`);
+		if (page.state === "resync_required") {
+			return { state: page.state, gaps: page.gaps, lost: page.lost };
+		}
+		for (const gap of page.gaps) gaps.add(gap);
+		capture = page.capture;
+		for (const change of page.changes) {
+			let record;
+			if (change.kind === "fragment") {
+				const key = `${change.id}:${change.revision}`;
+				const part = parts.get(key) ?? { bytes: 0, chunks: [] };
+				if (part.bytes !== change.byteOffset) throw new Error("Fragment offset");
+				const chunk = Buffer.from(change.data, "base64");
+				part.chunks.push(chunk);
+				part.bytes += chunk.length;
+				parts.set(key, part);
+				if (part.bytes !== change.totalBytes) continue;
+				record = JSON.parse(Buffer.concat(part.chunks).toString("utf8")).record;
+				parts.delete(key);
+			} else {
+				record = change.record;
+			}
+			present.add(record.id);
+			const prior = copies.get(record.id);
+			if (!prior || record.revision > prior.revision) copies.set(record.id, record);
+		}
+		if (!page.more) {
+			if (parts.size) throw new Error("Incomplete record");
+			return { state: "ready", next: page.next, present, gaps: [...gaps], capture };
+		}
+		if (!page.next) throw new Error("Missing continuation");
+		cursor = page.next;
+	}
+}
+
+const detail = await client.publicDetail(workerId);
+if (!("bindings" in detail)) throw new Error(detail.reason); // agent_run is unsupported.
+const binding = detail.bindings[0];
+if (!binding) throw new Error("Native binding not yet available");
+const copies = new Map();
+let read = await readAvailable(client, binding.ref, copies);
+if (read.state === "ready" && read.next) {
+	// Later, after a hint or an explicit refresh, not a tight polling loop:
+	read = await readAvailable(client, binding.ref, copies, read.next);
+}
+```
+
+The helper does not select a sort domain, reconnect, or schedule reads.
+After resync, a fresh call without a cursor returns the closed available set
+only when `state` is `ready`. The host uses that traversal's `present`, not
+all keys in `copies`, as the initial sortable set. Placeable recovery upserts
+can add IDs. Copies absent from the set remain available for consultation.
+Order is comparable within a binding, not across workers or generations.
+
+Recovery is explicit:
+
+```js
+const fresh = await readAvailable(client, binding.ref, copies);
+const recovery = await readAvailable(client, binding.ref, copies, undefined, true);
+// Preserve both observations and their gaps. Neither erases older copies.
+```
+
+A recovery page with `more: false` ends pagination, not loss.
+`capture.state: "incomplete"` with `gaps: ["capture_failed"]` is a failed
+capture observation even if registered native messages are recoverable.
+`not_persisted` reports missing transient recovery data. It does not exclude
+transient records already present in the closed fresh cut from its sort.
+
+Terminal reads remain independent:
+
+```js
+const terminal = await client.publicDetail(workerId);
+const outcome = await client.publicResult(terminal.ref);
+// outcome.state can be "pending" while shutdown or disposal still runs.
+// Reading an available outcome again does not consume coordinator delivery.
+// terminal.lifecycle.capture can be "incomplete" even for completed execution.
+```
+
+`branch_changed` records describe native head transitions. The host retains
+historical messages instead of treating every imported record as an active
+branch message. A replacement binding needs its own reference and read state.
+Same-session fallback remains in its existing binding.
+
 ## Change subscriptions
 
 `subscribe(listener)` returns a `BridgeSubscription` with `subscriptionId`,
@@ -195,7 +383,7 @@ refresh scheduling and must settle asynchronous callbacks before cleanup.
 It is idempotent. `disconnect()` is also owned and idempotent. A disconnect
 revokes that view and its subscription, not the workers.
 
-## Scoped history and sensitive reads
+## Scoped history and raw reads
 
 `historyList(options?)` is an ordinary metadata read. Options are `workerId`,
 `cursor`, and `limit`. With no `workerId`, scope is the current coordinator's
@@ -207,9 +395,9 @@ list options. IDs come from scoped metadata. Continuation preserves the same
 selectors and the returned cursor. The default limit is 50, and the maximum is
 200. Byte limits can shorten a page.
 
-Raw worker history requires both a launch `history` ceiling and a fresh
-`grant("history", true)`. Raw routing requires both the `route` ceiling and a
-fresh `grant("route", true)`. Neither acknowledgement can elevate a ceiling:
+Authenticated bridge views read scoped history and routing directly. The
+internal read-only bridge policy bypasses only sensitive-read acknowledgement;
+screen and Herdr views retain their own acknowledgement and control guards:
 
 ```ts
 import type { BridgeClient } from "pitako/extensions/agent/bridge/client.js";
@@ -220,9 +408,7 @@ async function readSensitiveFirstPages(
 	historyId: string,
 	groupId: string,
 ) {
-	await client.grant("history", true);
 	const history = await client.historyRead({ workerId, historyId, groupId });
-	await client.grant("route", true);
 	const route = await client.routeRead(workerId);
 	return { history, route };
 }
@@ -245,86 +431,24 @@ invocation.
 The bridge accepts no global history scope, coordinator transcript source,
 arbitrary path, or general file catalog. The broader foreground history tools
 have different authority. See [Worker history](worker-history.md).
-Reconnect resets both sensitive acknowledgements.
+## Read-only boundary
 
-## Explicit worker control
-
-Control requires the immutable `control` ceiling and explicit
-`grant("control", true, selection)` for a current controllable worker.
-`detail(id).controls.selection` supplies the complete `AgentSelection`.
-That selection binds process, coordinator session, epoch, target, instance,
-generation, history ID, and native session ID. A Team target also binds its
-assignment ID. Missing selection has a reason. Read references are not substitutes.
-
-Activation invokes the current controller's checks. Input and cancellation
-recheck the selection at admission. A replaced, terminal, synchronous, foreign,
-or retired target does not gain authority from an old selection.
-
-`input(selection, { intent, text, decisionId? }, sequence)` accepts only `query`
-or `steer`. Query asks for context. Steer supplies an in-scope correction relative
-to the original WorkBrief. Input is a note at a later native steering boundary,
-after current tools finish. It is not a command, replacement prompt, follow-up
-execution, or interruption of a running command. `decisionId` is an optional
-correlation label, not authorization.
-
-For one deliberate decision, the host supplies a sequence it has allocated:
-
-```ts
-import type { BridgeClient } from "pitako/extensions/agent/bridge/client.js";
-
-async function sendQuery(client: BridgeClient, id: string, sequence: number) {
-	const detail = await client.detail(id);
-	const selection = detail.controls.selection;
-	if (!selection) throw new Error("Worker is not controllable");
-	await client.grant("control", true, selection);
-	return client.input(selection, {
-		intent: "query",
-		text: "What context is missing from the original WorkBrief?",
-	}, sequence);
-}
-```
-
-`cancel(selection, sequence)` requests cancellation through the same current
-authority. A recorded cancellation receipt with native `status: "requested"`
-does not establish physical settlement, native disposal, or result readiness.
-The host observes those separately.
+The bridge does not implement `input`, `cancel`, `view.grant` or
+`request.status`. Such wire requests return `unsupported_method`, without
+worker effects. No client mutation methods, receipts or activation are exposed.
+Connecting, reading, closing a view and disconnecting cannot steer, abort or
+cancel workers or change their result delivery. Normal coordinator tools,
+steering and cancellation retain their existing authority and guards.
 
 The bridge cannot spawn workers, invoke arbitrary tools or shell commands,
 change models, operate the Board, or read general plan and verification evidence.
 
-## Mutation receipts and explicit reconnect
+## Explicit reconnect
 
-The lease is `{ clientId, resumeToken, highWater }`. `highWater` is the value at
-connect, not a live counter. Each later sequence is an explicit new client
-decision, a positive safe integer above the consumed high-water mark.
-The host tracks its allocations. Repeatedly computing `client.lease.highWater + 1`
-would reuse a stale value.
-
-The server records admission before the native effect. The same retained
-sequence and payload return the existing status without repeating the effect.
-A changed payload at that retained sequence rejects with `sequence_conflict`.
-Receipt eviction does not make a consumed sequence available again.
-Only one mutation per lease can perform native work at a time. A later sequence
-admitted while work is pending records a `busy` error and remains consumed.
-
-`input`, `cancel`, and `requestStatus(sequence)` return `MutationStatus`:
-
-| State | Meaning |
-| --- | --- |
-| `pending` | The admitted operation has not yet recorded its outcome. |
-| `recorded` | The receipt is retained. It is an input receipt, cancellation request, or classified error with a code. |
-| `outcome_unknown` | The sequence is consumed, but its outcome is unavailable. It is not permission to retry. |
-| `not_admitted` | This current logical lease has not admitted that sequence. It says nothing about a lost operation under an old owner or different lease. |
-
-An input receipt's native status is `queued`, `handled`, `rejected`, or
-`unconfirmed`. Queued proves admission. Handled proves input-hook consumption.
-Neither proves an answer, arbitrary provider delivery, or adequate correction.
-Rejected reports nonacceptance. Unconfirmed reports closure without delivery or
-answer proof. `candidateAnswer` is a possible linkage, not an adequacy judgment.
-
-After response loss, the host uses its prior private lease only for explicit
-resume and lookup. The following helper reconnects after the old connection
-has closed. It performs no mutation or grant:
+The private lease is `{ clientId, resumeToken }`. It supports explicit resume of
+the same logical read client after the old connection closes. It carries no
+mutation sequence or receipt state. Reconnect requires a fresh authoritative
+read and reinstalls no subscriptions:
 
 ```ts
 import {
@@ -332,31 +456,24 @@ import {
 	type ResumeLease,
 } from "pitako/extensions/agent/bridge/client.js";
 
-async function lookupAfterLoss(
+async function refreshAfterLoss(
 	descriptorPath: string,
 	expectedSessionId: string,
 	resume: ResumeLease,
-	sequence: number,
 ) {
 	const client = await connect(descriptorPath, { expectedSessionId, resume });
 	try {
-		return await client.requestStatus(sequence);
+		return await client.list();
 	} finally {
 		await client.disconnect();
 	}
 }
 ```
 
-Resume preserves retained lookup on the same logical lease. It restores no
-grants, control activation, or subscriptions. The host refreshes reads and
-reobserves a selection before any deliberate later control decision. Resubmission
-or advancing the sequence after an unknown outcome is never a transport retry.
-
 An active old connection can produce `busy` on resume. An expired or unknown
-resume token produces `lease_expired`. Transport loss, timeout, or process loss
-is not proof that a mutation failed. The client does not silently resend, advance
-a sequence, or retry with a new token. Owner retirement invalidates old live
-authority. Process restart or session replacement provides no recovery of
+resume token produces `lease_expired`. The client does not silently reconnect,
+resend or retry with a new token. Owner retirement invalidates old read
+references. Process restart or session replacement provides no recovery of
 worker execution and no automatic replay.
 
 ## Limits and trust boundary
@@ -369,20 +486,16 @@ These limits are fixed, not requests for unbounded buffering:
 | Active socket connections in total | 4 |
 | Active subscriptions per connection | 1 |
 | Outstanding requests per connection | 8 |
-| Latest mutation receipts per logical client | 32, plus the consumed high-water mark |
-| Disconnected lease lifetime | 5 idle minutes, beginning only after accepted work settles |
+| Disconnected lease lifetime | 5 idle minutes |
 | Complete frame | 64 KiB |
 | Complete UTF-8 reply | 48 KiB, including the envelope and LF |
 | Outbound queue | 256 KiB |
-| Input text | 16 KiB UTF-8, nonblank |
-| Decision ID | 1,024 UTF-8 bytes |
 | Descriptor file | 16 KiB |
 | Serialized read reference | 4,096 UTF-8 bytes |
-| Serialized control selection | 8,192 UTF-8 bytes |
 | Terminal activity retention | 128 snapshots, 64 KiB each, 8 MiB total |
 
 Text-page offsets and lengths use code units as described above. Transport,
-identity, input, and retention byte budgets are not character counts.
+identity and retention byte budgets are not character counts.
 Authoritative readers bound activity pages. The broker validates the complete
 envelope and reports `oversized` if it exceeds the reply budget. It does not
 subdivide an oversized activity reply. A slow peer can disconnect when its
@@ -407,3 +520,23 @@ directory and removes it only after the process and its owned work have settled.
 There is no Windows, TCP, browser, remote-access, global-discovery, or T3 path
 mapping support. This is the Pitako host API, not a shipped T3Code integration.
 Worker completion wake behavior remains unchanged.
+
+## Future T3 adapter and Lineage work
+
+Pitako provides **lectura pública incremental disponible**: available incremental
+public reads within declared capture and retention limits. It does not provide
+a complete conversation or establish functioning T3 Lineage.
+
+A separate T3 adapter needs to update its vendored protocol 2 client and remove
+old bridge grant and control settings. The adapter must correlate native
+`toolCallId` with the real parent turn and node, register each child before the
+parent terminal, and translate and persist public messages, tools, and results.
+Known live children need ingestion after the parent terminal until capture
+closes or reports an explicit incomplete outcome. The main-space conversation
+remains read-only. Resync must preserve old copies outside the available sort
+domain described above.
+
+This Pitako unit imports no T3 types, creates no T3 ThreadIds, writes no T3
+database, and implements no T3 translation or Lineage. Offline composed checks
+observe both launch handlers, real native SDK capture and the Node consumer.
+They do not certify external providers, T3 ingestion, or parent-terminal timing.

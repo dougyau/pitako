@@ -22,7 +22,7 @@ async function ownedBridge(run: (fixture: {
   chmodSync(root, 0o700);
   const owner = { sessionId, token: Symbol() };
   const controller = createAgentController(owner, () => owner);
-  const bridge = createAgentBridge(controller, root, [], () => true);
+  const bridge = createAgentBridge(controller, root, () => true);
   const wires: ReturnType<typeof rawClient>[] = [], clients: Awaited<ReturnType<typeof connect>>[] = [];
   try {
     await bridge.ready;
@@ -53,7 +53,7 @@ function rawClient(descriptor: Descriptor) {
     { label: "Agent bridge", fatalUtf8: true }));
   let sequence = 0;
   const envelope = (method: string, params: Record<string, unknown> = {}): Envelope =>
-    ({ version: 1, id: String(++sequence), clientId: "raw", owner: descriptor.owner, method, params });
+    ({ version: 2, id: String(++sequence), clientId: "raw", owner: descriptor.owner, method, params });
   const next = () => replies.length ? Promise.resolve(replies.shift()) :
     new Promise<unknown>(resolve => { receive = resolve; });
   return { socket, closed, envelope, next,
@@ -128,7 +128,7 @@ test("private ready descriptor and explicit connect have truthful default capabi
     expect(lstatSync(descriptor.socket).mode & 0o777).toBe(0o600);
     expect(isDescriptor(descriptor)).toBe(true);
     expect(descriptor.capabilities).toEqual(capabilities);
-    expect(descriptor.grants).toEqual([]);
+    expect(descriptor).not.toHaveProperty("grants");
     const peer = wire();
     const denied = await peer.request(peer.envelope("workers.list"));
     expect(denied).toMatchObject({ ok: false, error: { code: "unauthorized" } });
@@ -137,10 +137,10 @@ test("private ready descriptor and explicit connect have truthful default capabi
     const forged = peer.envelope("connect", { token: descriptor.token, expectedSessionId: "owner" });
     forged.owner = { ...forged.owner, epoch: "old" };
     expect(await peer.request(forged)).toMatchObject({ ok: false, error: { code: "stale_owner" } });
-    expect(await peer.authenticate()).toMatchObject({ ok: true, result: { capabilities, grants: [] } });
+    expect(await peer.authenticate()).toMatchObject({ ok: true, result: { capabilities } });
     for (const method of ["history.list", "history.read", "route.read", "view.grant", "control.cancel", "worker.detail", "workers.subscribe"]) {
       const reply = await peer.request(peer.envelope(method, { payload: "payload-not-to-echo", token: descriptor.token }));
-      const code = ["history.list", "history.read", "route.read", "view.grant"].includes(method) ? "invalid_request" : "unsupported_method";
+      const code = ["history.list", "history.read", "route.read"].includes(method) ? "invalid_request" : "unsupported_method";
       expect(reply).toMatchObject({ ok: false, error: { code } });
       expect(JSON.stringify(reply)).not.toContain("payload-not-to-echo"); expect(JSON.stringify(reply)).not.toContain(descriptor.token);
     }
@@ -169,7 +169,7 @@ test("scoped retained terminal rows paginate truthfully under the smaller cap an
       revision = page.revision;
       expect(page.items.length).toBeGreaterThan(0);
       expect(Buffer.byteLength(JSON.stringify(page.items))).toBeLessThanOrEqual(30 * 1024);
-      expect(Buffer.byteLength(JSON.stringify({ version: 1, id: '"'.repeat(128), clientId: '"'.repeat(128),
+      expect(Buffer.byteLength(JSON.stringify({ version: 2, id: '"'.repeat(128), clientId: '"'.repeat(128),
         owner: descriptor.owner, ok: true, result: page }) + "\n")).toBeLessThanOrEqual(replyBytes);
       for (const item of page.items) {
         expect(item.terminalAt).toBe(2); // retained long after footer linger, never a filter
@@ -202,7 +202,7 @@ test("malformed/oversized/wrong-version envelopes and more than eight simultaneo
     expect(isRequest(JSON.parse(malformed.toString("utf8")))).toBe(true); // Schema alone would admit replacement decoding.
     invalidUtf8.socket.write(malformed); await invalidUtf8.closed;
     const wrongVersion = wire();
-    wrongVersion.socket.write(frame({ ...wrongVersion.envelope("workers.list"), version: 2 }));
+    wrongVersion.socket.write(frame({ ...wrongVersion.envelope("workers.list"), version: 1 }));
     await wrongVersion.closed;
     const longId = wire();
     longId.socket.write(frame({ ...longId.envelope("workers.list"), id: "x".repeat(129) })); await longId.closed;
@@ -238,7 +238,7 @@ test("native client rejects invalid UTF-8 in otherwise schema-valid list metadat
 });
 
 test("schema rejects unsupported requests and foreign/extra/malformed reply payloads", () => {
-  const request: Envelope = { version: 1, id: "1", clientId: "client", owner: {
+  const request: Envelope = { version: 2, id: "1", clientId: "client", owner: {
     processId: "process", coordinatorSessionId: "owner", epoch: "epoch" }, method: "workers.list", params: {} };
   expect(isRequest(request)).toBe(true);
   expect(isRequest({ ...request, params: { selection: {} } })).toBe(false);
@@ -248,7 +248,7 @@ test("schema rejects unsupported requests and foreign/extra/malformed reply payl
     expect(isRequest({ ...request, owner: { ...request.owner, [key]: "x".repeat(1025) } })).toBe(false);
   expect(isReply(failure(request, "unauthorized"), "workers.list")).toBe(true);
   expect(isReply({ ...failure(request, "unauthorized"), error: { code: "unauthorized", message: "secret" } }, "workers.list")).toBe(false);
-  expect(isReply({ version: 1, id: "1", clientId: "client", owner: request.owner, ok: true,
+  expect(isReply({ version: 2, id: "1", clientId: "client", owner: request.owner, ok: true,
     result: { owner: { ...request.owner, epoch: "foreign" }, items: [], cursor: null } }, "workers.list")).toBe(false);
 });
 
@@ -258,7 +258,7 @@ test("non-owned host directory is rejected before creating any socket or descrip
   const owner = { sessionId: "owner", token: Symbol() }, controller = createAgentController(owner, () => owner);
   const uid = process.getuid!();
   const identity = spyOn(process, "getuid").mockReturnValue(uid + 1);
-  const bridge = createAgentBridge(controller, root, [], () => true);
+  const bridge = createAgentBridge(controller, root, () => true);
   try {
     await expect(bridge.ready).rejects.toThrow("same-user");
     bridge.revoke(); await bridge.settle();
@@ -281,7 +281,7 @@ test("invalid/nonprivate/symlink/conflicting/too-long directories fail without r
   symlinkSync(roots[4]!, roots[3]!);
   try {
     for (const root of roots) {
-      const bridge = createAgentBridge(controller, root, [], () => true);
+      const bridge = createAgentBridge(controller, root, () => true);
       await expect(bridge.ready).rejects.toThrow();
       bridge.revoke(); await bridge.settle();
     }
@@ -343,7 +343,7 @@ test("pending readiness is owned and revoke-before-await forbids a late descript
     const view = open();
     return { ...view, async close() { started(); await held; await view.close(); } };
   });
-  const bridge = createAgentBridge(controller, root, [], () => true);
+  const bridge = createAgentBridge(controller, root, () => true);
   try {
     await entered; bridge.revoke(); controller.revoke();
     const settlement = bridge.settle();
@@ -366,7 +366,7 @@ test("publication conflict after listen closes owned transport and preserves the
     if (target === file) writeFileSync(file, "unrelated publication", { flag: "wx", mode: 0o600 });
     return link(source, target);
   });
-  const bridge = createAgentBridge(controller, root, [], () => true);
+  const bridge = createAgentBridge(controller, root, () => true);
   try {
     await expect(bridge.ready).rejects.toThrow("EEXIST");
     await bridge.settle();

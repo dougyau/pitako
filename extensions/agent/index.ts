@@ -40,11 +40,12 @@ function historyOrigin(
   source: HistoryOrigin["source"],
   ctx: { sessionManager?: { getSessionId?: () => string | undefined; getSessionFile?: () => string | undefined } },
   workbrief: string,
+  toolCallId: string,
   execution?: ExecutionBinding,
   assignmentId?: string,
 ): HistoryOrigin {
   return {
-    source, workbrief, assignmentId,
+    source, workbrief, toolCallId, assignmentId,
     coordinatorSessionId: ctx.sessionManager?.getSessionId?.(),
     coordinatorSessionFile: ctx.sessionManager?.getSessionFile?.(),
     ...(execution ? { execution: {
@@ -167,7 +168,7 @@ export default function agentInstance(pi: ExtensionAPI): void {
             return snapshot;
           });
         }
-        const origin = historyOrigin("agent_run", ctx, params.task);
+        const origin = historyOrigin("agent_run", ctx, params.task, _toolCallId);
         if (dispatch) {
           origin.routing = dispatch.routing;
           origin.routingEvidence = { state: dispatch.evidence, gap: dispatch.evidenceGap };
@@ -284,7 +285,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
             params.task.trim(),
           ].join("\n");
           const launchRoot = execution?.executionRoot ?? ctx.cwd;
-          const origin = historyOrigin("team_assign", ctx, params.task, execution, id);
+          const origin = historyOrigin("team_assign", ctx, params.task, _toolCallId, execution, id);
           if (dispatch) {
             origin.routing = dispatch.routing;
             origin.routingEvidence = { state: dispatch.evidence, gap: dispatch.evidenceGap };
@@ -564,7 +565,7 @@ function registerBackgroundTools(pi: ExtensionAPI): void {
           owns: () => { check(); return true; },
         }) : undefined;
         check();
-        const origin = historyOrigin("agent_spawn", ctx, params.task, execution);
+        const origin = historyOrigin("agent_spawn", ctx, params.task, _toolCallId, execution);
         if (dispatch) {
           origin.routing = dispatch.routing;
           origin.routingEvidence = { state: dispatch.evidence, gap: dispatch.evidenceGap };

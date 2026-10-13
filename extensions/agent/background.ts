@@ -8,6 +8,7 @@ import type { LoadOptions } from "../roles/load.ts";
 import type { ExecutionBinding } from "../workflow.ts";
 import type { LiveHandle } from "./live.ts";
 import { randomUUID } from "node:crypto";
+import { PublicConversation } from "./public-conversation.ts";
 
 export interface WorkerInterest {
   planId: string;
@@ -102,6 +103,7 @@ interface Row {
   live?: LiveHandle;
   generation: number;
   attemptId?: string;
+  conversation?: PublicConversation;
 }
 
 interface Bag {
@@ -141,6 +143,7 @@ export function clearBackgroundOwner(): void {
 /** Retire admission authority without aborting or pretending to join workers. */
 export function revokeBackgroundOwner(token: symbol): void {
   const state = bag();
+  for (const row of state.rows.values()) if (row.ownerToken === token) row.conversation?.retire();
   removeOwnerTerminalActivity(token);
   if (state.owner?.token === token) state.owner = undefined;
   state.teamOwners?.delete(token);
@@ -197,6 +200,10 @@ export async function spawnBackground(input: {
           accepted.generation++;
           const generation = accepted.generation;
           const { historyId, sessionId } = handle;
+          if (accepted.conversation && handle.publicConversation) {
+            handle.publicConversation.attach(accepted.conversation);
+            if (accepted.attemptId) accepted.conversation.attempt(accepted.attemptId);
+          }
           const key = () => {
             if (!currentReadRow(accepted, epoch) || accepted.live !== handle || accepted.generation !== generation ||
                 handle.historyId !== historyId || handle.sessionId !== sessionId || !accepted.attemptId) return undefined;
@@ -244,12 +251,22 @@ export async function spawnBackground(input: {
         generation: 0,
       };
       bag().rows.set(instance.id, row);
+      if (ownerToken) {
+        row.conversation = new PublicConversation(undefined, input.executor.capturesPublicConversation === true);
+        row.conversation.bind(ownerToken);
+        row.conversation.onChange = () => {
+          if (row && currentReadRow(row, epoch)) touchObservation(row.instanceId, epoch);
+        };
+      }
     },
     onObserve(snapshot) {
       if (!row || bag().rows.get(row.instanceId) !== row || row.signal === "dropped" ||
           epoch !== observationEpoch() || row.ownerToken && bag().owner?.token !== row.ownerToken ||
           row.teamOwnerToken && !bag().teamOwners?.has(row.teamOwnerToken)) return;
       row.attemptId = snapshot.attemptId;
+      if (snapshot.attemptId && snapshot.activated?.attemptId === snapshot.attemptId)
+        row.conversation?.attempt(snapshot.attemptId, snapshot.activated, { model: snapshot.selectedModel,
+          requestedModel: snapshot.requestedModel, reasoning: snapshot.requestedReasoning });
       publishObservation(
         {
           ...snapshot,
@@ -322,7 +339,7 @@ export function resolveWorkerReadBinding(target: LiveTarget, scope: WorkerReadSc
   const key = terminalActivityKey(row.instanceId, scope.ownerToken, scope.coordinatorSessionId,
     target.kind === "team" ? scope.teamToken : undefined);
   return { instanceId: row.instanceId, generation: row.generation, attemptId: row.attemptId,
-    key, handle: row.live };
+    key, handle: row.live, conversation: row.conversation };
 }
 
 export interface ResultTextPage {
@@ -463,6 +480,7 @@ export function retireTeamWorkers(token: symbol): void {
   for (const [id, row] of state.rows) {
     if (row.teamOwnerToken !== token) continue;
     row.signal = "dropped";
+    row.conversation?.retire();
     if (!row.controller.signal.aborted) row.controller.abort();
     state.rows.delete(id);
     removeObservation(id);
@@ -474,6 +492,7 @@ export function cancelAllWorkers(): void {
   const state = bag();
   for (const row of state.rows.values()) {
     row.signal = "dropped";
+    row.conversation?.retire();
     if (!row.controller.signal.aborted) row.controller.abort();
   }
   state.rows.clear();
@@ -486,6 +505,7 @@ export function shutdownBackground(token: symbol): void {
   for (const [id, row] of state.rows) {
     if (row.ownerToken !== token) continue;
     row.signal = "dropped";
+    row.conversation?.retire();
     if (!row.controller.signal.aborted) row.controller.abort();
     state.rows.delete(id);
     removeObservation(id);
@@ -536,6 +556,7 @@ function settle(row: Row, result: AgentRunResult, epoch: number): void {
   if (current !== row || current.signal === "dropped") return;
   current.outcome = result;
   if (liveOwner(current)) current.onTeamSettled?.(result.status);
+  current.conversation?.finish();
   if (currentReadRow(current, epoch)) touchObservation(current.instanceId, epoch);
   collectResult(current);
   if (liveOwner(current) && idleOf(current.deliveryOwner)) deliverWorkerResults(current.ownerToken!);

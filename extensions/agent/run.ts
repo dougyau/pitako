@@ -139,6 +139,7 @@ export interface AttemptSession {
 
 export interface AttemptExecutor {
   capturesHistory?: boolean;
+  capturesPublicConversation?: boolean;
   start(input: {
     instanceId: string;
     role: ResolvedRole;
@@ -281,8 +282,7 @@ export async function runAgentInstance(input: {
   };
   const origin = input.historyOrigin ? structuredClone({ ...input.historyOrigin, workbrief: input.historyOrigin.workbrief ?? input.task }) : undefined;
   input.onAccepted?.(instance);
-  const history = input.executor.capturesHistory
-    ? new InvocationHistory(instance.cwd, origin, input.task) : undefined;
+  let history: InvocationHistory | undefined;
   const now = input.now ?? Date.now;
   const acceptedAt = now();
   const activity = createActivity(acceptedAt);
@@ -387,6 +387,8 @@ export async function runAgentInstance(input: {
   };
   refresh();
   try {
+    // Publish accepted provenance before history/SDK setup can fail or await.
+    history = input.executor.capturesHistory ? new InvocationHistory(instance.cwd, origin, input.task) : undefined;
     const result = await agentScope.run({ instanceId: instance.id, roleId: role.id }, () =>
       executeTargets(
         instance,
@@ -420,6 +422,12 @@ export async function runAgentInstance(input: {
     });
     history?.settled();
     return result;
+  } catch (error) {
+    instance.status = "failed";
+    terminalAt = now();
+    view.error = error instanceof Error ? error.message : String(error);
+    refresh();
+    throw error;
   } finally {
     timer.stop();
     stopParent();

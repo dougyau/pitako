@@ -5,7 +5,7 @@ import { resolveOwnedLive, resolveOwnedWorkerRead } from "./owner.ts";
 import { queryHistory, type HistoryQuery } from "./history-query.ts";
 import { teamEvaluationForSession } from "../team.ts";
 import type { AgentUiSnapshot } from "./ui.ts";
-import type { WorkerReadReference, WorkerReadCursor } from "./bridge/protocol.js";
+import type { WorkerReadReference, WorkerReadCursor, PublicWorkerDetail } from "./bridge/protocol.js";
 
 export interface AgentSelection {
   processId: string;
@@ -143,6 +143,20 @@ export function createAgentController(owner: AgentControllerOwner, current: () =
       throw new Error("stale_reference");
     return row;
   };
+  // Public references name a logical invocation or captured session, not current control admission.
+  const publicRef = (row: AgentUiSnapshot): WorkerReadReference => {
+    return { kind: "read", processId, coordinatorSessionId: owner.sessionId, epoch, instanceId: row.id,
+      source: row.origin?.source ?? "agent_spawn", ...(row.origin?.assignmentId ? { assignmentId: row.origin.assignmentId } : {}) };
+  };
+  const publicRow = (ref: WorkerReadReference) => {
+    check();
+    const row = rowFor(ref.instanceId);
+    const expected = publicRef(row);
+    if (ref.kind !== expected.kind || ref.processId !== expected.processId || ref.coordinatorSessionId !== expected.coordinatorSessionId ||
+      ref.epoch !== expected.epoch || ref.source !== expected.source || ref.assignmentId !== expected.assignmentId ||
+      ref.attemptId !== undefined || ref.evaluationId !== undefined) throw new Error("stale_reference");
+    return row;
+  };
   const offsetFor = (ref: WorkerReadReference, cursor: WorkerReadCursor | undefined, section: WorkerReadCursor["section"]) => {
     if (!cursor) return 0;
     readRow(cursor.ref);
@@ -160,16 +174,15 @@ export function createAgentController(owner: AgentControllerOwner, current: () =
       for (const view of views) view.revoke();
     },
     async settle() { await Promise.allSettled([...pending]); },
-    openView(options: { control?: boolean; bindControl?: (activate: (selection: AgentSelection) => void) => void } = {}) {
+    openView(options: { control?: boolean; policy?: "bridge-read" } = {}) {
       check();
       let connected = true, sensitiveHistory = false, sensitiveRoute = false, busy = false;
-      let control = options.control !== false;
+      const control = options.control !== false && options.policy !== "bridge-read";
       const work = new Set<Promise<unknown>>();
       let unsubscribe: (() => void) | undefined;
       const lease = { revoke() { connected = false; unsubscribe?.(); } };
       views.add(lease);
       const ready = () => { check(); if (!connected) throw new Error("view is disconnected"); };
-      options.bindControl?.(selection => { ready(); admit(selection); control = true; });
       const own = <T>(operation: () => Promise<T>): Promise<T> => {
         ready();
         if (busy) throw new Error("view has outstanding work");
@@ -181,6 +194,67 @@ export function createAgentController(owner: AgentControllerOwner, current: () =
         return accepted.then(result => { ready(); return result; });
       };
       return {
+        readPublicDetail(id: string, cursor?: WorkerReadCursor): PublicWorkerDetail | { state: "unavailable"; reason: "unsupported_kind" } {
+          ready();
+          if (cursor?.ref.native) throw new Error("invalid_cursor");
+          const row = cursor ? publicRow(cursor.ref) : rowFor(id);
+          if (row.id !== id) throw new Error("invalid_cursor");
+          if (row.origin?.source !== "agent_spawn" && row.origin?.source !== "team_assign")
+            return { state: "unavailable", reason: "unsupported_kind" };
+          const ref = publicRef(row);
+          if (cursor && cursor.section !== "brief" && cursor.section !== "public_bindings") throw new Error("invalid_cursor");
+          const outcome = readWorkerResult(targetFor(row), readScope());
+          const conversation = resolveOwnedWorkerRead(targetFor(row), readScope()).conversation;
+          const capture = conversation?.metadata(ref);
+          const workbrief = { ...textPage(row.origin?.workbrief ?? row.task,
+            cursor?.section === "brief" ? cursor.offset : 0),
+            source: row.origin?.workbrief === undefined ? "invocation task" as const : "original WorkBrief" as const };
+          const start = cursor?.section === "public_bindings" ? cursor.offset : 0;
+          if (!Number.isSafeInteger(start) || start < 0 || start > (capture?.bindings.length ?? 0)) throw new Error("invalid_cursor");
+          const bindings = [];
+          for (const binding of capture?.bindings.slice(start) ?? []) {
+            if (bindings.length >= 50 || Buffer.byteLength(JSON.stringify([...bindings, binding])) > 24 * 1024) break;
+            bindings.push(binding);
+          }
+          return { format: "public-v1", ref,
+            worker: { source: row.origin.source, instanceId: row.id, roleId: row.roleId,
+              coordinatorSessionId: row.origin?.coordinatorSessionId ?? null, toolCallId: row.origin?.toolCallId ?? null,
+              ...(row.origin?.assignmentId ? { assignmentId: row.origin.assignmentId } : {}),
+              acceptedAt: row.acceptedAt, linkage: row.origin?.toolCallId ? "tool" : "unlinked" },
+            lifecycle: { execution: outcome.state === "ready" ? outcome.status : row.status === "created" ? "accepted" : row.status,
+              result: outcome.state === "ready" ? "available" : ["completed", "failed", "cancelled"].includes(row.status) ? "unavailable" : "pending",
+              capture: capture?.capture ?? "incomplete", captureReason: capture?.captureReason ?? (capture ? undefined : "not_captured"),
+              finalSequence: capture?.finalSequence },
+            bindings, captureEpoch: capture?.epoch, conversationSequence: capture?.sequence, captureGaps: capture?.gaps,
+            nextBindings: start + bindings.length < (capture?.bindings.length ?? 0)
+              ? { ref, section: "public_bindings", offset: start + bindings.length } : null,
+            workbrief, nextBrief: nextText(ref, "brief", workbrief),
+            selected: { model: row.selectedModel, requestedModel: row.requestedModel, reasoning: row.requestedReasoning },
+            activated: row.activated ?? null,
+          };
+        },
+        readPublicActivity(ref: WorkerReadReference, cursor?: string, recovery = false, byteBudget?: number) {
+          ready();
+          const row = publicRow(ref);
+          if (row.origin?.source === "agent_run") return { state: "unavailable" as const, reason: "unsupported_kind" as const };
+          const conversation = resolveOwnedWorkerRead(targetFor(row), readScope()).conversation;
+          if (!conversation) return { state: "unavailable" as const, reason: "not_captured" as const };
+          return conversation.read(ref, cursor, recovery, byteBudget);
+        },
+        readPublicResult(ref: WorkerReadReference, cursor?: WorkerReadCursor) {
+          ready();
+          const row = publicRow(ref);
+          if (row.origin?.source === "agent_run") return { state: "unavailable" as const, reason: "unsupported_kind" as const };
+          if (ref.native && !resolveOwnedWorkerRead(targetFor(row), readScope()).conversation?.hasBinding(ref))
+            throw new Error("unknown_target");
+          if (cursor && (cursor.section !== "result_text" || JSON.stringify(cursor.ref) !== JSON.stringify(ref)))
+            throw new Error("invalid_cursor");
+          const result = readWorkerResult(targetFor(row), readScope(), {
+            offset: cursor?.section === "result_text" ? cursor.offset : 0 });
+          if (result.state !== "ready") return result;
+          return { format: "public-v1" as const, state: "ready" as const, ref, status: result.status,
+            text: result.text, nextText: nextText(ref, "result_text", result.text) };
+        },
         subscribe(listener: (revision: number) => void) {
           ready();
           if (unsubscribe || listeners.size >= 8) throw new Error("busy");
@@ -207,9 +281,6 @@ export function createAgentController(owner: AgentControllerOwner, current: () =
           if (cursor && cursor.section !== "brief" && cursor.section !== "detail_metadata") throw new Error("invalid_cursor");
           const outcome = row.origin?.source === "agent_run" ? { state: "unavailable" as const, reason: "unsupported_kind" }
             : readWorkerResult(targetFor(row), readScope());
-          let selection: AgentSelection | undefined;
-          let reason: string | undefined;
-          try { selection = selectionFor(row); } catch (error) { reason = String(error); }
           const metadata = textPage(JSON.stringify({ id: row.id, roleId: row.roleId, source: row.origin?.source,
             assignmentId: row.origin?.assignmentId, task: row.task, handoff: row.handoff, resultTaken: row.resultTaken,
             selected: { model: row.selectedModel, requestedModel: row.requestedModel, reasoning: row.requestedReasoning,
@@ -227,7 +298,7 @@ export function createAgentController(owner: AgentControllerOwner, current: () =
             observedStatus: row.status, result: outcome.state,
             activity: ref.native ? "observed_binding" : "unavailable",
             metadata, workbrief, nextMetadata: nextText(ref, "detail_metadata", metadata),
-            nextBrief: nextText(ref, "brief", workbrief), controls: { selection, reason, grant: control ? "enabled" : "denied" } };
+            nextBrief: nextText(ref, "brief", workbrief) };
         },
         readRequests(id: string, cursor?: WorkerReadCursor) {
           ready();
@@ -346,14 +417,14 @@ export function createAgentController(owner: AgentControllerOwner, current: () =
         },
         route(id: string, offset = 0, includeState = false) {
           ready();
-          if (!sensitiveRoute) throw new Error("raw route requires this view's acknowledgement");
+          if (options.policy !== "bridge-read" && !sensitiveRoute) throw new Error("raw route requires this view's acknowledgement");
           const row = rowFor(id);
           return { ...textPage(JSON.stringify(row.origin?.routing ?? null), offset),
             ...(includeState ? { state: routeSummary(row).state } : {}) };
         },
         history(query: HistoryQuery, worker?: { instanceId: string }, byteBudget?: number) {
           return own(async () => {
-            if (query.action === "read" && !sensitiveHistory) throw new Error("raw history requires this view's acknowledgement");
+            if (query.action === "read" && options.policy !== "bridge-read" && !sensitiveHistory) throw new Error("raw history requires this view's acknowledgement");
             const row = worker ? rowFor(worker.instanceId) : undefined;
             const scope = { coordinatorSessionId: owner.sessionId, ...(row ? { instanceId: row.id,
               ...(row.origin?.assignmentId ? { assignmentId: row.origin.assignmentId } : {}) } : {}) };

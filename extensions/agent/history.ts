@@ -10,6 +10,7 @@ import { acquireHistoryExclusion } from "./history-retention.ts";
 export interface HistoryOrigin {
   source: "agent_run" | "agent_spawn" | "team_assign";
   coordinatorSessionId?: string;
+  toolCallId?: string;
   coordinatorSessionFile?: string;
   assignmentId?: string;
   workbrief?: string;
@@ -38,6 +39,7 @@ export interface HistoryMember {
   historyId: string;
   roleId: string;
   coordinatorSessionId?: string;
+  toolCallId?: string;
   coordinatorSessionFile?: string;
   assignmentId?: string;
   instanceId?: string;
@@ -82,7 +84,7 @@ export interface HistoryGroup {
 }
 
 export type HistoryAdmission = Pick<HistoryMember,
-  "roleId" | "coordinatorSessionId" | "coordinatorSessionFile" | "assignmentId" |
+  "roleId" | "coordinatorSessionId" | "toolCallId" | "coordinatorSessionFile" | "assignmentId" |
   "instanceId" | "attemptId" | "memberId" | "continuationOf" | "diagnosisId" | "diagnosisOf" | "unitId" | "roundId" | "recoveryOf" | "retryOf">;
 
 export type NativeHistoryStatus =
@@ -323,6 +325,7 @@ export class InvocationHistory {
   admit(instanceId: string, roleId: string, target: ModelTarget): SessionHistory {
     const admission = {
       instanceId, roleId, coordinatorSessionId: this.origin?.coordinatorSessionId,
+      toolCallId: this.origin?.toolCallId,
       coordinatorSessionFile: this.origin?.coordinatorSessionFile, assignmentId: this.origin?.assignmentId,
     };
     const current = this.store.read(this.group.groupId);

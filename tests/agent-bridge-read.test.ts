@@ -39,7 +39,7 @@ reasoning = "off"
   const controller = createAgentController(owner, () => owner);
   const bridgeRoot = path.join(root, "b");
   mkdirSync(bridgeRoot, { mode: 0o700 });
-  const bridge = createAgentBridge(controller, bridgeRoot, [], () => true);
+  const bridge = createAgentBridge(controller, bridgeRoot, () => true);
   let client: Awaited<ReturnType<typeof connect>> | undefined;
   fixture.beforeRelease(async () => { await client?.disconnect(); bridge.revoke(); controller.revoke();
     await bridge.settle(); await controller.settle(); });
