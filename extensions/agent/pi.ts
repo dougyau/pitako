@@ -456,6 +456,7 @@ async function openSession(
       pi.on("agent_before_settle", () => live?.settle());
       pi.on("session_tree", event => live?.handle.publicConversation?.reconcile(event.oldLeafId));
       pi.on("session_start", () => live?.handle.publicConversation?.reconcile());
+      pi.on("session_compact", () => live?.handle.publicConversation?.reconcile());
     }, ...(input.head && headBinding ? [headExtension(input.head, headBinding, () => nativeSession!.sessionManager)] : []),
     ...(input.scope ? [leafScopeExtension(input.scope, () => nativeSession!)] : [])],
     appendSystemPrompt: [childInstructions(input.role, input.instanceId)],

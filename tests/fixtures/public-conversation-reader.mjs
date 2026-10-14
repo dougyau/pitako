@@ -12,13 +12,13 @@ const records = new Map();
 const commands = on(process, "message");
 let cursor;
 
-async function read() {
+async function read(recovery = false) {
   const parts = new Map();
   let pages = 0, fragments = 0, more;
   do {
-    const page = await client.publicActivity(ref, cursor);
+    const page = await client.publicActivity(ref, cursor, recovery);
     assert.equal(page.state, "ready");
-    assert.deepEqual(await client.publicActivity(ref, cursor), page);
+    if (cursor || !recovery) assert.deepEqual(await client.publicActivity(ref, cursor, recovery), page);
     assert.ok(Buffer.byteLength(JSON.stringify(page)) < 48 * 1024);
     assert.ok(page.changes.length <= 50);
     pages++;
@@ -44,6 +44,19 @@ async function read() {
   } while (more && cursor);
   assert.equal(parts.size, 0);
   const tools = [...records.values()].filter(record => record.kind === "tool");
+  if (toolError === "todo") {
+    assert.equal(tools.length, 3);
+    const selected = tools.find(tool => tool.toolCallId === "todo-3");
+    const binding = (await client.publicDetail(id)).bindings[0];
+    assert.deepEqual(binding.todoHead, { state: "ready", sourceEntryId: selected.nativeEntryId });
+    assert.deepEqual(selected.payload.todoSnapshot.tasks.map(task => [task.id, task.subject, task.status]),
+      [[1, "first", "pending"], [2, `second ${"漢😀".repeat(4000)}`, "pending"]]);
+    assert.equal(selected.payload.todoSnapshot.tasks[0].identityEntryId,
+      tools.find(tool => tool.toolCallId === "todo-1").nativeEntryId);
+    assert.equal(selected.payload.todoSnapshot.tasks[1].identityEntryId,
+      tools.find(tool => tool.toolCallId === "todo-2").nativeEntryId);
+    return { pages, fragments, selected, binding };
+  }
   assert.equal(tools.length, 1);
   const tool = tools[0];
   assert.equal(tool.toolCallId, "real-tool-id");
@@ -55,6 +68,18 @@ async function read() {
 
 try {
   const initial = await read();
+  if (toolError === "todo") {
+    assert.ok(initial.fragments > 1);
+    cursor = undefined;
+    const recovered = await read(true);
+    assert.ok(recovered.fragments > 1);
+    assert.equal(recovered.selected.id, initial.selected.id);
+    assert.deepEqual(recovered.selected.payload.todoSnapshot, initial.selected.payload.todoSnapshot);
+    assert.deepEqual(recovered.binding.todoHead, initial.binding.todoHead);
+    console.log(JSON.stringify({ node: process.version, ...initial,
+      recovery: { pages: recovered.pages, fragments: recovered.fragments,
+        id: recovered.selected.id, nativeEntryId: recovered.selected.nativeEntryId } }));
+  } else {
   assert.ok(initial.fragments > 1);
   assert.equal(initial.tool.payload.status, "updated");
   assert.equal(initial.tool.payload.result[0].text, "visible update");
@@ -81,6 +106,7 @@ try {
       process.send({ phase: "terminal", messages: repeated.length, result: result.text.text });
       break;
     } else throw Error(`Unknown reader phase ${command}`);
+  }
   }
 } finally {
   await commands.return();

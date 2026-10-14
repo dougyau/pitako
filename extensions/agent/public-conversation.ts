@@ -4,6 +4,7 @@ import type { AgentSession, AgentSessionEvent, SessionEntry } from "@earendil-wo
 import { fileCut, nativeHeader, validateCut, window, type FileCut } from "./history-native.ts";
 import type { SessionHistory } from "./history.ts";
 import type { PublicBinding, PublicConversationPage, PublicRecord, PublicContent, WorkerReadReference } from "./bridge/protocol.js";
+import { resolvePublicTodo } from "./public-todo.ts";
 
 const WORKER_BYTES = 4 * 1024 * 1024;
 const OWNER_BYTES = 32 * 1024 * 1024;
@@ -35,14 +36,19 @@ function content(value: unknown): PublicContent[] {
 type CapturedRecord = PublicRecord & { sequence: number | null };
 type NewRecord<T = PublicRecord> = T extends PublicRecord ?
   Omit<T, "revision" | "order" | "nativeOrder" | "occurredAt"> & Partial<Pick<T, "nativeOrder" | "occurredAt">> : never;
-type CaptureBinding = Omit<PublicBinding, "state" | "headEntryId" | "attemptIds"> & { active: boolean; head: string | null };
+type CaptureBinding = Omit<PublicBinding, "state" | "headEntryId" | "attemptIds"> &
+  { active: boolean; head: string | null; headObserved: boolean };
 interface Retained { record: CapturedRecord; bytes: number }
 type NativePlacement = Pick<PublicRecord, "nativeEntryId" | "parentEntryId" | "nativeTime" | "nativeOrder">;
 interface Placement { binding: number; id: string; order: number; revision: number; native?: NativePlacement }
 interface OrderRange { first: number; last: number; base: number; step: number }
+interface NativeDescriptor { id: string; parentId: string | null; type: string; offset: number; todo: boolean }
 interface RecoveryOrders {
   binding: number; revision: number; ranges?: OrderRange[];
   known?: Array<{ ordinal: number; order: number }>;
+  file: FileCut; observedAt: number; metadata: PublicBinding; capture: PublicConversationPage["capture"];
+  descriptors: Map<string, NativeDescriptor>; todoAdmitted: boolean; gaps: PublicConversationPage["gaps"];
+  materialized: Map<number, { json?: string; offset: number; ordinal: number; ended: boolean; gaps: PublicConversationPage["gaps"] }>;
 }
 interface Position {
   epoch: string; scope: string; binding: number; cut: number;
@@ -78,6 +84,8 @@ export class PublicConversation {
   private trimming = false;
   private evictedBindingsThrough = 0;
   private initialBrief = new Map<number, { entryId: string; text?: string }>();
+  private batching = 0;
+  private dirty = false;
   onChange?: () => void;
 
   constructor(private readonly limits = { worker: WORKER_BYTES, owner: OWNER_BYTES }, private readonly expectedSource = true) {}
@@ -113,7 +121,7 @@ export class PublicConversation {
     for (const previous of this.bindings) previous.active = false;
     const generation = ++this.nextGeneration;
     this.bindings.push({ generation, historyId, sessionId, active: true,
-      head: null, capture: "open", attempts: [], gaps: [] });
+      head: null, headObserved: false, todoHead: { state: "unavailable" }, capture: "open", attempts: [], gaps: [] });
     if (file) this.files.set(generation, { path: file, persisted: existsSync(file) });
     this.changed();
     return generation;
@@ -139,16 +147,35 @@ export class PublicConversation {
       this.trimming = true;
       try { this.trim(); } finally { this.trimming = false; }
     }
+    if (this.batching) { this.dirty = true; return; }
     try { this.onChange?.(); } catch { /* Hints cannot affect execution. */ }
   }
+
+  batch(action: () => void) {
+    this.batching++;
+    try { action(); } catch (error) {
+      this.fail();
+      throw error;
+    } finally {
+      this.batching--;
+      if (!this.batching && this.dirty) { this.dirty = false; this.changed(); }
+    }
+  }
+
+  todoLimits() { return { entries: Math.floor(this.limits.worker / 64), bytes: this.limits.worker }; }
 
   private storageBytes() {
     if (!this.retained.length && !this.bindings.length && !this.initialBrief.size &&
       !this.placements.size && !this.recoveryOrders.size) return 0;
-    return this.bytes + Buffer.byteLength(JSON.stringify(this.bindings.map(binding => this.publicBinding(binding)))) +
+    const recipes = [...this.recoveryOrders].map(([id, plan]) => [id, { ...plan,
+      descriptors: [...plan.descriptors.values()],
+      materialized: [...plan.materialized].map(([offset, { json, ...metadata }]) => [offset, metadata]) }]);
+    const materializedBytes = [...this.recoveryOrders.values()].reduce((sum, plan) => sum +
+      [...plan.materialized.values()].reduce((sum, item) => sum + Buffer.byteLength(item.json ?? ""), 0), 0);
+    return this.bytes + materializedBytes + Buffer.byteLength(JSON.stringify(this.bindings.map(binding => this.publicBinding(binding)))) +
       Buffer.byteLength(JSON.stringify([...this.initialBrief])) +
       Buffer.byteLength(JSON.stringify([...this.placements.values()])) +
-      Buffer.byteLength(JSON.stringify([...this.recoveryOrders]));
+      Buffer.byteLength(JSON.stringify(recipes));
   }
 
   /** Both changes and snapshots count; identity/attempt metadata cannot grow without bound. */
@@ -171,7 +198,8 @@ export class PublicConversation {
       const current = this.bindings.at(-1)!;
       if (!current.gaps.includes("evicted")) current.gaps.push("evicted");
     }
-    const group = this.owner && owners().get(this.owner);
+    // Keep local accumulation bounded during a batch; notify/trim peers only after its head is coherent.
+    const group = !this.batching && this.owner && owners().get(this.owner);
     if (group) {
       while ([...group].reduce((sum, worker) => sum + worker.storageBytes(), 0) > this.limits.owner) {
         const oldest = [...group].filter(worker => worker.retained.length)
@@ -208,12 +236,12 @@ export class PublicConversation {
 
   private evictOrderMetadata() {
     const plan = this.recoveryOrders.keys().next();
-    if (this.recoveryOrders.size > 1) this.recoveryOrders.delete(plan.value!);
+    if (this.recoveryOrders.size > 1) this.dropRecovery(plan.value!);
     else {
       const placement = this.placements.keys().next();
       if (placement.done) {
         if (plan.done) return false;
-        this.recoveryOrders.delete(plan.value);
+        this.dropRecovery(plan.value);
         return true;
       }
       const binding = this.bindings.find(item => item.generation === this.placements.get(placement.value)!.binding);
@@ -223,6 +251,13 @@ export class PublicConversation {
       this.orderEpoch++;
     }
     return true;
+  }
+
+  private dropRecovery(revision: number) {
+    const plan = this.recoveryOrders.get(revision);
+    this.recoveryOrders.delete(revision);
+    const binding = this.bindings.find(item => item.generation === plan?.binding);
+    if (binding && !binding.gaps.includes("evicted")) binding.gaps.push("evicted");
   }
 
   private place(binding: number, id: string, order?: number, revision = this.revision, native?: NativePlacement) {
@@ -279,7 +314,8 @@ export class PublicConversation {
   }
 
   /** Called only at a post-append point. IDs/parents come directly from SessionManager. */
-  entry(generation: number, entry: SessionEntry, initialUser = false, brief?: string, nativeOrder?: number) {
+  entry(generation: number, entry: SessionEntry, initialUser = false, brief?: string, nativeOrder?: number,
+    todoSnapshot?: import("./bridge/protocol.js").PublicTodoSnapshot) {
     if (entry.type !== "message") return;
     const message = entry.message;
     if (message.role === "user" || message.role === "assistant") {
@@ -301,7 +337,7 @@ export class PublicConversation {
         observedAt: Date.now(), nativeTime: entry.timestamp, payload: {
           status: message.isError ? "error" : "completed", name: message.toolName,
           args: tool?.payload.args, argsState: tool?.payload.argsState ?? "not_captured",
-          result: content(message.content), isError: message.isError } });
+          result: content(message.content), isError: message.isError, ...(todoSnapshot ? { todoSnapshot } : {}) } });
     }
   }
 
@@ -324,14 +360,25 @@ export class PublicConversation {
         isError: event.type === "tool_execution_end" ? event.isError : null } });
   }
 
-  head(generation: number, head: string | null, entries: SessionEntry[], oldLeaf?: string | null) {
+  head(generation: number, head: string | null, entries: SessionEntry[], oldLeaf?: string | null,
+    todoHead?: import("./bridge/protocol.js").PublicTodoHead) {
     if (this.retired) return;
     const binding = this.bindings.find(item => item.generation === generation)!;
-    if (binding.head === head && (oldLeaf === undefined || oldLeaf === head)) return;
+    binding.headObserved = true;
+    if (binding.capture === "incomplete") todoHead = { state: "unavailable" };
+    const selectorChanged = todoHead && JSON.stringify(binding.todoHead) !== JSON.stringify(todoHead);
+    if (todoHead) binding.todoHead = todoHead;
+    if (binding.head === head && (oldLeaf === undefined || oldLeaf === head)) {
+      if (selectorChanged) this.changed();
+      return;
+    }
     const previous = oldLeaf === undefined ? binding.head : oldLeaf;
     let current = head;
     const parents = new Map(entries.map(entry => [entry.id, entry.parentId]));
-    while (current && current !== previous) current = parents.get(current) ?? null;
+    const visited = new Set<string>();
+    while (current && current !== previous && !visited.has(current)) {
+      visited.add(current); current = parents.get(current) ?? null;
+    }
     if (previous && current !== previous) {
       this.push({ id: this.id(generation, "head", head ?? "root"), binding: generation, kind: "branch_changed",
         observedAt: Date.now(), nativeTime: null, nativeEntryId: head, toolCallId: null,
@@ -348,6 +395,7 @@ export class PublicConversation {
     binding.active = false;
     binding.capture = failed || binding.gaps.includes("capture_failed") ? "incomplete" : "closed";
     if (failed) {
+      binding.todoHead = { state: "unavailable" };
       if (!binding.gaps.includes("capture_failed")) binding.gaps.push("capture_failed");
       this.failed = true;
     }
@@ -359,13 +407,14 @@ export class PublicConversation {
     const binding = this.bindings.at(-1);
     if (binding) {
       binding.capture = "incomplete";
+      binding.todoHead = { state: "unavailable" };
       if (!binding.gaps.includes("capture_failed")) binding.gaps.push("capture_failed");
     }
     this.changed();
   }
   finish() { this.closed = true; this.changed(); }
   private publicBinding(binding: CaptureBinding): PublicBinding {
-    const { active, head, ...rest } = binding;
+    const { active, head, headObserved, ...rest } = binding;
     return { ...rest, state: active ? "active" : "historical", headEntryId: head,
       attemptIds: binding.attempts.map(attempt => attempt.attemptId) };
   }
@@ -387,7 +436,9 @@ export class PublicConversation {
       ref.instanceId, ref.source, ref.assignmentId, ref.native?.generation, ref.native?.historyId, ref.native?.sessionId])).digest("hex");
   }
   private encode(position: Position) {
-    const value = Buffer.from(JSON.stringify(position)).toString("base64url");
+    // Recovery metadata/materializations are owned and budgeted by the recipe, never duplicated in cursors.
+    const value = Buffer.from(JSON.stringify(position.mode === "recovery"
+      ? { ...position, bindingMetadata: undefined, capture: undefined } : position)).toString("base64url");
     return `${value}.${createHmac("sha256", this.key).update(value).digest("base64url")}`;
   }
   private decode(value: string, ref: WorkerReadReference): Position {
@@ -458,7 +509,8 @@ export class PublicConversation {
     return page;
   }
 
-  private page(ref: WorkerReadReference, position: Position, source: CapturedRecord[], byteBudget: number): PublicConversationPage {
+  private page(ref: WorkerReadReference, position: Position, source: CapturedRecord[], byteBudget: number,
+    frozenJson?: string): PublicConversationPage {
     const page: PublicConversationPage = { format: "public-v1", state: "ready", ref,
       epoch: this.epoch, cut: position.cut, changes: [], next: null, more: false,
       binding: position.bindingMetadata, capture: position.capture,
@@ -469,7 +521,7 @@ export class PublicConversation {
     let next = { ...position };
     for (const record of source) {
       const change = this.change(record);
-      const bytes = Buffer.from(JSON.stringify(change));
+      const bytes = Buffer.from(frozenJson ?? JSON.stringify(change));
       let offset = record.sequence === position.after ? position.fragment : 0;
       // A fragment continuation stays on its immutable revision, not the latest upsert.
       offset = position.fragment && page.changes.length === 0 ? position.fragment : offset;
@@ -508,19 +560,21 @@ export class PublicConversation {
       offset += newline < 0 ? bytes.length : newline + 1;
       ended = newline >= 0;
     }
-    return { offset, ended, total, entry: ended && total <= this.limits.worker && !skipLine
-      ? JSON.parse(Buffer.concat(chunks).toString("utf8")) as SessionEntry : undefined };
+    let entry: SessionEntry | undefined;
+    if (ended && total <= this.limits.worker && !skipLine) {
+      try { entry = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch { /* An unprovable line is a gap. */ }
+    }
+    return { offset, ended, total, entry };
   }
 
   private nativePublicId(binding: number, entry: SessionEntry) {
-    if (entry.type !== "message") return;
+    if (entry.type !== "message" || !entry.message || typeof entry.message !== "object" || Array.isArray(entry.message)) return;
     if (entry.message.role === "user" || entry.message.role === "assistant") return this.id(binding, "entry", entry.id);
     if (entry.message.role === "toolResult") return this.id(binding, "tool", entry.message.toolCallId);
   }
 
   /** Reserve insertion ranges once per recovery, not a second file-ordinal order domain.
-   * Only retained placement anchors and ranges survive the scan, never native history.
-   * The header page is still cheap; live capture/reconciliation never scans a file.
+   * Descriptors cover all native classes; only matching todo details are loaded by the resolver.
    */
   private prepareOrders(fd: number, cut: FileCut, plan: RecoveryOrders) {
     let placements = [...this.placements.values()].filter(item => item.binding === plan.binding)
@@ -528,9 +582,27 @@ export class PublicConversation {
     const available = new Map(placements.map(item => [item.id, item]));
     const anchors: Array<{ ordinal: number; placement: Placement }> = [];
     let ordinal = 0, offset = 0, skipLine = false;
+    let descriptorBytes = 0, complete = true;
     while (offset < cut.size) {
+      const start = offset;
       const line = this.nativeLine(fd, cut, offset, skipLine);
       offset = line.offset; skipLine = !line.ended;
+      const entry = line.entry;
+      if (entry && (entry.type as string) !== "session") {
+        if (typeof entry.id !== "string" || !entry.id || !(entry.parentId === null || typeof entry.parentId === "string") ||
+          typeof entry.type !== "string" || plan.descriptors.has(entry.id) ||
+          entry.type === "message" && (!entry.message || typeof entry.message !== "object" || Array.isArray(entry.message))) {
+          complete = false;
+          if (!plan.gaps.includes("capture_failed")) plan.gaps.push("capture_failed");
+        }
+        else {
+          const descriptor: NativeDescriptor = { id: entry.id, parentId: entry.parentId, type: entry.type, offset: start,
+            todo: entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === "todo" };
+          descriptorBytes += Buffer.byteLength(JSON.stringify(descriptor));
+          if (plan.descriptors.size >= this.todoLimits().entries || descriptorBytes > this.limits.worker) complete = false;
+          else plan.descriptors.set(entry.id, descriptor);
+        }
+      } else if (!entry) complete = false;
       const id = line.entry && this.nativePublicId(plan.binding, line.entry);
       if (!id) continue;
       ordinal++;
@@ -585,6 +657,25 @@ export class PublicConversation {
     }
     plan.ranges = ranges;
     plan.known = anchors.map(anchor => ({ ordinal: anchor.ordinal, order: anchor.placement.order }));
+    if (!complete || Buffer.byteLength(JSON.stringify({ ...plan, descriptors: [...plan.descriptors.values()] })) > this.limits.worker) {
+      complete = false;
+      plan.descriptors.clear();
+    }
+    const lookup = (id: string) => {
+      if (!complete) return;
+      const descriptor = plan.descriptors.get(id);
+      return descriptor?.todo ? this.nativeLine(fd, cut, descriptor.offset).entry : descriptor;
+    };
+    if (complete && plan.metadata.headEntryId !== null && !plan.descriptors.has(plan.metadata.headEntryId))
+      plan.gaps.push("capture_failed");
+    plan.todoAdmitted = plan.todoAdmitted && complete &&
+      (plan.metadata.headEntryId === null || plan.descriptors.has(plan.metadata.headEntryId));
+    if (plan.metadata.todoHead !== undefined) {
+      const todo = plan.todoAdmitted ? resolvePublicTodo(lookup, plan.metadata.headEntryId, this.todoLimits()) : undefined;
+      plan.metadata.todoHead = todo?.head ?? { state: "unavailable" };
+      if (todo?.budgetExceeded) plan.gaps.push("unsupported_content");
+    }
+    if (!complete) plan.gaps.push("unsupported_content");
     this.changed();
   }
 
@@ -596,14 +687,33 @@ export class PublicConversation {
     return range.base + (ordinal - range.first + 1) * range.step;
   }
 
+  private rejectRecovery(bindingId: number) {
+    this.batch(() => {
+      for (const [revision, plan] of this.recoveryOrders) if (plan.binding === bindingId) this.dropRecovery(revision);
+      const binding = this.bindings.find(item => item.generation === bindingId);
+      if (binding) {
+        binding.todoHead = { state: "unavailable" };
+        if (!binding.gaps.includes("capture_failed")) binding.gaps.push("capture_failed");
+      }
+      // Recovery projections never enter retained: independent live snapshots remain untouched.
+      this.changed();
+    });
+  }
+
   /** Only this registered binding's file, positional bounded reads, never an SDK loader. */
   private recover(ref: WorkerReadReference, position: Position, byteBudget: number): PublicConversationPage {
     const page: PublicConversationPage = { format: "public-v1", state: "ready", ref,
       epoch: this.epoch, cut: position.cut, changes: [], next: null, more: false, gaps: ["not_captured"] };
+    if (position.recoveryRevision && !this.recoveryOrders.has(position.recoveryRevision))
+      return { ...page, state: "resync_required", gaps: ["evicted", "resync_required"] };
     const registered = this.files.get(position.binding);
     const file = registered?.path;
     if (!file || !existsSync(file)) {
       page.gaps = [registered?.persisted ? "pruned" : "not_persisted"];
+      if (position.recoveryRevision) {
+        this.rejectRecovery(position.binding);
+        page.state = "resync_required"; page.gaps.push("resync_required");
+      }
       return page;
     }
     let fd: number | undefined;
@@ -617,20 +727,32 @@ export class PublicConversation {
       const recoveryRevision = position.recoveryRevision ?? ++this.revision;
       let orders = this.recoveryOrders.get(recoveryRevision);
       if (!position.recoveryRevision) {
-        orders = { binding: position.binding, revision: recoveryRevision };
+        // Head and FileCut are sampled in this synchronous entry, before any continuation.
+        orders = { binding: position.binding, revision: recoveryRevision, file: cut, observedAt,
+          metadata: JSON.parse(JSON.stringify(this.publicBinding(binding))),
+          capture: { state: this.metadata(ref).capture, finalSequence: this.closed ? this.sequence : null },
+          descriptors: new Map(), materialized: new Map(), todoAdmitted: binding.headObserved, gaps: [] };
         this.recoveryOrders.set(recoveryRevision, orders);
-        this.changed();
+        this.prepareOrders(fd, cut, orders);
       }
       if (!orders) throw new Error("unavailable public placement");
-      if (position.offset && !orders.ranges) this.prepareOrders(fd, cut, orders);
+      page.binding = orders.metadata; page.capture = orders.capture;
+      page.gaps.push(...orders.gaps);
       let offset = position.offset ?? 0;
       let ordinal = position.after;
       const records: CapturedRecord[] = [];
+      const start = offset;
+      let materialized = orders.materialized.get(start);
+      if (position.fragment && !materialized) throw new Error("unavailable public placement");
       // One bounded line per call. Oversized lines are skipped with an explicit gap.
-      const line = this.nativeLine(fd, cut, offset, position.skipLine);
+      const line = materialized ? { ...materialized, total: 0, entry: undefined } :
+        this.nativeLine(fd, cut, offset, position.skipLine);
       offset = line.offset;
       const { ended, total, entry } = line;
-      if (entry) {
+      if (materialized) {
+        ordinal = materialized.ordinal;
+        page.gaps.push(...materialized.gaps);
+      } else if (entry) {
         if (entry.type === "message" && (entry.message.role === "user" || entry.message.role === "assistant" || entry.message.role === "toolResult")) {
           if (typeof entry.id !== "string" || !entry.id || !(entry.parentId === null || typeof entry.parentId === "string") ||
             typeof entry.timestamp !== "string" || !Number.isFinite(entry.message.timestamp)) throw new Error("invalid public native message");
@@ -646,9 +768,17 @@ export class PublicConversation {
             const message = entry.message;
             if (typeof message.toolCallId !== "string" || !message.toolCallId || typeof message.toolName !== "string" ||
               typeof message.isError !== "boolean") throw new Error("invalid public native tool result");
+            const todo = orders.todoAdmitted && orders.metadata.todoHead !== undefined && message.toolName === "todo"
+              ? resolvePublicTodo(id => {
+                const descriptor = orders!.descriptors.get(id);
+                return descriptor?.todo ? this.nativeLine(fd!, cut, descriptor.offset).entry : descriptor;
+              }, entry.id, this.todoLimits()) : undefined;
+            if (todo?.budgetExceeded && !page.gaps.includes("unsupported_content")) page.gaps.push("unsupported_content");
             records.push({ ...fields, id: this.id(binding.generation, "tool", message.toolCallId), kind: "tool",
               toolCallId: message.toolCallId, payload: { status: message.isError ? "error" : "completed", name: message.toolName,
-                argsState: "not_captured", result: content(message.content), isError: message.isError } });
+                argsState: "not_captured", result: content(message.content), isError: message.isError,
+                ...(todo?.head.state === "ready" && todo.head.sourceEntryId === entry.id && todo.snapshot
+                  ? { todoSnapshot: todo.snapshot } : {}) } });
           } else records.push({ ...fields, id: this.id(binding.generation, "entry", entry.id), kind: "message",
             payload: { role: entry.message.role,
               ...(entry.message.role === "assistant" ? { stopReason: entry.message.stopReason, errorMessage: entry.message.errorMessage } : {}),
@@ -664,6 +794,12 @@ export class PublicConversation {
               nativeEntryId: retained.nativeEntryId ?? record.nativeEntryId,
               parentEntryId: retained.nativeEntryId ? retained.parentEntryId : record.parentEntryId,
               nativeTime: retained.nativeTime ?? record.nativeTime, occurredAt: retained.occurredAt ?? record.occurredAt };
+            if (record.kind === "tool" && retained.kind === "tool" && record.payload.name === "todo") {
+              // Native result/snapshot wins. Live-only permitted arguments and parent are retained.
+              records[0] = { ...records[0]!, kind: "tool", toolCallId: record.toolCallId,
+                nativeEntryId: record.nativeEntryId, parentEntryId: record.parentEntryId, nativeTime: record.nativeTime,
+                payload: { ...record.payload, args: retained.payload.args, argsState: retained.payload.argsState } };
+            }
           }
           const projected = records[0]!;
           this.place(binding.generation, record.id, record.order, record.revision, {
@@ -673,9 +809,25 @@ export class PublicConversation {
         }
       } else page.gaps.push(position.skipLine || !ended && offset < cut.size || total > this.limits.worker
         ? "unsupported_content" : "capture_failed");
-      const fragmentPage = this.page(ref, { ...position, observedAt, recoveryRevision, file: cut }, records, byteBudget);
+      if (!materialized) {
+        materialized = { ...(records[0] ? { json: JSON.stringify(this.change(records[0])) } : {}),
+          offset, ordinal, ended, gaps: page.gaps.filter(gap => gap !== "not_captured") };
+        orders.materialized.set(start, materialized);
+        this.changed();
+      }
+      records.length = 0;
+      if (materialized.json) {
+        const change = JSON.parse(materialized.json);
+        records.push({ ...change.record, sequence: change.sequence });
+      }
+      const frozenPosition = { ...position, observedAt, recoveryRevision, file: cut,
+        bindingMetadata: orders.metadata, capture: orders.capture };
+      const fragmentPage = this.page(ref, frozenPosition, records, byteBudget, materialized.json);
+      // Frozen metadata lives in the budgeted recipe, not in each signed cursor.
+      const cursorPosition = { ...position, observedAt, recoveryRevision, file: cut };
       page.changes = fragmentPage.changes;
-      page.next = fragmentPage.next ?? (offset < cut.size ? this.encode({ ...position, observedAt, recoveryRevision, file: cut, offset,
+      page.next = fragmentPage.next ??
+        (offset < cut.size ? this.encode({ ...cursorPosition, offset,
         after: ordinal, fragment: 0, skipLine: !ended }) : null);
       page.more = page.next !== null;
       if (!page.next) page.gaps.push("not_persisted"); // Transient tools are not recoverable from native messages.
@@ -683,7 +835,12 @@ export class PublicConversation {
         return { ...page, state: "resync_required", changes: [], next: null, more: false, gaps: ["evicted", "resync_required"] };
       return page;
     } catch (error) {
-      if (error instanceof RangeError || error instanceof Error && error.message === "stale_cursor") throw error;
+      if (error instanceof RangeError) throw error;
+      if (error instanceof Error && error.message === "stale_cursor") {
+        this.rejectRecovery(position.binding);
+        if (!position.recoveryRevision) throw error;
+        page.state = "resync_required";
+      }
       page.changes = []; page.next = null; page.more = false;
       if (error instanceof Error && error.message === "unavailable public placement") page.state = "resync_required";
       page.gaps = page.state === "resync_required" ? ["evicted", "resync_required"] :
@@ -714,22 +871,39 @@ export function createPublicProducer(session: AgentSession, history: SessionHist
       registeredSessionId = source.sessionId; registeredFile = member.native.path;
     }
     if (source.sessionFile !== registeredFile) throw new Error("unregistered public SDK session");
-    const next = capture.binding(history.historyId, source.sessionId, registeredFile);
-    if (generation !== next) {
-      if (generation !== undefined) capture.closeBinding(generation);
-      entryCount = 0; initialUser = true; generation = next;
-    }
-    const entries = source.sessionManager.getEntries();
-    for (const [index, entry] of entries.slice(entryCount).entries()) {
-      const first = initialUser && entry.type === "message" && entry.message.role === "user";
-      if (first) initialUser = false;
-      try {
-        capture.entry(next, entry, first && history.invocation.origin?.source === "team_assign",
-          history.invocation.origin?.workbrief, entryCount + index);
-      } catch { capture.fail(); }
-    }
-    entryCount = entries.length;
-    capture.head(next, source.sessionManager.getLeafId(), entries, oldLeaf);
+    const worker = capture, native = source;
+    worker.batch(() => {
+      const next = worker.binding(history.historyId, native.sessionId, registeredFile);
+      if (generation !== next) {
+        if (generation !== undefined) worker.closeBinding(generation);
+        entryCount = 0; initialUser = true; generation = next;
+      }
+      const entries = native.sessionManager.getEntries();
+      const limits = worker.todoLimits();
+      const ids = new Set<string>(), ambiguous = new Set<string>();
+      if (entries.length <= limits.entries) for (const entry of entries) {
+        if (ids.has(entry.id)) ambiguous.add(entry.id);
+        ids.add(entry.id);
+      }
+      const lookup = (id: string) => entries.length > limits.entries || ambiguous.has(id)
+        ? undefined : native.sessionManager.getEntry(id);
+      let failed = false;
+      for (const [index, entry] of entries.slice(entryCount).entries()) {
+        const first = initialUser && entry.type === "message" && entry.message.role === "user";
+        if (first) initialUser = false;
+        try {
+          const todo = entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === "todo"
+            ? resolvePublicTodo(lookup, entry.id, limits) : undefined;
+          worker.entry(next, entry, first && history.invocation.origin?.source === "team_assign",
+            history.invocation.origin?.workbrief, entryCount + index,
+            todo?.head.state === "ready" && todo.head.sourceEntryId === entry.id ? todo.snapshot : undefined);
+        } catch { failed = true; }
+      }
+      entryCount = entries.length;
+      const head = native.sessionManager.getLeafId();
+      worker.head(next, head, entries, oldLeaf, resolvePublicTodo(lookup, head, limits).head);
+      if (failed) worker.fail();
+    });
   };
   const safely = (oldLeaf?: string | null) => { try { reconcile(oldLeaf); } catch { capture?.fail(); } };
   return {
@@ -740,7 +914,7 @@ export function createPublicProducer(session: AgentSession, history: SessionHist
       if (generation !== undefined) {
         try { capture.tool(generation, event); } catch { capture.fail(); }
       }
-      if (event.type === "message_end" || event.type === "agent_end") {
+      if (event.type === "message_end" || event.type === "agent_end" || event.type === "entry_appended") {
         queued ??= new Promise<void>(resolve => queueMicrotask(() => { safely(); queued = undefined; resolve(); }));
       }
     },

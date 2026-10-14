@@ -17,17 +17,24 @@ export type PublicGap = "pending" | "not_captured" | "not_persisted" | "pruned" 
 export type PublicContent = { type: "text"; text: string } |
   { type: "toolCall"; toolCallId: string; name: string; arguments?: unknown } |
   { type: "omitted"; reason: "unsupported_content" };
+export type PublicTodoSnapshot = {
+  format: "rpiv-todo-v1";
+  tasks: { id: number; identityEntryId: string; subject: string;
+    status: "pending" | "in_progress" | "completed" | "deleted" }[];
+};
+export type PublicTodoHead = { state: "ready"; sourceEntryId: string | null } | { state: "unavailable" };
 export interface PublicBinding {
   generation: number; historyId: string; sessionId: string; state: "active" | "historical";
   headEntryId: string | null; capture: "open" | "closed" | "incomplete"; attemptIds: string[];
   attempts: { attemptId: string; activated?: { model: string; reasoning: string };
     selected?: { model: string; requestedModel?: string; reasoning?: string } }[];
-  gaps: PublicGap[];
+  gaps: PublicGap[]; todoHead?: PublicTodoHead;
 }
 export type PublicPayload = { role: "user" | "assistant"; blocks: PublicContent[];
   stopReason?: "pending" | "stop" | "length" | "toolUse" | "error" | "aborted" | "deferred"; errorMessage?: string } |
   { status: "started" | "updated" | "completed" | "error"; name: string; args?: unknown;
-    argsState: "available" | "not_captured"; result: PublicContent[] | null; isError: boolean | null } |
+    argsState: "available" | "not_captured"; result: PublicContent[] | null; isError: boolean | null;
+    todoSnapshot?: PublicTodoSnapshot } |
   { headEntryId: string | null; previousHeadEntryId: string };
 interface PublicRecordFields {
   id: string; binding: number; revision: number;
