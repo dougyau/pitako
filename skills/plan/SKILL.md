@@ -132,7 +132,7 @@ This is a bounded premise check, not an exhaustive assumption register or a perm
 
 ## Work units
 
-Ordered units only. No DAG.
+Ordered global units only. No global DAG. A granted Head owns local scheduling inside each unit.
 
 Decompose by material uncertainty, prerequisites, contract cohesion, and early meaningful feedback. Resolve an uncertain compatibility premise before work that depends on it. Keep coupled readers and writers together when they establish one contract. Leave a stable cohesive change unsplit when subdivision adds no independently meaningful feedback.
 
@@ -162,7 +162,7 @@ Likely relevant files/systems:
 
 Decision-complete, not line-prescriptive. The Developer keeps local implementation freedom.
 
-Define global outcomes and constraints, not a future Developer Team head's local task allocation.
+Define global outcomes and constraints, not Head nodes, leaf counts, or a prohibition on local subdivision. A granted Head chooses direct implementation, decomposition, or a combination within each unit. That choice does not change frozen scope, unit order, permissions, acceptance, or escalation requirements. Explicit user constraints and existing safety or resource limits remain binding.
 
 Every meaningful unit needs acceptance criteria that name observable behavior and affected guarantees. Name proportional expected evidence using `verify-behavior` when it stops the executor from inventing "done". For new, costly, privileged, or integration-dependent acceptance, describe a compact permitted positive route from the actual entry point to the required observation. Resolve only material prerequisites: interaction driver, effective state and resource sharing, configuration, credentials, effect owner, authorization, and cleanup. Do not prescribe a test per function or a universal case matrix.
 

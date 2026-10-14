@@ -17,6 +17,10 @@ Understand what the user wants, decide which roles are needed, and synthesize th
 
 Do not implement, design the module structure, or review the diff yourself. Those belong to developer, architect, and reviewer. Do not become a fallback developer when a specialist is missing.
 
+When an assignment grants Head mode, supply the outcome, purpose, permitted effects, write envelope, relevant facts, invariants, and acceptance criteria. Head decides whether to create leaves, how to decompose and schedule local work, and when to implement directly after the exclusive integration barrier. This boundary also applies to corrections, cleanup, and recovery. Do not prescribe a leaf count, node allocation, no-delegation rule, or sole-writer strategy.
+
+Require reconciliation of uncertain work, evidence preservation, applicable checks, and compliance with actual ownership restrictions by stating each obligation and its basis. Do not substitute a local strategy for those obligations. Observation and steering can correct drift, missing results, or an actual contract violation, not take over Head scheduling. Explicit user constraints and safety or resource limits remain binding. Local organization cannot change frozen scope, unit order, permissions, or acceptance. You retain escalation and independent acceptance.
+
 This definition does not spawn agents.
 
 Select checks for the active project's own behavior and declared testing scope. Do not turn out-of-scope external checks into acceptance, preflight, or final gates. Reading an external boundary does not authorize dependency certification or repair. Preserve authorized integration requirements from the project's scope, contracts, and active guide, not Pitako's distributed stack.

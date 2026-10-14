@@ -118,9 +118,10 @@ classifier_model = "classifier"
     },
   });
   const hostExecutor = createPiExecutor({ factories: host.factories }), leafExecutor = createPiExecutor({ factories: workers.factories });
-  let starts = 0;
+  let starts = 0, leafStarts = 0;
   setBackgroundExecutor({ capturesHistory: true, start(input) {
     starts++;
+    if (input.scope) leafStarts++;
     return input.head ? hostExecutor.start(input) : input.scope ? leafExecutor.start(input)
       : Promise.resolve({ status: "completed", result: "ordinary", sideEffects: false });
   } });
@@ -161,7 +162,7 @@ classifier_model = "classifier"
   const settle = async () => { headDone.resolve(); await fixture.settleRuns(); };
   return { root, evaluation, ctx, leaf, host, workers, headEntered, callPublic, call, read, closed, settle,
     delivery, headLocal: () => headLocal, headSession: () => headSession,
-    counts: () => ({ starts, classifications }),
+    counts: () => ({ starts, leafStarts, classifications }),
     outcome: (id: string, team = false) => team ? teamWorkerResult(evaluation.token, id) : workerResult(id) };
 }
 
@@ -181,7 +182,7 @@ test("public modes reject before effects and preserve ordinary routes", fixture.
     for (const tool of ["agent_spawn", "team_assign"]) expect((await h.callPublic(tool, { ...params, task: "invalid" })).isError).toBe(true);
   }
   expect((await h.callPublic("agent_run", { role: "developer", task: "sync", mode: "head", writes: [] })).isError).toBe(true);
-  expect(h.counts()).toEqual({ starts: 0, classifications: 0 });
+  expect(h.counts()).toEqual({ starts: 0, leafStarts: 0, classifications: 0 });
   expect(teamRoleReservation(h.evaluation, "developer")).toBeUndefined();
   const developer = await h.callPublic("agent_spawn", { role: "developer", task: "ordinary" });
   const researcher = await h.callPublic("team_assign", { role: "researcher", task: "ordinary" });
@@ -190,6 +191,53 @@ test("public modes reject before effects and preserve ordinary routes", fixture.
   expect(h.outcome(developer.details.instanceId).head).toBeUndefined();
   expect(h.outcome(researcher.details.instanceId, true).head).toBeUndefined();
   expect(h.counts().starts).toBe(2);
+}));
+
+test("public Team Head completes direct product work with no leaves through the exclusive barrier", fixture.ownedCase("public no-leaf Head", async () => {
+  const h = await harness();
+  const admission = await h.callPublic("team_assign", {
+    role: "developer", mode: "head", writes: ["direct.txt"], task: "Implement and check direct product work",
+  });
+  expect(admission.isError).not.toBe(true);
+  await h.headEntered.promise;
+  expect(teamRoleReservation(h.evaluation, "developer")).toBe(admission.details.id);
+  const initial = await h.read();
+  expect(initial.nodes).toEqual([]);
+  await expect(h.call("write", { path: "direct.txt", content: "premature\n" })).rejects.toThrow("exclusive integration barrier");
+  const barrier = await h.call("head_plan", { action: "beginIntegration", expectedRevision: initial.revision });
+  await h.call("write", { path: "direct.txt", content: "direct\n" });
+  await h.call("bash", { command: 'test "$(cat direct.txt)" = direct' });
+  const checked = h.headSession().sessionManager.getLeafId();
+  const candidates = (await h.read()).verificationCandidates;
+  expect(candidates).toContainEqual({ entryId: checked, toolCallId: "bash", toolName: "bash" });
+  const finish = {
+    status: "completed" as const, epoch: barrier.epoch, summary: "Implemented and checked direct product work",
+    verification: [checked], limits: ["Controlled SDK boundary, not autonomous model compliance"],
+  };
+  await h.call("head_finish", finish);
+  await h.settle();
+  const result = h.outcome(admission.details.instanceId, true);
+  expect(result.status).toBe("completed");
+  expect(result.role).toBe("developer");
+  expect(result.result).toBe(finish.summary);
+  expect(result.head).toEqual({
+    assignmentId: admission.details.id, headInstanceId: result.instanceId, revision: initial.revision,
+    finish, barrier, leaves: [],
+    metrics: {
+      ownUsage: result.usage,
+      aggregateUsage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, total: 15, cost: 0.01, turns: 1, toolCalls: 0 },
+      aggregateClassifierUsage: undefined,
+      usageComplete: true, classifierUsage: [], elapsedMs: expect.any(Number), observedPeakParallelism: 0,
+    },
+  });
+  expect(result.instanceId).toBe(admission.details.instanceId);
+  expect(h.counts()).toEqual({ starts: 1, leafStarts: 0, classifications: 0 });
+  expect(h.host.sessions).toHaveLength(1);
+  expect(h.workers.sessions).toHaveLength(0);
+  expect(readFileSync(path.join(h.root, "direct.txt"), "utf8")).toBe("direct\n");
+  expect(h.headSession().sessionManager.getBranch()).toContainEqual(expect.objectContaining({
+    type: "custom", customType: "pitako.head", data: expect.objectContaining({ kind: "barrier" }),
+  }));
 }));
 
 test("public Team Head decomposes, overlaps, corrects, integrates and returns native-backed handoff", fixture.ownedCase("public integrated Head", async () => {

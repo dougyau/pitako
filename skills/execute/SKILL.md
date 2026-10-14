@@ -84,6 +84,9 @@ Its host-granted local leaves do not authorize extra exterior Developers, reorde
 units, changes to the frozen plan or ledger, cleared holds, or waived final gates.
 The Head returns an integrated handoff or diagnostic failure, not leaf transcripts.
 The coordinator still owns acceptance and independent review.
+Head chooses whether to create leaves, local decomposition and scheduling, and
+direct implementation after the exclusive integration barrier, even with no leaves.
+Explicit user constraints and existing safety or resource limits remain binding.
 
 Compare new user information with the consulted object and original WorkBrief before using a result. For information within the brief, use the bounded in-scope input route below. Input does not expand the frozen authority or permitted effects.
 
@@ -97,6 +100,8 @@ Live observation and input are foreground-only. Select the exact `{kind: "team",
 
 Use `intent: "query"` to request missing context before judging a detour. Use `intent: "steer"` for a correction toward the assigned behavior within the existing scope. Supply a short note, not a replacement WorkBrief or a command. Even slash-prefixed text is non-command input. Delivery occurs only at a later native steering boundary after the current assistant turn and its tools. It never interrupts a running command.
 
+For Head work, correct drift, missing results, or an actual contract violation. Observation and steering do not transfer local scheduling to the coordinator.
+
 Inspect the receipt and later activity separately. `queued` means admitted to the native queue, not delivered or answered. `handled` means an input hook consumed the note, not an answer. `rejected` means no accepted submission. `unconfirmed` preserves uncertainty when the binding closes without delivery or answer proof. A candidate answer only identifies a reply that mentions the interaction ID. Judge correction from subsequent behavior and relevant evidence, not that marker.
 
 Neither `queued` nor `handled` proves correction or replaces a new consultation. Do not turn purposeful observation into status polling, a classification each turn, or mandatory consultation. Input does not settle a Team hold, accept a result, waive independent final review, change ModelPolicy, or allow another Developer.
@@ -109,6 +114,7 @@ Build a WorkBrief for the current unit only:
 - frozen unit id, outcome, and objective
 - assigned purpose, requested result, and completion condition, distinct from broader unit or final acceptance
 - relevant candidate and base identity, and permitted effects
+- explicit write envelope when granting Head mode
 - relevant scope and invariants
 - acceptance criteria and expected evidence
 - relevant prerequisites and rulings
@@ -129,7 +135,7 @@ Label evidence as accepted, advisory, failed, or unavailable according to its ac
 
 Supply resolved references to actual reusable evidence and identify what remains uncovered under `verify-behavior`'s shared policy. Do not require rediscovery of artifacts, reconciliation of every earlier report, or a replacement report merely for a handoff. Existing required reports and identity checks remain required.
 
-Local subdivision stays local. A future Developer Team head may choose implementation steps and assignments inside the unit. Those assignments do not replace global acceptance or authorize replanning. Preserve the frozen envelope and the Level 1 and Level 2 decision rules.
+Local subdivision stays local. A granted Head decides whether to create leaves, how to decompose and schedule work, and when to implement directly after the exclusive integration barrier. This includes corrections, cleanup, and recovery. Supply the outcome, purpose, permitted effects, write envelope, relevant facts, invariants, and acceptance criteria, not a leaf count, node allocation, no-delegation rule, or sole-writer strategy. Require reconciliation of uncertain work, preservation of evidence, applicable checks, and compliance with actual ownership restrictions by stating the obligations and their basis. Do not prescribe a local strategy to meet them. Local assignments do not replace global acceptance or authorize replanning. Preserve the frozen envelope, unit order, and the Level 1 and Level 2 decision rules.
 
 Developer implements and owns ordinary in-scope diagnosis and correction for implementation assignments. Verification-only work does not add a semantic review; diagnosis-only work does not authorize repair; cleanup can be a no-op. Return after the assigned outcome, necessary cleanup, and evidence recording. Reviewer independently judges the assigned consultation or change using `verify-behavior`, reports findings, and never fixes. Consultation and correction review are not final approval; unspecified change review covers the complete relevant diff, and final review covers the complete agreed final diff, underlying evidence, and relevant effects. Architect answers only an architecture question. Researcher fills only a real knowledge gap. If any delegation fails, report the error; failure never transfers specialist authority to the Coordinator. Do not perform that role yourself. Keep at most one Developer role active, without exception.
 

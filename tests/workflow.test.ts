@@ -415,8 +415,12 @@ describe("plan and execute contracts", () => {
       expect(policy).toContain("user guarantees");
       expect(policy).toContain("optional technical restrictions");
       expect(policy).toContain("architecture, scope, acceptance, or verification");
-      expect(policy).toContain("not a future Developer Team head's local task allocation");
     }
+    expect(architect).toContain("not a future Developer Team head's local task allocation");
+    expect(plan).toContain("not Head nodes, leaf counts, or a prohibition on local subdivision");
+    expect(plan).toContain("Ordered global units only. No global DAG");
+    expect(plan).toContain("chooses direct implementation, decomposition, or a combination");
+    expect(plan).toContain("does not change frozen scope, unit order, permissions, acceptance, or escalation requirements");
     expect(plan).toContain("not an exhaustive assumption register or a permission checkpoint");
     expect(plan).toContain("logical nonmutation does not imply that every SQLite sidecar byte must remain unchanged");
     expect(architect).toContain("Research or design does not authorize implementation");
@@ -467,7 +471,14 @@ describe("plan and execute contracts", () => {
     expect(brief).toContain("replacement report merely for a handoff");
     expect(brief).toContain("Existing required reports and identity checks remain required");
     expect(brief).toContain("Local subdivision stays local");
-    expect(brief).toContain("future Developer Team head");
+    expect(brief).toContain("A granted Head decides whether to create leaves");
+    expect(brief).toContain("directly after the exclusive integration barrier");
+    expect(brief).toContain("corrections, cleanup, and recovery");
+    expect(brief).toContain("not a leaf count, node allocation, no-delegation rule, or sole-writer strategy");
+    expect(brief).toContain("obligations and their basis");
+    expect(brief).toContain("Do not prescribe a local strategy");
+    expect(brief).toContain("explicit write envelope when granting Head mode");
+    expect(brief).not.toContain("future Developer Team head");
     expect(brief).toContain("do not replace global acceptance or authorize replanning");
     expect(brief).toContain("Level 1 and Level 2 decision rules");
     for (const contract of [
@@ -483,6 +494,8 @@ describe("plan and execute contracts", () => {
     expect(execute).toContain("Never ask the user to make a Level 1 or Level 2 decision");
     expect(execute).toContain("Use `verify-behavior` for diagnosis, affected regression, final gates");
     expect(execute).toContain("Mandatory gates and independent review remain required");
+    expect(execute).toContain("Observation and steering do not transfer local scheduling to the coordinator");
+    expect(execute).toContain("Explicit user constraints and existing safety or resource limits remain binding");
   });
 
   test("decision levels preserve equivalent choices and genuine binding authority", () => {

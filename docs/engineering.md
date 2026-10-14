@@ -167,6 +167,13 @@ requests for that name reject on synchronous and asynchronous entrypoints.
 Its primary policy must be configured explicitly, without legacy Developer or
 foreground fallback.
 
+The coordinator supplies the outcome, purpose, permitted effects, write envelope,
+facts, invariants, and acceptance criteria. Head chooses no leaves, decomposition,
+or a combination, including for corrections, cleanup, and recovery. Local
+organization does not change frozen scope, unit order, permissions, or acceptance.
+Explicit user constraints and safety or resource limits remain binding.
+Observation and steering correct drift or actual violations, not local scheduling.
+
 The host creates an attachment beneath the exterior Developer reservation before
 startup awaits. It grants only session-local `head_*` tools. Native child/global
 guards remain intact. The in-memory DAG admits bounded leaf briefs, explicit
@@ -178,7 +185,8 @@ managed writers; it is not a filesystem sandbox or durable DAG replay authority.
 
 The Head is not a concurrent product writer. An epoch-bound exclusive barrier
 requires satisfied retained nodes and physical closure of every owned operation.
-Integration coding is allowed only after that barrier. Successful `head_finish`
+An empty graph uses the same barrier. Direct implementation and integration coding
+are allowed only after that barrier. Successful `head_finish`
 binds the integrated summary and limits to successful native tool results in this
 Head's current branch after this barrier. References prove provenance, not check
 quality. Reopen invalidates the epoch and evidence. Failure joins owned children
