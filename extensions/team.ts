@@ -24,6 +24,7 @@ interface Evaluation {
   assignments: Map<string, TeamAssignment>;
   latest: Map<string, string>;
   hasRoster: boolean;
+  retiring?: Promise<void>;
 }
 
 interface Registry {
@@ -46,21 +47,27 @@ export function beginTeamEvaluation(sessionId: string | undefined, child: boolea
   const state = registry();
   const previous = state.evaluations.get(sessionId);
   if (previous) {
-    retireTeamWorkers(previous.token);
-    state.evaluations.delete(sessionId);
+    throw new Error("Team evaluation already exists; await retirement before replacing it");
   }
   const evaluation = { sessionId, token, roles: new Map(), assignments: new Map(), latest: new Map(), hasRoster: false };
   state.evaluations.set(sessionId, evaluation);
   return evaluation;
 }
 
-export function retireTeamEvaluation(evaluation: TeamEvaluation | undefined): void {
-  if (!evaluation) return;
+export function retireTeamEvaluation(evaluation: TeamEvaluation | undefined): Promise<void> {
+  if (!evaluation) return Promise.resolve();
   const state = registry();
   const current = state.evaluations.get(evaluation.sessionId);
-  if (current?.token !== evaluation.token) return;
-  retireTeamWorkers(evaluation.token);
-  state.evaluations.delete(evaluation.sessionId);
+  if (current?.token !== evaluation.token) return Promise.resolve();
+  if (current.retiring) return current.retiring;
+  // Revoke synchronously, but keep the role reservation until physical closure.
+  const retirement = Promise.withResolvers<void>();
+  current.retiring = retirement.promise;
+  void retireTeamWorkers(evaluation.token).then(() => {
+    if (state.evaluations.get(evaluation.sessionId) === current) state.evaluations.delete(evaluation.sessionId);
+    retirement.resolve();
+  }, retirement.reject);
+  return current.retiring;
 }
 
 /** Reserve one role before accepting work. Roll back on preaccept failure. */
@@ -72,7 +79,7 @@ export function reserveTeamRole(
   if (!evaluation) throw new Error("Team requires a foreground session identity");
   const state = registry();
   const current = state.evaluations.get(evaluation.sessionId);
-  if (!current || current.token !== evaluation.token) throw new Error("stale Team evaluation");
+  if (!current || current.token !== evaluation.token || current.retiring) throw new Error("stale Team evaluation");
   if (!TEAM_ROLES.has(roleId)) throw new Error(`unsupported Team role ${roleId}`);
   if (current.roles.has(roleId)) throw new Error(`Team role ${roleId} is already reserved`);
   current.roles.set(roleId, assignmentId);
@@ -89,7 +96,7 @@ export function reserveTeamRole(
     token: evaluation.token,
     owns() {
       const live = state.evaluations.get(evaluation.sessionId);
-      return !finished && live?.token === evaluation.token && live.roles.get(roleId) === assignmentId;
+      return !finished && live?.token === evaluation.token && !live.retiring && live.roles.get(roleId) === assignmentId;
     },
     commit() {
       if (finished) return;
@@ -122,12 +129,12 @@ export function reserveTeamRole(
 export function teamEvaluationForSession(sessionId: string | undefined, child: boolean): TeamEvaluation | undefined {
   if (child || !sessionId || executionForSession(sessionId)) return undefined;
   const current = registry().evaluations.get(sessionId);
-  return current ? { sessionId, token: current.token } : undefined;
+  return current && !current.retiring ? { sessionId, token: current.token } : undefined;
 }
 
 export function recordTeamAssignment(evaluation: TeamEvaluation, roleId: string, assignment: TeamAssignment): void {
   const current = registry().evaluations.get(evaluation.sessionId);
-  if (current?.token !== evaluation.token) throw new Error("stale Team evaluation");
+  if (current?.token !== evaluation.token || current.retiring) throw new Error("stale Team evaluation");
   current.assignments.set(assignment.id, assignment);
   current.latest.set(roleId, assignment.id);
 }

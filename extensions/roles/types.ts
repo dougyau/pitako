@@ -77,6 +77,10 @@ export interface PitakoConfig {
   userConfigPresent: boolean;
   roles: Readonly<Record<string, RoleDefinition>>;
   policies: Readonly<Record<string, ModelPolicy>>;
+  /** Internal descriptor, never a publicly dispatchable roles entry. */
+  developerHead: RoleDefinition;
+  developerRouting: { classifierProvider: string; classifierModel: string };
+  headDeveloper: { maxParallel: number };
   watchdog: WatchdogConfig;
   workerHistory: { ttlDays: number | false };
 }

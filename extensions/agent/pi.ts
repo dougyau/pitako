@@ -19,6 +19,9 @@ import type { ModelTarget, ReasoningLevel } from "../roles/types.ts";
 import { InvocationHistory, type SessionHistory } from "./history.ts";
 import { createLiveHandle } from "./live.ts";
 import { createPublicProducer } from "./public-conversation.ts";
+import { AgentClosureError } from "./closure.ts";
+import { headExtension, leafScopeExtension } from "./head/tools.ts";
+import type { HeadAttachment } from "./head/runtime.ts";
 
 // Package entry does not re-export this. Import the file next to the resolved entry.
 export let DEFAULT_THINKING_LEVEL: ThinkingLevel;
@@ -30,59 +33,84 @@ const sdkDefaultsReady = import(
 });
 
 const childLifecycles = new WeakMap<AgentSession, { bound: boolean; disposal?: Promise<void>; history?: SessionHistory;
-  live?: ReturnType<typeof createLiveHandle>; unbindLive?: () => void }>();
+  live?: ReturnType<typeof createLiveHandle>; unbindLive?: () => void;
+  head?: HeadAttachment; headBinding?: object; stopAbort?: () => void;
+  operations: Set<Promise<unknown>>; failures: unknown[]; abort?: Promise<void>; closing: boolean }>();
+
+function requestAbort(session: AgentSession): Promise<void> {
+  const lifecycle = childLifecycles.get(session)!;
+  if (lifecycle.abort) return lifecycle.abort;
+  const pending = Promise.resolve().then(() => session.abort());
+  lifecycle.abort = pending;
+  lifecycle.operations.add(pending);
+  void pending.then(() => lifecycle.operations.delete(pending), error => {
+    lifecycle.failures.push(error);
+    lifecycle.operations.delete(pending);
+  });
+  return pending;
+}
 
 function disposeChildSession(session: AgentSession): Promise<void> {
   const lifecycle = childLifecycles.get(session)!;
-  return lifecycle.disposal ??= (async () => {
-    let failure: unknown;
+  if (lifecycle.disposal) return lifecycle.disposal;
+  lifecycle.closing = true;
+  if (lifecycle.headBinding) lifecycle.head?.unbind(lifecycle.headBinding);
+  // Revoke live input synchronously; retain and join its exact close promise below.
+  const liveClose = lifecycle.live?.handle.close();
+  void liveClose?.catch(() => {});
+  lifecycle.disposal = (async () => {
+    const failures = lifecycle.failures;
     let shutdownSettled = !lifecycle.bound, disposalSettled = false;
-    try {
+    const joinOperations = async () => {
+      while (lifecycle.operations.size) await Promise.allSettled([...lifecycle.operations]);
+    };
+    await joinOperations();
+    const join = async (operation: () => unknown) => {
+      try { await operation(); } catch (error) { failures.push(error); }
+    };
+    await join(async () => {
+      const live = lifecycle.live;
+      const captureFailed = (reason: "close_failed" | "capture_failed") => {
+        try { live?.handle.onTerminalCaptureFailed?.(reason); } catch { /* Observation cannot obstruct native cleanup. */ }
+      };
       try {
-        const live = lifecycle.live;
-        const captureFailed = (reason: "close_failed" | "capture_failed") => {
-          try { live?.handle.onTerminalCaptureFailed?.(reason); } catch { /* Observation cannot obstruct native cleanup. */ }
-        };
-        try {
-          await live?.handle.close();
-        } catch (error) {
-          captureFailed("close_failed");
-          throw error;
-        }
-        if (live) {
-          try {
-            const snapshot = live.capture();
-            live.handle.onTerminalCapture?.(snapshot);
-          } catch { captureFailed("capture_failed"); }
-        }
-      } finally {
-        lifecycle.unbindLive?.();
-        try {
-          if (lifecycle.bound) await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
-          shutdownSettled = true;
-        } finally {
-          try {
-            await session.dispose();
-            disposalSettled = true;
-          } finally {
-            unregisterExecution(session.sessionId);
-          }
-        }
+        await liveClose;
+      } catch (error) {
+        captureFailed("close_failed");
+        throw error;
       }
-    } catch (error) {
-      failure = error;
-      throw error;
-    } finally {
-      let historySettled = false;
-      try {
-        lifecycle.history?.disposition(failure);
-        historySettled = true;
-      } finally {
-        // Include native history disposition in the settled head, after all SDK producers.
-        await lifecycle.live?.handle.publicConversation?.close(!shutdownSettled || !disposalSettled || !historySettled);
+      if (live) {
+        try {
+          const snapshot = live.capture();
+          live.handle.onTerminalCapture?.(snapshot);
+        } catch { captureFailed("capture_failed"); }
       }
-    }
+    });
+    await join(() => lifecycle.unbindLive?.());
+    await join(async () => {
+      if (lifecycle.bound) await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+      shutdownSettled = true;
+    });
+    await joinOperations();
+    await join(async () => {
+      await session.dispose();
+      disposalSettled = true;
+    });
+    lifecycle.stopAbort?.();
+    await joinOperations();
+    let historySettled = false;
+    await join(() => {
+      lifecycle.history?.disposition(failures.length ? new AgentClosureError([...failures], "SDK session") : undefined);
+      historySettled = true;
+    });
+    await join(async () => {
+      // Include native history disposition in the settled head, after all SDK producers.
+      await lifecycle.live?.handle.publicConversation?.close(failures.length > 0 || !shutdownSettled || !disposalSettled || !historySettled);
+    });
+    if (failures.length) throw new AgentClosureError([...failures], `SDK session ${session.sessionId}`);
+    unregisterExecution(session.sessionId);
   })();
+  return lifecycle.disposal;
 }
 
 /** Omitted reasoning is not forced to medium. Pi keeps its own default. */
@@ -113,11 +141,13 @@ export function createPiExecutor(options: { now?: () => number; factories?: Part
     capturesHistory: true,
     capturesPublicConversation: true,
     async start(input) {
+      if (input.head) input = { ...input, signal: AbortSignal.any([input.signal, input.head.signal]) };
       const history = (input.history ?? new InvocationHistory(input.cwd, undefined, input.task, true)).admit(input.instanceId, input.role.id, input.target);
       try {
         // Do not bind the worker abort signal here. The session abort owns cancellation.
         // A signal on runtime create aborts Cursor auth before the child prompt starts.
         const runtime = await factories.createRuntime({ allowModelNetwork: false });
+        input.scope?.assertStartup();
         const selections = new WeakMap<object, RequestSelection>();
         keepCursorTools(runtime);
         installServiceTierTransport(runtime, selections);
@@ -253,6 +283,8 @@ async function runTarget(
     onRequest?: (request: AgentRequestObservation) => void;
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
     bindLive?: Parameters<AttemptExecutor["start"]>[0]["bindLive"];
+    scope?: Parameters<AttemptExecutor["start"]>[0]["scope"];
+    head?: HeadAttachment;
     sessionHistory?: SessionHistory;
     factories: PiFactories;
   },
@@ -274,6 +306,7 @@ async function runTarget(
     try {
       session = await openSession(runtime, model, target, input);
     } catch (error) {
+      if (error instanceof AgentClosureError) throw error;
       if (input.signal.aborted) return { status: "cancelled", result: "cancelled", sideEffects: false };
       return { status: "failed", result: "", error: messageOf(error), sideEffects: false };
     }
@@ -311,6 +344,7 @@ async function runTarget(
     delete handle.retryBeforePrompt;
     return await drive(session, runtime, selections, now, prompt, input);
   } catch (error) {
+    if (error instanceof AgentClosureError) throw error;
     if (!continuation) await handle.dispose();
     return { status: "failed", result: "", error: messageOf(error), sideEffects: continuation, session: continuation ? handle : undefined };
   }
@@ -373,6 +407,8 @@ async function bindThenRun(
     onRequest?: (request: AgentRequestObservation) => void;
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
     bindLive?: Parameters<AttemptExecutor["start"]>[0]["bindLive"];
+    scope?: Parameters<AttemptExecutor["start"]>[0]["scope"];
+    head?: HeadAttachment;
     sessionHistory?: SessionHistory;
     factories: PiFactories;
   },
@@ -381,6 +417,7 @@ async function bindThenRun(
   try {
     session = await openSession(runtime, undefined, target, input);
   } catch (error) {
+    if (error instanceof AgentClosureError) throw error;
     if (input.signal.aborted) return { status: "cancelled", result: "cancelled", sideEffects: false };
     return { status: "failed", result: "", error: messageOf(error), sideEffects: false };
   }
@@ -400,12 +437,15 @@ async function openSession(
   model: NonNullable<ReturnType<ModelRuntime["getModel"]>> | undefined,
   target: ModelTarget,
   input: { instanceId: string; role: Parameters<AttemptExecutor["start"]>[0]["role"]; cwd: string; sessionHistory?: SessionHistory; factories: PiFactories;
+    signal: AbortSignal; head?: HeadAttachment; scope?: Parameters<AttemptExecutor["start"]>[0]["scope"];
     bindLive?: Parameters<AttemptExecutor["start"]>[0]["bindLive"] },
 ): Promise<AgentSession> {
   const agentDir = input.factories.getAgentDir();
   const settingsManager = input.factories.createSettings(input.cwd, agentDir);
   const allowed = new Set(skillNamesForRole(input.role));
   let live: ReturnType<typeof createLiveHandle> | undefined;
+  let nativeSession: AgentSession | undefined;
+  const headBinding = input.head?.bind(input.instanceId);
   const loader = input.factories.createLoader({
     cwd: input.cwd,
     agentDir,
@@ -416,7 +456,8 @@ async function openSession(
       pi.on("agent_before_settle", () => live?.settle());
       pi.on("session_tree", event => live?.handle.publicConversation?.reconcile(event.oldLeafId));
       pi.on("session_start", () => live?.handle.publicConversation?.reconcile());
-    }],
+    }, ...(input.head && headBinding ? [headExtension(input.head, headBinding, () => nativeSession!.sessionManager)] : []),
+    ...(input.scope ? [leafScopeExtension(input.scope, () => nativeSession!)] : [])],
     appendSystemPrompt: [childInstructions(input.role, input.instanceId)],
     skillsOverride: (base) => ({
       skills: base.skills.filter((skill) => allowed.has(skill.name)),
@@ -424,6 +465,8 @@ async function openSession(
     }),
   });
   await loader.reload();
+  input.scope?.assertStartup();
+  if (input.signal.aborted) throw new Error("Agent session startup cancelled");
   const thinkingLevel = model ? thinkingLevelFor(target.reasoning) : undefined;
   const { session } = await input.factories.createSession({
     cwd: input.cwd,
@@ -436,22 +479,45 @@ async function openSession(
     modelRuntime: runtime,
     excludeTools: [...ORCHESTRATION_TOOLS],
   });
-  live = input.bindLive ? createLiveHandle(session, input.sessionHistory!) : undefined;
-  if (live) live.handle.publicConversation = createPublicProducer(session, input.sessionHistory!);
-  const lifecycle = { bound: false, history: input.sessionHistory, live, unbindLive: live ? input.bindLive!(live.handle) : undefined };
+  nativeSession = session;
+  const lifecycle: NonNullable<ReturnType<typeof childLifecycles.get>> = {
+    bound: false, history: input.sessionHistory, head: input.head, headBinding, operations: new Set(), failures: [], closing: false,
+  };
   childLifecycles.set(session, lifecycle);
-  lifecycle.history?.attached();
-  if (live) session.subscribe(event => {
-    live!.event(event);
-    live!.handle.publicConversation?.event(event);
+  lifecycle.stopAbort = watchAbort(input.signal, () => {
+    input.head?.revoke();
+    void lifecycle.live?.handle.close().catch(error => lifecycle.failures.push(error));
+    void requestAbort(session).catch(() => {});
   });
-  if (lifecycle.history) session.subscribe((event) => {
-    if (event.type === "message_end" && event.message.role === "assistant") lifecycle.history!.assistantObserved();
-  });
-  registerExecution({ instanceId: input.instanceId, roleId: input.role.id, sessionId: session.sessionId });
   try {
+    input.scope?.assertStartup();
+    lifecycle.history?.attached();
+    if (input.scope && input.sessionHistory) {
+      input.scope.bindRevision(revision => input.sessionHistory!.headRevision(revision));
+    }
+    registerExecution({ instanceId: input.instanceId, roleId: input.role.id, sessionId: session.sessionId });
+    if (input.signal.aborted) {
+      await disposeChildSession(session);
+      throw new Error("Agent session startup cancelled");
+    }
+    live = input.bindLive ? createLiveHandle(session, input.sessionHistory!) : undefined;
+    lifecycle.live = live;
+    if (live) live.handle.publicConversation = createPublicProducer(session, input.sessionHistory!);
+    lifecycle.unbindLive = live ? input.bindLive!(live.handle) : undefined;
+    if (live) session.subscribe(event => {
+      live!.event(event);
+      live!.handle.publicConversation?.event(event);
+    });
+    if (lifecycle.history) session.subscribe((event) => {
+      if (event.type === "message_end" && event.message.role === "assistant") lifecycle.history!.assistantObserved();
+    });
+    if (input.signal.aborted) {
+      await disposeChildSession(session);
+      throw new Error("Agent session startup cancelled");
+    }
     await session.bindExtensions({});
     lifecycle.bound = true;
+    input.scope?.assertStartup();
     reconcileChildTools(session);
     return session;
   } catch (error) {
@@ -475,7 +541,9 @@ async function drive(
     onActivated?: (appliedReasoning: string) => void;
     onRequest?: (request: AgentRequestObservation) => void;
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
+    scope?: Parameters<AttemptExecutor["start"]>[0]["scope"];
     factories: PiFactories;
+    head?: HeadAttachment;
   },
 ): Promise<Attempt> {
   // continueWith skips executor.start. The probe closes over this session only.
@@ -551,43 +619,48 @@ async function drive(
     });
     const handle = resume(session, runtime, selections, now, input);
     const before = usageFrom(session, {});
+    const usage = () => attemptUsage(before, session, tools, Boolean(input.head || input.scope));
     if (input.signal.aborted) {
       try {
-        await session.abort();
+        await requestAbort(session);
       } finally {
         unsubscribe();
         session.agent.streamFunction = originalStreamFunction;
       }
-      return { status: "cancelled", result: "cancelled", sideEffects, requests: requests.length ? requests : undefined, usage: attemptUsage(before, session, tools), session: handle };
+      return { status: "cancelled", result: "cancelled", sideEffects, requests: requests.length ? requests : undefined, usage: usage(), session: handle };
     }
-    const stopWatch = watchAbort(input.signal, () => {
-      // Disposal joins this same close promise and propagates persistence failures.
-      void childLifecycles.get(session)?.live?.handle.close().catch(() => {});
-      void session.abort();
-    });
+    const stopWatch = watchAbort(input.signal, () => { void requestAbort(session).catch(() => {}); });
     try {
-      await session.prompt(prompt, { expandPromptTemplates: false });
+      const lifecycle = childLifecycles.get(session)!;
+      if (lifecycle.closing) throw new Error("Agent session is closing");
+      const prompting = Promise.resolve().then(() => {
+        if (input.signal.aborted || lifecycle.closing) return;
+        input.scope?.beginPrompt(session.sessionId);
+        return session.prompt(prompt, { expandPromptTemplates: false });
+      });
+      lifecycle.operations.add(prompting);
+      try { await prompting; } finally { lifecycle.operations.delete(prompting); }
       const assistant = lastAssistant(session);
       if (input.signal.aborted) {
-        return { status: "cancelled", result: "cancelled", sideEffects, requests: requests.length ? requests : undefined, usage: attemptUsage(before, session, tools), appliedReasoning: session.thinkingLevel, session: handle };
+        return { status: "cancelled", result: "cancelled", sideEffects, requests: requests.length ? requests : undefined, usage: usage(), appliedReasoning: session.thinkingLevel, session: handle };
       }
       if (assistant?.stopReason === "aborted" || assistant?.stopReason === "error") {
-        return failedAttempt(assistant.errorMessage ?? assistant.stopReason ?? "provider error", sideEffects, handle, session, attemptUsage(before, session, tools), requests);
+        return failedAttempt(assistant.errorMessage ?? assistant.stopReason ?? "provider error", sideEffects, handle, session, usage(), requests);
       }
       return {
         status: "completed",
         result: textOf(assistant),
         sideEffects,
         requests: requests.length ? requests : undefined,
-        usage: attemptUsage(before, session, tools),
+        usage: usage(),
         appliedReasoning: session.thinkingLevel,
         session: handle,
       };
     } catch (error) {
       if (input.signal.aborted) {
-        return { status: "cancelled", result: "cancelled", sideEffects, requests: requests.length ? requests : undefined, usage: attemptUsage(before, session, tools), session: handle };
+        return { status: "cancelled", result: "cancelled", sideEffects, requests: requests.length ? requests : undefined, usage: usage(), session: handle };
       }
-      return failedAttempt(messageOf(error), sideEffects, handle, session, attemptUsage(before, session, tools), requests);
+      return failedAttempt(messageOf(error), sideEffects, handle, session, usage(), requests);
     } finally {
       await childLifecycles.get(session)?.live?.settle();
       finishRequest(input.signal.aborted ? "cancelled" : "failed");
@@ -634,7 +707,9 @@ function resume(
     onActivated?: (appliedReasoning: string) => void;
     onRequest?: (request: AgentRequestObservation) => void;
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
+    scope?: Parameters<AttemptExecutor["start"]>[0]["scope"];
     factories: PiFactories;
+    head?: HeadAttachment;
   },
 ): NonNullable<Attempt["session"]> {
   const history = childLifecycles.get(session)?.history;
@@ -701,8 +776,8 @@ export function watchAbort(signal: AbortSignal, onAbort: () => void): () => void
   return () => signal.removeEventListener("abort", listener);
 }
 
-function attemptUsage(before: AgentUsage, session: AgentSession, tools: Record<string, number>): AgentUsage | undefined {
-  const delta = usageDelta(before, usageFrom(session, {}));
+function attemptUsage(before: AgentUsage, session: AgentSession, tools: Record<string, number>, preserveUnknown: boolean): AgentUsage | undefined {
+  const delta = usageDelta(before, usageFrom(session, {}), preserveUnknown);
   if (!delta) return undefined;
   return { ...delta, tools, contextTokens: usageFrom(session, {}).contextTokens };
 }

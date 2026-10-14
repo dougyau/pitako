@@ -44,11 +44,11 @@ import { listObservations } from "../extensions/agent/observe.ts";
 const fixture = agentFixtureOwnership();
 const tempDirs = fixture.directories;
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
-afterEach(() => {
+afterEach(async () => {
   fixture.requireReleasedFixture();
   if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
   else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
-  cancelAllWorkers();
+  await cancelAllWorkers();
   clearBackgroundOwner();
   setBackgroundExecutor(undefined);
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
@@ -141,8 +141,8 @@ describe("pitako agents command", () => {
     }
     const nextOwner = owner(true);
     bindBackgroundOwner(nextOwner);
-    shutdownBackground(foreground.token);
-    expect(() => resolveLiveTarget(target, "coordinator")).toThrow("unknown live target");
+    const retired = shutdownBackground(foreground.token);
+    expect(() => resolveLiveTarget(target, "coordinator")).toThrow("different foreground owner");
 
     const team = hang();
     let teamBind: typeof bind;
@@ -157,10 +157,13 @@ describe("pitako agents command", () => {
     expect(resolveLiveTarget(teamTarget, "coordinator", nextOwner.token)).toBe(teamLive);
     expect(() => resolveLiveTarget({ kind: "background", instanceId: assigned.instanceId }, "coordinator")).toThrow("unknown live target");
     expect(() => resolveLiveTarget(teamTarget, "coordinator", Symbol("retired"))).toThrow("unknown live target");
-    retireTeamWorkers(nextOwner.token);
-    expect(() => resolveLiveTarget(teamTarget, "coordinator", nextOwner.token)).toThrow("unknown live target");
+    const retiredTeam = retireTeamWorkers(nextOwner.token);
+    expect(() => resolveLiveTarget(teamTarget, "coordinator", nextOwner.token)).toThrow("Team evaluation is retired");
     expect(hanging.signal()?.aborted).toBe(true);
     expect(() => resolveLiveTarget(target, "coordinator")).toThrow();
+    hanging.release({ status: "cancelled", result: "cancelled", sideEffects: false });
+    team.release({ status: "cancelled", result: "cancelled", sideEffects: false });
+    await Promise.all([retired, retiredTeam]);
   }));
   test("empty list, running row, id filter, and unknown id", fixture.ownedCase("empty list, running row, id filter, and unknown id", async () => {
     const cmd = pitakoAgentsCommand();
@@ -686,12 +689,12 @@ describe("background registry", () => {
       executor: late.executor,
       load: load(),
     });
-    shutdownBackground(held.token);
-    expect(workerStatus().map(row => row.instanceId)).toEqual([handle.instanceId]);
-    shutdownBackground(bound.token);
-    expect(workerStatus()).toEqual([]);
+    const retirement = shutdownBackground(held.token);
+    expect(workerStatus(running.instanceId)[0]?.closure).toEqual({ state: "pending" });
+    await shutdownBackground(bound.token);
+    expect(workerStatus().map(row => row.instanceId)).toEqual([running.instanceId]);
     late.release({ status: "completed", result: "LATE", sideEffects: false });
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await retirement;
     expect(held.notes).toEqual([]);
     expect(() => workerStatus(running.instanceId)).toThrow(/unknown worker/);
   }));
@@ -713,7 +716,7 @@ describe("background registry", () => {
     settleWorkerResults(Symbol("other"), true);
     expect(bound.results).toEqual([]);
     expect(workerStatus(handle.instanceId)).toHaveLength(1);
-    shutdownBackground(Symbol("other"));
+    await shutdownBackground(Symbol("other"));
     expect(workerStatus(handle.instanceId)[0]?.status).toBe("failed");
     bound.isIdle = () => true;
     settleWorkerResults(bound.token, true);

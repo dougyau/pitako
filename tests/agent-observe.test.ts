@@ -26,12 +26,12 @@ import type { LoadOptions } from "../extensions/roles/load.ts";
 const fixture = agentFixtureOwnership();
 const tempDirs = fixture.directories;
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
-afterEach(() => {
+afterEach(async () => {
   fixture.requireReleasedFixture();
   setSystemTime();
   if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
   else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
-  cancelAllWorkers();
+  await cancelAllWorkers();
   clearBackgroundOwner();
   setBackgroundExecutor(undefined);
   clearObservations();

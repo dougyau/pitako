@@ -32,6 +32,7 @@ import { createPaneSession } from "./herdr/agents-ui/session.ts";
 import { readHerdrPresence } from "./herdr/presence.ts";
 import { registerCodexTools } from "./codex.ts";
 import { createAgentBridge } from "./agent/bridge/broker.ts";
+import { AgentClosureError } from "./agent/closure.ts";
 
 function requestedProfile(pi: ExtensionAPI): ProfileName {
   const flag = pi.getFlag("pitako-profile");
@@ -131,7 +132,9 @@ export default function pitako(pi: ExtensionAPI) {
   pi.on("session_start", async (event, ctx) => {
     const retired = revokeForeground();
     const revision = foregroundRevision;
-    const reopenDispatches = closeDispatchAdmissions(retired.evaluation?.sessionId ?? ctx.sessionManager?.getSessionId());
+    const previousEvaluation = retired.evaluation ?? teamEvaluationForSession(ctx.sessionManager?.getSessionId(), isChildSession(ctx));
+    const reopenDispatches = closeDispatchAdmissions(previousEvaluation?.sessionId ?? ctx.sessionManager?.getSessionId());
+    const retirement = Promise.allSettled([retireTeamEvaluation(previousEvaluation), shutdownBackground(retired.token)]);
     let upstreamFailure: { error: unknown } | undefined;
     try {
       try {
@@ -139,12 +142,12 @@ export default function pitako(pi: ExtensionAPI) {
       } catch (error) {
         upstreamFailure = { error };
       }
-      await settlePendingDispatches(retired.evaluation?.sessionId ?? ctx.sessionManager?.getSessionId());
-      await retired.controller?.settle();
-      await retired.pane?.close();
-      await retired.bridge?.settle();
-      retireTeamEvaluation(retired.evaluation);
-      shutdownBackground(retired.token);
+      const settled = await Promise.allSettled([
+        settlePendingDispatches(previousEvaluation?.sessionId ?? ctx.sessionManager?.getSessionId()),
+        retired.controller?.settle(), retired.pane?.close(), retired.bridge?.settle(),
+      ]);
+      const failures = [...settled, ...await retirement].flatMap(result => result.status === "rejected" ? [result.reason] : []);
+      if (failures.length) throw new AgentClosureError(failures, "Foreground replacement");
       if (revision !== foregroundRevision) return;
       const sessionId = ctx.sessionManager?.getSessionId();
       if (foregroundSession(sessionId)) {
@@ -162,7 +165,7 @@ export default function pitako(pi: ExtensionAPI) {
         }
         if (revision !== foregroundRevision) return;
       }
-      if (teamEvaluation && teamEvaluation.sessionId !== sessionId) retireTeamEvaluation(teamEvaluation);
+      if (teamEvaluation && teamEvaluation.sessionId !== sessionId) await retireTeamEvaluation(teamEvaluation);
       ownerToken = Symbol("pitako.foreground");
       teamEvaluation = beginTeamEvaluation(
         sessionId,
@@ -259,12 +262,16 @@ export default function pitako(pi: ExtensionAPI) {
   pi.on("session_shutdown", async (event, ctx) => {
     const retired = revokeForeground();
     const revision = foregroundRevision;
-    await settlePendingDispatches(retired.evaluation?.sessionId ?? ctx.sessionManager?.getSessionId());
-    await retired.controller?.settle();
-    await retired.pane?.close();
-    await retired.bridge?.settle();
-    retireTeamEvaluation(retired.evaluation);
-    shutdownBackground(retired.token);
+    const previousEvaluation = retired.evaluation ?? teamEvaluationForSession(ctx.sessionManager?.getSessionId(), isChildSession(ctx));
+    const reopenDispatches = closeDispatchAdmissions(previousEvaluation?.sessionId ?? ctx.sessionManager?.getSessionId());
+    const settled = await Promise.allSettled([
+      retireTeamEvaluation(previousEvaluation), shutdownBackground(retired.token),
+      settlePendingDispatches(previousEvaluation?.sessionId ?? ctx.sessionManager?.getSessionId()),
+      retired.controller?.settle(), retired.pane?.close(), retired.bridge?.settle(),
+    ]);
+    const failures = settled.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+    if (failures.length) throw new AgentClosureError(failures, "Foreground shutdown");
+    reopenDispatches();
     if (revision === foregroundRevision) unregisterSupervisedSession();
   });
 

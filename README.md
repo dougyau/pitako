@@ -224,6 +224,38 @@ The child cannot call `agent_run`, `agent_supervise`, `agent_spawn`, `agent_stat
 
 Collection, bookkeeping, delivery, and continuation remain separate. Handoff acknowledgement requires an exact committed result in the owning active branch, reconciled or inapplicable bookkeeping, and a subsequent owning turn with that result in its branch. A send, draft, preview, or getter is not that proof; even an observed turn is not model processing or work acceptance. Failed or uncertain operations remain visible and retain the full result, with at most one later event-driven recovery per operation. Parent abort/error never forces continuation. These handoffs are live-session state, not a durable queue or restart recovery. Full text can pressure the model context or be compacted later.
 
+### Optional Head Developer
+
+The one exterior Developer may receive assignment-local Head authority through
+asynchronous `agent_spawn` or `team_assign`:
+
+```json
+{ "role": "developer", "mode": "head", "writes": ["src", "tests"], "task": "Bounded WorkBrief" }
+```
+
+`writes` is explicit: relative files/subtrees, `[]` for read-only work, or `["."]`
+for the captured root. Omitted mode stays ordinary; single mode rejects writes.
+Other roles and synchronous `agent_run`/`agent_supervise` cannot become Heads.
+`developer_head` is internal, not a public role. Configure its primary explicitly;
+it does not inherit the legacy Developer or foreground policy. See the
+[example configuration](config/developer-profiles.example.toml).
+
+The Head keeps the Developer baseline and receives local `head_*` tools to scope,
+decompose, steer and judge its own Developer leaves. Leaves have bounded contexts,
+independent capacity policies and optional configured classifier advice. Global
+child/Team guards stay intact. Original writes remain reserved through physical
+closure, including active scope adjustments. The Head integrates only after an
+exclusive barrier, inspects relevant diffs/tests, verifies, and calls `head_finish`
+with current native evidence. Final text alone is not success.
+
+The exterior result is an integrated handoff or diagnostic failure. It includes
+bound identities, closure summaries and observed usage/parallelism; unknown usage
+is not zero. Cancellation joins only the owning subtree, and uncertain closure
+remains blocking. This is live coordination, not a sandbox, durable scheduler,
+extra exterior Developer or waiver of coordinator acceptance. Details:
+[Engineering layer](docs/engineering.md#assignment-local-head-developer) and
+[Worker history](docs/worker-history.md#head-developer-history).
+
 There is no fixed wall-clock deadline. A run ends for inactivity, not because it is old. The default idle window is 10 minutes with no tool running, and 45 minutes while a tool is running. `max_run_time = "0"` means unlimited. Parent cancellation is immediate and is not a stall. An open cursor AgentSession run uses the tool window because native exec emits no Pi tool event, and a stall still does not switch models. Prompt-cache warming does not count as progress. Pi's HTTP idle timeout is a separate transport limit and is left unchanged.
 
 ```toml

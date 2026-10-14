@@ -31,7 +31,7 @@ export interface LoadOptions {
   availableModels?: readonly ModelCapability[];
 }
 
-const ROOT_KEYS = new Set(["roles", "model_policies", "agent_runtime", "worker_history"]);
+const ROOT_KEYS = new Set(["roles", "model_policies", "agent_runtime", "worker_history", "developer_routing", "head_developer"]);
 const ROLE_KEYS = new Set(["name", "description", "instructions", "model_policy", "skills", "principles"]);
 const POLICY_KEYS = new Set(["primary", "fallbacks"]);
 const TARGET_KEYS = new Set(["model", "reasoning", "fast"]);
@@ -80,6 +80,31 @@ export function resolveRoleFromConfig(config: PitakoConfig, id: string, profile:
   });
 }
 
+/** Host-only Head resolution. Public role lookup deliberately does not expose it. */
+export function resolveDeveloperHeadFromConfig(config: PitakoConfig): ResolvedRole {
+  const role = config.developerHead;
+  return freeze({
+    id: role.id,
+    name: role.name,
+    description: role.description,
+    instructionsPath: role.instructionsPath,
+    instructions: role.instructions,
+    skills: Object.freeze([...role.skills]),
+    principles: Object.freeze([...role.principles]),
+    modelPolicyId: role.modelPolicy,
+    modelPolicy: resolvePolicy(requirePolicy(config, role.modelPolicy), config.userConfigPath),
+  });
+}
+
+function developerHead(role: RoleDefinition, instructionsPath: string): RoleDefinition {
+  return {
+    ...role, id: "developer_head", name: "Head Developer",
+    description: "Coordinates bounded Developer work and integrates its verified outcome.",
+    modelPolicy: "developer_head", instructionsPath,
+    instructions: `${role.instructions}\n\n${readInstructions(instructionsPath, instructionsPath)}`,
+  };
+}
+
 function parseBuiltin(defaultsPath: string, root: string): PitakoConfig {
   const raw = readToml(defaultsPath);
   const roles = parseRoles(raw.roles, defaultsPath, root, root);
@@ -93,10 +118,23 @@ function parseBuiltin(defaultsPath: string, root: string): PitakoConfig {
     }
   }
   return { defaultsPath, userConfigPath: "", userConfigPresent: false, roles, policies, watchdog: parseWatchdogConfig(raw.watchdog, defaultsPath),
+    developerHead: developerHead(roles.developer!, resolveInstructions(defaultsPath, "roles/developer-head.md", root, root)),
+    developerRouting: parseDeveloperRouting(raw.developerRouting, defaultsPath),
+    headDeveloper: parseHeadDeveloper(raw.headDeveloper, defaultsPath),
     workerHistory: parseWorkerHistory(raw.workerHistory, defaultsPath) };
 }
 
-function readUserConfig(userConfigPath: string): { present: boolean; roles: Record<string, RawRole>; policies: Record<string, RawPolicy>; watchdog?: unknown; workerHistory?: unknown } {
+interface UserConfig {
+  present: boolean;
+  roles: Record<string, RawRole>;
+  policies: Record<string, RawPolicy>;
+  watchdog?: unknown;
+  workerHistory?: unknown;
+  developerRouting?: unknown;
+  headDeveloper?: unknown;
+}
+
+function readUserConfig(userConfigPath: string): UserConfig {
   if (!existsSync(userConfigPath)) return { present: false, roles: {}, policies: {} };
   const raw = readToml(userConfigPath);
   return {
@@ -105,12 +143,14 @@ function readUserConfig(userConfigPath: string): { present: boolean; roles: Reco
     policies: parsePolicyTables(raw.policies, userConfigPath) ?? {},
     watchdog: raw.watchdog,
     workerHistory: raw.workerHistory,
+    developerRouting: raw.developerRouting,
+    headDeveloper: raw.headDeveloper,
   };
 }
 
 function mergeConfig(
   builtin: PitakoConfig,
-  user: { present: boolean; roles: Record<string, RawRole>; policies: Record<string, RawPolicy>; watchdog?: unknown; workerHistory?: unknown },
+  user: UserConfig,
   userConfigPath: string,
   availableModels: readonly ModelCapability[] | undefined,
 ): PitakoConfig {
@@ -156,6 +196,9 @@ function mergeConfig(
     userConfigPresent: user.present,
     roles,
     policies,
+    developerHead: developerHead(roles.developer!, builtin.developerHead.instructionsPath),
+    developerRouting: parseDeveloperRouting(user.developerRouting, userConfigPath, builtin.developerRouting),
+    headDeveloper: parseHeadDeveloper(user.headDeveloper, userConfigPath, builtin.headDeveloper),
     watchdog: mergeWatchdog(builtin.watchdog ?? DEFAULT_WATCHDOG, user.watchdog, userConfigPath),
     workerHistory: parseWorkerHistory(user.workerHistory, userConfigPath, builtin.workerHistory),
   };
@@ -263,6 +306,39 @@ interface RawDocument {
   policies: unknown;
   watchdog: unknown;
   workerHistory: unknown;
+  developerRouting: unknown;
+  headDeveloper: unknown;
+}
+
+function parseDeveloperRouting(
+  value: unknown, file: string,
+  base: PitakoConfig["developerRouting"] = { classifierProvider: "opencode", classifierModel: "jev-1.13-free" },
+): PitakoConfig["developerRouting"] {
+  if (value === undefined) return base;
+  const table = expectRecord(value, file, "developer_routing");
+  rejectUnknown(table, new Set(["classifier_provider", "classifier_model"]), file, "developer_routing");
+  const classifierProvider = optionalString(table.classifier_provider, file, "developer_routing.classifier_provider") ?? base.classifierProvider;
+  const classifierModel = optionalString(table.classifier_model, file, "developer_routing.classifier_model") ?? base.classifierModel;
+  if (/[/\s]/.test(classifierProvider)) {
+    throw new PitakoConfigError(`${file}: developer_routing.classifier_provider: expected a provider id`);
+  }
+  if (/\s/.test(classifierModel)) {
+    throw new PitakoConfigError(`${file}: developer_routing.classifier_model: expected a model id`);
+  }
+  return { classifierProvider, classifierModel };
+}
+
+function parseHeadDeveloper(
+  value: unknown, file: string, base: PitakoConfig["headDeveloper"] = { maxParallel: 3 },
+): PitakoConfig["headDeveloper"] {
+  if (value === undefined) return base;
+  const table = expectRecord(value, file, "head_developer");
+  rejectUnknown(table, new Set(["max_parallel"]), file, "head_developer");
+  const maxParallel = table.max_parallel === undefined ? base.maxParallel : table.max_parallel;
+  if (typeof maxParallel !== "number" || !Number.isSafeInteger(maxParallel) || maxParallel <= 0) {
+    throw new PitakoConfigError(`${file}: head_developer.max_parallel: expected a positive safe integer`);
+  }
+  return { maxParallel };
 }
 
 function parseWorkerHistory(value: unknown, file: string, base: PitakoConfig["workerHistory"] = { ttlDays: 180 }): PitakoConfig["workerHistory"] {
@@ -299,7 +375,8 @@ function readToml(file: string): RawDocument {
   }
   const record = expectRecord(parsed, file, "");
   rejectUnknown(record, ROOT_KEYS, file, "");
-  return { roles: record.roles, policies: record.model_policies, watchdog: record.agent_runtime, workerHistory: record.worker_history };
+  return { roles: record.roles, policies: record.model_policies, watchdog: record.agent_runtime, workerHistory: record.worker_history,
+    developerRouting: record.developer_routing, headDeveloper: record.head_developer };
 }
 
 function parseRoles(value: unknown, file: string, packageRootDir: string, stayInside: string): Record<string, RoleDefinition> {

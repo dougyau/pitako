@@ -129,13 +129,14 @@ reasoning = "high"
     const stale = execute("team_assign");
     await entered.promise;
     // Replacement lease cannot be erased by the old operation's rollback.
+    await retireTeamEvaluation(evaluation);
     const replacement = beginTeamEvaluation(sessionId, false)!;
     const fresh = reserveTeamRole(replacement, "developer", "replacement");
     gate.resolve(result());
     expect((await stale).isError).toBe(true);
     expect(teamRoleReservation(replacement, "developer")).toBe("replacement");
     expect(starts).toBe(2);
-    fresh.rollback(); retireTeamEvaluation(replacement);
+    fresh.rollback(); await retireTeamEvaluation(replacement);
 
     gate = deferred(); entered = deferred();
     const changed = execute("agent_spawn");
@@ -147,7 +148,7 @@ reasoning = "high"
   } finally {
     gate.resolve(result("aborted"));
     await settlePendingDispatches();
-    retireTeamEvaluation(evaluation);
+    await retireTeamEvaluation(evaluation);
     clearBackgroundOwner(); setBackgroundExecutor(undefined);
   }
 }));

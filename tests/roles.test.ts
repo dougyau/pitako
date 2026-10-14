@@ -8,7 +8,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getPitakoConfigPath } from "../extensions/board/paths.ts";
 import pitako from "../extensions/index.ts";
 import { PitakoConfigError } from "../extensions/errors.ts";
-import { getModelPolicy, getRole, loadPitakoConfig, resolveRole, resolveRoleFromConfig } from "../extensions/roles/load.ts";
+import { getModelPolicy, getRole, loadPitakoConfig, resolveDeveloperHeadFromConfig, resolveRole, resolveRoleFromConfig } from "../extensions/roles/load.ts";
 import { inspectPitako } from "../extensions/roles/format.ts";
 import { ROLE_IDS, DEVELOPER_PROFILES } from "../extensions/roles/types.ts";
 import { packageRoot } from "../extensions/stack.ts";
@@ -34,6 +34,105 @@ function writeConfig(configPath: string, text: string): void {
 }
 
 describe("role and model policy resolution", () => {
+  test("internal Head composes effective Developer instructions but has an independent model policy", () => {
+    const { env, configPath } = tempAgent();
+    writeConfig(configPath, `
+[roles.developer]
+instructions = "local-developer.md"
+skills = ["ponytail", "verify-behavior"]
+principles = ["principle-fix-root-causes"]
+[model_policies.developer.primary]
+model = "fixture/legacy"
+reasoning = "medium"
+[[model_policies.developer.fallbacks]]
+model = "fixture/worker-fallback"
+reasoning = "low"
+`);
+    writeFileSync(path.join(path.dirname(configPath), "local-developer.md"), "Effective Developer assignment contract.");
+    const legacyOnly = loadPitakoConfig({ env });
+    const missingHead = resolveDeveloperHeadFromConfig(legacyOnly);
+    expect(Object.keys(legacyOnly.roles).sort()).toEqual([...ROLE_IDS].sort());
+    expect(DEVELOPER_PROFILES).not.toContain("developer_head");
+    expect(() => resolveRoleFromConfig(legacyOnly, "developer_head")).toThrow('unknown role "developer_head"');
+    expect(missingHead.modelPolicy.primary).toBeUndefined();
+    expect(missingHead.modelPolicy.fallbacks).toEqual([]);
+    expect(missingHead.modelPolicy.diagnostic).toContain("[model_policies.developer_head.primary]");
+    expect(missingHead.modelPolicy.diagnostic).toContain(configPath);
+    expect(resolveRoleFromConfig(legacyOnly, "developer").modelPolicy.primary?.model).toBe("fixture/legacy");
+    const prior = readFileSync(configPath, "utf8");
+    writeConfig(configPath, prior + `
+[model_policies.developer_head.primary]
+model = "fixture/head"
+reasoning = "high"
+[[model_policies.developer_head.fallbacks]]
+model = "fixture/head-fallback"
+reasoning = "default"
+[model_policies.developer_senior.primary]
+model = "fixture/senior"
+reasoning = "xhigh"
+[model_policies.developer_mid.primary]
+model = "fixture/mid"
+reasoning = "off"
+[model_policies.developer_junior.primary]
+model = "fixture/junior"
+`);
+    const config = loadPitakoConfig({ env });
+    const head = resolveDeveloperHeadFromConfig(config);
+    expect(head.modelPolicy.primary).toEqual({ model: "fixture/head", reasoning: "high" });
+    expect(head.modelPolicy.fallbacks).toEqual([{ model: "fixture/head-fallback" }]);
+    expect(DEVELOPER_PROFILES.map(profile => resolveRoleFromConfig(config, "developer", profile).modelPolicy.primary))
+      .toEqual([{ model: "fixture/senior", reasoning: "xhigh" }, { model: "fixture/mid", reasoning: "off" }, { model: "fixture/junior" }]);
+    const developer = resolveRoleFromConfig(config, "developer");
+    expect(head.skills).toEqual(developer.skills);
+    expect(head.principles).toEqual(developer.principles);
+    const delivered = childInstructions(head, "internal-head-fixture");
+    for (const obligation of [
+      "Effective Developer assignment contract.", "actual observations", "input receipt is not compliance",
+      "expand local work", "write envelope", "escalate to the coordinator",
+      "underlying observed evidence before satisfying", "Inspect the integrated diff and evidence",
+      "verify-behavior", "Ponytail",
+    ]) expect(delivered).toContain(obligation);
+    expect(skillNamesForRole(head)).toContain("verify-behavior");
+    expect(skillNamesForRole(head)).toContain("ponytail");
+    writeConfig(configPath, prior + '[roles.developer_head]\nname = "Public Head"\n');
+    expect(() => loadPitakoConfig({ env })).toThrow('unknown role "developer_head"');
+  });
+
+  test("routing identity and Head concurrency are validated configuration, not model defaults", () => {
+    const { env, configPath } = tempAgent();
+    const defaults = loadPitakoConfig({ env });
+    expect(defaults.developerRouting).toEqual({ classifierProvider: "opencode", classifierModel: "jev-1.13-free" });
+    expect(defaults.headDeveloper.maxParallel).toBe(3);
+    writeConfig(configPath, `
+[developer_routing]
+classifier_provider = "fixture"
+classifier_model = "capacity/v2"
+[head_developer]
+max_parallel = 7
+`);
+    const configured = loadPitakoConfig({ env });
+    expect(configured.developerRouting).toEqual({ classifierProvider: "fixture", classifierModel: "capacity/v2" });
+    expect(configured.headDeveloper.maxParallel).toBe(7);
+    for (const max of ["0", "-1", "1.5", '"3"', "9007199254740992.0", "false"]) {
+      writeConfig(configPath, `[head_developer]\nmax_parallel = ${max}\n`);
+      expect(() => loadPitakoConfig({ env })).toThrow(`${configPath}: head_developer.max_parallel: expected a positive safe integer`);
+    }
+    writeConfig(configPath, "[head_developer]\nmax_parallel = 9007199254740992\n");
+    expect(() => loadPitakoConfig({ env })).toThrow("integer value cannot be represented losslessly");
+    for (const text of [
+      '[head_developer]\nquota = 1\n',
+      '[developer_routing]\nunknown = "fixture"\n',
+      '[developer_routing]\nclassifier_provider = "provider/model"\n',
+      '[developer_routing]\nclassifier_model = "invalid model"\n',
+      '[developer_routing]\nclassifier_model = ""\n',
+      '[developer_routing]\nclassifier_provider = 3\n',
+    ]) {
+      writeConfig(configPath, text);
+      expect(() => loadPitakoConfig({ env })).toThrow(PitakoConfigError);
+      expect(() => loadPitakoConfig({ env })).toThrow(configPath);
+    }
+  });
+
   test("Developer capacity policies inherit explicit legacy fields, not a second role contract", () => {
     const { env, configPath } = tempAgent();
     writeConfig(configPath, `

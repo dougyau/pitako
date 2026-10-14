@@ -23,9 +23,9 @@ import { ledgerFile, planFile, planHash, readLedgerTeamHolds } from "../extensio
 
 const fixture = agentFixtureOwnership();
 const evaluations: TeamEvaluation[] = [];
-afterEach(() => {
+afterEach(async () => {
   fixture.requireReleasedFixture();
-  for (const evaluation of evaluations.splice(0)) retireTeamEvaluation(evaluation);
+  for (const evaluation of evaluations.splice(0)) await retireTeamEvaluation(evaluation);
   clearBackgroundOwner();
 });
 
@@ -324,7 +324,7 @@ test("Team reads preserve occupancy and assignments; automatic bookkeeping is in
   expect(listObservations(evaluation.token)).toEqual(consumedObservation);
   expect(teamAssignments(evaluation)).toEqual(slots);
   expect(env.wakes).toEqual(wakesBefore);
-  retireTeamEvaluation(evaluation);
+  await retireTeamEvaluation(evaluation);
   expect(readWorkerResult(target, scope)).toEqual({ state: "stale_owner" });
 }));
 

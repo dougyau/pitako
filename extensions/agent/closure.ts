@@ -1,0 +1,12 @@
+/** A terminal outcome cannot release ownership when physical closure is uncertain. */
+export class AgentClosureError extends AggregateError {
+  constructor(errors: unknown[], context: string) {
+    super(errors, `${context}: closure unknown (${errors.map(String).join("; ")})`);
+    this.name = "AgentClosureError";
+  }
+}
+
+export type AgentClosure =
+  | { state: "pending" }
+  | { state: "released" }
+  | { state: "unknown"; reason: string };

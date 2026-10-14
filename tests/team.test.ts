@@ -31,9 +31,9 @@ const fixture = agentFixtureOwnership();
 const tempDirs = fixture.directories;
 let previousAgentDir: string | undefined;
 
-afterEach(() => {
+afterEach(async () => {
   fixture.requireReleasedFixture();
-  for (const evaluation of evaluations) retireTeamEvaluation(evaluation);
+  for (const evaluation of evaluations) await retireTeamEvaluation(evaluation);
   evaluations.clear();
   clearBackgroundOwner();
   setBackgroundExecutor(undefined);
@@ -255,15 +255,19 @@ describe("Team T1 ownership", () => {
     admission.commit();
     await late.started;
 
+    const retirement = retireTeamEvaluation(old);
+    expect(late.signal?.aborted).toBe(true);
+    expect(teamWorkerStatus(old.token)).toMatchObject([{ closure: { state: "pending" } }]);
+    expect(teamRoleReservation(old, "developer")).toBe("old-assignment");
+    expect(() => evaluation("team-session-reload")).toThrow("await retirement");
+    late.finish(completed("late"));
+    await retirement;
     const fresh = evaluation("team-session-reload");
     bindBackgroundOwner(owner(fresh.token));
-    expect(late.signal?.aborted).toBe(true);
     expect(teamWorkerStatus(old.token)).toEqual([]);
     expect(hasTeamRoster(fresh)).toBe(false);
     expect(() => teamWorkerStatus(fresh.token, oldWorker.instanceId)).toThrow("unknown Team worker");
 
-    late.finish(completed("late"));
-    await new Promise((resolve) => setTimeout(resolve, 20));
     expect(teamRoleReservation(fresh, "developer")).toBeUndefined();
     expect(listObservations()).toEqual([]);
   }));
@@ -285,13 +289,12 @@ describe("Team T1 ownership", () => {
     expect(teamWorkerStatus(second.token)).toEqual([expect.objectContaining({ instanceId: otherHandle.instanceId })]);
     expect(teamWorkerStatus(first.token, handle.instanceId)).toHaveLength(1);
     expect(workerStatus()).toEqual([]);
-    shutdownBackground(first.token);
-    retireTeamEvaluation(first);
+    const retirement = Promise.all([shutdownBackground(first.token), retireTeamEvaluation(first)]);
     expect(worker.signal?.aborted).toBe(true);
     expect(otherWorker.signal?.aborted).toBe(false);
     expect(teamWorkerStatus(second.token, otherHandle.instanceId)).toHaveLength(1);
     worker.finish(completed());
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await retirement;
     expect(teamWorkerStatus(first.token)).toEqual([]);
   }));
 

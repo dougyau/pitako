@@ -105,9 +105,10 @@ optional starting targets, not installed settings or quality claims.
 Use `/pitako policies`, `/pitako policy developer_mid` (or senior/junior), and
 `/pitako role developer` to inspect the resolved target and configuration sources.
 
-Ordinary `agent_run` Developer dispatch uses the public host classifier APIs to
-ask available `opencode/jev-1.13-free` one fixed capacity question about the exact
-submitted WorkBrief. Submit non-secret context. Missing, indeterminate, failed or
+Ordinary Developer dispatch uses the public host classifier APIs to
+ask the configured `developer_routing.classifier_provider` and
+`developer_routing.classifier_model` one fixed capacity question about the exact
+submitted WorkBrief. No classifier identity is mandatory. Submit non-secret context. Missing, indeterminate, failed or
 malformed advice selects mid; cancellation never selects a replacement. Native
 recording unavailable skips classification explicitly. The runner consumes an
 immutable configuration/policy snapshot and never reclassifies; direct runner
@@ -153,6 +154,47 @@ The captured foreground session ID, revision, owner token, and Team token fence 
 ## Team assignments
 
 `team_assign` starts background AgentInstances from the foreground session. A complete WorkBrief can run autonomously even when a coordinator decision depends on its result. One assignment per role can run at a time; physical settlement releases occupancy independently of handoff. An exact assignment-ID catalog retains every accepted assignment for its lease, with a separate latest-role index for default status. `team_status`, `team_result`, and `team_cancel` use assignment IDs, not worker instance IDs. Automatic collection and optional diagnostic re-reads share idempotent bookkeeping under the captured assignment, topic applicability, and execution binding. Successful results reconcile only their own result hold; failed/cancelled outcomes retain applicable blocking holds. Ledger failures never hide the result. All settled outcomes use automatic full delivery, even ad hoc assignments. Child sessions cannot dispatch Team work. Ad-hoc Team state is not a durable scheduler or a Board scope.
+
+### Assignment-local Head Developer
+
+Only asynchronous `agent_spawn` and `team_assign` accept Developer `mode: "head"`.
+Omission stays ordinary single mode. Head requires an explicit relative `writes`
+envelope, including `[]` for read-only work or `["."]` for the captured root.
+Invalid modes, other-role Head requests, single-mode writes and escaping paths
+reject before reservation, advice or capability creation. The internal
+`developer_head` descriptor is not a public role, profile or Team role; explicit
+requests for that name reject on synchronous and asynchronous entrypoints.
+Its primary policy must be configured explicitly, without legacy Developer or
+foreground fallback.
+
+The host creates an attachment beneath the exterior Developer reservation before
+startup awaits. It grants only session-local `head_*` tools. Native child/global
+guards remain intact. The in-memory DAG admits bounded leaf briefs, explicit
+capacity choices, finite slots and nonconflicting write reservations. Leaves get
+their own effective context, not the Head transcript, siblings or whole DAG.
+Scope proposals require exact native leaf acknowledgment and Head confirmation;
+original donor writes remain held until physical disposal. This coordinates
+managed writers; it is not a filesystem sandbox or durable DAG replay authority.
+
+The Head is not a concurrent product writer. An epoch-bound exclusive barrier
+requires satisfied retained nodes and physical closure of every owned operation.
+Integration coding is allowed only after that barrier. Successful `head_finish`
+binds the integrated summary and limits to successful native tool results in this
+Head's current branch after this barrier. References prove provenance, not check
+quality. Reopen invalidates the epoch and evidence. Failure joins owned children
+and retains diagnostics; unknown closure prevents normal release. Cancellation
+and coordinator retirement affect only the owning subtree.
+
+Native closed-result envelopes have stable IDs; offers and tool returns are not
+receipts. Active-branch entries establish incorporation, and uncertain offers
+replay the same ID with a delivery gap. `head_wait` is event-driven and retains
+the active-tool watchdog window. Ordinary final text is not successful completion;
+corrective continuation is bounded, and abort/error or `canContinue: false`
+cannot request another turn. The outer handoff contains identities, integrated
+finish, leaf closure summaries and observed metrics, not leaf transcripts.
+Own usage remains separate from aggregate Head, leaf-attempt and supplied
+classifier usage. Missing usage/cost stays unknown. These data make no claim of
+token savings, elapsed-time savings or model competence.
 
 ## Direct navigation tools
 

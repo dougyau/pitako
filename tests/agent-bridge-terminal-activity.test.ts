@@ -17,6 +17,7 @@ import { providerFixtureOwnership } from "./fixtures/provider-fixture-ownership.
 afterEach(() => clearObservations());
 const adapterOwnership = providerFixtureOwnership();
 afterEach(adapterOwnership.requireReleasedFixture);
+const retainedAdapterFixtures: unknown[] = [];
 const ownerToken = Symbol("terminal-owner");
 function key(instanceId = "worker", overrides: Partial<TerminalActivityKey> = {}): TerminalActivityKey {
   return { ownerToken, coordinatorSessionId: "coordinator", instanceId, generation: 1, attemptId: `${instanceId}:1`,
@@ -414,6 +415,7 @@ for (const mode of ["success", "close_failed", "capture_failed", "callback_throw
     adapterOwnership.ownedCase(`terminal adapter ${mode}`, async () => {
       const { InvocationHistory } = await import("../extensions/agent/history.ts");
       const { createPiExecutor } = await import("../extensions/agent/pi.ts");
+      const { AgentClosureError } = await import("../extensions/agent/closure.ts");
       const { executionForSession } = await import("../extensions/execution-identity.ts");
       const root = mkdtempSync(path.join(tmpdir(), "pitako-terminal-adapter-"));
       adapterOwnership.directories.push(root);
@@ -426,6 +428,7 @@ for (const mode of ["success", "close_failed", "capture_failed", "callback_throw
       const disposeGate = deferred<void>(), disposeStarted = deferred<void>();
       const timeline: string[] = [];
       const closeError = new Error("terminal fixture native close rejected");
+      const closeFails = mode === "close_failed" || mode === "failure_callback_throws";
       let native: ReturnType<typeof controlledPi>["sessions"][number] | undefined;
       let nativeDisposed = false;
       let currentKey: TerminalActivityKey | undefined;
@@ -438,12 +441,20 @@ for (const mode of ["success", "close_failed", "capture_failed", "callback_throw
           await disposeGate.promise; nativeDisposed = true; timeline.push("native-disposed");
         },
       });
-      let attemptForCleanup: Promise<unknown> | undefined;
+      let attemptForCleanup: Promise<{ error?: unknown }> | undefined;
       // Register before history/start: setup failure owns roots, globals and the spy too.
       adapterOwnership.beforeRelease(async () => {
         closeGate.resolve(); disposeGate.resolve();
-        await attemptForCleanup;
+        const outcome = await attemptForCleanup;
         if (native && !nativeDisposed) throw new Error(`Native terminal adapter release uncertain; retain ${root} and ${agentDir}`);
+        if (outcome?.error instanceof AgentClosureError) {
+          // Owned callbacks settled, but rejected close is not physical release.
+          retainedAdapterFixtures.push({ root, agentDir, native, attempt: attemptForCleanup });
+          for (const dir of [root, agentDir]) {
+            adapterOwnership.directories.splice(adapterOwnership.directories.indexOf(dir), 1);
+          }
+          console.error(`TERMINAL ADAPTER RETAINED: ${JSON.stringify({ mode, root, agentDir, reason: String(outcome.error) })}`);
+        }
         restoreLeaf?.();
         if (offline === undefined) delete process.env.PI_OFFLINE; else process.env.PI_OFFLINE = offline;
         if (telemetry === undefined) delete process.env.PI_TELEMETRY; else process.env.PI_TELEMETRY = telemetry;
@@ -467,7 +478,7 @@ for (const mode of ["success", "close_failed", "capture_failed", "callback_throw
             closeStarted.resolve();
             await closeGate.promise;
             await close();
-            if (mode === "close_failed" || mode === "failure_callback_throws") throw closeError;
+            if (closeFails) throw closeError;
             if (mode === "capture_failed") {
               const manager = native!.sessionManager, getLeafId = manager.getLeafId.bind(manager);
               restoreLeaf = () => { manager.getLeafId = getLeafId; };
@@ -510,7 +521,7 @@ for (const mode of ["success", "close_failed", "capture_failed", "callback_throw
         expect(ready(k)).toMatchObject({ active: false, activity: [], cursor: 0, more: false });
         expect(timeline).toEqual(["close", "capture", "unbind", "shutdown", "native-dispose"]);
       } else {
-        const reason = mode === "close_failed" || mode === "failure_callback_throws" ? "close_failed" : "capture_failed";
+        const reason = closeFails ? "close_failed" : "capture_failed";
         expect(callbacks).toBe(mode === "callback_throws" ? 1 : 0); expect(failures).toBe(1);
         expect(readTerminalActivity(k)).toEqual({ state: "unavailable", reason });
         expect(timeline.indexOf(`failure:${reason}`)).toBeLessThan(timeline.indexOf("unbind"));
@@ -519,13 +530,22 @@ for (const mode of ["success", "close_failed", "capture_failed", "callback_throw
       disposeGate.resolve();
       const outcome = await tracked;
       expect(timeline.at(-1)).toBe("native-disposed");
-      expect(executionForSession(k.sessionId)).toBeUndefined();
-      if (mode === "close_failed" || mode === "failure_callback_throws") expect(outcome.error).toBe(closeError);
-      else expect(outcome.result).toMatchObject({ status: "failed", error: "model unavailable: __terminal_unregistered_fixture__/absent" });
+      if (closeFails) {
+        expect(executionForSession(k.sessionId)).toEqual({ instanceId: "adapter", roleId: "developer", sessionId: k.sessionId });
+        expect(outcome.result).toBeUndefined();
+        expect(outcome.error).toBeInstanceOf(AgentClosureError);
+        if (!(outcome.error instanceof AgentClosureError)) throw new Error("adapter closure failure not classified");
+        expect(outcome.error.errors).toEqual([closeError]);
+      } else {
+        expect(executionForSession(k.sessionId)).toBeUndefined();
+        expect(outcome.error).toBeUndefined();
+        expect(outcome.result).toMatchObject({ status: "failed", error: "model unavailable: __terminal_unregistered_fixture__/absent" });
+      }
       const member = invocation.store.read(invocation.group.groupId).members[0]!;
       if (member.native.state !== "allocated") throw new Error("native adapter history not allocated");
-      expect(member.native.disposition.state).toBe(
-        mode === "close_failed" || mode === "failure_callback_throws" ? "unknown" : "disposed");
+      if (closeFails) expect(member.native.disposition).toMatchObject({ state: "unknown", reason: expect.stringContaining(closeError.message) });
+      else expect(member.native.disposition.state).toBe("disposed");
       invocation.settled();
+      expect(invocation.store.read(invocation.group.groupId).closure.state).toBe(closeFails ? "unclosed" : "closed");
     }));
 }

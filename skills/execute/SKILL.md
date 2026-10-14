@@ -77,7 +77,15 @@ If Team rejects a reserved role, distinguish occupancy from an unknown handle. E
 
 Handles are session-local. On resume, look only at `## Workers`. Do not treat frontmatter `status: running` or the `## Status` body as a worker. Check each recorded handle once by type: for a Team assignment, call `team_status` with its assignment ID; for a low-level worker, call `agent_status` with its instance ID. If it is running, end the turn. If the handle is unknown, record a blocker. Do not poll.
 
-Keep at most one Developer role active, without exception. Compare new user information with the consulted object and original WorkBrief before using a result. For information within the brief, use the bounded in-scope input route below. Input does not expand the frozen authority or permitted effects.
+Keep at most one exterior Developer role active, without exception. That one
+asynchronous assignment may explicitly use `mode: "head"` with `writes` listing
+relative files/subtrees, `[]` for read-only work, or `["."]` for the captured root.
+Its host-granted local leaves do not authorize extra exterior Developers, reordered
+units, changes to the frozen plan or ledger, cleared holds, or waived final gates.
+The Head returns an integrated handoff or diagnostic failure, not leaf transcripts.
+The coordinator still owns acceptance and independent review.
+
+Compare new user information with the consulted object and original WorkBrief before using a result. For information within the brief, use the bounded in-scope input route below. Input does not expand the frozen authority or permitted effects.
 
 If information changes the object outside the WorkBrief, mark the old consultation or review inapplicable to the pending decision. Interpret its automatic result when supplied, but do not use it to close that decision or apply the change after accepting the old judgment. Cancel the exact still-active target with `team_cancel` or `agent_cancel` according to handle type. End the turn while settlement and role release are pending. Only after settlement and role release, assign a fresh WorkBrief against the current object if still necessary and authorized. Preserve evidence validity, frozen authority, and Team Hold recovery; a new assignment does not clear a blocking hold.
 
