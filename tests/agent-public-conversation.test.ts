@@ -150,7 +150,7 @@ for (const method of ["agent_spawn", "team_assign"] as const) {
     fixture.beforeRelease(async () => {
       for (const client of clients) await client.disconnect();
       await view.close(); bridge.revoke(); controller.revoke(); await bridge.settle(); await controller.settle();
-      if (evaluation) retireTeamEvaluation(evaluation);
+      if (evaluation) await retireTeamEvaluation(evaluation);
     });
     await bridge.ready;
     const descriptor = path.join(root, "b/descriptor.json");
@@ -321,7 +321,7 @@ for (const method of ["agent_spawn", "team_assign"] as const) {
 
     // Rotate only after both owned runs have physically settled. The old broker
     // remains reachable to observe rejection; the new one has a private root.
-    if (evaluation) retireTeamEvaluation(evaluation);
+    if (evaluation) await retireTeamEvaluation(evaluation);
     currentOwner = { sessionId: "replacement-owner", token: Symbol() };
     const replacementDelivery: ResultMessage[] = [];
     bindBackgroundOwner({ ...currentOwner, hasUI: false, isIdle: () => true, notify() {}, sendMessage() {},
@@ -335,7 +335,7 @@ for (const method of ["agent_spawn", "team_assign"] as const) {
     fixture.beforeRelease(async () => {
       replacementBridge.revoke(); replacementController.revoke();
       await replacementBridge.settle(); await replacementController.settle();
-      if (replacementEvaluation) retireTeamEvaluation(replacementEvaluation);
+      if (replacementEvaluation) await retireTeamEvaluation(replacementEvaluation);
     });
     await replacementBridge.ready;
     const replacementClient = await connect(path.join(root, "b2/descriptor.json"), { expectedSessionId: currentOwner.sessionId });

@@ -51,7 +51,7 @@ function setup(ownership: Pick<typeof fixture, "directories" | "beforeRelease"> 
   let client: Awaited<ReturnType<typeof connect>> | undefined;
   ownership.beforeRelease(async () => {
     await client?.disconnect(); await view.close(); bridge.revoke(); controller.revoke();
-    await bridge.settle(); await controller.settle(); retireTeamEvaluation(evaluation);
+    await bridge.settle(); await controller.settle(); await retireTeamEvaluation(evaluation);
   });
   return { root, owner, evaluation, settled, view, tools, retireOwner() { currentOwner = undefined; },
     ctx: { cwd: root, sessionManager: { getSessionId: () => owner.sessionId, getSessionFile: () => path.join(root, "coordinator.jsonl") },

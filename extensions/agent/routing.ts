@@ -18,6 +18,11 @@ export const ROUTING_QUESTION = {
 } as const;
 const RECORD_LIMIT = 262144;
 
+export type DeveloperCapacity =
+  | { route: "direct"; profile: DeveloperProfile }
+  | { route: "default" }
+  | { route: "classify" };
+
 export interface RoutingRecord {
   version: 1;
   rubricVersion: 1;
@@ -33,6 +38,8 @@ export interface RoutingRecord {
   profile: DeveloperProfile;
   reason: string;
   resolvedPolicy: ResolvedRole["modelPolicy"];
+  route?: DeveloperCapacity["route"];
+  classifier?: PitakoConfig["developerRouting"];
 }
 
 export interface DispatchSnapshot {
@@ -67,14 +74,30 @@ export function classifyProfile(result: ClassifierResult): { profile: DeveloperP
   return { profile: answer.choice as DeveloperProfile, reason: "unique classifier choice" };
 }
 
-/** Host preflight only. The runner never discovers or classifies. */
-export async function developerPreflight(input: {
+interface PreflightInput {
   task: string; toolCallId: string; source: string; ctx: ExtensionContext;
   pi: Pick<ExtensionAPI, "appendEntry">; signal?: AbortSignal;
   owns: () => boolean; load?: LoadOptions;
+  /** Assignment-captured configuration; never reread it for a leaf dispatch. */
+  config?: PitakoConfig;
+}
+
+/** Ordinary Developer routing retains optional advice and its evidence fallback. */
+export function developerPreflight(input: PreflightInput): Promise<DispatchSnapshot> {
+  return developerCapacityPreflight({ ...input, capacity: { route: "classify" } });
+}
+
+/** Common host preflight. The runner never discovers, classifies, or reloads a snapshot. */
+export async function developerCapacityPreflight(input: PreflightInput & {
+  capacity: DeveloperCapacity;
 }): Promise<DispatchSnapshot> {
   if (!input.task.trim()) throw new PitakoConfigError("agent_run task must not be empty");
-  const config = immutable(loadPitakoConfig(input.load));
+  const capacity = immutable(structuredClone(input.capacity));
+  if (!["direct", "default", "classify"].includes(capacity.route) ||
+    (capacity.route === "direct" && !(DEVELOPER_PROFILES as readonly string[]).includes(capacity.profile))) {
+    throw new PitakoConfigError("invalid Developer capacity selection");
+  }
+  const config = immutable(structuredClone(input.config ?? loadPitakoConfig(input.load)));
   const sessionId = input.ctx.sessionManager?.getSessionId?.();
   const sessionFile = input.ctx.sessionManager?.getSessionFile?.();
   const check = () => {
@@ -82,27 +105,31 @@ export async function developerPreflight(input: {
       input.ctx.sessionManager?.getSessionFile?.() !== sessionFile) throw new Error("Developer dispatch cancelled before admission");
   };
   check();
-  let profile: DeveloperProfile = "developer_mid";
-  let reason = "classifier unavailable";
+  let profile: DeveloperProfile = capacity.route === "direct" ? capacity.profile : "developer_mid";
+  let reason = capacity.route === "classify" ? "classifier unavailable" : `${capacity.route} profile selection`;
   let request: ClassifierContext | undefined;
   let response: ClassifierResult | undefined;
   let evidence: DispatchSnapshot["evidence"] = "unavailable";
   let evidenceGap: string | undefined;
   const identity = { version: 1 as const, rubricVersion: 1 as const, dispatchId: randomUUID(), adviceId: randomUUID(),
     toolCallId: input.toolCallId, source: input.source, coordinatorSessionId: sessionId,
-    coordinatorSessionFile: sessionFile, taskReference: { toolCallId: input.toolCallId, field: "task" as const } };
+    coordinatorSessionFile: sessionFile, taskReference: { toolCallId: input.toolCallId, field: "task" as const },
+    route: capacity.route, classifier: config.developerRouting };
   const context: ClassifierContext = { state: { workbrief: input.task }, questions: { capacity: ROUTING_QUESTION } };
   // Leave room for the full public result and policy. Never silently clip the submitted task.
   if (!sessionFile || typeof input.pi.appendEntry !== "function") {
-    reason = "native recording unavailable; classification skipped";
-    evidenceGap = reason;
+    evidenceGap = "native recording unavailable";
+    if (capacity.route === "classify") reason = `${evidenceGap}; classification skipped`;
+  } else if (capacity.route !== "classify") {
+    // Direct/default selection requires neither registry discovery nor advice.
   } else if (JSON.stringify(context).length > RECORD_LIMIT / 2) {
     reason = "submitted WorkBrief exceeds supported native record budget; classification skipped";
   } else {
     try {
-      const available = await input.ctx.modelRegistry.getAvailableOfType("classifier", "opencode", { signal: input.signal });
+      const { classifierProvider, classifierModel } = config.developerRouting;
+      const available = await input.ctx.modelRegistry.getAvailableOfType("classifier", classifierProvider, { signal: input.signal });
       check();
-      const model = available.find(model => model.id === "jev-1.13-free" && model.provider === "opencode");
+      const model = available.find(model => model.id === classifierModel && model.provider === classifierProvider);
       // No tokenizer is exposed by the host classifier API. Use the advertised
       // context window as a conservative UTF-8 request budget, never truncate.
       if (model && Buffer.byteLength(JSON.stringify(context), "utf8") > model.contextWindow) {
@@ -138,10 +165,12 @@ export async function developerPreflight(input: {
       } catch { evidence = "pending-native-persistence"; }
       if (evidence !== "physical") evidenceGap = "Native append has no physical persistence receipt yet; coordinator/worker before-first-assistant gaps remain possible.";
     } catch (error) {
-      profile = "developer_mid";
-      reason = `native recording failed after advice: ${String(error)}`;
+      if (capacity.route === "classify") {
+        profile = "developer_mid";
+        reason = `native recording failed after advice: ${String(error)}`;
+      }
       evidence = "unavailable";
-      evidenceGap = reason;
+      evidenceGap = `native recording failed: ${String(error)}`;
       role = resolveRoleFromConfig(config, "developer", profile);
       // Do not propagate a failed write's probabilities as retained evidence or attempt another write.
       routing = { ...identity, profile, reason, resolvedPolicy: role.modelPolicy };

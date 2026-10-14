@@ -31,6 +31,7 @@ export function controlledPi(root: string, options: {
   bind?: (session: Session) => Promise<void> | void;
   prompt?: (session: Session, text: string) => Promise<void> | void;
   dispose?: (session: Session) => Promise<void> | void;
+  abort?: (session: Session) => Promise<void> | void;
 } = {}) {
   const models = options.models ?? [controlledModel()];
   const sessions: Session[] = [];
@@ -74,7 +75,7 @@ export function controlledPi(root: string, options: {
           if (options.prompt) await options.prompt(session, text);
           else session.messages.push({ role: "assistant", content: [{ type: "text", text: "controlled result" }], stopReason: "stop" });
         },
-        async abort() { session.events.push("abort"); },
+        async abort() { session.events.push("abort"); await options.abort?.(session); },
         async dispose() { session.events.push("dispose"); await options.dispose?.(session); },
         extensionRunner: { async emit(event) { session.events.push(event.type); } },
       };

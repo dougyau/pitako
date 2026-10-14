@@ -20,6 +20,7 @@ import {
 import { listObservations, noteResultTaken, observationEpoch, publishObservation } from "./observe.ts";
 import { currentInstanceId } from "./scope.ts";
 import { createPiExecutor } from "./pi.ts";
+import { createHead, validateAgentMode } from "./head/admission.ts";
 import { formatAgentResult, formatTeamExecutionSummary, runAgentInstance, teamExecutionSummary } from "./run.ts";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -155,6 +156,7 @@ export default function agentInstance(pi: ExtensionAPI): void {
         return errorResult("agent_run cannot be called from an AgentInstance");
       }
       try {
+        validateAgentMode(params, ctx.cwd, false);
         let live = "";
         const epoch = observationEpoch();
         let dispatch;
@@ -242,12 +244,16 @@ function registerTeamTools(pi: ExtensionAPI): void {
       plan: Type.Optional(Type.String()),
       unit: Type.Optional(Type.String()),
       boardTopicId: Type.Optional(Type.String({ description: "Existing Board topic ID; no topic is created" })),
+      mode: Type.Optional(Type.Union([Type.Literal("single"), Type.Literal("head")])),
+      writes: Type.Optional(Type.Array(Type.String(), { maxItems: 128 })),
     }, noExtra),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
+        const headOptions = validateAgentMode(params, ctx.cwd);
         const evaluation = evaluationFor(ctx);
         const id = randomUUID();
         const admission = reserveTeamRole(evaluation, params.role, id);
+        const head = createHead(id, ctx.cwd, headOptions, backgroundExecutor());
         let accepted = false;
         let durableWatch: { planId: string; unitId: string; execution?: ExecutionBinding } | undefined;
         return await ownedDispatch(ctx, signal, admission.owns, async (signal, check) => {
@@ -263,7 +269,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
           }
           const topic = await teamBoardTopic(params.boardTopicId, watch?.planId, ctx.cwd, plan?.meta, check);
           check();
-          const dispatch = params.role === "developer" ? await developerPreflight({
+          const dispatch = params.role === "developer" && !head ? await developerPreflight({
             task: params.task, toolCallId: _toolCallId, source: "team_assign", ctx, pi, signal,
             owns: () => { check(); return true; },
           }) : undefined;
@@ -300,6 +306,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
             executor: backgroundExecutor(),
             historyOrigin: origin,
             dispatch,
+            head,
             teamOwner: {
               token: admission.token,
               assignmentId: id,
@@ -320,6 +327,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
           return textResult(`assignment_id: ${id}\nrole: ${params.role}\ninstance_id: ${handle.instanceId}\nstatus: running`, assignment);
         } catch (error) {
           if (!accepted) {
+            await head?.close();
             if (durableWatch) {
               try { recordPlanTeamWork(ctx.cwd, durableWatch.planId, durableWatch.unitId, id, undefined, durableWatch.execution); } catch { /* original assignment failure takes precedence */ }
             }
@@ -549,6 +557,8 @@ function registerBackgroundTools(pi: ExtensionAPI): void {
         task: Type.String({ description: "Explicit task for the isolated agent" }),
         plan: Type.Optional(Type.String({ description: "Optional execution correlation; all settled results are delivered automatically" })),
         unit: Type.Optional(Type.String({ description: "Unit id paired with plan" })),
+        mode: Type.Optional(Type.Union([Type.Literal("single"), Type.Literal("head")])),
+        writes: Type.Optional(Type.Array(Type.String(), { maxItems: 128 })),
       },
       noExtra,
     ),
@@ -556,11 +566,14 @@ function registerBackgroundTools(pi: ExtensionAPI): void {
       const blocked = childBlocked("agent_spawn");
       if (blocked) return blocked;
       try {
+        const headOptions = validateAgentMode(params, ctx.cwd);
         const watch = interestFrom(params.plan, params.unit);
         const execution = watch ? watchedExecutionBinding(watch.planId, ctx.cwd) : undefined;
         const launchRoot = execution?.executionRoot ?? ctx.cwd;
+        const head = createHead(randomUUID(), launchRoot, headOptions, backgroundExecutor());
         return await ownedDispatch(ctx, signal, () => true, async (signal, check) => {
-        const dispatch = params.role === "developer" ? await developerPreflight({
+        try {
+        const dispatch = params.role === "developer" && !head ? await developerPreflight({
           task: params.task, toolCallId: _toolCallId, source: "agent_spawn", ctx, pi, signal,
           owns: () => { check(); return true; },
         }) : undefined;
@@ -579,8 +592,10 @@ function registerBackgroundTools(pi: ExtensionAPI): void {
           executor: backgroundExecutor(),
           historyOrigin: origin,
           dispatch,
+          head,
         });
         return textResult(formatWorkerHandle(handle), { ...handle, ...(dispatch ? { dispatchId: dispatch.routing.dispatchId } : {}) });
+        } catch (error) { await head?.close(); throw error; }
         });
       } catch (error) {
         const message = error instanceof PitakoConfigError || error instanceof Error ? error.message : String(error);

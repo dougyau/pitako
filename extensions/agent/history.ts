@@ -17,6 +17,8 @@ export interface HistoryOrigin {
   execution?: { executionRoot: string; executionRef: string };
   routing?: import("./routing.ts").DispatchSnapshot["routing"];
   routingEvidence?: { state: import("./routing.ts").DispatchSnapshot["evidence"]; gap?: string };
+  head?: { assignmentId: string; headInstanceId?: string; nodeId?: string; runId?: string;
+    admittedRevision?: number; effectiveRevision?: number };
 }
 
 export type HistoryClosure =
@@ -52,6 +54,7 @@ export interface HistoryMember {
   roundId?: string;
   recoveryOf?: string;
   retryOf?: string;
+  head?: HistoryOrigin["head"];
   admittedAt: string;
   native:
     | { state: "not-created" }
@@ -85,7 +88,7 @@ export interface HistoryGroup {
 
 export type HistoryAdmission = Pick<HistoryMember,
   "roleId" | "coordinatorSessionId" | "toolCallId" | "coordinatorSessionFile" | "assignmentId" |
-  "instanceId" | "attemptId" | "memberId" | "continuationOf" | "diagnosisId" | "diagnosisOf" | "unitId" | "roundId" | "recoveryOf" | "retryOf">;
+  "instanceId" | "attemptId" | "memberId" | "continuationOf" | "diagnosisId" | "diagnosisOf" | "unitId" | "roundId" | "recoveryOf" | "retryOf" | "head">;
 
 export type NativeHistoryStatus =
   | { state: "not-created" }
@@ -300,6 +303,15 @@ export class WorkerHistory {
       // Missing native provenance before the first assistant is not missing admission coverage.
     });
   }
+
+  recordHeadRevision(groupId: string, historyId: string, effectiveRevision: number): void {
+    this.mutate(groupId, group => {
+      const member = this.member(group, historyId);
+      if (!member.head || member.terminal || !Number.isSafeInteger(effectiveRevision) ||
+          effectiveRevision < (member.head.effectiveRevision ?? 0)) throw new Error("invalid live Head history revision");
+      member.head.effectiveRevision = effectiveRevision;
+    });
+  }
 }
 
 /** One invocation owns every replacement session; execution-bound invocations share a group. */
@@ -327,6 +339,7 @@ export class InvocationHistory {
       instanceId, roleId, coordinatorSessionId: this.origin?.coordinatorSessionId,
       toolCallId: this.origin?.toolCallId,
       coordinatorSessionFile: this.origin?.coordinatorSessionFile, assignmentId: this.origin?.assignmentId,
+      head: this.origin?.head,
     };
     const current = this.store.read(this.group.groupId);
     if (current.closure.state !== "unclosed" || current.cleanup || current.prunedAt) throw new Error("worker history group is not open");
@@ -365,6 +378,11 @@ export class SessionHistory {
 
   append(event: string, data: unknown): void {
     this.manager?.appendCustomEntry("pitako.worker-history", { version: 1, event, data });
+  }
+
+  headRevision(effectiveRevision: number): void {
+    this.invocation.store.recordHeadRevision(this.invocation.group.groupId, this.historyId, effectiveRevision);
+    this.append("head-scope-confirmed", { effectiveRevision });
   }
 
   create(): SessionManager {

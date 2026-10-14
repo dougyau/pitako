@@ -6,6 +6,15 @@
 [worker_history]
 ttl_days = 180
 
+[developer_routing]
+classifier_provider = "opencode"
+classifier_model = "jev-1.13-free"
+
+[head_developer]
+max_parallel = 3
+
+# Internal Head policy is independent of legacy Developer and worker profiles.
+[model_policies.developer_head]
 [model_policies.developer_senior]
 [model_policies.developer_mid]
 [model_policies.developer_junior]

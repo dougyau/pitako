@@ -1,13 +1,15 @@
 import { randomBytes } from "node:crypto";
 import { currentWorkspace } from "../board/workspace.ts";
 import { PitakoConfigError } from "../errors.ts";
-import { loadPitakoConfig, resolveRoleFromConfig, type LoadOptions } from "../roles/load.ts";
+import { loadPitakoConfig, resolveDeveloperHeadFromConfig, resolveRoleFromConfig, type LoadOptions } from "../roles/load.ts";
 import type { FallbackReason, ModelTarget, ResolvedRole } from "../roles/types.ts";
 import { classifyProviderFailure, isServiceTierRejection } from "./fallback.ts";
 import { formatAgentLive } from "./present.ts";
 import { agentScope } from "./scope.ts";
 import type { AgentUiSnapshot } from "./ui.ts";
 import { InvocationHistory, type HistoryOrigin } from "./history.ts";
+import { AgentClosureError } from "./closure.ts";
+import type { HeadAttachment, LeafScopeAttachment } from "./head/runtime.ts";
 import {
   activityKind,
   createActivity,
@@ -100,6 +102,7 @@ export interface AgentRunResult {
   requests?: AgentRequestObservation[];
   usage?: AgentUsage;
   watchdog?: WatchdogSnapshot;
+  head?: import("./head/runtime.ts").HeadHandoff;
 }
 
 export interface TeamExecutionSummary {
@@ -147,6 +150,10 @@ export interface AttemptExecutor {
     target: ModelTarget;
     cwd: string;
     signal: AbortSignal;
+    /** Host-granted assignment authority, never a public tool parameter. */
+    head?: HeadAttachment;
+    /** Host-only acknowledgment for one Head-owned leaf; never grants orchestration. */
+    scope?: LeafScopeAttachment;
     history?: InvocationHistory;
     onActivity?: (event: ActivityEvent) => void;
     /** Fired only after setModel / session open succeeds. Not a second lifecycle. */
@@ -171,6 +178,7 @@ async function runAttempt(
     target: ModelTarget;
     cwd: string;
     signal: AbortSignal;
+    head?: HeadAttachment;
     history?: InvocationHistory;
     onActivity?: (event: ActivityEvent) => void;
     onActivated?: (appliedReasoning: string) => void;
@@ -194,6 +202,7 @@ async function runAttempt(
     await session?.dispose();
     return await executor.start(input);
   } catch (error) {
+    if (error instanceof AgentClosureError) throw error;
     if (input.signal.aborted) {
       return { status: "cancelled", result: "cancelled", sideEffects, session };
     }
@@ -217,7 +226,9 @@ export function childInstructions(role: ResolvedRole, instanceId: string): strin
   return [
     `You are Pitako AgentInstance ${instanceId}, role ${role.id}.`,
     "Your conversation is private. Do not assume you saw the parent session.",
-    "Do not spawn other agents. agent_run, agent_supervise, agent_spawn, agent_status, agent_result, agent_observe, agent_input, agent_cancel, team_assign, team_status, team_result, and team_cancel are not available.",
+    ...(role.id === "developer_head"
+      ? ["Use only your host-granted head_* tools to coordinate local Developer leaves. Public agent_* and team_* orchestration remains unavailable."]
+      : ["Do not spawn other agents. agent_run, agent_supervise, agent_spawn, agent_status, agent_result, agent_observe, agent_input, agent_cancel, team_assign, team_status, team_result, and team_cancel are not available."]),
     "Publish shared findings on the Board. Board contents are not injected here.",
     "Your rpiv-todo list is private to this session.",
     "The model and reasoning for this run come from this role's ModelPolicy, not from the parent session.",
@@ -241,6 +252,7 @@ export async function runAgentInstance(input: {
   executionRoot?: string;
   historyOrigin?: HistoryOrigin;
   dispatch?: import("./routing.ts").DispatchSnapshot;
+  head?: HeadAttachment;
   /** Test clock. Production uses Date.now. */
   now?: () => number;
   /** Test scheduler. Production uses setInterval and unref. */
@@ -259,16 +271,19 @@ export async function runAgentInstance(input: {
   if (input.executionRoot !== undefined && workspace !== input.executionRoot) {
     throw new PitakoConfigError(`AgentInstance workspace drift: expected ${input.executionRoot}, got ${workspace}`);
   }
-  const loaded = input.dispatch?.config ?? loadPitakoConfig(input.load);
-  const role = input.dispatch?.role ?? resolveRoleFromConfig(loaded, input.roleId);
-  if (role.id !== input.roleId) throw new PitakoConfigError("dispatch snapshot role does not match runner role");
+  const loaded = input.head?.dag?.configSnapshot ?? input.dispatch?.config ?? loadPitakoConfig(input.load);
+  const role = input.head?.dag ? resolveDeveloperHeadFromConfig(input.head.dag.configSnapshot)
+    : input.dispatch?.role ?? resolveRoleFromConfig(loaded, input.roleId);
+  if (role.id !== input.roleId && !(input.head?.dag && input.roleId === "developer")) {
+    throw new PitakoConfigError("dispatch snapshot role does not match runner role");
+  }
   if (!role.modelPolicy.primary) {
     throw new PitakoConfigError(role.modelPolicy.diagnostic ?? `model policy "${role.modelPolicyId}" has no primary target`);
   }
   const targets = [role.modelPolicy.primary, ...role.modelPolicy.fallbacks];
   const instance: AgentInstance = {
     id: createInstanceId(role.id),
-    roleId: role.id,
+    roleId: input.roleId,
     workspace,
     cwd: input.cwd,
     status: "created",
@@ -280,8 +295,19 @@ export async function runAgentInstance(input: {
     },
     createdAt: new Date().toISOString(),
   };
-  const origin = input.historyOrigin ? structuredClone({ ...input.historyOrigin, workbrief: input.historyOrigin.workbrief ?? input.task }) : undefined;
-  input.onAccepted?.(instance);
+  const origin: HistoryOrigin | undefined = input.head?.dag || input.historyOrigin ? structuredClone({
+    ...input.historyOrigin, source: input.historyOrigin?.source ?? "agent_run",
+    workbrief: input.historyOrigin?.workbrief ?? input.task,
+    ...(input.head ? { head: { assignmentId: input.head.assignmentId, headInstanceId: instance.id } } : {}),
+  }) : undefined;
+  if (input.head) {
+    if (input.roleId !== "developer") throw new PitakoConfigError("Head attachment requires a Developer assignment");
+    input.head.claim(instance.id, workspace);
+  }
+  try { input.onAccepted?.(instance); } catch (error) {
+    await input.head?.close();
+    throw error;
+  }
   let history: InvocationHistory | undefined;
   const now = input.now ?? Date.now;
   const acceptedAt = now();
@@ -327,7 +353,8 @@ export async function runAgentInstance(input: {
     observe();
   };
   const child = new AbortController();
-  const stopParent = input.signal ? watchAbort(input.signal, () => child.abort()) : () => {};
+  const cancel = () => { input.head?.revoke(); child.abort(); };
+  const stopParent = input.signal ? watchAbort(input.signal, cancel) : () => {};
   let stall: StallInfo | undefined;
   let activityProbe: (() => { name: string } | undefined) | undefined;
   const bindActivityProbe = (probe: typeof activityProbe) => {
@@ -354,7 +381,7 @@ export async function runAgentInstance(input: {
     if (verdict === "stalled" || verdict === "max_runtime") {
       stall = stallInfo(activity, t, verdict === "max_runtime" ? "max_runtime" : "stalled");
       timer.stop();
-      child.abort();
+      cancel();
     }
   }, undefined, input.schedule);
   const onActivity = (event: ActivityEvent) => {
@@ -414,6 +441,7 @@ export async function runAgentInstance(input: {
           terminalAt = at;
         },
         history,
+        input.head,
       ),
     );
     if (history && !history.admitted) history.admit(instance.id, role.id, targets[0]!).result({
@@ -421,6 +449,15 @@ export async function runAgentInstance(input: {
       error: result.status === "failed" ? result.result : undefined, sideEffects: false,
     });
     history?.settled();
+    if (input.head?.dag) {
+      result.head = input.head.dag.handoff(result);
+      if (result.status === "completed" || (result.status === "cancelled" && !input.signal?.aborted &&
+          input.head.dag.finishStatus === "failed")) {
+        result.status = result.head.finish.status;
+        result.result = result.head.finish.status === "completed" ? result.head.finish.summary : result.head.finish.diagnostic;
+        instance.status = result.status;
+      }
+    }
     return result;
   } catch (error) {
     instance.status = "failed";
@@ -431,6 +468,7 @@ export async function runAgentInstance(input: {
   } finally {
     timer.stop();
     stopParent();
+    await input.head?.close();
   }
 }
 
@@ -456,12 +494,15 @@ async function executeTargets(
   work: WorkCounts,
   markTerminal: (at: number) => void,
   history?: InvocationHistory,
+  head?: HeadAttachment,
 ): Promise<AgentRunResult> {
   instance.status = "running";
   let session: AttemptSession | undefined;
   let sideEffects = false;
   let lastError = "no model target could be used";
   let usage: AgentUsage | undefined;
+  const preserveUnknownUsage = Boolean(head || history?.origin?.head);
+  let missingUsage = false;
   const requests: AgentRequestObservation[] = [];
   const done = (
     status: AgentRunResult["status"],
@@ -502,16 +543,18 @@ async function executeTargets(
         onRequest,
         bindActivityProbe,
         history,
+        head,
       });
       bindActivityProbe(undefined);
-      usage = mergeUsage(usage, attempt.usage);
+      missingUsage ||= preserveUnknownUsage && attempt.usage === undefined;
+      usage = missingUsage ? undefined : mergeUsage(usage, attempt.usage, preserveUnknownUsage);
       if (attempt.requests) requests.push(...attempt.requests);
       session = attempt.session ?? session;
       const stall = stalled();
       if (stall && !parentSignal?.aborted) {
         return done("failed", formatStall(stall), target, index);
       }
-      sideEffects = sideEffects || attempt.sideEffects;
+      sideEffects = sideEffects || attempt.sideEffects || head?.sideEffects === true;
       view.usage = usage;
       if (attempt.appliedReasoning !== undefined) instance.model.appliedReasoning = attempt.appliedReasoning;
       present();
@@ -539,7 +582,13 @@ async function executeTargets(
     }
     return done("failed", lastError, targets[targets.length - 1], targets.length - 1);
   } finally {
-    await session?.dispose();
+    const closures = await Promise.allSettled([head?.close(), session?.dispose()]);
+    const failures = closures.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+    if (failures.length) {
+      const error = new AgentClosureError(failures, `AgentInstance ${instance.id}`);
+      head?.retainUnknown(error);
+      throw error;
+    }
   }
 }
 
@@ -811,7 +860,7 @@ export function formatTeamExecutionSummary(summary: TeamExecutionSummary): strin
 }
 
 /** Counters are subtracted. contextTokens is a gauge and keeps the later value. */
-export function usageDelta(before: AgentUsage | undefined, after: AgentUsage | undefined): AgentUsage | undefined {
+export function usageDelta(before: AgentUsage | undefined, after: AgentUsage | undefined, preserveUnknown = false): AgentUsage | undefined {
   if (!after) return undefined;
   if (!before) return { ...after, tools: after.tools ? { ...after.tools } : undefined };
   const tools: Record<string, number> = {};
@@ -819,7 +868,7 @@ export function usageDelta(before: AgentUsage | undefined, after: AgentUsage | u
     const delta = (after.tools?.[name] ?? 0) - (before.tools?.[name] ?? 0);
     if (delta > 0) tools[name] = delta;
   }
-  return {
+  const result: AgentUsage = {
     input: Math.max(0, after.input - before.input),
     output: Math.max(0, after.output - before.output),
     cacheRead: Math.max(0, (after.cacheRead ?? 0) - (before.cacheRead ?? 0)),
@@ -831,14 +880,20 @@ export function usageDelta(before: AgentUsage | undefined, after: AgentUsage | u
     tools,
     contextTokens: after.contextTokens,
   };
+  if (preserveUnknown) {
+    for (const field of ["cacheRead", "cacheWrite", "total", "cost", "turns", "toolCalls"] as const) {
+      if (before[field] === undefined || after[field] === undefined) result[field] = undefined;
+    }
+  }
+  return result;
 }
 
-export function mergeUsage(left: AgentUsage | undefined, right: AgentUsage | undefined): AgentUsage | undefined {
+export function mergeUsage(left: AgentUsage | undefined, right: AgentUsage | undefined, preserveUnknown = false): AgentUsage | undefined {
   if (!right) return left;
   if (!left) return { ...right, tools: right.tools ? { ...right.tools } : undefined };
   const tools = { ...(left.tools ?? {}) };
   for (const [name, count] of Object.entries(right.tools ?? {})) tools[name] = (tools[name] ?? 0) + count;
-  return {
+  const result: AgentUsage = {
     input: left.input + right.input,
     output: left.output + right.output,
     cacheRead: (left.cacheRead ?? 0) + (right.cacheRead ?? 0),
@@ -850,4 +905,10 @@ export function mergeUsage(left: AgentUsage | undefined, right: AgentUsage | und
     tools,
     contextTokens: right.contextTokens ?? left.contextTokens,
   };
+  if (preserveUnknown) {
+    for (const field of ["cacheRead", "cacheWrite", "total", "cost", "turns", "toolCalls"] as const) {
+      if (left[field] === undefined || right[field] === undefined) result[field] = undefined;
+    }
+  }
+  return result;
 }

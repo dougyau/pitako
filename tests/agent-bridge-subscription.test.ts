@@ -94,14 +94,14 @@ test("only current owner/Team rows drive revisions; retained removal and consump
       const second = await subscription.refresh();
       expect(second.items.map(item => item.id)).toEqual(["team"]);
       expect(second.revision).toBe(5);
-      retireTeamEvaluation(evaluation);
+      await retireTeamEvaluation(evaluation);
       expect((await subscription.refresh()).items).toEqual([]);
       const captured = observationEpoch();
       clearObservations(); row("new", "owner", token);
       const current = await subscription.refresh();
       touchObservation("new", captured);
       expect((await subscription.refresh()).revision).toBe(current.revision);
-    } finally { retireTeamEvaluation(evaluation); await subscription.dispose(); }
+    } finally { await retireTeamEvaluation(evaluation); await subscription.dispose(); }
   }));
 
 test("coalesced reply plus hint installs the native client listener synchronously; gaps are hints requiring refresh", async () => {

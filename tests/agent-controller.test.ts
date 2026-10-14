@@ -166,6 +166,8 @@ test(`packaged ${mode} fences bridge reads and joins ordinary native control thr
     expect(bridgeStarts).toBe(1); expect(admissions).toBe(0);
     releaseInput();
     expect((await acceptedInput as Error).message).toContain("retired");
+    expect(finished).toBe(false); // the admitted worker attempt is still owned
+    finishWorker(completed);
     await transition;
     // Keep the observer active through all remaining foreground reconciliation.
     await new Promise<void>(resolve => setImmediate(resolve));
@@ -301,7 +303,7 @@ test("controller fences parent, epoch, generation, Team retirement and native re
     teamOwnerToken: team.token, origin: { source: "team_assign", coordinatorSessionId: owner.sessionId, assignmentId: "assignment", workbrief: "original" } });
   const teamController = createAgentController(owner, () => owner), teamView = teamController.openView();
   expect(teamView.list().items.some(row => row.id === "team")).toBe(true);
-  retireTeamEvaluation(team);
+  await retireTeamEvaluation(team);
   expect(() => teamView.detail("team")).toThrow("unknown scoped worker");
   await teamView.close(); teamController.revoke(); await teamController.settle();
 }));
@@ -411,13 +413,14 @@ test("current Team lease permits native input/cancel; retirement leaves independ
   expect(detail.teamWrapper).toBe("Team fixture");
   expect(await view.input(selection, { intent: "steer", text: "literal correction" })).toMatchObject({ status: "queued" });
   expect(view.cancel(selection)).toMatchObject({ status: "requested" });
-  retireTeamEvaluation(evaluation);
+  const retirement = retireTeamEvaluation(evaluation);
   await expect(view.input(selection, { intent: "query", text: "retired Team" })).rejects.toThrow("unknown scoped worker");
   publishObservation({ id: "independent-sync", roleId: "researcher", status: "completed", phase: "idle", task: "independent",
     selectedModel: "fixture/selected", acceptedAt: 1, lastActivityKind: "start",
     origin: { source: "agent_run", coordinatorSessionId: owner.sessionId, workbrief: "independent" } });
   expect(view.detail("independent-sync").workbrief.text).toBe("independent");
   finish(completed);
+  await retirement;
   await view.close(); controller.revoke(); await controller.settle();
 }));
 
@@ -511,13 +514,14 @@ test("same-session startup fences agent_spawn while controlled external startup 
     expect(freshView.list().items.map(row => row.id)).toContain((fresh.details as { instanceId: string }).instanceId);
     expect(starts).toBe(1);
     await freshView.close();
+    for (const finish of finishes) finish();
     await emit("session_shutdown");
     expect(await status()).toEqual({ workers: [] });
   } finally {
     releaseCodex(); releaseDispatch();
+    for (const finish of finishes) finish();
     await Promise.allSettled([stale, dispatch, rebind, newerRebind]);
     await cleanup?.();
-    for (const finish of finishes) finish();
     await view?.close();
     captureController.mockRestore(); captureCodex.mockRestore();
   }
@@ -635,8 +639,9 @@ for (const { event, failUpstream } of [
       release(); await dispatch;
       await Promise.resolve();
       expect(settled).toBe(false); // accepted controller work is still held
-      releaseInput(); await expect(acceptedInput).rejects.toThrow("retired"); await transition;
+      releaseInput(); await expect(acceptedInput).rejects.toThrow("retired");
       worker.finish(completed);
+      await transition;
       if (event === "session_shutdown") await emit("session_start");
       const freshView = controllers.at(-1)!.openView();
       expect(freshView.list().items).toEqual([]);

@@ -9,6 +9,8 @@ import type { ExecutionBinding } from "../workflow.ts";
 import type { LiveHandle } from "./live.ts";
 import { randomUUID } from "node:crypto";
 import { PublicConversation } from "./public-conversation.ts";
+import { AgentClosureError, type AgentClosure } from "./closure.ts";
+import type { HeadAttachment } from "./head/runtime.ts";
 
 export interface WorkerInterest {
   planId: string;
@@ -31,6 +33,7 @@ export interface WorkerView {
   status: WorkerStatus;
   watch: boolean;
   elapsedMs: number;
+  closure: AgentClosure;
 }
 
 export interface BackgroundOwner {
@@ -104,6 +107,8 @@ interface Row {
   generation: number;
   attemptId?: string;
   conversation?: PublicConversation;
+  run: Promise<void>;
+  closure: AgentClosure;
 }
 
 interface Bag {
@@ -163,6 +168,7 @@ export async function spawnBackground(input: {
   cwd: string;
   historyOrigin?: import("./history.ts").HistoryOrigin;
   dispatch?: import("./routing.ts").DispatchSnapshot;
+  head?: HeadAttachment;
   foreground?: AbortSignal;
   watch?: WorkerInterest;
   executor: AttemptExecutor;
@@ -177,6 +183,7 @@ export async function spawnBackground(input: {
   const epoch = observationEpoch();
   const ownerToken = bag().owner?.token;
   let row: Row | undefined;
+  const completion = Promise.withResolvers<void>();
   const pending = runAgentInstance({
     roleId: input.roleId,
     task: input.task,
@@ -184,6 +191,7 @@ export async function spawnBackground(input: {
     executionRoot: input.watch?.execution?.executionRoot,
     historyOrigin: input.historyOrigin,
     dispatch: input.dispatch,
+    head: input.head,
     signal: controller.signal,
     executor: {
       ...input.executor,
@@ -249,6 +257,8 @@ export async function spawnBackground(input: {
         ownerToken,
         coordinatorSessionId: input.historyOrigin?.coordinatorSessionId,
         generation: 0,
+        closure: { state: "pending" },
+        run: completion.promise,
       };
       bag().rows.set(instance.id, row);
       if (ownerToken) {
@@ -285,17 +295,26 @@ export async function spawnBackground(input: {
     throw new Error("agent_spawn did not accept");
   }
   const accepted = row;
-  pending.then(
-    (result) => settle(accepted, result, epoch),
-    (error: unknown) =>
+  void pending.then(
+    (result) => {
+      accepted.closure = { state: "released" };
+      settle(accepted, result, epoch);
+    },
+    (error: unknown) => {
+      accepted.closure = error instanceof AgentClosureError
+        ? { state: "unknown", reason: error.message } : { state: "released" };
       settle(accepted, {
         instanceId: accepted.instanceId,
         role: accepted.roleId,
         status: "failed",
         model: { selectedModel: "unknown" },
         result: error instanceof Error ? error.message : String(error),
-      }, epoch),
-  );
+      }, epoch);
+    },
+  ).then(completion.resolve, error => {
+    accepted.closure = { state: "unknown", reason: String(error) };
+    completion.resolve();
+  });
   return {
     instanceId: accepted.instanceId,
     roleId: accepted.roleId,
@@ -474,46 +493,46 @@ export function cancelTeamWorker(token: symbol, instanceId: string, now: () => n
 }
 
 /** Retire only rows and observations attached to this evaluation lease. */
-export function retireTeamWorkers(token: symbol): void {
+export async function retireTeamWorkers(token: symbol): Promise<void> {
   const state = bag();
   state.teamOwners?.delete(token);
-  for (const [id, row] of state.rows) {
-    if (row.teamOwnerToken !== token) continue;
-    row.signal = "dropped";
-    row.conversation?.retire();
-    if (!row.controller.signal.aborted) row.controller.abort();
-    state.rows.delete(id);
-    removeObservation(id);
-  }
+  await retireRows([...state.rows.values()].filter(row => row.teamOwnerToken === token));
   removeTeamObservations(token);
 }
 
-export function cancelAllWorkers(): void {
+async function retireRows(rows: Row[]): Promise<void> {
   const state = bag();
-  for (const row of state.rows.values()) {
+  for (const row of rows) {
     row.signal = "dropped";
     row.conversation?.retire();
     if (!row.controller.signal.aborted) row.controller.abort();
   }
-  state.rows.clear();
+  await Promise.all(rows.map(row => row.run));
+  const uncertain = rows.filter(row => row.closure.state !== "released");
+  for (const row of rows) {
+    if (row.closure.state !== "released" || state.rows.get(row.instanceId) !== row) continue;
+    state.rows.delete(row.instanceId);
+    removeObservation(row.instanceId);
+  }
+  if (uncertain.length) throw new AgentClosureError(uncertain.map(row => new Error(`${row.instanceId}: ${
+    row.closure.state === "unknown" ? row.closure.reason : "owned run has not settled"
+  }`)), "Background retirement");
+}
+
+export async function cancelAllWorkers(): Promise<void> {
+  const state = bag();
+  await retireRows([...state.rows.values()]);
   state.restrictions.clear();
   clearObservations();
 }
 
-export function shutdownBackground(token: symbol): void {
+export async function shutdownBackground(token: symbol): Promise<void> {
   const state = bag();
-  for (const [id, row] of state.rows) {
-    if (row.ownerToken !== token) continue;
-    row.signal = "dropped";
-    row.conversation?.retire();
-    if (!row.controller.signal.aborted) row.controller.abort();
-    state.rows.delete(id);
-    removeObservation(id);
-  }
-  state.restrictions.delete(token);
   state.teamOwners?.delete(token);
-  removeTeamObservations(token);
   if (state.owner?.token === token) state.owner = undefined;
+  await retireRows([...state.rows.values()].filter(row => row.ownerToken === token));
+  state.restrictions.delete(token);
+  removeTeamObservations(token);
 }
 
 export function formatWorkerHandle(handle: WorkerHandle): string {
@@ -553,10 +572,11 @@ export function interestFrom(plan: string | undefined, unit: string | undefined)
 function settle(row: Row, result: AgentRunResult, epoch: number): void {
   const state = bag();
   const current = state.rows.get(row.instanceId);
-  if (current !== row || current.signal === "dropped") return;
+  if (current !== row) return;
   current.outcome = result;
-  if (liveOwner(current)) current.onTeamSettled?.(result.status);
+  if (current.closure.state === "released" && current.signal !== "dropped" && liveOwner(current)) current.onTeamSettled?.(result.status);
   current.conversation?.finish();
+  if (current.signal === "dropped") return;
   if (currentReadRow(current, epoch)) touchObservation(current.instanceId, epoch);
   collectResult(current);
   if (liveOwner(current) && idleOf(current.deliveryOwner)) deliverWorkerResults(current.ownerToken!);
@@ -808,5 +828,6 @@ function view(row: Row, now: number): WorkerView {
     status: statusOf(row),
     watch: row.interest !== undefined,
     elapsedMs: Math.max(0, now - row.acceptedAt),
+    closure: { ...row.closure },
   };
 }

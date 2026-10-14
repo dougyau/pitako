@@ -40,6 +40,32 @@ resolution. Historical native worker reads remain independent of this live state
 
 ## List and read
 
+### Head Developer history
+
+Head and local leaf history use the existing catalog and native JSONL authority.
+Member `head` metadata links the exterior assignment and Head instance to node,
+run, admitted revision and effective revision where known. Confirmed active
+scope changes update the bound leaf member and append native provenance.
+Head-native `pitako.head` entries record graph, proposal, barrier and finish
+observations. These records are diagnostics, not durable DAG replay authority;
+private ownership tokens are not model parameters.
+Local leaf members name their native Head session as coordinator. Select the
+exterior `assignmentId` to list the Head and its leaves together; the ordinary
+default foreground-session selector remains unchanged.
+
+The complete exterior result carries an integrated summary or diagnostic failure,
+current barrier/evidence references, bounded leaf identities and closure state.
+It preserves the Head's own usage separately from aggregate observed usage,
+classifier usage, elapsed time and peak active leaf parallelism. Missing values
+remain unknown; retries and continuation are not counted as new absolute usage.
+It does not copy leaf transcripts or promise model quality or savings.
+
+Head-local `head_wait` returns new events and closed outcomes without polling.
+Native `pitako.head.result` offers reconcile against the owning active branch.
+An unobserved offer may replay the same envelope ID with a delivery gap, never
+silently become a receipt. Ordinary catalog selectors, pagination and native
+read contracts below are unchanged.
+
 The foreground `agent_history` tool supports these requests:
 
 ```json

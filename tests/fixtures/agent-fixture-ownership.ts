@@ -49,10 +49,11 @@ export function agentFixtureOwnership(options: { deferDirectories?: boolean } = 
             finishers = [];
             controllers = [];
             runs = [];
-            fixture.beforeRelease(() => {
-              cancelAllWorkers();
+            fixture.beforeRelease(async () => {
+              const retirement = cancelAllWorkers();
               for (const controller of controllers) controller.abort();
               for (const finish of finishers) finish();
+              await retirement;
             });
             await body();
           })();

@@ -99,7 +99,7 @@ test("bind failure and cancellation before prompt dispose controlled sessions", 
   const cancelled = setup({ bind() { stop.abort(); } });
   expect(await fixture.acquire(cancelled.executor.start({ ...cancelled.input, signal: stop.signal }))).toMatchObject({ status: "cancelled" });
   expect(cancelled.host.sessions[0]!.prompts).toEqual([]);
-  expect(cancelled.host.sessions[0]!.events).toEqual(["bind", "session_shutdown", "dispose"]);
+  expect(cancelled.host.sessions[0]!.events).toEqual(["bind", "abort", "session_shutdown", "dispose"]);
 }));
 
 for (const target of [
