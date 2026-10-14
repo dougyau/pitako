@@ -245,7 +245,8 @@ function publicDetail(value, owner) {
     optional(value, "captureGaps", item => Array.isArray(item) && item.every(publicGap)) &&
     optional(value, "nextBindings", item => cursor(item, value.ref, "public_bindings", true)) &&
     Array.isArray(value.bindings) && value.bindings.length <= 50 && value.bindings.every(binding =>
-      object(binding) && keys(binding, ["generation", "historyId", "sessionId", "state", "headEntryId", "capture", "attemptIds", "attempts", "gaps", "ref"]) &&
+      object(binding) && keys(binding, ["generation", "historyId", "sessionId", "state", "headEntryId", "capture", "attemptIds", "attempts", "gaps", "ref", "todoHead"]) &&
+      optional(binding, "todoHead", publicTodoHead) &&
       integer(binding.generation) && string(binding.historyId) && string(binding.sessionId) &&
       ["active", "historical"].includes(binding.state) && Array.isArray(binding.attemptIds) && binding.attemptIds.every(item => string(item)) &&
       (binding.headEntryId === null || string(binding.headEntryId)) && ["open", "closed", "incomplete"].includes(binding.capture) &&
@@ -268,6 +269,24 @@ const publicGap = value => ["pending", "not_captured", "not_persisted", "pruned"
 function publicSelection(value) {
   return object(value) && keys(value, ["model", "requestedModel", "reasoning"]) && text(value.model) &&
     ["requestedModel", "reasoning"].every(key => optional(value, key, text));
+}
+function publicTodoHead(value) {
+  return object(value) && (value.state === "unavailable" ? keys(value, ["state"]) :
+    value.state === "ready" && keys(value, ["state", "sourceEntryId"]) &&
+    (value.sourceEntryId === null || string(value.sourceEntryId)));
+}
+function publicTodoSnapshot(value) {
+  if (!object(value) || !keys(value, ["format", "tasks"]) || value.format !== "rpiv-todo-v1" ||
+      !Array.isArray(value.tasks)) return false;
+  const ids = new Set();
+  return value.tasks.every(task => {
+    if (!object(task) || !keys(task, ["id", "identityEntryId", "subject", "status"]) ||
+        !Number.isSafeInteger(task.id) || task.id <= 0 || ids.has(task.id) ||
+        !string(task.identityEntryId) || typeof task.subject !== "string" ||
+        !["pending", "in_progress", "completed", "deleted"].includes(task.status)) return false;
+    ids.add(task.id);
+    return true;
+  });
 }
 function publicContent(value) {
   return Array.isArray(value) && value.every(block => object(block) &&
@@ -292,7 +311,8 @@ function publicChange(change) {
       optional(payload, "stopReason", reason => ["pending", "stop", "length", "toolUse", "error", "aborted", "deferred"].includes(reason)) &&
       optional(payload, "errorMessage", text) && (payload.role === "assistant" || payload.stopReason === undefined && payload.errorMessage === undefined) &&
       string(record.nativeEntryId) && record.toolCallId === null
-    : record.kind === "tool" ? object(payload) && keys(payload, ["status", "name", "args", "argsState", "result", "isError"]) &&
+    : record.kind === "tool" ? object(payload) && keys(payload, ["status", "name", "args", "argsState", "result", "isError", "todoSnapshot"]) &&
+      optional(payload, "todoSnapshot", publicTodoSnapshot) &&
       ["started", "updated", "completed", "error"].includes(payload.status) && string(payload.name) &&
       ["available", "not_captured"].includes(payload.argsState) && (payload.result === null || publicContent(payload.result)) &&
       (payload.isError === null || typeof payload.isError === "boolean") && string(record.toolCallId) &&
@@ -315,7 +335,8 @@ function publicActivity(value, owner) {
     (value.next === null || string(value.next, 16 * 1024)) &&
     typeof value.more === "boolean" &&
     optional(value, "lost", item => object(item) && keys(item, ["from", "through"]) && integer(item.from) && integer(item.through)) &&
-    optional(value, "binding", item => object(item) && keys(item, ["generation", "historyId", "sessionId", "state", "headEntryId", "capture", "attemptIds", "attempts", "gaps"]) &&
+    optional(value, "binding", item => object(item) && keys(item, ["generation", "historyId", "sessionId", "state", "headEntryId", "capture", "attemptIds", "attempts", "gaps", "todoHead"]) &&
+      optional(item, "todoHead", publicTodoHead) &&
       item.generation === value.ref.native?.generation && item.sessionId === value.ref.native?.sessionId &&
       item.historyId === value.ref.native?.historyId && ["active", "historical"].includes(item.state) &&
       (item.headEntryId === null || string(item.headEntryId)) && ["open", "closed", "incomplete"].includes(item.capture) &&

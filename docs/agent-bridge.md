@@ -242,10 +242,21 @@ reads. Recovery never opens a new SDK session or scans unrelated archives.
 Unpersisted intermediate tool updates cannot be recovered. Missing, pruned and
 unsupported sources remain explicit gaps; recovery is not proof of completeness.
 Placement metadata and immutable recovery recipes count against these same
-budgets. Recovery's first page reads only the header. Its next page makes one
-positional reservation pass over that registered file cut, keeping only bounded
-placement anchors/ranges, then streams individual lines. Live updates,
-reconciliation and continuation do not reread the complete file.
+budgets. Recovery synchronously freezes the observed head and registered
+`FileCut` before any await, then reads bounded native ancestry metadata and
+placement anchors/ranges from that cut. It materializes individual native
+results as needed; live updates, reconciliation and continuation do not reread
+the complete file. The file tail does not select the active branch.
+
+Every recovery page, including fragment continuations, carries that recovery's
+frozen binding, selector and capture observation. The first materialization of
+a record freezes its final merged upsert bytes, including permitted retained
+live arguments and the native cut's checklist decision. Repeated cursors and
+later fragments reuse those bytes even if the same tool receives a live upsert.
+Recovery-derived snapshots stay in the cut's recipe, not live retained records.
+Loss of the recipe, materialized bytes or an admissible cut requires
+`resync_required`, never reconstruction from newer live data. A rejected cut
+cannot export its checklist through a subsequent live follow read.
 
 After `resync_required`, finish a **fresh read without a cursor** before choosing
 its sort domain: `state: "ready", more: false` closes that available cut; its
@@ -265,6 +276,83 @@ private entries, routing, managed auth, leases and control selections. Original
 WorkBrief and ordinary public text/tool arguments remain public; this is not a
 universal scanner for arbitrary secrets written into those fields. Images and
 binary/unknown content are represented as explicit omissions.
+
+### Public worker checklist
+
+Protocol 2 and `public-v1` add two optional fields, without a new operation or
+permission: `todoSnapshot` on the tool variant of `PublicPayload`, and
+`todoHead` on `PublicBinding` in detail and activity pages. The public types are
+declared in `extensions/agent/bridge/protocol.d.ts`; the shared
+`extensions/agent/bridge/protocol.js` validator admits them for broker and Node
+client alike. Native resolution is private to `extensions/agent/public-todo.ts`,
+with capture/recovery in `extensions/agent/public-conversation.ts`, registered
+file reads in `extensions/agent/history-native.ts` and lifecycle hooks in
+`extensions/agent/pi.ts`.
+
+```ts
+export type PublicTodoSnapshot = {
+	format: "rpiv-todo-v1";
+	tasks: Array<{
+		id: number;
+		identityEntryId: string;
+		subject: string;
+		status: "pending" | "in_progress" | "completed" | "deleted";
+	}>;
+};
+
+export type PublicTodoHead =
+	| { state: "ready"; sourceEntryId: string | null }
+	| { state: "unavailable" };
+```
+
+Only these fields are exported; arbitrary native `details`, allocator state,
+task timestamps, dependencies, owner and metadata are not checklist fields.
+IDs must be positive safe integers and unique within the snapshot. A snapshot
+keeps the complete membership and row order, including `deleted`, even when
+the visible `todo list` text was filtered.
+
+`todoSnapshot` describes the persisted native result at `record.nativeEntryId`.
+Pre-append tool events cannot establish it or invent native identity from
+`toolCallId`. Reconciliation publishes snapshots, `headEntryId` and `todoHead`
+together before notifying readers. `todoHead` selects by native ancestry from
+`binding.headEntryId` through all entry classes, including non-message entries;
+it is not the tool with the highest public revision. Recovery of older result A
+can give A a newer public revision while result B remains selected.
+
+For each task, `identityEntryId` is the earliest native result containing its
+numeric ID in that continuous membership lifetime on the selected ancestry.
+Deletion retains membership and identity. An intervening snapshot without the
+ID ends that lifetime; clear followed by ID reuse has a new identity. Invalid
+intermediate subject/status rows do not themselves erase numeric membership.
+Interpret this identity only within the existing owner, capture epoch, binding
+generation, history and native session scope, not globally across workers.
+
+Use the selector, not text, action, params or revision, to choose a checklist:
+
+| Binding observation | Meaning |
+| --- | --- |
+| `todoHead: { state: "ready", sourceEntryId: "<native ID>" }` | This native result is selected. Find its `todoSnapshot` within the same binding, possibly in historical/recovered pages; do not substitute another while waiting. |
+| `todoHead: { state: "ready", sourceEntryId: null }` | The complete ancestry to the root was checked and contains no matching TODO result. |
+| `todoHead: { state: "unavailable" }` | Selected data is invalid, or selection/identity cannot be proven. There is no older-result fallback and no inferred empty checklist. |
+| No `todoHead` field | The producer does not announce this capability; absence is not an empty checklist. |
+
+Clear is a selected result, distinct from proven absence:
+
+```json
+{"todoSnapshot":{"format":"rpiv-todo-v1","tasks":[]}}
+```
+
+Its binding has `{"todoHead":{"state":"ready","sourceEntryId":"<clear entry ID>"}}`,
+not a null source. Missing/corrupt/cyclic ancestry, ambiguous native IDs and
+limits cannot establish a partial identity or silently truncate tasks.
+Recovery with a head outside its frozen file cut publishes `unavailable` and
+no snapshots from that cut. If rejection happens after fragments were emitted,
+the continuation requires `resync_required`, not altered remaining bytes.
+
+Task arrays are not cursor state or a separate pagination domain. Large
+snapshots use the existing whole-upsert base64 JSON fragments and budgets.
+Assemble the entire immutable upsert before applying the snapshot; do not
+interpret partial task arrays or combine fragments from different revisions.
 
 ### Node page assembly and follow reads
 
@@ -520,6 +608,55 @@ directory and removes it only after the process and its owned work have settled.
 There is no Windows, TCP, browser, remote-access, global-discovery, or T3 path
 mapping support. This is the Pitako host API, not a shipped T3Code integration.
 Worker completion wake behavior remains unchanged.
+
+## Reproduce the offline public boundary
+
+From a prepared checkout root, using the prerequisites in [GATES.md](../GATES.md),
+run the existing fixtures; do not launch a second SDK driver or supply real
+provider credentials:
+
+```sh
+bun test ./tests/agent-public-conversation.test.ts
+bun test --parallel ./tests/agent-public-todo.test.ts ./tests/agent-public-conversation.test.ts ./tests/agent-public-retention.test.ts ./tests/agent-public-sdk-premise.test.ts ./tests/agent-pi.test.ts ./tests/agent-bridge-transport.test.ts
+```
+
+The first file includes both `agent_spawn real rpiv-todo create and filtered
+list native smoke` and `team_assign real rpiv-todo create and filtered list
+native smoke`. They invoke the existing launch handlers/controller,
+`createPiExecutor`, the real rpiv-todo extension and persisted SDK sessions.
+A registered deterministic `streamSimple` emits actual `todo` calls. The
+private runtime uses `refreshOnCreate: false`, `allowModelNetwork: false` and
+`OFFLINE_DUMMY`, not model-network requests or paid credentials.
+
+The fixture starts the broker and invokes
+`tests/fixtures/public-conversation-reader.mjs` with Node over the published
+client entry. It owns private config/agent/history/IPC roots and waits for
+sessions, background attempts, callbacks, broker/controller and reader disposal
+before removing them. The reader's descriptor/session/worker arguments come
+from the running fixture; it is not a standalone command against another owner.
+
+Inspect assertions and `NATIVE_TODO_SMOKE` / `NATIVE_TODO_EDGES` observations:
+the filtered completed list still exports both pending tasks; public
+`nativeEntryId` and `todoHead.sourceEntryId` equal the saved list result's ID;
+task identities equal their saved create IDs. Deleted remains present, clear
+selects an empty snapshot and reused ID 1 gets its new create entry identity.
+Native navigation through non-message ancestry, proven absence, invalid
+selection, compaction, registered reopen and distinct workers are exercised.
+
+The same conversation file's other composed journeys are named
+`<agent_spawn|team_assign> composes the real SDK producer, bridge and published
+Node reader through live <upserts|errors> and independent closure`. They check
+large UTF-8 argument fragments, immutable page replay, live updates and
+independent terminal capture/result reads. The parallel group also exercises
+resolver/wire admission and retention/recovery boundaries. For checklist
+recovery, inspect frozen head/selector/capture, historical A versus selected B,
+complete large snapshots, fragment continuation after a same-tool live upsert,
+and rejected-cut/recipe-loss resync rather than mixed bytes or retained leakage.
+
+These commands describe reproducible checks, not a claim that a particular
+checkout passed. Record observed exits, assertion failures and gaps. Focused
+fixtures do not replace the full typecheck-then-test procedure or independent
+review in `GATES.md`, certify dependencies or demonstrate T3 ingestion/UI.
 
 ## Future T3 adapter and Lineage work
 

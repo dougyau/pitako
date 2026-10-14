@@ -118,14 +118,18 @@ test("worker/owner byte eviction offers bounded resync and positional recovery o
   const spy = spyOn(fs, "readSync").mockImplementation(observeRead);
   try {
     const firstRecovery = capture.read(bindingRef, undefined, true);
-    expect(firstRecovery.changes).toEqual([]); // Header only: does not consume/reimport the whole file.
+    expect(firstRecovery).toMatchObject({ state: "ready", more: true });
+    expect(firstRecovery.changes).toEqual([]); // Descriptor scan, not a bulk public reimport.
     expect(reads.length).toBeGreaterThan(0);
     expect(reads.every(read => read.position !== null && read.length <= 4096)).toBe(true);
-    expect(reads.reduce((sum, read) => sum + read.length, 0)).toBeLessThan(fs.statSync(manager.getSessionFile()!).size / 2);
+    expect(reads.reduce((sum, read) => sum + read.length, 0)).toBeGreaterThanOrEqual(fs.statSync(manager.getSessionFile()!).size);
     const recovered = collect(cursor => capture.read(bindingRef, cursor, true), firstRecovery.next!);
-    expect(recovered.output.map(record => record.nativeEntryId)).toEqual(manager.getEntries().filter(entry => entry.type === "message").map(entry => entry.id));
+    expect(recovered.last).toMatchObject({ state: "resync_required", gaps: ["evicted", "resync_required"] });
+    // Reserving final materialized bytes may evict the live merge source before a record can be issued.
+    expect(recovered.output.length).toBeLessThan(8); // Final frozen bytes cannot all fit this deliberately small recipe budget.
+    expect(recovered.output.map(record => record.nativeEntryId)).toEqual(manager.getEntries()
+      .filter(entry => entry.type === "message").slice(0, recovered.output.length).map(entry => entry.id));
     expect(recovered.output.every(record => record.recovered && record.nativeTime !== null)).toBe(true);
-    expect(recovered.last.gaps).toContain("not_persisted"); // Unpersisted transient updates are not invented.
   } finally { spy.mockRestore(); }
   const sibling = new PublicConversation({ worker: 80000, owner: 120000 }); captures.push(sibling); sibling.bind(owner);
   const siblingManager = SessionManager.inMemory(root);
@@ -207,9 +211,14 @@ test(`recovery upsert orders rich tools with ${transients} transients${evicted ?
   const before = capture.read(bindingRef).next!;
   const persisted = manager.appendMessage(assistant("before tool"));
   capture.entry(generation, manager.getEntry(persisted)!, false, undefined, 0);
-  if (evicted) for (let index = 0; index < 4; index++) {
-    const id = manager.appendMessage(assistant("x".repeat(30000)));
-    capture.entry(generation, manager.getEntry(id)!, false, undefined, index);
+  if (evicted) {
+    for (let index = 0; index < 4; index++) {
+      const id = manager.appendMessage(assistant(`persisted before tool ${index}`));
+      capture.entry(generation, manager.getEntry(id)!, false, undefined, index);
+    }
+    // Evict unrelated live data without making the entire persisted recipe exceed its budget.
+    capture.tool(generation, { type: "tool_execution_start", toolCallId: "pressure", toolName: "read",
+      args: { value: "x".repeat(78000) } });
   }
   for (let index = 0; index < transients; index++)
     capture.tool(generation, { type: "tool_execution_start", toolCallId: `transient-${index}`, toolName: "read", args: {} });
@@ -233,6 +242,7 @@ test(`recovery upsert orders rich tools with ${transients} transients${evicted ?
   const imported = new Map<string, PublicRecord>();
   upsert(imported, available.output);
   const recovered = collect(cursor => capture.read(bindingRef, cursor, true));
+  expect(recovered.last.state).toBe("ready");
   expect(recovered.output.at(-1)).toMatchObject({ nativeEntryId: followingIds.at(-1),
     payload: { blocks: [{ type: "text", text: "after tool 2" }] } });
   expect(recovered.output.find(record => record.id === rich.id)!.revision).toBeGreaterThan(rich.revision);
@@ -361,7 +371,7 @@ test("recovery revisions replay immutably and cannot eclipse later live reconcil
 
 test("old imported pages survive resync as consultation copies outside the closed available sort domain", () => owned((root, captures) => {
   const manager = SessionManager.create(root, path.join(root, "sessions"));
-  const capture = new PublicConversation({ worker: 80000, owner: 160000 });
+  const capture = new PublicConversation({ worker: 400000, owner: 800000 });
   captures.push(capture); capture.bind(Symbol());
   const generation = capture.binding("history", manager.getSessionId(), manager.getSessionFile());
   const bindingRef = { ...ref, native: { generation, historyId: "history", sessionId: manager.getSessionId() } };
@@ -373,6 +383,8 @@ test("old imported pages survive resync as consultation copies outside the close
   const imported = new Map<string, PublicRecord>();
   upsert(imported, old.output);
   const oldTransient = old.output.find(record => record.toolCallId === "old-transient")!;
+  capture.tool(generation, { type: "tool_execution_start", toolCallId: "pressure", toolName: "read",
+    args: { value: "x".repeat(397000) } });
   for (let index = 0; index < 5; index++) {
     const id = manager.appendMessage(assistant(`persisted ${index} ${"x".repeat(30000)}`));
     capture.entry(generation, manager.getEntry(id)!);
