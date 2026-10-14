@@ -86,12 +86,21 @@ model = "fixture/junior"
     expect(head.skills).toEqual(developer.skills);
     expect(head.principles).toEqual(developer.principles);
     const delivered = childInstructions(head, "internal-head-fixture");
+    expect(delivered).toContain(developer.instructions);
     for (const obligation of [
       "Effective Developer assignment contract.", "actual observations", "input receipt is not compliance",
       "expand local work", "write envelope", "escalate to the coordinator",
       "underlying observed evidence before satisfying", "Inspect the integrated diff and evidence",
       "verify-behavior", "Ponytail",
+      "Choose whether to create leaves", "An empty graph, delegated work, or a combination is valid",
+      "initial work, corrections, cleanup, and recovery",
+      "does not change frozen units, their order, scope, permissions, or acceptance",
+      "Explicit user constraints and safety or resource limits remain binding",
+      "without taking over your local scheduling",
+      "Do not edit product before the exclusive integration barrier, including when you choose no leaves",
+      "An empty graph uses the same barrier",
     ]) expect(delivered).toContain(obligation);
+    expect(delivered).not.toContain("Delegate during execution");
     expect(skillNamesForRole(head)).toContain("verify-behavior");
     expect(skillNamesForRole(head)).toContain("ponytail");
     writeConfig(configPath, prior + '[roles.developer_head]\nname = "Public Head"\n');
@@ -224,6 +233,14 @@ fallbacks = []
       }
       if (id === "coordinator") {
         expect(instructions).toContain("out-of-scope external checks into acceptance, preflight, or final gates");
+        for (const obligation of [
+          "Head decides whether to create leaves",
+          "corrections, cleanup, and recovery",
+          "Do not prescribe a leaf count, node allocation, no-delegation rule, or sole-writer strategy",
+          "each obligation and its basis",
+          "not take over Head scheduling",
+          "You retain escalation and independent acceptance",
+        ]) expect(instructions).toContain(obligation);
       }
     }
   });

@@ -240,13 +240,17 @@ Other roles and synchronous `agent_run`/`agent_supervise` cannot become Heads.
 it does not inherit the legacy Developer or foreground policy. See the
 [example configuration](config/developer-profiles.example.toml).
 
-The Head keeps the Developer baseline and receives local `head_*` tools to scope,
-decompose, steer and judge its own Developer leaves. Leaves have bounded contexts,
-independent capacity policies and optional configured classifier advice. Global
+The Head keeps the Developer baseline and decides whether to create leaves,
+decompose work, implement directly, or combine these approaches. The coordinator
+supplies the outcome and constraints, including for corrections, cleanup, and
+recovery. Local `head_*` tools scope, steer and judge its own Developer leaves.
+Leaves have bounded contexts, independent capacity policies and optional
+configured classifier advice. Global
 child/Team guards stay intact. Original writes remain reserved through physical
-closure, including active scope adjustments. The Head integrates only after an
-exclusive barrier, inspects relevant diffs/tests, verifies, and calls `head_finish`
-with current native evidence. Final text alone is not success.
+closure, including active scope adjustments. Product work starts only after an
+exclusive barrier, even with no leaves. The Head inspects relevant diffs and tests,
+verifies, and calls `head_finish` with current native evidence. Final text alone
+is not success.
 
 The exterior result is an integrated handoff or diagnostic failure. It includes
 bound identities, closure summaries and observed usage/parallelism; unknown usage
