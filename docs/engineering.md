@@ -167,6 +167,51 @@ requests for that name reject on synchronous and asynchronous entrypoints.
 Its primary policy must be configured explicitly, without legacy Developer or
 foreground fallback.
 
+The optional public API differs from `$execute` selection policy. Every new
+exterior implementation-related Developer assignment under execute explicitly
+selects asynchronous `role: "developer"`, `mode: "head"`, and authorized relative
+`writes`, including diagnosis, correction, focused in-unit verification, product
+cleanup edits, and recovery. Small scope and no-leaf strategies are not exceptions.
+Read-only work uses `writes: []`; root-wide access is not the default. Prefer
+Team when registered, otherwise `agent_spawn`, preserving plan/unit correlation,
+the captured execution root, and one exterior Developer.
+
+The complete rule ships in `skills/execute/SKILL.md`, not only
+`roles/coordinator.md`: the foreground profile hook does not load the Coordinator
+role. It is instruction delivery, not host enforcement of execute purpose.
+Plan/unit strings, task text, child identities, and session names supply no
+trusted producer of that authority. Static tests do not prove model compliance
+or host rejection of every contrary call. Ordinary omitted-mode, synchronous,
+capacity, Head leaf, and configured ModelPolicy fallback behavior stays unchanged.
+
+Compatible explicit user single-mode requirements or Head prohibitions are
+recorded exceptions, using ordinary mode without `writes`; prohibitions on leaves
+or parallelism alone still permit Head. Frozen safety/resource conflicts use
+existing decision levels. Missing policy, bad envelope, occupancy, unavailable
+asynchronous Head, or binding rejection blocks dispatch, not an omitted-mode,
+synchronous, transport, configuration-edit, or inline fallback. Inline is only
+for sessions with no agent or Team tools at all.
+
+Product cleanup edits require a fresh Head after prior physical settlement and
+normal admission; no-op cleanup creates no Developer. Setup, ledger/Board
+bookkeeping, the principal final typecheck-then-test procedure, independent review,
+and acceptance remain non-Developer responsibilities. The final complete
+procedure cannot be a delegated cleanup or focused-verification subtask.
+
+Steering cannot upgrade an admitted ordinary Developer. For an unexcepted active
+assignment, preserve exact handle, brief, binding, effects, and evidence; cancel
+only that handle and end the turn for settlement. Same-invocation replacement
+requires already-returned model-facing host released-closure proof for that
+exact handle plus hold recovery and normal admission. Normal `team_cancel`
+reports pending closure. Team status omits closure, ordinary status excludes
+Team workers and omits ordinary closure, and history seals invocation rather than
+execution groups. Wake/result content, terminal labels, hidden details, and
+self-report do not supply proof. Without proof, replacement stays blocked in that
+invocation; retain resources and holds. Do not recancel, poll, probe another
+assignment, switch transport, or add an observation API. Later authorized
+admission still requires a free role and normal binding, ownership, and hold
+recovery. Keep settled useful ordinary work for review, without Head replay.
+
 The coordinator supplies the outcome, purpose, permitted effects, write envelope,
 facts, invariants, and acceptance criteria. Head chooses no leaves, decomposition,
 or a combination, including for corrections, cleanup, and recovery. Local

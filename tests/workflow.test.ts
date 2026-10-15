@@ -477,7 +477,9 @@ describe("plan and execute contracts", () => {
     expect(brief).toContain("not a leaf count, node allocation, no-delegation rule, or sole-writer strategy");
     expect(brief).toContain("obligations and their basis");
     expect(brief).toContain("Do not prescribe a local strategy");
-    expect(brief).toContain("explicit write envelope when granting Head mode");
+    expect(brief).toContain('explicit asynchronous `role: "developer"`, `mode: "head"` and authorized relative `writes`');
+    expect(brief).toContain("including fresh follow-ups");
+    expect(brief).toContain("or record the deliberate single-mode exception above");
     expect(brief).not.toContain("future Developer Team head");
     expect(brief).toContain("do not replace global acceptance or authorize replanning");
     expect(brief).toContain("Level 1 and Level 2 decision rules");
@@ -682,7 +684,7 @@ describe("plan and execute contracts", () => {
     expect(execute).toContain("agent_run");
     expect(execute).toContain("## Workers");
     expect(execute).toContain("not foreground implementation");
-    expect(execute).toContain("neither `agent_run` nor `team_assign` nor `agent_spawn` is registered");
+    expect(execute).toContain("only when no agent or Team tools are registered");
     expect(execute).not.toContain("`agent_run` unavailable still means implement inline");
     expect(execute).not.toContain("If `agent_run` is unavailable, implement inline");
     expect(execute).toContain("Consult Architect in background");
@@ -810,6 +812,75 @@ describe("plan and execute contracts", () => {
     expect(readme).toContain("Ad hoc `agent_run` remains synchronous");
     expect(engineering).toContain("`agent_run` stays synchronous");
     expect(router).toContain("`agent_run` executes one isolated instance synchronously");
+  });
+
+  test("execute selects exterior Head across implementation phases without changing the optional API", () => {
+    const workers = execute.slice(execute.indexOf("Keep at most one exterior Developer"), execute.indexOf("### Reconcile an existing ordinary Developer")).replace(/\s+/g, " ");
+    for (const contract of [
+      "Every new exterior Developer assignment serving an execute implementation unit must use",
+      'asynchronous `role: "developer"`, `mode: "head"`, and explicit authorized `writes`',
+      "initial implementation, implementation-related diagnosis, correction, focused in-unit verification, product cleanup edits, and recovery",
+      "use `agent_spawn` only when Team is not registered",
+      "Small scope, short duration, and a no-leaf strategy are not single-mode exceptions",
+      "use `[]` for no authorized product writes",
+      'Do not grant `["."]` by default or derive writes from a leaf count',
+      "explicit user requirement for ordinary single Developer, or prohibition of Head itself",
+      'deliberately dispatch `mode: "single"` without `writes`',
+      "prohibition on leaves or parallelism alone does not prohibit Head",
+      "existing decision levels, not an automatic downgrade",
+      "Missing `developer_head` policy, invalid envelope, occupied role, unavailable asynchronous Head support, and execution-binding rejection are concrete blockers",
+      "do not omit `mode`, call `agent_run`, switch transport to evade rejection, edit personal configuration, or take over implementation",
+      "Configured Head ModelPolicy fallback is unchanged",
+      "Ordinary APIs outside execute still default omitted mode to single",
+    ]) expect(workers).toContain(contract);
+    expect(execute).not.toContain('may explicitly use `mode: "head"`');
+    expect(execute).toContain("synchronous-only tools do not activate that exception");
+
+    const correction = execute.slice(execute.indexOf("If verification fails in an implementation assignment"), execute.indexOf("## Cleanup")).replace(/\s+/g, " ");
+    expect(correction).toContain("Keep ordinary in-scope correction with the responsible active Developer");
+    expect(correction).toContain("select Head again for the remaining outcome");
+    const cleanup = execute.slice(execute.indexOf("## Cleanup"), execute.indexOf("## Review")).replace(/\s+/g, " ");
+    expect(cleanup).toContain("Product cleanup edits require a fresh asynchronous Developer Head assignment after the prior Developer has physically settled");
+    expect(cleanup).toContain("A no-op cleanup creates no Developer");
+    expect(cleanup).toContain("Setup, ledger and Board bookkeeping, the principal final typecheck-then-test procedure, independent review, and acceptance are non-Developer responsibilities");
+    expect(cleanup).toContain("Never delegate the principal final complete procedure as cleanup or focused verification");
+    for (const file of ["README.md", "docs/engineering.md"]) {
+      const docs = readFileSync(path.join(packageRoot(), file), "utf8").replace(/\s+/g, " ");
+      expect(docs).toContain("optional");
+      expect(docs).toContain('`role: "developer"`, `mode: "head"`');
+      expect(docs).toContain("`writes: []`");
+      expect(docs).toContain("fresh Head after prior physical settlement");
+      expect(docs).toContain("no-op cleanup creates no Developer");
+      expect(docs).toContain("principal final typecheck-then-test procedure");
+    }
+  });
+
+  test("execute delivers blocked ordinary-to-Head transition rather than inventing closure proof", () => {
+    const transition = execute.slice(execute.indexOf("### Reconcile an existing ordinary Developer"), execute.indexOf("Compare new user information")).replace(/\s+/g, " ");
+    // Instruction-delivery proof only: no fake successful replacement after a pending cancel.
+    for (const contract of [
+      "cannot gain Head authority through steering",
+      "preserve its WorkBrief, binding, effects, and evidence",
+      "policy deviation, not a runtime admission rejection",
+      "Cancel only that exact assignment by its handle type",
+      "End the turn for physical settlement",
+      "already-returned model-facing host proof of released closure for that exact handle, required hold recovery, and normal admission",
+      "Without that proof, no Head starts in this invocation",
+      "preserve the blocker, affected resources, and holds",
+      "A normal `team_cancel` receipt reports pending closure, not released closure",
+      "Later `team_status` omits closure",
+      "`agent_status` excludes Team-owned workers",
+      "History seals invocation groups, not execution groups",
+      "wake or automatic result content",
+      "hidden tool details",
+      "worker self-report do not substitute",
+      "Do not recancel, poll, probe another assignment, switch transport, or add an observation API",
+      "later authorized admission may assign Head only after the role is free",
+      "Failed, cancelled, and no-outcome holds never clear merely because a new Head starts",
+      "Retain already physically settled useful ordinary work",
+      "do not replay it to manufacture a Head handoff",
+      "Assign only the remaining outcome",
+    ]) expect(transition).toContain(contract);
   });
 
   test("execute and pre-pr order cleanup before final gates and review", () => {

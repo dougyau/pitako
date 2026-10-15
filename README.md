@@ -224,7 +224,7 @@ The child cannot call `agent_run`, `agent_supervise`, `agent_spawn`, `agent_stat
 
 Collection, bookkeeping, delivery, and continuation remain separate. Handoff acknowledgement requires an exact committed result in the owning active branch, reconciled or inapplicable bookkeeping, and a subsequent owning turn with that result in its branch. A send, draft, preview, or getter is not that proof; even an observed turn is not model processing or work acceptance. Failed or uncertain operations remain visible and retain the full result, with at most one later event-driven recovery per operation. Parent abort/error never forces continuation. These handoffs are live-session state, not a durable queue or restart recovery. Full text can pressure the model context or be compacted later.
 
-### Optional Head Developer
+### Head Developer: optional API, normal execute selection
 
 The one exterior Developer may receive assignment-local Head authority through
 asynchronous `agent_spawn` or `team_assign`:
@@ -239,6 +239,32 @@ Other roles and synchronous `agent_run`/`agent_supervise` cannot become Heads.
 `developer_head` is internal, not a public role. Configure its primary explicitly;
 it does not inherit the legacy Developer or foreground policy. See the
 [example configuration](config/developer-profiles.example.toml).
+
+Under `$execute`, every new exterior implementation-related Developer assignment
+explicitly selects asynchronous `role: "developer"`, `mode: "head"`, and an
+authorized relative `writes` envelope. This includes diagnosis, correction,
+focused in-unit verification, product cleanup edits, and recovery. Small tasks
+and no-leaf work still select Head. Read-only work uses `writes: []`; root access
+is not the default. Use Team when registered, otherwise `agent_spawn`.
+An explicit compatible user single-mode requirement or Head prohibition is a
+recorded exception, dispatched without `writes`. No-leaf or no-parallelism
+restrictions alone are not exceptions. Missing Head configuration or rejected
+admission blocks dispatch, not a downgrade, transport evasion, or inline takeover.
+Inline execute work remains available only when no agent or Team tools exist.
+The public API default and configured Head ModelPolicy fallback are unchanged.
+
+Product cleanup edits require a fresh Head after prior physical settlement and
+normal admission; no-op cleanup creates no Developer. Setup, bookkeeping, the
+principal final typecheck-then-test procedure, independent review, and acceptance
+are not Developer assignments. Never delegate that final procedure as cleanup.
+An active ordinary assignment cannot gain Head authority through steering.
+Replacement in the same invocation requires already-returned model-facing host
+released-closure proof for its exact handle, hold recovery, and normal admission.
+A normal pending Team cancel receipt supplies none; later status, history, wake,
+or result content cannot replace it. Preserve blockers, resources, and holds
+without polling, probing, or switching transport. Retain useful settled ordinary
+work for review rather than manufacturing a Head replay. The complete selection
+and transition policy is in [`$execute`](skills/execute/SKILL.md).
 
 The Head keeps the Developer baseline and decides whether to create leaves,
 decompose work, implement directly, or combine these approaches. The coordinator
