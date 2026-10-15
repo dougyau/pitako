@@ -94,6 +94,16 @@ model = "fixture/junior"
       "verify-behavior", "Ponytail",
       "Choose whether to create leaves", "An empty graph, delegated work, or a combination is valid",
       "initial work, corrections, cleanup, and recovery",
+      "distinct responsibilities and verifiable results", "One leaf plus your own work counts",
+      "Ordered dependencies do not prevent decomposition",
+      "context duplication, coordination, and integration costs",
+      "one causal chain dominates", "Unknown work is not necessarily inseparable",
+      "Do not use difficulty, file count, or brief length alone to decide",
+      "Before starting leaves or direct implementation",
+      "Organization decision: direct", "Organization decision: decompose",
+      "each leaf's contribution and what you retain", "One sentence suffices for trivial",
+      "record the revised decision and reason before changing strategy",
+      "Include the final decision and reason in your integrated handoff summary",
       "does not change frozen units, their order, scope, permissions, or acceptance",
       "Explicit user constraints and safety or resource limits remain binding",
       "without taking over your local scheduling",
@@ -565,7 +575,7 @@ reasoning = "high"
   test("declares Board, todo and coding resources", () => {
     const manifest = JSON.parse(readFileSync(path.join(packageRoot(), "package.json"), "utf8")).pi;
     expect(manifest.extensions).toContain("./extensions/board/index.ts");
-    expect(manifest.extensions).toContain("./node_modules/@juicesharp/rpiv-todo/index.ts");
+    expect(manifest.extensions).toContain("./extensions/todo.ts");
     expect(manifest.skills).toContain("./skills/practical");
     expect(manifest.skills).toContain("./node_modules/@dietrichgebert/ponytail/skills/ponytail");
   });

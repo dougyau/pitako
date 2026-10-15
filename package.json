@@ -32,7 +32,7 @@
       "./extensions/index.ts",
       "./node_modules/pi-lsp-client/src/index.ts",
       "./node_modules/@vndv/pi-codegraph/extensions/codegraph.ts",
-      "./node_modules/@juicesharp/rpiv-todo/index.ts",
+      "./extensions/todo.ts",
       "./extensions/board/index.ts",
       "./extensions/agent/index.ts",
       "./extensions/acp.ts",

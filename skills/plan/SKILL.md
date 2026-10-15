@@ -19,6 +19,8 @@ The only intentional writes are `.pitako/` artifacts, unless the user asked you 
 
 Do not invoke $execute. Planning completion is not implementation authority.
 
+Before starting the first planning step, list existing TODOs and register all known planning stages as `pending`. Reuse them as you advance or resume. This checklist covers authorized planning, not the future implementation units. Freezing the plan does not start those units.
+
 ## When to ask
 
 Resolve technical choices from the repository, docs, tests, and Board. Ask only when the desired outcome is ambiguous, a material preference cannot be inferred, risk appetite is required, or two valid outcomes differ in user-visible intent.

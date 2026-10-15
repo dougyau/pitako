@@ -6,7 +6,9 @@ Pitako 0.1 is a Pi package. This note records its dependency choices, Board, rol
 
 ### rpiv-todo: npm dependency, full extension
 
-`@juicesharp/rpiv-todo` 2.11.0 is a real Pi package (MIT). Pitako depends on it and loads `node_modules/@juicesharp/rpiv-todo/index.ts`. That is the session-local TODO layer: `todo`, `/todos`, overlay, `blockedBy`, `owner`, `metadata`, and branch replay.
+`@juicesharp/rpiv-todo` 2.11.0 is a real Pi package (MIT). Pitako loads its full factory once through `extensions/todo.ts`. That is the session-local TODO layer: `todo`, `/todos`, overlay, `blockedBy`, `owner`, `metadata`, and branch replay.
+
+The wrapper changes only the `todo` tool's exposure to `model-only`. Direct calls retain native result snapshots for replay and checklist readers. Codemode's nested-call metadata lacks those snapshots. Pitako does not modify upstream state, add a persistence writer, or change T3's adapter. This prevents new nested TODO calls; it does not repair historical entries.
 
 It is not Pitako Tasks or Memory. Do not overload it with Board semantics. The Board is a separate extension. Upstream keeps exactly one task `in_progress` per session. Team workers have separate sessions and separate TODO lists; do not turn one session's list into a shared roster.
 

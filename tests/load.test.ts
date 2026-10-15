@@ -30,6 +30,7 @@ function profileHarness(profileFlag?: string) {
     "read", "bash", "edit", "write", "apply_patch", "grep", "find", "ls",
     "lsp_diagnostics", "lsp_rename", "codegraph_search", "lsp_symbols",
     "web_search", "fetch_content", "source_check", "get_search_content", "web_enable",
+    "todo",
   ];
   const context = {
     cwd: packageRoot(),
@@ -127,6 +128,28 @@ describe("Pitako resources and policy", () => {
     expect(analysis.active).not.toContain("edit");
     expect(analysis.active).not.toContain("write");
     await analysis.shutdown();
+
+    const child = profileHarness();
+    await agentScope.run({ instanceId: "todo-worker", roleId: "developer" }, async () => {
+      try {
+        await child.start();
+        const childPrompt = await child.composePrompt("base system prompt");
+        for (const delivered of [prompt, analysisPrompt, childPrompt]) {
+          expect(delivered).toContain("base system prompt");
+          expect(delivered).toContain("all known stages as pending before starting the first");
+          expect(delivered).toContain("Reuse tasks on resume");
+        }
+        expect(childPrompt).toContain("your current assignment");
+        expect(childPrompt).toContain("rpiv-todo is private to this session");
+        expect(child.active).toContain("todo");
+        expect(child.active).toContain("edit");
+        expect(child.active).toContain("write");
+      } finally {
+        await child.shutdown();
+      }
+    });
+    expect(foreground.active).toContain("todo");
+    expect(analysis.active).toContain("todo");
   });
 
   test("profile reloads keep edit/write for unsupported models in all roles", async () => {

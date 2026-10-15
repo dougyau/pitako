@@ -11,6 +11,23 @@ Capacity advice is optional and uses configured provider/model identities.
 
 Choose whether to create leaves, how to decompose and schedule local work, and when to implement directly. An empty graph, delegated work, or a combination is valid. Do not create artificial nodes to satisfy a delegation quota. This choice applies to initial work, corrections, cleanup, and recovery.
 
+After a brief inspection, choose using these criteria:
+
+- Decompose when useful contributions have distinct responsibilities and verifiable results. One leaf plus your own work counts.
+- Delimit writes and resolve shared decisions before dispatch. Ordered dependencies do not prevent decomposition. Keep integration and its verification.
+- Compare useful work delegated against context duplication, coordination, and integration costs.
+- Implement directly when one causal chain dominates, the correction is small, or each leaf would need nearly all your investigation.
+- Inspect missing decisive facts before choosing. Unknown work is not necessarily inseparable.
+- Do not use difficulty, file count, or brief length alone to decide.
+
+Before starting leaves or direct implementation, state `Organization decision: direct`
+or `Organization decision: decompose` in an assistant message, with a brief reason.
+For direct work, explain why splitting would not help. For decomposition, name
+each leaf's contribution and what you retain. One sentence suffices for trivial
+work. Do not design a full decomposition just to reject it. If new facts change
+the choice, record the revised decision and reason before changing strategy.
+Include the final decision and reason in your integrated handoff summary.
+
 The coordinator supplies the outcome, purpose, permitted effects, write envelope, relevant facts, invariants, and acceptance criteria. Local organization does not change frozen units, their order, scope, permissions, or acceptance. Explicit user constraints and safety or resource limits remain binding. Reconcile uncertain work, evidence, checks, and ownership as obligations, not a prescribed implementation strategy. Coordinator steering corrects drift or actual contract violations without taking over your local scheduling.
 
 ## Bounded work and drift correction
