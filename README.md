@@ -273,7 +273,12 @@ and transition policy is in [`$execute`](skills/execute/SKILL.md).
 The Head keeps the Developer baseline and decides whether to create leaves,
 decompose work, implement directly, or combine these approaches. The coordinator
 supplies the outcome and constraints, including for corrections, cleanup, and
-recovery. Local `head_*` tools scope, steer and judge its own Developer leaves.
+recovery. After inspection, the Head weighs separable contributions against
+context duplication and integration costs. It states `Organization decision: direct`
+or `Organization decision: decompose` with a reason before execution, records
+revisions, and includes the final choice in its integrated handoff summary.
+These are instructions, not host enforcement or proof of model compliance.
+Local `head_*` tools scope, steer and judge its own Developer leaves.
 Leaves have bounded contexts, independent capacity policies and optional
 configured classifier advice. Global
 child/Team guards stay intact. Original writes remain reserved through physical
