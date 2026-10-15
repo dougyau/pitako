@@ -77,10 +77,23 @@ If Team rejects a reserved role, distinguish occupancy from an unknown handle. E
 
 Handles are session-local. On resume, look only at `## Workers`. Do not treat frontmatter `status: running` or the `## Status` body as a worker. Check each recorded handle once by type: for a Team assignment, call `team_status` with its assignment ID; for a low-level worker, call `agent_status` with its instance ID. If it is running, end the turn. If the handle is unknown, record a blocker. Do not poll.
 
-Keep at most one exterior Developer role active, without exception. That one
-asynchronous assignment may explicitly use `mode: "head"` with `writes` listing
-relative files/subtrees, `[]` for read-only work, or `["."]` for the captured root.
-Its host-granted local leaves do not authorize extra exterior Developers, reordered
+For an unexcepted active ordinary Developer, apply the transition rules below
+before ending the turn; a resume status check supplies no released-closure proof.
+
+Keep at most one exterior Developer role active, without exception. Every new
+exterior Developer assignment serving an execute implementation unit must use
+asynchronous `role: "developer"`, `mode: "head"`, and explicit authorized `writes`.
+This includes initial implementation, implementation-related diagnosis,
+correction, focused in-unit verification, product cleanup edits, and recovery.
+Use `team_assign` when registered; use `agent_spawn` only when Team is not registered.
+Preserve frozen plan and unit correlation and the captured execution root.
+Small scope, short duration, and a no-leaf strategy are not single-mode exceptions.
+
+List permitted relative files/subtrees in `writes`; use `[]` for no authorized
+product writes, including read-only focused verification. Do not grant `["."]`
+by default or derive writes from a leaf count. The envelope does not authorize
+frozen plan, ledger, personal settings, or unrelated resource changes.
+Head's host-granted local leaves do not authorize extra exterior Developers, reordered
 units, changes to the frozen plan or ledger, cleared holds, or waived final gates.
 The Head returns an integrated handoff or diagnostic failure, not leaf transcripts.
 The coordinator still owns acceptance and independent review.
@@ -88,9 +101,68 @@ Head chooses whether to create leaves, local decomposition and scheduling, and
 direct implementation after the exclusive integration barrier, even with no leaves.
 Explicit user constraints and existing safety or resource limits remain binding.
 
+An explicit user requirement for ordinary single Developer, or prohibition of
+Head itself, controls when compatible with the frozen envelope. Record that
+exception and deliberately dispatch `mode: "single"` without `writes`, retaining
+permitted effects in the WorkBrief. A prohibition on leaves or parallelism alone
+does not prohibit Head; preserve it through the no-leaf route. A frozen restriction
+or real safety/resource conflict uses the existing decision levels, not an
+automatic downgrade.
+
+Missing `developer_head` policy, invalid envelope, occupied role, unavailable
+asynchronous Head support, and execution-binding rejection are concrete blockers.
+Preserve the diagnostic; do not omit `mode`, call `agent_run`, switch transport
+to evade rejection, edit personal configuration, or take over implementation.
+Correct a request only within existing authority. Configured Head ModelPolicy
+fallback is unchanged, not ordinary Developer fallback. A synchronous-only route
+cannot supply Head. Ordinary APIs outside execute still default omitted mode to
+single; synchronous ad hoc calls and Head leaf routes are unchanged.
+
+This is shipped workflow instruction, not host enforcement of execute purpose.
+The foreground profile hook does not load the Coordinator role, so this skill
+carries the complete foreground policy. Plan/unit strings, task text, child
+identities, and session names do not establish that authority. Static policy
+checks prove delivery, not model compliance or rejection of every contrary call.
+
+### Reconcile an existing ordinary Developer
+
+An admitted ordinary worker cannot gain Head authority through steering. For an
+unexcepted active ordinary assignment, record the selection deviation and exact
+handle; preserve its WorkBrief, binding, effects, and evidence. This is a policy
+deviation, not a runtime admission rejection. Cancel only that exact assignment
+by its handle type. Do not replace it or take over its writes. End the turn for
+physical settlement.
+
+Interpret the complete result and model-facing host content already returned for
+that exact handle. Reconcile actual writers, repository effects, binding, and
+any Team hold. A fresh Head in this invocation requires already-returned
+model-facing host proof of released closure for that exact handle, required hold
+recovery, and normal admission. Without that proof, no Head starts in this
+invocation: preserve the blocker, affected resources, and holds.
+
+A normal `team_cancel` receipt reports pending closure, not released closure.
+Later `team_status` omits closure; `agent_status` excludes Team-owned workers and
+its ordinary-worker content also omits closure. History seals invocation groups,
+not execution groups. Status, `resultAvailable`, history, wake or automatic result
+content, steering receipts, hidden tool details, thread stops, and worker
+self-report do not substitute for model-facing host closure proof. Do not
+recancel, poll, probe another assignment, switch transport, or add an observation
+API to manufacture proof.
+
+A later authorized admission may assign Head only after the role is free and
+normal binding, ownership, and explicit evidence-based hold recovery permit it.
+This does not prove closure in the current invocation. Failed, cancelled, and
+no-outcome holds never clear merely because a new Head starts. An explicit
+single-mode exception is not a deviation. Retain already physically settled useful
+ordinary work for normal independent review and acceptance; do not replay it to
+manufacture a Head handoff. Assign only the remaining outcome.
+
 Compare new user information with the consulted object and original WorkBrief before using a result. For information within the brief, use the bounded in-scope input route below. Input does not expand the frozen authority or permitted effects.
 
 If information changes the object outside the WorkBrief, mark the old consultation or review inapplicable to the pending decision. Interpret its automatic result when supplied, but do not use it to close that decision or apply the change after accepting the old judgment. Cancel the exact still-active target with `team_cancel` or `agent_cancel` according to handle type. End the turn while settlement and role release are pending. Only after settlement and role release, assign a fresh WorkBrief against the current object if still necessary and authorized. Preserve evidence validity, frozen authority, and Team Hold recovery; a new assignment does not clear a blocking hold.
+
+Any fresh Developer assignment also obeys Head selection and, for an ordinary
+selection deviation, the stricter same-invocation closure rules above.
 
 ### Observe and redirect an active worker
 
@@ -106,7 +178,7 @@ Inspect the receipt and later activity separately. `queued` means admitted to th
 
 Neither `queued` nor `handled` proves correction or replaces a new consultation. Do not turn purposeful observation into status polling, a classification each turn, or mandatory consultation. Input does not settle a Team hold, accept a result, waive independent final review, change ModelPolicy, or allow another Developer.
 
-Inline implementation is allowed only when neither `agent_run` nor `team_assign` nor `agent_spawn` is registered in the session. A failure, stall, cancellation, or lost worker is not foreground implementation.
+Inline implementation is allowed only when no agent or Team tools are registered in the session. Failure, stall, cancellation, lost workers, or synchronous-only tools do not activate that exception.
 
 Build a WorkBrief for the current unit only:
 
@@ -114,7 +186,7 @@ Build a WorkBrief for the current unit only:
 - frozen unit id, outcome, and objective
 - assigned purpose, requested result, and completion condition, distinct from broader unit or final acceptance
 - relevant candidate and base identity, and permitted effects
-- explicit write envelope when granting Head mode
+- explicit asynchronous `role: "developer"`, `mode: "head"` and authorized relative `writes` for every new exterior implementation-related assignment, including fresh follow-ups; use `writes: []` when product changes are prohibited, or record the deliberate single-mode exception above
 - relevant scope and invariants
 - acceptance criteria and expected evidence
 - relevant prerequisites and rulings
@@ -139,7 +211,7 @@ Local subdivision stays local. A granted Head decides whether to create leaves, 
 
 Developer implements and owns ordinary in-scope diagnosis and correction for implementation assignments. Verification-only work does not add a semantic review; diagnosis-only work does not authorize repair; cleanup can be a no-op. Return after the assigned outcome, necessary cleanup, and evidence recording. Reviewer independently judges the assigned consultation or change using `verify-behavior`, reports findings, and never fixes. Consultation and correction review are not final approval; unspecified change review covers the complete relevant diff, and final review covers the complete agreed final diff, underlying evidence, and relevant effects. Architect answers only an architecture question. Researcher fills only a real knowledge gap. If any delegation fails, report the error; failure never transfers specialist authority to the Coordinator. Do not perform that role yourself. Keep at most one Developer role active, without exception.
 
-When neither `agent_run` nor `team_assign` nor `agent_spawn` is registered, implement inline with the same plan, ledger, evidence, and verification rules. A failed, stalled, cancelled, or lost delegation does not authorize inline specialist work.
+When no agent or Team tools are registered, implement inline with the same plan, ledger, evidence, and verification rules. A failed, stalled, cancelled, or lost delegation does not authorize inline specialist work.
 
 Routine implementation does not require Architect or Reviewer.
 
@@ -165,6 +237,13 @@ The principal coordinator owns the final complete procedure directly. Never dele
 
 If verification fails in an implementation assignment, the same Developer reproduces, finds the root cause, makes the smallest in-scope correction, and verifies again. Diagnosis-only and verification-only assignments retain their permitted effects. Do not ask the user, call Architect, or switch to a stronger model merely because a check failed.
 
+Keep ordinary in-scope correction with the responsible active Developer, using
+bounded input when appropriate, not a second exterior Developer. If failure or
+cancellation requires a fresh assignment, first satisfy settlement, binding,
+ownership, and hold recovery; select Head again for the remaining outcome under
+Workers. An active ordinary selection deviation follows the stricter transition
+rules above. A failed worker never authorizes inline takeover.
+
 Known focused diagnosis and correction remain with the Developer, regardless of failure count. Consult for an identified design, knowledge, authority or correctness question: Architect resolves a missing design decision; Reviewer assesses an existing proposal. Resolve missing context through focused inspection. When useful, `verify-behavior` offers optional JEV consultation orientation using the assigned result, scope, proposal, established evidence, remaining uncertainty and actual specialist question when known. Advice is not a WorkBrief, dispatch or authority. Missing advice creates no installation task or mandatory consultation. If evidence shows the implementation shape is wrong but the plan envelope still holds, ask Architect, record a Level 2 amendment, and continue. If no solution preserves the envelope, return `USER_DECISION_REQUIRED`. Independent final review remains required and is never waived by advice.
 
 Do not start the next unit until this unit is verifiable.
@@ -172,6 +251,15 @@ Do not start the next unit until this unit is verifiable.
 Design-time ordering guidance does not authorize skipping or reordering frozen units. After a verification prerequisite failure, continue only useful independent checks permitted inside the current unit. Do not bypass ownership, unresolved Team holds, or setup restrictions. Failed or interrupted setup permits only non-dependent read-only diagnosis, not implementation writes or dependent checks. Independent checks do not accept the incomplete unit or waive required evidence, final gates, or review.
 
 ## Cleanup
+
+Product cleanup edits require a fresh asynchronous Developer Head assignment
+after the prior Developer has physically settled and normal ownership and
+admission requirements are satisfied. Supply the authorized relative envelope;
+leave local organization to Head. A no-op cleanup creates no Developer.
+Setup, ledger and Board bookkeeping, the principal final typecheck-then-test
+procedure, independent review, and acceptance are non-Developer responsibilities.
+Never delegate the principal final complete procedure as cleanup or focused
+verification. Head finish and focused checks do not establish coordinator acceptance.
 
 Ponytail is the first defense. After all units are verified and material findings are resolved, make one deliberate Ponytail pass over the complete finished diff. This pass comes before `remove-ai-slops` and final gates; it does not replace Ponytail during implementation. Apply `verify-behavior`'s deletion rule to tests and their infrastructure: identify the guarantee and where it remains demonstrated, or why the contract no longer applies. Preserve uncertain cases and distinct guarantees.
 

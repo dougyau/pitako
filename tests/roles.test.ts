@@ -233,6 +233,30 @@ fallbacks = []
       }
       if (id === "coordinator") {
         expect(instructions).toContain("out-of-scope external checks into acceptance, preflight, or final gates");
+        const policy = instructions.replace(/\s+/g, " ");
+        for (const obligation of [
+          "Under `$execute`, every new exterior Developer assignment",
+          'asynchronous `role: "developer"`, `mode: "head"`, and explicit authorized relative `writes`',
+          "initial implementation, implementation-related diagnosis, correction, focused in-unit verification, product cleanup edits, and recovery",
+          "Small scope, short duration, or no leaves do not justify single mode",
+          "`writes: []` for read-only focused work",
+          "fresh Head after prior physical settlement and normal admission",
+          "a no-op cleanup creates no Developer",
+          "Never delegate the principal final complete procedure",
+          'deliberately use `mode: "single"` without `writes`',
+          "prohibition on leaves or parallelism alone still permits Head",
+          "Missing `developer_head` policy, invalid envelope, occupied role, unavailable asynchronous Head support, and binding rejection remain blockers",
+          "no agent or Team tools are registered",
+          "cannot become Head through steering",
+          "cancel only that handle and end the turn for physical settlement",
+          "already-returned model-facing host proof of released closure for that exact handle, required Team hold recovery, and normal admission",
+          "`team_cancel` pending receipt supplies no proof",
+          "Without proof, no Head starts in this invocation",
+          "preserve blockers, resources, and holds",
+          "Do not recancel, poll, probe, switch transport, or add an observation API",
+          "without manufacturing a Head replay",
+          "foreground profile hook does not load this role file",
+        ]) expect(policy).toContain(obligation);
         for (const obligation of [
           "Head decides whether to create leaves",
           "corrections, cleanup, and recovery",
