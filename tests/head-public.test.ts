@@ -1,14 +1,21 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { createCodingTools, type AgentBeforeSettleEventResult, type ExtensionAPI, type ExtensionContext, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import agentExtension from "../extensions/agent/index.ts";
 import { bindBackgroundOwner, clearBackgroundOwner, setBackgroundExecutor, workerResult, teamWorkerResult } from "../extensions/agent/background.ts";
-import { beginTeamEvaluation, retireTeamEvaluation, teamRoleReservation } from "../extensions/team.ts";
+import { beginTeamEvaluation, recordPlanTeamWork, retireTeamEvaluation, teamRoleReservation } from "../extensions/team.ts";
 import { createPiExecutor } from "../extensions/agent/pi.ts";
 import { agentFixtureOwnership } from "./fixtures/agent-fixture-ownership.ts";
 import { controlledPi } from "./fixtures/pi-factories.ts";
+import { adoptCheckpoint, listCheckpoints, readCheckpoint, type CheckpointOrigin } from "../extensions/agent/checkpoints.ts";
+import { WorkerHistory } from "../extensions/agent/history.ts";
+import { openBoard } from "../extensions/board/store.ts";
+import { currentWorkspace } from "../extensions/board/workspace.ts";
+import { openExecutionPlan, planFile, readLedgerTeamHolds } from "../extensions/workflow.ts";
+import { classifyProviderFailure } from "../extensions/agent/fallback.ts";
 
 const fixture = agentFixtureOwnership();
 const gate = () => Promise.withResolvers<void>();
@@ -24,10 +31,16 @@ async function bind(factories: ExtensionFactory[], appendEntry: ExtensionAPI["ap
   return { tools, events };
 }
 
-async function harness(options: { headPolicy?: boolean; final?: "stop" | "error" | "aborted"; missingCost?: boolean } = {}) {
-  const root = mkdtempSync(path.join(tmpdir(), "pitako-head-public-"));
-  fixture.directories.push(root);
+async function harness(options: { headPolicy?: boolean; final?: "stop" | "error" | "aborted"; missingCost?: boolean; managed?: boolean; headFallback?: boolean;
+  root?: string; seed?: (root: string) => void | Promise<void>; cutReceipt?: boolean; finalError?: string; objectFormat?: "sha256" } = {}) {
+  const root = options.root ?? mkdtempSync(path.join(tmpdir(), "pitako-head-public-"));
+  if (!options.root) fixture.directories.push(root);
+  if (options.managed && !options.root) {
+    execFileSync("git", ["init", "--quiet", ...(options.objectFormat ? [`--object-format=${options.objectFormat}`] : []), root]);
+    execFileSync("git", ["-C", root, "-c", "user.name=Fixture", "-c", "user.email=fixture@invalid", "commit", "--quiet", "--allow-empty", "-m", "admission"]);
+  }
   process.env.PI_CODING_AGENT_DIR = root;
+  await options.seed?.(root);
   const configFile = path.join(root, "pitako/config.toml");
   mkdirSync(path.dirname(configFile), { recursive: true });
   writeFileSync(configFile, `
@@ -39,13 +52,14 @@ model = "fixture/selected"
 [model_policies.developer_mid.primary]
 model = "fixture/selected"
 ${options.headPolicy === false ? "" : '[model_policies.developer_head.primary]\nmodel = "fixture/selected"\nreasoning = "off"'}
+${options.headFallback ? '[[model_policies.developer_head.fallbacks]]\nmodel = "fixture/selected"\nreasoning = "high"' : ""}
 [head_developer]
 max_parallel = 3
 [developer_routing]
 classifier_provider = "fixture"
 classifier_model = "classifier"
 `);
-  const headEntered = gate(), headDone = gate();
+  const headEntered = gate(), headDone = gate(), headAborted = gate();
   const leaves = new Map<string, { entered: ReturnType<typeof gate>; done: ReturnType<typeof gate>;
     disposing: ReturnType<typeof gate>; dispose: ReturnType<typeof gate>; local?: Local; session?: any; task?: string }>();
   const leaf = (id: string) => {
@@ -72,8 +86,13 @@ classifier_model = "classifier"
       headSession = session;
       if (options.missingCost) Object.assign(session.stats, { cost: undefined });
       headLocal = await bind(host.loaderInputs[host.sessions.indexOf(session)].extensionFactories,
-        (type, data) => { session.sessionManager.appendCustomEntry(type, data); });
+        (type, data) => {
+          if (options.cutReceipt && type === "pitako.head.checkpoint") throw new Error("controlled cut after ref before receipt");
+          session.sessionManager.appendCustomEntry(type, data);
+        });
       for (const tool of createCodingTools(root)) headLocal.tools.set(tool.name, tool);
+      // Model the SDK's custom-definition precedence over builtins/loaded extension tools.
+      for (const tool of host.sessionInputs.at(-1).customTools ?? []) headLocal.tools.set(tool.name, tool);
       session.getAllTools = () => [...headLocal.tools.keys(), "agent_spawn", "team_assign"].map(name => ({ name }));
     },
     prompt: async session => {
@@ -84,16 +103,17 @@ classifier_model = "classifier"
         cost: options.missingCost ? undefined : 0.01, assistantMessages: 1,
       });
       const message = { role: "assistant" as const, content: [{ type: "text" as const, text: "unexamined final" }],
-        stopReason: options.final ?? "stop", errorMessage: options.final === "error" ? "controlled failure" : undefined };
+        stopReason: options.final ?? "stop", errorMessage: options.final === "error" ? options.finalError ?? "controlled failure" : undefined };
       session.messages.push(message);
       session.sessionManager.appendMessage(message as never);
     },
-    abort: () => { headDone.resolve(); },
+    abort: () => { headAborted.resolve(); headDone.resolve(); },
   });
   const workers = controlledPi(root, {
     bind: async session => {
       const local = await bind(workers.loaderInputs[workers.sessions.indexOf(session)].extensionFactories,
         (type, data) => { session.sessionManager.appendCustomEntry(type, data); });
+      for (const tool of workers.sessionInputs.at(-1).customTools ?? []) local.tools.set(tool.name, tool);
       locals.set(session, local);
       (session as any).steer = async () => "queued";
       session.getAllTools = () => ["read", "bash", "agent_spawn", "team_assign", ...local.tools.keys()].map(name => ({ name }));
@@ -136,18 +156,32 @@ classifier_model = "classifier"
   });
   const publicLocal = await bind([agentExtension], () => {});
   const callPublic = (tool: string, params: unknown) => publicLocal.tools.get(tool).execute(`public-${tool}`, params, undefined, undefined, ctx);
-  const call = async (name: string, params: unknown) => {
+  let localCalls = 0;
+  const call = async (name: string, params: unknown, onUpdate?: (update: unknown) => unknown) => {
+    const id = `${name}-${++localCalls}`;
     for (const hook of headLocal.events.get("tool_call") ?? []) {
-      const result = await hook({ toolName: name, toolCallId: name, input: params }, headCtx());
+      const result = await hook({ toolName: name, toolCallId: id, input: params }, headCtx());
       if (result?.block) throw Error(result.reason);
     }
-    headSession.emit({ type: "tool_execution_start", toolName: name, toolCallId: name });
+    headSession.emit({ type: "tool_execution_start", toolName: name, toolCallId: id });
     try {
-      const result = await headLocal.tools.get(name).execute(name, params, undefined, undefined, headCtx());
-      headSession.sessionManager.appendMessage({ role: "toolResult", toolName: name, toolCallId: name,
-        content: result.content, details: result.details, isError: false, timestamp: Date.now() });
+      const result = await headLocal.tools.get(name).execute(id, params, undefined, onUpdate, headCtx());
+      headSession.sessionManager.appendMessage({ role: "toolResult", toolName: name, toolCallId: id,
+        content: result.content, details: result.details, isError: result.isError === true, timestamp: Date.now() });
       return result.details;
-    } finally { headSession.emit({ type: "tool_execution_end", toolName: name, toolCallId: name }); }
+    } catch (error) {
+      headSession.sessionManager.appendMessage({ role: "toolResult", toolName: name, toolCallId: id,
+        content: [{ type: "text", text: String(error) }], isError: true, timestamp: Date.now() });
+      throw error;
+    } finally { headSession.emit({ type: "tool_execution_end", toolName: name, toolCallId: id }); }
+  };
+  const callLeaf = async (nodeId: string, name: string, params: unknown) => {
+    const state = leaf(nodeId), id = `leaf-${nodeId}-${name}-${++localCalls}`;
+    const result = await state.local!.tools.get(name).execute(id, params, undefined, undefined,
+      { ...ctx, sessionManager: state.session.sessionManager });
+    state.session.sessionManager.appendMessage({ role: "toolResult", toolName: name, toolCallId: id,
+      content: result.content, details: result.details, isError: result.isError === true, timestamp: Date.now() });
+    return result;
   };
   const read = () => call("head_plan", { action: "read" });
   const closed = async (runId: string) => {
@@ -160,7 +194,7 @@ classifier_model = "classifier"
     }
   };
   const settle = async () => { headDone.resolve(); await fixture.settleRuns(); };
-  return { root, evaluation, ctx, leaf, host, workers, headEntered, callPublic, call, read, closed, settle,
+  return { root, evaluation, ctx, leaf, host, workers, headEntered, headAborted, callPublic, call, callLeaf, read, closed, settle,
     delivery, headLocal: () => headLocal, headSession: () => headSession,
     counts: () => ({ starts, leafStarts, classifications }),
     outcome: (id: string, team = false) => team ? teamWorkerResult(evaluation.token, id) : workerResult(id) };
@@ -178,6 +212,10 @@ test("public modes reject before effects and preserve ordinary routes", fixture.
     { role: "developer", mode: "head", writes: ["../escape"] },
     { role: "developer", mode: "head", writes: ["/absolute"] },
     { role: "developer", mode: "head", writes: [] },
+    { role: "reviewer", mode: "head", writes: [], checkpoints: "local" },
+    { role: "developer", mode: "head", writes: [], checkpoint_origin: { assignmentId: "old", checkpointId: "old", commit: "abc" } },
+    { role: "developer", checkpoints: "local" },
+    { role: "developer", mode: "head", writes: [], checkpoints: "remote" },
   ]) {
     for (const tool of ["agent_spawn", "team_assign"]) expect((await h.callPublic(tool, { ...params, task: "invalid" })).isError).toBe(true);
   }
@@ -193,6 +231,554 @@ test("public modes reject before effects and preserve ordinary routes", fixture.
   expect(h.counts().starts).toBe(2);
 }));
 
+const gitAt = (root: string, ...args: string[]) => execFileSync("git", ["-C", root, ...args]).toString().trim();
+const checkpoint = (h: Awaited<ReturnType<typeof harness>>, paths: string[], expectedRevision = 0) =>
+  h.call("head_checkpoint", { action: "create", expectedRevision, paths, summary: "Save partial work",
+    remaining: ["Independent review and remaining product work"], limits: ["Controlled SDK boundary"], evidence: [] });
+function seedCheckpoint(root: string) {
+  mkdirSync(path.join(root, "work"));
+  for (const [name, text] of Object.entries({ a: "base\n", removed: "remove\n", mode: "mode\n", foreign: "base foreign\n" })) {
+    writeFileSync(path.join(root, "work", name), text);
+  }
+  gitAt(root, "add", "--", "work");
+  gitAt(root, "-c", "user.name=Fixture", "-c", "user.email=fixture@invalid", "commit", "--quiet", "-m", "seed");
+  writeFileSync(path.join(root, "work/foreign"), "foreign index\n");
+  gitAt(root, "add", "--", "work/foreign");
+  writeFileSync(path.join(root, "work/foreign"), "foreign working\n");
+  writeFileSync(path.join(root, "work/untracked"), "foreign untracked\n");
+}
+
+test("local checkpoints save a no-leaf Head chain without index/branch or finish authority", fixture.ownedCase("public real checkpoint chain", async () => {
+  const h = await harness({ managed: true, seed: seedCheckpoint });
+  const base = gitAt(h.root, "rev-parse", "HEAD"), branch = gitAt(h.root, "symbolic-ref", "HEAD");
+  const index = readFileSync(path.join(h.root, ".git/index")), flags = gitAt(h.root, "ls-files", "-v");
+  await h.callPublic("agent_spawn", { role: "developer", mode: "head", writes: ["work"], checkpoints: "local", task: "Partial work" });
+  await h.headEntered.promise;
+  const barrier = await h.call("head_plan", { action: "beginIntegration", expectedRevision: 0 });
+  await h.call("write", { path: "work/a", content: "first\n" });
+  await h.call("write", { path: "work/new", content: "new\n" });
+  await h.call("write", { path: "work/omitted", content: "later\n" });
+  await h.call("bash", { command: "rm work/removed; chmod +x work/mode" });
+  const refused = await checkpoint(h, ["work/a", "work/foreign", "work/untracked", "../escape"]);
+  expect(refused.status).toBe("refused");
+  expect(refused.rejected.map((entry: any) => entry.path)).toEqual(["work/foreign", "work/untracked", "../escape"]);
+  expect(listCheckpoints(h.root)).toEqual([]);
+  const first = await checkpoint(h, ["work/a", "work/new", "work/removed", "work/mode"]);
+  expect(first.status).toBe("committed");
+  expect(first.manifest.parent).toBe(base);
+  expect(gitAt(h.root, "show", `${first.origin.commit}:work/a`)).toBe("first");
+  expect(gitAt(h.root, "ls-tree", first.origin.commit, "--", "work/mode")).toStartWith("100755");
+  expect(gitAt(h.root, "ls-tree", first.origin.commit, "--", "work/removed")).toBe("");
+  expect(first.manifest.omitted).toEqual(expect.arrayContaining(["work/foreign", "work/untracked", "work/omitted"]));
+  expect(gitAt(h.root, "show", `${first.origin.commit}:work/foreign`)).toBe("base foreign");
+  const checkpointEntry = h.headSession().sessionManager.getLeafId();
+  await expect(h.call("head_finish", { status: "completed", epoch: barrier.epoch, summary: "Not verification",
+    verification: [checkpointEntry], limits: [] })).rejects.toThrow("successful native tool results");
+  await h.call("write", { path: "work/a", content: "second\n" });
+  await h.call("write", { path: "work/new", content: "modified but omitted\n" });
+  const second = await checkpoint(h, ["work/a"]);
+  expect(second.status).toBe("committed");
+  expect(gitAt(h.root, "rev-parse", `${second.origin.commit}^`)).toBe(first.origin.commit);
+  expect(second.manifest.saved.map((entry: any) => entry.path).sort()).toEqual(["work/a", "work/mode", "work/new", "work/removed"]);
+  expect(gitAt(h.root, "show", `${second.origin.commit}:work/new`)).toBe("new");
+  expect(second.manifest.omitted).toContain("work/new");
+  expect(second.manifest.native[0].entries).toContainEqual(expect.objectContaining({ toolName: "write", isError: false }));
+  expect(second.manifest.native[0].testedSource).toBe("not_recorded");
+  expect(readFileSync(path.join(h.root, ".git/index"))).toEqual(index);
+  expect(gitAt(h.root, "ls-files", "-v")).toBe(flags);
+  expect(gitAt(h.root, "rev-parse", "HEAD")).toBe(base);
+  expect(gitAt(h.root, "symbolic-ref", "HEAD")).toBe(branch);
+  expect(readFileSync(path.join(h.root, "work/foreign"), "utf8")).toBe("foreign working\n");
+  await h.call("bash", { command: "test \"$(cat work/a)\" = second" });
+  await h.call("head_finish", { status: "completed", epoch: barrier.epoch, summary: "Integrated",
+    verification: [h.headSession().sessionManager.getLeafId()], limits: [] });
+  await h.settle();
+  const inspected = await h.callPublic("agent_checkpoints", { action: "read", ...second.origin });
+  expect(inspected.details.current.filter((entry: any) => !entry.matches).map((entry: any) => entry.path)).toEqual(["work/new"]);
+  expect(inspected.details.checkoutDirt.some((entry: string) => entry.includes("work/omitted"))).toBe(true);
+  expect(inspected.details.historicalEvidence.closureGaps).toEqual([]);
+}));
+
+test("checkpoint exemption spans closed waves while product editing and stale verification remain fenced", fixture.ownedCase("public checkpoint waves", async () => {
+  const h = await harness({ managed: true });
+  await h.callPublic("agent_spawn", { role: "developer", mode: "head", writes: ["shared"], checkpoints: "local", task: "waves" });
+  await h.headEntered.promise;
+  await h.call("head_plan", { action: "edit", expectedRevision: 0, nodes: [node("a", ["shared"])], supersede: [] });
+  const [a] = await h.call("head_start", { expectedRevision: 1, nodeIds: ["a"] });
+  await h.leaf("a").entered.promise;
+  expect(h.leaf("a").local!.tools.has("head_checkpoint")).toBe(false);
+  const leafInstructions = h.workers.loaderInputs[0].appendSystemPrompt.join("\n");
+  expect(leafInstructions).toContain("leaves do not stage or commit independently");
+  expect(leafInstructions).toContain("Shell scope is cooperative, not confinement");
+  await h.callLeaf("a", "write", { path: "shared", content: "leaf A\n" });
+  await expect(checkpoint(h, ["shared"], 1)).rejects.toThrow("still settling");
+  h.leaf("a").done.resolve(); h.leaf("a").dispose.resolve();
+  await h.closed(a.runId);
+  await h.call("head_review", { runId: a.runId, effectiveRevision: 1, judgment: "satisfied",
+    evidence: ["read inspected native result"], reason: "Controlled leaf result inspected" });
+  const barrier = await h.call("head_plan", { action: "beginIntegration", expectedRevision: 1 });
+  await h.call("write", { path: "shared", content: "leaf A + Head\n" });
+  await h.call("bash", { command: "test -f shared" });
+  const staleCheck = h.headSession().sessionManager.getLeafId();
+  const first = await checkpoint(h, ["shared"], 1);
+  expect(first.status).toBe("committed");
+  await h.call("head_plan", { action: "reopen", epoch: barrier.epoch });
+  await expect(h.call("write", { path: "shared", content: "outside integration" })).rejects.toThrow("exclusive integration barrier");
+  await h.call("head_plan", { action: "edit", expectedRevision: 1, nodes: [
+    node("b", ["shared"], ["a"]), node("future", ["shared"], ["b"]),
+  ], supersede: [] });
+  const [b] = await h.call("head_start", { expectedRevision: 2, nodeIds: ["b"] });
+  await h.leaf("b").entered.promise;
+  await h.callLeaf("b", "bash", { command: "test \"$(cat shared)\" = 'leaf A + Head'; printf ' + leaf B\\n' >> shared" });
+  h.leaf("b").done.resolve(); h.leaf("b").dispose.resolve();
+  await h.closed(b.runId);
+  const second = await checkpoint(h, ["shared"], 2);
+  expect(second.status).toBe("committed");
+  expect(second.manifest.parent).toBe(first.origin.commit);
+  expect(second.manifest.contributors.map((entry: any) => entry.contribution.source.kind)).toEqual(expect.arrayContaining(["leaf", "head"]));
+  expect(JSON.stringify(second.manifest.graph)).toContain("future");
+  expect((await h.read()).nodes.find((entry: any) => entry.id === "future").judgment).toBe("pending");
+  await expect(h.call("head_plan", { action: "beginIntegration", expectedRevision: 2 })).rejects.toThrow();
+  expect((await h.read()).verificationCandidates).not.toContainEqual(expect.objectContaining({ entryId: staleCheck }));
+  await h.call("head_finish", { status: "failed", diagnostic: "Useful partial waves, not accepted work", evidence: [], limits: [] });
+  await h.settle();
+  expect(readCheckpoint(h.root, second.origin).historicalEvidence.closureGaps).toEqual([]);
+}));
+
+test("ref survives receipt loss; independent explicit recovery keeps dirt and fresh authority", fixture.ownedCase("public checkpoint recovery", async () => {
+  const h = await harness({ managed: true, seed: seedCheckpoint, cutReceipt: true, final: "aborted" });
+  const admission = await h.callPublic("agent_spawn", { role: "developer", mode: "head", writes: ["work"], checkpoints: "local", task: "Interrupted" });
+  await h.headEntered.promise;
+  await h.call("head_plan", { action: "beginIntegration", expectedRevision: 0 });
+  await h.call("write", { path: "work/a", content: "saved\n" });
+  const cut = await checkpoint(h, ["work/a"]);
+  expect(cut.status).toBe("uncertain");
+  const origin: CheckpointOrigin = cut.origin;
+  expect(listCheckpoints(h.root)).toHaveLength(1);
+  expect((await h.callPublic("agent_checkpoints", { action: "list" })).details).toHaveLength(1);
+  const liveRecovery = await h.callPublic("agent_spawn", { role: "developer", mode: "head", writes: ["work"], checkpoints: "local",
+    checkpoint_origin: origin, task: "Too soon" });
+  expect(liveRecovery.isError).toBe(true);
+  expect(h.counts().starts).toBe(1);
+  await h.settle();
+  expect(h.outcome(admission.details.instanceId).status).toBe("failed");
+  const independent = readCheckpoint(h.root, origin);
+  expect(independent.historicalEvidence.closureGaps).toEqual([]);
+  writeFileSync(path.join(h.root, "work/post-checkpoint"), "keep subsequent dirt\n");
+  await retireTeamEvaluation(h.evaluation);
+  const replacement = await harness({ managed: true, root: h.root });
+  const parameters = { role: "developer", mode: "head", writes: ["work"], checkpoints: "local", checkpoint_origin: origin, task: "Continue known state" };
+  for (const change of [
+    { writes: [] }, { checkpoint_origin: { ...origin, commit: gitAt(h.root, "rev-parse", "HEAD") } },
+  ]) {
+    expect((await replacement.callPublic("agent_spawn", { ...parameters, ...change })).isError).toBe(true);
+  }
+  const saved = path.join(h.root, "work/a");
+  const other = mkdtempSync(path.join(tmpdir(), "pitako-checkpoint-wrong-root-"));
+  fixture.directories.push(other);
+  gitAt(other, "init", "--quiet");
+  expect(() => adoptCheckpoint(other, origin, [path.join(other, "work")])).toThrow();
+  const base = gitAt(h.root, "rev-parse", "HEAD"), index = readFileSync(path.join(h.root, ".git/index"));
+  const moved = gitAt(h.root, "-c", "user.name=Fixture", "-c", "user.email=fixture@invalid", "commit-tree",
+    `${base}^{tree}`, "-p", base, "-m", "different base");
+  gitAt(h.root, "update-ref", "HEAD", moved);
+  try {
+    expect(readCheckpoint(h.root, origin).commit).toBe(origin.commit);
+    expect((await replacement.callPublic("agent_spawn", parameters)).isError).toBe(true);
+  } finally { gitAt(h.root, "update-ref", "HEAD", base); }
+  gitAt(h.root, "update-index", "--assume-unchanged", "work/mode");
+  try { expect((await replacement.callPublic("agent_spawn", parameters)).isError).toBe(true); }
+  finally { writeFileSync(path.join(h.root, ".git/index"), index); }
+  const fsmonitor = path.join(h.root, "fsmonitor"), sentinel = path.join(h.root, "fsmonitor-ran");
+  writeFileSync(fsmonitor, `#!/bin/sh\nprintf ran > "${sentinel}"\n`);
+  chmodSync(fsmonitor, 0o755);
+  gitAt(h.root, "config", "core.fsmonitor", fsmonitor);
+  try {
+    expect(readCheckpoint(h.root, origin).checkoutObservationGaps.join()).toContain("unsupported");
+    expect(existsSync(sentinel)).toBe(false);
+    expect((await replacement.callPublic("agent_spawn", parameters)).isError).toBe(true);
+  } finally { gitAt(h.root, "config", "--unset", "core.fsmonitor"); }
+  writeFileSync(saved, "post-checkpoint edit\n");
+  expect(readCheckpoint(h.root, origin).current[0]!.matches).toBe(false);
+  expect((await replacement.callPublic("agent_spawn", parameters)).isError).toBe(true);
+  writeFileSync(saved, "saved\n");
+  chmodSync(saved, 0o755);
+  expect((await replacement.callPublic("agent_spawn", parameters)).isError).toBe(true);
+  chmodSync(saved, 0o644);
+  const admitted = await replacement.callPublic("agent_spawn", parameters);
+  expect(admitted.isError).not.toBe(true);
+  await replacement.headEntered.promise;
+  expect((await replacement.read()).nodes).toEqual([]);
+  await replacement.call("head_plan", { action: "beginIntegration", expectedRevision: 0 });
+  const foreign = await checkpoint(replacement, ["work/post-checkpoint"]);
+  expect(foreign.status).toBe("refused");
+  await replacement.call("write", { path: "work/a", content: "continued\n" });
+  const child = await checkpoint(replacement, ["work/a"]);
+  expect(child.status).toBe("committed");
+  expect(child.manifest.parent).toBe(origin.commit);
+  expect(child.manifest.origin).toEqual(origin);
+  expect(child.manifest.contributors.map((entry: any) => entry.inherited)).toEqual(expect.arrayContaining([true, false]));
+  expect(readFileSync(path.join(h.root, "work/post-checkpoint"), "utf8")).toBe("keep subsequent dirt\n");
+  expect(readFileSync(path.join(h.root, "work/foreign"), "utf8")).toBe("foreign working\n");
+  await replacement.call("head_finish", { status: "failed", diagnostic: "Saved partial continuation", evidence: [], limits: [] });
+  await replacement.settle();
+}));
+
+test("checkpoint lease is acquired synchronously and cancellation publishes nothing", fixture.ownedCase("public checkpoint lease", async () => {
+  const h = await harness({ managed: true });
+  await h.callPublic("agent_spawn", { role: "developer", mode: "head", writes: ["direct.txt"], checkpoints: "local", task: "Lease" });
+  await h.headEntered.promise;
+  const barrier = await h.call("head_plan", { action: "beginIntegration", expectedRevision: 0 });
+  await h.call("write", { path: "direct.txt", content: "save\n" });
+  const tools = h.headLocal().tools, ctx = { ...h.ctx, sessionManager: h.headSession().sessionManager };
+  const cancellation = new AbortController();
+  const saving = tools.get("head_checkpoint").execute("lease-cp", { action: "create", expectedRevision: 0,
+    paths: ["direct.txt"], summary: "lease", remaining: [], limits: [], evidence: [] }, cancellation.signal, undefined, ctx);
+  const blockedReopen = tools.get("head_plan").execute("reopen", { action: "reopen", epoch: barrier.epoch });
+  const guards = [
+    ["head_plan", { action: "edit", expectedRevision: 0, nodes: [node("x", ["direct.txt"])], supersede: [] }],
+    ["head_plan", { action: "beginIntegration", expectedRevision: 0 }],
+    ["head_plan", { action: "confirm", runId: "unknown", effectiveRevision: 0, historyId: "unknown", sessionId: "unknown", proposalId: "unknown" }],
+    ["head_review", { runId: "unknown", effectiveRevision: 0, judgment: "satisfied", evidence: ["no"], reason: "no" }],
+    ["head_finish", { status: "completed", epoch: barrier.epoch, summary: "no", verification: ["no"], limits: [] }],
+  ] as const;
+  const guarded = [blockedReopen, ...guards.map(([tool, params]) =>
+    Promise.resolve().then(() => tools.get(tool).execute("guard", params, undefined, undefined, ctx)))];
+  const settledGuards = Promise.allSettled(guarded);
+  expect(() => tools.get("head_start").execute("start", { expectedRevision: 0, nodeIds: ["x"] }, undefined, undefined, ctx)).toThrow("checkpoint lease");
+  expect(() => tools.get("write").execute("write", { path: "direct.txt", content: "conflict" }, undefined, undefined, ctx)).toThrow("checkpoint lease");
+  const conflictingAdmission = h.callPublic("agent_spawn", { role: "developer", mode: "head", writes: ["direct.txt"],
+    checkpoints: "local", task: "Must not construct a new baseline while leased" });
+  cancellation.abort();
+  expect((await conflictingAdmission).isError).toBe(true);
+  expect(h.counts().starts).toBe(1);
+  for (const result of await settledGuards) {
+    expect(result.status).toBe("rejected");
+    if (result.status === "rejected") expect(String(result.reason)).toContain("checkpoint lease");
+  }
+  expect((await saving).details.status).toBe("refused");
+  expect(listCheckpoints(h.root)).toEqual([]);
+  await h.call("write", { path: "direct.txt", content: "lease released only after settlement\n" });
+  expect((await checkpoint(h, ["direct.txt"])).status).toBe("committed");
+  await h.call("head_finish", { status: "failed", diagnostic: "Lease observations complete", evidence: [], limits: [] });
+  await h.settle();
+}));
+
+test("requested unsupported and foreign paths refuse the whole checkpoint without laundering", fixture.ownedCase("public checkpoint path rejection", async () => {
+  const h = await harness({ managed: true, seed: seedCheckpoint });
+  await h.callPublic("agent_spawn", { role: "developer", mode: "head", writes: ["work"], checkpoints: "local", task: "Reject mixed selection" });
+  await h.headEntered.promise;
+  await h.call("head_plan", { action: "beginIntegration", expectedRevision: 0 });
+  await h.call("write", { path: "work/a", content: "eligible\n" });
+  await h.call("write", { path: "work/foreign", content: "managed edit cannot claim the initial preimage\n" });
+  await h.call("bash", { command: "ln -s a work/link; mkdir work/directory" });
+  const result = await checkpoint(h, ["work/a", "work/foreign", "work/link", "work/directory", "work/a"]);
+  expect(result.status).toBe("refused");
+  expect(result.selected).toHaveLength(5);
+  expect(result.rejected.map((entry: any) => entry.path)).toEqual(["work/a", "work/foreign", "work/link", "work/directory", "work/a"]);
+  expect(result.rejected.every((entry: any) => entry.reasons.length > 0)).toBe(true);
+  expect(listCheckpoints(h.root)).toEqual([]);
+  const saved = await checkpoint(h, ["work/a"]);
+  expect(saved.status).toBe("committed");
+  expect(gitAt(h.root, "show", `${saved.origin.commit}:work/foreign`)).toBe("base foreign");
+  await h.settle();
+}));
+
+for (const drift of ["source", "index", "configuration", "attributes"] as const) {
+  test(`checkpoint rechecks ${drift} across its scheduling boundary`, fixture.ownedCase(`public checkpoint ${drift} drift`, async () => {
+    const h = await harness({ managed: true, seed: seedCheckpoint });
+    await h.callPublic("agent_spawn", { role: "developer", mode: "head", writes: ["work"], checkpoints: "local", task: "Recheck source authority" });
+    await h.headEntered.promise;
+    await h.call("head_plan", { action: "beginIntegration", expectedRevision: 0 });
+    await h.call("write", { path: "work/a", content: "known\n" });
+    await expect(checkpoint(h, ["work/a"], 9)).rejects.toThrow("stale");
+    const ctx = { ...h.ctx, sessionManager: h.headSession().sessionManager };
+    const saving = h.headLocal().tools.get("head_checkpoint").execute("drift", { action: "create", expectedRevision: 0,
+      paths: ["work/a"], summary: "Recheck", remaining: [], limits: [], evidence: [] }, undefined, undefined, ctx);
+    if (drift === "source") writeFileSync(path.join(h.root, "work/a"), "unattributed\n");
+    if (drift === "index") gitAt(h.root, "update-index", "--assume-unchanged", "work/mode");
+    if (drift === "configuration") gitAt(h.root, "config", "core.autocrlf", "true");
+    if (drift === "attributes") writeFileSync(path.join(h.root, "work/.gitattributes"), "a filter=unsupported\n");
+    expect((await saving).details.status).toBe("refused");
+    expect(listCheckpoints(h.root)).toEqual([]);
+    await h.settle();
+  }));
+}
+
+for (const policy of ["hook", "hook-resolution", "signing", "fsmonitor", "promisor", "filter"] as const) {
+  test(`checkpoint refuses unsupported ${policy} without executing repository programs`, fixture.ownedCase(`public checkpoint ${policy}`, async () => {
+    const h = await harness({ managed: true, seed: root => {
+      seedCheckpoint(root);
+      const sentinel = path.join(root, "repository-program-ran");
+      if (policy === "hook") {
+        const hook = path.join(root, ".git/hooks/reference-transaction");
+        writeFileSync(hook, `#!/bin/sh\nprintf ran > "${sentinel}"\n`);
+        chmodSync(hook, 0o755);
+      }
+      if (policy === "hook-resolution") gitAt(root, "config", "core.hooksPath", "/dev/null/not-a-directory");
+      if (policy === "signing") gitAt(root, "config", "commit.gpgsign", "true");
+      if (policy === "fsmonitor") gitAt(root, "config", "core.fsmonitor", `touch ${sentinel}`);
+      if (policy === "promisor") gitAt(root, "config", "remote.origin.promisor", "true");
+      if (policy === "filter") {
+        gitAt(root, "config", "filter.unsupported.clean", `touch ${sentinel}`);
+        writeFileSync(path.join(root, "work/.gitattributes"), "a filter=unsupported\n");
+      }
+    } });
+    await h.callPublic("agent_spawn", { role: "developer", mode: "head", writes: ["work"], checkpoints: "local", task: "Refuse unsupported policy" });
+    await h.headEntered.promise;
+    await h.call("head_plan", { action: "beginIntegration", expectedRevision: 0 });
+    await h.call("write", { path: "work/a", content: "not checkpointable\n" });
+    expect((await checkpoint(h, ["work/a"])).status).toBe("refused");
+    expect(existsSync(path.join(h.root, "repository-program-ran"))).toBe(false);
+    // Listing is read-only and does not run status/filter/fsmonitor.
+    expect(listCheckpoints(h.root)).toEqual([]);
+    await h.settle();
+  }));
+}
+
+test("checkpoint supports SHA256 and EOL conversion while sanitizing inherited Git redirections", fixture.ownedCase("public checkpoint EOL", async () => {
+  const h = await harness({ managed: true, objectFormat: "sha256", seed: root => {
+    seedCheckpoint(root);
+    writeFileSync(path.join(root, ".gitattributes"), "work/a text eol=lf\n");
+    gitAt(root, "add", "--", ".gitattributes");
+    gitAt(root, "-c", "user.name=Fixture", "-c", "user.email=fixture@invalid", "commit", "--quiet", "-m", "attributes");
+  } });
+  await h.callPublic("agent_spawn", { role: "developer", mode: "head", writes: ["work/a"], checkpoints: "local", task: "Save CRLF raw" });
+  await h.headEntered.promise;
+  await h.call("head_plan", { action: "beginIntegration", expectedRevision: 0 });
+  await h.call("write", { path: "work/a", content: "saved\r\n" });
+  const index = readFileSync(path.join(h.root, ".git/index"));
+  const poison = { GIT_DIR: path.join(h.root, "nonexistent-git"), GIT_WORK_TREE: "/nonexistent-worktree",
+    GIT_INDEX_FILE: path.join(h.root, "caller-index"), GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "commit.gpgsign",
+    GIT_CONFIG_VALUE_0: "true", GIT_TRACE: path.join(h.root, "caller-trace") };
+  const prior = Object.fromEntries(Object.keys(poison).map(key => [key, process.env[key]]));
+  const saved = await (async () => {
+    try {
+      Object.assign(process.env, poison);
+      return await checkpoint(h, ["work/a"]);
+    } finally {
+      for (const [key, value] of Object.entries(prior)) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+    }
+  })();
+  expect(saved.status).toBe("committed");
+  expect(saved.origin.commit).toHaveLength(64);
+  expect(readFileSync(path.join(h.root, ".git/index"))).toEqual(index);
+  expect(existsSync(poison.GIT_INDEX_FILE)).toBe(false);
+  expect(existsSync(poison.GIT_TRACE)).toBe(false);
+  expect(execFileSync("git", ["-C", h.root, "show", `${saved.origin.commit}:work/a`]).toString()).toBe("saved\n");
+  expect(readFileSync(path.join(h.root, "work/a"), "utf8")).toBe("saved\r\n");
+  await h.settle();
+  expect(adoptCheckpoint(h.root, saved.origin, [path.join(h.root, "work/a")]).saved).toEqual(saved.manifest.saved);
+}));
+
+test("recovery proves linked sealed leaf members without sealing the plan execution group", fixture.ownedCase("public plan checkpoint recovery", async () => {
+  const plan = "checkpoint-plan";
+  const h = await harness({ managed: true, cutReceipt: true, seed: async root => {
+    const board = await openBoard();
+    try {
+      const workspace = currentWorkspace(root);
+      const topic = board.createTopic(workspace, { title: "Checkpoint recovery" });
+      board.claimTopic(workspace, topic.id, plan);
+      const file = planFile(plan, root);
+      mkdirSync(path.dirname(file), { recursive: true });
+      writeFileSync(file, `---\nid: ${plan}\nrevision: 1\nstatus: frozen\nexecution: expected\nboard_topic_id: ${topic.id}\n---\n\nPartial work.\n`);
+    } finally { board.close(); }
+  } });
+  const admitted = await h.callPublic("team_assign", { role: "developer", mode: "head", writes: ["work"], checkpoints: "local",
+    plan, unit: "T2", task: "Plan-bound useful partial work" });
+  expect(admitted.isError).not.toBe(true);
+  await h.headEntered.promise;
+  await h.call("head_plan", { action: "edit", expectedRevision: 0, nodes: [node("a", ["work"])], supersede: [] });
+  const [a] = await h.call("head_start", { expectedRevision: 1, nodeIds: ["a"] });
+  await h.leaf("a").entered.promise;
+  await h.callLeaf("a", "write", { path: "work/saved", content: "linked leaf\n" });
+  h.leaf("a").done.resolve(); h.leaf("a").dispose.resolve();
+  await h.closed(a.runId);
+  const receipt = await checkpoint(h, ["work/saved"], 1);
+  expect(receipt.status).toBe("uncertain");
+  await h.settle();
+  expect(h.outcome(admitted.details.instanceId, true).status).toBe("failed");
+  const origin: CheckpointOrigin = receipt.origin;
+  const read = readCheckpoint(h.root, origin);
+  expect(read.historicalEvidence.closureGaps).toContain(`Unreconciled execution hold: ${admitted.details.id}`);
+  const store = new WorkerHistory(h.root, { initialize: false });
+  const headSource = read.manifest.head;
+  const leafSource = read.manifest.contributors.find(entry => entry.contribution.source.kind === "leaf")!.contribution.source;
+  expect(store.read(headSource.groupId).identity.kind).toBe("execution");
+  expect(store.read(headSource.groupId).closure.state).toBe("unclosed");
+  expect(store.read(leafSource.groupId).identity.kind).toBe("invocation");
+  expect(store.read(leafSource.groupId).closure.state).toBe("closed");
+  const binding = openExecutionPlan(plan, h.root, { createLedger: false }).binding;
+  expect(readLedgerTeamHolds(h.root, plan, binding).map(hold => hold.assignmentId)).toContain(admitted.details.id);
+  recordPlanTeamWork(h.root, plan, "T2", admitted.details.id, undefined, binding);
+  expect(readCheckpoint(h.root, origin).historicalEvidence.closureGaps).toEqual([]);
+  await retireTeamEvaluation(h.evaluation);
+  const replacement = await harness({ managed: true, root: h.root });
+  const params = { role: "developer", mode: "head", writes: ["work"], checkpoints: "local", checkpoint_origin: origin,
+    plan, unit: "T2", task: "Continue released partial work" };
+  const leafFile = path.join(store.catalogDir, `${leafSource.groupId}.json`), priorCatalog = readFileSync(leafFile, "utf8");
+  renameSync(leafFile, `${leafFile}.missing`);
+  try {
+    expect(readCheckpoint(h.root, origin).historicalEvidence.closureGaps.join()).toContain(leafSource.groupId);
+    expect((await replacement.callPublic("team_assign", params)).isError).toBe(true);
+    expect(replacement.counts().starts).toBe(0);
+  } finally { renameSync(`${leafFile}.missing`, leafFile); }
+  for (const corrupt of [
+    (group: ReturnType<WorkerHistory["read"]>) => { group.members[0]!.native = { state: "not-created" }; },
+    (group: ReturnType<WorkerHistory["read"]>) => { group.members[0]!.assignmentId = "different-assignment"; },
+    (group: ReturnType<WorkerHistory["read"]>) => { group.members[0]!.terminal = undefined; },
+  ]) {
+    const group = JSON.parse(priorCatalog);
+    corrupt(group);
+    writeFileSync(leafFile, JSON.stringify(group));
+    try {
+      expect(readCheckpoint(h.root, origin).historicalEvidence.closureGaps.length).toBeGreaterThan(0);
+      expect((await replacement.callPublic("team_assign", params)).isError).toBe(true);
+    } finally { writeFileSync(leafFile, priorCatalog); }
+  }
+  const missingHistory = path.join(h.root, "does-not-exist");
+  expect(readCheckpoint(h.root, origin, missingHistory).historicalEvidence.closureGaps.length).toBeGreaterThan(0);
+  expect(existsSync(missingHistory)).toBe(false);
+  const replacementAdmission = await replacement.callPublic("team_assign", params);
+  expect(replacementAdmission.isError).not.toBe(true);
+  await replacement.headEntered.promise;
+  expect((await replacement.read()).nodes).toEqual([]);
+  await replacement.call("head_plan", { action: "beginIntegration", expectedRevision: 0 });
+  await replacement.call("write", { path: "work/saved", content: "linked leaf + new Head\n" });
+  const next = await checkpoint(replacement, ["work/saved"]);
+  expect(next.status).toBe("committed");
+  expect(next.manifest.parent).toBe(origin.commit);
+  expect(next.manifest.contributors.some((entry: any) => entry.inherited && entry.contribution.source.runId === a.runId)).toBe(true);
+  await replacement.call("head_finish", { status: "failed", diagnostic: "Saved without acceptance", evidence: [], limits: [] });
+  await replacement.settle();
+  expect(store.read(headSource.groupId).closure.state).toBe("unclosed");
+  expect(readCheckpoint(h.root, next.origin).historicalEvidence.closureGaps.join()).toContain("Unreconciled execution hold");
+}));
+
+test("public granted Head edits and checks through managed definitions without leaves", fixture.ownedCase("public managed Head", async () => {
+  const h = await harness({ managed: true });
+  const admission = await h.callPublic("agent_spawn", {
+    role: "developer", mode: "head", writes: ["direct.txt"], checkpoints: "local", task: "Implement directly",
+  });
+  expect(admission.isError).not.toBe(true);
+  await h.headEntered.promise;
+  await expect(h.call("write", { path: "direct.txt", content: "early" })).rejects.toThrow("exclusive integration barrier");
+  let barrier = await h.call("head_plan", { action: "beginIntegration", expectedRevision: 0 });
+  const inventory = (await h.read()).managed.inventory.admission;
+  expect(inventory.root).toBe(h.root);
+  expect(inventory.paths).toEqual([]);
+  await h.call("write", { path: "direct.txt", content: "first integration\n" });
+  await h.call("head_plan", { action: "reopen", epoch: barrier.epoch });
+  await expect(h.call("write", { path: "direct.txt", content: "between waves" })).rejects.toThrow("exclusive integration barrier");
+  barrier = await h.call("head_plan", { action: "beginIntegration", expectedRevision: 0 });
+  expect((await h.read()).managed.inventory.admission).toEqual(inventory);
+  await h.call("write", { path: "direct.txt", content: "managed\n" });
+  await expect(h.call("write", { path: "other.txt", content: "escape" })).rejects.toThrow("write reservation");
+  await expect(h.call("codemode", { code: "unknown writer" })).rejects.toThrow("Unsupported writer");
+  await h.call("bash", { command: "printf failed-check; exit 7" });
+  const failedCheck = h.headSession().sessionManager.getLeafId();
+  await expect(h.call("head_finish", { status: "completed", epoch: barrier.epoch, summary: "Not passed",
+    verification: [failedCheck], limits: [] })).rejects.toThrow("successful native tool results");
+  await h.call("bash", { command: 'test "$(cat direct.txt)" = managed' });
+  const checked = h.headSession().sessionManager.getLeafId();
+  await h.call("head_finish", { status: "completed", epoch: barrier.epoch, summary: "Managed native work",
+    verification: [checked], limits: ["Controlled PiFactories; cooperative shell"] });
+  await h.settle();
+  expect(h.outcome(admission.details.instanceId).status).toBe("completed");
+  const managed = h.outcome(admission.details.instanceId).head!.managed!;
+  expect(managed.inventory.admission).toEqual(inventory);
+  expect(managed.inventory.contributions.some((entry: any) => entry.source.toolName === "write" && entry.changes[0].path === "direct.txt")).toBe(true);
+  expect(managed.native[0]).toMatchObject({ closure: "released", source: {
+    kind: "head", instanceId: admission.details.instanceId, sessionId: h.headSession().sessionId,
+  } });
+  expect(managed.native[0].entries).toContainEqual(expect.objectContaining({ toolName: "bash", isError: true,
+    entryId: expect.any(String), digest: expect.any(String) }));
+  for (const contribution of managed.inventory.contributions) {
+    expect(managed.native[0].entries).toContainEqual(expect.objectContaining({
+      toolName: contribution.source.toolName, toolCallId: contribution.source.toolCallId,
+    }));
+  }
+  expect(readFileSync(path.join(h.root, "direct.txt"), "utf8")).toBe("managed\n");
+  expect(h.host.sessionInputs[0].customTools.map((tool: any) => tool.name)).toContain("bash");
+  const instructions = h.host.loaderInputs[0].appendSystemPrompt.join("\n");
+  expect(instructions).toContain("No daemons, detached/remote writers or escaped descendants");
+  expect(instructions).toContain("Only the host-bound Head requests staging through head_checkpoint");
+  expect(instructions).toContain("Choose checkpoint timing and continuation yourself");
+  expect(instructions).toContain("A ref, terminal status, missing history, or receipt alone");
+  expect(h.counts()).toEqual({ starts: 1, leafStarts: 0, classifications: 0 });
+}));
+
+test("managed Head effects without leaves prevent fallback replay", fixture.ownedCase("managed fallback fence", async () => {
+  const finalError = "HTTP 429 too many requests";
+  expect(classifyProviderFailure(finalError)).toBe("rate_limit");
+  const h = await harness({ managed: true, headFallback: true, final: "error", finalError });
+  const admission = await h.callPublic("team_assign", { role: "developer", mode: "head", writes: ["direct.txt"],
+    checkpoints: "local", task: "Head edit then provider failure" });
+  await h.headEntered.promise;
+  await h.call("head_plan", { action: "beginIntegration", expectedRevision: 0 });
+  await h.call("write", { path: "direct.txt", content: "only once\n" });
+  await h.settle();
+  expect(h.outcome(admission.details.instanceId, true).status).toBe("failed");
+  expect(h.host.sessions).toHaveLength(1);
+  expect(readFileSync(path.join(h.root, "direct.txt"), "utf8")).toBe("only once\n");
+}));
+
+test("checkpoint object effects alone fence an eligible fresh-prompt fallback", fixture.ownedCase("checkpoint fallback fence", async () => {
+  const finalError = "HTTP 429 too many requests";
+  const h = await harness({ managed: true, seed: seedCheckpoint });
+  await h.callPublic("agent_spawn", { role: "developer", mode: "head", writes: ["work/a"], checkpoints: "local", task: "Save partial source" });
+  await h.headEntered.promise;
+  await h.call("head_plan", { action: "beginIntegration", expectedRevision: 0 });
+  await h.call("write", { path: "work/a", content: "saved\n" });
+  const saved = await checkpoint(h, ["work/a"]);
+  expect(saved.status).toBe("committed");
+  await h.settle();
+  await retireTeamEvaluation(h.evaluation);
+  const replacement = await harness({ managed: true, root: h.root, headFallback: true, final: "error", finalError });
+  await replacement.callPublic("agent_spawn", { role: "developer", mode: "head", writes: ["work/a"], checkpoints: "local",
+    checkpoint_origin: saved.origin, task: "Save unchanged recovered source" });
+  await replacement.headEntered.promise;
+  const child = await checkpoint(replacement, ["work/a"]);
+  expect(child.status).toBe("committed");
+  expect(child.manifest.contributors.every((entry: any) => entry.inherited)).toBe(true);
+  await replacement.settle();
+  expect(replacement.host.sessions).toHaveLength(1);
+  expect(listCheckpoints(h.root)).toHaveLength(2);
+}));
+
+test("native callback settlement retains the slot through cancellation and session disposal", fixture.ownedCase("managed native disposal join", async () => {
+  const h = await harness({ managed: true });
+  const admission = await h.callPublic("agent_spawn", { role: "developer", mode: "head", writes: ["direct.txt"],
+    checkpoints: "local", task: "Owned callback" });
+  await h.headEntered.promise;
+  const barrier = await h.call("head_plan", { action: "beginIntegration", expectedRevision: 0 });
+  const entered = gate(), release = gate();
+  fixture.finishOnCleanup(() => release.resolve());
+  const native = h.call("bash", { command: "printf native" }, () => { entered.resolve(); return release.promise; });
+  const nativeSettled = Promise.allSettled([native]);
+  await entered.promise;
+  await expect(h.call("head_plan", { action: "reopen", epoch: barrier.epoch })).rejects.toThrow("still settling");
+  await expect(checkpoint(h, ["direct.txt"])).rejects.toThrow("still settling");
+  let retirement: Promise<void> | undefined;
+  let retired = false;
+  try {
+    const receipt = await h.callPublic("agent_cancel", { id: admission.details.instanceId });
+    expect(receipt.isError).not.toBe(true); // Cancellation receipt is not a closure witness.
+    await h.headAborted.promise;
+    retirement = h.settle();
+    void retirement.then(() => { retired = true; });
+    await h.callPublic("agent_status", { id: admission.details.instanceId });
+    expect(retired).toBe(false);
+    expect(h.headSession().events).not.toContain("dispose");
+  } finally {
+    release.resolve(); await nativeSettled; await retirement;
+  }
+  expect(h.headSession().events).toContain("dispose");
+  await h.settle();
+}));
+
 test("public Team Head completes direct product work with no leaves through the exclusive barrier", fixture.ownedCase("public no-leaf Head", async () => {
   const h = await harness();
   const admission = await h.callPublic("team_assign", {
@@ -200,6 +786,8 @@ test("public Team Head completes direct product work with no leaves through the 
   });
   expect(admission.isError).not.toBe(true);
   await h.headEntered.promise;
+  expect(h.headLocal().tools.has("head_checkpoint")).toBe(false);
+  expect(h.host.loaderInputs[0].appendSystemPrompt.join("\n")).not.toContain("Managed local-source support:");
   expect(teamRoleReservation(h.evaluation, "developer")).toBe(admission.details.id);
   const initial = await h.read();
   expect(initial.nodes).toEqual([]);
@@ -209,7 +797,8 @@ test("public Team Head completes direct product work with no leaves through the 
   await h.call("bash", { command: 'test "$(cat direct.txt)" = direct' });
   const checked = h.headSession().sessionManager.getLeafId();
   const candidates = (await h.read()).verificationCandidates;
-  expect(candidates).toContainEqual({ entryId: checked, toolCallId: "bash", toolName: "bash" });
+  expect(candidates).toContainEqual({ entryId: checked,
+    toolCallId: h.headSession().sessionManager.getEntry(checked).message.toolCallId, toolName: "bash" });
   const finish = {
     status: "completed" as const, epoch: barrier.epoch, summary: "Implemented and checked direct product work",
     verification: [checked], limits: ["Controlled SDK boundary, not autonomous model compliance"],

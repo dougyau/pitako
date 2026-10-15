@@ -2,6 +2,7 @@ import type { AgentSession, ExtensionFactory, SessionManager } from "@earendil-w
 import { Type } from "typebox";
 import type { HeadAttachment, LeafScopeAttachment } from "./runtime.ts";
 import { marksSideEffect } from "../effects.ts";
+import { listCheckpoints, readCheckpoint } from "../checkpoints.ts";
 
 const boundedString = Type.String({ minLength: 1, maxLength: 16384 });
 const references = Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { minItems: 1, maxItems: 32 });
@@ -54,6 +55,30 @@ export function headExtension(attachment: HeadAttachment, binding: object,
         assignmentId: attachment.assignmentId, headInstanceId: attachment.headInstanceId, kind, data,
       }));
       const localTools = new Set(["head_result", "head_wait", "head_plan", "head_start", "head_observe", "head_input", "head_review", "head_finish"]);
+      if (attachment.managed) {
+        localTools.add("head_checkpoint");
+        pi.registerTool({
+          name: "head_checkpoint", label: "Local Head checkpoint",
+          description: "Granted Head only: create a local Git checkpoint or list/read this assignment's checkpoints. Requires physically released writers/operations; pending nodes are allowed. Creation leases out writes and graph/integration changes. Use the current revision and literal relative file paths; any rejection refuses the whole write. Committed/refused/uncertain results do not satisfy nodes, final verification, acceptance or publication. Inspect uncertain identity before any retry.",
+          parameters: Type.Union([
+            Type.Object({ action: Type.Literal("create"), expectedRevision: revision,
+              paths: Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), { minItems: 1, maxItems: 256 }),
+              summary: boundedString, remaining: Type.Array(boundedString, { maxItems: 32 }),
+              limits: Type.Array(boundedString, { maxItems: 32 }),
+              evidence: Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { maxItems: 32 }) }, { additionalProperties: false }),
+            Type.Object({ action: Type.Literal("list") }, { additionalProperties: false }),
+            Type.Object({ action: Type.Literal("read"), checkpointId: Type.String(), commit: Type.String() }, { additionalProperties: false }),
+          ]),
+          async execute(_id, params, signal) {
+            attachment.check(binding);
+            if (params.action === "create") return response(await attachment.checkpoints(binding,
+              result => pi.appendEntry?.("pitako.head.checkpoint", result)).create(params, signal));
+            const root = attachment.managed!.root;
+            return response(params.action === "list" ? listCheckpoints(root, attachment.assignmentId) :
+              readCheckpoint(root, { assignmentId: attachment.assignmentId, checkpointId: params.checkpointId, commit: params.commit }));
+          },
+        });
+      }
       pi.on("tool_call", event => {
         if (!localTools.has(event.toolName) && marksSideEffect(event.toolName) && !dag.codingAllowed(binding)) {
           return { block: true, reason: "Head coding requires the exclusive integration barrier; reopen before admitting more work" };

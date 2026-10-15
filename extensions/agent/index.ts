@@ -34,8 +34,12 @@ import { executionForSession } from "../execution-identity.ts";
 import { developerPreflight } from "./routing.ts";
 import { ownedDispatch, settlePendingDispatches } from "./dispatch.ts";
 import { resolveOwnedLive } from "./owner.ts";
+import { listCheckpoints, readCheckpoint } from "./checkpoints.ts";
 
 const noExtra = { additionalProperties: false } as const;
+const checkpointOrigin = Type.Object({ assignmentId: Type.String({ minLength: 1, maxLength: 128 }),
+  checkpointId: Type.String({ minLength: 1, maxLength: 128 }), commit: Type.String({ minLength: 1, maxLength: 256 }) },
+  { ...noExtra, description: "Explicit new Head continuation with checkpoints local; host validates exact saved source/index/root and positive predecessor/contributor closure. Does not apply a commit or restore sessions, DAG, ledger or acceptance." });
 
 function historyOrigin(
   source: HistoryOrigin["source"],
@@ -57,6 +61,22 @@ function historyOrigin(
 }
 
 export default function agentInstance(pi: ExtensionAPI): void {
+  pi.registerTool({
+    name: "agent_checkpoints", label: "Inspect local checkpoints",
+    description: "Foreground read-only local Git checkpoint list/read in the current repository, independent of live Head state. Reports saved identities, current saved-path matches, checkout dirt and historical evidence/gaps separately. Does not apply or adopt source. Missing history, a ref or terminal status alone is not closure or acceptance.",
+    parameters: Type.Union([
+      Type.Object({ action: Type.Literal("list"), assignmentId: Type.Optional(Type.String()) }, noExtra),
+      Type.Object({ action: Type.Literal("read"), ...checkpointOrigin.properties }, noExtra),
+    ]),
+    async execute(_id, params, _signal, _update, ctx) {
+      const blocked = childBlocked("agent_checkpoints");
+      if (blocked) return blocked;
+      try {
+        const details = params.action === "list" ? listCheckpoints(ctx.cwd, params.assignmentId) : readCheckpoint(ctx.cwd, params);
+        return { content: [{ type: "text", text: JSON.stringify(details) }], details };
+      } catch (error) { return errorResult(error instanceof Error ? error.message : String(error)); }
+    },
+  });
   let dispatchSessionId: string | undefined;
   pi.on?.("session_shutdown", async (_event, ctx) => {
     await settlePendingDispatches(dispatchSessionId ?? ctx?.sessionManager?.getSessionId?.());
@@ -235,7 +255,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "team_assign",
     label: "Assign Team role",
-    description: "Start one isolated Team role. Returns immediately. One assignment per role may run at a time.",
+    description: "Start one isolated Team role. Returns immediately. One assignment per role may run at a time. Only asynchronous developer mode head with explicit writes supports opt-in checkpoints local and checkpoint_origin continuation; neither grants publication or acceptance.",
     promptSnippet: "Assign independent work to a Team role",
     promptGuidelines: ["Use team_assign for independent long work. Keep task scoped. Do not wait or poll; interpret complete results automatically supplied in context. team_result is an optional diagnostic re-read, not a transport or acknowledgement."],
     parameters: Type.Object({
@@ -246,6 +266,8 @@ function registerTeamTools(pi: ExtensionAPI): void {
       boardTopicId: Type.Optional(Type.String({ description: "Existing Board topic ID; no topic is created" })),
       mode: Type.Optional(Type.Union([Type.Literal("single"), Type.Literal("head")])),
       writes: Type.Optional(Type.Array(Type.String(), { maxItems: 128 })),
+      checkpoints: Type.Optional(Type.Literal("local", { description: "Opt-in local source checkpoints for developer mode head only. Supported managed tools and cooperative foreground shell, not a sandbox." })),
+      checkpoint_origin: Type.Optional(checkpointOrigin),
     }, noExtra),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
@@ -253,7 +275,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
         const evaluation = evaluationFor(ctx);
         const id = randomUUID();
         const admission = reserveTeamRole(evaluation, params.role, id);
-        const head = createHead(id, ctx.cwd, headOptions, backgroundExecutor());
+        let head: ReturnType<typeof createHead>;
         let accepted = false;
         let durableWatch: { planId: string; unitId: string; execution?: ExecutionBinding } | undefined;
         return await ownedDispatch(ctx, signal, admission.owns, async (signal, check) => {
@@ -269,7 +291,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
           }
           const topic = await teamBoardTopic(params.boardTopicId, watch?.planId, ctx.cwd, plan?.meta, check);
           check();
-          const dispatch = params.role === "developer" && !head ? await developerPreflight({
+          const dispatch = params.role === "developer" && !headOptions ? await developerPreflight({
             task: params.task, toolCallId: _toolCallId, source: "team_assign", ctx, pi, signal,
             owns: () => { check(); return true; },
           }) : undefined;
@@ -291,6 +313,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
             params.task.trim(),
           ].join("\n");
           const launchRoot = execution?.executionRoot ?? ctx.cwd;
+          head = createHead(id, launchRoot, headOptions, backgroundExecutor());
           const origin = historyOrigin("team_assign", ctx, params.task, _toolCallId, execution, id);
           if (dispatch) {
             origin.routing = dispatch.routing;
@@ -546,7 +569,7 @@ function registerBackgroundTools(pi: ExtensionAPI): void {
     name: "agent_spawn",
     label: "Spawn agent",
     description:
-      "Start one Pitako role in the background and return its instance id while it is still running. Does not wait for the result. A failure is not permission to do that role in the parent.",
+      "Start one Pitako role in the background and return its instance id while it is still running. Does not wait for the result. A failure is not permission to do that role in the parent. Only asynchronous developer mode head with explicit writes supports opt-in checkpoints local and checkpoint_origin continuation; neither grants publication or acceptance.",
     promptSnippet: "Start a background Pitako role and return before it finishes",
     promptGuidelines: [
       "Use agent_spawn for long specialist work while you stay available. Interpret complete results automatically supplied in context; agent_result is an optional diagnostic re-read. Do not poll. If it fails, report the error. Do not do that role yourself.",
@@ -559,6 +582,8 @@ function registerBackgroundTools(pi: ExtensionAPI): void {
         unit: Type.Optional(Type.String({ description: "Unit id paired with plan" })),
         mode: Type.Optional(Type.Union([Type.Literal("single"), Type.Literal("head")])),
         writes: Type.Optional(Type.Array(Type.String(), { maxItems: 128 })),
+        checkpoints: Type.Optional(Type.Literal("local", { description: "Opt-in local source checkpoints for developer mode head only. Supported managed tools and cooperative foreground shell, not a sandbox." })),
+        checkpoint_origin: Type.Optional(checkpointOrigin),
       },
       noExtra,
     ),

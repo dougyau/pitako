@@ -2,13 +2,21 @@ import { loadPitakoConfig, resolveDeveloperHeadFromConfig } from "../../roles/lo
 import { currentWorkspace } from "../../board/workspace.ts";
 import { HeadGraph } from "./graph.ts";
 import { HeadAttachment, type HeadDagOptions } from "./runtime.ts";
+import type { CheckpointOrigin } from "../checkpoints.ts";
 
 /** Public validation happens before reservations, advice, or capability creation. */
-export function validateAgentMode(params: { role: string; mode?: string; writes?: string[] }, cwd: string,
+export function validateAgentMode(params: { role: string; mode?: string; writes?: string[]; checkpoints?: string; checkpoint_origin?: CheckpointOrigin }, cwd: string,
   asynchronous = true): Omit<HeadDagOptions, "executor"> | undefined {
   if (params.role === "developer_head") throw new Error("developer_head is internal; use developer with mode head");
   const mode = params.mode ?? "single";
   if (!["single", "head"].includes(mode)) throw new Error("invalid agent mode");
+  if (params.checkpoints !== undefined &&
+      (params.checkpoints !== "local" || params.role !== "developer" || mode !== "head" || !asynchronous)) {
+    throw new Error("checkpoints local requires asynchronous developer mode head");
+  }
+  if (params.checkpoint_origin !== undefined && (params.checkpoints !== "local" || !asynchronous || params.role !== "developer" || mode !== "head")) {
+    throw new Error("checkpoint_origin requires asynchronous developer mode head with checkpoints local");
+  }
   if (mode === "single") {
     if (params.writes !== undefined) throw new Error("writes requires developer mode head");
     return;
@@ -20,7 +28,8 @@ export function validateAgentMode(params: { role: string; mode?: string; writes?
   const config = loadPitakoConfig();
   const role = resolveDeveloperHeadFromConfig(config);
   if (!role.modelPolicy.primary) throw new Error(role.modelPolicy.diagnostic ?? "developer_head primary is not configured");
-  return { writes: [...params.writes], config };
+  return { writes: [...params.writes], config, ...(params.checkpoints ? { checkpoints: "local" as const } : {}),
+    ...(params.checkpoint_origin ? { checkpoint_origin: params.checkpoint_origin } : {}) };
 }
 
 export function createHead(assignmentId: string, cwd: string, options: ReturnType<typeof validateAgentMode>,

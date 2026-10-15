@@ -133,6 +133,17 @@ function bag(): Bag {
   return created;
 }
 
+/** Recovery uses positive durable closure too; retained host owners can only veto it. */
+export function assertCheckpointWorkersReleased(instanceId: string, assignmentId: string): void {
+  for (const row of bag().rows.values()) {
+    if (row.instanceId !== instanceId && row.teamAssignmentId !== assignmentId) continue;
+    if (row.closure.state !== "released" || row.live ||
+        row.handoff && !["reconciled", "inapplicable"].includes(row.handoff.bookkeeping)) {
+      throw new Error(`checkpoint predecessor retains a live/unknown owner or bookkeeping hold: ${instanceId}`);
+    }
+  }
+}
+
 export function bindBackgroundOwner(owner: BackgroundOwner): void {
   const state = bag();
   state.owner = owner;

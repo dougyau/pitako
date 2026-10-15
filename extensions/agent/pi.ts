@@ -22,6 +22,7 @@ import { createPublicProducer } from "./public-conversation.ts";
 import { AgentClosureError } from "./closure.ts";
 import { headExtension, leafScopeExtension } from "./head/tools.ts";
 import type { HeadAttachment } from "./head/runtime.ts";
+import { ManagedProducer, managedTools, managedGuard } from "./head/managed-tools.ts";
 
 // Package entry does not re-export this. Import the file next to the resolved entry.
 export let DEFAULT_THINKING_LEVEL: ThinkingLevel;
@@ -35,6 +36,7 @@ const sdkDefaultsReady = import(
 const childLifecycles = new WeakMap<AgentSession, { bound: boolean; disposal?: Promise<void>; history?: SessionHistory;
   live?: ReturnType<typeof createLiveHandle>; unbindLive?: () => void;
   head?: HeadAttachment; headBinding?: object; stopAbort?: () => void;
+  managed?: ManagedProducer; captureManaged?: (closure?: "released" | "unknown") => void;
   operations: Set<Promise<unknown>>; failures: unknown[]; abort?: Promise<void>; closing: boolean }>();
 
 function requestAbort(session: AgentSession): Promise<void> {
@@ -54,6 +56,7 @@ function disposeChildSession(session: AgentSession): Promise<void> {
   const lifecycle = childLifecycles.get(session)!;
   if (lifecycle.disposal) return lifecycle.disposal;
   lifecycle.closing = true;
+  lifecycle.managed?.cancel();
   if (lifecycle.headBinding) lifecycle.head?.unbind(lifecycle.headBinding);
   // Revoke live input synchronously; retain and join its exact close promise below.
   const liveClose = lifecycle.live?.handle.close();
@@ -68,6 +71,9 @@ function disposeChildSession(session: AgentSession): Promise<void> {
     const join = async (operation: () => unknown) => {
       try { await operation(); } catch (error) { failures.push(error); }
     };
+    await join(() => lifecycle.managed?.settle());
+    await join(() => lifecycle.managed?.assignment.assertHealthy());
+    await join(() => lifecycle.captureManaged?.());
     await join(async () => {
       const live = lifecycle.live;
       const captureFailed = (reason: "close_failed" | "capture_failed") => {
@@ -107,6 +113,7 @@ function disposeChildSession(session: AgentSession): Promise<void> {
       // Include native history disposition in the settled head, after all SDK producers.
       await lifecycle.live?.handle.publicConversation?.close(failures.length > 0 || !shutdownSettled || !disposalSettled || !historySettled);
     });
+    await join(() => lifecycle.captureManaged?.(failures.length ? "unknown" : "released"));
     if (failures.length) throw new AgentClosureError([...failures], `SDK session ${session.sessionId}`);
     unregisterExecution(session.sessionId);
   })();
@@ -446,6 +453,24 @@ async function openSession(
   let live: ReturnType<typeof createLiveHandle> | undefined;
   let nativeSession: AgentSession | undefined;
   const headBinding = input.head?.bind(input.instanceId);
+  const managedAssignment = input.head?.managed ?? input.scope?.managed;
+  const supported = new Set<string>();
+  const managed = managedAssignment ? new ManagedProducer(managedAssignment, {
+    writes: input.head ? input.head.dag!.graph.envelope : input.scope!.originalWrites,
+    check: () => {
+      if (!nativeSession) throw new Error("managed native session not bound");
+      if (input.head) {
+        input.head.check(headBinding!);
+        if (!input.head.dag!.codingAllowed(headBinding!)) throw new Error("Head coding requires the exclusive integration barrier");
+        return input.head.dag!.graph.revision;
+      }
+      return input.scope!.checkManaged(nativeSession.sessionId);
+    },
+    effects: () => input.head?.admitted(),
+    source: () => ({ kind: input.head ? "head" : "leaf", instanceId: input.instanceId,
+      groupId: input.sessionHistory!.invocation.group.groupId, historyId: input.sessionHistory!.historyId,
+      sessionId: nativeSession!.sessionId, ...(input.scope ? { runId: input.scope.runId } : {}) }),
+  }, input.signal) : undefined;
   const loader = input.factories.createLoader({
     cwd: input.cwd,
     agentDir,
@@ -458,8 +483,11 @@ async function openSession(
       pi.on("session_start", () => live?.handle.publicConversation?.reconcile());
       pi.on("session_compact", () => live?.handle.publicConversation?.reconcile());
     }, ...(input.head && headBinding ? [headExtension(input.head, headBinding, () => nativeSession!.sessionManager)] : []),
-    ...(input.scope ? [leafScopeExtension(input.scope, () => nativeSession!)] : [])],
-    appendSystemPrompt: [childInstructions(input.role, input.instanceId)],
+    ...(input.scope ? [leafScopeExtension(input.scope, () => nativeSession!)] : []),
+    ...(managed ? [managedGuard(supported, !!input.head)] : [])],
+    appendSystemPrompt: [childInstructions(input.role, input.instanceId), ...(managed ? [
+      "Managed local-source support: use the supported native file tools, known loaded apply_patch, or finite foreground bash within your canonical write reservation. No daemons, detached/remote writers or escaped descendants. Shell scope is cooperative, not confinement. Unsupported writing tools and unowned compositions are refused. Only the host-bound Head requests staging through head_checkpoint; leaves do not stage or commit independently. A checkpoint is local partial source, not acceptance, publication or final verification.",
+    ] : [])],
     skillsOverride: (base) => ({
       skills: base.skills.filter((skill) => allowed.has(skill.name)),
       diagnostics: base.diagnostics,
@@ -468,6 +496,8 @@ async function openSession(
   await loader.reload();
   input.scope?.assertStartup();
   if (input.signal.aborted) throw new Error("Agent session startup cancelled");
+  const customTools = managed ? managedTools(loader, managed) : undefined;
+  for (const definition of customTools ?? []) supported.add(definition.name);
   const thinkingLevel = model ? thinkingLevelFor(target.reasoning) : undefined;
   const { session } = await input.factories.createSession({
     cwd: input.cwd,
@@ -479,13 +509,30 @@ async function openSession(
     resourceLoader: loader,
     modelRuntime: runtime,
     excludeTools: [...ORCHESTRATION_TOOLS],
+    ...(customTools ? { customTools } : {}),
   });
   nativeSession = session;
   const lifecycle: NonNullable<ReturnType<typeof childLifecycles.get>> = {
-    bound: false, history: input.sessionHistory, head: input.head, headBinding, operations: new Set(), failures: [], closing: false,
+    bound: false, history: input.sessionHistory, head: input.head, headBinding, managed, operations: new Set(), failures: [], closing: false,
   };
+  if (managed) {
+    // Capture native IDs before retirement, never infer them from tool events/results text.
+    const identity = () => ({ kind: input.head ? "head" as const : "leaf" as const, instanceId: input.instanceId,
+      groupId: input.sessionHistory!.invocation.group.groupId, historyId: input.sessionHistory!.historyId,
+      sessionId: session.sessionId, observedRevision: input.head ? input.head.dag!.graph.revision : input.scope!.effectiveRevision,
+      ...(input.scope ? { runId: input.scope.runId } : {}) });
+    lifecycle.captureManaged = closure => {
+      if (closure) managedAssignment!.closed(input.sessionHistory!.historyId, closure);
+      else managedAssignment!.capture(identity(), session.sessionManager.getBranch());
+    };
+    if (input.head) input.head.bindCheckpointCapture(() => {
+      managedAssignment!.capture(identity(), session.sessionManager.getBranch());
+      return identity();
+    });
+  }
   childLifecycles.set(session, lifecycle);
   lifecycle.stopAbort = watchAbort(input.signal, () => {
+    managed?.cancel();
     input.head?.revoke();
     void lifecycle.live?.handle.close().catch(error => lifecycle.failures.push(error));
     void requestAbort(session).catch(() => {});
@@ -663,6 +710,7 @@ async function drive(
       }
       return failedAttempt(messageOf(error), sideEffects, handle, session, usage(), requests);
     } finally {
+      childLifecycles.get(session)?.captureManaged?.();
       await childLifecycles.get(session)?.live?.settle();
       finishRequest(input.signal.aborted ? "cancelled" : "failed");
       stopWatch();

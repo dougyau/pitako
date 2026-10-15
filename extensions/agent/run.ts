@@ -228,7 +228,7 @@ export function childInstructions(role: ResolvedRole, instanceId: string): strin
     "Your conversation is private. Do not assume you saw the parent session.",
     ...(role.id === "developer_head"
       ? ["Use only your host-granted head_* tools to coordinate local Developer leaves. Public agent_* and team_* orchestration remains unavailable."]
-      : ["Do not spawn other agents. agent_run, agent_supervise, agent_spawn, agent_status, agent_result, agent_observe, agent_input, agent_cancel, team_assign, team_status, team_result, and team_cancel are not available."]),
+      : ["Do not spawn other agents. agent_run, agent_supervise, agent_spawn, agent_status, agent_result, agent_observe, agent_input, agent_cancel, agent_checkpoints, team_assign, team_status, team_result, and team_cancel are not available."]),
     "Publish shared findings on the Board. Board contents are not injected here.",
     "Your rpiv-todo list is private to this session.",
     "The model and reasoning for this run come from this role's ModelPolicy, not from the parent session.",
@@ -298,7 +298,8 @@ export async function runAgentInstance(input: {
   const origin: HistoryOrigin | undefined = input.head?.dag || input.historyOrigin ? structuredClone({
     ...input.historyOrigin, source: input.historyOrigin?.source ?? "agent_run",
     workbrief: input.historyOrigin?.workbrief ?? input.task,
-    ...(input.head ? { head: { assignmentId: input.head.assignmentId, headInstanceId: instance.id } } : {}),
+    ...(input.head ? { assignmentId: input.head.assignmentId,
+      head: { assignmentId: input.head.assignmentId, headInstanceId: instance.id } } : {}),
   }) : undefined;
   if (input.head) {
     if (input.roleId !== "developer") throw new PitakoConfigError("Head attachment requires a Developer assignment");

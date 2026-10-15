@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext, ExtensionFactory } from "@earendil-works/pi-coding-agent";
@@ -37,14 +38,21 @@ type Leaf = {
   local?: Local; session?: any; task?: string;
 };
 async function harness(options: { maxParallel?: number; preflight?: HeadDagOptions["preflight"]; rootAlias?: boolean;
+  managed?: boolean;
   leafFallback?: boolean; workerPrompt?: NonNullable<Parameters<typeof controlledPi>[1]>["prompt"];
   prepareWorkers?: (workers: ReturnType<typeof controlledPi>) => void } = {}) {
   const ownedRoot = mkdtempSync(path.join(tmpdir(), "pitako-head-dag-"));
   fixture.directories.push(ownedRoot);
+  if (options.managed) {
+    execFileSync("git", ["init", "--quiet", ownedRoot]);
+    execFileSync("git", ["-C", ownedRoot, "-c", "user.name=Fixture", "-c", "user.email=fixture@invalid", "commit", "--quiet", "--allow-empty", "-m", "admission"]);
+  }
   const root = options.rootAlias ? path.join(ownedRoot, "checkout") : ownedRoot;
   if (options.rootAlias) symlinkSync(ownedRoot, root);
-  process.env.PI_CODING_AGENT_DIR = root;
-  const userConfigPath = path.join(root, "pitako", "config.toml");
+  const agentDir = options.managed ? mkdtempSync(path.join(tmpdir(), "pitako-managed-home-")) : root;
+  if (options.managed) fixture.directories.push(agentDir);
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  const userConfigPath = path.join(agentDir, "pitako", "config.toml");
   mkdirSync(path.dirname(userConfigPath), { recursive: true });
   writeFileSync(userConfigPath, `[model_policies.developer.primary]
 model = "fixture/selected"
@@ -59,7 +67,7 @@ ${options.leafFallback ? '[[model_policies.developer_mid.fallbacks]]\nmodel = "f
 [head_developer]
 max_parallel = ${options.maxParallel ?? 3}
 `);
-  const load = { userConfigPath, env: { PI_CODING_AGENT_DIR: root } };
+  const load = { userConfigPath, env: { PI_CODING_AGENT_DIR: agentDir } };
   const config = loadPitakoConfig(load);
   const leaves = new Map<string, Leaf>();
   const get = (id: string): Leaf => {
@@ -68,11 +76,12 @@ max_parallel = ${options.maxParallel ?? 3}
   };
   const starts: string[] = [];
   const leafLocals = new Map<object, Local>();
-  const workers = controlledPi(root, {
+  const workers = controlledPi(agentDir, {
     bind: async session => {
       const index = workers.sessionInputs.findIndex(input => input.sessionManager === session.sessionManager);
       const local = await bind(workers.loaderInputs[index].extensionFactories,
         (type, data) => { session.sessionManager.appendCustomEntry(type, data); });
+      for (const tool of workers.sessionInputs[index].customTools ?? []) local.tools.set(tool.name, tool);
       leafLocals.set(session, local);
       (session as any).steer = async () => "queued";
       session.getAllTools = () => ["read", "bash", "agent_run", "team_assign", ...local.tools.keys()].map(name => ({ name }));
@@ -100,13 +109,15 @@ max_parallel = ${options.maxParallel ?? 3}
   });
   options.prepareWorkers?.(workers);
   const head = new HeadAttachment("owned-assignment", ownedRoot, { writes: ["."], config,
+    ...(options.managed ? { checkpoints: "local" } : {}),
     executor: createPiExecutor({ factories: workers.factories }), preflight: options.preflight });
   let local!: Local, ctx!: ExtensionContext;
   const headEntered = deferred(), headFinish = deferred();
-  const host = controlledPi(root, {
+  const host = controlledPi(agentDir, {
     bind: async session => {
       local = await bind(host.loaderInputs[0].extensionFactories,
         (type, data) => { session.sessionManager.appendCustomEntry(type, data); });
+      for (const tool of host.sessionInputs[0].customTools ?? []) local.tools.set(tool.name, tool);
       ctx = { cwd: root, sessionManager: session.sessionManager, modelRegistry: {
         getAvailableOfType: async () => [{ id: config.developerRouting.classifierModel,
           provider: config.developerRouting.classifierProvider, contextWindow: 100000 }],
@@ -203,6 +214,47 @@ test("registered dispatch admits disjoint leaves simultaneously; delivery and te
   console.info("T3 parallel observation", JSON.stringify({ root: h.root, executionRoot: h.head.executionRoot, starts: h.starts,
     runs: [a.runId, b.runId, c.runId], nativePaths: h.workers.sessions.map(session => session.sessionManager.getSessionFile()),
     dependentStartedOnlyAfterClosedAndSatisfied: true }));
+  await h.finish();
+}));
+
+test("granted leaves keep independent managed reservations and closed native source identities", fixture.ownedCase("managed leaf producers", async () => {
+  const h = await harness({ managed: true, rootAlias: true });
+  await h.edit([node("a"), node("b")]);
+  const [a, b] = await h.start(["a", "b"]);
+  await Promise.all([h.get("a").entered.promise, h.get("b").entered.promise]);
+  const invoke = (id: string) => {
+    const leaf = h.get(id), session = leaf.session;
+    expect(session.active).toContain("write");
+    for (const tool of ["head_plan", "head_finish", "head_start"]) expect(session.active).not.toContain(tool);
+    return leaf.local!.tools.get("write")!.execute(`write-${id}`, { path: id, content: `owned ${id}\n` }, undefined, undefined,
+      { cwd: h.root, sessionManager: session.sessionManager }).then((result: any) => {
+        session.sessionManager.appendMessage({ role: "toolResult", toolName: "write", toolCallId: `write-${id}`,
+          content: result.content, isError: false, timestamp: Date.now() });
+      });
+  };
+  const first = invoke("a"), second = invoke("b");
+  expect(h.head.managed!.snapshot().active).toBe(2);
+  await Promise.all([first, second]);
+  expect(() => h.get("a").local!.tools.get("write")!.execute("escape", { path: "b", content: "no" }, undefined, undefined,
+    { cwd: h.root })).toThrow("write reservation");
+  const original = h.head.managed!.snapshot().inventory.admission;
+  expect(original!.root).toBe(realpathSync(h.root));
+  for (const id of ["a", "b"]) { h.get(id).finish.resolve(); h.get(id).releaseDispose.resolve(); }
+  await Promise.all([h.closed(a.runId), h.closed(b.runId)]);
+  const snapshot = h.head.managed!.snapshot();
+  expect(snapshot.inventory.admission).toEqual(original);
+  for (const run of [a, b]) {
+    expect(snapshot.native).toContainEqual(expect.objectContaining({
+      source: expect.objectContaining({ kind: "leaf", runId: run.runId, observedRevision: run.effectiveRevision }),
+      closure: "released", entries: [expect.objectContaining({ toolName: "write", isError: false })],
+    }));
+    await h.review(run.runId, run.effectiveRevision);
+  }
+  await h.call("head_plan", { action: "beginIntegration", expectedRevision: 1 });
+  expect(h.head.managed!.snapshot().inventory.admission).toEqual(original);
+  expect(h.head.managed!.snapshot().inventory.gaps).toEqual([]);
+  expect(readFileSync(path.join(h.root, "a"), "utf8")).toBe("owned a\n");
+  expect(readFileSync(path.join(h.root, "b"), "utf8")).toBe("owned b\n");
   await h.finish();
 }));
 

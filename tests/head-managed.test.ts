@@ -1,0 +1,236 @@
+import { expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { Type } from "typebox";
+import { createWriteToolDefinition, SessionManager, type ExtensionToolContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { AgentClosureError } from "../extensions/agent/closure.ts";
+import { AdmissionInventory, localGitEnv } from "../extensions/agent/head/inventory.ts";
+import { ManagedAssignment, ManagedProducer, foregroundBash, managedGuard, managedTools } from "../extensions/agent/head/managed-tools.ts";
+
+async function repository(body: (root: string, git: (args: string[], input?: string | Buffer, extra?: NodeJS.ProcessEnv) => Buffer) => Promise<void>) {
+  const root = mkdtempSync(path.join(tmpdir(), "pitako-managed-"));
+  const git = (args: string[], input?: string | Buffer, extra?: NodeJS.ProcessEnv) => execFileSync("git", args, {
+    cwd: root, env: { ...localGitEnv(), ...extra }, input, stdio: ["pipe", "pipe", "pipe"],
+  });
+  try {
+    git(["init", "--quiet"]);
+    git(["config", "user.name", "Fixture"]); git(["config", "user.email", "fixture@invalid"]);
+    for (const name of ["clean", "staged", "dirty", "flagged", "mode"]) writeFileSync(path.join(root, name), "base\n");
+    writeFileSync(path.join(root, ".gitignore"), "ignored/\n*.opaque\n");
+    git(["add", "."]); git(["commit", "--quiet", "-m", "admission"]);
+    await body(root, git);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}
+function producer(assignment: ManagedAssignment, options: { writes?: string[]; revision?: () => number;
+  effects?: () => void; signal?: AbortSignal; instance?: string } = {}) {
+  return new ManagedProducer(assignment, { writes: options.writes ?? [assignment.root], check: options.revision ?? (() => 0),
+    effects: options.effects ?? (() => {}),
+    source: () => ({ kind: "head", instanceId: options.instance ?? "instance", groupId: "group", historyId: "history", sessionId: "native" }),
+  }, options.signal ?? new AbortController().signal);
+}
+const context = (cwd: string) => ({ cwd }) as ExtensionToolContext;
+const result = { content: [{ type: "text" as const, text: "native result" }], details: undefined };
+
+test("immutable eligibility separates staged, working, untracked, ignored and flagged admission preimages", () => repository(async (root, git) => {
+  writeFileSync(path.join(root, "staged"), "staged\n"); git(["add", "staged"]);
+  writeFileSync(path.join(root, "dirty"), "dirty\n");
+  writeFileSync(path.join(root, "untracked"), "foreign\n");
+  git(["update-index", "--skip-worktree", "flagged"]);
+  symlinkSync("clean", path.join(root, "link")); git(["add", "link"]);
+  mkdirSync(path.join(root, "ignored")); writeFileSync(path.join(root, "ignored", "old"), "opaque");
+  const inventory = new AdmissionInventory(root, [root]);
+  expect(inventory.snapshot().unavailable).toBeUndefined();
+  for (const name of ["staged", "dirty", "untracked", "flagged", "link", "ignored/new", "absent.opaque"]) {
+    expect(inventory.eligibility(name).eligible).toBe(false);
+  }
+  expect(inventory.eligibility("clean").eligible).toBe(true);
+  expect(inventory.eligibility("absent").eligible).toBe(true);
+  const before = inventory.observe();
+  writeFileSync(path.join(root, "dirty"), "now managed\n"); chmodSync(path.join(root, "mode"), 0o755);
+  inventory.contributed(before, { kind: "head", instanceId: "i", groupId: "g", historyId: "h", sessionId: "s",
+    effectiveRevision: 0, toolCallId: "write", toolName: "write" }, "returned", [root]);
+  expect(inventory.eligibility("dirty").eligible).toBe(false);
+  expect(inventory.snapshot().contributions[0].changes.map(change => change.path)).toEqual(expect.arrayContaining(["dirty", "mode"]));
+  const snapshot = inventory.snapshot(); snapshot.admission!.paths.length = 0;
+  expect(inventory.eligibility("dirty").eligible).toBe(false);
+  writeFileSync(path.join(root, "clean"), "external\n"); inventory.observe();
+  expect(inventory.snapshot().gaps).toContain("unattributed change: clean");
+  git(["add", "dirty"]); inventory.observe();
+  expect(inventory.snapshot().gaps).toContain("repository, HEAD, real index, configuration or policy drift");
+  writeFileSync(path.join(root, ".gitignore"), "");
+  expect(inventory.eligibility("ignored/new").eligible).toBe(false);
+  expect(inventory.eligibility("absent.opaque").eligible).toBe(false);
+}));
+
+test("admission uses Git text/EOL semantics without executing an external filter", () => repository(async (root, git) => {
+  writeFileSync(path.join(root, ".gitattributes"), "clean text eol=crlf\n");
+  git(["add", ".gitattributes"]); git(["commit", "--quiet", "-m", "EOL policy"]);
+  writeFileSync(path.join(root, "clean"), "base\r\n");
+  expect(new AdmissionInventory(root, [root]).eligibility("clean").eligible).toBe(true);
+  writeFileSync(path.join(root, ".gitattributes"), "clean filter=external\n");
+  git(["config", "filter.external.clean", "touch FILTER_EXECUTED; cat"]);
+  const filtered = new AdmissionInventory(root, [root]);
+  expect(filtered.eligibility("clean").eligible).toBe(false);
+  expect(filtered.snapshot().admission!.paths.some(entry => entry.path === "FILTER_EXECUTED")).toBe(false);
+  expect(() => readFileSync(path.join(root, "FILTER_EXECUTED"))).toThrow();
+}));
+
+test("incomplete, sparse and missing repository inventories do not invent clean preimages", () => repository(async (root, git) => {
+  git(["config", "core.sparseCheckout", "true"]);
+  const unsupported = new AdmissionInventory(root, [root]);
+  expect(unsupported.snapshot().unavailable).toContain("sparse");
+  expect(unsupported.eligibility("absent").eligible).toBe(false);
+  const outside = mkdtempSync(path.join(tmpdir(), "pitako-no-git-"));
+  try { expect(new AdmissionInventory(outside, [outside]).eligibility("new").eligible).toBe(false); }
+  finally { rmSync(outside, { recursive: true }); }
+}));
+
+test("native reservation precedes suspension, revalidates revision, fences effects, owns async callbacks", () => repository(async root => {
+  const assignment = new ManagedAssignment(root, [root]);
+  let revision = 0, effects = 0, nativeCalls = 0;
+  const managed = producer(assignment, { revision: () => revision, effects: () => { effects++; } });
+  const entered = Promise.withResolvers<void>(), callback = Promise.withResolvers<void>();
+  const definition: ToolDefinition = { name: "write", label: "Native", description: "native", parameters: Type.Object({ path: Type.String() }),
+    async execute(_id, _params, _signal, onUpdate) { nativeCalls++; entered.resolve(); onUpdate?.(result); return result; } };
+  const wrapped = managed.wrap(definition);
+  const stale = wrapped.execute("stale", { path: "clean" }, undefined, undefined, context(root));
+  expect(() => assignment.assertIdle()).toThrow("still settling");
+  revision++;
+  await expect(stale).rejects.toThrow("revision changed");
+  expect(nativeCalls).toBe(0); expect(effects).toBe(0);
+  const movedContext = context(root);
+  const moved = wrapped.execute("moved", { path: "clean" }, undefined, undefined, movedContext);
+  movedContext.cwd = tmpdir();
+  await expect(moved).rejects.toThrow("launch root");
+  expect(nativeCalls).toBe(0); expect(effects).toBe(0);
+  const pending = wrapped.execute("live", { path: "clean" }, undefined, () => callback.promise, context(root));
+  try {
+    await entered.promise;
+    expect(effects).toBe(1);
+    expect(() => wrapped.execute("overlap", { path: "clean" }, undefined, undefined, context(root))).toThrow("slot is occupied");
+    expect(() => assignment.assertIdle()).toThrow("still settling");
+    let settled = false; void pending.then(() => { settled = true; });
+    await Promise.resolve(); expect(settled).toBe(false);
+  } finally { callback.resolve(); await pending; }
+  assignment.assertIdle();
+  managed.cancel();
+  expect(() => wrapped.execute("retired", { path: "clean" }, undefined, undefined, context(root))).toThrow("retired");
+}));
+
+test("scope and symlink/move checks refuse before mutation, disjoint native producers overlap", () => repository(async root => {
+  mkdirSync(path.join(root, "a")); mkdirSync(path.join(root, "b"));
+  symlinkSync(path.join(root, "b"), path.join(root, "a", "escape"));
+  const assignment = new ManagedAssignment(root, [root]);
+  const a = producer(assignment, { writes: [path.join(root, "a")] }), b = producer(assignment, { writes: [path.join(root, "b")] });
+  const write = a.wrap(createWriteToolDefinition(root));
+  expect(() => write.execute("escape", { path: "a/escape/new", content: "no" }, undefined, undefined, context(root))).toThrow("write reservation");
+  expect(() => write.execute("outside", { path: "../new", content: "no" }, undefined, undefined, context(root))).toThrow("launch root");
+  const patch = a.wrap({ name: "apply_patch", label: "Patch", description: "native parser", parameters: Type.Object({ patch: Type.String() }),
+    async execute() { throw new Error("must not invoke"); } });
+  expect(() => patch.execute("move", { patch: "*** Begin Patch\n*** Update File: a/old\n*** Move to: b/new\n@@\n-x\n+y\n*** End Patch\n" },
+    undefined, undefined, context(root))).toThrow("write reservation");
+  const enteredA = Promise.withResolvers<void>(), enteredB = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const delayed = (entered: typeof enteredA): ToolDefinition => ({ name: "write", label: "write", description: "controlled suspension",
+    parameters: Type.Object({ path: Type.String() }), async execute() { entered.resolve(); await release.promise; return result; } });
+  const first = a.wrap(delayed(enteredA)).execute("a", { path: "a/new" }, undefined, undefined, context(root));
+  const second = b.wrap(delayed(enteredB)).execute("b", { path: "b/new" }, undefined, undefined, context(root));
+  try { await Promise.all([enteredA.promise, enteredB.promise]); expect(assignment.snapshot().active).toBe(2); }
+  finally { release.resolve(); await Promise.allSettled([first, second]); }
+  assignment.assertIdle();
+}));
+
+test("owned foreground bash waits for stream/cancel settlement and reports timeout without unknown closure", () => repository(async root => {
+  const abort = new AbortController(), entered = Promise.withResolvers<void>();
+  let output = "";
+  const command = foregroundBash.exec("printf ready; read -r line < /dev/zero", root, {
+    signal: abort.signal, onData(bytes) { output += bytes.toString(); entered.resolve(); },
+  });
+  try { await entered.promise; abort.abort(); await expect(command).rejects.toThrow("aborted"); expect(output).toContain("ready"); }
+  finally { abort.abort(); await command.catch(() => {}); }
+  await expect(foregroundBash.exec("read -r line < /dev/zero", root, { timeout: 0.02, onData() {} })).rejects.toThrow("timeout:");
+  await expect(foregroundBash.exec("true", root, { timeout: Infinity, onData() {} })).rejects.toThrow("Invalid timeout");
+  const successful = await foregroundBash.exec("printf check", root, { onData(bytes) { output += bytes.toString(); } });
+  expect(successful.exitCode).toBe(0); expect(output).toContain("check");
+}));
+
+test("unknown producer closure blocks new work while a known pre-start refusal does not", () => repository(async root => {
+  const assignment = new ManagedAssignment(root, [root]), managed = producer(assignment);
+  const failed = managed.wrap({ name: "write", label: "write", description: "unknown native closure", parameters: Type.Object({ path: Type.String() }),
+    async execute() { throw new AgentClosureError([new Error("unjoined resource")], "native"); } });
+  await expect(failed.execute("failed", { path: "clean" }, undefined, undefined, context(root))).rejects.toBeInstanceOf(AgentClosureError);
+  expect(() => assignment.assertIdle()).toThrow(AgentClosureError);
+  expect(() => producer(assignment).wrap(createWriteToolDefinition(root)).execute("new", { path: "clean", content: "no" }, undefined, undefined, context(root)))
+    .toThrow(AgentClosureError);
+}));
+
+test("loaded known patch keeps native schema, grammar, rendering and output; replacements are unsupported", () => repository(async root => {
+  const entry = new URL("../extensions/index.ts", import.meta.resolve("pi-codex-tools"));
+  const definitions: ToolDefinition[] = [];
+  const extension = (await import(entry.href)).default;
+  const offline = process.env.PI_OFFLINE;
+  try {
+    process.env.PI_OFFLINE = "1";
+    await extension({ registerTool(definition: ToolDefinition) { definitions.push(definition); }, on() {} });
+  } finally {
+    if (offline === undefined) delete process.env.PI_OFFLINE; else process.env.PI_OFFLINE = offline;
+  }
+  const patch = definitions.find(definition => definition.name === "apply_patch")!;
+  const managed = producer(new ManagedAssignment(root, [root]));
+  const loader = (resolvedPath: string) => ({ getExtensions: () => ({ extensions: [{
+    resolvedPath, tools: new Map([["apply_patch", { definition: patch }]]),
+  }] }) }) as any;
+  const tools = managedTools(loader(entry.pathname), managed);
+  const wrapped = tools.find(definition => definition.name === "apply_patch")!;
+  expect(wrapped.parameters).toBe(patch.parameters); expect(wrapped.renderCall).toBe(patch.renderCall);
+  expect(wrapped.renderResult).toBe(patch.renderResult); expect(wrapped).toMatchObject({ promptSnippet: patch.promptSnippet });
+  expect((wrapped as any).constrainedSampling).toBe((patch as any).constrainedSampling);
+  const applied = await wrapped.execute("patch", { patch: "*** Begin Patch\n*** Add File: patched\n+native\n*** End Patch\n" }, undefined, undefined, {
+    ...context(root), model: { api: "openai-responses", compat: { supportsOpenAIGrammarTools: true } } as any,
+  });
+  expect(applied.details).toEqual({ changes: [{ kind: "added", path: "patched" }] });
+  expect(readFileSync(path.join(root, "patched"), "utf8")).toBe("native\n");
+  expect(managedTools(loader(import.meta.filename), managed).some(definition => definition.name === "apply_patch")).toBe(false);
+  let guard!: Function;
+  await managedGuard(new Set(tools.map(definition => definition.name)))({ on(_name: string, hook: Function) { guard = hook; } } as any);
+  for (const name of ["codemode", "mcp_write", "apply_patch_replacement"]) expect(guard({ toolName: name }).block).toBe(true);
+  for (const name of ["read", "todo", "head_plan", "bash"]) expect(guard({ toolName: name })).toBeUndefined();
+}));
+
+test("native evidence retains actual entry identities, errors, bounded excerpts and missing-result gaps", () => repository(async root => {
+  const assignment = new ManagedAssignment(root, [root]), native = SessionManager.inMemory(root);
+  const source = { kind: "head" as const, instanceId: "instance", groupId: "group", historyId: "history", sessionId: native.getSessionId() };
+  const managed = new ManagedProducer(assignment, { writes: [root], check: () => 0, effects() {}, source: () => source }, new AbortController().signal);
+  const result = await managed.wrap(createWriteToolDefinition(root)).execute("write-call", { path: "clean", content: "owned" },
+    undefined, undefined, context(root));
+  assignment.capture({ ...source, observedRevision: 0 }, native.getBranch());
+  expect(assignment.snapshot().native[0]!.gaps).toContain("No captured native result: write/write-call");
+  native.appendMessage({ role: "toolResult", toolCallId: "write-call", toolName: "write", ...result, isError: false, timestamp: Date.now() });
+  native.appendMessage({ role: "toolResult", toolCallId: "check-call", toolName: "fixture_check",
+    content: [{ type: "text", text: "failed ".repeat(500) }], isError: true, timestamp: Date.now() });
+  assignment.capture({ ...source, observedRevision: 0 }, native.getBranch());
+  const record = assignment.snapshot().native[0]!;
+  expect(record.gaps).toEqual([]);
+  expect(record.closure).toBe("observed"); // A result is not a closure witness.
+  expect(record.entries.at(-1)).toMatchObject({ entryId: native.getLeafId(), toolCallId: "check-call", isError: true, truncated: true });
+  expect(record.entries.at(-1)!.excerpt.length).toBe(2048);
+}));
+
+test("fixed argv private-index/object/commit/ref/read seam leaves branch and real index untouched", () => repository(async (root, git) => {
+  const head = git(["rev-parse", "HEAD"]).toString().trim(), branch = git(["symbolic-ref", "HEAD"]).toString().trim();
+  const index = readFileSync(path.join(root, ".git/index"));
+  const env = { GIT_INDEX_FILE: path.join(root, ".git", "private-index") };
+  git(["read-tree", head], undefined, env);
+  const blob = git(["hash-object", "-w", "--stdin"], "private checkpoint\n", env).toString().trim();
+  git(["update-index", "--add", "--cacheinfo", "100644", blob, "clean"], undefined, env);
+  const tree = git(["write-tree"], undefined, env).toString().trim();
+  const commit = git(["-c", "commit.gpgsign=false", "commit-tree", tree, "-p", head], "private seam\n", env).toString().trim();
+  git(["update-ref", "refs/pitako-fixture/one", commit, "0".repeat(head.length)], undefined, env);
+  expect(git(["rev-parse", "refs/pitako-fixture/one"]).toString().trim()).toBe(commit);
+  expect(git(["show", "refs/pitako-fixture/one:clean"]).toString()).toBe("private checkpoint\n");
+  expect(git(["rev-parse", "HEAD"]).toString().trim()).toBe(head);
+  expect(git(["symbolic-ref", "HEAD"]).toString().trim()).toBe(branch);
+  expect(readFileSync(path.join(root, ".git/index"))).toEqual(index);
+  expect(readFileSync(path.join(root, "clean"), "utf8")).toBe("base\n");
+}));

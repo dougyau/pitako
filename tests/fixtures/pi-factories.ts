@@ -32,6 +32,7 @@ export function controlledPi(root: string, options: {
   prompt?: (session: Session, text: string) => Promise<void> | void;
   dispose?: (session: Session) => Promise<void> | void;
   abort?: (session: Session) => Promise<void> | void;
+  extensions?: Array<{ resolvedPath: string; tools: Map<string, { definition: any }> }>;
 } = {}) {
   const models = options.models ?? [controlledModel()];
   const sessions: Session[] = [];
@@ -50,7 +51,9 @@ export function controlledPi(root: string, options: {
     getAgentDir: () => root,
     createSettings: () => ({ getModelThinkingLevel() {}, getDefaultThinkingLevel() {} }) as never,
     createCodemode: () => () => {},
-    createLoader(input) { loaderInputs.push(input); return { async reload() {} } as never; },
+    createLoader(input) { loaderInputs.push(input); return {
+      async reload() {}, getExtensions: () => ({ extensions: options.extensions ?? [], errors: [] }),
+    } as never; },
     async createSession(input) {
       sessionInputs.push(input);
       const listeners = new Set<(event: any) => void>();
