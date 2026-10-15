@@ -50,6 +50,10 @@ describe("stack configuration", () => {
     expect(manifest.bundledDependencies).not.toContain("@ast-grep/napi");
     expect(manifest.dependencies["@dietrichgebert/ponytail"]).toBe("4.10.0");
     expect(manifest.dependencies["@juicesharp/rpiv-todo"]).toBe("2.11.0");
+    expect(stack.required.find(({ id }) => id === "@juicesharp/rpiv-todo")).toEqual({
+      id: "@juicesharp/rpiv-todo", spec: "@juicesharp/rpiv-todo@2.11.0",
+      entry: "extensions/todo.ts", tools: ["todo"],
+    });
     expect(manifest.dependencies["pi-hermes-memory"]).toBe("0.9.9");
     expect(manifest.bundledDependencies).toContain("pi-hermes-memory");
     expect(manifest.dependencies["billion-context-pi"]).toBe("0.1.83");

@@ -35,7 +35,7 @@
     {
       "id": "@juicesharp/rpiv-todo",
       "spec": "@juicesharp/rpiv-todo@2.11.0",
-      "entry": "node_modules/@juicesharp/rpiv-todo/index.ts",
+      "entry": "extensions/todo.ts",
       "tools": ["todo"]
     },
     {

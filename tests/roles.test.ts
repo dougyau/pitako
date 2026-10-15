@@ -565,7 +565,7 @@ reasoning = "high"
   test("declares Board, todo and coding resources", () => {
     const manifest = JSON.parse(readFileSync(path.join(packageRoot(), "package.json"), "utf8")).pi;
     expect(manifest.extensions).toContain("./extensions/board/index.ts");
-    expect(manifest.extensions).toContain("./node_modules/@juicesharp/rpiv-todo/index.ts");
+    expect(manifest.extensions).toContain("./extensions/todo.ts");
     expect(manifest.skills).toContain("./skills/practical");
     expect(manifest.skills).toContain("./node_modules/@dietrichgebert/ponytail/skills/ponytail");
   });

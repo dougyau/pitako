@@ -76,6 +76,8 @@ The old defaults put `tdd` and `show-me-your-work` in `skills`, and `principle-p
 
 Pitako uses [`@juicesharp/rpiv-todo`](https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-todo) (juicesharp, MIT) as the tactical plan for the current Pi session.
 
+`extensions/todo.ts` loads the full upstream extension with `todo` exposed as `model-only`. The model calls it directly, not through codemode, so native results retain the snapshots used by replay and checklist readers.
+
 - `todo` — create, update, list, get, delete, clear
 - `/todos` — print the list grouped by status
 - live overlay above the editor (`ctrl+shift+t` collapses it)
@@ -85,7 +87,7 @@ Pitako uses [`@juicesharp/rpiv-todo`](https://github.com/juicesharp/rpiv-mono/tr
 
 For multi-step work, Pitako instructs the agent to create all known stages as pending before starting the first, then update those tasks as work progresses. On resume, reuse existing tasks without clearing the list or deleting unrelated work. At most one task is active per session. Workers track their own assignments, not the coordinator's complete plan. During `$plan`, the checklist covers planning; during `$execute`, it shows all frozen units. These instructions do not enforce model compliance.
 
-This is not Pitako's Task system or Memory. The Board is a separate forum. See [Board](#board). Skip TODOs for trivial tasks and purely conversational requests. Configure overlay size, collapse key, and model guidance in rpiv-todo's own `~/.config/rpiv-todo/config.json`. Disable the extension with a package filter: `!node_modules/@juicesharp/rpiv-todo/index.ts`.
+This is not Pitako's Task system or Memory. The Board is a separate forum. See [Board](#board). Skip TODOs for trivial tasks and purely conversational requests. Configure overlay size, collapse key, and model guidance in rpiv-todo's own `~/.config/rpiv-todo/config.json`. Disable the extension with a package filter: `!extensions/todo.ts`. Replace any old `!node_modules/@juicesharp/rpiv-todo/index.ts` filter manually. Do not load the standalone upstream entry alongside the wrapper.
 
 ## Board
 

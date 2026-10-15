@@ -4,7 +4,9 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, spyOn, test } from "bun:test";
 import * as acp from "billion-context-pi";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import * as rpivTodo from "@juicesharp/rpiv-todo";
+import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import {
   DEFAULT_SKILL_NAMES,
   EXCLUDED_SKILL_NAMES,
@@ -22,6 +24,39 @@ function readRepo(relative: string): string {
 }
 
 describe("engineering-layer composition", () => {
+  test("TODO composition preserves upstream registration except for model-only exposure", async () => {
+    const todo: ToolDefinition = {
+      name: "todo", label: "TODO", description: "controlled upstream tool",
+      parameters: Type.Object({}), execute: async () => ({ content: [], details: { tasks: [] } }),
+    };
+    const other = { ...todo, name: "other", exposure: "codemode" as const };
+    const tools: ToolDefinition[] = [];
+    const pi = {
+      registerTool(tool: ToolDefinition) { tools.push(tool); },
+      on() { return () => {}; },
+      registerCommand() {},
+    };
+    let forwarded: ExtensionAPI | undefined;
+    const registration = spyOn(rpivTodo, "default").mockImplementation(api => {
+      forwarded = api;
+      api.registerTool(todo);
+      api.registerTool(other);
+    });
+    try {
+      const extension = await import("../extensions/todo.ts");
+      extension.default(pi as unknown as ExtensionAPI);
+      expect(registration).toHaveBeenCalledTimes(1);
+      expect(forwarded?.on).toBe(pi.on);
+      expect(forwarded?.registerCommand).toBe(pi.registerCommand);
+      expect(tools).toEqual([{ ...todo, exposure: "model-only" }, other]);
+      expect(tools[0]?.execute).toBe(todo.execute);
+      expect(tools[1]).toBe(other);
+      expect(todo.exposure).toBeUndefined();
+    } finally {
+      registration.mockRestore();
+    }
+  });
+
   test("ACP defaults disable implicit bash deadlines without starting the external runtime", async () => {
     const factory = () => {};
     const registration = spyOn(acp, "createAcpExtension").mockReturnValue(factory);
@@ -43,7 +78,9 @@ describe("engineering-layer composition", () => {
     expect(manifest.extensions[0]).toBe("./extensions/index.ts");
     for (const entry of ["./extensions/board/index.ts", "./extensions/agent/index.ts",
       "./node_modules/@vndv/pi-codegraph/extensions/codegraph.ts", "./node_modules/pi-lsp-client/src/index.ts",
-      "./node_modules/@juicesharp/rpiv-todo/index.ts"]) expect(manifest.extensions).toContain(entry);
+      "./extensions/todo.ts"]) expect(manifest.extensions).toContain(entry);
+    expect(manifest.extensions.filter((entry: string) => entry === "./extensions/todo.ts")).toHaveLength(1);
+    expect(manifest.extensions).not.toContain("./node_modules/@juicesharp/rpiv-todo/index.ts");
     expect(manifest.extensions.some((entry: string) => entry.includes("ponytail"))).toBe(false);
     const skills = manifest.skills.filter((entry: string) => !entry.includes("node_modules"));
     expect(skills).toEqual(expect.arrayContaining(["./skills/pitako-coding", "./skills/practical", "./skills/principles"]));
