@@ -39,7 +39,7 @@ import { listCheckpoints, readCheckpoint } from "./checkpoints.ts";
 const noExtra = { additionalProperties: false } as const;
 const checkpointOrigin = Type.Object({ assignmentId: Type.String({ minLength: 1, maxLength: 128 }),
   checkpointId: Type.String({ minLength: 1, maxLength: 128 }), commit: Type.String({ minLength: 1, maxLength: 256 }) },
-  { ...noExtra, description: "Explicit new Head continuation with checkpoints local; host validates exact saved source/index/root and positive predecessor/contributor closure. Does not apply a commit or restore sessions, DAG, ledger or acceptance." });
+  { ...noExtra, description: "Explicit new asynchronous Developer Head continuation; host validates exact saved source/index/root and positive predecessor/contributor closure. Does not apply a commit or restore sessions, DAG, ledger or acceptance." });
 
 function historyOrigin(
   source: HistoryOrigin["source"],
@@ -255,7 +255,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "team_assign",
     label: "Assign Team role",
-    description: "Start one isolated Team role. Returns immediately. One assignment per role may run at a time. Only asynchronous developer mode head with explicit writes supports opt-in checkpoints local and checkpoint_origin continuation; neither grants publication or acceptance.",
+    description: "Start one isolated Team role. Returns immediately. One assignment per role may run at a time. Every asynchronous developer mode head with explicit writes has local checkpoints and supports explicit checkpoint_origin continuation; neither grants publication or acceptance.",
     promptSnippet: "Assign independent work to a Team role",
     promptGuidelines: ["Use team_assign for independent long work. Keep task scoped. Do not wait or poll; interpret complete results automatically supplied in context. team_result is an optional diagnostic re-read, not a transport or acknowledgement."],
     parameters: Type.Object({
@@ -266,7 +266,6 @@ function registerTeamTools(pi: ExtensionAPI): void {
       boardTopicId: Type.Optional(Type.String({ description: "Existing Board topic ID; no topic is created" })),
       mode: Type.Optional(Type.Union([Type.Literal("single"), Type.Literal("head")])),
       writes: Type.Optional(Type.Array(Type.String(), { maxItems: 128 })),
-      checkpoints: Type.Optional(Type.Literal("local", { description: "Opt-in local source checkpoints for developer mode head only. Supported managed tools and cooperative foreground shell, not a sandbox." })),
       checkpoint_origin: Type.Optional(checkpointOrigin),
     }, noExtra),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -569,7 +568,7 @@ function registerBackgroundTools(pi: ExtensionAPI): void {
     name: "agent_spawn",
     label: "Spawn agent",
     description:
-      "Start one Pitako role in the background and return its instance id while it is still running. Does not wait for the result. A failure is not permission to do that role in the parent. Only asynchronous developer mode head with explicit writes supports opt-in checkpoints local and checkpoint_origin continuation; neither grants publication or acceptance.",
+      "Start one Pitako role in the background and return its instance id while it is still running. Does not wait for the result. A failure is not permission to do that role in the parent. Every asynchronous developer mode head with explicit writes has local checkpoints and supports explicit checkpoint_origin continuation; neither grants publication or acceptance.",
     promptSnippet: "Start a background Pitako role and return before it finishes",
     promptGuidelines: [
       "Use agent_spawn for long specialist work while you stay available. Interpret complete results automatically supplied in context; agent_result is an optional diagnostic re-read. Do not poll. If it fails, report the error. Do not do that role yourself.",
@@ -582,7 +581,6 @@ function registerBackgroundTools(pi: ExtensionAPI): void {
         unit: Type.Optional(Type.String({ description: "Unit id paired with plan" })),
         mode: Type.Optional(Type.Union([Type.Literal("single"), Type.Literal("head")])),
         writes: Type.Optional(Type.Array(Type.String(), { maxItems: 128 })),
-        checkpoints: Type.Optional(Type.Literal("local", { description: "Opt-in local source checkpoints for developer mode head only. Supported managed tools and cooperative foreground shell, not a sandbox." })),
         checkpoint_origin: Type.Optional(checkpointOrigin),
       },
       noExtra,

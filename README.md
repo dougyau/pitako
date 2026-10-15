@@ -295,15 +295,11 @@ extra exterior Developer or waiver of coordinator acceptance. Details:
 [Engineering layer](docs/engineering.md#assignment-local-head-developer) and
 [Worker history](docs/worker-history.md#head-developer-history).
 
-To permit partial-work saves, add `checkpoints: "local"` to an asynchronous
-Developer Head request. This is per assignment, not a configuration default:
-
-```json
-{ "role": "developer", "mode": "head", "writes": ["src", "tests"], "checkpoints": "local", "task": "Bounded WorkBrief" }
-```
-
-The granted Head chooses when to call `head_checkpoint`. Foreground
-`agent_checkpoints` discovers saved refs without a live Head. Explicit new
+Every asynchronous Developer Head has `head_checkpoint` from admission, without
+an activation field. The Head chooses useful quiescent progress points for fast
+recovery; availability does not automatically create checkpoints or require one
+per tool. Unsupported repositories truthfully refuse creation.
+Foreground `agent_checkpoints` discovers saved refs without a live Head. Explicit new
 continuation can supply `checkpoint_origin: { assignmentId, checkpointId, commit }`.
 The host requires compatible exact source and positive predecessor/contributor
 closure. It does not apply commits or restore sessions, the DAG, or acceptance.

@@ -59,7 +59,7 @@ export function headExtension(attachment: HeadAttachment, binding: object,
         localTools.add("head_checkpoint");
         pi.registerTool({
           name: "head_checkpoint", label: "Local Head checkpoint",
-          description: "Granted Head only: create a local Git checkpoint or list/read this assignment's checkpoints. Requires physically released writers/operations; pending nodes are allowed. Creation leases out writes and graph/integration changes. Use the current revision and literal relative file paths; any rejection refuses the whole write. Committed/refused/uncertain results do not satisfy nodes, final verification, acceptance or publication. Inspect uncertain identity before any retry.",
+          description: "Developer Head: create a local Git checkpoint or list/read this assignment's checkpoints. Available from admission; creation requires supported Git and physically released writers/operations; pending nodes are allowed. Creation leases out writes and graph/integration changes. Use the current revision and literal relative file paths; any rejection refuses the whole write. Committed/refused/uncertain results do not satisfy nodes, final verification, acceptance or publication. Inspect uncertain identity before any retry.",
           parameters: Type.Union([
             Type.Object({ action: Type.Literal("create"), expectedRevision: revision,
               paths: Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), { minItems: 1, maxItems: 256 }),

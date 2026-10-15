@@ -38,19 +38,19 @@ type Leaf = {
   local?: Local; session?: any; task?: string;
 };
 async function harness(options: { maxParallel?: number; preflight?: HeadDagOptions["preflight"]; rootAlias?: boolean;
-  managed?: boolean;
+  gitRepository?: boolean;
   leafFallback?: boolean; workerPrompt?: NonNullable<Parameters<typeof controlledPi>[1]>["prompt"];
   prepareWorkers?: (workers: ReturnType<typeof controlledPi>) => void } = {}) {
   const ownedRoot = mkdtempSync(path.join(tmpdir(), "pitako-head-dag-"));
   fixture.directories.push(ownedRoot);
-  if (options.managed) {
+  if (options.gitRepository) {
     execFileSync("git", ["init", "--quiet", ownedRoot]);
     execFileSync("git", ["-C", ownedRoot, "-c", "user.name=Fixture", "-c", "user.email=fixture@invalid", "commit", "--quiet", "--allow-empty", "-m", "admission"]);
   }
   const root = options.rootAlias ? path.join(ownedRoot, "checkout") : ownedRoot;
   if (options.rootAlias) symlinkSync(ownedRoot, root);
-  const agentDir = options.managed ? mkdtempSync(path.join(tmpdir(), "pitako-managed-home-")) : root;
-  if (options.managed) fixture.directories.push(agentDir);
+  const agentDir = options.gitRepository ? mkdtempSync(path.join(tmpdir(), "pitako-managed-home-")) : root;
+  if (options.gitRepository) fixture.directories.push(agentDir);
   process.env.PI_CODING_AGENT_DIR = agentDir;
   const userConfigPath = path.join(agentDir, "pitako", "config.toml");
   mkdirSync(path.dirname(userConfigPath), { recursive: true });
@@ -109,7 +109,6 @@ max_parallel = ${options.maxParallel ?? 3}
   });
   options.prepareWorkers?.(workers);
   const head = new HeadAttachment("owned-assignment", ownedRoot, { writes: ["."], config,
-    ...(options.managed ? { checkpoints: "local" } : {}),
     executor: createPiExecutor({ factories: workers.factories }), preflight: options.preflight });
   let local!: Local, ctx!: ExtensionContext;
   const headEntered = deferred(), headFinish = deferred();
@@ -183,7 +182,9 @@ test("registered dispatch admits disjoint leaves simultaneously; delivery and te
   expect(h.get("a").task).not.toContain("SECRET");
   expect(h.get("a").session.active).toContain("head_scope_ack");
   expect(h.get("a").session.active).not.toContain("agent_run");
-  expect([...h.get("a").local!.tools.keys()]).toEqual(["head_scope_ack"]);
+  expect(h.get("a").local!.tools.has("head_scope_ack")).toBe(true);
+  expect(h.get("a").local!.tools.has("head_checkpoint")).toBe(false);
+  expect(h.get("a").local!.tools.has("write")).toBe(true);
   h.get("a").finish.resolve();
   await h.get("a").disposing.promise;
   expect((await h.result(a.runId)).envelope).toBeUndefined();
@@ -218,7 +219,7 @@ test("registered dispatch admits disjoint leaves simultaneously; delivery and te
 }));
 
 test("granted leaves keep independent managed reservations and closed native source identities", fixture.ownedCase("managed leaf producers", async () => {
-  const h = await harness({ managed: true, rootAlias: true });
+  const h = await harness({ gitRepository: true, rootAlias: true });
   await h.edit([node("a"), node("b")]);
   const [a, b] = await h.start(["a", "b"]);
   await Promise.all([h.get("a").entered.promise, h.get("b").entered.promise]);

@@ -253,9 +253,12 @@ token savings, elapsed-time savings or model competence.
 
 ### Local source checkpoints
 
-Optional `checkpoints: "local"` adds managed source capture to an asynchronous
-Developer Head, including its leaves. The host captures immutable eligibility
-at admission, separately from later observed contributions. Initial foreign
+Every asynchronous Developer Head uses managed source capture from construction,
+including its leaves, without an activation flag. Checkpoint availability is not
+automatic creation or recovery; the Head chooses quiescent progress points.
+Unavailable inventory refuses checkpoint creation rather than falling back to
+unmanaged writers. The host captures immutable eligibility at admission,
+separately from later observed contributions. Initial foreign
 preimages and ignored regions cannot become eligible through a managed edit or
 a satisfied judgment. Selecting a path grants no authority or hunk authorship.
 

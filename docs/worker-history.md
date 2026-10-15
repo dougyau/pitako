@@ -68,12 +68,16 @@ read contracts below are unchanged.
 
 ### Local source checkpoints
 
-Only asynchronous `agent_spawn` and `team_assign` with `role: "developer"`,
-`mode: "head"`, explicit `writes`, and `checkpoints: "local"` grant checkpointing.
-Omission preserves ordinary behavior. Other roles, modes, and synchronous
-entrypoints reject the grant. This does not change any ModelPolicy.
+Every asynchronous `agent_spawn` and `team_assign` with `role: "developer"`,
+`mode: "head"`, and explicit `writes` has checkpoint capability from admission.
+No activation field is required. Other roles, modes, synchronous entrypoints,
+and leaves do not gain Head checkpoint authority. This does not change any ModelPolicy.
 Only the host-bound Head requests staging through `head_checkpoint`; leaves
 do not stage or commit independently.
+
+The Head chooses useful quiescent progress points for fast recovery, not a save
+per tool. Availability does not automatically create, restart, reset, check out,
+or adopt anything. Unsupported repositories refuse creation truthfully.
 
 `head_checkpoint` supports these requests for its own assignment:
 
@@ -129,7 +133,8 @@ evidence references, linked members, and `closureGaps`. Its tested source is
 Missing history permits inspection with gaps, not adoption.
 
 Explicit new Head continuation adds
-`checkpoint_origin: { assignmentId, checkpointId, commit }` to the local grant.
+`checkpoint_origin: { assignmentId, checkpointId, commit }` to the asynchronous
+Developer Head request, without a second activation field.
 Before a writable baseline or prompt, the host requires the same repository and
 worktree, compatible admission HEAD and real index, exact saved raw content and
 mode, compatible configuration, and a new envelope covering all cumulative saved

@@ -47,9 +47,9 @@ export class HeadAttachment {
     this.signal = this.controller.signal;
     if (options) this.dag = new HeadDagRuntime(this, options);
     assertNoCheckpointLease(this.dag?.graph.root ?? executionRoot);
-    if (options?.checkpoints === "local") {
-      this.checkpointOrigin = options.checkpoint_origin && adoptCheckpoint(this.dag!.graph.root, options.checkpoint_origin, this.dag!.graph.envelope);
-      this.managed = new ManagedAssignment(this.dag!.graph.root, this.dag!.graph.envelope, this.checkpointOrigin);
+    if (this.dag) {
+      this.checkpointOrigin = options?.checkpoint_origin && adoptCheckpoint(this.dag.graph.root, options.checkpoint_origin, this.dag.graph.envelope);
+      this.managed = new ManagedAssignment(this.dag.graph.root, this.dag.graph.envelope, this.checkpointOrigin);
     }
   }
 
@@ -246,7 +246,6 @@ export interface HeadDagOptions {
   writes: string[];
   config: PitakoConfig;
   executor: AttemptExecutor;
-  checkpoints?: "local";
   checkpoint_origin?: CheckpointOrigin;
   /** Host boundary injection for controlled tests; snapshots still confer no start authority. */
   preflight?: typeof developerCapacityPreflight;
