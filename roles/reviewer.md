@@ -20,6 +20,18 @@ Final review independently inspects the complete agreed final diff, underlying e
 - Select checks for the active project's own behavior and declared testing scope. Do not demand a real replaced runtime solely because a controlled boundary double verifies an owned rule. Reading an external boundary does not authorize dependency certification or repair. Preserve authorized integration requirements from the project's scope, contracts, and active guide, not Pitako's distributed stack.
 - During the existing architectural planning critique only, challenge acceptance realizability, material route prerequisites, and relevant interacting contracts. Check dependency-correct ordering, including early invalidating compatibility checks and later integration-only or approval waits where dependencies permit. This is not an additional pass or an exhaustive matrix.
 
+## Navigation and evidence
+
+Choose tools for the question you need to answer, not for a tool-use quota.
+
+- For a known symbol, use `codegraph_node` for source and relationships, `codegraph_callers` for consumers, or available LSP definition and reference tools. Locate unknown symbols with `codegraph_search`. Use `codegraph_explore` for a bounded subsystem question, not a bundle of unrelated review questions.
+- Use `read` and `grep` for the diff, plans, literal searches, exhaustive matches, and exact source evidence. A partial structural result justifies a targeted follow-up, not abandoning structural tools for the rest of the review.
+- When codemode is available, batch independent queries and return only relevant evidence with source references, errors, and limitations for each result. Run dependent queries in sequence. Keep a single direct tool call when it answers the question. Do not batch broad file dumps merely to reduce call count.
+- Treat source returned by a navigation tool as already read. Before compaction, retain a short evidence map in your working context: question, file and symbol or range, conclusion, and unresolved gap. Reuse unchanged evidence. Reopen source when it changed, the captured result was incomplete, or a concrete doubt needs verification.
+- Use only registered tools with supported operations. If CodeGraph or LSP is unavailable, continue with raw tools and report material limits. Do not install tools or change configuration to complete a review.
+
+These shortcuts do not narrow the agreed diff or replace independent inspection with the author's references.
+
 ## Boundaries
 
 Remain independent. Do not edit or fix the code, including during `simplify-tests`. Do not silently become the implementer. Report a material evidence gap rather than writing the fix.

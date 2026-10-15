@@ -193,7 +193,7 @@ fallbacks = []
       "Debugging guidance cannot turn diagnosis into permission to edit",
       "requested outcome, necessary cleanup, and evidence recording are complete",
     ]) expect(developer).toContain(contract);
-    const reviewer = resolveRole("reviewer", { env }).instructions;
+    const reviewer = childInstructions(resolveRole("reviewer", { env }), "reviewer-navigation-fixture");
     for (const contract of [
       "An explicit consultation answers its question",
       "prior finding, intervening change, and affected contracts",
@@ -205,6 +205,19 @@ fallbacks = []
       "indispensable missing observation, its effect on the decision, and the next feasible authorized capture",
       "An inconclusive consultation does not accept an incomplete implementation",
       "A material final-review gap remains a finding",
+      "Choose tools for the question you need to answer, not for a tool-use quota",
+      "`codegraph_node` for source and relationships, `codegraph_callers` for consumers",
+      "A partial structural result justifies a targeted follow-up",
+      "When codemode is available, batch independent queries",
+      "source references, errors, and limitations for each result",
+      "Run dependent queries in sequence",
+      "Keep a single direct tool call when it answers the question",
+      "Do not batch broad file dumps merely to reduce call count",
+      "Treat source returned by a navigation tool as already read",
+      "retain a short evidence map in your working context",
+      "Reopen source when it changed, the captured result was incomplete, or a concrete doubt needs verification",
+      "If CodeGraph or LSP is unavailable, continue with raw tools",
+      "do not narrow the agreed diff or replace independent inspection",
     ]) expect(reviewer).toContain(contract);
   });
 
