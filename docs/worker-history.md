@@ -66,6 +66,111 @@ An unobserved offer may replay the same envelope ID with a delivery gap, never
 silently become a receipt. Ordinary catalog selectors, pagination and native
 read contracts below are unchanged.
 
+### Local source checkpoints
+
+Every asynchronous `agent_spawn` and `team_assign` with `role: "developer"`,
+`mode: "head"`, and explicit `writes` has checkpoint capability from admission.
+No activation field is required. Other roles, modes, synchronous entrypoints,
+and leaves do not gain Head checkpoint authority. This does not change any ModelPolicy.
+Only the host-bound Head requests staging through `head_checkpoint`; leaves
+do not stage or commit independently.
+
+The Head chooses useful quiescent progress points for fast recovery, not a save
+per tool. Availability does not automatically create, restart, reset, check out,
+or adopt anything. Unsupported repositories refuse creation truthfully.
+
+`head_checkpoint` supports these requests for its own assignment:
+
+```json
+{ "action": "create", "expectedRevision": 0, "paths": ["src/example.ts"], "summary": "Save partial implementation", "remaining": ["Review and remaining work"], "limits": ["Checks have not run"], "evidence": [] }
+{ "action": "list" }
+{ "action": "read", "checkpointId": "CHECKPOINT_ID", "commit": "COMMIT_ID" }
+```
+
+Creation accepts 1 to 256 literal relative file paths, not directories or globs.
+`summary` is required. `remaining`, `limits`, and `evidence` are required arrays
+with at most 32 entries each. All owned writers and operations must be physically
+released. Pending nodes are allowed, but product edits still require integration.
+An active checkpoint lease blocks writes, admission, graph changes, integration
+transitions, and successful finish. Cancellation or unknown closure is not release.
+
+Creation returns one of these statuses:
+
+- `committed` includes `origin`, `ref`, and the versioned `manifest`.
+- `refused` includes `checkpointId`, requested `selected` paths, `omitted` paths,
+  `rejected` paths with reasons, and overall `reasons`. Any rejected path refuses
+  the whole write. A deliberate valid subset needs a new request.
+- `uncertain` includes exact `origin`, `ref`, and a `diagnostic`. The ref may
+  survive receipt failure. Inspect that identity rather than blindly retrying.
+
+Lease, stale-binding, and revision failures can instead raise tool errors before
+creation. List returns records with `assignmentId`, `checkpointId`, `commit`,
+and `ref`. The first commit parents admission HEAD or an explicitly adopted
+origin. Later commits parent the preceding checkpoint. Only selected eligible
+paths change in the saved tree; omitted paths keep their parent version.
+Renames require explicit eligible delete/add paths.
+
+The foreground read-only `agent_checkpoints` tool works without a live Head:
+
+```json
+{ "action": "list" }
+{ "action": "list", "assignmentId": "ASSIGNMENT_ID" }
+{ "action": "read", "assignmentId": "ASSIGNMENT_ID", "checkpointId": "CHECKPOINT_ID", "commit": "COMMIT_ID" }
+```
+
+It uses the current repository, not a caller-supplied filesystem path. Reusable
+source-module exports in `extensions/agent/checkpoints.ts` are
+`listCheckpoints(root, assignmentId?)` and
+`readCheckpoint(root, origin, agentDir?)`. These are not a package export.
+The reader validates actual ref, commit, tree, and manifest relationships.
+Read returns `manifest`, cumulative saved-path `current` comparisons with raw
+content/mode `matches`, `checkoutDirt`, `checkoutObservationGaps`, and
+`historicalEvidence`, separately from `origin`, `ref`, and `commit`.
+`manifest.selected`, `omitted`, and cumulative `saved` describe the saved point,
+not all current dirt. `historicalEvidence` includes bounded native results,
+evidence references, linked members, and `closureGaps`. Its tested source is
+`not_recorded`; a historical successful edit or check is not current verification.
+Missing history permits inspection with gaps, not adoption.
+
+Explicit new Head continuation adds
+`checkpoint_origin: { assignmentId, checkpointId, commit }` to the asynchronous
+Developer Head request, without a second activation field.
+Before a writable baseline or prompt, the host requires the same repository and
+worktree, compatible admission HEAD and real index, exact saved raw content and
+mode, compatible configuration, and a new envelope covering all cumulative saved
+paths. It also requires positive terminal/disposed closure of the exact
+predecessor Head and contributors, with live owners and execution holds reconciled.
+Contributing leaves may occupy sealed invocation groups while the execution
+group remains open. Missing, mismatched, live, or unknown records refuse adoption.
+A ref, terminal status alone, or tool receipt proves neither closure nor acceptance.
+
+The replacement starts a new DAG under new authority. It does not resume sessions,
+restore judgments or the ledger, apply a commit, discard dirt, or dispatch
+recovery automatically. Initial foreign and ignored paths remain excluded.
+Omitted and subsequent dirt stays visible and ineligible under this origin.
+Separately justified ordinary work may reconcile it later. Failed or cancelled
+but settled contributions can be useful saved work without being accepted.
+
+The supported boundary uses managed public SDK file tools, the known loaded
+patch implementation/parser and provenance, and owned finite foreground Bash.
+Shell scope is cooperative, not confinement. Daemons, detached or remote writers,
+and escaped descendants are unsupported. Arbitrary external writers are not
+coordinated. Unsupported writing definitions and unowned composition routes
+refuse. Checkpoint Git support also refuses effective executable hooks, signing
+requirements, external filters/fsmonitor, lazy-fetch/promisor repositories, and
+uncertain configuration or attributes. Bare, unborn, or non-Git repositories
+are unavailable. No hooks, signing, or private configuration are bypassed to save.
+
+Commits use a private index and create-only
+`refs/pitako/checkpoints/<root-digest>/<assignmentId>/<checkpointId>` refs.
+The writer preserves working bytes, HEAD, branch, and real-index bytes/flags.
+Private refs are a namespace, not access control. Bounded briefs and native result
+excerpts can contain sensitive local material. Local storage grants no remote
+publication, acceptance, node satisfaction, or final-verification authority.
+No power-loss guarantee or protection against deleted refs is promised.
+
+### Native history requests
+
 The foreground `agent_history` tool supports these requests:
 
 ```json

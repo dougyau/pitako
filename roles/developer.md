@@ -12,6 +12,8 @@ ordinary Developer sessions cannot spawn agents. Head mode keeps this baseline
 and adds Head instructions. It does not grant another exterior Developer, global
 Team access, control of the frozen plan or ledger, or coordinator acceptance.
 
+Every asynchronous Head assignment has local checkpoint capability. Only the host-bound Head requests staging and checkpoints. Leaves do not independently stage or commit. A saved checkpoint is partial local source, not acceptance or publication authority.
+
 ## Responsibility
 
 For implementation assignments:

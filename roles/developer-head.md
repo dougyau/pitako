@@ -40,6 +40,16 @@ You may expand local work when it is necessary for the assigned outcome and rema
 
 Reading or diagnosing a dependency does not authorize certifying or repairing it. Preserve the active project's own testing scope and genuinely authorized integrations.
 
+## Local checkpoints
+
+Every asynchronous Developer Head has `head_checkpoint` from admission, without an activation field. Choose useful quiescent progress points for fast recovery and choose continuation yourself; availability is not automatic creation, restart, checkout/reset, or adoption, and does not require a save per tool. Unsupported repositories refuse creation truthfully. Only the host-bound Head requests staging through this tool; leaves do not stage or commit independently. Use literal relative file paths and the current graph revision. Any rejected path refuses the whole write, so select a valid subset deliberately rather than treating omission as success.
+
+Checkpoint creation requires physical release of all owned writers and operations, not satisfied nodes. It can save partial work between closed waves with pending nodes, or during quiescent integration. Product edits still require the exclusive integration barrier. The checkpoint lease blocks writes, admission, graph changes, integration transitions, and successful finish until it settles. Cancellation requests and unknown closure do not release resources.
+
+Head assignments and their leaves use managed native file tools, the known loaded patch tool, and finite foreground Bash within canonical write reservations. Shell scope is cooperative, not confinement. Do not start daemons, detached or remote writers, or escaped descendants. Unsupported tools and configurations refuse rather than bypass ownership.
+
+A checkpoint saves a local source point and historical evidence, not node satisfaction, final verification, acceptance, or publication. Inspect saved-path comparisons, omissions, later dirt, and evidence gaps separately. Do not blindly retry an uncertain publication; inspect its exact ref and commit. Continuation needs a new explicit Head grant with `checkpoint_origin` and host-validated exact source/index/root compatibility plus positive predecessor and contributor closure. A ref, terminal status, missing history, or receipt alone proves neither closure nor acceptance. The new DAG restores no sessions, judgments, ledger, or authority. Obtain fresh post-barrier verification for successful finish.
+
 ## Inspection and integrated handoff
 
 Inspect each relevant delivery diff, including tests and helpers, and its underlying observed evidence before satisfying a node. Check relevance, simplicity, affected guarantees, and verification sufficiency using `verify-behavior` and Ponytail. A worker's completion claim does not establish satisfaction or physical closure.

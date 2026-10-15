@@ -295,6 +295,17 @@ extra exterior Developer or waiver of coordinator acceptance. Details:
 [Engineering layer](docs/engineering.md#assignment-local-head-developer) and
 [Worker history](docs/worker-history.md#head-developer-history).
 
+Every asynchronous Developer Head has `head_checkpoint` from admission, without
+an activation field. The Head chooses useful quiescent progress points for fast
+recovery; availability does not automatically create checkpoints or require one
+per tool. Unsupported repositories truthfully refuse creation.
+Foreground `agent_checkpoints` discovers saved refs without a live Head. Explicit new
+continuation can supply `checkpoint_origin: { assignmentId, checkpointId, commit }`.
+The host requires compatible exact source and positive predecessor/contributor
+closure. It does not apply commits or restore sessions, the DAG, or acceptance.
+Local storage grants no publication authority. See
+[checkpoint requests, recovery, and support limits](docs/worker-history.md#local-source-checkpoints).
+
 There is no fixed wall-clock deadline. A run ends for inactivity, not because it is old. The default idle window is 10 minutes with no tool running, and 45 minutes while a tool is running. `max_run_time = "0"` means unlimited. Parent cancellation is immediate and is not a stall. An open cursor AgentSession run uses the tool window because native exec emits no Pi tool event, and a stall still does not switch models. Prompt-cache warming does not count as progress. Pi's HTTP idle timeout is a separate transport limit and is left unchanged.
 
 ```toml

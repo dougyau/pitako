@@ -103,6 +103,16 @@ Head chooses whether to create leaves, local decomposition and scheduling, and
 direct implementation after the exclusive integration barrier, even with no leaves.
 Explicit user constraints and existing safety or resource limits remain binding.
 
+Every asynchronous Developer Head has local checkpoint capability from admission;
+do not withhold it or request an activation flag. Let Head choose useful quiescent
+progress points for fast recovery, not a checkpoint per tool. Availability does
+not automatically save, restart, reset, check out, or adopt source. Explicit
+`checkpoint_origin` continuation requires host-validated exact source/index/root
+compatibility and positive predecessor/contributor closure before a new baseline
+or prompt. A saved ref, receipt, terminal status, or missing history cannot bypass
+those checks, writer settlement, Team holds, fresh verification, or acceptance.
+Unsupported repositories truthfully refuse checkpoint creation.
+
 An explicit user requirement for ordinary single Developer, or prohibition of
 Head itself, controls when compatible with the frozen envelope. Record that
 exception and deliberately dispatch `mode: "single"` without `writes`, retaining

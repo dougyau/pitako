@@ -864,6 +864,11 @@ describe("plan and execute contracts", () => {
       "do not omit `mode`, call `agent_run`, switch transport to evade rejection, edit personal configuration, or take over implementation",
       "Configured Head ModelPolicy fallback is unchanged",
       "Ordinary APIs outside execute still default omitted mode to single",
+      "Every asynchronous Developer Head has local checkpoint capability from admission",
+      "do not withhold it or request an activation flag",
+      "Let Head choose useful quiescent progress points for fast recovery",
+      "Explicit `checkpoint_origin` continuation requires host-validated exact source/index/root compatibility and positive predecessor/contributor closure",
+      "Unsupported repositories truthfully refuse checkpoint creation",
     ]) expect(workers).toContain(contract);
     expect(execute).not.toContain('may explicitly use `mode: "head"`');
     expect(execute).toContain("synchronous-only tools do not activate that exception");

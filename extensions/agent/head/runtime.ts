@@ -8,6 +8,10 @@ import { developerCapacityPreflight, type DispatchSnapshot } from "../routing.ts
 import type { PitakoConfig } from "../../roles/types.ts";
 import type { ActivityReadOptions, LiveHandle } from "../live.ts";
 import { HeadGraph, boundedText, contains, evidenceRefs, writesConflict, type HeadNodeSpec, type HeadTransaction } from "./graph.ts";
+import { ManagedAssignment } from "./managed-tools.ts";
+import { acquireCheckpointLease, assertNoCheckpointLease } from "./checkpoint-lease.ts";
+import { CheckpointWriter } from "./checkpoint.ts";
+import { adoptCheckpoint, type CheckpointManifest, type CheckpointNative, type CheckpointOrigin } from "../checkpoints.ts";
 
 export interface HeadResultEnvelope {
   envelopeId: string;
@@ -34,10 +38,42 @@ export class HeadAttachment {
   private offered = new Set<string>();
   closure: AgentClosure = { state: "pending" };
   readonly dag?: HeadDagRuntime;
+  readonly managed?: ManagedAssignment;
+  readonly checkpointOrigin?: CheckpointManifest;
+  private checkpointWriter?: CheckpointWriter;
+  private checkpointCapture?: () => CheckpointNative["source"];
 
   constructor(readonly assignmentId: string, readonly executionRoot: string, options?: HeadDagOptions) {
     this.signal = this.controller.signal;
     if (options) this.dag = new HeadDagRuntime(this, options);
+    assertNoCheckpointLease(this.dag?.graph.root ?? executionRoot);
+    if (this.dag) {
+      this.checkpointOrigin = options?.checkpoint_origin && adoptCheckpoint(this.dag.graph.root, options.checkpoint_origin, this.dag.graph.envelope);
+      this.managed = new ManagedAssignment(this.dag.graph.root, this.dag.graph.envelope, this.checkpointOrigin);
+    }
+  }
+
+  bindCheckpointCapture(capture: () => CheckpointNative["source"]): void { this.checkpointCapture = capture; }
+  checkpoints(binding: object, append: (result: unknown) => void): CheckpointWriter {
+    this.check(binding);
+    if (!this.managed || !this.dag) throw new Error("local checkpoints not granted");
+    this.checkpointWriter ??= new CheckpointWriter({
+      assignmentId: this.assignmentId, managed: this.managed, signal: this.signal,
+      acquire: revision => {
+        this.check(binding);
+        if (this.operations.size || this.failures.length) throw new Error("Head attachment operations are still settling or unknown");
+        this.dag!.assertCheckpointReady(binding, revision);
+        return acquireCheckpointLease(this.managed!.root);
+      },
+      check: revision => { this.check(binding); this.dag!.checkCheckpointRevision(revision); this.managed!.assertHealthy(); },
+      capture: () => {
+        if (!this.checkpointCapture) throw new Error("native checkpoint source not bound");
+        return this.checkpointCapture();
+      },
+      graph: () => this.dag!.graph.snapshot(), effects: () => this.admitted(),
+      own: operation => this.own(binding, operation), append,
+    }, this.checkpointOrigin);
+    return this.checkpointWriter;
   }
 
   claim(instanceId: string, executionRoot: string): void {
@@ -53,6 +89,7 @@ export class HeadAttachment {
   admitted(): void { this.effects = true; }
 
   bind(instanceId: string): object {
+    this.managed?.assertIdle();
     if (instanceId !== this.instanceId || this.signal.aborted) throw new Error("Head attachment is not granted");
     // Replacing a native binding synchronously invalidates every borrowed capability.
     this.wake();
@@ -183,6 +220,7 @@ export class HeadAttachment {
     this.revoke();
     this.closing = (async () => {
       while (this.operations.size) await Promise.allSettled([...this.operations]);
+      try { await this.managed?.settle(); } catch (error) { this.failures.push(error); }
       const uncertainty = this.dag?.closureFailures();
       if (uncertainty?.length) this.failures.push(...uncertainty);
       if (this.failures.length) {
@@ -208,6 +246,7 @@ export interface HeadDagOptions {
   writes: string[];
   config: PitakoConfig;
   executor: AttemptExecutor;
+  checkpoint_origin?: CheckpointOrigin;
   /** Host boundary injection for controlled tests; snapshots still confer no start authority. */
   preflight?: typeof developerCapacityPreflight;
 }
@@ -216,6 +255,7 @@ export type HeadFinish =
   | { status: "failed"; diagnostic: string; evidence: string[]; limits: string[] };
 export interface HeadHandoff {
   assignmentId: string;
+  managed?: ReturnType<ManagedAssignment["snapshot"]>;
   headInstanceId?: string;
   revision: number;
   finish: HeadFinish;
@@ -277,6 +317,14 @@ export class LeafScopeAttachment {
   bindRevision(sink: (revision: number) => void): void { this.attempt.onRevision = sink; }
   assertStartup(): void { this.runtime.checkAdmission(this.attempt); }
   beginPrompt(sessionId: string): void { this.runtime.beginPrompt(this.attempt, sessionId); }
+  get managed(): ManagedAssignment | undefined { return this.runtime.managed; }
+  get originalWrites(): readonly string[] { return [...this.attempt.originalWrites]; }
+  checkManaged(sessionId: string): number {
+    this.runtime.checkLeaf(this.attempt, sessionId);
+    return this.attempt.effectiveRevision;
+  }
+  get runId(): string { return this.attempt.runId; }
+  get effectiveRevision(): number { return this.attempt.effectiveRevision; }
   current(sessionId: string) {
     this.runtime.checkLeaf(this.attempt, sessionId);
     return { runId: this.attempt.runId, effectiveRevision: this.attempt.effectiveRevision,
@@ -323,6 +371,18 @@ export class HeadDagRuntime {
   private startedAt = Date.now();
   private diagnostics?: (kind: string, data: unknown) => void;
   get finishStatus(): HeadFinish["status"] | undefined { return this.finished?.status; }
+  get managed(): ManagedAssignment | undefined { return this.owner.managed; }
+
+  checkCheckpointRevision(revision: number): void {
+    if (this.finished) throw new Error("Head already finished");
+    if (revision !== this.graph.revision) throw new Error("stale checkpoint revision");
+  }
+  assertCheckpointReady(binding: object, revision: number): void {
+    this.owner.check(binding);
+    this.owner.managed?.assertIdle();
+    this.checkCheckpointRevision(revision);
+    if (this.active().length || this.closureFailures().length) throw new Error("checkpoint requires physically released leaf attempts");
+  }
 
   constructor(private owner: HeadAttachment, private options: HeadDagOptions) {
     this.config = structuredClone(options.config);
@@ -385,11 +445,13 @@ export class HeadDagRuntime {
   snapshot(binding: object) {
     this.owner.check(binding);
     return { ...this.graph.snapshot(), maxParallel: this.maxParallel,
+      ...(this.owner.managed ? { managed: this.owner.managed.snapshot() } : {}),
       barrier: this.barrier ? { epoch: this.barrier.epoch, revision: this.barrier.revision } : undefined,
       runs: [...this.attempts.values()].map(run => this.result(binding, run.runId)) };
   }
   plan(binding: object, transaction: HeadTransaction) {
     this.owner.check(binding);
+    this.owner.managed?.assertIdle();
     this.assertOpen();
     this.graph.transact(transaction, this.activeNodes());
     this.invalidateProposals();
@@ -399,6 +461,7 @@ export class HeadDagRuntime {
   start(binding: object, expectedRevision: number, nodeIds: string[], toolCallId: string,
     ctx: ExtensionContext, pi: Pick<ExtensionAPI, "appendEntry">, signal?: AbortSignal) {
     this.owner.check(binding);
+    this.owner.managed?.assertWritable();
     this.assertOpen();
     if (signal?.aborted || expectedRevision !== this.graph.revision) throw new Error("stale or cancelled Head start");
     if (!nodeIds.length || new Set(nodeIds).size !== nodeIds.length) throw new Error("invalid Head start batch");
@@ -547,6 +610,7 @@ export class HeadDagRuntime {
   review(binding: object, runId: string, effectiveRevision: number, judgment: "satisfied" | "rejected",
     evidence: string[], reason: string, closureConcern?: string) {
     this.owner.check(binding);
+    this.owner.managed?.assertIdle();
     const run = this.run(runId, effectiveRevision);
     if (run.phase !== "closed" || run.closure.state !== "released") throw new Error("Head review requires physical closure");
     if (closureConcern) {
@@ -565,6 +629,7 @@ export class HeadDagRuntime {
   propose(binding: object, identity: HeadRunIdentity, expectedRevision: number,
     next: HeadNodeSpec, additions: HeadNodeSpec[], progress: string[]) {
     this.owner.check(binding);
+    this.owner.managed?.assertWritable();
     this.assertOpen();
     const run = this.liveRun(identity);
     evidenceRefs(progress);
@@ -601,6 +666,7 @@ export class HeadDagRuntime {
   }
   confirm(binding: object, identity: HeadRunIdentity, proposalId: string) {
     this.owner.check(binding);
+    this.owner.managed?.assertIdle();
     this.assertOpen();
     const run = this.liveRun(identity);
     const proposal = run.proposals.find(item => item.proposalId === proposalId);
@@ -674,6 +740,7 @@ export class HeadDagRuntime {
   }
   beginIntegration(binding: object, expectedRevision: number, entries: readonly { id: string }[]) {
     this.owner.check(binding);
+    this.owner.managed?.assertIdle();
     this.assertOpen();
     if (expectedRevision !== this.graph.revision) throw new Error("stale Head integration revision");
     if (this.active().length || this.owner.ownedOperations || this.closureFailures().length ||
@@ -681,6 +748,7 @@ export class HeadDagRuntime {
       throw new Error("Head integration requires satisfied work and physical closure of every owned operation");
     }
     this.owner.admitted(); // Integration effects must never permit initial-prompt replay.
+    this.owner.managed?.inventory.observe();
     this.barrier = { epoch: randomUUID(), revision: this.graph.revision, before: new Set(entries.map(entry => entry.id)) };
     this.changed("integration_barrier");
     this.record("barrier", { epoch: this.barrier.epoch, revision: this.barrier.revision });
@@ -688,9 +756,11 @@ export class HeadDagRuntime {
   }
   reopen(binding: object, epoch: string) {
     this.owner.check(binding);
+    this.owner.managed?.assertIdle();
     if (!this.barrier || this.barrier.epoch !== epoch) throw new Error("stale Head integration epoch");
     this.barrier = undefined;
     this.finished = undefined;
+    this.owner.managed?.inventory.observe();
     this.changed("integration_reopened");
     return this.snapshot(binding);
   }
@@ -712,6 +782,7 @@ export class HeadDagRuntime {
     for (const limit of finish.limits) boundedText(limit, "Head limit");
     if (finish.limits.length > 32) throw new Error("too many Head limits");
     if (finish.status === "completed") {
+      this.owner.managed?.assertIdle();
       boundedText(finish.summary, "integrated summary");
       evidenceRefs(finish.verification);
       const barrier = this.barrier;
@@ -785,6 +856,7 @@ export class HeadDagRuntime {
       }
     }
     return { assignmentId: this.owner.assignmentId, headInstanceId: this.owner.headInstanceId, revision: this.graph.revision,
+      ...(this.owner.managed ? { managed: this.owner.managed.snapshot() } : {}),
       finish: (result.status === "completed" || this.finished?.status === "failed" ? this.finished : undefined) ??
         { status: "failed", diagnostic: result.status === "completed"
         ? "Head returned without head_finish" : result.result, evidence: [], limits: ["No integrated finish was observed"] },

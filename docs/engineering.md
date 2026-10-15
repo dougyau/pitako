@@ -251,6 +251,39 @@ Own usage remains separate from aggregate Head, leaf-attempt and supplied
 classifier usage. Missing usage/cost stays unknown. These data make no claim of
 token savings, elapsed-time savings or model competence.
 
+### Local source checkpoints
+
+Every asynchronous Developer Head uses managed source capture from construction,
+including its leaves, without an activation flag. Checkpoint availability is not
+automatic creation or recovery; the Head chooses quiescent progress points.
+Unavailable inventory refuses checkpoint creation rather than falling back to
+unmanaged writers. The host captures immutable eligibility at admission,
+separately from later observed contributions. Initial foreign
+preimages and ignored regions cannot become eligible through a managed edit or
+a satisfied judgment. Selecting a path grants no authority or hunk authorship.
+
+Managed producers use public SDK file definitions, known loaded patch provenance,
+and owned finite foreground Bash. They join commands, streams, callbacks, and
+disposal before release. Leaves keep independent reservations; Head product work
+still requires integration. Shell cooperation is not a sandbox or a guarantee
+against arbitrary external editors or escaped descendants.
+
+A synchronous process-local lease permits a checkpoint between closed waves,
+even with pending nodes, or during quiescent integration. It blocks managed writes,
+admission, graph changes, integration transitions, and successful finish.
+The writer rechecks binding, revision, root, source, real index, configuration,
+and attributes before effects and publication. It marks effects before Git object
+creation to preserve the fresh-prompt replay fence. An alternate private index
+and create-only local ref leave working bytes, HEAD, branch, and the real index
+unchanged. Ref publication can survive receipt loss; it is not finish evidence.
+
+The independent reader and explicit `checkpoint_origin` admission establish a
+known source point, not durable DAG replay. Positive closure comes from exact
+linked host history members and reconciled live owners and execution holds,
+not from a commit or model text. A new attachment restores no old satisfaction
+or acceptance. [Worker history](worker-history.md#local-source-checkpoints)
+documents requests, current comparisons, and refusal limits.
+
 ## Direct navigation tools
 
 Pitako loads LSP and CodeGraph through their direct extension entries. CodeGraph retains its upstream navigation prompt hook and uses the CLI through `codegraph serve --mcp`. Runtime tools do not initialize or refresh the index. This checkout's `scripts/setup.sh` attempts missing-index initialization best-effort after dependency/native prerequisites, using a CLI on PATH or in the checkout's `node_modules/.bin` and respecting a valid `CODEGRAPH_DIR` override. Existing indexes are untouched; missing CLI or initialization errors warn and continue. The noninteractive init child suppresses Git-hook offers, platform downloads, and telemetry/update network calls; it adds no runtime or startup hook. Other projects own their preparation. Read, grep, find, ls, and bash remain available for inspection, literal searches, and follow-up when a backend is partial or unavailable. `/pitako stats` reports general model and AgentInstance usage, not query-specific metrics.
