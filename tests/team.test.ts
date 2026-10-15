@@ -1,3 +1,4 @@
+import { preparedTool } from "./fixtures/background-dispatch.ts";
 import { stubExternalFactories } from "./fixtures/offline.ts";
 stubExternalFactories();
 import { agentFixtureOwnership } from "./fixtures/agent-fixture-ownership.ts";
@@ -47,6 +48,7 @@ function evaluation(id: string) {
   const result = beginTeamEvaluation(id, false);
   if (!result) throw new Error("evaluation missing");
   evaluations.add(result);
+  bindBackgroundOwner(owner(result.token));
   return result;
 }
 
@@ -122,7 +124,7 @@ describe("Team T1 ownership", () => {
     previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     process.env.PI_CODING_AGENT_DIR = config.env.PI_CODING_AGENT_DIR;
     const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
-    agentExtension({ registerTool: (tool: any) => tools.set(tool.name, tool) } as unknown as ExtensionAPI);
+    agentExtension({ registerTool: (tool: any) => tools.set(tool.name, preparedTool(tool)) } as unknown as ExtensionAPI);
     let finish!: (attempt: Attempt) => void;
     setBackgroundExecutor({ async start() { return fixture.pendingAttempt(resolve => { finish = resolve; }); } });
     const root = mkdtempSync(path.join(tmpdir(), "pitako-team-catalog-"));
@@ -317,7 +319,7 @@ describe("Team T1 ownership", () => {
     const sent: { message: any; options: any }[] = [];
     const branch: unknown[] = [];
     const pi = {
-      registerTool(tool: any) { tools.set(tool.name, tool); },
+      registerTool(tool: any) { tools.set(tool.name, preparedTool(tool)); },
       registerFlag() {}, registerCommand() {},
       on(event: string, handler: Function) { if (!handlers.has(event)) handlers.set(event, handler); },
       getFlag() { return undefined; }, getAllTools() { return []; }, getActiveTools() { return []; },
@@ -463,7 +465,7 @@ describe("Team T1 ownership", () => {
     previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     process.env.PI_CODING_AGENT_DIR = config.env.PI_CODING_AGENT_DIR;
     const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
-    agentExtension({ registerTool: (tool: any) => tools.set(tool.name, tool) } as unknown as ExtensionAPI);
+    agentExtension({ registerTool: (tool: any) => tools.set(tool.name, preparedTool(tool)) } as unknown as ExtensionAPI);
     const workers: { task: string; started: Promise<void>; finish: (attempt: Attempt) => void }[] = [];
     setBackgroundExecutor({
       async start(input) {
@@ -484,11 +486,12 @@ describe("Team T1 ownership", () => {
     const ctx = { cwd, sessionManager: { getSessionId: () => current.sessionId } };
     const invoke = (name: string, params: unknown) => tools.get(name)!.execute("call", params, new AbortController().signal, undefined, ctx);
     const status = await invoke("team_status", {});
-    expect((status.details as any).roles.map((row: any) => row.role)).toEqual(["architect", "developer", "reviewer", "researcher"]);
+    expect((status.details as any).roles.map((row: any) => row.role)).toEqual(["architect", "developer", "reviewer", "researcher", "scout", "oracle"]);
     const assignTool = tools.get("team_assign") as any;
     expect(assignTool.promptGuidelines.join(" ")).toContain("team_result");
     expect(assignTool.promptGuidelines.join(" ")).toContain("independent long work");
     expect((await invoke("team_assign", { role: "architect", task: "unrelated", boardTopicId: "1" })).isError).toBe(true);
+    wakes.length = 0; // The no-worker failure has already been incorporated.
     const firstAssignment = await invoke("team_assign", { role: "developer", task: "Inspect lease\nsecond line", plan: "plan-a", unit: "unit-a" });
     expect(firstAssignment.isError).toBe(false);
     expect(existsSync(ledgerFile("plan-a", cwd))).toBe(false);
@@ -501,7 +504,7 @@ describe("Team T1 ownership", () => {
     expect(latestTeamAssignment(current, "developer")?.boardTopicId).toBeUndefined();
     expect((await invoke("team_assign", { role: "developer", task: "overlap" })).isError).toBe(true);
     const views = await invoke("team_status", {});
-    expect((views.details as any).roles.map((row: any) => row.status)).toEqual(["idle", "running", "idle", "running"]);
+    expect((views.details as any).roles.map((row: any) => row.status)).toEqual(["failed", "running", "idle", "running", "idle", "idle"]);
     const developer = latestTeamAssignment(current, "developer");
     expect(developer).toBeDefined();
     publishObservation({
@@ -533,7 +536,7 @@ describe("Team T1 ownership", () => {
     expect(wakes).toHaveLength(2);
     const ready = (await invoke("team_status", {})).details as any;
     expect(ready.roles[1]).toMatchObject({ status: "completed", resultAvailable: true });
-    expect(ready.roles[0]).toMatchObject({ role: "architect", status: "idle" });
+    expect(ready.roles[0]).toMatchObject({ role: "architect", status: "failed" });
     const result = await invoke("team_result", { assignmentId: developer!.id });
     expect(result.content[0].text).toContain("x".repeat(9000));
     expect(result.details).not.toHaveProperty("truncated");
@@ -572,7 +575,7 @@ describe("Team T1 ownership", () => {
       },
     });
     const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
-    agentExtension({ registerTool: (tool: any) => tools.set(tool.name, tool) } as unknown as ExtensionAPI);
+    agentExtension({ registerTool: (tool: any) => tools.set(tool.name, preparedTool(tool)) } as unknown as ExtensionAPI);
     const cwd = mkdtempSync(path.join(tmpdir(), "pitako-team-summary-"));
     tempDirs.push(cwd);
     const ctx = { cwd, sessionManager: { getSessionId: () => current.sessionId } };
@@ -653,15 +656,16 @@ describe("Team T1 ownership", () => {
     let idle = false;
     const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
     const handlers = new Map<string, Function>();
+    const branch: unknown[] = [];
     pitako({
-      registerTool(tool: any) { tools.set(tool.name, tool); }, registerFlag() {}, registerCommand() {},
+      registerTool(tool: any) { tools.set(tool.name, preparedTool(tool)); }, registerFlag() {}, registerCommand() {},
       on(event: string, handler: Function) { handlers.set(event, handler); }, getFlag() { return undefined; },
       getAllTools() { return []; }, getActiveTools() { return []; }, setActiveTools() {},
-      getSessionName() { return undefined; }, setSessionName() {}, sendMessage() {},
+      getSessionName() { return undefined; }, setSessionName() {}, sendMessage(message: unknown) { branch.push({ type: "custom_message", ...(message as object) }); },
     } as unknown as ExtensionAPI);
-    boardExtension({ registerTool: (tool: any) => tools.set(tool.name, tool), registerFlag() {}, registerCommand() {}, on() {} } as unknown as ExtensionAPI);
-    agentExtension({ registerTool: (tool: any) => tools.set(tool.name, tool) } as unknown as ExtensionAPI);
-    const sessionContext = { hasUI: false, isIdle: () => idle, ui: { notify() {}, setStatus() {} }, sessionManager: { getSessionId: () => current.sessionId } };
+    boardExtension({ registerTool: (tool: any) => tools.set(tool.name, preparedTool(tool)), registerFlag() {}, registerCommand() {}, on() {} } as unknown as ExtensionAPI);
+    agentExtension({ registerTool: (tool: any) => tools.set(tool.name, preparedTool(tool)) } as unknown as ExtensionAPI);
+    const sessionContext = { hasUI: false, isIdle: () => idle, ui: { notify() {}, setStatus() {} }, sessionManager: { getSessionId: () => current.sessionId, getBranch: () => branch } };
     await handlers.get("session_start")?.({}, sessionContext);
     await handlers.get("session_start")?.({}, sessionContext);
     const afterReload = await openBoard();
@@ -724,7 +728,7 @@ describe("Team T1 ownership", () => {
     process.env.PI_CODING_AGENT_DIR = config.env.PI_CODING_AGENT_DIR;
     const current = evaluation("team-four-roles-execution-root");
     const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
-    agentExtension({ registerTool: (tool: any) => tools.set(tool.name, tool) } as unknown as ExtensionAPI);
+    agentExtension({ registerTool: (tool: any) => tools.set(tool.name, preparedTool(tool)) } as unknown as ExtensionAPI);
     const workers: { cwd: string; finish: (attempt: Attempt) => void }[] = [];
     setBackgroundExecutor({ async start(input) {
       return fixture.pendingAttempt((resolve) => workers.push({ cwd: input.cwd, finish: resolve }));
@@ -761,7 +765,7 @@ describe("Team T1 ownership", () => {
     const first = evaluation("team-cold-admission-a");
     const second = evaluation("team-cold-admission-b");
     const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
-    agentExtension({ registerTool: (tool: any) => tools.set(tool.name, tool) } as unknown as ExtensionAPI);
+    agentExtension({ registerTool: (tool: any) => tools.set(tool.name, preparedTool(tool)) } as unknown as ExtensionAPI);
     const started: string[] = [];
     setBackgroundExecutor({ async start(input) {
       started.push(input.cwd);
@@ -825,7 +829,7 @@ describe("Team T1 ownership", () => {
     const teamA = evaluation("team-topic-admission-a");
     const teamB = evaluation("team-topic-admission-b");
     const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
-    agentExtension({ registerTool: (tool: any) => tools.set(tool.name, tool) } as unknown as ExtensionAPI);
+    agentExtension({ registerTool: (tool: any) => tools.set(tool.name, preparedTool(tool)) } as unknown as ExtensionAPI);
     const started: string[] = [];
     setBackgroundExecutor({ async start(input) { started.push(input.cwd); return completed(); } });
     const assign = (team: ReturnType<typeof evaluation>, cwd: string) => tools.get("team_assign")!.execute("assign", {
@@ -872,8 +876,8 @@ describe("Team T1 ownership", () => {
     const current = evaluation("team-result-cwd-change");
     bindBackgroundOwner(owner(current.token));
     const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
-    boardExtension({ registerTool: (tool: any) => tools.set(tool.name, tool), registerFlag() {}, registerCommand() {}, on() {} } as unknown as ExtensionAPI);
-    agentExtension({ registerTool: (tool: any) => tools.set(tool.name, tool) } as unknown as ExtensionAPI);
+    boardExtension({ registerTool: (tool: any) => tools.set(tool.name, preparedTool(tool)), registerFlag() {}, registerCommand() {}, on() {} } as unknown as ExtensionAPI);
+    agentExtension({ registerTool: (tool: any) => tools.set(tool.name, preparedTool(tool)) } as unknown as ExtensionAPI);
     let finish!: (attempt: Attempt) => void;
     let workerCwd = "";
     setBackgroundExecutor({ async start(input) {
@@ -940,8 +944,8 @@ describe("Team T1 ownership", () => {
     writeFileSync(sourcePlan, `---\nid: ${id}\nrevision: 1\nstatus: frozen\nboard_topic_id: ${topic.id}\nexecution: expected\n---\n\nPlan.\n`);
 
     const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
-    boardExtension({ registerTool: (tool: any) => tools.set(tool.name, tool), registerFlag() {}, registerCommand() {}, on() {} } as unknown as ExtensionAPI);
-    agentExtension({ registerTool: (tool: any) => tools.set(tool.name, tool) } as unknown as ExtensionAPI);
+    boardExtension({ registerTool: (tool: any) => tools.set(tool.name, preparedTool(tool)), registerFlag() {}, registerCommand() {}, on() {} } as unknown as ExtensionAPI);
+    agentExtension({ registerTool: (tool: any) => tools.set(tool.name, preparedTool(tool)) } as unknown as ExtensionAPI);
     const lifecycle = tools.get("board_workflow_lifecycle")!;
     const fromA = { cwd: source, sessionManager: { getSessionId: () => "lifecycle-preflight-a" } };
     const noLedger = await lifecycle.execute("no-ledger", { planId: id, status: "resolved" }, undefined, undefined, fromA);
@@ -1018,8 +1022,8 @@ describe("Team T1 ownership", () => {
     const current = evaluation("team-family-admission");
     bindBackgroundOwner(owner(current.token));
     const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
-    boardExtension({ registerTool: (tool: any) => tools.set(tool.name, tool), registerFlag() {}, registerCommand() {}, on() {} } as unknown as ExtensionAPI);
-    agentExtension({ registerTool: (tool: any) => tools.set(tool.name, tool) } as unknown as ExtensionAPI);
+    boardExtension({ registerTool: (tool: any) => tools.set(tool.name, preparedTool(tool)), registerFlag() {}, registerCommand() {}, on() {} } as unknown as ExtensionAPI);
+    agentExtension({ registerTool: (tool: any) => tools.set(tool.name, preparedTool(tool)) } as unknown as ExtensionAPI);
     let finish!: (attempt: Attempt) => void;
     setBackgroundExecutor({ async start() { return fixture.pendingAttempt((resolve) => (finish = resolve)); } });
     const context = { cwd: execution, sessionManager: { getSessionId: () => current.sessionId } };
@@ -1092,7 +1096,7 @@ describe("Team T1 ownership", () => {
 
     const current = evaluation("team-foreign-root-admission");
     const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
-    agentExtension({ registerTool: (tool: any) => tools.set(tool.name, tool) } as unknown as ExtensionAPI);
+    agentExtension({ registerTool: (tool: any) => tools.set(tool.name, preparedTool(tool)) } as unknown as ExtensionAPI);
     let started = false;
     setBackgroundExecutor({ async start() { started = true; return completed(); } });
     const result = await tools.get("team_assign")!.execute("assign", {
@@ -1127,6 +1131,8 @@ describe("Team T1 ownership", () => {
       { role: "developer", status: "idle" },
       { role: "reviewer", status: "idle" },
       { role: "researcher", status: "idle" },
+      { role: "scout", status: "idle" },
+      { role: "oracle", status: "idle" },
     ]);
     expect(hasTeamRoster(current)).toBe(false);
     expect(notes.join(" ")).not.toContain("transcript");

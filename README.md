@@ -156,13 +156,29 @@ RoleDefinition
 
 The role carries instructions, skills, and principles. The model policy carries an ordered list of model targets. A target is a Pi model id (`provider/model`) plus an optional reasoning level. The role is not a model.
 
-Built-in roles are `coordinator`, `architect`, `developer`, `reviewer`, and `researcher`. Instructions live in `roles/*.md`. Structured defaults live in `config/defaults.toml`. Concrete models are not shipped, because installations do not share subscriptions.
+Built-in roles are `coordinator`, `architect`, `developer`, `reviewer`, `researcher`, `scout`, and `oracle`. Instructions live in `roles/*.md`. Structured defaults live in `config/defaults.toml`. Concrete models are not shipped, because installations do not share subscriptions.
 
 User overrides go in `$PI_CODING_AGENT_DIR/pitako/config.toml`. If `PI_CODING_AGENT_DIR` is unset, that path is `~/.pi/agent/pitako/config.toml`. Do not edit the package to change models.
 
 Precedence is built-in defaults, then the user file. A scalar replaces that field when set. A `skills` or `principles` array replaces the built-in list when set, and is left alone when omitted. `primary` and `fallbacks` work the same way. There is no append merge.
 
 Reasoning uses Pi's levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. `default`, or omitting the field, leaves the later runner on Pi's session default. Pitako does not clamp a level the model cannot do. When a model catalog is supplied, an unsupported level fails. Without a catalog, only the syntax of `provider/model` is checked, so a target can be named before that provider is authenticated.
+
+### Background consultations
+
+Scout prepares repository context, Researcher establishes facts, and Oracle offers technical advice. They are analysis leaves, not substitutes for Architect design, Developer implementation or Reviewer judgment. Configure their independent `[model_policies.scout]`, `[model_policies.researcher]` and `[model_policies.oracle]` policies; no concrete models ship by default.
+
+Use `agent_spawn` or `team_assign` with `role`, `task` and optional `reasoning`. `agent_run` and `agent_supervise` reject these roles. A granted Head uses `head_consult`. All return a reserved handle before external preparation, then deliver through the existing automatic background or Head result channel. Reserved identity is not worker admission. Cancellation and retirement join owned preparation/disposal; unknown closure retains resources and capacity.
+
+- Omitted reasoning or `{mode:"default"}` preserves the configured primary, including Pi's settings/default chain when reasoning is omitted.
+- `{mode:"direct",level:"high"}` changes only primary reasoning. Unsupported direct reasoning fails after actual model bind before any prompt, without availability fallback.
+- `{mode:"classify"}` optionally asks for effort among the primary model's public SDK choices (including `max` only when supported) plus indeterminate. It shares Developer's configured `developer_routing.classifier_provider`/`classifier_model`, not its capacity question. Default/direct never discover or call the classifier. Failed, invalid, indeterminate, oversized or unrecordable advice keeps the frozen primary; cancellation never starts a fallback worker. Capability drift restores configured reasoning without reclassification.
+
+Each availability fallback keeps its own reasoning. Analysis excludes direct editing and Pitako orchestration, including nested and late tools, while keeping bash/navigation. It is not a shell sandbox. Head consultations share Developer capacity and managed producers with an empty write envelope; advice is never node review or native verification.
+
+After the exact outcome is incorporated in the current caller branch, `consultation_feedback` accepts `{dispatchId,usefulness:"used"|"partial"|"not_used"|"unknown",note?,followupInstances?}`. It is voluntary: completion, an offered result or a getter does not submit or authorize feedback. Later attributed feedback corrects the display without erasing prior entries. Foreground links only its catalog runs; Head links only its children. Links show observed association, not causal savings or quality.
+
+`/pitako stats consultations [dispatchId]` projects retained caller decisions, classifier overhead, worker attempts, closure/delivery and feedback. `agent_history` reads original entries using catalog-authorized dispatch locators, including Head and no-worker decisions. Missing or pre-first-assistant persistence, pruning, omitted rows and bounded-prefix scans remain gaps; unknown differs from reported zero. Zero catalog prices are not billing receipts. Inclusive Head/descendant observations are not added into a combined total. See [worker history](docs/worker-history.md).
 
 ### Fast requests
 

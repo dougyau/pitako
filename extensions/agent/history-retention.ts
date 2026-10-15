@@ -34,6 +34,10 @@ function regularOrAbsent(file: string): void {
 function ownedFiles(history: WorkerHistory, group: HistoryGroup): NonNullable<HistoryGroup["cleanup"]>["files"] {
   const files: NonNullable<HistoryGroup["cleanup"]>["files"] = [];
   const targets = new Set<string>();
+  const callers = new Set(history.list().flatMap(group => [
+    ...group.members.flatMap(row => [row.coordinatorSessionFile, row.callerSessionFile]),
+    ...(group.consultations ?? []).map(row => row.callerSessionFile),
+  ]).filter((file): file is string => Boolean(file)).map(file => path.resolve(file)));
   for (const member of group.members) {
     if (member.native.state !== "allocated") continue;
     const native = member.native;
@@ -41,7 +45,7 @@ function ownedFiles(history: WorkerHistory, group: HistoryGroup): NonNullable<Hi
     if (path.dirname(native.path) !== directory ||
       !(path.basename(native.path) === `${native.sessionId}.jsonl` || path.basename(native.path).endsWith(`_${native.sessionId}.jsonl`)))
       throw new Error("native file outside registered ownership");
-    if (group.members.some((row) => row.coordinatorSessionFile && path.resolve(row.coordinatorSessionFile) === native.path))
+    if (callers.has(native.path))
       throw new Error("coordinator session is protected");
     regularOrAbsent(native.path);
     try {
@@ -71,7 +75,8 @@ async function closure(group: HistoryGroup) {
   if (group.identity.kind === "mission") return { reason: "archived/catalog-only; current closure unknown" };
   if (group.prunedAt) return { reason: "already pruned" };
   if (group.coverage !== "complete") return { reason: "membership coverage is partial" };
-  if (!group.members.length) return { reason: "no demonstrated member lifecycle" };
+  if (!group.members.length && !group.consultations?.length) return { reason: "no demonstrated member lifecycle" };
+  if (group.consultations?.some(row => row.closure.state !== "released")) return { reason: "consultation closure unconfirmed" };
   if (group.identity.kind === "execution") return { reason: "execution has no durable closure proof" };
   if (group.members.some((member) => !member.terminal ||
     member.native.state === "allocated" && member.native.disposition.state !== "disposed"))
@@ -125,6 +130,7 @@ export async function pruneWorkerHistory(history: WorkerHistory, ttlDays: number
       group.members = group.members.map((member) => ({ historyId: member.historyId, roleId: member.roleId,
         admittedAt: member.admittedAt, native: { state: member.native.state === "not-created" ? "not-created" : "pruned" }, gaps: [],
         coordinatorSessionId: member.coordinatorSessionId, coordinatorSessionFile: member.coordinatorSessionFile,
+        callerSessionId: member.callerSessionId, callerSessionFile: member.callerSessionFile,
         assignmentId: member.assignmentId, instanceId: member.instanceId,
         attemptId: member.attemptId }));
       delete group.cleanup; delete group.aliases;

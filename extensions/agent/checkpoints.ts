@@ -146,7 +146,8 @@ function validateManifest(value: unknown): CheckpointManifest {
       !Array.isArray(m.contributors) || !m.contributors.every(entry => entry && typeof entry.assignmentId === "string" &&
         typeof entry.inherited === "boolean" && entry.contribution && ["returned", "threw"].includes(entry.contribution.outcome) &&
         validSource(entry.contribution.source) &&
-        Number.isSafeInteger(entry.contribution.source.effectiveRevision) && entry.contribution.source.effectiveRevision >= 0 &&
+        Number.isSafeInteger(entry.contribution.source.kind === "consultation" ? entry.contribution.source.observedRevision : entry.contribution.source.effectiveRevision) &&
+        (entry.contribution.source.kind === "consultation" ? entry.contribution.source.observedRevision! : entry.contribution.source.effectiveRevision!) >= 0 &&
         Array.isArray(entry.contribution.changes) && entry.contribution.changes.every(change => literal(change.path) &&
           validRaw(change.before) && validRaw(change.after))) ||
       !Array.isArray(m.native) || !m.native.every(entry => validSource(entry.source) && typeof entry.assignmentId === "string" &&
@@ -164,10 +165,11 @@ function validRaw(value: RawFile | undefined): boolean {
   return value === undefined || !!value && ["symlink", "unsupported"].includes(value.kind) || !!value && value.kind === "file" && typeof value.digest === "string" &&
     /^[a-f0-9]{64}$/.test(value.digest) && [0o100644, 0o100755].includes(value.mode!);
 }
-function validSource(value: Pick<Contribution["source"], "kind" | "instanceId" | "groupId" | "historyId" | "sessionId" | "runId"> | undefined): boolean {
-  return !!value && ["head", "leaf"].includes(value.kind) &&
+function validSource(value: Pick<Contribution["source"], "kind" | "instanceId" | "groupId" | "historyId" | "sessionId" | "runId" | "dispatchId" | "effectiveRevision"> | undefined): boolean {
+  return !!value && ["head", "leaf", "consultation"].includes(value.kind) &&
     ["instanceId", "groupId", "historyId", "sessionId"].every(key => typeof value[key as keyof typeof value] === "string") &&
-    (value.kind !== "leaf" || typeof value.runId === "string");
+    (value.kind !== "leaf" || typeof value.runId === "string") &&
+    (value.kind === "consultation" ? typeof value.dispatchId === "string" && value.runId === undefined && value.effectiveRevision === undefined : value.dispatchId === undefined);
 }
 
 export function listCheckpoints(root: string, assignmentId?: string) {
@@ -187,7 +189,8 @@ function checkpointHistory(manifest: CheckpointManifest, agentDir: string) {
   try { store = new WorkerHistory(agentDir, { initialize: false }); }
   catch (error) { return { closureGaps: [`Worker history unavailable: ${String(error)}`], members: [] }; }
   const sources = [{ assignmentId: manifest.assignmentId, source: manifest.head },
-    ...manifest.contributors.map(entry => ({ assignmentId: entry.assignmentId, source: entry.contribution.source }))];
+    ...manifest.contributors.map(entry => ({ assignmentId: entry.assignmentId, source: entry.contribution.source })),
+    ...manifest.native.map(entry => ({ assignmentId: entry.assignmentId, source: entry.source }))];
   const seen = new Set<string>();
   for (const { assignmentId, source } of sources) {
     const key = `${source.groupId}/${source.historyId}`;
@@ -206,7 +209,12 @@ function checkpointHistory(manifest: CheckpointManifest, agentDir: string) {
           (member.head?.assignmentId !== assignmentId || member.head.runId !== source.runId ||
            member.head.headInstanceId !== manifest.native.find(entry => entry.assignmentId === assignmentId && entry.source.kind === "head")?.source.instanceId ||
            member.head.effectiveRevision !== captured.observedRevision ||
-           "effectiveRevision" in source && source.effectiveRevision > captured.observedRevision)) throw new Error("mismatched linked history member");
+           "effectiveRevision" in source && source.effectiveRevision! > captured.observedRevision)) throw new Error("mismatched linked history member");
+      if (source.kind === "consultation" && (!group.consultations?.some(row => row.dispatchId === source.dispatchId && row.instanceId === source.instanceId) ||
+          member.head?.assignmentId !== assignmentId || member.head.runId !== undefined ||
+          member.head.nodeId !== undefined || member.head.effectiveRevision !== undefined || member.head.admittedRevision !== undefined ||
+          member.head.observedRevision !== captured.observedRevision ||
+          member.head.headInstanceId !== manifest.native.find(entry => entry.assignmentId === assignmentId && entry.source.kind === "head")?.source.instanceId)) throw new Error("mismatched consultation history member");
       records.push({ group, historyId: source.historyId });
       if (!member.terminal || !["completed", "failed", "cancelled"].includes(member.terminal.status) ||
           typeof member.terminal.at !== "string" || member.native.disposition.state !== "disposed" ||

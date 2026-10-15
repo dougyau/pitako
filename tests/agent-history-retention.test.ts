@@ -1,7 +1,7 @@
 import { stubExternalFactories } from "./fixtures/offline.ts";
 stubExternalFactories();
 import { afterEach, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -286,4 +286,19 @@ test("public command/startup prune and dry-run remain foreground-only; busy main
   process.env.PI_CODING_AGENT_DIR = path.join(sample.root, "absent-agent");
   await command("history prune --dry-run", ctx);
   expect(existsSync(process.env.PI_CODING_AGENT_DIR)).toBe(false);
+});
+
+test("Head caller readability never transfers deletion ownership across history groups", async () => {
+  const sample = fixture();
+  const advice = sample.history.createGroup(sample.root);
+  sample.history.mutate(advice.groupId, saved => {
+    saved.consultations = [{ dispatchId: randomUUID(), instanceId: "researcher-reserved", roleId: "researcher",
+      callerSessionId: "captured-head",
+      callerSessionFile: sample.file, coordinatorSessionId: "outer-operator", gaps: [], closure: { state: "released" } }];
+  });
+  sample.history.closeInvocation(advice.groupId);
+  const result = await pruneWorkerHistory(sample.history, 180, { now: later });
+  expect(result.groups.find(row => row.groupId === sample.group.groupId)).toMatchObject({ state: "failed", reason: expect.stringContaining("coordinator session is protected") });
+  expect(existsSync(sample.file)).toBe(true);
+  expect(existsSync(`${sample.file}.acp.json`)).toBe(true);
 });

@@ -3,7 +3,7 @@ import { executionForSession } from "./execution-identity.ts";
 import { readLedgerTeamHolds, updateLedgerTeamHold, type ExecutionBinding } from "./workflow.ts";
 
 const KEY = Symbol.for("pitako.teamRegistry");
-const TEAM_ROLES = new Set(["architect", "developer", "reviewer", "researcher"]);
+const TEAM_ROLES = new Set(["architect", "developer", "reviewer", "researcher", "scout", "oracle"]);
 
 export interface TeamAssignment {
   id: string;
@@ -75,7 +75,7 @@ export function reserveTeamRole(
   evaluation: TeamEvaluation | undefined,
   roleId: string,
   assignmentId: string,
-): { token: symbol; owns: () => boolean; commit: () => void; rollback: () => void; settled: () => void } {
+): { token: symbol; owns: () => boolean; commit: () => void; rollback: () => void; settled: () => void; noWorkerReleased: () => void } {
   if (!evaluation) throw new Error("Team requires a foreground session identity");
   const state = registry();
   const current = state.evaluations.get(evaluation.sessionId);
@@ -112,6 +112,11 @@ export function reserveTeamRole(
     },
     rollback() {
       if (committed || finished) return;
+      finished = true;
+      release();
+    },
+    noWorkerReleased() {
+      if (finished) return;
       finished = true;
       release();
     },

@@ -424,12 +424,14 @@ test("current Team lease permits native input/cancel; retirement leaves independ
   await view.close(); controller.revoke(); await controller.settle();
 }));
 
-test("same-session startup fences agent_spawn while controlled external startup is held", fixture.ownedCase("startup admission", async () => {
+for (const role of ["researcher", "reviewer"]) {
+test(`same-session startup fences ${role} agent_spawn while controlled external startup is held`, fixture.ownedCase("startup admission " + role, async () => {
   const { root, load } = setup();
   process.env.PI_OFFLINE = "1";
   const agentDir = process.env.PI_CODING_AGENT_DIR!;
   mkdirSync(path.join(agentDir, "pitako"), { recursive: true });
-  writeFileSync(path.join(agentDir, "pitako/config.toml"), readFileSync(load.userConfigPath));
+  writeFileSync(path.join(agentDir, "pitako/config.toml"), readFileSync(load.userConfigPath, "utf8") +
+    '\n[model_policies.reviewer.primary]\nmodel = "fixture/selected"\nreasoning = "off"\n');
   let releaseCodex!: () => void, releaseDispatch!: () => void;
   const codexHold = new Promise<void>(resolve => { releaseCodex = resolve; });
   const dispatchHold = new Promise<void>(resolve => { releaseDispatch = resolve; });
@@ -444,10 +446,11 @@ test("same-session startup fences agent_spawn while controlled external startup 
   const captureController = spyOn(controllerModule, "createAgentController").mockImplementation((...args) => {
     const controller = create(...args); controllers.push(controller); return controller;
   });
-  let starts = 0;
+  let starts = 0, started!: () => void;
+  const workerStarted = new Promise<void>(resolve => { started = resolve; });
   const finishes: Array<() => void> = [];
   setBackgroundExecutor({ async start() {
-    starts++;
+    starts++; started();
     return fixture.pendingAttempt(resolve => { finishes.push(() => resolve(completed)); });
   } });
 
@@ -470,7 +473,7 @@ test("same-session startup fences agent_spawn while controlled external startup 
     };
     cleanup = () => emit("session_shutdown");
     await emit("session_start");
-    const spawn = (task: string) => tools.get("agent_spawn")!.execute(task, { role: "researcher", task }, undefined, undefined, ctx);
+    const spawn = (task: string) => tools.get("agent_spawn")!.execute(task, { role, task }, undefined, undefined, ctx);
     const status = async () => (await tools.get("agent_status")!.execute("status", {}, undefined, undefined, ctx)).details;
     view = controllers.at(-1)!.openView();
     let dispatchSignal: AbortSignal | undefined;
@@ -478,7 +481,7 @@ test("same-session startup fences agent_spawn while controlled external startup 
       dispatchSignal = signal; await dispatchHold;
     });
     await Promise.resolve();
-    // This Pitako tool call is suspended at ownedDispatch's first microtask.
+    // Async launch reserves immediately; retirement must join its no-worker preparation.
     stale = spawn("stale queued spawn");
     holdNextStartup = true;
     let joined = false;
@@ -488,9 +491,12 @@ test("same-session startup fences agent_spawn while controlled external startup 
     const staleResult = await stale;
     const during = await spawn("spawn during startup");
     const heldRows = await status();
-    expect(staleResult).toMatchObject({ isError: true, details: { error: "Dispatch cancelled before admission" } });
+    expect(staleResult).toMatchObject({ isError: false, details: { dispatchPhase: "preflight" } });
     expect(during).toMatchObject({ isError: true, details: { error: "Dispatch cancelled before admission" } });
-    expect(heldRows).toEqual({ workers: [] });
+    expect(heldRows.workers).toEqual([expect.objectContaining({
+      instanceId: (staleResult as { details: { instanceId: string } }).details.instanceId,
+      status: "cancelled", workerStarted: false,
+    })]);
     expect(starts).toBe(0);
     expect(joined).toBe(false);
     expect(await ownedDispatch({ ...ctx, sessionManager: { getSessionId: () => "independent" } } as never,
@@ -501,6 +507,8 @@ test("same-session startup fences agent_spawn while controlled external startup 
     await Promise.resolve(); await Promise.resolve();
     expect(newerJoined).toBe(false); // abort request alone does not settle the held callback
     releaseDispatch(); await dispatch; await newerRebind;
+    expect(await status()).toEqual({ workers: [] });
+    expect(starts).toBe(0);
     expect(joined).toBe(false);
     const newestController = controllers.at(-1)!;
     expect(await spawn("older startup still held")).toMatchObject({
@@ -509,7 +517,8 @@ test("same-session startup fences agent_spawn while controlled external startup 
     releaseCodex(); await rebind;
     expect(controllers.at(-1)).toBe(newestController);
     const fresh = await spawn("fresh authorized spawn");
-    expect(fresh).toMatchObject({ details: { status: "running" }, isError: false });
+    expect(fresh).toMatchObject({ details: { status: "running", dispatchPhase: "preflight" }, isError: false });
+    await workerStarted;
     const freshView = controllers.at(-1)!.openView();
     expect(freshView.list().items.map(row => row.id)).toContain((fresh.details as { instanceId: string }).instanceId);
     expect(starts).toBe(1);
@@ -526,6 +535,7 @@ test("same-session startup fences agent_spawn while controlled external startup 
     captureController.mockRestore(); captureCodex.mockRestore();
   }
 }));
+}
 
 for (const { event, failUpstream } of [
   { event: "session_start", failUpstream: false },

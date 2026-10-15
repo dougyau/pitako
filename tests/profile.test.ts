@@ -68,6 +68,17 @@ describe("profiles", () => {
     expect(tools).toEqual(expect.arrayContaining(["acp_delegate", "acp_delegate_wait", "compress"]));
   });
 
+  test("Head local tools require the host grant while a Developer leaf retains only scope acknowledgment", () => {
+    const local = ["head_consult", "head_plan", "head_checkpoint", "head_scope_ack"];
+    const select = (managed?: "head" | "leaf" | "consultation", profile: "coding" | "analysis" = "coding") =>
+      toolsForProfile({ available: [...available, ...local], profile, child: true, managed });
+    expect(select().filter(name => name.startsWith("head_"))).toEqual([]);
+    expect(select("head")).toEqual(expect.arrayContaining(local));
+    expect(select("leaf").filter(name => name.startsWith("head_"))).toEqual(["head_scope_ack"]);
+    expect(select("consultation", "analysis").filter(name => name.startsWith("head_"))).toEqual([]);
+    expect(select("consultation", "analysis")).toContain("bash");
+  });
+
   test("powershell is included only when requested", () => {
     const tools = toolsForProfile({ available, profile: "coding", includePowerShell: true });
     expect(tools).toContain("powershell");

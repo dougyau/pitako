@@ -8,7 +8,7 @@ import {
   formatWorkerHandle,
   formatWorkerViews,
   interestFrom,
-  spawnBackground,
+  reserveBackground,
   workerResult,
   workerStatus,
   teamWorkerStatus,
@@ -16,11 +16,15 @@ import {
   teamWorkerHasOutcome,
   cancelTeamWorker,
   workerHandoff,
+  consultationFeedback,
 } from "./background.ts";
+import { feedbackSchema } from "./consultation-feedback.ts";
+import { consultationSnapshot, consultationRecord, prepareConsultation, isConsultation, reasoningSchema } from "./consultation.ts";
 import { listObservations, noteResultTaken, observationEpoch, publishObservation } from "./observe.ts";
 import { currentInstanceId } from "./scope.ts";
 import { createPiExecutor } from "./pi.ts";
 import { createHead, validateAgentMode } from "./head/admission.ts";
+import { assertNoCheckpointLease } from "./head/checkpoint-lease.ts";
 import { formatAgentResult, formatTeamExecutionSummary, runAgentInstance, teamExecutionSummary } from "./run.ts";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -138,8 +142,9 @@ export default function agentInstance(pi: ExtensionAPI): void {
       }, noExtra),
       Type.Object({
         action: Type.Literal("read"),
-        historyId: Type.String(),
-        source: Type.Optional(Type.Union([Type.Literal("worker"), Type.Literal("coordinator")])),
+        historyId: Type.Optional(Type.String()),
+        dispatchId: Type.Optional(Type.String({ description: "Read the captured caller for one consultation, including no-worker outcomes" })),
+        source: Type.Optional(Type.Union([Type.Literal("worker"), Type.Literal("coordinator"), Type.Literal("caller")])),
         groupId: Type.Optional(Type.String()),
         cursor: Type.Optional(Type.String()),
         limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
@@ -153,6 +158,16 @@ export default function agentInstance(pi: ExtensionAPI): void {
       return textResult(JSON.stringify(page), page);
     },
   });
+  pi.registerTool({
+    name: "consultation_feedback", label: "Consultation feedback",
+    description: "Voluntary attributed assessment after the exact outcome is incorporated in your current branch. Corrections retain history. Optional followupInstances must be owned catalog runs; links show association, not cause. Never review, verification or acceptance.",
+    parameters: feedbackSchema,
+    async execute(_id, params, _signal, _update, ctx) {
+      if (currentInstanceId() || executionForSession(ctx.sessionManager?.getSessionId?.())) return errorResult("consultation_feedback is foreground or granted Head only");
+      try { const result = consultationFeedback(params, ctx.sessionManager?.getSessionId?.(), ctx.sessionManager); return textResult(JSON.stringify(result), result); }
+      catch (error) { return errorResult(String(error)); }
+    },
+  });
   registerBackgroundTools(pi);
   registerTeamTools(pi);
   pi.registerTool({
@@ -162,7 +177,7 @@ export default function agentInstance(pi: ExtensionAPI): void {
       "Run one Pitako role in an isolated context. Returns the final result and model provenance, not the child transcript. If this fails, report the failure. Do not perform that role yourself.",
     promptSnippet: "Run an isolated Pitako role and return its final result",
     promptGuidelines: [
-      "Use agent_run for a role such as architect or researcher. If agent_run fails, report the error. Do not do that role's work in the parent session.",
+      "Use agent_run for a role such as architect. Scout, Researcher and Oracle require agent_spawn or team_assign. If agent_run fails, report the error. Do not do that role's work in the parent session.",
     ],
     parameters: Type.Object(
       {
@@ -176,10 +191,11 @@ export default function agentInstance(pi: ExtensionAPI): void {
         return errorResult("agent_run cannot be called from an AgentInstance");
       }
       try {
+        if (isConsultation(params.role)) throw new Error("Consultative roles require agent_spawn or team_assign, not agent_run");
         validateAgentMode(params, ctx.cwd, false);
         let live = "";
         const epoch = observationEpoch();
-        let dispatch;
+        let dispatch: Awaited<ReturnType<typeof developerPreflight>> | undefined;
         let checkDispatch: (() => void) | undefined;
         if (params.role === "developer") {
           dispatch = await ownedDispatch(ctx, signal, () => true, async (signal, check) => {
@@ -240,7 +256,7 @@ export default function agentInstance(pi: ExtensionAPI): void {
 }
 
 function registerTeamTools(pi: ExtensionAPI): void {
-  const roles = ["architect", "developer", "reviewer", "researcher"] as const;
+  const roles = ["architect", "developer", "reviewer", "researcher", "scout", "oracle"] as const;
   const evaluationFor = (ctx: { sessionManager?: { getSessionId?: () => string | undefined } }) =>
     teamEvaluationForSession(
       typeof ctx.sessionManager?.getSessionId === "function" ? ctx.sessionManager.getSessionId() : undefined,
@@ -267,100 +283,81 @@ function registerTeamTools(pi: ExtensionAPI): void {
       mode: Type.Optional(Type.Union([Type.Literal("single"), Type.Literal("head")])),
       writes: Type.Optional(Type.Array(Type.String(), { maxItems: 128 })),
       checkpoint_origin: Type.Optional(checkpointOrigin),
+      reasoning: reasoningSchema,
     }, noExtra),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
+        if (signal?.aborted || !params.task.trim()) throw new Error("Dispatch cancelled or empty task");
         const headOptions = validateAgentMode(params, ctx.cwd);
+        if (headOptions) assertNoCheckpointLease(ctx.cwd);
+        let consultation = consultationSnapshot(params.role, params.reasoning, ctx.cwd);
+        const caller = ctx.sessionManager;
         const evaluation = evaluationFor(ctx);
         const id = randomUUID();
         const admission = reserveTeamRole(evaluation, params.role, id);
+        const origin = historyOrigin("team_assign", ctx, params.task, _toolCallId, undefined, id);
+        const callerOwns = () => admission.owns() && ctx.sessionManager?.getSessionId?.() === origin.coordinatorSessionId &&
+          ctx.sessionManager?.getSessionFile?.() === origin.coordinatorSessionFile;
         let head: ReturnType<typeof createHead>;
-        let accepted = false;
         let durableWatch: { planId: string; unitId: string; execution?: ExecutionBinding } | undefined;
-        return await ownedDispatch(ctx, signal, admission.owns, async (signal, check) => {
         try {
-          check();
-          const watch = interestFrom(params.plan, params.unit);
-          let plan: { file: string; text: string; meta: PlanMeta } | undefined;
-          let execution: ExecutionBinding | undefined;
-          if (watch) {
-            plan = existsSync(ledgerFile(watch.planId, ctx.cwd))
-              ? openExecutionPlan(watch.planId, ctx.cwd, { createLedger: false })
-              : assignmentPlan(watch.planId, ctx.cwd);
-          }
-          const topic = await teamBoardTopic(params.boardTopicId, watch?.planId, ctx.cwd, plan?.meta, check);
-          check();
-          const dispatch = params.role === "developer" && !headOptions ? await developerPreflight({
-            task: params.task, toolCallId: _toolCallId, source: "team_assign", ctx, pi, signal,
-            owns: () => { check(); return true; },
-          }) : undefined;
-          check();
-          if (watch && plan?.meta.status === "frozen") {
-            const opened = openExecutionPlan(watch.planId, ctx.cwd, { createLedger: true, source: plan });
-            plan = opened;
-            execution = opened.binding;
-            if (topic !== undefined) await claimTeamBoardTopicExecution(topic, opened.meta, ctx.cwd, opened.binding.executionRoot, check);
-            check();
-          }
-          if (watch && topic !== undefined && plan) {
-            durableWatch = { ...watch, execution };
-            recordPlanTeamWork(ctx.cwd, watch.planId, watch.unitId, id, "pending", execution);
-          }
-          const task = [
-            `Team assignment header: Team ${evaluation!.sessionId}; role ${params.role}; assignment ${id}${topic !== undefined ? `; Board topic ${topic}` : ""}.`,
-            "WorkBrief:",
-            params.task.trim(),
-          ].join("\n");
-          const launchRoot = execution?.executionRoot ?? ctx.cwd;
-          head = createHead(id, launchRoot, headOptions, backgroundExecutor());
-          const origin = historyOrigin("team_assign", ctx, params.task, _toolCallId, execution, id);
-          if (dispatch) {
-            origin.routing = dispatch.routing;
-            origin.routingEvidence = { state: dispatch.evidence, gap: dispatch.evidenceGap };
-          }
-          check();
-          const handle = await spawnBackground({
-            roleId: params.role,
-            task,
-            cwd: launchRoot,
-            foreground: signal,
-            watch: watch ? { ...watch, execution } : undefined,
-            executor: backgroundExecutor(),
-            historyOrigin: origin,
-            dispatch,
-            head,
-            teamOwner: {
-              token: admission.token,
-              assignmentId: id,
-              onSettled() { admission.settled(); },
+          const handle = reserveBackground({ roleId: params.role, coordinatorSessionId: origin.coordinatorSessionId, task: params.task, origin,
+            owns: callerOwns,
+            teamOwner: { token: admission.token, assignmentId: id, onSettled: () => admission.settled(), noWorkerReleased: admission.noWorkerReleased },
+            async cleanup() {
+              await head?.close();
+              if (durableWatch) recordPlanTeamWork(ctx.cwd, durableWatch.planId, durableWatch.unitId, id, undefined, durableWatch.execution);
             },
-            reconcileBookkeeping: watch && topic !== undefined
-              ? result => recordPlanTeamWork(launchRoot, watch.planId, watch.unitId, id, result.status, execution)
-              : undefined,
-          });
-          accepted = true;
-          admission.commit();
-          const assignment = {
-            id, instanceId: handle.instanceId, roleId: params.role, task: params.task.trim(),
-            planId: watch?.planId, unitId: watch?.unitId, boardTopicId: topic, execution,
-            dispatchId: dispatch?.routing.dispatchId,
-          };
-          recordTeamAssignment(evaluation!, params.role, assignment);
-          return textResult(`assignment_id: ${id}\nrole: ${params.role}\ninstance_id: ${handle.instanceId}\nstatus: running`, assignment);
-        } catch (error) {
-          if (!accepted) {
-            await head?.close();
-            if (durableWatch) {
-              try { recordPlanTeamWork(ctx.cwd, durableWatch.planId, durableWatch.unitId, id, undefined, durableWatch.execution); } catch { /* original assignment failure takes precedence */ }
+            async prepare(signal, check, reserved) {
+              if (consultation) {
+              const record = consultationRecord(pi, ctx, origin, reserved.dispatchId, reserved.instanceId, consultation, reserved.current, undefined, caller);
+              reserved.record(record);
+              consultation = await prepareConsultation(consultation, params.task, ctx, signal, check, record);
             }
-            admission.rollback();
-          }
-          throw error;
-        }
-        });
-      } catch (error) {
-        return errorResult(error instanceof Error ? error.message : String(error));
-      }
+              check();
+              const watch = interestFrom(params.plan, params.unit);
+              let plan: { file: string; text: string; meta: PlanMeta } | undefined;
+              let execution: ExecutionBinding | undefined;
+              if (watch) plan = existsSync(ledgerFile(watch.planId, ctx.cwd))
+                ? openExecutionPlan(watch.planId, ctx.cwd, { createLedger: false }) : assignmentPlan(watch.planId, ctx.cwd);
+              const topic = await teamBoardTopic(params.boardTopicId, watch?.planId, ctx.cwd, plan?.meta, check);
+              check();
+              const dispatch = params.role === "developer" && !headOptions ? await developerPreflight({
+                task: params.task, toolCallId: _toolCallId, source: "team_assign", ctx, pi, signal,
+                owns: () => { check(); return true; },
+              }) : undefined;
+              check();
+              if (watch && plan?.meta.status === "frozen") {
+                const opened = openExecutionPlan(watch.planId, ctx.cwd, { createLedger: true, source: plan });
+                plan = opened; execution = opened.binding;
+                if (topic !== undefined) await claimTeamBoardTopicExecution(topic, opened.meta, ctx.cwd, opened.binding.executionRoot, check);
+                check();
+              }
+              if (watch && topic !== undefined && plan) {
+                durableWatch = { ...watch, execution };
+                recordPlanTeamWork(ctx.cwd, watch.planId, watch.unitId, id, "pending", execution);
+              }
+              const task = [`Team assignment header: Team ${evaluation!.sessionId}; role ${params.role}; assignment ${id}${topic !== undefined ? `; Board topic ${topic}` : ""}.`,
+                "WorkBrief:", params.task.trim()].join("\n");
+              const launchRoot = execution?.executionRoot ?? ctx.cwd;
+              head = createHead(id, launchRoot, headOptions, backgroundExecutor());
+              if (execution) origin.execution = { executionRoot: execution.executionRoot, executionRef: `${execution.planId}@${execution.revision}:${execution.hash}` };
+              if (dispatch) { origin.routing = dispatch.routing; origin.routingEvidence = { state: dispatch.evidence, gap: dispatch.evidenceGap }; }
+              check();
+              recordTeamAssignment(evaluation!, params.role, { id, instanceId: reserved.instanceId, roleId: params.role,
+                task: params.task.trim(), planId: watch?.planId, unitId: watch?.unitId, boardTopicId: topic, execution, dispatchId: reserved.dispatchId });
+              return { roleId: params.role, task, cwd: launchRoot, watch: watch ? { ...watch, execution } : undefined,
+                executor: backgroundExecutor(), historyOrigin: origin, dispatch, consultation, head,
+                reconcileBookkeeping: watch && topic !== undefined
+                  ? result => recordPlanTeamWork(launchRoot, watch.planId, watch.unitId, id, result.status, execution) : undefined };
+            },
+          });
+          admission.commit();
+          const assignment = { id, instanceId: handle.instanceId, roleId: params.role, task: params.task.trim(), dispatchId: handle.dispatchId };
+          recordTeamAssignment(evaluation!, params.role, assignment);
+          return textResult(formatWorkerHandle(handle), { ...assignment, ...handle });
+        } catch (error) { admission.rollback(); throw error; }
+      } catch (error) { return errorResult(error instanceof Error ? error.message : String(error)); }
     },
   });
 
@@ -582,6 +579,7 @@ function registerBackgroundTools(pi: ExtensionAPI): void {
         mode: Type.Optional(Type.Union([Type.Literal("single"), Type.Literal("head")])),
         writes: Type.Optional(Type.Array(Type.String(), { maxItems: 128 })),
         checkpoint_origin: Type.Optional(checkpointOrigin),
+        reasoning: reasoningSchema,
       },
       noExtra,
     ),
@@ -589,41 +587,42 @@ function registerBackgroundTools(pi: ExtensionAPI): void {
       const blocked = childBlocked("agent_spawn");
       if (blocked) return blocked;
       try {
+        if (signal?.aborted || !params.task.trim()) throw new Error("Dispatch cancelled or empty task");
         const headOptions = validateAgentMode(params, ctx.cwd);
-        const watch = interestFrom(params.plan, params.unit);
-        const execution = watch ? watchedExecutionBinding(watch.planId, ctx.cwd) : undefined;
-        const launchRoot = execution?.executionRoot ?? ctx.cwd;
-        const head = createHead(randomUUID(), launchRoot, headOptions, backgroundExecutor());
-        return await ownedDispatch(ctx, signal, () => true, async (signal, check) => {
-        try {
-        const dispatch = params.role === "developer" && !head ? await developerPreflight({
-          task: params.task, toolCallId: _toolCallId, source: "agent_spawn", ctx, pi, signal,
-          owns: () => { check(); return true; },
-        }) : undefined;
-        check();
-        const origin = historyOrigin("agent_spawn", ctx, params.task, _toolCallId, execution);
-        if (dispatch) {
-          origin.routing = dispatch.routing;
-          origin.routingEvidence = { state: dispatch.evidence, gap: dispatch.evidenceGap };
-        }
-        const handle = await spawnBackground({
-          roleId: params.role,
-          task: params.task,
-          cwd: launchRoot,
-          foreground: signal,
-          watch: watch ? { ...watch, execution } : undefined,
-          executor: backgroundExecutor(),
-          historyOrigin: origin,
-          dispatch,
-          head,
+        if (headOptions) assertNoCheckpointLease(ctx.cwd);
+        let consultation = consultationSnapshot(params.role, params.reasoning, ctx.cwd);
+        const caller = ctx.sessionManager;
+        const origin = historyOrigin("agent_spawn", ctx, params.task, _toolCallId);
+        let head: ReturnType<typeof createHead>;
+        const handle = reserveBackground({ roleId: params.role, coordinatorSessionId: origin.coordinatorSessionId, task: params.task, origin,
+          owns: () => ctx.sessionManager?.getSessionId?.() === origin.coordinatorSessionId &&
+            ctx.sessionManager?.getSessionFile?.() === origin.coordinatorSessionFile,
+          async cleanup() { await head?.close(); },
+          async prepare(signal, check, reserved) {
+            if (consultation) {
+              const record = consultationRecord(pi, ctx, origin, reserved.dispatchId, reserved.instanceId, consultation, reserved.current, undefined, caller);
+              reserved.record(record);
+              consultation = await prepareConsultation(consultation, params.task, ctx, signal, check, record);
+            }
+            check();
+            const watch = interestFrom(params.plan, params.unit);
+            const execution = watch ? watchedExecutionBinding(watch.planId, ctx.cwd) : undefined;
+            const launchRoot = execution?.executionRoot ?? ctx.cwd;
+            head = createHead(randomUUID(), launchRoot, headOptions, backgroundExecutor());
+            const dispatch = params.role === "developer" && !head ? await developerPreflight({
+              task: params.task, toolCallId: _toolCallId, source: "agent_spawn", ctx, pi, signal,
+              owns: () => { check(); return true; },
+            }) : undefined;
+            check();
+            if (execution) origin.execution = { executionRoot: execution.executionRoot, executionRef: `${execution.planId}@${execution.revision}:${execution.hash}` };
+            if (dispatch) { origin.routing = dispatch.routing; origin.routingEvidence = { state: dispatch.evidence, gap: dispatch.evidenceGap }; }
+            return { roleId: params.role, task: params.task, cwd: launchRoot,
+              watch: watch ? { ...watch, execution } : undefined, executor: backgroundExecutor(), historyOrigin: origin,
+              dispatch, consultation, head };
+          },
         });
-        return textResult(formatWorkerHandle(handle), { ...handle, ...(dispatch ? { dispatchId: dispatch.routing.dispatchId } : {}) });
-        } catch (error) { await head?.close(); throw error; }
-        });
-      } catch (error) {
-        const message = error instanceof PitakoConfigError || error instanceof Error ? error.message : String(error);
-        return errorResult(message);
-      }
+        return textResult(formatWorkerHandle(handle), handle);
+      } catch (error) { return errorResult(error instanceof Error ? error.message : String(error)); }
     },
   });
 

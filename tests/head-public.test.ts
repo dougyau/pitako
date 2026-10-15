@@ -1,16 +1,18 @@
 import { expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { preparedTool } from "./fixtures/background-dispatch.ts";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { createCodingTools, type AgentBeforeSettleEventResult, type ExtensionAPI, type ExtensionContext, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import agentExtension from "../extensions/agent/index.ts";
-import { bindBackgroundOwner, clearBackgroundOwner, setBackgroundExecutor, workerResult, teamWorkerResult } from "../extensions/agent/background.ts";
+import { bindBackgroundOwner, clearBackgroundOwner, deliverWorkerResults, setBackgroundExecutor, workerResult, teamWorkerResult } from "../extensions/agent/background.ts";
 import { beginTeamEvaluation, recordPlanTeamWork, retireTeamEvaluation, teamRoleReservation } from "../extensions/team.ts";
 import { createPiExecutor } from "../extensions/agent/pi.ts";
 import { agentFixtureOwnership } from "./fixtures/agent-fixture-ownership.ts";
-import { controlledPi } from "./fixtures/pi-factories.ts";
+import { controlledPi, controlledModel } from "./fixtures/pi-factories.ts";
 import { adoptCheckpoint, listCheckpoints, readCheckpoint, type CheckpointOrigin } from "../extensions/agent/checkpoints.ts";
+import { consultationStats, queryHistory } from "../extensions/agent/history-query.ts";
 import { WorkerHistory } from "../extensions/agent/history.ts";
 import { openBoard } from "../extensions/board/store.ts";
 import { currentWorkspace } from "../extensions/board/workspace.ts";
@@ -32,6 +34,7 @@ async function bind(factories: ExtensionFactory[], appendEntry: ExtensionAPI["ap
 }
 
 async function harness(options: { headPolicy?: boolean; final?: "stop" | "error" | "aborted"; missingCost?: boolean; gitRepository?: boolean; headFallback?: boolean; ordinarySdk?: boolean;
+  workerCreate?: { entered: ReturnType<typeof gate>; release: ReturnType<typeof gate> };
   root?: string; seed?: (root: string) => void | Promise<void>; cutReceipt?: boolean; finalError?: string; objectFormat?: "sha256" } = {}) {
   const root = options.root ?? mkdtempSync(path.join(tmpdir(), "pitako-head-public-"));
   if (!options.root) fixture.directories.push(root);
@@ -69,15 +72,16 @@ classifier_model = "classifier"
   let headLocal!: Local, headSession: any;
   const locals = new Map<object, Local>();
   let classifications = 0;
-  const modelRegistry = { getAvailableOfType: async () => [{ provider: "fixture", id: "classifier", contextWindow: 100000 }],
+  const modelRegistry = { find: (provider: string, id: string) => provider === "fixture" && id === "selected" ? controlledModel() : undefined, getAvailableOfType: async () => [{ provider: "fixture", id: "classifier", contextWindow: 100000 }],
     classify: async () => { classifications++; return { stopReason: "stop", answers: { capacity: {
       type: "choice", choice: "developer_mid", probabilities: { developer_mid: 0.9, developer_senior: 0.1, developer_junior: 0, indeterminate: 0 },
     } } }; } };
   const publicSessionId = `owner-${path.basename(root)}`;
   const ctx = { cwd: root, sessionManager: { getSessionId: () => publicSessionId }, modelRegistry } as unknown as ExtensionContext;
-  const evaluation = beginTeamEvaluation(publicSessionId, false)!;
+  const ownerToken = Symbol(publicSessionId);
+  const evaluation = beginTeamEvaluation(publicSessionId, false, ownerToken)!;
   const delivery: any[] = [];
-  bindBackgroundOwner({ token: Symbol(publicSessionId), sessionId: publicSessionId, isIdle: () => false,
+  bindBackgroundOwner({ token: ownerToken, sessionId: publicSessionId, isIdle: () => false,
     hasUI: false, notify() {}, sendMessage() {}, appendResult(message) { delivery.push({ type: "custom_message", ...message }); },
     getBranch: () => delivery });
   const headCtx = () => ({ ...ctx, sessionManager: headSession.sessionManager }) as ExtensionContext;
@@ -119,7 +123,7 @@ classifier_model = "classifier"
       session.getAllTools = () => ["read", "bash", "agent_spawn", "team_assign", ...local.tools.keys()].map(name => ({ name }));
     },
     prompt: async (session, task) => {
-      const id = JSON.parse(task).brief.split(" ").at(-1);
+      const id = task.startsWith("{") ? JSON.parse(task).brief.split(" ").at(-1) : task;
       const state = leaf(id);
       state.session = session; state.local = locals.get(session); state.task = task;
       for (const hook of state.local!.events.get("turn_start") ?? []) await hook({});
@@ -137,12 +141,17 @@ classifier_model = "classifier"
       if (state) { state.disposing.resolve(); await state.dispose.promise; }
     },
   });
+  if (options.workerCreate) {
+    const create = workers.factories.createSession!;
+    workers.factories.createSession = async input => { options.workerCreate!.entered.resolve(); await options.workerCreate!.release.promise; return create(input); };
+    fixture.finishOnCleanup(() => options.workerCreate!.release.resolve());
+  }
   const hostExecutor = createPiExecutor({ factories: host.factories }), leafExecutor = createPiExecutor({ factories: workers.factories });
   let starts = 0, leafStarts = 0;
   setBackgroundExecutor({ capturesHistory: true, start(input) {
     starts++;
     if (input.scope) leafStarts++;
-    return input.head || options.ordinarySdk ? hostExecutor.start(input) : input.scope ? leafExecutor.start(input)
+    return input.head || options.ordinarySdk ? hostExecutor.start(input) : input.scope || input.consultant ? leafExecutor.start(input)
       : Promise.resolve({ status: "completed", result: "ordinary", sideEffects: false });
   } });
   fixture.finishOnCleanup(() => {
@@ -155,7 +164,7 @@ classifier_model = "classifier"
     clearBackgroundOwner(); setBackgroundExecutor(undefined);
   });
   const publicLocal = await bind([agentExtension], () => {});
-  const callPublic = (tool: string, params: unknown) => publicLocal.tools.get(tool).execute(`public-${tool}`, params, undefined, undefined, ctx);
+  const callPublic = (tool: string, params: unknown) => preparedTool(publicLocal.tools.get(tool)).execute(`public-${tool}`, params, undefined, undefined, ctx);
   let localCalls = 0;
   const call = async (name: string, params: unknown, onUpdate?: (update: unknown) => unknown) => {
     const id = `${name}-${++localCalls}`;
@@ -195,10 +204,167 @@ classifier_model = "classifier"
   };
   const settle = async () => { headDone.resolve(); await fixture.settleRuns(); };
   return { root, evaluation, ctx, leaf, host, workers, headEntered, headAborted, callPublic, call, callLeaf, read, closed, settle,
-    delivery, publicTools: publicLocal.tools, headLocal: () => headLocal, headSession: () => headSession,
+    delivery, deliver: () => deliverWorkerResults(ownerToken, true), publicTools: publicLocal.tools, headLocal: () => headLocal, headSession: () => headSession,
     counts: () => ({ starts, leafStarts, classifications }),
     outcome: (id: string, team = false) => team ? teamWorkerResult(evaluation.token, id) : workerResult(id) };
 }
+
+test("Head consultation composes native receipt, live Developer control, checkpoint and finish", fixture.ownedCase("composed consultation route", async () => {
+  const h = await harness({ gitRepository: true });
+  const admission = await h.callPublic("agent_spawn", { role: "developer", mode: "head", writes: ["shared"], task: "consult with Developer active" });
+  await h.headEntered.promise;
+  await h.call("head_plan", { action: "edit", expectedRevision: 0,
+    nodes: [node("a", ["shared"])], supersede: [] });
+  const [a] = await h.call("head_start", { expectedRevision: 1, nodeIds: ["a"] });
+  await h.leaf("a").entered.promise;
+  const handle = await h.call("head_consult", { role: "researcher", task: "advice", reasoning: { mode: "direct", level: "low" } });
+  expect(handle.state).toBe("preparing");
+  // No turn_end or before_settle releases preparation; wait in this same turn progresses.
+  let after = (await h.read()).cursor;
+  while (!h.leaf("advice").session) {
+    const event = await h.call("head_wait", { after });
+    after = event.cursor;
+    const state = await h.call("head_result", { childId: handle.childId });
+    if (state.phase === "closed") throw new Error(JSON.stringify(state.envelope));
+  }
+  await h.leaf("advice").entered.promise;
+  const advice = h.leaf("advice");
+  await expect(checkpoint(h, ["shared"], 1)).rejects.toThrow();
+  await expect(h.call("head_plan", { action: "beginIntegration", expectedRevision: 1 })).rejects.toThrow();
+  await expect(h.call("head_finish", { status: "completed", epoch: "not-integrated", summary: "early", verification: ["fake"], limits: [] })).rejects.toThrow();
+  expect(advice.session.active).not.toContain("head_consult");
+  expect(advice.local!.tools.has("head_scope_ack")).toBe(false);
+  expect(advice.local!.tools.has("head_checkpoint")).toBe(false);
+  await expect(h.callLeaf("advice", "write", { path: "shared", content: "bad" })).rejects.toThrow();
+  await h.callLeaf("advice", "bash", { command: "test ! -f shared" });
+  const nativeId = advice.session.sessionId;
+  advice.session.sessionId = "wrong-native";
+  try { await expect(h.callLeaf("advice", "bash", { command: "true" })).rejects.toThrow("native identity changed"); }
+  finally { advice.session.sessionId = nativeId; }
+  const active = await h.call("head_result", { childId: a.runId });
+  const identity = { runId: a.runId, effectiveRevision: 1, ...active.native };
+  expect((await h.call("head_observe", identity)).activity.active).toBe(true);
+  expect(await h.call("head_input", { ...identity, intent: "query", text: "continue independently" })).toBeDefined();
+  await h.callLeaf("a", "write", { path: "shared", content: "Developer change\n" });
+  advice.done.resolve(); advice.dispose.resolve();
+  const closedAdvice = await h.closed(handle.childId);
+  expect(closedAdvice.envelope).toMatchObject({ purpose: "consultation", dispatchId: handle.dispatchId, outcome: "completed" });
+  expect(closedAdvice.envelope).not.toHaveProperty("nodeId");
+  await expect(h.call("head_review", { runId: handle.childId, effectiveRevision: 1, judgment: "satisfied", evidence: ["advice"], reason: "not a node" })).rejects.toThrow();
+  h.leaf("a").done.resolve(); h.leaf("a").dispose.resolve(); await h.closed(a.runId);
+  await expect(h.call("head_plan", { action: "beginIntegration", expectedRevision: 1 })).rejects.toThrow();
+  const event = { outcome: "completed", context: { canContinue: true } };
+  let offered: AgentBeforeSettleEventResult | undefined;
+  for (const hook of h.headLocal().events.get("agent_before_settle") ?? []) offered = await hook(event) ?? offered;
+  expect(offered?.entries?.filter(entry => entry.type === "custom_message" && entry.customType === "pitako.head.result")).toHaveLength(2);
+  // Native SDK commit, not a substituted receipt consumer.
+  for (const entry of offered!.entries!) {
+    if (entry.type === "custom_message") h.headSession().sessionManager.appendCustomMessageEntry(entry.customType, entry.content, entry.display, entry.details);
+  }
+  expect((await h.call("head_result", { childId: handle.childId })).received).toBe(true);
+  await h.call("head_review", { runId: a.runId, effectiveRevision: 1, judgment: "satisfied", evidence: ["native Developer result and managed diff"], reason: "inspected" });
+  const barrier = await h.call("head_plan", { action: "beginIntegration", expectedRevision: 1 });
+  await expect(h.call("head_consult", { role: "oracle", task: "after barrier" })).rejects.toThrow("integration");
+  const saved = await checkpoint(h, ["shared"], 1);
+  expect(saved.status).toBe("committed");
+  const consultationSources = saved.manifest.contributors.filter((entry: any) => entry.contribution.source.kind === "consultation");
+  expect(consultationSources.length).toBeGreaterThan(0);
+  for (const entry of consultationSources) {
+    expect(entry.contribution.source).toMatchObject({ dispatchId: handle.dispatchId, observedRevision: 1 });
+    expect(entry.contribution.source).not.toHaveProperty("effectiveRevision");
+    expect(entry.contribution.source).not.toHaveProperty("runId");
+    expect(entry.contribution.changes).toEqual([]);
+  }
+  expect(saved.manifest.native).toContainEqual(expect.objectContaining({ source: expect.objectContaining({ kind: "consultation", dispatchId: handle.dispatchId }) }));
+  await h.call("bash", { command: "test -f shared" });
+  h.headSession().sessionManager.appendMessage({ role: "toolResult", toolName: "consultation_feedback", toolCallId: "reserved-feedback",
+    content: [{ type: "text", text: "advice is not verification" }], isError: false, timestamp: Date.now() });
+  const candidates = (await h.read()).verificationCandidates;
+  expect(candidates.some((entry: any) => entry.toolName === "consultation_feedback")).toBe(false);
+  expect(candidates.every((entry: any) => entry.toolName !== "head_consult")).toBe(true);
+  await h.call("head_finish", { status: "completed", epoch: barrier.epoch, summary: "Integrated Developer change", verification: candidates.map((entry: any) => entry.entryId), limits: ["Controlled PiFactories boundary"] });
+  await h.settle();
+  expect(h.outcome(admission.details.instanceId).head?.metrics).toMatchObject({ aggregateUsage: undefined, usageComplete: false, consultations: [expect.objectContaining({ dispatchId: handle.dispatchId, usage: expect.objectContaining({ input: 2, output: 1, cost: 0.002 }) })], observedPeakParallelism: 2 });
+  expect(h.delivery).toHaveLength(0);
+  h.deliver();
+  expect(h.delivery).toHaveLength(1); // only the integrated Head handoff reaches the foreground
+  const historical = readCheckpoint(h.root, saved.origin);
+  expect(historical.historicalEvidence.closureGaps).toEqual([]);
+  expect(adoptCheckpoint(h.root, saved.origin, [path.join(h.root, "shared")]).checkpointId).toBe(saved.origin.checkpointId);
+  // Reconstruct from disk, not the live dispatch/Head object.
+  const stats = await consultationStats(h.ctx.sessionManager.getSessionId(), handle.dispatchId, h.root);
+  expect(stats.rows).toContainEqual(expect.objectContaining({ dispatchId: handle.dispatchId, evidence: "physically-persisted" }));
+  expect(stats.rows).toContainEqual(expect.objectContaining({ dispatchId: handle.dispatchId, events: expect.arrayContaining([expect.objectContaining({ event: "decision", data: expect.objectContaining({ decisionId: handle.decisionId }) })]) }));
+  const catalog = new WorkerHistory(h.root).list().flatMap(group => group.consultations ?? []);
+  expect(catalog.find(row => row.dispatchId === handle.dispatchId)).toMatchObject({
+    callerSessionId: h.headSession().sessionId, coordinatorSessionId: h.ctx.sessionManager.getSessionId() });
+}));
+
+test("Head shares capacity atomically and no-worker receipt releases without result getters", fixture.ownedCase("consultation capacity", async () => {
+  const h = await harness();
+  await h.callPublic("agent_spawn", { role: "developer", mode: "head", writes: [], task: "capacity" });
+  await h.headEntered.promise;
+  await h.call("head_plan", { action: "edit", expectedRevision: 0, nodes: [node("a", []), node("b", []), node("c", [])], supersede: [] });
+  const handles = await Promise.all(["one", "two"].map(task => h.call("head_consult", { role: "oracle", task })));
+  // Reservations precede preparation; even if preflight fails they need native receipts.
+  await expect(h.call("head_start", { expectedRevision: 1, nodeIds: ["a", "b"] })).rejects.toThrow("parallel limit");
+  expect((await h.read()).runs).toHaveLength(0);
+  const third = await h.call("head_consult", { role: "oracle", task: "three" });
+  await expect(h.call("head_consult", { role: "researcher", task: "full" })).rejects.toThrow("parallel limit");
+  const event = { outcome: "completed", context: { canContinue: false } };
+  const received: string[] = [];
+  // Boundaries await progressing preflight, offer ready outcomes before correction, and never request unavailable continuation.
+  while (received.length < 3) {
+    let offered: AgentBeforeSettleEventResult | undefined;
+    for (const hook of h.headLocal().events.get("agent_before_settle") ?? []) offered = await hook(event) ?? offered;
+    expect(offered?.continue).not.toBe(true);
+    const entries = offered!.entries!.filter(entry => entry.type === "custom_message" && entry.customType === "pitako.head.result");
+    expect(entries.length).toBeGreaterThan(0);
+    for (const entry of entries) if (entry.type === "custom_message") {
+      const envelope = JSON.parse(entry.content as string);
+      expect(envelope).toMatchObject({ purpose: "consultation", outcome: "no-worker" });
+      expect(envelope).not.toHaveProperty("instanceId");
+      expect(envelope).not.toHaveProperty("result");
+      expect(received).not.toContain(envelope.childId);
+      received.push(envelope.childId);
+      h.headSession().sessionManager.appendCustomMessageEntry(entry.customType, entry.content, entry.display, entry.details);
+    }
+  }
+  // Admission observes branch receipts directly, with no head_result/read in between.
+  const runs = await h.call("head_start", { expectedRevision: 1, nodeIds: ["a", "b", "c"] });
+  expect(runs).toHaveLength(3);
+  await expect(h.call("head_consult", { role: "researcher", task: "Developers full" })).rejects.toThrow("parallel limit");
+  for (const id of ["a", "b", "c"]) { await h.leaf(id).entered.promise; h.leaf(id).done.resolve(); h.leaf(id).dispose.resolve(); }
+  for (const run of runs) await h.closed(run.runId);
+  for (const run of runs) await h.call("head_review", { runId: run.runId, effectiveRevision: 1, judgment: "satisfied", evidence: ["native result"], reason: "inspected" });
+  const barrier = await h.call("head_plan", { action: "beginIntegration", expectedRevision: 1 });
+  await h.call("bash", { command: "true" });
+  const verification = (await h.read()).verificationCandidates.map((entry: any) => entry.entryId);
+  await h.call("head_finish", { status: "completed", epoch: barrier.epoch, summary: "No-worker receipt allowed valid independent progress", verification, limits: [] });
+  await h.settle();
+  expect(new Set([...handles, third].map(handle => handle.childId)).size).toBe(3);
+}));
+
+test("outer cancellation owns consultation startup and late disposal without retargeting", fixture.ownedCase("consultation startup cancellation", async () => {
+  const workerCreate = { entered: gate(), release: gate() };
+  const h = await harness({ workerCreate });
+  const admission = await h.callPublic("agent_spawn", { role: "developer", mode: "head", writes: [], task: "cancel startup" });
+  await h.headEntered.promise;
+  await h.call("head_consult", { role: "researcher", task: "late" });
+  await workerCreate.entered.promise;
+  await h.callPublic("agent_cancel", { id: admission.details.instanceId });
+  await h.headAborted.promise;
+  let settled = false;
+  const settling = h.settle().then(() => { settled = true; });
+  await Promise.resolve();
+  expect(settled).toBe(false);
+  workerCreate.release.resolve();
+  await settling;
+  expect(h.workers.sessions).toHaveLength(1);
+  expect(h.workers.sessions[0].prompts).toEqual([]);
+  expect(h.workers.sessions[0].events).toContain("dispose");
+  expect(h.outcome(admission.details.instanceId).status).toBe("cancelled");
+}));
 
 test("public modes reject before effects and preserve ordinary routes", fixture.ownedCase("public mode admission", async () => {
   const h = await harness({ headPolicy: false });
@@ -846,7 +1012,7 @@ test("public Team Head completes direct product work with no leaves through the 
       ownUsage: result.usage,
       aggregateUsage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, total: 15, cost: 0.01, turns: 1, toolCalls: 0 },
       aggregateClassifierUsage: undefined,
-      usageComplete: true, classifierUsage: [], elapsedMs: expect.any(Number), observedPeakParallelism: 0,
+      usageComplete: true, classifierUsage: [], consultations: [], combinedTotal: null, coverage: expect.any(String), elapsedMs: expect.any(Number), observedPeakParallelism: 0,
     },
   });
   expect(result.instanceId).toBe(admission.details.instanceId);
@@ -929,8 +1095,8 @@ test("public Team Head decomposes, overlaps, corrects, integrates and returns na
   const result = h.outcome(admission.details.instanceId, true);
   expect(result.status).toBe("completed"); expect(result.result).toBe("Integrated correction and verified product");
   expect(result.head!.finish).toMatchObject({ status: "completed", verification: [finalCheck], epoch: next.epoch });
-  expect(result.head!.metrics).toMatchObject({ ownUsage: { input: 10, output: 5 }, aggregateUsage: { input: 16, output: 8 },
-    usageComplete: true, observedPeakParallelism: 2, classifierUsage: [] });
+  expect(result.head!.metrics).toMatchObject({ ownUsage: { input: 10, output: 5 }, aggregateUsage: undefined,
+    usageComplete: false, observedPeakParallelism: 2, classifierUsage: [] });
   expect(result.head!.headInstanceId).toBe(result.instanceId);
   expect(result.head!.leaves).toHaveLength(3);
   expect(JSON.stringify(result)).not.toContain('"role":"assistant"');
@@ -967,6 +1133,9 @@ test("public spawn grants read-only Head; native offers are not receipts and inv
   expect(repeated.details).toMatchObject({ envelopeId: JSON.parse(envelope.content).envelopeId,
     deliveryGap: expect.stringContaining("Prior offer") });
   h.headSession().sessionManager.appendCustomMessageEntry(envelope.customType, envelope.content, true, envelope.details);
+  const correction = await boundary(event);
+  expect(correction?.continue).toBe(true); // Offers do not consume the missing-finish correction.
+  expect((await boundary(event))?.continue).toBe(true);
   const stopped = await boundary(event);
   expect(stopped?.continue).not.toBe(true);
   for (const event of [{ outcome: "aborted", context: { canContinue: true } },
@@ -1073,4 +1242,148 @@ test("cancelled public Head cannot finish successfully and waits for its own chi
   expect(h.leaf("a").session.events).toContain("dispose");
   expect(teamRoleReservation(h.evaluation, "developer")).toBeUndefined();
   expect(() => h.outcome(admission.details.instanceId, true)).toThrow("unknown Team worker");
+}));
+
+test("accepted no-worker consultation fences initial Head prompt replay", fixture.ownedCase("consultation replay fence", async () => {
+  const h = await harness({ headFallback: true, final: "error", finalError: "HTTP 429 too many requests" });
+  const admission = await h.callPublic("agent_spawn", { role: "developer", mode: "head", writes: [], task: "Dispatch once" });
+  await h.headEntered.promise;
+  const handle = await h.call("head_consult", { role: "oracle", task: "missing policy" });
+  expect((await h.closed(handle.childId)).envelope.outcome).toBe("no-worker");
+  await h.settle();
+  expect(h.outcome(admission.details.instanceId).status).toBe("failed");
+  expect(h.host.sessions).toHaveLength(1);
+  expect(h.host.sessions[0].prompts.filter(task => task.includes("Dispatch once"))).toHaveLength(1);
+  expect(h.workers.sessions).toHaveLength(0);
+}));
+
+test("outer cancellation joins consultation disposal and records drop on the Head caller", fixture.ownedCase("consultation disposal cancellation", async () => {
+  const h = await harness();
+  const admission = await h.callPublic("agent_spawn", { role: "developer", mode: "head", writes: [], task: "cancel disposal" });
+  await h.headEntered.promise;
+  const handle = await h.call("head_consult", { role: "researcher", task: "disposing-advice" });
+  const advice = h.leaf("disposing-advice");
+  await advice.entered.promise;
+  advice.done.resolve();
+  await advice.disposing.promise;
+  await h.callPublic("agent_cancel", { id: admission.details.instanceId });
+  await h.headAborted.promise;
+  let finished = false;
+  const settling = h.settle().then(() => { finished = true; });
+  await Promise.resolve();
+  expect(finished).toBe(false);
+  advice.dispose.resolve();
+  await settling;
+  expect(h.outcome(admission.details.instanceId).status).toBe("cancelled");
+  const stats = await consultationStats(h.ctx.sessionManager.getSessionId(), handle.dispatchId, h.root);
+  expect(stats.rows).toContainEqual(expect.objectContaining({ dispatchId: handle.dispatchId, events: expect.arrayContaining([expect.objectContaining({ event: "delivery", data: { state: "dropped" } })]) }));
+  expect(h.workers.sessions).toHaveLength(1);
+}));
+
+
+test("Head classify and voluntary feedback cross SDK-managed history, exact branch receipts and authorized followups", fixture.ownedCase("Head reasoning feedback", async () => {
+  const h = await harness(), entered = gate(), release = gate();
+  fixture.finishOnCleanup(() => release.resolve());
+  const requests: any[] = [];
+  h.ctx.modelRegistry.classify = (async (_model: any, request: any, options: any) => {
+    expect(options.maxRetries).toBe(0); requests.push(request); entered.resolve(); await release.promise;
+    return { api: "fixture", provider: "fixture", model: "classifier", timestamp: 1, stopReason: "stop", answers: { reasoning: {
+      type: "choice", choice: "high", confidence: 0.9,
+      probabilities: Object.fromEntries(Object.keys(request.questions.reasoning.criteria).map(key => [key, key === "high" ? 0.9 : 0.01])),
+    } }, usage: { input: 5, output: 1, totalTokens: 6 } };
+  }) as any;
+  const admission = await h.callPublic("agent_spawn", { role: "developer", mode: "head", writes: [], task: "Head T3" });
+  await h.headEntered.promise;
+  const handle = await h.call("head_consult", { role: "researcher", task: "classified", reasoning: { mode: "classify" } });
+  expect(requests).toEqual([]); expect(h.workers.sessions).toEqual([]);
+  await entered.promise;
+  expect((await h.call("head_result", { childId: handle.childId })).phase).toBe("preflight");
+  expect(requests[0].questions).not.toHaveProperty("capacity");
+  release.resolve(); await h.leaf("classified").entered.promise;
+  expect(h.leaf("classified").session.thinkingLevel).toBe("high");
+  h.leaf("classified").done.resolve(); h.leaf("classified").dispose.resolve(); await h.closed(handle.childId);
+  const feedback = { dispatchId: handle.dispatchId, usefulness: "used" };
+  await expect(h.call("consultation_feedback", feedback)).rejects.toThrow(); // getter/completion are not receipt
+  const manager = h.headSession().sessionManager;
+  const before = manager.getLeafId();
+  let offered: AgentBeforeSettleEventResult | undefined;
+  for (const hook of h.headLocal().events.get("agent_before_settle") ?? []) offered = await hook({ outcome: "completed", context: { canContinue: true } }) ?? offered;
+  await expect(h.call("consultation_feedback", feedback)).rejects.toThrow(); // offered/draft is not receipt
+  for (const entry of offered!.entries!) if (entry.type === "custom_message") manager.appendCustomMessageEntry(entry.customType, entry.content, entry.display, entry.details);
+  expect(await h.call("consultation_feedback", feedback)).toMatchObject({ usefulness: "used", author: { callerSessionId: h.headSession().sessionId } });
+  const after = manager.getLeafId(); manager.branch(before!);
+  await expect(h.call("consultation_feedback", feedback)).rejects.toThrow();
+  manager.branch(after!);
+  await h.call("head_plan", { action: "edit", expectedRevision: 0, nodes: [node("follow", [])], supersede: [] });
+  const [follow] = await h.call("head_start", { expectedRevision: 1, nodeIds: ["follow"] });
+  await h.leaf("follow").entered.promise; h.leaf("follow").done.resolve(); h.leaf("follow").dispose.resolve(); const followClosed = await h.closed(follow.runId);
+  const followId = followClosed.envelope.result.instanceId;
+  for (const followupInstances of [["fabricated"], [admission.details.instanceId], [followId, followId]])
+    await expect(h.call("consultation_feedback", { ...feedback, followupInstances })).rejects.toThrow();
+  await h.call("consultation_feedback", { ...feedback, usefulness: "partial", followupInstances: [followId] });
+  const store = new WorkerHistory(), linked = store.list().find(group => group.consultations?.some(locator => locator.dispatchId === handle.dispatchId))!;
+  const filler = store.createGroup(h.root);
+  for (let i = 0; i < 201; i++) {
+    const groupId = `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`;
+    writeFileSync(path.join(store.catalogDir, `${groupId}.json`), JSON.stringify({ ...filler, groupId }));
+  }
+  expect(store.list().findIndex(group => group.members.some(member => member.instanceId === followId))).toBeGreaterThan(200);
+  const foreign = store.admit(filler.groupId, { roleId: "developer", instanceId: "foreign-followup", coordinatorSessionId: "foreign", head: { assignmentId: "foreign", headInstanceId: "foreign" } });
+  for (const followupInstances of [[foreign.instanceId], ["fabricated"], [admission.details.instanceId], [followId, followId]])
+    await expect(h.call("consultation_feedback", { ...feedback, followupInstances })).rejects.toThrow();
+  expect(await h.call("consultation_feedback", { ...feedback, usefulness: "partial", note: "large catalog", followupInstances: [followId] })).toMatchObject({ followupInstances: [followId] });
+  store.mutate(linked.groupId, group => { group.consultations!.push({ ...group.consultations![0]!, dispatchId: "ffffffff-ffff-4fff-8fff-ffffffffffff", followupInstances: [followId] }); });
+  await expect(h.call("consultation_feedback", { ...feedback, followupInstances: [followId] })).rejects.toThrow("already linked");
+  await h.call("head_finish", { status: "failed", diagnostic: "Controlled observation complete", evidence: [], limits: ["No product change"] });
+  await h.settle();
+  const coordinatorSessionId = h.ctx.sessionManager.getSessionId();
+  const chunks: Buffer[] = [];
+  let cursor: string | undefined;
+  do {
+    const persisted = await queryHistory({ action: "read", dispatchId: handle.dispatchId, groupId: linked.groupId, source: "caller", cursor, limit: 200 }, coordinatorSessionId, h.root);
+    expect(persisted.diagnostics.some(item => item.code === "native_physical_order")).toBe(true);
+    chunks.push(...persisted.items.map((item: any) => Buffer.from(item.data, "base64")));
+    cursor = persisted.cursor ?? undefined;
+  } while (cursor);
+  const entries = Buffer.concat(chunks).toString("utf8").trim().split("\n").map(line => JSON.parse(line));
+  expect(entries.filter(entry => entry.data?.event === "feedback")).toHaveLength(3);
+  expect(entries.filter(entry => entry.data?.event === "feedback").at(-1).data.data).toMatchObject({
+    note: "large catalog", followupInstances: [followId], author: { callerSessionId: h.headSession().sessionId },
+  });
+  // The targeted reader above observes the large catalog. Keep the existing bounded stats check separate.
+  for (let i = 0; i < 201; i++) unlinkSync(path.join(store.catalogDir, `00000000-0000-4000-8000-${String(i).padStart(12, "0")}.json`));
+  const stats = await consultationStats(coordinatorSessionId, handle.dispatchId, h.root);
+  const row = stats.rows[0] as any;
+  expect(row.classifier).toMatchObject({ usage: { input: 5, output: 1 } });
+  expect(row.attempts).toHaveLength(1); expect(row.attempts[0].usage).toMatchObject({ input: 2, output: 1 });
+  expect(row.followups).toHaveLength(1); expect(row.followups[0].usage).toMatchObject({ input: 2, output: 1 });
+  expect(row.latestFeedback.data).toMatchObject({ usefulness: "partial", followupInstances: [followId] });
+  expect(row.events.filter((event: any) => event.event === "feedback")).toHaveLength(3);
+  expect(h.outcome(admission.details.instanceId).head!.metrics).toMatchObject({ combinedTotal: null, usageComplete: false,
+    classifierUsage: [expect.objectContaining({ dispatchId: handle.dispatchId, usage: { input: 5, output: 1, totalTokens: 6 } })],
+    consultations: [expect.objectContaining({ dispatchId: handle.dispatchId })] });
+}));
+
+
+for (const stage of ["discovery", "classify"] as const) test(`Head cancellation joins held ${stage} without worker admission`, fixture.ownedCase("Head held " + stage, async () => {
+  const h = await harness(), entered = gate(), release = gate();
+  fixture.finishOnCleanup(() => release.resolve());
+  h.ctx.modelRegistry.getAvailableOfType = (async () => {
+    if (stage === "discovery") { entered.resolve(); await release.promise; }
+    return [{ provider: "fixture", id: "classifier", contextWindow: 100000 }];
+  }) as any;
+  h.ctx.modelRegistry.classify = (async (_model: any, request: any) => {
+    if (stage === "classify") { entered.resolve(); await release.promise; }
+    return { stopReason: "stop", answers: { reasoning: { type: "choice", choice: "high", confidence: 1,
+      probabilities: Object.fromEntries(Object.keys(request.questions.reasoning.criteria).map(key => [key, key === "high" ? 1 : 0])) } } };
+  }) as any;
+  const admission = await h.callPublic("agent_spawn", { role: "developer", mode: "head", writes: [], task: "cancel held advice" });
+  await h.headEntered.promise;
+  await h.call("head_consult", { role: "researcher", task: "held", reasoning: { mode: "classify" } });
+  await entered.promise;
+  await h.callPublic("agent_cancel", { id: admission.details.instanceId }); await h.headAborted.promise;
+  let settled = false; const settling = h.settle().then(() => { settled = true; });
+  await Promise.resolve(); expect(settled).toBe(false); expect(h.workers.sessions).toHaveLength(0);
+  release.resolve(); await settling;
+  expect(h.workers.sessions).toHaveLength(0); expect(h.outcome(admission.details.instanceId).status).toBe("cancelled");
 }));

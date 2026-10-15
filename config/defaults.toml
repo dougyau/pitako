@@ -103,3 +103,22 @@ max_run_time = "0"
 [model_policies.developer]
 [model_policies.reviewer]
 [model_policies.researcher]
+
+[roles.scout]
+name = "Scout"
+description = "Maps repository context, contracts and evidence gaps."
+instructions = "roles/scout.md"
+model_policy = "scout"
+skills = ["verify-behavior"]
+principles = ["principle-guard-the-context-window"]
+
+[roles.oracle]
+name = "Oracle"
+description = "Advises on difficult technical uncertainty and alternatives."
+instructions = "roles/oracle.md"
+model_policy = "oracle"
+skills = ["verify-behavior"]
+principles = ["principle-foundational-thinking"]
+
+[model_policies.scout]
+[model_policies.oracle]

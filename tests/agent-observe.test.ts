@@ -255,6 +255,8 @@ describe("T2 observations", () => {
 
   test("agent_status text still comes from formatWorkerViews only", fixture.ownedCase("agent_status text still comes from formatWorkerViews only", async () => {
     process.env.PI_CODING_AGENT_DIR = load().env?.PI_CODING_AGENT_DIR;
+    bindBackgroundOwner({ token: Symbol("status owner"), isIdle: () => false, hasUI: false,
+      notify() {}, sendMessage() {} });
     let release!: (attempt: { status: "completed"; result: string; sideEffects: false }) => void;
     const gate = fixture.pendingAttempt((resolve) => {
       release = resolve;
@@ -287,6 +289,7 @@ describe("T2 observations", () => {
       undefined,
       { cwd: packageRoot() },
     );
+    expect(spawnResult.isError).toBe(false);
     await startedP;
     setSystemTime(Date.now());
     const status = await tools.get("agent_status")?.execute("call", {}, undefined, undefined, { cwd: packageRoot() });
@@ -299,7 +302,10 @@ describe("T2 observations", () => {
     expect(listObservations().some((row) => row.id === spawnResult.details.instanceId)).toBe(true);
 
     release({ status: "completed", result: "ok", sideEffects: false });
-    await waitSettled(spawnResult.details.instanceId);
+    await fixture.settleRuns();
+    expect(workerStatus(spawnResult.details.instanceId)[0]).toMatchObject({
+      status: "completed", closure: { state: "released" },
+    });
   }));
 
   test("model_stream samples accumulate streamMs and tool freezes the clock", fixture.ownedCase("model_stream samples accumulate streamMs and tool freezes the clock", async () => {

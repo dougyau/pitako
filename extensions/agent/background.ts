@@ -3,13 +3,14 @@ import { createPiExecutor } from "./pi.ts";
 import { clearObservations, noteResultTaken, noteHandoff, observationEpoch, publishObservation, removeObservation, removeTeamObservations,
   publishActivityBinding, retainTerminalActivity, noteTerminalActivityUnavailable, terminalActivityKey,
   removeOwnerTerminalActivity, touchObservation, type TerminalActivityKey } from "./observe.ts";
-import { runAgentInstance, type AgentRunResult, type AttemptExecutor } from "./run.ts";
+import { runAgentInstance, createInstanceId, type AgentRunResult, type AttemptExecutor } from "./run.ts";
 import type { LoadOptions } from "../roles/load.ts";
 import type { ExecutionBinding } from "../workflow.ts";
 import type { LiveHandle } from "./live.ts";
 import { randomUUID } from "node:crypto";
 import { PublicConversation } from "./public-conversation.ts";
 import { AgentClosureError, type AgentClosure } from "./closure.ts";
+import { dispatchAdmissionsClosed } from "./dispatch.ts";
 import type { HeadAttachment } from "./head/runtime.ts";
 
 export interface WorkerInterest {
@@ -23,6 +24,8 @@ export interface WorkerHandle {
   roleId: string;
   status: "running";
   watch: boolean;
+  dispatchId?: string;
+  dispatchPhase?: "preflight" | "worker" | "settled";
 }
 
 export type WorkerStatus = "running" | "completed" | "failed" | "cancelled";
@@ -34,6 +37,9 @@ export interface WorkerView {
   watch: boolean;
   elapsedMs: number;
   closure: AgentClosure;
+  dispatchId?: string;
+  dispatchPhase?: "preflight" | "worker" | "settled";
+  workerStarted?: boolean;
 }
 
 export interface BackgroundOwner {
@@ -109,6 +115,13 @@ interface Row {
   conversation?: PublicConversation;
   run: Promise<void>;
   closure: AgentClosure;
+  dispatchId?: string;
+  dispatchPhase?: "preflight" | "worker" | "settled";
+  workerStarted?: boolean;
+  releaseNoWorker?: () => void;
+  preparationSettled?: boolean;
+  launch?: { task: string; origin?: import("./history.ts").HistoryOrigin };
+  consultation?: ReturnType<typeof import("./consultation.ts").consultationRecord>;
 }
 
 interface Bag {
@@ -173,12 +186,16 @@ export function backgroundExecutor(): AttemptExecutor {
   return bag().executor ?? createPiExecutor();
 }
 
-export async function spawnBackground(input: {
+export interface SpawnInput {
   roleId: string;
   task: string;
   cwd: string;
   historyOrigin?: import("./history.ts").HistoryOrigin;
   dispatch?: import("./routing.ts").DispatchSnapshot;
+  consultation?: import("./consultation.ts").ConsultationSnapshot;
+  /** Internal host reservation, never a tool parameter. */
+  reservation?: Row;
+  check?: () => void;
   head?: HeadAttachment;
   foreground?: AbortSignal;
   watch?: WorkerInterest;
@@ -187,12 +204,15 @@ export async function spawnBackground(input: {
   now?: () => number;
   teamOwner?: { token: symbol; assignmentId: string; onSettled: (status: WorkerStatus) => void };
   reconcileBookkeeping?: (result: AgentRunResult) => void;
-}): Promise<WorkerHandle> {
+}
+
+export async function spawnBackground(input: SpawnInput): Promise<WorkerHandle> {
+  input.check?.();
   if (input.foreground?.aborted) throw new Error("agent_spawn cancelled");
-  const controller = new AbortController();
+  const controller = input.reservation?.controller ?? new AbortController();
   const now = input.now ?? Date.now;
   const epoch = observationEpoch();
-  const ownerToken = bag().owner?.token;
+  const ownerToken = input.reservation?.ownerToken ?? bag().owner?.token;
   let row: Row | undefined;
   const completion = Promise.withResolvers<void>();
   const pending = runAgentInstance({
@@ -202,6 +222,8 @@ export async function spawnBackground(input: {
     executionRoot: input.watch?.execution?.executionRoot,
     historyOrigin: input.historyOrigin,
     dispatch: input.dispatch,
+    consultation: input.consultation,
+    reservedInstanceId: input.reservation?.instanceId,
     head: input.head,
     signal: controller.signal,
     executor: {
@@ -252,8 +274,10 @@ export async function spawnBackground(input: {
     load: input.load,
     now,
     onAccepted(instance) {
+      input.check?.();
       if (input.foreground?.aborted) throw new Error("agent_spawn cancelled");
-      row = {
+      if (input.reservation && instance.id !== input.reservation.instanceId) throw new Error("reserved worker identity mismatch");
+      row = input.reservation ?? {
         instanceId: instance.id,
         roleId: instance.roleId,
         acceptedAt: now(),
@@ -271,6 +295,11 @@ export async function spawnBackground(input: {
         closure: { state: "pending" },
         run: completion.promise,
       };
+      row.workerStarted = true;
+      row.dispatchPhase = "worker";
+      row.run = completion.promise;
+      row.interest = input.watch;
+      row.reconcileBookkeeping = input.reconcileBookkeeping;
       bag().rows.set(instance.id, row);
       if (ownerToken) {
         row.conversation = new PublicConversation(undefined, input.executor.capturesPublicConversation === true);
@@ -291,9 +320,10 @@ export async function spawnBackground(input: {
       publishObservation(
         {
           ...snapshot,
+          acceptedAt: row.acceptedAt,
           planId: input.watch?.planId,
           unitId: input.watch?.unitId,
-          teamOwnerToken: input.teamOwner?.token,
+          teamOwnerToken: row.teamOwnerToken,
           ownerToken,
         },
         epoch,
@@ -332,6 +362,74 @@ export async function spawnBackground(input: {
     status: "running",
     watch: accepted.interest !== undefined,
   };
+}
+
+/** Reserve before external work; the captured owner's macrotask cannot overtake the caller's continuation. */
+export function reserveBackground(input: {
+  roleId: string;
+  coordinatorSessionId?: string;
+  origin?: import("./history.ts").HistoryOrigin;
+  task: string;
+  owns: () => boolean;
+  teamOwner?: { token: symbol; assignmentId: string; onSettled: (status: WorkerStatus) => void; noWorkerReleased: () => void };
+  prepare: (signal: AbortSignal, check: () => void, row: { instanceId: string; dispatchId: string;
+    record: (record: NonNullable<Row["consultation"]>) => void; current: () => boolean }) => Promise<SpawnInput>;
+  cleanup?: () => Promise<void>;
+}): WorkerHandle {
+  if (dispatchAdmissionsClosed(input.coordinatorSessionId)) throw new Error("Dispatch cancelled before admission");
+  const owner = input.teamOwner ? bag().teamOwners?.get(input.teamOwner.token) : bag().owner;
+  if (!owner || owner.owns && !owner.owns() || !input.owns()) throw new Error("background owner unavailable or retired");
+  const controller = new AbortController();
+  const completion = Promise.withResolvers<void>();
+  const row: Row = { instanceId: createInstanceId(input.roleId), roleId: input.roleId, dispatchId: randomUUID(),
+    dispatchPhase: "preflight", workerStarted: false, acceptedAt: Date.now(), controller,
+    ownerToken: owner.token, deliveryOwner: owner, coordinatorSessionId: input.coordinatorSessionId,
+    teamOwnerToken: input.teamOwner?.token, teamAssignmentId: input.teamOwner?.assignmentId,
+    onTeamSettled: input.teamOwner?.onSettled, releaseNoWorker: input.teamOwner?.noWorkerReleased,
+    generation: 0, signal: "pending", closure: { state: "pending" }, run: completion.promise,
+    launch: { task: input.task, origin: input.origin && structuredClone(input.origin) } };
+  bag().rows.set(row.instanceId, row);
+  const check = () => {
+    if (controller.signal.aborted || dispatchAdmissionsClosed(input.coordinatorSessionId) || !liveOwner(row) || !input.owns()) {
+      controller.abort(); throw new Error("Dispatch cancelled before admission");
+    }
+  };
+  publishObservation({ id: row.instanceId, roleId: row.roleId, task: input.task, status: "created",
+    phase: "working", acceptedAt: row.acceptedAt, selectedModel: "unknown", lastActivityKind: "preflight",
+    origin: input.origin, ownerToken: owner.token, teamOwnerToken: input.teamOwner?.token });
+  setImmediate(() => {
+    void (async () => {
+      try {
+        const prepared = await input.prepare(controller.signal, check, { instanceId: row.instanceId, dispatchId: row.dispatchId!,
+          record(record) { row.consultation = record; }, current: () => liveOwner(row) && input.owns() });
+        check();
+        await spawnBackground({ ...prepared, reservation: row, check, foreground: controller.signal });
+        await row.run;
+      } catch (error) {
+        if (!row.workerStarted) {
+          let failure = error;
+          try { await input.cleanup?.(); } catch (cleanup) { failure = new AgentClosureError([error, cleanup], "Background preparation"); }
+          row.closure = failure instanceof AgentClosureError ? { state: "unknown", reason: failure.message } : { state: "released" };
+          settle(row, { instanceId: row.instanceId, role: row.roleId,
+            status: controller.signal.aborted ? "cancelled" : "failed", model: { selectedModel: "unknown" },
+            result: String(failure) }, observationEpoch());
+        }
+      } finally {
+        row.preparationSettled = true;
+        completion.resolve();
+        releaseNoWorker(row);
+      }
+    })();
+  });
+  return { instanceId: row.instanceId, dispatchId: row.dispatchId, roleId: row.roleId,
+    status: "running", watch: false, dispatchPhase: "preflight" };
+}
+
+function releaseNoWorker(row: Row): void {
+  if (row.workerStarted !== false || !row.preparationSettled || row.closure.state !== "released" ||
+      row.signal !== "dropped" && row.handoff?.delivery !== "incorporated") return;
+  row.releaseNoWorker?.();
+  row.releaseNoWorker = undefined;
 }
 
 export type LiveTarget = { kind: "background"; instanceId: string } | { kind: "team"; assignmentId: string };
@@ -522,6 +620,11 @@ async function retireRows(rows: Row[]): Promise<void> {
   const uncertain = rows.filter(row => row.closure.state !== "released");
   for (const row of rows) {
     if (row.closure.state !== "released" || state.rows.get(row.instanceId) !== row) continue;
+    if (row.consultation) {
+      row.consultation.retired();
+      row.consultation.settled();
+    }
+    releaseNoWorker(row);
     state.rows.delete(row.instanceId);
     removeObservation(row.instanceId);
   }
@@ -549,6 +652,7 @@ export async function shutdownBackground(token: symbol): Promise<void> {
 export function formatWorkerHandle(handle: WorkerHandle): string {
   return [
     `instance_id: ${handle.instanceId}`,
+    ...(handle.dispatchId ? [`dispatch_id: ${handle.dispatchId}`, `dispatch_phase: ${handle.dispatchPhase}`] : []),
     `role: ${handle.roleId}`,
     `status: ${handle.status}`,
     `watch: ${handle.watch ? "yes" : "no"}`,
@@ -585,9 +689,18 @@ function settle(row: Row, result: AgentRunResult, epoch: number): void {
   const current = state.rows.get(row.instanceId);
   if (current !== row) return;
   current.outcome = result;
-  if (current.closure.state === "released" && current.signal !== "dropped" && liveOwner(current)) current.onTeamSettled?.(result.status);
+  current.dispatchPhase = "settled";
+  current.consultation?.event("outcome", current.workerStarted
+    ? { workerStarted: true, status: result.status, instanceId: result.instanceId, model: result.model, usage: result.usage }
+    : { workerStarted: false, status: result.status, reason: result.result });
+  current.consultation?.settled(current.closure.state === "unknown" ? current.closure.reason : undefined);
+  if (current.workerStarted !== false && current.closure.state === "released" && current.signal !== "dropped" && liveOwner(current)) current.onTeamSettled?.(result.status);
   current.conversation?.finish();
   if (current.signal === "dropped") return;
+  if (current.workerStarted === false) publishObservation({ id: current.instanceId, roleId: current.roleId, task: current.launch?.task ?? "",
+    status: result.status, phase: "idle", acceptedAt: current.acceptedAt, selectedModel: "unknown", lastActivityKind: "no-worker",
+    ownerToken: current.ownerToken, teamOwnerToken: current.teamOwnerToken,
+    origin: current.launch?.origin }, epoch);
   if (currentReadRow(current, epoch)) touchObservation(current.instanceId, epoch);
   collectResult(current);
   if (liveOwner(current) && idleOf(current.deliveryOwner)) deliverWorkerResults(current.ownerToken!);
@@ -617,6 +730,7 @@ function collectResult(row: Row): void {
     deliveryId: randomUUID(), instanceId: row.instanceId, assignmentId: row.teamAssignmentId,
     ownerSessionId: owner.sessionId ?? row.coordinatorSessionId, foregroundRevision: owner.revision,
     status: row.outcome.status,
+    ...(row.dispatchId ? { dispatchId: row.dispatchId, workerStarted: row.workerStarted } : {}),
     roleId: row.roleId, planId: row.interest?.planId, unitId: row.interest?.unitId,
   });
   row.handoff = {
@@ -686,7 +800,9 @@ export function observeWorkerResults(token: symbol, turnStarted = false): void {
     const handoff = row.handoff!;
     const inBranch = incorporated(row);
     if (inBranch) {
+      if (handoff.delivery !== "incorporated") row.consultation?.event("delivery", { state: "incorporated", deliveryId: handoff.message.details.deliveryId });
       handoff.delivery = "incorporated";
+      releaseNoWorker(row);
       handoff.deliveryDiagnostic = undefined;
       handoff.outstanding = false;
       if (turnStarted) {
@@ -840,5 +956,14 @@ function view(row: Row, now: number): WorkerView {
     watch: row.interest !== undefined,
     elapsedMs: Math.max(0, now - row.acceptedAt),
     closure: { ...row.closure },
+    dispatchId: row.dispatchId, dispatchPhase: row.dispatchPhase, workerStarted: row.workerStarted,
   };
+}
+
+/** Exact active-branch receipt, rechecked synchronously by the captured native writer. */
+export function consultationFeedback(input: import("./consultation-feedback.ts").ConsultationFeedbackInput, sessionId: string | undefined, manager: unknown) {
+  const row = [...bag().rows.values()].find(row => row.dispatchId === input.dispatchId && row.coordinatorSessionId === sessionId);
+  if (!row?.consultation || !row.consultation.matchesCaller(manager) || !row.handoff || !liveOwner(row) || row.closure.state !== "released")
+    throw new Error("consultation is not owned and physically settled");
+  return row.consultation.feedback(input, () => incorporated(row));
 }
