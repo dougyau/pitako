@@ -89,6 +89,15 @@ describe("profiles", () => {
       expect(note).toContain("raw tools");
       expect(note).toContain("Verify real behavior before claiming done.");
       expect(note).toContain("Select checks for the active project's own behavior and declared testing scope.");
+      expect(note).toContain("your current assignment");
+      expect(note).toContain("all known stages as pending before starting the first");
+      expect(note).toContain("Reuse tasks on resume");
+      expect(note).toContain("preserve unrelated tasks");
+      expect(note).toContain("never clear");
+      expect(note).toContain("at most one in_progress");
+      expect(note).toContain("complete only finished work");
+      expect(note).toContain("newly discovered stages");
+      expect(note).toContain("Skip TODOs for trivial tasks");
       expect(note).not.toContain("navigation baseline");
     }
     expect(coding).toContain("Use apply_patch when available; otherwise edit");
@@ -97,7 +106,9 @@ describe("profiles", () => {
     expect(coding).not.toContain("FINDING");
     expect(analysis).toContain("edit, write, apply_patch, and lsp_rename are not");
     expect(analysis).toContain("this profile is not a sandbox");
-    expect(coding.length).toBeLessThan(800);
+    expect(child).toContain("rpiv-todo is private to this session");
+    // Allow the shared TODO policy while keeping the always-on note brief.
+    expect(coding.length).toBeLessThan(1200);
   });
 });
 

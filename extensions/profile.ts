@@ -57,6 +57,7 @@ export function reconcileChildTools(session: {
 
 const NAVIGATION_GUIDANCE = "Inspect the repo first. Keep read/grep/bash/LSP/CodeGraph available. For bounded structural code questions, choose a supported LSP or CodeGraph tool; use raw tools for literal, exhaustive or exact results; follow up with raw tools if a query/backend is partial or unavailable.";
 const VERIFICATION_GUIDANCE = "Verify real behavior before claiming done. Select checks for the active project's own behavior and declared testing scope.";
+const TODO_GUIDANCE = "For multi-step work on your current assignment, list existing TODOs and create all known stages as pending before starting the first. Reuse tasks on resume; preserve unrelated tasks and never clear the list to rebuild it. Update existing tasks, keep at most one in_progress, and complete only finished work. Add newly discovered stages when known. Skip TODOs for trivial tasks and conversation.";
 
 const BUILTIN_TOOLS = new Set([
   "read",
@@ -123,6 +124,7 @@ export function profileNote(profile: ProfileName): string {
     "Research or design does not authorize implementation.",
     "Pi owns model and provider selection.",
     "Board tools are pull-only; do not paste posts into the turn. rpiv-todo is the session plan.",
+    TODO_GUIDANCE,
   ];
   if (profile === "analysis") {
     return [
@@ -148,5 +150,6 @@ export function childSessionNote(instanceId: string): string {
     "Keep diffs small.",
     VERIFICATION_GUIDANCE,
     "Board tools are pull-only. rpiv-todo is private to this session. Do not spawn agents.",
+    TODO_GUIDANCE,
   ].join(" ");
 }

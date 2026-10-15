@@ -29,6 +29,8 @@ Paths come from `planFile`, `ledgerFile`, and `evidenceFile`. Do not construct t
 
 After validating the binding, reconcile `## Workers` and unresolved `Team Holds` before setup or other mutation. Use the handle-specific resume rules below: a running worker ends the turn; unknown or unreconciled ownership blocks setup. Unresolved holds block setup until their existing recovery requirements are met.
 
+Then reconcile the session TODOs as described in Records. Register all frozen units before preparation or implementation begins.
+
 Inspect `binding.executionRoot`'s optional `scripts/setup.sh` and relevant prerequisites, not the pinned plan-source worktree or installed Pitako package. Read the script before running it. If it is an external symlink, stop automatic preparation and apply the existing authority decision rules rather than executing another checkout's code. An unreadable script is a blocker, not a missing hook.
 
 When the workspace is quiescent, the script's effects fit existing authority, and compatible successful setup evidence is absent, run:
@@ -285,7 +287,9 @@ Before `EXECUTION_COMPLETED`, the single final review must inspect the complete 
 
 ## Records
 
-`todo` is what you are doing now. Do not mirror every TODO into the ledger.
+`todo` shows all global units of the frozen plan, not just the current activity. List existing tasks first. Before starting T1, register T1, T2, T3, and T4 if those are the plan's units. Keep unit IDs and titles recognizable. Create future units as `pending`; keep at most one task `in_progress`. After accepting T1 and starting T2, T1 is `completed`, T2 is `in_progress`, and T3 and T4 remain `pending`. Delegation or a worker result alone does not complete a unit. Workers track only their own assignment.
+
+On resume, reconcile TODOs with the plan, ledger, and relevant evidence. Reuse existing tasks, preserve unrelated tasks, and never `clear` the list to rebuild it. If tasks are missing, reconstruct their states from those records. Keep accepted units completed; do not duplicate or execute them again. Subtasks may supplement global units, not replace them. TODOs are a session checklist, not acceptance authority. Do not mirror every TODO into the ledger.
 
 The Board is not a progress log. Use FINDING for a fact or constraint; DECISION for a chosen boundary before its authoritative artifact; QUESTION/ANSWER for cross-context coordination; BLOCKER only when another context cannot correctly continue; HANDOFF only for essential next-context knowledge; INFO sparingly for mission context. Do not post progress, status, test counts, heartbeats, or ordinary worker events (for example, `HANDOFF: T3 done, 44 tests pass`): ledger and evidence own progress. Once absorbed, the plan, code, tests, or docs are authoritative. No execution-local blocker post is needed when the ledger suffices.
 

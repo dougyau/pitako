@@ -245,6 +245,38 @@ describe("plan and execute contracts", () => {
   const verify = readFileSync(path.join(packageRoot(), "skills/practical/verify-behavior/SKILL.md"), "utf8");
 
   // Static policy contracts, not tests of model compliance or implementation effectiveness.
+  test("TODO guidance exposes known stages and preserves them through resume", () => {
+    for (const instruction of [router, plan]) {
+      expect(instruction).toMatch(/all known (?:planning )?stages as `pending`/);
+      expect(instruction).toMatch(/before starting the first/i);
+      expect(instruction).toMatch(/[Rr]euse/);
+      expect(instruction).toContain("resume");
+    }
+    expect(router).toContain("preserve unrelated tasks");
+    expect(router).toContain("never `clear`");
+    expect(router).toContain("complete it only after the work is actually done");
+    expect(router).toContain("Skip TODOs for trivial tasks");
+    expect(plan).toContain("authorized planning, not the future implementation units");
+    expect(plan).toContain("Freezing the plan does not start those units");
+
+    const preparation = execute.split("## Prepare the captured checkout")[1]!.split("## Decisions")[0]!;
+    expect(preparation.indexOf("Register all frozen units")).toBeGreaterThan(preparation.indexOf("reconcile `## Workers`"));
+    expect(preparation.indexOf("Register all frozen units")).toBeLessThan(preparation.indexOf("bash ./scripts/setup.sh"));
+    const records = execute.split("## Records")[1]!.split("## Report")[0]!;
+    expect(records).toContain("Before starting T1, register T1, T2, T3, and T4");
+    expect(records).toContain("unit IDs and titles recognizable");
+    expect(records).toContain("at most one task `in_progress`");
+    expect(records).toContain("T1 is `completed`, T2 is `in_progress`, and T3 and T4 remain `pending`");
+    expect(records).toContain("a worker result alone does not complete a unit");
+    expect(records).toContain("Workers track only their own assignment");
+    expect(records).toContain("plan, ledger, and relevant evidence");
+    expect(records).toContain("Reuse existing tasks, preserve unrelated tasks, and never `clear`");
+    expect(records).toContain("reconstruct their states from those records");
+    expect(records).toContain("Keep accepted units completed");
+    expect(records).toContain("not acceptance authority");
+    expect(records).not.toContain("what you are doing now");
+  });
+
   test("guidance selects owned behavior without reviving external certification", () => {
     const author = readFileSync(path.join(packageRoot(), "skills/practical/gates/SKILL.md"), "utf8");
     const readme = readFileSync(path.join(packageRoot(), "README.md"), "utf8");
