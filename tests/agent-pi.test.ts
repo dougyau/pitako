@@ -104,13 +104,16 @@ test("bind failure and cancellation before prompt dispose controlled sessions", 
 
 for (const target of [
   { model: "openai/arbitrary", fast: true },
+  { model: "openai-codex/arbitrary", fast: true },
+  { model: "openai-codex/arbitrary", fast: false },
+  { model: "openai-codex/arbitrary" },
   { model: "xai/grok-4.7", fast: true },
   { model: "xai/grok-4.7", fast: false },
 ]) {
   test("transport preserves payload hook and maps only selected target tier: " + JSON.stringify(target),
     fixture.ownedCase("target tier", async () => {
       const [provider, id] = target.model.split("/");
-      const model = controlledModel(provider!, id!, "openai-responses");
+      const model = controlledModel(provider!, id!, provider === "openai-codex" ? "openai-codex-responses" : "openai-responses");
       const { host, input, executor } = setup({ models: [model], async prompt(session) {
         await session.agent.streamFunction(session.model, { messages: [] }, { sessionId: session.sessionId,
           onPayload: (payload: any) => ({ ...payload, hook: "retained" }) }).result();
@@ -123,8 +126,9 @@ for (const target of [
         })();
       };
       const attempt = await fixture.acquire(executor.start({ ...input, target }));
+      expect(attempt.status).toBe("completed");
       expect(bodies).toEqual([{ model: id, hook: "retained", ...(target.fast ? { service_tier: "priority" } : {}) }]);
-      expect(attempt.requests).toMatchObject([{ fast_requested: target.fast, returned_service_tier: "unavailable",
+      expect(attempt.requests).toMatchObject([{ fast_requested: target.fast === true, returned_service_tier: "unavailable",
         ...(target.fast ? { requested_service_tier: "priority" } : {}) }]);
     }));
 }
