@@ -199,11 +199,11 @@ export function* catalogValues(fd: number): Generator<{ key: string; value: unkn
   while (peek() !== 125) {
     const key = value();
     if (typeof key !== "string") throw new Error("corrupt_catalog");
-    if (!["version", "groupId", "workspace", "identity", "coverage", "members", "closure", "missionStore", "cleanup", "prunedAt", "aliases"].includes(key) || keys.has(key))
+    if (!["version", "groupId", "workspace", "identity", "coverage", "members", "consultations", "closure", "missionStore", "cleanup", "prunedAt", "aliases"].includes(key) || keys.has(key))
       throw new Error("incompatible_catalog");
     keys.add(key);
     expect(58);
-    if (key === "members") {
+    if (key === "members" || key === "consultations") {
       expect(91);
       whitespace();
       let index = 0;

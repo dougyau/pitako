@@ -12,13 +12,16 @@ export interface HistoryOrigin {
   coordinatorSessionId?: string;
   toolCallId?: string;
   coordinatorSessionFile?: string;
+  callerSessionId?: string;
+  callerSessionFile?: string;
   assignmentId?: string;
   workbrief?: string;
   execution?: { executionRoot: string; executionRef: string };
   routing?: import("./routing.ts").DispatchSnapshot["routing"];
   routingEvidence?: { state: import("./routing.ts").DispatchSnapshot["evidence"]; gap?: string };
+  consultation?: { dispatchId: string; groupId: string; decisionId?: string };
   head?: { assignmentId: string; headInstanceId?: string; nodeId?: string; runId?: string;
-    admittedRevision?: number; effectiveRevision?: number };
+    admittedRevision?: number; effectiveRevision?: number; observedRevision?: number };
 }
 
 export type HistoryClosure =
@@ -43,6 +46,8 @@ export interface HistoryMember {
   coordinatorSessionId?: string;
   toolCallId?: string;
   coordinatorSessionFile?: string;
+  callerSessionId?: string;
+  callerSessionFile?: string;
   assignmentId?: string;
   instanceId?: string;
   attemptId?: string;
@@ -55,6 +60,7 @@ export interface HistoryMember {
   recoveryOf?: string;
   retryOf?: string;
   head?: HistoryOrigin["head"];
+  consultation?: HistoryOrigin["consultation"];
   admittedAt: string;
   native:
     | { state: "not-created" }
@@ -70,6 +76,23 @@ export interface HistoryMember {
   gaps: string[];
 }
 
+export interface ConsultationLocator {
+  dispatchId: string;
+  instanceId: string;
+  roleId: string;
+  toolCallId?: string;
+  callerSessionId?: string;
+  callerSessionFile?: string;
+  coordinatorSessionId?: string;
+  gaps: string[];
+  closure: import("./closure.ts").AgentClosure;
+  /** Versioned host metadata; never a native persistence or deletion receipt. */
+  version?: 1;
+  decisionId?: string;
+  callerHeadInstanceId?: string;
+  followupInstances?: string[];
+}
+
 export interface HistoryGroup {
   version: 1;
   groupId: string;
@@ -77,6 +100,7 @@ export interface HistoryGroup {
   identity: HistoryIdentity;
   coverage: "complete" | "partial";
   members: HistoryMember[];
+  consultations?: ConsultationLocator[];
   closure: HistoryClosure;
   missionStore?: { dbPath: string; objectDir: string; sessionsDirectory: string };
   /** Exact cleanup intent remains visible until every owned unlink succeeds. */
@@ -87,8 +111,8 @@ export interface HistoryGroup {
 }
 
 export type HistoryAdmission = Pick<HistoryMember,
-  "roleId" | "coordinatorSessionId" | "toolCallId" | "coordinatorSessionFile" | "assignmentId" |
-  "instanceId" | "attemptId" | "memberId" | "continuationOf" | "diagnosisId" | "diagnosisOf" | "unitId" | "roundId" | "recoveryOf" | "retryOf" | "head">;
+  "callerSessionId" | "callerSessionFile" | "roleId" | "coordinatorSessionId" | "toolCallId" | "coordinatorSessionFile" | "assignmentId" |
+  "instanceId" | "attemptId" | "memberId" | "continuationOf" | "diagnosisId" | "diagnosisOf" | "unitId" | "roundId" | "recoveryOf" | "retryOf" | "head" | "consultation">;
 
 export type NativeHistoryStatus =
   | { state: "not-created" }
@@ -237,6 +261,7 @@ export class WorkerHistory {
   closeInvocation(groupId: string): void {
     this.mutate(groupId, (group) => {
       if (group.identity.kind !== "invocation") return; // A worker cannot seal an execution.
+      if (group.consultations?.some(row => row.closure.state !== "released")) return;
       if (group.members.some((member) => !member.terminal ||
         member.native.state === "allocated" && member.native.disposition.state !== "disposed")) return;
       group.closure = { state: "closed", closedAt: new Date().toISOString(), evidenceRef: "host invocation settled and all allocated sessions disposed" };
@@ -329,7 +354,7 @@ export class InvocationHistory {
     this.origin = origin;
     this.task = task;
     this.standalone = standalone;
-    this.group = origin?.execution
+    this.group = origin?.consultation ? this.store.read(origin.consultation.groupId) : origin?.execution
       ? this.store.executionGroup(cwd, { kind: "execution", ...origin.execution })
       : this.store.createGroup(cwd);
   }
@@ -337,9 +362,9 @@ export class InvocationHistory {
   admit(instanceId: string, roleId: string, target: ModelTarget): SessionHistory {
     const admission = {
       instanceId, roleId, coordinatorSessionId: this.origin?.coordinatorSessionId,
-      toolCallId: this.origin?.toolCallId,
+      toolCallId: this.origin?.toolCallId, callerSessionId: this.origin?.callerSessionId, callerSessionFile: this.origin?.callerSessionFile,
       coordinatorSessionFile: this.origin?.coordinatorSessionFile, assignmentId: this.origin?.assignmentId,
-      head: this.origin?.head,
+      head: this.origin?.head, consultation: this.origin?.consultation,
     };
     const current = this.store.read(this.group.groupId);
     if (current.closure.state !== "unclosed" || current.cleanup || current.prunedAt) throw new Error("worker history group is not open");
@@ -369,6 +394,7 @@ export class SessionHistory {
   private terminal = false;
   private observedAssistant = false;
   private streamInstructions?: string;
+  private results = 0;
 
   constructor(invocation: InvocationHistory, historyId: string, target: ModelTarget) {
     this.invocation = invocation;
@@ -413,8 +439,15 @@ export class SessionHistory {
 
   result(attempt: Attempt): Attempt {
     this.last = attempt;
-    this.append("result", { status: attempt.status, error: attempt.error,
-      sideEffects: attempt.sideEffects, appliedReasoning: attempt.appliedReasoning });
+    const data = { version: 2, resultId: `${this.historyId}:${++this.results}`, historyId: this.historyId,
+      at: new Date().toISOString(), target: this.target, provenance: attempt.provenance,
+      status: attempt.status, error: attempt.error, sideEffects: attempt.sideEffects,
+      appliedReasoning: attempt.appliedReasoning, usage: attempt.usage ?? null,
+      usageSource: "observed native session delta; native assistant entries remain authoritative; catalog cost is not a billing receipt",
+      requests: attempt.requests?.slice(0, 50), requestsOmitted: Math.max(0, (attempt.requests?.length ?? 0) - 50) };
+    if (Buffer.byteLength(JSON.stringify(data)) <= 262144) this.append("result", data);
+    else this.append("result", { version: 2, resultId: data.resultId, historyId: this.historyId, at: data.at,
+      target: this.target, status: attempt.status, usage: null, gap: "complete attempt record exceeds native budget" });
     // Setup failures may dispose before returning their result, or never allocate.
     if (this.disposalObserved || !this.live) {
       if (!this.disposalObserved) {

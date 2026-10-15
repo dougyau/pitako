@@ -2,6 +2,8 @@ import type { AgentSession, ExtensionFactory, SessionManager } from "@earendil-w
 import { Type } from "typebox";
 import type { HeadAttachment, LeafScopeAttachment } from "./runtime.ts";
 import { marksSideEffect } from "../effects.ts";
+import { feedbackSchema } from "../consultation-feedback.ts";
+import { reasoningSchema } from "../consultation.ts";
 import { listCheckpoints, readCheckpoint } from "../checkpoints.ts";
 
 const boundedString = Type.String({ minLength: 1, maxLength: 16384 });
@@ -33,7 +35,8 @@ export function headExtension(attachment: HeadAttachment, binding: object,
       parameters: Type.Object({ childId: Type.String() }),
       execute(_id, params) {
         return attachment.own(binding, async () => {
-          const result = attachment.dag ? attachment.dag.result(binding, params.childId) : attachment.result(binding, params.childId);
+          attachment.observeReceipts(binding, manager());
+          const result = attachment.consultationResult(binding, params.childId) ?? (attachment.dag ? attachment.dag.result(binding, params.childId) : attachment.result(binding, params.childId));
           return { content: [{ type: "text", text: JSON.stringify(result ?? { state: "pending" }) }], details: result };
         });
       },
@@ -54,7 +57,7 @@ export function headExtension(attachment: HeadAttachment, binding: object,
       dag.bindDiagnostics((kind, data) => pi.appendEntry?.("pitako.head", {
         assignmentId: attachment.assignmentId, headInstanceId: attachment.headInstanceId, kind, data,
       }));
-      const localTools = new Set(["head_result", "head_wait", "head_plan", "head_start", "head_observe", "head_input", "head_review", "head_finish"]);
+      const localTools = new Set(["consultation_feedback", "head_consult", "head_result", "head_wait", "head_plan", "head_start", "head_observe", "head_input", "head_review", "head_finish"]);
       if (attachment.managed) {
         localTools.add("head_checkpoint");
         pi.registerTool({
@@ -71,6 +74,7 @@ export function headExtension(attachment: HeadAttachment, binding: object,
           ]),
           async execute(_id, params, signal) {
             attachment.check(binding);
+            attachment.observeReceipts(binding, manager());
             if (params.action === "create") return response(await attachment.checkpoints(binding,
               result => pi.appendEntry?.("pitako.head.checkpoint", result)).create(params, signal));
             const root = attachment.managed!.root;
@@ -79,7 +83,24 @@ export function headExtension(attachment: HeadAttachment, binding: object,
           },
         });
       }
+      pi.registerTool({
+        name: "consultation_feedback", label: "Consultation feedback",
+        description: "Voluntary attributed assessment after an exact pitako.head.result receipt in the current Head branch. Optional links resolve only this Head's catalog children. Not review, verification or acceptance.",
+        parameters: feedbackSchema,
+        execute(_id, params) { return Promise.resolve(response(attachment.feedback(binding, params, manager()))); },
+      });
+      pi.registerTool({
+        name: "head_consult", label: "Head consultation",
+        description: "Reserve a shared Head slot and return an early consultation handle. Advice never satisfies a node or verification. Optional default/direct/classify reasoning.",
+        parameters: Type.Object({ role: Type.Union([Type.Literal("scout"), Type.Literal("researcher"), Type.Literal("oracle")]),
+          task: boundedString, reasoning: reasoningSchema }, { additionalProperties: false }),
+        execute(id, params, signal, _update, ctx) {
+          attachment.observeReceipts(binding, manager());
+          return Promise.resolve(response(attachment.consult(binding, params, id, ctx, pi, signal)));
+        },
+      });
       pi.on("tool_call", event => {
+        attachment.observeReceipts(binding, manager());
         if (!localTools.has(event.toolName) && marksSideEffect(event.toolName) && !dag.codingAllowed(binding)) {
           return { block: true, reason: "Head coding requires the exclusive integration barrier; reopen before admitting more work" };
         }
@@ -99,6 +120,7 @@ export function headExtension(attachment: HeadAttachment, binding: object,
           Type.Object({ action: Type.Literal("confirm"), ...identity, proposalId: Type.String() }, { additionalProperties: false }),
         ]),
         async execute(_id, params) {
+          attachment.observeReceipts(binding, manager());
           switch (params.action) {
             case "read": return response({ ...dag.snapshot(binding), verificationCandidates: dag.verificationEntries(binding, manager().getBranch()) });
             case "beginIntegration": return response(dag.beginIntegration(binding, params.expectedRevision, manager().getBranch()));
@@ -116,6 +138,7 @@ export function headExtension(attachment: HeadAttachment, binding: object,
         parameters: Type.Object({ expectedRevision: revision,
           nodeIds: Type.Array(Type.String(), { minItems: 1, maxItems: 128 }) }, { additionalProperties: false }),
         execute(id, params, signal, _update, ctx) {
+          attachment.observeReceipts(binding, manager());
           return Promise.resolve(response(dag.start(binding, params.expectedRevision, params.nodeIds, id, ctx, pi, signal)));
         },
       });
@@ -129,7 +152,7 @@ export function headExtension(attachment: HeadAttachment, binding: object,
             evidence: Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { maxItems: 32 }),
             limits: Type.Array(boundedString, { maxItems: 32 }) }, { additionalProperties: false }),
         ]),
-        async execute(_id, params) { return response(await dag.finish(binding, params, manager().getBranch())); },
+        async execute(_id, params) { attachment.observeReceipts(binding, manager()); return response(await dag.finish(binding, params, manager().getBranch())); },
       });
       pi.registerTool({
         name: "head_observe", label: "Head observe",

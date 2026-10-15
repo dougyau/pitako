@@ -14,7 +14,7 @@ const PI_THINKING = {
   max: true,
 } as const satisfies Record<ThinkingLevel, true>;
 
-export const ROLE_IDS = ["coordinator", "architect", "developer", "reviewer", "researcher"] as const;
+export const ROLE_IDS = ["coordinator", "architect", "developer", "reviewer", "researcher", "scout", "oracle"] as const;
 export type RoleId = (typeof ROLE_IDS)[number];
 export const DEVELOPER_PROFILES = ["developer_senior", "developer_mid", "developer_junior"] as const;
 export type DeveloperProfile = (typeof DEVELOPER_PROFILES)[number];
@@ -30,6 +30,12 @@ export interface ModelTarget {
   model: string;
   reasoning?: ReasoningLevel;
   fast?: boolean;
+  /** Host-only direct consultation validation; never parsed from configuration. */
+  directReasoning?: boolean;
+  /** Frozen configured consultation primary, including an omitted SDK default. */
+  configuredReasoning?: { level?: ReasoningLevel };
+  /** Host-only advice; capability drift restores this frozen configured level. */
+  classifiedReasoning?: { configured?: ReasoningLevel };
 }
 
 export interface ModelPolicy {

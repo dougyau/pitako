@@ -1,8 +1,11 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import type { AgentBeforeSettleEvent, ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import { SessionManager, type AgentBeforeSettleEvent, type ExtensionAPI, type ExtensionContext, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import { AgentClosureError } from "../extensions/agent/closure.ts";
+import { loadPitakoConfig } from "../extensions/roles/load.ts";
+import { headExtension } from "../extensions/agent/head/tools.ts";
 import { HeadAttachment } from "../extensions/agent/head/runtime.ts";
 import { createPiExecutor } from "../extensions/agent/pi.ts";
 import { runAgentInstance, type AgentRunResult } from "../extensions/agent/run.ts";
@@ -63,11 +66,12 @@ test("only the granted native Head receives closed child envelopes; offers are n
   const run = fixture.run(runAgentInstance({ roleId: "developer", task: "head brief", cwd: root, load, head,
     executor: createPiExecutor({ factories: host.factories }) }));
   await Promise.all([entered.promise, disposing.promise]);
+  expect(() => head.startChild("child-one", async () => { throw new Error("duplicate must not start"); })).toThrow("already started");
   const result = local.tools.get("head_result")!, wait = local.tools.get("head_wait")!;
   expect([...local.tools.keys()]).toEqual(["head_result", "head_wait"]);
   expect(await result.execute("read", { childId: "child-one" })).toMatchObject({ details: undefined });
   const event = local.events.get("agent_before_settle")!;
-  expect(await event(boundary())).toBeUndefined();
+  const settlingBoundary = event(boundary());
   let delivered = false;
   const waiting = wait.execute("wait", {}, undefined).then((value: unknown) => { delivered = true; return value; });
   void waiting.catch(() => {});
@@ -95,8 +99,9 @@ test("only the granted native Head receives closed child envelopes; offers are n
   const childOutcome = await childRun;
   expect(await waiting).toMatchObject({ details: [{ assignmentId: "assignment-one", childId: "child-one",
     result: { instanceId: childOutcome.instanceId } }] });
-  expect(await event(boundary(false))).toBeUndefined();
-  const offered = await event(boundary());
+  const offered = await settlingBoundary;
+  expect(await event(boundary(false))).toMatchObject({ entries: offered.entries });
+  expect((await event(boundary(false))).continue).not.toBe(true);
   expect(offered).toMatchObject({ continue: true, entries: [{ customType: "pitako.head.result" }] });
   expect(await event(boundary())).toEqual(offered); // callback return alone is not incorporation
   const envelope = JSON.parse(offered.entries[0].content);
@@ -106,7 +111,7 @@ test("only the granted native Head receives closed child envelopes; offers are n
   host.sessions[0]!.sessionManager.appendCustomMessageEntry(entry.customType, entry.content, entry.display, entry.details);
   expect(await event(boundary())).toBeUndefined();
   host.sessions[0]!.sessionManager.getBranch = () => { head.revoke(); return []; };
-  expect(() => event(boundary())).toThrow("retired"); // retirement during receipt inspection cannot offer late context
+  await expect(event(boundary())).rejects.toThrow("retired"); // retirement during receipt inspection cannot offer late context
   prompt.resolve();
   await run;
   expect(() => result.execute("late", { childId: "child-one" })).toThrow("retired");
@@ -205,4 +210,35 @@ test("cancel during Head delivery wakes owned callbacks and waits prompts and ch
   releaseChild.resolve();
   await childRun;
   expect((await run).status).toBe("cancelled");
+}));
+
+test("unknown consultation retains the shared lease and yields bounded settlement diagnostics", fixture.ownedCase("consultation unknown", async () => {
+  const { root, load } = setup();
+  appendFileSync(load.userConfigPath, '[model_policies.researcher.primary]\nmodel = "fixture/selected"\n');
+  const head = new HeadAttachment("unknown-assignment", root, { writes: [], config: loadPitakoConfig(load),
+    // Synthetic uncertainty: no provider, process or native session is actually started.
+    executor: { async start() { throw new AgentClosureError([new Error("controlled unknown")], "consultation"); } } });
+  head.claim("head-instance", root);
+  const binding = head.bind("head-instance"), manager = SessionManager.inMemory(root);
+  const local = await bind([headExtension(head, binding, () => manager)]);
+  const ctx = { cwd: root, sessionManager: manager } as unknown as ExtensionContext;
+  const handle = (await local.tools.get("head_consult")!.execute("consult", { role: "researcher", task: "unknown" }, undefined, undefined, ctx)).details;
+  let after = 0;
+  while (head.consultationResult(binding, handle.childId)?.phase !== "unknown") {
+    after = (await local.tools.get("head_wait")!.execute("wait", { after })).details.cursor;
+  }
+  expect(head.workSnapshot().retained).toBe(1);
+  expect(() => head.managed!.assertIdle()).toThrow(AgentClosureError);
+  expect(() => head.dag!.beginIntegration(binding, 0, [])).toThrow();
+  expect(() => head.dag!.assertCheckpointReady(binding, 0)).toThrow();
+  expect(() => head.dag!.codingAllowed(binding)).toThrow(AgentClosureError);
+  await expect(head.dag!.finish(binding, { status: "completed", epoch: "fake", summary: "no", verification: ["fake"], limits: [] }, [])).rejects.toThrow();
+  const offer = await head.boundary(binding, boundary(), manager);
+  for (const entry of offer!.entries!) if (entry.type === "custom_message") manager.appendCustomMessageEntry(entry.customType, entry.content, entry.display, entry.details);
+  const correction = await head.boundary(binding, boundary(), manager);
+  expect(JSON.stringify(correction)).toContain("unknown closure");
+  expect(head.workSnapshot().retained).toBe(1); // receipt cannot establish physical release
+  await head.boundary(binding, boundary(), manager);
+  expect(await head.boundary(binding, boundary(), manager)).toBeUndefined();
+  await expect(head.close()).rejects.toBeInstanceOf(AgentClosureError);
 }));

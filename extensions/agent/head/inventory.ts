@@ -74,8 +74,8 @@ export interface SourceInventory {
   ignored: string[];
 }
 export interface Contribution {
-  source: { kind: "head" | "leaf"; instanceId: string; groupId: string; historyId: string; sessionId: string;
-    runId?: string; effectiveRevision: number; toolCallId: string; toolName: string };
+  source: { kind: "head" | "leaf" | "consultation"; instanceId: string; groupId: string; historyId: string; sessionId: string;
+    runId?: string; dispatchId?: string; effectiveRevision?: number; observedRevision?: number; toolCallId: string; toolName: string };
   outcome: "returned" | "threw";
   changes: Array<{ path: string; before?: RawFile; after?: RawFile }>;
 }

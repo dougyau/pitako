@@ -151,7 +151,8 @@ test("setup failure updates the same accepted worker; internal callers remain un
     const controlled = spyOn(piExecutor, "createPiExecutor").mockReturnValue(executor);
     let run: Awaited<ReturnType<Parameters<ExtensionAPI["registerTool"]>[0]["execute"]>>;
     try {
-      run = await env.tools.get("agent_run")!.execute("sync-tool-call", { role: "researcher", task: "sync original" },
+      // Synchronous private reads use an ordinary role; consultants require the early async reservation.
+      run = await env.tools.get("agent_run")!.execute("sync-tool-call", { role: "reviewer", task: "sync original" },
         new AbortController().signal, undefined, env.ctx as never);
     } finally { controlled.mockRestore(); }
     expect(run.isError).not.toBe(true);
@@ -236,6 +237,7 @@ test("catalog initialization failure preserves accepted provenance and settles a
     expect(accepted.lifecycle.execution).toBe("accepted");
     const id = (result.details as { instanceId: string }).instanceId;
     expect(await peer.publicDetail(id)).toMatchObject({ worker: accepted.worker,
+      workbrief: { text: "original setup brief" },
       lifecycle: { execution: "failed", result: "available", capture: "incomplete" } });
     expect((await peer.detail(id)).status).toBe("failed");
   }));

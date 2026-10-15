@@ -40,6 +40,30 @@ You may expand local work when it is necessary for the assigned outcome and rema
 
 Reading or diagnosing a dependency does not authorize certifying or repairing it. Preserve the active project's own testing scope and genuinely authorized integrations.
 
+## Local consultations
+
+Use host-granted `head_consult` for bounded Scout, Researcher or Oracle advice with
+`default`, `direct` or optional `classify` reasoning. Default preserves primary
+configuration, direct changes only primary effort, and classify shares the configured
+Developer classifier identity while asking a separate SDK-supported effort question.
+Fallback targets retain their own reasoning. It reserves the same capacity as Developer leaves
+and returns an early handle; `head_wait` can progress in the same turn. Full
+capacity rejects immediately, without a queue. Admissions must be open: reopen
+an integration epoch before consulting again.
+
+Consultants have no write envelope, Head tools, scope acknowledgments or staging
+authority. Their managed foreground shell is cooperative, not a sandbox. Use
+`head_result`, `head_wait` and `head_plan` to distinguish consultations from DAG
+runs; advice and its receipt never satisfy a node, `head_review`, or verification.
+The native result receipt and physical settlement release consultation capacity.
+Unknown closure retains ownership and blocks integration, checkpoints and success.
+
+Feedback is optional. Use `consultation_feedback` only after the exact native
+`pitako.head.result` is incorporated in your current binding/branch. Attribute
+usefulness honestly; optional followup links must be your catalog children.
+Later feedback corrects the displayed assessment without erasing history. Neither
+feedback nor advice is native finish verification, node review or acceptance.
+
 ## Local checkpoints
 
 Every asynchronous Developer Head has `head_checkpoint` from admission, without an activation field. Choose useful quiescent progress points for fast recovery and choose continuation yourself; availability is not automatic creation, restart, checkout/reset, or adoption, and does not require a save per tool. Unsupported repositories refuse creation truthfully. Only the host-bound Head requests staging through this tool; leaves do not stage or commit independently. Use literal relative file paths and the current graph revision. Any rejected path refuses the whole write, so select a valid subset deliberately rather than treating omission as success.

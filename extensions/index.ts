@@ -1,3 +1,4 @@
+import { consultationStats } from "./agent/history-query.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { skillStatusLines } from "./catalog.ts";
 import { PitakoConfigError } from "./errors.ts";
@@ -9,7 +10,7 @@ import { beginTeamEvaluation, retireTeamEvaluation, teamEvaluationForSession, la
 import { teamWorkerStatus } from "./agent/background.ts";
 import { bindAgentUi, listObservations, unbindAgentUi } from "./agent/observe.ts";
 import { formatAgentsDetail } from "./agent/ui.ts";
-import { childSessionNote, parseProfile, profileNote, setSessionProfile, toolsForProfile, type ProfileName } from "./profile.ts";
+import { childSessionNote, parseProfile, profileNote, setSessionProfile, toolsForProfile, isOrchestrationTool, type ProfileName } from "./profile.ts";
 import { currentInstanceId } from "./agent/scope.ts";
 import { executionForSession } from "./execution-identity.ts";
 import { formatUsage, mergeUsage, type AgentUsage } from "./agent/run.ts";
@@ -45,6 +46,7 @@ function isChildSession(ctx: ExtensionContext): boolean {
 }
 
 function applyProfile(pi: ExtensionAPI, profile: ProfileName, ctx: ExtensionContext): string[] {
+  profile = executionForSession(ctx.sessionManager?.getSessionId())?.profile ?? profile;
   const available = pi.getAllTools().map((tool) => tool.name);
   const active = pi.getActiveTools();
   const next = toolsForProfile({
@@ -52,6 +54,7 @@ function applyProfile(pi: ExtensionAPI, profile: ProfileName, ctx: ExtensionCont
     profile,
     model: ctx.model,
     child: isChildSession(ctx),
+    managed: executionForSession(ctx.sessionManager?.getSessionId())?.managed,
     includePowerShell: process.platform === "win32" || active.includes("powershell"),
   });
   if (ctx.sessionManager) setSessionProfile(ctx.sessionManager, profile);
@@ -213,7 +216,7 @@ export default function pitako(pi: ExtensionAPI) {
         });
       }
       try {
-        profile = isChildSession(ctx) ? "coding" : requestedProfile(pi);
+        profile = isChildSession(ctx) ? executionForSession(ctx.sessionManager?.getSessionId())?.profile ?? "coding" : requestedProfile(pi);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (ctx.hasUI) ctx.ui.notify(message, "error");
@@ -386,7 +389,7 @@ export default function pitako(pi: ExtensionAPI) {
           notify(ctx, "Team unavailable for this session", "error");
           return;
         }
-        const roles = ["architect", "developer", "reviewer", "researcher"];
+        const roles = ["architect", "developer", "reviewer", "researcher", "scout", "oracle"];
         const rows = roles.map((role, index) => {
           const assignment = latestTeamAssignment(evaluation, role!);
           if (!assignment) return { role: roles[index], status: "idle" };
@@ -444,6 +447,13 @@ export default function pitako(pi: ExtensionAPI) {
       if (command === "stats") {
         try {
           const coordinator = ctx.sessionManager?.getSessionId();
+          if (value === "consultations" || value?.startsWith("consultations ")) {
+            if (!coordinator || !ownsEvent(ctx)) throw new Error("consultation stats require the authorized foreground caller");
+            const parts = args.trim().split(/\s+/);
+            if (parts.length > 3) throw new Error("stats consultations accepts one dispatchId");
+            notify(ctx, JSON.stringify(await consultationStats(coordinator, parts[2])), "info");
+            return;
+          }
           const rows = coordinator ? listObservations(teamEvaluation?.token, coordinator) : [];
           if (value) {
             const row = rows.find((item) => item.id === value);
@@ -533,6 +543,8 @@ export default function pitako(pi: ExtensionAPI) {
   });
 
   pi.on("tool_call", async (event, ctx) => {
+    if (executionForSession(ctx.sessionManager?.getSessionId())?.profile === "analysis" && isOrchestrationTool(event.toolName))
+      return { block: true, reason: "Consultative leaves cannot orchestrate Pitako work" };
     if (event.toolName !== "edit" && event.toolName !== "write") return undefined;
     const input = event.input as { path?: unknown };
     const target = typeof input.path === "string" ? input.path : "";

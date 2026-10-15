@@ -6,8 +6,9 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import agentInstance from "../extensions/agent/index.ts";
+import { subscribeChanges } from "../extensions/agent/observe.ts";
 import { ownedDispatch, settlePendingDispatches } from "../extensions/agent/dispatch.ts";
-import { setBackgroundExecutor, workerStatus, teamWorkerStatus, teamWorkerResult, bindBackgroundOwner, clearBackgroundOwner } from "../extensions/agent/background.ts";
+import { setBackgroundExecutor, workerStatus, teamWorkerStatus, bindBackgroundOwner, clearBackgroundOwner, workerResult, shutdownBackground, cancelAllWorkers } from "../extensions/agent/background.ts";
 import { beginTeamEvaluation, retireTeamEvaluation, reserveTeamRole, teamRoleReservation } from "../extensions/team.ts";
 import { agentFixtureOwnership } from "./fixtures/agent-fixture-ownership.ts";
 import { planFile, ledgerFile } from "../extensions/workflow.ts";
@@ -22,7 +23,7 @@ const result = (stopReason = "stop") => ({ api: "fixture", provider: "opencode",
     probabilities: { developer_senior: 0.7, developer_mid: 0.1, developer_junior: 0.1, indeterminate: 0.1 } } } });
 const fixture = agentFixtureOwnership();
 
-test("registered spawn and Team route once before synchronous acceptance; reservation outlives pending cancellation", fixture.ownedCase("Developer entrypoints", async () => {
+test("registered background handles precede routing; reservation outlives pending cancellation", fixture.ownedCase("Developer entrypoints", async () => {
   const root = mkdtempSync(path.join(tmpdir(), "pitako-entrypoints-"));
   fixture.directories.push(root);
   process.env.PI_CODING_AGENT_DIR = root;
@@ -53,103 +54,109 @@ reasoning = "high"
   const evaluation = beginTeamEvaluation(sessionId, false)!;
   bindBackgroundOwner({ token: evaluation.token, isIdle: () => false, hasUI: true,
     notify() {}, sendMessage() {} });
+  const execute = (name: string) => tools.get(name)!.execute(name, { role: "developer", task: "exact WorkBrief" }, undefined, undefined, ctx);
+  let started = deferred<void>();
   setBackgroundExecutor({ async start(input) {
     starts++;
     expect(input.target.model).toBe("fixture/senior");
     expect(input.target.reasoning).toBe("high");
-    // The row is admitted synchronously before executor's first suspension.
     expect(input.task.startsWith("Team assignment header:")
       ? teamWorkerStatus(evaluation.token, input.instanceId) : workerStatus(input.instanceId)).toHaveLength(1);
+    started.resolve();
     return { status: "completed", result: "fixture", sideEffects: false };
   } });
-  const execute = (name: string) => tools.get(name)!.execute(name, { role: "developer", task: "exact WorkBrief" }, undefined, undefined, ctx);
   try {
-    const spawn = execute("agent_spawn");
+    const spawned = await execute("agent_spawn");
+    expect(spawned.details.dispatchPhase).toBe("preflight");
+    expect(classifications).toBe(0);
+    expect(starts).toBe(0);
     await entered.promise;
     expect(starts).toBe(0);
     gate.resolve(result());
-    const spawned = await spawn;
-    expect(spawned.isError).not.toBe(true);
-    expect(starts).toBe(1);
-    expect(classifications).toBe(1);
+    await started.promise;
     await fixture.settleRuns();
+    expect(classifications).toBe(1);
     expect(workerStatus(spawned.details.instanceId)[0]?.status).toBe("completed");
+
+    gate = deferred(); entered = deferred(); started = deferred();
+    const acceptedTeam = await execute("team_assign");
+    expect(acceptedTeam.details.dispatchPhase).toBe("preflight");
+    await entered.promise;
+    gate.resolve(result()); await started.promise; await fixture.settleRuns();
+    expect(teamRoleReservation(evaluation, "developer")).toBeUndefined();
+    expect(teamWorkerStatus(evaluation.token, acceptedTeam.details.instanceId)[0]?.status).toBe("completed");
+    expect(classifications).toBe(2); expect(starts).toBe(2);
+
+    gate = deferred(); entered = deferred();
+    const aborted = await execute("agent_spawn");
+    await entered.promise;
+    const abortedOutcome = new Promise<void>(resolve => {
+      const stop = subscribeChanges(row => { if (row.id === aborted.details.instanceId && row.lastActivityKind === "no-worker") { stop(); resolve(); } });
+    });
+    gate.resolve(result("aborted")); await abortedOutcome;
+    expect(workerResult(aborted.details.instanceId).status).toBe("failed");
+    expect(starts).toBe(2); expect(records).toHaveLength(2);
 
     gate = deferred(); entered = deferred();
     const frozen = planFile("pending-route", root);
     mkdirSync(path.dirname(frozen), { recursive: true });
     writeFileSync(frozen, "---\nid: pending-route\nrevision: 1\nstatus: frozen\n---\nOwned plan.\n");
-    const team = tools.get("team_assign")!.execute("watched-route",
+    const team = await tools.get("team_assign")!.execute("watched-route",
       { role: "developer", task: "exact WorkBrief", plan: "pending-route", unit: "T2" }, undefined, undefined, ctx);
+    expect(team.details.dispatchPhase).toBe("preflight");
     await entered.promise;
     const reserved = teamRoleReservation(evaluation, "developer");
-    expect(reserved).toBeDefined();
-    const competing = await execute("team_assign");
-    expect(competing.isError).toBe(true);
-    expect(classifications).toBe(2);
+    expect(reserved).toBe(team.details.id);
+    expect((await execute("team_assign")).isError).toBe(true);
+    expect(classifications).toBe(4);
     let settled = false;
-    const shutdown = Promise.resolve(hooks.get("session_shutdown")!()).then(() => { settled = true; });
-    expect(seenSignal?.aborted).toBe(true);
+    const shutdown = Promise.all([hooks.get("session_shutdown")!(), shutdownBackground(evaluation.token)]).then(() => { settled = true; });
     await Promise.resolve();
+    expect(seenSignal?.aborted).toBe(true);
     expect(settled).toBe(false);
     expect(teamRoleReservation(evaluation, "developer")).toBe(reserved);
     expect(existsSync(ledgerFile("pending-route", root))).toBe(false);
     expect((await execute("agent_spawn")).isError).toBe(true);
-    expect(starts).toBe(1);
-    expect(classifications).toBe(2);
     gate.resolve(result());
-    expect((await team).isError).toBe(true);
     await shutdown;
-    expect(starts).toBe(1);
+    expect(starts).toBe(2);
     expect(teamRoleReservation(evaluation, "developer")).toBeUndefined();
     expect(existsSync(ledgerFile("pending-route", root))).toBe(false);
 
-    gate = deferred(); entered = deferred();
-    const valid = execute("team_assign");
-    await entered.promise;
-    gate.resolve(result());
-    const accepted = await valid;
-    expect(accepted.isError).not.toBe(true);
-    expect(accepted.details.dispatchId).toBeDefined();
-    await fixture.settleRuns();
-    expect(teamWorkerResult(evaluation.token, accepted.details.instanceId).status).toBe("completed");
-    expect(teamRoleReservation(evaluation, "developer")).toBeUndefined();
-    expect(starts).toBe(2);
-    expect(records).toHaveLength(2);
-
-    gate = deferred(); entered = deferred();
-    const aborted = execute("agent_spawn");
-    await entered.promise;
-    gate.resolve(result("aborted"));
-    expect((await aborted).isError).toBe(true);
-    expect(starts).toBe(2);
-    expect(records).toHaveLength(2);
-
-    gate = deferred(); entered = deferred();
-    const stale = execute("team_assign");
-    await entered.promise;
-    // Replacement lease cannot be erased by the old operation's rollback.
     await retireTeamEvaluation(evaluation);
-    const replacement = beginTeamEvaluation(sessionId, false)!;
-    const fresh = reserveTeamRole(replacement, "developer", "replacement");
+    // New owner generation, then retire it while routing is physically pending.
+    const fresh = beginTeamEvaluation(sessionId, false)!;
+    bindBackgroundOwner({ token: fresh.token, isIdle: () => false, hasUI: false, notify() {}, sendMessage() {} });
+    gate = deferred(); entered = deferred();
+    await execute("team_assign");
+    await entered.promise;
+    const retiring = retireTeamEvaluation(fresh);
+    expect(() => beginTeamEvaluation(sessionId, false)).toThrow("await retirement");
     gate.resolve(result());
-    expect((await stale).isError).toBe(true);
+    await retiring;
+    const replacement = beginTeamEvaluation(sessionId, false)!;
+    const replacementRole = reserveTeamRole(replacement, "developer", "replacement");
     expect(teamRoleReservation(replacement, "developer")).toBe("replacement");
     expect(starts).toBe(2);
-    fresh.rollback(); await retireTeamEvaluation(replacement);
+    replacementRole.rollback();
+    await retireTeamEvaluation(replacement);
 
+    bindBackgroundOwner({ token: Symbol("changed-session"), isIdle: () => false, hasUI: false, notify() {}, sendMessage() {} });
     gate = deferred(); entered = deferred();
-    const changed = execute("agent_spawn");
+    await execute("agent_spawn");
     await entered.promise;
     sessionId = "changed-session";
     gate.resolve(result());
-    expect((await changed).isError).toBe(true);
+    await cancelAllWorkers();
     expect(starts).toBe(2);
+    expect(records).toHaveLength(2);
   } finally {
     gate.resolve(result("aborted"));
+    await cancelAllWorkers();
     await settlePendingDispatches();
     await retireTeamEvaluation(evaluation);
-    clearBackgroundOwner(); setBackgroundExecutor(undefined);
+    setBackgroundExecutor(undefined);
+    clearBackgroundOwner();
   }
 }));
 

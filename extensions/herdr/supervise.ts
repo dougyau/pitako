@@ -1,3 +1,4 @@
+import { isConsultation } from "../agent/consultation.ts";
 import { spawn } from "node:child_process";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
@@ -54,6 +55,7 @@ export async function superviseAgent(input: {
   preflight?: () => Promise<DispatchSnapshot>;
   check?: () => void;
 }): Promise<SuperviseResult> {
+  if (isConsultation(input.roleId)) throw new Error("Consultative roles require agent_spawn or team_assign, not agent_supervise");
   if (inFlight) throw new Error("agent_supervise is already in flight");
   inFlight = true;
   try {
@@ -210,6 +212,7 @@ export function registerAgentSupervise(pi: ExtensionAPI): void {
     ),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
+        if (isConsultation(params.role)) throw new Error("Consultative roles require agent_spawn or team_assign, not agent_supervise");
         const result = await ownedDispatch(ctx, signal, () => true, async (signal, check) => {
           check();
           return superviseAgent({ roleId: params.role, task: params.task, cwd: ctx.cwd, signal, check,

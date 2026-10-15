@@ -143,7 +143,7 @@ export class ManagedProducer {
   cancel(): void { this.retired = true; this.controller.abort(); }
   async settle(): Promise<void> { await this.slot?.catch(() => {}); }
   private check(revision?: number): number {
-    this.assignment.assertHealthy();
+    this.assignment.assertWritable();
     if (this.retired || this.signal.aborted) throw new Error("managed native binding is retired");
     const current = this.binding.check();
     if (revision !== undefined && revision !== current) throw new Error("managed scope revision changed");
@@ -210,7 +210,8 @@ export class ManagedProducer {
           threw = true; failure = error;
         } finally {
           while (callbacks.size) await Promise.allSettled([...callbacks]);
-          this.assignment.inventory.contributed(before, { ...this.binding.source(), effectiveRevision: revision,
+          const source = this.binding.source();
+          this.assignment.inventory.contributed(before, { ...source, ...(source.kind === "consultation" ? { observedRevision: revision } : { effectiveRevision: revision }),
             toolCallId: id, toolName: definition.name }, outcome, this.binding.writes);
         }
         const allFailures = [...(threw ? [failure] : []), ...failures];
@@ -247,14 +248,14 @@ export function managedTools(loader: DefaultResourceLoader, producer: ManagedPro
     createReadToolDefinition(root), createGrepToolDefinition(root), createFindToolDefinition(root), createLsToolDefinition(root)];
 }
 
-const LOCAL = new Set(["head_result", "head_wait", "head_plan", "head_start", "head_observe", "head_input", "head_review", "head_finish", "head_scope_ack"]);
+const LOCAL = new Set(["consultation_feedback", "head_consult", "head_result", "head_wait", "head_plan", "head_start", "head_observe", "head_input", "head_review", "head_finish", "head_scope_ack"]);
 const BOOKKEEPING = new Set(["todo", "compress", "decompress", "search_context", "acp_status", "acp_cache",
   "board_post", "board_topic_create", "board_topic_update", "board_workflow_claim", "board_workflow_lifecycle",
   "memory_search", "memory_add", "memory_replace", "memory_remove", "session_search"]);
 
 export function managedGuard(supported: Set<string>, checkpoint = false): ExtensionFactory {
   return pi => { pi.on("tool_call", event => {
-    if (supported.has(event.toolName) || LOCAL.has(event.toolName) || checkpoint && event.toolName === "head_checkpoint" || BOOKKEEPING.has(event.toolName) ||
+    if (supported.has(event.toolName) || LOCAL.has(event.toolName) && (!["head_consult", "consultation_feedback"].includes(event.toolName) || checkpoint) || checkpoint && event.toolName === "head_checkpoint" || BOOKKEEPING.has(event.toolName) ||
         toolEffect(event.toolName) === "read_only") return;
     return { block: true, reason: "Unsupported writer/composition in a locally checkpointed assignment; use managed native file tools or finite foreground bash" };
   }); };

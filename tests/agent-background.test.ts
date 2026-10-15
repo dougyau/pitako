@@ -1,3 +1,4 @@
+import { preparedTool } from "./fixtures/background-dispatch.ts";
 import { runAgentInstance } from "../extensions/agent/run.ts";
 import { stubExternalFactories } from "./fixtures/offline.ts";
 stubExternalFactories();
@@ -906,7 +907,8 @@ describe("background tools", () => {
       return fixture.pendingAttempt((resolve) => (finish = resolve));
     } });
     const tools = new Map<string, { execute: Function }>();
-    agentInstance({ registerTool(tool: { name: string; execute: Function }) { tools.set(tool.name, tool); } } as unknown as ExtensionAPI);
+    agentInstance({ registerTool(tool: { name: string; execute: Function }) { tools.set(tool.name, preparedTool(tool)); } } as unknown as ExtensionAPI);
+    bindBackgroundOwner({ token: Symbol("pinned-tree"), isIdle: () => false, hasUI: false, notify() {}, sendMessage() {} });
     const result = await tools.get("agent_spawn")!.execute("call", {
       role: "developer", task: "work in pinned tree", plan: "background-frozen-root", unit: "T3",
     }, new AbortController().signal, undefined, { cwd: execution });

@@ -16,7 +16,21 @@ export const ROUTING_QUESTION = {
     indeterminate: "Context does not establish which profile fits.",
   },
 } as const;
-const RECORD_LIMIT = 262144;
+export const RECORD_LIMIT = 262144;
+
+/** Shared public classifier boundary; callers retain their own rubric and fallback. */
+export async function discoverClassifier(ctx: ExtensionContext, identity: PitakoConfig["developerRouting"],
+  signal: AbortSignal | undefined, check: () => void) {
+  const available = await ctx.modelRegistry.getAvailableOfType("classifier", identity.classifierProvider, { signal });
+  check();
+  return available.find(model => model.id === identity.classifierModel && model.provider === identity.classifierProvider);
+}
+export async function invokeClassifier(ctx: ExtensionContext, model: NonNullable<Awaited<ReturnType<typeof discoverClassifier>>>,
+  request: ClassifierContext, signal: AbortSignal | undefined, check: () => void) {
+  const response = await ctx.modelRegistry.classify(model, request, { signal, maxRetries: 0 });
+  check();
+  return response;
+}
 
 export type DeveloperCapacity =
   | { route: "direct"; profile: DeveloperProfile }
@@ -126,17 +140,15 @@ export async function developerCapacityPreflight(input: PreflightInput & {
     reason = "submitted WorkBrief exceeds supported native record budget; classification skipped";
   } else {
     try {
-      const { classifierProvider, classifierModel } = config.developerRouting;
-      const available = await input.ctx.modelRegistry.getAvailableOfType("classifier", classifierProvider, { signal: input.signal });
+      const model = await discoverClassifier(input.ctx, config.developerRouting, input.signal, check);
       check();
-      const model = available.find(model => model.id === classifierModel && model.provider === classifierProvider);
       // No tokenizer is exposed by the host classifier API. Use the advertised
       // context window as a conservative UTF-8 request budget, never truncate.
       if (model && Buffer.byteLength(JSON.stringify(context), "utf8") > model.contextWindow) {
         reason = "submitted WorkBrief exceeds conservative classifier context-window budget; classification skipped";
       } else if (model) {
         request = context;
-        response = await input.ctx.modelRegistry.classify(model, request, { signal: input.signal, maxRetries: 0 });
+        response = await invokeClassifier(input.ctx, model, request, input.signal, check);
         check();
         if (response.stopReason === "aborted") throw new Error("Developer classifier aborted before admission");
         ({ profile, reason } = classifyProfile(response));

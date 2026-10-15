@@ -1,5 +1,5 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { getCurrentSystemPrompt, lazyStream, normalizeContext, type AssistantMessageEvent, type Context, type Model } from "@earendil-works/pi-ai";
+import { getCurrentSystemPrompt, getSupportedThinkingLevels, lazyStream, normalizeContext, type AssistantMessageEvent, type Context, type Model } from "@earendil-works/pi-ai";
 import {
   createAgentSession,
   createCodemodeExtension,
@@ -10,7 +10,7 @@ import {
   type AgentSession,
 } from "@earendil-works/pi-coding-agent";
 import { registerExecution, unregisterExecution } from "../execution-identity.ts";
-import { reconcileChildTools, ORCHESTRATION_TOOLS } from "../profile.ts";
+import { reconcileChildTools, ORCHESTRATION_TOOLS, isOrchestrationTool } from "../profile.ts";
 import { packageRoot } from "../stack.ts";
 import { marksSideEffect } from "./effects.ts";
 import { isServiceTierRejection } from "./fallback.ts";
@@ -22,6 +22,7 @@ import { createPublicProducer } from "./public-conversation.ts";
 import { AgentClosureError } from "./closure.ts";
 import { headExtension, leafScopeExtension } from "./head/tools.ts";
 import type { HeadAttachment } from "./head/runtime.ts";
+import { isConsultation } from "./consultation.ts";
 import { ManagedProducer, managedTools, managedGuard } from "./head/managed-tools.ts";
 
 // Package entry does not re-export this. Import the file next to the resolved entry.
@@ -155,6 +156,7 @@ export function createPiExecutor(options: { now?: () => number; factories?: Part
         // A signal on runtime create aborts Cursor auth before the child prompt starts.
         const runtime = await factories.createRuntime({ allowModelNetwork: false });
         input.scope?.assertStartup();
+        input.consultant?.check();
         const selections = new WeakMap<object, RequestSelection>();
         keepCursorTools(runtime);
         installServiceTierTransport(runtime, selections);
@@ -291,6 +293,7 @@ async function runTarget(
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
     bindLive?: Parameters<AttemptExecutor["start"]>[0]["bindLive"];
     scope?: Parameters<AttemptExecutor["start"]>[0]["scope"];
+    consultant?: Parameters<AttemptExecutor["start"]>[0]["consultant"];
     head?: HeadAttachment;
     sessionHistory?: SessionHistory;
     factories: PiFactories;
@@ -319,7 +322,15 @@ async function runTarget(
     }
   }
   const handle = resume(session, runtime, selections, now, input);
+  let adjustment: string | undefined, requested = target.reasoning;
+  const observed = (attempt: Attempt, requested: ModelTarget["reasoning"], adjustment?: string) => {
+    attempt.provenance = { configured: target.configuredReasoning ?? { level: target.reasoning }, selected: target,
+      requestedReasoning: requested, activatedModel: session.model && `${session.model.provider}/${session.model.id}`,
+      appliedReasoning: attempt.appliedReasoning ?? session.thinkingLevel, adjustment };
+    return attempt;
+  };
   const beforeDrive = async (result: Attempt): Promise<Attempt> => {
+    observed(result, requested, adjustment);
     if (continuation) return { ...result, session: handle };
     await handle.dispose();
     return result;
@@ -342,6 +353,21 @@ async function runTarget(
   if (activationError) {
     return beforeDrive({ status: "failed", result: "", error: activationError, sideEffects: continuation });
   }
+  if (target.directReasoning && (!target.reasoning || !session.model ||
+      !getSupportedThinkingLevels(session.model).includes(target.reasoning))) {
+    return beforeDrive(configurationFailure(`direct reasoning "${target.reasoning}" is not supported by activated model ${session.model?.provider}/${session.model?.id}`, continuation));
+  }
+  if (target.classifiedReasoning && (!target.reasoning || !session.model ||
+      !getSupportedThinkingLevels(session.model).includes(target.reasoning))) {
+    adjustment = "classified capability drift; restored frozen configured primary reasoning without reclassification";
+    requested = target.classifiedReasoning.configured;
+    const restored = { ...target, reasoning: requested };
+    const error = await activateTarget(session, activated.model!, restored);
+    if (error) return beforeDrive(configurationFailure(error, continuation));
+    input.sessionHistory?.append("reasoning-adjustment", { adjustment, selected: target.reasoning,
+      configured: target.classifiedReasoning.configured, activatedModel: session.model && `${session.model.provider}/${session.model.id}`,
+      appliedReasoning: session.thinkingLevel });
+  }
   try {
     if (session.thinkingLevel) {
       recordAppliedReasoning(activated.model!, selections, session.thinkingLevel);
@@ -349,7 +375,8 @@ async function runTarget(
     }
     // Retire the caller's retained wrapper too: drive can throw before returning a new handle.
     delete handle.retryBeforePrompt;
-    return await drive(session, runtime, selections, now, prompt, input);
+    const attempt = await drive(session, runtime, selections, now, prompt, input);
+    return observed(attempt, requested, adjustment);
   } catch (error) {
     if (error instanceof AgentClosureError) throw error;
     if (!continuation) await handle.dispose();
@@ -415,6 +442,7 @@ async function bindThenRun(
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
     bindLive?: Parameters<AttemptExecutor["start"]>[0]["bindLive"];
     scope?: Parameters<AttemptExecutor["start"]>[0]["scope"];
+    consultant?: Parameters<AttemptExecutor["start"]>[0]["consultant"];
     head?: HeadAttachment;
     sessionHistory?: SessionHistory;
     factories: PiFactories;
@@ -445,6 +473,7 @@ async function openSession(
   target: ModelTarget,
   input: { instanceId: string; role: Parameters<AttemptExecutor["start"]>[0]["role"]; cwd: string; sessionHistory?: SessionHistory; factories: PiFactories;
     signal: AbortSignal; head?: HeadAttachment; scope?: Parameters<AttemptExecutor["start"]>[0]["scope"];
+    consultant?: Parameters<AttemptExecutor["start"]>[0]["consultant"];
     bindLive?: Parameters<AttemptExecutor["start"]>[0]["bindLive"] },
 ): Promise<AgentSession> {
   const agentDir = input.factories.getAgentDir();
@@ -453,10 +482,10 @@ async function openSession(
   let live: ReturnType<typeof createLiveHandle> | undefined;
   let nativeSession: AgentSession | undefined;
   const headBinding = input.head?.bind(input.instanceId);
-  const managedAssignment = input.head?.managed ?? input.scope?.managed;
+  const managedAssignment = input.head?.managed ?? input.scope?.managed ?? input.consultant?.managed;
   const supported = new Set<string>();
   const managed = managedAssignment ? new ManagedProducer(managedAssignment, {
-    writes: input.head ? input.head.dag!.graph.envelope : input.scope!.originalWrites,
+    writes: input.head ? input.head.dag!.graph.envelope : input.scope?.originalWrites ?? input.consultant!.writes,
     check: () => {
       if (!nativeSession) throw new Error("managed native session not bound");
       if (input.head) {
@@ -464,12 +493,12 @@ async function openSession(
         if (!input.head.dag!.codingAllowed(headBinding!)) throw new Error("Head coding requires the exclusive integration barrier");
         return input.head.dag!.graph.revision;
       }
-      return input.scope!.checkManaged(nativeSession.sessionId);
+      return input.scope ? input.scope.checkManaged(nativeSession.sessionId) : input.consultant!.check();
     },
     effects: () => input.head?.admitted(),
-    source: () => ({ kind: input.head ? "head" : "leaf", instanceId: input.instanceId,
+    source: () => ({ kind: input.head ? "head" : input.scope ? "leaf" : "consultation", instanceId: input.instanceId,
       groupId: input.sessionHistory!.invocation.group.groupId, historyId: input.sessionHistory!.historyId,
-      sessionId: nativeSession!.sessionId, ...(input.scope ? { runId: input.scope.runId } : {}) }),
+      sessionId: nativeSession!.sessionId, ...(input.scope ? { runId: input.scope.runId } : {}), ...(input.consultant ? { dispatchId: input.consultant.dispatchId } : {}) }),
   }, input.signal) : undefined;
   const loader = input.factories.createLoader({
     cwd: input.cwd,
@@ -477,7 +506,11 @@ async function openSession(
     settingsManager,
     additionalExtensionPaths: [packageRoot()],
     extensionFactories: [input.factories.createCodemode({ mode: "on" }), pi => {
-      pi.on("turn_start", () => { live?.open(); });
+      pi.on("tool_call", event => {
+        if (isConsultation(input.role.id) && isOrchestrationTool(event.toolName))
+          return { block: true, reason: "Consultative leaves cannot orchestrate Pitako work" };
+      });
+      pi.on("turn_start", () => { guardConsultationTools(); if (nativeSession) reconcileChildTools(nativeSession); live?.open(); });
       pi.on("agent_before_settle", () => live?.settle());
       pi.on("session_tree", event => live?.handle.publicConversation?.reconcile(event.oldLeafId));
       pi.on("session_start", () => live?.handle.publicConversation?.reconcile());
@@ -495,7 +528,20 @@ async function openSession(
   });
   await loader.reload();
   input.scope?.assertStartup();
+  input.consultant?.check();
   if (input.signal.aborted) throw new Error("Agent session startup cancelled");
+  // Codemode can invoke a registered definition without a top-level tool_call event.
+  function guardConsultationTools() {
+    if (!isConsultation(input.role.id)) return;
+    for (const extension of loader.getExtensions().extensions) {
+      for (const [name, tool] of extension.tools) if (isOrchestrationTool(name)) {
+        tool.definition = { ...tool.definition, async execute() {
+          return { content: [{ type: "text", text: "Consultative leaves cannot orchestrate Pitako work" }], details: {}, isError: true };
+        } };
+      }
+    }
+  }
+  guardConsultationTools();
   const customTools = managed ? managedTools(loader, managed) : undefined;
   for (const definition of customTools ?? []) supported.add(definition.name);
   const thinkingLevel = model ? thinkingLevelFor(target.reasoning) : undefined;
@@ -517,10 +563,10 @@ async function openSession(
   };
   if (managed) {
     // Capture native IDs before retirement, never infer them from tool events/results text.
-    const identity = () => ({ kind: input.head ? "head" as const : "leaf" as const, instanceId: input.instanceId,
+    const identity = () => ({ kind: input.head ? "head" as const : input.scope ? "leaf" as const : "consultation" as const, instanceId: input.instanceId,
       groupId: input.sessionHistory!.invocation.group.groupId, historyId: input.sessionHistory!.historyId,
-      sessionId: session.sessionId, observedRevision: input.head ? input.head.dag!.graph.revision : input.scope!.effectiveRevision,
-      ...(input.scope ? { runId: input.scope.runId } : {}) });
+      sessionId: session.sessionId, observedRevision: input.head ? input.head.dag!.graph.revision : input.scope?.effectiveRevision ?? input.consultant!.observedRevision,
+      ...(input.scope ? { runId: input.scope.runId } : {}), ...(input.consultant ? { dispatchId: input.consultant.dispatchId } : {}) });
     lifecycle.captureManaged = closure => {
       if (closure) managedAssignment!.closed(input.sessionHistory!.historyId, closure);
       else managedAssignment!.capture(identity(), session.sessionManager.getBranch());
@@ -538,12 +584,20 @@ async function openSession(
     void requestAbort(session).catch(() => {});
   });
   try {
+    const manager = session.sessionManager;
+    input.consultant?.bindNative(() => {
+      if (session.sessionManager !== manager) throw new Error("consultation native SessionManager replaced");
+      return JSON.stringify([session.sessionId, manager.getSessionId(), manager.getSessionFile()]);
+    });
     input.scope?.assertStartup();
+    input.consultant?.check();
     lifecycle.history?.attached();
     if (input.scope && input.sessionHistory) {
       input.scope.bindRevision(revision => input.sessionHistory!.headRevision(revision));
     }
-    registerExecution({ instanceId: input.instanceId, roleId: input.role.id, sessionId: session.sessionId });
+    registerExecution({ instanceId: input.instanceId, roleId: input.role.id, sessionId: session.sessionId,
+      profile: isConsultation(input.role.id) ? "analysis" : "coding",
+      managed: input.head ? "head" : input.scope ? "leaf" : input.consultant ? "consultation" : undefined });
     if (input.signal.aborted) {
       await disposeChildSession(session);
       throw new Error("Agent session startup cancelled");
@@ -565,7 +619,9 @@ async function openSession(
     }
     await session.bindExtensions({});
     lifecycle.bound = true;
+    guardConsultationTools();
     input.scope?.assertStartup();
+    input.consultant?.check();
     reconcileChildTools(session);
     return session;
   } catch (error) {
@@ -590,6 +646,7 @@ async function drive(
     onRequest?: (request: AgentRequestObservation) => void;
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
     scope?: Parameters<AttemptExecutor["start"]>[0]["scope"];
+    consultant?: Parameters<AttemptExecutor["start"]>[0]["consultant"];
     factories: PiFactories;
     head?: HeadAttachment;
   },
@@ -667,7 +724,7 @@ async function drive(
     });
     const handle = resume(session, runtime, selections, now, input);
     const before = usageFrom(session, {});
-    const usage = () => attemptUsage(before, session, tools, Boolean(input.head || input.scope));
+    const usage = () => attemptUsage(before, session, tools, Boolean(input.head || input.scope || isConsultation(input.role.id)));
     if (input.signal.aborted) {
       try {
         await requestAbort(session);
@@ -684,6 +741,7 @@ async function drive(
       const prompting = Promise.resolve().then(() => {
         if (input.signal.aborted || lifecycle.closing) return;
         input.scope?.beginPrompt(session.sessionId);
+        input.consultant?.beginPrompt();
         return session.prompt(prompt, { expandPromptTemplates: false });
       });
       lifecycle.operations.add(prompting);
@@ -757,6 +815,7 @@ function resume(
     onRequest?: (request: AgentRequestObservation) => void;
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
     scope?: Parameters<AttemptExecutor["start"]>[0]["scope"];
+    consultant?: Parameters<AttemptExecutor["start"]>[0]["consultant"];
     factories: PiFactories;
     head?: HeadAttachment;
   },

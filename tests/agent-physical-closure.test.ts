@@ -3,7 +3,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { bindBackgroundOwner, cancelTeamWorker, spawnBackground, teamWorkerStatus } from "../extensions/agent/background.ts";
+import { bindBackgroundOwner, cancelTeamWorker, spawnBackground, teamWorkerStatus, reserveBackground, observeWorkerResults } from "../extensions/agent/background.ts";
+import { AgentClosureError } from "../extensions/agent/closure.ts";
 import { createPiExecutor } from "../extensions/agent/pi.ts";
 import { HeadAttachment } from "../extensions/agent/head/runtime.ts";
 import { runAgentInstance } from "../extensions/agent/run.ts";
@@ -243,4 +244,26 @@ test("the Head's own SDK disposal failure cannot mark its attachment released", 
     retained.push(head);
     env.release(true);
   }
+});
+
+
+test("unknown no-worker preparation retains its reservation despite an incorporated outcome", async () => {
+  const env = setup(), delivered = Promise.withResolvers<void>();
+  const evaluation = beginTeamEvaluation("unknown-preparation", false)!;
+  const admission = reserveTeamRole(evaluation, "oracle", "unknown");
+  const branch: unknown[] = [];
+  bindBackgroundOwner({ token: evaluation.token, sessionId: evaluation.sessionId, isIdle: () => true, hasUI: false,
+    notify() {}, sendMessage() {}, getBranch: () => branch, appendResult(message) {
+      branch.push({ type: "custom_message", ...message }); delivered.resolve();
+    } });
+  try {
+    const handle = reserveBackground({ roleId: "oracle", task: "unknown", owns: () => true,
+      teamOwner: { token: evaluation.token, assignmentId: "unknown", onSettled() {}, noWorkerReleased: admission.noWorkerReleased },
+      async prepare() { throw new AgentClosureError([new Error("unjoined resource")], "preparation"); } });
+    admission.commit();
+    await delivered.promise; observeWorkerResults(evaluation.token);
+    expect(teamWorkerStatus(evaluation.token, handle.instanceId)[0]?.closure.state).toBe("unknown");
+    expect(teamRoleReservation(evaluation, "oracle")).toBe("unknown");
+    await expect(retireTeamEvaluation(evaluation)).rejects.toThrow("Background retirement");
+  } finally { env.release(true); }
 });

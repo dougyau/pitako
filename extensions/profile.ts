@@ -1,3 +1,4 @@
+import { executionForSession } from "./execution-identity.ts";
 import { PitakoConfigError } from "./errors.ts";
 import type { Model } from "@earendil-works/pi-ai";
 import { supportsOpenAIGrammarTools } from "pi-codex-tools";
@@ -14,6 +15,7 @@ export const MUTATING_TOOLS = new Set(["edit", "write", "apply_patch", "lsp_rena
 
 /** Foreground orchestration. Children do not receive these tools. */
 export const ORCHESTRATION_TOOLS = [
+  "consultation_feedback",
   "agent_run",
   "agent_supervise",
   "agent_spawn",
@@ -29,7 +31,7 @@ export const ORCHESTRATION_TOOLS = [
   "team_cancel",
 ] as const;
 
-const ORCHESTRATION = new Set<string>(ORCHESTRATION_TOOLS);
+export const isOrchestrationTool = (name: string): boolean => /^(agent_|team_|head_)/.test(name) || name === "consultation_feedback";
 // SDK imports and Pi's extension loader can create separate module copies.
 const PROFILE_KEY = Symbol.for("pitako.sessionProfiles");
 const host = globalThis as typeof globalThis & { [PROFILE_KEY]?: WeakMap<object, ProfileName> };
@@ -41,16 +43,17 @@ export function setSessionProfile(manager: object, profile: ProfileName): void {
 
 /** Reconcile explicitly: same-model setModel does not emit model_select. */
 export function reconcileChildTools(session: {
-  sessionManager: object;
+  sessionManager: object & { getSessionId?: () => string };
   model: Model<any> | undefined;
   getAllTools(): Array<{ name: string }>;
   setActiveToolsByName(names: string[]): void;
 }): void {
   session.setActiveToolsByName(toolsForProfile({
     available: session.getAllTools().map((tool) => tool.name),
-    profile: sessionProfiles.get(session.sessionManager) ?? "coding",
+    profile: executionForSession(session.sessionManager.getSessionId?.())?.profile ?? sessionProfiles.get(session.sessionManager) ?? "coding",
     model: session.model,
     child: true,
+    managed: executionForSession(session.sessionManager.getSessionId?.())?.managed,
     includePowerShell: process.platform === "win32",
   }));
 }
@@ -98,6 +101,7 @@ export function toolsForProfile(options: {
   profile: ProfileName;
   model?: Model<any>;
   child?: boolean;
+  managed?: "head" | "leaf" | "consultation";
   includePowerShell?: boolean;
 }): string[] {
   const available = new Set(options.available);
@@ -108,7 +112,11 @@ export function toolsForProfile(options: {
   for (const name of options.available) {
     if (BUILTIN_TOOLS.has(name)) continue;
     if (name === "apply_patch" && !patch) continue;
-    if (options.child && ORCHESTRATION.has(name)) continue;
+    if (options.child && (ORCHESTRATION_TOOLS as readonly string[]).includes(name) &&
+        !(name === "consultation_feedback" && options.managed === "head")) continue;
+    if (options.child && name.startsWith("head_") && options.managed !== "head" &&
+        !(options.managed === "leaf" && name === "head_scope_ack")) continue;
+    if (options.child && options.profile === "analysis" && isOrchestrationTool(name)) continue;
     if (options.profile === "analysis" && MUTATING_TOOLS.has(name)) continue;
     names.push(name);
   }

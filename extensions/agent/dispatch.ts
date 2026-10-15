@@ -25,6 +25,11 @@ export function closeDispatchAdmissions(sessionId?: string): () => void {
   };
 }
 
+/** Reservations share the same lifecycle gate as asynchronous dispatch work. */
+export function dispatchAdmissionsClosed(sessionId?: string): boolean {
+  return closing().has(undefined) || closing().has(sessionId);
+}
+
 /** Transitions wait for the actual admission work, including callbacks and rollback. */
 export async function settlePendingDispatches(sessionId?: string): Promise<void> {
   const reopen = closeDispatchAdmissions(sessionId);
@@ -52,9 +57,9 @@ export function ownedDispatch<T>(
   const abort = () => controller.abort();
   signal?.addEventListener("abort", abort, { once: true });
   ctx.signal?.addEventListener("abort", abort, { once: true });
-  if (signal?.aborted || ctx.signal?.aborted || closing().has(undefined) || closing().has(sessionId)) abort();
+  if (signal?.aborted || ctx.signal?.aborted || dispatchAdmissionsClosed(sessionId)) abort();
   const check = () => {
-    if (controller.signal.aborted || closing().has(undefined) || closing().has(sessionId) || !owns() ||
+    if (controller.signal.aborted || dispatchAdmissionsClosed(sessionId) || !owns() ||
       ctx.sessionManager?.getSessionId?.() !== sessionId ||
       ctx.sessionManager?.getSessionFile?.() !== sessionFile) {
       controller.abort();

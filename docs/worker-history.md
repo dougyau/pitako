@@ -449,3 +449,45 @@ Old databases, sidecars, objects, outputs, ACP, aliases, and generated ledgers a
 not migrated, recovered, or normalized.
 
 This feature adds no privacy system or cross-store deletion guarantee.
+
+
+## Consultation evidence and consumption
+
+`/pitako stats consultations [dispatchId]` is a foreground bounded projection over
+current coordinator catalog locators and their registered Head descendants. The ID
+filters that scope; it never grants access to an arbitrary session path.
+`agent_history` read accepts `{action:"read",dispatchId,source:"caller",groupId?,cursor?,limit?}`
+for original caller entries, even when preparation produced no worker historyId.
+The locator captures the actual caller SessionManager; Head caller and exterior
+coordinator are distinct. A locator grants reading, never deletion of caller files.
+
+Version 1 `pitako.consultation` entries distinguish decision, preparation, outcome,
+closure, delivery and feedback. Classified decisions retain the complete bounded
+request/response, identity, timing and reported usage or explicit absence. A valid
+append can remain in memory before the first assistant; only native bytes are a
+persistence receipt. The catalog stores a versioned decision reference and real
+worker association, not a fictitious member for no-worker preparation.
+
+`pitako.worker-history` result payload version 2 records a result ID, history ID,
+target, configured/selected/requested/activated/observed effort, timestamp, bounded
+request observations and attempt usage or null. Older payloads remain readable;
+missing attribution is unknown. Native assistant usage remains authoritative.
+Classifier overhead, worker attempts and authorized linked followups are separate
+observations, deduplicated by result IDs. Inclusive Head/descendant overlap makes
+a combined total unavailable. Zero catalog pricing does not prove free service.
+
+The existing 32768-byte page/projection budget, 8192-byte fragments and 1..200-entry
+pages remain. Stats additionally caps each native prefix scan at 1 MiB, its total
+native scan at 4 MiB/32 sources, and descendant listings at 16 Head callers. Omitted
+rows, incomplete prefixes and diagnostics are explicit; latest feedback means
+latest observed, not necessarily latest persisted when coverage is truncated.
+Use paged `agent_history` for records outside this projection, not a supplied path.
+
+`consultation_feedback` is foreground or granted Head only. It requires the exact
+incorporated result on the active owner branch and records host-attributed author,
+time, usefulness, optional note (4096 UTF-8 bytes), and up to 32 own catalog followup
+instances. Offered/draft/getter results do not authorize it. Corrections retain
+history; absent feedback is valid. Links establish association, not causal savings,
+acceptance, node review or finish verification. Unlinked/external work remains
+unattributed. Retention prunes only owned worker files, never referenced caller or
+followup sessions through these links.

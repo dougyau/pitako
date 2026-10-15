@@ -131,6 +131,7 @@ export interface Attempt {
   requests?: AgentRequestObservation[];
   usage?: AgentUsage;
   appliedReasoning?: string;
+  provenance?: { configured?: { level?: string }; requestedReasoning?: string; selected: ModelTarget; activatedModel?: string; appliedReasoning?: string; adjustment?: string };
   session?: AttemptSession;
 }
 
@@ -154,6 +155,7 @@ export interface AttemptExecutor {
     head?: HeadAttachment;
     /** Host-only acknowledgment for one Head-owned leaf; never grants orchestration. */
     scope?: LeafScopeAttachment;
+    consultant?: import("./head/runtime.ts").ConsultationAttachment;
     history?: InvocationHistory;
     onActivity?: (event: ActivityEvent) => void;
     /** Fired only after setModel / session open succeeds. Not a second lifecycle. */
@@ -252,6 +254,8 @@ export async function runAgentInstance(input: {
   executionRoot?: string;
   historyOrigin?: HistoryOrigin;
   dispatch?: import("./routing.ts").DispatchSnapshot;
+  consultation?: import("./consultation.ts").ConsultationSnapshot;
+  reservedInstanceId?: string;
   head?: HeadAttachment;
   /** Test clock. Production uses Date.now. */
   now?: () => number;
@@ -271,9 +275,9 @@ export async function runAgentInstance(input: {
   if (input.executionRoot !== undefined && workspace !== input.executionRoot) {
     throw new PitakoConfigError(`AgentInstance workspace drift: expected ${input.executionRoot}, got ${workspace}`);
   }
-  const loaded = input.head?.dag?.configSnapshot ?? input.dispatch?.config ?? loadPitakoConfig(input.load);
+  const loaded = input.head?.dag?.configSnapshot ?? input.dispatch?.config ?? input.consultation?.config ?? loadPitakoConfig(input.load);
   const role = input.head?.dag ? resolveDeveloperHeadFromConfig(input.head.dag.configSnapshot)
-    : input.dispatch?.role ?? resolveRoleFromConfig(loaded, input.roleId);
+    : input.dispatch?.role ?? input.consultation?.role ?? resolveRoleFromConfig(loaded, input.roleId);
   if (role.id !== input.roleId && !(input.head?.dag && input.roleId === "developer")) {
     throw new PitakoConfigError("dispatch snapshot role does not match runner role");
   }
@@ -282,7 +286,7 @@ export async function runAgentInstance(input: {
   }
   const targets = [role.modelPolicy.primary, ...role.modelPolicy.fallbacks];
   const instance: AgentInstance = {
-    id: createInstanceId(role.id),
+    id: input.reservedInstanceId ?? createInstanceId(role.id),
     roleId: input.roleId,
     workspace,
     cwd: input.cwd,
@@ -304,6 +308,7 @@ export async function runAgentInstance(input: {
   if (input.head) {
     if (input.roleId !== "developer") throw new PitakoConfigError("Head attachment requires a Developer assignment");
     input.head.claim(instance.id, workspace);
+    input.head.captureOrigin(origin);
   }
   try { input.onAccepted?.(instance); } catch (error) {
     await input.head?.close();
@@ -502,7 +507,7 @@ async function executeTargets(
   let sideEffects = false;
   let lastError = "no model target could be used";
   let usage: AgentUsage | undefined;
-  const preserveUnknownUsage = Boolean(head || history?.origin?.head);
+  const preserveUnknownUsage = Boolean(head || history?.origin?.head || history?.origin?.consultation);
   let missingUsage = false;
   const requests: AgentRequestObservation[] = [];
   const done = (
