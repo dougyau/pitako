@@ -6,7 +6,8 @@ export { frameBytes, frame, frames } from "../../agent/framing.js";
 type ControllerView = ReturnType<ReturnType<typeof createAgentController>["openView"]>;
 export type LocalView = Omit<ControllerView,
   "readDetail" | "readPublicDetail" | "readPublicActivity" | "readPublicResult" |
-  "readRequests" | "readActivity" | "readResult" | "subscribe" | "list"> & {
+  "readRequests" | "readActivity" | "readResult" | "subscribe" | "list" |
+  "listArchitectures" | "readArchitecture"> & {
   list(after?: string): Omit<ReturnType<ControllerView["list"]>, "revision">;
 };
 export type PaneView = { [K in keyof LocalView]: (...args: Parameters<LocalView[K]>) =>

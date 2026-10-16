@@ -454,6 +454,199 @@ historical messages instead of treating every imported record as an active
 branch message. A replacement binding needs its own reference and read state.
 Same-session fallback remains in its existing binding.
 
+## Passive Architecture tables
+
+The optional ordered capability group is `architecture.list`, `architecture.read`,
+`architecture.public-v1`. The bridge envelope stays version **2**. The updated
+public ESM client accepts either the original canonical v2 capabilities or that
+list plus the entire group; malformed or partial groups are rejected. It connects
+to original v2 servers and rejects unsupported Architecture calls locally without
+sending them. Previously distributed strict clients reject the extended server
+list: consumers must update their client. There is no per-client negotiation or
+v3 fallback.
+
+```js
+if (client.capabilities.includes("architecture.public-v1")) {
+	let catalog = await client.listArchitectures();
+	if (catalog.state !== "ready") throw new Error(catalog.state);
+	for (;;) {
+		for (const item of catalog.items) {
+			// item.ref identifies a table; it grants no execution authority.
+			const page = await client.readArchitecture(item.ref);
+			// Drain page.next before interpreting the complete snapshot.
+		}
+		if (catalog.next === null) break;
+		catalog = await client.listArchitectures(catalog.next);
+		if (catalog.state !== "ready") throw new Error(catalog.state);
+	}
+}
+```
+
+`listArchitectures(cursor?)` sends `architecture.list` with `{ cursor? }`.
+`readArchitecture(ref, cursor?)` sends `architecture.read` with `{ ref, cursor? }`.
+Both are passive reads. `ArchitectureRef` is the owner plus `kind: "architecture"`
+and `roomId`. It is distinct from a worker/conversation reference:
+
+```json
+{"kind":"architecture","processId":"p","coordinatorSessionId":"c","epoch":"e","roomId":"r"}
+```
+
+The public declarations in `client.d.ts` re-export `ArchitectureRef`,
+`ArchitectureCatalog`, `ArchitectureRead`, `ArchitecturePage`,
+`ArchitectureRecord`, `ArchitectureFragment`, `ArchitectureLifecycle`,
+`PublicArchitectureMessage`, `PublicArchitectureBody` and `PublicSynthesisBody`.
+They import no Pi, TypeBox, runtime or TypeScript source at runtime.
+
+### Sources and records
+
+Accepted tables are registered before asynchronous preparation. A catalog can
+therefore contain a table without a runtime or native conversation, including
+one started before the consumer connected. Empty captured catalogs return
+`items: []`, not `not_captured`.
+
+| Record kind | Identity and authoritative content |
+| --- | --- |
+| `room` | `id: roomId`, `mode`, start `origin` (coordinator session/tool call and director identities), `goalSource`, `lifecycle`, `pendingDoubtIds`. |
+| `member` | `id: memberId`, real Team `assignmentId`, `instanceId`, `roleId`, `function` (director/specialist/support), admission `ordinal`/`admittedAt`, `mandate`, `execution`, optional `workerRef`, known `conversationRefs`. |
+| `publication` | Stable Message `id` and the full original `message`, captured only when the runtime registers a settled turn. |
+| `control` | Stable `id`, acceptance `order`, `action`, optional `text`, author coordinator session/tool call, pending or applied `application`. |
+| `failure` | Stable `id`, `phase`, error text, and known member/assignment/stage/round context. |
+| `outcome` | `id: "final"`, `source: "background-settlement"`, definitive `status`, and typed synthesis or definitive text `content`. |
+
+The roster comes from real Team assignments, not composition proposals or
+transcripts. Failed admitted specialists, supports and superseded members remain
+present. Known `compositionMessageId` and `supersededByCompositionId` link
+compositions, never invented one-to-one replacements. Admission rollback creates
+no accepted member. Absence of a conversation does not remove a member.
+
+`goalSource: { kind: "worker-workbrief", instanceId }` identifies the root's
+existing public WorkBrief, not a second goal copy. Read it using
+`client.publicDetail(instanceId)` and each returned `nextBrief`, checking
+`workbrief.source` and returned offsets and concatenating only `workbrief.text`.
+The original Markdown (including Unicode, CRLF and escapes) is the document;
+the technical stage prompt is not. The director's mandate references that root
+WorkBrief; other mandates carry actual `TeamAssignment.task`. A participant's
+inherited origin must not be substituted for its mandate.
+
+`PublicArchitectureMessage` retains Message identity, ordinal, room, assignment,
+member, author, stage, snapshot, optional round, turn/attempt, `body`, `native`
+and generated `doubts`. The Body union retains `composition`, `preparation`,
+`contribution`, `decision`, `answer`, `consultation-plan`,
+`consultation-response`, `knowledge` and `synthesis`, with their original fields
+and references, not UI-renamed content. Provisional `architecture_submit` receipts
+are absent. A recorded publication survives later semantic validation or closure
+failure; that failure is separate. `native.persistence: "unconfirmed"` never
+proves native persistence.
+
+Only accepted coordinator controls appear. Context/priorities remain pending
+until consumed at the existing protocol boundary. Finish/stop apply at their
+flag/revocation boundary, including stop before runtime (`stage: null`). Applied
+stage/round does not prove model receipt; controls never rewrite the initial goal.
+
+### Outcome, physical closure and capture
+
+Stage, round, protocol state, outcome availability, physical closure and capture
+are independent. A published synthesis is the unadjusted settled Message clone.
+The runtime separately deposits its typed adjusted synthesis, bound internally
+to the exact driver result. Background selects it only after that driver resolves
+and finalization does not replace it. A failed outcome may contain a typed
+`partial` synthesis. Driver rejection, cancellation replacement or director
+close failure instead exports definitive settled text. No result string is parsed
+or matched to infer the typed candidate.
+
+For example, a synthesis can coexist with a pending director disposal:
+
+```json
+{"stage":"closing","round":2,"protocolState":"running","outcome":"pending","closure":{"state":"pending","members":"released","director":"pending"}}
+```
+
+Disband of subordinate Team members does not close the director. Aggregate
+`released` requires settled preparation/cleanup and positive closure of each
+created lifetime, with no uncertainty. An ordinary pre-runtime preparation
+failure after cleanup, `workerStarted === false` and no runtime proves members
+and director `not-created`, not disposed; aggregate closure may then be released.
+`AgentClosureError` remains unknown. A close failure after synthesis preserves
+that publication and adds a failed text outcome with unknown closure.
+`outcome: "unavailable"` means an explicit missing definitive capture, not a
+worker error disguised as absence.
+
+`capture.state` is `open`, `closed` or `incomplete`, with `finalCut` and explicit
+`not_captured`/`capture_failed` gaps. Closed means final capture is complete and
+no producers remain, not physical release. Capture faults do not change execution,
+accepted controls, outcomes or ordinary coordinator delivery. Owner/evaluation
+retirement yields `stale_owner` or disconnect, never a fabricated `retired` state.
+
+### Frozen pages, reconstruction and refresh
+
+The first synchronous read freezes a cut. A catalog page has `format:
+"architecture-public-v1"`, `state: "ready"`, `owner`, `snapshotId`, controller
+revision `cut`, `items`, and nullable `next`. A room page replaces owner/items with
+`ref`, `capture` and `records`. Continuation and replay retain that cut even while
+execution advances. Debate `message.ordinal` is separate from controller `cut`.
+`next: null` ends this snapshot, not the table's execution.
+
+Oversized records are serialized once and fragmented by UTF-8 bytes, with
+`kind: "fragment"`, `recordId`, `encoding: "base64-json"`, `byteOffset`,
+`totalBytes` and base64 `data`. Assemble bytes before decoding JSON:
+
+```js
+async function readArchitectureSnapshot(client, ref) {
+	let cursor, snapshotId;
+	const records = [], parts = new Map();
+	for (;;) {
+		const page = await client.readArchitecture(ref, cursor);
+		if (page.state !== "ready") return page; // Do not treat a partial cut as complete.
+		snapshotId ??= page.snapshotId;
+		if (snapshotId !== page.snapshotId) throw new Error("Mixed snapshots");
+		for (const record of page.records) {
+			if (record.kind !== "fragment") { records.push(record); continue; }
+			const part = parts.get(record.recordId) ?? { size: 0, chunks: [] };
+			if (part.size !== record.byteOffset) throw new Error("Fragment offset");
+			const chunk = Buffer.from(record.data, "base64");
+			part.chunks.push(chunk); part.size += chunk.length;
+			parts.set(record.recordId, part);
+			if (part.size === record.totalBytes) {
+				records.push(JSON.parse(Buffer.concat(part.chunks).toString("utf8")));
+				parts.delete(record.recordId);
+			}
+		}
+		if (page.next === null) {
+			if (parts.size) throw new Error("Incomplete record");
+			return { ...page, records };
+		}
+		cursor = page.next;
+	}
+}
+```
+
+Each result is at most 40 KiB and also subtracts the exact envelope plus LF from
+the 48 KiB bridge ceiling. Raw fragments are at most 12 KiB before base64.
+Existing 64 KiB framing, queue and pending-request limits still apply. Each view
+retains one catalog and one room snapshot, each at most 4 MiB; all snapshots per
+owner total at most 32 MiB. These limits bound frozen exports, not running table
+content or authority. Five-minute expiration is measured from creation and
+checked lazily. First reads replace only their own snapshot class in that view;
+final pages retain snapshots for retry. Disconnect/view close/owner revoke frees
+storage. Reservation failure returns `snapshot_oversized`, never truncation or
+eviction of another consumer.
+
+Domain absence is `{ state: "unavailable", reason: "unknown_room" |
+"not_captured" | "snapshot_oversized" }`; `unknown_room` is room-only. Partial
+capture may still be ready with incomplete/gaps. Owner and cursor errors may
+reject as `BridgeError` (`stale_owner`, `stale_cursor`, `invalid_cursor`). Another
+view/room cursor is invalid; expired or replaced snapshots are stale. Owner
+checks precede room lookup. Cursors are opaque, integrity-protected and bound to
+owner, view, room, snapshot, position and byte offset; never edit them.
+
+Table mutations explicitly advance the existing shared controller revision and
+coalesced `changed` hints, including publication, control and closure without a
+worker event. Reads and pagination do not. `subscription.refresh()` still
+refreshes **workers only**. After a hint, finish or discard the previous cut,
+then relist/reread tables without a cursor. After reconnect, relist and reread;
+hints are not a replay log. There is no new persistence, restart recovery,
+transcript inference, coordinator control or T3 UI. Preserve the last confirmed
+cut and mark connection/capture gaps instead of inventing final facts.
+
 ## Change subscriptions
 
 `subscribe(listener)` returns a `BridgeSubscription` with `subscriptionId`,

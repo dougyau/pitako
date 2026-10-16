@@ -1,3 +1,5 @@
+import { architectureRooms, architectureRoom, subscribeArchitectureChanges, createArchitectureSnapshots } from "../architecture/rooms.ts";
+import type { ArchitectureRef } from "./bridge/protocol.js";
 import { createHash, randomUUID } from "node:crypto";
 import { cancelTeamWorker, cancelWorker, readWorkerResult, type LiveTarget } from "./background.ts";
 import { listObservations, readTerminalActivity, subscribeChanges } from "./observe.ts";
@@ -61,6 +63,27 @@ export function createAgentController(owner: AgentControllerOwner, current: () =
     return listObservations(evaluation?.token, owner.sessionId).filter(row =>
       row.ownerToken === undefined || row.ownerToken === owner.token);
   };
+  const architectureEvaluation = teamEvaluationForSession(owner.sessionId, false);
+  const finalArchitectureCuts = new Map<string, number>();
+  const architectureReady = () => {
+    check();
+    if (architectureEvaluation && architectureEvaluation.token !== teamEvaluationForSession(owner.sessionId, false)?.token)
+      throw new Error("stale_owner");
+  };
+  const architectureSnapshots = createArchitectureSnapshots({ processId, coordinatorSessionId: owner.sessionId, epoch });
+  const mutate = () => {
+    if (revision === Number.MAX_SAFE_INTEGER) { active = false; for (const view of views) view.revoke(); return; }
+    revision++;
+    for (const listener of listeners) try { listener(revision); } catch { /* Passive listener. */ }
+  };
+  const unwatchArchitecture = subscribeArchitectureChanges(evaluation => {
+    const live = current();
+    if (active && live?.sessionId === owner.sessionId && live.token === owner.token && evaluation.sessionId === owner.sessionId &&
+        evaluation.token === teamEvaluationForSession(owner.sessionId, false)?.token) {
+      mutate();
+      for (const room of architectureRooms(evaluation)) if (room.captureComplete && !finalArchitectureCuts.has(room.roomId)) finalArchitectureCuts.set(room.roomId, revision);
+    }
+  });
   const unwatch = subscribeChanges(row => {
     const live = current();
     if (!active || live?.sessionId !== owner.sessionId || live.token !== owner.token ||
@@ -69,15 +92,7 @@ export function createAgentController(owner: AgentControllerOwner, current: () =
         !["agent_run", "agent_spawn", "team_assign"].includes(row.origin.source) ||
         row.teamOwnerToken && row.teamOwnerToken !== teamEvaluationForSession(owner.sessionId, false)?.token ||
         row.origin.source === "team_assign" && (!row.teamOwnerToken || !row.origin.assignmentId)) return;
-    if (revision === Number.MAX_SAFE_INTEGER) {
-      active = false; unwatch();
-      for (const view of views) view.revoke();
-      return;
-    }
-    revision++;
-    for (const listener of listeners) {
-      try { listener(revision); } catch { /* A host listener cannot affect worker execution. */ }
-    }
+    mutate();
   });
   const rowFor = (id: string) => {
     const row = rows().find(row => row.id === id);
@@ -170,7 +185,7 @@ export function createAgentController(owner: AgentControllerOwner, current: () =
   return {
     revoke() {
       active = false; // before any caller's cleanup await
-      unwatch();
+      unwatch(); unwatchArchitecture(); architectureSnapshots.clear(); finalArchitectureCuts.clear();
       for (const view of views) view.revoke();
     },
     async settle() { await Promise.allSettled([...pending]); },
@@ -180,7 +195,8 @@ export function createAgentController(owner: AgentControllerOwner, current: () =
       const control = options.control !== false && options.policy !== "bridge-read";
       const work = new Set<Promise<unknown>>();
       let unsubscribe: (() => void) | undefined;
-      const lease = { revoke() { connected = false; unsubscribe?.(); } };
+      const architectureView = architectureSnapshots.view();
+      const lease = { revoke() { connected = false; unsubscribe?.(); architectureView.close(); } };
       views.add(lease);
       const ready = () => { check(); if (!connected) throw new Error("view is disconnected"); };
       const own = <T>(operation: () => Promise<T>): Promise<T> => {
@@ -193,7 +209,39 @@ export function createAgentController(owner: AgentControllerOwner, current: () =
         accepted.then(release, release);
         return accepted.then(result => { ready(); return result; });
       };
+      const architectureRef = (roomId: string): ArchitectureRef => ({ kind: "architecture", processId, coordinatorSessionId: owner.sessionId, epoch, roomId });
       return {
+        listArchitectures(cursor?: string, byteBudget?: number) {
+          ready(); architectureReady();
+          return architectureView.read(null, cursor, revision, () => ({ header: { owner: { processId, coordinatorSessionId: owner.sessionId, epoch } },
+            records: architectureRooms(teamEvaluationForSession(owner.sessionId, false)).map(room => ({ ref: architectureRef(room.roomId),
+              mode: room.mode, director: room.director, lifecycle: structuredClone(room.lifecycle) })) }), byteBudget);
+        },
+        readArchitecture(ref: ArchitectureRef, cursor?: string, byteBudget?: number) {
+          ready(); architectureReady();
+          if (ref.processId !== processId || ref.coordinatorSessionId !== owner.sessionId || ref.epoch !== epoch) throw new Error("stale_owner");
+          return architectureView.read(ref.roomId, cursor, revision, () => {
+            const evaluation = teamEvaluationForSession(owner.sessionId, false);
+            const room = evaluation && architectureRoom(evaluation, ref.roomId);
+            if (!room) return undefined;
+            const records = structuredClone([...room.records.values()]);
+            const capture = structuredClone(room.capture);
+            if (room.captureComplete) {
+              if (!finalArchitectureCuts.has(room.roomId)) finalArchitectureCuts.set(room.roomId, revision);
+              capture.finalCut = finalArchitectureCuts.get(room.roomId)!;
+            }
+            for (const record of records) if (record.kind === "member") {
+              const row = rows().find(row => row.id === record.instanceId);
+              if (!row) continue;
+              record.workerRef = publicRef(row);
+              try {
+                const conversation = resolveOwnedWorkerRead(targetFor(row), readScope()).conversation;
+                record.conversationRefs = conversation?.metadata(record.workerRef).bindings.map(binding => binding.ref) ?? [];
+              } catch { capture.state = "incomplete"; if (!capture.gaps.includes("capture_failed")) capture.gaps.push("capture_failed"); }
+            }
+            return { header: { ref, capture }, records };
+          }, byteBudget);
+        },
         readPublicDetail(id: string, cursor?: WorkerReadCursor): PublicWorkerDetail | { state: "unavailable"; reason: "unsupported_kind" } {
           ready();
           if (cursor?.ref.native) throw new Error("invalid_cursor");

@@ -1,3 +1,4 @@
+import { architectureRoom, registerArchitectureRoom, captureArchitecture, architectureControl, architectureControlApplied } from "./rooms.ts";
 import { randomUUID } from "node:crypto";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -7,15 +8,15 @@ import { currentInstanceId } from "../agent/scope.ts";
 import { assertNoCheckpointLease } from "../agent/head/checkpoint-lease.ts";
 import { backgroundExecutor, cancelTeamWorker, reserveBackground, type WorkerInterest } from "../agent/background.ts";
 import { prepareTeamWatch } from "../agent/index.ts";
-import { createTeam, reserveTeamMember, recordTeamAssignment, recordPlanTeamWork, teamEvaluationForSession, type TeamEvaluation } from "../team.ts";
+import { createTeam, reserveTeamMember, recordTeamAssignment, recordPlanTeamWork, teamEvaluationForSession } from "../team.ts";
 import type { HistoryOrigin } from "../agent/history.ts";
-import { createConsultation, type Consultation } from "./runtime.ts";
+import { createConsultation } from "./runtime.ts";
 const strict = { additionalProperties: false } as const;
 const text = Type.String({ minLength: 1 });
+const briefGuidance = "Write goal as a self-contained Markdown work brief in its original language: short title, objective and expected result. Add context, questions, restrictions and references when useful. Use short paragraphs and lists; no required HTML, wide tables, frontmatter or empty sections. This is authorship guidance, not validation: plain text remains valid and submitted text is preserved without conversion or normalization.";
 const result = (details: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(details) }], details });
 
 export function registerArchitecture(pi: ExtensionAPI) {
-  const rooms = new Map<string, { evaluation: TeamEvaluation; assignmentId: string; instanceId: string; runtime?: Consultation }>();
   const evaluationFor = (ctx: ExtensionContext) => {
     const id = ctx.sessionManager.getSessionId();
     if (currentInstanceId() || executionForSession(id)) throw new Error("architecture coordinator tools are foreground only");
@@ -25,7 +26,7 @@ export function registerArchitecture(pi: ExtensionAPI) {
     return evaluation;
   };
   const roomFor = (id: string, ctx: ExtensionContext) => {
-    const evaluation = evaluationFor(ctx), room = rooms.get(id);
+    const evaluation = evaluationFor(ctx), room = architectureRoom(evaluation, id);
     if (!room || room.evaluation.token !== evaluation.token) throw new Error("unknown or retired architecture room");
     return room;
   };
@@ -34,8 +35,8 @@ export function registerArchitecture(pi: ExtensionAPI) {
     catch (error) { return { ...result({ error: String(error) }), isError: true }; }
   };
   pi.registerTool({ name: "architecture_start", label: "Start architecture consultation",
-    description: "Start an analysis-only direct consultation or autonomous table (up to five specialists, two supports and five rounds). Returns the real Architect Team result/cancel handle. Only the root delivers synthesis, after disband.",
-    parameters: Type.Object({ mode: Type.Union([Type.Literal("consultation"), Type.Literal("table")]), goal: text, topic: Type.Optional(text), plan: Type.Optional(text), unit: Type.Optional(text), boardTopicId: Type.Optional(text) }, strict),
+    description: `Start an analysis-only direct consultation or autonomous table (up to five specialists, two supports and five rounds). Returns the real Architect Team result/cancel handle. Only the root delivers synthesis, after disband. ${briefGuidance}`,
+    parameters: Type.Object({ mode: Type.Union([Type.Literal("consultation"), Type.Literal("table")]), goal: Type.String({ minLength: 1, description: briefGuidance }), topic: Type.Optional(text), plan: Type.Optional(text), unit: Type.Optional(text), boardTopicId: Type.Optional(text) }, strict),
     async execute(toolCallId, params, _signal, _update, ctx) {
       try {
         const evaluation = evaluationFor(ctx), config = structuredClone(loadPitakoConfig({ cwd: ctx.cwd }));
@@ -59,8 +60,8 @@ export function registerArchitecture(pi: ExtensionAPI) {
               const launchRoot = watched.execution?.executionRoot ?? ctx.cwd;
               if (watched.execution) origin.execution = { executionRoot: launchRoot, executionRef: `${watched.execution.planId}@${watched.execution.revision}:${watched.execution.hash}` };
               const runtime = createConsultation({ team, config, mode: params.mode, goal: params.goal, topic: params.topic, root: { assignmentId, memberId: admission.memberId, instanceId: reserved.instanceId },
-                origin, cwd: launchRoot, owns: reserved.current });
-              rooms.get(team.teamId)!.runtime = runtime;
+                origin, cwd: launchRoot, owns: reserved.current, observation: architectureRoom(evaluation, team.teamId) });
+              captureArchitecture(architectureRoom(evaluation, team.teamId), room => { room.runtime = runtime; room.runtimeCreated = true; });
               recordTeamAssignment(evaluation, "architect", { id: assignmentId, instanceId: reserved.instanceId, roleId: "architect", task: params.goal,
                 planId: watched.watch?.planId, unitId: watched.watch?.unitId, boardTopicId: watched.topic, execution: watched.execution, dispatchId: reserved.dispatchId });
               return { roleId: "architect", task: params.goal, cwd: launchRoot, historyOrigin: origin, architecture: runtime.architecture,
@@ -69,8 +70,8 @@ export function registerArchitecture(pi: ExtensionAPI) {
             },
           });
           admission.commit();
+          registerArchitectureRoom({ evaluation, roomId: team.teamId, mode: params.mode, toolCallId, director: { assignmentId, memberId: admission.memberId, instanceId: handle.instanceId } });
           recordTeamAssignment(evaluation, "architect", { id: assignmentId, instanceId: handle.instanceId, roleId: "architect", task: params.goal, dispatchId: handle.dispatchId });
-          rooms.set(team.teamId, { evaluation, assignmentId, instanceId: handle.instanceId });
           return result({ ...handle, roomId: team.teamId, assignmentId, memberId: admission.memberId });
         } catch (error) { admission.rollback(); throw error; }
       } catch (error) { return { ...result({ error: String(error) }), isError: true }; }
@@ -85,14 +86,16 @@ export function registerArchitecture(pi: ExtensionAPI) {
   });
   pi.registerTool({ name: "architecture_control", label: "Control architecture consultation", description: "Supply next-boundary context or priorities, finish after the current exchange, or revoke immediately with stop. Stop is not proof of closure.",
     parameters: Type.Object({ roomId: text, action: Type.Union([Type.Literal("context"), Type.Literal("priorities"), Type.Literal("finish"), Type.Literal("stop")]), text: Type.Optional(text) }, strict),
-    execute: protect(async (_id, params, _signal, _update, ctx) => {
+    execute: protect(async (toolCallId, params, _signal, _update, ctx) => {
       const room = roomFor(params.roomId, ctx);
       if (!room.runtime) {
         if (params.action !== "stop") throw new Error("architecture preparation pending");
         cancelTeamWorker(room.evaluation.token, room.instanceId);
+        const id = architectureControl(room, params.action, params.text, toolCallId);
+        architectureControlApplied(room, [id], null, 0);
         return result({ roomId: params.roomId, state: "stopping" });
       }
-      return result(room.runtime.control(params.action, params.text));
+      return result(room.runtime.control(params.action, params.text, toolCallId));
     }),
   });
 }

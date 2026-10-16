@@ -16,6 +16,8 @@ const errorCode = (error: unknown): ErrorCode => {
   return Object.hasOwn(errors, message) ? message as ErrorCode
     : message === "unknown scoped worker" ? "unknown_target"
     : message === "view has outstanding work" ? "busy"
+    : message === "stale_owner" ? "stale_owner"
+    : message === "stale_cursor" ? "stale_cursor"
     : message === "controller owner epoch is retired" || message === "view is disconnected" ? "stale_owner"
     : error instanceof RangeError ? "oversized"
     : "invalid_cursor";
@@ -128,6 +130,10 @@ export function createAgentBridge(controller: Controller, root: string, current:
           try {
             let page: unknown;
             switch (request.method) {
+              case "architecture.list": page = view.listArchitectures(request.params.cursor,
+                Math.min(40 * 1024, replyBytes - Buffer.byteLength(frame(success(request, null), "Agent bridge")) + 4)); break;
+              case "architecture.read": page = view.readArchitecture(request.params.ref, request.params.cursor,
+                Math.min(40 * 1024, replyBytes - Buffer.byteLength(frame(success(request, null), "Agent bridge")) + 4)); break;
               case "workers.list": page = view.list(request.params.after, request.params.revision); break;
               case "subscribe": {
                 if (subscription) throw new Error("busy");

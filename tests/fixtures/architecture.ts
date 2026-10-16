@@ -30,7 +30,7 @@ export function architectureFixture() {
   topic = "security"
   candidates = [{ model = "fixture/chosen", reasoning = "high" }, { model = "fixture/chosen", reasoning = "low" }, { model = "fixture/other" }]
   `;
-  async function setup(extra: { root?: string; config?: string; busy?: boolean; prompt?: (session: any, request: any, body: any) => Promise<any> | any; abort?: (session: any) => Promise<void>; dispose?: (session: any) => Promise<void>; bind?: (session: any) => Promise<void> | void; extensions?: any[] } = {}) {
+  async function setup(extra: { root?: string; config?: string; busy?: boolean; prompt?: (session: any, request: any, body: any) => Promise<any> | any; afterSubmit?: (session: any, request: any, receipt: any) => Promise<void> | void; abort?: (session: any) => Promise<void>; dispose?: (session: any) => Promise<void>; bind?: (session: any) => Promise<void> | void; extensions?: any[] } = {}) {
     const root = extra.root ?? mkdtempSync(path.join(tmpdir(), "pitako-architecture-"));
     if (!extra.root) fixture.directories.push(root);
     process.env.PI_CODING_AGENT_DIR = root;
@@ -63,23 +63,30 @@ export function architectureFixture() {
     const host = controlledPi(root, { inlineExtensions: true, bind: extra.bind, extensions: extra.extensions,
       models: ["director", "chosen", "other", "general", "support"].map(id => controlledModel("fixture", id)),
       async prompt(session, text) {
-        const request = JSON.parse(text.startsWith("{") ? text : [...session.prompts].reverse().find((prompt: string) => prompt.startsWith("{"))!);
-        const body = request.stage === "composition" ? { kind: "composition", snapshotId: request.snapshot.id, specialists: [{ candidateRef: "topic:0:0", mandate: "Review security", reason: "Relevant expertise" }] }
-          : request.stage === "answer" ? { kind: "answer", answer: "A".repeat(20000) + "🧠", evidence: ["source"], limits: [], doubts: [] }
-          : request.stage === "consultation-plan" ? { kind: "consultation-plan", resolutions: [], support: [] }
-          : request.stage === "knowledge" ? { kind: "knowledge", resolutions: [] }
-          : { kind: "synthesis", status: "complete", recommendation: "Use the bounded design", alternatives: [], evidence: [], assumptions: [], disagreements: [], pending: [] };
-        const chosen = await extra.prompt?.(session, request, body) ?? body;
-        if (chosen !== false) {
-          expect(executionForSession(session.sessionId)?.profile).toBe("analysis");
-          expect(session.active).not.toContain("edit"); expect(session.active).not.toContain("write");
-          const receipt = await session.boundTools.get("architecture_submit")!.execute("native-submit", { submissionId: `submit-${session.prompts.length}`, body: chosen }, undefined, undefined, { sessionManager: session.sessionManager });
-          seen.push({ session, request, receipt, levels: session.thinkingLevel, model: session.model!.id });
-          expect(receipt.isError).not.toBe(true);
+        // controlledPi has no event loop; drive the native turn admission/settlement hooks.
+        for (const handler of session.hooks.get("turn_start") ?? []) await handler({ type: "turn_start" }, { sessionManager: session.sessionManager });
+        try {
+          const request = JSON.parse(text.startsWith("{") ? text : [...session.prompts].reverse().find((prompt: string) => prompt.startsWith("{"))!);
+          const body = request.stage === "composition" ? { kind: "composition", snapshotId: request.snapshot.id, specialists: [{ candidateRef: "topic:0:0", mandate: "Review security", reason: "Relevant expertise" }] }
+            : request.stage === "answer" ? { kind: "answer", answer: "A".repeat(20000) + "🧠", evidence: ["source"], limits: [], doubts: [] }
+            : request.stage === "consultation-plan" ? { kind: "consultation-plan", resolutions: [], support: [] }
+            : request.stage === "knowledge" ? { kind: "knowledge", resolutions: [] }
+            : { kind: "synthesis", status: "complete", recommendation: "Use the bounded design", alternatives: [], evidence: [], assumptions: [], disagreements: [], pending: [] };
+          const chosen = await extra.prompt?.(session, request, body) ?? body;
+          if (chosen !== false) {
+            expect(executionForSession(session.sessionId)?.profile).toBe("analysis");
+            expect(session.active).not.toContain("edit"); expect(session.active).not.toContain("write");
+            const receipt = await session.boundTools.get("architecture_submit")!.execute("native-submit", { submissionId: `submit-${session.prompts.length}`, body: chosen }, undefined, undefined, { sessionManager: session.sessionManager });
+            seen.push({ session, request, receipt, levels: session.thinkingLevel, model: session.model!.id });
+            expect(receipt.isError).not.toBe(true);
+            await extra.afterSubmit?.(session, request, receipt);
+          }
+          const message = { role: "assistant", content: [{ type: "text", text: "submitted" }], stopReason: "stop", model: session.model!.id, provider: "fixture", api: "openai-completions", timestamp: Date.now() };
+          session.messages.push(message); session.sessionManager.appendMessage(message as never); session.emit({ type: "message_end", message });
+          if (request.stage === "knowledge") knowledge[knowledgeIndex++]!.resolve();
+        } finally {
+          for (const handler of session.hooks.get("agent_before_settle") ?? []) await handler({ type: "agent_before_settle" }, { sessionManager: session.sessionManager });
         }
-        const message = { role: "assistant", content: [{ type: "text", text: "submitted" }], stopReason: "stop", model: session.model!.id, provider: "fixture", api: "openai-completions", timestamp: Date.now() };
-        session.messages.push(message); session.sessionManager.appendMessage(message as never); session.emit({ type: "message_end", message });
-        if (request.stage === "knowledge") knowledge[knowledgeIndex++]!.resolve();
       }, abort: extra.abort, dispose: extra.dispose });
     host.factories.createSettings = () => ({ getModelThinkingLevel: () => "minimal", getDefaultThinkingLevel: () => "off" }) as never;
     setBackgroundExecutor(createPiExecutor({ factories: host.factories }));

@@ -1,3 +1,4 @@
+import { observeArchitectureAssignment, retireArchitectureRooms } from "./architecture/rooms.ts";
 import { randomUUID } from "node:crypto";
 import { reserveBackground, turnTeamWorker, finishTeamWorker, type SpawnInput, retireTeamMembers, retireTeamWorkers, teamWorkerHasOutcome, teamWorkerStatus } from "./agent/background.ts";
 import { executionForSession } from "./execution-identity.ts";
@@ -73,6 +74,7 @@ export function retireTeamEvaluation(evaluation: TeamEvaluation | undefined): Pr
   for (const team of current.teams.values()) team.closed = true;
   const retirement = Promise.withResolvers<void>();
   current.retiring = retirement.promise;
+  retireArchitectureRooms(evaluation);
   void retireTeamWorkers(evaluation.token).then(() => {
     if (state.evaluations.get(evaluation.sessionId) === current) state.evaluations.delete(evaluation.sessionId);
     retirement.resolve();
@@ -157,7 +159,9 @@ export function recordTeamAssignment(evaluation: TeamEvaluation, roleId: string,
   const member = [...current.members.values()].find(member => member.assignmentId === assignment.id && member.roleId === roleId);
   const previous = current.assignments.get(assignment.id);
   if (!member && !previous) throw new Error("Team assignment has no admission");
-  current.assignments.set(assignment.id, { ...(previous ?? member!), ...assignment });
+  const recorded = { ...(previous ?? member!), ...assignment };
+  current.assignments.set(assignment.id, recorded);
+  observeArchitectureAssignment(evaluation, recorded);
 }
 
 export function teamAssignments(evaluation: TeamEvaluation): readonly TeamAssignment[] {

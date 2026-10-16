@@ -29,6 +29,18 @@ Omitted reasoning uses the destination's settings/SDK default, never the precedi
 
 In direct mode, the first specialist answer and Architect's common knowledge boundary arrive automatically as an intermediate response. The room then waits without idle expiry. Context requests another exchange on the same specialist conversation and open history. A foreground turn ending does not cancel that lifetime. Session/workspace retirement, reload or exit revokes it and joins owned closure.
 
+## Writing the work brief
+
+Write `goal` as a self-contained Markdown work brief in the brief's original language. Include a short title, an objective and an expected result. Add context, questions, restrictions and references when useful. Prefer short paragraphs and lists; HTML, wide tables, frontmatter and empty sections are not required.
+
+This is authorship guidance for both modes, not validation. `goal` remains a plain string, and plain text remains valid. No Markdown file, extra field, conversion or normalization is introduced. JSON escaping preserves the submitted value, including whitespace, line breaks, Unicode, quotes, backslashes and code fences, after deserialization.
+
+The original general work brief is `architecture_start.goal`. Inspect it through the root identified by the start result: while its live handle is linked, existing `agent_observe` exposes `workbrief.source: "original WorkBrief"` and pages the text using `briefOffset` and the returned `workbrief.nextOffset`. Reconstruct all pages to read the complete original. Later room controls do not rewrite it.
+
+Individual mandates are separate assignments, not the general work brief. An internal participant may inherit the root's original WorkBrief as its history origin; that inherited text is not its individual mandate. Full technical stage prompts also contain instructions, context and structured protocol around `goal`; they are not solely the work brief. Neither debate fragments from `architecture_read` nor a Team wrapper establish the original source.
+
+UI reading/source views, page reconstruction in the UI, rendering and safe handling of links or HTML belong to the consumer's interface work, outside this change.
+
 ## Planning use
 
 Choose ordinary `team_assign` role work for a bounded pass, direct consultation for an exchange with the coordinator, or a table for useful independent perspectives. No table is mandatory for trivial work. Team identifies the collaboration, role the reusable responsibility, and member/assignment one participant; repeated roles do not occupy a global singleton slot.
@@ -38,13 +50,13 @@ A table may supply the required Architect judgment through its one actual Archit
 For example, with an unbound draft at `planFile("storage-design")`, validated prospective correlation is permitted:
 
 ```json
-{ "mode": "table", "plan": "storage-design", "unit": "architect-pass", "goal": "Design-only judgment on the current storage-design draft. Inspect the repository and draft, ignore ## Planning workers, and do not modify product files. Resolve boundaries and check unit partition/order for coupled contracts, prerequisites and consequential uncertainty." }
+{ "mode": "table", "plan": "storage-design", "unit": "architect-pass", "goal": "# Storage design review\n\n## Objective\nDesign-only judgment on the current storage-design draft.\n\n## Context and restrictions\nInspect the repository and draft, ignore ## Planning workers, and do not modify product files.\n\n## Expected result\nResolve boundaries and check unit partition/order for coupled contracts, prerequisites and consequential uncertainty." }
 ```
 
 A Board-bound draft without a ledger instead omits `plan`, `unit` and explicit `boardTopicId`:
 
 ```json
-{ "mode": "consultation", "goal": "Design-only judgment on the current bound storage-design draft. Ignore ## Planning workers; do not modify product files. Check boundaries and unit partition/order, reporting evidence and unresolved decisions." }
+{ "mode": "consultation", "goal": "# Bound storage design review\n\n## Objective\nDesign-only judgment on the current bound storage-design draft.\n\n## Restrictions\nIgnore ## Planning workers; do not modify product files.\n\n## Expected result\nCheck boundaries and unit partition/order, reporting evidence and unresolved decisions." }
 ```
 
 Neither draft route creates an execution ledger or Board binding. A compatible existing ledger may be correlated; incompatible ledgers and real Team holds remain blockers, not reasons to omit correlation or add an explicit-topic bypass. Preserve `$execute`'s one exterior Developer, asynchronous Head and authorized writes, exclusive integration barrier, Head-only checkpoints, root binding, holds and acceptance restrictions. The one-Developer rule is workflow policy, not an engine singleton reservation.
@@ -80,3 +92,14 @@ Intermediate responses use a separate in-memory envelope/receipt channel. They d
 Only a final result after disband reaches terminal handoff and hold reconciliation. A partial synthesis is `failed`, not success. Stop is `cancelled`; failed, partial and cancelled results retain applicable holds. Unbound drafts create no ledger or Board binding; a bound draft without a ledger does not authorize creating one.
 
 Disband closes admissions/grants and joins owned starts, prompts, aborts and disposal before releasing resources. Unknown closure retains reservations and actionable diagnostics and prevents terminal driver handoff, fictitious success or fallback. The root still joins its own disposal when a child fails to close. There is no protocol persistence, restart recovery, new runner or daemon. Histories and public observation metadata continue to use existing Team identities and capture rules; older captures remain readable.
+
+## Passive public observation
+
+An updated Node ESM bridge client can discover accepted tables with
+`listArchitectures()` and read frozen structured facts with `readArchitecture()`,
+without coordinator tools or execution effects. Detect the complete optional
+`architecture.public-v1` capability group under bridge envelope v2.
+See [Passive Architecture tables](agent-bridge.md#passive-architecture-tables) for
+public types, compatibility, byte reconstruction, limits and closure semantics.
+The original root WorkBrief remains the document source; mandates, controls,
+settled publications, definitive outcome and physical closure are separate facts.
