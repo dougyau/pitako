@@ -37,7 +37,7 @@ Record a compatible explicit user requirement for ordinary single mode or a
 prohibition of Head itself; deliberately use `mode: "single"` without `writes`.
 A prohibition on leaves or parallelism alone still permits Head. Frozen conflicts
 and real safety/resource limits use execute's decision levels, not a downgrade.
-Missing `developer_head` policy, invalid envelope, occupied role, unavailable
+Missing `developer_head` policy, invalid envelope, conflicting exterior Developer ownership, unavailable
 asynchronous Head support, and binding rejection remain blockers. Do not omit
 `mode`, use `agent_run`, evade admission through another transport, edit personal
 configuration, or take over implementation. Configured Head ModelPolicy fallback
@@ -54,7 +54,7 @@ exact handle, required Team hold recovery, and normal admission. A normal
 result content, hidden details, or worker self-report do not substitute.
 Without proof, no Head starts in this invocation: preserve blockers, resources,
 and holds. Do not recancel, poll, probe, switch transport, or add an observation
-API. Later authorized admission still requires a free role, binding, ownership,
+API. Later authorized admission still requires released prior exterior Developer ownership, binding,
 and evidence-based hold recovery. Retain already physically settled useful ordinary
 work for review and acceptance, without manufacturing a Head replay. The complete
 foreground policy lives in the execute skill; the foreground profile hook does

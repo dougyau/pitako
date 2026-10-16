@@ -1,4 +1,5 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { registerArchitecture } from "../architecture/index.ts";
+import type { ExtensionContext, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { PitakoConfigError } from "../errors.ts";
@@ -31,7 +32,7 @@ import { existsSync } from "node:fs";
 import { openBoard } from "../board/store.ts";
 import { boardWorkspace, currentWorkspace } from "../board/workspace.ts";
 import { ledgerFile, openExecutionPlan, planFile, readFrozenPlan, readPlan, type ExecutionBinding, type PlanMeta } from "../workflow.ts";
-import { teamEvaluationForSession, reserveTeamRole, recordTeamAssignment, recordPlanTeamWork, teamAssignments, latestTeamAssignment } from "../team.ts";
+import { teamEvaluationForSession, reserveTeamMember, recordTeamAssignment, recordPlanTeamWork, teamAssignments, selectTeamAssignments } from "../team.ts";
 import type { HistoryOrigin } from "./history.ts";
 import { queryHistory } from "./history-query.ts";
 import { executionForSession } from "../execution-identity.ts";
@@ -170,6 +171,7 @@ export default function agentInstance(pi: ExtensionAPI): void {
   });
   registerBackgroundTools(pi);
   registerTeamTools(pi);
+  registerArchitecture(pi);
   pi.registerTool({
     name: "agent_run",
     label: "Run agent",
@@ -271,7 +273,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "team_assign",
     label: "Assign Team role",
-    description: "Start one isolated Team role. Returns immediately. One assignment per role may run at a time. Every asynchronous developer mode head with explicit writes has local checkpoints and supports explicit checkpoint_origin continuation; neither grants publication or acceptance.",
+    description: "Start one isolated Team role. Returns immediately. Each call admits an independently identified member, including the same role. Every asynchronous developer mode head with explicit writes has local checkpoints and supports explicit checkpoint_origin continuation; neither grants publication or acceptance.",
     promptSnippet: "Assign independent work to a Team role",
     promptGuidelines: ["Use team_assign for independent long work. Keep task scoped. Do not wait or poll; interpret complete results automatically supplied in context. team_result is an optional diagnostic re-read, not a transport or acknowledgement."],
     parameters: Type.Object({
@@ -294,8 +296,9 @@ function registerTeamTools(pi: ExtensionAPI): void {
         const caller = ctx.sessionManager;
         const evaluation = evaluationFor(ctx);
         const id = randomUUID();
-        const admission = reserveTeamRole(evaluation, params.role, id);
-        const origin = historyOrigin("team_assign", ctx, params.task, _toolCallId, undefined, id);
+        const admission = reserveTeamMember(evaluation, params.role, id);
+        const origin = { ...historyOrigin("team_assign", ctx, params.task, _toolCallId, undefined, id),
+          teamId: admission.teamId, memberId: admission.memberId };
         const callerOwns = () => admission.owns() && ctx.sessionManager?.getSessionId?.() === origin.coordinatorSessionId &&
           ctx.sessionManager?.getSessionFile?.() === origin.coordinatorSessionFile;
         let head: ReturnType<typeof createHead>;
@@ -303,7 +306,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
         try {
           const handle = reserveBackground({ roleId: params.role, coordinatorSessionId: origin.coordinatorSessionId, task: params.task, origin,
             owns: callerOwns,
-            teamOwner: { token: admission.token, assignmentId: id, onSettled: () => admission.settled(), noWorkerReleased: admission.noWorkerReleased },
+            teamOwner: { token: admission.token, assignmentId: id, teamId: admission.teamId, memberId: admission.memberId, onSettled: () => admission.settled(), noWorkerReleased: admission.noWorkerReleased },
             async cleanup() {
               await head?.close();
               if (durableWatch) recordPlanTeamWork(ctx.cwd, durableWatch.planId, durableWatch.unitId, id, undefined, durableWatch.execution);
@@ -315,29 +318,15 @@ function registerTeamTools(pi: ExtensionAPI): void {
               consultation = await prepareConsultation(consultation, params.task, ctx, signal, check, record);
             }
               check();
-              const watch = interestFrom(params.plan, params.unit);
-              let plan: { file: string; text: string; meta: PlanMeta } | undefined;
-              let execution: ExecutionBinding | undefined;
-              if (watch) plan = existsSync(ledgerFile(watch.planId, ctx.cwd))
-                ? openExecutionPlan(watch.planId, ctx.cwd, { createLedger: false }) : assignmentPlan(watch.planId, ctx.cwd);
-              const topic = await teamBoardTopic(params.boardTopicId, watch?.planId, ctx.cwd, plan?.meta, check);
+              const watched = await prepareTeamWatch(params, ctx, id, check, async () =>
+                params.role === "developer" && !headOptions ? developerPreflight({
+                  task: params.task, toolCallId: _toolCallId, source: "team_assign", ctx, pi, signal,
+                  owns: () => { check(); return true; },
+                }) : undefined);
+              const { watch, execution, topic, preflight: dispatch } = watched;
+              durableWatch = watched.durableWatch;
               check();
-              const dispatch = params.role === "developer" && !headOptions ? await developerPreflight({
-                task: params.task, toolCallId: _toolCallId, source: "team_assign", ctx, pi, signal,
-                owns: () => { check(); return true; },
-              }) : undefined;
-              check();
-              if (watch && plan?.meta.status === "frozen") {
-                const opened = openExecutionPlan(watch.planId, ctx.cwd, { createLedger: true, source: plan });
-                plan = opened; execution = opened.binding;
-                if (topic !== undefined) await claimTeamBoardTopicExecution(topic, opened.meta, ctx.cwd, opened.binding.executionRoot, check);
-                check();
-              }
-              if (watch && topic !== undefined && plan) {
-                durableWatch = { ...watch, execution };
-                recordPlanTeamWork(ctx.cwd, watch.planId, watch.unitId, id, "pending", execution);
-              }
-              const task = [`Team assignment header: Team ${evaluation!.sessionId}; role ${params.role}; assignment ${id}${topic !== undefined ? `; Board topic ${topic}` : ""}.`,
+              const task = [`Team assignment header: Team ${admission.teamId}; member ${admission.memberId}; role ${params.role}; assignment ${id}${topic !== undefined ? `; Board topic ${topic}` : ""}.`,
                 "WorkBrief:", params.task.trim()].join("\n");
               const launchRoot = execution?.executionRoot ?? ctx.cwd;
               head = createHead(id, launchRoot, headOptions, backgroundExecutor());
@@ -348,14 +337,14 @@ function registerTeamTools(pi: ExtensionAPI): void {
                 task: params.task.trim(), planId: watch?.planId, unitId: watch?.unitId, boardTopicId: topic, execution, dispatchId: reserved.dispatchId });
               return { roleId: params.role, task, cwd: launchRoot, watch: watch ? { ...watch, execution } : undefined,
                 executor: backgroundExecutor(), historyOrigin: origin, dispatch, consultation, head,
-                reconcileBookkeeping: watch && topic !== undefined
-                  ? result => recordPlanTeamWork(launchRoot, watch.planId, watch.unitId, id, result.status, execution) : undefined };
+                reconcileBookkeeping: durableWatch
+                  ? result => recordPlanTeamWork(launchRoot, durableWatch!.planId, durableWatch!.unitId, id, result.status, execution) : undefined };
             },
           });
           admission.commit();
-          const assignment = { id, instanceId: handle.instanceId, roleId: params.role, task: params.task.trim(), dispatchId: handle.dispatchId };
+          const assignment = { id, assignmentId: id, teamId: admission.teamId, memberId: admission.memberId, ordinal: admission.ordinal, admittedAt: admission.admittedAt, instanceId: handle.instanceId, roleId: params.role, task: params.task.trim(), dispatchId: handle.dispatchId };
           recordTeamAssignment(evaluation!, params.role, assignment);
-          return textResult(formatWorkerHandle(handle), { ...assignment, ...handle });
+          return textResult(`assignment_id: ${id}\n${formatWorkerHandle(handle)}`, { ...assignment, ...handle });
         } catch (error) { admission.rollback(); throw error; }
       } catch (error) { return errorResult(error instanceof Error ? error.message : String(error)); }
     },
@@ -364,23 +353,20 @@ function registerTeamTools(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "team_status",
     label: "Team status",
-    description: "Show stable ordered Team role status. Does not wait or include task text or transcripts.",
+    description: "Show Team members in admission order. Does not wait or include task text or transcripts.",
     promptSnippet: "Inspect Team assignments without waiting",
-    parameters: Type.Object({ assignmentId: Type.Optional(Type.String()) }, noExtra),
+    parameters: Type.Object({ assignmentId: Type.Optional(Type.String({ minLength: 1 })), teamId: Type.Optional(Type.String({ minLength: 1 })), memberId: Type.Optional(Type.String({ minLength: 1 })) }, noExtra),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       try {
         const evaluation = evaluationFor(ctx);
         if (!evaluation) throw new Error("Team requires a foreground session identity");
-        const rows = roles.map((role) => {
-          const assignment = latestTeamAssignment(evaluation, role);
-          const selected = params.assignmentId ? teamAssignments(evaluation).find(item => item.roleId === role && item.id === params.assignmentId) : assignment;
-          if (params.assignmentId && !selected) return undefined;
-          const row = selected ?? assignment;
-          if (!row) return { role, status: "idle" };
+        const selected = selectTeamAssignments(evaluation, params);
+        const rows = selected.map(row => {
           const view = teamWorkerStatus(evaluation.token, row.instanceId)[0];
           const observation = listObservations(evaluation.token, evaluation.sessionId).find((item) => item.id === row.instanceId);
           return {
-            role,
+            role: row.roleId,
+            teamId: row.teamId, memberId: row.memberId, ordinal: row.ordinal, admittedAt: row.admittedAt,
             assignmentId: row.id,
             instanceId: row.instanceId,
             task: row.task.split("\n").find((line) => line.trim())?.trim().slice(0, 100) ?? "",
@@ -394,7 +380,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
           };
         }).filter((row) => row !== undefined);
         if (params.assignmentId && rows.length === 0) throw new Error(`unknown Team assignment ${params.assignmentId}`);
-        return textResult(JSON.stringify(rows), { roles: rows });
+        return textResult(JSON.stringify(rows), { members: rows });
       } catch (error) { return errorResult(error instanceof Error ? error.message : String(error)); }
     },
   });
@@ -416,7 +402,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
         const prefix = `${formatTeamExecutionSummary(summary)}\n\n`;
         const diagnostic = handoff?.bookkeepingDiagnostic ? `\n\nBookkeeping blocked: ${handoff.bookkeepingDiagnostic}` : "";
         return textResult(`${prefix}${result.result}${diagnostic}`, {
-          assignmentId: assignment.id, instanceId: result.instanceId, role: result.role,
+          teamId: assignment.teamId, memberId: assignment.memberId, assignmentId: assignment.id, instanceId: result.instanceId, role: result.role,
           status: result.status, model: result.model, usage: result.usage, summary, handoff, resultLength: result.result.length,
         }, result.status !== "completed" || handoff?.bookkeeping === "blocked");
       } catch (error) { return errorResult(error instanceof Error ? error.message : String(error)); }
@@ -426,7 +412,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "team_cancel",
     label: "Cancel Team assignment",
-    description: "Cancel one Team assignment. Its role stays occupied until worker settles.",
+    description: "Cancel one Team assignment. Its member stays owned until physical closure.",
     promptSnippet: "Cancel one Team assignment without waiting",
     parameters: Type.Object({ assignmentId: Type.String() }, noExtra),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -686,4 +672,26 @@ function registerBackgroundTools(pi: ExtensionAPI): void {
       }
     },
   });
+}
+
+/** Shared root admission rules. Internal protocol turns never call this helper. */
+export async function prepareTeamWatch<T = undefined>(params: { plan?: string; unit?: string; boardTopicId?: string }, ctx: ExtensionContext, id: string, check: () => void, beforeCommit?: () => Promise<T>) {
+  const watch = interestFrom(params.plan, params.unit);
+  let plan = watch ? existsSync(ledgerFile(watch.planId, ctx.cwd))
+    ? openExecutionPlan(watch.planId, ctx.cwd, { createLedger: false }) : assignmentPlan(watch.planId, ctx.cwd) : undefined;
+  let execution: ExecutionBinding | undefined;
+  const topic = await teamBoardTopic(params.boardTopicId, watch?.planId, ctx.cwd, plan?.meta, check);
+  check();
+  // Validate first, but never create a ledger or hold before routing has settled.
+  const preflight = await beforeCommit?.();
+  check();
+  if (watch && plan?.meta.status === "frozen") {
+    const opened = openExecutionPlan(watch.planId, ctx.cwd, { createLedger: true, source: plan });
+    plan = opened; execution = opened.binding;
+    if (topic !== undefined) await claimTeamBoardTopicExecution(topic, opened.meta, ctx.cwd, opened.binding.executionRoot, check);
+    check();
+  }
+  const durableWatch = watch && topic !== undefined && execution ? { ...watch, execution } : undefined;
+  if (durableWatch) recordPlanTeamWork(ctx.cwd, durableWatch.planId, durableWatch.unitId, id, "pending", execution);
+  return { watch, topic, execution, durableWatch, preflight };
 }

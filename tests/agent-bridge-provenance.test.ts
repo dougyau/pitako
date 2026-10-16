@@ -99,9 +99,14 @@ for (const method of ["agent_spawn", "team_assign"] as const) for (const role of
       expect(accepted.workbrief.text).toBe(brief); expect(nativeCreated).toBe(false);
       if (method === "team_assign") expect(accepted.worker.assignmentId).toBe((result.details as { id: string }).id);
       else expect(accepted.worker.assignmentId).toBeUndefined();
+      const turnId = `${id}:turn:1`;
+      const { turnId: acceptedTurnId, ...launchProvenance } = accepted.worker;
+      // Admission can be observed before or after the first logical turn is reserved.
+      expect([undefined, turnId]).toContain(acceptedTurnId);
       const detail = await peer.publicDetail(id);
       if (!("format" in detail)) throw Error(JSON.stringify(detail));
-      expect(detail.worker).toEqual(accepted.worker); expect(detail.workbrief.text).toBe(brief);
+      expect(detail.worker.turnId).toBe(turnId);
+      expect(detail.worker).toEqual({ ...launchProvenance, turnId }); expect(detail.workbrief.text).toBe(brief);
       expect(detail.lifecycle.capture).toBe("incomplete"); expect(detail.lifecycle.captureReason).toBe("not_captured");
       expect(detail.bindings).toEqual([]); expect(nativeCreated).toBe(false);
       expect(JSON.stringify(detail)).not.toContain("coordinator.jsonl");
@@ -121,7 +126,9 @@ for (const method of ["agent_spawn", "team_assign"] as const) for (const role of
       expect(catalog.toolCallId).toBe(toolCallId);
       expect(nativeOrigin).toMatchObject({ data: { event: "origin", data: { origin: { toolCallId, source: method, workbrief: brief } } } });
       const terminal = await peer.publicDetail(id);
-      expect(terminal).toMatchObject({ worker: accepted.worker, lifecycle: { execution: "completed", result: "available", capture: "incomplete" } });
+      if (!("format" in terminal)) throw Error(JSON.stringify(terminal));
+      expect(terminal.worker).toEqual({ ...launchProvenance, turnId });
+      expect(terminal).toMatchObject({ lifecycle: { execution: "completed", result: "available", capture: "incomplete" } });
     }));
 }
 

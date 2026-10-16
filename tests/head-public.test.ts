@@ -7,7 +7,7 @@ import { execFileSync } from "node:child_process";
 import { createCodingTools, type AgentBeforeSettleEventResult, type ExtensionAPI, type ExtensionContext, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import agentExtension from "../extensions/agent/index.ts";
 import { bindBackgroundOwner, clearBackgroundOwner, deliverWorkerResults, setBackgroundExecutor, workerResult, teamWorkerResult } from "../extensions/agent/background.ts";
-import { beginTeamEvaluation, recordPlanTeamWork, retireTeamEvaluation, teamRoleReservation } from "../extensions/team.ts";
+import { beginTeamEvaluation, recordPlanTeamWork, retireTeamEvaluation, firstTeamReservation } from "../extensions/team.ts";
 import { createPiExecutor } from "../extensions/agent/pi.ts";
 import { agentFixtureOwnership } from "./fixtures/agent-fixture-ownership.ts";
 import { controlledPi, controlledModel } from "./fixtures/pi-factories.ts";
@@ -391,7 +391,7 @@ test("public modes reject before effects and preserve ordinary routes", fixture.
   expect((await h.callPublic("agent_run", { role: "developer", task: "sync",
     checkpoint_origin: { assignmentId: "old", checkpointId: "old", commit: "abc" } })).isError).toBe(true);
   expect(h.counts()).toEqual({ starts: 0, leafStarts: 0, classifications: 0 });
-  expect(teamRoleReservation(h.evaluation, "developer")).toBeUndefined();
+  expect(firstTeamReservation(h.evaluation, "developer")).toBeUndefined();
   const developer = await h.callPublic("agent_spawn", { role: "developer", task: "ordinary" });
   const researcher = await h.callPublic("team_assign", { role: "researcher", task: "ordinary" });
   expect(developer.isError).not.toBe(true); expect(researcher.isError).not.toBe(true);
@@ -974,7 +974,7 @@ test("public Team Head completes direct product work with no leaves through the 
   await h.headEntered.promise;
   expect(h.headLocal().tools.has("head_checkpoint")).toBe(true);
   expect(h.host.loaderInputs[0].appendSystemPrompt.join("\n")).toContain("Managed local-source support:");
-  expect(teamRoleReservation(h.evaluation, "developer")).toBe(admission.details.id);
+  expect(firstTeamReservation(h.evaluation, "developer")).toBe(admission.details.id);
   const initial = await h.read();
   expect(initial.nodes).toEqual([]);
   await expect(h.call("write", { path: "direct.txt", content: "premature\n" })).rejects.toThrow("exclusive integration barrier");
@@ -1030,7 +1030,7 @@ test("public Team Head decomposes, overlaps, corrects, integrates and returns na
   const admission = await h.callPublic("team_assign", { role: "developer", mode: "head", writes: ["."], task: "PARENT SECRET" });
   expect(admission.isError).not.toBe(true);
   await h.headEntered.promise;
-  expect(teamRoleReservation(h.evaluation, "developer")).toBe(admission.details.id);
+  expect(firstTeamReservation(h.evaluation, "developer")).toBe(admission.details.id);
   expect(h.headSession().active).toContain("head_finish");
   expect(h.headSession().active).not.toContain("agent_spawn");
   await expect(h.call("bash", { command: "touch forbidden" })).rejects.toThrow("exclusive integration barrier");
@@ -1240,7 +1240,7 @@ test("cancelled public Head cannot finish successfully and waits for its own chi
   expect(h.headSession().events).toContain("abort");
   expect(h.headSession().events).toContain("dispose");
   expect(h.leaf("a").session.events).toContain("dispose");
-  expect(teamRoleReservation(h.evaluation, "developer")).toBeUndefined();
+  expect(firstTeamReservation(h.evaluation, "developer")).toBeUndefined();
   expect(() => h.outcome(admission.details.instanceId, true)).toThrow("unknown Team worker");
 }));
 

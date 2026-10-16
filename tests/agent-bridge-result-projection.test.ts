@@ -16,8 +16,8 @@ import { listObservations } from "../extensions/agent/observe.ts";
 import { createAgentController } from "../extensions/agent/controller.ts";
 import type { AgentRunResult, Attempt, AttemptExecutor } from "../extensions/agent/run.ts";
 import {
-  beginTeamEvaluation, recordPlanTeamWork, recordTeamAssignment, reserveTeamRole,
-  retireTeamEvaluation, teamAssignments, teamRoleReservation, type TeamEvaluation,
+  beginTeamEvaluation, recordPlanTeamWork, recordTeamAssignment, reserveTeamMember,
+  retireTeamEvaluation, teamAssignments, firstTeamReservation, type TeamEvaluation,
 } from "../extensions/team.ts";
 import { ledgerFile, planFile, planHash, readLedgerTeamHolds } from "../extensions/workflow.ts";
 
@@ -256,7 +256,7 @@ test("Team reads preserve occupancy and assignments; automatic bookkeeping is in
   writeFileSync(plan, planText);
   writeFileSync(ledger, `---\nplan_id: projection\nrevision: 1\nhash: ${planHash(planText)}\nstatus: running\n---\n\n## Team Holds\n\n<!-- pitako-team-holds:v1 -->\n[]\n<!-- /pitako-team-holds -->\n`);
   recordPlanTeamWork(env.root, "projection", "T2", "assignment", "pending");
-  const admission = reserveTeamRole(evaluation, "developer", "assignment");
+  const admission = reserveTeamMember(evaluation, "developer", "assignment");
   const worker = hanging();
   const handle = await spawnBackground({
     roleId: "developer", task: "Team wrapper\nWorkBrief:\noriginal", cwd: env.root, load: env.load, executor: worker.executor,
@@ -285,14 +285,14 @@ test("Team reads preserve occupancy and assignments; automatic bookkeeping is in
     expect(readWorkerResult(target, { ...scope, teamToken: Symbol("foreign") })).toEqual({ state: "stale_owner" });
     expect(readWorkerResult(target, env.scope)).toEqual({ state: "stale_owner" });
   }
-  expect(teamRoleReservation(evaluation, "developer")).toBe("assignment");
+  expect(firstTeamReservation(evaluation, "developer")).toBe("assignment");
   expect(teamAssignments(evaluation)).toEqual(slots);
   expect(readFileSync(ledger)).toEqual(ledgerBefore);
   expect(listObservations(evaluation.token)).toEqual(pendingObservation);
   worker.finish({ status: "completed", result: "Team result", sideEffects: false });
   await env.settled.promise;
   // Actual settlement releases the role. Only compare read effects after it.
-  expect(teamRoleReservation(evaluation, "developer")).toBeUndefined();
+  expect(firstTeamReservation(evaluation, "developer")).toBeUndefined();
   expect(env.wakes).toHaveLength(1);
   const settledObservation = listObservations(evaluation.token);
   const reconciledLedger = readFileSync(ledger);
@@ -304,7 +304,7 @@ test("Team reads preserve occupancy and assignments; automatic bookkeeping is in
   expect(readWorkerResult(target, { ...scope, teamToken: unrelatedTeam }))
     .toEqual({ state: "unavailable", reason: "unknown_target" });
   for (let i = 0; i < 3; i++) expect(ready(readWorkerResult(target, scope)).text.text).toBe("Team result");
-  expect(teamRoleReservation(evaluation, "developer")).toBeUndefined();
+  expect(firstTeamReservation(evaluation, "developer")).toBeUndefined();
   expect(teamAssignments(evaluation)).toEqual(slots);
   expect(readFileSync(ledger)).toEqual(reconciledLedger);
   expect(listObservations(evaluation.token)).toEqual(settledObservation);
@@ -368,7 +368,7 @@ test("automatic ledger failure never hides the full tool result; captured bookke
   writeFileSync(ledger, `---\nplan_id: projection\nrevision: 1\nhash: ${planHash(planText)}\nstatus: running\n---\n\n## Team Holds\n\n<!-- pitako-team-holds:v1 -->\n[]\n<!-- /pitako-team-holds -->\n`);
   recordPlanTeamWork(env.root, "projection", "T2", "assignment", "pending");
   const retainedLedger = readFileSync(ledger);
-  const admission = reserveTeamRole(evaluation, "developer", "assignment"), worker = hanging();
+  const admission = reserveTeamMember(evaluation, "developer", "assignment"), worker = hanging();
   const handle = await spawnBackground({ roleId: "developer", task: "work", cwd: env.root, load: env.load, executor: worker.executor,
     historyOrigin: { source: "team_assign", coordinatorSessionId: evaluation.sessionId, assignmentId: "assignment" },
     teamOwner: { token: evaluation.token, assignmentId: "assignment", onSettled: admission.settled },
@@ -380,7 +380,7 @@ test("automatic ledger failure never hides the full tool result; captured bookke
   const full = "\n漢😀e\u0301 ".repeat(3000) + "\n";
   worker.finish({ status: "completed", result: full, sideEffects: false });
   await fixture.settleRuns();
-  expect(teamRoleReservation(evaluation, "developer")).toBeUndefined();
+  expect(firstTeamReservation(evaluation, "developer")).toBeUndefined();
   const envelope = env.branch[0];
   const resultTool = tools().get("team_result")!;
   const context = { cwd: env.root, sessionManager: { getSessionId: () => evaluation.sessionId } } as Parameters<typeof resultTool.execute>[4];

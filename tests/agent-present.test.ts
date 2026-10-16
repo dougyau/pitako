@@ -259,7 +259,8 @@ fallbacks = [
         input.onActivity?.({ type: "tool_execution_start", toolName: "bash" });
         input.onActivity?.({ type: "tool_execution_update", toolName: "bash" });
         if (input.target.model === "example/primary") {
-          return { status: "failed", result: "", error: "429 rate limit", sideEffects: false };
+          return { status: "failed", result: "", error: "429 rate limit", sideEffects: false,
+            usage: { input: 0, output: 0, turns: 0, toolCalls: 0, cost: 0 } };
         }
         const pending = texts.at(-1) ?? "";
         expect(pending).toContain("activation pending");
@@ -301,6 +302,39 @@ fallbacks = [
     expect(result.result).toContain("CHILD-TRANSCRIPT");
     expect(formatAgentResult(result)).toContain("fallback: rate_limit from example/primary");
     expect(formatAgentResult(result)).toContain(result.result);
+  }));
+
+  test("ordinary fallback keeps aggregate usage unknown when the primary omits usage", fixture.ownedCase("unknown fallback usage", async () => {
+    const envDir = mkdtempSync(path.join(tmpdir(), "pitako-present-unknown-"));
+    fixture.directories.push(envDir);
+    const userConfigPath = path.join(envDir, "config.toml");
+    writeFileSync(userConfigPath, `
+[model_policies.architect]
+primary = { model = "example/primary", reasoning = "high" }
+fallbacks = [{ model = "example/fallback", reasoning = "high" }]
+`);
+    const starts: string[] = [], texts: string[] = [];
+    const result = await runAgentInstance({
+      roleId: "architect", task: "review the boundary", cwd: packageRoot(),
+      load: { userConfigPath, packageRoot: packageRoot() },
+      executor: { async start(input) {
+        starts.push(input.target.model);
+        return input.target.model === "example/primary"
+          ? { status: "failed", result: "", error: "429 rate limit", sideEffects: false }
+          : { status: "completed", result: "fallback result", sideEffects: false,
+            usage: { input: 3, output: 1, turns: 2, toolCalls: 1, cost: 1.2 } };
+      } },
+      onPresent(text) { texts.push(text); },
+    });
+    expect(starts).toEqual(["example/primary", "example/fallback"]);
+    expect(result.status).toBe("completed");
+    expect(result.model.fallbackOccurred).toBe(true);
+    expect(result.usage).toBeUndefined();
+    expect(texts.at(-1)).toContain(" completed");
+    for (const metric of ["input:", "output:", "turns:", "tool calls:", "cost:"]) {
+      expect(texts.join("\n")).not.toContain(metric);
+      expect(formatAgentResult(result)).not.toContain(metric);
+    }
   }));
 
   test("watchdog phase changes present, and a throwing callback does not change the stall", fixture.ownedCase("watchdog phase changes present, and a throwing callback does not change the stall", async () => {

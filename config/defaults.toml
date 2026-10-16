@@ -122,3 +122,10 @@ principles = ["principle-foundational-thinking"]
 
 [model_policies.scout]
 [model_policies.oracle]
+
+# Optional direct architecture consultations. No models are enabled by default.
+# [architecture]
+# candidates = [{ model = "provider/general", reasoning = "high" }]
+# [[architecture.topics]]
+# topic = "security and isolation"
+# candidates = [{ model = "provider/specialist" }]

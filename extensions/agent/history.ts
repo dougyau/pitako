@@ -8,6 +8,8 @@ import { acquireHistoryExclusion } from "./history-retention.ts";
 
 /** Host-supplied origin, never recovered from a prompt or child cwd. */
 export interface HistoryOrigin {
+  entrypoint?: "architecture_start";
+  parentAssignmentId?: string;
   source: "agent_run" | "agent_spawn" | "team_assign";
   coordinatorSessionId?: string;
   toolCallId?: string;
@@ -15,6 +17,10 @@ export interface HistoryOrigin {
   callerSessionId?: string;
   callerSessionFile?: string;
   assignmentId?: string;
+  dispatchId?: string;
+  teamId?: string;
+  memberId?: string;
+  turnId?: string;
   workbrief?: string;
   execution?: { executionRoot: string; executionRef: string };
   routing?: import("./routing.ts").DispatchSnapshot["routing"];
@@ -41,6 +47,10 @@ export type HistoryDisposition =
   | { state: "disposed"; at: string };
 
 export interface HistoryMember {
+  entrypoint?: HistoryOrigin["entrypoint"];
+  parentAssignmentId?: string;
+  teamId?: string;
+  turnId?: string;
   historyId: string;
   roleId: string;
   coordinatorSessionId?: string;
@@ -364,6 +374,7 @@ export class InvocationHistory {
       instanceId, roleId, coordinatorSessionId: this.origin?.coordinatorSessionId,
       toolCallId: this.origin?.toolCallId, callerSessionId: this.origin?.callerSessionId, callerSessionFile: this.origin?.callerSessionFile,
       coordinatorSessionFile: this.origin?.coordinatorSessionFile, assignmentId: this.origin?.assignmentId,
+      entrypoint: this.origin?.entrypoint, parentAssignmentId: this.origin?.parentAssignmentId, teamId: this.origin?.teamId, memberId: this.origin?.memberId, turnId: this.origin?.turnId,
       head: this.origin?.head, consultation: this.origin?.consultation,
     };
     const current = this.store.read(this.group.groupId);

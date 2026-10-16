@@ -22,6 +22,7 @@ import { createPublicProducer } from "./public-conversation.ts";
 import { AgentClosureError } from "./closure.ts";
 import { headExtension, leafScopeExtension } from "./head/tools.ts";
 import type { HeadAttachment } from "./head/runtime.ts";
+import { submitSchema, type NativeTurn } from "../architecture/types.ts";
 import { isConsultation } from "./consultation.ts";
 import { ManagedProducer, managedTools, managedGuard } from "./head/managed-tools.ts";
 
@@ -34,16 +35,19 @@ const sdkDefaultsReady = import(
   return defaults;
 });
 
+const architectureTools = new WeakMap<AgentSession, (identity: NativeTurn) => void>();
+
 const childLifecycles = new WeakMap<AgentSession, { bound: boolean; disposal?: Promise<void>; history?: SessionHistory;
   live?: ReturnType<typeof createLiveHandle>; unbindLive?: () => void;
   head?: HeadAttachment; headBinding?: object; stopAbort?: () => void;
   managed?: ManagedProducer; captureManaged?: (closure?: "released" | "unknown") => void;
-  operations: Set<Promise<unknown>>; failures: unknown[]; abort?: Promise<void>; closing: boolean }>();
+  operations: Set<Promise<unknown>>; failures: unknown[]; abort?: Promise<void>; generation: number; closing: boolean }>();
 
 function requestAbort(session: AgentSession): Promise<void> {
   const lifecycle = childLifecycles.get(session)!;
   if (lifecycle.abort) return lifecycle.abort;
-  const pending = Promise.resolve().then(() => session.abort());
+  const generation = lifecycle.generation;
+  const pending = Promise.resolve().then(() => { if (lifecycle.generation === generation) return session.abort(); });
   lifecycle.abort = pending;
   lifecycle.operations.add(pending);
   void pending.then(() => lifecycle.operations.delete(pending), error => {
@@ -53,9 +57,13 @@ function requestAbort(session: AgentSession): Promise<void> {
   return pending;
 }
 
-function disposeChildSession(session: AgentSession): Promise<void> {
+function disposeChildSession(session: AgentSession, signal?: AbortSignal): Promise<void> {
   const lifecycle = childLifecycles.get(session)!;
   if (lifecycle.disposal) return lifecycle.disposal;
+  if (signal) {
+    lifecycle.stopAbort?.();
+    lifecycle.stopAbort = watchAbort(signal, () => { void requestAbort(session).catch(() => {}); });
+  }
   lifecycle.closing = true;
   lifecycle.managed?.cancel();
   if (lifecycle.headBinding) lifecycle.head?.unbind(lifecycle.headBinding);
@@ -284,6 +292,8 @@ async function runTarget(
   prompt: string,
   input: {
     instanceId: string;
+    turnId?: string;
+    attemptId?: string;
     role: Parameters<AttemptExecutor["start"]>[0]["role"];
     cwd: string;
     signal: AbortSignal;
@@ -294,13 +304,14 @@ async function runTarget(
     bindLive?: Parameters<AttemptExecutor["start"]>[0]["bindLive"];
     scope?: Parameters<AttemptExecutor["start"]>[0]["scope"];
     consultant?: Parameters<AttemptExecutor["start"]>[0]["consultant"];
+    participant?: Parameters<AttemptExecutor["start"]>[0]["participant"];
     head?: HeadAttachment;
     sessionHistory?: SessionHistory;
     factories: PiFactories;
   },
-  existing?: { session: AgentSession; mode: "pre-prompt" | "continuation" },
+  existing?: { session: AgentSession; mode: "pre-prompt" | "continuation" | "turn" },
 ): Promise<Attempt> {
-  const continuation = existing?.mode === "continuation";
+  const continuation = existing !== undefined && existing.mode !== "pre-prompt";
   const existingHandle = existing && resume(existing.session, runtime, selections, now, input);
   if (input.signal.aborted) return { status: "cancelled", result: "cancelled", sideEffects: continuation, session: existingHandle };
   const model = findModel(runtime, target.model);
@@ -321,6 +332,10 @@ async function runTarget(
       return { status: "failed", result: "", error: messageOf(error), sideEffects: false };
     }
   }
+  const identity: NativeTurn = { instanceId: input.instanceId, turnId: input.turnId!, attemptId: input.attemptId!,
+    historyId: input.sessionHistory?.historyId, sessionId: session.sessionId };
+  input.participant?.begin(identity);
+  architectureTools.get(session)?.(identity);
   const handle = resume(session, runtime, selections, now, input);
   let adjustment: string | undefined, requested = target.reasoning;
   const observed = (attempt: Attempt, requested: ModelTarget["reasoning"], adjustment?: string) => {
@@ -332,55 +347,69 @@ async function runTarget(
   const beforeDrive = async (result: Attempt): Promise<Attempt> => {
     observed(result, requested, adjustment);
     if (continuation) return { ...result, session: handle };
-    await handle.dispose();
+    await handle.dispose(input.signal);
     return result;
   };
   if (input.signal.aborted) {
     return beforeDrive({ status: "cancelled", result: "cancelled", sideEffects: continuation });
   }
-  // Provider registration can replace the runtime model while the session binds.
-  const boundModel = findModel(runtime, target.model);
-  if (!boundModel) {
-    return beforeDrive(target.fast === true
-      ? configurationFailure(`fast mode unsupported: model unavailable after provider registration: ${target.model}`, continuation)
-      : { status: "failed", result: "", error: `model unavailable: ${target.model}`, sideEffects: continuation });
-  }
-  const activated = prepareTargetModel(boundModel, target, selections);
-  if (activated.error) {
-    return beforeDrive(configurationFailure(activated.error, continuation));
-  }
-  const activationError = await activateTarget(session, activated.model!, target);
-  if (activationError) {
-    return beforeDrive({ status: "failed", result: "", error: activationError, sideEffects: continuation });
-  }
-  if (target.directReasoning && (!target.reasoning || !session.model ||
-      !getSupportedThinkingLevels(session.model).includes(target.reasoning))) {
-    return beforeDrive(configurationFailure(`direct reasoning "${target.reasoning}" is not supported by activated model ${session.model?.provider}/${session.model?.id}`, continuation));
-  }
-  if (target.classifiedReasoning && (!target.reasoning || !session.model ||
-      !getSupportedThinkingLevels(session.model).includes(target.reasoning))) {
-    adjustment = "classified capability drift; restored frozen configured primary reasoning without reclassification";
-    requested = target.classifiedReasoning.configured;
-    const restored = { ...target, reasoning: requested };
-    const error = await activateTarget(session, activated.model!, restored);
-    if (error) return beforeDrive(configurationFailure(error, continuation));
-    input.sessionHistory?.append("reasoning-adjustment", { adjustment, selected: target.reasoning,
-      configured: target.classifiedReasoning.configured, activatedModel: session.model && `${session.model.provider}/${session.model.id}`,
-      appliedReasoning: session.thinkingLevel });
-  }
+  const operation = childLifecycles.get(session)!;
+  operation.generation++;
+  operation.abort = undefined;
+  const generation = operation.generation;
+  const stopWatch = watchAbort(input.signal, () => {
+    if (operation.generation === generation) void requestAbort(session).catch(() => {});
+  });
   try {
-    if (session.thinkingLevel) {
-      recordAppliedReasoning(activated.model!, selections, session.thinkingLevel);
-      input.onActivated?.(session.thinkingLevel);
+    // Provider registration can replace the runtime model while the session binds.
+    const boundModel = findModel(runtime, target.model);
+    if (!boundModel) {
+      return beforeDrive(target.fast === true
+        ? configurationFailure(`fast mode unsupported: model unavailable after provider registration: ${target.model}`, continuation)
+        : { status: "failed", result: "", error: `model unavailable: ${target.model}`, sideEffects: continuation });
     }
-    // Retire the caller's retained wrapper too: drive can throw before returning a new handle.
-    delete handle.retryBeforePrompt;
-    const attempt = await drive(session, runtime, selections, now, prompt, input);
-    return observed(attempt, requested, adjustment);
-  } catch (error) {
-    if (error instanceof AgentClosureError) throw error;
-    if (!continuation) await handle.dispose();
-    return { status: "failed", result: "", error: messageOf(error), sideEffects: continuation, session: continuation ? handle : undefined };
+    const activated = prepareTargetModel(boundModel, target, selections);
+    if (activated.error) {
+      return beforeDrive(configurationFailure(activated.error, continuation));
+    }
+    const activationError = await activateTarget(session, activated.model!, target);
+    if (activationError) {
+      return beforeDrive({ status: "failed", result: "", error: activationError, sideEffects: continuation });
+    }
+    if (target.directReasoning && (!target.reasoning || !session.model ||
+        !getSupportedThinkingLevels(session.model).includes(target.reasoning))) {
+      return beforeDrive(configurationFailure(`direct reasoning "${target.reasoning}" is not supported by activated model ${session.model?.provider}/${session.model?.id}`, continuation));
+    }
+    if (target.classifiedReasoning && (!target.reasoning || !session.model ||
+        !getSupportedThinkingLevels(session.model).includes(target.reasoning))) {
+      adjustment = "classified capability drift; restored frozen configured primary reasoning without reclassification";
+      requested = target.classifiedReasoning.configured;
+      const restored = { ...target, reasoning: requested };
+      const error = await activateTarget(session, activated.model!, restored);
+      if (error) return beforeDrive(configurationFailure(error, continuation));
+      input.sessionHistory?.append("reasoning-adjustment", { adjustment, selected: target.reasoning,
+        configured: target.classifiedReasoning.configured, activatedModel: session.model && `${session.model.provider}/${session.model.id}`,
+        appliedReasoning: session.thinkingLevel });
+    }
+    if (input.signal.aborted || childLifecycles.get(session)?.closing) return beforeDrive({ status: "cancelled", result: "cancelled", sideEffects: continuation });
+    try {
+      if (session.thinkingLevel) {
+        recordAppliedReasoning(activated.model!, selections, session.thinkingLevel);
+        input.onActivated?.(session.thinkingLevel);
+      }
+      // Retire the caller's retained wrapper too: drive can throw before returning a new handle.
+      delete handle.retryBeforePrompt;
+      const attempt = await drive(session, runtime, selections, now, prompt, input);
+      return observed(attempt, requested, adjustment);
+    } catch (error) {
+      if (error instanceof AgentClosureError) throw error;
+      if (!continuation) await handle.dispose(input.signal);
+      return { status: "failed", result: "", error: messageOf(error), sideEffects: continuation, session: continuation ? handle : undefined };
+    }
+  } finally {
+    try {
+      await childLifecycles.get(session)?.abort?.catch(error => { throw new AgentClosureError([error], `Agent operation ${input.instanceId}`); });
+    } finally { stopWatch(); }
   }
 }
 
@@ -433,6 +462,8 @@ async function bindThenRun(
   prompt: string,
   input: {
     instanceId: string;
+    turnId?: string;
+    attemptId?: string;
     role: Parameters<AttemptExecutor["start"]>[0]["role"];
     cwd: string;
     signal: AbortSignal;
@@ -443,6 +474,7 @@ async function bindThenRun(
     bindLive?: Parameters<AttemptExecutor["start"]>[0]["bindLive"];
     scope?: Parameters<AttemptExecutor["start"]>[0]["scope"];
     consultant?: Parameters<AttemptExecutor["start"]>[0]["consultant"];
+    participant?: Parameters<AttemptExecutor["start"]>[0]["participant"];
     head?: HeadAttachment;
     sessionHistory?: SessionHistory;
     factories: PiFactories;
@@ -459,10 +491,10 @@ async function bindThenRun(
   const handle = resume(session, runtime, selections, now, input);
   try {
     const result = await runTarget(runtime, selections, now, target, prompt, input, { session, mode: "pre-prompt" });
-    if (!result.session) await handle.dispose();
+    if (!result.session) await handle.dispose(input.signal);
     return result;
   } catch (error) {
-    await handle.dispose();
+    await handle.dispose(input.signal);
     throw error;
   }
 }
@@ -474,6 +506,7 @@ async function openSession(
   input: { instanceId: string; role: Parameters<AttemptExecutor["start"]>[0]["role"]; cwd: string; sessionHistory?: SessionHistory; factories: PiFactories;
     signal: AbortSignal; head?: HeadAttachment; scope?: Parameters<AttemptExecutor["start"]>[0]["scope"];
     consultant?: Parameters<AttemptExecutor["start"]>[0]["consultant"];
+    participant?: Parameters<AttemptExecutor["start"]>[0]["participant"];
     bindLive?: Parameters<AttemptExecutor["start"]>[0]["bindLive"] },
 ): Promise<AgentSession> {
   const agentDir = input.factories.getAgentDir();
@@ -507,9 +540,14 @@ async function openSession(
     additionalExtensionPaths: [packageRoot()],
     extensionFactories: [input.factories.createCodemode({ mode: "on" }), pi => {
       pi.on("tool_call", event => {
-        if (isConsultation(input.role.id) && isOrchestrationTool(event.toolName))
+        if ((isConsultation(input.role.id) || input.participant) && (isOrchestrationTool(event.toolName) || input.participant && ["edit", "write", "apply_patch", "lsp_rename"].includes(event.toolName)))
           return { block: true, reason: "Consultative leaves cannot orchestrate Pitako work" };
       });
+      if (input.participant) {
+        pi.registerTool({ name: "architecture_submit", label: "Submit architecture turn", description: "Provisional submission for your exact authorized architecture turn. Does not dispatch work.",
+          parameters: submitSchema, async execute() { throw new Error("architecture grant not active"); } });
+        pi.on("session_start", (_event, ctx) => input.participant!.bind(pi, ctx));
+      }
       pi.on("turn_start", () => { guardConsultationTools(); if (nativeSession) reconcileChildTools(nativeSession); live?.open(); });
       pi.on("agent_before_settle", () => live?.settle());
       pi.on("session_tree", event => live?.handle.publicConversation?.reconcile(event.oldLeafId));
@@ -518,7 +556,7 @@ async function openSession(
     }, ...(input.head && headBinding ? [headExtension(input.head, headBinding, () => nativeSession!.sessionManager)] : []),
     ...(input.scope ? [leafScopeExtension(input.scope, () => nativeSession!)] : []),
     ...(managed ? [managedGuard(supported, !!input.head)] : [])],
-    appendSystemPrompt: [childInstructions(input.role, input.instanceId), ...(managed ? [
+    appendSystemPrompt: [childInstructions(input.role, input.instanceId), ...(input.participant ? ["Host architecture policy: analysis only; no product edits, including through Bash. Use only your local architecture_submit grant. Do not dispatch agents or use coordinator tools. Bash remains a trusted tool, not an OS sandbox."] : []), ...(managed ? [
       "Managed local-source support: use the supported native file tools, known loaded apply_patch, or finite foreground bash within your canonical write reservation. No daemons, detached/remote writers or escaped descendants. Shell scope is cooperative, not confinement. Unsupported writing tools and unowned compositions are refused. Only the host-bound Head requests staging through head_checkpoint; leaves do not stage or commit independently. A checkpoint is local partial source, not acceptance, publication or final verification.",
     ] : [])],
     skillsOverride: (base) => ({
@@ -532,9 +570,9 @@ async function openSession(
   if (input.signal.aborted) throw new Error("Agent session startup cancelled");
   // Codemode can invoke a registered definition without a top-level tool_call event.
   function guardConsultationTools() {
-    if (!isConsultation(input.role.id)) return;
+    if (!isConsultation(input.role.id) && !input.participant) return;
     for (const extension of loader.getExtensions().extensions) {
-      for (const [name, tool] of extension.tools) if (isOrchestrationTool(name)) {
+      for (const [name, tool] of extension.tools) if (isOrchestrationTool(name) || input.participant && ["edit", "write", "apply_patch", "lsp_rename"].includes(name)) {
         tool.definition = { ...tool.definition, async execute() {
           return { content: [{ type: "text", text: "Consultative leaves cannot orchestrate Pitako work" }], details: {}, isError: true };
         } };
@@ -559,7 +597,7 @@ async function openSession(
   });
   nativeSession = session;
   const lifecycle: NonNullable<ReturnType<typeof childLifecycles.get>> = {
-    bound: false, history: input.sessionHistory, head: input.head, headBinding, managed, operations: new Set(), failures: [], closing: false,
+    bound: false, history: input.sessionHistory, head: input.head, headBinding, managed, operations: new Set(), failures: [], generation: 0, closing: false,
   };
   if (managed) {
     // Capture native IDs before retirement, never infer them from tool events/results text.
@@ -596,13 +634,15 @@ async function openSession(
       input.scope.bindRevision(revision => input.sessionHistory!.headRevision(revision));
     }
     registerExecution({ instanceId: input.instanceId, roleId: input.role.id, sessionId: session.sessionId,
-      profile: isConsultation(input.role.id) ? "analysis" : "coding",
+      profile: isConsultation(input.role.id) || input.participant ? "analysis" : "coding",
+      architecture: !!input.participant,
       managed: input.head ? "head" : input.scope ? "leaf" : input.consultant ? "consultation" : undefined });
     if (input.signal.aborted) {
       await disposeChildSession(session);
       throw new Error("Agent session startup cancelled");
     }
     live = input.bindLive ? createLiveHandle(session, input.sessionHistory!) : undefined;
+    if (live && input.participant) live.handle.input = async () => { throw new Error("Use architecture_control for architecture participants"); };
     lifecycle.live = live;
     if (live) live.handle.publicConversation = createPublicProducer(session, input.sessionHistory!);
     lifecycle.unbindLive = live ? input.bindLive!(live.handle) : undefined;
@@ -622,7 +662,20 @@ async function openSession(
     guardConsultationTools();
     input.scope?.assertStartup();
     input.consultant?.check();
+    if (input.participant) architectureTools.set(session, identity => {
+      for (const extension of loader.getExtensions().extensions) {
+        const tool = extension.tools.get("architecture_submit");
+        if (tool) tool.definition = { ...tool.definition, async execute(id, value, _signal, _update, ctx) {
+          try {
+            const receipt = input.participant!.submit(id, value, ctx, identity);
+            return { content: [{ type: "text", text: JSON.stringify(receipt) }], details: receipt };
+          } catch (error) { return { content: [{ type: "text", text: String(error) }], details: {}, isError: true }; }
+        } };
+      }
+    });
     reconcileChildTools(session);
+    lifecycle.stopAbort?.();
+    lifecycle.stopAbort = undefined;
     return session;
   } catch (error) {
     await disposeChildSession(session);
@@ -638,6 +691,8 @@ async function drive(
   prompt: string,
   input: {
     instanceId: string;
+    turnId?: string;
+    attemptId?: string;
     role: Parameters<AttemptExecutor["start"]>[0]["role"];
     cwd: string;
     signal: AbortSignal;
@@ -647,11 +702,13 @@ async function drive(
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
     scope?: Parameters<AttemptExecutor["start"]>[0]["scope"];
     consultant?: Parameters<AttemptExecutor["start"]>[0]["consultant"];
+    participant?: Parameters<AttemptExecutor["start"]>[0]["participant"];
     factories: PiFactories;
     head?: HeadAttachment;
   },
 ): Promise<Attempt> {
   // continueWith skips executor.start. The probe closes over this session only.
+  const operation = childLifecycles.get(session)!;
   input.bindActivityProbe?.(() => cursorStreamHold(session));
   try {
     let sideEffects = false;
@@ -724,7 +781,7 @@ async function drive(
     });
     const handle = resume(session, runtime, selections, now, input);
     const before = usageFrom(session, {});
-    const usage = () => attemptUsage(before, session, tools, Boolean(input.head || input.scope || isConsultation(input.role.id)));
+    const usage = () => attemptUsage(before, session, tools, Boolean(input.turnId || input.head || input.scope || isConsultation(input.role.id)));
     if (input.signal.aborted) {
       try {
         await requestAbort(session);
@@ -734,12 +791,15 @@ async function drive(
       }
       return { status: "cancelled", result: "cancelled", sideEffects, requests: requests.length ? requests : undefined, usage: usage(), session: handle };
     }
-    const stopWatch = watchAbort(input.signal, () => { void requestAbort(session).catch(() => {}); });
     try {
       const lifecycle = childLifecycles.get(session)!;
       if (lifecycle.closing) throw new Error("Agent session is closing");
       const prompting = Promise.resolve().then(() => {
         if (input.signal.aborted || lifecycle.closing) return;
+        if (input.participant) {
+          input.participant.prompt({ instanceId: input.instanceId, turnId: input.turnId!, attemptId: input.attemptId!,
+            historyId: childLifecycles.get(session)?.history?.historyId, sessionId: session.sessionId });
+        }
         input.scope?.beginPrompt(session.sessionId);
         input.consultant?.beginPrompt();
         return session.prompt(prompt, { expandPromptTemplates: false });
@@ -768,12 +828,15 @@ async function drive(
       }
       return failedAttempt(messageOf(error), sideEffects, handle, session, usage(), requests);
     } finally {
-      childLifecycles.get(session)?.captureManaged?.();
-      await childLifecycles.get(session)?.live?.settle();
-      finishRequest(input.signal.aborted ? "cancelled" : "failed");
-      stopWatch();
-      unsubscribe();
-      session.agent.streamFunction = originalStreamFunction;
+      try {
+        childLifecycles.get(session)?.captureManaged?.();
+        await childLifecycles.get(session)?.live?.settle();
+        await operation.abort;
+      } finally {
+        finishRequest(input.signal.aborted ? "cancelled" : "failed");
+        unsubscribe();
+        session.agent.streamFunction = originalStreamFunction;
+      }
     }
   } finally {
     input.bindActivityProbe?.(undefined);
@@ -808,6 +871,8 @@ function resume(
   now: () => number,
   input: {
     instanceId: string;
+    turnId?: string;
+    attemptId?: string;
     role: Parameters<AttemptExecutor["start"]>[0]["role"];
     cwd: string;
     onActivity?: Parameters<AttemptExecutor["start"]>[0]["onActivity"];
@@ -816,19 +881,26 @@ function resume(
     bindActivityProbe?: Parameters<AttemptExecutor["start"]>[0]["bindActivityProbe"];
     scope?: Parameters<AttemptExecutor["start"]>[0]["scope"];
     consultant?: Parameters<AttemptExecutor["start"]>[0]["consultant"];
+    participant?: Parameters<AttemptExecutor["start"]>[0]["participant"];
     factories: PiFactories;
     head?: HeadAttachment;
   },
 ): NonNullable<Attempt["session"]> {
   const history = childLifecycles.get(session)?.history;
   return {
-    async continueWith(target, note, signal) {
-      history?.append("continuation", { target, note });
-      const result = await runTarget(runtime, selections, now, target, note, { ...input, signal, sessionHistory: history }, { session, mode: "continuation" });
+    async turn(turn) {
+      history?.append("turn", { turnId: turn.turnId, attemptId: turn.attemptId, task: turn.task, target: turn.target });
+      const result = await runTarget(runtime, selections, now, turn.target, turn.task,
+        { ...input, ...turn, sessionHistory: history }, { session, mode: "turn" });
       return history?.result(result) ?? result;
     },
-    async dispose() {
-      await disposeChildSession(session);
+    async continueWith(target, note, signal, operation) {
+      history?.append("continuation", { target, note });
+      const result = await runTarget(runtime, selections, now, target, note, { ...input, ...operation, signal, sessionHistory: history }, { session, mode: "continuation" });
+      return history?.result(result) ?? result;
+    },
+    async dispose(signal) {
+      await disposeChildSession(session, signal);
     },
   };
 }

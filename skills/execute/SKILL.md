@@ -75,14 +75,15 @@ Long specialist work uses `team_assign` when registered, with `plan` and `unit`.
 
 Interpret complete `pitako.worker.result` messages supplied automatically in context. A short `pitako.worker` wake asks for that interpretation, not a fetch. A wake, terminal status, steering receipt, or bookkeeping result is not the required judgment. Replace the worker checkpoint line with the coordinator decision, then continue the unit within its existing authority. That checkpoint is not collection or handoff acknowledgement. `team_result` with an exact assignment ID and `agent_result` with a worker instance ID are optional, complete, idempotent diagnostic re-reads. They neither transport the automatic result nor acknowledge incorporation. Pending or blocked bookkeeping, delivery, and continuation are motor state, not a request for a model fetch. A failed, cancelled, or lost worker is not foreground implementation. Report it and stop that unit. If the result exists and verification fails, the existing correction order still applies. An unknown handle is a blocker, not evidence that another handle type should be tried. The planning-only lost-consultation replacement does not apply in execution; preserve Team Hold reconciliation and recovery.
 
-If Team rejects a reserved role, distinguish occupancy from an unknown handle. End the turn without polling or fallback. After that reservation settles and releases the role, retry `team_assign` if the consultation or review is still necessary and authorized. Another assignment's result does not answer this consultation. Do not use `agent_spawn` or `agent_run` to evade occupancy or admission rejection. Cancellation alone proves neither settlement nor role release and does not clear a Team hold.
+If Team rejects admission, distinguish the concrete policy/resource or binding blocker from an unknown handle. End the turn without polling or fallback while owned settlement is pending; retry `team_assign` only after its actual blocker is resolved and the consultation or review is still necessary and authorized. Another assignment's result does not answer this consultation. Do not use `agent_spawn` or `agent_run` to evade admission rejection. Cancellation alone proves neither settlement nor member release and does not clear a Team hold.
 
 Handles are session-local. On resume, look only at `## Workers`. Do not treat frontmatter `status: running` or the `## Status` body as a worker. Check each recorded handle once by type: for a Team assignment, call `team_status` with its assignment ID; for a low-level worker, call `agent_status` with its instance ID. If it is running, end the turn. If the handle is unknown, record a blocker. Do not poll.
 
 For an unexcepted active ordinary Developer, apply the transition rules below
 before ending the turn; a resume status check supplies no released-closure proof.
 
-Keep at most one exterior Developer role active, without exception. Every new
+Keep at most one exterior Developer role active, without exception. This is an
+execute workflow restriction, not an engine singleton reservation per role. Every new
 exterior Developer assignment serving an execute implementation unit must use
 asynchronous `role: "developer"`, `mode: "head"`, and explicit authorized `writes`.
 This includes initial implementation, implementation-related diagnosis,
@@ -121,7 +122,7 @@ does not prohibit Head; preserve it through the no-leaf route. A frozen restrict
 or real safety/resource conflict uses the existing decision levels, not an
 automatic downgrade.
 
-Missing `developer_head` policy, invalid envelope, occupied role, unavailable
+Missing `developer_head` policy, invalid envelope, conflicting exterior Developer ownership, unavailable
 asynchronous Head support, and execution-binding rejection are concrete blockers.
 Preserve the diagnostic; do not omit `mode`, call `agent_run`, switch transport
 to evade rejection, edit personal configuration, or take over implementation.
@@ -171,7 +172,7 @@ manufacture a Head handoff. Assign only the remaining outcome.
 
 Compare new user information with the consulted object and original WorkBrief before using a result. For information within the brief, use the bounded in-scope input route below. Input does not expand the frozen authority or permitted effects.
 
-If information changes the object outside the WorkBrief, mark the old consultation or review inapplicable to the pending decision. Interpret its automatic result when supplied, but do not use it to close that decision or apply the change after accepting the old judgment. Cancel the exact still-active target with `team_cancel` or `agent_cancel` according to handle type. End the turn while settlement and role release are pending. Only after settlement and role release, assign a fresh WorkBrief against the current object if still necessary and authorized. Preserve evidence validity, frozen authority, and Team Hold recovery; a new assignment does not clear a blocking hold.
+If information changes the object outside the WorkBrief, mark the old consultation or review inapplicable to the pending decision. Interpret its automatic result when supplied, but do not use it to close that decision or apply the change after accepting the old judgment. Cancel the exact still-active target with `team_cancel` or `agent_cancel` according to handle type. End the turn while settlement and member release are pending. Only after settlement and member release, assign a fresh WorkBrief against the current object if still necessary and authorized. Preserve evidence validity, frozen authority, and Team Hold recovery; a new assignment does not clear a blocking hold.
 
 Any fresh Developer assignment also obeys Head selection and, for an ordinary
 selection deviation, the stricter same-invocation closure rules above.

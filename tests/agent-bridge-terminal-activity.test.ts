@@ -532,7 +532,7 @@ for (const mode of ["success", "close_failed", "capture_failed", "callback_throw
       expect(timeline.at(-1)).toBe("native-disposed");
       if (closeFails) {
         expect(executionForSession(k.sessionId)).toEqual({ instanceId: "adapter", roleId: "developer", sessionId: k.sessionId,
-          profile: "coding", managed: undefined });
+          architecture: false, profile: "coding", managed: undefined });
         expect(outcome.result).toBeUndefined();
         expect(outcome.error).toBeInstanceOf(AgentClosureError);
         if (!(outcome.error instanceof AgentClosureError)) throw new Error("adapter closure failure not classified");

@@ -273,6 +273,7 @@ export class AgentScreen implements Component, Focusable {
   private lines(): string[] {
     if (!this.detail) return this.list.items.length ? this.list.items.map((row, index) =>
       `${index === this.selected ? ">" : " "} ${row.id} · ${row.roleId} · ${row.profile ?? (row.roleId === "developer" ? "profile unavailable" : "profile not applicable")} · ${row.status}\n` +
+      (row.memberId ? `  team: ${row.teamId} · member: ${row.memberId} · turn: ${row.turnId ?? "not started"}\n` : "") +
       `  selected: ${row.selectedModel ?? "unknown"} · requested: ${row.requestedModel ?? "unknown"} / ${row.requestedReasoning ?? "unknown"}\n` +
       `  activated: ${json(row.activated)} · SDK request: ${json(row.sdkRequest)}\n` +
       `  elapsed ${formatUiClock((row.terminalAt ?? Date.now()) - row.acceptedAt)} · ${row.phase} · ${row.activity} · ${row.task}` +
@@ -361,7 +362,7 @@ export function compatibilityView(agents: readonly { id: string; role: string; s
   const denied = () => { throw new Error("Compatibility fixture is read-only"); };
   return {
     list: () => ({ items: agents.map(row => ({ id: row.id, roleId: row.role, status: "running", source: undefined,
-      assignmentId: undefined, task: "", selectedModel: "unknown", requestedModel: undefined, requestedReasoning: undefined, activated: undefined, sdkRequest: null,
+      assignmentId: undefined, teamId: undefined, memberId: undefined, turnId: undefined, task: "", selectedModel: "unknown", requestedModel: undefined, requestedReasoning: undefined, activated: undefined, sdkRequest: null,
       acceptedAt: Date.now(), terminalAt: undefined, activity: row.state, phase: "working", profile: undefined,
       resultTaken: undefined, handoff: undefined })),
     cursor: null, owner: { processId: "fixture", coordinatorSessionId: "fixture", epoch: "00000000-0000-0000-0000-000000000000" } }),
@@ -369,7 +370,8 @@ export function compatibilityView(agents: readonly { id: string; role: string; s
       const row = agents.find(row => row.id === id);
       if (!row) throw new Error(`unknown worker ${id}`);
       return { id, roleId: row.role, status: "running", observation: null, resultTaken: undefined, handoff: undefined,
-        identity: { coordinatorSessionId: "fixture", source: undefined, assignmentId: undefined },
+        identity: { coordinatorSessionId: "fixture", source: undefined, assignmentId: undefined,
+          teamId: undefined, memberId: undefined, turnId: undefined },
         workbrief: { text: `Identity: ${id}\nRole: ${row.role}\nState: ${row.state}`, offset: 0, nextOffset: null, source: "original WorkBrief" },
         teamWrapper: undefined, route: { state: "unavailable" }, selected: { model: "unknown", reasoning: undefined, requestedModel: undefined, attemptId: undefined },
         activated: null, sdkRequest: null, sdkRequestsDropped: 0, controls: { available: false, reason: "Compatibility fixture is read-only" } };

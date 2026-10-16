@@ -12,7 +12,7 @@ import type { Attempt, AttemptExecutor } from "../extensions/agent/run.ts";
 import { bindBackgroundOwner, clearBackgroundOwner } from "../extensions/agent/background.ts";
 import { listObservations, publishObservation, subscribeChanges } from "../extensions/agent/observe.ts";
 import { registerExecution, unregisterExecution } from "../extensions/execution-identity.ts";
-import { beginTeamEvaluation, hasTeamRoster, hasUnsettledTeamWork, latestTeamAssignment, recordPlanTeamWork, reserveTeamRole, retireTeamEvaluation, teamEvaluationForSession, teamRoleReservation, teamAssignments } from "../extensions/team.ts";
+import { admitTeamMember, createTeam, disbandTeam, beginTeamEvaluation, hasTeamRoster, hasUnsettledTeamWork, recordPlanTeamWork, reserveTeamMember, retireTeamEvaluation, teamEvaluationForSession, firstTeamReservation, teamAssignments, selectTeamAssignments } from "../extensions/team.ts";
 import { openBoard } from "../extensions/board/store.ts";
 import { currentWorkspace, repositoryIdentity } from "../extensions/board/workspace.ts";
 import boardExtension from "../extensions/board/index.ts";
@@ -21,6 +21,12 @@ import { packageRoot } from "../extensions/stack.ts";
 import agentExtension from "../extensions/agent/index.ts";
 import { setBackgroundExecutor } from "../extensions/agent/background.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createPiExecutor } from "../extensions/agent/pi.ts";
+import { controlledPi } from "./fixtures/pi-factories.ts";
+import { WorkerHistory } from "../extensions/agent/history.ts";
+import { createAgentController } from "../extensions/agent/controller.ts";
+import { createAgentBridge } from "../extensions/agent/bridge/broker.ts";
+import { connect } from "../extensions/agent/bridge/client.js";
 import pitako from "../extensions/index.ts";
 
 // File-local integration bound: parallel Git/agent setup must finish before
@@ -117,7 +123,7 @@ async function spawn(evaluation: NonNullable<ReturnType<typeof beginTeamEvaluati
 const completed = (result = "done"): Attempt => ({ status: "completed", result, sideEffects: false });
 
 describe("Team T1 ownership", () => {
-  test("four successive role assignments remain exact-ID accessible while default status uses only the latest", fixture.ownedCase("exact assignment catalog", async () => {
+  test("four successive members remain exact-ID accessible in admission-ordered status", fixture.ownedCase("exact assignment catalog", async () => {
     const current = evaluation("team-exact-catalog");
     bindBackgroundOwner(owner(current.token));
     const config = load();
@@ -138,16 +144,17 @@ describe("Team T1 ownership", () => {
       ids.push(accepted.details.id);
       finish({ status, result: `result ${index}`, error: status === "failed" ? `result ${index}` : undefined, sideEffects: false });
       await fixture.settleRuns();
-      expect(teamRoleReservation(current, "researcher")).toBeUndefined();
+      expect(firstTeamReservation(current, "researcher")).toBeUndefined();
     }
     expect(teamAssignments(current).map(assignment => assignment.id)).toEqual(ids);
-    expect(latestTeamAssignment(current, "researcher")?.id).toBe(ids[3]);
-    expect((await invoke("team_status", {})).details.roles[3]).toMatchObject({ assignmentId: ids[3], status: "completed" });
+    expect(() => reserveTeamMember(current, "researcher", ids[0]!)).toThrow("already reserved");
+    expect(teamAssignments(current).at(-1)?.id).toBe(ids[3]);
+    expect((await invoke("team_status", {})).details.members[3]).toMatchObject({ assignmentId: ids[3], status: "completed" });
     for (const [index, id] of ids.entries()) {
       const read = await invoke("team_result", { assignmentId: id });
       expect(read.content[0].text).toContain(`result ${index}`);
       expect(read.isError).toBe(index === 1 || index === 2);
-      expect((await invoke("team_status", { assignmentId: id })).details.roles[0]).toMatchObject({ assignmentId: id, resultAvailable: true });
+      expect((await invoke("team_status", { assignmentId: id })).details.members[0]).toMatchObject({ assignmentId: id, resultAvailable: true });
     }
     expect(hasUnsettledTeamWork(current, "catalog-plan")).toBe(true);
     expect((await invoke("team_result", { assignmentId: "foreign" })).isError).toBe(true);
@@ -190,12 +197,14 @@ describe("Team T1 ownership", () => {
     expect(existsSync(path.join(path.dirname(ledgerFile("no-topic", cwd)), "team-state.json"))).toBe(false);
     expect(existsSync(ledgerFile("no-topic", cwd))).toBe(false);
   }));
-  test("reserves one assignment per role, allows other roles, and keeps cancellation occupied until settle", fixture.ownedCase("reserves one assignment per role, allows other roles, and keeps cancellation occupied until settle", async () => {
+  test("reserves independent same-role members and cancellation releases only its exact member", fixture.ownedCase("reserves independent same-role members and cancellation releases only its exact member", async () => {
     const current = evaluation("team-session-race");
     bindBackgroundOwner(owner(current.token));
-    const developer = reserveTeamRole(current, "developer", "assignment-dev");
-    const researcher = reserveTeamRole(current, "researcher", "assignment-research");
-    expect(() => reserveTeamRole(current, "developer", "assignment-dev-2")).toThrow("already reserved");
+    const developer = reserveTeamMember(current, "developer", "assignment-dev");
+    const researcher = reserveTeamMember(current, "researcher", "assignment-research");
+    const secondDeveloper = reserveTeamMember(current, "developer", "assignment-dev-2");
+    expect(secondDeveloper.memberId).not.toBe(developer.memberId);
+    secondDeveloper.commit();
 
     const devWorker = hanging();
     const researchWorker = hanging();
@@ -207,16 +216,20 @@ describe("Team T1 ownership", () => {
     await Promise.all([devWorker.started, researchWorker.started]);
 
     cancelTeamWorker(current.token, dev.instanceId);
-    expect(() => reserveTeamRole(current, "developer", "assignment-next")).toThrow("already reserved");
+    expect(developer.owns()).toBe(true);
+    expect(secondDeveloper.owns()).toBe(true);
     expect(teamWorkerStatus(current.token, dev.instanceId)[0]?.status).toBe("cancelled");
     expect(() => workerResult(dev.instanceId)).toThrow("unknown worker");
     expect(() => cancelWorker(dev.instanceId)).toThrow("unknown worker");
     devWorker.finish({ status: "cancelled", result: "cancelled", sideEffects: false });
     researchWorker.finish(completed());
     await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(teamRoleReservation(current, "developer")).toBeUndefined();
-    expect(teamRoleReservation(current, "researcher")).toBeUndefined();
-    const reused = reserveTeamRole(current, "developer", "assignment-next");
+    expect(developer.owns()).toBe(false);
+    expect(secondDeveloper.owns()).toBe(true);
+    secondDeveloper.settled();
+    expect(firstTeamReservation(current, "developer")).toBeUndefined();
+    expect(firstTeamReservation(current, "researcher")).toBeUndefined();
+    const reused = reserveTeamMember(current, "developer", "assignment-next");
     reused.rollback();
     expect(workerStatus()).toEqual([]);
     expect(() => teamWorkerStatus(Symbol("foreign"), dev.instanceId)).toThrow("unknown Team worker");
@@ -229,12 +242,12 @@ describe("Team T1 ownership", () => {
     const secondMessages: string[] = [];
     const firstOwner = owner(first.token), secondOwner = owner(second.token);
     bindBackgroundOwner({ ...firstOwner, isIdle: () => true, sendMessage: (text) => firstMessages.push(text) });
-    const firstAdmission = reserveTeamRole(first, "developer", "first-assignment");
+    const firstAdmission = reserveTeamMember(first, "developer", "first-assignment");
     const firstWorker = hanging();
     const firstHandle = await spawn(first, "developer", "first-assignment", firstWorker, firstAdmission.settled, { planId: "p", unitId: "u" });
     firstAdmission.commit();
     bindBackgroundOwner({ ...secondOwner, isIdle: () => true, sendMessage: (text) => secondMessages.push(text) });
-    const secondAdmission = reserveTeamRole(second, "researcher", "second-assignment");
+    const secondAdmission = reserveTeamMember(second, "researcher", "second-assignment");
     const secondWorker = hanging();
     const secondHandle = await spawn(second, "researcher", "second-assignment", secondWorker, secondAdmission.settled, { planId: "p", unitId: "u" });
     secondAdmission.commit();
@@ -251,7 +264,7 @@ describe("Team T1 ownership", () => {
   test("same-session reload retires only old Team rows and makes late settlement inert", fixture.ownedCase("same-session reload retires only old Team rows and makes late settlement inert", async () => {
     const old = evaluation("team-session-reload");
     bindBackgroundOwner(owner(old.token));
-    const admission = reserveTeamRole(old, "developer", "old-assignment");
+    const admission = reserveTeamMember(old, "developer", "old-assignment");
     const late = hanging();
     const oldWorker = await spawn(old, "developer", "old-assignment", late, admission.settled);
     admission.commit();
@@ -260,7 +273,7 @@ describe("Team T1 ownership", () => {
     const retirement = retireTeamEvaluation(old);
     expect(late.signal?.aborted).toBe(true);
     expect(teamWorkerStatus(old.token)).toMatchObject([{ closure: { state: "pending" } }]);
-    expect(teamRoleReservation(old, "developer")).toBe("old-assignment");
+    expect(firstTeamReservation(old, "developer")).toBe("old-assignment");
     expect(() => evaluation("team-session-reload")).toThrow("await retirement");
     late.finish(completed("late"));
     await retirement;
@@ -270,18 +283,18 @@ describe("Team T1 ownership", () => {
     expect(hasTeamRoster(fresh)).toBe(false);
     expect(() => teamWorkerStatus(fresh.token, oldWorker.instanceId)).toThrow("unknown Team worker");
 
-    expect(teamRoleReservation(fresh, "developer")).toBeUndefined();
+    expect(firstTeamReservation(fresh, "developer")).toBeUndefined();
     expect(listObservations()).toEqual([]);
   }));
 
   test("session leases and tagged rows cannot cross session boundaries", fixture.ownedCase("session leases and tagged rows cannot cross session boundaries", async () => {
     const first = evaluation("team-session-one");
     const second = evaluation("team-session-two");
-    const admission = reserveTeamRole(first, "architect", "first-assignment");
+    const admission = reserveTeamMember(first, "architect", "first-assignment");
     const worker = hanging();
     const handle = await spawn(first, "architect", "first-assignment", worker, admission.settled);
     admission.commit();
-    const otherAdmission = reserveTeamRole(second, "researcher", "second-assignment");
+    const otherAdmission = reserveTeamMember(second, "researcher", "second-assignment");
     const otherWorker = hanging();
     const otherHandle = await spawn(second, "researcher", "second-assignment", otherWorker, otherAdmission.settled);
     otherAdmission.commit();
@@ -486,7 +499,7 @@ describe("Team T1 ownership", () => {
     const ctx = { cwd, sessionManager: { getSessionId: () => current.sessionId } };
     const invoke = (name: string, params: unknown) => tools.get(name)!.execute("call", params, new AbortController().signal, undefined, ctx);
     const status = await invoke("team_status", {});
-    expect((status.details as any).roles.map((row: any) => row.role)).toEqual(["architect", "developer", "reviewer", "researcher", "scout", "oracle"]);
+    expect(status.details.members).toEqual([]);
     const assignTool = tools.get("team_assign") as any;
     expect(assignTool.promptGuidelines.join(" ")).toContain("team_result");
     expect(assignTool.promptGuidelines.join(" ")).toContain("independent long work");
@@ -495,17 +508,27 @@ describe("Team T1 ownership", () => {
     const firstAssignment = await invoke("team_assign", { role: "developer", task: "Inspect lease\nsecond line", plan: "plan-a", unit: "unit-a" });
     expect(firstAssignment.isError).toBe(false);
     expect(existsSync(ledgerFile("plan-a", cwd))).toBe(false);
-    expect((await invoke("team_assign", { role: "researcher", task: "Inspect evidence" })).isError).toBe(false);
+    const researchAssignment = await invoke("team_assign", { role: "researcher", task: "Inspect evidence" });
+    expect(researchAssignment.isError).toBe(false);
     await Promise.all(workers.map((worker) => worker.started));
     expect(workers).toHaveLength(2);
-    expect(workers[0]!.task).toContain(`Team ${current.sessionId}; role developer; assignment `);
+    expect(workers[0]!.task).toContain(`Team ${firstAssignment.details.teamId}; member ${firstAssignment.details.memberId}; role developer; assignment `);
     expect(workers[0]!.task).not.toContain("Board topic");
     expect(workers[0]!.task).toContain("WorkBrief:\nInspect lease");
-    expect(latestTeamAssignment(current, "developer")?.boardTopicId).toBeUndefined();
-    expect((await invoke("team_assign", { role: "developer", task: "overlap" })).isError).toBe(true);
+    expect(teamAssignments(current).find(member => member.id === firstAssignment.details.id)?.boardTopicId).toBeUndefined();
+    const overlap = await invoke("team_assign", { role: "developer", task: "overlap" });
+    expect(overlap.isError).toBe(false);
+    expect(overlap.details.memberId).not.toBe(firstAssignment.details.memberId);
+    for (const key of ["teamId", "memberId", "assignmentId", "instanceId", "dispatchId"]) {
+      expect(firstAssignment.details[key]).toBeString();
+      expect(firstAssignment.content[0].text).toContain(firstAssignment.details[key]);
+    }
+    expect((await invoke("team_status", { teamId: overlap.details.teamId, memberId: overlap.details.memberId })).details.members).toHaveLength(1);
+    expect((await invoke("team_status", { teamId: "foreign", memberId: overlap.details.memberId })).isError).toBe(true);
+    expect((await invoke("team_status", { assignmentId: firstAssignment.details.id, memberId: overlap.details.memberId })).isError).toBe(true);
     const views = await invoke("team_status", {});
-    expect((views.details as any).roles.map((row: any) => row.status)).toEqual(["failed", "running", "idle", "running", "idle", "idle"]);
-    const developer = latestTeamAssignment(current, "developer");
+    expect((views.details as any).members.map((row: any) => row.status)).toEqual(["failed", "running", "running", "running"]);
+    const developer = teamAssignments(current).find(member => member.id === firstAssignment.details.id);
     expect(developer).toBeDefined();
     publishObservation({
       id: developer!.instanceId, roleId: "developer", status: "running", phase: "working",
@@ -515,10 +538,10 @@ describe("Team T1 ownership", () => {
       origin: { source: "team_assign", coordinatorSessionId: current.sessionId, assignmentId: developer!.id, workbrief: "Inspect lease\nsecond line" },
     });
     const devStatus = (await invoke("team_status", {})).details as any;
-    expect(devStatus.roles[1]).toMatchObject({
+    expect(devStatus.members[1]).toMatchObject({
       task: "Inspect lease", model: "example/model", reasoning: "high", activity: { name: "grep" },
     });
-    expect(devStatus.roles[1].elapsedMs).toBeGreaterThanOrEqual(0);
+    expect(devStatus.members[1].elapsedMs).toBeGreaterThanOrEqual(0);
     expect(() => workerResult(developer!.instanceId)).toThrow("unknown worker");
     expect(() => cancelWorker(developer!.instanceId)).toThrow("unknown worker");
     const agentResult = await invoke("agent_result", { id: developer!.instanceId });
@@ -532,31 +555,32 @@ describe("Team T1 ownership", () => {
       },
     });
     workers[1]!.finish(completed("research done"));
+    workers[2]!.finish(completed("independent developer done"));
     await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(wakes).toHaveLength(2);
+    expect(wakes).toHaveLength(3);
     const ready = (await invoke("team_status", {})).details as any;
-    expect(ready.roles[1]).toMatchObject({ status: "completed", resultAvailable: true });
-    expect(ready.roles[0]).toMatchObject({ role: "architect", status: "failed" });
+    expect(ready.members[1]).toMatchObject({ status: "completed", resultAvailable: true });
+    expect(ready.members[0]).toMatchObject({ role: "architect", status: "failed" });
     const result = await invoke("team_result", { assignmentId: developer!.id });
     expect(result.content[0].text).toContain("x".repeat(9000));
     expect(result.details).not.toHaveProperty("truncated");
     expect((result.details as any).usage).toMatchObject({
       tools: { edit: 1, write: 2, apply_patch: 3 },
     });
-    expect((await invoke("team_result", { assignmentId: latestTeamAssignment(current, "researcher")?.id })).content[0].text).toContain("research done");
+    expect((await invoke("team_result", { assignmentId: researchAssignment.details.id })).content[0].text).toContain("research done");
     expect(wakes.every((text) => text.includes("already supplied"))).toBe(true);
     expect(wakes.some((text) => text.includes("Use agent_result"))).toBe(false);
     expect((await invoke("team_assign", { role: "developer", task: "Next task" })).isError).toBe(false);
     const cancelled = await invoke("team_assign", { role: "architect", task: "Cancel test", plan: "plan-a", unit: "cancel-test" });
     expect(cancelled.isError).toBe(false);
-    const reviewer = latestTeamAssignment(current, "architect")!;
+    const reviewer = teamAssignments(current).find(member => member.id === cancelled.details.id)!;
     await workers.at(-1)!.started;
     expect((await invoke("team_cancel", { assignmentId: reviewer.id })).isError).toBe(false);
     const cancelledStatus = await invoke("team_status", { assignmentId: reviewer.id });
-    expect((cancelledStatus.details as any).roles[0]).toMatchObject({ status: "cancelled", resultAvailable: false });
+    expect((cancelledStatus.details as any).members[0]).toMatchObject({ status: "cancelled", resultAvailable: false });
     workers.at(-1)!.finish({ status: "cancelled", result: "cancelled", sideEffects: false });
     await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(((await invoke("team_status", { assignmentId: reviewer.id })).details as any).roles[0].resultAvailable).toBe(true);
+    expect(((await invoke("team_status", { assignmentId: reviewer.id })).details as any).members[0].resultAvailable).toBe(true);
   }));
 
   test("team_result returns stable per-assignment execution summaries on diagnostic re-reads", fixture.ownedCase("Team diagnostic summaries", async () => {
@@ -1126,14 +1150,7 @@ describe("Team T1 ownership", () => {
       sessionManager: { getSessionId: () => current.sessionId },
       ui: { notify(message: string) { notes.push(message); }, setStatus() {} },
     });
-    expect(JSON.parse(notes[0]!)).toEqual([
-      { role: "architect", status: "idle" },
-      { role: "developer", status: "idle" },
-      { role: "reviewer", status: "idle" },
-      { role: "researcher", status: "idle" },
-      { role: "scout", status: "idle" },
-      { role: "oracle", status: "idle" },
-    ]);
+    expect(JSON.parse(notes[0]!)).toEqual([]);
     expect(hasTeamRoster(current)).toBe(false);
     expect(notes.join(" ")).not.toContain("transcript");
   }));
@@ -1145,10 +1162,120 @@ describe("Team T1 ownership", () => {
     expect(beginTeamEvaluation("registered-child-session", false)).toBeUndefined();
     unregisterExecution("registered-child-session");
     const current = evaluation("team-session-rollback");
-    const admission = reserveTeamRole(current, "reviewer", "not-accepted");
+    const admission = reserveTeamMember(current, "reviewer", "not-accepted");
     admission.rollback();
     expect(hasTeamRoster(current)).toBe(false);
-    expect(teamRoleReservation(current, "reviewer")).toBeUndefined();
-    expect(() => reserveTeamRole({ ...current, token: Symbol("stale") }, "reviewer", "stale")).toThrow("stale Team evaluation");
+    expect(firstTeamReservation(current, "reviewer")).toBeUndefined();
+    expect(() => reserveTeamMember({ ...current, token: Symbol("stale") }, "reviewer", "stale")).toThrow("stale Team evaluation");
   }));
 });
+
+
+test("host Team retains one conversation, background lifetime and history across turns; bridge readers retain member metadata",
+  fixture.ownedCase("maintained Team readers", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "pitako-team-lifetime-")); tempDirs.push(root);
+    previousAgentDir = process.env.PI_CODING_AGENT_DIR; process.env.PI_CODING_AGENT_DIR = root;
+    const config = path.join(root, "policy.toml");
+    writeFileSync(config, '[model_policies.architect]\nprimary = { model = "fixture/selected" }\n');
+    const current = evaluation("maintained-readers");
+    bindBackgroundOwner({ ...owner(current.token), sessionId: current.sessionId });
+    const sdk = controlledPi(root, { prompt(session, text) {
+      session.stats.tokens.input += 7; session.stats.tokens.output += 3; session.stats.assistantMessages++;
+      const message = { role: "assistant" as const, content: [{ type: "text" as const, text }], stopReason: "stop" as const,
+        api: "openai-completions" as const, provider: "fixture", model: "selected", timestamp: Date.now(),
+        usage: { input: 7, output: 3, cacheRead: 0, cacheWrite: 0, totalTokens: 10, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+      session.messages.push(message); session.sessionManager.appendMessage(message);
+      session.emit({ type: "message_end", message });
+    } });
+    const team = createTeam(current);
+    const input = { roleId: "architect", task: "mandate", cwd: root, executor: createPiExecutor({ factories: sdk.factories }), load: { userConfigPath: config } };
+    expect(() => admitTeamMember(team, Object.assign({}, input, { head: {} }))).toThrow("one-shot route");
+    const first = admitTeamMember(team, input), second = admitTeamMember(team, input);
+    expect(first.memberId).not.toBe(second.memberId);
+    expect(sdk.sessions).toHaveLength(0); // Admission reserves synchronously; native startup is lazy.
+    const binding = { sessionId: current.sessionId, token: current.token };
+    const controller = createAgentController(binding, () => binding);
+    mkdirSync(path.join(root, "bridge"), { mode: 0o700 });
+    const bridge = createAgentBridge(controller, path.join(root, "bridge"), () => true);
+    let client: Awaited<ReturnType<typeof connect>> | undefined;
+    try {
+      await bridge.ready;
+      client = await connect(path.join(root, "bridge", "descriptor.json"), { expectedSessionId: current.sessionId });
+      const one = await first.turn("first exchange");
+      expect(one.status).toBe("completed");
+      expect(teamWorkerStatus(current.token, first.instanceId)[0]).toMatchObject({ status: "running", closure: { state: "pending" } });
+      expect(() => teamWorkerResult(current.token, first.instanceId)).toThrow("still running");
+      let detail = await client.publicDetail(first.instanceId);
+      if (!("lifecycle" in detail)) throw new Error("missing public detail");
+      expect(detail.lifecycle).toMatchObject({ execution: "running", result: "pending", capture: "open" });
+      expect(detail.worker).toMatchObject({ teamId: team.teamId, memberId: first.memberId, assignmentId: first.assignmentId, turnId: one.turnId });
+      expect(detail.bindings).toHaveLength(1);
+      const native = detail.bindings[0]!;
+      const before = new WorkerHistory(root).list();
+      expect(before).toHaveLength(1); expect(before[0]!.closure.state).toBe("unclosed");
+      expect(before[0]!.members[0]!.terminal).toBeUndefined();
+      const two = await first.turn("second exchange");
+      expect(two.turnId).not.toBe(one.turnId);
+      detail = await client.publicDetail(first.instanceId);
+      if (!("lifecycle" in detail)) throw new Error("missing public detail");
+      expect(detail.bindings[0]).toMatchObject({ historyId: native.historyId, sessionId: native.sessionId, capture: "open" });
+      expect(new Set(detail.bindings[0]!.attemptIds).size).toBe(2);
+      const rows = (await client.list()).items;
+      expect(rows).toHaveLength(2);
+      expect(rows.find(row => row.id === first.instanceId)).toMatchObject({ teamId: team.teamId, memberId: first.memberId,
+        turnId: two.turnId, status: "running", phase: "idle" });
+      expect(rows.find(row => row.id === second.instanceId)?.memberId).toBe(second.memberId);
+      expect(sdk.sessions).toHaveLength(1); expect(sdk.sessions[0]!.events).not.toContain("dispose");
+      await first.finish(); await first.finish();
+      expect(teamWorkerResult(current.token, first.instanceId)).toMatchObject({ result: "second exchange", usage: { input: 14, output: 6, turns: 2 } });
+      const history = await client.historyList({ workerId: first.instanceId });
+      expect(history.items[0]).toMatchObject({ teamId: team.teamId, memberId: first.memberId, assignmentId: first.assignmentId,
+        native: { state: "allocated", disposition: { state: "disposed" } } });
+      const catalog = new WorkerHistory(root).list();
+      expect(catalog).toHaveLength(1); expect(catalog[0]!.closure.state).toBe("closed");
+      expect(sdk.sessions[0]!.events.filter(event => event === "dispose")).toHaveLength(1);
+      expect((await second.turn("independent member")).status).toBe("completed");
+      await second.finish();
+      expect(sdk.sessions).toHaveLength(2);
+      await disbandTeam(team);
+      const closed = await client.publicDetail(first.instanceId);
+      if (!("lifecycle" in closed)) throw new Error("missing closed capture");
+      expect(closed.lifecycle).toMatchObject({ execution: "completed", capture: "closed" });
+      expect(selectTeamAssignments(current, { memberId: first.memberId, teamId: team.teamId })[0]?.id).toBe(first.assignmentId);
+      expect((await client.list()).items).toHaveLength(2);
+    } finally {
+      await client?.disconnect(); await bridge.settle(); controller.revoke(); await controller.settle();
+      await disbandTeam(team);
+    }
+  }));
+
+test("disband synchronously revokes admission and joins late native creation without touching another same-role Team",
+  fixture.ownedCase("maintained late startup", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "pitako-team-late-")); tempDirs.push(root);
+    previousAgentDir = process.env.PI_CODING_AGENT_DIR; process.env.PI_CODING_AGENT_DIR = root;
+    const config = path.join(root, "policy.toml"); writeFileSync(config, '[model_policies.architect]\nprimary = { model = "fixture/selected" }\n');
+    const current = evaluation("maintained-late");
+    const sdk = controlledPi(root);
+    const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    const executor = createPiExecutor({ factories: { ...sdk.factories, async createSession(options) {
+      entered.resolve(); await release.promise; return sdk.factories.createSession(options);
+    } } });
+    const team = createTeam(current), other = createTeam(current);
+    const input = { roleId: "architect", task: "mandate", cwd: root, executor, load: { userConfigPath: config } };
+    const member = admitTeamMember(team, input), independent = admitTeamMember(other, input);
+    const turn = member.turn("late native startup");
+    try {
+      await entered.promise;
+      const closing = disbandTeam(team);
+      expect(disbandTeam(team)).toBe(closing);
+      expect(() => admitTeamMember(team, input)).toThrow("admission is closed");
+      await expect(member.turn("revoked")).rejects.toThrow("stale Team member");
+      let settled = false; void closing.then(() => { settled = true; }); await Promise.resolve();
+      expect(settled).toBe(false);
+      release.resolve(); await turn; await closing;
+      expect(sdk.sessions[0]!.prompts).toEqual([]);
+      expect(sdk.sessions[0]!.events.at(-1)).toBe("dispose");
+      expect((await independent.turn("independent progress")).status).toBe("completed");
+      await independent.finish();
+    } finally { release.resolve(); await Promise.allSettled([turn, disbandTeam(team), disbandTeam(other)]); }
+  }));

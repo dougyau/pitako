@@ -268,7 +268,7 @@ fallbacks = []
           "Never delegate the principal final complete procedure",
           'deliberately use `mode: "single"` without `writes`',
           "prohibition on leaves or parallelism alone still permits Head",
-          "Missing `developer_head` policy, invalid envelope, occupied role, unavailable asynchronous Head support, and binding rejection remain blockers",
+          "Missing `developer_head` policy, invalid envelope, conflicting exterior Developer ownership, unavailable asynchronous Head support, and binding rejection remain blockers",
           "no agent or Team tools are registered",
           "cannot become Head through steering",
           "cancel only that handle and end the turn for physical settlement",

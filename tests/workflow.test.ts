@@ -751,13 +751,13 @@ describe("plan and execute contracts", () => {
   test("planning correlation and operational checkpoints do not create or bypass Team Holds", () => {
     for (const contract of [
       "check the draft's explicit Board binding and existing ledger",
-      "For a bound draft without a ledger, call `team_assign` without `plan` or `unit`",
+      "For a bound draft without a ledger, call `team_assign` or `architecture_start` without `plan` or `unit`",
       "do not pass an explicit topic to bypass this rule",
       "For an unbound draft or a compatible existing ledger",
       "prospective, validated `plan` ID", "distinct, scoped `unit` ID per consultation",
       "incompatible ledger or real Team hold remains a blocker",
       "omitting correlation must not bypass it",
-      "Do not create an execution ledger during planning",
+      "Do not create an execution ledger or Board binding during planning",
       "Record role, purpose, handle type and exact ID, pending decision, and consulted object",
       "Team assignment ID for Team", "worker instance ID for `agent_spawn`",
       "with or without correlation", "operational checkpoint, not a Team Hold or acceptance evidence",
@@ -771,6 +771,35 @@ describe("plan and execute contracts", () => {
     expect(freeze).toContain("operational section was excluded from the consulted object");
     expect(freeze).toContain("Integrating corrections requested by critique does not itself require another consultation");
     expect(freeze).toContain("material blocker or a change outside the reviewed object");
+  });
+
+  test("optional planning architecture consumes only the exterior current-object judgment", () => {
+    for (const contract of [
+      'ordinary `team_assign` role work', 'mode: "consultation"', 'mode: "table"',
+      "trivial work needs no table", "one actual Architect director/root", "up to five internal specialists",
+      "may also use `architect`", "required current-object judgment", "unit partition/order",
+      "do not add a duplicate independent Architect consultation by default",
+      "Keep Reviewer separate from the designers", "not a frozen plan or its independent critique",
+      "record only the exterior root assignment", "use only that root for watched completion",
+      "Internal member IDs, room messages and direct intermediate responses cannot close the root's hold",
+      "complete terminal current-object judgment after owned closure",
+      "Partial, failed and cancelled results retain applicable holds", "bookkeeping, not acceptance",
+    ]) expect(plan).toContain(contract);
+    expect(plan).not.toContain("extra Architects and Reviewers");
+    for (const policy of [plan, execute]) expect(policy).not.toContain("If Team rejects a reserved role");
+    expect(execute).toContain("execute workflow restriction, not an engine singleton reservation per role");
+    const architecture = readFileSync(path.join(packageRoot(), "docs/architecture.md"), "utf8");
+    const examples = [...architecture.matchAll(/```json\n([\s\S]*?)\n```/g)].map(match => JSON.parse(match[1]!));
+    expect(examples).toHaveLength(2);
+    expect(examples[0]).toMatchObject({ mode: "table", plan: "storage-design", unit: "architect-pass" });
+    expect(examples[1]).toMatchObject({ mode: "consultation" });
+    for (const key of ["plan", "unit", "boardTopicId"]) expect(examples[1][key]).toBeUndefined();
+    for (const example of examples) {
+      expect(example.goal).toContain("current");
+      expect(example.goal.toLowerCase()).toContain("ignore ## planning workers");
+      expect(example.goal).toContain("do not modify product files");
+      expect(example.goal).toContain("unit partition/order");
+    }
   });
 
   test("background checkpoints interpret full results and distinguish planning loss from execution recovery", () => {
@@ -792,7 +821,7 @@ describe("plan and execute contracts", () => {
     expect(execute).toContain("preserve Team Hold reconciliation and recovery");
   });
 
-  test("object changes and Team occupancy cannot reuse stale judgments or bypass reservations", () => {
+  test("object changes and admission blockers cannot reuse stale judgments or bypass ownership", () => {
     for (const policy of [plan, execute]) {
       for (const contract of [
         "Compare new user information with the consulted object and original WorkBrief",
@@ -801,14 +830,14 @@ describe("plan and execute contracts", () => {
         "Interpret its automatic result when supplied, but do not use it to close that decision",
         "or apply the change after accepting the old judgment",
         "Cancel the exact still-active target with `team_cancel` or `agent_cancel` according to handle type",
-        "End the turn while settlement and role release are pending",
-        "Only after settlement and role release, assign a fresh WorkBrief against the current object",
-        "If Team rejects a reserved role, distinguish occupancy from an unknown handle",
-        "End the turn without polling or fallback",
-        "After that reservation settles and releases the role, retry `team_assign`",
+        "End the turn while settlement and member release are pending",
+        "Only after settlement and member release, assign a fresh WorkBrief against the current object",
+        "policy/resource or binding blocker from an unknown handle",
+        "End the turn without polling or fallback while owned settlement is pending",
+        "only after its actual blocker is resolved",
         "Another assignment's result does not answer this consultation",
-        "Do not use `agent_spawn` or `agent_run` to evade occupancy or admission rejection",
-        "Cancellation alone proves neither settlement nor role release",
+        "Do not use `agent_spawn` or `agent_run` to evade admission rejection",
+        "Cancellation alone proves neither settlement nor member release",
         "Neither `queued` nor `handled` proves correction or replaces a new consultation",
       ]) expect(policy).toContain(contract);
       expect(policy).not.toContain("Apply it after interpreting the supplied result, cancel the worker");
@@ -860,7 +889,7 @@ describe("plan and execute contracts", () => {
       'deliberately dispatch `mode: "single"` without `writes`',
       "prohibition on leaves or parallelism alone does not prohibit Head",
       "existing decision levels, not an automatic downgrade",
-      "Missing `developer_head` policy, invalid envelope, occupied role, unavailable asynchronous Head support, and execution-binding rejection are concrete blockers",
+      "Missing `developer_head` policy, invalid envelope, conflicting exterior Developer ownership, unavailable asynchronous Head support, and execution-binding rejection are concrete blockers",
       "do not omit `mode`, call `agent_run`, switch transport to evade rejection, edit personal configuration, or take over implementation",
       "Configured Head ModelPolicy fallback is unchanged",
       "Ordinary APIs outside execute still default omitted mode to single",

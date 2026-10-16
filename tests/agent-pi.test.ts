@@ -5,7 +5,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { activateTarget, createPiExecutor, cursorProviderContext, DEFAULT_THINKING_LEVEL } from "../extensions/agent/pi.ts";
 import { classifyProviderFailure } from "../extensions/agent/fallback.ts";
 import { executionForSession } from "../extensions/execution-identity.ts";
-import { runAgentInstance, teamExecutionSummary } from "../extensions/agent/run.ts";
+import { createConversationOwner, runAgentInstance, teamExecutionSummary } from "../extensions/agent/run.ts";
 import { ORCHESTRATION_TOOLS } from "../extensions/profile.ts";
 import { providerFixtureOwnership } from "./fixtures/provider-fixture-ownership.ts";
 import { controlledModel, controlledPi, controlledRole } from "./fixtures/pi-factories.ts";
@@ -272,3 +272,144 @@ test("cancellation marks a request with no output unavailable and clears activit
     time_to_first_model_output_unavailable_reason: "cancelled" });
   expect(events).toEqual(["bind", "clear"]);
 }));
+
+
+test("conversation owner rejects settlement callback reentry before SDK prompt and joins second cancellation",
+  fixture.ownedCase("conversation reentry", async () => {
+    const outer = Promise.withResolvers<void>(), entered = Promise.withResolvers<void>();
+    const callbackEntered = Promise.withResolvers<void>(), callbackRelease = Promise.withResolvers<void>();
+    let callback: Promise<void> | undefined;
+    const abortEntered = Promise.withResolvers<void>(), abortRelease = Promise.withResolvers<void>();
+    const secondPrompt = Promise.withResolvers<void>();
+    const firstSignal = new AbortController(), secondSignal = new AbortController();
+    let owner: ReturnType<typeof createConversationOwner>;
+    let rejection = "";
+    const f = setup({ bind(session) {
+      session.subscribe(event => {
+        if (event.type !== "agent_settled") return;
+        callback = (async () => {
+          try { await owner.turn("must never be queued"); } catch (error) { rejection = String(error); }
+          callbackEntered.resolve();
+          await callbackRelease.promise;
+        })();
+      });
+    }, async prompt(session, text) {
+      if (text === "first") {
+        // Controlled SDK boundary: settlement is emitted while the outer prompt still owns its stack.
+        session.emit({ type: "agent_settled" });
+        entered.resolve();
+        await outer.promise;
+        await callback;
+      } else { secondPrompt.resolve(); await abortEntered.promise; }
+      session.stats.tokens.input += 7;
+      session.stats.tokens.output += 3;
+      Reflect.deleteProperty(session.stats, "cost");
+      session.stats.assistantMessages++;
+      session.messages.push({ role: "assistant", content: [{ type: "text", text }], stopReason: "stop" });
+    }, async abort() { abortEntered.resolve(); await abortRelease.promise; } });
+    const config = path.join(f.root, "policy.toml");
+    writeFileSync(config, '[model_policies.developer]\nprimary = { model = "fixture/selected" }\n');
+    owner = createConversationOwner({ roleId: "developer", cwd: f.root, task: "first", executor: f.executor,
+      load: { userConfigPath: config } });
+    const first = owner.turn("first", { signal: firstSignal.signal });
+    let second: ReturnType<typeof owner.turn> | undefined;
+    try {
+      await entered.promise;
+      await callbackEntered.promise;
+      expect(rejection).toContain("busy");
+      expect(owner.busy).toBe(true);
+      expect(f.host.sessions[0]!.prompts).toEqual(["first"]);
+      outer.resolve();
+      await Promise.resolve();
+      expect(owner.busy).toBe(true);
+      await expect(owner.turn("callback still joining")).rejects.toThrow("busy");
+      callbackRelease.resolve();
+      const result = await first;
+      expect(result.usage).toMatchObject({ input: 7, output: 3 });
+      expect(result.usage?.cost).toBeUndefined();
+      expect(f.host.sessions[0]!.events).not.toContain("dispose");
+      second = owner.turn("second", { signal: secondSignal.signal });
+      await secondPrompt.promise;
+      firstSignal.abort();
+      expect(f.host.sessions[0]!.events).not.toContain("abort");
+      secondSignal.abort();
+      await abortEntered.promise;
+      let settled = false;
+      void second.then(() => { settled = true; });
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      abortRelease.resolve();
+      const cancelled = await second;
+      expect(cancelled).toMatchObject({ status: "cancelled", usage: { input: 7, output: 3 } });
+      expect(cancelled.usage?.cost).toBeUndefined();
+      await expect(owner.turn("terminal cancellation")).rejects.toThrow("closing");
+      expect(f.host.sessions).toHaveLength(1);
+      expect(f.host.sessions[0]!.prompts).toEqual(["first", "second"]);
+    } finally {
+      outer.resolve(); callbackRelease.resolve(); secondSignal.abort(); abortRelease.resolve();
+      await Promise.allSettled([first, second]);
+      await owner.close();
+    }
+    expect(f.host.sessions[0]!.events.filter(event => event === "dispose")).toHaveLength(1);
+  }));
+
+test("logical adapter operations do not reuse a previous resolved abort join",
+  fixture.ownedCase("operation abort generations", async () => {
+    const entered = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+    const aborted = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+    const release = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+    let prompts = 0, aborts = 0;
+    const f = setup({ async prompt() { const index = prompts++; entered[index]!.resolve(); await aborted[index]!.promise; },
+      async abort() { const index = aborts++; aborted[index]!.resolve(); await release[index]!.promise; } });
+    const one = new AbortController(), two = new AbortController();
+    const first = fixture.acquire(f.executor.start({ ...f.input, signal: one.signal }));
+    await entered[0]!.promise; one.abort(); await aborted[0]!.promise; release[0]!.resolve();
+    const result = await first;
+    const second = result.session!.turn!({ task: "new operation", target: f.input.target, signal: two.signal });
+    try {
+      await entered[1]!.promise; two.abort(); await aborted[1]!.promise;
+      let settled = false; void second.then(() => { settled = true; }); await Promise.resolve();
+      expect(aborts).toBe(2); expect(settled).toBe(false);
+      release[1]!.resolve(); expect((await second).status).toBe("cancelled");
+    } finally { release.forEach(gate => gate.resolve()); await second; await result.session!.dispose(); }
+  }));
+
+
+test("logical turn cancellation owns awaited activation as well as prompt and abort joins",
+  fixture.ownedCase("activation cancellation", async () => {
+    const entered = Promise.withResolvers<void>(), activationRelease = Promise.withResolvers<void>();
+    const aborted = Promise.withResolvers<void>(), abortRelease = Promise.withResolvers<void>();
+    const f = setup({ bind(session) {
+      const setModel = session.setModel.bind(session);
+      session.setModel = async model => {
+        if (session.prompts.length) { entered.resolve(); await activationRelease.promise; }
+        await setModel(model);
+      };
+    }, async abort() { aborted.resolve(); await abortRelease.promise; } });
+    const config = path.join(f.root, "policy.toml");
+    writeFileSync(config, '[model_policies.developer]\nprimary = { model = "fixture/selected" }\n');
+    const owner = createConversationOwner({ roleId: "developer", cwd: f.root, task: "first", executor: f.executor,
+      load: { userConfigPath: config } });
+    const stop = new AbortController();
+    const first = owner.turn();
+    let second: ReturnType<typeof owner.turn> | undefined;
+    try {
+      await first;
+      second = owner.turn("cancel during activation", { signal: stop.signal });
+      await entered.promise;
+      stop.abort();
+      await Promise.resolve();
+      expect(f.host.sessions[0]!.events).toContain("abort");
+      await aborted.promise;
+      let settled = false; void second.then(() => { settled = true; });
+      activationRelease.resolve();
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(settled).toBe(false);
+      abortRelease.resolve();
+      expect((await second).status).toBe("cancelled");
+      expect(f.host.sessions[0]!.prompts).toEqual(["first"]);
+    } finally {
+      activationRelease.resolve(); abortRelease.resolve(); stop.abort();
+      await Promise.allSettled([first, second]); await owner.close();
+    }
+  }));

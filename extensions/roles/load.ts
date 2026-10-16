@@ -31,7 +31,7 @@ export interface LoadOptions {
   availableModels?: readonly ModelCapability[];
 }
 
-const ROOT_KEYS = new Set(["roles", "model_policies", "agent_runtime", "worker_history", "developer_routing", "head_developer"]);
+const ROOT_KEYS = new Set(["roles", "model_policies", "agent_runtime", "worker_history", "developer_routing", "head_developer", "architecture"]);
 const ROLE_KEYS = new Set(["name", "description", "instructions", "model_policy", "skills", "principles"]);
 const POLICY_KEYS = new Set(["primary", "fallbacks"]);
 const TARGET_KEYS = new Set(["model", "reasoning", "fast"]);
@@ -125,6 +125,7 @@ function parseBuiltin(defaultsPath: string, root: string): PitakoConfig {
 }
 
 interface UserConfig {
+  architecture?: unknown;
   present: boolean;
   roles: Record<string, RawRole>;
   policies: Record<string, RawPolicy>;
@@ -139,6 +140,7 @@ function readUserConfig(userConfigPath: string): UserConfig {
   const raw = readToml(userConfigPath);
   return {
     present: true,
+    architecture: raw.architecture,
     roles: parseRoleOverrides(raw.roles, userConfigPath),
     policies: parsePolicyTables(raw.policies, userConfigPath) ?? {},
     watchdog: raw.watchdog,
@@ -191,6 +193,7 @@ function mergeConfig(
     };
   }
   const config: PitakoConfig = {
+    architecture: parseArchitecture(user.architecture, userConfigPath),
     defaultsPath: builtin.defaultsPath,
     userConfigPath,
     userConfigPresent: user.present,
@@ -302,6 +305,7 @@ function requirePolicy(config: PitakoConfig, id: string): ModelPolicy {
 }
 
 interface RawDocument {
+  architecture: unknown;
   roles: unknown;
   policies: unknown;
   watchdog: unknown;
@@ -375,7 +379,7 @@ function readToml(file: string): RawDocument {
   }
   const record = expectRecord(parsed, file, "");
   rejectUnknown(record, ROOT_KEYS, file, "");
-  return { roles: record.roles, policies: record.model_policies, watchdog: record.agent_runtime, workerHistory: record.worker_history,
+  return { architecture: record.architecture, roles: record.roles, policies: record.model_policies, watchdog: record.agent_runtime, workerHistory: record.worker_history,
     developerRouting: record.developer_routing, headDeveloper: record.head_developer };
 }
 
@@ -578,4 +582,33 @@ function stringList(value: unknown, file: string, field: string): string[] {
 
 function freeze<T extends object>(value: T): T {
   return Object.freeze(value);
+}
+
+function parseArchitecture(value: unknown, file: string): PitakoConfig["architecture"] {
+  if (value === undefined) return undefined;
+  const table = expectRecord(value, file, "architecture");
+  rejectUnknown(table, new Set(["candidates", "topics"]), file, "architecture");
+  const candidates = (value: unknown, field: string) => {
+    if (!Array.isArray(value) || !value.length) throw new PitakoConfigError(`${file}: ${field}: expected nonempty candidates`);
+    const seen = new Set<string>();
+    return value.map((item, index) => {
+      const key = `${field}[${index}]`;
+      rejectUnknown(expectRecord(item, file, key), new Set(["model", "reasoning"]), file, key);
+      const target = parseTarget(item, file, key), identity = targetKey(target);
+      if (seen.has(identity)) throw new PitakoConfigError(`${file}: ${key}: duplicate candidate`);
+      seen.add(identity);
+      return target;
+    });
+  };
+  if (table.topics !== undefined && !Array.isArray(table.topics)) throw new PitakoConfigError(`${file}: architecture.topics: expected array`);
+  const seen = new Set<string>();
+  return { candidates: candidates(table.candidates, "architecture.candidates"),
+    topics: ((table.topics ?? []) as unknown[]).map((item, index) => {
+      const field = `architecture.topics[${index}]`, entry = expectRecord(item, file, field);
+      rejectUnknown(entry, new Set(["topic", "candidates"]), file, field);
+      const topic = requiredString(entry.topic, file, `${field}.topic`).replace(/\s+/g, " ").toLowerCase();
+      if (seen.has(topic)) throw new PitakoConfigError(`${file}: ${field}: duplicate topic`);
+      seen.add(topic);
+      return { topic, candidates: candidates(entry.candidates, `${field}.candidates`) };
+    }) };
 }

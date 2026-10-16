@@ -5,6 +5,7 @@ export interface ExecutionIdentity {
   instanceId: string;
   roleId: string;
   sessionId: string;
+  architecture?: boolean;
   profile?: "analysis" | "coding";
   managed?: "head" | "leaf" | "consultation";
 }

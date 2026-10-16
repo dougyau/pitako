@@ -5,8 +5,8 @@ import { PitakoConfigError } from "./errors.ts";
 import { isProtectedEditPath } from "./paths.ts";
 import { canonicalPath } from "./board/paths.ts";
 import { bindBackgroundOwner, revokeBackgroundOwner, shutdownBackground, observeWorkerResults,
-  draftWorkerResults, settleWorkerResults, restrictWorkerContinuation, externallyStartedWorkerOwner } from "./agent/background.ts";
-import { beginTeamEvaluation, retireTeamEvaluation, teamEvaluationForSession, latestTeamAssignment, type TeamEvaluation } from "./team.ts";
+  draftWorkerResults, draftIntermediateResults, observeIntermediateResults, settleIntermediateResults, settleWorkerResults, restrictWorkerContinuation, externallyStartedWorkerOwner } from "./agent/background.ts";
+import { beginTeamEvaluation, retireTeamEvaluation, teamEvaluationForSession, teamAssignments, type TeamEvaluation } from "./team.ts";
 import { teamWorkerStatus } from "./agent/background.ts";
 import { bindAgentUi, listObservations, unbindAgentUi } from "./agent/observe.ts";
 import { formatAgentsDetail } from "./agent/ui.ts";
@@ -209,6 +209,9 @@ export default function pitako(pi: ExtensionAPI) {
               { deliverAs: "followUp", triggerTurn: true },
             );
           },
+          appendIntermediate: message => {
+            if (owns()) pi.sendMessage(message, { triggerTurn: false });
+          },
           appendResult: message => {
             if (owns()) pi.sendMessage(message, { triggerTurn: false });
           },
@@ -283,30 +286,34 @@ export default function pitako(pi: ExtensionAPI) {
     teamEvaluationForSession(teamEvaluation.sessionId, false)?.token === teamEvaluation.token &&
     teamEvaluation.token === ownerToken;
   const terminal = (_event: unknown, ctx: ExtensionContext) => {
-    if (ownsEvent(ctx)) settleWorkerResults(ownerToken, true);
+    if (ownsEvent(ctx)) { settleWorkerResults(ownerToken, true); settleIntermediateResults(ownerToken, true); }
   };
   pi.on("agent_before_settle", (event, ctx) => {
-    if (ownsEvent(ctx)) return draftWorkerResults(ownerToken, event.outcome);
+    if (!ownsEvent(ctx)) return;
+    const terminal = draftWorkerResults(ownerToken, event.outcome);
+    const intermediate = draftIntermediateResults(ownerToken, event.outcome);
+    if (terminal || intermediate) return { entries: [...terminal?.entries ?? [], ...intermediate?.entries ?? []],
+      continue: !!(terminal?.continue || intermediate?.continue) };
   });
   pi.on("agent_settled", terminal);
   pi.on("session_compact", (event, ctx) => {
     if (!ownsEvent(ctx)) return;
-    if (event.reason === "manual") settleWorkerResults(ownerToken, true, false);
-    else observeWorkerResults(ownerToken);
+    if (event.reason === "manual") { settleWorkerResults(ownerToken, true, false); settleIntermediateResults(ownerToken, true, false); }
+    else { observeWorkerResults(ownerToken); observeIntermediateResults(ownerToken); }
   });
   pi.on("session_compact_failed", (event, ctx) => {
     if (!ownsEvent(ctx)) return;
-    if (event.reason === "manual") settleWorkerResults(ownerToken, true, false);
-    else observeWorkerResults(ownerToken);
+    if (event.reason === "manual") { settleWorkerResults(ownerToken, true, false); settleIntermediateResults(ownerToken, true, false); }
+    else { observeWorkerResults(ownerToken); observeIntermediateResults(ownerToken); }
   });
   pi.on("session_tree", (_event, ctx) => {
-    if (ownsEvent(ctx)) settleWorkerResults(ownerToken, true, false);
+    if (ownsEvent(ctx)) { settleWorkerResults(ownerToken, true, false); settleIntermediateResults(ownerToken, true, false); }
   });
   pi.on("turn_start", (_event, ctx) => {
-    if (ownsEvent(ctx)) observeWorkerResults(ownerToken, true);
+    if (ownsEvent(ctx)) { observeWorkerResults(ownerToken, true); observeIntermediateResults(ownerToken, true); }
   });
   pi.on("context", (_event, ctx) => {
-    if (ownsEvent(ctx)) observeWorkerResults(ownerToken);
+    if (ownsEvent(ctx)) { observeWorkerResults(ownerToken); observeIntermediateResults(ownerToken); }
   });
   pi.on("message_end", (event, ctx) => {
     if (!ownsEvent(ctx)) return;
@@ -314,7 +321,7 @@ export default function pitako(pi: ExtensionAPI) {
       if (event.message.stopReason === "aborted") restrictWorkerContinuation(ownerToken, "aborted");
       if (event.message.stopReason === "error") restrictWorkerContinuation(ownerToken, "error");
     }
-    observeWorkerResults(ownerToken);
+    observeWorkerResults(ownerToken); observeIntermediateResults(ownerToken);
   });
   pi.on("agent_end", (event, ctx) => {
     if (!ownsEvent(ctx)) return;
@@ -322,13 +329,13 @@ export default function pitako(pi: ExtensionAPI) {
     if (last?.role === "assistant" && (last.stopReason === "aborted" || last.stopReason === "error"))
       restrictWorkerContinuation(ownerToken, last.stopReason);
     if (ctx.signal?.aborted) restrictWorkerContinuation(ownerToken, "aborted");
-    observeWorkerResults(ownerToken);
+    observeWorkerResults(ownerToken); observeIntermediateResults(ownerToken);
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
     if (ownsEvent(ctx)) {
       externallyStartedWorkerOwner(ownerToken);
-      observeWorkerResults(ownerToken);
+      observeWorkerResults(ownerToken); observeIntermediateResults(ownerToken);
     }
     const entries = ctx.sessionManager?.getEntries?.() ?? [];
     const existingUserText = firstUserText(entries);
@@ -389,13 +396,11 @@ export default function pitako(pi: ExtensionAPI) {
           notify(ctx, "Team unavailable for this session", "error");
           return;
         }
-        const roles = ["architect", "developer", "reviewer", "researcher", "scout", "oracle"];
-        const rows = roles.map((role, index) => {
-          const assignment = latestTeamAssignment(evaluation, role!);
-          if (!assignment) return { role: roles[index], status: "idle" };
+        const rows = teamAssignments(evaluation).map(assignment => {
           const view = teamWorkerStatus(evaluation.token, assignment.instanceId)[0];
           return {
-            role: roles[index],
+            role: assignment.roleId,
+            teamId: assignment.teamId, memberId: assignment.memberId, ordinal: assignment.ordinal,
             assignmentId: assignment.id,
             instanceId: assignment.instanceId,
             status: view?.status ?? "settled",

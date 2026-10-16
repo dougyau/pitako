@@ -182,8 +182,11 @@ A terminal display status alone does not establish a ready settled result.
 
 `publicDetail` requests `workers.detail` with `format: "public-v1"` over
 protocol 2. Its `worker` identifies source, instance, role, coordinator session,
-actual launch `toolCallId`, acceptance time, and native Team `assignmentId` when
-applicable. Internal callers without a tool-call ID report `toolCallId: null`
+actual launch `toolCallId`, acceptance time, and native Team `assignmentId`,
+`teamId`, `memberId`, and current `turnId` when applicable. Worker list and detail
+carry the same optional identities; old captures without them remain readable.
+Maintained members stay running/idle between turns and expose no settled result
+until their assignment closes. Internal callers without a tool-call ID report `toolCallId: null`
 and `linkage: "unlinked"`; identity is not reconstructed from routing or output.
 `workbrief` preserves the original task with a separate `nextBrief` cursor.
 Selected/requested settings and observed activation remain separate.

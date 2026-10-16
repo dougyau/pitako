@@ -12,6 +12,14 @@ for non-consuming worker reads and scoped history. The bridge requires fresh
 acknowledgement for raw history and routing, and explicit activation for controls.
 Its history scope is narrower than the foreground tools described below.
 
+Team catalog members retain optional `teamId`, `memberId`, and initial `turnId`
+from host admission. Later logical turns append their own turn/attempt identity
+in the same native history; native request observations carry current turn and
+attempt IDs. Repeated roles are distinct members, never a latest-role projection.
+Older catalogs and captures without these optional fields remain readable.
+A maintained member keeps its invocation unclosed between turns; assignment
+close joins SDK disposal before sealing history. Unknown closure stays protected.
+
 ## Automatic settled results
 
 Background and Team workers supply their complete captured result automatically

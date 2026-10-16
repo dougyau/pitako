@@ -109,10 +109,10 @@ export const success = (request, result) => ({ version, id: request.id, clientId
 const text = value => typeof value === "string" && Buffer.byteLength(value) <= replyBytes;
 const optional = (value, key, validate) => value[key] === undefined || validate(value[key]);
 function isSdkRequest(value) {
-  return object(value) && keys(value, ["attemptId", "historyId", "sessionId", "sdkOptions", "model", "provider",
+  return object(value) && keys(value, ["turnId", "attemptId", "historyId", "sessionId", "sdkOptions", "model", "provider",
     "requestId", "inputTokens", "outputTokens", "reasoning", "fast_requested", "requested_service_tier",
     "returned_service_tier", "time_to_first_model_output_ms", "time_to_first_model_output_unavailable_reason"]) &&
-    ["attemptId", "historyId", "sessionId", "provider", "requestId", "reasoning"].every(key => optional(value, key, text)) &&
+    ["turnId", "attemptId", "historyId", "sessionId", "provider", "requestId", "reasoning"].every(key => optional(value, key, text)) &&
     text(value.model) && typeof value.fast_requested === "boolean" &&
     optional(value, "sdkOptions", options => object(options) &&
       keys(options, ["reasoning", "temperature", "maxTokens", "serviceTier"]) &&
@@ -129,13 +129,13 @@ function isList(value, owner) {
     sameOwner(value.owner, owner) && Array.isArray(value.items) && value.items.length <= 50 &&
     (value.cursor === null || string(value.cursor)) &&
     value.items.every(row => object(row) &&
-      keys(row, ["id", "roleId", "status", "source", "assignmentId", "task", "selectedModel", "requestedModel",
+      keys(row, ["id", "roleId", "status", "source", "teamId", "memberId", "turnId", "assignmentId", "task", "selectedModel", "requestedModel",
         "requestedReasoning", "activated", "sdkRequest", "acceptedAt", "terminalAt", "activity", "phase", "profile",
         "resultTaken", "handoff"]) &&
       string(row.id) && string(row.roleId) &&
       ["created", "running", "completed", "failed", "cancelled"].includes(row.status) &&
       optional(row, "source", source => ["agent_run", "agent_spawn", "team_assign"].includes(source)) &&
-      ["assignmentId", "requestedModel", "requestedReasoning", "profile"].every(key => optional(row, key, text)) &&
+      ["teamId", "memberId", "turnId", "assignmentId", "requestedModel", "requestedReasoning", "profile"].every(key => optional(row, key, text)) &&
       text(row.task) && text(row.selectedModel) && optional(row, "terminalAt", Number.isFinite) &&
       optional(row, "activated", item => object(item) && keys(item, ["attemptId", "model", "reasoning"]) &&
         text(item.attemptId) && text(item.model) && text(item.reasoning)) &&
@@ -229,7 +229,8 @@ function publicDetail(value, owner) {
   return keys(value, ["format", "ref", "worker", "lifecycle", "bindings", "workbrief", "nextBrief", "selected", "activated",
       "captureEpoch", "conversationSequence", "captureGaps", "nextBindings"]) &&
     value.format === "public-v1" && publicBoundRef(value.ref, owner) && ["agent_spawn", "team_assign"].includes(value.ref.source) &&
-    object(worker) && keys(worker, ["source", "instanceId", "roleId", "coordinatorSessionId", "toolCallId", "assignmentId", "acceptedAt", "linkage"]) &&
+    object(worker) && keys(worker, ["source", "instanceId", "roleId", "teamId", "memberId", "turnId", "coordinatorSessionId", "toolCallId", "assignmentId", "acceptedAt", "linkage"]) &&
+    ["teamId", "memberId", "turnId"].every(key => optional(worker, key, string)) &&
     worker.source === value.ref.source && worker.instanceId === value.ref.instanceId && string(worker.roleId) &&
     worker.coordinatorSessionId === owner.coordinatorSessionId &&
     (worker.toolCallId === null || string(worker.toolCallId)) &&

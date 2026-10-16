@@ -4,12 +4,13 @@ import { createPiExecutor } from "../../extensions/agent/pi.ts";
 
 type Factories = NonNullable<Parameters<typeof createPiExecutor>[0]>["factories"];
 type Session = {
-    sessionId: string; sessionManager: AgentSession["sessionManager"]; messages: any[]; model?: Model<any>;
+    sessionId: string; readonly sessionFile: string | undefined; sessionManager: AgentSession["sessionManager"]; messages: any[]; model?: Model<any>;
     thinkingLevel: any; isStreaming: boolean; events: string[]; prompts: string[]; active: string[];
     stats: { tokens: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
       cost: number; assistantMessages: number; toolCalls: number; contextUsage: { tokens: number } };
     agent: { streamFunction: any };
     emit(event: any): void; prompt(text: string): Promise<void>; abort(): Promise<void>; dispose(): Promise<void>;
+    tools: Map<string, { definition: any }>; hooks: Map<string, Function[]>;
     settingsManager: any; setModel(model: Model<any>): Promise<void>; setThinkingLevel(level: any): void;
     getAllTools(): Array<{ name: string }>; setActiveToolsByName(names: string[]): void;
     subscribe(listener: (event: any) => void): () => void; getSessionStats(): any;
@@ -27,6 +28,7 @@ export const controlledRole = {
 
 /** Factory responses only; tests drive callbacks/events explicitly, not a Pi event loop. */
 export function controlledPi(root: string, options: {
+  inlineExtensions?: boolean;
   models?: Model<any>[];
   bind?: (session: Session) => Promise<void> | void;
   prompt?: (session: Session, text: string) => Promise<void> | void;
@@ -46,33 +48,53 @@ export function controlledPi(root: string, options: {
       return { model, options: requestOptions, provider: { streamSimple: runtime.streamSimple } };
     },
   };
-  const factories: Factories = {
+  const loaders = new WeakMap<object, { tools: Map<string, { definition: any }>; hooks: Map<string, Function[]>; manager?: any }>();
+  const factories: Required<Factories> = {
     async createRuntime(input) { runtimeInputs.push(input); return { ...runtime } as never; },
     getAgentDir: () => root,
     createSettings: () => ({ getModelThinkingLevel() {}, getDefaultThinkingLevel() {} }) as never,
     createCodemode: () => () => {},
-    createLoader(input) { loaderInputs.push(input); return {
-      async reload() {}, getExtensions: () => ({ extensions: options.extensions ?? [], errors: [] }),
-    } as never; },
+    createLoader(input) {
+      loaderInputs.push(input);
+      const local = { tools: new Map<string, { definition: any }>(), hooks: new Map<string, Function[]>(), manager: undefined as any };
+      const loader = {
+        async reload() {
+          if (options.inlineExtensions) for (const extension of input.extensionFactories ?? []) await (typeof extension === "function" ? extension : extension.factory)({
+            registerTool(definition: any) { local.tools.set(definition.name, { definition }); },
+            on(name: string, handler: Function) { local.hooks.set(name, [...local.hooks.get(name) ?? [], handler]); },
+            appendEntry(type: string, data: unknown) { local.manager.appendCustomEntry(type, data); },
+          } as never);
+        },
+        getExtensions: () => ({ extensions: [...options.extensions ?? [], ...(options.inlineExtensions ? [{ resolvedPath: "controlled-inline", tools: local.tools }] : [])], errors: [] }),
+      };
+      loaders.set(loader, local);
+      return loader as never;
+    },
     async createSession(input) {
       sessionInputs.push(input);
       const listeners = new Set<(event: any) => void>();
       const manager = input!.sessionManager!;
       const sessionRuntime = input!.modelRuntime!;
+      const local = loaders.get(input!.resourceLoader!)!;
+      local.manager = manager;
       const session: Session = {
-        sessionId: manager.getSessionId(), sessionManager: manager, model: input!.model,
+        sessionId: manager.getSessionId(), get sessionFile() { return manager.getSessionFile(); }, sessionManager: manager, model: input!.model,
+        tools: local.tools, hooks: local.hooks,
         messages: [], thinkingLevel: input!.thinkingLevel, isStreaming: false, events: [], prompts: [], active: [],
         stats: { tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0, assistantMessages: 0, toolCalls: 0, contextUsage: { tokens: 17 } },
         agent: { streamFunction: (...args: any[]) => sessionRuntime.streamSimple(...args as [any, any, any]) },
         settingsManager: input!.settingsManager,
         async setModel(model) { session.model = model; },
         setThinkingLevel(level) { session.thinkingLevel = level; },
-        getAllTools: () => ["read", "grep", "find", "ls", "bash", "edit", "write", "agent_run"].map(name => ({ name })),
+        getAllTools: () => ["read", "grep", "find", "ls", "bash", "edit", "write", "agent_run", ...local.tools.keys()].map(name => ({ name })),
         setActiveToolsByName(names) { session.active = names; },
         subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
         getSessionStats: () => session.stats,
         emit(event) { for (const listener of listeners) listener(event); },
-        async bindExtensions() { session.events.push("bind"); await options.bind?.(session); },
+        async bindExtensions() {
+          session.events.push("bind"); await options.bind?.(session);
+          if (options.inlineExtensions) for (const handler of local.hooks.get("session_start") ?? []) await handler({}, { sessionManager: manager });
+        },
         async prompt(text) {
           session.prompts.push(text);
           if (options.prompt) await options.prompt(session, text);

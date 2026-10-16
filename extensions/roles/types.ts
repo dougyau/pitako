@@ -78,6 +78,7 @@ export interface ResolvedRole {
 }
 
 export interface PitakoConfig {
+  architecture?: ArchitectureConfig;
   defaultsPath: string;
   userConfigPath: string;
   userConfigPresent: boolean;
@@ -101,4 +102,9 @@ export interface ModelCapability {
 
 export function isReasoningLevel(value: string): value is ReasoningLevel {
   return (REASONING_LEVELS as readonly string[]).includes(value) || value in PI_THINKING;
+}
+
+export interface ArchitectureConfig {
+  candidates: readonly Pick<ModelTarget, "model" | "reasoning">[];
+  topics: readonly { topic: string; candidates: readonly Pick<ModelTarget, "model" | "reasoning">[] }[];
 }
