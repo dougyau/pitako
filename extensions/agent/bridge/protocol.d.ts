@@ -1,6 +1,6 @@
 export interface Owner { processId: string; coordinatorSessionId: string; epoch: string }
 export type Capability = "workers.list" | "workers.detail" | "workers.requests" | "workers.activity" | "workers.result" | "subscribe" | "unsubscribe" |
-  "history.list" | "history.read" | "route.read" | "workers.detail.public-v1" | "workers.activity.public-v1" | "workers.result.public-v1";
+  "history.list" | "history.read" | "route.read" | "workers.detail.public-v1" | "workers.activity.public-v1" | "workers.result.public-v1" | "architecture.list" | "architecture.read" | "architecture.public-v1";
 export interface ClientLease { clientId: string; resumeToken: string }
 export type ResumeLease = Pick<ClientLease, "clientId" | "resumeToken">;
 export interface Descriptor {
@@ -167,6 +167,8 @@ export type HistoryPage<T = HistoryFragment> = {
 };
 export type RoutePage = { state: "captured" | "not-routed" | "unavailable"; page: TextPage };
 export type Request = { version: 2; id: string; clientId: string; owner: Owner } & (
+  { method: "architecture.list"; params: { cursor?: string } } |
+  { method: "architecture.read"; params: { ref: ArchitectureRef; cursor?: string } } |
   { method: "connect"; params: { token: string; expectedSessionId: string; resumeToken?: string } } |
   { method: "workers.list"; params: { after?: string; revision?: number } } |
   { method: "subscribe"; params: Record<string, never> } |
@@ -187,7 +189,7 @@ export const errors: Readonly<Record<"invalid_request" | "unsupported_method" | 
   "invalid_cursor" | "stale_cursor" | "stale_reference" | "unknown_target" | "busy" | "oversized" | "lease_expired", string>>;
 export type ErrorCode = keyof typeof errors;
 export type Reply = { version: 2; id: string; clientId: string; owner: Owner } & (
-  { ok: true; result: WorkerList | WorkerDetail | WorkerRequests | WorkerActivity | WorkerResult | Subscription |
+  { ok: true; result: ArchitectureCatalog | ArchitectureRead | WorkerList | WorkerDetail | WorkerRequests | WorkerActivity | WorkerResult | Subscription |
     HistoryPage | HistoryPage<HistoryMetadata> | RoutePage | PublicWorkerDetail | PublicConversationPage | PublicWorkerResult |
     { subscriptionId: string } | { capabilities: readonly Capability[]; lease: ClientLease } } |
   { ok: false; error: { code: ErrorCode; message: string } });
@@ -204,3 +206,47 @@ export function isReply(value: unknown, method: Request["method"], format?: "pub
 export function isNotification(value: unknown): value is Notification;
 export function failure(request: Envelope, code: ErrorCode): Reply;
 export function success(request: Request, result: unknown): { version: 2; id: string; clientId: string; owner: Owner; ok: true; result: unknown };
+
+/** Passive Architecture export. These declarations load no runtime dependencies. */
+export interface ArchitectureRef extends Owner { kind: "architecture"; roomId: string }
+export type PublicArchitectureBody =
+  | { kind: "composition"; snapshotId: string; specialists: { candidateRef: string; mandate: string; reason: string }[] }
+  | { kind: "preparation"; analysis: string; doubts: { question: string; purpose: string }[] }
+  | { kind: "contribution"; proposal: string; arguments: string[]; objections: { memberId: string; messageId: string; argument: string }[]; doubts: { question: string; purpose: string }[] }
+  | { kind: "decision"; action: "continue" | "consult" | "synthesize" | "recompose"; reason: string }
+  | { kind: "answer"; answer: string; evidence: string[]; limits: string[]; doubts: { question: string; purpose: string }[] }
+  | { kind: "consultation-plan"; resolutions: { doubtId: string; status: "answered" | "rejected"; answer: string }[]; support: { role: "scout" | "researcher" | "oracle"; brief: string; doubtIds: string[]; prerequisites: number[] }[] }
+  | { kind: "consultation-response"; doubtIds: string[]; answer: string; evidence: string[]; limits: string[]; doubts: { question: string; purpose: string }[] }
+  | { kind: "knowledge"; resolutions: { doubtId: string; status: "answered" | "partial" | "rejected" | "failed"; answer: string; supportIds: string[] }[] }
+  | { kind: "synthesis"; status: "complete" | "partial" | "failed"; recommendation: string; alternatives: string[]; evidence: string[]; assumptions: string[]; disagreements: string[]; pending: string[] };
+export type PublicArchitectureStage = PublicArchitectureBody["kind"];
+export type PublicSynthesisBody = Extract<PublicArchitectureBody, { kind: "synthesis" }>;
+export interface PublicArchitectureMessage {
+  id: string; ordinal: number; roomId: string; assignmentId: string; memberId: string; author: string;
+  stage: PublicArchitectureStage; snapshotId: string; round?: number; turnId: string; attemptId: string;
+  body: PublicArchitectureBody; native: { historyId?: string; sessionId: string; toolCallId: string; persistence: "unconfirmed" };
+  doubts: { id: string; question: string; purpose: string }[];
+}
+export interface ArchitectureLifecycle {
+  stage: PublicArchitectureStage | "waiting" | "closing" | null; round: number;
+  protocolState: "starting" | "running" | "waiting" | "finished" | "failed" | "cancelled" | "closure-unknown";
+  outcome: "pending" | "available" | "unavailable";
+  closure: { state: "pending" | "released" | "unknown"; members: "not-created" | "pending" | "released" | "unknown"; director: "not-created" | "pending" | "released" | "unknown" };
+}
+export type ArchitectureRecord =
+  | { kind: "room"; id: string; mode: "table" | "consultation"; origin: { coordinatorSessionId: string; tool: "architecture_start"; toolCallId: string; memberId: string; assignmentId: string; instanceId: string }; goalSource: { kind: "worker-workbrief"; instanceId: string }; lifecycle: ArchitectureLifecycle; pendingDoubtIds: string[] }
+  | { kind: "member"; id: string; assignmentId: string; instanceId: string; roleId: string; function: "director" | "specialist" | "support"; ordinal: number; admittedAt: number; mandate: { source: "root-workbrief"; instanceId: string } | { source: "TeamAssignment.task"; text: string }; execution: "accepted" | "running" | "completed" | "failed" | "cancelled"; workerRef?: WorkerReadReference; conversationRefs: WorkerReadReference[]; compositionMessageId?: string; supersededByCompositionId?: string }
+  | { kind: "publication"; id: string; message: PublicArchitectureMessage }
+  | { kind: "control"; id: string; order: number; action: "context" | "priorities" | "finish" | "stop"; text?: string; author: { coordinatorSessionId: string; toolCallId: string }; application: { state: "pending" } | { state: "applied"; stage: ArchitectureLifecycle["stage"]; round: number } }
+  | { kind: "failure"; id: string; phase: "preparation" | "admission" | "turn" | "disband" | "director-close"; error: string; memberId?: string; assignmentId?: string; stage?: PublicArchitectureStage; round?: number }
+  | { kind: "outcome"; id: "final"; source: "background-settlement"; status: "completed" | "failed" | "cancelled"; content: { kind: "synthesis"; body: PublicSynthesisBody } | { kind: "text"; text: string } };
+export interface ArchitectureFragment { kind: "fragment"; recordId: string; encoding: "base64-json"; byteOffset: number; totalBytes: number; data: string }
+export type ArchitectureAvailability = { state: "unavailable"; reason: "unknown_room" | "not_captured" | "snapshot_oversized" } | { state: "stale_owner" | "stale_cursor" | "invalid_cursor" };
+export interface ArchitectureCatalogItem { ref: ArchitectureRef; mode: "table" | "consultation"; director: { memberId: string; assignmentId: string; instanceId: string }; lifecycle: ArchitectureLifecycle }
+export interface ArchitectureCatalogPage { format: "architecture-public-v1"; state: "ready"; owner: Owner; snapshotId: string; cut: number; items: ArchitectureCatalogItem[]; next: string | null }
+export type ArchitectureCatalog = ArchitectureCatalogPage | { state: "unavailable"; reason: "not_captured" | "snapshot_oversized" } | { state: "stale_owner" | "stale_cursor" | "invalid_cursor" };
+export interface ArchitecturePage { format: "architecture-public-v1"; state: "ready"; ref: ArchitectureRef; snapshotId: string; cut: number; capture: { state: "open" | "closed" | "incomplete"; finalCut: number | null; gaps: ("not_captured" | "capture_failed")[] }; records: (ArchitectureRecord | ArchitectureFragment)[]; next: string | null }
+export type ArchitectureRead = ArchitecturePage | ArchitectureAvailability;
+export function isArchitectureRef(value: unknown): value is ArchitectureRef;
+export function isArchitectureRecord(value: unknown): value is ArchitectureRecord;
+export function isPublicArchitectureBody(value: unknown): value is PublicArchitectureBody;

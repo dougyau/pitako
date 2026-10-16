@@ -1,3 +1,5 @@
+import { architecturePublication, architectureProgress, architectureMember, architectureControl, architectureControlApplied,
+  architectureCandidate, architectureMembersClosed, architectureFailure, type ArchitectureRoom } from "./rooms.ts";
 import { randomUUID } from "node:crypto";
 import { admitTeamMember, disbandTeam, teamAssignments, type createTeam } from "../team.ts";
 import { backgroundExecutor, cancelTeamWorker, intermediateReceipts, publishIntermediate, teamWorkerStatus, turnTeamWorker } from "../agent/background.ts";
@@ -11,13 +13,13 @@ import { participant, type Body, type Message, type Stage } from "./types.ts";
 type Team = ReturnType<typeof createTeam>;
 type Member = ReturnType<typeof admitTeamMember>;
 export function createConsultation(input: { team: Team; config: PitakoConfig; mode?: "consultation" | "table"; goal: string; topic?: string;
-  root: { assignmentId: string; memberId: string; instanceId: string }; origin: HistoryOrigin; cwd: string; owns: () => boolean }) {
-  const snapshotId = randomUUID(), messages: Message[] = [], controls: { action: string; text?: string }[] = [];
+  root: { assignmentId: string; memberId: string; instanceId: string }; origin: HistoryOrigin; cwd: string; owns: () => boolean; observation?: ArchitectureRoom }) {
+  const snapshotId = randomUUID(), messages: Message[] = [], controls: { action: string; text?: string; captureId?: string }[] = [];
   const mode = input.mode ?? "consultation";
   let round = 0, ordinal = 0, sharedId = snapshotId;
   const failures: { memberId: string; stage: Stage; round: number; error: string }[] = [];
   const appliedControls: { action: string; text?: string }[] = [];
-  const record = (message: Message) => { messages.push(structuredClone(message)); return message; };
+  const record = (message: Message, retain = true) => { if (retain) messages.push(structuredClone(message)); architecturePublication(input.observation, message); return message; };
   const candidates = input.config.architecture!;
   const snapshot = { id: snapshotId, general: candidates.candidates.map((candidate, index) => ({ ref: `general:${index}`, ...candidate })),
     topics: candidates.topics.map((topic, index) => ({ topic: topic.topic, ref: `topic:${index}`,
@@ -25,12 +27,18 @@ export function createConsultation(input: { team: Team; config: PitakoConfig; mo
   let state = "starting", stage: Stage | "waiting" | "closing" = "composition", stopping = false, finishing = false;
   let wake: (() => void) | undefined, signal: AbortSignal | undefined;
   const check = () => { if (!input.owns() || stopping || signal?.aborted) throw new Error("architecture authority retired or stopped"); };
+  const progress = () => architectureProgress(input.observation, stage, round, state as ArchitectureRoom["lifecycle"]["protocolState"], pendingDoubts.map(doubt => doubt.id));
+  const consumeControls = () => {
+    const accepted = controls.splice(0);
+    architectureControlApplied(input.observation, accepted.map(control => control.captureId), stage, round);
+    return accepted.map(({ action, text }) => ({ action, text }));
+  };
   const current = () => input.owns() && !stopping && !signal?.aborted;
   const capability = (identity: { assignmentId: string; memberId: string }, author: string) => {
     let publication: { ordinal: number; snapshotId: string; round?: number };
     const attached = participant({ current, publish(message) {
       check();
-      return structuredClone({ ...message, ...identity, roomId: input.team.teamId, author, id: randomUUID(), ...publication });
+      return structuredClone({ ...message, assignmentId: identity.assignmentId, memberId: identity.memberId, roomId: input.team.teamId, author, id: randomUUID(), ...publication });
     } });
     const open = attached.open;
     attached.open = kind => {
@@ -45,7 +53,7 @@ export function createConsultation(input: { team: Team; config: PitakoConfig; mo
     primary: role.modelPolicy.primary && strictTarget(role.modelPolicy.primary), fallbacks: role.modelPolicy.fallbacks.map(strictTarget) } });
   const rootArchitecture = { config: input.config, role: strictRole(rootRole), participant: director };
   const rootTurn = async (kind: Stage, context: unknown) => {
-    check(); stage = kind; director.open(kind);
+    check(); stage = kind; progress(); director.open(kind);
     const result = await turnTeamWorker(input.team.evaluation.token, input.root.instanceId, prompt(kind, context));
     check();
     return { result, message: record(director.settle(result.status === "completed")) };
@@ -64,16 +72,18 @@ export function createConsultation(input: { team: Team; config: PitakoConfig; mo
       role: role.id, mandate, callerSessionId: caller.callerSessionId });
     let member: Member;
     const attached = capability({ get assignmentId() { return member.assignmentId; }, get memberId() { return member.memberId; } }, author);
-    member = admitTeamMember(input.team, { roleId: role.id, task: mandate, cwd: input.cwd, historyOrigin: caller,
+    try { member = admitTeamMember(input.team, { roleId: role.id, task: mandate, cwd: input.cwd, historyOrigin: caller,
       executor: backgroundExecutor(), architecture: { config: input.config, role: strictRole(role), participant: attached },
-      recipient: { kind: "protocol", settle() {} } });
+      recipient: { kind: "protocol", settle() {} } }); }
+    catch (error) { architectureFailure(input.observation, "admission", error, { stage: stage === "waiting" || stage === "closing" ? undefined : stage, round }); throw error; }
+    architectureMember(input.observation, member.memberId, author === "specialist" ? "specialist" : "support");
     return { member, attached };
   };
   const memberTurn = async (target: ReturnType<typeof internal>, kind: Stage, context: unknown) => {
-    check(); stage = kind; target.attached.open(kind);
+    check(); stage = kind; progress(); target.attached.open(kind);
     const result = await target.member.turn(prompt(kind, context));
     check();
-    return target.attached.settle(result.status === "completed");
+    return record(target.attached.settle(result.status === "completed"), false);
   };
   let pendingDoubts: Message["doubts"] = [];
   const resolveDoubts = async (sources: Message[], phase = "consultation") => {
@@ -117,6 +127,7 @@ export function createConsultation(input: { team: Team; config: PitakoConfig; mo
           return { id: target.member.assignmentId, status: "completed", message };
         } catch (error) {
           if (error instanceof AgentClosureError || !current()) throw error;
+          architectureFailure(input.observation, "turn", error, { memberId: target.member.memberId, assignmentId: target.member.assignmentId, stage: "consultation-response", round });
           return { id: target.member.assignmentId, status: "failed", error: String(error) };
         } finally { target.attached.revoke(); await target.member.finish(); }
       }));
@@ -153,14 +164,18 @@ export function createConsultation(input: { team: Team; config: PitakoConfig; mo
       }).map(({ model, reasoning }) => ({ model, reasoning }));
       return { choice, targets };
     });
+    for (const item of outgoing) architectureMember(input.observation, item.target.member.memberId, "specialist", undefined, composition.id);
     await joined(outgoing.map(async item => { item.target.attached.revoke(); await item.target.member.finish(); }));
     check();
     if (mode === "table" && finishing) return [];
-    return choices.map(({ choice, targets }) => ({ choice, active: true,
-      target: internal({ ...rootRole, modelPolicy: { ...rootRole.modelPolicy, primary: targets[0]!, fallbacks: targets.slice(1) } }, choice.mandate, "specialist") }));
+    return choices.map(({ choice, targets }) => {
+      const target = internal({ ...rootRole, modelPolicy: { ...rootRole.modelPolicy, primary: targets[0]!, fallbacks: targets.slice(1) } }, choice.mandate, "specialist");
+      architectureMember(input.observation, target.member.memberId, "specialist", composition.id);
+      return { choice, active: true, target };
+    });
   };
   const frontier = () => {
-    appliedControls.push(...controls.splice(0));
+    appliedControls.push(...consumeControls());
     sharedId = randomUUID();
     return { id: sharedId, round, controls: structuredClone(appliedControls), failures: structuredClone(failures),
       messages: structuredClone(messages.filter(message => ["preparation", "contribution", "knowledge"].includes(message.stage))) };
@@ -185,6 +200,7 @@ export function createConsultation(input: { team: Team; config: PitakoConfig; mo
       }
     }));
     failures.push(...stageFailures.filter(Boolean));
+    for (const failure of stageFailures.filter(Boolean)) architectureFailure(input.observation, "turn", failure.error, { memberId: failure.memberId, stage: failure.stage, round: failure.round });
     const published = outcomes.flatMap(message => message ? [record(message)] : []);
     pendingDoubts.push(...published.flatMap(message => message.doubts));
     return published;
@@ -224,10 +240,13 @@ export function createConsultation(input: { team: Team; config: PitakoConfig; mo
     snapshot, goal: input.goal, topic: input.topic, controls: appliedControls, context });
   return {
     snapshot, architecture: rootArchitecture,
-    control(action: "context" | "priorities" | "finish" | "stop", text?: string) {
+    control(action: "context" | "priorities" | "finish" | "stop", text?: string, toolCallId?: string) {
       if (state === "finished" || state === "failed" || state === "cancelled") throw new Error("architecture room is terminal");
       if (action === "stop") { stopping = true; director.revoke(); cancelTeamWorker(input.team.evaluation.token, input.root.instanceId); }
-      else { check(); if (action === "finish") finishing = true; else if (!text?.trim()) throw new Error("architecture context must not be empty"); controls.push({ action, text }); }
+      else { check(); if (action === "finish") finishing = true; else if (!text?.trim()) throw new Error("architecture context must not be empty"); controls.push({ action, text, captureId: undefined }); }
+      const id = toolCallId ? architectureControl(input.observation, action, text, toolCallId) : undefined;
+      if (action === "stop" || action === "finish") architectureControlApplied(input.observation, [id], stage, round);
+      else if (controls.length) controls[controls.length - 1]!.captureId = id;
       wake?.();
       return { roomId: input.team.teamId, state: stopping ? "stopping" : state };
     },
@@ -266,25 +285,25 @@ export function createConsultation(input: { team: Team; config: PitakoConfig; mo
       signal.addEventListener("abort", aborted, { once: true });
       let result: AgentRunResult = { instanceId: input.root.instanceId, role: "architect", status: "failed", model: { selectedModel: "unknown" }, result: "architecture did not finish" };
       try {
-        check(); state = "running";
+        check(); state = "running"; progress();
         if (mode === "table") await table();
         else {
           const specialists = await compose();
           const specialist = specialists[0]!;
-          let context: unknown = { mandate: specialist.choice.mandate, reason: specialist.choice.reason, controls: controls.splice(0) };
+          let context: unknown = { mandate: specialist.choice.mandate, reason: specialist.choice.reason, controls: consumeControls() };
           while (true) {
             const answer = record(await memberTurn(specialist.target, "answer", context));
             const knowledge = await resolveDoubts([answer]);
             check();
             publishIntermediate(input.team.evaluation.token, input.root.instanceId, input.team.teamId, answer.turnId, JSON.stringify({ answer, knowledge }));
-            stage = "waiting"; state = "waiting";
+            stage = "waiting"; state = "waiting"; progress();
             while (!controls.length && !finishing && !stopping && !signal.aborted) await new Promise<void>(resolve => { wake = resolve; });
             wake = undefined; check();
             if (finishing) break;
-            state = "running"; context = { controls: controls.splice(0), knowledge };
+            state = "running"; context = { controls: consumeControls(), knowledge };
           }
         }
-        const synthesis = await rootTurn("synthesis", { messages, failures, pendingDoubts, round, controls: [...appliedControls, ...controls.splice(0)],
+        const synthesis = await rootTurn("synthesis", { messages, failures, pendingDoubts, round, controls: [...appliedControls, ...consumeControls()],
           limit: limitReached ? "Round six is forbidden. Redesign remains pending; synthesis must be partial." : undefined });
         if (synthesis.message.body.kind !== "synthesis") throw new Error("invalid synthesis");
         const body = synthesis.message.body;
@@ -293,15 +312,18 @@ export function createConsultation(input: { team: Team; config: PitakoConfig; mo
           body.pending.push(limitReached ? "Round limit reached; redesign remains pending" : "One or more member turns failed");
         }
         result = { ...synthesis.result, status: body.status === "complete" ? "completed" : "failed", result: JSON.stringify(body) };
+        architectureCandidate(input.observation, result, body);
       } catch (error) {
+        architectureFailure(input.observation, "turn", error, { stage: stage === "waiting" || stage === "closing" ? undefined : stage, round });
         result = { ...result, status: stopping || signal.aborted ? "cancelled" : "failed", result: String(error) };
         if (error instanceof AgentClosureError) throw error;
       } finally {
-        stage = "closing"; director.revoke();
-        try { await disbandTeam(input.team).catch(error => { state = "closure-unknown"; throw error; }); }
+        stage = "closing"; progress(); director.revoke();
+        try { await disbandTeam(input.team).then(() => architectureMembersClosed(input.observation), error => { architectureMembersClosed(input.observation, error); state = "closure-unknown"; throw error; }); }
         finally { signal.removeEventListener("abort", aborted); }
       }
       state = result.status === "completed" ? "finished" : result.status;
+      progress();
       return result;
     },
   };

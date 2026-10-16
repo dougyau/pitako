@@ -1,3 +1,4 @@
+import { observeArchitectureBackground, architectureFailure, architectureRoom } from "../architecture/rooms.ts";
 import { receiptInBranch, offerEnvelope } from "./delivery.ts";
 import { PitakoConfigError } from "../errors.ts";
 import { createPiExecutor } from "./pi.ts";
@@ -120,6 +121,7 @@ interface Handoff extends WorkerHandoff {
 type SignalState = "pending" | "dropped";
 
 interface Row extends TeamMetadata {
+  architectureSelectedDriver?: AgentRunResult;
   recipient?: Recipient;
   intermediates?: Intermediate[];
   ready?: Promise<void>;
@@ -381,6 +383,7 @@ export async function spawnBackground(input: SpawnInput): Promise<WorkerHandle> 
     row = input.reservation;
     row.run = completion.promise;
     row.workerStarted = true;
+    observeArchitectureRow(row, true);
     row.dispatchPhase = "worker";
     row.interest = input.watch;
     row.reconcileBookkeeping = input.reconcileBookkeeping;
@@ -483,6 +486,10 @@ export function reserveBackground(input: {
       } catch (error) {
         if (!row.workerStarted) {
           let failure = error;
+          if (row.teamOwnerToken && row.teamId && row.coordinatorSessionId) {
+            const room = architectureRoom({ token: row.teamOwnerToken, sessionId: row.coordinatorSessionId }, row.teamId);
+            if (room?.instanceId === row.instanceId) architectureFailure(room, "preparation", error);
+          }
           try { await input.cleanup?.(); } catch (cleanup) { failure = new AgentClosureError([error, cleanup], "Background preparation"); }
           row.closure = failure instanceof AgentClosureError ? { state: "unknown", reason: failure.message } : { state: "released" };
           settle(row, { instanceId: row.instanceId, role: row.roleId,
@@ -494,6 +501,7 @@ export function reserveBackground(input: {
         ready.resolve();
         completion.resolve();
         releaseNoWorker(row);
+        observeArchitectureRow(row);
       }
     })();
   });
@@ -577,11 +585,17 @@ export async function finishTeamWorker(token: symbol, instanceId: string): Promi
       row.closure = { state: "released" };
       const result = driven ?? maintained.last ?? { instanceId, role: row.roleId, status: "cancelled" as const,
         model: { selectedModel: "unknown" }, result: "cancelled before first turn" };
+      row.architectureSelectedDriver = !row.controller.signal.aborted ? driven : undefined;
       settle(row, { ...result, usage: maintained.usage,
         ...(row.controller.signal.aborted ? { status: "cancelled", result: "cancelled" } : {}) }, observationEpoch());
       completion.resolve();
     } catch (error) {
       row.closure = { state: "unknown", reason: String(error) };
+      row.architectureSelectedDriver = undefined;
+      if (row.teamOwnerToken && row.teamId && row.coordinatorSessionId) {
+        const room = architectureRoom({ token: row.teamOwnerToken, sessionId: row.coordinatorSessionId }, row.teamId);
+        if (room?.instanceId === instanceId) architectureFailure(room, "director-close", error);
+      }
       settle(row, { instanceId, role: row.roleId, status: "failed", model: { selectedModel: "unknown" }, result: String(error) }, observationEpoch());
       completion.reject(error);
     } finally { maintained.completion.resolve(); }
@@ -855,11 +869,17 @@ export function interestFrom(plan: string | undefined, unit: string | undefined)
   return { planId, unitId };
 }
 
+function observeArchitectureRow(row: Row, running = false) {
+  observeArchitectureBackground({ token: row.teamOwnerToken, teamId: row.teamId, instanceId: row.instanceId,
+    workerStarted: row.workerStarted, preparationSettled: row.preparationSettled, closure: row.closure,
+    result: row.outcome, selectedDriver: row.architectureSelectedDriver, running });
+}
 function settle(row: Row, result: AgentRunResult, epoch: number): void {
   const state = bag();
   const current = state.rows.get(row.instanceId);
   if (current !== row) return;
   current.outcome = result;
+  observeArchitectureRow(current);
   current.dispatchPhase = "settled";
   current.consultation?.event("outcome", current.workerStarted
     ? { workerStarted: true, status: result.status, instanceId: result.instanceId, model: result.model, usage: result.usage }

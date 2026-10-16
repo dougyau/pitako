@@ -77,7 +77,8 @@ test("foreground publishes protocol 2 without permission flags or mutation capab
     const client = await connect(file, { expectedSessionId: "owner" });
     try {
       expect(client.capabilities).toEqual(["workers.list", "workers.detail", "workers.requests", "workers.activity", "workers.result", "subscribe", "unsubscribe",
-        "history.list", "history.read", "route.read", "workers.detail.public-v1", "workers.activity.public-v1", "workers.result.public-v1"]);
+        "history.list", "history.read", "route.read", "workers.detail.public-v1", "workers.activity.public-v1", "workers.result.public-v1",
+        "architecture.list", "architecture.read", "architecture.public-v1"]);
       expect((await client.list()).items).toEqual([]);
     }
     finally { await client.disconnect(); }

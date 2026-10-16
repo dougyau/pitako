@@ -102,18 +102,25 @@ export async function connect(descriptorPath, { expectedSessionId, resume } = {}
       socket.write(data);
     });
   };
-  let lease;
+  let lease, negotiatedCapabilities;
   try {
     const connected = await request("connect", { token: descriptor.token, expectedSessionId,
       ...(resume === undefined ? {} : { resumeToken: resume.resumeToken }) });
     lease = Object.freeze(connected.lease);
+    negotiatedCapabilities = Object.freeze(connected.capabilities);
   } catch (error) {
     fail(error); await closed; throw error;
   }
   return Object.freeze({
     owner: Object.freeze({ ...descriptor.owner }),
-    capabilities: Object.freeze(descriptor.capabilities),
+    capabilities: negotiatedCapabilities,
     lease,
+    listArchitectures: cursor => negotiatedCapabilities.includes("architecture.public-v1")
+      ? request("architecture.list", { ...(cursor === undefined ? {} : { cursor }) })
+      : Promise.reject(new BridgeError("unsupported_method", "Architecture public-v1 is not available")),
+    readArchitecture: (ref, cursor) => negotiatedCapabilities.includes("architecture.public-v1")
+      ? request("architecture.read", { ref, ...(cursor === undefined ? {} : { cursor }) })
+      : Promise.reject(new BridgeError("unsupported_method", "Architecture public-v1 is not available")),
     list: (after, revision) => request("workers.list", { ...(after === undefined ? {} : { after }),
       ...(revision === undefined ? {} : { revision }) }),
     async subscribe(listener) {

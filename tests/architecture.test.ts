@@ -16,6 +16,66 @@ const { fixture, setup, policies, configuration } = architectureFixture();
 const deferred = <T = void>() => Promise.withResolvers<T>();
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
 
+test("registered start publishes Markdown guidance and preserves the original brief in prompts and active root observation", fixture.ownedCase("architecture original Markdown", async () => {
+  const goal = ["\n# Revisión 🧠", "", "## Objective", 'Preserve café, cafe\u0301 and "quoted text".  ',
+    "", "## Expected result", "Keep the submitted source unchanged.\r\n", "## Context", "```json",
+    String.raw`{"path":"C:\\work\\draft","quote":"\"literal\""}`, "```", "",
+    "- Context with Unicode 日本語 and a [reference](https://example.test/draft).\n".repeat(30), " \n"].join("\n");
+  const compositionEntered = deferred(), releaseComposition = deferred(), controlledKnowledge = deferred(), releaseKnowledge = deferred();
+  const release = () => { releaseComposition.resolve(); releaseKnowledge.resolve(); };
+  fixture.finishOnCleanup(release);
+  let knowledgeTurns = 0;
+  const s = await setup({ async prompt(_session, request) {
+    if (request.stage === "composition") { compositionEntered.resolve(); await releaseComposition.promise; }
+    if (request.stage === "knowledge" && ++knowledgeTurns === 2) { controlledKnowledge.resolve(); await releaseKnowledge.promise; }
+  } });
+  try {
+    const definition = s.tools.get("architecture_start"), schema = definition.parameters.properties;
+    expect(schema.goal.type).toBe("string"); expect(schema.goal.minLength).toBe(1);
+    for (const guidance of [definition.description, schema.goal.description]) {
+      for (const phrase of ["Markdown", "original language", "short title", "objective", "expected result", "context", "questions", "restrictions", "references", "short paragraphs and lists", "not validation", "plain text remains valid", "without conversion or normalization"])
+        expect(guidance).toContain(phrase);
+    }
+    for (const name of ["topic", "plan", "unit", "boardTopicId"]) expect(schema[name].description).toBeUndefined();
+    const start = await s.invoke("architecture_start", { mode: "consultation", goal });
+    expect(start.isError).not.toBe(true);
+    await compositionEntered.promise;
+    const rootSession = s.host.sessions.find(session => session.prompts.some(text => JSON.parse(text).stage === "composition"))!;
+    const readOriginal = async () => {
+      let briefOffset: number | null = 0, original = "", pages = 0;
+      while (briefOffset !== null) {
+        const observed = await s.invoke("agent_observe", { target: { kind: "team", assignmentId: start.details.assignmentId }, briefOffset });
+        expect(observed.isError).not.toBe(true);
+        const page = observed.details;
+        expect(page.active).toBe(true); expect(page.sessionId).toBe(rootSession.sessionId);
+        expect(page.workbrief.source).toBe("original WorkBrief");
+        expect(page.workbrief.offset).toBe(briefOffset);
+        original += page.workbrief.text; pages++;
+        if (page.workbrief.nextOffset !== null) expect(page.workbrief.nextOffset).toBeGreaterThan(briefOffset);
+        briefOffset = page.workbrief.nextOffset;
+      }
+      expect(pages).toBeGreaterThan(1);
+      expect(original).toBe(goal);
+    };
+    await readOriginal();
+    releaseComposition.resolve(); await s.knowledge[0]!.promise; await tick();
+    const answer = s.seen.find(item => item.request.stage === "answer")!;
+    expect(answer.session).not.toBe(rootSession);
+    expect(answer.request.context.mandate).toBe("Review security");
+    expect(answer.request.context.mandate).not.toBe(goal);
+    const control = "Different priorities: do not replace the original brief.";
+    expect((await s.invoke("architecture_control", { roomId: start.details.roomId, action: "context", text: control })).isError).not.toBe(true);
+    await controlledKnowledge.promise;
+    await readOriginal();
+    expect(s.seen.filter(item => item.request.stage === "answer").at(-1)!.request.context.controls).toContainEqual({ action: "context", text: control });
+    releaseKnowledge.resolve(); await s.knowledge[1]!.promise; await tick();
+    await s.invoke("architecture_control", { roomId: start.details.roomId, action: "finish" }); await s.delivered.promise;
+    for (const { request } of s.seen) expect(request.goal).toBe(goal);
+    expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("completed");
+    expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
+  } finally { release(); await s.close(); }
+}));
+
 test("registered watched consultation delivers two intermediate turns, preserves owner/history/holds, then one terminal synthesis after disband", fixture.ownedCase("architecture full route", async () => {
   const disposing = deferred(), release = deferred(); fixture.finishOnCleanup(release.resolve);
   const s = await setup({ busy: true, async dispose(session) { if (session.prompts.some((text: string) => JSON.parse(text).stage === "answer")) { disposing.resolve(); await release.promise; } } });
