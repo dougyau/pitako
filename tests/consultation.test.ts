@@ -10,7 +10,7 @@ import { registerAgentSupervise } from "../extensions/herdr/supervise.ts";
 import agentInstance from "../extensions/agent/index.ts";
 import { bindBackgroundOwner, clearBackgroundOwner, setBackgroundExecutor, observeWorkerResults, cancelAllWorkers,
   workerStatus, workerHandoff, shutdownBackground } from "../extensions/agent/background.ts";
-import { beginTeamEvaluation, retireTeamEvaluation, teamRoleReservation } from "../extensions/team.ts";
+import { beginTeamEvaluation, retireTeamEvaluation, firstTeamReservation } from "../extensions/team.ts";
 import { consultationSnapshot } from "../extensions/agent/consultation.ts";
 import { consultationStats, queryHistory } from "../extensions/agent/history-query.ts";
 import { WorkerHistory } from "../extensions/agent/history.ts";
@@ -84,7 +84,7 @@ test("independent consultative policies and no premature synchronous/future expo
     expect(s.tools.has("consultation_feedback")).toBe(true);
     expect(() => consultationSnapshot("developer", { mode: "classify" }, s.root)).toThrow("only available");
     const status = await s.invoke("team_status", {});
-    expect(status.details.roles.map((row: any) => row.role)).toEqual(["architect", "developer", "reviewer", "researcher", "scout", "oracle"]);
+    expect(status.details.members).toEqual([]);
   } finally { await cleanup(s); }
 }));
 
@@ -98,7 +98,7 @@ test("registered Team no-worker cancellation persists caller evidence and releas
     expect(handle.details.dispatchPhase).toBe("preflight");
     expect(starts).toBe(0);
     const status = await s.invoke("team_status", { assignmentId: handle.details.id });
-    expect(status.details.roles[0].status).toBe("running"); // independent action, same foreground turn
+    expect(status.details.members[0].status).toBe("running"); // independent action, same foreground turn
     toolSignal.abort();
     await s.invoke("team_cancel", { assignmentId: handle.details.id });
     await s.delivered.promise;
@@ -106,13 +106,12 @@ test("registered Team no-worker cancellation persists caller evidence and releas
     expect(s.messages).toHaveLength(1);
     expect(s.messages[0].details).toMatchObject({ workerStarted: false, status: "cancelled" });
     expect(workerHandoff(handle.details.instanceId)?.delivery).toBe("offered");
-    expect(teamRoleReservation(s.evaluation, "scout")).toBe(handle.details.id);
-    expect((await s.invoke("team_assign", { role: "scout", task: "blocked" })).isError).toBe(true);
+    expect(firstTeamReservation(s.evaluation, "scout")).toBe(handle.details.id); // Pending receipt retains this member, not a role slot.
     const groups = new WorkerHistory().list();
     expect(groups.flatMap(group => group.members)).toEqual([]);
     expect(groups.flatMap(group => group.consultations ?? [])).toHaveLength(1);
     s.commit();
-    expect(teamRoleReservation(s.evaluation, "scout")).toBeUndefined();
+    expect(firstTeamReservation(s.evaluation, "scout")).toBeUndefined();
     const recovered = await consultationStats(s.sessionId, handle.details.dispatchId, s.root);
     expect(recovered.rows[0]).toMatchObject({ evidence: "physically-persisted", truncated: false });
     expect((recovered.rows[0] as any).events.map((event: any) => event.event)).toEqual(["decision", "preparation", "outcome", "closure", "delivery"]);
@@ -188,7 +187,7 @@ for (const tool of ["agent_spawn", "team_assign"] as const) {
       await disposing.promise;
       expect(closed).toBe(false);
       expect(nativeEvents().filter(event => event.event === "delivery")).toEqual([]);
-      if (tool === "team_assign") expect(teamRoleReservation(s.evaluation, "scout")).toBe(handle.details.id);
+      if (tool === "team_assign") expect(firstTeamReservation(s.evaluation, "scout")).toBe(handle.details.id);
       disposed.resolve(); await retirement;
       expect(host.sessions[0]!.prompts).toEqual([]);
       expect(host.sessions[0]!.events).toContain("dispose");
@@ -200,7 +199,7 @@ for (const tool of ["agent_spawn", "team_assign"] as const) {
       expect(recovered.rows[0]).toMatchObject({ dispatchId: handle.details.dispatchId, evidence: "physically-persisted" });
       expect((recovered.rows[0] as any).events.filter((event: any) => event.event === "delivery")).toEqual([expect.objectContaining(dropped)]);
       if (tool === "agent_spawn") expect(() => workerStatus(handle.details.instanceId)).toThrow("unknown worker");
-      else expect(teamRoleReservation(s.evaluation, "scout")).toBeUndefined();
+      else expect(firstTeamReservation(s.evaluation, "scout")).toBeUndefined();
       await shutdownBackground(s.evaluation.token); await retireTeamEvaluation(s.evaluation);
       expect(nativeEvents().filter(event => event.event === "delivery")).toHaveLength(1);
     } finally {
@@ -217,11 +216,11 @@ test("registered Team retirement before preparation records the original caller 
     const retirement = retireTeamEvaluation(s.evaluation);
     bindBackgroundOwner({ token: Symbol("replacement"), isIdle: () => true, hasUI: false,
       notify() {}, sendMessage() { throw new Error("retargeted"); }, appendResult() { throw new Error("retargeted"); } });
-    expect(teamRoleReservation(s.evaluation, "scout")).toBe(handle.details.id);
+    expect(firstTeamReservation(s.evaluation, "scout")).toBe(handle.details.id);
     await retirement;
     expect(starts).toBe(0);
     expect(s.messages).toEqual([]);
-    expect(teamRoleReservation(s.evaluation, "scout")).toBeUndefined();
+    expect(firstTeamReservation(s.evaluation, "scout")).toBeUndefined();
     const groups = new WorkerHistory(s.root).list();
     expect(groups.flatMap(group => group.members)).toEqual([]);
     const recovered = await consultationStats(s.sessionId, handle.details.dispatchId, s.root);
@@ -229,7 +228,7 @@ test("registered Team retirement before preparation records the original caller 
     expect((recovered.rows[0] as any).events.filter((event: any) => event.event === "delivery"))
       .toEqual([expect.objectContaining({ event: "delivery", dispatchId: handle.details.dispatchId, role: "scout", data: { state: "dropped" } })]);
     await retireTeamEvaluation(s.evaluation);
-    expect(teamRoleReservation(s.evaluation, "scout")).toBeUndefined();
+    expect(firstTeamReservation(s.evaluation, "scout")).toBeUndefined();
   } finally { await cleanup(s); }
 }));
 

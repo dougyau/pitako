@@ -75,6 +75,7 @@ export interface WatchdogSnapshot {
 }
 
 export interface AgentRequestObservation {
+  turnId?: string;
   attemptId?: string;
   historyId?: string;
   sessionId?: string;
@@ -95,6 +96,7 @@ export interface AgentRequestObservation {
 
 export interface AgentRunResult {
   instanceId: string;
+  turnId?: string;
   role: string;
   status: Exclude<AgentStatus, "created" | "running">;
   model: AgentModelProvenance;
@@ -135,10 +137,15 @@ export interface Attempt {
   session?: AttemptSession;
 }
 
+export type AttemptTurn = Pick<Parameters<AttemptExecutor["start"]>[0],
+  "turnId" | "attemptId" | "task" | "target" | "signal" | "onActivity" | "onActivated" | "onRequest" | "bindActivityProbe" | "participant">;
+
 export interface AttemptSession {
+  /** A new host-admitted logical turn, not a provider retry. */
+  turn?(input: AttemptTurn): Promise<Attempt>;
   retryBeforePrompt?(target: ModelTarget, signal: AbortSignal): Promise<Attempt>;
-  continueWith(target: ModelTarget, note: string, signal: AbortSignal): Promise<Attempt>;
-  dispose(): Promise<void>;
+  continueWith(target: ModelTarget, note: string, signal: AbortSignal, operation?: AttemptTurn): Promise<Attempt>;
+  dispose(signal?: AbortSignal): Promise<void>;
 }
 
 export interface AttemptExecutor {
@@ -146,6 +153,8 @@ export interface AttemptExecutor {
   capturesPublicConversation?: boolean;
   start(input: {
     instanceId: string;
+    turnId?: string;
+    attemptId?: string;
     role: ResolvedRole;
     task: string;
     target: ModelTarget;
@@ -156,6 +165,7 @@ export interface AttemptExecutor {
     /** Host-only acknowledgment for one Head-owned leaf; never grants orchestration. */
     scope?: LeafScopeAttachment;
     consultant?: import("./head/runtime.ts").ConsultationAttachment;
+    participant?: import("../architecture/types.ts").Participant;
     history?: InvocationHistory;
     onActivity?: (event: ActivityEvent) => void;
     /** Fired only after setModel / session open succeeds. Not a second lifecycle. */
@@ -198,7 +208,7 @@ async function runAttempt(
           sideEffects: true,
         };
       }
-      return await session.continueWith(input.target, SIDE_EFFECT_NOTE, input.signal);
+      return await session.continueWith(input.target, SIDE_EFFECT_NOTE, input.signal, input);
     }
     if (session?.retryBeforePrompt) return await session.retryBeforePrompt(input.target, input.signal);
     await session?.dispose();
@@ -243,7 +253,7 @@ export function skillNamesForRole(role: ResolvedRole): string[] {
   return ["pitako-coding", "ponytail", "caveman", ...role.skills, ...role.principles];
 }
 
-export async function runAgentInstance(input: {
+export interface AgentRunInput {
   roleId: string;
   task: string;
   cwd: string;
@@ -255,6 +265,7 @@ export async function runAgentInstance(input: {
   historyOrigin?: HistoryOrigin;
   dispatch?: import("./routing.ts").DispatchSnapshot;
   consultation?: import("./consultation.ts").ConsultationSnapshot;
+  architecture?: { config: import("../roles/types.ts").PitakoConfig; role: ResolvedRole; participant: import("../architecture/types.ts").Participant };
   reservedInstanceId?: string;
   head?: HeadAttachment;
   /** Test clock. Production uses Date.now. */
@@ -268,16 +279,100 @@ export async function runAgentInstance(input: {
   onObserve?: (snapshot: AgentUiSnapshot) => void;
   /** Synchronous accept hook. Runs before watchdog setup and the first await. */
   onAccepted?: (instance: AgentInstance) => void;
-}): Promise<AgentRunResult> {
+}
+
+interface ConversationState {
+  instance?: AgentInstance;
+  history?: InvocationHistory;
+  session?: AttemptSession;
+  turn: number;
+  attempt: number;
+}
+
+/** Owns native resources across turns. Busy includes the outer prompt and its callbacks. */
+export function createConversationOwner(input: AgentRunInput) {
+  input = { ...input, reservedInstanceId: input.reservedInstanceId ?? createInstanceId(input.roleId) };
+  const state: ConversationState = { turn: 0, attempt: 0 };
+  const lifetime = new AbortController();
+  let active: Promise<AgentRunResult> | undefined;
+  let closing: Promise<void> | undefined;
+  let revoked = false;
+  let closureFailure: AgentClosureError | undefined;
+  const abort = () => {
+    revoked = true;
+    input.head?.revoke();
+    lifetime.abort();
+  };
+  const stopParent = input.signal ? watchAbort(input.signal, abort) : () => {};
+  return {
+    get instanceId() { return state.instance?.id ?? input.reservedInstanceId; },
+    get busy() { return active !== undefined; },
+    turn(task = input.task, options: Partial<Pick<AgentRunInput, "signal" | "onObserve" | "onPresent">> = {}): Promise<AgentRunResult> {
+      // Preserve one-shot pre-abort: its first operation reports cancellation without starting an executor.
+      if (closing || revoked && !(state.turn === 0 && input.signal?.aborted))
+        return Promise.reject(new Error("Agent conversation is closing"));
+      if (active) return Promise.reject(new Error("Agent conversation is busy"));
+      const signal = options.signal ? AbortSignal.any([lifetime.signal, options.signal]) : lifetime.signal;
+      const turnId = `${input.reservedInstanceId ?? state.instance?.id ?? "turn"}:turn:${++state.turn}`;
+      // Busy is installed before preparation, including synchronous observers.
+      const completion = Promise.withResolvers<AgentRunResult>();
+      const pending = completion.promise;
+      active = pending;
+      void runConversationTurn({ ...input, ...options, task, signal }, state, turnId).then(completion.resolve, completion.reject);
+      void pending.then(
+        result => { if (result.status === "cancelled") abort(); active = undefined; },
+        error => { if (error instanceof AgentClosureError) { closureFailure = error; abort(); } active = undefined; },
+      );
+      return pending;
+    },
+    abort,
+    close(): Promise<void> {
+      if (closing) return closing;
+      abort();
+      closing = (async () => {
+        const failures: unknown[] = closureFailure ? [closureFailure] : [];
+        try { await active; } catch (error) { if (error instanceof AgentClosureError) failures.push(error); }
+        const closures = await Promise.allSettled([input.head?.close(), state.session?.dispose(input.signal)]);
+        failures.push(...closures.flatMap(result => result.status === "rejected" ? [result.reason] : []));
+        stopParent();
+        if (failures.length) {
+          const error = new AgentClosureError(failures, `AgentInstance ${state.instance?.id ?? "startup"}`);
+          input.head?.retainUnknown(error);
+          throw error;
+        }
+        state.history?.settled();
+      })();
+      return closing;
+    },
+  };
+}
+
+/** One-shot, including Head: close before handing off the result. */
+export async function runAgentInstance(input: AgentRunInput): Promise<AgentRunResult> {
+  const owner = createConversationOwner(input);
+  let result: AgentRunResult;
+  try { result = await owner.turn(); } finally { await owner.close(); }
+  if (input.head?.dag) {
+    result.head = input.head.dag.handoff(result);
+    if (result.status === "completed" || (result.status === "cancelled" && !input.signal?.aborted &&
+        input.head.dag.finishStatus === "failed")) {
+      result.status = result.head.finish.status;
+      result.result = result.head.finish.status === "completed" ? result.head.finish.summary : result.head.finish.diagnostic;
+    }
+  }
+  return result;
+}
+
+async function runConversationTurn(input: AgentRunInput, state: ConversationState, turnId: string): Promise<AgentRunResult> {
   const task = input.task.trim();
   if (task.trim().length === 0) throw new PitakoConfigError("agent_run task must not be empty");
   const workspace = currentWorkspace(input.cwd);
   if (input.executionRoot !== undefined && workspace !== input.executionRoot) {
     throw new PitakoConfigError(`AgentInstance workspace drift: expected ${input.executionRoot}, got ${workspace}`);
   }
-  const loaded = input.head?.dag?.configSnapshot ?? input.dispatch?.config ?? input.consultation?.config ?? loadPitakoConfig(input.load);
+  const loaded = input.head?.dag?.configSnapshot ?? input.dispatch?.config ?? input.consultation?.config ?? input.architecture?.config ?? loadPitakoConfig(input.load);
   const role = input.head?.dag ? resolveDeveloperHeadFromConfig(input.head.dag.configSnapshot)
-    : input.dispatch?.role ?? input.consultation?.role ?? resolveRoleFromConfig(loaded, input.roleId);
+    : input.dispatch?.role ?? input.consultation?.role ?? input.architecture?.role ?? resolveRoleFromConfig(loaded, input.roleId);
   if (role.id !== input.roleId && !(input.head?.dag && input.roleId === "developer")) {
     throw new PitakoConfigError("dispatch snapshot role does not match runner role");
   }
@@ -285,7 +380,7 @@ export async function runAgentInstance(input: {
     throw new PitakoConfigError(role.modelPolicy.diagnostic ?? `model policy "${role.modelPolicyId}" has no primary target`);
   }
   const targets = [role.modelPolicy.primary, ...role.modelPolicy.fallbacks];
-  const instance: AgentInstance = {
+  const instance: AgentInstance = state.instance ?? {
     id: input.reservedInstanceId ?? createInstanceId(role.id),
     roleId: input.roleId,
     workspace,
@@ -299,18 +394,19 @@ export async function runAgentInstance(input: {
     },
     createdAt: new Date().toISOString(),
   };
+  state.instance = instance;
   const origin: HistoryOrigin | undefined = input.head?.dag || input.historyOrigin ? structuredClone({
-    ...input.historyOrigin, source: input.historyOrigin?.source ?? "agent_run",
+    ...input.historyOrigin, source: input.historyOrigin?.source ?? "agent_run", turnId,
     workbrief: input.historyOrigin?.workbrief ?? input.task,
     ...(input.head ? { assignmentId: input.head.assignmentId,
       head: { assignmentId: input.head.assignmentId, headInstanceId: instance.id } } : {}),
   }) : undefined;
-  if (input.head) {
+  if (input.head && state.turn === 1) {
     if (input.roleId !== "developer") throw new PitakoConfigError("Head attachment requires a Developer assignment");
     input.head.claim(instance.id, workspace);
     input.head.captureOrigin(origin);
   }
-  try { input.onAccepted?.(instance); } catch (error) {
+  try { if (state.turn === 1) input.onAccepted?.(instance); } catch (error) {
     await input.head?.close();
     throw error;
   }
@@ -349,7 +445,7 @@ export async function runAgentInstance(input: {
     if (!input.onObserve) return;
     try {
       input.onObserve({ ...observationOf(instance, task, activity, throughput, work, acceptedAt, terminalAt, now(), view.usage),
-        origin, attemptId, activated, sdkRequests: sdkRequests.map(request => ({ ...request })), sdkRequestsDropped });
+        origin, turnId, attemptId, activated, sdkRequests: sdkRequests.map(request => ({ ...request })), sdkRequestsDropped });
     } catch {
       // Observation must not change fallback, cancellation, or stall behavior.
     }
@@ -413,6 +509,7 @@ export async function runAgentInstance(input: {
     refresh();
   };
   const onRequest = (request: AgentRequestObservation) => {
+    request.turnId = turnId;
     request.attemptId = attemptId;
     sdkRequests.push(request);
     if (sdkRequests.length > 50) { sdkRequests.shift(); sdkRequestsDropped++; }
@@ -421,7 +518,7 @@ export async function runAgentInstance(input: {
   refresh();
   try {
     // Publish accepted provenance before history/SDK setup can fail or await.
-    history = input.executor.capturesHistory ? new InvocationHistory(instance.cwd, origin, input.task) : undefined;
+    history = state.history ??= input.executor.capturesHistory ? new InvocationHistory(instance.cwd, origin, input.task) : undefined;
     const result = await agentScope.run({ instanceId: instance.id, roleId: role.id }, () =>
       executeTargets(
         instance,
@@ -437,7 +534,7 @@ export async function runAgentInstance(input: {
         onActivity,
         onActivated,
         onRequest,
-        (index) => { attemptId = `${instance.id}:${index + 1}`; activated = undefined; },
+        () => { attemptId = `${instance.id}:${++state.attempt}`; activated = undefined; },
         refresh,
         view,
         bindActivityProbe,
@@ -448,22 +545,15 @@ export async function runAgentInstance(input: {
         },
         history,
         input.head,
+        state,
+        input.architecture?.participant,
       ),
     );
     if (history && !history.admitted) history.admit(instance.id, role.id, targets[0]!).result({
       status: result.status, result: result.result,
       error: result.status === "failed" ? result.result : undefined, sideEffects: false,
     });
-    history?.settled();
-    if (input.head?.dag) {
-      result.head = input.head.dag.handoff(result);
-      if (result.status === "completed" || (result.status === "cancelled" && !input.signal?.aborted &&
-          input.head.dag.finishStatus === "failed")) {
-        result.status = result.head.finish.status;
-        result.result = result.head.finish.status === "completed" ? result.head.finish.summary : result.head.finish.diagnostic;
-        instance.status = result.status;
-      }
-    }
+    result.turnId = turnId;
     return result;
   } catch (error) {
     instance.status = "failed";
@@ -474,7 +564,6 @@ export async function runAgentInstance(input: {
   } finally {
     timer.stop();
     stopParent();
-    await input.head?.close();
   }
 }
 
@@ -501,13 +590,15 @@ async function executeTargets(
   markTerminal: (at: number) => void,
   history?: InvocationHistory,
   head?: HeadAttachment,
+  owner?: ConversationState,
+  participant?: import("../architecture/types.ts").Participant,
 ): Promise<AgentRunResult> {
   instance.status = "running";
-  let session: AttemptSession | undefined;
-  let sideEffects = false;
+  let session = owner?.session;
+  let sideEffects = Boolean(session && owner && owner.turn > 1);
   let lastError = "no model target could be used";
   let usage: AgentUsage | undefined;
-  const preserveUnknownUsage = Boolean(head || history?.origin?.head || history?.origin?.consultation);
+  const preserveUnknownUsage = Boolean(owner || head || history?.origin?.head || history?.origin?.consultation);
   let missingUsage = false;
   const requests: AgentRequestObservation[] = [];
   const done = (
@@ -537,8 +628,10 @@ async function executeTargets(
       resetThroughput(throughput);
       view.error = undefined;
       present();
-      const attempt = await runAttempt(sideEffects, session, executor, {
+      const operation = {
         instanceId: instance.id,
+        turnId: owner ? `${instance.id}:turn:${owner.turn}` : undefined,
+        attemptId: owner ? `${instance.id}:${owner.attempt}` : undefined,
         role,
         task,
         target,
@@ -550,20 +643,26 @@ async function executeTargets(
         bindActivityProbe,
         history,
         head,
-      });
+        participant,
+      };
+      const attempt = index === 0 && session && owner && owner.turn > 1
+        ? session.turn ? await session.turn(operation) : { status: "failed" as const, result: "", error: "session cannot accept a new logical turn", sideEffects: false, session }
+        : await runAttempt(sideEffects, session, executor, operation);
       bindActivityProbe(undefined);
       missingUsage ||= preserveUnknownUsage && attempt.usage === undefined;
       usage = missingUsage ? undefined : mergeUsage(usage, attempt.usage, preserveUnknownUsage);
       if (attempt.requests) requests.push(...attempt.requests);
       session = attempt.session ?? session;
+      if (owner) owner.session = session;
       const stall = stalled();
       if (stall && !parentSignal?.aborted) {
         return done("failed", formatStall(stall), target, index);
       }
-      sideEffects = sideEffects || attempt.sideEffects || head?.sideEffects === true;
+      sideEffects = sideEffects || attempt.sideEffects || head?.sideEffects === true || !!(participant && session && !session.retryBeforePrompt);
       view.usage = usage;
       if (attempt.appliedReasoning !== undefined) instance.model.appliedReasoning = attempt.appliedReasoning;
       present();
+      if (participant?.failure) return done("failed", participant.failure, target, index);
       if (attempt.status === "completed") {
         return done("completed", attempt.result, target, index);
       }
@@ -588,13 +687,7 @@ async function executeTargets(
     }
     return done("failed", lastError, targets[targets.length - 1], targets.length - 1);
   } finally {
-    const closures = await Promise.allSettled([head?.close(), session?.dispose()]);
-    const failures = closures.flatMap(result => result.status === "rejected" ? [result.reason] : []);
-    if (failures.length) {
-      const error = new AgentClosureError(failures, `AgentInstance ${instance.id}`);
-      head?.retainUnknown(error);
-      throw error;
-    }
+    if (owner) owner.session = session;
   }
 }
 

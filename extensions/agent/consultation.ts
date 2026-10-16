@@ -124,9 +124,22 @@ export async function prepareConsultation(snapshot: ConsultationSnapshot, task: 
   return next;
 }
 
+/** Captured only at a native inline-extension boundary; no synthetic ExtensionContext. */
+export function nativeCaller(pi: Pick<ExtensionAPI, "appendEntry">, ctx: Pick<ExtensionContext, "sessionManager">, current: () => boolean) {
+  const manager = ctx.sessionManager, sessionId = manager.getSessionId?.(), sessionFile = manager.getSessionFile?.();
+  const check = () => {
+    if (!current() || ctx.sessionManager !== manager || manager.getSessionId?.() !== sessionId || manager.getSessionFile?.() !== sessionFile)
+      throw new Error("native caller binding retired");
+  };
+  return { manager, sessionId, sessionFile, check,
+    append(type: string, data: unknown) { check(); pi.appendEntry(type, data); } };
+}
+export type NativeCaller = ReturnType<typeof nativeCaller>;
+
 /** Host-owned caller index. Native entries, not this catalog, remain the evidence. */
 export function consultationRecord(pi: ExtensionAPI, ctx: ExtensionContext, origin: HistoryOrigin,
   dispatchId: string, instanceId: string, snapshot: ConsultationSnapshot, current: () => boolean, decisionId = randomUUID(), caller = ctx.sessionManager) {
+  const capability = nativeCaller(pi, ctx, current);
   const callerSessionId = caller?.getSessionId?.();
   const callerSessionFile = caller?.getSessionFile?.();
   const retirementAuthorized = !!callerSessionId && !!callerSessionFile &&
@@ -149,7 +162,8 @@ export function consultationRecord(pi: ExtensionAPI, ctx: ExtensionContext, orig
           callerSessionFile !== locator.callerSessionFile) throw new Error("caller binding retired; native event not appended");
       const record = { version: 1, event, dispatchId, role: snapshot.role.id, at: new Date().toISOString(), data };
       if (Buffer.byteLength(JSON.stringify(record)) > 262144) throw new Error("consultation record exceeds native budget");
-      pi.appendEntry("pitako.consultation", record);
+      if (authorized === current) capability.append("pitako.consultation", record);
+      else pi.appendEntry("pitako.consultation", record);
       return true;
     } catch (error) { gap(error); return false; }
   };

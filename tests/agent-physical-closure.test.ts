@@ -3,14 +3,17 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { bindBackgroundOwner, cancelTeamWorker, spawnBackground, teamWorkerStatus, reserveBackground, observeWorkerResults } from "../extensions/agent/background.ts";
+import { setBackgroundExecutor, clearBackgroundOwner, workerHandoff, bindBackgroundOwner, cancelTeamWorker, spawnBackground, teamWorkerStatus, reserveBackground, observeWorkerResults } from "../extensions/agent/background.ts";
 import { AgentClosureError } from "../extensions/agent/closure.ts";
 import { createPiExecutor } from "../extensions/agent/pi.ts";
 import { HeadAttachment } from "../extensions/agent/head/runtime.ts";
 import { runAgentInstance } from "../extensions/agent/run.ts";
 import { WorkerHistory } from "../extensions/agent/history.ts";
 import { subscribeChanges } from "../extensions/agent/observe.ts";
-import { beginTeamEvaluation, reserveTeamRole, retireTeamEvaluation, teamRoleReservation } from "../extensions/team.ts";
+import { beginTeamEvaluation, reserveTeamMember, retireTeamEvaluation, firstTeamReservation, createTeam, admitTeamMember, disbandTeam } from "../extensions/team.ts";
+import { architectureFixture } from "./fixtures/architecture.ts";
+import { openBoard } from "../extensions/board/store.ts";
+import { planFile, readLedgerTeamHolds } from "../extensions/workflow.ts";
 import { controlledPi } from "./fixtures/pi-factories.ts";
 
 // Intentional unknown owners remain referenced; only their isolated global bindings are restored.
@@ -45,18 +48,18 @@ function setup() {
 
 test("reentrant retirement at startup joins the accepted worker before releasing its reservation", async () => {
   const env = setup(), evaluation = beginTeamEvaluation("reentrant-start", false)!;
-  const reservation = reserveTeamRole(evaluation, "developer", "starting-assignment");
+  const reservation = reserveTeamMember(evaluation, "developer", "starting-assignment");
   let retirement: Promise<void> | undefined, starts = 0, heldReservation: string | undefined;
   const head = new HeadAttachment("starting-assignment", env.root);
   let lateReservationError: unknown;
   head.signal.addEventListener("abort", () => {
-    try { reserveTeamRole(evaluation, "reviewer", "late-assignment"); } catch (error) { lateReservationError = error; }
+    try { reserveTeamMember(evaluation, "reviewer", "late-assignment"); } catch (error) { lateReservationError = error; }
   }, { once: true });
   bindBackgroundOwner({ token: evaluation.token, sessionId: evaluation.sessionId, isIdle: () => false, hasUI: false, notify() {}, sendMessage() {} });
   const unsubscribe = subscribeChanges(() => {
     if (retirement) return;
     retirement = retireTeamEvaluation(evaluation);
-    heldReservation = teamRoleReservation(evaluation, "developer");
+    heldReservation = firstTeamReservation(evaluation, "developer");
   });
   try {
     await spawnBackground({ roleId: "developer", task: "starting", cwd: env.root, load: env.load, head,
@@ -68,7 +71,7 @@ test("reentrant retirement at startup joins the accepted worker before releasing
     expect(String(lateReservationError)).toContain("stale Team evaluation");
     expect(starts).toBe(0);
     expect(teamWorkerStatus(evaluation.token)).toEqual([]);
-    expect(teamRoleReservation(evaluation, "developer")).toBeUndefined();
+    expect(firstTeamReservation(evaluation, "developer")).toBeUndefined();
   } finally {
     await (retirement ?? retireTeamEvaluation(evaluation));
     unsubscribe();
@@ -82,7 +85,7 @@ test("ordinary SDK worker retains row and Team reservation through prompt, abort
     disposing = Promise.withResolvers<void>(), releaseDispose = Promise.withResolvers<void>();
   const evaluation = beginTeamEvaluation("ordinary-closure", false)!;
   bindBackgroundOwner({ token: evaluation.token, sessionId: evaluation.sessionId, isIdle: () => false, hasUI: false, notify() {}, sendMessage() {} });
-  const reservation = reserveTeamRole(evaluation, "developer", "ordinary-assignment");
+  const reservation = reserveTeamMember(evaluation, "developer", "ordinary-assignment");
   const sdk = controlledPi(env.root, {
     prompt: async () => { started.resolve(); await releasePrompt.promise; },
     abort: async () => { aborting.resolve(); await releaseAbort.promise; },
@@ -97,12 +100,12 @@ test("ordinary SDK worker retains row and Team reservation through prompt, abort
     await started.promise;
     expect(sdk.sessions[0]!.active.some(name => name.startsWith("head_"))).toBe(false);
     expect(cancelTeamWorker(evaluation.token, worker.instanceId)).toMatchObject({ status: "cancelled", closure: { state: "pending" } });
-    const independent = reserveTeamRole(evaluation, "reviewer", "independent");
+    const independent = reserveTeamMember(evaluation, "reviewer", "independent");
     expect(independent.owns()).toBe(true);
     independent.rollback();
     retirement = retireTeamEvaluation(evaluation).then(() => { closed = true; });
     await aborting.promise;
-    expect(teamRoleReservation(evaluation, "developer")).toBe("ordinary-assignment");
+    expect(firstTeamReservation(evaluation, "developer")).toBe("ordinary-assignment");
     expect(closed).toBe(false);
     releasePrompt.resolve();
     await Promise.resolve();
@@ -110,13 +113,13 @@ test("ordinary SDK worker retains row and Team reservation through prompt, abort
     releaseAbort.resolve();
     await disposing.promise;
     expect(teamWorkerStatus(evaluation.token, worker.instanceId)[0]?.closure).toEqual({ state: "pending" });
-    expect(teamRoleReservation(evaluation, "developer")).toBe("ordinary-assignment");
+    expect(firstTeamReservation(evaluation, "developer")).toBe("ordinary-assignment");
     expect(() => beginTeamEvaluation(evaluation.sessionId, false)).toThrow("await retirement");
     expect(closed).toBe(false);
     releaseDispose.resolve();
     await retirement;
     expect(teamWorkerStatus(evaluation.token)).toEqual([]);
-    expect(teamRoleReservation(evaluation, "developer")).toBeUndefined();
+    expect(firstTeamReservation(evaluation, "developer")).toBeUndefined();
   } finally {
     releasePrompt.resolve(); releaseAbort.resolve(); releaseDispose.resolve();
     await (retirement ?? retireTeamEvaluation(evaluation));
@@ -160,7 +163,7 @@ for (const failure of ["abort", "dispose"] as const) {
   test(`rejected SDK ${failure} retains unknown row, history and outer reservation without normal release`, async () => {
     const env = setup(), started = Promise.withResolvers<void>(), releasePrompt = Promise.withResolvers<void>();
     const evaluation = beginTeamEvaluation(`unknown-${failure}`, false)!;
-    const reservation = reserveTeamRole(evaluation, "developer", `assignment-${failure}`);
+    const reservation = reserveTeamMember(evaluation, "developer", `assignment-${failure}`);
     let normalRelease = 0;
     bindBackgroundOwner({ token: evaluation.token, sessionId: evaluation.sessionId, isIdle: () => false, hasUI: false, notify() {}, sendMessage() {} });
     const sdk = controlledPi(env.root, {
@@ -182,8 +185,8 @@ for (const failure of ["abort", "dispose"] as const) {
       await expect(retirement).rejects.toThrow(failure === "abort" ? "controlled abort rejected" : "controlled disposal rejected");
       expect(normalRelease).toBe(0);
       expect(teamWorkerStatus(evaluation.token, worker.instanceId)[0]?.closure.state).toBe("unknown");
-      expect(teamRoleReservation(evaluation, "developer")).toBe(`assignment-${failure}`);
-      expect(() => reserveTeamRole(evaluation, "developer", "replacement")).toThrow("stale Team evaluation");
+      expect(firstTeamReservation(evaluation, "developer")).toBe(`assignment-${failure}`);
+      expect(() => reserveTeamMember(evaluation, "developer", "replacement")).toThrow("stale Team evaluation");
       expect(() => beginTeamEvaluation(evaluation.sessionId, false)).toThrow("await retirement");
       const history = new WorkerHistory(env.root).list();
       expect(history[0]?.closure.state).not.toBe("closed");
@@ -250,7 +253,7 @@ test("the Head's own SDK disposal failure cannot mark its attachment released", 
 test("unknown no-worker preparation retains its reservation despite an incorporated outcome", async () => {
   const env = setup(), delivered = Promise.withResolvers<void>();
   const evaluation = beginTeamEvaluation("unknown-preparation", false)!;
-  const admission = reserveTeamRole(evaluation, "oracle", "unknown");
+  const admission = reserveTeamMember(evaluation, "oracle", "unknown");
   const branch: unknown[] = [];
   bindBackgroundOwner({ token: evaluation.token, sessionId: evaluation.sessionId, isIdle: () => true, hasUI: false,
     notify() {}, sendMessage() {}, getBranch: () => branch, appendResult(message) {
@@ -263,7 +266,93 @@ test("unknown no-worker preparation retains its reservation despite an incorpora
     admission.commit();
     await delivered.promise; observeWorkerResults(evaluation.token);
     expect(teamWorkerStatus(evaluation.token, handle.instanceId)[0]?.closure.state).toBe("unknown");
-    expect(teamRoleReservation(evaluation, "oracle")).toBe("unknown");
+    expect(firstTeamReservation(evaluation, "oracle")).toBe("unknown");
     await expect(retireTeamEvaluation(evaluation)).rejects.toThrow("Background retirement");
   } finally { env.release(true); }
+});
+
+
+for (const failure of ["abort", "dispose"] as const) {
+  test(`maintained Team ${failure} rejection retains exact member and blocks disband`, async () => {
+    const env = setup(), current = beginTeamEvaluation(`maintained-unknown-${failure}`, false)!;
+    bindBackgroundOwner({ token: current.token, sessionId: current.sessionId, isIdle: () => false, hasUI: false, notify() {}, sendMessage() {} });
+    const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    const sdk = controlledPi(env.root, {
+      async prompt(session, text) {
+        if (text === "blocked") { entered.resolve(); await release.promise; }
+        session.messages.push({ role: "assistant", content: [{ type: "text", text }], stopReason: "stop" });
+      },
+      async abort(session) { if (failure === "abort" && session.prompts.includes("blocked")) throw new Error("maintained abort unknown"); },
+      async dispose(session) { if (failure === "dispose" && session.prompts.includes("blocked")) throw new Error("maintained dispose unknown"); },
+    });
+    const team = createTeam(current);
+    const input = { roleId: "developer", task: "mandate", cwd: env.root, load: env.load, executor: createPiExecutor({ factories: sdk.factories }) };
+    const blocked = admitTeamMember(team, input), healthy = admitTeamMember(team, input);
+    const turn = blocked.turn("blocked");
+    void turn.catch(() => {});
+    let closing: Promise<void> | undefined;
+    try {
+      await entered.promise;
+      cancelTeamWorker(current.token, blocked.instanceId);
+      expect(firstTeamReservation(current, "developer")).toBe(blocked.assignmentId);
+      expect((await healthy.turn("independent progress")).status).toBe("completed");
+      await healthy.finish();
+      expect(teamWorkerStatus(current.token, healthy.instanceId)[0]?.closure.state).toBe("released");
+      closing = disbandTeam(team); void closing.catch(() => {});
+      release.resolve(); await Promise.allSettled([turn]);
+      await expect(closing).rejects.toThrow("Team disband");
+      expect(teamWorkerStatus(current.token, blocked.instanceId)[0]?.closure).toMatchObject({ state: "unknown" });
+      expect(firstTeamReservation(current, "developer")).toBe(blocked.assignmentId);
+      expect(() => admitTeamMember(team, input)).toThrow("admission is closed");
+      expect(new WorkerHistory(env.root).list().some(group => group.closure.state !== "closed")).toBe(true);
+    } finally {
+      release.resolve(); await Promise.allSettled([turn, closing ?? disbandTeam(team), retireTeamEvaluation(current)]);
+      env.release(true);
+    }
+  });
+}
+
+
+test("registered table replacement with rejected outgoing disposal retains root, diagnosis and hold without a replacement or private delivery", async () => {
+  const env = setup(), unknown = Promise.withResolvers<void>();
+  let handle: any, compositions = 0;
+  const room = await architectureFixture().setup({ root: env.root,
+    async prompt(_session, request, body) {
+      if (request.stage === "composition") { compositions++; return body; }
+      if (request.stage === "preparation") return { kind: "preparation", analysis: "independent", doubts: [] };
+      if (request.stage === "contribution") return { kind: "contribution", proposal: "bounded", arguments: ["reason"], objections: [], doubts: [] };
+      if (request.stage === "decision") return { kind: "decision", action: "recompose", reason: "replace member" };
+    },
+    async dispose(session) { if (session.model?.id === "chosen") throw new Error("table outgoing disposal rejected"); },
+  });
+  const changed = () => { if (handle && teamWorkerStatus(room.evaluation.token, handle.instanceId)[0]?.closure.state === "unknown") unknown.resolve(); };
+  const unsubscribe = subscribeChanges(changed);
+  try {
+    const db = await openBoard(); const topic = db.createTopic(env.root, { title: "Unknown table closure" }); db.claimTopic(env.root, topic.id, "unknown-table"); db.close();
+    const file = planFile("unknown-table", env.root); mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, `---\nid: unknown-table\nrevision: 1\nstatus: frozen\nboard_topic_id: ${topic.id}\n---\nUnknown closure.\n`);
+    const start = await room.invoke("architecture_start", { mode: "table", goal: "Unknown outgoing closure", plan: "unknown-table", unit: "T3" });
+    expect(start.isError).not.toBe(true); handle = start.details; changed(); await unknown.promise;
+    expect(compositions).toBe(2); expect(room.host.sessions).toHaveLength(2);
+    expect(room.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
+    expect(firstTeamReservation(room.evaluation, "architect")).toBe(handle.assignmentId);
+    expect(readLedgerTeamHolds(env.root, "unknown-table")).toHaveLength(1);
+    const status = (await room.invoke("architecture_read", { roomId: handle.roomId })).details;
+    expect(status.state).toBe("closure-unknown"); expect(status.closure.state).toBe("unknown");
+    expect(status.closure.reason).toContain("table outgoing disposal rejected");
+    const child = teamWorkerStatus(room.evaluation.token).find(row => row.instanceId !== handle.instanceId)!;
+    expect(child.closure.state).toBe("unknown");
+    expect(child.closure.state === "unknown" && child.closure.reason).toContain("table outgoing disposal rejected");
+    expect((await room.invoke("team_result", { assignmentId: handle.assignmentId })).isError).toBe(true);
+    expect(workerHandoff(handle.instanceId)).toBeUndefined();
+    const observed = await room.emit("agent_before_settle", { outcome: "completed", context: { canContinue: true } });
+    expect(observed?.entries ?? []).toEqual([]); expect(room.sent).toEqual([]); expect(room.branch).toEqual([]);
+    await expect(retireTeamEvaluation(room.evaluation)).rejects.toThrow("table outgoing disposal rejected");
+    expect(readLedgerTeamHolds(env.root, "unknown-table")).toHaveLength(1);
+  } finally {
+    unsubscribe();
+    await Promise.allSettled([room.emit("session_shutdown"), retireTeamEvaluation(room.evaluation)]);
+    clearBackgroundOwner(); setBackgroundExecutor(undefined);
+    retained.push(room); env.release(true);
+  }
 });

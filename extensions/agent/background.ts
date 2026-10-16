@@ -1,9 +1,10 @@
+import { receiptInBranch, offerEnvelope } from "./delivery.ts";
 import { PitakoConfigError } from "../errors.ts";
 import { createPiExecutor } from "./pi.ts";
 import { clearObservations, noteResultTaken, noteHandoff, observationEpoch, publishObservation, removeObservation, removeTeamObservations,
-  publishActivityBinding, retainTerminalActivity, noteTerminalActivityUnavailable, terminalActivityKey,
+  publishActivityBinding, listObservations, retainTerminalActivity, noteTerminalActivityUnavailable, terminalActivityKey,
   removeOwnerTerminalActivity, touchObservation, type TerminalActivityKey } from "./observe.ts";
-import { runAgentInstance, createInstanceId, type AgentRunResult, type AttemptExecutor } from "./run.ts";
+import { runAgentInstance, createConversationOwner, mergeUsage, createInstanceId, type AgentRunInput, type AgentRunResult, type AttemptExecutor } from "./run.ts";
 import type { LoadOptions } from "../roles/load.ts";
 import type { ExecutionBinding } from "../workflow.ts";
 import type { LiveHandle } from "./live.ts";
@@ -19,7 +20,13 @@ export interface WorkerInterest {
   execution?: ExecutionBinding;
 }
 
-export interface WorkerHandle {
+export interface TeamMetadata {
+  teamId?: string;
+  memberId?: string;
+  turnId?: string;
+}
+
+export interface WorkerHandle extends TeamMetadata {
   instanceId: string;
   roleId: string;
   status: "running";
@@ -30,7 +37,7 @@ export interface WorkerHandle {
 
 export type WorkerStatus = "running" | "completed" | "failed" | "cancelled";
 
-export interface WorkerView {
+export interface WorkerView extends TeamMetadata {
   instanceId: string;
   roleId: string;
   status: WorkerStatus;
@@ -52,6 +59,7 @@ export interface BackgroundOwner {
   notify: (message: string) => void;
   sendMessage: (content: string) => void;
   appendResult?: (message: ResultMessage) => void;
+  appendIntermediate?: (message: IntermediateMessage) => void;
   getBranch?: () => readonly unknown[];
 }
 
@@ -61,6 +69,9 @@ export interface ResultMessage {
   display: true;
   details: {
     deliveryId: string;
+    teamId?: string;
+    memberId?: string;
+    turnId?: string;
     instanceId: string;
     assignmentId?: string;
     ownerSessionId?: string;
@@ -71,6 +82,21 @@ export interface ResultMessage {
     unitId?: string;
   };
 }
+
+export interface IntermediateMessage {
+  customType: "pitako.architecture.response";
+  content: string;
+  display: true;
+  details: { deliveryId: string; roomId: string; assignmentId: string; instanceId: string; turnId: string };
+}
+interface Intermediate {
+  message: IntermediateMessage;
+  delivery: WorkerHandoff["delivery"];
+  continuation: WorkerHandoff["continuation"];
+  deliveryAttempts: number; wakeAttempts: number; outstanding: boolean; busyContinuation: boolean;
+  deliveryDiagnostic?: string;
+}
+export type Recipient = { kind: "protocol"; settle: (result: AgentRunResult, closure: AgentClosure) => void };
 
 export interface WorkerHandoff {
   collection: "collected";
@@ -93,7 +119,15 @@ interface Handoff extends WorkerHandoff {
 
 type SignalState = "pending" | "dropped";
 
-interface Row {
+interface Row extends TeamMetadata {
+  recipient?: Recipient;
+  intermediates?: Intermediate[];
+  ready?: Promise<void>;
+  preparation?: Promise<void>;
+  maintained?: { owner: ReturnType<typeof createConversationOwner>; completion: ReturnType<typeof Promise.withResolvers<void>>;
+    last?: AgentRunResult; usage?: AgentRunResult["usage"]; missingUsage: boolean;
+    driver?: Promise<AgentRunResult>;
+    turn?: Promise<AgentRunResult>; closing?: Promise<void>; stopAbort: () => void };
   instanceId: string;
   roleId: string;
   acceptedAt: number;
@@ -190,6 +224,9 @@ export interface SpawnInput {
   roleId: string;
   task: string;
   cwd: string;
+  architecture?: AgentRunInput["architecture"];
+  recipient?: Recipient;
+  driver?: (signal: AbortSignal) => Promise<AgentRunResult>;
   historyOrigin?: import("./history.ts").HistoryOrigin;
   dispatch?: import("./routing.ts").DispatchSnapshot;
   consultation?: import("./consultation.ts").ConsultationSnapshot;
@@ -202,7 +239,8 @@ export interface SpawnInput {
   executor: AttemptExecutor;
   load?: LoadOptions;
   now?: () => number;
-  teamOwner?: { token: symbol; assignmentId: string; onSettled: (status: WorkerStatus) => void };
+  maintained?: boolean;
+  teamOwner?: { token: symbol; assignmentId: string; teamId?: string; memberId?: string; onSettled: (status: WorkerStatus) => void };
   reconcileBookkeeping?: (result: AgentRunResult) => void;
 }
 
@@ -215,7 +253,7 @@ export async function spawnBackground(input: SpawnInput): Promise<WorkerHandle> 
   const ownerToken = input.reservation?.ownerToken ?? bag().owner?.token;
   let row: Row | undefined;
   const completion = Promise.withResolvers<void>();
-  const pending = runAgentInstance({
+  const runInput: AgentRunInput = {
     roleId: input.roleId,
     task: input.task,
     cwd: input.cwd,
@@ -223,6 +261,7 @@ export async function spawnBackground(input: SpawnInput): Promise<WorkerHandle> 
     historyOrigin: input.historyOrigin,
     dispatch: input.dispatch,
     consultation: input.consultation,
+    architecture: input.architecture,
     reservedInstanceId: input.reservation?.instanceId,
     head: input.head,
     signal: controller.signal,
@@ -295,6 +334,9 @@ export async function spawnBackground(input: SpawnInput): Promise<WorkerHandle> 
         closure: { state: "pending" },
         run: completion.promise,
       };
+      row.recipient = input.recipient;
+      row.teamId = input.historyOrigin?.teamId ?? row.teamId;
+      row.memberId = input.historyOrigin?.memberId ?? row.memberId;
       row.workerStarted = true;
       row.dispatchPhase = "worker";
       row.run = completion.promise;
@@ -313,6 +355,7 @@ export async function spawnBackground(input: SpawnInput): Promise<WorkerHandle> 
       if (!row || bag().rows.get(row.instanceId) !== row || row.signal === "dropped" ||
           epoch !== observationEpoch() || row.ownerToken && bag().owner?.token !== row.ownerToken ||
           row.teamOwnerToken && !bag().teamOwners?.has(row.teamOwnerToken)) return;
+      row.turnId = snapshot.turnId;
       row.attemptId = snapshot.attemptId;
       if (snapshot.attemptId && snapshot.activated?.attemptId === snapshot.attemptId)
         row.conversation?.attempt(snapshot.attemptId, snapshot.activated, { model: snapshot.selectedModel,
@@ -320,6 +363,8 @@ export async function spawnBackground(input: SpawnInput): Promise<WorkerHandle> 
       publishObservation(
         {
           ...snapshot,
+          teamId: row.teamId, memberId: row.memberId,
+          ...(input.maintained ? { status: "running" as const, terminalAt: undefined } : {}),
           acceptedAt: row.acceptedAt,
           planId: input.watch?.planId,
           unitId: input.watch?.unitId,
@@ -330,7 +375,32 @@ export async function spawnBackground(input: SpawnInput): Promise<WorkerHandle> 
       );
       if (row.live && row.attemptId && currentReadRow(row, epoch)) publishActivityBinding(activityKey(row, row.live), epoch);
     },
-  });
+  };
+  if (input.maintained) {
+    if (!input.reservation || input.head) throw new Error("maintained conversations require a reserved non-Head Team member");
+    row = input.reservation;
+    row.run = completion.promise;
+    row.workerStarted = true;
+    row.dispatchPhase = "worker";
+    row.interest = input.watch;
+    row.reconcileBookkeeping = input.reconcileBookkeeping;
+    row.recipient = input.recipient;
+    const owner = createConversationOwner(runInput);
+    row.maintained = { owner, completion, missingUsage: false, stopAbort: () => {} };
+    const accepted = row;
+    const cancel = () => { void finishTeamWorker(accepted.teamOwnerToken!, accepted.instanceId).catch(() => {}); };
+    controller.signal.addEventListener("abort", cancel, { once: true });
+    row.maintained.stopAbort = () => controller.signal.removeEventListener("abort", cancel);
+    if (input.driver) {
+      row.maintained.driver = Promise.resolve().then(() => input.driver!(controller.signal));
+      void row.maintained.driver.finally(() => finishTeamWorker(accepted.teamOwnerToken!, accepted.instanceId)).catch(() => {});
+    }
+    markConversationIdle(row, epoch);
+    if (controller.signal.aborted) cancel();
+    return { instanceId: row.instanceId, roleId: row.roleId, status: "running", watch: !!row.interest,
+      teamId: row.teamId, memberId: row.memberId, dispatchId: row.dispatchId, dispatchPhase: row.dispatchPhase };
+  }
+  const pending = runAgentInstance(runInput);
   if (!row) {
     await pending;
     throw new Error("agent_spawn did not accept");
@@ -371,7 +441,8 @@ export function reserveBackground(input: {
   origin?: import("./history.ts").HistoryOrigin;
   task: string;
   owns: () => boolean;
-  teamOwner?: { token: symbol; assignmentId: string; onSettled: (status: WorkerStatus) => void; noWorkerReleased: () => void };
+  teamOwner?: { token: symbol; assignmentId: string; teamId?: string; memberId?: string; onSettled: (status: WorkerStatus) => void; noWorkerReleased: () => void };
+  recipient?: Recipient;
   prepare: (signal: AbortSignal, check: () => void, row: { instanceId: string; dispatchId: string;
     record: (record: NonNullable<Row["consultation"]>) => void; current: () => boolean }) => Promise<SpawnInput>;
   cleanup?: () => Promise<void>;
@@ -381,10 +452,12 @@ export function reserveBackground(input: {
   if (!owner || owner.owns && !owner.owns() || !input.owns()) throw new Error("background owner unavailable or retired");
   const controller = new AbortController();
   const completion = Promise.withResolvers<void>();
-  const row: Row = { instanceId: createInstanceId(input.roleId), roleId: input.roleId, dispatchId: randomUUID(),
+  const ready = Promise.withResolvers<void>();
+  const row: Row = { recipient: input.recipient, instanceId: createInstanceId(input.roleId), roleId: input.roleId, dispatchId: randomUUID(),
     dispatchPhase: "preflight", workerStarted: false, acceptedAt: Date.now(), controller,
     ownerToken: owner.token, deliveryOwner: owner, coordinatorSessionId: input.coordinatorSessionId,
     teamOwnerToken: input.teamOwner?.token, teamAssignmentId: input.teamOwner?.assignmentId,
+    teamId: input.teamOwner?.teamId, memberId: input.teamOwner?.memberId, ready: ready.promise, preparation: completion.promise,
     onTeamSettled: input.teamOwner?.onSettled, releaseNoWorker: input.teamOwner?.noWorkerReleased,
     generation: 0, signal: "pending", closure: { state: "pending" }, run: completion.promise,
     launch: { task: input.task, origin: input.origin && structuredClone(input.origin) } };
@@ -395,6 +468,7 @@ export function reserveBackground(input: {
     }
   };
   publishObservation({ id: row.instanceId, roleId: row.roleId, task: input.task, status: "created",
+    teamId: row.teamId, memberId: row.memberId,
     phase: "working", acceptedAt: row.acceptedAt, selectedModel: "unknown", lastActivityKind: "preflight",
     origin: input.origin, ownerToken: owner.token, teamOwnerToken: input.teamOwner?.token });
   setImmediate(() => {
@@ -404,6 +478,7 @@ export function reserveBackground(input: {
           record(record) { row.consultation = record; }, current: () => liveOwner(row) && input.owns() });
         check();
         await spawnBackground({ ...prepared, reservation: row, check, foreground: controller.signal });
+        ready.resolve();
         await row.run;
       } catch (error) {
         if (!row.workerStarted) {
@@ -416,20 +491,114 @@ export function reserveBackground(input: {
         }
       } finally {
         row.preparationSettled = true;
+        ready.resolve();
         completion.resolve();
         releaseNoWorker(row);
       }
     })();
   });
-  return { instanceId: row.instanceId, dispatchId: row.dispatchId, roleId: row.roleId,
+  return { teamId: row.teamId, memberId: row.memberId, instanceId: row.instanceId, dispatchId: row.dispatchId, roleId: row.roleId,
     status: "running", watch: false, dispatchPhase: "preflight" };
 }
 
 function releaseNoWorker(row: Row): void {
   if (row.workerStarted !== false || !row.preparationSettled || row.closure.state !== "released" ||
-      row.signal !== "dropped" && row.handoff?.delivery !== "incorporated") return;
+      row.signal !== "dropped" && !row.recipient && row.handoff?.delivery !== "incorporated") return;
   row.releaseNoWorker?.();
   row.releaseNoWorker = undefined;
+}
+
+function markConversationIdle(row: Row, epoch: number): void {
+  const observation = listObservations(row.ownerToken, row.coordinatorSessionId).find(item => item.id === row.instanceId);
+  if (observation) publishObservation({ ...observation, status: "running", phase: "idle", activeTool: undefined,
+    teamId: row.teamId, memberId: row.memberId, turnId: row.turnId }, epoch);
+}
+
+/** Host driver only: reserve busy before startup can await. */
+export async function turnTeamWorker(token: symbol, instanceId: string, task: string): Promise<AgentRunResult> {
+  const row = bag().rows.get(instanceId);
+  if (!row || row.teamOwnerToken !== token || !liveOwner(row) || row.controller.signal.aborted || row.outcome) throw new Error("stale Team member");
+  if (row.maintained?.turn || pendingTurns.has(row)) throw new Error("Team member is busy");
+  pendingTurns.add(row);
+  try {
+    await row.ready;
+    if (!liveOwner(row) || row.controller.signal.aborted || row.outcome) throw new Error("stale Team member");
+    const maintained = row.maintained;
+    if (!maintained || maintained.closing) throw new Error("Team member has no open conversation");
+    const pending = maintained.owner.turn(task);
+    maintained.turn = pending;
+    try {
+      const result = await pending;
+      maintained.last = result;
+      maintained.missingUsage ||= result.usage === undefined;
+      maintained.usage = maintained.missingUsage ? undefined : mergeUsage(maintained.usage, result.usage, true);
+      if (liveOwner(row) && !maintained.closing) markConversationIdle(row, observationEpoch());
+      if (result.status === "cancelled") void finishTeamWorker(token, instanceId).catch(() => {});
+      return result;
+    } catch (error) {
+      maintained.last = { instanceId, role: row.roleId, status: "failed", model: { selectedModel: "unknown" }, result: String(error) };
+      void finishTeamWorker(token, instanceId).catch(() => {});
+      throw error;
+    } finally { maintained.turn = undefined; }
+  } finally { pendingTurns.delete(row); }
+}
+const pendingTurns = new WeakSet<Row>();
+
+/** Close the member's lifetime, not the exterior orchestrator that invoked this join. */
+export async function finishTeamWorker(token: symbol, instanceId: string): Promise<void> {
+  const row = bag().rows.get(instanceId);
+  if (!row || row.teamOwnerToken !== token) throw new Error("unknown Team member");
+  await row.ready;
+  const maintained = row.maintained;
+  if (!maintained) {
+    if (row.outcome) return;
+    throw new Error("Team member has no maintained conversation");
+  }
+  if (maintained.closing) return maintained.closing;
+  const completion = Promise.withResolvers<void>();
+  maintained.closing = completion.promise;
+  maintained.stopAbort();
+  void (async () => {
+    try {
+      let driven: AgentRunResult | undefined;
+      const closureErrors: unknown[] = [];
+      if (maintained.driver) {
+        try { driven = await maintained.driver; }
+        catch (error) {
+          if (error instanceof AgentClosureError) closureErrors.push(error);
+          else driven = { instanceId, role: row.roleId, status: row.controller.signal.aborted ? "cancelled" : "failed",
+            model: maintained.last?.model ?? { selectedModel: "unknown" }, result: String(error) };
+        }
+      }
+      try { await maintained.owner.close(); } catch (error) { closureErrors.push(error); }
+      // Its outcome is recorded by turnTeamWorker; a rejected turn is not unknown cleanup.
+      await maintained.turn?.catch(() => {});
+      if (closureErrors.length) throw new AgentClosureError(closureErrors, "Maintained Team");
+      row.closure = { state: "released" };
+      const result = driven ?? maintained.last ?? { instanceId, role: row.roleId, status: "cancelled" as const,
+        model: { selectedModel: "unknown" }, result: "cancelled before first turn" };
+      settle(row, { ...result, usage: maintained.usage,
+        ...(row.controller.signal.aborted ? { status: "cancelled", result: "cancelled" } : {}) }, observationEpoch());
+      completion.resolve();
+    } catch (error) {
+      row.closure = { state: "unknown", reason: String(error) };
+      settle(row, { instanceId, role: row.roleId, status: "failed", model: { selectedModel: "unknown" }, result: String(error) }, observationEpoch());
+      completion.reject(error);
+    } finally { maintained.completion.resolve(); }
+  })();
+  return completion.promise;
+}
+
+/** Disband one container without retiring another Team under the same foreground lease. */
+export async function retireTeamMembers(token: symbol, teamId: string): Promise<void> {
+  const rows = [...bag().rows.values()].filter(row => row.teamOwnerToken === token && row.teamId === teamId && !row.maintained?.driver);
+  // Container closure does not retire the foreground reader lease or its captures.
+  for (const row of rows) if (!row.controller.signal.aborted) row.controller.abort();
+  await Promise.all(rows.flatMap(row => [row.run, row.preparation]));
+  const uncertain = rows.filter(row => row.closure.state !== "released");
+  if (uncertain.length) throw new AgentClosureError(uncertain.map(row => new Error(`${row.instanceId}: ${
+    row.closure.state === "unknown" ? row.closure.reason : "owned run has not settled"
+  }`)), "Team disband");
 }
 
 export type LiveTarget = { kind: "background"; instanceId: string } | { kind: "team"; assignmentId: string };
@@ -616,7 +785,7 @@ async function retireRows(rows: Row[]): Promise<void> {
     row.conversation?.retire();
     if (!row.controller.signal.aborted) row.controller.abort();
   }
-  await Promise.all(rows.map(row => row.run));
+  await Promise.all(rows.flatMap(row => [row.run, row.preparation]));
   const uncertain = rows.filter(row => row.closure.state !== "released");
   for (const row of rows) {
     if (row.closure.state !== "released" || state.rows.get(row.instanceId) !== row) continue;
@@ -625,6 +794,7 @@ async function retireRows(rows: Row[]): Promise<void> {
       row.consultation.settled();
     }
     releaseNoWorker(row);
+    row.onTeamSettled?.(row.outcome?.status ?? "cancelled");
     state.rows.delete(row.instanceId);
     removeObservation(row.instanceId);
   }
@@ -651,6 +821,7 @@ export async function shutdownBackground(token: symbol): Promise<void> {
 
 export function formatWorkerHandle(handle: WorkerHandle): string {
   return [
+    ...(handle.teamId ? [`team_id: ${handle.teamId}`, `member_id: ${handle.memberId}`] : []),
     `instance_id: ${handle.instanceId}`,
     ...(handle.dispatchId ? [`dispatch_id: ${handle.dispatchId}`, `dispatch_phase: ${handle.dispatchPhase}`] : []),
     `role: ${handle.roleId}`,
@@ -695,7 +866,12 @@ function settle(row: Row, result: AgentRunResult, epoch: number): void {
     : { workerStarted: false, status: result.status, reason: result.result });
   current.consultation?.settled(current.closure.state === "unknown" ? current.closure.reason : undefined);
   if (current.workerStarted !== false && current.closure.state === "released" && current.signal !== "dropped" && liveOwner(current)) current.onTeamSettled?.(result.status);
+  current.recipient?.settle(result, current.closure);
   current.conversation?.finish();
+  if (current.maintained && currentReadRow(current, epoch)) {
+    const observation = listObservations(current.ownerToken, current.coordinatorSessionId).find(item => item.id === current.instanceId);
+    if (observation) publishObservation({ ...observation, status: result.status, phase: "idle", terminalAt: Date.now(), agentUsage: result.usage }, epoch);
+  }
   if (current.signal === "dropped") return;
   if (current.workerStarted === false) publishObservation({ id: current.instanceId, roleId: current.roleId, task: current.launch?.task ?? "",
     status: result.status, phase: "idle", acceptedAt: current.acceptedAt, selectedModel: "unknown", lastActivityKind: "no-worker",
@@ -724,9 +900,12 @@ function liveOwner(row: Row): boolean {
 }
 
 function collectResult(row: Row): void {
-  if (!row.outcome || row.handoff || !liveOwner(row)) return;
+  if (!row.outcome || row.recipient || row.handoff || !liveOwner(row)) return;
+  // A protocol driver cannot hand off while an owned member's closure is unknown.
+  if (row.maintained?.driver && row.closure.state !== "released") return;
   const owner = row.deliveryOwner!;
   const details = Object.freeze({
+    teamId: row.teamId, memberId: row.memberId, turnId: row.turnId,
     deliveryId: randomUUID(), instanceId: row.instanceId, assignmentId: row.teamAssignmentId,
     ownerSessionId: owner.sessionId ?? row.coordinatorSessionId, foregroundRevision: owner.revision,
     status: row.outcome.status,
@@ -785,12 +964,7 @@ function incorporated(row: Row): boolean {
   if (!liveOwner(row)) return false;
   const message = row.handoff!.message;
   try {
-    const matches = row.deliveryOwner!.getBranch?.().some(entry => {
-      if (!entry || typeof entry !== "object") return false;
-      const value = entry as { type?: unknown; customType?: unknown; content?: unknown; details?: { deliveryId?: unknown } };
-      return value.type === "custom_message" && value.customType === message.customType &&
-        value.details?.deliveryId === message.details.deliveryId && value.content === message.content;
-    }) ?? false;
+    const matches = receiptInBranch(message, row.deliveryOwner!.getBranch?.() ?? []);
     return matches && liveOwner(row);
   } catch { return false; }
 }
@@ -837,11 +1011,7 @@ function canOffer(row: Row): boolean {
 
 function offer(row: Row): ResultMessage {
   const handoff = row.handoff!;
-  ++handoff.deliveryAttempts;
-  handoff.delivery = "offered";
-  handoff.outstanding = true;
-  handoff.deliveryDiagnostic = "commitment not yet observed";
-  return handoff.message;
+  return offerEnvelope(handoff, handoff.message);
 }
 
 /** Busy boundary: drafts are offers, never receipts, regardless of preview canContinue. */
@@ -950,6 +1120,7 @@ function statusOf(row: Row): WorkerStatus {
 
 function view(row: Row, now: number): WorkerView {
   return {
+    teamId: row.teamId, memberId: row.memberId, turnId: row.turnId,
     instanceId: row.instanceId,
     roleId: row.roleId,
     status: statusOf(row),
@@ -966,4 +1137,84 @@ export function consultationFeedback(input: import("./consultation-feedback.ts")
   if (!row?.consultation || !row.consultation.matchesCaller(manager) || !row.handoff || !liveOwner(row) || row.closure.state !== "released")
     throw new Error("consultation is not owned and physically settled");
   return row.consultation.feedback(input, () => incorporated(row));
+}
+
+/** Nonterminal response channel: no outcome, handoff, hold, occupancy or resultTaken effects. */
+export function publishIntermediate(token: symbol, instanceId: string, roomId: string, turnId: string, content: string): void {
+  const row = bag().rows.get(instanceId);
+  if (!row || row.teamOwnerToken !== token || !liveOwner(row) || row.outcome || row.controller.signal.aborted || row.recipient)
+    throw new Error("intermediate owner retired");
+  row.intermediates ??= [];
+  if (row.intermediates.some(item => item.message.details.turnId === turnId)) throw new Error("duplicate intermediate turn");
+  row.intermediates.push({ message: { customType: "pitako.architecture.response", content, display: true,
+    details: { deliveryId: randomUUID(), roomId, assignmentId: row.teamAssignmentId!, instanceId, turnId } },
+    delivery: "pending", continuation: "not-requested", deliveryAttempts: 0, wakeAttempts: 0, outstanding: false, busyContinuation: false });
+  if (idleOf(row.deliveryOwner)) deliverIntermediateResults(token);
+}
+function intermediateRows(token: symbol) {
+  return [...bag().rows.values()].filter(row => row.ownerToken === token && row.intermediates && liveOwner(row));
+}
+export function intermediateReceipts(token: symbol, instanceId: string) {
+  const row = bag().rows.get(instanceId);
+  if (!row || row.ownerToken !== token || !liveOwner(row)) return [];
+  return row.intermediates?.map(item => ({ ...item.message.details, delivery: item.delivery, continuation: item.continuation,
+    diagnostic: item.deliveryDiagnostic })) ?? [];
+}
+export function observeIntermediateResults(token: symbol, turnStarted = false): void {
+  for (const row of intermediateRows(token)) for (const item of row.intermediates!) {
+    try {
+      if (receiptInBranch(item.message, row.deliveryOwner!.getBranch?.() ?? []) && liveOwner(row)) {
+        item.delivery = "incorporated"; item.outstanding = false; item.deliveryDiagnostic = undefined;
+        if (turnStarted) item.continuation = "observed";
+      }
+    } catch (error) { item.deliveryDiagnostic = `receipt unavailable: ${String(error)}`; }
+    if (bag().restrictions.has(token) && item.continuation !== "observed") item.continuation = "blocked-unconfirmed";
+  }
+}
+export function draftIntermediateResults(token: symbol, outcome: "completed" | "aborted" | "error") {
+  observeIntermediateResults(token);
+  const entries: (IntermediateMessage & { type: "custom_message" })[] = [];
+  for (const row of intermediateRows(token)) for (const item of row.intermediates!) {
+    if (item.delivery !== "incorporated" && !item.outstanding && item.deliveryAttempts < 2) {
+      entries.push({ type: "custom_message", ...offerEnvelope(item, item.message) });
+      if (outcome === "completed" && !bag().restrictions.has(token)) { item.continuation = "requested"; item.busyContinuation = true; }
+    }
+  }
+  return entries.length ? { entries, continue: outcome === "completed" && !bag().restrictions.has(token) } : undefined;
+}
+export function deliverIntermediateResults(token: symbol, terminalOperation = false, recovery = false): void {
+  observeIntermediateResults(token);
+  let wake: Row | undefined;
+  for (const row of intermediateRows(token)) {
+    if (!terminalOperation && !idleOf(row.deliveryOwner)) continue;
+    for (const item of row.intermediates!) {
+      if (item.delivery !== "incorporated" && !item.outstanding && item.deliveryAttempts < 2) {
+        try {
+          const message = offerEnvelope(item, item.message);
+          if (!row.deliveryOwner!.appendIntermediate) throw new Error("intermediate append boundary unavailable");
+          row.deliveryOwner!.appendIntermediate(message);
+        } catch (error) { item.outstanding = false; item.delivery = "blocked"; item.deliveryDiagnostic = String(error); }
+        observeIntermediateResults(token);
+      }
+      if (!liveOwner(row) || bag().restrictions.has(token)) continue;
+      if (item.delivery === "incorporated" && !item.busyContinuation && item.continuation !== "observed" &&
+          item.wakeAttempts < 2 && (!item.wakeAttempts || recovery)) {
+        ++item.wakeAttempts; item.continuation = "requested"; wake = row;
+      }
+    }
+  }
+  if (wake && liveOwner(wake)) {
+    try { wake.deliveryOwner!.sendMessage("Interpret the architecture responses already supplied. Continue authorized work; no polling or acknowledgement required."); }
+    catch { for (const item of wake.intermediates!) if (item.continuation === "requested") item.continuation = "blocked-unconfirmed"; }
+  }
+}
+export function settleIntermediateResults(token: symbol, terminalOperation = false, final = true): void {
+  observeIntermediateResults(token);
+  const outstanding: Intermediate[] = [];
+  for (const row of intermediateRows(token)) for (const item of row.intermediates!) {
+    if (item.outstanding) { outstanding.push(item); item.deliveryDiagnostic = "commitment unconfirmed at final boundary"; }
+    if (final && item.busyContinuation && item.continuation === "requested") item.continuation = "blocked-unconfirmed";
+  }
+  deliverIntermediateResults(token, terminalOperation, true);
+  for (const item of outstanding) { item.outstanding = false; if (item.deliveryAttempts >= 2) item.delivery = "blocked"; }
 }

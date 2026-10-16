@@ -3,7 +3,7 @@ import type { HistoryListOptions, HistoryReadOptions, HistoryPage, HistoryMetada
 import type { ClientLease, ResumeLease } from "./protocol.js";
 import type { PublicConversationPage, PublicWorkerResult, Availability } from "./protocol.js";
 export type { PublicConversationPage, PublicWorkerResult, PublicRecord, PublicFragment, PublicBinding, PublicGap, PublicContent } from "./protocol.js";
-export type { ClientLease, ResumeLease, PublicLaunch, PublicWorkerDetail } from "./protocol.js";
+export type { TeamMetadata, ClientLease, ResumeLease, PublicLaunch, PublicWorkerDetail } from "./protocol.js";
 export type { WorkerReadReference, WorkerReadCursor, WorkerDetail, WorkerRequests, WorkerActivity, WorkerResult } from "./protocol.js";
 export type { HistoryListOptions, HistoryReadOptions, HistoryPage, HistoryMetadata, HistoryFragment, RoutePage } from "./protocol.js";
 export class BridgeError extends Error { readonly code: string; constructor(code: string, message: string); }

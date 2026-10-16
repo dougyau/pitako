@@ -7,6 +7,9 @@ export type AgentUiPhase = "working" | "idle" | "suspected_stall" | "stalled";
 
 export interface AgentUiSnapshot {
   id: string;
+  teamId?: string;
+  memberId?: string;
+  turnId?: string;
   roleId: string;
   status: AgentUiStatus;
   phase: AgentUiPhase;
@@ -124,7 +127,7 @@ function sortRows(rows: readonly AgentUiSnapshot[]): AgentUiSnapshot[] {
 }
 
 function failureCompactKey(row: AgentUiSnapshot): string {
-  return `${groupKey(row)}\0${row.roleId}\0${row.failureKind ?? ""}`;
+  return `${groupKey(row)}\0${row.roleId}\0${row.memberId ?? ""}\0${row.failureKind ?? ""}`;
 }
 
 export function projectSnapshots(rows: readonly AgentUiSnapshot[], now: number): AgentUiSnapshot[] {
@@ -477,6 +480,7 @@ function detailLine(row: AgentUiSnapshot, now: number): string {
     `${glyphFor(row)} ${row.id}`,
     statusWord(row),
     row.roleId,
+    ...(row.memberId ? [`team ${row.teamId} · member ${row.memberId}`, ...(row.turnId ? [`turn ${row.turnId}`] : [])] : []),
     summarize(row.task, DETAIL_TASK_CAP),
     modelDetail(row),
   ];
@@ -504,7 +508,7 @@ function compactFailures(rows: readonly AgentUiSnapshot[]): DetailEntry[] {
   const failed = new Map<string, AgentUiSnapshot[]>();
   for (const row of rows) {
     if (row.status !== "failed" || !row.failureKind || row.handoff && !row.resultTaken) continue;
-    const key = `${row.roleId}\0${row.failureKind}`;
+    const key = `${row.roleId}\0${row.memberId ?? ""}\0${row.failureKind}`;
     const list = failed.get(key) ?? [];
     list.push(row);
     failed.set(key, list);
@@ -514,7 +518,7 @@ function compactFailures(rows: readonly AgentUiSnapshot[]): DetailEntry[] {
   const emitted = new Set<string>();
   for (const row of rows) {
     if (row.status === "failed" && row.failureKind && (!row.handoff || row.resultTaken)) {
-      const key = `${row.roleId}\0${row.failureKind}`;
+      const key = `${row.roleId}\0${row.memberId ?? ""}\0${row.failureKind}`;
       const list = failed.get(key)!;
       if (list.length >= 2) {
         if (emitted.has(key)) continue;

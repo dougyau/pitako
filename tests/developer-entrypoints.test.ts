@@ -9,7 +9,7 @@ import agentInstance from "../extensions/agent/index.ts";
 import { subscribeChanges } from "../extensions/agent/observe.ts";
 import { ownedDispatch, settlePendingDispatches } from "../extensions/agent/dispatch.ts";
 import { setBackgroundExecutor, workerStatus, teamWorkerStatus, bindBackgroundOwner, clearBackgroundOwner, workerResult, shutdownBackground, cancelAllWorkers } from "../extensions/agent/background.ts";
-import { beginTeamEvaluation, retireTeamEvaluation, reserveTeamRole, teamRoleReservation } from "../extensions/team.ts";
+import { beginTeamEvaluation, retireTeamEvaluation, reserveTeamMember, firstTeamReservation } from "../extensions/team.ts";
 import { agentFixtureOwnership } from "./fixtures/agent-fixture-ownership.ts";
 import { planFile, ledgerFile } from "../extensions/workflow.ts";
 
@@ -83,7 +83,7 @@ reasoning = "high"
     expect(acceptedTeam.details.dispatchPhase).toBe("preflight");
     await entered.promise;
     gate.resolve(result()); await started.promise; await fixture.settleRuns();
-    expect(teamRoleReservation(evaluation, "developer")).toBeUndefined();
+    expect(firstTeamReservation(evaluation, "developer")).toBeUndefined();
     expect(teamWorkerStatus(evaluation.token, acceptedTeam.details.instanceId)[0]?.status).toBe("completed");
     expect(classifications).toBe(2); expect(starts).toBe(2);
 
@@ -105,22 +105,28 @@ reasoning = "high"
       { role: "developer", task: "exact WorkBrief", plan: "pending-route", unit: "T2" }, undefined, undefined, ctx);
     expect(team.details.dispatchPhase).toBe("preflight");
     await entered.promise;
-    const reserved = teamRoleReservation(evaluation, "developer");
+    const reserved = firstTeamReservation(evaluation, "developer");
     expect(reserved).toBe(team.details.id);
-    expect((await execute("team_assign")).isError).toBe(true);
-    expect(classifications).toBe(4);
+    entered = deferred();
+    const sibling = await execute("team_assign");
+    expect(sibling.isError).toBeFalsy();
+    expect(sibling.details.memberId).not.toBe(team.details.memberId);
+    expect(sibling.details.id).not.toBe(reserved);
+    await entered.promise;
+    expect(firstTeamReservation(evaluation, "developer")).toBe(reserved);
+    expect(classifications).toBe(5);
     let settled = false;
     const shutdown = Promise.all([hooks.get("session_shutdown")!(), shutdownBackground(evaluation.token)]).then(() => { settled = true; });
     await Promise.resolve();
     expect(seenSignal?.aborted).toBe(true);
     expect(settled).toBe(false);
-    expect(teamRoleReservation(evaluation, "developer")).toBe(reserved);
+    expect(firstTeamReservation(evaluation, "developer")).toBe(reserved);
     expect(existsSync(ledgerFile("pending-route", root))).toBe(false);
     expect((await execute("agent_spawn")).isError).toBe(true);
     gate.resolve(result());
     await shutdown;
     expect(starts).toBe(2);
-    expect(teamRoleReservation(evaluation, "developer")).toBeUndefined();
+    expect(firstTeamReservation(evaluation, "developer")).toBeUndefined();
     expect(existsSync(ledgerFile("pending-route", root))).toBe(false);
 
     await retireTeamEvaluation(evaluation);
@@ -135,8 +141,8 @@ reasoning = "high"
     gate.resolve(result());
     await retiring;
     const replacement = beginTeamEvaluation(sessionId, false)!;
-    const replacementRole = reserveTeamRole(replacement, "developer", "replacement");
-    expect(teamRoleReservation(replacement, "developer")).toBe("replacement");
+    const replacementRole = reserveTeamMember(replacement, "developer", "replacement");
+    expect(firstTeamReservation(replacement, "developer")).toBe("replacement");
     expect(starts).toBe(2);
     replacementRole.rollback();
     await retireTeamEvaluation(replacement);

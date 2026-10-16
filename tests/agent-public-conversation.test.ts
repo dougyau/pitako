@@ -662,10 +662,10 @@ for (const method of ["agent_spawn", "team_assign"] as const) {
       new AbortController().signal, undefined, ctx as never);
     returned = true;
     if (launch.isError) throw Error(JSON.stringify(launch));
-    const handle = launch.details as { instanceId: string; id?: string };
+    const handle = launch.details as { instanceId: string; id?: string; teamId?: string; memberId?: string };
     expect(accepted).toMatchObject({ worker: { source: method, instanceId: handle.instanceId,
       roleId: "researcher", toolCallId, coordinatorSessionId: owner.sessionId, linkage: "tool",
-      ...(method === "team_assign" ? { assignmentId: handle.id } : {}) }, workbrief: { text: "public brief" } });
+      ...(method === "team_assign" ? { assignmentId: handle.id, teamId: handle.teamId, memberId: handle.memberId } : {}) }, workbrief: { text: "public brief" } });
     expect(accepted!.ref.native).toBeUndefined(); expect(sessions).toHaveLength(0);
     nativeRelease.release();
     await toolEntered.promise;
@@ -674,7 +674,7 @@ for (const method of ["agent_spawn", "team_assign"] as const) {
     if (!("format" in detail)) throw Error(JSON.stringify(detail));
     expect(detail.lifecycle).toMatchObject({ execution: "running", result: "pending", capture: "open" });
     expect(detail.bindings).toHaveLength(1);
-    expect(detail.worker).toEqual(accepted!.worker);
+    expect(detail.worker).toEqual({ ...accepted!.worker, turnId: `${handle.instanceId}:turn:1` });
     expect(detail.bindings[0]!.attempts[0]!.activated).toMatchObject({ model: "public-fixture/local" });
     expect(detail.ref).not.toHaveProperty("evaluationId");
     expect(detail.ref).not.toHaveProperty("attemptId");
@@ -684,7 +684,7 @@ for (const method of ["agent_spawn", "team_assign"] as const) {
     const nativeUser = sessions[0]!.sessionManager.getEntries().find(entry => entry.type === "message" && entry.message.role === "user");
     if (method === "team_assign") {
       expect(JSON.stringify(nativeUser)).toContain(
-        `Team assignment header: Team ${owner.sessionId}; role researcher; assignment ${handle.id}`);
+        `Team assignment header: Team ${handle.teamId}; member ${handle.memberId}; role researcher; assignment ${handle.id}`);
       expect(JSON.stringify(snapshot.output)).not.toContain("Team assignment header:");
     }
     expect(snapshot.output.find(record => record.kind === "message" && record.payload.role === "user"))

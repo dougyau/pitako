@@ -846,3 +846,17 @@ describe("role abbreviations", () => {
     expect(formatFooter([row({ id: "1", roleId: "specialist", appliedReasoning: "low", modelLabel: "M" })], NOW, 80)).toContain("spec");
   });
 });
+
+
+test("same-role Team failures retain independent members in footer and detail", () => {
+  const members = ["member-one", "member-two"].map((memberId, index) => row({ id: `worker-${index}`, teamId: "team",
+    memberId, turnId: `turn-${index}`, status: "failed", failureKind: "runtime", terminalAt: NOW - 1000 }));
+  expect(projectSnapshots(members, NOW).map(item => item.id)).toEqual(["worker-0", "worker-1"]);
+  const detail = formatAgentsDetail(members, NOW);
+  for (const member of members) {
+    expect(detail).toContain(member.id);
+    expect(detail).toContain(member.memberId!);
+    expect(detail).toContain(member.turnId!);
+  }
+  expect(detail).not.toContain("developer ×2");
+});

@@ -39,7 +39,8 @@ Disable Ponytail, Caveman, or any individual skill with `pi config` or package s
 - Foreground `agent_observe` and `agent_input` for bounded observation, context queries, and in-scope steering of exact active background or Team targets. Input waits for a later native boundary and never interrupts a command. A receipt is not an answer. See [worker history and input](docs/worker-history.md).
 - An opt-in local agent bridge for foreground native RPC hosts. Its passive Node client provides non-consuming reads, change hints, and explicitly granted worker controls. See [Agent bridge host reference](docs/agent-bridge.md) for launch flags, permissions, receipts, and reconnect limits.
 - `agent_supervise` for one synchronous visible sibling pane. It does not run in the background or join the Team roster.
-- `team_assign`, `team_status`, `team_result`, and `team_cancel` for background Team assignments from the foreground session, with one active assignment per role. `$plan` and `$execute` use them for Architect/Reviewer dependencies too.
+- `team_assign`, `team_status`, `team_result`, and `team_cancel` for independently identified background Team members. Every assignment admits a new member, including repeated roles. `$plan` and `$execute` use them for Architect/Reviewer dependencies too.
+- Optional `architecture_start`, `architecture_read`, and `architecture_control` for maintained direct consultations and autonomous tables. Direct answers arrive automatically; tables prepare independently and deliberate for at most five rounds. Only the root synthesizes after disband. See [Architecture consultations](docs/architecture.md). A table can supply the existing architectural `$plan` pass; it is optional, and independent Reviewer critique and `$execute` authority remain unchanged.
 - `$plan` and `$execute`. Planning stops at `PLAN_FROZEN`. Execution is a separate invocation. Neither calls Herdr.
 
 ## Verify behavior
@@ -372,7 +373,7 @@ Recorded managed-worker catalogs remain protected, read-only archives through
 
 ## What this is not yet
 
-Pitako does not implement subteams. Ad-hoc Team assignments let independent roles run concurrently, with one assignment per role; they do not become a durable scheduler. Session TODOs are local execution plans. The Board is not a team roster or a memory store.
+Pitako does not implement subteams. Ad-hoc Team assignments let independent members run concurrently; they do not become a durable scheduler. Multiple members of a role do not relax `$execute`'s single exterior Developer policy. Session TODOs are local execution plans. The Board is not a team roster or a memory store.
 
 ## Requirements
 

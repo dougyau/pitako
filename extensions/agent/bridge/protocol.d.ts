@@ -7,7 +7,8 @@ export interface Descriptor {
   version: 2; transport: "unix"; socket: string; token: string; owner: Owner;
   capabilities: readonly Capability[];
 }
-export interface PublicLaunch {
+export interface TeamMetadata { teamId?: string; memberId?: string; turnId?: string }
+export interface PublicLaunch extends TeamMetadata {
   source: "agent_spawn" | "team_assign"; instanceId: string; roleId: string;
   coordinatorSessionId: string | null; toolCallId: string | null; assignmentId?: string;
   acceptedAt: number; linkage: "tool" | "unlinked";
@@ -77,6 +78,7 @@ export interface PublicWorkerDetail {
 }
 /** Wire metadata only; no Pi or controller dependency in native consumer types. */
 export interface SdkRequest {
+  turnId?: string;
   attemptId?: string; historyId?: string; sessionId?: string;
   sdkOptions?: { reasoning?: string; temperature?: number; maxTokens?: number; serviceTier?: string };
   model: string; provider?: string; requestId?: string; inputTokens?: number | null; outputTokens?: number | null;
@@ -84,7 +86,7 @@ export interface SdkRequest {
   returned_service_tier: "unavailable"; time_to_first_model_output_ms: number | "unavailable";
   time_to_first_model_output_unavailable_reason?: "cancelled" | "failed";
 }
-export interface WorkerListItem {
+export interface WorkerListItem extends TeamMetadata {
   id: string; roleId: string; status: "created" | "running" | "completed" | "failed" | "cancelled";
   source?: "agent_run" | "agent_spawn" | "team_assign"; assignmentId?: string;
   task: string; selectedModel: string; requestedModel?: string; requestedReasoning?: string;
@@ -150,7 +152,7 @@ export type HistoryReadOptions = HistoryListOptions & { historyId: string; group
 /** Metadata is provenance, not a filesystem capability. Extra catalog fields remain opaque. */
 export type HistoryMetadata = {
   kind: "member"; groupId: string; historyId: string; roleId: string; coordinatorSessionId: string;
-  instanceId?: string; assignmentId?: string; attemptId?: string;
+  instanceId?: string; assignmentId?: string; attemptId?: string; teamId?: string; memberId?: string; turnId?: string;
   native: { state: "not-created" | "pruned" } |
     { state: "allocated"; sessionId: string; disposition: { state: "pending" } |
       { state: "disposed"; at: string } | { state: "unknown"; reason: string } };

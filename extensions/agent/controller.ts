@@ -217,7 +217,8 @@ export function createAgentController(owner: AgentControllerOwner, current: () =
             bindings.push(binding);
           }
           return { format: "public-v1", ref,
-            worker: { source: row.origin.source, instanceId: row.id, roleId: row.roleId,
+            worker: { ...(row.teamId ? { teamId: row.teamId } : {}), ...(row.memberId ? { memberId: row.memberId } : {}),
+              ...(row.turnId ? { turnId: row.turnId } : {}), source: row.origin.source, instanceId: row.id, roleId: row.roleId,
               coordinatorSessionId: row.origin?.coordinatorSessionId ?? null, toolCallId: row.origin?.toolCallId ?? null,
               ...(row.origin?.assignmentId ? { assignmentId: row.origin.assignmentId } : {}),
               acceptedAt: row.acceptedAt, linkage: row.origin?.toolCallId ? "tool" : "unlinked" },
@@ -282,6 +283,7 @@ export function createAgentController(owner: AgentControllerOwner, current: () =
           const outcome = row.origin?.source === "agent_run" ? { state: "unavailable" as const, reason: "unsupported_kind" }
             : readWorkerResult(targetFor(row), readScope());
           const metadata = textPage(JSON.stringify({ id: row.id, roleId: row.roleId, source: row.origin?.source,
+            teamId: row.teamId, memberId: row.memberId, turnId: row.turnId,
             assignmentId: row.origin?.assignmentId, task: row.task, handoff: row.handoff, resultTaken: row.resultTaken,
             selected: { model: row.selectedModel, requestedModel: row.requestedModel, reasoning: row.requestedReasoning,
               fast: { state: "unavailable", reason: "Fast intent is not retained in the selected-settings observation" } },
@@ -365,6 +367,7 @@ export function createAgentController(owner: AgentControllerOwner, current: () =
           const remaining = after ? sorted.slice(sorted.findIndex(row => row.id === after) + 1) : sorted;
           for (const row of remaining) {
             const item = { id: row.id, roleId: row.roleId, status: row.status, source: row.origin?.source,
+              teamId: row.teamId, memberId: row.memberId, turnId: row.turnId,
               assignmentId: row.origin?.assignmentId, task: row.task.slice(0, 100), selectedModel: row.selectedModel,
               requestedModel: row.requestedModel, requestedReasoning: row.requestedReasoning,
               activated: row.activated, sdkRequest: currentRequest(row), acceptedAt: row.acceptedAt,
@@ -398,7 +401,8 @@ export function createAgentController(owner: AgentControllerOwner, current: () =
             original = { text: page.text, offset: page.offset, nextOffset: page.nextOffset, source: "original WorkBrief" };
           }
           return structuredClone({ id: row.id, roleId: row.roleId, status: row.status, observation,
-            identity: { coordinatorSessionId: owner.sessionId, source: row.origin?.source, assignmentId: row.origin?.assignmentId },
+            identity: { coordinatorSessionId: owner.sessionId, source: row.origin?.source, assignmentId: row.origin?.assignmentId,
+              teamId: row.teamId, memberId: row.memberId, turnId: row.turnId },
             workbrief: original, resultTaken: row.resultTaken, handoff: row.handoff,
             teamWrapper: row.origin?.source === "team_assign" ? row.task.split("\nWorkBrief:")[0]!.slice(0, 1024) : undefined,
             route: routeSummary(row), selected: { model: row.selectedModel, reasoning: row.requestedReasoning,
