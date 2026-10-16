@@ -10,7 +10,7 @@ type Session = {
       cost: number; assistantMessages: number; toolCalls: number; contextUsage: { tokens: number } };
     agent: { streamFunction: any };
     emit(event: any): void; prompt(text: string): Promise<void>; abort(): Promise<void>; dispose(): Promise<void>;
-    tools: Map<string, { definition: any }>; hooks: Map<string, Function[]>;
+    tools: Map<string, { definition: any }>; boundTools: Map<string, any>; hooks: Map<string, Function[]>;
     settingsManager: any; setModel(model: Model<any>): Promise<void>; setThinkingLevel(level: any): void;
     getAllTools(): Array<{ name: string }>; setActiveToolsByName(names: string[]): void;
     subscribe(listener: (event: any) => void): () => void; getSessionStats(): any;
@@ -79,7 +79,7 @@ export function controlledPi(root: string, options: {
       local.manager = manager;
       const session: Session = {
         sessionId: manager.getSessionId(), get sessionFile() { return manager.getSessionFile(); }, sessionManager: manager, model: input!.model,
-        tools: local.tools, hooks: local.hooks,
+        tools: local.tools, boundTools: new Map(), hooks: local.hooks,
         messages: [], thinkingLevel: input!.thinkingLevel, isStreaming: false, events: [], prompts: [], active: [],
         stats: { tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0, assistantMessages: 0, toolCalls: 0, contextUsage: { tokens: 17 } },
         agent: { streamFunction: (...args: any[]) => sessionRuntime.streamSimple(...args as [any, any, any]) },
@@ -92,6 +92,8 @@ export function controlledPi(root: string, options: {
         getSessionStats: () => session.stats,
         emit(event) { for (const listener of listeners) listener(event); },
         async bindExtensions() {
+          // Native wrappers capture the definition object, not the mutable registry slot.
+          for (const [name, tool] of local.tools) session.boundTools.set(name, tool.definition);
           session.events.push("bind"); await options.bind?.(session);
           if (options.inlineExtensions) for (const handler of local.hooks.get("session_start") ?? []) await handler({}, { sessionManager: manager });
         },

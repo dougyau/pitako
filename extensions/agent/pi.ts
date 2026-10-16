@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { getCurrentSystemPrompt, getSupportedThinkingLevels, lazyStream, normalizeContext, type AssistantMessageEvent, type Context, type Model } from "@earendil-works/pi-ai";
 import {
@@ -35,7 +36,9 @@ const sdkDefaultsReady = import(
   return defaults;
 });
 
-const architectureTools = new WeakMap<AgentSession, (identity: NativeTurn) => void>();
+// A stable registered definition is captured by native wrappers. Authority belongs to
+// the originating prompt, never whichever turn happens to be active on this session.
+const architectureTurns = new AsyncLocalStorage<{ session: AgentSession; identity: NativeTurn; signal: AbortSignal; active: boolean }>();
 
 const childLifecycles = new WeakMap<AgentSession, { bound: boolean; disposal?: Promise<void>; history?: SessionHistory;
   live?: ReturnType<typeof createLiveHandle>; unbindLive?: () => void;
@@ -335,7 +338,6 @@ async function runTarget(
   const identity: NativeTurn = { instanceId: input.instanceId, turnId: input.turnId!, attemptId: input.attemptId!,
     historyId: input.sessionHistory?.historyId, sessionId: session.sessionId };
   input.participant?.begin(identity);
-  architectureTools.get(session)?.(identity);
   const handle = resume(session, runtime, selections, now, input);
   let adjustment: string | undefined, requested = target.reasoning;
   const observed = (attempt: Attempt, requested: ModelTarget["reasoning"], adjustment?: string) => {
@@ -545,7 +547,15 @@ async function openSession(
       });
       if (input.participant) {
         pi.registerTool({ name: "architecture_submit", label: "Submit architecture turn", description: "Provisional submission for your exact authorized architecture turn. Does not dispatch work.",
-          parameters: submitSchema, async execute() { throw new Error("architecture grant not active"); } });
+          parameters: submitSchema, async execute(id, value, signal, _update, ctx) {
+            try {
+              const turn = architectureTurns.getStore();
+              if (!turn?.active || turn.session !== nativeSession || turn.signal.aborted || signal?.aborted || childLifecycles.get(turn.session)?.closing)
+                throw new Error("architecture grant not active");
+              const receipt = input.participant!.submit(id, value, ctx, turn.identity);
+              return { content: [{ type: "text", text: JSON.stringify(receipt) }], details: receipt };
+            } catch (error) { return { content: [{ type: "text", text: String(error) }], details: {}, isError: true }; }
+          } });
         pi.on("session_start", (_event, ctx) => input.participant!.bind(pi, ctx));
       }
       pi.on("turn_start", () => { guardConsultationTools(); if (nativeSession) reconcileChildTools(nativeSession); live?.open(); });
@@ -662,17 +672,6 @@ async function openSession(
     guardConsultationTools();
     input.scope?.assertStartup();
     input.consultant?.check();
-    if (input.participant) architectureTools.set(session, identity => {
-      for (const extension of loader.getExtensions().extensions) {
-        const tool = extension.tools.get("architecture_submit");
-        if (tool) tool.definition = { ...tool.definition, async execute(id, value, _signal, _update, ctx) {
-          try {
-            const receipt = input.participant!.submit(id, value, ctx, identity);
-            return { content: [{ type: "text", text: JSON.stringify(receipt) }], details: receipt };
-          } catch (error) { return { content: [{ type: "text", text: String(error) }], details: {}, isError: true }; }
-        } };
-      }
-    });
     reconcileChildTools(session);
     lifecycle.stopAbort?.();
     lifecycle.stopAbort = undefined;
@@ -796,13 +795,17 @@ async function drive(
       if (lifecycle.closing) throw new Error("Agent session is closing");
       const prompting = Promise.resolve().then(() => {
         if (input.signal.aborted || lifecycle.closing) return;
-        if (input.participant) {
-          input.participant.prompt({ instanceId: input.instanceId, turnId: input.turnId!, attemptId: input.attemptId!,
-            historyId: childLifecycles.get(session)?.history?.historyId, sessionId: session.sessionId });
-        }
+        const identity: NativeTurn = { instanceId: input.instanceId, turnId: input.turnId!, attemptId: input.attemptId!,
+          historyId: lifecycle.history?.historyId, sessionId: session.sessionId };
+        input.participant?.prompt(identity);
         input.scope?.beginPrompt(session.sessionId);
         input.consultant?.beginPrompt();
-        return session.prompt(prompt, { expandPromptTemplates: false });
+        if (!input.participant) return session.prompt(prompt, { expandPromptTemplates: false });
+        const turn = { session, identity, signal: input.signal, active: true };
+        return architectureTurns.run(turn, async () => {
+          try { await session.prompt(prompt, { expandPromptTemplates: false }); }
+          finally { turn.active = false; }
+        });
       });
       lifecycle.operations.add(prompting);
       try { await prompting; } finally { lifecycle.operations.delete(prompting); }

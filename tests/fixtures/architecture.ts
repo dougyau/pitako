@@ -73,7 +73,7 @@ export function architectureFixture() {
         if (chosen !== false) {
           expect(executionForSession(session.sessionId)?.profile).toBe("analysis");
           expect(session.active).not.toContain("edit"); expect(session.active).not.toContain("write");
-          const receipt = await session.tools.get("architecture_submit")!.definition.execute("native-submit", { submissionId: `submit-${session.prompts.length}`, body: chosen }, undefined, undefined, { sessionManager: session.sessionManager });
+          const receipt = await session.boundTools.get("architecture_submit")!.execute("native-submit", { submissionId: `submit-${session.prompts.length}`, body: chosen }, undefined, undefined, { sessionManager: session.sessionManager });
           seen.push({ session, request, receipt, levels: session.thinkingLevel, model: session.model!.id });
           expect(receipt.isError).not.toBe(true);
         }
