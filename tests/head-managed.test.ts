@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Type } from "typebox";
@@ -9,19 +9,67 @@ import { AgentClosureError } from "../extensions/agent/closure.ts";
 import { AdmissionInventory, localGitEnv } from "../extensions/agent/head/inventory.ts";
 import { ManagedAssignment, ManagedProducer, foregroundBash, managedGuard, managedTools } from "../extensions/agent/head/managed-tools.ts";
 
-async function repository(body: (root: string, git: (args: string[], input?: string | Buffer, extra?: NodeJS.ProcessEnv) => Buffer) => Promise<void>) {
+function hasUnknownClosure(error: unknown): boolean {
+  return error instanceof AgentClosureError || error instanceof AggregateError && error.errors.some(hasUnknownClosure);
+}
+async function temporaryRoot(body: (root: string) => Promise<void>) {
   const root = mkdtempSync(path.join(tmpdir(), "pitako-managed-"));
-  const git = (args: string[], input?: string | Buffer, extra?: NodeJS.ProcessEnv) => execFileSync("git", args, {
-    cwd: root, env: { ...localGitEnv(), ...extra }, input, stdio: ["pipe", "pipe", "pipe"],
-  });
-  try {
+  let remove = true;
+  try { await body(root); }
+  catch (error) {
+    if (hasUnknownClosure(error)) {
+      remove = false;
+      throw new AgentClosureError([error], `Managed fixture retained at ${root}`);
+    }
+    throw error;
+  } finally { if (remove) rmSync(root, { recursive: true, force: true }); }
+}
+async function repository(body: (root: string, git: (args: string[], input?: string | Buffer, extra?: NodeJS.ProcessEnv) => Buffer) => Promise<void>) {
+  await temporaryRoot(async root => {
+    const git = (args: string[], input?: string | Buffer, extra?: NodeJS.ProcessEnv) => execFileSync("git", args, {
+      cwd: root, env: { ...localGitEnv(), ...extra }, input, stdio: ["pipe", "pipe", "pipe"],
+    });
     git(["init", "--quiet"]);
     git(["config", "user.name", "Fixture"]); git(["config", "user.email", "fixture@invalid"]);
     for (const name of ["clean", "staged", "dirty", "flagged", "mode"]) writeFileSync(path.join(root, name), "base\n");
     writeFileSync(path.join(root, ".gitignore"), "ignored/\n*.opaque\n");
     git(["add", "."]); git(["commit", "--quiet", "-m", "admission"]);
     await body(root, git);
-  } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+}
+async function awaitEntered(entered: Promise<void>, operation: Promise<unknown>): Promise<void> {
+  await Promise.race([entered, operation.then(() => { throw new Error("operation completed before readiness"); })]);
+}
+function rejectsWith(operation: Promise<unknown>, message: string): Promise<void> {
+  // Unlike a .rejects matcher, a normal Promise handler cannot suspend the caller.
+  return operation.then(() => { throw new Error(`Expected operation to reject: ${message}`); }, error => {
+    expect(error).toBeInstanceOf(Error);
+    expect(error.message).toContain(message);
+  });
+}
+async function withOperations(body: (own: <T>(operation: Promise<T>, source?: Promise<unknown>) => Promise<T>) => Promise<void>,
+  release: () => void, assignment?: ManagedAssignment) {
+  const operations: Promise<unknown>[] = [], errors: unknown[] = [];
+  const own = <T>(operation: Promise<T>, source: Promise<unknown> = operation): Promise<T> => {
+    operations.push(operation);
+    void operation.catch(() => {}); // Join below reports failures, including derived assertions.
+    const sourceObserved = source.catch(error => { if (hasUnknownClosure(error)) errors.push(error); });
+    operations.push(sourceObserved);
+    return operation;
+  };
+  try { await body(own); }
+  catch (error) { errors.push(error); }
+  finally {
+    try { release(); } catch (error) { errors.push(error); }
+    for (const outcome of await Promise.allSettled(operations)) {
+      if (outcome.status === "rejected") errors.push(outcome.reason);
+    }
+    try { assignment?.assertIdle(); }
+    catch (error) { errors.push(new AgentClosureError([error], "managed fixture release")); }
+  }
+  const failures = [...new Set(errors)];
+  if (failures.length === 1) throw failures[0];
+  if (failures.length) throw new AggregateError(failures, "Managed fixture failed");
 }
 function producer(assignment: ManagedAssignment, options: { writes?: string[]; revision?: () => number;
   effects?: () => void; signal?: AbortSignal; instance?: string } = {}) {
@@ -32,6 +80,68 @@ function producer(assignment: ManagedAssignment, options: { writes?: string[]; r
 }
 const context = (cwd: string) => ({ cwd }) as ExtensionToolContext;
 const result = { content: [{ type: "text" as const, text: "native result" }], details: undefined };
+
+test("readiness observes early rejection and completion, and permits a live entered operation", async () => {
+  const entered = Promise.withResolvers<void>(), operation = Promise.withResolvers<void>();
+  const failure = new Error("before entry");
+  await expect(awaitEntered(entered.promise, Promise.reject(failure))).rejects.toBe(failure);
+  await expect(awaitEntered(entered.promise, Promise.resolve())).rejects.toThrow("completed before readiness");
+  entered.resolve();
+  await awaitEntered(entered.promise, operation.promise);
+  operation.resolve();
+  await operation.promise;
+});
+
+test("a synchronous second start failure still releases callbacks, joins accepted work and preserves errors", async () => {
+  let directory = "", callbackSettled = false;
+  const callbackFailure = new Error("deferred callback failed"), releaseFailure = new Error("release failed");
+  let failure: unknown;
+  try {
+    await repository(async root => {
+      directory = root;
+      const assignment = new ManagedAssignment(root, [root]), managed = producer(assignment);
+      const entered = Promise.withResolvers<void>(), callback = Promise.withResolvers<void>();
+      const wrapped = managed.wrap({ name: "write", label: "write", description: "controlled callback", parameters: Type.Object({ path: Type.String() }),
+        async execute(_id, _params, _signal, onUpdate) { onUpdate?.(result); entered.resolve(); return result; } });
+      await withOperations(async own => {
+        const first = own(wrapped.execute("first", { path: "clean" }, undefined, () => callback.promise.then(() => {
+          expect(readFileSync(path.join(root, "clean"), "utf8")).toBe("base\n");
+          callbackSettled = true;
+          throw callbackFailure;
+        }), context(root)));
+        await awaitEntered(entered.promise, first);
+        own(wrapped.execute("second", { path: "clean" }, undefined, undefined, context(root)));
+      }, () => { callback.resolve(); throw releaseFailure; }, assignment);
+    });
+  } catch (error) { failure = error; }
+  expect(callbackSettled).toBe(true);
+  expect(existsSync(directory)).toBe(false);
+  expect(failure).toBeInstanceOf(AggregateError);
+  const errors = (failure as AggregateError).errors;
+  expect(errors[0].message).toContain("slot is occupied");
+  expect(errors[1]).toBe(releaseFailure);
+  expect(errors[2]).toBeInstanceOf(AggregateError);
+  expect(errors[2].errors).toContain(callbackFailure);
+});
+
+test("unknown closure retains the fixture root and reports its path even beside a primary failure", async () => {
+  let directory = "";
+  const primary = new Error("primary failure"), closure = new AgentClosureError([new Error("synthetic uncertainty")], "fixture");
+  try {
+    const run = temporaryRoot(async root => {
+      directory = root;
+      await withOperations(async own => { own(Promise.reject(closure)); throw primary; }, () => {});
+    });
+    await expect(run).rejects.toBeInstanceOf(AgentClosureError);
+    await expect(run).rejects.toThrow(`retained at ${directory}`);
+    expect(existsSync(directory)).toBe(true);
+    const error = await run.catch(error => error);
+    expect(error.errors[0].errors).toEqual(expect.arrayContaining([primary, closure]));
+  } finally {
+    // This synthetic closure owns no resources; only the retention decision is under test.
+    if (directory) rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 test("immutable eligibility separates staged, working, untracked, ignored and flagged admission preimages", () => repository(async (root, git) => {
   writeFileSync(path.join(root, "staged"), "staged\n"); git(["add", "staged"]);
@@ -95,25 +205,27 @@ test("native reservation precedes suspension, revalidates revision, fences effec
   const definition: ToolDefinition = { name: "write", label: "Native", description: "native", parameters: Type.Object({ path: Type.String() }),
     async execute(_id, _params, _signal, onUpdate) { nativeCalls++; entered.resolve(); onUpdate?.(result); return result; } };
   const wrapped = managed.wrap(definition);
-  const stale = wrapped.execute("stale", { path: "clean" }, undefined, undefined, context(root));
-  expect(() => assignment.assertIdle()).toThrow("still settling");
-  revision++;
-  await expect(stale).rejects.toThrow("revision changed");
-  expect(nativeCalls).toBe(0); expect(effects).toBe(0);
-  const movedContext = context(root);
-  const moved = wrapped.execute("moved", { path: "clean" }, undefined, undefined, movedContext);
-  movedContext.cwd = tmpdir();
-  await expect(moved).rejects.toThrow("launch root");
-  expect(nativeCalls).toBe(0); expect(effects).toBe(0);
-  const pending = wrapped.execute("live", { path: "clean" }, undefined, () => callback.promise, context(root));
-  try {
-    await entered.promise;
+  await withOperations(async own => {
+    const stale = wrapped.execute("stale", { path: "clean" }, undefined, undefined, context(root));
+    const staleRejected = own(rejectsWith(stale, "revision changed"), stale);
+    expect(() => assignment.assertIdle()).toThrow("still settling");
+    revision++;
+    await staleRejected;
+    expect(nativeCalls).toBe(0); expect(effects).toBe(0);
+    const movedContext = context(root);
+    const moved = wrapped.execute("moved", { path: "clean" }, undefined, undefined, movedContext);
+    const movedRejected = own(rejectsWith(moved, "launch root"), moved);
+    movedContext.cwd = tmpdir();
+    await movedRejected;
+    expect(nativeCalls).toBe(0); expect(effects).toBe(0);
+    const pending = own(wrapped.execute("live", { path: "clean" }, undefined, () => callback.promise, context(root)));
+    await awaitEntered(entered.promise, pending);
     expect(effects).toBe(1);
     expect(() => wrapped.execute("overlap", { path: "clean" }, undefined, undefined, context(root))).toThrow("slot is occupied");
     expect(() => assignment.assertIdle()).toThrow("still settling");
-    let settled = false; void pending.then(() => { settled = true; });
+    let settled = false; own(pending.then(() => { settled = true; }));
     await Promise.resolve(); expect(settled).toBe(false);
-  } finally { callback.resolve(); await pending; }
+  }, () => callback.resolve(), assignment);
   assignment.assertIdle();
   managed.cancel();
   expect(() => wrapped.execute("retired", { path: "clean" }, undefined, undefined, context(root))).toThrow("retired");
@@ -134,25 +246,34 @@ test("scope and symlink/move checks refuse before mutation, disjoint native prod
   const enteredA = Promise.withResolvers<void>(), enteredB = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
   const delayed = (entered: typeof enteredA): ToolDefinition => ({ name: "write", label: "write", description: "controlled suspension",
     parameters: Type.Object({ path: Type.String() }), async execute() { entered.resolve(); await release.promise; return result; } });
-  const first = a.wrap(delayed(enteredA)).execute("a", { path: "a/new" }, undefined, undefined, context(root));
-  const second = b.wrap(delayed(enteredB)).execute("b", { path: "b/new" }, undefined, undefined, context(root));
-  try { await Promise.all([enteredA.promise, enteredB.promise]); expect(assignment.snapshot().active).toBe(2); }
-  finally { release.resolve(); await Promise.allSettled([first, second]); }
+  await withOperations(async own => {
+    const first = own(a.wrap(delayed(enteredA)).execute("a", { path: "a/new" }, undefined, undefined, context(root)));
+    const second = own(b.wrap(delayed(enteredB)).execute("b", { path: "b/new" }, undefined, undefined, context(root)));
+    await Promise.all([awaitEntered(enteredA.promise, first), awaitEntered(enteredB.promise, second)]);
+    expect(assignment.snapshot().active).toBe(2);
+  }, () => release.resolve(), assignment);
   assignment.assertIdle();
 }));
 
-test("owned foreground bash waits for stream/cancel settlement and reports timeout without unknown closure", () => repository(async root => {
+test("owned foreground bash waits for stream/cancel settlement and reports timeout without unknown closure", () => temporaryRoot(async root => {
   const abort = new AbortController(), entered = Promise.withResolvers<void>();
   let output = "";
-  const command = foregroundBash.exec("printf ready; read -r line < /dev/zero", root, {
-    signal: abort.signal, onData(bytes) { output += bytes.toString(); entered.resolve(); },
-  });
-  try { await entered.promise; abort.abort(); await expect(command).rejects.toThrow("aborted"); expect(output).toContain("ready"); }
-  finally { abort.abort(); await command.catch(() => {}); }
-  await expect(foregroundBash.exec("read -r line < /dev/zero", root, { timeout: 0.02, onData() {} })).rejects.toThrow("timeout:");
-  await expect(foregroundBash.exec("true", root, { timeout: Infinity, onData() {} })).rejects.toThrow("Invalid timeout");
-  const successful = await foregroundBash.exec("printf check", root, { onData(bytes) { output += bytes.toString(); } });
-  expect(successful.exitCode).toBe(0); expect(output).toContain("check");
+  await withOperations(async own => {
+    const command = foregroundBash.exec("printf ready; read -r line < /dev/zero", root, {
+      signal: abort.signal, onData(bytes) { output += bytes.toString(); entered.resolve(); },
+    });
+    const aborted = own(rejectsWith(command, "aborted"), command);
+    await awaitEntered(entered.promise, command);
+    abort.abort();
+    await aborted;
+    expect(output).toContain("ready");
+    const timeout = foregroundBash.exec("read -r line < /dev/zero", root, { timeout: 0.02, onData() {} });
+    await own(rejectsWith(timeout, "timeout:"), timeout);
+    const invalid = foregroundBash.exec("true", root, { timeout: Infinity, onData() {} });
+    await own(rejectsWith(invalid, "Invalid timeout"), invalid);
+    const successful = await own(foregroundBash.exec("printf check", root, { onData(bytes) { output += bytes.toString(); } }));
+    expect(successful.exitCode).toBe(0); expect(output).toContain("check");
+  }, () => abort.abort());
 }));
 
 test("unknown producer closure blocks new work while a known pre-start refusal does not", () => repository(async root => {
