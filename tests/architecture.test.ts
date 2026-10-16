@@ -3,6 +3,7 @@ stubExternalFactories();
 import { expect, test } from "bun:test";
 import { mkdirSync, writeFileSync, existsSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { AsyncResource } from "node:async_hooks";
 import { workerHandoff, teamWorkerStatus } from "../extensions/agent/background.ts";
 import { firstTeamReservation } from "../extensions/team.ts";
 import { loadPitakoConfig } from "../extensions/roles/load.ts";
@@ -76,6 +77,22 @@ test("registered watched consultation delivers two intermediate turns, preserves
   } finally { release.resolve(); await s.close(); }
 }));
 
+test("bind-captured submit supports the first and subsequent authorized native turns", fixture.ownedCase("architecture captured submit", async () => {
+  const s = await setup();
+  try {
+    const start = await s.invoke("architecture_start", { mode: "consultation", goal: "captured submit" });
+    await Promise.race([s.knowledge[0]!.promise, s.delivered.promise]); await tick();
+    expect(s.seen.map(item => item.request.stage)).toContain("composition");
+    const specialist = s.seen.find(item => item.request.stage === "answer")!.session;
+    await s.invoke("architecture_control", { roomId: start.details.roomId, action: "context", text: "second native turn" });
+    await Promise.race([s.knowledge[1]!.promise, s.delivered.promise]); await tick();
+    expect(s.seen.filter(item => item.request.stage === "answer").map(item => item.session)).toEqual([specialist, specialist]);
+    await s.invoke("architecture_control", { roomId: start.details.roomId, action: "finish" }); await s.delivered.promise;
+    expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("completed");
+    expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
+  } finally { await s.close(); }
+}));
+
 test("optional strict configuration rejects malformed lists and absent config disables only architecture", fixture.ownedCase("architecture config", async () => {
   const s = await setup({ config: "" });
   try {
@@ -126,7 +143,7 @@ for (const invalid of ["snapshot", "model", "reasoning", "bind-reasoning", "miss
       }
       if (request.stage === "answer") {
         answerAttempts++;
-        const submit = session.tools.get("architecture_submit").definition;
+        const submit = session.boundTools.get("architecture_submit");
         if (invalid === "missing") return false;
         if (["conflict", "wrong-stage", "caller"].includes(invalid)) {
           const ctx = { sessionManager: session.sessionManager };
@@ -157,7 +174,7 @@ for (const invalid of ["snapshot", "model", "reasoning", "bind-reasoning", "miss
 }
 
 test("direct and codemode-reachable participant capabilities are leaf, and prior-turn submit grants are stale", fixture.ownedCase("architecture grants", async () => {
-  let forbiddenCalls = 0, oldSubmit: any;
+  let forbiddenCalls = 0, oldSubmit: (() => Promise<any>) | undefined;
   const external = new Map(["agent_spawn", "team_assign", "architecture_start", "architecture_control", "head_plan", "edit", "write", "apply_patch", "lsp_rename"].map(name =>
     [name, { definition: { name, execute(): { isError?: boolean } { forbiddenCalls++; return {}; } } }]));
   const s = await setup({ extensions: [{ resolvedPath: "controlled-capabilities", tools: external }], async prompt(session, request, body) {
@@ -168,11 +185,16 @@ test("direct and codemode-reachable participant capabilities are leaf, and prior
     }
     if (request.stage === "answer") {
       if (oldSubmit) {
-        expect((await oldSubmit.execute("stale", { submissionId: "old", body }, undefined, undefined, { sessionManager: session.sessionManager })).isError).toBe(true);
+        expect((await oldSubmit()).isError).toBe(true);
       }
-      oldSubmit = session.tools.get("architecture_submit").definition;
+      const submit = session.boundTools.get("architecture_submit");
+      expect(submit).toBe(session.tools.get("architecture_submit").definition);
+      // Retain the originating native async context, as a delayed tool callback would.
+      oldSubmit = AsyncResource.bind(() => submit.execute("stale", { submissionId: "old", body }, undefined, undefined, { sessionManager: session.sessionManager }));
+      const aborted = new AbortController(); aborted.abort();
+      expect((await submit.execute("aborted", { submissionId: "aborted", body }, aborted.signal, undefined, { sessionManager: session.sessionManager })).isError).toBe(true);
       const submitted = structuredClone(body);
-      expect((await oldSubmit.execute("immutable", { submissionId: "immutable", body: submitted }, undefined, undefined, { sessionManager: session.sessionManager })).isError).not.toBe(true);
+      expect((await submit.execute("immutable", { submissionId: "immutable", body: submitted }, undefined, undefined, { sessionManager: session.sessionManager })).isError).not.toBe(true);
       submitted.answer = "mutated after receipt";
       return false;
     }
@@ -185,6 +207,9 @@ test("direct and codemode-reachable participant capabilities are leaf, and prior
     await s.invoke("architecture_control", { roomId: start.details.roomId, action: "finish" }); await s.delivered.promise;
     expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("completed");
     expect(s.host.sessions).toHaveLength(2); expect(forbiddenCalls).toBe(0);
+    expect((await oldSubmit!()).isError).toBe(true); // retired origin after disposal
+    const specialist = s.host.sessions.find(session => session.prompts.some(text => JSON.parse(text).stage === "answer"))!;
+    expect((await specialist.boundTools.get("architecture_submit").execute("outside", {}, undefined, undefined, { sessionManager: specialist.sessionManager })).isError).toBe(true);
     expect(s.sent.filter(item => item.message.customType === "pitako.architecture.response")
       .every(item => JSON.parse(item.message.content).answer.body.answer.endsWith("🧠"))).toBe(true);
   } finally { await s.close(); }
@@ -208,6 +233,8 @@ for (const route of ["stop", "team_cancel"] as const) {
             children.push(session);
             if (children.length === (stage === "answer" ? 1 : 2)) entered.resolve();
             await releasePrompt.promise;
+            const rejected = await session.boundTools.get("architecture_submit").execute("after-abort", { submissionId: "late", body }, undefined, undefined, { sessionManager: session.sessionManager });
+            expect(rejected.isError).toBe(true);
             throw new Error("503 Service Unavailable");
           }
         },
