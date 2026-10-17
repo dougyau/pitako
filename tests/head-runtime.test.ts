@@ -1,11 +1,15 @@
+import { recoveryClock } from "./fixtures/recovery-clock.ts";
+import { Type } from "typebox";
 import { expect, test } from "bun:test";
-import { appendFileSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { SessionManager, type AgentBeforeSettleEvent, type ExtensionAPI, type ExtensionContext, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { AgentClosureError } from "../extensions/agent/closure.ts";
 import { loadPitakoConfig } from "../extensions/roles/load.ts";
 import { headExtension } from "../extensions/agent/head/tools.ts";
+import { reserveOperation, mutationGeneration } from "../extensions/agent/head/operation-leases.ts";
+import { acquireCheckpointLease } from "../extensions/agent/head/checkpoint-lease.ts";
 import { HeadAttachment } from "../extensions/agent/head/runtime.ts";
 import { createPiExecutor } from "../extensions/agent/pi.ts";
 import { runAgentInstance, type AgentRunResult } from "../extensions/agent/run.ts";
@@ -100,10 +104,9 @@ test("only the granted native Head receives closed child envelopes; offers are n
   expect(await waiting).toMatchObject({ details: [{ assignmentId: "assignment-one", childId: "child-one",
     result: { instanceId: childOutcome.instanceId } }] });
   const offered = await settlingBoundary;
-  expect(await event(boundary(false))).toMatchObject({ entries: offered.entries });
-  expect((await event(boundary(false))).continue).not.toBe(true);
+  expect(await event(boundary(false))).toBeUndefined();
   expect(offered).toMatchObject({ continue: true, entries: [{ customType: "pitako.head.result" }] });
-  expect(await event(boundary())).toEqual(offered); // callback return alone is not incorporation
+  expect(await event(boundary())).toBeUndefined(); // an open offer is neither receipt nor permission to duplicate
   const envelope = JSON.parse(offered.entries[0].content);
   envelope.result.result = "mutated caller copy";
   expect(JSON.parse((await result.execute("read", { childId: "child-one" })).content[0].text).result.result).toBe("controlled result");
@@ -241,4 +244,303 @@ test("unknown consultation retains the shared lease and yields bounded settlemen
   await head.boundary(binding, boundary(), manager);
   expect(await head.boundary(binding, boundary(), manager)).toBeUndefined();
   await expect(head.close()).rejects.toBeInstanceOf(AgentClosureError);
+}));
+
+const gateGrant = { durationMs: 15000, captureBytes: 65536, invocations: 8, artifactRoots: [], scratchRoots: ["scratch"] };
+async function gatedHead(overrides = {}, clock = recoveryClock()) {
+  const { root, load } = setup();
+  writeFileSync(path.join(root, "GATES.md"), "# Gates\nSelect the local component check. Manual review remains.\n");
+  mkdirSync(path.join(root, "component")); mkdirSync(path.join(root, "scratch"));
+  const head = new HeadAttachment("gated-assignment", root, { writes: ["product.md"], config: loadPitakoConfig(load),
+    executor: { async start() { throw new Error("not a leaf test"); } }, recoveryScheduler: clock.scheduler, verification: { ...gateGrant, ...overrides } });
+  head.claim("head-instance", root);
+  const binding = head.bind("head-instance");
+  const manager = SessionManager.create(root, path.join(root, ".pitako", "sessions"));
+  const local = await bind([headExtension(head, binding, () => manager)]);
+  const epoch = head.dag!.beginIntegration(binding, 0, manager.getBranch()).epoch;
+  const request = (shell: string, more = {}) => head.gates!.request(binding, { epoch, expectedRevision: 0,
+    coverage: "Selected component shell; manual review unrun", commands: [{ id: "local", shell, cwd: "component", env: {}, timeoutMs: 3000, ...more }] });
+  const completed = async () => {
+    const offered = await head.boundary(binding, boundary(false), manager);
+    for (const e of offered?.entries ?? []) if (e.type === "custom_message") manager.appendCustomMessageEntry(e.customType, e.content, e.display, e.details);
+    // Join the actual preparation/process/capture operation, not just the offered result.
+    await Promise.resolve();
+    return head.gates!.outcomes(binding).at(-1)!;
+  };
+  fixture.beforeRelease(() => head.close());
+  return { root, head, binding, manager, local, epoch, request, completed };
+}
+
+test("gate handle precedes filesystem/spawn; pre-macrotask cancel and retire launch zero commands", fixture.ownedCase("no late gate effects", async () => {
+  for (const retire of [false, true]) {
+    const h = await gatedHead();
+    const handle = h.request("printf started > ../scratch/started");
+    expect(h.head.gates!.status(h.binding, handle.runId).phase).toBe("preparing");
+    expect(existsSync(path.join(h.root, ".pitako/gates"))).toBe(false);
+    if (retire) h.head.revoke(); else h.head.gates!.cancel(h.binding, handle.runId);
+    await h.head.close();
+    expect(existsSync(path.join(h.root, "scratch/started"))).toBe(false);
+    expect(existsSync(path.join(h.root, ".pitako/gates"))).toBe(false);
+  }
+}));
+
+test("shared leases exclude an actually admitted writer and overlapping Heads/checkpoints, not disjoint reads", fixture.ownedCase("gate shared leases", async () => {
+  const h = await gatedHead();
+  const release = deferred(), entered = deferred();
+  // The same managed wrapper used by admitted Head tools surrounds real asynchronous effects.
+  const { ManagedProducer } = await import("../extensions/agent/head/managed-tools.ts");
+  const producer = new ManagedProducer(h.head.managed!, { writes: [path.join(h.root, "product.md")], check: () => 0, effects() {},
+    source: () => ({ kind: "head", instanceId: "head-instance", groupId: "group", historyId: "history", sessionId: "session" }) }, h.head.signal);
+  const native = producer.wrap({ name: "write", label: "write", description: "controlled writer", parameters: Type.Object({ path: Type.String() }),
+    async execute() { entered.resolve(); await release.promise; writeFileSync(path.join(h.root, "product.md"), "writer\n"); return { content: [], details: {} }; } });
+  const writing = native.execute("writer", { path: "product.md" }, undefined, undefined, { cwd: h.root } as never);
+  await entered.promise;
+  expect(() => h.request("printf blocked")).toThrow("active");
+  release.resolve(); await writing; await producer.settle();
+  const handle = h.request("printf component");
+  expect(() => reserveOperation(path.join(h.root, "component"), "writer")).toThrow("lease");
+  expect(() => acquireCheckpointLease(h.root)).toThrow("active");
+  expect(() => h.head.dag!.reopen(h.binding, h.epoch)).toThrow("lease");
+  expect(() => new HeadAttachment("other", h.root)).toThrow("lease");
+  await expect(h.head.dag!.finish(h.binding, { status: "completed", epoch: h.epoch, summary: "not done", verification: [handle.runId], limits: [] }, [])).rejects.toThrow("lease");
+  const disjoint = mkdtempSync(path.join(tmpdir(), "pitako-disjoint-")); fixture.directories.push(disjoint);
+  const independent = reserveOperation(disjoint, "writer"); independent.release();
+  expect(readFileSync(path.join(h.root, "GATES.md"), "utf8")).toContain("Manual");
+  expect((await h.completed()).outcome).toBe("passed");
+  await h.head.close();
+}));
+
+test("gate selection supports Markdown/component cwd, strips startup env, and exact receipt goes stale on new dirty inputs", fixture.ownedCase("gate evidence identity", async () => {
+  const h = await gatedHead();
+  const handle = h.request("test \"$PWD\" = \"$EXPECTED\" && test -z \"$BASH_ENV$ENV\" && printf 'markdown only\\n'", {
+    env: { EXPECTED: path.join(h.root, "component"), BASH_ENV: "/ungranted", ENV: "/ungranted" } });
+  expect(h.head.dag!.verificationEntries(h.binding, h.manager.getBranch())).toEqual([]);
+  const result = await h.completed();
+  expect(result).toMatchObject({ outcome: "passed", closure: "released", stale: false });
+  const entries = h.manager.getBranch();
+  const proof = h.head.dag!.verificationEntries(h.binding, entries).find(e => e.kind === "owned-gates")!;
+  expect(proof.entryId).toBeTruthy();
+  const receipt = entries.find(e => e.id === proof.entryId)!;
+  expect(h.head.dag!.verificationEntries(h.binding, [{ ...receipt, id: "copied" }] as never)).toEqual([]);
+  expect(() => h.head.gates!.status({}, handle.runId)).toThrow("retired");
+  writeFileSync(path.join(h.root, "new-product.md"), "new dirty input outside writes\n");
+  expect(h.head.dag!.verificationEntries(h.binding, entries)).toEqual([]);
+  await expect(h.head.dag!.finish(h.binding, { status: "completed", epoch: h.epoch, summary: "stale", verification: [proof.entryId], limits: [] }, entries)).rejects.toThrow("verification");
+  await h.head.close();
+}));
+
+test("a gate writing product becomes incomplete, and capture cap cannot silently pass", fixture.ownedCase("gate no silent correction", async () => {
+  const h = await gatedHead({ captureBytes: 16 });
+  h.request("printf corrected > ../new-product.md");
+  expect(await h.completed()).toMatchObject({ outcome: "incomplete", stale: true, complete: false });
+  h.request("printf 123456789012345678901234567890");
+  const capped = await h.completed();
+  expect(capped.outcome).toBe("incomplete"); expect(capped.complete).toBe(false);
+  expect(capped.bytes).toBe(16); expect(capped.diagnostic).toContain("cap");
+  expect(h.head.dag!.verificationEntries(h.binding, h.manager.getBranch())).toEqual([]);
+  await h.head.close();
+}));
+
+test("supported failed writers advance mutation generation before effects", fixture.ownedCase("gate generation", async () => {
+  const h = await gatedHead(); const before = mutationGeneration(h.root);
+  const lease = reserveOperation(h.root, "writer");
+  expect(mutationGeneration(h.root)).toBeGreaterThan(before);
+  lease.release();
+  h.request("printf pass"); expect((await h.completed()).candidate!.generation).toBeGreaterThan(before);
+  await h.head.close();
+}));
+
+
+test("head_wait is a typed deadline hold, steering/revoke interrupt it, and deadline/cancel join processes", fixture.ownedCase("gate wait lifecycle", async () => {
+  const h = await gatedHead();
+  const handle = h.request("exec sleep 30", { timeoutMs: 50 });
+  const cursor = (await h.head.dag!.wait(h.binding, 0)).cursor;
+  const waiting = h.local.tools.get("head_wait")!.execute("wait", { after: cursor });
+  expect(h.head.waitHold).toMatchObject({ kind: "owned-gates-wait", runId: handle.runId });
+  h.head.interruptWait(); await waiting;
+  expect(h.head.waitHold).toBeUndefined();
+  // Steering belongs to the next boundary; consuming it does not consume finish corrections.
+  await h.head.boundary(h.binding, boundary(false), h.manager);
+  expect((await h.completed()).outcome).toBe("timed-out");
+  const next = h.request("exec sleep 30");
+  const nextCursor = (await h.head.dag!.wait(h.binding, 0)).cursor;
+  const cancelledWait = h.local.tools.get("head_wait")!.execute("wait", { after: nextCursor });
+  h.head.gates!.cancel(h.binding, next.runId);
+  await cancelledWait; expect((await h.completed()).outcome).toBe("cancelled");
+  const finalCursor = (await h.head.dag!.wait(h.binding, 0)).cursor;
+  const revokedWait = h.local.tools.get("head_wait")!.execute("wait", { after: finalCursor });
+  const rejected = revokedWait.then(() => { throw new Error("revoked wait resolved"); }, (error: Error) => { expect(error.message).toContain("retired"); });
+  h.head.revoke(); await rejected; await h.head.close();
+}));
+
+
+test("internal capture exclusions do not authorize changing other project inputs", fixture.ownedCase("gate internal effects", async () => {
+  const h = await gatedHead();
+  h.request("printf changed > ../.pitako/project-input");
+  const result = await h.completed();
+  expect(result).toMatchObject({ outcome: "incomplete", stale: true, complete: false });
+  expect(result.candidate!.exclusions).not.toContain(".pitako");
+  expect(h.head.dag!.verificationEntries(h.binding, h.manager.getBranch())).toEqual([]);
+  await h.head.close();
+}));
+
+
+test("serial gates stop at the first real failure with remaining commands unrun and no retry", fixture.ownedCase("gate serial failure", async () => {
+  const h = await gatedHead();
+  const handle = h.head.gates!.request(h.binding, { epoch: h.epoch, expectedRevision: 0, coverage: "ordered Markdown checks; manual review remains",
+    commands: [
+      { id: "first", shell: "printf one", cwd: ".", env: {}, timeoutMs: 1000 },
+      { id: "failed", shell: "printf failure >&2; exit 9", cwd: "component", env: {}, timeoutMs: 1000 },
+      { id: "unrun", shell: "printf forbidden > scratch/unrun", cwd: ".", env: {}, timeoutMs: 1000 },
+    ] });
+  const outcome = await h.completed();
+  expect(outcome).toMatchObject({ outcome: "failed", closure: "released", complete: false,
+    commands: [{ state: "passed", exitCode: 0 }, { state: "failed", exitCode: 9 }, { state: "unrun", artifacts: [] }] });
+  expect(h.head.gates!.read(h.binding, handle.runId, "0-stdout").text).toBe("one");
+  expect(h.head.gates!.read(h.binding, handle.runId, "1-stderr").text).toBe("failure");
+  expect(existsSync(path.join(h.root, "scratch/unrun"))).toBe(false);
+  expect(h.head.dag!.verificationEntries(h.binding, h.manager.getBranch())).toEqual([]);
+  await h.head.close();
+}));
+
+
+test("owned scheduler releases a parked Head boundary after the stored gate outcome misses its fast wake", fixture.ownedCase("Head gates recovery producer", async () => {
+  const clock = recoveryClock({ suppressReady: true }), h = await gatedHead({}, clock);
+  expect(clock.pending).toBe(0);
+  const { manager, local } = h;
+  const anchor = manager.appendCustomMessageEntry("fixture.anchor", "prior", false);
+  const ready = deferred();
+  let notifications = 0;
+  clock.scheduler.notifyReady = () => { if (++notifications === 2) ready.resolve(); };
+  let responseSettled = false;
+  h.request("printf recovered");
+  const pending = local.events.get("agent_before_settle")!(boundary(false)).then((value: unknown) => { responseSettled = true; return value; });
+  // Gate outcome storage then actual owned-operation settlement both notify the same host.
+  await ready.promise;
+  expect(responseSettled).toBe(false);
+  expect(clock.pending).toBe(1);
+  clock.fire();
+  const offered = await pending as { entries: Array<{ customType: string; content: string; display: boolean; details: unknown }>; continue: boolean };
+  expect(offered.continue).toBe(true);
+  expect(offered.entries).toHaveLength(1);
+  const entry = offered.entries[0]!;
+  expect(entry.customType).toBe("pitako.head.gates");
+  expect(JSON.parse(entry.content)).toMatchObject({ outcome: "passed", closure: "released" });
+  expect(h.head.dag!.verificationEntries(h.binding, manager.getBranch())).toEqual([]);
+  // No event/timer duplicate while native commitment is outstanding.
+  clock.fire();
+  expect(await local.events.get("agent_before_settle")!(boundary(false))).toBeUndefined();
+  manager.appendCustomMessageEntry(entry.customType, entry.content, entry.display, entry.details);
+  await local.events.get("context")!({});
+  expect(h.head.dag!.verificationEntries(h.binding, manager.getBranch()).some(e => e.kind === "owned-gates")).toBe(true);
+  await local.events.get("turn_start")!({});
+  expect(clock.pending).toBe(0);
+  // A changed tree can invalidate evidence, but cannot rearm consumed liveness.
+  manager.branch(anchor);
+  expect(await local.events.get("agent_before_settle")!(boundary(false))).toBeUndefined();
+  expect(h.head.dag!.verificationEntries(h.binding, manager.getBranch())).toEqual([]);
+  expect(clock.pending).toBe(0);
+  await h.head.close();
+}));
+
+
+test("Head events and timer never duplicate an open gate offer, and closed boundaries share two total offers", fixture.ownedCase("Head recovery offer exhaustion", async () => {
+  const clock = recoveryClock(), h = await gatedHead({}, clock);
+  h.request("printf retained");
+  const event = h.local.events.get("agent_before_settle")!;
+  const first = await event(boundary(false));
+  clock.fire(); clock.fire();
+  expect(await event(boundary(false))).toBeUndefined();
+  await h.local.events.get("agent_settled")!({});
+  // A later safe boundary can retry the closed, uncommitted envelope, with exactly the same ID/body.
+  const second = await event(boundary(false));
+  expect(second.entries).toEqual(first.entries);
+  clock.fire();
+  expect(await event(boundary(false))).toBeUndefined();
+  await h.local.events.get("agent_settled")!({});
+  expect(clock.pending).toBe(0);
+  expect(await event(boundary(false))).toBeUndefined();
+  expect(h.head.workSnapshot().deliveries).toEqual([expect.objectContaining({ deliveryAttempts: 2,
+    deliveryDiagnostic: expect.stringContaining("exhausted") })]);
+  await h.head.close();
+}));
+
+test("Head receipt without an observed continuation stays blocked at final settlement and cannot create an idle prompt", fixture.ownedCase("Head unobserved continuation", async () => {
+  const clock = recoveryClock(), h = await gatedHead({}, clock);
+  h.request("printf ready");
+  const offered = await h.local.events.get("agent_before_settle")!(boundary(false));
+  const entry = offered.entries[0];
+  h.manager.appendCustomMessageEntry(entry.customType, entry.content, entry.display, entry.details);
+  await h.local.events.get("context")!({});
+  clock.fire();
+  expect(await h.local.events.get("agent_before_settle")!(boundary(false))).toBeUndefined();
+  await h.local.events.get("agent_settled")!({});
+  expect(clock.pending).toBe(0);
+  expect(h.head.workSnapshot().deliveries).toEqual([expect.objectContaining({ delivery: "incorporated", continuation: "blocked-unconfirmed" })]);
+  expect(await h.local.events.get("agent_before_settle")!(boundary(false))).toBeUndefined();
+  await h.head.close();
+}));
+
+test("the same host backstop recovers a retained consultation locally, not through foreground state", fixture.ownedCase("Head consultation recovery", async () => {
+  const { root, load } = setup();
+  appendFileSync(load.userConfigPath, '[model_policies.researcher.primary]\nmodel = "fixture/selected"\n');
+  const clock = recoveryClock({ suppressReady: true }), entered = deferred(), ready = deferred();
+  const outcome = Promise.withResolvers<import("../extensions/agent/run.ts").Attempt>();
+  let notifications = 0;
+  clock.scheduler.notifyReady = () => { if (++notifications === 2) ready.resolve(); };
+  const head = new HeadAttachment("consultation-recovery", root, { writes: [], config: loadPitakoConfig(load),
+    recoveryScheduler: clock.scheduler, executor: { async start() { entered.resolve(); return outcome.promise; } } });
+  fixture.beforeRelease(() => { outcome.resolve({ status: "completed", result: "controlled advice", sideEffects: false }); return head.close(); });
+  head.claim("head-instance", root);
+  const binding = head.bind("head-instance"), manager = SessionManager.inMemory(root);
+  const local = await bind([headExtension(head, binding, () => manager)]);
+  const ctx = { cwd: root, sessionManager: manager } as unknown as ExtensionContext;
+  await local.tools.get("head_consult")!.execute("consult", { role: "researcher", task: "advice" }, undefined, undefined, ctx);
+  await entered.promise;
+  let settled = false;
+  const pending = local.events.get("agent_before_settle")!(boundary()).then((value: unknown) => { settled = true; return value; });
+  outcome.resolve({ status: "completed", result: "controlled advice", sideEffects: false });
+  await ready.promise;
+  expect(settled).toBe(false);
+  clock.fire();
+  const offered = await pending as { entries: Array<{ customType: string; content: string; display: boolean; details: unknown }> };
+  expect(offered.entries).toHaveLength(1);
+  const entry = offered.entries[0]!;
+  expect(entry.customType).toBe("pitako.head.result");
+  expect(JSON.parse(entry.content)).toMatchObject({ purpose: "consultation", role: "researcher", outcome: "completed", result: { result: "controlled advice" } });
+  manager.appendCustomMessageEntry(entry.customType, entry.content, entry.display, entry.details);
+  await local.events.get("turn_start")!({});
+  expect(clock.pending).toBe(0);
+  expect(await local.events.get("agent_before_settle")!(boundary(false))).toBeUndefined();
+  await head.close();
+}));
+
+test("queued Head ticks cannot revive a retired attachment or a changed native owner during a parked await/callback", fixture.ownedCase("Head recovery lifecycle fences", async () => {
+  for (const change of ["retire", "during-await", "branch-callback", "error"] as const) {
+    const clock = recoveryClock(), h = await gatedHead({}, clock);
+    let current = h.manager;
+    const local = await bind([headExtension(h.head, h.binding, () => current)]);
+    const started = deferred(), release = deferred();
+    fixture.beforeRelease(() => release.resolve());
+    const operation = h.head.own(h.binding, async () => { started.resolve(); await release.promise; });
+    await started.promise;
+    const pending = local.events.get("agent_before_settle")!(boundary(false));
+    void pending.catch(() => {});
+    const queued = clock.take();
+    try {
+      if (change === "retire") h.head.revoke();
+      if (change === "during-await") current = SessionManager.inMemory(h.root);
+      if (change === "error") await local.events.get("message_end")!({ message: { role: "assistant", stopReason: "error" } });
+      if (change === "branch-callback") {
+        const original = h.manager.getBranch.bind(h.manager);
+        h.manager.getBranch = () => { current = SessionManager.inMemory(h.root); return original(); };
+      }
+      queued();
+      release.resolve(); await operation;
+      if (change === "error") expect(await pending).toBeUndefined();
+      else await expect(pending).rejects.toThrow("retired");
+      expect(clock.pending).toBe(0);
+    } finally { release.resolve(); await operation; }
+    await h.head.close();
+  }
 }));

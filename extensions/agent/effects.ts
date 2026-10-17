@@ -28,6 +28,7 @@ const READ_ONLY = new Set([
 ]);
 
 const MUTATING = new Set([
+  "head_gates",
   "edit",
   "write",
   "apply_patch",

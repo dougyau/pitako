@@ -114,7 +114,7 @@ export function readActivitySnapshot(
 /** Private to the driver's exact native session. The row receives only this capability. */
 export function createLiveHandle(session: Pick<AgentSession, "sessionId" | "sessionManager" | "sessionFile" | "steer">, history: {
   historyId: string; invocation: Pick<SessionHistory["invocation"], "origin" | "task">; append: SessionHistory["append"];
-}): {
+}, onQueued?: () => void): {
   handle: LiveHandle; open(): void; settle(): Promise<void>; event(event: AgentSessionEvent): void;
   capture(): TerminalActivitySnapshot;
 } {
@@ -181,6 +181,7 @@ export function createLiveHandle(session: Pick<AgentSession, "sessionId" | "sess
         try {
           const status = await session.steer(envelope, undefined, { source: "extension" });
           receipt.status = status === "handled" ? "handled" : revoked ? "unconfirmed" : status;
+          if (status === "queued" && !revoked) onQueued?.();
           receipt.delivery = status === "handled" ? "input hook consumed; not an answer" : "queued; provider delivery not yet confirmed";
         } catch (error) {
           receipt.status = "rejected"; receipt.reason = String(error);

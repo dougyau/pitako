@@ -1,3 +1,6 @@
+import { OwnerRecovery, offerEnvelope, recoveryPending, type DeliveryProgress, type RecoveryScheduler } from "../delivery.ts";
+import { reserveOperation } from "./operation-leases.ts";
+import { OwnedGates, type VerificationGrantInput } from "./gates.ts";
 import { randomUUID } from "node:crypto";
 import type { ClassifierResult } from "@earendil-works/pi-ai";
 import { relative as pathRelative } from "node:path";
@@ -21,7 +24,7 @@ export type HeadResultEnvelope = {
       outcome: "completed" | "failed" | "cancelled" | "no-worker"; instanceId?: string; result?: AgentRunResult; diagnostic?: string });
 type WorkPhase = "preflight" | "startup" | "running" | "cancelling" | "closed" | "unknown";
 interface OwnedWork {
-  childId: string; purpose: "developer" | "consultation"; binding: object;
+  childId: string; purpose: "developer" | "consultation"; binding: object; sharedLease: ReturnType<typeof reserveOperation>;
   phase: WorkPhase; started: boolean; closure: AgentClosure; controller: AbortController; signal: AbortSignal;
   envelope?: HeadResultEnvelope; delivery: "pending" | "incorporated" | "dropped";
   record?: ReturnType<typeof consultationRecord>;
@@ -42,20 +45,44 @@ export class HeadAttachment {
   private closing?: Promise<void>;
   private effects = false;
   private offered = new Set<string>();
+  private deliveries = new Map<string, DeliveryProgress & { binding: object }>();
+  private recovery?: OwnerRecovery;
+  private recoveryRestricted?: string;
+  private nativeCurrent?: () => boolean;
+  private nativeRetired = false;
+  private readonly recoveryScheduler?: RecoveryScheduler;
   closure: AgentClosure = { state: "pending" };
   readonly dag?: HeadDagRuntime;
   readonly managed?: ManagedAssignment;
   readonly checkpointOrigin?: CheckpointManifest;
+  readonly gates?: OwnedGates;
+  private steeringPending = false;
+  private waitingGates = 0;
+  get waitHold() { return this.waitingGates ? this.gates?.hold() : undefined; }
+  interruptWait(): void { this.steeringPending = true; this.dag?.changed("steering"); this.wake(); }
+  gateEpoch(binding: object) { this.check(binding); return this.dag!.gateEpoch(); }
+  gateIdle(binding: object) {
+    this.check(binding); this.managed?.assertGateIdle();
+    if (this.operations.size || this.unreleased().length || this.dag?.finishStatus) throw new Error("gate requires released owned operations");
+  }
+  gateUnknown(reason: string): void { this.failures.push(new AgentClosureError([new Error(reason)], "owned gates")); }
+  gateChanged(): void { this.dag?.changed("gates"); this.notifyReady(); }
+  async withGateWait<T>(work: () => Promise<T>): Promise<T> {
+    this.waitingGates++;
+    try { return await work(); } finally { this.waitingGates--; }
+  }
   private checkpointWriter?: CheckpointWriter;
   private checkpointCapture?: () => CheckpointNative["source"];
 
   constructor(readonly assignmentId: string, readonly executionRoot: string, options?: HeadDagOptions) {
     this.signal = this.controller.signal;
+    this.recoveryScheduler = options?.recoveryScheduler;
     if (options) this.dag = new HeadDagRuntime(this, options);
     assertNoCheckpointLease(this.dag?.graph.root ?? executionRoot);
     if (this.dag) {
       this.checkpointOrigin = options?.checkpoint_origin && adoptCheckpoint(this.dag.graph.root, options.checkpoint_origin, this.dag.graph.envelope);
       this.managed = new ManagedAssignment(this.dag.graph.root, this.dag.graph.envelope, this.checkpointOrigin);
+      if (options?.verification) this.gates = new OwnedGates(this, options.verification, options.evidenceRoot);
     }
   }
 
@@ -100,15 +127,34 @@ export class HeadAttachment {
     // Replacing a native binding synchronously invalidates every borrowed capability.
     this.wake();
     this.dag?.invalidateProposals();
-    this.binding = {};
-    return this.binding;
+    this.recovery?.close();
+    this.nativeCurrent = undefined;
+    this.nativeRetired = false;
+    const binding = {};
+    this.binding = binding;
+    this.recovery = new OwnerRecovery(() => {
+      try {
+        this.check(binding);
+        if (this.recoveryRestricted) return false;
+        this.syncDeliveries(binding);
+        return this.operations.size > 0 || [...this.deliveries.values()].some(state => state.binding === binding && recoveryPending(state));
+      } catch { this.recoveryRestricted = "captured Head owner retired or native binding changed"; return false; }
+    }, () => {
+      this.check(binding);
+      // Only release the parked native boundary. Never start a prompt/session.
+      this.wake();
+      this.check(binding);
+    }, this.recoveryScheduler);
+    return binding;
   }
 
   unbind(binding: object): void {
-    if (this.binding === binding) { this.binding = undefined; this.dag?.invalidateProposals(); this.wake(); }
+    if (this.binding === binding) { this.recovery?.close(); this.recoveryRestricted = "Head binding retired"; this.binding = undefined; this.dag?.invalidateProposals(); this.wake(); }
   }
 
   revoke(): void {
+    this.recovery?.close();
+    this.recoveryRestricted = "Head revoked";
     this.binding = undefined;
     this.controller.abort();
     for (const work of this.children.values()) if (work.closure.state === "pending") { work.phase = "cancelling"; work.controller.abort(); }
@@ -117,7 +163,56 @@ export class HeadAttachment {
   }
 
   check(binding: object): void {
-    if (binding !== this.binding || this.signal.aborted) throw new Error("Head binding is retired");
+    let current = false;
+    try { current = !this.nativeRetired && (!this.nativeCurrent || this.nativeCurrent()); } catch { /* retired native owner */ }
+    if (binding !== this.binding || this.signal.aborted || !current) {
+      if (binding === this.binding) {
+        this.nativeRetired = true; this.recoveryRestricted = "captured Head binding retired"; this.recovery?.close(); this.wake();
+      }
+      throw new Error("Head binding is retired");
+    }
+  }
+
+  bindNative(binding: object, current: () => boolean): void {
+    this.check(binding); this.nativeCurrent = current;
+  }
+  private progress(id: string): DeliveryProgress {
+    let state = this.deliveries.get(id);
+    if (!state) {
+      state = { binding: this.binding!, delivery: "pending", continuation: "not-requested", deliveryAttempts: 0,
+        wakeAttempts: 0, outstanding: false, busyContinuation: false };
+      this.deliveries.set(id, state);
+    }
+    return state;
+  }
+  private syncDeliveries(binding: object): void {
+    for (const child of this.children.values()) if (child.binding === binding && child.envelope && child.delivery !== "dropped")
+      this.progress(child.envelope.envelopeId);
+    for (const envelope of this.gates?.outcomes(binding) ?? []) this.progress(envelope.deliveryId);
+  }
+  observeTurn(binding: object, manager: Pick<SessionManager, "getBranch">): void {
+    this.observeReceipts(binding, manager);
+    for (const state of this.deliveries.values()) if (state.binding === binding && state.delivery === "incorporated" && state.continuation !== "observed") {
+      state.continuation = "observed"; state.outstanding = false;
+    }
+    this.recovery?.refresh();
+  }
+  settleDeliveries(binding: object, manager: Pick<SessionManager, "getBranch">, outcome = "completed"): void {
+    this.observeReceipts(binding, manager);
+    if (outcome !== "completed") this.recoveryRestricted = outcome;
+    for (const state of this.deliveries.values()) {
+      if (state.binding !== binding) continue;
+      state.outstanding = false;
+      if (state.continuation === "requested") {
+        state.continuation = "blocked-unconfirmed";
+        state.continuationDiagnostic = "busy continuation was not observed before final settlement";
+      }
+      recoveryPending(state);
+    }
+    this.recovery?.refresh();
+  }
+  restrictRecovery(binding: object, outcome: string): void {
+    this.check(binding); this.recoveryRestricted = outcome; this.wake();
   }
 
   /** Registers startup/preflight before it can suspend; admission must be checked after preflight. */
@@ -128,12 +223,13 @@ export class HeadAttachment {
       return operation();
     });
     this.operations.add(pending);
+    this.recovery?.refresh();
     void pending.then(
-      () => { this.operations.delete(pending); this.wake(); },
+      () => { this.operations.delete(pending); this.notifyReady(); },
       error => {
         this.operations.delete(pending);
         if (error instanceof AgentClosureError) this.failures.push(error);
-        this.wake();
+        this.notifyReady();
       },
     );
     return pending;
@@ -150,17 +246,23 @@ export class HeadAttachment {
     if (this.children.has(childId)) throw new Error("Head child already reserved");
     if (this.dag && this.unreleased().length >= this.dag.maxParallel) throw new Error("Head parallel limit is occupied");
     const controller = new AbortController();
-    const work: OwnedWork = { childId, purpose, binding, controller,
+    const sharedLease = reserveOperation(this.managed?.root, "writer");
+    const work: OwnedWork = { childId, purpose, binding, controller, sharedLease,
       signal: AbortSignal.any([controller.signal, this.signal, ...(signal ? [signal] : [])]),
       phase: "preflight", started: false, closure: { state: "pending" }, delivery: "pending" };
     this.children.set(childId, work);
     this.admitted();
+    this.recovery?.refresh();
     return work;
   }
   observeReceipts(binding: object, manager: Pick<SessionManager, "getBranch">): void {
     this.check(binding);
     const branch = manager.getBranch();
     this.check(binding);
+    this.syncDeliveries(binding);
+    this.gates?.drafts(binding, branch);
+    this.check(binding);
+    for (const id of this.gates?.deliveryReceipts(binding) ?? []) this.progress(id).delivery = "incorporated";
     for (const work of this.children.values()) {
       const envelope = work.envelope;
       if (!envelope || work.binding !== binding || work.delivery !== "pending") continue;
@@ -168,6 +270,7 @@ export class HeadAttachment {
           entry.content === JSON.stringify(envelope) && entry.details && typeof entry.details === "object" &&
           "envelopeId" in entry.details && entry.details.envelopeId === envelope.envelopeId)) {
         work.delivery = "incorporated";
+        this.progress(envelope.envelopeId).delivery = "incorporated";
         work.record?.event("delivery", { state: "incorporated", envelopeId: envelope.envelopeId });
         this.dag?.consultationChanged("received", work);
         this.wake();
@@ -196,7 +299,7 @@ export class HeadAttachment {
       received: work.delivery === "incorporated", delivery: work.delivery, envelope: work.envelope });
   }
   workSnapshot() {
-    return { retained: this.unreleased().length, operations: this.operations.size, maxParallel: this.dag?.maxParallel,
+    return { recoveryRestricted: this.recoveryRestricted, deliveries: [...this.deliveries].map(([id, { binding: _binding, ...state }]) => ({ id, ...state })), retained: this.unreleased().length, operations: this.operations.size, maxParallel: this.dag?.maxParallel,
       leases: [...this.children.values()].map(work => ({ childId: work.childId, purpose: work.purpose,
         phase: work.phase, closure: structuredClone(work.closure), delivery: work.delivery })) };
   }
@@ -283,7 +386,7 @@ export class HeadAttachment {
       } finally {
         retired();
         dag.consultationChanged("closed", work);
-        this.wake();
+        this.notifyReady();
       }
     });
     void pending.catch(error => {
@@ -315,7 +418,7 @@ export class HeadAttachment {
         const result = await run(this.signal);
         child.closure = { state: "released" };
         child.envelope = { envelopeId: randomUUID(), assignmentId: this.assignmentId, childId, ...context?.(), result: structuredClone(result) };
-        this.wake();
+        this.notifyReady();
         return result;
       } catch (error) {
         child.closure = error instanceof AgentClosureError
@@ -362,13 +465,29 @@ export class HeadAttachment {
   async boundary(binding: object, event: AgentBeforeSettleEvent, manager: Pick<SessionManager, "getBranch">): Promise<AgentBeforeSettleEventResult | undefined> {
     this.check(binding);
     this.observeReceipts(binding, manager);
-    if (event.outcome !== "completed") return;
+    if (event.outcome !== "completed") { this.restrictRecovery(binding, event.outcome); return; }
+    if (this.recoveryRestricted) return;
+    this.gates?.drafts(binding, manager.getBranch());
+    this.check(binding);
     // Join only progressing producers. Receipt-only/unknown ownership never waits for itself.
-    while (this.operations.size && ![...this.children.values()].some(child => child.envelope && child.delivery === "pending")) {
-      await new Promise<void>(resolve => { const done = () => { this.waiters.delete(done); resolve(); }; this.waiters.add(done); });
+    while (this.operations.size && !this.recoveryRestricted && !this.steeringPending && !this.gates?.ready(binding) && ![...this.children.values()].some(child => child.binding === binding && child.envelope && child.delivery === "pending")) {
+      await this.withGateWait(() => new Promise<void>(resolve => { const done = () => { this.waiters.delete(done); resolve(); }; this.waiters.add(done); }));
       this.check(binding); this.observeReceipts(binding, manager);
     }
-    const entries: NonNullable<AgentBeforeSettleEventResult["entries"]> = [];
+    if (this.recoveryRestricted) return;
+    const steering = this.steeringPending; this.steeringPending = false;
+    const branch = manager.getBranch(); this.check(binding);
+    const canOffer = (id: string) => {
+      this.check(binding);
+      const state = this.progress(id);
+      if (this.recoveryRestricted || state.continuation === "observed" || state.delivery === "incorporated" || state.outstanding || state.deliveryAttempts >= 2) return false;
+      offerEnvelope(state, undefined);
+      state.busyContinuation = true; state.continuation = "requested";
+      return true;
+    };
+    const gateEntries = this.gates?.drafts(binding, branch, canOffer) ?? [];
+    const entries: NonNullable<AgentBeforeSettleEventResult["entries"]> = [...gateEntries];
+    this.check(binding);
     for (const child of this.children.values()) {
       const envelope = child.envelope;
       if (!envelope || child.binding !== binding || child.delivery === "dropped") continue;
@@ -378,14 +497,18 @@ export class HeadAttachment {
         entry.details && typeof entry.details === "object" && "envelopeId" in entry.details &&
         entry.details.envelopeId === envelope.envelopeId);
       this.check(binding);
-      if (!incorporated) {
+      if (!incorporated && canOffer(envelope.envelopeId)) {
         entries.push({ type: "custom_message", customType: "pitako.head.result", content, display: true,
           details: { envelopeId: envelope.envelopeId, assignmentId: this.assignmentId, childId: envelope.childId,
             ...(this.dag && this.offered.has(envelope.envelopeId) ? { deliveryGap: "Prior offer not observed in the current native branch" } : {}) } });
         this.offered.add(envelope.envelopeId);
       }
     }
-    if (entries.length) return { entries, ...(event.context.canContinue ? { continue: true } : {}) };
+    this.recovery?.refresh();
+    if (entries.length) return { entries, ...(gateEntries.length || event.context.canContinue ? { continue: true } : {}) };
+    if (steering) return { continue: true };
+    if (this.gates?.pending() || [...this.deliveries.values()].some(state => state.binding === binding &&
+        state.outstanding && state.delivery !== "incorporated")) return;
     if (this.dag && event.context.canContinue) return this.dag.boundary(binding, entries, manager);
     return;
   }
@@ -415,7 +538,14 @@ export class HeadAttachment {
     this.closure = { state: "unknown", reason: error.message };
   }
 
-  private wake(): void { for (const wake of [...this.waiters]) wake(); }
+  releaseSettledWork(): void {
+    for (const work of this.children.values()) {
+      if (work.closure.state === "unknown") work.sharedLease.unknown(work.closure.reason);
+      else if (work.closure.state === "released") work.sharedLease.release();
+    }
+  }
+  private notifyReady(): void { this.releaseSettledWork(); if (this.recovery) this.recovery.ready(() => this.wake()); else this.wake(); }
+  private wake(): void { this.releaseSettledWork(); for (const wake of [...this.waiters]) wake(); this.recovery?.refresh(); }
 }
 
 /** Read-only reservation, not a Head or Developer scope capability. Shell remains cooperative. */
@@ -440,10 +570,13 @@ export class ConsultationAttachment {
 }
 
 export interface HeadDagOptions {
+  recoveryScheduler?: RecoveryScheduler;
   writes: string[];
   config: PitakoConfig;
   executor: AttemptExecutor;
   checkpoint_origin?: CheckpointOrigin;
+  verification?: VerificationGrantInput;
+  evidenceRoot?: string;
   /** Host boundary injection for controlled tests; snapshots still confer no start authority. */
   preflight?: typeof developerCapacityPreflight;
 }
@@ -895,6 +1028,7 @@ export class HeadDagRuntime {
   consultationChanged(kind: string, work: OwnedWork): void {
     if (work.purpose !== "consultation") return;
     const event = { sequence: ++this.sequence, kind, purpose: "consultation" as const, childId: work.childId };
+    this.owner.releaseSettledWork();
     this.events.push(event);
     if (this.events.length > 512) this.events.shift();
     if (kind === "running") this.peak = Math.max(this.peak, this.owner.runningCount);
@@ -904,6 +1038,7 @@ export class HeadDagRuntime {
   changed(kind: string, run?: HeadAttempt): void {
     if (kind === "running") this.peak = Math.max(this.peak, this.owner.runningCount);
     const event = { sequence: ++this.sequence, kind, runId: run?.runId, effectiveRevision: run?.effectiveRevision };
+    this.owner.releaseSettledWork();
     this.events.push(event);
     this.record(kind, { ...event, graphRevision: this.graph.revision,
       ...(run ? { nodeId: run.nodeId, phase: run.lease.phase, closure: run.lease.closure, proposals: run.proposals } : {}) });
@@ -925,6 +1060,7 @@ export class HeadDagRuntime {
       .flatMap(event => event.runId ? [event.runId] : []))].map(runId => this.result(binding, runId));
     return { cursor: this.sequence, events,
       gap: after < (this.events[0]?.sequence ?? 1) - 1 ? "Earlier events omitted" : undefined,
+      gates: this.owner.gates?.outcomes(binding) ?? [],
       outcomes: [...outcomes, ...this.owner.consultationResults(binding).filter(result => events.some(event => event.childId === result.childId && event.kind === "closed"))] };
   }
   private invalidateRunProposals(run: HeadAttempt): void {
@@ -940,6 +1076,10 @@ export class HeadDagRuntime {
     return this.active().map(run => new Error(`Head run ${run.runId} closure ${run.lease.closure.state}: ${run.lease.closure.state === "unknown" ? run.lease.closure.reason : "unsettled"}`));
   }
 
+  gateEpoch() {
+    if (!this.barrier || this.finished) throw new Error("gates require current integration epoch");
+    return { epoch: this.barrier.epoch, revision: this.barrier.revision };
+  }
   get executor(): AttemptExecutor { return this.options.executor; }
   assertAdmissionsOpen(): void { this.owner.managed?.assertWritable(); this.assertOpen(); }
   private assertOpen(): void {
@@ -973,16 +1113,16 @@ export class HeadDagRuntime {
   }
   codingAllowed(binding: object): boolean {
     this.owner.check(binding);
-    this.owner.managed?.assertHealthy();
+    this.owner.managed?.assertWritable();
     return Boolean(this.barrier && !this.finished && !this.owner.unreleased().length && !this.owner.ownedOperations);
   }
   verificationEntries(binding: object, entries: ReturnType<SessionManager["getBranch"]>) {
     this.owner.check(binding);
     const barrier = this.barrier;
     if (!barrier) return [];
-    return entries.flatMap(entry => entry.type === "message" && !barrier.before.has(entry.id) &&
+    return [...(this.owner.gates?.verification(binding, entries) ?? []), ...entries.flatMap(entry => entry.type === "message" && !barrier.before.has(entry.id) &&
       entry.message.role === "toolResult" && !entry.message.isError && !entry.message.toolName.startsWith("head_") && entry.message.toolName !== "consultation_feedback"
-      ? [{ entryId: entry.id, toolCallId: entry.message.toolCallId, toolName: entry.message.toolName }] : []);
+      ? [{ kind: "native-tool" as const, entryId: entry.id, toolCallId: entry.message.toolCallId, toolName: entry.message.toolName }] : [])];
   }
   async finish(binding: object, finish: HeadFinish, entries: ReturnType<SessionManager["getBranch"]>) {
     this.owner.check(binding);
@@ -998,7 +1138,7 @@ export class HeadDagRuntime {
           this.owner.unreleased().length || this.owner.ownedOperations) throw new Error("stale or unavailable Head integration barrier");
       const observed = new Set(this.verificationEntries(binding, entries).map(entry => entry.entryId));
       if (!finish.verification.every(ref => observed.has(ref))) {
-        throw new Error("verification must reference successful native tool results in this Head after this barrier");
+        throw new Error("verification must reference successful native tool results or current released owned-gates evidence in this Head after this barrier");
       }
       this.finished = structuredClone(finish);
     } else {

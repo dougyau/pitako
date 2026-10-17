@@ -478,6 +478,7 @@ async function runConversationTurn(input: AgentRunInput, state: ConversationStat
     // publish so activeTool shows (cursor-native) and tok/s hides.
     if (hasHold && !hadHold) freezeStream(throughput, t);
     const before = activity.phase;
+    activity.ownedGatesWait = input.head?.waitHold;
     const verdict = evaluateWatchdog(activity, input.watchdog ?? loaded.watchdog, t);
     if (hasHold !== hadHold || activity.phase !== before) refresh();
     if (verdict === "stalled" || verdict === "max_runtime") {

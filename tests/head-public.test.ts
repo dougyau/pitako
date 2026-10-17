@@ -3,6 +3,7 @@ import { preparedTool } from "./fixtures/background-dispatch.ts";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { createCodingTools, type AgentBeforeSettleEventResult, type ExtensionAPI, type ExtensionContext, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import agentExtension from "../extensions/agent/index.ts";
@@ -17,6 +18,8 @@ import { WorkerHistory } from "../extensions/agent/history.ts";
 import { openBoard } from "../extensions/board/store.ts";
 import { currentWorkspace } from "../extensions/board/workspace.ts";
 import { openExecutionPlan, planFile, readLedgerTeamHolds } from "../extensions/workflow.ts";
+import { principalLeases, reserveOperation } from "../extensions/agent/head/operation-leases.ts";
+import { AgentClosureError } from "../extensions/agent/closure.ts";
 import { classifyProviderFailure } from "../extensions/agent/fallback.ts";
 
 const fixture = agentFixtureOwnership();
@@ -33,8 +36,9 @@ async function bind(factories: ExtensionFactory[], appendEntry: ExtensionAPI["ap
   return { tools, events };
 }
 
-async function harness(options: { headPolicy?: boolean; final?: "stop" | "error" | "aborted"; missingCost?: boolean; gitRepository?: boolean; headFallback?: boolean; ordinarySdk?: boolean;
+async function harness(options: { separateAgentDir?: boolean; headPolicy?: boolean; final?: "stop" | "error" | "aborted"; missingCost?: boolean; gitRepository?: boolean; headFallback?: boolean; ordinarySdk?: boolean;
   workerCreate?: { entered: ReturnType<typeof gate>; release: ReturnType<typeof gate> };
+  afterText?: (session: any, local: Local) => Promise<void>;
   root?: string; seed?: (root: string) => void | Promise<void>; cutReceipt?: boolean; finalError?: string; objectFormat?: "sha256" } = {}) {
   const root = options.root ?? mkdtempSync(path.join(tmpdir(), "pitako-head-public-"));
   if (!options.root) fixture.directories.push(root);
@@ -42,9 +46,11 @@ async function harness(options: { headPolicy?: boolean; final?: "stop" | "error"
     execFileSync("git", ["init", "--quiet", ...(options.objectFormat ? [`--object-format=${options.objectFormat}`] : []), root]);
     execFileSync("git", ["-C", root, "-c", "user.name=Fixture", "-c", "user.email=fixture@invalid", "commit", "--quiet", "--allow-empty", "-m", "admission"]);
   }
-  process.env.PI_CODING_AGENT_DIR = root;
+  const agentDir = options.separateAgentDir ? mkdtempSync(path.join(tmpdir(), "pitako-head-agent-")) : root;
+  if (agentDir !== root) fixture.directories.push(agentDir);
+  process.env.PI_CODING_AGENT_DIR = agentDir;
   await options.seed?.(root);
-  const configFile = path.join(root, "pitako/config.toml");
+  const configFile = path.join(agentDir, "pitako/config.toml");
   mkdirSync(path.dirname(configFile), { recursive: true });
   writeFileSync(configFile, `
 [model_policies.developer.primary]
@@ -100,6 +106,8 @@ classifier_model = "classifier"
       session.getAllTools = () => [...headLocal.tools.keys(), "agent_spawn", "team_assign"].map(name => ({ name }));
     },
     prompt: async session => {
+      (session as any).steer = async () => "queued";
+      for (const hook of headLocal.events.get("turn_start") ?? []) await hook({});
       headEntered.resolve();
       await headDone.promise;
       Object.assign(session.stats, {
@@ -110,6 +118,7 @@ classifier_model = "classifier"
         stopReason: options.final ?? "stop", errorMessage: options.final === "error" ? options.finalError ?? "controlled failure" : undefined };
       session.messages.push(message);
       session.sessionManager.appendMessage(message as never);
+      await options.afterText?.(session, headLocal).catch(error => { console.error(error); throw error; });
     },
     abort: () => { headAborted.resolve(); headDone.resolve(); },
   });
@@ -204,7 +213,7 @@ classifier_model = "classifier"
   };
   const settle = async () => { headDone.resolve(); await fixture.settleRuns(); };
   return { root, evaluation, ctx, leaf, host, workers, headEntered, headAborted, callPublic, call, callLeaf, read, closed, settle,
-    delivery, deliver: () => deliverWorkerResults(ownerToken, true), publicTools: publicLocal.tools, headLocal: () => headLocal, headSession: () => headSession,
+    headDone, delivery, deliver: () => deliverWorkerResults(ownerToken, true), publicTools: publicLocal.tools, headLocal: () => headLocal, headSession: () => headSession,
     counts: () => ({ starts, leafStarts, classifications }),
     outcome: (id: string, team = false) => team ? teamWorkerResult(evaluation.token, id) : workerResult(id) };
 }
@@ -988,7 +997,7 @@ test("public Team Head completes direct product work with no leaves through the 
   await h.call("bash", { command: 'test "$(cat direct.txt)" = direct' });
   const checked = h.headSession().sessionManager.getLeafId();
   const candidates = (await h.read()).verificationCandidates;
-  expect(candidates).toContainEqual({ entryId: checked,
+  expect(candidates).toContainEqual({ kind: "native-tool", entryId: checked,
     toolCallId: h.headSession().sessionManager.getEntry(checked).message.toolCallId, toolName: "bash" });
   const finish = {
     status: "completed" as const, epoch: barrier.epoch, summary: "Implemented and checked direct product work",
@@ -1124,7 +1133,10 @@ test("public spawn grants read-only Head; native offers are not receipts and inv
     return result;
   };
   const event = { outcome: "completed", context: { canContinue: true } };
-  const first = await boundary(event), replay = await boundary(event);
+  const first = await boundary(event);
+  expect(await boundary(event)).toBeUndefined(); // An open offer waits for its receipt, not elapsed callbacks.
+  for (const hook of h.headLocal().events.get("agent_settled") ?? []) await hook({});
+  const replay = await boundary(event);
   const envelope = first?.entries?.find(entry => entry.type === "custom_message" && entry.customType === "pitako.head.result");
   const repeated = replay?.entries?.find(entry => entry.type === "custom_message" && entry.customType === "pitako.head.result");
   if (envelope?.type !== "custom_message" || repeated?.type !== "custom_message" || typeof envelope.content !== "string") {
@@ -1132,6 +1144,7 @@ test("public spawn grants read-only Head; native offers are not receipts and inv
   }
   expect(repeated.details).toMatchObject({ envelopeId: JSON.parse(envelope.content).envelopeId,
     deliveryGap: expect.stringContaining("Prior offer") });
+  expect(repeated.content).toBe(envelope.content);
   h.headSession().sessionManager.appendCustomMessageEntry(envelope.customType, envelope.content, true, envelope.details);
   const correction = await boundary(event);
   expect(correction?.continue).toBe(true); // Offers do not consume the missing-finish correction.
@@ -1386,4 +1399,191 @@ for (const stage of ["discovery", "classify"] as const) test(`Head cancellation 
   await Promise.resolve(); expect(settled).toBe(false); expect(h.workers.sessions).toHaveLength(0);
   release.resolve(); await settling;
   expect(h.workers.sessions).toHaveLength(0); expect(h.outcome(admission.details.instanceId).status).toBe("cancelled");
+}));
+
+const verificationGrant = { durationMs: 15000, captureBytes: 65536, invocations: 3, artifactRoots: [], scratchRoots: ["scratch"] };
+test("granted admitted Head waits interruptibly, receives native failed gate and corrects in the SAME one-shot", fixture.ownedCase("owned gate early decisive route", async () => {
+  const boundaryEntered = gate(), steeringContinuation = gate(), requestNext = gate(), finished = gate();
+  let first: any, second: any, epoch: string, receipt: string, native: string | undefined;
+  const delivered: any[] = [];
+  const h = await harness({ gitRepository: true, separateAgentDir: true,
+    seed(root) {
+      writeFileSync(path.join(root, "GATES.md"), "# Checks\nRun the local selected shell. Manually review stdout and stderr.\n");
+      mkdirSync(path.join(root, "scratch")); execFileSync("mkfifo", [path.join(root, "scratch/release")]);
+    },
+    afterText: async (session, local) => {
+      // SDK boundary double controls only the event, native commit, and legal continuation.
+      // The subprocess/outcome/capture are produced by the real host tool.
+      const beforeSettle = async () => {
+        let offered: any;
+        boundaryEntered.resolve();
+        for (const hook of local.events.get("agent_before_settle") ?? []) offered = await hook({ outcome: "completed", context: { canContinue: false } }) ?? offered;
+        if (offered?.entries) for (const e of offered.entries) {
+          const id = session.sessionManager.appendCustomMessageEntry(e.customType, e.content, e.display, e.details);
+          delivered.push({ id, ...e });
+        }
+        return offered;
+      };
+      native = session.sessionId;
+      const steering = await beforeSettle();
+      expect(steering).toEqual({ continue: true }); // no result exists yet
+      steeringContinuation.resolve();
+      expect((await beforeSettle())?.continue).toBe(true);
+      const failed = delivered.find(e => e.customType === "pitako.head.gates");
+      first = JSON.parse(failed.content);
+      expect(first).toMatchObject({ outcome: "failed", closure: "released", complete: false, commands: [{ exitCode: 7 }] });
+      expect(first.commands[0].artifacts).toEqual(["0-stdout", "0-stderr"]);
+      expect((await h.call("head_gates", { action: "read", runId: first.runId, artifact: "0-stdout" })).text).toBe("local stdout\n");
+      expect((await h.call("head_gates", { action: "read", runId: first.runId, artifact: "0-stderr" })).text).toBe("local stderr\n");
+      await h.call("write", { path: "product.md", content: "authorized correction\n" });
+      const handle = await h.call("head_gates", { action: "request", epoch, expectedRevision: 0, coverage: "Check corrected Markdown; manual review remains", commands: [{ id: "corrected", shell: "test -f product.md && printf 'corrected pass\\n'", cwd: ".", env: {}, timeoutMs: 3000 }] });
+      expect(handle.state).toBe("preparing");
+      requestNext.resolve();
+      expect((await beforeSettle())?.continue).toBe(true);
+      second = JSON.parse(delivered.filter(e => e.customType === "pitako.head.gates").at(-1).content);
+      expect(second).toMatchObject({ outcome: "passed", closure: "released", complete: true, stale: false });
+      expect(second.candidate).not.toEqual(first.candidate);
+      expect(second.runId).not.toBe(first.runId);
+      expect(session.sessionId).toBe(native);
+      const candidates = (await h.read()).verificationCandidates;
+      const proof = candidates.find((c: any) => c.kind === "owned-gates");
+      receipt = proof.entryId;
+      expect(proof.runId).toBe(second.runId);
+      await h.call("head_finish", { status: "completed", epoch, summary: "Selected gates passed after correction", verification: [receipt], limits: ["Manual review is not automated"] });
+      finished.resolve();
+    },
+  });
+  const admitted = await h.callPublic("agent_spawn", { role: "developer", mode: "head", writes: ["product.md"], verification: verificationGrant, task: "owned gates" });
+  await h.headEntered.promise;
+  expect(h.headSession().active).toContain("head_gates");
+  epoch = (await h.call("head_plan", { action: "beginIntegration", expectedRevision: 0 })).epoch;
+  const handle = await h.call("head_gates", { action: "request", epoch, expectedRevision: 0, coverage: "Run failing local stdout/stderr selection; manual review unrun", commands: [{ id: "fails", shell: "printf 'local stdout\\n'; printf 'local stderr\\n' >&2; read -r release < scratch/release; exit 7", cwd: ".", env: {}, timeoutMs: 5000 }] });
+  expect(handle.state).toBe("preparing");
+  expect((await h.call("head_gates", { action: "status", runId: handle.runId })).phase).toBe("preparing");
+  h.headDone.resolve(); await boundaryEntered.promise;
+  const target = { kind: "background", instanceId: admitted.details.instanceId };
+  const observed = (await h.callPublic("agent_observe", { target })).details;
+  const input = await h.callPublic("agent_input", { target, historyId: observed.historyId, sessionId: observed.sessionId, intent: "steer", text: "Retain the failed outcome, then correct inside writes and run again" });
+  expect(input.details.status).toBe("queued");
+  await steeringContinuation.promise;
+  expect(delivered).toEqual([]); // queued woke the wait BEFORE gate completion
+  await writeFile(path.join(h.root, "scratch/release"), "release\n");
+  await requestNext.promise; await finished.promise; await h.settle();
+  expect(h.host.sessions).toHaveLength(1);
+  expect(h.outcome(admitted.details.instanceId)?.status).toBe("completed");
+  expect(receipt!).toBeTruthy();
+  expect(native).toBeString();
+  console.log("Observed early gate route identities: " + JSON.stringify({ native, receipt: receipt!,
+    first: { runId: first.runId, deliveryId: first.deliveryId, candidate: first.candidate },
+    second: { runId: second.runId, deliveryId: second.deliveryId, candidate: second.candidate } }));
+}));
+
+for (const final of ["stop", "aborted"] as const) test(`gate receipt never overrides final SDK ${final} without legal continuation`, fixture.ownedCase("gate SDK final " + final, async () => {
+  let retained: any;
+  const h = await harness({ final, separateAgentDir: true,
+    seed(root) { writeFileSync(path.join(root, "GATES.md"), "# Checks\nVerify this Markdown guide exists; manual review remains.\n"); },
+    afterText: async (session, local) => {
+      let offered: any;
+      for (const hook of local.events.get("agent_before_settle") ?? []) offered = await hook({ outcome: "completed", context: { canContinue: false } }) ?? offered;
+      expect(offered.continue).toBe(true);
+      for (const entry of offered.entries) {
+        const id = session.sessionManager.appendCustomMessageEntry(entry.customType, entry.content, entry.display, entry.details);
+        retained = { id, ...JSON.parse(entry.content) };
+      }
+      // The SDK boundary double commits but refuses the requested continuation (or aborts).
+      // No Head finish and no replacement prompt/session may manufacture success.
+    } });
+  const admitted = await h.callPublic("agent_spawn", { role: "developer", mode: "head", writes: [], verification: verificationGrant, task: "SDK final boundary" });
+  await h.headEntered.promise;
+  const barrier = await h.call("head_plan", { action: "beginIntegration", expectedRevision: 0 });
+  await h.call("head_gates", { action: "request", epoch: barrier.epoch, expectedRevision: 0, coverage: "Markdown guide prerequisite; manual review unrun",
+    commands: [{ id: "guide", shell: "test -s GATES.md", cwd: ".", env: {}, timeoutMs: 3000 }] });
+  h.headDone.resolve(); await h.settle();
+  expect(retained).toMatchObject({ outcome: "passed", closure: "released", complete: true });
+  expect(h.outcome(admitted.details.instanceId)).toMatchObject({ status: "failed", head: { finish: { status: "failed" } } });
+  expect(h.headSession().messages.at(-1).stopReason).toBe(final);
+  expect(h.host.sessions).toHaveLength(1);
+  expect(h.headSession().prompts).toHaveLength(1);
+  expect(h.headSession().sessionManager.getBranch().some((entry: any) => entry.id === retained.id)).toBe(true);
+}));
+
+test("verification is exterior async Developer Head authority, never ordinary role or implicit capability", fixture.ownedCase("gate grant admission", async () => {
+  const h = await harness();
+  for (const params of [{ role: "reviewer", mode: "head", writes: [] }, { role: "developer", mode: "single" },
+    { role: "scout" }, { role: "developer_head", mode: "head", writes: [] }]) {
+    const refused = await h.callPublic("agent_spawn", { ...params, verification: verificationGrant, task: "must refuse" });
+    expect(refused.isError).toBe(true);
+  }
+  for (const field of ["durationMs", "captureBytes", "invocations"]) {
+    const refused = await h.callPublic("agent_spawn", { role: "developer", mode: "head", writes: [], task: "must refuse",
+      verification: { ...verificationGrant, [field]: 0 } });
+    expect(refused.isError).toBe(true);
+  }
+  const admitted = await h.callPublic("agent_spawn", { role: "developer", mode: "head", writes: [], task: "no grant" });
+  await h.headEntered.promise;
+  expect(h.headSession().active).not.toContain("head_gates");
+  await h.call("head_finish", { status: "failed", diagnostic: "No grant, ordinary Head preserved", evidence: [], limits: [] });
+  await h.settle(); expect(h.outcome(admitted.details.instanceId).status).toBe("failed");
+}));
+
+
+const unknownPrincipalCase = "unknown principal writer blocks Head lifecycle and second admission without blocking disjoint roots";
+test(unknownPrincipalCase, fixture.ownedCase("unknown principal Head barrier", async () => {
+  const phase = process.env.PITAKO_UNKNOWN_HEAD_HOST;
+  if (!phase) {
+    for (const phase of ["open", "integration"]) console.log(execFileSync(process.execPath, ["test", import.meta.path, "--test-name-pattern", `^${unknownPrincipalCase}$`], {
+      env: { ...process.env, PITAKO_UNKNOWN_HEAD_HOST: phase, BUN_OPTIONS: "", NO_COLOR: "1", FORCE_COLOR: "0" }, encoding: "utf8",
+    }));
+    return;
+  }
+  const h = await harness({ gitRepository: true });
+  await h.callPublic("agent_spawn", { role: "developer", mode: "head", writes: ["work"], task: "retain principal barrier" });
+  await h.headEntered.promise;
+  const barrier = phase === "integration" ? await h.call("head_plan", { action: "beginIntegration", expectedRevision: 0 }) : undefined;
+  if (barrier) await h.call("bash", { command: "printf valid-verification" });
+  const verification = (await h.read()).verificationCandidates.map((entry: any) => entry.entryId);
+  const principal = await bind([pi => principalLeases(pi, { async exec() {
+    throw new AgentClosureError([new Error("controlled group observation failure")], "principal fixture");
+  } })], () => {});
+  const unsupported = reserveOperation(undefined, "writer");
+  const hook = await principal.events.get("user_bash")![0]!({}, h.ctx);
+  await expect(hook.operations.exec("controlled", h.root, { onData() {} })).rejects.toThrow("closure");
+  const admission = await h.callPublic("agent_spawn", { role: "developer", mode: "head", writes: ["work"], task: "must be fenced" });
+  expect(admission.isError).toBe(true);
+  expect(JSON.stringify(admission)).toContain("unknown");
+  expect(h.counts().starts).toBe(1);
+  if (barrier) {
+    await expect(h.call("head_plan", { action: "reopen", epoch: barrier.epoch })).rejects.toThrow("unknown");
+    await expect(h.call("head_finish", { status: "completed", epoch: barrier.epoch, summary: "must be fenced", verification, limits: [] })).rejects.toThrow("unknown");
+  } else await expect(h.call("head_plan", { action: "beginIntegration", expectedRevision: 0 })).rejects.toThrow("unknown");
+  await expect(h.call("write", { path: "work/forbidden", content: "no" })).rejects.toThrow("unknown");
+  expect(existsSync(path.join(h.root, "work/forbidden"))).toBe(false);
+  const saving = await h.call("head_checkpoint", { action: "create", expectedRevision: 0, paths: ["work/forbidden"], summary: "no", remaining: [], limits: [], evidence: [] }).catch(error => error);
+  expect(JSON.stringify(saving) + String(saving)).toContain("unknown");
+  expect(listCheckpoints(h.root)).toHaveLength(0);
+  expect(() => reserveOperation(h.root, "gates")).toThrow("unknown");
+  // Failure can still join owned work. No synthetic observation error created a process.
+  await h.call("head_finish", { status: "failed", diagnostic: "Unknown principal remains fenced", evidence: [], limits: [] });
+  await h.settle();
+  const other = await harness({ gitRepository: true });
+  await other.callPublic("agent_spawn", { role: "developer", mode: "head", writes: ["independent"], task: "disjoint progress" });
+  await other.headEntered.promise;
+  const independentBarrier = await other.call("head_plan", { action: "beginIntegration", expectedRevision: 0 });
+  await other.call("write", { path: "independent", content: "legal" });
+  await other.call("head_plan", { action: "reopen", epoch: independentBarrier.epoch });
+  const finalBarrier = await other.call("head_plan", { action: "beginIntegration", expectedRevision: 0 });
+  await other.call("bash", { command: "printf independent" });
+  const independentVerification = (await other.read()).verificationCandidates.map((entry: any) => entry.entryId);
+  await other.call("head_finish", { status: "completed", epoch: finalBarrier.epoch, summary: "disjoint root remains usable", verification: independentVerification, limits: [] });
+  await other.settle();
+  // An unsupported composition has no proven root. Retention must fence even
+  // otherwise-disjoint admissions; do not erase global state to isolate this case.
+  unsupported.unknown(""); unsupported.release();
+  expect(() => reserveOperation(other.root, "writer")).toThrow("unknown");
+  expect(() => reserveOperation(undefined, "writer")).toThrow("unknown");
+  await expect(hook.operations.exec("blocked disjoint executor", other.root, { onData() {} })).rejects.toThrow("unknown");
+  const unscopedAdmission = await other.callPublic("agent_spawn", { role: "developer", mode: "head", writes: ["independent"], task: "unscoped writer fences every root" });
+  expect(unscopedAdmission.isError).toBe(true);
+  expect(JSON.stringify(unscopedAdmission)).toContain("unknown");
+  expect(other.counts().starts).toBe(1);
 }));

@@ -74,6 +74,14 @@ Head assignments and their leaves use managed native file tools, the known loade
 
 A checkpoint saves a local source point and historical evidence, not node satisfaction, final verification, acceptance, or publication. Inspect saved-path comparisons, omissions, later dirt, and evidence gaps separately. Do not blindly retry an uncertain publication; inspect its exact ref and commit. Continuation needs a new explicit Head grant with `checkpoint_origin` and host-validated exact source/index/root compatibility plus positive predecessor and contributor closure. A ref, terminal status, missing history, or receipt alone proves neither closure nor acceptance. The new DAG restores no sessions, judgments, ledger, or authority. Obtain fresh post-barrier verification for successful finish.
 
+## Explicit verification grant
+
+Only an exterior asynchronous admission with `verification` grants `head_gates`. Without it, keep ordinary focused checks and the principal's complete procedure. Read the single root `GATES.md` of your captured execution root; select exact ordered checks, component-relative cwd, child environment delta, finite timeouts and coverage, including unmet prerequisites/manual obligations. The engine does not interpret Markdown or evaluate a project recipe. A grant authorizes local checks and explicit artifact/scratch roots, not setup, installs, product/configuration writes, provider spend or acceptance. `writes: []` stays read-only.
+
+After integration, `head_gates request` returns a handle before preparation. Host execution owns serial subprocesses, bounded stdout/stderr, deadlines/cancellation and closure. Do not block codemode or relax managed composition. Use the same one-shot session: boundary or `head_wait` waits interruptibly for result, steering or revocation without consuming missing-finish corrections. A typed engine deadline hold does not extend max-runtime or fake watchdog activity. Active/unknown overlapping leases block writers, DAG changes, reopen, checkpoint and successful finish. Cancel is a request, not closure; unknown retains the barrier and diagnostics without replacement or cleanup.
+
+Interpret the retained outcome and exact native `pitako.head.gates` receipt. Only active-branch owned released/complete/passed evidence for the current candidate/epoch/revision can satisfy finish. Handles, status/read, copies, foreign/principal entries and stale/incomplete capture cannot. After released failure, correct only within authorized writes and request a new run within remaining grant limits. Preserve source identity, exclusions, raw artifact references and manual/unrun limits. A pass covers the selection only; the coordinator retains independent review and acceptance.
+
 ## Inspection and integrated handoff
 
 Inspect each relevant delivery diff, including tests and helpers, and its underlying observed evidence before satisfying a node. Check relevance, simplicity, affected guarantees, and verification sufficiency using `verify-behavior` and Ponytail. A worker's completion claim does not establish satisfaction or physical closure.
@@ -92,7 +100,7 @@ with `head_review`. After all retained work is satisfied and owned operations
 are physically closed, `head_plan` action `beginIntegration` returns an epoch.
 An empty graph uses the same barrier. Only then implement directly or integrate
 and run actual checks. `head_plan` action `read` lists native
-post-barrier `verificationCandidates` with entry ID, tool-call ID and tool name.
+post-barrier `verificationCandidates`: `native-tool` entries with entry/tool-call identity or exact `owned-gates` entries with run/candidate identity.
 Inspect the corresponding actual results; use sufficient successful checks in
 `head_finish` with the current epoch, integrated summary, verification references
 and limits. The host proves provenance, not semantic sufficiency. Reopening

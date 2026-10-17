@@ -1,3 +1,4 @@
+import { processGroupClosed } from "./gates.ts";
 import { spawn } from "node:child_process";
 import { constants as osConstants } from "node:os";
 import { existsSync, lstatSync, realpathSync } from "node:fs";
@@ -13,6 +14,7 @@ import { AgentClosureError } from "../closure.ts";
 import { toolEffect } from "../effects.ts";
 import { contains } from "./graph.ts";
 import { AdmissionInventory, digest, type Contribution } from "./inventory.ts";
+import { reserveOperation } from "./operation-leases.ts";
 import { assertNoCheckpointLease } from "./checkpoint-lease.ts";
 import type { CheckpointManifest } from "../checkpoints.ts";
 
@@ -54,6 +56,10 @@ export const foregroundBash: BashOperations = {
       // close, unlike exit/tool result/abort receipt, includes the owned stdio handles.
       const exitCode = await new Promise<number | null>(resolve => child.once("close", (code, signal) =>
         resolve(code ?? (signal ? 128 + (osConstants.signals[signal] ?? 0) : null))));
+      if (child.pid && process.platform !== "win32" && !processGroupClosed(child.pid)) {
+        cancel();
+        throw new AgentClosureError([new Error("owned process group closure unknown")], "foreground bash");
+      }
       if (failure) throw failure;
       if (options.signal?.aborted) throw new Error("aborted");
       if (timedOut) throw new Error(`timeout:${options.timeout}`);
@@ -87,6 +93,9 @@ export class ManagedAssignment {
   assertHealthy(): void {
     if (this.failures.length) throw new AgentClosureError([...this.failures], "managed assignment");
     if (realpathSync(this.root) !== this.root) throw new Error("managed launch root changed");
+  }
+  assertGateIdle(): void {
+    if (this.failures.length || this.active.size) throw new Error("managed operations active or unknown");
   }
   assertIdle(): void {
     assertNoCheckpointLease(this.root);
@@ -181,6 +190,7 @@ export class ManagedProducer {
           hunk.kind === "update" && hunk.moveTo ? [hunk.path, hunk.moveTo] : [hunk.path])
         : definition.name === "bash" ? [] : [(params as { path: string }).path];
       for (const target of targets) this.target(target);
+      const lease = reserveOperation(this.assignment.root, "writer");
       this.assignment.reserve(this); // Synchronous admission before preflight or native suspension.
       const callbacks = new Set<Promise<unknown>>();
       const failures: unknown[] = [];
@@ -222,9 +232,11 @@ export class ManagedProducer {
       });
       this.slot = pending;
       void pending.then(() => {
+        lease.release();
         this.slot = undefined; this.assignment.release(this);
       }, error => {
-        if (error instanceof AgentClosureError) this.assignment.unknown(error);
+        if (error instanceof AgentClosureError) { this.assignment.unknown(error); lease.unknown(String(error)); }
+        lease.release();
         this.slot = undefined; this.assignment.release(this);
       });
       return pending;
@@ -248,7 +260,7 @@ export function managedTools(loader: DefaultResourceLoader, producer: ManagedPro
     createReadToolDefinition(root), createGrepToolDefinition(root), createFindToolDefinition(root), createLsToolDefinition(root)];
 }
 
-const LOCAL = new Set(["consultation_feedback", "head_consult", "head_result", "head_wait", "head_plan", "head_start", "head_observe", "head_input", "head_review", "head_finish", "head_scope_ack"]);
+const LOCAL = new Set(["head_gates", "consultation_feedback", "head_consult", "head_result", "head_wait", "head_plan", "head_start", "head_observe", "head_input", "head_review", "head_finish", "head_scope_ack"]);
 const BOOKKEEPING = new Set(["todo", "compress", "decompress", "search_context", "acp_status", "acp_cache",
   "board_post", "board_topic_create", "board_topic_update", "board_workflow_claim", "board_workflow_lifecycle",
   "memory_search", "memory_add", "memory_replace", "memory_remove", "session_search"]);

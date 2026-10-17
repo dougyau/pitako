@@ -30,6 +30,20 @@ const response = (details: unknown) => ({ content: [{ type: "text" as const, tex
 export function headExtension(attachment: HeadAttachment, binding: object,
   manager: () => Pick<SessionManager, "getBranch">): ExtensionFactory {
   return pi => {
+    let captured: ReturnType<typeof manager> | undefined, sessionId: string | undefined, sessionFile: string | undefined;
+    attachment.bindNative(binding, () => {
+      const current = manager();
+      const native = current as Partial<Pick<SessionManager, "getSessionId" | "getSessionFile">>;
+      if (!captured) { captured = current; sessionId = native.getSessionId?.(); sessionFile = native.getSessionFile?.(); }
+      return current === captured && native.getSessionId?.() === sessionId && native.getSessionFile?.() === sessionFile;
+    });
+    pi.on("turn_start", () => attachment.observeTurn(binding, manager()));
+    pi.on("context", () => attachment.observeReceipts(binding, manager()));
+    pi.on("message_end", event => {
+      if (event.message.role === "assistant" && (event.message.stopReason === "aborted" || event.message.stopReason === "error"))
+        attachment.restrictRecovery(binding, event.message.stopReason);
+    });
+    pi.on("agent_settled", () => attachment.settleDeliveries(binding, manager()));
     pi.registerTool({
       name: "head_result", label: "Head result", description: "Read a physically closed child result belonging to this assignment.",
       parameters: Type.Object({ childId: Type.String() }),
@@ -45,11 +59,33 @@ export function headExtension(attachment: HeadAttachment, binding: object,
       name: "head_wait", label: "Head wait", description: "Wait for closed child results in this assignment.",
       parameters: Type.Object({ after: Type.Optional(revision) }, { additionalProperties: false }),
       execute(_id, _params, signal) {
-        return attachment.own(binding, async () => {
+        attachment.check(binding);
+        return attachment.withGateWait(async () => {
           const results = attachment.dag ? await attachment.dag.wait(binding, _params.after ?? 0, signal)
             : await attachment.wait(binding, signal);
-          return { content: [{ type: "text", text: JSON.stringify(results) }], details: results };
+          return response(results);
         });
+      },
+    });
+    if (attachment.gates) pi.registerTool({
+      name: "head_gates", label: "Owned verification gates", exposure: "model-only",
+      description: "Request finite host-owned serial checks for the current candidate; status/cancel/read are diagnostic, never finish evidence. Read root GATES.md and select relevant commands; manual obligations remain explicit. No setup, product writes, installs or external effects are granted.",
+      parameters: Type.Union([
+        Type.Object({ action: Type.Literal("request"), epoch: Type.String(), expectedRevision: revision, coverage: boundedString,
+          commands: Type.Array(Type.Object({ id: Type.String({ minLength: 1, maxLength: 64 }), shell: boundedString,
+            cwd: Type.String({ maxLength: 4096 }), env: Type.Record(Type.String(), Type.String()), timeoutMs: Type.Number({ exclusiveMinimum: 0, maximum: 2147483647 }) }, { additionalProperties: false }), { minItems: 1, maxItems: 32 }) }, { additionalProperties: false }),
+        Type.Object({ action: Type.Literal("status"), runId: Type.String() }, { additionalProperties: false }),
+        Type.Object({ action: Type.Literal("cancel"), runId: Type.String() }, { additionalProperties: false }),
+        Type.Object({ action: Type.Literal("read"), runId: Type.String(), artifact: Type.String(), offset: Type.Optional(revision), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 16384 })) }, { additionalProperties: false }),
+      ]),
+      execute(_id, params) {
+        const gates = attachment.gates!;
+        switch (params.action) {
+          case "request": return Promise.resolve(response(gates.request(binding, params)));
+          case "status": return Promise.resolve(response(gates.status(binding, params.runId)));
+          case "cancel": return Promise.resolve(response(gates.cancel(binding, params.runId)));
+          case "read": return Promise.resolve(response(gates.read(binding, params.runId, params.artifact, params.offset, params.limit)));
+        }
       },
     });
     const dag = attachment.dag;
@@ -57,7 +93,7 @@ export function headExtension(attachment: HeadAttachment, binding: object,
       dag.bindDiagnostics((kind, data) => pi.appendEntry?.("pitako.head", {
         assignmentId: attachment.assignmentId, headInstanceId: attachment.headInstanceId, kind, data,
       }));
-      const localTools = new Set(["consultation_feedback", "head_consult", "head_result", "head_wait", "head_plan", "head_start", "head_observe", "head_input", "head_review", "head_finish"]);
+      const localTools = new Set(["head_gates", "consultation_feedback", "head_consult", "head_result", "head_wait", "head_plan", "head_start", "head_observe", "head_input", "head_review", "head_finish"]);
       if (attachment.managed) {
         localTools.add("head_checkpoint");
         pi.registerTool({

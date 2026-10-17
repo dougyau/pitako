@@ -559,7 +559,8 @@ async function openSession(
         pi.on("session_start", (_event, ctx) => input.participant!.bind(pi, ctx));
       }
       pi.on("turn_start", () => { guardConsultationTools(); if (nativeSession) reconcileChildTools(nativeSession); live?.open(); });
-      pi.on("agent_before_settle", () => live?.settle());
+      pi.on("agent_before_settle", () => input.head ? undefined : live?.settle());
+      pi.on("agent_settled", () => live?.settle());
       pi.on("session_tree", event => live?.handle.publicConversation?.reconcile(event.oldLeafId));
       pi.on("session_start", () => live?.handle.publicConversation?.reconcile());
       pi.on("session_compact", () => live?.handle.publicConversation?.reconcile());
@@ -651,7 +652,7 @@ async function openSession(
       await disposeChildSession(session);
       throw new Error("Agent session startup cancelled");
     }
-    live = input.bindLive ? createLiveHandle(session, input.sessionHistory!) : undefined;
+    live = input.bindLive ? createLiveHandle(session, input.sessionHistory!, () => input.head?.interruptWait()) : undefined;
     if (live && input.participant) live.handle.input = async () => { throw new Error("Use architecture_control for architecture participants"); };
     lifecycle.live = live;
     if (live) live.handle.publicConversation = createPublicProducer(session, input.sessionHistory!);

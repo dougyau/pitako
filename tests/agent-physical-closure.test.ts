@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -16,11 +17,24 @@ import { openBoard } from "../extensions/board/store.ts";
 import { planFile, readLedgerTeamHolds } from "../extensions/workflow.ts";
 import { controlledPi } from "./fixtures/pi-factories.ts";
 
-// Intentional unknown owners remain referenced; only their isolated global bindings are restored.
+// Unknown reservations live for the host lifetime; never clear them to admit another case.
+function unknownTest(name: string, body: () => Promise<void>) {
+  test(name, async () => {
+    if (process.env.PITAKO_PHYSICAL_CLOSURE_CASE === name) return body();
+    const pattern = `^${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`;
+    console.log(execFileSync(process.execPath, ["test", import.meta.path, "--test-name-pattern", pattern], {
+      env: { ...process.env, PITAKO_PHYSICAL_CLOSURE_CASE: name, BUN_OPTIONS: "", NO_COLOR: "1", FORCE_COLOR: "0" },
+      encoding: "utf8", stdio: ["ignore", "pipe", "inherit"],
+    }));
+  });
+}
+
+// Child hosts retain intentional unknown owners and roots, not proof of producer closure.
 const retained: unknown[] = [];
 const keys = ["pitako.backgroundWorkers", "pitako.teamRegistry", "pitako.agentObservations", "pitako.agentUi", "pitako.executionIdentity"].map(Symbol.for);
 function setup() {
   const root = mkdtempSync(path.join(tmpdir(), "pitako-physical-closure-"));
+  if (process.env.PITAKO_FIXTURE_WITNESS) console.log("PHYSICAL_CLOSURE_CREATED", root);
   const host = globalThis as Record<symbol, unknown>;
   const previous = keys.map(key => Object.getOwnPropertyDescriptor(host, key));
   for (const key of keys) Reflect.deleteProperty(host, key);
@@ -41,7 +55,10 @@ function setup() {
       });
       if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = oldAgentDir;
-      if (!unknown) rmSync(root, { recursive: true, force: true });
+      if (!unknown) {
+        rmSync(root, { recursive: true, force: true });
+        if (process.env.PITAKO_FIXTURE_WITNESS) console.log("PHYSICAL_CLOSURE_REMOVED", root);
+      }
     },
   };
 }
@@ -160,7 +177,7 @@ test("cancellation during native disposal joins the newly admitted abort before 
 });
 
 for (const failure of ["abort", "dispose"] as const) {
-  test(`rejected SDK ${failure} retains unknown row, history and outer reservation without normal release`, async () => {
+  unknownTest(`rejected SDK ${failure} retains unknown row, history and outer reservation without normal release`, async () => {
     const env = setup(), started = Promise.withResolvers<void>(), releasePrompt = Promise.withResolvers<void>();
     const evaluation = beginTeamEvaluation(`unknown-${failure}`, false)!;
     const reservation = reserveTeamMember(evaluation, "developer", `assignment-${failure}`);
@@ -200,7 +217,7 @@ for (const failure of ["abort", "dispose"] as const) {
   });
 }
 
-test("Head child disposal failure blocks native delivery and leaves both assignment and parent closure unknown", async () => {
+unknownTest("Head child disposal failure blocks native delivery and leaves both assignment and parent closure unknown", async () => {
   const env = setup(), head = new HeadAttachment("unknown-head-assignment", env.root);
   const child = controlledPi(env.root, { dispose: async () => { throw new Error("controlled child disposal rejected"); } });
   let boundary: Function | undefined;
@@ -232,7 +249,7 @@ test("Head child disposal failure blocks native delivery and leaves both assignm
   }
 });
 
-test("the Head's own SDK disposal failure cannot mark its attachment released", async () => {
+unknownTest("the Head's own SDK disposal failure cannot mark its attachment released", async () => {
   const env = setup(), head = new HeadAttachment("own-disposal-assignment", env.root);
   const sdk = controlledPi(env.root, { dispose: async () => { throw new Error("controlled Head disposal rejected"); } });
   try {
@@ -250,7 +267,7 @@ test("the Head's own SDK disposal failure cannot mark its attachment released", 
 });
 
 
-test("unknown no-worker preparation retains its reservation despite an incorporated outcome", async () => {
+unknownTest("unknown no-worker preparation retains its reservation despite an incorporated outcome", async () => {
   const env = setup(), delivered = Promise.withResolvers<void>();
   const evaluation = beginTeamEvaluation("unknown-preparation", false)!;
   const admission = reserveTeamMember(evaluation, "oracle", "unknown");
@@ -273,7 +290,7 @@ test("unknown no-worker preparation retains its reservation despite an incorpora
 
 
 for (const failure of ["abort", "dispose"] as const) {
-  test(`maintained Team ${failure} rejection retains exact member and blocks disband`, async () => {
+  unknownTest(`maintained Team ${failure} rejection retains exact member and blocks disband`, async () => {
     const env = setup(), current = beginTeamEvaluation(`maintained-unknown-${failure}`, false)!;
     bindBackgroundOwner({ token: current.token, sessionId: current.sessionId, isIdle: () => false, hasUI: false, notify() {}, sendMessage() {} });
     const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
@@ -313,7 +330,7 @@ for (const failure of ["abort", "dispose"] as const) {
 }
 
 
-test("registered table replacement with rejected outgoing disposal retains root, diagnosis and hold without a replacement or private delivery", async () => {
+unknownTest("registered table replacement with rejected outgoing disposal retains root, diagnosis and hold without a replacement or private delivery", async () => {
   const env = setup(), unknown = Promise.withResolvers<void>();
   let handle: any, compositions = 0;
   const room = await architectureFixture().setup({ root: env.root,
