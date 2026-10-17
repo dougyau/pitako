@@ -1,10 +1,11 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { preparedTool } from "./fixtures/background-dispatch.ts";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
+import * as childProcess from "node:child_process";
 import { createCodingTools, type AgentBeforeSettleEventResult, type ExtensionAPI, type ExtensionContext, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import agentExtension from "../extensions/agent/index.ts";
 import { bindBackgroundOwner, clearBackgroundOwner, deliverWorkerResults, setBackgroundExecutor, workerResult, teamWorkerResult } from "../extensions/agent/background.ts";
@@ -22,7 +23,57 @@ import { principalLeases, reserveOperation } from "../extensions/agent/head/oper
 import { AgentClosureError } from "../extensions/agent/closure.ts";
 import { classifyProviderFailure } from "../extensions/agent/fallback.ts";
 
-const fixture = agentFixtureOwnership();
+// Always-on, synchronous stderr markers survive a blocked event loop. Keep the
+// Git observer test-local and installed until owned callbacks/cleanup settle.
+let activeCase = "", traceSequence = 0;
+function startTrace(operation: string, details: object = {}) {
+  const id = ++traceSequence, started = performance.now(), label = activeCase;
+  const emit = (phase: string) => writeSync(2, `[head-public] ${JSON.stringify({
+    pid: process.pid, case: label, id, operation, ...details, phase,
+    at: new Date().toISOString(), elapsedMs: Math.round(performance.now() - started),
+  })}\n`);
+  emit("START");
+  return emit;
+}
+async function traced<T>(operation: string, details: object, body: () => T | Promise<T>): Promise<T> {
+  const finish = startTrace(operation, details);
+  try {
+    const result = await body();
+    finish("END");
+    return result;
+  } catch (error) {
+    finish("ERROR");
+    throw error;
+  }
+}
+const ownership = agentFixtureOwnership();
+const fixture = { ...ownership, ownedCase(name: string, body: () => void | Promise<void>) {
+  return async () => {
+    activeCase = name;
+    const original = childProcess.execFileSync;
+    const capture = spyOn(childProcess, "execFileSync").mockImplementation(new Proxy(original, {
+      apply(target, thisArg, args) {
+        const finish = startTrace("execFileSync", { file: args[0], args: args[1],
+          cwd: args[2]?.cwd });
+        try {
+          const result = Reflect.apply(target, thisArg, args);
+          finish("END");
+          return result;
+        } catch (error) {
+          finish("ERROR");
+          throw error;
+        }
+      },
+    }));
+    try {
+      await traced("case", {}, ownership.ownedCase(name, () => traced("body", {}, body)));
+    } finally {
+      ownership.requireReleasedFixture();
+      capture.mockRestore();
+      activeCase = "";
+    }
+  };
+} };
 const gate = () => Promise.withResolvers<void>();
 const node = (id: string, writes = [id], deps: string[] = []) => ({
   id, brief: `Implement ${id}`, writes, deps, capacity: { route: "direct", profile: "developer_mid" },
@@ -173,9 +224,11 @@ classifier_model = "classifier"
     clearBackgroundOwner(); setBackgroundExecutor(undefined);
   });
   const publicLocal = await bind([agentExtension], () => {});
-  const callPublic = (tool: string, params: unknown) => preparedTool(publicLocal.tools.get(tool)).execute(`public-${tool}`, params, undefined, undefined, ctx);
+  const callPublic = (tool: string, params: unknown) => traced(`public ${tool}`, { root },
+    () => preparedTool(publicLocal.tools.get(tool)).execute(`public-${tool}`, params, undefined, undefined, ctx));
   let localCalls = 0;
-  const call = async (name: string, params: unknown, onUpdate?: (update: unknown) => unknown) => {
+  const call = (name: string, params: unknown, onUpdate?: (update: unknown) => unknown) => traced(`head ${name}`,
+    { root, input: JSON.stringify(params)?.slice(0, 300) }, async () => {
     const id = `${name}-${++localCalls}`;
     for (const hook of headLocal.events.get("tool_call") ?? []) {
       const result = await hook({ toolName: name, toolCallId: id, input: params }, headCtx());
@@ -192,15 +245,16 @@ classifier_model = "classifier"
         content: [{ type: "text", text: String(error) }], isError: true, timestamp: Date.now() });
       throw error;
     } finally { headSession.emit({ type: "tool_execution_end", toolName: name, toolCallId: id }); }
-  };
-  const callLeaf = async (nodeId: string, name: string, params: unknown) => {
+  });
+  const callLeaf = (nodeId: string, name: string, params: unknown) => traced(`leaf ${name}`,
+    { root, nodeId, input: JSON.stringify(params)?.slice(0, 300) }, async () => {
     const state = leaf(nodeId), id = `leaf-${nodeId}-${name}-${++localCalls}`;
     const result = await state.local!.tools.get(name).execute(id, params, undefined, undefined,
       { ...ctx, sessionManager: state.session.sessionManager });
     state.session.sessionManager.appendMessage({ role: "toolResult", toolName: name, toolCallId: id,
       content: result.content, details: result.details, isError: result.isError === true, timestamp: Date.now() });
     return result;
-  };
+  });
   const read = () => call("head_plan", { action: "read" });
   const closed = async (runId: string) => {
     let after = 0;
@@ -211,7 +265,7 @@ classifier_model = "classifier"
       after = event.cursor;
     }
   };
-  const settle = async () => { headDone.resolve(); await fixture.settleRuns(); };
+  const settle = () => traced("settle", { root }, async () => { headDone.resolve(); await fixture.settleRuns(); });
   return { root, evaluation, ctx, leaf, host, workers, headEntered, headAborted, callPublic, call, callLeaf, read, closed, settle,
     headDone, delivery, deliver: () => deliverWorkerResults(ownerToken, true), publicTools: publicLocal.tools, headLocal: () => headLocal, headSession: () => headSession,
     counts: () => ({ starts, leafStarts, classifications }),
@@ -1533,6 +1587,8 @@ test(unknownPrincipalCase, fixture.ownedCase("unknown principal Head barrier", a
   if (!phase) {
     for (const phase of ["open", "integration"]) console.log(execFileSync(process.execPath, ["test", import.meta.path, "--test-name-pattern", `^${unknownPrincipalCase}$`], {
       env: { ...process.env, PITAKO_UNKNOWN_HEAD_HOST: phase, BUN_OPTIONS: "", NO_COLOR: "1", FORCE_COLOR: "0" }, encoding: "utf8",
+      // Show child diagnostics while it runs, not only after execFileSync returns.
+      stdio: ["pipe", "pipe", "inherit"],
     }));
     return;
   }
