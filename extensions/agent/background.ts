@@ -651,6 +651,25 @@ export interface WorkerReadScope {
   teamToken?: symbol;
 }
 
+/** Passive owner-local snapshot, including reservations without an attempt identity. */
+export function readBackgroundPending(scope: WorkerReadScope): import("./bridge/protocol.js").BackgroundPending {
+  const state = bag(), owner = state.owner;
+  if (!owner || owner.token !== scope.ownerToken || !scope.coordinatorSessionId ||
+      owner.sessionId !== scope.coordinatorSessionId || owner.owns && !owner.owns() || state.owner !== owner) throw new Error("stale_owner");
+  for (const row of state.rows.values()) {
+    if (row.ownerToken !== scope.ownerToken || row.coordinatorSessionId !== scope.coordinatorSessionId) continue;
+    if (row.closure.state !== "released" || row.live || row.preparation && !row.preparationSettled ||
+        row.dispatchPhase !== "settled" || !row.outcome || row.workerStarted === false && row.releaseNoWorker) return { state: "pending" };
+    // Withdrawal discards delivery, never unsettled resources. Protocol recipients
+    // need physical/internal settlement, but no exterior receipt.
+    if (row.signal === "dropped" || row.recipient?.kind === "protocol") continue;
+    if (!row.handoff || !["reconciled", "inapplicable"].includes(row.handoff.bookkeeping) ||
+        row.handoff.delivery !== "incorporated" ||
+        row.intermediates?.some(item => item.delivery !== "incorporated")) return { state: "pending" };
+  }
+  return { state: "none" };
+}
+
 function currentReadRow(row: Row, epoch: number): boolean {
   const state = bag();
   return observationEpoch() === epoch && state.rows.get(row.instanceId) === row && row.signal !== "dropped" &&
@@ -910,7 +929,6 @@ function settle(row: Row, result: AgentRunResult, epoch: number): void {
   if (current !== row) return;
   current.outcome = result;
   observeArchitectureRow(current);
-  current.dispatchPhase = "settled";
   current.consultation?.event("outcome", current.workerStarted
     ? { workerStarted: true, status: result.status, instanceId: result.instanceId, model: result.model, usage: result.usage }
     : { workerStarted: false, status: result.status, reason: result.result });
@@ -918,6 +936,8 @@ function settle(row: Row, result: AgentRunResult, epoch: number): void {
   if (current.workerStarted !== false && current.closure.state === "released" && current.signal !== "dropped" && liveOwner(current)) current.onTeamSettled?.(result.status);
   current.recipient?.settle(result, current.closure);
   current.conversation?.finish();
+  // Reuse dispatch settlement after the owned callbacks have returned.
+  current.dispatchPhase = "settled";
   if (current.maintained && currentReadRow(current, epoch)) {
     const observation = listObservations(current.ownerToken, current.coordinatorSessionId).find(item => item.id === current.instanceId);
     if (observation) publishObservation({ ...observation, status: result.status, phase: "idle", terminalAt: Date.now(), agentUsage: result.usage }, epoch);

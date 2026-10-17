@@ -106,6 +106,8 @@ export async function connect(descriptorPath, { expectedSessionId, resume } = {}
   try {
     const connected = await request("connect", { token: descriptor.token, expectedSessionId,
       ...(resume === undefined ? {} : { resumeToken: resume.resumeToken }) });
+    if (JSON.stringify(connected.capabilities) !== JSON.stringify(descriptor.capabilities))
+      throw new BridgeError("invalid_reply", "Bridge descriptor and connect capabilities disagree");
     lease = Object.freeze(connected.lease);
     negotiatedCapabilities = Object.freeze(connected.capabilities);
   } catch (error) {
@@ -115,6 +117,14 @@ export async function connect(descriptorPath, { expectedSessionId, resume } = {}
     owner: Object.freeze({ ...descriptor.owner }),
     capabilities: negotiatedCapabilities,
     lease,
+    async backgroundPending() {
+      if (!negotiatedCapabilities.includes("background.pending")) return { state: "unavailable", reason: "unsupported" };
+      try { return await request("background.pending", {}); }
+      catch (error) {
+        return { state: "unavailable", reason: error instanceof BridgeError && error.code === "stale_owner"
+          ? "stale_owner" : "source_unavailable" };
+      }
+    },
     listArchitectures: cursor => negotiatedCapabilities.includes("architecture.public-v1")
       ? request("architecture.list", { ...(cursor === undefined ? {} : { cursor }) })
       : Promise.reject(new BridgeError("unsupported_method", "Architecture public-v1 is not available")),

@@ -1,6 +1,8 @@
 export interface Owner { processId: string; coordinatorSessionId: string; epoch: string }
 export type Capability = "workers.list" | "workers.detail" | "workers.requests" | "workers.activity" | "workers.result" | "subscribe" | "unsubscribe" |
-  "history.list" | "history.read" | "route.read" | "workers.detail.public-v1" | "workers.activity.public-v1" | "workers.result.public-v1" | "architecture.list" | "architecture.read" | "architecture.public-v1";
+  "history.list" | "history.read" | "route.read" | "workers.detail.public-v1" | "workers.activity.public-v1" | "workers.result.public-v1" | "architecture.list" | "architecture.read" | "architecture.public-v1" | "background.pending";
+export type BackgroundPending = { state: "pending" } | { state: "none" } |
+  { state: "unavailable"; reason: "unsupported" | "stale_owner" | "source_unavailable" };
 export interface ClientLease { clientId: string; resumeToken: string }
 export type ResumeLease = Pick<ClientLease, "clientId" | "resumeToken">;
 export interface Descriptor {
@@ -167,6 +169,7 @@ export type HistoryPage<T = HistoryFragment> = {
 };
 export type RoutePage = { state: "captured" | "not-routed" | "unavailable"; page: TextPage };
 export type Request = { version: 2; id: string; clientId: string; owner: Owner } & (
+  { method: "background.pending"; params: Record<string, never> } |
   { method: "architecture.list"; params: { cursor?: string } } |
   { method: "architecture.read"; params: { ref: ArchitectureRef; cursor?: string } } |
   { method: "connect"; params: { token: string; expectedSessionId: string; resumeToken?: string } } |
@@ -189,7 +192,7 @@ export const errors: Readonly<Record<"invalid_request" | "unsupported_method" | 
   "invalid_cursor" | "stale_cursor" | "stale_reference" | "unknown_target" | "busy" | "oversized" | "lease_expired", string>>;
 export type ErrorCode = keyof typeof errors;
 export type Reply = { version: 2; id: string; clientId: string; owner: Owner } & (
-  { ok: true; result: ArchitectureCatalog | ArchitectureRead | WorkerList | WorkerDetail | WorkerRequests | WorkerActivity | WorkerResult | Subscription |
+  { ok: true; result: BackgroundPending | ArchitectureCatalog | ArchitectureRead | WorkerList | WorkerDetail | WorkerRequests | WorkerActivity | WorkerResult | Subscription |
     HistoryPage | HistoryPage<HistoryMetadata> | RoutePage | PublicWorkerDetail | PublicConversationPage | PublicWorkerResult |
     { subscriptionId: string } | { capabilities: readonly Capability[]; lease: ClientLease } } |
   { ok: false; error: { code: ErrorCode; message: string } });
@@ -233,7 +236,16 @@ export interface ArchitectureLifecycle {
   outcome: "pending" | "available" | "unavailable";
   closure: { state: "pending" | "released" | "unknown"; members: "not-created" | "pending" | "released" | "unknown"; director: "not-created" | "pending" | "released" | "unknown" };
 }
+export interface PublicKnowledgeBoundary {
+  kind: "knowledge-boundary"; id: string; ordinal: number; roomId: string; cycleId: string;
+  planMessageId: string; knowledgeMessageId: string | null;
+  resolutions: (Extract<PublicArchitectureBody, { kind: "knowledge" }>["resolutions"][number] & {
+    provenance: { kind: "direct"; planMessageId: string } | { kind: "delegated"; knowledgeMessageId: string; consultationId: string;
+      responses: { consultationId: string; assignmentId?: string; messageId?: string; status: "completed" | "failed" }[] };
+  })[];
+}
 export type ArchitectureRecord =
+  | PublicKnowledgeBoundary
   | { kind: "room"; id: string; mode: "table" | "consultation"; origin: { coordinatorSessionId: string; tool: "architecture_start"; toolCallId: string; memberId: string; assignmentId: string; instanceId: string }; goalSource: { kind: "worker-workbrief"; instanceId: string }; lifecycle: ArchitectureLifecycle; pendingDoubtIds: string[] }
   | { kind: "member"; id: string; assignmentId: string; instanceId: string; roleId: string; function: "director" | "specialist" | "support"; ordinal: number; admittedAt: number; mandate: { source: "root-workbrief"; instanceId: string } | { source: "TeamAssignment.task"; text: string }; execution: "accepted" | "running" | "completed" | "failed" | "cancelled"; workerRef?: WorkerReadReference; conversationRefs: WorkerReadReference[]; compositionMessageId?: string; supersededByCompositionId?: string }
   | { kind: "publication"; id: string; message: PublicArchitectureMessage }

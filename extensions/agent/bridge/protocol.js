@@ -4,7 +4,7 @@ export const replyBytes = 48 * 1024;
 export const outstandingRequests = 8;
 export const queueBytes = 256 * 1024;
 export const capabilities = Object.freeze(["workers.list", "workers.detail", "workers.requests", "workers.activity", "workers.result", "subscribe", "unsubscribe",
-  "history.list", "history.read", "route.read", "workers.detail.public-v1", "workers.activity.public-v1", "workers.result.public-v1", "architecture.list", "architecture.read", "architecture.public-v1"]);
+  "history.list", "history.read", "route.read", "workers.detail.public-v1", "workers.activity.public-v1", "workers.result.public-v1", "architecture.list", "architecture.read", "architecture.public-v1", "background.pending"]);
 export const object = value => !!value && typeof value === "object" && !Array.isArray(value);
 const keys = (value, allowed) => Object.keys(value).every(key => allowed.includes(key));
 export const string = (value, max = 1024) =>
@@ -13,7 +13,8 @@ export const isOwner = value => object(value) && keys(value, ["processId", "coor
   string(value.processId) && string(value.coordinatorSessionId) && string(value.epoch);
 export const sameOwner = (a, b) => a.processId === b.processId &&
   a.coordinatorSessionId === b.coordinatorSessionId && a.epoch === b.epoch;
-const isCapabilities = value => Array.isArray(value) && [capabilities.length - 3, capabilities.length].includes(value.length) &&
+// Only the three published snapshots, not arbitrary subsets or future extensions.
+const isCapabilities = value => Array.isArray(value) && [13, 16, 17].includes(value.length) &&
   value.every((item, index) => item === capabilities[index]);
 const integer = value => Number.isSafeInteger(value) && value >= 0;
 const token = value => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
@@ -53,6 +54,7 @@ export function isRequest(value) {
     case "connect": return keys(value.params, ["token", "expectedSessionId", "resumeToken"]) &&
       token(value.params.token) && string(value.params.expectedSessionId) &&
       (value.params.resumeToken === undefined || token(value.params.resumeToken));
+    case "background.pending": return keys(value.params, []);
     case "architecture.list": return keys(value.params, ["cursor"]) && optional(value.params, "cursor", architectureCursor);
     case "architecture.read": return keys(value.params, ["ref", "cursor"]) && isArchitectureRef(value.params.ref) && optional(value.params, "cursor", architectureCursor);
     case "workers.list": return keys(value.params, ["after", "revision"]) &&
@@ -361,6 +363,10 @@ export function isReply(value, method, format) {
     object(value.error) && keys(value.error, ["code", "message"]) &&
     Object.hasOwn(errors, value.error.code) && value.error.message === errors[value.error.code];
   if (value.ok !== true || !keys(value, ["version", "id", "clientId", "owner", "ok", "result"])) return false;
+  if (method === "background.pending") return object(value.result) &&
+    (["pending", "none"].includes(value.result.state) ? keys(value.result, ["state"])
+      : value.result.state === "unavailable" && keys(value.result, ["state", "reason"]) &&
+        ["unsupported", "stale_owner", "source_unavailable"].includes(value.result.reason));
   if (method === "architecture.list" || method === "architecture.read") return architectureReply(value.result, method, value.owner);
   if (method === "connect") return object(value.result) && keys(value.result, ["capabilities", "lease"]) &&
     isCapabilities(value.result.capabilities) &&
@@ -460,6 +466,15 @@ export function isArchitectureRecord(value) {
       ["accepted", "running", "completed", "failed", "cancelled"].includes(value.execution) && optional(value, "workerRef", item => readReference(item, true)) &&
       array(value.conversationRefs, item => readReference(item, true)) && ["compositionMessageId", "supersededByCompositionId"].every(key => optional(value, key, string));
     case "publication": return keys(value, ["kind", "id", "message"]) && architectureMessage(value.message) && value.id === value.message.id;
+    case "knowledge-boundary": return keys(value, ["kind", "id", "ordinal", "roomId", "cycleId", "planMessageId", "knowledgeMessageId", "resolutions"]) &&
+      integer(value.ordinal) && ["roomId", "cycleId", "planMessageId"].every(key => string(value[key])) &&
+      (value.knowledgeMessageId === null || string(value.knowledgeMessageId)) && array(value.resolutions, item =>
+        resolution(item, ["answered", "partial", "rejected", "failed"], ["supportIds", "provenance"]) && strings(item.supportIds) && object(item.provenance) &&
+        (item.provenance.kind === "direct" ? fields(item.provenance, ["kind", "planMessageId"]) && string(item.provenance.planMessageId) && item.supportIds.length === 0 :
+          item.provenance.kind === "delegated" && fields(item.provenance, ["kind", "knowledgeMessageId", "consultationId", "responses"]) &&
+          string(item.provenance.knowledgeMessageId) && string(item.provenance.consultationId) && array(item.provenance.responses, response =>
+            fields(response, ["consultationId", "assignmentId", "messageId", "status"]) && string(response.consultationId) &&
+            optional(response, "assignmentId", string) && optional(response, "messageId", string) && ["completed", "failed"].includes(response.status))));
     case "control": return keys(value, ["kind", "id", "order", "action", "text", "author", "application"]) && integer(value.order) &&
       ["context", "priorities", "finish", "stop"].includes(value.action) && optional(value, "text", unboundedText) &&
       fields(value.author, ["coordinatorSessionId", "toolCallId"]) && string(value.author.coordinatorSessionId) && string(value.author.toolCallId) && object(value.application) &&

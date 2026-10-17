@@ -83,7 +83,8 @@ export function architectureFixture() {
           }
           const message = { role: "assistant", content: [{ type: "text", text: "submitted" }], stopReason: "stop", model: session.model!.id, provider: "fixture", api: "openai-completions", timestamp: Date.now() };
           session.messages.push(message); session.sessionManager.appendMessage(message as never); session.emit({ type: "message_end", message });
-          if (request.stage === "knowledge") knowledge[knowledgeIndex++]!.resolve();
+          // A cycle has no authored knowledge turn when all doubts were resolved directly.
+          if (request.stage === "knowledge" || request.stage === "consultation-plan" && chosen.support?.length === 0) knowledge[knowledgeIndex++]!.resolve();
         } finally {
           for (const handler of session.hooks.get("agent_before_settle") ?? []) await handler({ type: "agent_before_settle" }, { sessionManager: session.sessionManager });
         }

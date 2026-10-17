@@ -676,6 +676,8 @@ async function executeTargets(
       if (attempt.status === "cancelled" || parentSignal?.aborted || signal.aborted) {
         return done("cancelled", attempt.result || "cancelled");
       }
+      // A local submit consumes this architecture attempt even when contextually rejected.
+      if (participant?.attempted) return done("failed", lastError, target, index, reason);
       const more = index + 1 < targets.length;
       if (!reason || !more) {
         return done("failed", lastError, target, index, reason);

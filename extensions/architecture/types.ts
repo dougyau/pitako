@@ -1,9 +1,10 @@
 import { Type, type Static } from "typebox";
-import { Value } from "typebox/value";
 import { isDeepStrictEqual } from "node:util";
 import { randomUUID } from "node:crypto";
 import { nativeCaller, type NativeCaller } from "../agent/consultation.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+
+import { immutable, validateSubmission, SubmissionError, type StageGrant } from "./protocol.ts";
 
 const strict = { additionalProperties: false } as const;
 const text = Type.String({ minLength: 1 });
@@ -39,44 +40,77 @@ export interface Message { id: string; ordinal: number; roomId: string; assignme
 
 /** Per-member local capability. Receipt is provisional, not permission to drive another prompt. */
 export function participant(input: { current: () => boolean; publish: (message: Omit<Message, "id" | "ordinal" | "roomId" | "assignmentId" | "memberId" | "author" | "snapshotId">) => Message }) {
-  let expected: Stage | undefined, turn: NativeTurn | undefined, caller: NativeCaller | undefined;
+  let grant: StageGrant | undefined, turn: NativeTurn | undefined, caller: NativeCaller | undefined;
   let provisional: { submissionId: string; body: Body; receipt: { id: string; state: "provisional" }; toolCallId: string } | undefined;
-  let invalid: string | undefined;
-  const check = () => { if (!input.current() || !expected || !turn) throw new Error("architecture grant retired"); };
+  let invalid: string | undefined, submitted = false;
+  const attempts: { submissionId: unknown; value: unknown; error?: SubmissionError }[] = [];
+  const check = () => { if (!input.current() || !grant || !turn) throw new Error("architecture grant retired"); };
+  const attemptSubmit = (identity: NativeTurn) => {
+    // A stale callback must not consume or poison a later turn's grant.
+    check();
+    if (JSON.stringify(turn) !== JSON.stringify(identity)) throw new Error("stale architecture turn grant");
+    submitted = true;
+  };
   return {
     analysis: true as const,
+    attemptSubmit,
     get failure() { return invalid; },
+    get attempted() { return submitted; },
     get caller() { if (!caller) throw new Error("Architect native caller unavailable"); caller.check(); return caller; },
-    open(stage: Stage) { if (expected) throw new Error("architecture turn busy"); expected = stage; turn = undefined; provisional = undefined; invalid = undefined; },
-    begin(identity: NativeTurn) { if (!input.current() || !expected) throw new Error("architecture grant retired"); turn = identity; provisional = undefined; invalid = undefined; },
+    open(authorization: StageGrant) {
+      if (grant) throw new Error("architecture turn busy");
+      grant = immutable(structuredClone(authorization)); turn = undefined; provisional = undefined; invalid = undefined; submitted = false; attempts.length = 0;
+    },
+    begin(identity: NativeTurn) {
+      if (!input.current() || !grant) throw new Error("architecture grant retired");
+      if (submitted) throw new Error("architecture submission already attempted");
+      turn = structuredClone(identity);
+    },
     bind(pi: ExtensionAPI, ctx: ExtensionContext) { caller = nativeCaller(pi, ctx, input.current); },
     prompt(identity: NativeTurn) { check(); if (JSON.stringify(turn) !== JSON.stringify(identity)) throw new Error("architecture attempt mismatch"); caller?.check(); },
     submit(toolCallId: string, value: unknown, ctx: ExtensionContext, identity: NativeTurn) {
-      // An old callback cannot poison the current attempt's provisional submission.
-      check();
-      if (JSON.stringify(turn) !== JSON.stringify(identity)) throw new Error("stale architecture turn grant");
-      if (!caller || ctx.sessionManager !== caller.manager || ctx.sessionManager.getSessionId() !== turn!.sessionId) throw new Error("architecture native caller mismatch");
+      attemptSubmit(identity);
+      if (!caller || ctx.sessionManager !== caller.manager || ctx.sessionManager.getSessionId() !== turn!.sessionId) {
+        invalid = "architecture native caller mismatch";
+        throw new Error(invalid);
+      }
       caller.check();
+      if (invalid) throw new Error(invalid);
+      const submissionId = value && typeof value === "object" && "submissionId" in value ? value.submissionId : undefined;
+      const previous = attempts.find(attempt => attempt.submissionId === submissionId);
+      const fatal = (reason: string): never => { invalid = reason; throw new Error(reason); };
+      if (previous) {
+        if (!isDeepStrictEqual(previous.value, value)) fatal("conflicting architecture submission");
+        if (previous.error) throw previous.error;
+        return provisional!.receipt;
+      }
+      if (provisional) fatal("conflicting architecture submission");
+      if (attempts.length >= 2) fatal("architecture correction budget exhausted");
+      const attempt: typeof attempts[number] = { submissionId, value: structuredClone(value) };
+      attempts.push(attempt);
       try {
-        if (!Value.Check(submitSchema, value) || value.body.kind !== expected) throw new Error("invalid architecture submit for stage");
-        if (provisional) {
-          if (provisional.submissionId !== value.submissionId || !isDeepStrictEqual(provisional.body, value.body)) throw new Error("conflicting architecture submission");
-          return provisional.receipt;
-        }
-        provisional = { ...structuredClone(value), toolCallId, receipt: { id: randomUUID(), state: "provisional" } };
+        const validated = validateSubmission(grant!, value);
+        provisional = { ...structuredClone(validated), toolCallId, receipt: { id: randomUUID(), state: "provisional" } };
         return provisional.receipt;
-      } catch (error) { invalid = String(error); throw error; }
+      } catch (error) {
+        if (error instanceof SubmissionError) {
+          attempt.error = new SubmissionError({ ...error.diagnostic, correctionsLeft: 2 - attempts.length });
+          throw attempt.error;
+        }
+        return fatal(String(error));
+      }
     },
     settle(success: boolean): Message {
       try {
         check();
+        caller?.check();
         if (!success || invalid || !provisional) throw new Error(invalid ?? "architecture protocol failed: no valid settled submit");
-        return input.publish({ stage: expected!, body: structuredClone(provisional.body), turnId: turn!.turnId, attemptId: turn!.attemptId,
+        return input.publish({ stage: grant!.rules.kind, body: structuredClone(provisional.body), turnId: turn!.turnId, attemptId: turn!.attemptId,
           native: { historyId: turn!.historyId, sessionId: turn!.sessionId, toolCallId: provisional.toolCallId, persistence: "unconfirmed" },
           doubts: "doubts" in provisional.body ? provisional.body.doubts.map(doubt => ({ id: randomUUID(), ...doubt })) : [] });
-      } finally { expected = undefined; turn = undefined; provisional = undefined; }
+      } finally { grant = undefined; turn = undefined; provisional = undefined; }
     },
-    revoke() { expected = undefined; turn = undefined; provisional = undefined; },
+    revoke() { grant = undefined; turn = undefined; provisional = undefined; },
   };
 }
 export type Participant = ReturnType<typeof participant>;

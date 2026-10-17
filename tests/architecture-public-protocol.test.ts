@@ -13,11 +13,11 @@ const record = (text: string) => ({ kind: "failure", id: "failure", phase: "turn
 test("architecture capability group is complete, canonical, optional on both descriptor and connect", () => {
   const descriptor = { version: 2, transport: "unix", socket: "/tmp/bridge", token: "a".repeat(64), owner, capabilities };
   const connect = (group: readonly string[]) => success(envelope("connect", { token: "a".repeat(64), expectedSessionId: "owner" }), { capabilities: group, lease: { clientId: "client", resumeToken: "b".repeat(64) } });
-  for (const group of [capabilities, capabilities.slice(0, -3)]) {
+  for (const group of [capabilities, capabilities.slice(0, 13), capabilities.slice(0, 16)]) {
     expect(isDescriptor({ ...descriptor, capabilities: group })).toBe(true);
     expect(isReply(connect(group), "connect")).toBe(true);
   }
-  for (const group of [capabilities.slice(0, -1), capabilities.slice(0, -2), [...capabilities].reverse(), [...capabilities, "architecture.list"], [...capabilities.slice(0, -3), "architecture.public-v2"]]) {
+  for (const group of [capabilities.slice(0, 14), capabilities.slice(0, 15), [...capabilities].reverse(), [...capabilities, "architecture.list"], [...capabilities.slice(0, 13), "architecture.public-v2"]]) {
     expect(isDescriptor({ ...descriptor, capabilities: group })).toBe(false);
     expect(isReply(connect(group), "connect")).toBe(false);
   }

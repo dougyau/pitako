@@ -78,8 +78,9 @@ test("foreground publishes protocol 2 without permission flags or mutation capab
     try {
       expect(client.capabilities).toEqual(["workers.list", "workers.detail", "workers.requests", "workers.activity", "workers.result", "subscribe", "unsubscribe",
         "history.list", "history.read", "route.read", "workers.detail.public-v1", "workers.activity.public-v1", "workers.result.public-v1",
-        "architecture.list", "architecture.read", "architecture.public-v1"]);
+        "architecture.list", "architecture.read", "architecture.public-v1", "background.pending"]);
       expect((await client.list()).items).toEqual([]);
+      expect(await client.backgroundPending()).toEqual({ state: "none" });
     }
     finally { await client.disconnect(); }
   });

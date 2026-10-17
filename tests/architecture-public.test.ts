@@ -59,9 +59,9 @@ test("Node ESM detects original v2 without sending unsupported architecture meth
   const socket = path.join(root, "bridge.sock"), methods: string[] = [];
   const server = createServer(connection => { const receive = frames((request: any) => { methods.push(request.method);
     connection.write(frame({ version: 2, id: request.id, clientId: request.clientId, owner, ok: true,
-      result: { capabilities: capabilities.slice(0, -3), lease: { clientId: request.clientId, resumeToken: "a".repeat(64) } } }, "test")); }); connection.on("data", receive); });
+      result: { capabilities: capabilities.slice(0, 13), lease: { clientId: request.clientId, resumeToken: "a".repeat(64) } } }, "test")); }); connection.on("data", receive); });
   await new Promise<void>(resolve => server.listen(socket, resolve)); chmodSync(socket, 0o600);
-  writeFileSync(path.join(root, "descriptor.json"), JSON.stringify({ version: 2, transport: "unix", owner, socket, token: "b".repeat(64), capabilities: capabilities.slice(0, -3) }), { mode: 0o600 });
+  writeFileSync(path.join(root, "descriptor.json"), JSON.stringify({ version: 2, transport: "unix", owner, socket, token: "b".repeat(64), capabilities: capabilities.slice(0, 13) }), { mode: 0o600 });
   let node: Awaited<ReturnType<typeof reader>> | undefined;
   try { node = await reader(path.join(root, "descriptor.json"), owner.coordinatorSessionId); expect(node.ready.node).toBe("node");
     expect(node.ready.capabilities).not.toContain("architecture.list"); await expect(node.call("listArchitectures")).rejects.toMatchObject({ code: "unsupported_method" });
@@ -81,7 +81,7 @@ for (const preparation of ["continues", "fails", "stops"] as const) test(`Node d
   try {
     const start = await s.invoke("architecture_start", { mode: "consultation", goal: "# Original 🧠\r\n\nMandate", plan: "observe", unit: "T2" });
     expect(start.isError).not.toBe(true); await entered.promise; expect(s.host.sessions).toHaveLength(0);
-    bridge = await bridgeFor(s); expect(bridge.node.ready.capabilities.slice(-3)).toEqual(["architecture.list", "architecture.read", "architecture.public-v1"]);
+    bridge = await bridgeFor(s); expect(bridge.node.ready.capabilities.slice(13, 16)).toEqual(["architecture.list", "architecture.read", "architecture.public-v1"]);
     const list = await bridge.node.call("listArchitectures"); expect(list.items).toHaveLength(1); const ref = list.items[0].ref;
     const before = await readAll(bridge.node, ref); expect(before.capture.state).toBe("open");
     expect(before.records.filter((r: any) => r.kind === "member").map((r: any) => r.assignmentId)).toEqual(teamAssignments(s.evaluation).map(a => a.id));
@@ -148,7 +148,7 @@ test("Node sees settled synthesis, never provisional receipt; director disposal 
 }));
 
 
-test("Node roster preserves failed specialists, supports and recomposition; adjusted outcome is distinct", fixture.ownedCase("public roster and adjustment", async () => {
+test("Node roster preserves failed specialists, supports, boundaries and recomposition; partial synthesis is authored", fixture.ownedCase("public roster and synthesis", async () => {
   const frontier = gate(), advance = gate(), disposing = gate(), dispose = gate();
   fixture.finishOnCleanup(() => { advance.resolve(); dispose.resolve(); });
   let compositions = 0;
@@ -165,6 +165,7 @@ test("Node roster preserves failed specialists, supports and recomposition; adju
     if (request.stage === "contribution") { if (request.round === 1) { frontier.resolve(); await advance.promise; }
       return { kind: "contribution", proposal: request.context.mandate, arguments: ["Evidence"], objections: [], doubts: [] }; }
     if (request.stage === "decision") return { kind: "decision", action: request.round === 1 ? "recompose" : "synthesize", reason: "Known change" };
+    if (request.stage === "synthesis") return { ...body, status: "partial", pending: ["One or more member turns failed"] };
     return body;
   }, async dispose(session) { if (session.prompts.some((p: string) => JSON.parse(p).stage === "synthesis")) { disposing.resolve(); await dispose.promise; } } });
   let bridge: Awaited<ReturnType<typeof bridgeFor>> | undefined;
@@ -202,13 +203,14 @@ test("Node roster preserves failed specialists, supports and recomposition; adju
       for (const fragment of page.details.fragments) local.set(fragment.messageId, (local.get(fragment.messageId) ?? "") + fragment.text); localCursor = page.details.cursor ?? undefined;
     } while (localCursor);
     const registered = [...local.values()].map(text => JSON.parse(text));
-    expect(publications.map((r: any) => r.message)).toEqual(registered);
+    expect(held.records.filter((r: any) => ["publication", "knowledge-boundary"].includes(r.kind)).map((r: any) => r.message ?? r)).toEqual(registered);
+    expect(held.records.filter((r: any) => r.kind === "knowledge-boundary")).toHaveLength(2);
     expect(publications.every((r: any) => r.message.native.persistence === "unconfirmed")).toBe(true);
-    expect(publications.find((r: any) => r.message.stage === "synthesis").message.body.status).toBe("complete");
+    expect(publications.find((r: any) => r.message.stage === "synthesis").message.body.status).toBe("partial");
     const captured = closedCapture(s); dispose.resolve(); await s.delivered.promise; await captured;
     const final = await readAll(bridge.node, ref);
     expect(final.records.find((r: any) => r.kind === "outcome")).toMatchObject({ status: "failed", content: { kind: "synthesis", body: { status: "partial", pending: ["One or more member turns failed"] } } });
-    expect(final.records.find((r: any) => r.message?.stage === "synthesis").message.body.status).toBe("complete");
+    expect(final.records.find((r: any) => r.message?.stage === "synthesis").message.body.status).toBe("partial");
     expect(s.sent.filter(item => item.message.customType === "pitako.worker.result")).toHaveLength(1);
   } finally { advance.resolve(); dispose.resolve(); await bridge?.close(); await s.close(); }
 }));
@@ -294,22 +296,28 @@ for (const preparation of [false, true]) test(`Node observes unknown ${preparati
 });
 
 
-test("settled publication survives later semantic rejection without entering protocol history", fixture.ownedCase("invalid settled publication", async () => {
-  const s = await setup({ async prompt(_session, request, body) {
+test("contextually rejected bodies never enter publication or protocol history", fixture.ownedCase("invalid submitted publication", async () => {
+  const s = await setup({ async prompt(session, request, body) {
     if (request.stage === "preparation") return { kind: "preparation", analysis: "Ready", doubts: [] };
-    if (request.stage === "decision") return { kind: "decision", action: "synthesize", reason: "Done" };
-    if (request.stage === "contribution") return { kind: "contribution", proposal: "Settled but invalid reference", arguments: [],
-      objections: [{ memberId: "unknown", messageId: "unknown", argument: "Invalid reference" }], doubts: [] };
+    if (request.stage === "contribution") {
+      const invalid = { kind: "contribution", proposal: "Invalid reference", arguments: [],
+        objections: [{ memberId: "unknown", messageId: "unknown", argument: "Invalid reference" }], doubts: [] };
+      const rejected = await session.boundTools.get("architecture_submit").execute("bad-reference", { submissionId: "bad", body: invalid }, undefined, undefined, { sessionManager: session.sessionManager });
+      expect(rejected.isError).toBe(true); expect(rejected.details).toMatchObject({ code: "reference", badIds: ["unknown", "unknown"], correctionsLeft: 1 });
+      return false;
+    }
+    if (request.stage === "decision") return { kind: "decision", action: "synthesize", reason: "Member failed" };
+    if (request.stage === "synthesis") return { ...body, status: "partial", pending: ["Member turn failed"] };
     return body;
   } });
   let bridge: Awaited<ReturnType<typeof bridgeFor>> | undefined;
   try {
-    const start = await s.invoke("architecture_start", { mode: "table", goal: "Capture settled rejection" });
+    const start = await s.invoke("architecture_start", { mode: "table", goal: "Capture rejected submission" });
     await s.delivered.promise; bridge = await bridgeFor(s);
     const ref = (await bridge.node.call("listArchitectures")).items[0].ref;
     const final = await readAll(bridge.node, ref);
-    expect(final.records.find((r: any) => r.message?.stage === "contribution").message.body.objections[0].messageId).toBe("unknown");
-    expect(final.records.some((r: any) => r.kind === "failure" && r.error.includes("objection must reference"))).toBe(true);
+    expect(final.records.some((r: any) => r.message?.stage === "contribution")).toBe(false);
+    expect(final.records.some((r: any) => r.kind === "failure" && r.phase === "turn")).toBe(true);
     expect(final.records.find((r: any) => r.kind === "outcome")).toMatchObject({ status: "failed", content: { kind: "synthesis", body: { status: "partial" } } });
   } finally { await bridge?.close(); await s.close(); }
 }));
@@ -385,4 +393,70 @@ test("publication and closure producers advance cuts without worker events; reti
     nextController?.revoke(); await nextController?.settle();
     await retireTeamEvaluation(replacement); await bridge?.close(); await s.close();
   }
+}));
+
+
+test("published Node reader and local immutable cuts retain ten ordered resolutions from nine direct and one authored knowledge", fixture.ownedCase("public mixed knowledge", async () => {
+  const entered = gate(), release = gate(); fixture.finishOnCleanup(release.resolve);
+  let original: any[] = [], authored: any;
+  const s = await setup({ async prompt(_session, request, body) {
+    if (request.stage === "preparation") return { kind: "preparation", analysis: "Ten doubts", doubts: Array.from({ length: 10 }, (_, i) => ({ question: `Doubt ${i}`, purpose: "Complete boundary" })) };
+    if (request.stage === "consultation-plan") {
+      original = request.context.doubts;
+      return { kind: "consultation-plan", resolutions: original.slice(0, 9).map(d => ({ doubtId: d.id, status: "answered", answer: "Direct 🧠".repeat(3000) })),
+        support: [{ role: "oracle", brief: "Tenth only", doubtIds: [original[9].id], prerequisites: [] }] };
+    }
+    if (request.stage === "consultation-response") return { kind: "consultation-response", doubtIds: request.context.request.doubtIds, answer: "Tenth evidence", evidence: [], limits: [], doubts: [] };
+    if (request.stage === "knowledge") {
+      expect(request.context.delegatedDoubts).toEqual([original[9]]);
+      authored = { kind: "knowledge", resolutions: [{ doubtId: original[9].id, status: "answered", answer: "Delegated", supportIds: [request.context.responses[0].id] }] };
+      return authored;
+    }
+    if (request.stage === "contribution") {
+      expect(request.context.shared.knowledgeBoundaries[0].resolutions.map((r: any) => r.doubtId)).toEqual(original.map(d => d.id));
+      entered.resolve(); await release.promise; return { kind: "contribution", proposal: "Now shared", arguments: [], objections: [], doubts: [] };
+    }
+    if (request.stage === "decision") return { kind: "decision", action: "synthesize", reason: "Complete" };
+    if (request.stage === "synthesis") expect(request.context.knowledgeBoundaries[0].resolutions).toHaveLength(10);
+    return body;
+  } });
+  let bridge: Awaited<ReturnType<typeof bridgeFor>> | undefined;
+  try {
+    const start = await s.invoke("architecture_start", { mode: "table", goal: "Nine direct plus one delegated" }); await entered.promise;
+    bridge = await bridgeFor(s); const ref = (await bridge.node.call("listArchitectures")).items[0].ref;
+    const first = await bridge.node.call("readArchitecture", ref); expect(first.next).toBeString();
+    const localFirst = (await s.invoke("architecture_read", { roomId: start.details.roomId })).details; expect(localFirst.cursor).toBeString();
+    release.resolve(); await s.delivered.promise;
+    const frozen: any[] = [], chunks = new Map<string, Buffer[]>(); let page = first;
+    for (;;) {
+      expect(page.cut).toBe(first.cut);
+      for (const record of page.records) {
+        if (record.kind !== "fragment") { frozen.push(record); continue; }
+        const parts = chunks.get(record.recordId) ?? []; expect(record.byteOffset).toBe(parts.reduce((n, b) => n + b.length, 0));
+        parts.push(Buffer.from(record.data, "base64")); chunks.set(record.recordId, parts);
+        if (record.byteOffset + parts.at(-1)!.length === record.totalBytes) { frozen.push(JSON.parse(Buffer.concat(parts).toString())); chunks.delete(record.recordId); }
+      }
+      if (!page.next) break;
+      page = await bridge.node.call("readArchitecture", ref, page.next);
+    }
+    expect(chunks.size).toBe(0); expect(frozen.some(r => r.message?.stage === "synthesis")).toBe(false);
+    const boundaries = frozen.filter(r => r.kind === "knowledge-boundary"); expect(boundaries).toHaveLength(1);
+    const boundary = boundaries[0]; expect(boundary.resolutions.map((r: any) => r.doubtId)).toEqual(original.map(d => d.id));
+    expect(boundary.resolutions.slice(0, 9).every((r: any) => r.supportIds.length === 0 && r.provenance.kind === "direct" && r.provenance.planMessageId === boundary.planMessageId)).toBe(true);
+    const knowledge = frozen.find(r => r.message?.stage === "knowledge").message, support = frozen.find(r => r.message?.stage === "consultation-response").message;
+    expect(knowledge.body).toEqual(authored); expect(knowledge.body.resolutions).toHaveLength(1); expect(knowledge.native.toolCallId).toBe("native-submit");
+    expect(boundary.knowledgeMessageId).toBe(knowledge.id);
+    expect(boundary.resolutions[9].provenance).toEqual({ kind: "delegated", knowledgeMessageId: knowledge.id, consultationId: authored.resolutions[0].supportIds[0],
+      responses: [{ consultationId: authored.resolutions[0].supportIds[0], assignmentId: support.assignmentId, messageId: support.id, status: "completed" }] });
+    const local = new Map<string, string>(); let localPage = localFirst;
+    for (;;) {
+      expect(localPage.cut).toBe(localFirst.cut);
+      for (const fragment of localPage.fragments) { const prior = local.get(fragment.messageId) ?? ""; expect(fragment.offset).toBe(prior.length); local.set(fragment.messageId, prior + fragment.text); }
+      if (!localPage.cursor) break;
+      localPage = (await s.invoke("architecture_read", { roomId: start.details.roomId, cursor: localPage.cursor })).details;
+    }
+    const records = [...local.values()].map(text => JSON.parse(text)); expect(records.find(r => r.kind === "knowledge-boundary")).toEqual(boundary);
+    expect(records.some(r => r.stage === "synthesis")).toBe(false);
+    const final = await readAll(bridge.node, ref); expect(final.records.find((r: any) => r.message?.stage === "synthesis").message.body.status).toBe("complete");
+  } finally { release.resolve(); await bridge?.close(); await s.close(); }
 }));

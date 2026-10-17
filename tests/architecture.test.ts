@@ -27,7 +27,7 @@ test("registered start publishes Markdown guidance and preserves the original br
   let knowledgeTurns = 0;
   const s = await setup({ async prompt(_session, request) {
     if (request.stage === "composition") { compositionEntered.resolve(); await releaseComposition.promise; }
-    if (request.stage === "knowledge" && ++knowledgeTurns === 2) { controlledKnowledge.resolve(); await releaseKnowledge.promise; }
+    if (request.stage === "consultation-plan" && ++knowledgeTurns === 2) { controlledKnowledge.resolve(); await releaseKnowledge.promise; }
   } });
   try {
     const definition = s.tools.get("architecture_start"), schema = definition.parameters.properties;
