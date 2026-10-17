@@ -84,6 +84,86 @@ Neither the descriptor authentication token nor `lease.resumeToken` belongs in
 logs, model context, native history, or public output. A host does not need to
 print or rewrite the descriptor to connect.
 
+## Native background pending
+
+`await client.backgroundPending()` sends `background.pending` with params `{}`.
+The existing authenticated envelope identifies the owner; no worker references,
+Lineage imports, pagination, subscription, or model turn are required. It returns
+exactly one of:
+
+```ts
+type BackgroundPending =
+  | { state: "pending" }
+  | { state: "none" }
+  | { state: "unavailable";
+      reason: "unsupported" | "stale_owner" | "source_unavailable" };
+```
+
+`none` confirms absence only for this owner at the instant of reading, not future
+admissions. `pending` includes accepted preparation, running attempts, held SDK
+close and internal callbacks, unknown closure, and outstanding exterior delivery.
+It derives from native owner/session reservations and rows, not the UI catalog,
+historical roster, `resultTaken`, or a second task registry. A pre-reservation
+failure is absent; accepted partial preparation stays pending through cleanup
+and applicable failure delivery. Roster rollback cannot hide that native row.
+Cancellation and Stop may withdraw delivery but cannot release unsettled resources.
+
+Released protocol members need no exterior receipt. The exterior director still
+counts after specialist disband until its own lifetime and close settle. Exterior
+final handoffs require reconciled/inapplicable bookkeeping and incorporated
+delivery unless explicitly withdrawn. Each intermediate exterior response must
+independently be incorporated or explicitly withdrawn: a final receipt cannot
+hide an intermediate. No interpretation, acceptance, or observed continuation
+is required. Released historical rows alone do not pin. This is not a universal
+`agent_run` lifetime guarantee.
+
+The read is passive: it does not collect, acknowledge, consume results, advance
+protocols, send wakes, or renew activity. Owner replacement immediately revokes
+old reads and drains the old resources before admitting a new owner. Failed drain
+cannot authorize a new owner's zero; rows are never transferred to a new token.
+
+Version remains 2. `background.pending` follows `architecture.public-v1` in the
+capability list. Updated validators accept only three exact, ordered snapshots:
+13 base capabilities, 16 including the architecture group, or all 17 including
+pending. Descriptor and connect must agree. Missing capability returns
+`unavailable/unsupported` without sending an unknown operation. Incompatible
+versions fail connect; the consumer classifies that failure because no client
+exists yet. The broker retains authorization and stale-owner errors. Only
+`backgroundPending()` maps errors to this union: retired owner to `stale_owner`;
+source, transport, authentication and invalid replies to `source_unavailable`,
+never to `none`. Other client methods keep their exceptions.
+
+### T3 adoption and protection boundary
+
+T3 must adopt the **complete updated published v2 snapshot**, both JavaScript
+and TypeScript declarations, not copy this method alone. Its strict capability
+reader must recognize the three exact snapshots, current optional Team identities
+in worker list/detail, and architecture records including T1's
+`knowledge-boundary` provenance. Existing strict vendored v2 readers are not
+implicitly compatible. The historical version mismatch is not a proven incident
+cause.
+
+Both session-idle and thread-unload decisions must read native pending independently
+of Lineage, `eventSink.nativeWorkers`, `childThreadId`, and checkpoints. Combine
+positive native pending with ordinary T3 reasons, including `pendingWake`.
+Unavailable is not false: do not turn catches into absence. Keep the existing
+30-minute idle threshold and four-hour maximum pinning budget; retain diagnostic
+unavailability within that budget, genuine-activity renewal, and explicit Stop.
+Passive reads, reconnects and repeated diagnostics never renew the budget.
+
+After every await, fence the same runtime process, coordinator session and owner
+epoch before using the answer; discard late replies from retired owners. Connect
+through the private descriptor of the real Pi process and validate ownership,
+not an invented owner or a worker list fallback.
+
+Local publication is **not integrated T3 protection**. Consumer edits are separate.
+T3 still needs external integration checks: real registered `team_assign` and
+`agent_spawn` with Lineage import deliberately suppressed; simulated 30-minute /
+four-hour clocks and genuine renewal; specialists closed with director retained;
+then exterior delivery and unload under the same owner. Also cover cancellation,
+Stop, owner replacement, unavailable/incompatible bridge, and late-reply fences.
+Those are externally pending T3 checks, not Pitako gates or dependency certification.
+
 ## Ordinary worker reads
 
 These reads are scoped to the current owner. They do not consume results, release

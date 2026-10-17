@@ -15,6 +15,7 @@ import { reconcileChildTools, ORCHESTRATION_TOOLS, isOrchestrationTool } from ".
 import { packageRoot } from "../stack.ts";
 import { marksSideEffect } from "./effects.ts";
 import { isServiceTierRejection } from "./fallback.ts";
+import { SubmissionError } from "../architecture/protocol.ts";
 import { childInstructions, skillNamesForRole, usageDelta, type AgentRequestObservation, type AgentUsage, type Attempt, type AttemptExecutor } from "./run.ts";
 import type { ModelTarget, ReasoningLevel } from "../roles/types.ts";
 import { InvocationHistory, type SessionHistory } from "./history.ts";
@@ -546,15 +547,20 @@ async function openSession(
           return { block: true, reason: "Consultative leaves cannot orchestrate Pitako work" };
       });
       if (input.participant) {
-        pi.registerTool({ name: "architecture_submit", label: "Submit architecture turn", description: "Provisional submission for your exact authorized architecture turn. Does not dispatch work.",
+        pi.registerTool({ name: "architecture_submit", label: "Submit architecture turn", description: "Submit for your exact architecture grant. Contextual errors allow one correction with a new submissionId (two distinct candidates). Identical retries are idempotent; valid provisional submissions are locked. Does not dispatch work.",
           parameters: submitSchema, async execute(id, value, signal, _update, ctx) {
             try {
               const turn = architectureTurns.getStore();
-              if (!turn?.active || turn.session !== nativeSession || turn.signal.aborted || signal?.aborted || childLifecycles.get(turn.session)?.closing)
+              if (!turn?.active || turn.session !== nativeSession) throw new Error("architecture grant not active");
+              input.participant!.attemptSubmit(turn.identity);
+              if (turn.signal.aborted || signal?.aborted || childLifecycles.get(turn.session)?.closing)
                 throw new Error("architecture grant not active");
               const receipt = input.participant!.submit(id, value, ctx, turn.identity);
               return { content: [{ type: "text", text: JSON.stringify(receipt) }], details: receipt };
-            } catch (error) { return { content: [{ type: "text", text: String(error) }], details: {}, isError: true }; }
+            } catch (error) {
+              const details = error instanceof SubmissionError ? error.diagnostic : {};
+              return { content: [{ type: "text", text: String(error) }], details, isError: true };
+            }
           } });
         pi.on("session_start", (_event, ctx) => input.participant!.bind(pi, ctx));
       }

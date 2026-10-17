@@ -1,7 +1,7 @@
 import { architectureRooms, architectureRoom, subscribeArchitectureChanges, createArchitectureSnapshots } from "../architecture/rooms.ts";
 import type { ArchitectureRef } from "./bridge/protocol.js";
 import { createHash, randomUUID } from "node:crypto";
-import { cancelTeamWorker, cancelWorker, readWorkerResult, type LiveTarget } from "./background.ts";
+import { cancelTeamWorker, cancelWorker, readBackgroundPending, readWorkerResult, type LiveTarget } from "./background.ts";
 import { listObservations, readTerminalActivity, subscribeChanges } from "./observe.ts";
 import { resolveOwnedLive, resolveOwnedWorkerRead } from "./owner.ts";
 import { queryHistory, type HistoryQuery } from "./history-query.ts";
@@ -183,6 +183,10 @@ export function createAgentController(owner: AgentControllerOwner, current: () =
     page: ReturnType<typeof textPage>): WorkerReadCursor | null =>
     page.nextOffset === null ? null : { ref, section, offset: page.nextOffset };
   return {
+    backgroundPending() {
+      check();
+      return readBackgroundPending(readScope());
+    },
     revoke() {
       active = false; // before any caller's cleanup await
       unwatch(); unwatchArchitecture(); architectureSnapshots.clear(); finalArchitectureCuts.clear();

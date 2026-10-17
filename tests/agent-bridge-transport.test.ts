@@ -397,3 +397,96 @@ test("cleanup preserves replaced descriptor and refuses native close of a replac
     expect(readFileSync(file, "utf8")).toBe("unrelated descriptor");
     unlinkSync(file); unlinkSync(descriptorBackup);
   }));
+
+test("pending wire is exact, owner-scoped, non-paginated and authenticates before reads", () =>
+  ownedBridge(async ({ descriptor, wire, client, controller }) => {
+    const peer = wire(), request = peer.envelope("background.pending");
+    expect(isRequest(request)).toBe(true);
+    for (const params of [{ count: true }, { ref: {} }, { cursor: "x" }, { subscribe: true }])
+      expect(isRequest({ ...request, params })).toBe(false);
+    for (const result of [{ state: "none" }, { state: "pending" },
+      ...["unsupported", "stale_owner", "source_unavailable"].map(reason => ({ state: "unavailable", reason }))]) {
+      const { method: _method, params: _params, ...envelope } = request;
+      expect(isReply({ ...envelope, ok: true, result }, "background.pending")).toBe(true);
+      expect(isReply({ ...envelope, ok: true, result: { ...result, count: 0 } }, "background.pending")).toBe(false);
+    }
+    expect(await peer.request(request)).toMatchObject({ ok: false, error: { code: "unauthorized" } });
+    await peer.authenticate();
+    expect(await peer.request({ ...peer.envelope("background.pending"), owner: { ...descriptor.owner, epoch: "old" } }))
+      .toMatchObject({ ok: false, error: { code: "stale_owner" } });
+    const normal = await client();
+    controller.revoke();
+    expect(await normal.backgroundPending()).toEqual({ state: "unavailable", reason: "stale_owner" });
+    await expect(normal.list()).rejects.toMatchObject({ code: "stale_owner" });
+  }));
+
+test("exact known v2 capability snapshots agree at descriptor and connect; older producers receive no pending request", async () => {
+  const original = net.Socket.prototype.write;
+  for (const size of [13, 16]) {
+    let pendingRequests = 0;
+    const capture = spyOn(net.Socket.prototype, "write").mockImplementation(function(this: net.Socket, ...args) {
+      const bytes = Buffer.from(args[0] as string).toString();
+      let value: any;
+      try { value = JSON.parse(bytes); } catch { return Reflect.apply(original, this, args); }
+      if (value.owner?.coordinatorSessionId === "legacy-pending") {
+        if (value.method === "background.pending") pendingRequests++;
+        if (value.ok && value.result?.capabilities) return Reflect.apply(original, this,
+          [frame({ ...value, result: { ...value.result, capabilities: capabilities.slice(0, size) } }), ...args.slice(1)]);
+      }
+      return Reflect.apply(original, this, args);
+    });
+    try {
+      await ownedBridge(async ({ descriptor, file, client }) => {
+        const older = { ...descriptor, capabilities: capabilities.slice(0, size) };
+        writeFileSync(file, JSON.stringify(older));
+        expect(isDescriptor(older)).toBe(true);
+        const peer = await client();
+        expect(peer.capabilities).toEqual(older.capabilities);
+        expect(await peer.backgroundPending()).toEqual({ state: "unavailable", reason: "unsupported" });
+        expect(await peer.backgroundPending()).toEqual({ state: "unavailable", reason: "unsupported" });
+        expect(pendingRequests).toBe(0);
+        expect((await peer.list()).items).toEqual([]);
+      }, "legacy-pending");
+    } finally { capture.mockRestore(); }
+  }
+  await ownedBridge(async ({ descriptor, file }) => {
+    for (const list of [capabilities.slice(0, 14), capabilities.slice(0, 15), [...capabilities, "extension"],
+      [...capabilities].reverse(), [...capabilities.slice(0, 16), "wrong.pending"]]) {
+      expect(isDescriptor({ ...descriptor, capabilities: list })).toBe(false);
+    }
+    writeFileSync(file, JSON.stringify({ ...descriptor, capabilities: capabilities.slice(0, 16) }));
+    await expect(connect(file, { expectedSessionId: "owner" })).rejects.toMatchObject({ code: "invalid_reply" });
+  });
+});
+
+test("only backgroundPending maps auth, source, corrupt reply and transport failure to unavailable, never none", async () => {
+  const original = net.Socket.prototype.write;
+  for (const mode of ["unauthorized", "invalid_cursor", "corrupt", "unavailable"] as const) {
+    let changed = 0;
+    const capture = spyOn(net.Socket.prototype, "write").mockImplementation(function(this: net.Socket, ...args) {
+      let value: any;
+      try { value = JSON.parse(Buffer.from(args[0] as string).toString()); } catch { return Reflect.apply(original, this, args); }
+      if (value.owner?.coordinatorSessionId === "pending-errors" && "ok" in value && !value.result?.capabilities) {
+        changed++;
+        const replacement = mode === "corrupt" ? { ...value, ok: true, error: undefined, result: { state: "none", count: 0 } }
+          : mode === "unavailable" ? { ...value, ok: true, error: undefined, result: { state: "unavailable", reason: "source_unavailable" } }
+          : failure(value, mode);
+        return Reflect.apply(original, this, [frame(replacement), ...args.slice(1)]);
+      }
+      return Reflect.apply(original, this, args);
+    });
+    try {
+      await ownedBridge(async ({ client }) => {
+        const peer = await client();
+        expect(await peer.backgroundPending()).toEqual({ state: "unavailable", reason: "source_unavailable" });
+        expect(changed).toBe(1);
+        if (mode === "unauthorized" || mode === "invalid_cursor") await expect(peer.list()).rejects.toMatchObject({ code: mode });
+      }, "pending-errors");
+    } finally { capture.mockRestore(); }
+  }
+  await ownedBridge(async ({ client }) => {
+    const peer = await client(); await peer.disconnect();
+    expect(await peer.backgroundPending()).toEqual({ state: "unavailable", reason: "source_unavailable" });
+    await expect(peer.list()).rejects.toMatchObject({ code: "disconnected" });
+  });
+});

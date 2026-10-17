@@ -2,6 +2,7 @@ import { randomUUID, randomBytes, createHmac, timingSafeEqual } from "node:crypt
 import { teamEvaluationForSession, type TeamEvaluation, type TeamAssignment } from "../team.ts";
 import type { AgentRunResult } from "../agent/run.ts";
 import type { Consultation } from "./runtime.ts";
+import type { KnowledgeBoundary } from "./protocol.ts";
 import type { Message, Stage, Body } from "./types.ts";
 import type { ArchitectureRecord, ArchitectureLifecycle } from "../agent/bridge/protocol.js";
 
@@ -78,6 +79,9 @@ export function observeArchitectureAssignment(evaluation: TeamEvaluation, assign
 }
 export function architecturePublication(room: ArchitectureRoom | undefined, message: Message) {
   captureArchitecture(room, room => room.records.set(message.id, { kind: "publication", id: message.id, message: structuredClone(message) }));
+}
+export function architectureKnowledge(room: ArchitectureRoom | undefined, boundary: KnowledgeBoundary) {
+  captureArchitecture(room, room => room.records.set(boundary.id, structuredClone(boundary)));
 }
 export function architectureFailure(room: ArchitectureRoom | undefined, phase: "preparation" | "admission" | "turn" | "disband" | "director-close", error: unknown,
   context: { memberId?: string; assignmentId?: string; stage?: Stage; round?: number } = {}) {

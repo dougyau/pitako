@@ -130,6 +130,7 @@ export function createAgentBridge(controller: Controller, root: string, current:
           try {
             let page: unknown;
             switch (request.method) {
+              case "background.pending": page = controller.backgroundPending(); break;
               case "architecture.list": page = view.listArchitectures(request.params.cursor,
                 Math.min(40 * 1024, replyBytes - Buffer.byteLength(frame(success(request, null), "Agent bridge")) + 4)); break;
               case "architecture.read": page = view.readArchitecture(request.params.ref, request.params.cursor,

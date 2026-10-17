@@ -4,14 +4,14 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { setBackgroundExecutor, clearBackgroundOwner, workerHandoff, bindBackgroundOwner, cancelTeamWorker, spawnBackground, teamWorkerStatus, reserveBackground, observeWorkerResults } from "../extensions/agent/background.ts";
+import { setBackgroundExecutor, readBackgroundPending, clearBackgroundOwner, workerHandoff, bindBackgroundOwner, cancelTeamWorker, spawnBackground, teamWorkerStatus, reserveBackground, observeWorkerResults } from "../extensions/agent/background.ts";
 import { AgentClosureError } from "../extensions/agent/closure.ts";
 import { createPiExecutor } from "../extensions/agent/pi.ts";
 import { HeadAttachment } from "../extensions/agent/head/runtime.ts";
 import { runAgentInstance } from "../extensions/agent/run.ts";
 import { WorkerHistory } from "../extensions/agent/history.ts";
 import { subscribeChanges } from "../extensions/agent/observe.ts";
-import { beginTeamEvaluation, reserveTeamMember, retireTeamEvaluation, firstTeamReservation, createTeam, admitTeamMember, disbandTeam } from "../extensions/team.ts";
+import { beginTeamEvaluation, reserveTeamMember, retireTeamEvaluation, teamEvaluationForSession, firstTeamReservation, createTeam, admitTeamMember, disbandTeam } from "../extensions/team.ts";
 import { architectureFixture } from "./fixtures/architecture.ts";
 import { openBoard } from "../extensions/board/store.ts";
 import { planFile, readLedgerTeamHolds } from "../extensions/workflow.ts";
@@ -277,13 +277,14 @@ unknownTest("unknown no-worker preparation retains its reservation despite an in
       branch.push({ type: "custom_message", ...message }); delivered.resolve();
     } });
   try {
-    const handle = reserveBackground({ roleId: "oracle", task: "unknown", owns: () => true,
+    const handle = reserveBackground({ roleId: "oracle", task: "unknown", coordinatorSessionId: evaluation.sessionId, owns: () => true,
       teamOwner: { token: evaluation.token, assignmentId: "unknown", onSettled() {}, noWorkerReleased: admission.noWorkerReleased },
       async prepare() { throw new AgentClosureError([new Error("unjoined resource")], "preparation"); } });
     admission.commit();
     await delivered.promise; observeWorkerResults(evaluation.token);
     expect(teamWorkerStatus(evaluation.token, handle.instanceId)[0]?.closure.state).toBe("unknown");
     expect(firstTeamReservation(evaluation, "oracle")).toBe("unknown");
+    expect(readBackgroundPending({ ownerToken: evaluation.token, coordinatorSessionId: evaluation.sessionId })).toEqual({ state: "pending" });
     await expect(retireTeamEvaluation(evaluation)).rejects.toThrow("Background retirement");
   } finally { env.release(true); }
 });
@@ -364,8 +365,15 @@ unknownTest("registered table replacement with rejected outgoing disposal retain
     expect(workerHandoff(handle.instanceId)).toBeUndefined();
     const observed = await room.emit("agent_before_settle", { outcome: "completed", context: { canContinue: true } });
     expect(observed?.entries ?? []).toEqual([]); expect(room.sent).toEqual([]); expect(room.branch).toEqual([]);
+    const scope = { ownerToken: room.evaluation.token, coordinatorSessionId: room.evaluation.sessionId };
+    expect(readBackgroundPending(scope)).toEqual({ state: "pending" });
     await expect(retireTeamEvaluation(room.evaluation)).rejects.toThrow("table outgoing disposal rejected");
     expect(readLedgerTeamHolds(env.root, "unknown-table")).toHaveLength(1);
+    const replacement = room.emit("session_start");
+    expect(() => readBackgroundPending(scope)).toThrow("stale_owner");
+    await expect(replacement).rejects.toThrow("Foreground replacement");
+    expect(teamEvaluationForSession(scope.coordinatorSessionId, false)).toBeUndefined();
+    expect(() => readBackgroundPending({ ...scope, ownerToken: Symbol("not-admitted") })).toThrow("stale_owner");
   } finally {
     unsubscribe();
     await Promise.allSettled([room.emit("session_shutdown"), retireTeamEvaluation(room.evaluation)]);

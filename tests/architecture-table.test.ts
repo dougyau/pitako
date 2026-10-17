@@ -174,11 +174,17 @@ test("round frontiers freeze objections and controls; replacement waits for all 
 for (const action of ["consult", "continue"] as const) {
   test(`round five ${action} cannot dispatch round six; final clarification is partial`, fixture.ownedCase(`table limit ${action}`, async () => {
     const rounds: number[] = [], phases: string[] = []; let supports = 0;
-    const s = await setup({ prompt(_session, request, body) {
+    const s = await setup({ async prompt(session, request, body) {
       if (request.stage === "composition") return composition(request, 2);
       if (request.stage === "preparation") return preparation(request);
       if (request.stage === "contribution") { rounds.push(request.round); return { ...contribution(request), doubts: request.round === 5 ? [{ question: "Redesign?", purpose: "Final clarification" }] : [] }; }
-      if (request.stage === "decision") return decision(request.round === 5 ? action : "continue");
+      if (request.stage === "decision") {
+        if (request.round === 5 && action === "continue") {
+          const rejected = await session.boundTools.get("architecture_submit").execute("over-limit", { submissionId: "over-limit", body: decision("continue") }, undefined, undefined, { sessionManager: session.sessionManager });
+          expect(rejected.isError).toBe(true); expect(rejected.details.code).toBe("action");
+        }
+        return decision(request.round === 5 ? action === "continue" ? "synthesize" : action : "continue");
+      }
       if (request.stage === "consultation-plan") {
         phases.push(request.context.phase);
         return { kind: "consultation-plan", resolutions: [], support: request.context.doubts.length ? [
@@ -186,8 +192,10 @@ for (const action of ["consult", "continue"] as const) {
       }
       if (request.stage === "consultation-response") { supports++; return { ...support(request), doubts: [{ question: "Later investigation", purpose: "Not recursive" }] }; }
       if (request.stage === "knowledge") return { kind: "knowledge", resolutions: request.context.doubts.map((d: any) => ({ doubtId: d.id, status: "partial", answer: "Requires redesign", supportIds: [request.context.responses[0].id] })) };
-      if (request.stage === "synthesis" && action === "consult") {
-        expect(request.context.pendingDoubts).toHaveLength(1);
+      if (request.stage === "synthesis") {
+        expect(request.context.pendingDoubts).toHaveLength(action === "consult" ? 1 : 2);
+        const rejected = await session.boundTools.get("architecture_submit").execute("false-complete", { submissionId: "false-complete", body }, undefined, undefined, { sessionManager: session.sessionManager });
+        expect(rejected.isError).toBe(true); expect(rejected.details).toMatchObject({ code: "coverage", field: "body.status", correctionsLeft: 1 });
         return { ...body, status: "partial", pending: ["Requires redesign"] };
       }
       return body;
