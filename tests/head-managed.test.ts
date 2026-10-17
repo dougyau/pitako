@@ -1,10 +1,12 @@
 import { expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { closeSync, openSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Type } from "typebox";
 import { createWriteToolDefinition, SessionManager, type ExtensionToolContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { OwnedGates } from "../extensions/agent/head/gates.ts";
+import { reserveOperation } from "../extensions/agent/head/operation-leases.ts";
 import { AgentClosureError } from "../extensions/agent/closure.ts";
 import { AdmissionInventory, localGitEnv } from "../extensions/agent/head/inventory.ts";
 import { ManagedAssignment, ManagedProducer, foregroundBash, managedGuard, managedTools } from "../extensions/agent/head/managed-tools.ts";
@@ -355,3 +357,123 @@ test("fixed argv private-index/object/commit/ref/read seam leaves branch and rea
   expect(readFileSync(path.join(root, ".git/index"))).toEqual(index);
   expect(readFileSync(path.join(root, "clean"), "utf8")).toBe("base\n");
 }));
+
+
+// Unknown leases deliberately survive for the lifetime of the host. Give these cases
+// their own host so they cannot block unrelated, legitimately unscoped operations.
+function closureHost(name: string): boolean {
+  if (process.env.PITAKO_GATE_CLOSURE_CASE === name) return true;
+  const output = execFileSync(process.execPath, ["test", import.meta.path, "--test-name-pattern", `^${name}$`], {
+    env: { ...process.env, PITAKO_GATE_CLOSURE_CASE: name, BUN_OPTIONS: "", NO_COLOR: "1", FORCE_COLOR: "0" },
+    encoding: "utf8",
+  });
+  console.log(output);
+  return false;
+}
+
+const captureClosureCase = "capture write failure cancels and joins; unprovable group closure retains the gate barrier and diagnostics";
+test(captureClosureCase, async () => {
+  if (!closureHost(captureClosureCase)) return;
+  for (const uncertain of [false, true]) {
+    const root = mkdtempSync(path.join(tmpdir(), "pitako-gate-closure-"));
+    const changed = Promise.withResolvers<void>(), binding = {}, controller = new AbortController();
+    const pending: Promise<unknown>[] = []; let unknown: string | undefined;
+    const owner = { assignmentId: "closure-fixture", executionRoot: root, signal: controller.signal,
+      check(b: object) { if (b !== binding) throw new Error("foreign binding"); }, admitted() {}, gateIdle() {},
+      own<T>(_b: object, operation: () => Promise<T>) { const p = operation(); pending.push(p); return p; },
+      gateEpoch: () => ({ epoch: "epoch", revision: 0 }), gateChanged() { changed.resolve(); }, gateUnknown(reason: string) { unknown = reason; } };
+    const gates = new OwnedGates(owner, { durationMs: 2000, captureBytes: 1024, invocations: 2, artifactRoots: [], scratchRoots: [] }, undefined,
+      { write: uncertain ? writeSync : (() => { throw new Error("ENOSPC controlled capture write failure"); }) as typeof writeSync,
+        groupClosed(pid) {
+          if (uncertain) return false; // Host observation failure only: never substitutes an exit/output.
+          try { process.kill(-pid, 0); return false; } catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
+        } });
+    const handle = gates.request(binding, { epoch: "epoch", expectedRevision: 0, coverage: "closure failure injection; real local subprocess",
+      commands: [{ id: "capture", shell: "printf real-local-output", cwd: ".", env: {}, timeoutMs: 1000 }] });
+    await changed.promise; await Promise.all(pending);
+    const result = gates.outcomes(binding)[0]!;
+    expect(result).toMatchObject({ outcome: uncertain ? "unknown" : "incomplete", closure: uncertain ? "unknown" : "released", complete: false });
+    expect(result.commands[0]!.exitCode).not.toBeUndefined();
+    if (uncertain) {
+      expect(unknown).toContain("closure");
+      expect(() => reserveOperation(root, "writer")).toThrow("lease");
+      expect(() => gates.request(binding, { epoch: "epoch", expectedRevision: 0, coverage: "no replacement",
+        commands: [{ id: "replacement", shell: "printf forbidden", cwd: ".", env: {}, timeoutMs: 100 }] })).toThrow("active");
+      expect(gates.status(binding, handle.runId).artifacts).toHaveLength(2);
+      console.log(`Intentionally retained uncertain observation diagnostics: ${root}`);
+    } else {
+      expect(result.diagnostic).toContain("ENOSPC"); const lease = reserveOperation(root, "writer"); lease.release();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+
+const tailClosureCase = "leader exit cannot release a gate while inherited stdout still has a tail";
+test(tailClosureCase, async () => {
+  if (!closureHost(tailClosureCase)) return;
+  const root = mkdtempSync(path.join(tmpdir(), "pitako-gate-tail-")); mkdirSync(path.join(root, "scratch"));
+  const fifo = path.join(root, "scratch/release"); execFileSync("mkfifo", [fifo]); const fd = openSync(fifo, "r+");
+  const exited = Promise.withResolvers<void>(), changed = Promise.withResolvers<void>(), binding = {}, controller = new AbortController();
+  const pending: Promise<unknown>[] = [];
+  const owner = { assignmentId: "tail-fixture", executionRoot: root, signal: controller.signal,
+    check(b: object) { if (b !== binding) throw new Error("foreign binding"); }, admitted() {}, gateIdle() {},
+    own<T>(_b: object, operation: () => Promise<T>) { const p = operation(); pending.push(p); return p; },
+    gateEpoch: () => ({ epoch: "epoch", revision: 0 }), gateChanged() { changed.resolve(); }, gateUnknown() {} };
+  const gates = new OwnedGates(owner, { durationMs: 3000, captureBytes: 1024, invocations: 1, artifactRoots: [], scratchRoots: ["scratch"] }, undefined,
+    { write: writeSync, leaderExit() { exited.resolve(); }, groupClosed(pid) {
+      try { process.kill(-pid, 0); return false; } catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
+    } });
+  let retained = true;
+  try {
+    const handle = gates.request(binding, { epoch: "epoch", expectedRevision: 0, coverage: "leader/tail closure",
+      commands: [{ id: "tail", shell: "printf leader; (read -r release < scratch/release; printf tail) & exit 0", cwd: ".", env: {}, timeoutMs: 1500 }] });
+    await exited.promise;
+    expect(gates.status(binding, handle.runId)).toMatchObject({ available: false, closure: "pending" });
+    expect(() => reserveOperation(root, "writer")).toThrow("lease");
+    writeSync(fd, "release\n"); await changed.promise; await Promise.all(pending);
+    expect(gates.read(binding, handle.runId, "0-stdout").text).toBe("leadertail");
+    const outcome = gates.outcomes(binding)[0]!; retained = outcome.closure === "unknown";
+    if (outcome.outcome === "incomplete") {
+      expect(outcome.closure).toBe("released");
+      expect(outcome.diagnostic).toContain("leader closed before owned group closure");
+    } else expect(["passed", "unknown"]).toContain(outcome.outcome);
+    if (retained) console.log(`Intentionally retained unprovable orphan-group diagnostics: ${root}`);
+  } finally {
+    controller.abort(); await Promise.allSettled(pending); closeSync(fd);
+    if (!retained) rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
+test("cancellation after captured process output retains the lease through TERM/KILL and stream closure", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "pitako-gate-cancel-"));
+  mkdirSync(path.join(root, "scratch")); execFileSync("mkfifo", [path.join(root, "scratch/release")]);
+  const entered = Promise.withResolvers<void>(), binding = {}, controller = new AbortController();
+  const pending: Promise<unknown>[] = [];
+  const owner = { assignmentId: "cancel-fixture", executionRoot: root, signal: controller.signal,
+    check(b: object) { if (b !== binding) throw new Error("foreign binding"); }, admitted() {}, gateIdle() {},
+    own<T>(_b: object, operation: () => Promise<T>) { const p = operation(); pending.push(p); return p; },
+    gateEpoch: () => ({ epoch: "epoch", revision: 0 }), gateChanged() {}, gateUnknown() {} };
+  const gates = new OwnedGates(owner, { durationMs: 3000, captureBytes: 1024, invocations: 1, artifactRoots: [], scratchRoots: ["scratch"] }, undefined,
+    { write: ((fd: number, data: Uint8Array) => { const count = writeSync(fd, data); entered.resolve(); return count; }) as typeof writeSync,
+      groupClosed(pid) { try { process.kill(-pid, 0); return false; } catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; } } });
+  let released = false;
+  try {
+    const handle = gates.request(binding, { epoch: "epoch", expectedRevision: 0, coverage: "cancel a real started process ignoring TERM",
+      commands: [{ id: "cancel", shell: "trap '' TERM; printf started; read -r release < scratch/release", cwd: ".", env: {}, timeoutMs: 2000 }] });
+    await entered.promise;
+    gates.cancel(binding, handle.runId);
+    expect(gates.status(binding, handle.runId).closure).toBe("pending");
+    expect(() => reserveOperation(root, "writer")).toThrow("lease");
+    await Promise.all(pending);
+    const outcome = gates.outcomes(binding)[0]!; released = outcome.closure === "released";
+    expect(outcome).toMatchObject({ outcome: "cancelled", closure: "released", complete: false, commands: [{ signal: "SIGKILL" }] });
+    expect(gates.read(binding, handle.runId, "0-stdout").text).toBe("started");
+    const writer = reserveOperation(root, "writer"); writer.release();
+  } finally {
+    controller.abort(); await Promise.allSettled(pending);
+    if (released) rmSync(root, { recursive: true, force: true });
+    else console.log(`Intentionally retained cancellation diagnostics: ${root}`);
+  }
+});

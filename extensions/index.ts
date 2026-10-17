@@ -1,3 +1,4 @@
+import type { RecoveryScheduler } from "./agent/delivery.ts";
 import { consultationStats } from "./agent/history-query.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { skillStatusLines } from "./catalog.ts";
@@ -34,6 +35,8 @@ import { readHerdrPresence } from "./herdr/presence.ts";
 import { registerCodexTools } from "./codex.ts";
 import { createAgentBridge } from "./agent/bridge/broker.ts";
 import { AgentClosureError } from "./agent/closure.ts";
+import { principalLeases } from "./agent/head/operation-leases.ts";
+import { foregroundBash } from "./agent/head/managed-tools.ts";
 
 function requestedProfile(pi: ExtensionAPI): ProfileName {
   const flag = pi.getFlag("pitako-profile");
@@ -89,12 +92,13 @@ function foregroundModelUsage(entries: readonly unknown[] | undefined): string {
   return `model usage: input=${totals.input}, output=${totals.output}, cached_read=${totals.cacheRead}, cached_write=${totals.cacheWrite}, total=${total}, cost=${totals.cost}`;
 }
 
-export default function pitako(pi: ExtensionAPI) {
+export default function pitako(pi: ExtensionAPI, host: { recoveryScheduler?: RecoveryScheduler } = {}) {
   const root = packageRoot();
   // Fail during extension load so Pi surfaces a configuration error at startup.
   prepareRuntime(root);
 
   const startCodex = registerCodexTools(pi);
+  principalLeases(pi, foregroundBash);
 
   pi.registerFlag("pitako-profile", {
     description: 'Pitako profile: "coding" (default) or "analysis"',
@@ -191,7 +195,7 @@ export default function pitako(pi: ExtensionAPI) {
           sessionId === ctx.sessionManager?.getSessionId() && evaluationToken === teamEvaluation?.token &&
           (!evaluationToken || teamEvaluationForSession(sessionId, false)?.token === evaluationToken);
         bindBackgroundOwner({
-          token, sessionId, revision, owns,
+          token, sessionId, revision, owns, recoveryScheduler: host.recoveryScheduler,
           isIdle: () => ctx.isIdle(),
           hasUI: ctx.hasUI,
           notify: (message) => {

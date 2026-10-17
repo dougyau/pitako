@@ -715,3 +715,19 @@ fallbacks = [
 `);
   return { userConfigPath: path.join(dir, "config.toml"), packageRoot: packageRoot() };
 }
+
+
+test("owned gates wait uses real deadline without activity and never extends max runtime or another tool", () => {
+  const state = createActivity(0);
+  const config = { idleTimeoutMs: 100, toolStallTimeoutMs: 200, maxRunTimeMs: 500 };
+  state.ownedGatesWait = { kind: "owned-gates-wait", runId: "gate", deadlineAt: 1000 };
+  expect(evaluateWatchdog(state, config, 400)).toBe("ok");
+  expect(state.lastActivityAt).toBe(0); expect(state.lastActivityKind).toBe("created");
+  expect(evaluateWatchdog(state, config, 500)).toBe("max_runtime");
+  const other = createActivity(0); other.ownedGatesWait = state.ownedGatesWait;
+  noteToolStart(other, "bash", 0);
+  expect(evaluateWatchdog(other, config, 250)).toBe("suspect");
+  const expired = createActivity(0); expired.ownedGatesWait = { kind: "owned-gates-wait", runId: "gate", deadlineAt: 300 };
+  expect(evaluateWatchdog(expired, config, 299)).toBe("ok");
+  expect(evaluateWatchdog(expired, config, 300)).toBe("suspect");
+});

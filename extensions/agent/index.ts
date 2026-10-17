@@ -1,3 +1,4 @@
+import path from "node:path";
 import { registerArchitecture } from "../architecture/index.ts";
 import type { ExtensionContext, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
@@ -24,6 +25,8 @@ import { consultationSnapshot, consultationRecord, prepareConsultation, isConsul
 import { listObservations, noteResultTaken, observationEpoch, publishObservation } from "./observe.ts";
 import { currentInstanceId } from "./scope.ts";
 import { createPiExecutor } from "./pi.ts";
+import { verificationSchema } from "./head/gates.ts";
+import { evidenceFile } from "../workflow.ts";
 import { createHead, validateAgentMode } from "./head/admission.ts";
 import { assertNoCheckpointLease } from "./head/checkpoint-lease.ts";
 import { formatAgentResult, formatTeamExecutionSummary, runAgentInstance, teamExecutionSummary } from "./run.ts";
@@ -285,6 +288,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
       mode: Type.Optional(Type.Union([Type.Literal("single"), Type.Literal("head")])),
       writes: Type.Optional(Type.Array(Type.String(), { maxItems: 128 })),
       checkpoint_origin: Type.Optional(checkpointOrigin),
+      verification: verificationSchema,
       reasoning: reasoningSchema,
     }, noExtra),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -329,7 +333,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
               const task = [`Team assignment header: Team ${admission.teamId}; member ${admission.memberId}; role ${params.role}; assignment ${id}${topic !== undefined ? `; Board topic ${topic}` : ""}.`,
                 "WorkBrief:", params.task.trim()].join("\n");
               const launchRoot = execution?.executionRoot ?? ctx.cwd;
-              head = createHead(id, launchRoot, headOptions, backgroundExecutor());
+              head = createHead(id, launchRoot, headOptions, backgroundExecutor(), execution ? path.join(path.dirname(evidenceFile(execution.planId, "gates", launchRoot)), `gates-${id}`) : undefined);
               if (execution) origin.execution = { executionRoot: execution.executionRoot, executionRef: `${execution.planId}@${execution.revision}:${execution.hash}` };
               if (dispatch) { origin.routing = dispatch.routing; origin.routingEvidence = { state: dispatch.evidence, gap: dispatch.evidenceGap }; }
               check();
@@ -565,6 +569,7 @@ function registerBackgroundTools(pi: ExtensionAPI): void {
         mode: Type.Optional(Type.Union([Type.Literal("single"), Type.Literal("head")])),
         writes: Type.Optional(Type.Array(Type.String(), { maxItems: 128 })),
         checkpoint_origin: Type.Optional(checkpointOrigin),
+        verification: verificationSchema,
         reasoning: reasoningSchema,
       },
       noExtra,
@@ -594,7 +599,8 @@ function registerBackgroundTools(pi: ExtensionAPI): void {
             const watch = interestFrom(params.plan, params.unit);
             const execution = watch ? watchedExecutionBinding(watch.planId, ctx.cwd) : undefined;
             const launchRoot = execution?.executionRoot ?? ctx.cwd;
-            head = createHead(randomUUID(), launchRoot, headOptions, backgroundExecutor());
+            const assignmentId = randomUUID();
+            head = createHead(assignmentId, launchRoot, headOptions, backgroundExecutor(), execution ? path.join(path.dirname(evidenceFile(execution.planId, "gates", launchRoot)), `gates-${assignmentId}`) : undefined);
             const dispatch = params.role === "developer" && !head ? await developerPreflight({
               task: params.task, toolCallId: _toolCallId, source: "agent_spawn", ctx, pi, signal,
               owns: () => { check(); return true; },

@@ -37,6 +37,7 @@ export interface AgentActivityState {
   activeTool?: { name: string; startedAt: number };
   /** In-flight tools, oldest first. `activeTool` is the oldest. */
   runningTools: { id: string; name: string; startedAt: number }[];
+  ownedGatesWait?: { kind: "owned-gates-wait"; runId: string; deadlineAt: number };
   suspectedStallAt?: number;
   phase: WatchdogPhase;
 }
@@ -157,6 +158,8 @@ export function evaluateWatchdog(state: AgentActivityState, config: WatchdogConf
     state.phase = "stalled";
     return "max_runtime";
   }
+  if (state.ownedGatesWait && now < state.ownedGatesWait.deadlineAt &&
+      !state.runningTools.some(tool => tool.name !== "head_wait")) return "ok";
   const limit = state.activeTool ? config.toolStallTimeoutMs : config.idleTimeoutMs;
   const inactive = now - state.lastActivityAt;
   if (inactive < limit) {

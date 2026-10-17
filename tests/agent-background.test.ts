@@ -1,3 +1,4 @@
+import { recoveryClock } from "./fixtures/recovery-clock.ts";
 import { preparedTool } from "./fixtures/background-dispatch.ts";
 import { runAgentInstance } from "../extensions/agent/run.ts";
 import { stubExternalFactories } from "./fixtures/offline.ts";
@@ -234,6 +235,149 @@ describe("cancel before settle", () => {
 });
 
 describe("background registry", () => {
+  test("event and timer share the two-offer budget and a refused busy continuation cannot become an idle wake", fixture.ownedCase("shared recovery offer budget", async () => {
+    const clock = recoveryClock({ suppressReady: true }), bound = owner(false);
+    bound.recoveryScheduler = clock.scheduler;
+    bindBackgroundOwner(bound);
+    const hanging = hang();
+    const handle = await spawnBackground({ roleId: "developer", task: "work", cwd: packageRoot(), load: load(), executor: hanging.executor });
+    hanging.release({ status: "completed", result: "same stable body", sideEffects: false });
+    await fixture.settleRuns();
+    clock.fire(); // collect a ready/unoffered outcome, but never prompt the busy owner
+    expect(bound.results).toEqual([]); expect(bound.wakes).toEqual([]);
+    const first = draftWorkerResults(bound.token, "completed")!;
+    expect(first.entries).toHaveLength(1);
+    clock.fire(); clock.fire(); // an open boundary is not an elapsed-time failure
+    expect(draftWorkerResults(bound.token, "completed")).toBeUndefined();
+    expect(bound.results).toEqual([]);
+    settleWorkerResults(bound.token); // closes boundary without commitment or observed turn
+    bound.isIdle = () => true;
+    clock.fire(); // same ID/body, second and final total offer
+    expect(bound.results).toEqual([expect.objectContaining({ content: first.entries[0]!.content, details: first.entries[0]!.details })]);
+    expect(bound.results[0]!.details.deliveryId).toBe(first.entries[0]!.details.deliveryId);
+    expect(workerHandoff(handle.instanceId)).toMatchObject({ continuation: "blocked-unconfirmed" });
+    expect(bound.wakes).toEqual([]);
+    expect(clock.pending).toBe(0);
+    settleWorkerResults(bound.token, true); deliverWorkerResults(bound.token, true, true);
+    expect(bound.results).toHaveLength(1); expect(bound.wakes).toEqual([]);
+  }));
+
+  test("receipt without a later turn uses at most two idle wakes across events and ticks, then diagnoses and disarms", fixture.ownedCase("shared wake budget", async () => {
+    const clock = recoveryClock(), bound = owner(true);
+    bound.recoveryScheduler = clock.scheduler; bindBackgroundOwner(bound);
+    const hanging = hang();
+    const handle = await spawnBackground({ roleId: "developer", task: "work", cwd: packageRoot(), load: load(), executor: hanging.executor });
+    hanging.release({ status: "completed", result: "received", sideEffects: false });
+    await fixture.settleRuns();
+    expect(bound.results).toHaveLength(1); expect(bound.wakes).toHaveLength(1);
+    clock.fire();
+    expect(bound.results).toHaveLength(1); expect(bound.wakes).toHaveLength(2);
+    expect(clock.pending).toBe(0);
+    settleWorkerResults(bound.token, true); deliverWorkerResults(bound.token, true, true);
+    expect(bound.wakes).toHaveLength(2);
+    expect(workerHandoff(handle.instanceId)?.continuationDiagnostic).toContain("exhausted");
+    // Receipt was already observed: compaction before the later turn does not undo incorporation.
+    bound.branch.length = 0;
+    observeWorkerResults(bound.token, true);
+    expect(workerHandoff(handle.instanceId)?.continuation).toBe("observed");
+    expect(clock.pending).toBe(0);
+  }));
+
+  test("timer retries a rejected append once, never treats void success as receipt, and never replenishes exhausted offers", fixture.ownedCase("timer uncertain append", async () => {
+    for (const rejected of [true, false]) {
+      const clock = recoveryClock(), bound = owner(true), offers: ResultMessage[] = [];
+      bound.recoveryScheduler = clock.scheduler;
+      bound.appendResult = message => { offers.push(message); if (rejected) throw new Error("controlled rejected append"); };
+      bindBackgroundOwner(bound);
+      const hanging = hang();
+      const handle = await spawnBackground({ roleId: "developer", task: "work", cwd: packageRoot(), load: load(), executor: hanging.executor });
+      hanging.release({ status: "completed", result: "retained", sideEffects: false });
+      await fixture.settleRuns();
+      expect(offers).toHaveLength(1);
+      clock.fire();
+      expect(offers).toHaveLength(rejected ? 2 : 1);
+      expect(clock.pending).toBe(0);
+      expect(bound.wakes).toEqual([]);
+      expect(workerHandoff(handle.instanceId)?.deliveryDiagnostic).toContain(rejected ? "exhausted" : "unconfirmed");
+      if (rejected) {
+        expect(offers[1]).toEqual(offers[0]);
+        settleWorkerResults(bound.token, true); deliverWorkerResults(bound.token, true, true);
+        expect(offers).toHaveLength(2);
+      }
+      // A later actual branch receipt, not void callback success, can still establish delivery.
+      bound.branch.push({ type: "custom_message", ...structuredClone(offers[0]!) });
+      observeWorkerResults(bound.token, true);
+      expect(workerHandoff(handle.instanceId)).toMatchObject({ delivery: "incorporated", continuation: "observed" });
+      expect(clock.pending).toBe(0);
+    }
+  }));
+
+  test("callbacks cannot retire, restrict, or change the captured owner and then let recovery wake it", fixture.ownedCase("timer callback fences", async () => {
+    for (const change of ["abort", "error", "retire", "session", "revision"] as const) {
+      const clock = recoveryClock({ suppressReady: true }), bound = owner(true);
+      bound.sessionId = "captured"; bound.revision = 1; bound.recoveryScheduler = clock.scheduler;
+      bindBackgroundOwner(bound);
+      const hanging = hang();
+      await spawnBackground({ roleId: "developer", task: "work", cwd: packageRoot(), load: load(), executor: hanging.executor });
+      hanging.release({ status: "completed", result: "do not wake a changed owner", sideEffects: false });
+      await fixture.settleRuns();
+      const fresh = owner(true);
+      bound.getBranch = () => {
+        if (change === "abort" || change === "error") restrictWorkerContinuation(bound.token, change === "abort" ? "aborted" : "error");
+        if (change === "retire") { revokeBackgroundOwner(bound.token); bindBackgroundOwner(fresh); }
+        if (change === "session") bound.sessionId = "different";
+        if (change === "revision") bound.revision = 2;
+        return bound.branch;
+      };
+      clock.fire();
+      expect(bound.wakes).toEqual([]); expect(fresh.wakes).toEqual([]); expect(clock.pending).toBe(0);
+      // Reverting scalar identity is not a new grant and must not revive the captured owner.
+      if (change === "session" || change === "revision") {
+        bound.sessionId = "captured"; bound.revision = 1;
+        deliverWorkerResults(bound.token, true, true);
+        expect(bound.results).toEqual([]); expect(bound.wakes).toEqual([]);
+      }
+    }
+  }));
+
+  test("retirement during a pending producer fences even a previously queued host tick without adopting a replacement owner", fixture.ownedCase("timer retirement during await", async () => {
+    const clock = recoveryClock(), bound = owner(true);
+    bound.recoveryScheduler = clock.scheduler; bindBackgroundOwner(bound);
+    const hanging = hang();
+    await spawnBackground({ roleId: "developer", task: "pending", cwd: packageRoot(), load: load(), executor: hanging.executor });
+    const queued = clock.take();
+    const shutdown = shutdownBackground(bound.token);
+    const fresh = owner(true); bindBackgroundOwner(fresh);
+    hanging.release({ status: "completed", result: "late retained outcome", sideEffects: false });
+    await shutdown; queued();
+    expect(bound.results).toEqual([]); expect(bound.wakes).toEqual([]);
+    expect(fresh.results).toEqual([]); expect(fresh.wakes).toEqual([]); expect(clock.pending).toBe(0);
+  }));
+
+  test("retiring a Team row cannot poison recovery for an independent foreground result", fixture.ownedCase("independent recovery during retirement", async () => {
+    const clock = recoveryClock(), captured = owner(false);
+    let idle = false;
+    captured.isIdle = () => idle;
+    captured.recoveryScheduler = clock.scheduler;
+    bindBackgroundOwner(captured);
+    const team = hang(), ordinary = hang();
+    await spawnBackground({ roleId: "developer", task: "retiring Team result", cwd: packageRoot(), load: load(), executor: team.executor,
+      teamOwner: { token: captured.token, assignmentId: "retiring-assignment", onSettled() {} } });
+    await spawnBackground({ roleId: "developer", task: "independent result", cwd: packageRoot(), load: load(), executor: ordinary.executor });
+    team.release({ status: "completed", result: "Team result", sideEffects: false });
+    ordinary.release({ status: "completed", result: "independent result", sideEffects: false });
+    await fixture.settleRuns();
+    const retiring = retireTeamWorkers(captured.token);
+    try {
+      idle = true;
+      clock.fire();
+      expect(captured.results.map(result => result.content)).toEqual(["independent result"]);
+      expect(captured.wakes).toHaveLength(1);
+      observeWorkerResults(captured.token, true);
+      expect(clock.pending).toBe(0);
+    } finally { await retiring; }
+  }));
+
   test("ad hoc idle worker automatically supplies complete Unicode without UI or a getter", fixture.ownedCase("idle automatic handoff", async () => {
     const bound = owner(true);
     bound.hasUI = false;
@@ -729,6 +873,52 @@ describe("background registry", () => {
 });
 
 describe("background tools", () => {
+  test("host timer recovers the missed foreground fast path, and a public later turn consumes liveness even without a useful decision", fixture.ownedCase("foreground recovery producer", async () => {
+    const clock = recoveryClock({ suppressReady: true });
+    const handlers = new Map<string, Function>(), branch: unknown[] = [], sent: Array<{ message: ResultMessage; triggerTurn: boolean }> = [];
+    let idle = false;
+    const pi = {
+      registerFlag() {}, registerCommand() {}, registerTool() {}, getFlag() {}, getAllTools: () => [],
+      getActiveTools: () => [], setActiveTools() {}, getSessionName() {}, setSessionName() {},
+      on(name: string, handler: Function) { handlers.set(name, handler); },
+      sendMessage(message: ResultMessage, options: { triggerTurn: boolean }) {
+        sent.push({ message, triggerTurn: options.triggerTurn });
+        if (!options.triggerTurn) branch.push({ type: "custom_message", ...structuredClone(message) });
+      },
+    };
+    pitako(pi as unknown as ExtensionAPI, { recoveryScheduler: clock.scheduler });
+    const ctx = { cwd: packageRoot(), hasUI: false, isIdle: () => idle,
+      ui: { notify() {}, setStatus() {} }, sessionManager: { getSessionId: () => "timer-parent", getBranch: () => branch } };
+    await handlers.get("session_start")!({}, ctx);
+    expect(clock.pending).toBe(0);
+    const hanging = hang();
+    await spawnBackground({ roleId: "developer", task: "original codemode workflow result", cwd: packageRoot(), load: load(), executor: hanging.executor });
+    expect(clock.pending).toBe(1);
+    hanging.release({ status: "completed", result: "retained full result 🧬", sideEffects: false });
+    await fixture.settleRuns();
+    // Suppress ONLY the notification after actual storage, before collection/offer.
+    expect(sent).toEqual([]);
+    idle = true;
+    clock.fire();
+    expect(sent.map(item => item.triggerTurn)).toEqual([false, true]);
+    expect(sent[0]!.message.content).toBe("retained full result 🧬");
+    expect(sent[0]!.message.details.deliveryId).toBeString();
+    expect(branch).toHaveLength(1);
+    // A native turn-start observation, not a result getter or useful model decision.
+    await handlers.get("turn_start")!({}, ctx);
+    expect(clock.pending).toBe(0);
+    branch.length = 0;
+    await handlers.get("session_compact")!({ reason: "manual" }, ctx);
+    await handlers.get("session_tree")!({}, ctx);
+    await handlers.get("agent_settled")!({}, ctx);
+    expect(sent).toHaveLength(2);
+    expect(clock.pending).toBe(0);
+    expect(clock.delays.every(delay => delay === 15_000)).toBe(true);
+    expect(clock.unrefs).toBe(clock.delays.length);
+    await handlers.get("session_shutdown")!({}, ctx);
+    expect(clock.pending).toBe(0);
+  }));
+
   test("public terminal boundaries handle stale-idle compaction/tree and post-snapshot completion without restarting aborted/error parents", fixture.ownedCase("terminal adapter boundaries", async () => {
     const handlers = new Map<string, Function>(), branch: unknown[] = [], sent: { message: ResultMessage | { customType: string; content: string }; options: { triggerTurn: boolean } }[] = [];
     const pi = {

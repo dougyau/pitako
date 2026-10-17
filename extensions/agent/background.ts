@@ -1,5 +1,5 @@
 import { observeArchitectureBackground, architectureFailure, architectureRoom } from "../architecture/rooms.ts";
-import { receiptInBranch, offerEnvelope } from "./delivery.ts";
+import { receiptInBranch, offerEnvelope, OwnerRecovery, recoveryPending, type RecoveryScheduler } from "./delivery.ts";
 import { PitakoConfigError } from "../errors.ts";
 import { createPiExecutor } from "./pi.ts";
 import { clearObservations, noteResultTaken, noteHandoff, observationEpoch, publishObservation, removeObservation, removeTeamObservations,
@@ -62,6 +62,7 @@ export interface BackgroundOwner {
   appendResult?: (message: ResultMessage) => void;
   appendIntermediate?: (message: IntermediateMessage) => void;
   getBranch?: () => readonly unknown[];
+  recoveryScheduler?: RecoveryScheduler;
 }
 
 export interface ResultMessage {
@@ -116,6 +117,7 @@ interface Handoff extends WorkerHandoff {
   wakeAttempts: number;
   outstanding: boolean;
   busyContinuation: boolean;
+  idleUnconfirmed?: boolean;
 }
 
 type SignalState = "pending" | "dropped";
@@ -166,6 +168,7 @@ interface Bag {
   teamOwners?: Map<symbol, BackgroundOwner>;
   restrictions: Map<symbol, "aborted" | "error">;
   executor?: AttemptExecutor;
+  recoveries?: Map<BackgroundOwner, { timer: OwnerRecovery; sessionId?: string; revision?: number; retired?: boolean }>;
 }
 
 const KEY = Symbol.for("pitako.backgroundWorkers");
@@ -195,12 +198,34 @@ export function assertCheckpointWorkersReleased(instanceId: string, assignmentId
 
 export function bindBackgroundOwner(owner: BackgroundOwner): void {
   const state = bag();
+  if (state.owner && state.owner !== owner) stopRecovery(state.owner);
   state.owner = owner;
   state.teamOwners!.set(owner.token, owner);
+  state.recoveries ??= new Map();
+  if (!state.recoveries.has(owner)) {
+    const timer = new OwnerRecovery(() => recoveryRows(owner).length > 0, () => {
+      // Reuse the event producer and its total budgets. No model, Board or file scan.
+      observeWorkerResults(owner.token);
+      for (const row of recoveryRows(owner)) {
+        collectResult(row);
+        const handoff = row.handoff;
+        if (handoff?.outstanding && !handoff.busyContinuation) {
+          handoff.idleUnconfirmed = true;
+          handoff.deliveryDiagnostic = "idle append returned void; commitment remains unconfirmed";
+          publishHandoff(row);
+        }
+      }
+      if (!recoveryRows(owner).length) return;
+      deliverWorkerResults(owner.token, false, true);
+    }, owner.recoveryScheduler);
+    state.recoveries.set(owner, { timer, sessionId: owner.sessionId, revision: owner.revision });
+  }
+  refreshRecovery(owner);
 }
 
 export function clearBackgroundOwner(): void {
   const state = bag();
+  for (const owner of state.recoveries?.keys() ?? []) stopRecovery(owner);
   state.owner = undefined;
   state.teamOwners?.clear();
 }
@@ -210,6 +235,7 @@ export function revokeBackgroundOwner(token: symbol): void {
   const state = bag();
   for (const row of state.rows.values()) if (row.ownerToken === token) row.conversation?.retire();
   removeOwnerTerminalActivity(token);
+  for (const owner of state.recoveries?.keys() ?? []) if (owner.token === token) stopRecovery(owner);
   if (state.owner?.token === token) state.owner = undefined;
   state.teamOwners?.delete(token);
 }
@@ -345,6 +371,7 @@ export async function spawnBackground(input: SpawnInput): Promise<WorkerHandle> 
       row.interest = input.watch;
       row.reconcileBookkeeping = input.reconcileBookkeeping;
       bag().rows.set(instance.id, row);
+      refreshRecovery(row.deliveryOwner);
       if (ownerToken) {
         row.conversation = new PublicConversation(undefined, input.executor.capturesPublicConversation === true);
         row.conversation.bind(ownerToken);
@@ -465,6 +492,7 @@ export function reserveBackground(input: {
     generation: 0, signal: "pending", closure: { state: "pending" }, run: completion.promise,
     launch: { task: input.task, origin: input.origin && structuredClone(input.origin) } };
   bag().rows.set(row.instanceId, row);
+  refreshRecovery(owner);
   const check = () => {
     if (controller.signal.aborted || dispatchAdmissionsClosed(input.coordinatorSessionId) || !liveOwner(row) || !input.owns()) {
       controller.abort(); throw new Error("Dispatch cancelled before admission");
@@ -796,6 +824,7 @@ async function retireRows(rows: Row[]): Promise<void> {
   const state = bag();
   for (const row of rows) {
     row.signal = "dropped";
+    refreshRecovery(row.deliveryOwner);
     row.conversation?.retire();
     if (!row.controller.signal.aborted) row.controller.abort();
   }
@@ -827,6 +856,7 @@ export async function cancelAllWorkers(): Promise<void> {
 export async function shutdownBackground(token: symbol): Promise<void> {
   const state = bag();
   state.teamOwners?.delete(token);
+  for (const owner of state.recoveries?.keys() ?? []) if (owner.token === token) stopRecovery(owner);
   if (state.owner?.token === token) state.owner = undefined;
   await retireRows([...state.rows.values()].filter(row => row.ownerToken === token));
   state.restrictions.delete(token);
@@ -892,14 +922,18 @@ function settle(row: Row, result: AgentRunResult, epoch: number): void {
     const observation = listObservations(current.ownerToken, current.coordinatorSessionId).find(item => item.id === current.instanceId);
     if (observation) publishObservation({ ...observation, status: result.status, phase: "idle", terminalAt: Date.now(), agentUsage: result.usage }, epoch);
   }
-  if (current.signal === "dropped") return;
+  if (current.signal === "dropped") { refreshRecovery(current.deliveryOwner); return; }
   if (current.workerStarted === false) publishObservation({ id: current.instanceId, roleId: current.roleId, task: current.launch?.task ?? "",
     status: result.status, phase: "idle", acceptedAt: current.acceptedAt, selectedModel: "unknown", lastActivityKind: "no-worker",
     ownerToken: current.ownerToken, teamOwnerToken: current.teamOwnerToken,
     origin: current.launch?.origin }, epoch);
   if (currentReadRow(current, epoch)) touchObservation(current.instanceId, epoch);
-  collectResult(current);
-  if (liveOwner(current) && idleOf(current.deliveryOwner)) deliverWorkerResults(current.ownerToken!);
+  const ready = () => {
+    collectResult(current);
+    if (liveOwner(current) && idleOf(current.deliveryOwner)) deliverWorkerResults(current.ownerToken!);
+  };
+  const recovery = current.deliveryOwner && bag().recoveries?.get(current.deliveryOwner)?.timer;
+  if (recovery) recovery.ready(ready); else ready();
 }
 
 function idleOf(owner: BackgroundOwner | undefined): boolean {
@@ -913,10 +947,41 @@ function idleOf(owner: BackgroundOwner | undefined): boolean {
 
 function liveOwner(row: Row): boolean {
   const owner = row.deliveryOwner;
-  return bag().rows.get(row.instanceId) === row && row.signal !== "dropped" && !!owner &&
+  if (!owner) return false;
+  const captured = bag().recoveries?.get(owner);
+  const rowMatches = () => bag().rows.get(row.instanceId) === row && row.signal !== "dropped" &&
     owner.token === row.ownerToken &&
-    (row.teamOwnerToken ? bag().teamOwners?.get(row.teamOwnerToken) === owner : bag().owner === owner) &&
-    (!owner.owns || owner.owns());
+    (row.teamOwnerToken ? bag().teamOwners?.get(row.teamOwnerToken) === owner : bag().owner === owner);
+  if (!rowMatches()) return false;
+  const matches = () => (!captured || !captured.retired && captured.sessionId === owner.sessionId && captured.revision === owner.revision);
+  let live = false;
+  try { live = matches() && (!owner.owns || owner.owns()) && matches(); } catch { /* unavailable owner */ }
+  if (!live && captured) captured.retired = true;
+  return live && rowMatches();
+}
+
+function stopRecovery(owner: BackgroundOwner): void {
+  bag().recoveries?.get(owner)?.timer.close();
+  bag().recoveries?.delete(owner);
+}
+function refreshRecovery(owner: BackgroundOwner | undefined): void {
+  if (owner) bag().recoveries?.get(owner)?.timer.refresh();
+}
+function recoveryRows(owner: BackgroundOwner): Row[] {
+  return [...bag().rows.values()].filter(row => {
+    if (row.deliveryOwner !== owner || row.recipient || row.signal === "dropped") return false;
+    if (!liveOwner(row) || bag().restrictions.has(owner.token)) {
+      if (row.handoff && row.handoff.continuation !== "observed") {
+        row.handoff.continuation = "blocked-unconfirmed";
+        row.handoff.continuationDiagnostic = "captured owner retired, changed or restricted";
+      }
+      return false;
+    }
+    return !row.outcome || !row.handoff || !row.handoff.idleUnconfirmed && recoveryPending(row.handoff);
+  });
+}
+function collectOwnerResults(token: symbol): void {
+  for (const row of bag().rows.values()) if (row.ownerToken === token) collectResult(row);
 }
 
 function collectResult(row: Row): void {
@@ -963,7 +1028,7 @@ export function workerHandoff(instanceId: string): WorkerHandoff | undefined {
   const handoff = bag().rows.get(instanceId)?.handoff;
   if (!handoff) return undefined;
   const { message: _message, bookkeepingAttempts: _b, deliveryAttempts: _d, wakeAttempts: _w,
-    outstanding: _o, busyContinuation: _c, ...view } = handoff;
+    outstanding: _o, busyContinuation: _c, idleUnconfirmed: _i, ...view } = handoff;
   return view;
 }
 
@@ -996,21 +1061,24 @@ export function observeWorkerResults(token: symbol, turnStarted = false): void {
     if (inBranch) {
       if (handoff.delivery !== "incorporated") row.consultation?.event("delivery", { state: "incorporated", deliveryId: handoff.message.details.deliveryId });
       handoff.delivery = "incorporated";
+      handoff.idleUnconfirmed = false;
       releaseNoWorker(row);
       handoff.deliveryDiagnostic = undefined;
       handoff.outstanding = false;
-      if (turnStarted) {
-        handoff.continuation = "observed";
-        handoff.continuationDiagnostic = undefined;
-      }
+    }
+    if (turnStarted && handoff.delivery === "incorporated") {
+      handoff.continuation = "observed";
+      handoff.continuationDiagnostic = undefined;
     }
     publishHandoff(row);
   }
+  for (const owner of bag().recoveries?.keys() ?? []) if (owner.token === token) refreshRecovery(owner);
 }
 
 export function restrictWorkerContinuation(token: symbol, outcome: "completed" | "aborted" | "error"): void {
   if (outcome === "completed") return;
   bag().restrictions.set(token, outcome);
+  for (const owner of bag().recoveries?.keys() ?? []) if (owner.token === token) refreshRecovery(owner);
   for (const row of ownerRows(token)) {
     if (row.handoff!.continuation === "observed") continue;
     row.handoff!.continuation = "blocked-unconfirmed";
@@ -1022,11 +1090,12 @@ export function restrictWorkerContinuation(token: symbol, outcome: "completed" |
 /** Only an externally initiated run clears abort/error restrictions. Native wakes bypass this hook. */
 export function externallyStartedWorkerOwner(token: symbol): void {
   bag().restrictions.delete(token);
+  for (const owner of bag().recoveries?.keys() ?? []) if (owner.token === token) refreshRecovery(owner);
 }
 
 function canOffer(row: Row): boolean {
   const handoff = row.handoff!;
-  return liveOwner(row) && handoff.delivery !== "incorporated" && !handoff.outstanding && handoff.deliveryAttempts < 2;
+  return liveOwner(row) && handoff.continuation !== "observed" && handoff.delivery !== "incorporated" && !handoff.outstanding && handoff.deliveryAttempts < 2;
 }
 
 function offer(row: Row): ResultMessage {
@@ -1036,6 +1105,7 @@ function offer(row: Row): ResultMessage {
 
 /** Busy boundary: drafts are offers, never receipts, regardless of preview canContinue. */
 export function draftWorkerResults(token: symbol, outcome: "completed" | "aborted" | "error") {
+  collectOwnerResults(token);
   observeWorkerResults(token);
   restrictWorkerContinuation(token, outcome);
   const entries: (ResultMessage & { type: "custom_message" })[] = [];
@@ -1055,12 +1125,15 @@ export function draftWorkerResults(token: symbol, outcome: "completed" | "aborte
 
 /** One append per complete result, then a single short wake for the incorporated batch. */
 export function deliverWorkerResults(token: symbol, terminalOperation = false, recovery = false): void {
+  collectOwnerResults(token);
   observeWorkerResults(token);
   const rows = ownerRows(token);
   const wakes: Row[] = [];
   for (const row of rows) {
     if (!terminalOperation && !idleOf(row.deliveryOwner)) continue;
+    if (!liveOwner(row)) continue;
     if (recovery) reconcileBookkeeping(row);
+    if (!liveOwner(row)) continue;
     const handoff = row.handoff!;
     if (canOffer(row)) {
       const message = offer(row);
@@ -1081,16 +1154,23 @@ export function deliverWorkerResults(token: symbol, terminalOperation = false, r
     } else if (handoff.delivery === "incorporated" && !handoff.busyContinuation &&
         handoff.continuation !== "observed" && handoff.wakeAttempts < 2 &&
         (handoff.wakeAttempts === 0 || recovery)) {
-      ++handoff.wakeAttempts;
-      handoff.continuation = "requested";
-      handoff.continuationDiagnostic = "owning turn not yet observed";
       wakes.push(row);
     }
     publishHandoff(row);
   }
-  if (!wakes.length || !liveOwner(wakes[0]!)) return;
+  const first = wakes[0];
+  if (!first || !liveOwner(first) || bag().restrictions.has(token)) return;
+  const idle = terminalOperation || idleOf(first.deliveryOwner);
+  if (!idle || !liveOwner(first) || bag().restrictions.has(token)) return;
+  for (const row of wakes) {
+    ++row.handoff!.wakeAttempts;
+    row.handoff!.continuation = "requested";
+    row.handoff!.continuationDiagnostic = "owning turn not yet observed";
+    publishHandoff(row);
+  }
+  if (!liveOwner(first) || bag().restrictions.has(token)) return;
   try {
-    wakes[0]!.deliveryOwner!.sendMessage("Interpret the complete Pitako worker results already supplied in context. Decide the next authorized work; no result fetch or acknowledgement is required.");
+    first.deliveryOwner!.sendMessage("Interpret the complete Pitako worker results already supplied in context. Decide the next authorized work; no result fetch or acknowledgement is required.");
   } catch (error) {
     for (const row of wakes) {
       if (!liveOwner(row)) continue;
@@ -1110,6 +1190,7 @@ export function settleWorkerResults(token: symbol, terminalOperation = false, fi
     if (handoff.outstanding) {
       outstanding.add(row);
       handoff.outstanding = false;
+      handoff.idleUnconfirmed = false;
       if (handoff.deliveryAttempts >= 2) handoff.delivery = "blocked";
       handoff.deliveryDiagnostic = "commitment unconfirmed at final boundary";
     }
@@ -1125,6 +1206,7 @@ export function settleWorkerResults(token: symbol, terminalOperation = false, fi
   for (const row of outstanding) {
     if (liveOwner(row)) row.handoff!.outstanding = false;
   }
+  for (const owner of bag().recoveries?.keys() ?? []) if (owner.token === token) refreshRecovery(owner);
 }
 
 export function teamWorkerHasOutcome(token: symbol, instanceId: string): boolean {

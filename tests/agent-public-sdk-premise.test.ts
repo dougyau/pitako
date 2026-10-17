@@ -1,10 +1,14 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { Type } from "typebox";
+import { Type, type Static } from "typebox";
 import { createAssistantMessageEventStream, type AssistantMessage } from "@earendil-works/pi-ai";
-import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, createCodemodeExtension, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { mutationGeneration, principalLeases, reserveOperation } from "../extensions/agent/head/operation-leases.ts";
+import { AgentClosureError } from "../extensions/agent/closure.ts";
+import { foregroundBash } from "../extensions/agent/head/managed-tools.ts";
 import { providerFixtureOwnership } from "./fixtures/provider-fixture-ownership.ts";
 
 const ownership = providerFixtureOwnership();
@@ -121,3 +125,129 @@ test("real offline SDK exposes post-append IDs, branch/session hooks and settled
     console.log(JSON.stringify({ premise: "offline SDK", beforeAppend, afterAppend, branches, starts, shutdownSettled,
       finalHead: session.sessionManager.getLeafId(), requests }));
   }));
+
+
+async function principalLeaseCase(unknownClosure = false) {
+  const root = mkdtempSync(path.join(tmpdir(), "pitako-principal-leases-")); ownership.directories.push(root);
+  const other = mkdtempSync(path.join(tmpdir(), "pitako-principal-disjoint-")); ownership.directories.push(other);
+  const entered = gate(), release = gate(), nestedEntered = gate(), nestedRelease = gate();
+  ownership.beforeRelease(() => { release.release(); nestedRelease.release(); });
+  const runtime = await ModelRuntime.create({ authPath: path.join(root, "auth.json"), modelsPath: null,
+    modelsStorePath: path.join(root, "models-cache.json"), refreshOnCreate: false, allowModelNetwork: false });
+  const writeParams = Type.Object({ path: Type.String() });
+  let calls = 0, writes = 0; const nested: unknown[] = [];
+  runtime.registerProvider("lease-fixture", { api: "openai-completions", apiKey: "offline-fixture", baseUrl: "http://offline.invalid",
+    models: [{ id: "local", name: "local", reasoning: false, input: ["text"], contextWindow: 128000,
+      maxTokens: 1000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
+    streamSimple(model) {
+      const stream = createAssistantMessageEventStream(); calls++;
+      const message: AssistantMessage = { role: "assistant", api: model.api, provider: model.provider, model: model.id,
+        content: calls === 1 ? [{ type: "toolCall", id: "principal-held", name: "write", arguments: { path: "held.md" } }]
+          : calls === 3 ? [{ type: "toolCall", id: "codemode-admitted", name: "codemode", arguments: { code: "return await tools.write({ path: 'codemode.md' });" } }]
+          : calls === 5 ? [{ type: "toolCall", id: "codemode-blocked", name: "codemode", arguments: { code: "return await tools.write({ path: 'bypass.md' });" } },
+            { type: "toolCall", id: "nested-parent", name: "read", arguments: {} },
+            { type: "toolCall", id: "principal-blocked", name: "write", arguments: { path: "blocked.md" } }]
+          : calls === 7 ? [
+            { type: "toolCall", id: "unknown-write", name: "write", arguments: { path: "unknown.md" } },
+            { type: "toolCall", id: "unknown-edit", name: "edit", arguments: { path: "codemode.md", oldText: "product", newText: "bypass" } },
+            { type: "toolCall", id: "unknown-bash", name: "bash", arguments: { command: "printf bypass > unknown-bash" } },
+            { type: "toolCall", id: "unknown-codemode", name: "codemode", arguments: { code: "return await tools.write({ path: 'unknown-codemode.md' });" } },
+            { type: "toolCall", id: "unknown-nested", name: "read", arguments: {} },
+          ]
+          : [{ type: "text", text: "done" }],
+        stopReason: [1, 3, 5, 7].includes(calls) ? "toolUse" : "stop", timestamp: calls,
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+      stream.push({ type: "done", reason: message.stopReason === "toolUse" ? "toolUse" : "stop", message }); stream.end(); return stream;
+    } });
+  const settings = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
+  let foregroundCalls = 0;
+  const loader = new DefaultResourceLoader({ cwd: root, agentDir: root, settingsManager: settings, noExtensions: true,
+    noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+    extensionFactories: [createCodemodeExtension({ models: false }), pi => principalLeases(pi, {
+      async exec(command, cwd, options) {
+        foregroundCalls++;
+        if (command === "controlled-unknown") throw new AgentClosureError([new Error("controlled group observation failure")], "principal fixture");
+        return foregroundBash.exec(command, cwd, options);
+      },
+    })] });
+  await loader.reload();
+  const { session } = await ownership.acquire(createAgentSession({ cwd: root, agentDir: root, modelRuntime: runtime,
+    model: runtime.getModel("lease-fixture", "local"), resourceLoader: loader, settingsManager: settings,
+    sessionManager: SessionManager.create(root, path.join(root, "sessions")), tools: ["write", "edit", "read", "bash", "codemode"],
+    customTools: [{ name: "write", label: "write", description: "controlled writer", parameters: writeParams,
+      async execute(_id, params) {
+        const target = (params as Static<typeof writeParams>).path;
+        writes++; entered.release(); await release.promise;
+        if (target === "codemode.md") { nestedEntered.release(); await nestedRelease.promise; }
+        writeFileSync(path.join(root, target), "product"); return { content: [], details: {} };
+      } },
+    { name: "read", label: "read", description: "controlled nested boundary", parameters: Type.Object({}),
+      async execute(_id, _params, _signal, _update, ctx) {
+        nested.push(await ctx.executeTool("write", { path: "nested.md" }));
+        return { content: [], details: {} };
+      } }] }));
+  await session.bindExtensions({});
+  const first = ownership.run(session.prompt("write", { expandPromptTemplates: false })); await entered.promise;
+  expect(() => reserveOperation(root, "gates")).toThrow("active");
+  release.release(); await first;
+  const composition = ownership.run(session.prompt("nested codemode write", { expandPromptTemplates: false }));
+  await Promise.race([nestedEntered.promise, composition.then(() => { throw new Error("codemode settled without nested writer: " + JSON.stringify(session.messages)); })]);
+  expect(() => reserveOperation(root, "gates")).toThrow("active");
+  nestedRelease.release(); await composition;
+  expect(existsSync(path.join(root, "codemode.md"))).toBe(true);
+  const lease = reserveOperation(root, "gates");
+  try {
+    await ownership.run(session.prompt("nested and direct", { expandPromptTemplates: false }));
+    expect(writes).toBe(2); expect(nested).toHaveLength(1);
+    expect(existsSync(path.join(root, "bypass.md"))).toBe(false);
+    expect(JSON.stringify(nested)).toContain("lease"); expect(existsSync(path.join(root, "nested.md"))).toBe(false);
+    for (const excludeFromContext of [false, true]) {
+      const hook = await session.extensionRunner.emitUserBash({ type: "user_bash", cwd: root, command: "printf bypass > blocked", excludeFromContext });
+      expect(hook).toHaveProperty("operations");
+      await expect(session.executeBash("printf bypass > blocked", undefined, { excludeFromContext, operations: hook!.operations })).rejects.toThrow("lease");
+    }
+    // A returned operations object stays owned until its executor settles, not until the hook returns.
+    const hook = await session.extensionRunner.emitUserBash({ type: "user_bash", cwd: root, command: "unused", excludeFromContext: false });
+    const independent = reserveOperation(other, "writer"); independent.release();
+    expect(existsSync(path.join(root, "blocked"))).toBe(false);
+    expect(hook).toHaveProperty("operations");
+  } finally { lease.release(); }
+  const hook = await session.extensionRunner.emitUserBash({ type: "user_bash", cwd: root, command: "printf ordinary", excludeFromContext: true });
+  expect((await session.executeBash("printf ordinary", undefined, { excludeFromContext: true, operations: hook!.operations })).output).toBe("ordinary");
+  if (unknownClosure) {
+    const before = mutationGeneration(root);
+    await expect(session.executeBash("controlled-unknown", undefined, { operations: hook!.operations })).rejects.toThrow("closure");
+    expect(mutationGeneration(root)).toBeGreaterThan(before);
+    const afterFailure = mutationGeneration(root), executed = foregroundCalls;
+    for (const excludeFromContext of [false, true]) {
+      await expect(session.executeBash("printf forbidden", undefined, { excludeFromContext, operations: hook!.operations })).rejects.toThrow("unknown");
+    }
+    await ownership.run(session.prompt("writers after unknown closure", { expandPromptTemplates: false }));
+    expect(writes).toBe(2);
+    expect(foregroundCalls).toBe(executed);
+    expect(mutationGeneration(root)).toBe(afterFailure);
+    expect(readFileSync(path.join(root, "codemode.md"), "utf8")).toBe("product");
+    for (const name of ["unknown.md", "unknown-bash", "unknown-codemode.md", "nested.md"]) expect(existsSync(path.join(root, name))).toBe(false);
+    expect(nested).toHaveLength(2);
+    expect(JSON.stringify(nested[1])).toContain("unknown");
+    expect(() => reserveOperation(undefined, "writer")).toThrow("unknown");
+    expect(() => reserveOperation(root, "checkpoint")).toThrow("unknown");
+    expect(() => reserveOperation(root, "gates")).toThrow("unknown");
+    const independent = reserveOperation(other, "writer"); independent.release();
+    expect((await hook!.operations!.exec("printf disjoint", other, { onData() {} })).exitCode).toBe(0);
+    // The injected observation error owns no process. The retained host lease is
+    // not cleared; child-host exit, not fabricated release, isolates it.
+  }
+  await session.dispose();
+}
+
+test("principal real SDK tool_call, nested ctx.executeTool, and user_bash operations share gate leases",
+  ownership.ownedCase("principal leases", () => principalLeaseCase()));
+
+const unknownWriterCase = "retained unknown principal executor fences real SDK writers and unscoped compositions";
+test(unknownWriterCase, ownership.ownedCase("unknown principal lease", async () => {
+  if (process.env.PITAKO_UNKNOWN_PRINCIPAL_HOST === "1") return principalLeaseCase(true);
+  console.log(execFileSync(process.execPath, ["test", import.meta.path, "--test-name-pattern", `^${unknownWriterCase}$`], {
+    env: { ...process.env, PITAKO_UNKNOWN_PRINCIPAL_HOST: "1", BUN_OPTIONS: "", NO_COLOR: "1", FORCE_COLOR: "0" }, encoding: "utf8",
+  }));
+}));

@@ -30,8 +30,7 @@ Keep ordinary in-scope correction with the active Developer. Product cleanup edi
 require a fresh Head after prior physical settlement and normal admission; a no-op
 cleanup creates no Developer. Setup, ledger/Board bookkeeping, the principal final
 typecheck-then-test procedure, independent review, and acceptance are not Developer
-assignments. Never delegate the principal final complete procedure as cleanup or
-focused verification.
+assignments. Never delegate the principal final complete procedure as cleanup or focused verification. An explicit exterior `verification` grant to asynchronous Developer Head is the only delegated selection route: Head reads the root guide and selects exact commands, the host owns finite execution/capture/closure, and you independently review receipts, manual obligations, sufficiency and acceptance. Omission keeps the ordinary principal procedure. The grant supplies positive finite duration/capture/invocation budgets and explicit artifact/scratch roots; it grants no setup, product/configuration writes, spend or acceptance.
 
 Record a compatible explicit user requirement for ordinary single mode or a
 prohibition of Head itself; deliberately use `mode: "single"` without `writes`.
