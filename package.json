@@ -30,6 +30,8 @@
   "pi": {
     "extensions": [
       "./extensions/index.ts",
+      "./node_modules/pi-codex-tools/index.ts",
+      "./extensions/profile-policy.ts",
       "./node_modules/pi-lsp-client/src/index.ts",
       "./node_modules/@vndv/pi-codegraph/extensions/codegraph.ts",
       "./extensions/todo.ts",

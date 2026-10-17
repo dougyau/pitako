@@ -4,6 +4,18 @@
   "pitakoExtension": "extensions/index.ts",
   "required": [
     {
+      "id": "pi-codex-tools",
+      "spec": "pi-codex-tools@0.3.0",
+      "entry": "node_modules/pi-codex-tools/index.ts",
+      "tools": ["apply_patch"]
+    },
+    {
+      "id": "pitako-profile-policy",
+      "spec": "pitako",
+      "entry": "extensions/profile-policy.ts",
+      "tools": []
+    },
+    {
       "id": "pi-lsp-client",
       "spec": "github:code-yeongyu/pi-lsp-client#1c981dfcacc456fe4ce9f4120a2f0250b54d6844",
       "entry": "node_modules/pi-lsp-client/src/index.ts",
@@ -74,12 +86,6 @@
       "spec": "pi-web-access@0.31.0",
       "entry": "node_modules/pi-web-access/dist/index.js",
       "tools": ["web_search", "fetch_content", "source_check", "get_search_content", "web_enable"]
-    },
-    {
-      "id": "pi-codex-tools",
-      "spec": "pi-codex-tools@0.3.0",
-      "entry": "node_modules/pi-codex-tools/index.ts",
-      "tools": ["apply_patch"]
     }
   ],
   "optional": []

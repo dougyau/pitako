@@ -1,6 +1,4 @@
 import { preparedTool } from "./fixtures/background-dispatch.ts";
-import { stubExternalFactories } from "./fixtures/offline.ts";
-stubExternalFactories();
 import { agentFixtureOwnership } from "./fixtures/agent-fixture-ownership.ts";
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { execFileSync } from "node:child_process";

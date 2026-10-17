@@ -1,5 +1,3 @@
-import { stubExternalFactories } from "./fixtures/offline.ts";
-stubExternalFactories();
 import { spawnSync } from "node:child_process";
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -7,6 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import pitako from "../extensions/index.ts";
+import profilePolicy from "../extensions/profile-policy.ts";
 import { agentScope } from "../extensions/agent/scope.ts";
 import { packageRoot } from "../extensions/stack.ts";
 import { childActiveTools, toolsForProfile } from "../extensions/profile.ts";
@@ -22,7 +21,8 @@ afterEach(() => {
   configDirs.length = 0;
 });
 
-function profileHarness(profileFlag?: string) {
+function profileHarness(profileFlag?: string, external?: () => Promise<void>) {
+  const writes: string[] = [];
   const active = ["read", "bash", "edit", "write"];
   const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
   let profileCommand: ((args: string, ctx: unknown) => Promise<void>) | undefined;
@@ -34,6 +34,7 @@ function profileHarness(profileFlag?: string) {
   ];
   const context = {
     cwd: packageRoot(),
+    model: undefined as { api: string; compat?: { supportsOpenAIGrammarTools: boolean } } | undefined,
     hasUI: false,
     ui: { notify() {}, setStatus() {} },
     sessionManager: { getSessionId: () => `test-${profileFlag ?? "coding"}`, getEntries: () => [] },
@@ -55,10 +56,23 @@ function profileHarness(profileFlag?: string) {
     getSessionName() { return undefined; },
     setSessionName() {},
   };
-  pitako(pi as unknown as ExtensionAPI);
+  const factories = new Map<string, (pi: ExtensionAPI) => void>([
+    ["./extensions/index.ts", pitako],
+    ["./node_modules/pi-codex-tools/index.ts", api => {
+      // Controlled external synchronization deliberately enables mutators.
+      api.registerTool({ name: "apply_patch", parameters: {} } as never);
+      const synchronize = async () => { await external?.(); api.setActiveTools([...available]); };
+      api.on("session_start", synchronize);
+      api.on("model_select", synchronize);
+    }],
+    ["./extensions/profile-policy.ts", profilePolicy],
+  ]);
+  for (const entry of JSON.parse(readFileSync(path.join(packageRoot(), "package.json"), "utf8")).pi.extensions)
+    factories.get(entry)?.({ ...pi, setActiveTools(names: string[]) { writes.push(entry); pi.setActiveTools(names); } } as unknown as ExtensionAPI);
   return {
-    active,
+    active, available, writes,
     context,
+    async modelSelect() { await handlers.get("model_select")?.({}, context); },
     async start() {
       const handler = handlers.get("session_start");
       if (!handler) throw new Error("session_start was not registered");
@@ -274,10 +288,25 @@ describe("Pitako resources and policy", () => {
         },
         setSessionName() {},
       };
-      pitako(pi as unknown as ExtensionAPI);
+      const factories = new Map<string, (pi: ExtensionAPI) => void>([
+          ["./extensions/index.ts", pitako],
+          ["./node_modules/pi-codex-tools/index.ts", api => {
+            // Controlled external synchronization deliberately enables mutators.
+            api.registerTool({ name: "apply_patch", parameters: {} } as never);
+            const synchronize = () => api.setActiveTools([...available]);
+            api.on("session_start", synchronize);
+            api.on("model_select", synchronize);
+          }],
+          ["./extensions/profile-policy.ts", profilePolicy],
+        ]);
+        for (const entry of JSON.parse(readFileSync(path.join(packageRoot(), "package.json"), "utf8")).pi.extensions)
+          factories.get(entry)?.(pi as unknown as ExtensionAPI);
       const start = handlers.get("session_start");
       if (!start) throw new Error("session_start was not registered");
-      await start({}, { hasUI: false, ui: { notify() {}, setStatus() {} } });
+      const ctx = { cwd: packageRoot(), hasUI: false, ui: { notify() {}, setStatus() {} },
+        sessionManager: { getSessionId: () => "analysis-wiring", getEntries: () => [] } };
+      await start({}, ctx);
+      await handlers.get("session_shutdown")?.({}, ctx);
       expect(active).toContain("read");
       expect(active).toContain("grep");
       expect(active).toContain("lsp_diagnostics");
@@ -417,4 +446,63 @@ describe("repository hygiene", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+});
+
+
+test("late policy uses the live profile across model and command changes, and rejects retired manager/revision callbacks", async () => {
+  let release = () => {}, entered = () => {}, held = false;
+  let wait = Promise.resolve();
+  const host = profileHarness("coding", async () => { if (held) { entered(); await wait; } });
+  const policy = "./extensions/profile-policy.ts";
+  const model = { api: "openai-responses", compat: { supportsOpenAIGrammarTools: true } };
+  const pending: Promise<unknown>[] = [];
+  const suspend = () => {
+    held = true;
+    wait = new Promise<void>(resolve => { release = resolve; });
+    return new Promise<void>(resolve => { entered = resolve; });
+  };
+  try {
+    host.context.model = model;
+    await host.start();
+    expect(host.active).toContain("apply_patch");
+    expect(host.active).not.toContain("edit");
+    await host.selectProfile("analysis");
+    await host.modelSelect();
+    for (const name of ["edit", "write", "apply_patch", "lsp_rename"]) expect(host.active).not.toContain(name);
+    expect(await host.composePrompt()).toContain("Pitako profile: analysis.");
+    await host.selectProfile("coding");
+    host.context.model = { api: "anthropic-messages" };
+    await host.modelSelect();
+    expect(host.active).toEqual(expect.arrayContaining(["edit", "write"]));
+    host.context.model = model;
+    host.available.splice(host.available.indexOf("apply_patch"), 1);
+    await host.modelSelect();
+    expect(host.active).toEqual(expect.arrayContaining(["edit", "write"]));
+    host.available.push("apply_patch");
+
+    let ready = suspend();
+    const retiredManager = host.context.sessionManager;
+    const oldEvent = host.modelSelect(); pending.push(oldEvent); await ready;
+    host.context.sessionManager = { getSessionId: () => "replacement-manager", getEntries: () => [] };
+    let count = host.writes.filter(entry => entry === policy).length;
+    release(); await oldEvent;
+    expect(host.writes.filter(entry => entry === policy)).toHaveLength(count);
+    held = false;
+    await host.start();
+    await host.selectProfile("analysis");
+    await host.modelSelect();
+    expect(host.active).not.toContain("apply_patch");
+    expect(host.context.sessionManager).not.toBe(retiredManager);
+
+    ready = suspend();
+    const retiredRevision = host.modelSelect(); pending.push(retiredRevision); await ready;
+    await host.shutdown();
+    count = host.writes.filter(entry => entry === policy).length;
+    release(); await retiredRevision;
+    expect(host.writes.filter(entry => entry === policy)).toHaveLength(count);
+    held = false;
+    await host.start(); await host.selectProfile("analysis"); await host.modelSelect();
+    expect(host.writes.at(-1)).toBe(policy);
+    expect(host.active).not.toContain("apply_patch");
+  } finally { release(); await Promise.allSettled(pending); await host.shutdown(); }
 });

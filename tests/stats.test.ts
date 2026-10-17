@@ -1,5 +1,3 @@
-import { stubExternalFactories } from "./fixtures/offline.ts";
-stubExternalFactories();
 import { expect, test } from "bun:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import pitako from "../extensions/index.ts";

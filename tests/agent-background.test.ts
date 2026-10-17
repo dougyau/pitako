@@ -1,8 +1,6 @@
 import { recoveryClock } from "./fixtures/recovery-clock.ts";
 import { preparedTool } from "./fixtures/background-dispatch.ts";
 import { runAgentInstance } from "../extensions/agent/run.ts";
-import { stubExternalFactories } from "./fixtures/offline.ts";
-stubExternalFactories();
 import { agentFixtureOwnership } from "./fixtures/agent-fixture-ownership.ts";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";

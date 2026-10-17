@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { closeSync, openSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import { createWriteToolDefinition, SessionManager, type ExtensionToolContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { OwnedGates } from "../extensions/agent/head/gates.ts";
@@ -289,7 +290,7 @@ test("unknown producer closure blocks new work while a known pre-start refusal d
 }));
 
 test("loaded known patch keeps native schema, grammar, rendering and output; replacements are unsupported", () => repository(async root => {
-  const entry = new URL("../extensions/index.ts", import.meta.resolve("pi-codex-tools"));
+  const entry = new URL("../index.ts", import.meta.resolve("pi-codex-tools"));
   const definitions: ToolDefinition[] = [];
   const extension = (await import(entry.href)).default;
   const offline = process.env.PI_OFFLINE;
@@ -301,10 +302,10 @@ test("loaded known patch keeps native schema, grammar, rendering and output; rep
   }
   const patch = definitions.find(definition => definition.name === "apply_patch")!;
   const managed = producer(new ManagedAssignment(root, [root]));
-  const loader = (resolvedPath: string) => ({ getExtensions: () => ({ extensions: [{
-    resolvedPath, tools: new Map([["apply_patch", { definition: patch }]]),
-  }] }) }) as any;
-  const tools = managedTools(loader(entry.pathname), managed);
+  const owner = (resolvedPath: string) => ({ resolvedPath, tools: new Map([["apply_patch", { definition: patch }]]) });
+  const registrations = (extensions: ReturnType<typeof owner>[]) => ({ getExtensions: () => ({ extensions }) }) as any;
+  const loader = (resolvedPath: string) => registrations([owner(resolvedPath)]);
+  const tools = managedTools(loader(fileURLToPath(entry)), managed);
   const wrapped = tools.find(definition => definition.name === "apply_patch")!;
   expect(wrapped.parameters).toBe(patch.parameters); expect(wrapped.renderCall).toBe(patch.renderCall);
   expect(wrapped.renderResult).toBe(patch.renderResult); expect(wrapped).toMatchObject({ promptSnippet: patch.promptSnippet });
@@ -314,7 +315,18 @@ test("loaded known patch keeps native schema, grammar, rendering and output; rep
   });
   expect(applied.details).toEqual({ changes: [{ kind: "added", path: "patched" }] });
   expect(readFileSync(path.join(root, "patched"), "utf8")).toBe("native\n");
-  expect(managedTools(loader(import.meta.filename), managed).some(definition => definition.name === "apply_patch")).toBe(false);
+  expect(() => wrapped.execute("outside", { patch: "*** Begin Patch\n*** Add File: ../outside\n+no\n*** End Patch\n" },
+    undefined, undefined, context(root))).toThrow("launch root");
+  const publicPath = fileURLToPath(entry);
+  const internalPath = fileURLToPath(new URL("../extensions/index.ts", import.meta.resolve("pi-codex-tools")));
+  const copy = path.join(root, "index.ts"); writeFileSync(copy, "// distinct physical producer\n");
+  for (const owners of [[], [owner(import.meta.filename)], [owner(internalPath)],
+    [owner(fileURLToPath(import.meta.resolve("pi-codex-tools")))], [owner(copy)],
+    [owner(publicPath), owner(publicPath)], [owner(publicPath), owner(copy)]]) {
+    const unsupported = managedTools(registrations(owners), managed).map(definition => definition.name);
+    expect(unsupported).not.toContain("apply_patch");
+    expect(unsupported).toEqual(expect.arrayContaining(["edit", "write"]));
+  }
   let guard!: Function;
   await managedGuard(new Set(tools.map(definition => definition.name)))({ on(_name: string, hook: Function) { guard = hook; } } as any);
   for (const name of ["codemode", "mcp_write", "apply_patch_replacement"]) expect(guard({ toolName: name }).block).toBe(true);

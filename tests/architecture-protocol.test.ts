@@ -1,5 +1,3 @@
-import { stubExternalFactories } from "./fixtures/offline.ts";
-stubExternalFactories();
 import { expect, test } from "bun:test";
 import { architectureFixture } from "./fixtures/architecture.ts";
 import { participant } from "../extensions/architecture/types.ts";

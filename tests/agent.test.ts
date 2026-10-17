@@ -1,5 +1,3 @@
-import { stubExternalFactories } from "./fixtures/offline.ts";
-stubExternalFactories();
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { agentFixtureOwnership } from "./fixtures/agent-fixture-ownership.ts";
 import { tmpdir } from "node:os";

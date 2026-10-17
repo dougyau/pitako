@@ -1,11 +1,10 @@
-import { stubExternalFactories } from "./fixtures/offline.ts";
-stubExternalFactories();
 import { expect, test } from "bun:test";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import pitako from "../extensions/index.ts";
+import profilePolicy from "../extensions/profile-policy.ts";
 import { registerAgentSupervise } from "../extensions/herdr/supervise.ts";
 import agentInstance from "../extensions/agent/index.ts";
 import { bindBackgroundOwner, clearBackgroundOwner, setBackgroundExecutor, observeWorkerResults, cancelAllWorkers,
@@ -314,20 +313,21 @@ test("post-bind analysis survives late tools and same-model reconciliation; nest
   const tools = new Map<string, { definition: any }>();
   const names = ["read", "bash", "grep", "find", "ls", "edit", "write", "apply_patch", "lsp_rename", "codegraph_search", "agent_future", "team_assign", "head_plan", "consultation_feedback"];
   let hooks = new Map<string, Function>();
-  const profileHooks = new Map<string, Function>();
+  const profileHooks = new Map<string, Function[]>();
   let childContext: any;
   const host = controlledPi(s.root, { extensions: [{ resolvedPath: "controlled", tools }], async bind(session) {
     expect(executionForSession(session.sessionId)?.profile).toBe("analysis");
     for (const name of names) tools.set(name, { definition: { execute() { calls++; } } });
     session.getAllTools = () => names.map(name => ({ name }));
-    pitako({ registerTool() {}, registerFlag() {}, registerCommand() {}, getFlag: () => "coding",
-      on(name: string, fn: Function) { profileHooks.set(name, fn); },
+    const profilePi = { registerTool() {}, registerFlag() {}, registerCommand() {}, getFlag: () => "coding",
+      on(name: string, fn: Function) { profileHooks.set(name, [...profileHooks.get(name) ?? [], fn]); },
       getAllTools: () => session.getAllTools(), getActiveTools: () => session.active,
       setActiveTools: (active: string[]) => { session.active = active; },
       getSessionName: () => "pitako:coding", setSessionName() {},
-    } as unknown as ExtensionAPI);
+    } as unknown as ExtensionAPI;
+    pitako(profilePi); profilePolicy(profilePi);
     childContext = { cwd: s.root, sessionManager: session.sessionManager, model: session.model, hasUI: false };
-    await profileHooks.get("session_start")!({}, childContext);
+    for (const hook of profileHooks.get("session_start") ?? []) await hook({}, childContext);
     expect(session.active).toContain("bash");
     expect(session.active).not.toContain("edit");
     hooks = new Map();
@@ -343,7 +343,7 @@ test("post-bind analysis survives late tools and same-model reconciliation; nest
     hooks.get("turn_start")!();
     expect(await tools.get("team_late")!.definition.execute()).toMatchObject({ isError: true });
     await session.setModel(session.model!);
-    profileHooks.get("model_select")!({ model: session.model }, { ...childContext, model: session.model });
+    for (const hook of profileHooks.get("model_select") ?? []) await hook({ model: session.model }, childContext);
     expect(session.active).not.toContain("edit");
     reconcileChildTools({ ...session, model: session.model });
     expect(session.active).not.toContain("write");
@@ -353,7 +353,10 @@ test("post-bind analysis survives late tools and same-model reconciliation; nest
     const result = await fixture.run(runAgentInstance({ roleId: "scout", cwd: s.root, task: "analysis", consultation: consultationSnapshot("scout", undefined, s.root),
       executor: createPiExecutor({ factories: host.factories }) }));
     expect(result.status).toBe("completed"); expect(calls).toBe(0);
-  } finally { await cleanup(s); }
+  } finally {
+    if (childContext) for (const hook of profileHooks.get("session_shutdown") ?? []) await hook({}, childContext);
+    await cleanup(s);
+  }
 }));
 
 

@@ -11,7 +11,7 @@ import { beginTeamEvaluation, retireTeamEvaluation, teamEvaluationForSession, te
 import { teamWorkerStatus } from "./agent/background.ts";
 import { bindAgentUi, listObservations, unbindAgentUi } from "./agent/observe.ts";
 import { formatAgentsDetail } from "./agent/ui.ts";
-import { childSessionNote, parseProfile, profileNote, setSessionProfile, toolsForProfile, isOrchestrationTool, type ProfileName } from "./profile.ts";
+import { childSessionNote, parseProfile, profileNote, setSessionProfile, effectiveProfile, requestedProfile, isChildSession, applyProfile, isOrchestrationTool } from "./profile.ts";
 import { currentInstanceId } from "./agent/scope.ts";
 import { executionForSession } from "./execution-identity.ts";
 import { formatUsage, mergeUsage, type AgentUsage } from "./agent/run.ts";
@@ -32,38 +32,10 @@ import { createAgentController } from "./agent/controller.ts";
 import { openAgentScreen } from "./agent/screen.ts";
 import { createPaneSession } from "./herdr/agents-ui/session.ts";
 import { readHerdrPresence } from "./herdr/presence.ts";
-import { registerCodexTools } from "./codex.ts";
 import { createAgentBridge } from "./agent/bridge/broker.ts";
 import { AgentClosureError } from "./agent/closure.ts";
 import { principalLeases } from "./agent/head/operation-leases.ts";
 import { foregroundBash } from "./agent/head/managed-tools.ts";
-
-function requestedProfile(pi: ExtensionAPI): ProfileName {
-  const flag = pi.getFlag("pitako-profile");
-  if (typeof flag === "string") return parseProfile(flag);
-  return parseProfile(process.env.PITAKO_PROFILE);
-}
-
-function isChildSession(ctx: ExtensionContext): boolean {
-  return Boolean(executionForSession(ctx.sessionManager?.getSessionId()) || currentInstanceId() || process.env.PITAKO_INSTANCE_ID);
-}
-
-function applyProfile(pi: ExtensionAPI, profile: ProfileName, ctx: ExtensionContext): string[] {
-  profile = executionForSession(ctx.sessionManager?.getSessionId())?.profile ?? profile;
-  const available = pi.getAllTools().map((tool) => tool.name);
-  const active = pi.getActiveTools();
-  const next = toolsForProfile({
-    available,
-    profile,
-    model: ctx.model,
-    child: isChildSession(ctx),
-    managed: executionForSession(ctx.sessionManager?.getSessionId())?.managed,
-    includePowerShell: process.platform === "win32" || active.includes("powershell"),
-  });
-  if (ctx.sessionManager) setSessionProfile(ctx.sessionManager, profile);
-  pi.setActiveTools(next);
-  return next;
-}
 
 function foregroundSession(sessionId: string | undefined): sessionId is string {
   return Boolean(sessionId && !executionForSession(sessionId) && !currentInstanceId() && !process.env.PITAKO_INSTANCE_ID);
@@ -97,7 +69,6 @@ export default function pitako(pi: ExtensionAPI, host: { recoveryScheduler?: Rec
   // Fail during extension load so Pi surfaces a configuration error at startup.
   prepareRuntime(root);
 
-  const startCodex = registerCodexTools(pi);
   principalLeases(pi, foregroundBash);
 
   pi.registerFlag("pitako-profile", {
@@ -111,8 +82,6 @@ export default function pitako(pi: ExtensionAPI, host: { recoveryScheduler?: Rec
 
   registerAgentSupervise(pi);
 
-  let profile: ProfileName = "coding";
-
   let ownerToken = Symbol("pitako.foreground");
   let agentUiBindingToken: symbol | undefined;
   let teamEvaluation: TeamEvaluation | undefined;
@@ -120,6 +89,7 @@ export default function pitako(pi: ExtensionAPI, host: { recoveryScheduler?: Rec
   let agentPane: ReturnType<typeof createPaneSession> | undefined;
   let agentBridge: ReturnType<typeof createAgentBridge> | undefined;
   let foregroundRevision = 0;
+  let retirement: Promise<void> = Promise.resolve();
 
   const revokeForeground = () => {
     ++foregroundRevision;
@@ -131,32 +101,47 @@ export default function pitako(pi: ExtensionAPI, host: { recoveryScheduler?: Rec
     agentController = undefined;
     agentPane = undefined;
     agentBridge = undefined;
+    teamEvaluation = undefined;
     if (agentUiBindingToken) unbindAgentUi(agentUiBindingToken);
     agentUiBindingToken = undefined;
     return retired;
   };
 
-  pi.on("session_start", async (event, ctx) => {
+  // Retain prior handles even after revokeForeground clears the live references.
+  // Start closes synchronously to revoke Team authority before the first await.
+  // allSettled observes every close, and a failed close poisons this lifetime.
+  const retainRetirement = (retired: ReturnType<typeof revokeForeground>, sessionId?: string) => {
+    const previous = retirement;
+    retirement = Promise.allSettled([
+      previous,
+      ...[
+        () => retireTeamEvaluation(retired.evaluation), () => shutdownBackground(retired.token),
+        () => settlePendingDispatches(sessionId), () => retired.controller?.settle(),
+        () => retired.pane?.close(), () => retired.bridge?.settle(),
+      ].map(async close => close()),
+    ]).then(results => {
+      const failures = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+      if (failures.length) throw new AgentClosureError(failures, "Foreground retirement");
+    });
+    void retirement.catch(() => {});
+    return retirement;
+  };
+
+  pi.on("session_start", async (_event, ctx) => {
     const retired = revokeForeground();
     const revision = foregroundRevision;
-    const previousEvaluation = retired.evaluation ?? teamEvaluationForSession(ctx.sessionManager?.getSessionId(), isChildSession(ctx));
-    const reopenDispatches = closeDispatchAdmissions(previousEvaluation?.sessionId ?? ctx.sessionManager?.getSessionId());
-    const retirement = Promise.allSettled([retireTeamEvaluation(previousEvaluation), shutdownBackground(retired.token)]);
-    let upstreamFailure: { error: unknown } | undefined;
+    const manager = ctx.sessionManager;
+    const sessionId = manager?.getSessionId();
+    const current = () => revision === foregroundRevision && manager === ctx.sessionManager && sessionId === manager?.getSessionId();
+    retired.evaluation ??= teamEvaluationForSession(sessionId, isChildSession(ctx));
+    const retiringId = retired.evaluation?.sessionId ?? sessionId;
+    const reopenDispatches = closeDispatchAdmissions(retiringId);
+    const closed = retainRetirement(retired, retiringId);
+    let settled = false;
     try {
-      try {
-        await startCodex(event, ctx);
-      } catch (error) {
-        upstreamFailure = { error };
-      }
-      const settled = await Promise.allSettled([
-        settlePendingDispatches(previousEvaluation?.sessionId ?? ctx.sessionManager?.getSessionId()),
-        retired.controller?.settle(), retired.pane?.close(), retired.bridge?.settle(),
-      ]);
-      const failures = [...settled, ...await retirement].flatMap(result => result.status === "rejected" ? [result.reason] : []);
-      if (failures.length) throw new AgentClosureError(failures, "Foreground replacement");
-      if (revision !== foregroundRevision) return;
-      const sessionId = ctx.sessionManager?.getSessionId();
+      await closed;
+      settled = true;
+      if (!current()) return;
       if (foregroundSession(sessionId)) {
         // Cooperative history maintenance never waits for or cancels a worker.
         try {
@@ -170,9 +155,11 @@ export default function pitako(pi: ExtensionAPI, host: { recoveryScheduler?: Rec
           const message = `Worker history maintenance failed: ${String(error)}`;
           if (ctx.hasUI) ctx.ui.notify(message, "error"); else console.error(message);
         }
-        if (revision !== foregroundRevision) return;
+        if (!current()) return;
       }
-      if (teamEvaluation && teamEvaluation.sessionId !== sessionId) await retireTeamEvaluation(teamEvaluation);
+      const profile = isChildSession(ctx) ? executionForSession(sessionId)?.profile ?? "coding" : requestedProfile(pi);
+      if (manager) setSessionProfile(manager, profile, current);
+      applyProfile(pi, ctx);
       ownerToken = Symbol("pitako.foreground");
       teamEvaluation = beginTeamEvaluation(
         sessionId,
@@ -222,14 +209,6 @@ export default function pitako(pi: ExtensionAPI, host: { recoveryScheduler?: Rec
           getBranch: () => owns() ? ctx.sessionManager.getBranch() : [],
         });
       }
-      try {
-        profile = isChildSession(ctx) ? executionForSession(ctx.sessionManager?.getSessionId())?.profile ?? "coding" : requestedProfile(pi);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        if (ctx.hasUI) ctx.ui.notify(message, "error");
-        throw error;
-      }
-      applyProfile(pi, profile, ctx);
       const entries = ctx.sessionManager?.getEntries?.() ?? [];
       const existingUserText = firstUserText(entries);
       const invocation = latestPlanInvocation(entries);
@@ -245,42 +224,42 @@ export default function pitako(pi: ExtensionAPI, host: { recoveryScheduler?: Rec
           modelLookup: (provider, id) => ctx.modelRegistry?.find(provider, id),
         });
       }
-      // Upstream failure still reconciles the final profile above, but cannot
-      // publish or admit a replacement bridge for this failed transition.
       const bridgeRoot = pi.getFlag("pitako-agent-bridge");
       if (!isChildSession(ctx) && ctx.mode === "rpc" && bridgeRoot !== undefined) {
         if (typeof bridgeRoot !== "string" || !bridgeRoot.length)
           throw new Error("Agent bridge requires an absolute private directory");
-        if (!upstreamFailure && agentController && revision === foregroundRevision) {
-          const lifetime = createAgentBridge(agentController, bridgeRoot, () => revision === foregroundRevision);
+        if (agentController && current()) {
+          const lifetime = createAgentBridge(agentController, bridgeRoot, current);
           agentBridge = lifetime;
           await lifetime.ready;
+          if (!current()) {
+            if (revision === foregroundRevision) throw new Error("Foreground session retired during publication");
+            return;
+          }
         }
       }
+    } catch (error) {
+      // Failed retirement published nothing. Only this revision may clean its partial publication.
+      if (settled && revision === foregroundRevision) {
+        const partial = revokeForeground();
+        const cleanup = retainRetirement(partial, sessionId);
+        try { await cleanup; }
+        catch (failure) { settled = false; throw new AgentClosureError([error, failure], "Foreground publication"); }
+      }
+      throw error;
     } finally {
-      reopenDispatches();
-      // Upstream failure must not skip retirement, profile reconciliation, or
-      // the revision fence, but remains visible to Pi under this extension.
-      if (upstreamFailure) throw upstreamFailure.error;
+      // An uncertain close retains its lease for the lifetime, not just this event.
+      if (settled) reopenDispatches();
     }
   });
 
-  pi.on("model_select", (_event, ctx) => {
-    applyProfile(pi, profile, ctx);
-  });
-
-  pi.on("session_shutdown", async (event, ctx) => {
+  pi.on("session_shutdown", async (_event, ctx) => {
     const retired = revokeForeground();
     const revision = foregroundRevision;
-    const previousEvaluation = retired.evaluation ?? teamEvaluationForSession(ctx.sessionManager?.getSessionId(), isChildSession(ctx));
-    const reopenDispatches = closeDispatchAdmissions(previousEvaluation?.sessionId ?? ctx.sessionManager?.getSessionId());
-    const settled = await Promise.allSettled([
-      retireTeamEvaluation(previousEvaluation), shutdownBackground(retired.token),
-      settlePendingDispatches(previousEvaluation?.sessionId ?? ctx.sessionManager?.getSessionId()),
-      retired.controller?.settle(), retired.pane?.close(), retired.bridge?.settle(),
-    ]);
-    const failures = settled.flatMap(result => result.status === "rejected" ? [result.reason] : []);
-    if (failures.length) throw new AgentClosureError(failures, "Foreground shutdown");
+    retired.evaluation ??= teamEvaluationForSession(ctx.sessionManager?.getSessionId(), isChildSession(ctx));
+    const sessionId = retired.evaluation?.sessionId ?? ctx.sessionManager?.getSessionId();
+    const reopenDispatches = closeDispatchAdmissions(sessionId);
+    await retainRetirement(retired, sessionId);
     reopenDispatches();
     if (revision === foregroundRevision) unregisterSupervisedSession();
   });
@@ -356,7 +335,7 @@ export default function pitako(pi: ExtensionAPI, host: { recoveryScheduler?: Rec
     if (ctx.hasUI) ctx.ui.setStatus("pitako", pi.getSessionName() || undefined);
 
     const instanceId = executionForSession(ctx.sessionManager?.getSessionId())?.instanceId ?? currentInstanceId() ?? process.env.PITAKO_INSTANCE_ID;
-    const note = instanceId ? childSessionNote(instanceId) : profileNote(profile);
+    const note = instanceId ? childSessionNote(instanceId) : profileNote(effectiveProfile(ctx.sessionManager));
     const current = event.systemPrompt ?? "";
     if (current.includes(note)) return undefined;
     return { systemPrompt: current.length > 0 ? `${current}\n\n${note}` : note };
@@ -498,15 +477,16 @@ export default function pitako(pi: ExtensionAPI, host: { recoveryScheduler?: Rec
         return;
       }
       if (command === "profile" && value) {
-        profile = parseProfile(value);
-        const tools = applyProfile(pi, profile, ctx);
+        setSessionProfile(ctx.sessionManager, parseProfile(value));
+        const profile = effectiveProfile(ctx.sessionManager);
+        const tools = applyProfile(pi, ctx);
         if (ctx.hasUI) {
           ctx.ui.notify(`Pitako profile: ${profile} (${tools.length} tools)`, "info");
         }
         return;
       }
       const lines = [
-        `Pitako profile: ${profile}`,
+        `Pitako profile: ${effectiveProfile(ctx.sessionManager)}`,
         "coding: read, bash, grep, find, ls, LSP, CodeGraph, todo; apply_patch for grammar-capable OpenAI models, otherwise edit/write.",
         "analysis: read, bash, grep, find, ls, LSP, CodeGraph, todo; no edit, write, apply_patch, or lsp_rename",
         "Switch with /pitako profile analysis",
