@@ -371,7 +371,10 @@ unknownTest("registered table replacement with rejected outgoing disposal retain
     expect(readLedgerTeamHolds(env.root, "unknown-table")).toHaveLength(1);
     const replacement = room.emit("session_start");
     expect(() => readBackgroundPending(scope)).toThrow("stale_owner");
-    await expect(replacement).rejects.toThrow("Foreground replacement");
+    await expect(replacement).rejects.toBeInstanceOf(AgentClosureError);
+    await expect(replacement).rejects.toThrow(/^Foreground retirement: closure unknown/);
+    await expect(replacement).rejects.toThrow("table outgoing disposal rejected");
+    expect(readLedgerTeamHolds(env.root, "unknown-table")).toHaveLength(1);
     expect(teamEvaluationForSession(scope.coordinatorSessionId, false)).toBeUndefined();
     expect(() => readBackgroundPending({ ...scope, ownerToken: Symbol("not-admitted") })).toThrow("stale_owner");
   } finally {

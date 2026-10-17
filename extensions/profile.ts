@@ -2,6 +2,8 @@ import { executionForSession } from "./execution-identity.ts";
 import { PitakoConfigError } from "./errors.ts";
 import type { Model } from "@earendil-works/pi-ai";
 import { supportsOpenAIGrammarTools } from "pi-codex-tools";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { currentInstanceId } from "./agent/scope.ts";
 
 export const PROFILES = ["coding", "analysis"] as const;
 export type ProfileName = (typeof PROFILES)[number];
@@ -35,11 +37,44 @@ export const ORCHESTRATION_TOOLS = [
 export const isOrchestrationTool = (name: string): boolean => /^(agent_|team_|head_)/.test(name) || name === "consultation_feedback" || ["architecture_start", "architecture_read", "architecture_control"].includes(name);
 // SDK imports and Pi's extension loader can create separate module copies.
 const PROFILE_KEY = Symbol.for("pitako.sessionProfiles");
-const host = globalThis as typeof globalThis & { [PROFILE_KEY]?: WeakMap<object, ProfileName> };
-const sessionProfiles = host[PROFILE_KEY] ??= new WeakMap<object, ProfileName>();
+type SessionProfile = { profile: ProfileName; current?: () => boolean };
+const host = globalThis as typeof globalThis & { [PROFILE_KEY]?: WeakMap<object, SessionProfile> };
+const sessionProfiles = host[PROFILE_KEY] ??= new WeakMap<object, SessionProfile>();
 
-export function setSessionProfile(manager: object, profile: ProfileName): void {
-  sessionProfiles.set(manager, profile);
+export function setSessionProfile(manager: object, profile: ProfileName, current?: () => boolean): void {
+  sessionProfiles.set(manager, { profile, current: current ?? sessionProfiles.get(manager)?.current });
+}
+
+export function effectiveProfile(manager?: object & { getSessionId?: () => string }): ProfileName {
+  return executionForSession(manager?.getSessionId?.())?.profile ??
+    (manager && sessionProfiles.get(manager)?.profile) ?? "coding";
+}
+
+/** Late policy has no authority unless the early lifetime still owns this manager. */
+export function profileIsCurrent(manager: object): boolean {
+  return sessionProfiles.get(manager)?.current?.() === true;
+}
+
+export function requestedProfile(pi: ExtensionAPI): ProfileName {
+  const flag = pi.getFlag("pitako-profile");
+  return parseProfile(typeof flag === "string" ? flag : process.env.PITAKO_PROFILE);
+}
+
+export function isChildSession(ctx: ExtensionContext): boolean {
+  return Boolean(executionForSession(ctx.sessionManager?.getSessionId()) || currentInstanceId() || process.env.PITAKO_INSTANCE_ID);
+}
+
+export function applyProfile(pi: ExtensionAPI, ctx: ExtensionContext): string[] {
+  const next = toolsForProfile({
+    available: pi.getAllTools().map(tool => tool.name),
+    profile: effectiveProfile(ctx.sessionManager),
+    model: ctx.model,
+    child: isChildSession(ctx),
+    managed: executionForSession(ctx.sessionManager?.getSessionId())?.managed,
+    includePowerShell: process.platform === "win32" || pi.getActiveTools().includes("powershell"),
+  });
+  pi.setActiveTools(next);
+  return next;
 }
 
 /** Reconcile explicitly: same-model setModel does not emit model_select. */
@@ -51,7 +86,7 @@ export function reconcileChildTools(session: {
 }): void {
   session.setActiveToolsByName(toolsForProfile({
     available: session.getAllTools().map((tool) => tool.name),
-    profile: executionForSession(session.sessionManager.getSessionId?.())?.profile ?? sessionProfiles.get(session.sessionManager) ?? "coding",
+    profile: effectiveProfile(session.sessionManager),
     model: session.model,
     child: true,
     managed: executionForSession(session.sessionManager.getSessionId?.())?.managed,

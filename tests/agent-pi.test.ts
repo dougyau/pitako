@@ -413,3 +413,40 @@ test("logical turn cancellation owns awaited activation as well as prompt and ab
       await Promise.allSettled([first, second]); await owner.close();
     }
   }));
+
+
+test("child reconciliation survives same-model external mutations, capability changes and absent patch registrations",
+  fixture.ownedCase("child final profile", async () => {
+    for (const included of [true, false]) for (const roleId of ["developer", "researcher"]) {
+      const grammar = { ...controlledModel(), api: "openai-responses", compat: { supportsOpenAIGrammarTools: true } } as ReturnType<typeof controlledModel>;
+      const unsupported = controlledModel("fixture", "unsupported");
+      const f = setup({ models: [grammar, unsupported],
+        extensions: included ? [{ resolvedPath: "controlled-public-registration", tools: new Map([["apply_patch", { definition: { name: "apply_patch" } }]]) }] : [],
+        bind(session) {
+          const setModel = session.setModel.bind(session);
+          session.setModel = async model => {
+            await setModel(model);
+            session.setActiveToolsByName(["edit", "write", "apply_patch", "agent_run", "head_plan"]);
+          };
+        },
+      });
+      const result = await fixture.acquire(f.executor.start({ ...f.input, role: { ...controlledRole, id: roleId } }));
+      const session = f.host.sessions[0]!;
+      const check = (capable: boolean) => {
+        expect(session.active).not.toContain("agent_run"); expect(session.active).not.toContain("head_plan");
+        if (roleId === "researcher") {
+          for (const name of ["edit", "write", "apply_patch"]) expect(session.active).not.toContain(name);
+        } else if (included && capable) {
+          expect(session.active).toContain("apply_patch"); expect(session.active).not.toContain("edit"); expect(session.active).not.toContain("write");
+        } else {
+          expect(session.active).toEqual(expect.arrayContaining(["edit", "write"])); expect(session.active).not.toContain("apply_patch");
+        }
+      };
+      try {
+        expect(result.status).toBe("completed"); check(true);
+        expect((await result.session!.continueWith({ model: "fixture/selected" }, "same model", f.input.signal)).status).toBe("completed"); check(true);
+        expect((await result.session!.continueWith({ model: "fixture/unsupported" }, "without capability", f.input.signal)).status).toBe("completed"); check(false);
+        expect((await result.session!.continueWith({ model: "fixture/selected" }, "restore capability", f.input.signal)).status).toBe("completed"); check(true);
+      } finally { await result.session!.dispose(); }
+    }
+  }));

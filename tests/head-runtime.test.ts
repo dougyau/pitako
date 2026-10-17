@@ -1,4 +1,8 @@
 import { recoveryClock } from "./fixtures/recovery-clock.ts";
+import { execFileSync } from "node:child_process";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { applyPatch, APPLY_PATCH_GRAMMAR, createFreeformInputSchema, createOpenAILarkSampling } from "pi-codex-tools";
 import { Type } from "typebox";
 import { expect, test } from "bun:test";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
@@ -14,7 +18,7 @@ import { HeadAttachment } from "../extensions/agent/head/runtime.ts";
 import { createPiExecutor } from "../extensions/agent/pi.ts";
 import { runAgentInstance, type AgentRunResult } from "../extensions/agent/run.ts";
 import { providerFixtureOwnership } from "./fixtures/provider-fixture-ownership.ts";
-import { controlledModel, controlledPi } from "./fixtures/pi-factories.ts";
+import { controlledModel, controlledPi, controlledRole } from "./fixtures/pi-factories.ts";
 
 const fixture = providerFixtureOwnership();
 function deferred() { return Promise.withResolvers<void>(); }
@@ -544,3 +548,74 @@ test("queued Head ticks cannot revive a retired attachment or a changed native o
     await h.head.close();
   }
 }));
+
+
+test("public patch registration reaches managed createSession before bind and keeps the parser inside the envelope",
+  fixture.ownedCase("official producer boundary", async () => {
+    const { root, load } = setup();
+    execFileSync("git", ["init", "--quiet"], { cwd: root });
+    execFileSync("git", ["-c", "user.name=Fixture", "-c", "user.email=fixture@invalid", "commit", "--allow-empty", "--quiet", "-m", "initial"], { cwd: root });
+    const publicPath = realpathSync(fileURLToPath(new URL("../index.ts", import.meta.resolve("pi-codex-tools"))));
+    const patch = {
+      name: "apply_patch", label: "controlled public registration", description: "native parser boundary",
+      parameters: createFreeformInputSchema("patch", "raw patch"),
+      constrainedSampling: createOpenAILarkSampling(APPLY_PATCH_GRAMMAR),
+      renderCall: () => ({ render: () => [], invalidate() {} }),
+      renderResult: () => ({ render: () => [], invalidate() {} }),
+      async execute(_id: string, params: { patch: string }, signal: AbortSignal | undefined, _update: unknown, ctx: { cwd: string }) {
+        const details = await applyPatch(params.patch, { cwd: ctx.cwd, signal });
+        return { content: [{ type: "text" as const, text: "unchanged native result" }], details };
+      },
+    };
+    const model = { ...controlledModel(), api: "openai-responses", compat: { supportsOpenAIGrammarTools: true } } as ReturnType<typeof controlledModel>;
+    for (const included of [true, false]) {
+      let delivered: any[] = [], created = false, bound = false;
+      let local!: Awaited<ReturnType<typeof bind>>;
+      const host = controlledPi(root, { models: [model],
+        extensions: included ? [{ resolvedPath: publicPath, tools: new Map([["apply_patch", { definition: patch }]]) }] : [],
+        async bind() { expect(created).toBe(true); bound = true; local = await bind(host.loaderInputs[0].extensionFactories); },
+        async prompt(session) {
+          expect(bound).toBe(true);
+          const integration = await local.tools.get("head_plan")!.execute("integration", { action: "beginIntegration", expectedRevision: 0 },
+            undefined, undefined, { sessionManager: session.sessionManager });
+          expect(integration.isError).not.toBe(true);
+          expect(host.loaderInputs[0].additionalExtensionPaths).toEqual([path.resolve(import.meta.dirname, "..")]);
+          if (included) {
+            const wrapped = delivered.find(tool => tool.name === "apply_patch")!;
+            expect(session.active).toContain("apply_patch");
+            for (const name of ["parameters", "constrainedSampling", "renderCall", "renderResult"] as const) expect(wrapped[name]).toBe(patch[name]);
+            const result = await wrapped.execute("allowed", { patch: "*** Begin Patch\n*** Add File: product.md\n+owned\n*** End Patch\n" },
+              undefined, undefined, { cwd: root, model });
+            expect(result).toEqual({ content: [{ type: "text", text: "unchanged native result" }], details: { changes: [{ kind: "added", path: "product.md" }] } });
+            expect(readFileSync(path.join(root, "product.md"), "utf8")).toBe("owned\n");
+            expect(() => wrapped.execute("outside", { patch: "*** Begin Patch\n*** Add File: other.md\n+no\n*** End Patch\n" },
+              undefined, undefined, { cwd: root, model })).toThrow("write reservation");
+            expect(existsSync(path.join(root, "other.md"))).toBe(false);
+          } else {
+            expect(delivered.map(tool => tool.name)).not.toContain("apply_patch");
+            expect(session.active).toEqual(expect.arrayContaining(["edit", "write"]));
+          }
+          session.messages.push({ role: "assistant", content: [{ type: "text", text: "checked" }], stopReason: "stop" });
+        },
+      });
+      const create = host.factories.createSession;
+      host.factories.createSession = async input => {
+        expect(host.sessions).toHaveLength(0); expect(bound).toBe(false);
+        delivered = input!.customTools!; created = true;
+        expect(delivered.map(tool => tool.name).includes("apply_patch")).toBe(included);
+        return create(input);
+      };
+      const executor = createPiExecutor({ factories: host.factories });
+      const head = new HeadAttachment(`public-patch-${included}`, root, {
+        writes: ["product.md"], config: loadPitakoConfig(load), executor,
+      });
+      head.claim("patch-instance", root);
+      const outcome = await fixture.acquire(executor.start({ instanceId: "patch-instance",
+        role: controlledRole, cwd: root, task: "controlled registration", head, target: { model: "fixture/selected" }, signal: new AbortController().signal }));
+      expect(outcome).toMatchObject({ status: "completed", result: "checked" });
+      await outcome.session!.dispose();
+      await head.close();
+      expect(created).toBe(true); expect(bound).toBe(true);
+      expect(host.sessions[0]!.events).toEqual(["bind", "session_shutdown", "dispose"]);
+    }
+  }));

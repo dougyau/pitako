@@ -1,5 +1,3 @@
-import { stubExternalFactories } from "./fixtures/offline.ts";
-stubExternalFactories();
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, spyOn, test } from "bun:test";

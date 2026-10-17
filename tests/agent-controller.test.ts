@@ -1,5 +1,3 @@
-import { stubExternalFactories } from "./fixtures/offline.ts";
-stubExternalFactories();
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -9,14 +7,14 @@ import { bindBackgroundOwner, clearBackgroundOwner, spawnBackground, setBackgrou
 import { createLiveHandle } from "../extensions/agent/live.ts";
 import { clearObservations, publishObservation } from "../extensions/agent/observe.ts";
 import { runAgentInstance, type Attempt } from "../extensions/agent/run.ts";
-import { beginTeamEvaluation, retireTeamEvaluation } from "../extensions/team.ts";
+import { beginTeamEvaluation, retireTeamEvaluation, teamEvaluationForSession } from "../extensions/team.ts";
 import { agentFixtureOwnership } from "./fixtures/agent-fixture-ownership.ts";
 import { queryHistory } from "../extensions/agent/history-query.ts";
 import { ownedDispatch } from "../extensions/agent/dispatch.ts";
 import pitako from "../extensions/index.ts";
 import agentInstance from "../extensions/agent/index.ts";
 import * as controllerModule from "../extensions/agent/controller.ts";
-import * as codexModule from "../extensions/codex.ts";
+import profilePolicy from "../extensions/profile-policy.ts";
 import * as bridgeModule from "../extensions/agent/bridge/broker.ts";
 import { connect } from "../extensions/agent/bridge/client.js";
 
@@ -47,7 +45,7 @@ function setup(sessionId = "coordinator") {
   return { root, owner, controller, load: { userConfigPath: config, env: { PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR } } };
 }
 
-for (const mode of ["replacement", "shutdown", "captured-failure"] as const) {
+for (const mode of ["replacement", "shutdown", "codex-failure"] as const) {
 test(`packaged ${mode} fences bridge reads and joins ordinary native control throughout held retirement`, fixture.ownedCase(`bridge ${mode}`, async () => {
   const { root, load } = setup();
   process.env.PI_OFFLINE = "1";
@@ -63,10 +61,7 @@ test(`packaged ${mode} fences bridge reads and joins ordinary native control thr
     },
     getFlag(name: string) { return name === "pitako-agent-bridge" ? bridgeRoot : undefined; },
     getAllTools() { return ["read", "edit", "write", "apply_patch"].map(name => ({ name })); },
-    getActiveTools() {
-      if (failNext) { failNext = false; throw Error("fixture captured upstream failed"); }
-      return activeTools;
-    },
+    getActiveTools() { return activeTools; },
     setActiveTools(tools: string[]) { activeTools = tools; }, getSessionName() { return "pitako:coding"; },
     setSessionName() {}, sendMessage() {} };
   const ctx = { cwd: root, hasUI: false, mode: "rpc", isIdle: () => true,
@@ -82,10 +77,13 @@ test(`packaged ${mode} fences bridge reads and joins ordinary native control thr
   const bridgeCapture = spyOn(bridgeModule, "createAgentBridge").mockImplementation((...args) => {
     bridgeStarts++; return originalBridge(...args);
   });
-  const capturedStartup = spyOn(codexModule, "registerCodexTools").mockImplementation(() => async () => {
-    if (failNext) { failNext = false; throw Error("fixture captured upstream failed"); }
-  });
-  const factories = new Map([["./extensions/index.ts", pitako], ["./extensions/agent/index.ts", agentInstance]]);
+  const factories = new Map<string, Function>([
+    ["./extensions/index.ts", pitako], ["./extensions/agent/index.ts", agentInstance],
+    ["./node_modules/pi-codex-tools/index.ts", (api: any) => {
+      api.on("session_start", () => { if (failNext) { failNext = false; throw Error("fixture external startup failed"); } });
+    }],
+    ["./extensions/profile-policy.ts", profilePolicy],
+  ]);
   for (const entry of JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).pi.extensions) {
     const factory = factories.get(entry);
     if (factory) { extensions.push({ handlers: new Map() }); factory(pi as never); }
@@ -145,7 +143,7 @@ test(`packaged ${mode} fences bridge reads and joins ordinary native control thr
         await new Promise<void>(resolve => setImmediate(resolve));
       }
     })();
-    failNext = mode === "captured-failure";
+    failNext = mode === "codex-failure";
     let finished = false;
     transition = (mode === "shutdown" ? emit("session_shutdown") : start())
       .then(() => { finished = true; });
@@ -153,8 +151,8 @@ test(`packaged ${mode} fences bridge reads and joins ordinary native control thr
     await expect(client.list()).rejects.toThrow();
     expect(() => view.input(selection, { intent: "query", text: "obsolete mutation" })).toThrow();
     expect(() => view.cancel(selection)).toThrow();
-    // For captured-failure this is post-failure inside the SAME handler, not a later handler.
-    expect(failNext).toBe(false);
+    // The external entry has not run while Pitako still owns retirement.
+    expect(failNext).toBe(mode === "codex-failure");
     expect(finished).toBe(false);
     expect(bridgeStarts).toBe(1);
     await new Promise<void>(resolve => setImmediate(resolve));
@@ -172,9 +170,9 @@ test(`packaged ${mode} fences bridge reads and joins ordinary native control thr
     // Keep the observer active through all remaining foreground reconciliation.
     await new Promise<void>(resolve => setImmediate(resolve));
     observing = false; await observer;
-    expect(bridgeStarts).toBe(mode === "replacement" ? 2 : 1);
+    expect(bridgeStarts).toBe(mode === "shutdown" ? 1 : 2);
     expect(effects).toBe(1);
-    if (mode === "replacement") {
+    if (mode !== "shutdown") {
       const fresh = await connect(descriptor, { expectedSessionId: "coordinator" });
       try {
         await expect(connect(descriptor, { expectedSessionId: "coordinator", resume: lease })).rejects.toMatchObject({ code: "lease_expired" });
@@ -187,7 +185,7 @@ test(`packaged ${mode} fences bridge reads and joins ordinary native control thr
     }
     expect(activeTools).toContain("apply_patch");
     expect(activeTools).not.toContain("edit"); expect(activeTools).not.toContain("write");
-    if (mode === "captured-failure") expect(errors).toMatchObject([{ event: "session_start", error: "fixture captured upstream failed" }]);
+    if (mode === "codex-failure") expect(errors).toMatchObject([{ event: "session_start", error: "fixture external startup failed" }]);
     else expect(errors).toEqual([]);
     console.log("BRIDGE_PACKAGED_MUTATION_FENCE", JSON.stringify({ mode, effects, bridgeStarts, attempts, admissions,
       profile: activeTools, error: errors, heldDispatchAndMutationJoined: true, observedThroughRemainder: true }));
@@ -196,7 +194,7 @@ test(`packaged ${mode} fences bridge reads and joins ordinary native control thr
     observing = false; await observer;
     await client?.disconnect();
     await emit("session_shutdown");
-    capturedStartup.mockRestore(); controllerCapture.mockRestore(); bridgeCapture.mockRestore();
+    controllerCapture.mockRestore(); bridgeCapture.mockRestore();
     expect(readdirSync(bridgeRoot)).toEqual([]);
   }
 }));
@@ -436,10 +434,10 @@ test(`same-session startup fences ${role} agent_spawn while controlled external 
   const codexHold = new Promise<void>(resolve => { releaseCodex = resolve; });
   const dispatchHold = new Promise<void>(resolve => { releaseDispatch = resolve; });
   let holdNextStartup = false;
-  const captureCodex = spyOn(codexModule, "registerCodexTools").mockImplementation(pi => {
-    return async () => {
-      if (holdNextStartup) { holdNextStartup = false; await codexHold; }
-    };
+  let codexStarted!: () => void;
+  const codexStart = new Promise<void>(resolve => { codexStarted = resolve; });
+  const controlledCodex = (api: any) => api.on("session_start", async () => {
+    if (holdNextStartup) { holdNextStartup = false; codexStarted(); await codexHold; }
   });
   const controllers: ReturnType<typeof createAgentController>[] = [];
   const create = controllerModule.createAgentController;
@@ -467,7 +465,12 @@ test(`same-session startup fences ${role} agent_spawn while controlled external 
       setActiveTools() {}, getSessionName: () => "pitako:coding", setSessionName() {}, sendMessage() {} };
     const ctx = { cwd: root, hasUI: false, isIdle: () => true,
       sessionManager: { getSessionId: () => "same-session", getSessionFile: () => path.join(root, "coordinator.jsonl"), getEntries: () => [] } };
-    pitako(pi as never); agentInstance(pi as never);
+    const factories = new Map<string, Function>([["./extensions/index.ts", pitako],
+      ["./node_modules/pi-codex-tools/index.ts", controlledCodex],
+      ["./extensions/profile-policy.ts", profilePolicy], ["./extensions/agent/index.ts", agentInstance]]);
+    for (const entry of JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).pi.extensions)
+      factories.get(entry)?.(pi);
+
     const emit = async (type: string) => {
       for (const handler of handlers.get(type) ?? []) await handler({ type }, ctx);
     };
@@ -506,22 +509,24 @@ test(`same-session startup fences ${role} agent_spawn while controlled external 
     newerRebind = emit("session_start").then(() => { newerJoined = true; });
     await Promise.resolve(); await Promise.resolve();
     expect(newerJoined).toBe(false); // abort request alone does not settle the held callback
-    releaseDispatch(); await dispatch; await newerRebind;
+    releaseDispatch(); await dispatch; await codexStart; await newerRebind;
     expect(await status()).toEqual({ workers: [] });
     expect(starts).toBe(0);
     expect(joined).toBe(false);
     const newestController = controllers.at(-1)!;
-    expect(await spawn("older startup still held")).toMatchObject({
-      isError: true, details: { error: "Dispatch cancelled before admission" },
-    });
+    // Only Codex is held: both own phases have settled and admission is open.
+    const whileCodex = await spawn("external startup still held");
+    expect(whileCodex).toMatchObject({ isError: false, details: { status: "running" } });
+    await workerStarted;
     releaseCodex(); await rebind;
     expect(controllers.at(-1)).toBe(newestController);
+    const freshStarted = new Promise<void>(resolve => { started = resolve; });
     const fresh = await spawn("fresh authorized spawn");
     expect(fresh).toMatchObject({ details: { status: "running", dispatchPhase: "preflight" }, isError: false });
-    await workerStarted;
+    await freshStarted;
     const freshView = controllers.at(-1)!.openView();
     expect(freshView.list().items.map(row => row.id)).toContain((fresh.details as { instanceId: string }).instanceId);
-    expect(starts).toBe(1);
+    expect(starts).toBe(2);
     await freshView.close();
     for (const finish of finishes) finish();
     await emit("session_shutdown");
@@ -532,7 +537,7 @@ test(`same-session startup fences ${role} agent_spawn while controlled external 
     await Promise.allSettled([stale, dispatch, rebind, newerRebind]);
     await cleanup?.();
     await view?.close();
-    captureController.mockRestore(); captureCodex.mockRestore();
+    captureController.mockRestore();
   }
 }));
 }
@@ -555,10 +560,7 @@ for (const { event, failUpstream } of [
         const handlers = extensions.at(-1)!.handlers;
         handlers.set(name, [...handlers.get(name) ?? [], handler]);
       },
-      getFlag() {}, getAllTools() { return [{ name: "read" }]; }, getActiveTools() {
-        if (failNextUpstream) { failNextUpstream = false; throw new Error("fixture upstream startup failed"); }
-        return ["read"];
-      },
+      getFlag() {}, getAllTools() { return [{ name: "read" }]; }, getActiveTools() { return ["read"]; },
       setActiveTools() {}, getSessionName() { return "pitako:coding"; }, setSessionName() {}, sendMessage() {} };
     const ctx = { cwd: root, hasUI: true, isIdle: () => true,
       sessionManager: { getSessionId: () => "coordinator", getEntries: () => [] },
@@ -570,8 +572,12 @@ for (const { event, failUpstream } of [
       controllers.push(controller);
       return controller;
     });
-    const factories = new Map([
+    const factories = new Map<string, Function>([
       ["./extensions/index.ts", pitako],
+      ["./node_modules/pi-codex-tools/index.ts", (api: any) => api.on("session_start", () => {
+        if (failNextUpstream) { failNextUpstream = false; throw new Error("fixture upstream startup failed"); }
+      })],
+      ["./extensions/profile-policy.ts", profilePolicy],
       ["./extensions/agent/index.ts", agentInstance],
     ]);
     const manifest = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
@@ -635,6 +641,7 @@ for (const { event, failUpstream } of [
       let settled = false;
       failNextUpstream = failUpstream;
       transition = emit(event).then(() => { settled = true; });
+      expect(teamEvaluationForSession("coordinator", false)).toBeUndefined();
       expect(() => resolveOwnedLive(target, "coordinator")).toThrow("foreground owner");
       expect(() => view!.list()).toThrow("retired");
       expect(() => view!.detail(worker.instanceId)).toThrow("retired");
@@ -680,3 +687,145 @@ for (const { event, failUpstream } of [
     }
   }));
 }
+
+
+for (const successor of ["session_start", "session_shutdown", "uncertain-close"] as const) {
+  test(`retained own retirement fences overlapping ${successor} after live handles are cleared`, fixture.ownedCase(successor, async () => {
+    const { root } = setup();
+    const sessionId = `retained-${successor}-${path.basename(root)}`;
+    const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    const failed = Promise.withResolvers<void>(), bridgeClosing = Promise.withResolvers<void>(), bridgeRelease = Promise.withResolvers<void>();
+    const handlers = new Map<string, Function[]>(), controllers: ReturnType<typeof createAgentController>[] = [];
+    const pi = { registerFlag() {}, registerCommand() {}, registerTool() {},
+      getFlag: (name: string) => successor === "uncertain-close" && name === "pitako-agent-bridge" ? path.join(root, "bridge") : undefined,
+      on(type: string, handler: Function) { handlers.set(type, [...handlers.get(type) ?? [], handler]); },
+      getAllTools: () => [{ name: "read" }], getActiveTools: () => ["read"], setActiveTools() {},
+      getSessionName: () => "pitako:coding", setSessionName() {}, sendMessage() {} };
+    const ctx = { cwd: root, mode: "rpc", hasUI: false, isIdle: () => true,
+      sessionManager: { getSessionId: () => sessionId, getEntries: () => [] } };
+    const create = controllerModule.createAgentController;
+    const capture = spyOn(controllerModule, "createAgentController").mockImplementation((...args) => {
+      const controller = create(...args); controllers.push(controller);
+      if (controllers.length === 1) {
+        const settle = controller.settle;
+        controller.settle = async () => {
+          await settle(); entered.resolve(); await release.promise;
+          // Only a synthetic observation failure: the real resources above have settled.
+          if (successor === "uncertain-close") { failed.resolve(); throw new Error("controlled uncertain own close"); }
+        };
+      }
+      return controller;
+    });
+    const bridge = spyOn(bridgeModule, "createAgentBridge").mockImplementation(() => ({
+      ready: Promise.resolve(), revoke() {},
+      async settle() { bridgeClosing.resolve(); await bridgeRelease.promise; },
+    }) as never);
+    pitako(pi as never); profilePolicy(pi as never);
+    const emit = async (type: string) => { for (const handler of handlers.get(type) ?? []) await handler({ type }, ctx); };
+    const pending: Promise<unknown>[] = [];
+    try {
+      await emit("session_start");
+      const oldView = controllers[0]!.openView();
+      let firstDone = false, nextDone = false;
+      const first = emit("session_start").finally(() => { firstDone = true; }); pending.push(first); void first.catch(() => {});
+      expect(() => oldView.list()).toThrow("retired");
+      await entered.promise;
+      const next = emit(successor === "session_shutdown" ? successor : "session_start").finally(() => { nextDone = true; });
+      pending.push(next); void next.catch(() => {});
+      await Promise.resolve(); await Promise.resolve();
+      expect(firstDone).toBe(false); expect(nextDone).toBe(false); expect(controllers).toHaveLength(1);
+      const blocked = ownedDispatch(ctx as never, undefined, () => true, async (_signal, check) => { check(); return "bad"; });
+      await expect(blocked).rejects.toThrow("cancelled");
+      expect(await ownedDispatch({ ...ctx, sessionManager: { getSessionId: () => `independent-${sessionId}` } } as never,
+        undefined, () => true, async (_signal, check) => { check(); return "independent"; })).toBe("independent");
+      release.resolve();
+      if (successor === "uncertain-close") {
+        await failed.promise; await bridgeClosing.promise;
+        // One rejected close cannot conclude either event while another started close is held.
+        await Promise.resolve(); await Promise.resolve();
+        expect(firstDone).toBe(false); expect(nextDone).toBe(false);
+      }
+      bridgeRelease.resolve();
+      const results = await Promise.allSettled([first, next]);
+      if (successor === "uncertain-close") {
+        expect(results.map(result => result.status)).toEqual(["rejected", "rejected"]);
+        await expect(emit("session_start")).rejects.toThrow("Foreground retirement");
+        await expect(emit("session_shutdown")).rejects.toThrow("Foreground retirement");
+        expect(controllers).toHaveLength(1);
+        await expect(ownedDispatch(ctx as never, undefined, () => true, async (_signal, check) => { check(); })).rejects.toThrow("cancelled");
+      } else {
+        expect(results.map(result => result.status)).toEqual(["fulfilled", "fulfilled"]);
+        expect(controllers).toHaveLength(successor === "session_start" ? 2 : 1);
+        expect(await ownedDispatch(ctx as never, undefined, () => true, async (_signal, check) => { check(); return "open"; })).toBe("open");
+      }
+      await oldView.close();
+    } finally {
+      release.resolve(); bridgeRelease.resolve(); await Promise.allSettled(pending);
+      await emit("session_shutdown").catch(error => { if (successor !== "uncertain-close") throw error; });
+      capture.mockRestore(); bridge.mockRestore();
+    }
+  }));
+}
+
+test("partial own publication retires all new authority before releasing its lease; native errors remain separate",
+  fixture.ownedCase("partial publication cleanup", async () => {
+    const { root } = setup();
+    const ready = Promise.withResolvers<void>(), closing = Promise.withResolvers<void>(), closeEntered = Promise.withResolvers<void>();
+    const controllers: ReturnType<typeof createAgentController>[] = [];
+    const entries: Array<{ entry: string; hooks: Map<string, Function[]> }> = [];
+    const errors: Array<{ entry: string; error: unknown }> = [], statuses = new Map<string, string>();
+    const bridgeEntered = Promise.withResolvers<void>();
+    let active = ["read"], bridgeStarts = 0, revokes = 0, closes = 0, finalWrites = 0;
+    const create = controllerModule.createAgentController;
+    const capture = spyOn(controllerModule, "createAgentController").mockImplementation((...args) => {
+      const controller = create(...args); controllers.push(controller); return controller;
+    });
+    const bridge = spyOn(bridgeModule, "createAgentBridge").mockImplementation(() => {
+      const first = ++bridgeStarts === 1; bridgeEntered.resolve();
+      return { ready: first ? ready.promise : Promise.resolve(), revoke() { revokes++; },
+        async settle() { closes++; if (first) { closeEntered.resolve(); await closing.promise; } } } as never;
+    });
+    const pi = { registerFlag() {}, registerCommand() {}, registerTool() {},
+      getFlag: (name: string) => name === "pitako-agent-bridge" ? path.join(root, "bridge") : undefined,
+      on(type: string, handler: Function) { const hooks = entries.at(-1)!.hooks; hooks.set(type, [...hooks.get(type) ?? [], handler]); },
+      getAllTools: () => ["read", "edit", "write"].map(name => ({ name })), getActiveTools: () => active,
+      setActiveTools(names: string[]) { active = names; }, getSessionName: () => "pitako:coding", setSessionName() {}, sendMessage() {} };
+    const ctx = { cwd: root, mode: "rpc", hasUI: true, isIdle: () => true,
+      sessionManager: { getSessionId: () => `partial-${path.basename(root)}`, getEntries: () => [] },
+      ui: { notify() {}, setStatus(key: string, text?: string) { if (text) statuses.set(key, text); else statuses.delete(key); } } };
+    const external = new Error("controlled external failure"), publication = new Error("controlled bridge readiness failure");
+    const factories = new Map<string, Function>([["./extensions/index.ts", pitako],
+      ["./node_modules/pi-codex-tools/index.ts", (api: any) => api.on("session_start", () => { throw external; })],
+      ["./extensions/profile-policy.ts", (api: any) => profilePolicy({ ...api, setActiveTools(names: string[]) { finalWrites++; pi.setActiveTools(names); } })]]);
+    for (const entry of JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).pi.extensions) {
+      const factory = factories.get(entry); if (!factory) continue;
+      entries.push({ entry, hooks: new Map() }); factory(pi);
+    }
+    const emit = async (type: string) => {
+      for (const item of entries) for (const handler of item.hooks.get(type) ?? []) {
+        try { await handler({ type }, ctx); } catch (error) { errors.push({ entry: item.entry, error }); }
+      }
+    };
+    let transition: Promise<void> | undefined;
+    try {
+      transition = emit("session_start");
+      // Publication has reached the owned bridge, but its readiness is not yet settled.
+      await bridgeEntered.promise;
+      const partial = controllers[0]!.openView();
+      ready.reject(publication); await closeEntered.promise;
+      expect(() => partial.list()).toThrow("retired");
+      expect(statuses.has("pitako.agents")).toBe(false);
+      expect(revokes).toBe(1); expect(closes).toBe(1); expect(finalWrites).toBe(0);
+      await expect(ownedDispatch(ctx as never, undefined, () => true, async (_signal, check) => { check(); })).rejects.toThrow("cancelled");
+      closing.resolve(); await transition;
+      expect(errors).toEqual([{ entry: "./extensions/index.ts", error: publication },
+        { entry: "./node_modules/pi-codex-tools/index.ts", error: external }]);
+      expect(finalWrites).toBe(0);
+      await emit("session_start");
+      expect(controllers).toHaveLength(2); expect(bridgeStarts).toBe(2); expect(finalWrites).toBe(1);
+      const fresh = controllers[1]!.openView(); expect(fresh.list().items).toEqual([]); await fresh.close(); await partial.close();
+    } finally {
+      ready.resolve(); closing.resolve(); await transition; await emit("session_shutdown");
+      capture.mockRestore(); bridge.mockRestore();
+    }
+  }));

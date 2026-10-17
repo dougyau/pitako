@@ -1,5 +1,3 @@
-import { stubExternalFactories } from "./fixtures/offline.ts";
-stubExternalFactories();
 import { expect, test } from "bun:test";
 import { workerHandoff, teamWorkerStatus } from "../extensions/agent/background.ts";
 import { firstTeamReservation } from "../extensions/team.ts";

@@ -27,8 +27,7 @@ describe("stack configuration", () => {
     };
     const expected = [
       `./${stack.pitakoExtension}`,
-      // Codex is physically required, but registered by the foreground factory.
-      ...stack.required.filter(({ id }) => id !== "pi-codex-tools").map((extension) => `./${extension.entry}`),
+      ...stack.required.map((extension) => `./${extension.entry}`),
     ];
     expect(manifest.pi.extensions).toEqual(expected);
     const rooted = (name: string) => `${path.sep}${name}${path.sep}`;
@@ -37,7 +36,9 @@ describe("stack configuration", () => {
       expect(entry.includes(rooted("home"))).toBe(false);
       expect(entry.includes(rooted("Users"))).toBe(false);
     }
-    expect(manifest.dependencies["pi-lsp-client"]).toBe(stack.required[0]?.spec);
+    const lsp = stack.required.find(({ id }) => id === "pi-lsp-client");
+    if (!lsp) throw new Error("pi-lsp-client is missing from the required stack");
+    expect(manifest.dependencies["pi-lsp-client"]).toBe(lsp.spec);
     expect(manifest.dependencies["@vndv/pi-codegraph"]).toBe("0.1.10");
     expect(manifest.dependencies["@colbymchenry/codegraph"]).toBe("1.6.0");
     expect(stack.required.find(({ id }) => id === "@vndv/pi-codegraph")).toMatchObject({
@@ -77,7 +78,7 @@ describe("stack configuration", () => {
       entry: "node_modules/pi-web-access/dist/index.js",
       tools: ["web_search", "fetch_content", "source_check", "get_search_content", "web_enable"],
     });
-    expect(stack.required.at(-1)).toEqual({
+    expect(stack.required.find(({ id }) => id === "pi-codex-tools")).toEqual({
       id: "pi-codex-tools", spec: "pi-codex-tools@0.3.0",
       entry: "node_modules/pi-codex-tools/index.ts", tools: ["apply_patch"],
     });
@@ -98,7 +99,7 @@ describe("stack configuration", () => {
       prepareRuntime(root, { PATH: "" });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      expect(message).toContain('Required extension "pi-lsp-client"');
+      expect(message).toContain('Required extension "pi-codex-tools"');
       expect(message).toContain("bun install");
       const homePrefix = ["", "home", ""].join("/");
       expect(message.includes(homePrefix)).toBe(false);

@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import { processGroupClosed } from "./gates.ts";
 import { spawn } from "node:child_process";
 import { constants as osConstants } from "node:os";
@@ -252,7 +253,7 @@ export function managedTools(loader: DefaultResourceLoader, producer: ManagedPro
   ];
   const extensions = loader.getExtensions().extensions;
   const patchOwners = extensions.filter(extension => extension.tools.has("apply_patch"));
-  const knownEntry = realpathSync(new URL("../extensions/index.ts", import.meta.resolve("pi-codex-tools")).pathname);
+  const knownEntry = realpathSync(fileURLToPath(new URL("../index.ts", import.meta.resolve("pi-codex-tools"))));
   if (patchOwners.length === 1 && realpathSync(patchOwners[0]!.resolvedPath) === knownEntry) {
     definitions.push(patchOwners[0]!.tools.get("apply_patch")!.definition);
   }

@@ -47,7 +47,7 @@ ACP is the only compressor; `pi-codex-compaction` is not loaded. Use `compress`,
 
 Pitako's ACP factory defaults to `{ delegate: false, autoUpdate: false, toolBashDefaultTimeout: 0 }`. ACP does not add a default timeout to bash calls; explicit call timeouts still apply. Explicit `~/.pi/acp.json` and project `.pi/acp.json` override these defaults, with project settings winning. They can enable delegates or updates, or set `enabled:false`. Preserve user files. The factory reads the master switch from `process.cwd()`; runtime options use `ctx.cwd`. A different child cwd does not change the factory's master-switch location. Children cannot use Pitako orchestration, but explicit ACP configuration can enable ACP delegates.
 
-ACP loads before Hermes, and the official Codex entry loads before Pitako policy, once each in main and SDK child sessions. The Codex entry invokes upstream install telemetry. Disable it with `PI_OFFLINE=1` or Pi's `enableInstallTelemetry:false` setting.
+The manifest starts with early lifecycle, the independent official Codex entry, then late profile policy; ACP remains before Hermes. An excluded or absent Codex entry leaves coding `edit`/`write` available. Children load only the Pitako package root; parent filters are not automatically inherited and loader deduplication is not assumed. Managed Head requires exactly one canonical public-entry patch registration. The Codex entry invokes upstream install telemetry. Disable it with `PI_OFFLINE=1` or Pi's `enableInstallTelemetry:false` setting.
 
 ## Load when it applies
 
