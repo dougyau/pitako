@@ -115,6 +115,13 @@ describe("Pitako resources and policy", () => {
     expect(manifest.pi.prompts).toContain("./prompts");
   });
 
+  test("agent adapter does not physically resolve host-provided SDK peers", () => {
+    const source = readFileSync(path.join(packageRoot(), "extensions/agent/pi.ts"), "utf8");
+    // Git installs omit peers: only public imports can use Pi's virtual modules.
+    expect(source).not.toMatch(/(?:import\.meta|require)\.resolve\(\s*["']@earendil-works\/pi-/);
+    expect(source).not.toContain("./core/defaults.js");
+  });
+
   test("profile guidance reaches the provider prompt without changing direct tool access", async () => {
     const foreground = profileHarness();
     await foreground.start();

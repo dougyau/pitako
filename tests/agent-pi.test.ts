@@ -46,7 +46,7 @@ test("activation preserves auth classification and explicit, per-model, global a
     model, { model: "fixture/selected" });
   expect(level).toBe("medium");
   await activateTarget({ ...session, settingsManager: undefined }, model, { model: "fixture/selected" });
-  expect(level).toBe(DEFAULT_THINKING_LEVEL);
+  expect(level).toBe("medium");
 });
 
 test("construction selects offline runtime, role resources and child tools before prompt; disposal retires identity once",
@@ -197,7 +197,7 @@ test("fallback after an owned mutation continues on one controlled session and r
       selectedModel: "fixture/fallback", fallbackOccurred: true, appliedReasoning: DEFAULT_THINKING_LEVEL,
     } });
     expect(f.host.sessions).toHaveLength(1);
-    expect(activations).toEqual(["xhigh", DEFAULT_THINKING_LEVEL]);
+    expect(activations).toEqual(["xhigh", "medium"]);
     expect(f.host.sessions[0]!.prompts).toHaveLength(2);
     expect(f.host.sessions[0]!.prompts[1]).not.toBe("original work");
     expect(f.host.sessions[0]!.events).toEqual(["bind", "session_shutdown", "dispose"]);

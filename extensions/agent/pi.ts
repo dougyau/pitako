@@ -28,14 +28,8 @@ import { submitSchema, type NativeTurn } from "../architecture/types.ts";
 import { isConsultation } from "./consultation.ts";
 import { ManagedProducer, managedTools, managedGuard } from "./head/managed-tools.ts";
 
-// Package entry does not re-export this. Import the file next to the resolved entry.
-export let DEFAULT_THINKING_LEVEL: ThinkingLevel;
-const sdkDefaultsReady = import(
-  new URL("./core/defaults.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href,
-).then((defaults: { DEFAULT_THINKING_LEVEL: ThinkingLevel }) => {
-  DEFAULT_THINKING_LEVEL = defaults.DEFAULT_THINKING_LEVEL;
-  return defaults;
-});
+// Pi's default when no setting exists. Host-provided peers need not exist on disk.
+export const DEFAULT_THINKING_LEVEL: ThinkingLevel = "medium";
 
 // A stable registered definition is captured by native wrappers. Authority belongs to
 // the originating prompt, never whichever turn happens to be active on this session.
@@ -442,14 +436,13 @@ export async function activateTarget(
         setActiveToolsByName: (names) => session.setActiveToolsByName!(names),
       });
     }
-    const defaults = await sdkDefaultsReady;
     // setModel keeps the previous level when settings have no default.
     const settings = session.settingsManager;
     session.setThinkingLevel(
       thinkingLevelFor(target.reasoning)
         ?? settings?.getModelThinkingLevel(model.provider, model.id)
         ?? settings?.getDefaultThinkingLevel()
-        ?? defaults.DEFAULT_THINKING_LEVEL,
+        ?? DEFAULT_THINKING_LEVEL,
     );
     return undefined;
   } catch (error) {
