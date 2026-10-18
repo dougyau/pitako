@@ -4,6 +4,8 @@ import assert from "node:assert/strict";
 import { on } from "node:events";
 import { connect } from "../../extensions/agent/bridge/client.js";
 
+assert.equal(process.versions.bun, undefined, "Reader must run in native Node, not Bun");
+
 const [descriptor, owner, id, toolError] = process.argv.slice(2);
 const client = await connect(descriptor, { expectedSessionId: owner });
 const detail = await client.publicDetail(id);
