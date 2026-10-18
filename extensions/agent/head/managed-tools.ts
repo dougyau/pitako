@@ -1,7 +1,6 @@
 import { fileURLToPath } from "node:url";
-import { processGroupClosed } from "./gates.ts";
+import { ownProcess } from "./owned-process.ts";
 import { spawn } from "node:child_process";
-import { constants as osConstants } from "node:os";
 import { existsSync, lstatSync, realpathSync } from "node:fs";
 import path from "node:path";
 import type { TSchema } from "typebox";
@@ -11,7 +10,7 @@ import {
   type BashOperations, type DefaultResourceLoader, type ExtensionFactory, type ToolDefinition, type SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { parseApplyPatch } from "pi-codex-tools";
-import { AgentClosureError } from "../closure.ts";
+import { AgentClosureError, hasUnknownClosure, joinedClosureObservation } from "../closure.ts";
 import { toolEffect } from "../effects.ts";
 import { contains } from "./graph.ts";
 import { AdmissionInventory, digest, type Contribution } from "./inventory.ts";
@@ -34,44 +33,8 @@ export const foregroundBash: BashOperations = {
     const child = spawn("bash", ["--noprofile", "--norc", "-c", command], {
       cwd, env, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"],
     });
-    let failure: unknown, timedOut = false;
-    let killTimer: ReturnType<typeof setTimeout> | undefined;
-    const kill = (signal: NodeJS.Signals) => {
-      try {
-        if (child.pid && process.platform !== "win32") process.kill(-child.pid, signal);
-        else child.kill(signal);
-      } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") failure ??= new AgentClosureError([error], "managed bash cancellation"); }
-    };
-    const cancel = () => {
-      kill("SIGTERM");
-      killTimer ??= setTimeout(() => kill("SIGKILL"), 250);
-    };
-    const data = (bytes: Buffer) => { try { options.onData(bytes); } catch (error) { failure ??= error; cancel(); } };
-    child.stdout.on("data", data);
-    child.stderr.on("data", data);
-    child.on("error", error => { failure ??= error; });
-    const timeout = options.timeout === undefined ? undefined : setTimeout(() => { timedOut = true; cancel(); }, options.timeout * 1000);
-    options.signal?.addEventListener("abort", cancel, { once: true });
-    if (options.signal?.aborted) cancel();
-    try {
-      // close, unlike exit/tool result/abort receipt, includes the owned stdio handles.
-      const exitCode = await new Promise<number | null>(resolve => child.once("close", (code, signal) =>
-        resolve(code ?? (signal ? 128 + (osConstants.signals[signal] ?? 0) : null))));
-      if (child.pid && process.platform !== "win32" && !processGroupClosed(child.pid)) {
-        cancel();
-        throw new AgentClosureError([new Error("owned process group closure unknown")], "foreground bash");
-      }
-      if (failure) throw failure;
-      if (options.signal?.aborted) throw new Error("aborted");
-      if (timedOut) throw new Error(`timeout:${options.timeout}`);
-      return { exitCode };
-    } finally {
-      if (timeout) clearTimeout(timeout);
-      if (killTimer) clearTimeout(killTimer);
-      options.signal?.removeEventListener("abort", cancel);
-      child.stdout.removeListener("data", data);
-      child.stderr.removeListener("data", data);
-    }
+    return ownProcess(child, { onData: options.onData, signal: options.signal,
+      timeoutMs: options.timeout === undefined ? undefined : options.timeout * 1000 });
   },
 };
 
@@ -181,7 +144,8 @@ export class ManagedProducer {
       throw new Error("managed file tools cannot mutate Git metadata");
     }
   }
-  wrap<P extends TSchema, D, S>(definition: ToolDefinition<P, D, S>): ToolDefinition<P, D, S> {
+  wrap<P extends TSchema, D, S>(definition: ToolDefinition<P, D, S>,
+    createDefinition?: (observeUnknown: (error: unknown) => void) => ToolDefinition<P, D, S>): ToolDefinition<P, D, S> {
     return { ...definition, execute: (id, params, signal, onUpdate, ctx) => {
       const revision = this.check();
       if (this.slot) throw new Error("managed product operation slot is occupied");
@@ -195,6 +159,14 @@ export class ManagedProducer {
       this.assignment.reserve(this); // Synchronous admission before preflight or native suspension.
       const callbacks = new Set<Promise<unknown>>();
       const failures: unknown[] = [];
+      let settled = false;
+      const observeUnknown = (error: unknown) => {
+        if (!hasUnknownClosure(error)) return;
+        failures.push(error);
+        const observation = joinedClosureObservation([error]);
+        // Capture before native output finalization can replace the executor's error.
+        lease.unknown(String(error), observation && { observe: () => settled ? observation.observe() : "unknown" });
+      };
       const combined = AbortSignal.any([this.signal, this.controller.signal, ...(signal ? [signal] : [])]);
       const pending = Promise.resolve().then(async () => {
         this.check(revision);
@@ -207,7 +179,8 @@ export class ManagedProducer {
         let value: Awaited<ReturnType<typeof definition.execute>> | undefined;
         let threw = false, failure: unknown;
         try {
-          value = await definition.execute(id, params, combined, onUpdate ? update => {
+          const native = createDefinition?.(observeUnknown) ?? definition;
+          value = await native.execute(id, params, combined, onUpdate ? update => {
             // Accepting a callback also owns any async work it returned, even if its public type is void.
             try {
               const value: unknown = onUpdate(update);
@@ -221,22 +194,27 @@ export class ManagedProducer {
           threw = true; failure = error;
         } finally {
           while (callbacks.size) await Promise.allSettled([...callbacks]);
-          const source = this.binding.source();
-          this.assignment.inventory.contributed(before, { ...source, ...(source.kind === "consultation" ? { observedRevision: revision } : { effectiveRevision: revision }),
-            toolCallId: id, toolName: definition.name }, outcome, this.binding.writes);
+          try {
+            const source = this.binding.source();
+            this.assignment.inventory.contributed(before, { ...source, ...(source.kind === "consultation" ? { observedRevision: revision } : { effectiveRevision: revision }),
+              toolCallId: id, toolName: definition.name }, outcome, this.binding.writes);
+          } catch (error) { failures.push(error); }
         }
-        const allFailures = [...(threw ? [failure] : []), ...failures];
-        if (allFailures.some(error => error instanceof AgentClosureError)) throw new AgentClosureError(allFailures, "managed native operation");
+        const allFailures = [...new Set([...(threw ? [failure] : []), ...failures])];
+        if (allFailures.some(hasUnknownClosure)) throw new AgentClosureError(allFailures, "managed native operation",
+          joinedClosureObservation(allFailures));
         if (failures.length) throw new AggregateError(allFailures, "managed callback failed after settlement");
         if (threw) throw failure;
         return value!;
       });
       this.slot = pending;
       void pending.then(() => {
+        settled = true;
         lease.release();
         this.slot = undefined; this.assignment.release(this);
       }, error => {
-        if (error instanceof AgentClosureError) { this.assignment.unknown(error); lease.unknown(String(error)); }
+        if (error instanceof AgentClosureError) { this.assignment.unknown(error); lease.unknown(String(error), error.observation); }
+        settled = true;
         lease.release();
         this.slot = undefined; this.assignment.release(this);
       });
@@ -248,16 +226,23 @@ export class ManagedProducer {
 /** Preserve the exact loaded patch definition (schema, grammar, renderers), not a name-only substitute. */
 export function managedTools(loader: DefaultResourceLoader, producer: ManagedProducer): NativeDefinition[] {
   const root = producer.assignment.root;
+  const bash = createBashToolDefinition(root, { operations: foregroundBash });
+  const managedBash = producer.wrap(bash, observeUnknown => createBashToolDefinition(root, { operations: {
+    async exec(command, cwd, options) {
+      try { return await foregroundBash.exec(command, cwd, options); }
+      catch (error) { observeUnknown(error); throw error; }
+    },
+  } }));
   const definitions: NativeDefinition[] = [
-    createWriteToolDefinition(root), createEditToolDefinition(root), createBashToolDefinition(root, { operations: foregroundBash }),
+    producer.wrap(createWriteToolDefinition(root)), producer.wrap(createEditToolDefinition(root)), managedBash,
   ];
   const extensions = loader.getExtensions().extensions;
   const patchOwners = extensions.filter(extension => extension.tools.has("apply_patch"));
   const knownEntry = realpathSync(fileURLToPath(new URL("../index.ts", import.meta.resolve("pi-codex-tools"))));
   if (patchOwners.length === 1 && realpathSync(patchOwners[0]!.resolvedPath) === knownEntry) {
-    definitions.push(patchOwners[0]!.tools.get("apply_patch")!.definition);
+    definitions.push(producer.wrap(patchOwners[0]!.tools.get("apply_patch")!.definition));
   }
-  return [...definitions.map(definition => producer.wrap(definition)),
+  return [...definitions,
     createReadToolDefinition(root), createGrepToolDefinition(root), createFindToolDefinition(root), createLsToolDefinition(root)];
 }
 

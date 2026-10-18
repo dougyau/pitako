@@ -1,12 +1,13 @@
 import { expect, spyOn, test } from "bun:test";
 import { preparedTool } from "./fixtures/background-dispatch.ts";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import * as childProcess from "node:child_process";
-import { createCodingTools, type AgentBeforeSettleEventResult, type ExtensionAPI, type ExtensionContext, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import { EventEmitter } from "node:events";
+import { createCodingTools, SessionManager, type AgentBeforeSettleEventResult, type ExtensionAPI, type ExtensionContext, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import agentExtension from "../extensions/agent/index.ts";
 import { bindBackgroundOwner, clearBackgroundOwner, deliverWorkerResults, setBackgroundExecutor, workerResult, teamWorkerResult } from "../extensions/agent/background.ts";
 import { beginTeamEvaluation, recordPlanTeamWork, retireTeamEvaluation, firstTeamReservation } from "../extensions/team.ts";
@@ -21,6 +22,10 @@ import { currentWorkspace } from "../extensions/board/workspace.ts";
 import { openExecutionPlan, planFile, readLedgerTeamHolds } from "../extensions/workflow.ts";
 import { principalLeases, reserveOperation } from "../extensions/agent/head/operation-leases.ts";
 import { AgentClosureError } from "../extensions/agent/closure.ts";
+import { ownProcess } from "../extensions/agent/head/owned-process.ts";
+import { HeadAttachment } from "../extensions/agent/head/runtime.ts";
+import { headExtension } from "../extensions/agent/head/tools.ts";
+import { loadPitakoConfig } from "../extensions/roles/load.ts";
 import { classifyProviderFailure } from "../extensions/agent/fallback.ts";
 
 // Always-on, synchronous stderr markers survive a blocked event loop. Keep the
@@ -86,6 +91,272 @@ async function bind(factories: ExtensionFactory[], appendEntry: ExtensionAPI["ap
   for (const factory of factories) await factory(pi);
   return { tools, events };
 }
+
+// A private process and clock boundary; no real PID, global timers or late cleanup.
+function controlledBashProcess() {
+  const child = Object.assign(new EventEmitter(), { pid: 4242, stdout: new EventEmitter(), stderr: new EventEmitter() });
+  let now = 0, absent = false, probes = 0;
+  const signals: Array<{ signal: NodeJS.Signals; at: number }> = [];
+  const timers = new Map<ReturnType<typeof setTimeout>, { at: number; callback: () => void }>();
+  const host = {
+    kill(_pid: number, signal: NodeJS.Signals | 0) {
+      if (signal === 0) {
+        probes++;
+        if (absent) throw Object.assign(new Error("gone"), { code: "ESRCH" });
+      } else signals.push({ signal, at: now });
+      return true;
+    },
+    schedule(callback: () => void, ms: number) {
+      const timer = {} as ReturnType<typeof setTimeout>;
+      timers.set(timer, { at: now + ms, callback }); return timer;
+    },
+    clear(timer: ReturnType<typeof setTimeout>) { timers.delete(timer); },
+  };
+  return { child, host, signals, get pending() { return timers.size; }, get probes() { return probes; },
+    disappear() { absent = true; },
+    close() { child.stdout.emit("close"); child.stderr.emit("close"); child.emit("close", 0, null); },
+    advance(ms: number) {
+      const target = now + ms;
+      for (;;) {
+        const next = [...timers].sort((a, b) => a[1].at - b[1].at)[0];
+        if (!next || next[1].at > target) break;
+        now = next[1].at; timers.delete(next[0]); next[1].callback();
+      }
+      now = target;
+    },
+  };
+}
+
+test("registered Bash retains both invocation leases through textual conversion and recovers only original late closure", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "pitako-bash-recovery-"));
+  const processes = { a: controlledBashProcess(), b: controlledBashProcess() };
+  const principal = await bind([pi => principalLeases(pi, { exec(command, _cwd, options) {
+    const owned = processes[command as keyof typeof processes];
+    return ownProcess(owned.child as unknown as childProcess.ChildProcess, options, owned.host);
+  } })], () => {});
+  const ctx = { cwd: root, sessionManager: { getSessionId: () => "principal", getSessionFile: () => undefined } };
+  const runs: Promise<unknown>[] = [];
+  const controllers: AbortController[] = [];
+  try {
+    for (const id of ["a", "b"] as const) {
+      expect(await principal.events.get("tool_call")![0]!({ toolName: "bash", toolCallId: id, input: {} }, ctx)).toBeUndefined();
+      // Model the runner's error-to-text conversion outside the registered definition.
+      const controller = new AbortController(); controllers.push(controller);
+      const run = principal.tools.get("bash").execute(id, { command: id }, controller.signal, undefined, ctx)
+        .then(() => { throw new Error("unknown process unexpectedly succeeded"); }, (error: unknown) => {
+          expect(error).toBeInstanceOf(AgentClosureError);
+          return { content: [{ type: "text", text: String(error) }], details: undefined, isError: true };
+        });
+      runs.push(run);
+    }
+    // Abort owns one TERM/KILL/deadline sequence even without original close.
+    for (const controller of controllers) controller.abort();
+    for (const owned of Object.values(processes)) owned.advance(1500);
+    const results = await Promise.all(runs);
+    for (const [index, id] of ["a", "b"].entries()) {
+      const result = results[index] as { content: Array<{ text: string }>; details: undefined; isError: boolean };
+      expect(result.content[0].text).toContain("closure unknown");
+      await principal.events.get("tool_result")![0]!({ toolCallId: id, ...result }, ctx);
+    }
+    expect(() => reserveOperation(root, "writer")).toThrow("unknown");
+    const admit = () => principal.events.get("tool_call")![0]!({ toolName: "bash", toolCallId: "fresh", input: {} }, ctx);
+    expect(await admit()).toMatchObject({ block: true });
+    processes.a.disappear(); processes.a.close();
+    expect(await admit()).toMatchObject({ block: true });
+    expect(() => reserveOperation(root, "checkpoint")).toThrow("unknown"); // b owns its distinct proofs.
+    const probes = processes.a.probes;
+    processes.a.child.emit("close", 0, null); processes.a.advance(5000);
+    expect(processes.a.pending).toBe(0);
+    expect(processes.a.probes).toBe(probes); // Late events do not restart polling.
+    processes.b.disappear(); processes.b.close();
+    expect(await admit()).toBeUndefined();
+    expect(() => reserveOperation(root, "checkpoint")).toThrow("active");
+    await principal.events.get("tool_result")![0]!({ toolCallId: "fresh" }, ctx);
+    const fresh = reserveOperation(root, "checkpoint"); fresh.release();
+    expect(processes.a.probes).toBe(probes); // a was removed, not reobserved forever.
+    for (const owned of Object.values(processes)) expect(owned.signals.map(value => value.signal)).toEqual(["SIGTERM", "SIGKILL"]);
+  } finally {
+    for (const controller of controllers) controller.abort();
+    for (const owned of Object.values(processes)) { owned.disappear(); owned.close(); owned.advance(2000); }
+    await Promise.allSettled(runs);
+    for (const id of ["a", "b", "fresh"]) await principal.events.get("tool_result")![0]!({ toolCallId: id }, ctx);
+    reserveOperation(root, "checkpoint").release();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("registered Bash outer proof waits execute callbacks; user_bash retains only its executor lease", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "pitako-bash-callback-"));
+  const owned = controlledBashProcess(), callback = gate(), abort = new AbortController(), errorReported = gate();
+  const principal = await bind([pi => principalLeases(pi, { exec(_command, _cwd, options) {
+    const operation = ownProcess(owned.child as unknown as childProcess.ChildProcess, options, owned.host);
+    void operation.catch(() => errorReported.resolve());
+    return operation;
+  } })], () => {});
+  const ctx = { cwd: root, sessionManager: { getSessionId: () => "callbacks", getSessionFile: () => undefined } };
+  let run: Promise<unknown> | undefined;
+  try {
+    await principal.events.get("tool_call")![0]!({ toolName: "bash", toolCallId: "callback", input: {} }, ctx);
+    run = principal.tools.get("bash").execute("callback", { command: "callback" }, abort.signal, () => callback.promise, ctx)
+      .catch((error: unknown) => error);
+    abort.abort(); owned.advance(1500);
+    // Let the executor register its original error, while execute still owns the callback.
+    await errorReported.promise;
+    owned.disappear(); owned.close();
+    expect(() => reserveOperation(root, "checkpoint")).toThrow("unknown");
+    callback.resolve();
+    expect(await run).toBeInstanceOf(AgentClosureError);
+    await principal.events.get("tool_result")![0]!({ toolCallId: "callback", details: { closure: "unknown" } }, ctx);
+    reserveOperation(root, "checkpoint").release();
+
+    const user = controlledBashProcess(), userAbort = new AbortController();
+    const local = await bind([pi => principalLeases(pi, { exec(_command, _cwd, options) {
+      return ownProcess(user.child as unknown as childProcess.ChildProcess, options, user.host);
+    } })], () => {});
+    const hook = await local.events.get("user_bash")![0]!({}, ctx);
+    const pending = hook.operations.exec("user", root, { signal: userAbort.signal, onData() {} }).catch((error: unknown) => error);
+    try {
+      userAbort.abort(); user.advance(1500);
+      const error = await pending;
+      expect(error).toBeInstanceOf(AgentClosureError);
+      expect(() => reserveOperation(root, "writer")).toThrow("unknown");
+      user.disappear(); user.child.emit("exit", 0, null);
+      expect(() => reserveOperation(root, "writer")).toThrow("unknown");
+      user.close();
+      reserveOperation(root, "checkpoint").release(); // No exterior hook exists for user_bash.
+      expect(user.pending).toBe(0);
+    } finally {
+      userAbort.abort(); user.disappear(); user.close(); user.advance(1500);
+      await pending;
+    }
+  } finally {
+    abort.abort(); callback.resolve(); owned.disappear(); owned.close(); owned.advance(2000);
+    await run;
+    await principal.events.get("tool_result")![0]!({ toolCallId: "callback" }, ctx);
+    reserveOperation(root, "checkpoint").release();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("late gate closure recovers physical admission, never its unknown native receipt or failed Head authority", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "pitako-gate-recovery-")), owned = controlledBashProcess(), entered = gate();
+  const config = loadPitakoConfig({ userConfigPath: path.join(root, "absent.toml"), env: { PI_CODING_AGENT_DIR: root } });
+  const head = new HeadAttachment("gate-recovery", root, { writes: ["product"], config,
+    executor: { async start() { throw new Error("no leaves in this fixture"); } },
+    verification: { durationMs: 60000, invocations: 2, captureBytes: 4096, artifactRoots: [], scratchRoots: [] } });
+  head.claim("head", root);
+  const binding = head.bind("head"), manager = SessionManager.create(root, path.join(root, ".pitako", "sessions"));
+  const local = await bind([headExtension(head, binding, () => manager)], () => {});
+  const call = (name: string, input: object) => local.tools.get(name).execute(name, input, undefined);
+  // Inject only this gate instance's owned process/clock boundary, not global timers or kill.
+  Object.assign(head.gates!, { io: { write: writeSync, groupClosed: () => false, processHost: owned.host,
+    spawn() { entered.resolve(); return owned.child; } } });
+  let closureJoined = false;
+  try {
+    const barrier = (await call("head_plan", { action: "beginIntegration", expectedRevision: 0 })).details;
+    const handle = (await call("head_gates", { action: "request", epoch: barrier.epoch, expectedRevision: 0,
+      coverage: "controlled local closure", commands: [{ id: "local", shell: "controlled", cwd: ".", env: {}, timeoutMs: 100 }] })).details;
+    expect(handle.state).toBe("preparing");
+    await entered.promise;
+    owned.child.stdout.emit("data", Buffer.from("published stdout"));
+    owned.child.stderr.emit("data", Buffer.from("published stderr"));
+    owned.advance(1600);
+    const offered = await head.boundary(binding, { type: "agent_before_settle", entries: [], continue: false, outcome: "completed",
+      context: { canContinue: false, contextEntries: [], contextMessages: [], llmMessages: [], pendingMessages: [] } }, manager);
+    const draft = offered?.entries?.find(entry => entry.type === "custom_message" && entry.customType === "pitako.head.gates");
+    if (draft?.type !== "custom_message") throw new Error("missing native gate draft");
+    const receipt = manager.appendCustomMessageEntry(draft.customType, draft.content, draft.display, draft.details);
+    head.gates!.drafts(binding, manager.getBranch());
+    const before = head.gates!.outcomes(binding)[0]!;
+    expect(before).toMatchObject({ outcome: "unknown", closure: "unknown", complete: false });
+    expect(head.gates!.status(binding, handle.runId).receipt).toBe(receipt);
+    expect(head.gates!.status(binding, handle.runId).stale).toBe(false);
+    expect(head.gates!.verification(binding, manager.getBranch())).toEqual([]);
+    const artifacts = path.join(root, ".pitako", "gates");
+    const bytes = () => readdirSync(artifacts, { recursive: true, encoding: "utf8" }).filter(file => file.endsWith(".log"))
+      .map(file => [file, readFileSync(path.join(artifacts, file)).toString("hex")]);
+    const publishedBytes = bytes(), publishedReceipt = JSON.stringify(manager.getBranch().find(entry => entry.id === receipt));
+    const probes = owned.probes, signals = [...owned.signals];
+    owned.child.stdout.emit("data", Buffer.from("late stdout")); owned.child.stderr.emit("data", Buffer.from("late stderr"));
+    owned.advance(5000);
+    expect(owned.probes).toBe(probes); expect(owned.signals).toEqual(signals); expect(owned.pending).toBe(0);
+    expect(() => reserveOperation(root, "writer")).toThrow();
+    owned.disappear(); owned.child.emit("exit", 0, null);
+    expect(() => reserveOperation(root, "checkpoint")).toThrow();
+    owned.close();
+    reserveOperation(root, "checkpoint").release();
+    expect(head.gates!.status(binding, handle.runId).stale).toBe(false);
+    expect(head.gates!.verification(binding, manager.getBranch())).toEqual([]);
+    // Independent physical admission works, while the old managed assignment remains failed.
+    reserveOperation(root, "writer").release();
+    const independent = new HeadAttachment("independent", root); await independent.close();
+    expect(head.gates!.outcomes(binding)[0]).toEqual(before);
+    expect(bytes()).toEqual(publishedBytes);
+    expect(JSON.stringify(manager.getBranch().find(entry => entry.id === receipt))).toBe(publishedReceipt);
+    expect(head.gates!.verification(binding, manager.getBranch())).toEqual([]);
+    expect((await call("head_plan", { action: "read" })).details.verificationCandidates).toEqual([]);
+    await expect(call("head_plan", { action: "reopen", epoch: barrier.epoch })).rejects.toBeInstanceOf(AgentClosureError);
+    await expect(call("head_finish", { status: "completed", epoch: barrier.epoch, summary: "must refuse", verification: [receipt], limits: [] }))
+      .rejects.toBeInstanceOf(AgentClosureError);
+    await expect(head.close()).rejects.toBeInstanceOf(AgentClosureError);
+    closureJoined = true;
+    expect(owned.pending).toBe(0);
+  } finally {
+    owned.disappear(); owned.close(); owned.advance(5000);
+    if (!closureJoined) await head.close().catch(error => { if (!(error instanceof AgentClosureError)) throw error; });
+    reserveOperation(root, "checkpoint").release();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("admission reobserves only overlapping unknown obligations and release cannot resurrect terminal leases", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "pitako-lease-proof-"));
+  const a = path.join(root, "a"), b = path.join(root, "b");
+  let closed = false, probes = 0;
+  const old = reserveOperation(a, "writer");
+  old.unknown("process", { observe() { probes++; if (!closed) throw new Error("observation unavailable"); return "closed"; } });
+  try {
+    old.release();
+    expect(() => reserveOperation(a, "writer")).toThrow("unknown");
+    reserveOperation(b, "writer").release();
+    expect(probes).toBe(1);
+    closed = true;
+    const fresh = reserveOperation(a, "checkpoint"); fresh.release(); fresh.release(); fresh.unknown("too late");
+    old.unknown("late callback"); old.release();
+    reserveOperation(a, "checkpoint").release();
+    expect(probes).toBe(2);
+    const global = reserveOperation(undefined, "writer");
+    global.unknown("unscoped", { observe: () => closed ? "closed" : "unknown" });
+    closed = false;
+    expect(() => reserveOperation(b, "writer")).toThrow("unknown");
+    closed = true;
+    reserveOperation(b, "checkpoint").release();
+  } finally {
+    closed = true;
+    reserveOperation(root, "checkpoint").release();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+const mixedLeaseCase = "generic and mixed closure obligations cannot borrow a process proof";
+test(mixedLeaseCase, () => {
+  if (!process.env.PITAKO_MIXED_LEASE_HOST) {
+    console.log(execFileSync(process.execPath, ["test", import.meta.path, "--test-name-pattern", `^${mixedLeaseCase}$`], {
+      env: { ...process.env, PITAKO_MIXED_LEASE_HOST: "1", BUN_OPTIONS: "", NO_COLOR: "1", FORCE_COLOR: "0" },
+      encoding: "utf8", stdio: ["ignore", "pipe", "inherit"],
+    }));
+    return;
+  }
+  const root = mkdtempSync(path.join(tmpdir(), "pitako-mixed-lease-"));
+  const generic = reserveOperation(root, "writer"), mixed = reserveOperation(root, "writer");
+  generic.unknown("no owner capability"); generic.release();
+  mixed.unknown("observed process", { observe: () => "closed" });
+  mixed.unknown("another unobserved obligation"); mixed.release();
+  expect(() => reserveOperation(root, "writer")).toThrow("unknown");
+  expect(() => reserveOperation(root, "checkpoint")).toThrow("unknown");
+  // These intentional unknown reservations belong to this child host, not later tests.
+  console.log("MIXED_LEASE_RETAINED", root);
+});
 
 async function harness(options: { separateAgentDir?: boolean; headPolicy?: boolean; final?: "stop" | "error" | "aborted"; missingCost?: boolean; gitRepository?: boolean; headFallback?: boolean; ordinarySdk?: boolean;
   workerCreate?: { entered: ReturnType<typeof gate>; release: ReturnType<typeof gate> };

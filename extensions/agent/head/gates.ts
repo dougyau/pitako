@@ -6,6 +6,9 @@ import type { SessionManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { contains } from "./graph.ts";
 import { mutationGeneration, reserveOperation } from "./operation-leases.ts";
+import { AgentClosureError, hasUnknownClosure, joinedClosureObservation, type ClosureObservation } from "../closure.ts";
+import type { ManagedAssignment } from "./managed-tools.ts";
+import { ownProcess } from "./owned-process.ts";
 
 export interface VerificationGrantInput { durationMs: number; captureBytes: number; invocations: number; artifactRoots: string[]; scratchRoots: string[] }
 export const verificationSchema = Type.Optional(Type.Object({
@@ -46,6 +49,7 @@ interface GateRun {
 }
 interface GateOwner {
   assignmentId: string; executionRoot: string; signal: AbortSignal;
+  managed?: Pick<ManagedAssignment, "unknown">;
   check(binding: object): void; admitted(): void; own<T>(binding: object, operation: () => Promise<T>): Promise<T>;
   gateEpoch(binding: object): { epoch: string; revision: number };
   gateIdle(binding: object): void; gateChanged(): void; gateUnknown(reason: string): void;
@@ -81,7 +85,8 @@ export class OwnedGates {
   private expires: number;
   private grant: VerificationGrantInput;
   constructor(private owner: GateOwner, grant: VerificationGrantInput, private evidenceRoot?: string,
-    private io: { write: typeof writeSync; groupClosed(pid: number): boolean; leaderExit?(): void } = { write: writeSync, groupClosed: processGroupClosed }) {
+    private io: { write: typeof writeSync; groupClosed(pid: number): boolean; leaderExit?(): void;
+      close?: typeof closeSync; spawn?: typeof spawn; processHost?: Parameters<typeof ownProcess>[2] } = { write: writeSync, groupClosed: processGroupClosed }) {
     this.grant = validateVerification(grant);
     this.expires = Date.now() + grant.durationMs;
   }
@@ -128,20 +133,26 @@ export class OwnedGates {
   private noProcess(run: GateRun, error: unknown) {
     this.complete(run, { outcome: run.controller.signal.aborted || this.owner.signal.aborted ? "cancelled" : "no-process", closure: "released", diagnostic: String(error), commands: run.request.commands.map(c => ({ id: c.id, cwd: c.cwd, shell: c.shell, envKeys: Object.keys(c.env), state: "unrun", artifacts: [] })), bytes: 0, complete: false, stale: false });
   }
-  private complete(run: GateRun, value: Omit<GateEnvelope, "deliveryId" | "assignmentId" | "runId" | "candidate" | "requestDigest" | "coverage" | "limits" | "artifacts">) {
+  private complete(run: GateRun, value: Omit<GateEnvelope, "deliveryId" | "assignmentId" | "runId" | "candidate" | "requestDigest" | "coverage" | "limits" | "artifacts">,
+    observation?: ClosureObservation) {
     run.envelope = structuredClone({ ...value, deliveryId: randomUUID(), assignmentId: this.owner.assignmentId, runId: run.runId, candidate: run.candidate,
       requestDigest: hash(JSON.stringify(run.request)), coverage: run.request.coverage,
       guideDigest: run.guideDigest, artifacts: [...run.artifacts].map(([id, a]) => ({ id, bytes: a.bytes, tail: a.tail })),
       limits: ["POSIX cooperative process groups, not a sandbox or escaped/remote descendant confinement", "TERM then KILL after 250ms; closure observation bounded at 1500ms after cancellation", "No engine retries; selected commands only, manual obligations remain with Head and principal"] });
     run.phase = value.closure === "unknown" ? "unknown" : "closed";
     if (value.closure === "unknown") {
-      run.lease.unknown(value.diagnostic ?? "gate closure unknown"); this.owner.gateUnknown(value.diagnostic ?? "gate closure unknown");
+      const reason = value.diagnostic ?? "gate closure unknown";
+      run.lease.unknown(reason, observation);
+      // Recovering physical exclusion must not rehabilitate this assignment.
+      this.owner.managed?.unknown(new AgentClosureError([new Error(reason)], "owned gates"));
+      this.owner.gateUnknown(reason);
     } else run.lease.release();
     this.owner.gateChanged();
   }
   private async execute(run: GateRun) {
     const results: CommandResult[] = run.request.commands.map(c => ({ id: c.id, cwd: c.cwd, shell: c.shell, envKeys: Object.keys(c.env), state: "unrun", artifacts: [] }));
     let outcome: Outcome = "no-process", diagnostic: string | undefined, closure: "released" | "unknown" = "released", bytes = 0;
+    let observation: ClosureObservation | undefined, captureUnknown = false;
     try {
       this.check(run);
       if (process.platform === "win32") throw new Error("no POSIX owned process group support");
@@ -182,15 +193,16 @@ export class OwnedGates {
             }
             if (chunk.length !== data.length) throw new Error("gate capture cap exhausted");
           });
-          Object.assign(result, captured, { closedAt: Date.now() }); outcome = captured.state; diagnostic = captured.diagnostic;
-          if (captured.state === "unknown") closure = "unknown";
-          if (captured.state !== "passed") break;
-          this.check(run);
+          Object.assign(result, captured.result, { closedAt: Date.now() }); outcome = captured.result.state; diagnostic = captured.result.diagnostic;
+          if (outcome === "unknown") { closure = "unknown"; observation = captured.observation; }
         } finally {
-          for (const fd of fds) try { closeSync(fd); } catch (error) {
+          for (const fd of fds) try { (this.io.close ?? closeSync)(fd); } catch (error) {
+            captureUnknown = true;
             closure = "unknown"; outcome = "unknown"; diagnostic = `Capture descriptor closure unknown: ${error}`;
           }
         }
+        if (outcome !== "passed") break;
+        this.check(run);
       }
     } catch (error) {
       diagnostic = String(error);
@@ -200,50 +212,47 @@ export class OwnedGates {
     const stale = !!run.candidate && !this.current(run);
     if (outcome === "passed" && Date.now() >= run.deadlineAt) outcome = "timed-out";
     if (outcome === "passed" && stale) outcome = "incomplete";
-    this.complete(run, { outcome, closure, commands: results, diagnostic, bytes, complete: outcome === "passed", stale });
+    this.complete(run, { outcome, closure, commands: results, diagnostic, bytes, complete: outcome === "passed", stale },
+      captureUnknown ? undefined : observation);
   }
-  private command(run: GateRun, command: GateCommand, cwd: string, env: NodeJS.ProcessEnv,
-    capture: (stream: number, bytes: Buffer) => void): Promise<{ state: Outcome; exitCode: number | null; signal: string | null; diagnostic?: string }> {
-    return new Promise(resolve => {
-      const child = spawn("bash", ["--noprofile", "--norc", "-c", command.shell], { cwd, env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
-      let failure: unknown, cancelled = false, timedOut = false, settled = false;
-      let killTimer: ReturnType<typeof setTimeout> | undefined, closeTimer: ReturnType<typeof setTimeout> | undefined, groupTimer: ReturnType<typeof setInterval> | undefined;
-      const kill = (signal: NodeJS.Signals) => { try { if (child.pid) process.kill(-child.pid, signal); } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ESRCH") failure ??= e; } };
-      const finish = (state: Outcome, code: number | null, signal: string | null) => {
-        if (settled) return; settled = true; clearTimeout(deadline); if (killTimer) clearTimeout(killTimer); if (closeTimer) clearTimeout(closeTimer); if (groupTimer) clearInterval(groupTimer);
-        run.controller.signal.removeEventListener("abort", cancel); this.owner.signal.removeEventListener("abort", cancel);
-        resolve({ state, exitCode: code, signal, diagnostic: failure ? String(failure) : state === "unknown" ? "Owned process group/streams closure not proven; retained barrier and partial artifacts" : undefined });
-      };
-      const cancel = () => {
-        if (settled) return; cancelled = true; run.phase = "cancelling"; kill("SIGTERM");
-        killTimer ??= setTimeout(() => kill("SIGKILL"), 250);
-        closeTimer ??= setTimeout(() => finish("unknown", child.exitCode, child.signalCode), 1500);
-      };
-      run.activeDeadlineAt = Math.min(Date.now() + command.timeoutMs, run.deadlineAt);
-      const deadline = setTimeout(() => { timedOut = true; cancel(); }, Math.max(1, run.activeDeadlineAt - Date.now()));
-      run.controller.signal.addEventListener("abort", cancel, { once: true }); this.owner.signal.addEventListener("abort", cancel, { once: true });
-      child.stdout.on("data", (data: Buffer) => { if (settled) return; try { capture(0, data); } catch (e) { failure ??= e; cancel(); } });
-      child.stderr.on("data", (data: Buffer) => { if (settled) return; try { capture(1, data); } catch (e) { failure ??= e; cancel(); } });
-      child.on("error", e => { failure ??= e; });
-      for (const stream of [child.stdout, child.stderr]) stream.on("error", e => { failure ??= e; cancel(); });
-      child.once("exit", () => this.io.leaderExit?.());
-      child.once("close", (code, signal) => {
-        // close joins owned stdio; an exited leader alone is insufficient. Remaining group is unknown.
-        const groupAlive = child.pid ? !this.io.groupClosed(child.pid) : false;
-        const terminal = () => finish(failure ? child.pid ? "incomplete" : "no-process" : timedOut ? "timed-out" : cancelled ? "cancelled" : code === 0 ? "passed" : "failed", code, signal);
-        if (!groupAlive) { terminal(); return; }
-        // A leader may close its pipes while a group member remains. Terminate and observe,
-        // retaining the lease if the bounded observation cannot establish group closure.
-        // First allow terminal OS bookkeeping to settle. If a group still exists at the
-        // next observation, cancellation is an intervention, never a silent pass.
-        closeTimer ??= setTimeout(() => finish("unknown", code, signal), 1500);
-        groupTimer = setInterval(() => {
-          if (this.io.groupClosed(child.pid!)) { terminal(); return; }
-          failure ??= new Error("leader closed before owned group closure"); cancel();
-        }, 25);
-      });
-      if (run.controller.signal.aborted || this.owner.signal.aborted) cancel();
-    });
+  private async command(run: GateRun, command: GateCommand, cwd: string, env: NodeJS.ProcessEnv,
+    capture: (stream: number, bytes: Buffer) => void) {
+    const child = (this.io.spawn ?? spawn)("bash", ["--noprofile", "--norc", "-c", command.shell], { cwd, env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    const host = this.io.processHost ?? {
+      kill: (pid: number, signal: NodeJS.Signals | 0) => {
+        if (signal !== 0) return process.kill(pid, signal);
+        if (this.io.groupClosed(-pid)) throw Object.assign(new Error("owned group absent"), { code: "ESRCH" });
+        return true;
+      },
+      schedule: (callback: () => void, ms: number) => setTimeout(callback, ms),
+      clear: (timer: ReturnType<typeof setTimeout>) => clearTimeout(timer),
+    };
+    const timeout = new AbortController();
+    const signal = AbortSignal.any([run.controller.signal, this.owner.signal, timeout.signal]);
+    let timedOut = false, reported = false, captureFailure = false;
+    const cancelling = () => { run.phase = "cancelling"; };
+    signal.addEventListener("abort", cancelling, { once: true });
+    if (signal.aborted) cancelling();
+    run.activeDeadlineAt = Math.min(Date.now() + command.timeoutMs, run.deadlineAt);
+    const deadline = host.schedule(() => { timedOut = true; timeout.abort(); }, Math.max(1, run.activeDeadlineAt - Date.now()));
+    child.once("exit", () => { if (!reported) this.io.leaderExit?.(); });
+    let state: Outcome, diagnostic: string | undefined, observation: ClosureObservation | undefined;
+    try {
+      const result = await ownProcess(child, { signal, onData: (data, stream) => {
+        try { capture(stream, data); } catch (error) { captureFailure = true; cancelling(); throw error; }
+      } }, host);
+      state = result.exitCode === 0 ? "passed" : "failed";
+    } catch (error) {
+      if (hasUnknownClosure(error)) { state = "unknown"; observation = joinedClosureObservation([error]); }
+      else state = captureFailure ? "incomplete" : timedOut ? "timed-out" :
+        run.controller.signal.aborted || this.owner.signal.aborted ? "cancelled" : child.pid ? "incomplete" : "no-process";
+      diagnostic = String(error);
+    } finally {
+      reported = true;
+      host.clear(deadline);
+      signal.removeEventListener("abort", cancelling);
+    }
+    return { result: { state, exitCode: child.exitCode ?? null, signal: child.signalCode ?? null, diagnostic }, observation };
   }
   private run(binding: object, id: string) { this.owner.check(binding); const run = this.runs.get(id); if (!run || run.binding !== binding) throw new Error("unknown/foreign gate run"); return run; }
   status(binding: object, id: string) {

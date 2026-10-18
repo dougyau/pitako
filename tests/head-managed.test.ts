@@ -1,16 +1,82 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { execFileSync } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { closeSync, openSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
-import { createWriteToolDefinition, SessionManager, type ExtensionToolContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createBashToolDefinition, createWriteToolDefinition, DefaultResourceLoader, SessionManager, SettingsManager, type ExtensionToolContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { OwnedGates } from "../extensions/agent/head/gates.ts";
 import { reserveOperation } from "../extensions/agent/head/operation-leases.ts";
 import { AgentClosureError } from "../extensions/agent/closure.ts";
 import { AdmissionInventory, localGitEnv } from "../extensions/agent/head/inventory.ts";
 import { ManagedAssignment, ManagedProducer, foregroundBash, managedGuard, managedTools } from "../extensions/agent/head/managed-tools.ts";
+import { ownProcess } from "../extensions/agent/head/owned-process.ts";
+
+function controlledProcess() {
+  const child = Object.assign(new EventEmitter(), { pid: 4242, exitCode: null as number | null, signalCode: null as NodeJS.Signals | null,
+    stdout: new EventEmitter(), stderr: new EventEmitter() });
+  let now = 0, group: "visible" | "ESRCH" | "EPERM" = "visible", probes = 0;
+  const signals: Array<{ signal: NodeJS.Signals; at: number }> = [];
+  const timers = new Map<ReturnType<typeof setTimeout>, { at: number; callback: () => void }>();
+  const host = {
+    kill(_pid: number, signal: NodeJS.Signals | 0) {
+      if (signal === 0) {
+        probes++;
+        if (group !== "visible") throw Object.assign(new Error(group), { code: group });
+      } else signals.push({ signal, at: now });
+      return true;
+    },
+    schedule(callback: () => void, ms: number) {
+      const timer = {} as ReturnType<typeof setTimeout>;
+      timers.set(timer, { at: now + ms, callback }); return timer;
+    },
+    clear(timer: ReturnType<typeof setTimeout>) { timers.delete(timer); },
+  };
+  return { child: child as unknown as ChildProcess, stdout: child.stdout, stderr: child.stderr, host, signals,
+    get pending() { return timers.size; }, get probes() { return probes; },
+    get scheduled() { return [...timers.values()].map(timer => timer.callback); },
+    group(value: typeof group) { group = value; },
+    close(code = 0, signal: NodeJS.Signals | null = null) {
+      child.exitCode = code; child.signalCode = signal;
+      child.stdout.emit("close"); child.stderr.emit("close"); child.emit("close", code, signal);
+    },
+    advance(ms: number) {
+      const target = now + ms;
+      for (;;) {
+        const next = [...timers].sort((a, b) => a[1].at - b[1].at)[0];
+        if (!next || next[1].at > target) break;
+        now = next[1].at; timers.delete(next[0]); next[1].callback();
+      }
+      now = target;
+    },
+  };
+}
+
+function controlledGate(root: string, options: {
+  write?: typeof writeSync; close?: typeof closeSync; captureBytes?: number;
+} = {}) {
+  const process = controlledProcess(), binding = {}, entered = Promise.withResolvers<void>();
+  let operation: Promise<unknown> | undefined, starts = 0, exits = 0;
+  const gates = new OwnedGates({ assignmentId: "controlled-gates", executionRoot: root, signal: new AbortController().signal,
+    check() {}, admitted() {}, gateIdle() {}, gateUnknown() {}, gateChanged() {},
+    gateEpoch: () => ({ epoch: "epoch", revision: 0 }),
+    own<T>(_binding: object, run: () => Promise<T>) { const pending = run(); operation = pending; return pending; },
+  }, { durationMs: 60000, captureBytes: options.captureBytes ?? 65536, invocations: 1,
+    artifactRoots: [], scratchRoots: [] }, undefined, {
+    write: options.write ?? writeSync, close: options.close, groupClosed: () => false, processHost: process.host,
+    spawn: (() => { starts++; entered.resolve(); return process.child; }) as typeof import("node:child_process").spawn,
+    leaderExit() { exits++; },
+  });
+  return { process, gates, binding, entered: entered.promise, get starts() { return starts; }, get exits() { return exits; },
+    request(timeoutMs = 1000, commands = ["first", "later"]) { return gates.request(binding, { epoch: "epoch", expectedRevision: 0, coverage: "controlled ownership",
+      commands: commands.map(id => ({ id, shell: id, cwd: ".", env: {}, timeoutMs })) }); },
+    async result() { await operation; return gates.outcomes(binding)[0]!; },
+    async settle() { process.group("ESRCH"); process.close(); process.advance(5000); await operation; },
+  };
+}
 
 function hasUnknownClosure(error: unknown): boolean {
   return error instanceof AgentClosureError || error instanceof AggregateError && error.errors.some(hasUnknownClosure);
@@ -279,15 +345,398 @@ test("owned foreground bash waits for stream/cancel settlement and reports timeo
   }, () => abort.abort());
 }));
 
-test("unknown producer closure blocks new work while a known pre-start refusal does not", () => repository(async root => {
-  const assignment = new ManagedAssignment(root, [root]), managed = producer(assignment);
-  const failed = managed.wrap({ name: "write", label: "write", description: "unknown native closure", parameters: Type.Object({ path: Type.String() }),
-    async execute() { throw new AgentClosureError([new Error("unjoined resource")], "native"); } });
-  await expect(failed.execute("failed", { path: "clean" }, undefined, undefined, context(root))).rejects.toBeInstanceOf(AgentClosureError);
-  expect(() => assignment.assertIdle()).toThrow(AgentClosureError);
-  expect(() => producer(assignment).wrap(createWriteToolDefinition(root)).execute("new", { path: "clean", content: "no" }, undefined, undefined, context(root)))
-    .toThrow(AgentClosureError);
+test("process owner reobserves transient groups at 25 ms without intervention or false unknown", async () => {
+  const owned = controlledProcess();
+  const operation = ownProcess(owned.child, { onData() {} }, owned.host);
+  owned.close();
+  expect(owned.pending).toBe(1);
+  owned.advance(24);
+  expect(owned.signals).toEqual([]);
+  owned.group("ESRCH"); owned.advance(1);
+  expect(await operation).toEqual({ exitCode: 0 });
+  expect(owned.signals).toEqual([]);
+  expect(owned.pending).toBe(0);
+});
+
+test("process cancellation sends TERM once and KILL at 250 ms, holding original streams and close", async () => {
+  const owned = controlledProcess(), abort = new AbortController();
+  const operation = ownProcess(owned.child, { signal: abort.signal, onData() {}, timeoutMs: 100 }, owned.host);
+  const caught = operation.catch(error => error);
+  owned.child.emit("exit", 0, null);
+  abort.abort(); owned.stderr.emit("error", new Error("stream failed"));
+  expect(owned.signals).toEqual([{ signal: "SIGTERM", at: 0 }]);
+  owned.advance(249);
+  expect(owned.signals).toHaveLength(1);
+  owned.advance(1);
+  expect(owned.signals).toEqual([{ signal: "SIGTERM", at: 0 }, { signal: "SIGKILL", at: 250 }]);
+  owned.group("ESRCH");
+  let finished = false;
+  void caught.then(() => { finished = true; });
+  owned.advance(25); await Promise.resolve();
+  expect(finished).toBe(false); // Leader/group absence alone does not prove owned handles.
+  owned.stdout.emit("close"); owned.stderr.emit("close");
+  owned.advance(25); await Promise.resolve();
+  expect(finished).toBe(false);
+  owned.child.emit("close", null, "SIGKILL");
+  expect(await caught).toEqual(new Error("stream failed"));
+  expect(owned.pending).toBe(0);
+});
+
+test("persistent normal-close group intervenes, never silently succeeds, and retains its KILL timer", async () => {
+  const owned = controlledProcess();
+  const operation = ownProcess(owned.child, { onData() {} }, owned.host).catch(error => error);
+  owned.close(); owned.advance(25);
+  expect(owned.signals).toEqual([{ signal: "SIGTERM", at: 25 }]);
+  owned.advance(249); expect(owned.signals).toHaveLength(1);
+  owned.advance(1);
+  expect(owned.signals[1]).toEqual({ signal: "SIGKILL", at: 275 });
+  owned.group("ESRCH"); owned.advance(25);
+  const error = await operation;
+  expect(error).toBeInstanceOf(Error);
+  expect(error).not.toBeInstanceOf(AgentClosureError);
+  expect(error.message).toContain("remained after close");
+  expect(owned.pending).toBe(0);
+});
+
+test("unknown owner stops callbacks, polling and signals; late proof needs ESRCH, streams, original close and callbacks", async () => {
+  const owned = controlledProcess(), abort = new AbortController(), callback = Promise.withResolvers<void>();
+  let calls = 0, callbackClosed = false;
+  const operation = ownProcess(owned.child, { signal: abort.signal, onData() { calls++; return callback.promise; } }, owned.host)
+    .catch(error => error);
+  owned.stdout.emit("data", Buffer.from("accepted"));
+  abort.abort();
+  const stale = owned.scheduled;
+  owned.advance(1499);
+  expect(owned.pending).toBeGreaterThan(0);
+  owned.advance(1);
+  const error = await operation as AgentClosureError;
+  expect(error).toBeInstanceOf(AgentClosureError);
+  expect(owned.pending).toBe(0);
+  const probes = owned.probes, signals = [...owned.signals];
+  for (const callback of stale) callback(); // Even a callback already queued at the deadline is inert.
+  owned.stdout.emit("data", Buffer.from("discarded"));
+  owned.stderr.emit("error", new Error("late stream error"));
+  owned.child.emit("error", new Error("late process error"));
+  owned.child.emit("exit", 0, null);
+  owned.advance(5000);
+  expect(calls).toBe(1);
+  expect(owned.probes).toBe(probes);
+  expect(owned.signals).toEqual(signals);
+  expect(error.observation!.observe()).toBe("unknown");
+  owned.group("ESRCH"); owned.child.emit("close", 0, null);
+  expect(error.observation!.observe()).toBe("unknown");
+  owned.stdout.emit("close"); owned.stderr.emit("close");
+  expect(error.observation!.observe()).toBe("unknown");
+  callback.reject(new AgentClosureError([], "late callback obligation", { observe: () => callbackClosed ? "closed" : "unknown" }));
+  await callback.promise.catch(() => {});
+  expect(error.observation!.observe()).toBe("unknown");
+  callbackClosed = true;
+  owned.group("EPERM");
+  expect(error.observation!.observe()).toBe("unknown");
+  owned.group("visible");
+  expect(error.observation!.observe()).toBe("unknown");
+  owned.group("ESRCH");
+  expect(error.observation!.observe()).toBe("closed");
+  expect(owned.pending).toBe(0);
+});
+
+test("gates share transient group observation without intervention", () => temporaryRoot(async root => {
+  const h = controlledGate(root);
+  const handle = h.request(1000, ["first"]);
+  try {
+    await h.entered;
+    h.process.stdout.emit("data", Buffer.from("out")); h.process.stderr.emit("data", Buffer.from("err"));
+    h.process.close(); h.process.advance(24);
+    expect(h.starts).toBe(1);
+    expect(h.gates.status(h.binding, handle.runId).available).toBe(false);
+    expect(h.process.signals).toEqual([]);
+    h.process.group("ESRCH"); h.process.advance(1);
+    const envelope = await h.result();
+    expect(envelope.outcome).toBe("passed"); expect(envelope.closure).toBe("released");
+    expect(envelope.commands.map(command => command.state)).toEqual(["passed"]);
+    expect(envelope.artifacts.slice(0, 2).map(artifact => artifact.tail)).toEqual(["out", "err"]);
+    expect(h.starts).toBe(1);
+    expect(h.process.signals).toEqual([]); expect(h.process.pending).toBe(0);
+    reserveOperation(root, "writer").release();
+  } finally { await h.settle(); }
 }));
+
+test("gate normal-close intervention cannot silently pass or execute the next command", () => temporaryRoot(async root => {
+  const h = controlledGate(root);
+  h.request();
+  try {
+    await h.entered; h.process.close();
+    h.process.advance(25);
+    expect(h.process.signals).toEqual([{ signal: "SIGTERM", at: 25 }]);
+    h.process.advance(250);
+    expect(h.process.signals[1]).toEqual({ signal: "SIGKILL", at: 275 });
+    h.process.group("ESRCH"); h.process.advance(25);
+    const envelope = await h.result();
+    expect(envelope).toMatchObject({ outcome: "incomplete", closure: "released", complete: false });
+    expect(envelope.diagnostic).toContain("owned process group remained after close");
+    expect(envelope.commands.map(command => command.state)).toEqual(["incomplete", "unrun"]);
+    expect(h.starts).toBe(1); expect(h.process.pending).toBe(0);
+    expect(() => h.request()).toThrow("grant exhausted");
+    reserveOperation(root, "writer").release();
+  } finally { await h.settle(); }
+}));
+
+for (const deadline of [false, true]) test(`gates ${deadline ? "deadline" : "capture cap"} cancellation joins process proof and stops later commands without renewing grant`, () => temporaryRoot(async root => {
+  const h = controlledGate(root, { captureBytes: 4 });
+  const handle = h.request(100);
+  try {
+    await h.entered;
+    if (deadline) h.process.advance(100);
+    else h.process.stdout.emit("data", Buffer.from("too much output"));
+    const start = deadline ? 100 : 0;
+    expect(h.process.signals).toEqual([{ signal: "SIGTERM", at: start }]);
+    h.gates.cancel(h.binding, handle.runId);
+    h.process.advance(249); expect(h.process.signals).toHaveLength(1);
+    h.process.advance(1); expect(h.process.signals[1]).toEqual({ signal: "SIGKILL", at: start + 250 });
+    h.process.group("ESRCH");
+    h.process.child.emit("exit", null, "SIGKILL");
+    h.process.advance(25); await Promise.resolve();
+    expect(h.gates.status(h.binding, handle.runId).available).toBe(false);
+    h.process.close(137, "SIGKILL");
+    const envelope = await h.result();
+    expect(envelope.outcome).toBe(deadline ? "timed-out" : "incomplete");
+    expect(envelope.closure).toBe("released");
+    expect(envelope.commands.map(command => command.state)).toEqual([envelope.outcome, "unrun"]);
+    expect(envelope.bytes).toBe(deadline ? 0 : 4);
+    expect(h.starts).toBe(1); expect(h.process.pending).toBe(0);
+    reserveOperation(root, "checkpoint").release();
+    expect(() => h.request()).toThrow("grant exhausted");
+  } finally { await h.settle(); }
+}));
+
+test("unknown gate envelope and capture bytes stay immutable while original close alone recovers exclusion", () => temporaryRoot(async root => {
+  let writes = 0, closes = 0;
+  const h = controlledGate(root, {
+    write: ((...args: Parameters<typeof writeSync>) => { writes++; return writeSync(...args); }) as typeof writeSync,
+    close(fd) { closes++; closeSync(fd); },
+  });
+  const handle = h.request(100);
+  try {
+    await h.entered;
+    h.process.stdout.emit("data", Buffer.from("published")); h.process.stderr.emit("data", Buffer.from("diagnostic"));
+    h.process.advance(1600);
+    const envelope = await h.result(), before = JSON.stringify(envelope);
+    const reads = envelope.artifacts.map(a => h.gates.read(h.binding, handle.runId, a.id));
+    expect(envelope.outcome).toBe("unknown"); expect(envelope.closure).toBe("unknown");
+    expect(envelope.commands.map(command => command.state)).toEqual(["unknown", "unrun"]);
+    expect(h.starts).toBe(1); expect(writes).toBe(2); expect(closes).toBe(2); expect(h.process.pending).toBe(0);
+    const probes = h.process.probes, signals = [...h.process.signals];
+    h.process.stdout.emit("data", Buffer.from("late")); h.process.stderr.emit("data", Buffer.from("late"));
+    h.process.child.emit("exit", 0, null); h.process.advance(5000);
+    expect(h.exits).toBe(0); expect(writes).toBe(2);
+    expect(h.process.probes).toBe(probes); expect(h.process.signals).toEqual(signals);
+    expect(() => reserveOperation(root, "writer")).toThrow();
+    h.process.group("ESRCH"); h.process.stdout.emit("close"); h.process.stderr.emit("close");
+    expect(() => reserveOperation(root, "checkpoint")).toThrow(); // Needs original child close too.
+    h.process.child.emit("close", 0, null);
+    h.process.group("EPERM"); expect(() => reserveOperation(root, "writer")).toThrow();
+    h.process.group("ESRCH"); reserveOperation(root, "writer").release();
+    expect(JSON.stringify((await h.result()))).toBe(before);
+    expect(envelope.artifacts.map(a => h.gates.read(h.binding, handle.runId, a.id))).toEqual(reads);
+    expect(closes).toBe(2); expect(writes).toBe(2); expect(h.process.pending).toBe(0);
+  } finally { await h.settle(); reserveOperation(root, "checkpoint").release(); }
+}));
+
+const descriptorCase = "uncertain gate capture close is never retried or recovered by process proof";
+test(descriptorCase, async () => {
+  if (!process.env.PITAKO_CAPTURE_CLOSE_HOST) {
+    console.log(execFileSync(process.execPath, ["test", import.meta.path, "--test-name-pattern", `^${descriptorCase}$`], {
+      env: { ...process.env, PITAKO_CAPTURE_CLOSE_HOST: "1", BUN_OPTIONS: "", NO_COLOR: "1", FORCE_COLOR: "0" },
+      encoding: "utf8", stdio: ["ignore", "pipe", "inherit"],
+    }));
+    return;
+  }
+  const root = mkdtempSync(path.join(tmpdir(), "pitako-gate-descriptor-"));
+  let closes = 0;
+  const h = controlledGate(root, { close(fd) {
+    closeSync(fd); // Close only this fixture's owned descriptor before reporting uncertain close.
+    if (++closes === 1) throw new Error("local close observation lost");
+  } });
+  const handle = h.request();
+  try {
+    await h.entered; h.process.group("ESRCH"); h.process.close();
+    const envelope = await h.result(), before = JSON.stringify(envelope);
+    expect(envelope.outcome).toBe("unknown");
+    expect(envelope.diagnostic).toContain("Capture descriptor closure unknown");
+    expect(envelope.commands.map(command => command.state)).toEqual(["passed", "unrun"]);
+    expect(h.starts).toBe(1); expect(closes).toBe(2);
+    expect(() => reserveOperation(root, "writer")).toThrow();
+    h.process.close(); h.process.advance(5000);
+    expect(() => reserveOperation(root, "checkpoint")).toThrow();
+    expect(JSON.stringify(h.gates.outcomes(h.binding)[0])).toBe(before);
+    expect(h.gates.status(h.binding, handle.runId).closure).toBe("unknown");
+    expect(closes).toBe(2); expect(h.process.pending).toBe(0);
+  } finally {
+    await h.settle();
+    console.log("GATE_DESCRIPTOR_UNKNOWN_RETAINED", root);
+  }
+});
+
+const finalizationCase = "managed Bash preserves executor uncertainty when native output finalization replaces it";
+test(finalizationCase, async () => {
+  if (!process.env.PITAKO_MANAGED_FINALIZATION_HOST) {
+    console.log(execFileSync(process.execPath, ["test", import.meta.path, "--test-name-pattern", `^${finalizationCase}$`], {
+      env: { ...process.env, PITAKO_MANAGED_FINALIZATION_HOST: "1", BUN_OPTIONS: "", NO_COLOR: "1", FORCE_COLOR: "0" },
+      timeout: 20000, encoding: "utf8", stdio: ["ignore", "pipe", "inherit"],
+    }));
+    return;
+  }
+  // Private host: native output responses are controlled; unsupported synthetic obligations
+  // never escape into the suite's lease registry. No native process or output file is created.
+  const { OutputAccumulator } = await import(new URL("./core/tools/output-accumulator.js",
+    import.meta.resolve("@earendil-works/pi-coding-agent")).href);
+  for (const mode of ["physical", "callback", "missing", "mixed", "ordinary"]) await repository(async root => {
+    const assignment = new ManagedAssignment(root, [root]), managed = producer(assignment), owned = controlledProcess();
+    const abort = new AbortController(), entered = Promise.withResolvers<void>();
+    const finalizing = Promise.withResolvers<void>(), finalize = Promise.withResolvers<void>(), callback = Promise.withResolvers<void>();
+    const finalizationError = new Error("controlled native output finalization failed");
+    const ordinaryError = new Error("settled executor failed");
+    const missing = new AgentClosureError([], "executor obligation without proof");
+    let original: unknown, physical: AgentClosureError | undefined, callbackClosed = false;
+    const callbackError = mode === "callback"
+      ? new AgentClosureError([], "independent callback obligation", { observe: () => callbackClosed ? "closed" : "unknown" })
+      : new Error("settled callback failed");
+    const output = spyOn(OutputAccumulator.prototype, "closeTempFile").mockImplementation(async () => {
+      finalizing.resolve(); await finalize.promise; throw finalizationError;
+    });
+    const executor = spyOn(foregroundBash, "exec").mockImplementation(async (_command, _cwd, options) => {
+      entered.resolve();
+      try { await ownProcess(owned.child, options, owned.host); }
+      catch (error) {
+        physical = error as AgentClosureError;
+        original = mode === "missing" ? missing : mode === "mixed"
+          ? new AggregateError([error, missing], "mixed executor obligations") : error;
+        throw original;
+      }
+      original = ordinaryError; throw original;
+    });
+    const loader = new DefaultResourceLoader({ cwd: root, agentDir: root, settingsManager: SettingsManager.inMemory() });
+    const bash = managedTools(loader, managed).find(tool => tool.name === "bash")!;
+    const operation = bash.execute("finalization", { command: "controlled" }, abort.signal, () => callback.promise,
+      { ...context(root), sessionManager: SessionManager.inMemory(root) }).catch(error => error);
+    try {
+      await awaitEntered(entered.promise, operation);
+      if (mode === "ordinary") { owned.group("ESRCH"); owned.close(); }
+      else { abort.abort(); owned.advance(1500); }
+      await awaitEntered(finalizing.promise, operation);
+      if (mode !== "ordinary") {
+        expect(physical).toBeInstanceOf(AgentClosureError);
+        expect(physical!.observation!.observe()).toBe("unknown");
+        expect(() => reserveOperation(root, "writer")).toThrow("unknown");
+        owned.group("ESRCH"); owned.stdout.emit("close"); owned.stderr.emit("close");
+        expect(() => reserveOperation(root, "writer")).toThrow("unknown");
+        owned.child.emit("close", 0, null);
+        expect(physical!.observation!.observe()).toBe("closed");
+        expect(() => reserveOperation(root, "writer")).toThrow("unknown"); // Native finalization still owned.
+      }
+      finalize.resolve();
+      expect(() => reserveOperation(root, "checkpoint")).toThrow(); // Accepted callback still owned.
+      if (mode !== "ordinary") expect(() => reserveOperation(root, "writer")).toThrow("unknown");
+      callback.reject(callbackError);
+      const error = await operation;
+      expect(error).toBeInstanceOf(mode === "ordinary" ? AggregateError : AgentClosureError);
+      expect(error.errors).toContain(finalizationError);
+      expect(error.errors).toContain(callbackError);
+      if (mode !== "ordinary") {
+        expect(error.errors).toContain(original);
+        expect(() => assignment.assertWritable()).toThrow(AgentClosureError);
+      } else assignment.assertIdle();
+      if (["callback", "missing", "mixed"].includes(mode)) expect(() => reserveOperation(root, "writer")).toThrow("unknown");
+      callbackClosed = true;
+      if (mode === "missing" || mode === "mixed") {
+        expect(() => reserveOperation(root, "writer")).toThrow("unknown"); // Physical proof cannot discharge missing proof.
+      } else {
+        const fresh = producer(new ManagedAssignment(root, [root])).wrap(createWriteToolDefinition(root));
+        await fresh.execute("recovered", { path: "clean", content: "fresh writer\n" }, undefined, undefined, context(root));
+        expect(readFileSync(path.join(root, "clean"), "utf8")).toBe("fresh writer\n");
+        if (mode !== "ordinary") expect(() => assignment.assertIdle()).toThrow(AgentClosureError);
+      }
+      expect(owned.pending).toBe(0);
+    } finally {
+      finalize.resolve(); callback.resolve(); callbackClosed = true;
+      owned.group("ESRCH"); owned.close(); owned.advance(1500);
+      await operation; await managed.settle();
+      executor.mockRestore(); output.mockRestore();
+    }
+  });
+});
+
+for (const uncertainCallback of [false, true]) test(`managed native wrapper joins ${uncertainCallback ? "uncertain" : "ordinary failing"} callbacks without reviving assignment authority`, () => repository(async root => {
+  const assignment = new ManagedAssignment(root, [root]), managed = producer(assignment), owned = controlledProcess();
+  const abort = new AbortController(), callback = Promise.withResolvers<void>(), entered = Promise.withResolvers<void>();
+  let callbackClosed = false;
+  const callbackError = uncertainCallback ? new AgentClosureError([new Error("callback resource pending")], "callback",
+    { observe: () => callbackClosed ? "closed" : "unknown" }) : new Error("settled callback failure");
+  const native = createBashToolDefinition(root, { exposeSessionEnvironment: false, operations: { exec(_command, _cwd, options) {
+    entered.resolve();
+    return ownProcess(owned.child, options, owned.host);
+  } } });
+  const wrapped = managed.wrap(native);
+  const operation = wrapped.execute("owned", { command: "controlled" }, abort.signal, () => callback.promise, context(root))
+    .catch(error => error);
+  try {
+    await entered.promise;
+    abort.abort(); owned.advance(1500);
+    owned.group("ESRCH"); owned.close();
+    expect(() => reserveOperation(root, "checkpoint")).toThrow(); // Still owns accepted callback work.
+    callback.reject(callbackError);
+    const error = await operation as AgentClosureError;
+    expect(error).toBeInstanceOf(AgentClosureError);
+    expect(error.errors).toContain(callbackError);
+    if (uncertainCallback) expect(() => reserveOperation(root, "writer")).toThrow("unknown");
+    callbackClosed = true;
+    reserveOperation(root, "checkpoint").release();
+    expect(() => assignment.assertWritable()).toThrow(AgentClosureError);
+    expect(() => assignment.assertIdle()).toThrow(AgentClosureError);
+    expect(owned.pending).toBe(0);
+  } finally {
+    abort.abort(); callback.resolve(); callbackClosed = true;
+    owned.group("ESRCH"); owned.close(); owned.advance(1500);
+    await operation;
+    reserveOperation(root, "checkpoint").release();
+  }
+}));
+
+const unknownProducerCase = "unknown producer closure blocks new work while a known pre-start refusal does not";
+test(unknownProducerCase, async () => {
+  if (!process.env.PITAKO_UNKNOWN_PRODUCER_HOST) {
+    console.log(execFileSync(process.execPath, ["test", import.meta.path, "--test-name-pattern", `^${unknownProducerCase}$`], {
+      env: { ...process.env, PITAKO_UNKNOWN_PRODUCER_HOST: "1", BUN_OPTIONS: "", NO_COLOR: "1", FORCE_COLOR: "0" },
+      encoding: "utf8", stdio: ["ignore", "pipe", "inherit"],
+    }));
+    return;
+  }
+  await repository(async root => {
+    const assignment = new ManagedAssignment(root, [root]), managed = producer(assignment);
+    const failed = managed.wrap({ name: "write", label: "write", description: "unknown native closure", parameters: Type.Object({ path: Type.String() }),
+      async execute() { throw new AgentClosureError([new Error("unjoined resource")], "native"); } });
+    await expect(failed.execute("failed", { path: "clean" }, undefined, undefined, context(root))).rejects.toBeInstanceOf(AgentClosureError);
+    expect(() => assignment.assertIdle()).toThrow(AgentClosureError);
+    expect(() => producer(assignment).wrap(createWriteToolDefinition(root)).execute("new", { path: "clean", content: "no" }, undefined, undefined, context(root)))
+      .toThrow(AgentClosureError);
+  });
+  for (const aggregate of [false, true]) await repository(async root => {
+    const managed = producer(new ManagedAssignment(root, [root]));
+    const processError = new AgentClosureError([], "proven process", { observe: () => "closed" });
+    const generic = new AgentClosureError([], "unobserved callback");
+    const failed = managed.wrap({ name: "write", label: "write", description: "mixed uncertainty",
+      parameters: Type.Object({ path: Type.String() }), async execute(_id, _params, _signal, onUpdate) {
+        onUpdate?.(result);
+        if (aggregate) throw new AggregateError([processError, generic], "arbitrary aggregate");
+        throw processError;
+      } });
+    await expect(failed.execute("mixed", { path: "clean" }, undefined, () => { if (!aggregate) throw generic; }, context(root)))
+      .rejects.toBeInstanceOf(AgentClosureError);
+    expect(() => reserveOperation(root, "writer")).toThrow("unknown");
+    expect(() => reserveOperation(root, "checkpoint")).toThrow("unknown");
+    // No actual process was created. The child host owns the synthetic unknown leases.
+  });
+});
 
 test("loaded known patch keeps native schema, grammar, rendering and output; replacements are unsupported", () => repository(async root => {
   const entry = new URL("../index.ts", import.meta.resolve("pi-codex-tools"));
@@ -448,7 +897,7 @@ test(tailClosureCase, async () => {
     const outcome = gates.outcomes(binding)[0]!; retained = outcome.closure === "unknown";
     if (outcome.outcome === "incomplete") {
       expect(outcome.closure).toBe("released");
-      expect(outcome.diagnostic).toContain("leader closed before owned group closure");
+      expect(outcome.diagnostic).toContain("owned process group remained after close");
     } else expect(["passed", "unknown"]).toContain(outcome.outcome);
     if (retained) console.log(`Intentionally retained unprovable orphan-group diagnostics: ${root}`);
   } finally {
