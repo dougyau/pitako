@@ -342,6 +342,8 @@ max_run_time = "0"
 
 On Linux with Herdr 0.9.3 and Bun 1.4.2, an explicit foreground
 `/pitako agents pane` opens the same agent screen in a read-only plugin pane.
+That Bun version records a historical observation, not a runtime requirement;
+use a supported Bun release described in [Requirements](#requirements).
 It inspects existing workers; it does not create a worker or replace Pi's terminal.
 Installation, access flags, reconnect and sensitive-data limits are in
 [Optional Herdr pane](docs/worker-history.md#optional-herdr-pane).
@@ -379,7 +381,7 @@ Pitako does not implement subteams. Ad-hoc Team assignments let independent memb
 
 - Node.js 22.19 or newer (same floor as current Pi).
 - [Pi coding agent](https://github.com/earendil-works/pi) `@earendil-works/pi-coding-agent` 0.87 or newer.
-- The Bun version declared in `package.json` (`bun@1.4.2`) for checkout preparation. People who only install a published package do not need Bun.
+- Stable Bun >1.4.2 for checkout preparation. Use the installed Bun on PATH; an exact version or the latest release is not required. Bun 1.4.2 and earlier are unsupported. People who only install a published package do not need Bun.
 - An installed language server for LSP. It can be resolved from `PATH`, a project-local `node_modules/.bin`, or an explicit command path. TypeScript defaults to `typescript-language-server`; `/lsp install <id>` offers explicit installation for supported servers.
 - CodeGraph CLI. This package depends on `@colbymchenry/codegraph` and will use `node_modules/.bin/codegraph` when `codegraph` is not already on `PATH`.
 

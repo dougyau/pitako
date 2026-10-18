@@ -4,7 +4,7 @@ Run commands from this checkout's root. Select focused checks while implementing
 
 ## Check prerequisites
 
-Use the versions declared in [package.json](package.json): Bun 1.4.2 and Node >=22.19.0. Preparation through [scripts/setup.sh](scripts/setup.sh) installs frozen-lock dependencies and observes both Node SQLite paths. Reuse compatible setup evidence. Setup success does not prove every gate prerequisite.
+Use stable Bun >1.4.2 and Node >=22.19.0, as declared in [package.json](package.json). Use the installed runtimes on PATH; neither an exact Bun version nor the latest release is required. Bun 1.4.2 and earlier are unsupported because synchronous subprocess calls can hang. Do not install an older local runtime to satisfy historical version references. Preparation through [scripts/setup.sh](scripts/setup.sh) checks the installed runtimes, installs frozen-lock dependencies and observes both Node SQLite paths. It does not install or downgrade runtimes. Reuse compatible setup evidence. Setup success does not prove every gate prerequisite.
 
 Acceptance checks exercise Pitako-owned behavior. They do not require CodeGraph, LSP, Herdr, Pi SDK, external package loading, providers or classifiers to certify dependencies. Preparation is not integration acceptance. Controlled adapter responses and local history inputs preserve Pitako policy and lifecycle checks without demonstrating external runtime compatibility.
 

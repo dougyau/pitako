@@ -16,23 +16,24 @@ for runtime in git node bun; do
 done
 printf 'Bash %s (%s)\n' "$BASH_VERSION" "$BASH"
 git --version
-node --input-type=module <<'NODE'
+actual_bun="$(bun --version)"
+node --input-type=module - "$actual_bun" <<'NODE'
 import { readFileSync } from "node:fs";
 const { engines } = JSON.parse(readFileSync("package.json", "utf8"));
-const floor = /^>=(\d+)\.(\d+)\.(\d+)$/.exec(engines.node);
-if (!floor) throw new Error(`Unsupported Node declaration: ${engines.node}`);
-const actual = process.versions.node.split(".").map(Number);
-const minimum = floor.slice(1).map(Number);
-const difference = actual.map((n, i) => n - minimum[i]).find(n => n !== 0) ?? 0;
-if (difference < 0) throw new Error(`Node ${process.versions.node} does not satisfy ${engines.node}`);
+function checkRuntime(name, version, requirement) {
+  const floor = /^(>=|>)(\d+)\.(\d+)\.(\d+)$/.exec(requirement);
+  if (!floor) throw new Error(`Unsupported ${name} declaration: ${requirement}`);
+  const actual = /^(\d+)\.(\d+)\.(\d+)$/.exec(version);
+  if (!actual) throw new Error(`${name} ${version} is not a stable release`);
+  const minimum = floor.slice(2).map(Number);
+  const difference = actual.slice(1).map((n, i) => Number(n) - minimum[i]).find(n => n !== 0) ?? 0;
+  if (difference < 0 || difference === 0 && floor[1] === ">")
+    throw new Error(`${name} ${version} does not satisfy ${requirement}`);
+}
+checkRuntime("Node", process.versions.node, engines.node);
+checkRuntime("Bun", process.argv[2], engines.bun);
 console.log(`Node ${process.versions.node} (${process.execPath}), requires ${engines.node}`);
 NODE
-declared_bun="$(node -p 'JSON.parse(require("node:fs").readFileSync("package.json", "utf8")).packageManager')"
-actual_bun="$(bun --version)"
-[[ "$declared_bun" == "bun@$actual_bun" ]] || {
-  echo "setup requires $declared_bun; found bun@$actual_bun" >&2
-  exit 1
-}
 printf 'Bun %s (%s)\n' "$actual_bun" "$(command -v bun)"
 bun install --frozen-lockfile
 
