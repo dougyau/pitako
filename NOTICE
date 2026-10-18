@@ -9,7 +9,7 @@ Dependencies (not copied into this repository's source):
 - @colbymchenry/codegraph is MIT.
 - @dietrichgebert/ponytail is MIT. Pitako loads the ponytail skill only.
 - @juicesharp/rpiv-todo is MIT. Pitako loads the extension as the session TODO layer.
-- pi-web-access 0.31.0 (Nico Bailon) is MIT. Pitako bundles it for web search and page extraction. The license is docs/licenses/pi-web-access-LICENSE.
+- pi-web-access 0.42.0 (Nico Bailon) is MIT. Pitako bundles it for web search and page extraction. The license is docs/licenses/pi-web-access-LICENSE.
 - pi-hermes-memory 0.9.9 (Chandra Teja) is MIT. Pitako bundles it unchanged for persistent memory and conversation search, separate from the Board. The license is docs/licenses/pi-hermes-memory-LICENSE.
 - billion-context-pi 0.1.83 (ranxianglei) is MIT. Pitako uses it for ACP context
   compression: https://github.com/ranxianglei/billion-context-pi. Its license is

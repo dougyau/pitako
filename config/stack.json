@@ -83,7 +83,7 @@
     },
     {
       "id": "pi-web-access",
-      "spec": "pi-web-access@0.31.0",
+      "spec": "pi-web-access@0.42.0",
       "entry": "node_modules/pi-web-access/dist/index.js",
       "tools": ["web_search", "fetch_content", "source_check", "get_search_content", "web_enable"]
     }

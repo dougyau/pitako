@@ -70,11 +70,11 @@ describe("stack configuration", () => {
       entry: "node_modules/pi-hermes-memory/src/index.ts",
       tools: ["memory_add", "memory_replace", "memory_remove", "memory_search", "session_search", "skill_manage"],
     });
-    expect(manifest.dependencies["pi-web-access"]).toBe("0.31.0");
+    expect(manifest.dependencies["pi-web-access"]).toBe("0.42.0");
     expect(manifest.bundledDependencies).toContain("pi-web-access");
     expect(stack.required.find(({ id }) => id === "pi-web-access")).toEqual({
       id: "pi-web-access",
-      spec: "pi-web-access@0.31.0",
+      spec: "pi-web-access@0.42.0",
       entry: "node_modules/pi-web-access/dist/index.js",
       tools: ["web_search", "fetch_content", "source_check", "get_search_content", "web_enable"],
     });

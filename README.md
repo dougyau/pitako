@@ -501,7 +501,7 @@ With ACP active, native manual `/compact` reports `Compaction cancelled`, and au
 | Codex patch tools | [`pi-codex-tools`](https://github.com/jvm/pi-mono/tree/main/packages/pi-codex-tools) `0.3.0` | Official entry registers `apply_patch` and invokes upstream install telemetry. Disable telemetry with `PI_OFFLINE=1` or Pi's `enableInstallTelemetry:false` setting. Apache-2.0. |
 | Context compression | [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi) `0.1.83` | Public factory with delegation and updater off by default. MIT, with additional attribution terms for its inline acp-kernel. |
 | Memory and conversation search | [`pi-hermes-memory`](https://github.com/chandra447/pi-hermes-memory) `0.9.9` | Persistent lessons, corrections, and session search. Independent of the Board. MIT. |
-| Web research | [`pi-web-access`](https://github.com/nicobailon/pi-web-access) `0.31.0` | `web_search`, `fetch_content`, `source_check`, `get_search_content`, and `web_enable`. MIT. |
+| Web research | [`pi-web-access`](https://github.com/nicobailon/pi-web-access) `0.42.0` | `web_search`, `fetch_content`, `source_check`, `get_search_content`, and `web_enable`. MIT. |
 | Profiles, protected paths, status | `extensions/index.ts` | Pitako-owned. |
 
 `@vndv/pi-codegraph` registers Pi tools. It spawns `codegraph serve --mcp` internally. You do not add an MCP server to Pi.
@@ -569,7 +569,7 @@ To drop Pitako entirely: `pi remove` with the same source you installed.
 
 ## Web research
 
-Pitako bundles [`pi-web-access`](https://github.com/nicobailon/pi-web-access) `0.31.0`. It registers `web_search`, `fetch_content`, `source_check`, `get_search_content`, and `web_enable` by default. It does not set a model, provider, or API key.
+Pitako bundles [`pi-web-access`](https://github.com/nicobailon/pi-web-access) `0.42.0`. It registers `web_search`, `fetch_content`, `source_check`, `get_search_content`, and `web_enable` by default. It does not set a model, provider, or API key.
 
 Tool registration does not need API keys. Search needs network access and an available provider. Without a key, pi-web-access can use Exa MCP or DuckDuckGo, but provider availability depends on the network and service. Add optional credentials or settings to `web-search.json`. It defaults to `~/.pi/agent`; `PI_CODING_AGENT_DIR` and `XDG_CONFIG_HOME` can change the config directory. Do not commit credentials. See the [pi-web-access configuration guide](https://github.com/nicobailon/pi-web-access#configuration).
 

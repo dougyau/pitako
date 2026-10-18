@@ -26,7 +26,7 @@ Native Pi tools: `codegraph_search`, `codegraph_callers`, `codegraph_callees`, `
 
 Requires Node >= 22.19, matching Pi. Tested here against CodeGraph CLI 1.6.0, which this package depends on. If `codegraph` is already on `PATH`, that binary wins. Otherwise Pitako prepends its own `node_modules/.bin` for the process.
 
-### pi-web-access 0.31.0
+### pi-web-access 0.42.0
 
 MIT. Entry `node_modules/pi-web-access/dist/index.js`. Pitako bundles the package and registers `web_search`, `fetch_content`, `source_check`, `get_search_content`, and `web_enable` by default. It uses its own `web-search.json` configuration and optional provider credentials. Keyless search can use Exa MCP or DuckDuckGo, but both need network access and a reachable service.
 

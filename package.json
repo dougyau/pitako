@@ -64,7 +64,7 @@
     "pi-codex-tools": "0.3.0",
     "pi-hermes-memory": "0.9.9",
     "pi-lsp-client": "github:code-yeongyu/pi-lsp-client#1c981dfcacc456fe4ce9f4120a2f0250b54d6844",
-    "pi-web-access": "0.31.0",
+    "pi-web-access": "0.42.0",
     "smol-toml": "1.8.0"
   },
   "bundledDependencies": [
