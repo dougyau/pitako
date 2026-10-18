@@ -259,6 +259,34 @@ Own usage remains separate from aggregate Head, leaf-attempt and supplied
 classifier usage. Missing usage/cost stays unknown. These data make no claim of
 token savings, elapsed-time savings or model competence.
 
+### Physical process closure
+
+Bash and POSIX `OwnedGates` share `ownProcess`. Closure requires the original
+child `close`, closed streams, settled accepted callbacks, no pending timers or
+signals, and an absent process group observed as `ESRCH`. A group still visible
+after `close` gets a 25 ms reobservation before intervention. Cancellation sends
+TERM once, retains KILL at 250 ms, and reports `unknown` at 1500 ms if closure
+remains unproven. Repeated cancellation does not renew these deadlines.
+
+After `unknown`, the owner drains its original streams without external callbacks,
+polling, or new signals. A new overlapping admission can synchronously observe
+those original handles and remove only a fully proven physical lease. Ordinary
+`release()` cannot remove `unknown`. Missing proof, another uncertain obligation,
+or a group probe other than `ESRCH` keeps admission blocked.
+
+Gates also owns its capture descriptors. Every descriptor must close before
+process proof can recover its lease. An uncertain descriptor close stays
+nonrecoverable; retrying the descriptor number could close an unrelated file.
+Late process closure cannot change a published gate envelope, capture bytes, or
+receipt. An `unknown` gate never becomes verification evidence. Its failed
+`ManagedAssignment` still rejects reopen and successful Head finish after physical
+recovery. Child `sharedLease` reservations, Team Holds, and retirement retain
+their independent closure requirements.
+
+Process groups remain cooperative, not a sandbox or stable process identity.
+A reused group ID can prolong exclusion, and escaped or remote work is outside
+this proof. `OwnedGates` remains POSIX-only; Bash keeps its existing Windows route.
+
 ### Local source checkpoints
 
 Every asynchronous Developer Head uses managed source capture from construction,
