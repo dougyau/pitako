@@ -24,8 +24,13 @@ export interface ArchitectureRoom {
   controlOrder: number;
   captureComplete: boolean;
 }
-const rooms = new Map<symbol, Map<string, ArchitectureRoom>>();
-const listeners = new Set<(evaluation: TeamEvaluation) => void>();
+const KEY = Symbol.for("pitako.architectureRooms");
+interface Registry {
+  rooms: Map<symbol, Map<string, ArchitectureRoom>>;
+  listeners: Set<(evaluation: TeamEvaluation) => void>;
+}
+const host = globalThis as Record<symbol, Registry | undefined>;
+const { rooms, listeners } = (host[KEY] ??= { rooms: new Map(), listeners: new Set() });
 export function subscribeArchitectureChanges(listener: (evaluation: TeamEvaluation) => void) {
   listeners.add(listener);
   return () => { listeners.delete(listener); };
