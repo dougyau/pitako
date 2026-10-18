@@ -1,9 +1,10 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { mkdirSync, writeFileSync, chmodSync, mkdtempSync } from "node:fs";
+import { mkdirSync, writeFileSync, chmodSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import path from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { AgentClosureError } from "../extensions/agent/closure.ts";
 import { setBackgroundExecutor, clearBackgroundOwner, teamWorkerStatus } from "../extensions/agent/background.ts";
 import { architectureFixture } from "./fixtures/architecture.ts";
@@ -52,6 +53,76 @@ async function readAll(node: Awaited<ReturnType<typeof reader>>, ref: any) {
     cursor = page.next ?? undefined;
   } while (cursor); expect(parts.size).toBe(0); return { ...first, records };
 }
+
+test("independent room modules share catalog, notifications and token-scoped retirement with the public controller", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "pitako-room-modules-"));
+  let first: ReturnType<typeof beginTeamEvaluation>, second: ReturnType<typeof beginTeamEvaluation>;
+  let controller: ReturnType<typeof createAgentController> | undefined;
+  let view: ReturnType<NonNullable<typeof controller>["openView"]> | undefined;
+  const subscriptions: (() => void)[] = [];
+  try {
+    const sourcePath = fileURLToPath(new URL("../extensions/architecture/rooms.ts", import.meta.url));
+    // Evaluate the real module twice, resolving its dependencies back to production.
+    const source = readFileSync(sourcePath, "utf8").replace(/(from\s+["'])(\.[^"']+)(["'])/g,
+      (_, before, specifier, after) => before + path.resolve(path.dirname(sourcePath), specifier) + after);
+    for (const name of ["writer", "reader"]) writeFileSync(path.join(root, `${name}.ts`), source);
+    const writer: typeof import("../extensions/architecture/rooms.ts") = await import(path.join(root, "writer.ts"));
+    const reader: typeof writer = await import(path.join(root, "reader.ts"));
+    expect(writer.registerArchitectureRoom).not.toBe(reader.registerArchitectureRoom);
+    first = beginTeamEvaluation(`${path.basename(root)}-first`, false)!;
+    second = beginTeamEvaluation(`${path.basename(root)}-second`, false)!;
+    const owner = { sessionId: first.sessionId, token: first.token };
+    controller = createAgentController(owner, () => owner);
+    view = controller.openView({ policy: "bridge-read" });
+    const hints: number[] = [], changes: symbol[] = [], survivingChanges: symbol[] = [];
+    const publicSubscription = view.subscribe(revision => hints.push(revision));
+    subscriptions.push(() => publicSubscription.dispose());
+    const unsubscribe = reader.subscribeArchitectureChanges(evaluation => changes.push(evaluation.token));
+    subscriptions.push(unsubscribe, reader.subscribeArchitectureChanges(evaluation => survivingChanges.push(evaluation.token)),
+      reader.subscribeArchitectureChanges(() => { throw Error("passive observer failure"); }));
+    const input = { roomId: "shared-room", mode: "table" as const, toolCallId: "start",
+      director: { assignmentId: "director-assignment", memberId: "director-member", instanceId: "director-instance" } };
+    const room = writer.registerArchitectureRoom({ ...input, evaluation: first });
+    expect(reader.architectureRoom(first, room.roomId)).toBe(room);
+    expect(reader.architectureRooms(first)).toEqual([room]);
+    expect(reader.architectureRooms({ ...first, token: Symbol("unrelated") })).toEqual([]);
+    expect(changes).toEqual([first.token]);
+    expect(survivingChanges).toEqual([first.token]);
+    expect(hints).toHaveLength(1);
+    const list = view.listArchitectures();
+    expect(list).toMatchObject({ state: "ready", items: [{ ref: { roomId: room.roomId }, mode: "table" }] });
+    if (!("items" in list) || !Array.isArray(list.items)) throw Error("missing architecture catalog");
+    const ref = list.items[0].ref;
+    expect(view.readArchitecture(ref)).toMatchObject({ state: "ready", capture: { state: "open" },
+      records: [{ kind: "room", id: room.roomId, lifecycle: { closure: { state: "pending" } } }] });
+    writer.architectureControl(room, "context", "Cross-copy content", "control");
+    expect(changes).toEqual([first.token, first.token]);
+    expect(view.readArchitecture(ref)).toMatchObject({ records: [
+      { kind: "room" }, { kind: "control", text: "Cross-copy content" },
+    ] });
+    expect(hints).toHaveLength(2);
+    unsubscribe();
+    const other = writer.registerArchitectureRoom({ ...input, evaluation: second });
+    expect(reader.architectureRooms(second)).toEqual([other]);
+    expect(reader.architectureRoom(first, room.roomId)).toBe(room);
+    expect(changes).toEqual([first.token, first.token]);
+    expect(survivingChanges).toEqual([first.token, first.token, second.token]);
+    reader.retireArchitectureRooms(first);
+    expect(writer.architectureRooms(first)).toEqual([]);
+    expect(reader.architectureRooms(first)).toEqual([]);
+    expect(writer.architectureRoom(second, other.roomId)).toBe(other);
+    expect(reader.architectureRoom(second, other.roomId)).toBe(other);
+    writer.architectureProgress(other, "contribution", 2, "running");
+    expect(survivingChanges).toEqual([first.token, first.token, second.token, second.token]);
+    expect(changes).toEqual([first.token, first.token]);
+    expect(reader.architectureRoom(second, other.roomId)?.lifecycle.round).toBe(2);
+  } finally {
+    for (const unsubscribe of subscriptions) unsubscribe();
+    await view?.close(); controller?.revoke(); await controller?.settle();
+    await retireTeamEvaluation(first); await retireTeamEvaluation(second);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("Node ESM detects original v2 without sending unsupported architecture methods", fixture.ownedCase("old bridge", async () => {
   const s = await setup(); const root = path.join(s.root, "old"); mkdirSync(root, { mode: 0o700 });
