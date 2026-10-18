@@ -297,6 +297,7 @@ reports the gap; acknowledged native history remains the transcript authority.
 The optional pane was observed on Linux, Herdr **0.9.3**, Bun **1.4.2**, and the compatible
 declared Pi peers (**1.0.4**). These are historical observations, not runtime pins;
 use a supported Bun release described in [Requirements](../README.md#requirements).
+The pane was not revalidated with Bun **1.4.3**.
 Install Pitako and its declared peers in
 a conventional `node_modules` tree, not via a checkout/Pi alias fallback. For
 example, with an existing installation rooted at `/absolute/installation`:

@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { beforeEach, afterEach, describe, expect, spyOn, test } from "bun:test";
+import { privateStartupConfig } from "./fixtures/config-completion.ts";
 import {
   bindAgentUi,
   clearObservations,
@@ -13,6 +14,9 @@ import pitako from "../extensions/index.ts";
 import { registerExecution, unregisterExecution } from "../extensions/execution-identity.ts";
 
 type StatusCall = { key: string; text: string | undefined };
+let privateConfig: ReturnType<typeof privateStartupConfig>;
+const shutdowns: Array<() => Promise<void>> = [];
+beforeEach(() => { privateConfig = privateStartupConfig(); });
 
 function baseRow(patch: Partial<AgentUiSnapshot> & Pick<AgentUiSnapshot, "id">): AgentUiSnapshot {
   return {
@@ -53,9 +57,11 @@ function fakeClock() {
   };
 }
 
-afterEach(() => {
+afterEach(async () => {
+  for (const shutdown of shutdowns.splice(0)) await shutdown();
   unbindAgentUi();
   clearObservations();
+  privateConfig.close();
 });
 
 describe("agent UI lifecycle", () => {
@@ -271,6 +277,7 @@ describe("agent UI lifecycle", () => {
         },
       };
       pitako(pi as never);
+      shutdowns.push(async () => { await handlers.get("session_shutdown")?.({}, ctx); });
       return { handlers, statuses, ctx };
     };
     const sessionA = makeSession();
@@ -378,6 +385,7 @@ describe("agent UI lifecycle", () => {
       },
     };
     pitako(pi as never);
+    shutdowns.push(async () => { await handlers.get("session_shutdown")?.({}, ctx); });
     const start = handlers.get("session_start");
     const shutdown = handlers.get("session_shutdown");
     expect(start).toBeDefined();

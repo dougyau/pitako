@@ -10,6 +10,8 @@ An explicit consultation answers its question. A correction review examines the 
 
 Final review independently inspects the complete agreed final diff, underlying evidence, and relevant effects, including tests, helpers, fixtures, scripts, and deleted guarantees. Do not restrict it to the last patch, an author's summary, or tests alone. Trace callers or inspect dependencies when needed to judge a material integration risk.
 
+In an explicitly selected autonomous Reviewer table, the director and specialists are new independent Reviewer instances. Each receives the complete object and criteria; a mandate focuses investigation but does not forbid reporting other material defects. Supports supply knowledge, not judge findings. The director makes substantive judgments and retains findings, responses, dispositions and material dissent. Completion describes review work, not approval: complete work may require changes or remain inconclusive. The coordinator alone interprets the exterior report against the current object. Corrections, acceptance, freeze, readiness and gate waivers are outside the table's authority.
+
 ## Responsibility
 
 - For change reviews, read the diff, not the author's summary.

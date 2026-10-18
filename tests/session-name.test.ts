@@ -1,4 +1,5 @@
-import { describe, expect, test } from "bun:test";
+import { beforeEach, afterEach, describe, expect, test } from "bun:test";
+import { privateStartupConfig } from "./fixtures/config-completion.ts";
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -12,6 +13,14 @@ import {
   sessionNameAction,
   workflowDisplayName,
 } from "../extensions/session-name.ts";
+
+let privateConfig: ReturnType<typeof privateStartupConfig>;
+const shutdowns: Array<() => Promise<unknown>> = [];
+beforeEach(() => { privateConfig = privateStartupConfig(); });
+afterEach(async () => {
+  for (const shutdown of shutdowns.splice(0)) await shutdown();
+  privateConfig.close();
+});
 
 describe("session name handlers", () => {
   test("syncs first user line and preserves explicit names", async () => {
@@ -185,6 +194,7 @@ function createHandlerHarness(current: string | undefined, entries: unknown[], c
     getSessionName() { return name; }, setSessionName(value: string) { setNames.push(value); name = value || undefined; },
   };
   pitako(api as unknown as ExtensionAPI);
+  shutdowns.push(async () => { await events.get("session_shutdown")?.({}, context); });
   return { events, commands, context, setNames, statuses };
 }
 

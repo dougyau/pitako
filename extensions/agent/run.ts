@@ -165,7 +165,7 @@ export interface AttemptExecutor {
     /** Host-only acknowledgment for one Head-owned leaf; never grants orchestration. */
     scope?: LeafScopeAttachment;
     consultant?: import("./head/runtime.ts").ConsultationAttachment;
-    participant?: import("../architecture/types.ts").Participant;
+    participant?: import("../table/participant.ts").LocalParticipant;
     history?: InvocationHistory;
     onActivity?: (event: ActivityEvent) => void;
     /** Fired only after setModel / session open succeeds. Not a second lifecycle. */
@@ -253,6 +253,11 @@ export function skillNamesForRole(role: ResolvedRole): string[] {
   return ["pitako-coding", "ponytail", "caveman", ...role.skills, ...role.principles];
 }
 
+export interface TableAttachment {
+  config: import("../roles/types.ts").PitakoConfig;
+  role: ResolvedRole;
+  participant: import("../table/participant.ts").LocalParticipant;
+}
 export interface AgentRunInput {
   roleId: string;
   task: string;
@@ -265,7 +270,8 @@ export interface AgentRunInput {
   historyOrigin?: HistoryOrigin;
   dispatch?: import("./routing.ts").DispatchSnapshot;
   consultation?: import("./consultation.ts").ConsultationSnapshot;
-  architecture?: { config: import("../roles/types.ts").PitakoConfig; role: ResolvedRole; participant: import("../architecture/types.ts").Participant };
+  architecture?: TableAttachment;
+  table?: TableAttachment;
   reservedInstanceId?: string;
   head?: HeadAttachment;
   /** Test clock. Production uses Date.now. */
@@ -370,9 +376,9 @@ async function runConversationTurn(input: AgentRunInput, state: ConversationStat
   if (input.executionRoot !== undefined && workspace !== input.executionRoot) {
     throw new PitakoConfigError(`AgentInstance workspace drift: expected ${input.executionRoot}, got ${workspace}`);
   }
-  const loaded = input.head?.dag?.configSnapshot ?? input.dispatch?.config ?? input.consultation?.config ?? input.architecture?.config ?? loadPitakoConfig(input.load);
+  const loaded = input.head?.dag?.configSnapshot ?? input.dispatch?.config ?? input.consultation?.config ?? input.table?.config ?? input.architecture?.config ?? loadPitakoConfig(input.load);
   const role = input.head?.dag ? resolveDeveloperHeadFromConfig(input.head.dag.configSnapshot)
-    : input.dispatch?.role ?? input.consultation?.role ?? input.architecture?.role ?? resolveRoleFromConfig(loaded, input.roleId);
+    : input.dispatch?.role ?? input.consultation?.role ?? input.table?.role ?? input.architecture?.role ?? resolveRoleFromConfig(loaded, input.roleId);
   if (role.id !== input.roleId && !(input.head?.dag && input.roleId === "developer")) {
     throw new PitakoConfigError("dispatch snapshot role does not match runner role");
   }
@@ -547,7 +553,7 @@ async function runConversationTurn(input: AgentRunInput, state: ConversationStat
         history,
         input.head,
         state,
-        input.architecture?.participant,
+        (input.table ?? input.architecture)?.participant,
       ),
     );
     if (history && !history.admitted) history.admit(instance.id, role.id, targets[0]!).result({
@@ -592,7 +598,7 @@ async function executeTargets(
   history?: InvocationHistory,
   head?: HeadAttachment,
   owner?: ConversationState,
-  participant?: import("../architecture/types.ts").Participant,
+  participant?: import("../table/participant.ts").LocalParticipant,
 ): Promise<AgentRunResult> {
   instance.status = "running";
   let session = owner?.session;

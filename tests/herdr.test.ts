@@ -15,7 +15,10 @@ import { superviseAgent, type HerdrCommandResult, type HerdrRunner } from "../ex
 import { childActiveTools } from "../extensions/profile.ts";
 import { resolveRole, type LoadOptions } from "../extensions/roles/load.ts";
 import { packageRoot } from "../extensions/stack.ts";
+import { privateStartupConfig } from "./fixtures/config-completion.ts";
+import { providerFixtureOwnership } from "./fixtures/provider-fixture-ownership.ts";
 
+const authorFixture = providerFixtureOwnership();
 const roots: string[] = [];
 function fixtureRoot(): string {
   const root = mkdtempSync(path.join(tmpdir(), "pitako-supervise-"));
@@ -23,6 +26,7 @@ function fixtureRoot(): string {
   return root;
 }
 afterEach(() => {
+  authorFixture.requireReleasedFixture();
   for (const root of roots) rmSync(root, { recursive: true, force: true });
   roots.length = 0;
 });
@@ -133,64 +137,80 @@ function sessionHooks(): {
   return { start, shutdown };
 }
 
-async function withAuthorEnv(patch: Record<string, string | undefined>, run: () => Promise<void>): Promise<void> {
-  const saved = AUTHOR_ENV.map((key) => [key, process.env[key]] as const);
-  for (const key of AUTHOR_ENV) delete process.env[key];
-  for (const [key, value] of Object.entries(patch)) {
-    if (value === undefined) delete process.env[key];
-    else process.env[key] = value;
-  }
-  try {
-    await run();
-  } finally {
-    for (const [key, value] of saved) {
+async function withAuthorEnv(
+  patch: Record<string, string | undefined>,
+  run: (hooks: ReturnType<typeof sessionHooks>, configRoot: string) => Promise<void>,
+): Promise<void> {
+  await authorFixture.ownedCase("supervised board author startup", async () => {
+    const config = privateStartupConfig();
+    const saved = AUTHOR_ENV.map((key) => [key, process.env[key]] as const);
+    authorFixture.releaseDirectoriesAfterDisposal(() => {
+      for (const [key, value] of saved) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      config.close();
+    }, [config.root]);
+    for (const key of AUTHOR_ENV) delete process.env[key];
+    for (const [key, value] of Object.entries(patch)) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
-  }
+    const hooks = sessionHooks();
+    let context: unknown = { hasUI: false };
+    authorFixture.beforeRelease(() => hooks.shutdown({}, context));
+    await run({
+      ...hooks,
+      start(event, ctx) {
+        context = ctx;
+        return authorFixture.run(hooks.start(event, ctx));
+      },
+    }, config.root);
+  })();
 }
 
 describe("supervised board author", () => {
   afterEach(() => {
+    authorFixture.requireReleasedFixture();
     unregisterSupervisedSession();
   });
 
   test("no env, or env outside Herdr, still resolves to pi", async () => {
-    const { start } = sessionHooks();
     const sessionManager = { getSessionId: () => "foreground-sess" };
-    await withAuthorEnv({}, async () => {
+    await withAuthorEnv({}, async ({ start }, root) => {
+      const file = path.join(root, "pitako/config.toml");
       await start({}, { hasUI: false, sessionManager });
+      expect(readFileSync(file, "utf8")).toContain("# pitako:setting review.candidates");
+      expect(resolveBoardAuthor("foreground-sess")).toBe("pi");
     });
-    expect(resolveBoardAuthor("foreground-sess")).toBe("pi");
 
     await withAuthorEnv({
       PITAKO_INSTANCE_ID: "developer-c121cc",
       PITAKO_ROLE_ID: "developer",
       HERDR_ENV: "1",
-    }, async () => {
+    }, async ({ start }) => {
       await start({}, { hasUI: false, sessionManager: { getSessionId: () => "herdr-env-only" } });
+      expect(resolveBoardAuthor("herdr-env-only")).toBe("pi");
     });
-    expect(resolveBoardAuthor("herdr-env-only")).toBe("pi");
 
     await withAuthorEnv({
       PITAKO_INSTANCE_ID: "developer-c121cc",
       PITAKO_ROLE_ID: "developer",
-    }, async () => {
+    }, async ({ start }) => {
       await start({}, { hasUI: false, sessionManager: { getSessionId: () => "outside-herdr" } });
+      expect(resolveBoardAuthor("outside-herdr")).toBe("pi");
     });
-    expect(resolveBoardAuthor("outside-herdr")).toBe("pi");
 
     await withAuthorEnv({
       PITAKO_INSTANCE_ID: "developer-c121cc",
       ...inside,
-    }, async () => {
+    }, async ({ start }) => {
       await start({}, { hasUI: false, sessionManager: { getSessionId: () => "missing-role" } });
+      expect(resolveBoardAuthor("missing-role")).toBe("pi");
     });
-    expect(resolveBoardAuthor("missing-role")).toBe("pi");
   });
 
   test("session_start reads getSessionId and resolveBoardAuthor returns the instance id", async () => {
-    const { start, shutdown } = sessionHooks();
     let reads = 0;
     const sessionManager = {
       getSessionId() {
@@ -202,51 +222,43 @@ describe("supervised board author", () => {
       PITAKO_INSTANCE_ID: "developer-c121cc",
       PITAKO_ROLE_ID: "developer",
       ...inside,
-    }, async () => {
+    }, async ({ start, shutdown }) => {
       await start({}, { hasUI: false, sessionManager });
-    });
-    expect(reads).toBeGreaterThanOrEqual(1);
-    expect(resolveBoardAuthor("pane-sess")).toBe("developer-c121cc");
-    expect(executionForSession("pane-sess")?.roleId).toBe("developer");
+      expect(reads).toBeGreaterThanOrEqual(1);
+      expect(resolveBoardAuthor("pane-sess")).toBe("developer-c121cc");
+      expect(executionForSession("pane-sess")?.roleId).toBe("developer");
+      await shutdown({}, { hasUI: false });
+      expect(resolveBoardAuthor("pane-sess")).toBe("pi");
 
-    await shutdown({}, { hasUI: false });
-    expect(resolveBoardAuthor("pane-sess")).toBe("pi");
-
-    reads = 0;
-    const next = {
-      getSessionId() {
-        reads += 1;
-        return "pane-sess-next";
-      },
-    };
-    await withAuthorEnv({
-      PITAKO_INSTANCE_ID: "developer-c121cc",
-      PITAKO_ROLE_ID: "developer",
-      ...inside,
-    }, async () => {
+      reads = 0;
+      const next = {
+        getSessionId() {
+          reads += 1;
+          return "pane-sess-next";
+        },
+      };
       await start({}, { hasUI: false, sessionManager: next });
+      expect(reads).toBeGreaterThanOrEqual(1);
+      expect(resolveBoardAuthor("pane-sess-next")).toBe("developer-c121cc");
+      expect(resolveBoardAuthor("pane-sess")).toBe("pi");
+      await shutdown({}, { hasUI: false });
     });
-    expect(reads).toBeGreaterThanOrEqual(1);
-    expect(resolveBoardAuthor("pane-sess-next")).toBe("developer-c121cc");
-    expect(resolveBoardAuthor("pane-sess")).toBe("pi");
-    await shutdown({}, { hasUI: false });
   });
 
   test("missing session id does not throw and does not invent an author", async () => {
-    const { start } = sessionHooks();
     await withAuthorEnv({
       PITAKO_INSTANCE_ID: "developer-c121cc",
       PITAKO_ROLE_ID: "developer",
       ...inside,
-    }, async () => {
+    }, async ({ start }) => {
       await start({}, { hasUI: false, sessionManager: { getSessionId: () => undefined } });
       await start({}, { hasUI: false, sessionManager: { getSessionId: () => "" } });
       await start({}, { hasUI: false });
+      expect(resolveBoardAuthor(undefined)).toBe("pi");
+      expect(resolveBoardAuthor("")).toBe("pi");
+      expect(resolveBoardAuthor("developer-c121cc")).toBe("pi");
+      expect(executionForSession("developer-c121cc")).toBeUndefined();
     });
-    expect(resolveBoardAuthor(undefined)).toBe("pi");
-    expect(resolveBoardAuthor("")).toBe("pi");
-    expect(resolveBoardAuthor("developer-c121cc")).toBe("pi");
-    expect(executionForSession("developer-c121cc")).toBeUndefined();
   });
 });
 
@@ -532,7 +544,7 @@ reasoning = "high"
     expect(start).toContain("--no-approve");
     expect(start).not.toContain("--approve");
     expect(start[start.indexOf("--exclude-tools") + 1]).toBe(
-      "architecture_start,architecture_read,architecture_control,consultation_feedback,agent_run,agent_supervise,agent_spawn,agent_status,agent_result,agent_history,agent_observe,agent_input,agent_cancel,team_assign,team_status,team_result,team_cancel",
+      "architecture_start,architecture_read,architecture_control,review_start,review_read,review_control,consultation_feedback,agent_run,agent_supervise,agent_spawn,agent_status,agent_result,agent_history,agent_observe,agent_input,agent_cancel,team_assign,team_status,team_result,team_cancel",
     );
     const preamble = start[start.indexOf("--append-system-prompt") + 1] ?? "";
     expect(preamble).not.toContain("AgentInstance");

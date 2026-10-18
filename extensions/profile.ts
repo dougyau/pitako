@@ -18,6 +18,7 @@ export const MUTATING_TOOLS = new Set(["edit", "write", "apply_patch", "lsp_rena
 /** Foreground orchestration. Children do not receive these tools. */
 export const ORCHESTRATION_TOOLS = [
   "architecture_start", "architecture_read", "architecture_control",
+  "review_start", "review_read", "review_control",
   "consultation_feedback",
   "agent_run",
   "agent_supervise",
@@ -34,7 +35,7 @@ export const ORCHESTRATION_TOOLS = [
   "team_cancel",
 ] as const;
 
-export const isOrchestrationTool = (name: string): boolean => /^(agent_|team_|head_)/.test(name) || name === "consultation_feedback" || ["architecture_start", "architecture_read", "architecture_control"].includes(name);
+export const isOrchestrationTool = (name: string): boolean => /^(agent_|team_|head_)/.test(name) || name === "consultation_feedback" || ["architecture_start", "architecture_read", "architecture_control", "review_start", "review_read", "review_control"].includes(name);
 // SDK imports and Pi's extension loader can create separate module copies.
 const PROFILE_KEY = Symbol.for("pitako.sessionProfiles");
 type SessionProfile = { profile: ProfileName; current?: () => boolean };

@@ -41,6 +41,7 @@ Disable Ponytail, Caveman, or any individual skill with `pi config` or package s
 - `agent_supervise` for one synchronous visible sibling pane. It does not run in the background or join the Team roster.
 - `team_assign`, `team_status`, `team_result`, and `team_cancel` for independently identified background Team members. Every assignment admits a new member, including repeated roles. `$plan` and `$execute` use them for Architect/Reviewer dependencies too.
 - Optional `architecture_start`, `architecture_read`, and `architecture_control` for maintained direct consultations and autonomous tables. Direct answers arrive automatically; tables prepare independently and deliberate for at most five rounds. Only the root synthesizes after disband. See [Architecture consultations](docs/architecture.md). A table can supply the existing architectural `$plan` pass; it is optional, and independent Reviewer critique and `$execute` authority remain unchanged.
+- Optional `review_start`, `review_read`, and `review_control` for autonomous [Reviewer tables](docs/review.md). Explicit selection replaces one existing independent Reviewer pass one-for-one, never adds a mandatory pass. Ordinary Reviewer remains the default. The complete exterior report retains findings and distinguishes completed review work from its verdict; it does not accept work or waive gates.
 - `$plan` and `$execute`. Planning stops at `PLAN_FROZEN`. Execution is a separate invocation. Neither calls Herdr.
 
 ## Verify behavior
@@ -160,6 +161,8 @@ The role carries instructions, skills, and principles. The model policy carries 
 Built-in roles are `coordinator`, `architect`, `developer`, `reviewer`, `researcher`, `scout`, and `oracle`. Instructions live in `roles/*.md`. Structured defaults live in `config/defaults.toml`. Concrete models are not shipped, because installations do not share subscriptions.
 
 User overrides go in `$PI_CODING_AGENT_DIR/pitako/config.toml`. If `PI_CODING_AGENT_DIR` is unset, that path is `~/.pi/agent/pitako/config.toml`. Do not edit the package to change models.
+
+Principal startup creates or completes this file with missing safe defaults and commented customization examples. Existing values and source text remain intact. Model policies, role overrides, and architecture or review candidates stay commented until explicitly configured. See [Startup configuration completion](docs/configuration.md) for upgrade behavior, example syntax, publication, and error handling.
 
 Precedence is built-in defaults, then the user file. A scalar replaces that field when set. A `skills` or `principles` array replaces the built-in list when set, and is left alone when omitted. `primary` and `fallbacks` work the same way. There is no append merge.
 

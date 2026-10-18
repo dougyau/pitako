@@ -1,4 +1,5 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
+import * as completionModule from "../extensions/roles/complete.ts";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -723,8 +724,10 @@ for (const successor of ["session_start", "session_shutdown", "uncertain-close"]
     pitako(pi as never); profilePolicy(pi as never);
     const emit = async (type: string) => { for (const handler of handlers.get(type) ?? []) await handler({ type }, ctx); };
     const pending: Promise<unknown>[] = [];
+    const completion = spyOn(completionModule, "completePitakoConfig");
     try {
       await emit("session_start");
+      expect(completion).toHaveBeenCalledTimes(1);
       const oldView = controllers[0]!.openView();
       let firstDone = false, nextDone = false;
       const first = emit("session_start").finally(() => { firstDone = true; }); pending.push(first); void first.catch(() => {});
@@ -734,6 +737,7 @@ for (const successor of ["session_start", "session_shutdown", "uncertain-close"]
       pending.push(next); void next.catch(() => {});
       await Promise.resolve(); await Promise.resolve();
       expect(firstDone).toBe(false); expect(nextDone).toBe(false); expect(controllers).toHaveLength(1);
+      expect(completion).toHaveBeenCalledTimes(1);
       const blocked = ownedDispatch(ctx as never, undefined, () => true, async (_signal, check) => { check(); return "bad"; });
       await expect(blocked).rejects.toThrow("cancelled");
       expect(await ownedDispatch({ ...ctx, sessionManager: { getSessionId: () => `independent-${sessionId}` } } as never,
@@ -747,6 +751,7 @@ for (const successor of ["session_start", "session_shutdown", "uncertain-close"]
       }
       bridgeRelease.resolve();
       const results = await Promise.allSettled([first, next]);
+      expect(completion).toHaveBeenCalledTimes(successor === "session_start" ? 2 : 1);
       if (successor === "uncertain-close") {
         expect(results.map(result => result.status)).toEqual(["rejected", "rejected"]);
         await expect(emit("session_start")).rejects.toThrow("Foreground retirement");
@@ -762,7 +767,7 @@ for (const successor of ["session_start", "session_shutdown", "uncertain-close"]
     } finally {
       release.resolve(); bridgeRelease.resolve(); await Promise.allSettled(pending);
       await emit("session_shutdown").catch(error => { if (successor !== "uncertain-close") throw error; });
-      capture.mockRestore(); bridge.mockRestore();
+      capture.mockRestore(); bridge.mockRestore(); completion.mockRestore();
     }
   }));
 }

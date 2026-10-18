@@ -1,4 +1,5 @@
 import { PitakoConfigError } from "../errors.ts";
+import { CONFIG_KEYS } from "../roles/config-keys.ts";
 
 /**
  * The ~20 minute stops were the calling harness timeout around `pi --mode json`
@@ -79,7 +80,7 @@ export function parseWatchdogConfig(value: unknown, file: string): WatchdogConfi
     throw new PitakoConfigError(`${file}: agent_runtime: expected a table`);
   }
   const table = value as Record<string, unknown>;
-  const allowed = new Set(["idle_timeout", "tool_stall_timeout", "max_run_time"]);
+  const allowed = CONFIG_KEYS.agent_runtime;
   for (const key of Object.keys(table)) {
     if (!allowed.has(key)) throw new PitakoConfigError(`${file}: unknown key agent_runtime.${key}`);
   }

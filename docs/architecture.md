@@ -2,7 +2,11 @@
 
 Architecture is an optional, in-memory protocol over Team. It supports direct consultation and autonomous tables: one Architect director and up to five specialists derived independently from the Architect role. It may supply the existing architectural `$plan` pass; it does not grant execution or freeze authority or change `$execute` policy.
 
+[Reviewer tables](review.md) are a separate, autonomous-only protocol for independent critique. They can explicitly replace one existing Reviewer pass, not the Architect pass. Architecture's direct and table APIs and defaults are unchanged.
+
 ## Configuration
+
+[Startup configuration completion](configuration.md) adds commented architecture examples without enabling architecture consultations. Existing candidate and topic arrays remain unchanged.
 
 Add optional configuration to your existing Pitako user configuration:
 

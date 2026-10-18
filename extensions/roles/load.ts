@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { getSupportedThinkingLevels, type Model } from "@earendil-works/pi-ai";
 import { parse } from "smol-toml";
+import { CONFIG_KEYS } from "./config-keys.ts";
 import { getPitakoConfigPath } from "../board/paths.ts";
 import { DEFAULT_SKILL_NAMES, OPTIONAL_LANGUAGE_SKILLS } from "../catalog.ts";
 import { PitakoConfigError } from "../errors.ts";
@@ -31,18 +32,21 @@ export interface LoadOptions {
   availableModels?: readonly ModelCapability[];
 }
 
-const ROOT_KEYS = new Set(["roles", "model_policies", "agent_runtime", "worker_history", "developer_routing", "head_developer", "architecture"]);
-const ROLE_KEYS = new Set(["name", "description", "instructions", "model_policy", "skills", "principles"]);
-const POLICY_KEYS = new Set(["primary", "fallbacks"]);
-const TARGET_KEYS = new Set(["model", "reasoning", "fast"]);
+const { root: ROOT_KEYS, role: ROLE_KEYS, policy: POLICY_KEYS, target: TARGET_KEYS } = CONFIG_KEYS;
 const KNOWN_SKILLS = new Set<string>([...DEFAULT_SKILL_NAMES, ...OPTIONAL_LANGUAGE_SKILLS]);
 
 export function loadPitakoConfig(options: LoadOptions = {}): PitakoConfig {
+  const userConfigPath = options.userConfigPath ?? getPitakoConfigPath(options.env, options.cwd);
+  return parsePitakoConfig(existsSync(userConfigPath) ? readFileSync(userConfigPath, "utf8") : undefined, options);
+}
+
+/** Parse a snapshot at its real user path, without writing or rereading that file. */
+export function parsePitakoConfig(source: string | undefined, options: LoadOptions = {}): PitakoConfig {
   const root = options.packageRoot ?? packageRoot();
   const defaultsPath = path.join(root, "config", "defaults.toml");
   const userConfigPath = options.userConfigPath ?? getPitakoConfigPath(options.env, options.cwd);
   const builtin = parseBuiltin(defaultsPath, root);
-  const user = readUserConfig(userConfigPath);
+  const user = parseUserConfig(source, userConfigPath);
   return mergeConfig(builtin, user, userConfigPath, options.availableModels);
 }
 
@@ -126,6 +130,7 @@ function parseBuiltin(defaultsPath: string, root: string): PitakoConfig {
 
 interface UserConfig {
   architecture?: unknown;
+  review?: unknown;
   present: boolean;
   roles: Record<string, RawRole>;
   policies: Record<string, RawPolicy>;
@@ -135,12 +140,13 @@ interface UserConfig {
   headDeveloper?: unknown;
 }
 
-function readUserConfig(userConfigPath: string): UserConfig {
-  if (!existsSync(userConfigPath)) return { present: false, roles: {}, policies: {} };
-  const raw = readToml(userConfigPath);
+function parseUserConfig(source: string | undefined, userConfigPath: string): UserConfig {
+  if (source === undefined) return { present: false, roles: {}, policies: {} };
+  const raw = parseToml(source, userConfigPath);
   return {
     present: true,
     architecture: raw.architecture,
+    review: raw.review,
     roles: parseRoleOverrides(raw.roles, userConfigPath),
     policies: parsePolicyTables(raw.policies, userConfigPath) ?? {},
     watchdog: raw.watchdog,
@@ -193,7 +199,8 @@ function mergeConfig(
     };
   }
   const config: PitakoConfig = {
-    architecture: parseArchitecture(user.architecture, userConfigPath),
+    architecture: parseCandidates(user.architecture, userConfigPath, "architecture"),
+    review: parseCandidates(user.review, userConfigPath, "review"),
     defaultsPath: builtin.defaultsPath,
     userConfigPath,
     userConfigPresent: user.present,
@@ -306,6 +313,7 @@ function requirePolicy(config: PitakoConfig, id: string): ModelPolicy {
 
 interface RawDocument {
   architecture: unknown;
+  review: unknown;
   roles: unknown;
   policies: unknown;
   watchdog: unknown;
@@ -320,7 +328,7 @@ function parseDeveloperRouting(
 ): PitakoConfig["developerRouting"] {
   if (value === undefined) return base;
   const table = expectRecord(value, file, "developer_routing");
-  rejectUnknown(table, new Set(["classifier_provider", "classifier_model"]), file, "developer_routing");
+  rejectUnknown(table, CONFIG_KEYS.developer_routing, file, "developer_routing");
   const classifierProvider = optionalString(table.classifier_provider, file, "developer_routing.classifier_provider") ?? base.classifierProvider;
   const classifierModel = optionalString(table.classifier_model, file, "developer_routing.classifier_model") ?? base.classifierModel;
   if (/[/\s]/.test(classifierProvider)) {
@@ -337,7 +345,7 @@ function parseHeadDeveloper(
 ): PitakoConfig["headDeveloper"] {
   if (value === undefined) return base;
   const table = expectRecord(value, file, "head_developer");
-  rejectUnknown(table, new Set(["max_parallel"]), file, "head_developer");
+  rejectUnknown(table, CONFIG_KEYS.head_developer, file, "head_developer");
   const maxParallel = table.max_parallel === undefined ? base.maxParallel : table.max_parallel;
   if (typeof maxParallel !== "number" || !Number.isSafeInteger(maxParallel) || maxParallel <= 0) {
     throw new PitakoConfigError(`${file}: head_developer.max_parallel: expected a positive safe integer`);
@@ -348,7 +356,7 @@ function parseHeadDeveloper(
 function parseWorkerHistory(value: unknown, file: string, base: PitakoConfig["workerHistory"] = { ttlDays: 180 }): PitakoConfig["workerHistory"] {
   if (value === undefined) return base;
   const table = expectRecord(value, file, "worker_history");
-  rejectUnknown(table, new Set(["ttl_days"]), file, "worker_history");
+  rejectUnknown(table, CONFIG_KEYS.worker_history, file, "worker_history");
   const ttlDays = table.ttl_days ?? base.ttlDays;
   if (ttlDays !== false && (typeof ttlDays !== "number" || !Number.isSafeInteger(ttlDays) || ttlDays <= 0))
     throw new PitakoConfigError(`${file}: worker_history.ttl_days: expected a positive integer or false`);
@@ -371,15 +379,19 @@ interface RawPolicy {
 
 function readToml(file: string): RawDocument {
   if (!existsSync(file)) throw new PitakoConfigError(`${file}: file is missing`);
+  return parseToml(readFileSync(file, "utf8"), file);
+}
+
+function parseToml(source: string, file: string): RawDocument {
   let parsed: unknown;
   try {
-    parsed = parse(readFileSync(file, "utf8"));
+    parsed = parse(source);
   } catch (error) {
     throw new PitakoConfigError(`${file}: invalid TOML (${error instanceof Error ? error.message : String(error)})`);
   }
   const record = expectRecord(parsed, file, "");
   rejectUnknown(record, ROOT_KEYS, file, "");
-  return { architecture: record.architecture, roles: record.roles, policies: record.model_policies, watchdog: record.agent_runtime, workerHistory: record.worker_history,
+  return { architecture: record.architecture, review: record.review, roles: record.roles, policies: record.model_policies, watchdog: record.agent_runtime, workerHistory: record.worker_history,
     developerRouting: record.developer_routing, headDeveloper: record.head_developer };
 }
 
@@ -584,28 +596,28 @@ function freeze<T extends object>(value: T): T {
   return Object.freeze(value);
 }
 
-function parseArchitecture(value: unknown, file: string): PitakoConfig["architecture"] {
+function parseCandidates(value: unknown, file: string, name: "architecture" | "review"): PitakoConfig["architecture"] {
   if (value === undefined) return undefined;
-  const table = expectRecord(value, file, "architecture");
-  rejectUnknown(table, new Set(["candidates", "topics"]), file, "architecture");
+  const table = expectRecord(value, file, name);
+  rejectUnknown(table, CONFIG_KEYS.candidates, file, name);
   const candidates = (value: unknown, field: string) => {
     if (!Array.isArray(value) || !value.length) throw new PitakoConfigError(`${file}: ${field}: expected nonempty candidates`);
     const seen = new Set<string>();
     return value.map((item, index) => {
       const key = `${field}[${index}]`;
-      rejectUnknown(expectRecord(item, file, key), new Set(["model", "reasoning"]), file, key);
+      rejectUnknown(expectRecord(item, file, key), CONFIG_KEYS.candidate, file, key);
       const target = parseTarget(item, file, key), identity = targetKey(target);
       if (seen.has(identity)) throw new PitakoConfigError(`${file}: ${key}: duplicate candidate`);
       seen.add(identity);
       return target;
     });
   };
-  if (table.topics !== undefined && !Array.isArray(table.topics)) throw new PitakoConfigError(`${file}: architecture.topics: expected array`);
+  if (table.topics !== undefined && !Array.isArray(table.topics)) throw new PitakoConfigError(`${file}: ${name}.topics: expected array`);
   const seen = new Set<string>();
-  return { candidates: candidates(table.candidates, "architecture.candidates"),
+  return { candidates: candidates(table.candidates, `${name}.candidates`),
     topics: ((table.topics ?? []) as unknown[]).map((item, index) => {
-      const field = `architecture.topics[${index}]`, entry = expectRecord(item, file, field);
-      rejectUnknown(entry, new Set(["topic", "candidates"]), file, field);
+      const field = `${name}.topics[${index}]`, entry = expectRecord(item, file, field);
+      rejectUnknown(entry, CONFIG_KEYS.topic, file, field);
       const topic = requiredString(entry.topic, file, `${field}.topic`).replace(/\s+/g, " ").toLowerCase();
       if (seen.has(topic)) throw new PitakoConfigError(`${file}: ${field}: duplicate topic`);
       seen.add(topic);

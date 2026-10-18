@@ -123,6 +123,7 @@ interface Handoff extends WorkerHandoff {
 type SignalState = "pending" | "dropped";
 
 interface Row extends TeamMetadata {
+  tableProtocol?: "architecture" | "review";
   architectureSelectedDriver?: AgentRunResult;
   recipient?: Recipient;
   intermediates?: Intermediate[];
@@ -253,6 +254,7 @@ export interface SpawnInput {
   task: string;
   cwd: string;
   architecture?: AgentRunInput["architecture"];
+  table?: AgentRunInput["table"];
   recipient?: Recipient;
   driver?: (signal: AbortSignal) => Promise<AgentRunResult>;
   historyOrigin?: import("./history.ts").HistoryOrigin;
@@ -290,6 +292,7 @@ export async function spawnBackground(input: SpawnInput): Promise<WorkerHandle> 
     dispatch: input.dispatch,
     consultation: input.consultation,
     architecture: input.architecture,
+    table: input.table,
     reservedInstanceId: input.reservation?.instanceId,
     head: input.head,
     signal: controller.signal,
@@ -416,6 +419,7 @@ export async function spawnBackground(input: SpawnInput): Promise<WorkerHandle> 
     row.reconcileBookkeeping = input.reconcileBookkeeping;
     row.recipient = input.recipient;
     const owner = createConversationOwner(runInput);
+    row.tableProtocol = (input.table ?? input.architecture)?.participant.protocol;
     row.maintained = { owner, completion, missingUsage: false, stopAbort: () => {} };
     const accepted = row;
     const cancel = () => { void finishTeamWorker(accepted.teamOwnerToken!, accepted.instanceId).catch(() => {}); };
@@ -615,7 +619,11 @@ export async function finishTeamWorker(token: symbol, instanceId: string): Promi
         model: { selectedModel: "unknown" }, result: "cancelled before first turn" };
       row.architectureSelectedDriver = !row.controller.signal.aborted ? driven : undefined;
       settle(row, { ...result, usage: maintained.usage,
-        ...(row.controller.signal.aborted ? { status: "cancelled", result: "cancelled" } : {}) }, observationEpoch());
+        ...(row.controller.signal.aborted ? { status: "cancelled",
+          // Only the host-selected review driver carries this report. Synthesis remains historical evidence.
+          result: row.tableProtocol === "review" && driven
+            ? JSON.stringify({ ...JSON.parse(driven.result), completion: "failed", verdict: "inconclusive" })
+            : "cancelled" } : {}) }, observationEpoch());
       completion.resolve();
     } catch (error) {
       row.closure = { state: "unknown", reason: String(error) };

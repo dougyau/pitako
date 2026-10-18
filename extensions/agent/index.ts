@@ -1,5 +1,6 @@
 import path from "node:path";
 import { registerArchitecture } from "../architecture/index.ts";
+import { registerReview } from "../review/index.ts";
 import type { ExtensionContext, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -175,6 +176,7 @@ export default function agentInstance(pi: ExtensionAPI): void {
   registerBackgroundTools(pi);
   registerTeamTools(pi);
   registerArchitecture(pi);
+  registerReview(pi);
   pi.registerTool({
     name: "agent_run",
     label: "Run agent",

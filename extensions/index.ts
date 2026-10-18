@@ -16,6 +16,7 @@ import { currentInstanceId } from "./agent/scope.ts";
 import { executionForSession } from "./execution-identity.ts";
 import { formatUsage, mergeUsage, type AgentUsage } from "./agent/run.ts";
 import { inspectPitako } from "./roles/format.ts";
+import { completePitakoConfig } from "./roles/complete.ts";
 import { registerSupervisedSession, unregisterSupervisedSession } from "./herdr/author.ts";
 import { registerAgentSupervise } from "./herdr/supervise.ts";
 import { packageRoot, prepareRuntime } from "./stack.ts";
@@ -142,6 +143,13 @@ export default function pitako(pi: ExtensionAPI, host: { recoveryScheduler?: Rec
       await closed;
       settled = true;
       if (!current()) return;
+      if (foregroundSession(sessionId) && !isChildSession(ctx)) {
+        const completion = completePitakoConfig({ cwd: ctx.cwd }, current);
+        if (completion.state === "skipped") {
+          if (ctx.hasUI) ctx.ui.notify(completion.warning, "warning"); else console.warn(completion.warning);
+        }
+        if (!current()) return;
+      }
       if (foregroundSession(sessionId)) {
         // Cooperative history maintenance never waits for or cancels a worker.
         try {
