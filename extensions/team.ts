@@ -1,4 +1,5 @@
 import { observeArchitectureAssignment, retireArchitectureRooms } from "./architecture/rooms.ts";
+import { retireReviewRooms } from "./review/index.ts";
 import { randomUUID } from "node:crypto";
 import { reserveBackground, turnTeamWorker, finishTeamWorker, type SpawnInput, retireTeamMembers, retireTeamWorkers, teamWorkerHasOutcome, teamWorkerStatus } from "./agent/background.ts";
 import { executionForSession } from "./execution-identity.ts";
@@ -75,6 +76,7 @@ export function retireTeamEvaluation(evaluation: TeamEvaluation | undefined): Pr
   const retirement = Promise.withResolvers<void>();
   current.retiring = retirement.promise;
   retireArchitectureRooms(evaluation);
+  retireReviewRooms(evaluation.token);
   void retireTeamWorkers(evaluation.token).then(() => {
     if (state.evaluations.get(evaluation.sessionId) === current) state.evaluations.delete(evaluation.sessionId);
     retirement.resolve();

@@ -8,7 +8,7 @@ import { acquireHistoryExclusion } from "./history-retention.ts";
 
 /** Host-supplied origin, never recovered from a prompt or child cwd. */
 export interface HistoryOrigin {
-  entrypoint?: "architecture_start";
+  entrypoint?: "architecture_start" | "review_start";
   parentAssignmentId?: string;
   source: "agent_run" | "agent_spawn" | "team_assign";
   coordinatorSessionId?: string;

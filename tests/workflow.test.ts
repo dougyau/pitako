@@ -773,6 +773,34 @@ describe("plan and execute contracts", () => {
     expect(freeze).toContain("material blocker or a change outside the reviewed object");
   });
 
+  test("review table substitution stays explicit, independent and one-for-one", () => {
+    for (const policy of [plan, execute, prePr]) {
+      for (const contract of [
+        "Ordinary Reviewer remains the default", "replace one existing independent Reviewer", "one-for-one",
+        "never selects it automatically or adds another pass", "new independent Reviewer director/root",
+        "dynamically selected Reviewer specialists", "knowledge, not judge findings", "Corrections remain outside the table",
+        "actual returned exterior Team assignment", "physical closure and comparison with the current object",
+        "top-level `completion` and `verdict`", "not nested synthesis, dispositions",
+        "A final inconclusive judgment blocks approval", "not coordinator acceptance",
+        "No `review_read` or result fetch is required for transport or acknowledgement",
+        "Material object edits invalidate affected judgment",
+      ]) expect(policy).toContain(contract);
+    }
+    expect(plan).toContain('object: {kind: "plan", planId}');
+    expect(plan).toContain("same correlation rules to `review_start`");
+    expect(plan).toContain("object's `planId` still identifies the text to critique");
+    expect(plan).toContain("prospective correlation without creating a ledger or Board binding");
+    for (const policy of [execute, prePr]) {
+      expect(policy).toContain('object: {kind: "diff", base:');
+      expect(policy).toContain("staged, unstaged and applicable non-ignored untracked files");
+      expect(policy).toContain("clean-tree or commits-only");
+    }
+    expect(execute).toContain("Pass the frozen `plan` and relevant `unit` to `review_start`");
+    expect(prePr).toContain("This standalone pass omits `plan`, `unit` and `boardTopicId`");
+    expect(reviewer).toContain("a mandate focuses investigation but does not forbid reporting other material defects");
+    // Instruction assertions establish assembly, not future model obedience.
+  });
+
   test("optional planning architecture consumes only the exterior current-object judgment", () => {
     for (const contract of [
       'ordinary `team_assign` role work', 'mode: "consultation"', 'mode: "table"',

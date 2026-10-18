@@ -2,7 +2,8 @@ import { spawnSync } from "node:child_process";
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, test } from "bun:test";
+import { beforeEach, afterEach, describe, expect, test } from "bun:test";
+import { privateStartupConfig } from "./fixtures/config-completion.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import pitako from "../extensions/index.ts";
 import profilePolicy from "../extensions/profile-policy.ts";
@@ -11,14 +12,19 @@ import { packageRoot } from "../extensions/stack.ts";
 import { childActiveTools, toolsForProfile } from "../extensions/profile.ts";
 
 const configDirs: string[] = [];
+let privateConfig: ReturnType<typeof privateStartupConfig>;
+const shutdowns: Array<() => Promise<void>> = [];
+beforeEach(() => { privateConfig = privateStartupConfig(); });
 function configDirectory(prefix: string) {
   const dir = mkdtempSync(path.join(tmpdir(), prefix));
   configDirs.push(dir);
   return dir;
 }
-afterEach(() => {
+afterEach(async () => {
+  for (const shutdown of shutdowns.splice(0)) await shutdown();
   for (const dir of configDirs) rmSync(dir, { recursive: true, force: true });
   configDirs.length = 0;
+  privateConfig.close();
 });
 
 function profileHarness(profileFlag?: string, external?: () => Promise<void>) {
@@ -69,6 +75,7 @@ function profileHarness(profileFlag?: string, external?: () => Promise<void>) {
   ]);
   for (const entry of JSON.parse(readFileSync(path.join(packageRoot(), "package.json"), "utf8")).pi.extensions)
     factories.get(entry)?.({ ...pi, setActiveTools(names: string[]) { writes.push(entry); pi.setActiveTools(names); } } as unknown as ExtensionAPI);
+  shutdowns.push(async () => { await handlers.get("session_shutdown")?.({}, context); });
   return {
     active, available, writes,
     context,
@@ -312,6 +319,7 @@ describe("Pitako resources and policy", () => {
       if (!start) throw new Error("session_start was not registered");
       const ctx = { cwd: packageRoot(), hasUI: false, ui: { notify() {}, setStatus() {} },
         sessionManager: { getSessionId: () => "analysis-wiring", getEntries: () => [] } };
+      shutdowns.push(async () => { await handlers.get("session_shutdown")?.({}, ctx); });
       await start({}, ctx);
       await handlers.get("session_shutdown")?.({}, ctx);
       expect(active).toContain("read");

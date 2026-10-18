@@ -2,8 +2,9 @@ import { recoveryClock } from "./fixtures/recovery-clock.ts";
 import { preparedTool } from "./fixtures/background-dispatch.ts";
 import { runAgentInstance } from "../extensions/agent/run.ts";
 import { agentFixtureOwnership } from "./fixtures/agent-fixture-ownership.ts";
+import { privateStartupConfig } from "./fixtures/config-completion.ts";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -44,6 +45,7 @@ import { listObservations } from "../extensions/agent/observe.ts";
 const fixture = agentFixtureOwnership();
 const tempDirs = fixture.directories;
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+const developerPolicy = `[model_policies.developer.primary]\nmodel = "example/primary"\nreasoning = "off"\n`;
 afterEach(async () => {
   fixture.requireReleasedFixture();
   if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
@@ -59,8 +61,26 @@ function load(): LoadOptions {
   tempDirs.push(dir);
   const userConfigPath = path.join(dir, "pitako", "config.toml");
   mkdirSync(path.dirname(userConfigPath), { recursive: true });
-  writeFileSync(userConfigPath, `[model_policies.developer.primary]\nmodel = "example/primary"\nreasoning = "off"\n`);
+  writeFileSync(userConfigPath, developerPolicy);
   return { env: { PI_CODING_AGENT_DIR: dir }, userConfigPath };
+}
+
+async function startPrincipal(handlers: Map<string, Function>, ctx: unknown) {
+  const config = privateStartupConfig();
+  const previousInstance = process.env.PITAKO_INSTANCE_ID;
+  delete process.env.PITAKO_INSTANCE_ID;
+  fixture.releaseDirectoriesAfterDisposal(() => {
+    if (previousInstance === undefined) delete process.env.PITAKO_INSTANCE_ID;
+    else process.env.PITAKO_INSTANCE_ID = previousInstance;
+    config.close();
+  }, [config.root]);
+  fixture.beforeRelease(async () => { await handlers.get("session_shutdown")!({}, ctx); });
+  const file = path.join(config.root, "pitako/config.toml");
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(file, developerPolicy);
+  await handlers.get("session_start")!({}, ctx);
+  // Exercise the actual principal writer, not an inherited worker guard.
+  expect(readFileSync(file, "utf8")).toContain("# pitako:setting review.candidates");
 }
 
 function hang(): { executor: AttemptExecutor; started: Promise<void>; release: (attempt: Attempt) => void; signal: () => AbortSignal | undefined } {
@@ -887,7 +907,7 @@ describe("background tools", () => {
     pitako(pi as unknown as ExtensionAPI, { recoveryScheduler: clock.scheduler });
     const ctx = { cwd: packageRoot(), hasUI: false, isIdle: () => idle,
       ui: { notify() {}, setStatus() {} }, sessionManager: { getSessionId: () => "timer-parent", getBranch: () => branch } };
-    await handlers.get("session_start")!({}, ctx);
+    await startPrincipal(handlers, ctx);
     expect(clock.pending).toBe(0);
     const hanging = hang();
     await spawnBackground({ roleId: "developer", task: "original codemode workflow result", cwd: packageRoot(), load: load(), executor: hanging.executor });
@@ -931,7 +951,7 @@ describe("background tools", () => {
     pitako(pi as unknown as ExtensionAPI);
     const ctx = { cwd: packageRoot(), hasUI: false, isIdle: () => false, signal: undefined as AbortSignal | undefined,
       ui: { notify() {}, setStatus() {} }, sessionManager: { getSessionId: () => "terminal-parent", getBranch: () => branch } };
-    await handlers.get("session_start")!({}, ctx);
+    await startPrincipal(handlers, ctx);
     const finish = async (text: string) => {
       const hanging = hang();
       const handle = await spawnBackground({ roleId: "developer", task: text, cwd: packageRoot(), load: load(), executor: hanging.executor });
@@ -981,7 +1001,6 @@ describe("background tools", () => {
   }));
 
   test("spawn tool returns before the executor finishes and does not steer", fixture.ownedCase("spawn tool returns before the executor finishes and does not steer", async () => {
-    process.env.PI_CODING_AGENT_DIR = load().env?.PI_CODING_AGENT_DIR;
     const hanging = hang();
     setBackgroundExecutor(hanging.executor);
     const tools = new Map<string, { execute: Function }>();
@@ -1025,7 +1044,7 @@ describe("background tools", () => {
     pitako(pi as unknown as ExtensionAPI);
     const ctx = { cwd: packageRoot(), hasUI: false, isIdle: () => idle, ui: { notify() {}, setStatus() {} },
       sessionManager: { getSessionId: () => "parent", getBranch: () => branch } };
-    await handlers.get("session_start")?.({}, ctx);
+    await startPrincipal(handlers, ctx);
     const spawn = tools.get("agent_spawn");
     if (!spawn) throw new Error("agent_spawn missing");
     const result = await spawn.execute("call", { role: "developer", task: "change the widget", plan: "background-agent-delegation-test-only", unit: "T3" }, new AbortController().signal, undefined, { cwd: packageRoot() });

@@ -12,10 +12,12 @@ import { controlledPi, controlledModel } from "./pi-factories.ts";
 import { agentFixtureOwnership } from "./agent-fixture-ownership.ts";
 import { executionForSession } from "../../extensions/execution-identity.ts";
 
-export function architectureFixture() {
+export function architectureFixture(protocol: "architecture" | "review" = "architecture") {
   const fixture = agentFixtureOwnership();
   const deferred = <T = void>() => Promise.withResolvers<T>();
   const policies = `[model_policies.architect]
+  primary = { model = "fixture/director", reasoning = "low" }
+  [model_policies.reviewer]
   primary = { model = "fixture/director", reasoning = "low" }
   [model_policies.scout]
   primary = { model = "fixture/support" }
@@ -24,9 +26,9 @@ export function architectureFixture() {
   [model_policies.oracle]
   primary = { model = "fixture/support" }
   `;
-  const configuration = `[architecture]
+  const configuration = `[${protocol}]
   candidates = [{ model = "fixture/general" }]
-  [[architecture.topics]]
+  [[${protocol}.topics]]
   topic = "security"
   candidates = [{ model = "fixture/chosen", reasoning = "high" }, { model = "fixture/chosen", reasoning = "low" }, { model = "fixture/other" }]
   `;
@@ -67,7 +69,14 @@ export function architectureFixture() {
         for (const handler of session.hooks.get("turn_start") ?? []) await handler({ type: "turn_start" }, { sessionManager: session.sessionManager });
         try {
           const request = JSON.parse(text.startsWith("{") ? text : [...session.prompts].reverse().find((prompt: string) => prompt.startsWith("{"))!);
+          const review = request.protocol === "Pitako review";
           const body = request.stage === "composition" ? { kind: "composition", snapshotId: request.snapshot.id, specialists: [{ candidateRef: "topic:0:0", mandate: "Review security", reason: "Relevant expertise" }] }
+            : review && request.stage === "preparation" ? { kind: "preparation", analysis: "Independent whole-object review", findings: [], doubts: [] }
+            : review && request.stage === "contribution" ? { kind: "contribution", analysis: "Review incoming evidence", findings: [], responses: [], doubts: [] }
+            : review && request.stage === "decision" ? { kind: "decision", action: "synthesize", reason: "Sufficient observations" }
+            : review && request.stage === "synthesis" ? { kind: "synthesis", completion: "complete", verdict: "no-blockers", summary: "Reviewed complete object",
+              dispositions: request.review.findings.map((finding: any) => ({ findingId: finding.id, status: "upheld", reason: "Reachable failure", references: [finding.messageId] })),
+              newFindings: [], evidence: [], limits: [], pending: [] }
             : request.stage === "answer" ? { kind: "answer", answer: "A".repeat(20000) + "🧠", evidence: ["source"], limits: [], doubts: [] }
             : request.stage === "consultation-plan" ? { kind: "consultation-plan", resolutions: [], support: [] }
             : request.stage === "knowledge" ? { kind: "knowledge", resolutions: [] }
@@ -76,7 +85,7 @@ export function architectureFixture() {
           if (chosen !== false) {
             expect(executionForSession(session.sessionId)?.profile).toBe("analysis");
             expect(session.active).not.toContain("edit"); expect(session.active).not.toContain("write");
-            const receipt = await session.boundTools.get("architecture_submit")!.execute("native-submit", { submissionId: `submit-${session.prompts.length}`, body: chosen }, undefined, undefined, { sessionManager: session.sessionManager });
+            const receipt = await session.boundTools.get(`${review ? "review" : "architecture"}_submit`)!.execute("native-submit", { submissionId: `submit-${session.prompts.length}`, body: chosen }, undefined, undefined, { sessionManager: session.sessionManager });
             seen.push({ session, request, receipt, levels: session.thinkingLevel, model: session.model!.id });
             expect(receipt.isError).not.toBe(true);
             await extra.afterSubmit?.(session, request, receipt);

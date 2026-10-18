@@ -293,6 +293,16 @@ After cleanup, rerun checks invalidated by the edits using `verify-behavior`; if
 
 Skip Reviewer on trivial edits when deterministic checks cover the unit. Use Reviewer for boundaries, concurrency, persistence, security, external integration, lifecycle, or a wide blast radius. Use `blast-radius` only for those triggers, not for every unit.
 
+Ordinary Reviewer remains the default. You may explicitly choose `review_start` to replace one existing independent Reviewer pass one-for-one. `[review]` enables that option; it never selects it automatically or adds another pass. The autonomous table uses a new independent Reviewer director/root and one to five dynamically selected Reviewer specialists, separate from implementers, designers and the accepting coordinator. Optional Scout, Researcher and Oracle supports supply knowledge, not judge findings. Corrections remain outside the table with Developer under the existing correction order.
+
+For final review, use `object: {kind: "diff", base: "<agreed-local-ref>"}` for the complete final diff, including staged, unstaged and applicable non-ignored untracked files. Pin an explicit local base and provide scope, criteria, evidence and current identities. Do not impose a new clean-tree or commits-only prerequisite for review. A `brief` object is only a bounded consultation; neither that nor correction review substitutes for final whole-diff review. See [Reviewer tables](../../docs/review.md).
+
+Pass the frozen `plan` and relevant `unit` to `review_start` under the existing execution binding. Record only its actual returned exterior Team assignment under `## Workers`, with purpose, pending decision and consulted object. Preserve root watches, ledger and Board rules; incompatible binding or a real Team hold blocks, and the table is not an escape from admission rejection. Internal participant results never deliver foreground judgments.
+
+Interpret the complete automatic exterior JSON `ReviewReport` after physical closure and comparison with the current object. No `review_read` or result fetch is required for transport or acknowledgement. Use the actual exterior status and top-level `completion` and `verdict`, not nested synthesis, dispositions or diagnostic room state. Completed work can report `changes-required` or `inconclusive`; `no-blockers` is not coordinator acceptance. Failed, cancelled, partial or drifted work, or missing indispensable evidence, cannot approve. A final inconclusive judgment blocks approval. Successful work-hold reconciliation is bookkeeping only. The table cannot implement, accept units, freeze plans or waive gates.
+
+Fingerprints identify observed endpoints, not transactional snapshots, ABA-proof history or post-delivery freshness. Material object edits invalidate affected judgment under the review policy below.
+
 Classify cleanup and later edits against the complete final diff and evidence:
 - **A:** demonstrably nonsemantic subtraction. Identify what was removed and why, with checks or other evidence supporting unchanged behavior and contracts. Deletion alone does not prove A.
 - **B:** potentially semantic or uncertain, including changes to logic, state, lifecycle, concurrency, paths, security, privileges, output, or contracts. Treat uncertainty as B.

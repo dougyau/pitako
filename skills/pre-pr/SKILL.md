@@ -20,6 +20,14 @@ Use `verify-behavior` for check selection, stopping, and test quality in the dif
 
 ## Procedure
 
+Ordinary Reviewer remains the default. You may explicitly choose `review_start` to replace one existing independent Reviewer pass one-for-one. `[review]` enables that option; it never selects it automatically or adds another pass. The autonomous table uses a new independent Reviewer director/root and one to five dynamically selected Reviewer specialists, separate from the Coordinator and Developer. Optional Scout, Researcher and Oracle supports supply knowledge, not judge findings. Corrections remain outside the table.
+
+Use `object: {kind: "diff", base: "<selected-local-ref>"}` for final whole-diff review after step 6, not a `brief` or correction-only review. Include scope, criteria, evidence and current identities. The review object includes staged, unstaged and applicable non-ignored untracked files; review requires no new clean-tree or commits-only restriction. Step 8 and the publication-readiness rules below still apply.
+
+Record only the actual returned exterior Team assignment as the review handle. This standalone pass omits `plan`, `unit` and `boardTopicId`; it creates no ledger or Board binding. Existing incompatible binding or a real Team hold remains a blocker, not a reason to switch routes after admission rejection. Preserve existing root watches and correlation when a workflow already owns them. Internal participant results never deliver foreground judgments.
+
+Interpret the complete automatic exterior JSON `ReviewReport` after physical closure and comparison with the current object. No `review_read` or result fetch is required for transport or acknowledgement. Use the actual exterior status and top-level `completion` and `verdict`, not nested synthesis, dispositions or diagnostic room state. Completed work can report `changes-required` or `inconclusive`; `no-blockers` is not coordinator acceptance or READY. Failed, cancelled, partial or drifted work, or missing indispensable evidence, cannot approve. A final inconclusive judgment blocks approval. Fingerprints identify observed endpoints, not transactional snapshots, ABA-proof history or post-delivery freshness. Material object edits invalidate affected judgment under step 7. The table cannot implement, freeze plans or waive gates. See [Reviewer tables](../../docs/review.md).
+
 1. Pin the scope before editing. Record `git rev-parse --show-toplevel`, the current branch, `HEAD`, and `git status --short`. Use the cwd's worktree only.
 2. Choose a local comparison base in this order:
    - An explicit `base=<local-ref>` supplied by the user.

@@ -24,7 +24,7 @@ import { createPublicProducer } from "./public-conversation.ts";
 import { AgentClosureError } from "./closure.ts";
 import { headExtension, leafScopeExtension } from "./head/tools.ts";
 import type { HeadAttachment } from "./head/runtime.ts";
-import { submitSchema, type NativeTurn } from "../architecture/types.ts";
+import type { NativeTurn } from "../table/participant.ts";
 import { isConsultation } from "./consultation.ts";
 import { ManagedProducer, managedTools, managedGuard } from "./head/managed-tools.ts";
 
@@ -540,8 +540,8 @@ async function openSession(
           return { block: true, reason: "Consultative leaves cannot orchestrate Pitako work" };
       });
       if (input.participant) {
-        pi.registerTool({ name: "architecture_submit", label: "Submit architecture turn", description: "Submit for your exact architecture grant. Contextual errors allow one correction with a new submissionId (two distinct candidates). Identical retries are idempotent; valid provisional submissions are locked. Does not dispatch work.",
-          parameters: submitSchema, async execute(id, value, signal, _update, ctx) {
+        pi.registerTool({ name: `${input.participant.protocol}_submit`, label: "Submit table turn", description: "Submit for your exact table grant. Contextual errors allow one correction with a new submissionId (two distinct candidates). Identical retries are idempotent; valid provisional submissions are locked. Does not dispatch work.",
+          parameters: input.participant.schema, async execute(id, value, signal, _update, ctx) {
             try {
               const turn = architectureTurns.getStore();
               if (!turn?.active || turn.session !== nativeSession) throw new Error("architecture grant not active");
@@ -566,7 +566,7 @@ async function openSession(
     }, ...(input.head && headBinding ? [headExtension(input.head, headBinding, () => nativeSession!.sessionManager)] : []),
     ...(input.scope ? [leafScopeExtension(input.scope, () => nativeSession!)] : []),
     ...(managed ? [managedGuard(supported, !!input.head)] : [])],
-    appendSystemPrompt: [childInstructions(input.role, input.instanceId), ...(input.participant ? ["Host architecture policy: analysis only; no product edits, including through Bash. Use only your local architecture_submit grant. Do not dispatch agents or use coordinator tools. Bash remains a trusted tool, not an OS sandbox."] : []), ...(managed ? [
+    appendSystemPrompt: [childInstructions(input.role, input.instanceId), ...(input.participant ? [`Host ${input.participant.protocol} policy: analysis only; no product edits, including through Bash. Use only your local ${input.participant.protocol}_submit grant. Do not dispatch agents or use coordinator tools. Bash remains a trusted tool, not an OS sandbox.`] : []), ...(managed ? [
       "Managed local-source support: use the supported native file tools, known loaded apply_patch, or finite foreground bash within your canonical write reservation. No daemons, detached/remote writers or escaped descendants. Shell scope is cooperative, not confinement. Unsupported writing tools and unowned compositions are refused. Only the host-bound Head requests staging through head_checkpoint; leaves do not stage or commit independently. A checkpoint is local partial source, not acceptance, publication or final verification.",
     ] : [])],
     skillsOverride: (base) => ({
@@ -645,14 +645,15 @@ async function openSession(
     }
     registerExecution({ instanceId: input.instanceId, roleId: input.role.id, sessionId: session.sessionId,
       profile: isConsultation(input.role.id) || input.participant ? "analysis" : "coding",
-      architecture: !!input.participant,
+      architecture: input.participant?.protocol === "architecture",
+      table: input.participant?.protocol,
       managed: input.head ? "head" : input.scope ? "leaf" : input.consultant ? "consultation" : undefined });
     if (input.signal.aborted) {
       await disposeChildSession(session);
       throw new Error("Agent session startup cancelled");
     }
     live = input.bindLive ? createLiveHandle(session, input.sessionHistory!, () => input.head?.interruptWait()) : undefined;
-    if (live && input.participant) live.handle.input = async () => { throw new Error("Use architecture_control for architecture participants"); };
+    if (live && input.participant) live.handle.input = async () => { throw new Error(`Use ${input.participant!.protocol}_control for ${input.participant!.protocol} participants`); };
     lifecycle.live = live;
     if (live) live.handle.publicConversation = createPublicProducer(session, input.sessionHistory!);
     lifecycle.unbindLive = live ? input.bindLive!(live.handle) : undefined;

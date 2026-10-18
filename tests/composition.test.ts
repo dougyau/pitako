@@ -104,6 +104,31 @@ describe("engineering-layer composition", () => {
     expect(note).not.toContain("Encode the real domain in a data structure");
   });
 
+  test("review documentation ships through existing package resources", () => {
+    const manifest = JSON.parse(readRepo("package.json"));
+    for (const resource of ["extensions", "skills", "docs"]) expect(manifest.files).toContain(resource);
+    expect(manifest.pi.extensions.filter((entry: string) => entry === "./extensions/agent/index.ts")).toHaveLength(1);
+    expect(manifest.pi.extensions.some((entry: string) => entry.includes("/review/"))).toBe(false);
+    const documentation = readRepo("docs/review.md");
+    const examples = [...documentation.matchAll(/```json\n([\s\S]*?)\n```/g)].map(match => JSON.parse(match[1]!));
+    expect(examples).toHaveLength(2);
+    expect(examples[0]).toMatchObject({ object: { kind: "plan", planId: "storage-design" }, plan: "storage-design", unit: "reviewer-critique" });
+    expect(examples[1].object).toEqual(examples[0].object);
+    for (const key of ["plan", "unit", "boardTopicId"]) expect(examples[1][key]).toBeUndefined();
+    expect(readRepo("README.md")).toContain("[Reviewer tables](docs/review.md)");
+    expect(readRepo("docs/architecture.md")).toContain("[Reviewer tables](review.md)");
+  });
+
+  test("startup completion sources and guidance ship through existing package resources", () => {
+    const manifest = JSON.parse(readRepo("package.json"));
+    for (const resource of ["config", "extensions", "docs"]) expect(manifest.files).toContain(resource);
+    for (const resource of ["config/completion-examples.toml", "extensions/roles/config-completion.ts",
+      "extensions/roles/complete.ts", "docs/configuration.md"]) expect(readRepo(resource).length).toBeGreaterThan(0);
+    expect(readRepo("README.md")).toContain("[Startup configuration completion](docs/configuration.md)");
+    expect(readRepo("docs/review.md")).toContain("[Startup configuration completion](configuration.md)");
+    expect(readRepo("docs/architecture.md")).toContain("[Startup configuration completion](configuration.md)");
+  });
+
   test("pitako-coding routes without duplicating specialized bodies", () => {
     const router = readRepo("skills/pitako-coding/SKILL.md");
     expect(router).toContain("This skill is the router.");

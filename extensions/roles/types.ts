@@ -79,6 +79,7 @@ export interface ResolvedRole {
 
 export interface PitakoConfig {
   architecture?: ArchitectureConfig;
+  review?: ArchitectureConfig;
   defaultsPath: string;
   userConfigPath: string;
   userConfigPresent: boolean;
