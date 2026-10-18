@@ -16,7 +16,7 @@ test("setup prepares its checkout and initializes only missing indexes best-effo
     if (!nodeOnPath) throw new Error("setup test requires Node");
     const realNode = nodeOnPath;
     copyFileSync(new URL("../scripts/setup.sh", import.meta.url), path.join(checkout, "scripts/setup.sh"));
-    writeFileSync(path.join(checkout, "package.json"), '{"packageManager":"bun@1.3.14","engines":{"node":">=22.19.0"}}');
+    writeFileSync(path.join(checkout, "package.json"), '{"engines":{"node":">=22.19.0","bun":">1.4.2"}}');
     const log = path.join(root, "calls");
     for (const command of ["git", "bun", "node", "codegraph"]) {
       writeFileSync(path.join(bin, command), `#!/bin/bash
@@ -31,13 +31,13 @@ case "${command}:$1" in
     printf 'child-env|%s|%s|%s|%s|%s|%s\\n' "$PWD" "$CODEGRAPH_NO_WATCH" "$CODEGRAPH_FORCE_WATCH" "$CODEGRAPH_NO_DOWNLOAD" "$DO_NOT_TRACK" "\${CODEGRAPH_DIR:-}" >> "$CALL_LOG"
     exit "\${CODEGRAPH_EXIT:-0}" ;;
   git:*) exit "\${GIT_EXIT:-0}" ;;
-  bun:--version) echo "\${BUN_VERSION:-1.3.14}" ;;
+  bun:--version) echo "\${BUN_VERSION-1.4.3}" ;;
   bun:install) exit "\${INSTALL_EXIT:-0}" ;;
-  node:-p) echo bun@1.3.14 ;;
   node:--input-type=module)
     source="$(</dev/stdin)"
     if [[ "$source" == *createRequire* ]]; then exit "\${NATIVE_EXIT:-0}"; fi
-    exit "\${NODE_EXIT:-0}" ;;
+    if [[ "\${NODE_EXIT:-0}" != 0 ]]; then exit "$NODE_EXIT"; fi
+    exec "$REAL_NODE" "$@" <<< "$source" ;;
 esac
 `);
       chmodSync(path.join(bin, command), 0o755);
@@ -68,7 +68,7 @@ esac
     expect(skipped.stderr).not.toContain("Warning:");
     expect(skipped.calls).toContain("install --frozen-lockfile");
     expect(skipped.calls.match(/node\|.*\|--input-type=module/g)).toHaveLength(2);
-    expect(skipped.calls.match(/\|-p/g)).toHaveLength(1); // Keep package-manager lookup, omit graph-directory lookup.
+    expect(skipped.calls).not.toMatch(/\|-p/); // Omit graph-directory lookup.
     expect(skipped.calls).not.toContain("codegraph|");
     expect(run({ INSTALL_EXIT: "14" }, ["--skip-codegraph"]).status).toBe(14);
     expect(run({ NATIVE_EXIT: "15" }, ["--skip-codegraph"]).status).toBe(15);
@@ -77,6 +77,19 @@ esac
       expect(failed.status).not.toBe(0);
       expect(failed.calls).not.toContain("install --frozen-lockfile");
       expect(failed.calls).not.toContain("codegraph|");
+    }
+    for (const version of ["1.4.4", "1.5.0", "2.0.0"]) {
+      const newer = run({ BUN_VERSION: version }, ["--skip-codegraph"]);
+      expect(newer.status).toBe(0);
+      expect(newer.stdout).toContain(`Bun ${version}`);
+      expect(newer.calls).toContain("install --frozen-lockfile");
+    }
+    for (const version of ["1.4.2", "1.3.14", "1.4.3-canary.1", "invalid", ""]) {
+      const rejected = run({ BUN_VERSION: version }, ["--skip-codegraph"]);
+      expect(rejected.status).not.toBe(0);
+      expect(rejected.stderr).toContain("Bun");
+      expect(rejected.calls).not.toContain("install --frozen-lockfile");
+      expect(rejected.calls).not.toContain("codegraph|");
     }
     const install = run({ INSTALL_EXIT: "14" });
     expect(install.status).toBe(14);
@@ -150,7 +163,7 @@ test("setup rejects an unsupported actual Node before installation", () => {
   try {
     mkdirSync(path.join(root, "scripts"));
     copyFileSync(new URL("../scripts/setup.sh", import.meta.url), path.join(root, "scripts/setup.sh"));
-    writeFileSync(path.join(root, "package.json"), '{"packageManager":"bun@1.3.14","engines":{"node":">=99.0.0"}}');
+    writeFileSync(path.join(root, "package.json"), '{"engines":{"node":">=99.0.0","bun":">1.4.2"}}');
     const result = spawnSync("/bin/bash", [path.join(root, "scripts/setup.sh")], {
       cwd: tmpdir(), encoding: "utf8", timeout: 10000,
     });
