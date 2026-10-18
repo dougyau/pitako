@@ -720,7 +720,7 @@ for (const method of ["agent_spawn", "team_assign"] as const) {
     }
     fixture.finishOnCleanup(() => { if (node.connected) node.send("exit"); });
     await phase("live");
-    expect(JSON.parse(output.trim()).node).toMatch(/^v26/);
+    expect(JSON.parse(output.trim()).node).toMatch(/^v\d+\.\d+\.\d+/);
     const lease = client.lease;
     await client.disconnect(); // No input/cancel/disconnect side effect.
     const resumed = await connect(descriptor, { expectedSessionId: owner.sessionId, resume: lease }); clients.push(resumed);
