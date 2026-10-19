@@ -2,7 +2,7 @@ import { architectureRoom, registerArchitectureRoom, captureArchitecture, archit
 import { randomUUID } from "node:crypto";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { loadPitakoConfig } from "../roles/load.ts";
+import { loadPitakoConfig, resolveRoleFromConfig } from "../roles/load.ts";
 import { executionForSession } from "../execution-identity.ts";
 import { currentInstanceId } from "../agent/scope.ts";
 import { assertNoCheckpointLease } from "../agent/head/checkpoint-lease.ts";
@@ -34,14 +34,14 @@ export function registerArchitecture(pi: ExtensionAPI) {
     try { return await execute(...args); }
     catch (error) { return { ...result({ error: String(error) }), isError: true }; }
   };
-  pi.registerTool({ name: "architecture_start", label: "Start architecture consultation",
-    description: `Start an analysis-only direct consultation or autonomous table (up to five specialists, two supports and five rounds). Returns the real Architect Team result/cancel handle. Only the root delivers synthesis, after disband. ${briefGuidance}`,
-    parameters: Type.Object({ mode: Type.Union([Type.Literal("consultation"), Type.Literal("table")]), goal: Type.String({ minLength: 1, description: briefGuidance }), topic: Type.Optional(text), plan: Type.Optional(text), unit: Type.Optional(text), boardTopicId: Type.Optional(text) }, strict),
+  pi.registerTool({ name: "architecture_start", label: "Start Architect table",
+    description: `Start an analysis-only Architect-directed table with zero to five specialists, two supports and five rounds. Returns the real Architect Team result/cancel handle. Only the root delivers synthesis, after disband. ${briefGuidance}`,
+    parameters: Type.Object({ goal: Type.String({ minLength: 1, description: briefGuidance }), topic: Type.Optional(text), plan: Type.Optional(text), unit: Type.Optional(text), boardTopicId: Type.Optional(text) }, strict),
     async execute(toolCallId, params, _signal, _update, ctx) {
       try {
         const evaluation = evaluationFor(ctx), config = structuredClone(loadPitakoConfig({ cwd: ctx.cwd }));
-        if (params.mode !== "consultation" && params.mode !== "table") throw new Error("invalid architecture mode");
-        if (!config.architecture) throw new Error("architecture is disabled: configuration absent");
+        const director = resolveRoleFromConfig(config, "architect");
+        if (director.modelPolicy.diagnostic) throw new Error(director.modelPolicy.diagnostic);
         const team = createTeam(evaluation), assignmentId = randomUUID();
         const admission = reserveTeamMember(evaluation, "architect", assignmentId, team.teamId);
         const origin: HistoryOrigin = { source: "team_assign", entrypoint: "architecture_start", assignmentId,
@@ -59,7 +59,7 @@ export function registerArchitecture(pi: ExtensionAPI) {
               durableWatch = watched.durableWatch;
               const launchRoot = watched.execution?.executionRoot ?? ctx.cwd;
               if (watched.execution) origin.execution = { executionRoot: launchRoot, executionRef: `${watched.execution.planId}@${watched.execution.revision}:${watched.execution.hash}` };
-              const runtime = createConsultation({ team, config, mode: params.mode, goal: params.goal, topic: params.topic, root: { assignmentId, memberId: admission.memberId, instanceId: reserved.instanceId },
+              const runtime = createConsultation({ team, config, goal: params.goal, topic: params.topic, root: { assignmentId, memberId: admission.memberId, instanceId: reserved.instanceId },
                 origin, cwd: launchRoot, owns: reserved.current, observation: architectureRoom(evaluation, team.teamId) });
               captureArchitecture(architectureRoom(evaluation, team.teamId), room => { room.runtime = runtime; room.runtimeCreated = true; });
               recordTeamAssignment(evaluation, "architect", { id: assignmentId, instanceId: reserved.instanceId, roleId: "architect", task: params.goal,
@@ -70,7 +70,7 @@ export function registerArchitecture(pi: ExtensionAPI) {
             },
           });
           admission.commit();
-          registerArchitectureRoom({ evaluation, roomId: team.teamId, mode: params.mode, toolCallId, director: { assignmentId, memberId: admission.memberId, instanceId: handle.instanceId } });
+          registerArchitectureRoom({ evaluation, roomId: team.teamId, toolCallId, director: { assignmentId, memberId: admission.memberId, instanceId: handle.instanceId } });
           recordTeamAssignment(evaluation, "architect", { id: assignmentId, instanceId: handle.instanceId, roleId: "architect", task: params.goal, dispatchId: handle.dispatchId });
           return result({ ...handle, roomId: team.teamId, assignmentId, memberId: admission.memberId });
         } catch (error) { admission.rollback(); throw error; }

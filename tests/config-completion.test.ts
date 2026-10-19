@@ -26,6 +26,8 @@ describe("additive config completion", () => {
     "[roles.developer]\ndescription = '''\n# pitako:setting review.topics\n[agent_runtime]\n'''\n",
     '[roles.developer]\nname = "escaped \\"quote\\" # not comment"\ndescription = """ends with a quote""""\n',
     '[model_policies.developer]\nprimary = { model = "fixture/model" }\nfallbacks = [{model="fixture/other"}]\n',
+    '[review]\n',
+    '[review]\ncandidates=[]\ntopics=[]\n',
     '[review]\ncandidates = [{ model="fixture/model" }]\ntopics = [{ topic="security", candidates=[{model="fixture/other"}] }]\n',
   ]) {
     test(`preserves source and semantics: ${JSON.stringify(source.slice(0, 70))}`, () => {
@@ -118,6 +120,6 @@ describe("additive config completion", () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  for (const source of ["[broken", "unknown=1", "head_developer.max_parallel=0", '[review]\ncandidates=[]', 'roles.developer.instructions="missing.md"'])
+  for (const source of ["[broken", "unknown=1", "head_developer.max_parallel=0", '[review]\ncandidates={}', 'roles.developer.instructions="missing.md"'])
     test(`rejects invalid original ${source}`, () => { expect(() => planConfigCompletion(source, options)).toThrow(); });
 });

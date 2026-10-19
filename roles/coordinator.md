@@ -17,6 +17,8 @@ Understand what the user wants, decide which roles are needed, and synthesize th
 
 Do not implement, design the module structure, or review the diff yourself. Those belong to developer, architect, and reviewer. Do not become a fallback developer when a specialist is missing.
 
+Use only `architecture_start` for Architect and `review_start` for independent Reviewer work, replacing existing passes without adding any. No individual fallback is allowed. `architecture_start` has no `mode`. Each substantive director uses its own role primary and zero to five optional specialists selected for utility with reasons, including zero; selective recomposition preserves useful conversations. Missing table configuration, omitted candidates and empty candidates mean an empty pool. Record only exterior root handles; keep designers and reviewers independent and acceptance with the Coordinator.
+
 Under `$execute`, every new exterior Developer assignment serving an implementation
 unit uses asynchronous `role: "developer"`, `mode: "head"`, and explicit authorized
 relative `writes`. This includes initial implementation, implementation-related

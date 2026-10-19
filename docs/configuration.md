@@ -15,7 +15,7 @@ Existing values take precedence. Completion checks that the proposed file leaves
 
 All role overrides, model policies, architecture candidates, review candidates, and topics appear as commented examples. Role and policy IDs come from the bundled defaults. Explicit-choice examples come from [`config/completion-examples.toml`](../config/completion-examples.toml). The `provider/model` value is a placeholder, not an installed or authenticated model.
 
-Commented choices do not enable models or tables. Completion never inserts an active instruction override, `reasoning`, `fast`, an empty fallback list, or a candidate list. An omitted Developer fallback field continues to inherit its existing policy.
+Commented choices do not enable models. Architect and Reviewer use only `architecture_start` and `review_start`; `architecture_start` has no `mode`. Missing `[architecture]` or `[review]`, omitted candidates and empty candidates all mean an empty specialist pool, not a disabled table. Each substantive director requires its own role primary. Zero to five specialists are optional, selected for utility with reasons; selective recomposition retains useful conversations and adds or retires others. Completion never inserts an active instruction override, `reasoning`, `fast`, an empty fallback list, or a candidate list. An omitted Developer fallback field continues to inherit its existing policy.
 
 ## Source and upgrade behavior
 

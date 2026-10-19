@@ -86,12 +86,23 @@ test("import, registration, runtime preparation, readers and inspection commands
 
 test("invalid config startup rejects outside the history warning catch, before publication", async () => {
   mkdirSync(path.dirname(file()), { recursive: true });
-  writeFileSync(file(), "[review]\ncandidates=[]\n");
+  writeFileSync(file(), "[review]\ncandidates=false\n");
   const sample = harness();
-  await expect(sample.emit("session_start")).rejects.toThrow("expected nonempty candidates");
+  await expect(sample.emit("session_start")).rejects.toThrow("expected an array");
   expect(sample.messages.some(x => x.includes("Worker history maintenance failed"))).toBe(false);
   expect(sample.profiles).toEqual([]);
-  expect(readFileSync(file(), "utf8")).toBe("[review]\ncandidates=[]\n");
+  expect(readFileSync(file(), "utf8")).toBe("[review]\ncandidates=false\n");
+});
+
+test("empty table pools permit principal startup and remain normalized after completion", async () => {
+  mkdirSync(path.dirname(file()), { recursive: true });
+  writeFileSync(file(), "[architecture]\n[review]\ncandidates=[]\ntopics=[]\n");
+  const sample = harness();
+  await sample.emit("session_start");
+  const config = loadPitakoConfig({ cwd: owned.root });
+  expect(config.architecture).toEqual({ candidates: [], topics: [] });
+  expect(config.review).toEqual({ candidates: [], topics: [] });
+  expect(sample.profiles.length).toBeGreaterThan(0);
 });
 
 test("contention warns but preserves valid independent startup", async () => {

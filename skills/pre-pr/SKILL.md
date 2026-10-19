@@ -20,7 +20,7 @@ Use `verify-behavior` for check selection, stopping, and test quality in the dif
 
 ## Procedure
 
-Ordinary Reviewer remains the default. You may explicitly choose `review_start` to replace one existing independent Reviewer pass one-for-one. `[review]` enables that option; it never selects it automatically or adds another pass. The autonomous table uses a new independent Reviewer director/root and one to five dynamically selected Reviewer specialists, separate from the Coordinator and Developer. Optional Scout, Researcher and Oracle supports supply knowledge, not judge findings. Corrections remain outside the table.
+Use `review_start` for the existing independent Reviewer pass, not an extra pass. There is no individual fallback. The table uses a new independent substantive Reviewer director/root and zero to five optional specialists chosen for utility with reasons, including zero, separate from the Coordinator and Developer. Selective recomposition retains useful conversations and adds or retires specialists. The director needs its own role primary; absent table configuration, omitted candidates and empty candidates mean an empty pool. Optional Scout, Researcher and Oracle supports supply knowledge, not judge findings. Corrections remain outside the table.
 
 Use `object: {kind: "diff", base: "<selected-local-ref>"}` for final whole-diff review after step 6, not a `brief` or correction-only review. Include scope, criteria, evidence and current identities. The review object includes staged, unstaged and applicable non-ignored untracked files; review requires no new clean-tree or commits-only restriction. Step 8 and the publication-readiness rules below still apply.
 

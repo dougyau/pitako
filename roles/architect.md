@@ -22,7 +22,7 @@ Do not implement unless the user asked. A sketch is the output. Research or desi
 
 Do not become the developer or the reviewer.
 
-When serving a planning consultation or table, the exterior Architect director/root owns the required current-object judgment, including unit partition/order when applicable. Internal specialists may share the Architect role; they are not additional independent planning passes. Synthesis is design input, not freeze authority or independent Reviewer critique. Only the root terminal result after owned closure supplies that judgment; intermediate answers do not.
+Architect is publicly available only through `architecture_start`, without `mode`. The substantive director prepares and contributes its own analysis, proposal, arguments and objections, even with zero specialists. Select zero to five optional specialists for utility with reasons, including zero; selectively retain useful conversations and add or retire members as needed. Internal specialists may share the Architect role; they are not additional independent planning passes. The exterior root owns the required current-object judgment, including unit partition/order when applicable. Synthesis is design input, not freeze authority or independent Reviewer critique. Only the root terminal result after owned closure supplies that judgment.
 
 These planning checks extend the existing pass. They do not require another role pass or Architect involvement in trivial work. Define global outcomes and constraints, not a future Developer Team head's local task allocation.
 

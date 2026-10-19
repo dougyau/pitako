@@ -7,7 +7,7 @@ import { controlledPi, controlledModel } from "./fixtures/pi-factories.ts";
 import { createPiExecutor } from "../extensions/agent/pi.ts";
 import { readBackgroundPending, setBackgroundExecutor, reserveBackground, spawnBackground, workerHandoff, workerStatus,
   draftWorkerResults, observeWorkerResults, observeIntermediateResults, intermediateReceipts,
-  draftIntermediateResults, finishTeamWorker, cancelWorker, teamWorkerStatus } from "../extensions/agent/background.ts";
+  draftIntermediateResults, finishTeamWorker, cancelWorker, teamWorkerStatus, publishIntermediate } from "../extensions/agent/background.ts";
 import { createAgentController } from "../extensions/agent/controller.ts";
 import { createAgentBridge } from "../extensions/agent/bridge/broker.ts";
 import { connect } from "../extensions/agent/bridge/client.js";
@@ -131,7 +131,7 @@ test("disbanded specialists release internally while the exterior director still
   });
   const scope = scopeFor(room);
   try {
-    const accepted = await room.invoke("architecture_start", { mode: "table", goal: "bounded synthesis" });
+    const accepted = await room.invoke("architecture_start", { goal: "bounded synthesis" });
     expect(accepted.isError).not.toBe(true);
     const id = accepted.details.instanceId;
     await synthesizing.promise;
@@ -150,17 +150,24 @@ test("disbanded specialists release internally while the exterior director still
   } finally { synthesis.resolve(); close.resolve(); await room.close(); }
 }));
 
-test("direct consultation final receipt cannot hide an unincorporated intermediate", suite.fixture.ownedCase("intermediate", async () => {
+test("historical intermediate delivery cannot be hidden by the final receipt", suite.fixture.ownedCase("intermediate", async () => {
   const room = await suite.setup({ busy: true }), scope = scopeFor(room);
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  setBackgroundExecutor({ async start() {
+    entered.resolve(); await release.promise;
+    return { status: "completed", result: "answer", sideEffects: false };
+  } });
   try {
-    const accepted = await room.invoke("architecture_start", { mode: "consultation", goal: "one answer" });
+    const accepted = await room.invoke("team_assign", { role: "researcher", task: "controlled historical receipt" });
     expect(accepted.isError).not.toBe(true);
     const id = accepted.details.instanceId;
-    await room.knowledge[0]!.promise; await tick();
+    await entered.promise;
+    // Preserve generic envelope ordering without reviving the retired direct-table producer.
+    publishIntermediate(scope.ownerToken, id, "historical-room", "historical-turn", "historical answer");
     expect(intermediateReceipts(scope.ownerToken, id)[0]?.delivery).toBe("pending");
     expect(readBackgroundPending(scope)).toEqual({ state: "pending" });
-    expect((await room.invoke("architecture_control", { roomId: accepted.details.roomId, action: "finish" })).isError).not.toBe(true);
-    await finishTeamWorker(scope.ownerToken, id); await tick();
+    release.resolve();
+    await suite.fixture.settleRuns(); await tick();
     const final = draftWorkerResults(scope.ownerToken, "completed")!;
     room.branch.push(...final.entries); observeWorkerResults(scope.ownerToken);
     expect(workerHandoff(id)?.delivery).toBe("incorporated");
@@ -172,7 +179,7 @@ test("direct consultation final receipt cannot hide an unincorporated intermedia
     expect(intermediateReceipts(scope.ownerToken, id)[0]).toMatchObject({ delivery: "incorporated", continuation: "requested" });
     expect(readBackgroundPending(scope)).toEqual({ state: "none" });
     expect(workerHandoff(id)?.continuation).not.toBe("observed");
-  } finally { await room.close(); }
+  } finally { release.resolve(); await room.close(); }
 }));
 
 test("repeated cancel and Stop withdraw delivery only after held disposal", suite.fixture.ownedCase("cancel", async () => {

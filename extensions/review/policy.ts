@@ -70,7 +70,10 @@ export function validateReview(grant: ReviewGrant, value: unknown): { submission
       if (keys.has(added.finding.key)) reject("newFindings.key", [added.finding.key]);
       keys.add(added.finding.key); references(added.references);
     }
-    if (body.completion === "complete" && grant.partialReasons.length) reject("completion", ["complete"], grant.partialReasons);
+    if (body.completion === "complete" && (grant.partialReasons.length ||
+      grant.rules.kind === "synthesis" && grant.rules.pendingDoubts.length))
+      reject("completion", ["complete"], [...grant.partialReasons,
+        ...(grant.rules.kind === "synthesis" ? grant.rules.pendingDoubts.map(doubt => doubt.id) : [])]);
     const effective = (finding: PublishedFinding) => grant.responses.filter(item => item.findingId === finding.id && item.memberId === finding.memberId &&
       item.action === "modify").at(-1)?.replacement ?? finding;
     const material = (finding: { materiality: string; basis: { kind: string } }) => finding.materiality === "blocking" || finding.basis.kind === "missing-observation";
@@ -107,7 +110,8 @@ export function createReviewPolicy(object: ReviewObject, goal: string, criteria:
     grant(grant: StageGrant, messages: TableMessage[], partialReasons: string[]): ReviewGrant {
       return { ...grant, findings: grant.rules.kind === "preparation" ? [] : structuredClone(findings),
         responses: grant.rules.kind === "preparation" ? [] : structuredClone(responses),
-        references: [...messages.map(item => item.id), ...findings.map(item => item.id), ...messages.flatMap(item => item.doubts.map(doubt => doubt.id))],
+        references: grant.rules.kind === "preparation" ? [] :
+          [...messages.map(item => item.id), ...findings.map(item => item.id), ...messages.flatMap(item => item.doubts.map(doubt => doubt.id))],
         partialReasons };
     },
     reobserve() {

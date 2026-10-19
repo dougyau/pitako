@@ -584,6 +584,14 @@ export async function turnTeamWorker(token: symbol, instanceId: string, task: st
 }
 const pendingTurns = new WeakSet<Row>();
 
+/** Host composition admission uses authority and pending operations, not a status projection. */
+export function teamWorkerRetainable(token: symbol, instanceId: string): boolean {
+  const row = bag().rows.get(instanceId);
+  return !!row && row.teamOwnerToken === token && liveOwner(row) && !row.controller.signal.aborted &&
+    !row.outcome && row.closure.state === "pending" && !!row.maintained &&
+    !row.maintained.closing && !row.maintained.turn && !pendingTurns.has(row);
+}
+
 /** Close the member's lifetime, not the exterior orchestrator that invoked this join. */
 export async function finishTeamWorker(token: symbol, instanceId: string): Promise<void> {
   const row = bag().rows.get(instanceId);

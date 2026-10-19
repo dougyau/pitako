@@ -1,6 +1,6 @@
 import { createTable } from "../table/runtime.ts";
 
-/** Architecture's public facade retains direct and autonomous modes. */
+/** Architecture's director-led table facade. */
 export function createConsultation(input: Omit<Parameters<typeof createTable>[0], "review">) {
   return createTable(input);
 }

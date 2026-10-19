@@ -17,6 +17,7 @@ import agentInstance from "../extensions/agent/index.ts";
 import * as controllerModule from "../extensions/agent/controller.ts";
 import profilePolicy from "../extensions/profile-policy.ts";
 import * as bridgeModule from "../extensions/agent/bridge/broker.ts";
+import * as routing from "../extensions/agent/routing.ts";
 import { connect } from "../extensions/agent/bridge/client.js";
 
 const fixture = agentFixtureOwnership();
@@ -423,14 +424,14 @@ test("current Team lease permits native input/cancel; retirement leaves independ
   await view.close(); controller.revoke(); await controller.settle();
 }));
 
-for (const role of ["researcher", "reviewer"]) {
+for (const role of ["researcher", "developer"]) {
 test(`same-session startup fences ${role} agent_spawn while controlled external startup is held`, fixture.ownedCase("startup admission " + role, async () => {
   const { root, load } = setup();
   process.env.PI_OFFLINE = "1";
   const agentDir = process.env.PI_CODING_AGENT_DIR!;
   mkdirSync(path.join(agentDir, "pitako"), { recursive: true });
   writeFileSync(path.join(agentDir, "pitako/config.toml"), readFileSync(load.userConfigPath, "utf8") +
-    '\n[model_policies.reviewer.primary]\nmodel = "fixture/selected"\nreasoning = "off"\n');
+    '\n[model_policies.developer_mid.primary]\nmodel = "fixture/selected"\nreasoning = "off"\n');
   let releaseCodex!: () => void, releaseDispatch!: () => void;
   const codexHold = new Promise<void>(resolve => { releaseCodex = resolve; });
   const dispatchHold = new Promise<void>(resolve => { releaseDispatch = resolve; });
@@ -457,6 +458,8 @@ test(`same-session startup fences ${role} agent_spawn while controlled external 
   let stale: Promise<unknown> | undefined;
   let view: ReturnType<ReturnType<typeof createAgentController>["openView"]> | undefined;
   let cleanup: (() => Promise<void>) | undefined;
+  const preflight = spyOn(routing, "developerPreflight").mockImplementation(input =>
+    routing.developerCapacityPreflight({ ...input, capacity: { route: "default" } }));
   try {
     const handlers = new Map<string, Function[]>(), tools = new Map<string, { execute: Function }>();
     const pi = { registerFlag() {}, registerCommand() {},
@@ -502,6 +505,7 @@ test(`same-session startup fences ${role} agent_spawn while controlled external 
       status: "cancelled", workerStarted: false,
     })]);
     expect(starts).toBe(0);
+    expect(preflight).not.toHaveBeenCalled();
     expect(joined).toBe(false);
     expect(await ownedDispatch({ ...ctx, sessionManager: { getSessionId: () => "independent" } } as never,
       undefined, () => true, async (_signal, check) => { check(); return "independent"; })).toBe("independent");
@@ -528,6 +532,7 @@ test(`same-session startup fences ${role} agent_spawn while controlled external 
     const freshView = controllers.at(-1)!.openView();
     expect(freshView.list().items.map(row => row.id)).toContain((fresh.details as { instanceId: string }).instanceId);
     expect(starts).toBe(2);
+    expect(preflight).toHaveBeenCalledTimes(role === "developer" ? 2 : 0);
     await freshView.close();
     for (const finish of finishes) finish();
     await emit("session_shutdown");
@@ -538,6 +543,7 @@ test(`same-session startup fences ${role} agent_spawn while controlled external 
     await Promise.allSettled([stale, dispatch, rebind, newerRebind]);
     await cleanup?.();
     await view?.close();
+    preflight.mockRestore();
     captureController.mockRestore();
   }
 }));

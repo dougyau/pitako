@@ -1,21 +1,20 @@
 import { Type, type Static } from "typebox";
 import { createParticipant } from "../table/participant.ts";
 import { validateSubmission } from "./protocol.ts";
+import { compositionSchema } from "../table/composition.ts";
 export type { NativeTurn } from "../table/participant.ts";
 
 const strict = { additionalProperties: false } as const;
 const text = Type.String({ minLength: 1 });
 const texts = Type.Array(text);
 const doubts = Type.Array(Type.Object({ question: text, purpose: text }, strict));
-const specialist = Type.Object({ candidateRef: text, mandate: text, reason: text }, strict);
 export const bodySchema = Type.Union([
-  Type.Object({ kind: Type.Literal("composition"), snapshotId: text, specialists: Type.Array(specialist, { minItems: 1, maxItems: 5 }) }, strict),
+  compositionSchema,
   Type.Object({ kind: Type.Literal("preparation"), analysis: text, doubts }, strict),
   Type.Object({ kind: Type.Literal("contribution"), proposal: text, arguments: texts,
     objections: Type.Array(Type.Object({ memberId: text, messageId: text, argument: text }, strict)), doubts }, strict),
   Type.Object({ kind: Type.Literal("decision"), action: Type.Union([
     Type.Literal("continue"), Type.Literal("consult"), Type.Literal("synthesize"), Type.Literal("recompose")]), reason: text }, strict),
-  Type.Object({ kind: Type.Literal("answer"), answer: text, evidence: texts, limits: texts, doubts }, strict),
   Type.Object({ kind: Type.Literal("consultation-plan"), resolutions: Type.Array(Type.Object({ doubtId: text,
     status: Type.Union([Type.Literal("answered"), Type.Literal("rejected")]), answer: text }, strict)),
     support: Type.Array(Type.Object({ role: Type.Union([Type.Literal("scout"), Type.Literal("researcher"), Type.Literal("oracle")]),

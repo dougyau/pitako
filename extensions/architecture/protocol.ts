@@ -1,5 +1,6 @@
 import { Value } from "typebox/value";
 import { submitSchema, type Body, type Message, type Stage } from "./types.ts";
+import { CompositionError, planComposition, type CompositionBasis } from "../table/composition.ts";
 
 export type Doubt = Message["doubts"][number];
 export type Plan = Extract<Body, { kind: "consultation-plan" }>;
@@ -12,8 +13,8 @@ export interface ConsultationResponse {
   error?: string;
 }
 export type StageRules =
-  | { kind: "composition"; snapshotId: string; candidateRefs: string[]; direct: boolean }
-  | { kind: "preparation" | "answer" }
+  | ({ kind: "composition" } & CompositionBasis)
+  | { kind: "preparation" }
   | { kind: "contribution"; objections: { memberId: string; messageId: string }[] }
   | { kind: "decision"; allowed: Extract<Body, { kind: "decision" }>["action"][] }
   | { kind: "consultation-plan"; doubts: Doubt[] }
@@ -65,11 +66,11 @@ export function validateSubmission(grant: StageGrant, value: unknown): { submiss
     if (bad.length || missing.length) reject(bad.length ? "reference" : "coverage", field, bad, missing);
   };
   if (body.kind === "composition" && rules.kind === body.kind) {
-    if (body.snapshotId !== rules.snapshotId) reject("snapshot", "body.snapshotId", [body.snapshotId], [rules.snapshotId]);
-    if (rules.direct && body.specialists.length !== 1) reject("coverage", "body.specialists");
-    const bad = body.specialists.filter(item => !rules.candidateRefs.includes(item.candidateRef)).map(item => item.candidateRef);
-    if (bad.length) reject("reference", "body.specialists.candidateRef", bad);
-    if (body.specialists.some(item => !item.mandate.trim() || !item.reason.trim())) reject("structure", "body.specialists");
+    try { planComposition(body, rules); }
+    catch (error) {
+      if (error instanceof CompositionError) reject(error.code, error.field, error.badIds, error.missingIds);
+      throw error;
+    }
   } else if (body.kind === "decision" && rules.kind === body.kind) {
     if (!rules.allowed.includes(body.action)) reject("action", "body.action", [body.action], rules.allowed);
   } else if (body.kind === "contribution" && rules.kind === body.kind) {

@@ -38,6 +38,7 @@ test("incoming snapshots, author-only modifications and withdrawal history", () 
   expect(() => validateReview(grant("author"), submit(withdrawn))).not.toThrow(); policy.publish(message("withdraw", "author", withdrawn));
   expect(policy.findings[0]).toMatchObject({ ...finding, objectIdentity: "object-identity" });
   expect(policy.responses.map(item => item.action)).toEqual(["modify", "withdraw"]);
+  expect(grant("newcomer", { kind: "preparation" })).toMatchObject({ findings: [], responses: [], references: [] });
 });
 
 test("exact dispositions, author-supported withdrawals, valid references and acyclic duplicates", () => {
@@ -66,6 +67,9 @@ test("work completion, materiality and missing indispensable observation are dis
   const { policy, grant, synthesis } = setup();
   const check = (body: Synthesis, reasons: string[] = []) => validateReview(grant("director", { kind: "synthesis", pendingDoubts: [], partialReasons: reasons }, reasons), submit(body));
   const body = synthesis(); body.verdict = "no-blockers";
+  const unresolved = grant("director", { kind: "synthesis", pendingDoubts: [{ id: "pending", question: "Observation?", purpose: "Complete work" }], partialReasons: [] });
+  expect(() => validateReview(unresolved, submit(synthesis()))).toThrow();
+  expect(() => validateReview(unresolved, submit({ ...synthesis(), completion: "partial" }))).not.toThrow();
   expect(() => check(body)).toThrow();
   body.dispositions[0]!.status = "rejected";
   expect(() => check(body)).not.toThrow();
