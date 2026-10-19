@@ -602,7 +602,7 @@ test("published Node reader and local immutable cuts retain ten ordered resoluti
     }
     if (request.stage === "consultation-response") return { kind: "consultation-response", doubtIds: request.context.request.doubtIds, answer: "Tenth evidence", evidence: [], limits: [], doubts: [] };
     if (request.stage === "knowledge") {
-      expect(request.context.delegatedDoubts).toEqual([original[9]]);
+      expect(request.context.delegatedDoubtIds).toEqual([original[9].id]);
       authored = { kind: "knowledge", resolutions: [{ doubtId: original[9].id, status: "answered", answer: "Delegated", supportIds: [request.context.responses[0].id] }] };
       return authored;
     }

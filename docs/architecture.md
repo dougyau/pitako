@@ -73,7 +73,11 @@ The table runs without a coordinator response between stages. Architect chooses 
 
 Independent supports may run together, at most two including startup and disposal. Dependent work starts only after its prerequisites succeed and close. The complete batch reaches Architect in request order, not arrival order; no specialist receives an early support result. New support doubts remain pending for a later stage or synthesis, not recursive dispatch.
 
-Each deliberation round gives every active specialist the same immutable shared snapshot, including prior preparations, contributions, integrated knowledge, failures and frontier controls. Objections identify another specialist's message and explain disagreement; they are not knowledge doubts. Contributions become shared only after all expected outer turns and callbacks settle. Failed/cancelled/invalid turns remain explicit failures, never empty contributions.
+Participants explore the repository themselves through existing read, search, shell, CodeGraph and LSP analysis tools. Stage prompts include the original work brief, effective root and relevant references. A compatible execution binding can select a root different from the foreground working directory. Local files are not an immutable exploration view. Analysis grants no product edits, installs, fetches or provider demonstrations.
+
+Stage prompts contain inputs for the task, not the full journal. Preparation has the original brief and individual mandate without peer deliberation. Each deliberation round gives every participant the same immutable cut of confirmed preparations, contributions, integrated knowledge, failures and frontier controls. Supports receive assigned doubts and closed prerequisite results. Knowledge integration receives the current plan and support outcomes. Synthesis receives confirmed substantive results and linked knowledge, not orchestration history or native message envelopes. Scoped inputs do not promise constant or unlimited context.
+
+Objections identify another specialist's message and explain disagreement; they are not knowledge doubts. Contributions become shared only after all expected outer turns and callbacks settle. Failed/cancelled/invalid turns remain explicit failures, never empty contributions.
 
 Between stages Architect can continue, consult, synthesize early or selectively recompose. Composition describes the total desired set: `retain` keeps an eligible member's identity, conversation and frozen policy while updating its mandate; `add` admits a new candidate. Omission retires an active specialist. Validate all choices before revocation, close only outgoing owners, then admit additions in choice order; pending or unknown closure never frees a seat. There is no mandatory recomposition or fixed preference for zero. Context and priorities enter the next frontier for participants and director. No in-flight snapshot changes. After at most five rounds, only final clarification and synthesis remain. Requests for another round or redesign produce partial synthesis; round six is never dispatched. Preparation and consultation stages do not count as rounds.
 
@@ -98,6 +102,8 @@ Confirmed boundaries feed every shared frontier and final synthesis. Internal `c
 ## Delivery, holds and closure
 
 Internal members never produce foreground envelopes, including during retirement. The former direct intermediate response is not emitted by new tables.
+
+The automatic Architect result remains the authored synthesis body, not an internal journal. The separate Reviewer result is a compact judgment with an effective-root object descriptor and referenced grounds, as described in [Reviewer tables](review.md#exterior-report-and-judgment). Neither result requires a read to discover its judgment. Explicit `architecture_read` and `review_read` retain their full canonical journals for diagnostics. Saved worker results and `team_result` use the same respective result bodies as automatic delivery.
 
 Only a final result after disband reaches terminal handoff and hold reconciliation. A partial synthesis is `failed`, not success. Stop is `cancelled`; failed, partial and cancelled results retain applicable holds. Unbound drafts create no ledger or Board binding; a bound draft without a ledger does not authorize creating one.
 

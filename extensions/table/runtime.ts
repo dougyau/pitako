@@ -13,6 +13,7 @@ import { planComposition, type CompositionChoiceRef, type SpecialistChoice } fro
 import { createParticipant } from "./participant.ts";
 import { submitSchema as reviewSchema, type TableBody, type TableMessage as Message } from "../review/types.ts";
 import { validateReview, type ReviewGrant, type ReviewPolicy } from "../review/policy.ts";
+import { describeObject } from "../review/object.ts";
 import { immutable, mergeKnowledge, validateSubmission, type StageGrant, type KnowledgeBoundary, type StageRules, type ConsultationResponse, type Plan, type Knowledge } from "../architecture/protocol.ts";
 
 type Team = ReturnType<typeof createTeam>;
@@ -27,6 +28,16 @@ export function createTable(input: { team: Team; config: PitakoConfig; goal: str
   const failures: { memberId: string; stage: Stage; round: number; error: string }[] = [];
   const appliedControls: { action: string; text?: string }[] = [];
   const protocol = input.review ? "review" : "architecture", rootId = input.review ? "reviewer" : "architect";
+  const resultMessage = (message: Message) => {
+    const body = { ...message.body,
+      ...("doubts" in message.body ? { doubts: message.doubts } : {}),
+      ...(input.review && "findings" in message.body ? {
+        findings: input.review.findings.filter(finding => finding.messageId === message.id) } : {}) };
+    return structuredClone({ id: message.id, author: message.author, memberId: message.memberId,
+      stage: message.stage, round: message.round, body });
+  };
+  const supportResult = (response: ConsultationResponse) => ({ id: response.id, status: response.status,
+    ...(response.message ? { message: resultMessage(response.message) } : {}), ...(response.error ? { error: response.error } : {}) });
   const record = (message: Message) => {
     messages.push(structuredClone(message)); publications.push(structuredClone(message));
     if (input.review) input.review.publish(message);
@@ -118,7 +129,11 @@ export function createTable(input: { team: Team; config: PitakoConfig; goal: str
     // Preserve the entire original queue until a confirmed merge commits this cycle.
     pendingDoubts = structuredClone(doubts);
     const cycleId = randomUUID();
-    const plan = (await rootTurn({ kind: "consultation-plan", doubts }, { phase, cycleId, sources, doubts })).message;
+    const origins = messages.filter(message => sources.some(source => source.id === message.id) ||
+      message.doubts.some(doubt => doubts.some(pending => pending.id === doubt.id)));
+    const plan = (await rootTurn({ kind: "consultation-plan", doubts }, { phase, cycleId,
+      sources: origins.map(resultMessage), doubts: doubts.map(({ id }) => ({ id })),
+      knowledgeBoundaries: confirmedKnowledge(origins.map(message => message.id)) })).message;
     if (plan.body.kind !== "consultation-plan") throw new Error("invalid consultation plan");
     const requests = plan.body.support;
     const responses: ConsultationResponse[] = requests.map(() => ({ id: randomUUID(), status: "failed", error: "not executed" }));
@@ -133,8 +148,22 @@ export function createTable(input: { team: Team; config: PitakoConfig; goal: str
         let fatal: unknown;
         try {
           target = internal(resolveRoleFromConfig(input.config, request.role), request.brief);
+          const prerequisites = new Set<number>();
+          const include = (index: number) => {
+            if (prerequisites.has(index)) return;
+            prerequisites.add(index);
+            requests[index]!.prerequisites.forEach(include);
+          };
+          request.prerequisites.forEach(include);
+          const relevantDoubtIds = new Set(request.doubtIds);
+          for (const prerequisite of prerequisites) {
+            const body = responses[prerequisite]!.message?.body;
+            if (body?.kind === "consultation-response") for (const doubtId of body.doubtIds) relevantDoubtIds.add(doubtId);
+          }
           const message = await memberTurn(target, { kind: "consultation-response", doubtIds: request.doubtIds },
-            { cycleId, consultationId: id, request, prerequisites: request.prerequisites.map(value => responses[value]) });
+            { mandate: request.brief, cycleId, consultationId: id, request,
+              doubts: doubts.filter(doubt => relevantDoubtIds.has(doubt.id)),
+              prerequisites: [...prerequisites].map(value => supportResult(responses[value]!)) });
           response = { id, assignmentId: target.member.assignmentId, status: "completed", message: message as ArchitectureMessage };
         } catch (error) {
           if (error instanceof AgentClosureError || !current()) fatal = error;
@@ -168,7 +197,10 @@ export function createTable(input: { team: Team; config: PitakoConfig; goal: str
     let knowledge: (Message & { body: Knowledge }) | undefined;
     if (requests.length) {
       const message = (await rootTurn({ kind: "knowledge", plan: plan.body, responses },
-        { phase, cycleId, doubts, directResolutions: plan.body.resolutions, delegatedDoubts, plan, responses, deferredDoubts })).message;
+        { phase, cycleId, doubts, delegatedDoubtIds: delegatedDoubts.map(doubt => doubt.id), plan: resultMessage(plan),
+          responses: responses.map((response, index) => ({ ...supportResult(response),
+            prerequisites: requests[index]!.prerequisites.map(value => responses[value]!.id) })),
+          deferredDoubtIds: deferredDoubts.map(doubt => doubt.id) })).message;
       if (message.body.kind !== "knowledge") throw new Error("invalid knowledge");
       knowledge = { ...message, body: message.body };
     }
@@ -184,9 +216,8 @@ export function createTable(input: { team: Team; config: PitakoConfig; goal: str
   type Specialist = { target: ReturnType<typeof internal>; choice: SpecialistChoice; state: SpecialistState;
     admittedBy: CompositionChoiceRef; selectedBy: CompositionChoiceRef };
   const roster: Specialist[] = [];
-  const projection = (item: Specialist) => ({ memberId: item.target.member.memberId, assignmentId: item.target.member.assignmentId,
-    instanceId: item.target.member.instanceId, state: item.state, mandate: item.choice.mandate,
-    admittedBy: item.admittedBy, selectedBy: item.selectedBy });
+  const projection = (item: Specialist) => ({ memberId: item.target.member.memberId,
+    mandate: item.choice.mandate, reason: item.choice.reason });
   const observeMember = (item: Specialist, supersededBy?: string) => architectureMember(input.observation, item.target.member.memberId, "specialist",
     item.admittedBy.compositionMessageId, supersededBy, { compositionChoiceIndex: item.admittedBy.choiceIndex,
       selection: item.selectedBy, mandate: item.choice.mandate, state: item.state });
@@ -202,7 +233,9 @@ export function createTable(input: { team: Team; config: PitakoConfig; goal: str
     const basis = immutable({ snapshotId,
       candidateRefs: [...snapshot.general, ...snapshot.topics.flatMap(topic => topic.candidates)].map(candidate => candidate.ref),
       retainableMemberIds: roster.filter(eligible).map(item => item.target.member.memberId) });
-    const composition = (await rootTurn({ kind: "composition", ...basis }, { requestedTopic: input.topic, shared: frontier() })).message;
+    const shared = frontier();
+    const composition = (await rootTurn({ kind: "composition", ...basis }, { requestedTopic: input.topic,
+      roster: roster.filter(eligible).map(projection), ...(messages.length ? { shared } : { controls: shared.controls }) })).message;
     if (composition.body.kind !== "composition") throw new Error("invalid composition");
     const plan = planComposition(composition.body, basis);
     check();
@@ -240,13 +273,22 @@ export function createTable(input: { team: Team; config: PitakoConfig; goal: str
     }
     return added;
   };
+  const confirmedKnowledge = (excluded: string[] = []) => boundaries.map(boundary => {
+    const author = messages.find(message => message.id === (boundary.knowledgeMessageId ?? boundary.planMessageId))!;
+    return { id: boundary.id, cycleId: boundary.cycleId, planMessageId: boundary.planMessageId,
+      knowledgeMessageId: boundary.knowledgeMessageId, author: author.author, memberId: author.memberId, stage: author.stage, round: author.round,
+      resolutions: boundary.resolutions.map(resolution => ({ ...structuredClone(resolution),
+        provenance: resolution.provenance.kind === "direct" ? { ...resolution.provenance } : { ...resolution.provenance,
+          responses: resolution.provenance.responses.map(({ consultationId, messageId, status }) => ({ consultationId, messageId, status })) } })),
+      responses: messages.filter(message => !excluded.includes(message.id) && boundary.resolutions.some(resolution => resolution.provenance.kind === "delegated" &&
+        resolution.provenance.responses.some(response => response.messageId === message.id))).map(resultMessage) };
+  });
   const frontier = () => {
     appliedControls.push(...consumeControls());
     sharedId = randomUUID();
     return immutable({ id: sharedId, round, controls: structuredClone(appliedControls), failures: structuredClone(failures),
-      knowledgeBoundaries: structuredClone(boundaries), roster: roster.map(projection), pendingDoubts: structuredClone(pendingDoubts),
-      ...(input.review ? { findings: structuredClone(input.review.findings), responses: structuredClone(input.review.responses) } : {}),
-      messages: structuredClone(messages), publications: structuredClone(publications) });
+      knowledgeBoundaries: confirmedKnowledge(), pendingDoubts: pendingDoubts.map(({ id }) => ({ id })),
+      messages: messages.filter(message => ["preparation", "contribution"].includes(message.stage)).map(resultMessage) });
   };
   const specialistStage = async (specialists: Specialist[], kind: "preparation" | "contribution", shared: ReturnType<typeof frontier>, includeDirector = true) => {
     const stageFailures: typeof failures = [];
@@ -293,7 +335,13 @@ export function createTable(input: { team: Team; config: PitakoConfig; goal: str
       sources = await specialistStage(roster.filter(item => item.state === "active")
         .sort((a, b) => a.selectedBy.choiceIndex - b.selectedBy.choiceIndex), "contribution", frontier());
       if (finishing) return;
-      const decision = (await rootTurn({ kind: "decision", allowed: round === 5 ? ["consult", "synthesize"] : ["continue", "consult", "synthesize", "recompose"] }, { round, sources, failures, finalRound: round === 5 })).message;
+      const decision = (await rootTurn({ kind: "decision", allowed: round === 5 ? ["consult", "synthesize"] : ["continue", "consult", "synthesize", "recompose"] },
+        { sources: sources.map(resultMessage), failures: structuredClone(failures),
+          limits: messages.filter(message => !sources.some(source => source.id === message.id))
+            .flatMap(message => "limits" in message.body ? message.body.limits : []),
+          pendingDoubtIds: pendingDoubts.map(doubt => doubt.id),
+          pendingDoubts: pendingDoubts.filter(doubt => !sources.some(message => message.doubts.some(own => own.id === doubt.id))),
+          controls: structuredClone(appliedControls), finalRound: round === 5 })).message;
       if (decision.body.kind !== "decision") throw new Error("invalid table decision");
       if (finishing || decision.body.action === "synthesize") return;
       if (round === 5) {
@@ -313,20 +361,18 @@ export function createTable(input: { team: Team; config: PitakoConfig; goal: str
     }
   };
   const directorMandate = input.review ? "Independently review the complete object against every criterion" : "Independently analyze the complete architectural goal";
-  // First opinions receive the original task and their selected focus, never host deliberation fields.
-  const prompt = (rules: StageRules, context: Record<string, unknown>) => JSON.stringify(rules.kind === "preparation" ? {
-    protocol: `Pitako ${protocol}`, stage: rules.kind, authorization: { kind: "preparation" },
-    instructions: `Analysis only. No product edits. Independently examine the complete task. Submit using local ${protocol}_submit. Final prose is not a submission. Do not dispatch agents.`,
-    goal: input.goal, topic: input.topic, context: { mandate: context.mandate },
-    ...(input.review ? { object: input.review.object, criteria: input.review.criteria } : {}),
-  } : { protocol: `Pitako ${protocol}`, stage: rules.kind, round: round || undefined,
-    authorization: rules,
-    instructions: `Analysis only. No product edits. Submit one valid body using local ${protocol}_submit. Contextual rejections allow one correction (two distinct candidates total) in this prompt; use a new submissionId for correction. Identical retries are idempotent; an accepted provisional cannot be replaced. Knowledge covers only delegatedDoubts; defer new support doubts. Synthesis must be partial if ${input.review ? "scheduled work or failures remain" : "pending doubts, limits or failures remain"}. Final prose is not a submission. Do not dispatch agents. ${input.review ? "Review the complete object against all criteria independently. Mandates focus, never restrict judgment. Findings require reachable evidence or indispensable missing observation with effect and next authorized capture. Supports supply knowledge, never judge findings. Only authors modify or withdraw. Synthesis must dispose every published finding exactly once and preserve dissent. Completion is work, never product acceptance." : ""}`,
-    snapshot, goal: input.goal, ...(input.review ? { object: input.review.object, criteria: input.review.criteria,
-      review: { findings: input.review.findings, responses: input.review.responses } } : {}),
-    topic: input.topic, controls: appliedControls, context,
-    journal: { id: sharedId, round, messages, publications, knowledgeBoundaries: boundaries, roster: roster.map(projection),
-      failures, pendingDoubts, controls: appliedControls } });
+  // Rules with result bodies stay host-private; their contents occur only in the selected stage inputs.
+  const prompt = (rules: StageRules, context: Record<string, unknown>) => JSON.stringify({
+    protocol: `Pitako ${protocol}`, stage: rules.kind, round: round || undefined,
+    authorization: rules.kind === "consultation-plan" ? { kind: rules.kind, doubtIds: rules.doubts.map(doubt => doubt.id) }
+      : rules.kind === "knowledge" ? { kind: rules.kind }
+      : rules.kind === "synthesis" ? { kind: rules.kind, pendingDoubtIds: rules.pendingDoubts.map(doubt => doubt.id) } : rules,
+    instructions: `Analysis only. No product edits. Explore privately from the effective root using existing analysis tools. Independently examine the complete task. Submit one valid body using local ${protocol}_submit. Contextual rejections allow one correction (two distinct candidates total) in this prompt; use a new submissionId for correction. Identical retries are idempotent; an accepted provisional cannot be replaced. Knowledge covers only delegatedDoubtIds; defer new support doubts. Synthesis must be partial if ${input.review ? "scheduled work or failures remain" : "pending doubts, limits or failures remain"}. Final prose is not a submission. Do not dispatch agents. ${input.review ? "Review the complete object against all criteria independently. Mandates focus, never restrict judgment. Findings require reachable evidence or indispensable missing observation with effect and next authorized capture. Supports supply knowledge, never judge findings. Only authors modify or withdraw; use the published finding id, not its messageId. Synthesis must dispose every published finding exactly once and preserve dissent. Completion is work, never product acceptance." : ""}`,
+    goal: input.goal, topic: input.topic, root: input.cwd,
+    ...(input.review ? { object: describeObject(input.review.object), criteria: input.review.criteria } : {}),
+    ...(rules.kind === "composition" ? { snapshot } : {}),
+    context,
+  });
   return {
     snapshot, architecture: rootArchitecture, table: rootArchitecture,
     control(action: "context" | "priorities" | "finish" | "stop", text?: string, toolCallId?: string) {
@@ -382,12 +428,16 @@ export function createTable(input: { team: Team; config: PitakoConfig; goal: str
           ...boundaries.flatMap(boundary => boundary.resolutions.filter(item => item.status !== "answered" && item.status !== "rejected").map(item => `Unresolved knowledge: ${item.doubtId}`)),
           ...messages.flatMap(message => "limits" in message.body ? message.body.limits : [])];
         reviewReasons = partialReasons;
-        const synthesis = await rootTurn({ kind: "synthesis", pendingDoubts, partialReasons }, { messages, knowledgeBoundaries: boundaries, failures, pendingDoubts, partialReasons, round, controls: [...appliedControls, ...consumeControls()] });
+        const synthesis = await rootTurn({ kind: "synthesis", pendingDoubts, partialReasons }, {
+          messages: messages.filter(message => ["preparation", "contribution"].includes(message.stage)).map(resultMessage),
+          knowledgeBoundaries: confirmedKnowledge(), failures: structuredClone(failures),
+          pendingDoubts: pendingDoubts.map(({ id }) => ({ id })), partialReasons,
+          controls: [...appliedControls, ...consumeControls()] });
         if (synthesis.message.body.kind !== "synthesis") throw new Error("invalid synthesis");
         const body = synthesis.message.body;
         if (input.review && "completion" in body) {
           input.review.reobserve();
-          const report = input.review.report(messages, reviewReasons, false);
+          const report = input.review.report(messages, reviewReasons, false, pendingDoubts, boundaries);
           result = { ...synthesis.result, status: report.completion === "complete" ? "completed" : "failed", result: JSON.stringify({ ...report, modelObservations }) };
         } else if ("status" in body) {
           result = { ...synthesis.result, status: body.status === "complete" ? "completed" : "failed", result: JSON.stringify(body) };
@@ -397,7 +447,8 @@ export function createTable(input: { team: Team; config: PitakoConfig; goal: str
         architectureFailure(input.observation, "turn", error, { stage: stage === "closing" ? undefined : stage, round });
         result = { ...lastRootResult ?? result, status: stopping || signal.aborted ? "cancelled" : "failed", result: String(error) };
         reviewReasons.push(String(error));
-        if (input.review) result.result = JSON.stringify({ ...input.review.report(messages, reviewReasons, result.status === "cancelled"), modelObservations });
+        if (input.review) result.result = JSON.stringify({ ...input.review.report(messages, [...reviewReasons, ...failures.map(item => item.error)],
+          result.status === "cancelled", pendingDoubts, boundaries), modelObservations });
         if (error instanceof AgentClosureError) throw error;
       } finally {
         stage = "closing"; progress(); director.revoke();
