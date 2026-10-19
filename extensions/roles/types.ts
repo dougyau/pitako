@@ -16,6 +16,15 @@ const PI_THINKING = {
 
 export const ROLE_IDS = ["coordinator", "architect", "developer", "reviewer", "researcher", "scout", "oracle"] as const;
 export type RoleId = (typeof ROLE_IDS)[number];
+export const TABLE_ONLY_ROLES = { architect: "architecture_start", reviewer: "review_start" } as const;
+
+/** Public individual dispatch only; table participants still use internal role primitives. */
+export function assertIndividualRole(role: string): void {
+  if (Object.hasOwn(TABLE_ONLY_ROLES, role)) {
+    const start = TABLE_ONLY_ROLES[role as keyof typeof TABLE_ONLY_ROLES];
+    throw new Error(`Role "${role}" is table-only; use ${start} instead.`);
+  }
+}
 export const DEVELOPER_PROFILES = ["developer_senior", "developer_mid", "developer_junior"] as const;
 export type DeveloperProfile = (typeof DEVELOPER_PROFILES)[number];
 
@@ -78,8 +87,8 @@ export interface ResolvedRole {
 }
 
 export interface PitakoConfig {
-  architecture?: ArchitectureConfig;
-  review?: ArchitectureConfig;
+  architecture: ArchitectureConfig;
+  review: ArchitectureConfig;
   defaultsPath: string;
   userConfigPath: string;
   userConfigPresent: boolean;

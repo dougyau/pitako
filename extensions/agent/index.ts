@@ -5,6 +5,7 @@ import type { ExtensionContext, ExtensionAPI } from "@earendil-works/pi-coding-a
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { PitakoConfigError } from "../errors.ts";
+import { assertIndividualRole, TABLE_ONLY_ROLES } from "../roles/types.ts";
 import {
   backgroundExecutor,
   cancelWorker,
@@ -181,14 +182,14 @@ export default function agentInstance(pi: ExtensionAPI): void {
     name: "agent_run",
     label: "Run agent",
     description:
-      "Run one Pitako role in an isolated context. Returns the final result and model provenance, not the child transcript. If this fails, report the failure. Do not perform that role yourself.",
+      "Run one individual Pitako role in an isolated context. Architect and Reviewer require architecture_start and review_start. Returns the final result and model provenance, not the child transcript. If this fails, report the failure. Do not perform that role yourself.",
     promptSnippet: "Run an isolated Pitako role and return its final result",
     promptGuidelines: [
-      "Use agent_run for a role such as architect. Scout, Researcher and Oracle require agent_spawn or team_assign. If agent_run fails, report the error. Do not do that role's work in the parent session.",
+      "Use agent_run for Developer. Architect and Reviewer require architecture_start and review_start. Scout, Researcher and Oracle require agent_spawn or team_assign. If agent_run fails, report the error. Do not do that role's work in the parent session.",
     ],
     parameters: Type.Object(
       {
-        role: Type.String({ description: "Role id, for example architect" }),
+        role: Type.String({ not: { enum: Object.keys(TABLE_ONLY_ROLES) }, description: "Individual role id, for example developer; Architect/Reviewer require architecture_start/review_start" }),
         task: Type.String({ description: "Explicit task for the isolated agent" }),
       },
       noExtra,
@@ -198,6 +199,7 @@ export default function agentInstance(pi: ExtensionAPI): void {
         return errorResult("agent_run cannot be called from an AgentInstance");
       }
       try {
+        assertIndividualRole(params.role);
         if (isConsultation(params.role)) throw new Error("Consultative roles require agent_spawn or team_assign, not agent_run");
         validateAgentMode(params, ctx.cwd, false);
         let live = "";
@@ -263,7 +265,7 @@ export default function agentInstance(pi: ExtensionAPI): void {
 }
 
 function registerTeamTools(pi: ExtensionAPI): void {
-  const roles = ["architect", "developer", "reviewer", "researcher", "scout", "oracle"] as const;
+  const roles = ["developer", "researcher", "scout", "oracle"] as const;
   const evaluationFor = (ctx: { sessionManager?: { getSessionId?: () => string | undefined } }) =>
     teamEvaluationForSession(
       typeof ctx.sessionManager?.getSessionId === "function" ? ctx.sessionManager.getSessionId() : undefined,
@@ -278,7 +280,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "team_assign",
     label: "Assign Team role",
-    description: "Start one isolated Team role. Returns immediately. Each call admits an independently identified member, including the same role. Every asynchronous developer mode head with explicit writes has local checkpoints and supports explicit checkpoint_origin continuation; neither grants publication or acceptance.",
+    description: "Start one isolated individual Team role. Architect and Reviewer require architecture_start and review_start. Returns immediately. Each call admits an independently identified member, including the same role. Every asynchronous developer mode head with explicit writes has local checkpoints and supports explicit checkpoint_origin continuation; neither grants publication or acceptance.",
     promptSnippet: "Assign independent work to a Team role",
     promptGuidelines: ["Use team_assign for independent long work. Keep task scoped. Do not wait or poll; interpret complete results automatically supplied in context. team_result is an optional diagnostic re-read, not a transport or acknowledgement."],
     parameters: Type.Object({
@@ -295,6 +297,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
     }, noExtra),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
+        assertIndividualRole(params.role);
         if (signal?.aborted || !params.task.trim()) throw new Error("Dispatch cancelled or empty task");
         const headOptions = validateAgentMode(params, ctx.cwd);
         if (headOptions) assertNoCheckpointLease(ctx.cwd);
@@ -557,14 +560,14 @@ function registerBackgroundTools(pi: ExtensionAPI): void {
     name: "agent_spawn",
     label: "Spawn agent",
     description:
-      "Start one Pitako role in the background and return its instance id while it is still running. Does not wait for the result. A failure is not permission to do that role in the parent. Every asynchronous developer mode head with explicit writes has local checkpoints and supports explicit checkpoint_origin continuation; neither grants publication or acceptance.",
+      "Start one individual Pitako role in the background. Architect and Reviewer require architecture_start and review_start. Return its instance id while it is still running. Does not wait for the result. A failure is not permission to do that role in the parent. Every asynchronous developer mode head with explicit writes has local checkpoints and supports explicit checkpoint_origin continuation; neither grants publication or acceptance.",
     promptSnippet: "Start a background Pitako role and return before it finishes",
     promptGuidelines: [
       "Use agent_spawn for long specialist work while you stay available. Interpret complete results automatically supplied in context; agent_result is an optional diagnostic re-read. Do not poll. If it fails, report the error. Do not do that role yourself.",
     ],
     parameters: Type.Object(
       {
-        role: Type.String({ description: "Role id, for example developer" }),
+        role: Type.String({ not: { enum: Object.keys(TABLE_ONLY_ROLES) }, description: "Individual role id, for example developer; Architect/Reviewer require architecture_start/review_start" }),
         task: Type.String({ description: "Explicit task for the isolated agent" }),
         plan: Type.Optional(Type.String({ description: "Optional execution correlation; all settled results are delivered automatically" })),
         unit: Type.Optional(Type.String({ description: "Unit id paired with plan" })),
@@ -580,6 +583,7 @@ function registerBackgroundTools(pi: ExtensionAPI): void {
       const blocked = childBlocked("agent_spawn");
       if (blocked) return blocked;
       try {
+        assertIndividualRole(params.role);
         if (signal?.aborted || !params.task.trim()) throw new Error("Dispatch cancelled or empty task");
         const headOptions = validateAgentMode(params, ctx.cwd);
         if (headOptions) assertNoCheckpointLease(ctx.cwd);

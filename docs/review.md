@@ -1,14 +1,14 @@
 # Reviewer tables
 
-Reviewer tables are an optional, autonomous-only protocol over Team. Ordinary Reviewer is the default. Explicit selection can replace one existing independent Reviewer pass one-for-one in `$plan`, `$execute` or `pre-pr`. Configuration enables the option; it does not select the table or add a review pass.
+Reviewer tables are the sole public Reviewer route over Team. Use `review_start` for the existing independent Reviewer pass in `$plan`, `$execute` or `pre-pr`; it adds no pass. Individual Reviewer calls reject before dispatch and direct callers to `review_start`.
 
-Each table has a new independent Reviewer director/root and one to five dynamically selected Reviewer specialists. They are separate from designers, implementers and the accepting coordinator. Every judge receives the complete object and criteria. A mandate focuses investigation without forbidding other material findings. Optional Scout, Researcher and Oracle supports supply knowledge, not judge findings.
+Each table has a new independent substantive Reviewer director/root and zero to five optional specialists selected for utility with reasons, including zero. They are separate from designers, implementers and the accepting coordinator. Every judge receives the complete object and criteria. A mandate focuses investigation without forbidding other material findings. Optional Scout, Researcher and Oracle supports supply knowledge, not judge findings.
 
-The table does not implement corrections, accept units, freeze plans, declare READY, change requirements or waive gates. Corrections remain outside the table. Judgment does not require unanimity and is not a majority vote. [Architecture consultations](architecture.md) retain their direct and table APIs and defaults.
+The table does not implement corrections, accept units, freeze plans, declare READY, change requirements or waive gates. Corrections remain outside the table. Judgment does not require unanimity and is not a majority vote. [Architecture tables](architecture.md) are the separate Architect route, without a `mode` parameter or individual fallback.
 
 ## Configuration
 
-[Startup configuration completion](configuration.md) exposes review settings as comments. It does not activate Reviewer tables or select models.
+[Startup configuration completion](configuration.md) exposes candidate settings as comments without selecting models.
 
 The optional `[review]` section uses the same strict candidate and topic grammar as `[architecture]`:
 
@@ -21,9 +21,9 @@ topic = "security"
 candidates = [{ model = "provider/specialist" }]
 ```
 
-These are placeholder models, not availability or authentication claims. Without `[review]`, `review_start` rejects before reserving work. There is no implicit architecture fallback. Ordinary Reviewer remains usable without table configuration.
+These are placeholder models, not availability or authentication claims. Absent `[review]`, omitted `candidates` and `candidates = []` all mean an empty specialist pool. The director still requires its own `model_policies.reviewer` primary, checked before reservations or room registration. Candidates cannot supply it and there is no implicit architecture fallback.
 
-General and topic lists are nonempty. Candidates accept only `model` and optional `reasoning`, not `fast`. Unknown keys and complete duplicate candidates within a list are rejected. Topics are nonempty and unique after whitespace and case normalization.
+General and topic candidate lists may be empty. Candidates accept only `model` and optional `reasoning`, not `fast`. Unknown keys and complete duplicate candidates within a list are rejected. Topics are nonempty and unique after whitespace and case normalization.
 
 Start captures immutable candidate references. The director chooses a reference, mandate and reason, not an arbitrary model. A topic selection tries the chosen candidate, remaining topic models in declared order, then unattempted general models. A general selection uses only general models. Each logical turn starts again at the original selection, with at most one attempt per model.
 
@@ -35,7 +35,7 @@ Only eligible provider failures permit fallback. Disagreement, failed tests, can
 - `review_read({roomId, cursor?})` returns bounded diagnostic fragments, state and identities. It is optional. Reads do not transport or acknowledge the exterior result.
 - `review_control({roomId, action, text?})` accepts `context`, `priorities`, `finish` or `stop`. Context and priorities queue nonempty text for the next frontier without replacing the object or criteria. Finish drains current work and requests synthesis; it cannot invent missing review. Stop revokes and joins owned work. A stopping receipt is not closure.
 
-There is no maintained direct review-table mode. An ordinary Reviewer consultation remains available for a bounded question. Native steering of table participants is rejected in favor of table controls.
+There is no individual Reviewer fallback or direct review-table mode. Use a `brief` object for a bounded question. Native steering of table participants is rejected in favor of table controls.
 
 ## Objects and current identity
 
@@ -69,9 +69,9 @@ Only the actual returned exterior root assignment belongs in `## Planning worker
 
 ## Deliberation and findings
 
-Specialists prepare independently without peer findings. Each round gives participants the same immutable snapshot. Contributions publish together after settlement in stable order, not arrival order. The director can continue, consult, synthesize early or recompose within five rounds. Final clarification does not authorize a sixth round.
+The director prepares once and independently reviews the whole object against all criteria, with findings and responses of its own, even without specialists or after all specialists fail. New specialists prepare independently without peer findings. Each round gives participants the same immutable snapshot. Contributions publish together after settlement in stable order, not arrival order. The director can continue, consult, synthesize early or selectively recompose within five rounds. Final clarification does not authorize a sixth round.
 
-Optional supports run in finite batches, with at most two owners including preparation and disposal. Dependent work waits for successful prerequisite completion and closure. Recomposition validates replacements before revocation and waits for outgoing closure before seat reuse.
+Optional supports run in finite batches, with at most two owners including preparation and disposal. Dependent work waits for successful prerequisite completion and closure. Composition is the total desired set: retain eligible specialists with their identities, conversations and frozen policies, add new candidates, and retire omitted members. A reason is required even for zero specialists. Recomposition validates before revocation and waits for outgoing closure before seat reuse; it is selective, not mandatory, with no fixed preference for zero.
 
 Findings retain materiality, affected contract or risk, location, consequence and evidence. A finding can identify a reachable failure or an indispensable missing observation with its decision impact and next feasible authorized capture. Responses corroborate, object, modify or withdraw with reasons and evidence. Only an author modifies or withdraws their finding; the director judges it.
 

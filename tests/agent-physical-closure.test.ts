@@ -349,7 +349,7 @@ unknownTest("registered table replacement with rejected outgoing disposal retain
     const db = await openBoard(); const topic = db.createTopic(env.root, { title: "Unknown table closure" }); db.claimTopic(env.root, topic.id, "unknown-table"); db.close();
     const file = planFile("unknown-table", env.root); mkdirSync(path.dirname(file), { recursive: true });
     writeFileSync(file, `---\nid: unknown-table\nrevision: 1\nstatus: frozen\nboard_topic_id: ${topic.id}\n---\nUnknown closure.\n`);
-    const start = await room.invoke("architecture_start", { mode: "table", goal: "Unknown outgoing closure", plan: "unknown-table", unit: "T3" });
+    const start = await room.invoke("architecture_start", { goal: "Unknown outgoing closure", plan: "unknown-table", unit: "T3" });
     expect(start.isError).not.toBe(true); handle = start.details; changed(); await unknown.promise;
     expect(compositions).toBe(2); expect(room.host.sessions).toHaveLength(2);
     expect(room.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);

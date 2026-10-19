@@ -219,7 +219,7 @@ export function createAgentController(owner: AgentControllerOwner, current: () =
           ready(); architectureReady();
           return architectureView.read(null, cursor, revision, () => ({ header: { owner: { processId, coordinatorSessionId: owner.sessionId, epoch } },
             records: architectureRooms(teamEvaluationForSession(owner.sessionId, false)).map(room => ({ ref: architectureRef(room.roomId),
-              mode: room.mode, director: room.director, lifecycle: structuredClone(room.lifecycle) })) }), byteBudget);
+              director: room.director, lifecycle: structuredClone(room.lifecycle) })) }), byteBudget);
         },
         readArchitecture(ref: ArchitectureRef, cursor?: string, byteBudget?: number) {
           ready(); architectureReady();

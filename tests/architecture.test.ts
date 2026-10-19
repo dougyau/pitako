@@ -3,7 +3,7 @@ import { mkdirSync, writeFileSync, existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { AsyncResource } from "node:async_hooks";
 import { workerHandoff, teamWorkerStatus } from "../extensions/agent/background.ts";
-import { firstTeamReservation } from "../extensions/team.ts";
+import { firstTeamReservation, teamAssignments } from "../extensions/team.ts";
 import { loadPitakoConfig } from "../extensions/roles/load.ts";
 import { openBoard } from "../extensions/board/store.ts";
 import { ledgerFile, planFile, readLedgerTeamHolds } from "../extensions/workflow.ts";
@@ -14,18 +14,153 @@ const { fixture, setup, policies, configuration } = architectureFixture();
 const deferred = <T = void>() => Promise.withResolvers<T>();
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
 
+for (const protocol of ["architecture", "review"] as const) {
+  const empty = architectureFixture(protocol);
+  test(`${protocol} registered empty-pool start runs a useful director-only table`, empty.fixture.ownedCase(`${protocol} empty pool`, async () => {
+    const s = await empty.setup({ config: "", prompt(_session, request, body) {
+      if (request.stage === "composition") return { ...body, reason: "No specialists needed for this bounded object", specialists: [] };
+    } });
+    try {
+      const start = await s.invoke(`${protocol}_start`, protocol === "architecture" ? { goal: "Choose the bounded design" }
+        : { goal: "Review the bounded design", object: { kind: "brief", text: "Bounded proposal" }, criteria: ["Preserve ownership", "Remain bounded"] });
+      expect(start.isError).not.toBe(true);
+      await s.delivered.promise;
+      expect(s.host.sessions).toHaveLength(1);
+      expect(s.host.sessions[0]!.model!.id).toBe("director");
+      expect(s.seen.map(item => item.request.stage)).toEqual(["composition", "preparation", "consultation-plan", "contribution", "decision", "synthesis"]);
+      const page = (await s.invoke(`${protocol}_read`, { roomId: start.details.roomId })).details;
+      expect(page.state).toBe("finished"); expect(page.round).toBe(1); expect(page.members).toHaveLength(1);
+      expect(page.snapshot.general).toEqual([]); expect(page.snapshot.topics).toEqual([]);
+      expect(JSON.stringify(page.fragments)).toContain(protocol === "architecture" ? "Use the bounded design" : "Reviewed complete object");
+      expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("completed");
+      expect(s.host.sessions[0]!.events).toContain("dispose");
+      if (protocol === "review") {
+        for (const { request } of s.seen.filter(item => ["preparation", "contribution"].includes(item.request.stage))) {
+          expect(request.object.scope.text).toBe("Bounded proposal"); expect(request.criteria).toEqual(["Preserve ownership", "Remain bounded"]);
+        }
+      }
+    } finally { await s.close(); }
+  }));
+  test(`${protocol} rejects missing director primary before reserving work`, empty.fixture.ownedCase(`${protocol} missing primary`, async () => {
+    const s = await empty.setup({ policies: "", config: "" });
+    try {
+      const start = await s.invoke(`${protocol}_start`, protocol === "architecture" ? { goal: "No director target" }
+        : { goal: "No director target", object: { kind: "brief", text: "Bounded proposal" }, criteria: ["Ownership"] });
+      expect(start.isError).toBe(true);
+      expect(start.details.error).toContain(`model policy "${protocol === "architecture" ? "architect" : "reviewer"}" has no primary target.`);
+      expect(s.host.sessions).toEqual([]); expect(teamAssignments(s.evaluation)).toEqual([]);
+      expect(teamWorkerStatus(s.evaluation.token)).toEqual([]);
+      expect(s.sent).toEqual([]);
+    } finally { await s.close(); }
+  }));
+  test(`${protocol} total compositions zero, two, retain/add, zero preserve four global rounds`, empty.fixture.ownedCase(`${protocol} four rounds`, async () => {
+    let compositions = 0, retainedId = "", retiredId = "";
+    const frontiers = new Map<number, string>(), sessions = new Map<string, any>();
+    const s = await empty.setup({ async prompt(session, request, body) {
+      if (request.stage === "composition") {
+        compositions++;
+        const add = (mandate: string) => ({ kind: "add", candidateRef: "general:0", mandate, reason: "Useful independent focus" });
+        if (compositions === 3) {
+          [retainedId, retiredId] = request.authorization.retainableMemberIds;
+          const before = teamAssignments(s.evaluation), sessionsBefore = [...s.host.sessions];
+          const invalid = { ...body, reason: "Invalid duplicate retention", specialists: Array(2).fill({
+            kind: "retain", memberId: retainedId, mandate: "No side effects", reason: "Duplicate identity",
+          }) };
+          const rejected = await session.boundTools.get(`${protocol}_submit`).execute("invalid-retain",
+            { submissionId: "invalid-retain", body: invalid }, undefined, undefined, { sessionManager: session.sessionManager });
+          expect(rejected.isError).toBe(true); expect(rejected.details.correctionsLeft).toBe(1);
+          expect(teamAssignments(s.evaluation)).toEqual(before); expect(s.host.sessions).toEqual(sessionsBefore);
+          expect(sessionsBefore.every(peer => !peer.events.includes("dispose"))).toBe(true);
+        }
+        return { ...body, reason: "Select the full useful roster", specialists: compositions === 2 ? [add("First"), add("Second")]
+          : compositions === 3 ? [{ kind: "retain", memberId: retainedId, mandate: "Updated focus", reason: "Keep conversation" }, add("Fresh focus")] : [] };
+      }
+      if (request.stage === "preparation") {
+        expect(request).not.toHaveProperty("journal"); expect(request).not.toHaveProperty("review");
+        expect(request).not.toHaveProperty("controls"); expect(request).not.toHaveProperty("snapshot");
+        expect(Object.keys(request.context)).toEqual(["mandate"]);
+        sessions.set(request.context.mandate, session);
+        if (protocol === "review" && request.context.mandate === "Second") return { ...body, findings: [{
+          key: "retired-dissent", materiality: "nonblocking", contract: "Keep original dissent", reference: "brief",
+          consequence: "Losing evidence", basis: { kind: "failure", path: "Retirement hides original evidence", evidence: ["brief"] },
+        }] };
+      }
+      if (request.stage === "contribution") {
+        const shared = JSON.stringify(request.context.shared);
+        if (frontiers.has(request.round)) expect(frontiers.get(request.round)).toBe(shared);
+        else frontiers.set(request.round, shared);
+        if (request.context.mandate === "Updated focus") expect(session).toBe(sessions.get("First"));
+        if (request.round === 3) {
+          expect(request.context.shared.messages.some((m: any) => m.memberId === retiredId && m.stage === "preparation")).toBe(true);
+          if (protocol === "architecture")
+            expect(request.authorization.objections.some((ref: any) => ref.memberId === retiredId)).toBe(true);
+        }
+      }
+      if (request.stage === "decision") return { ...body, action: request.round < 4 ? "recompose" : "synthesize" };
+      return body;
+    } });
+    try {
+      const start = await s.invoke(`${protocol}_start`, { goal: "Keep useful conversations and original evidence",
+        ...(protocol === "review" ? { object: { kind: "brief", text: "Complete object" }, criteria: ["Keep evidence"] } : {}) });
+      await s.delivered.promise;
+      const result = (await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details;
+      expect(result.status).toBe("completed");
+      expect(compositions).toBe(4); expect([...frontiers.keys()]).toEqual([1, 2, 3, 4]);
+      expect(s.seen.filter(item => item.request.stage === "preparation")).toHaveLength(4);
+      expect(s.seen.filter(item => item.request.stage === "consultation-plan")).toHaveLength(3);
+      expect(s.seen.filter(item => item.request.stage === "contribution").map(item => item.request.round).sort())
+        .toEqual([1, 2, 2, 2, 3, 3, 3, 4]);
+      expect(teamAssignments(s.evaluation).find(member => member.memberId === retainedId)!.task).toBe("First");
+      expect(sessions.get("First").prompts.filter((text: string) => JSON.parse(text).stage === "preparation")).toHaveLength(1);
+      expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
+      if (protocol === "review") {
+        const report = JSON.parse(s.sent.find(item => item.message.customType === "pitako.worker.result")!.message.content);
+        expect(report.findings[0].memberId).toBe(retiredId); expect(report.findings[0].key).toBe("retired-dissent");
+        expect(report.dispositions).toHaveLength(1); expect(report.dispositions[0].findingId).toBe(report.findings[0].id);
+      }
+    } finally { await s.close(); }
+  }));
+  test(`${protocol} director failure does not transfer authority and preserves settled peer evidence`, empty.fixture.ownedCase(`${protocol} director failure`, async () => {
+    const s = await empty.setup({ prompt(session, request, body) {
+      if (session.model.id === "director" && request.stage === "preparation") return false;
+      if (request.stage === "synthesis") {
+        expect(request.context.partialReasons.length).toBeGreaterThan(0);
+        return protocol === "architecture" ? { ...body, status: "partial" }
+          : { ...body, completion: "partial", verdict: "inconclusive" };
+      }
+    } });
+    try {
+      const start = await s.invoke(`${protocol}_start`, { goal: "Never replace director authority",
+        ...(protocol === "review" ? { object: { kind: "brief", text: "Complete object" }, criteria: ["Authority"] } : {}) });
+      await s.delivered.promise;
+      expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("failed");
+      const page = (await s.invoke(`${protocol}_read`, { roomId: start.details.roomId })).details;
+      expect(page.fragments.map((fragment: any) => fragment.text).join("")).toContain('"stage":"preparation"');
+      expect(s.seen.filter(item => item.request.stage === "preparation")).toHaveLength(1);
+      expect(s.seen.find(item => item.request.stage === "preparation")!.session.model.id).toBe("chosen");
+      const root = s.seen.find(item => item.request.stage === "composition")!.session;
+      expect(s.seen.filter(item => item.request.stage === "synthesis").map(item => item.session)).toEqual([root]);
+      expect(s.seen.filter(item => item.request.stage === "contribution")).toHaveLength(2);
+      expect(s.host.sessions).toHaveLength(2);
+      expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
+    } finally { await s.close(); }
+  }));
+}
+
 test("registered start publishes Markdown guidance and preserves the original brief in prompts and active root observation", fixture.ownedCase("architecture original Markdown", async () => {
   const goal = ["\n# Revisión 🧠", "", "## Objective", 'Preserve café, cafe\u0301 and "quoted text".  ',
     "", "## Expected result", "Keep the submitted source unchanged.\r\n", "## Context", "```json",
     String.raw`{"path":"C:\\work\\draft","quote":"\"literal\""}`, "```", "",
     "- Context with Unicode 日本語 and a [reference](https://example.test/draft).\n".repeat(30), " \n"].join("\n");
-  const compositionEntered = deferred(), releaseComposition = deferred(), controlledKnowledge = deferred(), releaseKnowledge = deferred();
-  const release = () => { releaseComposition.resolve(); releaseKnowledge.resolve(); };
+  const compositionEntered = deferred(), releaseComposition = deferred(), decisions = [deferred(), deferred()], releases = [deferred(), deferred()];
+  const release = () => { releaseComposition.resolve(); for (const gate of releases) gate.resolve(); };
   fixture.finishOnCleanup(release);
-  let knowledgeTurns = 0;
-  const s = await setup({ async prompt(_session, request) {
+  const s = await setup({ async prompt(_session, request, body) {
     if (request.stage === "composition") { compositionEntered.resolve(); await releaseComposition.promise; }
-    if (request.stage === "consultation-plan" && ++knowledgeTurns === 2) { controlledKnowledge.resolve(); await releaseKnowledge.promise; }
+    if (request.stage === "decision") {
+      decisions[request.round - 1]!.resolve(); await releases[request.round - 1]!.promise;
+      return { ...body, action: request.round === 1 ? "continue" : "synthesize" };
+    }
   } });
   try {
     const definition = s.tools.get("architecture_start"), schema = definition.parameters.properties;
@@ -35,7 +170,8 @@ test("registered start publishes Markdown guidance and preserves the original br
         expect(guidance).toContain(phrase);
     }
     for (const name of ["topic", "plan", "unit", "boardTopicId"]) expect(schema[name].description).toBeUndefined();
-    const start = await s.invoke("architecture_start", { mode: "consultation", goal });
+    expect(schema).not.toHaveProperty("mode");
+    const start = await s.invoke("architecture_start", { goal });
     expect(start.isError).not.toBe(true);
     await compositionEntered.promise;
     const rootSession = s.host.sessions.find(session => session.prompts.some(text => JSON.parse(text).stage === "composition"))!;
@@ -56,71 +192,69 @@ test("registered start publishes Markdown guidance and preserves the original br
       expect(original).toBe(goal);
     };
     await readOriginal();
-    releaseComposition.resolve(); await s.knowledge[0]!.promise; await tick();
-    const answer = s.seen.find(item => item.request.stage === "answer")!;
-    expect(answer.session).not.toBe(rootSession);
-    expect(answer.request.context.mandate).toBe("Review security");
-    expect(answer.request.context.mandate).not.toBe(goal);
+    releaseComposition.resolve(); await decisions[0]!.promise;
+    const contribution = s.seen.find(item => item.request.stage === "contribution" && item.model === "chosen")!;
+    expect(contribution.session).not.toBe(rootSession);
+    expect(contribution.request.context.mandate).toBe("Review security");
+    expect(contribution.request.context.mandate).not.toBe(goal);
     const control = "Different priorities: do not replace the original brief.";
     expect((await s.invoke("architecture_control", { roomId: start.details.roomId, action: "context", text: control })).isError).not.toBe(true);
-    await controlledKnowledge.promise;
+    expect((await s.invoke("architecture_control", { roomId: start.details.roomId, action: "priorities", text: "Preserve ownership first" })).isError).not.toBe(true);
+    releases[0]!.resolve(); await decisions[1]!.promise;
     await readOriginal();
-    expect(s.seen.filter(item => item.request.stage === "answer").at(-1)!.request.context.controls).toContainEqual({ action: "context", text: control });
-    releaseKnowledge.resolve(); await s.knowledge[1]!.promise; await tick();
-    await s.invoke("architecture_control", { roomId: start.details.roomId, action: "finish" }); await s.delivered.promise;
+    expect(s.seen.filter(item => item.request.stage === "contribution").at(-1)!.request.context.shared.controls).toContainEqual({ action: "context", text: control });
+    expect(s.seen.filter(item => item.request.stage === "contribution").at(-1)!.request.context.shared.controls).toContainEqual({ action: "priorities", text: "Preserve ownership first" });
+    releases[1]!.resolve(); await s.delivered.promise;
     for (const { request } of s.seen) expect(request.goal).toBe(goal);
     expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("completed");
     expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
   } finally { release(); await s.close(); }
 }));
 
-test("registered watched consultation delivers two intermediate turns, preserves owner/history/holds, then one terminal synthesis after disband", fixture.ownedCase("architecture full route", async () => {
-  const disposing = deferred(), release = deferred(); fixture.finishOnCleanup(release.resolve);
-  const s = await setup({ busy: true, async dispose(session) { if (session.prompts.some((text: string) => JSON.parse(text).stage === "answer")) { disposing.resolve(); await release.promise; } } });
+test("registered watched table preserves owner/history/cursors/holds and delivers one terminal synthesis after disband", fixture.ownedCase("architecture full route", async () => {
+  const deciding = deferred(), continueDecision = deferred(), disposing = deferred(), release = deferred();
+  const finish = () => { continueDecision.resolve(); release.resolve(); }; fixture.finishOnCleanup(finish);
+  const s = await setup({ busy: true, async prompt(session, request, body) {
+    if (request.stage === "contribution" && session.model.id === "chosen") return { ...body, proposal: "A".repeat(20000) + "🧠" };
+    if (request.stage === "decision") { deciding.resolve(); await continueDecision.promise; }
+  }, async dispose(session) { if (session.model?.id === "chosen") { disposing.resolve(); await release.promise; } } });
   try {
     const db = await openBoard(); const topic = db.createTopic(s.root, { title: "Architecture" }); db.claimTopic(s.root, topic.id, "architecture-plan"); db.close();
     const file = planFile("architecture-plan", s.root); mkdirSync(path.dirname(file), { recursive: true });
     writeFileSync(file, `---\nid: architecture-plan\nrevision: 1\nstatus: frozen\nboard_topic_id: ${topic.id}\n---\nArchitecture owned work.\n`);
     const parent = new AbortController();
-    const started = await s.invoke("architecture_start", { mode: "consultation", goal: "Review security", topic: "security", plan: "architecture-plan", unit: "T2" }, parent.signal);
+    const started = await s.invoke("architecture_start", { goal: "Review security", topic: "security", plan: "architecture-plan", unit: "T2" }, parent.signal);
     expect(started.isError).not.toBe(true); const handle = started.details;
     parent.abort(); // foreground turn ending never owns the room lifetime
-    await s.knowledge[0]!.promise; await tick();
+    await deciding.promise;
     const hold = readLedgerTeamHolds(s.root, "architecture-plan"); expect(hold).toHaveLength(1);
     expect(hold[0]!.assignmentId).toBe(handle.assignmentId);
     expect(workerHandoff(handle.instanceId)).toBeUndefined();
     expect(firstTeamReservation(s.evaluation, "architect")).toBe(handle.assignmentId);
     const page = (await s.invoke("architecture_read", { roomId: handle.roomId })).details;
-    expect(page.state).toBe("waiting"); expect(page.delivery[0].delivery).toBe("pending");
+    expect(page.state).toBe("running"); expect(page.delivery).toEqual([]);
+    expect(page.cursor).not.toBeNull();
     const fragments = [...page.fragments]; let cursor = page.cursor;
     while (cursor) { const next = (await s.invoke("architecture_read", { roomId: handle.roomId, cursor })).details; expect(next.cut).toBe(page.cut); fragments.push(...next.fragments); cursor = next.cursor; }
     expect(fragments.map(fragment => fragment.text).join("")).toContain("🧠");
-    const firstSession = s.host.sessions.find(session => session.prompts.some(text => JSON.parse(text).stage === "answer"))!;
+    expect((await s.invoke("architecture_read", { roomId: handle.roomId, cursor: "invalid" })).isError).toBe(true);
+    const encodeCursor = (values: unknown[]) => Buffer.from(JSON.stringify(values)).toString("base64url");
+    for (const values of [[page.snapshot.id, page.cut + 1, 0, 0, 1], [page.snapshot.id, page.cut, 0, -1, 1],
+      ["foreign", page.cut, 0, 0, 1], [page.snapshot.id, page.cut, 0, 999999, 1]])
+      expect((await s.invoke("architecture_read", { roomId: handle.roomId, cursor: encodeCursor(values) })).isError).toBe(true);
+    const firstSession = s.host.sessions.find(session => session.model?.id === "chosen")!;
     expect(firstSession.events).not.toContain("dispose");
     expect((await s.invoke("agent_input", { target: { kind: "team", assignmentId: handle.assignmentId }, historyId: "bad", sessionId: s.host.sessions[0]!.sessionId, intent: "steer", text: "bypass" })).isError).toBe(true);
-    const getBranch = s.ctx.sessionManager.getBranch;
-    try {
-      s.ctx.sessionManager.getBranch = () => { throw new Error("branch temporarily unavailable"); };
-      await s.emit("message_end", { message: { role: "assistant", stopReason: "stop" } });
-      expect((await s.invoke("architecture_read", { roomId: handle.roomId })).details.delivery[0].diagnostic).toContain("receipt unavailable");
-    } finally { s.ctx.sessionManager.getBranch = getBranch; }
-    let draft = await s.emit("agent_before_settle", { outcome: "completed", context: { canContinue: true } });
-    expect(draft.entries.map((entry: any) => entry.customType)).toEqual(["pitako.architecture.response"]);
-    s.branch.push(...draft.entries); await s.emit("turn_start"); await s.emit("message_end", { message: { role: "assistant", stopReason: "stop" } });
-    expect((await s.invoke("architecture_read", { roomId: handle.roomId })).details.delivery[0].delivery).toBe("incorporated");
+    const draft = await s.emit("agent_before_settle", { outcome: "completed", context: { canContinue: true } });
+    expect(draft?.entries ?? []).toEqual([]);
     expect(workerHandoff(handle.instanceId)).toBeUndefined(); expect(readLedgerTeamHolds(s.root, "architecture-plan")).toEqual(hold);
     expect(listObservations().find(row => row.id === handle.instanceId)?.resultTaken).not.toBe(true);
-    await s.invoke("architecture_control", { roomId: handle.roomId, action: "context", text: "Now assess migration" });
-    await s.knowledge[1]!.promise; await tick();
-    expect(firstSession.prompts.filter(text => JSON.parse(text).stage === "answer")).toHaveLength(2);
     expect(s.host.sessions).toHaveLength(2);
-    draft = await s.emit("agent_before_settle", { outcome: "completed", context: { canContinue: true } });
-    expect(draft.entries).toHaveLength(1); s.branch.push(...draft.entries); await s.emit("turn_start"); await s.emit("message_end", { message: { role: "assistant", stopReason: "stop" } });
     expect(readLedgerTeamHolds(s.root, "architecture-plan")).toEqual(hold);
     const list = await s.invoke("agent_history", { action: "list" }); expect(JSON.stringify(list.details)).toContain(handle.assignmentId);
     const specialistMessage = (await s.invoke("architecture_read", { roomId: handle.roomId })).details;
     expect(specialistMessage.members.filter((member: any) => member.id !== handle.assignmentId)).toHaveLength(1);
-    await s.invoke("architecture_control", { roomId: handle.roomId, action: "finish" }); await disposing.promise;
+    continueDecision.resolve(); await disposing.promise;
     expect(workerHandoff(handle.instanceId)).toBeUndefined(); expect(readLedgerTeamHolds(s.root, "architecture-plan")).toEqual(hold);
     s.setIdle(true); release.resolve(); await s.delivered.promise;
     await s.emit("turn_start");
@@ -132,34 +266,64 @@ test("registered watched consultation delivers two intermediate turns, preserves
     const dispatch = s.host.sessions[0]!.sessionManager.getEntries().find((entry: any) => entry.customType === "pitako.architecture.dispatch") as any;
     expect(dispatch.data.callerSessionId).toBe(s.host.sessions[0]!.sessionId);
     expect(dispatch.data.parentAssignmentId).toBe(handle.assignmentId);
+  } finally { finish(); await s.close(); }
+}));
+
+test("finish drains active contributions and preserves truncation as partial rather than success", fixture.ownedCase("architecture finish", async () => {
+  const entered = deferred(), release = deferred(); fixture.finishOnCleanup(release.resolve);
+  const s = await setup({ async prompt(session, request, body) {
+    if (request.stage === "contribution" && session.model.id === "chosen") { entered.resolve(); await release.promise; }
+    if (request.stage === "synthesis") {
+      expect(request.context.partialReasons).toContain("Finish truncated scheduled architecture work");
+      return { ...body, status: "partial", pending: [...request.context.partialReasons] };
+    }
+  } });
+  try {
+    const start = await s.invoke("architecture_start", { goal: "Drain before finishing" });
+    await entered.promise;
+    expect((await s.invoke("architecture_control", { roomId: start.details.roomId, action: "finish" })).isError).not.toBe(true);
+    expect(workerHandoff(start.details.instanceId)).toBeUndefined();
+    expect(s.sent.filter(item => item.message.customType === "pitako.worker.result")).toEqual([]);
+    release.resolve(); await s.delivered.promise;
+    expect(s.seen.filter(item => item.request.stage === "contribution")).toHaveLength(2);
+    expect(s.seen.some(item => item.request.stage === "decision")).toBe(false);
+    expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("failed");
+    expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
   } finally { release.resolve(); await s.close(); }
 }));
 
 test("bind-captured submit supports the first and subsequent authorized native turns", fixture.ownedCase("architecture captured submit", async () => {
-  const s = await setup();
+  const deciding = deferred(), release = deferred(); fixture.finishOnCleanup(release.resolve);
+  const s = await setup({ async prompt(_session, request, body) {
+    if (request.stage === "decision" && request.round === 1) {
+      deciding.resolve(); await release.promise; return { ...body, action: "continue" };
+    }
+  } });
   try {
-    const start = await s.invoke("architecture_start", { mode: "consultation", goal: "captured submit" });
-    await Promise.race([s.knowledge[0]!.promise, s.delivered.promise]); await tick();
+    const start = await s.invoke("architecture_start", { goal: "captured submit" });
+    await deciding.promise;
     expect(s.seen.map(item => item.request.stage)).toContain("composition");
-    const specialist = s.seen.find(item => item.request.stage === "answer")!.session;
+    const specialist = s.seen.find(item => item.request.stage === "contribution" && item.model === "chosen")!.session;
     await s.invoke("architecture_control", { roomId: start.details.roomId, action: "context", text: "second native turn" });
-    await Promise.race([s.knowledge[1]!.promise, s.delivered.promise]); await tick();
-    expect(s.seen.filter(item => item.request.stage === "answer").map(item => item.session)).toEqual([specialist, specialist]);
-    await s.invoke("architecture_control", { roomId: start.details.roomId, action: "finish" }); await s.delivered.promise;
+    release.resolve(); await s.delivered.promise;
+    expect(s.seen.filter(item => item.request.stage === "contribution" && item.model === "chosen").map(item => item.session)).toEqual([specialist, specialist]);
     expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("completed");
     expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
-  } finally { await s.close(); }
+  } finally { release.resolve(); await s.close(); }
 }));
 
-test("optional strict configuration rejects malformed lists and absent config disables only architecture", fixture.ownedCase("architecture config", async () => {
-  const s = await setup({ config: "" });
+test("optional strict configuration permits empty pools and retains malformed-list diagnostics", fixture.ownedCase("architecture config", async () => {
+  const s = await setup({ config: "", prompt(_session, request, body) {
+    if (request.stage === "composition") return { ...body, reason: "Director can decide alone", specialists: [] };
+  } });
   try {
-    expect((await s.invoke("architecture_start", { mode: "consultation", goal: "review" })).isError).toBe(true);
-    expect(s.host.sessions).toHaveLength(0);
-    const invalid = ["[architecture]\ncandidates = []", "[architecture]\ncandidates = [{model='fixture/a',fast=true}]", "[architecture]\ncandidates = [{model='fixture/a'}, {model='fixture/a'}]",
+    const start = await s.invoke("architecture_start", { goal: "review" });
+    expect(start.isError).not.toBe(true); await s.delivered.promise;
+    expect(s.host.sessions).toHaveLength(1);
+    const invalid = ["[architecture]\ncandidates = false", "[architecture]\ncandidates = [{model='fixture/a',fast=true}]", "[architecture]\ncandidates = [{model='fixture/a'}, {model='fixture/a'}]",
       "[architecture]\ncandidates = [{model='fixture/a'}]\n[[architecture.topics]]\ntopic=' '\ncandidates=[{model='fixture/b'}]",
       "[architecture]\ncandidates = [{model='fixture/a'}]\n[[architecture.topics]]\ntopic='Topic'\ncandidates=[{model='fixture/b'}]\n[[architecture.topics]]\ntopic=' topic '\ncandidates=[{model='fixture/c'}]",
-      "[architecture]\ncandidates = [{model='fixture/a'}]\n[[architecture.topics]]\ntopic='topic'\ncandidates=[]"];
+      "[architecture]\ncandidates = [{model='fixture/a'}]\n[[architecture.topics]]\ntopic='topic'\ncandidates=false"];
     for (const config of invalid) { writeFileSync(path.join(s.root, "pitako/config.toml"), policies + config); expect(() => loadPitakoConfig({ cwd: s.root })).toThrow(); }
     writeFileSync(path.join(s.root, "pitako/config.toml"), policies + configuration);
     expect(loadPitakoConfig({ cwd: s.root }).architecture!.topics[0]!.candidates).toHaveLength(3);
@@ -168,39 +332,42 @@ test("optional strict configuration rejects malformed lists and absent config di
 
 test("topic fallback deduplicates models, uses each target's default, and restarts original choice on the retained conversation", fixture.ownedCase("architecture fallback", async () => {
   const attempts: { model: string; level: string; session: string }[] = [];
-  const s = await setup({ prompt(session, request) {
-    if (request.stage === "answer") {
+  const deciding = deferred(), release = deferred(); fixture.finishOnCleanup(release.resolve);
+  const s = await setup({ async prompt(session, request, body) {
+    if (request.stage === "decision" && request.round === 1) {
+      deciding.resolve(); await release.promise; return { ...body, action: "continue" };
+    }
+    if (request.stage === "contribution" && session.model.id !== "director") {
       attempts.push({ model: session.model.id, level: session.thinkingLevel, session: session.sessionId });
       if (session.model.id !== "general") throw new Error("503 Service Unavailable");
     }
   } });
   try {
-    const start = await s.invoke("architecture_start", { mode: "consultation", goal: "fallback" });
-    await s.knowledge[0]!.promise; await tick();
+    const start = await s.invoke("architecture_start", { goal: "fallback" });
+    await deciding.promise;
     expect(attempts.map(item => [item.model, item.level])).toEqual([["chosen", "high"], ["other", "minimal"], ["general", "minimal"]]);
     await s.invoke("architecture_control", { roomId: start.details.roomId, action: "context", text: "second exchange" });
-    await s.knowledge[1]!.promise; await tick();
+    release.resolve(); await s.delivered.promise;
     expect(attempts.slice(3).map(item => [item.model, item.level])).toEqual([["chosen", "high"], ["other", "minimal"], ["general", "minimal"]]);
     expect(new Set(attempts.map(item => item.session)).size).toBe(1);
     expect(s.host.sessions).toHaveLength(2);
-    await s.invoke("architecture_control", { roomId: start.details.roomId, action: "finish" }); await s.delivered.promise;
     expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("completed");
-  } finally { await s.close(); }
+  } finally { release.resolve(); await s.close(); }
 }));
 
 for (const invalid of ["snapshot", "model", "reasoning", "bind-reasoning", "missing", "conflict", "wrong-stage", "caller"] as const) {
   test(`registered protocol rejects ${invalid} without provider fallback`, fixture.ownedCase("architecture invalid " + invalid, async () => {
-    let answerAttempts = 0;
+    let contributionAttempts = 0;
     const s = await setup({ bind(session) {
       if (invalid === "bind-reasoning" && session.model?.id === "chosen") session.setModel = async (model: any) => { session.model = { ...model, reasoning: false }; };
     }, async prompt(session, request, body) {
       if (request.stage === "composition") {
         if (invalid === "snapshot") return { ...body, snapshotId: "invented" };
-        if (invalid === "model") return { ...body, specialists: [{ candidateRef: "fixture/chosen", mandate: "review", reason: "arbitrary model" }] };
+        if (invalid === "model") return { ...body, specialists: [{ kind: "add", candidateRef: "fixture/chosen", mandate: "review", reason: "arbitrary model" }] };
         if (invalid === "reasoning") s.host.models.find(model => model.id === "chosen")!.reasoning = false;
       }
-      if (request.stage === "answer") {
-        answerAttempts++;
+      if (request.stage === "contribution" && session.model.id !== "director") {
+        contributionAttempts++;
         const submit = session.boundTools.get("architecture_submit");
         if (invalid === "missing") return false;
         if (["conflict", "wrong-stage", "caller"].includes(invalid)) {
@@ -211,7 +378,7 @@ for (const invalid of ["snapshot", "model", "reasoning", "bind-reasoning", "miss
             expect(receipt.isError).not.toBe(true);
             const duplicate = await submit.execute("duplicate", structuredClone(value), undefined, undefined, ctx);
             expect(duplicate.details).toEqual(receipt.details);
-            const conflict = await submit.execute("conflict", { ...value, body: { ...body, answer: "different" } }, undefined, undefined, ctx);
+            const conflict = await submit.execute("conflict", { ...value, body: { ...body, proposal: "different" } }, undefined, undefined, ctx);
             expect(conflict.isError).toBe(true);
             throw new Error("503 Service Unavailable"); // invalid submit must not become a provider retry
           }
@@ -222,17 +389,41 @@ for (const invalid of ["snapshot", "model", "reasoning", "bind-reasoning", "miss
       }
     } });
     try {
-      const start = await s.invoke("architecture_start", { mode: "consultation", goal: "reject" }); await s.delivered.promise;
+      const start = await s.invoke("architecture_start", { goal: "reject" }); await s.delivered.promise;
       expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("failed");
-      expect(answerAttempts).toBe(["snapshot", "model", "reasoning", "bind-reasoning"].includes(invalid) ? 0 : 1);
-      expect(s.host.sessions.some(session => session.prompts.some(text => JSON.parse(text).stage === "answer") && session.model?.id !== "chosen")).toBe(false);
+      expect(contributionAttempts).toBe(["snapshot", "model", "reasoning", "bind-reasoning"].includes(invalid) ? 0 : 1);
+      expect(s.host.sessions.some(session => session.prompts.some(text => JSON.parse(text).stage === "contribution") && !["director", "chosen"].includes(session.model?.id ?? ""))).toBe(false);
       expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
     } finally { await s.close(); }
   }));
 }
 
+test("a contextual rejection permits one corrected contribution with an idempotent provisional receipt", fixture.ownedCase("architecture contextual correction", async () => {
+  let corrections = 0;
+  const s = await setup({ async prompt(session, request, body) {
+    if (request.stage !== "contribution" || session.model.id !== "chosen") return;
+    const submit = session.boundTools.get("architecture_submit"), ctx = { sessionManager: session.sessionManager };
+    const invalid = { ...body, objections: [{ memberId: "foreign", messageId: "invented", argument: "Not in this frontier" }] };
+    const rejected = await submit.execute("invalid", { submissionId: "invalid", body: invalid }, undefined, undefined, ctx);
+    expect(rejected.isError).toBe(true);
+    const value = { submissionId: "corrected", body }, accepted = await submit.execute("corrected", value, undefined, undefined, ctx);
+    expect(accepted.isError).not.toBe(true);
+    expect((await submit.execute("identical", structuredClone(value), undefined, undefined, ctx)).details).toEqual(accepted.details);
+    corrections++;
+    return false;
+  } });
+  try {
+    const start = await s.invoke("architecture_start", { goal: "Correct a contextual reference" }); await s.delivered.promise;
+    expect(corrections).toBe(1);
+    expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("completed");
+    expect(s.host.sessions).toHaveLength(2);
+    expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
+  } finally { await s.close(); }
+}));
+
 test("direct and codemode-reachable participant capabilities are leaf, and prior-turn submit grants are stale", fixture.ownedCase("architecture grants", async () => {
   let forbiddenCalls = 0, oldSubmit: (() => Promise<any>) | undefined;
+  const deciding = deferred(), release = deferred(); fixture.finishOnCleanup(release.resolve);
   const external = new Map(["agent_spawn", "team_assign", "architecture_start", "architecture_control", "head_plan", "edit", "write", "apply_patch", "lsp_rename"].map(name =>
     [name, { definition: { name, execute(): { isError?: boolean } { forbiddenCalls++; return {}; } } }]));
   const s = await setup({ extensions: [{ resolvedPath: "controlled-capabilities", tools: external }], async prompt(session, request, body) {
@@ -241,7 +432,10 @@ test("direct and codemode-reachable participant capabilities are leaf, and prior
       const guards = session.hooks.get("tool_call") ?? [];
       expect(guards.some((guard: Function) => guard({ toolName: name })?.block)).toBe(true);
     }
-    if (request.stage === "answer") {
+    if (request.stage === "decision" && request.round === 1) {
+      deciding.resolve(); await release.promise; return { ...body, action: "continue" };
+    }
+    if (request.stage === "contribution" && session.model.id === "chosen") {
       if (oldSubmit) {
         expect((await oldSubmit()).isError).toBe(true);
       }
@@ -253,28 +447,29 @@ test("direct and codemode-reachable participant capabilities are leaf, and prior
       expect((await submit.execute("aborted", { submissionId: "aborted", body }, aborted.signal, undefined, { sessionManager: session.sessionManager })).isError).toBe(true);
       const submitted = structuredClone(body);
       expect((await submit.execute("immutable", { submissionId: "immutable", body: submitted }, undefined, undefined, { sessionManager: session.sessionManager })).isError).not.toBe(true);
-      submitted.answer = "mutated after receipt";
+      submitted.proposal = "mutated after receipt";
       return false;
     }
   } });
   try {
-    const start = await s.invoke("architecture_start", { mode: "consultation", goal: "grants" });
-    await s.knowledge[0]!.promise; await tick();
+    const start = await s.invoke("architecture_start", { goal: "grants" });
+    await deciding.promise;
     expect(forbiddenCalls).toBe(0);
-    await s.invoke("architecture_control", { roomId: start.details.roomId, action: "context", text: "new turn" }); await s.knowledge[1]!.promise; await tick();
-    await s.invoke("architecture_control", { roomId: start.details.roomId, action: "finish" }); await s.delivered.promise;
+    await s.invoke("architecture_control", { roomId: start.details.roomId, action: "context", text: "new turn" });
+    release.resolve(); await s.delivered.promise;
     expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("completed");
     expect(s.host.sessions).toHaveLength(2); expect(forbiddenCalls).toBe(0);
     expect((await oldSubmit!()).isError).toBe(true); // retired origin after disposal
-    const specialist = s.host.sessions.find(session => session.prompts.some(text => JSON.parse(text).stage === "answer"))!;
+    const specialist = s.host.sessions.find(session => session.model?.id === "chosen")!;
     expect((await specialist.boundTools.get("architecture_submit").execute("outside", {}, undefined, undefined, { sessionManager: specialist.sessionManager })).isError).toBe(true);
-    expect(s.sent.filter(item => item.message.customType === "pitako.architecture.response")
-      .every(item => JSON.parse(item.message.content).answer.body.answer.endsWith("🧠"))).toBe(true);
-  } finally { await s.close(); }
+    const page = (await s.invoke("architecture_read", { roomId: start.details.roomId })).details;
+    expect(page.fragments.map((fragment: any) => fragment.text).join("")).toContain("Use a bounded design");
+    expect(page.fragments.map((fragment: any) => fragment.text).join("")).not.toContain("mutated after receipt");
+  } finally { release.resolve(); await s.close(); }
 }));
 
 for (const route of ["stop", "team_cancel"] as const) {
-  for (const stage of ["answer", "consultation-response"] as const) {
+  for (const stage of ["contribution", "consultation-response"] as const) {
     test(`${route} aborts active ${stage} children before prompt release and joins abort/disposal`, fixture.ownedCase(`architecture ${route} ${stage} closure`, async () => {
       const entered = deferred(), releasePrompt = deferred(), releaseAbort = deferred(), disposing = deferred(), releaseDispose = deferred();
       const children: any[] = [];
@@ -283,13 +478,13 @@ for (const route of ["stop", "team_cancel"] as const) {
       const s = await setup({
         async prompt(session, request, body) {
           if (stage === "consultation-response") {
-            if (request.stage === "answer") return { ...body, doubts: [0, 1].map(index => ({ question: `Question ${index}`, purpose: "check cancellation" })) };
+            if (request.stage === "preparation" && session.model.id === "chosen") return { ...body, doubts: [0, 1].map(index => ({ question: `Question ${index}`, purpose: "check cancellation" })) };
             if (request.stage === "consultation-plan") return { kind: "consultation-plan", resolutions: [], support: request.context.doubts.map((doubt: any) =>
               ({ role: "scout", brief: "resolve doubt", doubtIds: [doubt.id], prerequisites: [] })) };
           }
-          if (request.stage === stage) {
+          if (request.stage === stage && (stage !== "contribution" || session.model.id === "chosen")) {
             children.push(session);
-            if (children.length === (stage === "answer" ? 1 : 2)) entered.resolve();
+            if (children.length === (stage === "contribution" ? 1 : 2)) entered.resolve();
             await releasePrompt.promise;
             const rejected = await session.boundTools.get("architecture_submit").execute("after-abort", { submissionId: "late", body }, undefined, undefined, { sessionManager: session.sessionManager });
             expect(rejected.isError).toBe(true);
@@ -303,7 +498,7 @@ for (const route of ["stop", "team_cancel"] as const) {
         const db = await openBoard(); const topic = db.createTopic(s.root, { title: "Cancel" }); db.claimTopic(s.root, topic.id, "cancel-plan"); db.close();
         const file = planFile("cancel-plan", s.root); mkdirSync(path.dirname(file), { recursive: true });
         writeFileSync(file, `---\nid: cancel-plan\nrevision: 1\nstatus: frozen\nboard_topic_id: ${topic.id}\n---\nCancellation.\n`);
-        const start = await s.invoke("architecture_start", { mode: "consultation", goal: "cancel active children", plan: "cancel-plan", unit: "T2" });
+        const start = await s.invoke("architecture_start", { goal: "cancel active children", plan: "cancel-plan", unit: "T2" });
         await entered.promise;
         const hold = readLedgerTeamHolds(s.root, "cancel-plan"); expect(hold).toHaveLength(1);
         const before = s.host.sessions.map(session => ({ session, prompts: [...session.prompts] }));
@@ -318,7 +513,7 @@ for (const route of ["stop", "team_cancel"] as const) {
           expect(workerHandoff(start.details.instanceId)).toBeUndefined();
           expect(firstTeamReservation(s.evaluation, "architect")).toBe(start.details.assignmentId);
           expect(readLedgerTeamHolds(s.root, "cancel-plan")).toEqual(hold);
-          const active = teamWorkerStatus(s.evaluation.token).filter(row => row.teamId === start.details.roomId && row.roleId === (stage === "answer" ? "architect" : "scout"));
+          const active = teamWorkerStatus(s.evaluation.token).filter(row => row.teamId === start.details.roomId && row.roleId === (stage === "contribution" ? "architect" : "scout"));
           expect(active).toHaveLength(2);
           expect(active.every(row => row.closure.state === "pending")).toBe(true);
           expect(s.sent.filter(item => item.message.customType === "pitako.worker.result")).toHaveLength(0);
@@ -343,11 +538,11 @@ for (const route of ["stop", "team_cancel"] as const) {
     const s = await setup({ bind(session) {
       const setModel = session.setModel.bind(session);
       session.setModel = async (model: any) => { activations.push(model.id); await setModel(model); };
-    }, async prompt(_session, request) {
-      if (request.stage === "answer") { entered.resolve(); await release.promise; throw new Error("503 Service Unavailable"); }
+    }, async prompt(session, request) {
+      if (request.stage === "contribution" && session.model.id === "chosen") { entered.resolve(); await release.promise; throw new Error("503 Service Unavailable"); }
     } });
     try {
-      const start = await s.invoke("architecture_start", { mode: "consultation", goal: "late failure" }); await entered.promise;
+      const start = await s.invoke("architecture_start", { goal: "late failure" }); await entered.promise;
       const before = { activations: [...activations], prompts: s.host.sessions.map(session => [...session.prompts]) };
       if (route === "stop") await s.invoke("architecture_control", { roomId: start.details.roomId, action: "stop" });
       else await s.invoke("team_cancel", { assignmentId: start.details.assignmentId });
@@ -365,17 +560,17 @@ for (const route of ["stop", "team_cancel"] as const) {
 }
 
 for (const retire of ["stop", "session_start", "session_shutdown"] as const) {
-  test(`${retire} joins an active consultation without fallback or fictitious success`, fixture.ownedCase("architecture " + retire, async () => {
+  test(`${retire} joins an active table without fallback or fictitious success`, fixture.ownedCase("architecture " + retire, async () => {
     const entered = deferred(), release = deferred(); fixture.finishOnCleanup(release.resolve);
-    let answers = 0;
-    const s = await setup({ async prompt(_session, request) { if (request.stage === "answer") { answers++; entered.resolve(); await release.promise; return false; } } });
+    let contributions = 0;
+    const s = await setup({ async prompt(session, request) { if (request.stage === "contribution" && session.model.id === "chosen") { contributions++; entered.resolve(); await release.promise; return false; } } });
     try {
-      const start = await s.invoke("architecture_start", { mode: "consultation", goal: "cancel" }); await entered.promise;
+      const start = await s.invoke("architecture_start", { goal: "cancel" }); await entered.promise;
       const retirement = retire === "stop" ? s.invoke("architecture_control", { roomId: start.details.roomId, action: "stop" }) : s.emit(retire);
       await tick(); expect(workerHandoff(start.details.instanceId)).toBeUndefined();
       release.resolve(); await retirement;
       if (retire === "stop") { await s.delivered.promise; expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("cancelled"); }
-      expect(answers).toBe(1); expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
+      expect(contributions).toBe(1); expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
       expect(s.sent.filter(item => item.message.customType === "pitako.worker.result")).toHaveLength(retire === "stop" ? 1 : 0);
     } finally { release.resolve(); await s.close(); }
   }));
@@ -387,9 +582,8 @@ test("partial synthesis is failed and a bound draft without a ledger never inven
     const db = await openBoard(); const topic = db.createTopic(s.root, { title: "Draft" }); db.claimTopic(s.root, topic.id, "draft"); db.close();
     const file = planFile("draft", s.root); mkdirSync(path.dirname(file), { recursive: true });
     writeFileSync(file, `---\nid: draft\nrevision: 1\nstatus: draft\nboard_topic_id: ${topic.id}\n---\nDraft.\n`);
-    const start = await s.invoke("architecture_start", { mode: "consultation", goal: "partial", plan: "draft", unit: "T2" }); await s.knowledge[0]!.promise; await tick();
+    const start = await s.invoke("architecture_start", { goal: "partial", plan: "draft", unit: "T2" }); await s.delivered.promise;
     expect(existsSync(ledgerFile("draft", s.root))).toBe(false);
-    await s.invoke("architecture_control", { roomId: start.details.roomId, action: "finish" }); await s.delivered.promise;
     expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("failed");
     expect(existsSync(ledgerFile("draft", s.root))).toBe(false);
   } finally { await s.close(); }
@@ -399,7 +593,7 @@ test("Architect-authorized support uses real native parent attribution, finite d
   const both = deferred(), release = deferred(); fixture.finishOnCleanup(release.resolve);
   let active = 0, maxActive = 0, calls = 0;
   const s = await setup({ async prompt(session, request, body) {
-    if (request.stage === "answer") return { ...body, doubts: [0, 1, 2].map(index => ({ question: `Question ${index}`, purpose: "resolve uncertainty" })) };
+    if (request.stage === "preparation" && session.model.id === "chosen") return { ...body, doubts: [0, 1, 2].map(index => ({ question: `Question ${index}`, purpose: "resolve uncertainty" })) };
     if (request.stage === "consultation-plan") return { kind: "consultation-plan", resolutions: [], support: request.context.doubts.map((doubt: any, index: number) =>
       ({ role: "scout", brief: `support ${index}`, doubtIds: [doubt.id], prerequisites: index === 2 ? [0] : [] })) };
     if (request.stage === "consultation-response") {
@@ -414,19 +608,19 @@ test("Architect-authorized support uses real native parent attribution, finite d
       return { kind: "knowledge", resolutions: request.context.doubts.map((doubt: any, index: number) => ({ doubtId: doubt.id,
         status: index === 1 ? "answered" : "failed", answer: "Support outcome", supportIds: [request.context.responses[index].id] })) };
     }
+    if (request.stage === "synthesis") return { ...body, status: "partial", pending: ["Two consultations failed"] };
   } });
   try {
-    const start = await s.invoke("architecture_start", { mode: "consultation", goal: "support" }); await both.promise;
+    const start = await s.invoke("architecture_start", { goal: "support" }); await both.promise;
     expect(maxActive).toBe(2); expect(workerHandoff(start.details.instanceId)).toBeUndefined();
     expect(s.sent.filter(item => item.message.customType === "pitako.worker.result")).toHaveLength(0);
-    release.resolve(); await s.knowledge[0]!.promise; await s.response.promise;
+    release.resolve(); await s.delivered.promise;
     expect(calls).toBe(2); expect(s.host.sessions.filter(session => session.model!.id === "support").every(session => session.events.includes("dispose"))).toBe(true);
     const history = await s.invoke("agent_history", { action: "list" });
     expect(JSON.stringify(history.details)).toContain(s.host.sessions[0]!.sessionId);
     const dispatches = s.host.sessions[0]!.sessionManager.getEntries().filter((entry: any) => entry.customType === "pitako.architecture.dispatch") as any[];
     expect(dispatches).toHaveLength(3);
     expect(dispatches.every(entry => entry.data.callerSessionId === s.host.sessions[0]!.sessionId && entry.data.parentAssignmentId === start.details.assignmentId)).toBe(true);
-    await s.invoke("architecture_control", { roomId: start.details.roomId, action: "finish" }); await s.delivered.promise;
     expect(s.sent.filter(item => item.message.customType === "pitako.worker.result")).toHaveLength(1);
     expect(s.host.sessions).toHaveLength(4);
   } finally { release.resolve(); await s.close(); }

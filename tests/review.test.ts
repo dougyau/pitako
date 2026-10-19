@@ -21,8 +21,11 @@ test("registered review uses the real adapter, independent Reviewer preparation 
     else { subordinateEntered.resolve(); await subordinate.promise; }
   }, prompt(session, request, body) {
     if (request.stage === "preparation") {
-      expect(request.review.findings).toEqual([]);
-      expect(request.context.shared.messages).toEqual([]);
+      expect(request.review).toBeUndefined();
+      expect(request.context.shared).toBeUndefined();
+      expect(request.snapshot).toBeUndefined();
+      expect(request.controls).toBeUndefined();
+      expect(request.journal).toBeUndefined();
       expect(request.object.selector).toEqual(start.object);
       expect(request.criteria).toEqual(start.criteria);
     }
@@ -148,12 +151,18 @@ for (const [action, window, verdict] of [
   } finally { subordinate.resolve(); root.resolve(); await f.close(); }
 });
 
-test("absence rejects before reservation; public names guarded without prefix-blocking local submit", async () => {
-  const f = await setup({ config: "" });
+test("absent candidate pools still run director-only review; public names guard orchestration but not local submit", async () => {
+  const f = await setup({ config: "", prompt(_session, request, body) {
+    if (request.stage === "composition") return { ...body, specialists: [] };
+    return body;
+  } });
   try {
     const answer = await f.invoke("review_start", start);
-    expect(answer.isError).toBe(true); expect(answer.details.error).toContain("configuration absent");
-    expect(teamAssignments(f.evaluation)).toEqual([]); expect(f.host.sessions).toHaveLength(0);
+    expect(answer.isError).not.toBe(true); await f.delivered.promise;
+    expect(reportFor(f, answer.details).status).toBe("completed");
+    expect(teamAssignments(f.evaluation)).toHaveLength(1); expect(f.host.sessions).toHaveLength(1);
+    expect(f.seen.filter(item => item.request.stage === "preparation")).toHaveLength(1);
+    expect(f.seen.filter(item => item.request.stage === "contribution")).toHaveLength(1);
     const names = ["review_start", "review_read", "review_control", "review_submit"];
     expect(names.map(isOrchestrationTool)).toEqual([true, true, true, false]);
     for (const profile of ["coding", "analysis"] as const)
@@ -230,11 +239,12 @@ test("round publication is atomic in composition order; finish drains current wo
   let preparers = 0;
   const f = await setup({ async prompt(session, request, body) {
     if (request.stage === "composition") return { ...body, specialists: ["first", "second"].map(mandate =>
-      ({ candidateRef: "general:0", mandate, reason: "Independent review" })) };
+      ({ kind: "add", candidateRef: "general:0", mandate, reason: "Independent review" })) };
     if (request.stage === "preparation" && session.model.id !== "director") {
-      if (++preparers === 1) { first.resolve(); await release.promise; }
+      const key = ++preparers === 1 ? "first" : "second";
+      if (key === "first") { first.resolve(); await release.promise; }
       else second.resolve();
-      return { ...body, findings: [{ ...finding, key: request.context.mandate }] };
+      return { ...body, findings: [{ ...finding, key }] };
     }
     if (request.stage === "synthesis") return { ...body, completion: "partial", verdict: "changes-required" };
   } });
@@ -276,9 +286,11 @@ test("recomposition joins outgoing specialists and independently prepares newcom
   const f = await setup({ async dispose(session) {
     if (session.model.id === "chosen") { outgoing.resolve(); await release.promise; }
   }, prompt(session, request, body) {
-    if (request.stage === "composition" && ++compositions === 2) return { ...body, specialists: [{ candidateRef: "general:0", mandate: "Fresh review", reason: "Independent challenge" }] };
+    if (request.stage === "composition" && ++compositions === 2) return { ...body, specialists: [{ kind: "add", candidateRef: "general:0", mandate: "Fresh review", reason: "Independent challenge" }] };
     if (request.stage === "preparation") {
-      expect(request.review.findings).toEqual([]);
+      expect(request.review).toBeUndefined();
+      expect(request.authorization).toEqual({ kind: "preparation" });
+      expect(request.journal).toBeUndefined();
       if (session.model.id === "chosen") return { ...body, findings: [finding] };
     }
     if (request.stage === "decision") return { ...body, action: request.round === 1 ? "recompose" : "synthesize" };
@@ -316,8 +328,8 @@ test("support capacity includes retained disposal and dependencies consume only 
     if (session.model.id !== "support") return;
     if (++disposalCalls === 2) disposing.resolve();
     await releaseDispose.promise; active--;
-  }, async prompt(_session, request, body) {
-    if (request.stage === "preparation" && request.context.mandate !== "Independently review the complete object against every criterion")
+  }, async prompt(session, request, body) {
+    if (request.stage === "preparation" && session.model.id !== "director")
       return { ...body, doubts: [0, 1, 2].map(index => ({ question: `Question ${index}`, purpose: "Required observation" })) };
     if (request.stage === "consultation-plan") return { kind: "consultation-plan", resolutions: [], support: request.context.doubts.map((doubt: any, index: number) =>
       ({ role: "scout", brief: `support ${index}`, doubtIds: [doubt.id], prerequisites: index === 2 ? [0] : [] })) };

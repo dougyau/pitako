@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { loadPitakoConfig } from "../roles/load.ts";
+import { loadPitakoConfig, resolveRoleFromConfig } from "../roles/load.ts";
 import { executionForSession } from "../execution-identity.ts";
 import { currentInstanceId } from "../agent/scope.ts";
 import { assertNoCheckpointLease } from "../agent/head/checkpoint-lease.ts";
@@ -33,13 +33,14 @@ export function registerReview(pi: ExtensionAPI) {
     return { evaluation, room };
   };
   pi.registerTool({ name: "review_start", label: "Start Reviewer table",
-    description: "Start an independent, analysis-only Reviewer director and 1–5 Reviewer specialists. Captures the complete selected object and criteria. Returns the real exterior Team handle; only its final report delivers, after all physical closure. Not product acceptance.",
+    description: "Start an independent, analysis-only Reviewer director and zero to five Reviewer specialists. Captures the complete selected object and criteria. Returns the real exterior Team handle; only its final report delivers, after all physical closure. Not product acceptance.",
     parameters: Type.Object({ goal: text, object: objectSchema, criteria: Type.Array(text, { minItems: 1 }),
       topic: Type.Optional(text), plan: Type.Optional(text), unit: Type.Optional(text), boardTopicId: Type.Optional(text) }, strict),
     async execute(toolCallId, params, _signal, _update, ctx) {
       try {
         const evaluation = evaluationFor(ctx), config = structuredClone(loadPitakoConfig({ cwd: ctx.cwd }));
-        if (!config.review) throw new Error("review is disabled: configuration absent");
+        const director = resolveRoleFromConfig(config, "reviewer");
+        if (director.modelPolicy.diagnostic) throw new Error(director.modelPolicy.diagnostic);
         if (!params.goal.trim() || !params.criteria.length || params.criteria.some(item => !item.trim())) throw new Error("review requires goal and nonempty criteria");
         const captured = captureObject(params.object, ctx.cwd);
         const team = createTeam(evaluation), assignmentId = randomUUID();
@@ -62,7 +63,7 @@ export function registerReview(pi: ExtensionAPI) {
               if (watched.execution) origin.execution = { executionRoot: launchRoot, executionRef: `${watched.execution.planId}@${watched.execution.revision}:${watched.execution.hash}` };
               const object = launchRoot === captured.root ? captured : captureObject(params.object, launchRoot);
               const review = createReviewPolicy(object, params.goal, [...params.criteria]);
-              const runtime = createTable({ team, config, mode: "table", goal: params.goal, topic: params.topic, review,
+              const runtime = createTable({ team, config, goal: params.goal, topic: params.topic, review,
                 root: { assignmentId, memberId: admission.memberId, instanceId: reserved.instanceId }, origin, cwd: launchRoot, owns: reserved.current });
               room.runtime = runtime;
               recordTeamAssignment(evaluation, "reviewer", { id: assignmentId, instanceId: reserved.instanceId, roleId: "reviewer", task: params.goal,

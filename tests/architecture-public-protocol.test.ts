@@ -29,6 +29,12 @@ test("architecture capability group is complete, canonical, optional on both des
 
 test("typed body validators retain all protocol variants and reject UI/provisional/persistence substitutions", () => {
   const bodies = [
+    { kind: "composition", snapshotId: "snapshot", reason: "Director alone", specialists: [] },
+    { kind: "composition", snapshotId: "snapshot", reason: "Selective change", specialists: [
+      { kind: "retain", memberId: "existing", mandate: "Updated focus", reason: "Continuity" },
+      { kind: "add", candidateRef: "general:0", mandate: "New focus", reason: "Missing expertise" },
+    ] },
+    // Historical decoder forms are not live submit schemas.
     { kind: "composition", snapshotId: "snapshot", specialists: [{ candidateRef: "general:0", mandate: "task", reason: "reason" }] },
     { kind: "preparation", analysis: "analysis", doubts: [] },
     { kind: "contribution", proposal: "proposal", arguments: [], objections: [{ memberId: "other", messageId: "publication", argument: "why" }], doubts: [] },
@@ -48,7 +54,39 @@ test("typed body validators retain all protocol variants and reject UI/provision
     expect(isArchitectureRecord({ kind: "publication", id: message.id, message: { ...message, native: { ...message.native, persistence: "confirmed" } } })).toBe(false);
   }
   for (const bad of [{ kind: "provisional" }, { kind: "synthesis", recommendation: "only prose" }, { kind: "contribution", arguments: [42] }]) expect(isPublicArchitectureBody(bad)).toBe(false);
+  const choice = { kind: "retain", memberId: "existing", mandate: "Focus", reason: "Continuity" };
+  for (const body of [
+    { kind: "composition", snapshotId: "snapshot", specialists: [] },
+    { kind: "composition", snapshotId: "snapshot", reason: "", specialists: [] },
+    { kind: "composition", snapshotId: "snapshot", reason: "Too many", specialists: Array(6).fill(choice) },
+    { kind: "composition", snapshotId: "snapshot", reason: "Mixed union", specialists: [{ ...choice, candidateRef: "general:0" }] },
+    { kind: "composition", snapshotId: "snapshot", reason: "Missing tag", specialists: [{ candidateRef: "general:0", mandate: "Focus", reason: "New" }] },
+  ]) expect(isPublicArchitectureBody(body)).toBe(false);
   expect(isArchitectureRecord({ kind: "outcome", id: "final", source: "background-settlement", status: "completed", content: { kind: "text", text: "settled" } })).toBe(true);
+});
+
+test("current roster provenance and historical room/catalog/waiting records decode through isReply", () => {
+  const lifecycle = { stage: "waiting", round: 1, protocolState: "waiting", outcome: "pending",
+    closure: { state: "pending", members: "pending", director: "pending" } };
+  const director = { memberId: "director", assignmentId: "assignment", instanceId: "instance" };
+  const room = { kind: "room", id: "room", origin: { coordinatorSessionId: "owner", tool: "architecture_start", toolCallId: "start", ...director },
+    goalSource: { kind: "worker-workbrief", instanceId: "instance" }, lifecycle, pendingDoubtIds: [] };
+  for (const mode of [undefined, "table", "consultation"]) {
+    const legacy = mode === undefined ? {} : { mode };
+    const catalog = { format: "architecture-public-v1", state: "ready", owner, snapshotId: "snapshot", cut: 1,
+      items: [{ ref, director, lifecycle, ...legacy }], next: null };
+    expect(isReply(success(envelope("architecture.list", {}), catalog), "architecture.list")).toBe(true);
+    expect(isReply(success(envelope("architecture.read", { ref }), {
+      format: "architecture-public-v1", state: "ready", ref, snapshotId: "snapshot", cut: 1, capture, records: [{ ...room, ...legacy }], next: null,
+    }), "architecture.read")).toBe(true);
+  }
+  const member = { kind: "member", id: "member", assignmentId: "assignment", instanceId: "instance", roleId: "architect", function: "specialist",
+    ordinal: 1, admittedAt: 1, mandate: { source: "composition", text: "Current task" }, execution: "running", conversationRefs: [],
+    compositionMessageId: "admitted", compositionChoiceIndex: 0, selection: { compositionMessageId: "retained", choiceIndex: 1 } };
+  for (const state of ["preparing", "active", "closing", "closed", "closure-unknown"]) expect(isArchitectureRecord({ ...member, state })).toBe(true);
+  for (const invalid of [{ compositionChoiceIndex: -1 }, { selection: { compositionMessageId: "retained", choiceIndex: -1 } }, { state: "released" }])
+    expect(isArchitectureRecord({ ...member, ...invalid })).toBe(false);
+  expect(isArchitectureRecord({ ...member, selection: { ...member.selection, ui: true } })).toBe(false);
 });
 
 test("frozen Unicode byte pages replay exact cuts, bind view/room and authenticate cursors", () => {

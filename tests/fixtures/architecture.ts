@@ -32,11 +32,11 @@ export function architectureFixture(protocol: "architecture" | "review" = "archi
   topic = "security"
   candidates = [{ model = "fixture/chosen", reasoning = "high" }, { model = "fixture/chosen", reasoning = "low" }, { model = "fixture/other" }]
   `;
-  async function setup(extra: { root?: string; config?: string; busy?: boolean; prompt?: (session: any, request: any, body: any) => Promise<any> | any; afterSubmit?: (session: any, request: any, receipt: any) => Promise<void> | void; abort?: (session: any) => Promise<void>; dispose?: (session: any) => Promise<void>; bind?: (session: any) => Promise<void> | void; extensions?: any[] } = {}) {
+  async function setup(extra: { root?: string; config?: string; policies?: string; busy?: boolean; prompt?: (session: any, request: any, body: any) => Promise<any> | any; afterSubmit?: (session: any, request: any, receipt: any) => Promise<void> | void; abort?: (session: any) => Promise<void>; dispose?: (session: any) => Promise<void>; bind?: (session: any) => Promise<void> | void; extensions?: any[] } = {}) {
     const root = extra.root ?? mkdtempSync(path.join(tmpdir(), "pitako-architecture-"));
     if (!extra.root) fixture.directories.push(root);
     process.env.PI_CODING_AGENT_DIR = root;
-    mkdirSync(path.join(root, "pitako"), { recursive: true }); writeFileSync(path.join(root, "pitako/config.toml"), policies + (extra.config ?? configuration));
+    mkdirSync(path.join(root, "pitako"), { recursive: true }); writeFileSync(path.join(root, "pitako/config.toml"), (extra.policies ?? policies) + (extra.config ?? configuration));
     const sessionId = path.basename(root), branch: any[] = [], sent: any[] = [], tools = new Map<string, any>(), hooks = new Map<string, Function[]>();
     const file = path.join(root, "coordinator.jsonl");
     writeFileSync(file, JSON.stringify({ type: "session", version: 3, id: sessionId, cwd: root }) + "\n");
@@ -70,14 +70,16 @@ export function architectureFixture(protocol: "architecture" | "review" = "archi
         try {
           const request = JSON.parse(text.startsWith("{") ? text : [...session.prompts].reverse().find((prompt: string) => prompt.startsWith("{"))!);
           const review = request.protocol === "Pitako review";
-          const body = request.stage === "composition" ? { kind: "composition", snapshotId: request.snapshot.id, specialists: [{ candidateRef: "topic:0:0", mandate: "Review security", reason: "Relevant expertise" }] }
+          const body = request.stage === "composition" ? { kind: "composition", snapshotId: request.snapshot.id, reason: "Security expertise is useful",
+            specialists: [{ kind: "add", candidateRef: "topic:0:0", mandate: "Review security", reason: "Relevant expertise" }] }
             : review && request.stage === "preparation" ? { kind: "preparation", analysis: "Independent whole-object review", findings: [], doubts: [] }
             : review && request.stage === "contribution" ? { kind: "contribution", analysis: "Review incoming evidence", findings: [], responses: [], doubts: [] }
-            : review && request.stage === "decision" ? { kind: "decision", action: "synthesize", reason: "Sufficient observations" }
+            : request.stage === "preparation" ? { kind: "preparation", analysis: "Independent whole-goal architectural analysis", doubts: [] }
+            : request.stage === "contribution" ? { kind: "contribution", proposal: "Use a bounded design", arguments: ["Preserve existing ownership"], objections: [], doubts: [] }
+            : request.stage === "decision" ? { kind: "decision", action: "synthesize", reason: "Sufficient observations" }
             : review && request.stage === "synthesis" ? { kind: "synthesis", completion: "complete", verdict: "no-blockers", summary: "Reviewed complete object",
               dispositions: request.review.findings.map((finding: any) => ({ findingId: finding.id, status: "upheld", reason: "Reachable failure", references: [finding.messageId] })),
               newFindings: [], evidence: [], limits: [], pending: [] }
-            : request.stage === "answer" ? { kind: "answer", answer: "A".repeat(20000) + "🧠", evidence: ["source"], limits: [], doubts: [] }
             : request.stage === "consultation-plan" ? { kind: "consultation-plan", resolutions: [], support: [] }
             : request.stage === "knowledge" ? { kind: "knowledge", resolutions: [] }
             : { kind: "synthesis", status: "complete", recommendation: "Use the bounded design", alternatives: [], evidence: [], assumptions: [], disagreements: [], pending: [] };

@@ -10,6 +10,58 @@ import profilePolicy from "../extensions/profile-policy.ts";
 import { agentScope } from "../extensions/agent/scope.ts";
 import { packageRoot } from "../extensions/stack.ts";
 import { childActiveTools, toolsForProfile } from "../extensions/profile.ts";
+import { parsePitakoConfig } from "../extensions/roles/load.ts";
+
+describe("table candidate pool normalization", () => {
+  for (const section of ["architecture", "review"] as const) {
+    for (const [label, source] of [
+      ["missing file", undefined],
+      ["omitted section", ""],
+      ["empty section", `[${section}]\n`],
+      ["empty candidates", `[${section}]\ncandidates=[]\n`],
+      ["empty topics", `[${section}]\ntopics=[]\n`],
+      ["empty lists", `[${section}]\ncandidates=[]\ntopics=[]\n`],
+    ] as const) {
+      test(`${section}: ${label} normalizes to an empty pool`, () => {
+        expect(parsePitakoConfig(source)[section]).toEqual({ candidates: [], topics: [] });
+      });
+    }
+    for (const candidates of ["", "candidates=[]\n"]) {
+      test(`${section}: topic with ${candidates ? "empty" : "omitted"} candidates normalizes`, () => {
+        const config = parsePitakoConfig(`[[${section}.topics]]\ntopic="  Security   Design "\n${candidates}`);
+        expect(config[section]).toEqual({ candidates: [], topics: [{ topic: "security design", candidates: [] }] });
+      });
+    }
+    test(`${section}: preserves configured candidates and topics`, () => {
+      const config = parsePitakoConfig(`[${section}]
+candidates=[{model="test/general",reasoning="high"}]
+topics=[{topic="Security",candidates=[{model="test/security"}]}]`);
+      expect(config[section]).toEqual({
+        candidates: [{ model: "test/general", reasoning: "high" }],
+        topics: [{ topic: "security", candidates: [{ model: "test/security" }] }],
+      });
+    });
+    for (const [body, error] of [
+      [`${section}=[]`, "expected a table"],
+      [`[${section}]\nunknown=[]`, "unknown key"],
+      [`[${section}]\ncandidates="invalid"`, "expected an array"],
+      [`[${section}]\ntopics="invalid"`, "expected array"],
+      [`[${section}]\ncandidates=[{}]`, "empty fallback target"],
+      [`[${section}]\ncandidates=[{model="invalid"}]`, "provider/model"],
+      [`[${section}]\ncandidates=[{model="test/model",unknown=true}]`, "unknown key"],
+      [`[${section}]\ncandidates=[{model="test/model"},{model="test/model"}]`, "duplicate candidate"],
+      [`[${section}]\ntopics=[{}]`, "expected text"],
+      [`[${section}]\ntopics=[{topic="x",unknown=true}]`, "unknown key"],
+      [`[${section}]\ntopics=[{topic="x",candidates=false}]`, "expected an array"],
+      [`[${section}]\ntopics=[{topic=" X "},{topic="x"}]`, "duplicate topic"],
+      [`[${section}]\ntopics=[{topic="x",candidates=[{model="test/model"},{model="test/model"}]}]`, "duplicate candidate"],
+    ]) {
+      test(`${section}: rejects ${body}`, () => {
+        expect(() => parsePitakoConfig(body)).toThrow(error);
+      });
+    }
+  }
+});
 
 const configDirs: string[] = [];
 let privateConfig: ReturnType<typeof privateStartupConfig>;

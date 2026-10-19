@@ -29,7 +29,7 @@ export const synthesisSchema = Type.Object({
 }, strict);
 // Composition, support and round decisions share grammar, not architectural judgments.
 export const bodySchema = Type.Union([
-  ...architectureSchema.anyOf.filter(schema => !["preparation", "contribution", "synthesis", "answer"].includes(schema.properties.kind.const)),
+  ...architectureSchema.anyOf.filter(schema => !["preparation", "contribution", "synthesis"].includes(schema.properties.kind.const)),
   Type.Object({ kind: Type.Literal("preparation"), analysis: text, findings, doubts }, strict),
   Type.Object({ kind: Type.Literal("contribution"), analysis: text, findings, responses: Type.Array(response), doubts }, strict),
   synthesisSchema,
@@ -38,7 +38,7 @@ export const submitSchema = Type.Object({ submissionId: text, body: bodySchema }
 export type Finding = Static<typeof findingSchema>;
 export type Response = Static<typeof response>;
 export type Synthesis = Static<typeof synthesisSchema>;
-export type ReviewBody = Exclude<ArchitectureBody, { kind: "preparation" | "contribution" | "synthesis" | "answer" }>
+export type ReviewBody = Exclude<ArchitectureBody, { kind: "preparation" | "contribution" | "synthesis" }>
   | { kind: "preparation"; analysis: string; findings: Finding[]; doubts: { question: string; purpose: string }[] }
   | { kind: "contribution"; analysis: string; findings: Finding[]; responses: Response[]; doubts: { question: string; purpose: string }[] }
   | Synthesis;

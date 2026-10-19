@@ -123,7 +123,10 @@ principles = ["principle-foundational-thinking"]
 [model_policies.scout]
 [model_policies.oracle]
 
-# Optional direct architecture consultations. No models are enabled by default.
+# Optional specialist pool for architecture_start (no mode); review_start uses [review].
+# Missing section, omitted candidates or [] means an empty pool, not a disabled table.
+# Each substantive director requires its own role primary; no models are enabled by default.
+# Select zero to five specialists for utility with reasons; retain/add/retire selectively.
 # [architecture]
 # candidates = [{ model = "provider/general", reasoning = "high" }]
 # [[architecture.topics]]

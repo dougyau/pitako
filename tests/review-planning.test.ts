@@ -97,7 +97,8 @@ for (const outcome of ["no-blockers", "changes-required", "inconclusive", "faile
     const s = await setup({
       prompt(session, input, body) {
         if (input.stage === "preparation") {
-          expect(input.review.findings).toEqual([]); expect(input.context.shared.messages).toEqual([]);
+          expect(input.review).toBeUndefined(); expect(input.context.shared).toBeUndefined();
+          expect(input.journal).toBeUndefined(); expect(input.snapshot).toBeUndefined();
           expect(input.object.selector).toEqual(request.object); expect(input.criteria).toEqual(request.criteria);
           if (session.model.id !== "director" && outcome !== "no-blockers") return { ...body, findings: [finding] };
         }

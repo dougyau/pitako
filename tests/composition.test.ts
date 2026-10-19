@@ -199,9 +199,9 @@ describe("engineering-layer composition", () => {
     expect(execute).not.toContain("There is no steer into a running worker");
     for (const workflow of [skillText("plan"), execute]) {
       for (const contract of [
-        "use background dispatch", "supersedes generic tool prompts",
-        "use `agent_spawn` only when Team is not registered",
-        "No synchronous fallback, inline specialist work, or waived review",
+        "use only `architecture_start` and `review_start`",
+        "required start is unavailable", "blocked",
+        "No individual, synchronous or inline fallback and no waived review",
         "original WorkBrief", "foreground-only", 'intent: "query"', 'intent: "steer"',
         "historyId", "sessionId", "never interrupts a running command",
         "queued", "handled", "rejected", "unconfirmed",

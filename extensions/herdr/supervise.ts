@@ -11,7 +11,7 @@ import { createInstanceId } from "../agent/run.ts";
 import { currentInstanceId } from "../agent/scope.ts";
 import { PitakoConfigError } from "../errors.ts";
 import { loadPitakoConfig, resolveRoleFromConfig, type LoadOptions } from "../roles/load.ts";
-import type { ResolvedRole } from "../roles/types.ts";
+import { assertIndividualRole, TABLE_ONLY_ROLES, type ResolvedRole } from "../roles/types.ts";
 import { ORCHESTRATION_TOOLS } from "../profile.ts";
 import { piIntegrationCurrent, readHerdrPresence } from "./presence.ts";
 
@@ -55,6 +55,7 @@ export async function superviseAgent(input: {
   preflight?: () => Promise<DispatchSnapshot>;
   check?: () => void;
 }): Promise<SuperviseResult> {
+  assertIndividualRole(input.roleId);
   if (isConsultation(input.roleId)) throw new Error("Consultative roles require agent_spawn or team_assign, not agent_supervise");
   if (inFlight) throw new Error("agent_supervise is already in flight");
   inFlight = true;
@@ -198,20 +199,21 @@ export function registerAgentSupervise(pi: ExtensionAPI): void {
     name: "agent_supervise",
     label: "Supervise agent",
     description:
-      "Open one visible Herdr sibling Pi pane, submit one task, and return the instance id, pane id, and Herdr status. Requires Herdr presence and a current Pi integration. Does not fall back to agent_run.",
+      "Open one visible Herdr sibling Pi pane for an individual role. Architect and Reviewer require architecture_start and review_start. Submit one task and return the instance id, pane id, and Herdr status. Requires Herdr presence and a current Pi integration. Does not fall back to agent_run.",
     promptSnippet: "Supervise one role in a visible Herdr pane",
     promptGuidelines: [
       "Use agent_supervise only inside Herdr when a visible pane is required. If it fails, report the error. Do not fall back to agent_run or do that role's work yourself.",
     ],
     parameters: Type.Object(
       {
-        role: Type.String({ description: "Role id, for example developer" }),
+        role: Type.String({ not: { enum: Object.keys(TABLE_ONLY_ROLES) }, description: "Individual role id, for example developer; Architect/Reviewer require architecture_start/review_start" }),
         task: Type.String({ description: "Task for the supervised agent" }),
       },
       noExtra,
     ),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
+        assertIndividualRole(params.role);
         if (isConsultation(params.role)) throw new Error("Consultative roles require agent_spawn or team_assign, not agent_supervise");
         const result = await ownedDispatch(ctx, signal, () => true, async (signal, check) => {
           check();

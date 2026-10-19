@@ -701,8 +701,8 @@ describe("plan and execute contracts", () => {
     expect(execute).toContain("Level 2");
     expect(execute).toContain("Level 3");
     expect(execute).toContain("same Developer");
-    expect(execute).toContain("Prefer `team_assign` when registered");
-    expect(execute).toContain("Team assignment ID for Team");
+    expect(execute).toContain("Other long specialist work uses `team_assign` when registered");
+    expect(execute).toContain("exterior Team assignment ID for tables or Team");
     expect(execute).toContain("Interpret complete `pitako.worker.result` messages supplied automatically in context");
     expect(execute).toContain("optional, complete, idempotent diagnostic re-reads");
     expect(execute).toContain("They neither transport the automatic result nor acknowledge incorporation");
@@ -728,19 +728,16 @@ describe("plan and execute contracts", () => {
   test("Architect and Reviewer dependencies release the turn without synchronous fallback", () => {
     for (const policy of [plan, execute]) {
       for (const contract of [
-        "use background dispatch", "`team_assign` when registered",
-        "use `agent_spawn` only when Team is not registered",
-        "supersedes generic tool prompts", '"independent work"', "Do not change those prompts",
-        "If only `agent_run` exists", "blocked",
-        "No synchronous fallback, inline specialist work, or waived review",
-        "complete WorkBrief can run autonomously even when a coordinator decision depends on its answer",
-        "assignment turn", "keep a call open", "end the turn",
+        "use only `architecture_start` and `review_start`",
+        "required start is unavailable", "blocked",
+        "No individual, synchronous or inline fallback and no waived review",
+        "assignment turn", "keep a call open",
       ]) expect(policy).toContain(contract);
+      expect(policy).toMatch(/end the turn/i);
       expect(policy).not.toContain("A sync dependency uses `agent_run`");
       expect(policy).not.toContain("stays a synchronous call");
       expect(policy).not.toContain("call the Architect role with `agent_run`");
     }
-    expect(plan).toContain("including a critique needed before freeze");
     expect(plan).toContain("Do not freeze before interpreting the required current-object judgment");
     expect(execute).toContain("including Level 2 questions, judgments needed for the next action, and final independent review");
     expect(execute).toContain("Do not decide a Level 2 amendment, accept a unit, start a dependent unit, or declare `EXECUTION_COMPLETED` before interpreting");
@@ -751,7 +748,7 @@ describe("plan and execute contracts", () => {
   test("planning correlation and operational checkpoints do not create or bypass Team Holds", () => {
     for (const contract of [
       "check the draft's explicit Board binding and existing ledger",
-      "For a bound draft without a ledger, call `team_assign` or `architecture_start` without `plan` or `unit`",
+      "For a bound draft without a ledger, call `architecture_start` without `plan` or `unit`",
       "do not pass an explicit topic to bypass this rule",
       "For an unbound draft or a compatible existing ledger",
       "prospective, validated `plan` ID", "distinct, scoped `unit` ID per consultation",
@@ -773,18 +770,20 @@ describe("plan and execute contracts", () => {
     expect(freeze).toContain("material blocker or a change outside the reviewed object");
   });
 
-  test("review table substitution stays explicit, independent and one-for-one", () => {
+  test("review tables replace the existing pass, retaining independence and exterior report authority", () => {
     for (const policy of [plan, execute, prePr]) {
       for (const contract of [
-        "Ordinary Reviewer remains the default", "replace one existing independent Reviewer", "one-for-one",
-        "never selects it automatically or adds another pass", "new independent Reviewer director/root",
-        "dynamically selected Reviewer specialists", "knowledge, not judge findings", "Corrections remain outside the table",
+        "Use `review_start` for the existing independent Reviewer",
+        "zero to five optional specialists", "utility with reasons",
+        "Selective recomposition", "knowledge, not judge findings", "Corrections remain outside the table",
         "actual returned exterior Team assignment", "physical closure and comparison with the current object",
         "top-level `completion` and `verdict`", "not nested synthesis, dispositions",
         "A final inconclusive judgment blocks approval", "not coordinator acceptance",
         "No `review_read` or result fetch is required for transport or acknowledgement",
         "Material object edits invalidate affected judgment",
       ]) expect(policy).toContain(contract);
+      expect(policy).not.toContain("Ordinary Reviewer remains the default");
+      expect(policy).not.toContain("one to five");
     }
     expect(plan).toContain('object: {kind: "plan", planId}');
     expect(plan).toContain("same correlation rules to `review_start`");
@@ -803,13 +802,14 @@ describe("plan and execute contracts", () => {
 
   test("optional planning architecture consumes only the exterior current-object judgment", () => {
     for (const contract of [
-      'ordinary `team_assign` role work', 'mode: "consultation"', 'mode: "table"',
-      "trivial work needs no table", "one actual Architect director/root", "up to five internal specialists",
-      "may also use `architect`", "required current-object judgment", "unit partition/order",
-      "do not add a duplicate independent Architect consultation by default",
+      '`architecture_start` has no `mode`',
+      "Trivial work needs no table", "one substantive Architect director/root", "zero to five optional internal specialists",
+      "utility", "a reason even for zero", "Selective recomposition",
+      "required current-object judgment", "unit partition/order",
+      "do not add a duplicate independent Architect pass",
       "Keep Reviewer separate from the designers", "not a frozen plan or its independent critique",
       "record only the exterior root assignment", "use only that root for watched completion",
-      "Internal member IDs, room messages and direct intermediate responses cannot close the root's hold",
+      "Internal member IDs and room messages cannot close the root's hold",
       "complete terminal current-object judgment after owned closure",
       "Partial, failed and cancelled results retain applicable holds", "bookkeeping, not acceptance",
     ]) expect(plan).toContain(contract);
@@ -819,10 +819,10 @@ describe("plan and execute contracts", () => {
     const architecture = readFileSync(path.join(packageRoot(), "docs/architecture.md"), "utf8");
     const examples = [...architecture.matchAll(/```json\n([\s\S]*?)\n```/g)].map(match => JSON.parse(match[1]!));
     expect(examples).toHaveLength(2);
-    expect(examples[0]).toMatchObject({ mode: "table", plan: "storage-design", unit: "architect-pass" });
-    expect(examples[1]).toMatchObject({ mode: "consultation" });
+    expect(examples[0]).toMatchObject({ plan: "storage-design", unit: "architect-pass" });
     for (const key of ["plan", "unit", "boardTopicId"]) expect(examples[1][key]).toBeUndefined();
     for (const example of examples) {
+      expect(example.mode).toBeUndefined();
       expect(example.goal).toContain("current");
       expect(example.goal.toLowerCase()).toContain("ignore ## planning workers");
       expect(example.goal).toContain("do not modify product files");
@@ -887,20 +887,19 @@ describe("plan and execute contracts", () => {
     expect(coordinator).toContain("does not accept the work or expand specialist authority");
   });
 
-  test("published Team guidance agrees with workflow dependencies and preserves synchronous ad hoc runs", () => {
+  test("published guidance reserves Architect and Reviewer for tables while preserving allowed synchronous runs", () => {
     const readme = readFileSync(path.join(packageRoot(), "README.md"), "utf8");
     const engineering = readFileSync(path.join(packageRoot(), "docs/engineering.md"), "utf8");
     for (const policy of [router, readme, engineering]) {
-      expect(policy).toContain("supersedes generic");
-      expect(policy).toContain("only when Team is not registered");
+      expect(policy).toContain("use only `architecture_start` and `review_start`");
       expect(policy).toMatch(/block(?:ed)?/);
       expect(policy).toMatch(/automat(?:ic|ically)/);
       expect(policy).not.toContain("Use `team_assign` only for independent work");
       expect(policy).not.toContain("Team assignments remain independent work");
     }
-    expect(readme).toContain("Ad hoc `agent_run` remains synchronous");
+    expect(readme).toContain("`agent_run` for one synchronous in-process AgentInstance");
     expect(engineering).toContain("`agent_run` stays synchronous");
-    expect(router).toContain("`agent_run` executes one isolated instance synchronously");
+    expect(router).toContain("`agent_run` executes an allowed individual instance synchronously");
   });
 
   test("execute selects exterior Head across implementation phases without changing the optional API", () => {

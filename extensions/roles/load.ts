@@ -122,6 +122,8 @@ function parseBuiltin(defaultsPath: string, root: string): PitakoConfig {
     }
   }
   return { defaultsPath, userConfigPath: "", userConfigPresent: false, roles, policies, watchdog: parseWatchdogConfig(raw.watchdog, defaultsPath),
+    architecture: parseCandidates(raw.architecture, defaultsPath, "architecture"),
+    review: parseCandidates(raw.review, defaultsPath, "review"),
     developerHead: developerHead(roles.developer!, resolveInstructions(defaultsPath, "roles/developer-head.md", root, root)),
     developerRouting: parseDeveloperRouting(raw.developerRouting, defaultsPath),
     headDeveloper: parseHeadDeveloper(raw.headDeveloper, defaultsPath),
@@ -597,11 +599,12 @@ function freeze<T extends object>(value: T): T {
 }
 
 function parseCandidates(value: unknown, file: string, name: "architecture" | "review"): PitakoConfig["architecture"] {
-  if (value === undefined) return undefined;
+  if (value === undefined) return { candidates: [], topics: [] };
   const table = expectRecord(value, file, name);
   rejectUnknown(table, CONFIG_KEYS.candidates, file, name);
   const candidates = (value: unknown, field: string) => {
-    if (!Array.isArray(value) || !value.length) throw new PitakoConfigError(`${file}: ${field}: expected nonempty candidates`);
+    if (value === undefined) return [];
+    if (!Array.isArray(value)) throw new PitakoConfigError(`${file}: ${field}: expected an array`);
     const seen = new Set<string>();
     return value.map((item, index) => {
       const key = `${field}[${index}]`;

@@ -82,6 +82,7 @@ function load() {
   const userConfigPath = path.join(dir, "pitako", "config.toml");
   mkdirSync(path.dirname(userConfigPath), { recursive: true });
   writeFileSync(userConfigPath, `[model_policies.developer.primary]\nmodel = "example/primary"\nreasoning = "off"\n[model_policies.researcher.primary]\nmodel = "example/primary"\nreasoning = "off"\n[model_policies.architect.primary]\nmodel = "example/primary"\nreasoning = "off"\n[model_policies.reviewer.primary]\nmodel = "example/primary"\nreasoning = "off"\n`);
+  writeFileSync(userConfigPath, `\n[model_policies.scout.primary]\nmodel = "example/primary"\n[model_policies.oracle.primary]\nmodel = "example/primary"\n`, { flag: "a" });
   return { userConfigPath, env: { PI_CODING_AGENT_DIR: dir } };
 }
 
@@ -362,7 +363,7 @@ describe("Team T1 ownership", () => {
     expect(guidelines).toContain("automatically supplied");
     expect(guidelines).toContain("team_result");
     const architectResult = await invoke("team_assign", {
-      role: "architect", task: "Architect planning task", plan: "plan-frozen-a", unit: "architect-review",
+      role: "developer", task: "Developer planning task", plan: "plan-frozen-a", unit: "developer-analysis",
     });
     const researcherResult = await invoke("team_assign", {
       role: "researcher", task: "Research planning task", plan: "plan-frozen-a", unit: "research-evidence",
@@ -423,7 +424,7 @@ describe("Team T1 ownership", () => {
     handlers.get("agent_settled")?.({}, hostContext);
     expect(sent).toEqual([]);
 
-    workers.find((worker) => worker.task.includes("Architect planning task"))!.finish(completed(architectText));
+    workers.find((worker) => worker.task.includes("Developer planning task"))!.finish(completed(architectText));
     await fixture.settleRuns();
     expect(teamWorkerStatus(current.token, architect.instanceId)[0]?.status).toBe("completed");
     const architectResults = sent.filter((item) => item.message.customType === "pitako.worker.result");
@@ -441,8 +442,8 @@ describe("Team T1 ownership", () => {
     expect(committed.details).not.toBe(original.details);
     expect(original).toMatchObject({ content: architectText, details: {
       instanceId: architect.instanceId, assignmentId: architect.id, ownerSessionId: sessionId,
-      status: "completed", roleId: "architect",
-      planId: "plan-frozen-a", unitId: "architect-review",
+      status: "completed", roleId: "developer",
+      planId: "plan-frozen-a", unitId: "developer-analysis",
     } });
     expect(original.details.deliveryId).toBeString();
     expect(typeof original.details.foregroundRevision).toBe("number");
@@ -501,7 +502,7 @@ describe("Team T1 ownership", () => {
     const assignTool = tools.get("team_assign") as any;
     expect(assignTool.promptGuidelines.join(" ")).toContain("team_result");
     expect(assignTool.promptGuidelines.join(" ")).toContain("independent long work");
-    expect((await invoke("team_assign", { role: "architect", task: "unrelated", boardTopicId: "1" })).isError).toBe(true);
+    expect((await invoke("team_assign", { role: "developer", task: "unrelated", boardTopicId: "1" })).isError).toBe(true);
     wakes.length = 0; // The no-worker failure has already been incorporated.
     const firstAssignment = await invoke("team_assign", { role: "developer", task: "Inspect lease\nsecond line", plan: "plan-a", unit: "unit-a" });
     expect(firstAssignment.isError).toBe(false);
@@ -558,7 +559,7 @@ describe("Team T1 ownership", () => {
     expect(wakes).toHaveLength(3);
     const ready = (await invoke("team_status", {})).details as any;
     expect(ready.members[1]).toMatchObject({ status: "completed", resultAvailable: true });
-    expect(ready.members[0]).toMatchObject({ role: "architect", status: "failed" });
+    expect(ready.members[0]).toMatchObject({ role: "developer", status: "failed" });
     const result = await invoke("team_result", { assignmentId: developer!.id });
     expect(result.content[0].text).toContain("x".repeat(9000));
     expect(result.details).not.toHaveProperty("truncated");
@@ -569,7 +570,7 @@ describe("Team T1 ownership", () => {
     expect(wakes.every((text) => text.includes("already supplied"))).toBe(true);
     expect(wakes.some((text) => text.includes("Use agent_result"))).toBe(false);
     expect((await invoke("team_assign", { role: "developer", task: "Next task" })).isError).toBe(false);
-    const cancelled = await invoke("team_assign", { role: "architect", task: "Cancel test", plan: "plan-a", unit: "cancel-test" });
+    const cancelled = await invoke("team_assign", { role: "developer", task: "Cancel test", plan: "plan-a", unit: "cancel-test" });
     expect(cancelled.isError).toBe(false);
     const reviewer = teamAssignments(current).find(member => member.id === cancelled.details.id)!;
     await workers.at(-1)!.started;
@@ -702,16 +703,16 @@ describe("Team T1 ownership", () => {
     const invoke = (params: unknown) => tools.get("team_assign")!.execute("call", params, new AbortController().signal, undefined, {
       cwd, sessionManager: { getSessionId: () => current.sessionId },
     });
-    expect((await invoke({ role: "architect", task: "invalid", plan: "bound-plan", unit: "x", boardTopicId: "1; injected" })).isError).toBe(true);
-    expect((await invoke({ role: "architect", task: "overflow", plan: "bound-plan", unit: "x", boardTopicId: "9007199254740992" })).isError).toBe(true);
-    expect((await invoke({ role: "architect", task: "conflict", plan: "bound-plan", unit: "x", boardTopicId: "2" })).isError).toBe(true);
-    expect((await invoke({ role: "architect", task: "stale", plan: "stale-plan", unit: "x" })).isError).toBe(true);
-    expect((await invoke({ role: "architect", task: "owner mismatch", plan: "mismatch-plan", unit: "x" })).isError).toBe(true);
-    expect((await invoke({ role: "architect", task: "foreign workspace", plan: "foreign-plan", unit: "x" })).isError).toBe(true);
-    expect((await invoke({ role: "architect", task: "existing unbound explicit", plan: "empty-plan", unit: "x", boardTopicId: "3" })).isError).toBe(true);
+    expect((await invoke({ role: "developer", task: "invalid", plan: "bound-plan", unit: "x", boardTopicId: "1; injected" })).isError).toBe(true);
+    expect((await invoke({ role: "developer", task: "overflow", plan: "bound-plan", unit: "x", boardTopicId: "9007199254740992" })).isError).toBe(true);
+    expect((await invoke({ role: "developer", task: "conflict", plan: "bound-plan", unit: "x", boardTopicId: "2" })).isError).toBe(true);
+    expect((await invoke({ role: "developer", task: "stale", plan: "stale-plan", unit: "x" })).isError).toBe(true);
+    expect((await invoke({ role: "developer", task: "owner mismatch", plan: "mismatch-plan", unit: "x" })).isError).toBe(true);
+    expect((await invoke({ role: "developer", task: "foreign workspace", plan: "foreign-plan", unit: "x" })).isError).toBe(true);
+    expect((await invoke({ role: "developer", task: "existing unbound explicit", plan: "empty-plan", unit: "x", boardTopicId: "3" })).isError).toBe(true);
     expect(tasks).toHaveLength(0);
     rmSync(boundLedger);
-    const boundResult = await invoke({ role: "architect", task: "bound", plan: "bound-plan", unit: "T2", boardTopicId: "1" });
+    const boundResult = await invoke({ role: "developer", task: "bound", plan: "bound-plan", unit: "T2", boardTopicId: "1" });
     expect(boundResult).toMatchObject({ isError: false });
     expect(existsSync(boundLedger)).toBe(true);
     expect(tasks.at(-1)).toContain("Board topic 1");
@@ -725,7 +726,7 @@ describe("Team T1 ownership", () => {
     stillOpen.close();
     expect((await invoke({ role: "developer", task: "unbound", plan: "empty-plan", unit: "T2" })).isError).toBe(false);
     expect(tasks.at(-1)).not.toContain("Board topic");
-    const missingResult = await invoke({ role: "reviewer", task: "missing", plan: "missing-plan", unit: "T2", boardTopicId: "3" });
+    const missingResult = await invoke({ role: "developer", task: "missing", plan: "missing-plan", unit: "T2", boardTopicId: "3" });
     expect(missingResult).toMatchObject({ isError: false });
     expect(tasks.at(-1)).toContain("Board topic 3");
     expect((await invoke({ role: "researcher", task: "unrelated" })).isError).toBe(false);
@@ -737,7 +738,7 @@ describe("Team T1 ownership", () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
   }));
 
-  test("all Team roles inherit the execution worktree from a sibling frozen plan", fixture.ownedCase("all Team roles inherit the execution worktree from a sibling frozen plan", async () => {
+  test("individual Team roles inherit the execution worktree from a sibling frozen plan", fixture.ownedCase("individual Team roles inherit the execution worktree from a sibling frozen plan", async () => {
     const base = mkdtempSync(path.join(tmpdir(), "pitako-team-execution-root-"));
     tempDirs.push(base);
     const { source, execution } = initWorktreePair(base);
@@ -756,7 +757,7 @@ describe("Team T1 ownership", () => {
       return fixture.pendingAttempt((resolve) => workers.push({ cwd: input.cwd, finish: resolve }));
     } });
     const ctx = { cwd: execution, sessionManager: { getSessionId: () => current.sessionId } };
-    for (const role of ["architect", "developer", "reviewer", "researcher"]) {
+    for (const role of ["developer", "researcher", "scout", "oracle"]) {
       const result = await tools.get("team_assign")!.execute("call", {
         role, task: `work as ${role}`, plan: id, unit: "T3",
       }, new AbortController().signal, undefined, ctx);
@@ -817,8 +818,8 @@ describe("Team T1 ownership", () => {
     const sequentialId = "team-sequential-admission";
     const sequentialPlan = planFile(sequentialId, source);
     writeFileSync(sequentialPlan, `---\nid: ${sequentialId}\nrevision: 1\nstatus: frozen\n---\n\nSibling source.\n`);
-    const firstRoot = await assign(first, "architect", executionA, sequentialId);
-    const secondRoot = await assign(second, "reviewer", executionB, sequentialId);
+    const firstRoot = await assign(first, "developer", executionA, sequentialId);
+    const secondRoot = await assign(second, "researcher", executionB, sequentialId);
     expect(firstRoot.isError).toBe(false);
     expect((firstRoot.details as { execution: { executionRoot: string } }).execution.executionRoot).toBe(executionA);
     expect(secondRoot.isError).toBe(true);

@@ -16,7 +16,6 @@ export interface ArchitectureRoom {
   records: Map<string, ArchitectureRecord>;
   lifecycle: ArchitectureLifecycle;
   capture: { state: "open" | "closed" | "incomplete"; finalCut: number | null; gaps: ("not_captured" | "capture_failed")[] };
-  mode: "table" | "consultation";
   director: Identity;
   preparationSettled: boolean;
   runtimeCreated: boolean;
@@ -55,7 +54,7 @@ export function architectureRooms(evaluation: TeamEvaluation | undefined): Archi
 }
 export function architectureRoom(evaluation: TeamEvaluation, id: string) { return rooms.get(evaluation.token)?.get(id); }
 export function retireArchitectureRooms(evaluation: TeamEvaluation) { rooms.delete(evaluation.token); }
-export function registerArchitectureRoom(input: { evaluation: TeamEvaluation; roomId: string; mode: "table" | "consultation";
+export function registerArchitectureRoom(input: { evaluation: TeamEvaluation; roomId: string;
   director: Identity; toolCallId: string }): ArchitectureRoom {
   const room: ArchitectureRoom = { ...input, assignmentId: input.director.assignmentId, instanceId: input.director.instanceId,
     records: new Map(), preparationSettled: false, runtimeCreated: false, controlOrder: 0, captureComplete: false,
@@ -65,7 +64,7 @@ export function registerArchitectureRoom(input: { evaluation: TeamEvaluation; ro
   let catalog = rooms.get(input.evaluation.token);
   if (!catalog) { catalog = new Map(); rooms.set(input.evaluation.token, catalog); }
   catalog.set(input.roomId, room);
-  captureArchitecture(room, () => room.records.set(input.roomId, { kind: "room", id: input.roomId, mode: input.mode,
+  captureArchitecture(room, () => room.records.set(input.roomId, { kind: "room", id: input.roomId,
     origin: { coordinatorSessionId: input.evaluation.sessionId, tool: "architecture_start", toolCallId: input.toolCallId, ...input.director },
     goalSource: { kind: "worker-workbrief", instanceId: input.director.instanceId }, lifecycle: room.lifecycle, pendingDoubtIds: [] }));
   return room;
@@ -78,7 +77,8 @@ export function observeArchitectureAssignment(evaluation: TeamEvaluation, assign
     room.records.set(assignment.memberId, { ...(prior?.kind === "member" ? prior : {}), kind: "member", id: assignment.memberId,
       assignmentId: assignment.id, instanceId: assignment.instanceId, roleId: assignment.roleId,
       function: director ? "director" : prior?.kind === "member" ? prior.function : "specialist", ordinal: assignment.ordinal, admittedAt: assignment.admittedAt,
-      mandate: director ? { source: "root-workbrief", instanceId: assignment.instanceId } : { source: "TeamAssignment.task", text: assignment.task },
+      mandate: prior?.kind === "member" && prior.mandate.source === "composition" ? prior.mandate :
+        director ? { source: "root-workbrief", instanceId: assignment.instanceId } : { source: "TeamAssignment.task", text: assignment.task },
       execution: prior?.kind === "member" ? prior.execution : "accepted", conversationRefs: prior?.kind === "member" ? prior.conversationRefs : [] });
   });
 }
@@ -106,12 +106,19 @@ export function architectureProgress(room: ArchitectureRoom | undefined, stage: 
   });
 }
 export function architectureMember(room: ArchitectureRoom | undefined, memberId: string, purpose: "specialist" | "support",
-  compositionMessageId?: string, supersededByCompositionId?: string) {
+  compositionMessageId?: string, supersededByCompositionId?: string,
+  details?: { compositionChoiceIndex?: number; selection?: { compositionMessageId: string; choiceIndex: number };
+    mandate?: string; state?: "preparing" | "active" | "closing" | "closed" | "closure-unknown" }) {
   captureArchitecture(room, room => {
     const member = room.records.get(memberId);
     if (member?.kind !== "member") return;
     member.function = purpose;
-    if (compositionMessageId) member.compositionMessageId = compositionMessageId;
+    if (compositionMessageId && member.compositionMessageId === undefined) member.compositionMessageId = compositionMessageId;
+    if (details?.compositionChoiceIndex !== undefined && member.compositionChoiceIndex === undefined)
+      member.compositionChoiceIndex = details.compositionChoiceIndex;
+    if (details?.selection) member.selection = { ...details.selection };
+    if (details?.mandate !== undefined) member.mandate = { source: "composition", text: details.mandate };
+    if (details?.state) member.state = details.state;
     if (supersededByCompositionId) member.supersededByCompositionId = supersededByCompositionId;
   });
 }

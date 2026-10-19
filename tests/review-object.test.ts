@@ -92,14 +92,20 @@ test("independent optional review configuration shares strict candidates grammar
   const root = mkdtempSync(path.join(tmpdir(), "pitako-review-config-")), file = path.join(root, "config.toml");
   const load = (text: string) => { writeFileSync(file, text); return loadPitakoConfig({ userConfigPath: file, cwd: root }); };
   try {
-    expect(load("").review).toBeUndefined();
-    expect(load('[architecture]\ncandidates=[{model="fixture/architecture"}]').review).toBeUndefined();
+    for (const review of ["", "[review]", "[review]\ncandidates=[]", "[review]\ntopics=[]"]) {
+      expect(load(review).review).toEqual({ candidates: [], topics: [] });
+      expect(load('[architecture]\ncandidates=[{model="fixture/architecture"}]\n' + review).review)
+        .toEqual({ candidates: [], topics: [] });
+    }
+    for (const candidates of ["", "\ncandidates=[]"])
+      expect(load('[review]\n[[review.topics]]\ntopic=" Security "' + candidates).review)
+        .toEqual({ candidates: [], topics: [{ topic: "security", candidates: [] }] });
     const config = load('[architecture]\ncandidates=[{model="fixture/architecture"}]\n[review]\ncandidates=[{model="fixture/review"}]\n[[review.topics]]\ntopic=" Security  Audit "\ncandidates=[{model="fixture/security",reasoning="high"}]');
     expect(config.review?.candidates).toEqual([{ model: "fixture/review" }]);
     expect(config.review?.topics[0]?.topic).toBe("security audit");
     expect(config.architecture?.candidates[0]?.model).toBe("fixture/architecture");
     for (const text of [
-      '[review]\ncandidates=[]', '[review]\ncandidates=[{model="fixture/a",fast=true}]',
+      '[review]\ncandidates={}', '[review]\ncandidates=[{model="fixture/a",fast=true}]',
       '[review]\ncandidates=[{model="fixture/a"},{model="fixture/a"}]',
       '[review]\ncandidates=[{model="fixture/a"}]\nunknown=true',
       '[review]\ncandidates=[{model="fixture/a"}]\n[[review.topics]]\ntopic=" Security "\ncandidates=[{model="fixture/a"}]\n[[review.topics]]\ntopic="security"\ncandidates=[{model="fixture/b"}]',

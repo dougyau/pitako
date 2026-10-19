@@ -5,6 +5,7 @@ import path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import agentExtension from "../extensions/agent/index.ts";
 import * as piExecutor from "../extensions/agent/pi.ts";
+import * as routing from "../extensions/agent/routing.ts";
 import { bindBackgroundOwner, clearBackgroundOwner, setBackgroundExecutor, spawnBackground } from "../extensions/agent/background.ts";
 import { clearObservations, listObservations } from "../extensions/agent/observe.ts";
 import { createAgentController } from "../extensions/agent/controller.ts";
@@ -64,7 +65,7 @@ function setup(ownership: Pick<typeof fixture, "directories" | "beforeRelease"> 
     async client() { await bridge.ready; client = await connect(path.join(directory, "descriptor.json"), { expectedSessionId: owner.sessionId }); return client; },
   };
 }
-for (const method of ["agent_spawn", "team_assign"] as const) for (const role of ["architect", "developer", "reviewer", "researcher"]) {
+for (const method of ["agent_spawn", "team_assign"] as const) for (const role of ["developer", "researcher"]) {
   test(`${method}/${role} publishes real launch provenance before resolution and before native creation`,
     fixture.ownedCase(`${method}/${role} provenance`, async () => {
       const env = setup(), peer = await env.client(), enter = deferred<void>(), release = deferred<void>(), finish = deferred<Attempt>();
@@ -156,12 +157,14 @@ test("setup failure updates the same accepted worker; internal callers remain un
       historyOrigin: { source: "agent_spawn", coordinatorSessionId: env.owner.sessionId } });
     expect(await peer.publicDetail(unlinked.instanceId)).toMatchObject({ worker: { toolCallId: null, linkage: "unlinked" } });
     const controlled = spyOn(piExecutor, "createPiExecutor").mockReturnValue(executor);
+    const preflight = spyOn(routing, "developerPreflight").mockImplementation(input =>
+      routing.developerCapacityPreflight({ ...input, capacity: { route: "default" } }));
     let run: Awaited<ReturnType<Parameters<ExtensionAPI["registerTool"]>[0]["execute"]>>;
     try {
       // Synchronous private reads use an ordinary role; consultants require the early async reservation.
-      run = await env.tools.get("agent_run")!.execute("sync-tool-call", { role: "reviewer", task: "sync original" },
+      run = await env.tools.get("agent_run")!.execute("sync-tool-call", { role: "developer", task: "sync original" },
         new AbortController().signal, undefined, env.ctx as never);
-    } finally { controlled.mockRestore(); }
+    } finally { controlled.mockRestore(); preflight.mockRestore(); }
     expect(run.isError).not.toBe(true);
     const sync = listObservations().find(row => row.origin?.toolCallId === "sync-tool-call")!;
     expect(sync.origin?.source).toBe("agent_run");
