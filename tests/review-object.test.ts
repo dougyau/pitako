@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { captureObject, consultedPlan } from "../extensions/review/object.ts";
+import { captureObject, consultedPlan, describeObject } from "../extensions/review/object.ts";
 import { planHash } from "../extensions/workflow.ts";
 import { loadPitakoConfig } from "../extensions/roles/load.ts";
 
@@ -18,6 +18,9 @@ test("plan identity excludes only actual operational section, preserves later su
     const after = "## Acceptance <!-- frozen -->\nmust not disappear\n";
     writeFileSync(file, before + workers + "old worker\n" + after);
     const first = captureObject({ kind: "plan", planId: "example" }, root);
+    expect(describeObject(first)).toMatchObject({ selector: first.selector, root, identity: first.identity, file, revision: 1, limits: first.limits });
+    expect(describeObject(first)).not.toHaveProperty("scope");
+    expect(JSON.stringify(describeObject(first))).not.toContain("whole object");
     expect(first.scope).toMatchObject({ text: before + after });
     const hash = planHash(readFileSync(file, "utf8"));
     writeFileSync(file, before + workers.replace("note", "updated note") + "new worker\n" + after);
@@ -71,6 +74,10 @@ test("diff captures commits, index, raw dirty bytes, untracked, modes, symlinks 
     symlinkSync("dirty", path.join(root, "link"));
     writeFileSync(path.join(root, "binary"), Buffer.from([0, 255, 128]));
     const first = captureObject({ kind: "diff", base }, root), scope = first.scope as any;
+    expect(describeObject(first)).toMatchObject({ selector: first.selector, root, identity: first.identity,
+      base: scope.base, mergeBase: scope.mergeBase, head: scope.head, limits: first.limits });
+    for (const privateField of ["scope", "files", "committed", "staged", "contentBase64"]) expect(describeObject(first)).not.toHaveProperty(privateField);
+    expect(JSON.stringify(describeObject(first))).not.toContain("new bytes");
     expect(scope.base).toBe(base); expect(scope.mergeBase).toBe(base);
     expect(scope.head).toBe(git("rev-parse", "HEAD")); expect(scope.committed).toContain("+two");
     expect(scope.staged).toContain("+two");

@@ -36,7 +36,7 @@ for (const protocol of ["architecture", "review"] as const) {
       expect(s.host.sessions[0]!.events).toContain("dispose");
       if (protocol === "review") {
         for (const { request } of s.seen.filter(item => ["preparation", "contribution"].includes(item.request.stage))) {
-          expect(request.object.scope.text).toBe("Bounded proposal"); expect(request.criteria).toEqual(["Preserve ownership", "Remain bounded"]);
+          expect(request.object.selector).toEqual({ kind: "brief", text: "Bounded proposal" }); expect(request.criteria).toEqual(["Preserve ownership", "Remain bounded"]);
         }
       }
     } finally { await s.close(); }

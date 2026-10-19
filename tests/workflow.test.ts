@@ -796,7 +796,7 @@ describe("plan and execute contracts", () => {
     }
     expect(execute).toContain("Pass the frozen `plan` and relevant `unit` to `review_start`");
     expect(prePr).toContain("This standalone pass omits `plan`, `unit` and `boardTopicId`");
-    expect(reviewer).toContain("a mandate focuses investigation but does not forbid reporting other material defects");
+    expect(reviewer).toContain("A mandate focuses investigation but does not forbid reporting other material defects.");
     // Instruction assertions establish assembly, not future model obedience.
   });
 

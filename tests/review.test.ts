@@ -1,10 +1,12 @@
 import { expect, test as bunTest } from "bun:test";
-import { architectureFixture } from "./fixtures/architecture.ts";
+import { architectureFixture, reviewResults } from "./fixtures/architecture.ts";
 import { teamWorkerResult, teamWorkerStatus } from "../extensions/agent/background.ts";
 import { firstTeamReservation, teamAssignments } from "../extensions/team.ts";
 import { isOrchestrationTool, toolsForProfile } from "../extensions/profile.ts";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import path from "node:path";
+import { captureObject, consultedPlan, describeObject } from "../extensions/review/object.ts";
 
 const { fixture, setup } = architectureFixture("review");
 const test = (name: string, body: () => Promise<void>) => bunTest(name, fixture.ownedCase(name, body));
@@ -12,7 +14,39 @@ const deferred = <T = void>() => Promise.withResolvers<T>();
 const start = { goal: "Review the whole object", object: { kind: "brief", text: "Controlled complete brief" }, criteria: ["Preserve authority"] };
 const finding = { key: "authority", materiality: "blocking", contract: "Only the author can withdraw", reference: "source:12",
   consequence: "Another participant can erase a blocker", basis: { kind: "failure", path: "A reaches B without checking author", evidence: ["source:12-18"] } };
-const reportFor = (f: Awaited<ReturnType<typeof setup>>, handle: any) => teamWorkerResult(f.evaluation.token, handle.instanceId)!;
+const reportFor = (f: Awaited<ReturnType<typeof setup>>, handle: any) => {
+  const saved = teamWorkerResult(f.evaluation.token, handle.instanceId)!;
+  const delivered = f.sent.filter(item => item.message.customType === "pitako.worker.result");
+  expect(delivered).toHaveLength(1);
+  expect(delivered[0].message.content).toBe(saved.result);
+  const report = JSON.parse(saved.result);
+  expect(report).not.toHaveProperty("messages");
+  expect(report.object).not.toHaveProperty("scope");
+  expect(report.goal).toBe(start.goal);
+  expect(report.criteria).toEqual(start.criteria);
+  expect(report.modelObservations.length).toBeGreaterThan(0);
+  return saved;
+};
+async function journalFor(f: Awaited<ReturnType<typeof setup>>, handle: any) {
+  const records = new Map<string, string>();
+  let cursor: string | undefined;
+  do {
+    const read = await f.invoke("review_read", { roomId: handle.roomId, ...(cursor ? { cursor } : {}) });
+    expect(read.isError).not.toBe(true);
+    for (const fragment of read.details.fragments) {
+      expect((records.get(fragment.messageId) ?? "").length).toBe(fragment.offset);
+      records.set(fragment.messageId, (records.get(fragment.messageId) ?? "") + fragment.text);
+    }
+    cursor = read.details.cursor;
+  } while (cursor);
+  return [...records.values()].map(text => JSON.parse(text));
+}
+async function diagnosticFor(f: Awaited<ReturnType<typeof setup>>, handle: any) {
+  const saved = reportFor(f, handle), diagnostic = await f.invoke("team_result", { assignmentId: handle.assignmentId });
+  expect(diagnostic.details.status).toBe(saved.status);
+  expect(diagnostic.details.resultLength).toBe(saved.result.length);
+  expect(diagnostic.content[0].text.endsWith(saved.result)).toBe(true);
+}
 
 test("registered review uses the real adapter, independent Reviewer preparation and separate subordinate/root disposal before one exterior report", async () => {
   const subordinate = deferred(), root = deferred(), subordinateEntered = deferred(), rootEntered = deferred();
@@ -51,15 +85,20 @@ test("registered review uses the real adapter, independent Reviewer preparation 
     expect(f.seen.filter(item => item.request.stage === "preparation")).toHaveLength(2);
     expect(teamAssignments(f.evaluation).every(item => item.roleId === "reviewer")).toBe(true);
     expect(f.sent.filter(item => item.message.customType === "pitako.worker.result")).toHaveLength(1);
+    await diagnosticFor(f, handle);
   } finally { subordinate.resolve(); root.resolve(); await f.close(); }
 });
 
-for (const action of ["stop", "team_cancel"] as const) test(`${action} preserves a published finding through terminal abort override and both disposals`, async () => {
+for (const action of ["stop", "team_cancel"] as const) for (const window of ["contribution", "consultation-plan"] as const)
+test(`${action} during ${window} preserves published evidence through terminal abort override and both disposals`, async () => {
   const later = deferred(), releasePrompt = deferred(), subordinate = deferred(), root = deferred(), subordinateEntered = deferred(), rootEntered = deferred();
   const f = await setup({
     async prompt(session, request, body) {
-      if (request.stage === "preparation" && session.model.id !== "director") return { ...body, findings: [finding] };
-      if (request.stage === "contribution" && session.model.id !== "director") { later.resolve(); await releasePrompt.promise; return false; }
+      if (request.stage === "preparation" && session.model.id !== "director") return { ...body, findings: [finding],
+        ...(window === "consultation-plan" ? { doubts: [{ question: "Cancellation observation still needed", purpose: "Preserve pending evidence" }] } : {}) };
+      if (request.stage === window && (window === "consultation-plan" || session.model.id !== "director")) {
+        later.resolve(); await releasePrompt.promise; return false;
+      }
       return body;
     },
     async dispose(session) {
@@ -81,9 +120,15 @@ for (const action of ["stop", "team_cancel"] as const) test(`${action} preserves
     const result = reportFor(f, handle), report = JSON.parse(result.result);
     expect(result.status).toBe("cancelled"); expect(report.findings).toHaveLength(1);
     expect(report.findings[0].key).toBe("authority");
+    expect(report.findings[0]).toMatchObject(finding);
     expect(report.missingValidSynthesis).toBe(true); expect(report.dispositions).toBeNull();
     expect(report.verdict).toBe("inconclusive");
+    expect(report.pending).toEqual(window === "consultation-plan"
+      ? [{ id: expect.any(String), question: "Cancellation observation still needed", purpose: "Preserve pending evidence" }] : []);
     expect(f.sent.filter(item => item.message.customType === "pitako.worker.result")).toHaveLength(1);
+    await diagnosticFor(f, handle);
+    const journal = await journalFor(f, handle);
+    expect(journal.find(message => message.body.findings?.length).body.findings).toEqual([finding]);
   } finally { releasePrompt.resolve(); subordinate.resolve(); root.resolve(); await f.close(); }
 });
 
@@ -97,7 +142,7 @@ for (const [action, window, verdict] of [
     prompt(session, request, body) {
       if (request.stage === "preparation" && session.model.id !== "director") return { ...body, findings: [published] };
       if (request.stage === "contribution" && session.model.id !== "director") return { ...body, responses: [{
-        findingId: request.review.findings[0].id, action: "corroborate", reason: "Independent reachable evidence", evidence: ["source:20"],
+        findingId: reviewResults(request).findings[0].id, action: "corroborate", reason: "Independent reachable evidence", evidence: ["source:20"],
       }] };
       if (request.stage === "synthesis") return { ...body, verdict };
       return body;
@@ -132,15 +177,21 @@ for (const [action, window, verdict] of [
     expect(result.status).toBe("cancelled");
     expect(report.completion).toBe("failed"); expect(report.verdict).toBe("inconclusive");
     expect(report.missingValidSynthesis).toBe(false);
-    expect(report.findings).toEqual(synthesis.request.review.findings);
+    expect(report.findings).toEqual(reviewResults(synthesis.request).findings);
     expect(report.findings[0]).toMatchObject({ ...published, objectIdentity: report.object.identity });
-    expect(report.responses).toEqual(synthesis.request.review.responses);
+    expect(report.responses).toEqual(reviewResults(synthesis.request).responses);
     expect(report.responses).toHaveLength(1);
     expect(report.dispositions).toEqual(report.synthesis.dispositions);
     expect(report.dispositions).toHaveLength(1);
     expect(report.synthesis).toMatchObject({ completion: "complete", verdict });
-    expect(report.messages.slice(0, -1)).toEqual(synthesis.request.context.messages);
-    expect(report.messages.at(-1).body).toEqual(report.synthesis);
+    const journal = await journalFor(f, handle);
+    expect(journal.filter((message: any) => ["preparation", "contribution"].includes(message.stage)).map((message: any) => message.id))
+      .toEqual(synthesis.request.context.messages.map((message: any) => message.id));
+    expect(journal.at(-1).body).toEqual(report.synthesis);
+    expect(journal.filter(message => message.body).every(message => !!(message.native.sessionId && message.turnId && message.attemptId))).toBe(true);
+    expect(report.grounds).toContainEqual(expect.objectContaining({
+      reference: report.findings[0].messageId, content: { analysis: "Independent whole-object review" },
+    }));
     expect(report.observations).toEqual({ launch: report.object.identity, final: report.object.identity, error: null });
     const delivered = f.sent.filter(item => item.message.customType === "pitako.worker.result");
     expect(delivered).toHaveLength(1);
@@ -148,6 +199,7 @@ for (const [action, window, verdict] of [
     expect(JSON.parse(delivered[0].message.content)).toEqual(report);
     expect(teamWorkerStatus(f.evaluation.token, handle.instanceId)[0]!.closure.state).toBe("released");
     expect(firstTeamReservation(f.evaluation, "reviewer")).toBeUndefined();
+    await diagnosticFor(f, handle);
   } finally { subordinate.resolve(); root.resolve(); await f.close(); }
 });
 
@@ -227,10 +279,14 @@ for (const failure of ["invalid-synthesis", "drift", "observation-failure"] as c
     const result = reportFor(f, handle), report = JSON.parse(result.result);
     expect(result.status).toBe("failed"); expect(report.verdict).toBe("inconclusive"); expect(report.findings).toHaveLength(1);
     expect(report.findings[0].objectIdentity).toBe(report.object.identity);
+    expect(report.findings[0]).toMatchObject(finding);
     expect(report.missingValidSynthesis).toBe(failure === "invalid-synthesis");
     if (failure === "invalid-synthesis") expect(report.dispositions).toBeNull();
     else if (failure === "drift") expect(report.observations.final).not.toBe(report.object.identity);
     else expect(report.observations.error).toContain("plan is missing frontmatter");
+    expect(result.result).not.toContain("Original substantive object");
+    await diagnosticFor(f, handle);
+    expect((await journalFor(f, handle)).some(message => message.body.findings?.[0]?.key === finding.key)).toBe(true);
   } finally { await f.close(); }
 });
 
@@ -258,7 +314,7 @@ test("round publication is atomic in composition order; finish drains current wo
     const report = JSON.parse(reportFor(f, handle).result);
     expect(report.completion).toBe("partial"); expect(report.verdict).toBe("inconclusive");
     expect(report.findings.map((item: any) => item.key)).toEqual(["first", "second"]);
-    expect(report.messages.filter((item: any) => item.stage === "preparation")).toHaveLength(3);
+    expect((await journalFor(f, handle)).filter((item: any) => item.stage === "preparation")).toHaveLength(3);
     expect(report.failures).toContain("Finish truncated scheduled review work");
     expect(f.seen.filter(item => item.request.stage === "synthesis")[0]!.request.context.controls)
       .toContainEqual({ action: "priorities", text: "Focus retained evidence" });
@@ -321,6 +377,134 @@ test("prohibited sixth round is not disguised as complete work", async () => {
   } finally { await f.close(); }
 });
 
+test("dependent support can interpret prerequisite answers without unrelated deliberation", async () => {
+  const authored = [
+    { question: "Does the alternate auth path reject expired credentials?", purpose: "Decide whether expiry bypass is real" },
+    { question: "Is the proposed disposition supported by the prerequisite?", purpose: "Interpret the expiry observation" },
+    { question: "UNRELATED-QUESTION", purpose: "UNRELATED-PURPOSE" },
+  ];
+  let disposed = 0, disposedAtDependent = -1;
+  const f = await setup({
+    async dispose(session) { if (session.model.id === "support") disposed++; },
+    prompt(session, request, body) {
+      if (request.stage === "preparation" && session.model.id !== "director")
+        return { ...body, analysis: "UNRELATED-DELIBERATION", doubts: authored };
+      if (request.stage === "consultation-plan") return { kind: "consultation-plan",
+        resolutions: [{ doubtId: request.context.doubts[2].id, status: "answered", answer: "Unrelated resolved directly" }],
+        support: request.context.doubts.slice(0, 2).map((doubt: { id: string }, index: number) => ({
+          role: "scout", brief: index ? "Interpret prerequisite" : "Observe expiry",
+          doubtIds: [doubt.id], prerequisites: index ? [0] : [],
+        })) };
+      if (request.stage === "consultation-response") {
+        if (request.context.request.prerequisites.length) disposedAtDependent = disposed;
+        return { kind: "consultation-response", doubtIds: request.authorization.doubtIds,
+          answer: request.context.request.prerequisites.length ? "Expiry evidence supports rejection" : "Yes",
+          evidence: ["auth.ts:42"], limits: [], doubts: [] };
+      }
+      if (request.stage === "knowledge") return { kind: "knowledge",
+        resolutions: request.context.delegatedDoubtIds.map((doubtId: string, index: number) => ({
+          doubtId, status: "answered", answer: "Confirmed",
+          supportIds: [...request.context.responses[index].prerequisites, request.context.responses[index].id],
+        })) };
+      return body;
+    },
+  });
+  try {
+    const { details: handle } = await f.invoke("review_start", start);
+    await f.delivered.promise;
+    expect(reportFor(f, handle).status).toBe("completed");
+    const dependent = f.seen.filter(item => item.request.stage === "consultation-response")[1]!.request;
+    const journal = await journalFor(f, handle);
+    const preparation = journal.find(message => message.body?.doubts?.length === 3);
+    const [expiry, interpretation] = preparation.doubts;
+    expect(dependent.authorization.doubtIds).toEqual([interpretation.id]);
+    expect(dependent.context.request.doubtIds).toEqual([interpretation.id]);
+    expect(dependent.context.doubts).toEqual([expiry, interpretation]);
+    expect(dependent.context.prerequisites).toHaveLength(1);
+    const prerequisite = dependent.context.prerequisites[0];
+    const response = journal.find(message => message.body?.kind === "consultation-response" && message.body.answer === "Yes");
+    const boundary = journal.find(message => message.kind === "knowledge-boundary");
+    expect(prerequisite).toMatchObject({ status: "completed", message: {
+      id: response.id, author: response.author, memberId: response.memberId, body: response.body,
+    } });
+    expect(new Set([prerequisite.id, response.id, expiry.id]).size).toBe(3);
+    expect(prerequisite.message.body.doubtIds).toEqual([expiry.id]);
+    expect(boundary.resolutions[0].provenance).toMatchObject({
+      consultationId: prerequisite.id, responses: [expect.objectContaining({ consultationId: prerequisite.id, messageId: response.id })],
+    });
+    const serialized = JSON.stringify(dependent);
+    for (const doubt of authored.slice(0, 2)) for (const text of [doubt.question, doubt.purpose])
+      expect(serialized.split(text)).toHaveLength(2);
+    for (const marker of ["UNRELATED-QUESTION", "UNRELATED-PURPOSE", "UNRELATED-DELIBERATION", '"journal"', '"snapshot"', '"native"'])
+      expect(serialized).not.toContain(marker);
+    expect(disposedAtDependent).toBe(1); expect(disposed).toBe(2);
+    expect(teamWorkerStatus(f.evaluation.token, handle.instanceId)[0]!.closure.state).toBe("released");
+    expect(f.seen.every(item => !item.receipt.isError)).toBe(true);
+  } finally { await f.close(); }
+});
+
+test("delivered grounds follow A to B to C with own-only support citations, excluding independent D", async () => {
+  const labels = ["A", "B", "C", "D"];
+  const questions = labels.map(label => ({ question: `Chain question ${label}?`, purpose: `Chain purpose ${label}` }));
+  let doubtIds: string[] = [];
+  const f = await setup({ prompt(session, request, body) {
+    if (request.stage === "preparation" && session.model.id !== "director")
+      return { ...body, analysis: "PRIVATE-CHAIN-ANALYSIS", findings: [finding], doubts: questions };
+    if (request.stage === "consultation-plan") {
+      doubtIds = request.context.doubts.map((doubt: any) => doubt.id);
+      return { kind: "consultation-plan", resolutions: [], support: labels.map((label, index) => ({
+        role: "scout", brief: label, doubtIds: [doubtIds[index]], prerequisites: index < 2 ? [index + 1] : [],
+      })) };
+    }
+    if (request.stage === "consultation-response") return { kind: "consultation-response",
+      doubtIds: request.authorization.doubtIds, answer: `Chain answer ${request.context.mandate}`,
+      evidence: ["source:chain", ...request.context.prerequisites.map((result: any) => result.id)], limits: [], doubts: [] };
+    if (request.stage === "knowledge") return { kind: "knowledge", resolutions: doubtIds.map((doubtId, index) => ({
+      doubtId, status: "answered", answer: `Chain confirmed ${labels[index]}`, supportIds: [request.context.responses[index].id],
+    })) };
+    if (request.stage === "synthesis") return { ...body,
+      dispositions: reviewResults(request).findings.map((published: any) => ({
+        findingId: published.id, status: "rejected", reason: "A relies on B and C", references: [doubtIds[0], doubtIds[0]],
+      })) };
+    return body;
+  } });
+  try {
+    const { details: handle } = await f.invoke("review_start", start); await f.delivered.promise;
+    const saved = reportFor(f, handle), report = JSON.parse(saved.result);
+    expect(saved.status).toBe("completed");
+    expect(report).toMatchObject({ completion: "complete", verdict: "no-blockers", missingValidSynthesis: false });
+    const journal = await journalFor(f, handle);
+    const knowledge = journal.find(item => item.stage === "knowledge");
+    expect(knowledge.body.resolutions.map((item: any) => item.supportIds.length)).toEqual([1, 1, 1, 1]);
+    const boundary = journal.find(item => item.kind === "knowledge-boundary");
+    expect(boundary.resolutions.map((item: any) => item.provenance.responses.length)).toEqual([1, 1, 1, 1]);
+    const preparation = journal.find(item => item.body?.analysis === "PRIVATE-CHAIN-ANALYSIS");
+    for (const index of [0, 1, 2]) {
+      const response = journal.find(item => item.body?.answer === `Chain answer ${labels[index]}`);
+      const consultationId = boundary.resolutions[index].provenance.consultationId;
+      expect(report.grounds).toContainEqual({
+        reference: doubtIds[index], messageId: preparation.id, memberId: preparation.memberId,
+        author: preparation.author, stage: preparation.stage, content: questions[index],
+      });
+      expect(report.grounds).toContainEqual({
+        reference: response.id, messageId: response.id, memberId: response.memberId, author: response.author,
+        stage: response.stage, consultationId, content: { doubtIds: response.body.doubtIds,
+          answer: response.body.answer, evidence: response.body.evidence, limits: response.body.limits },
+      });
+    }
+    expect(report.grounds).toHaveLength(7);
+    expect(new Set(report.grounds.map((item: any) => item.reference)).size).toBe(7);
+    const serialized = JSON.stringify(report);
+    for (const marker of ["Chain question D?", "Chain purpose D", "Chain answer D", "Chain confirmed D",
+      "PRIVATE-CHAIN-ANALYSIS", '"messages"', '"native"', '"attemptId"', '"turnId"', '"snapshotId"'])
+      expect(serialized).not.toContain(marker);
+    expect(journal.some(item => item.body?.answer === "Chain answer D")).toBe(true);
+    expect(f.seen.every(item => !item.receipt.isError)).toBe(true);
+    expect(f.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
+    await diagnosticFor(f, handle);
+  } finally { await f.close(); }
+});
+
 test("support capacity includes retained disposal and dependencies consume only closed evidence", async () => {
   const both = deferred(), disposing = deferred(), releasePrompt = deferred(), releaseDispose = deferred();
   let calls = 0, active = 0, maxActive = 0, disposalCalls = 0;
@@ -334,13 +518,38 @@ test("support capacity includes retained disposal and dependencies consume only 
     if (request.stage === "consultation-plan") return { kind: "consultation-plan", resolutions: [], support: request.context.doubts.map((doubt: any, index: number) =>
       ({ role: "scout", brief: `support ${index}`, doubtIds: [doubt.id], prerequisites: index === 2 ? [0] : [] })) };
     if (request.stage === "consultation-response") {
+      expect(Object.keys(request.context).sort()).toEqual(["consultationId", "cycleId", "doubts", "mandate", "prerequisites", "request"]);
+      expect(request.context.doubts.map((doubt: any) => doubt.id)).toEqual(request.context.request.brief === "support 2"
+        ? [f.seen.find(item => item.request.stage === "consultation-response" && item.request.context.request.brief === "support 0")!.request.context.doubts[0].id,
+          ...request.context.request.doubtIds] : request.context.request.doubtIds);
+      expect(request.context.doubts[0].question).toStartWith("Question ");
+      if (request.context.request.brief === "support 2") {
+        expect(request.context.prerequisites).toHaveLength(1);
+        expect(request.context.prerequisites[0]).toMatchObject({ status: "completed",
+          message: { stage: "consultation-response", body: { answer: "Controlled observation" } } });
+      }
       calls++; active++; maxActive = Math.max(maxActive, active); if (calls === 2) both.resolve();
       if (calls === 3) expect(disposalCalls).toBe(2);
       await releasePrompt.promise;
       return { kind: "consultation-response", doubtIds: request.context.request.doubtIds, answer: "Controlled observation", evidence: ["source:42"], limits: [], doubts: [] };
     }
-    if (request.stage === "knowledge") return { kind: "knowledge", resolutions: request.context.doubts.map((doubt: any, index: number) =>
-      ({ doubtId: doubt.id, status: "answered", answer: "Observed", supportIds: [request.context.responses[index].id] })) };
+    if (request.stage === "knowledge") {
+      expect(request.authorization).toEqual({ kind: "knowledge" });
+      expect(request.context.responses[2].prerequisites).toEqual([request.context.responses[0].id]);
+      for (const response of request.context.responses) {
+        expect(response.id).not.toBe(response.message.id);
+        expect(response.status).toBe("completed");
+        expect(response.message.body.evidence).toEqual(["source:42"]);
+      }
+      return { kind: "knowledge", resolutions: request.context.doubts.map((doubt: any, index: number) =>
+        ({ doubtId: doubt.id, status: "answered", answer: "Observed",
+          supportIds: [...request.context.responses[index].prerequisites, request.context.responses[index].id] })) };
+    }
+    if (request.stage === "synthesis") {
+      const doubt = request.context.messages.flatMap((message: any) => message.body.doubts ?? [])[2];
+      return { ...body, newFindings: [{ finding: { ...finding, materiality: "nonblocking" }, status: "unresolved",
+        reason: "Bounded concern supported by prerequisite observations", references: [doubt.id] }] };
+    }
   } });
   try {
     const { details: handle } = await f.invoke("review_start", start); await both.promise;
@@ -350,6 +559,170 @@ test("support capacity includes retained disposal and dependencies consume only 
     releaseDispose.resolve(); await f.delivered.promise;
     expect(calls).toBe(3); expect(active).toBe(0); expect(maxActive).toBe(2);
     expect(reportFor(f, handle).status).toBe("completed");
-    expect(JSON.parse(reportFor(f, handle).result).findings).toEqual([]);
+    const report = JSON.parse(reportFor(f, handle).result);
+    expect(report.findings).toHaveLength(1);
+    expect(report.grounds.filter((item: any) => item.stage === "consultation-response")).toHaveLength(2);
+    expect(report.grounds.filter((item: any) => item.stage === "consultation-response").every((item: any) =>
+      item.content.answer === "Controlled observation" && item.content.evidence[0] === "source:42")).toBe(true);
+    const knowledge = report.grounds.find((item: any) => item.stage === "knowledge");
+    const judgedDoubt = report.grounds.find((item: any) => item.content.question === "Question 2").reference;
+    const resolution = knowledge.content.resolutions.find((item: any) => item.doubtId === judgedDoubt);
+    expect(resolution.answer).toBe("Observed");
+    expect(knowledge.content.resolutions).toHaveLength(2);
+    expect(report.grounds.filter((item: any) => item.stage === "consultation-response").map((item: any) => item.consultationId).sort())
+      .toEqual(resolution.supportIds.toSorted());
+    expect(report.grounds.filter((item: any) => item.content.question).map((item: any) => item.content.question).sort())
+      .toEqual(["Question 0", "Question 2"]);
+    await diagnosticFor(f, handle);
   } finally { releasePrompt.resolve(); releaseDispose.resolve(); await f.close(); }
+});
+
+test("plan prompts identify private capture for local exploration, retaining the brief and capture limits", async () => {
+  const marker = "PRIVATE-PLAN-CONTENT-42";
+  const header = "---\nid: object\nrevision: 7\nstatus: draft\n---\n";
+  const text = header + `# Scope\n${marker}\n\`\`\`md\n## Planning workers\nfenced substance\n\`\`\`\n` +
+    "## Planning workers <!-- operational -->\nprivate worker log\nAcceptance\n---\nrequired behavior\n";
+  const f = await setup({ explore(object) {
+    expect(object.selector).toEqual({ kind: "plan", planId: "object" });
+    if (!("file" in object)) throw Error("missing plan exploration coordinates");
+    return consultedPlan(readFileSync(path.resolve(object.root, object.file), "utf8"));
+  } });
+  try {
+    const file = path.join(f.root, ".pitako/plans/object.md");
+    mkdirSync(path.dirname(file), { recursive: true }); writeFileSync(file, text);
+    const captured = captureObject({ kind: "plan", planId: "object" }, f.root);
+    const { details: handle } = await f.invoke("review_start", { ...start, object: captured.selector }); await f.delivered.promise;
+    expect(reportFor(f, handle).status).toBe("completed");
+    for (const { request, exploration } of f.seen) {
+      expect(request.goal).toBe(start.goal); expect(request.criteria).toEqual(start.criteria);
+      expect(request.root).toBe(f.root); expect(request.object).toEqual(describeObject(captured));
+      expect(JSON.stringify(request)).not.toContain(marker);
+      expect(JSON.stringify(request)).not.toContain("private worker log");
+      expect(exploration).toBe((captured.scope as { text: string }).text);
+      expect(exploration).toContain(marker); expect(exploration).toContain("fenced substance");
+      expect(exploration).not.toContain("private worker log");
+      expect(request.object.limits.join(" ")).toContain("not transactional");
+    }
+    const report = JSON.parse(reportFor(f, handle).result);
+    expect(report.observations).toEqual({ launch: captured.identity, final: captured.identity, error: null });
+    expect(report.object).toEqual(describeObject(captured));
+    expect(reportFor(f, handle).result).not.toContain(marker);
+    expect(reportFor(f, handle).result).not.toContain("private worker log");
+    await diagnosticFor(f, handle);
+  } finally { await f.close(); }
+});
+
+test("diff prompts carry captured endpoints while participants explore commits, index and current bytes locally", async () => {
+  const markers = ["PRIVATE-COMMITTED-43", "PRIVATE-STAGED-44", "PRIVATE-DIRTY-45", "PRIVATE-UNTRACKED-46"];
+  const f = await setup({ explore(object) {
+    if (!("mergeBase" in object)) throw Error("missing diff exploration endpoints");
+    const git = (...args: string[]) => execFileSync("git", ["--no-optional-locks", "--no-replace-objects", ...args],
+      { cwd: object.root, env: { ...process.env, GIT_NO_LAZY_FETCH: "1", GIT_OPTIONAL_LOCKS: "0" } }).toString();
+    return {
+      committed: git("diff", "--no-ext-diff", "--no-textconv", `${object.mergeBase}..${object.head}`, "--"),
+      staged: git("diff", "--no-ext-diff", "--no-textconv", "--cached", object.head, "--"),
+      dirty: readFileSync(path.join(object.root, "dirty"), "utf8"),
+      untracked: readFileSync(path.join(object.root, git("ls-files", "--others", "--exclude-standard").trim()), "utf8"),
+      deleted: git("ls-files", "--deleted").trim(),
+    };
+  } });
+  const git = (...args: string[]) => execFileSync("git", args, { cwd: f.root,
+    env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } }).toString().trim();
+  try {
+    git("init", "-q"); git("config", "user.name", "Review fixture"); git("config", "user.email", "review@test.invalid");
+    writeFileSync(path.join(f.root, ".gitignore"), "pitako/\n*.jsonl\n.pitako/\n");
+    for (const name of ["committed", "staged", "dirty", "deleted"]) writeFileSync(path.join(f.root, name), "base\n");
+    git("add", "."); git("commit", "-qm", "base"); const base = git("rev-parse", "HEAD");
+    writeFileSync(path.join(f.root, "committed"), markers[0]!); git("add", "committed"); git("commit", "-qm", "committed");
+    writeFileSync(path.join(f.root, "staged"), markers[1]!); git("add", "staged");
+    writeFileSync(path.join(f.root, "dirty"), markers[2]!); writeFileSync(path.join(f.root, "untracked"), markers[3]!);
+    rmSync(path.join(f.root, "deleted"));
+    const captured = captureObject({ kind: "diff", base }, f.root);
+    const { details: handle } = await f.invoke("review_start", { ...start, object: captured.selector }); await f.delivered.promise;
+    expect(reportFor(f, handle).status).toBe("completed");
+    for (const { request, exploration } of f.seen) {
+      expect(request.object).toEqual(describeObject(captured));
+      expect(request.object.exploration).toContain("not git diff HEAD alone");
+      expect(request.object.exploration).toContain("without fetch");
+      for (const marker of markers) expect(JSON.stringify(request)).not.toContain(marker);
+      const found = exploration as { committed: string; staged: string; dirty: string; untracked: string; deleted: string };
+      expect(found.committed).toContain(markers[0]!); expect(found.staged).toContain(markers[1]!);
+      expect(found.dirty).toBe(markers[2]!); expect(found.untracked).toBe(markers[3]!); expect(found.deleted).toBe("deleted");
+    }
+    expect(JSON.parse(reportFor(f, handle).result).observations.final).toBe(captured.identity);
+    expect(JSON.parse(reportFor(f, handle).result).object).toEqual(describeObject(captured));
+    for (const marker of markers) {
+      expect(reportFor(f, handle).result).not.toContain(marker);
+      expect(reportFor(f, handle).result).not.toContain(Buffer.from(marker).toString("base64"));
+    }
+    await diagnosticFor(f, handle);
+  } finally { await f.close(); }
+});
+
+test("review responses use published finding IDs with author content and synthesis retains every author action", async () => {
+  let publishedId = "";
+  const f = await setup({ prompt(session, request, body) {
+    if (request.stage === "preparation" && session.model.id !== "director") return { ...body,
+      findings: [finding, { ...finding, key: "duplicate" }, { ...finding, key: "nonblocker", materiality: "nonblocking" }],
+      doubts: [{ question: "Does the alternate path enforce authorship?", purpose: "Grounds for rejecting the nonblocker" }] };
+    if (request.stage === "consultation-plan") return { ...body, resolutions: request.context.doubts.map((doubt: any) =>
+      ({ doubtId: doubt.id, status: "answered", answer: "The alternate path enforces authorship at source:42" })) };
+    if (request.stage === "contribution") {
+      const published = reviewResults(request).findings[0];
+      expect(published).toMatchObject(finding);
+      expect(published.id).not.toBe(published.messageId);
+      expect(published.memberId).toBe(request.context.shared.messages.find((message: any) => message.id === published.messageId).memberId);
+      if (publishedId) expect(published.id).toBe(publishedId);
+      publishedId = published.id;
+      return { ...body, responses: [{ findingId: published.id, action: session.model.id === "director" ? "object"
+        : request.round === 1 ? "modify" : "withdraw", reason: `author-action-${session.model.id}-${request.round}`,
+        evidence: ["source:42"], ...(session.model.id !== "director" && request.round === 1
+          ? { replacement: { ...finding, consequence: "Bounded revised consequence" } } : {}) }] };
+    }
+    if (request.stage === "decision") return { ...body, action: request.round === 1 ? "continue" : "synthesize" };
+    if (request.stage === "synthesis") {
+      const results = reviewResults(request);
+      expect(results.findings.map((item: any) => item.key)).toEqual(["authority", "duplicate", "nonblocker"]);
+      expect(results.findings[0].id).toBe(publishedId);
+      expect(results.responses).toHaveLength(4);
+      expect(results.responses.filter((item: any) => item.memberId === results.findings[0].memberId).map((item: any) => item.action))
+        .toEqual(["modify", "withdraw"]);
+      const doubt = request.context.messages.flatMap((message: any) => message.body.doubts ?? [])[0];
+      const director = request.context.messages.find((message: any) => message.stage === "contribution" && message.author === "reviewer");
+      return { ...body, verdict: "inconclusive", dispositions: [
+        { findingId: publishedId, status: "withdrawn", reason: "Author withdrawal retained after objection", references: [results.responses.at(-1).messageId] },
+        { findingId: results.findings[1].id, status: "duplicate", duplicateOf: publishedId, reason: "Same reachable path", references: [publishedId] },
+        { findingId: results.findings[2].id, status: "rejected", reason: "Alternate path checks authority", references: [doubt.id] },
+      ], newFindings: [{ finding: { ...finding, key: "synthesis-dissent", materiality: "nonblocking" }, status: "unresolved",
+        reason: "Director retains a bounded concern despite withdrawal", references: [director.id] }],
+      evidence: ["source:42"], limits: ["Bounded controlled observation"], pending: ["Optional follow-up on nonblocking dissent"] };
+    }
+  } });
+  try {
+    const { details: handle } = await f.invoke("review_start", start); await f.delivered.promise;
+    expect(reportFor(f, handle).status).toBe("completed");
+    const report = JSON.parse(reportFor(f, handle).result);
+    expect(report.findings.map((item: any) => item.key)).toEqual(["authority", "duplicate", "nonblocker", "synthesis-dissent"]);
+    expect(report.findings[0].id).toBe(publishedId);
+    expect(report.responses).toHaveLength(4); expect(report.dispositions[0].status).toBe("withdrawn");
+    expect(report.responses.filter((item: any) => item.action === "object")).toHaveLength(2);
+    expect(report.responses.every((item: any) => item.reason && item.evidence[0] === "source:42")).toBe(true);
+    expect(report.dispositions.map((item: any) => item.status)).toEqual(["withdrawn", "duplicate", "rejected", "unresolved"]);
+    expect(report.dispositions.map((item: any) => item.findingId)).toEqual(report.findings.map((item: any) => item.id));
+    expect(report.synthesis).toMatchObject({ evidence: ["source:42"], limits: ["Bounded controlled observation"],
+      pending: ["Optional follow-up on nonblocking dissent"] });
+    const source = f.seen.find(item => item.request.stage === "synthesis")!.request.context.messages;
+    const director = source.find((message: any) => message.stage === "contribution" && message.author === "reviewer");
+    const doubt = source.flatMap((message: any) => message.body.doubts ?? [])[0];
+    expect(report.grounds).toContainEqual(expect.objectContaining({ reference: director.id, content: { analysis: "Review incoming evidence" } }));
+    expect(report.grounds).toContainEqual(expect.objectContaining({ reference: doubt.id, content: {
+      question: "Does the alternate path enforce authorship?", purpose: "Grounds for rejecting the nonblocker",
+    } }));
+    expect(report.grounds).toContainEqual(expect.objectContaining({ stage: "consultation-plan", content: expect.objectContaining({
+      resolutions: [expect.objectContaining({ doubtId: doubt.id, answer: "The alternate path enforces authorship at source:42" })],
+    }) }));
+    expect(report.grounds.some((ground: any) => ground.reference === publishedId)).toBe(false); // Already a canonical finding.
+    expect(report.grounds.every((ground: any) => !("body" in ground) && !("native" in ground))).toBe(true);
+    await diagnosticFor(f, handle);
+  } finally { await f.close(); }
 });
