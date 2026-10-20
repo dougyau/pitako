@@ -703,9 +703,10 @@ describe("plan and execute contracts", () => {
     expect(execute).toContain("same Developer");
     expect(execute).toContain("Other long specialist work uses `team_assign` when registered");
     expect(execute).toContain("exterior Team assignment ID for tables or Team");
-    expect(execute).toContain("Interpret complete `pitako.worker.result` messages supplied automatically in context");
-    expect(execute).toContain("optional, complete, idempotent diagnostic re-reads");
-    expect(execute).toContain("They neither transport the automatic result nor acknowledge incorporation");
+    expect(execute).toContain("Interpret `pitako.worker.result` messages supplied automatically in context");
+    expect(execute).toContain("Ordinary assignments carry their existing complete result");
+    expect(execute).toContain("an incomplete reference: read pertinent `team_result` sections before dependent judgment");
+    expect(execute).toContain("reads do not acknowledge incorporation");
     expect(execute).not.toContain("call `team_result` once");
     expect(execute).toContain("call `team_status` with its assignment ID");
     expect(execute).not.toContain("`agent_result` once");
@@ -777,11 +778,16 @@ describe("plan and execute contracts", () => {
         "zero to five optional specialists", "utility with reasons",
         "Selective recomposition", "knowledge, not judge findings", "Corrections remain outside the table",
         "actual returned exterior Team assignment", "physical closure and comparison with the current object",
-        "top-level `completion` and `verdict`", "not nested synthesis, dispositions",
+        "authorized `judgment` completion/verdict", "not historical synthesis, dispositions",
+        "Null judgment cannot approve",
         "A final inconclusive judgment blocks approval", "not coordinator acceptance",
-        "No `review_read` or result fetch is required for transport or acknowledgement",
+        "`review_read` provides paged diagnostics, not acknowledgement",
         "Material object edits invalidate affected judgment",
       ]) expect(policy).toContain(contract);
+      expect(policy).toMatch(/[Cc]omplete inline reports? needs? no fetch/);
+      expect(policy).toMatch(/incomplete references? requires? pertinent `team_result` reading before (?:dependent )?judgment/);
+      expect(policy).not.toContain("complete automatic exterior JSON `ReviewReport`");
+      expect(policy).not.toContain("No `review_read` or result fetch is required for transport");
       expect(policy).not.toContain("Ordinary Reviewer remains the default");
       expect(policy).not.toContain("one to five");
     }
@@ -830,7 +836,7 @@ describe("plan and execute contracts", () => {
     }
   });
 
-  test("background checkpoints interpret full results and distinguish planning loss from execution recovery", () => {
+  test("background checkpoints interpret selected results and distinguish planning loss from execution recovery", () => {
     for (const policy of [plan, execute]) {
       for (const contract of [
         "Handles are session-local", "check each recorded handle once by type",
@@ -873,18 +879,21 @@ describe("plan and execute contracts", () => {
     expect(execute).toContain("a new assignment does not clear a blocking hold");
   });
 
-  test("active orchestration guidance interprets supplied results without fetching or accepting work", () => {
+  test("active orchestration guidance reads referenced content without acknowledging or accepting work", () => {
     const coordinator = readFileSync(path.join(packageRoot(), "roles/coordinator.md"), "utf8");
-    expect(plan).toContain("complete settled results automatically supplied in context");
-    expect(plan).toContain("optional exact-assignment diagnostic re-read");
+    expect(plan).toContain("Interpret settled results before deciding");
+    expect(plan).toContain("a table reference requires pertinent reading, not an automatic full-load loop");
+    expect(plan).toContain("Ordinary `team_result` and exact-worker `agent_result` diagnostic behavior is unchanged");
+    expect(plan).toContain("reads never acknowledge incorporation");
     expect(plan).not.toContain("on each watched completion wake, call");
     expect(execute).toContain("Automatic collection reconciles only a successful assignment's own result hold");
     expect(execute).toContain("it does not accept work or complete a unit");
-    expect(execute).toContain("Bookkeeping failure is reported separately and never hides the full result");
-    expect(router).toContain("do not poll or acknowledge collection");
-    expect(router).toContain("Automatic handoff is not work acceptance or unit completion");
-    expect(coordinator).toContain("not transport or acknowledgement");
-    expect(coordinator).toContain("does not accept the work or expand specialist authority");
+    expect(execute).toContain("Bookkeeping failure is reported separately and never hides the selected report or its reference");
+    expect(router).toContain("Do not poll or acknowledge collection");
+    expect(router).toContain("Automatic handoff, transport end and report completion are not work acceptance or unit completion");
+    expect(coordinator).toContain("read pertinent `team_result` sections before dependent judgment");
+    expect(coordinator).toContain("Do not poll or acknowledge collection");
+    expect(coordinator).toContain("Transport end, completion and handoff do not accept the work or expand specialist authority");
   });
 
   test("published guidance reserves Architect and Reviewer for tables while preserving allowed synchronous runs", () => {

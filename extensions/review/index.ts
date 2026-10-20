@@ -5,18 +5,19 @@ import { loadPitakoConfig, resolveRoleFromConfig } from "../roles/load.ts";
 import { executionForSession } from "../execution-identity.ts";
 import { currentInstanceId } from "../agent/scope.ts";
 import { assertNoCheckpointLease } from "../agent/head/checkpoint-lease.ts";
-import { backgroundExecutor, cancelTeamWorker, reserveBackground, type WorkerInterest } from "../agent/background.ts";
+import { backgroundExecutor, cancelTeamWorker, reserveBackground, readTableDiagnostic, type WorkerInterest } from "../agent/background.ts";
 import { prepareTeamWatch } from "../agent/index.ts";
 import { createTeam, reserveTeamMember, recordTeamAssignment, recordPlanTeamWork, teamEvaluationForSession } from "../team.ts";
 import type { HistoryOrigin } from "../agent/history.ts";
 import { createTable } from "../table/runtime.ts";
 import { captureObject, objectSchema } from "./object.ts";
 import { createReviewPolicy } from "./policy.ts";
+import { tableIncidental as result, tableError, tableReadProperties, type TableRead, type TableRootRegistration } from "../table/results.ts";
+import { captureTableArchive } from "../table/archive.ts";
 
 const rooms = new Map<symbol, Map<string, { instanceId: string; assignmentId: string; runtime?: ReturnType<typeof createTable> }>>();
 export function retireReviewRooms(token: symbol) { rooms.delete(token); }
 const strict = { additionalProperties: false } as const, text = Type.String({ minLength: 1 });
-const result = (details: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(details) }], details });
 
 export function registerReview(pi: ExtensionAPI) {
   const evaluationFor = (ctx: ExtensionContext) => {
@@ -24,7 +25,6 @@ export function registerReview(pi: ExtensionAPI) {
     if (currentInstanceId() || executionForSession(id)) throw new Error("review coordinator tools are foreground only");
     const evaluation = teamEvaluationForSession(id, false);
     if (!evaluation) throw new Error("review requires an active foreground Team evaluation");
-    assertNoCheckpointLease(ctx.cwd);
     return evaluation;
   };
   const roomFor = (id: string, ctx: ExtensionContext) => {
@@ -38,6 +38,7 @@ export function registerReview(pi: ExtensionAPI) {
       topic: Type.Optional(text), plan: Type.Optional(text), unit: Type.Optional(text), boardTopicId: Type.Optional(text) }, strict),
     async execute(toolCallId, params, _signal, _update, ctx) {
       try {
+        assertNoCheckpointLease(ctx.cwd);
         const evaluation = evaluationFor(ctx), config = structuredClone(loadPitakoConfig({ cwd: ctx.cwd }));
         const director = resolveRoleFromConfig(config, "reviewer");
         if (director.modelPolicy.diagnostic) throw new Error(director.modelPolicy.diagnostic);
@@ -49,22 +50,25 @@ export function registerReview(pi: ExtensionAPI) {
           coordinatorSessionId: evaluation.sessionId, coordinatorSessionFile: ctx.sessionManager.getSessionFile(), toolCallId,
           workbrief: params.goal, teamId: team.teamId, memberId: admission.memberId };
         let durableWatch: WorkerInterest | undefined;
+        const tableRoot: TableRootRegistration = { protocol: "review", archive: captureTableArchive(ctx.cwd, params.plan) };
         const room: { assignmentId: string; instanceId: string; runtime?: ReturnType<typeof createTable> } = { assignmentId, instanceId: "" };
         try {
           const handle = reserveBackground({ roleId: "reviewer", coordinatorSessionId: evaluation.sessionId, origin, task: params.goal,
-            owns: admission.owns,
+            owns: admission.owns, tableRoot,
             teamOwner: { token: admission.token, assignmentId, teamId: team.teamId, memberId: admission.memberId,
               onSettled: admission.settled, noWorkerReleased: admission.noWorkerReleased },
             async cleanup() { if (durableWatch) recordPlanTeamWork(ctx.cwd, durableWatch.planId, durableWatch.unitId, assignmentId, undefined, durableWatch.execution); },
             async prepare(_lifetime, check, reserved) {
               const watched = await prepareTeamWatch(params, ctx, assignmentId, check);
               durableWatch = watched.durableWatch;
-              const launchRoot = watched.execution?.executionRoot ?? captured.root;
+              const launchRoot = watched.execution?.executionRoot ?? (tableRoot.archive && "root" in tableRoot.archive ? tableRoot.archive.root : captured.root);
               if (watched.execution) origin.execution = { executionRoot: launchRoot, executionRef: `${watched.execution.planId}@${watched.execution.revision}:${watched.execution.hash}` };
               const object = launchRoot === captured.root ? captured : captureObject(params.object, launchRoot);
               const review = createReviewPolicy(object, params.goal, [...params.criteria]);
               const runtime = createTable({ team, config, goal: params.goal, topic: params.topic, review,
                 root: { assignmentId, memberId: admission.memberId, instanceId: reserved.instanceId }, origin, cwd: launchRoot, owns: reserved.current });
+              tableRoot.semantic = runtime.semantic;
+              tableRoot.diagnostic = runtime.diagnostic;
               room.runtime = runtime;
               recordTeamAssignment(evaluation, "reviewer", { id: assignmentId, instanceId: reserved.instanceId, roleId: "reviewer", task: params.goal,
                 planId: watched.watch?.planId, unitId: watched.watch?.unitId, boardTopicId: watched.topic, execution: watched.execution, dispatchId: reserved.dispatchId });
@@ -81,28 +85,29 @@ export function registerReview(pi: ExtensionAPI) {
           recordTeamAssignment(evaluation, "reviewer", { id: assignmentId, instanceId: handle.instanceId, roleId: "reviewer", task: params.goal, dispatchId: handle.dispatchId });
           return result({ ...handle, roomId: team.teamId, assignmentId, memberId: admission.memberId });
         } catch (error) { admission.rollback(); throw error; }
-      } catch (error) { return { ...result({ error: String(error) }), isError: true }; }
+      } catch (error) { return tableError(error); }
     },
   });
-  pi.registerTool({ name: "review_read", label: "Read Reviewer table", description: "Optional bounded diagnostic fragments. Never needed to discover findings in the complete exterior report.",
-    parameters: Type.Object({ roomId: text, cursor: Type.Optional(text) }, strict),
+  pi.registerTool({ name: "review_read", label: "Read Reviewer table", description: "Read an immutable diagnostic cut, including snapshot, members, failures, pending, closure and delivery. Start with section (default report), maxBytes 4096..16384 (default 16384); continue with cursor only. A new start replaces only this room's cut. No acknowledgement or protocol advancement. Exterior references require pertinent team_result reading before judgment.",
+    parameters: Type.Object({ roomId: text, ...tableReadProperties }, strict),
     async execute(_id, params, _signal, _update, ctx) {
       try {
-        const { room } = roomFor(params.roomId, ctx);
-        return result(room.runtime?.read(params.cursor) ?? { roomId: params.roomId, state: "starting", instanceId: room.instanceId, assignmentId: room.assignmentId });
-      } catch (error) { return { ...result({ error: String(error) }), isError: true }; }
+        const { evaluation, room } = roomFor(params.roomId, ctx);
+        return readTableDiagnostic(evaluation.token, room.instanceId, params as TableRead);
+      } catch (error) { return tableError(error); }
     },
   });
   pi.registerTool({ name: "review_control", label: "Control Reviewer table", description: "Queue context or priorities without changing object or criteria. Finish drains and synthesizes; stop revokes and joins, never proves closure.",
     parameters: Type.Object({ roomId: text, action: Type.Union([Type.Literal("context"), Type.Literal("priorities"), Type.Literal("finish"), Type.Literal("stop")]), text: Type.Optional(text) }, strict),
     async execute(toolCallId, params, _signal, _update, ctx) {
       try {
+        assertNoCheckpointLease(ctx.cwd);
         const { evaluation, room } = roomFor(params.roomId, ctx);
         if (room.runtime) return result(room.runtime.control(params.action, params.text, toolCallId));
         if (params.action !== "stop") throw new Error("review preparation pending");
         cancelTeamWorker(evaluation.token, room.instanceId);
         return result({ roomId: params.roomId, state: "stopping" });
-      } catch (error) { return { ...result({ error: String(error) }), isError: true }; }
+      } catch (error) { return tableError(error); }
     },
   });
 }

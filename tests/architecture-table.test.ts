@@ -154,7 +154,7 @@ test("retention keeps owners and immutable tasks; additions prepare independentl
   } });
   try {
     const start = await s.invoke("architecture_start", { goal: "Keep full historical evidence" }); await s.delivered.promise;
-    expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("completed");
+    expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("completed");
     const retained = teamAssignments(s.evaluation).find(member => member.memberId === retainedId)!;
     expect(retained.task).toBe("Member 0");
     const retainedSession = s.seen.find(item => item.request.stage === "contribution" && item.request.round === 2 && item.session.model.id === "chosen")!.session;
@@ -219,8 +219,8 @@ test("partial replacement admission preserves intention and closes created owner
     expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
     expect(teamAssignments(s.evaluation)).toHaveLength(3);
     expect(teamWorkerStatus(s.evaluation.token).every(row => row.closure.state === "released")).toBe(true);
-    const room = (await s.invoke("architecture_read", { roomId: start.details.roomId })).details;
-    expect(room.fragments.map((fragment: any) => fragment.text).join("")).toContain('"specialists":[{"kind":"add"');
+    const room = await s.read("architecture_read", { roomId: start.details.roomId });
+    expect(JSON.stringify(room.messages)).toContain('"specialists":[{"kind":"add"');
     expect(s.seen.filter(item => item.request.stage === "contribution").every(item => item.request.round === 1)).toBe(true);
   } finally { spy.mockRestore(); await s.close(); }
 }));
@@ -298,7 +298,7 @@ test("registered five-member table shares ordered support only at the knowledge 
         expect(session.active).not.toContain("agent_spawn"); expect(session.active).not.toContain("edit");
       }
       releaseRound.resolve(); await s.delivered.promise;
-      expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("completed");
+      expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("completed");
       expect(s.sent.filter(item => item.message.customType === "pitako.worker.result")).toHaveLength(1);
       expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
       expect(maxActive).toBe(2);
@@ -409,8 +409,8 @@ test("round frontiers freeze objections and controls; replacement waits for all 
     const start = await s.invoke("architecture_start", { goal: "Frontier changes" }); await entered.promise;
     const first = JSON.stringify(prompts[0].context.shared);
     expect(prompts.every(request => JSON.stringify(request.context.shared) === first)).toBe(true);
-    const before = (await s.invoke("architecture_read", { roomId: start.details.roomId })).details;
-    const cursor = before.cursor;
+    const before = JSON.parse((await s.invoke("architecture_read", { roomId: start.details.roomId, maxBytes: 4096 })).content[0].text);
+    const cursor = before.header.cursor;
     await s.invoke("architecture_control", { roomId: start.details.roomId, action: "context", text: "new context" });
     await s.invoke("architecture_control", { roomId: start.details.roomId, action: "priorities", text: "new priority" });
     expect(JSON.stringify(prompts[0].context.shared)).toBe(first);
@@ -425,13 +425,13 @@ test("round frontiers freeze objections and controls; replacement waits for all 
     expect(second[0].context.shared.controls).toEqual([{ action: "context", text: "new context" }, { action: "priorities", text: "new priority" }]);
     expect(second[0].context.shared.messages.filter((message: any) => message.stage === "contribution")).toHaveLength(6);
     expect(second[0].context.shared.messages.filter((message: any) => message.stage === "contribution").every((message: any) => message.body.objections.length === 1 && message.body.doubts.length === 0)).toBe(true);
-    const readAgain = (await s.invoke("architecture_read", { roomId: start.details.roomId, ...(cursor ? { cursor } : {}) })).details;
-    if (cursor) expect(readAgain.cut).toBe(before.cut);
+    const readAgain = JSON.parse((await s.invoke("architecture_read", { roomId: start.details.roomId, ...(cursor ? { cursor } : {}) })).content[0].text);
+    if (cursor) expect(readAgain.header.id).toBe(before.header.id);
     expect(s.host.sessions.filter(session => session.model?.id === "chosen")).toHaveLength(10);
     expect(outgoing.every(session => session.events.includes("dispose"))).toBe(true); await observePrivate(s);
     releaseSynthesis.resolve(); await s.delivered.promise;
     expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
-    expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("completed");
+    expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("completed");
   } finally { release(); await s.close(); }
 }));
 
@@ -469,7 +469,7 @@ for (const action of ["consult", "continue"] as const) {
       expect(rounds).toEqual([1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 5]);
       expect(phases).toEqual(action === "consult" ? ["initial", "final-clarification"] : ["initial"]);
       expect(supports).toBe(action === "consult" ? 1 : 0);
-      expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("failed");
+      expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("failed");
       const result = await s.invoke("team_result", { assignmentId: start.details.assignmentId });
       expect(result.content[0].text).toContain("partial"); expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
     } finally { await s.close(); }
@@ -502,7 +502,7 @@ for (const action of ["finish", "stop", "team_cancel"] as const) {
       releasePrompt.resolve(); await disposing.promise;
       expect(syntheses).toBe(action === "finish" ? 1 : 0); expect(workerHandoff(start.details.instanceId)).toBeUndefined(); await observePrivate(s);
       releaseDispose.resolve(); await s.delivered.promise;
-      expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe(action === "finish" ? "failed" : "cancelled");
+      expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe(action === "finish" ? "failed" : "cancelled");
       expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
       expect(s.seen.some(item => item.request.stage === "contribution")).toBe(false);
     } finally { release(); await s.close(); }
@@ -535,7 +535,7 @@ test("failed support prerequisites are unresolved, while independent support pro
   try {
     const start = await s.invoke("architecture_start", { goal: "Finite consultation failures" }); await s.delivered.promise;
     expect(calls).toEqual(["support 0", "support 1"]);
-    expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("failed");
+    expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("failed");
     expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
   } finally { await s.close(); }
 }));
@@ -567,7 +567,7 @@ test("continued rounds retain original doubts for the next consultation batch", 
   try {
     const start = await s.invoke("architecture_start", { goal: "Retain deferred questions" }); await s.delivered.promise;
     expect(s.seen.some(item => item.request.stage === "synthesis")).toBe(true);
-    expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("failed");
+    expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("failed");
   } finally { await s.close(); }
 }));
 
@@ -591,6 +591,7 @@ for (const failure of ["missing", "cancelled", "objection"] as const) {
         expect(request.context.sources).toHaveLength(2); expect(request.context.failures).toHaveLength(1);
         return decision("synthesize");
       }
+      if (request.stage === "synthesis") return { ...body, status: "partial" };
       return body;
     } });
     try {
@@ -602,8 +603,8 @@ for (const failure of ["missing", "cancelled", "objection"] as const) {
         expect((await s.invoke("team_cancel", { assignmentId: member.assignmentId })).isError).not.toBe(true);
       }
       release.resolve(); await s.delivered.promise;
-      expect(attempts).toBe(3); expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("failed");
-      const read = (await s.invoke("architecture_read", { roomId: start.details.roomId })).details;
+      expect(attempts).toBe(3); expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("failed");
+      const read = await s.read("architecture_read", { roomId: start.details.roomId });
       expect(read.failures).toHaveLength(1); expect(read.failures[0].stage).toBe("contribution"); expect(read.failures[0].round).toBe(1);
       expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
     } finally { release.resolve(); await s.close(); }

@@ -1,6 +1,6 @@
 import { expect, test as bunTest } from "bun:test";
 import { architectureFixture, reviewResults } from "./fixtures/architecture.ts";
-import { teamWorkerResult, teamWorkerStatus } from "../extensions/agent/background.ts";
+import { readTableResult, teamWorkerResult, teamWorkerStatus } from "../extensions/agent/background.ts";
 import { firstTeamReservation, teamAssignments } from "../extensions/team.ts";
 import { isOrchestrationTool, toolsForProfile } from "../extensions/profile.ts";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -18,34 +18,29 @@ const reportFor = (f: Awaited<ReturnType<typeof setup>>, handle: any) => {
   const saved = teamWorkerResult(f.evaluation.token, handle.instanceId)!;
   const delivered = f.sent.filter(item => item.message.customType === "pitako.worker.result");
   expect(delivered).toHaveLength(1);
-  expect(delivered[0].message.content).toBe(saved.result);
-  const report = JSON.parse(saved.result);
+  const automatic = JSON.parse(delivered[0].message.content);
+  expect(automatic.header).toMatchObject({ section: "report", acceptance: false });
+  let page = JSON.parse(readTableResult(f.evaluation.token, handle.instanceId, {}).content[0]!.text);
+  let canonical = page.fragment;
+  while (page.header.cursor) {
+    page = JSON.parse(readTableResult(f.evaluation.token, handle.instanceId, { cursor: page.header.cursor }).content[0]!.text);
+    canonical += page.fragment;
+  }
+  const report = JSON.parse(canonical);
   expect(report).not.toHaveProperty("messages");
   expect(report.object).not.toHaveProperty("scope");
   expect(report.goal).toBe(start.goal);
   expect(report.criteria).toEqual(start.criteria);
   expect(report.modelObservations.length).toBeGreaterThan(0);
-  return saved;
+  return { ...saved, report };
 };
 async function journalFor(f: Awaited<ReturnType<typeof setup>>, handle: any) {
-  const records = new Map<string, string>();
-  let cursor: string | undefined;
-  do {
-    const read = await f.invoke("review_read", { roomId: handle.roomId, ...(cursor ? { cursor } : {}) });
-    expect(read.isError).not.toBe(true);
-    for (const fragment of read.details.fragments) {
-      expect((records.get(fragment.messageId) ?? "").length).toBe(fragment.offset);
-      records.set(fragment.messageId, (records.get(fragment.messageId) ?? "") + fragment.text);
-    }
-    cursor = read.details.cursor;
-  } while (cursor);
-  return [...records.values()].map(text => JSON.parse(text));
+  return f.read("review_read", { roomId: handle.roomId, section: "messages" });
 }
 async function diagnosticFor(f: Awaited<ReturnType<typeof setup>>, handle: any) {
-  const saved = reportFor(f, handle), diagnostic = await f.invoke("team_result", { assignmentId: handle.assignmentId });
-  expect(diagnostic.details.status).toBe(saved.status);
-  expect(diagnostic.details.resultLength).toBe(saved.result.length);
-  expect(diagnostic.content[0].text.endsWith(saved.result)).toBe(true);
+  const saved = reportFor(f, handle), diagnostic = await f.read("team_result", { assignmentId: handle.assignmentId });
+  expect(diagnostic.host.status).toBe(saved.status);
+  expect(diagnostic).toEqual(saved.report);
 }
 
 test("registered review uses the real adapter, independent Reviewer preparation and separate subordinate/root disposal before one exterior report", async () => {
@@ -76,10 +71,10 @@ test("registered review uses the real adapter, independent Reviewer preparation 
     subordinate.resolve(); await rootEntered.promise;
     expect(f.sent.filter(item => item.message.customType === "pitako.worker.result")).toHaveLength(0);
     root.resolve(); await f.delivered.promise;
-    const result = reportFor(f, handle), report = JSON.parse(result.result);
+    const result = reportFor(f, handle), report = result.report;
     expect(result.status).toBe("completed"); expect(result.role).toBe("reviewer");
     expect(result.model.selectedModel).toBe("fixture/director");
-    expect(report.completion).toBe("complete"); expect(report.verdict).toBe("no-blockers");
+    expect(report.judgment.completion).toBe("complete"); expect(report.judgment.verdict).toBe("no-blockers");
     expect(report.criteria).toEqual(start.criteria);
     expect(report.observations.final).toBe(report.object.identity);
     expect(f.seen.filter(item => item.request.stage === "preparation")).toHaveLength(2);
@@ -109,26 +104,25 @@ test(`${action} during ${window} preserves published evidence through terminal a
   try {
     const { details: handle } = await f.invoke("review_start", start);
     await later.promise;
-    const cut = (await f.invoke("review_read", { roomId: handle.roomId })).details;
-    expect(cut.fragments.some((fragment: any) => fragment.text.includes("authority"))).toBe(true);
+    const cut = await journalFor(f, handle);
+    expect(cut.some((message: any) => message.body?.findings?.some((item: any) => item.key === "authority"))).toBe(true);
     const cancelled = action === "stop" ? f.invoke("review_control", { roomId: handle.roomId, action }) : f.invoke("team_cancel", { assignmentId: handle.assignmentId });
     releasePrompt.resolve(); await cancelled; await subordinateEntered.promise;
     expect(f.sent.filter(item => item.message.customType === "pitako.worker.result")).toHaveLength(0);
     subordinate.resolve(); await rootEntered.promise;
     expect(f.sent.filter(item => item.message.customType === "pitako.worker.result")).toHaveLength(0);
     root.resolve(); await f.delivered.promise;
-    const result = reportFor(f, handle), report = JSON.parse(result.result);
+    const result = reportFor(f, handle), report = result.report;
     expect(result.status).toBe("cancelled"); expect(report.findings).toHaveLength(1);
     expect(report.findings[0].key).toBe("authority");
     expect(report.findings[0]).toMatchObject(finding);
-    expect(report.missingValidSynthesis).toBe(true); expect(report.dispositions).toBeNull();
-    expect(report.verdict).toBe("inconclusive");
+    expect(report.missingValidSynthesis).toBe(true); expect(report.judgment).toBeNull();
     expect(report.pending).toEqual(window === "consultation-plan"
       ? [{ id: expect.any(String), question: "Cancellation observation still needed", purpose: "Preserve pending evidence" }] : []);
     expect(f.sent.filter(item => item.message.customType === "pitako.worker.result")).toHaveLength(1);
     await diagnosticFor(f, handle);
     const journal = await journalFor(f, handle);
-    expect(journal.find(message => message.body.findings?.length).body.findings).toEqual([finding]);
+    expect(journal.find((message: { body: { findings?: unknown[] } }) => message.body.findings?.length).body.findings).toEqual([finding]);
   } finally { releasePrompt.resolve(); subordinate.resolve(); root.resolve(); await f.close(); }
 });
 
@@ -163,7 +157,7 @@ for (const [action, window, verdict] of [
     await subordinateEntered.promise;
     const synthesis = f.seen.find(item => item.request.stage === "synthesis")!;
     expect(synthesis.receipt.isError).not.toBe(true);
-    expect((await f.invoke("review_read", { roomId: handle.roomId })).details.stage).toBe("closing");
+      expect((await f.read("review_read", { roomId: handle.roomId })).stage).toBe("closing");
     held();
     if (window === "root") { subordinate.resolve(); await rootEntered.promise; held(); }
     const cancelled = await (action === "stop"
@@ -173,22 +167,25 @@ for (const [action, window, verdict] of [
     held();
     subordinate.resolve(); await rootEntered.promise; held();
     root.resolve(); await f.delivered.promise;
-    const result = reportFor(f, handle), report = JSON.parse(result.result);
+    const result = reportFor(f, handle), report = result.report;
     expect(result.status).toBe("cancelled");
-    expect(report.completion).toBe("failed"); expect(report.verdict).toBe("inconclusive");
+    expect(report.judgment).toBeNull();
     expect(report.missingValidSynthesis).toBe(false);
     expect(report.findings).toEqual(reviewResults(synthesis.request).findings);
     expect(report.findings[0]).toMatchObject({ ...published, objectIdentity: report.object.identity });
     expect(report.responses).toEqual(reviewResults(synthesis.request).responses);
     expect(report.responses).toHaveLength(1);
-    expect(report.dispositions).toEqual(report.synthesis.dispositions);
-    expect(report.dispositions).toHaveLength(1);
-    expect(report.synthesis).toMatchObject({ completion: "complete", verdict });
+    const discarded = report.history.discardedJudgment;
+    expect(discarded.dispositions).toEqual(discarded.synthesis.dispositions);
+    expect(discarded.dispositions).toHaveLength(1);
+    expect(discarded.synthesis).toMatchObject({ completion: "complete", verdict });
     const journal = await journalFor(f, handle);
     expect(journal.filter((message: any) => ["preparation", "contribution"].includes(message.stage)).map((message: any) => message.id))
       .toEqual(synthesis.request.context.messages.map((message: any) => message.id));
-    expect(journal.at(-1).body).toEqual(report.synthesis);
-    expect(journal.filter(message => message.body).every(message => !!(message.native.sessionId && message.turnId && message.attemptId))).toBe(true);
+    expect(journal.at(-1).body).toEqual(discarded.synthesis);
+    expect(journal.filter((message: { body?: unknown }) => message.body).every((message: {
+      native: { sessionId: string }; turnId: string; attemptId: string;
+    }) => !!(message.native.sessionId && message.turnId && message.attemptId))).toBe(true);
     expect(report.grounds).toContainEqual(expect.objectContaining({
       reference: report.findings[0].messageId, content: { analysis: "Independent whole-object review" },
     }));
@@ -196,7 +193,9 @@ for (const [action, window, verdict] of [
     const delivered = f.sent.filter(item => item.message.customType === "pitako.worker.result");
     expect(delivered).toHaveLength(1);
     expect(delivered[0].message.details.status).toBe("cancelled");
-    expect(JSON.parse(delivered[0].message.content)).toEqual(report);
+    const automatic = JSON.parse(delivered[0].message.content);
+    if (automatic.header.complete) expect(automatic.report.judgment).toBeNull();
+    else expect(automatic.notice).toContain("team_result");
     expect(teamWorkerStatus(f.evaluation.token, handle.instanceId)[0]!.closure.state).toBe("released");
     expect(firstTeamReservation(f.evaluation, "reviewer")).toBeUndefined();
     await diagnosticFor(f, handle);
@@ -231,10 +230,10 @@ for (const verdict of ["changes-required", "inconclusive"] as const) test(`compl
   } });
   try {
     const { details: handle } = await f.invoke("review_start", start); await f.delivered.promise;
-    const result = reportFor(f, handle), report = JSON.parse(result.result);
-    expect(result.status).toBe("completed"); expect(report.verdict).toBe(verdict); expect(report.findings).toHaveLength(2);
-    expect(report.dispositions).toHaveLength(2);
-    expect(new Set(report.dispositions.map((item: any) => item.findingId))).toEqual(new Set(report.findings.map((item: any) => item.id)));
+    const result = reportFor(f, handle), report = result.report;
+    expect(result.status).toBe("completed"); expect(report.judgment.verdict).toBe(verdict); expect(report.findings).toHaveLength(2);
+    expect(report.judgment.dispositions).toHaveLength(2);
+    expect(new Set(report.judgment.dispositions.map((item: any) => item.findingId))).toEqual(new Set(report.findings.map((item: any) => item.id)));
     expect(report.findings.find((item: any) => item.key === "director-blocker").author).toBe("reviewer");
   } finally { await f.close(); }
 });
@@ -276,17 +275,17 @@ for (const failure of ["invalid-synthesis", "drift", "observation-failure"] as c
     mkdirSync(path.join(f.root, ".pitako/plans"), { recursive: true });
     writeFileSync(path.join(f.root, ".pitako/plans/object.md"), "---\nid: object\nrevision: 1\nstatus: draft\n---\nOriginal substantive object\n");
     const { details: handle } = await f.invoke("review_start", { ...start, object: { kind: "plan", planId: "object" } }); await f.delivered.promise;
-    const result = reportFor(f, handle), report = JSON.parse(result.result);
-    expect(result.status).toBe("failed"); expect(report.verdict).toBe("inconclusive"); expect(report.findings).toHaveLength(1);
+    const result = reportFor(f, handle), report = result.report;
+    expect(result.status).toBe("failed"); expect(report.judgment?.verdict ?? "inconclusive").toBe("inconclusive"); expect(report.findings).toHaveLength(1);
     expect(report.findings[0].objectIdentity).toBe(report.object.identity);
     expect(report.findings[0]).toMatchObject(finding);
     expect(report.missingValidSynthesis).toBe(failure === "invalid-synthesis");
-    if (failure === "invalid-synthesis") expect(report.dispositions).toBeNull();
+    if (failure === "invalid-synthesis") expect(report.judgment).toBeNull();
     else if (failure === "drift") expect(report.observations.final).not.toBe(report.object.identity);
     else expect(report.observations.error).toContain("plan is missing frontmatter");
     expect(result.result).not.toContain("Original substantive object");
     await diagnosticFor(f, handle);
-    expect((await journalFor(f, handle)).some(message => message.body.findings?.[0]?.key === finding.key)).toBe(true);
+    expect((await journalFor(f, handle)).some((message: { body: { findings?: { key: string }[] } }) => message.body.findings?.[0]?.key === finding.key)).toBe(true);
   } finally { await f.close(); }
 });
 
@@ -306,13 +305,13 @@ test("round publication is atomic in composition order; finish drains current wo
   } });
   try {
     const { details: handle } = await f.invoke("review_start", start); await first.promise; await second.promise;
-    const read = (await f.invoke("review_read", { roomId: handle.roomId })).details;
-    expect(read.fragments.map((item: any) => item.text).join("")).not.toContain('"kind":"preparation"');
+    const read = await journalFor(f, handle);
+    expect(read.some((item: any) => item.stage === "preparation")).toBe(false);
     await f.invoke("review_control", { roomId: handle.roomId, action: "priorities", text: "Focus retained evidence" });
     await f.invoke("review_control", { roomId: handle.roomId, action: "finish" });
     expect(f.sent).toHaveLength(0); release.resolve(); await f.delivered.promise;
-    const report = JSON.parse(reportFor(f, handle).result);
-    expect(report.completion).toBe("partial"); expect(report.verdict).toBe("inconclusive");
+    const report = reportFor(f, handle).report;
+    expect(report.judgment.completion).toBe("partial"); expect(report.judgment.verdict).toBe("inconclusive");
     expect(report.findings.map((item: any) => item.key)).toEqual(["first", "second"]);
     expect((await journalFor(f, handle)).filter((item: any) => item.stage === "preparation")).toHaveLength(3);
     expect(report.failures).toContain("Finish truncated scheduled review work");
@@ -328,9 +327,9 @@ test("failed director preparation does not erase valid peers or become complete 
   } });
   try {
     const { details: handle } = await f.invoke("review_start", start); await f.delivered.promise;
-    const report = JSON.parse(reportFor(f, handle).result);
-    expect(reportFor(f, handle).status).toBe("failed"); expect(report.completion).toBe("partial");
-    expect(report.findings).toHaveLength(1); expect(report.dispositions).toHaveLength(1);
+    const report = reportFor(f, handle).report;
+    expect(reportFor(f, handle).status).toBe("failed"); expect(report.judgment.completion).toBe("partial");
+    expect(report.findings).toHaveLength(1); expect(report.judgment.dispositions).toHaveLength(1);
     expect(report.failures.some((error: string) => error.includes("no valid settled submit"))).toBe(true);
     expect(f.host.sessions).toHaveLength(2);
   } finally { await f.close(); }
@@ -358,8 +357,8 @@ test("recomposition joins outgoing specialists and independently prepares newcom
     release.resolve(); await f.delivered.promise;
     expect(f.host.sessions).toHaveLength(3);
     expect(f.host.sessions.find(session => session.model?.id === "general")!.prompts.map((text: string) => JSON.parse(text).stage)).toContain("preparation");
-    const report = JSON.parse(reportFor(f, handle).result);
-    expect(report.completion).toBe("complete"); expect(report.findings).toHaveLength(1); expect(report.dispositions).toHaveLength(1);
+    const report = reportFor(f, handle).report;
+    expect(report.judgment.completion).toBe("complete"); expect(report.findings).toHaveLength(1); expect(report.judgment.dispositions).toHaveLength(1);
   } finally { release.resolve(); await f.close(); }
 });
 
@@ -371,8 +370,8 @@ test("prohibited sixth round is not disguised as complete work", async () => {
     const { details: handle } = await f.invoke("review_start", start); await f.delivered.promise;
     expect(f.seen.filter(item => item.request.stage === "contribution")).toHaveLength(10);
     expect(f.seen.every(item => (item.request.round ?? 0) <= 5)).toBe(true);
-    const report = JSON.parse(reportFor(f, handle).result);
-    expect(reportFor(f, handle).status).toBe("failed"); expect(report.completion).toBe("failed");
+    const report = reportFor(f, handle).report;
+    expect(reportFor(f, handle).status).toBe("failed"); expect(report.judgment).toBeNull();
     expect(report.missingValidSynthesis).toBe(true);
   } finally { await f.close(); }
 });
@@ -415,15 +414,15 @@ test("dependent support can interpret prerequisite answers without unrelated del
     expect(reportFor(f, handle).status).toBe("completed");
     const dependent = f.seen.filter(item => item.request.stage === "consultation-response")[1]!.request;
     const journal = await journalFor(f, handle);
-    const preparation = journal.find(message => message.body?.doubts?.length === 3);
+    const preparation = journal.find((message: { body?: { doubts?: unknown[] } }) => message.body?.doubts?.length === 3);
     const [expiry, interpretation] = preparation.doubts;
     expect(dependent.authorization.doubtIds).toEqual([interpretation.id]);
     expect(dependent.context.request.doubtIds).toEqual([interpretation.id]);
     expect(dependent.context.doubts).toEqual([expiry, interpretation]);
     expect(dependent.context.prerequisites).toHaveLength(1);
     const prerequisite = dependent.context.prerequisites[0];
-    const response = journal.find(message => message.body?.kind === "consultation-response" && message.body.answer === "Yes");
-    const boundary = journal.find(message => message.kind === "knowledge-boundary");
+    const response = journal.find((message: { body?: { kind: string; answer?: string } }) => message.body?.kind === "consultation-response" && message.body.answer === "Yes");
+    const boundary = journal.find((message: { kind?: string }) => message.kind === "knowledge-boundary");
     expect(prerequisite).toMatchObject({ status: "completed", message: {
       id: response.id, author: response.author, memberId: response.memberId, body: response.body,
     } });
@@ -470,17 +469,18 @@ test("delivered grounds follow A to B to C with own-only support citations, excl
   } });
   try {
     const { details: handle } = await f.invoke("review_start", start); await f.delivered.promise;
-    const saved = reportFor(f, handle), report = JSON.parse(saved.result);
+    const saved = reportFor(f, handle), report = saved.report;
     expect(saved.status).toBe("completed");
-    expect(report).toMatchObject({ completion: "complete", verdict: "no-blockers", missingValidSynthesis: false });
+    expect(report.judgment).toMatchObject({ completion: "complete", verdict: "no-blockers" });
+    expect(report.missingValidSynthesis).toBe(false);
     const journal = await journalFor(f, handle);
-    const knowledge = journal.find(item => item.stage === "knowledge");
+    const knowledge = journal.find((item: { stage?: string }) => item.stage === "knowledge");
     expect(knowledge.body.resolutions.map((item: any) => item.supportIds.length)).toEqual([1, 1, 1, 1]);
-    const boundary = journal.find(item => item.kind === "knowledge-boundary");
+    const boundary = journal.find((item: { kind?: string }) => item.kind === "knowledge-boundary");
     expect(boundary.resolutions.map((item: any) => item.provenance.responses.length)).toEqual([1, 1, 1, 1]);
-    const preparation = journal.find(item => item.body?.analysis === "PRIVATE-CHAIN-ANALYSIS");
+    const preparation = journal.find((item: { body?: { analysis?: string } }) => item.body?.analysis === "PRIVATE-CHAIN-ANALYSIS");
     for (const index of [0, 1, 2]) {
-      const response = journal.find(item => item.body?.answer === `Chain answer ${labels[index]}`);
+      const response = journal.find((item: { body?: { answer?: string } }) => item.body?.answer === `Chain answer ${labels[index]}`);
       const consultationId = boundary.resolutions[index].provenance.consultationId;
       expect(report.grounds).toContainEqual({
         reference: doubtIds[index], messageId: preparation.id, memberId: preparation.memberId,
@@ -498,7 +498,7 @@ test("delivered grounds follow A to B to C with own-only support citations, excl
     for (const marker of ["Chain question D?", "Chain purpose D", "Chain answer D", "Chain confirmed D",
       "PRIVATE-CHAIN-ANALYSIS", '"messages"', '"native"', '"attemptId"', '"turnId"', '"snapshotId"'])
       expect(serialized).not.toContain(marker);
-    expect(journal.some(item => item.body?.answer === "Chain answer D")).toBe(true);
+    expect(journal.some((item: { body?: { answer?: string } }) => item.body?.answer === "Chain answer D")).toBe(true);
     expect(f.seen.every(item => !item.receipt.isError)).toBe(true);
     expect(f.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
     await diagnosticFor(f, handle);
@@ -559,7 +559,7 @@ test("support capacity includes retained disposal and dependencies consume only 
     releaseDispose.resolve(); await f.delivered.promise;
     expect(calls).toBe(3); expect(active).toBe(0); expect(maxActive).toBe(2);
     expect(reportFor(f, handle).status).toBe("completed");
-    const report = JSON.parse(reportFor(f, handle).result);
+    const report = reportFor(f, handle).report;
     expect(report.findings).toHaveLength(1);
     expect(report.grounds.filter((item: any) => item.stage === "consultation-response")).toHaveLength(2);
     expect(report.grounds.filter((item: any) => item.stage === "consultation-response").every((item: any) =>
@@ -603,7 +603,7 @@ test("plan prompts identify private capture for local exploration, retaining the
       expect(exploration).not.toContain("private worker log");
       expect(request.object.limits.join(" ")).toContain("not transactional");
     }
-    const report = JSON.parse(reportFor(f, handle).result);
+    const report = reportFor(f, handle).report;
     expect(report.observations).toEqual({ launch: captured.identity, final: captured.identity, error: null });
     expect(report.object).toEqual(describeObject(captured));
     expect(reportFor(f, handle).result).not.toContain(marker);
@@ -649,8 +649,8 @@ test("diff prompts carry captured endpoints while participants explore commits, 
       expect(found.committed).toContain(markers[0]!); expect(found.staged).toContain(markers[1]!);
       expect(found.dirty).toBe(markers[2]!); expect(found.untracked).toBe(markers[3]!); expect(found.deleted).toBe("deleted");
     }
-    expect(JSON.parse(reportFor(f, handle).result).observations.final).toBe(captured.identity);
-    expect(JSON.parse(reportFor(f, handle).result).object).toEqual(describeObject(captured));
+    expect(reportFor(f, handle).report.observations.final).toBe(captured.identity);
+    expect(reportFor(f, handle).report.object).toEqual(describeObject(captured));
     for (const marker of markers) {
       expect(reportFor(f, handle).result).not.toContain(marker);
       expect(reportFor(f, handle).result).not.toContain(Buffer.from(marker).toString("base64"));
@@ -701,15 +701,15 @@ test("review responses use published finding IDs with author content and synthes
   try {
     const { details: handle } = await f.invoke("review_start", start); await f.delivered.promise;
     expect(reportFor(f, handle).status).toBe("completed");
-    const report = JSON.parse(reportFor(f, handle).result);
+    const report = reportFor(f, handle).report;
     expect(report.findings.map((item: any) => item.key)).toEqual(["authority", "duplicate", "nonblocker", "synthesis-dissent"]);
     expect(report.findings[0].id).toBe(publishedId);
-    expect(report.responses).toHaveLength(4); expect(report.dispositions[0].status).toBe("withdrawn");
+    expect(report.responses).toHaveLength(4); expect(report.judgment.dispositions[0].status).toBe("withdrawn");
     expect(report.responses.filter((item: any) => item.action === "object")).toHaveLength(2);
     expect(report.responses.every((item: any) => item.reason && item.evidence[0] === "source:42")).toBe(true);
-    expect(report.dispositions.map((item: any) => item.status)).toEqual(["withdrawn", "duplicate", "rejected", "unresolved"]);
-    expect(report.dispositions.map((item: any) => item.findingId)).toEqual(report.findings.map((item: any) => item.id));
-    expect(report.synthesis).toMatchObject({ evidence: ["source:42"], limits: ["Bounded controlled observation"],
+    expect(report.judgment.dispositions.map((item: any) => item.status)).toEqual(["withdrawn", "duplicate", "rejected", "unresolved"]);
+    expect(report.judgment.dispositions.map((item: any) => item.findingId)).toEqual(report.findings.map((item: any) => item.id));
+    expect(report.judgment.synthesis).toMatchObject({ evidence: ["source:42"], limits: ["Bounded controlled observation"],
       pending: ["Optional follow-up on nonblocking dissent"] });
     const source = f.seen.find(item => item.request.stage === "synthesis")!.request.context.messages;
     const director = source.find((message: any) => message.stage === "contribution" && message.author === "reviewer");

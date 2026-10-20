@@ -231,6 +231,30 @@ function planNotFound(id: string, file: string, searchedWorktrees = true): Pitak
   return new PitakoConfigError(`PLAN_NOT_FOUND: frozen plan "${id}" not found at ${file}${scope}`);
 }
 
+/** Observe existing execution authority without creating a ledger or adopting a legacy one. */
+export function readExecutionBinding(id: string, cwd = process.cwd()): ExecutionBinding | undefined {
+  assertPlanId(id);
+  const executionRoot = currentWorkspace(cwd);
+  const existing = readLedgerEntry(ledgerFile(id, executionRoot));
+  const commonDir = repositoryIdentity(executionRoot);
+  if (commonDir !== executionRoot) assertNoCompetingLedgers(executionRoot, commonDir, id);
+  if (existing === undefined) return undefined;
+  const saved = parseLedgerBinding(existing);
+  if (saved.planId !== id) throw new PitakoConfigError(`ledger plan id ${saved.planId} does not match ${id}`);
+  if (saved.executionRoot === undefined && saved.planSource === undefined) {
+    const mismatch = bindingMismatch(readFrozenPlan(id, executionRoot).meta, saved);
+    if (mismatch) throw new PitakoConfigError(mismatch);
+    return undefined;
+  }
+  if (!saved.executionRoot || !saved.planSource) throw new PitakoConfigError("ledger execution binding is incomplete");
+  if (saved.executionRoot !== executionRoot) {
+    throw new PitakoConfigError(`execution worktree changed: ledger is pinned to ${saved.executionRoot}, current worktree is ${executionRoot}`);
+  }
+  const binding = { planId: saved.planId, revision: saved.revision, hash: saved.hash, executionRoot: saved.executionRoot, planSource: saved.planSource };
+  readPinnedPlan(binding, commonDir);
+  return binding;
+}
+
 /** Open the execution-root ledger before resolving its pinned source. */
 export function openExecutionPlan(
   id: string,

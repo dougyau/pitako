@@ -363,11 +363,7 @@ test("Node roster preserves failed specialists, supports, boundaries and recompo
     expect(held.records.filter((r: any) => r.kind === "control").map((r: any) => [r.order, r.author.toolCallId, r.application.state])).toEqual([[1, "architecture_control-call", "applied"], [2, "architecture_control-call", "applied"]]);
     expect(held.records.some((r: any) => r.kind === "failure" && r.phase === "turn")).toBe(true);
     const publications = held.records.filter((r: any) => r.kind === "publication");
-    let localCursor: string | undefined; const local = new Map<string, string>();
-    do { const page = await s.invoke("architecture_read", { roomId: start.details.roomId, ...(localCursor ? { cursor: localCursor } : {}) });
-      for (const fragment of page.details.fragments) local.set(fragment.messageId, (local.get(fragment.messageId) ?? "") + fragment.text); localCursor = page.details.cursor ?? undefined;
-    } while (localCursor);
-    const registered = [...local.values()].map(text => JSON.parse(text));
+    const registered = (await s.read("architecture_read", { roomId: start.details.roomId })).messages;
     expect(held.records.filter((r: any) => ["publication", "knowledge-boundary"].includes(r.kind)).map((r: any) => r.message ?? r)).toEqual(registered);
     expect(held.records.filter((r: any) => r.kind === "knowledge-boundary")).toHaveLength(2);
     expect(publications.every((r: any) => r.message.native.persistence === "unconfirmed")).toBe(true);
@@ -619,7 +615,8 @@ test("published Node reader and local immutable cuts retain ten ordered resoluti
     const start = await s.invoke("architecture_start", { goal: "Nine direct plus one delegated" }); await entered.promise;
     bridge = await bridgeFor(s); const ref = (await bridge.node.call("listArchitectures")).items[0].ref;
     const first = await bridge.node.call("readArchitecture", ref); expect(first.next).toBeString();
-    const localFirst = (await s.invoke("architecture_read", { roomId: start.details.roomId })).details; expect(localFirst.cursor).toBeString();
+    const localFirst = await s.invoke("architecture_read", { roomId: start.details.roomId });
+    expect(JSON.parse(localFirst.content[0].text).header.cursor).toBeString();
     release.resolve(); await s.delivered.promise;
     const frozen: any[] = [], chunks = new Map<string, Buffer[]>(); let page = first;
     for (;;) {
@@ -642,15 +639,9 @@ test("published Node reader and local immutable cuts retain ten ordered resoluti
     expect(boundary.knowledgeMessageId).toBe(knowledge.id);
     expect(boundary.resolutions[9].provenance).toEqual({ kind: "delegated", knowledgeMessageId: knowledge.id, consultationId: authored.resolutions[0].supportIds[0],
       responses: [{ consultationId: authored.resolutions[0].supportIds[0], assignmentId: support.assignmentId, messageId: support.id, status: "completed" }] });
-    const local = new Map<string, string>(); let localPage = localFirst;
-    for (;;) {
-      expect(localPage.cut).toBe(localFirst.cut);
-      for (const fragment of localPage.fragments) { const prior = local.get(fragment.messageId) ?? ""; expect(fragment.offset).toBe(prior.length); local.set(fragment.messageId, prior + fragment.text); }
-      if (!localPage.cursor) break;
-      localPage = (await s.invoke("architecture_read", { roomId: start.details.roomId, cursor: localPage.cursor })).details;
-    }
-    const records = [...local.values()].map(text => JSON.parse(text)); expect(records.find(r => r.kind === "knowledge-boundary")).toEqual(boundary);
-    expect(records.some(r => r.stage === "synthesis")).toBe(false);
+    const records = (await s.read("architecture_read", { roomId: start.details.roomId }, localFirst)).messages;
+    expect(records.find((r: any) => r.kind === "knowledge-boundary")).toEqual(boundary);
+    expect(records.some((r: any) => r.stage === "synthesis")).toBe(false);
     const final = await readAll(bridge.node, ref); expect(final.records.find((r: any) => r.message?.stage === "synthesis").message.body.status).toBe("complete");
   } finally { release.resolve(); await bridge?.close(); await s.close(); }
 }));

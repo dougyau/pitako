@@ -523,8 +523,35 @@ describe("Team T1 ownership", () => {
       expect(firstAssignment.content[0].text).toContain(firstAssignment.details[key]);
     }
     expect((await invoke("team_status", { teamId: overlap.details.teamId, memberId: overlap.details.memberId })).details.members).toHaveLength(1);
-    expect((await invoke("team_status", { teamId: "foreign", memberId: overlap.details.memberId })).isError).toBe(true);
-    expect((await invoke("team_status", { assignmentId: firstAssignment.details.id, memberId: overlap.details.memberId })).isError).toBe(true);
+    for (const [params, message] of [
+      [{ teamId: "foreign", memberId: overlap.details.memberId }, "unknown Team"],
+      [{ assignmentId: firstAssignment.details.id, memberId: overlap.details.memberId }, "unknown Team member or incompatible filters"],
+    ] as const) {
+      expect(await invoke("team_status", params)).toEqual({
+        content: [{ type: "text", text: `Error: ${message}` }], details: { error: message }, isError: true,
+      });
+    }
+    expect(await invoke("team_result", { assignmentId: firstAssignment.details.id })).toEqual({
+      content: [{ type: "text", text: "Error: worker is still running" }],
+      details: { error: "worker is still running" }, isError: true,
+    });
+    const unknown = "foreign".repeat(1000);
+    expect(await invoke("team_result", { assignmentId: unknown })).toEqual({
+      content: [{ type: "text", text: `Error: unknown Team assignment ${unknown}` }],
+      details: { error: `unknown Team assignment ${unknown}` }, isError: true,
+    });
+    const paging = await invoke("team_result", { assignmentId: firstAssignment.details.id, cursor: unknown });
+    expect(paging.details).toEqual({ table: true });
+    expect(paging.isError).toBe(true);
+    expect(JSON.parse(paging.content[0].text).error).toBe("table_request_failed");
+    expect(Buffer.byteLength(JSON.stringify(paging), "utf8")).toBeLessThanOrEqual(4096);
+    for (const name of ["team_status", "team_result"]) {
+      const noSession = await tools.get(name)!.execute("call", { assignmentId: unknown }, undefined, undefined, { cwd });
+      expect(noSession).toEqual({
+        content: [{ type: "text", text: "Error: Team requires a foreground session identity" }],
+        details: { error: "Team requires a foreground session identity" }, isError: true,
+      });
+    }
     const views = await invoke("team_status", {});
     expect((views.details as any).members.map((row: any) => row.status)).toEqual(["failed", "running", "running", "running"]);
     const developer = teamAssignments(current).find(member => member.id === firstAssignment.details.id);
@@ -574,7 +601,12 @@ describe("Team T1 ownership", () => {
     expect(cancelled.isError).toBe(false);
     const reviewer = teamAssignments(current).find(member => member.id === cancelled.details.id)!;
     await workers.at(-1)!.started;
-    expect((await invoke("team_cancel", { assignmentId: reviewer.id })).isError).toBe(false);
+    const cancelResult = await invoke("team_cancel", { assignmentId: reviewer.id });
+    expect(cancelResult.isError).toBe(false);
+    expect(cancelResult.details).toMatchObject({ assignmentId: reviewer.id, instanceId: reviewer.instanceId,
+      status: "cancelled", closure: { state: "pending" } });
+    expect(JSON.parse(cancelResult.content[0].text)).toEqual(cancelResult.details);
+    expect(cancelResult.details).not.toHaveProperty("table");
     const cancelledStatus = await invoke("team_status", { assignmentId: reviewer.id });
     expect((cancelledStatus.details as any).members[0]).toMatchObject({ status: "cancelled", resultAvailable: false });
     workers.at(-1)!.finish({ status: "cancelled", result: "cancelled", sideEffects: false });

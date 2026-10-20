@@ -14,6 +14,7 @@ import { createParticipant } from "./participant.ts";
 import { submitSchema as reviewSchema, type TableBody, type TableMessage as Message } from "../review/types.ts";
 import { validateReview, type ReviewGrant, type ReviewPolicy } from "../review/policy.ts";
 import { describeObject } from "../review/object.ts";
+import type { TableSemanticReport } from "./results.ts";
 import { immutable, mergeKnowledge, validateSubmission, type StageGrant, type KnowledgeBoundary, type StageRules, type ConsultationResponse, type Plan, type Knowledge } from "../architecture/protocol.ts";
 
 type Team = ReturnType<typeof createTeam>;
@@ -28,6 +29,8 @@ export function createTable(input: { team: Team; config: PitakoConfig; goal: str
   const failures: { memberId: string; stage: Stage; round: number; error: string }[] = [];
   const appliedControls: { action: string; text?: string }[] = [];
   const protocol = input.review ? "review" : "architecture", rootId = input.review ? "reviewer" : "architect";
+  let authorizedSynthesis = false;
+  let reportReasons: string[] = [];
   const resultMessage = (message: Message) => {
     const body = { ...message.body,
       ...("doubts" in message.body ? { doubts: message.doubts } : {}),
@@ -375,6 +378,19 @@ export function createTable(input: { team: Team; config: PitakoConfig; goal: str
   });
   return {
     snapshot, architecture: rootArchitecture, table: rootArchitecture,
+    semantic(): TableSemanticReport {
+      if (input.review) {
+        const { synthesis, dispositions, completion, verdict, ...facts } =
+          input.review.report(messages, reportReasons, stopping, pendingDoubts, boundaries);
+        return { ...facts, protocol: "review", modelObservations: structuredClone(modelObservations),
+          judgment: authorizedSynthesis ? { synthesis, dispositions, completion, verdict } : null };
+      }
+      return { protocol: "architecture", goal: input.goal,
+        judgment: authorizedSynthesis ? messages.filter(message => message.body.kind === "synthesis").at(-1)!.body : null,
+        failures: structuredClone(failures), pending: structuredClone(pendingDoubts),
+        limits: messages.flatMap(message => "limits" in message.body ? message.body.limits : []),
+        observations: structuredClone(modelObservations) };
+    },
     control(action: "context" | "priorities" | "finish" | "stop", text?: string, toolCallId?: string) {
       if (state === "finished" || state === "failed" || state === "cancelled") throw new Error(`${protocol} room is terminal`);
       if (action === "stop") { stopping = true; director.revoke(); cancelTeamWorker(input.team.evaluation.token, input.root.instanceId); }
@@ -384,28 +400,11 @@ export function createTable(input: { team: Team; config: PitakoConfig; goal: str
       else if (controls.length) controls[controls.length - 1]!.captureId = id;
       return { roomId: input.team.teamId, state: stopping ? "stopping" : state };
     },
-    read(cursor?: string) {
-      let cut = publications.length, index = 0, offset = 0;
-      if (cursor) {
-        let parsed: unknown;
-        try { parsed = JSON.parse(Buffer.from(cursor, "base64url").toString()); } catch { throw new Error(`invalid ${protocol} cursor`); }
-        if (!Array.isArray(parsed) || parsed.length !== 5 || parsed[0] !== snapshotId || parsed[4] !== 1 || !parsed.slice(1).every(Number.isSafeInteger)) throw new Error(`invalid ${protocol} cursor`);
-        [, cut, index, offset] = parsed as [string, number, number, number, number];
-        if (cut < 0 || cut > publications.length || index < 0 || index > cut || offset < 0) throw new Error(`invalid ${protocol} cursor`);
-      }
-      const fragments: { messageId: string; offset: number; text: string; complete: boolean }[] = [];
-      let budget = 16384;
-      while (index < cut && budget > 0) {
-        const message = publications[index]!, serialized = JSON.stringify(message);
-        if (offset > serialized.length) throw new Error(`invalid ${protocol} cursor`);
-        const text = serialized.slice(offset, offset + budget), complete = offset + text.length === serialized.length;
-        fragments.push({ messageId: message.id, offset, text, complete }); budget -= text.length;
-        if (complete) { ++index; offset = 0; } else offset += text.length;
-      }
-      const root = teamWorkerStatus(input.team.evaluation.token, input.root.instanceId)[0];
-      return { roomId: input.team.teamId, state, stage, round, pendingDoubts: structuredClone(pendingDoubts), failures: structuredClone(failures), snapshot: structuredClone(snapshot), cut, fragments,
-        cursor: index < cut ? Buffer.from(JSON.stringify([snapshotId, cut, index, offset, 1])).toString("base64url") : null,
-        members: teamAssignments(input.team.evaluation).filter(member => member.teamId === input.team.teamId), closure: root?.closure,
+    diagnostic() {
+      return { roomId: input.team.teamId, state, stage, round, pending: structuredClone(pendingDoubts),
+        failures: structuredClone(failures), snapshot: structuredClone(snapshot), messages: structuredClone(publications),
+        controls: structuredClone(appliedControls),
+        members: teamAssignments(input.team.evaluation).filter(member => member.teamId === input.team.teamId),
         delivery: intermediateReceipts(input.team.evaluation.token, input.root.instanceId) };
     },
     async run(lifetime: AbortSignal): Promise<AgentRunResult> {
@@ -435,6 +434,7 @@ export function createTable(input: { team: Team; config: PitakoConfig; goal: str
           controls: [...appliedControls, ...consumeControls()] });
         if (synthesis.message.body.kind !== "synthesis") throw new Error("invalid synthesis");
         const body = synthesis.message.body;
+        authorizedSynthesis = true;
         if (input.review && "completion" in body) {
           input.review.reobserve();
           const report = input.review.report(messages, reviewReasons, false, pendingDoubts, boundaries);
@@ -445,6 +445,7 @@ export function createTable(input: { team: Team; config: PitakoConfig; goal: str
         } else throw new Error("host table synthesis policy mismatch");
       } catch (error) {
         architectureFailure(input.observation, "turn", error, { stage: stage === "closing" ? undefined : stage, round });
+        if (stage !== "closing") failures.push({ memberId: input.root.memberId, stage, round, error: String(error) });
         result = { ...lastRootResult ?? result, status: stopping || signal.aborted ? "cancelled" : "failed", result: String(error) };
         reviewReasons.push(String(error));
         if (input.review) result.result = JSON.stringify({ ...input.review.report(messages, [...reviewReasons, ...failures.map(item => item.error)],
@@ -465,6 +466,7 @@ export function createTable(input: { team: Team; config: PitakoConfig; goal: str
         finally { signal.removeEventListener("abort", aborted); }
       }
       state = result.status === "completed" ? "finished" : result.status;
+      reportReasons = reviewReasons;
       progress();
       return result;
     },
