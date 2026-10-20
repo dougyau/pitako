@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { setBackgroundExecutor, readBackgroundPending, clearBackgroundOwner, workerHandoff, bindBackgroundOwner, cancelTeamWorker, spawnBackground, teamWorkerStatus, reserveBackground, observeWorkerResults } from "../extensions/agent/background.ts";
+import { setBackgroundExecutor, readBackgroundPending, clearBackgroundOwner, workerHandoff, bindBackgroundOwner, cancelTeamWorker, finishTeamWorker, spawnBackground, teamWorkerStatus, reserveBackground, observeWorkerResults } from "../extensions/agent/background.ts";
 import { AgentClosureError } from "../extensions/agent/closure.ts";
 import { createPiExecutor } from "../extensions/agent/pi.ts";
 import { HeadAttachment } from "../extensions/agent/head/runtime.ts";
@@ -16,6 +16,7 @@ import { architectureFixture } from "./fixtures/architecture.ts";
 import { openBoard } from "../extensions/board/store.ts";
 import { planFile, readLedgerTeamHolds } from "../extensions/workflow.ts";
 import { controlledPi } from "./fixtures/pi-factories.ts";
+import { jsonBytes } from "../extensions/table/results.ts";
 
 // Unknown reservations live for the host lifetime; never clear them to admit another case.
 function unknownTest(name: string, body: () => Promise<void>) {
@@ -355,7 +356,7 @@ unknownTest("registered table replacement with rejected outgoing disposal retain
     expect(room.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
     expect(firstTeamReservation(room.evaluation, "architect")).toBe(handle.assignmentId);
     expect(readLedgerTeamHolds(env.root, "unknown-table")).toHaveLength(1);
-    const status = (await room.invoke("architecture_read", { roomId: handle.roomId })).details;
+    const status = await room.read("architecture_read", { roomId: handle.roomId });
     expect(status.state).toBe("closure-unknown"); expect(status.closure.state).toBe("unknown");
     expect(status.closure.reason).toContain("table outgoing disposal rejected");
     const child = teamWorkerStatus(room.evaluation.token).find(row => row.instanceId !== handle.instanceId)!;
@@ -379,6 +380,74 @@ unknownTest("registered table replacement with rejected outgoing disposal retain
     expect(() => readBackgroundPending({ ...scope, ownerToken: Symbol("not-admitted") })).toThrow("stale_owner");
   } finally {
     unsubscribe();
+    await Promise.allSettled([room.emit("session_shutdown"), retireTeamEvaluation(room.evaluation)]);
+    clearBackgroundOwner(); setBackgroundExecutor(undefined);
+    retained.push(room); env.release(true);
+  }
+});
+
+unknownTest("public Team cancel bounds a retained table root without losing its long close diagnostic or releasing ownership", async () => {
+  const env = setup(), disposing = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const diagnostic = 'controlled root close: \u0000"\\雪😀'.repeat(2048);
+  const room = await architectureFixture().setup({ root: env.root,
+    async dispose(session) {
+      if (session.model?.id === "director") {
+        disposing.resolve();
+        await release.promise;
+        throw new Error(diagnostic);
+      }
+    },
+  });
+  let handle: any;
+  try {
+    const oversizedTarget = 'unknown-target-\u0000"\\雪😀'.repeat(4096);
+    for (const assignmentId of [oversizedTarget, "", null, 42]) {
+      const error = await room.invoke("team_cancel", { assignmentId });
+      expect(error.isError).toBe(true);
+      expect(jsonBytes(error)).toBeLessThanOrEqual(4096);
+      expect(error.details).toEqual({ table: true });
+      expect(JSON.stringify(error)).not.toContain(oversizedTarget);
+    }
+    const db = await openBoard();
+    const topic = db.createTopic(env.root, { title: "Retained root cancel" });
+    db.claimTopic(env.root, topic.id, "cancel-root"); db.close();
+    const file = planFile("cancel-root", env.root); mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, `---\nid: cancel-root\nrevision: 1\nstatus: frozen\nboard_topic_id: ${topic.id}\n---\nRoot cancellation.\n`);
+    const start = await room.invoke("architecture_start", { goal: "Close root", plan: "cancel-root", unit: "T1" });
+    expect(start.isError).not.toBe(true); handle = start.details;
+    await disposing.promise;
+    // The control returns while close is still blocked, not an acknowledgement of release.
+    const pending = await room.invoke("team_cancel", { assignmentId: handle.assignmentId });
+    expect(pending.isError).not.toBe(true);
+    expect(teamWorkerStatus(room.evaluation.token, handle.instanceId)[0]?.closure).toEqual({ state: "pending" });
+    expect(firstTeamReservation(room.evaluation, "architect")).toBe(handle.assignmentId);
+    release.resolve();
+    await expect(finishTeamWorker(room.evaluation.token, handle.instanceId)).rejects.toThrow(diagnostic);
+    expect(teamEvaluationForSession(room.evaluation.sessionId, false)?.token).toBe(room.evaluation.token);
+    const original = await room.invoke("team_cancel", { assignmentId: handle.assignmentId });
+    const view = teamWorkerStatus(room.evaluation.token, handle.instanceId)[0]!;
+    expect(view.closure.state).toBe("unknown");
+    const reason = view.closure.state === "unknown" ? view.closure.reason : "";
+    expect(reason).toContain(diagnostic);
+    const cut = await room.read("architecture_read", { roomId: handle.roomId });
+    expect(cut.closure).toEqual({ state: "unknown", reason });
+    expect(teamWorkerStatus(room.evaluation.token, handle.instanceId)[0]?.closure).toEqual(cut.closure);
+    expect(firstTeamReservation(room.evaluation, "architect")).toBe(handle.assignmentId);
+    expect(readLedgerTeamHolds(env.root, "cancel-root")).toHaveLength(1);
+    expect(readBackgroundPending({ ownerToken: room.evaluation.token, coordinatorSessionId: room.evaluation.sessionId })).toEqual({ state: "pending" });
+    expect((await room.invoke("team_result", { assignmentId: handle.assignmentId })).isError).toBe(true);
+    expect(workerHandoff(handle.instanceId)).toBeUndefined();
+    expect(room.branch).toEqual([]); expect(room.sent).toEqual([]);
+    // Measure the produced object intact: content, details and flags together.
+    console.log("PUBLIC_TABLE_CANCEL_ORIGINAL_BYTES", jsonBytes(original));
+    expect(jsonBytes(original)).toBeLessThanOrEqual(4096);
+    expect(jsonBytes(pending)).toBeLessThanOrEqual(4096);
+    expect(original.details).toMatchObject({ table: true, assignmentId: handle.assignmentId,
+      teamId: handle.teamId, memberId: handle.memberId, closure: "unknown", resultAvailable: false });
+    expect(JSON.stringify(original)).not.toContain("controlled root close");
+  } finally {
+    release.resolve();
+    if (handle) await Promise.allSettled([finishTeamWorker(room.evaluation.token, handle.instanceId)]);
     await Promise.allSettled([room.emit("session_shutdown"), retireTeamEvaluation(room.evaluation)]);
     clearBackgroundOwner(); setBackgroundExecutor(undefined);
     retained.push(room); env.release(true);

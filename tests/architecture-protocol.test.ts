@@ -10,6 +10,8 @@ const submit = (session: any, id: string, body: any) => session.boundTools.get("
 const doubt = (index: number) => ({ question: `Question ${index}`, purpose: "Original coverage" });
 const response = (request: any) => ({ kind: "consultation-response", doubtIds: request.context.request.doubtIds, answer: "Evidence", evidence: [], limits: [], doubts: [] });
 const contribution = { kind: "contribution", proposal: "Bounded design", arguments: [], objections: [], doubts: [] };
+type LocalRecord = { id: string; stage?: string; kind?: string; author?: string;
+  body?: { resolutions?: { doubtId: string }[] } };
 test("shared composition validates the frozen total set for architecture and review", () => {
   const basis: CompositionBasis = { snapshotId: "frozen", candidateRefs: ["candidate"], retainableMemberIds: ["one", "two"] };
   const body: Composition = { kind: "composition", snapshotId: "frozen", reason: "Choose total roster", specialists: [
@@ -41,17 +43,7 @@ test("shared composition validates the frozen total set for architecture and rev
   }
 });
 async function localRecords(s: Awaited<ReturnType<typeof setup>>, roomId: string, first?: any) {
-  const records = new Map<string, string>(); let page = first ?? (await s.invoke("architecture_read", { roomId })).details;
-  const cut = page.cut;
-  for (;;) {
-    expect(page.cut).toBe(cut);
-    for (const fragment of page.fragments) {
-      const previous = records.get(fragment.messageId) ?? "";
-      expect(fragment.offset).toBe(previous.length); records.set(fragment.messageId, previous + fragment.text);
-    }
-    if (!page.cursor) return [...records.values()].map(text => JSON.parse(text));
-    page = (await s.invoke("architecture_read", { roomId, cursor: page.cursor })).details;
-  }
+  return (await s.read("architecture_read", { roomId }, first)).messages;
 }
 
 test("eleven original doubts reject an oracle twelfth before receipt, then settle eleven in the same grant", fixture.ownedCase("protocol eleven plus one", async () => {
@@ -64,8 +56,10 @@ test("eleven original doubts reject an oracle twelfth before receipt, then settl
     }
     if (request.stage === "consultation-response") { supportCalls++; return { ...response(request), doubts: [{ question: "Twelfth", purpose: "Later cycle only" }] }; }
     if (request.stage === "knowledge") {
-      expect(request.context.delegatedDoubts).toEqual(original); expect(request.context.deferredDoubts).toHaveLength(1);
-      deferredId = request.context.deferredDoubts[0].id;
+      expect(request.context.delegatedDoubtIds).toEqual(original.map(d => d.id)); expect(request.context.deferredDoubtIds).toHaveLength(1);
+      deferredId = request.context.deferredDoubtIds[0];
+      expect(request.context.doubts.map((d: any) => d.id)).toEqual(original.map(d => d.id));
+      expect(request.context.responses[0].message.body.doubts[0]).toMatchObject({ id: deferredId, question: "Twelfth", purpose: "Later cycle only" });
       const resolutions = original.map(d => ({ doubtId: d.id, status: "answered", answer: "Resolved", supportIds: [request.context.responses[0].id] }));
       const invalid = { kind: "knowledge", resolutions: [...resolutions, { ...resolutions[0], doubtId: deferredId }] };
       const first = await submit(session, "twelve", invalid), repeated = await submit(session, "twelve", structuredClone(invalid));
@@ -88,10 +82,10 @@ test("eleven original doubts reject an oracle twelfth before receipt, then settl
   try {
     const start = await s.invoke("architecture_start", { goal: "Eleven original doubts" }); await s.delivered.promise;
     expect(rejected).toBe(1); expect(supportCalls).toBe(1);
-    const records = await localRecords(s, start.details.roomId), knowledge = records.filter(r => r.stage === "knowledge"), boundaries = records.filter(r => r.kind === "knowledge-boundary");
+    const records = await localRecords(s, start.details.roomId), knowledge = records.filter((r: LocalRecord) => r.stage === "knowledge"), boundaries = records.filter((r: LocalRecord) => r.kind === "knowledge-boundary");
     expect(knowledge).toHaveLength(1); expect(knowledge[0].body.resolutions).toHaveLength(11); expect(knowledge[0].native.toolCallId).toBe("native-submit");
     expect(boundaries).toHaveLength(1); expect(boundaries[0].knowledgeMessageId).toBe(knowledge[0].id);
-    expect(records.some(r => r.body?.resolutions?.some((item: any) => item.doubtId === deferredId))).toBe(false);
+    expect(records.some((r: LocalRecord) => r.body?.resolutions?.some((item: any) => item.doubtId === deferredId))).toBe(false);
   } finally { await s.close(); }
 }));
 
@@ -106,7 +100,7 @@ for (const directOnly of [false, true]) test(`${directOnly ? "all-direct" : "del
       resolutions: request.context.doubts.slice(0, directOnly ? 2 : 1).map((d: any) => ({ doubtId: d.id, status: "answered", answer: "Direct" })),
       support: directOnly ? [] : [{ role: "scout", brief: "One delegated", doubtIds: [request.context.doubts[1].id], prerequisites: [] }] };
     if (request.stage === "consultation-response") return response(request);
-    if (request.stage === "knowledge") return { kind: "knowledge", resolutions: request.context.delegatedDoubts.map((d: any) => ({ doubtId: d.id, status: "answered", answer: "Delegated", supportIds: [request.context.responses[0].id] })) };
+    if (request.stage === "knowledge") return { kind: "knowledge", resolutions: request.context.delegatedDoubtIds.map((id: string) => ({ doubtId: id, status: "answered", answer: "Delegated", supportIds: [request.context.responses[0].id] })) };
     if (request.stage === "contribution") {
       firstBoundary ??= request.context.shared.knowledgeBoundaries[0];
       expect(request.context.shared.knowledgeBoundaries[0]).toEqual(firstBoundary);
@@ -120,13 +114,19 @@ for (const directOnly of [false, true]) test(`${directOnly ? "all-direct" : "del
   } });
   try {
     const start = await s.invoke("architecture_start", { goal: "Whole knowledge boundary" }); await entered.promise;
-    expect(firstBoundary.kind).toBe("knowledge-boundary"); expect(firstBoundary.resolutions).toHaveLength(2);
+    expect(firstBoundary.id).toBeTruthy(); expect(firstBoundary.resolutions).toHaveLength(2);
     expect(firstBoundary.resolutions[0]).toMatchObject({ supportIds: [], provenance: { kind: "direct" } });
     expect(firstBoundary.resolutions[1].provenance.kind).toBe(directOnly ? "direct" : "delegated");
-    frozen = (await s.invoke("architecture_read", { roomId: start.details.roomId })).details;
+    frozen = await s.invoke("architecture_read", { roomId: start.details.roomId });
     release.resolve(); await s.delivered.promise;
-    const old = await localRecords(s, start.details.roomId, frozen); expect(old.filter(r => r.kind === "knowledge-boundary")).toEqual([firstBoundary]);
-    expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("completed");
+    const old = await localRecords(s, start.details.roomId, frozen), boundaries = old.filter((r: LocalRecord) => r.kind === "knowledge-boundary");
+    expect(boundaries).toHaveLength(1);
+    expect(boundaries[0]).toMatchObject({ id: firstBoundary.id, cycleId: firstBoundary.cycleId,
+      planMessageId: firstBoundary.planMessageId, knowledgeMessageId: firstBoundary.knowledgeMessageId,
+      resolutions: firstBoundary.resolutions });
+    expect(firstBoundary.responses).toHaveLength(directOnly ? 0 : 1);
+    for (const response of firstBoundary.responses) expect(old.find((r: LocalRecord) => r.id === response.id)).toMatchObject(response);
+    expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("completed");
     expect(s.seen.filter(item => item.request.stage === "knowledge")).toHaveLength(directOnly ? 0 : 1);
     expect(s.sent.some(item => item.message.customType === "pitako.architecture.response")).toBe(false);
   } finally { release.resolve(); await s.close(); }
@@ -159,7 +159,7 @@ for (const invalid of ["plan-duplicate", "plan-extra", "cycle", "response", "dup
       }
       if (request.stage === "knowledge") {
         const ids = request.context.responses.map((r: any) => r.id);
-        const resolutions = request.context.delegatedDoubts.map((d: any, i: number) => ({ doubtId: d.id, status: invalid === "failed-prerequisite" && i !== 1 ? "failed" : "answered", answer: "Observed", supportIds: [ids[i]] }));
+        const resolutions = request.context.delegatedDoubtIds.map((id: string, i: number) => ({ doubtId: id, status: invalid === "failed-prerequisite" && i !== 1 ? "failed" : "answered", answer: "Observed", supportIds: [ids[i]] }));
         if (["duplicate-support", "unrelated-support", "missing-own", "failed-prerequisite"].includes(invalid)) {
           const bad = structuredClone(resolutions);
           if (invalid === "duplicate-support") bad[0].supportIds.push(ids[0]);
@@ -179,8 +179,8 @@ for (const invalid of ["plan-duplicate", "plan-extra", "cycle", "response", "dup
     try {
       const start = await s.invoke("architecture_start", { goal: "Correct contextual rejection" }); await s.delivered.promise;
       expect(rejected).toBe(1); expect(calls).toEqual(invalid === "failed-prerequisite" ? ["request-0", "request-1"] : ["request-0", "request-1", "request-2"]);
-      expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe(invalid === "failed-prerequisite" ? "failed" : "completed");
-      const records = await localRecords(s, start.details.roomId); expect(records.filter(r => r.stage === "knowledge")).toHaveLength(1);
+      expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe(invalid === "failed-prerequisite" ? "failed" : "completed");
+      const records = await localRecords(s, start.details.roomId); expect(records.filter((r: LocalRecord) => r.stage === "knowledge")).toHaveLength(1);
       expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
     } finally { await s.close(); }
   }));
@@ -200,8 +200,8 @@ for (const candidate of ["rejected", "valid", "aborted"] as const) test(`provide
   } });
   try {
     const start = await s.invoke("architecture_start", { goal: "No post-submit provider fallback" }); await s.delivered.promise;
-    expect(calls).toBe(1); expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("failed");
-    expect((await localRecords(s, start.details.roomId)).some(r => r.stage === "preparation" && r.author === "specialist")).toBe(false);
+    expect(calls).toBe(1); expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("failed");
+    expect((await localRecords(s, start.details.roomId)).some((r: LocalRecord) => r.stage === "preparation" && r.author === "specialist")).toBe(false);
   } finally { await s.close(); }
 }));
 
@@ -246,8 +246,8 @@ for (const mode of ["exhausted", "locked"] as const) test(`registered ${mode} gr
   try {
     const start = await s.invoke("architecture_start", { goal: "No replacement or exhausted correction" }); await s.delivered.promise;
     expect(calls).toBe(1);
-    expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("failed");
-    expect((await localRecords(s, start.details.roomId)).some(r => r.stage === "preparation" && r.author === "specialist")).toBe(false);
+    expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("failed");
+    expect((await localRecords(s, start.details.roomId)).some((r: LocalRecord) => r.stage === "preparation" && r.author === "specialist")).toBe(false);
   } finally { await s.close(); }
 }));
 
@@ -264,7 +264,8 @@ test("transitive prerequisites authorize citations and preserve stable request o
     }
     if (request.stage === "consultation-response") {
       expect(request.context.cycleId).toBe(cycleId); order.push(request.context.request.brief);
-      expect(request.context.prerequisites.every((r: any) => r.status === "completed" && r.assignmentId && r.message.id)).toBe(true);
+      expect(request.context.prerequisites.every((r: any) => r.status === "completed" && r.id && r.message.id && r.message.body.answer === "Evidence")).toBe(true);
+      expect(request.context.prerequisites.every((r: any) => !("assignmentId" in r))).toBe(true);
       return response(request);
     }
     if (request.stage === "knowledge") {
@@ -272,8 +273,9 @@ test("transitive prerequisites authorize citations and preserve stable request o
       const responses = request.context.responses;
       expect(new Set(responses.map((r: any) => r.id)).size).toBe(3);
       expect(responses.map((r: any) => r.message.body.answer)).toEqual(["Evidence", "Evidence", "Evidence"]);
-      expect(responses.map((r: any) => r.message.body.doubtIds[0])).toEqual(request.context.delegatedDoubts.map((d: any) => d.id));
-      return { kind: "knowledge", resolutions: request.context.delegatedDoubts.map((d: any, i: number) => ({ doubtId: d.id, status: "answered", answer: "Transitive evidence",
+      expect(responses.map((r: any) => r.message.body.doubtIds[0])).toEqual(request.context.delegatedDoubtIds);
+      expect(responses.map((r: any) => r.prerequisites)).toEqual([[responses[2].id], [], [responses[1].id]]);
+      return { kind: "knowledge", resolutions: request.context.delegatedDoubtIds.map((id: string, i: number) => ({ doubtId: id, status: "answered", answer: "Transitive evidence",
         supportIds: (i === 0 ? [0, 2, 1] : i === 2 ? [2, 1] : [1]).map(index => responses[index].id) })) };
     }
     if (request.stage === "contribution") return contribution;
@@ -283,8 +285,8 @@ test("transitive prerequisites authorize citations and preserve stable request o
   try {
     const start = await s.invoke("architecture_start", { goal: "Transitive stable identities" }); await s.delivered.promise;
     expect(order).toEqual(["request-1", "request-2", "request-0"]);
-    expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("completed");
-    const records = await localRecords(s, start.details.roomId), boundary = records.find(r => r.kind === "knowledge-boundary");
+    expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("completed");
+    const records = await localRecords(s, start.details.roomId), boundary = records.find((r: LocalRecord) => r.kind === "knowledge-boundary");
     expect(boundary.cycleId).toBe(cycleId!); expect(boundary.resolutions[0].provenance.responses).toHaveLength(3);
     expect(boundary.resolutions[0].provenance.responses.every((r: any) => r.status === "completed" && r.assignmentId && r.messageId)).toBe(true);
   } finally { await s.close(); }

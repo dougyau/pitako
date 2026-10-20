@@ -36,6 +36,67 @@ const canonical = (value: unknown) => {
   });
 };
 
+test("stage inputs carry unabridged results once, with identified doubts and no same-round publications", fixture.ownedCase("table projected inputs", async () => {
+  const analyses = ["chosen", "director"].map(model => `${model}-independent-` + "x".repeat(20000));
+  const s = await setup({ prompt(session, request, body) {
+    const serialized = JSON.stringify(request);
+    if (request.stage === "composition") return composition(request, 1);
+    if (request.stage === "preparation") {
+      expect(Object.keys(request.context)).toEqual(["mandate"]);
+      return { ...preparation(request), analysis: analyses[session.model.id === "chosen" ? 0 : 1],
+        doubts: [{ question: `question-${session.model.id}`, purpose: "Needed knowledge" }] };
+    }
+    if (request.stage === "consultation-plan") {
+      expect(request.authorization.doubtIds).toEqual(request.context.doubts.map((doubt: any) => doubt.id));
+      expect(request.context.sources).toHaveLength(2);
+      for (const source of request.context.sources) {
+        expect(serialized.split(source.body.analysis)).toHaveLength(2);
+        expect(serialized.split(source.body.doubts[0].question)).toHaveLength(2);
+        expect(source.body.doubts[0].id).toBe(request.context.doubts.find((doubt: any) => doubt.id === source.body.doubts[0].id).id);
+        for (const key of ["id", "author", "memberId", "stage"]) expect(source[key]).toBeTruthy();
+      }
+      return { kind: "consultation-plan", resolutions: request.context.doubts.map((doubt: any) =>
+        ({ doubtId: doubt.id, status: "answered", answer: `confirmed-${doubt.id}` })), support: [] };
+    }
+    if (request.stage === "contribution" || request.stage === "synthesis") {
+      const results = request.context.shared?.messages ?? request.context.messages;
+      for (const analysis of analyses) {
+        expect(results.some((result: any) => result.body.analysis === analysis)).toBe(true);
+        expect(serialized.split(analysis)).toHaveLength(2);
+      }
+      expect(new Set(results.map((result: any) => result.id)).size).toBe(results.length);
+      for (const result of results) {
+        expect(serialized.split(`"id":"${result.id}"`)).toHaveLength(2);
+        if (result.stage === "contribution") {
+          expect(serialized.split(result.body.proposal)).toHaveLength(2);
+          if (request.stage === "contribution") expect(result.round).toBeLessThan(request.round);
+        }
+      }
+      if (request.stage === "contribution") {
+        expect(results.filter((result: any) => result.stage === "contribution")).toHaveLength(request.round === 1 ? 0 : 2);
+        return { ...contribution(request), proposal: `proposal-${session.model.id}-round-${request.round}` };
+      }
+      expect(results.filter((result: any) => result.stage === "contribution")).toHaveLength(4);
+    }
+    if (request.stage === "decision") {
+      for (const analysis of analyses) expect(serialized).not.toContain(analysis);
+      expect(request.context.sources).toHaveLength(2);
+      for (const source of request.context.sources) {
+        expect(source.round).toBe(request.round);
+        expect(serialized.split(source.body.proposal)).toHaveLength(2);
+      }
+      return decision(request.round === 1 ? "continue" : "synthesize");
+    }
+    return body;
+  } });
+  try {
+    const start = await s.invoke("architecture_start", { goal: "Preserve all rounds and every substantive byte" }); await s.delivered.promise;
+    expect(teamWorkerResult(s.evaluation.token, start.details.instanceId)!.status).toBe("completed");
+    expect(s.seen.filter(item => item.request.stage === "contribution")).toHaveLength(4);
+    expect(s.seen.some(item => item.request.stage === "synthesis")).toBe(true);
+  } finally { await s.close(); }
+}));
+
 for (const failed of [false, true]) test(`${failed ? "all failed specialists" : "empty pool"} still prepares and contributes with the director`, fixture.ownedCase(`director ${failed}`, async () => {
   const s = await setup({ ...(failed ? {} : { config: "" }), prompt(session, request, body) {
     if (request.stage === "composition") return failed ? composition(request, 2) : { ...composition(request, 0) };
@@ -93,7 +154,7 @@ test("retention keeps owners and immutable tasks; additions prepare independentl
   } });
   try {
     const start = await s.invoke("architecture_start", { goal: "Keep full historical evidence" }); await s.delivered.promise;
-    expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("completed");
+    expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("completed");
     const retained = teamAssignments(s.evaluation).find(member => member.memberId === retainedId)!;
     expect(retained.task).toBe("Member 0");
     const retainedSession = s.seen.find(item => item.request.stage === "contribution" && item.request.round === 2 && item.session.model.id === "chosen")!.session;
@@ -158,8 +219,8 @@ test("partial replacement admission preserves intention and closes created owner
     expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
     expect(teamAssignments(s.evaluation)).toHaveLength(3);
     expect(teamWorkerStatus(s.evaluation.token).every(row => row.closure.state === "released")).toBe(true);
-    const room = (await s.invoke("architecture_read", { roomId: start.details.roomId })).details;
-    expect(room.fragments.map((fragment: any) => fragment.text).join("")).toContain('"specialists":[{"kind":"add"');
+    const room = await s.read("architecture_read", { roomId: start.details.roomId });
+    expect(JSON.stringify(room.messages)).toContain('"specialists":[{"kind":"add"');
     expect(s.seen.filter(item => item.request.stage === "contribution").every(item => item.request.round === 1)).toBe(true);
   } finally { spy.mockRestore(); await s.close(); }
 }));
@@ -228,8 +289,8 @@ test("registered five-member table shares ordered support only at the knowledge 
       releaseKnowledge.resolve(); await roundEntered.promise;
       packages.push(canonical({ supportBatch, shared: roundPrompts[0].context.shared }));
       expect(roundPrompts.every(request => JSON.stringify(request.context.shared) === JSON.stringify(roundPrompts[0].context.shared))).toBe(true);
-      expect(roundPrompts[0].context.shared.messages.filter((message: any) => message.stage === "knowledge")).toHaveLength(1);
-      expect(roundPrompts[0].context.shared.messages.filter((message: any) => message.stage === "consultation-response")).toHaveLength(3);
+      expect(roundPrompts[0].context.shared.knowledgeBoundaries).toHaveLength(1);
+      expect(roundPrompts[0].context.shared.knowledgeBoundaries[0].responses).toHaveLength(3);
       expect(s.host.sessions.filter(session => session.model?.id === "chosen")).toHaveLength(5);
       expect(s.host.sessions.filter(session => !session.events.includes("dispose")).every(session => executionForSession(session.sessionId)?.profile === "analysis")).toBe(true);
       for (const session of s.host.sessions) {
@@ -237,13 +298,88 @@ test("registered five-member table shares ordered support only at the knowledge 
         expect(session.active).not.toContain("agent_spawn"); expect(session.active).not.toContain("edit");
       }
       releaseRound.resolve(); await s.delivered.promise;
-      expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("completed");
+      expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("completed");
       expect(s.sent.filter(item => item.message.customType === "pitako.worker.result")).toHaveLength(1);
       expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
       expect(maxActive).toBe(2);
     } finally { release(); await s.close(); }
   }
   expect(packages[0]).toBe(packages[1]);
+}));
+
+test("consultation A receives the full B to C prerequisite chain without independent D or broader submit authority", fixture.ownedCase("transitive consultation context", async () => {
+  const labels = ["A", "B", "C", "D"];
+  const answers = labels.map(label => `Answer ${label}: ` + label.repeat(20000));
+  let doubtIds: string[] = [], responseIds: string[] = [];
+  const disposed: string[] = [];
+  let closedBeforeA: string[] = [];
+  const s = await setup({ async prompt(session, request, body) {
+    if (request.stage === "composition") return composition(request, 4);
+    if (request.stage === "preparation") return { ...preparation(request),
+      analysis: "PRIVATE-INDEPENDENT-DELIBERATION",
+      doubts: session.model.id === "director" ? [] : [{
+        question: `Question ${labels[Number(request.context.mandate.slice(-1))]}?`,
+        purpose: `Purpose ${labels[Number(request.context.mandate.slice(-1))]}`,
+      }] };
+    if (request.stage === "consultation-plan") {
+      doubtIds = request.context.doubts.map((doubt: any) => doubt.id);
+      return { kind: "consultation-plan", resolutions: [], support: labels.map((label, index) => ({
+        role: "scout", brief: label, doubtIds: [doubtIds[index]], prerequisites: index < 2 ? [index + 1] : [],
+      })) };
+    }
+    if (request.stage === "consultation-response") {
+      const index = labels.indexOf(request.context.mandate);
+      if (index === 0) {
+        closedBeforeA = [...disposed];
+        const rejected = await session.boundTools.get("architecture_submit").execute("broader-authority", {
+          submissionId: "broader-authority", body: { ...support(request), doubtIds: [doubtIds[0], doubtIds[2]] },
+        }, undefined, undefined, { sessionManager: session.sessionManager });
+        expect(rejected.isError).toBe(true);
+        expect(rejected.details).toMatchObject({ code: "reference", field: "body.doubtIds" });
+      }
+      return { ...support(request), answer: answers[index],
+        evidence: request.context.prerequisites.map((result: any) => result.id) };
+    }
+    if (request.stage === "knowledge") {
+      responseIds = request.context.responses.map((response: any) => response.id);
+      return { kind: "knowledge", resolutions: doubtIds.map((doubtId, index) => ({
+        doubtId, status: "answered", answer: `Confirmed ${labels[index]}`, supportIds: [responseIds[index]],
+      })) };
+    }
+    return body;
+  }, async dispose(session) {
+    const request = session.prompts.map((text: string) => JSON.parse(text)).find((item: any) => item.stage === "consultation-response");
+    if (request) disposed.push(request.context.mandate);
+  } });
+  try {
+    const start = await s.invoke("architecture_start", { goal: "Resolve A using B and C, not D" });
+    await s.delivered.promise;
+    expect(teamWorkerResult(s.evaluation.token, start.details.instanceId)!.status).toBe("completed");
+    const a = s.seen.find(item => item.request.stage === "consultation-response" && item.request.context.mandate === "A")!;
+    expect(a.receipt.isError).not.toBe(true);
+    expect(a.request.authorization).toEqual({ kind: "consultation-response", doubtIds: [doubtIds[0]] });
+    expect(a.request.context.request.doubtIds).toEqual([doubtIds[0]]);
+    expect(a.request.context.prerequisites.map((result: any) => result.id).sort()).toEqual(responseIds.slice(1, 3).sort());
+    expect(a.request.context.doubts).toEqual(labels.slice(0, 3).map((label, index) => ({
+      id: doubtIds[index], question: `Question ${label}?`, purpose: `Purpose ${label}`,
+    })));
+    const serialized = JSON.stringify(a.request);
+    for (const index of [1, 2]) {
+      const result = a.request.context.prerequisites.find((item: any) => item.id === responseIds[index]);
+      expect(result).toMatchObject({ status: "completed", message: { stage: "consultation-response",
+        body: { answer: answers[index], doubtIds: [doubtIds[index]] } } });
+      expect(result.id).not.toBe(result.message.id);
+      for (const key of ["id", "author", "memberId", "stage"]) expect(result.message[key]).toBeTruthy();
+      expect(serialized.split(answers[index]!)).toHaveLength(2);
+    }
+    for (const label of labels.slice(0, 3)) for (const text of [`Question ${label}?`, `Purpose ${label}`])
+      expect(serialized.split(text)).toHaveLength(2);
+    for (const text of [answers[3]!, "Question D?", "Purpose D", "PRIVATE-INDEPENDENT-DELIBERATION", '"snapshot"', '"journal"', '"native"'])
+      expect(serialized).not.toContain(text);
+    expect(closedBeforeA).toEqual(expect.arrayContaining(["B", "C"]));
+    expect(disposed).toHaveLength(4);
+    expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
+  } finally { await s.close(); }
 }));
 
 test("round frontiers freeze objections and controls; replacement waits for all five outgoing owners", fixture.ownedCase("table frontier replacement", async () => {
@@ -261,7 +397,7 @@ test("round frontiers freeze objections and controls; replacement waits for all 
       return contribution(request, prior ? [{ memberId: prior.memberId, messageId: prior.id, argument: "Counterargument, not a doubt" }] : []);
     }
     if (request.stage === "decision") {
-      expect(request.controls).toEqual(request.round === 1 ? [] : [{ action: "context", text: "new context" }, { action: "priorities", text: "new priority" }]);
+      expect(request.context.controls).toEqual(request.round === 1 ? [] : [{ action: "context", text: "new context" }, { action: "priorities", text: "new priority" }]);
       return decision(request.round === 1 ? "recompose" : "synthesize");
     }
     if (request.stage === "synthesis") { synthesis.resolve(); await releaseSynthesis.promise; }
@@ -273,8 +409,8 @@ test("round frontiers freeze objections and controls; replacement waits for all 
     const start = await s.invoke("architecture_start", { goal: "Frontier changes" }); await entered.promise;
     const first = JSON.stringify(prompts[0].context.shared);
     expect(prompts.every(request => JSON.stringify(request.context.shared) === first)).toBe(true);
-    const before = (await s.invoke("architecture_read", { roomId: start.details.roomId })).details;
-    const cursor = before.cursor;
+    const before = JSON.parse((await s.invoke("architecture_read", { roomId: start.details.roomId, maxBytes: 4096 })).content[0].text);
+    const cursor = before.header.cursor;
     await s.invoke("architecture_control", { roomId: start.details.roomId, action: "context", text: "new context" });
     await s.invoke("architecture_control", { roomId: start.details.roomId, action: "priorities", text: "new priority" });
     expect(JSON.stringify(prompts[0].context.shared)).toBe(first);
@@ -288,14 +424,14 @@ test("round frontiers freeze objections and controls; replacement waits for all 
     expect(second[0].context.shared.id).not.toBe(prompts[0].context.shared.id);
     expect(second[0].context.shared.controls).toEqual([{ action: "context", text: "new context" }, { action: "priorities", text: "new priority" }]);
     expect(second[0].context.shared.messages.filter((message: any) => message.stage === "contribution")).toHaveLength(6);
-    expect(second[0].context.shared.messages.filter((message: any) => message.stage === "contribution").every((message: any) => message.body.objections.length === 1 && message.doubts.length === 0)).toBe(true);
-    const readAgain = (await s.invoke("architecture_read", { roomId: start.details.roomId, ...(cursor ? { cursor } : {}) })).details;
-    if (cursor) expect(readAgain.cut).toBe(before.cut);
+    expect(second[0].context.shared.messages.filter((message: any) => message.stage === "contribution").every((message: any) => message.body.objections.length === 1 && message.body.doubts.length === 0)).toBe(true);
+    const readAgain = JSON.parse((await s.invoke("architecture_read", { roomId: start.details.roomId, ...(cursor ? { cursor } : {}) })).content[0].text);
+    if (cursor) expect(readAgain.header.id).toBe(before.header.id);
     expect(s.host.sessions.filter(session => session.model?.id === "chosen")).toHaveLength(10);
     expect(outgoing.every(session => session.events.includes("dispose"))).toBe(true); await observePrivate(s);
     releaseSynthesis.resolve(); await s.delivered.promise;
     expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
-    expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("completed");
+    expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("completed");
   } finally { release(); await s.close(); }
 }));
 
@@ -333,7 +469,7 @@ for (const action of ["consult", "continue"] as const) {
       expect(rounds).toEqual([1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 5]);
       expect(phases).toEqual(action === "consult" ? ["initial", "final-clarification"] : ["initial"]);
       expect(supports).toBe(action === "consult" ? 1 : 0);
-      expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("failed");
+      expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("failed");
       const result = await s.invoke("team_result", { assignmentId: start.details.assignmentId });
       expect(result.content[0].text).toContain("partial"); expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
     } finally { await s.close(); }
@@ -366,7 +502,7 @@ for (const action of ["finish", "stop", "team_cancel"] as const) {
       releasePrompt.resolve(); await disposing.promise;
       expect(syntheses).toBe(action === "finish" ? 1 : 0); expect(workerHandoff(start.details.instanceId)).toBeUndefined(); await observePrivate(s);
       releaseDispose.resolve(); await s.delivered.promise;
-      expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe(action === "finish" ? "failed" : "cancelled");
+      expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe(action === "finish" ? "failed" : "cancelled");
       expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
       expect(s.seen.some(item => item.request.stage === "contribution")).toBe(false);
     } finally { release(); await s.close(); }
@@ -399,7 +535,7 @@ test("failed support prerequisites are unresolved, while independent support pro
   try {
     const start = await s.invoke("architecture_start", { goal: "Finite consultation failures" }); await s.delivered.promise;
     expect(calls).toEqual(["support 0", "support 1"]);
-    expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("failed");
+    expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("failed");
     expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
   } finally { await s.close(); }
 }));
@@ -411,17 +547,19 @@ test("continued rounds retain original doubts for the next consultation batch", 
     if (request.stage === "preparation") return preparation(request);
     if (request.stage === "contribution") return { ...contribution(request), doubts: session.model.id !== "director" ? [{ question: `Round ${request.round}`, purpose: "Deferred consultation" }] : [] };
     if (request.stage === "decision") {
-      if (request.round === 1) firstDoubt = request.context.sources[0].doubts[0].id;
+      if (request.round === 1) firstDoubt = request.context.sources[0].body.doubts[0].id;
       return decision(request.round === 1 ? "continue" : request.round === 2 ? "consult" : "synthesize");
     }
     if (request.stage === "consultation-plan" && request.context.phase === "between-rounds") {
-      expect(request.context.doubts.map((d: any) => d.question)).toEqual(["Round 1", "Round 2"]);
+      expect(request.context.doubts.map((d: any) => request.context.sources.flatMap((source: any) => source.body.doubts ?? []).find((source: any) => source.id === d.id).question))
+        .toEqual(["Round 1", "Round 2"]);
       expect(request.context.doubts[0].id).toBe(firstDoubt);
       return { kind: "consultation-plan", resolutions: request.context.doubts.map((d: any) => ({ doubtId: d.id, status: "answered", answer: "Resolved by Architect" })), support: [] };
     }
     if (request.stage === "knowledge") return { kind: "knowledge", resolutions: request.context.doubts.map((d: any) => ({ doubtId: d.id, status: "answered", answer: "Common knowledge", supportIds: [] })) };
     if (request.stage === "synthesis") {
-      expect(request.context.pendingDoubts.map((d: any) => d.question)).toEqual(["Round 3"]);
+      expect(request.context.pendingDoubts.map((d: any) => request.context.messages.flatMap((message: any) => message.body.doubts ?? []).find((source: any) => source.id === d.id).question))
+        .toEqual(["Round 3"]);
       return { ...body, status: "partial", pending: ["Round 3"] };
     }
     return body;
@@ -429,7 +567,7 @@ test("continued rounds retain original doubts for the next consultation batch", 
   try {
     const start = await s.invoke("architecture_start", { goal: "Retain deferred questions" }); await s.delivered.promise;
     expect(s.seen.some(item => item.request.stage === "synthesis")).toBe(true);
-    expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("failed");
+    expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("failed");
   } finally { await s.close(); }
 }));
 
@@ -453,6 +591,7 @@ for (const failure of ["missing", "cancelled", "objection"] as const) {
         expect(request.context.sources).toHaveLength(2); expect(request.context.failures).toHaveLength(1);
         return decision("synthesize");
       }
+      if (request.stage === "synthesis") return { ...body, status: "partial" };
       return body;
     } });
     try {
@@ -464,8 +603,8 @@ for (const failure of ["missing", "cancelled", "objection"] as const) {
         expect((await s.invoke("team_cancel", { assignmentId: member.assignmentId })).isError).not.toBe(true);
       }
       release.resolve(); await s.delivered.promise;
-      expect(attempts).toBe(3); expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("failed");
-      const read = (await s.invoke("architecture_read", { roomId: start.details.roomId })).details;
+      expect(attempts).toBe(3); expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("failed");
+      const read = await s.read("architecture_read", { roomId: start.details.roomId });
       expect(read.failures).toHaveLength(1); expect(read.failures[0].stage).toBe("contribution"); expect(read.failures[0].round).toBe(1);
       expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
     } finally { release.resolve(); await s.close(); }

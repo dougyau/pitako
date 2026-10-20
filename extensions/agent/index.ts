@@ -33,6 +33,8 @@ import { createHead, validateAgentMode } from "./head/admission.ts";
 import { assertNoCheckpointLease } from "./head/checkpoint-lease.ts";
 import { formatAgentResult, formatTeamExecutionSummary, runAgentInstance, teamExecutionSummary } from "./run.ts";
 import { randomUUID } from "node:crypto";
+import { isTableRoot, readTableResult, tableRootStatus } from "./background.ts";
+import { tableReadProperties, tableIncidental, tableError, type TableRead } from "../table/results.ts";
 import { existsSync } from "node:fs";
 import { openBoard } from "../board/store.ts";
 import { boardWorkspace, currentWorkspace } from "../board/workspace.ts";
@@ -366,11 +368,17 @@ function registerTeamTools(pi: ExtensionAPI): void {
     promptSnippet: "Inspect Team assignments without waiting",
     parameters: Type.Object({ assignmentId: Type.Optional(Type.String({ minLength: 1 })), teamId: Type.Optional(Type.String({ minLength: 1 })), memberId: Type.Optional(Type.String({ minLength: 1 })) }, noExtra),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      let tableRequest = false;
       try {
         const evaluation = evaluationFor(ctx);
         if (!evaluation) throw new Error("Team requires a foreground session identity");
         const selected = selectTeamAssignments(evaluation, params);
+        // Fail closed while probing a singleton; generic aggregation is not a table request.
+        tableRequest = selected.length === 1;
         const rows = selected.map(row => {
+          const table = tableRootStatus(evaluation.token, row.instanceId);
+          if (table) return table;
+          tableRequest = false;
           const view = teamWorkerStatus(evaluation.token, row.instanceId)[0];
           const observation = listObservations(evaluation.token, evaluation.sessionId).find((item) => item.id === row.instanceId);
           return {
@@ -389,22 +397,30 @@ function registerTeamTools(pi: ExtensionAPI): void {
           };
         }).filter((row) => row !== undefined);
         if (params.assignmentId && rows.length === 0) throw new Error(`unknown Team assignment ${params.assignmentId}`);
+        if (tableRequest) return tableIncidental({ members: rows });
         return textResult(JSON.stringify(rows), { members: rows });
-      } catch (error) { return errorResult(error instanceof Error ? error.message : String(error)); }
+      } catch (error) { return tableRequest ? tableError(error) : errorResult(error instanceof Error ? error.message : String(error)); }
     },
   });
 
   pi.registerTool({
     name: "team_result",
     label: "Team result",
-    description: "Optional complete diagnostic re-read of one settled Team result. Idempotent; does not wait or acknowledge automatic handoff.",
+    description: "Read a settled result. Ordinary assignments retain their complete diagnostic. Tables return bounded canonical fragments; read pertinent sections before dependent judgment. Start with section (default report) and maxBytes 4096..16384 (default 16384); continue with cursor only. Transport end is not completion or product acceptance. No acknowledgement.",
     promptSnippet: "Inspect a settled Team assignment result",
-    parameters: Type.Object({ assignmentId: Type.String() }, noExtra),
+    parameters: Type.Object({ assignmentId: Type.String(), ...tableReadProperties }, noExtra),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const paging = params.cursor !== undefined || params.section !== undefined || params.maxBytes !== undefined;
+      let tableRequest = paging;
       try {
         const evaluation = evaluationFor(ctx);
         if (!evaluation) throw new Error("Team requires a foreground session identity");
         const assignment = findAssignment(evaluation, params.assignmentId);
+        // A retired matched root must not escape through the legacy error envelope.
+        tableRequest = true;
+        if (isTableRoot(evaluation.token, assignment.instanceId)) return readTableResult(evaluation.token, assignment.instanceId, params as TableRead);
+        tableRequest = paging;
+        if (paging) throw new Error("table paging requires a table root");
         const result = teamWorkerResult(evaluation.token, assignment.instanceId);
         const handoff = workerHandoff(assignment.instanceId);
         const summary = teamExecutionSummary(assignment.id, result);
@@ -414,7 +430,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
           teamId: assignment.teamId, memberId: assignment.memberId, assignmentId: assignment.id, instanceId: result.instanceId, role: result.role,
           status: result.status, model: result.model, usage: result.usage, summary, handoff, resultLength: result.result.length,
         }, result.status !== "completed" || handoff?.bookkeeping === "blocked");
-      } catch (error) { return errorResult(error instanceof Error ? error.message : String(error)); }
+      } catch (error) { return tableRequest ? tableError(error) : errorResult(error instanceof Error ? error.message : String(error)); }
     },
   });
 
@@ -425,13 +441,16 @@ function registerTeamTools(pi: ExtensionAPI): void {
     promptSnippet: "Cancel one Team assignment without waiting",
     parameters: Type.Object({ assignmentId: Type.String() }, noExtra),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      let ordinary = false;
       try {
         const evaluation = evaluationFor(ctx);
         if (!evaluation) throw new Error("Team requires a foreground session identity");
         const assignment = findAssignment(evaluation, params.assignmentId);
+        ordinary = !isTableRoot(evaluation.token, assignment.instanceId);
         const view = cancelTeamWorker(evaluation.token, assignment.instanceId);
+        if (!ordinary) return tableIncidental(tableRootStatus(evaluation.token, assignment.instanceId)!);
         return textResult(JSON.stringify({ assignmentId: assignment.id, ...view }), { assignmentId: assignment.id, ...view });
-      } catch (error) { return errorResult(error instanceof Error ? error.message : String(error)); }
+      } catch (error) { return ordinary ? errorResult(error instanceof Error ? error.message : String(error)) : tableError(error); }
     },
   });
 }

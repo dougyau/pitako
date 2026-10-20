@@ -41,11 +41,11 @@ for (const bound of [false, true]) {
       await s.delivered.promise;
       const terminal = s.branch.filter(entry => entry.customType === "pitako.worker.result");
       expect(terminal).toHaveLength(1);
-      expect(terminal[0].details).toMatchObject({ assignmentId: start.details.assignmentId, status: "completed",
-        ...(bound ? {} : { planId: "planning", unitId: "reviewer-critique" }) });
-      if (bound) { expect(terminal[0].details.planId).toBeUndefined(); expect(terminal[0].details.unitId).toBeUndefined(); }
-      const report = JSON.parse(terminal[0].content);
-      expect(report.object.selector).toEqual(request.object); expect(report.completion).toBe("complete");
+      expect(terminal[0].details).toMatchObject({ assignmentId: start.details.assignmentId, status: "completed" });
+      const report = await s.read("team_result", { assignmentId: start.details.assignmentId });
+      expect(report.host).toMatchObject(bound ? {} : { planId: "planning", unitId: "reviewer-critique" });
+      if (bound) { expect(report.host.planId).toBeUndefined(); expect(report.host.unitId).toBeUndefined(); }
+      expect(report.object.selector).toEqual(request.object); expect(report.judgment.completion).toBe("complete");
       expect(existsSync(ledgerFile("planning", s.root))).toBe(false);
       expect(readFileSync(file, "utf8")).toBe(draft);
       const after = await openBoard();
@@ -80,7 +80,8 @@ for (const rejection of ["bound-topic-bypass", "incompatible-ledger"] as const) 
       expect(s.host.sessions).toEqual([]);
       const terminal = s.branch.filter(entry => entry.customType === "pitako.worker.result");
       expect(terminal).toHaveLength(1); expect(terminal[0].details.status).toBe("failed");
-      expect(terminal[0].content).toContain(rejection === "bound-topic-bypass" ? "explicit Board topics require a bound watched plan" : "hash");
+      const report = await s.read("team_result", { assignmentId: start.details.assignmentId });
+      expect(report.host.failure).toContain(rejection === "bound-topic-bypass" ? "explicit Board topics require a bound watched plan" : "hash");
       expect(readFileSync(file, "utf8")).toBe(draft);
       if (ledger === undefined) expect(existsSync(ledgerFile("planning", s.root))).toBe(false);
       else expect(readFileSync(ledgerFile("planning", s.root), "utf8")).toBe(ledger);
@@ -142,11 +143,11 @@ for (const outcome of ["no-blockers", "changes-required", "inconclusive", "faile
       const status = outcome === "failed" ? "failed" : "completed";
       const terminal = s.branch.filter(entry => entry.customType === "pitako.worker.result");
       expect(terminal).toHaveLength(1);
-      expect(terminal[0].details).toMatchObject({ assignmentId: start.details.assignmentId, instanceId: start.details.instanceId,
-        planId: "planning", unitId: "reviewer-critique", status });
-      const report = JSON.parse(terminal[0].content); // automatic delivery, no review_read or result fetch
+      expect(terminal[0].details).toMatchObject({ assignmentId: start.details.assignmentId, instanceId: start.details.instanceId, status });
+      const report = await s.read("team_result", { assignmentId: start.details.assignmentId });
+      expect(report.host).toMatchObject({ planId: "planning", unitId: "reviewer-critique", status });
       expect(report).toMatchObject({ protocol: "review", criteria: request.criteria,
-        completion: outcome === "failed" ? "failed" : "complete", verdict: outcome === "failed" ? "inconclusive" : outcome });
+        judgment: outcome === "failed" ? null : { completion: "complete", verdict: outcome } });
       expect(report.observations.launch).toBe(report.object.identity);
       expect(report.observations.final).toBe(outcome === "failed" ? null : report.object.identity);
       expect(report.findings).toHaveLength(outcome === "no-blockers" ? 0 : 1);

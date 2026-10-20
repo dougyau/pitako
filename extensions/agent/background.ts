@@ -14,6 +14,8 @@ import { PublicConversation } from "./public-conversation.ts";
 import { AgentClosureError, type AgentClosure } from "./closure.ts";
 import { dispatchAdmissionsClosed } from "./dispatch.ts";
 import type { HeadAttachment } from "./head/runtime.ts";
+import { sealPages, type SealedPages, type TableRead, type TableRootRegistration } from "../table/results.ts";
+import { startTableArchive, type TableArchive } from "../table/archive.ts";
 
 export interface WorkerInterest {
   planId: string;
@@ -123,6 +125,7 @@ interface Handoff extends WorkerHandoff {
 type SignalState = "pending" | "dropped";
 
 interface Row extends TeamMetadata {
+  tableRoot?: { registration: TableRootRegistration; resultId: string; sealed?: SealedPages; cut?: SealedPages; archive?: TableArchive };
   tableProtocol?: "architecture" | "review";
   architectureSelectedDriver?: AgentRunResult;
   recipient?: Recipient;
@@ -477,6 +480,7 @@ export function reserveBackground(input: {
   owns: () => boolean;
   teamOwner?: { token: symbol; assignmentId: string; teamId?: string; memberId?: string; onSettled: (status: WorkerStatus) => void; noWorkerReleased: () => void };
   recipient?: Recipient;
+  tableRoot?: TableRootRegistration;
   prepare: (signal: AbortSignal, check: () => void, row: { instanceId: string; dispatchId: string;
     record: (record: NonNullable<Row["consultation"]>) => void; current: () => boolean }) => Promise<SpawnInput>;
   cleanup?: () => Promise<void>;
@@ -487,7 +491,8 @@ export function reserveBackground(input: {
   const controller = new AbortController();
   const completion = Promise.withResolvers<void>();
   const ready = Promise.withResolvers<void>();
-  const row: Row = { recipient: input.recipient, instanceId: createInstanceId(input.roleId), roleId: input.roleId, dispatchId: randomUUID(),
+  const row: Row = { tableRoot: input.tableRoot && { registration: input.tableRoot, resultId: randomUUID() },
+    recipient: input.recipient, instanceId: createInstanceId(input.roleId), roleId: input.roleId, dispatchId: randomUUID(),
     dispatchPhase: "preflight", workerStarted: false, acceptedAt: Date.now(), controller,
     ownerToken: owner.token, deliveryOwner: owner, coordinatorSessionId: input.coordinatorSessionId,
     teamOwnerToken: input.teamOwner?.token, teamAssignmentId: input.teamOwner?.assignmentId,
@@ -629,7 +634,7 @@ export async function finishTeamWorker(token: symbol, instanceId: string): Promi
       settle(row, { ...result, usage: maintained.usage,
         ...(row.controller.signal.aborted ? { status: "cancelled",
           // Only the host-selected review driver carries this report. Synthesis remains historical evidence.
-          result: row.tableProtocol === "review" && driven
+          result: !row.tableRoot && row.tableProtocol === "review" && driven
             ? JSON.stringify({ ...JSON.parse(driven.result), completion: "failed", verdict: "inconclusive" })
             : "cancelled" } : {}) }, observationEpoch());
       completion.resolve();
@@ -863,10 +868,17 @@ async function retireRows(rows: Row[]): Promise<void> {
     row.conversation?.retire();
     if (!row.controller.signal.aborted) row.controller.abort();
   }
-  await Promise.all(rows.flatMap(row => [row.run, row.preparation]));
-  const uncertain = rows.filter(row => row.closure.state !== "released");
+  const workers = await Promise.allSettled(rows.flatMap(row => [row.run, row.preparation]));
+  // Delivery authority may be gone, but released canonical reports still owe their captured archive.
+  for (const row of rows) startTableResultArchive(row);
+  await Promise.all(rows.map(row => row.tableRoot?.archive?.completion));
+  const failed = workers.find(result => result.status === "rejected");
+  if (failed?.status === "rejected") throw failed.reason;
+  const archiveUnknown = (row: Row) => row.tableRoot?.archive?.state.state === "failed" &&
+    row.tableRoot.archive.state.settlement === "unknown";
+  const uncertain = rows.filter(row => row.closure.state !== "released" || archiveUnknown(row));
   for (const row of rows) {
-    if (row.closure.state !== "released" || state.rows.get(row.instanceId) !== row) continue;
+    if (row.closure.state !== "released" || archiveUnknown(row) || state.rows.get(row.instanceId) !== row) continue;
     if (row.consultation) {
       row.consultation.retired();
       row.consultation.settled();
@@ -877,7 +889,7 @@ async function retireRows(rows: Row[]): Promise<void> {
     removeObservation(row.instanceId);
   }
   if (uncertain.length) throw new AgentClosureError(uncertain.map(row => new Error(`${row.instanceId}: ${
-    row.closure.state === "unknown" ? row.closure.reason : "owned run has not settled"
+    row.closure.state === "unknown" ? row.closure.reason : archiveUnknown(row) ? "table archive closure unknown; resources retained" : "owned run has not settled"
   }`)), "Background retirement");
 }
 
@@ -944,6 +956,16 @@ function settle(row: Row, result: AgentRunResult, epoch: number): void {
   const current = state.rows.get(row.instanceId);
   if (current !== row) return;
   current.outcome = result;
+  if (current.tableRoot && current.closure.state === "released" && !current.tableRoot.sealed) {
+    const semantic = current.tableRoot.registration.semantic?.() ?? { protocol: current.tableRoot.registration.protocol, judgment: null };
+    const { judgment, ...facts } = semantic;
+    const authorized = judgment != null && !!current.architectureSelectedDriver && !current.controller.signal.aborted;
+    current.tableRoot.sealed = sealPages({ ...facts, judgment: authorized ? judgment : null,
+      ...(!authorized && judgment ? { history: { discardedJudgment: judgment } } : {}),
+      host: { status: result.status, closure: current.closure, model: result.model, usage: result.usage,
+        planId: current.interest?.planId, unitId: current.interest?.unitId,
+        ...(!authorized ? { failure: result.result } : {}) } }, current.tableRoot.resultId);
+  }
   observeArchitectureRow(current);
   current.consultation?.event("outcome", current.workerStarted
     ? { workerStarted: true, status: result.status, instanceId: result.instanceId, model: result.model, usage: result.usage }
@@ -1023,9 +1045,13 @@ function collectOwnerResults(token: symbol): void {
 function collectResult(row: Row): void {
   if (!row.outcome || row.recipient || row.handoff || !liveOwner(row)) return;
   // A protocol driver cannot hand off while an owned member's closure is unknown.
-  if (row.maintained?.driver && row.closure.state !== "released") return;
+  if ((row.maintained?.driver || row.tableRoot) && row.closure.state !== "released") return;
   const owner = row.deliveryOwner!;
-  const details = Object.freeze({
+  const details = Object.freeze(row.tableRoot ? {
+    deliveryId: randomUUID(), instanceId: row.instanceId, assignmentId: row.teamAssignmentId,
+    teamId: row.teamId, memberId: row.memberId, status: row.outcome.status,
+    roleId: row.tableRoot.registration.protocol === "review" ? "reviewer" : "architect",
+  } : {
     teamId: row.teamId, memberId: row.memberId, turnId: row.turnId,
     deliveryId: randomUUID(), instanceId: row.instanceId, assignmentId: row.teamAssignmentId,
     ownerSessionId: owner.sessionId ?? row.coordinatorSessionId, foregroundRevision: owner.revision,
@@ -1033,14 +1059,62 @@ function collectResult(row: Row): void {
     ...(row.dispatchId ? { dispatchId: row.dispatchId, workerStarted: row.workerStarted } : {}),
     roleId: row.roleId, planId: row.interest?.planId, unitId: row.interest?.unitId,
   });
+  const message: ResultMessage = row.tableRoot
+    ? row.tableRoot.sealed!.inline(payload => ({ customType: "pitako.worker.result" as const, content: JSON.stringify(payload), display: true as const, details,
+      // Budget includes the busy-boundary wrapper as well as the idle message.
+      type: "custom_message" as const }))
+    : { customType: "pitako.worker.result", content: row.outcome.result, display: true, details };
   row.handoff = {
-    message: Object.freeze({ customType: "pitako.worker.result", content: row.outcome.result, display: true, details }),
+    message: Object.freeze(message),
     collection: "collected", bookkeeping: row.reconcileBookkeeping ? "pending" : "inapplicable",
     delivery: "pending", continuation: "not-requested",
     bookkeepingAttempts: 0, deliveryAttempts: 0, wakeAttempts: 0, outstanding: false, busyContinuation: false,
   };
+  // Seal and exact delivery are already fixed. Neither readers nor delivery join disk.
+  startTableResultArchive(row);
   reconcileBookkeeping(row);
   publishHandoff(row);
+}
+
+function startTableResultArchive(row: Row): void {
+  const root = row.tableRoot;
+  if (!root?.sealed || root.archive || row.closure.state !== "released") return;
+  root.archive = startTableArchive(root.registration.archive, root.resultId, root.sealed.canonical);
+}
+
+function tableRow(token: symbol, instanceId: string) {
+  const row = bag().rows.get(instanceId);
+  if (!row || row.teamOwnerToken !== token || !liveOwner(row)) throw new Error("unknown or retired table root");
+  return row;
+}
+export function isTableRoot(token: symbol, instanceId: string) {
+  return !!tableRow(token, instanceId).tableRoot;
+}
+export function readTableResult(token: symbol, instanceId: string, options: TableRead) {
+  const row = tableRow(token, instanceId);
+  if (!row.tableRoot?.sealed) throw new Error("table result pending or closure unknown");
+  return row.tableRoot.sealed.read(options);
+}
+export function readTableDiagnostic(token: symbol, instanceId: string, options: TableRead) {
+  const row = tableRow(token, instanceId), root = row.tableRoot;
+  if (!root) throw new Error("not a table root");
+  if (options.cursor === undefined) root.cut = sealPages({
+    ...root.registration.diagnostic?.() as object,
+    host: { ...teamWorkerStatus(token, instanceId)[0],
+      ...(row.outcome && !root.registration.semantic?.().judgment ? { failure: row.outcome.result } : {}) }, closure: row.closure,
+    resultId: root.sealed?.id, handoff: workerHandoff(instanceId),
+    archive: root.archive?.state ?? { state: "pending" },
+  });
+  if (!root.cut) throw new Error("unknown or retired diagnostic cut");
+  return root.cut.read(options);
+}
+export function tableRootStatus(token: symbol, instanceId: string) {
+  const row = tableRow(token, instanceId), root = row.tableRoot;
+  if (!root) return undefined;
+  return { role: root.registration.protocol, teamId: row.teamId, memberId: row.memberId,
+    assignmentId: row.teamAssignmentId, instanceId: row.instanceId, status: statusOf(row),
+    closure: row.closure.state, resultAvailable: !!root.sealed, resultId: root.resultId,
+    delivery: row.handoff?.delivery ?? "pending" };
 }
 
 function reconcileBookkeeping(row: Row): void {
@@ -1206,7 +1280,7 @@ export function deliverWorkerResults(token: symbol, terminalOperation = false, r
   }
   if (!liveOwner(first) || bag().restrictions.has(token)) return;
   try {
-    first.deliveryOwner!.sendMessage("Interpret the complete Pitako worker results already supplied in context. Decide the next authorized work; no result fetch or acknowledgement is required.");
+    first.deliveryOwner!.sendMessage("Interpret Pitako worker results already supplied in context. Table results may be inline or incomplete references: read pertinent team_result sections before dependent judgment. Ordinary worker results need no fetch. Delivery and completion are not product acceptance.");
   } catch (error) {
     for (const row of wakes) {
       if (!liveOwner(row)) continue;

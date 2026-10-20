@@ -2,7 +2,7 @@
 
 Reviewer tables are the sole public Reviewer route over Team. Use `review_start` for the existing independent Reviewer pass in `$plan`, `$execute` or `pre-pr`; it adds no pass. Individual Reviewer calls reject before dispatch and direct callers to `review_start`.
 
-Each table has a new independent substantive Reviewer director/root and zero to five optional specialists selected for utility with reasons, including zero. They are separate from designers, implementers and the accepting coordinator. Every judge receives the complete object and criteria. A mandate focuses investigation without forbidding other material findings. Optional Scout, Researcher and Oracle supports supply knowledge, not judge findings.
+Each table has a new independent substantive Reviewer director/root and zero to five optional specialists selected for utility with reasons, including zero. They are separate from designers, implementers and the accepting coordinator. Every judge reviews the whole selected object against all criteria through its own exploration. A mandate focuses investigation without forbidding other material findings. Optional Scout, Researcher and Oracle supports supply knowledge, not judge findings.
 
 The table does not implement corrections, accept units, freeze plans, declare READY, change requirements or waive gates. Corrections remain outside the table. Judgment does not require unanimity and is not a majority vote. [Architecture tables](architecture.md) are the separate Architect route, without a `mode` parameter or individual fallback.
 
@@ -32,7 +32,7 @@ Only eligible provider failures permit fallback. Disagreement, failed tests, can
 ## Foreground API
 
 - `review_start({goal, object, criteria, topic?, plan?, unit?, boardTopicId?})` starts the table. `goal` is a nonempty work brief; `criteria` is a nonempty array of nonempty strings. The response contains the real exterior Team `assignmentId`, `roomId`, member, instance and dispatch identities, not an approval.
-- `review_read({roomId, cursor?})` returns bounded diagnostic fragments, state and identities. It is optional. Reads do not transport or acknowledge the exterior result.
+- `review_read({roomId, section?, maxBytes?})` starts an immutable diagnostic cut; continue with `{roomId, cursor}` only. All fields are paged, not just journal text. Budgets are 4096..16384 bytes, default 16384, over the final owned JSON envelope. A new start replaces only this room's cut. Reads do not acknowledge the exterior result.
 - `review_control({roomId, action, text?})` accepts `context`, `priorities`, `finish` or `stop`. Context and priorities queue nonempty text for the next frontier without replacing the object or criteria. Finish drains current work and requests synthesis; it cannot invent missing review. Stop revokes and joins owned work. A stopping receipt is not closure.
 
 There is no individual Reviewer fallback or direct review-table mode. Use a `brief` object for a bounded question. Native steering of table participants is rejected in favor of table controls.
@@ -48,6 +48,10 @@ The `object` selector has three forms:
 Requests include purpose, scope, criteria, evidence references and current identities. The coordinator supplies the agreed local base and quiescence. Git capture is local and read-only, without network, external diff, textconv or filters. Unsupported or incomplete capture rejects with a diagnostic rather than silently omitting material.
 
 The host reobserves the object after synthesis. Observed drift or failed reobservation prevents a favorable report and retains earlier findings. Fingerprints identify observed endpoints, not transactional snapshots, ABA-proof history or freshness during disposal or after delivery. The coordinator compares the reviewed object with the decision object before using the judgment. Material edits invalidate affected judgment under the workflow's review policy.
+
+The capture stays private to the host. Prompts and the exterior report carry an object descriptor, not captured plan text, patches, manifests or file bytes. The descriptor contains the selector, effective root, launch identity and capture limits. A plan descriptor adds its path, revision and exploration rules. A diff descriptor adds resolved base, merge-base and HEAD references. Brief text remains inline.
+
+The effective root may come from a compatible execution binding rather than the foreground working directory. Participants use their existing read, search, shell, CodeGraph and LSP analysis tools there. They inspect local plan text, commits, the index and current files as needed. Exploration is not an immutable filesystem view. It grants no edits, installs, fetches or provider demonstrations, and Bash is not sandboxed.
 
 ## Workflow correlation and root records
 
@@ -69,7 +73,11 @@ Only the actual returned exterior root assignment belongs in `## Planning worker
 
 ## Deliberation and findings
 
-The director prepares once and independently reviews the whole object against all criteria, with findings and responses of its own, even without specialists or after all specialists fail. New specialists prepare independently without peer findings. Each round gives participants the same immutable snapshot. Contributions publish together after settlement in stable order, not arrival order. The director can continue, consult, synthesize early or selectively recompose within five rounds. Final clarification does not authorize a sixth round.
+The director prepares once and independently reviews the whole object against all criteria, with findings and responses of its own, even without specialists or after all specialists fail. New specialists prepare independently without peer findings. Preparation prompts contain the brief, descriptor, criteria and individual mandate, not peer deliberation.
+
+Later stages receive inputs for their task rather than the full journal. Round participants receive the same immutable cut of confirmed preparations, contributions, knowledge, controls and failures. Canonical findings and author responses accompany those review inputs. Supports receive their assigned doubts and closed prerequisite results. Knowledge integration receives the current consultation plan and outcomes. Synthesis receives confirmed review results and linked knowledge, including pending doubts and known failures. These are scoped inputs, not a constant-context or unlimited-context guarantee.
+
+Contributions publish together after settlement in stable order, not arrival order. The director can continue, consult, synthesize early or selectively recompose within five rounds. Final clarification does not authorize a sixth round.
 
 Optional supports run in finite batches, with at most two owners including preparation and disposal. Dependent work waits for successful prerequisite completion and closure. Composition is the total desired set: retain eligible specialists with their identities, conversations and frozen policies, add new candidates, and retire omitted members. A reason is required even for zero specialists. Recomposition validates before revocation and waits for outgoing closure before seat reuse; it is selective, not mandatory, with no fixed preference for zero.
 
@@ -79,18 +87,24 @@ Synthesis disposes each published finding exactly once as `upheld`, `rejected`, 
 
 ## Exterior report and judgment
 
-After owned physical closure, the existing automatic exterior result carries the complete JSON `ReviewReport` in `AgentRunResult.result`. It includes the object and criteria, canonical findings, responses, provenance, synthesis and dispositions or their explicit absence, failures, observed identities and limits. No read or result fetch is needed to discover objections. Internal participant results are not foreground delivery.
+After owned physical closure, automatic delivery carries a selected semantic report inline when the final owned envelope fits 4096 UTF-8 bytes, otherwise an incomplete notice with an active result ID. `team_result({assignmentId, section?, maxBytes?})` reads that same immutable report. Read pertinent sections before dependent judgment; an automatic reference is not the full report already in context. Start budgets are integers from 4096 to 16384 bytes, default 16384. Continue with `{assignmentId, cursor}` only. No unlimited `full:true` or automatic full-load loop is supported. Concatenating `report` fragments reconstructs the canonical serialization exactly. Header and metadata are bounded; payload is emitted once. Byte limits do not guarantee space in every context.
 
-The actual exterior status and report's top-level fields govern interpretation:
+The report retains the goal, criteria, object descriptor, observations, every published finding (including withdrawals, duplicates, nonblockers and synthesis additions), author responses, reasons, evidence, pending questions, failures, model observations and limits. `judgment` holds the authorized terminal judgment; cancellation during disposal leaves it null. Discarded synthesis may remain historical, never current. Internal participant results never deliver foreground judgments.
+
+`grounds` contains pertinent reasoning for disposition references to journal messages or doubts, preserving reference and author information without copying message envelopes. Cited doubts include question and purpose; resolutions and supporting responses include answers, evidence and limits, with consultation IDs distinct from message IDs. The report contains no `messages` or captured `object.scope`. `review_read` provides deeper diagnostics through an immutable paged cut.
+
+The actual exterior `host.status` and authorized `judgment` fields govern interpretation. A null judgment cannot approve:
 
 - `completion: "complete" | "partial" | "failed"` describes review work.
 - `verdict: "no-blockers" | "changes-required" | "inconclusive"` describes judgment.
 
 Complete work projects exterior `completed` even when it requires changes or is inconclusive. Partial and failed work project `failed`; stop or cancellation projects `cancelled`. Failed, cancelled, partial or drifted work, and missing indispensable evidence, cannot approve. Material upheld or unresolved blockers prevent `no-blockers`. A final inconclusive judgment blocks approval. Even `no-blockers` is not coordinator acceptance, freeze, READY or a gate waiver.
 
-Cancellation retains published findings and historical synthesis or dispositions, but top-level completion becomes `failed` and verdict becomes `inconclusive`. Nested complete or favorable synthesis is historical evidence, not final authority. Optional `review_read` may show the driver finished while exterior cancellation is still settling. Room state, reads and status alone establish neither approval nor closure.
+Cancellation retains published findings and may retain discarded synthesis or dispositions under `history`, but leaves `judgment` null. Historical complete or favorable synthesis is not final authority. Optional `review_read` may show the driver finished while exterior cancellation is still settling. Room state, reads and status alone establish neither approval nor closure.
 
 Successful terminal reconciliation removes only that assignment's work hold, never accepts the product. Failed or cancelled holds retain their existing recovery requirements. Starts, prompts, callbacks, aborts and disposal must settle before exterior delivery or resource release. Unknown closure retains reservations and diagnostics without a fictitious result.
+
+Review uses the same [auxiliary report archive](architecture.md#auxiliary-report-archive) as Architect. The canonical report and fixed notice never wait for disk; `review_read({roomId, section: "archive"})` pages the separate current archive state. Only `written` supplies a complete usable path. A new diagnostic cut does not rewrite existing pages or the final report. Retirement joins owned archive I/O; uncertain close retains resources. The copy adds no execution authority, ledger, personal registry or restart recovery.
 
 ## Limits
 

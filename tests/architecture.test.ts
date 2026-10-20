@@ -28,15 +28,15 @@ for (const protocol of ["architecture", "review"] as const) {
       expect(s.host.sessions).toHaveLength(1);
       expect(s.host.sessions[0]!.model!.id).toBe("director");
       expect(s.seen.map(item => item.request.stage)).toEqual(["composition", "preparation", "consultation-plan", "contribution", "decision", "synthesis"]);
-      const page = (await s.invoke(`${protocol}_read`, { roomId: start.details.roomId })).details;
+      const page = await s.read(`${protocol}_read`, { roomId: start.details.roomId });
       expect(page.state).toBe("finished"); expect(page.round).toBe(1); expect(page.members).toHaveLength(1);
       expect(page.snapshot.general).toEqual([]); expect(page.snapshot.topics).toEqual([]);
-      expect(JSON.stringify(page.fragments)).toContain(protocol === "architecture" ? "Use the bounded design" : "Reviewed complete object");
-      expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("completed");
+      expect(JSON.stringify(page.messages)).toContain(protocol === "architecture" ? "Use the bounded design" : "Reviewed complete object");
+      expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("completed");
       expect(s.host.sessions[0]!.events).toContain("dispose");
       if (protocol === "review") {
         for (const { request } of s.seen.filter(item => ["preparation", "contribution"].includes(item.request.stage))) {
-          expect(request.object.scope.text).toBe("Bounded proposal"); expect(request.criteria).toEqual(["Preserve ownership", "Remain bounded"]);
+          expect(request.object.selector).toEqual({ kind: "brief", text: "Bounded proposal" }); expect(request.criteria).toEqual(["Preserve ownership", "Remain bounded"]);
         }
       }
     } finally { await s.close(); }
@@ -47,7 +47,7 @@ for (const protocol of ["architecture", "review"] as const) {
       const start = await s.invoke(`${protocol}_start`, protocol === "architecture" ? { goal: "No director target" }
         : { goal: "No director target", object: { kind: "brief", text: "Bounded proposal" }, criteria: ["Ownership"] });
       expect(start.isError).toBe(true);
-      expect(start.details.error).toContain(`model policy "${protocol === "architecture" ? "architect" : "reviewer"}" has no primary target.`);
+      expect(JSON.parse(start.content[0].text).message).toContain(`model policy "${protocol === "architecture" ? "architect" : "reviewer"}" has no primary target.`);
       expect(s.host.sessions).toEqual([]); expect(teamAssignments(s.evaluation)).toEqual([]);
       expect(teamWorkerStatus(s.evaluation.token)).toEqual([]);
       expect(s.sent).toEqual([]);
@@ -103,8 +103,8 @@ for (const protocol of ["architecture", "review"] as const) {
       const start = await s.invoke(`${protocol}_start`, { goal: "Keep useful conversations and original evidence",
         ...(protocol === "review" ? { object: { kind: "brief", text: "Complete object" }, criteria: ["Keep evidence"] } : {}) });
       await s.delivered.promise;
-      const result = (await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details;
-      expect(result.status).toBe("completed");
+      const result = await s.read("team_result", { assignmentId: start.details.assignmentId });
+      expect(result.host.status).toBe("completed");
       expect(compositions).toBe(4); expect([...frontiers.keys()]).toEqual([1, 2, 3, 4]);
       expect(s.seen.filter(item => item.request.stage === "preparation")).toHaveLength(4);
       expect(s.seen.filter(item => item.request.stage === "consultation-plan")).toHaveLength(3);
@@ -114,9 +114,9 @@ for (const protocol of ["architecture", "review"] as const) {
       expect(sessions.get("First").prompts.filter((text: string) => JSON.parse(text).stage === "preparation")).toHaveLength(1);
       expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
       if (protocol === "review") {
-        const report = JSON.parse(s.sent.find(item => item.message.customType === "pitako.worker.result")!.message.content);
+        const report = result;
         expect(report.findings[0].memberId).toBe(retiredId); expect(report.findings[0].key).toBe("retired-dissent");
-        expect(report.dispositions).toHaveLength(1); expect(report.dispositions[0].findingId).toBe(report.findings[0].id);
+        expect(report.judgment.dispositions).toHaveLength(1); expect(report.judgment.dispositions[0].findingId).toBe(report.findings[0].id);
       }
     } finally { await s.close(); }
   }));
@@ -133,9 +133,9 @@ for (const protocol of ["architecture", "review"] as const) {
       const start = await s.invoke(`${protocol}_start`, { goal: "Never replace director authority",
         ...(protocol === "review" ? { object: { kind: "brief", text: "Complete object" }, criteria: ["Authority"] } : {}) });
       await s.delivered.promise;
-      expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("failed");
-      const page = (await s.invoke(`${protocol}_read`, { roomId: start.details.roomId })).details;
-      expect(page.fragments.map((fragment: any) => fragment.text).join("")).toContain('"stage":"preparation"');
+      expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("failed");
+      const page = await s.read(`${protocol}_read`, { roomId: start.details.roomId });
+      expect(JSON.stringify(page.messages)).toContain('"stage":"preparation"');
       expect(s.seen.filter(item => item.request.stage === "preparation")).toHaveLength(1);
       expect(s.seen.find(item => item.request.stage === "preparation")!.session.model.id).toBe("chosen");
       const root = s.seen.find(item => item.request.stage === "composition")!.session;
@@ -206,7 +206,7 @@ test("registered start publishes Markdown guidance and preserves the original br
     expect(s.seen.filter(item => item.request.stage === "contribution").at(-1)!.request.context.shared.controls).toContainEqual({ action: "priorities", text: "Preserve ownership first" });
     releases[1]!.resolve(); await s.delivered.promise;
     for (const { request } of s.seen) expect(request.goal).toBe(goal);
-    expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("completed");
+    expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("completed");
     expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
   } finally { release(); await s.close(); }
 }));
@@ -231,16 +231,18 @@ test("registered watched table preserves owner/history/cursors/holds and deliver
     expect(hold[0]!.assignmentId).toBe(handle.assignmentId);
     expect(workerHandoff(handle.instanceId)).toBeUndefined();
     expect(firstTeamReservation(s.evaluation, "architect")).toBe(handle.assignmentId);
-    const page = (await s.invoke("architecture_read", { roomId: handle.roomId })).details;
-    expect(page.state).toBe("running"); expect(page.delivery).toEqual([]);
-    expect(page.cursor).not.toBeNull();
-    const fragments = [...page.fragments]; let cursor = page.cursor;
-    while (cursor) { const next = (await s.invoke("architecture_read", { roomId: handle.roomId, cursor })).details; expect(next.cut).toBe(page.cut); fragments.push(...next.fragments); cursor = next.cursor; }
-    expect(fragments.map(fragment => fragment.text).join("")).toContain("🧠");
+    const page = JSON.parse((await s.invoke("architecture_read", { roomId: handle.roomId })).content[0].text);
+    expect(page.header.cursor).not.toBeNull();
+    let text = page.fragment, cursor = page.header.cursor;
+    while (cursor) { const next = JSON.parse((await s.invoke("architecture_read", { roomId: handle.roomId, cursor })).content[0].text);
+      expect(next.header.id).toBe(page.header.id); text += next.fragment; cursor = next.header.cursor; }
+    const diagnostic = JSON.parse(text);
+    expect(diagnostic.state).toBe("running"); expect(diagnostic.delivery).toEqual([]);
+    expect(text).toContain("🧠");
     expect((await s.invoke("architecture_read", { roomId: handle.roomId, cursor: "invalid" })).isError).toBe(true);
     const encodeCursor = (values: unknown[]) => Buffer.from(JSON.stringify(values)).toString("base64url");
-    for (const values of [[page.snapshot.id, page.cut + 1, 0, 0, 1], [page.snapshot.id, page.cut, 0, -1, 1],
-      ["foreign", page.cut, 0, 0, 1], [page.snapshot.id, page.cut, 0, 999999, 1]])
+    for (const values of [[diagnostic.snapshot.id, page.header.id + 1, 0, 0, 1], [diagnostic.snapshot.id, page.header.id, 0, -1, 1],
+      ["foreign", page.header.id, 0, 0, 1], [diagnostic.snapshot.id, page.header.id, 0, 999999, 1]])
       expect((await s.invoke("architecture_read", { roomId: handle.roomId, cursor: encodeCursor(values) })).isError).toBe(true);
     const firstSession = s.host.sessions.find(session => session.model?.id === "chosen")!;
     expect(firstSession.events).not.toContain("dispose");
@@ -252,7 +254,7 @@ test("registered watched table preserves owner/history/cursors/holds and deliver
     expect(s.host.sessions).toHaveLength(2);
     expect(readLedgerTeamHolds(s.root, "architecture-plan")).toEqual(hold);
     const list = await s.invoke("agent_history", { action: "list" }); expect(JSON.stringify(list.details)).toContain(handle.assignmentId);
-    const specialistMessage = (await s.invoke("architecture_read", { roomId: handle.roomId })).details;
+    const specialistMessage = await s.read("architecture_read", { roomId: handle.roomId });
     expect(specialistMessage.members.filter((member: any) => member.id !== handle.assignmentId)).toHaveLength(1);
     continueDecision.resolve(); await disposing.promise;
     expect(workerHandoff(handle.instanceId)).toBeUndefined(); expect(readLedgerTeamHolds(s.root, "architecture-plan")).toEqual(hold);
@@ -262,7 +264,7 @@ test("registered watched table preserves owner/history/cursors/holds and deliver
     expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
     expect(workerHandoff(handle.instanceId)).toMatchObject({ bookkeeping: "reconciled", delivery: "incorporated" });
     expect(readLedgerTeamHolds(s.root, "architecture-plan")).toEqual([]);
-    expect((await s.invoke("team_result", { assignmentId: handle.assignmentId })).details.status).toBe("completed");
+    expect((await s.read("team_result", { assignmentId: handle.assignmentId })).host.status).toBe("completed");
     const dispatch = s.host.sessions[0]!.sessionManager.getEntries().find((entry: any) => entry.customType === "pitako.architecture.dispatch") as any;
     expect(dispatch.data.callerSessionId).toBe(s.host.sessions[0]!.sessionId);
     expect(dispatch.data.parentAssignmentId).toBe(handle.assignmentId);
@@ -287,7 +289,7 @@ test("finish drains active contributions and preserves truncation as partial rat
     release.resolve(); await s.delivered.promise;
     expect(s.seen.filter(item => item.request.stage === "contribution")).toHaveLength(2);
     expect(s.seen.some(item => item.request.stage === "decision")).toBe(false);
-    expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("failed");
+    expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("failed");
     expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
   } finally { release.resolve(); await s.close(); }
 }));
@@ -307,7 +309,7 @@ test("bind-captured submit supports the first and subsequent authorized native t
     await s.invoke("architecture_control", { roomId: start.details.roomId, action: "context", text: "second native turn" });
     release.resolve(); await s.delivered.promise;
     expect(s.seen.filter(item => item.request.stage === "contribution" && item.model === "chosen").map(item => item.session)).toEqual([specialist, specialist]);
-    expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("completed");
+    expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("completed");
     expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
   } finally { release.resolve(); await s.close(); }
 }));
@@ -351,7 +353,7 @@ test("topic fallback deduplicates models, uses each target's default, and restar
     expect(attempts.slice(3).map(item => [item.model, item.level])).toEqual([["chosen", "high"], ["other", "minimal"], ["general", "minimal"]]);
     expect(new Set(attempts.map(item => item.session)).size).toBe(1);
     expect(s.host.sessions).toHaveLength(2);
-    expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("completed");
+    expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("completed");
   } finally { release.resolve(); await s.close(); }
 }));
 
@@ -390,7 +392,7 @@ for (const invalid of ["snapshot", "model", "reasoning", "bind-reasoning", "miss
     } });
     try {
       const start = await s.invoke("architecture_start", { goal: "reject" }); await s.delivered.promise;
-      expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("failed");
+      expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("failed");
       expect(contributionAttempts).toBe(["snapshot", "model", "reasoning", "bind-reasoning"].includes(invalid) ? 0 : 1);
       expect(s.host.sessions.some(session => session.prompts.some(text => JSON.parse(text).stage === "contribution") && !["director", "chosen"].includes(session.model?.id ?? ""))).toBe(false);
       expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
@@ -415,7 +417,7 @@ test("a contextual rejection permits one corrected contribution with an idempote
   try {
     const start = await s.invoke("architecture_start", { goal: "Correct a contextual reference" }); await s.delivered.promise;
     expect(corrections).toBe(1);
-    expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("completed");
+    expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("completed");
     expect(s.host.sessions).toHaveLength(2);
     expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
   } finally { await s.close(); }
@@ -457,14 +459,14 @@ test("direct and codemode-reachable participant capabilities are leaf, and prior
     expect(forbiddenCalls).toBe(0);
     await s.invoke("architecture_control", { roomId: start.details.roomId, action: "context", text: "new turn" });
     release.resolve(); await s.delivered.promise;
-    expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("completed");
+    expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("completed");
     expect(s.host.sessions).toHaveLength(2); expect(forbiddenCalls).toBe(0);
     expect((await oldSubmit!()).isError).toBe(true); // retired origin after disposal
     const specialist = s.host.sessions.find(session => session.model?.id === "chosen")!;
     expect((await specialist.boundTools.get("architecture_submit").execute("outside", {}, undefined, undefined, { sessionManager: specialist.sessionManager })).isError).toBe(true);
-    const page = (await s.invoke("architecture_read", { roomId: start.details.roomId })).details;
-    expect(page.fragments.map((fragment: any) => fragment.text).join("")).toContain("Use a bounded design");
-    expect(page.fragments.map((fragment: any) => fragment.text).join("")).not.toContain("mutated after receipt");
+    const page = await s.read("architecture_read", { roomId: start.details.roomId });
+    expect(JSON.stringify(page.messages)).toContain("Use a bounded design");
+    expect(JSON.stringify(page.messages)).not.toContain("mutated after receipt");
   } finally { release.resolve(); await s.close(); }
 }));
 
@@ -524,7 +526,7 @@ for (const route of ["stop", "team_cancel"] as const) {
         held();
         releaseAbort.resolve(); await disposing.promise; held();
         releaseDispose.resolve(); await s.delivered.promise;
-        expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("cancelled");
+        expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("cancelled");
         expect(s.host.sessions).toHaveLength(before.length);
         expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
         for (const { session, prompts } of before) expect(session.prompts).toEqual(prompts);
@@ -553,7 +555,7 @@ for (const route of ["stop", "team_cancel"] as const) {
       expect(activations).toEqual(before.activations);
       expect(s.host.sessions.map(session => session.prompts)).toEqual(before.prompts);
       expect(listObservations().some(row => row.fallbackOccurred)).toBe(false);
-      expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("cancelled");
+      expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("cancelled");
       expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
     } finally { release.resolve(); await s.close(); }
   }));
@@ -569,7 +571,7 @@ for (const retire of ["stop", "session_start", "session_shutdown"] as const) {
       const retirement = retire === "stop" ? s.invoke("architecture_control", { roomId: start.details.roomId, action: "stop" }) : s.emit(retire);
       await tick(); expect(workerHandoff(start.details.instanceId)).toBeUndefined();
       release.resolve(); await retirement;
-      if (retire === "stop") { await s.delivered.promise; expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("cancelled"); }
+      if (retire === "stop") { await s.delivered.promise; expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("cancelled"); }
       expect(contributions).toBe(1); expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
       expect(s.sent.filter(item => item.message.customType === "pitako.worker.result")).toHaveLength(retire === "stop" ? 1 : 0);
     } finally { release.resolve(); await s.close(); }
@@ -584,7 +586,7 @@ test("partial synthesis is failed and a bound draft without a ledger never inven
     writeFileSync(file, `---\nid: draft\nrevision: 1\nstatus: draft\nboard_topic_id: ${topic.id}\n---\nDraft.\n`);
     const start = await s.invoke("architecture_start", { goal: "partial", plan: "draft", unit: "T2" }); await s.delivered.promise;
     expect(existsSync(ledgerFile("draft", s.root))).toBe(false);
-    expect((await s.invoke("team_result", { assignmentId: start.details.assignmentId })).details.status).toBe("failed");
+    expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("failed");
     expect(existsSync(ledgerFile("draft", s.root))).toBe(false);
   } finally { await s.close(); }
 }));

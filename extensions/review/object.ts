@@ -17,6 +17,21 @@ export interface ReviewObject {
   selector: ObjectSelector; root: string; identity: string; scope: unknown;
   limits: string[];
 }
+/** Exploration coordinates from the private capture, never captured document or patch bytes. */
+export function describeObject(object: ReviewObject) {
+  const common = { selector: structuredClone(object.selector), root: object.root, identity: object.identity, limits: [...object.limits] };
+  if (object.selector.kind === "plan") {
+    const { file, revision } = object.scope as { file: string; revision: number };
+    return { ...common, file, revision,
+      exploration: "Read the plan locally. Exclude only the actual ATX H2 Planning workers section through the next H1/H2 (ATX or Setext). Ignore headings inside fenced code or HTML comments; preserve frontmatter and all other content." };
+  }
+  if (object.selector.kind === "diff") {
+    const { base, mergeBase, head } = object.scope as { base: string; mergeBase: string; head: string };
+    return { ...common, base, mergeBase, head,
+      exploration: "Explore locally without fetch: committed changes from mergeBase to head, staged changes against head, and current raw working bytes, deletions and untracked files. This is not git diff HEAD alone. Do not apply external diff, textconv or clean/smudge filters. The endpoint fingerprint does not promise immutable exploration." };
+  }
+  return common; // The brief selector itself carries the assignment text.
+}
 const digest = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
 
 /** Headings inside comments or fenced code do not delimit operational sections. */

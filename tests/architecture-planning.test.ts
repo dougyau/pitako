@@ -32,7 +32,9 @@ function writePlan(root: string, status: "draft" | "frozen", topic?: number) {
         await s.delivered.promise;
         const terminal = s.branch.filter(entry => entry.customType === "pitako.worker.result");
         expect(terminal).toHaveLength(1);
-        expect(terminal[0].details).toMatchObject({ assignmentId: start.details.assignmentId, status: "completed", ...(bound ? {} : { planId: "planning", unitId: "architect-pass" }) });
+        expect(terminal[0].details).toMatchObject({ assignmentId: start.details.assignmentId, status: "completed" });
+        const report = await s.read("team_result", { assignmentId: start.details.assignmentId });
+        expect(report.host).toMatchObject(bound ? {} : { planId: "planning", unitId: "architect-pass" });
         expect(existsSync(ledgerFile("planning", s.root))).toBe(false);
         expect(readFileSync(file, "utf8")).toBe(draft);
         const after = await openBoard();
@@ -67,7 +69,8 @@ function writePlan(root: string, status: "draft" | "frozen", topic?: number) {
         expect(s.host.sessions).toEqual([]);
         const terminal = s.branch.filter(entry => entry.customType === "pitako.worker.result");
         expect(terminal).toHaveLength(1); expect(terminal[0].details.status).toBe("failed");
-        expect(terminal[0].content).toContain(rejection === "bound-topic-bypass" ? "explicit Board topics require a bound watched plan" : "hash");
+         const report = await s.read("team_result", { assignmentId: start.details.assignmentId });
+         expect(report.host.failure).toContain(rejection === "bound-topic-bypass" ? "explicit Board topics require a bound watched plan" : "hash");
         expect(readFileSync(file, "utf8")).toBe(draft);
         if (ledger === undefined) expect(existsSync(ledgerFile("planning", s.root))).toBe(false);
         else expect(readFileSync(ledgerFile("planning", s.root), "utf8")).toBe(ledger);
@@ -106,7 +109,7 @@ function writePlan(root: string, status: "draft" | "frozen", topic?: number) {
         held();
         const members = (await s.invoke("team_status", {})).details.members.filter((member: any) => member.teamId === start.details.roomId);
         expect(members).toHaveLength(2); // one actual Architect root and one internal Architect specialist
-        expect(members.every((member: any) => member.role === "architect")).toBe(true);
+         expect(members.map((member: any) => member.role).sort()).toEqual(["architect", "architecture"]);
         expect(members.filter((member: any) => member.assignmentId === start.details.assignmentId)).toHaveLength(1);
         const boundary = await s.emit("agent_before_settle", { outcome: "completed", context: { canContinue: true } });
         expect((boundary?.entries ?? []).filter((entry: any) => entry.customType === "pitako.worker.result")).toEqual([]);
@@ -118,8 +121,17 @@ function writePlan(root: string, status: "draft" | "frozen", topic?: number) {
         const status = outcome === "complete" ? "completed" : outcome === "cancelled" ? "cancelled" : "failed";
         const terminal = s.branch.filter(entry => entry.customType === "pitako.worker.result");
         expect(terminal).toHaveLength(1);
-        expect(terminal[0].details).toMatchObject({ assignmentId: start.details.assignmentId, instanceId: start.details.instanceId, planId: "planning", unitId: "architect-pass", status });
-        expect(terminal[0].content).toContain(outcome === "failed" ? "architecture protocol failed: no valid settled submit" : outcome === "cancelled" ? "cancel" : "Current-object judgment: keep coupled units together");
+         expect(terminal[0].details).toMatchObject({ assignmentId: start.details.assignmentId, instanceId: start.details.instanceId, status });
+         const report = await s.read("team_result", { assignmentId: start.details.assignmentId });
+         expect(report.host).toMatchObject({ planId: "planning", unitId: "architect-pass", status });
+         if (outcome === "failed") {
+           expect(report.judgment).toBeNull();
+           expect(report.host.failure).toContain("architecture protocol failed: no valid settled submit");
+           const diagnostic = await s.read("architecture_read", { roomId: start.details.roomId, section: "host" });
+           expect(diagnostic.failure).toBe(report.host.failure);
+         }
+         else if (outcome === "cancelled") expect(report.judgment).toBeNull();
+         else expect(report.judgment.recommendation).toBe("Current-object judgment: keep coupled units together");
         expect(readLedgerTeamHolds(s.root, "planning", opened.binding)).toEqual(outcome === "complete" ? [] : [{ assignmentId: start.details.assignmentId, unitId: "architect-pass", status: outcome === "cancelled" ? "cancelled" : "failed" }]);
         expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
         expect(s.sent.filter(item => item.message.customType === "pitako.worker.result")).toHaveLength(1);
@@ -127,8 +139,8 @@ function writePlan(root: string, status: "draft" | "frozen", topic?: number) {
         await s.emit("turn_start");
         expect(workerHandoff(start.details.instanceId)?.continuation).toBe("observed");
         await s.emit("message_end", { message: { role: "assistant", stopReason: "stop" } });
-        const diagnostic = await s.invoke("team_result", { assignmentId: start.details.assignmentId });
-        expect(diagnostic.details.status).toBe(status); // optional re-read does not transport, acknowledge or accept
+        const diagnostic = await s.read("team_result", { assignmentId: start.details.assignmentId });
+        expect(diagnostic.host.status).toBe(status); // optional re-read does not transport, acknowledge or accept
         expect(readLedgerTeamHolds(s.root, "planning", opened.binding)).toEqual(outcome === "complete" ? [] : [{ assignmentId: start.details.assignmentId, unitId: "architect-pass", status: outcome === "cancelled" ? "cancelled" : "failed" }]);
         expect(s.sent.filter(item => item.message.customType === "pitako.worker.result")).toHaveLength(1);
       } finally { release(); await s.close(); }
