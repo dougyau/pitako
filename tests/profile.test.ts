@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { isProtectedEditPath } from "../extensions/paths.ts";
-import { childActiveTools, childSessionNote, parseProfile, profileNote, toolsForProfile } from "../extensions/profile.ts";
+import { childActiveTools, childSessionNote, isOrchestrationTool, parseProfile, profileNote, toolsForProfile } from "../extensions/profile.ts";
 
 const available = [
   "read",
@@ -68,6 +68,17 @@ describe("profiles", () => {
     expect(tools).toEqual(expect.arrayContaining(["acp_delegate", "acp_delegate_wait", "compress"]));
   });
 
+  test("result disposition stays foreground-only in coding and consultation profiles", () => {
+    const available = ["read", "execution_disposition"];
+    expect(isOrchestrationTool("execution_disposition")).toBe(true);
+    for (const profile of ["coding", "analysis"] as const) {
+      expect(toolsForProfile({ available, profile })).toContain("execution_disposition");
+      for (const managed of [undefined, "leaf", "consultation", "head"] as const)
+        expect(toolsForProfile({ available, profile, child: true, managed })).not.toContain("execution_disposition");
+    }
+    expect(childActiveTools(available)).not.toContain("execution_disposition");
+  });
+
   test("Head local tools require the host grant while a Developer leaf retains only scope acknowledgment", () => {
     const local = ["head_consult", "head_plan", "head_checkpoint", "head_scope_ack"];
     const select = (managed?: "head" | "leaf" | "consultation", profile: "coding" | "analysis" = "coding") =>
@@ -118,8 +129,8 @@ describe("profiles", () => {
     expect(analysis).toContain("edit, write, apply_patch, and lsp_rename are not");
     expect(analysis).toContain("this profile is not a sandbox");
     expect(child).toContain("rpiv-todo is private to this session");
-    // Allow the shared TODO policy while keeping the always-on note brief.
-    expect(coding.length).toBeLessThan(1200);
+    // Navigation/TODO plus the effective authority and provenance policies.
+    expect(coding.length).toBeLessThan(2400);
   });
 });
 

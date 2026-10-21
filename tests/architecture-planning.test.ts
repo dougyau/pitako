@@ -64,13 +64,19 @@ function writePlan(root: string, status: "draft" | "frozen", topic?: number) {
         }
         const draft = readFileSync(file, "utf8");
         const start = await s.invoke("architecture_start", { goal: "Design-only judgment", ...(rejection === "bound-topic-bypass" ? { boardTopicId: String(topic) } : { plan: "planning", unit: "architect-pass" }) });
-        expect(start.isError).not.toBe(true); // preflight is asynchronous
-        await s.delivered.promise;
+        if (rejection === "incompatible-ledger") {
+          expect(start.isError).toBe(true);
+          expect(JSON.stringify(start.content)).toContain("hash");
+          expect(s.branch.filter(entry => entry.customType === "pitako.worker.result")).toEqual([]);
+        } else {
+          expect(start.isError).not.toBe(true);
+          await s.delivered.promise;
+          const terminal = s.branch.filter(entry => entry.customType === "pitako.worker.result");
+          expect(terminal).toHaveLength(1); expect(terminal[0].details.status).toBe("failed");
+          const report = await s.read("team_result", { assignmentId: start.details.assignmentId });
+          expect(report.host.failure).toContain("explicit Board topics require a bound watched plan");
+        }
         expect(s.host.sessions).toEqual([]);
-        const terminal = s.branch.filter(entry => entry.customType === "pitako.worker.result");
-        expect(terminal).toHaveLength(1); expect(terminal[0].details.status).toBe("failed");
-         const report = await s.read("team_result", { assignmentId: start.details.assignmentId });
-         expect(report.host.failure).toContain(rejection === "bound-topic-bypass" ? "explicit Board topics require a bound watched plan" : "hash");
         expect(readFileSync(file, "utf8")).toBe(draft);
         if (ledger === undefined) expect(existsSync(ledgerFile("planning", s.root))).toBe(false);
         else expect(readFileSync(ledgerFile("planning", s.root), "utf8")).toBe(ledger);
@@ -132,6 +138,7 @@ function writePlan(root: string, status: "draft" | "frozen", topic?: number) {
          }
          else if (outcome === "cancelled") expect(report.judgment).toBeNull();
          else expect(report.judgment.recommendation).toBe("Current-object judgment: keep coupled units together");
+        await s.bookkeeping(start.details.instanceId);
         expect(readLedgerTeamHolds(s.root, "planning", opened.binding)).toEqual(outcome === "complete" ? [] : [{ assignmentId: start.details.assignmentId, unitId: "architect-pass", status: outcome === "cancelled" ? "cancelled" : "failed" }]);
         expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
         expect(s.sent.filter(item => item.message.customType === "pitako.worker.result")).toHaveLength(1);

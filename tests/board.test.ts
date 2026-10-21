@@ -16,11 +16,12 @@ import {
   openBoard as openBoardUnowned,
 } from "../extensions/board/store.ts";
 import { boardWorkspace, currentWorkspace, repositoryIdentity } from "../extensions/board/workspace.ts";
-import { ledgerFile, openExecutionPlan, planFile, readPlan } from "../extensions/workflow.ts";
+import { ledgerFile, ledgerTemplate, openExecutionPlan, planFile, readPlan } from "../extensions/workflow.ts";
 import { registerExecution, unregisterExecution } from "../extensions/execution-identity.ts";
 import { recordPlanTeamWork } from "../extensions/team.ts";
 import { packageRoot } from "../extensions/stack.ts";
 import { workspaceCrashOwnership } from "./fixtures/workspace-crash-ownership.ts";
+import { RootGuard, registerBackgroundAttempt } from "../extensions/workflow-engine.ts";
 
 const tempDirs: string[] = [];
 const fixture = workspaceCrashOwnership(tempDirs);
@@ -630,6 +631,25 @@ describe("board tools", () => {
     mkdirSync(path.dirname(plan), { recursive: true });
     writeFileSync(plan, "---\nid: workflow-plan\nrevision: 1\nstatus: draft\nexecution: none\n---\n\nPlan.\n");
     const { tools } = registeredBoard();
+    const guard = new RootGuard(repo);
+    fixture.cleanup(() => guard.close());
+    const attempt = (planId: string, unitId: string, assignmentId: string) => {
+      const registered = registerBackgroundAttempt({ kind: "ordinary", guard }, { cwd: repo,
+        instanceId: assignmentId, dispatchId: assignmentId, roleId: "developer", assignmentId,
+        watch: { planId, unitId } });
+      registered.admit();
+      registered.checkProjection();
+      return registered;
+    };
+    const complete = (registered: ReturnType<typeof attempt>) => {
+      registered.result({ status: "completed", result: "Controlled successful work" });
+      registered.producer.observe("preparation", "closed");
+      registered.producer.observe("host-operation", "closed");
+      const receipt = registered.producer.observe("callback", "closed", true);
+      expect(receipt).toBeDefined();
+      recordPlanTeamWork(repo, registered.attempt.watch!.planId, registered.attempt.watch!.unitId,
+        registered.attempt.assignmentId, "completed", undefined, receipt);
+    };
     const create = tools.get("board_topic_create");
     const claim = tools.get("board_workflow_claim");
     const lifecycle = tools.get("board_workflow_lifecycle");
@@ -667,23 +687,36 @@ describe("board tools", () => {
     writeFileSync(ledger, "---\nplan_id: workflow-plan\nrevision: 1\nhash: stale\nstatus: running\n---\n");
     expect((await lifecycle.execute("stale", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo })).isError).toBe(true);
     const boundMeta = readPlan("workflow-plan", repo).meta;
-    writeFileSync(ledger, `---\nplan_id: workflow-plan\nrevision: 1\nhash: ${boundMeta.hash}\nstatus: USER_DECISION_REQUIRED\n---\n`);
-    expect((await lifecycle.execute("decision", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo })).isError).toBe(true);
+    writeFileSync(ledger, `---\nplan_id: workflow-plan\nrevision: ${boundMeta.revision}\nhash: ${boundMeta.hash}\nstatus: USER_DECISION_REQUIRED\n---\n`);
+    const decision = await lifecycle.execute("decision", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo });
+    expect(decision.isError).toBe(true);
+    expect(textOf(decision)).toContain("USER_DECISION_REQUIRED");
     const unchanged = await openBoard();
     expect(unchanged.readTopic(repositoryIdentity(repo), 1).topic.status).toBe("open");
     unchanged.close();
     rmSync(ledger);
     const currentPlanMeta = readPlan("workflow-plan", repo).meta;
-    writeFileSync(ledger, `---\nplan_id: workflow-plan\nrevision: 1\nhash: ${currentPlanMeta.hash}\nstatus: running\n---\n\n## Team Holds\n\n<!-- pitako-team-holds:v1 -->\n[]\n<!-- /pitako-team-holds -->\n`);
+    writeFileSync(ledger, ledgerTemplate(currentPlanMeta));
     recordPlanTeamWork(repo, "workflow-plan", "unit-a", "cancelled-without-outcome", "pending");
-    expect((await lifecycle.execute("pending", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo })).isError).toBe(true);
+    const pending = await lifecycle.execute("pending", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo });
+    expect(pending.isError).toBe(true);
+    expect(textOf(pending)).toContain("Team work for this plan");
     recordPlanTeamWork(repo, "workflow-plan", "unit-a", "cancelled-without-outcome", "cancelled");
-    expect((await lifecycle.execute("cancelled", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo })).isError).toBe(true);
+    const cancelled = await lifecycle.execute("cancelled", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo });
+    expect(cancelled.isError).toBe(true);
+    expect(textOf(cancelled)).toContain("Team work for this plan");
     recordPlanTeamWork(repo, "workflow-plan", "unit-b", "later-failure", "failed");
-    expect((await lifecycle.execute("failed", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo })).isError).toBe(true);
-    recordPlanTeamWork(repo, "workflow-plan", "unit-c", "later-success", "completed");
+    const failed = await lifecycle.execute("failed", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo });
+    expect(failed.isError).toBe(true);
+    expect(textOf(failed)).toContain("Team work for this plan");
+    expect(() => recordPlanTeamWork(repo, "workflow-plan", "unit-c", "unregistered-success", "completed"))
+      .toThrow("no registered attempt");
+    const success = attempt("workflow-plan", "unit-c", "later-success");
+    complete(success);
     recordPlanTeamWork(repo, "workflow-plan", "unit-a", "cancelled-without-outcome", undefined);
     recordPlanTeamWork(repo, "workflow-plan", "unit-b", "later-failure", undefined);
+    // Neither an unrelated real success nor cleanup-without-outcome recovers these holds.
+    expect((await lifecycle.execute("still-held", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo })).isError).toBe(true);
     const closedTopic = await create.execute("closed", { title: "closed unowned" }, undefined, undefined, { cwd: repo });
     const closedDraft = planFile("closed-draft", repo);
     writeFileSync(closedDraft, "---\nid: closed-draft\nrevision: 1\nstatus: draft\n---\n\nClosed.\n");
@@ -728,17 +761,29 @@ describe("board tools", () => {
     expect(missingOwner.readTopic(repositoryIdentity(repo), missingTopicId!).topic.ownerPlanId).toBeNull();
     missingOwner.close();
     expect((await lifecycle.execute("resolve-missing", { planId: "missing-execution", status: "resolved" }, undefined, undefined, { cwd: repo })).isError).toBe(true);
-    const resolving = lifecycle.execute("resolve-race", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo });
-    recordPlanTeamWork(repo, "workflow-plan", "resolve-race", "racing-dispatch", "pending");
+    // Independent valid progress must not require fabricating recovery of the failed plan.
+    const racePlan = planFile("race-plan", repo);
+    writeFileSync(racePlan, "---\nid: race-plan\nrevision: 1\nstatus: draft\nexecution: none\n---\n\nIndependent plan.\n");
+    const raceTopic = await create.execute("race-topic", { title: "independent lifecycle" }, undefined, undefined, { cwd: repo });
+    expect((await claim.execute("race-claim", { planId: "race-plan", topicId: raceTopic.details?.topicId }, undefined, undefined, { cwd: repo })).isError).toBeFalsy();
+    const raceLedger = ledgerFile("race-plan", repo);
+    mkdirSync(path.dirname(raceLedger), { recursive: true });
+    writeFileSync(raceLedger, ledgerTemplate(readPlan("race-plan", repo).meta));
+    const resolving = lifecycle.execute("resolve-race", { planId: "race-plan", status: "resolved" }, undefined, undefined, { cwd: repo });
+    const racing = attempt("race-plan", "resolve-race", "racing-dispatch");
     const racedResolve = await resolving;
     expect(racedResolve.isError).toBe(true);
     const openAfterRace = await openBoard();
-    expect(openAfterRace.readTopic(repositoryIdentity(repo), 1).topic.status).toBe("open");
+    expect(openAfterRace.readTopic(repositoryIdentity(repo), raceTopic.details!.topicId!).topic.status).toBe("open");
     openAfterRace.close();
-    recordPlanTeamWork(repo, "workflow-plan", "resolve-race", "racing-dispatch", "completed");
-    const resolved = await lifecycle.execute("resolve", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo });
+    racing.result({ status: "completed", result: "Controlled successful work" });
+    recordPlanTeamWork(repo, "race-plan", "resolve-race", "racing-dispatch", "completed");
+    expect((await lifecycle.execute("without-receipt", { planId: "race-plan", status: "resolved" }, undefined, undefined, { cwd: repo })).isError).toBe(true);
+    complete(racing);
+    const resolved = await lifecycle.execute("resolve", { planId: "race-plan", status: "resolved" }, undefined, undefined, { cwd: repo });
     expect(resolved.details?.status).toBe("resolved");
-    const abandoned = await lifecycle.execute("abandon", { planId: "workflow-plan", status: "closed" }, undefined, undefined, { cwd: repo });
+    expect((await lifecycle.execute("held-after-independent-success", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo })).isError).toBe(true);
+    const abandoned = await lifecycle.execute("abandon", { planId: "race-plan", status: "closed" }, undefined, undefined, { cwd: repo });
     expect(abandoned.details?.status).toBe("closed");
     const noTopicRepo = gitRepo();
     const noTopicPlan = planFile("without-topic", noTopicRepo);
@@ -765,8 +810,9 @@ describe("board tools", () => {
     const expectedMeta = readPlan("expected-plan", repo).meta;
     const expectedLedger = ledgerFile("expected-plan", repo);
     mkdirSync(path.dirname(expectedLedger), { recursive: true });
-    writeFileSync(expectedLedger, `---\nplan_id: expected-plan\nrevision: 1\nhash: ${expectedMeta.hash}\nstatus: completed\n---\n\n## Team Holds\n\n<!-- pitako-team-holds:v1 -->\n[]\n<!-- /pitako-team-holds -->\n`);
+    writeFileSync(expectedLedger, ledgerTemplate(expectedMeta).replace("status: running", "status: completed"));
     const completed = await lifecycle.execute("completed", { planId: "expected-plan", status: "resolved" }, undefined, undefined, { cwd: repo });
+    expect(completed.isError, textOf(completed)).not.toBe(true);
     expect(completed.details?.status).toBe("resolved");
   }));
 

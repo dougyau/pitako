@@ -20,6 +20,7 @@ import { immutable, mergeKnowledge, validateSubmission, type StageGrant, type Kn
 type Team = ReturnType<typeof createTeam>;
 type Member = ReturnType<typeof admitTeamMember>;
 export function createTable(input: { team: Team; config: PitakoConfig; goal: string; topic?: string; review?: ReviewPolicy;
+  consultedSource?: { identity: string; text: string };
   root: { assignmentId: string; memberId: string; instanceId: string }; origin: HistoryOrigin; cwd: string; owns: () => boolean; observation?: ArchitectureRoom }) {
   const snapshotId = randomUUID(), messages: Message[] = [], controls: { action: string; text?: string; captureId?: string }[] = [];
   const boundaries: KnowledgeBoundary[] = [], publications: (Message | KnowledgeBoundary)[] = [];
@@ -372,6 +373,7 @@ export function createTable(input: { team: Team; config: PitakoConfig; goal: str
       : rules.kind === "synthesis" ? { kind: rules.kind, pendingDoubtIds: rules.pendingDoubts.map(doubt => doubt.id) } : rules,
     instructions: `Analysis only. No product edits. Explore privately from the effective root using existing analysis tools. Independently examine the complete task. Submit one valid body using local ${protocol}_submit. Contextual rejections allow one correction (two distinct candidates total) in this prompt; use a new submissionId for correction. Identical retries are idempotent; an accepted provisional cannot be replaced. Knowledge covers only delegatedDoubtIds; defer new support doubts. Synthesis must be partial if ${input.review ? "scheduled work or failures remain" : "pending doubts, limits or failures remain"}. Final prose is not a submission. Do not dispatch agents. ${input.review ? "Review the complete object against all criteria independently. Mandates focus, never restrict judgment. Findings require reachable evidence or indispensable missing observation with effect and next authorized capture. Supports supply knowledge, never judge findings. Only authors modify or withdraw; use the published finding id, not its messageId. Synthesis must dispose every published finding exactly once and preserve dissent. Completion is work, never product acceptance." : ""}`,
     goal: input.goal, topic: input.topic, root: input.cwd,
+    ...(input.consultedSource ? { consultedSource: input.consultedSource } : {}),
     ...(input.review ? { object: describeObject(input.review.object), criteria: input.review.criteria } : {}),
     ...(rules.kind === "composition" ? { snapshot } : {}),
     context,
@@ -386,6 +388,9 @@ export function createTable(input: { team: Team; config: PitakoConfig; goal: str
           judgment: authorizedSynthesis ? { synthesis, dispositions, completion, verdict } : null };
       }
       return { protocol: "architecture", goal: input.goal,
+        ...(input.consultedSource ? { source: input.consultedSource } : {}),
+        objections: messages.flatMap(message => message.body.kind === "contribution" && "objections" in message.body ?
+          message.body.objections.map((objection, index) => ({ id: `${message.id}:${index}`, ...objection })) : []),
         judgment: authorizedSynthesis ? messages.filter(message => message.body.kind === "synthesis").at(-1)!.body : null,
         failures: structuredClone(failures), pending: structuredClone(pendingDoubts),
         limits: messages.flatMap(message => "limits" in message.body ? message.body.limits : []),

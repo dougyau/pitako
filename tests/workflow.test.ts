@@ -1,10 +1,16 @@
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import { PitakoConfigError } from "../extensions/errors.ts";
 import { packageRoot } from "../extensions/stack.ts";
+import { openSqliteSync } from "../extensions/board/sqlite.ts";
+import { WorkflowState, acquireWorkflowOwner, type ReleaseReceipt } from "../extensions/workflow-state.ts";
+import { RootGuard, openExecuteActivity, openPlanActivity, captureCallContext, checkCallContext, guardDefinition, registerWorkflowCommands, reserveEffect, checkAuthority, statusOwner, waitForProducer, projectTeamHolds } from "../extensions/workflow-engine.ts";
+import { snapshotPlan } from "../extensions/workflow-planning.ts";
+import { getActivityStatus, subscribeActivityStatus } from "../extensions/workflow-status.ts";
+import { openExecutionPlan } from "../extensions/workflow.ts";
 import {
   bindingMismatch,
   bindPlanTopic,
@@ -20,6 +26,8 @@ import {
   workflowWorkspace,
   readLedgerTeamHolds,
   updateLedgerTeamHold,
+  withLedgerTeamHoldLock,
+  writeExecutionUserDecision,
 } from "../extensions/workflow.ts";
 
 const tempDirs: string[] = [];
@@ -43,6 +51,589 @@ function gitRepo(): string {
 function planText(status = "frozen", body = "body"): string {
   return `---\nid: herdr-integration\nrevision: 2\nstatus: ${status}\n---\n\n# Herdr integration\n\n${body}\n`;
 }
+
+describe("common workflow authority and journal", () => {
+  for (const git of [false, true]) test(`held ordinary writer and managed planning share the exact ${git ? "Git" : "noGit"} participating root`, async () => {
+    const root = git ? gitRepo() : tempDir("pitako-root-routing-");
+    const child = path.join(root, "child"), alias = path.join(tempDir("pitako-root-alias-"), "alias");
+    mkdirSync(child); symlinkSync(child, alias);
+    const parent = checkCallContext(captureCallContext(root));
+    const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    const manager = { getSessionId: () => "root-routing" };
+    const commands = new Map<string, any>(), errors: string[] = [], sent: unknown[] = [];
+    const shutdown = registerWorkflowCommands({ registerCommand(name: string, command: unknown) { commands.set(name, command); },
+      registerTool() {}, on() {}, sendMessage(message: unknown) { sent.push(message); } } as any, { shutdown: false });
+    const ctx = { cwd: alias, sessionManager: manager, hasUI: true,
+      ui: { notify(message: string) { errors.push(message); } }, async waitForIdle() {} };
+    const tool = guardDefinition({ name: "held-writer", parameters: {}, async execute() {
+      entered.resolve(); await release.promise; return { content: [], details: {} };
+    } } as any, "write");
+    let pending: Promise<unknown> | undefined;
+    let activity: ReturnType<typeof openPlanActivity> | undefined;
+    const exact = checkCallContext(captureCallContext(alias));
+    try {
+      pending = Promise.resolve(tool.execute("held", {}, undefined, undefined, { cwd: alias, sessionManager: manager } as any));
+      await entered.promise;
+      expect(checkCallContext(captureCallContext(child)).store.root).toBe(exact.store.root);
+      expect(exact.store.all<any>("reservations").some(r => r.kind === "writer" && r.state === "active")).toBe(true);
+      const independentRoot = tempDir("pitako-independent-root-");
+      const independent = openPlanActivity("independent", independentRoot, snapshotPlan("independent", independentRoot), {}, "independent");
+      const independentOwner = checkAuthority(independent.authority);
+      await independent.retire(); independentOwner.guard.close(); independentOwner.store.close();
+      const managedRoot = git ? root : child;
+      await commands.get("plan").handler("registered", ctx);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toMatch(/occupied/);
+      expect(sent).toHaveLength(0);
+      expect(() => { activity = openPlanActivity("blocked", managedRoot, snapshotPlan("blocked", managedRoot), manager, manager.getSessionId()); }).toThrow(/occupied/);
+      expect(exact.store.root).toBe(managedRoot);
+      release.resolve(); await pending;
+      expect(exact.store.all<any>("reservations").every(r => r.state === "released")).toBe(true);
+      await commands.get("plan").handler("registered", ctx);
+      expect(errors).toHaveLength(1);
+      expect(sent).toHaveLength(1);
+      const registered = captureCallContext(child, manager);
+      expect(registered.kind).toBe("managed");
+    } finally {
+      release.resolve(); await pending;
+      const registered = captureCallContext(child, manager);
+      const registeredOwner = registered.kind === "managed" ? checkAuthority(registered.authority) : undefined;
+      await shutdown();
+      registeredOwner?.guard.close(); registeredOwner?.store.close();
+      if (activity) {
+        const owner = checkAuthority(activity.authority);
+        await activity.retire(); owner.guard.close(); owner.store.close();
+      }
+      if (exact !== parent) exact.close();
+      parent.close();
+    }
+  });
+  test("two connections exclude exclusive work until exact scope closure is committed", () => {
+    const root = tempDir("pitako-workflow-store-");
+    const first = new RootGuard(root), second = new RootGuard(root);
+    try {
+      const resource = first.reserve({ reservationId: "writer", kind: "writer", paths: [root] })
+        .register("controlled SDK", ["sdk-session", "sdk-history", "callback"]);
+      resource.enter();
+      expect(() => second.reserve({ reservationId: "gate", kind: "gates", paths: [root] })).toThrow(/occupied/);
+      resource.observe("sdk-session", "closed");
+      resource.observe("sdk-history", "closed");
+      expect(() => second.assertIdle([root])).toThrow();
+      resource.observe("callback", "unknown", true);
+      expect(() => second.reserve({ reservationId: "another", kind: "writer", paths: [root] })).toThrow();
+      const receipt = resource.observe("callback", "closed");
+      expect(receipt).toBeDefined();
+      expect(second.store.verifyReceipt(receipt!)).toBe(true);
+      expect(second.store.verifyReceipt({ ...receipt!, generation: 2 })).toBe(false);
+      second.assertIdle([root]);
+      const gate = second.reserve({ reservationId: "admitted", kind: "gates", paths: [root] }).register("gate", ["host-operation"]);
+      gate.enter(); gate.observe("host-operation", "closed", true);
+    } finally { first.close(); second.close(); }
+  });
+  test("long plan exclusion does not block journal reads or independent progress", () => {
+    const root = tempDir("pitako-workflow-owner-");
+    const store = new WorkflowState(root);
+    const release = acquireWorkflowOwner(root, "alpha");
+    try {
+      expect(() => acquireWorkflowOwner(root, "alpha")).toThrow(/no takeover/);
+      const independent = acquireWorkflowOwner(root, "beta"); independent();
+      expect(store.all("observations")).toEqual([]);
+      const other = new WorkflowState(root);
+      try { other.transaction(() => other.enqueue("independent", "ordinary", { fact: 1 })); } finally { other.close(); }
+      expect(store.outbox()).toHaveLength(1);
+    } finally { release(); store.close(); }
+    acquireWorkflowOwner(root, "alpha")();
+  });
+  test("ancestor release requires every own scope and exact descendant fact", () => {
+    const root = tempDir("pitako-workflow-ancestors-"), guard = new RootGuard(root);
+    try {
+      const parent = guard.reserve({ reservationId: "parent", kind: "writer", paths: [root] });
+      const own = parent.register("parent", ["callback", "host-operation"]);
+      const child = guard.store.reserve({ reservationId: "child", kind: "writer", paths: [root], parentReservationId: "parent" }, parent.reservation.ownerId);
+      const childResource = guard.store.resource(child, { adapter: "child", scopes: ["callback"], purpose: "work" });
+      const grandchild = guard.store.reserve({ reservationId: "grandchild", kind: "writer", paths: [root], parentReservationId: "child" }, child.ownerId);
+      const grandResource = guard.store.resource(grandchild, { adapter: "grandchild", scopes: ["host-operation"], purpose: "work" });
+      own.observe("callback", "unknown", true);
+      guard.store.observe(childResource, 1, "callback", "closed", true);
+      expect(guard.store.all("receipts")).toEqual([]);
+      expect(() => guard.store.observe({ ...grandResource, generation: 2 }, 1, "host-operation", "closed", true)).toThrow(/foreign resource/);
+      expect(() => guard.store.observe({ ...grandResource, producerId: "foreign" }, 1, "host-operation", "closed", true)).toThrow(/foreign resource/);
+      const receipt = guard.store.observe(grandResource, 1, "host-operation", "closed", true)!;
+      expect(receipt.reservationId).toBe("grandchild");
+      expect(guard.store.all<ReleaseReceipt>("receipts").map(value => value.reservationId).sort()).toEqual(["child", "grandchild"]);
+      own.observe("callback", "closed");
+      expect(guard.store.all("receipts")).toHaveLength(2); // Parent still has its own missing host boundary.
+      const parentReceipt = own.observe("host-operation", "closed")!;
+      expect(parentReceipt.reservationId).toBe("parent");
+      expect(guard.store.verifyReceipt(parentReceipt)).toBe(true);
+      expect(guard.store.observe(grandResource, 1, "host-operation", "closed", true)).toEqual(receipt);
+      expect(guard.store.all("receipts")).toHaveLength(3);
+      expect(() => guard.store.observe(grandResource, 1, "host-operation", "unknown", true)).toThrow(/reused/);
+      guard.assertIdle([root]);
+    } finally { guard.close(); }
+  });
+  test("accepted ledger action excludes its target but permits independent journal and plan writes", () => {
+    const root = gitRepo();
+    for (const id of ["alpha", "beta"]) {
+      const file = planFile(id, root); mkdirSync(path.dirname(file), { recursive: true });
+      writeFileSync(file, `---\nid: ${id}\nrevision: 1\nstatus: frozen\nboard_topic_id: 1\n---\n\nPlan.\n`);
+    }
+    const alpha = openExecutionPlan("alpha", root).binding;
+    const beta = openExecutionPlan("beta", root).binding;
+    const independent = new WorkflowState(root);
+    const probe = openSqliteSync(independent.file, { setWal: false });
+    probe.exec("PRAGMA busy_timeout = 0");
+    try {
+      withLedgerTeamHoldLock(root, "alpha", () => {
+        // A zero-wait independent connection tests admission exactly at this boundary.
+        probe.exec("BEGIN IMMEDIATE"); probe.exec("ROLLBACK");
+        independent.transaction(() => independent.enqueue("independent", "beta", { progress: true }));
+        const contender = openSqliteSync(path.join(root, ".pitako", "runs", "alpha", "ledger-writer.sqlite"), { setWal: false });
+        try {
+          contender.exec("PRAGMA busy_timeout = 0");
+          expect(() => contender.exec("BEGIN IMMEDIATE")).toThrow(/locked/);
+        } finally { contender.close(); }
+        // This accepted action stands at the ledger's synchronous external-I/O boundary.
+        expect(updateLedgerTeamHold(root, "beta", { assignmentId: "other", unitId: "B", status: "pending" }, false, beta)).toBe(true);
+      });
+      independent.transaction(() => independent.enqueue("independent", "beta", { after: true }));
+      expect(independent.outbox()).toHaveLength(2);
+      expect(readLedgerTeamHolds(root, "alpha", alpha)).toEqual([]);
+      expect(readLedgerTeamHolds(root, "beta", beta)).toEqual([{ assignmentId: "other", unitId: "B", status: "pending" }]);
+      updateLedgerTeamHold(root, "alpha", { assignmentId: "first", unitId: "B", status: "pending" }, false, alpha);
+      writeExecutionUserDecision(alpha, "paused");
+      updateLedgerTeamHold(root, "alpha", { assignmentId: "second", unitId: "B", status: "pending" }, false, alpha);
+      expect(readFileSync(ledgerFile("alpha", root), "utf8")).toMatch(/^status: paused$/m);
+      expect(readLedgerTeamHolds(root, "alpha", alpha).map(hold => hold.assignmentId)).toEqual(["first", "second"]);
+    } finally { probe.close(); independent.close(); }
+  });
+  test("ordered Team projection retains blocked work and excludes a competing drainer without starving another plan", () => {
+    const root = gitRepo();
+    const bindings = ["alpha", "beta"].map(id => {
+      const file = planFile(id, root); mkdirSync(path.dirname(file), { recursive: true });
+      writeFileSync(file, `---\nid: ${id}\nrevision: 1\nstatus: frozen\nboard_topic_id: 1\n---\n\nPlan.\n`);
+      return openExecutionPlan(id, root).binding;
+    });
+    const first = new WorkflowState(root), second = new WorkflowState(root);
+    let stop = () => {};
+    try {
+      first.transaction(() => {
+        for (const [index, cleared] of [[0, false], [0, true], [1, false]] as const) {
+          const execution = bindings[index]!;
+          first.enqueue(`team-holds:${execution.planId}`, JSON.stringify(execution), { kind: "team-hold",
+            hold: { assignmentId: execution.planId, planId: execution.planId, unitId: "B", execution, status: "pending", cleared } });
+        }
+      });
+      const legacyLock = `${ledgerFile("alpha", root)}.lock`;
+      writeFileSync(legacyLock, "controlled unknown legacy writer");
+      projectTeamHolds(first);
+      expect(first.outbox().map(entry => entry.state)).toEqual(["blocked", "pending", "applied"]);
+      expect((first.outbox()[0]!.body as { projectionDiagnostic: string }).projectionDiagnostic).toMatch(/closure is unknown/);
+      expect(readLedgerTeamHolds(root, "beta", bindings[1]!)).toHaveLength(1);
+      rmSync(legacyLock); // This fixture owns the planted sentinel; no writer entered.
+      let contested = 0;
+      let contention: unknown;
+      stop = first.subscribe(() => {
+        if (contested++) return;
+        try { projectTeamHolds(second); } catch (error) { contention = error; }
+      });
+      projectTeamHolds(first);
+      expect(contested).toBeGreaterThan(0);
+      expect(String(contention)).toMatch(/target unavailable/);
+      expect(first.outbox().map(entry => entry.state)).toEqual(["applied", "applied", "applied"]);
+      expect(readLedgerTeamHolds(root, "alpha", bindings[0]!)).toEqual([]);
+      const before = readFileSync(ledgerFile("alpha", root), "utf8");
+      projectTeamHolds(second);
+      expect(readFileSync(ledgerFile("alpha", root), "utf8")).toBe(before);
+    } finally { stop(); first.close(); second.close(); }
+  });
+  test("corrupt, unversioned, and unknown stores fail closed without recreation", () => {
+    for (const version of [-1, 0, 999]) {
+      const root = tempDir("pitako-workflow-schema-");
+      const directory = path.join(root, ".pitako", "runs"); mkdirSync(directory, { recursive: true });
+      const file = path.join(directory, "workflow-state.sqlite");
+      if (version === -1) writeFileSync(file, "not sqlite");
+      else {
+        const db = openSqliteSync(file);
+        db.exec(`CREATE TABLE unrelated(value TEXT); PRAGMA user_version=${version}`); db.close();
+      }
+      const before = readFileSync(file);
+      expect(() => new WorkflowState(root)).toThrow();
+      expect(readFileSync(file)).toEqual(before);
+    }
+  });
+  test.each(["commit", "write"])("%s persistence failure closes admission after the fault is removed", fault => {
+    const root = tempDir("pitako-workflow-persistence-");
+    const guard = new RootGuard(root), reader = new WorkflowState(root);
+    const db = openSqliteSync(guard.store.file);
+    let notifications = 0, entered = false;
+    const stop = guard.store.subscribe(() => { notifications++; });
+    try {
+      db.exec(`CREATE TABLE parent(id TEXT PRIMARY KEY);
+        CREATE TABLE deferred_write(id TEXT REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);
+        CREATE TRIGGER reject_reservation AFTER INSERT ON reservations BEGIN
+          ${fault === "commit" ? "INSERT INTO deferred_write VALUES (new.id);" : "SELECT RAISE(ABORT, 'controlled write failure');"}
+        END;`);
+      let failure: unknown;
+      try {
+        guard.reserve({ reservationId: "failed", kind: "writer", paths: [root] })
+          .register("writer", ["host-operation"]).enter();
+        entered = true;
+      } catch (error) { failure = error; }
+      expect(String(failure)).toMatch(fault === "commit" ? /FOREIGN KEY/ : /controlled write failure/);
+      db.exec("DROP TRIGGER reject_reservation");
+      let rejected: unknown;
+      try { guard.reserve({ reservationId: "later", kind: "writer", paths: [root] }); }
+      catch (error) { rejected = error; }
+      expect(rejected).toBeInstanceOf(Error);
+      expect((rejected as Error).message).toBe("workflow store unavailable");
+      expect((rejected as Error).cause).toBe(failure);
+      expect(() => guard.store.transaction(() => { entered = true; })).toThrow(/unavailable/);
+      expect(() => guard.store.put("holds", "late", {})).toThrow(/unavailable/);
+      expect(() => guard.store.enqueue("late", "ordinary", {})).toThrow(/unavailable/);
+      expect(() => guard.store.project(() => { entered = true; return "applied"; })).toThrow(/unavailable/);
+      expect(entered).toBe(false); expect(notifications).toBe(0);
+      expect(reader.all("reservations")).toEqual([]);
+      expect(reader.all("resources")).toEqual([]);
+      expect(reader.all("receipts")).toEqual([]);
+      expect(reader.outbox()).toEqual([]);
+      expect(guard.store.all("reservations")).toEqual([]); // Diagnostics remain readable.
+    } finally { stop(); db.close(); reader.close(); guard.close(); }
+  });
+  test("failed release commit retains the exact resource and reservation without a receipt", () => {
+    const root = tempDir("pitako-workflow-release-"), guard = new RootGuard(root);
+    const reader = new RootGuard(root), db = openSqliteSync(guard.store.file);
+    // Journal-only controlled resource: no external writer or callback is started.
+    const reservation = guard.store.reserve({ reservationId: "writer", kind: "writer", paths: [root] }, guard.ownerId);
+    const resource = guard.store.resource(reservation, { adapter: "writer", scopes: ["host-operation"], purpose: "work" });
+    guard.store.enter(resource);
+    try {
+      db.exec(`CREATE TABLE parent(id TEXT PRIMARY KEY);
+        CREATE TABLE deferred_write(id TEXT REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);
+        CREATE TRIGGER reject_release AFTER INSERT ON receipts BEGIN
+          INSERT INTO deferred_write VALUES (new.id);
+        END;`);
+      expect(() => guard.store.observe(resource, 1, "host-operation", "closed", true)).toThrow(/FOREIGN KEY/);
+      db.exec("DROP TRIGGER reject_release");
+      expect(guard.store.exactResource(resource)).toMatchObject({ sealed: false, facts: {} });
+      expect(reader.store.all("receipts")).toEqual([]);
+      expect(reader.store.all("reservations")).toMatchObject([{ reservationId: "writer", state: "active" }]);
+      expect(reader.store.outbox().filter(entry => (entry.body as { kind: string }).kind === "released")).toEqual([]);
+      expect(() => reader.reserve({ reservationId: "gate", kind: "gates", paths: [root] })).toThrow(/occupied/);
+      expect(() => guard.store.observe(resource, 2, "host-operation", "closed", true)).toThrow(/unavailable/);
+    } finally { db.close(); reader.close(); guard.close(); }
+  });
+  test("failed ancestor receipt commit rolls back the child closure and notifies no consumer", () => {
+    const root = tempDir("pitako-workflow-ancestor-commit-"), guard = new RootGuard(root), reader = new RootGuard(root);
+    const parent = guard.reserve({ reservationId: "parent", kind: "writer", paths: [root] });
+    const own = parent.register("parent", ["callback"]);
+    const child = guard.store.reserve({ reservationId: "child", kind: "writer", paths: [root], parentReservationId: "parent" }, parent.reservation.ownerId);
+    const resource = guard.store.resource(child, { adapter: "child", scopes: ["callback"], purpose: "work" });
+    own.observe("callback", "closed", true);
+    const db = openSqliteSync(guard.store.file);
+    let notifications = 0;
+    const stop = guard.store.subscribe(() => { notifications++; });
+    try {
+      db.exec(`CREATE TABLE parent_key(id TEXT PRIMARY KEY);
+        CREATE TABLE deferred_receipt(id TEXT REFERENCES parent_key(id) DEFERRABLE INITIALLY DEFERRED);
+        CREATE TRIGGER reject_parent_receipt AFTER INSERT ON receipts
+        WHEN json_extract(new.body, '$.reservationId') = 'parent' BEGIN INSERT INTO deferred_receipt VALUES(new.id); END;`);
+      expect(() => guard.store.observe(resource, 1, "callback", "closed", true)).toThrow(/FOREIGN KEY/);
+      expect(reader.store.all("receipts")).toEqual([]);
+      expect(reader.store.exactResource(resource)).toMatchObject({ sealed: false, facts: {} });
+      expect(notifications).toBe(0);
+      expect(() => reader.assertIdle([root])).toThrow();
+      db.exec("DROP TRIGGER reject_parent_receipt");
+      expect(() => guard.store.observe(resource, 1, "callback", "closed", true)).toThrow(/unavailable/);
+    } finally { stop(); db.close(); reader.close(); guard.close(); }
+  });
+  test.each(["commit", "write"])("owner %s failure closes managed admission through its separate RootGuard", async fault => {
+    // Retain the failed owner's lock and diagnostic journal: retirement must not invent release.
+    const root = mkdtempSync(path.join(tmpdir(), "pitako-owner-store-failed-"));
+    console.info(`Retained failed owner diagnostic: ${root}`);
+    const file = planFile("herdr-integration", root);
+    mkdirSync(path.dirname(file), { recursive: true }); writeFileSync(file, planText());
+    const activity = openExecuteActivity(openExecutionPlan("herdr-integration", root), {}, "owner-failure");
+    const owner = statusOwner(activity.read), db = openSqliteSync(owner.store.file);
+    let notifications = 0;
+    const stop = owner.store.subscribe(() => { notifications++; });
+    try {
+      db.exec(`CREATE TABLE parent(id TEXT PRIMARY KEY);
+        CREATE TABLE deferred_write(id TEXT REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);
+        CREATE TRIGGER reject_owner_write AFTER INSERT ON holds BEGIN
+          ${fault === "commit" ? "INSERT INTO deferred_write VALUES (new.id);" : "SELECT RAISE(ABORT, 'controlled owner write failure');"}
+        END;`);
+      const before = owner.store.outbox();
+      let failure: unknown;
+      try { owner.store.transaction(() => owner.store.put("holds", "failed", {})); }
+      catch (error) { failure = error; }
+      expect(String(failure)).toMatch(fault === "commit" ? /FOREIGN KEY/ : /controlled owner write failure/);
+      db.exec("DROP TRIGGER reject_owner_write");
+      expect(() => checkAuthority(activity.authority)).toThrow(/workflow store unavailable/);
+      expect(() => reserveEffect(activity.context, { reservationId: "later", kind: "writer", paths: [root] }))
+        .toThrow(/workflow store unavailable/);
+      expect(owner.store.all("holds")).toEqual([]);
+      expect(owner.guard.store.all("reservations")).toEqual([]);
+      expect(owner.guard.store.all("resources")).toEqual([]);
+      expect(owner.store.all("receipts")).toEqual([]);
+      expect(owner.store.outbox()).toEqual(before);
+      expect(notifications).toBe(0);
+      await expect(activity.retire()).rejects.toThrow(/workflow store unavailable/);
+      await expect(activity.retire()).rejects.toThrow(/workflow store unavailable/);
+      expect(() => acquireWorkflowOwner(root, "herdr-integration")).toThrow(/no takeover/);
+    } finally {
+      stop(); db.close(); owner.guard.close(); owner.store.close();
+    }
+  });
+  test("failed observer release rejects retirement without unlocking the owner", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "pitako-observer-release-failed-"));
+    console.info(`Retained failed observer diagnostic: ${root}`);
+    const file = planFile("herdr-integration", root);
+    mkdirSync(path.dirname(file), { recursive: true }); writeFileSync(file, planText());
+    const activity = openExecuteActivity(openExecutionPlan("herdr-integration", root), {}, "observer-failure");
+    const owner = statusOwner(activity.read), db = openSqliteSync(owner.store.file);
+    let timers = 0;
+    const subscription = subscribeActivityStatus(activity.read, () => {}, {
+      now: Date.now, every: () => { timers++; return 1; }, clear: () => { timers--; },
+    });
+    try {
+      db.exec(`CREATE TABLE parent(id TEXT PRIMARY KEY);
+        CREATE TABLE deferred_write(id TEXT REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);
+        CREATE TRIGGER reject_observer_release AFTER INSERT ON receipts BEGIN
+          INSERT INTO deferred_write VALUES (new.id);
+        END;`);
+      await expect(activity.retire()).rejects.toThrow(/workflow observation retirement/);
+      db.exec("DROP TRIGGER reject_observer_release");
+      await expect(activity.retire()).rejects.toThrow(/workflow observation retirement/);
+      expect(timers).toBe(0);
+      expect(owner.guard.store.all("resources")).toMatchObject([{ sealed: false, facts: {} }]);
+      expect(owner.store.all("receipts")).toEqual([]);
+      expect(owner.store.all("reservations")).toMatchObject([{ state: "active" }]);
+      expect(owner.store.all("runs")).toMatchObject([{ state: "interrupted" }]);
+      expect(() => { const unlock = acquireWorkflowOwner(root, "herdr-integration"); unlock(); }).toThrow(/no takeover/);
+    } finally {
+      // No callback remains, but the failed release and owner lock intentionally remain diagnostic.
+      await subscription.close().catch(() => {});
+      db.close(); owner.guard.close(); owner.store.close();
+    }
+  });
+  test("domain rejection rolls back without poisoning valid independent progress", () => {
+    const root = tempDir("pitako-workflow-domain-"), guard = new RootGuard(root);
+    const diagnostic = new Error("domain rejected");
+    try {
+      expect(() => guard.store.transaction(() => {
+        guard.store.put("holds", "rolled-back", {});
+        throw diagnostic;
+      })).toThrow(diagnostic);
+      expect(guard.store.all("holds")).toEqual([]);
+      const gate = guard.reserve({ reservationId: "gate", kind: "gates", paths: [path.join(root, "a")] })
+        .register("gate", ["host-operation"]);
+      gate.enter();
+      expect(() => guard.reserve({ reservationId: "occupied", kind: "writer", paths: [path.join(root, "a")] })).toThrow(/occupied/);
+      const independent = guard.reserve({ reservationId: "independent", kind: "writer", paths: [path.join(root, "b")] })
+        .register("writer", ["host-operation"]);
+      independent.enter();
+      expect(independent.observe("host-operation", "closed", true)).toBeDefined();
+      expect(gate.observe("host-operation", "closed", true)).toBeDefined();
+    } finally { guard.close(); }
+  });
+  test("only live captured authority admits; late original observations do not reauthorize", async () => {
+    const root = tempDir("pitako-workflow-fence-");
+    const file = planFile("herdr-integration", root);
+    mkdirSync(path.dirname(file), { recursive: true }); writeFileSync(file, planText());
+    const plan = openExecutionPlan("herdr-integration", root, { createLedger: true });
+    const owner = openExecuteActivity(plan, {}, "controlled");
+    const reservation = reserveEffect(owner.context, { reservationId: "old", kind: "writer", paths: [root] });
+    const resource = reservation.register("old SDK", ["sdk-session"]); resource.enter();
+    expect(() => checkAuthority({ fence: { ...owner.authority.fence } })).toThrow(/unavailable/);
+    await owner.retire();
+    expect(() => checkAuthority(owner.authority)).toThrow(/retired/);
+    expect(() => reservation.register("late", ["callback"])).toThrow(/retired/);
+    expect(resource.observe("sdk-session", "closed", true)).toBeDefined();
+    const next = openExecuteActivity(plan, {}, "replacement");
+    try {
+      expect(next.authority.fence.runId).not.toBe(owner.authority.fence.runId);
+      expect(() => reserveEffect(owner.context, { reservationId: "stale", kind: "writer", paths: [root] })).toThrow();
+      expect(waitForProducer(next.authority, undefined, 0, () => {})).toEqual({ kind: "unavailable", reason: "no independent producer" });
+      expect(waitForProducer(next.authority, undefined, 0, () => {}, "host-return-dependent")).toEqual({
+        kind: "deferred", reason: "host-return-dependent",
+      });
+    } finally { await next.retire(); }
+  });
+  test("status and 120s heartbeat are read-only and join accepted callbacks on retirement", async () => {
+    const root = tempDir("pitako-workflow-status-");
+    const file = planFile("herdr-integration", root);
+    mkdirSync(path.dirname(file), { recursive: true }); writeFileSync(file, planText());
+    const owner = openExecuteActivity(openExecutionPlan("herdr-integration", root, { createLedger: true }), {}, "status");
+    const journal = new WorkflowState(root);
+    const initial = getActivityStatus(owner.read);
+    let timer: (() => void) | undefined, clears = 0, entered = 0;
+    const callback = Promise.withResolvers<void>();
+    const subscription = subscribeActivityStatus(owner.read, event => {
+      entered++; expect(event.kind).toBe("heartbeat"); return callback.promise;
+    }, { now: () => 120_000, every(fn, ms) { expect(ms).toBe(120_000); timer = fn; return 1; },
+      clear() { clears++; timer = undefined; } });
+    const before = journal.outbox();
+    timer!();
+    expect(entered).toBe(1); expect(journal.outbox()).toEqual(before);
+    expect(getActivityStatus(owner.read).lastFactAt).toBe(initial.lastFactAt);
+    let settled = false, closed = false;
+    const closing = subscription.close().then(result => { expect(result).toEqual({ kind: "closed" }); closed = true; });
+    const retiring = owner.retire().then(() => { settled = true; });
+    await Promise.resolve(); expect(settled).toBe(false); expect(closed).toBe(false); expect(clears).toBe(1);
+    callback.resolve(); await retiring; await closing; await subscription.close();
+    expect(settled).toBe(true); expect(timer).toBeUndefined();
+    expect(() => subscribeActivityStatus(owner.read, () => {})).toThrow(/retired/);
+    journal.close();
+  });
+  test.each(["synchronous", "post-await"])("%s observer self-close acknowledges without releasing its callback", async phase => {
+    const root = tempDir("pitako-status-self-close-"), file = planFile("herdr-integration", root);
+    mkdirSync(path.dirname(file), { recursive: true }); writeFileSync(file, planText());
+    const owner = openExecuteActivity(openExecutionPlan("herdr-integration", root, { createLedger: true }), {}, "self-close");
+    const journal = new WorkflowState(root), proceed = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>(), cleanup = Promise.withResolvers<void>();
+    let tick = () => {}, cleared = 0, entries = 0, acknowledged: unknown;
+    let retirement: Promise<void> | undefined, externalClose: Promise<void> | undefined;
+    let atRequest: { sealed: boolean; receipts: number } | undefined;
+    const subscription = subscribeActivityStatus(owner.read, async () => {
+      entries++;
+      if (phase === "post-await") await proceed.promise;
+      const closing = subscription.close();
+      atRequest = { sealed: journal.all<{ sealed: boolean }>("resources")[0]!.sealed,
+        receipts: journal.all("receipts").length };
+      acknowledged = await Promise.race([closing, cleanup.promise]);
+      await finish.promise;
+    }, { now: () => 120_000, every(fn) { tick = fn; return 1; }, clear() { cleared++; } });
+    try {
+      tick(); proceed.resolve();
+      await new Promise<void>(resolve => setImmediate(resolve)); // Give all runnable promise continuations a turn.
+      expect(atRequest).toEqual({ sealed: false, receipts: 0 }); // Accepted before synchronous entry.
+      expect(acknowledged).toEqual({ kind: "requested" });
+      expect(cleared).toBe(1);
+      let closed = false, retired = false;
+      externalClose = subscription.close().then(result => { expect(result).toEqual({ kind: "closed" }); closed = true; });
+      retirement = owner.retire().then(() => { retired = true; });
+      await Promise.resolve();
+      expect(closed).toBe(false); expect(retired).toBe(false);
+      expect(journal.all("receipts")).toEqual([]);
+      tick(); expect(entries).toBe(1);
+      finish.resolve(); await externalClose; await retirement;
+      expect(journal.all<{ sealed: boolean; facts: object }>("resources")).toMatchObject([
+        { sealed: true, facts: { callback: "closed" } },
+      ]);
+      expect(journal.all("receipts")).toHaveLength(1);
+      tick(); expect(entries).toBe(1);
+      expect(() => subscribeActivityStatus(owner.read, () => {})).toThrow(/retired/);
+    } finally {
+      cleanup.resolve(); proceed.resolve(); finish.resolve();
+      await subscription.close(); await externalClose; await retirement;
+      await owner.retire(); journal.close();
+    }
+  });
+  test.each(["synchronous", "post-await"])("%s observer retirement acknowledges request; repeated external retirement joins settlement", async phase => {
+    const root = tempDir("pitako-status-self-retire-"), file = planFile("herdr-integration", root);
+    mkdirSync(path.dirname(file), { recursive: true }); writeFileSync(file, planText());
+    const activity = openExecuteActivity(openExecutionPlan("herdr-integration", root), {}, "self-retire");
+    const journal = new WorkflowState(root), proceed = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>(), cleanup = Promise.withResolvers<void>();
+    let tick = () => {}, cleared = 0, entries = 0, acknowledged: unknown;
+    const subscription = subscribeActivityStatus(activity.read, async () => {
+      entries++;
+      if (phase === "post-await") await proceed.promise;
+      acknowledged = await Promise.race([activity.retire(), cleanup.promise]);
+      await finish.promise;
+    }, { now: () => 120_000, every(fn) { tick = fn; return 1; }, clear() { cleared++; } });
+    let external: Promise<void> | undefined, repeated: Promise<void> | undefined;
+    try {
+      tick(); proceed.resolve();
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(acknowledged).toEqual({ kind: "requested" });
+      expect(activity.current()).toBe(false); expect(cleared).toBe(1);
+      expect(() => checkAuthority(activity.authority)).toThrow(/retired/);
+      expect(journal.all("receipts")).toEqual([]);
+      expect(journal.all<{ sealed: boolean }>("resources")[0]!.sealed).toBe(false);
+      let closed = 0;
+      external = activity.retire().then(result => { expect(result).toEqual({ kind: "closed" }); closed++; });
+      repeated = activity.retire().then(result => { expect(result).toEqual({ kind: "closed" }); closed++; });
+      await Promise.resolve(); expect(closed).toBe(0);
+      expect(() => acquireWorkflowOwner(root, "herdr-integration")).toThrow(/no takeover/);
+      tick(); expect(entries).toBe(1);
+      finish.resolve(); await Promise.all([external, repeated]);
+      expect(closed).toBe(2);
+      expect(journal.all("receipts")).toHaveLength(1);
+      expect(journal.all<{ state: string }>("runs")[0]!.state).toBe("retiring");
+      acquireWorkflowOwner(root, "herdr-integration")();
+      expect(await activity.retire()).toEqual({ kind: "closed" });
+      tick(); expect(entries).toBe(1);
+    } finally {
+      cleanup.resolve(); proceed.resolve(); finish.resolve();
+      await subscription.close(); await Promise.all([external, repeated]); await activity.retire(); journal.close();
+    }
+  });
+  test("repeated external retirement cannot report closure while an accepted observer is held", async () => {
+    const root = tempDir("pitako-status-repeat-retire-"), file = planFile("herdr-integration", root);
+    mkdirSync(path.dirname(file), { recursive: true }); writeFileSync(file, planText());
+    const activity = openExecuteActivity(openExecutionPlan("herdr-integration", root), {}, "repeat-retire");
+    const finish = Promise.withResolvers<void>();
+    let tick = () => {}, closed = 0;
+    const subscription = subscribeActivityStatus(activity.read, () => finish.promise,
+      { now: () => 120_000, every(fn) { tick = fn; return 1; }, clear() {} });
+    tick();
+    const first = activity.retire().then(() => { closed++; });
+    const second = activity.retire().then(() => { closed++; });
+    try {
+      await Promise.resolve(); await Promise.resolve();
+      expect(closed).toBe(0);
+      expect(() => acquireWorkflowOwner(root, "herdr-integration")).toThrow(/no takeover/);
+      finish.resolve(); await Promise.all([first, second]);
+      expect(closed).toBe(2);
+    } finally {
+      finish.resolve(); await subscription.close(); await Promise.all([first, second]); await activity.retire();
+    }
+  });
+  test("reentrant status emissions coalesce to the latest snapshot without overlapping observers", async () => {
+    const root = tempDir("pitako-status-reentrant-"), file = planFile("herdr-integration", root);
+    mkdirSync(path.dirname(file), { recursive: true }); writeFileSync(file, planText());
+    const owner = openExecuteActivity(openExecutionPlan("herdr-integration", root, { createLedger: true }), {}, "reentrant");
+    const journal = new WorkflowState(root), finish = Promise.withResolvers<void>();
+    const delivered = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+    const sequences: number[][] = [[], []], active = [0, 0], maximum = [0, 0];
+    let tick = () => {}, timers = 0, clears = 0;
+    const timing = { now: () => 120_000, every(fn: () => void, ms: number) {
+      expect(ms).toBe(120_000); timers++; tick = fn; return 1;
+    }, clear() { clears++; } };
+    const subscriptions = [0, 1].map(index => subscribeActivityStatus(owner.read, async event => {
+      active[index]!++; maximum[index] = Math.max(maximum[index]!, active[index]!);
+      try {
+        sequences[index]!.push(event.sequence);
+        if (sequences[index]!.length === 1) {
+          if (index === 0) { tick(); tick(); tick(); }
+          await finish.promise;
+        } else delivered[index]!.resolve();
+      } finally { active[index]!--; }
+    }, timing));
+    try {
+      const before = journal.outbox(), lastFactAt = getActivityStatus(owner.read).lastFactAt;
+      tick();
+      expect(sequences).toEqual([[1], [2]]);
+      finish.resolve(); await Promise.all(delivered.map(item => item.promise));
+      expect(sequences).toEqual([[1, 4], [2, 4]]);
+      expect(maximum).toEqual([1, 1]); expect(timers).toBe(1);
+      expect(journal.outbox()).toEqual(before);
+      expect(getActivityStatus(owner.read).lastFactAt).toBe(lastFactAt);
+      await subscriptions[0]!.close(); expect(clears).toBe(0);
+      await subscriptions[1]!.close(); expect(clears).toBe(1);
+      expect(journal.all("receipts")).toHaveLength(1);
+      const entries = sequences.map(items => [...items]);
+      tick(); expect(sequences).toEqual(entries);
+      await owner.retire(); tick(); expect(sequences).toEqual(entries);
+    } finally {
+      finish.resolve();
+      await Promise.all(subscriptions.map(subscription => subscription.close()));
+      await owner.retire(); journal.close();
+    }
+  });
+});
 
 async function runHoldWorkers(cwd: string, source: (worker: number) => string, children: ReturnType<typeof spawn>[] = []): Promise<void> {
   const workers: { child: ReturnType<typeof spawn>; ready: Promise<void>; closed: Promise<void> }[] = [];
@@ -673,13 +1264,16 @@ describe("plan and execute contracts", () => {
     expect(plan).toContain("Do not invoke $execute");
     expect(plan).toContain("Watched Team assignments inherit the exact binding automatically");
     expect(plan).toContain("execution: expected");
-    expect(plan).toContain("initLedger(ledgerFile(id, cwd), meta)");
+    expect(plan).not.toContain("initLedger(ledgerFile(id, cwd), meta)");
+    expect(plan).toContain("Do not create an execution ledger during standalone planning");
+    expect(plan).toContain("planning_candidate");
+    expect(plan).toContain("planning_freeze");
     expect(plan).not.toContain("execution: expected #");
     const sample = plan.match(/```markdown\n([\s\S]*?)\n```/)?.[1];
     expect(sample).toBeDefined();
     expect(parsePlanDocument(sample!).execution).toBe("expected");
     expect(plan).toContain("board_workflow_claim");
-    expect(plan).toMatch(/After freezing[\s\S]*?initLedger\(ledgerFile\(id, cwd\), meta\)[\s\S]*?before resolving/);
+    expect(plan).toContain("board_workflow_lifecycle");
     expect(plan).toContain("agent_run");
     expect(plan).toContain("design-only");
     expect(plan).not.toMatch(/openai|anthropic|gpt-|claude|grok/i);
@@ -690,7 +1284,8 @@ describe("plan and execute contracts", () => {
     expect(execute).toContain("openExecutionPlan");
     expect(execute).toContain("existing execution-root ledger first");
     expect(execute).toContain("USER_DECISION_REQUIRED");
-    expect(execute).toContain("Persist `status: USER_DECISION_REQUIRED` in ledger frontmatter");
+    expect(execute).toContain("Persist `status: USER_DECISION_REQUIRED` through the authorized writer");
+    expect(execute).toContain("A blocked projection is not a persisted ledger status");
     expect(execute).toContain("execution: expected");
     expect(execute).toContain("Explicit abandonment of the whole workflow");
     expect(execute).toContain("Failed, cancelled, and no-outcome holds remain blocking across reload");
@@ -716,7 +1311,7 @@ describe("plan and execute contracts", () => {
     expect(execute).toContain("agent_spawn");
     expect(execute).toContain("agent_run");
     expect(execute).toContain("## Workers");
-    expect(execute).toContain("not foreground implementation");
+    expect(execute).toContain("does not authorize inline specialist work");
     expect(execute).toContain("only when no agent or Team tools are registered");
     expect(execute).not.toContain("`agent_run` unavailable still means implement inline");
     expect(execute).not.toContain("If `agent_run` is unavailable, implement inline");
@@ -749,13 +1344,11 @@ describe("plan and execute contracts", () => {
   test("planning correlation and operational checkpoints do not create or bypass Team Holds", () => {
     for (const contract of [
       "check the draft's explicit Board binding and existing ledger",
-      "For a bound draft without a ledger, call `architecture_start` without `plan` or `unit`",
-      "do not pass an explicit topic to bypass this rule",
-      "For an unbound draft or a compatible existing ledger",
-      "prospective, validated `plan` ID", "distinct, scoped `unit` ID per consultation",
-      "incompatible ledger or real Team hold remains a blocker",
-      "omitting correlation must not bypass it",
-      "Do not create an execution ledger or Board binding during planning",
+      "uses the captured draft automatically",
+      "Correlation is not authority and cannot select another slot",
+      "Do not create an execution ledger during standalone planning",
+      "Real reservations or incompatible bindings remain blockers",
+      "cannot bypass a real Team Hold",
       "Record role, purpose, handle type and exact ID, pending decision, and consulted object",
       "Team assignment ID for Team", "worker instance ID for `agent_spawn`",
       "with or without correlation", "operational checkpoint, not a Team Hold or acceptance evidence",
@@ -763,12 +1356,12 @@ describe("plan and execute contracts", () => {
       "explicitly instruct the worker to ignore that section",
     ]) expect(plan).toContain(contract);
     const freeze = plan.slice(plan.indexOf("## Critique and freeze"));
-    expect(freeze.indexOf("required results are interpreted")).toBeLessThan(freeze.indexOf("remove `## Planning workers`"));
-    expect(freeze.indexOf("remove `## Planning workers`")).toBeLessThan(freeze.indexOf("Set `status: frozen`"));
-    expect(freeze).toContain("removal does not invalidate critique");
-    expect(freeze).toContain("operational section was excluded from the consulted object");
-    expect(freeze).toContain("Integrating corrections requested by critique does not itself require another consultation");
-    expect(freeze).toContain("material blocker or a change outside the reviewed object");
+    expect(freeze).toContain("Preserve relevant conclusions before preparing the candidate");
+    expect(freeze).toContain("operational and excluded from the judged object");
+    expect(freeze).toContain("declared removal need not trigger ritual re-review");
+    expect(freeze).toContain("Material corrections invalidate affected judgments");
+    expect(freeze).toContain("writes exactly the reviewed bytes");
+    expect(freeze.indexOf("planning_freeze")).toBeLessThan(freeze.indexOf("Return `PLAN_FROZEN`"));
   });
 
   test("review tables replace the existing pass, retaining independence and exterior report authority", () => {
@@ -793,8 +1386,9 @@ describe("plan and execute contracts", () => {
     }
     expect(plan).toContain('object: {kind: "plan", planId}');
     expect(plan).toContain("same correlation rules to `review_start`");
-    expect(plan).toContain("object's `planId` still identifies the text to critique");
-    expect(plan).toContain("prospective correlation without creating a ledger or Board binding");
+    expect(plan).toContain("planning_review");
+    expect(plan).toContain("same complete text");
+    expect(plan).toContain("Correlation is not authority");
     for (const policy of [execute, prePr]) {
       expect(policy).toContain('object: {kind: "diff", base:');
       expect(policy).toContain("staged, unstaged and applicable non-ignored untracked files");
@@ -850,7 +1444,7 @@ describe("plan and execute contracts", () => {
     expect(plan).toContain("A known failure is not an unknown handle");
     expect(plan).toContain("does not recover Team Holds or authorize execution");
     expect(plan).toContain("real holds and incompatible ledgers retain their existing recovery requirements");
-    expect(execute).toContain("If the handle is unknown, record a blocker");
+    expect(execute).toContain("If unknown, record the missing ownership evidence and block dependent replacement, not independent diagnosis");
     expect(execute).toContain("planning-only lost-consultation replacement does not apply in execution");
     expect(execute).toContain("preserve Team Hold reconciliation and recovery");
   });

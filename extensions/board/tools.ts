@@ -23,12 +23,15 @@ import { executionForSession } from "../execution-identity.ts";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { getBoardDbPath } from "./paths.ts";
+import { captureCallContext, checkCallContext, checkAuthority, guardToolRegistrations } from "../workflow-engine.ts";
+import { assertPlanningLifecycle } from "../workflow-planning.ts";
 
 const PostTypeSchema = StringEnum(POST_TYPES);
 const TopicStatusSchema = StringEnum(TOPIC_STATUSES);
 const noExtra = { additionalProperties: false } as const;
 
 export function registerBoard(pi: ExtensionAPI): void {
+  pi = guardToolRegistrations(pi, "read");
   pi.registerTool({
     name: "board_topic_create",
     label: "Board topic",
@@ -168,6 +171,8 @@ export function registerBoard(pi: ExtensionAPI): void {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       if (isChildSession(ctx)) return toolError("workflow Board lifecycle cannot be called from a child session");
       try {
+        const context = captureCallContext(ctx.cwd, ctx.sessionManager);
+        const managedPlanning = context.kind === "managed" && checkAuthority(context.authority).run.phase === "planning";
         const evaluation = teamEvaluationForSession(ctx.sessionManager?.getSessionId?.(), false);
         const captured = teamExecutionBinding(evaluation, params.planId);
         const initialPlan = captured ? verifyExecutionBinding(captured) : lifecyclePlan(params.planId, ctx.cwd);
@@ -177,6 +182,7 @@ export function registerBoard(pi: ExtensionAPI): void {
         const location = boardWorkspace(ctx.cwd);
         const board = await openBoard();
         try {
+          checkCallContext(context);
           board.migrateLegacyWorkspaces(location.identity, location.legacyRoots);
           const ownedTopicId = board.findTopicOwnedByPlan(location.identity, params.planId);
           if (ownedTopicId === undefined) {
@@ -193,6 +199,13 @@ export function registerBoard(pi: ExtensionAPI): void {
           }
 
           let plan = initialPlan;
+          if (managedPlanning) {
+            assertPlanningLifecycle(ctx, params.planId);
+            if (plan.meta.boardTopicId !== topic.id || topic.executionRoot !== null || topic.planHash !== null || topic.planRevision !== null)
+              throw new BoardError("planning topic binding has an incompatible execution claim");
+            topic = board.transitionOwnedTopic(location.identity, topic.id, params.planId, params.status);
+            return toolSuccess(formatTopicCreated(topic), { topicId: topic.id, status: topic.status });
+          }
           let executionBinding = captured;
           let claimExecution = false;
           if (topic.executionRoot !== null || plan.meta.status === "frozen") {
@@ -365,7 +378,9 @@ async function run(
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: Record<string, unknown>; isError?: boolean }> {
   let board: Board | undefined;
   try {
+    const context = captureCallContext(ctx.cwd, ctx.sessionManager);
     board = await openBoard();
+    checkCallContext(context);
     const location = boardWorkspace(ctx.cwd);
     board.migrateLegacyWorkspaces(location.identity, location.legacyRoots);
     const result = action(board, location.identity);

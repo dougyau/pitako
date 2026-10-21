@@ -29,9 +29,23 @@ export const tableTool = (payload: unknown, isError = false) => ({
 });
 export type TableToolResult = ReturnType<typeof tableTool>;
 
-/** Only bounded metadata is duplicated. Measure the original final envelope. */
+const incidentalFields = new Set(["instanceId", "roleId", "role", "status", "watch", "dispatchId", "dispatchPhase",
+  "teamId", "roomId", "assignmentId", "memberId", "state", "stage", "round", "closure", "resultAvailable", "resultId",
+  "delivery", "ordinal", "admittedAt", "elapsedMs", "model", "reasoning", "activity", "workerStarted"]);
+/** Explicit public metadata only: never prompts, submissions, private config, or capabilities. */
+export function incidentalMetadata(payload: Record<string, unknown>): Record<string, unknown> {
+  const metadata: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(payload)) {
+    if (key === "members" && Array.isArray(value)) metadata.members = value.map(item => incidentalMetadata(item));
+    else if (incidentalFields.has(key) && (value === null || ["string", "number", "boolean"].includes(typeof value))) metadata[key] = value;
+  }
+  return metadata;
+}
+/** Handles are present in public-conversation content, not just hidden details. */
 export function tableIncidental(payload: Record<string, unknown>) {
-  const envelope = { content: [{ type: "text" as const, text: "Table operation." }], details: { table: true, ...payload } };
+  const metadata = incidentalMetadata(payload);
+  const details: Record<string, unknown> = { table: true, ...metadata };
+  const envelope = { content: [{ type: "text" as const, text: JSON.stringify({ kind: "table-operation", acceptance: false, metadata }) }], details };
   if (jsonBytes(envelope) > AUTOMATIC_BYTES) throw new Error("table incidental envelope exceeds budget");
   return envelope;
 }

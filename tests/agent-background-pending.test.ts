@@ -1,7 +1,8 @@
 import { expect, spyOn, test } from "bun:test";
 import path from "node:path";
 import * as consultation from "../extensions/agent/consultation.ts";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { Type } from "typebox";
 import { architectureFixture } from "./fixtures/architecture.ts";
 import { controlledPi, controlledModel } from "./fixtures/pi-factories.ts";
 import { createPiExecutor } from "../extensions/agent/pi.ts";
@@ -12,11 +13,93 @@ import { createAgentController } from "../extensions/agent/controller.ts";
 import { createAgentBridge } from "../extensions/agent/bridge/broker.ts";
 import { connect } from "../extensions/agent/bridge/client.js";
 import { reserveTeamMember, firstTeamReservation, teamEvaluationForSession } from "../extensions/team.ts";
+import { WorkflowState, type Reservation, type ReleaseReceipt } from "../extensions/workflow-state.ts";
+import { guardDefinition, RootGuard, type AttemptRecord, type TeamHoldRecord } from "../extensions/workflow-engine.ts";
+import { AgentClosureError } from "../extensions/agent/closure.ts";
+import { planFile, openExecutionPlan, readLedgerTeamHolds } from "../extensions/workflow.ts";
+import { openBoard } from "../extensions/board/store.ts";
+import { boardWorkspace } from "../extensions/board/workspace.ts";
 
 const suite = architectureFixture();
 const scopeFor = (room: Awaited<ReturnType<typeof suite.setup>>) => ({ ownerToken: room.evaluation.token,
   coordinatorSessionId: room.evaluation.sessionId });
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
+
+test("late guarded children release the completed attempt and its exact Team hold only at the last frontier", suite.fixture.ownedCase("late-definition", async () => {
+  const room = await suite.setup({ busy: true });
+  const file = planFile("late-child", room.root);
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(file, "---\nid: late-child\nrevision: 1\nstatus: draft\n---\n\nPlan.\n");
+  const board = await openBoard();
+  let topicId: number;
+  try {
+    const workspace = boardWorkspace(room.root).identity;
+    topicId = board.createTopic(workspace, { title: "late child controlled fixture" }).id;
+    board.claimTopic(workspace, topicId, "late-child");
+  } finally { board.close(); }
+  writeFileSync(file, `---\nid: late-child\nrevision: 1\nstatus: frozen\nboard_topic_id: ${topicId}\n---\n\nPlan.\n`);
+  const binding = openExecutionPlan("late-child", room.root).binding;
+  const closed = [false, false];
+  const toolErrors: unknown[] = [];
+  const fail = Promise.withResolvers<void>();
+  const tool = guardDefinition({
+    name: "controlled-late-definition", label: "late", description: "controlled boundary", parameters: Type.Object({ index: Type.Number() }),
+    async execute(_id, { index }) {
+      await fail.promise;
+      throw new AgentClosureError([new Error("controlled physical uncertainty")], "controlled child",
+        { observe: () => closed[index] ? "closed" : "unknown" });
+    },
+  }, "write");
+  setBackgroundExecutor({ async start() {
+    const calls = [0, 1].map(index => Promise.resolve(tool.execute(`child-${index}`, { index }, undefined, undefined,
+      room.ctx)).catch(error => { toolErrors.push(error); }));
+    fail.resolve();
+    await Promise.all(calls);
+    return { status: "completed", result: "handled tool errors", sideEffects: false };
+  } });
+  const guard = new RootGuard(room.root);
+  const journal = guard.store;
+  try {
+    const accepted = await room.invoke("team_assign", { role: "researcher", task: "handle guarded tool errors", plan: "late-child", unit: "B" });
+    expect(accepted.isError).not.toBe(true);
+    await suite.fixture.settleRuns(); await tick();
+    const attempt = journal.all<AttemptRecord>("attempts").find(value => value.instanceId === accepted.details.instanceId)!;
+    expect(attempt.outcome).toMatchObject({ status: "completed" });
+    expect(toolErrors).toHaveLength(2);
+    expect(toolErrors.every(error => error instanceof AgentClosureError)).toBe(true);
+    const receipt = () => journal.all<ReleaseReceipt>("receipts").find(value => value.reservationId === attempt.reservationId);
+    expect(receipt()).toBeUndefined();
+    expect(readLedgerTeamHolds(room.root, "late-child", binding)).toHaveLength(1);
+    expect(() => guard.assertIdle([room.root])).toThrow();
+    closed[0] = true;
+    expect(() => guard.assertIdle([room.root])).toThrow();
+    expect(receipt()).toBeUndefined();
+    expect(journal.all<TeamHoldRecord>("holds").find(value => value.assignmentId === attempt.assignmentId)?.cleared).toBe(false);
+    closed[1] = true;
+    guard.assertIdle([room.root]);
+    const parent = receipt()!;
+    expect(parent).toBeDefined();
+    expect(journal.verifyReceipt(parent)).toBe(true);
+    const children = journal.all<Reservation>("reservations").filter(value => value.parentReservationId === attempt.reservationId);
+    expect(children).toHaveLength(2);
+    const childReceipts = journal.all<ReleaseReceipt>("receipts").filter(value => children.some(child => child.reservationId === value.reservationId));
+    expect(childReceipts).toHaveLength(2);
+    expect(parent.commitSequence).toBe(Math.max(...childReceipts.map(value => value.commitSequence)));
+    expect(childReceipts.every(value => value.receiptId !== parent.receiptId)).toBe(true);
+    expect(journal.all<TeamHoldRecord>("holds").find(value => value.assignmentId === attempt.assignmentId)?.cleared).toBe(true);
+    expect(readLedgerTeamHolds(room.root, "late-child", binding)).toEqual([]);
+    guard.assertIdle([room.root]);
+    expect(receipt()).toEqual(parent);
+    const next = guard.reserve({ reservationId: "next-gate", kind: "gates", paths: [room.root] }).register("gate", ["host-operation"]);
+    next.enter(); next.observe("host-operation", "closed", true);
+  } finally {
+    closed.fill(true);
+    fail.resolve();
+    // Reobserve owned controlled boundaries before fixture cleanup, even on a red assertion.
+    try { guard.assertIdle([room.root]); } catch { /* Red preimage retains a journal-only parent, no external work. */ }
+    await room.close(); guard.close();
+  }
+}));
 
 for (const tool of ["team_assign", "agent_spawn"] as const) test(`${tool} native pending crosses the published client without imported launches`, suite.fixture.ownedCase(tool, async () => {
   const room = await suite.setup({ busy: true });
@@ -91,15 +174,23 @@ test("accepted partial preparation and roster rollback stay pending through clea
   const preparing = Promise.withResolvers<void>(), release = Promise.withResolvers<void>(),
     cleaning = Promise.withResolvers<void>(), cleanup = Promise.withResolvers<void>();
   const reservation = reserveTeamMember(room.evaluation, "oracle", "partial");
-  let noWorker = 0;
-  const handle = reserveBackground({ roleId: "oracle", task: "partial", coordinatorSessionId: scope.coordinatorSessionId,
+  let noWorker = 0, prepared = false;
+  const handle = reserveBackground({ cwd: room.root, roleId: "oracle", task: "partial", coordinatorSessionId: scope.coordinatorSessionId,
     owns: () => true, teamOwner: { token: scope.ownerToken, assignmentId: "partial", onSettled: reservation.settled,
       noWorkerReleased() { expect(readBackgroundPending(scope)).toEqual({ state: "pending" }); noWorker++; reservation.noWorkerReleased(); } },
-    async prepare() { preparing.resolve(); await release.promise; throw new Error("partial preparation failed"); },
+    async prepare() { prepared = true; preparing.resolve(); await release.promise; throw new Error("partial preparation failed"); },
     async cleanup() { cleaning.resolve(); await cleanup.promise; } });
   reservation.rollback();
   expect(firstTeamReservation(room.evaluation, "oracle")).toBeUndefined();
+  const journal = new WorkflowState(room.root);
   try {
+    // A second connection sees durable admission before the scheduled callback
+    // can enter preparation; roster rollback cannot erase it.
+    expect(prepared).toBe(false);
+    const attempt = journal.get<AttemptRecord>("attempts", handle.dispatchId!)!;
+    expect(attempt).toMatchObject({ instanceId: handle.instanceId, assignmentId: "partial" });
+    expect(journal.get<Reservation>("reservations", attempt.reservationId)?.state).toBe("active");
+    expect(attempt.outcome).toBeUndefined();
     expect(readBackgroundPending(scope)).toEqual({ state: "pending" });
     await preparing.promise;
     expect(readBackgroundPending(scope)).toEqual({ state: "pending" });
@@ -111,9 +202,15 @@ test("accepted partial preparation and roster rollback stay pending through clea
     room.branch.push(...draftWorkerResults(scope.ownerToken, "completed")!.entries);
     observeWorkerResults(scope.ownerToken);
     expect(noWorker).toBe(1); expect(firstTeamReservation(room.evaluation, "oracle")).toBeUndefined();
+    expect(journal.get<AttemptRecord>("attempts", handle.dispatchId!)?.outcome).toEqual({
+      status: "failed", result: "Error: partial preparation failed" });
+    const receipt = journal.all<ReleaseReceipt>("receipts").find(entry => entry.reservationId === attempt.reservationId);
+    expect(receipt).toBeDefined();
+    expect(journal.verifyReceipt(receipt!)).toBe(true);
+    expect(journal.get("obligations", `result:${handle.dispatchId}`)).toMatchObject({ cleared: false });
     expect(readBackgroundPending(scope)).toEqual({ state: "none" });
     observeWorkerResults(scope.ownerToken); expect(noWorker).toBe(1);
-  } finally { release.resolve(); cleanup.resolve(); await room.close(); }
+  } finally { release.resolve(); cleanup.resolve(); await room.close(); journal.close(); }
 }));
 
 test("disbanded specialists release internally while the exterior director still pins synthesis and close", suite.fixture.ownedCase("director", async () => {
@@ -242,7 +339,7 @@ test("protocol recipient remains pending inside its callback, then needs no exte
 test("incorporated exterior result still waits for blocked bookkeeping, but explicit withdrawal releases delivery", suite.fixture.ownedCase("bookkeeping", async () => {
   const room = await suite.setup({ busy: true }), scope = scopeFor(room), settled = Promise.withResolvers<void>();
   try {
-    const handle = reserveBackground({ roleId: "researcher", task: "bookkeeping", coordinatorSessionId: scope.coordinatorSessionId,
+    const handle = reserveBackground({ cwd: room.root, roleId: "researcher", task: "bookkeeping", coordinatorSessionId: scope.coordinatorSessionId,
       owns: () => true, async prepare() {
         return { roleId: "researcher", task: "bookkeeping", cwd: room.root,
           reconcileBookkeeping() { settled.resolve(); throw new Error("controlled bookkeeping hold"); },

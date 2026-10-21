@@ -43,9 +43,11 @@ for (const protocol of ["architecture", "review"] as const) {
       await s.delivered.promise;
       const message = s.sent.find(item => item.message.customType === "pitako.worker.result")!.message;
       expect(jsonBytes(message)).toBeLessThanOrEqual(4096);
-      const automatic = JSON.parse(message.content);
+      const provenance = JSON.parse(message.content);
+      expect(provenance).toMatchObject({ version: 1, kind: "result", deliveryId: message.details.deliveryId,
+        source: { producer: `pitako.${protocol}`, assignmentId: start.details.assignmentId, instanceId: start.details.instanceId } });
+      const automatic = provenance.projection;
       expect(jsonBytes(automatic.header)).toBeLessThanOrEqual(2048);
-      expect(automatic.header.complete).toBe(!large);
       let envelope = await s.invoke("team_result", { assignmentId: start.details.assignmentId, maxBytes: 4096 });
       let canonical = "";
       while (true) {
@@ -58,6 +60,14 @@ for (const protocol of ["architecture", "review"] as const) {
         envelope = replay;
       }
       const report = JSON.parse(canonical);
+      const fullMessage = { ...message, content: JSON.stringify({ ...provenance,
+        projection: { header: { ...automatic.header, complete: true }, report } }) };
+      // Provenance is part of the threshold, not an unmeasured suffix. Even a modest
+      // review report may now require a reference; no facts disappear from canonical.
+      expect(automatic.header.complete).toBe(jsonBytes(fullMessage) <= 4096);
+      if (large) expect(automatic.header.complete).toBe(false);
+      if (!large && protocol === "architecture") expect(automatic.header.complete).toBe(true);
+      expect(automatic.header.id).toBe(parse(await s.invoke("team_result", { assignmentId: start.details.assignmentId })).header.id);
       expect(report.protocol).toBe(protocol); expect(report.judgment).not.toBeNull();
       expect(report.host.closure).toEqual({ state: "released" });
       if (large) {
@@ -67,7 +77,9 @@ for (const protocol of ["architecture", "review"] as const) {
         expect(protocol === "review" ? report.findings[0].consequence : report.judgment.disagreements[0])
           .toBe(protocol === "review" ? "Independent objection" : "seeded dissent");
         expect(protocol === "review" ? report.judgment.synthesis.summary : report.judgment.recommendation).toBe(giant);
-      } else expect(automatic.report).toEqual(report);
+      }
+      if (automatic.header.complete) expect(automatic.report).toEqual(report);
+      else expect(automatic).not.toHaveProperty("report");
       // Canonical re-read, not reserialization of a stripped/mutated envelope.
       let full = "", page = parse(await s.invoke("team_result", { assignmentId: start.details.assignmentId }));
       while (true) {

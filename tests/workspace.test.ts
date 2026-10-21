@@ -1,8 +1,9 @@
+import * as childProcess from "node:child_process";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { evidenceFile, ledgerFile, planFile } from "../extensions/workflow.ts";
 import { currentWorkspace, repositoryIdentity } from "../extensions/board/workspace.ts";
 
@@ -29,6 +30,31 @@ function initRepo(dir: string): void {
 }
 
 describe("workspace Git identity", () => {
+  test("uses two fresh Git processes per discovery and observes same-cwd identity changes", () => {
+    const base = tempDir("pitako-worktree-refresh-");
+    const repo = path.join(base, "repo");
+    const other = path.join(base, "other");
+    initRepo(repo);
+    initRepo(other);
+    const capture = spyOn(childProcess, "execFileSync");
+    try {
+      expect(currentWorkspace(repo)).toBe(repo);
+      expect(capture).toHaveBeenCalledTimes(2);
+      expect(repositoryIdentity(repo)).toBe(path.join(repo, ".git"));
+      expect(capture).toHaveBeenCalledTimes(4);
+
+      renameSync(path.join(repo, ".git"), path.join(base, "saved.git"));
+      expect(repositoryIdentity(repo)).toBe(repo);
+      writeFileSync(path.join(repo, ".git"), `gitdir: ${path.join(other, ".git")}\n`);
+      expect(repositoryIdentity(repo)).toBe(path.join(other, ".git"));
+      expect(currentWorkspace(repo)).toBe(repo);
+      writeFileSync(path.join(repo, ".git"), "gitdir: missing-git-directory\n");
+      expect(() => repositoryIdentity(repo)).toThrow(/Git|git/i);
+    } finally {
+      capture.mockRestore();
+    }
+  });
+
   test("keeps worktree paths local and identifies their shared Git repository", () => {
     const base = tempDir("pitako-worktree-");
     const main = path.join(base, "main");
@@ -75,12 +101,18 @@ describe("workspace Git identity", () => {
 
   test("preserves newline and trailing-space Git paths", () => {
     const base = tempDir("pitako-worktree-path-");
-    for (const name of ["with\nnewline", "with trailing "]) {
+    for (const name of ["with\nnewline", "with trailing ", "with trailing\n"]) {
       const repo = path.join(base, name);
       initRepo(repo);
       expect(currentWorkspace(repo)).toBe(repo);
       expect(repositoryIdentity(repo)).toBe(path.join(repo, ".git"));
     }
+    const repo = path.join(base, "separate-git-dir");
+    const common = path.join(base, "common\n ");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", `--separate-git-dir=${common}`], { cwd: repo, stdio: "ignore" });
+    expect(currentWorkspace(repo)).toBe(repo);
+    expect(repositoryIdentity(repo)).toBe(common);
   });
 
   test("keeps canonical non-Git directories and rejects bare or invalid Git states", () => {

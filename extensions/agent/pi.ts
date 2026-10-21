@@ -18,7 +18,8 @@ import { isServiceTierRejection } from "./fallback.ts";
 import { SubmissionError } from "../architecture/protocol.ts";
 import { childInstructions, skillNamesForRole, usageDelta, type AgentRequestObservation, type AgentUsage, type Attempt, type AttemptExecutor } from "./run.ts";
 import type { ModelTarget, ReasoningLevel } from "../roles/types.ts";
-import { InvocationHistory, type SessionHistory } from "./history.ts";
+import { InvocationHistory, type SessionHistory, type HistoryOrigin } from "./history.ts";
+import { deliveryContent } from "./provenance.ts";
 import { createLiveHandle } from "./live.ts";
 import { createPublicProducer } from "./public-conversation.ts";
 import { AgentClosureError } from "./closure.ts";
@@ -26,7 +27,10 @@ import { headExtension, leafScopeExtension } from "./head/tools.ts";
 import type { HeadAttachment } from "./head/runtime.ts";
 import type { NativeTurn } from "../table/participant.ts";
 import { isConsultation } from "./consultation.ts";
-import { ManagedProducer, managedTools, managedGuard } from "./head/managed-tools.ts";
+import { ManagedProducer, managedTools, managedGuard, guardManagedLoadedDefinitions } from "./head/managed-tools.ts";
+import { captureCallContext, reserveEffect, bindCallContext, withCallContext, guardDefinition,
+  type Producer, type CallContext } from "../workflow-engine.ts";
+import { randomUUID } from "node:crypto";
 
 // Pi's default when no setting exists. Host-provided peers need not exist on disk.
 export const DEFAULT_THINKING_LEVEL: ThinkingLevel = "medium";
@@ -36,6 +40,7 @@ export const DEFAULT_THINKING_LEVEL: ThinkingLevel = "medium";
 const architectureTurns = new AsyncLocalStorage<{ session: AgentSession; identity: NativeTurn; signal: AbortSignal; active: boolean }>();
 
 const childLifecycles = new WeakMap<AgentSession, { bound: boolean; disposal?: Promise<void>; history?: SessionHistory;
+  resource?: Producer; context?: CallContext; unbindContext?: () => void;
   live?: ReturnType<typeof createLiveHandle>; unbindLive?: () => void;
   head?: HeadAttachment; headBinding?: object; stopAbort?: () => void;
   managed?: ManagedProducer; captureManaged?: (closure?: "released" | "unknown") => void;
@@ -70,7 +75,7 @@ function disposeChildSession(session: AgentSession, signal?: AbortSignal): Promi
   void liveClose?.catch(() => {});
   lifecycle.disposal = (async () => {
     const failures = lifecycle.failures;
-    let shutdownSettled = !lifecycle.bound, disposalSettled = false;
+    let shutdownSettled = !lifecycle.bound, disposalSettled = false, liveSettled = !lifecycle.live;
     const joinOperations = async () => {
       while (lifecycle.operations.size) await Promise.allSettled([...lifecycle.operations]);
     };
@@ -88,6 +93,7 @@ function disposeChildSession(session: AgentSession, signal?: AbortSignal): Promi
       };
       try {
         await liveClose;
+        liveSettled = true;
       } catch (error) {
         captureFailed("close_failed");
         throw error;
@@ -121,6 +127,15 @@ function disposeChildSession(session: AgentSession, signal?: AbortSignal): Promi
       await lifecycle.live?.handle.publicConversation?.close(failures.length > 0 || !shutdownSettled || !disposalSettled || !historySettled);
     });
     await join(() => lifecycle.captureManaged?.(failures.length ? "unknown" : "released"));
+    lifecycle.unbindContext?.();
+    const resource = lifecycle.resource;
+    if (resource) {
+      resource.observe("live-input", liveSettled ? "closed" : "unknown");
+      resource.observe("callback", failures.some(error => error instanceof AgentClosureError) ? "unknown" : "closed");
+      resource.observe("sdk-history", historySettled ? "closed" : "unknown");
+      resource.observe("session-shutdown", shutdownSettled ? "closed" : "unknown");
+      resource.observe("sdk-session", disposalSettled ? "closed" : "unknown", true);
+    }
     if (failures.length) throw new AgentClosureError([...failures], `SDK session ${session.sessionId}`);
     unregisterExecution(session.sessionId);
   })();
@@ -149,6 +164,15 @@ const piFactories: PiFactories = {
   createSession: createAgentSession,
 };
 
+function contextContent(input: { instanceId: string; head?: HeadAttachment }, task: string, origin?: HistoryOrigin): string {
+  return deliveryContent("context", {
+    producer: origin?.source ?? "pitako.agent", instanceId: input.instanceId,
+    assignmentId: origin?.assignmentId ?? input.head?.assignmentId,
+    ownerSessionId: origin?.coordinatorSessionId ?? origin?.callerSessionId,
+    teamId: origin?.teamId, memberId: origin?.memberId, turnId: origin?.turnId,
+  }, task);
+}
+
 export function createPiExecutor(options: { now?: () => number; factories?: Partial<PiFactories> } = {}): AttemptExecutor {
   const factories = { ...piFactories, ...options.factories };
   return {
@@ -157,6 +181,7 @@ export function createPiExecutor(options: { now?: () => number; factories?: Part
     async start(input) {
       if (input.head) input = { ...input, signal: AbortSignal.any([input.signal, input.head.signal]) };
       const history = (input.history ?? new InvocationHistory(input.cwd, undefined, input.task, true)).admit(input.instanceId, input.role.id, input.target);
+      const context = input.context ?? contextContent(input, input.task, history.invocation.origin);
       try {
         // Do not bind the worker abort signal here. The session abort owns cancellation.
         // A signal on runtime create aborts Cursor auth before the child prompt starts.
@@ -166,7 +191,7 @@ export function createPiExecutor(options: { now?: () => number; factories?: Part
         const selections = new WeakMap<object, RequestSelection>();
         keepCursorTools(runtime);
         installServiceTierTransport(runtime, selections);
-        const result = await runTarget(runtime, selections, options.now ?? (() => performance.now()), input.target, input.task,
+        const result = await runTarget(runtime, selections, options.now ?? (() => performance.now()), input.target, context,
           { ...input, sessionHistory: history, factories });
         try {
           return history?.result(result) ?? result;
@@ -496,6 +521,27 @@ async function bindThenRun(
 }
 
 async function openSession(
+  runtime: ModelRuntime, model: NonNullable<ReturnType<ModelRuntime["getModel"]>> | undefined,
+  target: ModelTarget, input: Parameters<typeof prepareSession>[3],
+): Promise<AgentSession> {
+  const managed = input.head?.managed ?? input.scope?.managed ?? input.consultant?.managed;
+  const context = managed?.context ?? captureCallContext(input.cwd);
+  const resource = reserveEffect(context, { reservationId: randomUUID(), kind: "writer", paths: [input.cwd],
+    purpose: managed ? "observation" : "work" })
+    .register("Pi SDK session attempt", ["preparation", "sdk-session", "session-shutdown", "sdk-history", "live-input", "callback"]);
+  resource.enter();
+  try {
+    const session = await withCallContext(context, () => prepareSession(runtime, model, target, input, resource, context));
+    resource.observe("preparation", "closed");
+    return session;
+  } catch (error) {
+    // No native handle is not a closure receipt. Keep the original attempt's barriers.
+    if (resource.live) resource.observe("preparation", resource.snapshot().sealed ? "closed" : "unknown");
+    throw error;
+  }
+}
+
+async function prepareSession(
   runtime: ModelRuntime,
   model: NonNullable<ReturnType<ModelRuntime["getModel"]>> | undefined,
   target: ModelTarget,
@@ -504,6 +550,7 @@ async function openSession(
     consultant?: Parameters<AttemptExecutor["start"]>[0]["consultant"];
     participant?: Parameters<AttemptExecutor["start"]>[0]["participant"];
     bindLive?: Parameters<AttemptExecutor["start"]>[0]["bindLive"] },
+  resource: Producer, context: CallContext,
 ): Promise<AgentSession> {
   const agentDir = input.factories.getAgentDir();
   const settingsManager = input.factories.createSettings(input.cwd, agentDir);
@@ -540,7 +587,7 @@ async function openSession(
           return { block: true, reason: "Consultative leaves cannot orchestrate Pitako work" };
       });
       if (input.participant) {
-        pi.registerTool({ name: `${input.participant.protocol}_submit`, label: "Submit table turn", description: "Submit for your exact table grant. Contextual errors allow one correction with a new submissionId (two distinct candidates). Identical retries are idempotent; valid provisional submissions are locked. Does not dispatch work.",
+        pi.registerTool(guardDefinition({ name: `${input.participant.protocol}_submit`, label: "Submit table turn", description: "Submit for your exact table grant. Contextual errors allow one correction with a new submissionId (two distinct candidates). Identical retries are idempotent; valid provisional submissions are locked. Does not dispatch work.",
           parameters: input.participant.schema, async execute(id, value, signal, _update, ctx) {
             try {
               const turn = architectureTurns.getStore();
@@ -554,7 +601,9 @@ async function openSession(
               const details = error instanceof SubmissionError ? error.diagnostic : {};
               return { content: [{ type: "text", text: String(error) }], details, isError: true };
             }
-          } });
+          } }, "read", false, error => ({
+            content: [{ type: "text", text: String(error) }], details: {}, isError: true,
+          })));
         pi.on("session_start", (_event, ctx) => input.participant!.bind(pi, ctx));
       }
       pi.on("turn_start", () => { guardConsultationTools(); if (nativeSession) reconcileChildTools(nativeSession); live?.open(); });
@@ -580,6 +629,7 @@ async function openSession(
   if (input.signal.aborted) throw new Error("Agent session startup cancelled");
   // Codemode can invoke a registered definition without a top-level tool_call event.
   function guardConsultationTools() {
+    if (managed) guardManagedLoadedDefinitions(loader);
     if (!isConsultation(input.role.id) && !input.participant) return;
     for (const extension of loader.getExtensions().extensions) {
       for (const [name, tool] of extension.tools) if (isOrchestrationTool(name) || input.participant && ["edit", "write", "apply_patch", "lsp_rename"].includes(name)) {
@@ -607,7 +657,8 @@ async function openSession(
   });
   nativeSession = session;
   const lifecycle: NonNullable<ReturnType<typeof childLifecycles.get>> = {
-    bound: false, history: input.sessionHistory, head: input.head, headBinding, managed, operations: new Set(), failures: [], generation: 0, closing: false,
+    bound: false, history: input.sessionHistory, head: input.head, headBinding, managed, resource, context,
+    operations: new Set(), failures: [], generation: 0, closing: false,
   };
   if (managed) {
     // Capture native IDs before retirement, never infer them from tool events/results text.
@@ -625,6 +676,7 @@ async function openSession(
     });
   }
   childLifecycles.set(session, lifecycle);
+  lifecycle.unbindContext = bindCallContext(session.sessionManager, context);
   lifecycle.stopAbort = watchAbort(input.signal, () => {
     managed?.cancel();
     input.head?.revoke();
@@ -669,6 +721,7 @@ async function openSession(
       throw new Error("Agent session startup cancelled");
     }
     await session.bindExtensions({});
+    if (input.head && headBinding) input.head.bindGateReceiptObserver(headBinding, session);
     lifecycle.bound = true;
     guardConsultationTools();
     input.scope?.assertStartup();
@@ -894,13 +947,13 @@ function resume(
   return {
     async turn(turn) {
       history?.append("turn", { turnId: turn.turnId, attemptId: turn.attemptId, task: turn.task, target: turn.target });
-      const result = await runTarget(runtime, selections, now, turn.target, turn.task,
+      const result = await runTarget(runtime, selections, now, turn.target, turn.context ?? contextContent(input, turn.task, history?.invocation.origin),
         { ...input, ...turn, sessionHistory: history }, { session, mode: "turn" });
       return history?.result(result) ?? result;
     },
     async continueWith(target, note, signal, operation) {
       history?.append("continuation", { target, note });
-      const result = await runTarget(runtime, selections, now, target, note, { ...input, ...operation, signal, sessionHistory: history }, { session, mode: "continuation" });
+      const result = await runTarget(runtime, selections, now, target, operation?.context ?? contextContent(input, note, history?.invocation.origin), { ...input, ...operation, signal, sessionHistory: history }, { session, mode: "continuation" });
       return history?.result(result) ?? result;
     },
     async dispose(signal) {

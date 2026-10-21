@@ -6,13 +6,20 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import pitako from "../../extensions/index.ts";
 import agent from "../../extensions/agent/index.ts";
 import { createPiExecutor } from "../../extensions/agent/pi.ts";
-import { setBackgroundExecutor, cancelAllWorkers, clearBackgroundOwner } from "../../extensions/agent/background.ts";
+import { setBackgroundExecutor, cancelAllWorkers, clearBackgroundOwner, workerHandoff } from "../../extensions/agent/background.ts";
+import { subscribeChanges } from "../../extensions/agent/observe.ts";
 import { teamEvaluationForSession, retireTeamEvaluation } from "../../extensions/team.ts";
 import { controlledPi, controlledModel } from "./pi-factories.ts";
 import { agentFixtureOwnership } from "./agent-fixture-ownership.ts";
 import { executionForSession } from "../../extensions/execution-identity.ts";
 import type { describeObject } from "../../extensions/review/object.ts";
 import { jsonBytes } from "../../extensions/table/results.ts";
+
+/** Decode only our controlled context transport, not a source of host authority. */
+export function tablePrompt(text: string) {
+  const projection = JSON.parse(text).projection as string;
+  return projection.startsWith("{") ? JSON.parse(projection) : { kind: "continuation", note: projection };
+}
 
 /** Test-only full reconstruction. Production consumers request pertinent sections, never auto-load. */
 export async function readCanonical(invoke: (name: string, params: any) => Promise<any>, name: string, params: any, first?: any) {
@@ -62,19 +69,20 @@ export function architectureFixture(protocol: "architecture" | "review" = "archi
   topic = "security"
   candidates = [{ model = "fixture/chosen", reasoning = "high" }, { model = "fixture/chosen", reasoning = "low" }, { model = "fixture/other" }]
   `;
-  async function setup(extra: { root?: string; config?: string; policies?: string; busy?: boolean;
+  async function setup(extra: { root?: string; storageRoot?: string; config?: string; policies?: string; busy?: boolean;
     explore?: (object: ReturnType<typeof describeObject>) => unknown;
     prompt?: (session: any, request: any, body: any) => Promise<any> | any; afterSubmit?: (session: any, request: any, receipt: any) => Promise<void> | void; abort?: (session: any) => Promise<void>; dispose?: (session: any) => Promise<void>; bind?: (session: any) => Promise<void> | void; extensions?: any[] } = {}) {
     const root = extra.root ?? mkdtempSync(path.join(tmpdir(), "pitako-architecture-"));
     if (!extra.root) fixture.directories.push(root);
-    process.env.PI_CODING_AGENT_DIR = root;
-    mkdirSync(path.join(root, "pitako"), { recursive: true }); writeFileSync(path.join(root, "pitako/config.toml"), (extra.policies ?? policies) + (extra.config ?? configuration));
-    const sessionId = path.basename(root), branch: any[] = [], sent: any[] = [], tools = new Map<string, any>(), hooks = new Map<string, Function[]>();
-    const file = path.join(root, "coordinator.jsonl");
+    const storageRoot = extra.storageRoot ?? root;
+    process.env.PI_CODING_AGENT_DIR = storageRoot;
+    mkdirSync(path.join(storageRoot, "pitako"), { recursive: true }); writeFileSync(path.join(storageRoot, "pitako/config.toml"), (extra.policies ?? policies) + (extra.config ?? configuration));
+    const sessionId = path.basename(root), branch: any[] = [], sent: any[] = [], tools = new Map<string, any>(), hooks = new Map<string, Function[]>(), commands = new Map<string, any>();
+    const file = path.join(storageRoot, "coordinator.jsonl");
     writeFileSync(file, JSON.stringify({ type: "session", version: 3, id: sessionId, cwd: root }) + "\n");
     let idle = !extra.busy;
     const delivered = deferred(), response = deferred();
-    const pi = { registerFlag() {}, registerCommand() {}, getFlag() {}, getAllTools: () => [], getActiveTools: () => [], setActiveTools() {}, getSessionName() {}, setSessionName() {},
+    const pi = { registerFlag() {}, registerCommand(name: string, definition: any) { commands.set(name, definition); }, getFlag() {}, getAllTools: () => [], getActiveTools: () => [], setActiveTools() {}, getSessionName() {}, setSessionName() {},
       registerTool(definition: any) { tools.set(definition.name, definition); },
       on(name: string, handler: Function) { hooks.set(name, [...hooks.get(name) ?? [], handler]); },
       sendMessage(message: any, options: any) {
@@ -83,7 +91,7 @@ export function architectureFixture(protocol: "architecture" | "review" = "archi
       },
     } as unknown as ExtensionAPI;
     pitako(pi); agent(pi);
-    const ctx: any = { cwd: root, hasUI: false, isIdle: () => idle, ui: { notify() {}, setStatus() {} },
+    const ctx: any = { cwd: root, hasUI: false, isIdle: () => idle, waitForIdle: async () => {}, ui: { notify() {}, setStatus() {} },
       sessionManager: { getSessionId: () => sessionId, getSessionFile: () => file, getBranch: () => branch, getEntries: () => [] } };
     const emit = async (name: string, event: any = {}) => {
       let answer: any;
@@ -94,13 +102,13 @@ export function architectureFixture(protocol: "architecture" | "review" = "archi
     const evaluation = teamEvaluationForSession(sessionId, false)!;
     const knowledge: ReturnType<typeof deferred>[] = Array.from({ length: 8 }, () => deferred()); let knowledgeIndex = 0;
     const seen: { session: any; request: any; receipt: any; levels: string; model: string; exploration?: unknown }[] = [];
-    const host = controlledPi(root, { inlineExtensions: true, bind: extra.bind, extensions: extra.extensions,
+    const host = controlledPi(storageRoot, { inlineExtensions: true, bind: extra.bind, extensions: extra.extensions,
       models: ["director", "chosen", "other", "general", "support"].map(id => controlledModel("fixture", id)),
       async prompt(session, text) {
         // controlledPi has no event loop; drive the native turn admission/settlement hooks.
         for (const handler of session.hooks.get("turn_start") ?? []) await handler({ type: "turn_start" }, { sessionManager: session.sessionManager });
         try {
-          const request = JSON.parse(text.startsWith("{") ? text : [...session.prompts].reverse().find((prompt: string) => prompt.startsWith("{"))!);
+          const request = [...session.prompts].reverse().map(tablePrompt).find(item => item.stage)!;
           const review = request.protocol === "Pitako review";
           expect(request).not.toHaveProperty("journal");
           expect(request).not.toHaveProperty("publications");
@@ -155,7 +163,22 @@ export function architectureFixture(protocol: "architecture" | "review" = "archi
     setBackgroundExecutor(createPiExecutor({ factories: host.factories }));
     const invoke = (name: string, params: any, signal?: AbortSignal) => tools.get(name).execute(name + "-call", params, signal, undefined, ctx);
     const read = (name: string, params: any, first?: any) => readCanonical(invoke, name, params, first);
-    return { root, pi, ctx, emit, invoke, read, tools, branch, sent, evaluation, host, seen, knowledge, delivered, response,
+    return { root, pi, ctx, emit, invoke, read, tools, commands, branch, sent, evaluation, host, seen, knowledge, delivered, response,
+      async bookkeeping(instanceId: string) {
+        let stop = () => {};
+        try {
+          await new Promise<void>((resolve, reject) => {
+            const inspect = () => {
+              const handoff = workerHandoff(instanceId);
+              if (!handoff || handoff.bookkeeping === "pending") return;
+              if (handoff.bookkeeping === "blocked") reject(new Error(handoff.bookkeepingDiagnostic));
+              else resolve();
+            };
+            stop = subscribeChanges(row => { if (row.id === instanceId) inspect(); });
+            inspect();
+          });
+        } finally { stop(); }
+      },
       setIdle(value: boolean) { idle = value; },
       async close() { await emit("session_shutdown"); await retireTeamEvaluation(evaluation); await cancelAllWorkers(); clearBackgroundOwner(); setBackgroundExecutor(undefined); } };
   }

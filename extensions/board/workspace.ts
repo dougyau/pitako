@@ -39,18 +39,18 @@ function workspacePaths(cwd: string): { worktreeRoot: string; commonDir: string 
 function gitPaths(cwd: string): { worktreeRoot: string; commonDir: string } | undefined {
   let state: string;
   try {
-    state = revParse(cwd, ["--is-inside-work-tree", "--is-bare-repository"]);
+    state = revParse(cwd, ["--is-inside-work-tree", "--is-bare-repository", "--path-format=absolute", "--git-common-dir"]);
   } catch (error) {
     const message = gitErrorMessage(error);
     if (/not a git repository/i.test(message) && !hasGitMetadata(cwd)) return undefined;
     throw new Error(`Git discovery failed in ${cwd}: ${message}`);
   }
 
-  const [inside, bare, ...extra] = state.split("\n");
+  // Only the two booleans are line-delimited; the remaining path may contain newlines.
+  const [, inside, bare, commonDir] = state.match(/^(true|false)\n(true|false)\n([\s\S]+)$/) ?? [];
   if (bare === "true") throw new Error(`Git repository is bare; no worktree exists for ${cwd}`);
-  if (inside !== "true" || extra.length > 0) throw new Error(`Git repository state is invalid for ${cwd}`);
+  if (inside !== "true" || bare !== "false" || commonDir === undefined) throw new Error(`Git repository state is invalid for ${cwd}`);
 
-  const commonDir = revParse(cwd, ["--path-format=absolute", "--git-common-dir"]);
   const topLevel = revParse(cwd, ["--path-format=absolute", "--show-toplevel"]);
   return {
     worktreeRoot: canonicalGitDirectory(topLevel, "worktree root"),

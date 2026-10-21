@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { AgentClosureError } from "../extensions/agent/closure.ts";
 import { setBackgroundExecutor, clearBackgroundOwner, teamWorkerStatus } from "../extensions/agent/background.ts";
-import { architectureFixture } from "./fixtures/architecture.ts";
+import { architectureFixture, tablePrompt } from "./fixtures/architecture.ts";
 import * as board from "../extensions/board/store.ts";
 import { planFile } from "../extensions/workflow.ts";
 import { createAgentController } from "../extensions/agent/controller.ts";
@@ -280,7 +280,7 @@ test("Node sees settled synthesis, never provisional receipt; director disposal 
   fixture.finishOnCleanup(() => { submit.resolve(); dispose.resolve(); });
   const s = await setupAtFrontier({
     async afterSubmit(_session, request, receipt) { if (request.stage === "synthesis") { expect(receipt.details.state).toBe("provisional"); provisional.resolve(); await submit.promise; } },
-    async dispose(session) { if (session.prompts.some((text: string) => JSON.parse(text).stage === "synthesis")) { disposing.resolve(); await dispose.promise; } },
+    async dispose(session) { if (session.prompts.some((text: string) => tablePrompt(text).stage === "synthesis")) { disposing.resolve(); await dispose.promise; } },
   });
   let bridge: Awaited<ReturnType<typeof bridgeFor>> | undefined;
   try {
@@ -328,7 +328,7 @@ test("Node roster preserves failed specialists, supports, boundaries and recompo
     if (request.stage === "decision") return { kind: "decision", action: request.round === 1 ? "recompose" : "synthesize", reason: "Known change" };
     if (request.stage === "synthesis") return { ...body, status: "partial", pending: ["One or more member turns failed"] };
     return body;
-  }, async dispose(session) { if (session.prompts.some((p: string) => JSON.parse(p).stage === "synthesis")) { disposing.resolve(); await dispose.promise; } } });
+  }, async dispose(session) { if (session.prompts.some((p: string) => tablePrompt(p).stage === "synthesis")) { disposing.resolve(); await dispose.promise; } } });
   let bridge: Awaited<ReturnType<typeof bridgeFor>> | undefined;
   try {
     const start = await s.invoke("architecture_start", { goal }); await frontier.promise;
@@ -380,7 +380,7 @@ test("Node roster preserves failed specialists, supports, boundaries and recompo
 for (const cancel of [false, true]) test(`finalization exports definitive text when driver ${cancel ? "is cancelled after synthesis" : "fails synthesis"}`, fixture.ownedCase(`driver replacement ${cancel}`, async () => {
   const disposing = gate(), dispose = gate(); fixture.finishOnCleanup(dispose.resolve);
   const s = await setupAtFrontier({ async prompt(_session, request) { if (!cancel && request.stage === "synthesis") throw Error("synthesis rejected"); },
-    async dispose(session) { if (cancel && session.prompts.some((text: string) => JSON.parse(text).stage === "synthesis")) { disposing.resolve(); await dispose.promise; } } });
+    async dispose(session) { if (cancel && session.prompts.some((text: string) => tablePrompt(text).stage === "synthesis")) { disposing.resolve(); await dispose.promise; } } });
   let bridge: Awaited<ReturnType<typeof bridgeFor>> | undefined;
   try {
     const start = await s.invoke("architecture_start", { goal: "Replacement" }); await s.frontier.promise;
@@ -432,7 +432,7 @@ test(`Node observes unknown ${scenario} without inventing release`, async () => 
     if (request.stage === "decision") return { ...body, action: "recompose" };
     return body;
   }, async dispose(session) {
-    if (specialist ? session.model.id === "chosen" : !preparation && session.prompts.some((p: string) => JSON.parse(p).stage === "synthesis"))
+    if (specialist ? session.model.id === "chosen" : !preparation && session.prompts.some((p: string) => tablePrompt(p).stage === "synthesis"))
       throw Error(`${scenario} rejected`);
   } });
   if (specialist) s.advance();

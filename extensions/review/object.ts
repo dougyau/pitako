@@ -4,7 +4,9 @@ import { lstatSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { Type, type Static } from "typebox";
 import { isUtf8 } from "node:buffer";
-import { readPlan, workflowWorkspace } from "../workflow.ts";
+import { readPlan, workflowWorkspace, verifyExecutionBinding, type ExecutionBinding } from "../workflow.ts";
+import { candidateFingerprint } from "../agent/head/gates.ts";
+import type { FreezeCandidate } from "../workflow-planning.ts";
 
 const text = Type.String({ minLength: 1 }), strict = { additionalProperties: false } as const;
 export const objectSchema = Type.Union([
@@ -16,12 +18,42 @@ export type ObjectSelector = Static<typeof objectSchema>;
 export interface ReviewObject {
   selector: ObjectSelector; root: string; identity: string; scope: unknown;
   limits: string[];
+  source?: CapturedReviewSource;
+}
+export type CapturedReviewSource = { kind: "local-selector"; selector: ObjectSelector } |
+  { kind: "managed-candidate"; candidate: FreezeCandidate } | { kind: "managed-execution"; binding: ExecutionBinding };
+export const executionExclusions = [".git", "node_modules", ".codegraph", ".pitako/runs", ".pitako/gates", ".pitako/sessions", ".pitako/table-results"];
+export const executionFingerprint = (root: string) => candidateFingerprint(root, executionExclusions);
+export function captureExecutionObject(binding: ExecutionBinding): ReviewObject {
+  verifyExecutionBinding(binding);
+  return { selector: { kind: "brief", text: `Whole execution review of frozen plan ${binding.planId}@${binding.revision}:${binding.hash}.
+Explore the complete local implementation and tests at this root against the frozen plan. No Git, base, credentials or publication required.
+Exclude only ${executionExclusions.join(", ")}. Review all relevant files, not only a result summary.` },
+    root: binding.executionRoot, identity: executionFingerprint(binding.executionRoot), scope: { binding },
+    source: { kind: "managed-execution", binding },
+    limits: ["Complete local execution root, not a Git diff. Endpoint fingerprints do not promise transactional or immutable exploration."] };
+}
+export function captureReviewSource(source: CapturedReviewSource, cwd: string): ReviewObject {
+  if (source.kind === "local-selector") return captureObject(source.selector, cwd);
+  if (source.kind === "managed-execution") return captureExecutionObject(source.binding);
+  const candidate = source.candidate;
+  return { selector: { kind: "plan", planId: candidate.expectedDraft.meta!.id }, root: realpathSync(workflowWorkspace(cwd)),
+    identity: candidate.objectHash, scope: { file: candidate.expectedDraft.file, revision: candidate.expectedDraft.revision,
+      text: candidate.consultedText }, source,
+    limits: ["Immutable host FreezeCandidate; paths are provenance, not a mutable source.",
+      "Operational Planning workers are excluded; the frozen status transformation was precomputed."] };
 }
 /** Exploration coordinates from the private capture, never captured document or patch bytes. */
 export function describeObject(object: ReviewObject) {
   const common = { selector: structuredClone(object.selector), root: object.root, identity: object.identity, limits: [...object.limits] };
   if (object.selector.kind === "plan") {
     const { file, revision } = object.scope as { file: string; revision: number };
+    if (object.source?.kind === "managed-candidate") {
+      const candidate = object.source.candidate;
+      return { ...common, file, revision, candidateId: candidate.candidateId, text: candidate.consultedText,
+        expectedDraft: { fileHash: candidate.expectedDraft.fileHash, objectHash: candidate.expectedDraft.objectHash, revision: candidate.expectedDraft.revision },
+        frozenHash: candidate.fileHash, transformations: candidate.transformations };
+    }
     return { ...common, file, revision,
       exploration: "Read the plan locally. Exclude only the actual ATX H2 Planning workers section through the next H1/H2 (ATX or Setext). Ignore headings inside fenced code or HTML comments; preserve frontmatter and all other content." };
   }

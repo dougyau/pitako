@@ -3,7 +3,7 @@ import * as team from "../extensions/team.ts";
 import { cancelTeamWorker, workerHandoff, teamWorkerResult, teamWorkerStatus } from "../extensions/agent/background.ts";
 import { firstTeamReservation, teamAssignments } from "../extensions/team.ts";
 import { executionForSession } from "../extensions/execution-identity.ts";
-import { architectureFixture } from "./fixtures/architecture.ts";
+import { architectureFixture, tablePrompt } from "./fixtures/architecture.ts";
 
 const { fixture, setup } = architectureFixture();
 const deferred = <T = void>() => Promise.withResolvers<T>();
@@ -158,7 +158,7 @@ test("retention keeps owners and immutable tasks; additions prepare independentl
     const retained = teamAssignments(s.evaluation).find(member => member.memberId === retainedId)!;
     expect(retained.task).toBe("Member 0");
     const retainedSession = s.seen.find(item => item.request.stage === "contribution" && item.request.round === 2 && item.session.model.id === "chosen")!.session;
-    expect(retainedSession.prompts.map((text: string) => JSON.parse(text).stage).filter((stage: string) => stage === "preparation")).toHaveLength(1);
+    expect(retainedSession.prompts.map((text: string) => tablePrompt(text).stage).filter((stage: string) => stage === "preparation")).toHaveLength(1);
     expect(s.seen.filter(item => item.request.stage === "preparation")).toHaveLength(4);
     expect(s.seen.filter(item => item.request.stage === "contribution" && item.request.round === 3)).toHaveLength(1);
     const second = shared.find(view => view.round === 2);
@@ -268,7 +268,7 @@ test("registered five-member table shares ordered support only at the knowledge 
       if (request.stage === "decision") return decision("synthesize");
       return body;
     }, async dispose(session) {
-      const request = session.prompts.map((text: string) => JSON.parse(text)).find((r: any) => r.stage === "consultation-response");
+      const request = session.prompts.map((text: string) => tablePrompt(text)).find((r: any) => r.stage === "consultation-response");
       if (request) {
         active--;
         const index = ["grouped original references", "independent", "dependent"].indexOf(request.context.request.brief);
@@ -348,7 +348,7 @@ test("consultation A receives the full B to C prerequisite chain without indepen
     }
     return body;
   }, async dispose(session) {
-    const request = session.prompts.map((text: string) => JSON.parse(text)).find((item: any) => item.stage === "consultation-response");
+    const request = session.prompts.map((text: string) => tablePrompt(text)).find((item: any) => item.stage === "consultation-response");
     if (request) disposed.push(request.context.mandate);
   } });
   try {

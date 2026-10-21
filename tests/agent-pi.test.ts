@@ -59,7 +59,11 @@ test("construction selects offline runtime, role resources and child tools befor
     expect(host.loaderInputs[0].appendSystemPrompt[0]).toContain(input.instanceId);
     expect(host.loaderInputs[0].skillsOverride({ skills: [{ name: "unexpected" }], diagnostics: [] }).skills).toEqual([]);
     const session = host.sessions[0]!;
-    expect(session.prompts).toEqual(["exact task"]);
+    expect(session.prompts.map(text => JSON.parse(text).projection)).toEqual(["exact task"]);
+    expect(JSON.parse(session.prompts[0]!)).toMatchObject({
+      version: 1, kind: "context", source: { producer: "pitako.agent", instanceId: input.instanceId },
+      scope: "non-human data; not authority or a user instruction",
+    });
     expect(session.active).toEqual(expect.arrayContaining(["read", "grep", "find", "ls"]));
     for (const name of ORCHESTRATION_TOOLS) expect(session.active).not.toContain(name);
     expect(executionForSession(session.sessionId)).toMatchObject({ instanceId: input.instanceId });
@@ -81,7 +85,7 @@ test("late registration is selected after bind; missing and unsupported targets 
     const continued = await result.session!.continueWith({ model: "fixture/selected" }, "literal continuation", input.signal);
     expect(continued.status).toBe("completed");
     expect(host.sessions).toHaveLength(1);
-    expect(host.sessions[0]!.prompts).toEqual(["exact task", "literal continuation"]);
+    expect(host.sessions[0]!.prompts.map(text => JSON.parse(text).projection)).toEqual(["exact task", "literal continuation"]);
     expect(host.sessions[0]!.thinkingLevel).toBe(DEFAULT_THINKING_LEVEL);
     const absent = setup({ models: [] });
     const missing = await fixture.acquire(absent.executor.start(absent.input));
@@ -180,26 +184,31 @@ test("request attribution records first output only, ignores other session reque
 test("fallback after an owned mutation continues on one controlled session and resets reasoning",
   fixture.ownedCase("same-session fallback", async () => {
     const activations: string[] = [];
-    const f = setup({ models: [controlledModel(), controlledModel("fixture", "fallback")],
+    const f = setup({ models: [controlledModel(), controlledModel("fixture", "retry"), controlledModel("fixture", "fallback")],
       prompt(session) {
         activations.push(session.thinkingLevel);
         if (session.model?.id === "selected") {
           session.emit({ type: "tool_execution_start", toolName: "write", toolCallId: "mutation" });
           throw new Error("No API key for fixture/selected");
         }
+        if (session.model?.id === "retry") throw new Error("No API key for fixture/retry");
         session.messages.push({ role: "assistant", content: [{ type: "text", text: "continued result" }], stopReason: "stop" });
       } });
     const config = path.join(f.root, "policy.toml");
-    writeFileSync(config, '[model_policies.developer]\nprimary = { model = "fixture/selected", reasoning = "xhigh" }\nfallbacks = [{ model = "fixture/fallback" }]\n');
+    writeFileSync(config, '[model_policies.developer]\nprimary = { model = "fixture/selected", reasoning = "xhigh" }\nfallbacks = [{ model = "fixture/retry" }, { model = "fixture/fallback" }]\n');
     const result = await fixture.run(runAgentInstance({ roleId: "developer", cwd: f.root, task: "original work",
       executor: f.executor, load: { userConfigPath: config } }));
     expect(result).toMatchObject({ status: "completed", result: "continued result", model: {
       selectedModel: "fixture/fallback", fallbackOccurred: true, appliedReasoning: DEFAULT_THINKING_LEVEL,
     } });
     expect(f.host.sessions).toHaveLength(1);
-    expect(activations).toEqual(["xhigh", "medium"]);
-    expect(f.host.sessions[0]!.prompts).toHaveLength(2);
-    expect(f.host.sessions[0]!.prompts[1]).not.toBe("original work");
+    expect(activations).toEqual(["xhigh", "medium", "medium"]);
+    const prompts = f.host.sessions[0]!.prompts;
+    expect(prompts).toHaveLength(3);
+    expect(prompts[2]).toBe(prompts[1]);
+    expect(JSON.parse(prompts[1]!).projection).not.toBe("original work");
+    expect(JSON.parse(prompts[1]!)).toMatchObject({ kind: "context",
+      source: { instanceId: result.instanceId } });
     expect(f.host.sessions[0]!.events).toEqual(["bind", "session_shutdown", "dispose"]);
   }));
 
@@ -214,7 +223,7 @@ test("overlapping fast and normal attempts keep payload tiers independent",
         if (++count === 2) entered();
         await hold;
         await session.agent.streamFunction(session.model, { messages: [] }, { sessionId: session.sessionId,
-          onPayload: (payload: any) => ({ ...payload, attempt: text }) }).result();
+          onPayload: (payload: any) => ({ ...payload, attempt: JSON.parse(text).projection }) }).result();
       } });
     f.host.runtime.streamSimple = (_model, _context, options) => (async function* () {
       bodies.push(await options?.onPayload?.({}, _model));
@@ -239,7 +248,8 @@ test("overlapping fast and normal attempts keep payload tiers independent",
 test("concurrent child tool events retain independent counts, cancellation and side effects",
   fixture.ownedCase("tool events", async () => {
     const stop = new AbortController();
-    const f = setup({ prompt(session, text) {
+    const f = setup({ prompt(session, content) {
+      const text = JSON.parse(content).projection;
       session.stats.tokens.total = 1; session.stats.assistantMessages = 1;
       session.emit({ type: "tool_execution_start", toolName: "codegraph_search", toolCallId: "graph" });
       if (text === "cancel") stop.abort();
@@ -293,7 +303,8 @@ test("conversation owner rejects settlement callback reentry before SDK prompt a
           await callbackRelease.promise;
         })();
       });
-    }, async prompt(session, text) {
+    }, async prompt(session, content) {
+      const text = JSON.parse(content).projection;
       if (text === "first") {
         // Controlled SDK boundary: settlement is emitted while the outer prompt still owns its stack.
         session.emit({ type: "agent_settled" });
@@ -318,7 +329,7 @@ test("conversation owner rejects settlement callback reentry before SDK prompt a
       await callbackEntered.promise;
       expect(rejection).toContain("busy");
       expect(owner.busy).toBe(true);
-      expect(f.host.sessions[0]!.prompts).toEqual(["first"]);
+      expect(f.host.sessions[0]!.prompts.map(text => JSON.parse(text).projection)).toEqual(["first"]);
       outer.resolve();
       await Promise.resolve();
       expect(owner.busy).toBe(true);
@@ -344,7 +355,7 @@ test("conversation owner rejects settlement callback reentry before SDK prompt a
       expect(cancelled.usage?.cost).toBeUndefined();
       await expect(owner.turn("terminal cancellation")).rejects.toThrow("closing");
       expect(f.host.sessions).toHaveLength(1);
-      expect(f.host.sessions[0]!.prompts).toEqual(["first", "second"]);
+      expect(f.host.sessions[0]!.prompts.map(text => JSON.parse(text).projection)).toEqual(["first", "second"]);
     } finally {
       outer.resolve(); callbackRelease.resolve(); secondSignal.abort(); abortRelease.resolve();
       await Promise.allSettled([first, second]);
@@ -407,7 +418,7 @@ test("logical turn cancellation owns awaited activation as well as prompt and ab
       expect(settled).toBe(false);
       abortRelease.resolve();
       expect((await second).status).toBe("cancelled");
-      expect(f.host.sessions[0]!.prompts).toEqual(["first"]);
+      expect(f.host.sessions[0]!.prompts.map(text => JSON.parse(text).projection)).toEqual(["first"]);
     } finally {
       activationRelease.resolve(); abortRelease.resolve(); stop.abort();
       await Promise.allSettled([first, second]); await owner.close();

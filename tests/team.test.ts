@@ -26,6 +26,7 @@ import { createAgentController } from "../extensions/agent/controller.ts";
 import { createAgentBridge } from "../extensions/agent/bridge/broker.ts";
 import { connect } from "../extensions/agent/bridge/client.js";
 import pitako from "../extensions/index.ts";
+import { RootGuard, registerBackgroundAttempt } from "../extensions/workflow-engine.ts";
 
 // File-local integration bound: parallel Git/agent setup must finish before
 // Bun interrupts subprocesses; callback ownership still governs cleanup.
@@ -108,12 +109,13 @@ function initWorktreePair(base: string, executionName = "execution"): { source: 
 }
 
 async function spawn(evaluation: NonNullable<ReturnType<typeof beginTeamEvaluation>>, role: string, id: string, worker: ReturnType<typeof hanging>, onSettled: () => void, watch?: { planId: string; unitId: string }) {
+  const config = load();
   return spawnBackground({
     roleId: role,
     task: `work ${id}`,
-    cwd: packageRoot(),
+    cwd: path.dirname(path.dirname(config.userConfigPath)),
     executor: worker.executor,
-    load: load(),
+    load: config,
     watch,
     teamOwner: { token: evaluation.token, assignmentId: id, onSettled },
   });
@@ -169,21 +171,38 @@ describe("Team T1 ownership", () => {
     const ledger = ledgerFile("persisted-plan", cwd);
     mkdirSync(path.dirname(ledger), { recursive: true });
     writeFileSync(ledger, `---\nplan_id: persisted-plan\nrevision: 1\nhash: ${planHash(planText)}\nstatus: running\n---\n\n## Team Holds\n\n<!-- pitako-team-holds:v1 -->\n[]\n<!-- /pitako-team-holds -->\n`);
-    recordPlanTeamWork(cwd, "persisted-plan", "unit-a", "cancelled-assignment", "pending");
-    recordPlanTeamWork(cwd, "persisted-plan", "unit-a", "cancelled-assignment", "cancelled");
-    recordPlanTeamWork(cwd, "persisted-plan", "unit-b", "failed-assignment", "failed");
+    const binding = openExecutionPlan("persisted-plan", cwd, { createLedger: true }).binding;
+    const record = (unit: string, id: string, status: "pending" | "completed" | "cancelled" | "failed") =>
+      recordPlanTeamWork(cwd, "persisted-plan", unit, id, status, binding);
+    record("unit-a", "cancelled-assignment", "pending");
+    record("unit-a", "cancelled-assignment", "cancelled");
+    record("unit-b", "failed-assignment", "failed");
     expect(hasUnsettledTeamWork(undefined, "persisted-plan", cwd)).toBe(true);
-    recordPlanTeamWork(cwd, "persisted-plan", "unit-c", "unrelated-success", "completed");
+    expect(() => record("unit-c", "unregistered-success", "completed")).toThrow("no registered attempt");
+    const guard = new RootGuard(cwd);
+    try {
+      const success = registerBackgroundAttempt({ kind: "ordinary", guard }, { cwd,
+        instanceId: "success", dispatchId: "success", roleId: "developer", assignmentId: "unrelated-success",
+        watch: { planId: "persisted-plan", unitId: "unit-c", execution: binding } });
+      success.admit(); success.checkProjection();
+      success.result({ status: "completed", result: "unrelated completed work" });
+      success.producer.observe("preparation", "closed");
+      success.producer.observe("host-operation", "closed");
+      const receipt = success.producer.observe("callback", "closed", true);
+      expect(receipt).toBeDefined();
+      recordPlanTeamWork(cwd, "persisted-plan", "unit-c", "unrelated-success", "completed", binding, receipt);
+      expect(readLedgerTeamHolds(cwd, "persisted-plan", binding).map(hold => hold.assignmentId)).not.toContain("unrelated-success");
+    } finally { guard.close(); }
     expect(hasUnsettledTeamWork(undefined, "persisted-plan", cwd)).toBe(true);
     expect(readFileSync(ledger, "utf8")).toContain('"assignmentId":"cancelled-assignment"');
-    expect(() => recordPlanTeamWork(cwd, "persisted-plan", "unit-d", "new", "pending")).not.toThrow();
-    recordPlanTeamWork(cwd, "persisted-plan", "unit-d", "new", "completed");
+    expect(() => record("unit-d", "new", "pending")).not.toThrow();
+    expect(() => record("unit-d", "new", "completed")).toThrow("no matching successful outcome");
     expect(hasUnsettledTeamWork(undefined, "persisted-plan", cwd)).toBe(true);
     writeFileSync(ledger, readFileSync(ledger, "utf8").replace("<!-- pitako-team-holds:v1 -->", ""));
     expect(() => hasUnsettledTeamWork(undefined, "persisted-plan", cwd)).toThrow("gate is missing or malformed");
     rmSync(ledger);
     expect(() => hasUnsettledTeamWork(undefined, "persisted-plan", cwd)).toThrow("ledger is missing");
-    expect(() => recordPlanTeamWork(cwd, "persisted-plan", "unit-e", "blocked", "pending")).toThrow("ledger is missing");
+    expect(() => record("unit-e", "blocked", "pending")).toThrow("ledger is missing");
   }));
 
   test("no-topic plans do not create a ledger or sidecar", fixture.ownedCase("no-topic plans do not create a ledger or sidecar", () => {
@@ -255,8 +274,10 @@ describe("Team T1 ownership", () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(firstMessages).toHaveLength(1);
     expect(secondMessages).toHaveLength(1);
-    expect(firstOwner.getBranch()).toMatchObject([{ content: "done", details: { assignmentId: "first-assignment", instanceId: firstHandle.instanceId } }]);
-    expect(secondOwner.getBranch()).toMatchObject([{ content: "done", details: { assignmentId: "second-assignment", instanceId: secondHandle.instanceId } }]);
+    expect(firstOwner.getBranch()).toMatchObject([{ details: { assignmentId: "first-assignment", instanceId: firstHandle.instanceId } }]);
+    expect(secondOwner.getBranch()).toMatchObject([{ details: { assignmentId: "second-assignment", instanceId: secondHandle.instanceId } }]);
+    expect(firstOwner.getBranch().map(entry => JSON.parse(entry.content).projection)).toEqual(["done"]);
+    expect(secondOwner.getBranch().map(entry => JSON.parse(entry.content).projection)).toEqual(["done"]);
     expect(firstMessages[0]).not.toContain("Use team_result");
   }));
 
@@ -327,13 +348,13 @@ describe("Team T1 ownership", () => {
     });
     let idle = false;
     const tools = new Map<string, { execute: (...args: any[]) => Promise<any>; promptGuidelines?: string[] }>();
-    const handlers = new Map<string, Function>();
+    const handlers = new Map<string, Function[]>();
     const sent: { message: any; options: any }[] = [];
     const branch: unknown[] = [];
     const pi = {
       registerTool(tool: any) { tools.set(tool.name, preparedTool(tool)); },
       registerFlag() {}, registerCommand() {},
-      on(event: string, handler: Function) { if (!handlers.has(event)) handlers.set(event, handler); },
+      on(event: string, handler: Function) { handlers.set(event, [...handlers.get(event) ?? [], handler]); },
       getFlag() { return undefined; }, getAllTools() { return []; }, getActiveTools() { return []; },
       setActiveTools() {}, getSessionName() { return undefined; }, setSessionName() {},
       sendMessage(message: any, options: any) {
@@ -351,7 +372,11 @@ describe("Team T1 ownership", () => {
       hasUI: false, isIdle: () => idle, ui: { notify() {}, setStatus() {} },
       sessionManager: { getSessionId: () => sessionId, getBranch: () => branch },
     };
-    await handlers.get("session_start")?.({}, hostContext);
+    async function emit(event: string) {
+      for (const handler of handlers.get(event) ?? []) await handler({}, hostContext);
+    }
+    fixture.beforeRelease(() => emit("session_shutdown"));
+    await emit("session_start");
     const current = teamEvaluationForSession(sessionId, false)!;
     evaluations.add(current);
     const cwd = mkdtempSync(path.join(tmpdir(), "pitako-team-planning-"));
@@ -380,25 +405,36 @@ describe("Team T1 ownership", () => {
     let collected!: () => void;
     const researchReady = new Promise<void>(resolve => { collected = resolve; });
     const unsubscribe = subscribeChanges(row => {
-      if (row.id === researcher.instanceId && row.handoff?.collection === "collected") collected();
+      if (row.id === researcher.instanceId && row.handoff?.collection === "collected" &&
+          row.handoff.bookkeeping === "reconciled") collected();
     });
     fixture.beforeRelease(unsubscribe);
     workers.find((worker) => worker.task.includes("Research planning task"))!.finish(completed(researchText));
     await researchReady;
     unsubscribe();
+    expect(listObservations(current.token).find(row => row.id === researcher.instanceId)?.handoff)
+      .toMatchObject({ bookkeeping: "reconciled" });
     expect(teamWorkerStatus(current.token, researcher.instanceId)[0]?.status).toBe("completed");
     expect(sent).toEqual([]);
-    const boundary = handlers.get("agent_before_settle")?.({ outcome: "completed", context: { canContinue: false } }, hostContext);
+    const boundary = { entries: [] as ResultMessage[], continue: false };
+    // Boundary results replace only the fields supplied; neutral observers keep prior results.
+    for (const handler of handlers.get("agent_before_settle") ?? []) {
+      const result = await handler({ ...boundary, outcome: "completed", context: { canContinue: false } }, hostContext);
+      if (result?.entries !== undefined) boundary.entries = result.entries;
+      if (result?.continue !== undefined) boundary.continue = result.continue;
+    }
     const cloned = structuredClone(boundary.entries);
     expect(cloned).toEqual(boundary.entries);
     expect(cloned[0].details).not.toBe(boundary.entries[0].details);
     const restored = JSON.parse(JSON.stringify(boundary.entries));
-    expect(boundary).toMatchObject({ continue: true, entries: [{ content: researchText, details: {
+    expect(boundary).toMatchObject({ continue: true, entries: [{ details: {
       instanceId: researcher.instanceId, assignmentId: researcher.id, ownerSessionId: sessionId,
       status: "completed", roleId: "researcher",
       planId: "plan-frozen-a", unitId: "research-evidence",
     } }] });
-    expect(restored[0].content).toBe(researchText);
+    expect(restored[0].content).toBe(boundary.entries[0].content);
+    expect(JSON.parse(restored[0].content)).toMatchObject({ kind: "result", projection: researchText,
+      source: { assignmentId: researcher.id, instanceId: researcher.instanceId, ownerSessionId: sessionId } });
     expect(boundary.entries[0].details.deliveryId).toBeString();
     expect(typeof boundary.entries[0].details.foregroundRevision).toBe("number");
     expect(Object.hasOwn(boundary.entries[0].details, "ownerToken")).toBe(false);
@@ -409,19 +445,19 @@ describe("Team T1 ownership", () => {
     expect(listObservations(current.token).find(row => row.id === researcher.instanceId)?.teamOwnerToken).toBe(current.token);
     expect(listObservations(current.token).find(row => row.id === researcher.instanceId)?.resultTaken).not.toBe(true);
     branch.push(...restored);
-    handlers.get("context")?.({}, hostContext);
+    await emit("context");
     expect(listObservations(current.token).find(row => row.id === researcher.instanceId)?.handoff?.delivery).toBe("incorporated");
     expect(listObservations(current.token).find(row => row.id === researcher.instanceId)?.handoff?.continuation).toBe("requested");
     expect(listObservations(current.token).find(row => row.id === researcher.instanceId)?.resultTaken).not.toBe(true);
-    handlers.get("turn_start")?.({}, hostContext);
+    await emit("turn_start");
     expect(listObservations(current.token).find(row => row.id === researcher.instanceId)?.handoff?.continuation).toBe("observed");
     expect(listObservations(current.token).find(row => row.id === researcher.instanceId)?.resultTaken).toBe(true);
     idle = true;
-    handlers.get("agent_settled")?.({}, hostContext);
+    await emit("agent_settled");
     expect(sent).toEqual([]);
     const consumed = await invoke("team_result", { assignmentId: researcher.id });
     expect(consumed.content[0].text).toContain(researchText);
-    handlers.get("agent_settled")?.({}, hostContext);
+    await emit("agent_settled");
     expect(sent).toEqual([]);
 
     workers.find((worker) => worker.task.includes("Developer planning task"))!.finish(completed(architectText));
@@ -432,15 +468,16 @@ describe("Team T1 ownership", () => {
     const original = architectResults[0]!.message;
     expect(structuredClone(original)).toEqual(original);
     const json = JSON.parse(JSON.stringify(original));
-    expect(json.content).toBe(architectText);
+    expect(json.content).toBe(original.content);
+    expect(JSON.parse(json.content).projection).toBe(architectText);
     for (const [key, value] of Object.entries(original.details)) {
       if (value !== undefined) expect(json.details[key]).toEqual(value);
     }
     const committed = branch.find((entry: any) => entry.details?.instanceId === architect.instanceId) as ResultMessage;
-    expect(committed.content).toBe(architectText);
+    expect(committed.content).toBe(original.content);
     expect(committed.details).toEqual(original.details);
     expect(committed.details).not.toBe(original.details);
-    expect(original).toMatchObject({ content: architectText, details: {
+    expect(original).toMatchObject({ details: {
       instanceId: architect.instanceId, assignmentId: architect.id, ownerSessionId: sessionId,
       status: "completed", roleId: "developer",
       planId: "plan-frozen-a", unitId: "developer-analysis",
@@ -455,16 +492,16 @@ describe("Team T1 ownership", () => {
     expect(sent).toHaveLength(2);
     expect(listObservations(current.token).find(row => row.id === architect.instanceId)?.teamOwnerToken).toBe(current.token);
     expect(listObservations(current.token).find(row => row.id === architect.instanceId)?.handoff).toMatchObject({
-      bookkeeping: "inapplicable", delivery: "incorporated", continuation: "requested",
+      bookkeeping: "reconciled", delivery: "incorporated", continuation: "requested",
     });
     expect(listObservations(current.token).find(row => row.id === architect.instanceId)?.resultTaken).not.toBe(true);
-    handlers.get("turn_start")?.({}, hostContext);
+    await emit("turn_start");
     expect(listObservations(current.token).find(row => row.id === architect.instanceId)?.handoff?.continuation).toBe("observed");
     expect(listObservations(current.token).find(row => row.id === architect.instanceId)?.resultTaken).toBe(true);
     const reread = await invoke("team_result", { assignmentId: architect.id });
     expect(reread.content[0].text).toContain(architectText);
-    handlers.get("agent_settled")?.({}, hostContext);
-    handlers.get("agent_settled")?.({}, hostContext);
+    await emit("agent_settled");
+    await emit("agent_settled");
     expect(sent).toHaveLength(2);
   }));
 
@@ -1210,7 +1247,11 @@ test("host Team retains one conversation, background lifetime and history across
     writeFileSync(config, '[model_policies.architect]\nprimary = { model = "fixture/selected" }\n');
     const current = evaluation("maintained-readers");
     bindBackgroundOwner({ ...owner(current.token), sessionId: current.sessionId });
-    const sdk = controlledPi(root, { prompt(session, text) {
+    const sdk = controlledPi(root, { prompt(session, context) {
+      const delivery = JSON.parse(context);
+      expect(delivery).toMatchObject({ kind: "context",
+        source: { producer: "team_assign", ownerSessionId: current.sessionId } });
+      const text = delivery.projection as string;
       session.stats.tokens.input += 7; session.stats.tokens.output += 3; session.stats.assistantMessages++;
       const message = { role: "assistant" as const, content: [{ type: "text" as const, text }], stopReason: "stop" as const,
         api: "openai-completions" as const, provider: "fixture", model: "selected", timestamp: Date.now(),

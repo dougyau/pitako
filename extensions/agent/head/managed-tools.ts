@@ -17,9 +17,14 @@ import { AdmissionInventory, digest, type Contribution } from "./inventory.ts";
 import { reserveOperation } from "./operation-leases.ts";
 import { assertNoCheckpointLease } from "./checkpoint-lease.ts";
 import type { CheckpointManifest } from "../checkpoints.ts";
+import { captureCallContext, checkCallContext, guardDefinition, hasDefinitionGuard, isGuardedDefinition, type CallContext } from "../../workflow-engine.ts";
+import { packageRoot } from "../../stack.ts";
 
 // Heterogeneous SDK registry. Individual wrappers retain their schema/details/render-state types.
 type NativeDefinition = ToolDefinition<any, any, any>;
+function physicalOwner(file: string): string | undefined {
+  try { return realpathSync(file); } catch { return undefined; }
+}
 
 /** Finite cooperative foreground commands only. Not descendant confinement or a sandbox. */
 export const foregroundBash: BashOperations = {
@@ -41,6 +46,7 @@ export const foregroundBash: BashOperations = {
 /** Assignment-wide exclusion/uncertainty; each native producer keeps its own product slot. */
 export class ManagedAssignment {
   readonly inventory: AdmissionInventory;
+  readonly context: CallContext;
   private active = new Set<ManagedProducer>();
   private failures: unknown[] = [];
   private nativeOmitted = 0;
@@ -51,10 +57,13 @@ export class ManagedAssignment {
     closure: "observed" | "released" | "unknown";
   }>();
   constructor(readonly root: string, envelope: readonly string[], adopted?: CheckpointManifest) {
+    this.context = captureCallContext(root);
+    checkCallContext(this.context);
     assertNoCheckpointLease(root);
     this.inventory = new AdmissionInventory(root, envelope, adopted);
   }
   assertHealthy(): void {
+    checkCallContext(this.context);
     if (this.failures.length) throw new AgentClosureError([...this.failures], "managed assignment");
     if (realpathSync(this.root) !== this.root) throw new Error("managed launch root changed");
   }
@@ -146,7 +155,7 @@ export class ManagedProducer {
   }
   wrap<P extends TSchema, D, S>(definition: ToolDefinition<P, D, S>,
     createDefinition?: (observeUnknown: (error: unknown) => void) => ToolDefinition<P, D, S>): ToolDefinition<P, D, S> {
-    return { ...definition, execute: (id, params, signal, onUpdate, ctx) => {
+    return guardDefinition({ ...definition, execute: (id, params, signal, onUpdate, ctx) => {
       const revision = this.check();
       if (this.slot) throw new Error("managed product operation slot is occupied");
       if (realpathSync(ctx.cwd) !== this.assignment.root) throw new Error("managed tool cwd differs from the launch root");
@@ -155,7 +164,7 @@ export class ManagedProducer {
           hunk.kind === "update" && hunk.moveTo ? [hunk.path, hunk.moveTo] : [hunk.path])
         : definition.name === "bash" ? [] : [(params as { path: string }).path];
       for (const target of targets) this.target(target);
-      const lease = reserveOperation(this.assignment.root, "writer");
+      const lease = reserveOperation(this.assignment.root, "writer", this.assignment.context);
       this.assignment.reserve(this); // Synchronous admission before preflight or native suspension.
       const callbacks = new Set<Promise<unknown>>();
       const failures: unknown[] = [];
@@ -219,7 +228,7 @@ export class ManagedProducer {
         this.slot = undefined; this.assignment.release(this);
       });
       return pending;
-    } };
+    } }, "read", definition.name === "apply_patch");
   }
 }
 
@@ -239,11 +248,14 @@ export function managedTools(loader: DefaultResourceLoader, producer: ManagedPro
   const extensions = loader.getExtensions().extensions;
   const patchOwners = extensions.filter(extension => extension.tools.has("apply_patch"));
   const knownEntry = realpathSync(fileURLToPath(new URL("../index.ts", import.meta.resolve("pi-codex-tools"))));
-  if (patchOwners.length === 1 && realpathSync(patchOwners[0]!.resolvedPath) === knownEntry) {
-    definitions.push(producer.wrap(patchOwners[0]!.tools.get("apply_patch")!.definition));
+  if (patchOwners.length === 1 && physicalOwner(patchOwners[0]!.resolvedPath) === knownEntry) {
+    const tool = patchOwners[0]!.tools.get("apply_patch")!;
+    tool.definition = producer.wrap(tool.definition);
+    definitions.push(tool.definition);
   }
   return [...definitions,
-    createReadToolDefinition(root), createGrepToolDefinition(root), createFindToolDefinition(root), createLsToolDefinition(root)];
+    ...[createReadToolDefinition(root), createGrepToolDefinition(root), createFindToolDefinition(root), createLsToolDefinition(root)]
+      .map((definition: NativeDefinition) => guardDefinition(definition, "read"))];
 }
 
 const LOCAL = new Set(["head_gates", "consultation_feedback", "head_consult", "head_result", "head_wait", "head_plan", "head_start", "head_observe", "head_input", "head_review", "head_finish", "head_scope_ack"]);
@@ -251,10 +263,35 @@ const BOOKKEEPING = new Set(["todo", "compress", "decompress", "search_context",
   "board_post", "board_topic_create", "board_topic_update", "board_workflow_claim", "board_workflow_lifecycle",
   "memory_search", "memory_add", "memory_replace", "memory_remove", "session_search"]);
 
+/** Enrol only actual packaged read/bookkeeping definitions from their known owners. */
+export function guardManagedLoadedDefinitions(loader: DefaultResourceLoader): void {
+  const root = packageRoot();
+  const owners = new Set([
+    "extensions/todo.ts", "extensions/acp.ts", "extensions/board/index.ts",
+    "node_modules/pi-lsp-client/src/index.ts", "node_modules/@vndv/pi-codegraph/extensions/codegraph.ts",
+    "node_modules/pi-hermes-memory/src/index.ts",
+  ].map(file => realpathSync(path.join(root, file))));
+  for (const extension of loader.getExtensions().extensions) {
+    const owner = physicalOwner(extension.resolvedPath);
+    const known = owner !== undefined && owners.has(owner);
+    const knownPatch = owner === realpathSync(fileURLToPath(new URL("../index.ts", import.meta.resolve("pi-codex-tools"))));
+    for (const [name, tool] of extension.tools) {
+      if (isGuardedDefinition(tool.definition) || knownPatch && name === "apply_patch") continue;
+      if (known && (BOOKKEEPING.has(name) || toolEffect(name) === "read_only"))
+        tool.definition = guardDefinition(tool.definition, "read");
+      else tool.definition = guardDefinition({ ...tool.definition, async execute() {
+        throw new Error("Unsupported managed definition/composition");
+      } }, "read");
+    }
+  }
+}
+
 export function managedGuard(supported: Set<string>, checkpoint = false): ExtensionFactory {
   return pi => { pi.on("tool_call", event => {
-    if (supported.has(event.toolName) || LOCAL.has(event.toolName) && (!["head_consult", "consultation_feedback"].includes(event.toolName) || checkpoint) || checkpoint && event.toolName === "head_checkpoint" || BOOKKEEPING.has(event.toolName) ||
-        toolEffect(event.toolName) === "read_only") return;
+    const info = pi.getAllTools?.().find(tool => tool.name === event.toolName);
+    if (info && hasDefinitionGuard(info.parameters)) return;
+    if (info?.sourceInfo.path === `builtin:${event.toolName}` &&
+      (BOOKKEEPING.has(event.toolName) || toolEffect(event.toolName) === "read_only")) return;
     return { block: true, reason: "Unsupported writer/composition in a locally checkpointed assignment; use managed native file tools or finite foreground bash" };
   }); };
 }

@@ -10,14 +10,14 @@ import {
   deliverWorkerResults, observeWorkerResults, revokeBackgroundOwner, settleWorkerResults, spawnBackground,
   type BackgroundOwner, type LiveTarget, type ResultMessage, type WorkerReadScope, type WorkerResultRead,
 } from "../extensions/agent/background.ts";
-import { listObservations } from "../extensions/agent/observe.ts";
+import { listObservations, subscribeChanges } from "../extensions/agent/observe.ts";
 import { createAgentController } from "../extensions/agent/controller.ts";
 import type { AgentRunResult, Attempt, AttemptExecutor } from "../extensions/agent/run.ts";
 import {
   beginTeamEvaluation, recordPlanTeamWork, recordTeamAssignment, reserveTeamMember,
   retireTeamEvaluation, teamAssignments, firstTeamReservation, type TeamEvaluation,
 } from "../extensions/team.ts";
-import { ledgerFile, planFile, planHash, readLedgerTeamHolds } from "../extensions/workflow.ts";
+import { ledgerFile, openExecutionPlan, planFile, planHash, readLedgerTeamHolds } from "../extensions/workflow.ts";
 
 const fixture = agentFixtureOwnership();
 const evaluations: TeamEvaluation[] = [];
@@ -129,7 +129,7 @@ test("terminal observation is not an outcome; abort without settlement is explic
   expect(hints.at(-1)?.state).toBe("ready");
   expect(ready(readWorkerResult(target, env.scope))).toMatchObject({ status: "completed", text: { text: "not settled yet" } });
   expect(env.notes).toEqual([]);
-  expect(env.branch).toMatchObject([{ content: "not settled yet" }]);
+  expect(env.branch.map((entry: any) => JSON.parse(entry.content).projection)).toEqual(["not settled yet"]);
 }));
 
 test("a failed settled outcome is readable as failure, never fabricated empty success", fixture.ownedCase("projection failed outcome", async () => {
@@ -222,7 +222,7 @@ test("exact bounded UTF-16 pages survive pending/incorporated/acknowledged state
   expect(readFileSync(manager.getSessionFile()!)).toEqual(historyBefore);
   env.foreground.isIdle = () => true;
   deliverWorkerResults(env.foreground.token);
-  expect(env.branch).toMatchObject([{ content: result }]);
+  expect(env.branch.map((entry: any) => JSON.parse(entry.content).projection)).toEqual([result]);
   expect(ready(readWorkerResult(target, env.scope)).text.text).toBe(result.slice(0, 1024));
   const tool = tools().get("agent_result")!;
   const consumed = await tool.execute("result", { id: handle.instanceId }, new AbortController().signal, undefined,
@@ -253,15 +253,16 @@ test("Team reads preserve occupancy and assignments; automatic bookkeeping is in
   const planText = "---\nid: projection\nrevision: 1\nstatus: frozen\nboard_topic_id: 1\n---\nTeam workflow.\n";
   writeFileSync(plan, planText);
   writeFileSync(ledger, `---\nplan_id: projection\nrevision: 1\nhash: ${planHash(planText)}\nstatus: running\n---\n\n## Team Holds\n\n<!-- pitako-team-holds:v1 -->\n[]\n<!-- /pitako-team-holds -->\n`);
-  recordPlanTeamWork(env.root, "projection", "T2", "assignment", "pending");
+  // The real spawn owns its pending hold/reservation; do not invent a second admission here.
+  const execution = openExecutionPlan("projection", env.root).binding;
   const admission = reserveTeamMember(evaluation, "developer", "assignment");
   const worker = hanging();
   const handle = await spawnBackground({
     roleId: "developer", task: "Team wrapper\nWorkBrief:\noriginal", cwd: env.root, load: env.load, executor: worker.executor,
     historyOrigin: { source: "team_assign", coordinatorSessionId: env.scope.coordinatorSessionId, assignmentId: "assignment" },
-    watch: { planId: "projection", unitId: "T2" },
+    watch: { planId: "projection", unitId: "T2", execution },
     teamOwner: { token: evaluation.token, assignmentId: "assignment", onSettled: admission.settled },
-    reconcileBookkeeping: result => recordPlanTeamWork(env.root, "projection", "T2", "assignment", result.status),
+    reconcileBookkeeping: (result, receipt) => recordPlanTeamWork(env.root, "projection", "T2", "assignment", result.status, execution, receipt),
   });
   admission.commit();
   recordTeamAssignment(evaluation, "developer", {
@@ -364,20 +365,30 @@ test("automatic ledger failure never hides the full tool result; captured bookke
   const planText = "---\nid: projection\nrevision: 1\nstatus: frozen\nboard_topic_id: 1\n---\nOwned ledger.\n";
   writeFileSync(plan, planText);
   writeFileSync(ledger, `---\nplan_id: projection\nrevision: 1\nhash: ${planHash(planText)}\nstatus: running\n---\n\n## Team Holds\n\n<!-- pitako-team-holds:v1 -->\n[]\n<!-- /pitako-team-holds -->\n`);
-  recordPlanTeamWork(env.root, "projection", "T2", "assignment", "pending");
-  const retainedLedger = readFileSync(ledger);
+  const execution = openExecutionPlan("projection", env.root).binding;
   const admission = reserveTeamMember(evaluation, "developer", "assignment"), worker = hanging();
   const handle = await spawnBackground({ roleId: "developer", task: "work", cwd: env.root, load: env.load, executor: worker.executor,
     historyOrigin: { source: "team_assign", coordinatorSessionId: evaluation.sessionId, assignmentId: "assignment" },
+    watch: { planId: "projection", unitId: "T2", execution },
     teamOwner: { token: evaluation.token, assignmentId: "assignment", onSettled: admission.settled },
-    reconcileBookkeeping: result => recordPlanTeamWork(env.root, "projection", "T2", "assignment", result.status) });
+    reconcileBookkeeping: (result, receipt) => recordPlanTeamWork(env.root, "projection", "T2", "assignment", result.status, execution, receipt) });
+  const retainedLedger = readFileSync(ledger);
   admission.commit();
   recordTeamAssignment(evaluation, "developer", { id: "assignment", instanceId: handle.instanceId, roleId: "developer", task: "work",
     planId: "projection", unitId: "T2", boardTopicId: 1 });
   rmSync(ledger);
+  // Missing projections can be recreated; a directory forces a real projection I/O failure.
+  mkdirSync(ledger);
   const full = "\n漢😀e\u0301 ".repeat(3000) + "\n";
+  const blocked = deferred<void>();
+  const stop = subscribeChanges(row => {
+    if (row.id === handle.instanceId && row.handoff?.bookkeeping === "blocked") blocked.resolve();
+  });
+  fixture.beforeRelease(async () => { stop(); });
   worker.finish({ status: "completed", result: full, sideEffects: false });
   await fixture.settleRuns();
+  await blocked.promise;
+  stop();
   expect(firstTeamReservation(evaluation, "developer")).toBeUndefined();
   const envelope = env.branch[0];
   const resultTool = tools().get("team_result")!;
@@ -395,10 +406,13 @@ test("automatic ledger failure never hides the full tool result; captured bookke
     handoff: { bookkeeping: "blocked", delivery: "incorporated", continuation: "observed" },
   });
   expect(listObservations(evaluation.token).find(row => row.id === handle.instanceId)?.resultTaken).not.toBe(true);
+  rmSync(ledger, { recursive: true });
   writeFileSync(ledger, retainedLedger);
   settleWorkerResults(evaluation.token, true);
   expect(readLedgerTeamHolds(env.root, "projection")).toEqual([]);
   expect(readFileSync(ledger, "utf8")).toContain("status: running");
+  expect(listObservations(evaluation.token).find(row => row.id === handle.instanceId)?.handoff)
+    .toMatchObject({ bookkeeping: "reconciled", continuation: "observed" });
   expect(listObservations(evaluation.token).find(row => row.id === handle.instanceId)?.resultTaken).toBe(true);
   expect(env.branch).toEqual([envelope]);
   expect(env.wakes).toHaveLength(1);

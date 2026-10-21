@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { evidenceFile, readExecutionBinding, workflowWorkspace } from "../workflow.ts";
 import { reserveOperation } from "../agent/head/operation-leases.ts";
+import { captureCallContext, currentCallContext, type Producer } from "../workflow-engine.ts";
 
 export type ArchiveDestination = { root: string; planId?: string } | { unavailable: string };
 export type ArchiveState =
@@ -27,14 +28,26 @@ class Unavailable extends Error {}
 /** Auxiliary copy only. A closed temp is linked exclusively, never renamed over a destination.
  * Component checks reject existing symlinks. They are not an adversarial filesystem sandbox:
  * the host must own the tree against concurrent external replacement. No fsync durability claim. */
-export function startTableArchive(destination: ArchiveDestination | undefined, id: string, canonical: string, io = fs) {
+export function startTableArchive(destination: ArchiveDestination | undefined, id: string, canonical: string, io = fs, producer?: Producer) {
   let state: ArchiveState = { state: "pending" };
   let lease: ReturnType<typeof reserveOperation> | undefined;
+  // Capture and register before any asynchronous filesystem operation. Background roots
+  // supply the port registered at admission; retirement cannot substitute a new owner.
+  // A captured caller owns the lease; its archive destination is only the effect path.
+  if (destination && !("unavailable" in destination) && !producer) {
+    try { lease = reserveOperation(destination.root, "writer", currentCallContext() ?? captureCallContext(destination.root)); }
+    catch (error) {
+      return { get state(): ArchiveState { return { state: "unavailable", reason: String(error) }; },
+        get retainedHandle() { return undefined; }, completion: Promise.resolve() };
+    }
+  }
   let temp: string | undefined, handle: Awaited<ReturnType<typeof fs.open>> | undefined;
   let unknown = false;
   const completion = (async () => {
     if (!destination || "unavailable" in destination) {
       state = { state: "unavailable", reason: destination?.unavailable ?? "no authorized archive root captured" };
+      producer?.observe("host-operation", "closed");
+      producer?.observe("callback", "closed", true);
       return;
     }
     try {
@@ -43,8 +56,6 @@ export function startTableArchive(destination: ArchiveDestination | undefined, i
       try {
         if (await io.realpath(root) !== root) throw new Unavailable("archive root changed physical identity");
       } catch (error) { throw new Unavailable(String(error)); }
-      try { lease = reserveOperation(root, "writer"); }
-      catch (error) { throw new Unavailable(String(error)); }
       const target = destination.planId
         ? evidenceFile(destination.planId, `table-results/${id}.json`, root)
         : path.join(root, ".pitako", "table-results", `${id}.json`);
@@ -83,6 +94,8 @@ export function startTableArchive(destination: ArchiveDestination | undefined, i
     } finally {
       if (unknown) lease?.unknown("table archive file close not established");
       else lease?.release();
+      producer?.observe("host-operation", unknown ? "unknown" : "closed");
+      producer?.observe("callback", unknown ? "unknown" : "closed", true);
     }
   })();
   // Retain the actual handle too if close failed; retirement must not drop its resources.

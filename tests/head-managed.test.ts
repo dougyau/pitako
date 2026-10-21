@@ -777,9 +777,14 @@ test("loaded known patch keeps native schema, grammar, rendering and output; rep
     expect(unsupported).toEqual(expect.arrayContaining(["edit", "write"]));
   }
   let guard!: Function;
-  await managedGuard(new Set(tools.map(definition => definition.name)))({ on(_name: string, hook: Function) { guard = hook; } } as any);
+  await managedGuard(new Set(tools.map(definition => definition.name)))({
+    on(_name: string, hook: Function) { guard = hook; },
+    getAllTools: () => [...tools.map(definition => ({ name: definition.name, parameters: definition.parameters, sourceInfo: { path: "captured" } })),
+      { name: "read", sourceInfo: { path: "builtin:read" } }],
+  } as any);
   for (const name of ["codemode", "mcp_write", "apply_patch_replacement"]) expect(guard({ toolName: name }).block).toBe(true);
-  for (const name of ["read", "todo", "head_plan", "bash"]) expect(guard({ toolName: name })).toBeUndefined();
+  for (const name of ["read", "bash", "apply_patch"]) expect(guard({ toolName: name })).toBeUndefined();
+  for (const name of ["todo", "head_plan"]) expect(guard({ toolName: name }).block).toBe(true);
 }));
 
 test("native evidence retains actual entry identities, errors, bounded excerpts and missing-result gaps", () => repository(async root => {
@@ -859,7 +864,7 @@ test(captureClosureCase, async () => {
       expect(unknown).toContain("closure");
       expect(() => reserveOperation(root, "writer")).toThrow("lease");
       expect(() => gates.request(binding, { epoch: "epoch", expectedRevision: 0, coverage: "no replacement",
-        commands: [{ id: "replacement", shell: "printf forbidden", cwd: ".", env: {}, timeoutMs: 100 }] })).toThrow("active");
+        commands: [{ id: "replacement", shell: "printf forbidden", cwd: ".", env: {}, timeoutMs: 100 }] })).toThrow("closure unknown");
       expect(gates.status(binding, handle.runId).artifacts).toHaveLength(2);
       console.log(`Intentionally retained uncertain observation diagnostics: ${root}`);
     } else {

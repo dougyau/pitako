@@ -1,66 +1,81 @@
 import { AgentClosureError, hasUnknownClosure, joinedClosureObservation, type ClosureObservation } from "../closure.ts";
 import { existsSync, realpathSync } from "node:fs";
 import path from "node:path";
-import { createBashToolDefinition, type ExtensionAPI, type BashOperations } from "@earendil-works/pi-coding-agent";
+import { createBashToolDefinition, createWriteToolDefinition, createEditToolDefinition,
+  type ExtensionAPI, type BashOperations } from "@earendil-works/pi-coding-agent";
 import { toolEffect } from "../effects.ts";
-import { executionForSession } from "../../execution-identity.ts";
+import { captureCallContext, checkCallContext, reserveEffect, guardDefinition, hasDefinitionGuard, hasReadDefinitionGuard,
+  withCallContext as withCaptured, assertGenericWrite, type Producer } from "../../workflow-engine.ts";
+import type { CallContext } from "../../workflow-engine.ts";
+import type { Reservation } from "../../workflow-state.ts";
+import { randomUUID } from "node:crypto";
 
 type Lease = { root?: string; kind: "writer" | "checkpoint" | "gates"; unknown?: string;
-  observations?: Array<ClosureObservation | undefined>; released?: boolean };
-const KEY = Symbol.for("pitako.operationLeases");
-const host = globalThis as typeof globalThis & { [KEY]?: { leases: Set<Lease>; mutations: Map<string, number>; next: number } };
-host[KEY] ??= { leases: new Set(), mutations: new Map(), next: 0 };
-const state = host[KEY];
+  observations: Array<ClosureObservation | undefined>; released?: boolean; producer: Producer };
+// Only local observation handles live here. Reservation/closure authority is in SQLite.
+const pending = new Set<Lease>();
 export const overlaps = (a: string, b: string) =>
   a === b || a.startsWith(b.endsWith(path.sep) ? b : b + path.sep) || b.startsWith(a.endsWith(path.sep) ? a : a + path.sep);
 export function canonicalRoot(root: string): string { return realpathSync(root); }
 function reobserve(root?: string): void {
-  for (const lease of state.leases) {
+  for (const lease of pending) {
     if (lease.unknown === undefined || root && lease.root && !overlaps(root, lease.root) || !lease.observations?.length) continue;
     try {
       if (!lease.observations.every(observation => observation?.observe() === "closed")) continue;
-      state.leases.delete(lease);
+      lease.producer.observe("host-operation", "closed", true);
+      pending.delete(lease);
       lease.released = true;
     } catch { /* A failed observation is not closure. */ }
+  }
+  for (const lease of pending) {
+    if (lease.root === undefined && lease.unknown !== undefined &&
+      lease.producer.snapshot().facts["host-operation"] !== "closed")
+      throw new AgentClosureError([new Error(lease.unknown ?? "unreleased operation")], "unscoped operation lease");
   }
 }
 // Ordinary writers may overlap; retained unknown writers may not admit new effects.
 export function assertNoExclusive(root?: string): void {
   reobserve(root);
-  const lease = [...state.leases].find(l => (l.kind !== "writer" || l.unknown !== undefined) && (!root || !l.root || overlaps(root, l.root)));
-  if (!lease) return;
-  if (lease.kind === "writer") throw new AgentClosureError([new Error(lease.unknown)], "overlapping writer");
-  throw new Error("checkpoint lease or gates lease is occupied");
+  const context = captureCallContext(root ? physicalTarget(root) : process.cwd());
+  checkCallContext(context).assertIdle([root ?? path.parse(process.cwd()).root], true);
 }
 export function assertQuiescent(root: string): void {
   reobserve(root);
-  if ([...state.leases].some(l => !l.root || overlaps(root, l.root)))
-    throw new Error("overlapping operation is active or unknown");
+  checkCallContext(captureCallContext(physicalTarget(root))).assertIdle([root]);
 }
 export function mutationGeneration(root: string): number {
-  return Math.max(0, ...[...state.mutations].filter(([r]) => r === "*" || overlaps(root, r)).map(([, n]) => n));
+  const store = checkCallContext(captureCallContext(root)).store;
+  return Math.max(0, ...store.outbox().filter(entry => {
+    const body = entry.body as { kind?: string; reservation?: Reservation };
+    return body.kind === "reserved" && body.reservation?.kind === "writer" &&
+      body.reservation.paths.some(scope => overlaps(root, scope));
+  }).map(entry => entry.sequence));
 }
 /** Admission precedes effects. Unknown closure deliberately keeps its reservation. */
-export function reserveOperation(root: string | undefined, kind: Lease["kind"]) {
-  if (kind === "writer") {
-    assertNoExclusive(root);
-    state.mutations.set(root ?? "*", ++state.next);
-  } else {
-    if (!root) throw new Error("exclusive operations require a physical root");
-    assertQuiescent(root);
-  }
-  const lease: Lease = { root, kind };
-  state.leases.add(lease);
+export function reserveOperation(root: string | undefined, kind: Lease["kind"], context?: CallContext) {
+  if (kind !== "writer" && !root) throw new Error("exclusive operations require a physical root");
+  reobserve(root);
+  if (!context && !root) throw new Error("unscoped native operation requires captured context");
+  context ??= captureCallContext(physicalTarget(root!));
+  assertGenericWrite(context);
+  const reservation = reserveEffect(context, { reservationId: randomUUID(), kind,
+    paths: [root ?? path.parse(process.cwd()).root] });
+  const producer = reservation.register("native-operation", ["host-operation"]);
+  producer.enter();
+  const lease: Lease = { root, kind, producer, observations: [] };
   return {
     release() {
       if (lease.released || lease.unknown !== undefined) return;
+      producer.observe("host-operation", "closed", true);
       lease.released = true;
-      state.leases.delete(lease);
+      pending.delete(lease);
     },
     unknown(reason: string, observation?: ClosureObservation) {
       if (lease.released) return;
+      producer.observe("host-operation", "unknown");
       lease.unknown = reason;
-      (lease.observations ??= []).push(observation);
+      lease.observations.push(observation);
+      pending.add(lease);
     },
   };
 }
@@ -83,15 +98,28 @@ function physicalTarget(target: string) {
 export function principalLeases(pi: ExtensionAPI, foreground: BashOperations) {
   const active = new Map<string, { lease: ReturnType<typeof reserveOperation>; linked: boolean }>();
   pi.on("tool_call", (event, ctx) => {
-    if (executionForSession(ctx.sessionManager?.getSessionId())?.managed ||
-        toolEffect(event.toolName) === "read_only" || BOOKKEEPING.has(event.toolName)) return;
+    const info = pi.getAllTools?.().find(tool => tool.name === event.toolName);
+    if (info && hasDefinitionGuard(info.parameters)) {
+      try {
+        const context = captureCallContext(ctx.cwd, ctx.sessionManager);
+        checkCallContext(context);
+        if (!hasReadDefinitionGuard(info.parameters))
+          withCaptured(context, () => assertNoExclusive(ctx.cwd));
+      } catch (error) { return { block: true, reason: String(error) }; }
+      if (hasReadDefinitionGuard(info.parameters)) return;
+    }
+    // A familiar spelling is not proof: only SDK-owned definitions get this exemption.
+    if (info?.sourceInfo.path === `builtin:${event.toolName}` &&
+        (toolEffect(event.toolName) === "read_only" || BOOKKEEPING.has(event.toolName))) return;
     try {
+      const context = captureCallContext(ctx.cwd, ctx.sessionManager);
+      checkCallContext(context);
       const input = event.input as { path?: string };
       const root = ["write", "edit"].includes(event.toolName) && typeof input.path === "string"
         ? physicalTarget(path.resolve(ctx.cwd, input.path))
         : event.toolName === "bash" ? realpathSync(ctx.cwd) : undefined;
       if (active.has(event.toolCallId)) throw new Error("writer call already active");
-      active.set(event.toolCallId, { lease: reserveOperation(root, "writer"), linked: false });
+      active.set(event.toolCallId, { lease: reserveOperation(root, "writer", context), linked: false });
     } catch (error) { return { block: true, reason: String(error) }; }
   });
   pi.on("tool_result", event => {
@@ -114,7 +142,9 @@ export function principalLeases(pi: ExtensionAPI, foreground: BashOperations) {
     finally { lease.release(); }
   } });
   const definition = createBashToolDefinition(process.cwd());
-  pi.registerTool({ ...definition, async execute(id, params, signal, onUpdate, ctx) {
+  pi.registerTool(guardDefinition(createWriteToolDefinition(process.cwd()), "write"));
+  pi.registerTool(guardDefinition(createEditToolDefinition(process.cwd()), "write"));
+  pi.registerTool(guardDefinition({ ...definition, async execute(id, params, signal, onUpdate, ctx) {
     const call = active.get(id);
     let settled = false;
     const unknown = (error: AgentClosureError) => {
@@ -149,7 +179,11 @@ export function principalLeases(pi: ExtensionAPI, foreground: BashOperations) {
     }
     if (threw) throw failure;
     return value!;
-  } });
+  } }, "write"));
   // Returning operations is not settlement: surround the actual executor, not this handler.
-  pi.on("user_bash", () => ({ operations: leasedForeground() }));
+  pi.on("user_bash", (_event, ctx) => {
+    const context = captureCallContext(ctx.cwd, ctx.sessionManager);
+    checkCallContext(context);
+    return { operations: { exec: (...args) => withCaptured(context, () => leasedForeground().exec(...args)) } };
+  });
 }

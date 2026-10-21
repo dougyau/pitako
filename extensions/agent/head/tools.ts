@@ -5,6 +5,7 @@ import { marksSideEffect } from "../effects.ts";
 import { feedbackSchema } from "../consultation-feedback.ts";
 import { reasoningSchema } from "../consultation.ts";
 import { listCheckpoints, readCheckpoint } from "../checkpoints.ts";
+import { guardToolRegistrations } from "../../workflow-engine.ts";
 
 const boundedString = Type.String({ minLength: 1, maxLength: 16384 });
 const references = Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { minItems: 1, maxItems: 32 });
@@ -30,6 +31,7 @@ const response = (details: unknown) => ({ content: [{ type: "text" as const, tex
 export function headExtension(attachment: HeadAttachment, binding: object,
   manager: () => Pick<SessionManager, "getBranch">): ExtensionFactory {
   return pi => {
+    pi = guardToolRegistrations(pi, "read");
     let captured: ReturnType<typeof manager> | undefined, sessionId: string | undefined, sessionFile: string | undefined;
     attachment.bindNative(binding, () => {
       const current = manager();
@@ -44,6 +46,13 @@ export function headExtension(attachment: HeadAttachment, binding: object,
         attachment.restrictRecovery(binding, event.message.stopReason);
     });
     pi.on("agent_settled", () => attachment.settleDeliveries(binding, manager()));
+    const rawWaitArguments = new Map<string, unknown[]>();
+    pi.on("tool_call", event => {
+      if (event.toolName !== "head_wait") return;
+      const occurrences = rawWaitArguments.get(event.toolCallId) ?? [];
+      occurrences.push(structuredClone(event.input));
+      rawWaitArguments.set(event.toolCallId, occurrences);
+    });
     pi.registerTool({
       name: "head_result", label: "Head result", description: "Read a physically closed child result belonging to this assignment.",
       parameters: Type.Object({ childId: Type.String() }),
@@ -56,14 +65,20 @@ export function headExtension(attachment: HeadAttachment, binding: object,
       },
     });
     pi.registerTool({
-      name: "head_wait", label: "Head wait", description: "Wait for closed child results in this assignment.",
+      name: "head_wait", label: "Head wait", description: "Wait for independent owned progress. A direct real return may carry owned gates; after normal append, head_plan(read) or completed verification:[] exposes authentic proof IDs. No rerun or intermediate final is needed. Nested/Codemode returns without a transcript head_wait pair are not native gates proof.",
       parameters: Type.Object({ after: Type.Optional(revision) }, { additionalProperties: false }),
       execute(_id, _params, signal) {
         attachment.check(binding);
+        const raw = rawWaitArguments.get(_id);
+        const wait = attachment.gates?.beginWait(binding, _id, raw?.length === 1 ? raw[0] : undefined, _params.after ?? 0);
         return attachment.withGateWait(async () => {
           const results = attachment.dag ? await attachment.dag.wait(binding, _params.after ?? 0, signal)
             : await attachment.wait(binding, signal);
-          return response(results);
+          const emitted = wait && !attachment.dag?.finishStatus ? attachment.gates!.emitWait(wait) : undefined;
+          if (!emitted?.gates.length) return response(results);
+          const details = { ...results, gates: emitted.gates };
+          return { content: [{ type: "text" as const, text: JSON.stringify(results) },
+            ...emitted.blocks.map(text => ({ type: "text" as const, text }))], details };
         });
       },
     });
@@ -180,10 +195,11 @@ export function headExtension(attachment: HeadAttachment, binding: object,
       });
       pi.registerTool({
         name: "head_finish", label: "Finish integrated Head assignment",
-        description: "Return an integrated handoff, not leaf reports. Successful finish requires this epoch and successful native tool-result entry IDs from this Head after its barrier. You judge verification sufficiency after inspecting the relevant diff/tests. Failed finish joins owned children and preserves diagnostics.",
+        description: "Return an integrated handoff, not leaf reports. Completed attempts return finished, needs-proof-selection, pending or unavailable. verification:[] never selects/succeeds; inspect authentic current native-tool/owned-gates entry IDs and select explicitly. Pending return/append is not failure; do not rerun gates or wait on yourself. Judge sufficiency after diff/tests. Logical completion is not physical closure. Failed finish revokes and joins owned work.",
         parameters: Type.Union([
           Type.Object({ status: Type.Literal("completed"), epoch: Type.String(), summary: boundedString,
-            verification: references, limits: Type.Array(boundedString, { maxItems: 32 }) }, { additionalProperties: false }),
+            verification: Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { maxItems: 32 }),
+            limits: Type.Array(boundedString, { maxItems: 32 }) }, { additionalProperties: false }),
           Type.Object({ status: Type.Literal("failed"), diagnostic: boundedString,
             evidence: Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { maxItems: 32 }),
             limits: Type.Array(boundedString, { maxItems: 32 }) }, { additionalProperties: false }),
@@ -226,7 +242,7 @@ export function headExtension(attachment: HeadAttachment, binding: object,
 /** A leaf can acknowledge only its own host-bound proposal; no Head/Team tools are installed. */
 export function leafScopeExtension(scope: LeafScopeAttachment,
   session: () => Pick<AgentSession, "sessionId" | "sessionManager">): ExtensionFactory {
-  return pi => pi.registerTool({
+  return pi => guardToolRegistrations(pi, "read").registerTool({
     name: "head_scope_ack", label: "Leaf scope acknowledgment",
     description: "Read your effective scoped contract, or accept/reject your own exact proposal with observed native progress entry IDs. Receipt is not acknowledgment; acknowledgment is not Head confirmation. Never follow a new contract until current reports its confirmed revision.",
     parameters: Type.Union([

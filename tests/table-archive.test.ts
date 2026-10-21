@@ -10,13 +10,26 @@ import * as agent from "../extensions/agent/index.ts";
 import { architectureFixture } from "./fixtures/architecture.ts";
 import { jsonBytes, sealPages } from "../extensions/table/results.ts";
 import { cancelAllWorkers, clearBackgroundOwner, setBackgroundExecutor, teamWorkerStatus, workerHandoff } from "../extensions/agent/background.ts";
-import { retireTeamEvaluation } from "../extensions/team.ts";
-import { assertQuiescent } from "../extensions/agent/head/operation-leases.ts";
+import { retireTeamEvaluation, hasUnsettledTeamWork } from "../extensions/team.ts";
+import { assertQuiescent, reserveOperation } from "../extensions/agent/head/operation-leases.ts";
+import { captureCallContext, checkCallContext, withCallContext } from "../extensions/workflow-engine.ts";
+import { openSqliteSync } from "../extensions/board/sqlite.ts";
 
 const privateRoot = () => realpathSync(mkdtempSync(path.join(tmpdir(), "pitako-table-archive-")));
 const parse = (envelope: any) => JSON.parse(envelope.content[0].text);
 const startArchive = archive.startTableArchive;
 const prepareTeamWatch = agent.prepareTeamWatch;
+// Admission now journals before preparation; it still may not adopt a ledger or archive.
+const journalEntries = new Set([".pitako", ".pitako/runs", "runs",
+  ...["workflow-state.sqlite", "workflow-state.sqlite-shm", "workflow-state.sqlite-wal"]
+    .flatMap(file => [`.pitako/runs/${file}`, `runs/${file}`])]);
+const withoutJournal = (entries: string[]) => entries.filter(entry => !journalEntries.has(entry));
+// These databases provide per-plan exclusion, not a ledger, binding or archive authority.
+function expectEmptyLock(file: string) {
+  const db = openSqliteSync(file, { readOnly: true });
+  try { expect(db.prepare("SELECT name FROM sqlite_master").all()).toEqual([]); }
+  finally { db.close(); }
+}
 
 for (const protocol of ["architecture", "review"] as const) {
   const f = architectureFixture(protocol);
@@ -96,7 +109,7 @@ for (const protocol of ["architecture", "review"] as const) {
     }
   }));
 
-  test(`${protocol} competing sibling ledger keeps failed root collection archive unavailable`, f.fixture.ownedCase(`${protocol} competing ledger`, async () => {
+  test(`${protocol} competing sibling ledger rejects admission without fallback or archive`, f.fixture.ownedCase(`${protocol} competing ledger`, async () => {
     const s = await f.setup({ config: "" });
     const operations: archive.TableArchive[] = [];
     const capture = spyOn(archive, "startTableArchive").mockImplementation((...args) => {
@@ -104,7 +117,7 @@ for (const protocol of ["architecture", "review"] as const) {
     });
     const authority = path.join(s.root, "authority"), execution = path.join(s.root, "execution");
     const git = (...args: string[]) => execFileSync("git", args, { cwd: authority, encoding: "utf8" });
-    const entries = (root: string) => readdirSync(root, { recursive: true }).map(String).sort();
+    const entries = (root: string) => withoutJournal(readdirSync(root, { recursive: true }).map(String)).sort();
     let beforeAuthority: [string, Buffer<ArrayBuffer>][], beforeEntries: string[], beforeExecution: string[], beforeRegistry: string;
     let binding: ReturnType<typeof openExecutionPlan>["binding"];
     try {
@@ -129,32 +142,33 @@ for (const protocol of ["architecture", "review"] as const) {
       expect(() => openExecutionPlan("competing", execution, { createLedger: false })).toThrow("competing ledger");
       const started = await s.invoke(`${protocol}_start`, { goal: "Reject competing execution authority", plan: "competing", unit: "inspect",
         ...(protocol === "review" ? { object: { kind: "brief", text: "Local" }, criteria: ["stable"] } : {}) });
-      expect(started.isError).not.toBe(true); // Reservation succeeds before actual preflight.
-      await s.delivered.promise;
-      const target = { assignmentId: started.details.assignmentId };
-      const first = await s.invoke("team_result", target);
-      const result = await s.read("team_result", target, first);
-      expect(result.judgment).toBeNull();
-      expect(result.host).toMatchObject({ status: "failed", closure: { state: "released" } });
-      expect(result.host.failure).toContain("competing ledger");
-      expect(result.host.failure).toContain(ledgerFile("competing", authority));
+      // C captures/validates source before reserving a Team member. There is no
+      // root result to collect or archive when that admission itself is refused.
+      expect(started.isError).toBe(true);
+      expect(started.content[0].text).toContain("competing ledger");
+      expect(started.content[0].text).toContain(ledgerFile("competing", authority));
+      expect(started.details).not.toHaveProperty("assignmentId");
+      expect(started.details).not.toHaveProperty("roomId");
       expect(s.host.sessions).toEqual([]);
-      expect(operations).toHaveLength(1); // Observe the archive launched by collection, not only preflight.
-      await operations[0]!.completion;
-      const state = await s.read(`${protocol}_read`, { roomId: started.details.roomId, section: "archive" });
-      expect(state).toEqual(operations[0]!.state);
-      expect(await s.invoke("team_result", target)).toEqual(first);
-      expect(workerHandoff(started.details.instanceId)?.delivery).toBe("incorporated");
+      expect(operations).toEqual([]);
+      expect(teamWorkerStatus(s.evaluation.token)).toEqual([]);
+      expect(s.sent).toEqual([]);
+      expect(s.branch).toEqual([]);
+      const context = captureCallContext(execution);
+      if (context.kind !== "ordinary") throw new Error("fixture requires ordinary context");
+      expect(context.guard.store.all("attempts")).toEqual([]);
+      expect(context.guard.store.all("holds")).toEqual([]);
+      expect(archive.captureTableArchive(execution, "competing"))
+        .toEqual({ unavailable: expect.stringContaining("competing ledger") });
     } finally {
       await s.close();
       await Promise.all(operations.map(operation => operation.completion));
       capture.mockRestore();
     }
     // Check after retirement too: no delayed fallback, ledger, binding or registry in A.
-    expect(operations[0]!.state).toMatchObject({ state: "unavailable", reason: expect.stringContaining("competing ledger") });
-    expect(operations[0]!.state).not.toHaveProperty("path");
+    expect(operations).toEqual([]);
     expect(entries(execution)).toEqual(beforeExecution!);
-    expect(existsSync(path.join(execution, ".pitako"))).toBe(false);
+    expect(existsSync(path.join(execution, ".pitako/table-results"))).toBe(false);
     expect(existsSync(path.join(s.root, ".pitako"))).toBe(false);
     for (const [file, bytes] of beforeAuthority!) expect(readFileSync(file)).toEqual(bytes);
     expect(entries(path.join(authority, ".pitako"))).toEqual(beforeEntries!);
@@ -189,7 +203,8 @@ for (const protocol of ["architecture", "review"] as const) {
       const ledger = ledgerFile("legacy", s.root); mkdirSync(path.dirname(ledger), { recursive: true });
       writeFileSync(ledger, `${ledgerTemplate(readFrozenPlan("legacy", s.root).meta)}\nKeep legacy evidence.\n`);
       const before = readFileSync(ledger);
-      const entries = () => readdirSync(path.join(s.root, ".pitako"), { recursive: true }).map(String).sort();
+      const planBefore = readFileSync(file);
+      const entries = () => withoutJournal(readdirSync(path.join(s.root, ".pitako"), { recursive: true }).map(String)).sort();
       const beforeEntries = entries();
       const started = await s.invoke(`${protocol}_start`, { goal: "Observe archive without adopting execution", plan: "legacy", unit: "inspect",
         ...(protocol === "review" ? { object: { kind: "brief", text: "Local" }, criteria: ["stable"] } : {}) });
@@ -205,6 +220,7 @@ for (const protocol of ["architecture", "review"] as const) {
       }
       release.resolve(); await s.delivered.promise;
       await Promise.all(operations.map(operation => operation.completion));
+      await s.bookkeeping(started.details.instanceId);
       const target = { assignmentId: started.details.assignmentId };
       const first = await s.invoke("team_result", target);
       const resultId = parse(first).header.id;
@@ -225,7 +241,11 @@ for (const protocol of ["architecture", "review"] as const) {
       const destination = path.join(realpathSync(s.root), ".pitako", "table-results", `${resultId}.json`);
       expect(operations[0]!.state).toEqual({ state: "written", path: destination });
       expect(JSON.parse(readFileSync(destination, "utf8"))).toEqual(result);
-      expect(entries()).toEqual([...beforeEntries, "table-results", `table-results/${resultId}.json`].sort());
+      expect(readFileSync(file)).toEqual(planBefore);
+      const locks = [`runs/legacy/team-holds-projection.sqlite`,
+        ...(action === "prepare" ? ["runs/legacy/ledger-writer.sqlite"] : [])];
+      expect(entries()).toEqual([...beforeEntries, ...locks, "table-results", `table-results/${resultId}.json`].sort());
+      for (const lock of locks) expectEmptyLock(path.join(s.root, ".pitako", lock));
     } finally {
       release.resolve(); await s.close();
       await Promise.all(operations.map(operation => operation.completion));
@@ -281,9 +301,10 @@ for (const protocol of ["architecture", "review"] as const) {
       const message = s.sent.find(item => item.message.customType === "pitako.worker.result")!.message;
       const exact = JSON.stringify(message);
       expect(jsonBytes(message)).toBeLessThanOrEqual(4096);
-      expect(JSON.parse(message.content).header.complete).toBe(false);
+      expect(JSON.parse(message.content).projection.header.complete).toBe(false);
       expect(workerHandoff(started.details.instanceId)?.delivery).toBe("incorporated");
       const receipt = workerHandoff(started.details.instanceId);
+      if (!receipt) throw new Error("canonical result has no handoff receipt");
       // Later read cwd must not choose another archive root.
       s.ctx.cwd = s.root;
       const resultTarget = { assignmentId: started.details.assignmentId };
@@ -298,6 +319,7 @@ for (const protocol of ["architecture", "review"] as const) {
       const unrelatedEntries = () => readdirSync(s.root, { recursive: true }).map(String).filter(entry => !entry.startsWith(archiveDirectory)).sort();
       const beforeFiles = unrelatedEntries();
       const beforeLedger = binding ? readFileSync(ledgerFile(binding.planId, s.root), "utf8") : undefined;
+      if (binding) expect(hasUnsettledTeamWork(s.evaluation, binding.planId, s.root, binding)).toBe(true);
       const diagnosticTarget = { roomId: started.details.roomId };
       const old = await s.invoke(`${protocol}_read`, { ...diagnosticTarget, maxBytes: 4096 });
       expect(jsonBytes(old)).toBeLessThanOrEqual(4096);
@@ -323,10 +345,16 @@ for (const protocol of ["architecture", "review"] as const) {
       expect(await s.invoke("team_result", { ...resultTarget, maxBytes: 4096 })).toEqual(first);
       expect(JSON.stringify(message)).toBe(exact);
       expect(workerHandoff(started.details.instanceId)?.delivery).toBe("incorporated");
-      expect(workerHandoff(started.details.instanceId)).toEqual(receipt);
+      await s.bookkeeping(started.details.instanceId);
+      expect(workerHandoff(started.details.instanceId)).toEqual({ ...receipt,
+        bookkeeping: "reconciled", bookkeepingDiagnostic: undefined });
       expect(readdirSync(path.dirname(destination))).toEqual([`${resultId}.json`]);
       expect(unrelatedEntries()).toEqual(beforeFiles);
-      if (binding) expect(beforeLedger).toBe(readFileSync(ledgerFile(binding.planId, s.root), "utf8"));
+      if (binding) {
+        expect(hasUnsettledTeamWork(s.evaluation, binding.planId, s.root, binding)).toBe(false);
+        // This captured plan has no Board topic: its Markdown sink is N/A.
+        expect(readFileSync(ledgerFile(binding.planId, s.root), "utf8")).toBe(beforeLedger!);
+      }
       expect(existsSync(path.join(s.root, "sub", ".pitako"))).toBe(false);
       if (!binding) expect(existsSync(ledgerFile("prospective", s.root))).toBe(false);
       expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
@@ -473,10 +501,12 @@ test("exclusive publication cannot overwrite; containment and permission have no
 
 test("written long path remains data in immutable bounded diagnostic pages", async () => {
   const owner = privateRoot(); let root = owner;
+  const context = captureCallContext(owner);
   try {
     for (let i = 0; i < 42; ++i) root = path.join(root, "p".repeat(90));
     mkdirSync(root, { recursive: true });
-    const operation = startArchive({ root }, randomUUID(), '{"judgment":"unchanged"}'); await operation.completion;
+    const operation = withCallContext(context, () => startArchive({ root }, randomUUID(), '{"judgment":"unchanged"}'));
+    await operation.completion;
     expect(operation.state).toMatchObject({ state: "written" });
     const pages = sealPages({ archive: operation.state });
     let envelope = pages.read({ section: "archive", maxBytes: 4096 }), canonical = "", count = 0;
@@ -490,7 +520,43 @@ test("written long path remains data in immutable bounded diagnostic pages", asy
     expect(count).toBeGreaterThan(1);
     expect(JSON.parse(canonical)).toEqual(operation.state);
     expect(readFileSync(JSON.parse(canonical).path, "utf8")).toBe('{"judgment":"unchanged"}');
-  } finally { rmSync(owner, { recursive: true, force: true }); }
+    expect(existsSync(path.join(root, ".pitako/runs"))).toBe(false);
+  } finally { checkCallContext(context).close(); rmSync(owner, { recursive: true, force: true }); }
+});
+
+test("archive effects share their captured owner's leases without recapturing a nested destination", async () => {
+  const owner = privateRoot(), root = path.join(owner, "component");
+  const other = privateRoot();
+  mkdirSync(root);
+  const context = captureCallContext(owner), guard = checkCallContext(context);
+  const otherContext = captureCallContext(other);
+  let gate: ReturnType<typeof reserveOperation> | undefined;
+  let operation: archive.TableArchive | undefined;
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  try {
+    gate = reserveOperation(owner, "gates", context);
+    const blocked = withCallContext(context, () => startArchive({ root }, randomUUID(), "blocked"));
+    await blocked.completion;
+    expect(blocked.state).toMatchObject({ state: "unavailable", reason: expect.stringContaining("lease") });
+    expect(existsSync(path.join(root, ".pitako"))).toBe(false);
+    gate.release(); gate = undefined;
+    operation = withCallContext(context, () => startArchive({ root }, randomUUID(), "canonical", { ...fs, async open(...args) {
+      const handle = await fs.open(...args);
+      entered.resolve(); await release.promise;
+      return handle;
+    } }));
+    await Promise.race([entered.promise, operation.completion.then(() => { throw new Error("archive ended before held open"); })]);
+    expect(() => reserveOperation(owner, "gates", context)).toThrow("active");
+    const independent = reserveOperation(other, "writer", otherContext); independent.release();
+    release.resolve(); await operation.completion;
+    expect(operation.state).toMatchObject({ state: "written" });
+    expect(existsSync(path.join(root, ".pitako/runs"))).toBe(false);
+    const after = reserveOperation(owner, "gates", context); after.release();
+  } finally {
+    release.resolve(); await operation?.completion; gate?.release();
+    guard.close(); checkCallContext(otherContext).close();
+    rmSync(owner, { recursive: true, force: true }); rmSync(other, { recursive: true, force: true });
+  }
 });
 
 test("uncertain file close retains temp, handle and writer reservation instead of publishing success", async () => {
@@ -509,7 +575,7 @@ test("uncertain file close retains temp, handle and writer reservation instead o
   expect(operation.state).not.toHaveProperty("path");
   expect(operation.retainedHandle).toBeDefined();
   expect(readdirSync(path.join(root, ".pitako/table-results"))).toHaveLength(1);
-  expect(() => assertQuiescent(root)).toThrow("overlapping operation");
+  expect(() => assertQuiescent(root)).toThrow("closure unknown");
   // Test owner establishes actual descriptor closure. Production uncertainty and evidence stay retained.
   await actual!.close();
   console.log("TABLE_ARCHIVE_UNCERTAIN_RETAINED", root);
@@ -558,7 +624,7 @@ for (const protocol of ["architecture", "review"] as const) test(`${protocol} re
     await expect(s.close()).rejects.toThrow("table archive closure unknown");
     expect(workerHandoff(started.details.instanceId)).toEqual(receipt); // row/resources not deleted
     expect(readdirSync(path.join(root, ".pitako/table-results"))).toHaveLength(1);
-    expect(() => assertQuiescent(root)).toThrow("overlapping operation");
+    expect(() => assertQuiescent(root)).toThrow("closure unknown");
   } finally {
     await Promise.all(operations.map(operation => operation.completion));
     close?.mockRestore();
