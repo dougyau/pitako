@@ -1,5 +1,5 @@
 import { expect, test as bunTest } from "bun:test";
-import { architectureFixture, reviewResults } from "./fixtures/architecture.ts";
+import { architectureFixture, reviewResults, tablePrompt } from "./fixtures/architecture.ts";
 import { readTableResult, teamWorkerResult, teamWorkerStatus } from "../extensions/agent/background.ts";
 import { firstTeamReservation, teamAssignments } from "../extensions/team.ts";
 import { isOrchestrationTool, toolsForProfile } from "../extensions/profile.ts";
@@ -18,7 +18,7 @@ const reportFor = (f: Awaited<ReturnType<typeof setup>>, handle: any) => {
   const saved = teamWorkerResult(f.evaluation.token, handle.instanceId)!;
   const delivered = f.sent.filter(item => item.message.customType === "pitako.worker.result");
   expect(delivered).toHaveLength(1);
-  const automatic = JSON.parse(delivered[0].message.content);
+  const automatic = JSON.parse(delivered[0].message.content).projection;
   expect(automatic.header).toMatchObject({ section: "report", acceptance: false });
   let page = JSON.parse(readTableResult(f.evaluation.token, handle.instanceId, {}).content[0]!.text);
   let canonical = page.fragment;
@@ -193,7 +193,7 @@ for (const [action, window, verdict] of [
     const delivered = f.sent.filter(item => item.message.customType === "pitako.worker.result");
     expect(delivered).toHaveLength(1);
     expect(delivered[0].message.details.status).toBe("cancelled");
-    const automatic = JSON.parse(delivered[0].message.content);
+    const automatic = JSON.parse(delivered[0].message.content).projection;
     if (automatic.header.complete) expect(automatic.report.judgment).toBeNull();
     else expect(automatic.notice).toContain("team_result");
     expect(teamWorkerStatus(f.evaluation.token, handle.instanceId)[0]!.closure.state).toBe("released");
@@ -356,7 +356,7 @@ test("recomposition joins outgoing specialists and independently prepares newcom
     expect(f.host.sessions).toHaveLength(2); expect(f.sent).toHaveLength(0);
     release.resolve(); await f.delivered.promise;
     expect(f.host.sessions).toHaveLength(3);
-    expect(f.host.sessions.find(session => session.model?.id === "general")!.prompts.map((text: string) => JSON.parse(text).stage)).toContain("preparation");
+    expect(f.host.sessions.find(session => session.model?.id === "general")!.prompts.map((text: string) => tablePrompt(text).stage)).toContain("preparation");
     const report = reportFor(f, handle).report;
     expect(report.judgment.completion).toBe("complete"); expect(report.findings).toHaveLength(1); expect(report.judgment.dispositions).toHaveLength(1);
   } finally { release.resolve(); await f.close(); }

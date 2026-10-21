@@ -278,7 +278,7 @@ unknownTest("unknown no-worker preparation retains its reservation despite an in
       branch.push({ type: "custom_message", ...message }); delivered.resolve();
     } });
   try {
-    const handle = reserveBackground({ roleId: "oracle", task: "unknown", coordinatorSessionId: evaluation.sessionId, owns: () => true,
+    const handle = reserveBackground({ cwd: env.root, roleId: "oracle", task: "unknown", coordinatorSessionId: evaluation.sessionId, owns: () => true,
       teamOwner: { token: evaluation.token, assignmentId: "unknown", onSettled() {}, noWorkerReleased: admission.noWorkerReleased },
       async prepare() { throw new AgentClosureError([new Error("unjoined resource")], "preparation"); } });
     admission.commit();
@@ -297,12 +297,13 @@ for (const failure of ["abort", "dispose"] as const) {
     bindBackgroundOwner({ token: current.token, sessionId: current.sessionId, isIdle: () => false, hasUI: false, notify() {}, sendMessage() {} });
     const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
     const sdk = controlledPi(env.root, {
-      async prompt(session, text) {
+      async prompt(session, context) {
+        const text = JSON.parse(context).projection as string;
         if (text === "blocked") { entered.resolve(); await release.promise; }
         session.messages.push({ role: "assistant", content: [{ type: "text", text }], stopReason: "stop" });
       },
-      async abort(session) { if (failure === "abort" && session.prompts.includes("blocked")) throw new Error("maintained abort unknown"); },
-      async dispose(session) { if (failure === "dispose" && session.prompts.includes("blocked")) throw new Error("maintained dispose unknown"); },
+      async abort(session) { if (failure === "abort" && session.prompts.some(text => JSON.parse(text).projection === "blocked")) throw new Error("maintained abort unknown"); },
+      async dispose(session) { if (failure === "dispose" && session.prompts.some(text => JSON.parse(text).projection === "blocked")) throw new Error("maintained dispose unknown"); },
     });
     const team = createTeam(current);
     const input = { roleId: "developer", task: "mandate", cwd: env.root, load: env.load, executor: createPiExecutor({ factories: sdk.factories }) };

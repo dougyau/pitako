@@ -7,7 +7,8 @@ import { executionForSession } from "../execution-identity.ts";
 import { currentInstanceId } from "../agent/scope.ts";
 import { assertNoCheckpointLease } from "../agent/head/checkpoint-lease.ts";
 import { backgroundExecutor, cancelTeamWorker, reserveBackground, readTableDiagnostic, type WorkerInterest } from "../agent/background.ts";
-import { prepareTeamWatch } from "../agent/index.ts";
+import { prepareTeamWatch, captureTeamWatch } from "../agent/index.ts";
+import { captureCallContext, guardToolRegistrations } from "../workflow-engine.ts";
 import { createTeam, reserveTeamMember, recordTeamAssignment, recordPlanTeamWork, teamEvaluationForSession } from "../team.ts";
 import type { HistoryOrigin } from "../agent/history.ts";
 import { createConsultation } from "./runtime.ts";
@@ -18,6 +19,7 @@ const text = Type.String({ minLength: 1 });
 const briefGuidance = "Write goal as a self-contained Markdown work brief in its original language: short title, objective and expected result. Add context, questions, restrictions and references when useful. Use short paragraphs and lists; no required HTML, wide tables, frontmatter or empty sections. This is authorship guidance, not validation: plain text remains valid and submitted text is preserved without conversion or normalization.";
 
 export function registerArchitecture(pi: ExtensionAPI) {
+  pi = guardToolRegistrations(pi, "read");
   const evaluationFor = (ctx: ExtensionContext) => {
     const id = ctx.sessionManager.getSessionId();
     if (currentInstanceId() || executionForSession(id)) throw new Error("architecture coordinator tools are foreground only");
@@ -40,6 +42,11 @@ export function registerArchitecture(pi: ExtensionAPI) {
     async execute(toolCallId, params, _signal, _update, ctx) {
       try {
         assertNoCheckpointLease(ctx.cwd);
+        const context = captureCallContext(ctx.cwd, ctx.sessionManager);
+        const captured = captureTeamWatch(params, ctx);
+        if (captured.error) throw new Error(captured.error);
+        const consultedSource = "planning" in captured && captured.planning ?
+          { identity: captured.planning.snapshot.objectHash!, text: captured.planning.snapshot.text! } : undefined;
         const evaluation = evaluationFor(ctx), config = structuredClone(loadPitakoConfig({ cwd: ctx.cwd }));
         const director = resolveRoleFromConfig(config, "architect");
         if (director.modelPolicy.diagnostic) throw new Error(director.modelPolicy.diagnostic);
@@ -51,17 +58,19 @@ export function registerArchitecture(pi: ExtensionAPI) {
         let durableWatch: WorkerInterest | undefined;
         const tableRoot: TableRootRegistration = { protocol: "architecture", archive: captureTableArchive(ctx.cwd, params.plan) };
         try {
+          const reservationRoot = captured.execution?.executionRoot ?? ctx.cwd;
           const handle = reserveBackground({ roleId: "architect", coordinatorSessionId: evaluation.sessionId, origin, task: params.goal,
+            cwd: reservationRoot, context, watch: captured.watch ? { ...captured.watch, execution: captured.execution } : undefined,
             owns: admission.owns, tableRoot,
             teamOwner: { token: admission.token, assignmentId, teamId: team.teamId, memberId: admission.memberId,
               onSettled: admission.settled, noWorkerReleased: admission.noWorkerReleased },
             async cleanup() { if (durableWatch) recordPlanTeamWork(ctx.cwd, durableWatch.planId, durableWatch.unitId, assignmentId, undefined, durableWatch.execution); },
             async prepare(_lifetime, check, reserved) {
-              const watched = await prepareTeamWatch(params, ctx, assignmentId, check);
+              const watched = await prepareTeamWatch(params, ctx, assignmentId, check, undefined, captured);
               durableWatch = watched.durableWatch;
               const launchRoot = watched.execution?.executionRoot ?? (tableRoot.archive && "root" in tableRoot.archive ? tableRoot.archive.root : ctx.cwd);
               if (watched.execution) origin.execution = { executionRoot: launchRoot, executionRef: `${watched.execution.planId}@${watched.execution.revision}:${watched.execution.hash}` };
-              const runtime = createConsultation({ team, config, goal: params.goal, topic: params.topic, root: { assignmentId, memberId: admission.memberId, instanceId: reserved.instanceId },
+              const runtime = createConsultation({ team, config, goal: params.goal, topic: params.topic, consultedSource, root: { assignmentId, memberId: admission.memberId, instanceId: reserved.instanceId },
                 origin, cwd: launchRoot, owns: reserved.current, observation: architectureRoom(evaluation, team.teamId) });
               tableRoot.semantic = runtime.semantic;
               tableRoot.diagnostic = runtime.diagnostic;
@@ -70,7 +79,7 @@ export function registerArchitecture(pi: ExtensionAPI) {
                 planId: watched.watch?.planId, unitId: watched.watch?.unitId, boardTopicId: watched.topic, execution: watched.execution, dispatchId: reserved.dispatchId });
               return { roleId: "architect", task: params.goal, cwd: launchRoot, historyOrigin: origin, architecture: runtime.architecture,
                 executor: backgroundExecutor(), maintained: true, driver: runtime.run, watch: watched.watch ? { ...watched.watch, execution: watched.execution } : undefined,
-                reconcileBookkeeping: durableWatch ? final => recordPlanTeamWork(launchRoot, durableWatch!.planId, durableWatch!.unitId, assignmentId, final.status, watched.execution) : undefined };
+                reconcileBookkeeping: durableWatch ? (final, receipt) => recordPlanTeamWork(launchRoot, durableWatch!.planId, durableWatch!.unitId, assignmentId, final.status, watched.execution, receipt) : undefined };
             },
           });
           admission.commit();

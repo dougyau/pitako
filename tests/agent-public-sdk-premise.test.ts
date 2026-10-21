@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Type, type Static } from "typebox";
@@ -10,12 +10,70 @@ import { mutationGeneration, principalLeases, reserveOperation } from "../extens
 import { AgentClosureError } from "../extensions/agent/closure.ts";
 import { foregroundBash } from "../extensions/agent/head/managed-tools.ts";
 import { providerFixtureOwnership } from "./fixtures/provider-fixture-ownership.ts";
+import { registerWorkflowCommands, captureCallContext, checkCallContext, guardDefinition } from "../extensions/workflow-engine.ts";
+import { planFile } from "../extensions/workflow.ts";
 
 const ownership = providerFixtureOwnership();
 const gate = () => {
   let release!: () => void;
   return { promise: new Promise<void>(resolve => { release = resolve; }), release: () => release() };
 };
+
+test("native execute command mounts on the declared offline SDK, captures before turn and delivers packaged policy",
+  ownership.ownedCase("native execute capture", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "pitako-native-execute-")); ownership.directories.push(root);
+    const file = planFile("native", root); mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, "---\nid: native\ntitle: Native\nstatus: frozen\nrevision: 1\n" +
+      "boardTopicId: null\ncreatedAt: 2026-01-01\nupdatedAt: 2026-01-01\n---\nFrozen body\n");
+    const runtime = await ModelRuntime.create({ authPath: path.join(root, "auth.json"), modelsPath: null,
+      modelsStorePath: path.join(root, "cache.json"), refreshOnCreate: false, allowModelNetwork: false });
+    const started = gate(), complete = gate(); ownership.beforeRelease(complete.release);
+    let requests = 0, delivered = "", captured: ReturnType<typeof captureCallContext> | undefined;
+    let session: Awaited<ReturnType<typeof createAgentSession>>["session"];
+    runtime.registerProvider("native-command-fixture", {
+      api: "openai-completions", apiKey: "offline", baseUrl: "http://offline.invalid",
+      models: [{ id: "local", name: "local", reasoning: false, input: ["text"], contextWindow: 128_000,
+        maxTokens: 1000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
+      streamSimple(model, context) {
+        requests++; delivered = JSON.stringify(context.messages);
+        captured = captureCallContext(root, session.sessionManager); checkCallContext(captured);
+        started.release();
+        const stream = createAssistantMessageEventStream();
+        void complete.promise.then(() => {
+          const message: AssistantMessage = { role: "assistant", api: model.api, provider: model.provider, model: model.id,
+            content: [{ type: "text", text: "controlled result" }], stopReason: "stop", timestamp: 1,
+            usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+          stream.push({ type: "done", reason: "stop", message }); stream.end();
+        });
+        return stream;
+      },
+    });
+    const settings = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
+    const loader = new DefaultResourceLoader({ cwd: root, agentDir: root, settingsManager: settings,
+      noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+      extensionFactories: [registerWorkflowCommands] });
+    await loader.reload();
+    ({ session } = await ownership.acquire(createAgentSession({ cwd: root, agentDir: root, modelRuntime: runtime,
+      model: runtime.getModel("native-command-fixture", "local"), resourceLoader: loader, settingsManager: settings,
+      sessionManager: SessionManager.create(root, path.join(root, "sessions")), tools: [] })));
+    await session.bindExtensions({});
+    expect(session.extensionRunner.getCommand("execute")).toBeDefined();
+    const command = ownership.run(session.prompt("/execute native", { expandPromptTemplates: true }));
+    await started.promise;
+    await command;
+    expect(captured?.kind).toBe("managed");
+    expect(delivered).toContain("Frozen binding");
+    expect(delivered).toContain("Execute");
+    await ownership.run(session.prompt("/execute native", { expandPromptTemplates: true }));
+    expect(requests).toBe(1);
+    await ownership.run(session.prompt("/execute missing", { expandPromptTemplates: true }));
+    checkCallContext(captured!); // Invalid input must not retire the valid invocation.
+    complete.release(); await ownership.run(session.waitForIdle());
+    await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+    expect(() => checkCallContext(captured!)).toThrow(/retired/);
+    await session.dispose();
+  }));
 
 test("real offline SDK exposes post-append IDs, branch/session hooks and settled final reconciliation",
   ownership.ownedCase("public SDK premise", async () => {
@@ -181,11 +239,11 @@ async function principalLeaseCase(unknownClosure = false) {
         if (target === "codemode.md") { nestedEntered.release(); await nestedRelease.promise; }
         writeFileSync(path.join(root, target), "product"); return { content: [], details: {} };
       } },
-    { name: "read", label: "read", description: "controlled nested boundary", parameters: Type.Object({}),
+    guardDefinition({ name: "read", label: "read", description: "controlled nested boundary", parameters: Type.Object({}),
       async execute(_id, _params, _signal, _update, ctx) {
         nested.push(await ctx.executeTool("write", { path: "nested.md" }));
         return { content: [], details: {} };
-      } }] }));
+      } }, "read")] }));
   await session.bindExtensions({});
   const first = ownership.run(session.prompt("write", { expandPromptTemplates: false })); await entered.promise;
   expect(() => reserveOperation(root, "gates")).toThrow("active");
@@ -230,7 +288,7 @@ async function principalLeaseCase(unknownClosure = false) {
     for (const name of ["unknown.md", "unknown-bash", "unknown-codemode.md", "nested.md"]) expect(existsSync(path.join(root, name))).toBe(false);
     expect(nested).toHaveLength(2);
     expect(JSON.stringify(nested[1])).toContain("unknown");
-    expect(() => reserveOperation(undefined, "writer")).toThrow("unknown");
+    expect(() => reserveOperation(undefined, "writer", captureCallContext(root))).toThrow("unknown");
     expect(() => reserveOperation(root, "checkpoint")).toThrow("unknown");
     expect(() => reserveOperation(root, "gates")).toThrow("unknown");
     const independent = reserveOperation(other, "writer"); independent.release();

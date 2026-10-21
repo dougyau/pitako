@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { Value } from "typebox/value";
 import { validateSubmission as architectureSubmission, SubmissionError, type StageGrant, type StageRules, type KnowledgeBoundary } from "../architecture/protocol.ts";
-import { captureObject, describeObject, type ReviewObject } from "./object.ts";
+import { captureObject, captureReviewSource, describeObject, type ReviewObject } from "./object.ts";
 import { submitSchema, type ReviewBody, type TableMessage, type PublishedFinding, type Response, type Synthesis } from "./types.ts";
 
 export interface ReviewGrant extends Omit<StageGrant, "rules"> {
@@ -174,7 +174,12 @@ export function createReviewPolicy(object: ReviewObject, goal: string, criteria:
         partialReasons };
     },
     reobserve() {
-      try { observed = captureObject(object.selector, object.root); if (observed.identity !== object.identity) failures.push("Review object drift"); }
+      if (object.source?.kind === "managed-candidate") {
+        // The reviewed object is the registered immutable candidate, not its mutable draft path.
+        observed = object;
+        return;
+      }
+      try { observed = object.source ? captureReviewSource(object.source, object.root) : captureObject(object.selector, object.root); if (observed.identity !== object.identity) failures.push("Review object drift"); }
       catch (error) { observationError = String(error); failures.push(`Review object reobservation failed: ${error}`); }
     },
     report(messages: TableMessage[], reasons: string[], cancelled: boolean, pending: TableMessage["doubts"] = [], boundaries: KnowledgeBoundary[] = []) {

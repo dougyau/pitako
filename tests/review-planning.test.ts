@@ -75,13 +75,19 @@ for (const rejection of ["bound-topic-bypass", "incompatible-ledger"] as const) 
       const draft = readFileSync(file, "utf8");
       const start = await s.invoke("review_start", { ...request, ...(rejection === "bound-topic-bypass"
         ? { boardTopicId: String(topic) } : { plan: "planning", unit: "reviewer-critique" }) });
-      expect(start.isError).not.toBe(true); // watched preflight is asynchronous
-      await s.delivered.promise;
+      if (rejection === "incompatible-ledger") {
+        expect(start.isError).toBe(true);
+        expect(JSON.stringify(start.content)).toContain("hash");
+        expect(s.branch.filter(entry => entry.customType === "pitako.worker.result")).toEqual([]);
+      } else {
+        expect(start.isError).not.toBe(true);
+        await s.delivered.promise;
+        const terminal = s.branch.filter(entry => entry.customType === "pitako.worker.result");
+        expect(terminal).toHaveLength(1); expect(terminal[0].details.status).toBe("failed");
+        const report = await s.read("team_result", { assignmentId: start.details.assignmentId });
+        expect(report.host.failure).toContain("explicit Board topics require a bound watched plan");
+      }
       expect(s.host.sessions).toEqual([]);
-      const terminal = s.branch.filter(entry => entry.customType === "pitako.worker.result");
-      expect(terminal).toHaveLength(1); expect(terminal[0].details.status).toBe("failed");
-      const report = await s.read("team_result", { assignmentId: start.details.assignmentId });
-      expect(report.host.failure).toContain(rejection === "bound-topic-bypass" ? "explicit Board topics require a bound watched plan" : "hash");
       expect(readFileSync(file, "utf8")).toBe(draft);
       if (ledger === undefined) expect(existsSync(ledgerFile("planning", s.root))).toBe(false);
       else expect(readFileSync(ledgerFile("planning", s.root), "utf8")).toBe(ledger);
@@ -153,6 +159,7 @@ for (const outcome of ["no-blockers", "changes-required", "inconclusive", "faile
       expect(report.findings).toHaveLength(outcome === "no-blockers" ? 0 : 1);
       if (outcome !== "no-blockers") expect(report.findings[0]).toMatchObject(finding);
       expect(report.missingValidSynthesis).toBe(outcome === "failed");
+      await s.bookkeeping(start.details.instanceId);
       expect(readLedgerTeamHolds(s.root, "planning", opened.binding)).toEqual(outcome === "failed"
         ? [{ assignmentId: start.details.assignmentId, unitId: "reviewer-critique", status: "failed" }] : []);
       expect(readFileSync(file, "utf8")).toContain("status: frozen"); // no acceptance transition

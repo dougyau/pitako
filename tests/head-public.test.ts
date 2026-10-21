@@ -22,8 +22,10 @@ import { currentWorkspace } from "../extensions/board/workspace.ts";
 import { openExecutionPlan, planFile, readLedgerTeamHolds } from "../extensions/workflow.ts";
 import { principalLeases, reserveOperation } from "../extensions/agent/head/operation-leases.ts";
 import { AgentClosureError } from "../extensions/agent/closure.ts";
+import { captureCallContext, openExecuteActivity, outcomeHash, recoverHold, type AttemptRecord, type RecoveryReceipt } from "../extensions/workflow-engine.ts";
+import { WorkflowState, type ReleaseReceipt } from "../extensions/workflow-state.ts";
 import { ownProcess } from "../extensions/agent/head/owned-process.ts";
-import { HeadAttachment } from "../extensions/agent/head/runtime.ts";
+import { HeadAttachment, type HeadFinish } from "../extensions/agent/head/runtime.ts";
 import { headExtension } from "../extensions/agent/head/tools.ts";
 import { loadPitakoConfig } from "../extensions/roles/load.ts";
 import { classifyProviderFailure } from "../extensions/agent/fallback.ts";
@@ -87,6 +89,8 @@ type Local = { tools: Map<string, any>; events: Map<string, Function[]> };
 async function bind(factories: ExtensionFactory[], appendEntry: ExtensionAPI["appendEntry"]): Promise<Local> {
   const tools = new Map<string, any>(), events = new Map<string, Function[]>();
   const pi = { registerTool(tool: any) { tools.set(tool.name, tool); }, appendEntry,
+    getAllTools: () => [...tools.values()].map(tool => ({ name: tool.name, parameters: tool.parameters,
+      sourceInfo: { path: "controlled-extension" } })),
     on(name: string, callback: Function) { events.set(name, [...(events.get(name) ?? []), callback]); } } as unknown as ExtensionAPI;
   for (const factory of factories) await factory(pi);
   return { tools, events };
@@ -247,7 +251,8 @@ test("late gate closure recovers physical admission, never its unknown native re
   head.claim("head", root);
   const binding = head.bind("head"), manager = SessionManager.create(root, path.join(root, ".pitako", "sessions"));
   const local = await bind([headExtension(head, binding, () => manager)], () => {});
-  const call = (name: string, input: object) => local.tools.get(name).execute(name, input, undefined);
+  const call = (name: string, input: object) => local.tools.get(name).execute(name, input, undefined, undefined,
+    { cwd: root, sessionManager: manager });
   // Inject only this gate instance's owned process/clock boundary, not global timers or kill.
   Object.assign(head.gates!, { io: { write: writeSync, groupClosed: () => false, processHost: owned.host,
     spawn() { entered.resolve(); return owned.child; } } });
@@ -297,7 +302,7 @@ test("late gate closure recovers physical admission, never its unknown native re
     expect((await call("head_plan", { action: "read" })).details.verificationCandidates).toEqual([]);
     await expect(call("head_plan", { action: "reopen", epoch: barrier.epoch })).rejects.toBeInstanceOf(AgentClosureError);
     await expect(call("head_finish", { status: "completed", epoch: barrier.epoch, summary: "must refuse", verification: [receipt], limits: [] }))
-      .rejects.toBeInstanceOf(AgentClosureError);
+      .rejects.toThrow("verification must reference");
     await expect(head.close()).rejects.toBeInstanceOf(AgentClosureError);
     closureJoined = true;
     expect(owned.pending).toBe(0);
@@ -325,7 +330,7 @@ test("admission reobserves only overlapping unknown obligations and release cann
     old.unknown("late callback"); old.release();
     reserveOperation(a, "checkpoint").release();
     expect(probes).toBe(2);
-    const global = reserveOperation(undefined, "writer");
+    const global = reserveOperation(undefined, "writer", captureCallContext(root));
     global.unknown("unscoped", { observe: () => closed ? "closed" : "unknown" });
     closed = false;
     expect(() => reserveOperation(b, "writer")).toThrow("unknown");
@@ -453,7 +458,8 @@ classifier_model = "classifier"
       (session as any).steer = async () => "queued";
       session.getAllTools = () => ["read", "bash", "agent_spawn", "team_assign", ...local.tools.keys()].map(name => ({ name }));
     },
-    prompt: async (session, task) => {
+    prompt: async (session, context) => {
+      const task = JSON.parse(context).projection as string;
       const id = task.startsWith("{") ? JSON.parse(task).brief.split(" ").at(-1) : task;
       const state = leaf(id);
       state.session = session; state.local = locals.get(session); state.task = task;
@@ -478,8 +484,9 @@ classifier_model = "classifier"
     fixture.finishOnCleanup(() => options.workerCreate!.release.resolve());
   }
   const hostExecutor = createPiExecutor({ factories: host.factories }), leafExecutor = createPiExecutor({ factories: workers.factories });
-  let starts = 0, leafStarts = 0;
+  let starts = 0, leafStarts = 0, attachment: HeadAttachment | undefined;
   setBackgroundExecutor({ capturesHistory: true, start(input) {
+    if (input.head) attachment = input.head;
     starts++;
     if (input.scope) leafStarts++;
     return input.head || options.ordinarySdk ? hostExecutor.start(input) : input.scope || input.consultant ? leafExecutor.start(input)
@@ -498,18 +505,30 @@ classifier_model = "classifier"
   const callPublic = (tool: string, params: unknown) => traced(`public ${tool}`, { root },
     () => preparedTool(publicLocal.tools.get(tool)).execute(`public-${tool}`, params, undefined, undefined, ctx));
   let localCalls = 0;
-  const call = (name: string, params: unknown, onUpdate?: (update: unknown) => unknown) => traced(`head ${name}`,
+  const call = (name: string, params: unknown, onUpdate?: (update: unknown) => unknown,
+    projection?: { prepared?: unknown; id?: string; transcriptName?: string; transform?(message: any): void; beforeAppend?(message: any): Promise<void>;
+      append?(message: any): void }) => traced(`head ${name}`,
     { root, input: JSON.stringify(params)?.slice(0, 300) }, async () => {
-    const id = `${name}-${++localCalls}`;
+    const id = projection?.id ?? `${name}-${++localCalls}`;
     for (const hook of headLocal.events.get("tool_call") ?? []) {
       const result = await hook({ toolName: name, toolCallId: id, input: params }, headCtx());
       if (result?.block) throw Error(result.reason);
     }
+    headSession.sessionManager.appendMessage({ role: "assistant", content: [{ type: "toolCall", id, name: projection?.transcriptName ?? name, arguments: params }],
+      stopReason: "toolUse", timestamp: Date.now() } as never);
     headSession.emit({ type: "tool_execution_start", toolName: name, toolCallId: id });
     try {
-      const result = await headLocal.tools.get(name).execute(id, params, undefined, onUpdate, headCtx());
-      headSession.sessionManager.appendMessage({ role: "toolResult", toolName: name, toolCallId: id,
-        content: result.content, details: result.details, isError: result.isError === true, timestamp: Date.now() });
+      const result = await headLocal.tools.get(name).execute(id, projection?.prepared ?? params, undefined, onUpdate, headCtx());
+      const message = { role: "toolResult", toolName: projection?.transcriptName ?? name, toolCallId: id,
+        content: result.content, details: result.details, isError: result.isError === true, timestamp: Date.now() };
+      headSession.emit({ type: "message_start", message });
+      projection?.transform?.(message);
+      // Controlled public boundary: posthooks final observation, then normal append
+      // with the same reference. This is our adapter test, not a Pi event-loop test.
+      headSession.emit({ type: "message_end", message });
+      await projection?.beforeAppend?.(message);
+      if (projection?.append) projection.append(message);
+      else headSession.sessionManager.appendMessage(message);
       return result.details;
     } catch (error) {
       headSession.sessionManager.appendMessage({ role: "toolResult", toolName: name, toolCallId: id,
@@ -539,7 +558,7 @@ classifier_model = "classifier"
   const settle = () => traced("settle", { root }, async () => { headDone.resolve(); await fixture.settleRuns(); });
   return { root, evaluation, ctx, leaf, host, workers, headEntered, headAborted, callPublic, call, callLeaf, read, closed, settle,
     headDone, delivery, deliver: () => deliverWorkerResults(ownerToken, true), publicTools: publicLocal.tools, headLocal: () => headLocal, headSession: () => headSession,
-    counts: () => ({ starts, leafStarts, classifications }),
+    counts: () => ({ starts, leafStarts, classifications }), attachment: () => attachment!,
     outcome: (id: string, team = false) => team ? teamWorkerResult(evaluation.token, id) : workerResult(id) };
 }
 
@@ -954,7 +973,8 @@ test("checkpoint lease is acquired synchronously and cancellation publishes noth
   const cancellation = new AbortController();
   const saving = tools.get("head_checkpoint").execute("lease-cp", { action: "create", expectedRevision: 0,
     paths: ["direct.txt"], summary: "lease", remaining: [], limits: [], evidence: [] }, cancellation.signal, undefined, ctx);
-  const blockedReopen = tools.get("head_plan").execute("reopen", { action: "reopen", epoch: barrier.epoch });
+  const blockedReopen = tools.get("head_plan").execute("reopen", { action: "reopen", epoch: barrier.epoch },
+    undefined, undefined, ctx);
   const guards = [
     ["head_plan", { action: "edit", expectedRevision: 0, nodes: [node("x", ["direct.txt"])], supersede: [] }],
     ["head_plan", { action: "beginIntegration", expectedRevision: 0 }],
@@ -972,9 +992,11 @@ test("checkpoint lease is acquired synchronously and cancellation publishes noth
   cancellation.abort();
   expect((await conflictingAdmission).isError).toBe(true);
   expect(h.counts().starts).toBe(1);
-  for (const result of await settledGuards) {
+  for (const [index, result] of (await settledGuards).entries()) {
     expect(result.status).toBe("rejected");
-    if (result.status === "rejected") expect(String(result.reason)).toContain("checkpoint lease");
+    // Invalid proof is rejected before any unrelated pending/lease diagnosis.
+    if (result.status === "rejected") expect(String(result.reason)).toContain(
+      index === guarded.length - 1 ? "verification must reference" : "checkpoint lease");
   }
   expect((await saving).details.status).toBe("refused");
   expect(listCheckpoints(h.root)).toEqual([]);
@@ -1093,7 +1115,7 @@ test("checkpoint supports SHA256 and EOL conversion while sanitizing inherited G
   expect(adoptCheckpoint(h.root, saved.origin, [path.join(h.root, "work/a")]).saved).toEqual(saved.manifest.saved);
 }));
 
-test("recovery proves linked sealed leaf members without sealing the plan execution group", fixture.ownedCase("public plan checkpoint recovery", async () => {
+async function recoveredPlanCheckpoint() {
   const plan = "checkpoint-plan";
   const h = await harness({ gitRepository: true, cutReceipt: true, seed: async root => {
     const board = await openBoard();
@@ -1133,25 +1155,51 @@ test("recovery proves linked sealed leaf members without sealing the plan execut
   const binding = openExecutionPlan(plan, h.root, { createLedger: false }).binding;
   expect(readLedgerTeamHolds(h.root, plan, binding).map(hold => hold.assignmentId)).toContain(admitted.details.id);
   recordPlanTeamWork(h.root, plan, "T2", admitted.details.id, undefined, binding);
+  expect(readCheckpoint(h.root, origin).historicalEvidence.closureGaps).toContain(`Unreconciled execution hold: ${admitted.details.id}`);
+  const journal = new WorkflowState(h.root);
+  try {
+    const attempt = journal.all<AttemptRecord>("attempts").find(entry => entry.instanceId === admitted.details.instanceId)!;
+    expect(attempt.outcome?.status).toBe("failed");
+    const receipt = journal.all<ReleaseReceipt>("receipts").find(entry => entry.reservationId === attempt.reservationId)!;
+    expect(receipt).toBeDefined();
+    const activity = openExecuteActivity(openExecutionPlan(plan, h.root, { createLedger: false }), {}, "explicit-recovery");
+    try {
+      const claim = { assignmentId: admitted.details.id, dispatchId: attempt.dispatchId, receipt,
+        evidence: [{ dispatchId: attempt.dispatchId, outcomeHash: outcomeHash(attempt.outcome!) }],
+        repository: h.root, remainingResult: "Continue the saved partial source; failure is not semantic acceptance." };
+      expect(() => recoverHold({ fence: activity.authority.fence }, claim)).toThrow("unavailable");
+      expect(() => recoverHold(activity.authority, { ...claim, receipt: { ...receipt, receiptId: "foreign" } }))
+        .toThrow("exact committed");
+      const recovered = recoverHold(activity.authority, claim);
+      expect(recovered.outcome?.status).toBe("failed");
+      expect(journal.get<AttemptRecord>("attempts", attempt.dispatchId)?.outcome?.status).toBe("failed");
+      expect(journal.get<RecoveryReceipt>("recoveries", recovered.recoveryId)).toEqual(recovered);
+    } finally { await activity.retire(); }
+  } finally { journal.close(); }
   expect(readCheckpoint(h.root, origin).historicalEvidence.closureGaps).toEqual([]);
   await retireTeamEvaluation(h.evaluation);
+  return { h, origin, store, leafSource, headSource, a, plan };
+}
+
+for (const damage of ["missing-catalog", "missing-native", "foreign-assignment", "missing-terminal"] as const) {
+test(`checkpoint recovery rejects ${damage} contributor evidence`, fixture.ownedCase(`public checkpoint recovery ${damage}`, async () => {
+  const { h, origin, store, leafSource, plan } = await recoveredPlanCheckpoint();
   const replacement = await harness({ gitRepository: true, root: h.root });
   const params = { role: "developer", mode: "head", writes: ["work"], checkpoint_origin: origin,
     plan, unit: "T2", task: "Continue released partial work" };
   const leafFile = path.join(store.catalogDir, `${leafSource.groupId}.json`), priorCatalog = readFileSync(leafFile, "utf8");
-  renameSync(leafFile, `${leafFile}.missing`);
-  try {
-    expect(readCheckpoint(h.root, origin).historicalEvidence.closureGaps.join()).toContain(leafSource.groupId);
-    expect((await replacement.callPublic("team_assign", params)).isError).toBe(true);
-    expect(replacement.counts().starts).toBe(0);
-  } finally { renameSync(`${leafFile}.missing`, leafFile); }
-  for (const corrupt of [
-    (group: ReturnType<WorkerHistory["read"]>) => { group.members[0]!.native = { state: "not-created" }; },
-    (group: ReturnType<WorkerHistory["read"]>) => { group.members[0]!.assignmentId = "different-assignment"; },
-    (group: ReturnType<WorkerHistory["read"]>) => { group.members[0]!.terminal = undefined; },
-  ]) {
+  if (damage === "missing-catalog") {
+    renameSync(leafFile, `${leafFile}.missing`);
+    try {
+      expect(readCheckpoint(h.root, origin).historicalEvidence.closureGaps.join()).toContain(leafSource.groupId);
+      expect((await replacement.callPublic("team_assign", params)).isError).toBe(true);
+      expect(replacement.counts().starts).toBe(0);
+    } finally { renameSync(`${leafFile}.missing`, leafFile); }
+  } else {
     const group = JSON.parse(priorCatalog);
-    corrupt(group);
+    if (damage === "missing-native") group.members[0].native = { state: "not-created" };
+    if (damage === "foreign-assignment") group.members[0].assignmentId = "different-assignment";
+    if (damage === "missing-terminal") delete group.members[0].terminal;
     writeFileSync(leafFile, JSON.stringify(group));
     try {
       expect(readCheckpoint(h.root, origin).historicalEvidence.closureGaps.length).toBeGreaterThan(0);
@@ -1161,8 +1209,17 @@ test("recovery proves linked sealed leaf members without sealing the plan execut
   const missingHistory = path.join(h.root, "does-not-exist");
   expect(readCheckpoint(h.root, origin, missingHistory).historicalEvidence.closureGaps.length).toBeGreaterThan(0);
   expect(existsSync(missingHistory)).toBe(false);
+  await replacement.settle();
+}));
+}
+
+test("recovery proves linked sealed leaf members without sealing the plan execution group", fixture.ownedCase("public plan checkpoint recovery", async () => {
+  const { h, origin, store, headSource, a, plan } = await recoveredPlanCheckpoint();
+  const replacement = await harness({ gitRepository: true, root: h.root });
+  const params = { role: "developer", mode: "head", writes: ["work"], checkpoint_origin: origin,
+    plan, unit: "T2", task: "Continue released partial work" };
   const replacementAdmission = await replacement.callPublic("team_assign", params);
-  expect(replacementAdmission.isError).not.toBe(true);
+  expect(replacementAdmission.isError, JSON.stringify(replacementAdmission)).not.toBe(true);
   await replacement.headEntered.promise;
   expect((await replacement.read()).nodes).toEqual([]);
   await replacement.call("head_plan", { action: "beginIntegration", expectedRevision: 0 });
@@ -1324,7 +1381,7 @@ test("public Team Head completes direct product work with no leaves through the 
   const candidates = (await h.read()).verificationCandidates;
   expect(candidates).toContainEqual({ kind: "native-tool", entryId: checked,
     toolCallId: h.headSession().sessionManager.getEntry(checked).message.toolCallId, toolName: "bash" });
-  const finish = {
+  const finish: HeadFinish = {
     status: "completed" as const, epoch: barrier.epoch, summary: "Implemented and checked direct product work",
     verification: [checked], limits: ["Controlled SDK boundary, not autonomous model compliance"],
   };
@@ -1386,12 +1443,11 @@ test("public Team Head decomposes, overlaps, corrects, integrates and returns na
   await expect(h.call("head_plan", { action: "confirm", ...identity, proposalId: proposal.proposalId })).rejects.toThrow();
   const leafSession = h.leaf("a").session;
   const progress = leafSession.sessionManager.appendCustomEntry("controlled.progress", { inspected: true });
-  const ackTool = h.leaf("a").local!.tools.get("head_scope_ack");
-  const ack = await ackTool.execute("ack", { action: "ack", proposalId: proposal.proposalId,
+  const ack = await h.callLeaf("a", "head_scope_ack", { action: "ack", proposalId: proposal.proposalId,
     effectiveRevision: identity.effectiveRevision, accept: true, progress: [progress] });
   expect(ack.details.confirmed).toBe(false);
   await h.call("head_plan", { action: "confirm", ...identity, proposalId: proposal.proposalId });
-  const effective = await ackTool.execute("current", { action: "current" });
+  const effective = await h.callLeaf("a", "head_scope_ack", { action: "current" });
   expect(effective.details.contract.brief).toBe("Inspect correction a");
   expect(effective.details.effectiveRevision).not.toBe(identity.effectiveRevision);
   await expect(h.call("head_start", { expectedRevision: (await h.read()).revision, nodeIds: ["c"] })).rejects.toThrow("write reservations");
@@ -1727,6 +1783,295 @@ for (const stage of ["discovery", "classify"] as const) test(`Head cancellation 
 }));
 
 const verificationGrant = { durationMs: 15000, captureBytes: 65536, invocations: 3, artifactRoots: [], scratchRoots: ["scratch"] };
+
+async function activeGate() {
+  const h = await harness({ separateAgentDir: true, seed(root) {
+    writeFileSync(path.join(root, "GATES.md"), "# Local check\nCheck this owned guide exists.\n");
+  } });
+  const admission = await h.callPublic("agent_spawn", { role: "developer", mode: "head", writes: [],
+    verification: { ...verificationGrant, invocations: 1 }, task: "D active native receipt" });
+  await h.headEntered.promise;
+  const barrier = await h.call("head_plan", { action: "beginIntegration", expectedRevision: 0 });
+  const handle = await h.call("head_gates", { action: "request", epoch: barrier.epoch, expectedRevision: 0,
+    coverage: "Owned guide check; no external certification",
+    commands: [{ id: "guide", shell: "test -s GATES.md", cwd: ".", env: {}, timeoutMs: 3000 }] });
+  const cursor = (await h.read()).cursor;
+  return { h, admission, barrier, handle, cursor };
+}
+
+test("D active gates wait observes PREappend, then reconciles authentic entry and consumes only admitted finish", fixture.ownedCase("D active native receipt", async () => {
+  const { h, admission, barrier, handle, cursor } = await activeGate();
+  const attempt = (verification: string[]) => h.call("head_finish", {
+    status: "completed", epoch: barrier.epoch, summary: "Owned guide checked", verification, limits: [] });
+  const result = await h.call("head_wait", { after: 0 }, undefined, { prepared: { after: cursor },
+    transform(message) {
+      // Allowed posthooks changes: unrelated details, reordered envelope keys, intact text movement.
+      message.details.gates = message.details.gates.map((g: object) => Object.fromEntries(Object.entries(g).reverse()));
+      message.details.presentation = "untrusted outer rendering";
+      message.content.unshift({ type: "text", text: "outer prefix" });
+      message.content.reverse(); message.timestamp = 7; message.usage = {};
+    },
+    async beforeAppend(message) {
+      expect(message.details.gates[0]).toMatchObject({ runId: handle.runId, outcome: "passed", complete: true });
+      expect((await h.read()).verificationCandidates).toEqual([]);
+      expect(await attempt([])).toMatchObject({ status: "pending" });
+      await expect(attempt(["fabricated"])).rejects.toThrow("verification");
+      // A callback may append between observation and normal tool result append.
+      h.headSession().sessionManager.appendCustomEntry("interposed", { source: "callback" });
+    } });
+  expect(result.gates).toHaveLength(1);
+  const candidates = (await h.read()).verificationCandidates;
+  const proof = candidates.find((c: any) => c.kind === "owned-gates");
+  expect(proof).toMatchObject({ runId: handle.runId });
+  expect(await attempt([])).toMatchObject({ status: "needs-proof-selection", verificationCandidates: [expect.objectContaining({ entryId: proof.entryId })] });
+  const attachment = h.attachment(), release = gate(), entered = gate();
+  const binding = (attachment as any).binding;
+  const callback = attachment.own(binding, async () => { entered.resolve(); await release.promise; });
+  await entered.promise;
+  try {
+    await expect(attempt(["foreign", proof.entryId])).rejects.toThrow("verification");
+    expect(await attempt([proof.entryId])).toMatchObject({ status: "pending" });
+    expect(attachment.workSnapshot().gateDeliveries![0]).toMatchObject({ consumed: false, deliveryAttempts: 1, wakeAttempts: 0 });
+  } finally { release.resolve(); await callback; }
+  expect(await attempt([proof.entryId])).toMatchObject({ status: "finished", finish: { status: "completed" } });
+  expect(attachment.signal.aborted).toBe(false); // logical finish is not physical closure
+  const before = attachment.workSnapshot().gateDeliveries;
+  let boundary;
+  for (const hook of h.headLocal().events.get("agent_before_settle") ?? [])
+    boundary = await hook({ outcome: "completed", context: { canContinue: true } }) ?? boundary;
+  expect(boundary).toBeUndefined();
+  expect(attachment.workSnapshot().gateDeliveries).toEqual(before);
+  await h.settle();
+  expect(h.outcome(admission.details.instanceId)).toMatchObject({ status: "completed" });
+  expect(h.host.sessions).toHaveLength(1);
+}));
+
+test("D unrelated public final between the owned start/end is not its occurrence or proof", fixture.ownedCase("D interposed public final", async () => {
+  const { h, barrier, cursor } = await activeGate();
+  const manager = h.headSession().sessionManager;
+  await h.call("head_wait", { after: cursor }, undefined, {
+    transform() {
+      const message = { role: "toolResult", toolName: "read", toolCallId: "interposed-read",
+        content: [{ type: "text", text: "unrelated" }], isError: false, timestamp: Date.now() };
+      h.headSession().emit({ type: "message_start", message });
+      h.headSession().emit({ type: "message_end", message });
+      manager.appendMessage(message);
+    },
+    async beforeAppend() {
+      expect((await h.read()).verificationCandidates.filter((c: any) => c.kind === "owned-gates")).toEqual([]);
+    },
+  });
+  const proof = (await h.read()).verificationCandidates.find((c: any) => c.kind === "owned-gates");
+  expect(proof).toBeDefined();
+  expect(h.attachment().workSnapshot().gateDeliveries![0]).toMatchObject({ deliveryAttempts: 1, pinned: true, consumed: false });
+  await h.call("head_finish", { status: "completed", epoch: barrier.epoch, summary: "Exact owned occurrence",
+    verification: [proof.entryId], limits: [] });
+  await h.settle();
+}));
+
+for (const corruption of ["alter", "split", "duplicate", "remove", "envelope", "clone", "error-absent", "error-true", "error-unknown", "role", "toolName", "toolCallId", "postobserve"] as const)
+  test(`D native projection rejects ${corruption} without manufacturing proof`, fixture.ownedCase(`D projection ${corruption}`, async () => {
+    const { h, barrier, cursor } = await activeGate();
+    let observed: any;
+    await h.call("head_wait", { after: cursor }, undefined, {
+      transform(message) {
+        observed = message;
+        const index = message.content.findIndex((b: any) => b.text.startsWith("<pitako.head.gates.v1>"));
+        const block = message.content[index];
+        if (corruption === "alter") block.text += "changed";
+        if (corruption === "split") message.content.splice(index, 1, { type: "text", text: block.text.slice(0, 20) }, { type: "text", text: block.text.slice(20) });
+        if (corruption === "duplicate") message.content.push({ ...block });
+        if (corruption === "remove") message.content.splice(index, 1);
+        if (corruption === "envelope") message.details.gates[0].coverage = "forged";
+        if (corruption === "error-absent") delete message.isError;
+        if (corruption === "error-true") message.isError = true;
+        if (corruption === "error-unknown") message.isError = "unknown";
+        if (corruption === "role") message.role = "assistant";
+        if (corruption === "toolName") message.toolName = "foreign";
+        if (corruption === "toolCallId") message.toolCallId = "foreign";
+      },
+      async beforeAppend(message) {
+        if (corruption !== "postobserve") return;
+        const block = message.content.find((b: any) => b.text.startsWith("<pitako.head.gates.v1>")), original = block.text;
+        block.text += "observed corruption";
+        expect((await h.read()).verificationCandidates).toEqual([]);
+        block.text = original; // observed corruption is permanent, not healed by restoring bytes
+      },
+      append(message) { h.headSession().sessionManager.appendMessage(corruption === "clone" ? structuredClone(message) : message); },
+    });
+    expect(observed).toBeDefined();
+    expect((await h.read()).verificationCandidates).toEqual([]);
+    expect((await h.call("head_finish", { status: "completed", epoch: barrier.epoch, summary: "cannot finish", verification: [], limits: [] })).status).toBe("unavailable");
+    await h.call("head_finish", { status: "failed", diagnostic: "Protected native receipt unavailable", evidence: [], limits: [] });
+    await h.settle();
+  }));
+
+test("D retained native pin crosses branch away/return and finish-required without reoffer or wake", fixture.ownedCase("D pin arbitration", async () => {
+  const { h, barrier, cursor } = await activeGate();
+  await h.call("head_wait", { after: cursor });
+  const manager = h.headSession().sessionManager;
+  const proof = (await h.read()).verificationCandidates.find((c: any) => c.kind === "owned-gates");
+  const leaf = manager.getLeafId(), away = manager.getBranch().find((e: any) => e.type === "message" && e.message.role === "assistant").id;
+  const boundary = async () => {
+    let result: any;
+    for (const hook of h.headLocal().events.get("agent_before_settle") ?? [])
+      result = await hook({ outcome: "completed", context: { canContinue: true } }) ?? result;
+    return result;
+  };
+  const state = h.attachment().workSnapshot().gateDeliveries![0]!;
+  expect(state).toMatchObject({ pinned: true, consumed: false, deliveryAttempts: 1, wakeAttempts: 0 });
+  const first = await boundary();
+  expect(first).toMatchObject({ continue: true, entries: [expect.objectContaining({ customType: "pitako.head.finish-required" })] });
+  manager.branch(away);
+  expect((await h.read()).verificationCandidates).toEqual([]);
+  await expect(h.call("head_finish", { status: "completed", epoch: barrier.epoch, summary: "offbranch", verification: [proof.entryId], limits: [] })).rejects.toThrow("verification");
+  const second = await boundary();
+  expect(second.entries.map((e: any) => e.customType)).toEqual(["pitako.head.finish-required"]);
+  expect(h.attachment().workSnapshot().gateDeliveries![0]).toEqual(state);
+  manager.branch(leaf);
+  expect((await h.read()).verificationCandidates.find((c: any) => c.kind === "owned-gates")).toEqual(proof);
+  expect(await boundary()).toBeUndefined(); // existing repeated-final budget, not a gates retry loop
+  await h.call("head_finish", { status: "completed", epoch: barrier.epoch, summary: "same retained proof", verification: [proof.entryId], limits: [] });
+  await h.settle();
+}));
+
+async function headBoundary(h: Awaited<ReturnType<typeof harness>>) {
+  let result: any;
+  for (const hook of h.headLocal().events.get("agent_before_settle") ?? [])
+    result = await hook({ outcome: "completed", context: { canContinue: true } }) ?? result;
+  return result;
+}
+
+test("D retained gate pin preserves the independent Developer delivery before finish-required", fixture.ownedCase("D gate and Developer channels", async () => {
+  const h = await harness({ separateAgentDir: true, seed(root) {
+    writeFileSync(path.join(root, "GATES.md"), "# Owned guide\n");
+  } });
+  await h.callPublic("agent_spawn", { role: "developer", mode: "head", writes: ["shared"],
+    verification: { ...verificationGrant, invocations: 1 }, task: "D distinct delivery channels" });
+  await h.headEntered.promise;
+  await h.call("head_plan", { action: "edit", expectedRevision: 0, nodes: [node("a", ["shared"])], supersede: [] });
+  const [run] = await h.call("head_start", { expectedRevision: 1, nodeIds: ["a"] });
+  await h.leaf("a").entered.promise;
+  h.leaf("a").done.resolve(); h.leaf("a").dispose.resolve();
+  await h.closed(run.runId);
+  expect(h.attachment().workSnapshot().deliveries).toContainEqual(expect.objectContaining({ delivery: "pending" }));
+  await h.call("head_review", { runId: run.runId, effectiveRevision: 1, judgment: "satisfied",
+    evidence: ["Controlled Developer outcome inspected"], reason: "No product mutation requested" });
+  const barrier = await h.call("head_plan", { action: "beginIntegration", expectedRevision: 1 });
+  await h.call("head_gates", { action: "request", epoch: barrier.epoch, expectedRevision: 1,
+    coverage: "Owned guide check", commands: [{ id: "guide", shell: "test -s GATES.md", cwd: ".", env: {}, timeoutMs: 3000 }] });
+  await h.call("head_wait", { after: (await h.read()).cursor });
+  const proof = (await h.read()).verificationCandidates.find((c: any) => c.kind === "owned-gates");
+  expect(proof).toBeDefined();
+  const gateState = h.attachment().workSnapshot().gateDeliveries;
+  const offer = await headBoundary(h);
+  expect(offer.entries.map((e: any) => e.customType)).toEqual(["pitako.head.result"]);
+  expect(await headBoundary(h)).toBeUndefined(); // genuine other-channel outstanding still blocks
+  expect(h.attachment().workSnapshot().gateDeliveries).toEqual(gateState);
+  for (const entry of offer.entries)
+    h.headSession().sessionManager.appendCustomMessageEntry(entry.customType, entry.content, entry.display, entry.details);
+  for (const hook of h.headLocal().events.get("turn_start") ?? []) await hook({});
+  expect((await headBoundary(h)).entries.map((e: any) => e.customType)).toEqual(["pitako.head.finish-required"]);
+  expect(h.attachment().workSnapshot().gateDeliveries).toEqual(gateState);
+  await h.call("head_finish", { status: "completed", epoch: barrier.epoch, summary: "Distinct deliveries inspected",
+    verification: [proof.entryId], limits: [] });
+  await h.settle();
+}));
+
+test("D corrupt owned return stays excluded from generic evidence after native registry loss", fixture.ownedCase("D composed corruption and loss", async () => {
+  const { h, barrier, cursor } = await activeGate();
+  const gates = h.attachment().gates as any;
+  await h.call("head_wait", { after: cursor }, undefined, {
+    transform(message) { message.toolName = "read"; },
+  });
+  expect((await h.read()).verificationCandidates).toEqual([]);
+  gates.waits = [];
+  expect((await h.read()).verificationCandidates).toEqual([]);
+  const entry = h.headSession().sessionManager.getBranch().findLast((e: any) =>
+    e.type === "message" && e.message.role === "toolResult");
+  await expect(h.call("head_finish", { status: "completed", epoch: barrier.epoch, summary: "corrupt proof",
+    verification: [entry.id], limits: [] })).rejects.toThrow("verification");
+  expect(h.attachment().workSnapshot().gateDeliveries![0]).toMatchObject({ consumed: false, pinned: false });
+  expect(h.attachment().workSnapshot().gateDeliveries![0]!.availability).toBeDefined();
+  await h.call("head_finish", { status: "failed", diagnostic: "Corrupt owned return remains unavailable", evidence: [], limits: [] });
+  await h.settle();
+}));
+
+for (const loss of ["native-registry", "codemode-unpaired"] as const)
+  test(`D ${loss} falls back prepin using only the original remaining credit`, fixture.ownedCase(`D fallback ${loss}`, async () => {
+    const { h, barrier, cursor } = await activeGate();
+    const gates = h.attachment().gates as any;
+    await h.call("head_wait", { after: cursor }, undefined, {
+      ...(loss === "codemode-unpaired" ? { transcriptName: "codemode" } : {}),
+      async beforeAppend() {
+        // A real return/append-dependent member must not await itself or reoffer.
+        if (loss === "native-registry") {
+          expect(await headBoundary(h)).toBeUndefined();
+          gates.waits = [];
+        }
+      },
+    });
+    expect((await h.read()).verificationCandidates.filter((c: any) => c.kind === "owned-gates")).toEqual([]);
+    const offer = await headBoundary(h);
+    expect(offer.entries.map((e: any) => e.customType)).toEqual(["pitako.head.gates"]);
+    expect(h.attachment().workSnapshot().gateDeliveries![0]).toMatchObject({ deliveryAttempts: 2, pinned: false, consumed: false });
+    expect((await h.read()).verificationCandidates.filter((c: any) => c.kind === "owned-gates")).toEqual([]); // offer is not a pin
+    for (const entry of offer.entries)
+      h.headSession().sessionManager.appendCustomMessageEntry(entry.customType, entry.content, entry.display, entry.details);
+    const proof = (await h.read()).verificationCandidates.find((c: any) => c.kind === "owned-gates");
+    expect(proof.kind).toBe("owned-gates");
+    expect((await headBoundary(h)).entries.map((e: any) => e.customType)).toEqual(["pitako.head.finish-required"]);
+    expect(h.attachment().workSnapshot().gateDeliveries![0]).toMatchObject({ deliveryAttempts: 2, pinned: true, consumed: false });
+    await h.call("head_finish", { status: "completed", epoch: barrier.epoch, summary: "Alternate exact receipt inspected", verification: [proof.entryId], limits: [] });
+    await h.settle();
+  }));
+
+for (const loss of ["record", "account", "winner", "pinned-registry", "entry-id", "rebind", "manager"] as const)
+  test(`D lost ${loss} cannot recreate proof, credit or an orphan wait`, fixture.ownedCase(`D lost ${loss}`, async () => {
+    const { h, barrier, cursor } = await activeGate();
+    await h.call("head_wait", { after: cursor });
+    const gates = h.attachment().gates as any;
+    const manager = h.headSession().sessionManager;
+    const proof = (await h.read()).verificationCandidates[0];
+    const record = [...gates.deliveries.values()][0] as any;
+    if (loss === "record") gates.deliveries.clear();
+    if (loss === "account") delete record.progress;
+    if (loss === "winner") delete record.pinnedWinner;
+    if (loss === "pinned-registry") gates.waits = [];
+    if (loss === "entry-id") record.pinnedWinner.result.id = "substituted-id";
+    if (loss === "rebind") h.attachment().bind(h.attachment().headInstanceId!);
+    if (loss === "manager") h.headSession().sessionManager = SessionManager.inMemory(h.root);
+    if (loss === "rebind" || loss === "manager") {
+      await expect(h.read()).rejects.toThrow("retired");
+      expect(gates.native).toBeUndefined(); // synchronous unsubscribe/retirement before joins
+      h.headSession().sessionManager = manager;
+      await h.attachment().close();
+    } else {
+      expect((await h.read()).verificationCandidates).toEqual([]);
+      await expect(h.call("head_finish", { status: "completed", epoch: barrier.epoch, summary: "Lost custody", verification: [proof.entryId], limits: [] })).rejects.toThrow("verification");
+      expect((await h.call("head_finish", { status: "completed", epoch: barrier.epoch, summary: "No selection", verification: [], limits: [] })).status).toBe("unavailable");
+      const boundary = await headBoundary(h);
+      expect(boundary.entries.map((e: any) => e.customType)).toEqual(["pitako.head.finish-required"]);
+      await h.call("head_finish", { status: "failed", diagnostic: "Lost capability remains unavailable", evidence: [], limits: [] });
+    }
+    await h.settle();
+  }));
+
+test("D repeated toolCallId includes preintegration waits and cannot select an execution", fixture.ownedCase("D ambiguous wait", async () => {
+  const h = await harness({ separateAgentDir: true });
+  await h.callPublic("agent_spawn", { role: "developer", mode: "head", writes: [],
+    verification: verificationGrant, task: "D occurrence custody" });
+  await h.headEntered.promise;
+  await h.call("head_wait", { after: 0 }, undefined, { id: "same-call" });
+  const barrier = await h.call("head_plan", { action: "beginIntegration", expectedRevision: 0 });
+  await h.call("head_gates", { action: "request", epoch: barrier.epoch, expectedRevision: 0, coverage: "Controlled command",
+    commands: [{ id: "check", shell: "true", cwd: ".", env: {}, timeoutMs: 3000 }] });
+  await h.call("head_wait", { after: (await h.read()).cursor }, undefined, { id: "same-call" });
+  expect((await h.read()).verificationCandidates).toEqual([]);
+  expect((h.attachment().gates as any).waits.filter((w: any) => w.toolCallId === "same-call")).toHaveLength(2);
+  await h.call("head_finish", { status: "failed", diagnostic: "Ambiguous occurrence never authenticates", evidence: [], limits: [] });
+  await h.settle();
+}));
 test("granted admitted Head waits interruptibly, receives native failed gate and corrects in the SAME one-shot", fixture.ownedCase("owned gate early decisive route", async () => {
   const boundaryEntered = gate(), steeringContinuation = gate(), requestNext = gate(), finished = gate();
   let first: any, second: any, epoch: string, receipt: string, native: string | undefined;
@@ -1872,7 +2217,7 @@ test(unknownPrincipalCase, fixture.ownedCase("unknown principal Head barrier", a
   const principal = await bind([pi => principalLeases(pi, { async exec() {
     throw new AgentClosureError([new Error("controlled group observation failure")], "principal fixture");
   } })], () => {});
-  const unsupported = reserveOperation(undefined, "writer");
+  const unsupported = reserveOperation(undefined, "writer", captureCallContext(h.root));
   const hook = await principal.events.get("user_bash")![0]!({}, h.ctx);
   await expect(hook.operations.exec("controlled", h.root, { onData() {} })).rejects.toThrow("closure");
   const admission = await h.callPublic("agent_spawn", { role: "developer", mode: "head", writes: ["work"], task: "must be fenced" });

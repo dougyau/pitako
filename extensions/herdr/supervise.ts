@@ -14,6 +14,7 @@ import { loadPitakoConfig, resolveRoleFromConfig, type LoadOptions } from "../ro
 import { assertIndividualRole, TABLE_ONLY_ROLES, type ResolvedRole } from "../roles/types.ts";
 import { ORCHESTRATION_TOOLS } from "../profile.ts";
 import { piIntegrationCurrent, readHerdrPresence } from "./presence.ts";
+import { currentCallContext, type CallContext } from "../workflow-engine.ts";
 
 /** CLI seam. Not an AgentRuntime. */
 export type HerdrCommandResult = {
@@ -45,6 +46,7 @@ const READ_STATUS = new Set(["blocked", "agent_blocked"]);
 let inFlight = false;
 
 export async function superviseAgent(input: {
+  context?: CallContext;
   roleId: string;
   task: string;
   cwd: string;
@@ -55,6 +57,8 @@ export async function superviseAgent(input: {
   preflight?: () => Promise<DispatchSnapshot>;
   check?: () => void;
 }): Promise<SuperviseResult> {
+  const context = input.context ?? currentCallContext();
+  if (context && context.kind !== "ordinary") throw new Error("agent_supervise does not participate in managed workflows");
   assertIndividualRole(input.roleId);
   if (isConsultation(input.roleId)) throw new Error("Consultative roles require agent_spawn or team_assign, not agent_supervise");
   if (inFlight) throw new Error("agent_supervise is already in flight");
@@ -218,6 +222,7 @@ export function registerAgentSupervise(pi: ExtensionAPI): void {
         const result = await ownedDispatch(ctx, signal, () => true, async (signal, check) => {
           check();
           return superviseAgent({ roleId: params.role, task: params.task, cwd: ctx.cwd, signal, check,
+             context: currentCallContext(ctx.sessionManager),
             preflight: async () => {
               const snapshot = await developerPreflight({ task: params.task, toolCallId: _toolCallId,
                 source: "agent_supervise", ctx, pi, signal, owns: () => { check(); return true; } });

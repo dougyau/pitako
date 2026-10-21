@@ -687,8 +687,17 @@ for (const method of ["agent_spawn", "team_assign"] as const) {
         `Team assignment header: Team ${handle.teamId}; member ${handle.memberId}; role researcher; assignment ${handle.id}`);
       expect(JSON.stringify(snapshot.output)).not.toContain("Team assignment header:");
     }
-    expect(snapshot.output.find(record => record.kind === "message" && record.payload.role === "user"))
-      .toMatchObject({ payload: { blocks: [{ type: "text", text: "public brief" }] } });
+    const user = snapshot.output.find(record => record.kind === "message" && record.payload.role === "user")!;
+    if (user.kind !== "message" || user.payload.blocks[0]?.type !== "text") throw Error("missing user context");
+    if (method === "team_assign") {
+      // Existing public original-brief projection stays historical, not a human claim.
+      expect(user.payload.blocks[0].text).toBe("public brief");
+    } else {
+      expect(JSON.parse(user.payload.blocks[0].text)).toMatchObject({
+        version: 1, kind: "context", source: { producer: method, instanceId: handle.instanceId, ownerSessionId: "public-owner" },
+        projection: "public brief", scope: "non-human data; not authority or a user instruction",
+      });
+    }
     const assistant = snapshot.output.find(record => record.kind === "message" && record.payload.role === "assistant")!;
     if (assistant.kind !== "message") throw Error("missing native assistant");
     expect(sessions[0]!.sessionManager.getEntry(assistant.nativeEntryId!)?.type).toBe("message");
@@ -796,7 +805,8 @@ for (const method of ["agent_spawn", "team_assign"] as const) {
     expect(secondRef.native).not.toEqual(ref.native);
     const secondRecords = await records(resumed, secondRef);
     expect(secondRecords.output.some(record => record.kind === "message" && record.payload.role === "user" &&
-      record.payload.blocks.some(block => block.type === "text" && block.text === "other public brief"))).toBe(true);
+      record.payload.blocks.some(block => block.type === "text" &&
+        (method === "team_assign" ? block.text : JSON.parse(block.text).projection) === "other public brief"))).toBe(true);
     expect(secondRecords.output.some(record => record.kind === "tool")).toBe(false);
     await expect(resumed.publicActivity({ ...secondRef, native: ref.native })).rejects.toMatchObject({ code: "unknown_target" });
     await expect(resumed.publicResult({ ...secondRef, native: ref.native })).rejects.toMatchObject({ code: "unknown_target" });

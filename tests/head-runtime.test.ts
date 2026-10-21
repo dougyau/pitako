@@ -39,10 +39,13 @@ reasoning = "off"
 }
 
 // Run the real local factories at the SDK boundary; the test owns event dispatch/receipt.
-async function bind(factories: ExtensionFactory[]) {
+async function bind(factories: ExtensionFactory[], context: Pick<ExtensionContext, "cwd" | "sessionManager">) {
   const tools = new Map<string, { execute: Function }>(), events = new Map<string, Function>();
   const api = {
-    registerTool(tool: { name: string; execute: Function }) { tools.set(tool.name, tool); },
+    registerTool(tool: { name: string; execute: Function }) {
+      tools.set(tool.name, { execute: (id: string, input: unknown, signal?: AbortSignal, update?: unknown, ctx = context) =>
+        tool.execute(id, input, signal, update, ctx) });
+    },
     on(name: string, callback: Function) { events.set(name, callback); return () => events.delete(name); },
   } as unknown as ExtensionAPI;
   for (const factory of factories) await factory(api);
@@ -61,11 +64,13 @@ test("only the granted native Head receives closed child envelopes; offers are n
   const head = new HeadAttachment("assignment-one", root);
   let local!: Awaited<ReturnType<typeof bind>>, childRun!: Promise<AgentRunResult>;
   const host = controlledPi(root, {
-    bind: async () => { local = await bind(host.loaderInputs[0].extensionFactories); },
+    bind: async session => { local = await bind(host.loaderInputs[0].extensionFactories, { cwd: root, sessionManager: session.sessionManager }); },
     prompt: async session => {
       childRun = fixture.run(head.startChild("child-one", signal => runAgentInstance({
         roleId: "developer", task: "child brief", cwd: root, load, signal, executor: createPiExecutor({ factories: child.factories }),
       })));
+      void childRun.then(result => disposing.reject(new Error(`Child returned before disposal: ${JSON.stringify(result)}`)),
+        error => disposing.reject(error));
       entered.resolve();
       await prompt.promise;
       session.messages.push({ role: "assistant", content: [{ type: "text", text: "head result" }], stopReason: "stop" });
@@ -73,6 +78,8 @@ test("only the granted native Head receives closed child envelopes; offers are n
   });
   const run = fixture.run(runAgentInstance({ roleId: "developer", task: "head brief", cwd: root, load, head,
     executor: createPiExecutor({ factories: host.factories }) }));
+  void run.then(result => entered.reject(new Error(`Head returned before admission: ${JSON.stringify(result)}`)),
+    error => entered.reject(error));
   await Promise.all([entered.promise, disposing.promise]);
   expect(() => head.startChild("child-one", async () => { throw new Error("duplicate must not start"); })).toThrow("already started");
   const result = local.tools.get("head_result")!, wait = local.tools.get("head_wait")!;
@@ -89,7 +96,7 @@ test("only the granted native Head receives closed child envelopes; offers are n
   // Another granted Head and an ordinary leaf get independently loaded factories.
   const otherHead = new HeadAttachment("assignment-two", root);
   let otherLocal!: Awaited<ReturnType<typeof bind>>, leafLocal!: Awaited<ReturnType<typeof bind>>;
-  const other = controlledPi(root, { bind: async () => { otherLocal = await bind(other.loaderInputs[0].extensionFactories); },
+  const other = controlledPi(root, { bind: async session => { otherLocal = await bind(other.loaderInputs[0].extensionFactories, { cwd: root, sessionManager: session.sessionManager }); },
     prompt: async session => {
       await expect(otherLocal.tools.get("head_result")!.execute("read", { childId: "child-one" })).rejects.toThrow("unknown Head child");
       expect(await otherLocal.events.get("agent_before_settle")!(boundary())).toBeUndefined();
@@ -97,7 +104,7 @@ test("only the granted native Head receives closed child envelopes; offers are n
     } });
   await fixture.run(runAgentInstance({ roleId: "developer", task: "other brief", cwd: root, load, head: otherHead,
     executor: createPiExecutor({ factories: other.factories }) }));
-  const leaf = controlledPi(root, { bind: async () => { leafLocal = await bind(leaf.loaderInputs[0].extensionFactories); } });
+  const leaf = controlledPi(root, { bind: async session => { leafLocal = await bind(leaf.loaderInputs[0].extensionFactories, { cwd: root, sessionManager: session.sessionManager }); } });
   await fixture.run(runAgentInstance({ roleId: "developer", task: "leaf brief", cwd: root, load,
     executor: createPiExecutor({ factories: leaf.factories }) }));
   expect(leafLocal.tools.size).toBe(0);
@@ -130,7 +137,7 @@ test("admitted child effects fence retries into the same Head session, never rep
   let childRun!: Promise<AgentRunResult>;
   const host = controlledPi(root, {
     models: [controlledModel(), controlledModel("fixture", "fallback")],
-    bind: async () => { await bind(host.loaderInputs[0].extensionFactories); },
+    bind: async session => { await bind(host.loaderInputs[0].extensionFactories, { cwd: root, sessionManager: session.sessionManager }); },
     prompt: async session => {
       if (session.prompts.length === 1) {
         childRun = fixture.run(head.startChild("admitted-child", signal => runAgentInstance({
@@ -192,7 +199,7 @@ test("cancel during Head delivery wakes owned callbacks and waits prompts and ch
   const child = controlledPi(root, { dispose: async () => { disposing.resolve(); await releaseChild.promise; } });
   let local!: Awaited<ReturnType<typeof bind>>, childRun!: Promise<AgentRunResult>, waiting!: Promise<unknown>;
   const host = controlledPi(root, {
-    bind: async () => { local = await bind(host.loaderInputs[0].extensionFactories); },
+    bind: async session => { local = await bind(host.loaderInputs[0].extensionFactories, { cwd: root, sessionManager: session.sessionManager }); },
     prompt: async () => {
       childRun = fixture.run(head.startChild("child", signal => runAgentInstance({ roleId: "developer", task: "child", cwd: root,
         load, signal, executor: createPiExecutor({ factories: child.factories }) })));
@@ -227,7 +234,7 @@ test("unknown consultation retains the shared lease and yields bounded settlemen
     executor: { async start() { throw new AgentClosureError([new Error("controlled unknown")], "consultation"); } } });
   head.claim("head-instance", root);
   const binding = head.bind("head-instance"), manager = SessionManager.inMemory(root);
-  const local = await bind([headExtension(head, binding, () => manager)]);
+  const local = await bind([headExtension(head, binding, () => manager)], { cwd: root, sessionManager: manager });
   const ctx = { cwd: root, sessionManager: manager } as unknown as ExtensionContext;
   const handle = (await local.tools.get("head_consult")!.execute("consult", { role: "researcher", task: "unknown" }, undefined, undefined, ctx)).details;
   let after = 0;
@@ -260,7 +267,7 @@ async function gatedHead(overrides = {}, clock = recoveryClock()) {
   head.claim("head-instance", root);
   const binding = head.bind("head-instance");
   const manager = SessionManager.create(root, path.join(root, ".pitako", "sessions"));
-  const local = await bind([headExtension(head, binding, () => manager)]);
+  const local = await bind([headExtension(head, binding, () => manager)], { cwd: root, sessionManager: manager });
   const epoch = head.dag!.beginIntegration(binding, 0, manager.getBranch()).epoch;
   const request = (shell: string, more = {}) => head.gates!.request(binding, { epoch, expectedRevision: 0,
     coverage: "Selected component shell; manual review unrun", commands: [{ id: "local", shell, cwd: "component", env: {}, timeoutMs: 3000, ...more }] });
@@ -302,7 +309,9 @@ test("shared leases exclude an actually admitted writer and overlapping Heads/ch
   expect(() => h.request("printf blocked")).toThrow("active");
   release.resolve(); await writing; await producer.settle();
   const handle = h.request("printf component");
-  expect(() => reserveOperation(path.join(h.root, "component"), "writer")).toThrow("lease");
+  // The component is an effect path, not a second noGit participating workspace.
+  expect(() => reserveOperation(path.join(h.root, "component"), "writer", h.head.managed!.context)).toThrow("lease");
+  expect(() => native.execute("blocked-writer", { path: "product.md" }, undefined, undefined, { cwd: h.root } as never)).toThrow("lease");
   expect(() => acquireCheckpointLease(h.root)).toThrow("active");
   expect(() => h.head.dag!.reopen(h.binding, h.epoch)).toThrow("lease");
   expect(() => new HeadAttachment("other", h.root)).toThrow("lease");
@@ -432,14 +441,14 @@ test("owned scheduler releases a parked Head boundary after the stored gate outc
   expect(JSON.parse(entry.content)).toMatchObject({ outcome: "passed", closure: "released" });
   expect(h.head.dag!.verificationEntries(h.binding, manager.getBranch())).toEqual([]);
   // No event/timer duplicate while native commitment is outstanding.
-  clock.fire();
+  expect(clock.pending).toBe(0);
   expect(await local.events.get("agent_before_settle")!(boundary(false))).toBeUndefined();
   manager.appendCustomMessageEntry(entry.customType, entry.content, entry.display, entry.details);
   await local.events.get("context")!({});
   expect(h.head.dag!.verificationEntries(h.binding, manager.getBranch()).some(e => e.kind === "owned-gates")).toBe(true);
   await local.events.get("turn_start")!({});
   expect(clock.pending).toBe(0);
-  // A changed tree can invalidate evidence, but cannot rearm consumed liveness.
+  // A changed tree removes eligibility, but retains the same unconsumed pin.
   manager.branch(anchor);
   expect(await local.events.get("agent_before_settle")!(boundary(false))).toBeUndefined();
   expect(h.head.dag!.verificationEntries(h.binding, manager.getBranch())).toEqual([]);
@@ -448,39 +457,42 @@ test("owned scheduler releases a parked Head boundary after the stored gate outc
 }));
 
 
-test("Head events and timer never duplicate an open gate offer, and closed boundaries share two total offers", fixture.ownedCase("Head recovery offer exhaustion", async () => {
+test("Head boundaries never duplicate an open gate offer, and closed boundaries share two total offers", fixture.ownedCase("Head recovery offer exhaustion", async () => {
   const clock = recoveryClock(), h = await gatedHead({}, clock);
   h.request("printf retained");
   const event = h.local.events.get("agent_before_settle")!;
   const first = await event(boundary(false));
-  clock.fire(); clock.fire();
   expect(await event(boundary(false))).toBeUndefined();
+  expect(clock.pending).toBe(0);
   await h.local.events.get("agent_settled")!({});
   // A later safe boundary can retry the closed, uncommitted envelope, with exactly the same ID/body.
   const second = await event(boundary(false));
   expect(second.entries).toEqual(first.entries);
-  clock.fire();
   expect(await event(boundary(false))).toBeUndefined();
+  expect(clock.pending).toBe(0);
   await h.local.events.get("agent_settled")!({});
   expect(clock.pending).toBe(0);
   expect(await event(boundary(false))).toBeUndefined();
-  expect(h.head.workSnapshot().deliveries).toEqual([expect.objectContaining({ deliveryAttempts: 2,
+  expect(h.head.workSnapshot().gateDeliveries).toEqual([expect.objectContaining({ deliveryAttempts: 2,
     deliveryDiagnostic: expect.stringContaining("exhausted") })]);
   await h.head.close();
 }));
 
-test("Head receipt without an observed continuation stays blocked at final settlement and cannot create an idle prompt", fixture.ownedCase("Head unobserved continuation", async () => {
+test("custom gate receipt retains explicit consumption without fictitious continuation or idle prompt", fixture.ownedCase("Head unobserved continuation", async () => {
   const clock = recoveryClock(), h = await gatedHead({}, clock);
   h.request("printf ready");
   const offered = await h.local.events.get("agent_before_settle")!(boundary(false));
   const entry = offered.entries[0];
   h.manager.appendCustomMessageEntry(entry.customType, entry.content, entry.display, entry.details);
   await h.local.events.get("context")!({});
-  clock.fire();
+  expect(clock.pending).toBe(0);
   expect(await h.local.events.get("agent_before_settle")!(boundary(false))).toBeUndefined();
   await h.local.events.get("agent_settled")!({});
   expect(clock.pending).toBe(0);
-  expect(h.head.workSnapshot().deliveries).toEqual([expect.objectContaining({ delivery: "incorporated", continuation: "blocked-unconfirmed" })]);
+  expect(h.head.workSnapshot().gateDeliveries).toEqual([expect.objectContaining({
+    delivery: "incorporated", continuation: "requested", wakeAttempts: 0, pinned: true, consumed: false })]);
+  await h.local.events.get("turn_start")!({});
+  expect(h.head.workSnapshot().gateDeliveries?.[0]?.continuation).toBe("requested");
   expect(await h.local.events.get("agent_before_settle")!(boundary(false))).toBeUndefined();
   await h.head.close();
 }));
@@ -497,7 +509,7 @@ test("the same host backstop recovers a retained consultation locally, not throu
   fixture.beforeRelease(() => { outcome.resolve({ status: "completed", result: "controlled advice", sideEffects: false }); return head.close(); });
   head.claim("head-instance", root);
   const binding = head.bind("head-instance"), manager = SessionManager.inMemory(root);
-  const local = await bind([headExtension(head, binding, () => manager)]);
+  const local = await bind([headExtension(head, binding, () => manager)], { cwd: root, sessionManager: manager });
   const ctx = { cwd: root, sessionManager: manager } as unknown as ExtensionContext;
   await local.tools.get("head_consult")!.execute("consult", { role: "researcher", task: "advice" }, undefined, undefined, ctx);
   await entered.promise;
@@ -523,7 +535,7 @@ test("queued Head ticks cannot revive a retired attachment or a changed native o
   for (const change of ["retire", "during-await", "branch-callback", "error"] as const) {
     const clock = recoveryClock(), h = await gatedHead({}, clock);
     let current = h.manager;
-    const local = await bind([headExtension(h.head, h.binding, () => current)]);
+    const local = await bind([headExtension(h.head, h.binding, () => current)], { cwd: h.root, sessionManager: current });
     const started = deferred(), release = deferred();
     fixture.beforeRelease(() => release.resolve());
     const operation = h.head.own(h.binding, async () => { started.resolve(); await release.promise; });
@@ -573,7 +585,7 @@ test("public patch registration reaches managed createSession before bind and ke
       let local!: Awaited<ReturnType<typeof bind>>;
       const host = controlledPi(root, { models: [model],
         extensions: included ? [{ resolvedPath: publicPath, tools: new Map([["apply_patch", { definition: patch }]]) }] : [],
-        async bind() { expect(created).toBe(true); bound = true; local = await bind(host.loaderInputs[0].extensionFactories); },
+        async bind(session) { expect(created).toBe(true); bound = true; local = await bind(host.loaderInputs[0].extensionFactories, { cwd: root, sessionManager: session.sessionManager }); },
         async prompt(session) {
           expect(bound).toBe(true);
           const integration = await local.tools.get("head_plan")!.execute("integration", { action: "beginIntegration", expectedRevision: 0 },

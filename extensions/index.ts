@@ -6,7 +6,7 @@ import { PitakoConfigError } from "./errors.ts";
 import { isProtectedEditPath } from "./paths.ts";
 import { canonicalPath } from "./board/paths.ts";
 import { bindBackgroundOwner, revokeBackgroundOwner, shutdownBackground, observeWorkerResults,
-  draftWorkerResults, draftIntermediateResults, observeIntermediateResults, settleIntermediateResults, settleWorkerResults, restrictWorkerContinuation, externallyStartedWorkerOwner } from "./agent/background.ts";
+  draftWorkerResults, draftIntermediateResults, observeIntermediateResults, settleBackgroundResults, restrictWorkerContinuation, externallyStartedWorkerOwner } from "./agent/background.ts";
 import { beginTeamEvaluation, retireTeamEvaluation, teamEvaluationForSession, teamAssignments, type TeamEvaluation } from "./team.ts";
 import { teamWorkerStatus } from "./agent/background.ts";
 import { bindAgentUi, listObservations, unbindAgentUi } from "./agent/observe.ts";
@@ -37,6 +37,7 @@ import { createAgentBridge } from "./agent/bridge/broker.ts";
 import { AgentClosureError } from "./agent/closure.ts";
 import { principalLeases } from "./agent/head/operation-leases.ts";
 import { foregroundBash } from "./agent/head/managed-tools.ts";
+import { registerWorkflowCommands } from "./workflow-engine.ts";
 
 function foregroundSession(sessionId: string | undefined): sessionId is string {
   return Boolean(sessionId && !executionForSession(sessionId) && !currentInstanceId() && !process.env.PITAKO_INSTANCE_ID);
@@ -71,6 +72,7 @@ export default function pitako(pi: ExtensionAPI, host: { recoveryScheduler?: Rec
   prepareRuntime(root);
 
   principalLeases(pi, foregroundBash);
+  const retireWorkflow = registerWorkflowCommands(pi, { shutdown: false });
 
   pi.registerFlag("pitako-profile", {
     description: 'Pitako profile: "coding" (default) or "analysis"',
@@ -111,14 +113,14 @@ export default function pitako(pi: ExtensionAPI, host: { recoveryScheduler?: Rec
   // Retain prior handles even after revokeForeground clears the live references.
   // Start closes synchronously to revoke Team authority before the first await.
   // allSettled observes every close, and a failed close poisons this lifetime.
-  const retainRetirement = (retired: ReturnType<typeof revokeForeground>, sessionId?: string) => {
+  const retainRetirement = (retired: ReturnType<typeof revokeForeground>, sessionId?: string, closeWorkflow?: () => Promise<void>) => {
     const previous = retirement;
     retirement = Promise.allSettled([
       previous,
       ...[
         () => retireTeamEvaluation(retired.evaluation), () => shutdownBackground(retired.token),
         () => settlePendingDispatches(sessionId), () => retired.controller?.settle(),
-        () => retired.pane?.close(), () => retired.bridge?.settle(),
+        () => retired.pane?.close(), () => retired.bridge?.settle(), () => closeWorkflow?.(),
       ].map(async close => close()),
     ]).then(results => {
       const failures = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
@@ -196,8 +198,9 @@ export default function pitako(pi: ExtensionAPI, host: { recoveryScheduler?: Rec
           notify: (message) => {
             if (ctx.hasUI) ctx.ui.notify(message, "info");
           },
-          sendMessage: (content) => {
+          sendMessage: (content, source) => {
             if (!owns()) return;
+            source.assertIssued();
             pi.sendMessage(
               {
                 customType: "pitako.worker",
@@ -267,7 +270,8 @@ export default function pitako(pi: ExtensionAPI, host: { recoveryScheduler?: Rec
     retired.evaluation ??= teamEvaluationForSession(ctx.sessionManager?.getSessionId(), isChildSession(ctx));
     const sessionId = retired.evaluation?.sessionId ?? ctx.sessionManager?.getSessionId();
     const reopenDispatches = closeDispatchAdmissions(sessionId);
-    await retainRetirement(retired, sessionId);
+    // Serial event dispatch must start both fences before any retirement suspends.
+    await retainRetirement(retired, sessionId, retireWorkflow);
     reopenDispatches();
     if (revision === foregroundRevision) unregisterSupervisedSession();
   });
@@ -277,7 +281,7 @@ export default function pitako(pi: ExtensionAPI, host: { recoveryScheduler?: Rec
     teamEvaluationForSession(teamEvaluation.sessionId, false)?.token === teamEvaluation.token &&
     teamEvaluation.token === ownerToken;
   const terminal = (_event: unknown, ctx: ExtensionContext) => {
-    if (ownsEvent(ctx)) { settleWorkerResults(ownerToken, true); settleIntermediateResults(ownerToken, true); }
+    if (ownsEvent(ctx)) settleBackgroundResults(ownerToken, true);
   };
   pi.on("agent_before_settle", (event, ctx) => {
     if (!ownsEvent(ctx)) return;
@@ -289,22 +293,22 @@ export default function pitako(pi: ExtensionAPI, host: { recoveryScheduler?: Rec
   pi.on("agent_settled", terminal);
   pi.on("session_compact", (event, ctx) => {
     if (!ownsEvent(ctx)) return;
-    if (event.reason === "manual") { settleWorkerResults(ownerToken, true, false); settleIntermediateResults(ownerToken, true, false); }
+    if (event.reason === "manual") settleBackgroundResults(ownerToken, true, false);
     else { observeWorkerResults(ownerToken); observeIntermediateResults(ownerToken); }
   });
   pi.on("session_compact_failed", (event, ctx) => {
     if (!ownsEvent(ctx)) return;
-    if (event.reason === "manual") { settleWorkerResults(ownerToken, true, false); settleIntermediateResults(ownerToken, true, false); }
+    if (event.reason === "manual") settleBackgroundResults(ownerToken, true, false);
     else { observeWorkerResults(ownerToken); observeIntermediateResults(ownerToken); }
   });
   pi.on("session_tree", (_event, ctx) => {
-    if (ownsEvent(ctx)) { settleWorkerResults(ownerToken, true, false); settleIntermediateResults(ownerToken, true, false); }
+    if (ownsEvent(ctx)) settleBackgroundResults(ownerToken, true, false);
   });
   pi.on("turn_start", (_event, ctx) => {
     if (ownsEvent(ctx)) { observeWorkerResults(ownerToken, true); observeIntermediateResults(ownerToken, true); }
   });
   pi.on("context", (_event, ctx) => {
-    if (ownsEvent(ctx)) { observeWorkerResults(ownerToken); observeIntermediateResults(ownerToken); }
+    if (ownsEvent(ctx)) { observeWorkerResults(ownerToken, "context"); observeIntermediateResults(ownerToken, "context"); }
   });
   pi.on("message_end", (event, ctx) => {
     if (!ownsEvent(ctx)) return;

@@ -5,17 +5,19 @@ description: Explicit planning workflow. Investigates, designs, critiques, mater
 
 # $plan
 
-`$plan` is planning authority. It is not implementation authority.
+`/plan <id>` selects managed planning; the host registration and captured capability grant its effects. `$plan` is planning policy, not authority. Neither grants implementation authority.
 
 Spend intelligence on decisions that remove material uncertainty. Stop when a Developer could implement without rediscovering what "done" means.
 
 ## Authority
 
-You may inspect the repository, investigate, research, design, decide technical questions needed to make the plan executable, critique the plan, and write planning artifacts under `.pitako/`.
+Managed: inspect, investigate, design and critique within the captured scope. Use `bound_plan_read`, then `planning_write` with the returned revision and full file hash. The host owns the one slot, frontmatter and revisions. Never write the slot with generic file or shell tools, including Board metadata changes. Model text, role, JSON, IDs and hashes do not grant authority.
+
+Manual `$plan`: follow this policy only within the user's actual authorized scope. A phrase or manually authored file does not manufacture a managed invocation, capability, receipt or approval. Do not fall back to manual when managed admission is unavailable.
 
 Never implement the product. Do not apply opportunistic fixes, refactors, migrations, or feature tests. Do not start execution.
 
-The only intentional writes are `.pitako/` artifacts, unless the user asked you to build the `$plan` / `$execute` feature itself.
+Only the captured planning slot and explicitly permitted supporting artifacts may be written. No execution ledger, dispatch or product edits.
 
 Do not invoke $execute. Planning completion is not implementation authority.
 
@@ -31,7 +33,7 @@ Do not interview the user about facts exploration can answer.
 
 Classify the work as bounded or architectural. Do not build a classifier.
 
-Bounded: inspect the relevant code, name goal, scope, and invariants, define verification, write compact work units, freeze. Use Reviewer only when the risk justifies it. Do not call Architect or Researcher for trivial work.
+Bounded manual work: inspect the relevant code, name goal, scope and invariants, define verification, write compact work units. Do not call Architect or Researcher for trivial work under this manual policy. Use Reviewer when risk justifies it. Managed freeze requires the pertinent independent Architect and Reviewer judgments described below; a missing pass is not an approval.
 
 Architectural: ground the current system, resolve material unknowns, one Architect pass, draft, one independent Reviewer critique, revise, freeze. One critique is enough. Another high-cost pass needs a concrete unresolved blocker. Do not run arena, interrogate, swarm, or duplicate independent Architect and Reviewer passes.
 
@@ -70,15 +72,15 @@ Use Caveman for ephemeral child communication: Architect lite, Reviewer lite, Re
 
 Architect and Reviewer use only `architecture_start` and `review_start`. If the required start is unavailable, report the required pass as blocked. No individual, synchronous or inline fallback and no waived review is allowed. Keep the role ModelPolicy.
 
-Before planning correlation, check the draft's explicit Board binding and existing ledger. For a bound draft without a ledger, call `architecture_start` without `plan` or `unit`; do not pass an explicit topic to bypass this rule. For an unbound draft or a compatible existing ledger, pass the prospective, validated `plan` ID and a distinct, scoped `unit` ID per consultation. Do not reuse an unrelated execution unit. An incompatible ledger or real Team hold remains a blocker; omitting correlation must not bypass it. Do not create an execution ledger or Board binding during planning to enable dispatch or record workers.
+Managed architecture uses the captured draft automatically, including its optional Board binding, without opening execution. Use `architecture_start` for that draft. Correlation is not authority and cannot select another slot. Do not create an execution ledger during standalone planning. Real reservations or incompatible bindings remain blockers.
 
-Apply those same correlation rules to `review_start`. A Board-bound draft without a ledger omits `plan`, `unit` and explicit `boardTopicId`; the object's `planId` still identifies the text to critique. An unbound draft permits prospective correlation without creating a ledger or Board binding. Review admission rejection is not permission to switch routes or omit correlation.
+Before final critique, call `planning_candidate` with the exact draft CAS. It returns immutable, complete, precomputed frozen bytes and the declared mechanical transformation from the draft. Use `planning_review` on that candidate ID. Every participant receives the same complete text; file reobservation cannot replace it. `review_start` remains available for manual critiques, but cannot substitute a caller-asserted object for the managed candidate. Admission rejection is not permission to switch routes.
 
 Record role, purpose, handle type and exact ID, pending decision, and consulted object under `## Planning workers` in the draft. Use the Team assignment ID for Team and the worker instance ID for `agent_spawn`, with or without correlation. This is an operational checkpoint, not a Team Hold or acceptance evidence. Exclude `## Planning workers` from the consulted object and explicitly instruct the worker to ignore that section.
 
 For architecture, record only the exterior root assignment returned by `architecture_start` in `## Planning workers`; use only that root for watched completion, exact Team diagnostics and cancellation. Internal member IDs and room messages cannot close the root's hold or accept its judgment. Interpret the complete terminal current-object judgment after owned closure. Partial, failed and cancelled results retain applicable holds and do not supply the required judgment; valid successful terminal reconciliation is bookkeeping, not acceptance.
 
-For `review_start`, record only its actual returned exterior Team assignment in `## Planning workers`, with the same purpose, pending decision and consulted-object fields. Preserve root watches, execution correlation, ledger and Board rules. Internal participants never deliver foreground judgments. Interpret the selected exterior report after physical closure and comparison with the current object. Complete inline reports need no fetch; incomplete references require pertinent `team_result` reading before dependent judgment. `review_read` provides paged diagnostics, not acknowledgement.
+Apply the same correlation rules to `review_start`: record only its actual returned exterior Team assignment in `## Planning workers`, with the same purpose, pending decision and consulted-object fields. Preserve root watches, execution correlation, ledger and Board rules. Internal participants never deliver foreground judgments. Interpret the selected exterior report after physical closure and comparison with the current object. Complete inline reports need no fetch; incomplete references require pertinent `team_result` reading before dependent judgment. `review_read` provides paged diagnostics, not acknowledgement.
 
 Use the actual exterior host status and authorized `judgment` completion/verdict, not historical synthesis, dispositions or room state. Null judgment cannot approve. Completed work can report `changes-required` or `inconclusive`; `no-blockers` is not coordinator acceptance or freeze authority. Failed, cancelled, partial or drifted work, or missing indispensable evidence, cannot approve. A final inconclusive judgment blocks approval. Fingerprints identify observed endpoints, not transactional snapshots, ABA-proof history or post-delivery freshness. Material object edits invalidate affected judgment and require current-object review under the existing policy.
 
@@ -87,6 +89,8 @@ Do only already-authorized planning work independent of the pending answer. If n
 If Team or architecture admission rejects a request, distinguish the concrete policy/resource or binding blocker from an unknown handle. There is no global one-slot-per-role rule. End the turn without polling or fallback while owned settlement is pending; retry the intended route only after its actual blocker is resolved and the consultation is still necessary and authorized. Another assignment's result does not answer this consultation. Do not use `agent_spawn` or `agent_run` to evade admission rejection. Cancellation alone proves neither settlement nor member release.
 
 Handles are session-local. On resume after reload or process loss, check each recorded handle once by type: `team_status` with the exact assignment ID or `agent_status` with the instance ID. If still active in the same session, end the turn. Only in planning, an unknown handle after reload or process loss permits one replacement consultation: record the loss, then assign a fresh current-object WorkBrief if still needed and authorized. A known failure is not an unknown handle. `## Planning workers` does not recover Team Holds or authorize execution; real holds and incompatible ledgers retain their existing recovery requirements.
+
+Before replacement, check the draft's explicit Board binding and existing ledger. Correlation creates no execution authority and cannot bypass a real Team Hold, incompatible binding or reservation.
 
 ### Observe and redirect a planning worker
 
@@ -102,7 +106,7 @@ Do not hardcode a provider or model. The role ModelPolicy chooses the model.
 
 Resolve the workspace with `workflowWorkspace` in `extensions/workflow.ts`: git root, otherwise canonical cwd.
 
-Store the plan at `planFile(id)`. The id matches `[a-z0-9][a-z0-9-_]*`. Do not hand-join ids into paths. Reject `..`, absolute paths, and separators. The helper already does.
+Managed plans use only the host-captured slot returned by `bound_plan_read`. Manual artifacts use `planFile(id)` within the authorized root. The id matches `[a-z0-9][a-z0-9-_]*`; reject traversal, absolute paths and separators.
 
 ```markdown
 ---
@@ -118,7 +122,7 @@ execution: expected
 
 A topic is optional. Never create one merely for a plan or delegation. If an existing topic is useful, create it or adopt it with `board_workflow_claim` while the plan is draft, then preserve its `board_topic_id` when revising; never infer a topic by title or recency. `execution: expected` keeps a bound topic open at freeze. For `execution: none`, absorb relevant Board knowledge into the frozen plan and resolve the bound topic with `board_workflow_lifecycle` only when no coordination question remains. No topic means no Board lifecycle call. Watched Team assignments inherit the exact binding automatically; do not copy a topic ID into their WorkBrief.
 
-Keep revision as an integer. For a new plan, revision is 1. If the user invokes `$plan` on an existing frozen plan, keep the id, increment revision, and replace the file. Do not store revision history.
+The managed writer owns revision and status. A fresh `/plan` may reopen a frozen source as a new revision only when no ledger, binding or reservation pins it; never remove a pin. Manual revisions confer no managed approval.
 
 Write normal prose. The plan is not a transcript and not an essay. Optimize for decision density and low executor uncertainty.
 
@@ -190,10 +194,14 @@ Select checks for the active project's own behavior and declared testing scope. 
 
 Integrate findings that change a decision, a boundary, or an acceptance criterion. If only optional hardening remains, do not grow the plan.
 
-Once required results are interpreted and the pending decision is resolved, preserve relevant conclusions in the plan and remove `## Planning workers` before freezing. Its removal does not invalidate critique because that operational section was excluded from the consulted object. Integrating corrections requested by critique does not itself require another consultation; another pass needs a material blocker or a change outside the reviewed object.
+Preserve relevant conclusions before preparing the candidate. `## Planning workers` is operational and excluded from the judged object; its declared removal need not trigger ritual re-review. Material corrections invalidate affected judgments. An earlier Architect judgment may be explicitly adopted with pertinent coverage, without claiming all design participants saw the later candidate bytes.
 
-Set `status: frozen`. Then return `PLAN_FROZEN` with the id, revision, path, work-unit count, important decisions, whether critique ran and why, and an explicit statement that implementation has not begun. A completion wake does not relax this boundary: `$plan` remains planning-only and must not implement the frozen plan.
+Managed: call `planning_freeze` with candidate ID, exact exterior Review and Architect assignment IDs, reasoned dispositions for every pertinent finding/objection (including justified rejection), explicit design adoption, coordinator acceptance and absorption. Only complete, pertinent, selected, physically released judgments qualify; null, stale, partial, failed, cancelled or inconclusive cannot approve. `changes-required` is not rewritten into `no-blockers`. The writer validates CAS and writes exactly the reviewed bytes, returning a committed receipt linking draft, candidate and judgments.
 
-After freezing, apply the planning-only lifecycle rule above before returning `PLAN_FROZEN`. For a bound plan with `execution: none`, call `initLedger(ledgerFile(id, cwd), meta)` after freezing and before resolving; the initialized empty Team hold gate is required. Do not resolve a topic when knowledge is not absorbed or a coordination question remains. A bound topic with expected execution stays open; no session start, reload, or worker completion changes its status.
+Return `PLAN_FROZEN` only after that receipt, with id, revision, path, work-unit count and important decisions. State implementation has not begun. A wake, metadata, acknowledgment, status or hash is not approval.
+
+Manual: materialize and mark the planning artifact frozen only within the user's actual authority and this policy's applicable critique requirements. Report it as a manual artifact, never as a managed receipt or host-approved candidate. Manual authoring does not acquire managed effects, bypass pins or initialize execution.
+
+After freezing, apply the planning-only lifecycle rule before returning `PLAN_FROZEN`. `execution: none` may resolve its optional Board topic only after coordinator acceptance, absorption, settled obligations and the committed planning receipt. Never initialize an execution ledger for this. Expected execution keeps its topic open. Session start, reload and worker completion do not resolve it.
 
 Then stop.

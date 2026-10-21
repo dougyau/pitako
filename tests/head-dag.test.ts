@@ -3,7 +3,8 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeF
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import type { ExtensionAPI, ExtensionContext, ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+import type { ExtensionAPI, ExtensionContext, ExtensionFactory, ExtensionToolContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { HeadAttachment, type HeadDagOptions } from "../extensions/agent/head/runtime.ts";
 import { HeadGraph } from "../extensions/agent/head/graph.ts";
 import { developerCapacityPreflight } from "../extensions/agent/routing.ts";
@@ -12,6 +13,7 @@ import { runAgentInstance } from "../extensions/agent/run.ts";
 import { loadPitakoConfig } from "../extensions/roles/load.ts";
 import { providerFixtureOwnership } from "./fixtures/provider-fixture-ownership.ts";
 import { controlledPi } from "./fixtures/pi-factories.ts";
+import { bindCallContext, captureCallContext } from "../extensions/workflow-engine.ts";
 
 const fixture = providerFixtureOwnership();
 const deferred = () => Promise.withResolvers<void>();
@@ -39,12 +41,17 @@ type Leaf = {
 };
 async function harness(options: { maxParallel?: number; preflight?: HeadDagOptions["preflight"]; rootAlias?: boolean;
   gitRepository?: boolean;
+  inlineWorkers?: boolean; workerExtensions?: NonNullable<Parameters<typeof controlledPi>[1]>["extensions"];
   leafFallback?: boolean; workerPrompt?: NonNullable<Parameters<typeof controlledPi>[1]>["prompt"];
   prepareWorkers?: (workers: ReturnType<typeof controlledPi>) => void } = {}) {
   const ownedRoot = mkdtempSync(path.join(tmpdir(), "pitako-head-dag-"));
   fixture.directories.push(ownedRoot);
   if (options.gitRepository) {
     execFileSync("git", ["init", "--quiet", ownedRoot]);
+    // Match the checkout's private host-metadata boundary. WAL mutations are
+    // not product source contributions from the granted leaves.
+    writeFileSync(path.join(ownedRoot, ".gitignore"), "/.pitako/runs/\n");
+    execFileSync("git", ["-C", ownedRoot, "add", "--", ".gitignore"]);
     execFileSync("git", ["-C", ownedRoot, "-c", "user.name=Fixture", "-c", "user.email=fixture@invalid", "commit", "--quiet", "--allow-empty", "-m", "admission"]);
   }
   const root = options.rootAlias ? path.join(ownedRoot, "checkout") : ownedRoot;
@@ -77,9 +84,10 @@ max_parallel = ${options.maxParallel ?? 3}
   const starts: string[] = [];
   const leafLocals = new Map<object, Local>();
   const workers = controlledPi(agentDir, {
+    inlineExtensions: options.inlineWorkers, extensions: options.workerExtensions,
     bind: async session => {
       const index = workers.sessionInputs.findIndex(input => input.sessionManager === session.sessionManager);
-      const local = await bind(workers.loaderInputs[index].extensionFactories,
+      const local = options.inlineWorkers ? { tools: session.boundTools, events: session.hooks } : await bind(workers.loaderInputs[index].extensionFactories,
         (type, data) => { session.sessionManager.appendCustomEntry(type, data); });
       for (const tool of workers.sessionInputs[index].customTools ?? []) local.tools.set(tool.name, tool);
       leafLocals.set(session, local);
@@ -88,10 +96,11 @@ max_parallel = ${options.maxParallel ?? 3}
     },
     prompt: async (session, task) => {
       if (options.workerPrompt) return options.workerPrompt(session, task);
-      const parsed = JSON.parse(task);
+      const projection = JSON.parse(task).projection as string;
+      const parsed = JSON.parse(projection);
       const id = parsed.brief.match(/Implement (\w+)/)?.[1] ?? parsed.brief;
       const leaf = get(id);
-      leaf.session = session; leaf.task = task; leaf.local = leafLocals.get(session)!;
+      leaf.session = session; leaf.task = projection; leaf.local = leafLocals.get(session)!;
       starts.push(id);
       for (const event of leaf.local.events.get("turn_start") ?? []) await event({});
       leaf.entered.resolve();
@@ -286,7 +295,8 @@ test("invalid transactions and mixed start batches have zero partial admissions;
   h.get("ok").session.sessionId = "replaced-native-session";
   await expect(h.call("head_observe", own)).rejects.toThrow("native");
   await expect(h.call("head_input", { ...own, intent: "query", text: "old identity" })).rejects.toThrow("native");
-  expect(() => h.get("ok").local!.tools.get("head_scope_ack")!.execute("current", { action: "current" })).toThrow("retired");
+  expect(() => h.get("ok").local!.tools.get("head_scope_ack")!.execute("current", { action: "current" },
+    undefined, undefined, { cwd: h.root, sessionManager: h.get("ok").session.sessionManager })).toThrow("retired");
   await h.finish();
 }));
 
@@ -486,8 +496,14 @@ test("same-session continuation tolerates independent graph edits but rejects re
     }
   }));
 
-test("active split negotiates receipt, leaf ack, and confirmation; original writes remain reserved until donor closure", fixture.ownedCase("DAG negotiated split", async () => {
-  const h = await harness();
+for (const inlineWorkers of [false, true]) {
+test(`active split negotiates receipt, leaf ack, and confirmation; original writes remain reserved until donor closure (${inlineWorkers ? "managed loader" : "direct registration"})`, fixture.ownedCase("DAG negotiated split", async () => {
+  let foreignCalls = 0;
+  const foreign = { name: "head_scope_ack", label: "foreign", description: "same name is not authority",
+    parameters: Type.Object({}), async execute() { foreignCalls++; return { content: [], details: {} }; } };
+  const foreignTools = new Map<string, { definition: ToolDefinition }>([["head_scope_ack", { definition: foreign }]]);
+  const h = await harness({ inlineWorkers, gitRepository: inlineWorkers,
+    workerExtensions: inlineWorkers ? [{ resolvedPath: "foreign-scope-extension", tools: foreignTools }] : undefined });
   await h.edit([node("donor", ["shared"])]);
   const [donor] = await h.start(["donor"]);
   await h.get("donor").entered.promise;
@@ -497,8 +513,31 @@ test("active split negotiates receipt, leaf ack, and confirmation; original writ
   expect((await h.read()).revision).toBe(1);
   const observation = await h.call("head_observe", identity);
   const progressEntry = h.get("donor").session.sessionManager.appendCustomEntry("leaf.progress", { done: "observed bounded progress" });
+  const session = h.get("donor").session;
+  const ctx = { cwd: h.root, sessionManager: session.sessionManager };
+  const leafTool = h.get("donor").local!.tools.get("head_scope_ack")!;
   const leafCall = async (params: unknown) =>
-    (await h.get("donor").local!.tools.get("head_scope_ack")!.execute("ack", params)).details;
+    (await leafTool.execute("ack", params, undefined, undefined, ctx)).details;
+  if (inlineWorkers) {
+    await expect(Promise.resolve().then(() => foreignTools.get("head_scope_ack")!.definition.execute(
+      "foreign", {}, undefined, undefined, ctx as ExtensionToolContext))).rejects.toThrow("Unsupported managed definition/composition");
+    expect(foreignCalls).toBe(0);
+    const captured = captureCallContext(h.root, session.sessionManager);
+    bindCallContext(session.sessionManager, { kind: "managed-unavailable", reason: "fixture context retired" });
+    try {
+      await expect(leafCall({ action: "current" })).rejects.toThrow("fixture context retired");
+    } finally {
+      bindCallContext(session.sessionManager, captured);
+    }
+    const sessionId = session.sessionId;
+    session.sessionId = "foreign-native-session";
+    try {
+      await expect(leafCall({ action: "current" })).rejects.toThrow("leaf scope binding is retired");
+    } finally {
+      session.sessionId = sessionId;
+    }
+  }
+  expect((await leafCall({ action: "current" })).effectiveRevision).toBe(1);
   const next = node("donor", ["shared/remaining"]);
   const additions = [node("disjoint"), node("transfer", ["shared/transferred"])];
   // An explanation never expands the outer grant; the narrower fixture checks actual outside paths too.
@@ -514,6 +553,8 @@ test("active split negotiates receipt, leaf ack, and confirmation; original writ
   expect(proposal.acknowledgment).toBeUndefined();
   await expect(h.call("head_plan", { action: "confirm", ...identity, proposalId: proposal.proposalId })).rejects.toThrow("not acknowledged");
   await expect(leafCall({ action: "ack", proposalId: "foreign", effectiveRevision: 1, accept: true, progress: [progressEntry] })).rejects.toThrow("foreign");
+  await expect(leafCall({ action: "ack", proposalId: proposal.proposalId, effectiveRevision: 0,
+    accept: true, progress: [progressEntry] })).rejects.toThrow("stale");
   await expect(leafCall({ action: "ack", proposalId: proposal.proposalId, effectiveRevision: 1,
     accept: true, progress: ["invented progress"] })).rejects.toThrow("native branch");
   const ack = await leafCall({ action: "ack", proposalId: proposal.proposalId, effectiveRevision: 1,
@@ -547,7 +588,9 @@ test("active split negotiates receipt, leaf ack, and confirmation; original writ
     steeringReceipt: proposal.receipt.status, acknowledgment: ack.acknowledgment, confirmedRevision: confirmed.effectiveRevision,
     originalWrites: (await h.result(donor.runId)).originalWrites, starts: h.starts }));
   await h.finish();
+  await expect(leafCall({ action: "current" })).rejects.toThrow("retired");
 }));
+}
 
 test("active dependents preserve satisfied prerequisites; cancellation invalidates proposals and joins steering callbacks", fixture.ownedCase("DAG scoped cancellation", async () => {
   const h = await harness();
@@ -575,7 +618,8 @@ test("active dependents preserve satisfied prerequisites; cancellation invalidat
   const proposalId = (await h.result(dependent.runId)).proposals[0].proposalId;
   h.head.revoke();
   expect(() => leafTool.execute("ack", { action: "ack", proposalId, effectiveRevision: 1,
-    accept: true, progress: [progressEntry] })).toThrow("retired");
+    accept: true, progress: [progressEntry] }, undefined, undefined,
+    { cwd: h.root, sessionManager: h.get("dependent").session.sessionManager })).toThrow("retired");
   h.get("dependent").finish.resolve();
   let settled = false;
   void h.run.then(() => { settled = true; });

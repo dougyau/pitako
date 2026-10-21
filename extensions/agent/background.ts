@@ -11,16 +11,20 @@ import type { ExecutionBinding } from "../workflow.ts";
 import type { LiveHandle } from "./live.ts";
 import { randomUUID } from "node:crypto";
 import { PublicConversation } from "./public-conversation.ts";
-import { AgentClosureError, type AgentClosure } from "./closure.ts";
+import { AgentClosureError, hasUnknownClosure, type AgentClosure } from "./closure.ts";
 import { dispatchAdmissionsClosed } from "./dispatch.ts";
 import type { HeadAttachment } from "./head/runtime.ts";
 import { sealPages, type SealedPages, type TableRead, type TableRootRegistration } from "../table/results.ts";
 import { startTableArchive, type TableArchive } from "../table/archive.ts";
+import { deliveryContent, type DeliverySource } from "./provenance.ts";
+import { captureCallContext, checkCallContext, withCallContext, registerBackgroundAttempt,
+  reconcileTeamHold, captureResultSource, type CapturedWakeSource, type CallContext, type BackgroundAttempt, type ReleaseReceipt } from "../workflow-engine.ts";
 
 export interface WorkerInterest {
   planId: string;
   unitId: string;
   execution?: ExecutionBinding;
+  unavailable?: string;
 }
 
 export interface TeamMetadata {
@@ -60,7 +64,7 @@ export interface BackgroundOwner {
   isIdle: () => boolean;
   hasUI: boolean;
   notify: (message: string) => void;
-  sendMessage: (content: string) => void;
+  sendMessage: (content: string, source: CapturedWakeSource) => void;
   appendResult?: (message: ResultMessage) => void;
   appendIntermediate?: (message: IntermediateMessage) => void;
   getBranch?: () => readonly unknown[];
@@ -94,7 +98,9 @@ export interface IntermediateMessage {
   details: { deliveryId: string; roomId: string; assignmentId: string; instanceId: string; turnId: string };
 }
 interface Intermediate {
+  source: CapturedWakeSource;
   message: IntermediateMessage;
+  readonly wake: string;
   delivery: WorkerHandoff["delivery"];
   continuation: WorkerHandoff["continuation"];
   deliveryAttempts: number; wakeAttempts: number; outstanding: boolean; busyContinuation: boolean;
@@ -113,7 +119,9 @@ export interface WorkerHandoff {
 }
 
 interface Handoff extends WorkerHandoff {
+  source: CapturedWakeSource;
   readonly message: ResultMessage;
+  readonly wake: string;
   bookkeepingAttempts: number;
   deliveryAttempts: number;
   wakeAttempts: number;
@@ -125,6 +133,9 @@ interface Handoff extends WorkerHandoff {
 type SignalState = "pending" | "dropped";
 
 interface Row extends TeamMetadata {
+  resultWaits?: { source: CapturedWakeSource; wake: string; requested: boolean }[];
+  durable: BackgroundAttempt;
+  durableSettled?: boolean;
   tableRoot?: { registration: TableRootRegistration; resultId: string; sealed?: SealedPages; cut?: SealedPages; archive?: TableArchive };
   tableProtocol?: "architecture" | "review";
   architectureSelectedDriver?: AgentRunResult;
@@ -147,7 +158,7 @@ interface Row extends TeamMetadata {
   teamAssignmentId?: string;
   onTeamSettled?: (status: WorkerStatus) => void;
   deliveryOwner?: BackgroundOwner;
-  reconcileBookkeeping?: (result: AgentRunResult) => void;
+  reconcileBookkeeping?: (result: AgentRunResult, receipt?: ReleaseReceipt) => void;
   handoff?: Handoff;
   ownerToken?: symbol;
   coordinatorSessionId?: string;
@@ -167,6 +178,8 @@ interface Row extends TeamMetadata {
 }
 
 interface Bag {
+  settledOwners?: Set<symbol>;
+  continuationBatch?: { token: symbol; attempted: boolean };
   rows: Map<string, Row>;
   owner?: BackgroundOwner;
   teamOwners?: Map<symbol, BackgroundOwner>;
@@ -174,6 +187,9 @@ interface Bag {
   executor?: AttemptExecutor;
   recoveries?: Map<BackgroundOwner, { timer: OwnerRecovery; sessionId?: string; revision?: number; retired?: boolean }>;
 }
+type WorkerDraftEntry = (ResultMessage & { type: "custom_message" }) |
+  { type: "custom_message"; customType: "pitako.worker"; content: string; display: false;
+    details: Pick<ResultMessage["details"], "deliveryId" | "instanceId"> };
 
 const KEY = Symbol.for("pitako.backgroundWorkers");
 
@@ -237,6 +253,7 @@ export function clearBackgroundOwner(): void {
 /** Retire admission authority without aborting or pretending to join workers. */
 export function revokeBackgroundOwner(token: symbol): void {
   const state = bag();
+  state.settledOwners?.delete(token);
   for (const row of state.rows.values()) if (row.ownerToken === token) row.conversation?.retire();
   removeOwnerTerminalActivity(token);
   for (const owner of state.recoveries?.keys() ?? []) if (owner.token === token) stopRecovery(owner);
@@ -256,6 +273,7 @@ export interface SpawnInput {
   roleId: string;
   task: string;
   cwd: string;
+  context?: CallContext;
   architecture?: AgentRunInput["architecture"];
   table?: AgentRunInput["table"];
   recipient?: Recipient;
@@ -274,12 +292,21 @@ export interface SpawnInput {
   now?: () => number;
   maintained?: boolean;
   teamOwner?: { token: symbol; assignmentId: string; teamId?: string; memberId?: string; onSettled: (status: WorkerStatus) => void };
-  reconcileBookkeeping?: (result: AgentRunResult) => void;
+  reconcileBookkeeping?: (result: AgentRunResult, receipt?: ReleaseReceipt) => void;
 }
 
 export async function spawnBackground(input: SpawnInput): Promise<WorkerHandle> {
   input.check?.();
   if (input.foreground?.aborted) throw new Error("agent_spawn cancelled");
+  const sourceContext = input.reservation?.durable.context ?? input.context ?? captureCallContext(input.cwd);
+  checkCallContext(sourceContext);
+  const instanceId = input.reservation?.instanceId ?? createInstanceId(input.roleId);
+  const durable = input.reservation?.durable ?? registerBackgroundAttempt(sourceContext, {
+    cwd: input.cwd, instanceId, dispatchId: randomUUID(), roleId: input.roleId,
+    assignmentId: input.teamOwner?.assignmentId, watch: input.watch,
+  });
+  const context = durable.context;
+  if (!input.reservation) durable.admit();
   const controller = input.reservation?.controller ?? new AbortController();
   const now = input.now ?? Date.now;
   const epoch = observationEpoch();
@@ -296,7 +323,7 @@ export async function spawnBackground(input: SpawnInput): Promise<WorkerHandle> 
     consultation: input.consultation,
     architecture: input.architecture,
     table: input.table,
-    reservedInstanceId: input.reservation?.instanceId,
+    reservedInstanceId: instanceId,
     head: input.head,
     signal: controller.signal,
     executor: {
@@ -351,6 +378,7 @@ export async function spawnBackground(input: SpawnInput): Promise<WorkerHandle> 
       if (input.foreground?.aborted) throw new Error("agent_spawn cancelled");
       if (input.reservation && instance.id !== input.reservation.instanceId) throw new Error("reserved worker identity mismatch");
       row = input.reservation ?? {
+        durable, preparationSettled: true,
         instanceId: instance.id,
         roleId: instance.roleId,
         acceptedAt: now(),
@@ -437,10 +465,20 @@ export async function spawnBackground(input: SpawnInput): Promise<WorkerHandle> 
     return { instanceId: row.instanceId, roleId: row.roleId, status: "running", watch: !!row.interest,
       teamId: row.teamId, memberId: row.memberId, dispatchId: row.dispatchId, dispatchPhase: row.dispatchPhase };
   }
-  const pending = runAgentInstance(runInput);
+  const pending = withCallContext(context, () => runAgentInstance(runInput));
   if (!row) {
-    await pending;
-    throw new Error("agent_spawn did not accept");
+    let failure: unknown;
+    let rejected: AgentRunResult | undefined;
+    try { rejected = await pending; } catch (error) { failure = error; }
+    const error = failure ?? new Error(rejected?.result || "agent_spawn did not accept");
+    if (!input.reservation) {
+      durable.result({ status: "failed", result: String(error) });
+      const fact = hasUnknownClosure(error) ? "unknown" : "closed";
+      durable.producer.observe("preparation", fact);
+      durable.producer.observe("host-operation", fact);
+      durable.producer.observe("callback", fact, true);
+    }
+    throw error;
   }
   const accepted = row;
   void pending.then(
@@ -459,9 +497,10 @@ export async function spawnBackground(input: SpawnInput): Promise<WorkerHandle> 
         result: error instanceof Error ? error.message : String(error),
       }, epoch);
     },
-  ).then(completion.resolve, error => {
+  ).then(() => { completion.resolve(); if (!input.reservation) finalizeAttempt(accepted); }, error => {
     accepted.closure = { state: "unknown", reason: String(error) };
     completion.resolve();
+    if (!input.reservation) finalizeAttempt(accepted);
   });
   return {
     instanceId: accepted.instanceId,
@@ -473,6 +512,9 @@ export async function spawnBackground(input: SpawnInput): Promise<WorkerHandle> 
 
 /** Reserve before external work; the captured owner's macrotask cannot overtake the caller's continuation. */
 export function reserveBackground(input: {
+  cwd: string;
+  context?: CallContext;
+  watch?: WorkerInterest;
   roleId: string;
   coordinatorSessionId?: string;
   origin?: import("./history.ts").HistoryOrigin;
@@ -488,11 +530,22 @@ export function reserveBackground(input: {
   if (dispatchAdmissionsClosed(input.coordinatorSessionId)) throw new Error("Dispatch cancelled before admission");
   const owner = input.teamOwner ? bag().teamOwners?.get(input.teamOwner.token) : bag().owner;
   if (!owner || owner.owns && !owner.owns() || !input.owns()) throw new Error("background owner unavailable or retired");
+  const sourceContext = input.context ?? captureCallContext(input.cwd);
+  const instanceId = createInstanceId(input.roleId), dispatchId = randomUUID();
+  const durable = registerBackgroundAttempt(sourceContext, { cwd: input.cwd, instanceId, dispatchId, roleId: input.roleId,
+    assignmentId: input.teamOwner?.assignmentId, watch: input.watch, archive: !!input.tableRoot });
+  const context = durable.context;
+  try { durable.admit(); }
+  catch (error) {
+    durable.result({ status: "failed", result: String(error) });
+    durable.producer.observe("preparation", "unknown");
+    throw error; // Retain the pre-Row attempt, hold and projection diagnostics.
+  }
   const controller = new AbortController();
   const completion = Promise.withResolvers<void>();
   const ready = Promise.withResolvers<void>();
-  const row: Row = { tableRoot: input.tableRoot && { registration: input.tableRoot, resultId: randomUUID() },
-    recipient: input.recipient, instanceId: createInstanceId(input.roleId), roleId: input.roleId, dispatchId: randomUUID(),
+  const row: Row = { durable, tableRoot: input.tableRoot && { registration: input.tableRoot, resultId: randomUUID() },
+    recipient: input.recipient, instanceId, roleId: input.roleId, dispatchId,
     dispatchPhase: "preflight", workerStarted: false, acceptedAt: Date.now(), controller,
     ownerToken: owner.token, deliveryOwner: owner, coordinatorSessionId: input.coordinatorSessionId,
     teamOwnerToken: input.teamOwner?.token, teamAssignmentId: input.teamOwner?.assignmentId,
@@ -503,6 +556,7 @@ export function reserveBackground(input: {
   bag().rows.set(row.instanceId, row);
   refreshRecovery(owner);
   const check = () => {
+    checkCallContext(context);
     if (controller.signal.aborted || dispatchAdmissionsClosed(input.coordinatorSessionId) || !liveOwner(row) || !input.owns()) {
       controller.abort(); throw new Error("Dispatch cancelled before admission");
     }
@@ -511,12 +565,13 @@ export function reserveBackground(input: {
     teamId: row.teamId, memberId: row.memberId,
     phase: "working", acceptedAt: row.acceptedAt, selectedModel: "unknown", lastActivityKind: "preflight",
     origin: input.origin, ownerToken: owner.token, teamOwnerToken: input.teamOwner?.token });
-  setImmediate(() => {
+  withCallContext(context, () => setImmediate(() => {
     void (async () => {
       try {
         const prepared = await input.prepare(controller.signal, check, { instanceId: row.instanceId, dispatchId: row.dispatchId!,
           record(record) { row.consultation = record; }, current: () => liveOwner(row) && input.owns() });
         check();
+        durable.checkProjection();
         await spawnBackground({ ...prepared, reservation: row, check, foreground: controller.signal });
         ready.resolve();
         await row.run;
@@ -537,13 +592,54 @@ export function reserveBackground(input: {
         row.preparationSettled = true;
         ready.resolve();
         completion.resolve();
+        finalizeAttempt(row);
         releaseNoWorker(row);
         observeArchitectureRow(row);
       }
     })();
-  });
+  }));
   return { teamId: row.teamId, memberId: row.memberId, instanceId: row.instanceId, dispatchId: row.dispatchId, roleId: row.roleId,
     status: "running", watch: false, dispatchPhase: "preflight" };
+}
+
+function finalizeAttempt(row: Row): void {
+  if (row.durableSettled || !row.preparationSettled) return;
+  row.durableSettled = true;
+  const fact = row.closure.state === "released" && !row.live ? "closed" : "unknown";
+  const producer = row.durable.producer;
+  producer.observe("preparation", fact);
+  producer.observe("host-operation", fact);
+  producer.observe("callback", fact, true);
+  // A preflight failure has no canonical report and never started the auxiliary operation.
+  if (row.durable.archive && !row.tableRoot?.archive) {
+    row.durable.archive.observe("host-operation", "closed");
+    row.durable.archive.observe("callback", "closed", true);
+  }
+  reconcileDurableHold(row);
+  if (row.handoff?.bookkeeping === "pending") reconcileBookkeeping(row);
+  if (row.handoff) publishHandoff(row);
+  if (!row.durable.receipt()) {
+    // Finalization may precede a guarded child's physical closure. Consume only
+    // the original attempt's committed receipt, not the child's notification.
+    const stop = row.durable.store.subscribe(() => {
+      if (!row.durable.receipt()) return;
+      stop(); // Reconciliation itself commits facts; do not reenter this sink.
+      reconcileDurableHold(row);
+      if (row.handoff?.bookkeeping === "pending") reconcileBookkeeping(row);
+      if (row.handoff) publishHandoff(row);
+    });
+  }
+}
+
+function reconcileDurableHold(row: Row): void {
+  const receipt = row.durable.receipt(), watch = row.durable.attempt.watch;
+  if (!receipt || !watch || !row.outcome) return;
+  try {
+    reconcileTeamHold(row.durable.store, watch, row.durable.attempt.assignmentId, row.outcome.status, receipt);
+  } catch {
+    // The persisted outbox retains the cause. Auxiliary closure must not rewrite
+    // a canonical result's delivery/bookkeeping receipt.
+  }
 }
 
 function releaseNoWorker(row: Row): void {
@@ -952,6 +1048,7 @@ function observeArchitectureRow(row: Row, running = false) {
     result: row.outcome, selectedDriver: row.architectureSelectedDriver, running });
 }
 function settle(row: Row, result: AgentRunResult, epoch: number): void {
+  row.durable.result({ status: result.status, result: result.result });
   const state = bag();
   const current = state.rows.get(row.instanceId);
   if (current !== row) return;
@@ -966,6 +1063,7 @@ function settle(row: Row, result: AgentRunResult, epoch: number): void {
         planId: current.interest?.planId, unitId: current.interest?.unitId,
         ...(!authorized ? { failure: result.result } : {}) } }, current.tableRoot.resultId);
   }
+  startTableResultArchive(current);
   observeArchitectureRow(current);
   current.consultation?.event("outcome", current.workerStarted
     ? { workerStarted: true, status: result.status, instanceId: result.instanceId, model: result.model, usage: result.usage }
@@ -1012,10 +1110,54 @@ function liveOwner(row: Row): boolean {
     (row.teamOwnerToken ? bag().teamOwners?.get(row.teamOwnerToken) === owner : bag().owner === owner);
   if (!rowMatches()) return false;
   const matches = () => (!captured || !captured.retired && captured.sessionId === owner.sessionId && captured.revision === owner.revision);
-  let live = false;
-  try { live = matches() && (!owner.owns || owner.owns()) && matches(); } catch { /* unavailable owner */ }
-  if (!live && captured) captured.retired = true;
-  return live && rowMatches();
+  let ownerLive = false;
+  try { ownerLive = matches() && (!owner.owns || owner.owns()) && matches(); } catch { /* unavailable owner */ }
+  if (!ownerLive && captured) captured.retired = true;
+  if (!ownerLive) return false;
+  // A retired phase retires this row, not the foreground owner's next phase.
+  try { checkCallContext(row.durable.context); } catch { return false; }
+  return rowMatches();
+}
+
+function resultWaitReady(row: Row, source: CapturedWakeSource): void {
+  if (!liveOwner(row) || bag().restrictions.has(row.ownerToken!)) return;
+  const wake = deliveryContent("wake", deliverySource(row), {
+    resultId: source.resultId,
+    guidance: "The exact independent producer selected by your result wait has settled. Continue only already authorized work; settlement is not acceptance.",
+  }, "producer-settled");
+  (row.resultWaits ??= []).push({ source, wake, requested: false });
+  if (idleOf(row.deliveryOwner) && bag().settledOwners?.has(row.ownerToken!)) continueResultWaits(row.ownerToken!);
+}
+
+/** Only a producer notification or a real terminal/before-settle boundary calls this. */
+function continueResultWaits(token: symbol, entries?: WorkerDraftEntry[]): boolean {
+  const busy = !!entries;
+  if (bag().restrictions.has(token) || bag().continuationBatch?.token === token && bag().continuationBatch!.attempted) return false;
+  for (const row of bag().rows.values()) {
+    if (row.ownerToken !== token || !liveOwner(row) || !busy && !idleOf(row.deliveryOwner)) continue;
+    for (const wait of row.resultWaits ?? []) {
+      if (wait.requested) continue;
+      // A throwing transport is still the single attempt for this causal source.
+      wait.requested = true;
+      let attempted = false;
+      try {
+        if (!wait.source.claimWake(JSON.stringify({ carrier: busy ? "before-settle" : "producer-ready", wake: wait.wake }))) continue;
+        wait.source.assertIssued();
+        bag().settledOwners?.delete(token);
+        if (bag().continuationBatch?.token === token) bag().continuationBatch!.attempted = true;
+        attempted = true;
+        if (entries) entries.push({ type: "custom_message", customType: "pitako.worker", content: wait.wake,
+          display: false, details: { deliveryId: randomUUID(), instanceId: row.instanceId } });
+        else row.deliveryOwner!.sendMessage(wait.wake, wait.source);
+        return true;
+      } catch {
+        // Do not spend a different queued cause after a throwing transport.
+        if (attempted) return false;
+        // Retired or superseded captures cannot gain another transport attempt.
+      }
+    }
+  }
+  return false;
 }
 
 function stopRecovery(owner: BackgroundOwner): void {
@@ -1035,11 +1177,22 @@ function recoveryRows(owner: BackgroundOwner): Row[] {
       }
       return false;
     }
-    return !row.outcome || !row.handoff || !row.handoff.idleUnconfirmed && recoveryPending(row.handoff);
+    return !row.outcome || !row.handoff || !row.handoff.idleUnconfirmed && recoveryPending(row.handoff) &&
+      row.handoff.source.recoveryPending();
   });
 }
 function collectOwnerResults(token: symbol): void {
   for (const row of bag().rows.values()) if (row.ownerToken === token) collectResult(row);
+}
+
+function deliverySource(row: Row): DeliverySource {
+  return {
+    producer: row.tableRoot ? `pitako.${row.tableRoot.registration.protocol}` : "pitako.worker",
+    assignmentId: row.teamAssignmentId, instanceId: row.instanceId,
+    ownerSessionId: row.deliveryOwner?.sessionId ?? row.coordinatorSessionId,
+    foregroundRevision: row.deliveryOwner?.revision,
+    teamId: row.teamId, memberId: row.memberId, turnId: row.turnId,
+  };
 }
 
 function collectResult(row: Row): void {
@@ -1059,13 +1212,21 @@ function collectResult(row: Row): void {
     ...(row.dispatchId ? { dispatchId: row.dispatchId, workerStarted: row.workerStarted } : {}),
     roleId: row.roleId, planId: row.interest?.planId, unitId: row.interest?.unitId,
   });
+  const source = deliverySource(row);
+  const content = (projection: unknown) => deliveryContent("result", source, projection, row.outcome!.status, details.deliveryId);
   const message: ResultMessage = row.tableRoot
-    ? row.tableRoot.sealed!.inline(payload => ({ customType: "pitako.worker.result" as const, content: JSON.stringify(payload), display: true as const, details,
+    ? row.tableRoot.sealed!.inline(payload => ({ customType: "pitako.worker.result" as const, content: content(payload), display: true as const, details,
       // Budget includes the busy-boundary wrapper as well as the idle message.
       type: "custom_message" as const }))
-    : { customType: "pitako.worker.result", content: row.outcome.result, display: true, details };
+    : { customType: "pitako.worker.result", content: content(row.outcome.result), display: true, details };
   row.handoff = {
+    source: captureResultSource(row.durable, row.durable.attempt.dispatchId, message,
+      { owns: () => liveOwner(row), getBranch: () => owner.getBranch?.() ?? [], waitReady: source => resultWaitReady(row, source) }),
     message: Object.freeze(message),
+    wake: deliveryContent("wake", source, {
+      resultDeliveryId: details.deliveryId,
+      guidance: "Interpret Pitako worker results already supplied in context. Table results may be inline or incomplete references: read pertinent team_result sections before dependent judgment. Ordinary worker results need no fetch. Delivery and completion are not product acceptance. Continue only already authorized work; cancelled concerns the worker assignment, not a user Stop.",
+    }, row.outcome.status),
     collection: "collected", bookkeeping: row.reconcileBookkeeping ? "pending" : "inapplicable",
     delivery: "pending", continuation: "not-requested",
     bookkeepingAttempts: 0, deliveryAttempts: 0, wakeAttempts: 0, outstanding: false, busyContinuation: false,
@@ -1079,7 +1240,12 @@ function collectResult(row: Row): void {
 function startTableResultArchive(row: Row): void {
   const root = row.tableRoot;
   if (!root?.sealed || root.archive || row.closure.state !== "released") return;
-  root.archive = startTableArchive(root.registration.archive, root.resultId, root.sealed.canonical);
+  root.archive = startTableArchive(root.registration.archive, root.resultId, root.sealed.canonical, undefined, row.durable.archive);
+  void root.archive.completion.then(() => {
+    reconcileDurableHold(row);
+    if (row.handoff?.bookkeeping === "pending") reconcileBookkeeping(row);
+    if (row.handoff) publishHandoff(row);
+  });
 }
 
 function tableRow(token: symbol, instanceId: string) {
@@ -1094,6 +1260,13 @@ export function readTableResult(token: symbol, instanceId: string, options: Tabl
   const row = tableRow(token, instanceId);
   if (!row.tableRoot?.sealed) throw new Error("table result pending or closure unknown");
   return row.tableRoot.sealed.read(options);
+}
+/** Internal host consumer of the selected, physically released full report; metadata grants nothing. */
+export function selectedTableResult(token: symbol, instanceId: string) {
+  const row = tableRow(token, instanceId), root = row.tableRoot;
+  if (!root?.sealed || row.closure.state !== "released" || !row.durable.receipt())
+    throw new Error("selected table report has no exact committed release receipt");
+  return { resultId: root.resultId, canonical: root.sealed.canonical };
 }
 export function readTableDiagnostic(token: symbol, instanceId: string, options: TableRead) {
   const row = tableRow(token, instanceId), root = row.tableRoot;
@@ -1121,9 +1294,12 @@ function reconcileBookkeeping(row: Row): void {
   const handoff = row.handoff!;
   if (!liveOwner(row) || !row.reconcileBookkeeping || handoff.bookkeeping === "reconciled" ||
       handoff.bookkeepingAttempts >= 2) return;
+  const receipt = row.durable.receipt();
+  // Collection/delivery can precede physical closure; bookkeeping cannot.
+  if (!receipt) return;
   ++handoff.bookkeepingAttempts;
   try {
-    row.reconcileBookkeeping(row.outcome!);
+    row.reconcileBookkeeping(row.outcome!, receipt);
     if (!liveOwner(row)) return;
     handoff.bookkeeping = "reconciled";
     handoff.bookkeepingDiagnostic = undefined;
@@ -1137,7 +1313,7 @@ function reconcileBookkeeping(row: Row): void {
 export function workerHandoff(instanceId: string): WorkerHandoff | undefined {
   const handoff = bag().rows.get(instanceId)?.handoff;
   if (!handoff) return undefined;
-  const { message: _message, bookkeepingAttempts: _b, deliveryAttempts: _d, wakeAttempts: _w,
+  const { source: _source, message: _message, wake: _wake, bookkeepingAttempts: _b, deliveryAttempts: _d, wakeAttempts: _w,
     outstanding: _o, busyContinuation: _c, idleUnconfirmed: _i, ...view } = handoff;
   return view;
 }
@@ -1164,10 +1340,23 @@ function incorporated(row: Row): boolean {
   } catch { return false; }
 }
 
-export function observeWorkerResults(token: symbol, turnStarted = false): void {
+export function observeWorkerResults(token: symbol, turnStarted: boolean | "context" | "agent_settled" = false): void {
+  if (turnStarted === true || turnStarted === "context") bag().settledOwners?.delete(token);
+  for (const row of bag().rows.values()) if (row.ownerToken === token && liveOwner(row)) {
+    for (const wait of row.resultWaits ?? []) {
+      try { wait.source.observe(turnStarted === true ? "turn_start" : turnStarted || undefined); }
+      catch { wait.requested = true; }
+    }
+  }
   for (const row of ownerRows(token)) {
     const handoff = row.handoff!;
     const inBranch = incorporated(row);
+    try { handoff.source.observe(turnStarted === true ? "turn_start" : turnStarted || undefined); }
+    catch (error) {
+      handoff.deliveryDiagnostic = `receipt unavailable: ${String(error)}`;
+      if (!liveOwner(row)) continue;
+      throw error;
+    }
     if (inBranch) {
       if (handoff.delivery !== "incorporated") row.consultation?.event("delivery", { state: "incorporated", deliveryId: handoff.message.details.deliveryId });
       handoff.delivery = "incorporated";
@@ -1176,10 +1365,12 @@ export function observeWorkerResults(token: symbol, turnStarted = false): void {
       handoff.deliveryDiagnostic = undefined;
       handoff.outstanding = false;
     }
-    if (turnStarted && handoff.delivery === "incorporated") {
+    if (turnStarted === true && inBranch) {
       handoff.continuation = "observed";
       handoff.continuationDiagnostic = undefined;
     }
+    if (turnStarted === "agent_settled" && handoff.source.noProgress())
+      handoff.continuationDiagnostic = "no-progress: credited result turn ended without disposition";
     publishHandoff(row);
   }
   for (const owner of bag().recoveries?.keys() ?? []) if (owner.token === token) refreshRecovery(owner);
@@ -1199,6 +1390,7 @@ export function restrictWorkerContinuation(token: symbol, outcome: "completed" |
 
 /** Only an externally initiated run clears abort/error restrictions. Native wakes bypass this hook. */
 export function externallyStartedWorkerOwner(token: symbol): void {
+  bag().settledOwners?.delete(token);
   bag().restrictions.delete(token);
   for (const owner of bag().recoveries?.keys() ?? []) if (owner.token === token) refreshRecovery(owner);
 }
@@ -1218,23 +1410,30 @@ export function draftWorkerResults(token: symbol, outcome: "completed" | "aborte
   collectOwnerResults(token);
   observeWorkerResults(token);
   restrictWorkerContinuation(token, outcome);
-  const entries: (ResultMessage & { type: "custom_message" })[] = [];
+  const entries: WorkerDraftEntry[] = [];
+  let continuation = false;
   for (const row of ownerRows(token)) {
     reconcileBookkeeping(row);
     if (canOffer(row)) {
       entries.push({ type: "custom_message", ...offer(row) });
       if (outcome === "completed" && !bag().restrictions.has(token)) {
-        row.handoff!.continuation = "requested";
-        row.handoff!.busyContinuation = true;
+        if (row.handoff!.source.claimWake(JSON.stringify({ carrier: "before-settle", entry: entries.at(-1), continue: true }))) {
+          row.handoff!.source.assertIssued();
+          row.handoff!.continuation = "requested";
+          row.handoff!.busyContinuation = true;
+          continuation = true;
+        }
       }
     }
     publishHandoff(row);
   }
-  return entries.length ? { entries, continue: outcome === "completed" && !bag().restrictions.has(token) } : undefined;
+  if (outcome === "completed") continuation = continueResultWaits(token, entries) || continuation;
+  return entries.length || continuation ? { entries, continue: continuation } : undefined;
 }
 
 /** One append per complete result, then a single short wake for the incorporated batch. */
 export function deliverWorkerResults(token: symbol, terminalOperation = false, recovery = false): void {
+  if (bag().continuationBatch?.token === token && bag().continuationBatch!.attempted) return;
   collectOwnerResults(token);
   observeWorkerResults(token);
   const rows = ownerRows(token);
@@ -1272,17 +1471,28 @@ export function deliverWorkerResults(token: symbol, terminalOperation = false, r
   if (!first || !liveOwner(first) || bag().restrictions.has(token)) return;
   const idle = terminalOperation || idleOf(first.deliveryOwner);
   if (!idle || !liveOwner(first) || bag().restrictions.has(token)) return;
-  for (const row of wakes) {
+  const claimed = wakes.filter(row => {
+    if (row.handoff!.source.claimWake(row.handoff!.wake)) return true;
+    row.handoff!.continuationDiagnostic = "no-progress: result-ready causal credit already spent";
+    publishHandoff(row);
+    return false;
+  });
+  if (!claimed.length) return;
+  for (const row of claimed) {
     ++row.handoff!.wakeAttempts;
     row.handoff!.continuation = "requested";
     row.handoff!.continuationDiagnostic = "owning turn not yet observed";
     publishHandoff(row);
   }
-  if (!liveOwner(first) || bag().restrictions.has(token)) return;
+  const selected = claimed[0]!;
+  if (!liveOwner(selected) || bag().restrictions.has(token)) return;
+  if (bag().continuationBatch?.token === token && bag().continuationBatch!.attempted) return;
   try {
-    first.deliveryOwner!.sendMessage("Interpret Pitako worker results already supplied in context. Table results may be inline or incomplete references: read pertinent team_result sections before dependent judgment. Ordinary worker results need no fetch. Delivery and completion are not product acceptance.");
+    selected.handoff!.source.assertIssued();
+    if (bag().continuationBatch?.token === token) bag().continuationBatch!.attempted = true;
+    selected.deliveryOwner!.sendMessage(selected.handoff!.wake, selected.handoff!.source);
   } catch (error) {
-    for (const row of wakes) {
+    for (const row of claimed) {
       if (!liveOwner(row)) continue;
       row.handoff!.continuation = "blocked-unconfirmed";
       row.handoff!.continuationDiagnostic = String(error);
@@ -1293,7 +1503,7 @@ export function deliverWorkerResults(token: symbol, terminalOperation = false, r
 
 /** Final boundaries settle outstanding drafts; they never bypass a rejected busy continuation. */
 export function settleWorkerResults(token: symbol, terminalOperation = false, finalAgentSettlement = true): void {
-  observeWorkerResults(token);
+  observeWorkerResults(token, finalAgentSettlement ? "agent_settled" : false);
   const outstanding = new Set<Row>();
   for (const row of ownerRows(token)) {
     const handoff = row.handoff!;
@@ -1358,8 +1568,16 @@ export function publishIntermediate(token: symbol, instanceId: string, roomId: s
     throw new Error("intermediate owner retired");
   row.intermediates ??= [];
   if (row.intermediates.some(item => item.message.details.turnId === turnId)) throw new Error("duplicate intermediate turn");
-  row.intermediates.push({ message: { customType: "pitako.architecture.response", content, display: true,
-    details: { deliveryId: randomUUID(), roomId, assignmentId: row.teamAssignmentId!, instanceId, turnId } },
+  const source = { ...deliverySource(row), producer: "pitako.architecture", turnId };
+  const deliveryId = randomUUID();
+  const message = Object.freeze({ customType: "pitako.architecture.response" as const,
+    content: deliveryContent("intermediate", source, content, "nonterminal", deliveryId), display: true,
+    details: Object.freeze({ deliveryId, roomId, assignmentId: row.teamAssignmentId!, instanceId, turnId }) });
+  const captured = captureResultSource(row.durable, `${row.durable.attempt.dispatchId}:${turnId}`, message,
+    { owns: () => liveOwner(row), getBranch: () => row.deliveryOwner!.getBranch?.() ?? [], waitReady: source => resultWaitReady(row, source) });
+  row.intermediates.push({ message: { ...message, display: true }, source: captured,
+    wake: deliveryContent("wake", source, { intermediateDeliveryId: deliveryId,
+      guidance: "Interpret the architecture responses already supplied. Continue authorized work; no polling or acknowledgement required." }, "nonterminal"),
     delivery: "pending", continuation: "not-requested", deliveryAttempts: 0, wakeAttempts: 0, outstanding: false, busyContinuation: false });
   if (idleOf(row.deliveryOwner)) deliverIntermediateResults(token);
 }
@@ -1372,13 +1590,16 @@ export function intermediateReceipts(token: symbol, instanceId: string) {
   return row.intermediates?.map(item => ({ ...item.message.details, delivery: item.delivery, continuation: item.continuation,
     diagnostic: item.deliveryDiagnostic })) ?? [];
 }
-export function observeIntermediateResults(token: symbol, turnStarted = false): void {
+export function observeIntermediateResults(token: symbol, turnStarted: boolean | "context" | "agent_settled" = false): void {
   for (const row of intermediateRows(token)) for (const item of row.intermediates!) {
     try {
+      item.source.observe(turnStarted === true ? "turn_start" : turnStarted || undefined);
       if (receiptInBranch(item.message, row.deliveryOwner!.getBranch?.() ?? []) && liveOwner(row)) {
         item.delivery = "incorporated"; item.outstanding = false; item.deliveryDiagnostic = undefined;
-        if (turnStarted) item.continuation = "observed";
+        if (turnStarted === true) item.continuation = "observed";
       }
+      if (turnStarted === "agent_settled" && item.source.noProgress())
+        item.deliveryDiagnostic = "no-progress: credited result turn ended without disposition";
     } catch (error) { item.deliveryDiagnostic = `receipt unavailable: ${String(error)}`; }
     if (bag().restrictions.has(token) && item.continuation !== "observed") item.continuation = "blocked-unconfirmed";
   }
@@ -1386,17 +1607,22 @@ export function observeIntermediateResults(token: symbol, turnStarted = false): 
 export function draftIntermediateResults(token: symbol, outcome: "completed" | "aborted" | "error") {
   observeIntermediateResults(token);
   const entries: (IntermediateMessage & { type: "custom_message" })[] = [];
+  let continuation = false;
   for (const row of intermediateRows(token)) for (const item of row.intermediates!) {
     if (item.delivery !== "incorporated" && !item.outstanding && item.deliveryAttempts < 2) {
       entries.push({ type: "custom_message", ...offerEnvelope(item, item.message) });
-      if (outcome === "completed" && !bag().restrictions.has(token)) { item.continuation = "requested"; item.busyContinuation = true; }
+      if (outcome === "completed" && !bag().restrictions.has(token) &&
+          item.source.claimWake(JSON.stringify({ carrier: "before-settle", entry: entries.at(-1), continue: true }))) {
+        item.source.assertIssued(); item.continuation = "requested"; item.busyContinuation = true; continuation = true;
+      }
     }
   }
-  return entries.length ? { entries, continue: outcome === "completed" && !bag().restrictions.has(token) } : undefined;
+  return entries.length ? { entries, continue: continuation } : undefined;
 }
 export function deliverIntermediateResults(token: symbol, terminalOperation = false, recovery = false): void {
+  if (bag().continuationBatch?.token === token && bag().continuationBatch!.attempted) return;
   observeIntermediateResults(token);
-  let wake: Row | undefined;
+  let wake: { row: Row; item: Intermediate } | undefined;
   for (const row of intermediateRows(token)) {
     if (!terminalOperation && !idleOf(row.deliveryOwner)) continue;
     for (const item of row.intermediates!) {
@@ -1411,17 +1637,24 @@ export function deliverIntermediateResults(token: symbol, terminalOperation = fa
       if (!liveOwner(row) || bag().restrictions.has(token)) continue;
       if (item.delivery === "incorporated" && !item.busyContinuation && item.continuation !== "observed" &&
           item.wakeAttempts < 2 && (!item.wakeAttempts || recovery)) {
-        ++item.wakeAttempts; item.continuation = "requested"; wake = row;
+        if (item.source.claimWake(item.wake)) {
+          ++item.wakeAttempts; item.continuation = "requested"; wake ??= { row, item };
+        } else item.deliveryDiagnostic = "no-progress: result-ready causal credit already spent";
       }
     }
   }
-  if (wake && liveOwner(wake)) {
-    try { wake.deliveryOwner!.sendMessage("Interpret the architecture responses already supplied. Continue authorized work; no polling or acknowledgement required."); }
-    catch { for (const item of wake.intermediates!) if (item.continuation === "requested") item.continuation = "blocked-unconfirmed"; }
+  if (wake && liveOwner(wake.row)) {
+    if (bag().continuationBatch?.token === token && bag().continuationBatch!.attempted) return;
+    try {
+      wake.item.source.assertIssued();
+      if (bag().continuationBatch?.token === token) bag().continuationBatch!.attempted = true;
+      wake.row.deliveryOwner!.sendMessage(wake.item.wake, wake.item.source);
+    }
+    catch { for (const item of wake.row.intermediates!) if (item.continuation === "requested") item.continuation = "blocked-unconfirmed"; }
   }
 }
 export function settleIntermediateResults(token: symbol, terminalOperation = false, final = true): void {
-  observeIntermediateResults(token);
+  observeIntermediateResults(token, final ? "agent_settled" : false);
   const outstanding: Intermediate[] = [];
   for (const row of intermediateRows(token)) for (const item of row.intermediates!) {
     if (item.outstanding) { outstanding.push(item); item.deliveryDiagnostic = "commitment unconfirmed at final boundary"; }
@@ -1429,4 +1662,16 @@ export function settleIntermediateResults(token: symbol, terminalOperation = fal
   }
   deliverIntermediateResults(token, terminalOperation, true);
   for (const item of outstanding) { item.outstanding = false; if (item.deliveryAttempts >= 2) item.delivery = "blocked"; }
+}
+
+/** Both result channels share the actual callback's single continuation attempt, including throws. */
+export function settleBackgroundResults(token: symbol, terminalOperation = false, final = true): void {
+  const state = bag(), prior = state.continuationBatch;
+  if (final) (state.settledOwners ??= new Set()).add(token);
+  state.continuationBatch = prior?.token === token ? prior : { token, attempted: false };
+  try {
+    settleWorkerResults(token, terminalOperation, final); settleIntermediateResults(token, terminalOperation, final);
+    if (final) continueResultWaits(token);
+  }
+  finally { state.continuationBatch = prior; }
 }

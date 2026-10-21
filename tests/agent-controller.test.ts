@@ -19,6 +19,7 @@ import profilePolicy from "../extensions/profile-policy.ts";
 import * as bridgeModule from "../extensions/agent/bridge/broker.ts";
 import * as routing from "../extensions/agent/routing.ts";
 import { connect } from "../extensions/agent/bridge/client.js";
+import { captureCallContext, checkCallContext } from "../extensions/workflow-engine.ts";
 
 const fixture = agentFixtureOwnership();
 const originalDir = process.env.PI_CODING_AGENT_DIR;
@@ -695,6 +696,54 @@ for (const { event, failUpstream } of [
   }));
 }
 
+
+test("packaged shutdown fences workflow authority while foreground retirement remains held",
+  fixture.ownedCase("composed workflow retirement", async () => {
+    const { root } = setup();
+    const handlers = new Map<string, Function[]>(), commands = new Map<string, { handler: Function }>();
+    const controllers: ReturnType<typeof createAgentController>[] = [];
+    const pi = { registerFlag() {}, registerTool() {},
+      registerCommand(name: string, command: { handler: Function }) { commands.set(name, command); },
+      on(type: string, handler: Function) { handlers.set(type, [...handlers.get(type) ?? [], handler]); },
+      getFlag() {}, getAllTools: () => [{ name: "read" }], getActiveTools: () => ["read"], setActiveTools() {},
+      getSessionName: () => "pitako:coding", setSessionName() {}, sendMessage() {} };
+    const ctx = { cwd: root, hasUI: false, isIdle: () => true, async waitForIdle() {},
+      sessionManager: { getSessionId: () => `workflow-${path.basename(root)}`, getEntries: () => [], getBranch: () => [] } };
+    const create = controllerModule.createAgentController;
+    const capture = spyOn(controllerModule, "createAgentController").mockImplementation((...args) => {
+      const controller = create(...args); controllers.push(controller); return controller;
+    });
+    const hold = Promise.withResolvers<void>();
+    let dispatch: Promise<unknown> | undefined, shutdown: Promise<void> | undefined;
+    const emit = async (type: string) => { for (const handler of handlers.get(type) ?? []) await handler({ type }, ctx); };
+    try {
+      pitako(pi as never);
+      await emit("session_start");
+      await commands.get("plan")!.handler("shutdown-owner", ctx);
+      const authority = captureCallContext(root, ctx.sessionManager);
+      expect(authority.kind).toBe("managed");
+      checkCallContext(authority);
+      const view = controllers[0]!.openView();
+      dispatch = ownedDispatch(ctx as never, undefined, () => true, async () => hold.promise);
+      await Promise.resolve();
+      let closed = false;
+      shutdown = emit("session_shutdown").then(() => { closed = true; });
+      expect(() => view.list()).toThrow("retired");
+      expect(() => checkCallContext(authority)).toThrow("retired");
+      expect(() => checkCallContext(captureCallContext(root, ctx.sessionManager))).toThrow("retired");
+      expect(teamEvaluationForSession(ctx.sessionManager.getSessionId(), false)).toBeUndefined();
+      await Promise.resolve();
+      expect(closed).toBe(false);
+      hold.resolve(); await dispatch; await shutdown;
+      await emit("session_start");
+      expect(() => checkCallContext(authority)).toThrow("retired");
+      expect(() => checkCallContext(captureCallContext(root, ctx.sessionManager))).toThrow("retired");
+      await view.close();
+    } finally {
+      hold.resolve(); await dispatch; await shutdown;
+      await emit("session_shutdown"); capture.mockRestore();
+    }
+  }));
 
 for (const successor of ["session_start", "session_shutdown", "uncertain-close"] as const) {
   test(`retained own retirement fences overlapping ${successor} after live handles are cleared`, fixture.ownedCase(successor, async () => {

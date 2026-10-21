@@ -94,8 +94,8 @@ describe("engineering-layer composition", () => {
     expect(note.startsWith("Pitako profile: coding.")).toBe(true);
     expect(note).toContain("Load a specialized skill only when it applies.");
     expect(note).toContain("Research or design does not authorize implementation.");
-    // Include the shared TODO policy without embedding the workflow skills.
-    expect(note.length).toBeLessThan(1200);
+    // Include authority/provenance and shared TODO policy, not workflow bodies.
+    expect(note.length).toBeLessThan(2400);
     for (const marker of THIRD_PARTY_ALWAYS_ON_MARKERS) {
       expect(note).not.toContain(marker);
     }

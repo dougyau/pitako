@@ -6,6 +6,7 @@ import type { FallbackReason, ModelTarget, ResolvedRole } from "../roles/types.t
 import { classifyProviderFailure, isServiceTierRejection } from "./fallback.ts";
 import { formatAgentLive } from "./present.ts";
 import { agentScope } from "./scope.ts";
+import { deliveryContent } from "./provenance.ts";
 import type { AgentUiSnapshot } from "./ui.ts";
 import { InvocationHistory, type HistoryOrigin } from "./history.ts";
 import { AgentClosureError } from "./closure.ts";
@@ -138,7 +139,7 @@ export interface Attempt {
 }
 
 export type AttemptTurn = Pick<Parameters<AttemptExecutor["start"]>[0],
-  "turnId" | "attemptId" | "task" | "target" | "signal" | "onActivity" | "onActivated" | "onRequest" | "bindActivityProbe" | "participant">;
+  "turnId" | "attemptId" | "task" | "context" | "target" | "signal" | "onActivity" | "onActivated" | "onRequest" | "bindActivityProbe" | "participant">;
 
 export interface AttemptSession {
   /** A new host-admitted logical turn, not a provider retry. */
@@ -157,6 +158,8 @@ export interface AttemptExecutor {
     attemptId?: string;
     role: ResolvedRole;
     task: string;
+    /** Immutable transport projection; task remains the raw diagnostic source. */
+    context?: string;
     target: ModelTarget;
     cwd: string;
     signal: AbortSignal;
@@ -187,6 +190,7 @@ async function runAttempt(
     instanceId: string;
     role: ResolvedRole;
     task: string;
+    context?: string;
     target: ModelTarget;
     cwd: string;
     signal: AbortSignal;
@@ -407,6 +411,15 @@ async function runConversationTurn(input: AgentRunInput, state: ConversationStat
     ...(input.head ? { assignmentId: input.head.assignmentId,
       head: { assignmentId: input.head.assignmentId, headInstanceId: instance.id } } : {}),
   }) : undefined;
+  const source = {
+    producer: origin?.source ?? "pitako.agent", assignmentId: origin?.assignmentId,
+    instanceId: instance.id, ownerSessionId: origin?.coordinatorSessionId ?? origin?.callerSessionId,
+    teamId: origin?.teamId, memberId: origin?.memberId, turnId,
+  };
+  const context = {
+    task: deliveryContent("context", source, task),
+    continuation: deliveryContent("context", source, SIDE_EFFECT_NOTE),
+  };
   if (input.head && state.turn === 1) {
     if (input.roleId !== "developer") throw new PitakoConfigError("Head attachment requires a Developer assignment");
     input.head.claim(instance.id, workspace);
@@ -554,6 +567,7 @@ async function runConversationTurn(input: AgentRunInput, state: ConversationStat
         input.head,
         state,
         (input.table ?? input.architecture)?.participant,
+        context,
       ),
     );
     if (history && !history.admitted) history.admit(instance.id, role.id, targets[0]!).result({
@@ -599,6 +613,7 @@ async function executeTargets(
   head?: HeadAttachment,
   owner?: ConversationState,
   participant?: import("../table/participant.ts").LocalParticipant,
+  context?: { task: string; continuation: string },
 ): Promise<AgentRunResult> {
   instance.status = "running";
   let session = owner?.session;
@@ -641,6 +656,7 @@ async function executeTargets(
         attemptId: owner ? `${instance.id}:${owner.attempt}` : undefined,
         role,
         task,
+        context: context?.task,
         target,
         cwd: instance.cwd,
         signal,
@@ -654,7 +670,8 @@ async function executeTargets(
       };
       const attempt = index === 0 && session && owner && owner.turn > 1
         ? session.turn ? await session.turn(operation) : { status: "failed" as const, result: "", error: "session cannot accept a new logical turn", sideEffects: false, session }
-        : await runAttempt(sideEffects, session, executor, operation);
+        : await runAttempt(sideEffects, session, executor, { ...operation,
+          context: sideEffects ? context?.continuation : context?.task });
       bindActivityProbe(undefined);
       missingUsage ||= preserveUnknownUsage && attempt.usage === undefined;
       usage = missingUsage ? undefined : mergeUsage(usage, attempt.usage, preserveUnknownUsage);

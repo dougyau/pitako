@@ -3,6 +3,8 @@ import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readF
 import path from "node:path";
 import { currentWorkspace, registeredWorktrees, repositoryIdentity } from "./board/workspace.ts";
 import { PitakoConfigError } from "./errors.ts";
+import { acquirePlanLock } from "./workflow-state.ts";
+import { updatePlanMetadata } from "./workflow-planning.ts";
 
 /** Lowercase slug. Rejects traversal, separators, and empty ids. */
 const PLAN_ID = /^[a-z0-9][a-z0-9-_]*$/;
@@ -98,27 +100,16 @@ export function parsePlanDocument(text: string): PlanMeta {
 
 export function setPlanExecution(id: string, execution: "expected" | "none", cwd = process.cwd()): PlanMeta {
   if (execution !== "expected" && execution !== "none") throw new PitakoConfigError('execution must be "expected" or "none"');
-  const { file, text, meta } = readPlan(id, cwd);
-  if (meta.status !== "draft") throw new PitakoConfigError("execution intent must be set before the plan is frozen");
-  const frontmatter = text.match(/^(---\r?\n[\s\S]*?)(\r?\n---(?:\r?\n|$))/);
-  if (!frontmatter) throw new PitakoConfigError("plan is missing frontmatter");
-  const fields = frontmatter[1]!;
-  const updated = /^execution:/m.test(fields)
-    ? fields.replace(/^execution:.*$/m, `execution: ${execution}`)
-    : `${fields}\nexecution: ${execution}`;
-  writeFileSync(file, text.replace(frontmatter[0], `${updated}${frontmatter[2]}`));
-  return readPlan(id, cwd).meta;
+  return updatePlanMetadata(id, { execution }, cwd);
 }
 
 export function bindPlanTopic(id: string, topicId: number, cwd = process.cwd()): PlanMeta {
   if (!Number.isSafeInteger(topicId) || topicId < 1) throw new PitakoConfigError("board topic ID must be a positive safe integer");
-  const { file, text, meta } = readPlan(id, cwd);
+  const { meta } = readPlan(id, cwd);
   if (meta.boardTopicId === topicId) return meta;
   if (meta.boardTopicId !== undefined) throw new PitakoConfigError(`plan ${id} is already bound to Board topic ${meta.boardTopicId}`);
   if (meta.status !== "draft") throw new PitakoConfigError("a frozen plan must contain its Board topic binding before claim");
-  const bound = text.replace(/^(---\r?\n[\s\S]*?)(\r?\n---(?:\r?\n|$))/, `$1\nboard_topic_id: ${topicId}$2`);
-  writeFileSync(file, bound);
-  return parsePlanDocument(bound);
+  return updatePlanMetadata(id, { boardTopicId: topicId }, cwd);
 }
 
 export function readPlan(id: string, cwd = process.cwd()): { file: string; text: string; meta: PlanMeta } {
@@ -629,23 +620,41 @@ export function readLedgerTeamHolds(cwd: string, planId: string, binding?: Execu
   return ledgerTeamHolds(text);
 }
 
-/** Update one bound plan's gate under an exclusive, fail-closed filesystem lock. */
+/** Exclude ledger read/replace/fsync per plan, without locking the observation journal. */
 export function withLedgerTeamHoldLock<T>(cwd: string, planId: string, action: () => T): T {
   const file = ledgerFile(planId, cwd);
   if (!existsSync(file)) throw new PitakoConfigError("bound plan ledger is missing; Team hold gate is unknown");
   const lock = `${file}.lock`;
-  const wait = new Int32Array(new SharedArrayBuffer(4));
-  const deadline = Date.now() + 5000;
-  while (true) {
-    try { mkdirSync(lock); break; }
-    catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      if (Date.now() >= deadline) throw new PitakoConfigError(`could not acquire ledger Team hold lock at ${lock}; verify no writer is active before manually removing the stale lock`);
-      Atomics.wait(wait, 0, 0, 10);
-    }
+  if (existsSync(lock)) throw new PitakoConfigError(`legacy ledger Team hold lock remains at ${lock}; closure is unknown; verify no writer is active before manually removing the stale lock`);
+  const release = acquirePlanLock(currentWorkspace(cwd), planId, "ledger-writer");
+  try {
+    const result = action();
+    if (result && typeof (result as { then?: unknown }).then === "function")
+      throw new Error("ledger action must not await");
+    return result;
   }
-  try { return action(); }
-  finally { rmSync(lock, { recursive: true, force: true }); }
+  finally { release(); }
+}
+
+/** User decisions may change only status on the exact captured ledger, never its body. */
+export function writeExecutionUserDecision(binding: ExecutionBinding, status: "running" | "paused" | "blocked" | "cancelled" | "USER_DECISION_REQUIRED"): void {
+  verifyExecutionBinding(binding);
+  withLedgerTeamHoldLock(binding.executionRoot, binding.planId, () => {
+    const file = ledgerFile(binding.planId, binding.executionRoot);
+    const text = readFileSync(file, "utf8");
+    const plan = verifyExecutionBinding(binding).meta;
+    const mismatch = executionLedgerMismatch(plan, parseLedgerBinding(text), binding);
+    if (mismatch) throw new PitakoConfigError(mismatch);
+    const header = text.match(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/);
+    if (!header || !/^status:.*$/m.test(header[0])) throw new PitakoConfigError("ledger status is missing");
+    const replacement = header[0].replace(/^status:.*$/m, `status: ${status}`) + text.slice(header[0].length);
+    const temp = `${file}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
+    const fd = openSync(temp, "wx");
+    try { writeFileSync(fd, replacement); fsyncSync(fd); } finally { closeSync(fd); }
+    renameSync(temp, file);
+    const dir = openSync(path.dirname(file), "r");
+    try { fsyncSync(dir); } finally { closeSync(dir); }
+  });
 }
 
 export function updateLedgerTeamHold(cwd: string, planId: string, hold: TeamHold, remove = false, binding?: ExecutionBinding): boolean {

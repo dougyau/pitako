@@ -9,7 +9,7 @@ import { openBoard } from "../extensions/board/store.ts";
 import { ledgerFile, planFile, readLedgerTeamHolds } from "../extensions/workflow.ts";
 import { listObservations } from "../extensions/agent/observe.ts";
 import { executionForSession } from "../extensions/execution-identity.ts";
-import { architectureFixture } from "./fixtures/architecture.ts";
+import { architectureFixture, tablePrompt } from "./fixtures/architecture.ts";
 const { fixture, setup, policies, configuration } = architectureFixture();
 const deferred = <T = void>() => Promise.withResolvers<T>();
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
@@ -25,6 +25,7 @@ for (const protocol of ["architecture", "review"] as const) {
         : { goal: "Review the bounded design", object: { kind: "brief", text: "Bounded proposal" }, criteria: ["Preserve ownership", "Remain bounded"] });
       expect(start.isError).not.toBe(true);
       await s.delivered.promise;
+      expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host).toMatchObject({ status: "completed" });
       expect(s.host.sessions).toHaveLength(1);
       expect(s.host.sessions[0]!.model!.id).toBe("director");
       expect(s.seen.map(item => item.request.stage)).toEqual(["composition", "preparation", "consultation-plan", "contribution", "decision", "synthesis"]);
@@ -111,7 +112,7 @@ for (const protocol of ["architecture", "review"] as const) {
       expect(s.seen.filter(item => item.request.stage === "contribution").map(item => item.request.round).sort())
         .toEqual([1, 2, 2, 2, 3, 3, 3, 4]);
       expect(teamAssignments(s.evaluation).find(member => member.memberId === retainedId)!.task).toBe("First");
-      expect(sessions.get("First").prompts.filter((text: string) => JSON.parse(text).stage === "preparation")).toHaveLength(1);
+      expect(sessions.get("First").prompts.filter((text: string) => tablePrompt(text).stage === "preparation")).toHaveLength(1);
       expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
       if (protocol === "review") {
         const report = result;
@@ -174,7 +175,7 @@ test("registered start publishes Markdown guidance and preserves the original br
     const start = await s.invoke("architecture_start", { goal });
     expect(start.isError).not.toBe(true);
     await compositionEntered.promise;
-    const rootSession = s.host.sessions.find(session => session.prompts.some(text => JSON.parse(text).stage === "composition"))!;
+    const rootSession = s.host.sessions.find(session => session.prompts.some(text => tablePrompt(text).stage === "composition"))!;
     const readOriginal = async () => {
       let briefOffset: number | null = 0, original = "", pages = 0;
       while (briefOffset !== null) {
@@ -262,6 +263,9 @@ test("registered watched table preserves owner/history/cursors/holds and deliver
     await s.emit("turn_start");
     expect(s.sent.filter(item => item.message.customType === "pitako.worker.result")).toHaveLength(1);
     expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
+    // Delivery cannot join auxiliary disk I/O. Its captured completion publishes
+    // the bookkeeping fact after the archive's actual resource receipt exists.
+    await s.bookkeeping(handle.instanceId);
     expect(workerHandoff(handle.instanceId)).toMatchObject({ bookkeeping: "reconciled", delivery: "incorporated" });
     expect(readLedgerTeamHolds(s.root, "architecture-plan")).toEqual([]);
     expect((await s.read("team_result", { assignmentId: handle.assignmentId })).host.status).toBe("completed");
@@ -394,7 +398,7 @@ for (const invalid of ["snapshot", "model", "reasoning", "bind-reasoning", "miss
       const start = await s.invoke("architecture_start", { goal: "reject" }); await s.delivered.promise;
       expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("failed");
       expect(contributionAttempts).toBe(["snapshot", "model", "reasoning", "bind-reasoning"].includes(invalid) ? 0 : 1);
-      expect(s.host.sessions.some(session => session.prompts.some(text => JSON.parse(text).stage === "contribution") && !["director", "chosen"].includes(session.model?.id ?? ""))).toBe(false);
+      expect(s.host.sessions.some(session => session.prompts.some(text => tablePrompt(text).stage === "contribution") && !["director", "chosen"].includes(session.model?.id ?? ""))).toBe(false);
       expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
     } finally { await s.close(); }
   }));

@@ -34,11 +34,12 @@ import { assertNoCheckpointLease } from "./head/checkpoint-lease.ts";
 import { formatAgentResult, formatTeamExecutionSummary, runAgentInstance, teamExecutionSummary } from "./run.ts";
 import { randomUUID } from "node:crypto";
 import { isTableRoot, readTableResult, tableRootStatus } from "./background.ts";
-import { tableReadProperties, tableIncidental, tableError, type TableRead } from "../table/results.ts";
+import { tableReadProperties, tableIncidental, tableError, incidentalMetadata, sealPages, type SealedPages, type TableRead } from "../table/results.ts";
 import { existsSync } from "node:fs";
 import { openBoard } from "../board/store.ts";
 import { boardWorkspace, currentWorkspace } from "../board/workspace.ts";
-import { ledgerFile, openExecutionPlan, planFile, readFrozenPlan, readPlan, type ExecutionBinding, type PlanMeta } from "../workflow.ts";
+import { ledgerFile, openExecutionPlan, planFile, readFrozenPlan, readPlan, readExecutionBinding, verifyExecutionBinding, type ExecutionBinding, type PlanMeta } from "../workflow.ts";
+import { captureCallContext, checkAuthority, planningSlot } from "../workflow-engine.ts";
 import { teamEvaluationForSession, reserveTeamMember, recordTeamAssignment, recordPlanTeamWork, teamAssignments, selectTeamAssignments } from "../team.ts";
 import type { HistoryOrigin } from "./history.ts";
 import { queryHistory } from "./history-query.ts";
@@ -267,6 +268,7 @@ export default function agentInstance(pi: ExtensionAPI): void {
 }
 
 function registerTeamTools(pi: ExtensionAPI): void {
+  let statusCut: { evaluation: NonNullable<ReturnType<typeof teamEvaluationForSession>>; pages: SealedPages } | undefined;
   const roles = ["developer", "researcher", "scout", "oracle"] as const;
   const evaluationFor = (ctx: { sessionManager?: { getSessionId?: () => string | undefined } }) =>
     teamEvaluationForSession(
@@ -315,7 +317,10 @@ function registerTeamTools(pi: ExtensionAPI): void {
         let head: ReturnType<typeof createHead>;
         let durableWatch: { planId: string; unitId: string; execution?: ExecutionBinding } | undefined;
         try {
+          const captured = captureTeamWatch(params, ctx);
+          const reservationRoot = captured.execution?.executionRoot ?? ctx.cwd;
           const handle = reserveBackground({ roleId: params.role, coordinatorSessionId: origin.coordinatorSessionId, task: params.task, origin,
+            cwd: reservationRoot, context: captureCallContext(reservationRoot, ctx.sessionManager), watch: captured.watch ? { ...captured.watch, execution: captured.execution } : undefined,
             owns: callerOwns,
             teamOwner: { token: admission.token, assignmentId: id, teamId: admission.teamId, memberId: admission.memberId, onSettled: () => admission.settled(), noWorkerReleased: admission.noWorkerReleased },
             async cleanup() {
@@ -333,7 +338,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
                 params.role === "developer" && !headOptions ? developerPreflight({
                   task: params.task, toolCallId: _toolCallId, source: "team_assign", ctx, pi, signal,
                   owns: () => { check(); return true; },
-                }) : undefined);
+                }) : undefined, captured);
               const { watch, execution, topic, preflight: dispatch } = watched;
               durableWatch = watched.durableWatch;
               check();
@@ -349,7 +354,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
               return { roleId: params.role, task, cwd: launchRoot, watch: watch ? { ...watch, execution } : undefined,
                 executor: backgroundExecutor(), historyOrigin: origin, dispatch, consultation, head,
                 reconcileBookkeeping: durableWatch
-                  ? result => recordPlanTeamWork(launchRoot, durableWatch!.planId, durableWatch!.unitId, id, result.status, execution) : undefined };
+                  ? (result, receipt) => recordPlanTeamWork(launchRoot, durableWatch!.planId, durableWatch!.unitId, id, result.status, execution, receipt) : undefined };
             },
           });
           admission.commit();
@@ -366,12 +371,21 @@ function registerTeamTools(pi: ExtensionAPI): void {
     label: "Team status",
     description: "Show Team members in admission order. Does not wait or include task text or transcripts.",
     promptSnippet: "Inspect Team assignments without waiting",
-    parameters: Type.Object({ assignmentId: Type.Optional(Type.String({ minLength: 1 })), teamId: Type.Optional(Type.String({ minLength: 1 })), memberId: Type.Optional(Type.String({ minLength: 1 })) }, noExtra),
+    parameters: Type.Object({ assignmentId: Type.Optional(Type.String({ minLength: 1 })), teamId: Type.Optional(Type.String({ minLength: 1 })), memberId: Type.Optional(Type.String({ minLength: 1 })),
+      cursor: Type.Optional(Type.String({ minLength: 1, maxLength: 1024 })) }, noExtra),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       let tableRequest = false;
       try {
         const evaluation = evaluationFor(ctx);
         if (!evaluation) throw new Error("Team requires a foreground session identity");
+        if (params.cursor !== undefined) {
+          tableRequest = true;
+          if (params.assignmentId !== undefined || params.teamId !== undefined || params.memberId !== undefined)
+            throw new Error("status cursor cannot be combined with selectors");
+          if (!statusCut || statusCut.evaluation.token !== evaluation.token || statusCut.evaluation.sessionId !== evaluation.sessionId)
+            throw new Error("unknown or retired status cut");
+          return statusCut.pages.read({ cursor: params.cursor });
+        }
         const selected = selectTeamAssignments(evaluation, params);
         // Fail closed while probing a singleton; generic aggregation is not a table request.
         tableRequest = selected.length === 1;
@@ -397,7 +411,18 @@ function registerTeamTools(pi: ExtensionAPI): void {
           };
         }).filter((row) => row !== undefined);
         if (params.assignmentId && rows.length === 0) throw new Error(`unknown Team assignment ${params.assignmentId}`);
-        if (tableRequest) return tableIncidental({ members: rows });
+        if (rows.some(row => "closure" in row && typeof row.closure === "string")) {
+          tableRequest = true;
+          const members = rows.map(row => incidentalMetadata(row));
+          // The same formatter/envelope is measured, including content escaping and details.
+          try { return tableIncidental({ members }); }
+          catch (error) {
+            if (!String(error).includes("exceeds budget")) throw error;
+            const cut = sealPages({ kind: "team-status", acceptance: false, members });
+            statusCut = { evaluation, pages: cut };
+            return cut.read({ maxBytes: 4096 });
+          }
+        }
         return textResult(JSON.stringify(rows), { members: rows });
       } catch (error) { return tableRequest ? tableError(error) : errorResult(error instanceof Error ? error.message : String(error)); }
     },
@@ -454,7 +479,6 @@ function registerTeamTools(pi: ExtensionAPI): void {
     },
   });
 }
-
 function watchedExecutionBinding(planId: string, cwd: string): ExecutionBinding | undefined {
   if (existsSync(ledgerFile(planId, cwd))) return openExecutionPlan(planId, cwd, { createLedger: true }).binding;
   const plan = assignmentPlan(planId, cwd);
@@ -610,19 +634,23 @@ function registerBackgroundTools(pi: ExtensionAPI): void {
         const caller = ctx.sessionManager;
         const origin = historyOrigin("agent_spawn", ctx, params.task, _toolCallId);
         let head: ReturnType<typeof createHead>;
+        const captured = captureTeamWatch(params, ctx);
+        const reservationRoot = captured.execution?.executionRoot ?? ctx.cwd;
         const handle = reserveBackground({ roleId: params.role, coordinatorSessionId: origin.coordinatorSessionId, task: params.task, origin,
+          cwd: reservationRoot, context: captureCallContext(reservationRoot, ctx.sessionManager), watch: captured.watch ? { ...captured.watch, execution: captured.execution } : undefined,
           owns: () => ctx.sessionManager?.getSessionId?.() === origin.coordinatorSessionId &&
             ctx.sessionManager?.getSessionFile?.() === origin.coordinatorSessionFile,
           async cleanup() { await head?.close(); },
           async prepare(signal, check, reserved) {
+            if (captured.error) throw new Error(captured.error);
             if (consultation) {
               const record = consultationRecord(pi, ctx, origin, reserved.dispatchId, reserved.instanceId, consultation, reserved.current, undefined, caller);
               reserved.record(record);
               consultation = await prepareConsultation(consultation, params.task, ctx, signal, check, record);
             }
             check();
-            const watch = interestFrom(params.plan, params.unit);
-            const execution = watch ? watchedExecutionBinding(watch.planId, ctx.cwd) : undefined;
+            const { watch, execution } = captured;
+            if (execution) verifyExecutionBinding(execution);
             const launchRoot = execution?.executionRoot ?? ctx.cwd;
             const assignmentId = randomUUID();
             head = createHead(assignmentId, launchRoot, headOptions, backgroundExecutor(), execution ? path.join(path.dirname(evidenceFile(execution.planId, "gates", launchRoot)), `gates-${assignmentId}`) : undefined);
@@ -706,13 +734,40 @@ function registerBackgroundTools(pi: ExtensionAPI): void {
 }
 
 /** Shared root admission rules. Internal protocol turns never call this helper. */
-export async function prepareTeamWatch<T = undefined>(params: { plan?: string; unit?: string; boardTopicId?: string }, ctx: ExtensionContext, id: string, check: () => void, beforeCommit?: () => Promise<T>) {
-  const watch = interestFrom(params.plan, params.unit);
-  let plan = watch ? existsSync(ledgerFile(watch.planId, ctx.cwd))
-    ? openExecutionPlan(watch.planId, ctx.cwd, { createLedger: false }) : assignmentPlan(watch.planId, ctx.cwd) : undefined;
-  let execution: ExecutionBinding | undefined;
+export function captureTeamWatch(params: { plan?: string; unit?: string }, ctx: ExtensionContext) {
+  let watch = interestFrom(params.plan, params.unit);
+  try {
+  const context = captureCallContext(ctx.cwd, ctx.sessionManager);
+  if (context.kind === "managed" && checkAuthority(context.authority).run.phase === "planning") {
+    const slot = planningSlot(context.authority), snapshot = slot.read();
+    if (params.plan !== undefined && params.plan !== slot.id) throw new Error("planning watch must use the captured slot");
+    if (!snapshot.meta || snapshot.meta.status !== "draft") throw new Error("planning table requires a bound draft");
+    watch = interestFrom(slot.id, params.unit ?? "planning");
+    const plan = { file: snapshot.file, text: snapshot.text!, meta: snapshot.meta };
+    return { watch, plan, execution: undefined, planning: { slot, snapshot }, error: undefined };
+  }
+  const saved = watch ? readExecutionBinding(watch.planId, ctx.cwd) : undefined;
+  const plan = watch ? saved ? verifyExecutionBinding(saved) : assignmentPlan(watch.planId, ctx.cwd) : undefined;
+  const execution = saved ?? (plan?.meta.status === "frozen" ? {
+    planId: plan.meta.id, revision: plan.meta.revision, hash: plan.meta.hash,
+    executionRoot: currentWorkspace(ctx.cwd), planSource: plan.file,
+  } : undefined);
+  if (execution) verifyExecutionBinding(execution);
+  return { watch, plan, execution, error: undefined };
+  } catch (error) {
+    return { watch: watch && { ...watch, unavailable: String(error) }, plan: undefined, execution: undefined, error: String(error) };
+  }
+}
+export async function prepareTeamWatch<T = undefined>(params: { plan?: string; unit?: string; boardTopicId?: string }, ctx: ExtensionContext, id: string, check: () => void,
+  beforeCommit?: () => Promise<T>, captured = captureTeamWatch(params, ctx)) {
+  const { watch } = captured;
+  if (captured.error) throw new Error(captured.error);
+  let { plan, execution } = captured;
+  if ("planning" in captured && captured.planning) captured.planning.slot.read();
+  if (execution) verifyExecutionBinding(execution);
   const topic = await teamBoardTopic(params.boardTopicId, watch?.planId, ctx.cwd, plan?.meta, check);
   check();
+  if ("planning" in captured && captured.planning) captured.planning.slot.read();
   // Validate first, but never create a ledger or hold before routing has settled.
   const preflight = await beforeCommit?.();
   check();
@@ -722,7 +777,7 @@ export async function prepareTeamWatch<T = undefined>(params: { plan?: string; u
     if (topic !== undefined) await claimTeamBoardTopicExecution(topic, opened.meta, ctx.cwd, opened.binding.executionRoot, check);
     check();
   }
-  const durableWatch = watch && topic !== undefined && execution ? { ...watch, execution } : undefined;
+  const durableWatch = watch ? { ...watch, execution } : undefined;
   if (durableWatch) recordPlanTeamWork(ctx.cwd, durableWatch.planId, durableWatch.unitId, id, "pending", execution);
   return { watch, topic, execution, durableWatch, preflight };
 }

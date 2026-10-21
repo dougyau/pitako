@@ -40,6 +40,23 @@ export async function openSqlite(file: string, options: { readOnly?: boolean; se
   return wrap(db);
 }
 
+/** Admission transactions must finish before their caller can enter a native effect. */
+export function openSqliteSync(file: string, options: { readOnly?: boolean; setWal?: boolean } = {}): SqlDatabase {
+  const readOnly = options.readOnly ?? false;
+  const db: SyncDb = typeof Bun !== "undefined"
+    ? new (require("bun:" + "sqlite").Database)(file, { create: !readOnly, readonly: readOnly })
+    : openNode(file, readOnly);
+  try {
+    db.exec("PRAGMA foreign_keys = ON");
+    db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
+    if (!readOnly && options.setWal !== false) db.exec("PRAGMA journal_mode = WAL");
+    return wrap(db);
+  } catch (error) {
+    db.close();
+    throw error;
+  }
+}
+
 function openNode(file: string, readOnly: boolean): SyncDb {
   const mod = require("node:sqlite") as {
     DatabaseSync: new (
