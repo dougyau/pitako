@@ -28,7 +28,7 @@ import type { HeadAttachment } from "./head/runtime.ts";
 import type { NativeTurn } from "../table/participant.ts";
 import { isConsultation } from "./consultation.ts";
 import { ManagedProducer, managedTools, managedGuard, guardManagedLoadedDefinitions } from "./head/managed-tools.ts";
-import { captureCallContext, reserveEffect, bindCallContext, withCallContext, guardDefinition,
+import { captureCallContext, reserveEffect, bindCallContext, withCallContext, guardDefinition, guardToolRegistrations,
   type Producer, type CallContext } from "../workflow-engine.ts";
 import { randomUUID } from "node:crypto";
 
@@ -581,7 +581,7 @@ async function prepareSession(
     agentDir,
     settingsManager,
     additionalExtensionPaths: [packageRoot()],
-    extensionFactories: [input.factories.createCodemode({ mode: "on" }), pi => {
+    extensionFactories: [pi => input.factories.createCodemode({ mode: "on" })(guardToolRegistrations(pi, "read")), pi => {
       pi.on("tool_call", event => {
         if ((isConsultation(input.role.id) || input.participant) && (isOrchestrationTool(event.toolName) || input.participant && ["edit", "write", "apply_patch", "lsp_rename"].includes(event.toolName)))
           return { block: true, reason: "Consultative leaves cannot orchestrate Pitako work" };

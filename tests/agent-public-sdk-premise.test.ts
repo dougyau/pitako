@@ -3,14 +3,14 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { Type, type Static } from "typebox";
+import { Type, type Static, type TSchema } from "typebox";
 import { createAssistantMessageEventStream, type AssistantMessage } from "@earendil-works/pi-ai";
 import { createAgentSession, createCodemodeExtension, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { mutationGeneration, principalLeases, reserveOperation } from "../extensions/agent/head/operation-leases.ts";
 import { AgentClosureError } from "../extensions/agent/closure.ts";
 import { foregroundBash } from "../extensions/agent/head/managed-tools.ts";
 import { providerFixtureOwnership } from "./fixtures/provider-fixture-ownership.ts";
-import { registerWorkflowCommands, captureCallContext, checkCallContext, guardDefinition } from "../extensions/workflow-engine.ts";
+import { registerWorkflowCommands, captureCallContext, checkCallContext, guardDefinition, guardToolRegistrations } from "../extensions/workflow-engine.ts";
 import { planFile } from "../extensions/workflow.ts";
 
 const ownership = providerFixtureOwnership();
@@ -221,7 +221,7 @@ async function principalLeaseCase(unknownClosure = false) {
   let foregroundCalls = 0;
   const loader = new DefaultResourceLoader({ cwd: root, agentDir: root, settingsManager: settings, noExtensions: true,
     noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
-    extensionFactories: [createCodemodeExtension({ models: false }), pi => principalLeases(pi, {
+    extensionFactories: [pi => createCodemodeExtension({ models: false })(guardToolRegistrations(pi, "read")), pi => principalLeases(pi, {
       async exec(command, cwd, options) {
         foregroundCalls++;
         if (command === "controlled-unknown") throw new AgentClosureError([new Error("controlled group observation failure")], "principal fixture");
@@ -232,13 +232,13 @@ async function principalLeaseCase(unknownClosure = false) {
   const { session } = await ownership.acquire(createAgentSession({ cwd: root, agentDir: root, modelRuntime: runtime,
     model: runtime.getModel("lease-fixture", "local"), resourceLoader: loader, settingsManager: settings,
     sessionManager: SessionManager.create(root, path.join(root, "sessions")), tools: ["write", "edit", "read", "bash", "codemode"],
-    customTools: [{ name: "write", label: "write", description: "controlled writer", parameters: writeParams,
+    customTools: [guardDefinition<TSchema, unknown, any>({ name: "write", label: "write", description: "controlled writer", parameters: writeParams,
       async execute(_id, params) {
         const target = (params as Static<typeof writeParams>).path;
         writes++; entered.release(); await release.promise;
         if (target === "codemode.md") { nestedEntered.release(); await nestedRelease.promise; }
         writeFileSync(path.join(root, target), "product"); return { content: [], details: {} };
-      } },
+      } }, "write"),
     guardDefinition({ name: "read", label: "read", description: "controlled nested boundary", parameters: Type.Object({}),
       async execute(_id, _params, _signal, _update, ctx) {
         nested.push(await ctx.executeTool("write", { path: "nested.md" }));

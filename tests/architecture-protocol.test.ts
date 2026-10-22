@@ -1,7 +1,9 @@
 import { expect, test } from "bun:test";
+import { Value } from "typebox/value";
 import { architectureFixture } from "./fixtures/architecture.ts";
-import { participant } from "../extensions/architecture/types.ts";
-import { planComposition, type Composition, type CompositionBasis } from "../extensions/table/composition.ts";
+import { participant, submitSchema as architectureSchema } from "../extensions/architecture/types.ts";
+import { submitSchema as reviewSchema } from "../extensions/review/types.ts";
+import { compositionSchema, specialistChoiceSchema, planComposition, type Composition, type CompositionBasis } from "../extensions/table/composition.ts";
 import { validateSubmission } from "../extensions/architecture/protocol.ts";
 import { validateReview } from "../extensions/review/policy.ts";
 
@@ -12,6 +14,28 @@ const response = (request: any) => ({ kind: "consultation-response", doubtIds: r
 const contribution = { kind: "contribution", proposal: "Bounded design", arguments: [], objections: [], doubts: [] };
 type LocalRecord = { id: string; stage?: string; kind?: string; author?: string;
   body?: { resolutions?: { doubtId: string }[] } };
+test("composition strings preserve complete values with search and full-string provider matching", () => {
+  const snapshotId = "e2de7680-ca07-414e-9ef9-f7aad49ff36e";
+  const body: Composition = { kind: "composition", snapshotId, reason: "Choose independent coverage", specialists: [
+    { kind: "add", candidateRef: "general:0", mandate: "Inspect complete argument strings", reason: "Preserve independent evidence" },
+  ] };
+  for (const schema of [architectureSchema, reviewSchema])
+    expect(Value.Check(schema, { submissionId: "composition", body })).toBe(true);
+  const [retain, add] = specialistChoiceSchema.anyOf;
+  for (const schema of [compositionSchema.properties.snapshotId, compositionSchema.properties.reason,
+    retain.properties.memberId, retain.properties.mandate, retain.properties.reason,
+    add.properties.candidateRef, add.properties.mandate, add.properties.reason]) {
+    if (!("pattern" in schema) || typeof schema.pattern !== "string")
+      throw new Error("Composition string must declare a pattern");
+    // The provider boundary may interpret JSON Schema patterns as full-string constraints.
+    const fullString = new RegExp(`^(?:${schema.pattern})$`, "u");
+    for (const [value, valid] of [[snapshotId, true], ["general:0", true], ["Complete argument strings", true],
+      ["x", true], ["\nRevisión 🧪\n", true], ["", false], [" \t\n\u00a0", false]] as const) {
+      expect(Value.Check(schema, value)).toBe(valid);
+      expect(fullString.test(value)).toBe(valid);
+    }
+  }
+});
 test("shared composition validates the frozen total set for architecture and review", () => {
   const basis: CompositionBasis = { snapshotId: "frozen", candidateRefs: ["candidate"], retainableMemberIds: ["one", "two"] };
   const body: Composition = { kind: "composition", snapshotId: "frozen", reason: "Choose total roster", specialists: [

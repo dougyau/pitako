@@ -2,7 +2,8 @@ import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
 
 const strict = { additionalProperties: false } as const;
-const text = Type.String({ minLength: 1, pattern: "\\S" });
+// Preserve complete strings when a provider matches patterns against the full value.
+const text = Type.String({ minLength: 1, pattern: "[\\s\\S]*\\S[\\s\\S]*" });
 export const specialistChoiceSchema = Type.Union([
   Type.Object({ kind: Type.Literal("retain"), memberId: text, mandate: text, reason: text }, strict),
   Type.Object({ kind: Type.Literal("add"), candidateRef: text, mandate: text, reason: text }, strict),

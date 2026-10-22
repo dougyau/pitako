@@ -9,6 +9,7 @@ import { captureCallContext, checkCallContext, reserveEffect, guardDefinition, h
 import type { CallContext } from "../../workflow-engine.ts";
 import type { Reservation } from "../../workflow-state.ts";
 import { randomUUID } from "node:crypto";
+import { packageRoot } from "../../stack.ts";
 
 type Lease = { root?: string; kind: "writer" | "checkpoint" | "gates"; unknown?: string;
   observations: Array<ClosureObservation | undefined>; released?: boolean; producer: Producer };
@@ -34,10 +35,10 @@ function reobserve(root?: string): void {
   }
 }
 // Ordinary writers may overlap; retained unknown writers may not admit new effects.
-export function assertNoExclusive(root?: string): void {
+export function assertNoExclusive(root: string): void {
   reobserve(root);
-  const context = captureCallContext(root ? physicalTarget(root) : process.cwd());
-  checkCallContext(context).assertIdle([root ?? path.parse(process.cwd()).root], true);
+  const context = captureCallContext(physicalTarget(root));
+  checkCallContext(context).assertIdle([root], true);
 }
 export function assertQuiescent(root: string): void {
   reobserve(root);
@@ -52,14 +53,17 @@ export function mutationGeneration(root: string): number {
   }).map(entry => entry.sequence));
 }
 /** Admission precedes effects. Unknown closure deliberately keeps its reservation. */
-export function reserveOperation(root: string | undefined, kind: Lease["kind"], context?: CallContext) {
+export function reserveOperation(root: string | undefined, kind: Lease["kind"], context?: CallContext, cwd?: string) {
   if (kind !== "writer" && !root) throw new Error("exclusive operations require a physical root");
   reobserve(root);
   if (!context && !root) throw new Error("unscoped native operation requires captured context");
   context ??= captureCallContext(physicalTarget(root!));
   assertGenericWrite(context);
+  // A missing effect target coordinates the captured cwd, never the filesystem
+  // root. This reservation does not confine an executor's effects.
+  const scope = root ?? realpathSync(cwd ?? checkCallContext(context).store.root);
   const reservation = reserveEffect(context, { reservationId: randomUUID(), kind,
-    paths: [root ?? path.parse(process.cwd()).root] });
+    paths: [scope] });
   const producer = reservation.register("native-operation", ["host-operation"]);
   producer.enter();
   const lease: Lease = { root, kind, producer, observations: [] };
@@ -80,7 +84,7 @@ export function reserveOperation(root: string | undefined, kind: Lease["kind"], 
   };
 }
 
-// Host bookkeeping does not modify candidate inputs. Unknown tools and compositions fail closed.
+// Host bookkeeping does not modify candidate inputs.
 const BOOKKEEPING = new Set(["todo", "compress", "decompress", "search_context", "acp_status", "acp_cache",
   "board_post", "board_topic_create", "board_topic_update", "board_workflow_claim", "board_workflow_lifecycle",
   "memory_search", "memory_add", "memory_replace", "memory_remove", "session_search",
@@ -94,32 +98,54 @@ function physicalTarget(target: string) {
   }
   return realpathSync(existing);
 }
+function packagedNavigationRead(name: string, source: string): boolean {
+  if (toolEffect(name) !== "read_only") return false;
+  const entry = name.startsWith("codegraph_") ? "node_modules/@vndv/pi-codegraph/extensions/codegraph.ts"
+    : name.startsWith("lsp_") ? "node_modules/pi-lsp-client/src/index.ts" : undefined;
+  if (!entry) return false;
+  try { return realpathSync(source) === realpathSync(path.join(packageRoot(), entry)); }
+  catch { return false; }
+}
 /** Hooks include nested session ctx.executeTool calls, not just model-issued calls. */
 export function principalLeases(pi: ExtensionAPI, foreground: BashOperations) {
   const active = new Map<string, { lease: ReturnType<typeof reserveOperation>; linked: boolean }>();
   pi.on("tool_call", (event, ctx) => {
     const info = pi.getAllTools?.().find(tool => tool.name === event.toolName);
-    if (info && hasDefinitionGuard(info.parameters)) {
+    // Packaged navigation does not mutate candidate inputs and needs no writer
+    // reservation. The registry's physical owner, not a familiar name, identifies it.
+    const navigationRead = info && packagedNavigationRead(info.name, info.sourceInfo.path);
+    // Native Codemode delegates effects through nested executeTool admissions.
+    const codemode = info?.name === "codemode" && info.sourceInfo.path === "builtin:codemode";
+    if (info && (hasDefinitionGuard(info.parameters) || navigationRead || codemode)) {
+      const read = navigationRead || codemode || hasReadDefinitionGuard(info.parameters);
       try {
         const context = captureCallContext(ctx.cwd, ctx.sessionManager);
         checkCallContext(context);
-        if (!hasReadDefinitionGuard(info.parameters))
+        if (!read)
           withCaptured(context, () => assertNoExclusive(ctx.cwd));
       } catch (error) { return { block: true, reason: String(error) }; }
-      if (hasReadDefinitionGuard(info.parameters)) return;
+      if (read) return;
     }
-    // A familiar spelling is not proof: only SDK-owned definitions get this exemption.
-    if (info?.sourceInfo.path === `builtin:${event.toolName}` &&
-        (toolEffect(event.toolName) === "read_only" || BOOKKEEPING.has(event.toolName))) return;
     try {
       const context = captureCallContext(ctx.cwd, ctx.sessionManager);
       checkCallContext(context);
+      // A familiar spelling is not proof: only SDK-owned definitions get this exemption.
+      if (info?.sourceInfo.path === `builtin:${event.toolName}` &&
+          (toolEffect(event.toolName) === "read_only" || BOOKKEEPING.has(event.toolName))) return;
+      if (!info || !hasDefinitionGuard(info.parameters)) {
+        assertGenericWrite(context);
+        // Ordinary extensions own their execution and effects. A tool_call/result
+        // pair cannot prove their closure or confine them to a writer reservation.
+        // Managed contexts still require a definition with an owned effect boundary.
+        if (context.kind === "ordinary") return;
+        throw new Error("Unsupported native definition/composition; a trusted effect adapter is required");
+      }
       const input = event.input as { path?: string };
       const root = ["write", "edit"].includes(event.toolName) && typeof input.path === "string"
         ? physicalTarget(path.resolve(ctx.cwd, input.path))
         : event.toolName === "bash" ? realpathSync(ctx.cwd) : undefined;
       if (active.has(event.toolCallId)) throw new Error("writer call already active");
-      active.set(event.toolCallId, { lease: reserveOperation(root, "writer", context), linked: false });
+      active.set(event.toolCallId, { lease: reserveOperation(root, "writer", context, ctx.cwd), linked: false });
     } catch (error) { return { block: true, reason: String(error) }; }
   });
   pi.on("tool_result", event => {

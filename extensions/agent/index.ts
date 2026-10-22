@@ -39,7 +39,7 @@ import { existsSync } from "node:fs";
 import { openBoard } from "../board/store.ts";
 import { boardWorkspace, currentWorkspace } from "../board/workspace.ts";
 import { ledgerFile, openExecutionPlan, planFile, readFrozenPlan, readPlan, readExecutionBinding, verifyExecutionBinding, type ExecutionBinding, type PlanMeta } from "../workflow.ts";
-import { captureCallContext, checkAuthority, guardToolRegistrations, planningSlot } from "../workflow-engine.ts";
+import { captureCallContext, checkAuthority, guardDefinition, guardToolRegistrations, assertGenericWrite, planningSlot } from "../workflow-engine.ts";
 import { teamEvaluationForSession, reserveTeamMember, recordTeamAssignment, recordPlanTeamWork, teamAssignments, selectTeamAssignments } from "../team.ts";
 import type { HistoryOrigin } from "./history.ts";
 import { queryHistory } from "./history-query.ts";
@@ -182,7 +182,9 @@ export default function agentInstance(pi: ExtensionAPI): void {
   registerTeamTools(pi);
   registerArchitecture(pi);
   registerReview(pi);
-  pi.registerTool({
+  // Dispatch owns its effects in the backend; validate the native caller without
+  // a second generic writer. Preserve the dispatch error result on owner loss.
+  pi.registerTool(guardDefinition({
     name: "agent_run",
     label: "Run agent",
     description:
@@ -203,6 +205,7 @@ export default function agentInstance(pi: ExtensionAPI): void {
         return errorResult("agent_run cannot be called from an AgentInstance");
       }
       try {
+        assertGenericWrite(captureCallContext(ctx.cwd, ctx.sessionManager));
         assertIndividualRole(params.role);
         if (isConsultation(params.role)) throw new Error("Consultative roles require agent_spawn or team_assign, not agent_run");
         validateAgentMode(params, ctx.cwd, false);
@@ -265,7 +268,7 @@ export default function agentInstance(pi: ExtensionAPI): void {
       const text = options.expanded ? full : details?.live || full;
       return new Text(theme.fg("toolOutput", text), 0, 0);
     },
-  });
+  }, "read", false, (): ReturnType<typeof textResult> => errorResult("Dispatch cancelled before admission")));
 }
 
 function registerTeamTools(pi: ExtensionAPI): void {
@@ -282,7 +285,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
     return assignment;
   };
 
-  pi.registerTool({
+  pi.registerTool(guardDefinition({
     name: "team_assign",
     label: "Assign Team role",
     description: "Start one isolated individual Team role. Architect and Reviewer require architecture_start and review_start. Returns immediately. Each call admits an independently identified member, including the same role. Every asynchronous developer mode head with explicit writes has local checkpoints and supports explicit checkpoint_origin continuation; neither grants publication or acceptance.",
@@ -302,6 +305,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
     }, noExtra),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
+        assertGenericWrite(captureCallContext(ctx.cwd, ctx.sessionManager));
         assertIndividualRole(params.role);
         if (signal?.aborted || !params.task.trim()) throw new Error("Dispatch cancelled or empty task");
         const headOptions = validateAgentMode(params, ctx.cwd);
@@ -365,7 +369,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
         } catch (error) { admission.rollback(); throw error; }
       } catch (error) { return errorResult(error instanceof Error ? error.message : String(error)); }
     },
-  });
+  }, "read", false, (): ReturnType<typeof textResult> => errorResult("Dispatch cancelled before admission")));
 
   guardToolRegistrations(pi, "read").registerTool({
     name: "team_status",
@@ -620,7 +624,7 @@ function registerBackgroundTools(pi: ExtensionAPI): void {
     const owned = managedWorkers(ctx);
     if (owned && !owned.has(id)) throw new Error(`unknown worker ${id}`);
   };
-  pi.registerTool({
+  pi.registerTool(guardDefinition({
     name: "agent_spawn",
     label: "Spawn agent",
     description:
@@ -647,6 +651,7 @@ function registerBackgroundTools(pi: ExtensionAPI): void {
       const blocked = childBlocked("agent_spawn");
       if (blocked) return blocked;
       try {
+        assertGenericWrite(captureCallContext(ctx.cwd, ctx.sessionManager));
         assertIndividualRole(params.role);
         if (signal?.aborted || !params.task.trim()) throw new Error("Dispatch cancelled or empty task");
         const headOptions = validateAgentMode(params, ctx.cwd);
@@ -690,7 +695,7 @@ function registerBackgroundTools(pi: ExtensionAPI): void {
         return textResult(formatWorkerHandle(handle), handle);
       } catch (error) { return errorResult(error instanceof Error ? error.message : String(error)); }
     },
-  });
+  }, "read", false, (): ReturnType<typeof textResult> => errorResult("Dispatch cancelled before admission")));
 
   guardToolRegistrations(pi, "read").registerTool({
     name: "agent_status",
