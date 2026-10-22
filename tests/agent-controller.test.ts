@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createAgentController } from "../extensions/agent/controller.ts";
-import { bindBackgroundOwner, clearBackgroundOwner, spawnBackground, setBackgroundExecutor } from "../extensions/agent/background.ts";
+import { bindBackgroundOwner, clearBackgroundOwner, spawnBackground, setBackgroundExecutor, workerStatus } from "../extensions/agent/background.ts";
 import { createLiveHandle } from "../extensions/agent/live.ts";
 import { clearObservations, publishObservation } from "../extensions/agent/observe.ts";
 import { runAgentInstance, type Attempt } from "../extensions/agent/run.ts";
@@ -498,10 +498,11 @@ test(`same-session startup fences ${role} agent_spawn while controlled external 
     expect(() => view!.list()).toThrow("retired");
     const staleResult = await stale;
     const during = await spawn("spawn during startup");
-    const heldRows = await status();
+    // Direct definitions expose the guard throw; Pi turns it into a tool error.
+    await expect(status()).rejects.toThrow("captured native context retired");
     expect(staleResult).toMatchObject({ isError: false, details: { dispatchPhase: "preflight" } });
     expect(during).toMatchObject({ isError: true, details: { error: "Dispatch cancelled before admission" } });
-    expect(heldRows.workers).toEqual([expect.objectContaining({
+    expect(workerStatus((staleResult as { details: { instanceId: string } }).details.instanceId)).toEqual([expect.objectContaining({
       instanceId: (staleResult as { details: { instanceId: string } }).details.instanceId,
       status: "cancelled", workerStarted: false,
     })]);
@@ -537,7 +538,8 @@ test(`same-session startup fences ${role} agent_spawn while controlled external 
     await freshView.close();
     for (const finish of finishes) finish();
     await emit("session_shutdown");
-    expect(await status()).toEqual({ workers: [] });
+    await expect(status()).rejects.toThrow("captured native context retired");
+    expect(workerStatus()).toEqual([]);
   } finally {
     releaseCodex(); releaseDispatch();
     for (const finish of finishes) finish();
@@ -656,9 +658,9 @@ for (const { event, failUpstream } of [
       expect(() => view!.acknowledge("history")).toThrow("retired");
       expect(() => view!.cancel(selection)).toThrow("retired");
       expect(() => view!.input(selection, { intent: "steer", text: "during retirement" })).toThrow("retired");
-      expect(await tools.get("agent_input")!.execute("during", {
+      expect(() => tools.get("agent_input")!.execute("during", {
         target, historyId: selection.historyId, sessionId: selection.sessionId, intent: "query", text: "during retirement",
-      }, undefined, undefined, ctx)).toMatchObject({ isError: true, details: { status: "rejected" } });
+      }, undefined, undefined, ctx)).toThrow("captured native context retired");
       expect(statuses.has("pitako.agents")).toBe(false);
       expect(settled).toBe(false);
       release(); await dispatch;

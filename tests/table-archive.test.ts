@@ -110,12 +110,14 @@ for (const protocol of ["architecture", "review"] as const) {
   }));
 
   test(`${protocol} competing sibling ledger rejects admission without fallback or archive`, f.fixture.ownedCase(`${protocol} competing ledger`, async () => {
-    const s = await f.setup({ config: "" });
+    const root = privateRoot();
+    f.fixture.directories.push(root);
+    let s: Awaited<ReturnType<typeof f.setup>> | undefined;
     const operations: archive.TableArchive[] = [];
     const capture = spyOn(archive, "startTableArchive").mockImplementation((...args) => {
       const operation = startArchive(...args); operations.push(operation); return operation;
     });
-    const authority = path.join(s.root, "authority"), execution = path.join(s.root, "execution");
+    const authority = path.join(root, "authority"), execution = path.join(root, "execution");
     const git = (...args: string[]) => execFileSync("git", args, { cwd: authority, encoding: "utf8" });
     const entries = (root: string) => withoutJournal(readdirSync(root, { recursive: true }).map(String)).sort();
     let beforeAuthority: [string, Buffer<ArrayBuffer>][], beforeEntries: string[], beforeExecution: string[], beforeRegistry: string;
@@ -125,6 +127,9 @@ for (const protocol of ["architecture", "review"] as const) {
       git("init", "-q", "-b", "main");
       git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "initial");
       git("worktree", "add", "-q", "-b", "execution", execution);
+      // Admit the actual foreground workspace, rather than changing cwd under
+      // an already bound manager from an unrelated root.
+      s = await f.setup({ root: execution, storageRoot: root, config: "" });
       const file = planFile("competing", authority); mkdirSync(path.dirname(file), { recursive: true });
       writeFileSync(file, "---\nid: competing\nrevision: 1\nstatus: frozen\n---\nSibling authority.\n");
       binding = openExecutionPlan("competing", authority).binding;
@@ -136,7 +141,6 @@ for (const protocol of ["architecture", "review"] as const) {
       beforeEntries = entries(path.join(authority, ".pitako"));
       beforeExecution = entries(execution);
       beforeRegistry = git("worktree", "list", "--porcelain");
-      s.ctx.cwd = execution;
       expect(existsSync(ledgerFile("competing", execution))).toBe(false);
       // Ordinary watched admission must still reject; capture must not turn this into fallback.
       expect(() => openExecutionPlan("competing", execution, { createLedger: false })).toThrow("competing ledger");
@@ -161,7 +165,7 @@ for (const protocol of ["architecture", "review"] as const) {
       expect(archive.captureTableArchive(execution, "competing"))
         .toEqual({ unavailable: expect.stringContaining("competing ledger") });
     } finally {
-      await s.close();
+      await s?.close();
       await Promise.all(operations.map(operation => operation.completion));
       capture.mockRestore();
     }
@@ -169,7 +173,7 @@ for (const protocol of ["architecture", "review"] as const) {
     expect(operations).toEqual([]);
     expect(entries(execution)).toEqual(beforeExecution!);
     expect(existsSync(path.join(execution, ".pitako/table-results"))).toBe(false);
-    expect(existsSync(path.join(s.root, ".pitako"))).toBe(false);
+    expect(existsSync(path.join(root, ".pitako"))).toBe(false);
     for (const [file, bytes] of beforeAuthority!) expect(readFileSync(file)).toEqual(bytes);
     expect(entries(path.join(authority, ".pitako"))).toEqual(beforeEntries!);
     expect(git("worktree", "list", "--porcelain")).toBe(beforeRegistry!);

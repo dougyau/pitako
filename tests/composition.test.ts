@@ -1,9 +1,10 @@
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
-import { describe, expect, spyOn, test } from "bun:test";
+import { describe, expect, mock, spyOn, test } from "bun:test";
 import * as acp from "billion-context-pi";
 import * as rpivTodo from "@juicesharp/rpiv-todo";
-import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionToolContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
   DEFAULT_SKILL_NAMES,
@@ -16,16 +17,21 @@ import pitako from "../extensions/index.ts";
 import { profileNote } from "../extensions/profile.ts";
 import { packageRoot } from "../extensions/stack.ts";
 import { toolsForProfile } from "../extensions/profile.ts";
+import { captureCallContext, hasReadDefinitionGuard } from "../extensions/workflow-engine.ts";
 
 function readRepo(relative: string): string {
   return readFileSync(path.join(packageRoot(), relative), "utf8");
 }
 
 describe("engineering-layer composition", () => {
-  test("TODO composition preserves upstream registration except for model-only exposure", async () => {
+  test("TODO composition delegates upstream execution and keeps native model-only exposure", async () => {
+    const upstream = { content: [], details: { tasks: [], nextId: 1 } };
+    const execute = mock(async (..._args: unknown[]) => {
+      return upstream;
+    });
     const todo: ToolDefinition = {
       name: "todo", label: "TODO", description: "controlled upstream tool",
-      parameters: Type.Object({}), execute: async () => ({ content: [], details: { tasks: [] } }),
+      parameters: Type.Object({}), execute,
     };
     const other = { ...todo, name: "other", exposure: "codemode" as const };
     const tools: ToolDefinition[] = [];
@@ -40,23 +46,40 @@ describe("engineering-layer composition", () => {
       api.registerTool(todo);
       api.registerTool(other);
     });
+    const root = mkdtempSync(path.join(tmpdir(), "pitako-todo-composition-"));
     try {
       const extension = await import("../extensions/todo.ts");
       extension.default(pi as unknown as ExtensionAPI);
       expect(registration).toHaveBeenCalledTimes(1);
       expect(forwarded?.on).toBe(pi.on);
       expect(forwarded?.registerCommand).toBe(pi.registerCommand);
-      expect(tools).toEqual([{ ...todo, exposure: "model-only" }, other]);
-      expect(tools[0]?.execute).toBe(todo.execute);
+      expect(tools[0]).toMatchObject({ name: todo.name, label: todo.label, description: todo.description, exposure: "model-only" });
+      expect(tools[0]!.parameters).toEqual(todo.parameters);
+      expect(hasReadDefinitionGuard(tools[0]!.parameters)).toBe(true);
+      const controller = new AbortController(), update = () => {};
+      const ctx = { cwd: root, sessionManager: {} } as unknown as ExtensionToolContext, args = {};
+      const result = await tools[0]!.execute("native-id", args, controller.signal, update, ctx);
+      expect(execute).toHaveBeenCalledTimes(1);
+      expect(execute).toHaveBeenCalledWith("native-id", args, controller.signal, update, ctx);
+      expect(result).toBe(upstream);
       expect(tools[1]).toBe(other);
       expect(todo.exposure).toBeUndefined();
     } finally {
       registration.mockRestore();
+      const context = captureCallContext(root);
+      if (context.kind === "ordinary") context.guard.close();
+      rmSync(root, { recursive: true, force: true });
     }
   });
 
   test("ACP defaults disable implicit bash deadlines without starting the external runtime", async () => {
-    const factory = () => {};
+    const tools: ToolDefinition[] = [];
+    const known = ["compress", "decompress", "search_context", "acp_status", "acp_cache"];
+    const definitions = [...known, "delegate", "execute", "future_context"].map(name => ({
+      name, label: name, description: name, parameters: Type.Object({}),
+      execute: async () => ({ content: [], details: {} }),
+    }));
+    const factory = (pi: ExtensionAPI) => { for (const tool of definitions) pi.registerTool(tool); };
     const registration = spyOn(acp, "createAcpExtension").mockReturnValue(factory);
     try {
       const extension = await import("../extensions/acp.ts");
@@ -64,7 +87,12 @@ describe("engineering-layer composition", () => {
       expect(registration).toHaveBeenCalledWith({
         delegate: false, autoUpdate: false, toolBashDefaultTimeout: 0,
       });
-      expect(extension.default).toBe(factory);
+      extension.default({ registerTool(tool: ToolDefinition) { tools.push(tool); } } as unknown as ExtensionAPI);
+      for (const [index, tool] of tools.entries()) {
+        expect(hasReadDefinitionGuard(tool.parameters)).toBe(known.includes(tool.name));
+        expect(hasReadDefinitionGuard({ ...tool.parameters })).toBe(false);
+        if (!known.includes(tool.name)) expect(tool).toBe(definitions[index]);
+      }
     } finally {
       registration.mockRestore();
     }

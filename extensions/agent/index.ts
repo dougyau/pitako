@@ -39,14 +39,14 @@ import { existsSync } from "node:fs";
 import { openBoard } from "../board/store.ts";
 import { boardWorkspace, currentWorkspace } from "../board/workspace.ts";
 import { ledgerFile, openExecutionPlan, planFile, readFrozenPlan, readPlan, readExecutionBinding, verifyExecutionBinding, type ExecutionBinding, type PlanMeta } from "../workflow.ts";
-import { captureCallContext, checkAuthority, planningSlot } from "../workflow-engine.ts";
+import { captureCallContext, checkAuthority, guardToolRegistrations, planningSlot } from "../workflow-engine.ts";
 import { teamEvaluationForSession, reserveTeamMember, recordTeamAssignment, recordPlanTeamWork, teamAssignments, selectTeamAssignments } from "../team.ts";
 import type { HistoryOrigin } from "./history.ts";
 import { queryHistory } from "./history-query.ts";
 import { executionForSession } from "../execution-identity.ts";
 import { developerPreflight } from "./routing.ts";
 import { ownedDispatch, settlePendingDispatches } from "./dispatch.ts";
-import { resolveOwnedLive } from "./owner.ts";
+import { resolveOwnedLive, resolveOwnedWorkerRead } from "./owner.ts";
 import { listCheckpoints, readCheckpoint } from "./checkpoints.ts";
 
 const noExtra = { additionalProperties: false } as const;
@@ -74,7 +74,8 @@ function historyOrigin(
 }
 
 export default function agentInstance(pi: ExtensionAPI): void {
-  pi.registerTool({
+  const controls = guardToolRegistrations(pi, "read");
+  controls.registerTool({
     name: "agent_checkpoints", label: "Inspect local checkpoints",
     description: "Foreground read-only local Git checkpoint list/read in the current repository, independent of live Head state. Reports saved identities, current saved-path matches, checkout dirt and historical evidence/gaps separately. Does not apply or adopt source. Missing history, a ref or terminal status alone is not closure or acceptance.",
     parameters: Type.Union([
@@ -105,7 +106,7 @@ export default function agentInstance(pi: ExtensionAPI): void {
   const liveFor = (target: import("./background.ts").LiveTarget, ctx: { sessionManager?: { getSessionId?: () => string | undefined } }) => {
     return resolveOwnedLive(target, ctx.sessionManager?.getSessionId?.()).handle;
   };
-  pi.registerTool({
+  controls.registerTool({
     name: "agent_observe", label: "Observe live worker",
     description: "Observe one exact active background instance or Team assignment: original WorkBrief, bounded ordered coalesced event activity, native history/session identity, interactions and persistence gaps. Default 50, max 200 events, 32KiB/page. after is the returned event cursor; briefOffset pages oversized WorkBriefs. Use agent_history for persisted native entries. Not a synchronous agent_run target.",
     parameters: Type.Object({ target: liveTarget, after: Type.Optional(Type.Integer({ minimum: 0 })),
@@ -117,7 +118,7 @@ export default function agentInstance(pi: ExtensionAPI): void {
       } catch (error) { return errorResult(String(error)); }
     },
   });
-  pi.registerTool({
+  controls.registerTool({
     name: "agent_input", label: "Input to live worker",
     description: "Foreground only: queue missing-context queries or in-scope steering through public steer on an observed exact historyId/sessionId. Delivered only at a later native steering boundary; never interrupts a running command. Returns a receipt, not an answer: queued is admission, handled is hook consumption, rejected is no accepted submission, unconfirmed preserves closure uncertainty. No commands, replacement, prompt stream or follow-up. Reobserve after native replacement. Candidate replies mention interactionId; adequacy is not judged.",
     parameters: Type.Object({ target: liveTarget, historyId: Type.String({ maxLength: 256 }), sessionId: Type.String({ maxLength: 256 }),
@@ -133,7 +134,7 @@ export default function agentInstance(pi: ExtensionAPI): void {
       }
     },
   });
-  pi.registerTool({
+  controls.registerTool({
     name: "agent_history",
     label: "Agent history",
     description: "Read-only local native histories, including all recorded branches and tool results. list defaults to this coordinator; explicit identity filters or scope all discover older groups. Members carry group identity and historyId. read source defaults to worker; coordinator resolves only its captured catalog session. Returns lossless base64 byte fragments in physical append order, not active context. Default 50, max 200 items, max 32KiB per page. Use the returned cursor until null; upstream truncation and external artifacts remain limits. No prune action or file/store paths.",
@@ -167,7 +168,7 @@ export default function agentInstance(pi: ExtensionAPI): void {
       return textResult(JSON.stringify(page), page);
     },
   });
-  pi.registerTool({
+  controls.registerTool({
     name: "consultation_feedback", label: "Consultation feedback",
     description: "Voluntary attributed assessment after the exact outcome is incorporated in your current branch. Corrections retain history. Optional followupInstances must be owned catalog runs; links show association, not cause. Never review, verification or acceptance.",
     parameters: feedbackSchema,
@@ -366,7 +367,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
     },
   });
 
-  pi.registerTool({
+  guardToolRegistrations(pi, "read").registerTool({
     name: "team_status",
     label: "Team status",
     description: "Show Team members in admission order. Does not wait or include task text or transcripts.",
@@ -428,7 +429,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
     },
   });
 
-  pi.registerTool({
+  guardToolRegistrations(pi, "read").registerTool({
     name: "team_result",
     label: "Team result",
     description: "Read a settled result. Ordinary assignments retain their complete diagnostic. Tables return bounded canonical fragments; read pertinent sections before dependent judgment. Start with section (default report) and maxBytes 4096..16384 (default 16384); continue with cursor only. Transport end is not completion or product acceptance. No acknowledgement.",
@@ -459,7 +460,7 @@ function registerTeamTools(pi: ExtensionAPI): void {
     },
   });
 
-  pi.registerTool({
+  guardToolRegistrations(pi, "read").registerTool({
     name: "team_cancel",
     label: "Cancel Team assignment",
     description: "Cancel one Team assignment. Its member stays owned until physical closure.",
@@ -599,6 +600,26 @@ function textResult(text: string, details: unknown, isError = false) {
 }
 
 function registerBackgroundTools(pi: ExtensionAPI): void {
+  // Managed admission cannot expose the legacy process-wide worker ports.
+  // Observations supply candidates; the backend revalidates their live owner.
+  const managedWorkers = (ctx: ExtensionContext): Set<string> | undefined => {
+    if (captureCallContext(ctx.cwd, ctx.sessionManager).kind !== "managed") return;
+    const sessionId = ctx.sessionManager.getSessionId();
+    const owned = new Set<string>();
+    for (const row of listObservations(undefined, sessionId)) {
+      if (!row.ownerToken) continue;
+      try {
+        resolveOwnedWorkerRead({ kind: "background", instanceId: row.id },
+          { ownerToken: row.ownerToken, coordinatorSessionId: sessionId });
+        owned.add(row.id);
+      } catch { /* Retired or foreign observations confer no worker authority. */ }
+    }
+    return owned;
+  };
+  const requireManagedWorker = (id: string, ctx: ExtensionContext) => {
+    const owned = managedWorkers(ctx);
+    if (owned && !owned.has(id)) throw new Error(`unknown worker ${id}`);
+  };
   pi.registerTool({
     name: "agent_spawn",
     label: "Spawn agent",
@@ -671,7 +692,7 @@ function registerBackgroundTools(pi: ExtensionAPI): void {
     },
   });
 
-  pi.registerTool({
+  guardToolRegistrations(pi, "read").registerTool({
     name: "agent_status",
     label: "Agent status",
     description: "Return compact background worker status. Does not wait for completion and does not include the result.",
@@ -681,11 +702,13 @@ function registerBackgroundTools(pi: ExtensionAPI): void {
       { id: Type.Optional(Type.String({ description: "Instance id. Omit to list every worker." })) },
       noExtra,
     ),
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const blocked = childBlocked("agent_status");
       if (blocked) return blocked;
       try {
-        const views = workerStatus(params.id);
+        const owned = managedWorkers(ctx);
+        if (params.id) requireManagedWorker(params.id, ctx);
+        const views = workerStatus(params.id).filter(row => !owned || owned.has(row.instanceId));
         return textResult(formatWorkerViews(views), { workers: views });
       } catch (error) {
         return errorResult(error instanceof Error ? error.message : String(error));
@@ -693,7 +716,7 @@ function registerBackgroundTools(pi: ExtensionAPI): void {
     },
   });
 
-  pi.registerTool({
+  guardToolRegistrations(pi, "read").registerTool({
     name: "agent_result",
     label: "Agent result",
     description:
@@ -701,10 +724,11 @@ function registerBackgroundTools(pi: ExtensionAPI): void {
     promptSnippet: "Inspect a settled background worker result",
     promptGuidelines: ["Interpret automatically supplied results. Use agent_result only for diagnostics; do not poll or acknowledge collection."],
     parameters: Type.Object({ id: Type.String({ description: "Instance id" }) }, noExtra),
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const blocked = childBlocked("agent_result");
       if (blocked) return blocked;
       try {
+        requireManagedWorker(params.id, ctx);
         const result = workerResult(params.id);
         return textResult(formatAgentResult(result), result, result.status !== "completed");
       } catch (error) {
@@ -713,17 +737,18 @@ function registerBackgroundTools(pi: ExtensionAPI): void {
     },
   });
 
-  pi.registerTool({
+  guardToolRegistrations(pi, "read").registerTool({
     name: "agent_cancel",
     label: "Cancel agent",
     description: "Cancel one background worker. Does not wait for the run to finish. Does not cancel other workers.",
     promptSnippet: "Cancel one background worker",
     promptGuidelines: ["Use agent_cancel only for the worker you intend to stop."],
     parameters: Type.Object({ id: Type.String({ description: "Instance id" }) }, noExtra),
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const blocked = childBlocked("agent_cancel");
       if (blocked) return blocked;
       try {
+        requireManagedWorker(params.id, ctx);
         const view = cancelWorker(params.id);
         return textResult(formatWorkerViews([view]), view);
       } catch (error) {

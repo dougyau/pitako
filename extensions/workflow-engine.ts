@@ -34,6 +34,17 @@ type HostOwner = {
   observation: () => Producer;
   unlock: () => void; listeners: Set<() => void>; retire: Set<() => Promise<void>>;
 };
+type NativeSession = object & { getSessionId?: () => string };
+type SessionBinding = {
+  readonly manager: NativeSession;
+  readonly sessionId: string | undefined;
+  readonly context: CallContext;
+};
+type ReceiverScope = {
+  manager: NativeSession; sessionId: string | undefined; initial: SessionBinding; owns: () => boolean;
+  activity?: { owner: HostOwner; ownerId: string; epoch: number };
+};
+type CallScope = { kind: "operation"; context: CallContext } | { kind: "receiver"; receiver: ReceiverScope };
 // Pi loads entries independently. Share captured host identities and their lifetime,
 // not serialized permissions or a process-wide "current owner".
 const HOST_KEY = Symbol.for("pitako.workflowHost");
@@ -44,8 +55,10 @@ function createHostState() {
     readers: new WeakMap<StatusReadAuthority, HostOwner>(),
     activityObservers: new AsyncLocalStorage<{ owner: HostOwner; active: boolean }>(),
     guards: new WeakSet<RootGuard>(),
-    contexts: new AsyncLocalStorage<CallContext>(),
+    contexts: new AsyncLocalStorage<CallScope | CallContext>(),
     sessions: new WeakMap<object, CallContext>(),
+    sessionBindings: new WeakMap<object, SessionBinding>(),
+    admissionOrigins: new WeakMap<CallContext, SessionBinding | undefined>(),
     liveProducers: new Map<string, Producer>(),
     // Only captured result custody can connect a disposition to its original transport.
     resultWaitSources: new WeakMap<PhaseAuthority, Map<string, (disposition: Extract<Disposition, { kind: "result-disposition" }>) => () => void>>(),
@@ -60,9 +73,13 @@ function createHostState() {
   };
 }
 const host = globalThis as typeof globalThis & { [HOST_KEY]?: ReturnType<typeof createHostState> };
-const { authorities, taskAuthorities, readers, activityObservers, guards, contexts, sessions, liveProducers,
+const state = host[HOST_KEY] ??= createHostState();
+// Add metadata to the existing host on reload; never replace its live stores or guards.
+state.sessionBindings ??= new WeakMap();
+state.admissionOrigins ??= new WeakMap();
+const { authorities, taskAuthorities, readers, activityObservers, guards, contexts, sessions, sessionBindings, admissionOrigins, liveProducers,
   resultWaitSources, ordinaryGuards, reservationParents, boundDrafts, lateDefinitions,
-  definitions, definitionParameters, readDefinitionParameters } = host[HOST_KEY] ??= createHostState();
+  definitions, definitionParameters, readDefinitionParameters } = state;
 function reobserveDefinitions(root: string): void {
   for (const entry of lateDefinitions) {
     if (entry.root !== root) continue;
@@ -117,9 +134,54 @@ export class RootGuard {
   close(): void { this.store.close(); guards.delete(this); }
 }
 
-export function currentCallContext(session?: object & { getSessionId?: () => string }): CallContext | undefined {
-  const captured = contexts.getStore() ?? (session && sessions.get(session));
-  if (captured) return captured;
+function bindingCurrent(binding: SessionBinding): boolean {
+  return sessionBindings.get(binding.manager) === binding && sessions.get(binding.manager) === binding.context &&
+    binding.sessionId === binding.manager.getSessionId?.();
+}
+function assertOriginCurrent(origin: SessionBinding | undefined): void {
+  if (origin && !bindingCurrent(origin)) throw new Error("original native admission retired or replaced");
+}
+function receiverBinding(receiver: ReceiverScope): SessionBinding {
+  if (!receiver.owns() || receiver.manager.getSessionId?.() !== receiver.sessionId)
+    throw new Error("native receiver owner retired");
+  const binding = sessionBindings.get(receiver.manager);
+  if (!binding || !bindingCurrent(binding)) throw new Error("native receiver binding unavailable");
+  if (binding !== receiver.initial) {
+    const activity = receiver.activity;
+    if (!activity || binding.context.kind !== "managed") throw new Error("native receiver binding replaced");
+    const owner = checkAuthority(binding.context.authority);
+    if (owner !== activity.owner || owner.manager !== receiver.manager ||
+        owner.run.ownerId !== activity.ownerId || owner.run.epoch !== activity.epoch)
+      throw new Error("native receiver activity replaced");
+  }
+  checkCallContext(binding.context);
+  return binding;
+}
+export function currentCallContext(session?: NativeSession): CallContext | undefined {
+  const scope = contexts.getStore();
+  if (scope?.kind === "receiver") {
+    if (session && session !== scope.receiver.manager) throw new Error("foreign native receiver manager");
+    return receiverBinding(scope.receiver).context;
+  }
+  const captured = scope?.kind === "operation" ? scope.context : scope;
+  if (captured) {
+    if (session) {
+      const bound = sessions.get(session);
+      const origin = admissionOrigins.get(captured);
+      if (origin || bound) {
+        if (captured.kind === "managed") checkAuthority(captured.authority);
+        assertOriginCurrent(origin);
+        if (bound !== captured) throw new Error("operation belongs to another native admission");
+        const binding = sessionBindings.get(session);
+        if (!binding || !bindingCurrent(binding)) throw new Error("native operation binding unavailable");
+      } else if (captured.kind !== "ordinary" || executionForSession(session.getSessionId?.())?.managed) {
+        throw new Error("native authority context is unavailable");
+      }
+    }
+    return captured;
+  }
+  const bound = session && sessions.get(session);
+  if (bound) return bound;
   if (session && executionForSession(session.getSessionId?.())?.managed)
     return { kind: "managed-unavailable", reason: "native authority context is unavailable" };
   return undefined;
@@ -132,25 +194,67 @@ export function captureCallContext(root: string | undefined, session?: object & 
   const physical = realpathSync(root);
   const workspace = currentWorkspace(statSync(physical).isDirectory() ? physical : path.dirname(physical));
   if (captured?.guard.store.root === workspace) return captured;
+  if (captured && admissionOrigins.get(captured)) throw new Error("native operation root mismatch");
   const guard = ordinaryGuards.get(workspace) ?? new RootGuard(workspace);
   ordinaryGuards.set(workspace, guard);
-  return { kind: "ordinary", guard };
+  const context: CallContext = { kind: "ordinary", guard };
+  admissionOrigins.set(context, undefined);
+  return context;
 }
 /** Registry entries are host objects, never reconstructed from names or execution correlation. */
 export function bindCallContext(session: object, context: CallContext): () => void {
   const prior = sessions.get(session);
   if (prior?.kind === "managed" && authorities.get(prior.authority)?.active) throw new Error("native context already bound");
+  const manager: NativeSession = session;
+  const binding: SessionBinding = { manager, sessionId: manager.getSessionId?.(), context };
   sessions.set(session, context);
-  return () => { if (sessions.get(session) === context) sessions.set(session, {
+  sessionBindings.set(session, binding);
+  // SDK children bind their attempt context, but cannot replace its original provenance.
+  if (!admissionOrigins.has(context)) admissionOrigins.set(context, binding);
+  return () => { if (sessionBindings.get(session) === binding && sessions.get(session) === context) sessions.set(session, {
     kind: "managed-unavailable", reason: "captured native context retired",
   }); };
 }
+/** Only real foreground lifecycle admission may publish an ordinary native root. */
+export function bindForegroundCallContext(root: string, manager: NativeSession): () => void {
+  const prior = sessions.get(manager), binding = sessionBindings.get(manager);
+  if (prior && (!binding || binding.sessionId === manager.getSessionId?.())) {
+    if (prior.kind === "ordinary") throw new Error("native foreground already bound");
+    // A trusted lifecycle can replace its closed ordinary admission, never a
+    // managed binding or its tombstone. Old operation origins stay retired.
+    if (prior.kind !== "managed-unavailable" || binding?.context.kind !== "ordinary") return () => {};
+  }
+  const physical = realpathSync(root), workspace = currentWorkspace(physical);
+  const guard = ordinaryGuards.get(workspace) ?? new RootGuard(workspace);
+  ordinaryGuards.set(workspace, guard);
+  return bindCallContext(manager, { kind: "ordinary", guard });
+}
+/** Host-only effect boundary. Producer scopes never become receiver authority. */
+export function withReceiverContext<T>(manager: NativeSession, expected: CallContext, owns: () => boolean, operation: () => T): T {
+  const binding = sessionBindings.get(manager);
+  if (!binding || binding.context !== expected || !bindingCurrent(binding) || reservationParents.has(expected))
+    throw new Error("native receiver requires the current principal root binding");
+  const receiver: ReceiverScope = { manager, sessionId: manager.getSessionId?.(), initial: binding, owns };
+  if (expected.kind === "managed") {
+    const owner = checkAuthority(expected.authority);
+    if (owner.manager !== manager) throw new Error("foreign native receiver owner");
+    receiver.activity = { owner, ownerId: owner.run.ownerId, epoch: owner.run.epoch };
+  }
+  receiverBinding(receiver);
+  return contexts.run({ kind: "receiver", receiver }, operation);
+}
 export function withCallContext<T>(context: CallContext, operation: () => T): T {
-  return contexts.run(context, operation);
+  if (!admissionOrigins.has(context)) admissionOrigins.set(context, undefined);
+  return contexts.run({ kind: "operation", context }, operation);
 }
 export function checkCallContext(context: CallContext): RootGuard {
   if (context.kind === "managed-unavailable") throw new Error(context.reason);
-  if (context.kind === "managed") return checkAuthority(context.authority).guard;
+  if (context.kind === "managed") {
+    const guard = checkAuthority(context.authority).guard;
+    assertOriginCurrent(admissionOrigins.get(context));
+    return guard;
+  }
+  assertOriginCurrent(admissionOrigins.get(context));
   if (!guards.has(context.guard)) throw new Error("ordinary root guard retired");
   return context.guard;
 }
@@ -232,6 +336,9 @@ export function registerBackgroundAttempt(context: CallContext, input: {
   cwd: string; instanceId: string; dispatchId: string; roleId: string; assignmentId?: string; watch?: AttemptWatch; archive?: boolean;
 }) {
   const guard = checkCallContext(context), store = guard.store;
+  if (!admissionOrigins.has(context)) admissionOrigins.set(context, undefined);
+  const origin = admissionOrigins.get(context);
+  const assertAdmissionCurrent = () => { assertOriginCurrent(origin); checkCallContext(context); };
   const cwd = realpathSync(input.cwd);
   if (cwd !== store.root && currentWorkspace(cwd) !== store.root) throw new Error("attempt context/root mismatch");
   if (input.watch?.execution) {
@@ -254,6 +361,7 @@ export function registerBackgroundAttempt(context: CallContext, input: {
       status: "pending", cleared: false });
     store.enqueue(`attempt:${input.dispatchId}`, JSON.stringify(producer.ref), { kind: "registered", attempt });
     captured = { ...context };
+    admissionOrigins.set(captured, origin);
     reservationParents.set(captured, reservation);
     if (context.kind === "managed") {
       const owner = checkAuthority(context.authority);
@@ -263,6 +371,13 @@ export function registerBackgroundAttempt(context: CallContext, input: {
   });
   return {
     context: captured, producer, archive, attempt, store,
+    assertAdmissionCurrent,
+    receiverContext(manager: object): CallContext {
+      assertAdmissionCurrent();
+      if (!origin || origin.manager !== manager || reservationParents.has(origin.context))
+        throw new Error("result has no original native principal receiver");
+      return origin.context;
+    },
     receipt: () => store.all<ReleaseReceipt>("receipts").find(receipt =>
       receipt.reservationId === attempt.reservationId && store.verifyReceipt(receipt)),
     admit() {
@@ -318,6 +433,7 @@ export interface CapturedWakeSource {
   observe(boundary?: "context" | "turn_start" | "agent_settled"): void;
   claimWake(envelope: string): boolean;
   assertIssued(): void;
+  receiverContext(manager: object): CallContext;
   recoveryPending(): boolean;
   noProgress(): boolean;
 }
@@ -329,7 +445,7 @@ export function captureResultSource(attempt: BackgroundAttempt, resultId: string
   const obligationId = `result:${resultId}`;
   // Run/result/cause-transition, deliberately independent of request, carrier and phase epoch.
   const cause = `wake:${runId ?? attempt.attempt.resource.producerId}:${resultId}:result-ready`;
-  const check = () => { checkCallContext(context); if (!owner.owns()) throw new Error("original result owner retired"); };
+  const check = () => { attempt.assertAdmissionCurrent(); if (!owner.owns()) throw new Error("original result owner retired"); };
   let effectiveReceipt: unknown;
   const exactReceipt = () => {
     const branch = owner.getBranch();
@@ -379,6 +495,7 @@ export function captureResultSource(attempt: BackgroundAttempt, resultId: string
     let recoveryExhausted = false;
     return Object.freeze({
       resultId,
+      receiverContext(manager: object) { valid(); return attempt.receiverContext(manager); },
       observe(boundary?: "context" | "turn_start" | "agent_settled") {
         valid();
         const receipt = exactReceipt();
@@ -526,6 +643,20 @@ export function guardDefinition<P extends TSchema, D, S>(definition: ToolDefinit
   const wrapped = { ...definition, parameters: preserveSchema ? definition.parameters : { ...definition.parameters },
     execute(...args: Parameters<typeof definition.execute>) {
     const [id, params, signal, update, ctx] = args;
+    if (effect === "read") {
+      // Observation validates any captured owner, but does not acquire workspace
+      // state: archived native history may outlive its physical checkout.
+      let context: CallContext | undefined;
+      try {
+        context = currentCallContext(ctx.sessionManager);
+        if (context) checkCallContext(context);
+      }
+      catch (error) {
+        if (unavailable) return Promise.resolve(unavailable(error));
+        throw error;
+      }
+      return context ? withCallContext(context, () => execute(...args)) : execute(...args);
+    }
     let context: CallContext, guard: RootGuard;
     try {
       context = captureCallContext(ctx.cwd, ctx.sessionManager);
@@ -534,7 +665,6 @@ export function guardDefinition<P extends TSchema, D, S>(definition: ToolDefinit
       if (unavailable) return Promise.resolve(unavailable(error));
       throw error;
     }
-    if (effect === "read") return withCallContext(context, () => execute(id, params, signal, update, ctx));
     assertGenericWrite(context);
     return (async () => {
     const resource = reserveEffect(context, { reservationId: randomUUID(), kind: "writer", paths: [realpathSync(ctx.cwd)] })
@@ -1131,7 +1261,15 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options: { shutdown: 
 export function registerWorkflowCommands(pi: ExtensionAPI, options?: { shutdown: false }): void | (() => Promise<void>) {
   let invocation: { identity: string; manager: object; sessionId: string; activity: ReturnType<typeof openActivity>; unbind: () => void; cleanup?: () => void; executePolicy?: string; taskId?: string } | undefined;
   let pending: { identity: string; manager: object; sessionId: string; ticket: number; taskId?: string } | undefined;
-  const sendTaskTurn = (activity: ReturnType<typeof openActivity>, authority: PhaseAuthority, policy: string, resume = false) => {
+  const sendTurn = (activity: ReturnType<typeof openActivity>, context: CallContext, effect: () => void) => {
+    const current = invocation, ticket = revision;
+    if (!current || current.activity !== activity) throw new Error("workflow turn owner retired");
+    const manager: NativeSession = current.manager;
+    const owns = () => invocation === current && revision === ticket && current.manager === manager &&
+      current.sessionId === manager.getSessionId?.() && activity.current();
+    return withReceiverContext(manager, context, owns, effect);
+  };
+  const sendTaskTurn = (activity: ReturnType<typeof openActivity>, context: CallContext, authority: PhaseAuthority, policy: string, resume = false) => {
     const owner = checkAuthority(authority), run = owner.store.fence(authority.fence);
     const key = `task-turn:${run.task!.intentId}:${run.phaseEpoch}${resume ? `:resume:${run.epoch}` : ""}`;
     const previous = owner.store.get<{ state: string }>("obligations", key);
@@ -1150,7 +1288,7 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options?: { shutdown:
       owner.store.enqueue(`run:${run.runId}`, run.binding, { kind: "task-phase-turn", key, message, phaseEpoch: run.phaseEpoch });
     });
     checkAuthority(authority);
-    pi.sendMessage(message, { triggerTurn: true });
+    sendTurn(activity, context, () => pi.sendMessage(message, { triggerTurn: true }));
     owner.store.transaction(() => owner.store.put("obligations", key,
       { kind: "phase-turn", key, message, state: "sent", cleared: true, runId: run.runId }));
   };
@@ -1171,7 +1309,7 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options?: { shutdown:
       const next = current.activity.deriveExecution(run.version, receipt);
       current.unbind();
       current.unbind = bindCallContext(current.manager, next.context);
-      sendTaskTurn(current.activity, next.authority, current.executePolicy!);
+      sendTaskTurn(current.activity, next.context, next.authority, current.executePolicy!);
     },
   });
   registerResultDispositionTool(pi);
@@ -1228,10 +1366,10 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options?: { shutdown:
         pending = undefined;
         if (ctx.signal?.aborted) { await retire(); throw new Error("workflow invocation aborted"); }
         ctx.signal?.addEventListener("abort", () => { if (invocation?.activity === activity) void retire(); }, { once: true });
-        pi.sendMessage({ customType: "pitako.workflow.execute",
+        sendTurn(activity, activity.context, () => pi.sendMessage({ customType: "pitako.workflow.execute",
           content: `${policy}\n\nNative /execute invocation. Frozen binding:\n${identity}`,
           display: true, details: { runId: activity.authority.fence.runId, source: "frozen" } },
-        { triggerTurn: true });
+        { triggerTurn: true }));
       } catch (error) { reject(ctx, error); }
       finally { if (pendingTicket !== undefined && pending?.ticket === pendingTicket) pending = undefined; }
     },
@@ -1273,8 +1411,8 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options?: { shutdown:
         pending = undefined;
         if (ctx.signal?.aborted) { await retire(); throw new Error("workflow invocation aborted"); }
         ctx.signal?.addEventListener("abort", () => { if (invocation?.activity === activity) void retire(); }, { once: true });
-        pi.sendMessage({ customType: "pitako.workflow.plan", content: `${policy}\n\nNative managed /plan. Local slot ${id}; host revision ${String(activity.readBoundPlan().meta?.revision ?? "absent")}. Use planning operations; no generic writes or execution ledger.`,
-          display: true, details: { runId: activity.authority.fence.runId, source: "draft" } }, { triggerTurn: true });
+        sendTurn(activity, activity.context, () => pi.sendMessage({ customType: "pitako.workflow.plan", content: `${policy}\n\nNative managed /plan. Local slot ${id}; host revision ${String(activity.readBoundPlan().meta?.revision ?? "absent")}. Use planning operations; no generic writes or execution ledger.`,
+          display: true, details: { runId: activity.authority.fence.runId, source: "draft" } }, { triggerTurn: true }));
       } catch (error) { reject(ctx, error); }
       finally { if (pendingTicket !== undefined && pending?.ticket === pendingTicket) pending = undefined; }
     },
@@ -1369,7 +1507,7 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options?: { shutdown:
         if (ctx.signal?.aborted) { await retire(); throw new Error("task invocation aborted"); }
         if (checkAuthority(activity.authority).run.phase === "execution")
           withCallContext(activity.context, () => openExecutionPlan(id, root, { createLedger: true }));
-        sendTaskTurn(activity, activity.authority, checkAuthority(activity.authority).run.phase === "planning" ? policy : executePolicy, resume);
+        sendTaskTurn(activity, activity.context, activity.authority, checkAuthority(activity.authority).run.phase === "planning" ? policy : executePolicy, resume);
       } catch (error) { reject(ctx, error); }
       finally {
         cleanup?.();

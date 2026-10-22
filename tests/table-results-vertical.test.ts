@@ -154,12 +154,12 @@ for (const protocol of ["architecture", "review"] as const) {
         expect(JSON.stringify(root)).not.toContain(giant);
       }
       release.resolve(); await s.close(); closed = true;
-      const retired = await s.invoke(`${protocol}_read`, { ...target, cursor: parse(replacement).header.cursor });
-      expect(retired.isError).toBe(true); expect(jsonBytes(retired)).toBeLessThanOrEqual(4096);
-      const retiredResult = await s.invoke("team_result", { ...resultTarget, cursor: resultPage.header.cursor });
-      expect(retiredResult.isError).toBe(true); expect(jsonBytes(retiredResult)).toBeLessThanOrEqual(4096);
-      expect(retiredResult.details).toEqual({ table: true });
-      expect(parse(retiredResult).error).toBe("table_request_failed");
+      // The observer itself is retired, so direct definitions reject before the
+      // table pagination adapter. Valid observers exercised bounded errors above.
+      expect(() => s.invoke(`${protocol}_read`, { ...target, cursor: parse(replacement).header.cursor }))
+        .toThrow("captured native context retired");
+      expect(() => s.invoke("team_result", { ...resultTarget, cursor: resultPage.header.cursor }))
+        .toThrow("captured native context retired");
     } finally { release.resolve(); if (!closed) await s.close(); }
   }));
 

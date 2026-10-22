@@ -4,9 +4,10 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type ExtensionContext, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import { createAssistantMessageEventStream, type AssistantMessage, type ToolResultMessage } from "@earendil-works/pi-ai";
 import { architectureFixture } from "./fixtures/architecture.ts";
-import { captureCallContext, checkAuthority, checkTaskAuthority, withCallContext, reserveEffect, RootGuard, waitForProducer } from "../extensions/workflow-engine.ts";
+import { captureCallContext, captureResultSource, currentCallContext, checkAuthority, checkTaskAuthority, registerBackgroundAttempt, withCallContext, reserveEffect, RootGuard, waitForProducer } from "../extensions/workflow-engine.ts";
 import { WorkflowState } from "../extensions/workflow-state.ts";
 import { ledgerFile, planFile } from "../extensions/workflow.ts";
 import { finishTask } from "../extensions/workflow-task.ts";
@@ -81,6 +82,120 @@ async function freeze(app: App, correct = false) {
     reviewAssignmentId: review.assignmentId, dispositions: [], designAdoption: "Complete unchanged design, exact status transformation",
     acceptance: "Accept the complete reviewed plan", absorption: "All pertinent released planning work absorbed" }));
 }
+
+test("native streaming /task Freeze keeps its original loop on the real derived execution receiver", async () => {
+  const app = await setup();
+  const settings = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
+  const runtime = await ModelRuntime.create({ authPath: path.join(app.root, "principal-auth"), modelsPath: null,
+    modelsStorePath: path.join(app.root, "principal-models"), allowModelNetwork: false, refreshOnCreate: false });
+  const finished = Promise.withResolvers<void>();
+  let requests = 0, failure: unknown, frozenWhileStreaming = false;
+  runtime.registerProvider("receiver", { api: "openai-completions", apiKey: "offline", baseUrl: "http://offline.invalid",
+    models: [{ id: "principal", name: "principal", reasoning: false, input: ["text"], contextWindow: 128000, maxTokens: 1000,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
+    streamSimple(model) {
+      const n = requests++, stream = createAssistantMessageEventStream();
+      const base: AssistantMessage = { role: "assistant", api: model.api, provider: model.provider, model: model.id,
+        content: [], stopReason: "stop", timestamp: Date.now(),
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+      void (async () => {
+        const context = currentCallContext();
+        expect(context?.kind).toBe("managed");
+        if (context?.kind !== "managed") throw new Error("missing native task receiver");
+        if (n === 0) {
+          expect(checkAuthority(context.authority).run.phase).toBe("planning");
+          const prior = registerBackgroundAttempt(context, { cwd: app.root, instanceId: "prior-phase",
+            dispatchId: "prior-phase", roleId: "developer" });
+          prior.admit();
+          const source = captureResultSource(prior, "prior-phase-result",
+            { customType: "result", content: "prior phase", details: { deliveryId: "prior-phase" } },
+            { owns: () => true, getBranch: () => [] });
+          prior.result({ status: "completed", result: "original phase custody" });
+          prior.producer.observe("preparation", "closed");
+          prior.producer.observe("host-operation", "closed");
+          expect(prior.producer.observe("callback", "closed", true)).toBeDefined();
+          await freeze(app);
+          frozenWhileStreaming = session.isStreaming;
+          const next = currentCallContext();
+          if (next?.kind !== "managed") throw new Error("missing derived receiver");
+          expect(checkAuthority(next.authority).run.phase).toBe("execution");
+          expect(() => source.receiverContext(session.sessionManager)).toThrow(/retired or replaced|stale/);
+          expect(prior.receipt()).toBeDefined();
+          expect(prior.store.get("attempts", "prior-phase")).toMatchObject({ outcome: { result: "original phase custody" } });
+          for (const manager of [undefined, session.sessionManager])
+            expect(() => withCallContext(context, () => {
+              const stale = currentCallContext(manager)!;
+              checkAuthority(stale.kind === "managed" ? stale.authority : context.authority);
+            })).toThrow(/stale|retired/);
+        } else expect(checkAuthority(context.authority).run.phase).toBe("execution");
+        const call = n === 1;
+        const message: AssistantMessage = { ...base,
+          content: call ? [{ type: "toolCall", id: "derived-gate", name: "execution_gates",
+            arguments: { commands: [{ command: "printf receiver-effect", timeoutSeconds: 5 }], coverage: "Native current execution receiver" } }]
+            : [{ type: "text", text: "phase observed" }], stopReason: call ? "toolUse" : "stop" };
+        stream.push({ type: "done", reason: call ? "toolUse" : "stop", message }); stream.end();
+      })().catch(error => {
+        failure = error;
+        stream.push({ type: "error", reason: "error", error: { ...base, stopReason: "error", errorMessage: String(error) } });
+        stream.end(); finished.resolve();
+      });
+      return stream;
+    },
+  });
+  // Reuse the full controlled table fixture. Only the principal loop and tool
+  // consumer are native SDK here; no test-only authority or acceptance producer.
+  const native: ExtensionFactory = pi => {
+    for (const definition of app.tools.values()) pi.registerTool(definition);
+    for (const [name, definition] of app.commands) pi.registerCommand(name, definition);
+    app.pi.getAllTools = () => pi.getAllTools();
+    app.pi.sendMessage = (message: any, options: any) => { app.sent.push({ message, options }); pi.sendMessage(message, options); };
+    const forward = (name: string) => async (event: unknown, ctx: ExtensionContext) => {
+      if (name === "session_start") {
+        app.ctx.sessionManager = ctx.sessionManager;
+        app.ctx.isIdle = () => ctx.isIdle();
+      }
+      const value = await app.emit(name, event);
+      if (name === "agent_settled" && requests >= 3) finished.resolve();
+      return value;
+    };
+    pi.on("session_start", forward("session_start"));
+    pi.on("session_shutdown", forward("session_shutdown"));
+    pi.on("input", forward("input"));
+    pi.on("tool_call", forward("tool_call"));
+    pi.on("tool_result", forward("tool_result"));
+    pi.on("turn_start", forward("turn_start"));
+    pi.on("context", forward("context"));
+    pi.on("message_end", forward("message_end"));
+    pi.on("agent_before_settle", forward("agent_before_settle"));
+    pi.on("agent_settled", forward("agent_settled"));
+    pi.on("agent_end", forward("agent_end"));
+  };
+  const loader = new DefaultResourceLoader({ cwd: app.root, agentDir: app.root, settingsManager: settings, noExtensions: true,
+    noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, extensionFactories: [native] });
+  await loader.reload();
+  const { session } = await f.fixture.acquire(createAgentSession({ cwd: app.root, agentDir: app.root, modelRuntime: runtime,
+    model: runtime.getModel("receiver", "principal"), settingsManager: settings, resourceLoader: loader,
+    sessionManager: SessionManager.create(app.root, path.join(app.root, "principal-sessions")) }));
+  try {
+    await session.bindExtensions({});
+    await f.fixture.run(session.prompt("/task streaming"));
+    await finished.promise;
+    await f.fixture.run(session.waitForIdle());
+    if (failure) throw failure;
+    expect(frozenWhileStreaming).toBe(true);
+    expect(requests).toBeGreaterThanOrEqual(3);
+    const result = session.messages.find((message): message is ToolResultMessage => message.role === "toolResult" && message.toolName === "execution_gates");
+    expect(result, "derived execution must consume a real current native tool call").toBeDefined();
+    expect(result!.isError, JSON.stringify(result)).not.toBe(true);
+    expect(JSON.stringify(result)).toContain("receiver-effect");
+    expect(app.sent.filter(item => item.message.customType === "pitako.workflow.task")).toHaveLength(2);
+  } finally {
+    await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+    await session.dispose();
+    await app.close();
+  }
+});
 
 async function prepareTask(app: App, git: boolean, input = "example") {
     if (git) execFileSync("git", ["init", "-q"], { cwd: app.root });

@@ -20,33 +20,42 @@ import {
 import { clearObservations, listObservations } from "../extensions/agent/observe.ts";
 import { formatAgentResult, runAgentInstance, type AttemptExecutor } from "../extensions/agent/run.ts";
 import { formatFooter } from "../extensions/agent/ui.ts";
-import { packageRoot } from "../extensions/stack.ts";
 import type { LoadOptions } from "../extensions/roles/load.ts";
 
 const fixture = agentFixtureOwnership();
 const tempDirs = fixture.directories;
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+let workspace: string | undefined;
 afterEach(async () => {
   fixture.requireReleasedFixture();
+  await cancelAllWorkers();
   setSystemTime();
   if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
   else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
-  await cancelAllWorkers();
   clearBackgroundOwner();
   setBackgroundExecutor(undefined);
   clearObservations();
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  workspace = undefined;
 });
 
+function operationRoot(): string {
+  if (!workspace) {
+    workspace = mkdtempSync(path.join(tmpdir(), "pitako-obs-"));
+    tempDirs.push(workspace);
+  }
+  return workspace;
+}
+
 function load(extra = ""): LoadOptions {
-  const dir = mkdtempSync(path.join(tmpdir(), "pitako-obs-"));
-  tempDirs.push(dir);
+  const dir = path.join(operationRoot(), "storage");
   const userConfigPath = path.join(dir, "pitako", "config.toml");
   mkdirSync(path.dirname(userConfigPath), { recursive: true });
   writeFileSync(
     userConfigPath,
     `[model_policies.developer.primary]\nmodel = "example/primary"\nreasoning = "medium"\n${extra}`,
   );
+  process.env.PI_CODING_AGENT_DIR = dir;
   return { env: { PI_CODING_AGENT_DIR: dir }, userConfigPath };
 }
 
@@ -72,7 +81,7 @@ describe("T2 observations", () => {
     const handle = await spawnBackground({
       roleId: "developer",
       task: "Fix lifecycle\nSECRET-SECOND",
-      cwd: packageRoot(),
+      cwd: operationRoot(),
       load: load(),
       watch: { planId: "obs-plan", unitId: "T2" },
       executor: {
@@ -114,7 +123,7 @@ describe("T2 observations", () => {
     const result = await runAgentInstance({
       roleId: "developer",
       task: "sample tokens",
-      cwd: packageRoot(),
+      cwd: operationRoot(),
       executor,
       load: load(),
       now: () => clock,
@@ -150,7 +159,7 @@ describe("T2 observations", () => {
     await runAgentInstance({
       roleId: "developer",
       task: "fallback path",
-      cwd: packageRoot(),
+      cwd: operationRoot(),
       executor,
       load: load(`[[model_policies.developer.fallbacks]]\nmodel = "example/fallback-1"\nreasoning = "high"\n`),
       onObserve(snap) {
@@ -223,7 +232,7 @@ describe("T2 observations", () => {
     const handle = await spawnBackground({
       roleId: "developer",
       task: "take result",
-      cwd: packageRoot(),
+      cwd: operationRoot(),
       load: load(),
       executor: {
         async start() {
@@ -287,12 +296,12 @@ describe("T2 observations", () => {
       { role: "developer", task: "status path" },
       new AbortController().signal,
       undefined,
-      { cwd: packageRoot() },
+      { cwd: operationRoot() },
     );
     expect(spawnResult.isError).toBe(false);
     await startedP;
     setSystemTime(Date.now());
-    const status = await tools.get("agent_status")?.execute("call", {}, undefined, undefined, { cwd: packageRoot() });
+    const status = await tools.get("agent_status")?.execute("call", {}, undefined, undefined, { cwd: operationRoot() });
     const views = workerStatus();
     expect(status.content[0].text).toBe(formatWorkerViews(views));
     expect(status.content[0].text).toContain("instance_id:");
@@ -343,7 +352,7 @@ describe("T2 observations", () => {
     await runAgentInstance({
       roleId: "developer",
       task: "stream clock",
-      cwd: packageRoot(),
+      cwd: operationRoot(),
       executor,
       load: load(),
       now: () => clock,
@@ -404,7 +413,7 @@ describe("T2 observations", () => {
     await runAgentInstance({
       roleId: "developer",
       task: "hold clock",
-      cwd: packageRoot(),
+      cwd: operationRoot(),
       executor,
       load: load(),
       now: () => clock,

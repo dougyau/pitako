@@ -157,13 +157,13 @@ async function withAuthorEnv(
       else process.env[key] = value;
     }
     const hooks = sessionHooks();
-    let context: unknown = { hasUI: false };
+    let context: unknown = { cwd: config.root, hasUI: false };
     authorFixture.beforeRelease(() => hooks.shutdown({}, context));
     await run({
       ...hooks,
       start(event, ctx) {
-        context = ctx;
-        return authorFixture.run(hooks.start(event, ctx));
+        context = { ...(ctx as object), cwd: config.root };
+        return authorFixture.run(hooks.start(event, context));
       },
     }, config.root);
   })();
