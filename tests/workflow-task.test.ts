@@ -82,9 +82,9 @@ async function freeze(app: App, correct = false) {
     acceptance: "Accept the complete reviewed plan", absorption: "All pertinent released planning work absorbed" }));
 }
 
-async function prepareTask(app: App, git: boolean) {
+async function prepareTask(app: App, git: boolean, input = "example") {
     if (git) execFileSync("git", ["init", "-q"], { cwd: app.root });
-    await app.commands.get("task").handler("example", app.ctx);
+    await app.commands.get("task").handler(input, app.ctx);
     const before = captureCallContext(app.root, app.ctx.sessionManager);
     if (before.kind !== "managed") throw new Error("missing task");
     const owner = checkAuthority(before.authority);
@@ -100,8 +100,8 @@ async function prepareTask(app: App, git: boolean) {
     expect(owner.run.phaseEpoch).toBe(2);
     expect(owner.run.phase).toBe("execution");
     expect(owner.run.task?.freezeReceiptRef).toBe(receipt.receiptId);
-    expect(readFileSync(planFile("example", app.root), "utf8")).toBe(receipt.snapshot.text);
-    expect(existsSync(ledgerFile("example", app.root))).toBe(true);
+    expect(readFileSync(planFile(owner.run.planId, app.root), "utf8")).toBe(receipt.snapshot.text);
+    expect(existsSync(ledgerFile(owner.run.planId, app.root))).toBe(true);
     const turns = app.sent.filter(item => item.message.customType === "pitako.workflow.task");
     expect(turns).toHaveLength(2);
     for (const [index, turn] of turns.entries()) {
@@ -115,7 +115,7 @@ async function prepareTask(app: App, git: boolean) {
       expect(turn.options.triggerTurn).toBe(true);
     }
     expect(app.sent.filter(item => item.message.customType === "pitako.workflow.execute")).toHaveLength(0);
-    await app.commands.get("task").handler("example", app.ctx);
+    await app.commands.get("task").handler(input, app.ctx);
     expect(app.sent.filter(item => item.message.customType === "pitako.workflow.task")).toHaveLength(2);
     writeFileSync(app.root + "/implementation.ts", "export const bounded = true;\n");
     const gates = payload(await app.invoke("execution_gates", { commands: [{ command: "printf owned-gate", timeoutSeconds: 5 }], coverage: "Controlled finite check" }));
@@ -278,6 +278,13 @@ test(`observed ${outcome} fences /${command} execution capabilities before agent
       release.resolve();
       await app.emit("session_before_switch");
       expect(joined).toBe(true);
+      if (command === "task") {
+        app.ctx.hasUI = true;
+        const turns = app.sent.length;
+        await app.commands.get("task").handler("", app.ctx);
+        expect(app.sent).toHaveLength(turns);
+        expect(() => checkAuthority(context.authority)).toThrow("retired");
+      }
     } finally { release.resolve(); await app.close(); }
 });
 
@@ -336,7 +343,7 @@ for (const git of [false, true]) describe(`/task full contract (${git ? "Git" : 
     owned = f.fixture.ownedCase(`${git ? "Git" : "no Git"} task fixture and completion`, async () => {
       app = await setup(!git);
       try {
-        prepared = await prepareTask(app, git);
+        prepared = await prepareTask(app, git, git ? "example" : "");
         ready.resolve();
         await finish.promise;
       } finally { await app.close(); }
@@ -356,7 +363,35 @@ for (const git of [false, true]) describe(`/task full contract (${git ? "Git" : 
       await completion;
     });
     bunTest("delivered policy and registered Review producer complete handler/FreezeReceipt/gates/acceptance/finish without publication", async () => {
-      completion = completeTask(app, prepared, review, git);
+      completion = (async () => {
+        await completeTask(app, prepared, review, git);
+        const previous = prepared.owner.run;
+        app.ctx.hasUI = true;
+        await app.commands.get("task").handler(previous.planId, app.ctx);
+        expect(app.sent.filter(item => item.message.customType === "pitako.workflow.task")).toHaveLength(2);
+        const conversation = SessionManager.inMemory(app.root);
+        conversation.appendMessage({ role: "user", content: "Now repair the next bounded behavior.", timestamp: Date.now() });
+        app.ctx.sessionManager.getBranch = () => conversation.getBranch();
+        await app.commands.get("task").handler(" \t ", app.ctx);
+        const fresh = captureCallContext(app.root, app.ctx.sessionManager);
+        if (fresh.kind !== "managed") throw new Error("missing fresh contextual task after completion");
+        const next = checkAuthority(fresh.authority).run;
+        expect(next.planId).toMatch(/^task-[a-z0-9_-]+$/);
+        expect(next.planId).not.toBe(previous.planId);
+        expect(next.runId).not.toBe(previous.runId);
+        expect(next.task!.intentId).not.toBe(previous.task!.intentId);
+        expect(next.phase).toBe("planning");
+        expect(next.task!.freezeReceiptRef).toBeUndefined();
+        expect(existsSync(planFile(next.planId, app.root))).toBe(false);
+        expect(existsSync(ledgerFile(next.planId, app.root))).toBe(false);
+        expect(prepared.owner.run.state).toBe("completed");
+        expect(() => checkAuthority(prepared.context.authority)).toThrow("retired");
+        const turns = app.sent.filter(item => item.message.customType === "pitako.workflow.task");
+        expect(turns).toHaveLength(3);
+        const delivered = JSON.parse(turns[2]!.message.content).projection;
+        expect(delivered).toMatchObject({ runId: next.runId, intentId: next.task!.intentId, phase: "planning", resume: false });
+        expect(delivered.instruction).toContain("current conversation");
+      })();
       await completion;
     });
   });
@@ -401,6 +436,49 @@ test("task captures pending intent before idle, duplicate is idempotent, invalid
     expect(checkAuthority(context.authority).run.phase).toBe("planning");
     expect(app.sent.filter(item => item.message.customType === "pitako.workflow.task")).toHaveLength(1);
   } finally { idle.resolve(); await app.close(); }
+});
+
+test("contextual task preserves pending/active intent and requires explicit resume after Stop", async () => {
+  const app = await setup(), idle = Promise.withResolvers<void>();
+  try {
+    app.ctx.hasUI = true; app.ctx.waitForIdle = () => idle.promise;
+    const starting = app.commands.get("task").handler("", app.ctx);
+    await app.commands.get("task").handler(" \t ", app.ctx);
+    await app.commands.get("task").handler("bad args", app.ctx);
+    idle.resolve(); await starting;
+    const context = captureCallContext(app.root, app.ctx.sessionManager);
+    if (context.kind !== "managed") throw new Error("missing contextual task");
+    const owner = checkAuthority(context.authority), intent = owner.run.task!.intentId;
+    expect(owner.run.planId).toMatch(/^task-[a-z0-9_-]+$/);
+    const sent = app.sent.filter(item => item.message.customType === "pitako.workflow.task");
+    expect(sent).toHaveLength(1);
+    await app.commands.get("task").handler("", app.ctx);
+    expect(owner.run.task!.intentId).toBe(intent);
+    expect(app.sent.filter(item => item.message.customType === "pitako.workflow.task")).toHaveLength(1);
+    await app.emit("input", { text: "/stop" });
+    app.ctx.waitForIdle = async () => {};
+    await app.commands.get("task").handler("", app.ctx);
+    expect(app.sent.filter(item => item.message.customType === "pitako.workflow.task")).toHaveLength(1);
+    expect(() => checkAuthority(context.authority)).toThrow(/retired/);
+    await app.commands.get("task").handler(owner.run.planId, app.ctx);
+    const resumed = captureCallContext(app.root, app.ctx.sessionManager);
+    if (resumed.kind !== "managed") throw new Error("missing explicit resume");
+    expect(checkAuthority(resumed.authority).run.task!.intentId).toBe(intent);
+  } finally { idle.resolve(); await app.close(); }
+});
+
+test("contextual task cannot retire a different active plan", async () => {
+  const app = await setup();
+  try {
+    app.ctx.hasUI = true;
+    await app.commands.get("plan").handler("independent", app.ctx);
+    const context = captureCallContext(app.root, app.ctx.sessionManager);
+    if (context.kind !== "managed") throw new Error("missing plan");
+    await app.commands.get("task").handler(" \t ", app.ctx);
+    expect(checkAuthority(context.authority).run.activity).toBe("plan");
+    expect(app.sent.filter(item => item.message.customType === "pitako.workflow.task")).toHaveLength(0);
+    expect(app.sent.filter(item => item.message.customType === "pitako.workflow.plan")).toHaveLength(1);
+  } finally { await app.close(); }
 });
 
 test("Abort observed while waiting revokes pending task synchronously; identity changes cannot acquire owner", async () => {
@@ -491,6 +569,9 @@ test("uncertain initial task outbox cannot acquire a replacement owner or send a
     if (first.kind !== "managed") throw new Error("missing captured task");
     await app.emit("input", { text: "/stop" });
     app.pi.sendMessage = send;
+    const turns = app.sent.length;
+    await app.commands.get("task").handler("", app.ctx);
+    expect(app.sent).toHaveLength(turns);
     await app.commands.get("task").handler("uncertain", app.ctx);
     expect(attempts).toBe(1);
     expect(captureCallContext(app.root, app.ctx.sessionManager).kind).toBe("managed-unavailable");
