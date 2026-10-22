@@ -10,6 +10,7 @@ import { agentScope } from "../extensions/agent/scope.ts";
 import type { HistoryPage, HistoryQuery } from "../extensions/agent/history-query.ts";
 import { pruneWorkerHistory } from "../extensions/agent/history-retention.ts";
 import { childActiveTools, toolsForProfile } from "../extensions/profile.ts";
+import { bindCallContext } from "../extensions/workflow-engine.ts";
 
 const roots: string[] = [];
 const original = process.env.PI_CODING_AGENT_DIR;
@@ -18,7 +19,7 @@ afterEach(() => {
   else process.env.PI_CODING_AGENT_DIR = original;
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
-function adapters(coordinator = "current") {
+function adapters(coordinator = "current", cwd = "/removed/worktree") {
   let tool: any;
   let command: any;
   const pi = {
@@ -28,10 +29,11 @@ function adapters(coordinator = "current") {
   };
   agentInstance(pi as unknown as ExtensionAPI);
   pitako(pi as unknown as ExtensionAPI);
-  const ctx = { cwd: "/removed/worktree", sessionManager: { getSessionId: () => coordinator },
+  const ctx = { cwd, sessionManager: { getSessionId: () => coordinator },
     hasUI: true, ui: { notify() {} } };
   return {
     tool,
+    manager: ctx.sessionManager,
     async query(input: HistoryQuery): Promise<HistoryPage> {
       const result = await tool.execute("consult", input, undefined, undefined, ctx);
       expect(Buffer.byteLength(result.content[0].text)).toBeLessThanOrEqual(32768);
@@ -61,6 +63,24 @@ function fixture(coordinator = "current") {
   return { root, history, group, member, file };
 }
 function codes(page: HistoryPage) { return page.diagnostics.map((row) => row.code); }
+
+test("ordinary archive reads need no checkout or workspace state; unavailable captured owners stay rejected", async () => {
+  const { root, file, member } = fixture();
+  const removed = path.join(root, "removed-worktree");
+  const api = adapters("current", removed);
+  writeFileSync(file, '{"type":"session","id":"native-id"}\n');
+  expect((await api.query({ action: "list" })).items).toHaveLength(1);
+  expect(await reconstruct(api, member.historyId)).toEqual(readFileSync(file));
+  expect(existsSync(removed)).toBe(false);
+  expect(existsSync(path.join(root, ".pitako"))).toBe(false);
+  const retire = bindCallContext(api.manager, { kind: "managed-unavailable", reason: "native authority context is unavailable" });
+  try {
+    await expect(Promise.resolve().then(() => api.query({ action: "list" }))).rejects.toThrow("native authority context is unavailable");
+  } finally { retire(); }
+  await expect(Promise.resolve().then(() => api.query({ action: "list" }))).rejects.toThrow("captured native context retired");
+  expect(existsSync(removed)).toBe(false);
+  expect(existsSync(path.join(root, ".pitako"))).toBe(false);
+});
 
 test("managed archives are recorded-only, immutable and protected with compatible physical continuation", async () => {
   const { root, history, group, member, file } = fixture();

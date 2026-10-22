@@ -3,6 +3,7 @@ import path from "node:path";
 import * as consultation from "../extensions/agent/consultation.ts";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { Type } from "typebox";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { architectureFixture } from "./fixtures/architecture.ts";
 import { controlledPi, controlledModel } from "./fixtures/pi-factories.ts";
 import { createPiExecutor } from "../extensions/agent/pi.ts";
@@ -14,7 +15,7 @@ import { createAgentBridge } from "../extensions/agent/bridge/broker.ts";
 import { connect } from "../extensions/agent/bridge/client.js";
 import { reserveTeamMember, firstTeamReservation, teamEvaluationForSession } from "../extensions/team.ts";
 import { WorkflowState, type Reservation, type ReleaseReceipt } from "../extensions/workflow-state.ts";
-import { guardDefinition, RootGuard, type AttemptRecord, type TeamHoldRecord } from "../extensions/workflow-engine.ts";
+import { bindCallContext, currentCallContext, guardDefinition, RootGuard, type AttemptRecord, type TeamHoldRecord } from "../extensions/workflow-engine.ts";
 import { AgentClosureError } from "../extensions/agent/closure.ts";
 import { planFile, openExecutionPlan, readLedgerTeamHolds } from "../extensions/workflow.ts";
 import { openBoard } from "../extensions/board/store.ts";
@@ -51,11 +52,16 @@ test("late guarded children release the completed attempt and its exact Team hol
     },
   }, "write");
   setBackgroundExecutor({ async start() {
-    const calls = [0, 1].map(index => Promise.resolve(tool.execute(`child-${index}`, { index }, undefined, undefined,
-      room.ctx)).catch(error => { toolErrors.push(error); }));
-    fail.resolve();
-    await Promise.all(calls);
-    return { status: "completed", result: "handled tool errors", sideEffects: false };
+    const context = currentCallContext()!;
+    const sessionManager = SessionManager.inMemory(room.root);
+    const unbind = bindCallContext(sessionManager, context);
+    try {
+      const calls = [0, 1].map(index => Promise.resolve(tool.execute(`child-${index}`, { index }, undefined, undefined,
+        { ...room.ctx, sessionManager })).catch(error => { toolErrors.push(error); }));
+      fail.resolve();
+      await Promise.all(calls);
+      return { status: "completed", result: "handled tool errors", sideEffects: false };
+    } finally { unbind(); }
   } });
   const guard = new RootGuard(room.root);
   const journal = guard.store;

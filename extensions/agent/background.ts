@@ -65,8 +65,8 @@ export interface BackgroundOwner {
   hasUI: boolean;
   notify: (message: string) => void;
   sendMessage: (content: string, source: CapturedWakeSource) => void;
-  appendResult?: (message: ResultMessage) => void;
-  appendIntermediate?: (message: IntermediateMessage) => void;
+  appendResult?: (message: ResultMessage, source: CapturedWakeSource) => void;
+  appendIntermediate?: (message: IntermediateMessage, source: CapturedWakeSource) => void;
   getBranch?: () => readonly unknown[];
   recoveryScheduler?: RecoveryScheduler;
 }
@@ -1115,7 +1115,7 @@ function liveOwner(row: Row): boolean {
   if (!ownerLive && captured) captured.retired = true;
   if (!ownerLive) return false;
   // A retired phase retires this row, not the foreground owner's next phase.
-  try { checkCallContext(row.durable.context); } catch { return false; }
+  try { row.durable.assertAdmissionCurrent(); } catch { return false; }
   return rowMatches();
 }
 
@@ -1448,7 +1448,7 @@ export function deliverWorkerResults(token: symbol, terminalOperation = false, r
       const message = offer(row);
       try {
         if (!row.deliveryOwner!.appendResult) throw new Error("result append boundary unavailable");
-        row.deliveryOwner!.appendResult(message);
+        row.deliveryOwner!.appendResult(message, handoff.source);
       } catch (error) {
         if (!liveOwner(row)) continue;
         handoff.outstanding = false;
@@ -1630,7 +1630,7 @@ export function deliverIntermediateResults(token: symbol, terminalOperation = fa
         try {
           const message = offerEnvelope(item, item.message);
           if (!row.deliveryOwner!.appendIntermediate) throw new Error("intermediate append boundary unavailable");
-          row.deliveryOwner!.appendIntermediate(message);
+          row.deliveryOwner!.appendIntermediate(message, item.source);
         } catch (error) { item.outstanding = false; item.delivery = "blocked"; item.deliveryDiagnostic = String(error); }
         observeIntermediateResults(token);
       }

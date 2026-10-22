@@ -368,8 +368,10 @@ describe("Team T1 ownership", () => {
     pitako(pi as unknown as ExtensionAPI);
     agentExtension(pi as unknown as ExtensionAPI);
     const sessionId = "team-plan-concurrent-wakes";
+    const cwd = mkdtempSync(path.join(tmpdir(), "pitako-team-planning-"));
+    tempDirs.push(cwd);
     const hostContext = {
-      hasUI: false, isIdle: () => idle, ui: { notify() {}, setStatus() {} },
+      cwd, hasUI: false, isIdle: () => idle, ui: { notify() {}, setStatus() {} },
       sessionManager: { getSessionId: () => sessionId, getBranch: () => branch },
     };
     async function emit(event: string) {
@@ -379,11 +381,7 @@ describe("Team T1 ownership", () => {
     await emit("session_start");
     const current = teamEvaluationForSession(sessionId, false)!;
     evaluations.add(current);
-    const cwd = mkdtempSync(path.join(tmpdir(), "pitako-team-planning-"));
-    tempDirs.push(cwd);
-    const invoke = (name: string, params: unknown) => tools.get(name)!.execute("call", params, new AbortController().signal, undefined, {
-      cwd, sessionManager: { getSessionId: () => sessionId },
-    });
+    const invoke = (name: string, params: unknown) => tools.get(name)!.execute("call", params, new AbortController().signal, undefined, hostContext);
     const guidelines = tools.get("team_assign")?.promptGuidelines?.join(" ") ?? "";
     expect(guidelines).toContain("automatically supplied");
     expect(guidelines).toContain("team_result");
@@ -757,7 +755,7 @@ describe("Team T1 ownership", () => {
     } as unknown as ExtensionAPI);
     boardExtension({ registerTool: (tool: any) => tools.set(tool.name, preparedTool(tool)), registerFlag() {}, registerCommand() {}, on() {} } as unknown as ExtensionAPI);
     agentExtension({ registerTool: (tool: any) => tools.set(tool.name, preparedTool(tool)) } as unknown as ExtensionAPI);
-    const sessionContext = { hasUI: false, isIdle: () => idle, ui: { notify() {}, setStatus() {} }, sessionManager: { getSessionId: () => current.sessionId, getBranch: () => branch } };
+    const sessionContext = { cwd, hasUI: false, isIdle: () => idle, ui: { notify() {}, setStatus() {} }, sessionManager: { getSessionId: () => current.sessionId, getBranch: () => branch } };
     await handlers.get("session_start")?.({}, sessionContext);
     await handlers.get("session_start")?.({}, sessionContext);
     const afterReload = await openBoard();
@@ -769,9 +767,7 @@ describe("Team T1 ownership", () => {
       tasks.push(input.task);
       return fixture.pendingAttempt((resolve) => finishes.push(resolve));
     } });
-    const invoke = (params: unknown) => tools.get("team_assign")!.execute("call", params, new AbortController().signal, undefined, {
-      cwd, sessionManager: { getSessionId: () => current.sessionId },
-    });
+    const invoke = (params: unknown) => tools.get("team_assign")!.execute("call", params, new AbortController().signal, undefined, sessionContext);
     expect((await invoke({ role: "developer", task: "invalid", plan: "bound-plan", unit: "x", boardTopicId: "1; injected" })).isError).toBe(true);
     expect((await invoke({ role: "developer", task: "overflow", plan: "bound-plan", unit: "x", boardTopicId: "9007199254740992" })).isError).toBe(true);
     expect((await invoke({ role: "developer", task: "conflict", plan: "bound-plan", unit: "x", boardTopicId: "2" })).isError).toBe(true);

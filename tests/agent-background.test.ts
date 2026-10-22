@@ -43,7 +43,7 @@ import { ledgerFile, planFile } from "../extensions/workflow.ts";
 import type { LoadOptions } from "../extensions/roles/load.ts";
 import { listObservations } from "../extensions/agent/observe.ts";
 import { WorkflowState, type Reservation } from "../extensions/workflow-state.ts";
-import type { AttemptRecord } from "../extensions/workflow-engine.ts";
+import { captureCallContext, type AttemptRecord } from "../extensions/workflow-engine.ts";
 
 const fixture = agentFixtureOwnership();
 const tempDirs = fixture.directories;
@@ -178,7 +178,7 @@ describe("pitako agents command", () => {
     expect(() => resolveLiveTarget(target, "other")).toThrow("foreground owner");
     const tools = new Map<string, { execute: Function }>();
     agentInstance({ registerTool(tool: { name: string; execute: Function }) { tools.set(tool.name, tool); } } as unknown as ExtensionAPI);
-    const ctx = { sessionManager: { getSessionId: () => "coordinator" } };
+    const ctx = { cwd: workerRoot(), sessionManager: { getSessionId: () => "coordinator" } };
     const observed = await tools.get("agent_observe")!.execute("observe", { target }, undefined, undefined, ctx);
     expect(observed.details).toMatchObject({ target, id: "second" });
     for (const intent of ["query", "steer"]) {
@@ -186,7 +186,7 @@ describe("pitako agents command", () => {
       const receipt = await tools.get("agent_input")!.execute("input", params, undefined, undefined, ctx);
       expect(receipt.details).toMatchObject({ target, status: "queued" });
       const denied = await tools.get("agent_input")!.execute("input", params, undefined, undefined,
-        { sessionManager: { getSessionId: () => "other" } });
+        { cwd: workerRoot(), sessionManager: { getSessionId: () => "other" } });
       expect(denied.details).toMatchObject({ target, historyId: "second", sessionId: "second", status: "rejected" });
       expect(denied.details.reason).toContain("foreground owner");
     }
@@ -635,7 +635,7 @@ describe("background registry", () => {
     const bound = owner(true);
     let appends = 0, wakes = 0;
     const commit = bound.appendResult!;
-    bound.appendResult = message => { if (++appends === 1) throw new Error("append rejected"); commit(message); };
+    bound.appendResult = (message, source) => { if (++appends === 1) throw new Error("append rejected"); commit(message, source); };
     bound.sendMessage = () => { ++wakes; throw new Error("wake rejected"); };
     bindBackgroundOwner(bound);
     const hanging = hang();
@@ -1003,7 +1003,8 @@ describe("background tools", () => {
     await startPrincipal(handlers, ctx);
     expect(clock.pending).toBe(0);
     const hanging = hang();
-    await spawnBackground({ roleId: "developer", task: "original codemode workflow result", cwd: workerRoot(), load: load(), executor: hanging.executor });
+    await spawnBackground({ roleId: "developer", task: "original codemode workflow result", cwd: workerRoot(), load: load(), executor: hanging.executor,
+      context: captureCallContext(ctx.cwd, ctx.sessionManager) });
     expect(clock.pending).toBe(1);
     hanging.release({ status: "completed", result: "retained full result 🧬", sideEffects: false });
     await fixture.settleRuns();
@@ -1047,7 +1048,8 @@ describe("background tools", () => {
     await startPrincipal(handlers, ctx);
     const finish = async (text: string) => {
       const hanging = hang();
-      const handle = await spawnBackground({ roleId: "developer", task: text, cwd: workerRoot(), load: load(), executor: hanging.executor });
+      const handle = await spawnBackground({ roleId: "developer", task: text, cwd: workerRoot(), load: load(), executor: hanging.executor,
+        context: captureCallContext(ctx.cwd, ctx.sessionManager) });
       hanging.release({ status: "completed", result: text, sideEffects: false });
       await fixture.settleRuns();
       return handle.instanceId;

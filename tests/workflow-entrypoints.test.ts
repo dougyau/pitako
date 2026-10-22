@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Type } from "typebox";
@@ -9,11 +9,14 @@ import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager
 import { architectureFixture } from "./fixtures/architecture.ts";
 import { captureCallContext, checkAuthority, checkCallContext, hasReadDefinitionGuard, withCallContext } from "../extensions/workflow-engine.ts";
 import { ledgerFile } from "../extensions/workflow.ts";
+import { resolvePublicTodo } from "../extensions/agent/public-todo.ts";
+import { cancelAllWorkers, cancelWorker, reserveBackground, workerStatus } from "../extensions/agent/background.ts";
+import { beginTeamEvaluation, recordTeamAssignment, reserveTeamMember, retireTeamEvaluation, teamEvaluationForSession } from "../extensions/team.ts";
 
 const f = architectureFixture();
 const repo = path.resolve(import.meta.dir, "..");
 
-for (const id of ["native", "", "   "]) test(`native SDK planning/Architect ports and contextual task (/task ${JSON.stringify(id)})`,
+for (const id of ["native", "", "   ", "controls"]) test(`native SDK planning/Architect ports and contextual task (/task ${JSON.stringify(id)})`,
   f.fixture.ownedCase(`native workflow entries ${id}`, async () => {
     const storageRoot = mkdtempSync(path.join(tmpdir(), "pitako-entry-storage-"));
     f.fixture.directories.push(storageRoot);
@@ -28,7 +31,11 @@ for (const id of ["native", "", "   "]) test(`native SDK planning/Architect port
       { name: "task_status", arguments: {} },
       { name: "architecture_start", arguments: { goal: "Repair the current conversation's bounded behavior" } },
       { name: "write", arguments: { path: path.join(app.root, "forbidden.txt"), content: "not allowed" } },
-      { name: "todo", arguments: {} },
+      ...(id === "controls" ? [
+        { name: "todo", arguments: { action: "list" } },
+        { name: "todo", arguments: { action: "create", subject: "Inspect managed ports" } },
+        { name: "todo", arguments: { action: "update", id: 1, status: "in_progress", activeForm: "inspecting ports" } },
+      ] : ["todo", "compress"].map(name => ({ name, arguments: {} }))),
     ];
     runtime.registerProvider("entry-fixture", {
       api: "openai-completions", apiKey: "offline", baseUrl: "http://offline.invalid",
@@ -50,9 +57,11 @@ for (const id of ["native", "", "   "]) test(`native SDK planning/Architect port
     const loader = new DefaultResourceLoader({ cwd: app.root, agentDir: storageRoot, settingsManager: settings,
       noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
       // Load the declared composition from disk; the Node case below additionally proves graph separation.
-      additionalExtensionPaths: [path.join(repo, "extensions/index.ts"), path.join(repo, "extensions/agent/index.ts")],
-      extensionFactories: [pi => {
-        pi.registerTool({ name: "todo", label: "forged bookkeeping", description: "Not an SDK builtin or a host capability",
+      additionalExtensionPaths: [path.join(repo, "extensions/index.ts"), path.join(repo, "extensions/agent/index.ts"),
+        ...(id === "controls" ? [path.join(repo, "extensions/todo.ts"), path.join(repo, "extensions/acp.ts")] : [])],
+      extensionFactories: id === "controls" ? [] : [pi => {
+        for (const name of ["todo", "compress"]) pi.registerTool({
+          name, label: "forged control", description: "Not an SDK builtin or a host capability",
           parameters: Type.Object({}), async execute() { forbidden++; return { content: [{ type: "text", text: "bypass" }], details: {} }; } });
       }] });
     await loader.reload();
@@ -60,10 +69,67 @@ for (const id of ["native", "", "   "]) test(`native SDK planning/Architect port
     expect(loader.getExtensions().extensions.filter(entry => entry.path.endsWith("/index.ts"))).toHaveLength(2);
     const { session } = await f.fixture.acquire(createAgentSession({ cwd: app.root, agentDir: storageRoot, modelRuntime: runtime,
       model: runtime.getModel("entry-fixture", "local"), resourceLoader: loader, settingsManager: settings,
-      sessionManager: SessionManager.create(app.root, path.join(storageRoot, "sessions")), tools: calls.map(call => call.name) }));
+      sessionManager: SessionManager.create(app.root, path.join(storageRoot, "sessions")),
+      tools: id === "controls" ? undefined : calls.map(call => call.name) }));
     await session.bindExtensions({});
-    session.setActiveToolsByName(calls.map(call => call.name));
+    const preparations: Promise<void>[] = [], completions: Promise<void>[] = [];
+    let ownedWorker: string | undefined, foreignWorker: string | undefined;
+    let foreignEvaluation: ReturnType<typeof beginTeamEvaluation>;
     try {
+      if (id === "controls") {
+        globalThis.fetch = Object.assign(async () => { throw new Error("unexpected network"); }, { preconnect: globalThis.fetch.preconnect });
+        const workerRoot = mkdtempSync(path.join(tmpdir(), "pitako-control-preflight-"));
+        f.fixture.directories.push(workerRoot);
+        const reserve = (sessionId: string, teamOwner?: Parameters<typeof reserveBackground>[0]["teamOwner"]) => {
+          const started = Promise.withResolvers<void>(), completed = Promise.withResolvers<void>();
+          const handle = reserveBackground({ cwd: workerRoot, roleId: "developer", task: "Owned preflight control",
+            coordinatorSessionId: sessionId, owns: () => true, context: captureCallContext(workerRoot), teamOwner,
+            origin: { source: teamOwner ? "team_assign" : "agent_spawn", coordinatorSessionId: sessionId,
+              assignmentId: teamOwner?.assignmentId, workbrief: "Owned preflight control", toolCallId: "control-preflight" },
+            recipient: { kind: "protocol", settle: () => completed.resolve() },
+            async prepare(signal) {
+              started.resolve();
+              await new Promise<void>(resolve => {
+                if (signal.aborted) resolve(); else signal.addEventListener("abort", () => resolve(), { once: true });
+              });
+              throw new Error("controlled preflight cancelled");
+            },
+          });
+          preparations.push(started.promise); completions.push(completed.promise);
+          return handle;
+        };
+        const sessionId = session.sessionManager.getSessionId(), evaluation = teamEvaluationForSession(sessionId, false)!;
+        ownedWorker = reserve(sessionId).instanceId;
+        foreignWorker = reserve("foreign-controls").instanceId;
+        const member = reserveTeamMember(evaluation, "developer", "owned-assignment");
+        const teamWorker = reserve(sessionId, { token: evaluation.token, assignmentId: "owned-assignment",
+          teamId: member.teamId, memberId: member.memberId, onSettled: member.settled, noWorkerReleased: member.noWorkerReleased });
+        member.commit();
+        recordTeamAssignment(evaluation, "developer", { id: "owned-assignment", instanceId: teamWorker.instanceId,
+          roleId: "developer", task: "Owned preflight control" });
+        foreignEvaluation = beginTeamEvaluation("foreign-controls", false)!;
+        const foreignMember = reserveTeamMember(foreignEvaluation, "developer", "foreign-assignment");
+        foreignMember.commit();
+        recordTeamAssignment(foreignEvaluation, "developer", { id: "foreign-assignment", instanceId: foreignWorker,
+          roleId: "developer", task: "Foreign preflight control" });
+        await Promise.all(preparations);
+        calls.push(
+          ...["acp_status", "acp_cache"].map(name => ({ name, arguments: {} })),
+          { name: "search_context", arguments: { query: "absent-fixture-context" } },
+          { name: "compress", arguments: { content: [] } },
+          { name: "agent_spawn", arguments: { role: "developer", task: "Unclassified dispatch" } },
+          { name: "team_assign", arguments: { role: "developer", task: "Unclassified dispatch" } },
+          { name: "agent_status", arguments: {} }, { name: "team_status", arguments: {} },
+          { name: "agent_status", arguments: { id: foreignWorker } },
+          { name: "agent_result", arguments: { id: foreignWorker } },
+          { name: "team_result", arguments: { assignmentId: "foreign-assignment" } },
+          { name: "agent_cancel", arguments: { id: foreignWorker } },
+          { name: "team_cancel", arguments: { assignmentId: "foreign-assignment" } },
+          { name: "agent_cancel", arguments: { id: ownedWorker } },
+          { name: "team_cancel", arguments: { assignmentId: "owned-assignment" } },
+        );
+      }
+      session.setActiveToolsByName(calls.map(call => call.name));
       await f.fixture.run(session.prompt("Repair the frobnicator without changing its public API.", { expandPromptTemplates: false }));
       await f.fixture.run(session.prompt(`/task ${id}`, { expandPromptTemplates: true }));
       await f.fixture.run(session.waitForIdle());
@@ -74,12 +140,58 @@ for (const id of ["native", "", "   "]) test(`native SDK planning/Architect port
         expect(result!.isError, JSON.stringify(result)).not.toBe(true);
         expect(hasReadDefinitionGuard(session.getAllTools().find(tool => tool.name === name)!.parameters)).toBe(true);
       }
-      for (const name of ["write", "todo"]) {
+      for (const name of id === "controls" ? ["write"] : ["write", "todo", "compress"]) {
         const result = results.find(message => message.toolName === name)!;
         expect(result.isError).toBe(true);
         expect(JSON.stringify(result)).toContain("generic mutations are unavailable");
       }
       expect(forbidden).toBe(0);
+      if (id === "controls") {
+        for (const name of ["acp_status", "acp_cache", "search_context", "compress", "agent_status", "team_status"]) {
+          const result = results.find(message => message.toolName === name)!;
+          expect(result.isError, JSON.stringify(result)).not.toBe(true);
+          expect(hasReadDefinitionGuard(session.getAllTools().find(tool => tool.name === name)!.parameters)).toBe(true);
+        }
+        for (const name of ["agent_spawn", "team_assign"]) {
+          const result = results.find(message => message.toolName === name)!;
+          expect(result.isError).toBe(true);
+          expect(JSON.stringify(result)).toContain("generic mutations are unavailable");
+        }
+        expect(results.find(message => message.toolName === "agent_status")!.details).toMatchObject({ workers: [{ instanceId: ownedWorker }] });
+        const teamStatus = results.find(message => message.toolName === "team_status")!.details as { members: { assignmentId: string }[] };
+        const architecture = results.find(message => message.toolName === "architecture_start")!.details as { assignmentId: string };
+        expect(teamStatus.members.map(member => member.assignmentId)).toEqual(["owned-assignment", architecture.assignmentId]);
+        for (const name of ["agent_status", "agent_result", "team_result"]) {
+          const denied = results.filter(message => message.toolName === name).at(-1)!;
+          expect(denied.isError, JSON.stringify(denied)).toBe(true);
+        }
+        for (const name of ["agent_cancel", "team_cancel"]) {
+          const pair = results.filter(message => message.toolName === name);
+          expect(pair).toHaveLength(2);
+          expect(pair[0]!.isError).toBe(true);
+          expect(pair[1]!.isError, JSON.stringify(pair[1])).not.toBe(true);
+        }
+        expect(workerStatus(foreignWorker!)[0]!.status, "foreign cancellation must not abort").toBe("running");
+        cancelWorker(foreignWorker!);
+        await Promise.all(completions);
+        const runner = session.extensionRunner;
+        for (const [name, input] of [["agent_result", { id: ownedWorker }], ["team_result", { assignmentId: "owned-assignment" }]] as const) {
+          const callId = "settled-" + name;
+          expect((await runner.emitToolCall({ type: "tool_call", toolName: name, toolCallId: callId, input }))?.block).not.toBe(true);
+          const result = await runner.getToolDefinition(name)!.execute(callId, input, undefined, undefined, runner.createToolContext(callId, undefined));
+          expect(JSON.stringify(result)).not.toMatch(/generic mutations are unavailable|unknown worker|unknown Team/);
+          expect(JSON.stringify(result)).toContain("controlled preflight cancelled");
+        }
+        const todos = results.filter(message => message.toolName === "todo");
+        expect(todos).toHaveLength(3);
+        for (const result of todos) expect(result.isError, JSON.stringify(result)).not.toBe(true);
+        expect(session.getAllTools().find(tool => tool.name === "todo")!.exposure).toBe("model-only");
+        const branch = session.sessionManager.getBranch();
+        const snapshot = resolvePublicTodo(entryId => session.sessionManager.getEntry(entryId),
+          branch.at(-1)?.id ?? null, { entries: 1000, bytes: 1000000 });
+        expect(snapshot.snapshot?.tasks[0]).toMatchObject({ id: 1, subject: "Inspect managed ports", status: "in_progress" });
+        expect(todos.at(-1)!.details).toMatchObject({ nextId: 2, tasks: [{ id: 1, status: "in_progress" }] });
+      }
       expect(existsSync(path.join(app.root, "forbidden.txt"))).toBe(false);
       expect(delivered[1]).toContain("Repair the frobnicator without changing its public API.");
       expect(delivered[1]).toContain("current conversation");
@@ -108,7 +220,16 @@ for (const id of ["native", "", "   "]) test(`native SDK planning/Architect port
       expect(requests).toBe(count);
       await expect(Promise.resolve().then(() => withCallContext(context, () => read.execute("stale", {}, undefined, undefined,
         { cwd: app.root, sessionManager: session.sessionManager } as never)))).rejects.toThrow(/retired/);
+      if (id === "controls") for (const name of ["todo", "acp_status", "agent_status", "team_status"]) {
+        const definition = session.extensionRunner.getToolDefinition(name)!;
+        await expect(Promise.resolve().then(() => withCallContext(context, () =>
+          definition.execute("stale-" + name, name === "todo" ? { action: "list" } : {}, undefined, undefined,
+            { cwd: path.join(app.root, "removed-worktree"), sessionManager: session.sessionManager } as never)))).rejects.toThrow(/retired/);
+      }
     } finally {
+      await cancelAllWorkers();
+      await Promise.all(completions);
+      if (foreignEvaluation) await retireTeamEvaluation(foreignEvaluation);
       await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
       await session.dispose();
       await app.close();
@@ -118,7 +239,6 @@ for (const id of ["native", "", "   "]) test(`native SDK planning/Architect port
 test("Node public loader preserves original schema and captured authority across independent entry graphs",
   f.fixture.ownedCase("independent Node entries", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "pitako-node-entry-"));
-    f.fixture.directories.push(root);
     const engine = JSON.stringify(path.join(repo, "extensions/workflow-engine.ts"));
     const sdk = JSON.stringify(import.meta.resolve("@earendil-works/pi-coding-agent"));
     const types = JSON.stringify(import.meta.resolve("typebox"));
@@ -126,18 +246,30 @@ test("Node public loader preserves original schema and captured authority across
     const producer = path.join(root, "producer.ts"), consumer = path.join(root, "consumer.ts");
     writeFileSync(producer, `
       import * as engine from ${engine};
+      import * as background from ${JSON.stringify(path.join(repo, "extensions/agent/background.ts"))};
+      import main from ${JSON.stringify(path.join(repo, "extensions/index.ts"))};
+      import todo from ${JSON.stringify(path.join(repo, "extensions/todo.ts"))};
       export default pi => {
-        globalThis[Symbol.for(${key})].producer = engine;
-        engine.registerWorkflowCommands(pi);
+        Object.assign(globalThis[Symbol.for(${key})], {producer:engine,background});
+        main(pi); todo(pi);
       };
     `);
     writeFileSync(consumer, `
       import * as engine from ${engine};
-      import { principalLeases } from ${JSON.stringify(path.join(repo, "extensions/agent/head/operation-leases.ts"))};
+      import { writeFileSync } from "node:fs";
+      import { currentInstanceId } from ${JSON.stringify(path.join(repo, "extensions/agent/scope.ts"))};
       import { Type } from ${types};
       export default pi => {
         const host = globalThis[Symbol.for(${key})]; host.consumer = engine;
-        principalLeases(pi, { async exec() { throw Error("unexpected foreground execution"); } });
+        pi.registerTool(engine.guardDefinition({
+          name: "receiver_effect", label: "receiver", description: "Private receiver effect witness", parameters: Type.Object({}),
+          async execute(_id, _params, _signal, _update, ctx) {
+            const context = engine.captureCallContext(ctx.cwd, ctx.sessionManager);
+            host.receiver = context; host.receiverInstance = currentInstanceId();
+            writeFileSync(ctx.cwd + "/receiver-witness", "principal");
+            return { content: [{type:"text",text:"written"}], details:{} };
+          }
+        }, "write"));
         const probe = engine.guardDefinition({
           name: "probe", label: "probe", description: "Read captured planning context", parameters: Type.Object({}),
           async execute(_id, _params, _signal, _update, ctx) {
@@ -158,61 +290,87 @@ test("Node public loader preserves original schema and captured authority across
     const script = path.join(root, "check.mjs");
     writeFileSync(script, `
       import assert from "node:assert/strict";
-      import { existsSync } from "node:fs";
+      import { existsSync, readFileSync, writeFileSync } from "node:fs";
       import { DefaultResourceLoader, ExtensionRunner, SessionManager, SettingsManager } from ${sdk};
       const root = ${JSON.stringify(root)}, host = { forbidden: 0 };
+      // Include static SDK import cost, not just the code after imports.
+      const phase = name => console.error("Node entries: " + name + " " + Math.round(process.uptime()*1000) + "ms");
+      phase("SDK imported");
+      console.error("Node entries: inherited context keys " + Object.keys(process.env)
+        .filter(key => /^(PI_|ACP_|BILLION_CONTEXT_|XDG_)/.test(key)).sort().join(","));
       globalThis[Symbol.for(${key})] = host;
-      const calls = [
-        ["planning_write", {revision:"absent",fileHash:null,body:"# Goal\\nCaptured planning"}],
-        ["bound_plan_read", {}], ["task_status", {}], ["probe", {}],
-        ["write", {path:root+"/forbidden",content:"bypass"}], ["forged", {}]
-      ];
       const settings = SettingsManager.inMemory({compaction:{enabled:false},retry:{enabled:false}});
       const loader = new DefaultResourceLoader({cwd:root,agentDir:root,settingsManager:settings,
         noExtensions:true,noSkills:true,noPromptTemplates:true,noThemes:true,noContextFiles:true,
         additionalExtensionPaths:${JSON.stringify([producer, consumer])}});
       await loader.reload();
+      phase("entries loaded");
       assert.deepEqual(loader.getExtensions().errors, []);
       assert.notEqual(host.producer.currentCallContext, host.consumer.currentCallContext, "must instantiate separate modules");
       // The Bun cases above own native model/conversation delivery. Here the real
       // public loader and serial runner isolate the distinct Node identity boundary.
       const loaded = loader.getExtensions(), manager = SessionManager.inMemory(root);
+      assert.equal(manager.getSessionFile(), undefined);
       const runner = new ExtensionRunner(loaded.extensions, loaded.runtime, root, manager, {});
       const tools = runner.getAllRegisteredTools().map(tool => ({
         ...tool.definition, sourceInfo: {path: tool.extensionPath}
       }));
-      const sent = [];
-      runner.bindCore({getAllTools:()=>tools,sendMessage:(message)=>sent.push(message)},
-        {getModel:()=>undefined,getScopedModels:()=>[],getSignal:()=>undefined,isIdle:()=>true});
+      const sent = [], effect = Promise.withResolvers();
+      const execute = async (name,input={}) => {
+        const id = "call-" + sent.length + "-" + name;
+        const admission = await runner.emitToolCall({type:"tool_call",toolName:name,toolCallId:id,input});
+        if(admission?.block) throw Error(admission.reason);
+        const result = await runner.getToolDefinition(name).execute(id,input,undefined,undefined,runner.createToolContext(id));
+        await runner.emitToolResult({type:"tool_result",toolName:name,toolCallId:id,input,isError:false,...result});
+        return result;
+      };
+      runner.bindCore({getAllTools:()=>tools,getActiveTools:()=>tools.map(t=>t.name),setActiveTools:()=>{},
+        getSessionName:()=>undefined,setSessionName:()=>{},sendMessage:(message,options)=>{
+        sent.push(message);
+        if(!options?.triggerTurn) manager.appendCustomMessageEntry(message.customType,message.content,message.display,message.details);
+        else if(message.customType==="pitako.worker") {
+          void execute("receiver_effect").then(effect.resolve,effect.reject);
+        }
+      }},
+        {getModel:()=>undefined,getScopedModels:()=>[],getSignal:()=>undefined,isIdle:()=>true,
+          getContextUsage:()=>undefined,getSystemPrompt:()=>""});
       runner.bindCommandContext({waitForIdle:async()=>{}});
       runner.onError(error => { throw Error(JSON.stringify(error)); });
       try {
-        const schema = tools.find(t=>t.name==="planning_write").parameters;
-        assert.equal(schema, loader.getExtensions().extensions[0].tools.get("planning_write").definition.parameters);
+        await runner.emit({type:"session_start"});
+        const principal = host.producer.captureCallContext(root,manager);
+        let child;
+        writeFileSync(root+"/config.toml",'[model_policies.developer.primary]\\nmodel = "fixture/local"\\n');
+        await host.producer.withCallContext(principal,()=>host.background.spawnBackground({
+          cwd:root,roleId:"developer",task:"Cross-graph native receiver",
+          load:{userConfigPath:root+"/config.toml"},
+          executor:{async start(){child=host.producer.currentCallContext();return {status:"completed",result:"offline",sideEffects:false};}}
+        }));
+        await effect.promise;
+        assert.equal(host.receiver,principal);
+        assert.equal(host.receiverInstance,undefined);
+        assert.equal(readFileSync(root+"/receiver-witness","utf8"),"principal");
+        assert.equal(host.background.workerStatus().at(-1).closure.state,"released");
+        assert.throws(()=>host.producer.withCallContext(child,()=>host.consumer.reserveEffect(
+          host.consumer.currentCallContext(),{reservationId:"late-child",kind:"writer",paths:[root]})),/ancestor is unavailable or retired/);
+        phase("cross-graph receiver effect");
+        const schema = tools.find(t=>t.name==="todo").parameters;
+        assert.equal(schema, loader.getExtensions().extensions[0].tools.get("todo").definition.parameters);
         assert.equal(host.consumer.hasReadDefinitionGuard(schema), true);
         assert.equal(host.consumer.hasReadDefinitionGuard({...schema}), false);
         await runner.getCommand("task").handler("named",runner.createCommandContext());
-        assert.equal(sent.length,1);
-        const results = [];
-        for (const [name,input] of calls) {
-          const id = "call-" + results.length;
-          const admission = await runner.emitToolCall({type:"tool_call",toolName:name,toolCallId:id,input});
-          if (admission?.block) results.push({toolName:name,isError:true,reason:admission.reason});
-          else {
-            const result = await runner.getToolDefinition(name).execute(id,input,undefined,undefined,runner.createToolContext(id));
-            results.push({toolName:name,isError:false,...result});
-            await runner.emitToolResult({type:"tool_result",toolName:name,toolCallId:id,input,...result,isError:false});
-          }
-        }
-        for(const name of ["planning_write","bound_plan_read","task_status","probe"]) {
-          const result = results.find(m=>m.toolName===name); assert.ok(result, name); assert.equal(result.isError,false,JSON.stringify(result));
-        }
-        for(const name of ["write","forged"]) {
-          const result = results.find(m=>m.toolName===name); assert.equal(result.isError,true);
-          assert.match(JSON.stringify(result),/generic mutations are unavailable/);
-        }
+        phase("planning entered");
+        assert.equal((await execute("probe")).details.planId,"named");
+        await execute("todo",{action:"list"});
+        await assert.rejects(()=>execute("forged"),/generic mutations are unavailable/);
+        await assert.rejects(()=>execute("receiver_effect"),/generic mutations are unavailable/);
         assert.equal(host.forbidden,0); assert.equal(existsSync(root+"/forbidden"),false);
         assert.equal(host.producer.checkAuthority(host.context.authority).run.planId,"named");
+        const missingCwd = root+"/removed-worktree";
+        const read = await runner.getToolDefinition("probe").execute("missing-checkout",{},undefined,undefined,
+          Object.defineProperty(runner.createToolContext("missing-checkout"),"cwd",{value:missingCwd}));
+        assert.equal(read.details.planId,"named");
+        assert.equal(existsSync(missingCwd),false);
         assert.throws(()=>host.consumer.checkAuthority(structuredClone(host.context.authority)),/unavailable/);
         const foreign = {getSessionId:()=>manager.getSessionId()};
         assert.notEqual(host.consumer.captureCallContext(root,foreign).kind,"managed");
@@ -225,14 +383,36 @@ test("Node public loader preserves original schema and captured authority across
         const fresh = host.consumer.captureCallContext(root,manager);
         assert.equal(host.consumer.checkAuthority(fresh.authority).run.planId,"replacement");
         assert.throws(()=>host.producer.checkCallContext(host.context),/retired/);
-        await assert.rejects(async()=>host.producer.withCallContext(host.context,()=>
-          runner.getToolDefinition("probe").execute("stale",{},undefined,undefined,runner.createToolContext("stale"))),/retired/);
+        for(const [name,input] of [["probe",{}],["todo",{action:"list"}]]) {
+          await assert.rejects(async()=>host.producer.withCallContext(host.context,()=>
+            runner.getToolDefinition(name).execute("stale",input,undefined,undefined,
+              Object.defineProperty(runner.createToolContext("stale"),"cwd",{value:missingCwd}))),/retired/);
+        }
       } finally {
+        await host.background.cancelAllWorkers();
+        host.background.clearBackgroundOwner();
         await runner.emit({type:"session_shutdown",reason:"quit"});
         runner.invalidate();
+        phase("shutdown settled");
       }
-      console.log("independent entries: original schema, serial tool_call, authority, rejection, Stop and replacement verified");
+      console.log("independent entries: original schema, cross-graph receiver effect after release, planning read, copied schema rejection, Stop and replacement verified");
     `);
-    console.log(execFileSync("node", [script], { cwd: root, encoding: "utf8",
-      env: { ...process.env, PI_CODING_AGENT_DIR: root, BUN_OPTIONS: "", NO_COLOR: "1", FORCE_COLOR: "0" } }));
+    // Only a successful child reaches the explicit native shutdown witness.
+    // Retain failed/killed roots; process exit alone cannot prove native closure.
+    try {
+      const output = await f.fixture.run(new Promise<string>((resolve, reject) => {
+        execFile("node", [script], { cwd: root, encoding: "utf8", timeout: 4000,
+          env: { ...process.env, HOME: root, PI_CODING_AGENT_DIR: root, BUN_OPTIONS: "", NO_COLOR: "1", FORCE_COLOR: "0" } },
+        (error, stdout, stderr) => {
+          console.error(stderr);
+          if (error) { console.error(stdout); reject(error); }
+          else resolve(stdout);
+        });
+      }));
+      console.log(output);
+      f.fixture.directories.push(root);
+    } catch (error) {
+      console.error("Node entries: retained diagnostic root " + root);
+      throw error;
+    }
   }));

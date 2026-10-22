@@ -266,7 +266,7 @@ describe("agent UI lifecycle", () => {
       };
       const ctx = {
         hasUI: true,
-        cwd: process.cwd(),
+        cwd: privateConfig.root,
         sessionManager: { getSessionId: () => "same-session-id", getEntries: () => [] },
         ui: {
           notify() {},
@@ -372,6 +372,7 @@ describe("agent UI lifecycle", () => {
       sendMessage() { throw new Error("not expected"); },
     };
     const ctx = {
+      cwd: privateConfig.root,
       hasUI: true,
       mode: "rpc",
       sessionManager: { getSessionId: () => "production-session", getEntries: () => [] },

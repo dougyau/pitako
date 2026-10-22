@@ -1,4 +1,5 @@
 import type { RecoveryScheduler } from "./agent/delivery.ts";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { consultationStats } from "./agent/history-query.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { skillStatusLines } from "./catalog.ts";
@@ -37,7 +38,7 @@ import { createAgentBridge } from "./agent/bridge/broker.ts";
 import { AgentClosureError } from "./agent/closure.ts";
 import { principalLeases } from "./agent/head/operation-leases.ts";
 import { foregroundBash } from "./agent/head/managed-tools.ts";
-import { registerWorkflowCommands } from "./workflow-engine.ts";
+import { bindForegroundCallContext, registerWorkflowCommands, withReceiverContext, type CapturedWakeSource } from "./workflow-engine.ts";
 
 function foregroundSession(sessionId: string | undefined): sessionId is string {
   return Boolean(sessionId && !executionForSession(sessionId) && !currentInstanceId() && !process.env.PITAKO_INSTANCE_ID);
@@ -93,6 +94,8 @@ export default function pitako(pi: ExtensionAPI, host: { recoveryScheduler?: Rec
   let agentBridge: ReturnType<typeof createAgentBridge> | undefined;
   let foregroundRevision = 0;
   let retirement: Promise<void> = Promise.resolve();
+  let unbindForeground: (() => void) | undefined;
+  let foregroundManager: ExtensionContext["sessionManager"] | undefined;
 
   const revokeForeground = () => {
     ++foregroundRevision;
@@ -101,6 +104,9 @@ export default function pitako(pi: ExtensionAPI, host: { recoveryScheduler?: Rec
     retired.pane?.revoke();
     retired.bridge?.revoke();
     revokeBackgroundOwner(retired.token);
+    unbindForeground?.();
+    unbindForeground = undefined;
+    foregroundManager = undefined;
     agentController = undefined;
     agentPane = undefined;
     agentBridge = undefined;
@@ -176,6 +182,10 @@ export default function pitako(pi: ExtensionAPI, host: { recoveryScheduler?: Rec
         isChildSession(ctx),
         ownerToken,
       );
+      if (!isChildSession(ctx) && manager && sessionId) {
+        unbindForeground = bindForegroundCallContext(ctx.cwd, manager);
+        foregroundManager = manager;
+      }
       if (!isChildSession(ctx) && sessionId) {
         const token = ownerToken;
         agentController = createAgentController({ sessionId, token }, () => {
@@ -189,8 +199,15 @@ export default function pitako(pi: ExtensionAPI, host: { recoveryScheduler?: Rec
         const token = ownerToken;
         const evaluationToken = teamEvaluation?.token;
         const owns = () => revision === foregroundRevision && token === ownerToken &&
+          manager === ctx.sessionManager && manager === foregroundManager &&
           sessionId === ctx.sessionManager?.getSessionId() && evaluationToken === teamEvaluation?.token &&
           (!evaluationToken || teamEvaluationForSession(sessionId, false)?.token === evaluationToken);
+        const enterNativeOwner = AsyncLocalStorage.snapshot();
+        const receive = (source: CapturedWakeSource, effect: () => void) => enterNativeOwner(() => {
+          if (!owns()) throw new Error("native foreground owner retired");
+          const context = source.receiverContext(manager);
+          return withReceiverContext(manager, context, owns, effect);
+        });
         bindBackgroundOwner({
           token, sessionId, revision, owns, recoveryScheduler: host.recoveryScheduler,
           isIdle: () => ctx.isIdle(),
@@ -199,23 +216,24 @@ export default function pitako(pi: ExtensionAPI, host: { recoveryScheduler?: Rec
             if (ctx.hasUI) ctx.ui.notify(message, "info");
           },
           sendMessage: (content, source) => {
-            if (!owns()) return;
-            source.assertIssued();
-            pi.sendMessage(
-              {
-                customType: "pitako.worker",
-                content,
-                display: true,
-                details: { source: "pitako.worker" },
-              },
-              { deliverAs: "followUp", triggerTurn: true },
-            );
+            receive(source, () => {
+              source.assertIssued();
+              pi.sendMessage(
+                {
+                  customType: "pitako.worker",
+                  content,
+                  display: true,
+                  details: { source: "pitako.worker" },
+                },
+                { deliverAs: "followUp", triggerTurn: true },
+              );
+            });
           },
-          appendIntermediate: message => {
-            if (owns()) pi.sendMessage(message, { triggerTurn: false });
+          appendIntermediate: (message, source) => {
+            receive(source, () => pi.sendMessage(message, { triggerTurn: false }));
           },
-          appendResult: message => {
-            if (owns()) pi.sendMessage(message, { triggerTurn: false });
+          appendResult: (message, source) => {
+            receive(source, () => pi.sendMessage(message, { triggerTurn: false }));
           },
           getBranch: () => owns() ? ctx.sessionManager.getBranch() : [],
         });
@@ -277,6 +295,7 @@ export default function pitako(pi: ExtensionAPI, host: { recoveryScheduler?: Rec
   });
 
   const ownsEvent = (ctx: ExtensionContext) => foregroundSession(ctx?.sessionManager?.getSessionId()) &&
+    ctx.sessionManager === foregroundManager &&
     ctx.sessionManager.getSessionId() === teamEvaluation?.sessionId &&
     teamEvaluationForSession(teamEvaluation.sessionId, false)?.token === teamEvaluation.token &&
     teamEvaluation.token === ownerToken;
