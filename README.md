@@ -358,6 +358,8 @@ Pi-only, RPC and child sessions do not start the pane broker.
 
 `$execute <plan-id>` is the implementation authority for that frozen plan. Until that invocation, planning completion is not permission to change the product.
 
+Native `/task [local-plan-id]` authorizes the combined local planning→execution workflow, without publication. With no ID, it uses the current conversation and chooses a local plan ID. Repeating it while the same task is active is a no-op; a stopped task requires its explicit ID to resume. With no ID, it does not replace an active `/plan`. Accepted Freeze derives execution under the same task intent, without a separate `/execute`.
+
 `/skill:pre-pr [base=<local-ref>]` prepares the current worktree diff for first or later publication without `$plan`, a frozen plan, or `$execute`. It never commits or performs remote actions.
 
 Artifacts live in the workspace (git root, or the current directory outside a repository):

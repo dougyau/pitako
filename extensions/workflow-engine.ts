@@ -34,21 +34,35 @@ type HostOwner = {
   observation: () => Producer;
   unlock: () => void; listeners: Set<() => void>; retire: Set<() => Promise<void>>;
 };
-const authorities = new WeakMap<PhaseAuthority, HostOwner>();
-const taskAuthorities = new WeakMap<TaskAuthority, HostOwner>();
-const readers = new WeakMap<StatusReadAuthority, HostOwner>();
-const activityObservers = new AsyncLocalStorage<{ owner: HostOwner; active: boolean }>();
-const guards = new WeakSet<RootGuard>();
-const contexts = new AsyncLocalStorage<CallContext>();
-const sessions = new WeakMap<object, CallContext>();
-const liveProducers = new Map<string, Producer>();
-// Only captured result custody can connect a disposition to its original transport.
-const resultWaitSources = new WeakMap<PhaseAuthority, Map<string, (disposition: Extract<Disposition, { kind: "result-disposition" }>) => () => void>>();
-const ordinaryGuards = new Map<string, RootGuard>();
-// Captured host objects only. JSON correlation can never nominate an ancestor lease.
-const reservationParents = new WeakMap<CallContext, OwnedReservation>();
-const boundDrafts = new WeakMap<CallContext, PlanSnapshot>();
-const lateDefinitions = new Set<{ root: string; producer: Producer; observe: () => "closed" | "unknown" }>();
+// Pi loads entries independently. Share captured host identities and their lifetime,
+// not serialized permissions or a process-wide "current owner".
+const HOST_KEY = Symbol.for("pitako.workflowHost");
+function createHostState() {
+  return {
+    authorities: new WeakMap<PhaseAuthority, HostOwner>(),
+    taskAuthorities: new WeakMap<TaskAuthority, HostOwner>(),
+    readers: new WeakMap<StatusReadAuthority, HostOwner>(),
+    activityObservers: new AsyncLocalStorage<{ owner: HostOwner; active: boolean }>(),
+    guards: new WeakSet<RootGuard>(),
+    contexts: new AsyncLocalStorage<CallContext>(),
+    sessions: new WeakMap<object, CallContext>(),
+    liveProducers: new Map<string, Producer>(),
+    // Only captured result custody can connect a disposition to its original transport.
+    resultWaitSources: new WeakMap<PhaseAuthority, Map<string, (disposition: Extract<Disposition, { kind: "result-disposition" }>) => () => void>>(),
+    ordinaryGuards: new Map<string, RootGuard>(),
+    // JSON correlation can never nominate an ancestor lease.
+    reservationParents: new WeakMap<CallContext, OwnedReservation>(),
+    boundDrafts: new WeakMap<CallContext, PlanSnapshot>(),
+    lateDefinitions: new Set<{ root: string; producer: Producer; observe: () => "closed" | "unknown" }>(),
+    definitions: new WeakSet<object>(),
+    definitionParameters: new WeakSet<object>(),
+    readDefinitionParameters: new WeakSet<object>(),
+  };
+}
+const host = globalThis as typeof globalThis & { [HOST_KEY]?: ReturnType<typeof createHostState> };
+const { authorities, taskAuthorities, readers, activityObservers, guards, contexts, sessions, liveProducers,
+  resultWaitSources, ordinaryGuards, reservationParents, boundDrafts, lateDefinitions,
+  definitions, definitionParameters, readDefinitionParameters } = host[HOST_KEY] ??= createHostState();
 function reobserveDefinitions(root: string): void {
   for (const entry of lateDefinitions) {
     if (entry.root !== root) continue;
@@ -504,9 +518,6 @@ export function recoverHold(authority: PhaseAuthority, claim: RecoveryClaim): Re
   return recovered;
 }
 
-const definitions = new WeakSet<object>();
-const definitionParameters = new WeakSet<object>();
-const readDefinitionParameters = new WeakSet<object>();
 /** Captures the actual host definition, not permission attached to a tool-name string. */
 export function guardDefinition<P extends TSchema, D, S>(definition: ToolDefinition<P, D, S>,
   effect: "read" | "write", preserveSchema = false,
@@ -1118,8 +1129,8 @@ function registerResultDispositionTool(pi: ExtensionAPI): void {
 export function registerWorkflowCommands(pi: ExtensionAPI): void;
 export function registerWorkflowCommands(pi: ExtensionAPI, options: { shutdown: false }): () => Promise<void>;
 export function registerWorkflowCommands(pi: ExtensionAPI, options?: { shutdown: false }): void | (() => Promise<void>) {
-  let invocation: { identity: string; manager: object; sessionId: string; activity: ReturnType<typeof openActivity>; unbind: () => void; cleanup?: () => void; executePolicy?: string } | undefined;
-  let pending: { identity: string; manager: object; sessionId: string; ticket: number } | undefined;
+  let invocation: { identity: string; manager: object; sessionId: string; activity: ReturnType<typeof openActivity>; unbind: () => void; cleanup?: () => void; executePolicy?: string; taskId?: string } | undefined;
+  let pending: { identity: string; manager: object; sessionId: string; ticket: number; taskId?: string } | undefined;
   const sendTaskTurn = (activity: ReturnType<typeof openActivity>, authority: PhaseAuthority, policy: string, resume = false) => {
     const owner = checkAuthority(authority), run = owner.store.fence(authority.fence);
     const key = `task-turn:${run.task!.intentId}:${run.phaseEpoch}${resume ? `:resume:${run.epoch}` : ""}`;
@@ -1131,7 +1142,7 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options?: { shutdown:
         foregroundRevision: run.epoch }, {
         policy, runId: run.runId, planId: run.planId, intentId: run.task!.intentId, phase: run.phase,
         phaseEpoch: run.phaseEpoch, resume,
-        instruction: `Use the existing ${run.phase} operations. Planning completion derives execution automatically, never a standalone /execute or a new human instruction. No publication.`,
+        instruction: `${run.phase === "planning" ? "Plan the work requested in the current conversation, preserving its goals and constraints. The host has chosen the local plan ID; do not ask the user for one. " : ""}Use the existing ${run.phase} operations. Planning completion derives execution automatically, never a standalone /execute or a new human instruction. No publication.`,
       }, run.phase, key),
       display: true, details: { runId: run.runId, phaseEpoch: run.phaseEpoch, key } };
     owner.store.transaction(() => {
@@ -1269,16 +1280,30 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options?: { shutdown:
     },
   });
   pi.registerCommand("task", {
-    description: "Plan, freeze, execute, review and finish locally without publication",
+    description: "Plan and execute the current conversation locally; optional local plan ID, no publication",
     async handler(args, ctx) {
       let cleanup: (() => void) | undefined;
       let pendingTicket: number | undefined;
       try {
         if (isChildSession(ctx)) throw new Error("AgentInstances have bound-plan read only, not foreground task control");
-        const match = /^([a-z0-9][a-z0-9_-]*)$/.exec(args.trim());
-        if (!match) throw new Error("usage: /task <local-plan-id>");
-        const root = currentWorkspace(ctx.cwd), id = match[1]!, expected = snapshotPlan(id, root);
+        const input = args.trim(), match = /^([a-z0-9][a-z0-9_-]*)$/.exec(input);
+        if (input && !match) throw new Error("usage: /task [local-plan-id]");
+        const root = currentWorkspace(ctx.cwd);
         const manager = ctx.sessionManager, sessionId = manager.getSessionId();
+        if (!input) {
+          const current = pending ?? invocation;
+          if (current?.manager === manager && current.sessionId === sessionId) {
+            if (current.taskId && (pending === current || invocation?.activity.current())) return;
+            if (!current.taskId) throw new Error("workflow already selected; use /task <local-plan-id> explicitly");
+          }
+          const state = new WorkflowState(root);
+          try {
+            const previous = state.all<RunRecord>("runs").filter(run =>
+              run.activity === "task" && run.sessionId === sessionId && run.state !== "completed").at(-1);
+            if (previous) throw new Error(`task already selected; use /task ${previous.planId} explicitly to inspect or resume`);
+          } finally { state.close(); }
+        }
+        const id = match?.[1] ?? `task-${randomUUID()}`, expected = snapshotPlan(id, root);
         const identity = JSON.stringify({ activity: "task", root, id });
         if ((invocation?.identity === identity && invocation.manager === manager && invocation.activity.current()) ||
             (pending?.identity === identity && pending.manager === manager)) return;
@@ -1311,7 +1336,7 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options?: { shutdown:
         } finally { state.close(); }
         const closing = retire(), ticket = revision;
         pendingTicket = ticket;
-        pending = { identity, manager, sessionId, ticket };
+        pending = { identity, manager, sessionId, ticket, taskId: id };
         const abort = () => {
           if (pending?.ticket === ticket || invocation?.identity === identity && invocation.manager === manager) void retire();
         };
@@ -1339,7 +1364,7 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options?: { shutdown:
         let unbind: () => void;
         try { unbind = bindCallContext(manager, activity.context); }
         catch (error) { await activity.retire(); throw error; }
-        invocation = { identity, manager, sessionId, activity, unbind, cleanup, executePolicy };
+        invocation = { identity, manager, sessionId, activity, unbind, cleanup, executePolicy, taskId: id };
         pending = undefined; cleanup = undefined;
         if (ctx.signal?.aborted) { await retire(); throw new Error("task invocation aborted"); }
         if (checkAuthority(activity.authority).run.phase === "execution")
