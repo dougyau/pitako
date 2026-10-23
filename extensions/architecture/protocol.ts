@@ -48,7 +48,7 @@ export function immutable<T>(value: T): T {
   return value;
 }
 /** The sole contextual validation boundary, called before a provisional receipt. */
-export function validateSubmission(grant: StageGrant, value: unknown): { submissionId: string; body: Body } {
+export function validateSubmission(grant: StageGrant, value: unknown): { body: Body } {
   const rules = grant.rules;
   const reject = (code: SubmissionDiagnostic["code"], field: string, badIds: (string | number)[] = [], missingIds: (string | number)[] = []): never => {
     throw new SubmissionError({ code, stage: rules.kind, field, badIds, missingIds, correctionsLeft: 0 });

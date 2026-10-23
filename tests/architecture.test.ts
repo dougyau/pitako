@@ -6,9 +6,11 @@ import { workerHandoff, teamWorkerStatus } from "../extensions/agent/background.
 import { firstTeamReservation, teamAssignments } from "../extensions/team.ts";
 import { loadPitakoConfig } from "../extensions/roles/load.ts";
 import { openBoard } from "../extensions/board/store.ts";
-import { ledgerFile, planFile, readLedgerTeamHolds } from "../extensions/workflow.ts";
+import { ledgerFile, planFile } from "../extensions/workflow.ts";
 import { listObservations } from "../extensions/agent/observe.ts";
 import { executionForSession } from "../extensions/execution-identity.ts";
+import { WorkflowState, type Resource } from "../extensions/workflow-state.ts";
+import type { AttemptRecord } from "../extensions/workflow-engine.ts";
 import { architectureFixture, tablePrompt } from "./fixtures/architecture.ts";
 const { fixture, setup, policies, configuration } = architectureFixture();
 const deferred = <T = void>() => Promise.withResolvers<T>();
@@ -68,7 +70,7 @@ for (const protocol of ["architecture", "review"] as const) {
             kind: "retain", memberId: retainedId, mandate: "No side effects", reason: "Duplicate identity",
           }) };
           const rejected = await session.boundTools.get(`${protocol}_submit`).execute("invalid-retain",
-            { submissionId: "invalid-retain", body: invalid }, undefined, undefined, { sessionManager: session.sessionManager });
+            { body: invalid }, undefined, undefined, { sessionManager: session.sessionManager });
           expect(rejected.isError).toBe(true); expect(rejected.details.correctionsLeft).toBe(1);
           expect(teamAssignments(s.evaluation)).toEqual(before); expect(s.host.sessions).toEqual(sessionsBefore);
           expect(sessionsBefore.every(peer => !peer.events.includes("dispose"))).toBe(true);
@@ -212,13 +214,14 @@ test("registered start publishes Markdown guidance and preserves the original br
   } finally { release(); await s.close(); }
 }));
 
-test("registered watched table preserves owner/history/cursors/holds and delivers one terminal synthesis after disband", fixture.ownedCase("architecture full route", async () => {
+test("registered watched table preserves owner/history/cursors/closure and delivers one terminal synthesis after disband", fixture.ownedCase("architecture full route", async () => {
   const deciding = deferred(), continueDecision = deferred(), disposing = deferred(), release = deferred();
   const finish = () => { continueDecision.resolve(); release.resolve(); }; fixture.finishOnCleanup(finish);
   const s = await setup({ busy: true, async prompt(session, request, body) {
     if (request.stage === "contribution" && session.model.id === "chosen") return { ...body, proposal: "A".repeat(20000) + "🧠" };
     if (request.stage === "decision") { deciding.resolve(); await continueDecision.promise; }
   }, async dispose(session) { if (session.model?.id === "chosen") { disposing.resolve(); await release.promise; } } });
+  const store = new WorkflowState(s.root);
   try {
     const db = await openBoard(); const topic = db.createTopic(s.root, { title: "Architecture" }); db.claimTopic(s.root, topic.id, "architecture-plan"); db.close();
     const file = planFile("architecture-plan", s.root); mkdirSync(path.dirname(file), { recursive: true });
@@ -228,8 +231,14 @@ test("registered watched table preserves owner/history/cursors/holds and deliver
     expect(started.isError).not.toBe(true); const handle = started.details;
     parent.abort(); // foreground turn ending never owns the room lifetime
     await deciding.promise;
-    const hold = readLedgerTeamHolds(s.root, "architecture-plan"); expect(hold).toHaveLength(1);
-    expect(hold[0]!.assignmentId).toBe(handle.assignmentId);
+    const attempt = store.get<AttemptRecord>("attempts", handle.dispatchId)!;
+    expect(attempt).toMatchObject({ assignmentId: handle.assignmentId, instanceId: handle.instanceId });
+    expect(attempt.outcome).toBeUndefined();
+    const resource = store.get<Resource>("resources", attempt.resource.resourceId);
+    expect(resource).toMatchObject(attempt.resource);
+    expect(resource!.effectReservation).toBeUndefined();
+    expect(store.closureReceipt(attempt.resource)).toBeUndefined();
+    expect(teamWorkerStatus(s.evaluation.token, handle.instanceId)[0]).toMatchObject({ status: "running", closure: { state: "pending" } });
     expect(workerHandoff(handle.instanceId)).toBeUndefined();
     expect(firstTeamReservation(s.evaluation, "architect")).toBe(handle.assignmentId);
     const page = JSON.parse((await s.invoke("architecture_read", { roomId: handle.roomId })).content[0].text);
@@ -250,15 +259,15 @@ test("registered watched table preserves owner/history/cursors/holds and deliver
     expect((await s.invoke("agent_input", { target: { kind: "team", assignmentId: handle.assignmentId }, historyId: "bad", sessionId: s.host.sessions[0]!.sessionId, intent: "steer", text: "bypass" })).isError).toBe(true);
     const draft = await s.emit("agent_before_settle", { outcome: "completed", context: { canContinue: true } });
     expect(draft?.entries ?? []).toEqual([]);
-    expect(workerHandoff(handle.instanceId)).toBeUndefined(); expect(readLedgerTeamHolds(s.root, "architecture-plan")).toEqual(hold);
+    expect(workerHandoff(handle.instanceId)).toBeUndefined(); expect(store.closureReceipt(attempt.resource)).toBeUndefined();
     expect(listObservations().find(row => row.id === handle.instanceId)?.resultTaken).not.toBe(true);
     expect(s.host.sessions).toHaveLength(2);
-    expect(readLedgerTeamHolds(s.root, "architecture-plan")).toEqual(hold);
+    expect(store.closureReceipt(attempt.resource)).toBeUndefined();
     const list = await s.invoke("agent_history", { action: "list" }); expect(JSON.stringify(list.details)).toContain(handle.assignmentId);
     const specialistMessage = await s.read("architecture_read", { roomId: handle.roomId });
     expect(specialistMessage.members.filter((member: any) => member.id !== handle.assignmentId)).toHaveLength(1);
     continueDecision.resolve(); await disposing.promise;
-    expect(workerHandoff(handle.instanceId)).toBeUndefined(); expect(readLedgerTeamHolds(s.root, "architecture-plan")).toEqual(hold);
+    expect(workerHandoff(handle.instanceId)).toBeUndefined(); expect(store.closureReceipt(attempt.resource)).toBeUndefined();
     s.setIdle(true); release.resolve(); await s.delivered.promise;
     await s.emit("turn_start");
     expect(s.sent.filter(item => item.message.customType === "pitako.worker.result")).toHaveLength(1);
@@ -267,12 +276,16 @@ test("registered watched table preserves owner/history/cursors/holds and deliver
     // the bookkeeping fact after the archive's actual resource receipt exists.
     await s.bookkeeping(handle.instanceId);
     expect(workerHandoff(handle.instanceId)).toMatchObject({ bookkeeping: "reconciled", delivery: "incorporated" });
-    expect(readLedgerTeamHolds(s.root, "architecture-plan")).toEqual([]);
+    expect(store.get<AttemptRecord>("attempts", handle.dispatchId)?.outcome?.status).toBe("completed");
+    expect(store.verifyClosureReceipt(store.closureReceipt(attempt.resource)!)).toBe(true);
+    const archive = await s.read("architecture_read", { roomId: handle.roomId, section: "archive" });
+    expect(archive.state).toBe("written");
+    expect(JSON.parse(readFileSync(archive.path, "utf8")).host.status).toBe("completed");
     expect((await s.read("team_result", { assignmentId: handle.assignmentId })).host.status).toBe("completed");
     const dispatch = s.host.sessions[0]!.sessionManager.getEntries().find((entry: any) => entry.customType === "pitako.architecture.dispatch") as any;
     expect(dispatch.data.callerSessionId).toBe(s.host.sessions[0]!.sessionId);
     expect(dispatch.data.parentAssignmentId).toBe(handle.assignmentId);
-  } finally { finish(); await s.close(); }
+  } finally { store.close(); finish(); await s.close(); }
 }));
 
 test("finish drains active contributions and preserves truncation as partial rather than success", fixture.ownedCase("architecture finish", async () => {
@@ -378,7 +391,7 @@ for (const invalid of ["snapshot", "model", "reasoning", "bind-reasoning", "miss
         if (invalid === "missing") return false;
         if (["conflict", "wrong-stage", "caller"].includes(invalid)) {
           const ctx = { sessionManager: session.sessionManager };
-          const value = { submissionId: "one", body };
+          const value = { body };
           if (invalid === "conflict") {
             const receipt = await submit.execute("one", value, undefined, undefined, ctx);
             expect(receipt.isError).not.toBe(true);
@@ -410,9 +423,9 @@ test("a contextual rejection permits one corrected contribution with an idempote
     if (request.stage !== "contribution" || session.model.id !== "chosen") return;
     const submit = session.boundTools.get("architecture_submit"), ctx = { sessionManager: session.sessionManager };
     const invalid = { ...body, objections: [{ memberId: "foreign", messageId: "invented", argument: "Not in this frontier" }] };
-    const rejected = await submit.execute("invalid", { submissionId: "invalid", body: invalid }, undefined, undefined, ctx);
+    const rejected = await submit.execute("invalid", { body: invalid }, undefined, undefined, ctx);
     expect(rejected.isError).toBe(true);
-    const value = { submissionId: "corrected", body }, accepted = await submit.execute("corrected", value, undefined, undefined, ctx);
+    const value = { body }, accepted = await submit.execute("corrected", value, undefined, undefined, ctx);
     expect(accepted.isError).not.toBe(true);
     expect((await submit.execute("identical", structuredClone(value), undefined, undefined, ctx)).details).toEqual(accepted.details);
     corrections++;
@@ -448,11 +461,11 @@ test("direct and codemode-reachable participant capabilities are leaf, and prior
       const submit = session.boundTools.get("architecture_submit");
       expect(submit).toBe(session.tools.get("architecture_submit").definition);
       // Retain the originating native async context, as a delayed tool callback would.
-      oldSubmit = AsyncResource.bind(() => submit.execute("stale", { submissionId: "old", body }, undefined, undefined, { sessionManager: session.sessionManager }));
+      oldSubmit = AsyncResource.bind(() => submit.execute("stale", { body }, undefined, undefined, { sessionManager: session.sessionManager }));
       const aborted = new AbortController(); aborted.abort();
-      expect((await submit.execute("aborted", { submissionId: "aborted", body }, aborted.signal, undefined, { sessionManager: session.sessionManager })).isError).toBe(true);
+      expect((await submit.execute("aborted", { body }, aborted.signal, undefined, { sessionManager: session.sessionManager })).isError).toBe(true);
       const submitted = structuredClone(body);
-      expect((await submit.execute("immutable", { submissionId: "immutable", body: submitted }, undefined, undefined, { sessionManager: session.sessionManager })).isError).not.toBe(true);
+      expect((await submit.execute("immutable", { body: submitted }, undefined, undefined, { sessionManager: session.sessionManager })).isError).not.toBe(true);
       submitted.proposal = "mutated after receipt";
       return false;
     }
@@ -492,7 +505,7 @@ for (const route of ["stop", "team_cancel"] as const) {
             children.push(session);
             if (children.length === (stage === "contribution" ? 1 : 2)) entered.resolve();
             await releasePrompt.promise;
-            const rejected = await session.boundTools.get("architecture_submit").execute("after-abort", { submissionId: "late", body }, undefined, undefined, { sessionManager: session.sessionManager });
+            const rejected = await session.boundTools.get("architecture_submit").execute("after-abort", { body }, undefined, undefined, { sessionManager: session.sessionManager });
             expect(rejected.isError).toBe(true);
             throw new Error("503 Service Unavailable");
           }
@@ -500,13 +513,15 @@ for (const route of ["stop", "team_cancel"] as const) {
         async abort(session) { if (children.includes(session)) await releaseAbort.promise; },
         async dispose(session) { if (children.includes(session)) { disposing.resolve(); await releaseDispose.promise; } },
       });
+      const store = new WorkflowState(s.root);
       try {
         const db = await openBoard(); const topic = db.createTopic(s.root, { title: "Cancel" }); db.claimTopic(s.root, topic.id, "cancel-plan"); db.close();
         const file = planFile("cancel-plan", s.root); mkdirSync(path.dirname(file), { recursive: true });
         writeFileSync(file, `---\nid: cancel-plan\nrevision: 1\nstatus: frozen\nboard_topic_id: ${topic.id}\n---\nCancellation.\n`);
         const start = await s.invoke("architecture_start", { goal: "cancel active children", plan: "cancel-plan", unit: "T2" });
         await entered.promise;
-        const hold = readLedgerTeamHolds(s.root, "cancel-plan"); expect(hold).toHaveLength(1);
+        const attempt = store.get<AttemptRecord>("attempts", start.details.dispatchId)!;
+        expect(attempt).toMatchObject({ assignmentId: start.details.assignmentId, instanceId: start.details.instanceId });
         const before = s.host.sessions.map(session => ({ session, prompts: [...session.prompts] }));
         const cancelled = route === "stop"
           ? await s.invoke("architecture_control", { roomId: start.details.roomId, action: "stop" })
@@ -518,7 +533,11 @@ for (const route of ["stop", "team_cancel"] as const) {
         const held = () => {
           expect(workerHandoff(start.details.instanceId)).toBeUndefined();
           expect(firstTeamReservation(s.evaluation, "architect")).toBe(start.details.assignmentId);
-          expect(readLedgerTeamHolds(s.root, "cancel-plan")).toEqual(hold);
+          expect(store.get<AttemptRecord>("attempts", start.details.dispatchId)?.outcome).toBeUndefined();
+          const resource = store.get<Resource>("resources", attempt.resource.resourceId);
+          expect(resource).toMatchObject(attempt.resource);
+          expect(resource!.effectReservation).toBeUndefined();
+          expect(store.closureReceipt(attempt.resource)).toBeUndefined();
           const active = teamWorkerStatus(s.evaluation.token).filter(row => row.teamId === start.details.roomId && row.roleId === (stage === "contribution" ? "architect" : "scout"));
           expect(active).toHaveLength(2);
           expect(active.every(row => row.closure.state === "pending")).toBe(true);
@@ -531,10 +550,17 @@ for (const route of ["stop", "team_cancel"] as const) {
         releaseAbort.resolve(); await disposing.promise; held();
         releaseDispose.resolve(); await s.delivered.promise;
         expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("cancelled");
+        await s.bookkeeping(start.details.instanceId);
+        const settled = store.get<AttemptRecord>("attempts", start.details.dispatchId)!;
+        expect(settled.outcome?.status).toBe("cancelled");
+        expect(store.verifyClosureReceipt(store.closureReceipt(attempt.resource)!)).toBe(true);
+        expect(firstTeamReservation(s.evaluation, "architect")).toBeUndefined();
+        expect((await s.read("team_result", { assignmentId: start.details.assignmentId })).host.status).toBe("cancelled");
+        expect(store.get<AttemptRecord>("attempts", start.details.dispatchId)?.outcome).toEqual(settled.outcome);
         expect(s.host.sessions).toHaveLength(before.length);
         expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
         for (const { session, prompts } of before) expect(session.prompts).toEqual(prompts);
-      } finally { release(); await s.close(); }
+      } finally { store.close(); release(); await s.close(); }
     }));
   }
 

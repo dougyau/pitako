@@ -1,4 +1,3 @@
-import { AsyncLocalStorage } from "node:async_hooks";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { getCurrentSystemPrompt, getSupportedThinkingLevels, lazyStream, normalizeContext, type AssistantMessageEvent, type Context, type Model } from "@earendil-works/pi-ai";
 import {
@@ -25,25 +24,24 @@ import { createPublicProducer } from "./public-conversation.ts";
 import { AgentClosureError } from "./closure.ts";
 import { headExtension, leafScopeExtension } from "./head/tools.ts";
 import type { HeadAttachment } from "./head/runtime.ts";
-import type { NativeTurn } from "../table/participant.ts";
+import type { NativeTurn, SubmitBinding } from "../table/participant.ts";
 import { isConsultation } from "./consultation.ts";
 import { ManagedProducer, managedTools, managedGuard, guardManagedLoadedDefinitions } from "./head/managed-tools.ts";
-import { captureCallContext, reserveEffect, bindCallContext, withCallContext, guardDefinition, guardToolRegistrations,
+import { captureCallContext, registerResource, bindCallContext, withCallContext, guardDefinition, guardToolRegistrations,
   type Producer, type CallContext } from "../workflow-engine.ts";
 import { randomUUID } from "node:crypto";
 
 // Pi's default when no setting exists. Host-provided peers need not exist on disk.
 export const DEFAULT_THINKING_LEVEL: ThinkingLevel = "medium";
 
-// A stable registered definition is captured by native wrappers. Authority belongs to
-// the originating prompt, never whichever turn happens to be active on this session.
-const architectureTurns = new AsyncLocalStorage<{ session: AgentSession; identity: NativeTurn; signal: AbortSignal; active: boolean }>();
-
+// Each refreshed executable captures its host binding and native turn. Nested tools
+// (including codemode) need not preserve the runner's async-local context.
 const childLifecycles = new WeakMap<AgentSession, { bound: boolean; disposal?: Promise<void>; history?: SessionHistory;
   resource?: Producer; context?: CallContext; unbindContext?: () => void;
   live?: ReturnType<typeof createLiveHandle>; unbindLive?: () => void;
   head?: HeadAttachment; headBinding?: object; stopAbort?: () => void;
   managed?: ManagedProducer; captureManaged?: (closure?: "released" | "unknown") => void;
+  registerSubmit?: (binding: SubmitBinding, identity: NativeTurn, signal: AbortSignal) => void;
   operations: Set<Promise<unknown>>; failures: unknown[]; abort?: Promise<void>; generation: number; closing: boolean }>();
 
 function requestAbort(session: AgentSession): Promise<void> {
@@ -357,7 +355,8 @@ async function runTarget(
   }
   const identity: NativeTurn = { instanceId: input.instanceId, turnId: input.turnId!, attemptId: input.attemptId!,
     historyId: input.sessionHistory?.historyId, sessionId: session.sessionId };
-  input.participant?.begin(identity);
+  const submitBinding = input.participant?.begin(identity);
+  if (submitBinding) childLifecycles.get(session)!.registerSubmit!(submitBinding, identity, input.signal);
   const handle = resume(session, runtime, selections, now, input);
   let adjustment: string | undefined, requested = target.reasoning;
   const observed = (attempt: Attempt, requested: ModelTarget["reasoning"], adjustment?: string) => {
@@ -526,9 +525,9 @@ async function openSession(
 ): Promise<AgentSession> {
   const managed = input.head?.managed ?? input.scope?.managed ?? input.consultant?.managed;
   const context = managed?.context ?? captureCallContext(input.cwd);
-  const resource = reserveEffect(context, { reservationId: randomUUID(), kind: "writer", paths: [input.cwd],
-    purpose: managed ? "observation" : "work" })
-    .register("Pi SDK session attempt", ["preparation", "sdk-session", "session-shutdown", "sdk-history", "live-input", "callback"]);
+  const resource = registerResource(context, "Pi SDK session attempt",
+    ["preparation", "sdk-session", "session-shutdown", "sdk-history", "live-input", "callback"],
+    managed ? "observation" : "work", "independent", ["live-input", "callback"]);
   resource.enter();
   try {
     const session = await withCallContext(context, () => prepareSession(runtime, model, target, input, resource, context));
@@ -557,6 +556,7 @@ async function prepareSession(
   const allowed = new Set(skillNamesForRole(input.role));
   let live: ReturnType<typeof createLiveHandle> | undefined;
   let nativeSession: AgentSession | undefined;
+  let registerSubmit: ((binding: SubmitBinding, identity: NativeTurn, signal: AbortSignal) => void) | undefined;
   const headBinding = input.head?.bind(input.instanceId);
   const managedAssignment = input.head?.managed ?? input.scope?.managed ?? input.consultant?.managed;
   const supported = new Set<string>();
@@ -587,17 +587,16 @@ async function prepareSession(
           return { block: true, reason: "Consultative leaves cannot orchestrate Pitako work" };
       });
       if (input.participant) {
-        pi.registerTool(guardDefinition({ name: `${input.participant.protocol}_submit`, label: "Submit table turn", description: "Submit for your exact table grant. Contextual errors allow one correction with a new submissionId (two distinct candidates). Identical retries are idempotent; valid provisional submissions are locked. Does not dispatch work.",
-          parameters: input.participant.schema, async execute(id, value, signal, _update, ctx) {
+        registerSubmit = (binding, identity, ownerSignal) => pi.registerTool(guardDefinition({ name: `${input.participant!.protocol}_submit`, label: "Submit table turn", description: "Submit for your exact table grant. Submit only { body }; administrative identity is host-bound. Contextual errors allow one correction (two distinct bodies). Identical retries are idempotent; valid provisional submissions are locked. Does not dispatch work.",
+          parameters: input.participant!.schema, async execute(id, value, signal, _update, ctx) {
             try {
-              const turn = architectureTurns.getStore();
-              if (!turn?.active || turn.session !== nativeSession) throw new Error("architecture grant not active");
-              input.participant!.attemptSubmit(turn.identity);
-              if (turn.signal.aborted || signal?.aborted || childLifecycles.get(turn.session)?.closing)
+              if (!nativeSession || ownerSignal.aborted || childLifecycles.get(nativeSession)?.closing)
                 throw new Error("architecture grant not active");
-              const receipt = input.participant!.submit(id, value, ctx, turn.identity);
+              const receipt = input.participant!.submit(binding, id, value, ctx, identity, signal);
               return { content: [{ type: "text", text: JSON.stringify(receipt) }], details: receipt };
             } catch (error) {
+              // abort() joins the prompt; its owner joins it after this callback returns.
+              if (input.participant!.failure && nativeSession) void requestAbort(nativeSession).catch(() => {});
               const details = error instanceof SubmissionError ? error.diagnostic : {};
               return { content: [{ type: "text", text: String(error) }], details, isError: true };
             }
@@ -658,7 +657,7 @@ async function prepareSession(
   nativeSession = session;
   const lifecycle: NonNullable<ReturnType<typeof childLifecycles.get>> = {
     bound: false, history: input.sessionHistory, head: input.head, headBinding, managed, resource, context,
-    operations: new Set(), failures: [], generation: 0, closing: false,
+    registerSubmit, operations: new Set(), failures: [], generation: 0, closing: false,
   };
   if (managed) {
     // Capture native IDs before retirement, never infer them from tool events/results text.
@@ -855,11 +854,10 @@ async function drive(
         input.scope?.beginPrompt(session.sessionId);
         input.consultant?.beginPrompt();
         if (!input.participant) return session.prompt(prompt, { expandPromptTemplates: false });
-        const turn = { session, identity, signal: input.signal, active: true };
-        return architectureTurns.run(turn, async () => {
+        return (async () => {
           try { await session.prompt(prompt, { expandPromptTemplates: false }); }
-          finally { turn.active = false; }
-        });
+          finally { input.participant!.endPrompt(identity); }
+        })();
       });
       lifecycle.operations.add(prompting);
       try { await prompting; } finally { lifecycle.operations.delete(prompting); }

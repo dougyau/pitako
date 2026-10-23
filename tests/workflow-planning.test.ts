@@ -10,6 +10,7 @@ import { ledgerFile, planFile, planHash } from "../extensions/workflow.ts";
 import { registerBoard } from "../extensions/board/tools.ts";
 import { PublicConversation } from "../extensions/agent/public-conversation.ts";
 import { executeCodemode } from "../node_modules/@earendil-works/pi-coding-agent/dist/extensions/codemode/execute.js";
+import { tableIncidental } from "../extensions/table/results.ts";
 
 const f = architectureFixture("review");
 const test = (name: string, body: () => Promise<void>) => bunTest(name, f.fixture.ownedCase(name, body));
@@ -198,8 +199,11 @@ test("registered review handles survive content-only conversation and Codemode u
 test("registered multiroot status preserves a paginated immutable cut within the final envelope budget", async () => {
   const release = Promise.withResolvers<void>();
   f.fixture.finishOnCleanup(release.resolve);
-  const app = await f.setup({ prompt: async (_session, request) => {
-    if (request.stage === "decision") await release.promise;
+  // This test needs registered pending roots, not 17 completed review deliberations.
+  // Park any entered first turn; cancellation below owns preflight/turn/disposal settlement.
+  const app = await f.setup({ prompt: async () => {
+    await release.promise;
+    return false;
   } });
   try {
     const handles = [];
@@ -211,23 +215,52 @@ test("registered multiroot status preserves a paginated immutable cut within the
     const initial = payload(first);
     expect(initial.header.complete).toBe(false);
     expect(initial.header.cursor).toBeString();
+    expect(initial.header.maxBytes).toBe(4096);
+    expect(initial.header.end).toBeLessThan(initial.header.total);
     const later = handle(await app.invoke("review_start", {
       goal: "After captured cut", object: { kind: "brief", text: "Later object" }, criteria: ["Boundary"],
     }));
-    let text = initial.fragment, cursor = initial.header.cursor;
+    let text = initial.fragment, cursor = initial.header.cursor, pages = 1;
+    let maxEnvelopeBytes = Buffer.byteLength(JSON.stringify(first));
     do {
       const page = await app.invoke("team_status", { cursor });
       if (page.isError) throw new Error(JSON.stringify(page.content));
-      expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(4096);
+      const bytes = Buffer.byteLength(JSON.stringify(page));
+      expect(bytes).toBeLessThanOrEqual(4096);
+      maxEnvelopeBytes = Math.max(maxEnvelopeBytes, bytes);
       const next = payload(page);
+      expect(next.header.id).toBe(initial.header.id);
+      expect(next.header.offset).toBe(text.length);
+      expect(next.header.end).toBeGreaterThan(next.header.offset);
+      expect(next.header.complete).toBe(next.header.cursor === null);
+      ++pages;
       text += next.fragment; cursor = next.header.cursor;
     } while (cursor);
     const cut = JSON.parse(text);
     expect(cut.members.map((member: any) => member.assignmentId)).toEqual(handles.map(item => item.assignmentId));
+    expect(cut.members.map((member: any) => ({ assignmentId: member.assignmentId, instanceId: member.instanceId,
+      teamId: member.teamId, memberId: member.memberId }))).toEqual(handles.map(({ assignmentId, instanceId, teamId, memberId }) =>
+      ({ assignmentId, instanceId, teamId, memberId })));
+    expect(cut.members.every((member: any) => member.status === "running" && member.closure === "pending" && !member.resultAvailable)).toBe(true);
+    expect(text.length).toBe(initial.header.total);
+    expect(pages).toBeGreaterThan(1);
+    // Witness actual byte pressure through the real inline formatter, not a row-count assumption.
+    expect(Buffer.byteLength(text)).toBeGreaterThan(4096);
+    expect(() => tableIncidental({ members: cut.members })).toThrow("exceeds budget");
     expect(text).not.toContain(later.assignmentId);
-    expect(payload(await app.invoke("team_status", { cursor: initial.header.cursor, assignmentId: handles[0]!.assignmentId })).error).toBeDefined();
+    const incompatible = await app.invoke("team_status", { cursor: initial.header.cursor, assignmentId: handles[0]!.assignmentId });
+    expect(Buffer.byteLength(JSON.stringify(incompatible))).toBeLessThanOrEqual(4096);
+    expect(payload(incompatible).error).toBeDefined();
+    const cancellations = [...handles, later].map(item => app.invoke("team_cancel", { assignmentId: item.assignmentId }));
     release.resolve();
+    for (const cancelled of await Promise.all(cancellations)) {
+      expect(cancelled.isError).not.toBe(true);
+      expect(Buffer.byteLength(JSON.stringify(cancelled))).toBeLessThanOrEqual(4096);
+    }
     await Promise.all([...handles, later].map(item => app.bookkeeping(item.instanceId)));
+    console.info("MULTIROOT_STATUS_WITNESS", JSON.stringify({ rootsBeforeCut: handles.length, laterRoots: 1, pages,
+      canonicalBytes: Buffer.byteLength(text), maxEnvelopeBytes, controlledSessions: app.host.sessions.length,
+      controlledPrompts: app.host.sessions.reduce((count, session) => count + session.prompts.length, 0) }));
   } finally { release.resolve(); await app.close(); }
 });
 
@@ -235,7 +268,7 @@ test("registered /plan: real independent design and candidate critique produce e
   const app = await f.setup({ config: f.configuration + '\n[architecture]\ncandidates = []\n',
     prompt: (_session, request, body) => {
       if (request.protocol !== "Pitako review" && request.stage === "composition")
-        return { kind: "composition", snapshotId: request.snapshot.id, specialists: [], reason: "Director analysis suffices for this bounded design" };
+        return { kind: "composition", specialists: [], reason: "Director analysis suffices for this bounded design" };
       if (request.protocol === "Pitako review" && request.stage === "synthesis")
         return { ...body, verdict: "changes-required", newFindings: [{ finding: {
           key: "boundary", materiality: "blocking", contract: "The plan identifies its permitted boundary",
@@ -291,7 +324,8 @@ test("registered /plan: real independent design and candidate critique produce e
     try {
       await entered.promise;
       expect(observationsJoined).toBe(false);
-      expect(owner.store.get<any>("reservations", owner.slotReservation!.reservation.reservationId).state).toBe("active");
+      expect(owner.slotProducer!.live).toBe(true);
+      expect(owner.slotProducer!.snapshot().effectReservation).toBeUndefined();
       expect(() => acquireWorkflowOwner(app.root, "example")).toThrow(/no takeover/);
     } finally { release.resolve(); }
     const receipt = payload(await freezing);
@@ -305,9 +339,9 @@ test("registered /plan: real independent design and candidate critique produce e
       expect(reader.get<any>("runs", context.authority.fence.runId).state).toBe("completed");
       const reservations = reader.all<any>("reservations").filter(item => item.runId === owner.run.runId);
       expect(reservations.every(item => item.state === "released")).toBe(true);
-      const slot = reservations.find(item => item.reservationId === owner.slotReservation?.reservation.reservationId);
+      const slot = reader.closureReceipt(owner.slotProducer!.ref);
       expect(slot).toBeDefined();
-      expect(reader.all<any>("receipts").some(item => item.reservationId === slot.reservationId && reader.verifyReceipt(item))).toBe(true);
+      expect(reader.verifyClosureReceipt(slot!)).toBe(true);
       expect(observationsJoined).toBe(true);
       acquireWorkflowOwner(app.root, "example")();
       expect(() => reserveEffect(context, { reservationId: "late", kind: "writer", paths: [app.root] })).toThrow(/completed/);
@@ -357,7 +391,7 @@ test(`registered /plan freezes the exact candidate after a host ${checkpoint} ch
   const app = await f.setup({ config: "[review]\ncandidates = []\n[architecture]\ncandidates = []\n",
     prompt: (_session, request) => {
       if (request.stage === "composition")
-        return { kind: "composition", snapshotId: request.snapshot.id, specialists: [], reason: "Bounded independent design" };
+        return { kind: "composition", specialists: [], reason: "Bounded independent design" };
     } });
   try {
     await app.commands.get("plan").handler("checkpoint", app.ctx);
@@ -445,7 +479,7 @@ test(`managed freeze rejects a real selected ${rejection} judgment without touch
   const app = await f.setup({ config: f.configuration + '\n[architecture]\ncandidates = []\n',
     prompt: (_session, request, body) => {
       if (request.protocol !== "Pitako review" && request.stage === "composition")
-        return { kind: "composition", snapshotId: request.snapshot.id, specialists: [], reason: "Bounded design" };
+        return { kind: "composition", specialists: [], reason: "Bounded design" };
       if (request.protocol === "Pitako review" && request.stage === "synthesis") {
         if (rejection === "null") return false;
         if (rejection === "partial") return { ...body, completion: "partial", verdict: "inconclusive" };

@@ -641,14 +641,17 @@ describe("board tools", () => {
       registered.checkProjection();
       return registered;
     };
-    const complete = (registered: ReturnType<typeof attempt>) => {
-      registered.result({ status: "completed", result: "Controlled successful work" });
+    const close = (registered: ReturnType<typeof attempt>) => {
       registered.producer.observe("preparation", "closed");
       registered.producer.observe("host-operation", "closed");
       const receipt = registered.producer.observe("callback", "closed", true);
       expect(receipt).toBeDefined();
       recordPlanTeamWork(repo, registered.attempt.watch!.planId, registered.attempt.watch!.unitId,
-        registered.attempt.assignmentId, "completed", undefined, receipt);
+        registered.attempt.assignmentId, undefined, undefined, receipt);
+    };
+    const complete = (registered: ReturnType<typeof attempt>) => {
+      registered.result({ status: "completed", result: "Controlled successful work" });
+      close(registered);
     };
     const create = tools.get("board_topic_create");
     const claim = tools.get("board_workflow_claim");
@@ -697,26 +700,28 @@ describe("board tools", () => {
     rmSync(ledger);
     const currentPlanMeta = readPlan("workflow-plan", repo).meta;
     writeFileSync(ledger, ledgerTemplate(currentPlanMeta));
-    recordPlanTeamWork(repo, "workflow-plan", "unit-a", "cancelled-without-outcome", "pending");
+    const cancelling = attempt("workflow-plan", "unit-a", "cancelled-without-closure");
     const pending = await lifecycle.execute("pending", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo });
     expect(pending.isError).toBe(true);
     expect(textOf(pending)).toContain("Team work for this plan");
-    recordPlanTeamWork(repo, "workflow-plan", "unit-a", "cancelled-without-outcome", "cancelled");
+    cancelling.result({ status: "cancelled", result: "Controlled cancellation" });
+    cancelling.producer.observe("callback", "unknown");
     const cancelled = await lifecycle.execute("cancelled", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo });
     expect(cancelled.isError).toBe(true);
     expect(textOf(cancelled)).toContain("Team work for this plan");
-    recordPlanTeamWork(repo, "workflow-plan", "unit-b", "later-failure", "failed");
+    const failing = attempt("workflow-plan", "unit-b", "later-failure");
+    failing.result({ status: "failed", result: "Controlled failure" });
     const failed = await lifecycle.execute("failed", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo });
     expect(failed.isError).toBe(true);
     expect(textOf(failed)).toContain("Team work for this plan");
-    expect(() => recordPlanTeamWork(repo, "workflow-plan", "unit-c", "unregistered-success", "completed"))
-      .toThrow("no registered attempt");
+    recordPlanTeamWork(repo, "workflow-plan", "unit-c", "unregistered-success", "completed");
+    expect(guard.store.get("attempts", "unregistered-success")).toBeUndefined();
     const success = attempt("workflow-plan", "unit-c", "later-success");
     complete(success);
-    recordPlanTeamWork(repo, "workflow-plan", "unit-a", "cancelled-without-outcome", undefined);
+    recordPlanTeamWork(repo, "workflow-plan", "unit-a", "cancelled-without-closure", undefined);
     recordPlanTeamWork(repo, "workflow-plan", "unit-b", "later-failure", undefined);
-    // Neither an unrelated real success nor cleanup-without-outcome recovers these holds.
-    expect((await lifecycle.execute("still-held", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo })).isError).toBe(true);
+    // Neither an unrelated success nor bookkeeping closes these original resources.
+    expect((await lifecycle.execute("still-open", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo })).isError).toBe(true);
     const closedTopic = await create.execute("closed", { title: "closed unowned" }, undefined, undefined, { cwd: repo });
     const closedDraft = planFile("closed-draft", repo);
     writeFileSync(closedDraft, "---\nid: closed-draft\nrevision: 1\nstatus: draft\n---\n\nClosed.\n");
@@ -782,7 +787,12 @@ describe("board tools", () => {
     complete(racing);
     const resolved = await lifecycle.execute("resolve", { planId: "race-plan", status: "resolved" }, undefined, undefined, { cwd: repo });
     expect(resolved.details?.status).toBe("resolved");
-    expect((await lifecycle.execute("held-after-independent-success", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo })).isError).toBe(true);
+    expect((await lifecycle.execute("open-after-independent-success", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo })).isError).toBe(true);
+    close(cancelling);
+    close(failing);
+    expect((await lifecycle.execute("closed-resources", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo })).isError).not.toBe(true);
+    expect(guard.store.get("attempts", cancelling.attempt.dispatchId)).toMatchObject({ outcome: { status: "cancelled" } });
+    expect(guard.store.get("attempts", failing.attempt.dispatchId)).toMatchObject({ outcome: { status: "failed" } });
     const abandoned = await lifecycle.execute("abandon", { planId: "race-plan", status: "closed" }, undefined, undefined, { cwd: repo });
     expect(abandoned.details?.status).toBe("closed");
     const noTopicRepo = gitRepo();

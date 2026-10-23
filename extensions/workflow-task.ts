@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { captureCallContext, checkAuthority, checkTaskAuthority, guardToolRegistrations,
-  reserveEffect, type PhaseAuthority, type TeamHoldRecord } from "./workflow-engine.ts";
-import type { RunRecord, WorkflowState, Reservation, ReleaseReceipt } from "./workflow-state.ts";
+import { captureCallContext, checkAuthority, checkTaskAuthority, currentCallContext, guardDefinition, guardToolRegistrations,
+  observePhaseTurns, outcomeHash, reserveEffect, retryUserDecisionProjections, type PhaseAuthority, type AttemptRecord } from "./workflow-engine.ts";
+import type { RunRecord, WorkflowState, Reservation, Resource, ResourceClosureReceipt } from "./workflow-state.ts";
 import type { PlanWriteReceipt } from "./workflow-planning.ts";
 import { isChildSession } from "./profile.ts";
 import { foregroundBash } from "./agent/head/managed-tools.ts";
@@ -12,17 +12,26 @@ import { selectedTableResult } from "./agent/background.ts";
 import { selectTeamAssignments, teamEvaluationForSession } from "./team.ts";
 import { startReviewTable } from "./review/index.ts";
 import { captureExecutionObject, executionFingerprint } from "./review/object.ts";
+import { readActivityStatus } from "./workflow-status.ts";
 
 export interface TaskAuthority { readonly intentId: string; readonly epoch: number }
 type Acceptance = {
   kind: "execution-acceptance"; acceptanceId: string; runId: string; binding: string; fingerprint: string;
   reviewResultId: string; evidenceRefs: string[]; acceptance: string; absorption: string;
+  contributors: { dispatchId: string; outcome: string | null; closure: string | null }[];
 };
 type Evidence = {
   kind: "execution-evidence"; evidenceId: string; runId: string; binding: string; fingerprint: string;
-  commands: { command: string; exitCode: number; output: string }[]; release: ReleaseReceipt; coverage: string;
+  commands: { command: string; exitCode: number; output: string }[]; release: ResourceClosureReceipt; coverage: string;
 };
 const result = (value: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(value) }], details: {} });
+function contributorFrontier(store: WorkflowState, runId: string): Acceptance["contributors"] {
+  const resources = new Set(store.all<Resource>("resources").filter(item => item.runId === runId).map(item => item.resourceId));
+  return store.all<AttemptRecord>("attempts").filter(item => resources.has(item.resource.resourceId))
+    .map(item => ({ dispatchId: item.dispatchId, outcome: item.outcome ? outcomeHash(item.outcome) : null,
+      closure: store.closureReceipt(item.resource)?.receiptId ?? null }))
+    .sort((a, b) => a.dispatchId.localeCompare(b.dispatchId));
+}
 
 /** Recovery consults committed host records, not status, archive JSON or model text. */
 export function taskFreezeReceipt(store: WorkflowState, run: RunRecord): PlanWriteReceipt | undefined {
@@ -44,14 +53,13 @@ function execution(ctx: ExtensionContext) {
   const owner = checkAuthority(context.authority);
   if (owner.manager !== ctx.sessionManager || owner.run.phase !== "execution" || !owner.binding)
     throw new Error("execution requires its captured foreground authority");
+  observePhaseTurns(owner.store, owner.run.runId, ctx.sessionManager.getSessionId(), ctx.sessionManager.getBranch());
   return { context, authority: context.authority, owner };
 }
 function barriers(authority: PhaseAuthority) {
   const owner = checkAuthority(authority), store = owner.store;
-  if (store.all<Reservation>("reservations").some(r => r.runId === owner.run.runId && r.state !== "released" && r.purpose !== "observation"))
+  if (store.all<Resource>("resources").some(r => r.runId === owner.run.runId && !store.closureReceipt(r) && r.purpose !== "observation"))
     throw new Error("execution resources remain active or unknown");
-  if (store.all<TeamHoldRecord>("holds").some(hold => hold.planId === owner.run.planId && !hold.cleared))
-    throw new Error("execution holds remain");
   if (store.all<{ runId?: string; cleared?: boolean }>("obligations").some(o => o.runId === owner.run.runId && !o.cleared))
     throw new Error("execution obligations remain unabsorbed");
 }
@@ -65,11 +73,12 @@ export function finishTask(authority: TaskAuthority, input: {
   if (!freeze || freeze.receiptId !== input.freezeReceiptRef || run.task?.freezeReceiptRef !== freeze.receiptId ||
       !acceptance || acceptance.kind !== "execution-acceptance" || acceptance.runId !== run.runId ||
       acceptance.binding !== run.binding || run.task.executionAcceptanceRef !== acceptance.acceptanceId ||
-      executionFingerprint(store.root) !== acceptance.fingerprint) throw new Error("task requires applicable FreezeReceipt and execution acceptance");
+      executionFingerprint(store.root) !== acceptance.fingerprint ||
+      JSON.stringify(contributorFrontier(store, run.runId)) !== JSON.stringify(acceptance.contributors))
+    throw new Error("task requires applicable FreezeReceipt and current execution acceptance frontier");
   // A phase authority is deliberately not manufactured from task input.
-  if (store.all<Reservation>("reservations").some(r => r.runId === run.runId && r.state !== "released" && r.purpose !== "observation") ||
-      store.all<{ runId?: string; cleared?: boolean }>("obligations").some(o => o.runId === run.runId && !o.cleared) ||
-      store.all<TeamHoldRecord>("holds").some(h => h.planId === run.planId && !h.cleared))
+  if (store.all<Resource>("resources").some(r => r.runId === run.runId && !store.closureReceipt(r) && r.purpose !== "observation") ||
+      store.all<{ runId?: string; cleared?: boolean }>("obligations").some(o => o.runId === run.runId && !o.cleared))
     throw new Error("task completion barriers remain");
   const receipt = { kind: "task-completion", receiptId: randomUUID(), runId: run.runId, ...input };
   store.transaction(() => {
@@ -168,33 +177,33 @@ export function registerTaskTools(api: ExtensionAPI, taskFor: (manager: object) 
       for (const ref of params.evidenceRefs) {
         const evidence = store.get<Evidence>("dispositions", ref);
         if (!evidence || evidence.kind !== "execution-evidence" || evidence.runId !== run.runId ||
-            evidence.binding !== run.binding || evidence.fingerprint !== fingerprint || !store.verifyReceipt(evidence.release))
+            evidence.binding !== run.binding || evidence.fingerprint !== fingerprint || !store.verifyClosureReceipt(evidence.release))
           throw new Error("execution evidence is missing, foreign or stale");
       }
-      // Absorb only actual released successful result producers. Failed work still needs D's explicit recovery.
+      // Acceptance interprets retained outcomes; closure never changes their status.
       const obligations = store.all<{ obligationId: string; kind: string; dispatchId?: string; runId?: string; cleared?: boolean }>("obligations")
         .filter(o => o.runId === run.runId && !o.cleared);
       for (const obligation of obligations) {
-        const attempt = obligation.dispatchId && store.get<{ outcome?: { status: string }; reservationId: string;
-          archive?: boolean; watch?: unknown; roleId: string }>("attempts", obligation.dispatchId);
-        const internalCancellation = attempt && attempt.archive === false && !attempt.watch &&
-          ["architect", "reviewer"].includes(attempt.roleId) && attempt.outcome?.status === "cancelled";
-        if (obligation.kind !== "result" || !attempt || !(attempt.outcome?.status === "completed" || internalCancellation) ||
-            store.get<Reservation>("reservations", attempt.reservationId)?.state !== "released")
-          throw new Error("execution obligation needs disposition or exact recovery");
+        const attempt = obligation.dispatchId ? store.get<AttemptRecord>("attempts", obligation.dispatchId) : undefined;
+        if (obligation.kind !== "result" || !attempt?.outcome ||
+            !store.closureReceipt(attempt.resource))
+          throw new Error("execution obligation needs disposition or physical closure");
       }
       const acceptance: Acceptance = { kind: "execution-acceptance", acceptanceId: randomUUID(), runId: run.runId,
         binding: run.binding, fingerprint, reviewResultId: selected.resultId, evidenceRefs: params.evidenceRefs,
-        acceptance: params.acceptance, absorption: params.absorption };
+        acceptance: params.acceptance, absorption: params.absorption, contributors: contributorFrontier(store, run.runId) };
       store.transaction(() => {
         checkAuthority(authority);
         for (const obligation of obligations) store.put("obligations", obligation.obligationId, { ...obligation, cleared: true });
         barriers(authority);
+        if (JSON.stringify(contributorFrontier(store, run.runId)) !== JSON.stringify(acceptance.contributors))
+          throw new Error("execution contributor frontier changed during acceptance");
         store.put("dispositions", acceptance.acceptanceId, { ...acceptance, retainedReview: review, dispositions: params.dispositions });
         const next = { ...run, version: run.version + 1, lastFactAt: new Date().toISOString(),
           ...(run.task ? { task: { ...run.task, executionAcceptanceRef: acceptance.acceptanceId } } : {}) };
         store.put("runs", run.runId, next); owner.run = next;
         store.enqueue(`run:${run.runId}`, run.binding, { kind: "execution-accepted", acceptanceId: acceptance.acceptanceId });
+        retryUserDecisionProjections(store, run.runId);
       });
       return result(acceptance);
     } });
@@ -207,6 +216,17 @@ export function registerTaskTools(api: ExtensionAPI, taskFor: (manager: object) 
       const owner = checkTaskAuthority(task);
       return result(owner.store.fence(owner.run));
     } });
+  api.registerTool(guardDefinition({ name: "workflow_status", label: "Inspect workflow activity",
+    description: "Read the latest or exact local workflow journal, including last result, delivery, projection and physical restrictions. Cold status cannot prove live closure.",
+    parameters: Type.Object({ runId: Type.Optional(text) }, strict), async execute(_id, params, _signal, _update, ctx) {
+      if (isChildSession(ctx)) throw new Error("workflow status is foreground only");
+      return result(readActivityStatus(ctx.cwd, params.runId));
+    } }, "read", false, (error, args) => {
+    const context = currentCallContext(args[4].sessionManager);
+    if (context?.kind !== "managed-unavailable") throw error;
+    if (isChildSession(args[4])) throw new Error("workflow status is foreground only");
+    return result(readActivityStatus(args[4].cwd, args[1].runId));
+  }));
   pi.registerTool({ name: "task_finish", label: "Finish accepted task",
     description: "Terminal task transition only with live task intent, exact version, FreezeReceipt, execution acceptance and released work barriers. Never publishes.",
     parameters: Type.Object({ expectedVersion: version, freezeReceiptRef: text, executionAcceptanceRef: text }, strict),

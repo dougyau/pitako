@@ -25,7 +25,6 @@ import {
   requireFrozen,
   workflowWorkspace,
   readLedgerTeamHolds,
-  updateLedgerTeamHold,
   withLedgerTeamHoldLock,
   writeExecutionUserDecision,
 } from "../extensions/workflow.ts";
@@ -52,8 +51,143 @@ function planText(status = "frozen", body = "body"): string {
   return `---\nid: herdr-integration\nrevision: 2\nstatus: ${status}\n---\n\n# Herdr integration\n\n${body}\n`;
 }
 
+function expectRecoveryPolicy(policy: string): void {
+  for (const contract of [
+    "`ResourceClosureReceipt`", "incompatible effect reservations", "authority and pins",
+    "A physically closed failed/cancelled attempt preserves its outcome and permits another authorized strategy without `clear` or `recoverHold`",
+    "Unknown closure is not released, success or acceptance",
+    "Historical `Team Holds` ledger entries are not admission authority",
+  ]) expect(policy).toContain(contract);
+  for (const retired of [
+    "Team work that is pending, failed, or cancelled", "in the `Team Holds` gate",
+    "Failed, cancelled, and no-outcome holds remain blocking", "missing/malformed gate fails closed",
+    "reconcile `## Workers` and unresolved `Team Holds`", "results retain applicable holds",
+    "failed/cancelled outcomes retain applicable blocking holds", "preserve Team Hold reconciliation and recovery",
+    "real holds and incompatible ledgers retain their existing recovery requirements",
+  ]) expect(policy).not.toContain(retired);
+}
+
+test("/task assembles the current planning recovery policy in its native turn", async () => {
+  const root = tempDir("pitako-task-recovery-policy-"), commands = new Map<string, any>(), branch: any[] = [], notices: string[] = [];
+  const manager = { getSessionId: () => "task-policy", getBranch: () => branch };
+  const shutdown = registerWorkflowCommands({
+    registerCommand(name: string, definition: any) { commands.set(name, definition); }, registerTool() {}, on() {},
+    sendMessage(message: any) { branch.push({ type: "custom_message", id: "task-policy-turn", ...message }); },
+  } as any, { shutdown: false });
+  try {
+    await commands.get("task").handler("recovery-policy", { cwd: root, sessionManager: manager, hasUI: true,
+      ui: { notify(value: string) { notices.push(value); } }, async waitForIdle() {} });
+    expect(notices).toEqual([]);
+    expect(branch).toHaveLength(1);
+    const delivered = JSON.parse(branch[0].content);
+    expect(delivered.status).toBe("planning");
+    expect(delivered.projection.policy).toBe(readFileSync(path.join(packageRoot(), "skills/plan/SKILL.md"), "utf8"));
+    expectRecoveryPolicy(delivered.projection.policy);
+  } finally { await shutdown(); }
+});
+
+for (const command of ["plan", "execute"] as const) test(`/${command} uncertain send blocks its exact target while an independent target continues`, async () => {
+  const root = tempDir(`pitako-${command}-turn-`), commands = new Map<string, any>(), notices: string[] = [], branch: any[] = [];
+  if (command === "execute") for (const id of ["alpha", "beta"]) {
+    const file = planFile(id, root); mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, `---\nid: ${id}\nrevision: 1\nstatus: frozen\nexecution: expected\n---\n\nPlan.\n`);
+  }
+  let sends = 0;
+  const manager = { getSessionId: () => "controlled-turn", getBranch: () => branch };
+  const api = { registerCommand(name: string, definition: any) { commands.set(name, definition); }, registerTool() {}, on() {},
+    sendMessage(message: any) { if (++sends === 1) throw new Error("controlled send cut"); branch.push({ type: "custom_message", id: `receipt-${sends}`, ...message }); } };
+  const shutdown = registerWorkflowCommands(api as any, { shutdown: false });
+  const ctx = { cwd: root, sessionManager: manager, hasUI: true, ui: { notify(value: string) { notices.push(value); } },
+    async waitForIdle() {} };
+  try {
+    await commands.get(command).handler("alpha", ctx);
+    const store = new WorkflowState(root);
+    try {
+      const original = store.all<any>("obligations").find(item => item.kind === "phase-turn");
+      expect(original).toMatchObject({ state: "invocation-started", cleared: false });
+      expect(original.message.content).toContain(readFileSync(path.join(packageRoot(), "skills", command, "SKILL.md"), "utf8"));
+      expectRecoveryPolicy(original.message.content);
+      await shutdown();
+      await commands.get(command).handler("alpha", ctx);
+      expect(sends).toBe(1);
+      expect(notices.at(-1)).toContain("exact receipt required");
+      await commands.get(command).handler("beta", ctx);
+      expect(sends).toBe(2);
+      branch.push({ type: "custom_message", id: "late-exact-receipt", ...original.message });
+      await commands.get(command).handler("alpha", ctx);
+      expect(store.get<any>("obligations", original.key)).toMatchObject({ state: "observed", cleared: true });
+      expect(branch.filter(item => item.details.deliveryId === original.key)).toHaveLength(1);
+      expect(sends).toBe(3);
+    } finally { store.close(); }
+  } finally { await shutdown(); }
+});
+
+for (const command of ["plan", "execute"] as const) test(`/${command} gives a second native receiver the same plan without borrowing the first receipt`, async () => {
+  const root = tempDir(`pitako-${command}-receiver-`), commands = new Map<string, any>();
+  if (command === "execute") {
+    const file = planFile("shared", root); mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, "---\nid: shared\nrevision: 1\nstatus: frozen\nexecution: expected\n---\n\nPlan.\n");
+  }
+  const aBranch: any[] = [], bBranch: any[] = [], notices: string[] = [];
+  const a = { getSessionId: () => "receiver-a", getBranch: () => aBranch };
+  const b = { getSessionId: () => "receiver-b", getBranch: () => bBranch };
+  let sends = 0;
+  const api = { registerCommand(name: string, definition: any) { commands.set(name, definition); }, registerTool() {}, on() {},
+    sendMessage(message: any) { if (++sends === 1) throw new Error("A send may have started");
+      bBranch.push({ type: "custom_message", id: `b-${sends}`, ...message }); } };
+  const shutdown = registerWorkflowCommands(api as any, { shutdown: false });
+  const ctx = (sessionManager: typeof a) => ({ cwd: root, sessionManager, hasUI: true,
+    ui: { notify(value: string) { notices.push(value); } }, async waitForIdle() {} });
+  try {
+    await commands.get(command).handler("shared", ctx(a));
+    const store = new WorkflowState(root);
+    try {
+      const original = store.all<any>("obligations").find(item => item.kind === "phase-turn");
+      expect(original).toMatchObject({ state: "invocation-started", cleared: false });
+      await shutdown();
+      bBranch.push({ type: "custom_message", id: "borrowed-a", ...original.message });
+      await commands.get(command).handler("shared", ctx(b));
+      expect(sends).toBe(2);
+      expect(store.get<any>("obligations", original.key)).toMatchObject({ state: "invocation-started", cleared: false });
+      await commands.get(command).handler("shared", ctx(a));
+      expect(sends).toBe(2);
+      expect(notices.at(-1)).toContain("exact receipt required");
+      aBranch.push({ type: "custom_message", id: "a-native", ...original.message });
+      await commands.get(command).handler("shared", ctx(a));
+      expect(store.get<any>("obligations", original.key)).toMatchObject({ state: "observed", cleared: true });
+      expect(sends).toBe(3);
+    } finally { store.close(); }
+  } finally { await shutdown(); }
+});
+
+test("a retired reserved turn has committed non-invocation proof and can start a fresh /plan turn", async () => {
+  const root = tempDir("pitako-reserved-turn-"), commands = new Map<string, any>(), branch: any[] = [];
+  const journal = new WorkflowState(root);
+  let sessionId = "before", sends = 0;
+  const stop = journal.subscribe(() => {
+    if (journal.all<any>("obligations").some(item => item.kind === "phase-turn" && item.state === "reserved"))
+      sessionId = "after";
+  });
+  const manager = { getSessionId: () => sessionId, getBranch: () => branch };
+  const api = { registerCommand(name: string, definition: any) { commands.set(name, definition); }, registerTool() {}, on() {},
+    sendMessage(message: any) { sends++; branch.push({ type: "custom_message", id: "current", ...message }); } };
+  const shutdown = registerWorkflowCommands(api as any, { shutdown: false });
+  const ctx = { cwd: root, sessionManager: manager, hasUI: true, ui: { notify() {} }, async waitForIdle() {} };
+  try {
+    await commands.get("plan").handler("alpha", ctx);
+    const original = journal.all<any>("obligations").find(item => item.kind === "phase-turn");
+    expect(original).toMatchObject({ state: "reserved", cleared: false });
+    expect(sends).toBe(0);
+    await shutdown();
+    await commands.get("plan").handler("alpha", ctx);
+    expect(journal.get<any>("obligations", original.key)).toMatchObject({ state: "not-invoked", cleared: true });
+    expect(sends).toBe(1);
+    expect(branch[0].details.deliveryId).not.toBe(original.key);
+  } finally { stop(); await shutdown(); journal.close(); }
+});
+
 describe("common workflow authority and journal", () => {
-  for (const git of [false, true]) test(`held ordinary writer and managed planning share the exact ${git ? "Git" : "noGit"} participating root`, async () => {
+  for (const git of [false, true]) test(`planning lifecycle shares the exact ${git ? "Git" : "noGit"} root without acquiring the ordinary writer's paths`, async () => {
     const root = git ? gitRepo() : tempDir("pitako-root-routing-");
     const child = path.join(root, "child"), alias = path.join(tempDir("pitako-root-alias-"), "alias");
     mkdirSync(child); symlinkSync(child, alias);
@@ -72,7 +206,7 @@ describe("common workflow authority and journal", () => {
     let activity: ReturnType<typeof openPlanActivity> | undefined;
     const exact = checkCallContext(captureCallContext(alias));
     try {
-      pending = Promise.resolve(tool.execute("held", {}, undefined, undefined, { cwd: alias, sessionManager: manager } as any));
+      pending = Promise.resolve(tool.execute("held", {}, undefined, undefined, { cwd: git ? root : alias, sessionManager: manager } as any));
       await entered.promise;
       expect(checkCallContext(captureCallContext(child)).store.root).toBe(exact.store.root);
       expect(exact.store.all<any>("reservations").some(r => r.kind === "writer" && r.state === "active")).toBe(true);
@@ -82,16 +216,13 @@ describe("common workflow authority and journal", () => {
       await independent.retire(); independentOwner.guard.close(); independentOwner.store.close();
       const managedRoot = git ? root : child;
       await commands.get("plan").handler("registered", ctx);
-      expect(errors).toHaveLength(1);
-      expect(errors[0]).toMatch(/occupied/);
-      expect(sent).toHaveLength(0);
-      expect(() => { activity = openPlanActivity("blocked", managedRoot, snapshotPlan("blocked", managedRoot), manager, manager.getSessionId()); }).toThrow(/occupied/);
+      expect(errors).toHaveLength(0);
+      expect(sent).toHaveLength(1);
+      activity = openPlanActivity("independent-slot", managedRoot, snapshotPlan("independent-slot", managedRoot), {}, "independent-slot");
       expect(exact.store.root).toBe(managedRoot);
+      expect(exact.store.all<any>("reservations").some(r => r.kind === "writer" && r.state === "active")).toBe(true);
       release.resolve(); await pending;
       expect(exact.store.all<any>("reservations").every(r => r.state === "released")).toBe(true);
-      await commands.get("plan").handler("registered", ctx);
-      expect(errors).toHaveLength(1);
-      expect(sent).toHaveLength(1);
       const registered = captureCallContext(child, manager);
       expect(registered.kind).toBe("managed");
     } finally {
@@ -123,8 +254,8 @@ describe("common workflow authority and journal", () => {
       expect(() => second.reserve({ reservationId: "another", kind: "writer", paths: [root] })).toThrow();
       const receipt = resource.observe("callback", "closed");
       expect(receipt).toBeDefined();
-      expect(second.store.verifyReceipt(receipt!)).toBe(true);
-      expect(second.store.verifyReceipt({ ...receipt!, generation: 2 })).toBe(false);
+      expect(second.store.verifyClosureReceipt(receipt!)).toBe(true);
+      expect(second.store.verifyClosureReceipt({ ...receipt!, resource: { ...receipt!.resource, generation: 2 } })).toBe(false);
       second.assertIdle([root]);
       const gate = second.reserve({ reservationId: "admitted", kind: "gates", paths: [root] }).register("gate", ["host-operation"]);
       gate.enter(); gate.observe("host-operation", "closed", true);
@@ -148,6 +279,7 @@ describe("common workflow authority and journal", () => {
     const root = tempDir("pitako-workflow-ancestors-"), guard = new RootGuard(root);
     try {
       const parent = guard.reserve({ reservationId: "parent", kind: "writer", paths: [root] });
+      const releases = () => guard.store.all<ReleaseReceipt>("receipts").filter(r => r.reservationId);
       const own = parent.register("parent", ["callback", "host-operation"]);
       const child = guard.store.reserve({ reservationId: "child", kind: "writer", paths: [root], parentReservationId: "parent" }, parent.reservation.ownerId);
       const childResource = guard.store.resource(child, { adapter: "child", scopes: ["callback"], purpose: "work" });
@@ -155,19 +287,20 @@ describe("common workflow authority and journal", () => {
       const grandResource = guard.store.resource(grandchild, { adapter: "grandchild", scopes: ["host-operation"], purpose: "work" });
       own.observe("callback", "unknown", true);
       guard.store.observe(childResource, 1, "callback", "closed", true);
-      expect(guard.store.all("receipts")).toEqual([]);
+      expect(releases()).toEqual([]);
       expect(() => guard.store.observe({ ...grandResource, generation: 2 }, 1, "host-operation", "closed", true)).toThrow(/foreign resource/);
       expect(() => guard.store.observe({ ...grandResource, producerId: "foreign" }, 1, "host-operation", "closed", true)).toThrow(/foreign resource/);
       const receipt = guard.store.observe(grandResource, 1, "host-operation", "closed", true)!;
-      expect(receipt.reservationId).toBe("grandchild");
-      expect(guard.store.all<ReleaseReceipt>("receipts").map(value => value.reservationId).sort()).toEqual(["child", "grandchild"]);
+      expect(receipt.resource.resourceId).toBe(grandResource.resourceId);
+      expect(releases().map(value => value.reservationId).sort()).toEqual(["child", "grandchild"]);
       own.observe("callback", "closed");
-      expect(guard.store.all("receipts")).toHaveLength(2); // Parent still has its own missing host boundary.
+      expect(releases()).toHaveLength(2); // Parent still has its own missing host boundary.
       const parentReceipt = own.observe("host-operation", "closed")!;
-      expect(parentReceipt.reservationId).toBe("parent");
-      expect(guard.store.verifyReceipt(parentReceipt)).toBe(true);
+      expect(parentReceipt.resource).toEqual(own.ref);
+      expect(guard.store.verifyClosureReceipt(parentReceipt)).toBe(true);
+      expect(releases().find(r => r.reservationId === "parent")).toBeDefined();
       expect(guard.store.observe(grandResource, 1, "host-operation", "closed", true)).toEqual(receipt);
-      expect(guard.store.all("receipts")).toHaveLength(3);
+      expect(releases()).toHaveLength(3);
       expect(() => guard.store.observe(grandResource, 1, "host-operation", "unknown", true)).toThrow(/reused/);
       guard.assertIdle([root]);
     } finally { guard.close(); }
@@ -194,20 +327,18 @@ describe("common workflow authority and journal", () => {
           expect(() => contender.exec("BEGIN IMMEDIATE")).toThrow(/locked/);
         } finally { contender.close(); }
         // This accepted action stands at the ledger's synchronous external-I/O boundary.
-        expect(updateLedgerTeamHold(root, "beta", { assignmentId: "other", unitId: "B", status: "pending" }, false, beta)).toBe(true);
+        writeExecutionUserDecision(beta, "blocked");
       });
       independent.transaction(() => independent.enqueue("independent", "beta", { after: true }));
       expect(independent.outbox()).toHaveLength(2);
       expect(readLedgerTeamHolds(root, "alpha", alpha)).toEqual([]);
-      expect(readLedgerTeamHolds(root, "beta", beta)).toEqual([{ assignmentId: "other", unitId: "B", status: "pending" }]);
-      updateLedgerTeamHold(root, "alpha", { assignmentId: "first", unitId: "B", status: "pending" }, false, alpha);
+      expect(readFileSync(ledgerFile("beta", root), "utf8")).toMatch(/^status: blocked$/m);
       writeExecutionUserDecision(alpha, "paused");
-      updateLedgerTeamHold(root, "alpha", { assignmentId: "second", unitId: "B", status: "pending" }, false, alpha);
       expect(readFileSync(ledgerFile("alpha", root), "utf8")).toMatch(/^status: paused$/m);
-      expect(readLedgerTeamHolds(root, "alpha", alpha).map(hold => hold.assignmentId)).toEqual(["first", "second"]);
+      expect(readLedgerTeamHolds(root, "alpha", alpha)).toEqual([]);
     } finally { probe.close(); independent.close(); }
   });
-  test("ordered Team projection retains blocked work and excludes a competing drainer without starving another plan", () => {
+  test("historical Team hold outbox cannot replay a retired capability or rewrite a ledger", () => {
     const root = gitRepo();
     const bindings = ["alpha", "beta"].map(id => {
       const file = planFile(id, root); mkdirSync(path.dirname(file), { recursive: true });
@@ -224,27 +355,12 @@ describe("common workflow authority and journal", () => {
             hold: { assignmentId: execution.planId, planId: execution.planId, unitId: "B", execution, status: "pending", cleared } });
         }
       });
-      const legacyLock = `${ledgerFile("alpha", root)}.lock`;
-      writeFileSync(legacyLock, "controlled unknown legacy writer");
+      const originals = bindings.map(b => readFileSync(ledgerFile(b.planId, root), "utf8"));
       projectTeamHolds(first);
-      expect(first.outbox().map(entry => entry.state)).toEqual(["blocked", "pending", "applied"]);
-      expect((first.outbox()[0]!.body as { projectionDiagnostic: string }).projectionDiagnostic).toMatch(/closure is unknown/);
-      expect(readLedgerTeamHolds(root, "beta", bindings[1]!)).toHaveLength(1);
-      rmSync(legacyLock); // This fixture owns the planted sentinel; no writer entered.
-      let contested = 0;
-      let contention: unknown;
-      stop = first.subscribe(() => {
-        if (contested++) return;
-        try { projectTeamHolds(second); } catch (error) { contention = error; }
-      });
-      projectTeamHolds(first);
-      expect(contested).toBeGreaterThan(0);
-      expect(String(contention)).toMatch(/target unavailable/);
-      expect(first.outbox().map(entry => entry.state)).toEqual(["applied", "applied", "applied"]);
-      expect(readLedgerTeamHolds(root, "alpha", bindings[0]!)).toEqual([]);
-      const before = readFileSync(ledgerFile("alpha", root), "utf8");
+      expect(first.outbox().map(entry => entry.state)).toEqual(["not-applicable", "not-applicable", "not-applicable"]);
       projectTeamHolds(second);
-      expect(readFileSync(ledgerFile("alpha", root), "utf8")).toBe(before);
+      expect(bindings.map(b => readFileSync(ledgerFile(b.planId, root), "utf8"))).toEqual(originals);
+      expect(first.outbox().map(entry => (entry.body as any).hold.status)).toEqual(["pending", "pending", "pending"]);
     } finally { stop(); first.close(); second.close(); }
   });
   test("corrupt, unversioned, and unknown stores fail closed without recreation", () => {
@@ -330,6 +446,7 @@ describe("common workflow authority and journal", () => {
     const child = guard.store.reserve({ reservationId: "child", kind: "writer", paths: [root], parentReservationId: "parent" }, parent.reservation.ownerId);
     const resource = guard.store.resource(child, { adapter: "child", scopes: ["callback"], purpose: "work" });
     own.observe("callback", "closed", true);
+    const originalReceipts = reader.store.all("receipts");
     const db = openSqliteSync(guard.store.file);
     let notifications = 0;
     const stop = guard.store.subscribe(() => { notifications++; });
@@ -339,7 +456,7 @@ describe("common workflow authority and journal", () => {
         CREATE TRIGGER reject_parent_receipt AFTER INSERT ON receipts
         WHEN json_extract(new.body, '$.reservationId') = 'parent' BEGIN INSERT INTO deferred_receipt VALUES(new.id); END;`);
       expect(() => guard.store.observe(resource, 1, "callback", "closed", true)).toThrow(/FOREIGN KEY/);
-      expect(reader.store.all("receipts")).toEqual([]);
+      expect(reader.store.all("receipts")).toEqual(originalReceipts);
       expect(reader.store.exactResource(resource)).toMatchObject({ sealed: false, facts: {} });
       expect(notifications).toBe(0);
       expect(() => reader.assertIdle([root])).toThrow();
@@ -408,7 +525,7 @@ describe("common workflow authority and journal", () => {
       expect(timers).toBe(0);
       expect(owner.guard.store.all("resources")).toMatchObject([{ sealed: false, facts: {} }]);
       expect(owner.store.all("receipts")).toEqual([]);
-      expect(owner.store.all("reservations")).toMatchObject([{ state: "active" }]);
+      expect(owner.store.all("reservations")).toEqual([]);
       expect(owner.store.all("runs")).toMatchObject([{ state: "interrupted" }]);
       expect(() => { const unlock = acquireWorkflowOwner(root, "herdr-integration"); unlock(); }).toThrow(/no takeover/);
     } finally {
@@ -757,7 +874,7 @@ describe("plan binding", () => {
   });
 });
 
-describe("ledger Team hold locking", () => {
+describe("ledger writer locking", () => {
   test("preserves concurrent updates across processes", async () => {
     const cwd = tempDir("pitako-hold-contention-");
     const file = planFile("hold-plan", cwd);
@@ -769,21 +886,21 @@ describe("ledger Team hold locking", () => {
     const children: ReturnType<typeof spawn>[] = [];
     // Ten distinct entries per worker retain repeated contention without a 400-write stress workload.
     await runHoldWorkers(cwd, worker => `
-      import { updateLedgerTeamHold } from ${JSON.stringify(moduleUrl)};
-      for (const status of ["pending", "failed"]) {
-        for (let i = 0; i < 10; i++) {
-          if (!updateLedgerTeamHold(${JSON.stringify(cwd)}, "hold-plan", {
-            assignmentId: ${JSON.stringify(`worker-${worker}-`)} + i, unitId: "unit", status,
-          })) throw new Error("hold was not updated");
-        }
+      import { withLedgerTeamHoldLock, ledgerFile } from ${JSON.stringify(moduleUrl)};
+      import { readFileSync, writeFileSync } from "node:fs";
+      for (let i = 0; i < 10; i++) {
+        withLedgerTeamHoldLock(${JSON.stringify(cwd)}, "hold-plan", () => {
+          const file = ledgerFile("hold-plan", ${JSON.stringify(cwd)});
+          writeFileSync(file, readFileSync(file, "utf8") + "\\nwriter-${worker}-" + i + "\\n");
+        });
       }
     `, children);
     expect(children).toHaveLength(4);
     for (const child of children) expect(child.exitCode).toBe(0);
     const expected = Array.from({ length: 4 }, (_, worker) =>
-      Array.from({ length: 10 }, (_, i) => ({ assignmentId: `worker-${worker}-${i}`, unitId: "unit", status: "failed" as const })),
-    ).flat().sort((a, b) => a.assignmentId.localeCompare(b.assignmentId));
-    expect(readLedgerTeamHolds(cwd, "hold-plan").sort((a, b) => a.assignmentId.localeCompare(b.assignmentId))).toEqual(expected);
+      Array.from({ length: 10 }, (_, i) => `writer-${worker}-${i}`),
+    ).flat().sort();
+    expect(readFileSync(ledgerFile("hold-plan", cwd), "utf8").split("\n").filter(s => s.startsWith("writer-")).sort()).toEqual(expected);
     expect(existsSync(`${ledgerFile("hold-plan", cwd)}.lock`)).toBe(false);
   });
 
@@ -818,7 +935,7 @@ describe("ledger Team hold locking", () => {
     const lock = `${ledger}.lock`;
     mkdirSync(lock);
     try {
-      expect(() => updateLedgerTeamHold(cwd, "stale-plan", { assignmentId: "a", unitId: "unit", status: "pending" })).toThrow(/verify no writer is active before manually removing the stale lock/);
+      expect(() => withLedgerTeamHoldLock(cwd, "stale-plan", () => {})).toThrow(/verify no writer is active before manually removing the stale lock/);
       expect(existsSync(lock)).toBe(true);
     } finally { rmSync(lock, { recursive: true, force: true }); }
   }, 10000);
@@ -836,6 +953,26 @@ describe("plan and execute contracts", () => {
   const verify = readFileSync(path.join(packageRoot(), "skills/practical/verify-behavior/SKILL.md"), "utf8");
 
   // Static policy contracts, not tests of model compliance or implementation effectiveness.
+  test("delivered workflow policies and documentation separate physical admission from outcome and acceptance", () => {
+    for (const policy of [plan, execute]) {
+      expectRecoveryPolicy(policy);
+      expect(policy).toContain("legacy ledger lock whose closure is unknown still blocks ledger writes");
+      expect(policy).toContain("closure of all contributing work");
+    }
+    expect(plan).toContain("acceptance requires a pertinent current-object judgment");
+    expect(execute).toContain("an uncertain phase turn blocks its exact target and that run's acceptance");
+    expect(execute).toContain("Do not replay an uncertain dispatch");
+    for (const file of ["docs/engineering.md", "docs/architecture.md"]) {
+      const docs = readFileSync(path.join(packageRoot(), file), "utf8");
+      for (const contract of [
+        "`ResourceClosureReceipt`", "A physically closed failed/cancelled attempt preserves its outcome",
+        "without `clear` or `recoverHold`", "Unknown closure is not released, success or acceptance",
+      ]) expect(docs).toContain(contract);
+      expect(docs).not.toContain("outcomes retain applicable holds");
+      expect(docs).not.toContain("failed/cancelled outcomes retain applicable blocking holds");
+      expect(docs).not.toContain("Team Hold authority are unchanged");
+    }
+  });
   test("TODO guidance exposes known stages and preserves them through resume", () => {
     for (const instruction of [router, plan]) {
       expect(instruction).toMatch(/all known (?:planning )?stages as `pending`/);
@@ -983,7 +1120,8 @@ describe("plan and execute contracts", () => {
     expect(setup.indexOf("Read the script")).toBeLessThan(setup.indexOf('bash ./scripts/setup.sh </dev/null'));
     for (const contract of [
       "running worker ends the turn", "unknown or unreconciled ownership blocks setup",
-      "Unresolved holds block setup", "external symlink", "unreadable script",
+      "Active or unknown resources that conflict with setup block it until exact closure is established",
+      "historical failed/cancelled outcomes do not", "external symlink", "unreadable script",
       "Missing setup is supported", "failed or interrupted invocation leaves dependent work blocked",
       "root, script, dependency declarations/lockfile, runtime, and installed dependencies",
       "Missing dependencies or relevant changes invalidate it", "without an arbitrary retry budget",
@@ -1232,7 +1370,12 @@ describe("plan and execute contracts", () => {
     const diagnosis = verify.slice(verify.indexOf("## Distinguish diagnosis"), verify.indexOf("## Reuse evidence"));
     for (const policy of [loop, sequenceExecution, diagnosis]) {
       expect(policy).toMatch(/useful independent (?:current-unit )?checks/i);
-      expect(policy).toMatch(/ownership, unresolved Team holds, (?:and|or) setup restrictions/);
+      expect(policy).toContain("ownership");
+      expect(policy).toContain("setup restrictions");
+      if (policy === loop) {
+        expect(policy).toContain("applicable physical closure or incompatible effect reservations");
+        expect(policy).toContain("Unresolved Team holds in shared verification guidance mean these physical exclusions, never a veto by historical outcome or ledger entries");
+      } else expect(policy).toMatch(/ownership, unresolved Team holds, (?:and|or) setup restrictions/);
       expect(policy).toContain("Failed or interrupted setup permits only non-dependent read-only diagnosis, not implementation writes or dependent checks");
     }
     expect(loop).toContain("Do not start the next unit until this unit is verifiable");
@@ -1288,7 +1431,7 @@ describe("plan and execute contracts", () => {
     expect(execute).toContain("A blocked projection is not a persisted ledger status");
     expect(execute).toContain("execution: expected");
     expect(execute).toContain("Explicit abandonment of the whole workflow");
-    expect(execute).toContain("Failed, cancelled, and no-outcome holds remain blocking across reload");
+    expect(execute).toContain("watched Team work without an exact `ResourceClosureReceipt`");
     expect(execute).toContain("WorkBrief");
     expect(execute).toContain("Do not send the parent transcript");
     expect(execute).toContain("Do not invoke $plan");
@@ -1341,17 +1484,17 @@ describe("plan and execute contracts", () => {
     expect(execute).toContain("frozen `plan` and relevant `unit`, preserving the existing binding and execution root");
   });
 
-  test("planning correlation and operational checkpoints do not create or bypass Team Holds", () => {
+  test("planning correlation and operational checkpoints do not create or bypass physical exclusions", () => {
     for (const contract of [
       "check the draft's explicit Board binding and existing ledger",
       "uses the captured draft automatically",
       "Correlation is not authority and cannot select another slot",
       "Do not create an execution ledger during standalone planning",
       "Real reservations or incompatible bindings remain blockers",
-      "cannot bypass a real Team Hold",
+      "cannot bypass applicable physical closure, an incompatible binding, effect reservation or pin",
       "Record role, purpose, handle type and exact ID, pending decision, and consulted object",
       "Team assignment ID for Team", "worker instance ID for `agent_spawn`",
-      "with or without correlation", "operational checkpoint, not a Team Hold or acceptance evidence",
+      "with or without correlation", "operational checkpoint, not a resource reservation or acceptance evidence",
       "Exclude `## Planning workers` from the consulted object",
       "explicitly instruct the worker to ignore that section",
     ]) expect(plan).toContain(contract);
@@ -1411,7 +1554,7 @@ describe("plan and execute contracts", () => {
       "record only the exterior root assignment", "use only that root for watched completion",
       "Internal member IDs and room messages cannot close the root's hold",
       "complete terminal current-object judgment after owned closure",
-      "Partial, failed and cancelled results retain applicable holds", "bookkeeping, not acceptance",
+      "Partial, failed and cancelled results do not supply the required judgment", "bookkeeping, not acceptance",
     ]) expect(plan).toContain(contract);
     expect(plan).not.toContain("extra Architects and Reviewers");
     for (const policy of [plan, execute]) expect(policy).not.toContain("If Team rejects a reserved role");
@@ -1442,11 +1585,12 @@ describe("plan and execute contracts", () => {
     expect(plan).toContain("Only in planning, an unknown handle after reload or process loss permits one replacement consultation");
     expect(plan).toContain("record the loss, then assign a fresh current-object WorkBrief");
     expect(plan).toContain("A known failure is not an unknown handle");
-    expect(plan).toContain("does not recover Team Holds or authorize execution");
-    expect(plan).toContain("real holds and incompatible ledgers retain their existing recovery requirements");
+    expect(plan).toContain("does not establish physical closure or authorize execution");
+    expect(plan).toContain("applicable active/unknown physical resources, incompatible effect reservations, bindings and pins remain blockers");
+    expect(plan).toContain("A lost handle does not prove release or permit replay of an uncertain dispatch");
     expect(execute).toContain("If unknown, record the missing ownership evidence and block dependent replacement, not independent diagnosis");
     expect(execute).toContain("planning-only lost-consultation replacement does not apply in execution");
-    expect(execute).toContain("preserve Team Hold reconciliation and recovery");
+    expect(execute).toContain("preserve exact physical closure, incompatible effect reservations, authority and pins");
   });
 
   test("object changes and admission blockers cannot reuse stale judgments or bypass ownership", () => {
@@ -1470,7 +1614,7 @@ describe("plan and execute contracts", () => {
       ]) expect(policy).toContain(contract);
       expect(policy).not.toContain("Apply it after interpreting the supplied result, cancel the worker");
     }
-    expect(execute).toContain("a new assignment does not clear a blocking hold");
+    expect(execute).toContain("a new assignment does not release an incompatible effect reservation");
   });
 
   test("active orchestration guidance reads referenced content without acknowledging or accepting work", () => {
@@ -1480,7 +1624,7 @@ describe("plan and execute contracts", () => {
     expect(plan).toContain("Ordinary `team_result` and exact-worker `agent_result` diagnostic behavior is unchanged");
     expect(plan).toContain("reads never acknowledge incorporation");
     expect(plan).not.toContain("on each watched completion wake, call");
-    expect(execute).toContain("Automatic collection reconciles only a successful assignment's own result hold");
+    expect(execute).toContain("Automatic collection verifies the exact attempt's physical closure independently of outcome");
     expect(execute).toContain("it does not accept work or complete a unit");
     expect(execute).toContain("Bookkeeping failure is reported separately and never hides the selected report or its reference");
     expect(router).toContain("Do not poll or acknowledge collection");
@@ -1560,9 +1704,9 @@ describe("plan and execute contracts", () => {
       "policy deviation, not a runtime admission rejection",
       "Cancel only that exact assignment by its handle type",
       "End the turn for physical settlement",
-      "already-returned model-facing host proof of released closure for that exact handle, required hold recovery, and normal admission",
+      "already-returned model-facing host proof of released closure for that exact handle and normal admission under current authority and pins",
       "Without that proof, no Head starts in this invocation",
-      "preserve the blocker, affected resources, and holds",
+      "preserve the blocker, affected resources, and reservations",
       "A normal `team_cancel` receipt reports pending closure, not released closure",
       "Later `team_status` omits closure",
       "`agent_status` excludes Team-owned workers",
@@ -1572,7 +1716,8 @@ describe("plan and execute contracts", () => {
       "worker self-report do not substitute",
       "Do not recancel, poll, probe another assignment, switch transport, or add an observation API",
       "later authorized admission may assign Head only after the role is free",
-      "Failed, cancelled, and no-outcome holds never clear merely because a new Head starts",
+      "A new Head never proves predecessor closure or changes a failed/cancelled outcome",
+      "Physically closed failures require no separate hold-clearing ritual",
       "Retain already physically settled useful ordinary work",
       "do not replay it to manufacture a Head handoff",
       "Assign only the remaining outcome",

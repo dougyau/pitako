@@ -1,6 +1,9 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { statusOwner, liveProducer, runActivityObserver, type StatusReadAuthority, type ResourceRef, type Producer } from "./workflow-engine.ts";
-import type { Activity, Phase, Reservation, RunRecord } from "./workflow-state.ts";
+import { existsSync } from "node:fs";
+import path from "node:path";
+import { statusOwner, liveProducer, runActivityObserver, type AttemptRecord, type StatusReadAuthority, type ResourceRef, type Producer } from "./workflow-engine.ts";
+import { currentWorkspace } from "./board/workspace.ts";
+import { WorkflowState, resourceRef, type Activity, type Phase, type Reservation, type Resource, type RunRecord } from "./workflow-state.ts";
 
 export type ActivityStatusSnapshot = {
   runId: string; activity: Activity; phase: Phase | null; ownerEpoch: number; phaseEpoch: number;
@@ -8,6 +11,16 @@ export type ActivityStatusSnapshot = {
   state: "active" | "waiting" | "blocked" | "retiring" | "completed" | "interrupted";
   wait: { kind: "live"; producerRef: ResourceRef } | { kind: "unknown"; reason: string } | null;
   diagnostics: readonly { scope: string; reason: string }[];
+  attempts: readonly { dispatchId: string; instanceId: string; roleId: string;
+    outcome: AttemptRecord["outcome"] | null; resource: ResourceRef; closure: "closed" | "unknown" | "open" }[];
+  evidence: readonly { resource: ResourceRef; adapter: string; scopes: Resource["scopes"];
+    facts: Resource["facts"]; closure: "closed" | "unknown" | "open" }[];
+  restrictions: readonly { reservationId: string; kind: Reservation["kind"]; paths: readonly string[];
+    state: "active" | "unknown"; reason: string | null }[];
+  lastResult: { dispatchId: string; outcome: AttemptRecord["outcome"] | null; closure: "closed" | "unknown" | "open" } | null;
+  delivery: readonly { key: string; state: string }[];
+  projections: readonly { sequence: number; state: string; diagnostic?: string }[];
+  cold: boolean; limits: readonly string[];
 };
 export type ActivityStatusEvent = { kind: "transition" | "heartbeat"; sequence: number; snapshot: ActivityStatusSnapshot };
 type Observer = (event: ActivityStatusEvent) => unknown;
@@ -28,14 +41,53 @@ export function getActivityStatus(read: StatusReadAuthority, now = Date.now()): 
   const owner = statusOwner(read);
   const run = owner.store.get<RunRecord>("runs", read.runId);
   if (!run) throw new Error("activity status unavailable");
-  const unknown = owner.store.all<Reservation>("reservations").filter(r => r.runId === run.runId && r.state === "unknown");
+  return snapshot(owner.store, run, false, now, !owner.active);
+}
+
+/** Cold query reads the committed journal; it makes no live-owner or process claim. */
+export function readActivityStatus(root: string, runId?: string, now = Date.now()): ActivityStatusSnapshot | null {
+  const workspace = currentWorkspace(root);
+  if (!existsSync(path.join(workspace, ".pitako", "runs", "workflow-state.sqlite"))) return null;
+  const store = new WorkflowState(workspace);
+  try {
+    const runs = store.all<RunRecord>("runs");
+    const run = runId ? runs.find(item => item.runId === runId) : runs.at(-1);
+    return run ? snapshot(store, run, true, now) : null;
+  } finally { store.close(); }
+}
+
+function snapshot(store: WorkflowState, run: RunRecord, cold: boolean, now: number, retired = false): ActivityStatusSnapshot {
+  const resources = store.all<Resource>("resources").filter(r => r.runId === run.runId && r.purpose !== "observation");
+  const closure = (resource: Resource): "closed" | "unknown" | "open" =>
+    store.closureReceipt(resource) ? "closed" : Object.values(resource.facts).includes("unknown") ? "unknown" : "open";
+  const restrictions = store.all<Reservation>("reservations").filter((r): r is Reservation & { state: "active" | "unknown" } =>
+    r.runId === run.runId && r.state !== "released" && !r.exclusionRetired && r.purpose !== "observation");
+  const attempts = store.all<AttemptRecord>("attempts").flatMap(attempt => {
+    const resource = resources.find(r => r.resourceId === attempt.resource.resourceId);
+    return resource ? [{ dispatchId: attempt.dispatchId, instanceId: attempt.instanceId, roleId: attempt.roleId,
+      outcome: attempt.outcome ?? null, resource: resourceRef(resource), closure: closure(resource) }] : [];
+  });
+  const last = attempts.at(-1);
   return {
     runId: run.runId, activity: run.activity, phase: run.phase, ownerEpoch: run.epoch, phaseEpoch: run.phaseEpoch,
     stateVersion: run.version, asOf: new Date(now).toISOString(), lastFactAt: run.lastFactAt,
-    state: !owner.active && !["completed", "retiring"].includes(run.state) ? "interrupted" : unknown.length ? "blocked" : run.state,
-    wait: run.state === "waiting" ? run.waitRef && liveProducer(run.waitRef)
+    state: retired && !["completed", "retiring"].includes(run.state) ? "interrupted" : run.state,
+    wait: run.state === "waiting" ? !cold && !retired && run.waitRef && liveProducer(run.waitRef)
       ? { kind: "live", producerRef: run.waitRef } : { kind: "unknown", reason: "no accredited local producer" } : null,
-    diagnostics: unknown.map(r => ({ scope: r.reservationId, reason: r.reason ?? "closure unknown" })),
+    diagnostics: restrictions.filter(r => r.state === "unknown").map(r => ({ scope: r.reservationId, reason: r.reason ?? "closure unknown" })),
+    attempts,
+    evidence: resources.map(resource => ({ resource: resourceRef(resource), adapter: resource.adapter,
+      scopes: resource.scopes, facts: resource.facts, closure: closure(resource) })),
+    restrictions: restrictions.map(r => ({ reservationId: r.reservationId, kind: r.kind, paths: r.paths, state: r.state, reason: r.reason })),
+    lastResult: last ? { dispatchId: last.dispatchId, outcome: last.outcome, closure: last.closure } : null,
+    delivery: store.all<{ kind?: string; runId?: string; key: string; state: string }>("obligations")
+      .filter(item => item.kind === "phase-turn" && item.runId === run.runId)
+      .map(({ key, state }) => ({ key, state })),
+    projections: store.outbox().filter(item => item.target === `disposition:${run.runId}` &&
+      (item.body as { choice?: { kind?: string } }).choice?.kind === "user-decision")
+      .map(item => ({ sequence: item.sequence, state: item.state,
+        diagnostic: (item.body as { projectionDiagnostic?: string }).projectionDiagnostic })),
+    cold, limits: cold ? ["Stored status does not prove a live owner or physical closure; inspect exact receipts and restrictions."] : [],
   };
 }
 

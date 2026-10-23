@@ -214,13 +214,15 @@ export function success(request: Request, result: unknown): { version: 2; id: st
 export interface ArchitectureRef extends Owner { kind: "architecture"; roomId: string }
 /** Decoder-only legacy bodies; never a live submission schema. */
 export type HistoricalArchitectureBody =
+  | { kind: "composition"; snapshotId: string; reason: string; specialists: PublicSpecialistChoice[] }
   | { kind: "composition"; snapshotId: string; specialists: { candidateRef: string; mandate: string; reason: string }[] }
   | { kind: "answer"; answer: string; evidence: string[]; limits: string[]; doubts: { question: string; purpose: string }[] };
+export type PublicSpecialistChoice =
+  { kind: "retain"; memberId: string; mandate: string; reason: string } |
+  { kind: "add"; candidateRef: string; mandate: string; reason: string };
 export type PublicArchitectureBody =
   | HistoricalArchitectureBody
-  | { kind: "composition"; snapshotId: string; reason: string; specialists: (
-      { kind: "retain"; memberId: string; mandate: string; reason: string } |
-      { kind: "add"; candidateRef: string; mandate: string; reason: string })[] }
+  | { kind: "composition"; reason: string; specialists: PublicSpecialistChoice[] }
   | { kind: "preparation"; analysis: string; doubts: { question: string; purpose: string }[] }
   | { kind: "contribution"; proposal: string; arguments: string[]; objections: { memberId: string; messageId: string; argument: string }[]; doubts: { question: string; purpose: string }[] }
   | { kind: "decision"; action: "continue" | "consult" | "synthesize" | "recompose"; reason: string }
@@ -231,6 +233,7 @@ export type PublicArchitectureBody =
 export type PublicArchitectureStage = PublicArchitectureBody["kind"];
 export type PublicSynthesisBody = Extract<PublicArchitectureBody, { kind: "synthesis" }>;
 export interface PublicArchitectureMessage {
+  submission?: { version: 2; provenance: "host-bound"; compositionBasis?: { snapshotId: string; candidateRefs: readonly string[]; retainableMemberIds: readonly string[] } };
   id: string; ordinal: number; roomId: string; assignmentId: string; memberId: string; author: string;
   stage: PublicArchitectureStage; snapshotId: string; round?: number; turnId: string; attemptId: string;
   body: PublicArchitectureBody; native: { historyId?: string; sessionId: string; toolCallId: string; persistence: "unconfirmed" };
@@ -268,3 +271,16 @@ export type ArchitectureRead = ArchitecturePage | ArchitectureAvailability;
 export function isArchitectureRef(value: unknown): value is ArchitectureRef;
 export function isArchitectureRecord(value: unknown): value is ArchitectureRecord;
 export function isPublicArchitectureBody(value: unknown): value is PublicArchitectureBody;
+
+/** History decoders never create SubmitBinding or grant live authority. */
+export type SubmissionProvenance = ({ version: 1; provenance: "model-administrative" } | { version: 2; provenance: "host-bound" }) & { liveAuthority: false };
+export type DecodedArchitectureMessage = SubmissionProvenance & { message: PublicArchitectureMessage };
+export type DecodedArchitectureSubmit = DecodedSubmitInput<PublicArchitectureBody>;
+export function decodeArchitectureMessage(value: unknown): DecodedArchitectureMessage | undefined;
+export function decodeArchitectureSubmit(value: unknown): DecodedArchitectureSubmit | undefined;
+export type SubmitInput<B> = { body: B };
+export type DecodedSubmitInput<B = Record<string, unknown>> = (
+  { version: 1; provenance: "model-administrative"; input: { submissionId: string; body: B } } |
+  { version: 2; provenance: "host-bound"; input: SubmitInput<B> }
+) & { liveAuthority: false };
+export function decodeSubmitInput(value: unknown): DecodedSubmitInput | undefined;

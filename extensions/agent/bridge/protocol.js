@@ -413,8 +413,8 @@ export function isPublicArchitectureBody(body) {
   switch (body.kind) {
     // This consumer decoder also reads history; live submissions use the table schema.
     case "composition": {
-      if (!nonempty(body.snapshotId) || !Array.isArray(body.specialists) || body.specialists.length > 5) return false;
-      if (!("reason" in body)) return keys(body, ["kind", "snapshotId", "specialists"]) && body.specialists.length >= 1 &&
+      if ("snapshotId" in body && !nonempty(body.snapshotId) || !Array.isArray(body.specialists) || body.specialists.length > 5) return false;
+      if (!("reason" in body)) return nonempty(body.snapshotId) && keys(body, ["kind", "snapshotId", "specialists"]) && body.specialists.length >= 1 &&
         body.specialists.every(item => fields(item, ["candidateRef", "mandate", "reason"]) &&
           [item.candidateRef, item.mandate, item.reason].every(nonempty));
       return keys(body, ["kind", "snapshotId", "reason", "specialists"]) && nonempty(body.reason) &&
@@ -452,12 +452,40 @@ function architectureLifecycle(value) {
 }
 const architectureIdentity = value => fields(value, ["memberId", "assignmentId", "instanceId"]) && [value.memberId, value.assignmentId, value.instanceId].every(item => string(item));
 function architectureMessage(value) {
-  return fields(value, ["id", "ordinal", "roomId", "assignmentId", "memberId", "author", "stage", "snapshotId", "round", "turnId", "attemptId", "body", "native", "doubts"]) &&
+  return fields(value, ["id", "ordinal", "roomId", "assignmentId", "memberId", "author", "stage", "snapshotId", "round", "turnId", "attemptId", "body", "native", "doubts", "submission"]) &&
     ["id", "roomId", "assignmentId", "memberId", "author", "snapshotId", "turnId", "attemptId"].every(key => string(value[key])) && integer(value.ordinal) &&
+    (value.submission === undefined ? value.body?.kind !== "composition" || nonempty(value.body.snapshotId) :
+      fields(value.submission, ["version", "provenance", "compositionBasis"]) && value.submission.version === 2 && value.submission.provenance === "host-bound" &&
+      (value.body?.kind === "composition" ? fields(value.submission.compositionBasis, ["snapshotId", "candidateRefs", "retainableMemberIds"]) &&
+        nonempty(value.submission.compositionBasis.snapshotId) && strings(value.submission.compositionBasis.candidateRefs) && strings(value.submission.compositionBasis.retainableMemberIds) :
+        value.submission.compositionBasis === undefined) &&
+      value.body?.kind !== "answer" && !(value.body?.kind === "composition" && "snapshotId" in value.body)) &&
     optional(value, "round", integer) && architectureStages.includes(value.stage) && isPublicArchitectureBody(value.body) && value.body.kind === value.stage &&
     fields(value.native, ["historyId", "sessionId", "toolCallId", "persistence"]) && optional(value.native, "historyId", string) && string(value.native.sessionId) &&
     string(value.native.toolCallId) && value.native.persistence === "unconfirmed" && array(value.doubts, item => fields(item, ["id", "question", "purpose"]) &&
       string(item.id) && nonempty(item.question) && nonempty(item.purpose));
+}
+/** Read-only provenance views. Original history is returned unchanged and conveys no live capability. */
+export function decodeArchitectureMessage(value) {
+  if (!architectureMessage(value)) return undefined;
+  return { version: value.submission ? 2 : 1, provenance: value.submission ? "host-bound" : "model-administrative",
+    liveAuthority: false, message: value };
+}
+/** Decode the common architecture/review history envelope, without contextual validation. */
+export function decodeSubmitInput(value) {
+  if (!object(value) || !object(value.body) || !nonempty(value.body.kind)) return undefined;
+  const legacy = "submissionId" in value;
+  if (!keys(value, legacy ? ["submissionId", "body"] : ["body"]) || legacy && !nonempty(value.submissionId)) return undefined;
+  if (!legacy && value.body.kind === "composition" && "snapshotId" in value.body) return undefined;
+  return { version: legacy ? 1 : 2, provenance: legacy ? "model-administrative" : "host-bound",
+    liveAuthority: false, input: value };
+}
+export function decodeArchitectureSubmit(value) {
+  const decoded = decodeSubmitInput(value);
+  if (!decoded || !isPublicArchitectureBody(value.body)) return undefined;
+  if (value.body.kind === "composition" && decoded.version === 1 && !nonempty(value.body.snapshotId) ||
+      decoded.version === 2 && value.body.kind === "answer") return undefined;
+  return decoded;
 }
 export function isArchitectureRecord(value) {
   if (!object(value) || !string(value.id)) return false;

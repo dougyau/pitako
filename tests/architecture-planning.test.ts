@@ -4,7 +4,9 @@ import path from "node:path";
 import { openBoard, type Topic } from "../extensions/board/store.ts";
 import { ledgerFile, openExecutionPlan, planFile, readLedgerTeamHolds } from "../extensions/workflow.ts";
 import { teamAssignments } from "../extensions/team.ts";
-import { workerHandoff } from "../extensions/agent/background.ts";
+import { teamWorkerStatus, workerHandoff } from "../extensions/agent/background.ts";
+import { WorkflowState, type Resource } from "../extensions/workflow-state.ts";
+import type { AttemptRecord } from "../extensions/workflow-engine.ts";
 import { architectureFixture } from "./fixtures/architecture.ts";
 
 const { fixture, setup } = architectureFixture();
@@ -99,18 +101,29 @@ function writePlan(root: string, status: "draft" | "frozen", topic?: number) {
       }, async dispose(session) {
         if (session.model?.id === "director") { disposing.resolve(); await releaseDispose.promise; }
       } });
+      const store = new WorkflowState(s.root);
       try {
         const db = await openBoard(); let topic: number;
         try { topic = db.createTopic(s.root, { title: "Watched planning judgment" }).id; db.claimTopic(s.root, topic, "planning"); } finally { db.close(); }
-        writePlan(s.root, "frozen", topic);
-        const opened = openExecutionPlan("planning", s.root, { createLedger: true }); // compatible existing ledger
+        const file = writePlan(s.root, "frozen", topic), frozen = readFileSync(file, "utf8");
+        const opened = openExecutionPlan("planning", s.root, { createLedger: true });
+        const historicalHolds = readLedgerTeamHolds(s.root, "planning", opened.binding);
         const start = await s.invoke("architecture_start", { goal: "Design-only current-object judgment including unit partition/order", plan: "planning", unit: "architect-pass" });
         expect(start.isError).not.toBe(true);
         await synthesizing.promise;
         const held = () => {
-          expect(readLedgerTeamHolds(s.root, "planning", opened.binding)).toEqual([{ assignmentId: start.details.assignmentId, unitId: "architect-pass", status: "pending" }]);
+          const attempt = store.get<AttemptRecord>("attempts", start.details.dispatchId)!;
+          expect(attempt).toMatchObject({ assignmentId: start.details.assignmentId, instanceId: start.details.instanceId,
+            watch: { planId: "planning", unitId: "architect-pass" } });
+          expect(attempt.outcome).toBeUndefined();
+          const resource = store.get<Resource>("resources", attempt.resource.resourceId);
+          expect(resource).toMatchObject(attempt.resource);
+          expect(resource!.effectReservation).toBeUndefined();
+          expect(store.closureReceipt(attempt.resource)).toBeUndefined();
+          expect(teamWorkerStatus(s.evaluation.token, start.details.instanceId)[0]?.closure.state).toBe("pending");
           expect(workerHandoff(start.details.instanceId)).toBeUndefined();
           expect(s.branch.filter(entry => entry.customType === "pitako.worker.result")).toEqual([]);
+          expect(s.sent.filter(item => item.options.triggerTurn)).toHaveLength(0);
         };
         held();
         const members = (await s.invoke("team_status", {})).details.members.filter((member: any) => member.teamId === start.details.roomId);
@@ -119,7 +132,7 @@ function writePlan(root: string, status: "draft" | "frozen", topic?: number) {
         expect(members.filter((member: any) => member.assignmentId === start.details.assignmentId)).toHaveLength(1);
         const boundary = await s.emit("agent_before_settle", { outcome: "completed", context: { canContinue: true } });
         expect((boundary?.entries ?? []).filter((entry: any) => entry.customType === "pitako.worker.result")).toEqual([]);
-        held(); // a settled internal member cannot close the root hold
+        held(); // a settled internal member cannot close the root resource
         if (outcome === "cancelled") expect((await s.invoke("team_cancel", { assignmentId: start.details.assignmentId })).isError).not.toBe(true);
         releaseSynthesis.resolve(); await disposing.promise;
         held(); // even a complete synthesis is not terminal before root disposal
@@ -139,7 +152,15 @@ function writePlan(root: string, status: "draft" | "frozen", topic?: number) {
          else if (outcome === "cancelled") expect(report.judgment).toBeNull();
          else expect(report.judgment.recommendation).toBe("Current-object judgment: keep coupled units together");
         await s.bookkeeping(start.details.instanceId);
-        expect(readLedgerTeamHolds(s.root, "planning", opened.binding)).toEqual(outcome === "complete" ? [] : [{ assignmentId: start.details.assignmentId, unitId: "architect-pass", status: outcome === "cancelled" ? "cancelled" : "failed" }]);
+        const settled = store.get<AttemptRecord>("attempts", start.details.dispatchId)!;
+        expect(settled.outcome?.status).toBe(status);
+        expect(store.verifyClosureReceipt(store.closureReceipt(settled.resource)!)).toBe(true);
+        expect(teamWorkerStatus(s.evaluation.token, start.details.instanceId)[0]?.closure.state).toBe("released");
+        // Historical parsing is a nonmutation check, never an activity or admission gate.
+        expect(readLedgerTeamHolds(s.root, "planning", opened.binding)).toEqual(historicalHolds);
+        expect(readFileSync(file, "utf8")).toBe(frozen);
+        const after = await openBoard();
+        try { expect(after.readTopic(s.root, topic).topic.status).toBe("open"); } finally { after.close(); }
         expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
         expect(s.sent.filter(item => item.message.customType === "pitako.worker.result")).toHaveLength(1);
         expect(workerHandoff(start.details.instanceId)).toMatchObject({ bookkeeping: "reconciled", delivery: "incorporated" });
@@ -148,8 +169,9 @@ function writePlan(root: string, status: "draft" | "frozen", topic?: number) {
         await s.emit("message_end", { message: { role: "assistant", stopReason: "stop" } });
         const diagnostic = await s.read("team_result", { assignmentId: start.details.assignmentId });
         expect(diagnostic.host.status).toBe(status); // optional re-read does not transport, acknowledge or accept
-        expect(readLedgerTeamHolds(s.root, "planning", opened.binding)).toEqual(outcome === "complete" ? [] : [{ assignmentId: start.details.assignmentId, unitId: "architect-pass", status: outcome === "cancelled" ? "cancelled" : "failed" }]);
+        expect(store.get<AttemptRecord>("attempts", start.details.dispatchId)?.outcome).toEqual(settled.outcome);
+        expect(diagnostic).toEqual(report);
         expect(s.sent.filter(item => item.message.customType === "pitako.worker.result")).toHaveLength(1);
-      } finally { release(); await s.close(); }
+      } finally { store.close(); release(); await s.close(); }
     }));
   }

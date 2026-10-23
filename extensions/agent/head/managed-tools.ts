@@ -17,7 +17,7 @@ import { AdmissionInventory, digest, type Contribution } from "./inventory.ts";
 import { reserveOperation } from "./operation-leases.ts";
 import { assertNoCheckpointLease } from "./checkpoint-lease.ts";
 import type { CheckpointManifest } from "../checkpoints.ts";
-import { captureCallContext, checkCallContext, guardDefinition, hasDefinitionGuard, isGuardedDefinition, type CallContext } from "../../workflow-engine.ts";
+import { captureCallContext, checkCallContext, guardDefinition, hasDefinitionGuard, isGuardedDefinition, registerResource, type CallContext, type Producer } from "../../workflow-engine.ts";
 import { packageRoot } from "../../stack.ts";
 
 // Heterogeneous SDK registry. Individual wrappers retain their schema/details/render-state types.
@@ -47,6 +47,7 @@ export const foregroundBash: BashOperations = {
 export class ManagedAssignment {
   readonly inventory: AdmissionInventory;
   readonly context: CallContext;
+  private inventoryPin?: { release: () => void; producer: Producer };
   private active = new Set<ManagedProducer>();
   private failures: unknown[] = [];
   private nativeOmitted = 0;
@@ -61,6 +62,16 @@ export class ManagedAssignment {
     checkCallContext(this.context);
     assertNoCheckpointLease(root);
     this.inventory = new AdmissionInventory(root, envelope, adopted);
+    const source = this.inventory.snapshot().admission;
+    if (source) {
+      const producer = registerResource(this.context, "source-inventory", ["callback"], "observation", "independent", ["callback"]);
+      producer.enter();
+      const release = checkCallContext(this.context).store.pinGit({ bindingId: `inventory:${producer.ref.resourceId}`, root,
+        resource: producer.ref, components: [{ component: "HEAD", expected: source.admissionHead },
+          { component: "index", expected: source.indexDigest }, { component: "gitDir", expected: source.gitDir },
+          { component: "commonDir", expected: source.repository }, { component: "policy", expected: source.configuration }] });
+      this.inventoryPin = { release, producer };
+    }
   }
   assertHealthy(): void {
     checkCallContext(this.context);
@@ -107,6 +118,13 @@ export class ManagedAssignment {
   async settle(): Promise<void> {
     while (this.active.size) await Promise.allSettled([...this.active].map(producer => producer.settle()));
     this.assertHealthy();
+  }
+  /** Called only after the owning Head retires and joins its operations. Historical snapshots grant no live pin. */
+  retireInventory(): void {
+    if (this.active.size) throw new Error("source inventory operations remain active");
+    this.inventoryPin?.release();
+    this.inventoryPin?.producer.observe("callback", "closed", true);
+    this.inventoryPin = undefined;
   }
 }
 

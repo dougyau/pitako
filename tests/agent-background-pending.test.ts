@@ -14,7 +14,7 @@ import { createAgentController } from "../extensions/agent/controller.ts";
 import { createAgentBridge } from "../extensions/agent/bridge/broker.ts";
 import { connect } from "../extensions/agent/bridge/client.js";
 import { reserveTeamMember, firstTeamReservation, teamEvaluationForSession } from "../extensions/team.ts";
-import { WorkflowState, type Reservation, type ReleaseReceipt } from "../extensions/workflow-state.ts";
+import { WorkflowState, type Resource, type Reservation, type ReleaseReceipt } from "../extensions/workflow-state.ts";
 import { bindCallContext, currentCallContext, guardDefinition, RootGuard, type AttemptRecord, type TeamHoldRecord } from "../extensions/workflow-engine.ts";
 import { AgentClosureError } from "../extensions/agent/closure.ts";
 import { planFile, openExecutionPlan, readLedgerTeamHolds } from "../extensions/workflow.ts";
@@ -26,7 +26,7 @@ const scopeFor = (room: Awaited<ReturnType<typeof suite.setup>>) => ({ ownerToke
   coordinatorSessionId: room.evaluation.sessionId });
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
 
-test("late guarded children release the completed attempt and its exact Team hold only at the last frontier", suite.fixture.ownedCase("late-definition", async () => {
+test("late guarded children close the completed attempt only at the last frontier, without a Team hold", suite.fixture.ownedCase("late-definition", async () => {
   const room = await suite.setup({ busy: true });
   const file = planFile("late-child", room.root);
   mkdirSync(path.dirname(file), { recursive: true });
@@ -73,26 +73,27 @@ test("late guarded children release the completed attempt and its exact Team hol
     expect(attempt.outcome).toMatchObject({ status: "completed" });
     expect(toolErrors).toHaveLength(2);
     expect(toolErrors.every(error => error instanceof AgentClosureError)).toBe(true);
-    const receipt = () => journal.all<ReleaseReceipt>("receipts").find(value => value.reservationId === attempt.reservationId);
+    const receipt = () => journal.closureReceipt(attempt.resource);
     expect(receipt()).toBeUndefined();
-    expect(readLedgerTeamHolds(room.root, "late-child", binding)).toHaveLength(1);
+    expect(readLedgerTeamHolds(room.root, "late-child", binding)).toEqual([]);
     expect(() => guard.assertIdle([room.root])).toThrow();
     closed[0] = true;
     expect(() => guard.assertIdle([room.root])).toThrow();
     expect(receipt()).toBeUndefined();
-    expect(journal.all<TeamHoldRecord>("holds").find(value => value.assignmentId === attempt.assignmentId)?.cleared).toBe(false);
+    expect(journal.all("holds")).toEqual([]);
     closed[1] = true;
     guard.assertIdle([room.root]);
     const parent = receipt()!;
     expect(parent).toBeDefined();
-    expect(journal.verifyReceipt(parent)).toBe(true);
-    const children = journal.all<Reservation>("reservations").filter(value => value.parentReservationId === attempt.reservationId);
+    expect(journal.verifyClosureReceipt(parent)).toBe(true);
+    const children = journal.all<Resource>("resources").filter(value => value.parentResource?.resourceId === attempt.resource.resourceId);
     expect(children).toHaveLength(2);
-    const childReceipts = journal.all<ReleaseReceipt>("receipts").filter(value => children.some(child => child.reservationId === value.reservationId));
+    const childReceipts = journal.all<ReleaseReceipt>("receipts").filter(value => children.some(child =>
+      child.effectReservation?.reservationId === value.reservationId));
     expect(childReceipts).toHaveLength(2);
     expect(parent.commitSequence).toBe(Math.max(...childReceipts.map(value => value.commitSequence)));
     expect(childReceipts.every(value => value.receiptId !== parent.receiptId)).toBe(true);
-    expect(journal.all<TeamHoldRecord>("holds").find(value => value.assignmentId === attempt.assignmentId)?.cleared).toBe(true);
+    expect(journal.all("holds")).toEqual([]);
     expect(readLedgerTeamHolds(room.root, "late-child", binding)).toEqual([]);
     guard.assertIdle([room.root]);
     expect(receipt()).toEqual(parent);
@@ -195,7 +196,9 @@ test("accepted partial preparation and roster rollback stay pending through clea
     expect(prepared).toBe(false);
     const attempt = journal.get<AttemptRecord>("attempts", handle.dispatchId!)!;
     expect(attempt).toMatchObject({ instanceId: handle.instanceId, assignmentId: "partial" });
-    expect(journal.get<Reservation>("reservations", attempt.reservationId)?.state).toBe("active");
+    expect(attempt.reservationId).toBeUndefined();
+    expect(journal.exactResource(attempt.resource).entered).toBe(true);
+    expect(journal.closureReceipt(attempt.resource)).toBeUndefined();
     expect(attempt.outcome).toBeUndefined();
     expect(readBackgroundPending(scope)).toEqual({ state: "pending" });
     await preparing.promise;
@@ -210,9 +213,9 @@ test("accepted partial preparation and roster rollback stay pending through clea
     expect(noWorker).toBe(1); expect(firstTeamReservation(room.evaluation, "oracle")).toBeUndefined();
     expect(journal.get<AttemptRecord>("attempts", handle.dispatchId!)?.outcome).toEqual({
       status: "failed", result: "Error: partial preparation failed" });
-    const receipt = journal.all<ReleaseReceipt>("receipts").find(entry => entry.reservationId === attempt.reservationId);
+    const receipt = journal.closureReceipt(attempt.resource);
     expect(receipt).toBeDefined();
-    expect(journal.verifyReceipt(receipt!)).toBe(true);
+    expect(journal.verifyClosureReceipt(receipt!)).toBe(true);
     expect(journal.get("obligations", `result:${handle.dispatchId}`)).toMatchObject({ cleared: false });
     expect(readBackgroundPending(scope)).toEqual({ state: "none" });
     observeWorkerResults(scope.ownerToken); expect(noWorker).toBe(1);

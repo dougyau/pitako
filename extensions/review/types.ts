@@ -34,7 +34,7 @@ export const bodySchema = Type.Union([
   Type.Object({ kind: Type.Literal("contribution"), analysis: text, findings, responses: Type.Array(response), doubts }, strict),
   synthesisSchema,
 ]);
-export const submitSchema = Type.Object({ submissionId: text, body: bodySchema }, strict);
+export const submitSchema = Type.Object({ body: bodySchema }, strict);
 export type Finding = Static<typeof findingSchema>;
 export type Response = Static<typeof response>;
 export type Synthesis = Static<typeof synthesisSchema>;

@@ -240,7 +240,8 @@ describe("engineering-layer composition", () => {
     for (const contract of [
       "Keep at most one Developer role active, without exception",
       "not a live controllable target",
-      "does not settle a Team hold", "waive independent final review", "change ModelPolicy",
+      "does not establish physical closure, release an incompatible effect reservation, accept a result",
+      "waive independent final review", "change ModelPolicy",
     ]) expect(execute).toContain(contract);
     const verify = skillText("verify-behavior");
     for (const contract of [

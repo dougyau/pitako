@@ -7,7 +7,7 @@ import { currentInstanceId } from "../agent/scope.ts";
 import { assertNoCheckpointLease } from "../agent/head/checkpoint-lease.ts";
 import { backgroundExecutor, cancelTeamWorker, reserveBackground, readTableDiagnostic, type WorkerInterest } from "../agent/background.ts";
 import { prepareTeamWatch, captureTeamWatch } from "../agent/index.ts";
-import { captureCallContext, checkAuthority, planningSlot, guardToolRegistrations } from "../workflow-engine.ts";
+import { captureCallContext, checkCallContext, checkAuthority, planningSlot, guardToolRegistrations, type AttemptRecord } from "../workflow-engine.ts";
 import { createTeam, reserveTeamMember, recordTeamAssignment, recordPlanTeamWork, teamEvaluationForSession } from "../team.ts";
 import type { HistoryOrigin } from "../agent/history.ts";
 import { createTable } from "../table/runtime.ts";
@@ -55,7 +55,7 @@ export function registerReview(pi: ExtensionAPI) {
     parameters: Type.Object({ roomId: text, action: Type.Union([Type.Literal("context"), Type.Literal("priorities"), Type.Literal("finish"), Type.Literal("stop")]), text: Type.Optional(text) }, strict),
     async execute(toolCallId, params, _signal, _update, ctx) {
       try {
-        assertNoCheckpointLease(ctx.cwd);
+        assertNoCheckpointLease(ctx.cwd, true);
         const { evaluation, room } = roomFor(params.roomId, ctx);
         if (room.runtime) return result(room.runtime.control(params.action, params.text, toolCallId));
         if (params.action !== "stop") throw new Error("review preparation pending");
@@ -70,7 +70,7 @@ export function registerReview(pi: ExtensionAPI) {
 export function startReviewTable(toolCallId: string, params: { goal: string; object: ObjectSelector; criteria: string[];
   topic?: string; plan?: string; unit?: string; boardTopicId?: string }, ctx: ExtensionContext, source?: CapturedReviewSource) {
   try {
-        assertNoCheckpointLease(ctx.cwd);
+        assertNoCheckpointLease(ctx.cwd, true);
         const context = captureCallContext(ctx.cwd, ctx.sessionManager);
         if (context.kind === "managed" && checkAuthority(context.authority).run.phase === "planning" && !source) {
           const slot = planningSlot(context.authority);
@@ -91,6 +91,18 @@ export function startReviewTable(toolCallId: string, params: { goal: string; obj
           coordinatorSessionId: evaluation.sessionId, coordinatorSessionFile: ctx.sessionManager.getSessionFile(), toolCallId,
           workbrief: params.goal, teamId: team.teamId, memberId: admission.memberId };
         let durableWatch: WorkerInterest | undefined;
+        const pinObject = (object: typeof captured, dispatchId: string) => {
+          if (!object.gitBasis) return () => {};
+          const basis = object.gitBasis;
+          const store = checkCallContext(context).store;
+          const attempt = store.get<AttemptRecord>("attempts", dispatchId);
+          if (!attempt || attempt.assignmentId !== assignmentId) throw new Error("review pin requires its actual background attempt");
+          return store.pinGit({ bindingId: `review:${assignmentId}:${object.root}`,
+            root: object.root, resource: attempt.resource, components: [{ component: "HEAD", expected: basis.head },
+              { component: "index", expected: basis.index }, { component: "gitDir", expected: basis.gitDir }, { component: "commonDir", expected: basis.commonDir }] });
+        };
+        let releasePin: (() => void) | undefined;
+        let backgroundOwnsPin = false;
         const tableRoot: TableRootRegistration = { protocol: "review", archive: captureTableArchive(ctx.cwd, params.plan) };
         const room: { assignmentId: string; instanceId: string; runtime?: ReturnType<typeof createTable> } = { assignmentId, instanceId: "" };
         try {
@@ -100,13 +112,17 @@ export function startReviewTable(toolCallId: string, params: { goal: string; obj
             owns: admission.owns, tableRoot,
             teamOwner: { token: admission.token, assignmentId, teamId: team.teamId, memberId: admission.memberId,
               onSettled: admission.settled, noWorkerReleased: admission.noWorkerReleased },
-            async cleanup() { if (durableWatch) recordPlanTeamWork(ctx.cwd, durableWatch.planId, durableWatch.unitId, assignmentId, undefined, durableWatch.execution); },
+            async cleanup() {
+              releasePin?.(); releasePin = undefined;
+              if (durableWatch) recordPlanTeamWork(ctx.cwd, durableWatch.planId, durableWatch.unitId, assignmentId, undefined, durableWatch.execution);
+            },
             async prepare(_lifetime, check, reserved) {
               const watched = await prepareTeamWatch(params, ctx, assignmentId, check, undefined, capturedWatch);
               durableWatch = watched.durableWatch;
               const launchRoot = watched.execution?.executionRoot ?? (tableRoot.archive && "root" in tableRoot.archive ? tableRoot.archive.root : captured.root);
               if (watched.execution) origin.execution = { executionRoot: launchRoot, executionRef: `${watched.execution.planId}@${watched.execution.revision}:${watched.execution.hash}` };
               const object = source && source.kind !== "local-selector" || launchRoot === captured.root ? captured : captureObject(params.object, launchRoot);
+              if (object !== captured) { const nextPin = pinObject(object, reserved.dispatchId); releasePin?.(); releasePin = nextPin; }
               const review = createReviewPolicy(object, params.goal, [...params.criteria]);
               const runtime = createTable({ team, config, goal: params.goal, topic: params.topic, review,
                 root: { assignmentId, memberId: admission.memberId, instanceId: reserved.instanceId }, origin, cwd: launchRoot, owns: reserved.current });
@@ -121,12 +137,14 @@ export function startReviewTable(toolCallId: string, params: { goal: string; obj
                 reconcileBookkeeping: durableWatch ? (final, receipt) => recordPlanTeamWork(launchRoot, durableWatch!.planId, durableWatch!.unitId, assignmentId, final.status, watched.execution, receipt) : undefined };
             },
           });
+          backgroundOwnsPin = true;
+          releasePin = pinObject(captured, handle.dispatchId!);
           admission.commit(); room.instanceId = handle.instanceId;
           let catalog = rooms.get(evaluation.token);
           if (!catalog) { catalog = new Map(); rooms.set(evaluation.token, catalog); }
           catalog.set(team.teamId, room);
           recordTeamAssignment(evaluation, "reviewer", { id: assignmentId, instanceId: handle.instanceId, roleId: "reviewer", task: params.goal, dispatchId: handle.dispatchId });
           return result({ ...handle, roomId: team.teamId, assignmentId, memberId: admission.memberId });
-        } catch (error) { admission.rollback(); throw error; }
+        } catch (error) { if (!backgroundOwnsPin) releasePin?.(); admission.rollback(); throw error; }
       } catch (error) { return tableError(error); }
 }

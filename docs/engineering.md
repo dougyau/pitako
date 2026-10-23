@@ -163,7 +163,7 @@ Host code can also use `createTeam`, `admitTeamMember`, member `turn`/`finish`, 
 
 The owner reserves busy synchronously before preparation. Settlement callbacks cannot reenter while the outer prompt or its owned callbacks remain joined; busy rejection happens before the SDK prompt/queue. Each adapter drive owns fresh signal watchers, observers and generation-scoped abort work. Old signals cannot abort the next operation. Member cancellation is terminal. Disband closes admission synchronously, cancels and joins preparation, prompts, aborts and disposal, without waiting on its exterior orchestrator. Unknown closure retains the exact member reservation and diagnostics, never a fictitious release. `runAgentInstance`, including Head, remains one-shot and closes before returning.
 
-Automatic collection and optional diagnostic re-reads share idempotent bookkeeping under the captured assignment, topic applicability, and execution binding. Successful results reconcile only their own result hold; failed/cancelled outcomes retain applicable blocking holds. Ledger failures never hide the result. All settled outcomes use automatic full delivery, even ad hoc assignments. Foreground lease retirement and Team Hold authority are unchanged. Child sessions cannot dispatch Team work. Multiple members of a role do not relax the workflow's single exterior Developer policy. Ad-hoc Team state is not a durable scheduler or a Board scope.
+Automatic collection and optional diagnostic re-reads verify the exact attempt's `ResourceClosureReceipt` under the captured assignment and execution binding, independently of outcome. Admission follows applicable physical closure, incompatible effect reservations, authority and pins, not historical `Team Holds` ledger entries. A physically closed failed/cancelled attempt preserves its outcome and permits another authorized strategy without `clear` or `recoverHold`. Unknown closure is not released, success or acceptance. Acceptance still requires pertinent current-object judgment, closure of contributors and satisfied run obligations. Preserve historical parsing and the legacy ledger lock when its closure is unknown. Bookkeeping failures never hide the result. All settled outcomes use automatic full delivery, even ad hoc assignments. Foreground lease retirement is unchanged. Child sessions cannot dispatch Team work. Multiple members of a role do not relax the workflow's single exterior Developer policy. Ad-hoc Team state is not a durable scheduler or a Board scope.
 
 ### Assignment-local Head Developer
 
@@ -258,6 +258,15 @@ finish, leaf closure summaries and observed metrics, not leaf transcripts.
 Own usage remains separate from aggregate Head, leaf-attempt and supplied
 classifier usage. Missing usage/cost stays unknown. These data make no claim of
 token savings, elapsed-time savings or model competence.
+
+Workflow phase turns are journaled before the native send, then recorded as
+invocation-started, returned, and observed only by an exact branch receipt. A
+void send return gives no delivery credit. An unresolved turn blocks its own
+target and current acceptance; it does not reserve unrelated paths. Result
+dispositions apply to exact results. Final acceptance absorbs physically closed
+historical failures without changing their outcomes, and requires current
+released review and execution evidence. The workflow status query reports
+committed outcomes and restrictions while marking cold liveness as unknown.
 
 ### Physical process closure
 

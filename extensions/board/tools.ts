@@ -17,7 +17,7 @@ import {
 import { resolveBoardAuthor } from "./author.ts";
 import { boardWorkspace } from "./workspace.ts";
 import { currentInstanceId } from "../agent/scope.ts";
-import { bindPlanTopic, ledgerFile, openExecutionPlan, parseLedgerBinding, parseLedgerStatus, readFrozenPlan, readPlan, bindingMismatch, verifyExecutionBinding, withLedgerTeamHoldLock } from "../workflow.ts";
+import { bindPlanTopic, ledgerFile, openExecutionPlan, parseLedgerBinding, parseLedgerStatus, readFrozenPlan, readPlan, bindingMismatch, verifyExecutionBinding } from "../workflow.ts";
 import { teamEvaluationForSession, teamExecutionBinding, hasUnsettledTeamWork } from "../team.ts";
 import { executionForSession } from "../execution-identity.ts";
 import { existsSync, readFileSync } from "node:fs";
@@ -257,7 +257,7 @@ export function registerBoard(pi: ExtensionAPI): void {
           }
           const transition = () => {
             if (params.status === "resolved" && hasUnsettledTeamWork(evaluation, plan.meta.id, executionRoot, executionBinding)) {
-              throw new BoardError("Team work for this plan is pending, failed, or cancelled; wait for its successful result or explicitly reconcile the exact ledger hold after documented recovery");
+              throw new BoardError("Team work for this plan retains active or unknown physical resources; wait for their closure");
             }
             const updated = board.transitionOwnedTopic(
               location.identity,
@@ -270,7 +270,7 @@ export function registerBoard(pi: ExtensionAPI): void {
             );
             return toolSuccess(formatTopicCreated(updated), { topicId: updated.id, status: updated.status });
           };
-          return params.status === "resolved" ? withLedgerTeamHoldLock(executionRoot, plan.meta.id, transition) : transition();
+          return transition();
         } finally {
           board.close();
         }

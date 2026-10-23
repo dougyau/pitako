@@ -9,8 +9,8 @@ export const digest = (bytes: string | Buffer): string => createHash("sha256").u
 const LIMIT = 8 * 1024 * 1024;
 
 /** Plumbing must not invoke repository programs, signing, or interactive/network helpers. */
-export function checkpointGitPolicy(root: string): string {
-  const git = (args: string[]) => execFileSync("git", args, { cwd: root, env: localGitEnv(), maxBuffer: LIMIT, stdio: ["pipe", "pipe", "pipe"] }).toString();
+export function checkpointGitPolicy(root: string, env = localGitEnv()): string {
+  const git = (args: string[]) => execFileSync("git", args, { cwd: root, env, maxBuffer: LIMIT, stdio: ["pipe", "pipe", "pipe"] }).toString();
   const config = git(["config", "--null", "--list", "--show-origin"]);
   const parts = config.split("\0");
   for (let i = 1; i < parts.length; i += 2) {

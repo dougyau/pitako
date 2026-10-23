@@ -48,3 +48,6 @@ export interface BridgeClient {
 }
 /** Explicit host entry: import from "pitako/extensions/agent/bridge/client.js". */
 export function connect(descriptorPath: string, options: { expectedSessionId: string; resume?: ResumeLease }): Promise<BridgeClient>;
+
+export { decodeArchitectureMessage, decodeArchitectureSubmit, decodeSubmitInput } from "./protocol.js";
+export type { SubmitInput, SubmissionProvenance, DecodedSubmitInput, DecodedArchitectureMessage, DecodedArchitectureSubmit } from "./protocol.js";

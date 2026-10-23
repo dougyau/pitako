@@ -4,7 +4,9 @@ import path from "node:path";
 import { openBoard, type Topic } from "../extensions/board/store.ts";
 import { ledgerFile, openExecutionPlan, planFile, readLedgerTeamHolds } from "../extensions/workflow.ts";
 import { teamAssignments } from "../extensions/team.ts";
-import { workerHandoff } from "../extensions/agent/background.ts";
+import { teamWorkerStatus, workerHandoff } from "../extensions/agent/background.ts";
+import { WorkflowState, type Resource } from "../extensions/workflow-state.ts";
+import type { AttemptRecord } from "../extensions/workflow-engine.ts";
 import { architectureFixture } from "./fixtures/architecture.ts";
 
 const { fixture, setup } = architectureFixture("review");
@@ -117,20 +119,29 @@ for (const outcome of ["no-blockers", "changes-required", "inconclusive", "faile
         else { subordinate.resolve(); await releaseSubordinate.promise; }
       },
     });
+    const store = new WorkflowState(s.root);
     try {
       const db = await openBoard(); let topic: number;
       try { topic = db.createTopic(s.root, { title: "Watched independent critique" }).id; db.claimTopic(s.root, topic, "planning"); } finally { db.close(); }
-      const file = writePlan(s.root, "frozen", topic);
+      const file = writePlan(s.root, "frozen", topic), frozen = readFileSync(file, "utf8");
       const opened = openExecutionPlan("planning", s.root, { createLedger: true });
+      const historicalHolds = readLedgerTeamHolds(s.root, "planning", opened.binding);
       const start = await s.invoke("review_start", { ...request, plan: "planning", unit: "reviewer-critique" });
       expect(start.isError).not.toBe(true);
       await subordinate.promise;
       const held = () => {
-        expect(readLedgerTeamHolds(s.root, "planning", opened.binding)).toEqual([
-          { assignmentId: start.details.assignmentId, unitId: "reviewer-critique", status: "pending" },
-        ]);
+        const attempt = store.get<AttemptRecord>("attempts", start.details.dispatchId)!;
+        expect(attempt).toMatchObject({ assignmentId: start.details.assignmentId, instanceId: start.details.instanceId,
+          watch: { planId: "planning", unitId: "reviewer-critique" } });
+        expect(attempt.outcome).toBeUndefined();
+        const resource = store.get<Resource>("resources", attempt.resource.resourceId);
+        expect(resource).toMatchObject(attempt.resource);
+        expect(resource!.effectReservation).toBeUndefined();
+        expect(store.closureReceipt(attempt.resource)).toBeUndefined();
+        expect(teamWorkerStatus(s.evaluation.token, start.details.instanceId)[0]?.closure.state).toBe("pending");
         expect(workerHandoff(start.details.instanceId)).toBeUndefined();
         expect(s.branch.filter(entry => entry.customType === "pitako.worker.result")).toEqual([]);
+        expect(s.sent.filter(item => item.options.triggerTurn)).toHaveLength(0);
       };
       held();
       const assignments = teamAssignments(s.evaluation);
@@ -160,13 +171,19 @@ for (const outcome of ["no-blockers", "changes-required", "inconclusive", "faile
       if (outcome !== "no-blockers") expect(report.findings[0]).toMatchObject(finding);
       expect(report.missingValidSynthesis).toBe(outcome === "failed");
       await s.bookkeeping(start.details.instanceId);
-      expect(readLedgerTeamHolds(s.root, "planning", opened.binding)).toEqual(outcome === "failed"
-        ? [{ assignmentId: start.details.assignmentId, unitId: "reviewer-critique", status: "failed" }] : []);
-      expect(readFileSync(file, "utf8")).toContain("status: frozen"); // no acceptance transition
+      const settled = store.get<AttemptRecord>("attempts", start.details.dispatchId)!;
+      expect(settled.outcome?.status).toBe(status);
+      expect(store.verifyClosureReceipt(store.closureReceipt(settled.resource)!)).toBe(true);
+      expect(teamWorkerStatus(s.evaluation.token, start.details.instanceId)[0]?.closure.state).toBe("released");
+      // Historical parsing is a nonmutation check, never an activity or admission gate.
+      expect(readLedgerTeamHolds(s.root, "planning", opened.binding)).toEqual(historicalHolds);
+      expect(readFileSync(file, "utf8")).toBe(frozen);
       const after = await openBoard();
       try { expect(after.readTopic(s.root, topic).topic.status).toBe("open"); } finally { after.close(); }
       expect(s.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
       expect(s.sent.filter(item => item.message.customType === "pitako.worker.result")).toHaveLength(1);
-    } finally { release(); await s.close(); }
+      expect(await s.read("team_result", { assignmentId: start.details.assignmentId })).toEqual(report);
+      expect(store.get<AttemptRecord>("attempts", start.details.dispatchId)?.outcome).toEqual(settled.outcome);
+    } finally { store.close(); release(); await s.close(); }
   }));
 }

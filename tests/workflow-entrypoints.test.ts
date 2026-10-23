@@ -17,7 +17,7 @@ import { beginTeamEvaluation, recordTeamAssignment, reserveTeamMember, retireTea
 const f = architectureFixture();
 const repo = path.resolve(import.meta.dir, "..");
 
-for (const id of ["native", "", "   ", "controls", "standalone-plan"]) test(`native SDK planning/Architect ports (/${id === "standalone-plan" ? "plan" : "task"} ${JSON.stringify(id)})`,
+for (const id of ["native", "", "   ", "controls", "standalone-plan"]) test(`native SDK planning/${id === "controls" ? "control" : "Architect"} ports (/${id === "standalone-plan" ? "plan" : "task"} ${JSON.stringify(id)})`,
   f.fixture.ownedCase(`native workflow entries ${id}`, async () => {
     const storageRoot = mkdtempSync(path.join(tmpdir(), "pitako-entry-storage-"));
     f.fixture.directories.push(storageRoot);
@@ -36,7 +36,7 @@ for (const id of ["native", "", "   ", "controls", "standalone-plan"]) test(`nat
       { name: "bound_plan_read", arguments: {} },
       ...(standalone ? [{ name: "codemode", arguments: { code: "text(await tools.bound_plan_read({}));" } }] : []),
       ...(!standalone ? [{ name: "task_status", arguments: {} }] : []),
-      { name: "architecture_start", arguments: { goal: "Repair the current conversation's bounded behavior" } },
+      ...(id === "controls" ? [] : [{ name: "architecture_start", arguments: { goal: "Repair the current conversation's bounded behavior" } }]),
       { name: "write", arguments: { path: path.join(app.root, "forbidden.txt"), content: "not allowed" } },
       ...(id === "controls" ? [
         { name: "todo", arguments: { action: "list" } },
@@ -148,7 +148,7 @@ for (const id of ["native", "", "   ", "controls", "standalone-plan"]) test(`nat
       await f.fixture.run(session.waitForIdle());
       await Promise.all(followUps);
       const results = session.messages.filter(message => message.role === "toolResult");
-      for (const name of ["planning_write", "bound_plan_read", ...(!standalone ? ["task_status"] : []), "architecture_start"]) {
+      for (const name of ["planning_write", "bound_plan_read", ...(!standalone ? ["task_status"] : []), ...(id === "controls" ? [] : ["architecture_start"])]) {
         const result = results.find(message => message.toolName === name);
         expect(result, `${name} must actually execute through native tool_call`).toBeDefined();
         expect(result!.isError, JSON.stringify(result)).not.toBe(true);
@@ -173,8 +173,7 @@ for (const id of ["native", "", "   ", "controls", "standalone-plan"]) test(`nat
         }
         expect(results.find(message => message.toolName === "agent_status")!.details).toMatchObject({ workers: [{ instanceId: ownedWorker }] });
         const teamStatus = results.find(message => message.toolName === "team_status")!.details as { members: { assignmentId: string }[] };
-        const architecture = results.find(message => message.toolName === "architecture_start")!.details as { assignmentId: string };
-        expect(teamStatus.members.map(member => member.assignmentId)).toEqual(["owned-assignment", architecture.assignmentId]);
+        expect(teamStatus.members.map(member => member.assignmentId)).toEqual(["owned-assignment"]);
         for (const name of ["agent_status", "agent_result", "team_result"]) {
           const denied = results.filter(message => message.toolName === name).at(-1)!;
           expect(denied.isError, JSON.stringify(denied)).toBe(true);

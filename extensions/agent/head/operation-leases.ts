@@ -4,7 +4,7 @@ import path from "node:path";
 import { createBashToolDefinition, createWriteToolDefinition, createEditToolDefinition,
   type ExtensionAPI, type BashOperations } from "@earendil-works/pi-coding-agent";
 import { toolEffect } from "../effects.ts";
-import { captureCallContext, checkCallContext, reserveEffect, guardDefinition, hasDefinitionGuard, hasReadDefinitionGuard,
+import { captureCallContext, checkCallContext, reserveEffect, guardDefinition, hasDefinitionGuard, hasReadDefinitionGuard, hasGitDefinitionGuard,
   withCallContext as withCaptured, assertGenericWrite, type Producer } from "../../workflow-engine.ts";
 import type { CallContext } from "../../workflow-engine.ts";
 import type { Reservation } from "../../workflow-state.ts";
@@ -106,21 +106,36 @@ function packagedNavigationRead(name: string, source: string): boolean {
   try { return realpathSync(source) === realpathSync(path.join(packageRoot(), entry)); }
   catch { return false; }
 }
+function packagedWorkflowStatus(info: { name: string; parameters: object; sourceInfo: { path: string } }): boolean {
+  if (info.name !== "workflow_status" || !hasReadDefinitionGuard(info.parameters)) return false;
+  try { return realpathSync(info.sourceInfo.path) === realpathSync(path.join(packageRoot(), "extensions/index.ts")); }
+  catch { return false; }
+}
 /** Hooks include nested session ctx.executeTool calls, not just model-issued calls. */
 export function principalLeases(pi: ExtensionAPI, foreground: BashOperations) {
   const active = new Map<string, { lease: ReturnType<typeof reserveOperation>; linked: boolean }>();
   pi.on("tool_call", (event, ctx) => {
     const info = pi.getAllTools?.().find(tool => tool.name === event.toolName);
+    if (info && hasGitDefinitionGuard(info.parameters)) {
+      try {
+        if (!["git_inspect", "git_commit"].includes(info.name) ||
+            realpathSync(info.sourceInfo.path) !== realpathSync(path.join(packageRoot(), "extensions/index.ts")))
+          throw new Error("Git definition physical owner unavailable");
+      } catch (error) { return { block: true, reason: String(error) }; }
+    }
     // Packaged navigation does not mutate candidate inputs and needs no writer
     // reservation. The registry's physical owner, not a familiar name, identifies it.
     const navigationRead = info && packagedNavigationRead(info.name, info.sourceInfo.path);
+    const journalRead = info && packagedWorkflowStatus(info);
+    if (event.toolName === "workflow_status" && !journalRead)
+      return { block: true, reason: "workflow status definition is untrusted" };
     // Native Codemode delegates effects through nested executeTool admissions.
     const codemode = info?.name === "codemode" && info.sourceInfo.path === "builtin:codemode";
     if (info && (hasDefinitionGuard(info.parameters) || navigationRead || codemode)) {
-      const read = navigationRead || codemode || hasReadDefinitionGuard(info.parameters);
+      const read = navigationRead || codemode || hasReadDefinitionGuard(info.parameters) || hasGitDefinitionGuard(info.parameters);
       try {
         const context = captureCallContext(ctx.cwd, ctx.sessionManager);
-        checkCallContext(context);
+        if (!(journalRead && context.kind === "managed-unavailable")) checkCallContext(context);
         if (!read)
           withCaptured(context, () => assertNoExclusive(ctx.cwd));
       } catch (error) { return { block: true, reason: String(error) }; }

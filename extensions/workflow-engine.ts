@@ -4,9 +4,10 @@ import { realpathSync, statSync, readFileSync, existsSync } from "node:fs";
 import path from "node:path";
 import { currentWorkspace } from "./board/workspace.ts";
 import { executionForSession } from "./execution-identity.ts";
-import { openExecutionPlan, verifyExecutionBinding, updateLedgerTeamHold, writeExecutionUserDecision, ledgerFile, readExecutionBinding, type ExecutionBinding, type ExecutionPlan } from "./workflow.ts";
+import { openExecutionPlan, verifyExecutionBinding, writeExecutionUserDecision, ledgerFile, readExecutionBinding, type ExecutionBinding, type ExecutionPlan } from "./workflow.ts";
 import type { ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
+import { registerGitTools } from "./workflow-git.ts";
 import { AgentClosureError, hasUnknownClosure, joinedClosureObservation } from "./agent/closure.ts";
 import { packageRoot } from "./stack.ts";
 import { isChildSession } from "./profile.ts";
@@ -16,10 +17,10 @@ import { receiptInBranch } from "./agent/delivery.ts";
 import { deliveryContent } from "./agent/provenance.ts";
 import {
   acquireWorkflowOwner, acquirePlanLock, WorkflowState, type Reservation, type ReservationSpec, type ResourceRef,
-  type ResourceScope, type ReleaseReceipt, type RunFence, type RunRecord,
+  type ResourceScope, type ReleaseReceipt, type ResourceClosureReceipt, type Resource, resourceRef, type RunFence, type RunRecord,
 } from "./workflow-state.ts";
 
-export type { ResourceRef, ResourceScope, RunFence, ReleaseReceipt } from "./workflow-state.ts";
+export type { ResourceRef, ResourceScope, RunFence, ReleaseReceipt, ResourceClosureReceipt } from "./workflow-state.ts";
 export type CallContext = { kind: "ordinary"; guard: RootGuard } |
   { kind: "managed"; authority: PhaseAuthority } | { kind: "managed-unavailable"; reason: string };
 export type PlanSource = { kind: "draft"; planId: string; revision: number | "absent"; file: string } |
@@ -29,7 +30,7 @@ export interface StatusReadAuthority { readonly runId: string }
 export type ActivityRetirement = { kind: "requested" } | { kind: "closed" };
 type HostOwner = {
   store: WorkflowState; run: RunRecord; binding?: ExecutionBinding; manager: object; active: boolean;
-  planning?: PlanSlot; slotReservation?: OwnedReservation; slotProducer?: Producer;
+   planning?: PlanSlot; slotProducer?: Producer;
   guard: RootGuard;
   observation: () => Producer;
   unlock: () => void; listeners: Set<() => void>; retire: Set<() => Promise<void>>;
@@ -65,11 +66,13 @@ function createHostState() {
     ordinaryGuards: new Map<string, RootGuard>(),
     // JSON correlation can never nominate an ancestor lease.
     reservationParents: new WeakMap<CallContext, OwnedReservation>(),
+    resourceParents: new WeakMap<CallContext, ResourceRef>(),
     boundDrafts: new WeakMap<CallContext, PlanSnapshot>(),
     lateDefinitions: new Set<{ root: string; producer: Producer; observe: () => "closed" | "unknown" }>(),
     definitions: new WeakSet<object>(),
     definitionParameters: new WeakSet<object>(),
     readDefinitionParameters: new WeakSet<object>(),
+    gitDefinitionParameters: new WeakSet<object>(),
   };
 }
 const host = globalThis as typeof globalThis & { [HOST_KEY]?: ReturnType<typeof createHostState> };
@@ -77,8 +80,10 @@ const state = host[HOST_KEY] ??= createHostState();
 // Add metadata to the existing host on reload; never replace its live stores or guards.
 state.sessionBindings ??= new WeakMap();
 state.admissionOrigins ??= new WeakMap();
+state.resourceParents ??= new WeakMap();
+state.gitDefinitionParameters ??= new WeakSet();
 const { authorities, taskAuthorities, readers, activityObservers, guards, contexts, sessions, sessionBindings, admissionOrigins, liveProducers,
-  resultWaitSources, ordinaryGuards, reservationParents, boundDrafts, lateDefinitions,
+  resultWaitSources, ordinaryGuards, reservationParents, resourceParents, boundDrafts, lateDefinitions,
   definitions, definitionParameters, readDefinitionParameters } = state;
 function reobserveDefinitions(root: string): void {
   for (const entry of lateDefinitions) {
@@ -102,27 +107,24 @@ export class RootGuard {
   }
   reserve(spec: ReservationSpec, authority?: PhaseAuthority): OwnedReservation {
     if (!guards.has(this)) throw new Error("unregistered root guard");
-    reobserveDefinitions(this.store.root);
+    reobserveDefinitions(this.store.root); this.store.reconcile();
     const owner = authority && checkAuthority(authority);
     if (owner && owner.store.root !== this.store.root) throw new Error("authority root mismatch");
     if (owner && !["active", "waiting"].includes(owner.run.state)) throw new Error(`workflow activity is ${owner.run.state}`);
+    retryUserDecisionProjections(this.store);
     const reservation = this.store.reserve(spec, owner?.run.ownerId ?? this.ownerId, authority?.fence);
     return new OwnedReservation(this.store, reservation, () => {
       if (!guards.has(this)) throw new Error("root guard retired");
       if (authority) checkAuthority(authority);
     });
   }
-  assertIdle(paths: readonly string[], exclusiveOnly = false): void {
-    reobserveDefinitions(this.store.root);
-    const context = currentCallContext();
-    const parent = context && (reservationParents.get(context) ??
-      (context.kind === "managed" ? checkAuthority(context.authority).slotReservation : undefined));
-    const ancestors = parent?.store.root === this.store.root
-      ? this.store.ancestors(parent.reservation.reservationId) : new Set<string>();
+  assertIdle(paths: readonly string[], exclusiveOnly: boolean | "non-writer" = false): void {
+    reobserveDefinitions(this.store.root); this.store.reconcile();
     for (const reservation of this.store.all<Reservation>("reservations").sort((a, b) =>
       Number(b.state === "unknown") - Number(a.state === "unknown"))) {
-      if (reservation.state === "released" || exclusiveOnly && reservation.kind === "writer" && reservation.state !== "unknown") continue;
-      if (reservation.state === "active" && ancestors.has(reservation.reservationId)) continue;
+      if (reservation.state === "released" || reservation.exclusionRetired) continue;
+      if (reservation.kind === "writer" &&
+          (exclusiveOnly === "non-writer" || exclusiveOnly === true && reservation.state !== "unknown")) continue;
       if (reservation.purpose === "observation" && reservation.state === "active") continue;
       if (paths.some(a => reservation.paths.some(b => a === b || a.startsWith(b + path.sep) || b.startsWith(a + path.sep)))) {
         if (reservation.state === "unknown")
@@ -232,7 +234,7 @@ export function bindForegroundCallContext(root: string, manager: NativeSession):
 /** Host-only effect boundary. Producer scopes never become receiver authority. */
 export function withReceiverContext<T>(manager: NativeSession, expected: CallContext, owns: () => boolean, operation: () => T): T {
   const binding = sessionBindings.get(manager);
-  if (!binding || binding.context !== expected || !bindingCurrent(binding) || reservationParents.has(expected))
+  if (!binding || binding.context !== expected || !bindingCurrent(binding) || reservationParents.has(expected) || resourceParents.has(expected))
     throw new Error("native receiver requires the current principal root binding");
   const receiver: ReceiverScope = { manager, sessionId: manager.getSessionId?.(), initial: binding, owns };
   if (expected.kind === "managed") {
@@ -247,8 +249,14 @@ export function withCallContext<T>(context: CallContext, operation: () => T): T 
   if (!admissionOrigins.has(context)) admissionOrigins.set(context, undefined);
   return contexts.run({ kind: "operation", context }, operation);
 }
-export function checkCallContext(context: CallContext): RootGuard {
+export function checkCallContext(context: CallContext, registered = false): RootGuard {
   if (context.kind === "managed-unavailable") throw new Error(context.reason);
+  const parent = resourceParents.get(context);
+  if (parent) {
+    const store = context.kind === "managed" ? checkAuthority(context.authority).guard.store : context.guard.store;
+    if ((!registered && store.exactResource(parent).sealed) || store.closureReceipt(parent))
+      throw new Error("resource ancestor is unavailable or retired");
+  }
   if (context.kind === "managed") {
     const guard = checkAuthority(context.authority).guard;
     assertOriginCurrent(admissionOrigins.get(context));
@@ -258,18 +266,47 @@ export function checkCallContext(context: CallContext): RootGuard {
   if (!guards.has(context.guard)) throw new Error("ordinary root guard retired");
   return context.guard;
 }
+/** Git consent belongs to the admitted foreground principal, never an invented ordinary context or child. */
+export function assertGitCommitOwner(context: CallContext, manager: NativeSession): void {
+  checkCallContext(context);
+  const binding = sessionBindings.get(manager);
+  if (!binding || binding.context !== context || !bindingCurrent(binding) || reservationParents.has(context) ||
+      resourceParents.has(context) || admissionOrigins.get(context) !== binding ||
+      context.kind === "managed" && checkAuthority(context.authority).manager !== manager)
+    throw new Error("Git commit requires the current native principal root binding");
+}
 export function reserveEffect(context: CallContext, spec: ReservationSpec): OwnedReservation {
-  const parent = reservationParents.get(context) ??
-    (context.kind === "managed" ? checkAuthority(context.authority).slotReservation : undefined);
-  return checkCallContext(context).reserve({ ...spec,
+  const guard = checkCallContext(context);
+  // The captured attempt's authorization is narrower than an ordinary principal's.
+  // It is not a reservation and owns no paths until an actual effect is admitted.
+  if (resourceParents.has(context) && spec.paths.some(p => p !== guard.store.root &&
+      !p.startsWith(guard.store.root + path.sep))) throw new Error("effect outside captured attempt root");
+  const parent = reservationParents.get(context);
+  const reservation = guard.reserve({ ...spec,
     ...(parent && !spec.parentReservationId ? { parentReservationId: parent.reservation.reservationId } : {}) },
   context.kind === "managed" ? context.authority : undefined);
+  reservation.parentResource = resourceParents.get(context);
+  return reservation;
+}
+
+/** Lifecycle identity is not a path exclusion. */
+export function registerResource(context: CallContext, adapter: string, scopes: ResourceScope[],
+  purpose: "work" | "observation" = "work", dependency: "independent" | "host-return-dependent" = "independent",
+  inProcessScopes: ResourceScope[] = []): Producer {
+  const guard = checkCallContext(context);
+  const owner = context.kind === "managed" ? checkAuthority(context.authority) : undefined;
+  const resource = guard.store.resource(undefined, { adapter, scopes, purpose,
+    ownerId: owner?.run.ownerId ?? guard.ownerId, runId: owner?.run.runId ?? null,
+    parentResource: resourceParents.get(context), inProcessScopes });
+  const producer = new Producer(guard.store, resource, () => { checkCallContext(context, true); }, dependency);
+  liveProducers.set(resource.resourceId, producer);
+  return producer;
 }
 
 export type AttemptWatch = { planId: string; unitId: string; execution?: ExecutionBinding; unavailable?: string };
 export type AttemptRecord = {
   instanceId: string; dispatchId: string; roleId: string; assignmentId: string;
-  reservationId: string; resource: ResourceRef; watch?: AttemptWatch;
+  reservationId?: string; resource: ResourceRef; watch?: AttemptWatch; archive?: boolean;
   outcome?: { status: "completed" | "failed" | "cancelled"; result: string };
 };
 export type TeamHoldRecord = {
@@ -288,52 +325,13 @@ export type RecoveryReceipt = RecoveryClaim & {
 };
 export const outcomeHash = (outcome: NonNullable<AttemptRecord["outcome"]>): string =>
   createHash("sha256").update(JSON.stringify(outcome)).digest("hex");
-const holdKey = (planId: string, assignmentId: string) => JSON.stringify([planId, assignmentId]);
-function putHold(store: WorkflowState, hold: TeamHoldRecord): void {
-  const key = holdKey(hold.planId, hold.assignmentId);
-  const previous = store.get<TeamHoldRecord>("holds", key);
-  if (previous && (previous.unitId !== hold.unitId || JSON.stringify(previous.execution) !== JSON.stringify(hold.execution) ||
-      previous.reservationId !== hold.reservationId)) throw new Error("Team hold belongs to another captured assignment");
-  store.put("holds", key, hold);
-  store.enqueue(`team-holds:${hold.planId}`, JSON.stringify(hold.execution ?? { kind: "draft", planId: hold.planId }),
-    { kind: "team-hold", hold });
-}
-/** Projection is an ordered sink. It never becomes the source of hold authority. */
+/** Retain historical hold facts, without replaying a retired capability. */
 export function projectTeamHolds(store: WorkflowState): void {
-  const targets = new Set(store.outbox().filter(entry => entry.target.startsWith("team-holds:") &&
-    !["applied", "not-applicable"].includes(entry.state)).map(entry => entry.target));
-  const failures: unknown[] = [];
-  for (const target of targets) {
-    let release: () => void;
-    try { release = acquirePlanLock(store.root, target.slice("team-holds:".length), "team-holds-projection"); }
-    catch (error) { failures.push(error); continue; } // Leave this target intact; other plans may progress.
-    try {
-      // Read the ordered outbox again under target exclusion. A stale drainer
-      // must not replay an earlier hold after another drainer has cleared it.
-      store.project(entry => {
-        const body = entry.body as { kind?: string; hold?: TeamHoldRecord };
-        if (body.kind !== "team-hold") return "blocked";
-        const hold = body.hold!;
-        if (!hold.execution) return "not-applicable"; // A draft has no execution ledger.
-        const plan = verifyExecutionBinding(hold.execution);
-        const applied = updateLedgerTeamHold(hold.execution.executionRoot, hold.planId,
-          { assignmentId: hold.assignmentId, unitId: hold.unitId, status: hold.status }, hold.cleared, hold.execution);
-        if (applied) return "applied";
-        return plan.meta.boardTopicId === undefined ? "not-applicable" : "blocked";
-      }, entry => entry.target === target);
-    } finally { release(); }
-  }
-  if (failures.length) throw new AggregateError(failures, "Team hold projection target unavailable");
+  store.project(() => "not-applicable", entry => entry.target.startsWith("team-holds:"));
 }
-function checkTeamProjection(store: WorkflowState, planId: string): void {
-  const pending = store.outbox().find(entry => entry.target === `team-holds:${planId}` &&
-    !["applied", "not-applicable"].includes(entry.state));
-  if (pending) throw new Error(`Team hold projection is blocked: ${
-    (pending.body as { projectionDiagnostic?: string }).projectionDiagnostic ?? pending.state}`);
-}
-/** Commit attempt, resource and hold together, before publishing a Row or scheduling preparation. */
+/** Commit attempt and root identity before publishing a Row or scheduling preparation. */
 export function registerBackgroundAttempt(context: CallContext, input: {
-  cwd: string; instanceId: string; dispatchId: string; roleId: string; assignmentId?: string; watch?: AttemptWatch; archive?: boolean;
+  cwd: string; instanceId: string; dispatchId: string; roleId: string; assignmentId?: string; watch?: AttemptWatch; archive?: { paths: string[] };
 }) {
   const guard = checkCallContext(context), store = guard.store;
   if (!admissionOrigins.has(context)) admissionOrigins.set(context, undefined);
@@ -351,18 +349,21 @@ export function registerBackgroundAttempt(context: CallContext, input: {
   let attempt!: AttemptRecord;
   let captured = context;
   store.transaction(() => {
-    const reservation = reserveEffect(context, { reservationId: randomUUID(), kind: "writer", paths: [store.root] });
-    producer = reservation.register("background-attempt", ["preparation", "host-operation", "callback"]);
-    if (input.archive) archive = reservation.register("table-archive", ["host-operation", "callback"]);
-    attempt = { ...input, assignmentId, reservationId: reservation.reservation.reservationId, resource: producer.ref };
-    if (store.get("attempts", input.dispatchId)) throw new Error("attempt already registered");
-    store.put("attempts", input.dispatchId, attempt);
-    if (input.watch) putHold(store, { ...input.watch, assignmentId, reservationId: attempt.reservationId,
-      status: "pending", cleared: false });
-    store.enqueue(`attempt:${input.dispatchId}`, JSON.stringify(producer.ref), { kind: "registered", attempt });
+    producer = registerResource(context, "background-attempt", ["preparation", "host-operation", "callback"],
+      "work", "independent", ["callback"]);
+    if (input.watch?.execution) store.pinGit({ bindingId: `attempt:${input.dispatchId}`, root: store.root,
+      resource: producer.ref, components: [{ component: "source", expected: JSON.stringify(input.watch.execution) }] });
     captured = { ...context };
     admissionOrigins.set(captured, origin);
-    reservationParents.set(captured, reservation);
+    resourceParents.set(captured, producer.ref);
+    if (input.archive) archive = input.archive.paths.length
+      ? reserveEffect(captured, { reservationId: randomUUID(), kind: "writer", paths: input.archive.paths })
+        .register("table-archive", ["host-operation", "callback"])
+      : registerResource(captured, "table-archive", ["host-operation", "callback"], "work", "independent", ["callback"]);
+    attempt = { ...input, archive: !!input.archive, assignmentId, resource: producer.ref };
+    if (store.get("attempts", input.dispatchId)) throw new Error("attempt already registered");
+    store.put("attempts", input.dispatchId, attempt);
+    store.enqueue(`attempt:${input.dispatchId}`, JSON.stringify(producer.ref), { kind: "registered", attempt });
     if (context.kind === "managed") {
       const owner = checkAuthority(context.authority);
       const draft = boundDrafts.get(context) ?? owner.planning?.read();
@@ -378,8 +379,10 @@ export function registerBackgroundAttempt(context: CallContext, input: {
         throw new Error("result has no original native principal receiver");
       return origin.context;
     },
-    receipt: () => store.all<ReleaseReceipt>("receipts").find(receipt =>
-      receipt.reservationId === attempt.reservationId && store.verifyReceipt(receipt)),
+    receipt: () => {
+      const receipt = store.closureReceipt(producer.ref);
+      return receipt && store.verifyClosureReceipt(receipt) ? receipt : undefined;
+    },
     admit() {
       checkCallContext(context);
       producer.enter();
@@ -390,7 +393,6 @@ export function registerBackgroundAttempt(context: CallContext, input: {
       if (input.watch?.execution) openExecutionPlan(input.watch.planId, store.root,
         { createLedger: true, source: verifyExecutionBinding(input.watch.execution) });
       projectTeamHolds(store);
-      if (input.watch) checkTeamProjection(store, input.watch.planId);
     },
     result(outcome: NonNullable<AttemptRecord["outcome"]>) {
       // Append to the original attempt even after foreground authority has retired.
@@ -402,8 +404,6 @@ export function registerBackgroundAttempt(context: CallContext, input: {
         saved.outcome = outcome;
         store.put("attempts", input.dispatchId, saved);
         store.enqueue(`attempt:${input.dispatchId}`, JSON.stringify(producer.ref), { kind: "result", outcome });
-        if (input.watch && outcome.status !== "completed") putHold(store, { ...input.watch, assignmentId,
-          reservationId: attempt.reservationId, status: outcome.status, cleared: false });
         const obligationId = `result:${input.dispatchId}`;
         store.put("obligations", obligationId, { obligationId, kind: "result", dispatchId: input.dispatchId,
           runId: context.kind === "managed" ? context.authority.fence.runId : null, cleared: false });
@@ -563,96 +563,24 @@ export function captureResultSource(attempt: BackgroundAttempt, resultId: string
     });
   }
 }
-/** Only the matching committed receipt and successful recorded outcome can clear a normal hold. */
-export function reconcileTeamHold(store: WorkflowState, watch: AttemptWatch, assignmentId: string,
-  status: "pending" | "completed" | "failed" | "cancelled" | undefined, receipt?: ReleaseReceipt): void {
-  store.transaction(() => {
-    const key = holdKey(watch.planId, assignmentId);
-    const hold = store.get<TeamHoldRecord>("holds", key);
-    if (!hold) {
-      putHold(store, { ...watch, assignmentId, status: status === "failed" || status === "cancelled" ? status : "pending", cleared: false });
-      if (status === "completed") throw new Error("Team hold has no registered attempt");
-      return;
-    }
-    if (hold.unitId !== watch.unitId || JSON.stringify(hold.execution) !== JSON.stringify(watch.execution))
-      throw new Error("Team hold binding mismatch");
-    if (status === "completed") {
-      const attempt = store.all<AttemptRecord>("attempts").find(value => value.assignmentId === assignmentId &&
-        value.reservationId === hold.reservationId && value.watch?.planId === watch.planId);
-      if (attempt?.outcome?.status !== "completed") throw new Error("Team hold has no matching successful outcome");
-      // Result bookkeeping can precede physical closure. It is not hold recovery.
-      // The original producer will append the exact committed receipt after closure.
-      if (receipt) {
-        if (receipt.reservationId !== hold.reservationId || !store.verifyReceipt(receipt))
-          throw new Error("Team hold requires its exact release receipt");
-        hold.cleared = true;
-      }
-    } else {
-      // Failed, cancelled and preflight-without-outcome require explicit recovery, not delivery.
-      hold.status = status === "failed" || status === "cancelled" ? status : "pending";
-    }
-    putHold(store, hold);
-  });
-  projectTeamHolds(store);
-  checkTeamProjection(store, watch.planId);
-}
-
-/** Explicit host recovery is distinct from resource release and successful completion.
- * Authority comes only from the captured live foreground grant, never the documentation.
- */
-export function recoverHold(authority: PhaseAuthority, claim: RecoveryClaim): RecoveryReceipt {
-  const owner = checkAuthority(authority), store = owner.store;
-  const binding = owner.binding;
-  if (!binding) throw new Error("execution hold recovery requires an execution activity");
-  const recovered = store.transaction(() => {
-    checkAuthority(authority);
-    if (claim.repository !== store.root || !claim.remainingResult.trim() || !claim.evidence.length)
-      throw new Error("recovery requires captured repository, evidence and remaining result");
-    const attempt = store.get<AttemptRecord>("attempts", claim.dispatchId);
-    if (!attempt || attempt.assignmentId !== claim.assignmentId || !attempt.watch?.execution ||
-        JSON.stringify(attempt.watch.execution) !== JSON.stringify(owner.binding))
-      throw new Error("recovery attempt belongs to another assignment or binding");
-    const hold = store.get<TeamHoldRecord>("holds", holdKey(binding.planId, claim.assignmentId));
-    if (!hold || hold.cleared || hold.reservationId !== attempt.reservationId || hold.unitId !== attempt.watch.unitId)
-      throw new Error("recovery has no matching outstanding hold");
-    if (claim.receipt.reservationId !== attempt.reservationId || !store.verifyReceipt(claim.receipt))
-      throw new Error("recovery requires the exact committed resource release receipt");
-    for (const evidence of claim.evidence) {
-      const source = store.get<AttemptRecord>("attempts", evidence.dispatchId);
-      if (!source?.outcome || JSON.stringify(source.watch?.execution) !== JSON.stringify(owner.binding) ||
-          outcomeHash(source.outcome) !== evidence.outcomeHash) throw new Error("recovery evidence is missing, foreign or stale");
-    }
-    const receipt: RecoveryReceipt = { ...structuredClone(claim), recoveryId: randomUUID(), runId: owner.run.runId,
-      planId: binding.planId, unitId: hold.unitId, outcome: attempt.outcome ?? null };
-    store.put("recoveries", receipt.recoveryId, receipt);
-    putHold(store, { ...hold, cleared: true, recoveryId: receipt.recoveryId });
-    return receipt;
-  });
-  if (JSON.stringify(store.get("recoveries", recovered.recoveryId)) !== JSON.stringify(recovered))
-    throw new Error("recovery receipt was not committed");
-  projectTeamHolds(store);
-  checkTeamProjection(store, binding.planId);
-  return recovered;
-}
-
 /** Captures the actual host definition, not permission attached to a tool-name string. */
 export function guardDefinition<P extends TSchema, D, S>(definition: ToolDefinition<P, D, S>,
-  effect: "read" | "write", preserveSchema = false,
-  unavailable?: (error: unknown) => Awaited<ReturnType<typeof definition.execute>>): ToolDefinition<P, D, S> {
+  effect: "read" | "write" | "git", preserveSchema = false,
+  unavailable?: (error: unknown, args: Parameters<typeof definition.execute>) => Awaited<ReturnType<typeof definition.execute>>): ToolDefinition<P, D, S> {
   const execute = definition.execute.bind(definition);
   const wrapped = { ...definition, parameters: preserveSchema ? definition.parameters : { ...definition.parameters },
     execute(...args: Parameters<typeof definition.execute>) {
     const [id, params, signal, update, ctx] = args;
-    if (effect === "read") {
+    if (effect === "read" || effect === "git") {
       // Observation validates any captured owner, but does not acquire workspace
       // state: archived native history may outlive its physical checkout.
       let context: CallContext | undefined;
       try {
-        context = currentCallContext(ctx.sessionManager);
+        context = effect === "git" ? captureCallContext(ctx.cwd, ctx.sessionManager) : currentCallContext(ctx.sessionManager);
         if (context) checkCallContext(context);
       }
       catch (error) {
-        if (unavailable) return Promise.resolve(unavailable(error));
+        if (unavailable) return Promise.resolve(unavailable(error, args));
         throw error;
       }
       return context ? withCallContext(context, () => execute(...args)) : execute(...args);
@@ -662,7 +590,7 @@ export function guardDefinition<P extends TSchema, D, S>(definition: ToolDefinit
       context = captureCallContext(ctx.cwd, ctx.sessionManager);
       guard = checkCallContext(context);
     } catch (error) {
-      if (unavailable) return Promise.resolve(unavailable(error));
+      if (unavailable) return Promise.resolve(unavailable(error, args));
       throw error;
     }
     assertGenericWrite(context);
@@ -698,21 +626,24 @@ export function guardDefinition<P extends TSchema, D, S>(definition: ToolDefinit
   definitions.add(wrapped);
   definitionParameters.add(wrapped.parameters);
   if (effect === "read") readDefinitionParameters.add(wrapped.parameters);
+  if (effect === "git") state.gitDefinitionParameters.add(wrapped.parameters);
   return wrapped;
 }
 export function isGuardedDefinition(definition: object): boolean { return definitions.has(definition); }
 export function hasDefinitionGuard(parameters: object): boolean { return definitionParameters.has(parameters); }
 export function hasReadDefinitionGuard(parameters: object): boolean { return readDefinitionParameters.has(parameters); }
+export function hasGitDefinitionGuard(parameters: object): boolean { return state.gitDefinitionParameters.has(parameters); }
 export function guardToolRegistrations(pi: ExtensionAPI, effect: "read" | "write"): ExtensionAPI {
   return { ...pi, registerTool(definition) { pi.registerTool(guardDefinition(definition, effect)); } };
 }
 
 export class OwnedReservation {
+  parentResource?: ResourceRef;
   constructor(readonly store: WorkflowState, readonly reservation: Reservation, private admit: () => void) {}
   register(adapter: string, scopes: ResourceScope[], purpose: "work" | "observation" = this.reservation.purpose ?? "work",
     dependency: "independent" | "host-return-dependent" = "independent"): Producer {
     this.admit();
-    const resource = this.store.resource(this.reservation, { adapter, scopes, purpose });
+    const resource = this.store.resource(this.reservation, { adapter, scopes, purpose, parentResource: this.parentResource });
     const producer = new Producer(this.store, resource, this.admit, dependency);
     liveProducers.set(resource.resourceId, producer);
     return producer;
@@ -727,21 +658,24 @@ export class Producer {
   private ended = false;
   constructor(private store: WorkflowState, resource: ResourceRef, private admit: () => void,
     readonly dependency: "independent" | "host-return-dependent" = "independent") {
-    const { resourceId, producerId, reservationId, generation } = resource;
-    this.ref = Object.freeze({ resourceId, producerId, reservationId, generation });
+    this.ref = Object.freeze(resourceRef(resource));
   }
   enter(): void { this.admit(); this.store.enter(this.ref); }
-  observe(scope: ResourceScope, fact: "closed" | "unknown", seal = false): ReleaseReceipt | undefined {
+  observe(scope: ResourceScope, fact: "closed" | "unknown", seal = false): ResourceClosureReceipt | undefined {
     const receipt = this.store.observe(this.ref, ++this.sequence, scope, fact, seal);
-    if (receipt && !this.store.verifyReceipt(receipt)) throw new Error("release receipt was not committed");
+    if (receipt && !this.store.verifyClosureReceipt(receipt)) throw new Error("closure receipt was not committed");
     if (receipt) { this.ended = true; liveProducers.delete(this.ref.resourceId); }
     for (const listener of this.listeners) { try { listener(); } catch { /* Observers cannot change reduction. */ } }
     return receipt;
   }
-  get live(): boolean { return !this.ended && liveProducers.get(this.ref.resourceId) === this; }
+  get live(): boolean { return !this.ended && !this.store.closureReceipt(this.ref) && liveProducers.get(this.ref.resourceId) === this; }
   get cursor(): number { return this.sequence; }
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener); }
   snapshot() { return this.store.exactResource(this.ref); }
+  get effectPaths(): readonly string[] {
+    const effect = this.snapshot().effectReservation;
+    return effect ? this.store.get<Reservation>("reservations", effect.reservationId)?.paths ?? [] : [];
+  }
 }
 
 export function checkAuthority(authority: PhaseAuthority): HostOwner {
@@ -773,8 +707,9 @@ export function readBoundPlan(context: CallContext) {
 }
 export function assertPlanningQuiescent(authority: PhaseAuthority): void {
   const owner = checkAuthority(authority);
-  const pending = owner.store.all<Reservation>("reservations").filter(item => item.runId === owner.run.runId &&
-    item.reservationId !== owner.slotReservation?.reservation.reservationId && item.state !== "released" && item.purpose !== "observation");
+  owner.store.reconcile();
+  const pending = owner.store.all<Resource>("resources").filter(item => item.runId === owner.run.runId &&
+    item.resourceId !== owner.slotProducer?.ref.resourceId && !owner.store.closureReceipt(item) && item.purpose !== "observation");
   if (pending.length) throw new Error("planning resources remain active or unknown");
 }
 export function assertGenericWrite(context: CallContext): void {
@@ -813,8 +748,6 @@ export function openTaskActivity(id: string, root: string, expected: PlanSnapsho
     if (previous?.state === "completed") throw new Error("task is already completed");
     const receipt = previous && taskFreezeReceipt(store, previous);
     if (expected.meta?.status === "frozen" && !receipt) throw new Error("frozen status is not a registered task FreezeReceipt");
-    if (previous && store.all<Reservation>("reservations").some(r => r.runId === previous.runId && r.state !== "released"))
-      throw new Error("previous task resources remain active or unknown; exact recovery required");
     if (receipt && (receipt.newHash !== expected.fileHash || receipt.snapshot.text !== expected.text))
       throw new Error("task FreezeReceipt source changed");
     return openActivity(receipt
@@ -828,7 +761,6 @@ function openActivity(source: { binding: ExecutionBinding } | { id: string; root
   const store = new WorkflowState("binding" in source ? source.binding.executionRoot : source.root);
   const planId = "binding" in source ? source.binding.planId : source.id;
   let unlock: (() => void) | undefined;
-  let slotReservation: OwnedReservation | undefined;
   let unownedGuard: RootGuard | undefined;
   try {
     unlock = acquireWorkflowOwner(store.root, planId);
@@ -849,19 +781,26 @@ function openActivity(source: { binding: ExecutionBinding } | { id: string; root
           store.fence(owner.run);
         };
         admit();
-        const reservation = guard.store.reserve({ reservationId: randomUUID(), kind: "writer",
-          paths: [store.root], purpose: "observation" }, owner.run.ownerId, owner.run);
-        return new OwnedReservation(guard.store, reservation, admit).register("activity-status", ["callback"], "observation");
+        return registerResource({ kind: "managed", authority }, "activity-status", ["callback"], "observation",
+          "independent", ["callback"]);
       },
       listeners: new Set(), retire: new Set() };
     const authority = Object.freeze({ fence: Object.freeze(fence) });
     const read = Object.freeze({ runId: run.runId });
     authorities.set(authority, owner); readers.set(read, owner);
+    const pinExecution = () => {
+      if (!owner.binding) return;
+      const release = store.pinGit({ bindingId: `execution:${run.runId}:${owner.run.phaseEpoch}`, root: store.root,
+        components: [{ component: "source", expected: JSON.stringify(owner.binding) }] });
+      owner.retire.add(async () => release());
+    };
+    pinExecution();
     const taskAuthority: TaskAuthority | undefined = task && Object.freeze({ intentId: run.task!.intentId, epoch: run.epoch });
     if (taskAuthority) taskAuthorities.set(taskAuthority, owner);
+    retryUserDecisionProjections(store);
     if (!("binding" in source)) {
-      slotReservation = owner.slotReservation = guard.reserve({ reservationId: randomUUID(), kind: "assignment-writer", paths: [store.root] }, authority);
-      owner.slotProducer = owner.slotReservation.register("planning-slot", ["host-operation"], "work", "host-return-dependent");
+      owner.slotProducer = registerResource({ kind: "managed", authority }, "planning-slot",
+        ["host-operation"], "work", "host-return-dependent");
       owner.slotProducer.enter();
       owner.planning = new PlanSlot(source.id, store, source.expected, () => {
         if (!owner.active) throw new Error("planning owner retired");
@@ -872,6 +811,7 @@ function openActivity(source: { binding: ExecutionBinding } | { id: string; root
       }, () => {
         checkAuthority(authority);
         if (owner.run.state !== "active") throw new Error(`planning activity is ${owner.run.state}`);
+        guard.assertIdle([source.expected.file]);
       });
     }
     let retiring: Promise<void> | undefined;
@@ -901,7 +841,8 @@ function openActivity(source: { binding: ExecutionBinding } | { id: string; root
           store.enqueue(`run:${next.runId}`, next.binding, { kind: "phase-derived", receiptId: receipt.receiptId, phaseEpoch: next.phaseEpoch });
         });
         owner.run = next; owner.binding = Object.freeze({ ...plan.binding });
-        owner.planning = undefined; owner.slotProducer = undefined; owner.slotReservation = undefined;
+        pinExecution();
+        owner.planning = undefined; owner.slotProducer = undefined;
         const execution = Object.freeze({ fence: Object.freeze({ runId: next.runId, ownerId: next.ownerId, epoch: next.epoch, phaseEpoch: next.phaseEpoch }) });
         authorities.set(execution, owner);
         checkAuthority(execution);
@@ -932,9 +873,8 @@ function openActivity(source: { binding: ExecutionBinding } | { id: string; root
           }));
           const errors = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
           if (errors.length) throw new AggregateError(errors, "planning completion retirement");
-          if (store.all<Reservation>("reservations").some(item => item.runId === owner.run.runId &&
-              item.reservationId !== owner.slotReservation?.reservation.reservationId &&
-              item.state !== "released"))
+          if (store.all<Resource>("resources").some(item => item.runId === owner.run.runId &&
+              item.resourceId !== owner.slotProducer?.ref.resourceId && !store.closureReceipt(item)))
             throw new Error("planning resources remain active or unknown");
           if (!owner.slotProducer?.observe("host-operation", "closed", true)) throw new Error("planning slot remains unsettled");
           owner.run = { ...owner.run, state: "completed", version: owner.run.version + 1, lastFactAt: new Date().toISOString() };
@@ -981,8 +921,8 @@ function openActivity(source: { binding: ExecutionBinding } | { id: string; root
       },
     };
   } catch (error) {
-    // Once admitted, a failed recovery/persistence step is not proof of release.
-    if (!slotReservation) { unownedGuard?.close(); unlock?.(); store.close(); }
+    // No effects have started before this synchronous admission returns.
+    unownedGuard?.close(); unlock?.(); store.close();
     throw error;
   }
 }
@@ -1013,10 +953,12 @@ function installProducerWait(authority: PhaseAuthority, ref: ResourceRef | undef
   const producer = liveProducer(ref);
   if (!producer) return { kind: "unavailable", reason: "producer interrupted or unavailable" };
   if (producer.dependency === "host-return-dependent") return { kind: "deferred", reason: producer.dependency };
-  const reservation = owner.store.get<Reservation>("reservations", ref.reservationId);
-  if (!reservation || reservation.runId !== owner.run.runId || reservation.ownerId !== owner.run.ownerId)
+  // A live registry hit may belong to another root; inspect its own strict snapshot first.
+  const resource = producer.snapshot();
+  if (resource.runId !== owner.run.runId || resource.ownerId !== owner.run.ownerId)
     return { kind: "unavailable", reason: "producer belongs to another owner" };
-  if (reservation.generation !== ref.generation || reservation.state === "released" || producer.snapshot().purpose !== "work")
+  owner.store.exactResource(ref);
+  if (owner.store.closureReceipt(ref) || producer.snapshot().purpose !== "work")
     return { kind: "unavailable", reason: "producer reservation is unavailable" };
   if (!Number.isSafeInteger(afterSequence) || afterSequence < 0 || afterSequence > producer.cursor)
     return { kind: "unavailable", reason: "producer cursor is unavailable" };
@@ -1090,6 +1032,32 @@ export type Disposition = { kind: "continue" | "retry" | "correct" | "phase-comp
   { kind: "defer"; obligationId: string; unitId: string; reason: "host-return-dependent" } |
   { kind: "result-disposition"; obligationId: string; unitId: string; resultId: string; expectedVersion: number;
     reason: string; choice: ResultChoice };
+/** Only the exact native branch receipt resolves a turn whose send may have started. */
+export function observePhaseTurns(store: WorkflowState, runId: string, receiverSessionId: string, branch: readonly unknown[]): void {
+  const run = store.get<RunRecord>("runs", runId);
+  for (const turn of store.all<{ kind?: string; key: string; runId: string; message: {
+    customType: string; content: string; details: { deliveryId: string } }; state: string; cleared: boolean }>("obligations")) {
+    if (turn.kind !== "phase-turn" || turn.runId !== runId || turn.cleared) continue;
+    const observed = run?.sessionId === receiverSessionId && receiptInBranch(turn.message, branch);
+    if (!observed && !(turn.state === "reserved" && ["retiring", "interrupted"].includes(run?.state ?? ""))) continue;
+    store.transaction(() => {
+      store.put("obligations", turn.key, { ...turn, state: observed ? "observed" : "not-invoked", cleared: true });
+      store.enqueue(`run:${runId}`, turn.key, { kind: observed ? "phase-turn-observed" : "phase-turn-not-invoked", key: turn.key });
+    });
+  }
+}
+function assertPriorTurns(root: string, activity: RunRecord["activity"], planId: string,
+  receiverSessionId: string, branch: readonly unknown[]): void {
+  const store = new WorkflowState(root);
+  try {
+    const allPrior = store.all<RunRecord>("runs").filter(item => item.activity === activity && item.planId === planId);
+    for (const run of allPrior) observePhaseTurns(store, run.runId, receiverSessionId, branch);
+    const prior = allPrior.filter(run => run.sessionId === receiverSessionId);
+    if (store.all<{ kind?: string; runId?: string; cleared?: boolean }>("obligations").some(turn =>
+      turn.kind === "phase-turn" && !turn.cleared && prior.some(run => run.runId === turn.runId)))
+      throw new Error("phase turn delivery uncertain for this target; exact receipt required");
+  } finally { store.close(); }
+}
 /** Shared storage/admission only. D owns continuation scheduling and proof arbitration. */
 export function recordObligation(authority: PhaseAuthority, obligation: Obligation): void {
   const owner = checkAuthority(authority);
@@ -1136,7 +1104,7 @@ export function recordDisposition(authority: PhaseAuthority, disposition: Dispos
       if (choice.kind === "consult") {
         const attempt = owner.store.all<AttemptRecord>("attempts").find(item => item.assignmentId === choice.assignmentId);
         if (!choice.question.trim() || !attempt || !["architect", "reviewer", "oracle", "researcher", "scout"].includes(attempt.roleId) ||
-            owner.store.get<Reservation>("reservations", attempt.reservationId)?.runId !== owner.run.runId)
+            owner.store.exactResource(attempt.resource).runId !== owner.run.runId)
           throw new Error("consult requires a real owned consultation and question");
       }
       if (choice.kind === "diagnose" && (!choice.missingEvidence.trim() || !choice.safeRemainingWork.trim()))
@@ -1150,8 +1118,8 @@ export function recordDisposition(authority: PhaseAuthority, disposition: Dispos
           throw new Error("accept has outstanding unit obligations");
         for (const result of results) {
           const attempt = owner.store.get<AttemptRecord>("attempts", result.dispatchId);
-          if (!attempt?.outcome || owner.store.get<Reservation>("reservations", attempt.reservationId)?.state !== "released")
-            throw new Error("accept requires recorded outcomes and released resource barriers");
+          if (attempt?.outcome?.status !== "completed" || !owner.store.closureReceipt(attempt.resource))
+            throw new Error("accept requires completed outcomes and released resource barriers");
         }
         obligation.cleared = true; // This result claim only; never a phase/run completion or hold release.
       }
@@ -1187,28 +1155,49 @@ export function recordDisposition(authority: PhaseAuthority, disposition: Dispos
 
 /** A committed decision and its exact ledger projection have separate outcomes.
  * Inspection retries the durable outbox; it never records the decision again. */
-function projectUserDecisions(authority: PhaseAuthority, retry = true) {
-  const owner = checkAuthority(authority);
+export function retryUserDecisionProjections(store: WorkflowState, runId?: string) {
+  const entries = store.outbox();
+  const accepted = new Set(store.all<{ kind?: string; runId?: string }>("dispositions")
+    .filter(item => item.kind === "execution-acceptance").map(item => item.runId));
   const accepts = (entry: ReturnType<WorkflowState["outbox"]>[number]) => {
     const body = entry.body as Partial<Extract<Disposition, { kind: "result-disposition" }>>;
-    return entry.target === `disposition:${owner.run.runId}` &&
+    return entry.target.startsWith("disposition:") && (!runId || entry.target === `disposition:${runId}`) &&
       body.kind === "result-disposition" && body.choice?.kind === "user-decision";
   };
-  if (retry) owner.store.project(entry => {
-    if (!owner.binding) return "not-applicable"; // Planning has no execution ledger.
-    if (entry.binding !== JSON.stringify(owner.binding)) throw new Error("user decision projection binding is stale");
-    writeExecutionUserDecision(owner.binding, "USER_DECISION_REQUIRED");
+  store.project(entry => {
+    const run = store.get<RunRecord>("runs", entry.target.slice("disposition:".length));
+    const binding = JSON.parse(entry.binding) as Partial<ExecutionBinding> & { file?: string; objectHash?: string };
+    if (!run || run.binding !== entry.binding) throw new Error("user decision projection binding is stale");
+    if (binding.file && "objectHash" in binding) return "not-applicable"; // Draft planning has no ledger.
+    if (binding.executionRoot !== store.root || !binding.planId) throw new Error("user decision projection target is unavailable");
+    if (accepted.has(run.runId) || entries.some(later => {
+      if (later.sequence <= entry.sequence || (later.body as { kind?: string }).kind !== "opened" ||
+          !later.target.startsWith("run:")) return false;
+      const successor = store.get<RunRecord>("runs", later.target.slice("run:".length));
+      return successor && successor.runId !== run.runId && successor.planId === run.planId &&
+        successor.phase === "execution" &&
+        (["active", "waiting", "blocked"].includes(successor.state) || accepted.has(successor.runId));
+    })) return "not-applicable";
+    writeExecutionUserDecision(binding as ExecutionBinding, "USER_DECISION_REQUIRED");
     return "applied";
   }, accepts);
-  return owner.store.outbox().filter(accepts).map(entry => ({
+  return store.outbox().filter(accepts).map(entry => ({
     sequence: entry.sequence, state: entry.state,
     diagnostic: (entry.body as { projectionDiagnostic?: string }).projectionDiagnostic,
   }));
 }
+function projectUserDecisions(authority: PhaseAuthority, retry = true) {
+  const owner = checkAuthority(authority);
+  if (retry) return retryUserDecisionProjections(owner.store, owner.run.runId);
+  return owner.store.outbox().filter(entry => entry.target === `disposition:${owner.run.runId}` &&
+    (entry.body as Partial<Extract<Disposition, { kind: "result-disposition" }>>).choice?.kind === "user-decision")
+    .map(entry => ({ sequence: entry.sequence, state: entry.state,
+      diagnostic: (entry.body as { projectionDiagnostic?: string }).projectionDiagnostic }));
+}
 
 function registerResultDispositionTool(pi: ExtensionAPI): void {
   const strict = { additionalProperties: false } as const, text = Type.String({ minLength: 1 });
-  const reference = Type.Object({ resourceId: text, producerId: text, reservationId: text, generation: Type.Integer({ minimum: 0 }) }, strict);
+  const reference = Type.Object({ resourceId: text, producerId: text, generation: Type.Integer({ minimum: 0 }) }, strict);
   guardToolRegistrations(pi, "read").registerTool({
     name: "execution_disposition", label: "Inspect or dispose a result obligation",
     description: "Foreground managed coordinator only. Record explicit reasoned claims after exact receipt and an effective turn boundary. Continue does not dispatch; wait/consult/diagnose do not accept or release; accept covers only the named result, never phase/run completion.",
@@ -1240,13 +1229,12 @@ function registerResultDispositionTool(pi: ExtensionAPI): void {
       }
       const userDecisionProjections = projectUserDecisions(authority, input.op === "inspect");
       const details = { admissionId: owner.run.runId, userDecisionProjections,
-        waitProducers: [...liveProducers.values()].filter(producer => {
-          const reservation = owner.store.get<Reservation>("reservations", producer.ref.reservationId);
-          return producer.live && producer.dependency === "independent" &&
-            reservation?.runId === owner.run.runId && reservation.ownerId === owner.run.ownerId &&
-            reservation.generation === producer.ref.generation && reservation.state !== "released" &&
-            producer.snapshot().purpose === "work";
-        }).map(producer => ({ producerRef: producer.ref, afterSequence: producer.cursor, adapter: producer.snapshot().adapter })),
+        waitProducers: owner.store.all<Resource>("resources").flatMap(resource => {
+          if (resource.runId !== owner.run.runId || resource.ownerId !== owner.run.ownerId || resource.purpose !== "work") return [];
+          const producer = liveProducer(resource);
+          return producer?.dependency === "independent"
+            ? [{ producerRef: producer.ref, afterSequence: producer.cursor, adapter: resource.adapter }] : [];
+        }),
         obligations: owner.store.all<ResultObligation>("obligations").filter(item => item.runId === owner.run.runId && item.resultId)
           .map(({ message: _privateExactReceipt, ...item }) => item),
         dispositions: owner.store.all<{ runId?: string }>("dispositions").filter(item => item.runId === owner.run.runId) };
@@ -1259,6 +1247,7 @@ function registerResultDispositionTool(pi: ExtensionAPI): void {
 export function registerWorkflowCommands(pi: ExtensionAPI): void;
 export function registerWorkflowCommands(pi: ExtensionAPI, options: { shutdown: false }): () => Promise<void>;
 export function registerWorkflowCommands(pi: ExtensionAPI, options?: { shutdown: false }): void | (() => Promise<void>) {
+  registerGitTools(pi);
   let invocation: { identity: string; manager: object; sessionId: string; activity: ReturnType<typeof openActivity>; unbind: () => void; cleanup?: () => void; executePolicy?: string; taskId?: string } | undefined;
   let pending: { identity: string; manager: object; sessionId: string; ticket: number; taskId?: string } | undefined;
   const sendTurn = (activity: ReturnType<typeof openActivity>, context: CallContext, effect: () => void) => {
@@ -1269,12 +1258,28 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options?: { shutdown:
       current.sessionId === manager.getSessionId?.() && activity.current();
     return withReceiverContext(manager, context, owns, effect);
   };
+  const sendPhaseTurn = (activity: ReturnType<typeof openActivity>, context: CallContext, authority: PhaseAuthority,
+    key: string, message: { customType: string; content: string; display: boolean; details: { deliveryId: string; [key: string]: unknown } }) => {
+    const owner = checkAuthority(authority), run = owner.store.fence(authority.fence);
+    const previous = owner.store.get<{ state: string }>("obligations", key);
+    if (previous?.state === "observed") return;
+    if (previous) throw new Error("phase turn delivery uncertain; inspect exact outbox before recovery");
+    const record = { kind: "phase-turn", key, message, runId: run.runId, cleared: false };
+    owner.store.transaction(() => {
+      owner.store.put("obligations", key, { ...record, state: "reserved" });
+      owner.store.enqueue(`run:${run.runId}`, run.binding, { kind: "phase-turn-reserved", key, message, phaseEpoch: run.phaseEpoch });
+    });
+    sendTurn(activity, context, () => {
+      owner.store.transaction(() => owner.store.put("obligations", key, { ...record, state: "invocation-started" }));
+      pi.sendMessage(message, { triggerTurn: true });
+    });
+    owner.store.transaction(() => owner.store.put("obligations", key, { ...record, state: "returned" }));
+    observePhaseTurns(owner.store, run.runId, owner.run.sessionId,
+      (owner.manager as { getBranch?: () => readonly unknown[] }).getBranch?.() ?? []);
+  };
   const sendTaskTurn = (activity: ReturnType<typeof openActivity>, context: CallContext, authority: PhaseAuthority, policy: string, resume = false) => {
     const owner = checkAuthority(authority), run = owner.store.fence(authority.fence);
     const key = `task-turn:${run.task!.intentId}:${run.phaseEpoch}${resume ? `:resume:${run.epoch}` : ""}`;
-    const previous = owner.store.get<{ state: string }>("obligations", key);
-    if (previous?.state === "sent") return;
-    if (previous) throw new Error("task turn delivery uncertain; inspect exact outbox before recovery");
     const message = { customType: "pitako.workflow.task", deliveryId: key,
       content: deliveryContent("context", { producer: "workflow-task", ownerSessionId: run.sessionId,
         foregroundRevision: run.epoch }, {
@@ -1282,15 +1287,8 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options?: { shutdown:
         phaseEpoch: run.phaseEpoch, resume,
         instruction: `${run.phase === "planning" ? "Plan the work requested in the current conversation, preserving its goals and constraints. The host has chosen the local plan ID; do not ask the user for one. " : ""}Use the existing ${run.phase} operations. Planning completion derives execution automatically, never a standalone /execute or a new human instruction. No publication.`,
       }, run.phase, key),
-      display: true, details: { runId: run.runId, phaseEpoch: run.phaseEpoch, key } };
-    owner.store.transaction(() => {
-      owner.store.put("obligations", key, { kind: "phase-turn", key, message, state: "reserved", cleared: false, runId: run.runId });
-      owner.store.enqueue(`run:${run.runId}`, run.binding, { kind: "task-phase-turn", key, message, phaseEpoch: run.phaseEpoch });
-    });
-    checkAuthority(authority);
-    sendTurn(activity, context, () => pi.sendMessage(message, { triggerTurn: true }));
-    owner.store.transaction(() => owner.store.put("obligations", key,
-      { kind: "phase-turn", key, message, state: "sent", cleared: true, runId: run.runId }));
+      display: true, details: { runId: run.runId, phaseEpoch: run.phaseEpoch, key, deliveryId: key } };
+    sendPhaseTurn(activity, context, authority, key, message);
   };
   registerPlanningTools(pi, {
     async afterFreeze(authority, receipt) {
@@ -1350,6 +1348,7 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options?: { shutdown:
         const sessionId = manager.getSessionId();
         const identity = JSON.stringify(plan.binding);
         if (invocation?.identity === identity && invocation.manager === manager && invocation.activity.current()) return;
+        assertPriorTurns(plan.binding.executionRoot, "execute", plan.binding.planId, sessionId, manager.getBranch?.() ?? []);
         const closing = retire(), ticket = revision;
         pendingTicket = ticket;
         pending = { identity, manager, sessionId, ticket };
@@ -1366,10 +1365,10 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options?: { shutdown:
         pending = undefined;
         if (ctx.signal?.aborted) { await retire(); throw new Error("workflow invocation aborted"); }
         ctx.signal?.addEventListener("abort", () => { if (invocation?.activity === activity) void retire(); }, { once: true });
-        sendTurn(activity, activity.context, () => pi.sendMessage({ customType: "pitako.workflow.execute",
+        const key = `phase-turn:${activity.authority.fence.runId}:${activity.authority.fence.phaseEpoch}`;
+        sendPhaseTurn(activity, activity.context, activity.authority, key, { customType: "pitako.workflow.execute",
           content: `${policy}\n\nNative /execute invocation. Frozen binding:\n${identity}`,
-          display: true, details: { runId: activity.authority.fence.runId, source: "frozen" } },
-        { triggerTurn: true }));
+          display: true, details: { runId: activity.authority.fence.runId, source: "frozen", deliveryId: key } });
       } catch (error) { reject(ctx, error); }
       finally { if (pendingTicket !== undefined && pending?.ticket === pendingTicket) pending = undefined; }
     },
@@ -1393,6 +1392,7 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options?: { shutdown:
         const manager = ctx.sessionManager, sessionId = manager.getSessionId();
         const identity = JSON.stringify({ activity: "plan", root, id, reopen });
         if (invocation?.identity === identity && invocation.manager === manager && invocation.activity.current()) return;
+        assertPriorTurns(root, "plan", id, sessionId, manager.getBranch?.() ?? []);
         const closing = retire(), ticket = revision;
         pendingTicket = ticket;
         pending = { identity, manager, sessionId, ticket };
@@ -1411,8 +1411,9 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options?: { shutdown:
         pending = undefined;
         if (ctx.signal?.aborted) { await retire(); throw new Error("workflow invocation aborted"); }
         ctx.signal?.addEventListener("abort", () => { if (invocation?.activity === activity) void retire(); }, { once: true });
-        sendTurn(activity, activity.context, () => pi.sendMessage({ customType: "pitako.workflow.plan", content: `${policy}\n\nNative managed /plan. Local slot ${id}; host revision ${String(activity.readBoundPlan().meta?.revision ?? "absent")}. Use planning operations; no generic writes or execution ledger.`,
-          display: true, details: { runId: activity.authority.fence.runId, source: "draft" } }, { triggerTurn: true }));
+        const key = `phase-turn:${activity.authority.fence.runId}:${activity.authority.fence.phaseEpoch}`;
+        sendPhaseTurn(activity, activity.context, activity.authority, key, { customType: "pitako.workflow.plan", content: `${policy}\n\nNative managed /plan. Local slot ${id}; host revision ${String(activity.readBoundPlan().meta?.revision ?? "absent")}. Use planning operations; no generic writes or execution ledger.`,
+          display: true, details: { runId: activity.authority.fence.runId, source: "draft", deliveryId: key } });
       } catch (error) { reject(ctx, error); }
       finally { if (pendingTicket !== undefined && pending?.ticket === pendingTicket) pending = undefined; }
     },
@@ -1456,8 +1457,9 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options?: { shutdown:
           const previous = state.all<RunRecord>("runs").filter(run => run.activity === "task" && run.planId === id).at(-1);
           previousRun = previous;
           if (previous?.state === "completed") throw new Error("task is already completed");
-          if (previous && state.all<{ runId?: string; kind?: string; state?: string }>("obligations")
-              .some(item => item.runId === previous.runId && item.kind === "phase-turn" && item.state !== "sent"))
+          if (previous) observePhaseTurns(state, previous.runId, manager.getSessionId(), manager.getBranch?.() ?? []);
+          if (previous && state.all<{ runId?: string; kind?: string; cleared?: boolean }>("obligations")
+              .some(item => item.runId === previous.runId && item.kind === "phase-turn" && !item.cleared))
             throw new Error("task turn delivery uncertain; exact outbox recovery required");
           const receipt = previous && taskFreezeReceipt(state, previous);
           if (expected.meta && expected.meta.status !== "draft" && !receipt)
@@ -1465,9 +1467,6 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options?: { shutdown:
           if (receipt && (receipt.newHash !== expected.fileHash || receipt.snapshot.text !== expected.text))
             throw new Error("task FreezeReceipt source changed");
           const ownedRun = invocation?.activity.authority.fence.runId;
-          if (state.all<Reservation>("reservations").some(r => r.state !== "released" && r.runId !== ownedRun) ||
-              state.all<TeamHoldRecord>("holds").some(h => !h.cleared))
-            throw new Error("task capacity is held by active or unknown work");
           if (previous && previous.state !== "retiring" && previous.state !== "interrupted" && previous.runId !== ownedRun)
             throw new Error("task owner is not released; exact recovery required");
           resume = !!previous;
@@ -1494,9 +1493,6 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options?: { shutdown:
               previous?.epoch !== previousRun?.epoch || previous?.phaseEpoch !== previousRun?.phaseEpoch ||
               previous?.task?.intentId !== previousRun?.task?.intentId)
             throw new Error("task predecessor fence changed before turn");
-          if (recheck.all<Reservation>("reservations").some(r => r.state !== "released") ||
-              recheck.all<TeamHoldRecord>("holds").some(h => !h.cleared))
-            throw new Error("task capacity changed before turn");
         } finally { recheck.close(); }
         const activity = openTaskActivity(id, root, expected, manager, sessionId);
         let unbind: () => void;

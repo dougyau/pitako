@@ -8,7 +8,7 @@ import { validateSubmission } from "../extensions/architecture/protocol.ts";
 import { validateReview } from "../extensions/review/policy.ts";
 
 const { fixture, setup } = architectureFixture();
-const submit = (session: any, id: string, body: any) => session.boundTools.get("architecture_submit").execute(id, { submissionId: id, body }, undefined, undefined, { sessionManager: session.sessionManager });
+const submit = (session: any, id: string, body: any) => session.boundTools.get("architecture_submit").execute(id, { body }, undefined, undefined, { sessionManager: session.sessionManager });
 const doubt = (index: number) => ({ question: `Question ${index}`, purpose: "Original coverage" });
 const response = (request: any) => ({ kind: "consultation-response", doubtIds: request.context.request.doubtIds, answer: "Evidence", evidence: [], limits: [], doubts: [] });
 const contribution = { kind: "contribution", proposal: "Bounded design", arguments: [], objections: [], doubts: [] };
@@ -16,13 +16,13 @@ type LocalRecord = { id: string; stage?: string; kind?: string; author?: string;
   body?: { resolutions?: { doubtId: string }[] } };
 test("composition strings preserve complete values with search and full-string provider matching", () => {
   const snapshotId = "e2de7680-ca07-414e-9ef9-f7aad49ff36e";
-  const body: Composition = { kind: "composition", snapshotId, reason: "Choose independent coverage", specialists: [
+  const body: Composition = { kind: "composition", reason: "Choose independent coverage", specialists: [
     { kind: "add", candidateRef: "general:0", mandate: "Inspect complete argument strings", reason: "Preserve independent evidence" },
   ] };
   for (const schema of [architectureSchema, reviewSchema])
-    expect(Value.Check(schema, { submissionId: "composition", body })).toBe(true);
+    expect(Value.Check(schema, { body })).toBe(true);
   const [retain, add] = specialistChoiceSchema.anyOf;
-  for (const schema of [compositionSchema.properties.snapshotId, compositionSchema.properties.reason,
+  for (const schema of [compositionSchema.properties.reason,
     retain.properties.memberId, retain.properties.mandate, retain.properties.reason,
     add.properties.candidateRef, add.properties.mandate, add.properties.reason]) {
     if (!("pattern" in schema) || typeof schema.pattern !== "string")
@@ -38,7 +38,7 @@ test("composition strings preserve complete values with search and full-string p
 });
 test("shared composition validates the frozen total set for architecture and review", () => {
   const basis: CompositionBasis = { snapshotId: "frozen", candidateRefs: ["candidate"], retainableMemberIds: ["one", "two"] };
-  const body: Composition = { kind: "composition", snapshotId: "frozen", reason: "Choose total roster", specialists: [
+  const body: Composition = { kind: "composition", reason: "Choose total roster", specialists: [
     { kind: "retain", memberId: "two", mandate: "Updated", reason: "Continuity" },
     { kind: "add", candidateRef: "candidate", mandate: "Fresh", reason: "Independence" },
     { kind: "add", candidateRef: "candidate", mandate: "Another", reason: "Independent same policy" },
@@ -62,8 +62,8 @@ test("shared composition validates the frozen total set for architecture and rev
     { ...body, specialists: [{ kind: "retain", memberId: "support", mandate: "M", reason: "R" }] },
   ]) {
     expect(() => planComposition(bad as Composition, basis)).toThrow();
-    expect(() => validateSubmission(grant, { submissionId: "bad", body: bad })).toThrow();
-    expect(() => validateReview(reviewGrant, { submissionId: "bad", body: bad })).toThrow();
+    expect(() => validateSubmission(grant, { body: bad })).toThrow();
+    expect(() => validateReview(reviewGrant, { body: bad })).toThrow();
   }
 });
 async function localRecords(s: Awaited<ReturnType<typeof setup>>, roomId: string, first?: any) {
@@ -157,7 +157,7 @@ for (const directOnly of [false, true]) test(`${directOnly ? "all-direct" : "del
 }));
 
 for (const invalid of ["plan-duplicate", "plan-extra", "cycle", "response", "duplicate-support", "unrelated-support", "missing-own", "failed-prerequisite"] as const) {
-  test(`registered contextual ${invalid} rejects before provisional, then a new ID corrects the same turn`, fixture.ownedCase(`contextual ${invalid}`, async () => {
+  test(`registered contextual ${invalid} rejects before provisional, then a distinct body corrects the same turn`, fixture.ownedCase(`contextual ${invalid}`, async () => {
     let rejected = 0; const calls: string[] = [];
     const s = await setup({ async prompt(session, request, body) {
       if (request.stage === "preparation") return { kind: "preparation", analysis: "Ready", doubts: session.model.id === "director" ? [] : [doubt(0), doubt(1), doubt(2)] };
@@ -216,7 +216,7 @@ for (const candidate of ["rejected", "valid", "aborted"] as const) test(`provide
     if (request.stage === "preparation" && session.model.id !== "director") {
       calls++;
       const abort = new AbortController(); abort.abort();
-      const receipt = candidate === "aborted" ? await session.boundTools.get("architecture_submit").execute("aborted", { submissionId: "aborted", body }, abort.signal, undefined, { sessionManager: session.sessionManager }) :
+      const receipt = candidate === "aborted" ? await session.boundTools.get("architecture_submit").execute("aborted", { body }, abort.signal, undefined, { sessionManager: session.sessionManager }) :
         await submit(session, "first", candidate === "valid" ? body : { ...body, extra: "invalid structure" });
       expect(receipt.isError === true).toBe(candidate !== "valid"); throw Error("503 Service Unavailable");
     }
@@ -234,17 +234,18 @@ test("begin cannot reset a consumed correction budget; only open initializes a n
   const identity = { instanceId: "instance", turnId: "turn", attemptId: "attempt", sessionId: "session" };
   const ctx = { sessionManager: { getSessionId: () => "session", getSessionFile: () => "/fixture" } };
   const grant = { roomId: "room", memberId: "member", assignmentId: "assignment", snapshotId: "snapshot", round: 0, rules: { kind: "preparation" as const } };
-  attached.open(grant); attached.begin(identity); attached.bind({ appendEntry() {} } as never, ctx as never);
-  const bad = { submissionId: "bad", body: { kind: "preparation" } };
-  expect(() => attached.submit("bad", bad, ctx as never, identity)).toThrow("correctionsLeft");
+  attached.bind({ appendEntry() {} } as never, ctx as never);
+  attached.open(grant); let binding = attached.begin(identity); attached.prompt(identity);
+  const bad = { body: { kind: "preparation" } };
+  expect(() => attached.submit(binding, "bad", bad, ctx as never, identity)).toThrow("correctionsLeft");
   expect(attached.attempted).toBe(true); expect(() => attached.begin({ ...identity, attemptId: "reopen" })).toThrow("already attempted");
-  expect(() => attached.submit("repeat", bad, ctx as never, identity)).toThrow('"correctionsLeft":1');
-  expect(() => attached.submit("second", { ...bad, submissionId: "second" }, ctx as never, identity)).toThrow('"correctionsLeft":0');
-  expect(() => attached.submit("third", { ...bad, submissionId: "third" }, ctx as never, identity)).toThrow("budget exhausted");
+  expect(() => attached.submit(binding, "repeat", bad, ctx as never, identity)).toThrow('"correctionsLeft":1');
+  expect(() => attached.submit(binding, "second", { body: { ...bad.body, analysis: "second invalid" } }, ctx as never, identity)).toThrow('"correctionsLeft":0');
+  expect(() => attached.submit(binding, "third", { body: { ...bad.body, analysis: "third invalid" } }, ctx as never, identity)).toThrow("budget exhausted");
   expect(() => attached.settle(true)).toThrow("budget exhausted"); expect(published).toEqual([]);
-  attached.open(grant); attached.begin(identity);
-  const value = { submissionId: "new", body: { kind: "preparation", analysis: "Valid", doubts: [] } };
-  const receipt = attached.submit("new", value, ctx as never, identity); expect(attached.submit("retry", structuredClone(value), ctx as never, identity)).toEqual(receipt);
+  attached.open(grant); binding = attached.begin(identity); attached.prompt(identity);
+  const value = { body: { kind: "preparation", analysis: "Valid", doubts: [] } };
+  const receipt = attached.submit(binding, "new", value, ctx as never, identity); expect(attached.submit(binding, "retry", structuredClone(value), ctx as never, identity)).toEqual(receipt);
   attached.settle(true); expect(published).toHaveLength(1);
 });
 
@@ -259,11 +260,11 @@ for (const mode of ["exhausted", "locked"] as const) test(`registered ${mode} gr
       const first = await submit(session, "bad-one", bad);
       expect(first.details).toMatchObject({ code: "structure", stage: "preparation", correctionsLeft: 1 });
       expect(await submit(session, "bad-one", structuredClone(bad))).toEqual(first);
-      expect((await submit(session, "bad-two", bad)).details.correctionsLeft).toBe(0);
+      expect((await submit(session, "bad-two", { ...bad, extra: "different invalid" })).details.correctionsLeft).toBe(0);
       expect((await submit(session, "third-valid", body)).isError).toBe(true);
     } else {
       const valid = await submit(session, "valid", body); expect(valid.isError).not.toBe(true);
-      expect((await submit(session, "replacement", body)).isError).toBe(true);
+      expect((await submit(session, "replacement", { ...body, analysis: "Replacement" })).isError).toBe(true);
     }
     return false;
   } });
@@ -315,3 +316,68 @@ test("transitive prerequisites authorize citations and preserve stable request o
     expect(boundary.resolutions[0].provenance.responses.every((r: any) => r.status === "completed" && r.assignmentId && r.messageId)).toBe(true);
   } finally { await s.close(); }
 }));
+
+test("definition identity and native provenance are checked before candidates or duplicate lookup", () => {
+  let current = true, file = "/native-A";
+  const ctx = { sessionManager: { getSessionId: () => "session", getSessionFile: () => file } };
+  const attached = participant({ current: () => current, publish: message => ({ ...message, id: "published", ordinal: 1,
+    roomId: "room", assignmentId: "assignment", memberId: "member", author: "architect", snapshotId: "snapshot" }) });
+  const identity = { instanceId: "instance", turnId: "turn", attemptId: "attempt", sessionId: "session", historyId: "history" };
+  const grant = { roomId: "room", memberId: "member", assignmentId: "assignment", snapshotId: "snapshot", round: 1, rules: { kind: "preparation" as const } };
+  attached.bind({ appendEntry() {} } as never, ctx as never); attached.open(grant);
+  const binding = attached.begin(identity), value = { body: { kind: "preparation", analysis: "Valid", doubts: [] } };
+  expect(() => attached.submit(binding, "before-prompt", value, ctx as never, identity)).toThrow("definition generation");
+  attached.prompt(identity);
+  expect(() => attached.submit({ ...binding }, "forged", value, ctx as never, identity)).toThrow("definition generation");
+  for (const key of Object.keys(identity)) expect(() => attached.submit(binding, "textual", value, ctx as never,
+    { ...identity, [key]: "another" })).toThrow("turn grant");
+  expect(() => attached.submit(binding, "foreign", value, { sessionManager: { ...ctx.sessionManager } } as never, identity)).toThrow("caller mismatch");
+  file = "/another-native-history";
+  expect(() => attached.submit(binding, "history", value, ctx as never, identity)).toThrow("caller binding retired");
+  file = "/native-A";
+  expect(attached.attempted).toBe(false);
+  const receipt = attached.submit(binding, "first", value, ctx as never, identity);
+  expect(attached.submit(binding, "alias", { body: { doubts: [], analysis: "Valid", kind: "preparation" } }, ctx as never, identity)).toEqual(receipt);
+  current = false;
+  expect(() => attached.submit(binding, "alias", value, ctx as never, identity)).toThrow("grant retired");
+  current = true;
+  attached.endPrompt(identity);
+  expect(() => attached.submit(binding, "alias", value, ctx as never, identity)).toThrow("definition generation");
+  const message = attached.settle(true);
+  expect(message.submission).toEqual({ version: 2, provenance: "host-bound" });
+  expect(message.native.persistence).toBe("unconfirmed");
+  expect(() => attached.submit(binding, "first", value, ctx as never, identity)).toThrow("grant retired");
+});
+
+for (const after of ["rejected", "provisional"] as const) test(`reused callback id conflicts after ${after}, including an idempotent alias`, () => {
+  const attached = participant({ current: () => true, publish: message => ({ ...message, id: "published", ordinal: 1,
+    roomId: "room", assignmentId: "assignment", memberId: "member", author: "architect", snapshotId: "snapshot" }) });
+  const ctx = { sessionManager: { getSessionId: () => "session", getSessionFile: () => "/native" } };
+  const identity = { instanceId: "instance", turnId: "turn", attemptId: "attempt", sessionId: "session" };
+  attached.bind({ appendEntry() {} } as never, ctx as never);
+  attached.open({ roomId: "room", memberId: "member", assignmentId: "assignment", snapshotId: "snapshot", round: 1, rules: { kind: "preparation" } });
+  const binding = attached.begin(identity), value = { body: after === "rejected" ? { kind: "preparation" }
+    : { kind: "preparation", analysis: "Original", doubts: [] } };
+  attached.prompt(identity);
+  for (const id of ["first", "alias"]) {
+    if (after === "rejected") expect(() => attached.submit(binding, id, value, ctx as never, identity)).toThrow('"correctionsLeft":1');
+    else expect(attached.submit(binding, id, value, ctx as never, identity)).toMatchObject({ state: "provisional" });
+  }
+  expect(() => attached.submit(binding, "alias", { body: { kind: "preparation", analysis: "Different", doubts: [] } }, ctx as never, identity)).toThrow("toolCallId");
+  expect(() => attached.settle(true)).toThrow("toolCallId");
+});
+
+
+test("a new native caller with matching text revokes the executable and cannot settle its predecessor", () => {
+  const attached = participant({ current: () => true, publish: () => { throw new Error("must not publish"); } });
+  const native = () => ({ sessionManager: { getSessionId: () => "same-session", getSessionFile: () => "/same-file" } });
+  const ctx = native(), identity = { instanceId: "instance", turnId: "turn", attemptId: "attempt", sessionId: "same-session" };
+  attached.bind({ appendEntry() {} } as never, ctx as never);
+  attached.open({ roomId: "room", memberId: "member", assignmentId: "assignment", snapshotId: "snapshot", round: 1, rules: { kind: "preparation" } });
+  const binding = attached.begin(identity); attached.prompt(identity);
+  const value = { body: { kind: "preparation", analysis: "Original", doubts: [] } };
+  attached.submit(binding, "accepted", value, ctx as never, identity);
+  attached.bind({ appendEntry() {} } as never, native() as never);
+  expect(() => attached.submit(binding, "accepted", value, ctx as never, identity)).toThrow("definition generation");
+  expect(() => attached.settle(true)).toThrow("caller mismatch");
+});

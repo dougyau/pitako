@@ -6,7 +6,7 @@ import { mergeKnowledge, type Plan, type Knowledge, type ConsultationResponse, t
 const finding: Finding = { key: "risk", materiality: "blocking", contract: "Author authority", reference: "source:12",
   consequence: "Erased evidence", basis: { kind: "failure", path: "A calls B without authority", evidence: ["source:12"] } };
 const message = (id: string, memberId: string, body: ReviewBody): TableMessage & { body: ReviewBody } => ({
-  id, memberId, author: memberId, assignmentId: `assignment-${memberId}`, roomId: "room", snapshotId: "snapshot", ordinal: 1,
+  submission: { version: 2, provenance: "host-bound" }, id, memberId, author: memberId, assignmentId: `assignment-${memberId}`, roomId: "room", snapshotId: "snapshot", ordinal: 1,
   stage: body.kind, body, turnId: id, attemptId: id, native: { sessionId: memberId, toolCallId: id, persistence: "unconfirmed" }, doubts: [],
 });
 function setup() {
@@ -21,7 +21,7 @@ function setup() {
     newFindings: [], evidence: [], limits: [], pending: [] });
   return { policy, grant, synthesis };
 }
-const submit = (body: ReviewBody) => ({ submissionId: "one", body });
+const submit = (body: ReviewBody) => ({ body });
 
 test("incoming snapshots, author-only modifications and withdrawal history", () => {
   const { policy, grant } = setup(), incoming = grant("peer"), id = policy.findings[0]!.id;

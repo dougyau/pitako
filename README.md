@@ -360,6 +360,8 @@ Pi-only, RPC and child sessions do not start the pane broker.
 
 Native `/task [local-plan-id]` authorizes the combined local planning→execution workflow, without publication. With no ID, it uses the current conversation and chooses a local plan ID. Repeating it while the same task is active is a no-op; a stopped task requires its explicit ID to resume. With no ID, it does not replace an active `/plan`. Accepted Freeze derives execution under the same task intent, without a separate `/execute`.
 
+`workflow_status` reads the latest local workflow run or an exact `runId`. It shows attempt outcomes, closure evidence, delivery state, ledger projection diagnostics, and path restrictions. A cold read cannot establish a live owner or physical closure. `/plan`, `/execute`, and `/task` tie an uncertain turn send to its actual dispatch and native receiver. Replay of that dispatch waits for an exact receipt in that receiver's branch, or supported proof that a reserved send was never invoked. Unrelated plans, receivers, and queries remain independent. A closed failed or cancelled attempt remains in history while current gates, released review, and reasoned acceptance can finish the run. An outcome or terminal status alone never proves closure or acceptance.
+
 `/skill:pre-pr [base=<local-ref>]` prepares the current worktree diff for first or later publication without `$plan`, a frozen plan, or `$execute`. It never commits or performs remote actions.
 
 Artifacts live in the workspace (git root, or the current directory outside a repository):

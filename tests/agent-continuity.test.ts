@@ -6,7 +6,7 @@ import path from "node:path";
 import { SessionManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Value } from "typebox/value";
 import pitako from "../extensions/index.ts";
-import { bindCallContext, openExecuteActivity, openPlanActivity, Producer, recordDisposition, reserveEffect, RootGuard, statusOwner, waitForProducer, type ResultObligation } from "../extensions/workflow-engine.ts";
+import { bindCallContext, openExecuteActivity, openPlanActivity, Producer, recordDisposition, registerWorkflowCommands, reserveEffect, RootGuard, statusOwner, waitForProducer, type ResultObligation } from "../extensions/workflow-engine.ts";
 import { snapshotPlan } from "../extensions/workflow-planning.ts";
 import { WorkflowState } from "../extensions/workflow-state.ts";
 import { ledgerFile, openExecutionPlan, planFile } from "../extensions/workflow.ts";
@@ -199,12 +199,57 @@ for (const blocked of ["legacy-lock", "ledger-binding", "file-failure"] as const
       if (blocked === "file-failure") { rmSync(file, { recursive: true }); renameSync(`${file}.saved`, file); }
       if (blocked === "ledger-binding") writeFileSync(file, before);
     }
+    const guard = new RootGuard(host.root);
+    try {
+      const independent = guard.reserve({ reservationId: `independent-${blocked}`, kind: "gates",
+        paths: [path.join(host.root, "independent")] }).register("independent-work", ["host-operation"]);
+      independent.enter(); independent.observe("host-operation", "closed", true);
+      expect(host.owner.store.outbox().filter(item => item.target === `disposition:${host.owner.run.runId}`)
+        .at(-1)?.state).toBe("applied");
+    } finally { guard.close(); }
     const retried = await host.invoke({ op: "inspect" });
     expect(retried.details.userDecisionProjections).toEqual([expect.objectContaining({ state: "applied" })]);
     expect(readFileSync(file, "utf8")).toBe(before.replace(/^status: running$/m, "status: USER_DECISION_REQUIRED"));
     expect(host.owner.store.all<any>("dispositions").filter(item => item.choice?.kind === "user-decision")).toHaveLength(1);
   }));
 }
+
+test("a newer /execute run makes an older blocked decision in the same ledger not applicable", fixture.ownedCase("superseded decision", async () => {
+  const host = await effectiveResult(), obligation = host.obligations()[0]!;
+  const file = ledgerFile("continuity", host.root), before = readFileSync(file, "utf8"), lock = `${file}.lock`;
+  mkdirSync(lock);
+  try {
+    const decision = await host.invoke({ op: "record", obligationId: obligation.obligationId,
+      expectedVersion: obligation.version, reason: "External choice remains unresolved for this old attempt",
+      choice: { kind: "user-decision", question: "Which outcome?", options: ["Keep", "Expand"],
+        boundary: "Outside old scope", evidenceRefs: [obligation.obligationId] } });
+    expect(decision.details.userDecisionProjections).toEqual([expect.objectContaining({ state: "blocked" })]);
+  } finally { rmSync(lock, { recursive: true }); }
+  await host.activity.retire();
+  const commands = new Map<string, any>(), branch: any[] = [];
+  const manager = { getSessionId: () => "independent-new-receiver", getBranch: () => branch };
+  const shutdown = registerWorkflowCommands({ registerCommand(name: string, definition: any) { commands.set(name, definition); },
+    registerTool() {}, on() {}, sendMessage(message: any) { branch.push({ type: "custom_message", id: "new-receipt", ...message }); } } as any,
+    { shutdown: false });
+  try {
+    const notices: string[] = [];
+    await commands.get("execute").handler("continuity", { cwd: host.root, sessionManager: manager, hasUI: true,
+      ui: { notify(message: string) { notices.push(message); } }, async waitForIdle() {} });
+    expect(notices).toEqual([]);
+    expect(branch).toHaveLength(1);
+    const old = host.owner.store.outbox().find(entry => entry.target === `disposition:${host.owner.run.runId}` &&
+      (entry.body as any).choice?.kind === "user-decision");
+    expect(old).toMatchObject({ state: "not-applicable" });
+    expect(readFileSync(file, "utf8")).toBe(before);
+    const guard = new RootGuard(host.root);
+    try {
+      const independent = guard.reserve({ reservationId: "after-supersession", kind: "gates",
+        paths: [path.join(host.root, "independent")] }).register("independent-work", ["host-operation"]);
+      independent.enter(); independent.observe("host-operation", "closed", true);
+    } finally { guard.close(); }
+    expect(readFileSync(file, "utf8")).toBe(before);
+  } finally { await shutdown(); }
+}));
 
 test("native disposition inspection works during planning without admitting generic mutations", fixture.ownedCase("planning disposition admission", async () => {
   const host = await mounted("planning");
@@ -352,7 +397,8 @@ test("wait inspection is observational and excludes absent, foreign, lost, histo
     const first = await host.invoke({ op: "inspect" }), second = await host.invoke({ op: "inspect" });
     expect(first.details).toEqual(second.details);
     expect(first.details.waitProducers.map((item: any) => item.adapter)).toEqual(["independent-proof"]);
-    expect(Object.keys(first.details.waitProducers[0].producerRef).sort()).toEqual(["generation", "producerId", "reservationId", "resourceId"]);
+    expect(first.details.waitProducers[0].producerRef).toStrictEqual(independent.ref);
+    expect(Object.keys(first.details.waitProducers[0].producerRef).sort()).toEqual(["generation", "producerId", "resourceId"]);
     expect(host.owner.store.outbox()).toEqual(before);
     expect(host.owner.store.all("dispositions")).toEqual(dispositions);
     let ready = 0;
@@ -360,17 +406,29 @@ test("wait inspection is observational and excludes absent, foreign, lost, histo
       waitForProducer(host.activity.authority, ref, cursor, () => { ready++; });
     expect(check(undefined)).toEqual({ kind: "unavailable", reason: "no independent producer" });
     expect(check(dependent.ref)).toEqual({ kind: "deferred", reason: "host-return-dependent" });
+    const foreignSubscribe = spyOn(foreign, "subscribe"), ownerSubscribe = spyOn(host.owner.store, "subscribe");
+    try {
+      expect(check(foreign.ref)).toEqual({ kind: "unavailable", reason: "producer belongs to another owner" });
+      expect(foreignSubscribe).not.toHaveBeenCalled();
+      expect(ownerSubscribe).not.toHaveBeenCalled();
+      expect(foreign.cursor).toBe(0);
+      expect(ready).toBe(0);
+    } finally { foreignSubscribe.mockRestore(); ownerSubscribe.mockRestore(); }
     for (const ref of [foreign.ref, lost.ref, observation.ref, { ...independent.ref, generation: 2 },
       { ...independent.ref, producerId: "forged" }, { ...independent.ref, resourceId: "absent" }])
       expect(check(ref).kind).toBe("unavailable");
+    const localError = new Error("controlled local resource lookup failure");
+    const lookup = spyOn(host.owner.store, "exactResource").mockImplementation(() => { throw localError; });
+    try { expect(() => check(independent.ref)).toThrow(localError); }
+    finally { lookup.mockRestore(); }
     expect(check(independent.ref, 1).kind).toBe("unavailable");
     await expect(host.wait({ ...independent.ref, generation: 2 })).rejects.toThrow(/unavailable/);
     await expect(host.wait(dependent.ref)).rejects.toThrow(/host-return-dependent/);
     expect(host.owner.store.fence(host.activity.authority.fence).state).toBe("active");
     expect(host.owner.store.all("dispositions")).toEqual(dispositions);
     // Property order is correlation syntax, not another producer or causal credit.
-    const { generation, reservationId, producerId, resourceId } = independent.ref;
-    await host.wait({ generation, reservationId, producerId, resourceId });
+    const { generation, producerId, resourceId } = independent.ref;
+    await host.wait({ generation, producerId, resourceId });
     independent.observe("host-operation", "unknown", true);
     expect(host.owner.store.fence(host.activity.authority.fence).state).toBe("waiting");
     expect(host.sends).toEqual([]);

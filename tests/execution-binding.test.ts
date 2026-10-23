@@ -141,17 +141,32 @@ describe("frozen execution binding", () => {
     const plan = readFrozenPlan("execution-plan", execution);
     const ledger = ledgerFile("execution-plan", execution);
     mkdirSync(path.dirname(ledger), { recursive: true });
-    const legacy = `${ledgerTemplate(plan.meta)}\nlegacy evidence remains\n`;
-    writeFileSync(ledger, legacy.replace("[]\n<!-- /pitako-team-holds -->", '[{"assignmentId":"kept","unitId":"unit","status":"failed"}]\n<!-- /pitako-team-holds -->'));
+    const historicalHolds = [{ assignmentId: "kept", unitId: "unit", status: "failed" as const }];
+    const holdSection = `## Team Holds\n\n<!-- pitako-team-holds:v1 -->\n${JSON.stringify(historicalHolds)}\n<!-- /pitako-team-holds -->\n`;
+    const legacy = `${ledgerTemplate(plan.meta)}\nlegacy evidence remains\n\n${holdSection}`;
+    writeFileSync(ledger, legacy);
+    const before = readFileSync(ledger, "utf8");
+    expect(before).toContain("legacy evidence remains");
+    expect(before).toContain(holdSection);
+    expect(ledgerTeamHolds(before)).toEqual(historicalHolds);
+    expect(parseLedgerBinding(before).executionRoot).toBeUndefined();
+    expect(parseLedgerBinding(before).planSource).toBeUndefined();
 
     const opened = openExecutionPlan("execution-plan", execution);
     const updated = readFileSync(ledger, "utf8");
     expect(opened.binding.planSource).toBe(sourceFile);
     expect(updated).toContain("legacy evidence remains");
-    expect(updated).toContain('"assignmentId":"kept"');
+    expect(updated).toContain(holdSection);
+    expect(ledgerTeamHolds(updated)).toEqual(historicalHolds);
     expect(updated).toContain("execution_root_b64:");
     rmSync(planFile("execution-plan", execution));
-    expect(openExecutionPlan("execution-plan", execution).file).toBe(sourceFile);
+    const resumed = openExecutionPlan("execution-plan", execution);
+    expect(resumed.file).toBe(sourceFile);
+    expect(resumed.binding).toEqual(opened.binding);
+    const afterResume = readFileSync(ledger, "utf8");
+    expect(afterResume).toBe(updated);
+    expect(afterResume).toContain("legacy evidence remains");
+    expect(ledgerTeamHolds(afterResume)).toEqual(historicalHolds);
   });
 
   test("direct initLedger refuses a second Git worktree ledger", () => {

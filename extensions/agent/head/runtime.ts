@@ -45,6 +45,7 @@ export class HeadAttachment {
   private children = new Map<string, OwnedWork>();
   private waiters = new Set<() => void>();
   private closing?: Promise<void>;
+  private inventoryRetirement?: Promise<void>;
   private effects = false;
   private offered = new Set<string>();
   private deliveries = new Map<string, DeliveryProgress & { binding: object }>();
@@ -165,6 +166,14 @@ export class HeadAttachment {
     this.controller.abort();
     for (const work of this.children.values()) if (work.closure.state === "pending") { work.phase = "cancelling"; work.controller.abort(); }
     this.dag?.revoke();
+    // Revocation ends future inventory use. Join its actual callers even when
+    // the assignment retains an unrelated unknown physical-closure result.
+    this.inventoryRetirement ??= (async () => {
+      await Promise.allSettled([...this.operations]);
+      await this.managed?.settle().catch(() => {}); // Health/outcome is handled by close; retirement asserts no active caller.
+      this.managed?.retireInventory();
+    })();
+    void this.inventoryRetirement.catch(error => { this.failures.push(error); });
     this.wake();
   }
 
@@ -526,12 +535,15 @@ export class HeadAttachment {
   }
 
   close(): Promise<void> {
-    if (this.closure.state === "unknown") return Promise.reject(new AgentClosureError(this.failures, `Head ${this.assignmentId}`));
+    if (this.closure.state === "unknown") return (this.inventoryRetirement ?? Promise.resolve()).then(() => {
+      throw new AgentClosureError(this.failures, `Head ${this.assignmentId}`);
+    });
     if (this.closing) return this.closing;
     this.revoke();
     this.closing = (async () => {
       while (this.operations.size) await Promise.allSettled([...this.operations]);
       try { await this.managed?.settle(); } catch (error) { this.failures.push(error); }
+      try { await this.inventoryRetirement; } catch (error) { this.failures.push(error); }
       const uncertainty = this.unreleased().filter(work => work.closure.state !== "released").map(work => new Error(`Head ${work.purpose} ${work.childId} closure ${work.closure.state}`));
       if (uncertainty?.length) this.failures.push(...uncertainty);
       if (this.failures.length) {

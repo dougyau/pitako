@@ -10,6 +10,7 @@ import { principalLeases, reserveOperation } from "../extensions/agent/head/oper
 import { packageRoot } from "../extensions/stack.ts";
 import { snapshotPlan } from "../extensions/workflow-planning.ts";
 import { openExecutionPlan, planFile } from "../extensions/workflow.ts";
+import { registerTaskTools } from "../extensions/workflow-task.ts";
 import {
   bindCallContext, bindForegroundCallContext, captureCallContext, captureResultSource, checkCallContext,
   currentCallContext, openPlanActivity, registerBackgroundAttempt, reserveEffect, withCallContext, withReceiverContext,
@@ -31,6 +32,8 @@ test("ordinary external tools need no fictional leases while managed effects ret
     getAllTools: () => [...tools.values()].map(tool => ({ ...tool, sourceInfo: { path: sources.get(tool.name) ?? "foreign-extension" } })),
   } as unknown as ExtensionAPI;
   principalLeases(pi, { async exec() { throw new Error("no shell in this fixture"); } });
+  registerTaskTools(pi, () => undefined, async () => {});
+  sources.set("workflow_status", path.join(packageRoot(), "extensions/index.ts"));
   pi.registerTool(guardDefinition({ name: "bounded_write", label: "bounded write", description: "Controlled writer",
     parameters: Type.Object({}), async execute(_id, _input, _signal, _update, ctx) {
       writeFileSync(path.join(ctx.cwd, "output.ts"), "bounded effect\n");
@@ -57,6 +60,7 @@ test("ordinary external tools need no fictional leases while managed effects ret
     try { return await tools.get(name).execute(name, input, undefined, undefined, ctx); }
     finally { await hooks.get("tool_result")!(event, ctx); }
   };
+  const status = async (native: SessionManager) => JSON.parse((await invoke("workflow_status", {}, native)).content[0].text);
   let planning: ReturnType<typeof openPlanActivity> | undefined, unbindPlanning = () => {};
   let execution: ReturnType<typeof openExecuteActivity> | undefined, unbindExecution = () => {};
   try {
@@ -87,28 +91,37 @@ test("ordinary external tools need no fictional leases while managed effects ret
       expect(JSON.stringify(await invoke("tool_search", {}, manager, cwd))).toContain("answer = 42");
     } finally { pi.getAllTools = registry; }
     expect(attempt.store.all("reservations")).toEqual(before);
+    expect(await status(manager)).toBeNull();
+    const realStatus = tools.get("workflow_status");
     // Compositions still pass their nested native calls through admission.
     tools.get("codemode").execute = () => invoke("write", { path: "composed.ts", content: "nested effect\n" }, manager, cwd);
     await invoke("codemode", {}, manager, cwd);
     expect(readFileSync(path.join(cwd, "composed.ts"), "utf8")).toBe("nested effect\n");
     await expect(invoke("write", { path: path.join(root, "..", "outside.ts"), content: "forbidden" }, child))
-      .rejects.toThrow("invalid parent reservation");
+      .rejects.toThrow("effect outside captured attempt root");
     await invoke("write", { path: "inside.ts", content: "authorized\n" }, child);
     expect(readFileSync(path.join(root, "inside.ts"), "utf8")).toBe("authorized\n");
     // An explicitly selected external target remains valid for the principal;
     // the bounded child's attempt cannot acquire that same scope.
     await invoke("write", { path: path.join(external, "explicit.ts"), content: "external effect\n" }, manager);
     expect(readFileSync(path.join(external, "explicit.ts"), "utf8")).toBe("external effect\n");
-    expect(() => reserveOperation(external, "writer", attempt.context)).toThrow("invalid parent reservation");
+    expect(() => reserveOperation(external, "writer", attempt.context)).toThrow("effect outside captured attempt root");
     attempt.result({ status: "completed", result: "controlled navigation and edit" });
     attempt.producer.observe("preparation", "closed");
     attempt.producer.observe("host-operation", "closed");
     expect(attempt.producer.observe("callback", "closed", true)).toBeDefined();
     unbind();
+    sources.set("workflow_status", "foreign-extension");
+    await expect(invoke("workflow_status", {}, manager)).rejects.toThrow("workflow status definition is untrusted");
+    sources.set("workflow_status", path.join(packageRoot(), "extensions/index.ts"));
+    tools.set("workflow_status", { ...realStatus, parameters: Type.Object({}) });
+    await expect(invoke("workflow_status", {}, manager)).rejects.toThrow("workflow status definition is untrusted");
+    tools.set("workflow_status", realStatus);
+    expect(await status(manager)).toBeNull();
     await expect(invoke("read", {}, manager)).rejects.toThrow(/retired/);
-    await expect(invoke("lsp_symbols", {}, child)).rejects.toThrow(/retired or replaced/);
+    await expect(invoke("lsp_symbols", {}, child)).rejects.toThrow(/retired/);
     for (const name of externalNames) {
-      await expect(invoke(name, {}, child)).rejects.toThrow(/retired or replaced/);
+      await expect(invoke(name, {}, child)).rejects.toThrow(/retired/);
       await expect(invoke(name, {}, manager)).rejects.toThrow(/retired/);
     }
     planning = openPlanActivity("independent", root, snapshotPlan("independent", root), manager, manager.getSessionId());
@@ -121,16 +134,33 @@ test("ordinary external tools need no fictional leases while managed effects ret
     }
     expect(externalCalls).toBe(beforeRejected);
     expect(planning.guard.store.all("reservations")).toEqual(managedReservations);
+    expect(await status(manager)).toMatchObject({ activity: "plan", cold: true });
+    sources.set("workflow_status", "foreign-extension");
+    await expect(invoke("workflow_status", {}, manager)).rejects.toThrow("workflow status definition is untrusted");
+    sources.set("workflow_status", path.join(packageRoot(), "extensions/index.ts"));
+    tools.set("workflow_status", { ...realStatus, parameters: Type.Object({}) });
+    await expect(invoke("workflow_status", {}, manager)).rejects.toThrow("workflow status definition is untrusted");
+    tools.set("workflow_status", realStatus);
     await planning.retire();
+    unbindPlanning();
+    expect(await status(manager)).toMatchObject({ activity: "plan", cold: true });
+    const priorInstance = process.env.PITAKO_INSTANCE_ID;
+    try {
+      process.env.PITAKO_INSTANCE_ID = "controlled-child";
+      await expect(invoke("workflow_status", {}, manager)).rejects.toThrow("workflow status is foreground only");
+    } finally {
+      if (priorInstance === undefined) delete process.env.PITAKO_INSTANCE_ID;
+      else process.env.PITAKO_INSTANCE_ID = priorInstance;
+    }
     for (const name of externalNames) {
       await expect(invoke(name, {}, manager)).rejects.toThrow(/retired/);
     }
-    unbindPlanning();
     const file = planFile("execution", root);
     mkdirSync(path.dirname(file), { recursive: true });
     writeFileSync(file, "---\nid: execution\nrevision: 1\nstatus: frozen\n---\n\n# Controlled execution\n");
     execution = openExecuteActivity(openExecutionPlan("execution", root, { createLedger: true }), manager, manager.getSessionId());
     unbindExecution = bindCallContext(manager, execution.context);
+    expect(await status(manager)).toMatchObject({ activity: "execute", cold: true });
     for (const name of externalNames) {
       await expect(invoke(name, {}, manager)).rejects.toThrow("trusted effect adapter is required");
     }

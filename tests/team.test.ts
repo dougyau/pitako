@@ -157,11 +157,11 @@ describe("Team T1 ownership", () => {
       expect(read.isError).toBe(index === 1 || index === 2);
       expect((await invoke("team_status", { assignmentId: id })).details.members[0]).toMatchObject({ assignmentId: id, resultAvailable: true });
     }
-    expect(hasUnsettledTeamWork(current, "catalog-plan")).toBe(true);
+    expect(hasUnsettledTeamWork(current, "catalog-plan")).toBe(false);
     expect((await invoke("team_result", { assignmentId: "foreign" })).isError).toBe(true);
   }));
 
-  test("ledger holds are exact, durable, and fail closed", fixture.ownedCase("ledger holds are exact, durable, and fail closed", () => {
+  test("historical outcome holds remain evidence, not admission authority", fixture.ownedCase("historical outcome holds", () => {
     const cwd = mkdtempSync(path.join(tmpdir(), "pitako-team-holds-"));
     tempDirs.push(cwd);
     const plan = planFile("persisted-plan", cwd);
@@ -174,11 +174,13 @@ describe("Team T1 ownership", () => {
     const binding = openExecutionPlan("persisted-plan", cwd, { createLedger: true }).binding;
     const record = (unit: string, id: string, status: "pending" | "completed" | "cancelled" | "failed") =>
       recordPlanTeamWork(cwd, "persisted-plan", unit, id, status, binding);
+    const historical = readFileSync(ledger, "utf8").replace("\n[]\n", '\n[{"assignmentId":"cancelled-assignment","unitId":"unit-a","status":"cancelled"}]\n');
+    writeFileSync(ledger, historical);
     record("unit-a", "cancelled-assignment", "pending");
     record("unit-a", "cancelled-assignment", "cancelled");
     record("unit-b", "failed-assignment", "failed");
-    expect(hasUnsettledTeamWork(undefined, "persisted-plan", cwd)).toBe(true);
-    expect(() => record("unit-c", "unregistered-success", "completed")).toThrow("no registered attempt");
+    expect(hasUnsettledTeamWork(undefined, "persisted-plan", cwd)).toBe(false);
+    expect(() => record("unit-c", "unregistered-success", "completed")).not.toThrow();
     const guard = new RootGuard(cwd);
     try {
       const success = registerBackgroundAttempt({ kind: "ordinary", guard }, { cwd,
@@ -193,16 +195,20 @@ describe("Team T1 ownership", () => {
       recordPlanTeamWork(cwd, "persisted-plan", "unit-c", "unrelated-success", "completed", binding, receipt);
       expect(readLedgerTeamHolds(cwd, "persisted-plan", binding).map(hold => hold.assignmentId)).not.toContain("unrelated-success");
     } finally { guard.close(); }
-    expect(hasUnsettledTeamWork(undefined, "persisted-plan", cwd)).toBe(true);
-    expect(readFileSync(ledger, "utf8")).toContain('"assignmentId":"cancelled-assignment"');
+    expect(hasUnsettledTeamWork(undefined, "persisted-plan", cwd)).toBe(false);
+    expect(readFileSync(ledger, "utf8")).toBe(historical);
+    expect(readLedgerTeamHolds(cwd, "persisted-plan", binding)).toEqual([
+      { assignmentId: "cancelled-assignment", unitId: "unit-a", status: "cancelled" },
+    ]);
     expect(() => record("unit-d", "new", "pending")).not.toThrow();
-    expect(() => record("unit-d", "new", "completed")).toThrow("no matching successful outcome");
-    expect(hasUnsettledTeamWork(undefined, "persisted-plan", cwd)).toBe(true);
+    expect(() => record("unit-d", "new", "completed")).not.toThrow();
+    expect(hasUnsettledTeamWork(undefined, "persisted-plan", cwd)).toBe(false);
     writeFileSync(ledger, readFileSync(ledger, "utf8").replace("<!-- pitako-team-holds:v1 -->", ""));
-    expect(() => hasUnsettledTeamWork(undefined, "persisted-plan", cwd)).toThrow("gate is missing or malformed");
+    expect(() => readLedgerTeamHolds(cwd, "persisted-plan", binding)).toThrow("gate is missing or malformed");
+    expect(hasUnsettledTeamWork(undefined, "persisted-plan", cwd)).toBe(false);
     rmSync(ledger);
-    expect(() => hasUnsettledTeamWork(undefined, "persisted-plan", cwd)).toThrow("ledger is missing");
-    expect(() => record("unit-e", "blocked", "pending")).toThrow("ledger is missing");
+    expect(hasUnsettledTeamWork(undefined, "persisted-plan", cwd)).toBe(false);
+    expect(() => record("unit-e", "blocked", "pending")).not.toThrow();
   }));
 
   test("no-topic plans do not create a ledger or sidecar", fixture.ownedCase("no-topic plans do not create a ledger or sidecar", () => {
@@ -980,9 +986,8 @@ describe("Team T1 ownership", () => {
     const assignment = assigned.details as { id: string; instanceId: string; execution: { executionRoot: string } };
     expect(workerCwd).toBe(execution);
     expect(assignment.execution.executionRoot).toBe(execution);
-    expect(readLedgerTeamHolds(execution, id, opened.binding)).toEqual([
-      { assignmentId: assignment.id, unitId: "T3", status: "pending" },
-    ]);
+    expect(readLedgerTeamHolds(execution, id, opened.binding)).toEqual([]);
+    expect(hasUnsettledTeamWork(current, id, execution, opened.binding)).toBe(true);
     const ledger = ledgerFile(id, execution);
     writeFileSync(ledger, readFileSync(ledger, "utf8").replace("status: running", "status: completed"));
     const sourceCtx = { cwd: source, sessionManager: executionCtx.sessionManager };
@@ -995,7 +1000,7 @@ describe("Team T1 ownership", () => {
       planId: id, status: "resolved",
     }, undefined, undefined, executionCtx);
     expect(blockedLifecycle.isError).toBe(true);
-    expect(blockedLifecycle.content[0].text).toContain("Team work for this plan is pending");
+    expect(blockedLifecycle.content[0].text).toContain("active or unknown physical resources");
 
     finish(completed("result"));
     await fixture.settleRuns();
@@ -1049,11 +1054,20 @@ describe("Team T1 ownership", () => {
     const ledger = ledgerFile(id, source);
     mkdirSync(path.dirname(ledger), { recursive: true });
     writeFileSync(ledger, ledgerTemplate(meta));
-    recordPlanTeamWork(source, id, "T4", "pending-assignment", "pending");
     writeFileSync(ledger, readFileSync(ledger, "utf8").replace("status: running", "status: completed"));
-    const pendingHold = await lifecycle.execute("pending-hold", { planId: id, status: "resolved" }, undefined, undefined, fromA);
-    expect(pendingHold.isError).toBe(true);
-    expect(pendingHold.content[0]!.text).toContain("Team work for this plan is pending");
+    const guard = new RootGuard(source);
+    const pending = registerBackgroundAttempt({ kind: "ordinary", guard }, { cwd: source, instanceId: "pending",
+      dispatchId: "pending", roleId: "developer", watch: { planId: id, unitId: "T4" } });
+    try {
+      pending.admit();
+      const pendingResource = await lifecycle.execute("pending-resource", { planId: id, status: "resolved" }, undefined, undefined, fromA);
+      expect(pendingResource.isError).toBe(true);
+      expect(pendingResource.content[0]!.text).toContain("active or unknown physical resources");
+    } finally {
+      pending.result({ status: "cancelled", result: "test owner settled" });
+      for (const scope of ["preparation", "host-operation", "callback"] as const) pending.producer.observe(scope, "closed", true);
+      guard.close();
+    }
     const afterPendingHold = await openBoard();
     expect(afterPendingHold.readTopic(repositoryIdentity(source), topic.id).topic).toMatchObject({
       status: "open", planRevision: null, planHash: null, executionRoot: null,
@@ -1136,7 +1150,7 @@ describe("Team T1 ownership", () => {
     const lifecycle = tools.get("board_workflow_lifecycle")!;
     const pending = await lifecycle.execute("pending", { planId: id, status: "resolved" }, undefined, undefined, reloadedContext);
     expect(pending.isError).toBe(true);
-    expect(pending.content[0].text).toContain("Team work for this plan is pending");
+    expect(pending.content[0].text).toContain("active or unknown physical resources");
 
     finish(completed("B result"));
     await fixture.settleRuns();
