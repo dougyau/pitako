@@ -1,5 +1,5 @@
 import { Type, type Static } from "typebox";
-import { createParticipant } from "../table/participant.ts";
+import { createParticipant, type SubmissionMetadata } from "../table/participant.ts";
 import { validateSubmission } from "./protocol.ts";
 import { compositionSchema } from "../table/composition.ts";
 export type { NativeTurn } from "../table/participant.ts";
@@ -28,8 +28,8 @@ export const bodySchema = Type.Union([
 ]);
 export type Body = Static<typeof bodySchema>;
 export type Stage = Body["kind"];
-export const submitSchema = Type.Object({ submissionId: text, body: bodySchema }, strict);
-export interface Message { id: string; ordinal: number; roomId: string; assignmentId: string; memberId: string;
+export const submitSchema = Type.Object({ body: bodySchema }, strict);
+export interface Message { submission: SubmissionMetadata; id: string; ordinal: number; roomId: string; assignmentId: string; memberId: string;
   author: string; stage: Stage; snapshotId: string; round?: number; turnId: string; attemptId: string; body: Body;
   native: { historyId?: string; sessionId: string; toolCallId: string; persistence: "unconfirmed" }; doubts: { id: string; question: string; purpose: string }[] }
 

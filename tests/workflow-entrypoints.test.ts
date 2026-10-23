@@ -3,9 +3,10 @@ import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { Type } from "typebox";
 import { createAssistantMessageEventStream, type AssistantMessage, type ToolCall } from "@earendil-works/pi-ai";
-import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, createCodemodeExtension, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { architectureFixture } from "./fixtures/architecture.ts";
 import { captureCallContext, checkAuthority, checkCallContext, hasReadDefinitionGuard, withCallContext } from "../extensions/workflow-engine.ts";
 import { ledgerFile } from "../extensions/workflow.ts";
@@ -16,7 +17,7 @@ import { beginTeamEvaluation, recordTeamAssignment, reserveTeamMember, retireTea
 const f = architectureFixture();
 const repo = path.resolve(import.meta.dir, "..");
 
-for (const id of ["native", "", "   ", "controls"]) test(`native SDK planning/Architect ports and contextual task (/task ${JSON.stringify(id)})`,
+for (const id of ["native", "", "   ", "controls", "standalone-plan"]) test(`native SDK planning/${id === "controls" ? "control" : "Architect"} ports (/${id === "standalone-plan" ? "plan" : "task"} ${JSON.stringify(id)})`,
   f.fixture.ownedCase(`native workflow entries ${id}`, async () => {
     const storageRoot = mkdtempSync(path.join(tmpdir(), "pitako-entry-storage-"));
     f.fixture.directories.push(storageRoot);
@@ -25,11 +26,17 @@ for (const id of ["native", "", "   ", "controls"]) test(`native SDK planning/Ar
       modelsStorePath: path.join(storageRoot, "cache.json"), refreshOnCreate: false, allowModelNetwork: false });
     let requests = 0, forbidden = 0;
     const delivered: string[] = [];
+    const standalone = id === "standalone-plan";
+    const command = standalone ? "plan" : "task";
+    let receiver: ReturnType<typeof AsyncLocalStorage.snapshot> | undefined;
+    const followUps: Promise<void>[] = [];
     const calls: Pick<ToolCall, "name" | "arguments">[] = [
+      ...(standalone ? [{ name: "bound_plan_read", arguments: {} }] : []),
       { name: "planning_write", arguments: { revision: "absent", fileHash: null, body: "# Goal\nRepair the current conversation's bounded behavior.\n" } },
       { name: "bound_plan_read", arguments: {} },
-      { name: "task_status", arguments: {} },
-      { name: "architecture_start", arguments: { goal: "Repair the current conversation's bounded behavior" } },
+      ...(standalone ? [{ name: "codemode", arguments: { code: "text(await tools.bound_plan_read({}));" } }] : []),
+      ...(!standalone ? [{ name: "task_status", arguments: {} }] : []),
+      ...(id === "controls" ? [] : [{ name: "architecture_start", arguments: { goal: "Repair the current conversation's bounded behavior" } }]),
       { name: "write", arguments: { path: path.join(app.root, "forbidden.txt"), content: "not allowed" } },
       ...(id === "controls" ? [
         { name: "todo", arguments: { action: "list" } },
@@ -44,6 +51,11 @@ for (const id of ["native", "", "   ", "controls"]) test(`native SDK planning/Ar
       streamSimple(model, context) {
         delivered.push(JSON.stringify(context.messages));
         const call = calls[requests++ - 1]; // First turn supplies conversation context before /task.
+        if (standalone && requests === 2) {
+          receiver = AsyncLocalStorage.snapshot();
+          followUps.push(session.sendCustomMessage({ customType: "controlled.followUp", content: "Continue the admitted planning work", display: false },
+            { triggerTurn: true, deliverAs: "followUp" }));
+        }
         const message: AssistantMessage = { role: "assistant", api: model.api, provider: model.provider, model: model.id,
           content: call ? [{ type: "toolCall", id: `entry-${requests}`, ...call }] : [{ type: "text", text: "done" }],
           stopReason: call ? "toolUse" : "stop", timestamp: requests,
@@ -58,8 +70,9 @@ for (const id of ["native", "", "   ", "controls"]) test(`native SDK planning/Ar
       noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
       // Load the declared composition from disk; the Node case below additionally proves graph separation.
       additionalExtensionPaths: [path.join(repo, "extensions/index.ts"), path.join(repo, "extensions/agent/index.ts"),
+        ...(standalone ? ["builtin:codemode"] : []),
         ...(id === "controls" ? [path.join(repo, "extensions/todo.ts"), path.join(repo, "extensions/acp.ts")] : [])],
-      extensionFactories: id === "controls" ? [] : [pi => {
+      extensionFactories: id === "controls" ? [] : [...(standalone ? [{ name: "codemode", builtin: true as const, factory: createCodemodeExtension({ models: false }) }] : []), pi => {
         for (const name of ["todo", "compress"]) pi.registerTool({
           name, label: "forged control", description: "Not an SDK builtin or a host capability",
           parameters: Type.Object({}), async execute() { forbidden++; return { content: [{ type: "text", text: "bypass" }], details: {} }; } });
@@ -131,10 +144,11 @@ for (const id of ["native", "", "   ", "controls"]) test(`native SDK planning/Ar
       }
       session.setActiveToolsByName(calls.map(call => call.name));
       await f.fixture.run(session.prompt("Repair the frobnicator without changing its public API.", { expandPromptTemplates: false }));
-      await f.fixture.run(session.prompt(`/task ${id}`, { expandPromptTemplates: true }));
+      await f.fixture.run(session.prompt(`/${command} ${id}`, { expandPromptTemplates: true }));
       await f.fixture.run(session.waitForIdle());
+      await Promise.all(followUps);
       const results = session.messages.filter(message => message.role === "toolResult");
-      for (const name of ["planning_write", "bound_plan_read", "task_status", "architecture_start"]) {
+      for (const name of ["planning_write", "bound_plan_read", ...(!standalone ? ["task_status"] : []), ...(id === "controls" ? [] : ["architecture_start"])]) {
         const result = results.find(message => message.toolName === name);
         expect(result, `${name} must actually execute through native tool_call`).toBeDefined();
         expect(result!.isError, JSON.stringify(result)).not.toBe(true);
@@ -159,8 +173,7 @@ for (const id of ["native", "", "   ", "controls"]) test(`native SDK planning/Ar
         }
         expect(results.find(message => message.toolName === "agent_status")!.details).toMatchObject({ workers: [{ instanceId: ownedWorker }] });
         const teamStatus = results.find(message => message.toolName === "team_status")!.details as { members: { assignmentId: string }[] };
-        const architecture = results.find(message => message.toolName === "architecture_start")!.details as { assignmentId: string };
-        expect(teamStatus.members.map(member => member.assignmentId)).toEqual(["owned-assignment", architecture.assignmentId]);
+        expect(teamStatus.members.map(member => member.assignmentId)).toEqual(["owned-assignment"]);
         for (const name of ["agent_status", "agent_result", "team_result"]) {
           const denied = results.filter(message => message.toolName === name).at(-1)!;
           expect(denied.isError, JSON.stringify(denied)).toBe(true);
@@ -194,17 +207,27 @@ for (const id of ["native", "", "   ", "controls"]) test(`native SDK planning/Ar
       }
       expect(existsSync(path.join(app.root, "forbidden.txt"))).toBe(false);
       expect(delivered[1]).toContain("Repair the frobnicator without changing its public API.");
-      expect(delivered[1]).toContain("current conversation");
+      expect(delivered[1]).toContain(standalone ? "Native managed /plan" : "current conversation");
       const context = captureCallContext(app.root, session.sessionManager);
       expect(context.kind).toBe("managed");
       if (context.kind !== "managed") throw new Error("expected managed context");
       const owner = checkAuthority(context.authority);
       if (id.trim()) expect(owner.run.planId).toBe(id);
       else expect(owner.run.planId).toMatch(/^task-[a-z0-9_-]+$/);
-      expect(owner.run.task?.intentId).toBeTruthy();
+      if (standalone) {
+        expect(owner.run.activity).toBe("plan");
+        expect(owner.run.task).toBeUndefined();
+        const reads = results.filter(message => message.toolName === "bound_plan_read");
+        expect(JSON.parse((reads[0]!.content[0] as { text: string }).text).revision).toBe("absent");
+        expect(JSON.stringify(reads[1])).toContain("Repair the current conversation");
+        expect(delivered.at(-1)).toContain("Continue the admitted planning work");
+        const composition = results.find(message => message.toolName === "codemode")!;
+        expect(composition.isError, JSON.stringify(composition)).not.toBe(true);
+        expect(JSON.stringify(composition)).toContain("Repair the current conversation");
+      } else expect(owner.run.task?.intentId).toBeTruthy();
       expect(existsSync(ledgerFile(owner.run.planId, app.root))).toBe(false);
       const count = requests;
-      await f.fixture.run(session.prompt("/task   ", { expandPromptTemplates: true }));
+      await f.fixture.run(session.prompt(standalone ? `/plan ${id}` : "/task   ", { expandPromptTemplates: true }));
       expect(requests).toBe(count);
       expect(checkAuthority(context.authority).run.task?.intentId).toBe(owner.run.task?.intentId);
       expect(() => checkAuthority(structuredClone(context.authority))).toThrow(/unavailable/);
@@ -214,12 +237,28 @@ for (const id of ["native", "", "   ", "controls"]) test(`native SDK planning/Ar
         .find(tool => tool.definition.name === "bound_plan_read")!.definition;
       await expect(read.execute("foreign", {}, undefined, undefined,
         { cwd: app.root, sessionManager: { getSessionId: () => session.sessionId } } as never)).rejects.toThrow();
+      if (standalone) {
+        const design = results.find(message => message.toolName === "architecture_start")!;
+        await app.bookkeeping((design.details as { instanceId: string }).instanceId);
+        await f.fixture.run(session.waitForIdle());
+      }
       await session.extensionRunner.emitInput("/stop", undefined, "interactive");
       expect(() => checkCallContext(context)).toThrow(/retired/);
-      await f.fixture.run(session.prompt("/task", { expandPromptTemplates: true }));
-      expect(requests).toBe(count);
+      if (!standalone) {
+        await f.fixture.run(session.prompt("/task", { expandPromptTemplates: true }));
+        expect(requests).toBe(count);
+      }
       await expect(Promise.resolve().then(() => withCallContext(context, () => read.execute("stale", {}, undefined, undefined,
         { cwd: app.root, sessionManager: session.sessionManager } as never)))).rejects.toThrow(/retired/);
+      if (standalone) {
+        await f.fixture.run(session.prompt("/plan replacement", { expandPromptTemplates: true }));
+        await f.fixture.run(session.waitForIdle());
+        const fresh = captureCallContext(app.root, session.sessionManager);
+        if (fresh.kind !== "managed") throw new Error("missing replacement planning admission");
+        expect(checkAuthority(fresh.authority).run.planId).toBe("replacement");
+        await expect(Promise.resolve().then(() => receiver!(() => read.execute("old-receiver", {}, undefined, undefined,
+          { cwd: app.root, sessionManager: session.sessionManager } as never)))).rejects.toThrow(/owner retired/);
+      }
       if (id === "controls") for (const name of ["todo", "acp_status", "agent_status", "team_status"]) {
         const definition = session.extensionRunner.getToolDefinition(name)!;
         await expect(Promise.resolve().then(() => withCallContext(context, () =>
@@ -227,6 +266,7 @@ for (const id of ["native", "", "   ", "controls"]) test(`native SDK planning/Ar
             { cwd: path.join(app.root, "removed-worktree"), sessionManager: session.sessionManager } as never)))).rejects.toThrow(/retired/);
       }
     } finally {
+      await Promise.all(followUps);
       await cancelAllWorkers();
       await Promise.all(completions);
       if (foreignEvaluation) await retireTeamEvaluation(foreignEvaluation);

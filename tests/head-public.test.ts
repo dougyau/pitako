@@ -22,7 +22,7 @@ import { currentWorkspace } from "../extensions/board/workspace.ts";
 import { openExecutionPlan, planFile, readLedgerTeamHolds } from "../extensions/workflow.ts";
 import { principalLeases, reserveOperation } from "../extensions/agent/head/operation-leases.ts";
 import { AgentClosureError } from "../extensions/agent/closure.ts";
-import { captureCallContext, openExecuteActivity, outcomeHash, recoverHold, type AttemptRecord, type RecoveryReceipt } from "../extensions/workflow-engine.ts";
+import { captureCallContext, openExecuteActivity, type AttemptRecord } from "../extensions/workflow-engine.ts";
 import { WorkflowState, type ReleaseReceipt } from "../extensions/workflow-state.ts";
 import { ownProcess } from "../extensions/agent/head/owned-process.ts";
 import { HeadAttachment, type HeadFinish } from "../extensions/agent/head/runtime.ts";
@@ -1144,7 +1144,7 @@ async function recoveredPlanCheckpoint() {
   expect(h.outcome(admitted.details.instanceId, true).status).toBe("failed");
   const origin: CheckpointOrigin = receipt.origin;
   const read = readCheckpoint(h.root, origin);
-  expect(read.historicalEvidence.closureGaps).toContain(`Unreconciled execution hold: ${admitted.details.id}`);
+  expect(read.historicalEvidence.closureGaps).toEqual([]);
   const store = new WorkerHistory(h.root, { initialize: false });
   const headSource = read.manifest.head;
   const leafSource = read.manifest.contributors.find(entry => entry.contribution.source.kind === "leaf")!.contribution.source;
@@ -1153,27 +1153,20 @@ async function recoveredPlanCheckpoint() {
   expect(store.read(leafSource.groupId).identity.kind).toBe("invocation");
   expect(store.read(leafSource.groupId).closure.state).toBe("closed");
   const binding = openExecutionPlan(plan, h.root, { createLedger: false }).binding;
-  expect(readLedgerTeamHolds(h.root, plan, binding).map(hold => hold.assignmentId)).toContain(admitted.details.id);
+  expect(readLedgerTeamHolds(h.root, plan, binding)).toEqual([]);
   recordPlanTeamWork(h.root, plan, "T2", admitted.details.id, undefined, binding);
-  expect(readCheckpoint(h.root, origin).historicalEvidence.closureGaps).toContain(`Unreconciled execution hold: ${admitted.details.id}`);
+  expect(readCheckpoint(h.root, origin).historicalEvidence.closureGaps).toEqual([]);
   const journal = new WorkflowState(h.root);
   try {
     const attempt = journal.all<AttemptRecord>("attempts").find(entry => entry.instanceId === admitted.details.instanceId)!;
     expect(attempt.outcome?.status).toBe("failed");
-    const receipt = journal.all<ReleaseReceipt>("receipts").find(entry => entry.reservationId === attempt.reservationId)!;
+    const receipt = journal.closureReceipt(attempt.resource);
     expect(receipt).toBeDefined();
-    const activity = openExecuteActivity(openExecutionPlan(plan, h.root, { createLedger: false }), {}, "explicit-recovery");
+    expect(journal.verifyClosureReceipt(receipt!)).toBe(true);
+    const activity = openExecuteActivity(openExecutionPlan(plan, h.root, { createLedger: false }), {}, "independent-progress");
     try {
-      const claim = { assignmentId: admitted.details.id, dispatchId: attempt.dispatchId, receipt,
-        evidence: [{ dispatchId: attempt.dispatchId, outcomeHash: outcomeHash(attempt.outcome!) }],
-        repository: h.root, remainingResult: "Continue the saved partial source; failure is not semantic acceptance." };
-      expect(() => recoverHold({ fence: activity.authority.fence }, claim)).toThrow("unavailable");
-      expect(() => recoverHold(activity.authority, { ...claim, receipt: { ...receipt, receiptId: "foreign" } }))
-        .toThrow("exact committed");
-      const recovered = recoverHold(activity.authority, claim);
-      expect(recovered.outcome?.status).toBe("failed");
       expect(journal.get<AttemptRecord>("attempts", attempt.dispatchId)?.outcome?.status).toBe("failed");
-      expect(journal.get<RecoveryReceipt>("recoveries", recovered.recoveryId)).toEqual(recovered);
+      expect(journal.all("recoveries")).toEqual([]);
     } finally { await activity.retire(); }
   } finally { journal.close(); }
   expect(readCheckpoint(h.root, origin).historicalEvidence.closureGaps).toEqual([]);
@@ -1231,7 +1224,7 @@ test("recovery proves linked sealed leaf members without sealing the plan execut
   await replacement.call("head_finish", { status: "failed", diagnostic: "Saved without acceptance", evidence: [], limits: [] });
   await replacement.settle();
   expect(store.read(headSource.groupId).closure.state).toBe("unclosed");
-  expect(readCheckpoint(h.root, next.origin).historicalEvidence.closureGaps.join()).toContain("Unreconciled execution hold");
+  expect(readCheckpoint(h.root, next.origin).historicalEvidence.closureGaps).toEqual([]);
 }));
 
 test("public granted Head edits and checks through managed definitions without leaves", fixture.ownedCase("public managed Head", async () => {

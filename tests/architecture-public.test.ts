@@ -120,9 +120,9 @@ test("Node broker/client reads no-mode rooms and retained selection without rewr
     expect(before.records.find((r: any) => r.kind === "room")).not.toHaveProperty("mode");
     expect(before.records.find((r: any) => r.kind === "member")).toMatchObject({ state: "preparing",
       compositionMessageId: "initial-composition", compositionChoiceIndex: 0 });
-    architecturePublication(room, { id: "retained-composition", ordinal: 1, roomId: room.roomId, assignmentId: room.assignmentId,
+    architecturePublication(room, { submission: { version: 2, provenance: "host-bound", compositionBasis: { snapshotId: "candidates", candidateRefs: [], retainableMemberIds: [assignment.memberId] } }, id: "retained-composition", ordinal: 1, roomId: room.roomId, assignmentId: room.assignmentId,
       memberId: "director", author: "architect", stage: "composition", snapshotId: "candidates", turnId: "turn", attemptId: "attempt",
-      body: { kind: "composition", snapshotId: "candidates", reason: "Keep useful conversation",
+      body: { kind: "composition", reason: "Keep useful conversation",
         specialists: [{ kind: "retain", memberId: assignment.memberId, mandate: "Current mandate", reason: "Continuity" }] },
       native: { sessionId: "director-session", toolCallId: "submit", persistence: "unconfirmed" }, doubts: [] });
     architectureMember(room, assignment.memberId, "specialist", "retained-composition", undefined, {
@@ -312,7 +312,7 @@ test("Node roster preserves failed specialists, supports, boundaries and recompo
   let compositions = 0;
   const goal = "# Original 🧠\r\n\n" + "- Literal \"quote\" \\ path\n".repeat(100);
   const s = await setup({ async prompt(session, request, body) {
-    if (request.stage === "composition") return { kind: "composition", snapshotId: request.snapshot.id, reason: "Known composition",
+    if (request.stage === "composition") return { kind: "composition", reason: "Known composition",
       specialists: (++compositions === 1 ? ["failed", "healthy"] : ["replacement"]).map(mandate => ({ kind: "add", candidateRef: "topic:0:0", mandate, reason: "Known composition" })) };
     if (request.stage === "preparation") {
       const mandate = teamAssignments(s.evaluation).find(a => a.instanceId === executionForSession(session.sessionId)?.instanceId)!.task;
@@ -487,7 +487,7 @@ test("contextually rejected bodies never enter publication or protocol history",
     if (request.stage === "contribution") {
       const invalid = { kind: "contribution", proposal: "Invalid reference", arguments: [],
         objections: [{ memberId: "unknown", messageId: "unknown", argument: "Invalid reference" }], doubts: [] };
-      const rejected = await session.boundTools.get("architecture_submit").execute("bad-reference", { submissionId: "bad", body: invalid }, undefined, undefined, { sessionManager: session.sessionManager });
+      const rejected = await session.boundTools.get("architecture_submit").execute("bad-reference", { body: invalid }, undefined, undefined, { sessionManager: session.sessionManager });
       expect(rejected.isError).toBe(true); expect(rejected.details).toMatchObject({ code: "reference", badIds: ["unknown", "unknown"], correctionsLeft: 1 });
       return false;
     }
@@ -546,7 +546,7 @@ test("publication and closure producers advance cuts without worker events; reti
     const room = architectureRooms(s.evaluation)[0]!;
     const publication = [...room.records.values()].find(record => record.kind === "publication" && record.message.body.kind === "preparation")!;
     if (publication.kind !== "publication" || publication.message.body.kind !== "preparation") throw Error("missing settled preparation");
-    const message = { ...publication.message, stage: "preparation" as const, body: publication.message.body };
+    const message = { ...publication.message, submission: { version: 2 as const, provenance: "host-bound" as const }, stage: "preparation" as const, body: publication.message.body };
     try {
       const hints: number[] = [], subscription = view.subscribe(revision => hints.push(revision));
       try {

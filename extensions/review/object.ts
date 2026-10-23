@@ -19,6 +19,7 @@ export interface ReviewObject {
   selector: ObjectSelector; root: string; identity: string; scope: unknown;
   limits: string[];
   source?: CapturedReviewSource;
+  gitBasis?: { head: string; index: string; gitDir: string; commonDir: string };
 }
 export type CapturedReviewSource = { kind: "local-selector"; selector: ObjectSelector } |
   { kind: "managed-candidate"; candidate: FreezeCandidate } | { kind: "managed-execution"; binding: ExecutionBinding };
@@ -108,6 +109,7 @@ export function captureObject(selector: ObjectSelector, cwd: string): ReviewObje
   const root = realpathSync(workflowWorkspace(cwd));
   const limits = ["Endpoint fingerprints are not transactional, ABA-proof, or a guarantee during disposal or after delivery."];
   let scope: unknown;
+  let gitBasis: ReviewObject["gitBasis"];
   if (selector.kind === "brief") {
     if (!selector.text.trim()) throw new Error("review brief must not be empty");
     scope = { text: selector.text };
@@ -129,6 +131,9 @@ export function captureObject(selector: ObjectSelector, cwd: string): ReviewObje
     if (!selector.base.trim()) throw new Error("review diff requires explicit local base");
     const base = git(["rev-parse", "--verify", "--end-of-options", `${selector.base}^{commit}`]).trim();
     const head = git(["rev-parse", "--verify", "HEAD^{commit}"]).trim();
+    gitBasis = { head, index: digest(readFileSync(git(["rev-parse", "--path-format=absolute", "--git-path", "index"]).trim())),
+      gitDir: realpathSync(git(["rev-parse", "--absolute-git-dir"]).trim()),
+      commonDir: realpathSync(git(["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()) };
     const mergeBase = git(["merge-base", base, head]).trim();
     const diff = (args: string[]) => git(["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--binary", "--full-index", "--no-renames", ...args, "--"]);
     const tracked = git(["ls-files", "--stage", "-z"]);
@@ -170,5 +175,5 @@ export function captureObject(selector: ObjectSelector, cwd: string): ReviewObje
       staged: diff(["--cached", head]), files };
     limits.push("Working bytes are captured raw, without clean/smudge filters or text conversion. Binary contents use base64.");
   }
-  return { selector: structuredClone(selector), root, scope, identity: digest(JSON.stringify({ selector, root, scope })), limits };
+  return { selector: structuredClone(selector), root, scope, identity: digest(JSON.stringify({ selector, root, scope })), limits, ...(gitBasis ? { gitBasis } : {}) };
 }

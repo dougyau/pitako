@@ -1,15 +1,184 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { SessionManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+import { principalLeases, reserveOperation } from "../extensions/agent/head/operation-leases.ts";
+import { packageRoot } from "../extensions/stack.ts";
 import { snapshotPlan } from "../extensions/workflow-planning.ts";
+import { openExecutionPlan, planFile } from "../extensions/workflow.ts";
+import { registerTaskTools } from "../extensions/workflow-task.ts";
 import {
   bindCallContext, bindForegroundCallContext, captureCallContext, captureResultSource, checkCallContext,
   currentCallContext, openPlanActivity, registerBackgroundAttempt, reserveEffect, withCallContext, withReceiverContext,
-  openTaskActivity,
+  openTaskActivity, openExecuteActivity, guardDefinition,
 } from "../extensions/workflow-engine.ts";
+
+test("ordinary external tools need no fictional leases while managed effects retain their boundaries", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "pitako-navigation-admission-"));
+  const external = mkdtempSync(path.join(tmpdir(), "pitako-navigation-external-"));
+  execFileSync("git", ["init", "-q"], { cwd: root });
+  const manager = SessionManager.inMemory(root), child = SessionManager.inMemory(root);
+  const unbind = bindForegroundCallContext(root, manager), principal = captureCallContext(root, manager);
+  const attempt = registerBackgroundAttempt(principal, { cwd: root, instanceId: "developer", dispatchId: "developer", roleId: "developer" });
+  attempt.admit();
+  const unbindChild = bindCallContext(child, attempt.context);
+  const tools = new Map<string, any>(), hooks = new Map<string, Function>();
+  const sources = new Map<string, string>();
+  const pi = { registerTool(tool: any) { tools.set(tool.name, tool); }, on(name: string, hook: Function) { hooks.set(name, hook); },
+    getAllTools: () => [...tools.values()].map(tool => ({ ...tool, sourceInfo: { path: sources.get(tool.name) ?? "foreign-extension" } })),
+  } as unknown as ExtensionAPI;
+  principalLeases(pi, { async exec() { throw new Error("no shell in this fixture"); } });
+  registerTaskTools(pi, () => undefined, async () => {});
+  sources.set("workflow_status", path.join(packageRoot(), "extensions/index.ts"));
+  pi.registerTool(guardDefinition({ name: "bounded_write", label: "bounded write", description: "Controlled writer",
+    parameters: Type.Object({}), async execute(_id, _input, _signal, _update, ctx) {
+      writeFileSync(path.join(ctx.cwd, "output.ts"), "bounded effect\n");
+      return { content: [{ type: "text", text: "written" }], details: {} };
+    } }, "write"));
+  // Controlled external definitions/results; source metadata is the host registry boundary.
+  const externalNames = ["lsp_rename", "unknown_navigation", "codemode", "task_status",
+    "orchestrator_capabilities", "delegate_task", "tool_search", "apply_patch"];
+  let externalCalls = 0;
+  for (const name of ["read", "codegraph_explore", "lsp_symbols", ...externalNames]) {
+    sources.set(name, path.join(packageRoot(), name.startsWith("codegraph_") ?
+      "node_modules/@vndv/pi-codegraph/extensions/codegraph.ts" : "node_modules/pi-lsp-client/src/index.ts"));
+    tools.set(name, { name, parameters: Type.Object({}), async execute() {
+      externalCalls++;
+      return { content: [{ type: "text", text: readFileSync(path.join(root, "input.ts"), "utf8") }], details: {} };
+    } });
+  }
+  sources.set("read", "builtin:read");
+  writeFileSync(path.join(root, "input.ts"), "export const answer = 42;\n");
+  const invoke = async (name: string, input: object, native: SessionManager, cwd = root) => {
+    const ctx = { cwd, sessionManager: native }, event = { toolCallId: name, toolName: name, input };
+    const admission = await hooks.get("tool_call")!(event, ctx);
+    if (admission?.block) throw new Error(admission.reason);
+    try { return await tools.get(name).execute(name, input, undefined, undefined, ctx); }
+    finally { await hooks.get("tool_result")!(event, ctx); }
+  };
+  const status = async (native: SessionManager) => JSON.parse((await invoke("workflow_status", {}, native)).content[0].text);
+  let planning: ReturnType<typeof openPlanActivity> | undefined, unbindPlanning = () => {};
+  let execution: ReturnType<typeof openExecuteActivity> | undefined, unbindExecution = () => {};
+  try {
+    const cwd = path.join(root, "session-cwd");
+    mkdirSync(cwd);
+    expect(realpathSync(cwd)).not.toBe(realpathSync(process.cwd()));
+    const beforeWrite = new Set(attempt.store.all<{ reservationId: string }>("reservations").map(r => r.reservationId));
+    await invoke("bounded_write", {}, child, cwd);
+    expect(readFileSync(path.join(cwd, "output.ts"), "utf8")).toBe("bounded effect\n");
+    const scopes = attempt.store.all<{ reservationId: string; paths: string[] }>("reservations")
+      .filter(r => !beforeWrite.has(r.reservationId)).flatMap(r => r.paths);
+    expect(new Set(scopes)).toEqual(new Set([realpathSync(cwd)]));
+    const before = attempt.store.all("reservations");
+    for (const name of ["codegraph_explore", "lsp_symbols"]) {
+      expect(JSON.stringify(await invoke(name, {}, child))).toContain("answer = 42");
+    }
+    expect(attempt.store.all("reservations")).toEqual(before);
+    expect(JSON.stringify(await invoke("read", {}, manager))).toContain("answer = 42");
+    for (const name of externalNames) {
+      expect(JSON.stringify(await invoke(name, {}, manager, cwd))).toContain("answer = 42");
+      expect(JSON.stringify(await invoke(name, {}, child, cwd))).toContain("answer = 42");
+    }
+    sources.set("codegraph_explore", "foreign-extension");
+    expect(JSON.stringify(await invoke("codegraph_explore", {}, child))).toContain("answer = 42");
+    const registry = pi.getAllTools;
+    try {
+      pi.getAllTools = undefined!;
+      expect(JSON.stringify(await invoke("tool_search", {}, manager, cwd))).toContain("answer = 42");
+    } finally { pi.getAllTools = registry; }
+    expect(attempt.store.all("reservations")).toEqual(before);
+    expect(await status(manager)).toBeNull();
+    const realStatus = tools.get("workflow_status");
+    // Compositions still pass their nested native calls through admission.
+    tools.get("codemode").execute = () => invoke("write", { path: "composed.ts", content: "nested effect\n" }, manager, cwd);
+    await invoke("codemode", {}, manager, cwd);
+    expect(readFileSync(path.join(cwd, "composed.ts"), "utf8")).toBe("nested effect\n");
+    await expect(invoke("write", { path: path.join(root, "..", "outside.ts"), content: "forbidden" }, child))
+      .rejects.toThrow("effect outside captured attempt root");
+    await invoke("write", { path: "inside.ts", content: "authorized\n" }, child);
+    expect(readFileSync(path.join(root, "inside.ts"), "utf8")).toBe("authorized\n");
+    // An explicitly selected external target remains valid for the principal;
+    // the bounded child's attempt cannot acquire that same scope.
+    await invoke("write", { path: path.join(external, "explicit.ts"), content: "external effect\n" }, manager);
+    expect(readFileSync(path.join(external, "explicit.ts"), "utf8")).toBe("external effect\n");
+    expect(() => reserveOperation(external, "writer", attempt.context)).toThrow("effect outside captured attempt root");
+    attempt.result({ status: "completed", result: "controlled navigation and edit" });
+    attempt.producer.observe("preparation", "closed");
+    attempt.producer.observe("host-operation", "closed");
+    expect(attempt.producer.observe("callback", "closed", true)).toBeDefined();
+    unbind();
+    sources.set("workflow_status", "foreign-extension");
+    await expect(invoke("workflow_status", {}, manager)).rejects.toThrow("workflow status definition is untrusted");
+    sources.set("workflow_status", path.join(packageRoot(), "extensions/index.ts"));
+    tools.set("workflow_status", { ...realStatus, parameters: Type.Object({}) });
+    await expect(invoke("workflow_status", {}, manager)).rejects.toThrow("workflow status definition is untrusted");
+    tools.set("workflow_status", realStatus);
+    expect(await status(manager)).toBeNull();
+    await expect(invoke("read", {}, manager)).rejects.toThrow(/retired/);
+    await expect(invoke("lsp_symbols", {}, child)).rejects.toThrow(/retired/);
+    for (const name of externalNames) {
+      await expect(invoke(name, {}, child)).rejects.toThrow(/retired/);
+      await expect(invoke(name, {}, manager)).rejects.toThrow(/retired/);
+    }
+    planning = openPlanActivity("independent", root, snapshotPlan("independent", root), manager, manager.getSessionId());
+    unbindPlanning = bindCallContext(manager, planning.context);
+    expect(JSON.stringify(await invoke("lsp_symbols", {}, manager))).toContain("answer = 42");
+    expect(JSON.stringify(await invoke("read", {}, manager))).toContain("answer = 42");
+    const beforeRejected = externalCalls, managedReservations = planning.guard.store.all("reservations");
+    for (const name of externalNames) {
+      await expect(invoke(name, {}, manager)).rejects.toThrow("generic mutations are unavailable");
+    }
+    expect(externalCalls).toBe(beforeRejected);
+    expect(planning.guard.store.all("reservations")).toEqual(managedReservations);
+    expect(await status(manager)).toMatchObject({ activity: "plan", cold: true });
+    sources.set("workflow_status", "foreign-extension");
+    await expect(invoke("workflow_status", {}, manager)).rejects.toThrow("workflow status definition is untrusted");
+    sources.set("workflow_status", path.join(packageRoot(), "extensions/index.ts"));
+    tools.set("workflow_status", { ...realStatus, parameters: Type.Object({}) });
+    await expect(invoke("workflow_status", {}, manager)).rejects.toThrow("workflow status definition is untrusted");
+    tools.set("workflow_status", realStatus);
+    await planning.retire();
+    unbindPlanning();
+    expect(await status(manager)).toMatchObject({ activity: "plan", cold: true });
+    const priorInstance = process.env.PITAKO_INSTANCE_ID;
+    try {
+      process.env.PITAKO_INSTANCE_ID = "controlled-child";
+      await expect(invoke("workflow_status", {}, manager)).rejects.toThrow("workflow status is foreground only");
+    } finally {
+      if (priorInstance === undefined) delete process.env.PITAKO_INSTANCE_ID;
+      else process.env.PITAKO_INSTANCE_ID = priorInstance;
+    }
+    for (const name of externalNames) {
+      await expect(invoke(name, {}, manager)).rejects.toThrow(/retired/);
+    }
+    const file = planFile("execution", root);
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, "---\nid: execution\nrevision: 1\nstatus: frozen\n---\n\n# Controlled execution\n");
+    execution = openExecuteActivity(openExecutionPlan("execution", root, { createLedger: true }), manager, manager.getSessionId());
+    unbindExecution = bindCallContext(manager, execution.context);
+    expect(await status(manager)).toMatchObject({ activity: "execute", cold: true });
+    for (const name of externalNames) {
+      await expect(invoke(name, {}, manager)).rejects.toThrow("trusted effect adapter is required");
+    }
+    expect(externalCalls).toBe(beforeRejected);
+  } finally {
+    unbindChild(); unbindExecution(); unbindPlanning(); unbind();
+    if (!attempt.receipt()) {
+      attempt.producer.observe("preparation", "closed");
+      attempt.producer.observe("host-operation", "closed");
+      attempt.producer.observe("callback", "closed", true);
+    }
+    await planning?.retire();
+    await execution?.retire();
+    if (principal.kind === "ordinary") principal.guard.close();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(external, { recursive: true, force: true });
+  }
+});
 
 test("native origin is an admission record, not manager ID, cloned context, or later SDK binding", async () => {
   const root = mkdtempSync(path.join(tmpdir(), "pitako-receiver-origin-"));

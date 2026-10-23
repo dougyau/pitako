@@ -3,8 +3,8 @@ import { retireReviewRooms } from "./review/index.ts";
 import { randomUUID } from "node:crypto";
 import { reserveBackground, turnTeamWorker, finishTeamWorker, type SpawnInput, retireTeamMembers, retireTeamWorkers, teamWorkerHasOutcome, teamWorkerStatus } from "./agent/background.ts";
 import { executionForSession } from "./execution-identity.ts";
-import { readLedgerTeamHolds, type ExecutionBinding } from "./workflow.ts";
-import { captureCallContext, reconcileTeamHold, type ReleaseReceipt, type TeamHoldRecord, type AttemptRecord } from "./workflow-engine.ts";
+import { type ExecutionBinding } from "./workflow.ts";
+import { captureCallContext, type ResourceClosureReceipt, type AttemptRecord } from "./workflow-engine.ts";
 import { WorkflowState, type Reservation } from "./workflow-state.ts";
 import { currentWorkspace } from "./board/workspace.ts";
 
@@ -263,7 +263,7 @@ export function disbandTeam(team: ReturnType<typeof createTeam>): Promise<void> 
 
 type TeamWorkStatus = "pending" | "failed" | "cancelled";
 
-/** Record or reconcile exactly one accepted assignment in its bound plan ledger. */
+/** A bookkeeping callback is not authority over admission or a plan ledger. */
 export function recordPlanTeamWork(
   cwd: string,
   planId: string,
@@ -271,47 +271,31 @@ export function recordPlanTeamWork(
   assignmentId: string,
   status: TeamWorkStatus | "completed" | undefined,
   binding?: ExecutionBinding,
-  receipt?: ReleaseReceipt,
+  receipt?: ResourceClosureReceipt,
 ): void {
+  if (!receipt) return;
   const store = new WorkflowState(currentWorkspace(binding?.executionRoot ?? cwd));
-  try { reconcileTeamHold(store, { planId, unitId, execution: binding }, assignmentId, status, receipt); }
+  try {
+    const attempt = store.all<AttemptRecord>("attempts").find(a => a.assignmentId === assignmentId &&
+      a.watch?.planId === planId && a.watch.unitId === unitId);
+    if (!attempt || JSON.stringify(attempt.resource) !== JSON.stringify(receipt.resource) ||
+        !store.verifyClosureReceipt(receipt)) throw new Error("bookkeeping requires the exact resource closure receipt");
+  }
   finally { store.close(); }
 }
 
-/** A resolve must not mistake an unsettled or unsuccessful Team result for success. */
+/** Board resolution still requires physical closure; outcome is a separate decision. */
 export function hasUnsettledTeamWork(evaluation: TeamEvaluation | undefined, planId: string, cwd?: string, expectedBinding?: ExecutionBinding): boolean {
   const binding = teamExecutionBinding(evaluation, planId) ?? expectedBinding;
   const root = binding?.executionRoot ?? cwd;
   if (root) {
-    // A broken projection is still a refusal, not a reason to ignore its captured binding.
-    if (readLedgerTeamHolds(root, planId, binding).length) return true;
     const store = new WorkflowState(currentWorkspace(root));
     try {
-      if (store.all<TeamHoldRecord>("holds").some(hold => hold.planId === planId && !hold.cleared)) return true;
-      if (store.outbox().some(entry => entry.target === `team-holds:${planId}` &&
-          !["applied", "not-applicable"].includes(entry.state))) return true;
       for (const attempt of store.all<AttemptRecord>("attempts")) {
         if (attempt.watch?.planId !== planId) continue;
-        if (store.get<Reservation>("reservations", attempt.reservationId)?.state !== "released") return true;
+        if (!attempt.resource || !store.closureReceipt(attempt.resource)) return true;
       }
     } finally { store.close(); }
-  }
-  // Older assignments remain authoritative under their captured execution binding.
-  for (const assignment of evaluation ? teamAssignments(evaluation) : []) {
-    if (assignment.planId === planId && assignment.execution &&
-        readLedgerTeamHolds(assignment.execution.executionRoot, planId, assignment.execution).length > 0) return true;
-  }
-  if (binding) return readLedgerTeamHolds(binding.executionRoot, planId, binding).length > 0;
-  if (cwd) return readLedgerTeamHolds(cwd, planId).length > 0;
-  if (!evaluation) return false;
-  for (const assignment of teamAssignments(evaluation)) {
-    if (assignment.planId !== planId) continue;
-    try {
-      if (!teamWorkerHasOutcome(evaluation.token, assignment.instanceId)) return true;
-      if (teamWorkerStatus(evaluation.token, assignment.instanceId)[0]?.status !== "completed") return true;
-    } catch {
-      return true;
-    }
   }
   return false;
 }

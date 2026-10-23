@@ -355,7 +355,7 @@ test("owner/coordinator fences deny foreign, missing and retired authority witho
   expect(listObservations().find(row => row.id === handle.instanceId)?.resultTaken).not.toBe(true);
 }));
 
-test("automatic ledger failure never hides the full tool result; captured bookkeeping recovers without another delivery or acceptance", fixture.ownedCase("projection partial ledger failure", async () => {
+test("historical ledger obstruction cannot hide a closed result or rewrite its bookkeeping", fixture.ownedCase("projection historical ledger obstruction", async () => {
   const evaluation = beginTeamEvaluation("projection-coordinator", false)!;
   evaluations.push(evaluation);
   const env = setup(true, evaluation.token);
@@ -377,18 +377,12 @@ test("automatic ledger failure never hides the full tool result; captured bookke
   recordTeamAssignment(evaluation, "developer", { id: "assignment", instanceId: handle.instanceId, roleId: "developer", task: "work",
     planId: "projection", unitId: "T2", boardTopicId: 1 });
   rmSync(ledger);
-  // Missing projections can be recreated; a directory forces a real projection I/O failure.
+  // Historical ledger bytes are not an admission or bookkeeping sink.
   mkdirSync(ledger);
   const full = "\n漢😀e\u0301 ".repeat(3000) + "\n";
-  const blocked = deferred<void>();
-  const stop = subscribeChanges(row => {
-    if (row.id === handle.instanceId && row.handoff?.bookkeeping === "blocked") blocked.resolve();
-  });
-  fixture.beforeRelease(async () => { stop(); });
   worker.finish({ status: "completed", result: full, sideEffects: false });
   await fixture.settleRuns();
-  await blocked.promise;
-  stop();
+  await env.settled.promise;
   expect(firstTeamReservation(evaluation, "developer")).toBeUndefined();
   const envelope = env.branch[0];
   const resultTool = tools().get("team_result")!;
@@ -396,21 +390,19 @@ test("automatic ledger failure never hides the full tool result; captured bookke
   const reads = await Promise.all([resultTool.execute("one", { assignmentId: "assignment" }, undefined, undefined, context),
     resultTool.execute("two", { assignmentId: "assignment" }, undefined, undefined, context)]);
   for (const read of reads) {
-    expect(read.isError).toBe(true);
+    expect(read.isError).not.toBe(true);
     const text = read.content.find(part => part.type === "text")!.text;
     expect(text).toContain(full);
-    expect(text).toContain("Bookkeeping blocked:");
   }
   observeWorkerResults(evaluation.token, true);
   expect(listObservations(evaluation.token).find(row => row.id === handle.instanceId)).toMatchObject({
-    handoff: { bookkeeping: "blocked", delivery: "incorporated", continuation: "observed" },
+    handoff: { bookkeeping: "reconciled", delivery: "incorporated", continuation: "observed" },
   });
-  expect(listObservations(evaluation.token).find(row => row.id === handle.instanceId)?.resultTaken).not.toBe(true);
   rmSync(ledger, { recursive: true });
   writeFileSync(ledger, retainedLedger);
   settleWorkerResults(evaluation.token, true);
   expect(readLedgerTeamHolds(env.root, "projection")).toEqual([]);
-  expect(readFileSync(ledger, "utf8")).toContain("status: running");
+  expect(readFileSync(ledger)).toEqual(retainedLedger);
   expect(listObservations(evaluation.token).find(row => row.id === handle.instanceId)?.handoff)
     .toMatchObject({ bookkeeping: "reconciled", continuation: "observed" });
   expect(listObservations(evaluation.token).find(row => row.id === handle.instanceId)?.resultTaken).toBe(true);

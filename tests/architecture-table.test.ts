@@ -8,7 +8,7 @@ import { architectureFixture, tablePrompt } from "./fixtures/architecture.ts";
 const { fixture, setup } = architectureFixture();
 const deferred = <T = void>() => Promise.withResolvers<T>();
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
-const composition = (request: any, count = 5) => ({ kind: "composition", snapshotId: request.snapshot.id, reason: "Useful independent perspectives",
+const composition = (request: any, count = 5) => ({ kind: "composition", reason: "Useful independent perspectives",
   specialists: Array.from({ length: count }, (_, index) => ({ kind: "add", candidateRef: "topic:0:0", mandate: `Member ${index}`, reason: "Independent perspective" })) });
 const preparation = (request: any, doubts = false) => ({ kind: "preparation", analysis: request.context.mandate,
   doubts: doubts ? [{ question: "Equivalent question", purpose: request.context.mandate }] : [] });
@@ -332,7 +332,7 @@ test("consultation A receives the full B to C prerequisite chain without indepen
       if (index === 0) {
         closedBeforeA = [...disposed];
         const rejected = await session.boundTools.get("architecture_submit").execute("broader-authority", {
-          submissionId: "broader-authority", body: { ...support(request), doubtIds: [doubtIds[0], doubtIds[2]] },
+          body: { ...support(request), doubtIds: [doubtIds[0], doubtIds[2]] },
         }, undefined, undefined, { sessionManager: session.sessionManager });
         expect(rejected.isError).toBe(true);
         expect(rejected.details).toMatchObject({ code: "reference", field: "body.doubtIds" });
@@ -444,7 +444,7 @@ for (const action of ["consult", "continue"] as const) {
       if (request.stage === "contribution") { rounds.push(request.round); return { ...contribution(request), doubts: request.round === 5 && session.model.id !== "director" ? [{ question: "Redesign?", purpose: "Final clarification" }] : [] }; }
       if (request.stage === "decision") {
         if (request.round === 5 && action === "continue") {
-          const rejected = await session.boundTools.get("architecture_submit").execute("over-limit", { submissionId: "over-limit", body: decision("continue") }, undefined, undefined, { sessionManager: session.sessionManager });
+          const rejected = await session.boundTools.get("architecture_submit").execute("over-limit", { body: decision("continue") }, undefined, undefined, { sessionManager: session.sessionManager });
           expect(rejected.isError).toBe(true); expect(rejected.details.code).toBe("action");
         }
         return decision(request.round === 5 ? action === "continue" ? "synthesize" : action : "continue");
@@ -458,7 +458,7 @@ for (const action of ["consult", "continue"] as const) {
       if (request.stage === "knowledge") return { kind: "knowledge", resolutions: request.context.doubts.map((d: any) => ({ doubtId: d.id, status: "partial", answer: "Requires redesign", supportIds: [request.context.responses[0].id] })) };
       if (request.stage === "synthesis") {
         expect(request.context.pendingDoubts).toHaveLength(action === "consult" ? 1 : 2);
-        const rejected = await session.boundTools.get("architecture_submit").execute("false-complete", { submissionId: "false-complete", body }, undefined, undefined, { sessionManager: session.sessionManager });
+        const rejected = await session.boundTools.get("architecture_submit").execute("false-complete", { body }, undefined, undefined, { sessionManager: session.sessionManager });
         expect(rejected.isError).toBe(true); expect(rejected.details).toMatchObject({ code: "coverage", field: "body.status", correctionsLeft: 1 });
         return { ...body, status: "partial", pending: ["Requires redesign"] };
       }

@@ -6,19 +6,18 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import * as archive from "../extensions/table/archive.ts";
 import { evidenceFile, ledgerFile, ledgerTemplate, openExecutionPlan, planFile, readFrozenPlan } from "../extensions/workflow.ts";
-import * as agent from "../extensions/agent/index.ts";
 import { architectureFixture } from "./fixtures/architecture.ts";
 import { jsonBytes, sealPages } from "../extensions/table/results.ts";
 import { cancelAllWorkers, clearBackgroundOwner, setBackgroundExecutor, teamWorkerStatus, workerHandoff } from "../extensions/agent/background.ts";
 import { retireTeamEvaluation, hasUnsettledTeamWork } from "../extensions/team.ts";
 import { assertQuiescent, reserveOperation } from "../extensions/agent/head/operation-leases.ts";
-import { captureCallContext, checkCallContext, withCallContext } from "../extensions/workflow-engine.ts";
+import { captureCallContext, checkCallContext, reserveEffect, withCallContext } from "../extensions/workflow-engine.ts";
+import { assertNoCheckpointLease } from "../extensions/agent/head/checkpoint-lease.ts";
 import { openSqliteSync } from "../extensions/board/sqlite.ts";
 
 const privateRoot = () => realpathSync(mkdtempSync(path.join(tmpdir(), "pitako-table-archive-")));
 const parse = (envelope: any) => JSON.parse(envelope.content[0].text);
 const startArchive = archive.startTableArchive;
-const prepareTeamWatch = agent.prepareTeamWatch;
 // Admission now journals before preparation; it still may not adopt a ledger or archive.
 const journalEntries = new Set([".pitako", ".pitako/runs", "runs",
   ...["workflow-state.sqlite", "workflow-state.sqlite-shm", "workflow-state.sqlite-wal"]
@@ -186,16 +185,9 @@ for (const protocol of ["architecture", "review"] as const) {
     const s = await f.setup({ config: "", prompt(_session, request, body) {
       return request.stage === "composition" ? { ...body, specialists: [] } : body;
     } });
-    const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
-    f.fixture.finishOnCleanup(release.resolve);
     const operations: archive.TableArchive[] = [];
     const capture = spyOn(archive, "startTableArchive").mockImplementation((...args) => {
       const operation = startArchive(...args); operations.push(operation); return operation;
-    });
-    // Hold the actual admission boundary, not archive capture or ledger I/O.
-    const preflight = spyOn(agent, "prepareTeamWatch").mockImplementation(async (...args) => {
-      entered.resolve(); await release.promise; args[3]();
-      return prepareTeamWatch(...args);
     });
     try {
       execFileSync("git", ["init", "-q", s.root]);
@@ -213,7 +205,8 @@ for (const protocol of ["architecture", "review"] as const) {
       const started = await s.invoke(`${protocol}_start`, { goal: "Observe archive without adopting execution", plan: "legacy", unit: "inspect",
         ...(protocol === "review" ? { object: { kind: "brief", text: "Local" }, criteria: ["stable"] } : {}) });
       expect(started.isError).not.toBe(true);
-      await entered.promise;
+      // reserveBackground schedules preparation in a macrotask after this
+      // continuation. Inspect/cancel here without mocking another entrygraph's exports.
       expect(s.host.sessions).toEqual([]);
       expect(readFileSync(ledger)).toEqual(before);
       expect(entries()).toEqual(beforeEntries); // No archive-enabling ledger or registry.
@@ -222,7 +215,7 @@ for (const protocol of ["architecture", "review"] as const) {
         expect(readFileSync(ledger)).toEqual(before);
         expect(entries()).toEqual(beforeEntries);
       }
-      release.resolve(); await s.delivered.promise;
+      await s.delivered.promise;
       await Promise.all(operations.map(operation => operation.completion));
       await s.bookkeeping(started.details.instanceId);
       const target = { assignmentId: started.details.assignmentId };
@@ -246,14 +239,13 @@ for (const protocol of ["architecture", "review"] as const) {
       expect(operations[0]!.state).toEqual({ state: "written", path: destination });
       expect(JSON.parse(readFileSync(destination, "utf8"))).toEqual(result);
       expect(readFileSync(file)).toEqual(planBefore);
-      const locks = [`runs/legacy/team-holds-projection.sqlite`,
-        ...(action === "prepare" ? ["runs/legacy/ledger-writer.sqlite"] : [])];
+      const locks = action === "prepare" ? ["runs/legacy/ledger-writer.sqlite"] : [];
       expect(entries()).toEqual([...beforeEntries, ...locks, "table-results", `table-results/${resultId}.json`].sort());
       for (const lock of locks) expectEmptyLock(path.join(s.root, ".pitako", lock));
     } finally {
-      release.resolve(); await s.close();
+      await s.close();
       await Promise.all(operations.map(operation => operation.completion));
-      preflight.mockRestore(); capture.mockRestore();
+      capture.mockRestore();
     }
   }));
 
@@ -585,6 +577,61 @@ test("uncertain file close retains temp, handle and writer reservation instead o
   console.log("TABLE_ARCHIVE_UNCERTAIN_RETAINED", root);
 });
 
+test("admitted archive owns exact target/temp intent; late original closure releases only that footprint", async () => {
+  const root = privateRoot(), context = captureCallContext(root), guard = checkCallContext(context);
+  const id = randomUUID(), paths = archive.tableArchivePaths({ root }, id);
+  const producer = reserveEffect(context, { reservationId: randomUUID(), kind: "writer", paths })
+    .register("table-archive", ["host-operation", "callback"]);
+  producer.enter();
+  let allowClose = false;
+  const operation = startArchive({ root }, id, "canonical", { ...fs, async open(...args) {
+    const actual = await fs.open(...args);
+    return new Proxy(actual, { get(target, key) {
+      if (key === "close") return async () => {
+        if (!allowClose) throw new Error("controlled late close");
+        await target.close();
+      };
+      const value = Reflect.get(target, key);
+      return typeof value === "function" ? value.bind(target) : value;
+    } });
+  } }, producer);
+  try {
+    await operation.completion;
+    const failed = structuredClone(operation.state);
+    expect(failed).toMatchObject({ state: "failed", settlement: "unknown", retained: paths[1] });
+    expect(operation.closure).toBe("unknown");
+    for (const target of paths) {
+      expect(() => reserveOperation(target, "writer", context)).toThrow("closure unknown");
+    }
+    expect(() => assertNoCheckpointLease(root, true)).not.toThrow(); // No lifecycle root veto.
+    expect(() => reserveOperation(root, "checkpoint", context)).toThrow("closure unknown");
+    const independent = withCallContext(context, () => startArchive({ root }, randomUUID(), "independent"));
+    await independent.completion;
+    expect(independent.state.state).toBe("written");
+    // An already admitted but unrelated producer cannot bypass target ownership or be falsely closed.
+    const mismatch = startArchive({ root }, randomUUID(), "not owned", fs, producer);
+    await mismatch.completion;
+    expect(mismatch.state).toMatchObject({ state: "unavailable", reason: expect.stringContaining("exact publication intent") });
+    expect(operation.closure).toBe("unknown");
+    expect(() => assertQuiescent(root)).toThrow("closure unknown");
+    allowClose = true;
+    await operation.closeRetained();
+    expect(operation.closure).toBe("released");
+    expect(operation.retainedHandle).toBeUndefined();
+    expect(operation.state).toEqual(failed); // Closure is not a successful archival outcome.
+    expect(() => assertQuiescent(root)).not.toThrow();
+    const checkpoint = reserveOperation(root, "checkpoint", context);
+    expect(() => assertNoCheckpointLease(root, true)).toThrow("active");
+    checkpoint.release();
+    expect(existsSync(paths[0]!)).toBe(false);
+    expect(readFileSync(paths[1]!, "utf8")).toBe("canonical");
+  } finally {
+    allowClose = true;
+    await operation.closeRetained();
+    guard.close(); rmSync(root, { recursive: true, force: true });
+  }
+});
+
 const retained: unknown[] = [];
 for (const protocol of ["architecture", "review"] as const) test(`${protocol} retirement retains an uncertain archive without revoking the delivered judgment or blocking reads`, async () => {
   const root = privateRoot(), env = process.env.PI_CODING_AGENT_DIR;
@@ -618,16 +665,20 @@ for (const protocol of ["architecture", "review"] as const) test(`${protocol} re
     expect(result.judgment).not.toBeNull();
     expect(await s.read(`${protocol}_read`, { roomId: started.details.roomId, section: "archive" }))
       .toMatchObject({ state: "failed", settlement: "unknown" });
-    // Unknown writers still fence effects, not in-memory result/diagnostic reading.
-    expect((await s.invoke(`${protocol}_start`, args)).isError).toBe(true);
+    // The original unknown file writer cannot exclude another independent strategy.
+    control.mockRestore();
+    const next = await s.invoke(`${protocol}_start`, args);
+    expect(next.isError, JSON.stringify(next)).not.toBe(true);
+    await s.bookkeeping(next.details.instanceId);
+    await operations[1]!.completion;
     expect((await s.invoke(`${protocol}_control`, { roomId: started.details.roomId, action: "stop" })).isError).toBe(true);
-    expect(operations).toHaveLength(1);
+    expect(operations).toHaveLength(2);
     expect(await s.read("team_result", { assignmentId: started.details.assignmentId })).toEqual(result);
     const receipt = workerHandoff(started.details.instanceId);
     expect(receipt?.delivery).toBe("incorporated");
     await expect(s.close()).rejects.toThrow("table archive closure unknown");
     expect(workerHandoff(started.details.instanceId)).toEqual(receipt); // row/resources not deleted
-    expect(readdirSync(path.join(root, ".pitako/table-results"))).toHaveLength(1);
+    expect(readdirSync(path.join(root, ".pitako/table-results"))).toHaveLength(2);
     expect(() => assertQuiescent(root)).toThrow("closure unknown");
   } finally {
     await Promise.all(operations.map(operation => operation.completion));

@@ -5,7 +5,7 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { WorkerHistory, type HistoryGroup } from "./history.ts";
 import { assertCheckpointWorkersReleased } from "./background.ts";
 import { executionForSession } from "../execution-identity.ts";
-import { ledgerFile, parseLedgerBinding, readLedgerTeamHolds, verifyExecutionBinding } from "../workflow.ts";
+import { ledgerFile, parseLedgerBinding, verifyExecutionBinding } from "../workflow.ts";
 import { contains } from "./head/graph.ts";
 import { AdmissionInventory, checkpointGitPolicy, digest, localGitEnv, raw, type Contribution, type RawFile, type SourceInventory } from "./head/inventory.ts";
 import type { ManagedAssignment } from "./head/managed-tools.ts";
@@ -250,9 +250,6 @@ function checkpointHistory(manifest: CheckpointManifest, agentDir: string) {
         const binding = { planId: match[1]!, revision: Number(match[2]), hash: match[3]!, executionRoot: group.identity.executionRoot,
           planSource: saved.planSource };
         verifyExecutionBinding(binding);
-        if (readLedgerTeamHolds(group.identity.executionRoot, match[1]!, binding).some(hold => hold.assignmentId === assignmentId)) {
-          gaps.push(`Unreconciled execution hold: ${assignmentId}`);
-        }
       }
     } catch (error) { gaps.push(`${key}: ${String(error)}`); }
   }

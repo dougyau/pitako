@@ -41,7 +41,7 @@ export function registerArchitecture(pi: ExtensionAPI) {
     parameters: Type.Object({ goal: Type.String({ minLength: 1, description: briefGuidance }), topic: Type.Optional(text), plan: Type.Optional(text), unit: Type.Optional(text), boardTopicId: Type.Optional(text) }, strict),
     async execute(toolCallId, params, _signal, _update, ctx) {
       try {
-        assertNoCheckpointLease(ctx.cwd);
+        assertNoCheckpointLease(ctx.cwd, true);
         const context = captureCallContext(ctx.cwd, ctx.sessionManager);
         const captured = captureTeamWatch(params, ctx);
         if (captured.error) throw new Error(captured.error);
@@ -100,7 +100,7 @@ export function registerArchitecture(pi: ExtensionAPI) {
   pi.registerTool({ name: "architecture_control", label: "Control architecture consultation", description: "Supply next-boundary context or priorities, finish after the current exchange, or revoke immediately with stop. Stop is not proof of closure.",
     parameters: Type.Object({ roomId: text, action: Type.Union([Type.Literal("context"), Type.Literal("priorities"), Type.Literal("finish"), Type.Literal("stop")]), text: Type.Optional(text) }, strict),
     execute: protect(async (toolCallId, params, _signal, _update, ctx) => {
-      assertNoCheckpointLease(ctx.cwd);
+      assertNoCheckpointLease(ctx.cwd, true);
       const room = roomFor(params.roomId, ctx);
       if (!room.runtime) {
         if (params.action !== "stop") throw new Error("architecture preparation pending");

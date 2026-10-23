@@ -544,7 +544,7 @@ reasoning = "high"
     expect(start).toContain("--no-approve");
     expect(start).not.toContain("--approve");
     expect(start[start.indexOf("--exclude-tools") + 1]).toBe(
-      "architecture_start,architecture_read,architecture_control,review_start,review_read,review_control,consultation_feedback,execution_disposition,execution_gates,execution_review,execution_acceptance,task_status,task_finish,agent_run,agent_supervise,agent_spawn,agent_status,agent_result,agent_history,agent_observe,agent_input,agent_cancel,team_assign,team_status,team_result,team_cancel",
+      "architecture_start,architecture_read,architecture_control,review_start,review_read,review_control,consultation_feedback,execution_disposition,execution_gates,execution_review,execution_acceptance,task_status,task_finish,workflow_status,agent_run,agent_supervise,agent_spawn,agent_status,agent_result,agent_history,agent_observe,agent_input,agent_cancel,team_assign,team_status,team_result,team_cancel",
     );
     const preamble = start[start.indexOf("--append-system-prompt") + 1] ?? "";
     expect(preamble).not.toContain("AgentInstance");

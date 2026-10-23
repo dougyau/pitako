@@ -157,3 +157,36 @@ test("exact escaped bridge envelope leaves room for fragments below both caps", 
   expect(Buffer.byteLength(JSON.stringify(success(request, page)) + "\n")).toBeLessThanOrEqual(replyBytes);
   expect(page.records.length).toBeGreaterThan(0);
 });
+
+test("history decoders identify legacy and host-bound inputs without changing original bytes or live authority", async () => {
+  const { decodeArchitectureMessage, decodeArchitectureSubmit, decodeSubmitInput } = await import("../extensions/agent/bridge/client.js");
+  const { submitSchema } = await import("../extensions/architecture/types.ts");
+  const { Value } = await import("typebox/value");
+  const body = { kind: "composition", reason: "Director alone", specialists: [] };
+  const oldInputs = [
+    { submissionId: "authored-id", body: { ...body, snapshotId: "model-snapshot" } },
+    { submissionId: "earlier", body: { kind: "composition", snapshotId: "model-snapshot", specialists: [{ candidateRef: "general:0", mandate: "Focus", reason: "Useful" }] } },
+  ];
+  const inputs = [...oldInputs, { body }];
+  for (const [index, input] of inputs.entries()) {
+    const original = JSON.stringify(input), decoded = decodeArchitectureSubmit(input)!;
+    expect(decoded).toMatchObject({ version: index < 2 ? 1 : 2, provenance: index < 2 ? "model-administrative" : "host-bound", liveAuthority: false });
+    expect(Object.is(decoded.input, input)).toBe(true); expect(JSON.stringify(input)).toBe(original);
+    expect(Value.Check(submitSchema, input)).toBe(index === 2);
+    const message = { id: "publication", ordinal: 1, roomId: "room", assignmentId: "assignment", memberId: "member", author: "architect", stage: "composition",
+      snapshotId: "host-frontier", turnId: "turn", attemptId: "attempt", body: input.body,
+      ...(index === 2 ? { submission: { version: 2, provenance: "host-bound", compositionBasis: { snapshotId: "host-candidates", candidateRefs: [], retainableMemberIds: [] } } } : {}),
+      native: { sessionId: "session", toolCallId: "native-call", persistence: "unconfirmed" }, doubts: [] };
+    const serialized = JSON.stringify(message);
+    expect(decodeArchitectureMessage(message)).toMatchObject({ version: decoded.version, provenance: decoded.provenance, liveAuthority: false });
+    expect(Object.is(decodeArchitectureMessage(message)!.message, message)).toBe(true);
+    expect(JSON.stringify(message)).toBe(serialized);
+    expect(isArchitectureRecord({ kind: "publication", id: message.id, message })).toBe(true);
+    expect(decodeArchitectureMessage({ ...message, submission: { version: 3, provenance: "host-bound" } })).toBeUndefined();
+  }
+  expect(decodeArchitectureSubmit({ body: oldInputs[0]!.body })).toBeUndefined();
+  expect(decodeArchitectureSubmit({ body, grant: "transcribed" })).toBeUndefined();
+  const review = { body: { kind: "preparation", analysis: "Independent review", findings: [], doubts: [] } };
+  expect(decodeSubmitInput(review)).toMatchObject({ version: 2, provenance: "host-bound", liveAuthority: false, input: review });
+  expect(decodeSubmitInput({ submissionId: "old", ...review })).toMatchObject({ version: 1, provenance: "model-administrative", liveAuthority: false });
+});

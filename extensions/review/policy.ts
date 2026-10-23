@@ -72,12 +72,12 @@ function judgmentGrounds(messages: TableMessage[], references: string[], boundar
   }).filter(item => item !== undefined);
 }
 
-export function validateReview(grant: ReviewGrant, value: unknown): { submissionId: string; body: ReviewBody } {
+export function validateReview(grant: ReviewGrant, value: unknown): { body: ReviewBody } {
   const reject = (field: string, badIds: string[] = [], missingIds: string[] = []): never => {
     throw new SubmissionError({ code: "reference", stage: grant.rules.kind, field, badIds, missingIds, correctionsLeft: 0 });
   };
   if (!Value.Check(submitSchema, value)) reject("body");
-  const submitted = value as { submissionId: string; body: ReviewBody }, body = submitted.body;
+  const submitted = value as { body: ReviewBody }, body = submitted.body;
   if (body.kind !== grant.rules.kind) reject("body.kind");
   const meaningful = (value: unknown): boolean => typeof value === "string" ? !!value.trim()
     : Array.isArray(value) ? value.every(meaningful)

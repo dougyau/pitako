@@ -1,8 +1,9 @@
-import { afterEach, beforeEach, describe, expect, test as bunTest } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, spyOn, test as bunTest } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import * as childProcess from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type ExtensionContext, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream, type AssistantMessage, type ToolResultMessage } from "@earendil-works/pi-ai";
@@ -27,7 +28,7 @@ const setup = (critique = false) => {
   config: "[review]\ncandidates = []\n[architecture]\ncandidates = []\n",
   prompt: (_session, request, body) => {
     if (request.stage === "composition")
-      return { kind: "composition", snapshotId: request.snapshot.id, specialists: [], reason: "Bounded independent design" };
+      return { kind: "composition", specialists: [], reason: "Bounded independent design" };
     if (critique && request.protocol === "Pitako review" && request.stage === "synthesis") {
       critique = false;
       return { ...body, verdict: "changes-required", newFindings: [{ finding: {
@@ -40,6 +41,51 @@ const setup = (critique = false) => {
   });
 };
 type App = Awaited<ReturnType<typeof setup>>;
+function controlTaskFixtureDiscovery(root: string, git: boolean, marker: "TASK_WAIT_DISCOVERY" | "TASK_ERROR_DISCOVERY" | "TASK_FULL_DISCOVERY" | "TASK_STRATEGY_DISCOVERY", label = "") {
+  expect(realpathSync(root)).toBe(root);
+  if (git) {
+    expect(realpathSync(path.join(root, ".git"))).toBe(path.join(root, ".git"));
+    expect(statSync(path.join(root, ".git")).isDirectory()).toBe(true);
+  } else expect(existsSync(path.join(root, ".git"))).toBe(false);
+  const original = childProcess.execFileSync;
+  const discoveryCalls = { state: { real: 0, replayed: 0 }, top: { real: 0, replayed: 0 } };
+  const observed = new Map<"state" | "top", { ok: true; value: string } | { ok: false; error: unknown }>();
+  const stateArgv = JSON.stringify(["rev-parse", "--is-inside-work-tree", "--is-bare-repository", "--path-format=absolute", "--git-common-dir"]);
+  const topArgv = JSON.stringify(["rev-parse", "--path-format=absolute", "--show-toplevel"]);
+  const capture = spyOn(childProcess, "execFileSync").mockImplementation(new Proxy(original, {
+    apply(target, thisArg, args) {
+      const options = args[2];
+      if (args[0] !== "git" || options?.cwd !== root || options.encoding !== "utf8" ||
+          JSON.stringify(options.stdio) !== JSON.stringify(["ignore", "pipe", "pipe"]) ||
+          options.env?.LC_ALL !== "C" || Object.keys(options.env).some(key => key.startsWith("GIT_")))
+        return Reflect.apply(target, thisArg, args);
+      const argv = JSON.stringify(args[1]);
+      const kind = argv === stateArgv ? "state" : argv === topArgv ? "top" : undefined;
+      if (!kind) return Reflect.apply(target, thisArg, args);
+      const prior = observed.get(kind);
+      if (prior) {
+        discoveryCalls[kind].replayed++;
+        if (prior.ok) return prior.value;
+        throw prior.error;
+      }
+      discoveryCalls[kind].real++;
+      try {
+        const value = Reflect.apply(target, thisArg, args);
+        if (typeof value !== "string") throw new Error("controlled Git discovery expected the real UTF-8 response");
+        observed.set(kind, { ok: true, value });
+        return value;
+      } catch (error) {
+        observed.set(kind, { ok: false, error });
+        throw error;
+      }
+    },
+  }));
+  f.fixture.releaseDirectoriesAfterDisposal(() => {
+    console.error(`${marker} ${label}${git ? "Git" : "no-Git"} ${JSON.stringify(discoveryCalls)}`);
+    capture.mockRestore();
+  }, []);
+  return { discoveryCalls, observed };
+}
 async function freeze(app: App, correct = false) {
   let body = "# Goal\nImplement the bounded local behavior without publication.\n";
   let draft = payload(await app.invoke("planning_write", {
@@ -197,8 +243,9 @@ test("native streaming /task Freeze keeps its original loop on the real derived 
   }
 });
 
-async function prepareTask(app: App, git: boolean, input = "example") {
+async function prepareTask(app: App, git: boolean, input = "example", onFixtureReady?: () => void) {
     if (git) execFileSync("git", ["init", "-q"], { cwd: app.root });
+    onFixtureReady?.();
     await app.commands.get("task").handler(input, app.ctx);
     const before = captureCallContext(app.root, app.ctx.sessionManager);
     if (before.kind !== "managed") throw new Error("missing task");
@@ -239,92 +286,112 @@ async function prepareTask(app: App, git: boolean, input = "example") {
     return { owner, context, receipt, gates };
 }
 
-for (const git of [false, true]) test(`registered task wait preserves automatic Freeze handoff (${git ? "Git" : "no Git"})`, async () => {
-  const held = Promise.withResolvers<void>();
-  let compositions = 0;
+for (const git of [false, true]) test(git ? "registered task Git-root Freeze preserves automatic /task handoff"
+  : "registered task wait preserves automatic Freeze handoff (no Git)", async () => {
+  const started = performance.now();
+  const stage = (name: string) => console.error(`TASK_WAIT_STAGE ${git ? "Git" : "no-Git"} ${name} ${Math.round(performance.now() - started)}ms`);
+  stage("begin");
   const storageRoot = mkdtempSync(path.join(tmpdir(), "pitako-task-wait-storage-"));
   f.fixture.directories.push(storageRoot);
   const app = await f.setup({ storageRoot, config: "[review]\ncandidates = []\n[architecture]\ncandidates = []\n",
-    prompt: async (_session, request) => {
-      if (request.stage === "composition") {
-        if (++compositions === 2) await held.promise;
-        return { kind: "composition", snapshotId: request.snapshot.id, specialists: [], reason: "Bounded independent design" };
-      }
-    },
+    prompt: (_session, request) => request.stage === "composition"
+      ? { kind: "composition", specialists: [], reason: "Bounded independent design" } : undefined,
   });
+  stage("setup-complete");
   app.pi.getAllTools = () => [...app.tools.values()].map(tool => ({ ...tool, sourceInfo: { path: "controlled:pitako" } }));
   const native = SessionManager.inMemory(app.root);
   app.ctx.sessionManager.getBranch = () => native.getBranch();
   app.ctx.sessionManager.getEntries = () => native.getEntries();
   app.pi.sendMessage = (message: any, options: any) => {
     app.sent.push({ message, options });
-    if (!options.triggerTurn) native.appendCustomMessageEntry(message.customType, message.content, message.display, message.details);
+    native.appendCustomMessageEntry(message.customType, message.content, message.display, message.details);
   };
-  let second: ReturnType<typeof handle> | undefined;
+  let independent: ReturnType<typeof registerBackgroundAttempt> | undefined;
   try {
     if (git) execFileSync("git", ["init", "-q"], { cwd: app.root });
+    stage("git-init-complete");
+    const { discoveryCalls, observed } = controlTaskFixtureDiscovery(app.root, git, "TASK_WAIT_DISCOVERY");
     await app.commands.get("task").handler("example", app.ctx);
+    stage("task-start-complete");
     const context = captureCallContext(app.root, app.ctx.sessionManager);
     if (context.kind !== "managed") throw new Error("missing task");
     const owner = checkAuthority(context.authority), original = payload(await app.invoke("task_status", {}));
     const draft = payload(await app.invoke("planning_write", { revision: "absent", fileHash: null,
       body: "# Goal\nBounded local behavior, no publication.\n", execution: "expected" })).snapshot;
+    stage("planning-write-complete");
     const design = handle(await app.invoke("architecture_start", { goal: "Review complete current bounded design" }));
+    stage("architecture-start-complete");
     await app.bookkeeping(design.instanceId);
-    const offer = await app.emit("agent_before_settle", { outcome: "completed" });
-    for (const entry of offer?.entries ?? [])
-      native.appendCustomMessageEntry(entry.customType, entry.content, entry.display, entry.details);
-    await app.emit("turn_start");
-    second = handle(await app.invoke("architecture_start", { goal: "Independent second design on the same object" }));
-    const inspection = payload(await app.invoke("execution_disposition", { op: "inspect" }));
-    const obligation = inspection.obligations.find((item: any) => item.dispatchId === design.dispatchId);
-    expect(obligation.state).toBe("disposition-required");
-    expect(obligation.boundary).toBe("turn_start");
-    expect(native.getBranch().some(entry => entry.id === obligation.receipt.entryId)).toBe(true);
+    stage("architecture-bookkeeping-complete");
     const slot = owner.slotProducer!;
     expect(slot.live).toBe(true);
     expect(slot.snapshot()).toMatchObject({ adapter: "planning-slot", entered: true, sealed: false });
-    expect(inspection.waitProducers.some((item: any) => item.adapter === "planning-slot")).toBe(false);
     let selfReady = false;
-    expect(waitForProducer(context.authority, slot.ref, slot.cursor, () => { selfReady = true; }))
-      .toEqual({ kind: "deferred", reason: "host-return-dependent" });
-    const selfClaim = { op: "record", obligationId: obligation.obligationId, expectedVersion: obligation.version,
-      reason: "The captured planning slot cannot complete independently of this workflow",
-      choice: { kind: "wait", producerRef: slot.ref, afterSequence: slot.cursor } };
-    const selfAdmission = await app.emit("tool_call", {
-      toolName: "execution_disposition", toolCallId: "task-self-wait", input: selfClaim,
-    });
-    expect(selfAdmission?.block).not.toBe(true); // The read tool admits the claim; producer accreditation rejects it.
-    await expect(app.invoke("execution_disposition", selfClaim)).rejects.toThrow("host-return-dependent");
-    const rejected = payload(await app.invoke("execution_disposition", { op: "inspect" }));
-    expect(rejected.obligations).toEqual(inspection.obligations);
-    expect(rejected.dispositions).toEqual(inspection.dispositions);
-    expect(payload(await app.invoke("task_status", {}))).toEqual(original);
-    const producer = inspection.waitProducers.find((item: any) => item.adapter === "background-attempt");
-    expect(producer).toBeDefined();
-    const claim = { op: "record", obligationId: obligation.obligationId, expectedVersion: obligation.version,
-      reason: "Wait for the independent second live design",
-      choice: { kind: "wait", producerRef: producer.producerRef, afterSequence: producer.afterSequence } };
-    const admission = await app.emit("tool_call", { toolName: "execution_disposition", toolCallId: "task-wait", input: claim });
-    expect(admission?.block).not.toBe(true);
-    await app.invoke("execution_disposition", claim);
-    const waiting = payload(await app.invoke("task_status", {}));
-    expect(waiting.state).toBe("waiting");
-    expect(waiting.version).toBe(original.version + 1);
-    await expect(app.invoke("execution_disposition", claim)).rejects.toThrow("exact effective receipt/boundary and version");
-    held.resolve();
-    await app.bookkeeping(second.instanceId);
-    const settled = payload(await app.invoke("task_status", {}));
-    expect(settled.state).toBe("active");
-    expect(settled.version).toBe(waiting.version + 1);
+    let settled = original;
+    if (!git) {
+      const offer = await app.emit("agent_before_settle", { outcome: "completed" });
+      for (const entry of offer?.entries ?? [])
+        native.appendCustomMessageEntry(entry.customType, entry.content, entry.display, entry.details);
+      await app.emit("turn_start");
+      stage("turn-start-complete");
+      independent = registerBackgroundAttempt(context, { cwd: app.root, instanceId: "independent-attempt",
+        dispatchId: randomUUID(), roleId: "developer" });
+      independent.admit();
+      stage("independent-admitted");
+      const inspection = payload(await app.invoke("execution_disposition", { op: "inspect" }));
+      const obligation = inspection.obligations.find((item: any) => item.dispatchId === design.dispatchId);
+      expect(obligation.state).toBe("disposition-required");
+      expect(obligation.boundary).toBe("turn_start");
+      expect(native.getBranch().some(entry => entry.id === obligation.receipt.entryId)).toBe(true);
+      expect(inspection.waitProducers.some((item: any) => item.adapter === "planning-slot")).toBe(false);
+      expect(waitForProducer(context.authority, slot.ref, slot.cursor, () => { selfReady = true; }))
+        .toEqual({ kind: "deferred", reason: "host-return-dependent" });
+      const selfClaim = { op: "record", obligationId: obligation.obligationId, expectedVersion: obligation.version,
+        reason: "The captured planning slot cannot complete independently of this workflow",
+        choice: { kind: "wait", producerRef: slot.ref, afterSequence: slot.cursor } };
+      const selfAdmission = await app.emit("tool_call", {
+        toolName: "execution_disposition", toolCallId: "task-self-wait", input: selfClaim,
+      });
+      expect(selfAdmission?.block).not.toBe(true); // The read tool admits the claim; producer accreditation rejects it.
+      await expect(app.invoke("execution_disposition", selfClaim)).rejects.toThrow("host-return-dependent");
+      const rejected = payload(await app.invoke("execution_disposition", { op: "inspect" }));
+      expect(rejected.obligations).toEqual(inspection.obligations);
+      expect(rejected.dispositions).toEqual(inspection.dispositions);
+      expect(payload(await app.invoke("task_status", {}))).toEqual(original);
+      const producer = inspection.waitProducers.find((item: any) =>
+        item.producerRef.resourceId === independent!.producer.ref.resourceId);
+      expect(producer).toBeDefined();
+      const claim = { op: "record", obligationId: obligation.obligationId, expectedVersion: obligation.version,
+        reason: "Wait for the independent live attempt",
+        choice: { kind: "wait", producerRef: producer.producerRef, afterSequence: producer.afterSequence } };
+      const admission = await app.emit("tool_call", { toolName: "execution_disposition", toolCallId: "task-wait", input: claim });
+      expect(admission?.block).not.toBe(true);
+      await app.invoke("execution_disposition", claim);
+      stage("wait-recorded");
+      const waiting = payload(await app.invoke("task_status", {}));
+      expect(waiting.state).toBe("waiting");
+      expect(waiting.version).toBe(original.version + 1);
+      await expect(app.invoke("execution_disposition", claim)).rejects.toThrow("exact effective receipt/boundary and version");
+      independent.producer.observe("preparation", "closed");
+      independent.producer.observe("host-operation", "closed");
+      expect(independent.producer.observe("callback", "closed", true)).toBeDefined();
+      stage("independent-closed");
+      settled = payload(await app.invoke("task_status", {}));
+      expect(settled.state).toBe("active");
+      expect(settled.version).toBe(waiting.version + 1);
+    }
     const candidate = payload(await app.invoke("planning_candidate", { revision: draft.revision, fileHash: draft.fileHash }));
+    stage("candidate-complete");
     const review = handle(await app.invoke("planning_review", { candidateId: candidate.candidateId,
       goal: "Review the complete current candidate", criteria: ["Local boundary"] }));
+    stage("review-start-complete");
     await app.bookkeeping(review.instanceId);
+    stage("review-bookkeeping-complete");
     const receipt = payload(await app.invoke("planning_freeze", { candidateId: candidate.candidateId,
       designAssignmentId: design.assignmentId, reviewAssignmentId: review.assignmentId, dispositions: [],
       designAdoption: "Adopt complete unchanged design", acceptance: "Accept complete reviewed bounded plan",
-      absorption: "Both complete designs and associated Review absorbed" }));
+      absorption: git ? "The complete design and Review were absorbed" : "The complete design, closed independent attempt, and Review were absorbed" }));
+    stage("freeze-complete");
     const execution = payload(await app.invoke("task_status", {}));
     expect(execution).toMatchObject({ runId: original.runId, ownerId: original.ownerId, epoch: original.epoch,
       phase: "execution", phaseEpoch: original.phaseEpoch + 1, version: settled.version + 1, state: "active",
@@ -332,14 +399,16 @@ for (const git of [false, true]) test(`registered task wait preserves automatic 
     expect(execution.waitRef).toBeUndefined();
     expect(slot.live).toBe(false);
     expect(slot.snapshot()).toMatchObject({ sealed: true, facts: { "host-operation": "closed" } });
-    expect(owner.store.get<any>("reservations", slot.ref.reservationId)?.state).toBe("released");
-    expect(selfReady).toBe(false);
+    expect(owner.store.closureReceipt(slot.ref)).toBeDefined();
+    expect(slot.snapshot().effectReservation).toBeUndefined();
+    if (!git) expect(selfReady).toBe(false);
     expect(owner.run).toEqual(execution);
     expect(owner.store.all<any>("dispositions").find(item => item.kind === "planning-acceptance").receipt).toEqual(receipt);
     expect(readFileSync(planFile("example", app.root), "utf8")).toBe(receipt.snapshot.text);
     expect(existsSync(ledgerFile("example", app.root))).toBe(true);
     expect(() => checkAuthority(context.authority)).toThrow("stale");
     await app.commands.get("task").handler("example", app.ctx);
+    stage("task-handoff-complete");
     const turns = app.sent.filter(item => item.message.customType === "pitako.workflow.task");
     expect(turns).toHaveLength(2);
     const turn = turns[1]!;
@@ -351,10 +420,28 @@ for (const git of [false, true]) test(`registered task wait preserves automatic 
       policy: readFileSync(path.join(import.meta.dir, "../skills/execute/SKILL.md"), "utf8") });
     expect(turn.options.triggerTurn).toBe(true);
     expect(app.sent.some(item => item.message.customType === "pitako.workflow.execute")).toBe(false);
+    expect(discoveryCalls.state.real).toBe(1);
+    expect(discoveryCalls.state.replayed).toBeGreaterThan(1);
+    if (git) {
+      expect(discoveryCalls.top.real).toBe(1);
+      expect(discoveryCalls.top.replayed).toBeGreaterThan(1);
+      expect(observed.get("state")).toEqual({ ok: true, value: `true\nfalse\n${path.join(app.root, ".git")}\n` });
+      expect(observed.get("top")).toEqual({ ok: true, value: `${app.root}\n` });
+    } else {
+      expect(discoveryCalls.top).toEqual({ real: 0, replayed: 0 });
+      const state = observed.get("state");
+      expect(state?.ok).toBe(false);
+      if (state?.ok === false) expect(String((state.error as { stderr?: unknown }).stderr)).toContain("not a git repository");
+    }
   } finally {
-    held.resolve();
-    if (second) await app.bookkeeping(second.instanceId);
+    stage("cleanup-begin");
+    if (independent?.producer.live) {
+      independent.producer.observe("preparation", "closed");
+      independent.producer.observe("host-operation", "closed");
+      independent.producer.observe("callback", "closed", true);
+    }
     await app.close();
+    stage("cleanup-complete");
   }
 });
 
@@ -362,9 +449,14 @@ for (const command of ["task", "execute"] as const)
 for (const outcome of ["error", "aborted"] as const)
 test(`observed ${outcome} fences /${command} execution capabilities before agent_end`, async () => {
     const app = await setup(true);
+    const started = performance.now();
+    const stage = (name: string) => console.error(`TASK_ERROR_STAGE ${command}/${outcome} ${name} ${Math.round(performance.now() - started)}ms`);
+    stage("setup-complete");
+    const discovery = controlTaskFixtureDiscovery(app.root, false, "TASK_ERROR_DISCOVERY", `${command}/${outcome} `);
     const release = Promise.withResolvers<void>();
     try {
       const prepared = await prepareTask(app, false);
+      stage("prepare-complete");
       if (command === "execute") {
         await app.emit("session_before_switch");
         await app.commands.get("execute").handler("example", app.ctx);
@@ -376,11 +468,13 @@ test(`observed ${outcome} fences /${command} execution capabilities before agent
       let joined = false;
       owner.retire.add(async () => { await release.promise; joined = true; });
       const observed = app.emit("message_end", { message: { role: "assistant", stopReason: outcome } });
+      stage("error-observed");
       const denied = expect(invoke("execution_gates", {
         commands: [{ command: "touch forbidden-effect", timeoutSeconds: 5 }], coverage: "Must not start",
       })).rejects.toThrow("retired");
       expect(() => checkAuthority(context.authority)).toThrow("retired");
       await observed;
+      stage("observation-settled");
       await denied;
       await expect(invoke("execution_review",
         { goal: "Must not start", criteria: ["No retired effects"] })).rejects.toThrow("retired");
@@ -392,6 +486,7 @@ test(`observed ${outcome} fences /${command} execution capabilities before agent
       expect(owner.run.state).not.toBe("interrupted");
       release.resolve();
       await app.emit("session_before_switch");
+      stage("retirement-joined");
       expect(joined).toBe(true);
       if (command === "task") {
         app.ctx.hasUI = true;
@@ -400,7 +495,13 @@ test(`observed ${outcome} fences /${command} execution capabilities before agent
         expect(app.sent).toHaveLength(turns);
         expect(() => checkAuthority(context.authority)).toThrow("retired");
       }
-    } finally { release.resolve(); await app.close(); }
+    } finally { release.resolve(); await app.close(); stage("cleanup-complete"); }
+    expect(discovery.discoveryCalls.state.real).toBe(1);
+    expect(discovery.discoveryCalls.state.replayed).toBeGreaterThan(1);
+    expect(discovery.discoveryCalls.top).toEqual({ real: 0, replayed: 0 });
+    const state = discovery.observed.get("state");
+    expect(state?.ok).toBe(false);
+    if (state?.ok === false) expect(String((state.error as { stderr?: unknown }).stderr)).toContain("not a git repository");
 });
 
 async function startTaskReview(app: App, { owner, gates }: Awaited<ReturnType<typeof prepareTask>>) {
@@ -452,13 +553,22 @@ async function completeTask(app: App, { owner, context, receipt }: Awaited<Retur
 
 for (const git of [false, true]) describe(`/task full contract (${git ? "Git" : "no Git with plan correction"})`, () => {
   let app: App, prepared: Awaited<ReturnType<typeof prepareTask>>, owned: Promise<void>, completion: Promise<void> | undefined;
+  let discovery: ReturnType<typeof controlTaskFixtureDiscovery> | undefined;
   let ready: ReturnType<typeof Promise.withResolvers<void>>, finish: ReturnType<typeof Promise.withResolvers<void>>;
+  let started: number;
+  const stage = (name: string) => console.error(`TASK_FULL_STAGE ${git ? "Git" : "no-Git"} ${name} ${Math.round(performance.now() - started)}ms`);
   beforeEach(async () => {
-    ready = Promise.withResolvers<void>(); finish = Promise.withResolvers<void>(); completion = undefined;
+    started = performance.now(); stage("begin");
+    ready = Promise.withResolvers<void>(); finish = Promise.withResolvers<void>(); completion = undefined; discovery = undefined;
     owned = f.fixture.ownedCase(`${git ? "Git" : "no Git"} task fixture and completion`, async () => {
       app = await setup(!git);
+      stage("setup-complete");
       try {
-        prepared = await prepareTask(app, git, git ? "example" : "");
+        prepared = await prepareTask(app, git, git ? "example" : "", () => {
+          stage("git-initialized");
+          discovery = controlTaskFixtureDiscovery(app.root, git, "TASK_FULL_DISCOVERY");
+        });
+        stage("prepare-complete");
         ready.resolve();
         await finish.promise;
       } finally { await app.close(); }
@@ -469,17 +579,36 @@ for (const git of [false, true]) describe(`/task full contract (${git ? "Git" : 
   afterEach(async () => {
     // Keep fixture ownership through the real callback, even if the runner requests teardown.
     try { await completion; }
-    finally { finish.resolve(); await owned; }
+    finally { finish.resolve(); await owned; stage("owned-settled"); }
+    if (discovery) {
+      expect(discovery.discoveryCalls.state.real).toBe(1);
+      expect(discovery.discoveryCalls.state.replayed).toBeGreaterThan(1);
+      if (git) {
+        expect(discovery.discoveryCalls.top.real).toBe(1);
+        expect(discovery.discoveryCalls.top.replayed).toBeGreaterThan(1);
+        expect(discovery.observed.get("state")).toEqual({ ok: true, value: `true\nfalse\n${path.join(app.root, ".git")}\n` });
+        expect(discovery.observed.get("top")).toEqual({ ok: true, value: `${app.root}\n` });
+      } else {
+        expect(discovery.discoveryCalls.top).toEqual({ real: 0, replayed: 0 });
+        const state = discovery.observed.get("state");
+        expect(state?.ok).toBe(false);
+        if (state?.ok === false) expect(String((state.error as { stderr?: unknown }).stderr)).toContain("not a git repository");
+      }
+    }
   });
   describe("managed Review admitted", () => {
     let review: Awaited<ReturnType<typeof startTaskReview>>;
     beforeEach(async () => {
+      stage("review-start");
       completion = startTaskReview(app, prepared).then(result => { review = result; });
       await completion;
+      stage("review-admitted");
     });
     bunTest("delivered policy and registered Review producer complete handler/FreezeReceipt/gates/acceptance/finish without publication", async () => {
       completion = (async () => {
+        stage("completion-start");
         await completeTask(app, prepared, review, git);
+        stage("finish-complete");
         const previous = prepared.owner.run;
         app.ctx.hasUI = true;
         await app.commands.get("task").handler(previous.planId, app.ctx);
@@ -506,6 +635,7 @@ for (const git of [false, true]) describe(`/task full contract (${git ? "Git" : 
         const delivered = JSON.parse(turns[2]!.message.content).projection;
         expect(delivered).toMatchObject({ runId: next.runId, intentId: next.task!.intentId, phase: "planning", resume: false });
         expect(delivered.instruction).toContain("current conversation");
+        stage("new-intent-complete");
       })();
       await completion;
     });
@@ -693,8 +823,22 @@ test("uncertain initial task outbox cannot acquire a replacement owner or send a
     const state = new WorkflowState(app.root);
     try {
       expect(state.all<any>("runs")).toHaveLength(1);
-      expect(state.all<any>("obligations").find(item => item.kind === "phase-turn")?.cleared).toBe(false);
+      const original = state.all<any>("obligations").find(item => item.kind === "phase-turn");
+      expect(original?.cleared).toBe(false);
+      expect(original?.state).toBe("invocation-started");
       expect(state.all<any>("reservations").every(item => item.state === "released")).toBe(true);
+      const query = payload(await app.invoke("workflow_status", { runId: original.runId }));
+      expect(query.delivery).toEqual([{ key: original.key, state: "invocation-started" }]);
+      expect(query.limits).toHaveLength(1);
+      await app.commands.get("task").handler("independent", app.ctx);
+      expect(app.sent.filter(item => item.message.customType === "pitako.workflow.task")).toHaveLength(1);
+      app.branch.push({ type: "custom_message", id: "exact-late-receipt", ...original.message });
+      await app.commands.get("task").handler("uncertain", app.ctx);
+      expect(attempts).toBe(1);
+      expect(state.get<any>("obligations", original.key)).toMatchObject({ state: "observed", cleared: true });
+      expect(state.outbox().some(item => (item.body as any).key === original.key)).toBe(true);
+      expect(app.sent.filter(item => item.message.customType === "pitako.workflow.task")
+        .filter(item => item.message.details.deliveryId === original.key)).toHaveLength(0);
     } finally { state.close(); }
   } finally { app.pi.sendMessage = send; await app.close(); }
 });
@@ -742,30 +886,237 @@ test("failed finite gates release their producer but produce no acceptance credi
   } finally { await app.close(); }
 });
 
-test("capacity acquired during idle rejects pending task without retiring independent work, then permits a fresh valid intent", async () => {
-  const app = await setup(), idle = Promise.withResolvers<void>(), guard = new RootGuard(app.root);
+for (const status of ["failed", "cancelled"] as const) test(`${status} closed strategy remains visible while a later result completes /task`, async () => {
+  const started = performance.now();
+  const stage = (name: string) => console.error(`TASK_STRATEGY_STAGE ${status} ${name} ${Math.round(performance.now() - started)}ms`);
+  stage("begin");
+  const app = await setup();
+  stage("setup-complete");
+  // This fresh no-Git root never changes Git metadata; only implementation files change.
+  // Preserve one real external discovery and the normal producer/Review/acceptance path.
+  const discovery = controlTaskFixtureDiscovery(app.root, false, "TASK_STRATEGY_DISCOVERY", `${status} `);
+  f.fixture.releaseDirectoriesAfterDisposal(() => {
+    expect(existsSync(path.join(app.root, ".git"))).toBe(false);
+    expect(discovery.discoveryCalls.state.real).toBe(1);
+    expect(discovery.discoveryCalls.state.replayed).toBeGreaterThan(1);
+    expect(discovery.discoveryCalls.top).toEqual({ real: 0, replayed: 0 });
+    const state = discovery.observed.get("state");
+    expect(state?.ok).toBe(false);
+    if (state?.ok === false) expect(String((state.error as { stderr?: unknown }).stderr)).toContain("not a git repository");
+  }, []);
+  try {
+    await app.commands.get("task").handler(`strategy-${status}`, app.ctx);
+    stage("task-start-complete");
+    const receipt = await freeze(app);
+    stage("freeze-complete");
+    const context = captureCallContext(app.root, app.ctx.sessionManager);
+    if (context.kind !== "managed") throw new Error("missing execution owner");
+    const owner = checkAuthority(context.authority);
+    writeFileSync(app.root + "/implementation.ts", "export const bounded = true;\n");
+    const record = async (dispatchId: string, outcome: "failed" | "cancelled" | "completed") => {
+      const attempt = registerBackgroundAttempt(context, { cwd: app.root, instanceId: dispatchId,
+        dispatchId, roleId: "developer" });
+      attempt.admit();
+      attempt.result({ status: outcome, result: `${outcome} strategy outcome` });
+      const message = { customType: "pitako.worker.result", content: dispatchId, details: { deliveryId: dispatchId } };
+      const source = captureResultSource(attempt, dispatchId, message, { owns: () => true, getBranch: () => app.branch });
+      app.branch.push({ type: "custom_message", id: dispatchId, ...message });
+      source.observe("turn_start");
+      attempt.producer.observe("preparation", "closed");
+      attempt.producer.observe("host-operation", "closed");
+      expect(attempt.producer.observe("callback", "closed", true)).toBeDefined();
+      const obligation = payload(await app.invoke("execution_disposition", { op: "inspect" })).obligations
+        .find((item: any) => item.dispatchId === dispatchId);
+      expect(obligation.state).toBe("disposition-required");
+      return obligation;
+    };
+    const historical = await record(`historical-${status}`, status);
+    stage("historical-closed");
+    const claim = (obligation: any) => ({ op: "record", obligationId: obligation.obligationId,
+      expectedVersion: obligation.version, reason: "Assess this exact closed result",
+      choice: { kind: "accept", resultRefs: [obligation.obligationId], evidenceRefs: [obligation.obligationId],
+        reviewClaim: "Current result has independent proof" } });
+    await expect(app.invoke("execution_disposition", claim(historical))).rejects.toThrow("completed outcomes");
+    await app.invoke("execution_disposition", { ...claim(historical), choice: { kind: "continue", admissionId: owner.run.runId } });
+    stage("historical-continued");
+    const current = await record(`current-${status}`, "completed");
+    await app.invoke("execution_disposition", claim(current));
+    stage("current-accepted");
+    const gates = payload(await app.invoke("execution_gates", { commands: [{ command: "printf current-proof", timeoutSeconds: 5 }],
+      coverage: "Current bounded result" }));
+    stage("gates-complete");
+    const review = handle(await app.invoke("execution_review", { goal: "Review current bounded execution", criteria: ["Current result and history"] }));
+    await app.bookkeeping(review.instanceId);
+    stage("review-closed");
+    const input = { expectedVersion: owner.run.version, reviewAssignmentId: review.assignmentId,
+      evidenceRefs: [gates.evidenceId], acceptance: "Accept the current released reviewed result",
+      absorption: `Retain ${status} history after physical closure; absorb current successful work`, dispositions: [] };
+    await expect(app.invoke("execution_acceptance", { ...input, expectedVersion: input.expectedVersion - 1 })).rejects.toThrow("stale");
+    await expect(app.invoke("execution_acceptance", { ...input, evidenceRefs: ["foreign"] })).rejects.toThrow("evidence");
+    const accepted = payload(await app.invoke("execution_acceptance", input));
+    stage("acceptance-complete");
+    const before = payload(await app.invoke("workflow_status", { runId: owner.run.runId }));
+    expect(before.attempts.find((item: any) => item.dispatchId === `historical-${status}`))
+      .toMatchObject({ outcome: { status }, closure: "closed" });
+    expect(before.attempts.find((item: any) => item.dispatchId === `current-${status}`))
+      .toMatchObject({ outcome: { status: "completed" }, closure: "closed" });
+    expect(before.lastResult.closure).toBe("closed");
+    expect(before.cold).toBe(true);
+    let finalAcceptance = accepted;
+    if (status === "failed") {
+      const later = registerBackgroundAttempt(context, { cwd: app.root, instanceId: "later-contributor",
+        dispatchId: "later-contributor", roleId: "developer" });
+      later.admit(); later.result({ status: "completed", result: "Later contributor" });
+      later.producer.observe("preparation", "closed"); later.producer.observe("host-operation", "closed");
+      later.producer.observe("callback", "closed", true);
+      stage("later-contributor-closed");
+      await expect(app.invoke("task_finish", { expectedVersion: owner.run.version, freezeReceiptRef: receipt.receiptId,
+        executionAcceptanceRef: accepted.acceptanceId })).rejects.toThrow("frontier");
+      const refreshedGates = payload(await app.invoke("execution_gates", { commands: [{ command: "printf refreshed", timeoutSeconds: 5 }],
+        coverage: "Later contributor" }));
+      stage("refreshed-gates-complete");
+      const refreshedReview = handle(await app.invoke("execution_review", { goal: "Review after later contributor", criteria: ["Current result"] }));
+      await app.bookkeeping(refreshedReview.instanceId);
+      stage("refreshed-review-closed");
+      finalAcceptance = payload(await app.invoke("execution_acceptance", { ...input, expectedVersion: owner.run.version,
+        reviewAssignmentId: refreshedReview.assignmentId, evidenceRefs: [refreshedGates.evidenceId] }));
+      stage("refreshed-acceptance-complete");
+    }
+    await app.invoke("task_finish", { expectedVersion: owner.run.version, freezeReceiptRef: receipt.receiptId,
+      executionAcceptanceRef: finalAcceptance.acceptanceId });
+    stage("finish-complete");
+    const final = payload(await app.invoke("workflow_status", { runId: owner.run.runId }));
+    expect(final.state).toBe("completed");
+    expect(final.attempts.find((item: any) => item.dispatchId === `historical-${status}`).outcome.status).toBe(status);
+    expect(final.restrictions).toEqual([]);
+  } finally { stage("cleanup-begin"); await app.close(); stage("cleanup-complete"); }
+});
+
+test("a closed failed implementation needs current gates and Review, not an invented successful worker", async () => {
+  const app = await setup();
+  try {
+    await app.commands.get("task").handler("partial-source", app.ctx);
+    const freezeReceipt = await freeze(app);
+    const context = captureCallContext(app.root, app.ctx.sessionManager);
+    if (context.kind !== "managed") throw new Error("missing execution owner");
+    const owner = checkAuthority(context.authority);
+    writeFileSync(path.join(app.root, "implementation.ts"), "export const bounded = true;\n");
+    const attempt = registerBackgroundAttempt(context, { cwd: app.root, instanceId: "closed-partial",
+      dispatchId: "closed-partial", roleId: "developer" });
+    attempt.admit(); attempt.result({ status: "failed", result: "partial source retained for independent validation" });
+    const message = { customType: "pitako.worker.result", content: "closed-partial", details: { deliveryId: "closed-partial" } };
+    const source = captureResultSource(attempt, "closed-partial", message, { owns: () => true, getBranch: () => app.branch });
+    app.branch.push({ type: "custom_message", id: "partial-receipt", ...message }); source.observe("turn_start");
+    attempt.producer.observe("preparation", "closed"); attempt.producer.observe("host-operation", "closed");
+    attempt.producer.observe("callback", "closed", true);
+    const obligation = payload(await app.invoke("execution_disposition", { op: "inspect" })).obligations
+      .find((item: any) => item.dispatchId === "closed-partial");
+    await app.invoke("execution_disposition", { op: "record", obligationId: obligation.obligationId,
+      expectedVersion: obligation.version, reason: "Retain the failed strategy and independently validate current source",
+      choice: { kind: "continue", admissionId: owner.run.runId } });
+    const input = { expectedVersion: owner.run.version, reviewAssignmentId: "missing", evidenceRefs: ["missing"],
+      acceptance: "Current source is independently checked", absorption: "Retain the failed attempt and closed contributor", dispositions: [] };
+    await expect(app.invoke("execution_acceptance", input)).rejects.toThrow();
+    const gates = payload(await app.invoke("execution_gates", { commands: [{ command: "printf validated", timeoutSeconds: 5 }],
+      coverage: "Current bounded source" }));
+    const review = handle(await app.invoke("execution_review", { goal: "Review independently checked partial source",
+      criteria: ["Current candidate and historical failed attempt"] }));
+    await app.bookkeeping(review.instanceId);
+    await expect(app.invoke("execution_acceptance", { ...input, expectedVersion: owner.run.version,
+      reviewAssignmentId: review.assignmentId, evidenceRefs: ["foreign"] })).rejects.toThrow("evidence");
+    const accepted = payload(await app.invoke("execution_acceptance", { ...input, expectedVersion: owner.run.version,
+      reviewAssignmentId: review.assignmentId, evidenceRefs: [gates.evidenceId] }));
+    await app.invoke("task_finish", { expectedVersion: owner.run.version, freezeReceiptRef: freezeReceipt.receiptId,
+      executionAcceptanceRef: accepted.acceptanceId });
+    const status = payload(await app.invoke("workflow_status", { runId: owner.run.runId }));
+    expect(status.state).toBe("completed");
+    expect(status.attempts.filter((item: any) => item.roleId === "developer"))
+      .toMatchObject([{ dispatchId: "closed-partial", outcome: { status: "failed" }, closure: "closed" }]);
+    expect(status.restrictions).toEqual([]);
+  } finally { await app.close(); }
+});
+
+test("accepted execution retires its blocked user-decision projection without rewriting the ledger", async () => {
+  const app = await setup();
+  try {
+    await app.commands.get("task").handler("accepted-decision", app.ctx);
+    await freeze(app);
+    const context = captureCallContext(app.root, app.ctx.sessionManager);
+    if (context.kind !== "managed") throw new Error("missing execution owner");
+    const owner = checkAuthority(context.authority);
+    writeFileSync(path.join(app.root, "implementation.ts"), "export const bounded = true;\n");
+    const attempt = registerBackgroundAttempt(context, { cwd: app.root, instanceId: "decision-worker",
+      dispatchId: "decision-worker", roleId: "developer" });
+    attempt.admit(); attempt.result({ status: "failed", result: "Decision needed beyond bounded work" });
+    const message = { customType: "pitako.worker.result", content: "decision-worker", details: { deliveryId: "decision-worker" } };
+    const source = captureResultSource(attempt, "decision-worker", message, { owns: () => true, getBranch: () => app.branch });
+    app.branch.push({ type: "custom_message", id: "decision-receipt", ...message }); source.observe("turn_start");
+    attempt.producer.observe("preparation", "closed"); attempt.producer.observe("host-operation", "closed");
+    attempt.producer.observe("callback", "closed", true);
+    const obligation = payload(await app.invoke("execution_disposition", { op: "inspect" })).obligations
+      .find((item: any) => item.dispatchId === "decision-worker");
+    const ledger = ledgerFile("accepted-decision", app.root), before = readFileSync(ledger, "utf8");
+    const lock = `${ledger}.lock`;
+    mkdirSync(lock);
+    const decision = payload(await app.invoke("execution_disposition", { op: "record", obligationId: obligation.obligationId,
+      expectedVersion: obligation.version, reason: "A choice outside this result's admitted scope",
+      choice: { kind: "user-decision", question: "Expand scope?", options: ["Keep", "Expand"],
+        boundary: "External scope", evidenceRefs: [obligation.obligationId] } }));
+    expect(decision.userDecisionProjections).toEqual([expect.objectContaining({ state: "blocked" })]);
+    const current = payload(await app.invoke("execution_disposition", { op: "inspect" })).obligations
+      .find((item: any) => item.dispatchId === "decision-worker");
+    await app.invoke("execution_disposition", { op: "record", obligationId: current.obligationId,
+      expectedVersion: current.version, reason: "Continue within the independently checked bounded source",
+      choice: { kind: "continue", admissionId: owner.run.runId } });
+    const gates = payload(await app.invoke("execution_gates", { commands: [{ command: "printf checked", timeoutSeconds: 5 }],
+      coverage: "Current bounded source" }));
+    const review = handle(await app.invoke("execution_review", { goal: "Review current candidate and decision history",
+      criteria: ["Current evidence and closed contributor"] }));
+    await app.bookkeeping(review.instanceId);
+    await app.invoke("execution_acceptance", { expectedVersion: owner.run.version, reviewAssignmentId: review.assignmentId,
+      evidenceRefs: [gates.evidenceId], acceptance: "Accept current independently checked source",
+      absorption: "Retain the obsolete historical decision", dispositions: [] });
+    rmSync(lock, { recursive: true });
+    const status = payload(await app.invoke("workflow_status", { runId: owner.run.runId }));
+    expect(status.projections).toEqual([expect.objectContaining({ state: "not-applicable" })]);
+    expect(readFileSync(ledger, "utf8")).toBe(before);
+    const guard = new RootGuard(app.root);
+    try {
+      const probe = guard.reserve({ reservationId: randomUUID(), kind: "gates", paths: [path.join(app.root, "independent")] })
+        .register("independent", ["host-operation"]);
+      probe.enter(); probe.observe("host-operation", "closed", true);
+    } finally { guard.close(); }
+    expect(readFileSync(ledger, "utf8")).toBe(before);
+  } finally {
+    const lock = `${ledgerFile("accepted-decision", app.root)}.lock`;
+    if (existsSync(lock)) rmSync(lock, { recursive: true });
+    await app.close();
+  }
+});
+
+test("planning admission owns no paths; a conflicting physical effect blocks only the plan write and late closure permits it", async () => {
+  const app = await setup(), guard = new RootGuard(app.root);
   const held = guard.reserve({ reservationId: randomUUID(), kind: "assignment-writer", paths: [app.root] }).register("independent-admission", ["host-operation"]);
   try {
     held.enter();
-    // Initial rejection is harmless; a second dispatch captures an actual pending wait.
     app.ctx.hasUI = true;
     await app.commands.get("task").handler("capacity", app.ctx);
-    expect(app.sent.filter(item => item.message.customType === "pitako.workflow.task")).toHaveLength(0);
+    expect(app.sent.filter(item => item.message.customType === "pitako.workflow.task")).toHaveLength(1);
+    const slot = payload(await app.invoke("bound_plan_read", {}));
+    await expect(app.invoke("planning_write", { revision: slot.revision, fileHash: slot.fileHash, body: "Blocked body" }))
+      .rejects.toThrow(/operation lease/);
+    expect(held.live).toBe(true);
     held.observe("host-operation", "closed", true);
-    app.ctx.waitForIdle = () => idle.promise;
-    const pending = app.commands.get("task").handler("capacity", app.ctx);
     const later = guard.reserve({ reservationId: randomUUID(), kind: "assignment-writer", paths: [app.root] }).register("independent-later-admission", ["host-operation"]);
     later.enter();
     try {
-      idle.resolve(); await pending;
-      expect(app.sent.filter(item => item.message.customType === "pitako.workflow.task")).toHaveLength(0);
+      await expect(app.invoke("planning_write", { revision: slot.revision, fileHash: slot.fileHash, body: "Still blocked" }))
+        .rejects.toThrow(/operation lease/);
       expect(later.live).toBe(true);
     } finally { later.observe("host-operation", "closed", true); }
-    app.ctx.waitForIdle = async () => {};
-    await app.commands.get("task").handler("capacity", app.ctx);
-    expect(app.sent.filter(item => item.message.customType === "pitako.workflow.task")).toHaveLength(1);
+    expect(payload(await app.invoke("planning_write", { revision: slot.revision, fileHash: slot.fileHash, body: "Independent progress" })).snapshot.revision)
+      .toBe(1);
   } finally {
-    idle.resolve();
     if (held.live) held.observe("host-operation", "closed", true);
     guard.close(); await app.close();
   }

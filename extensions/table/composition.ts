@@ -2,13 +2,14 @@ import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
 
 const strict = { additionalProperties: false } as const;
-const text = Type.String({ minLength: 1, pattern: "\\S" });
+// Preserve complete strings when a provider matches patterns against the full value.
+const text = Type.String({ minLength: 1, pattern: "[\\s\\S]*\\S[\\s\\S]*" });
 export const specialistChoiceSchema = Type.Union([
   Type.Object({ kind: Type.Literal("retain"), memberId: text, mandate: text, reason: text }, strict),
   Type.Object({ kind: Type.Literal("add"), candidateRef: text, mandate: text, reason: text }, strict),
 ]);
 export const compositionSchema = Type.Object({
-  kind: Type.Literal("composition"), snapshotId: text, reason: text,
+  kind: Type.Literal("composition"), reason: text,
   specialists: Type.Array(specialistChoiceSchema, { maxItems: 5 }),
 }, strict);
 export type SpecialistChoice = Static<typeof specialistChoiceSchema>;
@@ -32,8 +33,6 @@ export class CompositionError extends Error {
 /** Pure total-set validation; callers use the same frozen basis before and after settlement. */
 export function planComposition(body: Composition, basis: CompositionBasis): CompositionPlan {
   if (!Value.Check(compositionSchema, body)) throw new CompositionError("structure", "body");
-  if (body.snapshotId !== basis.snapshotId)
-    throw new CompositionError("snapshot", "body.snapshotId", [body.snapshotId], [basis.snapshotId]);
   const retained: { memberId: string; choiceIndex: number }[] = [], added: { candidateRef: string; choiceIndex: number }[] = [];
   const seen = new Set<string>();
   body.specialists.forEach((choice, choiceIndex) => {

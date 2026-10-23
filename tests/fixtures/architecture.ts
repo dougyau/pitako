@@ -70,6 +70,7 @@ export function architectureFixture(protocol: "architecture" | "review" = "archi
   candidates = [{ model = "fixture/chosen", reasoning = "high" }, { model = "fixture/chosen", reasoning = "low" }, { model = "fixture/other" }]
   `;
   async function setup(extra: { root?: string; storageRoot?: string; config?: string; policies?: string; busy?: boolean;
+    configure?: (host: ReturnType<typeof controlledPi>) => void;
     explore?: (object: ReturnType<typeof describeObject>) => unknown;
     prompt?: (session: any, request: any, body: any) => Promise<any> | any; afterSubmit?: (session: any, request: any, receipt: any) => Promise<void> | void; abort?: (session: any) => Promise<void>; dispose?: (session: any) => Promise<void>; bind?: (session: any) => Promise<void> | void; extensions?: any[] } = {}) {
     const root = extra.root ?? mkdtempSync(path.join(tmpdir(), "pitako-architecture-"));
@@ -87,7 +88,8 @@ export function architectureFixture(protocol: "architecture" | "review" = "archi
       on(name: string, handler: Function) { hooks.set(name, [...hooks.get(name) ?? [], handler]); },
       sendMessage(message: any, options: any) {
         sent.push({ message, options });
-        if (!options.triggerTurn) { branch.push({ type: "custom_message", ...message }); if (message.customType === "pitako.worker.result") delivered.resolve(); else response.resolve(); }
+        branch.push({ type: "custom_message", ...message });
+        if (!options.triggerTurn) { if (message.customType === "pitako.worker.result") delivered.resolve(); else response.resolve(); }
       },
     } as unknown as ExtensionAPI;
     pitako(pi); agent(pi);
@@ -114,7 +116,7 @@ export function architectureFixture(protocol: "architecture" | "review" = "archi
           expect(request).not.toHaveProperty("publications");
           expect(request).not.toHaveProperty("review");
           if (request.stage !== "composition") expect(request).not.toHaveProperty("snapshot");
-          const privateKeys = ["native", "attemptId", "turnId", "historyId", "sessionId", "toolCallId", "instanceId", "assignmentId", "captureId"];
+          const privateKeys = ["snapshotId", "submissionId", "native", "attemptId", "turnId", "historyId", "sessionId", "toolCallId", "instanceId", "assignmentId", "captureId"];
           const leaked: string[] = [];
           const inspect = (value: unknown) => {
             if (!value || typeof value !== "object") return;
@@ -128,7 +130,7 @@ export function architectureFixture(protocol: "architecture" | "review" = "archi
             expect(request.object).not.toHaveProperty("contentBase64");
           }
           const exploration = review ? extra.explore?.(request.object) : undefined;
-          const body = request.stage === "composition" ? { kind: "composition", snapshotId: request.snapshot.id, reason: "Security expertise is useful",
+          const body = request.stage === "composition" ? { kind: "composition", reason: "Security expertise is useful",
             specialists: [{ kind: "add", candidateRef: "topic:0:0", mandate: "Review security", reason: "Relevant expertise" }] }
             : review && request.stage === "preparation" ? { kind: "preparation", analysis: "Independent whole-object review", findings: [], doubts: [] }
             : review && request.stage === "contribution" ? { kind: "contribution", analysis: "Review incoming evidence", findings: [], responses: [], doubts: [] }
@@ -146,7 +148,7 @@ export function architectureFixture(protocol: "architecture" | "review" = "archi
             expect(executionForSession(session.sessionId)?.profile).toBe("analysis");
             for (const name of ["read", "grep", "find", "ls", "bash"]) expect(session.active).toContain(name);
             expect(session.active).not.toContain("edit"); expect(session.active).not.toContain("write");
-            const receipt = await session.boundTools.get(`${review ? "review" : "architecture"}_submit`)!.execute("native-submit", { submissionId: `submit-${session.prompts.length}`, body: chosen }, undefined, undefined, { sessionManager: session.sessionManager });
+            const receipt = await session.boundTools.get(`${review ? "review" : "architecture"}_submit`)!.execute("native-submit", { body: chosen }, undefined, undefined, { sessionManager: session.sessionManager });
             seen.push({ session, request, receipt, levels: session.thinkingLevel, model: session.model!.id, exploration });
             expect(receipt.isError).not.toBe(true);
             await extra.afterSubmit?.(session, request, receipt);
@@ -159,6 +161,7 @@ export function architectureFixture(protocol: "architecture" | "review" = "archi
           for (const handler of session.hooks.get("agent_before_settle") ?? []) await handler({ type: "agent_before_settle" }, { sessionManager: session.sessionManager });
         }
       }, abort: extra.abort, dispose: extra.dispose });
+    extra.configure?.(host);
     host.factories.createSettings = () => ({ getModelThinkingLevel: () => "minimal", getDefaultThinkingLevel: () => "off" }) as never;
     setBackgroundExecutor(createPiExecutor({ factories: host.factories }));
     const invoke = (name: string, params: any, signal?: AbortSignal) => tools.get(name).execute(name + "-call", params, signal, undefined, ctx);

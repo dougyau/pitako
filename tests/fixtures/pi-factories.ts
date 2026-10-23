@@ -48,7 +48,7 @@ export function controlledPi(root: string, options: {
       return { model, options: requestOptions, provider: { streamSimple: runtime.streamSimple } };
     },
   };
-  const loaders = new WeakMap<object, { tools: Map<string, { definition: any }>; hooks: Map<string, Function[]>; manager?: any }>();
+  const loaders = new WeakMap<object, { tools: Map<string, { definition: any }>; hooks: Map<string, Function[]>; manager?: any; refresh?: () => void }>();
   const factories: Required<Factories> = {
     async createRuntime(input) { runtimeInputs.push(input); return { ...runtime } as never; },
     getAgentDir: () => root,
@@ -56,11 +56,12 @@ export function controlledPi(root: string, options: {
     createCodemode: () => () => {},
     createLoader(input) {
       loaderInputs.push(input);
-      const local = { tools: new Map<string, { definition: any }>(), hooks: new Map<string, Function[]>(), manager: undefined as any };
+      const local = { tools: new Map<string, { definition: any }>(), hooks: new Map<string, Function[]>(), manager: undefined as any, refresh: undefined as (() => void) | undefined };
       const loader = {
         async reload() {
           if (options.inlineExtensions) for (const extension of input.extensionFactories ?? []) await (typeof extension === "function" ? extension : extension.factory)({
-            registerTool(definition: any) { local.tools.set(definition.name, { definition }); },
+            registerTool(definition: any) { local.tools.set(definition.name, { definition }); local.refresh?.(); },
+            getAllTools: () => [...local.tools.values()].map(tool => tool.definition),
             on(name: string, handler: Function) { local.hooks.set(name, [...local.hooks.get(name) ?? [], handler]); },
             appendEntry(type: string, data: unknown) { local.manager.appendCustomEntry(type, data); },
           } as never);
@@ -93,8 +94,10 @@ export function controlledPi(root: string, options: {
         getSessionStats: () => session.stats,
         emit(event) { for (const listener of listeners) listener(event); },
         async bindExtensions() {
-          // Native wrappers capture the definition object, not the mutable registry slot.
-          for (const [name, tool] of local.tools) session.boundTools.set(name, tool.definition);
+          // Public registerTool replaces the slot and refreshes wrappers after bind.
+          // Retained wrappers still capture the original executable definition.
+          local.refresh = () => { for (const [name, tool] of local.tools) session.boundTools.set(name, tool.definition); };
+          local.refresh();
           session.events.push("bind"); await options.bind?.(session);
           if (options.inlineExtensions) for (const handler of local.hooks.get("session_start") ?? []) await handler({}, { sessionManager: manager });
         },

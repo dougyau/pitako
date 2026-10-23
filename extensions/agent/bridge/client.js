@@ -178,3 +178,5 @@ export async function connect(descriptorPath, { expectedSessionId, resume } = {}
     },
   });
 }
+
+export { decodeArchitectureMessage, decodeArchitectureSubmit, decodeSubmitInput } from "./protocol.js";

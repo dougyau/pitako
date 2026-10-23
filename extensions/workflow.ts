@@ -493,12 +493,6 @@ export function ledgerTemplate(meta: PlanMeta, binding?: ExecutionBinding): stri
     "",
     "## Blockers",
     "",
-    "## Team Holds",
-    "",
-    "<!-- pitako-team-holds:v1 -->",
-    "[]",
-    "<!-- /pitako-team-holds -->",
-    "",
     "## Evidence",
     "",
   ].join("\n");
@@ -587,6 +581,7 @@ const HOLD_END = "<!-- /pitako-team-holds -->";
 
 export function ledgerTeamHolds(text: string): TeamHold[] {
   rejectGeneratedLedger(text);
+  if (!text.includes(HOLD_START) && !text.includes(HOLD_END)) return [];
   const matches = [...text.matchAll(/^<!-- pitako-team-holds:v1 -->\r?\n([\s\S]*?)\r?\n<!-- \/pitako-team-holds -->$/gm)];
   if (matches.length !== 1 || text.split(HOLD_START).length !== 2 || text.split(HOLD_END).length !== 2) {
     throw new PitakoConfigError("ledger Team hold gate is missing or malformed");
@@ -654,31 +649,6 @@ export function writeExecutionUserDecision(binding: ExecutionBinding, status: "r
     renameSync(temp, file);
     const dir = openSync(path.dirname(file), "r");
     try { fsyncSync(dir); } finally { closeSync(dir); }
-  });
-}
-
-export function updateLedgerTeamHold(cwd: string, planId: string, hold: TeamHold, remove = false, binding?: ExecutionBinding): boolean {
-  if (binding && binding.planId !== planId) throw new PitakoConfigError(`execution binding plan id ${binding.planId} does not match ${planId}`);
-  const plan = (binding ? verifyExecutionBinding(binding) : readPlan(planId, cwd)).meta;
-  if (plan.boardTopicId === undefined) return false;
-  const root = binding?.executionRoot ?? cwd;
-  const file = ledgerFile(planId, root);
-  return withLedgerTeamHoldLock(root, planId, () => {
-    const text = readFileSync(file, "utf8");
-    const mismatch = executionLedgerMismatch(plan, parseLedgerBinding(text), binding);
-    if (mismatch) throw new PitakoConfigError(mismatch);
-    const holds = ledgerTeamHolds(text);
-    const next = holds.filter((item) => item.assignmentId !== hold.assignmentId);
-    if (!remove) next.push(hold);
-    const replacement = text.replace(/^<!-- pitako-team-holds:v1 -->\r?\n[\s\S]*?\r?\n<!-- \/pitako-team-holds -->$/m,
-      `${HOLD_START}\n${JSON.stringify(next)}\n${HOLD_END}`);
-    const temp = `${file}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
-    const fd = openSync(temp, "wx");
-    try { writeFileSync(fd, replacement); fsyncSync(fd); } finally { closeSync(fd); }
-    renameSync(temp, file);
-    const dir = openSync(path.dirname(file), "r");
-    try { fsyncSync(dir); } finally { closeSync(dir); }
-    return true;
   });
 }
 

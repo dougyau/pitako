@@ -14,7 +14,9 @@ import { subscribeChanges } from "../extensions/agent/observe.ts";
 import { beginTeamEvaluation, reserveTeamMember, retireTeamEvaluation, teamEvaluationForSession, firstTeamReservation, createTeam, admitTeamMember, disbandTeam } from "../extensions/team.ts";
 import { architectureFixture } from "./fixtures/architecture.ts";
 import { openBoard } from "../extensions/board/store.ts";
-import { planFile, readLedgerTeamHolds } from "../extensions/workflow.ts";
+import { planFile } from "../extensions/workflow.ts";
+import { WorkflowState, type Resource } from "../extensions/workflow-state.ts";
+import type { AttemptRecord } from "../extensions/workflow-engine.ts";
 import { controlledPi } from "./fixtures/pi-factories.ts";
 import { jsonBytes } from "../extensions/table/results.ts";
 
@@ -32,6 +34,19 @@ function unknownTest(name: string, body: () => Promise<void>) {
 
 // Child hosts retain intentional unknown owners and roots, not proof of producer closure.
 const retained: unknown[] = [];
+function unclosedPlanResource(root: string, planId: string, assignmentId: string) {
+  const store = new WorkflowState(root);
+  try {
+    const attempt = store.all<AttemptRecord>("attempts").find(row => row.assignmentId === assignmentId);
+    expect(attempt?.watch?.planId).toBe(planId);
+    const ref = attempt!.resource;
+    const resource = store.get<Resource>("resources", ref.resourceId);
+    expect(resource).toMatchObject(ref);
+    expect(resource!.effectReservation).toBeUndefined();
+    expect(store.closureReceipt(ref)).toBeUndefined();
+    return ref;
+  } finally { store.close(); }
+}
 const keys = ["pitako.backgroundWorkers", "pitako.teamRegistry", "pitako.agentObservations", "pitako.agentUi", "pitako.executionIdentity"].map(Symbol.for);
 function setup() {
   const root = mkdtempSync(path.join(tmpdir(), "pitako-physical-closure-"));
@@ -333,7 +348,7 @@ for (const failure of ["abort", "dispose"] as const) {
 }
 
 
-unknownTest("registered table replacement with rejected outgoing disposal retains root, diagnosis and hold without a replacement or private delivery", async () => {
+unknownTest("registered table replacement with rejected outgoing disposal retains root, diagnosis and resource without a replacement or private delivery", async () => {
   const env = setup(), unknown = Promise.withResolvers<void>();
   let handle: any, compositions = 0;
   const room = await architectureFixture().setup({ root: env.root,
@@ -356,7 +371,7 @@ unknownTest("registered table replacement with rejected outgoing disposal retain
     expect(compositions).toBe(2); expect(room.host.sessions).toHaveLength(2);
     expect(room.host.sessions.every(session => session.events.includes("dispose"))).toBe(true);
     expect(firstTeamReservation(room.evaluation, "architect")).toBe(handle.assignmentId);
-    expect(readLedgerTeamHolds(env.root, "unknown-table")).toHaveLength(1);
+    const resource = unclosedPlanResource(env.root, "unknown-table", handle.assignmentId);
     const status = await room.read("architecture_read", { roomId: handle.roomId });
     expect(status.state).toBe("closure-unknown"); expect(status.closure.state).toBe("unknown");
     expect(status.closure.reason).toContain("table outgoing disposal rejected");
@@ -370,13 +385,13 @@ unknownTest("registered table replacement with rejected outgoing disposal retain
     const scope = { ownerToken: room.evaluation.token, coordinatorSessionId: room.evaluation.sessionId };
     expect(readBackgroundPending(scope)).toEqual({ state: "pending" });
     await expect(retireTeamEvaluation(room.evaluation)).rejects.toThrow("table outgoing disposal rejected");
-    expect(readLedgerTeamHolds(env.root, "unknown-table")).toHaveLength(1);
+    expect(unclosedPlanResource(env.root, "unknown-table", handle.assignmentId)).toEqual(resource);
     const replacement = room.emit("session_start");
     expect(() => readBackgroundPending(scope)).toThrow("stale_owner");
     await expect(replacement).rejects.toBeInstanceOf(AgentClosureError);
     await expect(replacement).rejects.toThrow(/^Foreground retirement: closure unknown/);
     await expect(replacement).rejects.toThrow("table outgoing disposal rejected");
-    expect(readLedgerTeamHolds(env.root, "unknown-table")).toHaveLength(1);
+    expect(unclosedPlanResource(env.root, "unknown-table", handle.assignmentId)).toEqual(resource);
     expect(teamEvaluationForSession(scope.coordinatorSessionId, false)).toBeUndefined();
     expect(() => readBackgroundPending({ ...scope, ownerToken: Symbol("not-admitted") })).toThrow("stale_owner");
   } finally {
@@ -434,7 +449,7 @@ unknownTest("public Team cancel bounds a retained table root without losing its 
     expect(cut.closure).toEqual({ state: "unknown", reason });
     expect(teamWorkerStatus(room.evaluation.token, handle.instanceId)[0]?.closure).toEqual(cut.closure);
     expect(firstTeamReservation(room.evaluation, "architect")).toBe(handle.assignmentId);
-    expect(readLedgerTeamHolds(env.root, "cancel-root")).toHaveLength(1);
+    unclosedPlanResource(env.root, "cancel-root", handle.assignmentId);
     expect(readBackgroundPending({ ownerToken: room.evaluation.token, coordinatorSessionId: room.evaluation.sessionId })).toEqual({ state: "pending" });
     expect((await room.invoke("team_result", { assignmentId: handle.assignmentId })).isError).toBe(true);
     expect(workerHandoff(handle.instanceId)).toBeUndefined();

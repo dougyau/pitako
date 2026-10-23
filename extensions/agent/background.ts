@@ -15,10 +15,10 @@ import { AgentClosureError, hasUnknownClosure, type AgentClosure } from "./closu
 import { dispatchAdmissionsClosed } from "./dispatch.ts";
 import type { HeadAttachment } from "./head/runtime.ts";
 import { sealPages, type SealedPages, type TableRead, type TableRootRegistration } from "../table/results.ts";
-import { startTableArchive, type TableArchive } from "../table/archive.ts";
+import { startTableArchive, tableArchivePaths, type TableArchive } from "../table/archive.ts";
 import { deliveryContent, type DeliverySource } from "./provenance.ts";
 import { captureCallContext, checkCallContext, withCallContext, registerBackgroundAttempt,
-  reconcileTeamHold, captureResultSource, type CapturedWakeSource, type CallContext, type BackgroundAttempt, type ReleaseReceipt } from "../workflow-engine.ts";
+  captureResultSource, type CapturedWakeSource, type CallContext, type BackgroundAttempt, type ResourceClosureReceipt } from "../workflow-engine.ts";
 
 export interface WorkerInterest {
   planId: string;
@@ -158,7 +158,7 @@ interface Row extends TeamMetadata {
   teamAssignmentId?: string;
   onTeamSettled?: (status: WorkerStatus) => void;
   deliveryOwner?: BackgroundOwner;
-  reconcileBookkeeping?: (result: AgentRunResult, receipt?: ReleaseReceipt) => void;
+  reconcileBookkeeping?: (result: AgentRunResult, receipt?: ResourceClosureReceipt) => void;
   handoff?: Handoff;
   ownerToken?: symbol;
   coordinatorSessionId?: string;
@@ -209,9 +209,8 @@ function bag(): Bag {
 export function assertCheckpointWorkersReleased(instanceId: string, assignmentId: string): void {
   for (const row of bag().rows.values()) {
     if (row.instanceId !== instanceId && row.teamAssignmentId !== assignmentId) continue;
-    if (row.closure.state !== "released" || row.live ||
-        row.handoff && !["reconciled", "inapplicable"].includes(row.handoff.bookkeeping)) {
-      throw new Error(`checkpoint predecessor retains a live/unknown owner or bookkeeping hold: ${instanceId}`);
+    if (row.closure.state !== "released" || row.live || !row.durable.receipt()) {
+      throw new Error(`checkpoint predecessor retains a live/unknown owner: ${instanceId}`);
     }
   }
 }
@@ -292,7 +291,7 @@ export interface SpawnInput {
   now?: () => number;
   maintained?: boolean;
   teamOwner?: { token: symbol; assignmentId: string; teamId?: string; memberId?: string; onSettled: (status: WorkerStatus) => void };
-  reconcileBookkeeping?: (result: AgentRunResult, receipt?: ReleaseReceipt) => void;
+  reconcileBookkeeping?: (result: AgentRunResult, receipt?: ResourceClosureReceipt) => void;
 }
 
 export async function spawnBackground(input: SpawnInput): Promise<WorkerHandle> {
@@ -532,8 +531,10 @@ export function reserveBackground(input: {
   if (!owner || owner.owns && !owner.owns() || !input.owns()) throw new Error("background owner unavailable or retired");
   const sourceContext = input.context ?? captureCallContext(input.cwd);
   const instanceId = createInstanceId(input.roleId), dispatchId = randomUUID();
+  const resultId = input.tableRoot && randomUUID();
   const durable = registerBackgroundAttempt(sourceContext, { cwd: input.cwd, instanceId, dispatchId, roleId: input.roleId,
-    assignmentId: input.teamOwner?.assignmentId, watch: input.watch, archive: !!input.tableRoot });
+    assignmentId: input.teamOwner?.assignmentId, watch: input.watch,
+    archive: input.tableRoot && { paths: tableArchivePaths(input.tableRoot.archive, resultId!) } });
   const context = durable.context;
   try { durable.admit(); }
   catch (error) {
@@ -544,7 +545,7 @@ export function reserveBackground(input: {
   const controller = new AbortController();
   const completion = Promise.withResolvers<void>();
   const ready = Promise.withResolvers<void>();
-  const row: Row = { durable, tableRoot: input.tableRoot && { registration: input.tableRoot, resultId: randomUUID() },
+  const row: Row = { durable, tableRoot: input.tableRoot && { registration: input.tableRoot, resultId: resultId! },
     recipient: input.recipient, instanceId, roleId: input.roleId, dispatchId,
     dispatchPhase: "preflight", workerStarted: false, acceptedAt: Date.now(), controller,
     ownerToken: owner.token, deliveryOwner: owner, coordinatorSessionId: input.coordinatorSessionId,
@@ -615,7 +616,6 @@ function finalizeAttempt(row: Row): void {
     row.durable.archive.observe("host-operation", "closed");
     row.durable.archive.observe("callback", "closed", true);
   }
-  reconcileDurableHold(row);
   if (row.handoff?.bookkeeping === "pending") reconcileBookkeeping(row);
   if (row.handoff) publishHandoff(row);
   if (!row.durable.receipt()) {
@@ -624,21 +624,9 @@ function finalizeAttempt(row: Row): void {
     const stop = row.durable.store.subscribe(() => {
       if (!row.durable.receipt()) return;
       stop(); // Reconciliation itself commits facts; do not reenter this sink.
-      reconcileDurableHold(row);
       if (row.handoff?.bookkeeping === "pending") reconcileBookkeeping(row);
       if (row.handoff) publishHandoff(row);
     });
-  }
-}
-
-function reconcileDurableHold(row: Row): void {
-  const receipt = row.durable.receipt(), watch = row.durable.attempt.watch;
-  if (!receipt || !watch || !row.outcome) return;
-  try {
-    reconcileTeamHold(row.durable.store, watch, row.durable.attempt.assignmentId, row.outcome.status, receipt);
-  } catch {
-    // The persisted outbox retains the cause. Auxiliary closure must not rewrite
-    // a canonical result's delivery/bookkeeping receipt.
   }
 }
 
@@ -970,8 +958,7 @@ async function retireRows(rows: Row[]): Promise<void> {
   await Promise.all(rows.map(row => row.tableRoot?.archive?.completion));
   const failed = workers.find(result => result.status === "rejected");
   if (failed?.status === "rejected") throw failed.reason;
-  const archiveUnknown = (row: Row) => row.tableRoot?.archive?.state.state === "failed" &&
-    row.tableRoot.archive.state.settlement === "unknown";
+  const archiveUnknown = (row: Row) => row.tableRoot?.archive?.closure === "unknown";
   const uncertain = rows.filter(row => row.closure.state !== "released" || archiveUnknown(row));
   for (const row of rows) {
     if (row.closure.state !== "released" || archiveUnknown(row) || state.rows.get(row.instanceId) !== row) continue;
@@ -1242,7 +1229,6 @@ function startTableResultArchive(row: Row): void {
   if (!root?.sealed || root.archive || row.closure.state !== "released") return;
   root.archive = startTableArchive(root.registration.archive, root.resultId, root.sealed.canonical, undefined, row.durable.archive);
   void root.archive.completion.then(() => {
-    reconcileDurableHold(row);
     if (row.handoff?.bookkeeping === "pending") reconcileBookkeeping(row);
     if (row.handoff) publishHandoff(row);
   });

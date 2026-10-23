@@ -27,7 +27,7 @@ Open the workflow with `openExecutionPlan(id, cwd)` from `extensions/workflow.ts
 
 On resume, read the plan and the ledger before evidence; `openExecutionPlan` reads the ledger first, then its pinned plan. If the ledger binding or pinned source does not match, block dependent effects and report the exact mismatch. Continue only independent authorized diagnosis. A blocked projection is not a persisted ledger status: report what could not be written rather than claiming `USER_DECISION_REQUIRED` was saved. A mismatch alone is not a human decision. Never resolve the plan's Board topic while blocked. Reload and resume never change Board status.
 
-A bound topic remains open for `execution: expected` at `PLAN_FROZEN`; never resolve it at freeze or reopen it during execute. Once all gates, review, and knowledge absorption are complete, set ledger `status: completed`, then resolve only via `board_workflow_lifecycle`. The lifecycle tool rejects ledger mismatch, `USER_DECISION_REQUIRED`, missing execution intent, and Team work that is pending, failed, or cancelled. Bound-plan Team dispatches are held by exact assignment and unit in the `Team Holds` gate in `.pitako/runs/<plan-id>/ledger.md`; no-topic assignments create no persistence artifact. Automatic collection reconciles only a successful assignment's own result hold under its captured execution binding; it does not accept work or complete a unit. Failed, cancelled, and no-outcome holds remain blocking across reload, and a missing/malformed gate fails closed. Bookkeeping failure is reported separately and never hides the full result. Explicit recovery requires confirming the worker is quiescent, reconciling repository state, recording concrete recovery evidence in the ledger, then removing only that assignment's hold; never clear a pending no-outcome hold without recovered outcome and evidence. Explicit abandonment of the whole workflow closes its bound topic; worker failure/cancellation or an unresolved user decision alone does not. For `execution: none`, `$plan` resolves after absorption at freeze; execute is not invoked.
+A bound topic remains open for `execution: expected` at `PLAN_FROZEN`; never resolve it at freeze or reopen it during execute. Once all gates, review, and knowledge absorption are complete, set ledger `status: completed`, then resolve only via `board_workflow_lifecycle`. The lifecycle tool rejects ledger mismatch, `USER_DECISION_REQUIRED`, missing execution intent, and watched Team work without an exact `ResourceClosureReceipt`. Admission follows applicable physical closure, incompatible effect reservations, captured authority and pins. A physically closed failed/cancelled attempt preserves its outcome and permits another authorized strategy without `clear` or `recoverHold`; it does not accept work or complete a unit. Unknown closure is not released, success or acceptance. Historical `Team Holds` ledger entries are not admission authority; preserve their history and parser validation. A legacy ledger lock whose closure is unknown still blocks ledger writes. Bookkeeping failure is reported separately and never hides the full result. Explicit abandonment of the whole workflow closes its bound topic; worker failure/cancellation or an unresolved user decision alone does not. For `execution: none`, `$plan` resolves after absorption at freeze; execute is not invoked.
 
 Then inspect the repository and only the evidence for the current unit. Reconcile plan + ledger + evidence + repository. A stale conversation is not required and is not authoritative.
 
@@ -35,7 +35,7 @@ Paths come from `planFile`, `ledgerFile`, and `evidenceFile`. Do not construct t
 
 ## Prepare the captured checkout
 
-After validating the binding, reconcile `## Workers` and unresolved `Team Holds` before setup or other mutation. Use the handle-specific resume rules below: a running worker ends the turn; unknown or unreconciled ownership blocks setup. Unresolved holds block setup until their existing recovery requirements are met.
+After validating the binding, reconcile `## Workers`, applicable physical closure and incompatible effect reservations before setup or other mutation. Use the handle-specific resume rules below: a running worker ends the turn; unknown or unreconciled ownership blocks setup. Active or unknown resources that conflict with setup block it until exact closure is established; historical failed/cancelled outcomes do not.
 
 Then reconcile the session TODOs as described in Records. Register all frozen units before preparation or implementation begins.
 
@@ -55,7 +55,7 @@ Project-owned setup may initialize a missing CodeGraph index best-effort after d
 
 Reuse successful evidence while the root, script, dependency declarations/lockfile, runtime, and installed dependencies remain compatible. Missing dependencies or relevant changes invalidate it. Diagnose and retry invalidated or failed preparation without an arbitrary retry budget. Do not add runtime hooks, a persistent setup cache, or readiness markers.
 
-Do not run setup during `$plan`, plan discovery, `/reload`, worker startup, or merely because of a wake. On resume, reconcile workers and holds first. A completion wake may prepare the quiescent workspace before dependent work when compatible evidence is absent. Include relevant setup outcomes and evidence references in the WorkBrief so workers do not repeat preparation by default. Setup success does not prove all gate-specific prerequisites.
+Do not run setup during `$plan`, plan discovery, `/reload`, worker startup, or merely because of a wake. On resume, reconcile workers, applicable closure and effect reservations first. A completion wake may prepare the quiescent workspace before dependent work when compatible evidence is absent. Include relevant setup outcomes and evidence references in the WorkBrief so workers do not repeat preparation by default. Setup success does not prove all gate-specific prerequisites.
 
 ## Decisions
 
@@ -81,13 +81,13 @@ The wait is logical, not a synchronous call. Do not decide a Level 2 amendment, 
 
 Other long specialist work uses `team_assign` when registered, with `plan` and `unit`. Otherwise use `agent_spawn` with `plan` and `unit`. Architect and Reviewer starts also pass the frozen `plan` and relevant `unit`, preserving the existing binding and execution root; record only their exterior Team assignment, never internal participants. Do not use `agent_run` for independent long work. Do not fetch a result in the assignment turn or poll status. After assignment, write one line under `## Workers` with the worker role, purpose, pending decision, consulted object, and the handle type and exact ID: exterior Team assignment ID for tables or Team, worker instance ID for low-level `agent_spawn`. Do only already-authorized current-unit work independent of the pending answer. End the turn if nothing else in the current unit can proceed without that result. Do not ask the user whether to wait or keep a call open.
 
-Interpret `pitako.worker.result` messages supplied automatically in context. Ordinary assignments carry their existing complete result. Tables carry either a complete inline report or an incomplete reference: read pertinent `team_result` sections before dependent judgment. A short `pitako.worker` wake is not itself the required judgment. Replace the worker checkpoint line with the coordinator decision, then continue the unit within its existing authority. That checkpoint is not collection or handoff acknowledgement. Exact-assignment `team_result` and worker-instance `agent_result` reads do not acknowledge incorporation. Table starts accept `{section?, maxBytes?}` (4096..16384 bytes, default 16384); continuations use only `cursor` with the exact assignment ID. Do not automatically load every page. Ordinary diagnostic reads retain their prior behavior. Pending or blocked bookkeeping, delivery, and continuation remain motor state. A failed, cancelled, lost or inconclusive worker blocks acceptance, not independent authorized diagnosis. Report the failure, delimit the remaining correction, and use the active Head's authorized input route; replacement requires exact settlement, recovery and normal admission first. Never take over inline or blindly retry another transport. An unknown handle is a blocker to replacement, not evidence that another handle type should be tried. The planning-only lost-consultation replacement does not apply in execution; preserve Team Hold reconciliation and recovery.
+Interpret `pitako.worker.result` messages supplied automatically in context. Ordinary assignments carry their existing complete result. Tables carry either a complete inline report or an incomplete reference: read pertinent `team_result` sections before dependent judgment. A short `pitako.worker` wake is not itself the required judgment. Replace the worker checkpoint line with the coordinator decision, then continue the unit within its existing authority. That checkpoint is not collection or handoff acknowledgement. Exact-assignment `team_result` and worker-instance `agent_result` reads do not acknowledge incorporation. Table starts accept `{section?, maxBytes?}` (4096..16384 bytes, default 16384); continuations use only `cursor` with the exact assignment ID. Do not automatically load every page. Ordinary diagnostic reads retain their prior behavior. Pending or blocked bookkeeping, delivery, and continuation remain motor state. A failed, cancelled, lost or inconclusive worker blocks acceptance, not independent authorized diagnosis. Report the failure, delimit the remaining correction, and use the active Head's authorized input route; replacement requires exact settlement, recovery and normal admission first. Never take over inline or blindly retry another transport. An unknown handle is a blocker to replacement, not evidence that another handle type should be tried. The planning-only lost-consultation replacement does not apply in execution; preserve exact physical closure, incompatible effect reservations, authority and pins.
 
 A durable result, its current-branch receipt, and its interpretation/disposition are separate facts. A late or absent receipt does not prove consideration. Wait only for a live independent producer; host-return/append-dependent work is deferred, not a reason to await itself. Lost/restarted ownership requires diagnosis, not reconstructed authority. A wake without new causal progress does not justify redispatch or another wake. Retirement fences sends, drafts and recovery before joins while retaining outcome facts.
 
-Automatic collection reconciles only a successful assignment's own result hold; it does not accept work or complete a unit. Bookkeeping failure is reported separately and never hides the selected report or its reference. A wake, terminal status, steering receipt, or bookkeeping result is not the required judgment.
+Automatic collection verifies the exact attempt's physical closure independently of outcome; it does not accept work or complete a unit. Bookkeeping failure is reported separately and never hides the selected report or its reference. A wake, terminal status, steering receipt, or bookkeeping result is not the required judgment.
 
-If Team or table admission rejects a request, distinguish the concrete policy/resource or binding blocker from an unknown handle. End the turn without polling or fallback while owned settlement is pending; retry the intended route only after its actual blocker is resolved and the consultation or review is still necessary and authorized. Another assignment's result does not answer this consultation. Do not use `agent_spawn` or `agent_run` to evade admission rejection. Cancellation alone proves neither settlement nor member release and does not clear a Team hold.
+If Team or table admission rejects a request, distinguish the concrete policy/resource or binding blocker from an unknown handle. End the turn without polling or fallback while owned settlement is pending; retry the intended route only after its actual blocker is resolved and the consultation or review is still necessary and authorized. Another assignment's result does not answer this consultation. Do not use `agent_spawn` or `agent_run` to evade admission rejection. Cancellation alone proves neither settlement nor member release or release an incompatible effect reservation.
 
 Handles are session-local. On resume, look only at `## Workers`. Do not treat frontmatter `status: running` or the `## Status` body as a worker. Check each recorded handle once by type: for a Team assignment, call `team_status` with its assignment ID; for a low-level worker, call `agent_status` with its instance ID. If running, continue only independent authorized work or end the turn to wait. If unknown, record the missing ownership evidence and block dependent replacement, not independent diagnosis. Do not poll or infer a new authorization requirement.
 
@@ -109,7 +109,7 @@ product writes, including read-only focused verification. Do not grant `["."]`
 by default or derive writes from a leaf count. The envelope does not authorize
 frozen plan, ledger, personal settings, or unrelated resource changes.
 Head's host-granted local leaves do not authorize extra exterior Developers, reordered
-units, changes to the frozen plan or ledger, cleared holds, or waived final gates.
+units, changes to the frozen plan or ledger, released resources without closure, or waived final gates.
 The Head returns an integrated handoff or diagnostic failure, not leaf transcripts.
 The coordinator still owns acceptance and independent review.
 Head chooses whether to create leaves, local decomposition and scheduling, and
@@ -123,7 +123,7 @@ not automatically save, restart, reset, check out, or adopt source. Explicit
 `checkpoint_origin` continuation requires host-validated exact source/index/root
 compatibility and positive predecessor/contributor closure before a new baseline
 or prompt. A saved ref, receipt, terminal status, or missing history cannot bypass
-those checks, writer settlement, Team holds, fresh verification, or acceptance.
+those checks, writer settlement, applicable closure and effect reservations, fresh verification, or acceptance.
 Unsupported repositories truthfully refuse checkpoint creation.
 
 An explicit user requirement for ordinary single Developer, or prohibition of
@@ -160,10 +160,10 @@ physical settlement.
 
 Interpret the complete result and model-facing host content already returned for
 that exact handle. Reconcile actual writers, repository effects, binding, and
-any Team hold. A fresh Head in this invocation requires already-returned
-model-facing host proof of released closure for that exact handle, required hold
-recovery, and normal admission. Without that proof, no Head starts in this
-invocation: preserve the blocker, affected resources, and holds.
+applicable effect reservations. A fresh Head in this invocation requires already-returned
+model-facing host proof of released closure for that exact handle and normal
+admission under current authority and pins. Without that proof, no Head starts in this
+invocation: preserve the blocker, affected resources, and reservations.
 
 A normal `team_cancel` receipt reports pending closure, not released closure.
 Later `team_status` omits closure; `agent_status` excludes Team-owned workers and
@@ -175,16 +175,17 @@ recancel, poll, probe another assignment, switch transport, or add an observatio
 API to manufacture proof.
 
 A later authorized admission may assign Head only after the role is free and
-normal binding, ownership, and explicit evidence-based hold recovery permit it.
-This does not prove closure in the current invocation. Failed, cancelled, and
-no-outcome holds never clear merely because a new Head starts. An explicit
+normal binding, ownership, exact physical closure and effect reservations permit it.
+This does not prove closure in the current invocation. A new Head never proves
+predecessor closure or changes a failed/cancelled outcome. Physically closed
+failures require no separate hold-clearing ritual. An explicit
 single-mode exception is not a deviation. Retain already physically settled useful
 ordinary work for normal independent review and acceptance; do not replay it to
 manufacture a Head handoff. Assign only the remaining outcome.
 
 Compare new user information with the consulted object and original WorkBrief before using a result. For information within the brief, use the bounded in-scope input route below. Input does not expand the frozen authority or permitted effects.
 
-If information changes the object outside the WorkBrief, mark the old consultation or review inapplicable to the pending decision. Interpret its automatic result when supplied, but do not use it to close that decision or apply the change after accepting the old judgment. Cancel the exact still-active target with `team_cancel` or `agent_cancel` according to handle type. End the turn while settlement and member release are pending. Only after settlement and member release, assign a fresh WorkBrief against the current object if still necessary and authorized. Preserve evidence validity, frozen authority, and Team Hold recovery; a new assignment does not clear a blocking hold.
+If information changes the object outside the WorkBrief, mark the old consultation or review inapplicable to the pending decision. Interpret its automatic result when supplied, but do not use it to close that decision or apply the change after accepting the old judgment. Cancel the exact still-active target with `team_cancel` or `agent_cancel` according to handle type. End the turn while settlement and member release are pending. Only after settlement and member release, assign a fresh WorkBrief against the current object if still necessary and authorized. Preserve evidence validity, frozen authority, exact physical closure and pins; a new assignment does not release an incompatible effect reservation.
 
 Any fresh Developer assignment also obeys Head selection and, for an ordinary
 selection deviation, the stricter same-invocation closure rules above.
@@ -201,7 +202,7 @@ For Head work, correct drift, missing results, or an actual contract violation. 
 
 Inspect the receipt and later activity separately. `queued` means admitted to the native queue, not delivered or answered. `handled` means an input hook consumed the note, not an answer. `rejected` means no accepted submission. `unconfirmed` preserves uncertainty when the binding closes without delivery or answer proof. A candidate answer only identifies a reply that mentions the interaction ID. Judge correction from subsequent behavior and relevant evidence, not that marker.
 
-Neither `queued` nor `handled` proves correction or replaces a new consultation. Do not turn purposeful observation into status polling, a classification each turn, or mandatory consultation. Input does not settle a Team hold, accept a result, waive independent final review, change ModelPolicy, or allow another Developer.
+Neither `queued` nor `handled` proves correction or replaces a new consultation. Do not turn purposeful observation into status polling, a classification each turn, or mandatory consultation. Input does not establish physical closure, release an incompatible effect reservation, accept a result, waive independent final review, change ModelPolicy, or allow another Developer.
 
 Inline implementation is allowed only when no agent or Team tools are registered in the session. Failure, stall, cancellation, lost workers, or synchronous-only tools do not activate that exception.
 
@@ -246,7 +247,7 @@ Communication with Developer and Researcher: Caveman full. Architect and Reviewe
 
 ## Loop
 
-For each unit: load the WorkBrief, implement, verify, then checkpoint. A failed or inconclusive required review leaves that unit unaccepted; diagnose, correct via the authorized Head route, run affected checks/gates, then obtain the still-required relevant final review and interpret it before acceptance. An active Head may receive bounded input. A new Head requires settled prior ownership, exact hold recovery and admission. Unknown closure may bar replacement while independent authorized diagnosis continues.
+For each unit: load the WorkBrief, implement, verify, then checkpoint. A failed or inconclusive required review leaves that unit unaccepted; diagnose, correct via the authorized Head route, run affected checks/gates, then obtain the still-required relevant final review and interpret it before acceptance. An active Head may receive bounded input. A new Head requires settled prior ownership, exact physical closure and admission under applicable effect reservations and pins. Unknown closure may bar replacement while independent authorized diagnosis continues.
 
 Developer implementation uses Ponytail full. There is no separate Ponytail agent. Ponytail may simplify how a requirement is implemented. It may not drop an acceptance criterion, invariant, trust-boundary check, security behavior, or necessary error handling. Record a `RULING` when that simplification is architectural.
 
@@ -271,7 +272,7 @@ If verification fails in an implementation assignment, the same Developer reprod
 Keep ordinary in-scope correction with the responsible active Developer, using
 bounded input when appropriate, not a second exterior Developer. If failure or
 cancellation requires a fresh assignment, first satisfy settlement, binding,
-ownership, and hold recovery; select Head again for the remaining outcome under
+ownership, applicable effect reservations and pins; select Head again for the remaining outcome under
 Workers. An active ordinary selection deviation follows the stricter transition
 rules above. A failed worker never authorizes inline takeover.
 
@@ -279,7 +280,7 @@ Known focused diagnosis and correction remain with the Developer, regardless of 
 
 Do not start the next unit until this unit is verifiable.
 
-Design-time ordering guidance does not authorize skipping or reordering frozen units. After a verification prerequisite failure, continue only useful independent checks permitted inside the current unit. Do not bypass ownership, unresolved Team holds, or setup restrictions. Failed or interrupted setup permits only non-dependent read-only diagnosis, not implementation writes or dependent checks. Independent checks do not accept the incomplete unit or waive required evidence, final gates, or review.
+Design-time ordering guidance does not authorize skipping or reordering frozen units. After a verification prerequisite failure, continue only useful independent checks permitted inside the current unit. Do not bypass ownership, applicable physical closure or incompatible effect reservations, or setup restrictions. Unresolved Team holds in shared verification guidance mean these physical exclusions, never a veto by historical outcome or ledger entries. Failed or interrupted setup permits only non-dependent read-only diagnosis, not implementation writes or dependent checks. Independent checks do not accept the incomplete unit or waive required evidence, final gates, or review.
 
 ## Cleanup
 
@@ -315,13 +316,13 @@ For standalone `$execute` and bounded consultations, use the public route:
 
 Use `review_start` for the existing independent Reviewer pass, with no individual fallback or extra pass. For standalone final review, use `object: {kind: "diff", base: "<agreed-local-ref>"}` for the complete final diff, including staged, unstaged and applicable non-ignored untracked files. Pin an explicit local base and provide scope, criteria, evidence and current identities. Do not impose a new clean-tree or commits-only prerequisite for review. A `brief` object is only a bounded consultation; neither that nor correction review substitutes for final whole-diff review. See [Reviewer tables](../../docs/review.md).
 
-Pass the frozen `plan` and relevant `unit` to `review_start` under the existing execution binding. The managed `execution_review` port supplies that correlation itself. For either route, record only its actual returned exterior Team assignment under `## Workers`, with purpose, pending decision and consulted object. Preserve root watches, ledger and Board rules; incompatible binding or a real Team hold blocks, and the table is not an escape from admission rejection. Internal participant results never deliver foreground judgments.
+Pass the frozen `plan` and relevant `unit` to `review_start` under the existing execution binding. The managed `execution_review` port supplies that correlation itself. For either route, record only its actual returned exterior Team assignment under `## Workers`, with purpose, pending decision and consulted object. Preserve root watches, ledger and Board rules; incompatible binding, applicable active/unknown physical resources or incompatible effect reservations block, and the table is not an escape from admission rejection. Internal participant results never deliver foreground judgments.
 
 Both routes use a new independent substantive director/root and zero to five optional specialists selected for utility with reasons, separate from implementers, designers and the accepting coordinator. Selective recomposition preserves useful conversations. Optional Scout, Researcher and Oracle supports supply knowledge, not judge findings. Corrections remain outside the table with Developer under the existing correction order.
 
-Interpret the selected exterior table report after physical closure and comparison with the current object. A complete inline report needs no fetch; an incomplete reference requires pertinent `team_result` reading before judgment. `review_read` provides paged diagnostics, not acknowledgement. Use the actual exterior host status and authorized `judgment` completion/verdict, not historical synthesis, dispositions or diagnostic room state. Null judgment cannot approve. Completed work can report `changes-required` or `inconclusive`; `no-blockers` is not coordinator acceptance. Failed, cancelled, partial or drifted work, or missing indispensable evidence, cannot approve. A final inconclusive judgment blocks approval. Successful work-hold reconciliation is bookkeeping only. The table cannot implement, accept units, freeze plans or waive gates.
+Interpret the selected exterior table report after physical closure and comparison with the current object. A complete inline report needs no fetch; an incomplete reference requires pertinent `team_result` reading before judgment. `review_read` provides paged diagnostics, not acknowledgement. Use the actual exterior host status and authorized `judgment` completion/verdict, not historical synthesis, dispositions or diagnostic room state. Null judgment cannot approve. Completed work can report `changes-required` or `inconclusive`; `no-blockers` is not coordinator acceptance. Failed, cancelled, partial or drifted work, or missing indispensable evidence, cannot approve. A final inconclusive judgment blocks approval. Physical closure is bookkeeping evidence, not a successful judgment or acceptance. Acceptance also requires closure of all contributing work and satisfied current-run obligations; an uncertain phase turn blocks its exact target and that run's acceptance. Do not replay an uncertain dispatch. The table cannot implement, accept units, freeze plans or waive gates.
 
-Failed/inconclusive Review blocks approval, not authorized diagnosis/correction. Delimit the correction, use active Head input or replacement only after exact settlement/recovery/admission, run affected checks/gates, and obtain the relevant final review again. `queued`/`handled` prove neither repair nor review. No inline takeover, blind retry, transport workaround or waived hold. Unknown may block replacement while independent authorized diagnosis continues.
+Failed/inconclusive Review blocks approval, not authorized diagnosis/correction. Delimit the correction, use active Head input or replacement only after exact physical settlement and normal admission, run affected checks/gates, and obtain the relevant final review again. `queued`/`handled` prove neither repair nor review. No inline takeover, blind retry, transport workaround or waived physical exclusion. Unknown may block replacement while independent authorized diagnosis continues.
 
 Fingerprints identify observed endpoints, not transactional snapshots, ABA-proof history or post-delivery freshness. Material object edits invalidate affected judgment under the review policy below.
 

@@ -152,7 +152,8 @@ describe("pitako agents command", () => {
       expect(attempts).toHaveLength(1);
       expect(attempts[0]!.outcome?.status).toBe("failed");
       expect(attempts[0]!.outcome?.result).toContain("missing-fixture-role");
-      expect(store.get<Reservation>("reservations", attempts[0]!.reservationId)?.state).toBe("released");
+      expect(attempts[0]!.reservationId).toBeUndefined();
+      expect(store.closureReceipt(attempts[0]!.resource)).toBeDefined();
       expect(store.all("obligations")).toHaveLength(1);
     } finally { store.close(); }
   }));

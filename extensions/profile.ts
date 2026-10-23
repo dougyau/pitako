@@ -21,7 +21,7 @@ export const ORCHESTRATION_TOOLS = [
   "review_start", "review_read", "review_control",
   "consultation_feedback",
   "execution_disposition",
-  "execution_gates", "execution_review", "execution_acceptance", "task_status", "task_finish",
+  "execution_gates", "execution_review", "execution_acceptance", "task_status", "task_finish", "workflow_status",
   "agent_run",
   "agent_supervise",
   "agent_spawn",
@@ -37,7 +37,7 @@ export const ORCHESTRATION_TOOLS = [
   "team_cancel",
 ] as const;
 
-export const isOrchestrationTool = (name: string): boolean => /^(agent_|team_|head_|task_|execution_)/.test(name) || name === "consultation_feedback" || ["architecture_start", "architecture_read", "architecture_control", "review_start", "review_read", "review_control"].includes(name);
+export const isOrchestrationTool = (name: string): boolean => /^(agent_|team_|head_|task_|execution_)/.test(name) || ["consultation_feedback", "workflow_status", "architecture_start", "architecture_read", "architecture_control", "review_start", "review_read", "review_control"].includes(name);
 // SDK imports and Pi's extension loader can create separate module copies.
 const PROFILE_KEY = Symbol.for("pitako.sessionProfiles");
 type SessionProfile = { profile: ProfileName; current?: () => boolean };

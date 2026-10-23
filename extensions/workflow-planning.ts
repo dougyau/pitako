@@ -4,7 +4,7 @@ import path from "node:path";
 import { isUtf8 } from "node:buffer";
 import { assertPlanId, ledgerFile, parsePlanDocument, planFile, planHash, readExecutionBinding, type PlanMeta } from "./workflow.ts";
 import { acquireWorkflowOwner, type WorkflowState } from "./workflow-state.ts";
-import { captureCallContext, checkCallContext, checkAuthority, planningSlot, reserveEffect, assertPlanningQuiescent, readBoundPlan, guardToolRegistrations, type PhaseAuthority } from "./workflow-engine.ts";
+import { captureCallContext, checkCallContext, checkAuthority, observePhaseTurns, planningSlot, reserveEffect, assertPlanningQuiescent, readBoundPlan, guardToolRegistrations, type PhaseAuthority, type AttemptRecord } from "./workflow-engine.ts";
 import { consultedPlan } from "./review/object.ts";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -195,6 +195,7 @@ function foregroundPlanning(ctx: ExtensionContext) {
   if (isChildSession(ctx) || context.kind !== "managed") throw new Error("planning requires the live foreground managed invocation");
   const owner = checkAuthority(context.authority);
   if (owner.manager !== ctx.sessionManager || owner.run.phase !== "planning") throw new Error("not the captured planning foreground");
+  observePhaseTurns(owner.store, owner.run.runId, ctx.sessionManager.getSessionId(), ctx.sessionManager.getBranch());
   return { context, owner, slot: planningSlot(context.authority) };
 }
 function expected(slot: PlanSlot, revision: number | "absent", fileHash: string | null) {
@@ -237,9 +238,8 @@ export function acceptPlanning(ctx: ExtensionContext, input: PlanningAcceptance)
   const obligations = owner.store.all<{ obligationId: string; kind: string; dispatchId?: string; runId: string; cleared: boolean }>("obligations")
     .filter(item => item.runId === owner.run.runId && !item.cleared);
   for (const obligation of obligations) {
-    const attempt = obligation.dispatchId ? owner.store.get<{ outcome?: { status: string }; reservationId: string }>("attempts", obligation.dispatchId) : undefined;
-    const reservation = attempt && owner.store.get<{ state: string }>("reservations", attempt.reservationId);
-    if (obligation.kind !== "result" || !attempt?.outcome || reservation?.state !== "released")
+    const attempt = obligation.dispatchId ? owner.store.get<AttemptRecord>("attempts", obligation.dispatchId) : undefined;
+    if (obligation.kind !== "result" || !attempt?.outcome || !owner.store.closureReceipt(attempt.resource))
       throw new Error("planning obligation remains unabsorbed or unsettled");
   }
   const record = { kind: "planning-acceptance", runId: owner.run.runId, ...input,
