@@ -61,6 +61,8 @@ The manifest starts with early lifecycle, the independent official Codex entry, 
 | Shared API, type, or module change | `blast-radius` |
 | Cross-module design before code | `architecture-design` |
 | Explicit multi-perspective design discussion through pi-subagents | `architecture` |
+| Explicit advisory adversarial review through pi-subagents | `review` |
+| Review unnecessary complexity without applying fixes | `ponytail-review` |
 | Novel architecture with no precedent | `principle-exhaust-the-design-space` |
 | Verify behavior, review test quality in a diff, or simplify tests within authorized scope | `verify-behavior` |
 | Debugging | `principle-fix-root-causes` |

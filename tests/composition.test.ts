@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, mock, spyOn, test } from "bun:test";
@@ -195,6 +195,45 @@ describe("engineering-layer composition", () => {
     expect(note).not.toContain("The ladder");
     expect(note).not.toContain("wenyan");
     expect(note).not.toContain("Encode the real domain in a data structure");
+  });
+
+  test("ships advisory Reviewer resources without changing managed review", () => {
+    const manifest = JSON.parse(readRepo("package.json"));
+    expect(manifest.pi.skills).toContain("./skills/review");
+    expect(manifest.pi.skills).toContain("./node_modules/@dietrichgebert/ponytail/skills/ponytail-review");
+    for (const name of ["review", "ponytail-review"])
+      expect(DEFAULT_SKILL_NAMES as readonly string[]).toContain(name);
+    const { frontmatter: profile, body } = parseFrontmatter(readRepo("agents/reviewer.md"));
+    const architect = parseFrontmatter(readRepo("agents/architect.md")).frontmatter;
+    expect(`${profile.package}.${profile.name}`).toBe("pitako.reviewer");
+    expect(profile).toMatchObject({
+      acceptanceRole: "read-only", defaultContext: "fresh", systemPromptMode: "replace",
+      inheritProjectContext: true, inheritGlobalContext: false, inheritSkills: false,
+      skills: ["verify-behavior"],
+    });
+    expect(profile.model).toBeUndefined();
+    if (!Array.isArray(architect.tools) || !Array.isArray(architect.subagentOnlyExtensions) ||
+      !Array.isArray(profile.subagentOnlyExtensions) ||
+      !Array.isArray(profile.skillPath)) throw new Error("Expected profile resource lists");
+    expect(profile.tools).toEqual([...architect.tools.slice(0, 4), "watchdog_diff", ...architect.tools.slice(4)]);
+    expect(profile.subagentOnlyExtensions).toEqual(architect.subagentOnlyExtensions);
+    for (const provider of profile.subagentOnlyExtensions)
+      expect(readRepo(path.join("agents", provider)).length).toBeGreaterThan(0);
+    for (const directory of profile.skillPath)
+      expect(statSync(path.join(packageRoot(), "agents", directory)).isDirectory()).toBe(true);
+    expect(profile.skillPath).toContain("../node_modules/@dietrichgebert/ponytail/skills/ponytail-review");
+    expect(parseFrontmatter(readRepo("node_modules/@dietrichgebert/ponytail/skills/ponytail-review/SKILL.md"))
+      .frontmatter.name).toBe("ponytail-review");
+    const skill = readRepo("skills/review/SKILL.md");
+    expect(parseFrontmatter(skill).frontmatter.name).toBe("review");
+    expect(skill).toContain("does not replace required");
+    expect(skill).toContain("managed `review_start`");
+    expect(skill).toContain("pitako.reviewer");
+    expect(skill).toContain("No extra rounds");
+    expect(body).toContain("pi-subagents `agents/reviewer.md`");
+    expect(body).toContain("Do not claim to have reviewed unavailable bytes");
+    expect(readRepo("skills/pitako-coding/SKILL.md")).toContain("`review`");
+    expect(readRepo("README.md")).toContain("/skill:review <target and requirements>");
   });
 
   test("ordinary delegation ships directly while managed routes remain explicit", () => {

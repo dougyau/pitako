@@ -195,6 +195,25 @@ This advisory skill does not replace managed Architect tables, required
 `$plan` or `$execute` passes, or independent review. See
 [the architecture skill](skills/architecture/SKILL.md).
 
+### Review through independent adversarial angles
+
+Use `/skill:review <target and requirements>` for an advisory review through
+`pi-subagents`. Supply the exact diff, plan, solution, codebase scope, or issue
+material, not just a commit label. One background scripted workflow uses
+`pitako.reviewer` with CodeGraph, read-only LSP, and verify-behavior.
+
+The director chooses two to four angles on the complete target. Reviewers first
+work independently, then critique peer findings and respond once to challenges
+against their own. The director synthesizes supported findings, uncertainties,
+and evidence limits, with a reasoned disposition for every finding. There are no
+extra rounds or finding quotas. `ponytail-review`, from the existing Ponytail
+dependency, supplies the complexity angle when relevant; it is also exposed as
+a standalone skill.
+
+This workflow does not edit code, approve merges, or replace required managed
+Reviewer tables. It adds no Pitako model-policy integration. See
+[the review skill](skills/review/SKILL.md) for target capture and failure limits.
+
 ## Roles and model policies
 
 A role is a reusable responsibility template, not a running agent. AgentInstances use roles for synchronous runs, background workers, and Team assignments.

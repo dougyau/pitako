@@ -2,10 +2,12 @@
 export const DEFAULT_SKILL_NAMES = [
   "pitako-coding",
   "ponytail",
+  "ponytail-review",
   "caveman",
   "investigate-first",
   "architecture-design",
   "architecture",
+  "review",
   "how",
   "why",
   "blast-radius",
