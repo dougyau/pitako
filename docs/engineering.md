@@ -26,7 +26,7 @@ Caveman is not a Pi package. `skills/` is MIT. Engine, proxy, browse, MCP, and t
 
 ### pstack: vendor selected skills
 
-`@zenspc/pi-pstack` 0.6.0 is the Pi-native port evaluated for the initial distribution. It loads poteto-mode, setup-pstack, and `pi-subagents`. Depending on it would add orchestration outside Pitako's AgentInstance and Team tools.
+`@zenspc/pi-pstack` 0.6.0 is the Pi-native port evaluated for the initial distribution. It loads poteto-mode, setup-pstack, and `pi-subagents`. Pitako selects its dependencies independently rather than loading that composition.
 
 Pitako vendors selected skills from the official pstack plugin (Lauren Tan, MIT, plugin revision `6ed0f7a9504f577d7529064103cecce9be7dfc5e`) and rewrites the orchestrated ones (`how`, `why`, `architect`, `blast-radius`, `reflect`, verification procedures) for a single agent.
 
@@ -42,7 +42,7 @@ Creating or maintaining a project verification procedure requires an explicitly 
 
 Check selection starts from behavior owned by the active project and its declared testing scope. The active project's root `GATES.md` controls its procedure, not the installed Pitako checkout. Reading an external boundary to understand a call does not authorize dependency certification or repair. A Reviewer cannot require the real replaced runtime solely because a controlled boundary double verifies an owned rule. Other projects retain authorized integration requirements from their scope, contracts, and active guide, not Pitako's distributed stack.
 
-Pitako acceptance covers its own rules, adapters, resource declarations, and instruction assembly through controlled external boundaries. It does not certify installation or operation of Pi, SDK, ACP, third-party extensions, providers, classifiers, CodeGraph, LSP, or Herdr. The complete checkout procedure is `bun run typecheck`, then `bun run test`, with normal file-parallel discovery. External certification checks are retired, not deferred gates. Local text and assembly checks observe policy availability, not future model compliance. Isolation, asynchronous settlement before cleanup, evidence limits, and independent review remain required.
+Pitako acceptance covers its own rules, adapters, resource declarations, and instruction assembly through controlled external boundaries. It does not certify installation or operation of Pi, SDK, ACP, third-party extensions, providers, classifiers, CodeGraph, or LSP. The complete checkout procedure is `bun run typecheck`, then `bun run test`, with normal file-parallel discovery. External certification checks are retired, not deferred gates. Local text and assembly checks observe policy availability, not future model compliance. Isolation, asynchronous settlement before cleanup, evidence limits, and independent review remain required.
 
 `typescript-best-practices` lives under `skills/language/` and is not in the default `pi.skills` list.
 
@@ -56,11 +56,41 @@ Pitako no longer has a strict-path, exact-match patch engine or structured patch
 
 `compress`, `search_context`, `decompress`, and `/acp` manage and recover blocks while keeping original session entries. Persistent sessions reload `<sessionFile>.acp.json`; in-memory children have no persistent sidecar. Active ACP cancels native manual `/compact` with `Compaction cancelled` and prevents automatic native summaries. Disabled ACP or a refused `bili` proxy leaves native compaction available. Pitako does not add `pi-codex-compaction`, a custom compactor, or a second scheduler.
 
-The manifest begins with early lifecycle (`extensions/index.ts`), the independent official `node_modules/pi-codex-tools/index.ts`, and late policy (`extensions/profile-policy.ts`), in that order. The remaining entries retain their relative order, including ACP before Hermes. Early startup synchronously revokes old controller, pane, bridge and background authority and closes admission before suspension. Counted leases remain independent; each own lease ends after its own retirement/publication, including bridge readiness, not after Codex or late policy. Accumulated retirement joins prior handles across overlapping transitions and shutdown; uncertain close remains fail-closed. Partial publication retires every newly created resource. A Codex error is reported under its native entry without invalidating a ready readonly bridge or masking Pitako's own error.
+The manifest begins with early lifecycle (`extensions/index.ts`), the independent official `node_modules/pi-codex-tools/index.ts`, and late policy (`extensions/profile-policy.ts`), in that order. The remaining entries retain their relative order, including ACP before Hermes. Early startup synchronously revokes old controller, bridge and background authority and closes admission before suspension. Counted leases remain independent; each own lease ends after its own retirement/publication, including bridge readiness, not after Codex or late policy. Accumulated retirement joins prior handles across overlapping transitions and shutdown; uncertain close remains fail-closed. Partial publication retires every newly created resource. A Codex error is reported under its native entry without invalidating a ready readonly bridge or masking Pitako's own error.
 
 The existing session-profile WeakMap holds the effective profile and early revision/manager validity. Late startup and model hooks reread that profile and check the live manager, session id and revision before applying tools; they neither reread flags nor create owners or release leases. Commands, prompt guidance and child reconciliation use the same profile source. Explicit child reconciliation follows bind and model activation, including same-model activation.
 
 Codex can be excluded through its normal manifest entry, with coding `edit`/`write` as the absent-tool fallback. SDK children still add only the Pitako package root: no extra Codex entry, hidden filtering or loader deduplication assumption. Parent filters are not automatically inherited. Managed Head accepts exactly one patch registration whose canonical loader path is the official public entry resolved relative to the package's bare import; it wraps that same definition, preserving schema, grammar, rendering and result. Duplicate, internal-entry, different-copy and foreign registrations are unsupported. Codex remains a bundled runtime prerequisite and invokes upstream install telemetry; `PI_OFFLINE=1` or Pi's `enableInstallTelemetry:false` disables telemetry. Caller-owned entries loaded before Pitako have no public lifecycle priority guarantee.
+
+### pi-subagents: ordinary delegation alongside the managed runtime
+
+Pitako pins and bundles `pi-subagents@0.79.2`, loading its published `index.js`
+directly from `pi.extensions` and declaring the same entry in `config/stack.json`.
+No wrapper is needed. Its peer `pi-ai >=0.86.1` admits the existing `1.0.4`
+development baseline; `0.80.0` and `0.81.0` require `>=1.2.0`. This avoids a
+general Pi upgrade. Package metadata and public API inspection establish this
+minimum compatibility choice, not provider/runtime certification.
+
+This version exposes `subagent` (including list/status actions),
+`subagents_enable`, `bg_wait`, `subagent_supervisor` and `contact_supervisor`,
+rather than separate status/manage tools. Upstream skills and prompts are not
+activated as Pitako resources. `roles/coordinator.md` guides resolved Coordinator
+instances, while `profileNote` supplies the ordinary-delegation preference to
+the real foreground `before_agent_start` hook; that hook does not load role files.
+
+Pitako's own runtime is retained. `$plan`, `$execute`, `/task`, Developer Head,
+Architect/Reviewer tables, holds, gates and acceptance continue through their
+existing routes. Upstream children do not automatically inherit Pitako
+`ModelPolicy`, routing, reservations, history or the T3 agent bridge. No bridge
+adapter or equivalence is claimed. Analysis delegation is instructed to remain
+read-only; neither foreground profile is a sandbox.
+
+The child loader filters out extensions registering upstream orchestration
+before binding their session/scheduler hooks. The profile excludes upstream
+orchestration from every Pitako child/managed session, the SDK excludes the published tool names, and child definitions and
+tool-call hooks reject the upstream family, including direct codemode calls.
+Existing managed-definition guards remain in force. These controlled policy
+checks do not certify upstream child operation or future model compliance.
 
 ## Conflicts
 
@@ -76,7 +106,7 @@ Codex can be excluded through its normal manifest entry, with coding `edit`/`wri
 
 ## Always-on context
 
-The Pitako extension injects `profileNote` only: profile, inspect-first, small diffs, real verification, and "load a specialized skill only when it applies." Skill bodies stay out of that note.
+The Pitako extension injects `profileNote` for the foreground: profile, inspect-first, small diffs, real verification, ordinary pi-subagents delegation with managed-route boundaries, and "load a specialized skill only when it applies." Pitako children receive `childSessionNote` instead. Skill bodies stay out of these notes.
 
 ## Configurability
 
@@ -152,8 +182,6 @@ AgentInstance has no 20-minute deadline. The stops at that mark came from the pa
 Bookkeeping and delivery recover independently, with one initial operation and at most one later event-driven recovery per failed operation. Outstanding offers suppress duplicate offers until a safe final boundary; late exact receipts still reconcile after recovery is exhausted. Incorporation is historical once observed, but final `resultTaken` also requires reconciled or inapplicable bookkeeping and a subsequent public owning `turn_start` with the full result in its active branch. Neither this turn opportunity nor bookkeeping accepts work or completes a unit. Incorporated text is not resent to repair continuation; a rejected busy continuation never falls back to an idle wake. Parent abort/error restrictions clear only on an externally initiated owning run.
 
 The captured foreground session ID, revision, owner token, and Team token fence every effect. Worker live-handle generation is not the foreground lease. Terminal manual-compaction/tree boundaries can deliver despite stale `isIdle`; automatic compaction during busy work is not final agent settlement. Retirement prevents retargeting and preserves cancellation/resource settlement. `steer` is not used for result handoff. Workers and handoffs do not survive reload, `/new`, fork, resume, or process exit.
-
-`agent_supervise` stays a synchronous Herdr wait. It is not an AgentInstance path and it is not the background path. It requires Herdr presence and a current official Pi integration. The operator installs that integration with `herdr integration install pi`. Pitako does not install it. A supervised result is an instance id, a pane id, and a Herdr status. It is not an `AgentRunResult`.
 
 ## Team assignments
 
@@ -335,7 +363,7 @@ Pitako loads LSP and CodeGraph through their direct extension entries. CodeGraph
 
 ## Plan and execute
 
-`$plan` writes `.pitako/plans/<id>.md` and stops at `PLAN_FROZEN`. It does not invoke `$execute`. `$execute` is a separate skill. It requires `status: frozen`. `$plan` and `$execute` are not Herdr callers.
+`$plan` writes `.pitako/plans/<id>.md` and stops at `PLAN_FROZEN`. It does not invoke `$execute`. `$execute` is a separate skill. It requires `status: frozen`.
 
 Both workflows use only `architecture_start` and `review_start` for Architect/Reviewer dependencies, including Level 2 consultations and final independent review. These replace existing passes without adding any. Missing starts block the required judgment; they do not permit individual or inline fallback or waived review. Designers remain separate from reviewers and the Coordinator retains acceptance. The coordinator ends its turn when no authorized independent work remains and interprets the complete automatic result before a dependent decision. Admission rejection requires resolving its concrete policy/resource or binding blocker, not a transport fallback.
 

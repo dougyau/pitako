@@ -11,6 +11,7 @@ import { agentScope } from "../extensions/agent/scope.ts";
 import { packageRoot } from "../extensions/stack.ts";
 import { childActiveTools, toolsForProfile } from "../extensions/profile.ts";
 import { parsePitakoConfig } from "../extensions/roles/load.ts";
+import type { AgentScreen } from "../extensions/agent/screen.ts";
 
 describe("table candidate pool normalization", () => {
   for (const section of ["architecture", "review"] as const) {
@@ -81,6 +82,7 @@ afterEach(async () => {
 
 function profileHarness(profileFlag?: string, external?: () => Promise<void>) {
   const writes: string[] = [];
+  const registeredTools: string[] = [];
   const active = ["read", "bash", "edit", "write"];
   const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
   let profileCommand: ((args: string, ctx: unknown) => Promise<void>) | undefined;
@@ -99,7 +101,7 @@ function profileHarness(profileFlag?: string, external?: () => Promise<void>) {
   };
   const pi = {
     registerFlag() {},
-    registerTool() {},
+    registerTool(tool: { name: string }) { registeredTools.push(tool.name); },
     getFlag() { return profileFlag; },
     on(event: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) {
       const previous = handlers.get(event);
@@ -129,8 +131,12 @@ function profileHarness(profileFlag?: string, external?: () => Promise<void>) {
     factories.get(entry)?.({ ...pi, setActiveTools(names: string[]) { writes.push(entry); pi.setActiveTools(names); } } as unknown as ExtensionAPI);
   shutdowns.push(async () => { await handlers.get("session_shutdown")?.({}, context); });
   return {
-    active, available, writes,
+    active, available, writes, registeredTools,
     context,
+    async command(args: string, ctx: unknown = context) {
+      if (!profileCommand) throw new Error("pitako command was not registered");
+      await profileCommand(args, ctx);
+    },
     async modelSelect() { await handlers.get("model_select")?.({}, context); },
     async start() {
       const handler = handlers.get("session_start");
@@ -154,6 +160,55 @@ function profileHarness(profileFlag?: string, external?: () => Promise<void>) {
 }
 
 describe("Pitako resources and policy", () => {
+  test("foreground omits supervision and opens the primary native agent screen", async () => {
+    const host = profileHarness();
+    await host.start();
+    expect(host.registeredTools).toContain("apply_patch");
+    expect(host.registeredTools).not.toContain("agent_supervise");
+    const rendered: string[] = [], notices: string[] = [];
+    let closed = 0;
+    const context = { ...host.context, hasUI: true, mode: "tui", ui: {
+      ...host.context.ui,
+      notify(text: string) { notices.push(text); },
+      async custom(factory: (tui: unknown, theme: unknown, keys: unknown, done: () => void) => AgentScreen) {
+        const screen = factory({ requestRender() {}, terminal: { rows: 40 } }, {}, {}, () => { closed++; });
+        try {
+          rendered.push(screen.render(100).join("\n"));
+          screen.handleInput("\x1b");
+        } finally { await screen.finish(); }
+      },
+    } };
+    await host.command("agents", context);
+    expect(rendered).toHaveLength(1);
+    expect(rendered[0]).toContain("Agents · list");
+    expect(rendered[0]).toContain("No workers");
+    expect(closed).toBe(1);
+    await host.command("agents pane", context);
+    expect(notices.at(-1)).toContain("unknown scoped worker");
+    expect(rendered).toHaveLength(1);
+  });
+
+  test("foreground hook supplies ordinary delegation guidance without selecting Coordinator", async () => {
+    const host = profileHarness();
+    await host.start();
+    for (const profile of ["coding", "analysis"]) {
+      await host.selectProfile(profile);
+      const prompt = await host.composePrompt("Existing system instructions.");
+      expect(prompt).toContain("Existing system instructions.");
+      expect(prompt).toContain("prefer pi-subagents");
+      expect(prompt).toContain("Keep $plan/$execute, /task, Developer Head, Architect/Reviewer tables");
+      expect(prompt).toContain("never bypass missing policy, failed admission or managed restrictions");
+      expect(prompt).toContain("Analysis delegates must be read-only");
+      expect(prompt).not.toContain("You own the mission.");
+      expect(await host.composePrompt(prompt)).toBe(prompt);
+    }
+    await agentScope.run({ instanceId: "controlled-child", roleId: "developer" }, async () => {
+      const prompt = await host.composePrompt();
+      expect(prompt).toContain("Pitako AgentInstance controlled-child.");
+      expect(prompt).not.toContain("prefer pi-subagents");
+    });
+  });
+
   test("declares Pitako resources and explicit-only gates without a Pi loader", () => {
     const root = packageRoot(), manifest = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
     expect(manifest.pi.extensions[0]).toBe("./extensions/index.ts");
@@ -289,11 +344,11 @@ describe("Pitako resources and policy", () => {
     await developer.shutdown();
   });
 
-  test("supervised Herdr roles keep edit/write on unsupported models", async () => {
+  test("environment-marked children keep edit/write on unsupported models", async () => {
     const previousId = process.env.PITAKO_INSTANCE_ID;
     const previousRole = process.env.PITAKO_ROLE_ID;
     try {
-      process.env.PITAKO_INSTANCE_ID = "herdr-child";
+      process.env.PITAKO_INSTANCE_ID = "environment-child";
       process.env.PITAKO_ROLE_ID = "developer";
       const developer = profileHarness();
       await developer.start();

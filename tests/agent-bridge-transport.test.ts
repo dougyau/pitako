@@ -10,7 +10,6 @@ import { clearObservations, publishObservation } from "../extensions/agent/obser
 import { createAgentBridge } from "../extensions/agent/bridge/broker.ts";
 import { connect } from "../extensions/agent/bridge/client.js";
 import { frame, frames, frameBytes } from "../extensions/agent/framing.js";
-import { frame as paneFrame, frames as paneFrames } from "../extensions/herdr/agents-ui/protocol.ts";
 import { capabilities, failure, isDescriptor, isRequest, isReply, replyBytes, type Descriptor, type Envelope } from "../extensions/agent/bridge/protocol.js";
 
 async function ownedBridge(run: (fixture: {
@@ -68,49 +67,47 @@ function row(id: string, session = "owner", selectedModel = "fixture/local") {
     origin: { source: "agent_run", coordinatorSessionId: session, workbrief: "not ordinary read metadata" } });
 }
 
-test("shared and re-exported pane framing preserve LF-only records, byte bounds and synchronous callbacks", () => {
-  for (const [encode, parse] of [[frame, frames], [paneFrame, paneFrames]] as const) {
-    const values: unknown[] = [], receive = parse(value => values.push(value));
-    const first = { text: '漢字\u2028\u2029\n😀"\\' };
-    expect(encode(first)).toBe(JSON.stringify(first) + "\n");
-    const bytes = Buffer.from(encode(first) + encode({ text: "other" }));
-    const split = bytes.indexOf(Buffer.from("漢")) + 1;
-    receive(bytes.subarray(0, split)); receive(bytes.subarray(split, split + 1));
-    expect(values).toEqual([]);
-    receive(bytes.subarray(split + 1));
-    expect(values).toEqual([first, { text: "other" }]);
-    const exact = encode("x".repeat(frameBytes - 3));
-    expect(Buffer.byteLength(exact)).toBe(65536);
-    receive(Buffer.from(exact).subarray(0, -1)); receive(Buffer.from("\n"));
-    expect(values.at(-1)).toBe("x".repeat(frameBytes - 3));
-    expect(() => encode("x".repeat(frameBytes - 2))).toThrow("Agent pane frame exceeds 64KiB");
-    const pending = parse(() => {});
-    pending(Buffer.alloc(frameBytes, 32));
-    expect(() => pending(Buffer.from("\n"))).toThrow("Agent pane frame exceeds 64KiB");
-    expect(() => parse(() => {})(Buffer.alloc(frameBytes + 1, 32))).toThrow("Agent pane frame exceeds 64KiB");
-    for (const invalid of ["{broken}\n", "\n", " \n"])
-      expect(() => parse(() => {})(Buffer.from(invalid))).toThrow(SyntaxError);
-    const ordered: unknown[] = [];
-    const reentrant = parse(value => {
-      ordered.push(value);
-      if (value === 1) reentrant(Buffer.from("2\n"));
-    });
-    reentrant(Buffer.from("1\n3\n"));
-    expect(ordered).toEqual([1, 2, 3]);
-    const callbackError = Error("callback error");
-    const throwing = parse(() => { throw callbackError; });
-    expect(() => throwing(Buffer.from("1\n"))).toThrow(callbackError);
-    expect(() => throwing(Buffer.from("2\n"))).toThrow(callbackError);
-  }
+test("native framing preserves LF-only records, byte bounds and synchronous callbacks", () => {
+  const values: unknown[] = [], receive = frames(value => values.push(value));
+  const first = { text: '漢字\u2028\u2029\n😀"\\' };
+  expect(frame(first)).toBe(JSON.stringify(first) + "\n");
+  const bytes = Buffer.from(frame(first) + frame({ text: "other" }));
+  const split = bytes.indexOf(Buffer.from("漢")) + 1;
+  receive(bytes.subarray(0, split)); receive(bytes.subarray(split, split + 1));
+  expect(values).toEqual([]);
+  receive(bytes.subarray(split + 1));
+  expect(values).toEqual([first, { text: "other" }]);
+  const exact = frame("x".repeat(frameBytes - 3));
+  expect(Buffer.byteLength(exact)).toBe(65536);
+  receive(Buffer.from(exact).subarray(0, -1)); receive(Buffer.from("\n"));
+  expect(values.at(-1)).toBe("x".repeat(frameBytes - 3));
+  expect(() => frame("x".repeat(frameBytes - 2))).toThrow("Agent frame exceeds 64KiB");
+  const pending = frames(() => {});
+  pending(Buffer.alloc(frameBytes, 32));
+  expect(() => pending(Buffer.from("\n"))).toThrow("Agent frame exceeds 64KiB");
+  expect(() => frames(() => {})(Buffer.alloc(frameBytes + 1, 32))).toThrow("Agent frame exceeds 64KiB");
+  for (const invalid of ["{broken}\n", "\n", " \n"])
+    expect(() => frames(() => {})(Buffer.from(invalid))).toThrow(SyntaxError);
+  const ordered: unknown[] = [];
+  const reentrant = frames(value => {
+    ordered.push(value);
+    if (value === 1) reentrant(Buffer.from("2\n"));
+  });
+  reentrant(Buffer.from("1\n3\n"));
+  expect(ordered).toEqual([1, 2, 3]);
+  const callbackError = Error("callback error");
+  const throwing = frames(() => { throw callbackError; });
+  expect(() => throwing(Buffer.from("1\n"))).toThrow(callbackError);
+  expect(() => throwing(Buffer.from("2\n"))).toThrow(callbackError);
 });
 
-test("pane replacement decoding and BOM rejection differ deliberately from fatal bridge decoding", () => {
+test("native framing preserves replacement decoding and fatal bridge UTF-8 handling", () => {
   const invalidUtf8 = Buffer.from([34, 0xff, 34, 10]), bom = Buffer.from('\ufeff"valid"\n');
-  for (const parse of [frames, paneFrames]) {
+  {
     const values: unknown[] = [];
-    parse(value => values.push(value))(invalidUtf8);
+    frames(value => values.push(value))(invalidUtf8);
     expect(values).toEqual(["\ufffd"]);
-    expect(() => parse(() => {})(bom)).toThrow(SyntaxError);
+    expect(() => frames(() => {})(bom)).toThrow(SyntaxError);
   }
   const strict = (receive: (value: unknown) => void) => frames(receive, { label: "Agent bridge", fatalUtf8: true });
   expect(() => strict(() => {})(invalidUtf8)).toThrow();

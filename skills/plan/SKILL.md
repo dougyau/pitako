@@ -110,7 +110,7 @@ Managed plans use only the host-captured slot returned by `bound_plan_read`. Man
 
 ```markdown
 ---
-id: herdr-integration
+id: native-agent-update
 revision: 1
 status: frozen
 created_at: 2026-08-14T00:00:00Z

@@ -671,13 +671,12 @@ reasoning = "medium"
       if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previous;
     }
-    const names = childActiveTools(["read", "grep", "find", "ls", "bash", "agent_run", "agent_supervise", "board_post", "database_migrate"]);
+    const names = childActiveTools(["read", "grep", "find", "ls", "bash", "agent_run", "board_post", "database_migrate"]);
     expect(names).toContain("grep");
     expect(names).toContain("find");
     expect(names).toContain("ls");
     expect(names).toContain("read");
     expect(names).not.toContain("agent_run");
-    expect(names).not.toContain("agent_supervise");
     const unix = childActiveTools(["read", "bash", "powershell", "agent_run"], "linux");
     expect(unix).toContain("bash");
     expect(unix).not.toContain("powershell");
@@ -803,7 +802,7 @@ reasoning = "medium"
         return ["agent_run", "agent_observe", "agent_input", "read"];
       },
       getAllTools() {
-        return ["agent_run", "agent_supervise", "agent_observe", "agent_input", "read"].map(name => ({ name }));
+        return ["agent_run", "agent_observe", "agent_input", "read"].map(name => ({ name }));
       },
       setActiveTools(names: string[]) {
         active.splice(0, active.length, ...names);
@@ -819,7 +818,6 @@ reasoning = "medium"
       for (const handler of startup) await handler({}, { hasUI: false, ui: { notify() {}, setStatus() {} } });
     });
     expect(active.includes("agent_run")).toBe(false);
-    expect(active.includes("agent_supervise")).toBe(false);
     expect(active.includes("agent_observe")).toBe(false);
     expect(active.includes("agent_input")).toBe(false);
     expect(currentInstanceId()).toBeUndefined();

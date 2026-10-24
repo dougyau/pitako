@@ -18,8 +18,6 @@ import { executionForSession } from "./execution-identity.ts";
 import { formatUsage, mergeUsage, type AgentUsage } from "./agent/run.ts";
 import { inspectPitako } from "./roles/format.ts";
 import { completePitakoConfig } from "./roles/complete.ts";
-import { registerSupervisedSession, unregisterSupervisedSession } from "./herdr/author.ts";
-import { registerAgentSupervise } from "./herdr/supervise.ts";
 import { packageRoot, prepareRuntime } from "./stack.ts";
 import { planHeading, planInvocation, sessionNameAction } from "./session-name.ts";
 import { planFile, readFrozenPlan, readPlan } from "./workflow.ts";
@@ -32,8 +30,6 @@ import { loadPitakoConfig } from "./roles/load.ts";
 import { closeDispatchAdmissions, settlePendingDispatches } from "./agent/dispatch.ts";
 import { createAgentController } from "./agent/controller.ts";
 import { openAgentScreen } from "./agent/screen.ts";
-import { createPaneSession } from "./herdr/agents-ui/session.ts";
-import { readHerdrPresence } from "./herdr/presence.ts";
 import { createAgentBridge } from "./agent/bridge/broker.ts";
 import { AgentClosureError } from "./agent/closure.ts";
 import { principalLeases } from "./agent/head/operation-leases.ts";
@@ -84,13 +80,10 @@ export default function pitako(pi: ExtensionAPI, host: { recoveryScheduler?: Rec
     type: "string",
   });
 
-  registerAgentSupervise(pi);
-
   let ownerToken = Symbol("pitako.foreground");
   let agentUiBindingToken: symbol | undefined;
   let teamEvaluation: TeamEvaluation | undefined;
   let agentController: ReturnType<typeof createAgentController> | undefined;
-  let agentPane: ReturnType<typeof createPaneSession> | undefined;
   let agentBridge: ReturnType<typeof createAgentBridge> | undefined;
   let foregroundRevision = 0;
   let retirement: Promise<void> = Promise.resolve();
@@ -99,16 +92,14 @@ export default function pitako(pi: ExtensionAPI, host: { recoveryScheduler?: Rec
 
   const revokeForeground = () => {
     ++foregroundRevision;
-    const retired = { controller: agentController, pane: agentPane, bridge: agentBridge, token: ownerToken, evaluation: teamEvaluation };
+    const retired = { controller: agentController, bridge: agentBridge, token: ownerToken, evaluation: teamEvaluation };
     retired.controller?.revoke();
-    retired.pane?.revoke();
     retired.bridge?.revoke();
     revokeBackgroundOwner(retired.token);
     unbindForeground?.();
     unbindForeground = undefined;
     foregroundManager = undefined;
     agentController = undefined;
-    agentPane = undefined;
     agentBridge = undefined;
     teamEvaluation = undefined;
     if (agentUiBindingToken) unbindAgentUi(agentUiBindingToken);
@@ -126,7 +117,7 @@ export default function pitako(pi: ExtensionAPI, host: { recoveryScheduler?: Rec
       ...[
         () => retireTeamEvaluation(retired.evaluation), () => shutdownBackground(retired.token),
         () => settlePendingDispatches(sessionId), () => retired.controller?.settle(),
-        () => retired.pane?.close(), () => retired.bridge?.settle(), () => closeWorkflow?.(),
+        () => retired.bridge?.settle(), () => closeWorkflow?.(),
       ].map(async close => close()),
     ]).then(results => {
       const failures = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
@@ -192,9 +183,7 @@ export default function pitako(pi: ExtensionAPI, host: { recoveryScheduler?: Rec
           const currentId = ctx.sessionManager?.getSessionId();
           return currentId ? { sessionId: currentId, token: ownerToken } : undefined;
         });
-        agentPane = createPaneSession(agentController, readHerdrPresence(), path.join(packageRoot(), "extensions/herdr/agents-ui"));
       }
-      registerSupervisedSession(sessionId, process.env, pi, ctx.model);
       if (!isChildSession(ctx) && typeof ctx.isIdle === "function") {
         const token = ownerToken;
         const evaluationToken = teamEvaluation?.token;
@@ -284,14 +273,12 @@ export default function pitako(pi: ExtensionAPI, host: { recoveryScheduler?: Rec
 
   pi.on("session_shutdown", async (_event, ctx) => {
     const retired = revokeForeground();
-    const revision = foregroundRevision;
     retired.evaluation ??= teamEvaluationForSession(ctx.sessionManager?.getSessionId(), isChildSession(ctx));
     const sessionId = retired.evaluation?.sessionId ?? ctx.sessionManager?.getSessionId();
     const reopenDispatches = closeDispatchAdmissions(sessionId);
     // Serial event dispatch must start both fences before any retirement suspends.
     await retainRetirement(retired, sessionId, retireWorkflow);
     reopenDispatches();
-    if (revision === foregroundRevision) unregisterSupervisedSession();
   });
 
   const ownsEvent = (ctx: ExtensionContext) => foregroundSession(ctx?.sessionManager?.getSessionId()) &&
@@ -427,19 +414,6 @@ export default function pitako(pi: ExtensionAPI, host: { recoveryScheduler?: Rec
       if (command === "agents") {
         if (isChildSession(ctx)) { notify(ctx, "agents cannot be called from an AgentInstance", "error"); return; }
         try {
-          const agentArgs = args.trim().slice("agents".length).trim();
-          if (agentArgs.split(/\s+/)[0] === "pane") {
-            if (!ctx.hasUI || ctx.mode !== "tui") throw new Error("Agent pane requires an interactive foreground Pi terminal");
-            if (!agentPane) throw new Error("Agent pane controller unavailable");
-            const args = agentArgs.split(/\s+/).slice(1);
-            if (args.length === 1 && args[0] === "close") await agentPane.close();
-            else {
-              if (new Set(args).size !== args.length || args.some(arg => arg !== "--control" && arg !== "--raw-history"))
-                throw new Error("Use /pitako agents pane [--control] [--raw-history] or /pitako agents pane close");
-              await agentPane.launch({ control: args.includes("--control"), rawHistory: args.includes("--raw-history") });
-            }
-            return;
-          }
           if (ctx.hasUI && ctx.mode === "tui") {
             if (!agentController) throw new Error("Agent controller unavailable for this foreground session");
             await openAgentScreen(ctx, agentController, value);

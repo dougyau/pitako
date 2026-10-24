@@ -5,7 +5,6 @@ import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import pitako from "../extensions/index.ts";
 import profilePolicy from "../extensions/profile-policy.ts";
-import { registerAgentSupervise } from "../extensions/herdr/supervise.ts";
 import agentInstance from "../extensions/agent/index.ts";
 import { bindBackgroundOwner, clearBackgroundOwner, setBackgroundExecutor, observeWorkerResults, cancelAllWorkers,
   workerStatus, workerHandoff, shutdownBackground } from "../extensions/agent/background.ts";
@@ -51,7 +50,7 @@ primary = { model = "fixture/selected", reasoning = "medium" }
   } } as unknown as ExtensionAPI;
   const ctx = { cwd: root, sessionManager: { getSessionId: () => sessionId, getSessionFile: () => file, getBranch: () => branch },
     modelRegistry: { getAvailableOfType() { throw new Error("consultation must not discover a classifier"); } } } as unknown as ExtensionContext;
-  agentInstance(pi); registerAgentSupervise(pi);
+  agentInstance(pi);
   const evaluation = beginTeamEvaluation(sessionId, false)!;
   bindBackgroundOwner({ token: evaluation.token, sessionId, isIdle: () => true, hasUI: false,
     notify() {}, sendMessage() {}, getBranch: () => branch,
@@ -75,9 +74,7 @@ test("independent consultative policies and no premature synchronous/future expo
     const defaults = loadPitakoConfig({ cwd: s.root, userConfigPath: path.join(s.root, "absent") });
     for (const role of ["scout", "researcher", "oracle"]) {
       expect(resolveRoleFromConfig(defaults, role).modelPolicy.primary).toBeUndefined();
-      for (const tool of ["agent_run", "agent_supervise"]) {
-        expect((await s.invoke(tool, { role, task: "consult" })).isError).toBe(true);
-      }
+      expect((await s.invoke("agent_run", { role, task: "consult" })).isError).toBe(true);
     }
     expect(s.tools.has("head_consult")).toBe(false);
     expect(s.tools.has("consultation_feedback")).toBe(true);
@@ -311,7 +308,7 @@ test("activated direct validation, defaults, fallback reasoning and append gaps 
 test("post-bind analysis survives late tools and same-model reconciliation; nested definitions cannot orchestrate", fixture.ownedCase("analysis", async () => {
   const s = setup(); let calls = 0;
   const tools = new Map<string, { definition: any }>();
-  const names = ["read", "bash", "grep", "find", "ls", "edit", "write", "apply_patch", "lsp_rename", "codegraph_search", "agent_future", "team_assign", "head_plan", "consultation_feedback"];
+  const names = ["read", "bash", "grep", "find", "ls", "edit", "write", "apply_patch", "lsp_rename", "codegraph_search", "agent_future", "team_assign", "head_plan", "consultation_feedback", "subagent", "subagents_enable", "bg_wait", "subagent_supervisor", "contact_supervisor"];
   let hooks = new Map<string, Function>();
   const profileHooks = new Map<string, Function[]>();
   let childContext: any;
@@ -335,7 +332,7 @@ test("post-bind analysis survives late tools and same-model reconciliation; nest
   }, async prompt(session) {
     for (const name of ["read", "bash", "grep", "find", "ls", "codegraph_search"]) expect(session.active).toContain(name);
     for (const name of names.slice(5).filter(name => name !== "codegraph_search")) expect(session.active).not.toContain(name);
-    for (const name of ["agent_future", "team_assign", "head_plan", "consultation_feedback"]) {
+    for (const name of ["agent_future", "team_assign", "head_plan", "consultation_feedback", "subagent", "subagents_enable", "bg_wait", "subagent_supervisor", "contact_supervisor"]) {
       expect(await tools.get(name)!.definition.execute()).toMatchObject({ isError: true }); // codemode's direct-definition path
       expect(hooks.get("tool_call")!({ toolName: name }).block).toBe(true);
     }

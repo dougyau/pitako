@@ -94,6 +94,18 @@ Do not use the Board as a transcript, scratchpad, TODO list, or progress log. `t
 
 ## Roles
 
+For authorized ordinary foreground delegation, prefer bundled `pi-subagents`:
+activate with `subagents_enable({})` if needed, inspect agents with
+`subagent({ action: "list" })`, then use `subagent({ agent: "scout", task, async: false })`
+for reconnaissance or `worker` for authorized implementation. Pass scope,
+permitted effects and checks explicitly; analysis assignments stay read-only.
+Use `subagent({ action: "status", id: "<run-id>" })` and `bg_wait` for retained runs.
+This runtime does not inherit Pitako `ModelPolicy`, routing, reservations, history
+or the T3 agent bridge. Keep `$plan`, `$execute`, `/task`, Developer Head and
+Architect/Reviewer tables on their existing Pitako routes. Never substitute
+`subagent` for missing policy, failed admission or child/managed restrictions.
+Pitako children do not receive these upstream orchestration tools.
+
 `/pitako roles` and `/pitako role <id>` show role definitions. A role is a responsibility template; its `ModelPolicy` selects the instance's primary model and fallbacks. `agent_run` executes an allowed individual instance synchronously. The foreground session uses `team_assign`, `team_status`, `team_result`, and `team_cancel` for individual Team work; `/pitako team` inspects its roster. Architect and Reviewer use only `architecture_start` and `review_start`, including ad hoc questions. If the required start is absent, the pass is blocked, not individual, inline or waived. Background results are supplied automatically in the owning context, with or without plan/unit correlation. Tables supply either a complete inline report or an incomplete reference: read pertinent `team_result` sections before a dependent decision. Start with optional `section` and `maxBytes` (4096..16384 bytes, default 16384); continue with cursor only. Do not automatically load every page. Ordinary assignments retain complete results and optional diagnostic re-reads. Do not poll or acknowledge collection. Automatic handoff, transport end and report completion are not work acceptance or unit completion. Child instances do not receive orchestration tools. If delegation fails, report the error; do not take over that specialist work.
 
 Ordinary Team role work admits distinct members, including repeated roles; Team, role and member/assignment are different identities. Both starts use a substantive director with its own role primary and zero to five optional specialists selected for utility with reasons, including zero. Selective recomposition retains useful conversations. Missing table configuration, omitted candidates and empty candidates mean an empty pool; `architecture_start` has no `mode`. Tables replace existing Architect/Reviewer passes, not add passes. Record and watch only the exterior root. Interpret its complete terminal current-object judgment and keep independent Reviewer critique separate from designers. This does not relax `$execute`'s one exterior Developer, asynchronous Head/writes, integration barriers, checkpoint authority, holds or acceptance policy.

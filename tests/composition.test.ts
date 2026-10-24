@@ -123,13 +123,33 @@ describe("engineering-layer composition", () => {
     expect(note).toContain("Load a specialized skill only when it applies.");
     expect(note).toContain("Research or design does not authorize implementation.");
     // Include authority/provenance and shared TODO policy, not workflow bodies.
-    expect(note.length).toBeLessThan(2400);
+    expect(note.length).toBeLessThan(3200);
     for (const marker of THIRD_PARTY_ALWAYS_ON_MARKERS) {
       expect(note).not.toContain(marker);
     }
     expect(note).not.toContain("The ladder");
     expect(note).not.toContain("wenyan");
     expect(note).not.toContain("Encode the real domain in a data structure");
+  });
+
+  test("ordinary delegation ships directly while managed routes remain explicit", () => {
+    const manifest = JSON.parse(readRepo("package.json"));
+    const stack = JSON.parse(readRepo("config/stack.json"));
+    expect(manifest.dependencies["pi-subagents"]).toBe("0.79.2");
+    expect(manifest.bundledDependencies).toContain("pi-subagents");
+    expect(manifest.devDependencies["@earendil-works/pi-ai"]).toBe("1.0.4");
+    expect(manifest.peerDependencies["@earendil-works/pi-ai"]).toBe(">=1.0.4");
+    expect(manifest.pi.extensions.filter((entry: string) => entry.includes("pi-subagents")))
+      .toEqual(["./node_modules/pi-subagents/index.js"]);
+    expect(stack.required.find((entry: { id: string }) => entry.id === "pi-subagents"))
+      .toEqual({ id: "pi-subagents", spec: "pi-subagents@0.79.2", entry: "node_modules/pi-subagents/index.js",
+        tools: ["subagent", "subagents_enable", "bg_wait", "subagent_supervisor", "contact_supervisor"] });
+    for (const resources of [manifest.pi.skills, manifest.pi.prompts])
+      expect(resources.some((entry: string) => entry.includes("pi-subagents"))).toBe(false);
+    for (const text of [profileNote("coding"), profileNote("analysis"), readRepo("roles/coordinator.md"), readRepo("skills/pitako-coding/SKILL.md")]) {
+      for (const boundary of ["pi-subagents", "subagent", "subagents_enable", "$plan", "$execute", "/task", "Head", "Architect/Reviewer", "ModelPolicy", "T3 agent bridge"])
+        expect(text).toContain(boundary);
+    }
   });
 
   test("review documentation ships through existing package resources", () => {

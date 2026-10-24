@@ -17,7 +17,7 @@ Use [package.json](package.json) for current runtime versions, dependencies, and
 
 ## Keep changes scoped
 
-Tests verify implementation and decisions owned by Pitako, not installation or operation of Pi, ACP, third-party extensions, providers, CodeGraph, LSP or Herdr. Keep owned guarantees using controlled external boundaries; dependency certification is not an acceptance obligation. The complete procedure is `bun run typecheck` followed by `bun run test`, with normal discovery.
+Tests verify implementation and decisions owned by Pitako, not installation or operation of Pi, ACP, third-party extensions, providers, CodeGraph or LSP. Keep owned guarantees using controlled external boundaries; dependency certification is not an acceptance obligation. The complete procedure is `bun run typecheck` followed by `bun run test`, with normal discovery.
 
 Reuse existing code and fixtures before adding another helper or abstraction. Verify the affected Pitako behavior and integrations, not the dependencies themselves. Choose behavior-based checks that preserve the contract rather than tests tied to implementation details.
 

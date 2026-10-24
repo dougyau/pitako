@@ -17,6 +17,7 @@ It currently combines:
 - [`@juicesharp/rpiv-todo`](https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-todo) for session-local TODOs
 - [`pi-web-access`](https://github.com/nicobailon/pi-web-access) for web search, source checks, and page extraction
 - [`pi-hermes-memory`](https://github.com/chandra447/pi-hermes-memory) for persistent learning and conversation search, separate from the Board
+- [`pi-subagents`](https://github.com/nicobailon/pi-subagents) for ordinary foreground delegation, alongside Pitako's managed runtime
 
 Not every skill or principle is active all the time. Pi keeps names and descriptions in context and loads a skill body when the task matches. Principles are contextual. Roles can use different subsets. Team assignments and the workspace Board are available to the foreground session.
 
@@ -38,11 +39,10 @@ Disable Ponytail, Caveman, or any individual skill with `pi config` or package s
 - `agent_spawn` for one background in-process AgentInstance. The Coordinator stays available. `agent_status`, `agent_result`, and `agent_cancel` inspect that worker. `/pitako agents [instance-id]` opens the native list/detail screen in Pi's terminal and retains bounded text in non-TUI modes. See [the screen controls](docs/worker-history.md#native-agent-screen).
 - Foreground `agent_observe` and `agent_input` for bounded observation, context queries, and in-scope steering of exact active background or Team targets. Input waits for a later native boundary and never interrupts a command. A receipt is not an answer. See [worker history and input](docs/worker-history.md).
 - An opt-in local agent bridge for foreground native RPC hosts. Its passive Node client provides non-consuming reads, change hints, and explicitly granted worker controls. See [Agent bridge host reference](docs/agent-bridge.md) for launch flags, permissions, receipts, and reconnect limits.
-- `agent_supervise` for one synchronous visible sibling pane. It does not run in the background or join the Team roster.
 - `team_assign`, `team_status`, `team_result`, and `team_cancel` for independently identified individual background Team members. Every assignment admits a new member, including repeated allowed roles. Architect/Reviewer individual dispatch is rejected.
 - `architecture_start`, `architecture_read`, and `architecture_control` for [Architect tables](docs/architecture.md), the sole Architect route. `architecture_start` has no `mode`. A substantive director prepares and contributes even with zero specialists; zero to five optional specialists are chosen for utility with reasons and selectively retained, added or retired. The table supplies the existing architectural `$plan` pass when needed, not an extra pass; trivial work needs none.
 - `review_start`, `review_read`, and `review_control` for independent [Reviewer tables](docs/review.md), the sole Reviewer route replacing the existing pass one-for-one. A substantive director and zero to five optional specialists remain separate from designers and the accepting coordinator. Both directors require their own role primary; absent table config, omitted candidates and empty candidates mean an empty pool. The complete exterior report distinguishes completed review work from its verdict; it does not accept work or waive gates.
-- `$plan` and `$execute`. Planning stops at `PLAN_FROZEN`. Execution is a separate invocation. Neither calls Herdr.
+- `$plan` and `$execute`. Planning stops at `PLAN_FROZEN`. Execution is a separate invocation.
 
 ## Verify behavior
 
@@ -146,6 +146,30 @@ backfill. Search is a secondary index, not transcript or retention authority.
 See [Worker history](docs/worker-history.md) for pagination, retention defaults,
 capture gaps, sensitive raw records, and the manual indexing root difference.
 
+## Ordinary delegation
+
+Pitako bundles `pi-subagents@0.79.2` through its published `index.js` extension.
+This version admits the existing Pi `1.0.4` development baseline; `0.80.0` and
+`0.81.0` require `pi-ai >=1.2.0`. Pitako's Pi peers and development pins are unchanged.
+Upstream skills and prompts are not added to Pitako's resource lists.
+
+The foreground profile and Coordinator instructions prefer `subagent` for
+authorized ordinary work. Use `subagents_enable({})` if activation is needed,
+then `subagent({ agent: "scout", task: "Inspect the relevant code", async: false })`
+or `worker` for authorized implementation. `subagent({ action: "list" })` lists
+agents; `subagent({ action: "status", id: "<run-id>" })` and `bg_wait` track background work.
+Supply scope, permitted effects and checks explicitly; analysis assignments stay read-only.
+
+`$plan`, `$execute`, `/task`, Developer Head and Architect/Reviewer tables keep
+their Pitako routes, holds, gates and acceptance rules. The upstream runtime
+does not inherit Pitako `ModelPolicy`, Developer routing, reservations, history
+or the T3 agent bridge. Its run IDs are not Pitako handles. Missing policy or
+failed admission is not a reason to switch to `subagent`. Pitako children and
+managed sessions cannot use the new orchestration tools. Instruction checks
+verify availability of this guidance, not model compliance or provider operation.
+
+Disable with the package filter `!node_modules/pi-subagents/index.js`.
+
 ## Roles and model policies
 
 A role is a reusable responsibility template, not a running agent. AgentInstances use roles for synchronous runs, background workers, and Team assignments.
@@ -172,7 +196,7 @@ Reasoning uses Pi's levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, 
 
 Scout prepares repository context, Researcher establishes facts, and Oracle offers technical advice. They are analysis leaves, not substitutes for Architect design, Developer implementation or Reviewer judgment. Configure their independent `[model_policies.scout]`, `[model_policies.researcher]` and `[model_policies.oracle]` policies; no concrete models ship by default.
 
-Use `agent_spawn` or `team_assign` with `role`, `task` and optional `reasoning`. `agent_run` and `agent_supervise` reject these roles. A granted Head uses `head_consult`. All return a reserved handle before external preparation, then deliver through the existing automatic background or Head result channel. Reserved identity is not worker admission. Cancellation and retirement join owned preparation/disposal; unknown closure retains resources and capacity.
+Use `agent_spawn` or `team_assign` with `role`, `task` and optional `reasoning`. `agent_run` rejects these roles. A granted Head uses `head_consult`. All return a reserved handle before external preparation, then deliver through the existing automatic background or Head result channel. Reserved identity is not worker admission. Cancellation and retirement join owned preparation/disposal; unknown closure retains resources and capacity.
 
 - Omitted reasoning or `{mode:"default"}` preserves the configured primary, including Pi's settings/default chain when reasoning is omitted.
 - `{mode:"direct",level:"high"}` changes only primary reasoning. Unsupported direct reasoning fails after actual model bind before any prompt, without availability fallback.
@@ -205,8 +229,6 @@ fast = true
 These settings express request intent, not a granted tier. A provider endpoint can accept a request and still serve it at the standard tier. xAI `priority` means priority processing, not the separate Grok 4.7 Fast model variant.
 
 `agent_run` and `agent_result` include per-request summaries: `fast_requested`, `requested_service_tier`, `returned_service_tier`, and `time_to_first_model_output_ms`. `requested_service_tier` records the request, not the tier served. Current Pi does not expose the response service tier, so `returned_service_tier` is `unavailable`. Time to first model output is elapsed time from the Pi model-stream request start to the first non-empty text or thinking delta, or first tool-call start. Pi-reported cost is an estimate, not the provider's bill. The requested tier, response time, and estimated cost do not establish that ChatGPT Fast was active.
-
-Herdr has no fast-mode parity. `agent_supervise` rejects a `fast = true` primary before splitting a pane. A fast fallback is not selected by Herdr.
 
 Fallback means the preferred target could not be used because of provider or model availability: rate limit, quota, outage, or auth. It does not mean the code failed tests, the answer was weak, or the task got hard. `agent_run` may switch to the next target for those availability failures only. Pi does not export a stable error taxonomy, so `fallback_on` is not configurable.
 
@@ -242,9 +264,9 @@ Before a mutating or unknown tool runs, the next target may start a fresh sessio
 
 The result can include turns, input, output, cache tokens, cost, and tool-call counts when Pi reports them. Input tokens are cumulative across turns, not the size of one prompt.
 
-The child cannot call `agent_run`, `agent_supervise`, `agent_spawn`, `agent_status`, `agent_result`, `agent_cancel`, or the `team_*` orchestration tools. ACP delegates are off by default, but explicit ACP configuration can enable them in children too. Children start in `coding`, independently of the parent's profile. Same-session fallback can continue a child run; it does not expose a separate resume command.
+The child cannot call `agent_run`, `agent_spawn`, `agent_status`, `agent_result`, `agent_cancel`, or the `team_*` orchestration tools. ACP delegates are off by default, but explicit ACP configuration can enable them in children too. Children start in `coding`, independently of the parent's profile. Same-session fallback can continue a child run; it does not expose a separate resume command.
 
-`agent_spawn` returns while the worker is still running. The worker has its own cancellation. A later Coordinator turn does not cancel it. Physical settlement automatically collects and supplies the complete result to the live owning conversation, with or without `plan` and `unit`, UI, or a result-tool call. Idle owners receive full context messages followed by a short wake; busy owners receive result drafts at the settlement boundary and an admissible continuation request. The Coordinator interprets supplied results, rather than fetching or acknowledging them. `agent_result` and `team_result` remain optional, complete, idempotent diagnostic re-reads. Herdr supervision is unchanged.
+`agent_spawn` returns while the worker is still running. The worker has its own cancellation. A later Coordinator turn does not cancel it. Physical settlement automatically collects and supplies the complete result to the live owning conversation, with or without `plan` and `unit`, UI, or a result-tool call. Idle owners receive full context messages followed by a short wake; busy owners receive result drafts at the settlement boundary and an admissible continuation request. The Coordinator interprets supplied results, rather than fetching or acknowledging them. `agent_result` and `team_result` remain optional, complete, idempotent diagnostic re-reads.
 
 Collection, bookkeeping, delivery, and continuation remain separate. Handoff acknowledgement requires an exact committed result in the owning active branch, reconciled or inapplicable bookkeeping, and a subsequent owning turn with that result in its branch. A send, draft, preview, or getter is not that proof; even an observed turn is not model processing or work acceptance. Failed or uncertain operations remain visible and retain the full result, with at most one later event-driven recovery per operation. Parent abort/error never forces continuation. These handoffs are live-session state, not a durable queue or restart recovery. Full text can pressure the model context or be compacted later.
 
@@ -259,7 +281,7 @@ asynchronous `agent_spawn` or `team_assign`:
 
 `writes` is explicit: relative files/subtrees, `[]` for read-only work, or `["."]`
 for the captured root. Omitted mode stays ordinary; single mode rejects writes.
-Other roles and synchronous `agent_run`/`agent_supervise` cannot become Heads.
+Other roles and synchronous `agent_run` cannot become Heads.
 `developer_head` is internal, not a public role. Configure its primary explicitly;
 it does not inherit the legacy Developer or foreground policy. See the
 [example configuration](config/developer-profiles.example.toml).
@@ -335,22 +357,7 @@ tool_stall_timeout = "45m"
 max_run_time = "0"
 ```
 
-`[agent_runtime]` is the in-process watchdog. It does not apply to a supervised pane.
-
-## Visible pane
-
-`agent_supervise` is a separate tool. It requires Herdr presence and a current official Pi integration. The operator installs that integration with `herdr integration install pi`. Pitako does not install it. The result is an instance id, a pane id, and a Herdr status. It is not an `AgentRunResult`.
-
-### Optional agent inspection pane
-
-On Linux with Herdr 0.9.3 and Bun 1.4.2, an explicit foreground
-`/pitako agents pane` opens the same agent screen in a read-only plugin pane.
-That Bun version records a historical observation, not a runtime requirement;
-use a supported Bun release described in [Requirements](#requirements).
-It inspects existing workers; it does not create a worker or replace Pi's terminal.
-Installation, access flags, reconnect and sensitive-data limits are in
-[Optional Herdr pane](docs/worker-history.md#optional-herdr-pane).
-Pi-only, RPC and child sessions do not start the pane broker.
+`[agent_runtime]` is the in-process watchdog.
 
 ## Plans
 
@@ -374,7 +381,7 @@ Artifacts live in the workspace (git root, or the current directory outside a re
 
 Six records stay separate. `todo` is the current session checklist. The Board holds shared findings, decisions, and handoffs. The plan is the frozen decision. The ledger is the resume checkpoint: plan id, revision, content hash, status, and rulings. Evidence is proof for one unit. The repository is the product change. Do not use one as a substitute for another.
 
-`$plan` and `$execute` are not Herdr callers. Architect and Reviewer use only `architecture_start` and `review_start`, including bounded questions. Generic `agent_run`, `agent_spawn`, `team_assign`, `agent_supervise` and exported `superviseAgent` reject both roles before preparation or admission and direct callers to the corresponding start. The coordinator can handle user input while judgment is pending, but must interpret the complete automatic exterior result after physical closure before freezing, accepting dependent work, or completing execution. A missing start blocks the required pass; no individual, synchronous or inline fallback or waived review is allowed. Ad hoc `agent_run` remains synchronous for allowed roles. Historical direct-mode captures remain readable without migration; new callers omit architecture `mode` and external observers must support the new composition emission.
+Architect and Reviewer use only `architecture_start` and `review_start`, including bounded questions. Generic `agent_run`, `agent_spawn` and `team_assign` reject both roles before preparation or admission and direct callers to the corresponding start. The coordinator can handle user input while judgment is pending, but must interpret the complete automatic exterior result after physical closure before freezing, accepting dependent work, or completing execution. A missing start blocks the required pass; no individual, synchronous or inline fallback or waived review is allowed. Ad hoc `agent_run` remains synchronous for allowed roles. Historical direct-mode captures remain readable without migration; new callers omit architecture `mode` and external observers must support the new composition emission.
 
 The managed `/mission` runtime is retired. Use `$execute` for frozen ordinary plans.
 Recorded managed-worker catalogs remain protected, read-only archives through
@@ -444,7 +451,7 @@ Unlike ordinary setup's optional CodeGraph preparation, this hook requires CodeG
 
 Prepare the checkout with `bash ./scripts/setup.sh`. Use [GATES.md](GATES.md) for prerequisites, focused checks, and the complete routine procedure. Run `bun run typecheck`, then `bun run test` from the root. The test script uses `bun test --parallel` with normal discovery.
 
-Acceptance covers behavior implemented by Pitako, including its rules, adapters, declared resources, and instruction assembly. Tests use controlled external boundaries. They do not certify installation or operation of Pi, SDK, ACP, third-party extensions, providers, classifiers, CodeGraph, LSP, or Herdr. Those external certification checks are retired, not optional gates. Local instruction assertions observe content and availability, not future model compliance.
+Acceptance covers behavior implemented by Pitako, including its rules, adapters, declared resources, and instruction assembly. Tests use controlled external boundaries. They do not certify installation or operation of Pi, SDK, ACP, third-party extensions, providers, classifiers, CodeGraph, or LSP. Those external certification checks are retired, not optional gates. Local instruction assertions observe content and availability, not future model compliance.
 
 `verify-behavior` reads the active project's root `GATES.md`, not the installed Pitako package's guide. Planning reads it without running checks. Missing or stale guidance falls back to existing discovery for uncovered obligations; frozen requirements and independent review remain controlling. Routine verification does not automatically author the guide.
 

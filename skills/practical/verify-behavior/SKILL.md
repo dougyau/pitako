@@ -25,7 +25,7 @@ Modes are natural-language requests, not a new tool or API. For example:
 
 Start check selection from behavior owned by the active project and its declared testing scope. Requirements for authorized product integrations come from that project's scope, contracts, and active guide, not from Pitako's distributed stack.
 
-In the Pitako checkout, acceptance covers Pitako's rules, adapters, resource declarations, and instruction assembly with controlled external boundaries. It does not certify installation or operation of Pi, SDK, ACP, third-party extensions, providers, classifiers, CodeGraph, LSP, or Herdr. External certification checks are retired, not deferred acceptance work.
+In the Pitako checkout, acceptance covers Pitako's rules, adapters, resource declarations, and instruction assembly with controlled external boundaries. It does not certify installation or operation of Pi, SDK, ACP, third-party extensions, providers, classifiers, CodeGraph, or LSP. External certification checks are retired, not deferred acceptance work.
 
 Reading an external boundary to understand a call grants no certification or repair task. A controlled boundary double can verify an owned rule without proving the replaced runtime. Reviewer must not demand that runtime solely because a double was used. Preserve separately authorized integration requirements in projects that implement those integrations, and report what local evidence does not prove.
 

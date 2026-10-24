@@ -761,7 +761,7 @@ selectors and the returned cursor. The default limit is 50, and the maximum is
 
 Authenticated bridge views read scoped history and routing directly. The
 internal read-only bridge policy bypasses only sensitive-read acknowledgement;
-screen and Herdr views retain their own acknowledgement and control guards:
+native screen retains its own acknowledgement and control guards:
 
 ```ts
 import type { BridgeClient } from "pitako/extensions/agent/bridge/client.js";
