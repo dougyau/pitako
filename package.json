@@ -14,7 +14,6 @@
     "skills",
     "prompts",
     "config",
-    "roles",
     "agents",
     "fixtures",
     "docs",
@@ -37,7 +36,6 @@
       "./node_modules/@vndv/pi-codegraph/extensions/codegraph.ts",
       "./extensions/todo.ts",
       "./extensions/board/index.ts",
-      "./extensions/agent/index.ts",
       "./node_modules/pi-subagents/bundle/index.js",
       "./extensions/acp.ts",
       "./node_modules/pi-hermes-memory/src/index.ts",
@@ -47,8 +45,6 @@
       "./skills/pitako-coding",
       "./skills/architecture",
       "./skills/review",
-      "./skills/plan",
-      "./skills/execute",
       "./skills/pre-pr",
       "./skills/remove-ai-slops",
       "./skills/caveman",
@@ -73,8 +69,7 @@
     "pi-hermes-memory": "0.9.9",
     "pi-lsp-client": "github:code-yeongyu/pi-lsp-client#1c981dfcacc456fe4ce9f4120a2f0250b54d6844",
     "pi-subagents": "0.81.0",
-    "pi-web-access": "0.42.0",
-    "smol-toml": "1.9.0"
+    "pi-web-access": "0.42.0"
   },
   "bundledDependencies": [
     "@dietrichgebert/ponytail",

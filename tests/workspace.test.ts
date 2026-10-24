@@ -4,7 +4,6 @@ import { mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync 
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { evidenceFile, ledgerFile, planFile } from "../extensions/workflow.ts";
 import { currentWorkspace, repositoryIdentity } from "../extensions/board/workspace.ts";
 
 const tempDirs: string[] = [];
@@ -79,11 +78,6 @@ describe("workspace Git identity", () => {
     expect(repositoryIdentity(mainNested)).toBe(commonDir);
     expect(repositoryIdentity(linkedNested)).toBe(commonDir);
     expect(repositoryIdentity(separate)).not.toBe(commonDir);
-    expect(planFile("worktree-plan", linkedNested)).toBe(path.join(linked, ".pitako", "plans", "worktree-plan.md"));
-    expect(ledgerFile("worktree-plan", linkedNested)).toBe(path.join(linked, ".pitako", "runs", "worktree-plan", "ledger.md"));
-    expect(evidenceFile("worktree-plan", "T1/check.txt", linkedNested)).toBe(
-      path.join(linked, ".pitako", "runs", "worktree-plan", "evidence", "T1", "check.txt"),
-    );
 
     const link = path.join(base, "linked-alias");
     symlinkSync(linked, link);

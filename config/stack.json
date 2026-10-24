@@ -64,12 +64,6 @@
       ]
     },
     {
-      "id": "pitako-agent",
-      "spec": "pitako",
-      "entry": "extensions/agent/index.ts",
-      "tools": ["agent_run"]
-    },
-    {
       "id": "pi-subagents",
       "spec": "pi-subagents@0.81.0",
       "entry": "node_modules/pi-subagents/bundle/index.js",

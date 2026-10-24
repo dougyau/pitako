@@ -16,12 +16,8 @@ import {
   openBoard as openBoardUnowned,
 } from "../extensions/board/store.ts";
 import { boardWorkspace, currentWorkspace, repositoryIdentity } from "../extensions/board/workspace.ts";
-import { ledgerFile, ledgerTemplate, openExecutionPlan, planFile, readPlan } from "../extensions/workflow.ts";
-import { registerExecution, unregisterExecution } from "../extensions/execution-identity.ts";
-import { recordPlanTeamWork } from "../extensions/team.ts";
 import { packageRoot } from "../extensions/stack.ts";
 import { workspaceCrashOwnership } from "./fixtures/workspace-crash-ownership.ts";
-import { RootGuard, registerBackgroundAttempt } from "../extensions/workflow-engine.ts";
 
 const tempDirs: string[] = [];
 const fixture = workspaceCrashOwnership(tempDirs);
@@ -591,240 +587,12 @@ describe("board tools", () => {
     else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
   });
 
-  test("rejected frozen resolution leaves an unclaimed closed topic unchanged", fixture.ownedCase("rejected frozen resolution leaves an unclaimed closed topic unchanged", async () => {
-    process.env.PI_CODING_AGENT_DIR = tempDir("pitako-board-lifecycle-rollback-");
-    const repo = gitRepo();
-    const planId = "closed-frozen-topic";
-    const topicDb = await openBoard();
-    const topic = topicDb.createTopic(repositoryIdentity(repo), { title: "closed frozen topic" });
-    topicDb.claimTopic(repositoryIdentity(repo), topic.id, planId);
-    topicDb.transitionOwnedTopic(repositoryIdentity(repo), topic.id, planId, "closed");
-    const before = topicDb.readTopic(repositoryIdentity(repo), topic.id).topic;
-    topicDb.close();
-
-    const plan = planFile(planId, repo);
-    mkdirSync(path.dirname(plan), { recursive: true });
-    writeFileSync(plan, `---\nid: ${planId}\nrevision: 1\nstatus: frozen\nboard_topic_id: ${topic.id}\nexecution: expected\n---\n\nFrozen plan.\n`);
-    const opened = openExecutionPlan(planId, repo);
-    writeFileSync(opened.ledger, readFileSync(opened.ledger, "utf8").replace("status: running", "status: completed"));
-    const planBefore = readFileSync(plan, "utf8");
-    const ledgerBefore = readFileSync(opened.ledger, "utf8");
-
-    const lifecycle = registeredBoard().tools.get("board_workflow_lifecycle");
-    if (!lifecycle) throw new Error("missing workflow lifecycle tool");
-    const result = await lifecycle.execute("resolve-closed", { planId, status: "resolved" }, undefined, undefined, { cwd: repo });
-    expect(result.isError).toBe(true);
-    expect(result.content?.[0]?.text).toContain("cannot transition closed topic to resolved");
-
-    const verified = await openBoard();
-    expect(verified.readTopic(repositoryIdentity(repo), topic.id).topic).toEqual(before);
-    verified.close();
-    expect(readFileSync(plan, "utf8")).toBe(planBefore);
-    expect(readFileSync(opened.ledger, "utf8")).toBe(ledgerBefore);
-  }));
-
-  test("workflow claim and lifecycle require exact plan binding and foreground ownership", fixture.ownedCase("workflow claim and lifecycle require exact plan binding and foreground ownership", async () => {
-    const agentDir = tempDir("pitako-board-workflow-tools-");
-    process.env.PI_CODING_AGENT_DIR = agentDir;
-    const repo = gitRepo();
-    const plan = planFile("workflow-plan", repo);
-    mkdirSync(path.dirname(plan), { recursive: true });
-    writeFileSync(plan, "---\nid: workflow-plan\nrevision: 1\nstatus: draft\nexecution: none\n---\n\nPlan.\n");
-    const { tools } = registeredBoard();
-    const guard = new RootGuard(repo);
-    fixture.cleanup(() => guard.close());
-    const attempt = (planId: string, unitId: string, assignmentId: string) => {
-      const registered = registerBackgroundAttempt({ kind: "ordinary", guard }, { cwd: repo,
-        instanceId: assignmentId, dispatchId: assignmentId, roleId: "developer", assignmentId,
-        watch: { planId, unitId } });
-      registered.admit();
-      registered.checkProjection();
-      return registered;
-    };
-    const close = (registered: ReturnType<typeof attempt>) => {
-      registered.producer.observe("preparation", "closed");
-      registered.producer.observe("host-operation", "closed");
-      const receipt = registered.producer.observe("callback", "closed", true);
-      expect(receipt).toBeDefined();
-      recordPlanTeamWork(repo, registered.attempt.watch!.planId, registered.attempt.watch!.unitId,
-        registered.attempt.assignmentId, undefined, undefined, receipt);
-    };
-    const complete = (registered: ReturnType<typeof attempt>) => {
-      registered.result({ status: "completed", result: "Controlled successful work" });
-      close(registered);
-    };
-    const create = tools.get("board_topic_create");
-    const claim = tools.get("board_workflow_claim");
-    const lifecycle = tools.get("board_workflow_lifecycle");
-    const update = tools.get("board_topic_update");
-    const read = tools.get("board_topic_read");
-    if (!create || !claim || !lifecycle || !update || !read) throw new Error("missing workflow Board tool");
-    await create.execute("c", { title: "owned" }, undefined, undefined, { cwd: repo });
-    registerExecution({ instanceId: "child", roleId: "developer", sessionId: "registered-child" });
-    try {
-      const childClaim = await claim.execute("child", { planId: "workflow-plan", topicId: 1 }, undefined, undefined, { cwd: repo, sessionManager: { getSessionId: () => "registered-child" } });
-      expect(childClaim.isError).toBe(true);
-    } finally { unregisterExecution("registered-child"); }
-    const adopted = await claim.execute("claim", { planId: "workflow-plan", topicId: 1 }, undefined, undefined, { cwd: repo });
-    expect(adopted.isError).toBeFalsy();
-    expect(readFileSync(plan, "utf8")).toContain("board_topic_id: 1");
-    expect((await update.execute("u", { topicId: 1, status: "resolved" }, undefined, undefined, { cwd: repo })).isError).toBe(true);
-    registerExecution({ instanceId: "registered-child", roleId: "developer", sessionId: "registered-lifecycle-child" });
-    try {
-      const registeredChildLifecycle = await lifecycle.execute("registered-child", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo, sessionManager: { getSessionId: () => "registered-lifecycle-child" } });
-      expect(registeredChildLifecycle.isError).toBe(true);
-    } finally { unregisterExecution("registered-lifecycle-child"); }
-    const priorChildId = process.env.PITAKO_INSTANCE_ID;
-    process.env.PITAKO_INSTANCE_ID = "child-id";
-    try {
-      expect((await lifecycle.execute("child", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo })).isError).toBe(true);
-    } finally {
-      if (priorChildId === undefined) delete process.env.PITAKO_INSTANCE_ID;
-      else process.env.PITAKO_INSTANCE_ID = priorChildId;
-    }
-    const otherPlan = planFile("other-plan", repo);
-    writeFileSync(otherPlan, "---\nid: other-plan\nrevision: 1\nstatus: frozen\nboard_topic_id: 1\n---\n\nWrong owner.\n");
-    expect((await lifecycle.execute("mismatch", { planId: "other-plan", status: "resolved" }, undefined, undefined, { cwd: repo })).isError).toBe(true);
-    const ledger = ledgerFile("workflow-plan", repo);
-    mkdirSync(path.dirname(ledger), { recursive: true });
-    writeFileSync(ledger, "---\nplan_id: workflow-plan\nrevision: 1\nhash: stale\nstatus: running\n---\n");
-    expect((await lifecycle.execute("stale", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo })).isError).toBe(true);
-    const boundMeta = readPlan("workflow-plan", repo).meta;
-    writeFileSync(ledger, `---\nplan_id: workflow-plan\nrevision: ${boundMeta.revision}\nhash: ${boundMeta.hash}\nstatus: USER_DECISION_REQUIRED\n---\n`);
-    const decision = await lifecycle.execute("decision", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo });
-    expect(decision.isError).toBe(true);
-    expect(textOf(decision)).toContain("USER_DECISION_REQUIRED");
-    const unchanged = await openBoard();
-    expect(unchanged.readTopic(repositoryIdentity(repo), 1).topic.status).toBe("open");
-    unchanged.close();
-    rmSync(ledger);
-    const currentPlanMeta = readPlan("workflow-plan", repo).meta;
-    writeFileSync(ledger, ledgerTemplate(currentPlanMeta));
-    const cancelling = attempt("workflow-plan", "unit-a", "cancelled-without-closure");
-    const pending = await lifecycle.execute("pending", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo });
-    expect(pending.isError).toBe(true);
-    expect(textOf(pending)).toContain("Team work for this plan");
-    cancelling.result({ status: "cancelled", result: "Controlled cancellation" });
-    cancelling.producer.observe("callback", "unknown");
-    const cancelled = await lifecycle.execute("cancelled", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo });
-    expect(cancelled.isError).toBe(true);
-    expect(textOf(cancelled)).toContain("Team work for this plan");
-    const failing = attempt("workflow-plan", "unit-b", "later-failure");
-    failing.result({ status: "failed", result: "Controlled failure" });
-    const failed = await lifecycle.execute("failed", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo });
-    expect(failed.isError).toBe(true);
-    expect(textOf(failed)).toContain("Team work for this plan");
-    recordPlanTeamWork(repo, "workflow-plan", "unit-c", "unregistered-success", "completed");
-    expect(guard.store.get("attempts", "unregistered-success")).toBeUndefined();
-    const success = attempt("workflow-plan", "unit-c", "later-success");
-    complete(success);
-    recordPlanTeamWork(repo, "workflow-plan", "unit-a", "cancelled-without-closure", undefined);
-    recordPlanTeamWork(repo, "workflow-plan", "unit-b", "later-failure", undefined);
-    // Neither an unrelated success nor bookkeeping closes these original resources.
-    expect((await lifecycle.execute("still-open", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo })).isError).toBe(true);
-    const closedTopic = await create.execute("closed", { title: "closed unowned" }, undefined, undefined, { cwd: repo });
-    const closedDraft = planFile("closed-draft", repo);
-    writeFileSync(closedDraft, "---\nid: closed-draft\nrevision: 1\nstatus: draft\n---\n\nClosed.\n");
-    const closedDb = await openBoard();
-    closedDb.updateTopic(repositoryIdentity(repo), closedTopic.details?.topicId as number, { status: "closed" });
-    closedDb.close();
-    expect((await claim.execute("closed-claim", { planId: "closed-draft", topicId: closedTopic.details?.topicId }, undefined, undefined, { cwd: repo })).isError).toBe(true);
-    expect(readFileSync(closedDraft, "utf8")).not.toContain("board_topic_id:");
-    const unowned = await create.execute("unowned", { title: "frozen unowned" }, undefined, undefined, { cwd: repo });
-    const frozenUnowned = planFile("frozen-unowned", repo);
-    writeFileSync(frozenUnowned, `---\nid: frozen-unowned\nrevision: 1\nstatus: frozen\nboard_topic_id: ${unowned.details?.topicId}\n---\n\nFrozen.\n`);
-    expect((await claim.execute("frozen-claim", { planId: "frozen-unowned", topicId: unowned.details?.topicId }, undefined, undefined, { cwd: repo })).isError).toBe(true);
-    const stillUnowned = await openBoard();
-    expect(stillUnowned.readTopic(repositoryIdentity(repo), unowned.details?.topicId as number).topic.ownerPlanId).toBeNull();
-    stillUnowned.close();
-
-    const recoveredOwnerPlan = planFile("recovered-owner", repo);
-    writeFileSync(recoveredOwnerPlan, "---\nid: recovered-owner\nrevision: 1\nstatus: draft\nexecution: none\n---\n\nRecovery.\n");
-    const recoveryTopic = await create.execute("recovery-topic", { title: "preclaimed recovery" }, undefined, undefined, { cwd: repo });
-    const recoveryTopicId = recoveryTopic.details?.topicId;
-    const ownedDb = await openBoard();
-    ownedDb.claimTopic(repositoryIdentity(repo), recoveryTopicId!, "recovered-owner");
-    ownedDb.close();
-    const recovered = await claim.execute("recover", { planId: "recovered-owner", topicId: recoveryTopicId }, undefined, undefined, { cwd: repo });
-    expect(recovered.isError).toBeFalsy();
-    expect(readFileSync(recoveredOwnerPlan, "utf8")).toContain(`board_topic_id: ${recoveryTopicId}`);
-    const ownerRead = await openBoard();
-    expect(ownerRead.readTopic(repositoryIdentity(repo), recoveryTopicId!).topic.ownerPlanId).toBe("recovered-owner");
-    ownerRead.close();
-    const duplicateTopic = await create.execute("duplicate", { title: "second owned topic" }, undefined, undefined, { cwd: repo });
-    const duplicateClaim = await claim.execute("duplicate-claim", { planId: "recovered-owner", topicId: duplicateTopic.details?.topicId }, undefined, undefined, { cwd: repo });
-    expect(duplicateClaim.isError).toBe(true);
-    expect(readFileSync(recoveredOwnerPlan, "utf8")).toContain(`board_topic_id: ${recoveryTopicId}`);
-    expect(textOf(await read.execute("read-owner", { topicId: recoveryTopicId }, undefined, undefined, { cwd: repo }))).toContain("owner plan: recovered-owner");
-    const missingExecution = planFile("missing-execution", repo);
-    const createdForMissing = await create.execute("c3", { title: "missing execution" }, undefined, undefined, { cwd: repo });
-    const missingTopicId = createdForMissing.details?.topicId;
-    writeFileSync(missingExecution, `---\nid: missing-execution\nrevision: 1\nstatus: frozen\nboard_topic_id: ${missingTopicId}\n---\n\nNo intent.\n`);
-    const boundMissing = await claim.execute("claim-missing", { planId: "missing-execution", topicId: missingTopicId }, undefined, undefined, { cwd: repo });
-    expect(boundMissing.isError).toBe(true);
-    const missingOwner = await openBoard();
-    expect(missingOwner.readTopic(repositoryIdentity(repo), missingTopicId!).topic.ownerPlanId).toBeNull();
-    missingOwner.close();
-    expect((await lifecycle.execute("resolve-missing", { planId: "missing-execution", status: "resolved" }, undefined, undefined, { cwd: repo })).isError).toBe(true);
-    // Independent valid progress must not require fabricating recovery of the failed plan.
-    const racePlan = planFile("race-plan", repo);
-    writeFileSync(racePlan, "---\nid: race-plan\nrevision: 1\nstatus: draft\nexecution: none\n---\n\nIndependent plan.\n");
-    const raceTopic = await create.execute("race-topic", { title: "independent lifecycle" }, undefined, undefined, { cwd: repo });
-    expect((await claim.execute("race-claim", { planId: "race-plan", topicId: raceTopic.details?.topicId }, undefined, undefined, { cwd: repo })).isError).toBeFalsy();
-    const raceLedger = ledgerFile("race-plan", repo);
-    mkdirSync(path.dirname(raceLedger), { recursive: true });
-    writeFileSync(raceLedger, ledgerTemplate(readPlan("race-plan", repo).meta));
-    const resolving = lifecycle.execute("resolve-race", { planId: "race-plan", status: "resolved" }, undefined, undefined, { cwd: repo });
-    const racing = attempt("race-plan", "resolve-race", "racing-dispatch");
-    const racedResolve = await resolving;
-    expect(racedResolve.isError).toBe(true);
-    const openAfterRace = await openBoard();
-    expect(openAfterRace.readTopic(repositoryIdentity(repo), raceTopic.details!.topicId!).topic.status).toBe("open");
-    openAfterRace.close();
-    racing.result({ status: "completed", result: "Controlled successful work" });
-    recordPlanTeamWork(repo, "race-plan", "resolve-race", "racing-dispatch", "completed");
-    expect((await lifecycle.execute("without-receipt", { planId: "race-plan", status: "resolved" }, undefined, undefined, { cwd: repo })).isError).toBe(true);
-    complete(racing);
-    const resolved = await lifecycle.execute("resolve", { planId: "race-plan", status: "resolved" }, undefined, undefined, { cwd: repo });
-    expect(resolved.details?.status).toBe("resolved");
-    expect((await lifecycle.execute("open-after-independent-success", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo })).isError).toBe(true);
-    close(cancelling);
-    close(failing);
-    expect((await lifecycle.execute("closed-resources", { planId: "workflow-plan", status: "resolved" }, undefined, undefined, { cwd: repo })).isError).not.toBe(true);
-    expect(guard.store.get("attempts", cancelling.attempt.dispatchId)).toMatchObject({ outcome: { status: "cancelled" } });
-    expect(guard.store.get("attempts", failing.attempt.dispatchId)).toMatchObject({ outcome: { status: "failed" } });
-    const abandoned = await lifecycle.execute("abandon", { planId: "race-plan", status: "closed" }, undefined, undefined, { cwd: repo });
-    expect(abandoned.details?.status).toBe("closed");
-    const noTopicRepo = gitRepo();
-    const noTopicPlan = planFile("without-topic", noTopicRepo);
-    mkdirSync(path.dirname(noTopicPlan), { recursive: true });
-    writeFileSync(noTopicPlan, "---\nid: without-topic\nrevision: 1\nstatus: frozen\n---\n\nNo Board topic.\n");
-    const emptyAgentDir = tempDir("pitako-board-no-topic-");
-    process.env.PI_CODING_AGENT_DIR = emptyAgentDir;
-    const noTopic = await lifecycle.execute("none", { planId: "without-topic", status: "closed" }, undefined, undefined, { cwd: noTopicRepo });
-    expect(noTopic.details?.noTopic).toBe(true);
-    expect(existsSync(getBoardDbPath())).toBe(false);
-
-    process.env.PI_CODING_AGENT_DIR = agentDir;
-    const expectedPlan = planFile("expected-plan", repo);
-    writeFileSync(expectedPlan, "---\nid: expected-plan\nrevision: 1\nstatus: draft\nexecution: expected\n---\n\nExpected execution.\n");
-    const secondTopic = await create.execute("c2", { title: "execute lifecycle" }, undefined, undefined, { cwd: repo });
-    const expectedTopicId = secondTopic.details?.topicId;
-    const claimed = await claim.execute("claim2", { planId: "expected-plan", topicId: expectedTopicId }, undefined, undefined, { cwd: repo });
-    expect(claimed.isError).toBeFalsy();
-    writeFileSync(expectedPlan, readFileSync(expectedPlan, "utf8").replace("status: draft", "status: frozen"));
-    expect((await lifecycle.execute("early", { planId: "expected-plan", status: "resolved" }, undefined, undefined, { cwd: repo })).isError).toBe(true);
-    const beforeCompletion = await openBoard();
-    expect(beforeCompletion.readTopic(repositoryIdentity(repo), expectedTopicId!).topic.status).toBe("open");
-    beforeCompletion.close();
-    const expectedMeta = readPlan("expected-plan", repo).meta;
-    const expectedLedger = ledgerFile("expected-plan", repo);
-    mkdirSync(path.dirname(expectedLedger), { recursive: true });
-    writeFileSync(expectedLedger, ledgerTemplate(expectedMeta).replace("status: running", "status: completed"));
-    const completed = await lifecycle.execute("completed", { planId: "expected-plan", status: "resolved" }, undefined, undefined, { cwd: repo });
-    expect(completed.isError, textOf(completed)).not.toBe(true);
-    expect(completed.details?.status).toBe("resolved");
-  }));
+  test("registers ordinary pull-based tools without workflow lifecycle controls", () => {
+    expect([...registeredBoard().tools.keys()].sort()).toEqual([
+      "board_post", "board_query", "board_topic_create", "board_topic_list",
+      "board_topic_read", "board_topic_update",
+    ]);
+  });
 
   test("board post guidance defines every type and rejects progress logging", fixture.ownedCase("board post guidance defines every type and rejects progress logging", () => {
     const { guidance } = registeredBoard();
@@ -837,8 +605,8 @@ describe("board tools", () => {
       "BLOCKER only when another context cannot correctly continue",
       "HANDOFF only for essential next-context knowledge",
       "INFO sparingly for mission context",
-      "HANDOFF: T3 done, 44 tests pass",
-      "Ledger and evidence own progress",
+      "Do not post progress, status, test counts, heartbeats, or ordinary worker events",
+      "TODOs and verification evidence own progress",
       "Board stays pull-based",
     ]) expect(text).toContain(expected);
   }));
@@ -887,8 +655,6 @@ describe("board tools", () => {
       "board_topic_list",
       "board_topic_read",
       "board_topic_update",
-      "board_workflow_claim",
-      "board_workflow_lifecycle",
     ]);
 
     const repoA = gitRepo();

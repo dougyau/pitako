@@ -5,9 +5,9 @@ description: Review a supplied diff, plan, solution, codebase scope, or issue th
 
 # Review
 
-Use only `pi-subagents` for this advisory review. This does not replace required
-managed `review_start`, `$plan`, `$execute`, or `/task` review and acceptance.
-Do not bypass missing policy, failed admission, or managed restrictions.
+Use only `pi-subagents` for this advisory review. This skill initiates the
+workflow; its director and reviewers reason about the supplied target.
+The caller interprets the report and retains authority over any further action.
 
 ## Prepare
 
@@ -69,8 +69,8 @@ same complete target, not files or subtasks:
    for every finding: include, discard, or uncertain. Evidence decides, not votes.
    Unresolved claims stay uncertain rather than becoming defects automatically.
 
-The workflow makes no model overrides and adds no Pitako ModelPolicy routing.
-That integration is deferred. Existing native child model selection is unchanged.
+The workflow makes no model overrides. Pi-subagents owns native child model
+selection.
 
 ## Interpret
 

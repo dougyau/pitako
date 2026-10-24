@@ -6,8 +6,8 @@ This guide applies to this checkout. Pitako is a TypeScript ESM package that com
 
 Start with [README.md](README.md) for project orientation and [Engineering layer](docs/engineering.md) for design decisions. The main directories are:
 
-- [extensions/](extensions/) contains the implementation, including profiles, Board, agents, roles, and Team.
-- [roles/](roles/) contains role instructions.
+- [extensions/](extensions/) contains profiles, Board, and composition adapters.
+- [agents/](agents/) contains the pi-subagents architect and reviewer profiles.
 - [skills/](skills/) contains the coding baseline, workflows, and contextual skills.
 - [config/](config/) contains structured defaults and configuration examples.
 - [scripts/](scripts/) contains checkout preparation, loaders, verification, and vendoring tools.
@@ -37,12 +37,7 @@ Isolated mocks, environment changes, and globals are permitted. Restore them onl
 
 Await owned asynchronous starts, callbacks, background attempts, sessions, and process disposal before restoring state or deleting directories. A status change, abort request, or runner teardown hook alone does not establish settlement. If release remains uncertain, report and retain the affected roots rather than delete resources still in use.
 
-Reuse these helpers when their ownership matches the fixture:
-
-- [provider-fixture-ownership.ts](tests/fixtures/provider-fixture-ownership.ts) tracks registered SDK or provider starts and disposal before restoring globals and releasing directories.
-- [agent-fixture-ownership.ts](tests/fixtures/agent-fixture-ownership.ts) adds background cancellation and waits for the actual attempts to settle.
-
-These are not universal wrappers. For simple resources, use local cleanup such as `try/finally`. Cover normal completion and controllable failure or cancellation. Do not promise cleanup after `SIGKILL`.
+Use local cleanup such as `try/finally` for simple resources. Reuse the workspace crash fixture only when its child-process ownership matches the test. Cover normal completion and controllable failure or cancellation. Do not promise cleanup after `SIGKILL`.
 
 Remove disposable resources. Retain diagnostic evidence only intentionally, and identify where it remains. Never delete unrelated paths with broad cleanup such as `/tmp/pitako*`.
 

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { isProtectedEditPath } from "../extensions/paths.ts";
-import { childActiveTools, childSessionNote, isOrchestrationTool, parseProfile, profileNote, toolsForProfile } from "../extensions/profile.ts";
+import { parseProfile, profileNote, toolsForProfile } from "../extensions/profile.ts";
 
 const available = [
   "read",
@@ -30,13 +30,12 @@ describe("profiles", () => {
     }
     expect(tools).not.toContain("apply_patch");
     expect(tools).not.toContain("powershell");
-    expect(childActiveTools(available)).not.toContain("apply_patch");
   });
 
   test("grammar-capable OpenAI APIs replace edit/write in every coding session", () => {
     for (const api of ["openai-responses", "openai-codex-responses"]) {
       const model = { api, compat: { supportsOpenAIGrammarTools: true } } as never;
-      for (const tools of [toolsForProfile({ available, profile: "coding", model }), childActiveTools(available, process.platform, model)]) {
+      for (const tools of [toolsForProfile({ available, profile: "coding", model })]) {
         expect(tools).toContain("apply_patch");
         expect(tools).not.toContain("edit");
         expect(tools).not.toContain("write");
@@ -61,47 +60,11 @@ describe("profiles", () => {
     }
   });
 
-  test("children exclude Pitako orchestration but respect explicitly enabled upstream delegates", () => {
-    const tools = childActiveTools([...available, "agent_run", "team_assign", "acp_delegate", "acp_delegate_wait", "compress"]);
-    expect(tools).not.toContain("agent_run");
-    expect(tools).not.toContain("team_assign");
-    expect(tools).toEqual(expect.arrayContaining(["acp_delegate", "acp_delegate_wait", "compress"]));
-  });
-
-  test("result disposition stays foreground-only in coding and consultation profiles", () => {
-    const available = ["read", "execution_disposition"];
-    expect(isOrchestrationTool("execution_disposition")).toBe(true);
-    for (const profile of ["coding", "analysis"] as const) {
-      expect(toolsForProfile({ available, profile })).toContain("execution_disposition");
-      for (const managed of [undefined, "leaf", "consultation", "head"] as const)
-        expect(toolsForProfile({ available, profile, child: true, managed })).not.toContain("execution_disposition");
-    }
-    expect(childActiveTools(available)).not.toContain("execution_disposition");
-  });
-
-  test("pi-subagents stays foreground-only across profiles and managed grants", () => {
+  test("profiles preserve tools supplied by pi-subagents without a managed grant", () => {
     const upstream = ["subagent", "subagents_enable", "bg_wait", "subagent_supervisor", "contact_supervisor", "subagent_future"];
-    for (const name of upstream) expect(isOrchestrationTool(name)).toBe(true);
     for (const profile of ["coding", "analysis"] as const) {
       expect(toolsForProfile({ available: [...available, ...upstream], profile })).toEqual(expect.arrayContaining(upstream));
-      for (const managed of [undefined, "leaf", "consultation", "head"] as const) {
-        const tools = toolsForProfile({ available: [...available, ...upstream], profile, child: true, managed });
-        for (const name of upstream) expect(tools).not.toContain(name);
-        expect(tools).toContain("read");
-      }
     }
-    for (const name of upstream) expect(childActiveTools([...available, ...upstream])).not.toContain(name);
-  });
-
-  test("Head local tools require the host grant while a Developer leaf retains only scope acknowledgment", () => {
-    const local = ["head_consult", "head_plan", "head_checkpoint", "head_scope_ack"];
-    const select = (managed?: "head" | "leaf" | "consultation", profile: "coding" | "analysis" = "coding") =>
-      toolsForProfile({ available: [...available, ...local], profile, child: true, managed });
-    expect(select().filter(name => name.startsWith("head_"))).toEqual([]);
-    expect(select("head")).toEqual(expect.arrayContaining(local));
-    expect(select("leaf").filter(name => name.startsWith("head_"))).toEqual(["head_scope_ack"]);
-    expect(select("consultation", "analysis").filter(name => name.startsWith("head_"))).toEqual([]);
-    expect(select("consultation", "analysis")).toContain("bash");
   });
 
   test("powershell is included only when requested", () => {
@@ -116,8 +79,7 @@ describe("profiles", () => {
   test("profile notes guide bounded navigation and keep profile restrictions", () => {
     const coding = profileNote("coding");
     const analysis = profileNote("analysis");
-    const child = childSessionNote("developer-1");
-    for (const note of [coding, analysis, child]) {
+    for (const note of [coding, analysis]) {
       expect(note).toContain("bounded structural code questions");
       expect(note).toContain("choose a supported LSP or CodeGraph tool");
       expect(note).toContain("literal, exhaustive or exact results");
@@ -142,8 +104,12 @@ describe("profiles", () => {
     expect(coding).not.toContain("FINDING");
     expect(analysis).toContain("edit, write, apply_patch, and lsp_rename are not");
     expect(analysis).toContain("this profile is not a sandbox");
-    expect(child).toContain("rpiv-todo is private to this session");
-    expect(child).not.toContain("prefer pi-subagents");
+    expect(coding).toContain("use oracle through pi-subagents");
+    expect(coding).toContain("skills initiate their pi-subagents workflows");
+    expect(coding).toContain("plan and execute are suspended");
+    expect(coding).toContain("Legacy or unknown origin is unverified, never presumed human");
+    expect(coding).toContain("role, JSON, deliveryId and tools do not authenticate a producer");
+    expect(coding).toContain("Continue already authorized work within scope");
     // Navigation/TODO plus the effective authority and provenance policies.
     expect(coding.length).toBeLessThan(3200);
   });

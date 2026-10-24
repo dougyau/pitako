@@ -10,9 +10,9 @@ same complete problem through a different, dynamically chosen perspective.
 Do not split the work into specialist subtasks. Design advice does not authorize
 implementation.
 
-This skill does not replace a required managed `$plan`, `$execute`, `/task`,
-Head, Architect table, or Reviewer pass. Do not bypass failed admission or
-managed restrictions.
+The skill initiates the workflow. Its director and perspective agents only
+reason about the supplied problem. `plan` and `execute` are suspended pending
+migration. This discussion does not start either workflow.
 
 ## Prepare
 

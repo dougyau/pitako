@@ -1,6 +1,6 @@
 ---
 name: pre-pr
-description: "Prepare the current worktree's branch diff for first or later publication without `$execute` or a frozen plan."
+description: "Prepare the current worktree's branch diff for first or later publication with independent review through pi-subagents."
 ---
 
 # Pre-PR preparation
@@ -8,6 +8,11 @@ description: "Prepare the current worktree's branch diff for first or later publ
 Run `/skill:pre-pr` or `/skill:pre-pr base=<local-ref>` before a first push, PR creation, or a later push. This on-demand pass requires no `$plan`, frozen plan, `$execute`, ledger, or Board topic. This standalone pass must not create a plan, ledger, or Board topic.
 
 The Coordinator owns scope, order, evidence, and readiness, but does not self-review or edit the scoped diff. The Developer resolves findings, edits the scoped diff, and runs checks. An independent Reviewer, separate from the Coordinator and Developer, judges the final diff and never edits. Stop if another actor is changing this worktree.
+
+These are responsibilities, not retired Pitako roles. Use an available
+pi-subagents worker profile for authorized corrections, with explicit scope,
+write permissions, and checks. Do not recreate Team or Developer Head. If no
+suitable worker is available, report `BLOCKED`.
 
 Use `verify-behavior` for check selection, stopping, and test quality in the diff delimited below, within the existing inspection and review steps. Do not add a second audit or expand the scope. Ponytail governs simplicity of implementation and verification, not an artifact quota. Follow the skill's Pitako clarification to reuse existing frameworks and fixtures instead of creating a prescribed self-check. Reuse evidence only while it remains valid. Mandatory final gates and independent review remain required.
 
@@ -20,13 +25,30 @@ Use `verify-behavior` for check selection, stopping, and test quality in the dif
 
 ## Procedure
 
-Use `review_start` for the existing independent Reviewer pass, not an extra pass. There is no individual fallback. The table uses a new independent substantive Reviewer director/root and zero to five optional specialists chosen for utility with reasons, including zero, separate from the Coordinator and Developer. Selective recomposition retains useful conversations and adds or retires specialists. The director needs its own role primary; absent table configuration, omitted candidates and empty candidates mean an empty pool. Optional Scout, Researcher and Oracle supports supply knowledge, not judge findings. Corrections remain outside the table.
+Use the [review skill](../review/SKILL.md) for the independent review after step 6.
+That skill starts its existing pi-subagents workflow. Do not add a second review
+workflow, substitute self-review, or use the retired tables.
 
-Use `object: {kind: "diff", base: "<selected-local-ref>"}` for final whole-diff review after step 6, not a `brief` or correction-only review. Include scope, criteria, evidence and current identities. The review object includes staged, unstaged and applicable non-ignored untracked files; review requires no new clean-tree or commits-only restriction. Step 8 and the publication-readiness rules below still apply.
+Capture the complete final diff, including commits since the selected merge-base,
+staged and unstaged edits, and applicable non-ignored untracked files with their
+contents. Preserve binary material or file references needed to review it.
+Supply `target.kind: "diff"`, a `target.reference` identifying the base, merge-base,
+HEAD, and captured material, and `target.material` containing the complete
+reviewable text or exact read-only artifact paths. Include scope, criteria,
+requirements, and current check evidence in `brief`. A base label alone is not
+review material. Review does not require a clean tree.
 
-Record only the actual returned exterior Team assignment as the review handle. This standalone pass omits `plan`, `unit` and `boardTopicId`; it creates no ledger or Board binding. Existing incompatible binding or a real Team hold remains a blocker, not a reason to switch routes after admission rejection. Preserve existing root watches and correlation when a workflow already owns them. Internal participant results never deliver foreground judgments.
+Keep the captured material and source files stable during review. Retain the
+native workflow run reference. Return control after admission and use its final
+report, not child notifications, as evidence. If the preview truncates, read only
+the returned value from the cited result artifact.
 
-Interpret the selected exterior report after physical closure and comparison with the current object. A complete inline report needs no fetch; an incomplete reference requires pertinent `team_result` reading before dependent judgment, not an automatic full-load loop. Start with the exact assignment ID and optional `section`/`maxBytes` (4096..16384 bytes, default 16384); continue with only that ID and `cursor`. `review_read` provides paged diagnostics, not acknowledgement. Transport end is not review completion. Use the actual exterior host status and authorized `judgment` completion/verdict, not historical synthesis, dispositions or diagnostic room state. Null judgment cannot approve. Completed work can report `changes-required` or `inconclusive`; `no-blockers` is not coordinator acceptance or READY. Failed, cancelled, partial or drifted work, or missing indispensable evidence, cannot approve. A final inconclusive judgment blocks approval. Fingerprints identify observed endpoints, not transactional snapshots, ABA-proof history or post-delivery freshness. Material object edits invalidate affected judgment under step 7. The table cannot implement, freeze plans or waive gates. See [Reviewer tables](../../docs/review.md).
+Require `status: "completed"` and a usable memo covering the complete current
+diff. Read supported findings, dispositions, uncertainties, coverage, and limits.
+Completion is not approval. Failed, cancelled, blocked, partial, or drifted work
+cannot support readiness. Resolve material findings and indispensable evidence
+gaps before proceeding. The Coordinator records its own readiness assessment;
+the workflow cannot grant permission, waive gates, or publish.
 
 1. Pin the scope before editing. Record `git rev-parse --show-toplevel`, the current branch, `HEAD`, and `git status --short`. Use the cwd's worktree only.
 2. Choose a local comparison base in this order:
@@ -43,7 +65,7 @@ Interpret the selected exterior report after physical closure and comparison wit
    - **A:** demonstrably nonsemantic subtraction; behavior and contracts are unchanged. Record the reason and evidence. Deletion alone does not prove A.
    - **B:** potentially semantic or uncertain, including changes to logic, state, lifecycle, concurrency, paths, security, permissions, public output, or workflow guidance that changes permissions. Treat uncertainty as B.
 
-   Before reporting readiness, confirm evidence includes an adequate independent review of the complete final diff. If no independent review covers the complete final diff, including when review is absent or inadequate, obtain one. If an independent Reviewer is unavailable, report `BLOCKED`. B requires an independent Reviewer to assess the whole final diff, not only the last patch. The Reviewer does not fix findings; the Developer resolves material findings. Any B or uncertain edit after approval invalidates that approval: rerun affected checks and applicable final gates, then obtain an independent Reviewer assessment of the complete updated final diff. Repeat after any further B or uncertain edits. An evidenced A does not require a second review solely for cleanup when adequate independent review already covers it. This exception does not waive `$execute`'s required final review or any review required by risk. Do not claim prior review without evidence of its scope.
+   Before reporting readiness, confirm evidence includes an adequate independent review of the complete final diff. If no independent review covers it, obtain one through the review skill. If that workflow is unavailable or incomplete, report `BLOCKED`. B requires review of the whole final diff, not only the last patch. Reviewers do not fix findings; the Developer resolves them. Any B or uncertain edit invalidates the affected review: rerun affected checks and applicable final gates, then review the complete updated final diff. Repeat after further B or uncertain edits. An evidenced A does not require another review solely for cleanup when adequate independent review already covers it. This exception does not waive review required by risk. Do not claim prior review without evidence of its scope.
 8. Reinspect the complete diff and scoped Git status, including staged, unstaged, and relevant untracked files. Inspect staged and unstaged scoped changes and relevant untracked files during cleanup; do not omit them from review. Check for generated residue, secrets, and unrelated edits. Check any PR copy already present in the worktree; do not retrieve one remotely.
 
 ## Report

@@ -16,22 +16,12 @@ import {
 } from "./store.ts";
 import { resolveBoardAuthor } from "./author.ts";
 import { boardWorkspace } from "./workspace.ts";
-import { currentInstanceId } from "../agent/scope.ts";
-import { bindPlanTopic, ledgerFile, openExecutionPlan, parseLedgerBinding, parseLedgerStatus, readFrozenPlan, readPlan, bindingMismatch, verifyExecutionBinding } from "../workflow.ts";
-import { teamEvaluationForSession, teamExecutionBinding, hasUnsettledTeamWork } from "../team.ts";
-import { executionForSession } from "../execution-identity.ts";
-import { existsSync, readFileSync } from "node:fs";
-import path from "node:path";
-import { getBoardDbPath } from "./paths.ts";
-import { captureCallContext, checkCallContext, checkAuthority, guardToolRegistrations } from "../workflow-engine.ts";
-import { assertPlanningLifecycle } from "../workflow-planning.ts";
 
 const PostTypeSchema = StringEnum(POST_TYPES);
 const TopicStatusSchema = StringEnum(TOPIC_STATUSES);
 const noExtra = { additionalProperties: false } as const;
 
 export function registerBoard(pi: ExtensionAPI): void {
-  pi = guardToolRegistrations(pi, "read");
   pi.registerTool({
     name: "board_topic_create",
     label: "Board topic",
@@ -108,7 +98,7 @@ export function registerBoard(pi: ExtensionAPI): void {
     name: "board_topic_update",
     label: "Update Board topic",
     description:
-      "Update a current-workspace topic title, description, or status (open, resolved, closed). Owned topic status changes require the plan lifecycle tool. A DECISION post does not resolve the topic.",
+      "Update a current-workspace topic title, description, or status (open, resolved, closed). A DECISION post does not resolve the topic.",
     promptSnippet: "Update a Board topic title, description, or status",
     promptGuidelines: [
       "Use board_topic_update when a discussion is resolved or no longer active. A DECISION post does not change topic status by itself.",
@@ -131,156 +121,6 @@ export function registerBoard(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
-    name: "board_workflow_claim",
-    label: "Claim Board topic for plan",
-    description: "Explicitly bind an existing open Board topic to a draft plan. Does not create or reopen topics.",
-    promptSnippet: "Claim an existing Board topic for a plan",
-    parameters: Type.Object({ planId: Type.String(), topicId: Type.Number() }, noExtra),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      try {
-        const plan = readPlan(params.planId, ctx.cwd);
-        if (plan.meta.boardTopicId !== undefined && plan.meta.boardTopicId !== params.topicId) throw new BoardError("plan Board topic binding does not match requested topic");
-        if (plan.meta.boardTopicId === undefined && plan.meta.status !== "draft") throw new BoardError("a frozen plan must contain its Board topic binding before claim");
-        return workflowRun(ctx, (board, workspace) => {
-          const current = board.readTopic(workspace, params.topicId).topic;
-          const ownedTopicId = board.findTopicOwnedByPlan(workspace, plan.meta.id);
-          if (ownedTopicId !== undefined && ownedTopicId !== current.id) throw new BoardError(`plan ${plan.meta.id} already owns topic ${ownedTopicId}`);
-          if (current.status !== "open") throw new BoardError(`topic ${current.id} must be open before it can be claimed`);
-          if (current.ownerPlanId !== null && current.ownerPlanId !== plan.meta.id) {
-            throw new BoardError(`topic ${current.id} is already owned by plan ${current.ownerPlanId}`);
-          }
-          if (plan.meta.status === "frozen" && current.ownerPlanId !== plan.meta.id) {
-            throw new BoardError("a frozen bound plan must already own its Board topic");
-          }
-          const topic = board.claimTopic(workspace, current.id, plan.meta.id);
-          if (plan.meta.boardTopicId === undefined) bindPlanTopic(plan.meta.id, current.id, ctx.cwd);
-          return { text: formatTopicCreated(topic), details: { topicId: topic.id, ownerPlanId: topic.ownerPlanId } };
-        });
-      } catch (error) {
-        return toolError(error instanceof Error ? error.message : String(error));
-      }
-    },
-  });
-
-  pi.registerTool({
-    name: "board_workflow_lifecycle",
-    label: "Update workflow topic lifecycle",
-    description: "Resolve or close only the explicitly bound Board topic owned by a plan. Child sessions cannot call this operation.",
-    promptSnippet: "Resolve or close a plan-owned Board topic",
-    parameters: Type.Object({ planId: Type.String(), status: StringEnum(["resolved", "closed"] as const) }, noExtra),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      if (isChildSession(ctx)) return toolError("workflow Board lifecycle cannot be called from a child session");
-      try {
-        const context = captureCallContext(ctx.cwd, ctx.sessionManager);
-        const managedPlanning = context.kind === "managed" && checkAuthority(context.authority).run.phase === "planning";
-        const evaluation = teamEvaluationForSession(ctx.sessionManager?.getSessionId?.(), false);
-        const captured = teamExecutionBinding(evaluation, params.planId);
-        const initialPlan = captured ? verifyExecutionBinding(captured) : lifecyclePlan(params.planId, ctx.cwd);
-        if (initialPlan.meta.boardTopicId === undefined && !existsSync(getBoardDbPath())) {
-          return toolSuccess("Plan has no Board topic; no Board changes made.", { noTopic: true });
-        }
-        const location = boardWorkspace(ctx.cwd);
-        const board = await openBoard();
-        try {
-          checkCallContext(context);
-          board.migrateLegacyWorkspaces(location.identity, location.legacyRoots);
-          const ownedTopicId = board.findTopicOwnedByPlan(location.identity, params.planId);
-          if (ownedTopicId === undefined) {
-            if (initialPlan.meta.boardTopicId === undefined) {
-              return toolSuccess("Plan has no Board topic; no Board changes made.", { noTopic: true });
-            }
-            throw new BoardError(`Board topic ${initialPlan.meta.boardTopicId} is not owned by plan ${params.planId}`);
-          }
-          let topic = board.readTopic(location.identity, ownedTopicId).topic;
-          if (topic.ownerPlanId !== params.planId) throw new BoardError(`Board topic ${topic.id} is not owned by plan ${params.planId}`);
-          const executionRoot = topic.executionRoot ?? captured?.executionRoot ?? location.physicalRoot;
-          if (executionRoot !== location.physicalRoot) {
-            throw new BoardError(`caller worktree ${location.physicalRoot} does not match Board topic execution worktree ${executionRoot}`);
-          }
-
-          let plan = initialPlan;
-          if (managedPlanning) {
-            assertPlanningLifecycle(ctx, params.planId);
-            if (plan.meta.boardTopicId !== topic.id || topic.executionRoot !== null || topic.planHash !== null || topic.planRevision !== null)
-              throw new BoardError("planning topic binding has an incompatible execution claim");
-            topic = board.transitionOwnedTopic(location.identity, topic.id, params.planId, params.status);
-            return toolSuccess(formatTopicCreated(topic), { topicId: topic.id, status: topic.status });
-          }
-          let executionBinding = captured;
-          let claimExecution = false;
-          if (topic.executionRoot !== null || plan.meta.status === "frozen") {
-            const source = captured ? verifyExecutionBinding(captured) : topic.executionRoot === null ? plan : undefined;
-            const opened = openExecutionPlan(params.planId, executionRoot, {
-              createLedger: false,
-              ...(source ? { source } : {}),
-            });
-            plan = opened;
-            executionBinding = opened.binding;
-            if (plan.meta.boardTopicId !== topic.id) throw new BoardError(`Board topic ${topic.id} does not match the pinned frozen plan binding`);
-            if (captured && (opened.binding.executionRoot !== captured.executionRoot || opened.binding.planSource !== captured.planSource ||
-              opened.binding.revision !== captured.revision || opened.binding.hash !== captured.hash)) {
-              throw new BoardError("ledger execution binding does not match captured Team execution");
-            }
-            if (topic.planRevision !== null || topic.planHash !== null || topic.executionRoot !== null) {
-              if (topic.planRevision !== plan.meta.revision || topic.planHash !== plan.meta.hash || topic.executionRoot !== executionRoot) {
-                throw new BoardError(`Board topic ${topic.id} frozen plan identity or execution worktree does not match`);
-              }
-            } else {
-              claimExecution = true;
-            }
-          } else if (topic.planRevision !== null || topic.planHash !== null || topic.executionRoot !== null) {
-            throw new BoardError(`Board topic ${topic.id} has a frozen execution claim for a non-frozen plan`);
-          } else if (plan.meta.boardTopicId !== topic.id) {
-            throw new BoardError(`Board topic ${topic.id} does not match the plan binding`);
-          }
-
-          const ledger = ledgerFile(plan.meta.id, executionRoot);
-          let ledgerStatus: string | undefined;
-          if (existsSync(ledger)) {
-            const ledgerText = readFileSync(ledger, "utf8");
-            const ledgerBinding = parseLedgerBinding(ledgerText);
-            const mismatch = bindingMismatch(plan.meta, ledgerBinding);
-            if (mismatch) throw new BoardError(mismatch);
-            if (executionBinding && (ledgerBinding.executionRoot !== executionBinding.executionRoot || ledgerBinding.planSource !== executionBinding.planSource)) {
-              throw new BoardError("ledger execution binding does not match the Board topic execution");
-            }
-            ledgerStatus = parseLedgerStatus(ledgerText);
-          }
-          if (params.status === "resolved") {
-            if (ledgerStatus === "USER_DECISION_REQUIRED") throw new BoardError("USER_DECISION_REQUIRED in ledger prohibits resolving the Board topic");
-            if (plan.meta.execution === undefined) {
-              throw new BoardError("bound frozen plan must declare execution: expected or execution: none before resolving its Board topic");
-            }
-            if (plan.meta.execution === "expected" && ledgerStatus !== "completed") {
-              throw new BoardError("expected execution can resolve its Board topic only after the ledger is completed");
-            }
-          }
-          const transition = () => {
-            if (params.status === "resolved" && hasUnsettledTeamWork(evaluation, plan.meta.id, executionRoot, executionBinding)) {
-              throw new BoardError("Team work for this plan retains active or unknown physical resources; wait for their closure");
-            }
-            const updated = board.transitionOwnedTopic(
-              location.identity,
-              topic.id,
-              plan.meta.id,
-              params.status,
-              params.status === "resolved" && claimExecution
-                ? { revision: plan.meta.revision, hash: plan.meta.hash, executionRoot }
-                : undefined,
-            );
-            return toolSuccess(formatTopicCreated(updated), { topicId: updated.id, status: updated.status });
-          };
-          return transition();
-        } finally {
-          board.close();
-        }
-      } catch (error) {
-        return toolError(error instanceof Error ? error.message : String(error));
-      }
-    },
-  });
-
-  pi.registerTool({
     name: "board_post",
     label: "Board post",
     description:
@@ -288,8 +128,8 @@ export function registerBoard(pi: ExtensionAPI): void {
     promptSnippet: "Post cross-context knowledge to a Board topic",
     promptGuidelines: [
       "Use FINDING for a fact or constraint; DECISION for a chosen boundary before its authoritative artifact; QUESTION/ANSWER for cross-context coordination; BLOCKER only when another context cannot correctly continue; HANDOFF only for essential next-context knowledge; INFO sparingly for mission context.",
-      "Do not post progress, status, test counts, heartbeats, or ordinary worker events: HANDOFF: T3 done, 44 tests pass is invalid. Ledger and evidence own progress; once knowledge is absorbed, the plan, code, tests, or docs are authoritative. Board stays pull-based.",
-      "Do not post transcripts, raw reasoning, TODO steps, or execution-local blockers when the ledger suffices.",
+      "Do not post progress, status, test counts, heartbeats, or ordinary worker events. TODOs and verification evidence own progress; code, tests, or docs are authoritative once knowledge is absorbed. Board stays pull-based.",
+      "Do not post transcripts, raw reasoning, or TODO steps.",
     ],
     parameters: Type.Object(
       {
@@ -378,9 +218,7 @@ async function run(
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: Record<string, unknown>; isError?: boolean }> {
   let board: Board | undefined;
   try {
-    const context = captureCallContext(ctx.cwd, ctx.sessionManager);
     board = await openBoard();
-    checkCallContext(context);
     const location = boardWorkspace(ctx.cwd);
     board.migrateLegacyWorkspaces(location.identity, location.legacyRoots);
     const result = action(board, location.identity);
@@ -395,36 +233,6 @@ async function run(
   } finally {
     board?.close();
   }
-}
-
-function lifecyclePlan(planId: string, cwd: string): { file: string; text: string; meta: ReturnType<typeof readPlan>["meta"] } {
-  try {
-    return readPlan(planId, cwd);
-  } catch (error) {
-    if (error instanceof Error && /plan not found:/i.test(error.message)) return readFrozenPlan(planId, cwd);
-    throw error;
-  }
-}
-
-function isChildSession(ctx: { sessionManager?: { getSessionId?: () => string } }): boolean {
-  const sessionId = ctx.sessionManager?.getSessionId?.();
-  return Boolean(currentInstanceId() || process.env.PITAKO_INSTANCE_ID || executionForSession(sessionId));
-}
-
-function workflowRun(
-  ctx: { cwd: string; sessionManager?: { getSessionId?: () => string } },
-  action: (board: Board, workspace: string) => { text: string; details: Record<string, unknown> },
-) {
-  if (isChildSession(ctx)) return Promise.resolve(toolError("workflow Board operations cannot be called from a child session"));
-  return run(ctx, action);
-}
-
-function toolSuccess(text: string, details: Record<string, unknown>) {
-  return { content: [{ type: "text" as const, text }], details };
-}
-
-function toolError(message: string) {
-  return { content: [{ type: "text" as const, text: `Error: ${message}` }], details: { error: message }, isError: true };
 }
 
 export function formatTopicCreated(topic: Pick<Topic, "id" | "status" | "title">): string {

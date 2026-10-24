@@ -1,699 +1,87 @@
 # Pitako
 
-Pitako is a small, installable [Pi](https://github.com/earendil-works/pi) package. It gives you a curated coding session on top of the Pi you already run: normal coding tools, LSP, CodeGraph, and web research, plus a tool-gated analysis profile.
+Pitako is a TypeScript ESM Pi package for coding sessions. It composes navigation,
+editing, context management, memory, TODOs, Board, and pi-subagents. Pi owns models,
+providers, and the session runtime.
 
-It is an opinionated composition of Pi. It is not a fork, and it does not replace Pi's model or provider.
+## Prepare this checkout
 
-## Engineering philosophy
+Use Node >=22.19.0 and Bun >1.4.2.
 
-Pitako is a curated engineering distribution of Pi, not a concatenation of other frameworks.
-
-It currently combines:
-
-- [Ponytail](https://github.com/DietrichGebert/ponytail) (Dietrich Gebert) for the smallest complete implementation
-- selected [Caveman](https://github.com/JuliusBrussee/caveman) (Julius Brussee) coding-skill behavior, lite by default
-- selected [pstack](https://github.com/cursor/plugins/tree/main/pstack) practical skills and `principle-*` skills (Lauren Tan)
-- LSP (`pi-lsp-client`) and CodeGraph (`@vndv/pi-codegraph`)
-- [`@juicesharp/rpiv-todo`](https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-todo) for session-local TODOs
-- [`pi-web-access`](https://github.com/nicobailon/pi-web-access) for web search, source checks, and page extraction
-- [`pi-hermes-memory`](https://github.com/chandra447/pi-hermes-memory) for persistent learning and conversation search, separate from the Board
-- [`pi-subagents`](https://github.com/nicobailon/pi-subagents) for ordinary foreground delegation, alongside Pitako's managed runtime
-
-Not every skill or principle is active all the time. Pi keeps names and descriptions in context and loads a skill body when the task matches. Principles are contextual. Roles can use different subsets. Team assignments and the workspace Board are available to the foreground session.
-
-`pitako-coding` is the router: inspect the repo, keep read, grep, LSP, and CodeGraph available, choose supported tools for bounded structural questions, keep diffs small, verify real behavior, and load a specialized skill only when it applies. It does not embed the full Ponytail, Caveman, or pstack bodies.
-
-Disable Ponytail, Caveman, or any individual skill with `pi config` or package skill filters. See [Disable or override](#disable-or-override-an-extension). Attribution and pins are in [THIRD_PARTY.md](THIRD_PARTY.md). Decisions are in [docs/engineering.md](docs/engineering.md).
-
-## What this milestone is
-
-- A Pi package (`keywords: pi-package`) with Pitako, official Codex tools, ACP context compression, web access, Hermes memory, and Board extensions, curated skills, and one prompt.
-- The **coding** profile: Pi's read and bash tools, model-compatible editing tools, grep, find, ls, LSP, and CodeGraph.
-- The **analysis** profile: the same read and search tools, without `edit`, `write`, `apply_patch`, or `lsp_rename`.
-- Startup checks that fail with a clear configuration error when a required extension file or the `codegraph` CLI is missing.
-- On-demand Ponytail, selected Caveman skills, and selected pstack practical skills and principles.
-- Session-local TODOs via `@juicesharp/rpiv-todo` (`todo`, `/todos`, overlay).
-- A workspace-scoped Board (`board_*` tools, `/board`) stored in SQLite. Plans can bind and finalize their own topics.
-- Role definitions and model policies (`/pitako roles`). These are templates, not running agents.
-- `agent_run` for one synchronous in-process AgentInstance. It does not start a team.
-- `agent_spawn` for one background in-process AgentInstance. The Coordinator stays available. `agent_status`, `agent_result`, and `agent_cancel` inspect that worker. `/pitako agents [instance-id]` opens the native list/detail screen in Pi's terminal and retains bounded text in non-TUI modes. See [the screen controls](docs/worker-history.md#native-agent-screen).
-- Foreground `agent_observe` and `agent_input` for bounded observation, context queries, and in-scope steering of exact active background or Team targets. Input waits for a later native boundary and never interrupts a command. A receipt is not an answer. See [worker history and input](docs/worker-history.md).
-- An opt-in local agent bridge for foreground native RPC hosts. Its passive Node client provides non-consuming reads, change hints, and explicitly granted worker controls. See [Agent bridge host reference](docs/agent-bridge.md) for launch flags, permissions, receipts, and reconnect limits.
-- `team_assign`, `team_status`, `team_result`, and `team_cancel` for independently identified individual background Team members. Every assignment admits a new member, including repeated allowed roles. Architect/Reviewer individual dispatch is rejected.
-- `architecture_start`, `architecture_read`, and `architecture_control` for [Architect tables](docs/architecture.md), the sole Architect route. `architecture_start` has no `mode`. A substantive director prepares and contributes even with zero specialists; zero to five optional specialists are chosen for utility with reasons and selectively retained, added or retired. The table supplies the existing architectural `$plan` pass when needed, not an extra pass; trivial work needs none.
-- `review_start`, `review_read`, and `review_control` for independent [Reviewer tables](docs/review.md), the sole Reviewer route replacing the existing pass one-for-one. A substantive director and zero to five optional specialists remain separate from designers and the accepting coordinator. Both directors require their own role primary; absent table config, omitted candidates and empty candidates mean an empty pool. The complete exterior report distinguishes completed review work from its verdict; it does not accept work or waive gates.
-- `$plan` and `$execute`. Planning stops at `PLAN_FROZEN`. Execution is a separate invocation.
-
-## Verify behavior
-
-`verify-behavior` selects evidence by observable behavior and contract-derived expectations, not by function coverage or test count. A unit test can prove a domain rule. A mock cannot prove the real dependency or an integration it replaces. Reuse existing checks and add only what a concrete missing guarantee needs.
-
-```text
-/skill:verify-behavior verify the authorized change
-/skill:verify-behavior review-diff base=<agreed-local-ref>
-/skill:verify-behavior simplify-tests tests/<agreed-module>
-```
-
-- `verify` checks the authorized task and reports the behavior, check, observed result, and limits.
-- `review-diff` is read-only. It covers the complete agreed diff, including tests, helpers, fixtures, and configuration. A branch review includes commits since the agreed base, staged and unstaged edits, and relevant new files. It does not assume `main` or fetch a base.
-- `simplify-tests` recommends changes in the agreed paths, even without a diff. Applying changes requires explicit edit authorization and an editing role. Reviewer and Researcher remain read-only. Before deletion, identify where the guarantee remains demonstrated or why the contract no longer applies. Preserve uncertain cases and distinct guarantees. Green after deletion is not proof of safety.
-
-These modes are natural-language requests, not a new API. Ponytail governs simplicity of implementation and verification. `verify-behavior` governs evidence validity and sufficiency. Pitako permits existing frameworks and fixtures rather than requiring Ponytail's prescribed self-check artifact. Neither skill relaxes mandatory gates or independent review.
-
-Roles, `$plan`, `$execute`, and `pre-pr` use this policy within their existing passes. Acceptance criteria describe observable behavior and proportional expected evidence. Review includes deleted guarantees; absence of a new test is not itself a defect. Cleanup reruns invalidated checks and applicable mandatory gates, not every prior check merely because the role changed. Creating or maintaining a project-specific verification skill requires an explicitly authorized task; routine verification does not require a feature map or tree audit.
-
-### Migrate role overrides
-
-`verify-behavior` replaces the retired `tdd`, `show-me-your-work`, and `principle-prove-it-works` skills. Developer, Reviewer, Coordinator, and Researcher include it once in their default `skills` arrays. Architect is unchanged.
-
-Old names in a personal `skills` or `principles` array now produce the existing `unknown skill` error and block config loading. No aliases or automatic migration are provided. To migrate `$PI_CODING_AGENT_DIR/pitako/config.toml` manually:
-
-1. Remove all three retired names wherever they appear in `skills` or `principles`.
-2. Add `verify-behavior` once in `skills`, not once in each array.
-3. Preserve your other choices. Every supplied array replaces the whole corresponding default array; omitted arrays retain their defaults.
-
-The old defaults put `tdd` and `show-me-your-work` in `skills`, and `principle-prove-it-works` in `principles`. Do not replace all three names blindly in both arrays. Pitako does not rewrite personal config.
-
-## Session TODOs
-
-Pitako uses [`@juicesharp/rpiv-todo`](https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-todo) (juicesharp, MIT) as the tactical plan for the current Pi session.
-
-`extensions/todo.ts` loads the full upstream extension with `todo` exposed as `model-only`. The model calls it directly, not through codemode, so native results retain the snapshots used by replay and checklist readers.
-
-- `todo` — create, update, list, get, delete, clear
-- `/todos` — print the list grouped by status
-- live overlay above the editor (`ctrl+shift+t` collapses it)
-- session/branch replay, so the list survives `/reload` and compaction
-- `blockedBy` dependencies (cycles are rejected)
-- `owner` and `metadata` fields, unused by Pitako today and left for later Task/Board wiring
-
-For multi-step work, Pitako instructs the agent to create all known stages as pending before starting the first, then update those tasks as work progresses. On resume, reuse existing tasks without clearing the list or deleting unrelated work. At most one task is active per session. Workers track their own assignments, not the coordinator's complete plan. During `$plan`, the checklist covers planning; during `$execute`, it shows all frozen units. These instructions do not enforce model compliance.
-
-This is not Pitako's Task system or Memory. The Board is a separate forum. See [Board](#board). Skip TODOs for trivial tasks and purely conversational requests. Configure overlay size, collapse key, and model guidance in rpiv-todo's own `~/.config/rpiv-todo/config.json`. Disable the extension with a package filter: `!extensions/todo.ts`. Replace any old `!node_modules/@juicesharp/rpiv-todo/index.ts` filter manually. Do not load the standalone upstream entry alongside the wrapper.
-
-## Board
-
-Pitako Board is a forum for the current workspace. A topic is one shared subject. Posts record what the work established. The Board is not chat history, a TODO list, a task scheduler, or durable memory.
-
-```
-Board
-└── Topic
-    └── Posts
-```
-
-Post types are `INFO`, `FINDING`, `QUESTION`, `ANSWER`, `DECISION`, `BLOCKER`, and `HANDOFF`.
-
-| Tool | Behavior |
-| --- | --- |
-| `board_topic_create` | Create a topic. Scope is `global` and status starts `open`. The foreground author is `pi`; child authors use their AgentInstance id. |
-| `board_topic_list` | List topics in this workspace. Defaults to open, newest activity first. Default 20, max 50. |
-| `board_topic_read` | Read one topic and a page of posts, oldest to newest within the page. Default 40, max 100. Page with `beforePostId` or `afterPostId`. |
-| `board_topic_update` | Change title, description, or status (`open`, `resolved`, `closed`). Plan-owned topic status uses `board_workflow_lifecycle`. |
-| `board_workflow_claim` | Bind an existing open topic to a draft plan. |
-| `board_workflow_lifecycle` | Resolve or close the bound plan topic from the foreground session after plan checks. |
-| `board_post` | Add a post. `replyTo` must be a post in the same topic. |
-| `board_query` | Filter current-workspace posts by topic, type, author, or text. Default 20, max 50. |
-
-`/board` lists open topics. `/board 3` reads topic 3.
-
-`todo` is the session plan. The Board is shared knowledge. Do not copy TODOs onto the Board, and do not create TODOs from posts.
-
-The database is `$PI_CODING_AGENT_DIR/pitako/board.db`. If `PI_CODING_AGENT_DIR` is unset, that path is `~/.pi/agent/pitako/board.db`. A relative `PI_CODING_AGENT_DIR` resolves to an absolute path. The file is shared by the Pi installation. Each topic stores a workspace. The workspace is the git repository root, or the current directory when you are not in a git repository. Topics from another repository do not appear.
-
-Agents pull the Board by calling the tools. Pitako does not inject topics or posts into every turn.
-
-Storage is SQLite schema version 2, with foreign keys and WAL. It migrates v1 data without deleting posts and rejects incomplete schemas. Node uses built-in `node:sqlite`; Bun tests use `bun:sqlite`. Scope is `global` only. Decisions are immutable posts. A later post can point at an earlier one with `replyTo` or metadata such as `{"supersedes": 17}`. There is no decision graph. A `DECISION` post does not resolve the topic. Set the status when the discussion is done or no longer relevant.
-
-Private boards, embeddings, and automatic Board summaries are not in this version. A later Pitako Thread may namespace topics. Persistent memory is provided separately by Hermes.
-
-Disable the extension with a package filter: `!extensions/board/index.ts`.
-
-## Memory and conversation search
-
-Pitako bundles [`pi-hermes-memory`](https://github.com/chandra447/pi-hermes-memory) `0.9.9` unchanged. The Board holds knowledge agents deliberately share for a task. Hermes retains lessons, corrections, and searchable conversations across sessions. Pitako does not synchronize the two stores or promote Board posts into memory.
-
-Hermes provides `memory_add`, `memory_replace`, `memory_remove`, `memory_search`, `session_search`, and `skill_manage`. Its default `policy-only` mode retrieves memories on demand instead of injecting the full store. Background learning uses additional model calls and follows Hermes configuration.
-
-Configuration lives in `$PI_CODING_AGENT_DIR/hermes-memory-config.json`, defaulting to `~/.pi/agent/hermes-memory-config.json`. See the [Hermes configuration reference](https://github.com/chandra447/pi-hermes-memory#configuration). Use `/memory-index-sessions` to index older conversations and `/memory-preview-context` to inspect prompt additions.
-
-Disable Hermes with the package filter `!node_modules/pi-hermes-memory/src/index.ts`. This does not disable the Board.
-
-SDK worker transcripts remain native Pi history. Foreground `agent_history` and
-`/pitako history` provide bounded list and read access after restart, even without
-Hermes. Durable attempts and diagnosis sessions keep their canonical private
-directories and expose owned shallow discovery aliases to ordinary Hermes
-backfill. Search is a secondary index, not transcript or retention authority.
-See [Worker history](docs/worker-history.md) for pagination, retention defaults,
-capture gaps, sensitive raw records, and the manual indexing root difference.
-
-## Ordinary delegation
-
-Pitako bundles `pi-subagents@0.81.0` through its published `bundle/index.js` extension.
-Pitako requires Pi `1.4.0` or newer and pins all `@earendil-works/*`
-development dependencies to `1.4.0`.
-Upstream skills and prompts are not added to Pitako's resource lists.
-
-The foreground profile and Coordinator instructions prefer `subagent` for
-authorized ordinary work. Use `subagents_enable({})` if activation is needed,
-then `subagent({ agent: "scout", task: "Inspect the relevant code", async: false })`
-or `worker` for authorized implementation. `subagent({ action: "list" })` lists
-agents; `subagent({ action: "status", id: "<run-id>" })` and `bg_wait` track background work.
-Supply scope, permitted effects and checks explicitly; analysis assignments stay read-only.
-
-`$plan`, `$execute`, `/task`, Developer Head and Architect/Reviewer tables keep
-their Pitako routes, holds, gates and acceptance rules. The upstream runtime
-does not inherit Pitako `ModelPolicy`, Developer routing, reservations, history
-or the T3 agent bridge. Its run IDs are not Pitako handles. Missing policy or
-failed admission is not a reason to switch to `subagent`. Pitako children and
-managed sessions cannot use the new orchestration tools. Instruction checks
-verify availability of this guidance, not model compliance or provider operation.
-
-Disable with the package filter `!node_modules/pi-subagents/bundle/index.js`.
-
-### Discuss a design through dynamic perspectives
-
-Use `/skill:architecture <decision>` for a read-only design discussion through
-`pi-subagents`. One background scripted workflow conducts the discussion while
-the foreground session stays available. A reasoning director chooses two to
-four dynamic perspectives on the same complete problem. The script collects
-independent reports, relays objections and live steering, and awaits the
-director's synthesis for up to five rounds. It stops earlier when further rounds
-would not resolve a material disagreement. Perspectives are task instructions, not
-new agent profiles or a split into specialist subtasks.
-
-Fresh director and member sessions use the packaged `pitako.architect` profile.
-It provides CodeGraph, read-only LSP tools, and selected design principles.
-Its practical skills cover exploration, design rationale, contract sketches,
-and impact analysis.
-Use `/skill:architecture-design` for a single-agent design sketch. It replaces
-the former `architect` skill; update explicit skill lists in local overrides
-if they still name it. The agent and role names do not change.
-The workflow assigns the responsibility and perspective. Retained sessions keep
-their existing native profile.
-
-This advisory skill does not replace managed Architect tables, required
-`$plan` or `$execute` passes, or independent review. See
-[the architecture skill](skills/architecture/SKILL.md).
-
-### Review through independent adversarial angles
-
-Use `/skill:review <target and requirements>` for an advisory review through
-`pi-subagents`. Supply the exact diff, plan, solution, codebase scope, or issue
-material, not just a commit label. One background scripted workflow uses
-`pitako.reviewer` with CodeGraph, read-only LSP, and verify-behavior.
-
-The director chooses two to four angles on the complete target. Reviewers first
-work independently, then critique peer findings and respond once to challenges
-against their own. The director synthesizes supported findings, uncertainties,
-and evidence limits, with a reasoned disposition for every finding. There are no
-extra rounds or finding quotas. `ponytail-review`, from the existing Ponytail
-dependency, supplies the complexity angle when relevant; it is also exposed as
-a standalone skill.
-
-This workflow does not edit code, approve merges, or replace required managed
-Reviewer tables. It adds no Pitako model-policy integration. See
-[the review skill](skills/review/SKILL.md) for target capture and failure limits.
-
-## Roles and model policies
-
-A role is a reusable responsibility template, not a running agent. AgentInstances use roles for synchronous runs, background workers, and Team assignments.
-
-```
-RoleDefinition
-  -> ModelPolicy
-    -> ModelTarget
-```
-
-The role carries instructions, skills, and principles. The model policy carries an ordered list of model targets. A target is a Pi model id (`provider/model`) plus an optional reasoning level. The role is not a model.
-
-Built-in roles are `coordinator`, `architect`, `developer`, `reviewer`, `researcher`, `scout`, and `oracle`. Instructions live in `roles/*.md`. Structured defaults live in `config/defaults.toml`. Concrete models are not shipped, because installations do not share subscriptions.
-
-User overrides go in `$PI_CODING_AGENT_DIR/pitako/config.toml`. If `PI_CODING_AGENT_DIR` is unset, that path is `~/.pi/agent/pitako/config.toml`. Do not edit the package to change models.
-
-Principal startup creates or completes this file with missing safe defaults and commented customization examples. Existing values and source text remain intact. Model policies, role overrides, and architecture or review candidates stay commented until explicitly configured. See [Startup configuration completion](docs/configuration.md) for upgrade behavior, example syntax, publication, and error handling.
-
-Precedence is built-in defaults, then the user file. A scalar replaces that field when set. A `skills` or `principles` array replaces the built-in list when set, and is left alone when omitted. `primary` and `fallbacks` work the same way. There is no append merge.
-
-Reasoning uses Pi's levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. `default`, or omitting the field, leaves the later runner on Pi's session default. Pitako does not clamp a level the model cannot do. When a model catalog is supplied, an unsupported level fails. Without a catalog, only the syntax of `provider/model` is checked, so a target can be named before that provider is authenticated.
-
-### Background consultations
-
-Scout prepares repository context, Researcher establishes facts, and Oracle offers technical advice. They are analysis leaves, not substitutes for Architect design, Developer implementation or Reviewer judgment. Configure their independent `[model_policies.scout]`, `[model_policies.researcher]` and `[model_policies.oracle]` policies; no concrete models ship by default.
-
-Use `agent_spawn` or `team_assign` with `role`, `task` and optional `reasoning`. `agent_run` rejects these roles. A granted Head uses `head_consult`. All return a reserved handle before external preparation, then deliver through the existing automatic background or Head result channel. Reserved identity is not worker admission. Cancellation and retirement join owned preparation/disposal; unknown closure retains resources and capacity.
-
-- Omitted reasoning or `{mode:"default"}` preserves the configured primary, including Pi's settings/default chain when reasoning is omitted.
-- `{mode:"direct",level:"high"}` changes only primary reasoning. Unsupported direct reasoning fails after actual model bind before any prompt, without availability fallback.
-- `{mode:"classify"}` optionally asks for effort among the primary model's public SDK choices (including `max` only when supported) plus indeterminate. It shares Developer's configured `developer_routing.classifier_provider`/`classifier_model`, not its capacity question. Default/direct never discover or call the classifier. Failed, invalid, indeterminate, oversized or unrecordable advice keeps the frozen primary; cancellation never starts a fallback worker. Capability drift restores configured reasoning without reclassification.
-
-Each availability fallback keeps its own reasoning. Analysis excludes direct editing and Pitako orchestration, including nested and late tools, while keeping bash/navigation. It is not a shell sandbox. Head consultations share Developer capacity and managed producers with an empty write envelope; advice is never node review or native verification.
-
-After the exact outcome is incorporated in the current caller branch, `consultation_feedback` accepts `{dispatchId,usefulness:"used"|"partial"|"not_used"|"unknown",note?,followupInstances?}`. It is voluntary: completion, an offered result or a getter does not submit or authorize feedback. Later attributed feedback corrects the display without erasing prior entries. Foreground links only its catalog runs; Head links only its children. Links show observed association, not causal savings or quality.
-
-`/pitako stats consultations [dispatchId]` projects retained caller decisions, classifier overhead, worker attempts, closure/delivery and feedback. `agent_history` reads original entries using catalog-authorized dispatch locators, including Head and no-worker decisions. Missing or pre-first-assistant persistence, pruning, omitted rows and bounded-prefix scans remain gaps; unknown differs from reported zero. Zero catalog prices are not billing receipts. Inclusive Head/descendant observations are not added into a combined total. See [worker history](docs/worker-history.md).
-
-### Fast requests
-
-A target can set `fast = true` to request provider-specific priority service. Pitako sends `service_tier = "priority"` for any model from the `openai` or `openai-codex` provider and for `xai/grok-4.7`. Omitting `fast` or setting it to `false` keeps normal service behavior. Pitako's `fast` flag is separate from Codex CLI's `fast_mode` option. See the [Codex Fast mode documentation](https://developers.openai.com/codex/agent-configuration/speed/) and the [Codex configuration reference](https://developers.openai.com/codex/config-file/config-reference/).
-
-```toml
-[model_policies.developer.primary]
-model = "openai/gpt-6-luna"
-reasoning = "max"
-fast = true
-```
-
-```toml
-[model_policies.reviewer.primary]
-model = "xai/grok-4.7"
-reasoning = "xhigh"
-fast = true
-```
-
-These settings express request intent, not a granted tier. A provider endpoint can accept a request and still serve it at the standard tier. xAI `priority` means priority processing, not the separate Grok 4.7 Fast model variant.
-
-`agent_run` and `agent_result` include per-request summaries: `fast_requested`, `requested_service_tier`, `returned_service_tier`, and `time_to_first_model_output_ms`. `requested_service_tier` records the request, not the tier served. Current Pi does not expose the response service tier, so `returned_service_tier` is `unavailable`. Time to first model output is elapsed time from the Pi model-stream request start to the first non-empty text or thinking delta, or first tool-call start. Pi-reported cost is an estimate, not the provider's bill. The requested tier, response time, and estimated cost do not establish that ChatGPT Fast was active.
-
-Fallback means the preferred target could not be used because of provider or model availability: rate limit, quota, outage, or auth. It does not mean the code failed tests, the answer was weak, or the task got hard. `agent_run` may switch to the next target for those availability failures only. Pi does not export a stable error taxonomy, so `fallback_on` is not configurable.
-
-A fresh install still resolves a role. The model policy diagnostic says no primary target is configured. It does not crash the coding session.
-
-```toml
-[model_policies.architect.primary]
-model = "openai-codex/gpt-5.6-sol"
-reasoning = "high"
-
-[[model_policies.architect.fallbacks]]
-model = "example/other-model"
-reasoning = "medium"
-```
-
-Inspect the effective config with `/pitako roles`, `/pitako role architect`, `/pitako policies`, and `/pitako policy architect`. These commands do not show API keys and do not write config.
-
-## AgentInstance
-
-A RoleDefinition is a template. An AgentInstance is one isolated run of that role.
-
-```
-agent_run({ role: "developer", task: "..." })
-```
-
-The child gets the role instructions, that role's skills and principles, the Pitako coding baseline, the current cwd, and the shared Board. It does not get the parent transcript or the parent TODO list. Board posts from the child use the instance id as author. That id is looked up from the child Pi session, not from a module-local async store and not from a tool argument.
-
-The run is synchronous. It returns the final result, the instance id, the selected model, the reasoning level, and whether a fallback happened. It does not return the child transcript.
-
-The model comes from the role's ModelPolicy. An explicit reasoning level is applied. `default`, or an omitted level, is not rewritten to `medium`. Pi keeps its own default. Activating a target includes resolving the model and `setModel`. A quota, rate-limit, auth, or unavailable failure at that step tries the next target. An unknown error does not.
-
-Before a mutating or unknown tool runs, the next target may start a fresh session. After one runs, the same session switches model and continues. The original task is not sent again. Unknown tools count as potential side effects. Pi does not mark tools as mutating, so this list is fail-safe rather than a registry. A failed test does not switch models. If every target fails, `agent_run` returns the error. The parent must not do that role's work itself.
-
-The result can include turns, input, output, cache tokens, cost, and tool-call counts when Pi reports them. Input tokens are cumulative across turns, not the size of one prompt.
-
-The child cannot call `agent_run`, `agent_spawn`, `agent_status`, `agent_result`, `agent_cancel`, or the `team_*` orchestration tools. ACP delegates are off by default, but explicit ACP configuration can enable them in children too. Children start in `coding`, independently of the parent's profile. Same-session fallback can continue a child run; it does not expose a separate resume command.
-
-`agent_spawn` returns while the worker is still running. The worker has its own cancellation. A later Coordinator turn does not cancel it. Physical settlement automatically collects and supplies the complete result to the live owning conversation, with or without `plan` and `unit`, UI, or a result-tool call. Idle owners receive full context messages followed by a short wake; busy owners receive result drafts at the settlement boundary and an admissible continuation request. The Coordinator interprets supplied results, rather than fetching or acknowledging them. `agent_result` and `team_result` remain optional, complete, idempotent diagnostic re-reads.
-
-Collection, bookkeeping, delivery, and continuation remain separate. Handoff acknowledgement requires an exact committed result in the owning active branch, reconciled or inapplicable bookkeeping, and a subsequent owning turn with that result in its branch. A send, draft, preview, or getter is not that proof; even an observed turn is not model processing or work acceptance. Failed or uncertain operations remain visible and retain the full result, with at most one later event-driven recovery per operation. Parent abort/error never forces continuation. These handoffs are live-session state, not a durable queue or restart recovery. Full text can pressure the model context or be compacted later.
-
-### Head Developer: optional API, normal execute selection
-
-The one exterior Developer may receive assignment-local Head authority through
-asynchronous `agent_spawn` or `team_assign`:
-
-```json
-{ "role": "developer", "mode": "head", "writes": ["src", "tests"], "task": "Bounded WorkBrief" }
-```
-
-`writes` is explicit: relative files/subtrees, `[]` for read-only work, or `["."]`
-for the captured root. Omitted mode stays ordinary; single mode rejects writes.
-Other roles and synchronous `agent_run` cannot become Heads.
-`developer_head` is internal, not a public role. Configure its primary explicitly;
-it does not inherit the legacy Developer or foreground policy. See the
-[example configuration](config/developer-profiles.example.toml).
-
-Under `$execute`, every new exterior implementation-related Developer assignment
-explicitly selects asynchronous `role: "developer"`, `mode: "head"`, and an
-authorized relative `writes` envelope. This includes diagnosis, correction,
-focused in-unit verification, product cleanup edits, and recovery. Small tasks
-and no-leaf work still select Head. Read-only work uses `writes: []`; root access
-is not the default. Use Team when registered, otherwise `agent_spawn`.
-An explicit compatible user single-mode requirement or Head prohibition is a
-recorded exception, dispatched without `writes`. No-leaf or no-parallelism
-restrictions alone are not exceptions. Missing Head configuration or rejected
-admission blocks dispatch, not a downgrade, transport evasion, or inline takeover.
-Inline execute work remains available only when no agent or Team tools exist.
-The public API default and configured Head ModelPolicy fallback are unchanged.
-
-Product cleanup edits require a fresh Head after prior physical settlement and
-normal admission; no-op cleanup creates no Developer. Setup, bookkeeping, the
-principal final typecheck-then-test procedure, independent review, and acceptance
-are not Developer assignments. Never delegate that final procedure as cleanup.
-An active ordinary assignment cannot gain Head authority through steering.
-Replacement in the same invocation requires already-returned model-facing host
-released-closure proof for its exact handle, hold recovery, and normal admission.
-A normal pending Team cancel receipt supplies none; later status, history, wake,
-or result content cannot replace it. Preserve blockers, resources, and holds
-without polling, probing, or switching transport. Retain useful settled ordinary
-work for review rather than manufacturing a Head replay. The complete selection
-and transition policy is in [`$execute`](skills/execute/SKILL.md).
-
-The Head keeps the Developer baseline and decides whether to create leaves,
-decompose work, implement directly, or combine these approaches. The coordinator
-supplies the outcome and constraints, including for corrections, cleanup, and
-recovery. After inspection, the Head weighs separable contributions against
-context duplication and integration costs. It states `Organization decision: direct`
-or `Organization decision: decompose` with a reason before execution, records
-revisions, and includes the final choice in its integrated handoff summary.
-These are instructions, not host enforcement or proof of model compliance.
-Local `head_*` tools scope, steer and judge its own Developer leaves.
-Leaves have bounded contexts, independent capacity policies and optional
-configured classifier advice. Global
-child/Team guards stay intact. Original writes remain reserved through physical
-closure, including active scope adjustments. Product work starts only after an
-exclusive barrier, even with no leaves. The Head inspects relevant diffs and tests,
-verifies, and calls `head_finish` with current native evidence. Final text alone
-is not success.
-
-The exterior result is an integrated handoff or diagnostic failure. It includes
-bound identities, closure summaries and observed usage/parallelism; unknown usage
-is not zero. Cancellation joins only the owning subtree, and uncertain closure
-remains blocking. This is live coordination, not a sandbox, durable scheduler,
-extra exterior Developer or waiver of coordinator acceptance. Details:
-[Engineering layer](docs/engineering.md#assignment-local-head-developer) and
-[Worker history](docs/worker-history.md#head-developer-history).
-
-Every asynchronous Developer Head has `head_checkpoint` from admission, without
-an activation field. The Head chooses useful quiescent progress points for fast
-recovery; availability does not automatically create checkpoints or require one
-per tool. Unsupported repositories truthfully refuse creation.
-Foreground `agent_checkpoints` discovers saved refs without a live Head. Explicit new
-continuation can supply `checkpoint_origin: { assignmentId, checkpointId, commit }`.
-The host requires compatible exact source and positive predecessor/contributor
-closure. It does not apply commits or restore sessions, the DAG, or acceptance.
-Local storage grants no publication authority. See
-[checkpoint requests, recovery, and support limits](docs/worker-history.md#local-source-checkpoints).
-
-There is no fixed wall-clock deadline. A run ends for inactivity, not because it is old. The default idle window is 10 minutes with no tool running, and 45 minutes while a tool is running. `max_run_time = "0"` means unlimited. Parent cancellation is immediate and is not a stall. An open cursor AgentSession run uses the tool window because native exec emits no Pi tool event, and a stall still does not switch models. Prompt-cache warming does not count as progress. Pi's HTTP idle timeout is a separate transport limit and is left unchanged.
-
-```toml
-[agent_runtime]
-idle_timeout = "10m"
-tool_stall_timeout = "45m"
-max_run_time = "0"
-```
-
-`[agent_runtime]` is the in-process watchdog.
-
-## Plans
-
-`$plan` investigates, writes a decision-complete plan, and stops at `PLAN_FROZEN`. It does not implement, and it does not invoke `$execute`.
-
-`$execute <plan-id>` is the implementation authority for that frozen plan. Until that invocation, planning completion is not permission to change the product.
-
-Native `/task [local-plan-id]` authorizes the combined local planning→execution workflow, without publication. With no ID, it uses the current conversation and chooses a local plan ID. Repeating it while the same task is active is a no-op; a stopped task requires its explicit ID to resume. With no ID, it does not replace an active `/plan`. Accepted Freeze derives execution under the same task intent, without a separate `/execute`.
-
-`workflow_status` reads the latest local workflow run or an exact `runId`. It shows attempt outcomes, closure evidence, delivery state, ledger projection diagnostics, and path restrictions. A cold read cannot establish a live owner or physical closure. `/plan`, `/execute`, and `/task` tie an uncertain turn send to its actual dispatch and native receiver. Replay of that dispatch waits for an exact receipt in that receiver's branch, or supported proof that a reserved send was never invoked. Unrelated plans, receivers, and queries remain independent. A closed failed or cancelled attempt remains in history while current gates, released review, and reasoned acceptance can finish the run. An outcome or terminal status alone never proves closure or acceptance.
-
-`/skill:pre-pr [base=<local-ref>]` prepares the current worktree diff for first or later publication without `$plan`, a frozen plan, or `$execute`. It never commits or performs remote actions.
-
-Artifacts live in the workspace (git root, or the current directory outside a repository):
-
-```
-.pitako/plans/<id>.md
-.pitako/runs/<id>/ledger.md
-.pitako/runs/<id>/evidence/
-```
-
-Six records stay separate. `todo` is the current session checklist. The Board holds shared findings, decisions, and handoffs. The plan is the frozen decision. The ledger is the resume checkpoint: plan id, revision, content hash, status, and rulings. Evidence is proof for one unit. The repository is the product change. Do not use one as a substitute for another.
-
-Architect and Reviewer use only `architecture_start` and `review_start`, including bounded questions. Generic `agent_run`, `agent_spawn` and `team_assign` reject both roles before preparation or admission and direct callers to the corresponding start. The coordinator can handle user input while judgment is pending, but must interpret the complete automatic exterior result after physical closure before freezing, accepting dependent work, or completing execution. A missing start blocks the required pass; no individual, synchronous or inline fallback or waived review is allowed. Ad hoc `agent_run` remains synchronous for allowed roles. Historical direct-mode captures remain readable without migration; new callers omit architecture `mode` and external observers must support the new composition emission.
-
-The managed `/mission` runtime is retired. Use `$execute` for frozen ordinary plans.
-Recorded managed-worker catalogs remain protected, read-only archives through
-`agent_history`; see [worker history](docs/worker-history.md) for coverage limits.
-
-## What this is not yet
-
-Pitako does not implement subteams. Ad-hoc Team assignments let independent members run concurrently; they do not become a durable scheduler. Multiple members of a role do not relax `$execute`'s single exterior Developer policy. Session TODOs are local execution plans. The Board is not a team roster or a memory store.
-
-## Requirements
-
-- Node.js 22.19 or newer (same floor as current Pi).
-- [Pi coding agent](https://github.com/earendil-works/pi) `@earendil-works/pi-coding-agent` 0.87 or newer.
-- Stable Bun >1.4.2 for checkout preparation. Use the installed Bun on PATH; an exact version or the latest release is not required. Bun 1.4.2 and earlier are unsupported. People who only install a published package do not need Bun.
-- An installed language server for LSP. It can be resolved from `PATH`, a project-local `node_modules/.bin`, or an explicit command path. TypeScript defaults to `typescript-language-server`; `/lsp install <id>` offers explicit installation for supported servers.
-- CodeGraph CLI. This package depends on `@colbymchenry/codegraph` and will use `node_modules/.bin/codegraph` when `codegraph` is not already on `PATH`.
-
-Pitako does not set a provider or model. Use whatever you configured in Pi.
-
-## Install into Pi
-
-From a checkout, install dependencies first. A local path install does not run `npm install` for you.
-
-```bash
-bash ./scripts/setup.sh
-pi install .
-```
-
-`scripts/setup.sh` selects its checkout from the script directory, independently of caller cwd. It checks declared runtimes, installs with `bun install --frozen-lockfile`, and uses actual Node to resolve Hermes's native SQLite dependency and construct/query/close both SQLite implementations. After those prerequisites pass, it initializes a missing CodeGraph index best-effort, respecting a valid `CODEGRAPH_DIR` override. An existing index is left untouched; an unavailable CLI or initialization failure warns and allows LSP/read/grep use. It does not run gates, install global tools or Git hooks, or write Pi settings. You can also invoke it directly by absolute path.
-
-If installation or native loading fails, preserve the original error and resolve the reported host prerequisite before retrying. A working prebuilt needs no `node-gyp`; compilation may need a local toolchain. `--ignore-scripts` does not prove that the installed binary works. Setup success does not supply language servers or every gate-specific facility.
-
-`pi install .` writes the package into Pi settings. Add `-l` to install it for the current project instead of your user settings.
-
-Try it once without saving settings:
-
-```bash
-bash ./scripts/setup.sh
-pi --no-extensions --approve -e .
-```
-
-`--no-extensions` skips other discovered extensions so you can see Pitako on its own. `-e .` still loads this package. Drop `--no-extensions` when you want Pitako together with your other packages.
-
-Development shortcut, using the Pi binary from this repo's dev dependency rather than whatever `pi` is on your `PATH`:
-
-```bash
+```sh
+bash scripts/setup.sh
 bun run pi
 ```
 
-Open a project with source files and a language server for LSP. The `codegraph_*` runtime tools need an existing index and do not initialize or refresh it. This checkout's setup attempts missing-index initialization best-effort; for other projects, use their preparation procedure or run `codegraph init` explicitly when you want CodeGraph navigation.
+The setup script installs checkout dependencies and attempts CodeGraph index
+initialization. CodeGraph tools use an existing index and do not initialize or
+refresh it themselves. If CodeGraph or an LSP server is unavailable, use the
+ordinary read and search tools. See [verification](GATES.md) for the test procedure.
 
-### Prepare new worktrees in T3 Code
+For another project, install the package through Pi's package mechanism. The
+package manifest declares its extensions, skills, prompts, and agent profiles.
+Do not install those entries a second time as separate Pitako resources.
 
-Import the **Setup worktree** script from [t3.json](t3.json) into the project's effective T3 Code settings. Check that `runOnWorktreeCreate` is enabled and `async` is `false`. The file is a shared declaration, not an active hook by itself. `async: false` waits for the command to finish. Whether T3 prevents an agent from starting after a failed hook is unverified.
+## Use the coding baseline
 
-The hook runs `bash scripts/setup-worktree.sh` in the new worktree. The script first runs `scripts/setup.sh --skip-codegraph`, retaining dependency installation and runtime checks. After setup succeeds, it finds the principal checkout through Git and prepares CodeGraph:
+`coding` is the default profile. `/pitako profile analysis` disables `edit`,
+`write`, `apply_patch`, and `lsp_rename`. Shell remains available, so analysis is
+not a sandbox. `--pitako-profile` takes precedence over `PITAKO_PROFILE`.
 
-- If the target already has `codegraph.db`, it preserves the DB and runs `codegraph sync`. Retries and runs in the principal checkout follow this rule.
-- If only the principal has a DB, it copies a consistent SQLite snapshot and reusable index files, then runs `codegraph sync` in the target. It excludes process state and SQLite sidecars.
-- If neither checkout has a DB, it runs `codegraph init` in the target with `--yes`.
+Pitako selects upstream `apply_patch` on grammar-capable OpenAI models and uses
+`edit` and `write` otherwise. The latter tools reject protected `.git`,
+`node_modules`, and environment-file paths. This guard does not constrain
+upstream `apply_patch` or shell.
 
-Both checkouts use the same valid single-segment `CODEGRAPH_DIR` override, or `.codegraph` by default. The script resolves the CLI from `PATH` first, then the target's `node_modules/.bin/codegraph`. It does not install global tools.
+Use `/pitako` for profile and skill status, `/todos` for the session task list,
+and `/board` for shared topics. Board tools are pull-only. They do not inject
+posts into every turn.
 
-Unlike ordinary setup's optional CodeGraph preparation, this hook requires CodeGraph success. Setup, discovery, corruption, copy, initialization, and synchronization errors fail the command. A corrupt DB is not replaced with a new index. The hook does not run verification gates.
+Load specialized skills only when they apply. The default collection includes
+Ponytail, Caveman, investigation, architecture, review, verification, and
+technical-writing guidance. See [the coding router](skills/pitako-coding/SKILL.md).
 
-## Development
+## Delegate through pi-subagents
 
-Prepare the checkout with `bash ./scripts/setup.sh`. Use [GATES.md](GATES.md) for prerequisites, focused checks, and the complete routine procedure. Run `bun run typecheck`, then `bun run test` from the root. The test script uses `bun test --parallel` with normal discovery.
-
-Acceptance covers behavior implemented by Pitako, including its rules, adapters, declared resources, and instruction assembly. Tests use controlled external boundaries. They do not certify installation or operation of Pi, SDK, ACP, third-party extensions, providers, classifiers, CodeGraph, or LSP. Those external certification checks are retired, not optional gates. Local instruction assertions observe content and availability, not future model compliance.
-
-`verify-behavior` reads the active project's root `GATES.md`, not the installed Pitako package's guide. Planning reads it without running checks. Missing or stale guidance falls back to existing discovery for uncovered obligations; frozen requirements and independent review remain controlling. Routine verification does not automatically author the guide.
-
-Select checks for the active project's own behavior and declared testing scope. Reading an external boundary does not authorize dependency certification or repair. Other projects retain authorized integration requirements from their scope, contracts, and active guide, not Pitako's distributed stack. A controlled boundary double can verify an owned rule without proving the replaced runtime. That limit alone does not require a real-runtime check. Preserve isolation, asynchronous settlement before cleanup, sufficient evidence, and independent review.
-
-To create or update the guide explicitly, use Pi's native skill command with a natural-language scope:
-
-```text
-/skill:gates create GATES.md for the current project
-/skill:gates update only the API test commands in this worktree's GATES.md
-```
-
-The shipped `gates` skill is explicit-only through `disable-model-invocation: true`. Pi discovers it recursively under the package's `skills/practical` directory. It inspects executable sources and writes only the selected root `GATES.md`, preserving accurate unrelated content and labeling unresolved prerequisites. Source-confirmed commands are not claims of observed execution. Authoring does not authorize setup, installs, broad runs, product fixes, new test infrastructure, settings changes, or feature maps.
-
-`create-verification-skill` and `maintain-verification-skill` retain their app-driving verification and feature-map tasks. They are not alternative project gate recipes, and ordinary role skills do not include `gates`. If Pi currently loads a different package checkout, activate the edited package and reload or start a fresh quiescent session before claiming its policy is in use.
-
-## Profiles
-
-| Profile | Tools |
-| --- | --- |
-| `coding` (default) | `read`, `bash`, `grep`, `find`, `ls`, LSP, CodeGraph, context tools, and configured web research tools. Editing uses `apply_patch` on supported models, otherwise `edit` and `write`. On Windows, `powershell` is included when Pi registered it. |
-| `analysis` | `read`, `bash`, `grep`, `find`, `ls`, LSP, CodeGraph, and configured web research tools. No `edit`, `write`, `apply_patch`, or `lsp_rename`. |
-
-Official `pi-codex-tools` registers `apply_patch` and owns its grammar capability. Pitako uses its public `supportsOpenAIGrammarTools` helper for every coding role, including the foreground session. Models using `openai-responses` or `openai-codex-responses` with `compat.supportsOpenAIGrammarTools === true` get `apply_patch` instead of `edit` and `write`. Other models get `edit` and `write`, not `apply_patch`. Pitako reapplies this policy after startup, model changes, and profile changes, including same-model child activation.
-
-Shell is still available in `analysis`, and ACP's `decompress` can write output to temporary paths allowed by upstream. This profile is not a sandbox.
-
-The manifest starts with `extensions/index.ts` (early lifecycle), the official `node_modules/pi-codex-tools/index.ts`, then `extensions/profile-policy.ts` (late tool policy). Early startup revokes the old foreground owner and joins its retirement before publishing the replacement; its admission lease ends after its own publication, including bridge readiness, not after Codex or late policy. A native Codex startup error remains attributed to Codex and does not invalidate a ready readonly bridge. Late policy rereads the current profile after Codex synchronization, without owning lifecycle resources.
-
-`!node_modules/pi-codex-tools/index.ts` can exclude the independent official entry; coding then retains `edit` and `write`. Child loading still uses the Pitako package root, with no extra Codex path or hidden filter. Parent filters are not automatically inherited, and Pi loader deduplication is not assumed. Managed Head patch support requires exactly one registration from the canonical official public entry; duplicate or foreign registrations are unsupported. Official Codex alone and standalone agent tools remain independent. Pitako cannot guarantee priority over caller-owned entries loaded earlier.
-
-```bash
-pi --no-extensions --approve -e . --pitako-profile analysis
-```
-
-Or, inside a session: `/pitako profile analysis`. `/pitako` prints the current profile.
-
-`PITAKO_PROFILE` is used when `--pitako-profile` is omitted. An unknown name fails startup with `PitakoConfigError`.
-
-`edit` and `write` are blocked for `.git/`, `node_modules/`, `.env`, and `.env.*` files. These foreground guards do not protect `apply_patch`. The old Pitako strict-path, exact-match patch engine and its structured failures are gone. Upstream accepts absolute paths, symlinks, moves, and fuzzy matching. Foreground and ad hoc sessions are not sandboxed.
-
-An unnamed session takes its display name from the first user line, capped at 60 characters. `--name` and `/name` win. A `$plan` or `$execute` session is renamed from the plan heading when that file exists, as `plan: <heading>` or `execute: <heading>`. On resume, Pitako replaces the old `pitako:coding` or `pitako:analysis` placeholder. The footer cwd line and `pitako` status slot both show the display name; the profile is not written into the status slot. `/pitako` still prints the profile.
-
-## Context compression
-
-Pitako bundles `billion-context-pi@0.1.83` as its only compressor. It uses [acp-kernel](https://github.com/ranxianglei/acp-kernel) inline. Pitako does not load `pi-codex-compaction` or add another scheduler.
-
-The public factory starts with `{ delegate: false, autoUpdate: false, toolBashDefaultTimeout: 0 }`. ACP does not add a default timeout to bash calls; explicit call timeouts still apply. With clean configuration, `compress`, `search_context`, `decompress`, `acp_status`, and `acp_cache` are available after session start, but ACP delegates and updater are off. `/acp` displays block status. Use `compress` to create blocks and `search_context` and `decompress` to recover their contents.
-
-Explicit `~/.pi/acp.json` and project `.pi/acp.json` settings override those defaults, with project settings taking precedence. They can enable delegates or the updater, or disable ACP with `enabled:false`. Pitako does not rewrite these files. The factory reads the master switch from `process.cwd()`, not an arbitrary child's cwd. Runtime options use upstream `ctx.cwd`.
-
-ACP keeps the original session entries. Persistent block state reloads from `<sessionFile>.acp.json`; copy that sidecar with the transcript when moving a session. In-memory child state lasts only as long as its session.
-
-With ACP active, native manual `/compact` reports `Compaction cancelled`, and automatic compaction produces no native summary. Use ACP's block tools instead. When ACP is disabled or refuses a `bili` proxy, native compaction remains available.
-
-## Included extensions
-
-| Piece | Package | Why |
-| --- | --- | --- |
-| LSP | [`pi-lsp-client`](https://github.com/code-yeongyu/pi-lsp-client) at `1c981dfcacc456fe4ce9f4120a2f0250b54d6844` | Pi-native tools for diagnostics, go to definition, references, symbols, prepare-rename, and rename. Not published on npm, so it is pinned as a git dependency. MIT. |
-| CodeGraph | [`@vndv/pi-codegraph`](https://github.com/vndv/pi-codegraph) `0.1.10` | Pi-native tools over the `codegraph` CLI: search, callers, callees, impact, explore, node, files, status. MIT. |
-| CodeGraph CLI | `@colbymchenry/codegraph` `1.6.0` | The index and `codegraph serve` process the raw extension talks to. MIT. |
-| Codex patch tools | [`pi-codex-tools`](https://github.com/jvm/pi-mono/tree/main/packages/pi-codex-tools) `0.3.0` | Official entry registers `apply_patch` and invokes upstream install telemetry. Disable telemetry with `PI_OFFLINE=1` or Pi's `enableInstallTelemetry:false` setting. Apache-2.0. |
-| Context compression | [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi) `0.1.83` | Public factory with delegation and updater off by default. MIT, with additional attribution terms for its inline acp-kernel. |
-| Memory and conversation search | [`pi-hermes-memory`](https://github.com/chandra447/pi-hermes-memory) `0.9.9` | Persistent lessons, corrections, and session search. Independent of the Board. MIT. |
-| Web research | [`pi-web-access`](https://github.com/nicobailon/pi-web-access) `0.42.0` | `web_search`, `fetch_content`, `source_check`, `get_search_content`, and `web_enable`. MIT. |
-| Profiles, protected paths, status | `extensions/index.ts` | Pitako-owned. |
-
-`@vndv/pi-codegraph` registers Pi tools. It spawns `codegraph serve --mcp` internally. You do not add an MCP server to Pi.
-
-Hover is not part of `pi-lsp-client`. This package does not add a second LSP client to fill that gap.
-
-Selection notes and rejected packages are in [docs/foundation.md](docs/foundation.md).
-
-### Use LSP
-
-In a TypeScript project, with `typescript-language-server` on `PATH`:
+Use pi-subagents for authorized delegation. The `architecture` and `review`
+skills initiate their scripted workflows. Those scripts dispatch the packaged
+`pitako.architect` and `pitako.reviewer` profiles, which perform read-only
+reasoning without delegation.
 
 ```text
-Use lsp_diagnostics on src/main.ts.
-Use lsp_goto_definition on the greet call in src/main.ts.
+/skill:architecture <decision>
+/skill:review <target and requirements>
+/skill:pre-pr base=<local-ref>
 ```
 
-### Use CodeGraph
+An architecture memo is design advice. A completed review supplies findings,
+uncertainties, and coverage, not permission to edit, merge approval, or passing
+test evidence. The caller retains scope, authorization, and interpretation.
+`pre-pr` reuses the review skill for independent whole-diff review and assesses
+local publication readiness without committing or publishing.
 
-```bash
-codegraph init
-```
+See [architecture](docs/architecture.md) and [review](docs/review.md).
 
-Then ask Pi to use `codegraph_search` and `codegraph_callers`. Pitako loads the CodeGraph extension directly, including its navigation prompt hook. These are operator usage instructions, not Pitako acceptance checks.
+## Retired orchestration
 
-## Disable or override an extension
+Pitako no longer provides AgentInstance, Team, Developer Head, managed
+Architect/Reviewer tables, `/task`, or the shared planning/execution engine.
+Its worker bridge and historical reader are removed. There are no compatibility
+tools or replacement scheduler.
 
-Pi can filter a package without editing Pitako. In `settings.json`:
+`plan` and `execute` are suspended and excluded from advertised skills pending
+their migration. Old configuration, plans, ledgers, histories, and Board bindings
+are not resumed, completed, pruned, or migrated by the retired runtime. Loading
+the package does not require its former `config.toml` or model policies.
 
-```json
-{
-  "packages": [
-    {
-      "source": "/absolute/or/relative/path/to/pitako",
-      "extensions": [
-        "!node_modules/@vndv/pi-codegraph/extensions/codegraph.ts"
-      ]
-    }
-  ]
-}
-```
+The retirement does not delete user files. Former reservation, fencing,
+fallback, delivery, checkpoint, and managed-acceptance guarantees are not
+promises of pi-subagents.
 
-`pi config` toggles individual resources from installed packages, including skills. Paths are relative to the package root. Filtering CodeGraph out of the loader stops Pi from registering its `codegraph_*` tools and prompt hook; it does not remove the dependency. If your private settings excluded `extensions/code-intelligence/codegraph-raw.ts`, replace that filter with the direct path above. Pitako does not migrate private settings. To disable web research, add `!node_modules/pi-web-access/dist/index.js` to the `extensions` list.
+## Reference
 
-To drop Ponytail, Caveman, or one principle without editing Pitako:
-
-```json
-{
-  "packages": [
-    {
-      "source": "/absolute/or/relative/path/to/pitako",
-      "skills": [
-        "!node_modules/@dietrichgebert/ponytail/skills/ponytail",
-        "!skills/caveman",
-        "!skills/principles/principle-experience-first"
-      ]
-    }
-  ]
-}
-```
-
-To load the optional TypeScript skill: `+skills/language/typescript-best-practices`.
-
-To drop Pitako entirely: `pi remove` with the same source you installed.
-
-## Web research
-
-Pitako bundles [`pi-web-access`](https://github.com/nicobailon/pi-web-access) `0.42.0`. It registers `web_search`, `fetch_content`, `source_check`, `get_search_content`, and `web_enable` by default. It does not set a model, provider, or API key.
-
-Tool registration does not need API keys. Search needs network access and an available provider. Without a key, pi-web-access can use Exa MCP or DuckDuckGo, but provider availability depends on the network and service. Add optional credentials or settings to `web-search.json`. It defaults to `~/.pi/agent`; `PI_CODING_AGENT_DIR` and `XDG_CONFIG_HOME` can change the config directory. Do not commit credentials. See the [pi-web-access configuration guide](https://github.com/nicobailon/pi-web-access#configuration).
-
-`fetch_content` reads remote pages and supports GitHub repositories and PDFs. By default, GitHub URLs can clone repositories under `/tmp/pi-github-repos`. PDF extraction can save text under the operating system's temporary `pi-web-pdf` directory. Fetching sends requests to the target site, and configured extraction providers may receive the URL or page content.
-
-## Configuration examples
-
-`config/presets.example.json` shows thinking-level examples with no provider and no model. Pitako does not load it. Copy it to `~/.pi/agent/presets.json` only if you already use Pi's preset example.
-
-Do not commit API keys, `auth.json`, or `~/.pi/agent/settings.json`.
-
-## Layout
-
-```
-pitako/
-├── package.json          # pi manifest and pinned dependencies
-├── extensions/           # profiles, Board, roles, and Team
-├── roles/                # role instruction markdown
-├── skills/pitako-coding/ # router + baseline
-├── skills/plan/          # $plan, stops at PLAN_FROZEN
-├── skills/execute/       # explicit implementation authority
-├── skills/remove-ai-slops/
-├── skills/caveman/       # vendored MIT Caveman skill
-├── skills/practical/     # selected pstack workflows and verify-behavior
-├── skills/principles/    # selected pstack principles
-├── skills/language/      # optional; not loaded by default
-├── prompts/explain.md
-├── config/stack.json
-├── fixtures/             # retained examples and records
-├── scripts/              # setup, verification recipe, and vendoring
-└── tests/
-```
-
-Team assignment and model policy code already live under `extensions/agent/`, `extensions/team.ts`, and `extensions/roles/`. No separate package is required.
-
-## Checkout checks
-
-```bash
-bash ./scripts/setup.sh
-bun run typecheck
-bun run test
-```
-
-Follow [GATES.md](GATES.md) for focused selections, capture, failure interpretation, and evidence reuse. Keep file-owned mutable resources isolated and await owned asynchronous work before cleanup. The discovered suite observes Pitako-owned behavior without launching external runtimes to certify them.
-
-## Current limitations
-
-- No hover tool. `pi-lsp-client` does not provide one.
-- `codegraph_context` is not wrapped. `codegraph_explore` and `codegraph_node` cover relevant source and call edges.
-- Analysis mode does not sandbox shell or ACP temporary output. Protected-path guards for `edit` and `write` do not cover upstream `apply_patch`.
-- Language servers are not installed automatically.
-- `pi-lsp-client` is consumed from git because it is not on npm. The commit is pinned.
-- Web search depends on network access and provider availability. Board scope is global only. Agent fallback does not rerun a task after side effects.
-- Local `pi install .` requires checkout preparation first; use `bash ./scripts/setup.sh`. Missing optional setup in another project is not preparation success.
-
-## Roadmap
-
-Not built yet:
-
-- Subteams and nested agent delegation
-- Background workers that survive process exit
-- Private or team Board scopes
-- Hover and `codegraph_context` tools
-
-## License
-
-MIT. Third-party notices are in [NOTICE](NOTICE).
+- [Configuration](docs/configuration.md)
+- [Engineering layer](docs/engineering.md)
+- [Contributing](AGENTS.md)
+- [Verification](GATES.md)
+- [Third-party provenance and licenses](THIRD_PARTY.md)
