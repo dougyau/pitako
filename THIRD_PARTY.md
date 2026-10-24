@@ -6,7 +6,7 @@ Pitako composes Pi packages and vendors selected MIT skills. It does not ship BS
 
 | Project | License | Use |
 | --- | --- | --- |
-| [@dietrichgebert/ponytail](https://github.com/DietrichGebert/ponytail) 4.10.0 (`e3ba2aa`) | MIT | Skill `ponytail` only. The Pi extension is installed but not loaded. |
+| [@dietrichgebert/ponytail](https://github.com/DietrichGebert/ponytail) 4.10.0 (`e3ba2aa`) | MIT | Skills `ponytail` and `ponytail-review`. The Pi extension is installed but not loaded. |
 | [@juicesharp/rpiv-todo](https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-todo) 2.11.0 | MIT | Session-local `todo` tool, `/todos`, overlay, and branch replay. `@juicesharp/rpiv-i18n` stays optional. |
 | [pi-web-access](https://github.com/nicobailon/pi-web-access) 0.42.0 (Nico Bailon) | MIT | Web search, page extraction, and source checking. Bundled into the Pitako package tarball. |
 | [pi-hermes-memory](https://github.com/chandra447/pi-hermes-memory) 0.9.9 (Chandra Teja) | MIT | Persistent memory and conversation search. Bundled unchanged, independent of the Board. |
@@ -20,6 +20,9 @@ Pitako composes Pi packages and vendors selected MIT skills. It does not ship BS
 | [Pi](https://github.com/earendil-works/pi) | MIT | Host |
 
 License text for pi-hermes-memory: `docs/licenses/pi-hermes-memory-LICENSE`. License texts for pi-web-access: `docs/licenses/pi-web-access-LICENSE`. For Ponytail, see `docs/licenses/ponytail-LICENSE` and the package's own `LICENSE` after install. For pi-codex-tools, see `docs/licenses/pi-codex-tools-LICENSE` and `docs/licenses/pi-codex-tools-NOTICE`.
+
+`agents/reviewer.md` adapts pi-subagents `agents/reviewer.md`; its MIT license is
+included at `node_modules/pi-subagents/LICENSE` in the bundled package.
 
 License texts for ACP: `docs/licenses/billion-context-pi-LICENSE` and `docs/licenses/acp-kernel-LICENSE`. The latter includes the upstream "Attribution on Product Surfaces" term. Pitako's README and this document provide the required visible attribution and link. Neither upstream npm package ships a separate NOTICE.
 

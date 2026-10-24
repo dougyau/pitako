@@ -46,6 +46,7 @@
     "skills": [
       "./skills/pitako-coding",
       "./skills/architecture",
+      "./skills/review",
       "./skills/plan",
       "./skills/execute",
       "./skills/pre-pr",
@@ -54,7 +55,8 @@
       "./skills/investigate-first",
       "./skills/practical",
       "./skills/principles",
-      "./node_modules/@dietrichgebert/ponytail/skills/ponytail"
+      "./node_modules/@dietrichgebert/ponytail/skills/ponytail",
+      "./node_modules/@dietrichgebert/ponytail/skills/ponytail-review"
     ],
     "prompts": ["./prompts"],
     "subagents": {
