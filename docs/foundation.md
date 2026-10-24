@@ -2,7 +2,7 @@
 
 This note records package choices and rejected alternatives. For the current AgentInstance, Team, Board, and tool behavior, see [engineering.md](engineering.md).
 
-Pitako 0.1 composes Pi (`@earendil-works/pi-coding-agent` tested and supported public API floor 1.0.4). Packages declare resources under `package.json` `pi` (`extensions`, `skills`, `prompts`). Pi installs npm and git packages with `pi install` and runs `npm install` in that package. A local path is not copied and does not install dependencies, so a checkout needs `bun install` first.
+Pitako 0.1 composes Pi (`@earendil-works/pi-coding-agent` declared public API floor 1.4.0). Packages declare resources under `package.json` `pi` (`extensions`, `skills`, `prompts`). Pi installs npm and git packages with `pi install` and runs `npm install` in that package. A local path is not copied and does not install dependencies, so a checkout needs `bun install` first.
 
 Third-party Pi packages are dependencies. Their entry files are listed in `pi.extensions` and `config/stack.json`. Pi's own docs require those nested packages to be in `dependencies` and `bundledDependencies` so the published tarball contains them. Pitako does not vendor their source.
 

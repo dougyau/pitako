@@ -54,7 +54,7 @@ Do not invoke every skill or role because it exists.
 
 ## Architect and Reviewer
 
-The `architect` skill continues into implementation when the user asked to build. Do not use that path here.
+The `architecture-design` skill continues into implementation when the user asked to build. Do not use that path here.
 
 During an architectural `$plan`, use `architecture_start` for the Architect pass. The task must be design-only: inspect, reason, model, propose, critique. Ask that existing pass to check unit partition and ordering for coupled contracts and consequential uncertainty. It must say not to modify product files. A delegation failure never transfers specialist authority to the Coordinator; report it rather than doing the specialist work.
 

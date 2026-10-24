@@ -150,7 +150,7 @@ function profileHarness(profileFlag?: string, external?: () => Promise<void>) {
     async composePrompt(systemPrompt = "") {
       const handler = handlers.get("before_agent_start");
       if (!handler) throw new Error("before_agent_start was not registered");
-      const result = await handler({ systemPrompt }, context) as { systemPrompt?: string } | undefined;
+      const result = await handler({ messageType: "user", prompt: "", systemPrompt }, context) as { systemPrompt?: string } | undefined;
       return result?.systemPrompt ?? systemPrompt;
     },
     async shutdown() {

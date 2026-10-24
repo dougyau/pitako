@@ -340,8 +340,9 @@ export default function pitako(pi: ExtensionAPI, host: { recoveryScheduler?: Rec
     }
     const entries = ctx.sessionManager?.getEntries?.() ?? [];
     const existingUserText = firstUserText(entries);
-    const pendingPrompt = existingUserText ? undefined : event.prompt;
-    const invocation = planInvocation(event.prompt);
+    const prompt = event.messageType === "user" ? event.prompt : undefined;
+    const pendingPrompt = existingUserText ? undefined : prompt;
+    const invocation = planInvocation(prompt);
     const workflow = invocation && readWorkflowTitle(invocation.activity, invocation.id, ctx.cwd);
     const action = sessionNameAction({
       current: pi.getSessionName(),

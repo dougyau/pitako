@@ -47,12 +47,12 @@ describe("session name handlers", () => {
       const harness = createHandlerHarness(undefined, [], cwd);
       const before = harness.events.get("before_agent_start");
       if (!before) throw new Error("before_agent_start was not registered");
-      await before({ prompt: "$execute topic-naming" }, harness.context);
+      await before({ messageType: "user", prompt: "$execute topic-naming" }, harness.context);
       expect(harness.setNames).toEqual(["execute: Session display name"]);
       expect(harness.statuses.at(-1)?.[1]).toBe("execute: Session display name");
 
       const missing = createHandlerHarness(undefined, [], cwd);
-      await missing.events.get("before_agent_start")?.({ prompt: "$execute missing-plan" }, missing.context);
+      await missing.events.get("before_agent_start")?.({ messageType: "user", prompt: "$execute missing-plan" }, missing.context);
       expect(missing.setNames).toEqual(["$execute missing-plan"]);
     } finally {
       rmSync(cwd, { recursive: true, force: true });
@@ -66,7 +66,7 @@ describe("session name handlers", () => {
       writeFileSync(path.join(cwd, ".pitako", "plans", "topic-naming.md"), "---\nid: topic-naming\nrevision: 3\nstatus: frozen\n---\n\n# Session display name\n");
       const entries = [{ type: "message", message: { role: "user", content: "Old task" } }];
       const harness = createHandlerHarness("Old task", entries, cwd);
-      await harness.events.get("before_agent_start")?.({ prompt: "$execute topic-naming" }, harness.context);
+      await harness.events.get("before_agent_start")?.({ messageType: "user", prompt: "$execute topic-naming" }, harness.context);
       expect(harness.setNames).toEqual(["execute: Session display name"]);
     } finally {
       rmSync(cwd, { recursive: true, force: true });
@@ -80,7 +80,7 @@ describe("session name handlers", () => {
       writeFileSync(path.join(cwd, ".pitako", "plans", "topic-naming.md"), "---\nid: topic-naming\nrevision: 3\nstatus: frozen\n---\n\n# Session display name\n");
       const entries = [{ type: "message", message: { role: "user", content: "$execute topic-naming" } }];
       const harness = createHandlerHarness("execute: Existing title", entries, cwd);
-      await harness.events.get("before_agent_start")?.({ prompt: "Ordinary follow-up" }, harness.context);
+      await harness.events.get("before_agent_start")?.({ messageType: "user", prompt: "Ordinary follow-up" }, harness.context);
       expect(harness.setNames).toEqual([]);
     } finally {
       rmSync(cwd, { recursive: true, force: true });
@@ -145,10 +145,10 @@ describe("session name handlers", () => {
       writeFileSync(path.join(cwd, ".pitako", "plans", "invalid-plan.md"), "not a plan");
       writeFileSync(path.join(cwd, ".pitako", "plans", "no-heading.md"), "---\nid: no-heading\nrevision: 1\nstatus: frozen\n---\n");
       const invalid = createHandlerHarness(undefined, [], cwd);
-      await invalid.events.get("before_agent_start")?.({ prompt: "$plan invalid-plan" }, invalid.context);
+      await invalid.events.get("before_agent_start")?.({ messageType: "user", prompt: "$plan invalid-plan" }, invalid.context);
       expect(invalid.setNames).toEqual(["$plan invalid-plan"]);
       const noHeading = createHandlerHarness(undefined, [], cwd);
-      await noHeading.events.get("before_agent_start")?.({ prompt: "$plan no-heading" }, noHeading.context);
+      await noHeading.events.get("before_agent_start")?.({ messageType: "user", prompt: "$plan no-heading" }, noHeading.context);
       expect(noHeading.setNames).toEqual(["plan: no-heading"]);
     } finally {
       rmSync(cwd, { recursive: true, force: true });
@@ -159,7 +159,7 @@ describe("session name handlers", () => {
     const harness = createHandlerHarness(undefined, []);
     const before = harness.events.get("before_agent_start");
     if (!before) throw new Error("before_agent_start was not registered");
-    await before({ prompt: "Fix session titles\nMore detail" }, harness.context);
+    await before({ messageType: "user", prompt: "Fix session titles\nMore detail" }, harness.context);
     expect(harness.setNames).toEqual(["Fix session titles"]);
     expect(harness.statuses.at(-1)?.[1]).toBe("Fix session titles");
 
@@ -168,6 +168,23 @@ describe("session name handlers", () => {
     await profile("profile analysis", harness.context);
     expect(harness.setNames).toEqual(["Fix session titles"]);
     expect(harness.statuses.at(-1)?.[1]).toBe("Fix session titles");
+  });
+
+  test("custom wakes retain profile guidance without naming from the notice", async () => {
+    for (const current of [undefined, "execute: Existing title"]) {
+      const harness = createHandlerHarness(current, []);
+      const before = harness.events.get("before_agent_start");
+      if (!before) throw new Error("before_agent_start was not registered");
+      const result = await before({
+        type: "before_agent_start",
+        messageType: "custom",
+        message: { customType: "subagent-notify", content: "$execute foreign-plan", display: true },
+        systemPrompt: "Base instructions",
+      }, harness.context) as { systemPrompt: string };
+      expect(harness.setNames).toEqual([]);
+      expect(result.systemPrompt).toContain("Base instructions");
+      expect(result.systemPrompt).toContain("Pitako profile: coding.");
+    }
   });
 });
 

@@ -59,7 +59,8 @@ The manifest starts with early lifecycle, the independent official Codex entry, 
 | How does this currently work? | `how` |
 | Why is it shaped this way? | `why` |
 | Shared API, type, or module change | `blast-radius` |
-| Cross-module design before code | `architect` |
+| Cross-module design before code | `architecture-design` |
+| Explicit multi-perspective design discussion through pi-subagents | `architecture` |
 | Novel architecture with no precedent | `principle-exhaust-the-design-space` |
 | Verify behavior, review test quality in a diff, or simplify tests within authorized scope | `verify-behavior` |
 | Debugging | `principle-fix-root-causes` |
@@ -93,6 +94,11 @@ Use FINDING for a fact or constraint; DECISION for a chosen boundary before its 
 Do not use the Board as a transcript, scratchpad, TODO list, or progress log. `todo` is the session plan. The Board is pull-based and is not injected into every turn. Bind an existing open topic to a draft plan with `board_workflow_claim`. Only a foreground session can finalize the plan-owned topic with `board_workflow_lifecycle`.
 
 ## Roles
+
+An explicitly requested `architecture` skill discussion uses only `pi-subagents`
+with dynamic perspectives on the same complete problem. It is advisory and
+separate from the managed Architect route below. It does not replace required
+managed passes or bypass their admission.
 
 For authorized ordinary foreground delegation, prefer bundled `pi-subagents`:
 activate with `subagents_enable({})` if needed, inspect agents with
