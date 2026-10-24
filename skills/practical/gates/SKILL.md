@@ -10,7 +10,7 @@ Use only when the user explicitly requests creation or maintenance of root `GATE
 
 ## Select the target and scope
 
-Read the user's natural-language request. Identify the selected project/worktree root and whether the task is creation or a bounded update. Use the root-selection rules in `../verify-behavior/SKILL.md` and existing `workflowWorkspace` resolution. Do not substitute the installed package, pinned plan source, or an unrelated ancestor. If the target or requested scope is ambiguous, clarify before writing.
+Read the user's natural-language request. Identify the selected project/worktree root and whether the task is creation or a bounded update. Use the root-selection rules in `../verify-behavior/SKILL.md`. Do not substitute the installed package or an unrelated ancestor. If the target or requested scope is ambiguous, clarify before writing.
 
 Write only `<selected-project-root>/GATES.md`. Inspect an existing file before editing; an external symlink is not permission to write another root. Preserve accurate content outside the requested scope. Report an unrelated stale section rather than silently expanding maintenance.
 

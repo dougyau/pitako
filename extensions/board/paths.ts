@@ -22,10 +22,6 @@ export function getBoardDbPath(env: NodeJS.ProcessEnv = process.env, cwd = proce
   return path.join(getPitakoDataDir(env, cwd), "board.db");
 }
 
-export function getPitakoConfigPath(env: NodeJS.ProcessEnv = process.env, cwd = process.cwd()): string {
-  return path.join(getPitakoDataDir(env, cwd), "config.toml");
-}
-
 export function canonicalPath(input: string, cwd = process.cwd()): string {
   const absolute = path.resolve(cwd, input);
   const existing = deepestExisting(absolute);

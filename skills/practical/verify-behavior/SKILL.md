@@ -5,134 +5,141 @@ description: "Select checks by observable behavior, review test quality in an ag
 
 # Verify behavior
 
-Choose evidence by behavior, not by function or test count. This skill does not expand the task, edit permissions, or role authority.
+Choose evidence by behavior, not by function or test count. This skill does not
+expand the task, edit permissions, or authority.
 
 ## Choose the mode and scope
 
-Modes are natural-language requests, not a new tool or API. For example:
-
-```text
-/skill:verify-behavior verify the authorized change
-/skill:verify-behavior review-diff base=<agreed-local-ref>
-/skill:verify-behavior simplify-tests tests/<agreed-module>
-```
-
-- `verify`: check the authorized task using proportional evidence. Do not change code outside its authority.
-- `review-diff`: read only. Inspect the complete agreed diff, including product code, tests, helpers, fixtures, scripts, dependencies, and relevant configuration. For a branch, include commits since the agreed base, staged and unstaged changes, and relevant new files. For a local diff, say so. Reuse the base and scope supplied by `pre-pr` or `execute`. Do not assume `main`, fetch, or invent an ambiguous base. Consult unchanged code as context, not as cleanup scope. Inspect removed guarantees as well as added complexity.
-- `simplify-tests`: analyze existing tests in the agreed paths, even without a diff. Recommend by default. Edit only with explicit authorization and an editing role. Reviewer and Researcher remain read-only. For a large tree, work by behavior or module in verifiable units. Report out-of-scope issues without cleaning them.
+- `verify`: check the authorized task with proportional evidence.
+- `review-diff`: read only. Inspect the complete agreed diff, including product
+  code, tests, fixtures, scripts, dependencies, configuration, meaningful docs,
+  and relevant untracked files. Use the agreed base and scope. Do not assume
+  `main`, fetch, or invent a base. Inspect removed guarantees as well as additions.
+- `simplify-tests`: analyze tests in the agreed paths. Recommend by default.
+  Edit only with explicit authorization. Work by behavior in verifiable units.
+  Report out-of-scope issues without cleaning them.
 
 ## Read the project's verification guide
 
-Start check selection from behavior owned by the active project and its declared testing scope. Requirements for authorized product integrations come from that project's scope, contracts, and active guide, not from Pitako's distributed stack.
+Start from behavior owned by the active project and its declared testing scope.
+Read one root `GATES.md`. Resolve the current Git worktree root, or canonical cwd
+outside Git. For an explicitly selected project, use that project instead.
+Never substitute the installed Pitako package or an unrelated ancestor.
 
-In the Pitako checkout, acceptance covers Pitako's rules, adapters, resource declarations, and instruction assembly with controlled external boundaries. It does not certify installation or operation of Pi, SDK, ACP, third-party extensions, providers, classifiers, CodeGraph, or LSP. External certification checks are retired, not deferred acceptance work.
+Treat the guide as ordinary Markdown, without a required schema or headings.
+Use its prerequisites, focused and complete procedures, exact commands and cwd,
+order, concurrency, wrapper coverage, and failure or skip interpretation.
+Cross-check consequential claims against manifests, CI, wrappers, or tests.
+Discover uncovered obligations when guidance is missing or stale. Ordinary
+verification does not authorize maintaining the guide.
 
-Reading an external boundary to understand a call grants no certification or repair task. A controlled boundary double can verify an owned rule without proving the replaced runtime. Reviewer must not demand that runtime solely because a double was used. Preserve separately authorized integration requirements in projects that implement those integrations, and report what local evidence does not prove.
+In Pitako, verify owned composition, rules, resources, adapters, and instruction
+assembly through controlled external boundaries. This does not certify Pi, SDK,
+ACP, pi-subagents, providers, classifiers, CodeGraph, or LSP. Reading an external
+boundary grants no certification or repair task. Other projects retain authorized
+integration requirements from their scope, contracts, and active guide.
 
-Read one root `GATES.md` for the active project. Use existing workspace resolution through `workflowWorkspace` in `extensions/workflow.ts`, which selects the Git worktree root or canonical cwd outside Git:
-
-- `$execute` uses `binding.executionRoot` captured by `openExecutionPlan`, not the pinned plan source.
-- `$plan` uses the project being planned. Read guidance only; do not run setup or checks.
-- Standalone verification and `$pre-pr` use the current canonical project/worktree root.
-
-Read `<active-project-root>/GATES.md`, never the installed Pitako package, plan-source checkout, or substitute ancestors. A mixed repository uses one root guide that may name component-specific command working directories.
-
-Treat the guide as ordinary Markdown. Require no fixed headings, frontmatter, schema, parser, timestamp, generated stamp, or cache. Generic verification does not require `package.json` or any particular stack or runner. Use the guide's relevant prerequisites, focused and complete procedures, exact commands and cwd, order, supported concurrency, wrapper coverage, expected observations, and failure or skip interpretation.
-
-Cross-check consequential claims against manifests, CI, wrappers, or test sources before relying on them. Missing, stale, or incomplete guidance falls back to existing discovery for the uncovered obligation. Do not automatically create or maintain the guide. A guide cannot waive a frozen gate, authorize product changes, replace independent review, or turn a skipped or unrun check into a pass.
-
-The frozen plan and user authority control a genuine conflict. Apply existing execution decision rules rather than silently replacing the requirement. Fresh focused diagnostics remain allowed. Preserve phase- and binding-compatible evidence reuse below. Reference the root guide and relevant obligations in a WorkBrief rather than copying the whole guide into every brief.
+A guide cannot waive a required gate, authorize changes, replace independent
+review, or turn skipped or unrun checks into passes. Honor explicit user
+requirements and raise genuine conflicts rather than silently replacing them.
 
 ### Repository codemode procedure
 
-When the active project's guide provides `scripts/verification-recipe-v1.js`, load it from the active project root; under `$execute`, use the captured `binding.executionRoot`, never the installed skill directory or pinned plan-source checkout. In the ordinary workflow context, derive a unique absolute invocation directory with `evidenceFile(planId, uniqueRelative, binding.executionRoot)` from `extensions/workflow.ts`. Pass the resolved root and directory into ordinary built-in codemode. QuickJS cannot import that Node helper. Follow the root guide's source-loading example: use actual `tools.read` without offset/limit, reject failed, non-string or truncated/continuation reads before evaluation, and require `version === 1` and callable `run`. Record current source identity as well as version and binding.
+If the active guide provides `scripts/verification-recipe-v1.js`, load it from
+the active project root. Follow that guide's complete source-loading example.
+Use actual `tools.read` without offset or limit, reject failed, non-string, or
+truncated reads before evaluation, and require `version === 1` and callable `run`.
+Pass the resolved root and a unique absolute owned evidence directory to ordinary
+built-in codemode. No plan binding, managed tool, or classifier is required.
+Projects without the asset retain ordinary discovery.
 
-The repository recipe and optional advisory helper have separate locations and invocations. Find `jev-advice.js` only beside this skill's advertised installed `SKILL.md` path as described below. No classifier, provider, new SDK driver or second codemode factory is required. Projects without the asset retain ordinary discovery; do not create an asset or require this repository's stack.
-
-Use explicit focused selections during implementation. Without an explicit exterior verification grant, the principal coordinator owns the final complete invocation directly; never delegate it to an AgentInstance or Team subject to the 45-minute tool-stall watchdog. With that grant, an asynchronous Developer Head selects the root guide's exact ordered commands through `head_gates`; the host owns finite subprocesses/capture/closure and the same one-shot Head interprets exact native receipts and corrects only after released closure. The engine neither parses Markdown nor evaluates the project recipe. The grant does not authorize setup, edits, spend, or acceptance. Verify current candidate identity, released complete pass, active native branch and manual/unrun obligations; handles/status/copied or stale evidence never suffice. The principal retains independent review and acceptance. Leave routine bash timeout and codemode `timeout_ms` unset and await nested calls. Workers retain focused checks with bounds appropriate to their actual fixtures. Inspect raw logs and observed exits, tool errors, interruption and capture failure; successful enclosing codemode completion alone is not gate success. The fixed full procedure stops at its first failed, interrupted or unavailable command and names the remaining obligations as unrun. Preserve partial evidence and establish prior owned invocation settlement before a replacement. Do not add a detached runner, heartbeat or settings change.
+Await nested calls. Leave routine bash timeout and codemode `timeout_ms` unset
+for the recipe. Inspect logs and observed exits, errors, interruptions, and
+capture failures. Enclosing script success alone is not check success. Stop the
+ordered procedure at the first failed or interrupted command and name unrun
+obligations. Preserve partial evidence and settle owned work before replacing it.
+Do not add a detached runner, heartbeat, settings change, or second factory.
 
 ## Select and observe evidence
 
-1. Identify the active project's owned behavior and declared testing scope. Name the input or action, observable result, and affected guarantees that must remain true. Derive expectations from the contract or requirement, not from a copy of the implementation.
-2. Reuse existing checks. Choose the smallest check that observes the relevant contract, whether a domain rule, public library API, command, service, or user interaction. For new, costly, privileged, or integration-dependent evidence, trace a compact permitted positive route from the actual entry point to the required observation. Resolve only material prerequisites: interaction driver, effective state and resource sharing, configuration, credentials, effect owner, authorization, and cleanup. A call to `save()` does not prove persistence. Retrieve the data through the relevant path. Intention logs, compilation, a diff, or a mock that supplies the expected answer do not replace that observation.
-3. Before adding a test, ask what plausible wrong implementation it would reject and what it adds beyond existing evidence. This is a brief technical decision, not a written justification per test or a mutation-testing requirement. Reject copied algorithms, mock-stipulated results, internal details without a contract, and duplicate guarantees without a meaningful distinct case. An interaction can be observable when it is the contract. A different parameter can represent a distinct behavior class.
-4. Before running checks that launch other checks, trace their reachable commands through suites, fixtures, and wrappers. Use the actual arguments and environment. Do not run a cycle that re-enters the same verification stage or suite. When enabling a stage, update unsupported-stage cases whose contract no longer applies. Keep valid verifier integration tests outside the suites they launch.
-5. Run the check and inspect the actual result. A double can isolate a dependency, but proves neither that dependency's real behavior nor an integration it replaces. This limit does not create a requirement to exercise that runtime. Deterministic host checks prove their host contract or local mechanism, not an external model's completion of the real workflow. Preserve a separately required real-provider demonstration when it belongs to the authorized testing scope. Advisory observations, including passes, do not satisfy required acceptance checks. Report only what the exercised path observes. Internal refactors that preserve the contract should not break tests through implementation details.
+1. Name the authorized input or action, observable result, and guarantees that
+   must remain true. Derive expectations from the contract, not copied logic.
+2. Reuse existing checks. Choose the smallest observer of the relevant behavior.
+   For costly, privileged, or integration-dependent evidence, trace a permitted
+   positive route through its actual entry point, configuration, authorization,
+   resource owner, and cleanup. A save call does not prove retrieved persistence.
+3. Before adding a test, identify the plausible wrong implementation it rejects
+   and the distinct guarantee it adds. Reject copied algorithms, stipulated mock
+   results, and internal details without a contract. An interaction is observable
+   when the interaction is the contract.
+4. Trace checks that launch other checks. Do not re-enter the same verification
+   stage recursively. Keep verifier integration tests outside suites they launch.
+5. Inspect the actual result. A double isolates a dependency but does not prove
+   that dependency's behavior. This limit adds no external certification duty.
+   Preserve real-provider demonstrations only when separately required by the
+   authorized project scope. Advisory results cannot satisfy deterministic gates.
 
-Inspect the actual path before choosing a restriction. A worktree does not prove global-state isolation. Private state is not inherently prohibited, and a credentials symlink does not prove immutable credentials.
+Own mutable resources and settle asynchronous work before restoring globals or
+deleting roots. A worktree does not isolate global settings. A cancellation
+request, status change, or runner teardown is not settlement. Use appropriate
+timeouts for child-process checks. Inspect a stalled invocation before replacing
+it. Report hangs and timeouts as failed or incomplete, never passing.
 
-An equivalent PTY or private-state route is permitted only if it preserves the required actual entry point, authorization, and resource constraints. Preserve an explicit prohibition on credential persistence; do not invent one when absent. Direct internal receipt creation cannot prove a native path it bypasses.
-
-A fixture, equivalent test environment, successful diagnostic, or ordinary ledger ruling grants no spending, external-effect, reset, or budget authority. Workers retain their assigned purpose, permitted effects and completion conditions; a worker result is not coordinator acceptance. Standalone consumers retain their existing scope and authority; this skill requires no plan, setup, or new evidence artifact.
-
-Use an appropriate timeout for checks that spawn processes. Use the existing runner's cleanup for owned child processes. If a run stalls, inspect its process tree and command chain before starting another run. Report a hang or timeout as failed or incomplete verification, never as passing evidence.
-
-TDD is optional when requested or when it makes a cheap local regression easier. Reproduce the exact reported failure when feasible. Keep a new regression test when it adds useful, proportional protection, not merely because a correction occurred. Report when the prior failure could not be demonstrated.
+TDD is optional when requested or when a cheap reproduction helps. Preserve a
+useful regression test, not a ceremonial artifact. Report unreproduced failures.
 
 ## Distinguish diagnosis from final gates
 
-### Optional JEV orientation
+Diagnose concrete failures with focused reproductions. Correct only within the
+authorized assignment, then run affected regressions before repeating broad
+gates. Diagnostic success does not waive final gates or independent review.
+An unavailable prerequisite leaves dependent checks unproven; useful independent
+checks may still run within authority. Do not impose arbitrary run caps.
 
-When interpreting evidence would be useful, optionally request `failure`, `test-audit` or `consultation` advice. It is not needed for every assertion, failure or role decision. Known focused diagnosis/correction remains Developer work. An identified missing design decision goes to Architect; a correctness question about an existing proposal goes to Reviewer. Focused inspection can resolve missing context. Consultation context includes the assigned result, scope, existing proposal, established evidence, remaining uncertainty and the actual specialist question when known, not a failure counter.
-
-Find `jev-advice.js` beside this skill's **advertised installed `SKILL.md` path**, not in the project checkout or a planning-machine path. In actual codemode, call `tools.read({path: helperPath})` for the entire source (no offset/limit). Reject a failed read, non-string result, or a read containing a truncation/continuation notice; never evaluate a partial source. Evaluate that complete expression and require `version === 1`. For example, with `helperPath` resolved from the advertised skill directory:
-
-```js
-const source = await tools.read({path: helperPath});
-if (typeof source !== "string" ||
-    /\[(?:Showing |.*more lines in file|Line .*exceeds)/.test(source))
-  throw new Error("Incomplete advisory source read");
-const helper = eval(source);
-if (helper.version !== 1) throw new Error("Unsupported advisory helper");
-return await helper.advise({subject: "consultation", context: selectedContext, evidenceRefs: refs});
-```
-
-Pass only selected bounded non-secret JSON context, never an entire transcript or raw log. References are provenance strings, not permission to read files. Questions/categories are fixed by the helper; supply no executable prompts, questions or policy. Use one `advise` call per short invocation and finish it before gates or unrelated operations.
-
-The helper checks available classifiers for `opencode/jev-1.13-free` on each use. Pi owns principal registration; its built-in codemode must already be active through normal Pi tool selection (`--tools`, `defaultTools` or `setActiveTools`), not another factory. Missing helper, codemode or JEV leaves normal verification usable: no credentials, retry, alternative model, installation task or mandatory consult. Explicit unavailable, malformed, error and aborted outcomes do not change deterministic evidence.
-
-Advice gives orientation/model estimates, not calibrated certainty, gate selection/execution, edits, role dispatch, approvals, permissions or a generated WorkBrief. Do not normalize, round or threshold probabilities. An audit label cannot delete a check; a failure cannot become a pass. The coordinator retains dispatch and ModelPolicy. Neither `continue_developer` nor unavailable advice waives or postpones mandatory independent final review.
-
-The `pitako.jev.latest` slot stages a complete record with a distinct ID/time, exact state/questions/criteria/references and full public response (including unknown labels, choice/confidence, bool probability, score/confidence, usage/status/errors). Unsent attempts have no request/response. Oversized input is rejected, never truncated. A complete-record storage failure is **incomplete advisory evidence**, not permission to drop probabilities or add another writer. Pi limits each JSON value to 262144 characters and active values to 1048576.
-
-`evidence: "staged"` is not a commitment receipt: require enclosing `Script completed`, and inspect the physical native `codemode-store` entry when retention matters. Failed, interrupted or uncommitted invocations remain incomplete unless that entry exists. Later invocations overwrite the active slot, but post-mortems use the existing retained history and physical entries, not only `load()`/latest state. Keep the private native agent directory outside disposable cwd; no local export or direct journal writer is needed.
-
-For optional advice about live worker input, include the proposal you had before advice and the evidence for it. Keep the original probabilities and distinguish the recommendation from your selected action. Finish advice, decision recording, actual input, and later observation in separate invocations. After advice finishes, use `recordDecision({adviceId, target, selectedAction, reason, evidenceRefs})` with the exact retained advice ID, not an assumed latest record. The helper's target is a flat object with `kind`, `instanceId` or `assignmentId`, `historyId`, and `sessionId`. `selectedAction` is an object describing the chosen action, not a dispatch instruction. Retain older IDs when newer advice overwrites the active slot.
-
-Submit the selected action through the ordinary `agent_input` tool with `decisionId` after the decision invocation finishes. A staged decision is not dispatch. If no committed decision is available, act without a `decisionId` rather than inventing one. Inspect the actual native tool call and result. Later, use `recordObservation({decisionId, interactionReceipt, observedOutcome, evidenceRefs})` to link the receipt and subsequent activity. Decision and observation storage have the same staged-versus-physical commitment limits as advice. Recording errors, missing records, or incomplete advice never block ordinary action, gates, or review.
-
-For a post-mortem, read `agent_history` with the worker's `historyId` and `source: "coordinator"`. That source follows the coordinator session identity captured in the worker catalog, not an arbitrary file path. Worker retention does not own or delete coordinator bytes. Compare advice, selected action, actual dispatch and result, and later observation together. Synthetic fixture probabilities prove linkage, not utility. Genuine utility needs real subsequent work. If no genuine authorized configured consultation occurred, record no sample or unavailable advice without manufacturing a provider call.
-
-Diagnose a concrete failure with a focused reproduction. Seek early reachable evidence for consequential interactions, such as persistence and fallback before the first assistant, before repeating an expensive demonstration. A focused local reproduction does not replace a separately required real-provider demonstration or establish that a dependency caused the defect. Diagnose a dependency only as needed to locate the failing boundary of the authorized objective. Report out-of-scope findings and whether they block required acceptance; do not turn diagnosis into dependency maintenance.
-
-After the correction, run affected regression checks before repeating a broad final gate. Diagnosis explains the failure. Affected regression checks the corrected behavior and affected guarantees. Final gates establish the plan's required finished-state evidence. Diagnostic success does not waive final gates or independent review.
-
-Check relevant environment prerequisites when evidence makes them material, such as runtime dependency visibility, platform support, or fixture isolation. A failed prerequisite leaves dependent checks unproven. Useful independent checks may still run only within existing authority. Under `$execute`, they stay inside the current unit and cannot bypass ownership, unresolved Team holds, or setup restrictions. Failed or interrupted setup permits only non-dependent read-only diagnosis, not implementation writes or dependent checks. Independent checks do not accept an incomplete unit, start a later unit, skip a required check, or waive final review. Do not impose universal fail-fast behavior, arbitrary run caps, or a preflight framework.
+Known diagnosis stays within the assignment. For an authorized consultation or
+escalation, use `oracle` through pi-subagents with the scope, evidence, uncertainty,
+and specific question. Check that the profile is available before dispatch.
+If it is unavailable, report the blocker rather than substituting architect.
+The architecture and review skills are explicit workflows, not the default
+escalation route. A worker result is not coordinator acceptance.
 
 ## Reuse evidence only for the obligation it covers
 
-A wrapper can satisfy a required gate when its observed execution covers that obligation. Trace the actual checks it launches and compare arguments, inputs, environment, completeness, and required phase or binding. Record the coverage in existing workflow evidence rather than running a covered check again by default.
+A wrapper may cover a required check when its observed commands, arguments,
+inputs, environment, completeness, and phase cover that obligation. Record that
+coverage instead of repeating it by default.
 
-Partial logs, skipped checks, interrupted output, stale artifacts, or the same command string alone are insufficient. A final gate and a worker diagnostic command can be different obligations even when their command strings match. Evidence from one binding does not satisfy a different required binding merely because the command is identical.
-
-Reuse underlying completed evidence while its inputs, environment, contract, completeness, and required phase or binding remain compatible. Inspect the artifact, not a prior worker's summary. Check the identity facts needed for the conclusion, not every historical fact. Do not discard valid evidence solely because it is old. A handoff, role change, or no-op cleanup does not itself invalidate evidence or require a replacement report. Relevant edits after a pass invalidate affected conclusions, not every independent observation. Missing, conflicting, incomplete, or invalidated evidence requires the appropriate check. Rerun checks whose conclusions are invalidated. Valid reuse satisfies an obligation only through demonstrated coverage. It never cancels a mandatory gate or independent review.
-
-Evidence reuse preserves assigned authority and any required structured responses, receipts, affected-checks phases, and current phase and binding evidence. Reuse cannot bypass applicable isolation, ownership, disposal, coordinator acceptance, completion checks, or final independent review.
+Partial logs, skipped checks, interrupted output, stale artifacts, and identical
+command strings alone are insufficient. Inspect artifacts, not just a delegate's
+summary. Reuse completed evidence while relevant inputs, environment, contract,
+scope, and required phase remain compatible. A role change, handoff, age, or no-op
+cleanup alone does not invalidate it. Relevant edits invalidate affected
+conclusions, not every independent observation. Required gates and independent
+review remain required.
 
 ## Simplify without losing guarantees
 
-Before recommending or deleting a test, identify its guarantee and where that guarantee remains demonstrated, or why the contract no longer applies. Preserve uncertain cases, distinct guarantees, and current regressions. Age, slowness, size, or mocks do not prove a test useless. Green after deletion is not proof that deletion was safe.
+Before deleting a test, identify its guarantee and where it remains demonstrated,
+or why the contract no longer applies. Preserve uncertain cases, distinct
+guarantees, and current regressions. Age, slowness, size, and mocks do not prove
+a test useless. Green after deletion is not proof that deletion was safe.
 
-Simplification can reduce setup, remove unnecessary mocks, merge equivalent cases, or remove unused helpers. Deletion is not a goal. Never weaken an assertion to accept a failure, hide an adverse result, remove the only protection of a current guarantee, or replace recurring automated protection with a one-time manual observation just to reduce tests.
+Simplify setup, remove unnecessary mocks, merge equivalent cases, or remove unused
+helpers only within scope. Never weaken assertions, hide failures, remove the
+only protection of a current guarantee, or replace recurring protection with a
+one-time manual observation merely to reduce tests.
 
 ## Keep the proof proportional
 
-Ponytail governs simplicity of implementation and all verification artifacts. `verify-behavior` governs evidence validity and sufficiency. Reuse first, extend for a concrete missing guarantee, and create only what is needed. Apply this to fixtures, mocks, helpers, scripts, dependencies, evidence files, and runs. Keep setup, action, and observation readable. Do not build a framework for one case or an abstraction for small duplication. Optimize understanding, execution, and maintenance, not line or test counts.
+Reuse existing frameworks and fixtures. Ponytail's runnable-check examples are
+not an artifact mandate or a ban on the repository's testing tools. Do not add a
+parallel self-check, framework, or abstraction for small duplication. Distinct
+contracts may need distinct checks. Optimize understanding and maintenance,
+not line or test counts.
 
-Pitako does not treat Ponytail's `ONE runnable check`, `demo()` or `test_*.py`, and no-frameworks/no-fixtures paragraph as an artifact mandate. Reuse the repository's existing frameworks and fixtures when they observe the contract. One existing check may suffice; distinct contracts may require distinct checks. Do not add an alternative self-check just to satisfy that paragraph.
-
-Stop when the assigned outcome and its evidence obligations are complete. For implementation acceptance, demonstrate acceptance criteria, check concrete risks introduced by the change, and pass mandatory gates. Completing an assigned observation or consultation is not acceptance of a unit, final diff, or mission. Verification-only work does not add semantic-review duties. Diagnosis-only work does not authorize repair. A missing fact alone does not require stopping or user escalation. Continue useful authorized diagnosis and escalate genuine architecture, scope, or authority decisions through the existing workflow. Expand verification only for new evidence or a specific risk connected to the change, not an invented list of nearby cases. Report an out-of-scope failure without silently taking it on. State whether it blocks a mandatory gate.
-
-Do not rerun solely because the role changed. Repeat when changes, a relevant environment difference, or insufficient evidence invalidate the conclusion, or when a mandatory gate requires it. Independent review remains required where applicable.
-
-Report the behavior, check, observed result, and limits. Inspect artifacts rather than trusting a delegate's summary. Name necessary checks that could not run and the behavior still unproven. Do not compensate with irrelevant tests, use a green suite or coverage percentage as proof of an unobserved behavior, or create another record when workflow evidence already suffices.
+Stop when the assigned outcome and evidence obligations are met. Verification
+does not authorize repair, setup, paid requests, external effects, or extra
+review duties. Expand only for concrete evidence or change-related risks.
+Report the behavior, command, result, limits, unavailable checks, and whether
+out-of-scope failures block required gates. Do not claim an unobserved behavior
+because unrelated checks passed.

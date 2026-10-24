@@ -1,5 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, mock, spyOn, test } from "bun:test";
 import * as acp from "billion-context-pi";
@@ -17,7 +16,6 @@ import pitako from "../extensions/index.ts";
 import { profileNote } from "../extensions/profile.ts";
 import { packageRoot } from "../extensions/stack.ts";
 import { toolsForProfile } from "../extensions/profile.ts";
-import { captureCallContext, hasReadDefinitionGuard } from "../extensions/workflow-engine.ts";
 
 function readRepo(relative: string): string {
   return readFileSync(path.join(packageRoot(), relative), "utf8");
@@ -46,7 +44,6 @@ describe("engineering-layer composition", () => {
       api.registerTool(todo);
       api.registerTool(other);
     });
-    const root = mkdtempSync(path.join(tmpdir(), "pitako-todo-composition-"));
     try {
       const extension = await import("../extensions/todo.ts");
       extension.default(pi as unknown as ExtensionAPI);
@@ -55,9 +52,8 @@ describe("engineering-layer composition", () => {
       expect(forwarded?.registerCommand).toBe(pi.registerCommand);
       expect(tools[0]).toMatchObject({ name: todo.name, label: todo.label, description: todo.description, exposure: "model-only" });
       expect(tools[0]!.parameters).toEqual(todo.parameters);
-      expect(hasReadDefinitionGuard(tools[0]!.parameters)).toBe(true);
       const controller = new AbortController(), update = () => {};
-      const ctx = { cwd: root, sessionManager: {} } as unknown as ExtensionToolContext, args = {};
+      const ctx = { cwd: packageRoot(), sessionManager: {} } as unknown as ExtensionToolContext, args = {};
       const result = await tools[0]!.execute("native-id", args, controller.signal, update, ctx);
       expect(execute).toHaveBeenCalledTimes(1);
       expect(execute).toHaveBeenCalledWith("native-id", args, controller.signal, update, ctx);
@@ -66,9 +62,6 @@ describe("engineering-layer composition", () => {
       expect(todo.exposure).toBeUndefined();
     } finally {
       registration.mockRestore();
-      const context = captureCallContext(root);
-      if (context.kind === "ordinary") context.guard.close();
-      rmSync(root, { recursive: true, force: true });
     }
   });
 
@@ -88,11 +81,8 @@ describe("engineering-layer composition", () => {
         delegate: false, autoUpdate: false, toolBashDefaultTimeout: 0,
       });
       extension.default({ registerTool(tool: ToolDefinition) { tools.push(tool); } } as unknown as ExtensionAPI);
-      for (const [index, tool] of tools.entries()) {
-        expect(hasReadDefinitionGuard(tool.parameters)).toBe(known.includes(tool.name));
-        expect(hasReadDefinitionGuard({ ...tool.parameters })).toBe(false);
-        if (!known.includes(tool.name)) expect(tool).toBe(definitions[index]);
-      }
+      expect(tools).toEqual(definitions);
+      for (const [index, tool] of tools.entries()) expect(tool).toBe(definitions[index]);
     } finally {
       registration.mockRestore();
     }
@@ -102,7 +92,7 @@ describe("engineering-layer composition", () => {
     const manifest = JSON.parse(readRepo("package.json")).pi;
     expect(readRepo("skills/pre-pr/SKILL.md")).toContain("Prepare the current worktree");
     expect(manifest.extensions[0]).toBe("./extensions/index.ts");
-    for (const entry of ["./extensions/board/index.ts", "./extensions/agent/index.ts",
+    for (const entry of ["./extensions/board/index.ts",
       "./node_modules/@vndv/pi-codegraph/extensions/codegraph.ts", "./node_modules/pi-lsp-client/src/index.ts",
       "./extensions/todo.ts"]) expect(manifest.extensions).toContain(entry);
     expect(manifest.extensions.filter((entry: string) => entry === "./extensions/todo.ts")).toHaveLength(1);
@@ -117,7 +107,7 @@ describe("engineering-layer composition", () => {
     expect(active).toEqual(expect.arrayContaining(tools));
   });
 
-  test("architecture discussion ships separately from managed tables", () => {
+  test("architecture skill ships its pi-subagents workflow", () => {
     const manifest = JSON.parse(readRepo("package.json"));
     expect(manifest.files).toContain("skills");
     expect(manifest.pi.skills).toContain("./skills/architecture");
@@ -127,7 +117,7 @@ describe("engineering-layer composition", () => {
     for (const contract of [
       "same complete problem", "Use only `pi-subagents`",
       "Never exceed five rounds", "Do not split the work",
-      "resume: lastRunId", "does not replace a required managed",
+      "resume: lastRunId",
     ]) expect(skill).toContain(contract);
     for (const contract of ["async: true", "advanced-rolling-child-runs", "steering-a-workflow-child", "continuation"])
       expect(skill).toContain(contract);
@@ -197,7 +187,7 @@ describe("engineering-layer composition", () => {
     expect(note).not.toContain("Encode the real domain in a data structure");
   });
 
-  test("ships advisory Reviewer resources without changing managed review", () => {
+  test("ships the read-only Reviewer profile and review workflow", () => {
     const manifest = JSON.parse(readRepo("package.json"));
     expect(manifest.pi.skills).toContain("./skills/review");
     expect(manifest.pi.skills).toContain("./node_modules/@dietrichgebert/ponytail/skills/ponytail-review");
@@ -226,8 +216,7 @@ describe("engineering-layer composition", () => {
       .frontmatter.name).toBe("ponytail-review");
     const skill = readRepo("skills/review/SKILL.md");
     expect(parseFrontmatter(skill).frontmatter.name).toBe("review");
-    expect(skill).toContain("does not replace required");
-    expect(skill).toContain("managed `review_start`");
+    expect(skill).not.toContain("review_start");
     expect(skill).toContain("pitako.reviewer");
     expect(skill).toContain("No extra rounds");
     expect(body).toContain("pi-subagents `agents/reviewer.md`");
@@ -236,7 +225,7 @@ describe("engineering-layer composition", () => {
     expect(readRepo("README.md")).toContain("/skill:review <target and requirements>");
   });
 
-  test("ordinary delegation ships directly while managed routes remain explicit", () => {
+  test("ordinary delegation ships directly without the Pitako runtime", () => {
     const manifest = JSON.parse(readRepo("package.json"));
     const stack = JSON.parse(readRepo("config/stack.json"));
     expect(manifest.dependencies["pi-subagents"]).toBe("0.81.0");
@@ -254,35 +243,27 @@ describe("engineering-layer composition", () => {
         tools: ["subagent", "subagents_enable", "bg_wait", "subagent_supervisor", "contact_supervisor"] });
     for (const resources of [manifest.pi.skills, manifest.pi.prompts])
       expect(resources.some((entry: string) => entry.includes("pi-subagents"))).toBe(false);
-    for (const text of [profileNote("coding"), profileNote("analysis"), readRepo("roles/coordinator.md"), readRepo("skills/pitako-coding/SKILL.md")]) {
-      for (const boundary of ["pi-subagents", "subagent", "subagents_enable", "$plan", "$execute", "/task", "Head", "Architect/Reviewer", "ModelPolicy", "T3 agent bridge"])
+    for (const text of [profileNote("coding"), profileNote("analysis"), readRepo("skills/pitako-coding/SKILL.md")]) {
+      for (const boundary of ["pi-subagents", "oracle"])
         expect(text).toContain(boundary);
     }
+    for (const name of ["agent/index.ts", "team.ts", "roles/load.ts", "workflow.ts", "workflow-engine.ts"])
+      expect(existsSync(path.join(packageRoot(), "extensions", name))).toBe(false);
+    for (const entry of manifest.pi.extensions) expect(existsSync(path.join(packageRoot(), entry))).toBe(true);
+    for (const skill of ["plan", "execute"]) expect(manifest.pi.skills).not.toContain(`./skills/${skill}`);
+    expect(manifest.exports).toBeUndefined();
+    expect(manifest.files).not.toContain("roles");
+    expect(manifest.dependencies["smol-toml"]).toBeUndefined();
   });
 
   test("review documentation ships through existing package resources", () => {
     const manifest = JSON.parse(readRepo("package.json"));
     for (const resource of ["extensions", "skills", "docs"]) expect(manifest.files).toContain(resource);
-    expect(manifest.pi.extensions.filter((entry: string) => entry === "./extensions/agent/index.ts")).toHaveLength(1);
+    expect(manifest.pi.extensions).not.toContain("./extensions/agent/index.ts");
     expect(manifest.pi.extensions.some((entry: string) => entry.includes("/review/"))).toBe(false);
     const documentation = readRepo("docs/review.md");
-    const examples = [...documentation.matchAll(/```json\n([\s\S]*?)\n```/g)].map(match => JSON.parse(match[1]!));
-    expect(examples).toHaveLength(2);
-    expect(examples[0]).toMatchObject({ object: { kind: "plan", planId: "storage-design" }, plan: "storage-design", unit: "reviewer-critique" });
-    expect(examples[1].object).toEqual(examples[0].object);
-    for (const key of ["plan", "unit", "boardTopicId"]) expect(examples[1][key]).toBeUndefined();
-    expect(readRepo("README.md")).toContain("[Reviewer tables](docs/review.md)");
-    expect(readRepo("docs/architecture.md")).toContain("[Reviewer tables](review.md)");
-  });
-
-  test("startup completion sources and guidance ship through existing package resources", () => {
-    const manifest = JSON.parse(readRepo("package.json"));
-    for (const resource of ["config", "extensions", "docs"]) expect(manifest.files).toContain(resource);
-    for (const resource of ["config/completion-examples.toml", "extensions/roles/config-completion.ts",
-      "extensions/roles/complete.ts", "docs/configuration.md"]) expect(readRepo(resource).length).toBeGreaterThan(0);
-    expect(readRepo("README.md")).toContain("[Startup configuration completion](docs/configuration.md)");
-    expect(readRepo("docs/review.md")).toContain("[Startup configuration completion](configuration.md)");
-    expect(readRepo("docs/architecture.md")).toContain("[Startup configuration completion](configuration.md)");
+    expect(documentation).toContain("/skill:review");
+    expect(readRepo("README.md")).toContain("(docs/review.md)");
   });
 
   test("pitako-coding routes without duplicating specialized bodies", () => {
@@ -331,58 +312,34 @@ describe("engineering-layer composition", () => {
     expect(caveman).not.toContain("Must always apply.");
   });
 
-  test("loaded shared evidence policy preserves assignment and required boundaries", async () => {
-    const verify = readRepo("skills/practical/verify-behavior/SKILL.md");
+  test("shared evidence policy preserves required checks and uses ordinary escalation", () => {
+    const verify = readRepo("skills/practical/verify-behavior/SKILL.md").replace(/\s+/g, " ");
     for (const contract of [
       "scripts/verification-recipe-v1.js",
-      "binding.executionRoot",
-      "evidenceFile(planId, uniqueRelative, binding.executionRoot)",
-      "advertised installed `SKILL.md` path",
-      "principal coordinator owns the final complete invocation directly",
-      "never delegate it to an AgentInstance or Team",
-      "Projects without the asset retain ordinary discovery",
-      "Inspect the artifact, not a prior worker's summary",
-      "A handoff, role change, or no-op cleanup does not itself invalidate evidence",
-      "Missing, conflicting, incomplete, or invalidated evidence requires the appropriate check",
-      "assigned authority and any required structured responses, receipts, affected-checks phases",
-      "current phase and binding evidence",
-      "isolation, ownership, disposal, coordinator acceptance, completion checks, or final independent review",
-      "Completing an assigned observation or consultation is not acceptance",
-      "Continue useful authorized diagnosis",
+      "ordinary built-in codemode", "No plan binding, managed tool, or classifier is required",
+      "ordinary discovery", "A guide cannot waive a required gate",
+      "Stop the", "first failed or interrupted command", "name unrun",
+      "oracle", "pi-subagents",
     ]) expect(verify).toContain(contract);
+    for (const contract of ["binding.executionRoot", "evidenceFile(", "AgentInstance", "ModelPolicy"])
+      expect(verify).not.toContain(contract);
   });
 
-  test("loaded workflows and evidence guidance distinguish background dependencies, input, and optional advice", async () => {
-    const skillText = (name: string) => readRepo(name === "verify-behavior"
-      ? "skills/practical/verify-behavior/SKILL.md" : `skills/${name}/SKILL.md`);
-    const execute = skillText("execute");
-    expect(execute).not.toContain("There is no steer into a running worker");
-    for (const workflow of [skillText("plan"), execute]) {
-      for (const contract of [
-        "use only `architecture_start` and `review_start`",
-        "required start is unavailable", "blocked",
-        "No individual, synchronous or inline fallback and no waived review",
-        "original WorkBrief", "foreground-only", 'intent: "query"', 'intent: "steer"',
-        "historyId", "sessionId", "never interrupts a running command",
-        "queued", "handled", "rejected", "unconfirmed",
-        "Neither `queued` nor `handled` proves correction or replaces a new consultation",
-      ]) expect(workflow).toContain(contract);
-      expect(workflow).toMatch(/reobserve after native replacement/i);
-    }
+  test("pre-pr reuses review and keeps readiness with the coordinator", () => {
+    const skill = readRepo("skills/pre-pr/SKILL.md");
     for (const contract of [
-      "Keep at most one Developer role active, without exception",
-      "not a live controllable target",
-      "does not establish physical closure, release an incompatible effect reservation, accept a result",
-      "waive independent final review", "change ModelPolicy",
-    ]) expect(execute).toContain(contract);
-    const verify = skillText("verify-behavior");
-    for (const contract of [
-      "for the entire source (no offset/limit)", "require `version === 1`", "proposal you had before advice",
-      "Keep the original probabilities", "separate invocations", "recordDecision", "recordObservation",
-      "staged decision is not dispatch", "exact retained advice ID", "Retain older IDs",
-      "never block ordinary action, gates, or review", 'source: "coordinator"',
-      "Worker retention does not own or delete coordinator bytes", "record no sample or unavailable advice",
-    ]) expect(verify).toContain(contract);
+      "[review skill](../review/SKILL.md)", "existing pi-subagents workflow",
+      'target.kind: "diff"', "target.reference", "target.material",
+      "untracked files with their", "source files stable during review",
+      'status: "completed"', "Completion is not approval",
+      "The Coordinator records its own readiness assessment",
+      "Failed, cancelled, blocked, partial, or drifted work",
+      "Never commit, push", "required review is unavailable", "READY_TO_PUSH",
+      "pi-subagents worker profile",
+    ]) expect(skill).toContain(contract);
+    for (const contract of ["review_start", "team_result", "AgentInstance"]) expect(skill).not.toContain(contract);
+    for (const name of ["plan", "execute"])
+      expect(readRepo(`skills/${name}/SKILL.md`)).toContain("disable-model-invocation: true");
   });
 
   test("/pitako status lists the catalog without loading the Ponytail extension", async () => {

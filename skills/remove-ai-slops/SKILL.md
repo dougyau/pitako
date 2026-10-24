@@ -19,7 +19,7 @@ Skip a tiny or mechanical edit. Ponytail already covered that pass.
 
 Default scope is files changed by this execution. Do not follow ugliness into untouched files. Note an out-of-scope issue and leave it.
 
-Standalone `$pre-pr` invokes this skill only for durable prose touched by its diff. This prose-only restriction overrides the code cleanup ideas below: do not review or delete code during the `$pre-pr` pass. It does not require an `$execute` ledger or `deslop.md`, and does not change `$execute` behavior or its broader changed-file scope and evidence rules.
+Standalone `$pre-pr` invokes this skill only for durable prose touched by its diff. This prose-only restriction overrides the code cleanup ideas below: do not review or delete code during the `$pre-pr` pass. It requires no ledger or separate cleanup artifact.
 
 ## What to remove
 
@@ -44,4 +44,4 @@ Do not impose a line-count limit. Do not split a file because it is long.
 
 Use `verify-behavior` to rerun checks invalidated by cleanup and any applicable mandatory gates. Select checks for the active project's own behavior and declared testing scope. Cleanup does not add dependency certification or revive retired external checks. Preserve authorized integration requirements. Reuse evidence that remains valid instead of repeating every earlier check. If a cleanup change fails, revert that change and verify again. Do not widen the cleanup to make the failure go away.
 
-For a dedicated `$execute` pass, write a short `deslop.md` in unit evidence or in `evidence/final/`: scope, simplifications that matter, risky candidates you kept, and the verification result. Standalone `$pre-pr` uses its report instead. Do not list every deleted comment.
+Report the scope, simplifications that matter, risky candidates you kept, and the verification result in the current task report. Standalone `$pre-pr` uses its report. Do not list every deleted comment.

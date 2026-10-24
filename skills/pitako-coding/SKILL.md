@@ -11,10 +11,10 @@ This skill is the router. Do not paste the full bodies of Ponytail, Caveman, pra
 
 ## Profiles
 
-- `coding` (default): read, bash, grep, find, ls, LSP, CodeGraph, and ACP context tools. All coding roles use `apply_patch` on supported models, otherwise `edit` and `write`.
+- `coding` (default): read, bash, grep, find, ls, LSP, CodeGraph, and ACP context tools. Use `apply_patch` on supported models, otherwise `edit` and `write`.
 - `analysis`: the same read and search tools, without `edit`, `write`, `apply_patch`, or `lsp_rename`. Shell and ACP temporary output are still available. This is not a sandbox.
 
-Official `pi-codex-tools` registers `apply_patch` and owns its grammar capability. Pitako selects it through the public `supportsOpenAIGrammarTools` helper for `openai-responses` or `openai-codex-responses` models with `compat.supportsOpenAIGrammarTools === true`. On these models, `edit` and `write` are inactive. Pitako reapplies the policy after startup, model changes, and profile changes, including same-model child activation. Children start in `coding` independently of the parent profile.
+Official `pi-codex-tools` registers `apply_patch` and owns its grammar capability. Pitako selects it through the public `supportsOpenAIGrammarTools` helper for `openai-responses` or `openai-codex-responses` models with `compat.supportsOpenAIGrammarTools === true`. On these models, `edit` and `write` are inactive. Pitako reapplies the policy after startup, model changes, and profile changes. Pi-subagents owns its children's profiles and tool selection.
 
 Switch with `/pitako profile analysis` or start Pi with `--pitako-profile analysis`. `PITAKO_PROFILE` is the fallback when the flag is omitted.
 
@@ -45,9 +45,9 @@ LSP needs an installed server for the file type. It can resolve a command on `PA
 
 ACP is the only compressor; `pi-codex-compaction` is not loaded. Use `compress`, `search_context`, `decompress`, and `/acp` for blocks. Original entries remain available. Persistent sessions reload `<sessionFile>.acp.json`; in-memory children retain state only for their session's lifetime. With ACP active, native `/compact` reports `Compaction cancelled` and automatic compaction creates no native summary. Disabled ACP or a refused `bili` proxy leaves native compaction available.
 
-Pitako's ACP factory defaults to `{ delegate: false, autoUpdate: false, toolBashDefaultTimeout: 0 }`. ACP does not add a default timeout to bash calls; explicit call timeouts still apply. Explicit `~/.pi/acp.json` and project `.pi/acp.json` override these defaults, with project settings winning. They can enable delegates or updates, or set `enabled:false`. Preserve user files. The factory reads the master switch from `process.cwd()`; runtime options use `ctx.cwd`. A different child cwd does not change the factory's master-switch location. Children cannot use Pitako orchestration, but explicit ACP configuration can enable ACP delegates.
+Pitako's ACP factory defaults to `{ delegate: false, autoUpdate: false, toolBashDefaultTimeout: 0 }`. ACP does not add a default timeout to bash calls; explicit call timeouts still apply. Explicit `~/.pi/acp.json` and project `.pi/acp.json` override these defaults, with project settings winning. They can enable delegates or updates, or set `enabled:false`. Preserve user files. The factory reads the master switch from `process.cwd()`; runtime options use `ctx.cwd`. A different child cwd does not change the factory's master-switch location.
 
-The manifest starts with early lifecycle, the independent official Codex entry, then late profile policy; ACP remains before Hermes. An excluded or absent Codex entry leaves coding `edit`/`write` available. Children load only the Pitako package root; parent filters are not automatically inherited and loader deduplication is not assumed. Managed Head requires exactly one canonical public-entry patch registration. The Codex entry invokes upstream install telemetry. Disable it with `PI_OFFLINE=1` or Pi's `enableInstallTelemetry:false` setting.
+The manifest starts with early profile setup, the independent official Codex entry, then late profile policy; ACP remains before Hermes. An excluded or absent Codex entry leaves coding `edit`/`write` available. The Codex entry invokes upstream install telemetry. Disable it with `PI_OFFLINE=1` or Pi's `enableInstallTelemetry:false` setting.
 
 ## Load when it applies
 
@@ -75,9 +75,7 @@ The manifest starts with early lifecycle, the independent official Codex entry, 
 | Explicitly authorized task to maintain or audit an app-driving verification skill and feature map | `maintain-verification-skill` |
 | Docs, README, PR prose | `technical-writing`, then `unslop` |
 | Hard finished work, what to keep | `reflect` |
-| Decision-complete plan, then stop | `plan` |
-| Implement one frozen plan | `execute` |
-| Prepare a local diff for publication without `$execute` | `pre-pr` |
+| Prepare a local diff for publication | `pre-pr` |
 
 Do not load every skill. Do not load `caveman` at full or ultra unless the user asks. Do not load Ponytail and Caveman full bodies together.
 
@@ -91,32 +89,35 @@ Ponytail governs simplicity of implementation and verification. `verify-behavior
 
 Use the Board when information should stay visible as explicit shared context.
 
-Use FINDING for a fact or constraint; DECISION for a chosen boundary before its authoritative artifact; QUESTION/ANSWER for cross-context coordination; BLOCKER only when another context cannot correctly continue; HANDOFF only for essential next-context knowledge; INFO sparingly for mission context. Do not post progress, status, test counts, heartbeats, or ordinary worker events (for example, `HANDOFF: T3 done, 44 tests pass`): ledger and evidence own progress. Once absorbed, the plan, code, tests, or docs are authoritative. Keep posts concise and query with `board_query` or `board_topic_read` before posting a duplicate; do not load the whole Board when a focused query is enough.
+Use FINDING for a fact or constraint; DECISION for a chosen boundary before its authoritative artifact; QUESTION/ANSWER for cross-context coordination; BLOCKER only when another context cannot correctly continue; HANDOFF only for essential next-context knowledge; INFO sparingly for mission context. Do not post progress, status, test counts, heartbeats, or ordinary worker events (for example, `HANDOFF: T3 done, 44 tests pass`): TODOs and evidence own progress. Once absorbed, code, tests, or docs are authoritative. Keep posts concise and query with `board_query` or `board_topic_read` before posting a duplicate; do not load the whole Board when a focused query is enough.
 
-Do not use the Board as a transcript, scratchpad, TODO list, or progress log. `todo` is the session plan. The Board is pull-based and is not injected into every turn. Bind an existing open topic to a draft plan with `board_workflow_claim`. Only a foreground session can finalize the plan-owned topic with `board_workflow_lifecycle`.
+Do not use the Board as a transcript, scratchpad, TODO list, or progress log. `todo` is the session plan. The Board is pull-based and is not injected into every turn. Use `board_topic_update` for ordinary topic lifecycle. Plan ownership and execution lifecycle tools are retired.
 
-## Roles
+## Delegation
 
-An explicitly requested `architecture` skill discussion uses only `pi-subagents`
-with dynamic perspectives on the same complete problem. It is advisory and
-separate from the managed Architect route below. It does not replace required
-managed passes or bypass their admission.
-
-For authorized ordinary foreground delegation, prefer bundled `pi-subagents`:
+For authorized delegation, use bundled `pi-subagents`:
 activate with `subagents_enable({})` if needed, inspect agents with
 `subagent({ action: "list" })`, then use `subagent({ agent: "scout", task, async: false })`
 for reconnaissance or `worker` for authorized implementation. Pass scope,
 permitted effects and checks explicitly; analysis assignments stay read-only.
-Use `subagent({ action: "status", id: "<run-id>" })` and `bg_wait` for retained runs.
-This runtime does not inherit Pitako `ModelPolicy`, routing, reservations, history
-or the T3 agent bridge. Keep `$plan`, `$execute`, `/task`, Developer Head and
-Architect/Reviewer tables on their existing Pitako routes. Never substitute
-`subagent` for missing policy, failed admission or child/managed restrictions.
-Pitako children do not receive these upstream orchestration tools.
+For native async work, return control after admission and interpret its automatic
+completion. Do not poll or add watchers. Use retained-run status only when
+diagnosis is needed. A launch failure is a blocker, not permission to switch
+runtimes silently.
 
-`/pitako roles` and `/pitako role <id>` show role definitions. A role is a responsibility template; its `ModelPolicy` selects the instance's primary model and fallbacks. `agent_run` executes an allowed individual instance synchronously. The foreground session uses `team_assign`, `team_status`, `team_result`, and `team_cancel` for individual Team work; `/pitako team` inspects its roster. Architect and Reviewer use only `architecture_start` and `review_start`, including ad hoc questions. If the required start is absent, the pass is blocked, not individual, inline or waived. Background results are supplied automatically in the owning context, with or without plan/unit correlation. Tables supply either a complete inline report or an incomplete reference: read pertinent `team_result` sections before a dependent decision. Start with optional `section` and `maxBytes` (4096..16384 bytes, default 16384); continue with cursor only. Do not automatically load every page. Ordinary assignments retain complete results and optional diagnostic re-reads. Do not poll or acknowledge collection. Automatic handoff, transport end and report completion are not work acceptance or unit completion. Child instances do not receive orchestration tools. If delegation fails, report the error; do not take over that specialist work.
+For authorized consultation or escalation, use `oracle`. Inspect the available
+profiles first and pass the specific question, scope, and evidence. If oracle
+is unavailable, report the blocker. Architect is not a general escalation role.
 
-Ordinary Team role work admits distinct members, including repeated roles; Team, role and member/assignment are different identities. Both starts use a substantive director with its own role primary and zero to five optional specialists selected for utility with reasons, including zero. Selective recomposition retains useful conversations. Missing table configuration, omitted candidates and empty candidates mean an empty pool; `architecture_start` has no `mode`. Tables replace existing Architect/Reviewer passes, not add passes. Record and watch only the exterior root. Interpret its complete terminal current-object judgment and keep independent Reviewer critique separate from designers. This does not relax `$execute`'s one exterior Developer, asynchronous Head/writes, integration barriers, checkpoint authority, holds or acceptance policy.
+The `architecture` and `review` skills initiate their existing scripted
+workflows. Scripts own dispatch; `pitako.architect` and `pitako.reviewer` perform
+read-only reasoning without delegation. Advice and review completion are not
+authorization, passing checks, or acceptance.
+
+The former AgentInstance, Team, Head, table, routing, and bridge runtime is
+retired. Its model policies and execution guarantees do not transfer to
+pi-subagents. `plan` and `execute` are suspended pending migration, and `/task`
+is unavailable. No historical execution is resumed or maintained automatically.
 
 ## Web access
 
@@ -124,4 +125,4 @@ Use `web_search` for current external sources, `fetch_content` to read a URL, an
 
 ## Not in this package
 
-Poteto-mode is not bundled. `$plan` and `$execute` are skills, not a scheduler.
+Poteto-mode is not bundled. Pitako adds no scheduler.

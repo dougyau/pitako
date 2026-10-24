@@ -18,8 +18,6 @@ export const DEFAULT_SKILL_NAMES = [
   "reflect",
   "technical-writing",
   "unslop",
-  "plan",
-  "execute",
   "pre-pr",
   "remove-ai-slops",
   "principle-foundational-thinking",
