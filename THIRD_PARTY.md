@@ -10,7 +10,7 @@ Pitako composes Pi packages and vendors selected MIT skills. It does not ship BS
 | [@juicesharp/rpiv-todo](https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-todo) 2.11.0 | MIT | Session-local `todo` tool, `/todos`, overlay, and branch replay. `@juicesharp/rpiv-i18n` stays optional. |
 | [pi-web-access](https://github.com/nicobailon/pi-web-access) 0.42.0 (Nico Bailon) | MIT | Web search, page extraction, and source checking. Bundled into the Pitako package tarball. |
 | [pi-hermes-memory](https://github.com/chandra447/pi-hermes-memory) 0.9.9 (Chandra Teja) | MIT | Persistent memory and conversation search. Bundled unchanged, independent of the Board. |
-| [pi-subagents](https://github.com/nicobailon/pi-subagents) 0.79.2 (Nico Bailon) | MIT | Ordinary foreground delegation through the published extension. Bundled unchanged with its LICENSE; Pitako's managed runtime is retained. |
+| [pi-subagents](https://github.com/nicobailon/pi-subagents) 0.81.0 (Nico Bailon) | MIT | Ordinary foreground delegation through the published extension. Bundled unchanged with its LICENSE; Pitako's managed runtime is retained. |
 | [pi-lsp-client](https://github.com/code-yeongyu/pi-lsp-client) | MIT | LSP tools |
 | [pi-codex-tools](https://github.com/jvm/pi-mono/tree/main/packages/pi-codex-tools) 0.3.0 | Apache-2.0; OpenAI Codex attribution | Official extension registers `apply_patch` and invokes upstream install telemetry. Bundled unchanged. |
 | [billion-context-pi](https://github.com/ranxianglei/billion-context-pi) 0.1.83 (ranxianglei) | MIT | ACP context compression through the public factory. Bundled unchanged, with delegation and updates off by default. |

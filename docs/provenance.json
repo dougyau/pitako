@@ -109,6 +109,13 @@
     ],
     "adapted": [
       {
+        "name": "architecture-design",
+        "path": "skills/practical/architecture-design/SKILL.md",
+        "renamedFrom": "architect",
+        "informedBy": "https://github.com/mattpocock/skills/tree/main/skills/engineering/codebase-design",
+        "reason": "Local design guidance for caller obligations, interface leverage, change locality, justified variation, and observable checks; no codebase-design text or orchestration is vendored."
+      },
+      {
         "name": "verify-behavior",
         "path": "skills/practical/verify-behavior/SKILL.md",
         "consolidatesRetired": ["tdd", "show-me-your-work", "principle-prove-it-works"],
@@ -126,7 +133,7 @@
     ],
     "localModifications": [
       "Practical skills rewritten for a single agent using CodeGraph and LSP",
-      "architect stops after the sketch unless the user asked to implement",
+      "architect is renamed architecture-design; it stops after the sketch unless the user asked to implement; reapply the interface-design adaptation after vendoring",
       "Removed disable-model-invocation so skills stay discoverable",
       "unslop limited to prose",
       "create-verification-skill writes .pi/skills/ and triggers only for explicitly authorized creation; routine verify-behavior use does not require a feature map; reapply after vendoring",

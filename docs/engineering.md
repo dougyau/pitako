@@ -30,6 +30,13 @@ Caveman is not a Pi package. `skills/` is MIT. Engine, proxy, browse, MCP, and t
 
 Pitako vendors selected skills from the official pstack plugin (Lauren Tan, MIT, plugin revision `6ed0f7a9504f577d7529064103cecce9be7dfc5e`) and rewrites the orchestrated ones (`how`, `why`, `architect`, `blast-radius`, `reflect`, verification procedures) for a single agent.
 
+The adapted `architect` skill is named `architecture-design` locally. It checks
+caller obligations, useful complexity hidden by an interface, change locality,
+justified points of variation, and observable verification. These ideas are
+informed by [codebase-design](https://github.com/mattpocock/skills/tree/main/skills/engineering/codebase-design);
+its text, prescribed vocabulary, and parallel-agent process are not vendored.
+Reapply this local adaptation after updating upstream skills.
+
 Pitako's `verify-behavior` consolidates the useful responsibilities of the retired `tdd`, `show-me-your-work`, and `principle-prove-it-works`. It loads from the existing `skills/practical` package location. Its modes select checks, review the complete agreed diff read-only, or recommend test simplification. Edits require explicit authorization and an editing role. See [Verify behavior](../README.md#verify-behavior) for usage and manual override migration.
 
 The catalog and role defaults select `verify-behavior` once for Developer, Reviewer, Coordinator, and Researcher. Architect, ModelPolicy, resource filtering, and whole-array override semantics are unchanged. Retired override names fail with the existing `unknown skill` error.
@@ -64,12 +71,11 @@ Codex can be excluded through its normal manifest entry, with coding `edit`/`wri
 
 ### pi-subagents: ordinary delegation alongside the managed runtime
 
-Pitako pins and bundles `pi-subagents@0.79.2`, loading its published `index.js`
+Pitako pins and bundles `pi-subagents@0.81.0`, loading its published `bundle/index.js`
 directly from `pi.extensions` and declaring the same entry in `config/stack.json`.
-No wrapper is needed. Its peer `pi-ai >=0.86.1` admits the existing `1.0.4`
-development baseline; `0.80.0` and `0.81.0` require `>=1.2.0`. This avoids a
-general Pi upgrade. Package metadata and public API inspection establish this
-minimum compatibility choice, not provider/runtime certification.
+No wrapper is needed. Pitako's `@earendil-works/*` peers require `1.4.0` or
+newer and its development dependencies are pinned to `1.4.0`. Package metadata
+establishes the minimum requirement, not provider/runtime certification.
 
 This version exposes `subagent` (including list/status actions),
 `subagents_enable`, `bg_wait`, `subagent_supervisor` and `contact_supervisor`,
@@ -99,7 +105,7 @@ checks do not certify upstream child operation or future model compliance.
 | Ponytail artifact prescription vs repository checks | Ponytail governs simplicity of implementation and verification. `verify-behavior` governs evidence validity and sufficiency. Developer child instructions clarify that existing frameworks and fixtures are valid and distinct contracts may need distinct checks. No dependency edit or hook enforces this instruction. |
 | Ponytail "never stall" vs research ≠ implement | Profile note and `pitako-coding`: design does not authorize implementation. |
 | Caveman full dialect vs clear architecture | Default lite. Full/ultra/wenyan only if the user asks. |
-| pstack architect implements by default | Pitako architect stops at the sketch. |
+| pstack architect implements by default | Pitako architecture-design stops at the sketch. |
 | pstack how/why spawn subagents | Single agent, CodeGraph and LSP. |
 | principle-never-block-on-the-human | Excluded. Later authority boundaries need inspect / experiment / implement. |
 | unslop "must always apply" | Limited to prose. |

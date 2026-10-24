@@ -148,9 +148,9 @@ capture gaps, sensitive raw records, and the manual indexing root difference.
 
 ## Ordinary delegation
 
-Pitako bundles `pi-subagents@0.79.2` through its published `index.js` extension.
-This version admits the existing Pi `1.0.4` development baseline; `0.80.0` and
-`0.81.0` require `pi-ai >=1.2.0`. Pitako's Pi peers and development pins are unchanged.
+Pitako bundles `pi-subagents@0.81.0` through its published `bundle/index.js` extension.
+Pitako requires Pi `1.4.0` or newer and pins all `@earendil-works/*`
+development dependencies to `1.4.0`.
 Upstream skills and prompts are not added to Pitako's resource lists.
 
 The foreground profile and Coordinator instructions prefer `subagent` for
@@ -168,7 +168,32 @@ failed admission is not a reason to switch to `subagent`. Pitako children and
 managed sessions cannot use the new orchestration tools. Instruction checks
 verify availability of this guidance, not model compliance or provider operation.
 
-Disable with the package filter `!node_modules/pi-subagents/index.js`.
+Disable with the package filter `!node_modules/pi-subagents/bundle/index.js`.
+
+### Discuss a design through dynamic perspectives
+
+Use `/skill:architecture <decision>` for a read-only design discussion through
+`pi-subagents`. One background scripted workflow conducts the discussion while
+the foreground session stays available. A reasoning director chooses two to
+four dynamic perspectives on the same complete problem. The script collects
+independent reports, relays objections and live steering, and awaits the
+director's synthesis for up to five rounds. It stops earlier when further rounds
+would not resolve a material disagreement. Perspectives are task instructions, not
+new agent profiles or a split into specialist subtasks.
+
+Fresh director and member sessions use the packaged `pitako.architect` profile.
+It provides CodeGraph, read-only LSP tools, and selected design principles.
+Its practical skills cover exploration, design rationale, contract sketches,
+and impact analysis.
+Use `/skill:architecture-design` for a single-agent design sketch. It replaces
+the former `architect` skill; update explicit skill lists in local overrides
+if they still name it. The agent and role names do not change.
+The workflow assigns the responsibility and perspective. Retained sessions keep
+their existing native profile.
+
+This advisory skill does not replace managed Architect tables, required
+`$plan` or `$execute` passes, or independent review. See
+[the architecture skill](skills/architecture/SKILL.md).
 
 ## Roles and model policies
 

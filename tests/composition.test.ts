@@ -4,7 +4,7 @@ import path from "node:path";
 import { describe, expect, mock, spyOn, test } from "bun:test";
 import * as acp from "billion-context-pi";
 import * as rpivTodo from "@juicesharp/rpiv-todo";
-import type { ExtensionAPI, ExtensionToolContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { parseFrontmatter, type ExtensionAPI, type ExtensionToolContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
   DEFAULT_SKILL_NAMES,
@@ -117,6 +117,71 @@ describe("engineering-layer composition", () => {
     expect(active).toEqual(expect.arrayContaining(tools));
   });
 
+  test("architecture discussion ships separately from managed tables", () => {
+    const manifest = JSON.parse(readRepo("package.json"));
+    expect(manifest.files).toContain("skills");
+    expect(manifest.pi.skills).toContain("./skills/architecture");
+    expect(DEFAULT_SKILL_NAMES as readonly string[]).toContain("architecture");
+    const skill = readRepo("skills/architecture/SKILL.md");
+    expect(skill).toMatch(/^---\nname: architecture\ndescription: .+\n---/);
+    for (const contract of [
+      "same complete problem", "Use only `pi-subagents`",
+      "Never exceed five rounds", "Do not split the work",
+      "resume: lastRunId", "does not replace a required managed",
+    ]) expect(skill).toContain(contract);
+    for (const contract of ["async: true", "advanced-rolling-child-runs", "steering-a-workflow-child", "continuation"])
+      expect(skill).toContain(contract);
+    expect(readRepo("skills/architecture/workflow.js")).toContain("runs.steer");
+    expect(readRepo("README.md")).toContain("/skill:architecture <decision>");
+    expect(readRepo("skills/pitako-coding/SKILL.md")).toContain("`architecture`");
+  });
+
+  test("ships a task-assigned architect with explicit read-only navigation and selected principles", async () => {
+    const manifest = JSON.parse(readRepo("package.json"));
+    expect(manifest.files).toContain("agents");
+    expect(manifest.pi.subagents.agents).toEqual(["./agents"]);
+    const source = readRepo("agents/architect.md");
+    const { frontmatter: profile, body } = parseFrontmatter(source);
+    // The agent adapter's scalar/list parser differs from Pi's YAML parser.
+    const agentParser = await import(path.join(packageRoot(), "node_modules/pi-subagents/src/agents/frontmatter.js"));
+    const nativeProfile = agentParser.parseFrontmatter(source).frontmatter;
+    expect(agentParser.parseFrontmatterList(nativeProfile.extensions)).toEqual([]);
+    expect(`${profile.package}.${profile.name}`).toBe("pitako.architect");
+    expect(profile).toMatchObject({
+      acceptanceRole: "read-only", defaultContext: "fresh", systemPromptMode: "replace",
+      inheritProjectContext: true, inheritGlobalContext: false, inheritSkills: false,
+    });
+    expect(profile.tools).toEqual([
+      "read", "grep", "find", "ls",
+      "codegraph_search", "codegraph_callers", "codegraph_callees", "codegraph_impact",
+      "codegraph_explore", "codegraph_node", "codegraph_status", "codegraph_files",
+      "lsp_diagnostics", "lsp_goto_definition", "lsp_find_references", "lsp_symbols",
+    ]);
+    const providers = [
+      "../node_modules/@vndv/pi-codegraph/extensions/codegraph.ts",
+      "../node_modules/pi-lsp-client/src/index.ts",
+    ];
+    expect(profile.subagentOnlyExtensions).toEqual(providers);
+    for (const provider of providers)
+      expect(readRepo(path.join("agents", provider)).length).toBeGreaterThan(0);
+    expect(profile.skillPath).toEqual(["../skills/principles", "../skills/practical"]);
+    const practical = ["architecture-design", "how", "why", "blast-radius"];
+    const principles = [
+      "principle-foundational-thinking", "principle-boundary-discipline",
+      "principle-type-system-discipline", "principle-minimize-reader-load",
+    ];
+    expect(profile.skills).toEqual([...practical, ...principles]);
+    for (const [directory, names] of [["practical", practical], ["principles", principles]] as const)
+      for (const name of names) {
+        const source = readRepo(`skills/${directory}/${name}/SKILL.md`);
+        expect(parseFrontmatter(source).frontmatter.name).toBe(name);
+      }
+    expect(body).toContain("The task defines your responsibility");
+    expect(body).toContain("The workflow owns dispatch");
+    expect(body).toContain("Do not impose a merge verdict");
+    expect(readRepo("skills/architecture/SKILL.md")).toContain("`pitako.architect`");
+  });
+
   test("always-on profile note stays small and does not embed third-party bodies", () => {
     const note = profileNote("coding");
     expect(note.startsWith("Pitako profile: coding.")).toBe(true);
@@ -135,14 +200,18 @@ describe("engineering-layer composition", () => {
   test("ordinary delegation ships directly while managed routes remain explicit", () => {
     const manifest = JSON.parse(readRepo("package.json"));
     const stack = JSON.parse(readRepo("config/stack.json"));
-    expect(manifest.dependencies["pi-subagents"]).toBe("0.79.2");
+    expect(manifest.dependencies["pi-subagents"]).toBe("0.81.0");
     expect(manifest.bundledDependencies).toContain("pi-subagents");
-    expect(manifest.devDependencies["@earendil-works/pi-ai"]).toBe("1.0.4");
-    expect(manifest.peerDependencies["@earendil-works/pi-ai"]).toBe(">=1.0.4");
+    const piPackages = new Set([...Object.keys(manifest.devDependencies), ...Object.keys(manifest.peerDependencies)]);
+    for (const name of piPackages) {
+      if (!name.startsWith("@earendil-works/")) continue;
+      expect(manifest.devDependencies[name]).toBe("1.4.0");
+      expect(manifest.peerDependencies[name]).toBe(">=1.4.0");
+    }
     expect(manifest.pi.extensions.filter((entry: string) => entry.includes("pi-subagents")))
-      .toEqual(["./node_modules/pi-subagents/index.js"]);
+      .toEqual(["./node_modules/pi-subagents/bundle/index.js"]);
     expect(stack.required.find((entry: { id: string }) => entry.id === "pi-subagents"))
-      .toEqual({ id: "pi-subagents", spec: "pi-subagents@0.79.2", entry: "node_modules/pi-subagents/index.js",
+      .toEqual({ id: "pi-subagents", spec: "pi-subagents@0.81.0", entry: "node_modules/pi-subagents/bundle/index.js",
         tools: ["subagent", "subagents_enable", "bg_wait", "subagent_supervisor", "contact_supervisor"] });
     for (const resources of [manifest.pi.skills, manifest.pi.prompts])
       expect(resources.some((entry: string) => entry.includes("pi-subagents"))).toBe(false);
@@ -193,7 +262,11 @@ describe("engineering-layer composition", () => {
   });
 
   test("specialized skills keep single-agent and contextual contracts", () => {
-    const architect = readRepo("skills/practical/architect/SKILL.md");
+    const architect = readRepo("skills/practical/architecture-design/SKILL.md");
+    expect(parseFrontmatter(architect).frontmatter.name).toBe("architecture-design");
+    expect(DEFAULT_SKILL_NAMES as readonly string[]).toContain("architecture-design");
+    expect(DEFAULT_SKILL_NAMES as readonly string[]).not.toContain("architect");
+    expect(() => readRepo("skills/practical/architect/SKILL.md")).toThrow();
     expect(architect).toContain("Do not run arena");
     expect(architect).toContain("does not authorize implementation");
     expect(architect).toContain("Routine edits do not need this skill");

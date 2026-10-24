@@ -35,7 +35,7 @@ description = "Owns system structure, domain modeling, and module boundaries."
 instructions = "roles/architect.md"
 model_policy = "architect"
 skills = [
-  "architect",
+  "architecture-design",
   "how",
   "why",
   "blast-radius",

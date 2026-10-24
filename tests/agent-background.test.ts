@@ -1084,7 +1084,7 @@ describe("background tools", () => {
     expect(sent).toHaveLength(7);
     expect(workerHandoff(aborted)).toMatchObject({ delivery: "incorporated", continuation: "blocked-unconfirmed" });
     ctx.signal = undefined;
-    await handlers.get("before_agent_start")!({ prompt: "new authorized run", systemPrompt: "" }, ctx);
+    await handlers.get("before_agent_start")!({ messageType: "user", prompt: "new authorized run", systemPrompt: "" }, ctx);
     await handlers.get("turn_start")!({}, ctx);
     expect(workerHandoff(aborted)?.continuation).toBe("observed");
     await handlers.get("message_end")!({ message: { role: "assistant", stopReason: "error" } }, ctx);

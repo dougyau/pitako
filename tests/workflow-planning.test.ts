@@ -62,7 +62,7 @@ test(`${composition} observed ${boundary} ${outcome} fences captured planning be
     expect(existsSync(planFile("observed", app.root))).toBe(false);
     expect(joined).toBe(false);
     expect(owner.run.state).not.toBe("interrupted");
-    await emit("before_agent_start", { prompt: "continue", systemPrompt: "" });
+    await emit("before_agent_start", { messageType: "user", prompt: "continue", systemPrompt: "" });
     expect(() => checkCallContext(captured)).toThrow();
     await emit("agent_end", { messages: [message] });
     expect(joined).toBe(false);
@@ -103,7 +103,7 @@ test("observed retirement ignores success, Worker data and foreign or stale sess
     expect(draft.revision).toBe(1);
     await app.emit("message_end", { message: { role: "assistant", stopReason: "error" } });
     await expect(write(draft.revision, draft.fileHash, "Forbidden\n")).rejects.toThrow("retired");
-    await app.emit("before_agent_start", { prompt: "continue", systemPrompt: "" });
+    await app.emit("before_agent_start", { messageType: "user", prompt: "continue", systemPrompt: "" });
     expect(() => checkCallContext(captured)).toThrow("retired");
     await app.commands.get("plan").handler("owned", app.ctx);
     const fresh = captureCallContext(app.root, manager);

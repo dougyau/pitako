@@ -299,7 +299,7 @@ fallbacks = []
     expect(Object.keys(config.roles).sort()).toEqual([...ROLE_IDS].sort());
     const architect = getRole("architect", { env });
     expect(architect.modelPolicy).toBe("architect");
-    expect(architect.skills).toEqual(["architect", "how", "why", "blast-radius"]);
+    expect(architect.skills).toEqual(["architecture-design", "how", "why", "blast-radius"]);
     expect(architect.principles).toContain("principle-foundational-thinking");
     expect(architect.instructions).toContain("You own system structure");
     expect(architect.instructionsPath.endsWith(`${path.sep}roles${path.sep}architect.md`)).toBe(true);
@@ -351,7 +351,7 @@ reasoning = "medium"
     );
     const other = tempAgent();
     const untouched = resolveRole("architect", { env: other.env });
-    expect(untouched.skills).toContain("architect");
+    expect(untouched.skills).toContain("architecture-design");
     expect(untouched.modelPolicy.primary).toBeUndefined();
 
     const resolved = resolveRole("architect", { env });

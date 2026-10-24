@@ -36,4 +36,4 @@ Post a DECISION when a boundary is chosen. Post a FINDING when the repository co
 
 ## Skills
 
-Use `architect`, `how`, `why`, and `blast-radius` when they apply. Load `principle-exhaust-the-design-space` only when the shape is novel. Do not paste skill bodies into the answer.
+Use `architecture-design`, `how`, `why`, and `blast-radius` when they apply. Load `principle-exhaust-the-design-space` only when the shape is novel. Do not paste skill bodies into the answer.

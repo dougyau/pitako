@@ -308,7 +308,7 @@ reasoning = "medium"
     const resolved = resolveRole("architect", configured);
     expect(resolved.modelPolicy.primary?.model).toBe("example/primary");
     expect(resolved.modelPolicy.fallbacks.map((target) => target.model)).toEqual(["example/fallback-1", "example/fallback-2"]);
-    expect(skillNamesForRole(resolved)).toContain("architect");
+    expect(skillNamesForRole(resolved)).toContain("architecture-design");
     expect(skillNamesForRole(resolved)).toContain("ponytail");
     expect(skillNamesForRole(resolved)).not.toContain("verify-behavior");
     const prompt = childInstructions(resolved, "architect-abc123");
