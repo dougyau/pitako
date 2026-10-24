@@ -37,6 +37,7 @@
       "./extensions/todo.ts",
       "./extensions/board/index.ts",
       "./extensions/agent/index.ts",
+      "./node_modules/pi-subagents/index.js",
       "./extensions/acp.ts",
       "./node_modules/pi-hermes-memory/src/index.ts",
       "./node_modules/pi-web-access/dist/index.js"
@@ -64,6 +65,7 @@
     "pi-codex-tools": "0.3.0",
     "pi-hermes-memory": "0.9.9",
     "pi-lsp-client": "github:code-yeongyu/pi-lsp-client#1c981dfcacc456fe4ce9f4120a2f0250b54d6844",
+    "pi-subagents": "0.79.2",
     "pi-web-access": "0.42.0",
     "smol-toml": "1.9.0"
   },
@@ -75,6 +77,7 @@
     "pi-codex-tools",
     "billion-context-pi",
     "pi-hermes-memory",
+    "pi-subagents",
     "pi-web-access"
   ],
   "peerDependencies": {

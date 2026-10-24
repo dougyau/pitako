@@ -79,6 +79,20 @@ describe("profiles", () => {
     expect(childActiveTools(available)).not.toContain("execution_disposition");
   });
 
+  test("pi-subagents stays foreground-only across profiles and managed grants", () => {
+    const upstream = ["subagent", "subagents_enable", "bg_wait", "subagent_supervisor", "contact_supervisor", "subagent_future"];
+    for (const name of upstream) expect(isOrchestrationTool(name)).toBe(true);
+    for (const profile of ["coding", "analysis"] as const) {
+      expect(toolsForProfile({ available: [...available, ...upstream], profile })).toEqual(expect.arrayContaining(upstream));
+      for (const managed of [undefined, "leaf", "consultation", "head"] as const) {
+        const tools = toolsForProfile({ available: [...available, ...upstream], profile, child: true, managed });
+        for (const name of upstream) expect(tools).not.toContain(name);
+        expect(tools).toContain("read");
+      }
+    }
+    for (const name of upstream) expect(childActiveTools([...available, ...upstream])).not.toContain(name);
+  });
+
   test("Head local tools require the host grant while a Developer leaf retains only scope acknowledgment", () => {
     const local = ["head_consult", "head_plan", "head_checkpoint", "head_scope_ack"];
     const select = (managed?: "head" | "leaf" | "consultation", profile: "coding" | "analysis" = "coding") =>
@@ -129,8 +143,9 @@ describe("profiles", () => {
     expect(analysis).toContain("edit, write, apply_patch, and lsp_rename are not");
     expect(analysis).toContain("this profile is not a sandbox");
     expect(child).toContain("rpiv-todo is private to this session");
+    expect(child).not.toContain("prefer pi-subagents");
     // Navigation/TODO plus the effective authority and provenance policies.
-    expect(coding.length).toBeLessThan(2400);
+    expect(coding.length).toBeLessThan(3200);
   });
 });
 

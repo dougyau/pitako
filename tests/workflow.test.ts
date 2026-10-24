@@ -48,7 +48,7 @@ function gitRepo(): string {
 }
 
 function planText(status = "frozen", body = "body"): string {
-  return `---\nid: herdr-integration\nrevision: 2\nstatus: ${status}\n---\n\n# Herdr integration\n\n${body}\n`;
+  return `---\nid: native-agent-update\nrevision: 2\nstatus: ${status}\n---\n\n# Native agent update\n\n${body}\n`;
 }
 
 function expectRecoveryPolicy(policy: string): void {
@@ -468,9 +468,9 @@ describe("common workflow authority and journal", () => {
     // Retain the failed owner's lock and diagnostic journal: retirement must not invent release.
     const root = mkdtempSync(path.join(tmpdir(), "pitako-owner-store-failed-"));
     console.info(`Retained failed owner diagnostic: ${root}`);
-    const file = planFile("herdr-integration", root);
+    const file = planFile("native-agent-update", root);
     mkdirSync(path.dirname(file), { recursive: true }); writeFileSync(file, planText());
-    const activity = openExecuteActivity(openExecutionPlan("herdr-integration", root), {}, "owner-failure");
+    const activity = openExecuteActivity(openExecutionPlan("native-agent-update", root), {}, "owner-failure");
     const owner = statusOwner(activity.read), db = openSqliteSync(owner.store.file);
     let notifications = 0;
     const stop = owner.store.subscribe(() => { notifications++; });
@@ -497,7 +497,7 @@ describe("common workflow authority and journal", () => {
       expect(notifications).toBe(0);
       await expect(activity.retire()).rejects.toThrow(/workflow store unavailable/);
       await expect(activity.retire()).rejects.toThrow(/workflow store unavailable/);
-      expect(() => acquireWorkflowOwner(root, "herdr-integration")).toThrow(/no takeover/);
+      expect(() => acquireWorkflowOwner(root, "native-agent-update")).toThrow(/no takeover/);
     } finally {
       stop(); db.close(); owner.guard.close(); owner.store.close();
     }
@@ -505,9 +505,9 @@ describe("common workflow authority and journal", () => {
   test("failed observer release rejects retirement without unlocking the owner", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "pitako-observer-release-failed-"));
     console.info(`Retained failed observer diagnostic: ${root}`);
-    const file = planFile("herdr-integration", root);
+    const file = planFile("native-agent-update", root);
     mkdirSync(path.dirname(file), { recursive: true }); writeFileSync(file, planText());
-    const activity = openExecuteActivity(openExecutionPlan("herdr-integration", root), {}, "observer-failure");
+    const activity = openExecuteActivity(openExecutionPlan("native-agent-update", root), {}, "observer-failure");
     const owner = statusOwner(activity.read), db = openSqliteSync(owner.store.file);
     let timers = 0;
     const subscription = subscribeActivityStatus(activity.read, () => {}, {
@@ -527,7 +527,7 @@ describe("common workflow authority and journal", () => {
       expect(owner.store.all("receipts")).toEqual([]);
       expect(owner.store.all("reservations")).toEqual([]);
       expect(owner.store.all("runs")).toMatchObject([{ state: "interrupted" }]);
-      expect(() => { const unlock = acquireWorkflowOwner(root, "herdr-integration"); unlock(); }).toThrow(/no takeover/);
+      expect(() => { const unlock = acquireWorkflowOwner(root, "native-agent-update"); unlock(); }).toThrow(/no takeover/);
     } finally {
       // No callback remains, but the failed release and owner lock intentionally remain diagnostic.
       await subscription.close().catch(() => {});
@@ -556,9 +556,9 @@ describe("common workflow authority and journal", () => {
   });
   test("only live captured authority admits; late original observations do not reauthorize", async () => {
     const root = tempDir("pitako-workflow-fence-");
-    const file = planFile("herdr-integration", root);
+    const file = planFile("native-agent-update", root);
     mkdirSync(path.dirname(file), { recursive: true }); writeFileSync(file, planText());
-    const plan = openExecutionPlan("herdr-integration", root, { createLedger: true });
+    const plan = openExecutionPlan("native-agent-update", root, { createLedger: true });
     const owner = openExecuteActivity(plan, {}, "controlled");
     const reservation = reserveEffect(owner.context, { reservationId: "old", kind: "writer", paths: [root] });
     const resource = reservation.register("old SDK", ["sdk-session"]); resource.enter();
@@ -579,9 +579,9 @@ describe("common workflow authority and journal", () => {
   });
   test("status and 120s heartbeat are read-only and join accepted callbacks on retirement", async () => {
     const root = tempDir("pitako-workflow-status-");
-    const file = planFile("herdr-integration", root);
+    const file = planFile("native-agent-update", root);
     mkdirSync(path.dirname(file), { recursive: true }); writeFileSync(file, planText());
-    const owner = openExecuteActivity(openExecutionPlan("herdr-integration", root, { createLedger: true }), {}, "status");
+    const owner = openExecuteActivity(openExecutionPlan("native-agent-update", root, { createLedger: true }), {}, "status");
     const journal = new WorkflowState(root);
     const initial = getActivityStatus(owner.read);
     let timer: (() => void) | undefined, clears = 0, entered = 0;
@@ -604,9 +604,9 @@ describe("common workflow authority and journal", () => {
     journal.close();
   });
   test.each(["synchronous", "post-await"])("%s observer self-close acknowledges without releasing its callback", async phase => {
-    const root = tempDir("pitako-status-self-close-"), file = planFile("herdr-integration", root);
+    const root = tempDir("pitako-status-self-close-"), file = planFile("native-agent-update", root);
     mkdirSync(path.dirname(file), { recursive: true }); writeFileSync(file, planText());
-    const owner = openExecuteActivity(openExecutionPlan("herdr-integration", root, { createLedger: true }), {}, "self-close");
+    const owner = openExecuteActivity(openExecutionPlan("native-agent-update", root, { createLedger: true }), {}, "self-close");
     const journal = new WorkflowState(root), proceed = Promise.withResolvers<void>();
     const finish = Promise.withResolvers<void>(), cleanup = Promise.withResolvers<void>();
     let tick = () => {}, cleared = 0, entries = 0, acknowledged: unknown;
@@ -648,9 +648,9 @@ describe("common workflow authority and journal", () => {
     }
   });
   test.each(["synchronous", "post-await"])("%s observer retirement acknowledges request; repeated external retirement joins settlement", async phase => {
-    const root = tempDir("pitako-status-self-retire-"), file = planFile("herdr-integration", root);
+    const root = tempDir("pitako-status-self-retire-"), file = planFile("native-agent-update", root);
     mkdirSync(path.dirname(file), { recursive: true }); writeFileSync(file, planText());
-    const activity = openExecuteActivity(openExecutionPlan("herdr-integration", root), {}, "self-retire");
+    const activity = openExecuteActivity(openExecutionPlan("native-agent-update", root), {}, "self-retire");
     const journal = new WorkflowState(root), proceed = Promise.withResolvers<void>();
     const finish = Promise.withResolvers<void>(), cleanup = Promise.withResolvers<void>();
     let tick = () => {}, cleared = 0, entries = 0, acknowledged: unknown;
@@ -673,13 +673,13 @@ describe("common workflow authority and journal", () => {
       external = activity.retire().then(result => { expect(result).toEqual({ kind: "closed" }); closed++; });
       repeated = activity.retire().then(result => { expect(result).toEqual({ kind: "closed" }); closed++; });
       await Promise.resolve(); expect(closed).toBe(0);
-      expect(() => acquireWorkflowOwner(root, "herdr-integration")).toThrow(/no takeover/);
+      expect(() => acquireWorkflowOwner(root, "native-agent-update")).toThrow(/no takeover/);
       tick(); expect(entries).toBe(1);
       finish.resolve(); await Promise.all([external, repeated]);
       expect(closed).toBe(2);
       expect(journal.all("receipts")).toHaveLength(1);
       expect(journal.all<{ state: string }>("runs")[0]!.state).toBe("retiring");
-      acquireWorkflowOwner(root, "herdr-integration")();
+      acquireWorkflowOwner(root, "native-agent-update")();
       expect(await activity.retire()).toEqual({ kind: "closed" });
       tick(); expect(entries).toBe(1);
     } finally {
@@ -688,9 +688,9 @@ describe("common workflow authority and journal", () => {
     }
   });
   test("repeated external retirement cannot report closure while an accepted observer is held", async () => {
-    const root = tempDir("pitako-status-repeat-retire-"), file = planFile("herdr-integration", root);
+    const root = tempDir("pitako-status-repeat-retire-"), file = planFile("native-agent-update", root);
     mkdirSync(path.dirname(file), { recursive: true }); writeFileSync(file, planText());
-    const activity = openExecuteActivity(openExecutionPlan("herdr-integration", root), {}, "repeat-retire");
+    const activity = openExecuteActivity(openExecutionPlan("native-agent-update", root), {}, "repeat-retire");
     const finish = Promise.withResolvers<void>();
     let tick = () => {}, closed = 0;
     const subscription = subscribeActivityStatus(activity.read, () => finish.promise,
@@ -701,7 +701,7 @@ describe("common workflow authority and journal", () => {
     try {
       await Promise.resolve(); await Promise.resolve();
       expect(closed).toBe(0);
-      expect(() => acquireWorkflowOwner(root, "herdr-integration")).toThrow(/no takeover/);
+      expect(() => acquireWorkflowOwner(root, "native-agent-update")).toThrow(/no takeover/);
       finish.resolve(); await Promise.all([first, second]);
       expect(closed).toBe(2);
     } finally {
@@ -709,9 +709,9 @@ describe("common workflow authority and journal", () => {
     }
   });
   test("reentrant status emissions coalesce to the latest snapshot without overlapping observers", async () => {
-    const root = tempDir("pitako-status-reentrant-"), file = planFile("herdr-integration", root);
+    const root = tempDir("pitako-status-reentrant-"), file = planFile("native-agent-update", root);
     mkdirSync(path.dirname(file), { recursive: true }); writeFileSync(file, planText());
-    const owner = openExecuteActivity(openExecutionPlan("herdr-integration", root, { createLedger: true }), {}, "reentrant");
+    const owner = openExecuteActivity(openExecutionPlan("native-agent-update", root, { createLedger: true }), {}, "reentrant");
     const journal = new WorkflowState(root), finish = Promise.withResolvers<void>();
     const delivered = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
     const sequences: number[][] = [[], []], active = [0, 0], maximum = [0, 0];
@@ -799,7 +799,7 @@ describe("workflow paths", () => {
     mkdirSync(nested);
     const loose = tempDir("pitako-plan-loose-");
     expect(workflowWorkspace(nested)).toBe(workflowWorkspace(repo));
-    expect(planFile("herdr-integration", nested)).toBe(path.join(repo, ".pitako", "plans", "herdr-integration.md"));
+    expect(planFile("native-agent-update", nested)).toBe(path.join(repo, ".pitako", "plans", "native-agent-update.md"));
     expect(workflowWorkspace(loose)).toBe(loose);
     expect(planFile("bounded-fix", loose)).toBe(path.join(loose, ".pitako", "plans", "bounded-fix.md"));
   });
@@ -824,14 +824,14 @@ describe("plan binding", () => {
     const loose = tempDir("pitako-plan-meta-");
     const text = planText();
     const meta = parsePlanDocument(text);
-    expect(meta.id).toBe("herdr-integration");
+    expect(meta.id).toBe("native-agent-update");
     expect(meta.revision).toBe(2);
     expect(meta.status).toBe("frozen");
     expect(meta.hash).toHaveLength(64);
-    const file = planFile("herdr-integration", loose);
+    const file = planFile("native-agent-update", loose);
     mkdirSync(path.dirname(file), { recursive: true });
     writeFileSync(file, text);
-    const read = readPlan("herdr-integration", loose);
+    const read = readPlan("native-agent-update", loose);
     expect(read.meta.revision).toBe(2);
     expect(read.meta.hash).toBe(meta.hash);
     expect(() => requireFrozen(parsePlanDocument(planText("draft")))).toThrow(/not frozen/);
@@ -840,27 +840,27 @@ describe("plan binding", () => {
 
   test("persists an optional validated topic binding only on a draft", () => {
     const loose = tempDir("pitako-plan-topic-");
-    const file = planFile("herdr-integration", loose);
+    const file = planFile("native-agent-update", loose);
     mkdirSync(path.dirname(file), { recursive: true });
     writeFileSync(file, planText("draft"));
     expect(parsePlanDocument(planText("draft")).boardTopicId).toBeUndefined();
     expect(parsePlanDocument(planText("draft")).execution).toBeUndefined();
-    expect(setPlanExecution("herdr-integration", "expected", loose).execution).toBe("expected");
+    expect(setPlanExecution("native-agent-update", "expected", loose).execution).toBe("expected");
     const body = "# execution: body must stay unchanged\n\nbody execution: old value\n";
     writeFileSync(file, planText("draft", body));
-    setPlanExecution("herdr-integration", "none", loose);
+    setPlanExecution("native-agent-update", "none", loose);
     expect(readFileSync(file, "utf8")).toContain(body);
-    const bound = bindPlanTopic("herdr-integration", 27, loose);
+    const bound = bindPlanTopic("native-agent-update", 27, loose);
     expect(bound.boardTopicId).toBe(27);
     expect(readFileSync(file, "utf8")).toContain("board_topic_id: 27");
-    expect(() => bindPlanTopic("herdr-integration", 28, loose)).toThrow(/already bound/);
+    expect(() => bindPlanTopic("native-agent-update", 28, loose)).toThrow(/already bound/);
     expect(() => parsePlanDocument(planText().replace("status: frozen", "status: frozen\nboard_topic_id: 1.5"))).toThrow(/positive safe integer/);
   });
 
   test("detects revision and hash mismatch and does not overwrite an existing ledger", () => {
     const loose = tempDir("pitako-plan-ledger-");
     const meta = parsePlanDocument(planText());
-    const file = ledgerFile("herdr-integration", loose);
+    const file = ledgerFile("native-agent-update", loose);
     expect(initLedger(file, meta)).toBe("created");
     const first = readFileSync(file, "utf8");
     writeFileSync(file, `${first}\n## Rulings\n\nKeep the seam.\n`);

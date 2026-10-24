@@ -2,7 +2,7 @@
 
 Architecture is an in-memory directed table over Team: one substantive Architect director and zero to five optional specialists derived independently from the Architect role. It supplies the existing architectural `$plan` pass when needed; it does not add a pass, grant execution or freeze authority, or change `$execute` policy. Trivial work needs no Architect.
 
-[Reviewer tables](review.md) are the separate route for independent critique, replacing the existing Reviewer pass, not the Architect pass. Public individual Architect and Reviewer calls through `agent_run`, `agent_spawn`, `team_assign` or `agent_supervise` (including `superviseAgent`) reject with the corresponding start tool. Internal roles and ModelPolicies remain available to tables.
+[Reviewer tables](review.md) are the separate route for independent critique, replacing the existing Reviewer pass, not the Architect pass. Public individual Architect and Reviewer calls through `agent_run`, `agent_spawn` or `team_assign` reject with the corresponding start tool. Internal roles and ModelPolicies remain available to tables.
 
 ## Configuration
 

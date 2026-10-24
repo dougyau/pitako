@@ -6,7 +6,6 @@ import {
 import type { createAgentController } from "./controller.ts";
 import { formatUiClock } from "./ui.ts";
 import type { HistoryPage } from "./history-query.ts";
-import type { PaneView } from "../herdr/agents-ui/protocol.ts";
 
 type ControllerView = ReturnType<ReturnType<typeof createAgentController>["openView"]>;
 export type AgentView = Omit<ControllerView,
@@ -14,6 +13,11 @@ export type AgentView = Omit<ControllerView,
   "readRequests" | "readActivity" | "readResult" | "subscribe" | "list" |
   "listArchitectures" | "readArchitecture"> & {
   list(after?: string): Omit<ReturnType<ControllerView["list"]>, "revision">;
+};
+export type AgentScreenView = { [K in keyof AgentView]: (...args: Parameters<AgentView[K]>) =>
+  ReturnType<AgentView[K]> | Promise<Awaited<ReturnType<AgentView[K]>>> } & {
+  connection?(): string;
+  reconnect?(): Promise<void>;
 };
 type Detail = ReturnType<AgentView["detail"]>;
 type List = ReturnType<AgentView["list"]>;
@@ -50,7 +54,7 @@ export class AgentScreen implements Component, Focusable {
   private content: string[] = [];
 
   constructor(
-    private readonly view: PaneView,
+    private readonly view: AgentScreenView,
     private readonly repaint: () => void,
     private readonly close: () => void,
     private readonly rows: () => number,

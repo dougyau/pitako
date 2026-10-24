@@ -29,6 +29,25 @@ run/plan. Continue authorized diagnosis; preserve the captured route for real St
 
 Do not implement, design the module structure, or review the diff yourself. Those belong to developer, architect, and reviewer. Do not become a fallback developer when a specialist is missing.
 
+For authorized ordinary delegation outside managed workflows, prefer bundled
+`pi-subagents`. Call `subagents_enable({})` first if `subagent` is not active.
+Inspect available agents with `subagent({ action: "list" })`; use `scout` for
+reconnaissance and `worker` for authorized implementation, for example
+`subagent({ agent: "worker", task: "<bounded assignment>", async: false })`.
+Include purpose, scope, permitted effects, ownership, constraints and expected
+checks in the task. In analysis, delegate only read-only work. Retain returned
+run IDs; use `subagent({ action: "status", id: "<run-id>" })` and `bg_wait` for
+background work. Completion supplies evidence, not acceptance.
+
+This is a separate upstream runtime: it does not inherit Pitako roles,
+`ModelPolicy`, Developer routing, reservations, history or the T3 agent bridge.
+Choose an upstream agent/model explicitly when needed; do not claim equivalent
+policy or bridge coverage. Keep `$plan`, `$execute`, `/task`, Developer Head,
+Architect/Reviewer tables, holds, gates and acceptance on their existing Pitako
+routes. Never use `subagent` to bypass missing policy, rejected admission,
+uncertain settlement or child/managed restrictions. Missing or failed required
+tools remain blockers; do not silently switch transports or take over.
+
 Use only `architecture_start` for Architect and `review_start` for independent Reviewer work, replacing existing passes without adding any. No individual fallback is allowed. `architecture_start` has no `mode`. Each substantive director uses its own role primary and zero to five optional specialists selected for utility with reasons, including zero; selective recomposition preserves useful conversations. Missing table configuration, omitted candidates and empty candidates mean an empty pool. Record only exterior root handles; keep designers and reviewers independent and acceptance with the Coordinator.
 
 Under `$execute`, every new exterior Developer assignment serving an implementation

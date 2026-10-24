@@ -1,11 +1,11 @@
 export const frameBytes = 64 * 1024;
-export function frame(value, label = "Agent pane") {
+export function frame(value, label = "Agent") {
   const data = JSON.stringify(value) + "\n";
   if (Buffer.byteLength(data) > frameBytes) throw new Error(`${label} frame exceeds 64KiB`);
   return data;
 }
 /** Byte accounting happens before UTF-8 decoding; neither peers nor JSON can allocate an unbounded frame. */
-export function frames(receive, { label = "Agent pane", fatalUtf8 = false } = {}) {
+export function frames(receive, { label = "Agent", fatalUtf8 = false } = {}) {
   let pending = Buffer.alloc(0);
   return chunk => {
     while (chunk.length) {

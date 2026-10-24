@@ -6,7 +6,7 @@ import { activateTarget, createPiExecutor, cursorProviderContext, DEFAULT_THINKI
 import { classifyProviderFailure } from "../extensions/agent/fallback.ts";
 import { executionForSession } from "../extensions/execution-identity.ts";
 import { createConversationOwner, runAgentInstance, teamExecutionSummary } from "../extensions/agent/run.ts";
-import { ORCHESTRATION_TOOLS } from "../extensions/profile.ts";
+import { ORCHESTRATION_TOOLS, PI_SUBAGENTS_TOOLS } from "../extensions/profile.ts";
 import { providerFixtureOwnership } from "./fixtures/provider-fixture-ownership.ts";
 import { controlledModel, controlledPi, controlledRole } from "./fixtures/pi-factories.ts";
 
@@ -57,6 +57,11 @@ test("construction selects offline runtime, role resources and child tools befor
     expect(host.runtimeInputs).toEqual([{ allowModelNetwork: false }]);
     expect(host.sessionInputs[0]).toMatchObject({ excludeTools: [...ORCHESTRATION_TOOLS], cwd: input.cwd });
     expect(host.loaderInputs[0].appendSystemPrompt[0]).toContain(input.instanceId);
+    const upstream = { tools: new Map([["subagent", {}]]), hooks: { session_start() { throw new Error("must not activate"); } } };
+    const own = { tools: new Map([["read", {}]]) };
+    const errors = [{ message: "preserved diagnostic" }];
+    expect(host.loaderInputs[0].extensionsOverride({ extensions: [own, upstream], errors }))
+      .toEqual({ extensions: [own], errors });
     expect(host.loaderInputs[0].skillsOverride({ skills: [{ name: "unexpected" }], diagnostics: [] }).skills).toEqual([]);
     const session = host.sessions[0]!;
     expect(session.prompts.map(text => JSON.parse(text).projection)).toEqual(["exact task"]);
@@ -70,6 +75,33 @@ test("construction selects offline runtime, role resources and child tools befor
     await result.session!.dispose(); await result.session!.dispose();
     expect(session.events).toEqual(["bind", "session_shutdown", "dispose"]);
     expect(executionForSession(session.sessionId)).toBeUndefined();
+  }));
+
+test("ordinary children reject pi-subagents through active tools, hooks and direct definitions",
+  fixture.ownedCase("upstream orchestration boundary", async () => {
+    let calls = 0;
+    const names = [...PI_SUBAGENTS_TOOLS, "subagent_future"];
+    const tools = new Map(names.map(name => [name, { definition: { async execute() { calls++; } } }]));
+    const { host, executor, input } = setup({ inlineExtensions: true,
+      extensions: [{ resolvedPath: "controlled-upstream", tools }],
+      async prompt(session) {
+        for (const name of names) {
+          expect(session.active).not.toContain(name);
+          expect(await tools.get(name)!.definition.execute()).toMatchObject({ isError: true });
+          for (const hook of session.hooks.get("tool_call") ?? [])
+            expect(hook({ toolName: name })).toMatchObject({ block: true });
+        }
+        tools.set("subagent_late", { definition: { async execute() { calls++; } } });
+        for (const hook of session.hooks.get("turn_start") ?? []) await hook();
+        expect(await tools.get("subagent_late")!.definition.execute()).toMatchObject({ isError: true });
+        expect(session.active).not.toContain("subagent_late");
+        session.messages.push({ role: "assistant", content: [{ type: "text", text: "bounded result" }], stopReason: "stop" });
+      },
+    });
+    const result = await fixture.acquire(executor.start(input));
+    expect(result.status).toBe("completed");
+    expect(host.sessionInputs[0].excludeTools).toEqual(expect.arrayContaining([...PI_SUBAGENTS_TOOLS]));
+    expect(calls).toBe(0);
   }));
 
 test("late registration is selected after bind; missing and unsupported targets never prompt; continuation stays on one session",

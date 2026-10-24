@@ -70,6 +70,12 @@
       "tools": ["agent_run"]
     },
     {
+      "id": "pi-subagents",
+      "spec": "pi-subagents@0.79.2",
+      "entry": "node_modules/pi-subagents/index.js",
+      "tools": ["subagent", "subagents_enable", "bg_wait", "subagent_supervisor", "contact_supervisor"]
+    },
+    {
       "id": "billion-context-pi",
       "spec": "billion-context-pi@0.1.83",
       "entry": "extensions/acp.ts",

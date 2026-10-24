@@ -10,7 +10,7 @@ import {
   type AgentSession,
 } from "@earendil-works/pi-coding-agent";
 import { registerExecution, unregisterExecution } from "../execution-identity.ts";
-import { reconcileChildTools, ORCHESTRATION_TOOLS, isOrchestrationTool } from "../profile.ts";
+import { reconcileChildTools, ORCHESTRATION_TOOLS, isOrchestrationTool, isPiSubagentsTool } from "../profile.ts";
 import { packageRoot } from "../stack.ts";
 import { marksSideEffect } from "./effects.ts";
 import { isServiceTierRejection } from "./fallback.ts";
@@ -583,6 +583,7 @@ async function prepareSession(
     additionalExtensionPaths: [packageRoot()],
     extensionFactories: [pi => input.factories.createCodemode({ mode: "on" })(guardToolRegistrations(pi, "read")), pi => {
       pi.on("tool_call", event => {
+        if (isPiSubagentsTool(event.toolName)) return { block: true, reason: "pi-subagents is foreground-only" };
         if ((isConsultation(input.role.id) || input.participant) && (isOrchestrationTool(event.toolName) || input.participant && ["edit", "write", "apply_patch", "lsp_rename"].includes(event.toolName)))
           return { block: true, reason: "Consultative leaves cannot orchestrate Pitako work" };
       });
@@ -605,7 +606,7 @@ async function prepareSession(
           })));
         pi.on("session_start", (_event, ctx) => input.participant!.bind(pi, ctx));
       }
-      pi.on("turn_start", () => { guardConsultationTools(); if (nativeSession) reconcileChildTools(nativeSession); live?.open(); });
+      pi.on("turn_start", () => { guardChildTools(); if (nativeSession) reconcileChildTools(nativeSession); live?.open(); });
       pi.on("agent_before_settle", () => input.head ? undefined : live?.settle());
       pi.on("agent_settled", () => live?.settle());
       pi.on("session_tree", event => live?.handle.publicConversation?.reconcile(event.oldLeafId));
@@ -617,6 +618,10 @@ async function prepareSession(
     appendSystemPrompt: [childInstructions(input.role, input.instanceId), ...(input.participant ? [`Host ${input.participant.protocol} policy: analysis only; no product edits, including through Bash. Use only your local ${input.participant.protocol}_submit grant. Do not dispatch agents or use coordinator tools. Bash remains a trusted tool, not an OS sandbox.`] : []), ...(managed ? [
       "Managed local-source support: use the supported native file tools, known loaded apply_patch, or finite foreground bash within your canonical write reservation. No daemons, detached/remote writers or escaped descendants. Shell scope is cooperative, not confinement. Unsupported writing tools and unowned compositions are refused. Only the host-bound Head requests staging through head_checkpoint; leaves do not stage or commit independently. A checkpoint is local partial source, not acceptance, publication or final verification.",
     ] : [])],
+    // Exclude upstream session/scheduler hooks as well as its model-facing tools.
+    extensionsOverride: (base) => ({ ...base,
+      extensions: base.extensions.filter(extension => ![...extension.tools.keys()].some(isPiSubagentsTool)),
+    }),
     skillsOverride: (base) => ({
       skills: base.skills.filter((skill) => allowed.has(skill.name)),
       diagnostics: base.diagnostics,
@@ -627,18 +632,19 @@ async function prepareSession(
   input.consultant?.check();
   if (input.signal.aborted) throw new Error("Agent session startup cancelled");
   // Codemode can invoke a registered definition without a top-level tool_call event.
-  function guardConsultationTools() {
+  function guardChildTools() {
     if (managed) guardManagedLoadedDefinitions(loader);
-    if (!isConsultation(input.role.id) && !input.participant) return;
     for (const extension of loader.getExtensions().extensions) {
-      for (const [name, tool] of extension.tools) if (isOrchestrationTool(name) || input.participant && ["edit", "write", "apply_patch", "lsp_rename"].includes(name)) {
+      for (const [name, tool] of extension.tools) if (isPiSubagentsTool(name) ||
+          (isConsultation(input.role.id) || input.participant) && isOrchestrationTool(name) ||
+          input.participant && ["edit", "write", "apply_patch", "lsp_rename"].includes(name)) {
         tool.definition = { ...tool.definition, async execute() {
-          return { content: [{ type: "text", text: "Consultative leaves cannot orchestrate Pitako work" }], details: {}, isError: true };
+          return { content: [{ type: "text", text: isPiSubagentsTool(name) ? "pi-subagents is foreground-only" : "Consultative leaves cannot orchestrate Pitako work" }], details: {}, isError: true };
         } };
       }
     }
   }
-  guardConsultationTools();
+  guardChildTools();
   const customTools = managed ? managedTools(loader, managed) : undefined;
   for (const definition of customTools ?? []) supported.add(definition.name);
   const thinkingLevel = model ? thinkingLevelFor(target.reasoning) : undefined;
@@ -722,7 +728,7 @@ async function prepareSession(
     await session.bindExtensions({});
     if (input.head && headBinding) input.head.bindGateReceiptObserver(headBinding, session);
     lifecycle.bound = true;
-    guardConsultationTools();
+    guardChildTools();
     input.scope?.assertStartup();
     input.consultant?.check();
     reconcileChildTools(session);

@@ -1,13 +1,6 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, chmodSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { AgentScreen, compatibilityView, type AgentView } from "../extensions/agent/screen.ts";
-import { readDescriptor } from "../extensions/herdr/agents-ui/descriptor.ts";
-import { createAgentBroker } from "../extensions/herdr/agents-ui/broker.ts";
-import { createAgentController } from "../extensions/agent/controller.ts";
-import type { PaneView } from "../extensions/herdr/agents-ui/protocol.ts";
+import { AgentScreen, compatibilityView, type AgentView, type AgentScreenView } from "../extensions/agent/screen.ts";
 
 describe("shared compatibility screen", () => {
   test("selection, detail/back/close and resize use the same inert component", async () => {
@@ -31,29 +24,6 @@ describe("shared compatibility screen", () => {
     const hostile = new AgentScreen(compatibilityView([{ id: "\x1b]0;title\x07", role: "\x9b31m", state: "idle" }]), () => {}, () => {}, () => 40);
     expect(hostile.render(100).join("\n")).not.toMatch(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/);
     await empty.finish(); await hostile.finish();
-  });
-
-  test("manual, public, malformed and symlink descriptors fail before terminal startup", async () => {
-    const root = mkdtempSync(path.join(tmpdir(), "pitako-pane-descriptor-"));
-    const owner = { sessionId: "descriptor-test", token: Symbol() };
-    const controller = createAgentController(owner, () => owner);
-    const broker = await createAgentBroker(controller, { control: false, rawHistory: false }, root);
-    try {
-      await expect(readDescriptor(undefined)).rejects.toThrow("owning Pi session");
-      const file = broker.descriptorPath;
-      await readDescriptor(file);
-      chmodSync(file, 0o644);
-      await expect(readDescriptor(file)).rejects.toThrow("private");
-      chmodSync(file, 0o600);
-      writeFileSync(file, '{"version":2}');
-      await expect(readDescriptor(file)).rejects.toThrow("Unsupported");
-      const link = path.join(root, "link");
-      symlinkSync(file, link);
-      await expect(readDescriptor(link)).rejects.toThrow();
-    } finally {
-      controller.revoke(); await controller.settle(); await broker.close();
-      rmSync(root, { recursive: true, force: true });
-    }
   });
 });
 
@@ -171,10 +141,10 @@ test("switching and closing during a sensitive read discard stale content and jo
   }
 });
 
-test("asynchronous pane paging resets the selected producer without a competing detail request", async () => {
+test("asynchronous screen paging resets the selected producer without a competing detail request", async () => {
   const base = compatibilityView(), offsets: number[] = [];
   let details = 0, rendered: (() => void) | undefined;
-  const view: PaneView = { ...base,
+  const view: AgentScreenView = { ...base,
     async detail(id) { details++; return base.detail(id); },
     async requests(_id, offset = 0) {
       offsets.push(offset);
@@ -210,10 +180,10 @@ test("mutation uncertainty survives post-error, manual and periodic reads plus e
       let disconnected = false, mutations = 0, reconnects = 0, reads = 0;
       let painted: (() => void) | undefined;
       const base = compatibilityView();
-      const view: PaneView = { ...base,
+      const view: AgentScreenView = { ...base,
         detail(id) {
           reads++;
-          if (disconnected) return Promise.reject(Error("Agent pane is disconnected; explicit reconnect required"));
+          if (disconnected) return Promise.reject(Error("Agent view is disconnected; explicit reconnect required"));
           return { ...base.detail(id), controls: { available: true, selection: { processId: "fixture", epoch: "fixture",
             coordinatorSessionId: "fixture", instanceId: id, generation: 1, historyId: "history", sessionId: "session",
             target: { kind: "background", instanceId: id } } } };
