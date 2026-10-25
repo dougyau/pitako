@@ -14,7 +14,7 @@ import {
 } from "../extensions/catalog.ts";
 import pitako from "../extensions/index.ts";
 import { profileNote } from "../extensions/profile.ts";
-import { packageRoot } from "../extensions/stack.ts";
+import { packageRoot, readStack } from "../extensions/stack.ts";
 import { toolsForProfile } from "../extensions/profile.ts";
 
 function readRepo(relative: string): string {
@@ -22,6 +22,50 @@ function readRepo(relative: string): string {
 }
 
 describe("engineering-layer composition", () => {
+  test("dev-tools public entry registers every group and hooks and runs the shipped sampler", async () => {
+    const manifest = JSON.parse(readRepo("package.json"));
+    const provider = readStack(packageRoot()).required.find(({ id }) => id === "@nredd/pi-dev-tools")!;
+    const entry = `./${provider.entry}`;
+    expect(manifest.pi.extensions.filter((value: string) => value === entry)).toEqual([entry]);
+    const tools: ToolDefinition[] = [];
+    const handlers = new Map<string, (event: any) => any>();
+    const extension = await import(path.join(packageRoot(), entry));
+    extension.default({
+      registerTool(tool: ToolDefinition) { tools.push(tool); },
+      on(event: string, handler: (event: any) => any) { handlers.set(event, handler); },
+    } as unknown as ExtensionAPI);
+    expect(tools.map(tool => tool.name)).toEqual(provider.tools);
+    for (const tool of tools) {
+      expect(tool.outputSchema).toBeDefined();
+      expect(typeof tool.execute).toBe("function");
+    }
+    expect([...handlers.keys()]).toEqual(["tool_call", "before_agent_start"]);
+    expect(handlers.get("tool_call")!({ toolName: "bash", input: { command: "git commit -n" } }))
+      .toMatchObject({ block: true });
+    expect(handlers.get("tool_call")!({ toolName: "bash", input: { command: "git status" } })).toBeUndefined();
+    expect(handlers.get("before_agent_start")!({ systemPrompt: "base" }).systemPrompt)
+      .toContain("base\n\nBefore knowingly starting a large test or compile");
+
+    // No sampler override: exercise the published runtime dependency through the public provider.
+    // Assert the Pitako composition contract, not host-specific availability or process inventory.
+    const observer = tools.find(tool => tool.name === "resource_snapshot")!;
+    const result = await observer.execute("resource", { process_limit: 1, interval_ms: 100 }, undefined, undefined,
+      { cwd: packageRoot() } as ExtensionToolContext);
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      platform: process.platform,
+      interval: { requestedMs: 100 },
+      memory: { status: "available" },
+    });
+    expect(result.content[0]).toMatchObject({ type: "text" });
+
+    const cancellation = new AbortController(), reason = new Error("owned sampler cancellation");
+    cancellation.abort(reason);
+    // The provider awaits sampler disposal before this rejection settles.
+    await expect(observer.execute("cancelled-resource", {}, cancellation.signal, undefined,
+      { cwd: packageRoot() } as ExtensionToolContext)).rejects.toBe(reason);
+  });
+
   test("TODO composition delegates upstream execution and keeps native model-only exposure", async () => {
     const upstream = { content: [], details: { tasks: [], nextId: 1 } };
     const execute = mock(async (..._args: unknown[]) => {

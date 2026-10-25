@@ -8,6 +8,8 @@ Pitako composes Pi packages and vendors selected MIT skills. It does not ship BS
 | --- | --- | --- |
 | [@dietrichgebert/ponytail](https://github.com/DietrichGebert/ponytail) 4.10.0 (`e3ba2aa`) | MIT | Skills `ponytail` and `ponytail-review`. The Pi extension is installed but not loaded. |
 | [@juicesharp/rpiv-todo](https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-todo) 2.11.0 | MIT | Session-local `todo` tool, `/todos`, overlay, and branch replay. `@juicesharp/rpiv-i18n` stays optional. |
+| [@nredd/pi-dev-tools](https://github.com/nredd/pi-harness/tree/main/packages/dev-tools) 0.6.0 (Redd) | MIT | Full Git, SSH, Python, Cargo and resource provider, including its hooks. Bundled unchanged through `src/index.ts`. |
+| [@nredd/pi-resource-sampler](https://github.com/nredd/pi-harness/tree/main/packages/resource-sampler) 0.1.1 (Redd) | MIT | Runtime resource sampler for pi-dev-tools. Bundled unchanged. |
 | [pi-web-access](https://github.com/nicobailon/pi-web-access) 0.42.0 (Nico Bailon) | MIT | Web search, page extraction, and source checking. Bundled into the Pitako package tarball. |
 | [pi-hermes-memory](https://github.com/chandra447/pi-hermes-memory) 0.9.9 (Chandra Teja) | MIT | Persistent memory and conversation search. Bundled unchanged, independent of the Board. |
 | [pi-subagents](https://github.com/nicobailon/pi-subagents) 0.82.0 (Nico Bailon) | MIT | Native delegation, scripted workflows and missions through the published extension. Bundled unchanged with its LICENSE; Pitako's former managed runtime stays retired. |
@@ -20,6 +22,10 @@ Pitako composes Pi packages and vendors selected MIT skills. It does not ship BS
 | [Pi](https://github.com/earendil-works/pi) | MIT | Host |
 
 License text for pi-hermes-memory: `docs/licenses/pi-hermes-memory-LICENSE`. License texts for pi-web-access: `docs/licenses/pi-web-access-LICENSE`. For Ponytail, see `docs/licenses/ponytail-LICENSE` and the package's own `LICENSE` after install. For pi-codex-tools, see `docs/licenses/pi-codex-tools-LICENSE` and `docs/licenses/pi-codex-tools-NOTICE`.
+
+License texts for dev-tools and its sampler: `docs/licenses/pi-dev-tools-LICENSE`
+and `docs/licenses/pi-resource-sampler-LICENSE`. Both bundled packages retain
+their upstream `LICENSE`; neither publishes a separate NOTICE.
 
 `agents/reviewer.md` and `agents/worker.md` adapt pi-subagents 0.82.0
 `agents/reviewer.md` and `agents/worker.md`; its MIT license is

@@ -51,6 +51,29 @@ describe("stack configuration", () => {
     expect(manifest.bundledDependencies).not.toContain("@ast-grep/napi");
     expect(manifest.dependencies["@dietrichgebert/ponytail"]).toBe("4.10.0");
     expect(manifest.dependencies["@juicesharp/rpiv-todo"]).toBe("2.11.0");
+    expect(manifest.dependencies["@nredd/pi-dev-tools"]).toBe("0.6.0");
+    expect(manifest.dependencies["@nredd/pi-resource-sampler"]).toBe("0.1.1");
+    for (const name of ["@nredd/pi-dev-tools", "@nredd/pi-resource-sampler"]) {
+      expect(manifest.bundledDependencies).toContain(name);
+      const installed = JSON.parse(readFileSync(path.join(root, "node_modules", name, "package.json"), "utf8"));
+      expect(installed.version).toBe(manifest.dependencies[name]);
+      expect(readFileSync(path.join(root, "node_modules", name, "LICENSE"), "utf8"))
+        .toBe(readFileSync(path.join(root, "docs/licenses", `${name.split("/")[1]}-LICENSE`), "utf8"));
+    }
+    const devTools = JSON.parse(readFileSync(path.join(root, "node_modules/@nredd/pi-dev-tools/package.json"), "utf8"));
+    expect(devTools.dependencies["@nredd/pi-resource-sampler"]).toBe("0.1.1");
+    expect(stack.required.find(({ id }) => id === "@nredd/pi-dev-tools")).toEqual({
+      id: "@nredd/pi-dev-tools", spec: "@nredd/pi-dev-tools@0.6.0",
+      entry: "node_modules/@nredd/pi-dev-tools/src/index.ts",
+      tools: [
+        "git_worktree_list", "git_worktree_add", "git_worktree_remove", "git_worktree_prune",
+        "git_status", "git_diff", "git_log", "git_show", "git_commit",
+        "ssh_exec", "ssh_pull", "ssh_push",
+        "py_lint", "py_format", "py_typecheck", "py_test", "py_uv",
+        "cargo_check", "cargo_clippy", "cargo_fmt", "cargo_test", "cargo_build",
+        "cargo_run", "cargo_doc", "cargo_bench", "cargo_add", "resource_snapshot",
+      ],
+    });
     expect(stack.required.find(({ id }) => id === "@juicesharp/rpiv-todo")).toEqual({
       id: "@juicesharp/rpiv-todo", spec: "@juicesharp/rpiv-todo@2.11.0",
       entry: "extensions/todo.ts", tools: ["todo"],

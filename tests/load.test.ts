@@ -4,9 +4,10 @@ import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import devTools from "../node_modules/@nredd/pi-dev-tools/src/index.ts";
 import pitako from "../extensions/index.ts";
 import profilePolicy from "../extensions/profile-policy.ts";
-import { packageRoot } from "../extensions/stack.ts";
+import { packageRoot, readStack } from "../extensions/stack.ts";
 import { toolsForProfile } from "../extensions/profile.ts";
 
 const configDirs: string[] = [];
@@ -21,6 +22,29 @@ afterEach(async () => {
   for (const dir of configDirs) rmSync(dir, { recursive: true, force: true });
   configDirs.length = 0;
 });
+
+function loadProfileExtensions(pi: ExtensionAPI, codex: (pi: ExtensionAPI) => void, writes: string[] = []) {
+  const factories = new Map<string, (pi: ExtensionAPI) => void>([
+    ["./extensions/index.ts", pitako],
+    ["./node_modules/pi-codex-tools/index.ts", codex],
+    ["./extensions/profile-policy.ts", profilePolicy],
+    ["./node_modules/@nredd/pi-dev-tools/src/index.ts", devTools],
+  ]);
+  // These providers are outside this profile fixture's controlled boundary.
+  const excluded = new Set([
+    "./node_modules/pi-lsp-client/src/index.ts",
+    "./node_modules/@vndv/pi-codegraph/extensions/codegraph.ts",
+    "./extensions/todo.ts", "./extensions/board/index.ts",
+    "./node_modules/pi-subagents/bundle/index.js", "./extensions/acp.ts",
+    "./node_modules/pi-hermes-memory/src/index.ts", "./node_modules/pi-web-access/dist/index.js",
+  ]);
+  for (const entry of JSON.parse(readFileSync(path.join(packageRoot(), "package.json"), "utf8")).pi.extensions) {
+    if (excluded.has(entry)) continue;
+    const factory = factories.get(entry);
+    if (!factory) throw new Error(`Profile fixture has no factory for ${entry}`);
+    factory({ ...pi, setActiveTools(names) { writes.push(entry); pi.setActiveTools(names); } });
+  }
+}
 
 function profileHarness(profileFlag?: string, external?: () => Promise<void>) {
   const writes: string[] = [];
@@ -44,11 +68,20 @@ function profileHarness(profileFlag?: string, external?: () => Promise<void>) {
   };
   const pi = {
     registerFlag() {},
-    registerTool(tool: { name: string }) { registeredTools.push(tool.name); },
+    registerTool(tool: { name: string }) {
+      registeredTools.push(tool.name);
+      if (!available.includes(tool.name)) available.push(tool.name);
+    },
     getFlag() { return profileFlag; },
     on(event: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) {
       const previous = handlers.get(event);
-      handlers.set(event, async (event, ctx) => { await previous?.(event, ctx); return handler(event, ctx); });
+      handlers.set(event, async (input, ctx) => {
+        const result = await previous?.(input, ctx) as { systemPrompt?: string; block?: boolean } | undefined;
+        if (result?.block) return result;
+        const next = event === "before_agent_start" && result?.systemPrompt !== undefined
+          ? { ...input as object, systemPrompt: result.systemPrompt } : input;
+        return await handler(next, ctx) ?? result;
+      });
     },
     registerCommand(name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) {
       registeredCommands.push(name);
@@ -60,19 +93,13 @@ function profileHarness(profileFlag?: string, external?: () => Promise<void>) {
     getSessionName() { return undefined; },
     setSessionName() {},
   };
-  const factories = new Map<string, (pi: ExtensionAPI) => void>([
-    ["./extensions/index.ts", pitako],
-    ["./node_modules/pi-codex-tools/index.ts", api => {
-      // Controlled external synchronization deliberately enables mutators.
-      api.registerTool({ name: "apply_patch", parameters: {} } as never);
-      const synchronize = async () => { await external?.(); api.setActiveTools([...available]); };
-      api.on("session_start", synchronize);
-      api.on("model_select", synchronize);
-    }],
-    ["./extensions/profile-policy.ts", profilePolicy],
-  ]);
-  for (const entry of JSON.parse(readFileSync(path.join(packageRoot(), "package.json"), "utf8")).pi.extensions)
-    factories.get(entry)?.({ ...pi, setActiveTools(names: string[]) { writes.push(entry); pi.setActiveTools(names); } } as unknown as ExtensionAPI);
+  loadProfileExtensions(pi as unknown as ExtensionAPI, api => {
+    // Controlled external synchronization deliberately enables mutators.
+    api.registerTool({ name: "apply_patch", parameters: {} } as never);
+    const synchronize = async () => { await external?.(); api.setActiveTools([...available]); };
+    api.on("session_start", synchronize);
+    api.on("model_select", synchronize);
+  }, writes);
   shutdowns.push(async () => { await handlers.get("session_shutdown")?.({}, context); });
   return {
     active, available, writes, registeredTools, registeredCommands,
@@ -104,11 +131,14 @@ function profileHarness(profileFlag?: string, external?: () => Promise<void>) {
 }
 
 describe("Pitako resources and policy", () => {
-  test("foreground registers only the ordinary command and no managed tools", async () => {
+  test("foreground loads the full dev-tools public entry alongside ordinary policy", async () => {
     const host = profileHarness("coding");
     try {
       await host.start();
-      expect(host.registeredTools).toEqual(["apply_patch"]);
+      const provider = readStack(packageRoot()).required.find(({ id }) => id === "@nredd/pi-dev-tools");
+      expect(provider).toBeDefined();
+      expect(host.registeredTools).toEqual(["apply_patch", ...provider!.tools]);
+      for (const name of provider!.tools) expect(host.active).toContain(name);
       expect(host.registeredCommands).toEqual(["pitako"]);
       await expect(host.command("agents")).rejects.toThrow("Usage: /pitako");
     } finally { await host.shutdown(); }
@@ -125,7 +155,10 @@ describe("Pitako resources and policy", () => {
           "skills initiate their pi-subagents workflows", "Analysis delegates must be read-only"])
           expect(prompt).toContain(text);
         for (const text of ["AgentInstance", "ModelPolicy", "Developer Head"]) expect(prompt).not.toContain(text);
-        expect(await host.composePrompt(prompt)).toBe(prompt);
+        const repeated = await host.composePrompt(prompt);
+        // Pitako's own note is idempotent; the upstream resource hook appends per invocation.
+        expect(repeated.split("Pitako profile:").length).toBe(prompt.split("Pitako profile:").length);
+        expect(repeated).toContain("Use resource_snapshot when available");
       }
     } finally { await host.shutdown(); }
   });
@@ -224,19 +257,13 @@ describe("Pitako resources and policy", () => {
         },
         setSessionName() {},
       };
-      const factories = new Map<string, (pi: ExtensionAPI) => void>([
-          ["./extensions/index.ts", pitako],
-          ["./node_modules/pi-codex-tools/index.ts", api => {
-            // Controlled external synchronization deliberately enables mutators.
-            api.registerTool({ name: "apply_patch", parameters: {} } as never);
-            const synchronize = () => api.setActiveTools([...available]);
-            api.on("session_start", synchronize);
-            api.on("model_select", synchronize);
-          }],
-          ["./extensions/profile-policy.ts", profilePolicy],
-        ]);
-        for (const entry of JSON.parse(readFileSync(path.join(packageRoot(), "package.json"), "utf8")).pi.extensions)
-          factories.get(entry)?.(pi as unknown as ExtensionAPI);
+      loadProfileExtensions(pi as unknown as ExtensionAPI, api => {
+        // Controlled external synchronization deliberately enables mutators.
+        api.registerTool({ name: "apply_patch", parameters: {} } as never);
+        const synchronize = () => api.setActiveTools([...available]);
+        api.on("session_start", synchronize);
+        api.on("model_select", synchronize);
+      });
       const start = handlers.get("session_start");
       if (!start) throw new Error("session_start was not registered");
       const ctx = { cwd: packageRoot(), hasUI: false, ui: { notify() {}, setStatus() {} },
