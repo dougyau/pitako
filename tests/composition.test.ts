@@ -22,6 +22,46 @@ function readRepo(relative: string): string {
 }
 
 describe("engineering-layer composition", () => {
+  test("all nine profiles pass the native parser and required-tool plan with explicit ACP and role ceilings", async () => {
+    const parser = await import("../node_modules/pi-subagents/src/agents/frontmatter.js");
+    const { resolvePiLaunchToolPlan } = await import("../node_modules/pi-subagents/src/runs/shared/child-tool-plan.js");
+    const acpTools = ["compress", "decompress", "search_context", "acp_status", "acp_cache"];
+    const queries = ["git_worktree_list", "git_status", "git_diff", "git_log", "git_show", "resource_snapshot", "file_sha256", "codemode"];
+    const provider = readStack(packageRoot()).required.find(({ id }) => id === "@nredd/pi-dev-tools")!;
+    for (const role of ["architect", "reviewer", "scout", "researcher", "evidence-auditor", "execution-inspector", "worker", "execution-director", "interview-relay"]) {
+      const { frontmatter, body } = parser.parseFrontmatter(readRepo(`agents/${role}.md`));
+      const resolve = (raw?: string) => parser.parseFrontmatterList(raw)?.map(entry => path.resolve(packageRoot(), "agents", entry));
+      const plan = resolvePiLaunchToolPlan({
+        cwd: packageRoot(), agentName: `pitako.${role}`, fast: false,
+        tools: parser.parseFrontmatterList(frontmatter.tools),
+        extensions: resolve(frontmatter.extensions),
+        subagentOnlyExtensions: resolve(frontmatter.subagentOnlyExtensions),
+      });
+      expect(plan.disableAmbientExtensions).toBe(true);
+      expect(plan.extensionArgs).toContain(path.join(packageRoot(), "extensions/acp.ts"));
+      for (const tool of acpTools) expect(plan.requiredChildTools).toContain(tool);
+      expect(body).toContain("billion-context-pi");
+      expect(body).toContain("unmet prerequisite");
+      expect(body).toContain("native-compaction stand-down");
+      expect(plan.fanoutAuthorized).toBe(role === "execution-director");
+      if (role === "interview-relay") {
+        expect(plan.effectiveToolAllowlist).toEqual(["contact_supervisor", ...acpTools]);
+        expect(plan.configuredExtensions).toEqual([path.join(packageRoot(), "extensions/acp.ts")]);
+        continue;
+      }
+      for (const tool of queries) expect(plan.requiredChildTools).toContain(tool);
+      expect(plan.extensionArgs).toContain(path.join(packageRoot(), provider.entry));
+      expect(plan.extensionArgs).toContain(path.join(packageRoot(), "extensions/file-sha256.ts"));
+      if (role === "worker") {
+        for (const tool of [...provider.tools, "file_sha256_save"]) expect(plan.requiredChildTools).toContain(tool);
+        for (const tool of ["subagent", "bg_wait", "subagent_supervisor"]) expect(plan.requiredChildTools).not.toContain(tool);
+      } else {
+        for (const tool of provider.tools.filter(tool => !queries.includes(tool))) expect(plan.effectiveToolAllowlist).not.toContain(tool);
+        expect(plan.requiredChildTools).not.toContain("file_sha256_save");
+      }
+    }
+  });
+
   test("dev-tools public entry registers every group and hooks and runs the shipped sampler", async () => {
     const manifest = JSON.parse(readRepo("package.json"));
     const provider = readStack(packageRoot()).required.find(({ id }) => id === "@nredd/pi-dev-tools")!;
@@ -179,19 +219,22 @@ describe("engineering-layer composition", () => {
     // The agent adapter's scalar/list parser differs from Pi's YAML parser.
     const agentParser = await import(path.join(packageRoot(), "node_modules/pi-subagents/src/agents/frontmatter.js"));
     const nativeProfile = agentParser.parseFrontmatter(source).frontmatter;
-    expect(agentParser.parseFrontmatterList(nativeProfile.extensions)).toEqual([]);
+    expect(agentParser.parseFrontmatterList(nativeProfile.extensions)).toEqual(["../extensions/acp.ts"]);
     expect(`${profile.package}.${profile.name}`).toBe("pitako.architect");
     expect(profile).toMatchObject({
       acceptanceRole: "read-only", defaultContext: "fresh", systemPromptMode: "replace",
       inheritProjectContext: true, inheritGlobalContext: false, inheritSkills: false,
     });
     expect(profile.tools).toEqual([
+      "compress", "decompress", "search_context", "acp_status", "acp_cache",
+      "git_worktree_list", "git_status", "git_diff", "git_log", "git_show", "resource_snapshot", "file_sha256", "codemode",
       "read", "grep", "find", "ls",
       "codegraph_search", "codegraph_callers", "codegraph_callees", "codegraph_impact",
       "codegraph_explore", "codegraph_node", "codegraph_status", "codegraph_files",
       "lsp_diagnostics", "lsp_goto_definition", "lsp_find_references", "lsp_symbols",
     ]);
     const providers = [
+      "../node_modules/@nredd/pi-dev-tools/src/index.ts", "../extensions/file-sha256.ts",
       "../node_modules/@vndv/pi-codegraph/extensions/codegraph.ts",
       "../node_modules/pi-lsp-client/src/index.ts",
     ];
@@ -249,7 +292,8 @@ describe("engineering-layer composition", () => {
     if (!Array.isArray(architect.tools) || !Array.isArray(architect.subagentOnlyExtensions) ||
       !Array.isArray(profile.subagentOnlyExtensions) ||
       !Array.isArray(profile.skillPath)) throw new Error("Expected profile resource lists");
-    expect(profile.tools).toEqual([...architect.tools.slice(0, 4), "watchdog_diff", ...architect.tools.slice(4)]);
+    const navigationStart = architect.tools.indexOf("codegraph_search");
+    expect(profile.tools).toEqual([...architect.tools.slice(0, navigationStart), "watchdog_diff", ...architect.tools.slice(navigationStart)]);
     expect(profile.subagentOnlyExtensions).toEqual(architect.subagentOnlyExtensions);
     for (const provider of profile.subagentOnlyExtensions)
       expect(readRepo(path.join("agents", provider)).length).toBeGreaterThan(0);

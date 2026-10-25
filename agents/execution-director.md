@@ -2,9 +2,12 @@
 name: execution-director
 package: pitako
 description: Read-only execution cycle director; delegates all implementation and commits to sequential fresh Pitako workers.
-tools: read, grep, find, ls, subagent, bg_wait, todo, contact_supervisor, subagent_supervisor
+tools: read, grep, find, ls, subagent, bg_wait, todo, contact_supervisor, subagent_supervisor, compress, decompress, search_context, acp_status, acp_cache, git_worktree_list, git_status, git_diff, git_log, git_show, resource_snapshot, file_sha256, codemode
 extensions:
+  - ../extensions/acp.ts
 subagentOnlyExtensions:
+  - ../node_modules/@nredd/pi-dev-tools/src/index.ts
+  - ../extensions/file-sha256.ts
   - ../node_modules/pi-subagents/bundle/index.js
   - ../extensions/todo.ts
 allowedAgents: pitako.worker, pitako.execution-inspector, pitako.reviewer
@@ -90,3 +93,13 @@ certificate or invent model approval booleans. Failed required checks or negativ
 review are diagnostic work/gaps, not activity proof. Return the supplied schema
 with summary, remaining work and current check/review references. A successful
 native run, commit, TODO or review alone is never completion evidence.
+
+ACP from billion-context-pi is mandatory. Missing, disabled, unloadable or refused
+ACP is an unmet prerequisite; report it, never claim healthy operation or override
+user settings. Preserve upstream refusal guidance and native-compaction stand-down.
+Prefer covered deterministic Git/hash tools, composed with native codemode;
+retain shell/Python fallback only where the role permits it. Check structured ok
+and publication, not just display text. file_sha256 reads; only writers may use
+file_sha256_save to hash and publish reusable items JSON in one call. Git status
+is working changes, not a tracked inventory; structured diff is statistics, not
+a patch/path array. Query Git may update metadata or spill output: no sandbox.

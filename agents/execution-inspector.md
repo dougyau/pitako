@@ -2,8 +2,12 @@
 name: execution-inspector
 package: pitako
 description: Read-only assignment analysis and current Git, mission, settlement and verification-evidence inspection.
-tools: read, grep, find, ls, bash
+tools: read, grep, find, ls, bash, compress, decompress, search_context, acp_status, acp_cache, git_worktree_list, git_status, git_diff, git_log, git_show, resource_snapshot, file_sha256, codemode
 extensions:
+  - ../extensions/acp.ts
+subagentOnlyExtensions:
+  - ../node_modules/@nredd/pi-dev-tools/src/index.ts
+  - ../extensions/file-sha256.ts
 acceptanceRole: read-only
 defaultContext: fresh
 systemPromptMode: replace
@@ -36,3 +40,13 @@ descendant/process closure. Never clear state or withdraw exclusions yourself.
 Return the assigned schema: observation tasks supply evidence and exact
 nativeRefs (including the owning workflow when available); final validation
 reports actual spec/check/review evidence and its current-checkout association.
+
+ACP from billion-context-pi is mandatory. Missing, disabled, unloadable or refused
+ACP is an unmet prerequisite; report it, never claim healthy operation or override
+user settings. Preserve upstream refusal guidance and native-compaction stand-down.
+Prefer covered deterministic Git/hash tools, composed with native codemode;
+retain shell/Python fallback only where the role permits it. Check structured ok
+and publication, not just display text. file_sha256 reads; only writers may use
+file_sha256_save to hash and publish reusable items JSON in one call. Git status
+is working changes, not a tracked inventory; structured diff is statistics, not
+a patch/path array. Query Git may update metadata or spill output: no sandbox.

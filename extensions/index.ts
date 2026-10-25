@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { skillStatusLines } from "./catalog.ts";
 import planExecute from "./plan-execute.ts";
 import { isProtectedEditPath } from "./paths.ts";
-import { applyProfile, effectiveProfile, parseProfile, profileNote, requestedProfile, setSessionProfile } from "./profile.ts";
+import { applyProfile, MUTATING_TOOLS, effectiveProfile, parseProfile, profileNote, requestedProfile, setSessionProfile } from "./profile.ts";
 import { sessionNameAction } from "./session-name.ts";
 import { packageRoot, prepareRuntime } from "./stack.ts";
 
@@ -63,7 +63,7 @@ export default function pitako(pi: ExtensionAPI): void {
       const lines = [
         `Pitako profile: ${effectiveProfile(ctx.sessionManager)}`,
         "coding: navigation and editing; apply_patch for grammar-capable OpenAI models, otherwise edit/write.",
-        "analysis: navigation without edit, write, apply_patch, or lsp_rename. Shell is not sandboxed.",
+        "analysis: navigation and hashing; editing, saving and introduced mutators blocked, including nested calls. Shell is not sandboxed.",
         "Switch with /pitako profile analysis",
         "Session TODOs: todo and /todos. Shared knowledge: board_* and /board.",
         "Delegation: pi-subagents. Architecture, review, plan and execute skills start their workflows.",
@@ -74,6 +74,11 @@ export default function pitako(pi: ExtensionAPI): void {
   });
 
   pi.on("tool_call", (event, ctx) => {
+    // Inactive codemode/deferred registrations remain callable in Pi. Enforce at
+    // the shared tool-call pipeline as well as the advertised profile loadout.
+    if (effectiveProfile(ctx.sessionManager) === "analysis" && MUTATING_TOOLS.has(event.toolName)) {
+      return { block: true, reason: `Pitako analysis forbids ${event.toolName}.` };
+    }
     if (event.toolName !== "edit" && event.toolName !== "write") return;
     const target = (event.input as { path?: unknown }).path;
     if (typeof target !== "string" || !isProtectedEditPath(target)) return;

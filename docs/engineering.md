@@ -21,15 +21,37 @@ ACP loads before Hermes. Web access and pi-subagents are direct upstream entries
 ACP keeps Pitako defaults `delegate:false`, `autoUpdate:false`, and
 `toolBashDefaultTimeout:0`. Explicit global and project ACP files retain upstream
 precedence. No managed workflow guards wrap ACP, TODO, or Board.
+All nine packaged profiles explicitly load this `billion-context-pi` adapter and
+require its five context tools. Native child required-tool diagnostics report
+missing registration. Registration alone does not establish operational
+compression after a refusal; disabled, unloadable or refused ACP is an unmet
+prerequisite. Preserve upstream refusal and native-compaction stand-down rather
+than overriding settings.
+
+The complete `@nredd/pi-dev-tools` public entry supplies Git, SSH, Python, Cargo
+and resource tools and hooks, with its shipped sampler dependency. Prefer covered
+deterministic operations, composed through native codemode; keep bash/Python
+fallback for uncovered cases. Git queries are not sandboxed: metadata or spilled
+output may be written. `git_status` is working changes, not tracked inventory;
+structured `git_diff` is statistics, not a patch/path array.
+`file_sha256` is read-only; writer-only `file_sha256_save` hashes and atomically
+publishes reusable items JSON in one call. Both share a validation/hash core,
+independent of spec-plan inspection. Check structured `ok` and `publication`;
+codemode can return structured failures without throwing.
 
 ## Profiles and authority
 
 `extensions/profile.ts` owns ordinary session profile selection, not worker
 identity. It selects upstream patch tools by model capability and leaves raw
-navigation available. Analysis removes known editing tools but retains shell.
+navigation available. Analysis removes known editing tools and introduced
+mutators (including locally writing `ssh_pull`, Python/Cargo execution effects
+and hash saving) and blocks them at the tool-call boundary, including codemode.
+It retains shell, so this is not a sandbox. Child strict allowlists retain
+hash queries for read-only roles, saving/full tools for workers, director-only
+delegation and the narrow interview relay.
 
 `extensions/index.ts` registers only `/pitako`, profile guidance, automatic
-ordinary session naming, and edit/write protected-path guards. Startup does not
+ordinary session naming, profile mutation and edit/write protected-path guards. Startup does not
 load role policies, complete legacy configuration, create leases, start a
 bridge, reconcile executions, or prune histories.
 

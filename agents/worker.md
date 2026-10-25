@@ -11,9 +11,12 @@ thinking: high
 systemPromptMode: replace
 inheritProjectContext: true
 inheritSkills: false
-tools: read, grep, find, ls, bash, edit, write, contact_supervisor, apply_patch, codegraph_search, codegraph_callers, codegraph_callees, codegraph_impact, codegraph_explore, codegraph_node, codegraph_status, codegraph_files, lsp_diagnostics, lsp_goto_definition, lsp_find_references, lsp_symbols, lsp_prepare_rename, lsp_rename
+tools: read, grep, find, ls, bash, edit, write, contact_supervisor, apply_patch, codegraph_search, codegraph_callers, codegraph_callees, codegraph_impact, codegraph_explore, codegraph_node, codegraph_status, codegraph_files, lsp_diagnostics, lsp_goto_definition, lsp_find_references, lsp_symbols, lsp_prepare_rename, lsp_rename, compress, decompress, search_context, acp_status, acp_cache, git_worktree_list, git_worktree_add, git_worktree_remove, git_worktree_prune, git_status, git_diff, git_log, git_show, git_commit, ssh_exec, ssh_pull, ssh_push, py_lint, py_format, py_typecheck, py_test, py_uv, cargo_check, cargo_clippy, cargo_fmt, cargo_test, cargo_build, cargo_run, cargo_doc, cargo_bench, cargo_add, resource_snapshot, file_sha256, file_sha256_save, codemode
 extensions:
+  - ../extensions/acp.ts
 subagentOnlyExtensions:
+  - ../node_modules/@nredd/pi-dev-tools/src/index.ts
+  - ../extensions/file-sha256.ts
   - ../node_modules/@vndv/pi-codegraph/extensions/codegraph.ts
   - ../node_modules/pi-lsp-client/src/index.ts
   - ../node_modules/pi-codex-tools/index.ts
@@ -76,3 +79,14 @@ actual error/test and trace causality before choosing repair, focused analysis,
 fixture/stability simplification or justified test retirement. Preserve required
 spec guarantees and recommend out-of-scope edits instead of making them. Do not
 hide flakes with green retries or fix timeouts by inflating deadlines.
+
+ACP from billion-context-pi is mandatory. Missing, disabled, unloadable or refused
+ACP is an unmet prerequisite; report it, never claim healthy operation or override
+user settings. Preserve upstream refusal guidance and native-compaction stand-down.
+Prefer covered deterministic Git/hash tools, composed with native codemode;
+retain shell/Python fallback only where the role permits it. Check structured ok
+and publication, not just display text. file_sha256 reads; only writers may use
+file_sha256_save to hash and publish reusable items JSON in one call. Git status
+is working changes, not a tracked inventory; structured diff is statistics, not
+a patch/path array. Query Git may update metadata or spill output: no sandbox.
+git_commit pushes by default: set push:false unless publication is authorized.

@@ -133,6 +133,44 @@ function profileHarness(profileFlag?: string, external?: () => Promise<void>) {
 }
 
 describe("Pitako resources and policy", () => {
+  test.each(["reader", "worker", "disabled", "unloadable", "foreground"])(
+    "isolated native child lifecycle and actual call boundary: %s", async mode => {
+      const owned = configDirectory("pitako-profile-acp-");
+      const cwd = path.join(owned, "worktree"), home = path.join(owned, "home");
+      mkdirSync(cwd); mkdirSync(home);
+      const env = {
+        PATH: process.env.PATH!, HOME: home, PI_CODING_AGENT_DIR: path.join(home, ".pi/agent"),
+        GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null",
+        ...(mode === "foreground" ? { PITAKO_PROFILE: "analysis" } : {}),
+      };
+      const init = spawnSync("git", ["init", "--quiet"], { cwd, env, encoding: "utf8" });
+      expect(init.error).toBeUndefined(); expect(init.status).toBe(0);
+      const child = Bun.spawn([process.execPath, path.join(packageRoot(), "tests/fixtures/profile-acp-child.ts"), mode], {
+        cwd, env, stdout: "pipe", stderr: "pipe",
+      });
+      shutdowns.push(async () => {
+        if (child.exitCode === null) child.kill("SIGTERM");
+        await child.exited;
+      });
+      let output = "", stderr = "", exit: number;
+      try {
+        [output, stderr, exit] = await Promise.all([
+          new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
+        ]);
+      } finally { await child.exited; }
+      expect({ exit, stderr, output }).toMatchObject({ exit: 0 });
+      const report = JSON.parse(output.trim().split("\n").at(-1)!);
+      expect(report).toMatchObject({
+        mode, disposed: true, sideEffects: 0,
+        state: ["disabled", "unloadable"].includes(mode) ? "prerequisite-failed" : "completed",
+      });
+      expect(report.missing).toEqual(["disabled", "unloadable"].includes(mode)
+        ? ["compress", "decompress", "search_context", "acp_status", "acp_cache"] : []);
+      if (["disabled", "unloadable"].includes(mode)) expect(report.nativeExitCode).toBe(1);
+      if (mode === "unloadable") expect(report.errors.join("\n")).toContain("compress");
+    },
+  );
+
   test("foreground loads the full dev-tools public entry alongside ordinary policy", async () => {
     const host = profileHarness("coding");
     try {

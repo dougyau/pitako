@@ -450,14 +450,16 @@ describe("plan/execute packaged composition", () => {
     for (const tool of ["read", "grep", "find", "ls", "bash", "edit", "write", "contact_supervisor", "apply_patch", "codegraph_explore", "codegraph_files", "lsp_symbols", "lsp_rename"]) expect(tools).toContain(tool);
     expect(tools).not.toContain("subagent"); expect(worker.allowNestedSubagents).toBeUndefined(); expect(worker.model).toBeUndefined();
     expect(worker.skills).toBe("ponytail, verify-behavior"); expect(worker.skillPath).toEqual(["../node_modules/@dietrichgebert/ponytail/skills/ponytail", "../skills/practical/verify-behavior"]);
-    expect(worker.subagentOnlyExtensions).toEqual(["../node_modules/@vndv/pi-codegraph/extensions/codegraph.ts", "../node_modules/pi-lsp-client/src/index.ts", "../node_modules/pi-codex-tools/index.ts"]);
+    expect(worker.extensions).toEqual(["../extensions/acp.ts"]);
+    expect(worker.subagentOnlyExtensions).toEqual(["../node_modules/@nredd/pi-dev-tools/src/index.ts", "../extensions/file-sha256.ts", "../node_modules/@vndv/pi-codegraph/extensions/codegraph.ts", "../node_modules/pi-lsp-client/src/index.ts", "../node_modules/pi-codex-tools/index.ts"]);
     for (const provider of worker.subagentOnlyExtensions as string[]) expect(existsSync(path.resolve("agents", provider))).toBe(true);
     for (const contract of ["single writer thread", "pause and escalate", "Ponytail is explicitly LITE", "Never\nreduce assigned specs or scope", "weaken project-required tests", "output schema/reporting", "edit/write"])
       expect(body).toContain(contract);
     const director = parseFrontmatter(read("agents/execution-director.md"));
     for (const tool of ["subagent", "todo", "contact_supervisor", "subagent_supervisor"]) expect(String(director.frontmatter.tools)).toContain(tool);
     expect(String(director.frontmatter.tools)).not.toMatch(/\b(?:bash|edit|write|apply_patch)\b/);
-    expect(director.frontmatter.subagentOnlyExtensions).toEqual(["../node_modules/pi-subagents/bundle/index.js", "../extensions/todo.ts"]);
+    expect(director.frontmatter.extensions).toEqual(["../extensions/acp.ts"]);
+    expect(director.frontmatter.subagentOnlyExtensions).toEqual(["../node_modules/@nredd/pi-dev-tools/src/index.ts", "../extensions/file-sha256.ts", "../node_modules/pi-subagents/bundle/index.js", "../extensions/todo.ts"]);
     for (const role of ["architect", "reviewer", "scout", "researcher", "evidence-auditor", "execution-inspector"]) {
       const profile = parseFrontmatter(read(`agents/${role}.md`)).frontmatter;
       expect(profile.acceptanceRole).toBe("read-only"); expect(profile.allowNestedSubagents).toBeUndefined();
@@ -485,7 +487,12 @@ describe("plan/execute packaged composition", () => {
       expect([...registered]).toContain("subagent"); expect([...registered]).toContain("subagent_supervisor");
       expect([...registered]).not.toContain("subagents_enable");
       const supplied = new Set(["read", "grep", "find", "ls", "todo", "bg_wait", ...registered]);
-      expect(plan.requiredChildTools.filter(tool => !supplied.has(tool))).toEqual([]);
+      // This fanout-only harness owns delegation. The separate real child lifecycle
+      // check loads these ACP/deterministic providers and verifies actual calls.
+      expect(plan.requiredChildTools.filter(tool => !supplied.has(tool))).toEqual([
+        "compress", "decompress", "search_context", "acp_status", "acp_cache",
+        "git_worktree_list", "git_status", "git_diff", "git_log", "git_show", "resource_snapshot", "file_sha256", "codemode",
+      ]);
       expect(body).toContain("skip its parent-only");
       const relay = parseFrontmatter(read("agents/interview-relay.md"));
       const relayPlan = resolvePiLaunchToolPlan({ tools: String(relay.frontmatter.tools).split(/,\s*/), extensions: [] });
