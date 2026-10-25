@@ -71,6 +71,16 @@ Reused results alone never prove current checks. The read-only host API requires
 a finite per-operation timeout; its native maximum is not a Pitako cycle budget.
 The old bridge has no historical replacement.
 
+The packaged execution-director alone uses native `timeoutMs: 7200000` (two
+hours), not a global or worker budget. A confirmed native timeout consumes its
+cycle. The fresh read-only execution-inspector must reconcile all descendants
+and actual Git before a new fresh director can use the next of three slots in
+the same invocation. Only non-reused verified settlement clears unsettled state;
+uncertain descendants, permissions, ordinary failures and Stop remain blockers.
+Compact timeout and settlement references survive replay; Git/WIP and immutable
+inputs are retained. Three settled timeouts return partial, never a fourth cycle
+or successful review. Later completion still requires current-checkout validation.
+
 ## Verification boundary
 
 Tests cover Pitako-owned composition, profile policy, instruction resources,

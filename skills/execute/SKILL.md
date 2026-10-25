@@ -138,11 +138,13 @@ Pitako execution ledger is created. No Pitako time/token/price/usage budget is
 added. Native limits remain. runs.host requires a finite timeout; only the
 allowlisted read-only inspection uses its native 24-hour maximum, NOT a workflow,
 director or worker deadline.
+The packaged execution-director profile alone sets native `timeoutMs: 7200000`
+(two hours). This does not change worker deadlines or global/workflow budgets.
 
 ## Results and recovery
 
 Interpret complete, partial and blocked semantically, not process success.
-Three COMPLETE cycles exhaust the invocation. A NEW explicit human /execute
+Three cycle attempts (including confirmed native director timeouts) exhaust the invocation. A NEW explicit human /execute
 can grant up to three more on the same mission/checkout without losing work,
 provided prior settlement is established. Technical recovery grants none.
 
@@ -161,7 +163,7 @@ An attempt is saved BEFORE dispatch. If replay finds no durably saved settled
 result, the workflow blocks instead of blindly replacing the director. This
 includes the conservative pre-dispatch crash gap. Likewise a failed director
 or uncertain descendants retain the mission's unsettled marker and block even
-a new invocation. Inspect mission.show, exact linked run/descendant native
+a new invocation, except for the confirmed timeout path below. Inspect mission.show, exact linked run/descendant native
 process-terminal evidence, commits and dirty work; preserve useful partial work.
 Missing/unknown proof is a blocker, not permission to clear state or race writers.
 After ACTUAL reconciliation, record the evidence in native mission decisions;
@@ -172,6 +174,28 @@ Do not overwrite an attempted cycle or reset its count; retain its failed result
 and references. If safe resolution cannot be represented, use a separately
 explicitly bound mission retaining the prior references after human decision.
 No automatic recovery of a partial director's internal steps is promised.
+
+A confirmed native director timeout consumes its current cycle, never retries
+that cycle. Native `terminalOutcome` with `partial`/`timeout` or the director's
+single native result `timedOut` establishes the cause, NOT writer safety.
+Error strings, model reports, `bg_wait.timedOut`, ended/status labels and Stop
+are not timeout proof. The existing fresh read-only execution-inspector first
+reconciles ALL owned descendants' process-terminal evidence and actual Git,
+even without a verdict or `writersSettled` assertion. Only fresh, non-reused
+verified settlement with evidence clears the unsettled marker. Live/uncertain
+descendants, pending permissions, missing/refused/stale settlement, ordinary
+failure, cancellation/Stop or missing results remain blocked.
+
+After verified timeout settlement, automatically launch a NEW FRESH director
+in the NEXT remaining cycle of the SAME invocation/mission/snapshot/cwd. Pass
+the prior native artifact and settlement references so it can recover TODO,
+evidence and remaining work without discarding Git/WIP. A third settled timeout
+returns partial with recoverable remaining work; a third unsafe timeout blocks.
+No fourth cycle, count reset, new invocation/mission or successful review is
+implied. A later complete cycle still needs whole-spec review and fresh
+current-checkout validation. Replay retains consumed attempts and compact
+timeout/settlement references; an interruption before settlement was durably
+recorded and the unsettled marker cleared remains a reconciliation blocker.
 
 The packaged `pitako.worker` explicitly loads the existing Ponytail skill in
 LITE mode: reuse code, avoid speculative abstractions and keep diffs small. This

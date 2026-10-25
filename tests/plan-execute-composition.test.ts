@@ -9,6 +9,7 @@ import { resolveWorkflowResource } from "../node_modules/pi-subagents/src/workfl
 import { runWorkflowScript, validateWorkflowScript } from "../node_modules/pi-subagents/src/workflows/scripted-workflow.js";
 import registerFanoutChild from "../node_modules/pi-subagents/src/extension/fanout-child.js";
 import { resolvePiLaunchToolPlan } from "../node_modules/pi-subagents/src/runs/shared/child-tool-plan.js";
+import { discoverAgents } from "../node_modules/pi-subagents/src/agents/agents.js";
 import planExecute, { executionResource } from "../extensions/plan-execute.ts";
 import { DEFAULT_SKILL_NAMES } from "../extensions/catalog.ts";
 import { digest, inspectionSnapshot, MAX_SPEC_BYTES, SPEC_SECTIONS, specChunks, validateSpec } from "../extensions/spec-plans.ts";
@@ -23,6 +24,24 @@ function repository() {
 }
 
 describe("plan/execute packaged composition", () => {
+  test("native profile loader applies the two-hour deadline only to the packaged execution director", () => {
+    const root = repository(), prior = process.env.PI_CODING_AGENT_DIR;
+    writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "pitako", pi: { subagents: { agents: [path.resolve("agents")] } } }));
+    process.env.PI_CODING_AGENT_DIR = path.join(root, "private-agent-config");
+    try {
+      const loaded = discoverAgents(root, "project", undefined, { globalNpmRoot: null });
+      const director = loaded.agents.find(agent => agent.name === "pitako.execution-director");
+      expect(director?.defaultTimeoutMs).toBe(7200000);
+      expect(director?.filePath).toBe(path.resolve("agents/execution-director.md"));
+      for (const role of ["worker", "execution-inspector", "reviewer"]) {
+        const agent = loaded.agents.find(agent => agent.name === `pitako.${role}`);
+        expect(agent).toBeDefined(); expect(agent?.defaultTimeoutMs).toBeUndefined();
+      }
+    } finally {
+      if (prior === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = prior;
+    }
+  });
+
   test("documented mission creation, inspection and launch reuse the designated store from a nested foreground cwd", () => {
     const root = repository(), foreground = path.join(root, "src"); mkdirSync(foreground);
     const missionId = "explicit.native-id", stores = new Map<string, Set<string>>();

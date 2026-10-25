@@ -2,11 +2,14 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { digest, inspectionSnapshot, MAX_SPEC_BYTES, SPEC_SECTIONS, specChunks, validateSpec } from "../extensions/spec-plans.ts";
 import { MISSION_STATE_MAX_BYTES } from "../node_modules/pi-subagents/src/missions/workflow-state.js";
+import { runWorkflowScript, type WorkflowScriptChildResult } from "../node_modules/pi-subagents/src/workflows/scripted-workflow.js";
+import { workflowTerminalOutcomeForResult } from "../node_modules/pi-subagents/src/workflows/workflow-settlement.js";
 
 const source = readFileSync(new URL("../skills/execute/workflow.js", import.meta.url), "utf8");
 interface Request { key: string; agent: string; context: string; cwd: string; output: boolean; task: string; outputSchema: unknown; async?: boolean; model?: string }
 interface NativePointers { runId?: string; artifactPaths?: string[]; outputReference?: string; asyncDir?: string }
-interface Result extends NativePointers { ok: boolean; reused?: boolean; error?: string; structuredOutput?: Record<string, unknown>; results?: unknown[]; output?: string }
+interface Result extends NativePointers { ok: boolean; reused?: boolean; error?: string; structuredOutput?: Record<string, unknown>; results?: unknown[]; output?: string;
+  terminalOutcome?: WorkflowScriptChildResult["terminalOutcome"]; stopped?: boolean; interrupted?: boolean; detached?: boolean; state?: "running" }
 interface Outcome { status: string; reason?: string; cycle?: number; cycles?: number; remaining?: string; candidates?: unknown[]; references?: (NativePointers & { key: string })[] }
 const config = { root: "/owned/designated", id: "spec", invocation: "human-1", missionId: "native.mission-1", inspections: ["initial", "cycle-1", "cycle-2", "cycle-3", "validation-before", "validation-after"].map(phase => ({ key: `inspect-${phase}`, command: "READ" })), chunks: Array.from({ length: 26 }, (_, index) => ({ key: `input-${index}`, command: "CHUNK" })) };
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(accept => { resolve = accept; }); return { resolve, promise }; }
@@ -18,7 +21,7 @@ function fixture(content = "COMPLETE IMMUTABLE SPECS") {
   let fingerprint = "checkout-0", inputDigest = "original";
   let selection: typeof selected | null = selected;
   let hostResponse: ((key: string, value: unknown) => unknown) | undefined;
-  let respond: (request: Request) => Result | Promise<Result> = request => ({ ok: true, runId: `native-${request.key}`, structuredOutput:
+  let respond: (request: Request) => Result | undefined | Promise<Result | undefined> = request => ({ ok: true, runId: `native-${request.key}`, structuredOutput:
     request.key.endsWith("prepare") ? { status: "ready", todo: "More than three increments if needed", evidence: "read-only Git evidence" }
       : (request.key.endsWith("validate") || request.key.endsWith("settlement")) ? { status: "verified", evidence: "Fresh Git + checks + full-spec review + process proofs" }
         : { status: "complete", summary: "Done", remaining: "None", evidence: "native-review and checks", writersSettled: true } });
@@ -49,14 +52,177 @@ function fixture(content = "COMPLETE IMMUTABLE SPECS") {
     changeInput: () => { inputDigest = "changed"; }, changeCheckout: () => { fingerprint += "-changed"; },
     noSelection: () => { selection = null; },
     execute: (invocation = "human-1", mission = true): Promise<Outcome> => new AsyncFunction("config", "runs", "state", source)({ ...config, invocation }, runs, mission ? state : undefined),
+    executeNative: async (): Promise<Outcome> => {
+      const result = await runWorkflowScript({ script: `const config = ${JSON.stringify(config)};\n${source}`, state,
+        launch: async (key, params) => ({ key, output: "", artifactPaths: [], ...(await runs.all([{ ...params, key } as unknown as Request]))[0] } as WorkflowScriptChildResult),
+        status: async () => { throw new Error("Unexpected status"); },
+        host: async (key, params) => ({ ...(await runs.host(key, params)), key, kind: "command", state: "passed", exitCode: 0, stderr: "", outputPath: `/native/${key}.log`, durationMs: 0 }),
+      });
+      return result.value as Outcome;
+    },
   };
 }
 function gap(request: Request): Result { return { ok: true, runId: `native-${request.key}`, structuredOutput:
   request.key.endsWith("prepare") ? { status: "ready", todo: "Five increments with own checks and WIP commits", evidence: "Existing dirty work preserved" }
     : request.key.endsWith("settlement") ? { status: "verified", evidence: "Exact native descendant process-terminal proofs" }
     : { status: "gaps", summary: "Five increments implemented; independent whole-spec review found a material gap", remaining: "Resolve full-spec gap next cycle", evidence: "five settled workers and independent native review", writersSettled: true } }; }
+function timeout(request: Request): Result {
+  return { ok: false, runId: `native-${request.key}`, artifactPaths: [`/native/${request.key}/result.json`, `/native/${request.key}/session.jsonl`],
+    outputReference: `/native/${request.key}/output.md`, terminalOutcome: workflowTerminalOutcomeForResult({ timedOut: true }),
+    results: [{ timedOut: true, task: request.task }], error: "Native deadline" };
+}
+function complete(request: Request): Result {
+  return request.key.endsWith("validate") ? { ok: true, runId: `native-${request.key}`, structuredOutput: { status: "verified", evidence: "Fresh whole-spec review/current checkout" } }
+    : request.agent === "pitako.execution-director" ? { ...gap(request), structuredOutput:
+      { status: "complete", summary: "Done", remaining: "None", evidence: "Whole-spec review and current checks", writersSettled: true } } : gap(request);
+}
 
 describe("native execution workflow", () => {
+  test.each([1, 2, 3])("%s confirmed timeouts consume slots and advance only after fresh settlement; replay grants none", async count => {
+    const host = fixture();
+    host.setRespond(request => {
+      if (request.agent !== "pitako.execution-director") return complete(request);
+      const cycle = Number(request.key.at(-1));
+      expect(host.storage.get("invoke-human-1")).toMatchObject({ cycles: Array.from({ length: cycle }, () => ({ attempted: true })) });
+      expect(host.storage.get("pitako-execution")).toMatchObject({ unsettled: { cycle } });
+      if (cycle > 1) {
+        expect(request.task).toContain(`/native/invoke-human-1-cycle-${cycle - 1}/session.jsonl`);
+        expect(request.task).toContain("Exact native descendant process-terminal proofs");
+        expect(request.task).toContain("Five increments with own checks and WIP commits");
+        expect(request.task).toContain("COMPLETE IMMUTABLE SPECS");
+      }
+      return cycle <= count ? timeout(request) : complete(request);
+    });
+    const result = await host.executeNative();
+    expect(result).toMatchObject(count === 3 ? { status: "partial", cycles: 3 } : { status: "complete", cycle: count + 1 });
+    const directors = host.calls.filter(request => request.agent === "pitako.execution-director");
+    expect(directors.map(request => request.key)).toEqual(Array.from({ length: Math.min(count + 1, 3) }, (_, i) => `invoke-human-1-cycle-${i + 1}`));
+    for (const request of directors) { expect(request.context).toBe("fresh"); expect(request.cwd).toBe(config.root); }
+    for (let cycle = 1; cycle <= count; cycle++) {
+      const settlement = host.calls.find(request => request.key === `invoke-human-1-cycle-${cycle}-settlement`)!;
+      expect(settlement.task).toContain("EVERY owned descendant");
+      expect(settlement.task).toContain("plus actual Git changes");
+      expect(settlement.task).toContain("Pending permissions");
+      expect(result.references).toContainEqual(expect.objectContaining({ key: `invoke-human-1-cycle-${cycle}`, runId: `native-invoke-human-1-cycle-${cycle}` }));
+    }
+    const saved = JSON.stringify(host.storage.get("invoke-human-1"));
+    expect(saved).toContain('"terminalOutcome":{"state":"partial","reason":"timeout"}');
+    expect(saved).not.toContain('"results"'); expect(saved).not.toContain('"task"');
+    expect(host.storage.get("pitako-execution")).toMatchObject({ unsettled: null });
+    if (count === 3) expect(result.remaining).toContain("recover remaining work");
+    host.calls.length = 0;
+    expect((await host.executeNative()).status).toBe(result.status);
+    expect(host.calls.filter(request => request.agent === "pitako.execution-director")).toHaveLength(0);
+    expect(host.calls.map(request => request.key)).toEqual(count === 3 ? [] : [`invoke-human-1-cycle-${count + 1}-validate`]);
+  });
+
+  test("native runs.all transports results[].timedOut and retains terminal cause if non-JSON metadata is omitted", async () => {
+    for (const mode of ["single-result", "non-json-results"]) {
+      const host = fixture();
+      host.setRespond(request => {
+        if (request.key !== "invoke-human-1-cycle-1") return complete(request);
+        const result = timeout(request);
+        if (mode === "single-result") delete result.terminalOutcome;
+        else result.results = [{ timedOut: true, task: request.task, nonJson: () => {} }];
+        return result;
+      });
+      expect(await host.executeNative()).toMatchObject({ status: "complete", cycle: 2 });
+      expect(host.storage.get("invoke-human-1")).toMatchObject({ cycles: [{ result: { terminalOutcome: { state: "partial", reason: "timeout" } } }, {}] });
+    }
+  });
+
+  test("timeout waits for independent settlement before permitting the next writer", async () => {
+    const host = fixture(), entered = deferred<void>(), waiting = deferred<Result>();
+    host.setRespond(request => {
+      if (request.key.endsWith("cycle-1")) return timeout(request);
+      if (request.key.endsWith("cycle-1-settlement")) { entered.resolve(); return waiting.promise; }
+      return complete(request);
+    });
+    const work = host.execute(); await entered.promise;
+    try {
+      expect(host.calls.filter(request => request.agent === "pitako.execution-director")).toHaveLength(1);
+      expect(host.storage.get("pitako-execution")).toMatchObject({ unsettled: { cycle: 1 } });
+    } finally { waiting.resolve(gap(host.calls.at(-1)!)); }
+    expect(await work).toMatchObject({ status: "complete", cycle: 2 });
+  });
+
+  test.each(["live", "stale", "pending-permission", "missing", "reused", "refused", "no-evidence", "third-unsafe"])("timeout with %s settlement remains blocked across technical recovery and new invocations", async fault => {
+    const host = fixture();
+    host.setRespond(request => {
+      if (request.agent === "pitako.execution-director") return timeout(request);
+      if (request.key.endsWith("settlement") && (fault !== "third-unsafe" || request.key.includes("cycle-3"))) {
+        if (fault === "missing") return undefined;
+        return { ok: fault !== "refused", reused: fault === "reused", runId: "inspection", structuredOutput:
+          { status: ["live", "stale", "pending-permission", "third-unsafe"].includes(fault) ? "blocked" : "verified", evidence: fault === "no-evidence" ? "" : "Native descendant still live / evidence stale / permission unresolved" } };
+      }
+      return gap(request);
+    });
+    expect((await host.execute()).status).toBe("blocked");
+    const count = host.calls.filter(request => request.agent === "pitako.execution-director").length;
+    expect(count).toBe(fault === "third-unsafe" ? 3 : 1);
+    const calls = host.calls.length;
+    expect((await host.execute()).status).toBe("blocked");
+    expect((await host.execute("human-2")).status).toBe("blocked");
+    expect(host.calls).toHaveLength(calls);
+    expect(host.storage.get("pitako-execution")).toMatchObject({ unsettled: { cycle: count } });
+  });
+
+  test.each(["error-text", "model-timeout", "stopped", "interrupted", "detached", "running", "missing", "no-run-id"])("does not retry ordinary failure, Stop, or unconfirmed timeout: %s", async fault => {
+    const host = fixture();
+    host.setRespond(request => {
+      if (request.key.endsWith("prepare")) return gap(request);
+      if (fault === "missing") return undefined;
+      if (fault === "error-text") return { ok: false, runId: "failed", error: "timed out", results: [{ timedOut: false }] };
+      if (fault === "model-timeout") return { ok: false, runId: "failed", structuredOutput: { timedOut: true, status: "timeout", writersSettled: true } };
+      const result = timeout(request);
+      if (fault === "no-run-id") delete result.runId;
+      else if (fault === "running") result.state = "running";
+      else result[fault as "stopped" | "interrupted" | "detached"] = true;
+      return result;
+    });
+    expect((await host.execute()).status).toBe("blocked");
+    expect(host.calls.map(request => request.key)).toEqual(["invoke-human-1-prepare", "invoke-human-1-cycle-1"]);
+  });
+
+  test("interruption after saving timeout but before settlement remains blocked without relaunch", async () => {
+    const host = fixture();
+    host.setRespond(request => {
+      if (request.key.endsWith("cycle-1")) return timeout(request);
+      if (request.key.endsWith("settlement")) throw new Error("Technical interruption");
+      return gap(request);
+    });
+    expect((await host.execute()).status).toBe("blocked");
+    expect(host.storage.get("invoke-human-1")).toMatchObject({ cycles: [{ attempted: true, result: { terminalOutcome: { reason: "timeout" } } }] });
+    const calls = host.calls.length;
+    expect((await host.execute()).status).toBe("blocked"); expect(host.calls).toHaveLength(calls);
+  });
+
+  test("technical continuation after settled timeout uses only the next remaining slot", async () => {
+    const host = fixture(); let interrupted = false;
+    host.setRespond(request => request.agent === "pitako.execution-director" ? timeout(request) : gap(request));
+    host.setHostResponse((key, value) => {
+      if (key === "inspect-cycle-2" && !interrupted) { interrupted = true; throw new Error("Technical interruption before next attempt"); }
+      return value;
+    });
+    expect((await host.execute()).status).toBe("blocked");
+    expect(host.storage.get("pitako-execution")).toMatchObject({ unsettled: null });
+    expect(host.storage.get("invoke-human-1")).toMatchObject({ cycles: [{ attempted: true, settlement: { structuredOutput: { status: "verified" } } }] });
+    host.calls.length = 0;
+    expect(await host.execute()).toMatchObject({ status: "partial", cycles: 3 });
+    expect(host.calls.filter(request => request.agent === "pitako.execution-director").map(request => request.key))
+      .toEqual(["invoke-human-1-cycle-2", "invoke-human-1-cycle-3"]);
+    host.calls.length = 0;
+    expect((await host.execute()).status).toBe("partial"); expect(host.calls).toHaveLength(0);
+  });
+
+  test("persisted timeout without verified settlement cannot authorize another director", async () => {
+    const host = fixture();
+    host.storage.set("invoke-human-1", { digest: "original", source: "/owned/sibling/.pitako/plans/spec.md", content: "snapshot",
+      preparation: { todo: "prepared" }, cycles: [{ attempted: true, result: { ok: false, runId: "timed-out", terminalOutcome: { state: "partial", reason: "timeout" } } }] });
+    expect((await host.execute()).reason).toContain("lacks recorded independent settlement");
+    expect(host.calls).toHaveLength(0);
+  });
+
   test.each(["count-zero", "count-overflow", "byte-overflow", "bad-digest", "changed-digest", "changed-input", "wrong-index", "wrong-count", "truncated", "truncated-content", "noncanonical", "oversized-envelope"])("rejects invalid metadata transport before preparation: %s", async fault => {
     const host = fixture(), content = "COMPLETE IMMUTABLE SPECS";
     const metadata = { root: config.root, commonDir: "/owned/common", candidates: [],
