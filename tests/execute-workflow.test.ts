@@ -9,22 +9,24 @@ const source = readFileSync(new URL("../skills/execute/workflow.js", import.meta
 interface Request { key: string; agent: string; context: string; cwd: string; output: boolean; task: string; outputSchema: unknown; async?: boolean; model?: string }
 interface NativePointers { runId?: string; artifactPaths?: string[]; outputReference?: string; asyncDir?: string }
 interface Result extends NativePointers { ok: boolean; reused?: boolean; error?: string; structuredOutput?: Record<string, unknown>; results?: unknown[]; output?: string;
-  terminalOutcome?: WorkflowScriptChildResult["terminalOutcome"]; stopped?: boolean; interrupted?: boolean; detached?: boolean; state?: "running" }
+  terminalOutcome?: WorkflowScriptChildResult["terminalOutcome"]; recovery?: unknown; stopped?: boolean; interrupted?: boolean; detached?: boolean; state?: "running" }
 interface Outcome { status: string; reason?: string; cycle?: number; cycles?: number; remaining?: string; candidates?: unknown[]; references?: (NativePointers & { key: string })[] }
 const config = { root: "/owned/designated", id: "spec", invocation: "human-1", missionId: "native.mission-1", inspections: ["initial", "cycle-1", "cycle-2", "cycle-3", "validation-before", "validation-after"].map(phase => ({ key: `inspect-${phase}`, command: "READ" })), chunks: Array.from({ length: 26 }, (_, index) => ({ key: `input-${index}`, command: "CHUNK" })) };
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(accept => { resolve = accept; }); return { resolve, promise }; }
 function fixture(content = "COMPLETE IMMUTABLE SPECS") {
   const chunks = specChunks(content);
-  const calls: Request[] = [], hostCalls: string[] = [];
+  const calls: Request[] = [], hostCalls: string[] = [], statusCalls: string[] = [];
+  let status: (ref: string) => Result | Promise<Result> = () => ({ ok: true, results: [] });
   const storage = new Map<string, unknown>();
   const selected = { source: "/owned/sibling/.pitako/plans/spec.md", digest: "original", chunks: chunks.length };
   let fingerprint = "checkout-0", inputDigest = "original";
   let selection: typeof selected | null = selected;
   let hostResponse: ((key: string, value: unknown) => unknown) | undefined;
   let respond: (request: Request) => Result | undefined | Promise<Result | undefined> = request => ({ ok: true, runId: `native-${request.key}`, structuredOutput:
-    request.key.endsWith("prepare") ? { status: "ready", todo: "More than three increments if needed", evidence: "read-only Git evidence" }
-      : (request.key.endsWith("validate") || request.key.endsWith("settlement")) ? { status: "verified", evidence: "Fresh Git + checks + full-spec review + process proofs" }
-        : { status: "complete", summary: "Done", remaining: "None", evidence: "native-review and checks", writersSettled: true } });
+    request.key.endsWith("prepare") ? { status: "ready", nativeRefs: [], todo: "More than three increments if needed", evidence: "read-only Git evidence" }
+      : request.key.endsWith("validate") ? { status: "verified", evidence: "Fresh Git + checks + full-spec review" }
+        : request.key.endsWith("settlement") || request.key.endsWith("admission") ? { evidence: "Known native refs and Git observations", nativeRefs: [] }
+        : { status: "complete", summary: "Done", remaining: "None", evidence: "native-review and checks" } });
   const state = {
     get: async (key: string) => structuredClone(storage.get(key)),
     set: async (key: string, value: unknown) => {
@@ -44,18 +46,20 @@ function fixture(content = "COMPLETE IMMUTABLE SPECS") {
     },
     // Native config-form all waits and returns terminal failures with run identities.
     all: async (requests: Request[]) => Promise.all(requests.map(request => { calls.push(request); return respond(request); })),
+    status: async (ref: string) => { statusCalls.push(ref); return status(ref); },
   };
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
-  return { calls, hostCalls, storage, state,
+  return { calls, hostCalls, statusCalls, storage, state,
+    setStatus: (callback: typeof status) => { status = callback; },
     setRespond: (callback: typeof respond) => { respond = callback; },
     setHostResponse: (callback: NonNullable<typeof hostResponse>) => { hostResponse = callback; },
     changeInput: () => { inputDigest = "changed"; }, changeCheckout: () => { fingerprint += "-changed"; },
     noSelection: () => { selection = null; },
-    execute: (invocation = "human-1", mission = true): Promise<Outcome> => new AsyncFunction("config", "runs", "state", source)({ ...config, invocation }, runs, mission ? state : undefined),
-    executeNative: async (): Promise<Outcome> => {
-      const result = await runWorkflowScript({ script: `const config = ${JSON.stringify(config)};\n${source}`, state,
+    execute: (invocation = "human-1", mission = true, unblock = false): Promise<Outcome> => new AsyncFunction("config", "runs", "state", source)({ ...config, invocation, unblock }, runs, mission ? state : undefined),
+    executeNative: async (invocation = "human-1", unblock = false): Promise<Outcome> => {
+      const result = await runWorkflowScript({ script: `const config = ${JSON.stringify({ ...config, invocation, unblock })};\n${source}`, state,
         launch: async (key, params) => ({ key, output: "", artifactPaths: [], ...(await runs.all([{ ...params, key } as unknown as Request]))[0] } as WorkflowScriptChildResult),
-        status: async () => { throw new Error("Unexpected status"); },
+        status: async ref => ({ key: ref, output: "", artifactPaths: [], ...await runs.status(ref) } as WorkflowScriptChildResult),
         host: async (key, params) => ({ ...(await runs.host(key, params)), key, kind: "command", state: "passed", exitCode: 0, stderr: "", outputPath: `/native/${key}.log`, durationMs: 0 }),
       });
       return result.value as Outcome;
@@ -63,9 +67,9 @@ function fixture(content = "COMPLETE IMMUTABLE SPECS") {
   };
 }
 function gap(request: Request): Result { return { ok: true, runId: `native-${request.key}`, structuredOutput:
-  request.key.endsWith("prepare") ? { status: "ready", todo: "Five increments with own checks and WIP commits", evidence: "Existing dirty work preserved" }
-    : request.key.endsWith("settlement") ? { status: "verified", evidence: "Exact native descendant process-terminal proofs" }
-    : { status: "gaps", summary: "Five increments implemented; independent whole-spec review found a material gap", remaining: "Resolve full-spec gap next cycle", evidence: "five settled workers and independent native review", writersSettled: true } }; }
+  request.key.endsWith("prepare") ? { status: "ready", nativeRefs: [], todo: "Five increments with own checks and WIP commits", evidence: "Existing dirty work preserved" }
+    : request.key.endsWith("settlement") || request.key.endsWith("admission") ? { evidence: "Known native refs and Git observations", nativeRefs: [] }
+    : { status: "gaps", summary: "Five increments implemented; independent whole-spec review found a material gap", remaining: "Resolve full-spec gap next cycle", evidence: "five settled workers and independent native review" } }; }
 function timeout(request: Request): Result {
   return { ok: false, runId: `native-${request.key}`, artifactPaths: [`/native/${request.key}/result.json`, `/native/${request.key}/session.jsonl`],
     outputReference: `/native/${request.key}/output.md`, terminalOutcome: workflowTerminalOutcomeForResult({ timedOut: true }),
@@ -74,10 +78,208 @@ function timeout(request: Request): Result {
 function complete(request: Request): Result {
   return request.key.endsWith("validate") ? { ok: true, runId: `native-${request.key}`, structuredOutput: { status: "verified", evidence: "Fresh whole-spec review/current checkout" } }
     : request.agent === "pitako.execution-director" ? { ...gap(request), structuredOutput:
-      { status: "complete", summary: "Done", remaining: "None", evidence: "Whole-spec review and current checks", writersSettled: true } } : gap(request);
+      { status: "complete", summary: "Done", remaining: "None", evidence: "Whole-spec review and current checks" } } : gap(request);
+}
+function historical(host: ReturnType<typeof fixture>) {
+  const hold = { invocation: "old-human", cycle: 2, key: "invoke-old-human-cycle-2" };
+  const old = { source: "/owned/sibling/.pitako/plans/spec.md", digest: "original", content: "OLD IMMUTABLE SPECS",
+    preparation: { todo: "Old TODO" }, cycles: [{ attempted: true, result: { ok: true, runId: "old-first", structuredOutput: { status: "gaps", evidence: "Required test red" } } },
+      { attempted: true, result: { ok: false, runId: "exact-old", error: "Old failed check; not inactivity proof" } }] };
+  host.storage.set("invoke-old-human", structuredClone(old));
+  host.storage.set("other-history", { untouched: true });
+  host.storage.set("pitako-execution", { root: config.root, commonDir: "/owned/common", missionId: config.missionId,
+    id: config.id, source: old.source, digest: old.digest, unsettled: hold });
+  return { hold, old };
 }
 
 describe("native execution workflow", () => {
+  test("historical missing proof gets bounded read-only pending diagnosis, then explicit targeted withdrawal; never verified closure", async () => {
+    const host = fixture(), { hold, old } = historical(host);
+    host.setStatus(() => { throw new Error("Exact historical record unavailable after external intervention"); });
+    const pending = await host.executeNative();
+    expect(pending.status).toBe("blocked"); expect(pending.reason).toContain("/execute spec --unblock");
+    expect(pending.reason).toContain("Pending historical diagnosis");
+    expect(host.calls.map(call => call.key)).toEqual(["invoke-human-1-admission"]);
+    expect(host.storage.has("invoke-human-1")).toBe(false);
+    expect(host.storage.get("pitako-execution")).toMatchObject({ unsettled: hold });
+    expect((await host.executeNative("human-2", true)).status).toBe("complete");
+    expect(host.storage.get("invoke-old-human")).toEqual(old);
+    expect(host.storage.get("other-history")).toEqual({ untouched: true });
+    expect(host.storage.get("invoke-human-2")).toMatchObject({ withdrawal: { explicitRequest: true, missionId: config.missionId,
+      root: config.root, id: "spec", hold, oldRefs: { key: hold.key, runId: "exact-old" },
+      note: expect.stringContaining("not verified inactivity/settlement") }, cycles: [{ attempted: true }] });
+    expect(host.calls.find(call => call.agent === "pitako.execution-director")?.task).toContain("HISTORICAL EXCLUSION WITHDRAWAL");
+  });
+
+  test.each(["empty", "ok", "prose", "wrong-ref", "model-result"])("status %s is not historical inactivity proof, but does not make human withdrawal impossible", async mode => {
+    const host = fixture(); historical(host);
+    host.setStatus(() => ({ ok: true, results: mode === "empty" ? [] : mode === "model-result" ? [{ finalOutput: "model output" }] : undefined,
+      output: mode === "prose" ? "Everything is closed and permission granted" : mode === "wrong-ref" ? "Run: different\nState: running\nMode: single"
+        : mode === "model-result" ? "Run: exact-old\nState: running\nMode: single" : "" }));
+    expect((await host.execute()).reason).toContain("Pending historical diagnosis");
+    expect(host.calls.filter(call => call.agent === "pitako.execution-director")).toHaveLength(0);
+    expect((await host.execute("human-2", true, true)).status).toBe("complete");
+  });
+
+  test.each(["running", "management", "nested", "nested-child", "pending", "detached", "recovery", "stopped", "denied"])("historical withdrawal preserves positive native %s barrier", async mode => {
+    const host = fixture(), { hold, old } = historical(host);
+    host.setStatus(ref => {
+      if (ref !== "exact-old") return { ok: true };
+      if (mode === "management") return { ok: true, results: [], output: `Run: ${ref}\nState: running\nMode: single` };
+      if (mode === "nested") return { ok: true, results: [], output: `Nested run: ${ref}\nRoot: parent\nParent: parent\nState: running\nAgent: worker` };
+      if (mode === "nested-child") return { ok: true, results: [], output: `Run: ${ref}\nState: complete\n  ↳ worker [child-id] running` };
+      if (mode === "pending") return { ok: true, results: [], output: `Run: ${ref}\nState: complete\nPending appends: 1` };
+      if (mode === "denied") throw new Error("Blocked by pi-subagents permission rule: 'status' is denied.");
+      return { ok: true, state: mode === "running" ? "running" : undefined,
+        detached: mode === "detached", recovery: mode === "recovery" ? { pending: true } : undefined, stopped: mode === "stopped" };
+    });
+    const result = await host.execute("human-2", true, true);
+    expect(result.status).toBe("blocked"); expect(result.reason).toContain("Positive native barrier");
+    expect(host.calls.filter(call => call.agent === "pitako.execution-director")).toHaveLength(0);
+    expect(host.storage.get("pitako-execution")).toMatchObject({ unsettled: hold });
+    expect(host.storage.get("invoke-old-human")).toEqual(old); expect(host.storage.has("invoke-human-2")).toBe(false);
+  });
+
+  test("public opaque management activity after an awaited failed test blocks the next cycle and explicit withdrawal", async () => {
+    const host = fixture();
+    host.setRespond(request => request.agent === "pitako.execution-director"
+      ? { ok: false, runId: "exact-owned", error: "Required test failed" } : complete(request));
+    // Source-verified 0.82 shapes: foregroundStatusResult emits management
+    // results:[] and Run/State/Mode; workflowChildResult keeps the receipt but
+    // loses structured state/runId. This controlled boundary is not SDK certification.
+    host.setStatus(ref => ref === "exact-owned"
+      ? { ok: true, results: [], output: `Run: ${ref}\nState: running\nMode: single` } : { ok: true, results: [] });
+    expect((await host.executeNative()).reason).toContain("Positive native activity");
+    expect((await host.executeNative("human-2", true)).reason).toContain("Positive native barrier");
+    expect(host.calls.filter(call => call.agent === "pitako.execution-director")).toHaveLength(1);
+    expect(host.storage.get("pitako-execution")).toMatchObject({ unsettled: { invocation: "human-1", cycle: 1 } });
+  });
+
+  test("preparation reports facts/refs, not permission to bypass a known native writer", async () => {
+    const host = fixture();
+    host.setRespond(() => ({ ok: true, structuredOutput: { status: "ready", todo: "Diagnose", evidence: "Current Git",
+      nativeRefs: ["known-writer"] } }));
+    host.setStatus(ref => ({ ok: true, results: [], output: `Run: ${ref}\nState: running\nMode: single` }));
+    expect((await host.executeNative()).reason).toContain("prevents dispatch");
+    expect(host.calls.map(call => call.key)).toEqual(["invoke-human-1-prepare"]);
+    expect(host.storage.get("invoke-human-1")).toMatchObject({ cycles: [] });
+  });
+
+  test("new unblock invocation gets three slots; replay grants none and cannot clear a newer hold", async () => {
+    const host = fixture(), { old } = historical(host); host.setRespond(gap);
+    expect(await host.execute("human-2", true, true)).toMatchObject({ status: "partial", cycles: 3 });
+    const saved = structuredClone(host.storage.get("invoke-human-2"));
+    const count = host.calls.filter(call => call.agent === "pitako.execution-director").length;
+    expect(count).toBe(3);
+    expect((await host.execute("human-2", true, true)).status).toBe("partial");
+    expect(host.calls.filter(call => call.agent === "pitako.execution-director")).toHaveLength(count);
+    const execution = host.storage.get("pitako-execution") as Record<string, unknown>;
+    const newer = { invocation: "later-human", cycle: 1, key: "invoke-later-human-cycle-1" };
+    host.storage.set("pitako-execution", { ...execution, unsettled: newer });
+    expect((await host.execute("human-2", true, true)).reason).toContain("newer/unrelated hold");
+    expect(host.storage.get("pitako-execution")).toMatchObject({ unsettled: newer });
+    expect(host.storage.get("invoke-old-human")).toEqual(old); expect(host.storage.get("invoke-human-2")).toEqual(saved);
+  });
+
+  test.each(["root", "commonDir", "id", "source", "missionId", "digest"])("unblock rejects changed %s association without touching history", async field => {
+    const host = fixture(); historical(host);
+    const before = { ...(host.storage.get("pitako-execution") as Record<string, unknown>), [field]: "wrong" };
+    host.storage.set("pitako-execution", before);
+    expect((await host.execute("human-2", true, true)).status).toBe("blocked");
+    expect(host.calls).toHaveLength(0); expect(host.storage.get("pitako-execution")).toEqual(before);
+    expect(host.storage.has("invoke-human-2")).toBe(false);
+  });
+
+  test("an interleaved newer hold is never cleared after read-only diagnosis", async () => {
+    const host = fixture(); historical(host);
+    const newer = { invocation: "newer", cycle: 1, key: "newer-cycle-1" };
+    host.setRespond(request => {
+      if (request.key.endsWith("admission")) host.storage.set("pitako-execution", {
+        ...(host.storage.get("pitako-execution") as Record<string, unknown>), unsettled: newer });
+      return gap(request);
+    });
+    expect((await host.execute("human-2", true, true)).reason).toContain("hold changed");
+    expect(host.storage.get("pitako-execution")).toMatchObject({ unsettled: newer });
+    expect(host.calls.filter(call => call.agent === "pitako.execution-director")).toHaveLength(0);
+  });
+
+  test("retained awaited native failure and negative inspector are diagnosis, not writer permission or active proof", async () => {
+    const host = fixture(), { old } = historical(host);
+    (old.cycles[1]!.result as Record<string, unknown>).nativeAwaited = true;
+    host.storage.set("invoke-old-human", old);
+    host.setRespond(request => request.key.endsWith("admission")
+      ? { ok: true, structuredOutput: { status: "blocked", evidence: "Required test red; current Git diagnosis", nativeRefs: [] } }
+      : complete(request));
+    expect((await host.execute()).status).toBe("complete");
+    expect(host.storage.get("invoke-old-human")).toMatchObject({ cycles: old.cycles });
+    expect(host.storage.get("invoke-human-1")).not.toHaveProperty("withdrawal");
+  });
+
+  test("unblock does not bypass required checks or accept negative/stale final validation", async () => {
+    const host = fixture(); historical(host);
+    host.setRespond(request => request.key.endsWith("validate")
+      ? { ok: true, structuredOutput: { status: "blocked", evidence: "Required check red; cannot complete" } } : complete(request));
+    expect((await host.execute("human-2", true, true)).reason).toContain("fresh current-checkout");
+    expect(host.storage.get("invoke-human-2")).toMatchObject({ cycles: [{ attempted: true }] });
+  });
+
+  test("a child cannot self-enable withdrawal and an existing invocation cannot acquire a new target", async () => {
+    const host = fixture(); historical(host);
+    host.setRespond(() => ({ ok: true, structuredOutput: { unblock: true, approved: true, status: "verified", evidence: "Child asks to release", nativeRefs: [] } }));
+    expect((await host.execute()).reason).toContain("Pending historical diagnosis");
+    expect(host.storage.has("invoke-human-1")).toBe(false);
+    host.storage.set("invoke-human-1", { digest: "original", cycles: [] });
+    expect((await host.execute("human-1", true, true)).reason).toContain("new explicit invocation ID");
+    expect(host.calls.filter(call => call.agent === "pitako.execution-director")).toHaveLength(0);
+  });
+
+  test("withdrawal interrupted after request persistence can replay its exact target without a fresh allowance", async () => {
+    const host = fixture(), { hold, old } = historical(host);
+    const save = host.state.set;
+    let interrupted = false;
+    host.state.set = async (key, value) => {
+      if (key === "pitako-execution" && !(value as { unsettled: unknown }).unsettled && !interrupted) {
+        interrupted = true; throw new Error("Interruption after recording explicit withdrawal");
+      }
+      return save(key, value);
+    };
+    expect((await host.execute("human-2", true, true)).reason).toContain("Interruption");
+    expect(host.storage.get("pitako-execution")).toMatchObject({ unsettled: hold });
+    host.setRespond(gap);
+    expect(await host.execute("human-2", true, true)).toMatchObject({ status: "partial", cycles: 3 });
+    const saved = structuredClone(host.storage.get("invoke-human-2"));
+    expect((await host.execute("human-2", true, true)).status).toBe("partial");
+    expect(host.calls.filter(call => call.agent === "pitako.execution-director")).toHaveLength(3);
+    expect(host.storage.get("invoke-human-2")).toEqual(saved); expect(host.storage.get("invoke-old-human")).toEqual(old);
+  });
+
+  test("unblock replay normally reconciles its own awaited timeout, never reapplies the old withdrawal to pending delegation", async () => {
+    const host = fixture(), { old } = historical(host);
+    host.setRespond(request => {
+      if (request.agent === "pitako.execution-director") return timeout(request);
+      if (request.key.endsWith("settlement")) throw new Error("Interrupted observation");
+      return gap(request);
+    });
+    expect((await host.execute("human-2", true, true)).reason).toContain("Interrupted observation");
+    const execution = host.storage.get("pitako-execution");
+    const current = structuredClone(host.storage.get("invoke-human-2")) as { cycles: { result: unknown }[]; withdrawal: unknown };
+    const withdrawal = structuredClone(current.withdrawal);
+    const savedReceipt = structuredClone(current.cycles[0]!.result);
+    // Without awaited completion of this NEW cycle, the old flag cannot release it.
+    current.cycles[0]!.result = null; host.storage.set("invoke-human-2", current);
+    expect((await host.execute("human-2", true, true)).reason).toContain("newer/unrelated hold");
+    expect(host.storage.get("pitako-execution")).toEqual(execution);
+    // Restore the actual saved native receipt, not a model settlement assertion.
+    current.cycles[0]!.result = savedReceipt;
+    host.storage.set("invoke-human-2", current);
+    host.setRespond(request => request.agent === "pitako.execution-director" ? timeout(request) : gap(request));
+    expect(await host.execute("human-2", true, true)).toMatchObject({ status: "partial", cycles: 3 });
+    expect(host.calls.filter(call => call.agent === "pitako.execution-director").map(call => call.key))
+      .toEqual([1, 2, 3].map(cycle => `invoke-human-2-cycle-${cycle}`));
+    expect(host.storage.get("invoke-human-2")).toMatchObject({ withdrawal });
+    expect(host.storage.get("invoke-old-human")).toEqual(old);
+  });
+
   test.each([1, 2, 3])("%s confirmed timeouts consume slots and advance only after fresh settlement; replay grants none", async count => {
     const host = fixture();
     host.setRespond(request => {
@@ -87,7 +289,7 @@ describe("native execution workflow", () => {
       expect(host.storage.get("pitako-execution")).toMatchObject({ unsettled: { cycle } });
       if (cycle > 1) {
         expect(request.task).toContain(`/native/invoke-human-1-cycle-${cycle - 1}/session.jsonl`);
-        expect(request.task).toContain("Exact native descendant process-terminal proofs");
+        expect(request.task).toContain("Known native refs and Git observations");
         expect(request.task).toContain("Five increments with own checks and WIP commits");
         expect(request.task).toContain("COMPLETE IMMUTABLE SPECS");
       }
@@ -100,7 +302,7 @@ describe("native execution workflow", () => {
     for (const request of directors) { expect(request.context).toBe("fresh"); expect(request.cwd).toBe(config.root); }
     for (let cycle = 1; cycle <= count; cycle++) {
       const settlement = host.calls.find(request => request.key === `invoke-human-1-cycle-${cycle}-settlement`)!;
-      expect(settlement.task).toContain("EVERY owned descendant");
+      expect(settlement.task).toContain("known owned descendant references");
       expect(settlement.task).toContain("plus actual Git changes");
       expect(settlement.task).toContain("Pending permissions");
       expect(result.references).toContainEqual(expect.objectContaining({ key: `invoke-human-1-cycle-${cycle}`, runId: `native-invoke-human-1-cycle-${cycle}` }));
@@ -146,37 +348,38 @@ describe("native execution workflow", () => {
     expect(await work).toMatchObject({ status: "complete", cycle: 2 });
   });
 
-  test.each(["live", "stale", "pending-permission", "missing", "reused", "refused", "no-evidence", "third-unsafe"])("timeout with %s settlement remains blocked across technical recovery and new invocations", async fault => {
+  test.each(["live", "stale", "pending-permission", "missing", "reused", "refused", "no-evidence", "third-unsafe"])("timeout with %s observations preserves barriers/pending diagnosis across recovery", async fault => {
     const host = fixture();
+    host.setStatus(ref => ref === "exact-unsafe" ? { ok: true, state: "running" } : { ok: true, results: [] });
     host.setRespond(request => {
       if (request.agent === "pitako.execution-director") return timeout(request);
-      if (request.key.endsWith("settlement") && (fault !== "third-unsafe" || request.key.includes("cycle-3"))) {
+      if ((request.key.endsWith("settlement") || request.key.endsWith("admission")) && (fault !== "third-unsafe" || request.key.includes("cycle-3") || request.key.endsWith("admission"))) {
         if (fault === "missing") return undefined;
-        return { ok: fault !== "refused", reused: fault === "reused", runId: "inspection", structuredOutput:
-          { status: ["live", "stale", "pending-permission", "third-unsafe"].includes(fault) ? "blocked" : "verified", evidence: fault === "no-evidence" ? "" : "Native descendant still live / evidence stale / permission unresolved" } };
+        return { ok: fault !== "refused", recovery: fault === "pending-permission" ? { state: "pending" } : undefined,
+          reused: fault === "reused", runId: "inspection", structuredOutput:
+          { evidence: ["no-evidence", "stale"].includes(fault) ? "" : "Concrete native refs / Git evidence",
+            nativeRefs: ["live", "third-unsafe"].includes(fault) ? ["exact-unsafe"] : [] } };
       }
       return gap(request);
     });
     expect((await host.execute()).status).toBe("blocked");
     const count = host.calls.filter(request => request.agent === "pitako.execution-director").length;
     expect(count).toBe(fault === "third-unsafe" ? 3 : 1);
-    const calls = host.calls.length;
     expect((await host.execute()).status).toBe("blocked");
     expect((await host.execute("human-2")).status).toBe("blocked");
-    expect(host.calls).toHaveLength(calls);
+    expect(host.calls.filter(request => request.agent === "pitako.execution-director")).toHaveLength(count);
     expect(host.storage.get("pitako-execution")).toMatchObject({ unsettled: { cycle: count } });
   });
 
-  test.each(["error-text", "model-timeout", "stopped", "interrupted", "detached", "running", "missing", "no-run-id"])("does not retry ordinary failure, Stop, or unconfirmed timeout: %s", async fault => {
+  test.each(["stopped", "interrupted", "detached", "running", "missing", "recovery", "permission"])("does not replace native Stop/pending/unsafe delegation: %s", async fault => {
     const host = fixture();
     host.setRespond(request => {
       if (request.key.endsWith("prepare")) return gap(request);
       if (fault === "missing") return undefined;
-      if (fault === "error-text") return { ok: false, runId: "failed", error: "timed out", results: [{ timedOut: false }] };
-      if (fault === "model-timeout") return { ok: false, runId: "failed", structuredOutput: { timedOut: true, status: "timeout", writersSettled: true } };
       const result = timeout(request);
-      if (fault === "no-run-id") delete result.runId;
-      else if (fault === "running") result.state = "running";
+      if (fault === "running") result.state = "running";
+      else if (fault === "recovery") result.recovery = { pending: true };
+      else if (fault === "permission") result.error = "Blocked by pi-subagents permission rule: 'bash' is denied.";
       else result[fault as "stopped" | "interrupted" | "detached"] = true;
       return result;
     });
@@ -184,7 +387,23 @@ describe("native execution workflow", () => {
     expect(host.calls.map(request => request.key)).toEqual(["invoke-human-1-prepare", "invoke-human-1-cycle-1"]);
   });
 
-  test("interruption after saving timeout but before settlement remains blocked without relaunch", async () => {
+  test.each(["error-text", "model-timeout", "no-run-id"])("unconfirmed timeout is diagnosis, never a timeout retry or activity claim: %s", async fault => {
+    const host = fixture();
+    host.setRespond(request => {
+      if (request.agent !== "pitako.execution-director") return complete(request);
+      if (fault === "error-text") return { ok: false, runId: "failed", error: "timed out", results: [{ timedOut: false }] };
+      if (fault === "model-timeout") return { ok: false, runId: "failed", structuredOutput: { timedOut: true, status: "timeout", writersSettled: true } };
+      const result = timeout(request); delete result.runId; return result;
+    });
+    expect(await host.execute()).toMatchObject({ status: "partial", cycles: 3 });
+    const saved = JSON.stringify(host.storage.get("invoke-human-1"));
+    expect(saved).not.toContain('"terminalOutcome"');
+    expect(host.calls.filter(request => request.agent === "pitako.execution-director").map(request => request.key))
+      .toEqual([1, 2, 3].map(cycle => `invoke-human-1-cycle-${cycle}`));
+    expect(host.storage.get("pitako-execution")).toMatchObject({ unsettled: null });
+  });
+
+  test("interruption before observations gets read-only recovery without retrying the consumed timeout", async () => {
     const host = fixture();
     host.setRespond(request => {
       if (request.key.endsWith("cycle-1")) return timeout(request);
@@ -193,8 +412,9 @@ describe("native execution workflow", () => {
     });
     expect((await host.execute()).status).toBe("blocked");
     expect(host.storage.get("invoke-human-1")).toMatchObject({ cycles: [{ attempted: true, result: { terminalOutcome: { reason: "timeout" } } }] });
-    const calls = host.calls.length;
-    expect((await host.execute()).status).toBe("blocked"); expect(host.calls).toHaveLength(calls);
+    host.setRespond(request => request.agent === "pitako.execution-director" ? timeout(request) : gap(request));
+    expect(await host.execute()).toMatchObject({ status: "partial", cycles: 3 });
+    expect(host.calls.filter(request => request.key === "invoke-human-1-cycle-1")).toHaveLength(1);
   });
 
   test("technical continuation after settled timeout uses only the next remaining slot", async () => {
@@ -206,7 +426,7 @@ describe("native execution workflow", () => {
     });
     expect((await host.execute()).status).toBe("blocked");
     expect(host.storage.get("pitako-execution")).toMatchObject({ unsettled: null });
-    expect(host.storage.get("invoke-human-1")).toMatchObject({ cycles: [{ attempted: true, settlement: { structuredOutput: { status: "verified" } } }] });
+    expect(host.storage.get("invoke-human-1")).toMatchObject({ cycles: [{ attempted: true, settlement: { structuredOutput: { evidence: "Known native refs and Git observations" } } }] });
     host.calls.length = 0;
     expect(await host.execute()).toMatchObject({ status: "partial", cycles: 3 });
     expect(host.calls.filter(request => request.agent === "pitako.execution-director").map(request => request.key))
@@ -219,7 +439,7 @@ describe("native execution workflow", () => {
     const host = fixture();
     host.storage.set("invoke-human-1", { digest: "original", source: "/owned/sibling/.pitako/plans/spec.md", content: "snapshot",
       preparation: { todo: "prepared" }, cycles: [{ attempted: true, result: { ok: false, runId: "timed-out", terminalOutcome: { state: "partial", reason: "timeout" } } }] });
-    expect((await host.execute()).reason).toContain("lacks recorded independent settlement");
+    expect((await host.execute()).reason).toContain("lacks recorded independent observations");
     expect(host.calls).toHaveLength(0);
   });
 
@@ -270,9 +490,10 @@ describe("native execution workflow", () => {
     const host = fixture();
     const pointers = { runId: "supplied-director", artifactPaths: ["/actual/native/report.json", "/actual/native/session.jsonl"], outputReference: "/actual/native/output.md", asyncDir: "/actual/native/async" };
     host.setRespond(request => request.agent === "pitako.execution-director"
-      ? { ...gap(request), ...pointers, structuredOutput: { status: "complete", summary: "Done", remaining: "None", evidence: "Supplied artifacts", writersSettled: true } }
+      ? { ...gap(request), ...pointers, structuredOutput: { status: "complete", summary: "Done", remaining: "None", evidence: "Supplied artifacts" } }
       : { ok: true, runId: request.key, structuredOutput: request.key.endsWith("prepare")
-        ? { status: "ready", todo: "Prepared", evidence: "Checkout" } : { status: "verified", evidence: "Inspected actual pointers" } });
+        ? { status: "ready", nativeRefs: [], todo: "Prepared", evidence: "Checkout" } : request.key.endsWith("settlement")
+          ? { evidence: "Inspected actual pointers", nativeRefs: [] } : { status: "verified", evidence: "Inspected actual pointers" } });
     const reference = { key: "invoke-human-1-cycle-1", ...pointers };
     const result = await host.execute(); expect(result.status).toBe("complete");
     const inspectors = host.calls.filter(request => request.key.endsWith("settlement") || request.key.endsWith("validate"));
@@ -322,7 +543,7 @@ describe("native execution workflow", () => {
     for (const invocation of ["human-1", "human-2"])
       expect(host.storage.get(`invoke-${invocation}`)).toMatchObject({ content, cycles: [1, 2, 3].map(cycle => ({ result: {
         ...pointers({ key: `invoke-${invocation}-cycle-${cycle}` } as Request), ok: true,
-        structuredOutput: { status: "gaps", writersSettled: true },
+        structuredOutput: { status: "gaps" },
       } })) });
     const before = host.calls.length;
     expect((await host.execute("human-2")).status).toBe("partial"); expect(host.calls).toHaveLength(before);
@@ -337,14 +558,16 @@ describe("native execution workflow", () => {
     expect((await work).status).toBe("partial");
   });
 
-  test.each([false, "native-failure"])("uncertain or failed director blocks any replacement/new allowance: %s", async failure => {
-    const host = fixture(); host.setRespond(request => request.key.endsWith("prepare") ? gap(request) : failure === false
-      ? { ok: true, runId: "uncertain", structuredOutput: { status: "blocked", evidence: "Unknown grandchildren", writersSettled: false } }
-      : { ok: false, runId: "native-failed", error: "Native child infrastructure failure" });
-    expect((await host.execute()).status).toBe("blocked"); const count = host.calls.length;
-    expect((await host.execute()).reason).toContain("settlement");
-    expect((await host.execute("human-2")).status).toBe("blocked"); expect(host.calls).toHaveLength(count);
-    expect(host.storage.get("pitako-execution")).toMatchObject({ unsettled: { invocation: "human-1", cycle: 1 } });
+  test.each([false, "native-failure"])("negative model/native work outcome is not a historical writer veto: %s", async failure => {
+    const host = fixture(); host.setRespond(request => request.agent !== "pitako.execution-director" ? gap(request) : failure === false
+      ? { ok: true, runId: "uncertain", structuredOutput: { status: "gaps", evidence: "Red check; diagnose cause", writersSettled: false } }
+      : { ok: false, runId: "native-failed", error: "Native child failure" });
+    expect(await host.execute()).toMatchObject({ status: "partial", cycles: 3 });
+    expect(host.storage.get("pitako-execution")).toMatchObject({ unsettled: null });
+    const count = host.calls.length;
+    expect((await host.execute()).status).toBe("partial"); expect(host.calls).toHaveLength(count);
+    expect((await host.execute("human-2")).status).toBe("partial");
+    expect(host.calls.filter(request => request.agent === "pitako.execution-director")).toHaveLength(6);
   });
 
   test("an interrupted recorded attempt never blindly reruns director/grandchildren", async () => {
@@ -369,7 +592,7 @@ describe("native execution workflow", () => {
 
   test("native failure and product blockers stop early, not an unconditional repair loop", async () => {
     const host = fixture(); host.setRespond(request => request.key.endsWith("prepare") ? gap(request)
-      : { ok: true, runId: "blocked-cycle", structuredOutput: { status: "blocked", summary: "Need scope decision", remaining: "Human decision", evidence: "native refs", writersSettled: true } });
+      : { ok: true, runId: "blocked-cycle", structuredOutput: { status: "blocked", summary: "Need scope decision", remaining: "Human decision", evidence: "native refs" } });
     expect((await host.execute()).status).toBe("blocked"); expect(host.calls).toHaveLength(3);
   });
 });

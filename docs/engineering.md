@@ -72,14 +72,24 @@ a finite per-operation timeout; its native maximum is not a Pitako cycle budget.
 The old bridge has no historical replacement.
 
 The packaged execution-director alone uses native `timeoutMs: 7200000` (two
-hours), not a global or worker budget. A confirmed native timeout consumes its
-cycle. The fresh read-only execution-inspector must reconcile all descendants
-and actual Git before a new fresh director can use the next of three slots in
-the same invocation. Only non-reused verified settlement clears unsettled state;
-uncertain descendants, permissions, ordinary failures and Stop remain blockers.
-Compact timeout and settlement references survive replay; Git/WIP and immutable
-inputs are retained. Three settled timeouts return partial, never a fourth cycle
-or successful review. Later completion still requires current-checkout validation.
+hours). A confirmed timeout consumes one of three cycles in that explicit
+invocation; native awaited completion and fresh read-only Git/known-ref
+observations precede the next slot. Positive native active/pending, detached,
+recovery, Stop and permission signals block replacement. Failed tests/model
+verdicts are diagnosis, not activity proof or writer permission. Shared
+verify-behavior is explicitly selected in director/worker profiles.
+
+An unsettled historical marker permits pertinent read-only admission diagnosis.
+Missing retained awaited completion produces exact pending diagnosis and explicit
+`/execute <spec-id> --unblock` guidance. That actual human request maps to strict
+boolean data on the same named resource and can withdraw only that historical
+Pitako exclusion, recording the request/old refs in native mission state. It is
+not authentication, verified closure or a native barrier override. Old outcomes,
+counts, snapshots and Git/WIP remain. Same-ID replay cannot renew three slots or
+clear a newer hold. Status projection/inventory is incomplete: positive exact-ref
+native management warnings are advisory blockers; absent fields, status.ok and
+normal prose never certify CLOSED. No global process lock is claimed. Completion
+still needs current-checkout verification and whole-spec review.
 
 ## Verification boundary
 

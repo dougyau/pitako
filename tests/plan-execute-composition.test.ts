@@ -33,6 +33,15 @@ describe("plan/execute packaged composition", () => {
       const director = loaded.agents.find(agent => agent.name === "pitako.execution-director");
       expect(director?.defaultTimeoutMs).toBe(7200000);
       expect(director?.filePath).toBe(path.resolve("agents/execution-director.md"));
+      for (const role of ["worker", "execution-director"]) {
+        const agent = loaded.agents.find(agent => agent.name === `pitako.${role}`)!;
+        expect(agent.skills).toContain("verify-behavior");
+        const skill = agent.skillPath?.map(entry => path.resolve(path.dirname(agent.filePath), entry))
+          .find(entry => entry === path.resolve("skills/practical/verify-behavior"));
+        expect(skill).toBeDefined();
+        expect(readFileSync(path.join(skill!, "SKILL.md"), "utf8")).toContain("Triage a failing check");
+        expect(agent.systemPrompt).toContain("verify-behavior");
+      }
       for (const role of ["worker", "execution-inspector", "reviewer"]) {
         const agent = loaded.agents.find(agent => agent.name === `pitako.${role}`);
         expect(agent).toBeDefined(); expect(agent?.defaultTimeoutMs).toBeUndefined();
@@ -119,6 +128,10 @@ describe("plan/execute packaged composition", () => {
     expect(validateWorkflowScript(expanded.script)).toEqual({ ok: true, errors: [] });
     expect(() => executionResource().resolve({ ...args, invocation: "../escape" })).toThrow();
     expect(() => executionResource().resolve({ ...args, approval: true })).toThrow("Unknown");
+    for (const unblock of ["true", 1, {}, [], null])
+      expect(() => executionResource().resolve({ ...args, unblock })).toThrow("strict boolean");
+    expect(executionResource().resolve({ ...args, unblock: true }).script).toContain('"unblock":true');
+    expect(executionResource().resolve({ ...args, unblock: false }).script).toContain('"unblock":false');
     for (const missionId of [undefined, "", " ", false, {}, "../escape", "native..mission", "native/mission", "x".repeat(129)])
       expect(() => executionResource().resolve({ ...args, missionId })).toThrow("missionId");
     expect(expanded.script).toContain('"missionId":"native.mission-1"');
@@ -178,9 +191,10 @@ describe("plan/execute packaged composition", () => {
         state: { get: key => storage.get(key), set: (key, value) => { storage.set(key, structuredClone(value)); } },
         launch: async (key, request) => {
           launched.push(key); expect(request.cwd).toBe(root); expect(request.task).toContain(selected);
-          const value = key.endsWith("prepare") ? { status: "ready", todo: "Prepared", evidence: "Git" }
-            : key.endsWith("settlement") || key.endsWith("validate") ? { status: "verified", evidence: "Native settled/current evidence" }
-              : { status: "complete", summary: "Done", remaining: "None", evidence: "Review/checks", writersSettled: true };
+          const value = key.endsWith("prepare") ? { status: "ready", nativeRefs: [], todo: "Prepared", evidence: "Git" }
+            : key.endsWith("settlement") ? { evidence: "Known native refs/Git", nativeRefs: [] }
+            : key.endsWith("validate") ? { status: "verified", evidence: "Current review/check evidence" }
+              : { status: "complete", summary: "Done", remaining: "None", evidence: "Review/checks" };
           return { key, ok: true, output: "", runId: `native-${key}`, artifactPaths: [], structuredOutput: value };
         },
         status: async () => { throw new Error("Unexpected status"); },
@@ -246,9 +260,10 @@ describe("plan/execute packaged composition", () => {
       state: { get: key => storage.get(key), set: (key, value) => { storage.set(key, structuredClone(value)); } },
       launch: async (key, request) => {
         expect(request.task).toContain(selected.source); expect(request.task).toContain(content);
-        const value = key.endsWith("prepare") ? { status: "ready", todo: "Prepared", evidence: "Git" }
-          : key.endsWith("settlement") || key.endsWith("validate") ? { status: "verified", evidence: "Native settlement/current checks" }
-            : { status: key.endsWith("cycle-3") ? "complete" : "gaps", summary: "Bounded cycle", remaining: "Review gaps", evidence: "Review/checks", writersSettled: true };
+        const value = key.endsWith("prepare") ? { status: "ready", nativeRefs: [], todo: "Prepared", evidence: "Git" }
+          : key.endsWith("settlement") ? { evidence: "Known native refs/Git", nativeRefs: [] }
+          : key.endsWith("validate") ? { status: "verified", evidence: "Current review/check evidence" }
+            : { status: key.endsWith("cycle-3") ? "complete" : "gaps", summary: "Bounded cycle", remaining: "Review gaps", evidence: "Review/checks" };
         return { key, ok: true, output: "", artifactPaths: [], runId: `native-${key}`, structuredOutput: value };
       },
       status: async () => { throw new Error("Unexpected status"); },
@@ -281,9 +296,10 @@ describe("plan/execute packaged composition", () => {
         expect(admission).toEqual({ admitted: true, batch: true });
         expect(typeof request.agent).toBe("string"); expect(typeof request.task).toBe("string");
         calls.push({ key, agent: request.agent, task: request.task });
-        const value = key.endsWith("prepare") ? { status: "ready", todo: "Five increments if needed", evidence: "checkout" }
-          : key.endsWith("settlement") || key.endsWith("validate") ? { status: "verified", evidence: "Current artifacts and native descendant process proofs" }
-            : { status: "complete", summary: "Specs satisfied", remaining: "None", writersSettled: true, evidence: "Full-spec review and current checks" };
+        const value = key.endsWith("prepare") ? { status: "ready", nativeRefs: [], todo: "Five increments if needed", evidence: "checkout" }
+          : key.endsWith("settlement") ? { evidence: "Known native refs/Git", nativeRefs: [] }
+          : key.endsWith("validate") ? { status: "verified", evidence: "Current artifacts/review/checks" }
+            : { status: "complete", summary: "Specs satisfied", remaining: "None", evidence: "Full-spec review and current checks" };
         return { key, ok: true, output: "", runId: `native-${key}`, artifactPaths: [], ...(request.agent === "pitako.execution-director" ? pointers : {}), structuredOutput: value };
       },
       status: async () => { throw new Error("Unexpected status fallback"); },
@@ -330,7 +346,7 @@ describe("plan/execute packaged composition", () => {
     const tools = String(worker.tools).split(/,\s*/);
     for (const tool of ["read", "grep", "find", "ls", "bash", "edit", "write", "contact_supervisor", "apply_patch", "codegraph_explore", "codegraph_files", "lsp_symbols", "lsp_rename"]) expect(tools).toContain(tool);
     expect(tools).not.toContain("subagent"); expect(worker.allowNestedSubagents).toBeUndefined(); expect(worker.model).toBeUndefined();
-    expect(worker.skills).toBe("ponytail"); expect(worker.skillPath).toEqual(["../node_modules/@dietrichgebert/ponytail/skills/ponytail"]);
+    expect(worker.skills).toBe("ponytail, verify-behavior"); expect(worker.skillPath).toEqual(["../node_modules/@dietrichgebert/ponytail/skills/ponytail", "../skills/practical/verify-behavior"]);
     expect(worker.subagentOnlyExtensions).toEqual(["../node_modules/@vndv/pi-codegraph/extensions/codegraph.ts", "../node_modules/pi-lsp-client/src/index.ts", "../node_modules/pi-codex-tools/index.ts"]);
     for (const provider of worker.subagentOnlyExtensions as string[]) expect(existsSync(path.resolve("agents", provider))).toBe(true);
     for (const contract of ["single writer thread", "pause and escalate", "Ponytail is explicitly LITE", "Never\nreduce assigned specs or scope", "weaken project-required tests", "output schema/reporting", "edit/write"])

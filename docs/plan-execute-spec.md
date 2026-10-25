@@ -2,6 +2,10 @@
 
 Status: implementation candidate; independent acceptance not yet established.
 
+Admission/failure-triage correction: native owns lifecycle. The clarified
+contract below supersedes historical universal process-closure requirements in
+this migration design; it does not modify pi-subagents.
+
 This document specifies the replacement for Pitako's suspended `plan` and
 `execute` skills. It also requires importing Matt Pocock's `grilling` skill.
 The explicit implementation request supplies authority; this document is not
@@ -255,23 +259,15 @@ Do not add Pitako token, price, usage, or global/worker time budgets to a cycle.
 The packaged execution-director alone sets native `timeoutMs: 7200000` (two
 hours). Normal usage is subscription-based; other native runtime limits remain.
 
-A confirmed native director timeout consumes the current cycle attempt. Before
-continuing, a fresh read-only execution-inspector reconciles ALL owned
-descendants' process-terminal evidence and actual Git, even without a usable
-director verdict or `writersSettled` assertion. Native `terminalOutcome`
-partial/timeout or the single director native result's `timedOut` proves only
-cause, never safety. Error strings, model reports, wait timeouts and status
-labels do not establish cause or settlement. Only fresh non-reused verified
-settlement clears unsettled state and permits a new fresh director in the NEXT
-remaining cycle of the SAME invocation, mission, immutable snapshot and cwd.
-Preserve TODO/evidence/native artifact references and Git/WIP. Ordinary failure,
-cancellation/Stop, missing results, pending permissions and uncertain/live
-descendants or missing/stale/refused settlement remain blocked.
-Three settled timeouts return partial with recoverable remaining work; a third
-unsafe timeout blocks. Never retry the timeout cycle, reset consumed attempts,
-create an invocation/mission or add a fourth cycle. Timeout is not successful
-implementation or review; later completion still needs whole-spec review and
-current-checkout verification.
+A confirmed native director timeout consumes the current cycle attempt. Native
+cause is not safety proof. Fresh read-only Git/known-ref observations precede
+the next remaining slot in the SAME invocation. Native awaited completion handles
+ordinary owned runs; positive native active/pending/detached/recovery/Stop or
+permission signals block replacement. No model writersSettled boolean or universal
+descendant/process-closure certificate is required. Missing/reused/refused
+observations yield specific pending diagnosis and historical --unblock guidance,
+never successful review or a hidden timeout retry. Three observed timeouts return
+partial; later completion still needs whole-spec review and current verification.
 
 At the ceiling, return partial work and remaining gaps. A new explicit
 `/execute` invocation can authorize up to three more complete cycles on the
@@ -344,7 +340,8 @@ truth, and report stale or uncertain evidence rather than declare success.
 An interrupted director's internal TODO and grandchildren are not automatically
 restored as individual outer-workflow steps. Its replacement must reconcile
 native references, mission state, and Git before allowing another writer.
-If settlement or association cannot be established, report a blocker.
+Ambiguous association blocks. Missing historical lifecycle evidence requires
+specific pending diagnosis, not an invented active writer.
 
 Host commands and steering can run again during replay. Keep those operations
 read-only or idempotent; put implementation and commits in owned workers and
@@ -452,13 +449,34 @@ and a 39,936-byte UTF-8 spec boundary (shared docs may be linked, never truncate
 The native host-command API mandates a finite per-operation timeout; the native
 24-hour maximum applies only to these read-only reads, not workflow/agent budgets.
 
-Cycle attempts are saved before dispatch. An unrecorded settled result blocks
-rather than blindly replaying a possibly live writer, including the conservative
-pre-dispatch crash gap. Failed directors and uncertain descendants block further
-invocations until actual native mission/Git/settlement reconciliation. Successful
-recorded cycles may reuse results, but a reused final validator cannot establish
-current success. The workflow reports needs-validation instead. This adds no
-private ledger, automatic grandchild restoration, or exactly-once guarantee.
+Cycle attempts are saved before dispatch. An unrecorded attempt is never blindly
+rerun. Historical exclusion admits read-only diagnosis first. Missing retained
+awaited completion yields a specific pending response and an explicit
+`/execute <spec-id> --unblock` route (ID omitted only for unique association).
+Foreground maps only an actual explicit human request to strict boolean data on
+the same resource; the flag is neither authentication nor a child/model grant.
+After exact selected mission/spec/worktree checks and native observations, it
+may withdraw that historical Pitako exclusion without claiming inactivity or
+verified settlement. Positive current native activity/Stop/permission/recovery
+barriers remain; no global force, kill, new ledger or pi-subagents change.
+
+Native state retains the explicit request, old hold/refs and all prior outcomes,
+checks, counters and immutable input. A new explicit invocation has at most three
+slots; replay of the same ID never renews them or clears a newer/unrelated hold.
+Git/WIP is untouched. Incomplete native status/inventory is an honest limit, not
+an eternal exclusion: positive exact-ref public management warnings block, while
+missing state/empty results/status.ok/normal prose never certify CLOSED. Native
+awaited completion is provenance of an owned call, not universal process proof.
+
+Failed required checks or negative inspector/model verdicts are diagnostic work,
+not writer activity. Director and assigned workers load shared verify-behavior:
+read error/test, confirm own regression or trace the exact plausible mechanism,
+audit useful guarantees before justified retirement, check reproducibility and
+flake causes, diagnose timeout work/waits/contention/deadlocks rather than raise
+deadlines, and simplify fixtures/processes preserving coverage. Bounded necessary
+verification/stability edits can be within assignment, not global cleanup.
+Standalone recommendation/read-only authority modes remain. Inspectors provide
+facts and exact refs, never permission. Full gates and review remain required.
 
 The vendoring seams present in this checkout are `scripts/vendor-engineering-layer.py`
 and `docs/provenance.json`; no parallel provenance registry is introduced.

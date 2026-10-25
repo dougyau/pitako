@@ -16,7 +16,8 @@ function isMissionId(value: unknown): value is string {
 }
 export function executionResource(platform: NodeJS.Platform = process.platform) {
   return { name: "pitako.execute", version: 1, resolve(args: Readonly<Record<string, unknown>>) {
-    if (Object.keys(args).some(key => !["id", "root", "source", "invocation", "missionId"].includes(key))) throw new Error("Unknown execution argument.");
+    if (Object.keys(args).some(key => !["id", "root", "source", "invocation", "missionId", "unblock"].includes(key))) throw new Error("Unknown execution argument.");
+    if (args.unblock !== undefined && typeof args.unblock !== "boolean") throw new Error("Expected strict boolean unblock data from the explicit human request.");
     if (!isMissionId(args.missionId)) throw new Error("Expected an existing native missionId data pointer.");
     validatePlanId(args.id);
     validatePlanId(args.invocation);
@@ -25,7 +26,7 @@ export function executionResource(platform: NodeJS.Platform = process.platform) 
     const command = inspectionCommand([path.join(packageRoot(), "skills/execute/inspect.mjs"), root, args.id, args.source ?? ""], platform);
     const chunks = Array.from({ length: 26 }, (_, index) => ({ key: `input-${index}`, command: `${command} ${index}` }));
     const inspections = ["initial", "cycle-1", "cycle-2", "cycle-3", "validation-before", "validation-after"].map(phase => ({ key: `inspect-${phase}`, command: `${command} metadata` }));
-    const config = { root, id: args.id, invocation: args.invocation, missionId: args.missionId, inspections, chunks };
+    const config = { root, id: args.id, invocation: args.invocation, missionId: args.missionId, unblock: args.unblock === true, inspections, chunks };
     return { script: `const config = ${JSON.stringify(config)};\n${readFileSync(path.join(packageRoot(), "skills/execute/workflow.js"), "utf8")}`,
       hostCommands: [...inspections, ...chunks] };
   } };
