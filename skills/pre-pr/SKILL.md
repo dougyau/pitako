@@ -43,12 +43,24 @@ native workflow run reference. Return control after admission and use its final
 report, not child notifications, as evidence. If the preview truncates, read only
 the returned value from the cited result artifact.
 
-Require `status: "completed"` and a usable memo covering the complete current
-diff. Read supported findings, dispositions, uncertainties, coverage, and limits.
+Require `status: "completed"` and a usable memo. Coverage of the complete current
+diff may combine a prior whole-diff review with a closure review of corrections,
+as described in step 7. Read classifications, requirement sources, dispositions,
+uncertainties, coverage, and limits.
 Completion is not approval. Failed, cancelled, blocked, partial, or drifted work
 cannot support readiness. Resolve material findings and indispensable evidence
 gaps before proceeding. The Coordinator records its own readiness assessment;
 the workflow cannot grant permission, waive gates, or publish.
+
+Before assigning corrections, the Coordinator records each admitted finding's
+agreed requirement or existing guarantee, its source, material consequence if
+left unresolved, and smallest authorized correction. Decide whether existing
+evidence suffices or a new regression adds a distinct guarantee. Do not forward
+the report as an automatic repair list. Substantiated improvements and
+out-of-scope observations do not block readiness merely because they are real.
+Keep uncertain claims uncertain. Investigate indispensable evidence gaps without
+silently converting them into defects. Ask the user before adding a product
+guarantee; internal implementation choices do not become requirements by repetition.
 
 1. Pin the scope before editing. Record `git rev-parse --show-toplevel`, the current branch, `HEAD`, and `git status --short`. Use the cwd's worktree only.
 2. Choose a local comparison base in this order:
@@ -65,7 +77,33 @@ the workflow cannot grant permission, waive gates, or publish.
    - **A:** demonstrably nonsemantic subtraction; behavior and contracts are unchanged. Record the reason and evidence. Deletion alone does not prove A.
    - **B:** potentially semantic or uncertain, including changes to logic, state, lifecycle, concurrency, paths, security, permissions, public output, or workflow guidance that changes permissions. Treat uncertainty as B.
 
-   Before reporting readiness, confirm evidence includes an adequate independent review of the complete final diff. If no independent review covers it, obtain one through the review skill. If that workflow is unavailable or incomplete, report `BLOCKED`. B requires review of the whole final diff, not only the last patch. Reviewers do not fix findings; the Developer resolves them. Any B or uncertain edit invalidates the affected review: rerun affected checks and applicable final gates, then review the complete updated final diff. Repeat after further B or uncertain edits. An evidenced A does not require another review solely for cleanup when adequate independent review already covers it. This exception does not waive review required by risk. Do not claim prior review without evidence of its scope.
+   Before reporting readiness, require independent coverage of the complete final
+   diff. Obtain a whole-diff review through the review skill if none exists.
+   Reviewers do not fix findings; the Developer resolves admitted findings.
+
+   After a B or uncertain correction, rerun invalidated checks and applicable
+   final gates. Request a closure review through the same workflow, not another
+   unrestricted audit. Supply the prior report and exact reviewed candidate,
+   admitted findings, complete correction delta, affected guarantees, and
+   current check evidence in `brief`. Keep the complete updated candidate and
+   delta available in `target.material` for tracing interactions.
+
+   The closure review checks those corrections and affected guarantees. A new
+   finding can block when it demonstrates a correction regression, a missed
+   material defect in the agreed scope, or a grave risk such as data loss or a
+   security flaw. Record other new observations as recommendations, not repair
+   assignments. A grave out-of-scope risk can block readiness, but does not
+   authorize an out-of-scope fix.
+
+   Record how prior coverage and closure coverage together cover the final
+   candidate. Reuse only unaffected conclusions. If the prior material is
+   unavailable or interactions cannot be bounded, broaden the review to obtain
+   the missing coverage, including a whole-diff review when necessary. Failed,
+   incomplete, or unavailable required review leaves readiness `BLOCKED`.
+   Further semantic corrections require another closure review of their effects,
+   not an automatic restart of the audit. An evidenced A alone needs no new
+   review when adequate coverage remains valid. Do not impose a round cap or
+   claim prior review without evidence of its scope.
 8. Reinspect the complete diff and scoped Git status, including staged, unstaged, and relevant untracked files. Inspect staged and unstaged scoped changes and relevant untracked files during cleanup; do not omit them from review. Check for generated residue, secrets, and unrelated edits. Check any PR copy already present in the worktree; do not retrieve one remotely.
 
 ## Report

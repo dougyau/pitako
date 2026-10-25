@@ -22,13 +22,21 @@ The caller interprets the report and retains authority over any further action.
    `plan`, `solution`, `codebase`, or `issue`), `reference` (the exact revision,
    artifact, or named scope), and `material` (the reviewable text or exact
    read-only artifact paths). A commit label alone is not a diff.
-   Include requirements, non-goals, and relevant evidence in `brief`.
+   Include requirements with their sources, non-goals, and relevant evidence in
+   `brief`. Distinguish agreed requirements from internal implementation choices.
    Resolve material ambiguity before dispatch. Arguments persist; omit secrets.
 
 Keep source artifacts stable for the duration of the pass. Every child receives
 the same target, but the workflow does not snapshot the checkout or certify that
 referenced files stayed unchanged. If they change, the report is not current:
-capture the new target and start a new pass.
+capture the new target and start a new pass. After corrections, use a closure
+review rather than restarting the audit by default. In `brief`, name the prior
+review and exact reviewed candidate, admitted findings, correction delta,
+affected guarantees, and still-valid evidence. Keep the complete current
+candidate in `target.material` alongside that delta. All reviewers share this
+boundary and can inspect relevant interactions in the complete candidate.
+If prior coverage or the correction boundary is unavailable, obtain the missing
+coverage instead of claiming closure.
 
 ## Launch
 
@@ -67,6 +75,11 @@ same complete target, not files or subtasks:
    When there are no findings, both phases need no child calls. No extra rounds.
 3. **Synthesis.** The director deduplicates and records a reasoned disposition
    for every finding: include, discard, or uncertain. Evidence decides, not votes.
+   Each finding and final disposition also has a `classification`:
+   `scoped-defect`, `related-improvement`, `out-of-scope`, or `uncertain`.
+   `requirement` cites the agreed requirement or existing guarantee and its
+   source for a scoped defect; it is `null` when none is established.
+   Cross-critique challenges both factual support and belonging to the scope.
    Unresolved claims stay uncertain rather than becoming defects automatically.
 
 The workflow makes no model overrides. Pi-subagents owns native child model
@@ -81,7 +94,14 @@ Read the returned `status`, not just workflow process success:
 - `failed`: a child or protocol failed; no complete review is claimed.
 
 Completion is not a clean verdict, merge approval, or acceptance. The memo must
-separate supported findings, uncertainties, checked coverage, and limits.
+separate scoped defects, non-blocking improvements and out-of-scope observations,
+uncertainties, checked coverage, and limits. `include` means substantiated, not
+blocking or authorized for repair. The caller decides which corrections to
+admit by recording the requirement, material consequence, smallest correction,
+and whether existing evidence suffices or a distinct regression is needed.
+Ask the user before adding a product guarantee.
+For closure, new correction regressions, missed material scope defects, and
+grave risks can block. Other new observations remain recommendations.
 No findings does not mean unrun tests passed. Only the final report and native
 run references return to the caller; intermediate reports stay in native
 artifacts. If the completion preview truncates, read only the workflow's returned
@@ -95,7 +115,8 @@ diagnostic and run references. Config-form `runs.all` collects terminal failures
 including the director's, with their native run IDs. A dispatch rejection before
 a child result exists may have no run ID; the script does not invent one.
 Those references are diagnostic, not a workflow
-continuation. After correction, capture the current target and request a new pass explicitly.
+continuation. After correction, capture the current target and request a closure
+review explicitly.
 On Stop, cancel the owning workflow; cancellation admission is not closure.
 
 Read-only profiles are tool boundaries, not sandbox confinement or confidentiality.
