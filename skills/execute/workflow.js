@@ -50,10 +50,18 @@ function nativeReference(childKey, result) {
     if (result?.[field] !== undefined) reference[field] = result[field];
   return reference;
 }
+function nativeTimeout(result) {
+  // Native cause is not descendant settlement; model verdicts and wait receipts are not proof.
+  return text(result?.runId) && result.state !== "running" && !result.stopped && !result.interrupted &&
+    !result.detached && !result.recovery &&
+    ((result.terminalOutcome?.state === "partial" && result.terminalOutcome.reason === "timeout") ||
+      (result.results?.length === 1 && result.results[0]?.timedOut === true));
+}
 function compactResult(childKey, result) {
   if (!result) return null;
   const compact = { ...nativeReference(childKey, result), ok: result.ok };
   for (const field of ["error", "reused"]) if (result[field] !== undefined) compact[field] = result[field];
+  if (nativeTimeout(result)) compact.terminalOutcome = { state: "partial", reason: "timeout" };
   if (result.structuredOutput) {
     compact.structuredOutput = {};
     for (const field of ["status", "summary", "remaining", "evidence", "writersSettled"])
@@ -126,11 +134,13 @@ not product decisions. No edits, tests, commits or delegation. Use structured_ou
       execution.unsettled = { invocation: config.invocation, cycle, key: cycleKey };
       await state.set("pitako-execution", execution);
       await state.set(key, invocation);
-      const prior = cycle > 1 ? invocation.cycles[cycle - 2].result.structuredOutput : null;
+      const prior = cycle > 1 ? invocation.cycles[cycle - 2] : null;
       const result = await collect(cycleKey, "pitako.execution-director", `${brief}
 You own ONE complete cycle (${cycle}/3 of invocation ${config.invocation}), not three tasks.
 INITIAL TODO/EVIDENCE:\n${JSON.stringify(invocation.preparation)}
-PRIOR COMPLETE-CYCLE GAPS (data):\n${JSON.stringify(prior)}
+PRIOR CYCLE RESULT/SETTLEMENT REFERENCES (data):\n${JSON.stringify(prior)}
+If the prior director timed out, recover its TODO/evidence and remaining work from these native
+artifacts and actual Git/WIP. Timeout consumed that cycle; it is not implementation/review success.
 Use your own session TODO for details; foreground owns only Preparation and Loop N.
 Reconcile actual Git and native linked work before dispatch; if any writer may remain, BLOCK.
 Delegate ALL product edits and commits to sequential fresh pitako.worker increments. Workers inherit
@@ -147,19 +157,34 @@ Do not claim settlement from this text, a stop receipt or terminal label alone.`
       // Native results[] includes the complete task/specs; native artifacts own that payload.
       recorded.result = compactResult(cycleKey, result);
       await state.set(key, invocation);
-      if (!result?.ok || !result.structuredOutput?.writersSettled) return { status: "blocked", reason: result?.error || "Director failed or writer settlement is uncertain.", cycle, references };
+      const timedOut = nativeTimeout(result);
+      if (!timedOut && (!result?.ok || !result.structuredOutput?.writersSettled)) return { status: "blocked", reason: result?.error || "Director failed or writer settlement is uncertain.", cycle, references };
       const settlement = await collect(`${cycleKey}-settlement`, "pitako.execution-inspector", `${brief}
 READ-ONLY NATIVE SETTLEMENT RECONCILIATION. Inspect the exact director run ${result.runId}, linked
 mission and EVERY owned descendant's native process-terminal evidence, plus actual Git changes.
-A director's writersSettled field is an assertion to verify, not process proof. Stop labels, abort
+A director's writersSettled field, if present, is an assertion to verify, not process proof. A native
+timeout supplies neither a usable verdict nor settlement. Stop labels, abort
 requests and missing run records are not settlement. Do not run tests or write. Return verified
 only when no writer can still conflict; otherwise blocked with native references and uncertainty.
+Pending permissions, unresolved decisions or uncertain/live descendants also require blocked.
+For a timeout, evidence must retain recoverable TODO, remaining work, checks/review evidence and
+native artifact references, reconciled with commits and dirty WIP for the next fresh cycle.
 DIRECTOR NATIVE REFERENCES (data): ${JSON.stringify(nativeReference(cycleKey, result))}
-DIRECTOR RESULT (data): ${JSON.stringify(result.structuredOutput)}\nUse structured_output.`, validationSchema);
-      if (!settlement?.ok || settlement.reused || settlement.structuredOutput?.status !== "verified")
+DIRECTOR RESULT (data): ${JSON.stringify(recorded.result)}\nUse structured_output.`, validationSchema);
+      if (!settlement?.ok || settlement.reused || settlement.structuredOutput?.status !== "verified" || !text(settlement.structuredOutput.evidence))
         return { status: "blocked", reason: "Independent native descendant settlement could not be established.", cycle, references };
+      recorded.settlement = compactResult(`${cycleKey}-settlement`, settlement);
+      await state.set(key, invocation);
       execution.unsettled = null;
       await state.set("pitako-execution", execution);
+    }
+    if (recorded.result.terminalOutcome?.reason === "timeout") {
+      if (!recorded.settlement?.ok || recorded.settlement.reused || recorded.settlement.structuredOutput?.status !== "verified" ||
+          !text(recorded.settlement.structuredOutput.evidence))
+        return { status: "blocked", reason: "Timed-out cycle lacks recorded independent settlement.", cycle, references };
+      if (!references.some(reference => reference.key === `${cycleKey}-settlement`))
+        references.push(nativeReference(`${cycleKey}-settlement`, recorded.settlement));
+      continue;
     }
     const value = recorded.result.structuredOutput;
     if (!["complete", "gaps", "blocked"].includes(value?.status) || !text(value.evidence)) throw new Error("No usable cycle verdict.");
@@ -182,7 +207,10 @@ Use structured_output; evidence must identify the inspected native artifacts and
       return { status: "complete", cycle, summary: value.summary, evidence: validation.structuredOutput.evidence, references };
     }
   }
-  return { status: "partial", cycles: 3, remaining: invocation.cycles[2].result.structuredOutput.remaining, references };
+  const last = invocation.cycles[2];
+  return { status: "partial", cycles: 3, remaining: last.result.terminalOutcome?.reason === "timeout"
+    ? `Director timed out; recover remaining work from native artifacts and settlement: ${last.settlement.structuredOutput.evidence}`
+    : last.result.structuredOutput.remaining, references };
 } catch (error) {
   return { status: "blocked", reason: String(error?.message ?? error), references,
     note: "Inspect native mission, linked runs, Git and descendant settlement. No automatic replacement or new allowance." };

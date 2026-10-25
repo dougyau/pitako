@@ -251,14 +251,35 @@ Each invocation permits at most three complete cycles. This limit is not three
 workers, three tasks, or three commits. Stop before the ceiling when the specs
 are satisfied, a blocker requires a decision, or work cannot make progress.
 
-Do not add Pitako token, price, usage, or time budgets to a cycle. Normal usage
-is subscription-based. Existing native runtime limits and failures still apply;
-the workflow reports them instead of claiming to override them.
+Do not add Pitako token, price, usage, or global/worker time budgets to a cycle.
+The packaged execution-director alone sets native `timeoutMs: 7200000` (two
+hours). Normal usage is subscription-based; other native runtime limits remain.
+
+A confirmed native director timeout consumes the current cycle attempt. Before
+continuing, a fresh read-only execution-inspector reconciles ALL owned
+descendants' process-terminal evidence and actual Git, even without a usable
+director verdict or `writersSettled` assertion. Native `terminalOutcome`
+partial/timeout or the single director native result's `timedOut` proves only
+cause, never safety. Error strings, model reports, wait timeouts and status
+labels do not establish cause or settlement. Only fresh non-reused verified
+settlement clears unsettled state and permits a new fresh director in the NEXT
+remaining cycle of the SAME invocation, mission, immutable snapshot and cwd.
+Preserve TODO/evidence/native artifact references and Git/WIP. Ordinary failure,
+cancellation/Stop, missing results, pending permissions and uncertain/live
+descendants or missing/stale/refused settlement remain blocked.
+Three settled timeouts return partial with recoverable remaining work; a third
+unsafe timeout blocks. Never retry the timeout cycle, reset consumed attempts,
+create an invocation/mission or add a fourth cycle. Timeout is not successful
+implementation or review; later completion still needs whole-spec review and
+current-checkout verification.
 
 At the ceiling, return partial work and remaining gaps. A new explicit
 `/execute` invocation can authorize up to three more complete cycles on the
 same execution. It renews the cycle allowance, not the implementation state.
 A technical recovery retains the current invocation's count and active cycle.
+Compact timeout markers and settlement references survive replay without
+duplicating native task/spec payloads. Recovery never reruns a consumed timeout
+cycle; an interrupted unsettled attempt still requires explicit reconciliation.
 The workflow never raises its own ceiling. Raising the initial ceiling is a
 future user decision based on observed stability.
 

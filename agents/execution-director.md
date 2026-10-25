@@ -10,6 +10,7 @@ subagentOnlyExtensions:
 allowedAgents: pitako.worker, pitako.execution-inspector, pitako.reviewer
 acceptanceRole: read-only
 defaultContext: fresh
+timeoutMs: 7200000
 systemPromptMode: replace
 inheritProjectContext: true
 inheritGlobalContext: false
