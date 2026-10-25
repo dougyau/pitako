@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import devTools from "../node_modules/@nredd/pi-dev-tools/src/index.ts";
+import fileSha256 from "../extensions/file-sha256.ts";
 import pitako from "../extensions/index.ts";
 import profilePolicy from "../extensions/profile-policy.ts";
 import { packageRoot, readStack } from "../extensions/stack.ts";
@@ -29,6 +30,7 @@ function loadProfileExtensions(pi: ExtensionAPI, codex: (pi: ExtensionAPI) => vo
     ["./node_modules/pi-codex-tools/index.ts", codex],
     ["./extensions/profile-policy.ts", profilePolicy],
     ["./node_modules/@nredd/pi-dev-tools/src/index.ts", devTools],
+    ["./extensions/file-sha256.ts", fileSha256],
   ]);
   // These providers are outside this profile fixture's controlled boundary.
   const excluded = new Set([
@@ -137,8 +139,9 @@ describe("Pitako resources and policy", () => {
       await host.start();
       const provider = readStack(packageRoot()).required.find(({ id }) => id === "@nredd/pi-dev-tools");
       expect(provider).toBeDefined();
-      expect(host.registeredTools).toEqual(["apply_patch", ...provider!.tools]);
+      expect(host.registeredTools).toEqual(["apply_patch", ...provider!.tools, "file_sha256", "file_sha256_save"]);
       for (const name of provider!.tools) expect(host.active).toContain(name);
+      for (const name of ["file_sha256", "file_sha256_save"]) expect(host.active).toContain(name);
       expect(host.registeredCommands).toEqual(["pitako"]);
       await expect(host.command("agents")).rejects.toThrow("Usage: /pitako");
     } finally { await host.shutdown(); }

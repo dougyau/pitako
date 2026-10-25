@@ -78,6 +78,10 @@ describe("stack configuration", () => {
       id: "@juicesharp/rpiv-todo", spec: "@juicesharp/rpiv-todo@2.11.0",
       entry: "extensions/todo.ts", tools: ["todo"],
     });
+    expect(stack.required.find(({ id }) => id === "pitako-file-sha256")).toEqual({
+      id: "pitako-file-sha256", spec: "pitako", entry: "extensions/file-sha256.ts",
+      tools: ["file_sha256", "file_sha256_save"],
+    });
     expect(manifest.dependencies["pi-hermes-memory"]).toBe("0.9.9");
     expect(manifest.bundledDependencies).toContain("pi-hermes-memory");
     expect(manifest.dependencies["billion-context-pi"]).toBe("0.1.83");

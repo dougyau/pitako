@@ -35,6 +35,7 @@
       "./node_modules/pi-lsp-client/src/index.ts",
       "./node_modules/@vndv/pi-codegraph/extensions/codegraph.ts",
       "./node_modules/@nredd/pi-dev-tools/src/index.ts",
+      "./extensions/file-sha256.ts",
       "./extensions/todo.ts",
       "./extensions/board/index.ts",
       "./node_modules/pi-subagents/bundle/index.js",
