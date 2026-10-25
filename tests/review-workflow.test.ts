@@ -9,7 +9,10 @@ interface Request {
 interface Result { ok: boolean; runId?: string; error?: string; structuredOutput?: unknown }
 interface Outcome {
   status: string; phase: string; memo?: string; error?: string;
-  dispositions?: { findingId: string; decision: string; reason: string }[];
+  dispositions?: {
+    findingId: string; decision: string; reason: string;
+    classification: string; requirement: string | null;
+  }[];
   references: { key: string; runId: string }[];
 }
 const args = {
@@ -23,10 +26,14 @@ const angles = [
 const finding = {
   title: "PRIVATE_FINDING", location: "src/api.ts:12", scenario: "Caller passes an empty key",
   evidence: "Guard removed by the supplied patch", impact: "Wrong record selected",
+  classification: "scoped-defect", requirement: "README.md: caller keys must select the matching record",
 };
 const challenge = { findingId: "a-1", assessment: "refuted", evidence: "Caller rejects empty keys" };
 const response = { findingId: "a-1", disposition: "withdraw", reason: "Confirmed the caller guard" };
-const disposition = { findingId: "a-1", decision: "discard", reason: "Existing guard prevents the scenario" };
+const disposition = {
+  findingId: "a-1", decision: "discard", reason: "Existing guard prevents the scenario",
+  classification: finding.classification, requirement: finding.requirement,
+};
 function child(key: string, properties?: object): Result {
   let body: object;
   if (key === "director-prepare") body = { angles };
@@ -111,6 +118,8 @@ describe("review scripted workflow", () => {
     ]);
     const byKey = (key: string) => host.calls.find(call => call.key === key)!.request;
     expect(byKey("critique-b").task).toContain("PRIVATE_FINDING");
+    expect(byKey("critique-b").task).toContain(finding.requirement);
+    expect(byKey("critique-b").task).toContain("Challenge both factual support and belonging");
     expect(byKey("critique-b").resume).toBe("native-independent-b");
     expect(byKey("defense-a").resume).toBe("native-independent-a");
     expect(byKey("defense-a").task).toContain(challenge.evidence);
@@ -203,8 +212,66 @@ describe("review scripted workflow", () => {
   test.each(["include", "uncertain", "discard"])("allows evidence-based %s without a vote", async decision => {
     const host = fixture(key => child(key, key === "director-synthesis"
       ? { memo: "Explicit source contradiction and evidence limits.",
-        dispositions: [{ ...disposition, decision, reason: "Director cites contrary source evidence" }] } : {}));
+        dispositions: [{ ...disposition, decision,
+          classification: decision === "uncertain" ? "uncertain" : "scoped-defect",
+          reason: "Director cites contrary source evidence" }] } : {}));
     expect((await host.execute()).dispositions?.[0]?.decision).toBe(decision);
+  });
+
+  test("closure review preserves scope distinctions without turning supported suggestions into repair authority", async () => {
+    const classifications = ["scoped-defect", "related-improvement", "out-of-scope", "uncertain"];
+    const findings = classifications.map(classification => ({
+      ...finding, classification,
+      requirement: classification === "scoped-defect" ? finding.requirement : null,
+    }));
+    const dispositions = findings.map((entry, index) => ({
+      ...disposition, findingId: `a-${index + 1}`, classification: entry.classification,
+      requirement: entry.requirement, decision: entry.classification === "uncertain" ? "uncertain" : "include",
+    }));
+    const input = { ...args, brief: `${args.brief}
+Closure review of candidate-16 against candidate-17: close admitted finding a-1.
+Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffected coverage.` };
+    const host = fixture(key => child(key,
+      key === "independent-a" ? { findings }
+        : key === "critique-b" ? { challenges: dispositions.map(entry =>
+          ({ ...challenge, findingId: entry.findingId })) }
+          : key === "defense-a" ? { responses: dispositions.map(entry =>
+            ({ ...response, findingId: entry.findingId })) }
+            : key === "director-synthesis" ? { dispositions, memo: "Scoped defect and recommendations kept separate." }
+              : {}));
+    const result = await host.execute(input);
+    expect(result.status).toBe("completed");
+    expect(result.dispositions).toEqual(dispositions);
+    for (const { request } of host.calls.filter(call => !call.request.resume)) {
+      expect(request.task).toContain(input.brief);
+      expect(request.task).toContain(JSON.stringify(input.target));
+    }
+    for (const { request } of host.calls) {
+      expect(request.task).toContain("Honor the agreed review boundary");
+      expect(request.task).toContain("not reopening an audit by default");
+      expect(request.task).toContain("correction delta, admitted findings, and affected guarantees");
+      expect(request.task).toContain("keep other new observations non-blocking");
+      expect(request.task).toContain("the caller admits work");
+      expect(request.task).toContain("name its distinct guarantee");
+      expect(request.task).not.toContain("Inspect the complete target independently");
+    }
+    for (const key of ["independent-a", "director-synthesis"]) {
+      const schema = host.calls.find(call => call.key === key)!.request.outputSchema;
+      const collection = key === "independent-a" ? "findings" : "dispositions";
+      expect(schema).toMatchObject({
+        properties: {
+          [collection]: {
+            items: {
+              required: expect.arrayContaining(["classification", "requirement"]),
+              properties: {
+                classification: { enum: classifications },
+                requirement: { anyOf: [{ type: "string", minLength: 1 }, { type: "null" }] },
+              },
+            },
+          },
+        },
+      });
+    }
   });
 
   test.each(["independent", "critique", "defense"])(
@@ -375,9 +442,16 @@ describe("review scripted workflow", () => {
 
   test.each([
     ["independent-a", { findings: [{ ...finding, evidence: "" }] }],
+    ["independent-a", { findings: [{ ...finding, classification: "blocking" }] }],
+    ["independent-a", { findings: [{ ...finding, requirement: null }] }],
+    ["independent-a", { findings: [{ ...finding, requirement: undefined }] }],
     ["independent-a", { findings: null }],
     ["independent-a", { coverage: "" }],
     ["director-synthesis", { memo: "" }],
+    ["director-synthesis", { dispositions: [{ ...disposition, classification: "blocking" }] }],
+    ["director-synthesis", { dispositions: [{ ...disposition, requirement: null }] }],
+    ["director-synthesis", { dispositions: [{ ...disposition, requirement: undefined }] }],
+    ["director-synthesis", { dispositions: [{ ...disposition, classification: "uncertain", decision: "include" }] }],
   ] as const)("rejects inadequate report evidence at %s", async (key, properties) => {
     const host = fixture(current => child(current, current === key ? properties : {}));
     const result = await host.execute();

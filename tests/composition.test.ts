@@ -335,8 +335,13 @@ describe("engineering-layer composition", () => {
       "The Coordinator records its own readiness assessment",
       "Failed, cancelled, blocked, partial, or drifted work",
       "Never commit, push", "required review is unavailable", "READY_TO_PUSH",
-      "pi-subagents worker profile",
+      "pi-subagents worker profile", "Do not forward",
+      "distinct guarantee", "Ask the user before adding a product",
+      "Request a closure review", "complete correction delta",
+      "Reuse only unaffected conclusions", "interactions cannot be bounded",
+      "authorize an out-of-scope fix",
     ]) expect(skill).toContain(contract);
+    expect(skill).not.toContain("then review the complete updated final diff. Repeat");
     for (const contract of ["review_start", "team_result", "AgentInstance"]) expect(skill).not.toContain(contract);
     for (const name of ["plan", "execute"])
       expect(readRepo(`skills/${name}/SKILL.md`)).not.toContain("disable-model-invocation: true");
