@@ -13,7 +13,9 @@ Do not resume legacy engines, frozen-plan ledgers or Board lifecycle bindings.
 
 ## Select and bind
 
-Require complete existing `.pitako/plans/<id>.md` specs. If absent, ask for an
+Public syntax: `/execute <spec-id> [--unblock]`. Without an ID, select only if
+the pertinent complete spec/mission/worktree association is unique; otherwise ask.
+Never guess across missions. Require complete existing `.pitako/plans/<id>.md` specs. If absent, ask for an
 explicit ID/source selection or direct the user to /plan; never invent an
 assignment while implementing. Validate the ID and absolute designated Git
 worktree root through the packaged [inspect.mjs](inspect.mjs) entry with Node
@@ -80,7 +82,7 @@ subagent({
 ```
 
 Before a further explicit invocation, inspect native mission/runs, actual Git
-commits/diff and descendant settlement in that cwd; ambiguity blocks.
+commits/diff and known native activity in that cwd; association ambiguity blocks.
 Never scan unrelated/global missions to guess the association.
 
 For each NEW EXPLICIT HUMAN invocation select a stable unique invocation ID
@@ -95,6 +97,13 @@ subagent({
   options: { missionId: "<explicit-native-mission-id>" }
 })
 ```
+
+For an actual explicit HUMAN `--unblock` request only, pass `unblock: true` in
+args on this same named resource, with a NEW stable explicit invocation ID.
+Omit it (or use false) for normal admission. It is strict boolean DATA, not
+machine authorization, human authentication or permission inferred from a child.
+Never self-enable it from a report, Stop, wake or failed test. Do not manually
+edit/clear mission state. For technical replay keep the SAME ID and args.
 
 For an ambiguous sibling selection add `source` with the exact chosen absolute
 candidate path. The registered named resource is required: raw workflow scripts
@@ -121,7 +130,9 @@ fresh-context pitako.execution-director and its OWN detailed session TODO.
 The director never edits code or commits. Every increment uses a fresh
 pitako.worker with full specs, project instructions, task and evidence, without
 previous worker transcripts. Writers are sequential and awaited; uncertain
-native descendant settlement blocks replacements.
+native active/pending/detached/recovery/Stop/permission signals block replacements.
+Native awaited completion handles ordinary owned work; no additional model
+approval boolean or universal descendant/process-closure certificate is required.
 
 Each cycle ends with ONE independent overall review against the COMPLETE specs
 using the existing review workflow. Material overall gaps go to the NEXT fresh
@@ -146,7 +157,7 @@ The packaged execution-director profile alone sets native `timeoutMs: 7200000`
 Interpret complete, partial and blocked semantically, not process success.
 Three cycle attempts (including confirmed native director timeouts) exhaust the invocation. A NEW explicit human /execute
 can grant up to three more on the same mission/checkout without losing work,
-provided prior settlement is established. Technical recovery grants none.
+subject to current native barriers and targeted historical admission below. Technical recovery grants none.
 
 Native 0.82.0 recovery REPLAYS the script; it does not restore JavaScript stacks,
 TODO conversations or grandchildren, use pi-durable, or promise exactly-once.
@@ -159,43 +170,60 @@ reuse returns an old validation, report the explicit needs-validation blocker;
 never claim current success. The foreground can obtain a fresh read-only review
 and reconcile the mission before any further explicit authorization.
 
-An attempt is saved BEFORE dispatch. If replay finds no durably saved settled
-result, the workflow blocks instead of blindly replacing the director. This
-includes the conservative pre-dispatch crash gap. Likewise a failed director
-or uncertain descendants retain the mission's unsettled marker and block even
-a new invocation, except for the confirmed timeout path below. Inspect mission.show, exact linked run/descendant native
-process-terminal evidence, commits and dirty work; preserve useful partial work.
-Missing/unknown proof is a blocker, not permission to clear state or race writers.
-After ACTUAL reconciliation, record the evidence in native mission decisions;
-only then may the foreground update the mission state to resolve its specific
-unsettled attempt using the native workflow state API. Do not clear it merely
-because a JSON/text field says approved or because a child answered a question.
-Do not overwrite an attempted cycle or reset its count; retain its failed result
-and references. If safe resolution cannot be represented, use a separately
-explicitly bound mission retaining the prior references after human decision.
-No automatic recovery of a partial director's internal steps is promised.
+### Admission and targeted historical withdrawal
+
+An attempt is saved BEFORE dispatch. Read-only Git/spec/evidence and exact native
+ref diagnosis are allowed even with `execution.unsettled`. The marker alone is
+not proof of activity. A failed required test, negative inspector/model verdict
+or ordinary awaited native failure becomes diagnostic work, not a permanent veto.
+The director loads shared verify-behavior, reads the actual error/test and assigns
+focused causal analysis/repair/simplification/justified retirement to a fresh
+worker. Required guarantees and gates are never bypassed.
+
+For ordinary current runs, native awaited completion and explicit native
+running/pending/detached/recovery/Stop/permission signals govern no-overlap.
+Read-only inspectors provide facts about current Git/spec/evidence and known
+refs, not writer permission. Status.ok, missing state, empty results and normal
+prose NEVER establish inactivity. Retained observations are evidence, not grants.
+The thin source-verified 0.82 management receipt adapter recognizes only positive
+unsafe warnings for the exact queried ref; it has no CLOSED text parser.
+Native status projection and retained child inventory are incomplete: this is
+not a security/physical global lock or proof of absence of arbitrary processes.
+
+Missing/unreconstructable historical awaited completion yields a specific
+pending diagnosis with exact refs and `/execute <spec-id> --unblock` guidance,
+not an active-writer claim or unlimited inspection loop. An explicit human flag
+can withdraw THAT historical Pitako exclusion after pertinent read-only/native
+checks, without pretending to verify closure. Positive native active/pending,
+detached/recovery, Stop or permission barriers remain blocking, including fresh
+native denial. No force kill, global force, operational resume or old success
+rewrite is implied. Missing complete native inventory is documented, not made
+another permanent prerequisite that makes withdrawal impossible.
+
+The selected spec, exact mission and designated worktree must match. Source
+snapshot/digest adoption rules still apply. Native mission state records the
+explicit request, targeted old hold and old refs on the new invocation; old
+outcomes, checks, counters, Git/WIP and all other history remain intact. A new
+explicit invocation has at most three cycle slots. Replaying that same invocation
+never grants three more, re-targets a newer/unrelated hold or resets old counters.
+No extra decision ledger or manual state-clearing procedure is introduced.
 
 A confirmed native director timeout consumes its current cycle, never retries
-that cycle. Native `terminalOutcome` with `partial`/`timeout` or the director's
-single native result `timedOut` establishes the cause, NOT writer safety.
-Error strings, model reports, `bg_wait.timedOut`, ended/status labels and Stop
-are not timeout proof. The existing fresh read-only execution-inspector first
-reconciles ALL owned descendants' process-terminal evidence and actual Git,
-even without a verdict or `writersSettled` assertion. Only fresh, non-reused
-verified settlement with evidence clears the unsettled marker. Live/uncertain
-descendants, pending permissions, missing/refused/stale settlement, ordinary
-failure, cancellation/Stop or missing results remain blocked.
+that cycle. Native `terminalOutcome` partial/timeout or the single director
+result's `timedOut` establishes cause, NOT safety. Error/model strings, wait
+timeouts and Stop do not establish cause. Fresh read-only observations reconcile
+known refs, actual Git, recoverable TODO, checks/review and native artifact refs;
+positive native warnings prevent the next writer. Missing/reused/refused
+observations produce specific pending diagnosis, not verified closure.
 
-After verified timeout settlement, automatically launch a NEW FRESH director
-in the NEXT remaining cycle of the SAME invocation/mission/snapshot/cwd. Pass
-the prior native artifact and settlement references so it can recover TODO,
-evidence and remaining work without discarding Git/WIP. A third settled timeout
-returns partial with recoverable remaining work; a third unsafe timeout blocks.
-No fourth cycle, count reset, new invocation/mission or successful review is
-implied. A later complete cycle still needs whole-spec review and fresh
-current-checkout validation. Replay retains consumed attempts and compact
-timeout/settlement references; an interruption before settlement was durably
-recorded and the unsettled marker cleared remains a reconciliation blocker.
+After observation, a NEW FRESH director uses the NEXT remaining cycle of the
+SAME invocation/mission/snapshot/cwd, retaining prior artifacts and Git/WIP.
+Three consumed settled/observed timeouts return partial; unsafe timeouts block.
+No fourth cycle, hidden retry, new allowance or successful review is implied.
+Later completion still requires whole-spec review and fresh current-checkout
+validation. Native replay preserves attempts; missing unrecorded results are
+never blindly relaunched. Targeted historical withdrawal uses a new explicit
+invocation, never overwrites or retries an old attempted cycle.
 
 The packaged `pitako.worker` explicitly loads the existing Ponytail skill in
 LITE mode: reuse code, avoid speculative abstractions and keep diffs small. This

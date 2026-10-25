@@ -103,6 +103,27 @@ If it is unavailable, report the blocker rather than substituting architect.
 The architecture and review skills are explicit workflows, not the default
 escalation route. A worker result is not coordinator acceptance.
 
+### Triage a failing check before choosing an edit
+
+Read the actual error and test, then choose the causal task, not blanket
+red-test-to-repair:
+
+1. Repair a confirmed regression owned by the assignment.
+2. For a plausible effect, trace the exact causal mechanism before editing or
+   attributing blame. Coincidence with a change is not causation.
+3. Audit the test's real useful guarantee. Recommend retiring a useless check;
+   edit/retire only within authorized scope, never delete a required spec guarantee.
+4. Check reproducibility and determinism. Diagnose a useful flake and fix its
+   cause, not a retry-until-green policy.
+5. For timeouts, inspect excessive work, waits, contention and deadlocks. Remove
+   avoidable causes rather than inflate deadlines.
+6. Simplify fixtures/processes when they obscure the behavior, preserving coverage.
+
+In an implementation assignment, bounded necessary verification-fixture and
+stability fixes can belong to that assignment; they are not automatic authority
+for unrelated product changes or global cleanup. Standalone `review-diff` remains
+read-only and `simplify-tests` still recommends unless edits are authorized.
+
 ## Reuse evidence only for the obligation it covers
 
 A wrapper may cover a required check when its observed commands, arguments,
