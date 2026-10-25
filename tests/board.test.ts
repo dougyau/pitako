@@ -135,6 +135,23 @@ describe("workspace", () => {
     expect(repositoryIdentity(repo)).not.toBe(repositoryIdentity(other));
   }));
 
+  test("bare-backed worktrees share Board identity without an administrative legacy root", fixture.ownedCase("bare-backed worktrees share Board identity without an administrative legacy root", () => {
+    const seed = gitRepo(), base = tempDir("pitako-board-bare-worktrees-");
+    const bare = path.join(base, "bare.git"), source = path.join(base, "source"), execution = path.join(base, "execution");
+    const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, stdio: "ignore" });
+    git(seed, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "initial");
+    git(seed, "clone", "--bare", "-q", seed, bare);
+    git(bare, "worktree", "add", "-qb", "source", source);
+    git(bare, "worktree", "add", "-qb", "execution", execution);
+    expect(() => boardWorkspace(bare)).toThrow("bare; no worktree");
+    for (const physicalRoot of [source, execution]) {
+      const workspace = boardWorkspace(physicalRoot);
+      expect(workspace.identity).toBe(bare);
+      expect(workspace.physicalRoot).toBe(physicalRoot);
+      expect(workspace.legacyRoots.sort()).toEqual([source, execution].sort());
+    }
+  }));
+
   test("rejects unresolved registered worktrees before Board family migration", fixture.ownedCase("rejects unresolved registered worktrees before Board family migration", () => {
     const { source, execution } = gitWorktreePair();
     rmSync(execution, { recursive: true, force: true });

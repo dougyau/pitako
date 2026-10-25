@@ -116,7 +116,7 @@ describe("engineering-layer composition", () => {
     expect(skill).toMatch(/^---\nname: architecture\ndescription: .+\n---/);
     for (const contract of [
       "same complete problem", "Use only `pi-subagents`",
-      "Never exceed five rounds", "Do not split the work",
+      "Never exceed ten rounds", "Do not split the work",
       "resume: lastRunId",
     ]) expect(skill).toContain(contract);
     for (const contract of ["async: true", "advanced-rolling-child-runs", "steering-a-workflow-child", "continuation"])
@@ -228,7 +228,7 @@ describe("engineering-layer composition", () => {
   test("ordinary delegation ships directly without the Pitako runtime", () => {
     const manifest = JSON.parse(readRepo("package.json"));
     const stack = JSON.parse(readRepo("config/stack.json"));
-    expect(manifest.dependencies["pi-subagents"]).toBe("0.81.0");
+    expect(manifest.dependencies["pi-subagents"]).toBe("0.82.0");
     expect(manifest.bundledDependencies).toContain("pi-subagents");
     const piPackages = new Set([...Object.keys(manifest.devDependencies), ...Object.keys(manifest.peerDependencies)]);
     for (const name of piPackages) {
@@ -239,7 +239,7 @@ describe("engineering-layer composition", () => {
     expect(manifest.pi.extensions.filter((entry: string) => entry.includes("pi-subagents")))
       .toEqual(["./node_modules/pi-subagents/bundle/index.js"]);
     expect(stack.required.find((entry: { id: string }) => entry.id === "pi-subagents"))
-      .toEqual({ id: "pi-subagents", spec: "pi-subagents@0.81.0", entry: "node_modules/pi-subagents/bundle/index.js",
+      .toEqual({ id: "pi-subagents", spec: "pi-subagents@0.82.0", entry: "node_modules/pi-subagents/bundle/index.js",
         tools: ["subagent", "subagents_enable", "bg_wait", "subagent_supervisor", "contact_supervisor"] });
     for (const resources of [manifest.pi.skills, manifest.pi.prompts])
       expect(resources.some((entry: string) => entry.includes("pi-subagents"))).toBe(false);
@@ -250,7 +250,7 @@ describe("engineering-layer composition", () => {
     for (const name of ["agent/index.ts", "team.ts", "roles/load.ts", "workflow.ts", "workflow-engine.ts"])
       expect(existsSync(path.join(packageRoot(), "extensions", name))).toBe(false);
     for (const entry of manifest.pi.extensions) expect(existsSync(path.join(packageRoot(), entry))).toBe(true);
-    for (const skill of ["plan", "execute"]) expect(manifest.pi.skills).not.toContain(`./skills/${skill}`);
+    for (const skill of ["plan", "execute", "grilling"]) expect(manifest.pi.skills).toContain(`./skills/${skill}`);
     expect(manifest.exports).toBeUndefined();
     expect(manifest.files).not.toContain("roles");
     expect(manifest.dependencies["smol-toml"]).toBeUndefined();
@@ -339,7 +339,7 @@ describe("engineering-layer composition", () => {
     ]) expect(skill).toContain(contract);
     for (const contract of ["review_start", "team_result", "AgentInstance"]) expect(skill).not.toContain(contract);
     for (const name of ["plan", "execute"])
-      expect(readRepo(`skills/${name}/SKILL.md`)).toContain("disable-model-invocation: true");
+      expect(readRepo(`skills/${name}/SKILL.md`)).not.toContain("disable-model-invocation: true");
   });
 
   test("/pitako status lists the catalog without loading the Ponytail extension", async () => {

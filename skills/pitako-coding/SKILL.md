@@ -62,6 +62,9 @@ The manifest starts with early profile setup, the independent official Codex ent
 | Cross-module design before code | `architecture-design` |
 | Explicit multi-perspective design discussion through pi-subagents | `architecture` |
 | Explicit advisory adversarial review through pi-subagents | `review` |
+| Clarify an authorized assignment into confirmed complete specs | `plan` |
+| Stress-test an idea with a decision-tree interview | `grilling` |
+| Implement complete selected specs through native mission cycles | `execute` |
 | Review unnecessary complexity without applying fixes | `ponytail-review` |
 | Novel architecture with no precedent | `principle-exhaust-the-design-space` |
 | Verify behavior, review test quality in a diff, or simplify tests within authorized scope | `verify-behavior` |
@@ -116,7 +119,10 @@ authorization, passing checks, or acceptance.
 
 The former AgentInstance, Team, Head, table, routing, and bridge runtime is
 retired. Its model policies and execution guarantees do not transfer to
-pi-subagents. `plan` and `execute` are suspended pending migration, and `/task`
+pi-subagents. `/plan` uses grilling and actual foreground human confirmation.
+`/execute` uses explicit native missions, fresh read-only cycle directors, and
+sequential fresh `pitako.worker` increments with CodeGraph/LSP and the official
+model-compatible apply_patch adapter. Only the cycle director delegates. `/task`
 is unavailable. No historical execution is resumed or maintained automatically.
 
 ## Web access

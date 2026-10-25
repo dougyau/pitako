@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { skillStatusLines } from "./catalog.ts";
+import planExecute from "./plan-execute.ts";
 import { isProtectedEditPath } from "./paths.ts";
 import { applyProfile, effectiveProfile, parseProfile, profileNote, requestedProfile, setSessionProfile } from "./profile.ts";
 import { sessionNameAction } from "./session-name.ts";
@@ -7,6 +8,7 @@ import { packageRoot, prepareRuntime } from "./stack.ts";
 
 export default function pitako(pi: ExtensionAPI): void {
   prepareRuntime(packageRoot());
+  planExecute(pi);
   pi.registerFlag("pitako-profile", {
     description: 'Pitako profile: "coding" (default) or "analysis"',
     type: "string",
@@ -64,7 +66,7 @@ export default function pitako(pi: ExtensionAPI): void {
         "analysis: navigation without edit, write, apply_patch, or lsp_rename. Shell is not sandboxed.",
         "Switch with /pitako profile analysis",
         "Session TODOs: todo and /todos. Shared knowledge: board_* and /board.",
-        "Delegation: pi-subagents. The architecture and review skills start their workflows.",
+        "Delegation: pi-subagents. Architecture, review, plan and execute skills start their workflows.",
         ...skillStatusLines(),
       ];
       if (ctx.hasUI) ctx.ui.notify(lines.join("\n"), "info");

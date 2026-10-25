@@ -1,6 +1,6 @@
 ---
 name: architecture
-description: Discuss an architectural decision through dynamic perspectives on the same complete problem, using one background pi-subagents scripted workflow and at most five rounds. Use for architecture, a design council, or contrasting viewpoints without splitting the work.
+description: Discuss an architectural decision through dynamic perspectives on the same complete problem, using one background pi-subagents scripted workflow and at most ten rounds. Use for architecture, a design council, or contrasting viewpoints without splitting the work.
 ---
 
 # Architecture
@@ -11,8 +11,8 @@ Do not split the work into specialist subtasks. Design advice does not authorize
 implementation.
 
 The skill initiates the workflow. Its director and perspective agents only
-reason about the supplied problem. `plan` and `execute` are suspended pending
-migration. This discussion does not start either workflow.
+reason about the supplied problem. `plan` uses this discussion with factual providers and a distinct doubts phase.
+An ordinary architecture discussion does not start execution.
 
 ## Prepare
 
@@ -45,7 +45,7 @@ at the project being discussed.
 subagent({
 	workflow: "<absolute skill directory>/workflow.js",
 	async: true,
-	args: { brief: "<complete decision brief>", maxRounds: 5 }
+	args: { brief: "<complete decision brief>", maxRounds: 10 }
 })
 ```
 
@@ -69,7 +69,7 @@ still-running peers through awaited `runs.steer`, then the script collects the
 remaining results. No child uses `async: true`, which would return an admission
 receipt instead of its report.
 
-Never exceed five rounds, including the initial round. Honor a lower positive
+Never exceed ten rounds, including the initial round. Honor a lower positive
 `maxRounds`. Stop earlier when further evidence is unlikely to change the
 recommendation. At the cap, preserve unresolved disagreements instead of forcing
 agreement. The script rejects an extra round.
@@ -120,9 +120,33 @@ The original decision and consumed round count remain in effect. Do not reset
 the count to extend the same discussion. Failed rounds consume that budget.
 The separate `validRounds` count increases only after every member returns a
 ready report. Completion requires at least one such round, including after a
-failed consultation is resumed. Only for an explicitly new decision,
-set `newDecision: true` and provide its complete brief. This reuses the director
-but starts fresh perspective members and a new round count.
+failed consultation is resumed. For an ordinary explicitly NEW human-authorized decision, `newDecision: true`
+with its complete new brief may reuse the director but starts fresh perspective
+members and a new count. Unchanged briefs cannot reset the same decision. The
+flag or slightly changed text is not proof of human authorization; the foreground
+must obtain the actual instruction. Normal continuations retain their count.
+Planning is stricter: it uses an explicit mission and stable consultation ID;
+native state retains consumed rounds even on repeated entry. `newDecision` may
+not reset that planning consultation. A genuinely new planning assignment needs
+its own separately authorized consultation. Its doubts phase dispatches factual
+providers between rounds. Reentry uses the same mission and consultation ID;
+the returned planning continuation is a bounded reference, not the retained
+reports. Do not resend full accumulated evidence in workflow arguments.
+It launches pitako.interview-relay through the native
+supervisor channel concurrently with independent research. Each doubt names
+explicit factual prerequisite IDs; only dependent human questions wait for those
+facts. The read-only relay does not decide: when its interview_request arrives,
+present the ENTIRE supplied frontier to the ACTUAL HUMAN immediately, wait for
+their answers, then use subagent_supervisor action reply with that request's
+replyTo. Do not answer preferences yourself or wait for unrelated research.
+Relay reports/receipts are decision context, not implementation permission or
+final confirmation. All launched work is awaited and native references retained.
+Prerequisites for each dependent frontier run before later groups or unrelated
+facts; its relay is submitted without waiting for the human answer. This delays
+some unrelated research to avoid FIFO admission delaying answerable questions,
+without a custom priority scheduler or preemption.
+At the ceiling, answer/evidence reconciliation and synthesis-only reentry remain
+available; no eleventh perspective round is permitted.
 
 Native retention and resume eligibility are finite. A failed resume stops the
 workflow; no fresh-context replacement or model substitution occurs silently.
