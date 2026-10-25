@@ -118,6 +118,7 @@ function canonicalGitDirectory(value: string, label: string): string {
 interface WorktreeEntry {
   path: string;
   prunable: boolean;
+  bare: boolean;
 }
 
 /** Verify Git's registered worktrees before inspecting any worktree-local artifacts. */
@@ -167,7 +168,7 @@ function parseWorktreeList(output: string): WorktreeEntry[] {
   const entries: WorktreeEntry[] = [];
   let current: WorktreeEntry | undefined;
   const finish = () => {
-    if (current) entries.push(current);
+    if (current && !current.bare) entries.push(current);
     current = undefined;
   };
   for (const field of output.split("\0")) {
@@ -178,10 +179,11 @@ function parseWorktreeList(output: string): WorktreeEntry[] {
       if (!worktreePath || !path.isAbsolute(worktreePath)) {
         throw new PitakoConfigError(`Git worktree list contains invalid path "${worktreePath}"`);
       }
-      current = { path: worktreePath, prunable: false };
+      current = { path: worktreePath, prunable: false, bare: false };
     } else if (!current) {
       throw new PitakoConfigError(`Git worktree list contains unexpected field "${field}"`);
-    } else if (/^prunable(?: |$)/.test(field)) current.prunable = true;
+    } else if (field === "bare") current.bare = true;
+    else if (/^prunable(?: |$)/.test(field)) current.prunable = true;
   }
   finish();
   if (entries.length === 0) throw new PitakoConfigError("Git worktree list contains no registered roots");

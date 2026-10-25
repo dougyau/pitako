@@ -34,7 +34,7 @@ Use `git diff --check` for publication readiness.
 ## Focused checks
 
 Choose explicit affected test files before the complete procedure. Profile,
-load, composition, Board, session naming, and the two scripted workflows are the
+load, composition, Board, session naming, and the scripted workflows are the
 main retirement regressions. Use small parallel groups when ownership changes.
 No configured-model or provider request is required.
 

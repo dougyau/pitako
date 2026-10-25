@@ -146,5 +146,21 @@
       "verify-behavior consolidates three retired skills; role defaults, router, and workflow entries reference the common evidence contract"
     ],
     "update": "Clone the pstack tree from cursor/plugins, set PSTACK_CHECKOUT, CAVEMAN_CHECKOUT, and PONYTAIL_CHECKOUT, then run scripts/vendor-engineering-layer.py. Re-apply the local modifications documented here. Bump docs/provenance.json."
+  },
+  "grilling": {
+    "decision": "vendor-exact",
+    "repository": "https://github.com/mattpocock/skills",
+    "revision": "5beb35b040e3de97e54fa9e386d7e42d15c295c2",
+    "license": "MIT",
+    "copyright": "Copyright (c) 2026 Matt Pocock",
+    "sourceMapping": {
+      "skills/productivity/grilling/SKILL.md": "skills/grilling/SKILL.md",
+      "LICENSE": "docs/licenses/mattpocock-skills-LICENSE"
+    },
+    "sha256": {
+      "skills/grilling/SKILL.md": "befdff1e27a1dfe2a294d5871169ac1afe16d983911daa4f32627514a48c1e15",
+      "docs/licenses/mattpocock-skills-LICENSE": "0e7ac423bf2c6e223b7c5b156f8cf72da49d748e56a1641402c31f22ad07dbb5"
+    },
+    "localModifications": []
   }
 }

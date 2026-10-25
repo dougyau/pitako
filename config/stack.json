@@ -65,7 +65,7 @@
     },
     {
       "id": "pi-subagents",
-      "spec": "pi-subagents@0.81.0",
+      "spec": "pi-subagents@0.82.0",
       "entry": "node_modules/pi-subagents/bundle/index.js",
       "tools": ["subagent", "subagents_enable", "bg_wait", "subagent_supervisor", "contact_supervisor"]
     },

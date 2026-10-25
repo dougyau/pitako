@@ -62,6 +62,28 @@ local publication readiness without committing or publishing.
 
 See [architecture](docs/architecture.md) and [review](docs/review.md).
 
+## Plan and execute
+
+`/plan <assignment>` uses the packaged Matt Pocock `grilling` procedure, read-only
+context providers and architecture with a doubts phase. The foreground obtains
+actual human shared-understanding confirmation before writing complete specs at
+`.pitako/plans/<id>.md`; it never edits product code or starts execution.
+
+`/execute <id>` selects complete specs local-first across registered worktrees,
+binds a native mission explicitly, and permits up to three complete cycles per
+explicit invocation. Each fresh read-only director owns its detailed TODO and
+delegates every edit/commit to sequential fresh `pitako.worker` increments.
+The worker retains normal implementation tools and adds CodeGraph, LSP and the
+official model-compatible apply_patch adapter, with edit/write fallback. Only the
+director delegates. Each cycle ends with independent whole-spec review; gaps go
+to the next fresh director, not an unlimited repair loop.
+
+See the [plan skill](skills/plan/SKILL.md), [execute skill](skills/execute/SKILL.md)
+and [migration spec](docs/plan-execute-spec.md) for source selection, native
+replay, immutable input snapshots, conservative settlement blockers and limits.
+Installing 0.82.0 does not prove a running host reloaded it. No provider/model is
+pinned and no Pitako usage budget, scheduler or private execution store is added.
+
 ## Retired orchestration
 
 Pitako no longer provides AgentInstance, Team, Developer Head, managed
@@ -69,10 +91,12 @@ Architect/Reviewer tables, `/task`, or the shared planning/execution engine.
 Its worker bridge and historical reader are removed. There are no compatibility
 tools or replacement scheduler.
 
-`plan` and `execute` are suspended and excluded from advertised skills pending
-their migration. Old configuration, plans, ledgers, histories, and Board bindings
+Old configuration, plans, ledgers, histories, and Board bindings
 are not resumed, completed, pruned, or migrated by the retired runtime. Loading
 the package does not require its former `config.toml` or model policies.
+
+The replacement uses new-contract specs and native missions, not legacy frozen
+status or old receipts.
 
 The retirement does not delete user files. Former reservation, fencing,
 fallback, delivery, checkpoint, and managed-acceptance guarantees are not
@@ -85,3 +109,9 @@ promises of pi-subagents.
 - [Contributing](AGENTS.md)
 - [Verification](GATES.md)
 - [Third-party provenance and licenses](THIRD_PARTY.md)
+
+The packaged `pitako.worker` explicitly loads the existing Ponytail skill in
+LITE mode: reuse code, avoid speculative abstractions and keep diffs small. This
+never reduces assigned specs/scope, weakens required tests or replaces acceptance
+criteria. Project instructions and output schemas/reporting take precedence over
+generic Ponytail prose/test-minimization preferences; upstream bytes are unchanged.

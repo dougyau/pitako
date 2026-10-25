@@ -55,7 +55,21 @@ workflow, not a general escalation role.
 
 `pre-pr` reuses the review skill, interprets its complete current-target report,
 and retains local checks and publication-readiness rules. It adds no workflow.
-Plan and execute are suspended. The old bridge has no historical replacement.
+Plan and execute compose the same architecture/review contracts. Foreground
+planning owns grilling and actual human confirmation. Execution uses a narrowly
+registered named resource for read-only spec/Git host inspections, native mission
+state for immutable invocation inputs and cycle attempts, fresh cycle directors,
+and sequential fresh packaged workers. Only the director opts into delegation,
+TODO and both supervisor channels. The ordinary worker retains the native worker
+contract plus explicit CodeGraph/LSP/Codex providers, without delegation.
+
+Registration is session-scoped and disposed on shutdown/re-registration. Helpers
+and scripts ship under extensions/skills. The raw sandbox cannot fs/import or
+call arbitrary tools. Native replay is not stack restoration or exactly-once;
+unrecorded attempts block for native mission/Git/descendant reconciliation.
+Reused results alone never prove current checks. The read-only host API requires
+a finite per-operation timeout; its native maximum is not a Pitako cycle budget.
+The old bridge has no historical replacement.
 
 ## Verification boundary
 
