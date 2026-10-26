@@ -465,7 +465,8 @@ describe("plan/execute packaged composition", () => {
     const tools = String(worker.tools).split(/,\s*/);
     for (const tool of ["read", "grep", "find", "ls", "bash", "edit", "write", "contact_supervisor", "apply_patch", "codegraph_explore", "codegraph_files", "lsp_symbols", "lsp_rename"]) expect(tools).toContain(tool);
     expect(tools).not.toContain("subagent"); expect(worker.allowNestedSubagents).toBeUndefined(); expect(worker.model).toBeUndefined();
-    expect(worker.skills).toBe("ponytail, verify-behavior"); expect(worker.skillPath).toEqual(["../node_modules/@dietrichgebert/ponytail/skills/ponytail", "../skills/practical/verify-behavior"]);
+    expect(String(worker.skills).split(/,\s*/)).toEqual(["ponytail", "verify-behavior"]);
+    expect(worker.skillPath).toEqual(["../node_modules/@dietrichgebert/ponytail/skills/ponytail", "../skills/practical/verify-behavior"]);
     expect(worker.extensions).toEqual(["../extensions/acp.ts"]);
     expect(worker.subagentOnlyExtensions).toEqual(["../node_modules/@nredd/pi-dev-tools/src/index.ts", "../extensions/file-sha256.ts", "../node_modules/@vndv/pi-codegraph/extensions/codegraph.ts", "../node_modules/pi-lsp-client/src/index.ts", "../node_modules/pi-codex-tools/index.ts"]);
     for (const provider of worker.subagentOnlyExtensions as string[]) expect(existsSync(path.resolve("agents", provider))).toBe(true);
