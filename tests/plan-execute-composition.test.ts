@@ -28,7 +28,7 @@ describe("plan/execute packaged composition", () => {
   test("execute prompt binds foreground effective-profile checks before mission mutation or preparation, not SDK confinement", () => {
     const prompt = read("prompts/execute.md"), skill = read("skills/execute/SKILL.md");
     expect(prompt).toContain("FIRST perform the skill's effective-profile preflight");
-    expect(prompt).toContain("STOP before mission creation, state mutation or preparation");
+    expect(prompt).toContain("Only after compatibility passes, bind a native mission explicitly");
     const preflight = skill.slice(skill.indexOf("## Effective-profile preflight"), skill.indexOf("List existing foreground TODOs"));
     for (const role of ["execution-inspector", "execution-director", "worker"]) {
       const marker = `<!-- pitako-execute-contract: ${role}/1 -->`;
@@ -45,34 +45,34 @@ describe("plan/execute packaged composition", () => {
     expect(skill).toContain("Compatibility does not override negative current preparation or native barriers");
   });
 
-  test("execute instruction assembly requires known native trust before get, binding and withdrawal; no untrusted fallback", () => {
+  test("execute instruction assembly permits public get and native workflow operations with opaque T3 trust", () => {
     const prompt = read("prompts/execute.md"), skill = read("skills/execute/SKILL.md");
-    expect(prompt).toContain("known foreground native project-trust approval for that designated root BEFORE action:get");
-    expect(prompt).toContain("including --unblock withdrawal");
-    const start = skill.indexOf("FIRST require known foreground native project-trust approval");
-    const get = skill.indexOf('action: "get", agent: "pitako.execution-inspector"');
-    const bind = skill.indexOf('action: "mission.create"');
-    expect(start).toBeGreaterThan(skill.indexOf("## Effective-profile preflight"));
-    expect(get).toBeGreaterThan(start);
-    expect(bind).toBeGreaterThan(get);
-    const trust = skill.slice(start, get);
+    const instructions = `${prompt}\n${skill}`.replace(/\s+/g, " ");
+    expect(prompt).toContain("Unknown or unobservable native trust is not a denial");
+    expect(prompt).toContain("proceed with public get and native workflow operations under their actual policy");
     for (const instruction of [
-      "BEFORE effective get, mission binding,", "historical withdrawal (including --unblock)",
-      "declined, unknown or not observable", "STOP this invocation",
-      "Cannot certify execute child selection at <designated-absolute-root>",
-      "expected known native project-trust approval", "<declined/unknown/unobservable and known context>",
-      "Public action:get cannot", "certify child selection in this context",
-      "no binding, withdrawal or preparation", "NEW explicit /execute <spec-id>",
-      "Public get has no project-trust filter/probe",
-      'agentScope "user" repairs that ambiguity', "Do not infer approval from get's",
-      "compatible marker are NOT native", "`pi --approve`", "FUTURE Pi processes",
-      "it does not approve the current declined session", "Do not approve trust on the user's",
-      "add projectTrusted to tool args", "launch a probe", "not a runtime guard",
-      "legitimate user/global overrides and same-name user agent files",
-    ]) expect(trust).toContain(instruction);
-    expect(skill).toContain("Recheck trust and profiles if cwd, provider or configuration changes");
-    // Resource ordering/diagnostics only: this does not exercise SDK trust or
-    // claim that a model obeys the assembled foreground policy.
+      "Unknown or unobservable native trust, including an opaque T3 context, is not a denial",
+      "Do not stop solely because projectApproved is absent, false or unknown",
+      "require a trust certificate, or require leaving T3/reopening Pi CLI",
+      "Continue with public action:get and native workflow operations under their actual policy",
+      "Native discovery/filtering is not automatically an execution denial",
+      "NOT an exact native child-selection certificate across contexts",
+      "the observed and launched profiles can differ",
+      "Do not infer approval OR denial from get's Path/marker or this observation limit",
+      "Respect real native permission rejections, Stop and positive current activity, including for --unblock",
+      "never approve trust on the user's behalf, edit trust/settings or add projectTrusted to tool args",
+      "Do not add a trust probe, certificate or substitute admission gate",
+    ]) expect(instructions).toContain(instruction);
+    for (const removedBlock of [
+      "FIRST require known foreground native project-trust approval",
+      "Cannot certify execute child selection", "Rebind to a known approved foreground session",
+      "Supported human rebinding", "pi --approve", "Recheck trust and profiles",
+    ]) expect(instructions).not.toContain(removedBlock);
+    const get = skill.indexOf('action: "get", agent: "pitako.execution-inspector"');
+    expect(get).toBeGreaterThan(skill.indexOf("## Effective-profile preflight"));
+    expect(skill.indexOf('action: "mission.create"')).toBeGreaterThan(get);
+    // Owned instruction assembly only: no simulated model decisions, command
+    // execution, trust approval or certification of native child selection.
   });
 
   test.each(["missing", "wrong", "compatible", "prompt-override", "provider-override"])("foreground public get exposes the cwd profile and effective body for preflight: %s", mode => {
