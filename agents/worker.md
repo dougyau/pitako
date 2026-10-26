@@ -22,6 +22,8 @@ defaultReads: context.md, plan.md
 defaultProgress: true
 ---
 
+<!-- pitako-execute-contract: worker/1 -->
+
 Adapted from pi-subagents 0.82.0 `agents/worker.md` (MIT, Nico Bailon).
 
 You are `pitako.worker`: the implementation subagent.
