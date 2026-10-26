@@ -93,6 +93,28 @@ function historical(host: ReturnType<typeof fixture>) {
 }
 
 describe("native execution workflow", () => {
+  test("a new explicit invocation prepares afresh after old blocked preparation; replay does not renew cycles or erase history", async () => {
+    const host = fixture();
+    host.setRespond(request => request.key === "invoke-human-1-prepare"
+      ? { ok: true, runId: "old-frozen-inspector", structuredOutput: { status: "blocked", todo: "", evidence: "Old profile demanded universal closure" } }
+      : complete(request));
+    expect((await host.executeNative()).reason).toBe("Old profile demanded universal closure");
+    expect(host.calls.map(call => call.key)).toEqual(["invoke-human-1-prepare"]);
+    const old = structuredClone(host.storage.get("invoke-human-1"));
+    expect(old).toMatchObject({ preparation: null, cycles: [] });
+    expect(await host.executeNative("human-2")).toMatchObject({ status: "complete", cycle: 1 });
+    expect(host.calls.filter(call => call.key.endsWith("prepare")).map(call => call.key))
+      .toEqual(["invoke-human-1-prepare", "invoke-human-2-prepare"]);
+    expect(host.storage.get("invoke-human-1")).toEqual(old);
+    const current = structuredClone(host.storage.get("invoke-human-2"));
+    const directorCount = host.calls.filter(call => call.agent === "pitako.execution-director").length;
+    expect(await host.executeNative("human-2")).toMatchObject({ status: "complete", cycle: 1 });
+    expect(host.calls.filter(call => call.agent === "pitako.execution-director")).toHaveLength(directorCount);
+    expect(host.calls.filter(call => call.key === "invoke-human-2-prepare")).toHaveLength(1);
+    expect(host.storage.get("invoke-human-2")).toEqual(current);
+    expect(host.storage.get("invoke-human-1")).toEqual(old);
+  });
+
   test("historical missing proof gets bounded read-only pending diagnosis, then explicit targeted withdrawal; never verified closure", async () => {
     const host = fixture(), { hold, old } = historical(host);
     host.setStatus(() => { throw new Error("Exact historical record unavailable after external intervention"); });

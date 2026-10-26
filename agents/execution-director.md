@@ -21,6 +21,8 @@ skillPath:
 skills: review, verify-behavior
 ---
 
+<!-- pitako-execute-contract: execution-director/1 -->
+
 # One execution cycle
 
 You are the sole delegating cycle director, not an implementing worker. You may

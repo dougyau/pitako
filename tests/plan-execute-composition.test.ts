@@ -9,7 +9,8 @@ import { resolveWorkflowResource } from "../node_modules/pi-subagents/src/workfl
 import { runWorkflowScript, validateWorkflowScript } from "../node_modules/pi-subagents/src/workflows/scripted-workflow.js";
 import registerFanoutChild from "../node_modules/pi-subagents/src/extension/fanout-child.js";
 import { resolvePiLaunchToolPlan } from "../node_modules/pi-subagents/src/runs/shared/child-tool-plan.js";
-import { discoverAgents } from "../node_modules/pi-subagents/src/agents/agents.js";
+import { discoverAgents, discoverAgentsAll } from "../node_modules/pi-subagents/src/agents/agents.js";
+import { handleManagementAction } from "../node_modules/pi-subagents/src/agents/agent-management.js";
 import planExecute, { executionResource } from "../extensions/plan-execute.ts";
 import { DEFAULT_SKILL_NAMES } from "../extensions/catalog.ts";
 import { digest, inspectionSnapshot, MAX_SPEC_BYTES, SPEC_SECTIONS, specChunks, validateSpec } from "../extensions/spec-plans.ts";
@@ -24,6 +25,103 @@ function repository() {
 }
 
 describe("plan/execute packaged composition", () => {
+  test("execute prompt binds foreground effective-profile checks before mission mutation or preparation, not SDK confinement", () => {
+    const prompt = read("prompts/execute.md"), skill = read("skills/execute/SKILL.md");
+    expect(prompt).toContain("FIRST perform the skill's effective-profile preflight");
+    expect(prompt).toContain("STOP before mission creation, state mutation or preparation");
+    const preflight = skill.slice(skill.indexOf("## Effective-profile preflight"), skill.indexOf("List existing foreground TODOs"));
+    for (const role of ["execution-inspector", "execution-director", "worker"]) {
+      const marker = `<!-- pitako-execute-contract: ${role}/1 -->`;
+      expect(parseFrontmatter(read(`agents/${role}.md`)).body).toContain(marker);
+      expect(preflight).toContain(`action: "get", agent: "pitako.${role}", agentScope: "both"`);
+      expect(preflight).toContain(marker);
+    }
+    for (const instruction of ["AFTER configured/provider overrides", "STOP this invocation before binding or preparation",
+      "at <Path> (origin <origin>)", "Synchronize this", "preserving custom providers",
+      "not a JSON profile contract", "Raw SDK/resource callers can bypass this prompt policy",
+      "NOT a package version, exact body hash", "Do not change installed profiles"])
+      expect(preflight).toContain(instruction);
+    expect(skill).toContain("Never revive an old inspector/director");
+    expect(skill).toContain("Compatibility does not override negative current preparation or native barriers");
+  });
+
+  test("execute instruction assembly requires known native trust before get, binding and withdrawal; no untrusted fallback", () => {
+    const prompt = read("prompts/execute.md"), skill = read("skills/execute/SKILL.md");
+    expect(prompt).toContain("known foreground native project-trust approval for that designated root BEFORE action:get");
+    expect(prompt).toContain("including --unblock withdrawal");
+    const start = skill.indexOf("FIRST require known foreground native project-trust approval");
+    const get = skill.indexOf('action: "get", agent: "pitako.execution-inspector"');
+    const bind = skill.indexOf('action: "mission.create"');
+    expect(start).toBeGreaterThan(skill.indexOf("## Effective-profile preflight"));
+    expect(get).toBeGreaterThan(start);
+    expect(bind).toBeGreaterThan(get);
+    const trust = skill.slice(start, get);
+    for (const instruction of [
+      "BEFORE effective get, mission binding,", "historical withdrawal (including --unblock)",
+      "declined, unknown or not observable", "STOP this invocation",
+      "Cannot certify execute child selection at <designated-absolute-root>",
+      "expected known native project-trust approval", "<declined/unknown/unobservable and known context>",
+      "Public action:get cannot", "certify child selection in this context",
+      "no binding, withdrawal or preparation", "NEW explicit /execute <spec-id>",
+      "Public get has no project-trust filter/probe",
+      'agentScope "user" repairs that ambiguity', "Do not infer approval from get's",
+      "compatible marker are NOT native", "`pi --approve`", "FUTURE Pi processes",
+      "it does not approve the current declined session", "Do not approve trust on the user's",
+      "add projectTrusted to tool args", "launch a probe", "not a runtime guard",
+      "legitimate user/global overrides and same-name user agent files",
+    ]) expect(trust).toContain(instruction);
+    expect(skill).toContain("Recheck trust and profiles if cwd, provider or configuration changes");
+    // Resource ordering/diagnostics only: this does not exercise SDK trust or
+    // claim that a model obeys the assembled foreground policy.
+  });
+
+  test.each(["missing", "wrong", "compatible", "prompt-override", "provider-override"])("foreground public get exposes the cwd profile and effective body for preflight: %s", mode => {
+    const root = repository(), prior = process.env.PI_CODING_AGENT_DIR;
+    const agentDir = path.join(root, "agents"), configDir = path.join(root, ".pi");
+    mkdirSync(agentDir); mkdirSync(configDir);
+    process.env.PI_CODING_AGENT_DIR = path.join(root, "private-agent-config");
+    const marker = "<!-- pitako-execute-contract: execution-inspector/1 -->";
+    const source = read("agents/execution-inspector.md")
+      .replace("tools: read, grep, find, ls, bash", "tools: read, grep, find, ls, bash, acp_status, file_sha256, codemode")
+      .replace("extensions:\n", "extensions:\n  - ../extensions/acp.ts\n")
+      .replace(marker, mode === "missing" ? "" : mode === "wrong" ? "<!-- pitako-execute-contract: execution-inspector/0 -->" : marker);
+    const sourcePath = path.join(agentDir, "execution-inspector.md");
+    writeFileSync(sourcePath, source);
+    writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "custom-checkout", pi: { subagents: { agents: ["./agents"] } } }));
+    const override = { "pitako.execution-inspector": { systemPrompt: "Configured older policy: missing proof means blocked." } };
+    if (mode.endsWith("override")) writeFileSync(path.join(configDir, "settings.json"), JSON.stringify({
+      subagents: mode === "provider-override" ? { agentOverridesByProvider: { controlled: override } } : { agentOverrides: override },
+    }));
+    try {
+      // Controlled PUBLIC management action; native profile loading/formatting only,
+      // no provider, extension startup, child launch or invented get-JSON response.
+      const response = handleManagementAction("get", { agent: "pitako.execution-inspector", agentScope: "both" }, {
+        cwd: root, model: { provider: "controlled" } as never, modelRegistry: {} as never,
+        discoverAgentsAll: (cwd, provider) => {
+          expect(cwd).toBe(root);
+          return discoverAgentsAll(cwd, provider, { globalNpmRoot: null });
+        },
+      });
+      expect(response.isError).toBe(false);
+      const detail = response.content.filter(item => item.type === "text").map(item => item.text).join("\n");
+      expect(detail).toContain(`Path: ${sourcePath}`);
+      expect(detail).toContain("Agent: pitako.execution-inspector (package)");
+      expect(detail).toContain("Tools: read, grep, find, ls, bash, acp_status, file_sha256, codemode");
+      expect(detail).toContain(`Extensions: ${path.join(root, "extensions/acp.ts")}`);
+      const body = detail.split("\nSystem Prompt:\n")[1]!;
+      expect(body).toBeDefined();
+      expect(body.split("\n").includes(marker)).toBe(mode === "compatible");
+      if (mode.endsWith("override")) {
+        expect(readFileSync(sourcePath, "utf8")).toContain(marker);
+        expect(body).toBe("Configured older policy: missing proof means blocked.");
+      }
+      // The preceding instruction-binding test owns STOP/diagnostic ordering.
+      // This checks the effective observation, NOT simulated model compliance.
+    } finally {
+      if (prior === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = prior;
+    }
+  });
+
   test("native profile loader applies the two-hour deadline only to the packaged execution director", () => {
     const root = repository(), prior = process.env.PI_CODING_AGENT_DIR;
     writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "pitako", pi: { subagents: { agents: [path.resolve("agents")] } } }));
@@ -54,12 +152,16 @@ describe("plan/execute packaged composition", () => {
   test("documented mission creation, inspection and launch reuse the designated store from a nested foreground cwd", () => {
     const root = repository(), foreground = path.join(root, "src"); mkdirSync(foreground);
     const missionId = "explicit.native-id", stores = new Map<string, Set<string>>();
-    const calls: { action?: string; workflow?: string; cwd?: string; options?: { missionId?: string } }[] = [];
+    const calls: { action?: string; agent?: string; agentScope?: string; workflow?: string; cwd?: string; options?: { missionId?: string } }[] = [];
     // Controlled native boundary: stores are keyed by request cwd, not its enclosing Git root.
     const subagent = (input: typeof calls[number]) => {
       calls.push(input);
       const cwd = path.resolve(foreground, input.cwd ?? ".");
       expect(cwd).toBe(root);
+      if (input.action === "get") {
+        expect(stores.size).toBe(0); expect(input.agentScope).toBe("both");
+        return;
+      }
       if (input.action === "mission.create") stores.set(cwd, new Set([missionId]));
       else expect(stores.get(cwd)?.has(input.options?.missionId ?? "")).toBe(true);
       return { details: { missionId } };
@@ -70,7 +172,8 @@ describe("plan/execute packaged composition", () => {
         .replaceAll("<explicit-native-mission-id>", missionId);
       new Function("subagent", script)(subagent);
     }
-    expect(calls.map(call => call.action ?? call.workflow)).toEqual(["mission.create", "mission.show", "pitako.execute"]);
+    expect(calls.map(call => call.action ?? call.workflow)).toEqual(["get", "get", "get", "mission.create", "mission.show", "pitako.execute"]);
+    expect(calls.slice(0, 3).map(call => call.agent)).toEqual(["pitako.execution-inspector", "pitako.execution-director", "pitako.worker"]);
     expect(read("skills/execute/SKILL.md")).toContain("all mission management and run reconciliation calls");
   });
 

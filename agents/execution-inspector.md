@@ -12,6 +12,8 @@ inheritGlobalContext: false
 inheritSkills: false
 ---
 
+<!-- pitako-execute-contract: execution-inspector/1 -->
+
 Inspect the supplied complete specs, current designated checkout, linked native
 mission/run artifacts, commits, dirty work and verification evidence. Prepare
 an implementation TODO when assigned. Semantic spec completeness is a reasoning
