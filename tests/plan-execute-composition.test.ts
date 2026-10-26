@@ -16,7 +16,13 @@ import { DEFAULT_SKILL_NAMES } from "../extensions/catalog.ts";
 import { digest, inspectionSnapshot, MAX_SPEC_BYTES, SPEC_SECTIONS, specChunks, validateSpec } from "../extensions/spec-plans.ts";
 
 const roots: string[] = [], disposers: (() => void)[] = [];
-afterEach(() => { for (const dispose of disposers.splice(0)) dispose(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+const previewSettlements: Promise<void>[] = [];
+afterEach(async () => {
+  // A runner timeout does not settle the preview test's workflow continuation.
+  await Promise.all(previewSettlements.splice(0));
+  for (const dispose of disposers.splice(0)) dispose();
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
 const read = (name: string) => readFileSync(path.resolve(name), "utf8");
 function repository() {
   const root = mkdtempSync(path.join(tmpdir(), "pitako-workflow-resource-")); roots.push(root);
@@ -266,7 +272,14 @@ describe("plan/execute packaged composition", () => {
     expect(() => executionResource().resolve({ ...args, root: nested })).toThrow("subdirectory");
   });
 
-  test.each(["siblings", "long-path"])("inspector metadata crosses a controlled 4096-byte native preview: %s", async mode => {
+  test.each(["siblings", "long-path"])("inspector metadata crosses a controlled 4096-byte native preview: %s", mode => {
+    const operation = runPreview(mode);
+    // Observe rejection immediately and await either outcome before removing roots.
+    previewSettlements.push(operation.then(() => {}, () => {}));
+    return operation;
+  });
+
+  async function runPreview(mode: string) {
     const main = repository();
     const parent = path.join(main, ...(mode === "long-path" ? Array.from({ length: 12 }, (_, index) => `${index}-` + '中é"\\'.repeat(22)) : ["siblings"]));
     mkdirSync(parent, { recursive: true });
@@ -275,8 +288,10 @@ describe("plan/execute packaged composition", () => {
     git("worktree", "add", "-qb", "designated", root);
     const content = `---\npitako-spec: 1\nid: assignment\nstatus: complete\n---\n${SPEC_SECTIONS.map(title => `## ${title}\nAgreed ${title}.`).join("\n")}\n`;
     const locations = [];
-    for (let index = 0; index < (mode === "siblings" ? 32 : 1); index++) {
-      const sibling = mode === "long-path" ? root : path.join(parent, `sibling-${index}-` + 'é中"\\'.repeat(20));
+    // Cross the preview byte limit with longer paths, not more Git worktrees.
+    for (let index = 0; index < (mode === "siblings" ? 3 : 1); index++) {
+      const sibling = mode === "long-path" ? root : path.join(parent, `sibling-${index}`,
+        ...Array.from({ length: 8 }, (_, part) => `segment-${part}-` + 'é中"\\'.repeat(20)));
       if (sibling !== root) git("worktree", "add", "-qb", `sibling-${index}`, sibling);
       const target = path.join(sibling, ".pitako/plans/assignment.md");
       mkdirSync(path.dirname(target), { recursive: true }); writeFileSync(target, content); locations.push(target);
@@ -325,11 +340,12 @@ describe("plan/execute packaged composition", () => {
     }
     if (mode === "siblings") {
       const ambiguous = await execute();
-      expect(structuredClone(ambiguous.value)).toMatchObject({ status: "blocked", candidateCount: 32, candidatesOmitted: expect.any(Number) });
+      expect(structuredClone(ambiguous.value)).toMatchObject({ status: "blocked", candidateCount: locations.length, candidatesOmitted: expect.any(Number) });
       const ambiguity = ambiguous.value as { candidates: { source: string }[]; candidatesOmitted: number };
       expect(ambiguity.candidates.length).toBeGreaterThan(0); expect(ambiguity.candidatesOmitted).toBeGreaterThan(0);
-      expect(ambiguity.candidates.length + ambiguity.candidatesOmitted).toBe(32);
+      expect(ambiguity.candidates.length + ambiguity.candidatesOmitted).toBe(locations.length);
       for (const candidate of ambiguity.candidates) expect(locations).toContain(candidate.source);
+      expect(ambiguity.candidates.map(candidate => candidate.source)).not.toContain(selected);
       expect(ambiguous.launched).toHaveLength(0);
     }
     const chosen = await execute(selected);
@@ -339,7 +355,7 @@ describe("plan/execute packaged composition", () => {
     expect(chosen.envelopes.some(envelope => JSON.parse(envelope).transport)).toBe(mode === "long-path");
     const initial = JSON.parse(chosen.envelopes[0]!);
     if (mode === "siblings") { expect(initial.candidates).toEqual([]); expect(initial.selected.source).toBe(selected); }
-  });
+  }
 
   test.each(["escaped", "multibyte"])("maximum-size specs plus selected metadata fit all three native cycles within exactly 32 host calls: %s", async kind => {
     const root = repository();
