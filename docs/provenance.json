@@ -1,4 +1,84 @@
 {
+  "pi-dev-tools": {
+    "decision": "owned-source",
+    "package": "@nredd/pi-dev-tools",
+    "version": "0.6.0",
+    "repository": "https://github.com/nredd/pi-harness",
+    "revision": "6104beaf45d34933efd13e4c6b7e2be54c552f16",
+    "license": "MIT",
+    "copyright": "Copyright (c) 2026 Redd",
+    "sourceMapping": {
+      "packages/dev-tools/src/": "extensions/dev-tools/",
+      "packages/dev-tools/LICENSE": "docs/licenses/pi-dev-tools-LICENSE",
+      "packages/dev-tools/test/fixtures/": "tests/dev-tools/fixtures/"
+    },
+    "testOrigins": {
+      "tests/dev-tools/support.ts": [
+        "packages/dev-tools/test/support.ts"
+      ],
+      "tests/dev-tools/cargo-parse.test.ts": [
+        "packages/dev-tools/test/cargo/parse.test.ts"
+      ],
+      "tests/dev-tools/py-parse.test.ts": [
+        "packages/dev-tools/test/py/parse.test.ts"
+      ],
+      "tests/dev-tools/git-guard.test.ts": [
+        "packages/dev-tools/test/git/guard.test.ts"
+      ],
+      "tests/dev-tools/git-status.test.ts": [
+        "packages/dev-tools/test/git/status.test.ts"
+      ],
+      "tests/dev-tools/resource.test.ts": [
+        "packages/dev-tools/test/resource.test.ts"
+      ],
+      "tests/dev-tools/lock.test.ts": [
+        "packages/dev-tools/test/core/lock.test.ts"
+      ],
+      "tests/dev-tools/process.test.ts": [
+        "packages/dev-tools/test/core/process.test.ts",
+        "packages/dev-tools/test/core/process-lines.test.ts"
+      ],
+      "tests/dev-tools/git-commit.test.ts": [
+        "packages/dev-tools/test/scenarios/git.test.ts",
+        "packages/dev-tools/test/git/commit-message.test.ts"
+      ],
+      "tests/dev-tools/factory.test.ts": []
+    },
+    "localModifications": [
+      "resource/index.ts imports the owned sampler and authoritative types; reports secondary disposal failure without replacing the primary error.",
+      "git/commit-message.ts removes automatic Claude attribution; git/index.ts removes its misleading producer description. Explicit user text and other message validation remain.",
+      "core/lock.ts releases on onWait callback failure and retains queue ownership until earlier work settles after a waiter cancellation.",
+      "Selected upstream tests use bun:test and owned import paths; parser fixtures resolve from tests/dev-tools/fixtures. Lifecycle, cancellation, stored Git message, controlled signing failure, branch checks and command injection checks are adapted or added locally. Factory test is Pitako-original.",
+      "Controlled private Git and child-process fixtures replace external CLI certification; pending lock outcomes are observed natively before assertions to avoid eager Bun matcher deadlock.",
+      "Cargo check.jsonl and clippy-good.jsonl fixture home paths are replaced with /fixture/user/ placeholders to preserve repository source hygiene without changing parser diagnostics; format diff fixtures normalize whitespace-only context lines for clean publication."
+    ],
+    "evidenceLimits": "Source imported from the recorded Git tree. No signature authentication or full npm artifact/source equality is claimed. Runtime registration and dependency removal are a subsequent composition increment."
+  },
+  "pi-resource-sampler": {
+    "decision": "owned-source",
+    "package": "@nredd/pi-resource-sampler",
+    "version": "0.1.1",
+    "repository": "https://github.com/nredd/pi-harness",
+    "revision": "aebee47ecd4e852a0f80134c376690ff4e33deb7",
+    "license": "MIT",
+    "copyright": "Copyright (c) 2026 Redd",
+    "sourceMapping": {
+      "packages/resource-sampler/src/": "extensions/resource-sampler/",
+      "packages/resource-sampler/LICENSE": "docs/licenses/pi-resource-sampler-LICENSE"
+    },
+    "testOrigins": {
+      "tests/resource-sampler/sampler.test.ts": [
+        "packages/resource-sampler/test/sampler.test.ts"
+      ],
+      "tests/resource-sampler/lifecycle.test.ts": [],
+      "tests/resource-sampler/fixtures/lifecycle.ts": []
+    },
+    "localModifications": [
+      "Source files are unchanged from the recorded Git tree.",
+      "Selected sampler tests use bun:test and owned imports. Pitako-original isolated lifecycle fixture controls asynchronous collection settlement, independent owners, cancellation and awaited disposal; its subprocess is externally bounded."
+    ],
+    "evidenceLimits": "The npm artifact publishes dist, not src. This import uses the recorded authoritative Git source; no built artifact equality or signature authentication is claimed."
+  },
   "rpiv-todo": {
     "decision": "dependency",
     "package": "@juicesharp/rpiv-todo",

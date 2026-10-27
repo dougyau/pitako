@@ -1,0 +1,2 @@
+src/pt/bad.py:3:12: error[invalid-return-type] Return type does not match returned value: expected `str`, found `int`
+Found 1 diagnostic

@@ -1,0 +1,6 @@
+src/pt/bad.py:1:1: I001 [*] Import block is un-sorted or un-formatted
+src/pt/bad.py:1:8: F401 [*] `os` imported but unused
+src/pt/bad.py:1:11: F401 [*] `sys` imported but unused
+tests/test_a.py:1:1: I001 [*] Import block is un-sorted or un-formatted
+Found 4 errors.
+[*] 4 fixable with the `--fix` option.

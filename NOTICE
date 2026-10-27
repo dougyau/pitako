@@ -27,3 +27,16 @@ Vendored MIT material (see THIRD_PARTY.md and docs/licenses/):
   paths are not shipped.
 - Selected pstack skills and principles (Lauren Tan / official Cursor pstack
   plugin). Orchestration, poteto-mode, and subagent runtimes are not shipped.
+
+Owned provider source (nredd/pi-harness; MIT, Copyright (c) 2026 Redd):
+
+- pi-dev-tools 0.6.0, source revision 6104beaf45d34933efd13e4c6b7e2be54c552f16:
+  extensions/dev-tools/ and adapted tests/fixtures in tests/dev-tools/.
+  Full license: docs/licenses/pi-dev-tools-LICENSE.
+- pi-resource-sampler 0.1.1, source revision aebee47ecd4e852a0f80134c376690ff4e33deb7:
+  extensions/resource-sampler/ and adapted tests in tests/resource-sampler/.
+  Full license: docs/licenses/pi-resource-sampler-LICENSE.
+
+Source mappings, test origins, local changes and evidence limits are recorded in
+docs/provenance.json. These notices do not claim signature authentication or
+full source-to-npm-artifact equality.

@@ -1,0 +1,15 @@
+Diff in /private/tmp/ws/good/benches/b.rs:1:
+-use criterion::{criterion_group, criterion_main, Criterion};
+-fn bench(c: &mut Criterion) { c.bench_function("add", |b| b.iter(|| good::add(std::hint::black_box(1), 2))); }
++use criterion::{Criterion, criterion_group, criterion_main};
++fn bench(c: &mut Criterion) {
++    c.bench_function("add", |b| b.iter(|| good::add(std::hint::black_box(1), 2)));
++}
+ criterion_group!(benches, bench);
+ criterion_main!(benches);
+
+Diff in /private/tmp/ws/good/src/ugly.rs:1:
+-pub fn x( ) ->u32{ 1 }
++pub fn x() -> u32 {
++    1
++}
