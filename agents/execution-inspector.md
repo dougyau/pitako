@@ -6,7 +6,7 @@ tools: read, grep, find, ls, bash, compress, decompress, search_context, acp_sta
 extensions:
   - ../extensions/acp.ts
 subagentOnlyExtensions:
-  - ../node_modules/@nredd/pi-dev-tools/src/index.ts
+  - ../extensions/dev-tools/index.ts
   - ../extensions/file-sha256.ts
 acceptanceRole: read-only
 defaultContext: fresh

@@ -1,0 +1,139 @@
+{
+  "@colbymchenry/codegraph": {
+    "version": "1.6.2",
+    "registry": "https://registry.npmjs.org/@colbymchenry/codegraph/1.6.2",
+    "tarball": "https://registry.npmjs.org/@colbymchenry/codegraph/-/codegraph-1.6.2.tgz",
+    "integrity": "sha512-hODH/mGnCf3IUMs6rzktv/zbecJIKJfdZAYHZ9mqecb0G7ZkHaA8CZafDVnswANFEL1YFcG+lfAwc5SIXzUH6Q==",
+    "gitHead": "6560052a6f856855d3f71eee838fd66ccfa4285d",
+    "license": "MIT"
+  },
+  "@dietrichgebert/ponytail": {
+    "version": "5.3.2",
+    "registry": "https://registry.npmjs.org/@dietrichgebert/ponytail/5.3.2",
+    "tarball": "https://registry.npmjs.org/@dietrichgebert/ponytail/-/ponytail-5.3.2.tgz",
+    "integrity": "sha512-AjJnMi54AXO55kXi0ISNPacLuTjb7e9V4lV2oidyxBOnVoPih8CIAmnfHgwX2VyPsDqwQhJthJ9bNu30MaHuOg==",
+    "gitHead": "16352ac229eb08a9598dcae48fe9f2b342567d86",
+    "license": "MIT"
+  },
+  "@juicesharp/rpiv-todo": {
+    "version": "2.15.0",
+    "registry": "https://registry.npmjs.org/@juicesharp/rpiv-todo/2.15.0",
+    "tarball": "https://registry.npmjs.org/@juicesharp/rpiv-todo/-/rpiv-todo-2.15.0.tgz",
+    "integrity": "sha512-8WfYssdgQgSWzFNsRzdw5Z6ZJIjO2ecM/YqEzYpR/ore+Hh5aNmafGVy94uFbIofAv2wGGitx5e3J/ucRrViXQ==",
+    "gitHead": "ce6d3530410812ca504ec294995581a52170f9e1",
+    "license": "MIT"
+  },
+  "@juicesharp/rpiv-i18n": {
+    "version": "2.15.0",
+    "registry": "https://registry.npmjs.org/@juicesharp/rpiv-i18n/2.15.0",
+    "tarball": "https://registry.npmjs.org/@juicesharp/rpiv-i18n/-/rpiv-i18n-2.15.0.tgz",
+    "integrity": "sha512-YpC8nN2dO/oi3slxMPvF2TQsitVY4IWdoLoT0C7EV7jxPVrySXx7Iucx9oeaP5zlO4pu2Mei5q3UFy3Ni2xwWw==",
+    "gitHead": "ce6d3530410812ca504ec294995581a52170f9e1",
+    "license": "MIT"
+  },
+  "@vndv/pi-codegraph": {
+    "version": "0.1.11",
+    "registry": "https://registry.npmjs.org/@vndv/pi-codegraph/0.1.11",
+    "tarball": "https://registry.npmjs.org/@vndv/pi-codegraph/-/pi-codegraph-0.1.11.tgz",
+    "integrity": "sha512-aa85G54s3b9ergShNnQ6qNAp/f2a/CsxbczO89gX4IrgQLHRN+o/vX0EzGqfr5FteG0UUGM1ilOj3qHg1KyArg==",
+    "gitHead": "f193644d98e0c3a3f130364a393301408450d185",
+    "license": "MIT"
+  },
+  "billion-context-pi": {
+    "version": "0.1.83",
+    "registry": "https://registry.npmjs.org/billion-context-pi/0.1.83",
+    "tarball": "https://registry.npmjs.org/billion-context-pi/-/billion-context-pi-0.1.83.tgz",
+    "integrity": "sha512-122CcPmZvC5Yqqbj75UMppOFlkdAN8kbzvJ4OugV6xBPW6wbiHbaZ9YDYWQwDy4hJ/Vc98eOREGkWLWKflbnZw==",
+    "gitHead": "1cb6340df262933c8e640a7f45e19a7b34fe1ed8",
+    "license": "MIT"
+  },
+  "pi-codex-tools": {
+    "version": "0.4.0",
+    "registry": "https://registry.npmjs.org/pi-codex-tools/0.4.0",
+    "tarball": "https://registry.npmjs.org/pi-codex-tools/-/pi-codex-tools-0.4.0.tgz",
+    "integrity": "sha512-A5gK8/XnQ8qSwOhuRKdWY3GSawPOF4ToIjfbzXDIj07q/SWBNitOCkmgANUtjjav7J1+ieWY00EzH3mWvxrd4g==",
+    "gitHead": "306242f2c802ea4c0067d64d4fd5fd103d89a6b5",
+    "license": "Apache-2.0"
+  },
+  "pi-hermes-memory": {
+    "version": "0.9.11",
+    "registry": "https://registry.npmjs.org/pi-hermes-memory/0.9.11",
+    "tarball": "https://registry.npmjs.org/pi-hermes-memory/-/pi-hermes-memory-0.9.11.tgz",
+    "integrity": "sha512-94mMGy65ys/3VKzzI1M2ZMNDBC2WZ/QTw3IyftqNF4SBq0mQ21DazoM9flomMksjqccGqPz/hh6KsIG0Sth1Tg==",
+    "gitHead": "71cf5ab7d909318a383bf52bb3ad3cf83a9efc03",
+    "license": "MIT"
+  },
+  "pi-subagents": {
+    "version": "0.83.0",
+    "registry": "https://registry.npmjs.org/pi-subagents/0.83.0",
+    "tarball": "https://registry.npmjs.org/pi-subagents/-/pi-subagents-0.83.0.tgz",
+    "integrity": "sha512-MlmLLa8Cb2/RCkkhCgbRDdeigpFL8v0rKqa+HjWpa/3ylZb49Fg+XDsbMeNu+zQ6268dnxGt1sTDhXsAKxBzKg==",
+    "gitHead": "3a63e0ad8898cf116ce671feabb0f8a7b31731a4",
+    "license": "MIT"
+  },
+  "pi-web-access": {
+    "version": "0.45.0",
+    "registry": "https://registry.npmjs.org/pi-web-access/0.45.0",
+    "tarball": "https://registry.npmjs.org/pi-web-access/-/pi-web-access-0.45.0.tgz",
+    "integrity": "sha512-AHgUKUas1vvBtdKbcv+7rWTPTIOl8xHR4E7s4dLBAz6soSGGPC4YNq1uVGuH5+bVrMx4X/fmPCm4rsOQIxexdQ==",
+    "gitHead": "35e57ef30f4b8ac771f4062a381493993af41ebe",
+    "license": "MIT"
+  },
+  "@earendil-works/pi-agent-core": {
+    "version": "1.4.0",
+    "registry": "https://registry.npmjs.org/@earendil-works/pi-agent-core/1.4.0",
+    "tarball": "https://registry.npmjs.org/@earendil-works/pi-agent-core/-/pi-agent-core-1.4.0.tgz",
+    "integrity": "sha512-PoKY84SKUwnt7S5QBZaGUqfNO1kjP3KHpHUA9QpFTj4cOjaVWMYIcBPJ6FDRCdE8Zen9OSECQUd0uUfVgtSmgA==",
+    "license": "MIT"
+  },
+  "@earendil-works/pi-ai": {
+    "version": "1.4.0",
+    "registry": "https://registry.npmjs.org/@earendil-works/pi-ai/1.4.0",
+    "tarball": "https://registry.npmjs.org/@earendil-works/pi-ai/-/pi-ai-1.4.0.tgz",
+    "integrity": "sha512-hQM/C4+1w8rHYACzDDf+0vQMnEnpzIop1tptIERVgR3ZeT/hHSzBNG8PaWPgxWQjqSeKCyBZSyp8uTT6eKK1pQ==",
+    "license": "MIT"
+  },
+  "@earendil-works/pi-coding-agent": {
+    "version": "1.4.0",
+    "registry": "https://registry.npmjs.org/@earendil-works/pi-coding-agent/1.4.0",
+    "tarball": "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-1.4.0.tgz",
+    "integrity": "sha512-Z41LpZ3yYHSC/UUps6Mr39UMFPwH8elhJBG9DY1P7kuzsE5qSK/6eMj2EHzO5evJRQWLbKSqUMw+4nCNtIyiQg==",
+    "license": "MIT"
+  },
+  "@earendil-works/pi-tui": {
+    "version": "1.4.0",
+    "registry": "https://registry.npmjs.org/@earendil-works/pi-tui/1.4.0",
+    "tarball": "https://registry.npmjs.org/@earendil-works/pi-tui/-/pi-tui-1.4.0.tgz",
+    "integrity": "sha512-4obPOjgOD7g4mGSlngIvxyujC1UPdmyI9zdVthbr8GufacFEX+Ce0+scPgHg++k2xj5+QjESM2d5TxvIuzCVmg==",
+    "license": "MIT"
+  },
+  "@types/bun": {
+    "version": "1.4.4",
+    "registry": "https://registry.npmjs.org/@types/bun/1.4.4",
+    "tarball": "https://registry.npmjs.org/@types/bun/-/bun-1.4.4.tgz",
+    "integrity": "sha512-9wkRDXUXK124pEnAutE6n/l18j+i9GC5IAHK8TmX/2nlySETmky0OU6yL5U8pW1AoKh++AN9auDCr647BfurjQ==",
+    "license": "MIT"
+  },
+  "typescript": {
+    "version": "7.0.2",
+    "registry": "https://registry.npmjs.org/typescript/7.0.2",
+    "tarball": "https://registry.npmjs.org/typescript/-/typescript-7.0.2.tgz",
+    "integrity": "sha512-8FYau96o3NKOhbjKi/qNvG/W5jhzxkbdm5sj9AbZ/5T5sWqn3hJgLfGx27sRKZWTvyzCP8dLRBTf5tBTSRVUNA==",
+    "gitHead": "2bd066d87f5bafd315be9f40889d0a60b9e58e0b",
+    "license": "Apache-2.0"
+  },
+  "typebox": {
+    "version": "1.4.3",
+    "registry": "https://registry.npmjs.org/typebox/1.4.3",
+    "tarball": "https://registry.npmjs.org/typebox/-/typebox-1.4.3.tgz",
+    "integrity": "sha512-u3nyf7ZciAv1GOijVpI0TDt9At5wmEi7lSHSlRrnjuThv1DcB7fgGBqqrz+fGZ54jAfTpOOX0JXwxSIg3pnxQA==",
+    "license": "MIT"
+  },
+  "pi-lsp-client": {
+    "version": "0.2.0",
+    "repository": "https://github.com/code-yeongyu/pi-lsp-client",
+    "tag": "v0.2.0",
+    "tagObject": "6b5026c5cae7443ed2cec9dd9c6e6e17606a9624",
+    "revision": "9d029fb32b721c038b58fb418b98bbfcf720cf0a"
+  }
+}

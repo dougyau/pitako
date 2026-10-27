@@ -96,7 +96,7 @@ See the [plan skill](skills/plan/SKILL.md), [execute skill](skills/execute/SKILL
 and [migration spec](docs/plan-execute-spec.md) for source selection, native
 replay, immutable input snapshots, native activity barriers and targeted human
 `/execute <id> --unblock` historical exclusion withdrawal (not verified closure).
-Installing 0.82.0 does not prove a running host reloaded it. No provider/model is
+Installing 0.83.0 does not prove a running host reloaded it. No provider/model is
 pinned and no Pitako usage budget, scheduler or private execution store is added.
 
 ## Retired orchestration

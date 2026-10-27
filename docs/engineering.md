@@ -28,8 +28,9 @@ compression after a refusal; disabled, unloadable or refused ACP is an unmet
 prerequisite. Preserve upstream refusal and native-compaction stand-down rather
 than overriding settings.
 
-The complete `@nredd/pi-dev-tools` public entry supplies Git, SSH, Python, Cargo
-and resource tools and hooks, with its shipped sampler dependency. Prefer covered
+The owned `extensions/dev-tools/index.ts` factory supplies Git, SSH, Python,
+Cargo and resource tools and hooks. Its sampler is the library under
+`extensions/resource-sampler/`, not a second extension or external dependency. Prefer covered
 deterministic operations, composed through native codemode; keep bash/Python
 fallback for uncovered cases. Git queries are not sandboxed: metadata or spilled
 output may be written. `git_status` is working changes, not tracked inventory;

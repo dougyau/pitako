@@ -4,7 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import devTools from "../node_modules/@nredd/pi-dev-tools/src/index.ts";
+import devTools from "../extensions/dev-tools/index.ts";
 import fileSha256 from "../extensions/file-sha256.ts";
 import pitako from "../extensions/index.ts";
 import profilePolicy from "../extensions/profile-policy.ts";
@@ -29,7 +29,7 @@ function loadProfileExtensions(pi: ExtensionAPI, codex: (pi: ExtensionAPI) => vo
     ["./extensions/index.ts", pitako],
     ["./node_modules/pi-codex-tools/index.ts", codex],
     ["./extensions/profile-policy.ts", profilePolicy],
-    ["./node_modules/@nredd/pi-dev-tools/src/index.ts", devTools],
+    ["./extensions/dev-tools/index.ts", devTools],
     ["./extensions/file-sha256.ts", fileSha256],
   ]);
   // These providers are outside this profile fixture's controlled boundary.
@@ -175,7 +175,7 @@ describe("Pitako resources and policy", () => {
     const host = profileHarness("coding");
     try {
       await host.start();
-      const provider = readStack(packageRoot()).required.find(({ id }) => id === "@nredd/pi-dev-tools");
+      const provider = readStack(packageRoot()).required.find(({ id }) => id === "pitako-dev-tools");
       expect(provider).toBeDefined();
       expect(host.registeredTools).toEqual(["apply_patch", ...provider!.tools, "file_sha256", "file_sha256_save"]);
       for (const name of provider!.tools) expect(host.active).toContain(name);

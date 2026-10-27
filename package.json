@@ -34,7 +34,7 @@
       "./extensions/profile-policy.ts",
       "./node_modules/pi-lsp-client/src/index.ts",
       "./node_modules/@vndv/pi-codegraph/extensions/codegraph.ts",
-      "./node_modules/@nredd/pi-dev-tools/src/index.ts",
+      "./extensions/dev-tools/index.ts",
       "./extensions/file-sha256.ts",
       "./extensions/todo.ts",
       "./extensions/board/index.ts",
@@ -65,24 +65,20 @@
     }
   },
   "dependencies": {
-    "@colbymchenry/codegraph": "1.6.0",
-    "@dietrichgebert/ponytail": "4.10.0",
-    "@juicesharp/rpiv-todo": "2.11.0",
-    "@nredd/pi-dev-tools": "0.6.0",
-    "@nredd/pi-resource-sampler": "0.1.1",
-    "@vndv/pi-codegraph": "0.1.10",
+    "@colbymchenry/codegraph": "1.6.2",
+    "@dietrichgebert/ponytail": "5.3.2",
+    "@juicesharp/rpiv-todo": "2.15.0",
+    "@vndv/pi-codegraph": "0.1.11",
     "billion-context-pi": "0.1.83",
-    "pi-codex-tools": "0.3.0",
-    "pi-hermes-memory": "0.9.9",
-    "pi-lsp-client": "github:code-yeongyu/pi-lsp-client#1c981dfcacc456fe4ce9f4120a2f0250b54d6844",
-    "pi-subagents": "0.82.0",
-    "pi-web-access": "0.42.0"
+    "pi-codex-tools": "0.4.0",
+    "pi-hermes-memory": "0.9.11",
+    "pi-lsp-client": "github:code-yeongyu/pi-lsp-client#9d029fb32b721c038b58fb418b98bbfcf720cf0a",
+    "pi-subagents": "0.83.0",
+    "pi-web-access": "0.45.0"
   },
   "bundledDependencies": [
     "@dietrichgebert/ponytail",
     "@juicesharp/rpiv-todo",
-    "@nredd/pi-dev-tools",
-    "@nredd/pi-resource-sampler",
     "@vndv/pi-codegraph",
     "pi-lsp-client",
     "pi-codex-tools",
@@ -103,8 +99,9 @@
     "@earendil-works/pi-ai": "1.4.0",
     "@earendil-works/pi-coding-agent": "1.4.0",
     "@earendil-works/pi-tui": "1.4.0",
-    "@juicesharp/rpiv-i18n": "2.11.0",
-    "@types/bun": "1.3.14",
-    "typescript": "5.9.3"
+    "@juicesharp/rpiv-i18n": "2.15.0",
+    "@types/bun": "1.4.4",
+    "typescript": "7.0.2",
+    "typebox": "1.4.3"
   }
 }

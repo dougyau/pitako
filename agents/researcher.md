@@ -6,7 +6,7 @@ tools: read, grep, find, ls, web_search, fetch_content, get_search_content, sour
 extensions:
   - ../extensions/acp.ts
 subagentOnlyExtensions:
-  - ../node_modules/@nredd/pi-dev-tools/src/index.ts
+  - ../extensions/dev-tools/index.ts
   - ../extensions/file-sha256.ts
   - ../node_modules/pi-web-access/dist/index.js
 acceptanceRole: read-only

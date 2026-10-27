@@ -468,7 +468,7 @@ describe("plan/execute packaged composition", () => {
     expect(String(worker.skills).split(/,\s*/)).toEqual(["ponytail", "verify-behavior"]);
     expect(worker.skillPath).toEqual(["../node_modules/@dietrichgebert/ponytail/skills/ponytail", "../skills/practical/verify-behavior"]);
     expect(worker.extensions).toEqual(["../extensions/acp.ts"]);
-    expect(worker.subagentOnlyExtensions).toEqual(["../node_modules/@nredd/pi-dev-tools/src/index.ts", "../extensions/file-sha256.ts", "../node_modules/@vndv/pi-codegraph/extensions/codegraph.ts", "../node_modules/pi-lsp-client/src/index.ts", "../node_modules/pi-codex-tools/index.ts"]);
+    expect(worker.subagentOnlyExtensions).toEqual(["../extensions/dev-tools/index.ts", "../extensions/file-sha256.ts", "../node_modules/@vndv/pi-codegraph/extensions/codegraph.ts", "../node_modules/pi-lsp-client/src/index.ts", "../node_modules/pi-codex-tools/index.ts"]);
     for (const provider of worker.subagentOnlyExtensions as string[]) expect(existsSync(path.resolve("agents", provider))).toBe(true);
     for (const contract of ["single writer thread", "pause and escalate", "Ponytail is explicitly LITE", "Never\nreduce assigned specs or scope", "weaken project-required tests", "output schema/reporting", "edit/write"])
       expect(body).toContain(contract);
@@ -476,7 +476,7 @@ describe("plan/execute packaged composition", () => {
     for (const tool of ["subagent", "todo", "contact_supervisor", "subagent_supervisor"]) expect(String(director.frontmatter.tools)).toContain(tool);
     expect(String(director.frontmatter.tools)).not.toMatch(/\b(?:bash|edit|write|apply_patch)\b/);
     expect(director.frontmatter.extensions).toEqual(["../extensions/acp.ts"]);
-    expect(director.frontmatter.subagentOnlyExtensions).toEqual(["../node_modules/@nredd/pi-dev-tools/src/index.ts", "../extensions/file-sha256.ts", "../node_modules/pi-subagents/bundle/index.js", "../extensions/todo.ts"]);
+    expect(director.frontmatter.subagentOnlyExtensions).toEqual(["../extensions/dev-tools/index.ts", "../extensions/file-sha256.ts", "../node_modules/pi-subagents/bundle/index.js", "../extensions/todo.ts"]);
     for (const role of ["architect", "reviewer", "scout", "researcher", "evidence-auditor", "execution-inspector"]) {
       const profile = parseFrontmatter(read(`agents/${role}.md`)).frontmatter;
       expect(profile.acceptanceRole).toBe("read-only"); expect(profile.allowNestedSubagents).toBeUndefined();

@@ -35,7 +35,7 @@ tools:
 extensions:
   - ../extensions/acp.ts
 subagentOnlyExtensions:
-  - ../node_modules/@nredd/pi-dev-tools/src/index.ts
+  - ../extensions/dev-tools/index.ts
   - ../extensions/file-sha256.ts
   - ../node_modules/@vndv/pi-codegraph/extensions/codegraph.ts
   - ../node_modules/pi-lsp-client/src/index.ts

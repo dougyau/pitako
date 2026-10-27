@@ -6,7 +6,7 @@ tools: read, grep, find, ls, subagent, bg_wait, todo, contact_supervisor, subage
 extensions:
   - ../extensions/acp.ts
 subagentOnlyExtensions:
-  - ../node_modules/@nredd/pi-dev-tools/src/index.ts
+  - ../extensions/dev-tools/index.ts
   - ../extensions/file-sha256.ts
   - ../node_modules/pi-subagents/bundle/index.js
   - ../extensions/todo.ts

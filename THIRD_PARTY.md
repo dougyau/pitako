@@ -6,13 +6,13 @@ Pitako composes Pi packages and vendors selected MIT skills. It does not ship BS
 
 | Project | License | Use |
 | --- | --- | --- |
-| [@dietrichgebert/ponytail](https://github.com/DietrichGebert/ponytail) 4.10.0 (`e3ba2aa`) | MIT | Skills `ponytail` and `ponytail-review`. The Pi extension is installed but not loaded. |
-| [@juicesharp/rpiv-todo](https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-todo) 2.11.0 | MIT | Session-local `todo` tool, `/todos`, overlay, and branch replay. `@juicesharp/rpiv-i18n` stays optional. |
-| [pi-web-access](https://github.com/nicobailon/pi-web-access) 0.42.0 (Nico Bailon) | MIT | Web search, page extraction, and source checking. Bundled into the Pitako package tarball. |
-| [pi-hermes-memory](https://github.com/chandra447/pi-hermes-memory) 0.9.9 (Chandra Teja) | MIT | Persistent memory and conversation search. Bundled unchanged, independent of the Board. |
-| [pi-subagents](https://github.com/nicobailon/pi-subagents) 0.82.0 (Nico Bailon) | MIT | Native delegation, scripted workflows and missions through the published extension. Bundled unchanged with its LICENSE; Pitako's former managed runtime stays retired. |
+| [@dietrichgebert/ponytail](https://github.com/DietrichGebert/ponytail) 5.3.2 | MIT | Skills `ponytail` and `ponytail-review`. The Pi extension is installed but not loaded. |
+| [@juicesharp/rpiv-todo](https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-todo) 2.15.0 | MIT | Session-local `todo` tool, `/todos`, overlay, and branch replay. `@juicesharp/rpiv-i18n` stays optional. |
+| [pi-web-access](https://github.com/nicobailon/pi-web-access) 0.45.0 (Nico Bailon) | MIT | Web search, page extraction, and source checking. Bundled into the Pitako package tarball. |
+| [pi-hermes-memory](https://github.com/chandra447/pi-hermes-memory) 0.9.11 (Chandra Teja) | MIT | Persistent memory and conversation search. Bundled unchanged, independent of the Board. |
+| [pi-subagents](https://github.com/nicobailon/pi-subagents) 0.83.0 (Nico Bailon) | MIT | Native delegation, scripted workflows and missions through the published extension. Bundled unchanged with its LICENSE; Pitako's former managed runtime stays retired. |
 | [pi-lsp-client](https://github.com/code-yeongyu/pi-lsp-client) | MIT | LSP tools |
-| [pi-codex-tools](https://github.com/jvm/pi-mono/tree/main/packages/pi-codex-tools) 0.3.0 | Apache-2.0; OpenAI Codex attribution | Official extension registers `apply_patch` and invokes upstream install telemetry. Bundled unchanged. |
+| [pi-codex-tools](https://github.com/jvm/pi-mono/tree/main/packages/pi-codex-tools) 0.4.0 | Apache-2.0; OpenAI Codex attribution | Official extension registers `apply_patch` and invokes upstream install telemetry. Bundled unchanged. |
 | [billion-context-pi](https://github.com/ranxianglei/billion-context-pi) 0.1.83 (ranxianglei) | MIT | ACP context compression through the public factory. Bundled unchanged, with delegation and updates off by default. |
 | [acp-kernel](https://github.com/ranxianglei/acp-kernel) 0.0.98 (ranxianglei) | MIT with an additional visible-attribution term | Compression engine bundled inline in billion-context-pi's `dist/index.js`. Pitako uses acp-kernel through that package. |
 | [@vndv/pi-codegraph](https://github.com/vndv/pi-codegraph) | MIT | CodeGraph tools |
@@ -25,8 +25,8 @@ License text for pi-hermes-memory: `docs/licenses/pi-hermes-memory-LICENSE`. Lic
 
 The imported MIT projects below are maintained as ordinary Pitako source. Their
 separate full license texts are retained; neither upstream project publishes a
-separate NOTICE. Existing external registrations are migrated in the composition
-increment, not by these source imports alone.
+separate NOTICE. The owned dev-tools entry is registered once; the sampler is library-only.
+Neither external package is required at runtime or bundled.
 
 | Project | Source revision | Imported paths | License |
 | --- | --- | --- | --- |

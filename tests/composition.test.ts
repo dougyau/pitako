@@ -5,6 +5,7 @@ import * as acp from "billion-context-pi";
 import * as rpivTodo from "@juicesharp/rpiv-todo";
 import { parseFrontmatter, type ExtensionAPI, type ExtensionToolContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { validateToolArguments } from "@earendil-works/pi-ai";
 import {
   DEFAULT_SKILL_NAMES,
   EXCLUDED_SKILL_NAMES,
@@ -22,12 +23,43 @@ function readRepo(relative: string): string {
 }
 
 describe("engineering-layer composition", () => {
+  test("selected external LSP entry preserves the declared six-tool surface and symbol scopes", async () => {
+    const tools: ToolDefinition[] = [];
+    const commands: string[] = [];
+    const extension = await import(path.join(packageRoot(), "node_modules/pi-lsp-client/src/index.ts"));
+    const { disposeDefaultLspManager } = await import(path.join(packageRoot(), "node_modules/pi-lsp-client/src/lsp/manager.ts"));
+    try {
+      extension.default({
+        registerTool(tool: ToolDefinition) { tools.push(tool); },
+        registerCommand(name: string) { commands.push(name); },
+        on() {},
+      } as unknown as ExtensionAPI);
+      expect(tools.map(tool => tool.name)).toEqual(
+        readStack(packageRoot()).required.find(({ id }) => id === "pi-lsp-client")!.tools);
+      expect(commands).toEqual(["lsp"]);
+      const symbols = tools.find(tool => tool.name === "lsp_symbols")!;
+      for (const scope of ["document", "workspace"]) {
+        const arguments_ = { filePath: "source.ts", scope, ...(scope === "workspace" ? { query: "owned" } : {}) };
+        expect(validateToolArguments(symbols, {
+          type: "toolCall", id: scope, name: symbols.name, arguments: arguments_,
+        })).toEqual(arguments_);
+      }
+      expect(tools.find(tool => tool.name === "lsp_rename")!.executionMode).toBe("sequential");
+      const available = tools.map(tool => tool.name);
+      expect(toolsForProfile({ profile: "analysis", available })).not.toContain("lsp_rename");
+      expect(toolsForProfile({ profile: "coding", available })).toContain("lsp_rename");
+    } finally {
+      // Registration owns the client's idle reaper even without a server request.
+      await disposeDefaultLspManager();
+    }
+  });
+
   test("all nine profiles pass the native parser and required-tool plan with explicit ACP and role ceilings", async () => {
     const parser = await import("../node_modules/pi-subagents/src/agents/frontmatter.js");
     const { resolvePiLaunchToolPlan } = await import("../node_modules/pi-subagents/src/runs/shared/child-tool-plan.js");
     const acpTools = ["compress", "decompress", "search_context", "acp_status", "acp_cache"];
     const queries = ["git_worktree_list", "git_status", "git_diff", "git_log", "git_show", "resource_snapshot", "file_sha256", "codemode"];
-    const provider = readStack(packageRoot()).required.find(({ id }) => id === "@nredd/pi-dev-tools")!;
+    const provider = readStack(packageRoot()).required.find(({ id }) => id === "pitako-dev-tools")!;
     for (const role of ["architect", "reviewer", "scout", "researcher", "evidence-auditor", "execution-inspector", "worker", "execution-director", "interview-relay"]) {
       const { frontmatter, body } = parser.parseFrontmatter(readRepo(`agents/${role}.md`));
       const resolve = (raw?: string) => parser.parseFrontmatterList(raw)?.map(entry => path.resolve(packageRoot(), "agents", entry));
@@ -62,9 +94,9 @@ describe("engineering-layer composition", () => {
     }
   });
 
-  test("dev-tools public entry registers every group and hooks and runs the shipped sampler", async () => {
+  test("dev-tools public entry registers every group and hooks and runs the owned sampler", async () => {
     const manifest = JSON.parse(readRepo("package.json"));
-    const provider = readStack(packageRoot()).required.find(({ id }) => id === "@nredd/pi-dev-tools")!;
+    const provider = readStack(packageRoot()).required.find(({ id }) => id === "pitako-dev-tools")!;
     const entry = `./${provider.entry}`;
     expect(manifest.pi.extensions.filter((value: string) => value === entry)).toEqual([entry]);
     const tools: ToolDefinition[] = [];
@@ -86,7 +118,7 @@ describe("engineering-layer composition", () => {
     expect(handlers.get("before_agent_start")!({ systemPrompt: "base" }).systemPrompt)
       .toContain("base\n\nBefore knowingly starting a large test or compile");
 
-    // No sampler override: exercise the published runtime dependency through the public provider.
+    // No sampler override: exercise the owned sampler through the public provider.
     // Assert the Pitako composition contract, not host-specific availability or process inventory.
     const observer = tools.find(tool => tool.name === "resource_snapshot")!;
     const result = await observer.execute("resource", { process_limit: 1, interval_ms: 100 }, undefined, undefined,
@@ -234,7 +266,7 @@ describe("engineering-layer composition", () => {
       "lsp_diagnostics", "lsp_goto_definition", "lsp_find_references", "lsp_symbols",
     ]);
     const providers = [
-      "../node_modules/@nredd/pi-dev-tools/src/index.ts", "../extensions/file-sha256.ts",
+      "../extensions/dev-tools/index.ts", "../extensions/file-sha256.ts",
       "../node_modules/@vndv/pi-codegraph/extensions/codegraph.ts",
       "../node_modules/pi-lsp-client/src/index.ts",
     ];
@@ -316,7 +348,7 @@ describe("engineering-layer composition", () => {
   test("ordinary delegation ships directly without the Pitako runtime", () => {
     const manifest = JSON.parse(readRepo("package.json"));
     const stack = JSON.parse(readRepo("config/stack.json"));
-    expect(manifest.dependencies["pi-subagents"]).toBe("0.82.0");
+    expect(manifest.dependencies["pi-subagents"]).toBe("0.83.0");
     expect(manifest.bundledDependencies).toContain("pi-subagents");
     const piPackages = new Set([...Object.keys(manifest.devDependencies), ...Object.keys(manifest.peerDependencies)]);
     for (const name of piPackages) {
@@ -327,7 +359,7 @@ describe("engineering-layer composition", () => {
     expect(manifest.pi.extensions.filter((entry: string) => entry.includes("pi-subagents")))
       .toEqual(["./node_modules/pi-subagents/bundle/index.js"]);
     expect(stack.required.find((entry: { id: string }) => entry.id === "pi-subagents"))
-      .toEqual({ id: "pi-subagents", spec: "pi-subagents@0.82.0", entry: "node_modules/pi-subagents/bundle/index.js",
+      .toEqual({ id: "pi-subagents", spec: "pi-subagents@0.83.0", entry: "node_modules/pi-subagents/bundle/index.js",
         tools: ["subagent", "subagents_enable", "bg_wait", "subagent_supervisor", "contact_supervisor"] });
     for (const resources of [manifest.pi.skills, manifest.pi.prompts])
       expect(resources.some((entry: string) => entry.includes("pi-subagents"))).toBe(false);
