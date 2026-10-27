@@ -23,6 +23,35 @@ function readRepo(relative: string): string {
 }
 
 describe("engineering-layer composition", () => {
+  test.each(["coding", "analysis"] as const)("Pi-only %s startup delivers profile guidance without host prerequisites", profile => {
+    const handlers = new Map<string, (event: any, ctx: any) => any>();
+    // Actual owned registration/builder; no client metadata or model simulation.
+    pitako({
+      on(event: string, handler: (event: any, ctx: any) => any) { handlers.set(event, handler); },
+      registerFlag() {}, registerCommand() {},
+      getFlag() { return profile; },
+      getAllTools() { return []; }, getActiveTools() { return []; }, setActiveTools() {},
+      getSessionName() { return "Pi-only"; },
+    } as unknown as ExtensionAPI);
+    const ctx = {
+      cwd: packageRoot(), hasUI: false,
+      sessionManager: { getSessionId() { return `pi-only-${profile}`; }, getEntries() { return []; } },
+    };
+    handlers.get("session_start")!({}, ctx);
+    try {
+      const result = handlers.get("before_agent_start")!({ systemPrompt: "Pi base", messageType: "user", prompt: "Inspect sources" }, ctx);
+      expect(result.systemPrompt).toBe(`Pi base\n\n${profileNote(profile)}`);
+      for (const instruction of ["Pi-native tools and codemode need no T3 client",
+        "Optional-host guidance applies only when present", "unknown trust is not denial",
+        "Honor actual native rejections and Stop", "never invent a trust certificate",
+        "billion-context-pi ACP is mandatory", "Only the execution director delegates"])
+        expect(result.systemPrompt).toContain(instruction);
+      expect(handlers.get("before_agent_start")!({ systemPrompt: result.systemPrompt }, ctx)).toBeUndefined();
+    } finally {
+      handlers.get("session_shutdown")!({}, ctx);
+    }
+  });
+
   test("selected external LSP entry preserves the declared six-tool surface and symbol scopes", async () => {
     const tools: ToolDefinition[] = [];
     const commands: string[] = [];

@@ -85,6 +85,7 @@ export function toolsForProfile(options: {
 export function profileNote(profile: ProfileName): string {
   return [
     `Pitako profile: ${profile}.`,
+    "Pi-native tools and codemode need no T3 client, MCP wrapper or client thread ID. Optional-host guidance applies only when present; unknown trust is not denial. Honor actual native rejections and Stop; never invent a trust certificate.",
     profile === "analysis"
       ? "Read-only coding tools are enabled. edit, write, apply_patch, and lsp_rename are not. Introduced mutators are also blocked, including nested calls. Shell remains; this profile is not a sandbox."
       : "Use apply_patch when available; otherwise edit for local edits and write for new files.",

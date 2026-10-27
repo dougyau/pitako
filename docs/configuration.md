@@ -72,5 +72,8 @@ Pi and pi-subagents own model and child configuration. Pitako's former
 `config.toml`, role policies, developer routing, Head, and worker-history settings
 are not read, validated, or completed. Existing files are left untouched.
 
-`plan` and `execute` are excluded from advertised skills. Their files only
-document suspension; they are not compatibility implementations.
+`plan` and `execute` are advertised skills, with `/plan` and `/execute` prompt
+templates. Planning gathers evidence and confirms specs without implementation;
+execution uses native pi-subagents missions and the `pitako.execute` resource
+registered by `extensions/plan-execute.ts`. See the [plan/execute
+specification](plan-execute-spec.md) for their authority and preflight boundaries.
