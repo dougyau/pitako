@@ -7,10 +7,10 @@ Dependencies (not copied into this repository's source):
   itself remains under a different license and is not shipped here.
 - @vndv/pi-codegraph is MIT.
 - @colbymchenry/codegraph is MIT.
-- @dietrichgebert/ponytail is MIT. Pitako loads the ponytail skill only.
+- @dietrichgebert/ponytail is MIT. Pitako loads the ponytail and ponytail-review skills only.
 - @juicesharp/rpiv-todo is MIT. Pitako loads the extension as the session TODO layer.
-- pi-web-access 0.42.0 (Nico Bailon) is MIT. Pitako bundles it for web search and page extraction. The license is docs/licenses/pi-web-access-LICENSE.
-- pi-hermes-memory 0.9.9 (Chandra Teja) is MIT. Pitako bundles it unchanged for persistent memory and conversation search, separate from the Board. The license is docs/licenses/pi-hermes-memory-LICENSE.
+- pi-web-access 0.45.0 (Nico Bailon) is MIT. Pitako bundles it for web search and page extraction. The license is docs/licenses/pi-web-access-LICENSE.
+- pi-hermes-memory 0.9.11 (Chandra Teja) is MIT. Pitako bundles it unchanged for persistent memory and conversation search, separate from the Board. The license is docs/licenses/pi-hermes-memory-LICENSE.
 - billion-context-pi 0.1.83 (ranxianglei) is MIT. Pitako uses it for ACP context
   compression: https://github.com/ranxianglei/billion-context-pi. Its license is
   docs/licenses/billion-context-pi-LICENSE.
@@ -19,7 +19,7 @@ Dependencies (not copied into this repository's source):
   Attribution on Product Surfaces term, retained in docs/licenses/acp-kernel-LICENSE.
   Visible attribution is also in README.md and THIRD_PARTY.md.
 - Pi (@earendil-works/pi-coding-agent) is MIT.
-- pi-codex-tools 0.3.0 is Apache-2.0 and includes parser/grammar behavior derived from OpenAI Codex, Copyright 2025 OpenAI. Its attribution is retained in docs/licenses/pi-codex-tools-NOTICE; the license is docs/licenses/pi-codex-tools-LICENSE.
+- pi-codex-tools 0.4.0 is Apache-2.0 and includes parser/grammar behavior derived from OpenAI Codex, Copyright 2025 OpenAI. Its attribution is retained in docs/licenses/pi-codex-tools-NOTICE; the license is docs/licenses/pi-codex-tools-LICENSE.
 
 Vendored MIT material (see THIRD_PARTY.md and docs/licenses/):
 
@@ -27,3 +27,16 @@ Vendored MIT material (see THIRD_PARTY.md and docs/licenses/):
   paths are not shipped.
 - Selected pstack skills and principles (Lauren Tan / official Cursor pstack
   plugin). Orchestration, poteto-mode, and subagent runtimes are not shipped.
+
+Owned provider source (nredd/pi-harness; MIT, Copyright (c) 2026 Redd):
+
+- pi-dev-tools 0.6.0, source revision 6104beaf45d34933efd13e4c6b7e2be54c552f16:
+  extensions/dev-tools/ and adapted tests/fixtures in tests/dev-tools/.
+  Full license: docs/licenses/pi-dev-tools-LICENSE.
+- pi-resource-sampler 0.1.1, source revision aebee47ecd4e852a0f80134c376690ff4e33deb7:
+  extensions/resource-sampler/ and adapted tests in tests/resource-sampler/.
+  Full license: docs/licenses/pi-resource-sampler-LICENSE.
+
+Source mappings, test origins, local changes and evidence limits are recorded in
+docs/provenance.json. These notices do not claim signature authentication or
+full source-to-npm-artifact equality.

@@ -1,6 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import { isProtectedEditPath } from "../extensions/paths.ts";
-import { parseProfile, profileNote, toolsForProfile } from "../extensions/profile.ts";
+import { MUTATING_TOOLS, parseProfile, profileNote, toolsForProfile } from "../extensions/profile.ts";
+
+// Source behavior, not the provider's readOnlyHint: checks can run code/write caches.
+const introducedMutators = [
+  "file_sha256_save", "git_worktree_add", "git_worktree_remove", "git_worktree_prune", "git_commit",
+  "ssh_exec", "ssh_pull", "ssh_push", "py_lint", "py_format", "py_typecheck", "py_test", "py_uv",
+  "cargo_check", "cargo_clippy", "cargo_fmt", "cargo_test", "cargo_build", "cargo_run", "cargo_doc", "cargo_bench", "cargo_add",
+];
+const deterministicReads = ["git_worktree_list", "git_status", "git_diff", "git_log", "git_show", "resource_snapshot", "file_sha256", "codemode"];
 
 const available = [
   "read",
@@ -20,6 +28,7 @@ const available = [
   "todo",
   "board_post",
   "board_query",
+  ...introducedMutators, ...deterministicReads,
 ];
 
 describe("profiles", () => {
@@ -55,9 +64,13 @@ describe("profiles", () => {
     for (const name of ["read", "bash", "grep", "find", "ls", "lsp_diagnostics", "codegraph_callers", "todo", "board_query"]) {
       expect(tools).toContain(name);
     }
-    for (const name of ["edit", "write", "apply_patch", "lsp_rename"]) {
+    for (const name of ["edit", "write", "apply_patch", "lsp_rename", ...introducedMutators]) {
       expect(tools).not.toContain(name);
+      expect(MUTATING_TOOLS.has(name)).toBe(true);
     }
+    for (const name of deterministicReads) expect(tools).toContain(name);
+    const coding = toolsForProfile({ available, profile: "coding" });
+    for (const name of [...introducedMutators, ...deterministicReads]) expect(coding).toContain(name);
   });
 
   test("profiles preserve tools supplied by pi-subagents without a managed grant", () => {

@@ -5,7 +5,7 @@
   "required": [
     {
       "id": "pi-codex-tools",
-      "spec": "pi-codex-tools@0.3.0",
+      "spec": "pi-codex-tools@0.4.0",
       "entry": "node_modules/pi-codex-tools/index.ts",
       "tools": ["apply_patch"]
     },
@@ -17,7 +17,7 @@
     },
     {
       "id": "pi-lsp-client",
-      "spec": "github:code-yeongyu/pi-lsp-client#1c981dfcacc456fe4ce9f4120a2f0250b54d6844",
+      "spec": "github:code-yeongyu/pi-lsp-client#9d029fb32b721c038b58fb418b98bbfcf720cf0a",
       "entry": "node_modules/pi-lsp-client/src/index.ts",
       "tools": [
         "lsp_diagnostics",
@@ -30,7 +30,7 @@
     },
     {
       "id": "@vndv/pi-codegraph",
-      "spec": "@vndv/pi-codegraph@0.1.10",
+      "spec": "@vndv/pi-codegraph@0.1.11",
       "entry": "node_modules/@vndv/pi-codegraph/extensions/codegraph.ts",
       "bin": "codegraph",
       "tools": [
@@ -45,8 +45,48 @@
       ]
     },
     {
+      "id": "pitako-dev-tools",
+      "spec": "pitako",
+      "entry": "extensions/dev-tools/index.ts",
+      "tools": [
+        "git_worktree_list",
+        "git_worktree_add",
+        "git_worktree_remove",
+        "git_worktree_prune",
+        "git_status",
+        "git_diff",
+        "git_log",
+        "git_show",
+        "git_commit",
+        "ssh_exec",
+        "ssh_pull",
+        "ssh_push",
+        "py_lint",
+        "py_format",
+        "py_typecheck",
+        "py_test",
+        "py_uv",
+        "cargo_check",
+        "cargo_clippy",
+        "cargo_fmt",
+        "cargo_test",
+        "cargo_build",
+        "cargo_run",
+        "cargo_doc",
+        "cargo_bench",
+        "cargo_add",
+        "resource_snapshot"
+      ]
+    },
+    {
+      "id": "pitako-file-sha256",
+      "spec": "pitako",
+      "entry": "extensions/file-sha256.ts",
+      "tools": ["file_sha256", "file_sha256_save"]
+    },
+    {
       "id": "@juicesharp/rpiv-todo",
-      "spec": "@juicesharp/rpiv-todo@2.11.0",
+      "spec": "@juicesharp/rpiv-todo@2.15.0",
       "entry": "extensions/todo.ts",
       "tools": ["todo"]
     },
@@ -65,7 +105,7 @@
     },
     {
       "id": "pi-subagents",
-      "spec": "pi-subagents@0.82.0",
+      "spec": "pi-subagents@0.83.0",
       "entry": "node_modules/pi-subagents/bundle/index.js",
       "tools": ["subagent", "subagents_enable", "bg_wait", "subagent_supervisor", "contact_supervisor"]
     },
@@ -77,13 +117,13 @@
     },
     {
       "id": "pi-hermes-memory",
-      "spec": "pi-hermes-memory@0.9.9",
+      "spec": "pi-hermes-memory@0.9.11",
       "entry": "node_modules/pi-hermes-memory/src/index.ts",
       "tools": ["memory_add", "memory_replace", "memory_remove", "memory_search", "session_search", "skill_manage"]
     },
     {
       "id": "pi-web-access",
-      "spec": "pi-web-access@0.42.0",
+      "spec": "pi-web-access@0.45.0",
       "entry": "node_modules/pi-web-access/dist/index.js",
       "tools": ["web_search", "fetch_content", "source_check", "get_search_content", "web_enable"]
     }

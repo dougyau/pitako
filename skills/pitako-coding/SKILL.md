@@ -12,7 +12,7 @@ This skill is the router. Do not paste the full bodies of Ponytail, Caveman, pra
 ## Profiles
 
 - `coding` (default): read, bash, grep, find, ls, LSP, CodeGraph, and ACP context tools. Use `apply_patch` on supported models, otherwise `edit` and `write`.
-- `analysis`: the same read and search tools, without `edit`, `write`, `apply_patch`, or `lsp_rename`. Shell and ACP temporary output are still available. This is not a sandbox.
+- `analysis`: read/search and hash queries, without editing, hash saving or introduced Git/SSH/Python/Cargo mutators. The tool-call boundary blocks those directly and through codemode, including `ssh_pull`'s local writes. Shell and ACP temporary output are still available. This is not a sandbox.
 
 Official `pi-codex-tools` registers `apply_patch` and owns its grammar capability. Pitako selects it through the public `supportsOpenAIGrammarTools` helper for `openai-responses` or `openai-codex-responses` models with `compat.supportsOpenAIGrammarTools === true`. On these models, `edit` and `write` are inactive. Pitako reapplies the policy after startup, model changes, and profile changes. Pi-subagents owns its children's profiles and tool selection.
 
@@ -30,6 +30,16 @@ Switch with `/pitako profile analysis` or start Pi with `--pitako-profile analys
 
 ## Tools
 
+Prefer deterministic Git/hash tools for covered operations and compose them
+through native codemode. Keep bash/Python fallback for uncovered operations when
+your role permits it. `git_status` reports working changes, not every tracked
+file; structured `git_diff` returns statistics, not a patch/path array. Git queries
+may update metadata or spill output; they are not sandboxed.
+`file_sha256` reads only. Authorized writers use `file_sha256_save` to hash and
+atomically publish reusable items JSON in one call. Inspect structured `ok` and
+`publication`: typed failures can return without throwing, and successful hashes
+alone do not establish saving, a source snapshot, or passing tests.
+
 Keep read/grep, LSP, and CodeGraph visible, with `bash` and the model-compatible editing tools in the coding profile. Choose supported LSP or CodeGraph tools for bounded structural questions. Use read, grep, or bash for literal searches, exhaustive or exact results, unsupported backends, and follow-up.
 
 The `codegraph_*` runtime tools use the CodeGraph CLI and need an existing index; they do not initialize or refresh it. This checkout's `scripts/setup.sh` attempts missing-index initialization best-effort after dependencies are ready. Other projects own their optional preparation; use it or run `codegraph init` explicitly when you want CodeGraph navigation. If initialization is unavailable or fails, continue with LSP/read/grep.
@@ -43,7 +53,17 @@ LSP needs an installed server for the file type. It can resolve a command on `PA
 
 `edit` and `write` are blocked for `.git/`, `node_modules/`, `.env`, and `.env.*` files. Do not bypass that with shell unless the user explicitly asks. Those guards do not protect upstream `apply_patch`, which accepts absolute paths, symlinks, moves, and fuzzy matching. The old strict-path, exact-match engine and structured failures are gone. No sandbox is added; future bwrap or OpenShell work does not protect this version.
 
-ACP is the only compressor; `pi-codex-compaction` is not loaded. Use `compress`, `search_context`, `decompress`, and `/acp` for blocks. Original entries remain available. Persistent sessions reload `<sessionFile>.acp.json`; in-memory children retain state only for their session's lifetime. With ACP active, native `/compact` reports `Compaction cancelled` and automatic compaction creates no native summary. Disabled ACP or a refused `bili` proxy leaves native compaction available.
+ACP from `billion-context-pi` is mandatory and the only compressor;
+`pi-codex-compaction` is not loaded. All nine packaged profiles explicitly load
+the adapter and require `compress`, `decompress`, `search_context`, `acp_status`
+and `acp_cache`. Missing, disabled, unloadable or refused ACP is an unmet
+prerequisite; report it rather than claim healthy work or override user settings.
+Registration alone cannot prove compression remains operational after refusal.
+Use `/acp` for blocks. Original entries remain available. Persistent sessions
+reload `<sessionFile>.acp.json`; in-memory children retain state only for their
+session's lifetime. With ACP active, native `/compact` reports `Compaction cancelled`
+and automatic compaction creates no native summary. Disabled ACP or a refused
+`bili` proxy leaves native compaction available; preserve that upstream guidance.
 
 Pitako's ACP factory defaults to `{ delegate: false, autoUpdate: false, toolBashDefaultTimeout: 0 }`. ACP does not add a default timeout to bash calls; explicit call timeouts still apply. Explicit `~/.pi/acp.json` and project `.pi/acp.json` override these defaults, with project settings winning. They can enable delegates or updates, or set `enabled:false`. Preserve user files. The factory reads the master switch from `process.cwd()`; runtime options use `ctx.cwd`. A different child cwd does not change the factory's master-switch location.
 

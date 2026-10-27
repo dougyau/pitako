@@ -5,6 +5,7 @@ import * as acp from "billion-context-pi";
 import * as rpivTodo from "@juicesharp/rpiv-todo";
 import { parseFrontmatter, type ExtensionAPI, type ExtensionToolContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { validateToolArguments } from "@earendil-works/pi-ai";
 import {
   DEFAULT_SKILL_NAMES,
   EXCLUDED_SKILL_NAMES,
@@ -14,7 +15,7 @@ import {
 } from "../extensions/catalog.ts";
 import pitako from "../extensions/index.ts";
 import { profileNote } from "../extensions/profile.ts";
-import { packageRoot } from "../extensions/stack.ts";
+import { packageRoot, readStack } from "../extensions/stack.ts";
 import { toolsForProfile } from "../extensions/profile.ts";
 
 function readRepo(relative: string): string {
@@ -22,6 +23,150 @@ function readRepo(relative: string): string {
 }
 
 describe("engineering-layer composition", () => {
+  test.each(["coding", "analysis"] as const)("Pi-only %s startup delivers profile guidance without host prerequisites", profile => {
+    const handlers = new Map<string, (event: any, ctx: any) => any>();
+    // Actual owned registration/builder; no client metadata or model simulation.
+    pitako({
+      on(event: string, handler: (event: any, ctx: any) => any) { handlers.set(event, handler); },
+      registerFlag() {}, registerCommand() {},
+      getFlag() { return profile; },
+      getAllTools() { return []; }, getActiveTools() { return []; }, setActiveTools() {},
+      getSessionName() { return "Pi-only"; },
+    } as unknown as ExtensionAPI);
+    const ctx = {
+      cwd: packageRoot(), hasUI: false,
+      sessionManager: { getSessionId() { return `pi-only-${profile}`; }, getEntries() { return []; } },
+    };
+    handlers.get("session_start")!({}, ctx);
+    try {
+      const result = handlers.get("before_agent_start")!({ systemPrompt: "Pi base", messageType: "user", prompt: "Inspect sources" }, ctx);
+      expect(result.systemPrompt).toBe(`Pi base\n\n${profileNote(profile)}`);
+      for (const instruction of ["Pi-native tools and codemode need no T3 client",
+        "Optional-host guidance applies only when present", "unknown trust is not denial",
+        "Honor actual native rejections and Stop", "never invent a trust certificate",
+        "billion-context-pi ACP is mandatory", "Only the execution director delegates"])
+        expect(result.systemPrompt).toContain(instruction);
+      expect(handlers.get("before_agent_start")!({ systemPrompt: result.systemPrompt }, ctx)).toBeUndefined();
+    } finally {
+      handlers.get("session_shutdown")!({}, ctx);
+    }
+  });
+
+  test("selected external LSP entry preserves the declared six-tool surface and symbol scopes", async () => {
+    const tools: ToolDefinition[] = [];
+    const commands: string[] = [];
+    const extension = await import(path.join(packageRoot(), "node_modules/pi-lsp-client/src/index.ts"));
+    const { disposeDefaultLspManager } = await import(path.join(packageRoot(), "node_modules/pi-lsp-client/src/lsp/manager.ts"));
+    try {
+      extension.default({
+        registerTool(tool: ToolDefinition) { tools.push(tool); },
+        registerCommand(name: string) { commands.push(name); },
+        on() {},
+      } as unknown as ExtensionAPI);
+      expect(tools.map(tool => tool.name)).toEqual(
+        readStack(packageRoot()).required.find(({ id }) => id === "pi-lsp-client")!.tools);
+      expect(commands).toEqual(["lsp"]);
+      const symbols = tools.find(tool => tool.name === "lsp_symbols")!;
+      for (const scope of ["document", "workspace"]) {
+        const arguments_ = { filePath: "source.ts", scope, ...(scope === "workspace" ? { query: "owned" } : {}) };
+        expect(validateToolArguments(symbols, {
+          type: "toolCall", id: scope, name: symbols.name, arguments: arguments_,
+        })).toEqual(arguments_);
+      }
+      expect(tools.find(tool => tool.name === "lsp_rename")!.executionMode).toBe("sequential");
+      const available = tools.map(tool => tool.name);
+      expect(toolsForProfile({ profile: "analysis", available })).not.toContain("lsp_rename");
+      expect(toolsForProfile({ profile: "coding", available })).toContain("lsp_rename");
+    } finally {
+      // Registration owns the client's idle reaper even without a server request.
+      await disposeDefaultLspManager();
+    }
+  });
+
+  test("all nine profiles pass the native parser and required-tool plan with explicit ACP and role ceilings", async () => {
+    const parser = await import("../node_modules/pi-subagents/src/agents/frontmatter.js");
+    const { resolvePiLaunchToolPlan } = await import("../node_modules/pi-subagents/src/runs/shared/child-tool-plan.js");
+    const acpTools = ["compress", "decompress", "search_context", "acp_status", "acp_cache"];
+    const queries = ["git_worktree_list", "git_status", "git_diff", "git_log", "git_show", "resource_snapshot", "file_sha256", "codemode"];
+    const provider = readStack(packageRoot()).required.find(({ id }) => id === "pitako-dev-tools")!;
+    for (const role of ["architect", "reviewer", "scout", "researcher", "evidence-auditor", "execution-inspector", "worker", "execution-director", "interview-relay"]) {
+      const { frontmatter, body } = parser.parseFrontmatter(readRepo(`agents/${role}.md`));
+      const resolve = (raw?: string) => parser.parseFrontmatterList(raw)?.map(entry => path.resolve(packageRoot(), "agents", entry));
+      const plan = resolvePiLaunchToolPlan({
+        cwd: packageRoot(), agentName: `pitako.${role}`, fast: false,
+        tools: parser.parseFrontmatterList(frontmatter.tools),
+        extensions: resolve(frontmatter.extensions),
+        subagentOnlyExtensions: resolve(frontmatter.subagentOnlyExtensions),
+      });
+      expect(plan.disableAmbientExtensions).toBe(true);
+      expect(plan.extensionArgs).toContain(path.join(packageRoot(), "extensions/acp.ts"));
+      for (const tool of acpTools) expect(plan.requiredChildTools).toContain(tool);
+      expect(body).toContain("billion-context-pi");
+      expect(body).toContain("unmet prerequisite");
+      expect(body).toContain("native-compaction stand-down");
+      expect(plan.fanoutAuthorized).toBe(role === "execution-director");
+      if (role === "interview-relay") {
+        expect(plan.effectiveToolAllowlist).toEqual(["contact_supervisor", ...acpTools]);
+        expect(plan.configuredExtensions).toEqual([path.join(packageRoot(), "extensions/acp.ts")]);
+        continue;
+      }
+      for (const tool of queries) expect(plan.requiredChildTools).toContain(tool);
+      expect(plan.extensionArgs).toContain(path.join(packageRoot(), provider.entry));
+      expect(plan.extensionArgs).toContain(path.join(packageRoot(), "extensions/file-sha256.ts"));
+      if (role === "worker") {
+        for (const tool of [...provider.tools, "file_sha256_save"]) expect(plan.requiredChildTools).toContain(tool);
+        for (const tool of ["subagent", "bg_wait", "subagent_supervisor"]) expect(plan.requiredChildTools).not.toContain(tool);
+      } else {
+        for (const tool of provider.tools.filter(tool => !queries.includes(tool))) expect(plan.effectiveToolAllowlist).not.toContain(tool);
+        expect(plan.requiredChildTools).not.toContain("file_sha256_save");
+      }
+    }
+  });
+
+  test("dev-tools public entry registers every group and hooks and runs the owned sampler", async () => {
+    const manifest = JSON.parse(readRepo("package.json"));
+    const provider = readStack(packageRoot()).required.find(({ id }) => id === "pitako-dev-tools")!;
+    const entry = `./${provider.entry}`;
+    expect(manifest.pi.extensions.filter((value: string) => value === entry)).toEqual([entry]);
+    const tools: ToolDefinition[] = [];
+    const handlers = new Map<string, (event: any) => any>();
+    const extension = await import(path.join(packageRoot(), entry));
+    extension.default({
+      registerTool(tool: ToolDefinition) { tools.push(tool); },
+      on(event: string, handler: (event: any) => any) { handlers.set(event, handler); },
+    } as unknown as ExtensionAPI);
+    expect(tools.map(tool => tool.name)).toEqual(provider.tools);
+    for (const tool of tools) {
+      expect(tool.outputSchema).toBeDefined();
+      expect(typeof tool.execute).toBe("function");
+    }
+    expect([...handlers.keys()]).toEqual(["tool_call", "before_agent_start"]);
+    expect(handlers.get("tool_call")!({ toolName: "bash", input: { command: "git commit -n" } }))
+      .toMatchObject({ block: true });
+    expect(handlers.get("tool_call")!({ toolName: "bash", input: { command: "git status" } })).toBeUndefined();
+    expect(handlers.get("before_agent_start")!({ systemPrompt: "base" }).systemPrompt)
+      .toContain("base\n\nBefore knowingly starting a large test or compile");
+
+    // No sampler override: exercise the owned sampler through the public provider.
+    // Assert the Pitako composition contract, not host-specific availability or process inventory.
+    const observer = tools.find(tool => tool.name === "resource_snapshot")!;
+    const result = await observer.execute("resource", { process_limit: 1, interval_ms: 100 }, undefined, undefined,
+      { cwd: packageRoot() } as ExtensionToolContext);
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      platform: process.platform,
+      interval: { requestedMs: 100 },
+      memory: { status: "available" },
+    });
+    expect(result.content[0]).toMatchObject({ type: "text" });
+
+    const cancellation = new AbortController(), reason = new Error("owned sampler cancellation");
+    cancellation.abort(reason);
+    // The provider awaits sampler disposal before this rejection settles.
+    await expect(observer.execute("cancelled-resource", {}, cancellation.signal, undefined,
+      { cwd: packageRoot() } as ExtensionToolContext)).rejects.toBe(reason);
+  });
+
   test("TODO composition delegates upstream execution and keeps native model-only exposure", async () => {
     const upstream = { content: [], details: { tasks: [], nextId: 1 } };
     const execute = mock(async (..._args: unknown[]) => {
@@ -135,19 +280,22 @@ describe("engineering-layer composition", () => {
     // The agent adapter's scalar/list parser differs from Pi's YAML parser.
     const agentParser = await import(path.join(packageRoot(), "node_modules/pi-subagents/src/agents/frontmatter.js"));
     const nativeProfile = agentParser.parseFrontmatter(source).frontmatter;
-    expect(agentParser.parseFrontmatterList(nativeProfile.extensions)).toEqual([]);
+    expect(agentParser.parseFrontmatterList(nativeProfile.extensions)).toEqual(["../extensions/acp.ts"]);
     expect(`${profile.package}.${profile.name}`).toBe("pitako.architect");
     expect(profile).toMatchObject({
       acceptanceRole: "read-only", defaultContext: "fresh", systemPromptMode: "replace",
       inheritProjectContext: true, inheritGlobalContext: false, inheritSkills: false,
     });
     expect(profile.tools).toEqual([
+      "compress", "decompress", "search_context", "acp_status", "acp_cache",
+      "git_worktree_list", "git_status", "git_diff", "git_log", "git_show", "resource_snapshot", "file_sha256", "codemode",
       "read", "grep", "find", "ls",
       "codegraph_search", "codegraph_callers", "codegraph_callees", "codegraph_impact",
       "codegraph_explore", "codegraph_node", "codegraph_status", "codegraph_files",
       "lsp_diagnostics", "lsp_goto_definition", "lsp_find_references", "lsp_symbols",
     ]);
     const providers = [
+      "../extensions/dev-tools/index.ts", "../extensions/file-sha256.ts",
       "../node_modules/@vndv/pi-codegraph/extensions/codegraph.ts",
       "../node_modules/pi-lsp-client/src/index.ts",
     ];
@@ -205,7 +353,8 @@ describe("engineering-layer composition", () => {
     if (!Array.isArray(architect.tools) || !Array.isArray(architect.subagentOnlyExtensions) ||
       !Array.isArray(profile.subagentOnlyExtensions) ||
       !Array.isArray(profile.skillPath)) throw new Error("Expected profile resource lists");
-    expect(profile.tools).toEqual([...architect.tools.slice(0, 4), "watchdog_diff", ...architect.tools.slice(4)]);
+    const navigationStart = architect.tools.indexOf("codegraph_search");
+    expect(profile.tools).toEqual([...architect.tools.slice(0, navigationStart), "watchdog_diff", ...architect.tools.slice(navigationStart)]);
     expect(profile.subagentOnlyExtensions).toEqual(architect.subagentOnlyExtensions);
     for (const provider of profile.subagentOnlyExtensions)
       expect(readRepo(path.join("agents", provider)).length).toBeGreaterThan(0);
@@ -228,7 +377,7 @@ describe("engineering-layer composition", () => {
   test("ordinary delegation ships directly without the Pitako runtime", () => {
     const manifest = JSON.parse(readRepo("package.json"));
     const stack = JSON.parse(readRepo("config/stack.json"));
-    expect(manifest.dependencies["pi-subagents"]).toBe("0.82.0");
+    expect(manifest.dependencies["pi-subagents"]).toBe("0.83.0");
     expect(manifest.bundledDependencies).toContain("pi-subagents");
     const piPackages = new Set([...Object.keys(manifest.devDependencies), ...Object.keys(manifest.peerDependencies)]);
     for (const name of piPackages) {
@@ -239,7 +388,7 @@ describe("engineering-layer composition", () => {
     expect(manifest.pi.extensions.filter((entry: string) => entry.includes("pi-subagents")))
       .toEqual(["./node_modules/pi-subagents/bundle/index.js"]);
     expect(stack.required.find((entry: { id: string }) => entry.id === "pi-subagents"))
-      .toEqual({ id: "pi-subagents", spec: "pi-subagents@0.82.0", entry: "node_modules/pi-subagents/bundle/index.js",
+      .toEqual({ id: "pi-subagents", spec: "pi-subagents@0.83.0", entry: "node_modules/pi-subagents/bundle/index.js",
         tools: ["subagent", "subagents_enable", "bg_wait", "subagent_supervisor", "contact_supervisor"] });
     for (const resources of [manifest.pi.skills, manifest.pi.prompts])
       expect(resources.some((entry: string) => entry.includes("pi-subagents"))).toBe(false);

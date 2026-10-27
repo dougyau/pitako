@@ -25,8 +25,9 @@ Do not install those entries a second time as separate Pitako resources.
 ## Use the coding baseline
 
 `coding` is the default profile. `/pitako profile analysis` disables `edit`,
-`write`, `apply_patch`, and `lsp_rename`. Shell remains available, so analysis is
-not a sandbox. `--pitako-profile` takes precedence over `PITAKO_PROFILE`.
+`write`, `apply_patch`, `lsp_rename`, hash saving, and introduced Git/SSH/Python/Cargo
+mutators, including nested codemode calls. Shell remains available, so analysis
+is not a sandbox. `--pitako-profile` takes precedence over `PITAKO_PROFILE`.
 
 Pitako selects upstream `apply_patch` on grammar-capable OpenAI models and uses
 `edit` and `write` otherwise. The latter tools reject protected `.git`,
@@ -40,6 +41,19 @@ posts into every turn.
 Load specialized skills only when they apply. The default collection includes
 Ponytail, Caveman, investigation, architecture, review, verification, and
 technical-writing guidance. See [the coding router](skills/pitako-coding/SKILL.md).
+
+Prefer bundled deterministic Git/hash tools for covered operations; compose them
+through native codemode and retain bash/Python fallback for uncovered operations.
+`git_status` reports working changes, not a tracked inventory; structured
+`git_diff` returns statistics, not patches or path arrays. `file_sha256` reads;
+authorized writers use `file_sha256_save` to hash and atomically publish reusable
+items JSON in one call. Inspect structured `ok` and `publication`, not just text
+or absence of an exception.
+
+ACP from `billion-context-pi` is mandatory, including in all nine packaged child
+profiles. Missing, disabled, unloadable or refused ACP is an unmet prerequisite,
+not a supported ACP-less mode. Preserve explicit user configuration and upstream
+refusal/native-compaction guidance; never force-enable it.
 
 ## Delegate through pi-subagents
 
@@ -82,7 +96,7 @@ See the [plan skill](skills/plan/SKILL.md), [execute skill](skills/execute/SKILL
 and [migration spec](docs/plan-execute-spec.md) for source selection, native
 replay, immutable input snapshots, native activity barriers and targeted human
 `/execute <id> --unblock` historical exclusion withdrawal (not verified closure).
-Installing 0.82.0 does not prove a running host reloaded it. No provider/model is
+Installing 0.83.0 does not prove a running host reloaded it. No provider/model is
 pinned and no Pitako usage budget, scheduler or private execution store is added.
 
 ## Retired orchestration

@@ -1,43 +1,137 @@
 {
+  "pi-dev-tools": {
+    "decision": "owned-source",
+    "package": "@nredd/pi-dev-tools",
+    "version": "0.6.0",
+    "repository": "https://github.com/nredd/pi-harness",
+    "revision": "6104beaf45d34933efd13e4c6b7e2be54c552f16",
+    "license": "MIT",
+    "copyright": "Copyright (c) 2026 Redd",
+    "sourceMapping": {
+      "packages/dev-tools/src/": "extensions/dev-tools/",
+      "packages/dev-tools/LICENSE": "docs/licenses/pi-dev-tools-LICENSE",
+      "packages/dev-tools/test/fixtures/": "tests/dev-tools/fixtures/"
+    },
+    "testOrigins": {
+      "tests/dev-tools/support.ts": [
+        "packages/dev-tools/test/support.ts"
+      ],
+      "tests/dev-tools/cargo-parse.test.ts": [
+        "packages/dev-tools/test/cargo/parse.test.ts"
+      ],
+      "tests/dev-tools/py-parse.test.ts": [
+        "packages/dev-tools/test/py/parse.test.ts"
+      ],
+      "tests/dev-tools/git-guard.test.ts": [
+        "packages/dev-tools/test/git/guard.test.ts"
+      ],
+      "tests/dev-tools/git-status.test.ts": [
+        "packages/dev-tools/test/git/status.test.ts"
+      ],
+      "tests/dev-tools/resource.test.ts": [
+        "packages/dev-tools/test/resource.test.ts"
+      ],
+      "tests/dev-tools/lock.test.ts": [
+        "packages/dev-tools/test/core/lock.test.ts"
+      ],
+      "tests/dev-tools/process.test.ts": [
+        "packages/dev-tools/test/core/process.test.ts",
+        "packages/dev-tools/test/core/process-lines.test.ts"
+      ],
+      "tests/dev-tools/git-commit.test.ts": [
+        "packages/dev-tools/test/scenarios/git.test.ts",
+        "packages/dev-tools/test/git/commit-message.test.ts"
+      ],
+      "tests/dev-tools/factory.test.ts": []
+    },
+    "localModifications": [
+      "resource/index.ts imports the owned sampler and authoritative types; reports secondary disposal failure without replacing the primary error.",
+      "git/commit-message.ts removes automatic Claude attribution; git/index.ts removes its misleading producer description. Explicit user text and other message validation remain.",
+      "core/lock.ts releases on onWait callback failure and retains queue ownership until earlier work settles after a waiter cancellation.",
+      "Selected upstream tests use bun:test and owned import paths; parser fixtures resolve from tests/dev-tools/fixtures. Lifecycle, cancellation, stored Git message, controlled signing failure, branch checks and command injection checks are adapted or added locally. Factory test is Pitako-original.",
+      "Controlled private Git and child-process fixtures replace external CLI certification; pending lock outcomes are observed natively before assertions to avoid eager Bun matcher deadlock.",
+      "Cargo check.jsonl and clippy-good.jsonl fixture home paths are replaced with /fixture/user/ placeholders to preserve repository source hygiene without changing parser diagnostics; format diff fixtures normalize whitespace-only context lines for clean publication."
+    ],
+    "evidenceLimits": "Source imported from the recorded Git tree. Loaded once through extensions/dev-tools/index.ts, using only the owned library sampler. No signature authentication or full npm artifact/source equality is claimed."
+  },
+  "pi-resource-sampler": {
+    "decision": "owned-source",
+    "package": "@nredd/pi-resource-sampler",
+    "version": "0.1.1",
+    "repository": "https://github.com/nredd/pi-harness",
+    "revision": "aebee47ecd4e852a0f80134c376690ff4e33deb7",
+    "license": "MIT",
+    "copyright": "Copyright (c) 2026 Redd",
+    "sourceMapping": {
+      "packages/resource-sampler/src/": "extensions/resource-sampler/",
+      "packages/resource-sampler/LICENSE": "docs/licenses/pi-resource-sampler-LICENSE"
+    },
+    "testOrigins": {
+      "tests/resource-sampler/sampler.test.ts": [
+        "packages/resource-sampler/test/sampler.test.ts"
+      ],
+      "tests/resource-sampler/lifecycle.test.ts": [],
+      "tests/resource-sampler/fixtures/lifecycle.ts": []
+    },
+    "localModifications": [
+      "Source files are unchanged from the recorded Git tree.",
+      "Selected sampler tests use bun:test and owned imports. Pitako-original isolated lifecycle fixture controls asynchronous collection settlement, independent owners, cancellation and awaited disposal; its subprocess is externally bounded."
+    ],
+    "evidenceLimits": "The npm artifact publishes dist, not src. This import uses the recorded authoritative Git source; no built artifact equality or signature authentication is claimed."
+  },
   "rpiv-todo": {
     "decision": "dependency",
     "package": "@juicesharp/rpiv-todo",
-    "version": "2.11.0",
+    "version": "2.15.0",
     "repository": "https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-todo",
     "license": "MIT",
-    "loaded": ["index.ts"],
-    "notLoaded": ["@juicesharp/rpiv-i18n"],
+    "loaded": [
+      "index.ts"
+    ],
+    "notLoaded": [
+      "@juicesharp/rpiv-i18n"
+    ],
     "reason": "Official Pi package. Session-local TODO overlay, tool, and /todos. Pitako does not vendor the reducer, overlay, or schemas. i18n remains an optional peer."
   },
   "pi-hermes-memory": {
     "decision": "dependency",
     "package": "pi-hermes-memory",
-    "version": "0.9.9",
+    "version": "0.9.11",
     "repository": "https://github.com/chandra447/pi-hermes-memory",
     "license": "MIT",
-    "loaded": ["src/index.ts"],
+    "loaded": [
+      "src/index.ts"
+    ],
     "reason": "Bundle the upstream extension unchanged for persistent learning and conversation search. Independent of the Board, with no synchronization or post promotion."
   },
   "pi-codex-tools": {
     "decision": "dependency",
     "package": "pi-codex-tools",
-    "version": "0.3.0",
+    "version": "0.4.0",
     "repository": "https://github.com/jvm/pi-mono/tree/main/packages/pi-codex-tools",
     "license": "Apache-2.0",
     "attribution": "OpenAI Codex, Copyright 2025 OpenAI; see package NOTICE",
-    "loaded": ["public parser and grammar exports from the package entry"],
-    "notLoaded": ["index.ts extension", "extensions/index.ts", "src/install-telemetry.ts"],
-    "reason": "Use only the public parser/grammar library entry; do not load the extension that replaces edit/write or reports install telemetry."
+    "loaded": [
+      "index.ts extension",
+      "public parser and grammar exports"
+    ],
+    "notLoaded": [],
+    "reason": "Official model-compatible apply_patch provider; late Pitako profile policy preserves edit/write fallback and existing role ceilings."
   },
   "ponytail": {
     "decision": "dependency",
     "package": "@dietrichgebert/ponytail",
-    "version": "4.10.0",
+    "version": "5.3.2",
     "repository": "https://github.com/DietrichGebert/ponytail",
-    "revision": "e3ba2aa6f1e6f0bc4d69eb09c9f0d0a93af56156",
+    "revision": "16352ac229eb08a9598dcae48fe9f2b342567d86",
     "license": "MIT",
-    "loaded": ["skills/ponytail"],
-    "notLoaded": ["pi-extension/index.js"],
+    "loaded": [
+      "skills/ponytail",
+      "skills/ponytail-review"
+    ],
+    "notLoaded": [
+      "pi-extension/index.js"
+    ],
     "reason": "Official Pi package. The extension injects the full skill body on every turn. Pitako loads only the skill so Ponytail stays on-demand."
   },
   "caveman": {
@@ -45,8 +139,19 @@
     "repository": "https://github.com/JuliusBrussee/caveman",
     "revision": "ae26f3a4775574bd49dc8bdb61c0287bbc3cd268",
     "license": "MIT for skills/",
-    "paths": ["skills/caveman/SKILL.md", "skills/investigate-first/SKILL.md"],
-    "notVendored": ["engine/", "proxy/", "browse/", "mcp/", "mem/ Go core", "caveman-compress", "cavecrew"],
+    "paths": [
+      "skills/caveman/SKILL.md",
+      "skills/investigate-first/SKILL.md"
+    ],
+    "notVendored": [
+      "engine/",
+      "proxy/",
+      "browse/",
+      "mcp/",
+      "mem/ Go core",
+      "caveman-compress",
+      "cavecrew"
+    ],
     "localModifications": [
       "Pitako default section: lite intensity, keep architectural explanations, do not pair with the full Ponytail body",
       "Override upstream Default: full to Pitako default lite"
@@ -118,7 +223,11 @@
       {
         "name": "verify-behavior",
         "path": "skills/practical/verify-behavior/SKILL.md",
-        "consolidatesRetired": ["tdd", "show-me-your-work", "principle-prove-it-works"],
+        "consolidatesRetired": [
+          "tdd",
+          "show-me-your-work",
+          "principle-prove-it-works"
+        ],
         "reason": "Compact Pitako contract for observable evidence, read-only diff review, and explicitly authorized test simplification; retains pstack MIT attribution."
       }
     ],
@@ -162,5 +271,9 @@
       "docs/licenses/mattpocock-skills-LICENSE": "0e7ac423bf2c6e223b7c5b156f8cf72da49d748e56a1641402c31f22ad07dbb5"
     },
     "localModifications": []
+  },
+  "dependencyReleases": {
+    "record": "docs/dependency-releases.json",
+    "reason": "Exact selected registry version metadata and LSP annotated-tag target checked before private installation; integrity records are not independent signature or source-to-artifact authentication."
   }
 }

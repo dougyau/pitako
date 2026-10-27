@@ -21,15 +21,38 @@ ACP loads before Hermes. Web access and pi-subagents are direct upstream entries
 ACP keeps Pitako defaults `delegate:false`, `autoUpdate:false`, and
 `toolBashDefaultTimeout:0`. Explicit global and project ACP files retain upstream
 precedence. No managed workflow guards wrap ACP, TODO, or Board.
+All nine packaged profiles explicitly load this `billion-context-pi` adapter and
+require its five context tools. Native child required-tool diagnostics report
+missing registration. Registration alone does not establish operational
+compression after a refusal; disabled, unloadable or refused ACP is an unmet
+prerequisite. Preserve upstream refusal and native-compaction stand-down rather
+than overriding settings.
+
+The owned `extensions/dev-tools/index.ts` factory supplies Git, SSH, Python,
+Cargo and resource tools and hooks. Its sampler is the library under
+`extensions/resource-sampler/`, not a second extension or external dependency. Prefer covered
+deterministic operations, composed through native codemode; keep bash/Python
+fallback for uncovered cases. Git queries are not sandboxed: metadata or spilled
+output may be written. `git_status` is working changes, not tracked inventory;
+structured `git_diff` is statistics, not a patch/path array.
+`file_sha256` is read-only; writer-only `file_sha256_save` hashes and atomically
+publishes reusable items JSON in one call. Both share a validation/hash core,
+independent of spec-plan inspection. Check structured `ok` and `publication`;
+codemode can return structured failures without throwing.
 
 ## Profiles and authority
 
 `extensions/profile.ts` owns ordinary session profile selection, not worker
 identity. It selects upstream patch tools by model capability and leaves raw
-navigation available. Analysis removes known editing tools but retains shell.
+navigation available. Analysis removes known editing tools and introduced
+mutators (including locally writing `ssh_pull`, Python/Cargo execution effects
+and hash saving) and blocks them at the tool-call boundary, including codemode.
+It retains shell, so this is not a sandbox. Child strict allowlists retain
+hash queries for read-only roles, saving/full tools for workers, director-only
+delegation and the narrow interview relay.
 
 `extensions/index.ts` registers only `/pitako`, profile guidance, automatic
-ordinary session naming, and edit/write protected-path guards. Startup does not
+ordinary session naming, profile mutation and edit/write protected-path guards. Startup does not
 load role policies, complete legacy configuration, create leases, start a
 bridge, reconcile executions, or prune histories.
 
@@ -71,9 +94,11 @@ Reused results alone never prove current checks. The read-only host API requires
 a finite per-operation timeout; its native maximum is not a Pitako cycle budget.
 The old bridge has no historical replacement.
 
-The packaged execution-director alone uses native `timeoutMs: 7200000` (two
-hours). A confirmed timeout consumes one of three cycles in that explicit
-invocation; native awaited completion and fresh read-only Git/known-ref
+The packaged execution-director uses native `timeoutMs: 7200000` (two hours).
+The worker defaults to `timeoutMs: 14400000` (four hours), also requested by the
+director for each new attempt; neither retimes a running child nor extends an
+earlier parent deadline. A confirmed native director timeout consumes one of three
+cycles in that explicit invocation; native awaited completion and fresh read-only Git/known-ref
 observations precede the next slot. Positive native active/pending, detached,
 recovery, Stop and permission signals block replacement. Failed tests/model
 verdicts are diagnosis, not activity proof or writer permission. Shared
@@ -90,6 +115,11 @@ clear a newer hold. Status projection/inventory is incomplete: positive exact-re
 native management warnings are advisory blockers; absent fields, status.ok and
 normal prose never certify CLOSED. No global process lock is claimed. Completion
 still needs current-checkout verification and whole-spec review.
+Ordinary awaited cycles skip model settlement; retained awaited results reconcile
+historical markers through exact native observations. Fresh read-only recovery
+remains for timeouts lacking observations and missing historical receipts. The
+final validator assesses current spec/check/review evidence, not a universal
+historical closure certificate.
 
 ## Verification boundary
 

@@ -2,8 +2,9 @@
 name: interview-relay
 package: pitako
 description: Read-only relay of the planning human frontier through native supervisor coordination.
-tools: contact_supervisor
+tools: contact_supervisor, compress, decompress, search_context, acp_status, acp_cache
 extensions:
+  - ../extensions/acp.ts
 acceptanceRole: read-only
 defaultContext: fresh
 systemPromptMode: replace
@@ -29,4 +30,8 @@ faithfully in the assigned structured_output report, identifying unanswered
 questions and the reply's native reference when available. A reply, receipt or
 structured output is decision context, NOT permission to implement, materialize
 specs, or bypass final actual-human confirmation. No edits, shell, tests,
-installation, delegation, loader calls or other tools.
+installation, delegation, loader calls or tools outside this relay and required ACP context management.
+
+ACP from billion-context-pi is mandatory. Missing, disabled, unloadable or refused
+ACP is an unmet prerequisite; report it, never claim healthy operation or override
+user settings. Preserve upstream refusal guidance and native-compaction stand-down.

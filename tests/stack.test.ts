@@ -17,6 +17,27 @@ afterEach(() => {
 });
 
 describe("stack configuration", () => {
+  test("selected release identities match every declared and installed direct dependency", () => {
+    const root = packageRoot();
+    const manifest = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
+    const identities = JSON.parse(readFileSync(path.join(root, "docs/dependency-releases.json"), "utf8"));
+    const dependencies = { ...manifest.dependencies, ...manifest.devDependencies };
+    expect(Object.keys(identities).sort()).toEqual(Object.keys(dependencies).sort());
+    for (const [name, spec] of Object.entries(dependencies)) {
+      const identity = identities[name];
+      expect(spec).toBe(name === "pi-lsp-client"
+        ? `github:code-yeongyu/pi-lsp-client#${identity.revision}` : identity.version);
+      expect(JSON.parse(readFileSync(path.join(root, "node_modules", name, "package.json"), "utf8")).version)
+        .toBe(identity.version);
+    }
+    expect(manifest.engines).toEqual({ node: ">=22.19.0", bun: ">1.4.2" });
+    expect(manifest.scripts.typecheck).toBe("tsc --noEmit");
+    for (const name of ["pi-ai", "pi-agent-core", "pi-coding-agent", "pi-tui"]) {
+      expect(manifest.devDependencies[`@earendil-works/${name}`]).toBe("1.4.0");
+      expect(manifest.peerDependencies[`@earendil-works/${name}`]).toBe(">=1.4.0");
+    }
+  });
+
   test("package manifest entries match config/stack.json and stay relative", () => {
     const root = packageRoot();
     const stack = readStack(root);
@@ -39,8 +60,8 @@ describe("stack configuration", () => {
     const lsp = stack.required.find(({ id }) => id === "pi-lsp-client");
     if (!lsp) throw new Error("pi-lsp-client is missing from the required stack");
     expect(manifest.dependencies["pi-lsp-client"]).toBe(lsp.spec);
-    expect(manifest.dependencies["@vndv/pi-codegraph"]).toBe("0.1.10");
-    expect(manifest.dependencies["@colbymchenry/codegraph"]).toBe("1.6.0");
+    expect(manifest.dependencies["@vndv/pi-codegraph"]).toBe("0.1.11");
+    expect(manifest.dependencies["@colbymchenry/codegraph"]).toBe("1.6.2");
     expect(stack.required.find(({ id }) => id === "@vndv/pi-codegraph")).toMatchObject({
       entry: "node_modules/@vndv/pi-codegraph/extensions/codegraph.ts",
       bin: "codegraph",
@@ -49,13 +70,34 @@ describe("stack configuration", () => {
     expect(manifest.pi.extensions.some((entry) => entry.includes("extensions/code-intelligence/"))).toBe(false);
     expect(manifest.dependencies["@ast-grep/napi"]).toBeUndefined();
     expect(manifest.bundledDependencies).not.toContain("@ast-grep/napi");
-    expect(manifest.dependencies["@dietrichgebert/ponytail"]).toBe("4.10.0");
-    expect(manifest.dependencies["@juicesharp/rpiv-todo"]).toBe("2.11.0");
+    expect(manifest.dependencies["@dietrichgebert/ponytail"]).toBe("5.3.2");
+    expect(manifest.dependencies["@juicesharp/rpiv-todo"]).toBe("2.15.0");
+    for (const name of ["@nredd/pi-dev-tools", "@nredd/pi-resource-sampler"]) {
+      expect(manifest.dependencies[name]).toBeUndefined();
+      expect(manifest.bundledDependencies).not.toContain(name);
+      expect(manifest.pi.extensions.some(entry => entry.includes(name))).toBe(false);
+    }
+    expect(stack.required.find(({ id }) => id === "pitako-dev-tools")).toEqual({
+      id: "pitako-dev-tools", spec: "pitako",
+      entry: "extensions/dev-tools/index.ts",
+      tools: [
+        "git_worktree_list", "git_worktree_add", "git_worktree_remove", "git_worktree_prune",
+        "git_status", "git_diff", "git_log", "git_show", "git_commit",
+        "ssh_exec", "ssh_pull", "ssh_push",
+        "py_lint", "py_format", "py_typecheck", "py_test", "py_uv",
+        "cargo_check", "cargo_clippy", "cargo_fmt", "cargo_test", "cargo_build",
+        "cargo_run", "cargo_doc", "cargo_bench", "cargo_add", "resource_snapshot",
+      ],
+    });
     expect(stack.required.find(({ id }) => id === "@juicesharp/rpiv-todo")).toEqual({
-      id: "@juicesharp/rpiv-todo", spec: "@juicesharp/rpiv-todo@2.11.0",
+      id: "@juicesharp/rpiv-todo", spec: "@juicesharp/rpiv-todo@2.15.0",
       entry: "extensions/todo.ts", tools: ["todo"],
     });
-    expect(manifest.dependencies["pi-hermes-memory"]).toBe("0.9.9");
+    expect(stack.required.find(({ id }) => id === "pitako-file-sha256")).toEqual({
+      id: "pitako-file-sha256", spec: "pitako", entry: "extensions/file-sha256.ts",
+      tools: ["file_sha256", "file_sha256_save"],
+    });
+    expect(manifest.dependencies["pi-hermes-memory"]).toBe("0.9.11");
     expect(manifest.bundledDependencies).toContain("pi-hermes-memory");
     expect(manifest.dependencies["billion-context-pi"]).toBe("0.1.83");
     expect(manifest.bundledDependencies).toContain("billion-context-pi");
@@ -66,23 +108,23 @@ describe("stack configuration", () => {
     expect(stack.required.findIndex(({ id }) => id === "billion-context-pi")).toBeLessThan(stack.required.findIndex(({ id }) => id === "pi-hermes-memory"));
     expect(stack.required.find(({ id }) => id === "pi-hermes-memory")).toEqual({
       id: "pi-hermes-memory",
-      spec: "pi-hermes-memory@0.9.9",
+      spec: "pi-hermes-memory@0.9.11",
       entry: "node_modules/pi-hermes-memory/src/index.ts",
       tools: ["memory_add", "memory_replace", "memory_remove", "memory_search", "session_search", "skill_manage"],
     });
-    expect(manifest.dependencies["pi-web-access"]).toBe("0.42.0");
+    expect(manifest.dependencies["pi-web-access"]).toBe("0.45.0");
     expect(manifest.bundledDependencies).toContain("pi-web-access");
     expect(stack.required.find(({ id }) => id === "pi-web-access")).toEqual({
       id: "pi-web-access",
-      spec: "pi-web-access@0.42.0",
+      spec: "pi-web-access@0.45.0",
       entry: "node_modules/pi-web-access/dist/index.js",
       tools: ["web_search", "fetch_content", "source_check", "get_search_content", "web_enable"],
     });
     expect(stack.required.find(({ id }) => id === "pi-codex-tools")).toEqual({
-      id: "pi-codex-tools", spec: "pi-codex-tools@0.3.0",
+      id: "pi-codex-tools", spec: "pi-codex-tools@0.4.0",
       entry: "node_modules/pi-codex-tools/index.ts", tools: ["apply_patch"],
     });
-    expect(manifest.dependencies["pi-codex-tools"]).toBe("0.3.0");
+    expect(manifest.dependencies["pi-codex-tools"]).toBe("0.4.0");
     expect(manifest.bundledDependencies).toContain("pi-codex-tools");
     expect(manifest.pi.skills).toContain("./node_modules/@dietrichgebert/ponytail/skills/ponytail");
     expect(manifest.pi.skills).not.toContain("./skills");

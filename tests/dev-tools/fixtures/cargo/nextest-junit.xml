@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="2" skipped="0" failures="1" errors="0" uuid="3ba23a0a-2699-4187-aca7-e7c1f6c50e9e" timestamp="2026-10-09T17:42:11.360-07:00" time="0.014">
+    <testsuite name="good" tests="2" skipped="0" errors="0" failures="1">
+        <testcase name="tests::passes" classname="good" timestamp="2026-10-09T17:42:11.362-07:00" time="0.010"/>
+        <testcase name="tests::fails" classname="good" timestamp="2026-10-09T17:42:11.362-07:00" time="0.010">
+            <failure message="thread &apos;tests::fails&apos; (13108253) panicked at good/src/lib.rs:27:9" type="test failure with exit code 101">thread &apos;tests::fails&apos; (13108253) panicked at good/src/lib.rs:27:9:
+assertion `left == right` failed: math is hard
+  left: 3
+ right: 4
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace</failure>
+            <system-out>
+running 1 test
+test tests::fails ... FAILED
+
+failures:
+
+failures:
+    tests::fails
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+</system-out>
+            <system-err>
+thread &apos;tests::fails&apos; (13108253) panicked at good/src/lib.rs:27:9:
+assertion `left == right` failed: math is hard
+  left: 3
+ right: 4
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+</system-err>
+        </testcase>
+    </testsuite>
+</testsuites>

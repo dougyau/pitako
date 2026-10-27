@@ -1,0 +1,82 @@
+   Compiling crossbeam-utils v0.8.23
+   Compiling serde_core v1.0.229
+   Compiling either v1.19.0
+   Compiling cfg-if v1.0.5
+   Compiling zmij v1.0.23
+   Compiling regex-syntax v0.8.11
+   Compiling zerocopy v0.8.62
+   Compiling plotters-backend v0.3.7
+   Compiling clap_lex v1.1.1
+   Compiling anstyle v1.0.14
+   Compiling ciborium-io v0.2.2
+   Compiling memchr v2.8.3
+   Compiling itoa v1.0.18
+   Compiling itertools v0.13.0
+   Compiling plotters-svg v0.3.7
+   Compiling clap_builder v4.6.7
+   Compiling libc v0.2.190
+   Compiling num-traits v0.2.19
+   Compiling same-file v1.0.6
+   Compiling crossbeam-epoch v0.9.21
+   Compiling cast v0.3.0
+   Compiling walkdir v2.5.0
+   Compiling crossbeam-deque v0.8.8
+   Compiling alloca v0.4.0
+   Compiling rayon-core v1.13.0
+   Compiling oorandom v11.1.5
+   Compiling anes v0.1.6
+   Compiling good v0.1.0 (/private/tmp/ws/good)
+warning: unused variable: `unused`
+  --> good/src/lib.rs:15:9
+   |
+15 |     let unused = 5;
+   |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_unused`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `good` (lib) generated 1 warning (run `cargo fix --lib -p good` to apply 1 suggestion)
+   Compiling plotters v0.3.7
+   Compiling regex-automata v0.4.18
+   Compiling rayon v1.12.0
+   Compiling page_size v0.6.0
+   Compiling criterion-plot v0.8.2
+   Compiling clap v4.6.7
+   Compiling serde v1.0.229
+   Compiling serde_json v1.0.151
+   Compiling regex v1.13.1
+   Compiling tinytemplate v1.2.1
+   Compiling half v2.7.1
+   Compiling ciborium-ll v0.2.2
+   Compiling ciborium v0.2.2
+   Compiling criterion v0.8.2
+warning: `good` (lib test) generated 1 warning (1 duplicate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.55s
+────────────
+ Nextest run ID 3ba23a0a-2699-4187-aca7-e7c1f6c50e9e with nextest profile: ci
+    Starting 2 tests across 1 binary
+        PASS [   0.010s] (1/2) good tests::passes
+        FAIL [   0.010s] (2/2) good tests::fails
+  stdout ───
+
+    running 1 test
+    test tests::fails ... FAILED
+
+    failures:
+
+    failures:
+        tests::fails
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+  stderr ───
+
+    thread 'tests::fails' (13108253) panicked at good/src/lib.rs:27:9:
+    assertion `left == right` failed: math is hard
+      left: 3
+     right: 4
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+────────────
+     Summary [   0.014s] 2 tests run: 1 passed, 1 failed, 0 skipped
+        FAIL [   0.010s] (2/2) good tests::fails
+error: test run failed

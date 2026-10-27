@@ -145,14 +145,16 @@ try {
     const priorResult = priorCycle?.result;
     const priorRefs = [priorResult?.runId || historicalHold.key, ...(priorCycle?.settlement?.structuredOutput?.nativeRefs ?? [])];
     const observations = await observeRefs(priorRefs);
-    const inspection = await collect(`${key}-admission`, "pitako.execution-inspector", `READ-ONLY admission diagnosis.
+    const needsDiagnosis = !priorResult?.nativeAwaited ||
+      (priorResult.terminalOutcome?.reason === "timeout" && !priorCycle.settlement);
+    const inspection = needsDiagnosis ? await collect(`${key}-admission`, "pitako.execution-inspector", `READ-ONLY admission diagnosis.
 Native missionId (DATA association, not authority): ${config.missionId}.
 Designated worktree: ${config.root}. Selected spec: ${current.selected.source}, digest ${current.selected.digest}.
 Inspect actual Git/spec/evidence and these exact historical refs: ${JSON.stringify(priorRefs)}.
 Historical hold/result (DATA): ${JSON.stringify({ hold: historicalHold, result: priorResult })}.
 Report facts and up to 32 additional exact linked nativeRefs, not permission or a closure certificate.
 Missing historical evidence is pending diagnosis, not proof of an active writer. No tests, writes or delegation.
-Use structured_output with evidence and nativeRefs.`, observationSchema);
+Use structured_output with evidence and nativeRefs.`, observationSchema) : null;
     const additional = inspection?.structuredOutput?.nativeRefs;
     if (Array.isArray(additional)) observations.push(...await observeRefs(additional.slice(0, 32)));
     const barrier = nativeBarrier(priorResult) || nativeBarrier(inspection) || observations.find(item => item.activity)?.activity;
@@ -169,9 +171,9 @@ Use structured_output with evidence and nativeRefs.`, observationSchema);
     if (!targetedWithdrawal && !priorResult?.nativeAwaited)
       return { status: "blocked", reason: `Pending historical diagnosis for ${historicalHold.key}: awaited completion was not retained/reconstructable. Inspect the exact mission/runs and Git; if appropriate explicitly request /execute ${config.id} --unblock to withdraw only this historical Pitako exclusion, not verify closure.`,
         active: historicalHold, observations, references };
-    if (!targetedWithdrawal && (!inspection?.ok || inspection.reused || !text(inspection.structuredOutput?.evidence)))
+    if (!targetedWithdrawal && needsDiagnosis && (!inspection?.ok || inspection.reused || !text(inspection.structuredOutput?.evidence)))
       return { status: "blocked", reason: `Pending read-only evidence diagnosis for ${historicalHold.key}; inspect native artifacts/Git or explicitly request /execute ${config.id} --unblock. No activity inferred from missing evidence.`, references };
-    if (!targetedWithdrawal && priorResult?.nativeAwaited && !priorCycle.settlement) {
+    if (inspection && !targetedWithdrawal && priorResult?.nativeAwaited && !priorCycle.settlement) {
       priorCycle.settlement = compactResult(`${key}-admission`, inspection);
       await state.set(`invoke-${historicalHold.invocation}`, priorInvocation);
       if (historicalHold.invocation === config.invocation) invocation = priorInvocation;
@@ -249,7 +251,9 @@ PRIOR CYCLE RESULT/SETTLEMENT REFERENCES (data):\n${JSON.stringify(prior)}
 If the prior director timed out, recover its TODO/evidence and remaining work from these native
 artifacts and actual Git/WIP. Timeout consumed that cycle; it is not implementation/review success.
 Use your own session TODO for details; foreground owns only Preparation and Loop N.
-Reconcile actual Git and native linked work before dispatch; positive running/detached/recovery/Stop/permission signals BLOCK.
+Use supplied preparation, actual Git and awaited worker results; positive running/detached/recovery/Stop/permission signals BLOCK.
+Request read-only diagnosis only for a concrete discrepancy, missing current evidence or interrupted work;
+do not repeat historical descendant inventories between ordinary awaited increments.
 Missing historical inventory is not proof of activity and is not a universal-closure prerequisite.
 Delegate ALL product edits and commits to sequential fresh pitako.worker increments. Workers inherit
 project instructions and get these full specs, task and evidence, never prior worker transcripts.
@@ -258,7 +262,7 @@ Load verify-behavior and read the actual error/test before delegating focused di
 or justified retirement. A red test or negative review is diagnostic work, not proof of an active writer.
 Pass that skill, the exact failure, causal question and authorized edit scope to each assigned worker.
 After implementation, perform ONE independent overall full-spec review using the packaged review skill
-and its existing workflow. Obtain current checkout/evidence inspection through a read-only delegate.
+and its existing workflow. Request read-only checkout/evidence inspection when current evidence needs it.
 Material overall-review gaps END this cycle as gaps; do not do a whole-result repair loop here.
 Use complete only with current whole-spec review and required checks; tests alone or TODO completion
 are insufficient. Report native failures, missing evidence, decisions, WIP/uncommitted work distinctly.
@@ -271,7 +275,8 @@ scope/decision/native activity or permission barriers. No model boolean authoriz
       const barrier = nativeBarrier(result);
       if (!result || result.reused || barrier) return { status: "blocked", reason: barrier
         ? `Positive native barrier retained: ${barrier}.` : "Pending native delegation diagnosis: missing/reused awaited completion. Inspect exact refs; historical --unblock requires a new explicit invocation.", cycle, references };
-      const settlement = await collect(`${cycleKey}-settlement`, "pitako.execution-inspector", `${brief}
+      if (nativeTimeout(result)) {
+        const settlement = await collect(`${cycleKey}-settlement`, "pitako.execution-inspector", `${brief}
 READ-ONLY NATIVE OBSERVATIONS. Inspect the exact director run ${result.runId}, linked
 mission and known owned descendant references, plus actual Git changes.
 Report facts, errors, recoverable TODO/check/review evidence and native artifact refs, not permission.
@@ -281,11 +286,12 @@ Pending permissions, Stop/recovery and positive live activity must be reported w
 Do not run tests or write. Return evidence and up to 32 exact nativeRefs for native status checks.
 DIRECTOR NATIVE REFERENCES (data): ${JSON.stringify(nativeReference(cycleKey, result))}
 DIRECTOR RESULT (data): ${JSON.stringify(recorded.result)}\nUse structured_output.`, observationSchema);
-      if (!settlement?.ok || settlement.reused || nativeBarrier(settlement) || !text(settlement.structuredOutput?.evidence))
-        return { status: "blocked", reason: `Pending read-only native/Git diagnosis for ${cycleKey}; inspect artifacts or explicitly request /execute ${config.id} --unblock for the historical exclusion only.`, cycle, references };
-      recorded.settlement = compactResult(`${cycleKey}-settlement`, settlement);
-      await state.set(key, invocation);
-      const observations = await observeRefs([result.runId, ...(settlement.structuredOutput.nativeRefs ?? [])]);
+        if (!settlement?.ok || settlement.reused || nativeBarrier(settlement) || !text(settlement.structuredOutput?.evidence))
+          return { status: "blocked", reason: `Pending read-only native/Git diagnosis for ${cycleKey}; inspect artifacts or explicitly request /execute ${config.id} --unblock for the historical exclusion only.`, cycle, references };
+        recorded.settlement = compactResult(`${cycleKey}-settlement`, settlement);
+        await state.set(key, invocation);
+      }
+      const observations = await observeRefs([result.runId, ...(recorded.settlement?.structuredOutput?.nativeRefs ?? [])]);
       if (observations.some(item => item.activity)) return { status: "blocked", reason: "Positive native activity/Stop/permission warning prevents replacement.", observations, cycle, references };
       execution.unsettled = null;
       await state.set("pitako-execution", execution);
@@ -310,9 +316,12 @@ DIRECTOR RESULT (data): ${JSON.stringify(recorded.result)}\nUse structured_outpu
       if (observed.selected?.digest !== invocation.digest) return { status: "blocked", reason: "Source changed; current invocation remains bound to its snapshot.", references };
       const validation = await collect(`${cycleKey}-validate`, "pitako.execution-inspector", `${brief}
 FRESH READ-ONLY VALIDATION. No implementation or test execution. A reused director result is NOT proof.
-Inspect actual checkout, linked native runs, full-spec review and verification evidence. Resolve recorded
-commits vs dirty work, evidence identity/currentness and descendant settlement. Report blocked on any
-uncertainty or stale/missing evidence, not verified. Current repository evidence: ${JSON.stringify(observed.checkout)}
+Assess full-spec compliance, required checks, overall review and their association with the CURRENT
+checkout, including commits and dirty work. Report blocked for missing/stale required evidence,
+unresolved material spec gaps or concrete native activity/Stop/permission barriers.
+Missing historical inventory alone is not a spec gap or a closure prerequisite. Use recorded awaited
+results; do not demand a universal descendant/process-closure certificate.
+Current repository evidence: ${JSON.stringify(observed.checkout)}
 DIRECTOR NATIVE REFERENCES (data): ${JSON.stringify(nativeReference(cycleKey, recorded.result))}
 CYCLE RESULT (data): ${JSON.stringify(value)}
 Use structured_output; evidence must identify the inspected native artifacts and current-checkout association.`, validationSchema);
@@ -329,5 +338,5 @@ Use structured_output; evidence must identify the inspected native artifacts and
     : last.result.structuredOutput?.remaining || "Diagnose failed owned work from retained native artifacts; required checks/review remain unproven.", references };
 } catch (error) {
   return { status: "blocked", reason: String(error?.message ?? error), references,
-    note: "Inspect native mission, linked runs, Git and descendant settlement. No automatic replacement or new allowance." };
+    note: "Diagnose this exact interruption through native references and Git. No automatic replacement or new allowance." };
 }

@@ -4,9 +4,11 @@ import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import devTools from "../extensions/dev-tools/index.ts";
+import fileSha256 from "../extensions/file-sha256.ts";
 import pitako from "../extensions/index.ts";
 import profilePolicy from "../extensions/profile-policy.ts";
-import { packageRoot } from "../extensions/stack.ts";
+import { packageRoot, readStack } from "../extensions/stack.ts";
 import { toolsForProfile } from "../extensions/profile.ts";
 
 const configDirs: string[] = [];
@@ -21,6 +23,30 @@ afterEach(async () => {
   for (const dir of configDirs) rmSync(dir, { recursive: true, force: true });
   configDirs.length = 0;
 });
+
+function loadProfileExtensions(pi: ExtensionAPI, codex: (pi: ExtensionAPI) => void, writes: string[] = []) {
+  const factories = new Map<string, (pi: ExtensionAPI) => void>([
+    ["./extensions/index.ts", pitako],
+    ["./node_modules/pi-codex-tools/index.ts", codex],
+    ["./extensions/profile-policy.ts", profilePolicy],
+    ["./extensions/dev-tools/index.ts", devTools],
+    ["./extensions/file-sha256.ts", fileSha256],
+  ]);
+  // These providers are outside this profile fixture's controlled boundary.
+  const excluded = new Set([
+    "./node_modules/pi-lsp-client/src/index.ts",
+    "./node_modules/@vndv/pi-codegraph/extensions/codegraph.ts",
+    "./extensions/todo.ts", "./extensions/board/index.ts",
+    "./node_modules/pi-subagents/bundle/index.js", "./extensions/acp.ts",
+    "./node_modules/pi-hermes-memory/src/index.ts", "./node_modules/pi-web-access/dist/index.js",
+  ]);
+  for (const entry of JSON.parse(readFileSync(path.join(packageRoot(), "package.json"), "utf8")).pi.extensions) {
+    if (excluded.has(entry)) continue;
+    const factory = factories.get(entry);
+    if (!factory) throw new Error(`Profile fixture has no factory for ${entry}`);
+    factory({ ...pi, setActiveTools(names) { writes.push(entry); pi.setActiveTools(names); } });
+  }
+}
 
 function profileHarness(profileFlag?: string, external?: () => Promise<void>) {
   const writes: string[] = [];
@@ -44,11 +70,20 @@ function profileHarness(profileFlag?: string, external?: () => Promise<void>) {
   };
   const pi = {
     registerFlag() {},
-    registerTool(tool: { name: string }) { registeredTools.push(tool.name); },
+    registerTool(tool: { name: string }) {
+      registeredTools.push(tool.name);
+      if (!available.includes(tool.name)) available.push(tool.name);
+    },
     getFlag() { return profileFlag; },
     on(event: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) {
       const previous = handlers.get(event);
-      handlers.set(event, async (event, ctx) => { await previous?.(event, ctx); return handler(event, ctx); });
+      handlers.set(event, async (input, ctx) => {
+        const result = await previous?.(input, ctx) as { systemPrompt?: string; block?: boolean } | undefined;
+        if (result?.block) return result;
+        const next = event === "before_agent_start" && result?.systemPrompt !== undefined
+          ? { ...input as object, systemPrompt: result.systemPrompt } : input;
+        return await handler(next, ctx) ?? result;
+      });
     },
     registerCommand(name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) {
       registeredCommands.push(name);
@@ -60,19 +95,13 @@ function profileHarness(profileFlag?: string, external?: () => Promise<void>) {
     getSessionName() { return undefined; },
     setSessionName() {},
   };
-  const factories = new Map<string, (pi: ExtensionAPI) => void>([
-    ["./extensions/index.ts", pitako],
-    ["./node_modules/pi-codex-tools/index.ts", api => {
-      // Controlled external synchronization deliberately enables mutators.
-      api.registerTool({ name: "apply_patch", parameters: {} } as never);
-      const synchronize = async () => { await external?.(); api.setActiveTools([...available]); };
-      api.on("session_start", synchronize);
-      api.on("model_select", synchronize);
-    }],
-    ["./extensions/profile-policy.ts", profilePolicy],
-  ]);
-  for (const entry of JSON.parse(readFileSync(path.join(packageRoot(), "package.json"), "utf8")).pi.extensions)
-    factories.get(entry)?.({ ...pi, setActiveTools(names: string[]) { writes.push(entry); pi.setActiveTools(names); } } as unknown as ExtensionAPI);
+  loadProfileExtensions(pi as unknown as ExtensionAPI, api => {
+    // Controlled external synchronization deliberately enables mutators.
+    api.registerTool({ name: "apply_patch", parameters: {} } as never);
+    const synchronize = async () => { await external?.(); api.setActiveTools([...available]); };
+    api.on("session_start", synchronize);
+    api.on("model_select", synchronize);
+  }, writes);
   shutdowns.push(async () => { await handlers.get("session_shutdown")?.({}, context); });
   return {
     active, available, writes, registeredTools, registeredCommands,
@@ -104,11 +133,53 @@ function profileHarness(profileFlag?: string, external?: () => Promise<void>) {
 }
 
 describe("Pitako resources and policy", () => {
-  test("foreground registers only the ordinary command and no managed tools", async () => {
+  test.each(["reader", "worker", "disabled", "unloadable", "foreground"])(
+    "isolated native child lifecycle and actual call boundary: %s", async mode => {
+      const owned = configDirectory("pitako-profile-acp-");
+      const cwd = path.join(owned, "worktree"), home = path.join(owned, "home");
+      mkdirSync(cwd); mkdirSync(home);
+      const env = {
+        PATH: process.env.PATH!, HOME: home, PI_CODING_AGENT_DIR: path.join(home, ".pi/agent"),
+        GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null",
+        ...(mode === "foreground" ? { PITAKO_PROFILE: "analysis" } : {}),
+      };
+      const init = spawnSync("git", ["init", "--quiet"], { cwd, env, encoding: "utf8" });
+      expect(init.error).toBeUndefined(); expect(init.status).toBe(0);
+      const child = Bun.spawn([process.execPath, path.join(packageRoot(), "tests/fixtures/profile-acp-child.ts"), mode], {
+        cwd, env, stdout: "pipe", stderr: "pipe",
+      });
+      shutdowns.push(async () => {
+        if (child.exitCode === null) child.kill("SIGTERM");
+        await child.exited;
+      });
+      let output = "", stderr = "", exit: number;
+      try {
+        [output, stderr, exit] = await Promise.all([
+          new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
+        ]);
+      } finally { await child.exited; }
+      expect({ exit, stderr, output }).toMatchObject({ exit: 0 });
+      const report = JSON.parse(output.trim().split("\n").at(-1)!);
+      expect(report).toMatchObject({
+        mode, disposed: true, sideEffects: 0,
+        state: ["disabled", "unloadable"].includes(mode) ? "prerequisite-failed" : "completed",
+      });
+      expect(report.missing).toEqual(["disabled", "unloadable"].includes(mode)
+        ? ["compress", "decompress", "search_context", "acp_status", "acp_cache"] : []);
+      if (["disabled", "unloadable"].includes(mode)) expect(report.nativeExitCode).toBe(1);
+      if (mode === "unloadable") expect(report.errors.join("\n")).toContain("compress");
+    },
+  );
+
+  test("foreground loads the full dev-tools public entry alongside ordinary policy", async () => {
     const host = profileHarness("coding");
     try {
       await host.start();
-      expect(host.registeredTools).toEqual(["apply_patch"]);
+      const provider = readStack(packageRoot()).required.find(({ id }) => id === "pitako-dev-tools");
+      expect(provider).toBeDefined();
+      expect(host.registeredTools).toEqual(["apply_patch", ...provider!.tools, "file_sha256", "file_sha256_save"]);
+      for (const name of provider!.tools) expect(host.active).toContain(name);
+      for (const name of ["file_sha256", "file_sha256_save"]) expect(host.active).toContain(name);
       expect(host.registeredCommands).toEqual(["pitako"]);
       await expect(host.command("agents")).rejects.toThrow("Usage: /pitako");
     } finally { await host.shutdown(); }
@@ -125,7 +196,10 @@ describe("Pitako resources and policy", () => {
           "skills initiate their pi-subagents workflows", "Analysis delegates must be read-only"])
           expect(prompt).toContain(text);
         for (const text of ["AgentInstance", "ModelPolicy", "Developer Head"]) expect(prompt).not.toContain(text);
-        expect(await host.composePrompt(prompt)).toBe(prompt);
+        const repeated = await host.composePrompt(prompt);
+        // Pitako's own note is idempotent; the upstream resource hook appends per invocation.
+        expect(repeated.split("Pitako profile:").length).toBe(prompt.split("Pitako profile:").length);
+        expect(repeated).toContain("Use resource_snapshot when available");
       }
     } finally { await host.shutdown(); }
   });
@@ -224,19 +298,13 @@ describe("Pitako resources and policy", () => {
         },
         setSessionName() {},
       };
-      const factories = new Map<string, (pi: ExtensionAPI) => void>([
-          ["./extensions/index.ts", pitako],
-          ["./node_modules/pi-codex-tools/index.ts", api => {
-            // Controlled external synchronization deliberately enables mutators.
-            api.registerTool({ name: "apply_patch", parameters: {} } as never);
-            const synchronize = () => api.setActiveTools([...available]);
-            api.on("session_start", synchronize);
-            api.on("model_select", synchronize);
-          }],
-          ["./extensions/profile-policy.ts", profilePolicy],
-        ]);
-        for (const entry of JSON.parse(readFileSync(path.join(packageRoot(), "package.json"), "utf8")).pi.extensions)
-          factories.get(entry)?.(pi as unknown as ExtensionAPI);
+      loadProfileExtensions(pi as unknown as ExtensionAPI, api => {
+        // Controlled external synchronization deliberately enables mutators.
+        api.registerTool({ name: "apply_patch", parameters: {} } as never);
+        const synchronize = () => api.setActiveTools([...available]);
+        api.on("session_start", synchronize);
+        api.on("model_select", synchronize);
+      });
       const start = handlers.get("session_start");
       if (!start) throw new Error("session_start was not registered");
       const ctx = { cwd: packageRoot(), hasUI: false, ui: { notify() {}, setStatus() {} },

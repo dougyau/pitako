@@ -1,0 +1,18 @@
+warning: unused variable: `unused`
+  --> good/src/lib.rs:15:9
+   |
+15 |     let unused = 5;
+   |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_unused`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `good` (lib) generated 1 warning (run `cargo fix --lib -p good` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+   Doc-tests good
+
+running 1 test
+test good/src/lib.rs - add (line 4) ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+all doctests ran in 0.31s; merged doctests compilation took 0.20s

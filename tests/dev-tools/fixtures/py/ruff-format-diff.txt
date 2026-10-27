@@ -1,0 +1,30 @@
+--- src/pt/bad.py
++++ src/pt/bad.py
+@@ -1,3 +1,5 @@
+-import os,sys
+-def f( x:int )->str:
++import os, sys
++
++
++def f(x: int) -> str:
+     return x
+
+--- tests/test_a.py
++++ tests/test_a.py
+@@ -1,11 +1,14 @@
+ from pt.good import add
+
++
+ def test_ok():
+     assert add(1, 2) == 3
+
++
+ def test_fail():
+     print("hello stdout")
+     assert add(1, 2) == 4, "math is hard"
+
++
+ def test_err():
+     raise ValueError("boom")
+
+2 files would be reformatted, 3 files already formatted

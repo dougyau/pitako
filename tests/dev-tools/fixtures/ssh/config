@@ -1,0 +1,17 @@
+# Mirrors the shapes in a real ~/.ssh/config
+Host github.com
+  User git
+Host pi home homeassistant ha
+  HostName 100.1.2.3
+  ForwardAgent yes
+Host nas
+  HostName nas.example.invalid
+Host *.internal
+  User ops
+Host !bad *
+  ServerAliveInterval 5
+Include included.d/*.conf included.d/sub/a.conf
+Include missing-file
+Host trailing # a comment here
+Host=eqform
+Host "quoted"

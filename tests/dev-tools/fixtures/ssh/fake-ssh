@@ -1,0 +1,16 @@
+#!/bin/sh
+# Stand-in for ssh: accepts the real argv shape, then behaves like the remote `exec sh -s`.
+# Host "down" simulates a connection failure (exit 255, nothing run).
+host=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --) shift; host="$1"; shift; break ;;
+    -o) shift 2 ;;
+    -*) shift ;;
+    *) host="$1"; shift; break ;;
+  esac
+done
+echo "fake-ssh host=$host argv=$*" >&2
+[ "$host" = "down" ] && { echo "ssh: connect to host down port 22: Operation timed out" >&2; exit 255; }
+[ "$1" = "exec sh -s" ] || { echo "unexpected remote command: $1" >&2; exit 254; }
+exec sh -s
