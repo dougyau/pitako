@@ -1,19 +1,27 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import { runWorkflowScript, type WorkflowScriptChildResult } from "../node_modules/pi-subagents/src/workflows/scripted-workflow.js";
 
 const source = readFileSync(new URL("../skills/review/workflow.js", import.meta.url), "utf8");
 interface Request {
   agent?: string; resume?: string; context?: string; skill?: string[];
   model?: string; async?: boolean; task: string; output: boolean; outputSchema: unknown;
 }
-interface Result { ok: boolean; runId?: string; error?: string; structuredOutput?: unknown }
+interface Result {
+  ok: boolean; runId?: string; error?: string; structuredOutput?: unknown;
+  agent?: string; outputReference?: string; outputArtifactPath?: string;
+  outputPathMapping?: { requestedPath: string; savedPath: string };
+  artifactPaths?: string[]; results?: WorkflowScriptChildResult["results"];
+  stopped?: boolean;
+}
 interface Outcome {
   status: string; phase: string; memo?: string; error?: string;
   dispositions?: {
     findingId: string; decision: string; reason: string;
     classification: string; requirement: string | null;
   }[];
-  references: { key: string; runId: string }[];
+  references: { key: string; runId: string; stopped?: boolean; results?: { structuredOutputPath: string }[] }[];
+  screening?: { verdict: string; reason: string; assessments: unknown[] };
 }
 const args = {
   brief: "Preserve the caller contract. No implementation.",
@@ -81,10 +89,216 @@ function fixture(
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor as new (
     ...parameters: string[]
   ) => (input: unknown, runner: typeof runs) => Promise<Outcome>;
-  return { calls, execute: (input: unknown = args) => new AsyncFunction("args", "runs", source)(input, runs) };
+  return {
+    calls,
+    execute: (input: unknown = args) => new AsyncFunction("args", "runs", source)(input, runs),
+    library: <T = Outcome>(input: unknown = args, options: object = {}, tail?: string) =>
+      new AsyncFunction("args", "runs", `const pitakoReviewLibraryMode = true;\n${source}\n${
+        tail ?? `return reviewPhase(args, runs, ${JSON.stringify(options)});`
+      }`)(input, runs) as Promise<T>,
+  };
 }
 
 describe("review scripted workflow", () => {
+  test("the unchanged library source is inert until called and validates standalone input inside the function", async () => {
+    const host = fixture();
+    expect(await host.library<{ status: string; references: never[] }>({ rootExecuteArgument: true }, {}, 'return { status: "root", references: [] };'))
+      .toEqual({ status: "root", references: [] });
+    expect(host.calls).toHaveLength(0);
+    await expect(host.library({ rootExecuteArgument: true })).rejects.toThrow("Provide a review brief");
+    expect(host.calls).toHaveLength(0);
+    expect(await host.library()).toEqual(await fixture().execute());
+  });
+
+  test("sequential library calls own their state and prefix every child key", async () => {
+    const host = fixture(key => child(key.slice(key.indexOf(".") + 1)));
+    const result = await host.library(args, {}, `
+      return reviewPhase(args, runs, { prefix: "loop1." }).then(first =>
+        reviewPhase(args, runs, { prefix: "loop2." }).then(second => ({ first, second })));
+    `) as unknown as { first: Outcome; second: Outcome };
+    for (const [prefix, outcome] of [["loop1.", result.first], ["loop2.", result.second]] as const) {
+      expect(outcome.status).toBe("completed");
+      expect(outcome.references).toHaveLength(6);
+      expect(outcome.references.every(entry => entry.key.startsWith(prefix))).toBe(true);
+    }
+    expect(host.calls).toHaveLength(12);
+  });
+
+  test.each(["bad/prefix", "x".repeat(85), ""] as const)(
+    "rejects a non-native or missing execute prefix before dispatch: %s", async prefix => {
+      const host = fixture();
+      await expect(host.library(args, { prefix, mode: "execute" })).rejects.toThrow("caller prefix");
+      expect(host.calls).toHaveLength(0);
+    },
+  );
+
+  test.each(["clear", "material-gaps", "blocked"])(
+    "execute screening is reasoned independently of protocol completion: %s", async verdict => {
+      const assessment = { findingId: "a-1", requirement: finding.requirement,
+        material: verdict === "material-gaps", consequence: "Caller may select a wrong record",
+        reason: verdict === "material-gaps" ? "Reachable violation remains" : "Existing guard bounds the risk" };
+      const screening = { verdict, reason: "Requirement and current caller evidence assessed", assessments: [assessment] };
+      const host = fixture(key => child(key.slice("loop1.".length), key.endsWith("director-synthesis")
+        ? { dispositions: [{ ...disposition, decision: "include" }], screening } : {}));
+      const result = await host.library(args, { prefix: "loop1.", mode: "execute" });
+      expect(result.status).toBe("completed");
+      expect(result.screening).toEqual(screening);
+      expect(result.dispositions?.[0]?.decision).toBe("include");
+      expect(host.calls.at(-1)?.request.task).toContain("Clear permits a separate whole-spec compliance analysis");
+      expect(host.calls.at(-1)?.request.outputSchema).toMatchObject({
+        required: expect.arrayContaining(["screening"]),
+      });
+    },
+  );
+
+  test.each([
+    undefined,
+    { verdict: "clear", reason: "No gaps", assessments: [] },
+    { verdict: "clear", reason: "No gaps", assessments: [
+      { findingId: "a-1", material: true, reason: "Violation", requirement: finding.requirement, consequence: "Wrong record" },
+    ] },
+    { verdict: "material-gaps", reason: "Gaps", assessments: [
+      { findingId: "a-1", material: false, reason: "Bounded", requirement: finding.requirement, consequence: "Wrong record" },
+    ] },
+    { verdict: "clear", reason: "No gaps", assessments: [
+      { findingId: "a-1", material: false, reason: "Bounded", requirement: "invented", consequence: "Wrong record" },
+    ] },
+    { verdict: "clear", reason: "No gaps", assessments: [
+      { findingId: "a-1", material: false, reason: "Bounded", requirement: finding.requirement, consequence: "" },
+    ] },
+  ])("rejects absent, incomplete, or contradictory execute screening: %j", async screening => {
+    const host = fixture(key => child(key.slice("loop1.".length),
+      key.endsWith("director-synthesis") ? { screening } : {}));
+    const result = await host.library(args, { prefix: "loop1.", mode: "execute" });
+    expect(result.status).toBe("failed");
+    expect(result.screening).toBeUndefined();
+  });
+
+  test.each([
+    { ...disposition, decision: "discard" },
+    { ...disposition, decision: "include", classification: "related-improvement" },
+    { ...disposition, decision: "include", classification: "out-of-scope" },
+    { ...disposition, decision: "uncertain", classification: "uncertain", requirement: null },
+  ])("does not manufacture a material scoped gap from disposition %j", async finalDisposition => {
+    const host = fixture(key => child(key.slice("loop1.".length),
+      key.endsWith("director-synthesis") ? {
+        dispositions: [finalDisposition],
+        screening: { verdict: "material-gaps", reason: "Claimed gap", assessments: [{
+          findingId: "a-1", material: true, reason: "Claimed violation",
+          requirement: finalDisposition.requirement, consequence: "Wrong record",
+        }] },
+      } : {}));
+    const result = await host.library(args, { prefix: "loop1.", mode: "execute" });
+    expect(result.status).toBe("failed");
+    expect(result.screening).toBeUndefined();
+  });
+
+  test("retains exact native references without copying child reports or deriving paths", async () => {
+    const pointers = {
+      agent: "pitako.reviewer", outputReference: "/native/exact-output",
+      outputArtifactPath: "/native/published/report.json",
+      outputPathMapping: { requestedPath: "/requested/report.json", savedPath: "/native/published/report.json" },
+      artifactPaths: ["/native/debug/a", "/native/debug/b"],
+      results: [{ index: 0, agent: "pitako.reviewer", task: "Review target", exitCode: 0,
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
+        structuredOutputPath: "/native/optional/structured.json" }],
+    };
+    const host = fixture(key => ({ ...child(key), ...pointers }));
+    const result = await host.library();
+    expect(result.references[0]).toEqual({ key: "director-prepare", runId: "native-director-prepare", ...pointers,
+      results: [{ structuredOutputPath: "/native/optional/structured.json" }] });
+    expect(JSON.stringify(result)).not.toContain("structuredOutput\":");
+  });
+
+  test.each([2, 3, 4])("native sandbox preserves standalone/library parity and all %i-angle phases", async count => {
+    const roster = Array.from({ length: count }, (_, index) => ({ id: `r${index}`, focus: `Risk ${index}`, skills: [] }));
+    const outcomes: unknown[] = [];
+    for (const library of [false, true]) {
+      const calls: string[] = [];
+      const result = await runWorkflowScript({
+        script: library ? `const pitakoReviewLibraryMode = true;\n${source}\nreturn reviewPhase(args, runs);` : source,
+        args,
+        state: { get: () => undefined, set: () => { throw new Error("Review must not persist private state"); } },
+        launch: async (key, request) => {
+          calls.push(key);
+          const id = key.slice(key.indexOf("-") + 1);
+          const index = roster.findIndex(angle => angle.id === id);
+          const body = key === "director-prepare" ? { angles: roster }
+            : key.startsWith("independent-") ? { findings: [finding] }
+              : key.startsWith("critique-") ? { challenges: [{ ...challenge, findingId: `${roster[(index + 1) % count]!.id}-1` }] }
+                : key.startsWith("defense-") ? { responses: [{ ...response, findingId: `${id}-1` }] }
+                  : { dispositions: roster.map(angle => ({ ...disposition, findingId: `${angle.id}-1` })) };
+          if (key.startsWith("independent-")) {
+            expect(request.task).toContain(JSON.stringify(args.target));
+            expect(request.task).toContain(args.brief);
+            expect(request.task).not.toContain(finding.title);
+          }
+          return { key, ...child(key, body), output: "", artifactPaths: [] };
+        },
+        status: async () => { throw new Error("Unexpected status query"); },
+      });
+      expect(result.value).toMatchObject({ status: "completed", phase: "synthesis" });
+      expect(calls).toEqual([
+        "director-prepare", ...roster.map(angle => `independent-${angle.id}`),
+        ...roster.map(angle => `critique-${angle.id}`), ...roster.map(angle => `defense-${angle.id}`),
+        "director-synthesis",
+      ]);
+      expect(calls).toHaveLength(3 * count + 2); // 8 / 11 / 14, including preparation and synthesis.
+      outcomes.push(result.value);
+    }
+    expect(outcomes[1]).toEqual(outcomes[0]);
+  });
+
+  test("controlled capacity exhaustion in the native sandbox retains completed phases without replacement", async () => {
+    const calls: string[] = [];
+    const attempted: string[] = [];
+    const result = await runWorkflowScript({
+      script: `const pitakoReviewLibraryMode = true;\n${source}\nreturn reviewPhase(args, runs, { prefix: "loop1." });`,
+      args,
+      state: { get: () => undefined, set: () => {} },
+      launch: async key => {
+        attempted.push(key);
+        // The public sandbox delegates runtime admission to its launch boundary.
+        if (calls.length === 3) throw new Error("Native spawn capacity exhausted");
+        calls.push(key);
+        return { key, ...child(key.slice("loop1.".length)), output: "", artifactPaths: [] };
+      },
+      status: async () => { throw new Error("Unexpected status query"); },
+    });
+    expect(result.value).toMatchObject({ status: "failed", phase: "critique",
+      references: [
+        { key: "loop1.director-prepare", runId: "native-director-prepare" },
+        { key: "loop1.independent-a", runId: "native-independent-a" },
+        { key: "loop1.independent-b", runId: "native-independent-b" },
+      ] });
+    expect(calls).toEqual(["loop1.director-prepare", "loop1.independent-a", "loop1.independent-b"]);
+    expect(attempted).toEqual([...calls, "loop1.critique-b"]);
+    expect(JSON.stringify(result.value)).toContain("spawn");
+  });
+
+  test("a settled stopped child is incomplete and preserves Stop evidence after siblings settle", async () => {
+    const waiting = deferred<Result>(), entered = deferred<void>();
+    const host = fixture(key => {
+      if (key === "independent-a") return { ok: false, runId: "stopped-native", stopped: true, error: "User Stop" };
+      if (key === "independent-b") { entered.resolve(); return waiting.promise; }
+      return child(key);
+    });
+    let finished = false;
+    const work = host.library().then(result => { finished = true; return result; });
+    let result: Outcome;
+    try {
+      await entered.promise;
+      expect(finished).toBe(false);
+    } finally {
+      waiting.resolve(child("independent-b"));
+      result = await work;
+    }
+    expect(result.status).toBe("failed"); // A child's Stop does not certify invocation cancellation.
+    expect(result.error).toContain("User Stop");
+    expect(result.references).toContainEqual({ key: "independent-a", runId: "stopped-native", stopped: true });
+    expect(host.calls).toHaveLength(3);
+  });
+
   test("independent angles receive the same target, selected skills, and no peer conclusions", async () => {
     const host = fixture();
     const result = await host.execute();
@@ -180,7 +394,7 @@ describe("review scripted workflow", () => {
     expect(result.dispositions).toEqual(dispositions);
   });
 
-  test.each([3, 4])("assigns every finding a distinct peer critic with %i dynamic angles", async count => {
+  test.each([2, 3, 4])("assigns every finding a distinct peer critic with %i dynamic angles", async count => {
     const roster = Array.from({ length: count }, (_, index) =>
       ({ id: `angle${index}`, focus: `Risk ${index}`, skills: [] }));
     const findingsFor = (id: string) => [1, 2].map(ordinal =>

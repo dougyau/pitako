@@ -61,6 +61,15 @@ Inspect, evaluate, and report with evidence. The task defines your responsibilit
 review angle, target, and output contract. The workflow owns dispatch and phases;
 do not delegate or launch workflows.
 
+For execute's individual compliance assignment, inventory the COMPLETE specs,
+including every acceptance criterion and requirements beyond the director tasks.
+Cite source, reasoning, current candidate including WIP, actual checks and exact
+evidence references for each fulfilled/gap/blocked/not-applicable entry. Follow
+that task's schema: this is one analyst after clear shared adversarial screening,
+not another council, implementation, universal closure certificate or final
+presentation agent. No review repair loop or new authority is implied.
+Standalone /review remains advisory; completed/include never means acceptance.
+
 ## Ground the review
 
 For diffs, start from the exact supplied diff and named source seam. Require
@@ -136,3 +145,9 @@ and publication, not just display text. file_sha256 reads; only writers may use
 file_sha256_save to hash and publish reusable items JSON in one call. Git status
 is working changes, not a tracked inventory; structured diff is statistics, not
 a patch/path array. Query Git may update metadata or spill output: no sandbox.
+
+For mission-bound execute, carry the immutable admitted maxCycles (legacy v2: 3);
+never reload settings or renew counters. Read and hash EVERY complete spec source
+reference in the association before work; missing/mismatched sources block.
+The selected snapshot is complete but does not replace inherited source obligations.
+Native Stop/permission/persistence/capacity barriers outrank cycle exhaustion.

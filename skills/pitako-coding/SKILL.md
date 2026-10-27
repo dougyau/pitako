@@ -26,7 +26,7 @@ Switch with `/pitako profile analysis` or start Pi with `--pitako-profile analys
 4. Keep the diff proportionate to the task. No speculative abstractions.
 5. Verify real behavior (diff, tests, command output) before claiming done. Select checks for the active project's own behavior and declared testing scope.
 6. Default to conversation or analysis. A problem description, proposal or question does not authorize a new plan or implementation. A clear natural-language instruction authorizes the requested activity without magic words or turn-by-turn reconfirmation. Planning does not authorize implementation; a plan or available tools alone grants no authority. Conversation does not revoke already authorized work. Assigned children continue their authorized task within scope, not standby.
-7. For meaningful multi-step work, list existing TODOs, then create all known stages as `pending` before starting the first. Mark only the current step `in_progress` and complete it only after the work is actually done. Update existing tasks as you advance or resume; preserve unrelated tasks and never `clear` the list to rebuild it. Add genuinely new stages when discovered. Each session tracks its own assignment, not other workers' tasks. Skip TODOs for trivial tasks and purely conversational requests.
+7. Outside root-owned /execute (no foreground or private child TODO supervision), for meaningful multi-step work, list existing TODOs, then create all known stages as `pending` before starting the first. Mark only the current step `in_progress` and complete it only after the work is actually done. Update existing tasks as you advance or resume; preserve unrelated tasks and never `clear` the list to rebuild it. Add genuinely new stages when discovered. Each session tracks its own assignment, not other workers' tasks. Skip TODOs for trivial tasks and purely conversational requests.
 
 ## Tools
 
@@ -140,9 +140,12 @@ authorization, passing checks, or acceptance.
 The former AgentInstance, Team, Head, table, routing, and bridge runtime is
 retired. Its model policies and execution guarantees do not transfer to
 pi-subagents. `/plan` uses grilling and actual foreground human confirmation.
-`/execute` uses explicit native missions, fresh read-only cycle directors, and
-sequential fresh `pitako.worker` increments with CodeGraph/LSP and the official
-model-compatible apply_patch adapter. Only the cycle director delegates. `/task`
+`/execute` uses one explicit native mission-bound root workflow. Fresh read-only
+directors publish loop_plan and end before sequential fresh `pitako.worker`
+attempts with CodeGraph/LSP and the official model-compatible apply_patch adapter.
+The root owns dispatch, checks, shared adversarial review and one individual
+whole-spec compliance analyst. No foreground/private TODO supervision or final
+validator; display existing structured progress and semantic closure. `/task`
 is unavailable. No historical execution is resumed or maintained automatically.
 
 ## Web access

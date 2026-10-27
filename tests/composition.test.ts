@@ -44,7 +44,7 @@ describe("engineering-layer composition", () => {
       for (const instruction of ["Pi-native tools and codemode need no T3 client",
         "Optional-host guidance applies only when present", "unknown trust is not denial",
         "Honor actual native rejections and Stop", "never invent a trust certificate",
-        "billion-context-pi ACP is mandatory", "Only the execution director delegates"])
+        "billion-context-pi ACP is mandatory", "/execute root owns dispatch, shared review and compliance"])
         expect(result.systemPrompt).toContain(instruction);
       expect(handlers.get("before_agent_start")!({ systemPrompt: result.systemPrompt }, ctx)).toBeUndefined();
     } finally {
@@ -104,7 +104,7 @@ describe("engineering-layer composition", () => {
       expect(body).toContain("billion-context-pi");
       expect(body).toContain("unmet prerequisite");
       expect(body).toContain("native-compaction stand-down");
-      expect(plan.fanoutAuthorized).toBe(role === "execution-director");
+      expect(plan.fanoutAuthorized).toBe(false);
       if (role === "interview-relay") {
         expect(plan.effectiveToolAllowlist).toEqual(["contact_supervisor", ...acpTools]);
         expect(plan.configuredExtensions).toEqual([path.join(packageRoot(), "extensions/acp.ts")]);

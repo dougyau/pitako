@@ -48,8 +48,8 @@ navigation available. Analysis removes known editing tools and introduced
 mutators (including locally writing `ssh_pull`, Python/Cargo execution effects
 and hash saving) and blocks them at the tool-call boundary, including codemode.
 It retains shell, so this is not a sandbox. Child strict allowlists retain
-hash queries for read-only roles, saving/full tools for workers, director-only
-delegation and the narrow interview relay.
+hash queries for read-only roles, saving/full tools for workers, no packaged child delegation and the narrow
+interview relay.
 
 `extensions/index.ts` registers only `/pitako`, profile guidance, automatic
 ordinary session naming, profile mutation and edit/write protected-path guards. Startup does not
@@ -79,47 +79,77 @@ workflow, not a general escalation role.
 `pre-pr` reuses the review skill, interprets its complete current-target report,
 and retains local checks and publication-readiness rules. It adds no workflow.
 Plan and execute compose the same architecture/review contracts. Foreground
-planning owns grilling and actual human confirmation. Execution uses a narrowly
-registered named resource for read-only spec/Git host inspections, native mission
-state for immutable invocation inputs and cycle attempts, fresh cycle directors,
-and sequential fresh packaged workers. Only the director opts into delegation,
-TODO and both supervisor channels. The ordinary worker retains the native worker
-contract plus explicit CodeGraph/LSP/Codex providers, without delegation.
+planning owns grilling and actual human confirmation. Execute registers one
+session-scoped named root resource, replaced/disposed on lifecycle events.
+Registration preloads COMPLETE trusted sources: lexical review library marker,
+complete shared review source, then execute controller. No slicing, protocol
+copy, sandbox imports, nested async helpers or nested workflows are introduced.
+The bounded resolver has no discovery I/O; physical registered-root/Git checks
+remain launch hooks and host inspection. POSIX quoting and Windows encoded
+argument transport retain exact arguments through the Node-hook inspect.mjs loader.
 
-Registration is session-scoped and disposed on shutdown/re-registration. Helpers
-and scripts ship under extensions/skills. The raw sandbox cannot fs/import or
-call arbitrary tools. Native replay is not stack restoration or exactly-once;
-unrecorded attempts block for native mission/Git/descendant reconciliation.
-Reused results alone never prove current checks. The read-only host API requires
-a finite per-operation timeout; its native maximum is not a Pitako cycle budget.
-The old bridge has no historical replacement.
+Native mission state binds actual returned missionPath/missionId, invocation,
+full immutable specs and designated Git common root. The 39,936-byte snapshot
+uses the existing 26 chunk grants, initial inspection, one settings admission and four closing
+inspections (32 host grants/calls maximum). No arbitrary check
+commands or artifact loader are added to host authority. The finite native host
+read deadline is not an execution budget. Child spawn capacity is separate;
+exhaustion returns incomplete with phase/work/refs, not overrides or renewed slots.
 
-The packaged execution-director uses native `timeoutMs: 7200000` (two hours).
-The worker defaults to `timeoutMs: 14400000` (four hours), also requested by the
-director for each new attempt; neither retimes a running child nor extends an
-earlier parent deadline. A confirmed native director timeout consumes one of three
-cycles in that explicit invocation; native awaited completion and fresh read-only Git/known-ref
-observations precede the next slot. Positive native active/pending, detached,
-recovery, Stop and permission signals block replacement. Failed tests/model
-verdicts are diagnosis, not activity proof or writer permission. Shared
-verify-behavior is explicitly selected in director/worker profiles.
 
-An unsettled historical marker permits pertinent read-only admission diagnosis.
-Missing retained awaited completion produces exact pending diagnosis and explicit
-`/execute <spec-id> --unblock` guidance. That actual human request maps to strict
-boolean data on the same named resource and can withdraw only that historical
-Pitako exclusion, recording the request/old refs in native mission state. It is
-not authentication, verified closure or a native barrier override. Old outcomes,
-counts, snapshots and Git/WIP remain. Same-ID replay cannot renew three slots or
-clear a newer hold. Status projection/inventory is incomplete: positive exact-ref
-native management warnings are advisory blockers; absent fields, status.ok and
-normal prose never certify CLOSED. No global process lock is claimed. Completion
-still needs current-checkout verification and whole-spec review.
-Ordinary awaited cycles skip model settlement; retained awaited results reconcile
-historical markers through exact native observations. Fresh read-only recovery
-remains for timeouts lacking observations and missing historical receipts. The
-final validator assesses current spec/check/review evidence, not a universal
-historical closure certificate.
+The admitted `pitako.execute.maxCycles` is a positive safe integer (default 3).
+Pi global agent-dir `settings.json` is overridden by the designated worktree's
+`.pi/settings.json`, never the source/sibling cwd. Invalid settings stop before
+a director; no settings are written. The immutable native association freezes
+the limit across recovery/settings edits; legacy version-2 records stay fixed
+at three without migration. Reports use `Loop n de max` and consumed/max.
+Early fulfillment stops; last-slot gaps need a new human invocation. Stop,
+permissions, persistence and actual native host/child capacity outrank the limit.
+Higher limits grant no extra native capacity. Hash-associated complete inherited
+spec refs remain in all phase contexts without enlarging the selected snapshot.
+See the execute skill for settings examples, sourceRefs and bounded host grants.
+
+The root consumes one of the admitted loops before each fresh read-only director. That
+director publishes the sole schema-bound full loop_plan and ends before workers.
+It has no delegation/TODO/supervisor orchestration tools. Sequential ordinary
+fresh workers implement only selected tasks and report actual checks/current
+candidate including WIP, work done, concrete pending work and causal diagnosis.
+Execute sets reads:false/progress:false, supported acceptance suppression with
+an explicit duplicate-gate reason, and 14400000 ms per implementation attempt.
+Ordinary worker defaults/tools remain unchanged. Useful diagnosed same-task
+continuations get new attempt keys; no blind retries or arbitrary attempt quota.
+
+The root invokes the real shared adversarial phases, then exactly one fresh
+reviewer-profile full-spec compliance analyst only on clear screening. Both
+receive complete specs and the same candidate with no own writer active.
+Material gaps end the loop and go to another director; no global repair phase
+follows review. Native closing compares the candidate with check/analysis evidence.
+Complete requires reasoned fulfillment/current mandatory checks/no material gaps;
+the admitted loops without it return partial. Standalone /review remains advisory.
+
+Compact explicit native-state result projections retain exact producer/run,
+outputReference/outputArtifactPath/outputPathMapping/artifactPaths and optional
+structuredOutputPath. No whole prompts/reports/child objects are duplicated.
+The identical active-plan cache is optional within the entire 256 KiB state file;
+essential snapshot/frozen descriptor/progress failure stops dispatch, never prunes
+history. Exceptional inspector recovery reads original full values via retained
+refs only when unavailable directly. Compare full JSON where binding/original
+survive. Missing binding uses original in place; conflict forbids edits; optional
+artifact loss does not block admitted payload/cache; full loss needs remaining
+director or partial. Native replay is not exactly-once/read-only reattachment.
+Reconcile settled results and Git/WIP before cursor advancement; never blindly
+redispatch unresolved writers. Positive actual activity/Stop/permission/recovery
+barriers matter, not missing historical inventory or universal certificates.
+
+Foreground displays existing structured progress and per-loop/final reports:
+invocation, loop, phase, task/attempt, work/check-review-compliance including unrun,
+pending and next authorized action, original elapsed time including pauses and
+attributable deduplicated tokens with partial/unavailable coverage. No polling,
+extra models, foreground/private TODO supervision or final validator. Complete
+answers fulfillment and no human action/no more loops; partial distinguishes
+technical continuation from new authorization. Child timeout is not invocation
+cancellation. Publication is separate. Old supervisor replay and --unblock receive
+clear rejection; historical invoke-*, pitako-execution and Git remain untouched.
 
 ## Verification boundary
 
