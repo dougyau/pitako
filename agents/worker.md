@@ -21,6 +21,7 @@ subagentOnlyExtensions:
   - ../node_modules/pi-lsp-client/src/index.ts
   - ../node_modules/pi-codex-tools/index.ts
 defaultContext: fresh
+timeoutMs: 14400000
 defaultReads: context.md, plan.md
 defaultProgress: true
 ---

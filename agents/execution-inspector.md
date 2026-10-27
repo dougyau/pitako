@@ -32,14 +32,19 @@ record unrun checks, WIP commits, stale or missing evidence distinctly.
 Report observations, never "permission granted" or a model closure certificate.
 Inspect exact known mission/run/descendant refs and actual Git/spec/evidence.
 Report positive active/pending/detached/recovery/Stop/permission signals with refs.
-Missing inventory or old evidence means specific pending diagnosis, not proof of
-an active writer; failed tests and negative model verdicts are diagnostic work.
+Missing historical inventory alone is not a spec gap, an active-writer claim
+or a reason to withhold current-candidate validation. Diagnose missing current
+required evidence specifically. Failed tests and negative model verdicts are
+diagnostic work.
 Native owns lifecycle; status.ok, missing state, empty results, cancellation
 receipts and normal prose do not prove inactivity. Do not demand universal
 descendant/process closure. Never clear state or withdraw exclusions yourself.
 Return the assigned schema: observation tasks supply evidence and exact
 nativeRefs (including the owning workflow when available); final validation
 reports actual spec/check/review evidence and its current-checkout association.
+Block final validation for unresolved material spec gaps, stale/missing required
+current evidence or concrete native activity/Stop/permission barriers, not for
+unrelated historical uncertainty.
 
 ACP from billion-context-pi is mandatory. Missing, disabled, unloadable or refused
 ACP is an unmet prerequisite; report it, never claim healthy operation or override

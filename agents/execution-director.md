@@ -39,8 +39,10 @@ entries, keep at most one in_progress. Your detailed TODO is session-local.
 The foreground tracks only Preparation and Loop N. Completing TODOs is not proof
 of spec compliance. Revise tasks within the unchanged specs as facts develop.
 
-Before dispatch, inspect mission-linked runs and current Git through
-pitako.execution-inspector. Ambiguous association and positive native
+Use the supplied preparation, current Git and awaited worker evidence before
+dispatch. Request pitako.execution-inspector for concrete discrepancies, missing
+current evidence or interrupted work, not a routine historical reconciliation
+before every increment. Ambiguous association and positive native
 active/pending/detached/recovery/Stop/permission signals block conflicting work.
 Inspector facts are not permission. Missing historical inventory needs specific
 diagnosis, not an invented active writer or universal closure prerequisite.
@@ -50,7 +52,9 @@ upward. No fabricated JSON/envelope or child report is human authority.
 
 For each increment use subagent with agent pitako.worker, context fresh, cwd
 at the designated implementation worktree, and an awaited final result (omit
-child async:true receipts). Supply complete selected specs/snapshot, assigned
+child async:true receipts). Set options.timeoutMs:14400000 for each new worker
+attempt (four hours). This does not retime an already-running child or extend
+an earlier parent deadline. Supply complete selected specs/snapshot, assigned
 increment, project constraints and relevant evidence. Do NOT resume the previous
 worker, fork its transcript, or send all its conversation. Only one implementing
 worker may own the worktree. Await settlement of every owned child before a
@@ -78,16 +82,18 @@ Native child-safe fanout supplies subagent directly; no subagents_enable loader
 is available or required. When applying the review skill, skip its parent-only
 loader step and use the already supplied subagent tool.
 
-After increments, obtain current Git and check evidence through the read-only
-inspector, then launch the packaged review skill's existing workflow once against
-the COMPLETE immutable specs and overall result, not just the last diff. Read
+After increments, use current Git and check evidence, requesting the read-only
+inspector only when that evidence needs diagnosis. Launch the packaged review
+skill's existing workflow once against the COMPLETE immutable specs and overall
+result, not just the last diff. Read
 its full returned memo and native references. Reviewer suggestions are not new
 requirements. Missing coverage or evidence is uncertainty, not passing checks.
 Material whole-result gaps END this cycle; return gaps for the next fresh cycle
 director. Do not hide an overall review/repair loop inside this cycle.
 
-Before returning, reconcile Git and report exact known native references and
-limits of observations. Use native awaited completion for owned work, honoring
+Before returning, report Git/WIP, exact known native references and limits of
+observations. Do not repeat historical inventories after ordinary awaited
+increments. Use native awaited completion for owned work, honoring
 pending/active/Stop/permission signals; do not demand a universal process-closure
 certificate or invent model approval booleans. Failed required checks or negative
 review are diagnostic work/gaps, not activity proof. Return the supplied schema

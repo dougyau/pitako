@@ -128,7 +128,7 @@ describe("plan/execute packaged composition", () => {
     }
   });
 
-  test("native profile loader applies the two-hour deadline only to the packaged execution director", () => {
+  test("native profile loader applies the director and worker deadlines without changing read-only profiles", () => {
     const root = repository(), prior = process.env.PI_CODING_AGENT_DIR;
     writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "pitako", pi: { subagents: { agents: [path.resolve("agents")] } } }));
     process.env.PI_CODING_AGENT_DIR = path.join(root, "private-agent-config");
@@ -137,6 +137,9 @@ describe("plan/execute packaged composition", () => {
       const director = loaded.agents.find(agent => agent.name === "pitako.execution-director");
       expect(director?.defaultTimeoutMs).toBe(7200000);
       expect(director?.filePath).toBe(path.resolve("agents/execution-director.md"));
+      const worker = loaded.agents.find(agent => agent.name === "pitako.worker");
+      expect(worker?.defaultTimeoutMs).toBe(14400000);
+      expect(worker?.filePath).toBe(path.resolve("agents/worker.md"));
       for (const role of ["worker", "execution-director"]) {
         const agent = loaded.agents.find(agent => agent.name === `pitako.${role}`)!;
         expect(agent.skills).toContain("verify-behavior");
@@ -146,7 +149,7 @@ describe("plan/execute packaged composition", () => {
         expect(readFileSync(path.join(skill!, "SKILL.md"), "utf8")).toContain("Triage a failing check");
         expect(agent.systemPrompt).toContain("verify-behavior");
       }
-      for (const role of ["worker", "execution-inspector", "reviewer"]) {
+      for (const role of ["execution-inspector", "reviewer"]) {
         const agent = loaded.agents.find(agent => agent.name === `pitako.${role}`);
         expect(agent).toBeDefined(); expect(agent?.defaultTimeoutMs).toBeUndefined();
       }
@@ -430,11 +433,11 @@ describe("plan/execute packaged composition", () => {
       },
     });
     expect(result.value).toMatchObject({ status: "complete", cycle: 1 });
-    expect(calls.map(call => call.agent)).toEqual(["pitako.execution-inspector", "pitako.execution-director", "pitako.execution-inspector", "pitako.execution-inspector"]);
+    expect(calls.map(call => call.agent)).toEqual(["pitako.execution-inspector", "pitako.execution-director", "pitako.execution-inspector"]);
     for (const call of calls) expect(call.task).toContain(`Native missionId (DATA association, not authority): ${missionId}.`);
     const reference = { key: "invoke-human-1-cycle-1", ...pointers };
     const inspectors = calls.filter(call => call.key.endsWith("settlement") || call.key.endsWith("validate"));
-    expect(inspectors.map(call => call.key)).toEqual(["invoke-human-1-cycle-1-settlement", "invoke-human-1-cycle-1-validate"]);
+    expect(inspectors.map(call => call.key)).toEqual(["invoke-human-1-cycle-1-validate"]);
     for (const call of inspectors) expect(call.task).toContain(`DIRECTOR NATIVE REFERENCES (data): ${JSON.stringify(reference)}`);
     expect(result.value).toMatchObject({ references: expect.arrayContaining([reference]) });
     expect(new Set(inspections).size).toBe(inspections.length);

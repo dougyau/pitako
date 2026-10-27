@@ -94,9 +94,11 @@ Reused results alone never prove current checks. The read-only host API requires
 a finite per-operation timeout; its native maximum is not a Pitako cycle budget.
 The old bridge has no historical replacement.
 
-The packaged execution-director alone uses native `timeoutMs: 7200000` (two
-hours). A confirmed timeout consumes one of three cycles in that explicit
-invocation; native awaited completion and fresh read-only Git/known-ref
+The packaged execution-director uses native `timeoutMs: 7200000` (two hours).
+The worker defaults to `timeoutMs: 14400000` (four hours), also requested by the
+director for each new attempt; neither retimes a running child nor extends an
+earlier parent deadline. A confirmed native director timeout consumes one of three
+cycles in that explicit invocation; native awaited completion and fresh read-only Git/known-ref
 observations precede the next slot. Positive native active/pending, detached,
 recovery, Stop and permission signals block replacement. Failed tests/model
 verdicts are diagnosis, not activity proof or writer permission. Shared
@@ -113,6 +115,11 @@ clear a newer hold. Status projection/inventory is incomplete: positive exact-re
 native management warnings are advisory blockers; absent fields, status.ok and
 normal prose never certify CLOSED. No global process lock is claimed. Completion
 still needs current-checkout verification and whole-spec review.
+Ordinary awaited cycles skip model settlement; retained awaited results reconcile
+historical markers through exact native observations. Fresh read-only recovery
+remains for timeouts lacking observations and missing historical receipts. The
+final validator assesses current spec/check/review evidence, not a universal
+historical closure certificate.
 
 ## Verification boundary
 

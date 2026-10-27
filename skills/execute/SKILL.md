@@ -224,7 +224,14 @@ using the existing review workflow. Material overall gaps go to the NEXT fresh
 director, not a hidden whole-result repair loop. Increment repairs are allowed.
 A TODO, successful native run or passing tests alone is not spec compliance.
 An additional fresh read-only validation inspects current Git/evidence before
-success. Reused validator output, source drift or checkout drift cannot succeed.
+success. It checks current spec compliance, required checks and overall-review
+evidence, not universal historical closure. Reused validator output, source drift
+or checkout drift cannot succeed.
+
+Ordinary awaited cycles do not launch a settlement inspector. Directors use the
+supplied preparation and awaited worker evidence; read-only diagnosis is for
+concrete discrepancies, missing current evidence or interrupted work, not another
+historical inventory before and after every increment.
 
 Native mission state stores invocation input, initial TODO, cycle attempts and
 compact results; native linked runs/artifacts retain evidence. Git commits
@@ -234,8 +241,11 @@ Pitako execution ledger is created. No Pitako time/token/price/usage budget is
 added. Native limits remain. runs.host requires a finite timeout; only the
 allowlisted read-only inspection uses its native 24-hour maximum, NOT a workflow,
 director or worker deadline.
-The packaged execution-director profile alone sets native `timeoutMs: 7200000`
-(two hours). This does not change worker deadlines or global/workflow budgets.
+The packaged execution-director profile sets native `timeoutMs: 7200000`
+(two hours). The packaged worker defaults to `timeoutMs: 14400000` (four hours),
+and the director explicitly requests that timeout for each new worker attempt.
+These settings do not retime already-running children or extend an earlier
+parent deadline. No global or workflow deadline is changed.
 
 ## Results and recovery
 
@@ -270,6 +280,9 @@ running/pending/detached/recovery/Stop/permission signals govern no-overlap.
 Read-only inspectors provide facts about current Git/spec/evidence and known
 refs, not writer permission. Status.ok, missing state, empty results and normal
 prose NEVER establish inactivity. Retained observations are evidence, not grants.
+An existing awaited result can reconcile its historical marker through exact-ref
+native observations without another model inspector. A timeout lacking recorded
+observations still requires the targeted read-only recovery described below.
 The thin source-verified 0.82 management receipt adapter recognizes only positive
 unsafe warnings for the exact queried ref; it has no CLOSED text parser.
 Native status projection and retained child inventory are incomplete: this is
@@ -284,6 +297,8 @@ detached/recovery, Stop or permission barriers remain blocking, including fresh
 native denial. No force kill, global force, operational resume or old success
 rewrite is implied. Missing complete native inventory is documented, not made
 another permanent prerequisite that makes withdrawal impossible.
+Missing historical inventory alone does not withhold final validation when
+current spec, required-check and whole-review evidence are adequate.
 
 The selected spec, exact mission and designated worktree must match. Source
 snapshot/digest adoption rules still apply. Native mission state records the
