@@ -40,8 +40,10 @@ Registration and instruction sources:
 Availability is role-specific, not inherited from the foreground tool inventory.
 All nine [profiles](agents/) explicitly load ACP. Eight load dev-tools and hashes;
 the interview relay has only ACP and native supervisor contact. Four roles
-(architect, reviewer, scout, worker) load LSP/CodeGraph. Only the execution director
-delegates; the worker is the single writer. Preserve these ceilings and the
+(architect, reviewer, scout, worker) load LSP/CodeGraph. The execute root workflow owns
+dispatch; its director only publishes a read-only plan and ends. No packaged
+child delegates; the worker is the single writer. The inspector is exceptional
+read-only observation/recovery, not preparation or final validation. Preserve these ceilings and the
 coding/analysis mutation policy: shell is not a sandbox, query Git can write
 metadata, and Python/Cargo/SSH are not read-only merely because of annotations.
 `git_commit` pushes by default; workers must set `push:false` without publication

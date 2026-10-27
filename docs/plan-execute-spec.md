@@ -19,8 +19,8 @@ for user spec-plans. It does not change where this design document is stored.
 
 `/plan` turns a conversation into complete specs. `/execute` turns those specs
 into a working, verified implementation through a Ralph-style execution loop.
-The implementation TODO belongs to execution and can change as work proceeds.
-Completing that TODO does not establish that the specs are satisfied.
+The execution root owns a single complete loop_plan per loop. Exhausting tasks
+does not establish that the specs are satisfied.
 
 Pitako composes Pi, pi-subagents workflows, native missions, session-local TODOs,
 and Git. Pi retains model, provider, and session ownership. Pitako adds no
@@ -43,12 +43,12 @@ Specs, agent results, and mission records do not grant additional permissions.
   It is not a project-wide specification or a fixed implementation TODO.
 - An **increment** is a bounded piece of implementation, investigation, or repair
   performed by a worker with fresh context.
-- A **complete cycle** prepares or updates the implementation TODO, implements
-  its increments, and reviews the overall result against the specs.
+- A **complete cycle/loop** obtains one full read-only plan, implements its tasks,
+  checks, adversarially reviews and individually analyzes full-spec compliance.
 - An **invocation** is an explicit user request to `/execute`. It permits up to
-  three complete cycles. A technical recovery is not a new invocation.
+  the admitted number of complete cycles (default 3). A technical recovery is not a new invocation.
 - The **foreground coordinator** is the calling session. The **cycle director**
-  is a separate, fresh-context subagent responsible for one execution cycle.
+  is a separate fresh-context read-only planner that publishes and ends.
 
 ## Grilling is a packaged skill
 
@@ -176,178 +176,161 @@ during implementation. Old documents are not eligible merely because the former
 engine called them `frozen`. They need to satisfy the new spec-plan contract,
 and no historical execution or receipt is resumed automatically.
 
-## Execution has an outer workflow and an isolated cycle director
+## Execution is one root workflow
 
-The foreground coordinator supplies the selected specs and designated worktree
-to the outer `/execute` workflow. That workflow analyzes the assignment and
-checkout, prepares the initial implementation TODO, and launches the cycle
-director. Model-backed analysis remains agent work, not an ability of the
-JavaScript sandbox. The foreground session TODO contains high-level work such
-as preparation and `Loop 1`, not every implementation task.
-
-The outer workflow launches a fresh-context cycle director for each cycle.
-This is an agent with explicitly enabled native delegation, not an invented
-workflow-to-workflow script API.
+The foreground supplies authorized complete specs, explicit native mission and
+designated registered worktree to `pitako.execute`. Retain actual returned
+missionId AND missionPath from public mission.create/mission.show in that root;
+never derive native storage paths. args.missionId matches options.missionId.
+The immutable association includes invocation, full snapshot/source/digest and
+Git common directory. Technical recovery retains it and the consumed count.
 
 ```mermaid
 flowchart TD
-    Coordinator["Foreground coordinator: specs and designated worktree"] --> Outer["Outer workflow: analyze and prepare initial TODO"]
-    Outer --> Director["Fresh cycle director with its own TODO"]
-    Director --> Worker["Fresh worker: one increment"]
-    Worker --> Check["Increment checks and Git checkpoint"]
-    Check --> More{"Implementation work remains?"}
-    More -->|Yes| Director
-    More -->|No| Review["Independent overall review against specs"]
-    Review --> Result["Cycle result and native references"]
-    Result --> Outer
-    Outer --> Next{"Another cycle needed and permitted?"}
-    Next -->|Yes| Director
-    Next -->|No| Return["Return complete, partial, blocked, or failed"]
+    Coordinator["Foreground: authorized specs, mission and worktree"] --> Root["One root workflow"]
+    Root --> Director["Consume loop; fresh read-only director publishes loop_plan and ends"]
+    Director --> Worker["Sequential fresh workers: ordered tasks and diagnosed attempts"]
+    Worker --> Checks["Final mandatory checks on current HEAD and WIP"]
+    Checks --> Review["Shared adversarial whole-result review"]
+    Review --> Clear{"Clear of material gaps?"}
+    Clear -->|Yes| Compliance["One fresh individual whole-spec compliance analyst"]
+    Clear -->|No| Close["Native closing candidate comparison"]
+    Compliance --> Close
+    Close --> Fulfilled{"Full spec fulfilled and evidence current?"}
+    Fulfilled -->|Yes| Complete["Execution complete; no more loops or human action"]
+    Fulfilled -->|No, slots remain| Director
+    Fulfilled -->|No, last admitted loop| Partial["Execution partial; new authorization required"]
 ```
 
-### Responsibilities and context
 
-The cycle director reads, plans, updates its detailed TODO, delegates, and
-evaluates results. It does not edit product code, make small fixes itself, or
-create commits. Keeping its context free of implementation work is a requirement.
-Within its cycle, the director retains continuity.
+The admitted `pitako.execute.maxCycles` is a positive safe integer (default 3).
+Pi global agent-dir `settings.json` is overridden by the designated worktree's
+`.pi/settings.json`, never the source/sibling cwd. Invalid settings stop before
+a director; no settings are written. The immutable native association freezes
+the limit across recovery/settings edits; legacy version-2 records stay fixed
+at three without migration. Reports use `Loop n de max` and consumed/max.
+Early fulfillment stops; last-slot gaps need a new human invocation. Stop,
+permissions, persistence and actual native host/child capacity outrank the limit.
+Higher limits grant no extra native capacity. Hash-associated complete inherited
+spec refs remain in all phase contexts without enlarging the selected snapshot.
+See the execute skill for settings examples, sourceRefs and bounded host grants.
 
-Workers perform implementation and commits. The packaged `pitako.worker` is based
-on pi-subagents 0.82.0 builtin worker, retaining ordinary implementation tools,
-fresh context and project instructions, and adding explicit CodeGraph, LSP and
-the official model-compatible apply_patch adapter with edit/write fallback. It
-does not gain delegation; Pi retains model/provider selection.
-Each increment starts with a fresh
-worker context containing the assigned task, selected specs, applicable project
-instructions, relevant evidence, and access to the current checkout. Fresh
-context does not mean an empty brief or the loss of project constraints.
-Workers do not inherit the previous worker's conversation.
+### One work definition and fresh workers
 
-Only one implementing worker writes in the designated worktree at a time.
-The director waits for owned work before starting a conflicting writer.
-Fresh context and read-only role instructions are not sandbox guarantees.
+The root durably consumes a loop before director dispatch. A fresh read-only
+director returns `plan` or `needs-decision` using outputSchema and the native
+binding, then ends before implementation. It has no delegation, TODO or
+supervisor orchestration. The full `loop_plan` is the sole task definition:
+association, complete shared context and ordered stable IDs, goals, sources,
+context references, scope/effects, expected results and concrete checks. A last
+verification task is mandatory even when code already exists. A derived ID/order
+manifest recovers position only, not another checklist or permission set.
 
-A different subagent reviews the overall result against the complete specs.
-That review considers behavior, coverage, current evidence, and the project's
-required checks. Passing tests alone does not prove spec compliance. Nor does
-review completion establish passing checks or merge approval.
+Ordinary packaged workers start fresh and sequentially, with no prior transcript
+fork and no async child receipts. They retain normal tools/read/progress defaults;
+execute calls alone set reads:false/progress:false, suppress duplicate inferred
+acceptance with explicit supported reason, and apply timeoutMs:14400000 per
+implementation attempt. This does not waive required checks or native barriers,
+extend the director/root or impose a logical-task deadline. No private diaries,
+progress files or TODOs. A worker implements only the selected full task and
+returns task/attempt, work done, concrete pending work, causal diagnosis,
+Git/checkpoints/WIP, final candidate and actual command/cwd/output/log/result.
+Existing checkoutEvidence identity is recorded before/after checks and after
+last writes. Useful diagnosed same-task continuations get new attempt keys;
+blind repetition/material replanning goes to a remaining director, without
+arbitrary quotas, retries-until-green or deadline inflation.
 
-The detailed TODO belongs to the director's session. The foreground TODO does
-not mirror its entries. Return a compact result, remaining work, blockers, and
-native evidence references rather than all internal transcripts. Native
-session-local TODO storage is the ownership boundary. This spec does not promise
-how an external host such as T3 renders descendant events.
+### Shared adversarial review, then individual compliance
 
-### A cycle ends with the overall review
+After mandatory checks, the root runs the REAL shared review: two to four dynamic
+whole-result perspectives, cross-critique, one defense and synthesis, all with
+complete specs/current candidate. Reasoned screening is clear/material-gaps/
+blocked; include means substantiated, not blocking, and completed is protocol
+termination only. Clear alone launches exactly one fresh reviewer-profile
+compliance analyst, not another council. It inventories the COMPLETE specs,
+including all 17 acceptance criteria and requirements beyond director tasks,
+with sources, reasons and actual current check/evidence references. It returns
+fulfilled/gaps/blocked. Standalone /review retains advisory authority.
 
-The director can revise the implementation TODO when new facts change the work.
-It can remove unnecessary tasks, reorder work within dependencies, and delegate
-increment-level repairs. It does not change the specs or expand their scope.
+No own writer is active during either analysis. A single native closing per loop
+compares current candidate including WIP to evidence. Drift invalidates affected
+checks/analyses. Complete requires reasoned whole-spec fulfillment, current
+mandatory checks and no material in-scope gaps. Green tests, task exhaustion,
+commits or finished reviews alone are insufficient. Material review/compliance
+gaps end the loop and reach the next fresh director, never a hidden same-loop
+global repair phase. The admitted loops without fulfillment return partial. Native
+Stop, permissions/decisions, pertinent activity or actual capacity may suspend
+earlier. No automatic invocation/mission, publication, commits or slot renewal.
 
-After implementing the TODO, run the overall review. Material spec gaps become
-input to the next cycle, with a new director. Do not hide another sequence of
-whole-result review and repair inside the same cycle to bypass the outer limit.
-Unsupported reviewer suggestions do not automatically become new requirements.
-If a product decision is necessary, report the question instead of inventing
-the answer.
+## Recovery uses native missions and Git
 
-Each invocation permits at most three complete cycles. This limit is not three
-workers, three tasks, or three commits. Stop before the ceiling when the specs
-are satisfied, a blocker requires a decision, or work cannot make progress.
+Native state retains versioned immutable association, loops consumed, phase,
+manifest/cursor, frozen task/attempt, intent/launch/result distinctions and exact
+refs. Git preserves code/checkpoints/WIP, not acceptance receipts. Preserve exact
+producer/run, outputReference/outputArtifactPath/outputPathMapping/artifactPaths
+and optional results[].structuredOutputPath. Binding JSON, optional original
+native value and debug artifacts are different. Consume the original complete
+structuredOutput, not previews or invented paths. Store compact explicit result
+projections, not full child objects/prompts/reports under allowed string fields.
+Snapshot/frozen descriptor/progress are essential; failure to persist halts new
+dispatch. Cache at most one identical active plan if it fits the entire 256 KiB
+native state file. Do not delete history to make room.
 
-Do not add Pitako token, price, usage, or global/worker time budgets to a cycle.
-The packaged execution-director alone sets native `timeoutMs: 7200000` (two
-hours). Normal usage is subscription-based; other native runtime limits remain.
+When full values are unavailable directly, exceptional read-only inspector
+recovery uses existing reads and exact retained refs, no new host loader. Compare
+full JSON when original and binding survive, including scope/effects/order, not
+only IDs. Missing binding with surviving authoritative original uses it in place
+with exact provenance/recovery source, never copied or relocated by another
+director. Changed/conflicting binding => diagnosis/no edits. Optional witness
+loss does not block admitted full payload/cache. No trustworthy full definition
+=> remaining director or partial, never reconstruct scopes from summaries.
+Publication-before-admission recovers the actual full original result.
 
-A confirmed native director timeout consumes the current cycle attempt. Native
-cause is not safety proof. Fresh read-only Git/known-ref observations precede
-the next remaining slot in the SAME invocation. Native awaited completion handles
-ordinary owned runs; positive native active/pending/detached/recovery/Stop or
-permission signals block replacement. No model writersSettled boolean or universal
-descendant/process-closure certificate is required. Missing/reused/refused
-observations yield specific pending diagnosis and historical --unblock guidance,
-never successful review or a hidden timeout retry. Three observed timeouts return
-partial; later completion still needs whole-spec review and current verification.
+Native replay relaunches code, not JavaScript stacks or exactly-once effects.
+Never call unresolved writer keys as supposedly read-only reconnect: failed
+reattachment can dispatch another writer. Reconcile actual settled results and
+Git/WIP, including commit-before-cursor, before repeating edits. Positive
+pertinent queued/running/pending/detached/recovery/Stop/permission signals block
+replacement even between loops. Missing inventory is not activity or a universal
+historical exclusion. `reused` alone is neither success, activity nor error;
+check phase, association, original descriptor and current candidate.
 
-At the ceiling, return partial work and remaining gaps. A new explicit
-`/execute` invocation can authorize up to three more complete cycles on the
-same execution. It renews the cycle allowance, not the implementation state.
-A technical recovery retains the current invocation's count and active cycle.
-Compact timeout markers and settlement references survive replay without
-duplicating native task/spec payloads. Recovery never reruns a consumed timeout
-cycle; an interrupted unsettled attempt still requires explicit reconciliation.
-The workflow never raises its own ceiling. Raising the initial ceiling is a
-future user decision based on observed stability.
+Old supervisor invoke-* and pitako-execution records and Git stay unchanged.
+Clearly reject obsolete supervisor replay and --unblock, without migration,
+deletion, new invocation or native barrier bypass. A later explicit invocation
+requires actual human authorization; technical continuation never renews slots.
 
-Use stable invocation and cycle identities across native workflow relaunches.
-Do not increment an allowance counter merely because the script starts again.
-An additional explicit invocation is distinct from resuming an interrupted one.
+### Resource and presentation boundaries
 
-## Recovery uses missions and Git
+Registration/setup preloads trusted complete sources. Assembly prepends a lexical
+library marker to COMPLETE shared review source, then execute source; no slicing,
+protocol copy, imports, nested workflows or async helpers. The resolver is bounded
+and performs no discovery I/O. Physical registered-root/Git checks stay at launch
+hooks/inspection; inspect.mjs retains Node-hook TypeScript loading and exact
+POSIX/Windows argument transport. Preserve local-first complete spec selection
+and the 39,936-byte UTF-8 boundary, never truncate. The existing 26 snapshot
+grants plus initial, one read-only settings admission and four closing grants use at most 32 host calls. Higher admitted limits never enlarge this native capacity.
+No arbitrary checks/artifact gates are added. Native host deadlines and child
+spawn capacity are separate. Actual exhaustion preserves phase/work/references,
+returns incomplete and never skips required analyses or overrides capacity.
 
-Use native missions for execution state, decisions, pending work, input
-references, and linked runs. Use Git commits to preserve code. Do not create
-another ledger, task registry, checkpoint service, or Board-owned lifecycle.
-TODOs present the session's work; Board remains optional shared knowledge.
-Create the mission first through native `mission.create`, or explicitly attach an
-existing mission. The named `pitako.execute` launch requires the same exact ID in
-`options.missionId` (native attachment) and `args.missionId` (DATA pointer for
-inspector/director briefs). One-step mission creation is unsupported because the
-resource resolver cannot know the new ID. This association is not human approval
-or security confinement. Native validates storage existence before dispatch; no
-custom ledger or ephemeral fallback is added.
+Foreground presents existing structured progress and per-loop/final results,
+not polling, private/foreground Preparation/Loop TODOs, extra agents or final
+validators. Progress identifies invocation, loop/phase and task/attempt when
+applicable. Each loop reports candidate, work, checks/adversarial/compliance
+(including unrun/failed/stale), pending work, next authorized action and human
+action needed. Original elapsed time includes pauses; token attribution is
+deduplicated across replay, with reported/partial/unavailable coverage. Missing
+metrics never become zero, estimates, a blocker or reason for more calls.
+Re-emission consumes no loop or tokens. Do not duplicate full reports in state.
 
-Record a concrete input version for each invocation using native artifacts or
-available source revisions. Retain the original location. Changes to the source
-document must not silently change an active invocation's objective. Report a
-changed input before adopting it through an explicit user decision.
-
-Commits are recovery points, not acceptance receipts. Workers may use
-`wip: <description>` for partial work, including known failures or unrun checks.
-The mission retains that distinction and the remaining work. Do not create an
-empty commit merely to mark a loop, include unrelated changes, or automatically
-squash WIP history.
-
-On continuation, inspect the mission, selected specs, actual checkout, commits,
-uncommitted changes, and linked runs. Continue automatically only when the
-association with the specs and designated checkout is unambiguous. Otherwise
-ask. Do not interpret a stop request, transport receipt, or terminal label as
-proof that all writers have settled. Resolve outstanding native work before
-starting a replacement writer.
-
-A commit may exist even when the mission update was interrupted. Uncommitted
-work may also be useful. Reconcile both sources rather than discard changes or
-blindly repeat work. Recovery does not promise automatic restart, exactly-once
-effects, or cleanup after `SIGKILL`.
-
-### Native workflow recovery in pi-subagents 0.82.0
-
-Use the native async scripted-workflow recovery facilities, not `pi-durable` or
-another Pitako recovery service. Native automatic continuation may resume the
-same already-authorized invocation, in its original designated worktree, without
-granting another three cycles or additional effects. User stop is not an
-automatic-continuation request.
-
-Native recovery relaunches the script from its beginning. Stable script, input,
-invocation, and child keys let upstream reuse matching successful child results
-or reattach eligible live work. This is not a restored JavaScript stack.
-Native automatic-resume attempt limits are separate from the three complete
-Pitako cycles.
-
-Reuse of a director result does not establish that the current checkout still
-passes its checks. Retain the associated input and evidence, inspect repository
-truth, and report stale or uncertain evidence rather than declare success.
-An interrupted director's internal TODO and grandchildren are not automatically
-restored as individual outer-workflow steps. Its replacement must reconcile
-native references, mission state, and Git before allowing another writer.
-Ambiguous association blocks. Missing historical lifecycle evidence requires
-specific pending diagnosis, not an invented active writer.
-
-Host commands and steering can run again during replay. Keep those operations
-read-only or idempotent; put implementation and commits in owned workers and
-inspect existing effects before repeating them. No exactly-once guarantee is
-added by native result reuse. Source-document discovery across worktrees does
-not transfer execution ownership or change native recovery's original cwd.
+Final closure first answers fulfillment and whether the human must act:
+Execution complete/partial/blocked/cancelled. Complete means fulfilled/verified,
+no more loops or human action required. Partial/blocked names concrete gaps or
+impediment and distinguishes technical continuation from new authorization
+after the admitted maximum. A pending decision is blocked with the concrete question;
+child timeout alone is not invocation cancellation. The last loop report and
+closure may share a message. Publication and Git/WIP are reported separately.
 
 ## Owned integration scope
 
@@ -362,12 +345,9 @@ Relevant existing resources include `skills/plan/SKILL.md`,
 `extensions/catalog.ts`. Reuse the existing architecture and review contracts
 rather than copy their protocols into unrelated coordinators.
 
-The execution director is an explicit exception to ordinary non-delegating
-children. Its profile opts into nested delegation and provides the TODO and
-required tool extensions. Do not enable delegation on every worker, architect,
-or reviewer. Do not assume every frontmatter field is accepted by
-`agentOverrides`. Profile names and helper-file layout are implementation
-choices, not new product behavior.
+No packaged child delegates: the root owns execution dispatch and shared phases.
+Director/inspector/reviewer are read-only; worker retains its ordinary providers
+and defaults. No agentOverrides or settings changes supply missing authority.
 
 ## Acceptance and verification
 
@@ -385,13 +365,13 @@ Implementation checks must cover these observable requirements:
 - Selecting sibling specs leaves implementation in the designated worktree.
 - Execution requires complete specs and retains a concrete invocation input.
   Source edits do not silently change it.
-- The parent TODO contains high-level loops. The director owns the detailed
-  session TODO and delegates every product edit and commit.
+- The root owns one schema-bound loop_plan per loop and all task/attempt dispatch.
+  Director ends before workers; no foreground/private child TODO supervision.
 - Increment workers and each new cycle director start with fresh context.
   Implementation has only one writer at a time.
 - Overall review uses the complete specs and current evidence. Completing a TODO
   or receiving a successful native run is not a success verdict.
-- Review gaps move to the next cycle. Three complete cycles exhaust one
+- Review gaps move to the next cycle. The admitted number of complete cycles exhausts one
   invocation, while fewer tasks or more than three increments do not.
 - A partial execution can receive another explicit invocation without losing
   work. Technical recovery does not reset the active allowance.
@@ -431,7 +411,7 @@ runtime test evidence.
   behavior. Commit `d305195` retired that runtime.
 - [Ralph](https://ghuntley.com/ralph/) supplies the fresh-context, persisted-work
   iteration model. This design distinguishes increment iterations from the
-  three complete execution cycles allowed per invocation.
+  configurable complete execution cycles allowed per invocation (default 3).
 
 ## Candidate implementation notes
 
@@ -449,34 +429,15 @@ and a 39,936-byte UTF-8 spec boundary (shared docs may be linked, never truncate
 The native host-command API mandates a finite per-operation timeout; the native
 24-hour maximum applies only to these read-only reads, not workflow/agent budgets.
 
-Cycle attempts are saved before dispatch. An unrecorded attempt is never blindly
-rerun. Historical exclusion admits read-only diagnosis first. Missing retained
-awaited completion yields a specific pending response and an explicit
-`/execute <spec-id> --unblock` route (ID omitted only for unique association).
-Foreground maps only an actual explicit human request to strict boolean data on
-the same resource; the flag is neither authentication nor a child/model grant.
-After exact selected mission/spec/worktree checks and native observations, it
-may withdraw that historical Pitako exclusion without claiming inactivity or
-verified settlement. Positive current native activity/Stop/permission/recovery
-barriers remain; no global force, kill, new ledger or pi-subagents change.
-
-Native state retains the explicit request, old hold/refs and all prior outcomes,
-checks, counters and immutable input. A new explicit invocation has at most three
-slots; replay of the same ID never renews them or clears a newer/unrelated hold.
-Git/WIP is untouched. Incomplete native status/inventory is an honest limit, not
-an eternal exclusion: positive exact-ref public management warnings block, while
-missing state/empty results/status.ok/normal prose never certify CLOSED. Native
-awaited completion is provenance of an owned call, not universal process proof.
-
-Failed required checks or negative inspector/model verdicts are diagnostic work,
-not writer activity. Director and assigned workers load shared verify-behavior:
-read error/test, confirm own regression or trace the exact plausible mechanism,
-audit useful guarantees before justified retirement, check reproducibility and
-flake causes, diagnose timeout work/waits/contention/deadlocks rather than raise
-deadlines, and simplify fixtures/processes preserving coverage. Bounded necessary
-verification/stability edits can be within assignment, not global cleanup.
-Standalone recommendation/read-only authority modes remain. Inspectors provide
-facts and exact refs, never permission. Full gates and review remain required.
+Loop slots and frozen attempts persist before dispatch. Controlled tests cover
+original full-plan recovery, binding conflict/loss, optional witness loss,
+publication/result/cursor cuts, current-candidate replay and native barriers.
+No historical marker/closure ceremony or --unblock path survives. Tests exercise
+shared review with two/three/four angles and findings, native capacity exhaustion,
+full state-file bounds and compact projection of large reports. Maximum UTF-8
+snapshots/metadata, transport, immutable association and no discovery in resolve
+remain owned guarantees. Presentation checks cover per-loop/combined final
+reports, decisions, unrun checks, pauses and partial/unavailable metrics.
 
 The vendoring seams present in this checkout are `scripts/vendor-engineering-layer.py`
 and `docs/provenance.json`; no parallel provenance registry is introduced.

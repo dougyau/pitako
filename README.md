@@ -84,20 +84,45 @@ actual human shared-understanding confirmation before writing complete specs at
 `.pitako/plans/<id>.md`; it never edits product code or starts execution.
 
 `/execute <id>` selects complete specs local-first across registered worktrees,
-binds a native mission explicitly, and permits up to three complete cycles per
-explicit invocation. Each fresh read-only director owns its detailed TODO and
-delegates every edit/commit to sequential fresh `pitako.worker` increments.
-The worker retains normal implementation tools and adds CodeGraph, LSP and the
-official model-compatible apply_patch adapter, with edit/write fallback. Only the
-director delegates. Each cycle ends with independent whole-spec review; gaps go
-to the next fresh director, not an unlimited repair loop.
+retains the full immutable snapshot and an explicitly created/opened native
+mission's actual missionId/missionPath, and launches one root workflow. Up to
+the admitted loops each use a fresh read-only director that publishes one complete
+`loop_plan` and ends before sequential fresh `pitako.worker` attempts. The root
+owns task/attempt selection, mandatory checks, shared adversarial review and,
+only after clear screening, one individual full-spec compliance analyst.
+
+
+The admitted `pitako.execute.maxCycles` is a positive safe integer (default 3).
+Pi global agent-dir `settings.json` is overridden by the designated worktree's
+`.pi/settings.json`, never the source/sibling cwd. Invalid settings stop before
+a director; no settings are written. The immutable native association freezes
+the limit across recovery/settings edits; legacy version-2 records stay fixed
+at three without migration. Reports use `Loop n de max` and consumed/max.
+Early fulfillment stops; last-slot gaps need a new human invocation. Stop,
+permissions, persistence and actual native host/child capacity outrank the limit.
+Higher limits grant no extra native capacity. Hash-associated complete inherited
+spec refs remain in all phase contexts without enlarging the selected snapshot.
+See the execute skill for settings examples, sourceRefs and bounded host grants.
+
+Workers retain normal tools and defaults; execute alone disables private
+read/progress diaries and applies four hours per implementation attempt.
+Material review/compliance gaps go to the next loop, not a hidden repair loop.
+Completion requires full-spec fulfillment, current checks and no material gaps
+on the same candidate including WIP. The admitted loops without fulfillment are partial.
+Native Stop, permissions/activity and capacity remain barriers; recovery does
+not renew slots or blindly redispatch an unresolved writer.
+
+Foreground displays the root's structured progress, per-loop and final reports
+without polling, TODO supervision or a final validator. Missing time/token
+metrics remain unavailable/partial. Complete means no more loops or human action
+needed for fulfillment; publication is separate and never automatic.
 
 See the [plan skill](skills/plan/SKILL.md), [execute skill](skills/execute/SKILL.md)
-and [migration spec](docs/plan-execute-spec.md) for source selection, native
-replay, immutable input snapshots, native activity barriers and targeted human
-`/execute <id> --unblock` historical exclusion withdrawal (not verified closure).
-Installing 0.83.0 does not prove a running host reloaded it. No provider/model is
-pinned and no Pitako usage budget, scheduler or private execution store is added.
+and [migration spec](docs/plan-execute-spec.md) for immutable association and
+exceptional original-full-plan recovery. Obsolete supervisor replay and
+`--unblock` are rejected without changing historical records or Git. Installed
+pi-subagents 0.83.0 does not prove a running host reloaded it. No models, settings,
+capacity overrides, private execution store or replacement scheduler are added.
 
 ## Retired orchestration
 

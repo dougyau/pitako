@@ -1,4 +1,7 @@
-import { checkoutEvidence, designatedWorkspace, discoverSpec, inspectionSnapshot, specChunks, validatePlanId } from "../../extensions/spec-plans.ts";
+import { checkoutEvidence, designatedWorkspace, discoverSpec, inspectionSnapshot, specChunks, validatePlanId, validateSpec } from "../../extensions/spec-plans.ts";
+import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import path from "node:path";
 
 // Planning validates only the root; execution uses the named resource's exact inspections. No writes.
 const [root, id, source, part] = process.argv.slice(2);
@@ -8,7 +11,25 @@ function emitBounded(value: unknown) {
   if (Buffer.byteLength(encoded + "\n") > 4096) throw new Error("Inspection envelope exceeds the native 4096-byte stdout boundary.");
   console.log(encoded);
 }
-if (part === "root") {
+if (part === "settings") {
+  try {
+    const { executeMaxCycles } = await import("../../extensions/execute-settings.ts");
+    const agentDir = process.argv[7];
+    if (!agentDir || !path.isAbsolute(agentDir)) throw new Error("Expected absolute host agent directory for settings admission.");
+    const sourceRefs = JSON.parse(process.argv[6] ?? "[]") as { path: string; digest: string }[];
+    for (const ref of sourceRefs) {
+      const content = readFileSync(ref.path, "utf8");
+      validateSpec(content, path.basename(ref.path, ".md"));
+      if (createHash("sha256").update(content).digest("hex") !== ref.digest)
+        throw new Error(`Complete spec source hash mismatch: ${ref.path}`);
+    }
+    emitBounded({ maxCycles: executeMaxCycles(root, agentDir) });
+  } catch (error) {
+    // Native failed-command summaries truncate at 200 characters. Transport the
+    // complete admission diagnostic; this successful read is NOT admission.
+    emitBounded({ error: String(error instanceof Error ? error.message : error) });
+  }
+} else if (part === "root") {
   validatePlanId(id);
   console.log(JSON.stringify(designatedWorkspace(root)));
 } else {
