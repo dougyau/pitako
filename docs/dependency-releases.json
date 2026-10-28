@@ -129,6 +129,13 @@
     "integrity": "sha512-u3nyf7ZciAv1GOijVpI0TDt9At5wmEi7lSHSlRrnjuThv1DcB7fgGBqqrz+fGZ54jAfTpOOX0JXwxSIg3pnxQA==",
     "license": "MIT"
   },
+  "smol-toml": {
+    "version": "1.9.1",
+    "registry": "https://registry.npmjs.org/smol-toml/1.9.1",
+    "tarball": "https://registry.npmjs.org/smol-toml/-/smol-toml-1.9.1.tgz",
+    "integrity": "sha512-j7WyPdf0CJoutMzMoPLF/bVXHtKZIT9Rb4eGeEbWw8X2t5oirjPgpL+OpaENZrILYaXqYwnVH+qgUwVbl+pUJQ==",
+    "license": "BSD-3-Clause"
+  },
   "pi-lsp-client": {
     "version": "0.2.0",
     "repository": "https://github.com/code-yeongyu/pi-lsp-client",

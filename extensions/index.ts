@@ -1,10 +1,16 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { skillStatusLines } from "./catalog.ts";
+import { herdrSetupNotice } from "./herdr.ts";
 import planExecute from "./plan-execute.ts";
 import { isProtectedEditPath } from "./paths.ts";
 import { applyProfile, MUTATING_TOOLS, effectiveProfile, parseProfile, profileNote, requestedProfile, setSessionProfile } from "./profile.ts";
 import { sessionNameAction } from "./session-name.ts";
 import { packageRoot, prepareRuntime } from "./stack.ts";
+
+// Keep advisory deduplication across Pi reloads and separate extension module copies.
+const HERDR_NOTICES_KEY = Symbol.for("pitako.herdrNotices");
+const host = globalThis as typeof globalThis & { [HERDR_NOTICES_KEY]?: WeakMap<object, Set<string>> };
+const herdrNotices = host[HERDR_NOTICES_KEY] ??= new WeakMap<object, Set<string>>();
 
 export default function pitako(pi: ExtensionAPI): void {
   prepareRuntime(packageRoot());
@@ -28,6 +34,14 @@ export default function pitako(pi: ExtensionAPI): void {
     });
     if (action.set !== undefined) pi.setSessionName(action.set);
     if (ctx.hasUI) ctx.ui.setStatus("pitako", pi.getSessionName() || undefined);
+    if (ctx.hasUI && process.env.HERDR_ENV === "1" && process.env.PI_SUBAGENT_CHILD !== "1"
+      && !herdrNotices.get(captured)?.has(sessionId)) {
+      const notices = herdrNotices.get(captured) ?? new Set<string>();
+      notices.add(sessionId);
+      herdrNotices.set(captured, notices);
+      const notice = herdrSetupNotice(ctx.cwd);
+      if (notice) ctx.ui.notify(notice, "info");
+    }
   });
   pi.on("session_shutdown", () => { manager = undefined; });
 
