@@ -13,9 +13,10 @@ and `extensions/profile-policy.ts`. The early extension captures the session
 profile. The late policy reapplies model-compatible tools after Codex startup
 and model changes without taking over upstream hooks.
 
-Navigation uses pi-lsp-client and pi-codegraph. TODO wraps rpiv-todo and keeps
-`todo` model-only so nested codemode calls cannot lose the snapshots used by
-replay and readers. Board is repository-scoped storage shared by its worktrees.
+Navigation uses pi-lsp-client and pi-codegraph. `extensions/todo.ts` re-exports
+rpiv-todo without changing tool exposure. `todo` is available directly and through
+codemode. Upstream persists mutations as session entries for replay.
+Board is repository-scoped storage shared by its worktrees.
 ACP loads before Hermes. Web access and pi-subagents are direct upstream entries.
 
 ACP keeps Pitako defaults `delegate:false`, `autoUpdate:false`, and

@@ -8,6 +8,8 @@ Pitako composes Pi packages and vendors selected MIT skills. It does not ship BS
 | --- | --- | --- |
 | [@dietrichgebert/ponytail](https://github.com/DietrichGebert/ponytail) 5.3.2 | MIT | Skills `ponytail` and `ponytail-review`. The Pi extension is installed but not loaded. |
 | [@juicesharp/rpiv-todo](https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-todo) 2.15.0 | MIT | Session-local `todo` tool, `/todos`, overlay, and branch replay. `@juicesharp/rpiv-i18n` stays optional. |
+| [@juicesharp/rpiv-ask-user-question](https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-ask-user-question) 2.15.0 | MIT | Structured questions through `ask_user_question`. Bundled unchanged with its LICENSE. |
+| [pi-markdown-preview](https://github.com/omaclaren/pi-markdown-preview) 0.25.0 | MIT | Markdown and LaTeX previews and artifact export. Bundled unchanged with its LICENSE. |
 | [pi-web-access](https://github.com/nicobailon/pi-web-access) 0.45.0 (Nico Bailon) | MIT | Web search, page extraction, and source checking. Bundled into the Pitako package tarball. |
 | [pi-hermes-memory](https://github.com/chandra447/pi-hermes-memory) 0.9.11 (Chandra Teja) | MIT | Persistent memory and conversation search. Bundled unchanged, independent of the Board. |
 | [pi-subagents](https://github.com/nicobailon/pi-subagents) 0.83.0 (Nico Bailon) | MIT | Native delegation, scripted workflows and missions through the published extension. Bundled unchanged with its LICENSE; Pitako's former managed runtime stays retired. |

@@ -167,7 +167,7 @@ describe("engineering-layer composition", () => {
       { cwd: packageRoot() } as ExtensionToolContext)).rejects.toBe(reason);
   });
 
-  test("TODO composition delegates upstream execution and keeps native model-only exposure", async () => {
+  test("TODO composition preserves upstream registration and default direct exposure", async () => {
     const upstream = { content: [], details: { tasks: [], nextId: 1 } };
     const execute = mock(async (..._args: unknown[]) => {
       return upstream;
@@ -182,7 +182,7 @@ describe("engineering-layer composition", () => {
       registerTool(tool: ToolDefinition) { tools.push(tool); },
       on() { return () => {}; },
       registerCommand() {},
-    };
+    } as unknown as ExtensionAPI;
     let forwarded: ExtensionAPI | undefined;
     const registration = spyOn(rpivTodo, "default").mockImplementation(api => {
       forwarded = api;
@@ -191,12 +191,11 @@ describe("engineering-layer composition", () => {
     });
     try {
       const extension = await import("../extensions/todo.ts");
-      extension.default(pi as unknown as ExtensionAPI);
+      extension.default(pi);
       expect(registration).toHaveBeenCalledTimes(1);
-      expect(forwarded?.on).toBe(pi.on);
-      expect(forwarded?.registerCommand).toBe(pi.registerCommand);
-      expect(tools[0]).toMatchObject({ name: todo.name, label: todo.label, description: todo.description, exposure: "model-only" });
-      expect(tools[0]!.parameters).toEqual(todo.parameters);
+      expect(forwarded).toBe(pi);
+      expect(tools[0]).toBe(todo);
+      expect(tools[0]!.exposure).toBeUndefined();
       const controller = new AbortController(), update = () => {};
       const ctx = { cwd: packageRoot(), sessionManager: {} } as unknown as ExtensionToolContext, args = {};
       const result = await tools[0]!.execute("native-id", args, controller.signal, update, ctx);

@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -114,6 +114,19 @@ describe("stack configuration", () => {
     });
     expect(manifest.dependencies["pi-web-access"]).toBe("0.45.0");
     expect(manifest.bundledDependencies).toContain("pi-web-access");
+    for (const extension of [
+      { id: "pi-markdown-preview", version: "0.25.0", tools: ["preview_export"] },
+      { id: "@juicesharp/rpiv-ask-user-question", version: "2.15.0", tools: ["ask_user_question"] },
+    ]) {
+      expect(manifest.dependencies[extension.id]).toBe(extension.version);
+      expect(manifest.bundledDependencies).toContain(extension.id);
+      expect(stack.required.find(({ id }) => id === extension.id)).toEqual({
+        id: extension.id, spec: `${extension.id}@${extension.version}`,
+        entry: `node_modules/${extension.id}/index.ts`, tools: extension.tools,
+      });
+      expect(manifest.pi.extensions.filter(entry => entry === `./node_modules/${extension.id}/index.ts`)).toHaveLength(1);
+      expect(existsSync(path.join(root, "node_modules", extension.id, "index.ts"))).toBe(true);
+    }
     expect(stack.required.find(({ id }) => id === "pi-web-access")).toEqual({
       id: "pi-web-access",
       spec: "pi-web-access@0.45.0",
