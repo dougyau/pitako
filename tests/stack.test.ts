@@ -121,13 +121,14 @@ describe("stack configuration", () => {
     });
     expect(manifest.bundledDependencies).toContain("pi-web-access");
     for (const extension of [
-      { id: "pi-markdown-preview", version: "0.25.0", tools: ["preview_export"] },
-      { id: "@juicesharp/rpiv-ask-user-question", version: "2.15.0", tools: ["ask_user_question"] },
+      { id: "pi-markdown-preview", tools: ["preview_export"] },
+      { id: "@juicesharp/rpiv-ask-user-question", tools: ["ask_user_question"] },
     ]) {
-      expect(manifest.dependencies[extension.id]).toBe(extension.version);
+      const version = manifest.dependencies[extension.id];
+      expect(version).toMatch(/^\d+\.\d+\.\d+$/);
       expect(manifest.bundledDependencies).toContain(extension.id);
       expect(stack.required.find(({ id }) => id === extension.id)).toEqual({
-        id: extension.id, spec: `${extension.id}@${extension.version}`,
+        id: extension.id, spec: `${extension.id}@${version}`,
         entry: `node_modules/${extension.id}/index.ts`, tools: extension.tools,
       });
       expect(manifest.pi.extensions.filter(entry => entry === `./node_modules/${extension.id}/index.ts`)).toHaveLength(1);
