@@ -53,6 +53,28 @@ tests its installed registration boundary, not upstream source compilation or
 post-edit/server compatibility. No dependency patch or compatibility cast is
 applied.
 
+## Previews and questions
+
+Pitako loads these upstream entries directly in ordinary sessions, not in the
+packaged child profiles:
+
+- `pi-markdown-preview` 0.25.0 provides `/preview`, `/preview-browser`,
+  `/preview-pdf`, and `preview_export`. Export writes artifacts, so the analysis
+  profile blocks the tool, including nested codemode calls.
+- `@juicesharp/rpiv-ask-user-question` 2.15.0 provides `ask_user_question` for
+  structured questions with options and custom answers. It remains available in
+  both coding and analysis profiles.
+
+Markdown preview requires Pandoc. Terminal previews and PNG export also require
+a Chromium-based browser. Terminal image display requires a compatible terminal.
+PDF export requires a LaTeX engine, and Mermaid diagrams in PDF require `mmdc`.
+Some browser assets load from jsDelivr or unpkg and need network access.
+Pitako does not install these programs.
+
+Markdown preview renders Mermaid in its previews and exports, independently of
+Pi's native inline renderer. No change to `markdown.mermaid` is required.
+Pitako does not change user settings.
+
 ## Package and session settings
 
 - `package.json` declares extensions, advertised skills, prompts, and pi-subagents

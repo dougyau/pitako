@@ -39,6 +39,8 @@ function loadProfileExtensions(pi: ExtensionAPI, codex: (pi: ExtensionAPI) => vo
     "./extensions/todo.ts", "./extensions/board/index.ts",
     "./node_modules/pi-subagents/bundle/index.js", "./extensions/acp.ts",
     "./node_modules/pi-hermes-memory/src/index.ts", "./node_modules/pi-web-access/dist/index.js",
+    "./node_modules/pi-markdown-preview/index.ts",
+    "./node_modules/@juicesharp/rpiv-ask-user-question/index.ts",
   ]);
   for (const entry of JSON.parse(readFileSync(path.join(packageRoot(), "package.json"), "utf8")).pi.extensions) {
     if (excluded.has(entry)) continue;
@@ -59,7 +61,7 @@ function profileHarness(profileFlag?: string, external?: () => Promise<void>) {
     "read", "bash", "edit", "write", "apply_patch", "grep", "find", "ls",
     "lsp_diagnostics", "lsp_rename", "codegraph_search", "lsp_symbols",
     "web_search", "fetch_content", "source_check", "get_search_content", "web_enable",
-    "todo",
+    "todo", "ask_user_question", "preview_export",
   ];
   const context = {
     cwd: packageRoot(),
@@ -239,7 +241,8 @@ describe("Pitako resources and policy", () => {
           expect(prompt).toContain(text);
         for (const name of ["read", "grep", "bash", "lsp_diagnostics", "codegraph_search",
           "lsp_symbols", "todo", "web_search", "fetch_content", "source_check",
-          "get_search_content", "web_enable"]) expect(host.active).toContain(name);
+          "get_search_content", "web_enable", "ask_user_question"]) expect(host.active).toContain(name);
+        expect(host.active.includes("preview_export")).toBe(profile === "coding");
         for (const name of ["edit", "write"]) expect(host.active.includes(name)).toBe(profile === "coding");
         expect(host.active).not.toContain("apply_patch");
       } finally { await host.shutdown(); }

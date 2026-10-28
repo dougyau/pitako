@@ -40,7 +40,7 @@ Do not install those entries a second time as separate Pitako resources.
 ## Use the coding baseline
 
 `coding` is the default profile. `/pitako profile analysis` disables `edit`,
-`write`, `apply_patch`, `lsp_rename`, hash saving, and introduced Git/SSH/Python/Cargo
+`write`, `apply_patch`, `lsp_rename`, hash saving, preview export, and introduced Git/SSH/Python/Cargo
 mutators, including nested codemode calls. Shell remains available, so analysis
 is not a sandbox. `--pitako-profile` takes precedence over `PITAKO_PROFILE`.
 
@@ -52,6 +52,11 @@ upstream `apply_patch` or shell.
 Use `/pitako` for profile and skill status, `/todos` for the session task list,
 and `/board` for shared topics. Board tools are pull-only. They do not inject
 posts into every turn.
+
+Pitako also bundles Markdown previews through `/preview` and structured questions
+through `ask_user_question`. See [preview settings](docs/configuration.md#previews-and-questions)
+for external prerequisites. Mermaid renders in previews independently of Pi's
+native inline renderer.
 
 Load specialized skills only when they apply. The default collection includes
 Ponytail, Caveman, investigation, architecture, review, verification, and
