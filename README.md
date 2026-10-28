@@ -37,6 +37,37 @@ For another project, install the package through Pi's package mechanism. The
 package manifest declares its extensions, skills, prompts, and agent profiles.
 Do not install those entries a second time as separate Pitako resources.
 
+## Update dependencies
+
+The [Update dependencies workflow](.github/workflows/update-dependencies.yml)
+runs every Monday at 05:17 UTC and supports manual runs from GitHub Actions.
+It updates npm runtime dependencies to exact versions, regenerates `bun.lock`,
+and synchronizes stack versions, existing dependency version notices, and
+`docs/dependency-releases.json` with exact-version npm release provenance.
+Pi host packages, development dependencies, the Git-pinned LSP dependency, and
+vendored skills stay unchanged.
+
+The workflow prepares the checkout and runs `bun run typecheck`, `bun run test`,
+and `git diff --check` before creating or updating one dependency PR.
+Dependency code runs in a read-only job. Only the separate PR job has write access.
+If the PR matches the verified candidate, the workflow requests squash auto-merge.
+Failed checks prevent publication and auto-merge. No changes means no new PR.
+
+Enable **Allow GitHub Actions to create and approve pull requests** under
+**Settings > Actions > General > Workflow permissions**.
+Also enable **Allow auto-merge** and **Allow squash merging** under
+**Settings > General > Pull Requests**.
+Branch protection requirements still apply; the workflow does not bypass them.
+PRs created with `GITHUB_TOKEN` do not trigger other GitHub Actions workflows.
+If branch rules require separate PR checks, configure their trigger or an
+appropriate bot token before expecting automatic merges.
+Passing Pitako's checks does not certify upstream compatibility or licenses.
+The workflow does not publish npm releases.
+
+After merging, `pi update --extensions` receives these versions when Pitako is
+installed from the updated Git branch. Pinned tags, pinned commits, npm installs,
+and local-path installs require their own release or checkout update.
+
 ## Use the coding baseline
 
 `coding` is the default profile. `/pitako profile analysis` disables `edit`,

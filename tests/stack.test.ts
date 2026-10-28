@@ -60,8 +60,19 @@ describe("stack configuration", () => {
     const lsp = stack.required.find(({ id }) => id === "pi-lsp-client");
     if (!lsp) throw new Error("pi-lsp-client is missing from the required stack");
     expect(manifest.dependencies["pi-lsp-client"]).toBe(lsp.spec);
-    expect(manifest.dependencies["@vndv/pi-codegraph"]).toBe("0.1.11");
-    expect(manifest.dependencies["@colbymchenry/codegraph"]).toBe("1.6.2");
+    expect(Object.keys(manifest.dependencies)).toEqual(expect.arrayContaining([
+      "@colbymchenry/codegraph", "@vndv/pi-codegraph", "@dietrichgebert/ponytail",
+      "@juicesharp/rpiv-todo", "billion-context-pi", "pi-codex-tools",
+      "pi-hermes-memory", "pi-lsp-client", "pi-subagents", "pi-web-access", "smol-toml",
+    ]));
+    for (const [id, version] of Object.entries(manifest.dependencies)) {
+      if (id !== "pi-lsp-client") expect(version).toMatch(/^\d+\.\d+\.\d+$/);
+    }
+    for (const extension of stack.required) {
+      const version = manifest.dependencies[extension.id];
+      if (version && extension.id !== "pi-lsp-client")
+        expect(extension.spec).toBe(`${extension.id}@${version}`);
+    }
     expect(stack.required.find(({ id }) => id === "@vndv/pi-codegraph")).toMatchObject({
       entry: "node_modules/@vndv/pi-codegraph/extensions/codegraph.ts",
       bin: "codegraph",
@@ -70,8 +81,6 @@ describe("stack configuration", () => {
     expect(manifest.pi.extensions.some((entry) => entry.includes("extensions/code-intelligence/"))).toBe(false);
     expect(manifest.dependencies["@ast-grep/napi"]).toBeUndefined();
     expect(manifest.bundledDependencies).not.toContain("@ast-grep/napi");
-    expect(manifest.dependencies["@dietrichgebert/ponytail"]).toBe("5.3.2");
-    expect(manifest.dependencies["@juicesharp/rpiv-todo"]).toBe("2.15.0");
     for (const name of ["@nredd/pi-dev-tools", "@nredd/pi-resource-sampler"]) {
       expect(manifest.dependencies[name]).toBeUndefined();
       expect(manifest.bundledDependencies).not.toContain(name);
@@ -90,38 +99,36 @@ describe("stack configuration", () => {
       ],
     });
     expect(stack.required.find(({ id }) => id === "@juicesharp/rpiv-todo")).toEqual({
-      id: "@juicesharp/rpiv-todo", spec: "@juicesharp/rpiv-todo@2.15.0",
+      id: "@juicesharp/rpiv-todo", spec: `@juicesharp/rpiv-todo@${manifest.dependencies["@juicesharp/rpiv-todo"]}`,
       entry: "extensions/todo.ts", tools: ["todo"],
     });
     expect(stack.required.find(({ id }) => id === "pitako-file-sha256")).toEqual({
       id: "pitako-file-sha256", spec: "pitako", entry: "extensions/file-sha256.ts",
       tools: ["file_sha256", "file_sha256_save"],
     });
-    expect(manifest.dependencies["pi-hermes-memory"]).toBe("0.9.11");
     expect(manifest.bundledDependencies).toContain("pi-hermes-memory");
-    expect(manifest.dependencies["billion-context-pi"]).toBe("0.1.83");
     expect(manifest.bundledDependencies).toContain("billion-context-pi");
     expect(stack.required.find(({ id }) => id === "billion-context-pi")).toEqual({
-      id: "billion-context-pi", spec: "billion-context-pi@0.1.83", entry: "extensions/acp.ts",
+      id: "billion-context-pi", spec: `billion-context-pi@${manifest.dependencies["billion-context-pi"]}`, entry: "extensions/acp.ts",
       tools: ["compress", "search_context", "decompress", "acp_status", "acp_cache"],
     });
     expect(stack.required.findIndex(({ id }) => id === "billion-context-pi")).toBeLessThan(stack.required.findIndex(({ id }) => id === "pi-hermes-memory"));
     expect(stack.required.find(({ id }) => id === "pi-hermes-memory")).toEqual({
       id: "pi-hermes-memory",
-      spec: "pi-hermes-memory@0.9.11",
+      spec: `pi-hermes-memory@${manifest.dependencies["pi-hermes-memory"]}`,
       entry: "node_modules/pi-hermes-memory/src/index.ts",
       tools: ["memory_add", "memory_replace", "memory_remove", "memory_search", "session_search", "skill_manage"],
     });
-    expect(manifest.dependencies["pi-web-access"]).toBe("0.45.0");
     expect(manifest.bundledDependencies).toContain("pi-web-access");
     for (const extension of [
-      { id: "pi-markdown-preview", version: "0.25.0", tools: ["preview_export"] },
-      { id: "@juicesharp/rpiv-ask-user-question", version: "2.15.0", tools: ["ask_user_question"] },
+      { id: "pi-markdown-preview", tools: ["preview_export"] },
+      { id: "@juicesharp/rpiv-ask-user-question", tools: ["ask_user_question"] },
     ]) {
-      expect(manifest.dependencies[extension.id]).toBe(extension.version);
+      const version = manifest.dependencies[extension.id];
+      expect(version).toMatch(/^\d+\.\d+\.\d+$/);
       expect(manifest.bundledDependencies).toContain(extension.id);
       expect(stack.required.find(({ id }) => id === extension.id)).toEqual({
-        id: extension.id, spec: `${extension.id}@${extension.version}`,
+        id: extension.id, spec: `${extension.id}@${version}`,
         entry: `node_modules/${extension.id}/index.ts`, tools: extension.tools,
       });
       expect(manifest.pi.extensions.filter(entry => entry === `./node_modules/${extension.id}/index.ts`)).toHaveLength(1);
@@ -129,15 +136,14 @@ describe("stack configuration", () => {
     }
     expect(stack.required.find(({ id }) => id === "pi-web-access")).toEqual({
       id: "pi-web-access",
-      spec: "pi-web-access@0.45.0",
+      spec: `pi-web-access@${manifest.dependencies["pi-web-access"]}`,
       entry: "node_modules/pi-web-access/dist/index.js",
       tools: ["web_search", "fetch_content", "source_check", "get_search_content", "web_enable"],
     });
     expect(stack.required.find(({ id }) => id === "pi-codex-tools")).toEqual({
-      id: "pi-codex-tools", spec: "pi-codex-tools@0.4.0",
+      id: "pi-codex-tools", spec: `pi-codex-tools@${manifest.dependencies["pi-codex-tools"]}`,
       entry: "node_modules/pi-codex-tools/index.ts", tools: ["apply_patch"],
     });
-    expect(manifest.dependencies["pi-codex-tools"]).toBe("0.4.0");
     expect(manifest.bundledDependencies).toContain("pi-codex-tools");
     expect(manifest.pi.skills).toContain("./node_modules/@dietrichgebert/ponytail/skills/ponytail");
     expect(manifest.pi.skills).not.toContain("./skills");

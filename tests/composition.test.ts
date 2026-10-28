@@ -376,7 +376,7 @@ describe("engineering-layer composition", () => {
   test("ordinary delegation ships directly without the Pitako runtime", () => {
     const manifest = JSON.parse(readRepo("package.json"));
     const stack = JSON.parse(readRepo("config/stack.json"));
-    expect(manifest.dependencies["pi-subagents"]).toBe("0.83.0");
+    expect(manifest.dependencies["pi-subagents"]).toMatch(/^\d+\.\d+\.\d+$/);
     expect(manifest.bundledDependencies).toContain("pi-subagents");
     const piPackages = new Set([...Object.keys(manifest.devDependencies), ...Object.keys(manifest.peerDependencies)]);
     for (const name of piPackages) {
@@ -387,7 +387,7 @@ describe("engineering-layer composition", () => {
     expect(manifest.pi.extensions.filter((entry: string) => entry.includes("pi-subagents")))
       .toEqual(["./node_modules/pi-subagents/bundle/index.js"]);
     expect(stack.required.find((entry: { id: string }) => entry.id === "pi-subagents"))
-      .toEqual({ id: "pi-subagents", spec: "pi-subagents@0.83.0", entry: "node_modules/pi-subagents/bundle/index.js",
+      .toEqual({ id: "pi-subagents", spec: `pi-subagents@${manifest.dependencies["pi-subagents"]}`, entry: "node_modules/pi-subagents/bundle/index.js",
         tools: ["subagent", "subagents_enable", "bg_wait", "subagent_supervisor", "contact_supervisor"] });
     for (const resources of [manifest.pi.skills, manifest.pi.prompts])
       expect(resources.some((entry: string) => entry.includes("pi-subagents"))).toBe(false);
