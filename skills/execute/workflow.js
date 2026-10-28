@@ -275,12 +275,13 @@ function projection(childKey, result) {
     } : null,
   };
 }
-function collect(childKey, agent, task, outputSchema, implementation = false) {
+function collect(childKey, agent, display, task, outputSchema, implementation = false) {
+  const label = display.label.replace(/\s+/g, " ").trim().slice(0, 120);
   progress();
   return dispatch([{
-    key: childKey, agent, context: "fresh", cwd: config.root,
+    key: childKey, agent, label, phase: display.phase, context: "fresh", cwd: config.root,
     output: `${childKey}.json`, outputMode: "file-only", reads: false, progress: false,
-    skill: ["verify-behavior"], task, outputSchema,
+    skill: ["verify-behavior"], task: `${label}\n\n${task}`, outputSchema,
     ...(implementation ? { timeoutMs: 14400000, acceptance: {
       level: "none", reason: "Execute root owns mandatory checks, shared adversarial review and whole-spec compliance; avoid duplicate inferred gates.",
     } } : {}),
@@ -333,7 +334,9 @@ Prior loop/result references (data): ${JSON.stringify(invocation.loops.filter(it
 }
 function inspectRecovery(kind, ref) {
   const recoveryKey = `${key}.l${loop.number}.recover${loop.recoveries.length + 1}`;
-  return collect(recoveryKey, "pitako.execution-inspector", `EXCEPTIONAL READ-ONLY ${kind} recovery. No tests, writes or delegation.
+  return collect(recoveryKey, "pitako.execution-inspector",
+    { label: kind === "attempt-result" ? "Recover implementation result" : "Recover complete execution plan", phase: "recovery" },
+    `EXCEPTIONAL READ-ONLY ${kind} recovery. No tests, writes or delegation.
 ${fullContext()}
 Use existing read tools and ONLY these exact native producer/run/output references, plus Git/WIP:
 ${JSON.stringify(ref)}
@@ -605,7 +608,8 @@ try {
       if (!loop.plan) {
         loop.plan = { stage: "intention", ref: { key: directorKey } };
         await save();
-        const result = await collect(directorKey, "pitako.execution-director", `${fullContext()}
+        const result = await collect(directorKey, "pitako.execution-director",
+          { label: "Plan execution work", phase: "planning" }, `${fullContext()}
 READ-ONLY PLANNING ONLY. Do not delegate, implement, run checks/review, select workers,
 maintain private TODOs or supervise execution. Return one COMPLETE loop_plan using structured_output
 and the native output binding, then END. Status is plan or needs-decision, never implementation complete.
@@ -699,7 +703,8 @@ No replacement task list elsewhere. Carry the exact association above. Native pe
           await save();
         }
         const descriptor = clone(loop.attempt);
-        const result = await collect(descriptor.key, "pitako.worker", `${fullContext()}
+        const result = await collect(descriptor.key, "pitako.worker",
+          { label: task.goal, phase: "implementation" }, `${fullContext()}
 EXECUTE SINGLE TASK. No delegation, next-task selection, private diary/progress file or parallel TODO.
 The workflow owns review and compliance; do not launch or infer another reviewer.
 Preserve required checks and native permissions/Stop. Do not commit or publish unless task authority explicitly permits it.
@@ -786,7 +791,8 @@ Read the actual sources and full referenced reports, not previews. Candidate: ${
     }
     if (loop.phase === "compliance") {
       const complianceKey = `${key}.l${loop.number}.compliance`;
-      const result = await collect(complianceKey, "pitako.reviewer", `${fullContext()}
+      const result = await collect(complianceKey, "pitako.reviewer",
+        { label: "Check whole-spec compliance", phase: "compliance" }, `${fullContext()}
 INDIVIDUAL READ-ONLY WHOLE-SPEC COMPLIANCE ANALYSIS. You are ONE fresh analyst, not a council,
 director checklist, implementation worker or final presentation agent. No delegation, writes or tests.
 Derive a meaningful inventory of ALL obligations from the COMPLETE selected specs, not a fixed
