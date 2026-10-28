@@ -402,7 +402,6 @@ describe("engineering-layer composition", () => {
     for (const skill of ["plan", "execute", "grilling"]) expect(manifest.pi.skills).toContain(`./skills/${skill}`);
     expect(manifest.exports).toBeUndefined();
     expect(manifest.files).not.toContain("roles");
-    expect(manifest.dependencies["smol-toml"]).toBeUndefined();
   });
 
   test("review documentation ships through existing package resources", () => {

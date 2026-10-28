@@ -18,6 +18,21 @@ initialization. CodeGraph tools use an existing index and do not initialize or
 refresh it themselves. If CodeGraph or an LSP server is unavailable, use the
 ordinary read and search tools. See [verification](GATES.md) for the test procedure.
 
+### Herdr worktrees
+
+[`.herdr/worktree.toml`](.herdr/worktree.toml) configures Herdr UI to run
+`bash scripts/setup-worktree.sh` in new worktrees. Unlike basic setup, this
+script requires a current CodeGraph index and reports preparation failures.
+Herdr owns script execution and asks for human trust approval.
+
+When `HERDR_ENV=1`, Pitako checks the current checkout at interactive session
+startup. If `scripts/setup-worktree.sh` exists but the recommended Herdr setup
+entry is missing or different, it suggests the configuration once per session.
+Custom setup is not assumed incorrect. Pitako does not edit files, execute setup,
+or approve trust. Non-UI sessions and pi-subagents children do not show the notice.
+An existing entry does not prove that setup completed in this checkout, and this
+hook does not guarantee setup for worktrees created through Git or the daemon CLI.
+
 For another project, install the package through Pi's package mechanism. The
 package manifest declares its extensions, skills, prompts, and agent profiles.
 Do not install those entries a second time as separate Pitako resources.

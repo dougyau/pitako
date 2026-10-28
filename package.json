@@ -74,7 +74,8 @@
     "pi-hermes-memory": "0.9.11",
     "pi-lsp-client": "github:code-yeongyu/pi-lsp-client#9d029fb32b721c038b58fb418b98bbfcf720cf0a",
     "pi-subagents": "0.83.0",
-    "pi-web-access": "0.45.0"
+    "pi-web-access": "0.45.0",
+    "smol-toml": "1.9.1"
   },
   "bundledDependencies": [
     "@dietrichgebert/ponytail",
