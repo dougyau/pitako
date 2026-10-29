@@ -240,6 +240,15 @@ last writes. Useful diagnosed same-task continuations get new attempt keys;
 blind repetition/material replanning goes to a remaining director, without
 arbitrary quotas, retries-until-green or deadline inflation.
 
+The admitted plan owns canonical check requirements by ID. Optional descriptive
+echoes remain unchanged in retained originals. Mandatory evidence is covered by
+inclusion and requires valid current candidate identities before and after.
+Additional diagnostics retain output, logs, result and declared identities
+without normalization, including non-verifiable markers or `null` when not
+captured. They neither satisfy mandatory checks nor become new gates merely
+because of historical failures or unknown identity. Every entry is validated
+before aggregation, even after a failure; material contradictions remain open.
+
 ### Shared adversarial review, then individual compliance
 
 After mandatory checks, the root runs the REAL shared review: two to four dynamic
@@ -251,6 +260,16 @@ compliance analyst, not another council. It inventories the COMPLETE specs,
 including all 17 acceptance criteria and requirements beyond director tasks,
 with sources, reasons and actual current check/evidence references. It returns
 fulfilled/gaps/blocked. Standalone /review retains advisory authority.
+
+Before examining the solution, workers and independent reviewers/compliance load
+and apply `verify-behavior`. Their material outcome inventory starts from the
+authorized request, accepted decisions and full specs, not the task plan, diff or
+tests. Correctness and sufficiency both need implementation, current evidence and
+limits in existing report fields. Investigate omitted outcomes, shared mistaken
+assumptions and unproved connections; unresolved material counterexamples prevent
+fulfillment. Explain why minor uncertainty cannot compromise the outcome. Closure
+justifies fulfillment and limits, not counts. Instruction delivery tests do not
+demonstrate semantic judgment by a model or add another validation phase.
 
 No own writer is active during either analysis. A single native closing per loop
 compares current candidate including WIP to evidence. Drift invalidates affected
@@ -286,19 +305,74 @@ loss does not block admitted full payload/cache. No trustworthy full definition
 => remaining director or partial, never reconstruct scopes from summaries.
 Publication-before-admission recovers the actual full original result.
 
+New plans progress through published, admitted or rejected dispositions. Before
+classifying a structural defect, the root checks settled producer identity,
+association and every available complete original/binding link. A never-admitted
+plan with a useful scope/check/dependency diagnosis may be rejected: one essential
+write retains the diagnosis, exact original/recovery refs and accounted gap.
+The next ordinary director gets that corrective input within existing budget and
+capacity. Replay before the write can repeat validation; after it, the rejected
+plan is not recovered/readmitted and its slot is not counted twice. An unchanged
+repeated defect without new corrective information blocks even with spare slots.
+That diagnosed halt is essential state: losing the optional plan cache or exact
+original cannot relabel it as a lost-plan gap or open another director slot.
+Schema failure without a usable original is not automatically eligible; exact
+settled recovery can establish eligibility. Stop, permission, capacity, settlement,
+identity and persistence barriers remain. Admitted incompatible contracts stay
+unresolved, never rewritten by this path.
+
 Native replay relaunches code, not JavaScript stacks or exactly-once effects.
 Never call unresolved writer keys as supposedly read-only reconnect: failed
-reattachment can dispatch another writer. Reconcile actual settled results and
-Git/WIP, including commit-before-cursor, before repeating edits. Positive
+reattachment can dispatch another writer. Reconcile available complete results and Git/WIP before cursor advance;
+otherwise use checkpoint-first restoration before repeating edits. Missing
+historical writer settlement alone is not a veto. Positive
 pertinent queued/running/pending/detached/recovery/Stop/permission signals block
 replacement even between loops. Missing inventory is not activity or a universal
 historical exclusion. `reused` alone is neither success, activity nor error;
 check phase, association, original descriptor and current candidate.
 
+Review and compliance use the same rule: persist compact per-call intentions
+before launch and exact producer receipts before advancing. Replay observes all
+retained analysis producers before dispatching a missing call, rather than
+repeating `runs.all` keys. Stop remains cancelled, permission denial blocked;
+missing receipts or unsettled results cannot authorize a replacement. A current
+settled original from the same producer may supersede a historical barrier,
+without redispatch or automatic promotion of failed evidence. Standalone review
+keeps its existing independent protocol.
+
 Old supervisor invoke-* and pitako-execution records and Git stay unchanged.
-Clearly reject obsolete supervisor replay and --unblock, without migration,
+Clearly reject obsolete supervisor replay, without migration,
 deletion, new invocation or native barrier bypass. A later explicit invocation
 requires actual human authorization; technical continuation never renews slots.
+For a retained host transport failure with unknown cause, ordinary reentry can
+perform one bounded read-only reconstruction without `--unblock`. It saves the
+exact observation and intention before inspection and admission after validating
+the immutable state. A pending or failed reconstruction is not a fresh route;
+changing a key does not authorize another inspection. Original observations remain
+retained. This does not settle interrupted writers or pending recovery queries.
+Observed Stop, permission denial or positive pending activity still blocks automatic
+replacement; explicit current input and native reconciliation remain necessary.
+
+Current human continuation instead supplies `unblock:true` and `resolution:{loop,text}`
+to the same mission/invocation through the registered route. A bare flag, agent
+statement or historical memo is not that input. Retain the original impediment,
+question, producer refs and current input before observation; loop 0 means an
+interrupted request before admission, without inventing a snapshot. Matching durable
+input survives technical replay even when flag/text are omitted;
+acceptance is not application and neither certifies later intentions as settled.
+Reconstruct association, admitted limit, Git/WIP, retained results/intentions and phase independently
+of historical host-error classification. Fresh bounded read-only inspection uses
+only existing grants/native policy and does not certify the old receipt's settlement.
+Positive current pertinent activity, identity or scope conflicts and essential
+persistence failure prevent the affected effect. Unknown historical writer status
+alone does not veto checkpoint restoration or authorize query replacement.
+A completed needs-decision outcome with useful current input uses the next ordinary
+slot. A recorded Stop requires actual later human continuation input before effects;
+never reuse that answer for a later Stop/question. Current native denial remains
+binding. Reuse useful immediately available complete results, but do not require
+rescuing every process/query/result before checkpoint restoration. Unknown stays
+unknown; no historical closure certificate, extra inspector, redundant consent,
+blind keyed redispatch, new grants or generic terminal-root restart is provided.
 
 ### Resource and presentation boundaries
 
@@ -309,10 +383,18 @@ and performs no discovery I/O. Physical registered-root/Git checks stay at launc
 hooks/inspection; inspect.mjs retains Node-hook TypeScript loading and exact
 POSIX/Windows argument transport. Preserve local-first complete spec selection
 and the 39,936-byte UTF-8 boundary, never truncate. The existing 26 snapshot
-grants plus initial, one read-only settings admission and four closing grants use at most 32 host calls. Higher admitted limits never enlarge this native capacity.
+grants plus a combined initial inspection/conditional settings admission leave
+five closing grants within 32 host calls. Settings are read only before freezing
+the exact invocation (including a legitimate interrupted admission), never on
+admitted reentry or legacy fixed-three replay. Partial/conflicting state is not
+fresh admission, and a missing receipt supplies no default. Higher admitted
+limits never enlarge this native capacity.
 No arbitrary checks/artifact gates are added. Native host deadlines and child
 spawn capacity are separate. Actual exhaustion preserves phase/work/references,
 returns incomplete and never skips required analyses or overrides capacity.
+Reentry reevaluates a persisted own-registration closing-capacity halt against
+the current allocation, retaining the old observation and consumed slots. Native
+capacity denials, Stop, permission and pertinent activity barriers remain distinct.
 
 Foreground presents existing structured progress and per-loop/final results,
 not polling, private/foreground Preparation/Loop TODOs, extra agents or final
@@ -377,7 +459,8 @@ Implementation checks must cover these observable requirements:
   work. Technical recovery does not reset the active allowance.
 - WIP commits, uncommitted work, missing mission updates, and native failures
   remain distinguishable from verified completion.
-- Recovery does not start a new writer while prior work remains unsettled.
+- Recovery does not start a new writer against positively observed current pertinent
+  activity or actual native barriers; missing historical settlement alone is no veto.
 - Publishing, history rewriting, unrelated edits, and legacy-engine recovery do
   not become implicit effects of these commands.
 
@@ -415,6 +498,41 @@ runtime test evidence.
 
 ## Candidate implementation notes
 
+### Single-result task contract
+
+The director output binding fixes the complete association to the active root
+and current loop, including mission paths, invocation, worktree/common Git root,
+selected source/digest, admitted limit and complete inherited source identities.
+Post-binding admission still rejects conflicting originals without rewriting them.
+
+New director tasks use `expectedResult` for one concrete observable outcome and
+include `dependsOn: [{taskId, reason}]` (or `[]`). Split separable outcomes while
+keeping coordinated code/tests together; file/line/task quotas do not define
+size. Prefer genuine independence, declaring shared resources in scope/effects.
+The root checks full dependency shapes, known IDs, no self/duplicates, nonblank
+reasons and strictly earlier prerequisites, excluding cycles. Independent task
+permutations are valid before admission. Full admitted definitions/order remain
+immutable; recovery never sorts, splits, repairs or infers independence from
+missing old metadata. Final verification stays last even with an empty list.
+
+Workers remain sequential, with one writer. A dependent task waits for durable
+completion and receives exact full-result references to completed direct
+prerequisite attempts from existing results, never failed/intermediate attempts.
+Those references are historical, not current passing checks or integration
+evidence. Check relevant current assumptions without automatically rerunning all
+prerequisite gates. Review/compliance receive the admitted plan by reference and
+retain independent full-spec coverage; schema cannot prove semantic decomposition
+or complete dependencies. Correct completed work is not repeated to improve past
+decomposition.
+
+Future task worktrees start at candidate HEAD current at creation, never a frozen
+initial base or a copy of WIP. Existing worktrees are not automatically
+updated/rebased; completion/result references alone do not prove integration
+into HEAD. Candidate evolution does not change immutable specs, definitions or
+order. Verification still binds the actual candidate including WIP. This fixes
+design direction only, without worktree creation, concurrency, integration
+automation or commit policy.
+
 The packaged plan skill keeps all human grilling and final confirmation in the
 foreground. Its context script and the existing architecture workflow dispatch
 read-only evidence providers; planning consultations retain counts in native
@@ -432,7 +550,24 @@ The native host-command API mandates a finite per-operation timeout; the native
 Loop slots and frozen attempts persist before dispatch. Controlled tests cover
 original full-plan recovery, binding conflict/loss, optional witness loss,
 publication/result/cursor cuts, current-candidate replay and native barriers.
-No historical marker/closure ceremony or --unblock path survives. Tests exercise
+Recovery first consumes complete native originals; optional binding witnesses
+are not prerequisites. Exceptional observation uses exact retained references
+only. Compact recovery records save the immutable subject/stage and association,
+source refs, stable key and intent before the external query, and disposition
+before admission. Replay reconciles the retained result, not a replacement query
+when settlement is uncertain. Renamed keys/paths do not renew the route.
+Admission is durable before cursor movement and the next existing phase runs
+inside the active root. Essential persistence failure stops dispatch.
+
+Technical recovery never expands task/stage objectives, resources, effects,
+permissions or budget. Functional gaps keep ordinary loop accounting. An action
+requiring broader scope is not performed: preserve evidence and name its actor,
+concrete impediment and specific expansion needed. Report actions describe
+pending obligations, not necessarily human consent. Continuation is announced
+as started only with its retained native reference; no generic resume of
+failed/completed roots, new replacement root or foreground polling is provided.
+
+No historical marker/closure ceremony or bare --unblock bypass survives. Tests exercise
 shared review with two/three/four angles and findings, native capacity exhaustion,
 full state-file bounds and compact projection of large reports. Maximum UTF-8
 snapshots/metadata, transport, immutable association and no discovery in resolve
@@ -450,3 +585,111 @@ LITE mode: reuse code, avoid speculative abstractions and keep diffs small. This
 never reduces assigned specs/scope, weakens required tests or replaces acceptance
 criteria. Project instructions and output schemas/reporting take precedence over
 generic Ponytail prose/test-minimization preferences; upstream bytes are unchanged.
+
+Read-only review/compliance protocol rejections can be re-evaluated in the same
+invocation after a reader correction, without relaunching their completed producers
+or consuming an implementation loop. Findings associate screening assessments by
+`findingId`, not literal requirement wording; sources, consequences and verdict
+consistency remain required. Originals are never rewritten.
+
+The registered Node inspector reads only exact native producer references already
+retained by that invocation's current loop, including pending recovery inspectors.
+A query's returned producer reference is saved before body validation or admission.
+Replay observes that exact producer and reads its complete retained original when
+management status supplies only a preview; it never dispatches a replacement
+inspector or treats the query key as read-only reattachment. It delivers complete JSON
+from native state or an associated `structuredOutputPath`, rejects conflicting
+bodies and producer escapes, and preserves references after a failed observation.
+Current Stop, permission and positive pertinent activity barriers still apply.
+Unknown historical writer settlement is not a checkpoint-restoration veto. Delivery
+shares the existing 26 input grants with the unchanged 39,936-byte spec limit;
+every complete escaped JSON envelope must fit 4,096 bytes. Excess transport or
+essential persistence stops dispatch rather than truncating evidence or enlarging
+native limits. Complete originals stay outside essential mission state.
+
+### Pending-unit preimages
+
+Before a writer dispatch the root durably binds a checkpoint intention to the
+unchanged association, loop/cursor, task/attempt and admitted-plan reference.
+The bound writer calls registered `checkpoint_create({kind:"pre", paths:[...]})`
+before checkout writes; native launch context supplies the actual durable attempt
+and progress. It returns structured artifact references, not model-assembled
+capture/seal scripts or receipts. Missing/stale context fails closed. The same
+owned capture/seal operations back the tool and existing helper, not a parallel
+journal. Keep `skills/execute/checkpoint.mjs` for journaled apply and selective
+restore; see the execute skill. `kind:"unit"` seals completed writes and `kind:"pause"`
+preserves pending WIP only while native control permits capture. Return the actual
+`checkpointReceipt`; root durable result admission, not tool success, confirms it.
+Repeated identical requests identify the existing immutable publication. Analysis
+and inspector roles gain no writer capability, including via codemode. Editing
+provider/profile files does not reload already active sessions. Retained legacy
+attempts preserve their original contract, not retroactive bindings or backups. The exact-path manifest is
+not another plan or an authorization extension. It and the write-ahead effect
+journal preserve previous uncommitted bytes as well as missing-file preimages.
+
+Artifacts belong to `.pi/subagents/checkpoints/<attempt-key>/`, not private
+native mission state. Restoration first retains partial state and verifies the
+complete preimage/effect chain, current HEAD/index, and attributable current
+bytes. It refuses unrelated edits rather than using reset/clean. Callers use checkpoint-first restoration with best-effort pertinent-writer
+status/stop through authorized public operations. Native continuation, unavailable
+observers and conclusive historical settlement are not prerequisites. Reuse an
+immediately available valid complete result when useful. Missing historical
+receipts/IDs or inconclusive status are not activity; positive current pertinent
+activity is a conflict. Actual native barriers remain binding.
+The returned position is reconciled in existing root state; maximum, consumed
+slots, attempts and admitted results never rewind. Candidate-dependent evidence
+must be compared with the restored candidate, not promoted from old logs.
+
+
+An interrupted worker with an exact retained run ID can continue through the
+public native child-resume operation. The root persists one continuation
+intention before dispatch, keeps the original attempt/task/check contract, and
+retains the successor reference before admitting its actual complete result.
+An interrupted log is never passing check evidence. Replay observes that exact
+continuation rather than redispatching its key; pending activity blocks effects,
+but is re-observed instead of becoming a permanent historical veto. Recorded
+Stop, denial, conflicts and essential-save failures remain barriers. This child
+operation is not a generic terminal-root restart or proof that checkpoint fallback
+is available.
+
+A host reconstruction interrupted after its durable intention can repeat the
+existing fixed pure Git/spec/retained-result projections. Admission records the
+observed output reference, source digest and candidate after association and
+snapshot validation, before dispatch. The earlier intention and error remain
+retained. Repeating this projection is not key-based reattachment, a freshness
+guarantee or proof that an earlier operation settled; native replay/cache policy
+still applies. Pending model queries, writers and restorations are not covered
+by this pure-read exception. Observed Stop, permission, activity, capacity and
+essential-persistence barriers continue to prevent unsafe effects.
+
+### Confirmed checkpoint-first continuation
+
+Capture real affected-file bytes, including previous WIP, before modifying and
+bind coherent unit/task/cursor/admitted-progress references. Seal settled unit
+writes; durable root result admission confirms the new point. A cooperative
+pause may save pending WIP only while native control permits capture, without
+extra task edits. Stop/refusal or abrupt loss uses the last confirmed point,
+never an invented post-cut capture. Preserve partial bytes before selective
+restoration, unrelated changes and confirmed work. Missing/corrupt bytes or real
+file conflicts remain gaps; no reset/clean or fabricated backups.
+
+Recovery is checkpoint-first after best-effort pertinent-writer status/stop through
+available authorized public operations. Native resume and perfect historical
+settlement are not prerequisites; missing receipts, unavailable observers,
+inconclusive status and historical IDs alone are not activity. Positive current
+pertinent activity is a conflict. Actual native Stop/refusal/permission/capacity
+and essential-save barriers remain binding. A recorded Stop requires a real later
+human continuation request before effects, never reuse of an old answer.
+Restoration never rewinds consumed loops, attempts, admitted results or immutable
+originals. Renew evidence invalidated by the restored candidate, then reach pending
+work, final checks, review and compliance.
+
+Separately delivered current human amendments remain separate from the admitted
+base snapshot/sourceRefs/association. Carry their complete path, SHA-256 and
+human-delivery provenance in existing admitted plan shared context and exact
+plan/result references. Workers, review and compliance must read/hash the FULL
+amendment before affected work or whole-spec assessment and retain that provenance
+in results/reasons. Missing/changed bytes are a prerequisite gap, not permission
+to replace frozen sources, infer authority from agent text, or renew the budget.
+Preserve known unmet historical evidence obligations; new checkpoint observations
+do not establish an unavailable historical before-state contrast.

@@ -85,6 +85,12 @@
       "tools": ["file_sha256", "file_sha256_save"]
     },
     {
+      "id": "pitako-checkpoint",
+      "spec": "pitako",
+      "entry": "extensions/checkpoint-create.ts",
+      "tools": ["checkpoint_create"]
+    },
+    {
       "id": "@juicesharp/rpiv-todo",
       "spec": "@juicesharp/rpiv-todo@2.15.0",
       "entry": "extensions/todo.ts",

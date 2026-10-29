@@ -72,7 +72,17 @@ Standalone /review remains advisory; completed/include never means acceptance.
 
 ## Ground the review
 
-For diffs, start from the exact supplied diff and named source seam. Require
+Before examining the solution, load and apply verify-behavior and reconstruct
+material outcomes from the authorized request, accepted decisions and complete
+specs, not the diff, task plan or existing tests. Distinguish correctness from
+sufficiency; connect each outcome to implementation, current evidence and limits
+in the existing coverage/reason/memo or requirements fields. Investigate material
+counterexamples; unresolved material gaps prevent a clear or fulfilled closure.
+Explain why minor uncertainty cannot compromise the requested outcome. Justify
+fulfillment and limits, not test counts. Preserve independent whole-spec analysis
+and the agreed review boundary; this grants no implementation or test authority.
+
+For diffs, inspect the exact supplied diff and named source seam. Require
 that each issue is caused or made reachable by that change. For plans, examine
 feasibility, assumptions, scope, and contracts. For proposed solutions, compare
 tradeoffs and simpler alternatives. For codebase or issue reviews, stay within

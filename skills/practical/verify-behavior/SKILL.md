@@ -1,12 +1,43 @@
 ---
 name: verify-behavior
-description: "Select checks by observable behavior, review test quality in an agreed diff, or simplify existing tests within explicitly authorized scope. Use for verification, review-diff, or simplify-tests."
+description: "Verify correctness and sufficiency of the whole authorized assignment before claiming completion; select behavioral evidence, review test quality, or simplify tests within authorized scope."
 ---
 
 # Verify behavior
 
 Choose evidence by behavior, not by function or test count. This skill does not
 expand the task, edit permissions, or authority.
+
+## Verify the assignment before the solution
+
+Before examining the solution, reconstruct the material expected outcomes from
+the authorized request, accepted decisions, and complete available specs. Do not
+derive this inventory from the diff, director tasks, or existing tests: the plan
+itself may omit an obligation. Surface known contradictions without expanding
+scope or changing admitted snapshots.
+
+Distinguish correctness (does what was built work?) from sufficiency (does it
+resolve the whole assignment?). For each material outcome, identify its
+implementation, current evidence, and what remains unproved in the existing
+report fields. Explain why the evidence demonstrates the required behavior and
+its limits; citing a related test is not enough.
+
+Before claiming completion, try to refute it with reasonable in-scope scenarios:
+omitted requirements, mistaken assumptions shared by code and tests, unproved
+connections between tested pieces, and green tests despite an unmet outcome.
+Investigate material counterexamples using sources and evidence; a plausible
+explanation does not refute them, and unsupported suspicion is not automatically
+a blocker. Missing material evidence remains a gap or barrier under the existing
+categories. A minor uncertainty need not block when you explain why it cannot
+compromise the requested outcome; calling it minor is not that explanation.
+
+Completion requires fulfilled and sufficiently demonstrated material outcomes,
+current mandatory checks, and no unresolved material counterexamples. Justify
+fulfillment and evidence limits in the existing final report, not a new template
+or registry. Test counts, completed tasks, and clean reviews alone are not proof.
+This reduces premature closure; it does not promise absence of all defects.
+Keep independent review independent of the task plan. This standard adds no
+agent, phase, gate, model, loop, repair authority, or dependency certification.
 
 ## Choose the mode and scope
 

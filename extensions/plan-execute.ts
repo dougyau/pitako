@@ -14,6 +14,14 @@ function inspectionCommand(args: string[], platform: NodeJS.Platform): string {
 function isMissionId(value: unknown): value is string {
   return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value) && !value.includes("..");
 }
+function validateResolution(args: Readonly<Record<string, unknown>>): void {
+  if (args.unblock === undefined && args.resolution === undefined) return;
+  const value = args.resolution as { loop?: unknown; text?: unknown } | undefined;
+  if (args.unblock !== true || !value || Object.keys(value).sort().join(",") !== "loop,text" ||
+      !Number.isSafeInteger(value.loop) || (value.loop as number) < 0 ||
+      typeof value.text !== "string" || !value.text.trim() || value.text.includes("\0"))
+    throw new Error("--unblock requires current human resolution: {loop, text}; loop 0 denotes a pre-admission request.");
+}
 export function executionResource(platform: NodeJS.Platform = process.platform) {
   // Pi resolves a relative agent dir in the host, not the designated child's cwd.
   const agentDir = path.resolve(getAgentDir());
@@ -22,8 +30,8 @@ export function executionResource(platform: NodeJS.Platform = process.platform) 
   const reviewScript = readFileSync(path.join(packageRoot(), "skills/review/workflow.js"), "utf8");
   const inspectorEntry = path.join(packageRoot(), "skills/execute/inspect.mjs");
   return { name: "pitako.execute", version: 1, resolve(args: Readonly<Record<string, unknown>>) {
-    if (args.unblock !== undefined) throw new Error("Obsolete --unblock is unsupported; historical records remain unchanged.");
-    if (Object.keys(args).some(key => !["id", "root", "source", "sourceRefs", "invocation", "missionId", "missionPath"].includes(key))) throw new Error("Unknown execution argument.");
+    validateResolution(args);
+    if (Object.keys(args).some(key => !["id", "root", "source", "sourceRefs", "invocation", "missionId", "missionPath", "unblock", "resolution"].includes(key))) throw new Error("Unknown execution argument.");
     if (!isMissionId(args.missionId)) throw new Error("Expected an existing native missionId data pointer.");
     if (typeof args.missionPath !== "string" || !path.isAbsolute(args.missionPath) || args.missionPath.includes("\0"))
       throw new Error("Expected the actual absolute missionPath returned by native mission.create or mission.show.");
@@ -39,13 +47,24 @@ export function executionResource(platform: NodeJS.Platform = process.platform) 
       typeof ref.path !== "string" || !path.isAbsolute(ref.path) || ref.path.includes("\0") ||
       !/^[a-f0-9]{64}$/.test(ref.digest)))
       throw new Error("Expected at most two complete spec sourceRefs with absolute path and SHA-256 digest.");
-    const command = inspectionCommand([inspectorEntry, root, args.id, args.source ?? ""], platform);
-    const chunks = Array.from({ length: 26 }, (_, index) => ({ key: `input-${index}`, command: `${command} ${index}` }));
-    const inspections = ["initial", "loop-1", "loop-2", "loop-3", "loop-4"].map(phase => ({ key: `inspect-${phase}`, command: `${command} metadata` }));
-    const settings = { key: "execute-settings", command: inspectionCommand([inspectorEntry, root, args.id, args.source ?? "", "settings", JSON.stringify(sourceRefs), agentDir], platform) };
-    const config = { root, id: args.id, invocation: args.invocation, missionId: args.missionId, missionPath: args.missionPath, sourceRefs, settings, inspections, chunks };
+    const context = { missionId: args.missionId, missionPath: args.missionPath, invocation: args.invocation, sourceRefs };
+    const input = [inspectorEntry, root, args.id, args.source ?? ""];
+    const command = (part: string, initial = false) => inspectionCommand([
+      ...input, part, JSON.stringify({ ...context, admissionTransport: true,
+        ...(initial ? { admission: { sourceRefs, agentDir } } : {}) }),
+    ], platform);
+    const chunks = Array.from({ length: 26 }, (_, index) => ({ key: `input-${index}`, command: command(String(index)) }));
+    // The initial read includes settings only before this invocation is frozen.
+    // All remaining grants are required closing observations, not extra budget.
+    const closingCapacity = 32 - chunks.length - 1;
+    const inspections = ["initial", ...Array.from({ length: closingCapacity }, (_, index) => `loop-${index + 1}`)].map((phase, index) => ({
+      key: `inspect-${phase}`, command: command("metadata", index === 0),
+    }));
+    const config = { root, id: args.id, invocation: args.invocation, missionId: args.missionId, missionPath: args.missionPath, sourceRefs, inspections, chunks,
+      checkpointHelper: path.join(packageRoot(), "skills/execute/checkpoint.mjs"),
+      ...(args.unblock === true ? { unblock: true, resolution: args.resolution } : {}) };
     return { script: `const config = ${JSON.stringify(config)};\nconst pitakoReviewLibraryMode = true;\n${reviewScript}\n${rootScript}`,
-      hostCommands: [...inspections, ...chunks, settings] };
+      hostCommands: [...inspections, ...chunks] };
   } };
 }
 export default function planExecute(pi: ExtensionAPI): void {
@@ -54,8 +73,8 @@ export default function planExecute(pi: ExtensionAPI): void {
     const input = event.input as { workflow?: unknown; cwd?: unknown; args?: { missionId?: unknown; missionPath?: unknown; root?: unknown; unblock?: unknown }; options?: { missionId?: unknown; mission?: unknown } };
     if (typeof input.workflow !== "string" || input.workflow.trim() !== "pitako.execute") return;
     const options = input.options;
-    if (input.args?.unblock !== undefined)
-      return { block: true, reason: "Obsolete --unblock is unsupported; historical records remain unchanged." };
+    try { validateResolution(input.args ?? {}); }
+    catch (error) { return { block: true, reason: String(error instanceof Error ? error.message : error) }; }
     if (options?.mission !== undefined || !isMissionId(input.args?.missionId) || input.args.missionId !== options?.missionId)
       return { block: true, reason: "pitako.execute requires a mission already created via mission.create, with the same native missionId in args and options. One-step mission creation is unsupported; this is data association, not approval or confinement." };
     try {

@@ -10,7 +10,7 @@ export const ANALYSIS_BUILTINS = ["read", "bash", "grep", "find", "ls"] as const
 // Source behavior in pi-dev-tools 0.6.0, not its optimistic readOnlyHint annotations:
 // SSH executes/transfers; every Python/Cargo tool can execute code or write env/build/cache data.
 export const MUTATING_TOOLS = new Set([
-  "edit", "write", "apply_patch", "lsp_rename", "file_sha256_save",
+  "edit", "write", "apply_patch", "lsp_rename", "file_sha256_save", "checkpoint_create",
   "git_worktree_add", "git_worktree_remove", "git_worktree_prune", "git_commit",
   "ssh_exec", "ssh_pull", "ssh_push",
   "py_lint", "py_format", "py_typecheck", "py_test", "py_uv",
@@ -92,6 +92,7 @@ export function profileNote(profile: ProfileName): string {
     "Inspect the repo first. Keep read/grep/bash/LSP/CodeGraph available. For bounded structural code questions, choose a supported LSP or CodeGraph tool; use raw tools for literal, exhaustive or exact results; follow up with raw tools if a query/backend is partial or unavailable.",
     "Prefer covered deterministic Git/hash tools; bash/Python remain fallback. In codemode check ok. file_sha256 reads; writer file_sha256_save hashes/saves reusable items JSON once; check publication too. billion-context-pi ACP is mandatory; missing/refused ACP is a prerequisite failure, not success. native compaction stands down only while ACP operates.",
     "Keep diffs small. Reuse code; avoid speculation. Verify real behavior before claiming done. Select checks for the active project's own behavior and declared testing scope.",
+    "First load and apply verify-behavior.",
     "Load a specialized skill only when it applies. Research or design does not authorize implementation.",
     "Default to conversation or analysis. Describing a problem, proposing changes or asking a question does not authorize planning or implementation. Clear instructions can authorize work without magic words. A request for a new plan authorizes planning only, not implementation. A plan or available tools alone grants no implementation authority. Conversation does not revoke already authorized work; continue it within its captured scope.",
     "For authorized delegation, use pi-subagents. Pass scope, effects and checks explicitly. Analysis delegates must be read-only. If required tools are absent or fail, report the blocker.",

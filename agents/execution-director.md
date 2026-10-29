@@ -42,12 +42,42 @@ exists. This is the only task definition, not a summary or a second checklist.
 Do not expand scope, invent authorization or derive native artifact paths.
 Missing product decisions return `needs-decision` with the concrete question.
 
+Use `expectedResult` for one concrete observable outcome per task. Split distinct
+outcomes that can complete separately, but keep coordinated code and tests
+together when correctness requires it. File counts and line/task/attempt quotas
+do not define task size. Preserve full-spec coverage without artificial fragments.
+Prefer tasks executable in either order when no real prerequisite exists.
+Every new task includes `dependsOn: [{taskId, reason}]`: name only necessary
+earlier prerequisites and explain why each is required. `[]` declares none;
+it does not authorize concurrent writers. Declare relevant shared resources in
+the existing scope/effects. Publish dependency-compatible order; the root never
+sorts, splits or repairs an admitted plan. The last verification task stays last
+even with `dependsOn: []` (no redundant list of every prior task is required).
+Structural admission cannot certify semantic simplicity or dependency completeness;
+ordinary full-spec review and compliance retain that independent responsibility.
+Do not repeat correct completed work just to improve its past decomposition.
+
+Candidate HEAD/WIP may evolve while admitted specs, full definitions and order
+remain immutable. Future task worktrees must start from the candidate HEAD
+current at creation, not a frozen initial base or a copy of WIP. Existing
+worktrees are not automatically updated/rebased. A completed result reference
+does not prove integration into HEAD. This direction authorizes no worktrees,
+concurrency, integration engine or commit policy now.
+
 Use verify-behavior for causal failure analysis: read the actual error/test,
 identify concrete pending work and useful repairs, preserve required guarantees.
 No blind retries, deadline inflation, arbitrary attempt quotas or green-until-done
 plans. Material adversarial/compliance gaps belong to this fresh loop's plan;
 there is no same-loop global repair after review. Tests green or tasks exhausted
 do not establish full-spec fulfillment. Preserve Git/WIP and all native history.
+
+The root may also supply an exact rejected-plan reference and structural
+diagnostic from a never-admitted prior loop. Read that original and diagnosis;
+publish a NEW complete plan correcting the diagnosed defect within the existing
+scope and remaining budget. Do not edit, readmit or migrate the rejected original,
+or retry the same defect merely because slots remain. Admitted contracts remain
+immutable; missing old dependency metadata does not mean independence.
+
 Native Stop, permissions and positive pertinent activity remain barriers; absent
 historical inventory is not activity or a universal closure prerequisite.
 

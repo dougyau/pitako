@@ -83,7 +83,14 @@ Complete-target access supports tracing affected interactions, not reopening an 
 For closure, check the correction delta, admitted findings, and affected guarantees.
 Surface new correction regressions, missed material scope defects, or grave risks;
 keep other new observations non-blocking and state any gap that prevents bounded closure.
-Use verify-behavior. Require reachable scenarios, concrete impact and source evidence.
+Before examining the solution, load and apply verify-behavior. Reconstruct material outcomes
+from the authorized request, accepted decisions and complete specs, not the diff, task plan
+or existing tests. Distinguish correctness from sufficiency; connect each outcome to its
+implementation, current evidence and limits in existing coverage/reason/memo fields.
+Investigate material counterexamples, including omitted obligations and unproved connections
+between tested pieces. Unresolved material gaps prevent clear closure; explain why minor
+uncertainty cannot compromise the requested outcome. Justify fulfillment, not test counts.
+Require reachable scenarios, concrete impact and source evidence.
 For a diff, require the change caused or made the issue reachable. No finding quota.
 Classify each claim as scoped-defect, related-improvement, out-of-scope, or uncertain.
 A scoped-defect must cite the agreed requirement or existing guarantee and its source
@@ -288,7 +295,7 @@ observations, uncertainties, checked coverage, and limits. Do not turn suggestio
 repair instructions. The caller decides admission and the smallest authorized correction.
 No supported findings is valid, but does not prove unrun tests or merge readiness.
 ${mode === "execute" ? `Also provide reasoned screening: clear, material-gaps, or blocked.
-    Account for each disposition in assessments, citing the same requirement, concrete
+    Account for each disposition in assessments, citing the applicable requirement source (not a literal copy), concrete
     consequence, and why it is or is not material to this candidate within the agreed scope.
     Include means substantiated, NOT material. Completed phases, green checks or zero findings
     are NOT acceptance. Clear permits a separate whole-spec compliance analysis; it does not
@@ -310,7 +317,7 @@ ${mode === "execute" ? `Also provide reasoned screening: clear, material-gaps, o
         exactIds(screening.assessments, findings.map(finding => finding.id), "material", [true, false]);
         if (screening.assessments.some(entry => !text(entry.consequence) ||
             (entry.material && !text(entry.requirement)) ||
-            entry.requirement !== synthesis.dispositions.find(item => item.findingId === entry.findingId).requirement ||
+            !(text(entry.requirement) || entry.requirement === null) ||
             (entry.material && synthesis.dispositions.some(item => item.findingId === entry.findingId &&
               (item.decision === "discard" || ["out-of-scope", "related-improvement"].includes(item.classification))))) ||
             (screening.verdict === "clear" && screening.assessments.some(entry => entry.material)) ||

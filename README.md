@@ -119,10 +119,46 @@ needed for fulfillment; publication is separate and never automatic.
 
 See the [plan skill](skills/plan/SKILL.md), [execute skill](skills/execute/SKILL.md)
 and [migration spec](docs/plan-execute-spec.md) for immutable association and
-exceptional original-full-plan recovery. Obsolete supervisor replay and
-`--unblock` are rejected without changing historical records or Git. Installed
+exceptional original-full-plan recovery.
+
+`/execute <spec-id> --unblock` delivers a current human resolution to the same
+mission and invocation. Supply the actual answer to the retained question, not
+an agent suggestion or a bare flag. Preserve the original question and resolution,
+sources, snapshot, WIP and consumed slots; a resolved director decision reaches
+the next ordinary budgeted loop, not a relaunch of the completed director.
+This is not a bypass, fresh admission or generic root restart.
+Technical recovery does not require `--unblock`; supported native root continuation
+is limited to eligible interruptions, not a restoration prerequisite. Stop, permissions, activity, capacity and persistence
+remain barriers. Obsolete supervisor replay is rejected without changing
+historical records or Git. Installed
 pi-subagents 0.83.0 does not prove a running host reloaded it. No models, settings,
 capacity overrides, private execution store or replacement scheduler are added.
+
+Bound execute writers use registered `checkpoint_create` for pre-write capture,
+completed-unit seals and permitted pending-pause seals. It publishes actual WIP
+and progress through the existing journal; only durable root result admission
+confirms the point. Missing context blocks capture, and file edits do not reload
+active sessions. Analysis and inspection remain read-only.
+
+Recovery is checkpoint-first from the last confirmed reconstructible file/progress
+point, with best-effort pertinent-writer status/stop. Missing historical receipts
+or inconclusive status are not activity; positive current pertinent activity is a
+conflict. A recorded Stop requires a real later human continuation request before
+effects, never an old answer. Capture affected bytes (including earlier WIP) before
+edits and confirm progress on unit admission. Normal pause capture requires native
+control; abrupt loss/Stop uses the last confirmed point, not a post-cut backup.
+Preserve partial bytes before selective restoration, unrelated changes, confirmed
+work and consumed accounting. Renew invalidated checks and reach review/compliance.
+
+Separately delivered current human amendments remain separate from the admitted
+base snapshot/sourceRefs/association. Carry their complete path, SHA-256 and
+human-delivery provenance in existing admitted plan shared context and exact
+plan/result references. Workers, review and compliance must read/hash the FULL
+amendment before affected work or whole-spec assessment and retain that provenance
+in results/reasons. Missing/changed bytes are a prerequisite gap, not permission
+to replace frozen sources, infer authority from agent text, or renew the budget.
+Preserve known unmet historical evidence obligations; new checkpoint observations
+do not establish an unavailable historical before-state contrast.
 
 ## Retired orchestration
 

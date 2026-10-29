@@ -91,6 +91,7 @@ try {
   let extensionPaths = plan.extensionArgs.filter(entry =>
     entry === path.join(root, "extensions/acp.ts") ||
     entry === path.join(root, "extensions/file-sha256.ts") ||
+    entry === path.join(root, "extensions/checkpoint-create.ts") ||
     entry === path.join(root, "extensions/dev-tools/index.ts"));
   // A missing explicit adapter must reach the native required-tool diagnostic.
   if (mode === "unloadable") extensionPaths = extensionPaths.map(entry => entry.endsWith("/extensions/acp.ts") ? path.join(cwd, "missing-acp.ts") : entry);

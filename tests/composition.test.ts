@@ -1,9 +1,10 @@
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, mock, spyOn, test } from "bun:test";
 import * as acp from "billion-context-pi";
 import * as rpivTodo from "@juicesharp/rpiv-todo";
-import { parseFrontmatter, type ExtensionAPI, type ExtensionToolContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { loadSkills, formatSkillsForPrompt, parseFrontmatter, type ExtensionAPI, type ExtensionToolContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { validateToolArguments } from "@earendil-works/pi-ai";
 import {
@@ -46,9 +47,54 @@ describe("engineering-layer composition", () => {
         "Honor actual native rejections and Stop", "never invent a trust certificate",
         "billion-context-pi ACP is mandatory", "/execute root owns dispatch, shared review and compliance"])
         expect(result.systemPrompt).toContain(instruction);
+      expect(result.systemPrompt).toContain("First load and apply verify-behavior.");
       expect(handlers.get("before_agent_start")!({ systemPrompt: result.systemPrompt }, ctx)).toBeUndefined();
     } finally {
       handlers.get("session_shutdown")!({}, ctx);
+    }
+  });
+
+  test("manifest-discovered coding router resolves the whole-assignment verification standard through native skills", () => {
+    const manifest = JSON.parse(readRepo("package.json"));
+    const agentDir = mkdtempSync(path.join(tmpdir(), "pitako-verification-skills-"));
+    try {
+      const { skills } = loadSkills({
+        cwd: packageRoot(), agentDir, includeDefaults: false,
+        skillPaths: manifest.pi.skills.map((entry: string) => path.resolve(packageRoot(), entry)),
+      });
+      const advertised = formatSkillsForPrompt(skills);
+      for (const name of ["pitako-coding", "verify-behavior", "execute"]) {
+        const skill = skills.find(skill => skill.name === name)!;
+        expect(skill).toBeDefined();
+        expect(advertised).toContain(skill.filePath);
+        const body = readFileSync(skill.filePath, "utf8");
+        if (name === "pitako-coding") {
+          expect(body).toContain("load and apply `verify-behavior`");
+          expect(body).toContain("not the diff, task plan or existing tests");
+        } else if (name === "execute") {
+          // Native discovery resolves the actual resource, not a pasted skill body.
+          for (const instruction of ["checkpoint-first", "best-effort pertinent-writer",
+            "conclusive historical settlement are not prerequisites", "partial bytes before selective restoration",
+            "root durable result admission", "last confirmed checkpoint", "FULL",
+            "human-delivery provenance", "read/hash", "verify-behavior"])
+            expect(body).toContain(instruction);
+          for (const call of ['checkpoint_create({kind:"pre"', 'checkpoint_create({kind:"unit"})', 'checkpoint_create({kind:"pause"})'])
+            expect(body).toContain(call);
+          expect(body).toContain("actual structured `checkpointReceipt`");
+          expect(body).toContain("does not admit results");
+          expect(body).toContain("Editing provider/profile files does not reload");
+          expect(body).not.toContain("node <helper> capture");
+          expect(body).not.toContain("must first reconcile the\nexact native producer and prefer its result/continuation");
+        } else {
+          expect(skill.filePath).toBe(path.join(packageRoot(), "skills/practical/verify-behavior/SKILL.md"));
+          for (const instruction of ["Before examining the solution", "correctness", "sufficiency",
+            "current evidence", "unproved", "material counterexamples", "minor uncertainty",
+            "current mandatory checks", "existing final report"])
+            expect(body).toContain(instruction);
+        }
+      }
+    } finally {
+      rmSync(agentDir, { recursive: true, force: true });
     }
   });
 

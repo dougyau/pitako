@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { checkoutEvidence, designatedWorkspace, digest, discoverSpec, inspectionSnapshot, MAX_SPEC_BYTES, SPEC_SECTIONS, specChunks, validateSpec } from "../extensions/spec-plans.ts";
 import { boardWorkspace } from "../extensions/board/workspace.ts";
+import { applyCheckpoint, captureCheckpoint, checkpointDirectory, completeCheckpoint, prepareCheckpoint, restoreCheckpoint, type CheckpointIntent } from "../extensions/execute-checkpoint.ts";
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -25,6 +26,118 @@ function put(root: string, content = spec()) {
 }
 
 describe("spec-plan discovery and concrete input", () => {
+  function checkpoint(root: string): CheckpointIntent {
+    return { version: 1, association: { root, commonDir: designatedWorkspace(root).identity,
+      missionId: "mission", missionPath: "/native/mission.json", invocation: "run",
+      source: "/immutable/spec.md", digest: "a".repeat(64), maxCycles: 5, sourceRefs: [] },
+      key: "run.l2.t2.a1", taskId: "unit", attempt: 1, loop: 2, cursor: 1,
+      phase: "implementation", planRef: { runId: "plan" } };
+  }
+  const authority = { settled: true, continuationUnavailable: true, pending: true,
+    stop: false, permissionDenied: false, activeWriter: false, references: ["native:exact-settled-run"] };
+  const bytes = (value: string) => ({ bytes: Buffer.from(value).toString("base64"), mode: 0o644 });
+  test("checkpoint restores modified/deleted/new files to prior WIP, retaining partial bytes and position", () => {
+    const { main } = fixture(), intent = checkpoint(main);
+    writeFileSync(path.join(main, "modified"), "earlier WIP");
+    writeFileSync(path.join(main, "deleted"), "earlier deletion target");
+    writeFileSync(path.join(main, "unrelated"), "other WIP");
+    const before = checkoutEvidence(main);
+    captureCheckpoint(intent, ["modified", "deleted", "new"]);
+    expect(checkoutEvidence(main).fingerprint).toBe(before.fingerprint);
+    applyCheckpoint(intent, [{ path: "modified", image: bytes("partial") }, { path: "deleted", image: null },
+      { path: "new", image: bytes("new partial") }]);
+    const result = restoreCheckpoint(intent, authority);
+    expect(result.position).toEqual({ loop: 2, cursor: 1, phase: "implementation" });
+    expect(result.candidate.fingerprint).toBe(before.fingerprint);
+    expect(readFileSync(path.join(main, "unrelated"), "utf8")).toBe("other WIP");
+    const partial = JSON.parse(JSON.parse(readFileSync(result.partialRef, "utf8")).data);
+    expect(partial.partial).toEqual([{ path: "modified", image: bytes("partial") }, { path: "deleted", image: null },
+      { path: "new", image: bytes("new partial") }]);
+    expect(restoreCheckpoint(intent, authority).candidate.fingerprint).toBe(before.fingerprint);
+  });
+  test("checkpoint refuses unrecorded edits, missing images, escapes and HEAD-only backups without overwriting WIP", () => {
+    const { main, other } = fixture(), intent = checkpoint(main);
+    writeFileSync(path.join(main, "owned"), "before");
+    const captured = captureCheckpoint(intent, ["owned"]);
+    expect(() => applyCheckpoint(intent, [{ path: "outside", image: bytes("bad") }])).toThrow("outside captured");
+    writeFileSync(path.join(main, "owned"), "third party");
+    expect(() => restoreCheckpoint(intent, authority)).toThrow("Unattributed");
+    expect(readFileSync(path.join(main, "owned"), "utf8")).toBe("third party");
+    expect(() => restoreCheckpoint({ ...intent, taskId: "another" }, authority)).toThrow("association");
+    const manifest = path.join(captured.directory, "manifest.json"), envelope = JSON.parse(readFileSync(manifest, "utf8"));
+    writeFileSync(manifest, JSON.stringify({ ...envelope, data: envelope.data + " " }));
+    expect(() => restoreCheckpoint(intent, authority)).toThrow("digest mismatch");
+    rmSync(manifest);
+    writeFileSync(manifest, JSON.stringify({ sha256: digest(JSON.stringify({ intent, base: captured.base })),
+      data: JSON.stringify({ intent, base: captured.base }) }));
+    expect(() => restoreCheckpoint(intent, authority)).toThrow("preimages");
+    const fresh = { ...intent, key: "fresh" };
+    expect(() => captureCheckpoint(fresh, ["../escape"])).toThrow("Invalid");
+    expect(() => captureCheckpoint(fresh, [".git/config"])).toThrow("protected");
+    symlinkSync(other, path.join(main, "linked"));
+    expect(() => captureCheckpoint(fresh, ["linked/file"])).toThrow("symlink");
+    expect(() => captureCheckpoint(fresh, [".pitako/plans/spec.md"])).toThrow("immutable");
+  });
+  test("capture publication cuts cannot license writes or overwrite an existing preimage", () => {
+    const { main } = fixture(), intent = checkpoint(main);
+    writeFileSync(path.join(main, "owned"), "prior WIP");
+    // A failed publication leaves no authoritative manifest and no file effects.
+    const directory = checkpointDirectory(intent);
+    mkdirSync(path.join(directory, "manifest.json"), { recursive: true });
+    expect(() => captureCheckpoint(intent, ["owned"])).toThrow("already exists");
+    expect(() => applyCheckpoint(intent, [{ path: "owned", image: bytes("partial") }])).toThrow();
+    expect(readFileSync(path.join(main, "owned"), "utf8")).toBe("prior WIP");
+    rmSync(directory, { recursive: true });
+    captureCheckpoint(intent, ["owned"]);
+    const original = readFileSync(path.join(directory, "manifest.json"), "utf8");
+    expect(() => captureCheckpoint(intent, ["owned"])).toThrow("already exists");
+    expect(readFileSync(path.join(directory, "manifest.json"), "utf8")).toBe(original);
+    applyCheckpoint(intent, [{ path: "owned", image: bytes("partial") }]);
+    rmSync(path.join(directory, "manifest.json"));
+    expect(() => restoreCheckpoint(intent, authority)).toThrow();
+    expect(readFileSync(path.join(main, "owned"), "utf8")).toBe("partial");
+  });
+  test.each(["stop", "permissionDenied", "activeWriter", "pending"])(
+    "checkpoint restoration respects current %s observation", field => {
+      const { main } = fixture(), intent = checkpoint(main);
+      writeFileSync(path.join(main, "owned"), "before"); captureCheckpoint(intent, ["owned"]);
+      applyCheckpoint(intent, [{ path: "owned", image: bytes("partial") }]);
+      const observed = { ...authority, [field]: !authority[field as keyof typeof authority] };
+      expect(() => restoreCheckpoint(intent, observed)).toThrow("authority");
+      expect(readFileSync(path.join(main, "owned"), "utf8")).toBe("partial");
+    });
+  test.each(["absent", "inconclusive", "historically-settled"])(
+    "checkpoint restoration does not require %s writer settlement metadata", mode => {
+      const { main } = fixture(), intent = checkpoint(main);
+      writeFileSync(path.join(main, "owned"), "prior WIP"); captureCheckpoint(intent, ["owned"]);
+      applyCheckpoint(intent, [{ path: "owned", image: bytes("partial") }]);
+      const { settled, continuationUnavailable, ...current } = authority;
+      const observation = mode === "absent" ? current : { ...current,
+        settled: mode === "historically-settled", continuationUnavailable: mode === "historically-settled" };
+      const restored = restoreCheckpoint(intent, observation);
+      expect(readFileSync(path.join(main, "owned"), "utf8")).toBe("prior WIP");
+      expect(readFileSync(restored.partialRef, "utf8")).toContain(Buffer.from("partial").toString("base64"));
+      expect(restored.position).toEqual({ loop: 2, cursor: 1, phase: "implementation" });
+      expect(observation).toEqual(mode === "absent" ? current : { ...current,
+        settled: mode === "historically-settled", continuationUnavailable: mode === "historically-settled" });
+    });
+  test("checkpoint restore reconciles a cut after effect publication and during partial restoration", () => {
+    const { main } = fixture(), intent = checkpoint(main);
+    writeFileSync(path.join(main, "a"), "prior a", { mode: 0o644 }); writeFileSync(path.join(main, "b"), "prior b", { mode: 0o644 });
+    captureCheckpoint(intent, ["a", "b"]);
+    prepareCheckpoint(intent, [{ path: "a", image: bytes("after a") }, { path: "b", image: bytes("after b") }]);
+    expect(readFileSync(path.join(main, "a"), "utf8")).toBe("prior a");
+    completeCheckpoint(intent);
+    // Model a cut between atomic effects using an exact recorded preimage.
+    writeFileSync(path.join(main, "b"), "prior b");
+    const restored = restoreCheckpoint(intent, authority);
+    expect(readFileSync(path.join(main, "a"), "utf8")).toBe("prior a");
+    // The retained partial-state record permits replay of an interrupted
+    // restoration; it never licenses an unrelated byte sequence.
+    writeFileSync(path.join(main, "a"), "after a");
+    expect(restoreCheckpoint(intent, authority).candidate.fingerprint).toBe(restored.candidate.fingerprint);
+    expect(checkpointDirectory(intent)).toContain(".pi/subagents/checkpoints");
+  });
   test("local first, unique registered sibling, ambiguity with explicit selection, and unrelated exclusion", () => {
     const { main, sibling, other } = fixture();
     put(other);
@@ -138,7 +251,7 @@ describe("spec-plan discovery and concrete input", () => {
     const installed = path.join(base, "install with ' quotes & %PATH% !", "node_modules", "pitako");
     // Copy only owned shipped resources; no dependency install, Pi loader or provider.
     for (const file of ["package.json", "skills/execute/inspect.mjs", "skills/execute/inspect.ts",
-      "extensions/spec-plans.ts", "extensions/board/workspace.ts", "extensions/board/paths.ts", "extensions/errors.ts"]) {
+      "extensions/spec-plans.ts", "extensions/execute-retained.ts", "extensions/execute-checkpoint.ts", "extensions/board/workspace.ts", "extensions/board/paths.ts", "extensions/errors.ts"]) {
       const target = path.join(installed, file); mkdirSync(path.dirname(target), { recursive: true }); cpSync(path.resolve(file), target);
     }
     const entry = path.join(installed, "skills/execute/inspect.mjs");
@@ -184,7 +297,7 @@ describe("spec-plan discovery and concrete input", () => {
     expect(ordinary.packets).toHaveLength(26);
     expect(ordinary.packets.map(packet => packet.content).join("")).toBe(content);
     expect(() => inspectionSnapshot({ source: '"\\'.repeat(8000) }, content)).toThrow("26-chunk native snapshot envelope");
-    expect(() => inspectionSnapshot({ source: "中".repeat(14000) }, spec())).toThrow("metadata exceeds the native snapshot boundary");
+    expect(() => inspectionSnapshot({ source: "中".repeat(40000) }, spec())).toThrow("metadata exceeds the native snapshot boundary");
   });
 
   test("checkout evidence recognizes gitlinks and observes submodule heads and nested dirty/untracked bytes", () => {
