@@ -4,11 +4,12 @@ import { MUTATING_TOOLS, parseProfile, profileNote, toolsForProfile } from "../e
 
 // Source behavior, not the provider's readOnlyHint: checks can run code/write caches.
 const introducedMutators = [
+  "ast_rewrite",
   "file_sha256_save", "git_worktree_add", "git_worktree_remove", "git_worktree_prune", "git_commit",
   "ssh_exec", "ssh_pull", "ssh_push", "py_lint", "py_format", "py_typecheck", "py_test", "py_uv",
   "cargo_check", "cargo_clippy", "cargo_fmt", "cargo_test", "cargo_build", "cargo_run", "cargo_doc", "cargo_bench", "cargo_add",
 ];
-const deterministicReads = ["git_worktree_list", "git_status", "git_diff", "git_log", "git_show", "resource_snapshot", "file_sha256", "codemode"];
+const deterministicReads = ["ast_search", "git_worktree_list", "git_status", "git_diff", "git_log", "git_show", "resource_snapshot", "file_sha256", "codemode"];
 
 const available = [
   "read",

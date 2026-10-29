@@ -36,6 +36,7 @@ function loadProfileExtensions(pi: ExtensionAPI, codex: (pi: ExtensionAPI) => vo
   const excluded = new Set([
     "./node_modules/pi-lsp-client/src/index.ts",
     "./node_modules/@vndv/pi-codegraph/extensions/codegraph.ts",
+    "./node_modules/@nicknisi/pi-ast-grep/index.ts",
     "./extensions/todo.ts", "./extensions/board/index.ts",
     "./node_modules/pi-subagents/bundle/index.js", "./extensions/acp.ts",
     "./node_modules/pi-hermes-memory/src/index.ts", "./node_modules/pi-web-access/dist/index.js",
@@ -58,6 +59,7 @@ function profileHarness(profileFlag?: string, external?: () => Promise<void>) {
   const available = [
     "read", "bash", "edit", "write", "apply_patch", "grep", "find", "ls",
     "lsp_diagnostics", "lsp_rename", "codegraph_search", "lsp_symbols",
+    "ast_search", "ast_rewrite",
     "web_search", "fetch_content", "source_check", "get_search_content", "web_enable",
     "todo",
   ];
@@ -179,7 +181,7 @@ describe("Pitako resources and policy", () => {
       expect(provider).toBeDefined();
       expect(host.registeredTools).toEqual(["apply_patch", ...provider!.tools, "file_sha256", "file_sha256_save"]);
       for (const name of provider!.tools) expect(host.active).toContain(name);
-      for (const name of ["file_sha256", "file_sha256_save"]) expect(host.active).toContain(name);
+      for (const name of ["file_sha256", "file_sha256_save", "ast_search", "ast_rewrite"]) expect(host.active).toContain(name);
       expect(host.registeredCommands).toEqual(["pitako"]);
       await expect(host.command("agents")).rejects.toThrow("Usage: /pitako");
     } finally { await host.shutdown(); }
@@ -473,7 +475,8 @@ test("late policy uses the live profile across model and command changes, and re
     expect(host.active).not.toContain("edit");
     await host.selectProfile("analysis");
     await host.modelSelect();
-    for (const name of ["edit", "write", "apply_patch", "lsp_rename"]) expect(host.active).not.toContain(name);
+    for (const name of ["edit", "write", "apply_patch", "lsp_rename", "ast_rewrite"]) expect(host.active).not.toContain(name);
+    expect(host.active).toContain("ast_search");
     expect(await host.composePrompt()).toContain("Pitako profile: analysis.");
     await host.selectProfile("coding");
     host.context.model = { api: "anthropic-messages" };

@@ -31,6 +31,13 @@
     "gitHead": "ce6d3530410812ca504ec294995581a52170f9e1",
     "license": "MIT"
   },
+  "@nicknisi/pi-ast-grep": {
+    "version": "0.3.4",
+    "registry": "https://registry.npmjs.org/@nicknisi/pi-ast-grep/0.3.4",
+    "tarball": "https://registry.npmjs.org/@nicknisi/pi-ast-grep/-/pi-ast-grep-0.3.4.tgz",
+    "integrity": "sha512-r2N+GT8PTLbYmcHKPyEZFuzg5qMcVbIDNJ3/U9vstGkGewTLlQptDRpyjlESA/qaMi4ISA6m6Rh8WG0SCV4ljg==",
+    "license": "MIT"
+  },
   "@vndv/pi-codegraph": {
     "version": "0.1.11",
     "registry": "https://registry.npmjs.org/@vndv/pi-codegraph/0.1.11",

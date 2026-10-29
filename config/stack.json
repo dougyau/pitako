@@ -45,6 +45,12 @@
       ]
     },
     {
+      "id": "@nicknisi/pi-ast-grep",
+      "spec": "@nicknisi/pi-ast-grep@0.3.4",
+      "entry": "node_modules/@nicknisi/pi-ast-grep/index.ts",
+      "tools": ["ast_search", "ast_rewrite"]
+    },
+    {
       "id": "pitako-dev-tools",
       "spec": "pitako",
       "entry": "extensions/dev-tools/index.ts",

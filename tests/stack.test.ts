@@ -70,6 +70,13 @@ describe("stack configuration", () => {
     expect(manifest.pi.extensions.some((entry) => entry.includes("extensions/code-intelligence/"))).toBe(false);
     expect(manifest.dependencies["@ast-grep/napi"]).toBeUndefined();
     expect(manifest.bundledDependencies).not.toContain("@ast-grep/napi");
+    expect(manifest.dependencies["@nicknisi/pi-ast-grep"]).toBe("0.3.4");
+    expect(manifest.bundledDependencies).toContain("@nicknisi/pi-ast-grep");
+    expect(stack.required.find(({ id }) => id === "@nicknisi/pi-ast-grep")).toEqual({
+      id: "@nicknisi/pi-ast-grep", spec: "@nicknisi/pi-ast-grep@0.3.4",
+      entry: "node_modules/@nicknisi/pi-ast-grep/index.ts",
+      tools: ["ast_search", "ast_rewrite"],
+    });
     expect(manifest.dependencies["@dietrichgebert/ponytail"]).toBe("5.3.2");
     expect(manifest.dependencies["@juicesharp/rpiv-todo"]).toBe("2.15.0");
     for (const name of ["@nredd/pi-dev-tools", "@nredd/pi-resource-sampler"]) {

@@ -10,7 +10,7 @@ export const ANALYSIS_BUILTINS = ["read", "bash", "grep", "find", "ls"] as const
 // Source behavior in pi-dev-tools 0.6.0, not its optimistic readOnlyHint annotations:
 // SSH executes/transfers; every Python/Cargo tool can execute code or write env/build/cache data.
 export const MUTATING_TOOLS = new Set([
-  "edit", "write", "apply_patch", "lsp_rename", "file_sha256_save",
+  "edit", "write", "apply_patch", "lsp_rename", "ast_rewrite", "file_sha256_save",
   "git_worktree_add", "git_worktree_remove", "git_worktree_prune", "git_commit",
   "ssh_exec", "ssh_pull", "ssh_push",
   "py_lint", "py_format", "py_typecheck", "py_test", "py_uv",

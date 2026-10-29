@@ -13,7 +13,13 @@ and `extensions/profile-policy.ts`. The early extension captures the session
 profile. The late policy reapplies model-compatible tools after Codex startup
 and model changes without taking over upstream hooks.
 
-Navigation uses pi-lsp-client and pi-codegraph. TODO wraps rpiv-todo and keeps
+Navigation uses pi-lsp-client and pi-codegraph. The direct `@nicknisi/pi-ast-grep`
+entry adds syntax search and single-file rewrites through an external ast-grep CLI.
+Analysis blocks `ast_rewrite` at the call boundary, including previews and
+codemode calls, while retaining `ast_search`. Architect, reviewer, and scout
+allow only `ast_search`; the worker also allows `ast_rewrite`. These four roles
+explicitly load the extension alongside LSP/CodeGraph.
+TODO wraps rpiv-todo and keeps
 `todo` model-only so nested codemode calls cannot lose the snapshots used by
 replay and readers. Board is repository-scoped storage shared by its worktrees.
 ACP loads before Hermes. Web access and pi-subagents are direct upstream entries.
@@ -34,7 +40,8 @@ Cargo and resource tools and hooks. Its sampler is the library under
 deterministic operations, composed through native codemode; keep bash/Python
 fallback for uncovered cases. Git queries are not sandboxed: metadata or spilled
 output may be written. `git_status` is working changes, not tracked inventory;
-structured `git_diff` is statistics, not a patch/path array.
+structured `git_diff` includes `stat` and the bounded `diff`, with
+`fullOutputPath` when truncated. Stat-only requests return an empty `diff`.
 `file_sha256` is read-only; writer-only `file_sha256_save` hashes and atomically
 publishes reusable items JSON in one call. Both share a validation/hash core,
 independent of spec-plan inspection. Check structured `ok` and `publication`;
