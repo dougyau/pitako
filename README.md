@@ -15,7 +15,10 @@ bun run pi
 
 The setup script installs checkout dependencies and attempts CodeGraph index
 initialization. CodeGraph tools use an existing index and do not initialize or
-refresh it themselves. If CodeGraph or an LSP server is unavailable, use the
+refresh it themselves. Pitako installs the TypeScript/JavaScript, Python, and PHP
+language servers. Install `rust-analyzer` with your Rust toolchain. See
+[language servers](docs/configuration.md#language-servers) for details.
+If CodeGraph or an LSP server is unavailable, use the
 ordinary read and search tools. See [verification](GATES.md) for the test procedure.
 
 ### Herdr worktrees
@@ -44,8 +47,8 @@ runs every Monday at 05:17 UTC and supports manual runs from GitHub Actions.
 It updates npm runtime dependencies to exact versions, regenerates `bun.lock`,
 and synchronizes stack versions, existing dependency version notices, and
 `docs/dependency-releases.json` with exact-version npm release provenance.
-Pi host packages, development dependencies, the Git-pinned LSP dependency, and
-vendored skills stay unchanged.
+Pi host packages, development dependencies, the Git-pinned LSP client,
+classic TypeScript and its language-server pins, and vendored skills stay unchanged.
 
 The workflow prepares the checkout and runs `bun run typecheck`, `bun run test`,
 and `git diff --check` before creating or updating one dependency PR.
@@ -82,10 +85,17 @@ Pitako selects upstream `apply_patch` on grammar-capable OpenAI models and uses
 upstream `apply_patch` or shell.
 
 `@nicknisi/pi-ast-grep` adds `ast_search` for syntax matching and `ast_rewrite`
-for single-file replacements. Install the [ast-grep CLI](https://ast-grep.github.io/)
-separately and expose `ast-grep` on Pi's `PATH`. Rewrites preview by default;
+for single-file replacements. Pitako includes the [ast-grep CLI](https://ast-grep.github.io/)
+through `@ast-grep/cli` and adds its bundled binary to Pi's `PATH` when needed.
+Rewrites preview by default;
 only `dryRun:false` applies changes. Inspect the preview and the resulting diff.
 Analysis keeps `ast_search` but blocks all `ast_rewrite` calls, including previews.
+
+Navigation guidance selects LSP for symbol identity, definitions, and references,
+CodeGraph for architecture, call chains, and impact, and ast-grep for syntax
+patterns. Grep remains the tool for literal text, logs, and configuration. Read
+the relevant source after navigation. Unavailable or incomplete backends permit
+targeted read/grep fallback; empty results alone do not prove absence.
 
 Use `/pitako` for profile and skill status, `/todos` for the session task list,
 and `/board` for shared topics. Board tools are pull-only. They do not inject
@@ -110,9 +120,7 @@ items JSON in one call. Inspect structured `ok` and `publication`, not just text
 or absence of an exception.
 
 ACP from `billion-context-pi` is mandatory, including in all nine packaged child
-profiles. Missing, disabled, unloadable or refused ACP is an unmet prerequisite,
-not a supported ACP-less mode. Preserve explicit user configuration and upstream
-refusal/native-compaction guidance; never force-enable it.
+profiles. Preserve explicit user configuration; never force-enable it.
 
 ## Delegate through pi-subagents
 

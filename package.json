@@ -25,7 +25,7 @@
   "scripts": {
     "test": "bun test --parallel",
     "pi": "pi --no-extensions --approve -e .",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "node node_modules/typescript-compiler/bin/tsc --noEmit"
   },
   "pi": {
     "extensions": [
@@ -68,6 +68,7 @@
     }
   },
   "dependencies": {
+    "@ast-grep/cli": "0.51.0",
     "@colbymchenry/codegraph": "1.6.2",
     "@dietrichgebert/ponytail": "5.3.2",
     "@juicesharp/rpiv-ask-user-question": "2.15.0",
@@ -75,15 +76,20 @@
     "@nicknisi/pi-ast-grep": "0.3.4",
     "@vndv/pi-codegraph": "0.1.11",
     "billion-context-pi": "0.1.83",
+    "intelephense": "1.18.5",
     "pi-codex-tools": "0.4.0",
     "pi-hermes-memory": "0.9.11",
     "pi-lsp-client": "github:code-yeongyu/pi-lsp-client#9d029fb32b721c038b58fb418b98bbfcf720cf0a",
     "pi-markdown-preview": "0.25.0",
     "pi-subagents": "0.83.0",
     "pi-web-access": "0.45.0",
-    "smol-toml": "1.9.1"
+    "pyright": "1.1.414",
+    "smol-toml": "1.9.1",
+    "typescript": "5.9.3",
+    "typescript-language-server": "5.3.0"
   },
   "bundledDependencies": [
+    "@ast-grep/cli",
     "@dietrichgebert/ponytail",
     "@juicesharp/rpiv-ask-user-question",
     "@juicesharp/rpiv-todo",
@@ -96,6 +102,9 @@
     "pi-markdown-preview",
     "pi-subagents",
     "pi-web-access"
+  ],
+  "trustedDependencies": [
+    "@ast-grep/cli"
   ],
   "peerDependencies": {
     "@earendil-works/pi-agent-core": ">=1.4.0",
@@ -111,7 +120,7 @@
     "@earendil-works/pi-tui": "1.4.0",
     "@juicesharp/rpiv-i18n": "2.15.0",
     "@types/bun": "1.4.4",
-    "typescript": "7.0.2",
+    "typescript-compiler": "npm:typescript@7.0.2",
     "typebox": "1.4.3"
   }
 }

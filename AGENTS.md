@@ -29,12 +29,12 @@ Registration and instruction sources:
 
 | Provider | Entry / responsibility |
 | --- | --- |
-| `billion-context-pi` | [extensions/acp.ts](extensions/acp.ts) adapts mandatory ACP. Missing, disabled, unloadable or refused ACP is an unmet prerequisite; preserve upstream refusal guidance and native-compaction stand-down. Never override user settings to force admission. |
+| `billion-context-pi` | [extensions/acp.ts](extensions/acp.ts) adapts automatic context management. Configuration and runtime behavior belong to the provider, not model-directed preflight checks. |
 | `pi-subagents` | `node_modules/pi-subagents/bundle/index.js` owns delegation, workflows and missions. [extensions/plan-execute.ts](extensions/plan-execute.ts) registers the owned execution resource; [skills/plan](skills/plan), [skills/execute](skills/execute), [skills/architecture](skills/architecture) and [skills/review](skills/review) supply workflow instructions/scripts. |
 | Pi codemode | Native tool composition/discovery, not a separate Pitako runtime or MCP bridge. [extensions/profile-policy.ts](extensions/profile-policy.ts) preserves analysis mutation policy for nested calls. |
 | Pitako dev-tools | [extensions/dev-tools/index.ts](extensions/dev-tools/index.ts) registers Git, SSH, Python, Cargo and `resource_snapshot`. [extensions/resource-sampler/index.ts](extensions/resource-sampler/index.ts) is the owned sampler library consumed by resource tooling, **not a second extension**. |
 | Pitako hashes | [extensions/file-sha256.ts](extensions/file-sha256.ts) registers read-only `file_sha256` and writer-only `file_sha256_save`; inspect structured `ok` and publication, not display text alone. |
-| External `pi-lsp-client` | `node_modules/pi-lsp-client/src/index.ts` registers six LSP tools; Pitako does not own the client or install servers. See [configuration](docs/configuration.md). |
+| External `pi-lsp-client` | `node_modules/pi-lsp-client/src/index.ts` registers six LSP tools. Pitako installs the TypeScript/JavaScript, Python, and PHP server dependencies, but does not own their implementations. Rust uses the host's `rust-analyzer`. See [configuration](docs/configuration.md). |
 | Other composition | [extensions/index.ts](extensions/index.ts) and [extensions/profile.ts](extensions/profile.ts) assemble profile instructions; [extensions/catalog.ts](extensions/catalog.ts) advertises skills. [extensions/todo.ts](extensions/todo.ts) adapts rpiv-todo; [extensions/board/index.ts](extensions/board/index.ts) owns Board. CodeGraph, Codex patch tools, memory and web entries are linked in the stack manifest. |
 
 Availability is role-specific, not inherited from the foreground tool inventory.

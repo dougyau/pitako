@@ -9,10 +9,12 @@ function updateDependencies(root: string): void {
   const manifestPath = path.join(root, "package.json");
   const readDependencies = (): Record<string, string> =>
     JSON.parse(readFileSync(manifestPath, "utf8")).dependencies;
-  // Git revisions and Pi's dev/peer dependencies stay under manual control.
+  // These must retain classic tsserver and Pitako's Node floor respectively.
+  const manual = new Set(["typescript", "typescript-language-server"]);
+  // Git revisions and Pi's dev/peer dependencies also stay under manual control.
   const previousDependencies = readDependencies();
   const names = Object.entries(previousDependencies)
-    .filter(([, version]) => registryVersion.test(version))
+    .filter(([name, version]) => !manual.has(name) && registryVersion.test(version))
     .map(([name]) => name);
   if (names.length === 0) throw new Error("No pinned npm runtime dependencies to update");
   execFileSync("bun", ["update", "--latest", "--exact", ...names], { cwd: root, stdio: "inherit" });

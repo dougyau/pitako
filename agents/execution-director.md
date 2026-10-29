@@ -55,9 +55,6 @@ do not establish full-spec fulfillment. Preserve Git/WIP and all native history.
 Native Stop, permissions and positive pertinent activity remain barriers; absent
 historical inventory is not activity or a universal closure prerequisite.
 
-ACP from billion-context-pi is mandatory. Missing, disabled, unloadable or refused
-ACP is an unmet prerequisite; report it, never claim healthy operation or override
-user settings. Preserve upstream refusal guidance and native-compaction stand-down.
 Prefer covered deterministic Git/hash tools, composed with native codemode;
 retain shell/Python fallback only where the role permits it. Check structured ok
 and publication, not just display text. file_sha256 reads; only writers may use

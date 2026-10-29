@@ -19,9 +19,9 @@ Analysis blocks `ast_rewrite` at the call boundary, including previews and
 codemode calls, while retaining `ast_search`. Architect, reviewer, and scout
 allow only `ast_search`; the worker also allows `ast_rewrite`. These four roles
 explicitly load the extension alongside LSP/CodeGraph.
-`extensions/todo.ts` re-exports
-rpiv-todo without changing tool exposure. `todo` is available directly and through
-codemode. Upstream persists mutations as session entries for replay.
+`extensions/todo.ts` adapts rpiv-todo registration to make only `todo` model-only,
+available directly to the model but not through codemode.
+Upstream persists mutations as session entries for replay.
 Board is repository-scoped storage shared by its worktrees.
 ACP loads before Hermes. Web access and pi-subagents are direct upstream entries.
 
@@ -30,10 +30,8 @@ ACP keeps Pitako defaults `delegate:false`, `autoUpdate:false`, and
 precedence. No managed workflow guards wrap ACP, TODO, or Board.
 All nine packaged profiles explicitly load this `billion-context-pi` adapter and
 require its five context tools. Native child required-tool diagnostics report
-missing registration. Registration alone does not establish operational
-compression after a refusal; disabled, unloadable or refused ACP is an unmet
-prerequisite. Preserve upstream refusal and native-compaction stand-down rather
-than overriding settings.
+missing registration. Explicit user configuration is preserved; ACP is never
+force-enabled.
 
 The owned `extensions/dev-tools/index.ts` factory supplies Git, SSH, Python,
 Cargo and resource tools and hooks. Its sampler is the library under

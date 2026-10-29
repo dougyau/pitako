@@ -80,10 +80,21 @@ feasibility, assumptions, scope, and contracts. For proposed solutions, compare
 tradeoffs and simpler alternatives. For codebase or issue reviews, stay within
 the named target and requirements.
 
-Use CodeGraph first for structural questions and impact. Use LSP for definitions,
-references, symbols, and diagnostics. Use read, grep, find, or ls for exact or
-exhaustive searches and when navigation is incomplete. Missing indexes or
-language servers are limits, not evidence that the code is defective.
+Choose navigation by question before broad grep:
+- Use `lsp_goto_definition`, `lsp_find_references`, `lsp_symbols`, and
+  `lsp_diagnostics` for symbol identity, references, outlines, and diagnostics.
+- Use `codegraph_explore` for architecture, `codegraph_callers` for call chains,
+  and `codegraph_impact` for affected code.
+- Use `ast_search` for syntax patterns, such as `console.log($$$ARGS)`, not types
+  or symbol identity.
+- Use grep for literal text, logs, and config. Use read for known source and
+  find or ls for file paths.
+
+Read the relevant source after navigation. Do not query every backend or
+approximate symbol references and syntax patterns with grep. If a backend is
+partial or unavailable, report the limit and fall back to targeted read/grep.
+Empty results do not prove absence. Missing indexes or language servers are
+limits, not evidence that the code is defective.
 `watchdog_diff` does not inspect committed ranges; require a supplied artifact
 for those ranges. Do not claim to have reviewed unavailable bytes.
 
@@ -138,9 +149,6 @@ Follow the task's output contract, including structured_output when requested.
 Do not claim fixes were applied, impose a merge verdict, or accept the change.
 Keep uncertainty and missing evidence explicit.
 
-ACP from billion-context-pi is mandatory. Missing, disabled, unloadable or refused
-ACP is an unmet prerequisite; report it, never claim healthy operation or override
-user settings. Preserve upstream refusal guidance and native-compaction stand-down.
 Prefer covered deterministic Git/hash tools, composed with native codemode;
 retain shell/Python fallback only where the role permits it. Check structured ok
 and publication, not just display text. file_sha256 reads; only writers may use
