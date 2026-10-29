@@ -1,4 +1,12 @@
 {
+  "@ast-grep/cli": {
+    "version": "0.51.0",
+    "registry": "https://registry.npmjs.org/@ast-grep/cli/0.51.0",
+    "tarball": "https://registry.npmjs.org/@ast-grep/cli/-/cli-0.51.0.tgz",
+    "integrity": "sha512-sIZEt4L4iQJRM2QDKQnbltQxddIsxzt9nmguw3/X7eP3cFwBopsZtFRvaEVht/3/6C1xe3Opn/pbsxSFVJDvpA==",
+    "gitHead": "48b54b3120b70fa9e8cbb40a03bf3bfebe6bf50a",
+    "license": "MIT"
+  },
   "@colbymchenry/codegraph": {
     "version": "1.6.2",
     "registry": "https://registry.npmjs.org/@colbymchenry/codegraph/1.6.2",
@@ -137,13 +145,44 @@
     "integrity": "sha512-9wkRDXUXK124pEnAutE6n/l18j+i9GC5IAHK8TmX/2nlySETmky0OU6yL5U8pW1AoKh++AN9auDCr647BfurjQ==",
     "license": "MIT"
   },
-  "typescript": {
+  "typescript-compiler": {
     "version": "7.0.2",
     "registry": "https://registry.npmjs.org/typescript/7.0.2",
     "tarball": "https://registry.npmjs.org/typescript/-/typescript-7.0.2.tgz",
     "integrity": "sha512-8FYau96o3NKOhbjKi/qNvG/W5jhzxkbdm5sj9AbZ/5T5sWqn3hJgLfGx27sRKZWTvyzCP8dLRBTf5tBTSRVUNA==",
     "gitHead": "2bd066d87f5bafd315be9f40889d0a60b9e58e0b",
     "license": "Apache-2.0"
+  },
+  "typescript": {
+    "version": "5.9.3",
+    "registry": "https://registry.npmjs.org/typescript/5.9.3",
+    "tarball": "https://registry.npmjs.org/typescript/-/typescript-5.9.3.tgz",
+    "integrity": "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==",
+    "gitHead": "c63de15a992d37f0d6cec03ac7631872838602cb",
+    "license": "Apache-2.0"
+  },
+  "typescript-language-server": {
+    "version": "5.3.0",
+    "registry": "https://registry.npmjs.org/typescript-language-server/5.3.0",
+    "tarball": "https://registry.npmjs.org/typescript-language-server/-/typescript-language-server-5.3.0.tgz",
+    "integrity": "sha512-5puofxZHgFdAYtfNpmwCAvgtaYgg8wrUnH30m7Ze3QuguId5RNRadKASpOpyDxTyUdAF51FjhTdjntLw/EuWcQ==",
+    "gitHead": "589044479e4bc2bffb796b593242136f5323b582",
+    "license": "Apache-2.0"
+  },
+  "pyright": {
+    "version": "1.1.414",
+    "registry": "https://registry.npmjs.org/pyright/1.1.414",
+    "tarball": "https://registry.npmjs.org/pyright/-/pyright-1.1.414.tgz",
+    "integrity": "sha512-FPZZb51jepDX4eP7TEYDeNFtmE3WgwkkEcJpvH3/QmUSsj0EAy3LXu+xB4T/FWDejtsXlCfFr/rbWFjwuwuXww==",
+    "license": "MIT"
+  },
+  "intelephense": {
+    "version": "1.18.5",
+    "registry": "https://registry.npmjs.org/intelephense/1.18.5",
+    "tarball": "https://registry.npmjs.org/intelephense/-/intelephense-1.18.5.tgz",
+    "integrity": "sha512-dqCH1YNCRlHGBLND+iUFjBJlGwM4pPimX2jm8AaP/6K2WZNM2K2+E8dOWCD3ZYMP2zC2ICBD9Soe2oxKtU9d9A==",
+    "gitHead": "fcc545f641cd2c5d0a785e6eb8c230329cb54d8e",
+    "license": "SEE LICENSE IN LICENSE.txt"
   },
   "typebox": {
     "version": "1.4.3",

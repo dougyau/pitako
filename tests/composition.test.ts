@@ -44,8 +44,9 @@ describe("engineering-layer composition", () => {
       for (const instruction of ["Pi-native tools and codemode need no T3 client",
         "Optional-host guidance applies only when present", "unknown trust is not denial",
         "Honor actual native rejections and Stop", "never invent a trust certificate",
-        "billion-context-pi ACP is mandatory", "/execute root owns dispatch, shared review and compliance"])
+        "ast_search for syntax patterns", "/execute root owns dispatch, shared review and compliance"])
         expect(result.systemPrompt).toContain(instruction);
+      expect(result.systemPrompt).not.toContain("ACP");
       expect(handlers.get("before_agent_start")!({ systemPrompt: result.systemPrompt }, ctx)).toBeUndefined();
     } finally {
       handlers.get("session_shutdown")!({}, ctx);
@@ -101,15 +102,25 @@ describe("engineering-layer composition", () => {
       expect(plan.disableAmbientExtensions).toBe(true);
       expect(plan.extensionArgs).toContain(path.join(packageRoot(), "extensions/acp.ts"));
       for (const tool of acpTools) expect(plan.requiredChildTools).toContain(tool);
-      expect(body).toContain("billion-context-pi");
-      expect(body).toContain("unmet prerequisite");
-      expect(body).toContain("native-compaction stand-down");
+      // Context management stays wired without model-directed preflight guidance.
+      expect(body).not.toMatch(/ACP|billion-context-pi|acp_status|native-compaction/);
       expect(plan.fanoutAuthorized).toBe(false);
       const usesAstGrep = ["architect", "reviewer", "scout", "worker"].includes(role);
       expect(plan.requiredChildTools.includes("ast_search")).toBe(usesAstGrep);
       expect(plan.requiredChildTools.includes("ast_rewrite")).toBe(role === "worker");
       expect(plan.extensionArgs.includes(path.join(packageRoot(), "node_modules/@nicknisi/pi-ast-grep/index.ts")))
         .toBe(usesAstGrep);
+      if (usesAstGrep) {
+        const instructions = body.replace(/\s+/g, " ");
+        for (const instruction of [
+          "navigation by question before broad grep",
+          "`lsp_goto_definition`", "`lsp_find_references`", "`lsp_symbols`",
+          "`codegraph_explore`", "`codegraph_callers`", "`codegraph_impact`",
+          "`ast_search` for syntax patterns", "not types or symbol identity",
+          "grep for literal text, logs, and config",
+          "Empty results do not prove absence", "partial or unavailable",
+        ]) expect(instructions).toContain(instruction);
+      }
       if (role === "interview-relay") {
         expect(plan.effectiveToolAllowlist).toEqual(["contact_supervisor", ...acpTools]);
         expect(plan.configuredExtensions).toEqual([path.join(packageRoot(), "extensions/acp.ts")]);
@@ -172,35 +183,45 @@ describe("engineering-layer composition", () => {
       { cwd: packageRoot() } as ExtensionToolContext)).rejects.toBe(reason);
   });
 
-  test("TODO composition preserves upstream registration and default direct exposure", async () => {
+  test("TODO composition sets only todo model-only and preserves upstream registration", async () => {
     const upstream = { content: [], details: { tasks: [], nextId: 1 } };
     const execute = mock(async (..._args: unknown[]) => {
       return upstream;
     });
-    const todo: ToolDefinition = {
+    const todo: ToolDefinition = Object.freeze({
       name: "todo", label: "TODO", description: "controlled upstream tool",
       parameters: Type.Object({}), execute,
-    };
+    });
     const other = { ...todo, name: "other", exposure: "codemode" as const };
     const tools: ToolDefinition[] = [];
+    const unsubscribe = () => {};
+    const on = mock(() => unsubscribe), registerCommand = mock(() => {});
+    const handler = async () => {};
+    const command = { description: "controlled command", handler };
     const pi = {
       registerTool(tool: ToolDefinition) { tools.push(tool); },
-      on() { return () => {}; },
-      registerCommand() {},
+      on,
+      registerCommand,
     } as unknown as ExtensionAPI;
     let forwarded: ExtensionAPI | undefined;
     const registration = spyOn(rpivTodo, "default").mockImplementation(api => {
       forwarded = api;
       api.registerTool(todo);
       api.registerTool(other);
+      expect(api.on("session_start", handler)).toBe(unsubscribe);
+      api.registerCommand("todos", command);
     });
     try {
       const extension = await import("../extensions/todo.ts");
       extension.default(pi);
       expect(registration).toHaveBeenCalledTimes(1);
-      expect(forwarded).toBe(pi);
-      expect(tools[0]).toBe(todo);
-      expect(tools[0]!.exposure).toBeUndefined();
+      expect(forwarded!.on).toBe(pi.on);
+      expect(forwarded!.registerCommand).toBe(pi.registerCommand);
+      expect(on).toHaveBeenCalledWith("session_start", handler);
+      expect(registerCommand).toHaveBeenCalledWith("todos", command);
+      expect(tools[0]).toEqual({ ...todo, exposure: "model-only" });
+      expect(tools[0]!.execute).toBe(execute);
+      expect(tools[0]!.parameters).toBe(todo.parameters);
       const controller = new AbortController(), update = () => {};
       const ctx = { cwd: packageRoot(), sessionManager: {} } as unknown as ExtensionToolContext, args = {};
       const result = await tools[0]!.execute("native-id", args, controller.signal, update, ctx);
@@ -209,6 +230,7 @@ describe("engineering-layer composition", () => {
       expect(result).toBe(upstream);
       expect(tools[1]).toBe(other);
       expect(todo.exposure).toBeUndefined();
+      expect(pi.registerTool).not.toBe(forwarded!.registerTool);
     } finally {
       registration.mockRestore();
     }
@@ -433,6 +455,12 @@ describe("engineering-layer composition", () => {
     expect(router).not.toContain("ACTIVE EVERY RESPONSE");
     expect(router).not.toContain("Respond terse like smart caveman");
     expect(router).not.toContain("subagent_type");
+    expect(router).not.toMatch(/ACP|acp_status|native compaction/);
+    for (const instruction of [
+      "Choose navigation by question", "`lsp_find_references`", "`codegraph_impact`",
+      "`ast_search`", "grep", "syntax, not types", "Empty results do not prove absence",
+      "Do not query every backend", "`dryRun:false`",
+    ]) expect(router.replace(/\s+/g, " ")).toContain(instruction);
   });
 
   test("specialized skills keep single-agent and contextual contracts", () => {

@@ -19,6 +19,7 @@
       "id": "pi-lsp-client",
       "spec": "github:code-yeongyu/pi-lsp-client#9d029fb32b721c038b58fb418b98bbfcf720cf0a",
       "entry": "node_modules/pi-lsp-client/src/index.ts",
+      "bins": ["typescript-language-server", "pyright-langserver", "intelephense"],
       "tools": [
         "lsp_diagnostics",
         "lsp_goto_definition",
@@ -32,7 +33,7 @@
       "id": "@vndv/pi-codegraph",
       "spec": "@vndv/pi-codegraph@0.1.11",
       "entry": "node_modules/@vndv/pi-codegraph/extensions/codegraph.ts",
-      "bin": "codegraph",
+      "bins": ["codegraph"],
       "tools": [
         "codegraph_search",
         "codegraph_callers",
@@ -48,6 +49,7 @@
       "id": "@nicknisi/pi-ast-grep",
       "spec": "@nicknisi/pi-ast-grep@0.3.4",
       "entry": "node_modules/@nicknisi/pi-ast-grep/index.ts",
+      "bins": ["ast-grep"],
       "tools": ["ast_search", "ast_rewrite"]
     },
     {

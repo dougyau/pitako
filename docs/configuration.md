@@ -6,16 +6,43 @@ ordinary profiles, and the upstream extensions' settings.
 ## Language servers
 
 Pitako bundles the external `pi-lsp-client` v0.2.0 client at commit
-`9d029fb32b721c038b58fb418b98bbfcf720cf0a`, not language servers. Its six
+`9d029fb32b721c038b58fb418b98bbfcf720cf0a`. Its six
 tools include document/workspace symbols and prepare/rename; existing role
 permissions still restrict `lsp_rename`. Other supported languages remain
 available through the client's normal server selection.
 
-Provision servers explicitly in an environment you own. For a classic
-TypeScript server, for example, install `typescript-language-server` and a
-classic TypeScript release supplying `tsserver.js` in a private tool directory, after checking
-their chosen releases' Node requirements. Put that directory's `node_modules/.bin`
-on PATH, or configure an absolute command in project `.pi/lsp-client.json`:
+Pitako installs these npm dependencies:
+
+| Language | Server | Executable |
+| --- | --- | --- |
+| TypeScript and JavaScript | `typescript-language-server` 5.3.0 with classic `typescript` 5.9.3 | `typescript-language-server` |
+| Python | `pyright` 1.1.414 | `pyright-langserver` |
+| PHP | `intelephense` 1.18.5 | `intelephense` |
+
+Startup accepts these commands from PATH or adds Pitako's `node_modules/.bin`
+when needed. This also applies to packaged child agents. No global npm install
+or user configuration change is required. Intelephense is downloaded as a
+dependency, not bundled in Pitako's tarball, under its
+[proprietary license](https://github.com/bmewburn/intelephense-docs/blob/master/LICENSE.txt).
+Navigation and diagnostics are free; rename requires an Intelephense licence.
+
+Pitako's typecheck gate still uses TypeScript 7.0.2, installed separately as
+the `typescript-compiler` development alias. The explicit gate command avoids
+the two packages' competing `tsc` binaries. TypeScript 7 does not provide classic
+`tsserver.js`. Compiler and server language-version equivalence is not promised.
+The classic TypeScript and language-server pins are updated manually to preserve
+`tsserver.js` and Pitako's Node >=22.19.0 floor.
+
+For Rust, install the `rust-analyzer` component of the project's Rust toolchain:
+
+```sh
+rustup component add rust-analyzer
+rust-analyzer --version
+```
+
+Keep its executable on PATH. Pitako does not install or require it at startup.
+Provision other servers in an environment you own. To override a server, set its
+command in project `.pi/lsp-client.json`, for example:
 
 ```json
 {
@@ -28,12 +55,8 @@ on PATH, or configure an absolute command in project `.pi/lsp-client.json`:
 }
 ```
 
-The server must resolve its classic `typescript/lib/tsserver.js`; TypeScript
-7.0.2 used by Pitako's sole `tsc --noEmit` gate does not provide that classic
-server. Compiler and server language-version equivalence is not promised.
-A selected server can require a newer Node runtime than Pitako's
-`>=22.19.0` host floor; provision its runtime separately. CodeGraph and ambient
-PATH are not evidence that a suitable server is installed.
+An overridden server may need a newer Node runtime or its own classic TypeScript
+installation. Provision those with the server.
 
 The external client's README is authoritative for its built-in languages and
 configuration. Project `.pi/lsp-client.json` overrides `~/.pi/lsp-client.json`;
@@ -55,8 +78,12 @@ applied.
 
 ## AST syntax tools
 
-Pitako bundles `@nicknisi/pi-ast-grep` 0.3.4, not the ast-grep CLI.
-Install the CLI separately and ensure `ast-grep --version` works on Pi's `PATH`.
+Pitako bundles `@nicknisi/pi-ast-grep` 0.3.4 and `@ast-grep/cli` 0.51.0.
+On load, Pitako uses `ast-grep` from `PATH` or adds its `node_modules/.bin`
+directory when needed. No separate CLI installation is required.
+Keep optional dependencies enabled when installing; they provide the native binary.
+The manifest trusts the CLI's `postinstall` script under Bun so the launcher does
+not emit fallback warnings, which the extension treats as errors on empty searches.
 The extension uses `ast-grep`, not `sg`, and adds no configuration files.
 
 `ast_search` matches syntax, not types. `ast_rewrite` requires an explicit file

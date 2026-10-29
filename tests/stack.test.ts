@@ -6,10 +6,27 @@ import { PitakoConfigError } from "../extensions/errors.ts";
 import { commandOnPath, packageRoot, prepareRuntime, readStack } from "../extensions/stack.ts";
 
 const roots: string[] = [];
+const requiredBins = ["typescript-language-server", "pyright-langserver", "intelephense", "codegraph", "ast-grep"];
 function fixtureRoot(prefix: string): string {
   const root = mkdtempSync(path.join(tmpdir(), prefix));
   roots.push(root);
   return root;
+}
+function runtimeRoot(): string {
+  const root = fixtureRoot("pitako-runtime-");
+  mkdirSync(path.join(root, "config"), { recursive: true });
+  const stack = readStack(packageRoot());
+  writeFileSync(path.join(root, "config", "stack.json"), JSON.stringify(stack));
+  for (const extension of stack.required) {
+    const entry = path.join(root, extension.entry);
+    mkdirSync(path.dirname(entry), { recursive: true });
+    writeFileSync(entry, "export {};\n");
+  }
+  return root;
+}
+function addBin(directory: string, name: string): void {
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(path.join(directory, process.platform === "win32" ? `${name}.cmd` : name), "");
 }
 afterEach(() => {
   for (const root of roots) rmSync(root, { recursive: true, force: true });
@@ -26,12 +43,15 @@ describe("stack configuration", () => {
     for (const [name, spec] of Object.entries(dependencies)) {
       const identity = identities[name];
       expect(spec).toBe(name === "pi-lsp-client"
-        ? `github:code-yeongyu/pi-lsp-client#${identity.revision}` : identity.version);
+        ? `github:code-yeongyu/pi-lsp-client#${identity.revision}`
+        : name === "typescript-compiler" ? `npm:typescript@${identity.version}` : identity.version);
       expect(JSON.parse(readFileSync(path.join(root, "node_modules", name, "package.json"), "utf8")).version)
         .toBe(identity.version);
     }
     expect(manifest.engines).toEqual({ node: ">=22.19.0", bun: ">1.4.2" });
-    expect(manifest.scripts.typecheck).toBe("tsc --noEmit");
+    expect(manifest.scripts.typecheck).toBe("node node_modules/typescript-compiler/bin/tsc --noEmit");
+    expect(manifest.devDependencies["typescript-compiler"]).toBe("npm:typescript@7.0.2");
+    expect(existsSync(path.join(root, "node_modules/typescript/lib/tsserver.js"))).toBe(true);
     for (const name of ["pi-ai", "pi-agent-core", "pi-coding-agent", "pi-tui"]) {
       expect(manifest.devDependencies[`@earendil-works/${name}`]).toBe("1.4.0");
       expect(manifest.peerDependencies[`@earendil-works/${name}`]).toBe(">=1.4.0");
@@ -45,6 +65,7 @@ describe("stack configuration", () => {
       pi: { extensions: string[]; skills: string[] };
       dependencies: Record<string, string>;
       bundledDependencies: string[];
+      trustedDependencies: string[];
     };
     const expected = [
       `./${stack.pitakoExtension}`,
@@ -61,10 +82,17 @@ describe("stack configuration", () => {
     if (!lsp) throw new Error("pi-lsp-client is missing from the required stack");
     expect(manifest.dependencies["pi-lsp-client"]).toBe(lsp.spec);
     expect(Object.keys(manifest.dependencies)).toEqual(expect.arrayContaining([
-      "@colbymchenry/codegraph", "@vndv/pi-codegraph", "@dietrichgebert/ponytail",
+      "@ast-grep/cli", "@colbymchenry/codegraph", "@vndv/pi-codegraph", "@dietrichgebert/ponytail",
       "@juicesharp/rpiv-todo", "billion-context-pi", "pi-codex-tools",
       "pi-hermes-memory", "pi-lsp-client", "pi-subagents", "pi-web-access", "smol-toml",
+      "typescript", "typescript-language-server", "pyright", "intelephense",
     ]));
+    expect(lsp.bins).toEqual(["typescript-language-server", "pyright-langserver", "intelephense"]);
+    expect(stack.required.flatMap(({ bins }) => bins ?? [])).toEqual(requiredBins);
+    for (const bin of requiredBins)
+      expect(commandOnPath(bin, path.join(root, "node_modules", ".bin"))).toBe(true);
+    expect(manifest.dependencies["rust-analyzer"]).toBeUndefined();
+    expect(manifest.bundledDependencies).not.toContain("intelephense");
     for (const [id, version] of Object.entries(manifest.dependencies)) {
       if (id !== "pi-lsp-client") expect(version).toMatch(/^\d+\.\d+\.\d+$/);
     }
@@ -75,7 +103,7 @@ describe("stack configuration", () => {
     }
     expect(stack.required.find(({ id }) => id === "@vndv/pi-codegraph")).toMatchObject({
       entry: "node_modules/@vndv/pi-codegraph/extensions/codegraph.ts",
-      bin: "codegraph",
+      bins: ["codegraph"],
     });
     expect(stack.required.some(({ id }) => id === "pitako-code-intelligence")).toBe(false);
     expect(manifest.pi.extensions.some((entry) => entry.includes("extensions/code-intelligence/"))).toBe(false);
@@ -83,9 +111,12 @@ describe("stack configuration", () => {
     expect(manifest.bundledDependencies).not.toContain("@ast-grep/napi");
     expect(manifest.dependencies["@nicknisi/pi-ast-grep"]).toMatch(/^\d+\.\d+\.\d+$/);
     expect(manifest.bundledDependencies).toContain("@nicknisi/pi-ast-grep");
+    expect(manifest.bundledDependencies).toContain("@ast-grep/cli");
+    expect(manifest.trustedDependencies).toContain("@ast-grep/cli");
     expect(stack.required.find(({ id }) => id === "@nicknisi/pi-ast-grep")).toEqual({
       id: "@nicknisi/pi-ast-grep", spec: `@nicknisi/pi-ast-grep@${manifest.dependencies["@nicknisi/pi-ast-grep"]}`,
       entry: "node_modules/@nicknisi/pi-ast-grep/index.ts",
+      bins: ["ast-grep"],
       tools: ["ast_search", "ast_rewrite"],
     });
     for (const name of ["@nredd/pi-dev-tools", "@nredd/pi-resource-sampler"]) {
@@ -195,22 +226,66 @@ describe("stack configuration", () => {
     }
   });
 
-  test("codegraph on PATH is accepted without a bundled binary", () => {
-    const root = fixtureRoot("pitako-bin-");
-    mkdirSync(path.join(root, "config"), { recursive: true });
-    const stack = readStack(packageRoot());
-    writeFileSync(path.join(root, "config", "stack.json"), JSON.stringify(stack));
-    for (const extension of stack.required) {
-      const entry = path.join(root, extension.entry);
-      mkdirSync(path.dirname(entry), { recursive: true });
-      writeFileSync(entry, "export {};\n");
-    }
+  test("required CLIs on PATH are accepted without bundled binaries", () => {
+    const root = runtimeRoot();
     const binDir = fixtureRoot("pitako-path-");
-    writeFileSync(path.join(binDir, "codegraph"), "");
+    for (const bin of requiredBins) addBin(binDir, bin);
     const env = { PATH: binDir };
     const prepared = prepareRuntime(root, env);
     expect(prepared.codegraph).toBe("path");
-    expect(commandOnPath("codegraph", env.PATH)).toBe(true);
+    for (const bin of requiredBins) expect(commandOnPath(bin, env.PATH)).toBe(true);
+    expect(env.PATH).toBe(binDir);
+  });
+
+  test.each(requiredBins)("installed %s fills a missing PATH entry", (bin) => {
+    const root = runtimeRoot();
+    const binDir = fixtureRoot("pitako-path-");
+    for (const other of requiredBins.filter(name => name !== bin)) addBin(binDir, other);
+    const bundledBinDir = path.join(root, "node_modules", ".bin");
+    addBin(bundledBinDir, bin);
+    const env = { PATH: binDir };
+    prepareRuntime(root, env);
+    expect(env.PATH).toBe([bundledBinDir, binDir].join(path.delimiter));
+    for (const name of requiredBins) expect(commandOnPath(name, env.PATH)).toBe(true);
+    prepareRuntime(root, env);
+    expect(env.PATH).toBe([bundledBinDir, binDir].join(path.delimiter));
+  });
+
+  test("all installed CLIs need only one PATH entry", () => {
+    const root = runtimeRoot();
+    const bundledBinDir = path.join(root, "node_modules", ".bin");
+    for (const bin of requiredBins) addBin(bundledBinDir, bin);
+    const env = { PATH: "" };
+    expect(prepareRuntime(root, env).codegraph).toBe("bundled");
+    expect(env.PATH).toBe(bundledBinDir);
+  });
+
+  test("installed ast-grep runs outside the package without fallback diagnostics", async () => {
+    const root = fixtureRoot("pitako-ast-cli-");
+    writeFileSync(path.join(root, "sample.ts"), "console.log(42);\n");
+    const env = { ...process.env };
+    prepareRuntime(packageRoot(), env);
+    const cli = path.join(packageRoot(), "node_modules", ".bin",
+      process.platform === "win32" ? "ast-grep.cmd" : "ast-grep");
+    const child = Bun.spawn([cli, "run", "--pattern=absentFunction()", "sample.ts"], {
+      cwd: root, env, stdout: "pipe", stderr: "pipe",
+    });
+    const [code, stdout, stderr] = await Promise.all([
+      child.exited, new Response(child.stdout).text(), new Response(child.stderr).text(),
+    ]);
+    expect(code).toBe(1);
+    expect(stdout).toBe("");
+    expect(stderr).toBe("");
+  });
+
+  test.each(requiredBins)("missing %s explains how to fix the install", (bin) => {
+    const root = runtimeRoot();
+    const binDir = fixtureRoot("pitako-path-");
+    for (const other of requiredBins.filter(name => name !== bin)) addBin(binDir, other);
+    const env = { PATH: binDir };
+    expect(() => prepareRuntime(root, env)).toThrow(`required program "${bin}"`);
+    expect(() => prepareRuntime(root, env)).toThrow(`node_modules/.bin/${bin}`);
+    expect(() => prepareRuntime(root, env)).toThrow("bun install");
     expect(env.PATH).toBe(binDir);
   });
 });

@@ -67,8 +67,24 @@ acceptance criteria with simplicity preferences. Project instructions and the
 assigned output schema/reporting override generic Ponytail prose and test-
 minimization preferences. Do not apply full/ultra unless the actual human asks.
 
-Use CodeGraph or LSP for structural questions, and raw read/search when unavailable
-or incomplete. Do not initialize indexes or install servers without permission.
+Choose navigation by question before broad grep:
+- Use `lsp_goto_definition`, `lsp_find_references`, `lsp_symbols`, and
+  `lsp_diagnostics` for symbol identity, references, outlines, and diagnostics.
+- Use `codegraph_explore` for architecture, `codegraph_callers` for call chains,
+  and `codegraph_impact` for affected code.
+- Use `ast_search` for syntax patterns, such as `console.log($$$ARGS)`, not types
+  or symbol identity.
+- Use grep for literal text, logs, and config. Use read for known source and
+  find or ls for file paths.
+
+Read the relevant source after navigation. Do not query every backend or
+approximate symbol references and syntax patterns with grep. If a backend is
+partial or unavailable, report the limit and fall back to targeted read/grep.
+Empty results do not prove absence. Do not initialize indexes or install servers
+without permission. For an authorized rename, use `lsp_prepare_rename`, then
+`lsp_rename`. For an authorized syntax replacement, preview `ast_rewrite` in an
+explicit file, inspect the matches, apply with `dryRun:false`, and inspect the diff.
+
 The official Codex adapter exposes apply_patch only on grammar-capable models;
 otherwise keep ordinary edit/write. Shell, tests and commits remain available.
 No subagent/delegation tools are granted. In execute, implement only the assigned
@@ -98,9 +114,6 @@ fixture/stability simplification or justified test retirement. Preserve required
 spec guarantees and recommend out-of-scope edits instead of making them. Do not
 hide flakes with green retries or fix timeouts by inflating deadlines.
 
-ACP from billion-context-pi is mandatory. Missing, disabled, unloadable or refused
-ACP is an unmet prerequisite; report it, never claim healthy operation or override
-user settings. Preserve upstream refusal guidance and native-compaction stand-down.
 Prefer covered deterministic Git/hash tools, composed with native codemode;
 retain shell/Python fallback only where the role permits it. Check structured ok
 and publication, not just display text. file_sha256 reads; only writers may use

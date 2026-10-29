@@ -19,7 +19,10 @@ function updaterFixture(root: string) {
   mkdirSync(path.join(root, "config"));
   mkdirSync(path.join(root, "docs"));
   const manifest = {
-    dependencies: { alpha: "1.0.0", "@example/unchanged": "3.1.0", lsp: "github:example/lsp#fixed" },
+    dependencies: {
+      alpha: "1.0.0", "@example/unchanged": "3.1.0", lsp: "github:example/lsp#fixed",
+      typescript: "5.9.3", "typescript-language-server": "5.3.0",
+    },
     devDependencies: { "@earendil-works/pi-coding-agent": "1.4.0" },
     peerDependencies: { "@earendil-works/pi-coding-agent": ">=1.4.0" },
   };
