@@ -33,7 +33,8 @@ Switch with `/pitako profile analysis` or start Pi with `--pitako-profile analys
 Prefer deterministic Git/hash tools for covered operations and compose them
 through native codemode. Keep bash/Python fallback for uncovered operations when
 your role permits it. `git_status` reports working changes, not every tracked
-file; structured `git_diff` returns statistics, not a patch/path array. Git queries
+file. Structured `git_diff` returns `stat` and the bounded `diff`, with
+`fullOutputPath` when truncated. Stat-only requests return an empty `diff`. Git queries
 may update metadata or spill output; they are not sandboxed.
 `file_sha256` reads only. Authorized writers use `file_sha256_save` to hash and
 atomically publish reusable items JSON in one call. Inspect structured `ok` and

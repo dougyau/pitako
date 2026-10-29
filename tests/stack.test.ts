@@ -81,6 +81,13 @@ describe("stack configuration", () => {
     expect(manifest.pi.extensions.some((entry) => entry.includes("extensions/code-intelligence/"))).toBe(false);
     expect(manifest.dependencies["@ast-grep/napi"]).toBeUndefined();
     expect(manifest.bundledDependencies).not.toContain("@ast-grep/napi");
+    expect(manifest.dependencies["@nicknisi/pi-ast-grep"]).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(manifest.bundledDependencies).toContain("@nicknisi/pi-ast-grep");
+    expect(stack.required.find(({ id }) => id === "@nicknisi/pi-ast-grep")).toEqual({
+      id: "@nicknisi/pi-ast-grep", spec: `@nicknisi/pi-ast-grep@${manifest.dependencies["@nicknisi/pi-ast-grep"]}`,
+      entry: "node_modules/@nicknisi/pi-ast-grep/index.ts",
+      tools: ["ast_search", "ast_rewrite"],
+    });
     for (const name of ["@nredd/pi-dev-tools", "@nredd/pi-resource-sampler"]) {
       expect(manifest.dependencies[name]).toBeUndefined();
       expect(manifest.bundledDependencies).not.toContain(name);

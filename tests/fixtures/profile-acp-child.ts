@@ -21,6 +21,7 @@ const root = path.resolve(import.meta.dir, "../.."), cwd = process.cwd();
 const mode = process.argv[2]!;
 const acpTools = ["compress", "decompress", "search_context", "acp_status", "acp_cache"];
 const mutators = [
+  "ast_rewrite",
   "file_sha256_save", "preview_export", "git_worktree_add", "git_worktree_remove", "git_worktree_prune", "git_commit",
   "ssh_exec", "ssh_pull", "ssh_push", "py_lint", "py_format", "py_typecheck", "py_test", "py_uv",
   "cargo_check", "cargo_clippy", "cargo_fmt", "cargo_test", "cargo_build", "cargo_run", "cargo_doc", "cargo_bench", "cargo_add",
@@ -75,7 +76,7 @@ try {
   };
   const captured = createCapturedChildHooks(runtime);
   const externalNames = plan.requiredChildTools.filter(name =>
-    /^(codegraph_|lsp_|web_|fetch_|source_|get_search_|apply_patch)/.test(name));
+    /^(codegraph_|lsp_|ast_|web_|fetch_|source_|get_search_|apply_patch)/.test(name));
   const controlledNavigation = { name: "controlled-navigation", factory(pi: sdk.ExtensionAPI) {
     for (const name of externalNames) pi.registerTool({
       name, label: name, description: "controlled external boundary", parameters: Type.Object({}),
@@ -102,6 +103,11 @@ try {
     // No real mutator executes: these owned counters reveal any boundary leak.
     pitako(pi);
     fileSha256(pi);
+    pi.registerTool({
+      name: "ast_search", label: "AST Search", description: "controlled search", exposure: "deferred",
+      parameters: Type.Object({}),
+      execute: async () => ({ content: [], details: {} }),
+    });
     for (const name of mutators.filter(name => name !== "file_sha256_save")) pi.registerTool({
       name, label: name, description: "controlled side effect", exposure: "deferred", parameters: Type.Object({}),
       execute: async () => { sideEffects++; return { content: [], details: {} }; },
@@ -167,6 +173,8 @@ try {
           assert.match(text(nested), new RegExp(`Pitako analysis forbids ${name}`));
         }
         assert.equal(sideEffects, 0);
+        assert.equal((await call("ast_search", {})).isError, false);
+        assert.equal((await call("codemode", { code: "await tools.ast_search({});" })).isError, false);
         assert.equal(existsSync(path.join(cwd, "forbidden")), false);
         const read = await call("file_sha256", { items: [{ path: "source" }] });
         assert.equal(read.isError, false);

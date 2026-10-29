@@ -82,7 +82,7 @@ export function registerGitTools(pi: ExtensionAPI): void {
 		name: "git_diff",
 		label: "git diff",
 		description:
-			"Unified diff of the working tree (default), the index (`staged`), or against a base ref. Starts with `--stat`; pass `stat: true` for the stat alone.",
+			"Unified diff of the working tree (default), the index (`staged`), or against a base ref. Structured results include the bounded `diff` and `stat`; pass `stat: true` for the stat alone.",
 		promptSnippet: "Show changes as a diff or stat (prefer over `bash git diff`)",
 		annotations: READ_ONLY,
 		parameters: Type.Object({
@@ -94,7 +94,13 @@ export function registerGitTools(pi: ExtensionAPI): void {
 			stat: Type.Optional(Type.Boolean({ description: "Only the diffstat." })),
 			timeout_s: ReadTimeout,
 		}),
-		outputSchema: orFailure(Type.Object({ changed: Type.Boolean(), stat: Type.String(), truncated: Type.Boolean() })),
+		outputSchema: orFailure(Type.Object({
+			changed: Type.Boolean(),
+			stat: Type.String(),
+			diff: Type.String({ description: "Bounded unified diff. Empty for stat-only requests or no changes." }),
+			truncated: Type.Boolean(),
+			fullOutputPath: Type.Optional(Type.String({ description: "Saved diff output when truncated." })),
+		})),
 		async execute(_id, params, signal, _update, ctx) {
 			const cwd = cwdOf(params, ctx);
 			const timeoutMs = readTimeout(params);
@@ -117,7 +123,7 @@ export function registerGitTools(pi: ExtensionAPI): void {
 			if (params.stat || !statText) {
 				return toolResult({
 					text: statText || "no changes",
-					structured: { changed: statText !== "", stat: statText, truncated: false },
+					structured: { changed: statText !== "", stat: statText, diff: "", truncated: false },
 				});
 			}
 			const full = await git([...common, `-U${params.context ?? 3}`, ...tail], { cwd, signal, timeoutMs });
@@ -126,7 +132,10 @@ export function registerGitTools(pi: ExtensionAPI): void {
 			const body = await bound(full.stdout, { label: "git-diff", alreadyDropped: full.stdoutDropped });
 			return toolResult({
 				text: `${statText}\n\n${body.text}`,
-				structured: { changed: true, stat: statText, truncated: body.truncated },
+				structured: {
+					changed: true, stat: statText, diff: body.text,
+					truncated: body.truncated, fullOutputPath: body.fullOutputPath,
+				},
 				details: { fullOutputPath: body.fullOutputPath },
 			});
 		},

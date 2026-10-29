@@ -53,6 +53,18 @@ tests its installed registration boundary, not upstream source compilation or
 post-edit/server compatibility. No dependency patch or compatibility cast is
 applied.
 
+## AST syntax tools
+
+Pitako bundles `@nicknisi/pi-ast-grep` 0.3.4, not the ast-grep CLI.
+Install the CLI separately and ensure `ast-grep --version` works on Pi's `PATH`.
+The extension uses `ast-grep`, not `sg`, and adds no configuration files.
+
+`ast_search` matches syntax, not types. `ast_rewrite` requires an explicit file
+and previews changes unless `dryRun:false` is supplied. Analysis blocks
+`ast_rewrite`, including previews and nested codemode calls, but keeps `ast_search`.
+The architect, reviewer, and scout load the extension with only `ast_search`
+allowed. The worker also allows `ast_rewrite`. Other child roles do not load it.
+
 ## Previews and questions
 
 Pitako loads these upstream entries directly in ordinary sessions, not in the

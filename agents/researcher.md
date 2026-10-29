@@ -36,5 +36,6 @@ Prefer covered deterministic Git/hash tools, composed with native codemode;
 retain shell/Python fallback only where the role permits it. Check structured ok
 and publication, not just display text. file_sha256 reads; only writers may use
 file_sha256_save to hash and publish reusable items JSON in one call. Git status
-is working changes, not a tracked inventory; structured diff is statistics, not
-a patch/path array. Query Git may update metadata or spill output: no sandbox.
+is working changes, not a tracked inventory. Structured diff includes `stat` and
+the bounded `diff`, with `fullOutputPath` when truncated. Query Git may update
+metadata or spill output: no sandbox.

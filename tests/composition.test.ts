@@ -105,6 +105,11 @@ describe("engineering-layer composition", () => {
       expect(body).toContain("unmet prerequisite");
       expect(body).toContain("native-compaction stand-down");
       expect(plan.fanoutAuthorized).toBe(false);
+      const usesAstGrep = ["architect", "reviewer", "scout", "worker"].includes(role);
+      expect(plan.requiredChildTools.includes("ast_search")).toBe(usesAstGrep);
+      expect(plan.requiredChildTools.includes("ast_rewrite")).toBe(role === "worker");
+      expect(plan.extensionArgs.includes(path.join(packageRoot(), "node_modules/@nicknisi/pi-ast-grep/index.ts")))
+        .toBe(usesAstGrep);
       if (role === "interview-relay") {
         expect(plan.effectiveToolAllowlist).toEqual(["contact_supervisor", ...acpTools]);
         expect(plan.configuredExtensions).toEqual([path.join(packageRoot(), "extensions/acp.ts")]);
@@ -292,11 +297,13 @@ describe("engineering-layer composition", () => {
       "codegraph_search", "codegraph_callers", "codegraph_callees", "codegraph_impact",
       "codegraph_explore", "codegraph_node", "codegraph_status", "codegraph_files",
       "lsp_diagnostics", "lsp_goto_definition", "lsp_find_references", "lsp_symbols",
+      "ast_search",
     ]);
     const providers = [
       "../extensions/dev-tools/index.ts", "../extensions/file-sha256.ts",
       "../node_modules/@vndv/pi-codegraph/extensions/codegraph.ts",
       "../node_modules/pi-lsp-client/src/index.ts",
+      "../node_modules/@nicknisi/pi-ast-grep/index.ts",
     ];
     expect(profile.subagentOnlyExtensions).toEqual(providers);
     for (const provider of providers)

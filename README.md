@@ -71,7 +71,8 @@ and local-path installs require their own release or checkout update.
 ## Use the coding baseline
 
 `coding` is the default profile. `/pitako profile analysis` disables `edit`,
-`write`, `apply_patch`, `lsp_rename`, hash saving, preview export, and introduced Git/SSH/Python/Cargo
+`write`, `apply_patch`, `lsp_rename`, `ast_rewrite`, hash saving, preview export,
+and introduced Git/SSH/Python/Cargo
 mutators, including nested codemode calls. Shell remains available, so analysis
 is not a sandbox. `--pitako-profile` takes precedence over `PITAKO_PROFILE`.
 
@@ -79,6 +80,12 @@ Pitako selects upstream `apply_patch` on grammar-capable OpenAI models and uses
 `edit` and `write` otherwise. The latter tools reject protected `.git`,
 `node_modules`, and environment-file paths. This guard does not constrain
 upstream `apply_patch` or shell.
+
+`@nicknisi/pi-ast-grep` adds `ast_search` for syntax matching and `ast_rewrite`
+for single-file replacements. Install the [ast-grep CLI](https://ast-grep.github.io/)
+separately and expose `ast-grep` on Pi's `PATH`. Rewrites preview by default;
+only `dryRun:false` applies changes. Inspect the preview and the resulting diff.
+Analysis keeps `ast_search` but blocks all `ast_rewrite` calls, including previews.
 
 Use `/pitako` for profile and skill status, `/todos` for the session task list,
 and `/board` for shared topics. Board tools are pull-only. They do not inject
@@ -96,7 +103,8 @@ technical-writing guidance. See [the coding router](skills/pitako-coding/SKILL.m
 Prefer bundled deterministic Git/hash tools for covered operations; compose them
 through native codemode and retain bash/Python fallback for uncovered operations.
 `git_status` reports working changes, not a tracked inventory; structured
-`git_diff` returns statistics, not patches or path arrays. `file_sha256` reads;
+`git_diff` returns `stat` and the bounded `diff`, with `fullOutputPath` when
+truncated. `stat:true` returns an empty `diff`. `file_sha256` reads;
 authorized writers use `file_sha256_save` to hash and atomically publish reusable
 items JSON in one call. Inspect structured `ok` and `publication`, not just text
 or absence of an exception.
