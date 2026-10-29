@@ -42,7 +42,9 @@
       "./node_modules/pi-subagents/bundle/index.js",
       "./extensions/acp.ts",
       "./node_modules/pi-hermes-memory/src/index.ts",
-      "./node_modules/pi-web-access/dist/index.js"
+      "./node_modules/pi-web-access/dist/index.js",
+      "./node_modules/pi-markdown-preview/index.ts",
+      "./node_modules/@juicesharp/rpiv-ask-user-question/index.ts"
     ],
     "skills": [
       "./skills/pitako-coding",
@@ -68,6 +70,7 @@
   "dependencies": {
     "@colbymchenry/codegraph": "1.6.2",
     "@dietrichgebert/ponytail": "5.3.2",
+    "@juicesharp/rpiv-ask-user-question": "2.15.0",
     "@juicesharp/rpiv-todo": "2.15.0",
     "@nicknisi/pi-ast-grep": "0.3.4",
     "@vndv/pi-codegraph": "0.1.11",
@@ -75,11 +78,14 @@
     "pi-codex-tools": "0.4.0",
     "pi-hermes-memory": "0.9.11",
     "pi-lsp-client": "github:code-yeongyu/pi-lsp-client#9d029fb32b721c038b58fb418b98bbfcf720cf0a",
+    "pi-markdown-preview": "0.25.0",
     "pi-subagents": "0.83.0",
-    "pi-web-access": "0.45.0"
+    "pi-web-access": "0.45.0",
+    "smol-toml": "1.9.1"
   },
   "bundledDependencies": [
     "@dietrichgebert/ponytail",
+    "@juicesharp/rpiv-ask-user-question",
     "@juicesharp/rpiv-todo",
     "@nicknisi/pi-ast-grep",
     "@vndv/pi-codegraph",
@@ -87,6 +93,7 @@
     "pi-codex-tools",
     "billion-context-pi",
     "pi-hermes-memory",
+    "pi-markdown-preview",
     "pi-subagents",
     "pi-web-access"
   ],

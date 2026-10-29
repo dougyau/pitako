@@ -15,6 +15,14 @@
     "gitHead": "16352ac229eb08a9598dcae48fe9f2b342567d86",
     "license": "MIT"
   },
+  "@juicesharp/rpiv-ask-user-question": {
+    "version": "2.15.0",
+    "registry": "https://registry.npmjs.org/@juicesharp/rpiv-ask-user-question/2.15.0",
+    "tarball": "https://registry.npmjs.org/@juicesharp/rpiv-ask-user-question/-/rpiv-ask-user-question-2.15.0.tgz",
+    "integrity": "sha512-Gm6de5IZF52BaSeh9dnDqJBn821Z5XfJkCmhkCmqTzvNv3SCpSv1mA4Gj5VBcfrSe+xTtWSVQzJwIqJFQHH3Lg==",
+    "gitHead": "ce6d3530410812ca504ec294995581a52170f9e1",
+    "license": "MIT"
+  },
   "@juicesharp/rpiv-todo": {
     "version": "2.15.0",
     "registry": "https://registry.npmjs.org/@juicesharp/rpiv-todo/2.15.0",
@@ -68,6 +76,14 @@
     "tarball": "https://registry.npmjs.org/pi-hermes-memory/-/pi-hermes-memory-0.9.11.tgz",
     "integrity": "sha512-94mMGy65ys/3VKzzI1M2ZMNDBC2WZ/QTw3IyftqNF4SBq0mQ21DazoM9flomMksjqccGqPz/hh6KsIG0Sth1Tg==",
     "gitHead": "71cf5ab7d909318a383bf52bb3ad3cf83a9efc03",
+    "license": "MIT"
+  },
+  "pi-markdown-preview": {
+    "version": "0.25.0",
+    "registry": "https://registry.npmjs.org/pi-markdown-preview/0.25.0",
+    "tarball": "https://registry.npmjs.org/pi-markdown-preview/-/pi-markdown-preview-0.25.0.tgz",
+    "integrity": "sha512-SGhniEWU/o4wBYfvkAZJj9KTmheCh6ntSvV/fTiHok1uRpATo+zDrlGLqi1+0jKf41yw3ZAeJFU+pnaedpptVA==",
+    "gitHead": "da8ca37328ee8b80f2f21a13316e9b009abcde5e",
     "license": "MIT"
   },
   "pi-subagents": {
@@ -135,6 +151,13 @@
     "tarball": "https://registry.npmjs.org/typebox/-/typebox-1.4.3.tgz",
     "integrity": "sha512-u3nyf7ZciAv1GOijVpI0TDt9At5wmEi7lSHSlRrnjuThv1DcB7fgGBqqrz+fGZ54jAfTpOOX0JXwxSIg3pnxQA==",
     "license": "MIT"
+  },
+  "smol-toml": {
+    "version": "1.9.1",
+    "registry": "https://registry.npmjs.org/smol-toml/1.9.1",
+    "tarball": "https://registry.npmjs.org/smol-toml/-/smol-toml-1.9.1.tgz",
+    "integrity": "sha512-j7WyPdf0CJoutMzMoPLF/bVXHtKZIT9Rb4eGeEbWw8X2t5oirjPgpL+OpaENZrILYaXqYwnVH+qgUwVbl+pUJQ==",
+    "license": "BSD-3-Clause"
   },
   "pi-lsp-client": {
     "version": "0.2.0",

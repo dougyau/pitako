@@ -5,7 +5,7 @@ import { MUTATING_TOOLS, parseProfile, profileNote, toolsForProfile } from "../e
 // Source behavior, not the provider's readOnlyHint: checks can run code/write caches.
 const introducedMutators = [
   "ast_rewrite",
-  "file_sha256_save", "git_worktree_add", "git_worktree_remove", "git_worktree_prune", "git_commit",
+  "file_sha256_save", "preview_export", "git_worktree_add", "git_worktree_remove", "git_worktree_prune", "git_commit",
   "ssh_exec", "ssh_pull", "ssh_push", "py_lint", "py_format", "py_typecheck", "py_test", "py_uv",
   "cargo_check", "cargo_clippy", "cargo_fmt", "cargo_test", "cargo_build", "cargo_run", "cargo_doc", "cargo_bench", "cargo_add",
 ];
@@ -27,6 +27,7 @@ const available = [
   "codegraph_search",
   "codegraph_callers",
   "todo",
+  "ask_user_question",
   "board_post",
   "board_query",
   ...introducedMutators, ...deterministicReads,
@@ -62,7 +63,7 @@ describe("profiles", () => {
 
   test("analysis removes file-mutating tools and keeps LSP and CodeGraph reads", () => {
     const tools = toolsForProfile({ available, profile: "analysis" });
-    for (const name of ["read", "bash", "grep", "find", "ls", "lsp_diagnostics", "codegraph_callers", "todo", "board_query"]) {
+    for (const name of ["read", "bash", "grep", "find", "ls", "lsp_diagnostics", "codegraph_callers", "todo", "board_query", "ask_user_question"]) {
       expect(tools).toContain(name);
     }
     for (const name of ["edit", "write", "apply_patch", "lsp_rename", ...introducedMutators]) {

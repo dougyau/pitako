@@ -172,7 +172,7 @@ describe("engineering-layer composition", () => {
       { cwd: packageRoot() } as ExtensionToolContext)).rejects.toBe(reason);
   });
 
-  test("TODO composition delegates upstream execution and keeps native model-only exposure", async () => {
+  test("TODO composition preserves upstream registration and default direct exposure", async () => {
     const upstream = { content: [], details: { tasks: [], nextId: 1 } };
     const execute = mock(async (..._args: unknown[]) => {
       return upstream;
@@ -187,7 +187,7 @@ describe("engineering-layer composition", () => {
       registerTool(tool: ToolDefinition) { tools.push(tool); },
       on() { return () => {}; },
       registerCommand() {},
-    };
+    } as unknown as ExtensionAPI;
     let forwarded: ExtensionAPI | undefined;
     const registration = spyOn(rpivTodo, "default").mockImplementation(api => {
       forwarded = api;
@@ -196,12 +196,11 @@ describe("engineering-layer composition", () => {
     });
     try {
       const extension = await import("../extensions/todo.ts");
-      extension.default(pi as unknown as ExtensionAPI);
+      extension.default(pi);
       expect(registration).toHaveBeenCalledTimes(1);
-      expect(forwarded?.on).toBe(pi.on);
-      expect(forwarded?.registerCommand).toBe(pi.registerCommand);
-      expect(tools[0]).toMatchObject({ name: todo.name, label: todo.label, description: todo.description, exposure: "model-only" });
-      expect(tools[0]!.parameters).toEqual(todo.parameters);
+      expect(forwarded).toBe(pi);
+      expect(tools[0]).toBe(todo);
+      expect(tools[0]!.exposure).toBeUndefined();
       const controller = new AbortController(), update = () => {};
       const ctx = { cwd: packageRoot(), sessionManager: {} } as unknown as ExtensionToolContext, args = {};
       const result = await tools[0]!.execute("native-id", args, controller.signal, update, ctx);
@@ -384,7 +383,7 @@ describe("engineering-layer composition", () => {
   test("ordinary delegation ships directly without the Pitako runtime", () => {
     const manifest = JSON.parse(readRepo("package.json"));
     const stack = JSON.parse(readRepo("config/stack.json"));
-    expect(manifest.dependencies["pi-subagents"]).toBe("0.83.0");
+    expect(manifest.dependencies["pi-subagents"]).toMatch(/^\d+\.\d+\.\d+$/);
     expect(manifest.bundledDependencies).toContain("pi-subagents");
     const piPackages = new Set([...Object.keys(manifest.devDependencies), ...Object.keys(manifest.peerDependencies)]);
     for (const name of piPackages) {
@@ -395,7 +394,7 @@ describe("engineering-layer composition", () => {
     expect(manifest.pi.extensions.filter((entry: string) => entry.includes("pi-subagents")))
       .toEqual(["./node_modules/pi-subagents/bundle/index.js"]);
     expect(stack.required.find((entry: { id: string }) => entry.id === "pi-subagents"))
-      .toEqual({ id: "pi-subagents", spec: "pi-subagents@0.83.0", entry: "node_modules/pi-subagents/bundle/index.js",
+      .toEqual({ id: "pi-subagents", spec: `pi-subagents@${manifest.dependencies["pi-subagents"]}`, entry: "node_modules/pi-subagents/bundle/index.js",
         tools: ["subagent", "subagents_enable", "bg_wait", "subagent_supervisor", "contact_supervisor"] });
     for (const resources of [manifest.pi.skills, manifest.pi.prompts])
       expect(resources.some((entry: string) => entry.includes("pi-subagents"))).toBe(false);
@@ -409,7 +408,6 @@ describe("engineering-layer composition", () => {
     for (const skill of ["plan", "execute", "grilling"]) expect(manifest.pi.skills).toContain(`./skills/${skill}`);
     expect(manifest.exports).toBeUndefined();
     expect(manifest.files).not.toContain("roles");
-    expect(manifest.dependencies["smol-toml"]).toBeUndefined();
   });
 
   test("review documentation ships through existing package resources", () => {

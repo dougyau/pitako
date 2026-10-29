@@ -15,6 +15,7 @@ const config = {
 };
 type Candidate = { head: string; fingerprint: string };
 type Request = { key: string; agent?: string; resume?: string; context?: string; cwd?: string; task: string;
+  label?: string; phase?: string;
   output?: string | boolean; outputSchema?: any; timeoutMs?: number; reads?: boolean; progress?: boolean; acceptance?: any; async?: boolean };
 type Result = Omit<Partial<WorkflowScriptChildResult>, "state"> & { ok: boolean; state?: string; structuredOutput?: any; [key: string]: any };
 type Outcome = { status: string; reason: string; loopsConsumed: number; loopReport: any; tokens: any; elapsedMs: number; [key: string]: any };
@@ -396,11 +397,16 @@ describe("workflow-owned execute controller", () => {
     const output = await host.executeNative();
     expect(output.status).toBe("complete"); expect(output.loopsConsumed).toBe(1);
     const director = host.calls[0]!;
+    expect(director).toMatchObject({ key: "invoke-human-1.l1.director", label: "Plan execution work", phase: "planning" });
+    expect(director.task.startsWith("Plan execution work\n\nASSOCIATION (data): ")).toBe(true);
     expect(director.agent).toBe("pitako.execution-director"); expect(director.task).toContain("then END");
     expect(director.outputSchema.properties.status.enum).toEqual(["plan", "needs-decision"]);
     expect(host.snapshots.some(value => value.loops?.[0]?.plan?.stage === "intention")).toBe(true);
     const workers = host.calls.filter(call => call.agent === "pitako.worker"); expect(workers).toHaveLength(2);
     for (const worker of workers) {
+      const selectedTask = JSON.parse(worker.task.split("COMPLETE SELECTED TASK:\n")[1]!.split("\nFROZEN ATTEMPT")[0]!);
+      expect(worker).toMatchObject({ label: selectedTask.goal, phase: "implementation" });
+      expect(worker.task.startsWith(`${selectedTask.goal}\n\nASSOCIATION (data): `)).toBe(true);
       expect(worker).toMatchObject({ context: "fresh", cwd: config.root, timeoutMs: 14400000, reads: false, progress: false, acceptance: { level: "none" } });
       expect(worker.acceptance.reason).toContain("root owns"); expect(worker.async).toBeUndefined();
       expect(worker.task).toContain("ALL COMPLETE SPEC SECTIONS"); expect(worker.task).toContain("FULL SHARED CONTEXT");
@@ -408,6 +414,9 @@ describe("workflow-owned execute controller", () => {
     }
     expect(host.calls.filter(call => call.agent === "pitako.execution-inspector")).toHaveLength(0);
     expect(host.calls.filter(call => call.key.endsWith(".compliance"))).toHaveLength(1);
+    const compliance = host.calls.find(call => call.key.endsWith(".compliance"))!;
+    expect(compliance).toMatchObject({ label: "Check whole-spec compliance", phase: "compliance" });
+    expect(compliance.task.startsWith("Check whole-spec compliance\n\nASSOCIATION (data): ")).toBe(true);
     expect(host.calls.findIndex(call => call.key.endsWith(".compliance"))).toBeGreaterThan(host.calls.findIndex(call => call.key.endsWith("director-synthesis")));
     expect(host.hostCalls.filter(key => key.startsWith("inspect-"))).toEqual(["inspect-initial", "inspect-loop-1"]);
     expect(output.actionRequired).toBe("none"); expect(output.reason).toContain("No more loops");
@@ -417,6 +426,24 @@ describe("workflow-owned execute controller", () => {
       outputPathMapping: { requestedPath: "invoke-human-1.l1.director.json", savedPath: "/native/remapped/invoke-human-1.l1.director.json" },
       results: [{ structuredOutputPath: "/native/witness/invoke-human-1.l1.director.json" }] });
     expect(host.current().snapshot.content).toBe("ALL COMPLETE SPEC SECTIONS");
+  });
+
+  test("Fleet titles collapse whitespace and stay concise without truncating the selected task", async () => {
+    const host = fixture();
+    const goal = "  Fix recovery\n after\t timeout " + "with complete evidence ".repeat(12);
+    host.setRespond((request, normal) => {
+      const result = normal();
+      if (request.key.endsWith(".director")) result.structuredOutput.tasks[0].goal = goal;
+      return result;
+    });
+    expect((await host.execute()).status).toBe("complete");
+    const worker = host.calls.find(call => call.agent === "pitako.worker")!;
+    expect(worker.label).toHaveLength(120);
+    expect(worker.label).toStartWith("Fix recovery after timeout with complete evidence");
+    expect(worker.label).toBe(worker.task.split("\n")[0]);
+    expect(worker.key).toBe("invoke-human-1.l1.t1.a1");
+    const selectedTask = JSON.parse(worker.task.split("COMPLETE SELECTED TASK:\n")[1]!.split("\nFROZEN ATTEMPT")[0]!);
+    expect(selectedTask.goal).toBe(goal);
   });
 
   test.each([2, 3, 4])("real %s-angle review includes critiques, one defense and synthesis, not include=material", async angles => {
@@ -722,6 +749,10 @@ describe("workflow-owned execute controller", () => {
     expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(2);
     expect(host.current().startedAt).toBe(1000);
     expect(host.calls.filter(call => call.agent === "pitako.execution-inspector").length).toBeGreaterThan(0);
+    for (const recovery of host.calls.filter(call => call.agent === "pitako.execution-inspector")) {
+      expect(recovery).toMatchObject({ label: "Recover complete execution plan", phase: "recovery" });
+      expect(recovery.task.startsWith(`${recovery.label}\n\nEXCEPTIONAL READ-ONLY`)).toBe(true);
+    }
   });
 
   test.each(["direct-values", "direct-conflict", "absent-binding", "absent-witness", "cache-only", "lost-definition", "changed-binding", "changed-native", "changed-order"])("recovery distinguishes %s using full originals and exact refs", async mode => {
@@ -847,10 +878,10 @@ describe("workflow-owned execute controller", () => {
       return { ok: true, results: [] };
     });
     const kind = phase === "plan" ? "loop-plan" : "attempt-result";
-    host.setRespond((request, normal) => request.task.startsWith(`EXCEPTIONAL READ-ONLY ${kind}`)
+    host.setRespond((request, normal) => request.phase === "recovery" && request.task.includes(`\n\nEXCEPTIONAL READ-ONLY ${kind}`)
       ? { ...normal(), ok: false, [signal]: true } : normal());
     expect((await host.execute()).status).toBe("cancelled");
-    expect(host.calls.some(call => call.task.startsWith(`EXCEPTIONAL READ-ONLY ${kind}`))).toBe(true);
+    expect(host.calls.some(call => call.phase === "recovery" && call.task.includes(`\n\nEXCEPTIONAL READ-ONLY ${kind}`))).toBe(true);
     expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(1);
     expect(host.calls.filter(call => call.key.endsWith(".director"))).toHaveLength(1);
   });
@@ -906,7 +937,10 @@ describe("workflow-owned execute controller", () => {
     });
     expect((await host.executeNative()).status).toBe("blocked");
     expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(1);
-    expect(host.calls.some(call => call.task.startsWith("EXCEPTIONAL READ-ONLY attempt-result"))).toBe(true);
+    expect(host.calls.some(call => call.phase === "recovery" && call.task.includes("\n\nEXCEPTIONAL READ-ONLY attempt-result"))).toBe(true);
+    expect(host.calls.find(call => call.phase === "recovery")).toMatchObject({
+      label: "Recover implementation result", phase: "recovery",
+    });
   });
 
   test("a formerly active unresolved writer is re-observed, not converted into a historical universal hold", async () => {

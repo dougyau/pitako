@@ -19,9 +19,10 @@ Analysis blocks `ast_rewrite` at the call boundary, including previews and
 codemode calls, while retaining `ast_search`. Architect, reviewer, and scout
 allow only `ast_search`; the worker also allows `ast_rewrite`. These four roles
 explicitly load the extension alongside LSP/CodeGraph.
-TODO wraps rpiv-todo and keeps
-`todo` model-only so nested codemode calls cannot lose the snapshots used by
-replay and readers. Board is repository-scoped storage shared by its worktrees.
+`extensions/todo.ts` re-exports
+rpiv-todo without changing tool exposure. `todo` is available directly and through
+codemode. Upstream persists mutations as session entries for replay.
+Board is repository-scoped storage shared by its worktrees.
 ACP loads before Hermes. Web access and pi-subagents are direct upstream entries.
 
 ACP keeps Pitako defaults `delegate:false`, `autoUpdate:false`, and

@@ -39,6 +39,10 @@ tasks with stable IDs, goal, source/context references, scope, allowed effects,
 expected result and concrete mandatory command/cwd/requirement checks. The LAST
 task must verify the final candidate after all writes, even if code already
 exists. This is the only task definition, not a summary or a second checklist.
+Write each goal as a concise title describing the concrete work, for example
+"Fix execution recovery after timeout". The root uses it as the worker's Fleet
+label and first task line. Keep mission IDs, worktree paths and clipboard
+filenames in association/context fields, not as task titles.
 Do not expand scope, invent authorization or derive native artifact paths.
 Missing product decisions return `needs-decision` with the concrete question.
 

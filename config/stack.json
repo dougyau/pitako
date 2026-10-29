@@ -132,6 +132,18 @@
       "spec": "pi-web-access@0.45.0",
       "entry": "node_modules/pi-web-access/dist/index.js",
       "tools": ["web_search", "fetch_content", "source_check", "get_search_content", "web_enable"]
+    },
+    {
+      "id": "pi-markdown-preview",
+      "spec": "pi-markdown-preview@0.25.0",
+      "entry": "node_modules/pi-markdown-preview/index.ts",
+      "tools": ["preview_export"]
+    },
+    {
+      "id": "@juicesharp/rpiv-ask-user-question",
+      "spec": "@juicesharp/rpiv-ask-user-question@2.15.0",
+      "entry": "node_modules/@juicesharp/rpiv-ask-user-question/index.ts",
+      "tools": ["ask_user_question"]
     }
   ],
   "optional": []

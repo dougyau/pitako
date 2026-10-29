@@ -18,14 +18,61 @@ initialization. CodeGraph tools use an existing index and do not initialize or
 refresh it themselves. If CodeGraph or an LSP server is unavailable, use the
 ordinary read and search tools. See [verification](GATES.md) for the test procedure.
 
+### Herdr worktrees
+
+[`.herdr/worktree.toml`](.herdr/worktree.toml) configures Herdr UI to run
+`bash scripts/setup-worktree.sh` in new worktrees. Unlike basic setup, this
+script requires a current CodeGraph index and reports preparation failures.
+Herdr owns script execution and asks for human trust approval.
+
+When `HERDR_ENV=1`, Pitako checks the current checkout at interactive session
+startup. If `scripts/setup-worktree.sh` exists but the recommended Herdr setup
+entry is missing or different, it suggests the configuration once per session.
+Custom setup is not assumed incorrect. Pitako does not edit files, execute setup,
+or approve trust. Non-UI sessions and pi-subagents children do not show the notice.
+An existing entry does not prove that setup completed in this checkout, and this
+hook does not guarantee setup for worktrees created through Git or the daemon CLI.
+
 For another project, install the package through Pi's package mechanism. The
 package manifest declares its extensions, skills, prompts, and agent profiles.
 Do not install those entries a second time as separate Pitako resources.
 
+## Update dependencies
+
+The [Update dependencies workflow](.github/workflows/update-dependencies.yml)
+runs every Monday at 05:17 UTC and supports manual runs from GitHub Actions.
+It updates npm runtime dependencies to exact versions, regenerates `bun.lock`,
+and synchronizes stack versions, existing dependency version notices, and
+`docs/dependency-releases.json` with exact-version npm release provenance.
+Pi host packages, development dependencies, the Git-pinned LSP dependency, and
+vendored skills stay unchanged.
+
+The workflow prepares the checkout and runs `bun run typecheck`, `bun run test`,
+and `git diff --check` before creating or updating one dependency PR.
+Dependency code runs in a read-only job. Only the separate PR job has write access.
+If the PR matches the verified candidate, the workflow requests squash auto-merge.
+Failed checks prevent publication and auto-merge. No changes means no new PR.
+
+Enable **Allow GitHub Actions to create and approve pull requests** under
+**Settings > Actions > General > Workflow permissions**.
+Also enable **Allow auto-merge** and **Allow squash merging** under
+**Settings > General > Pull Requests**.
+Branch protection requirements still apply; the workflow does not bypass them.
+PRs created with `GITHUB_TOKEN` do not trigger other GitHub Actions workflows.
+If branch rules require separate PR checks, configure their trigger or an
+appropriate bot token before expecting automatic merges.
+Passing Pitako's checks does not certify upstream compatibility or licenses.
+The workflow does not publish npm releases.
+
+After merging, `pi update --extensions` receives these versions when Pitako is
+installed from the updated Git branch. Pinned tags, pinned commits, npm installs,
+and local-path installs require their own release or checkout update.
+
 ## Use the coding baseline
 
 `coding` is the default profile. `/pitako profile analysis` disables `edit`,
-`write`, `apply_patch`, `lsp_rename`, `ast_rewrite`, hash saving, and introduced Git/SSH/Python/Cargo
+`write`, `apply_patch`, `lsp_rename`, `ast_rewrite`, hash saving, preview export,
+and introduced Git/SSH/Python/Cargo
 mutators, including nested codemode calls. Shell remains available, so analysis
 is not a sandbox. `--pitako-profile` takes precedence over `PITAKO_PROFILE`.
 
@@ -43,6 +90,11 @@ Analysis keeps `ast_search` but blocks all `ast_rewrite` calls, including previe
 Use `/pitako` for profile and skill status, `/todos` for the session task list,
 and `/board` for shared topics. Board tools are pull-only. They do not inject
 posts into every turn.
+
+Pitako also bundles Markdown previews through `/preview` and structured questions
+through `ask_user_question`. See [preview settings](docs/configuration.md#previews-and-questions)
+for external prerequisites. Mermaid renders in previews independently of Pi's
+native inline renderer.
 
 Load specialized skills only when they apply. The default collection includes
 Ponytail, Caveman, investigation, architecture, review, verification, and

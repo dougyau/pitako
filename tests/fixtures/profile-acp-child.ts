@@ -22,7 +22,7 @@ const mode = process.argv[2]!;
 const acpTools = ["compress", "decompress", "search_context", "acp_status", "acp_cache"];
 const mutators = [
   "ast_rewrite",
-  "file_sha256_save", "git_worktree_add", "git_worktree_remove", "git_worktree_prune", "git_commit",
+  "file_sha256_save", "preview_export", "git_worktree_add", "git_worktree_remove", "git_worktree_prune", "git_commit",
   "ssh_exec", "ssh_pull", "ssh_push", "py_lint", "py_format", "py_typecheck", "py_test", "py_uv",
   "cargo_check", "cargo_clippy", "cargo_fmt", "cargo_test", "cargo_build", "cargo_run", "cargo_doc", "cargo_bench", "cargo_add",
 ];
