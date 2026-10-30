@@ -2062,6 +2062,40 @@ describe("workflow-owned execute controller", () => {
     expect(host.current().loops[0].results[0].checks).toMatchObject({ current: true, count: 2 });
   });
 
+  test.each(["blocked", "continue", "gaps", "complete"])(
+    "worker %s with uncaptured mandatory checks retains diagnostics but cannot attest completion", async status => {
+      const host = fixture(undefined, { readOnly: true }); host.setLimit(1);
+      let original: any;
+      host.setRespond((request, normal) => {
+        const result = normal();
+        if (request.key === "invoke-human-1.l1.t1.a1") {
+          const value = result.structuredOutput;
+          value.status = status;
+          value.diagnosis = "Checkpoint durable association mismatch.";
+          value.remaining = status === "complete" ? [] : ["Capture failed before implementation"];
+          value.usefulProgress = false; value.continuation = null;
+          value.checks[0] = { ...value.checks[0], result: "not-run",
+            output: "Checkpoint capture failed before checks", before: null, after: null };
+          original = copy(value);
+        }
+        return result;
+      });
+      const output = await host.executeNative();
+      expect(output.status).not.toBe("complete");
+      expect(host.calls.some(call => call.key.includes(".review.") || call.key.endsWith(".compliance"))).toBe(false);
+      expect(host.native.get("invoke-human-1.l1.t1.a1")!.structuredOutput).toEqual(original);
+      const results = host.current().loops[0].results;
+      if (status === "complete") {
+        expect(results).toHaveLength(0);
+        expect(output.reason).toContain("Missing checkoutEvidence candidate identity.");
+      } else {
+        expect(results).toHaveLength(1);
+        expect(results[0]).toMatchObject({ status, diagnosis: "Checkpoint durable association mismatch.",
+          checks: { current: false, count: 1, passed: 0, failed: 0, notRun: 1 } });
+        if (status === "blocked") expect(output.reason).toContain("Checkpoint durable association mismatch.");
+      }
+    });
+
   test.each(["missing-mandatory", "duplicate-mandatory", "duplicate-additional", "empty-id", "empty-command",
     "empty-cwd", "empty-output", "invalid-logs", "invalid-log-entry", "invalid-result", "missing-identity",
     "changed-mandatory-command", "changed-mandatory-cwd"])("additional checks cannot hide %s evidence", async mode => {

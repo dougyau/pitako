@@ -3385,7 +3385,7 @@ test("registered Node public root resume consumes durable results and closes the
     const {registerHooks, stripTypeScriptTypes} = require("node:module");
     const input = JSON.parse(fs.readFileSync(0, "utf8"));
     const base = input.packageRoot + "/node_modules/pi-subagents/src/";
-    const workflowURL = pathToFileURL(base + "workflows/scripted-workflow.js").href;
+    const workflowURL = pathToFileURL(fs.realpathSync(base + "workflows/scripted-workflow.js")).href;
     registerHooks({load(url, context, next) {
       if (url === workflowURL) return {format:"module", shortCircuit:true, source:
         'export * from ' + JSON.stringify(url + '?original') + '; import {runWorkflowScript as run} from ' + JSON.stringify(url + '?original') +

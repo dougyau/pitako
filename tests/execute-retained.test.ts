@@ -105,3 +105,14 @@ test.each(["stopped", "interrupted", "detached"])("missing status does not erase
 	writeFileSync(f.statePath, JSON.stringify(state));
 	expect(f.load()).toMatchObject([{ ok: false, [field]: true }]);
 }));
+
+test("missing native state never substitutes metadata containing invocation-shaped data", () => fixture(f => {
+	writeFileSync(f.mission, readFileSync(f.statePath));
+	rmSync(f.statePath);
+	expect(f.load()).toEqual([]);
+}));
+
+test("corrupt native state is not treated as a fresh invocation", () => fixture(f => {
+	writeFileSync(f.statePath, "{invalid");
+	expect(f.load).toThrow();
+}));
