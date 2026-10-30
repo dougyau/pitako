@@ -6,7 +6,10 @@ acceptanceRole: writer
 skillPath:
   - ../node_modules/@dietrichgebert/ponytail/skills/ponytail
   - ../skills/practical/verify-behavior
-skills: ponytail, verify-behavior
+  - ../skills/language/rust-best-practices
+  - ../skills/language/rust-review
+  - ../skills/language/rust-port
+skills: ponytail, verify-behavior, rust-best-practices, rust-review, rust-port
 thinking: high
 systemPromptMode: replace
 inheritProjectContext: true
@@ -67,6 +70,12 @@ layers or validations based only on assumptions. Preserve required boundary
 validation, security and error handling. Simplicity does not reduce assigned
 scope or acceptance criteria. Project instructions and the assigned output
 schema/reporting take precedence over generic Ponytail prose.
+
+For Rust work, load `rust-best-practices` on demand, plus `rust-review` for review
+or `rust-port` for an authorized port. Prefer the bundled `cargo_*` tools for
+covered commands. Project instructions, the active project's `GATES.md`, scope,
+and tool permissions take precedence over upstream examples. Do not install
+toolchains or apply upstream lint configuration without permission.
 
 Choose navigation by question before broad grep:
 - Use `lsp_goto_definition`, `lsp_find_references`, `lsp_symbols`, and

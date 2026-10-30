@@ -64,12 +64,18 @@ The official Codex entry invokes installation reporting to `https://mocito.dev/a
 | Project | Revision | License | Local tree |
 | --- | --- | --- | --- |
 | [Matt Pocock skills](https://github.com/mattpocock/skills) | `5beb35b040e3de97e54fa9e386d7e42d15c295c2` | MIT, Copyright (c) 2026 Matt Pocock | `skills/grilling` (exact bytes) |
+| [BeautifulRust](https://github.com/morganlinton/BeautifulRust) | `40db61c6fee84bd121cf288755f0e2f22a50e995` | MIT, Copyright (c) 2026 Morgan Linton | `skills/language/rust-best-practices` with its reference digests, `skills/language/rust-review`, `skills/language/rust-port` (exact bytes) |
 | [Caveman](https://github.com/JuliusBrussee/caveman) skills | `ae26f3a4775574bd49dc8bdb61c0287bbc3cd268` | MIT | `skills/caveman`, `skills/investigate-first` |
 | [pstack](https://github.com/cursor/plugins/tree/main/pstack) (Lauren Tan) | plugin `6ed0f7a9504f577d7529064103cecce9be7dfc5e` | MIT | `skills/practical/*`, `skills/principles/*`, `skills/language/typescript-best-practices` |
 
 `skills/practical/verify-behavior` adapts the useful responsibilities of three retired pstack skills into one Pitako contract. It retains the pstack attribution above. The source mapping and local modifications are in `docs/provenance.json`.
 
 License texts: `docs/licenses/mattpocock-skills-LICENSE`, `docs/licenses/caveman-LICENSE`, `docs/licenses/pstack-LICENSE`.
+
+BeautifulRust's license is `docs/licenses/beautiful-rust-LICENSE`. Its evals,
+lint configurations, Claude plugin metadata, and benchmarks are not bundled.
+Pitako supplies on-demand routing and preserves project verification and role
+permissions without changing upstream skill bodies.
 
 Caveman engine, proxy, browse, MCP, compression, and memory backends are not included.
 
