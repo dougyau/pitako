@@ -1131,12 +1131,12 @@ function workerValue(result, descriptor, task, statusRef) {
     // Only planned checks attest to the candidate. Diagnostic identities may be
     // unknown or non-verifiable; preserve them without normalization.
     return definition ? { ...check, requirement: definition.requirement,
-      before: candidate(check.before), after: candidate(check.after) } : { ...check };
+      ...(value.status === "complete" ? { before: candidate(check.before), after: candidate(check.after) } : {}) } : { ...check };
   });
   // Historical diagnostics retain their evidence without becoming new mandatory gates.
   const checksCurrent = checks.filter(check => task.checks.some(required => required.id === check.id))
     .every(check => check.result === "passed" &&
-      same(check.before, check.after) && same(check.after, value.candidate));
+      same(check.before, value.candidate) && same(check.after, value.candidate));
   if (value.status === "complete" && (!checksCurrent || value.remaining.length))
     throw new Error("Task complete contradicts current mandatory checks or pending work.");
   return { value, checks, checksCurrent };
