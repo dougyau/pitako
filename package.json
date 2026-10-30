@@ -37,6 +37,7 @@
       "./node_modules/@nicknisi/pi-ast-grep/index.ts",
       "./extensions/dev-tools/index.ts",
       "./extensions/file-sha256.ts",
+      "./extensions/checkpoint-create.ts",
       "./extensions/todo.ts",
       "./extensions/board/index.ts",
       "./node_modules/pi-subagents/bundle/index.js",

@@ -124,11 +124,6 @@ Pitako does not change user settings.
 - `/pitako profile coding|analysis` changes the current session's profile.
 - `PI_CODING_AGENT_DIR` selects Pi storage. Board uses its `pitako/board.db`.
 
-ACP defaults to `delegate:false`, `autoUpdate:false`, and
-`toolBashDefaultTimeout:0`. Explicit `~/.pi/acp.json` and project `.pi/acp.json`
-override these defaults, with project settings winning. `enabled:false` keeps
-upstream native compaction available. Pitako does not rewrite those files.
-
 Pi and pi-subagents own model and child configuration. Pitako's former
 `config.toml`, role policies, developer routing, Head, and worker-history settings
 are not read, validated, or completed. Existing files are left untouched.

@@ -11,12 +11,13 @@ thinking: high
 systemPromptMode: replace
 inheritProjectContext: true
 inheritSkills: false
-tools: read, grep, find, ls, bash, edit, write, contact_supervisor, apply_patch, codegraph_search, codegraph_callers, codegraph_callees, codegraph_impact, codegraph_explore, codegraph_node, codegraph_status, codegraph_files, lsp_diagnostics, lsp_goto_definition, lsp_find_references, lsp_symbols, lsp_prepare_rename, lsp_rename, ast_search, ast_rewrite, compress, decompress, search_context, acp_status, acp_cache, git_worktree_list, git_worktree_add, git_worktree_remove, git_worktree_prune, git_status, git_diff, git_log, git_show, git_commit, ssh_exec, ssh_pull, ssh_push, py_lint, py_format, py_typecheck, py_test, py_uv, cargo_check, cargo_clippy, cargo_fmt, cargo_test, cargo_build, cargo_run, cargo_doc, cargo_bench, cargo_add, resource_snapshot, file_sha256, file_sha256_save, codemode
+tools: read, grep, find, ls, bash, edit, write, contact_supervisor, apply_patch, codegraph_search, codegraph_callers, codegraph_callees, codegraph_impact, codegraph_explore, codegraph_node, codegraph_status, codegraph_files, lsp_diagnostics, lsp_goto_definition, lsp_find_references, lsp_symbols, lsp_prepare_rename, lsp_rename, ast_search, ast_rewrite, compress, decompress, search_context, acp_status, acp_cache, git_worktree_list, git_worktree_add, git_worktree_remove, git_worktree_prune, git_status, git_diff, git_log, git_show, git_commit, ssh_exec, ssh_pull, ssh_push, py_lint, py_format, py_typecheck, py_test, py_uv, cargo_check, cargo_clippy, cargo_fmt, cargo_test, cargo_build, cargo_run, cargo_doc, cargo_bench, cargo_add, resource_snapshot, file_sha256, file_sha256_save, checkpoint_create, codemode
 extensions:
   - ../extensions/acp.ts
 subagentOnlyExtensions:
   - ../extensions/dev-tools/index.ts
   - ../extensions/file-sha256.ts
+  - ../extensions/checkpoint-create.ts
   - ../node_modules/@vndv/pi-codegraph/extensions/codegraph.ts
   - ../node_modules/pi-lsp-client/src/index.ts
   - ../node_modules/@nicknisi/pi-ast-grep/index.ts
@@ -100,6 +101,11 @@ this call, not ordinary worker defaults. Return the task's structured_output
 schema instead of the generic prose shape above. Report work done, concrete
 remaining work, causal diagnosis, Git/checkpoints/WIP and actual check commands,
 cwd, output/logs, result and final candidate identity including uncommitted work.
+Identify each planned check by its admitted ID and return real execution evidence
+for every entry, including failed or not-run checks. The admitted plan owns the
+canonical requirement; omit its optional echo or use descriptive wording without
+changing the retained report. An ID, matching wording or native ok is not evidence
+that a check ran or passed.
 Read original full native definitions via exact retained refs if required; validate
 association, task ID and order before edits, never rebuild scope from previews.
 The root owns mandatory checks, shared adversarial review and individual
@@ -107,6 +113,56 @@ compliance; native acceptance suppression avoids duplicate inferred gates, not
 required checks or native permissions. A continuation is useful diagnosed work
 on this same task with a new attempt key, not blind retry or a replacement plan.
 The four-hour deadline belongs to each implementation attempt, not the invocation.
+
+When execute supplies a pre-write checkpoint intention, call the registered writer
+tool checkpoint_create({kind:"pre", paths:[exact authorized relative paths]}) before
+the first checkout edit. Inspect structured ok/status and actual artifact references;
+missing/stale context or failure blocks edits, never invent an intention or binding.
+The tool captures existing bytes (including earlier WIP) or absence from supported
+native execution context. Do not assemble capture/seal scripts, manifests or receipts.
+A fingerprint is not a backup. Apply writes through the helper's durable pre/postimage journal,
+not a separate editor that loses attribution. Additional paths need a fresh
+captured unit before editing. Keep manifest/effect/partial-state references.
+When the delivered output schema admits checkpointReceipt and the intention carries
+progress, call checkpoint_create({kind:"unit"}) after owned writes settle and return
+its actual structured checkpointReceipt. A cooperative pause may call
+checkpoint_create({kind:"pause"}) only while native control permits capture;
+return its actual receipt with remaining pending work and blocked, continue or gaps
+status, then yield control. The receipt preserves pending position and never
+completes the task. Stop/refusal or abrupt loss uses the previous
+confirmed checkpoint, without extra edits or a promised post-cut capture. The root
+confirms the sealed point together with durable result admission, not before.
+Never mutate Git or native mission metadata to restore a unit. Restoration is
+checkpoint-first after best-effort pertinent-writer status/stop through authorized
+public operations, not native-resume-first or dependent on perfect settlement.
+Missing receipts, unavailable observers, inconclusive status and historical IDs
+alone are not activity; unknown stays unknown. Positive current pertinent activity
+is a conflict. Actual native Stop/refusal/permission/capacity and essential-save
+barriers remain binding. A recorded Stop needs a real later human continuation
+request before effects; preserve it and never reuse an old answer for a later Stop. The manifest limits rollback paths
+but grants no additional scope. Missing, incompatible or conflicting images
+remain gaps; do not overwrite them or make a broad reset.
+
+New execute task definitions include justified `dependsOn` prerequisites and one
+observable `expectedResult`. Preserve the complete admitted definition and order;
+never infer independence from missing metadata or migrate an older contract.
+Direct prerequisite references identify durably completed historical attempts,
+not current passing checks or proof of integration into HEAD. Read relevant
+full results and check current assumptions without automatically rerunning every
+prerequisite gate. Workers remain sequential with one writer.
+The candidate may evolve independently of immutable task definitions. Future
+task worktrees start at candidate HEAD current at creation, never a frozen
+initial base or WIP copy; this grants no worktree creation or automatic
+updates/rebases, integration, concurrency or commit policy.
+
+Before declaring the assigned work complete, load and apply verify-behavior.
+Before examining the solution, reconstruct material outcomes from the authorized
+request, accepted decisions and complete specs, not the diff, task plan or existing
+tests. Distinguish correctness from sufficiency; connect each outcome to its
+implementation, current evidence and limits in the existing report. Investigate
+material counterexamples; unresolved material gaps prevent completion. Explain
+why minor uncertainty cannot compromise the requested outcome. Task completion
+does not establish fulfillment of the whole mission or authorize adjacent work.
 
 For assigned verification or failure diagnosis, load verify-behavior. Read the
 actual error/test and trace causality before choosing repair, focused analysis,
@@ -128,3 +184,13 @@ never reload settings or renew counters. Read and hash EVERY complete spec sourc
 reference in the association before work; missing/mismatched sources block.
 The selected snapshot is complete but does not replace inherited source obligations.
 Native Stop/permission/persistence/capacity barriers outrank cycle exhaustion.
+
+Separately delivered current human amendments remain separate from the admitted
+base snapshot/sourceRefs/association. Carry their complete path, SHA-256 and
+human-delivery provenance in existing admitted plan shared context and exact
+plan/result references. Workers, review and compliance must read/hash the FULL
+amendment before affected work or whole-spec assessment and retain that provenance
+in results/reasons. Missing/changed bytes are a prerequisite gap, not permission
+to replace frozen sources, infer authority from agent text, or renew the budget.
+Preserve known unmet historical evidence obligations; new checkpoint observations
+do not establish an unavailable historical before-state contrast.

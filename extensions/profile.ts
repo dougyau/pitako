@@ -10,7 +10,7 @@ export const ANALYSIS_BUILTINS = ["read", "bash", "grep", "find", "ls"] as const
 // Source behavior in pi-dev-tools 0.6.0, not its optimistic readOnlyHint annotations:
 // SSH executes/transfers; every Python/Cargo tool can execute code or write env/build/cache data.
 export const MUTATING_TOOLS = new Set([
-  "edit", "write", "apply_patch", "lsp_rename", "ast_rewrite", "file_sha256_save", "preview_export",
+  "edit", "write", "apply_patch", "lsp_rename", "ast_rewrite", "file_sha256_save", "checkpoint_create", "preview_export",
   "git_worktree_add", "git_worktree_remove", "git_worktree_prune", "git_commit",
   "ssh_exec", "ssh_pull", "ssh_push",
   "py_lint", "py_format", "py_typecheck", "py_test", "py_uv",
@@ -92,8 +92,9 @@ export function profileNote(profile: ProfileName): string {
     "Inspect named files first. Choose navigation by question before broad grep: LSP for definitions, references, symbols and diagnostics; CodeGraph for architecture, call chains and impact; ast_search for syntax patterns; grep for literal text, logs and config. Read source afterward. Report partial or unavailable backends; fall back to read/grep. Empty results do not prove absence.",
     "Prefer covered deterministic Git/hash tools; bash/Python remain fallback. In codemode check ok. file_sha256 reads; writer file_sha256_save hashes/saves reusable items JSON once; check publication too.",
     "Keep diffs small. Reuse code; avoid speculation. Verify real behavior before claiming done. Select checks for the active project's own behavior and declared testing scope.",
+    "First load and apply verify-behavior.",
     "Load a specialized skill only when it applies. Research or design does not authorize implementation.",
-    "Default to conversation or analysis. Describing a problem, proposing changes or asking a question does not authorize planning or implementation. Clear instructions can authorize work without magic words. A request for a new plan authorizes planning only, not implementation. A plan or available tools alone grants no implementation authority. Conversation does not revoke already authorized work; continue it within its captured scope.",
+    "Default to conversation or analysis. Problems, proposals and questions do not authorize planning or implementation. Clear instructions can authorize work without magic words. New-plan requests authorize planning only; plans and tools grant no implementation authority. Conversation does not revoke already authorized work; continue it within its captured scope.",
     "For authorized delegation, use pi-subagents. Pass scope, effects and checks explicitly. Analysis delegates must be read-only. If required tools are absent or fail, report the blocker.",
     "For authorized consultation or escalation, use oracle through pi-subagents after confirming its profile is available. Architect is not a general escalation role.",
     "Architecture and review skills initiate their pi-subagents workflows; scripts dispatch. /plan produces confirmed specs; /execute root owns dispatch, shared review and compliance with frozen pitako.execute.maxCycles (default 3). /task is unavailable.",

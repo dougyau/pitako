@@ -21,7 +21,7 @@ Pitako composes Pi packages and vendors selected MIT skills. It does not ship BS
 | [@nicknisi/pi-ast-grep](https://github.com/nicknisi/pi-extensions/tree/main/packages/ast-grep) 0.3.4 (Nick Nisi) | MIT | Syntax search and preview-first rewrites through Pitako's ast-grep CLI dependency. Bundled unchanged with its `LICENSE` and `THIRD_PARTY_NOTICES.md`. |
 | [@ast-grep/cli](https://github.com/ast-grep/ast-grep) 0.51.0 | MIT | ast-grep CLI with platform-specific optional binaries. Bundled into the Pitako package tarball. |
 | [pi-codex-tools](https://github.com/jvm/pi-mono/tree/main/packages/pi-codex-tools) 0.4.0 | Apache-2.0; OpenAI Codex attribution | Official extension registers `apply_patch` and invokes upstream install telemetry. Bundled unchanged. |
-| [billion-context-pi](https://github.com/ranxianglei/billion-context-pi) 0.1.83 (ranxianglei) | MIT | ACP context compression through the public factory. Bundled unchanged, with delegation and updates off by default. |
+| [billion-context-pi](https://github.com/ranxianglei/billion-context-pi) 0.1.83 (ranxianglei) | MIT | Context compression through the public factory. Bundled unchanged. |
 | [acp-kernel](https://github.com/ranxianglei/acp-kernel) 0.0.98 (ranxianglei) | MIT with an additional visible-attribution term | Compression engine bundled inline in billion-context-pi's `dist/index.js`. Pitako uses acp-kernel through that package. |
 | [@vndv/pi-codegraph](https://github.com/vndv/pi-codegraph) | MIT | CodeGraph tools |
 | [@colbymchenry/codegraph](https://github.com/colbymchenry/codegraph) | MIT | CodeGraph CLI |
@@ -55,9 +55,9 @@ No full source-to-package equality or signature authentication is claimed.
 `agents/reviewer.md` and `agents/worker.md`; its MIT license is
 included at `node_modules/pi-subagents/LICENSE` in the bundled package.
 
-License texts for ACP: `docs/licenses/billion-context-pi-LICENSE` and `docs/licenses/acp-kernel-LICENSE`. The latter includes the upstream "Attribution on Product Surfaces" term. Pitako's README and this document provide the required visible attribution and link. Neither upstream npm package ships a separate NOTICE.
+License texts: `docs/licenses/billion-context-pi-LICENSE` and `docs/licenses/acp-kernel-LICENSE`. The latter includes the upstream "Attribution on Product Surfaces" term. This document provides the required visible attribution and links. Neither upstream npm package ships a separate NOTICE.
 
-The official Codex entry invokes installation reporting to `https://mocito.dev/api/report-install` under upstream policy and stores its state under Pi's agent directory. Disable it with `PI_OFFLINE=1` or `"enableInstallTelemetry": false` in Pi's agent `settings.json`. There is no Pitako telemetry toggle. ACP configuration overrides are described in the [README](README.md#context-compression).
+The official Codex entry invokes installation reporting to `https://mocito.dev/api/report-install` under upstream policy and stores its state under Pi's agent directory. Disable it with `PI_OFFLINE=1` or `"enableInstallTelemetry": false` in Pi's agent `settings.json`. There is no Pitako telemetry toggle.
 
 ## Vendored
 

@@ -6,6 +6,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import devTools from "../extensions/dev-tools/index.ts";
 import fileSha256 from "../extensions/file-sha256.ts";
+import checkpointCreate from "../extensions/checkpoint-create.ts";
 import pitako from "../extensions/index.ts";
 import profilePolicy from "../extensions/profile-policy.ts";
 import { packageRoot, readStack } from "../extensions/stack.ts";
@@ -31,6 +32,7 @@ function loadProfileExtensions(pi: ExtensionAPI, codex: (pi: ExtensionAPI) => vo
     ["./extensions/profile-policy.ts", profilePolicy],
     ["./extensions/dev-tools/index.ts", devTools],
     ["./extensions/file-sha256.ts", fileSha256],
+    ["./extensions/checkpoint-create.ts", checkpointCreate],
   ]);
   // These providers are outside this profile fixture's controlled boundary.
   const excluded = new Set([
@@ -137,9 +139,9 @@ function profileHarness(profileFlag?: string, external?: () => Promise<void>) {
 }
 
 describe("Pitako resources and policy", () => {
-  test.each(["reader", "worker", "disabled", "unloadable", "foreground"])(
-    "isolated native child lifecycle and actual call boundary: %s", async mode => {
-      const owned = configDirectory("pitako-profile-acp-");
+  test.each(["reader", "worker", "foreground"])(
+    "isolated native child lifecycle and actual call boundary: %s", mode => {
+      const owned = configDirectory("pitako-profile-policy-");
       const cwd = path.join(owned, "worktree"), home = path.join(owned, "home");
       mkdirSync(cwd); mkdirSync(home);
       const env = {
@@ -149,29 +151,25 @@ describe("Pitako resources and policy", () => {
       };
       const init = spawnSync("git", ["init", "--quiet"], { cwd, env, encoding: "utf8" });
       expect(init.error).toBeUndefined(); expect(init.status).toBe(0);
-      const child = Bun.spawn([process.execPath, path.join(packageRoot(), "tests/fixtures/profile-acp-child.ts"), mode], {
+      const child = Bun.spawn([process.execPath, path.join(packageRoot(), "tests/fixtures/profile-child.ts"), mode], {
         cwd, env, stdout: "pipe", stderr: "pipe",
       });
+      const pending = [new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited] as const;
+      let cancelled = false;
+      const work = (async () => {
+        const [output, stderr, exit] = await Promise.all(pending);
+        if (cancelled) return;
+        expect({ exit, stderr, output }).toMatchObject({ exit: 0 });
+        const report = JSON.parse(output.trim().split("\n").at(-1)!);
+        expect(report).toMatchObject({ mode, disposed: true, sideEffects: 0, errors: [] });
+      })();
+      void work.catch(() => {});
       shutdowns.push(async () => {
+        cancelled = true;
         if (child.exitCode === null) child.kill("SIGTERM");
-        await child.exited;
+        await Promise.allSettled([...pending, work]);
       });
-      let output = "", stderr = "", exit: number;
-      try {
-        [output, stderr, exit] = await Promise.all([
-          new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
-        ]);
-      } finally { await child.exited; }
-      expect({ exit, stderr, output }).toMatchObject({ exit: 0 });
-      const report = JSON.parse(output.trim().split("\n").at(-1)!);
-      expect(report).toMatchObject({
-        mode, disposed: true, sideEffects: 0,
-        state: ["disabled", "unloadable"].includes(mode) ? "prerequisite-failed" : "completed",
-      });
-      expect(report.missing).toEqual(["disabled", "unloadable"].includes(mode)
-        ? ["compress", "decompress", "search_context", "acp_status", "acp_cache"] : []);
-      if (["disabled", "unloadable"].includes(mode)) expect(report.nativeExitCode).toBe(1);
-      if (mode === "unloadable") expect(report.errors.join("\n")).toContain("compress");
+      return work;
     },
   );
 
@@ -181,7 +179,7 @@ describe("Pitako resources and policy", () => {
       await host.start();
       const provider = readStack(packageRoot()).required.find(({ id }) => id === "pitako-dev-tools");
       expect(provider).toBeDefined();
-      expect(host.registeredTools).toEqual(["apply_patch", ...provider!.tools, "file_sha256", "file_sha256_save"]);
+      expect(host.registeredTools).toEqual(["apply_patch", ...provider!.tools, "file_sha256", "file_sha256_save", "checkpoint_create"]);
       for (const name of provider!.tools) expect(host.active).toContain(name);
       for (const name of ["file_sha256", "file_sha256_save", "ast_search", "ast_rewrite"]) expect(host.active).toContain(name);
       expect(host.registeredCommands).toEqual(["pitako"]);

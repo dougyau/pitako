@@ -8,7 +8,7 @@ not authorize installing dependencies or changing user settings.
 
 Verify Pitako-owned composition, profiles, resources, workflow scripts, Board,
 and checkout preparation. Use controlled external boundaries. Certification of
-Pi, SDK, ACP, pi-subagents, providers, CodeGraph, LSP, and T3 is not an acceptance
+Pi, SDK, pi-subagents, providers, CodeGraph, LSP, and T3 is not an acceptance
 obligation. Missing external facilities must not become fabricated passes.
 
 The AgentInstance, Team, Head, managed-table, bridge, and `/task` engine tests

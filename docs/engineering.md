@@ -1,5 +1,16 @@
 # Engineering layer
 
+Before closing authorized work, foreground guidance and the coding router require
+loading and applying `verify-behavior`, as do worker/reviewer profiles and workflow
+compliance. Reconstruct material outcomes from the request, accepted decisions and
+complete specs before examining the solution, independently of tasks, diff and
+tests. Check both correctness and sufficiency: link each outcome to implementation,
+current evidence and limits. Investigate material counterexamples; unresolved
+material gaps prevent closure. Explain why minor uncertainty cannot compromise the
+outcome. Existing reports justify fulfillment and evidence limits, not test counts.
+Native discovery/assembly tests demonstrate delivery and readable skill paths,
+not a model's semantic judgment or obedience. No new gate or phase is introduced.
+
 Pitako composes Pi rather than replacing its runtime. The package has one
 delegation route, pi-subagents, and no execution owner or scheduler of its own.
 
@@ -23,15 +34,8 @@ explicitly load the extension alongside LSP/CodeGraph.
 available directly to the model but not through codemode.
 Upstream persists mutations as session entries for replay.
 Board is repository-scoped storage shared by its worktrees.
-ACP loads before Hermes. Web access and pi-subagents are direct upstream entries.
-
-ACP keeps Pitako defaults `delegate:false`, `autoUpdate:false`, and
-`toolBashDefaultTimeout:0`. Explicit global and project ACP files retain upstream
-precedence. No managed workflow guards wrap ACP, TODO, or Board.
-All nine packaged profiles explicitly load this `billion-context-pi` adapter and
-require its five context tools. Native child required-tool diagnostics report
-missing registration. Explicit user configuration is preserved; ACP is never
-force-enabled.
+Web access and pi-subagents are direct upstream entries.
+No managed workflow guards wrap TODO or Board.
 
 The owned `extensions/dev-tools/index.ts` factory supplies Git, SSH, Python,
 Cargo and resource tools and hooks. Its sampler is the library under
@@ -96,8 +100,8 @@ argument transport retain exact arguments through the Node-hook inspect.mjs load
 
 Native mission state binds actual returned missionPath/missionId, invocation,
 full immutable specs and designated Git common root. The 39,936-byte snapshot
-uses the existing 26 chunk grants, initial inspection, one settings admission and four closing
-inspections (32 host grants/calls maximum). No arbitrary check
+uses the existing 26 chunk grants and a combined initial inspection/settings
+admission, leaving five closing inspections (32 host grants/calls maximum). No arbitrary check
 commands or artifact loader are added to host authority. The finite native host
 read deadline is not an execution budget. Child spawn capacity is separate;
 exhaustion returns incomplete with phase/work/refs, not overrides or renewed slots.
@@ -108,7 +112,11 @@ Pi global agent-dir `settings.json` is overridden by the designated worktree's
 `.pi/settings.json`, never the source/sibling cwd. Invalid settings stop before
 a director; no settings are written. The immutable native association freezes
 the limit across recovery/settings edits; legacy version-2 records stay fixed
-at three without migration. Reports use `Loop n de max` and consumed/max.
+at three without migration. Initial inspection reads neither settings file for
+an admitted invocation; incompatible or partial associations are not fresh admission.
+Reentry reevaluates a historical own-registration capacity halt only against the
+current closing allocation, retaining history and cumulative consumption, not
+overriding a native rejection. Reports use `Loop n de max` and consumed/max.
 Early fulfillment stops; last-slot gaps need a new human invocation. Stop,
 permissions, persistence and actual native host/child capacity outrank the limit.
 Higher limits grant no extra native capacity. Hash-associated complete inherited
@@ -124,6 +132,29 @@ Execute sets reads:false/progress:false, supported acceptance suppression with
 an explicit duplicate-gate reason, and 14400000 ms per implementation attempt.
 Ordinary worker defaults/tools remain unchanged. Useful diagnosed same-task
 continuations get new attempt keys; no blind retries or arbitrary attempt quota.
+
+New tasks describe one observable `expectedResult`, keeping coordinated code/tests
+together while separating independent outcomes. Mandatory
+`dependsOn: [{taskId, reason}]` declares necessary justified earlier prerequisites;
+`[]` means none, not concurrent-write safety. Admission validates complete shapes,
+known unique IDs, nonblank reasons and strict precedence (hence no cycles).
+Independent permutations are valid before admission; full admitted definitions
+and order are never sorted, split, repaired or backfilled during recovery.
+Final verification stays last even with `[]`. Sequential workers receive exact
+durably completed direct prerequisite result references from existing results.
+Failed/intermediate attempts are excluded. Historical results are not current
+checks: workers check relevant assumptions, not automatically every prior gate.
+Review/compliance receive plan references and independently cover full specs;
+schema cannot prove semantic simplicity or dependency completeness. Correct
+completed implementation is not repeated to improve retrospective decomposition.
+
+Future task worktrees start at the candidate HEAD current at their creation,
+not a frozen initial HEAD or copied WIP; existing worktrees are not automatically
+updated/rebased. Completion or a result reference does not prove integration
+into HEAD. Specs, full definitions and order stay immutable while the candidate
+evolves; current verification still binds the actual candidate including WIP.
+This is design direction only: no worktrees, concurrency, integration engine or
+commit policy are implemented here.
 
 The root invokes the real shared adversarial phases, then exactly one fresh
 reviewer-profile full-spec compliance analyst only on clear screening. Both
@@ -143,9 +174,44 @@ refs only when unavailable directly. Compare full JSON where binding/original
 survive. Missing binding uses original in place; conflict forbids edits; optional
 artifact loss does not block admitted payload/cache; full loss needs remaining
 director or partial. Native replay is not exactly-once/read-only reattachment.
-Reconcile settled results and Git/WIP before cursor advancement; never blindly
-redispatch unresolved writers. Positive actual activity/Stop/permission/recovery
+Reconcile available complete results and Git/WIP before cursor advancement;
+otherwise use checkpoint-first restoration, never blind writer redispatch. Positive actual activity/Stop/permission/recovery
 barriers matter, not missing historical inventory or universal certificates.
+
+An available complete native original is consumed before optional inspector
+fallback. The active root durably records a compact recovery subject/stage,
+immutable association, source/query refs, intention and disposition before
+querying or advancing. Replay reconciles that exact observation, never launches
+a replacement pending query or renews the route by changing keys/paths. Result
+admission precedes cursor advancement and the next existing phase actually runs.
+Essential persistence failure stops dispatch. This is not a generic resume API
+for terminal roots, nor exactly-once external execution.
+
+An unresolved plan observation is not full plan loss. New-plan recovery,
+admitted-definition recovery and replay retain its concrete actor, impediment,
+required scope/effects expansion and exact references without opening another
+director, writer, replacement query or loop slot. Replay observes the retained
+query; only genuine loss without a current barrier permits ordinary replanning.
+
+A never-admitted plan is published before structural admission. Only after
+settled producer/association and consistent complete links are established can
+a useful structural diagnosis reject it. Rejection and the accounted gap share
+one essential write; the next budgeted director receives the original reference
+and corrective diagnosis. Replay cannot readmit a rejected plan or consume its
+slot again; repetition without new corrective input blocks. Optional-cache or
+original loss cannot renew that diagnosed route: its halt is essential state.
+Native schema failure
+needs a usable exact original (possibly recovered), not reconstruction. Existing
+capacity, Stop, permission, settlement, identity and persistence barriers remain;
+admitted incompatible contracts are not migrated or repaired.
+
+Recovery remains inside the authorized task/stage objective, resources, effects,
+permissions and budget. No artifact repair, functional work, extra host grants,
+settings changes, replacement root or foreground polling is implied. If an
+out-of-scope action is needed, retain evidence and name the actor, impediment
+and concrete scope/effects expansion without performing it. Derived report
+actions are pending obligations, not necessarily missing human consent or
+claims that continuation already started.
 
 Foreground displays existing structured progress and per-loop/final reports:
 invocation, loop, phase, task/attempt, work/check-review-compliance including unrun,
@@ -154,14 +220,99 @@ attributable deduplicated tokens with partial/unavailable coverage. No polling,
 extra models, foreground/private TODO supervision or final validator. Complete
 answers fulfillment and no human action/no more loops; partial distinguishes
 technical continuation from new authorization. Child timeout is not invocation
-cancellation. Publication is separate. Old supervisor replay and --unblock receive
-clear rejection; historical invoke-*, pitako-execution and Git remain untouched.
+cancellation. Publication is separate. Old supervisor replay receives clear rejection;
+historical invoke-*, pitako-execution and Git remain untouched. Current human input
+uses `unblock:true, resolution:{loop,text}` on the same immutable invocation, not a
+bare bypass flag. The root retains the original impediment and current input before
+reconstruction; loop 0 denotes request-only state without an invented snapshot.
+Ambiguous historical host failure permits fresh bounded read-only reconstruction
+under current policy, not a claim to have recovered or settled its failed receipt.
+Positive current pertinent activity prevents replacement. Checkpoint restoration
+does not require conclusive historical writer settlement.
+Analysis/inspector result admission still reconciles exact retained originals;
+do not blindly replace their queries. A failed status transport may use the
+existing finite inspector route to observe the original complete operation receipt,
+not reconstruct it from an agent output or infer closure from missing inventory.
+Settled historical interruption or a completed needs-decision outcome can then consume
+the next ordinary slot with current human corrective input. Never repeat completed
+work, reuse an interrupted producer key, double-apply input, or let it authorize
+later interruptions. Current native barriers, scope and essential persistence remain
+authoritative. This does not supply generic native root restart support.
 
 ## Verification boundary
 
 Tests cover Pitako-owned composition, profile policy, instruction resources,
 workflow scripts, Board, and checkout preparation through controlled boundaries.
-They do not certify external models, Pi, ACP, pi-subagents, T3, CodeGraph, or LSP.
+They do not certify external models, Pi, pi-subagents, T3, CodeGraph, or LSP.
 Tests solely for the removed runtime no longer represent product obligations.
 
 See [GATES.md](../GATES.md) for the complete procedure.
+
+Read-only review/compliance protocol rejections can be re-evaluated in the same
+invocation after a reader correction, without relaunching their completed producers
+or consuming an implementation loop. Findings associate screening assessments by
+`findingId`, not literal requirement wording; sources, consequences and verdict
+consistency remain required. Originals are never rewritten.
+
+The registered Node inspector reads only exact native producer references already
+retained by that invocation's current read-only phase. It delivers complete JSON
+from native state or an associated `structuredOutputPath`, rejects conflicting
+bodies and producer escapes, and preserves references after a failed observation.
+Current Stop, permission and positive pertinent activity barriers still apply.
+Unknown historical writer settlement is not a checkpoint-restoration veto. Delivery
+shares the existing 26 input grants with the unchanged 39,936-byte spec limit;
+every complete escaped JSON envelope must fit 4,096 bytes. Excess transport or
+essential persistence stops dispatch rather than truncating evidence or enlarging
+native limits. Complete originals stay outside essential mission state.
+
+### Scoped checkpoint artifacts
+
+`extensions/execute-checkpoint.ts` and the separate Node writer entry
+`skills/execute/checkpoint.mjs` implement exact-path preimages and immutable
+write-ahead effects. They use normal worker authority, not read-only inspector
+grants. The registered root saves an associated intention before dispatch;
+the bound worker calls registered `checkpoint_create` with `kind:"pre"` and exact
+paths before editing, and `kind:"unit"` or permitted pending `kind:"pause"` after
+writes settle. The tool resolves real durable context, reuses the same owned
+capture/seal operations and returns actual structured artifacts/receipts; it
+never confirms results or advances the root cursor. Missing/stale context fails,
+identical repeats preserve publications, and analysis/inspector calls remain
+nonwriting directly and through codemode. The helper remains the journaled
+apply/restore entry. File edits do not reload existing sessions. Artifacts under the
+existing transient `.pi/subagents/` area do not alter checkoutEvidence identity.
+Restoration retains partial bytes and refuses unrecorded changes, protected
+metadata, symlinks, changed HEAD/index and missing/corrupt backups. Its position
+projection cannot rewind budget/history or establish current check evidence.
+Observations passed by the active caller are not native permission certificates.
+
+### Confirmed checkpoint-first continuation
+
+Capture real affected-file bytes, including previous WIP, before modifying and
+bind coherent unit/task/cursor/admitted-progress references. Seal settled unit
+writes; durable root result admission confirms the new point. A cooperative
+pause may save pending WIP only while native control permits capture, without
+extra task edits. Stop/refusal or abrupt loss uses the last confirmed point,
+never an invented post-cut capture. Preserve partial bytes before selective
+restoration, unrelated changes and confirmed work. Missing/corrupt bytes or real
+file conflicts remain gaps; no reset/clean or fabricated backups.
+
+Recovery is checkpoint-first after best-effort pertinent-writer status/stop through
+available authorized public operations. Native resume and perfect historical
+settlement are not prerequisites; missing receipts, unavailable observers,
+inconclusive status and historical IDs alone are not activity. Positive current
+pertinent activity is a conflict. Actual native Stop/refusal/permission/capacity
+and essential-save barriers remain binding. A recorded Stop requires a real later
+human continuation request before effects, never reuse of an old answer.
+Restoration never rewinds consumed loops, attempts, admitted results or immutable
+originals. Renew evidence invalidated by the restored candidate, then reach pending
+work, final checks, review and compliance.
+
+Separately delivered current human amendments remain separate from the admitted
+base snapshot/sourceRefs/association. Carry their complete path, SHA-256 and
+human-delivery provenance in existing admitted plan shared context and exact
+plan/result references. Workers, review and compliance must read/hash the FULL
+amendment before affected work or whole-spec assessment and retain that provenance
+in results/reasons. Missing/changed bytes are a prerequisite gap, not permission
+to replace frozen sources, infer authority from agent text, or renew the budget.
+Preserve known unmet historical evidence obligations; new checkpoint observations
+do not establish an unavailable historical before-state contrast.

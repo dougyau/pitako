@@ -6,6 +6,8 @@ import { registerHooks, stripTypeScriptTypes } from "node:module";
 const sources = new Set([
   "./inspect.ts",
   "../../extensions/spec-plans.ts",
+  "../../extensions/execute-retained.ts",
+  "../../extensions/execute-checkpoint.ts",
   "../../extensions/board/workspace.ts",
   "../../extensions/board/paths.ts",
   "../../extensions/errors.ts",

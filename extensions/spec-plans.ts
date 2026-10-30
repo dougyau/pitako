@@ -54,7 +54,7 @@ export function specChunks(content: string): string[] {
 /** Share the native 26 input grants between exact specs and oversized selected metadata. */
 export function inspectionSnapshot(metadata: unknown, content: string) {
   const encoded = JSON.stringify(metadata), characters = [...encoded];
-  if (Buffer.byteLength(encoded) > MAX_SPEC_BYTES) throw new Error("Selected inspection metadata exceeds the native snapshot boundary.");
+  if (Buffer.byteLength(encoded) > 26 * 4096) throw new Error("Selected inspection metadata exceeds the native snapshot boundary.");
   const metadataDigest = digest(encoded), inputDigest = digest(content), parts = specChunks(content);
   const packets: { digest: string; metadataDigest: string; index: number; chunks: number; metadata: string; content: string }[] = [];
   let cursor = 0;

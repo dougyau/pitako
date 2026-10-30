@@ -151,6 +151,22 @@ describe("review scripted workflow", () => {
     },
   );
 
+  test.each(["clear", "material-gaps"])(
+    "execute screening preserves rephrased requirements and its %s verdict", async verdict => {
+      const screening = { verdict, reason: "Current requirement and consequence assessed", assessments: [{
+        findingId: "a-1", requirement: "README.md: selecting a record must respect the caller's key",
+        material: verdict === "material-gaps", consequence: "Caller may select a wrong record",
+        reason: verdict === "material-gaps" ? "Reachable violation remains" : "Existing guard bounds the risk",
+      }] };
+      const host = fixture(key => child(key.slice("loop1.".length), key.endsWith("director-synthesis")
+        ? { dispositions: [{ ...disposition, decision: "include" }], screening } : {}));
+      const result = await host.library(args, { prefix: "loop1.", mode: "execute" });
+      expect(result.status).toBe("completed");
+      expect(result.screening).toEqual(screening);
+      expect(result.dispositions?.[0]?.requirement).toBe(finding.requirement);
+    },
+  );
+
   test.each([
     undefined,
     { verdict: "clear", reason: "No gaps", assessments: [] },
@@ -160,15 +176,16 @@ describe("review scripted workflow", () => {
     { verdict: "material-gaps", reason: "Gaps", assessments: [
       { findingId: "a-1", material: false, reason: "Bounded", requirement: finding.requirement, consequence: "Wrong record" },
     ] },
-    { verdict: "clear", reason: "No gaps", assessments: [
-      { findingId: "a-1", material: false, reason: "Bounded", requirement: "invented", consequence: "Wrong record" },
+    { verdict: "material-gaps", reason: "Gaps", assessments: [
+      { findingId: "a-1", material: true, reason: "Violation", requirement: null, consequence: "Wrong record" },
     ] },
     { verdict: "clear", reason: "No gaps", assessments: [
       { findingId: "a-1", material: false, reason: "Bounded", requirement: finding.requirement, consequence: "" },
     ] },
   ])("rejects absent, incomplete, or contradictory execute screening: %j", async screening => {
     const host = fixture(key => child(key.slice("loop1.".length),
-      key.endsWith("director-synthesis") ? { screening } : {}));
+      key.endsWith("director-synthesis")
+        ? { dispositions: [{ ...disposition, decision: "include" }], screening } : {}));
     const result = await host.library(args, { prefix: "loop1.", mode: "execute" });
     expect(result.status).toBe("failed");
     expect(result.screening).toBeUndefined();

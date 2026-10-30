@@ -106,6 +106,7 @@ describe("profiles", () => {
       expect(note).not.toMatch(/ACP|acp_status|native compaction/);
       expect(note).toContain("Verify real behavior before claiming done.");
       expect(note).toContain("Select checks for the active project's own behavior and declared testing scope.");
+      expect(note).toContain("Clear instructions can authorize work without magic words.");
       expect(note).toContain("your current assignment");
       expect(note).toContain("all known stages as pending before starting the first");
       expect(note).toContain("Reuse tasks on resume");
