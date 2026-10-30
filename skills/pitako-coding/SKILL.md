@@ -85,6 +85,9 @@ An excluded or absent Codex entry leaves coding `edit`/`write` available. The Co
 | Situation | Skill |
 | --- | --- |
 | Writing or shrinking implementation | `ponytail` |
+| Writing, debugging, or explaining Rust | `rust-best-practices` |
+| Reviewing Rust code | `rust-best-practices`, then `rust-review` |
+| Porting code to Rust | `rust-best-practices`, then `rust-port` |
 | Tight tool use, less filler | `caveman` (lite) |
 | Ambiguous failure, do not fix yet | `investigate-first` |
 | How does this currently work? | `how` |
@@ -114,6 +117,12 @@ An excluded or absent Codex entry leaves coding `edit`/`write` available. The Co
 Do not load every skill. Do not load `caveman` at full or ultra unless the user asks. Do not load Ponytail and Caveman full bodies together.
 
 Ordinary verification uses `verify-behavior`; it does not invoke `gates` maintenance. `/skill:gates` writes only the selected project's root guide within the user's requested scope. The app-driving skills are not alternative project-wide gate recipes.
+
+BeautifulRust supplies the three Rust skills under `skills/language/`. Load their
+bodies only for relevant Rust work. Prefer the bundled `cargo_*` tools for covered
+commands. Project instructions, the active project's `GATES.md`, authorization,
+and role tool limits take precedence over upstream command examples. Do not
+install toolchains or apply upstream lint configuration without permission.
 
 Use the active project's `GATES.md`, not the installed Pitako checkout as a universal guide. Reading a dependency to understand a call does not authorize certification or repair. Pitako checks its own rules through controlled external boundaries, not the operation of its distributed dependencies. Other projects retain authorized integration requirements from their scope, contracts, and active guide, not Pitako's distributed stack.
 

@@ -3263,8 +3263,14 @@ A1 supersedes native-resume-first recovery; preserve the missing historical befo
     const tools = String(worker.tools).split(/,\s*/);
     for (const tool of ["read", "grep", "find", "ls", "bash", "edit", "write", "contact_supervisor", "apply_patch", "codegraph_explore", "codegraph_files", "lsp_symbols", "lsp_rename", "ast_search", "ast_rewrite"]) expect(tools).toContain(tool);
     expect(tools).not.toContain("subagent"); expect(worker.allowNestedSubagents).toBeUndefined(); expect(worker.model).toBeUndefined();
-    expect(String(worker.skills).split(/,\s*/)).toEqual(["ponytail", "verify-behavior"]);
-    expect(worker.skillPath).toEqual(["../node_modules/@dietrichgebert/ponytail/skills/ponytail", "../skills/practical/verify-behavior"]);
+    expect(String(worker.skills).split(/,\s*/)).toEqual(["ponytail", "verify-behavior", "rust-best-practices", "rust-review", "rust-port"]);
+    expect(worker.skillPath).toEqual([
+      "../node_modules/@dietrichgebert/ponytail/skills/ponytail",
+      "../skills/practical/verify-behavior",
+      "../skills/language/rust-best-practices",
+      "../skills/language/rust-review",
+      "../skills/language/rust-port",
+    ]);
     expect(worker.extensions).toEqual(["../extensions/acp.ts"]);
     expect(worker.subagentOnlyExtensions).toEqual(["../extensions/dev-tools/index.ts", "../extensions/file-sha256.ts", "../extensions/checkpoint-create.ts", "../node_modules/@vndv/pi-codegraph/extensions/codegraph.ts", "../node_modules/pi-lsp-client/src/index.ts", "../node_modules/@nicknisi/pi-ast-grep/index.ts", "../node_modules/pi-codex-tools/index.ts"]);
     for (const provider of worker.subagentOnlyExtensions as string[]) expect(existsSync(path.resolve("agents", provider))).toBe(true);

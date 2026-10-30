@@ -1,4 +1,5 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, mock, spyOn, test } from "bun:test";
@@ -127,6 +128,66 @@ describe("engineering-layer composition", () => {
     } finally {
       // Registration owns the client's idle reaper even without a server request.
       await disposeDefaultLspManager();
+    }
+  });
+
+  test("BeautifulRust is discoverable from the package and relevant child profiles with exact references and license", async () => {
+    const names = ["rust-best-practices", "rust-review", "rust-port"];
+    const manifest = JSON.parse(readRepo("package.json"));
+    const provenance = JSON.parse(readRepo("docs/provenance.json"))["beautiful-rust"];
+    expect(provenance.revision).toMatch(/^[a-f0-9]{40}$/);
+    expect(provenance.localModifications).toEqual([]);
+    expect(readRepo("THIRD_PARTY.md")).toContain(provenance.revision);
+    for (const destination of Object.values(provenance.sourceMapping) as string[]) {
+      expect(manifest.files).toContain(destination.split("/")[0]);
+      expect(createHash("sha256").update(readFileSync(path.join(packageRoot(), destination))).digest("hex"))
+        .toBe(provenance.sha256[destination]);
+    }
+    expect(readRepo("docs/licenses/beautiful-rust-LICENSE")).toContain("Copyright (c) 2026 Morgan Linton");
+    for (const name of names) {
+      expect(manifest.pi.skills).toContain(`./skills/language/${name}`);
+      expect(DEFAULT_SKILL_NAMES as readonly string[]).toContain(name);
+      expect(readRepo("skills/pitako-coding/SKILL.md")).toContain(`\`${name}\``);
+    }
+    const bestPractices = readRepo("skills/language/rust-best-practices/SKILL.md");
+    const references = [...bestPractices.matchAll(/`(references\/[\w-]+\.md)`/g)].map(match => match[1]!);
+    expect(references.length).toBeGreaterThan(0);
+    for (const reference of references) {
+      const destination = `skills/language/rust-best-practices/${reference}`;
+      expect(Object.values(provenance.sourceMapping)).toContain(destination);
+      expect(readRepo(destination).length).toBeGreaterThan(0);
+    }
+    const parser = await import(path.join(packageRoot(), "node_modules/pi-subagents/src/agents/frontmatter.js"));
+    const { resolveSkillsWithFallback, buildSkillInjection } = await import(path.join(packageRoot(), "node_modules/pi-subagents/src/agents/skills.js"));
+    const agentDir = mkdtempSync(path.join(tmpdir(), "pitako-rust-skills-"));
+    try {
+      for (const role of ["foreground", "worker", "reviewer"]) {
+        const profile = role === "foreground" ? undefined : parser.parseFrontmatter(readRepo(`agents/${role}.md`)).frontmatter;
+        const skillPaths = profile
+          ? parser.parseFrontmatterList(profile.skillPath)!.map((entry: string) => path.resolve(packageRoot(), "agents", entry))
+          : manifest.pi.skills.map((entry: string) => path.resolve(packageRoot(), entry));
+        const discovered = loadSkills({ cwd: packageRoot(), agentDir, includeDefaults: false, skillPaths });
+        expect(discovered.diagnostics).toEqual([]);
+        const selected = profile ? resolveSkillsWithFallback(
+          parser.parseFrontmatterList(profile.skills)!, agentDir, undefined,
+          parser.parseFrontmatterList(profile.skillPath)!, path.join(packageRoot(), "agents"),
+        ) : undefined;
+        if (selected) expect(selected.missing).toEqual([]);
+        const advertised = selected ? buildSkillInjection(selected.resolved) : formatSkillsForPrompt(discovered.skills);
+        const expected = role === "reviewer" ? names.slice(0, 2) : names;
+        for (const name of expected) {
+          const filePath = discovered.skills.find(skill => skill.name === name)?.filePath;
+          expect(filePath).toBe(path.join(packageRoot(), `skills/language/${name}/SKILL.md`));
+          expect(advertised).toContain(filePath!);
+          // Descriptions advertise the skill without eagerly loading its full body.
+          expect(advertised).not.toContain(parseFrontmatter(readFileSync(filePath!, "utf8")).body);
+        }
+        if (profile) {
+          expect(profile.inheritSkills).toBe("false");
+        }
+      }
+    } finally {
+      rmSync(agentDir, { recursive: true, force: true });
     }
   });
 
@@ -421,7 +482,7 @@ describe("engineering-layer composition", () => {
     expect(profile).toMatchObject({
       acceptanceRole: "read-only", defaultContext: "fresh", systemPromptMode: "replace",
       inheritProjectContext: true, inheritGlobalContext: false, inheritSkills: false,
-      skills: ["verify-behavior", "ponytail", "ponytail-review"],
+      skills: ["verify-behavior", "ponytail", "ponytail-review", "rust-best-practices", "rust-review"],
     });
     expect(profile.model).toBeUndefined();
     if (!Array.isArray(architect.tools) || !Array.isArray(architect.subagentOnlyExtensions) ||

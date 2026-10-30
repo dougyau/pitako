@@ -45,12 +45,16 @@ subagentOnlyExtensions:
 skillPath:
   - ../skills/practical
   - ../skills/principles
+  - ../skills/language/rust-best-practices
+  - ../skills/language/rust-review
   - ../node_modules/@dietrichgebert/ponytail/skills/ponytail
   - ../node_modules/@dietrichgebert/ponytail/skills/ponytail-review
 skills:
   - verify-behavior
   - ponytail
   - ponytail-review
+  - rust-best-practices
+  - rust-review
 acceptanceRole: read-only
 defaultContext: fresh
 systemPromptMode: replace
@@ -60,6 +64,12 @@ inheritSkills: false
 ---
 
 # Review
+
+For Rust targets, load `rust-best-practices` and `rust-review` on demand.
+They do not grant shell, Cargo, formatting, or editing authority. Keep this
+profile read-only, use supplied check evidence, and report unrun checks.
+Project instructions, the assigned report format, and `verify-behavior` take
+precedence over upstream examples.
 
 Adapted from pi-subagents `agents/reviewer.md` (MIT, Nico Bailon).
 Inspect, evaluate, and report with evidence. The task defines your responsibility,

@@ -7,6 +7,7 @@ Expected environment:
   PONYTAIL_CHECKOUT  DietrichGebert/ponytail checkout
 
 For grilling only: MATTPOCOCK_SKILLS_CHECKOUT=/reviewed/checkout python3 scripts/vendor-engineering-layer.py grilling
+For BeautifulRust only: BEAUTIFULRUST_CHECKOUT=/reviewed/checkout python3 scripts/vendor-engineering-layer.py beautiful-rust
 """
 
 from __future__ import annotations
@@ -145,16 +146,16 @@ def vendor_licenses(pstack: Path, caveman: Path, ponytail: Path) -> None:
     shutil.copy2(ponytail / "LICENSE", dest / "ponytail-LICENSE")
 
 
-def vendor_grilling(checkout: Path) -> None:
+def vendor_exact(checkout: Path, name: str) -> None:
     """Copy only reviewed, exact upstream bytes; provenance is the revision authority."""
-    provenance = json.loads((ROOT / "docs/provenance.json").read_text())["grilling"]
+    provenance = json.loads((ROOT / "docs/provenance.json").read_text())[name]
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=checkout, text=True).strip()
     if revision != provenance["revision"]:
-        raise SystemExit(f"grilling revision differs: {revision}")
+        raise SystemExit(f"{name} revision differs: {revision}")
     for source, destination in provenance["sourceMapping"].items():
         blob = subprocess.check_output(["git", "show", f"{revision}:{source}"], cwd=checkout)
         if hashlib.sha256(blob).hexdigest() != provenance["sha256"][destination]:
-            raise SystemExit(f"grilling digest differs: {source}")
+            raise SystemExit(f"{name} digest differs: {source}")
         target = ROOT / destination
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(blob)
@@ -162,8 +163,12 @@ def vendor_grilling(checkout: Path) -> None:
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["grilling"]:
-        vendor_grilling(required_checkout("MATTPOCOCK_SKILLS_CHECKOUT"))
+        vendor_exact(required_checkout("MATTPOCOCK_SKILLS_CHECKOUT"), "grilling")
         print("vendored exact reviewed grilling skill and MIT license")
+        raise SystemExit(0)
+    if sys.argv[1:] == ["beautiful-rust"]:
+        vendor_exact(required_checkout("BEAUTIFULRUST_CHECKOUT"), "beautiful-rust")
+        print("vendored exact reviewed BeautifulRust skills, references and MIT license")
         raise SystemExit(0)
     pstack = required_checkout("PSTACK_CHECKOUT")
     caveman = required_checkout("CAVEMAN_CHECKOUT")

@@ -110,6 +110,17 @@ Load specialized skills only when they apply. The default collection includes
 Ponytail, Caveman, investigation, architecture, review, verification, and
 technical-writing guidance. See [the coding router](skills/pitako-coding/SKILL.md).
 
+For Rust work, Pitako bundles [BeautifulRust](https://github.com/morganlinton/BeautifulRust)
+as three on-demand skills: `rust-best-practices`, `rust-review`, and `rust-port`,
+with the best-practices references. Invoke `/skill:rust-best-practices`,
+`/skill:rust-review`, or `/skill:rust-port` explicitly when needed.
+The worker can discover all three; the read-only reviewer can discover the
+best-practices and review skills without gaining Cargo or editing tools.
+Existing `cargo_*` tools handle checks, tests, formatting, builds, and dependencies.
+The host supplies Rust and `rust-analyzer`. No toolchain or lint configuration
+is installed automatically. The active project's verification guide and role
+permissions take precedence over upstream command examples.
+
 Prefer bundled deterministic Git/hash tools for covered operations; compose them
 through native codemode and retain bash/Python fallback for uncovered operations.
 `git_status` reports working changes, not a tracked inventory; structured

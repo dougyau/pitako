@@ -272,6 +272,40 @@
     },
     "localModifications": []
   },
+  "beautiful-rust": {
+    "decision": "vendor-exact",
+    "repository": "https://github.com/morganlinton/BeautifulRust",
+    "revision": "40db61c6fee84bd121cf288755f0e2f22a50e995",
+    "license": "MIT",
+    "copyright": "Copyright (c) 2026 Morgan Linton",
+    "sourceMapping": {
+      "skills/rust-best-practices/SKILL.md": "skills/language/rust-best-practices/SKILL.md",
+      "skills/rust-review/SKILL.md": "skills/language/rust-review/SKILL.md",
+      "skills/rust-port/SKILL.md": "skills/language/rust-port/SKILL.md",
+      "skills/rust-best-practices/references/bevy.md": "skills/language/rust-best-practices/references/bevy.md",
+      "skills/rust-best-practices/references/effective-rust.md": "skills/language/rust-best-practices/references/effective-rust.md",
+      "skills/rust-best-practices/references/google-rust-style-guide.md": "skills/language/rust-best-practices/references/google-rust-style-guide.md",
+      "skills/rust-best-practices/references/microsoft-rust-guidelines.md": "skills/language/rust-best-practices/references/microsoft-rust-guidelines.md",
+      "skills/rust-best-practices/references/rust-api-guidelines.md": "skills/language/rust-best-practices/references/rust-api-guidelines.md",
+      "skills/rust-best-practices/references/rust-design-patterns.md": "skills/language/rust-best-practices/references/rust-design-patterns.md",
+      "LICENSE": "docs/licenses/beautiful-rust-LICENSE"
+    },
+    "sha256": {
+      "skills/language/rust-best-practices/SKILL.md": "f9446430549a64d9fb2d480c875c4920b1d98c2540b937bd41448200b2639f6a",
+      "skills/language/rust-review/SKILL.md": "3a2ee9874896d2f8f980b617e2b32ce3daff8275ec6ee12c2fb2710e2ae91a9f",
+      "skills/language/rust-port/SKILL.md": "f7c8ee4f328ae52086245b4ef628a9ed5d8f306c4dbee7f41551871cac93d073",
+      "skills/language/rust-best-practices/references/bevy.md": "f8a96bccecd2e3faa2d79d206c24061ac9c5eb2dab3269573717b910ba5e8899",
+      "skills/language/rust-best-practices/references/effective-rust.md": "c0fe4ea29d2601224ac68b307d8c6137dd932b2565c141c1527c88ba1c5d5415",
+      "skills/language/rust-best-practices/references/google-rust-style-guide.md": "cfe61cd554c9dc32b412bb22dec7bd58e9eb4b3931db79124a61b8c2f573542c",
+      "skills/language/rust-best-practices/references/microsoft-rust-guidelines.md": "648cfee06cea304e3d9c525e6de9047c296ce353e156a8117111094418ccc4b8",
+      "skills/language/rust-best-practices/references/rust-api-guidelines.md": "392a94ed5151a7eeaf6f0d0f0cbd29904fa41ae4c4ae5ae98d79e7da3ba2a8af",
+      "skills/language/rust-best-practices/references/rust-design-patterns.md": "3102f45153ac7c75179ee43b12d143b33e4aaba9b2209c454dd4f0542cae7ae7",
+      "docs/licenses/beautiful-rust-LICENSE": "fe7214bea08bfb3d6b8c34841b54f7bc8ee84b080c83888aed9b0df321705d7c"
+    },
+    "localModifications": [],
+    "excluded": ["evals", "lints", "Claude plugin metadata", "benchmarks"],
+    "update": "Check out the recorded revision, set BEAUTIFULRUST_CHECKOUT, and run python3 scripts/vendor-engineering-layer.py beautiful-rust. Review source changes and update this mapping and digests before selecting another revision."
+  },
   "dependencyReleases": {
     "record": "docs/dependency-releases.json",
     "reason": "Exact selected registry version metadata and LSP annotated-tag target checked before private installation; integrity records are not independent signature or source-to-artifact authentication."
