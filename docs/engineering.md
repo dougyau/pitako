@@ -24,20 +24,18 @@ and `extensions/profile-policy.ts`. The early extension captures the session
 profile. The late policy reapplies model-compatible tools after Codex startup
 and model changes without taking over upstream hooks.
 
-Navigation uses pi-lsp-client and pi-codegraph. TODO wraps rpiv-todo and keeps
-`todo` model-only so nested codemode calls cannot lose the snapshots used by
-replay and readers. Board is repository-scoped storage shared by its worktrees.
-ACP loads before Hermes. Web access and pi-subagents are direct upstream entries.
-
-ACP keeps Pitako defaults `delegate:false`, `autoUpdate:false`, and
-`toolBashDefaultTimeout:0`. Explicit global and project ACP files retain upstream
-precedence. No managed workflow guards wrap ACP, TODO, or Board.
-All nine packaged profiles explicitly load this `billion-context-pi` adapter and
-require its five context tools. Native child required-tool diagnostics report
-missing registration. Registration alone does not establish operational
-compression after a refusal; disabled, unloadable or refused ACP is an unmet
-prerequisite. Preserve upstream refusal and native-compaction stand-down rather
-than overriding settings.
+Navigation uses pi-lsp-client and pi-codegraph. The direct `@nicknisi/pi-ast-grep`
+entry adds syntax search and single-file rewrites through an external ast-grep CLI.
+Analysis blocks `ast_rewrite` at the call boundary, including previews and
+codemode calls, while retaining `ast_search`. Architect, reviewer, and scout
+allow only `ast_search`; the worker also allows `ast_rewrite`. These four roles
+explicitly load the extension alongside LSP/CodeGraph.
+`extensions/todo.ts` adapts rpiv-todo registration to make only `todo` model-only,
+available directly to the model but not through codemode.
+Upstream persists mutations as session entries for replay.
+Board is repository-scoped storage shared by its worktrees.
+Web access and pi-subagents are direct upstream entries.
+No managed workflow guards wrap TODO or Board.
 
 The owned `extensions/dev-tools/index.ts` factory supplies Git, SSH, Python,
 Cargo and resource tools and hooks. Its sampler is the library under
@@ -45,7 +43,8 @@ Cargo and resource tools and hooks. Its sampler is the library under
 deterministic operations, composed through native codemode; keep bash/Python
 fallback for uncovered cases. Git queries are not sandboxed: metadata or spilled
 output may be written. `git_status` is working changes, not tracked inventory;
-structured `git_diff` is statistics, not a patch/path array.
+structured `git_diff` includes `stat` and the bounded `diff`, with
+`fullOutputPath` when truncated. Stat-only requests return an empty `diff`.
 `file_sha256` is read-only; writer-only `file_sha256_save` hashes and atomically
 publishes reusable items JSON in one call. Both share a validation/hash core,
 independent of spec-plan inspection. Check structured `ok` and `publication`;
@@ -244,7 +243,7 @@ authoritative. This does not supply generic native root restart support.
 
 Tests cover Pitako-owned composition, profile policy, instruction resources,
 workflow scripts, Board, and checkout preparation through controlled boundaries.
-They do not certify external models, Pi, ACP, pi-subagents, T3, CodeGraph, or LSP.
+They do not certify external models, Pi, pi-subagents, T3, CodeGraph, or LSP.
 Tests solely for the removed runtime no longer represent product obligations.
 
 See [GATES.md](../GATES.md) for the complete procedure.

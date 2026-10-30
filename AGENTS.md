@@ -29,18 +29,19 @@ Registration and instruction sources:
 
 | Provider | Entry / responsibility |
 | --- | --- |
-| `billion-context-pi` | [extensions/acp.ts](extensions/acp.ts) adapts mandatory ACP. Missing, disabled, unloadable or refused ACP is an unmet prerequisite; preserve upstream refusal guidance and native-compaction stand-down. Never override user settings to force admission. |
 | `pi-subagents` | `node_modules/pi-subagents/bundle/index.js` owns delegation, workflows and missions. [extensions/plan-execute.ts](extensions/plan-execute.ts) registers the owned execution resource; [skills/plan](skills/plan), [skills/execute](skills/execute), [skills/architecture](skills/architecture) and [skills/review](skills/review) supply workflow instructions/scripts. |
 | Pi codemode | Native tool composition/discovery, not a separate Pitako runtime or MCP bridge. [extensions/profile-policy.ts](extensions/profile-policy.ts) preserves analysis mutation policy for nested calls. |
 | Pitako dev-tools | [extensions/dev-tools/index.ts](extensions/dev-tools/index.ts) registers Git, SSH, Python, Cargo and `resource_snapshot`. [extensions/resource-sampler/index.ts](extensions/resource-sampler/index.ts) is the owned sampler library consumed by resource tooling, **not a second extension**. |
 | Pitako hashes | [extensions/file-sha256.ts](extensions/file-sha256.ts) registers read-only `file_sha256` and writer-only `file_sha256_save`; inspect structured `ok` and publication, not display text alone. |
-| External `pi-lsp-client` | `node_modules/pi-lsp-client/src/index.ts` registers six LSP tools; Pitako does not own the client or install servers. See [configuration](docs/configuration.md). |
+| External `pi-lsp-client` | `node_modules/pi-lsp-client/src/index.ts` registers six LSP tools. Pitako installs the TypeScript/JavaScript, Python, and PHP server dependencies, but does not own their implementations. Rust uses the host's `rust-analyzer`. See [configuration](docs/configuration.md). |
 | Other composition | [extensions/index.ts](extensions/index.ts) and [extensions/profile.ts](extensions/profile.ts) assemble profile instructions; [extensions/catalog.ts](extensions/catalog.ts) advertises skills. [extensions/todo.ts](extensions/todo.ts) adapts rpiv-todo; [extensions/board/index.ts](extensions/board/index.ts) owns Board. CodeGraph, Codex patch tools, memory and web entries are linked in the stack manifest. |
 
 Availability is role-specific, not inherited from the foreground tool inventory.
-All nine [profiles](agents/) explicitly load ACP. Eight load dev-tools and hashes;
-the interview relay has only ACP and native supervisor contact. Four roles
-(architect, reviewer, scout, worker) load LSP/CodeGraph. The execute root workflow owns
+Eight of the nine [profiles](agents/) load dev-tools and hashes.
+The interview relay has no shell or file tools. Four roles
+(architect, reviewer, scout, worker) load LSP/CodeGraph and ast-grep. Only the
+worker allows `ast_rewrite`; the other three allow only `ast_search`.
+The execute root workflow owns
 dispatch; its director only publishes a read-only plan and ends. No packaged
 child delegates; the worker is the single writer. The inspector is exceptional
 read-only observation/recovery, not preparation or final validation. Preserve these ceilings and the
@@ -51,7 +52,7 @@ authority.
 
 ## Keep changes scoped
 
-Tests verify implementation and decisions owned by Pitako, not installation or operation of Pi, ACP, third-party extensions, providers, CodeGraph or LSP. Keep owned guarantees using controlled external boundaries; dependency certification is not an acceptance obligation. The complete procedure is `bun run typecheck` followed by `bun run test`, with normal discovery.
+Tests verify implementation and decisions owned by Pitako, not installation or operation of Pi, third-party extensions, providers, CodeGraph or LSP. Keep owned guarantees using controlled external boundaries; dependency certification is not an acceptance obligation. The complete procedure is `bun run typecheck` followed by `bun run test`, with normal discovery.
 
 Reuse existing code and fixtures before adding another helper or abstraction. Verify the affected Pitako behavior and integrations, not the dependencies themselves. Choose behavior-based checks that preserve the contract rather than tests tied to implementation details.
 

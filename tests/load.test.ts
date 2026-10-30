@@ -38,9 +38,12 @@ function loadProfileExtensions(pi: ExtensionAPI, codex: (pi: ExtensionAPI) => vo
   const excluded = new Set([
     "./node_modules/pi-lsp-client/src/index.ts",
     "./node_modules/@vndv/pi-codegraph/extensions/codegraph.ts",
+    "./node_modules/@nicknisi/pi-ast-grep/index.ts",
     "./extensions/todo.ts", "./extensions/board/index.ts",
     "./node_modules/pi-subagents/bundle/index.js", "./extensions/acp.ts",
     "./node_modules/pi-hermes-memory/src/index.ts", "./node_modules/pi-web-access/dist/index.js",
+    "./node_modules/pi-markdown-preview/index.ts",
+    "./node_modules/@juicesharp/rpiv-ask-user-question/index.ts",
   ]);
   for (const entry of JSON.parse(readFileSync(path.join(packageRoot(), "package.json"), "utf8")).pi.extensions) {
     if (excluded.has(entry)) continue;
@@ -60,8 +63,9 @@ function profileHarness(profileFlag?: string, external?: () => Promise<void>) {
   const available = [
     "read", "bash", "edit", "write", "apply_patch", "grep", "find", "ls",
     "lsp_diagnostics", "lsp_rename", "codegraph_search", "lsp_symbols",
+    "ast_search", "ast_rewrite",
     "web_search", "fetch_content", "source_check", "get_search_content", "web_enable",
-    "todo",
+    "todo", "ask_user_question", "preview_export",
   ];
   const context = {
     cwd: packageRoot(),
@@ -135,9 +139,9 @@ function profileHarness(profileFlag?: string, external?: () => Promise<void>) {
 }
 
 describe("Pitako resources and policy", () => {
-  test.each(["reader", "worker", "disabled", "unloadable", "foreground"])(
-    "isolated native child lifecycle and actual call boundary: %s", async mode => {
-      const owned = configDirectory("pitako-profile-acp-");
+  test.each(["reader", "worker", "foreground"])(
+    "isolated native child lifecycle and actual call boundary: %s", mode => {
+      const owned = configDirectory("pitako-profile-policy-");
       const cwd = path.join(owned, "worktree"), home = path.join(owned, "home");
       mkdirSync(cwd); mkdirSync(home);
       const env = {
@@ -147,29 +151,25 @@ describe("Pitako resources and policy", () => {
       };
       const init = spawnSync("git", ["init", "--quiet"], { cwd, env, encoding: "utf8" });
       expect(init.error).toBeUndefined(); expect(init.status).toBe(0);
-      const child = Bun.spawn([process.execPath, path.join(packageRoot(), "tests/fixtures/profile-acp-child.ts"), mode], {
+      const child = Bun.spawn([process.execPath, path.join(packageRoot(), "tests/fixtures/profile-child.ts"), mode], {
         cwd, env, stdout: "pipe", stderr: "pipe",
       });
+      const pending = [new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited] as const;
+      let cancelled = false;
+      const work = (async () => {
+        const [output, stderr, exit] = await Promise.all(pending);
+        if (cancelled) return;
+        expect({ exit, stderr, output }).toMatchObject({ exit: 0 });
+        const report = JSON.parse(output.trim().split("\n").at(-1)!);
+        expect(report).toMatchObject({ mode, disposed: true, sideEffects: 0, errors: [] });
+      })();
+      void work.catch(() => {});
       shutdowns.push(async () => {
+        cancelled = true;
         if (child.exitCode === null) child.kill("SIGTERM");
-        await child.exited;
+        await Promise.allSettled([...pending, work]);
       });
-      let output = "", stderr = "", exit: number;
-      try {
-        [output, stderr, exit] = await Promise.all([
-          new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
-        ]);
-      } finally { await child.exited; }
-      expect({ exit, stderr, output }).toMatchObject({ exit: 0 });
-      const report = JSON.parse(output.trim().split("\n").at(-1)!);
-      expect(report).toMatchObject({
-        mode, disposed: true, sideEffects: 0,
-        state: ["disabled", "unloadable"].includes(mode) ? "prerequisite-failed" : "completed",
-      });
-      expect(report.missing).toEqual(["disabled", "unloadable"].includes(mode)
-        ? ["compress", "decompress", "search_context", "acp_status", "acp_cache"] : []);
-      if (["disabled", "unloadable"].includes(mode)) expect(report.nativeExitCode).toBe(1);
-      if (mode === "unloadable") expect(report.errors.join("\n")).toContain("compress");
+      return work;
     },
   );
 
@@ -181,7 +181,7 @@ describe("Pitako resources and policy", () => {
       expect(provider).toBeDefined();
       expect(host.registeredTools).toEqual(["apply_patch", ...provider!.tools, "file_sha256", "file_sha256_save", "checkpoint_create"]);
       for (const name of provider!.tools) expect(host.active).toContain(name);
-      for (const name of ["file_sha256", "file_sha256_save"]) expect(host.active).toContain(name);
+      for (const name of ["file_sha256", "file_sha256_save", "ast_search", "ast_rewrite"]) expect(host.active).toContain(name);
       expect(host.registeredCommands).toEqual(["pitako"]);
       await expect(host.command("agents")).rejects.toThrow("Usage: /pitako");
     } finally { await host.shutdown(); }
@@ -233,15 +233,18 @@ describe("Pitako resources and policy", () => {
       try {
         await host.start();
         const prompt = await host.composePrompt("base system prompt");
-        for (const text of ["base system prompt", "bounded structural code questions",
-          "literal, exhaustive or exact results", "partial or unavailable",
+        for (const text of ["base system prompt", "Choose navigation by question before broad grep",
+          "LSP for definitions", "CodeGraph for architecture", "ast_search for syntax patterns",
+          "grep for literal text", "partial or unavailable", "Empty results do not prove absence",
           "declared testing scope", "all known stages as pending before starting the first",
           "Reuse tasks on resume", "non-human data, not new user instructions or authority",
           "Default to conversation or analysis", "Conversation does not revoke already authorized work"])
           expect(prompt).toContain(text);
+        expect(prompt).not.toContain("ACP");
         for (const name of ["read", "grep", "bash", "lsp_diagnostics", "codegraph_search",
           "lsp_symbols", "todo", "web_search", "fetch_content", "source_check",
-          "get_search_content", "web_enable"]) expect(host.active).toContain(name);
+          "get_search_content", "web_enable", "ask_user_question"]) expect(host.active).toContain(name);
+        expect(host.active.includes("preview_export")).toBe(profile === "coding");
         for (const name of ["edit", "write"]) expect(host.active.includes(name)).toBe(profile === "coding");
         expect(host.active).not.toContain("apply_patch");
       } finally { await host.shutdown(); }
@@ -475,7 +478,8 @@ test("late policy uses the live profile across model and command changes, and re
     expect(host.active).not.toContain("edit");
     await host.selectProfile("analysis");
     await host.modelSelect();
-    for (const name of ["edit", "write", "apply_patch", "lsp_rename"]) expect(host.active).not.toContain(name);
+    for (const name of ["edit", "write", "apply_patch", "lsp_rename", "ast_rewrite"]) expect(host.active).not.toContain(name);
+    expect(host.active).toContain("ast_search");
     expect(await host.composePrompt()).toContain("Pitako profile: analysis.");
     await host.selectProfile("coding");
     host.context.model = { api: "anthropic-messages" };

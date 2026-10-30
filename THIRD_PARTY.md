@@ -8,16 +8,25 @@ Pitako composes Pi packages and vendors selected MIT skills. It does not ship BS
 | --- | --- | --- |
 | [@dietrichgebert/ponytail](https://github.com/DietrichGebert/ponytail) 5.3.2 | MIT | Skills `ponytail` and `ponytail-review`. The Pi extension is installed but not loaded. |
 | [@juicesharp/rpiv-todo](https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-todo) 2.15.0 | MIT | Session-local `todo` tool, `/todos`, overlay, and branch replay. `@juicesharp/rpiv-i18n` stays optional. |
+| [@juicesharp/rpiv-ask-user-question](https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-ask-user-question) 2.15.0 | MIT | Structured questions through `ask_user_question`. Bundled unchanged with its LICENSE. |
+| [pi-markdown-preview](https://github.com/omaclaren/pi-markdown-preview) 0.25.0 | MIT | Markdown and LaTeX previews and artifact export. Bundled unchanged with its LICENSE. |
 | [pi-web-access](https://github.com/nicobailon/pi-web-access) 0.45.0 (Nico Bailon) | MIT | Web search, page extraction, and source checking. Bundled into the Pitako package tarball. |
 | [pi-hermes-memory](https://github.com/chandra447/pi-hermes-memory) 0.9.11 (Chandra Teja) | MIT | Persistent memory and conversation search. Bundled unchanged, independent of the Board. |
 | [pi-subagents](https://github.com/nicobailon/pi-subagents) 0.83.0 (Nico Bailon) | MIT | Native delegation, scripted workflows and missions through the published extension. Bundled unchanged with its LICENSE; Pitako's former managed runtime stays retired. |
 | [pi-lsp-client](https://github.com/code-yeongyu/pi-lsp-client) | MIT | LSP tools |
+| [typescript-language-server](https://github.com/typescript-language-server/typescript-language-server) 5.3.0 | Apache-2.0 | TypeScript and JavaScript LSP server installed as an npm dependency. |
+| [typescript](https://github.com/microsoft/TypeScript) 5.9.3 | Apache-2.0 | Classic `tsserver.js` for the LSP server. The gate retains TypeScript 7.0.2 through the `typescript-compiler` development alias. |
+| [pyright](https://github.com/microsoft/pyright) 1.1.414 | MIT | Python LSP server installed as an npm dependency. |
+| [intelephense](https://github.com/bmewburn/intelephense-docs) 1.18.5 | Proprietary, `LICENSE.txt` | PHP LSP server downloaded as an npm dependency, not redistributed in Pitako's tarball. Premium features require a licence. |
+| [@nicknisi/pi-ast-grep](https://github.com/nicknisi/pi-extensions/tree/main/packages/ast-grep) 0.3.4 (Nick Nisi) | MIT | Syntax search and preview-first rewrites through Pitako's ast-grep CLI dependency. Bundled unchanged with its `LICENSE` and `THIRD_PARTY_NOTICES.md`. |
+| [@ast-grep/cli](https://github.com/ast-grep/ast-grep) 0.51.0 | MIT | ast-grep CLI with platform-specific optional binaries. Bundled into the Pitako package tarball. |
 | [pi-codex-tools](https://github.com/jvm/pi-mono/tree/main/packages/pi-codex-tools) 0.4.0 | Apache-2.0; OpenAI Codex attribution | Official extension registers `apply_patch` and invokes upstream install telemetry. Bundled unchanged. |
-| [billion-context-pi](https://github.com/ranxianglei/billion-context-pi) 0.1.83 (ranxianglei) | MIT | ACP context compression through the public factory. Bundled unchanged, with delegation and updates off by default. |
+| [billion-context-pi](https://github.com/ranxianglei/billion-context-pi) 0.1.83 (ranxianglei) | MIT | Context compression through the public factory. Bundled unchanged. |
 | [acp-kernel](https://github.com/ranxianglei/acp-kernel) 0.0.98 (ranxianglei) | MIT with an additional visible-attribution term | Compression engine bundled inline in billion-context-pi's `dist/index.js`. Pitako uses acp-kernel through that package. |
 | [@vndv/pi-codegraph](https://github.com/vndv/pi-codegraph) | MIT | CodeGraph tools |
 | [@colbymchenry/codegraph](https://github.com/colbymchenry/codegraph) | MIT | CodeGraph CLI |
 | [Pi](https://github.com/earendil-works/pi) | MIT | Host |
+| [smol-toml](https://github.com/squirrelchat/smol-toml) 1.9.1 | BSD-3-Clause | Read Herdr worktree configuration without executing it. |
 
 License text for pi-hermes-memory: `docs/licenses/pi-hermes-memory-LICENSE`. License texts for pi-web-access: `docs/licenses/pi-web-access-LICENSE`. For Ponytail, see `docs/licenses/ponytail-LICENSE` and the package's own `LICENSE` after install. For pi-codex-tools, see `docs/licenses/pi-codex-tools-LICENSE` and `docs/licenses/pi-codex-tools-NOTICE`.
 
@@ -46,9 +55,9 @@ No full source-to-package equality or signature authentication is claimed.
 `agents/reviewer.md` and `agents/worker.md`; its MIT license is
 included at `node_modules/pi-subagents/LICENSE` in the bundled package.
 
-License texts for ACP: `docs/licenses/billion-context-pi-LICENSE` and `docs/licenses/acp-kernel-LICENSE`. The latter includes the upstream "Attribution on Product Surfaces" term. Pitako's README and this document provide the required visible attribution and link. Neither upstream npm package ships a separate NOTICE.
+License texts: `docs/licenses/billion-context-pi-LICENSE` and `docs/licenses/acp-kernel-LICENSE`. The latter includes the upstream "Attribution on Product Surfaces" term. This document provides the required visible attribution and links. Neither upstream npm package ships a separate NOTICE.
 
-The official Codex entry invokes installation reporting to `https://mocito.dev/api/report-install` under upstream policy and stores its state under Pi's agent directory. Disable it with `PI_OFFLINE=1` or `"enableInstallTelemetry": false` in Pi's agent `settings.json`. There is no Pitako telemetry toggle. ACP configuration overrides are described in the [README](README.md#context-compression).
+The official Codex entry invokes installation reporting to `https://mocito.dev/api/report-install` under upstream policy and stores its state under Pi's agent directory. Disable it with `PI_OFFLINE=1` or `"enableInstallTelemetry": false` in Pi's agent `settings.json`. There is no Pitako telemetry toggle.
 
 ## Vendored
 

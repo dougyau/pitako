@@ -8,7 +8,7 @@ export interface StackExtension {
   id: string;
   spec: string;
   entry: string;
-  bin?: string;
+  bins?: string[];
   tools: string[];
 }
 
@@ -71,8 +71,8 @@ export interface PreparedRuntime {
 }
 
 /**
- * Confirm required extension entries exist and that `codegraph` can be spawned.
- * Prepends this package's node_modules/.bin only when the CLI is not already on PATH.
+ * Confirm required extension entries and CLIs exist.
+ * Prepends this package's node_modules/.bin when a required CLI is not on PATH.
  */
 export function prepareRuntime(root: string, env: NodeJS.ProcessEnv = process.env): PreparedRuntime {
   const stack = readStack(root);
@@ -91,16 +91,21 @@ export function prepareRuntime(root: string, env: NodeJS.ProcessEnv = process.en
 
   const bundledBinDir = path.join(root, "node_modules", ".bin");
   let codegraph: PreparedRuntime["codegraph"] = "path";
-  const needsCodegraph = stack.required.some((extension) => extension.bin === "codegraph");
-  if (needsCodegraph && !commandOnPath("codegraph", env.PATH)) {
-    const bundled = path.join(bundledBinDir, process.platform === "win32" ? "codegraph.cmd" : "codegraph");
+  const originalPath = env.PATH;
+  let needsBundledPath = false;
+  for (const bin of stack.required.flatMap(({ bins }) => bins ?? [])) {
+    if (commandOnPath(bin, originalPath)) continue;
+    const bundled = path.join(bundledBinDir, process.platform === "win32" ? `${bin}.cmd` : bin);
     if (!existsSync(bundled)) {
       throw new PitakoConfigError(
-        "Pitako configuration error: required program \"codegraph\" was not found on PATH, and Pitako's bundled binary is missing at node_modules/.bin/codegraph. Install dependencies with `bun install` (the package depends on @colbymchenry/codegraph) or install the codegraph CLI and put it on PATH.",
+        `Pitako configuration error: required program "${bin}" was not found on PATH, and Pitako's bundled binary is missing at node_modules/.bin/${bin}. Install Pitako dependencies with \`bun install\`, then restart Pi.`,
       );
     }
-    env.PATH = [bundledBinDir, env.PATH ?? ""].filter((entry) => entry.length > 0).join(path.delimiter);
-    codegraph = "bundled";
+    needsBundledPath = true;
+    if (bin === "codegraph") codegraph = "bundled";
+  }
+  if (needsBundledPath) {
+    env.PATH = [bundledBinDir, originalPath ?? ""].filter((entry) => entry.length > 0).join(path.delimiter);
   }
 
   return { stack, path: env.PATH ?? "", codegraph };

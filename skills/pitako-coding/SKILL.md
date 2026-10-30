@@ -1,6 +1,6 @@
 ---
 name: pitako-coding
-description: Use Pitako's coding baseline. Router plus philosophy for a curated Pi coding session. Keep raw LSP and CodeGraph visible, keep diffs small, and load specialized skills only when they apply. Use when navigating or changing code in a Pitako session.
+description: Use Pitako's coding baseline. Choose LSP for symbols, CodeGraph for architecture and impact, ast-grep for syntax, and grep for text. Keep diffs small and load specialized skills only when they apply. Use when navigating or changing code in a Pitako session.
 ---
 
 # Pitako coding
@@ -11,8 +11,8 @@ This skill is the router. Do not paste the full bodies of Ponytail, Caveman, pra
 
 ## Profiles
 
-- `coding` (default): read, bash, grep, find, ls, LSP, CodeGraph, and ACP context tools. Use `apply_patch` on supported models, otherwise `edit` and `write`.
-- `analysis`: read/search and hash queries, without editing, hash saving or introduced Git/SSH/Python/Cargo mutators. The tool-call boundary blocks those directly and through codemode, including `ssh_pull`'s local writes. Shell and ACP temporary output are still available. This is not a sandbox.
+- `coding` (default): read, bash, grep, find, ls, LSP, CodeGraph, and ast-grep. Use `apply_patch` on supported models, otherwise `edit` and `write`.
+- `analysis`: read/search and hash queries, without editing, hash saving or introduced Git/SSH/Python/Cargo mutators. The tool-call boundary blocks those directly and through codemode, including `ssh_pull`'s local writes and all `ast_rewrite` calls. Shell remains available. This is not a sandbox.
 
 Official `pi-codex-tools` registers `apply_patch` and owns its grammar capability. Pitako selects it through the public `supportsOpenAIGrammarTools` helper for `openai-responses` or `openai-codex-responses` models with `compat.supportsOpenAIGrammarTools === true`. On these models, `edit` and `write` are inactive. Pitako reapplies the policy after startup, model changes, and profile changes. Pi-subagents owns its children's profiles and tool selection.
 
@@ -21,7 +21,7 @@ Switch with `/pitako profile analysis` or start Pi with `--pitako-profile analys
 ## Defaults
 
 1. Inspect the actual repository before editing.
-2. Keep read, grep, LSP, and CodeGraph available. Choose a supported LSP or CodeGraph tool for bounded structural questions; use read, grep, or bash for literal, exhaustive, or exact results. Follow up with those tools when a backend is partial or unavailable.
+2. Start with supplied files and named seams. Choose navigation by question before broad grep, using the table below. Read the relevant source after navigation.
 3. Reuse what already exists. Question whether new code is needed.
 4. Keep the diff proportionate to the task. No speculative abstractions.
 5. Before claiming the authorized assignment complete, load and apply `verify-behavior`. Before examining the solution, reconstruct material outcomes from the authorized request, accepted decisions and complete specs, not the diff, task plan or existing tests. Distinguish correctness from sufficiency: connect each outcome to implementation, current evidence and limits. Investigate material counterexamples; unresolved material gaps prevent completion. Explain why minor uncertainty cannot compromise the requested outcome. Justify fulfillment and limits in the existing report, not test counts. Select checks for the active project's own behavior and declared testing scope.
@@ -33,41 +33,52 @@ Switch with `/pitako profile analysis` or start Pi with `--pitako-profile analys
 Prefer deterministic Git/hash tools for covered operations and compose them
 through native codemode. Keep bash/Python fallback for uncovered operations when
 your role permits it. `git_status` reports working changes, not every tracked
-file; structured `git_diff` returns statistics, not a patch/path array. Git queries
+file. Structured `git_diff` returns `stat` and the bounded `diff`, with
+`fullOutputPath` when truncated. Stat-only requests return an empty `diff`. Git queries
 may update metadata or spill output; they are not sandboxed.
 `file_sha256` reads only. Authorized writers use `file_sha256_save` to hash and
 atomically publish reusable items JSON in one call. Inspect structured `ok` and
 `publication`: typed failures can return without throwing, and successful hashes
 alone do not establish saving, a source snapshot, or passing tests.
 
-Keep read/grep, LSP, and CodeGraph visible, with `bash` and the model-compatible editing tools in the coding profile. Choose supported LSP or CodeGraph tools for bounded structural questions. Use read, grep, or bash for literal searches, exhaustive or exact results, unsupported backends, and follow-up.
+### Choose navigation by question
 
-The `codegraph_*` runtime tools use the CodeGraph CLI and need an existing index; they do not initialize or refresh it. This checkout's `scripts/setup.sh` attempts missing-index initialization best-effort after dependencies are ready. Other projects own their optional preparation; use it or run `codegraph init` explicitly when you want CodeGraph navigation. If initialization is unavailable or fails, continue with LSP/read/grep.
+| Question | First tool |
+| --- | --- |
+| Where is this symbol defined or referenced? | `lsp_goto_definition` or `lsp_find_references` at a known position. Use `lsp_symbols` to find a symbol or outline a file. |
+| How does this subsystem work? | `codegraph_explore` for related source, or `codegraph_files` for the indexed structure. |
+| Who calls this function, or what would a change affect? | `codegraph_callers`, `codegraph_callees`, or `codegraph_impact`. |
+| Where is this code shape used? | `ast_search`, for example `console.log($$$ARGS)`. `$NAME` captures one syntax node and `$$$NAME` captures several. |
+| Where is this exact string, log message, or config key? | `grep`. Use `find` or `ls` for file paths and `read` for known source. |
+| What diagnostics does the language server report? | `lsp_diagnostics`. |
 
-- `lsp_diagnostics` for server diagnostics
-- `lsp_goto_definition` and `lsp_find_references` for navigation
-- `lsp_symbols` for a document outline or workspace symbol search
-- `lsp_prepare_rename`, then `lsp_rename`, when a rename should be applied
+Do not approximate symbol references or syntax patterns with grep when the
+matching navigation tool is available. ast-grep matches syntax, not types or
+symbol identity. Use LSP when that distinction matters. With a symbol name but
+no position, `codegraph_search` can locate it and `codegraph_node` can inspect it.
+Do not query every backend for the same question.
 
-LSP needs an installed server for the file type. It can resolve a command on `PATH`, in the project's `node_modules/.bin`, or at an explicit path. TypeScript defaults to `typescript-language-server`. Servers are not installed automatically; `/lsp install <id>` installs supported recipes. A registered tool does not guarantee that a server or its requested operation is available.
+Read the relevant source after navigation. If a backend is partial or unavailable,
+report the limit and fall back to another supported tool or targeted read/grep.
+Empty results do not prove absence. Check scope, language, or index coverage
+before concluding that no callers or matches exist.
+
+The `codegraph_*` tools need an existing index and do not initialize or refresh
+it. Use `codegraph_status` when index availability or freshness is in question.
+Do not install servers or initialize indexes without provisioning authority.
+Pitako installs the TypeScript/JavaScript, Python, and PHP server dependencies;
+Rust uses the host's `rust-analyzer`. A registered tool does not guarantee that
+a server supports the requested operation. See [configuration](../../docs/configuration.md).
+
+For an authorized rename, use `lsp_prepare_rename`, then `lsp_rename`.
+For an authorized syntax replacement, preview `ast_rewrite` in an explicit file,
+inspect the matches, then apply with `dryRun:false` and inspect the diff.
+Read-only roles cannot rewrite or rename. Analysis blocks every `ast_rewrite`
+call, including previews.
 
 `edit` and `write` are blocked for `.git/`, `node_modules/`, `.env`, and `.env.*` files. Do not bypass that with shell unless the user explicitly asks. Those guards do not protect upstream `apply_patch`, which accepts absolute paths, symlinks, moves, and fuzzy matching. The old strict-path, exact-match engine and structured failures are gone. No sandbox is added; future bwrap or OpenShell work does not protect this version.
 
-ACP from `billion-context-pi` is mandatory and the only compressor;
-`pi-codex-compaction` is not loaded. All nine packaged profiles explicitly load
-the adapter and require `compress`, `decompress`, `search_context`, `acp_status`
-and `acp_cache`. Missing, disabled, unloadable or refused ACP is an unmet
-prerequisite; report it rather than claim healthy work or override user settings.
-Registration alone cannot prove compression remains operational after refusal.
-Use `/acp` for blocks. Original entries remain available. Persistent sessions
-reload `<sessionFile>.acp.json`; in-memory children retain state only for their
-session's lifetime. With ACP active, native `/compact` reports `Compaction cancelled`
-and automatic compaction creates no native summary. Disabled ACP or a refused
-`bili` proxy leaves native compaction available; preserve that upstream guidance.
-
-Pitako's ACP factory defaults to `{ delegate: false, autoUpdate: false, toolBashDefaultTimeout: 0 }`. ACP does not add a default timeout to bash calls; explicit call timeouts still apply. Explicit `~/.pi/acp.json` and project `.pi/acp.json` override these defaults, with project settings winning. They can enable delegates or updates, or set `enabled:false`. Preserve user files. The factory reads the master switch from `process.cwd()`; runtime options use `ctx.cwd`. A different child cwd does not change the factory's master-switch location.
-
-The manifest starts with early profile setup, the independent official Codex entry, then late profile policy; ACP remains before Hermes. An excluded or absent Codex entry leaves coding `edit`/`write` available. The Codex entry invokes upstream install telemetry. Disable it with `PI_OFFLINE=1` or Pi's `enableInstallTelemetry:false` setting.
+An excluded or absent Codex entry leaves coding `edit`/`write` available. The Codex entry invokes upstream install telemetry. Disable it with `PI_OFFLINE=1` or Pi's `enableInstallTelemetry:false` setting.
 
 ## Load when it applies
 

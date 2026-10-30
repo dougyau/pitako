@@ -169,7 +169,7 @@ Profile inspection is optional diagnosis, not an exact child-selection certifica
 or mandatory preflight ceremony. The director is read-only planning, the worker
 is the nondelegating writer with normal tools and CodeGraph/LSP/Codex (edit/write
 fallback), and reviewer/exceptional inspector are read-only. Missing required
-providers (including mandatory ACP) are unmet prerequisites, not fabricated passes.
+providers are unmet prerequisites, not fabricated passes.
 
 Create a native mission explicitly or inspect/open the explicitly selected
 existing mission in the SAME designated absolute root. Use that root for all

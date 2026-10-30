@@ -19,6 +19,7 @@
       "id": "pi-lsp-client",
       "spec": "github:code-yeongyu/pi-lsp-client#9d029fb32b721c038b58fb418b98bbfcf720cf0a",
       "entry": "node_modules/pi-lsp-client/src/index.ts",
+      "bins": ["typescript-language-server", "pyright-langserver", "intelephense"],
       "tools": [
         "lsp_diagnostics",
         "lsp_goto_definition",
@@ -32,7 +33,7 @@
       "id": "@vndv/pi-codegraph",
       "spec": "@vndv/pi-codegraph@0.1.11",
       "entry": "node_modules/@vndv/pi-codegraph/extensions/codegraph.ts",
-      "bin": "codegraph",
+      "bins": ["codegraph"],
       "tools": [
         "codegraph_search",
         "codegraph_callers",
@@ -43,6 +44,13 @@
         "codegraph_status",
         "codegraph_files"
       ]
+    },
+    {
+      "id": "@nicknisi/pi-ast-grep",
+      "spec": "@nicknisi/pi-ast-grep@0.3.4",
+      "entry": "node_modules/@nicknisi/pi-ast-grep/index.ts",
+      "bins": ["ast-grep"],
+      "tools": ["ast_search", "ast_rewrite"]
     },
     {
       "id": "pitako-dev-tools",
@@ -132,6 +140,18 @@
       "spec": "pi-web-access@0.45.0",
       "entry": "node_modules/pi-web-access/dist/index.js",
       "tools": ["web_search", "fetch_content", "source_check", "get_search_content", "web_enable"]
+    },
+    {
+      "id": "pi-markdown-preview",
+      "spec": "pi-markdown-preview@0.25.0",
+      "entry": "node_modules/pi-markdown-preview/index.ts",
+      "tools": ["preview_export"]
+    },
+    {
+      "id": "@juicesharp/rpiv-ask-user-question",
+      "spec": "@juicesharp/rpiv-ask-user-question@2.15.0",
+      "entry": "node_modules/@juicesharp/rpiv-ask-user-question/index.ts",
+      "tools": ["ask_user_question"]
     }
   ],
   "optional": []

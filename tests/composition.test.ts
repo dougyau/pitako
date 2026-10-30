@@ -45,9 +45,10 @@ describe("engineering-layer composition", () => {
       for (const instruction of ["Pi-native tools and codemode need no T3 client",
         "Optional-host guidance applies only when present", "unknown trust is not denial",
         "Honor actual native rejections and Stop", "never invent a trust certificate",
-        "billion-context-pi ACP is mandatory", "/execute root owns dispatch, shared review and compliance"])
+        "ast_search for syntax patterns", "/execute root owns dispatch, shared review and compliance"])
         expect(result.systemPrompt).toContain(instruction);
       expect(result.systemPrompt).toContain("First load and apply verify-behavior.");
+      expect(result.systemPrompt).not.toContain("ACP");
       expect(handlers.get("before_agent_start")!({ systemPrompt: result.systemPrompt }, ctx)).toBeUndefined();
     } finally {
       handlers.get("session_shutdown")!({}, ctx);
@@ -147,10 +148,25 @@ describe("engineering-layer composition", () => {
       expect(plan.disableAmbientExtensions).toBe(true);
       expect(plan.extensionArgs).toContain(path.join(packageRoot(), "extensions/acp.ts"));
       for (const tool of acpTools) expect(plan.requiredChildTools).toContain(tool);
-      expect(body).toContain("billion-context-pi");
-      expect(body).toContain("unmet prerequisite");
-      expect(body).toContain("native-compaction stand-down");
+      // Context management stays wired without model-directed preflight guidance.
+      expect(body).not.toMatch(/ACP|billion-context-pi|acp_status|native-compaction/);
       expect(plan.fanoutAuthorized).toBe(false);
+      const usesAstGrep = ["architect", "reviewer", "scout", "worker"].includes(role);
+      expect(plan.requiredChildTools.includes("ast_search")).toBe(usesAstGrep);
+      expect(plan.requiredChildTools.includes("ast_rewrite")).toBe(role === "worker");
+      expect(plan.extensionArgs.includes(path.join(packageRoot(), "node_modules/@nicknisi/pi-ast-grep/index.ts")))
+        .toBe(usesAstGrep);
+      if (usesAstGrep) {
+        const instructions = body.replace(/\s+/g, " ");
+        for (const instruction of [
+          "navigation by question before broad grep",
+          "`lsp_goto_definition`", "`lsp_find_references`", "`lsp_symbols`",
+          "`codegraph_explore`", "`codegraph_callers`", "`codegraph_impact`",
+          "`ast_search` for syntax patterns", "not types or symbol identity",
+          "grep for literal text, logs, and config",
+          "Empty results do not prove absence", "partial or unavailable",
+        ]) expect(instructions).toContain(instruction);
+      }
       if (role === "interview-relay") {
         expect(plan.effectiveToolAllowlist).toEqual(["contact_supervisor", ...acpTools]);
         expect(plan.configuredExtensions).toEqual([path.join(packageRoot(), "extensions/acp.ts")]);
@@ -213,36 +229,45 @@ describe("engineering-layer composition", () => {
       { cwd: packageRoot() } as ExtensionToolContext)).rejects.toBe(reason);
   });
 
-  test("TODO composition delegates upstream execution and keeps native model-only exposure", async () => {
+  test("TODO composition sets only todo model-only and preserves upstream registration", async () => {
     const upstream = { content: [], details: { tasks: [], nextId: 1 } };
     const execute = mock(async (..._args: unknown[]) => {
       return upstream;
     });
-    const todo: ToolDefinition = {
+    const todo: ToolDefinition = Object.freeze({
       name: "todo", label: "TODO", description: "controlled upstream tool",
       parameters: Type.Object({}), execute,
-    };
+    });
     const other = { ...todo, name: "other", exposure: "codemode" as const };
     const tools: ToolDefinition[] = [];
+    const unsubscribe = () => {};
+    const on = mock(() => unsubscribe), registerCommand = mock(() => {});
+    const handler = async () => {};
+    const command = { description: "controlled command", handler };
     const pi = {
       registerTool(tool: ToolDefinition) { tools.push(tool); },
-      on() { return () => {}; },
-      registerCommand() {},
-    };
+      on,
+      registerCommand,
+    } as unknown as ExtensionAPI;
     let forwarded: ExtensionAPI | undefined;
     const registration = spyOn(rpivTodo, "default").mockImplementation(api => {
       forwarded = api;
       api.registerTool(todo);
       api.registerTool(other);
+      expect(api.on("session_start", handler)).toBe(unsubscribe);
+      api.registerCommand("todos", command);
     });
     try {
       const extension = await import("../extensions/todo.ts");
-      extension.default(pi as unknown as ExtensionAPI);
+      extension.default(pi);
       expect(registration).toHaveBeenCalledTimes(1);
-      expect(forwarded?.on).toBe(pi.on);
-      expect(forwarded?.registerCommand).toBe(pi.registerCommand);
-      expect(tools[0]).toMatchObject({ name: todo.name, label: todo.label, description: todo.description, exposure: "model-only" });
-      expect(tools[0]!.parameters).toEqual(todo.parameters);
+      expect(forwarded!.on).toBe(pi.on);
+      expect(forwarded!.registerCommand).toBe(pi.registerCommand);
+      expect(on).toHaveBeenCalledWith("session_start", handler);
+      expect(registerCommand).toHaveBeenCalledWith("todos", command);
+      expect(tools[0]).toEqual({ ...todo, exposure: "model-only" });
+      expect(tools[0]!.execute).toBe(execute);
+      expect(tools[0]!.parameters).toBe(todo.parameters);
       const controller = new AbortController(), update = () => {};
       const ctx = { cwd: packageRoot(), sessionManager: {} } as unknown as ExtensionToolContext, args = {};
       const result = await tools[0]!.execute("native-id", args, controller.signal, update, ctx);
@@ -251,6 +276,7 @@ describe("engineering-layer composition", () => {
       expect(result).toBe(upstream);
       expect(tools[1]).toBe(other);
       expect(todo.exposure).toBeUndefined();
+      expect(pi.registerTool).not.toBe(forwarded!.registerTool);
     } finally {
       registration.mockRestore();
     }
@@ -339,11 +365,13 @@ describe("engineering-layer composition", () => {
       "codegraph_search", "codegraph_callers", "codegraph_callees", "codegraph_impact",
       "codegraph_explore", "codegraph_node", "codegraph_status", "codegraph_files",
       "lsp_diagnostics", "lsp_goto_definition", "lsp_find_references", "lsp_symbols",
+      "ast_search",
     ]);
     const providers = [
       "../extensions/dev-tools/index.ts", "../extensions/file-sha256.ts",
       "../node_modules/@vndv/pi-codegraph/extensions/codegraph.ts",
       "../node_modules/pi-lsp-client/src/index.ts",
+      "../node_modules/@nicknisi/pi-ast-grep/index.ts",
     ];
     expect(profile.subagentOnlyExtensions).toEqual(providers);
     for (const provider of providers)
@@ -423,7 +451,7 @@ describe("engineering-layer composition", () => {
   test("ordinary delegation ships directly without the Pitako runtime", () => {
     const manifest = JSON.parse(readRepo("package.json"));
     const stack = JSON.parse(readRepo("config/stack.json"));
-    expect(manifest.dependencies["pi-subagents"]).toBe("0.83.0");
+    expect(manifest.dependencies["pi-subagents"]).toMatch(/^\d+\.\d+\.\d+$/);
     expect(manifest.bundledDependencies).toContain("pi-subagents");
     const piPackages = new Set([...Object.keys(manifest.devDependencies), ...Object.keys(manifest.peerDependencies)]);
     for (const name of piPackages) {
@@ -434,7 +462,7 @@ describe("engineering-layer composition", () => {
     expect(manifest.pi.extensions.filter((entry: string) => entry.includes("pi-subagents")))
       .toEqual(["./node_modules/pi-subagents/bundle/index.js"]);
     expect(stack.required.find((entry: { id: string }) => entry.id === "pi-subagents"))
-      .toEqual({ id: "pi-subagents", spec: "pi-subagents@0.83.0", entry: "node_modules/pi-subagents/bundle/index.js",
+      .toEqual({ id: "pi-subagents", spec: `pi-subagents@${manifest.dependencies["pi-subagents"]}`, entry: "node_modules/pi-subagents/bundle/index.js",
         tools: ["subagent", "subagents_enable", "bg_wait", "subagent_supervisor", "contact_supervisor"] });
     for (const resources of [manifest.pi.skills, manifest.pi.prompts])
       expect(resources.some((entry: string) => entry.includes("pi-subagents"))).toBe(false);
@@ -448,7 +476,6 @@ describe("engineering-layer composition", () => {
     for (const skill of ["plan", "execute", "grilling"]) expect(manifest.pi.skills).toContain(`./skills/${skill}`);
     expect(manifest.exports).toBeUndefined();
     expect(manifest.files).not.toContain("roles");
-    expect(manifest.dependencies["smol-toml"]).toBeUndefined();
   });
 
   test("review documentation ships through existing package resources", () => {
@@ -474,6 +501,20 @@ describe("engineering-layer composition", () => {
     expect(router).not.toContain("ACTIVE EVERY RESPONSE");
     expect(router).not.toContain("Respond terse like smart caveman");
     expect(router).not.toContain("subagent_type");
+    expect(router).not.toMatch(/ACP|acp_status|native compaction/);
+    for (const instruction of [
+      "Choose navigation by question", "`lsp_find_references`", "`codegraph_impact`",
+      "`ast_search`", "grep", "syntax, not types", "Empty results do not prove absence",
+      "Do not query every backend", "`dryRun:false`",
+    ]) expect(router.replace(/\s+/g, " ")).toContain(instruction);
+  });
+
+  test("guidance omits automatic context-provider operations", () => {
+    for (const pattern of ["AGENTS.md", "GATES.md", "README.md", "docs/**/*.md", "skills/**/SKILL.md", "prompts/**/*.md"]) {
+      for (const file of new Bun.Glob(pattern).scanSync({ cwd: packageRoot(), onlyFiles: true })) {
+        expect(readRepo(file), file).not.toMatch(/\bACP\b|\bacp\b|billion-context/);
+      }
+    }
   });
 
   test("specialized skills keep single-agent and contextual contracts", () => {

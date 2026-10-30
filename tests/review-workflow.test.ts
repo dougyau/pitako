@@ -107,7 +107,7 @@ describe("review scripted workflow", () => {
     expect(host.calls).toHaveLength(0);
     await expect(host.library({ rootExecuteArgument: true })).rejects.toThrow("Provide a review brief");
     expect(host.calls).toHaveLength(0);
-    expect(await host.library()).toEqual(await fixture().execute());
+    expect(await host.library<Outcome>()).toEqual(await fixture().execute());
   });
 
   test("sequential library calls own their state and prefix every child key", async () => {

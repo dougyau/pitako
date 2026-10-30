@@ -578,12 +578,13 @@ function analysisDispatch(requests) {
     });
   })));
 }
-function collect(childKey, agent, task, outputSchema, implementation = false, dispatcher = dispatch, resume) {
+function collect(childKey, agent, display, task, outputSchema, implementation = false, dispatcher = dispatch, resume) {
+  const label = display.label.replace(/\s+/g, " ").trim().slice(0, 120);
   progress();
   return dispatcher([{
-    key: childKey, ...(resume ? { resume } : { agent, context: "fresh" }), cwd: config.root,
+    key: childKey, ...(resume ? { resume } : { agent, context: "fresh" }), label, phase: display.phase, cwd: config.root,
     output: `${childKey}.json`, outputMode: "file-only", reads: false, progress: false,
-    skill: ["verify-behavior"], task, outputSchema,
+    skill: ["verify-behavior"], task: `${label}\n\n${task}`, outputSchema,
     ...(implementation ? { timeoutMs: 14400000,
       ...(!resume ? { extensionBindings: { "pitako.checkpoint/1": { association: clone(invocation.association), key: loop.attempt.key } } } : {}),
       acceptance: {
@@ -726,7 +727,10 @@ function inspectRecovery(kind, ref, retained) {
     if (cause) throw nativeBarrier(cause);
     return retainedReadOnlyOriginal(result, recovery.ref);
   }) : save().then(() =>
-    collect(recoveryKey, "pitako.execution-inspector", `EXCEPTIONAL READ-ONLY ${kind} recovery. No tests, writes or delegation.
+    collect(recoveryKey, "pitako.execution-inspector",
+    { label: kind === "attempt-result" ? "Recover implementation result" : kind === "checkpoint" ? "Recover writer checkpoint"
+      : kind === "interrupted-operation" ? "Recover interrupted operation" : "Recover complete execution plan", phase: "recovery" },
+    `EXCEPTIONAL READ-ONLY ${kind} recovery. No tests, writes or delegation.
 ${fullContext()}
 Use existing read tools and ONLY these exact native producer/run/output references, plus Git/WIP:
 ${JSON.stringify(recovery.source)}
@@ -881,7 +885,8 @@ function continueAttempt(observed, ref, task, prerequisites) {
     continuation = descriptor.nativeContinuation = {
       stage: "intention", source: clone({ ...ref, runId }), ref: { key: `${descriptor.key}.resume` },
     };
-    return save().then(() => collect(continuation.ref.key, "pitako.worker", `${fullContext()}
+    return save().then(() => collect(continuation.ref.key, "pitako.worker",
+      { label: task.goal, phase: "implementation" }, `${fullContext()}
 CONTINUE THE EXACT INTERRUPTED ATTEMPT through the public native resume operation.
 No new task, loop or permission. Preserve prior WIP and the admitted task/check contracts.
 Do not infer a pass from partial logs; finish missing work and execute required checks
@@ -1569,7 +1574,8 @@ try {
       if (!loop.plan) {
         loop.plan = { stage: "intention", ref: { key: directorKey } };
         await save();
-        const result = await collect(directorKey, "pitako.execution-director", `${fullContext()}
+        const result = await collect(directorKey, "pitako.execution-director",
+          { label: "Plan execution work", phase: "planning" }, `${fullContext()}
 READ-ONLY PLANNING ONLY. Do not delegate, implement, run checks/review, select workers,
 maintain private TODOs or supervise execution. Return one COMPLETE loop_plan using structured_output
 and the native output binding, then END. Status is plan or needs-decision, never implementation complete.
@@ -1737,7 +1743,8 @@ No replacement task list elsewhere. Carry the exact association above. Native pe
           await save();
         }
         const descriptor = clone(loop.attempt);
-        let result = await collect(descriptor.key, "pitako.worker", `${fullContext()}
+        let result = await collect(descriptor.key, "pitako.worker",
+          { label: task.goal, phase: "implementation" }, `${fullContext()}
 EXECUTE SINGLE TASK. No delegation, next-task selection, private diary/progress file or parallel TODO.
 The workflow owns review and compliance; do not launch or infer another reviewer.
 Preserve required checks and native permissions/Stop. Do not commit or publish unless task authority explicitly permits it.
@@ -1908,7 +1915,8 @@ Read the actual sources and full referenced reports, not previews. Candidate: ${
     if (loop.phase === "compliance") {
       await reconcileAnalysis();
       const complianceKey = `${key}.l${loop.number}.compliance`;
-      const result = await collect(complianceKey, "pitako.reviewer", `${fullContext()}
+      const result = await collect(complianceKey, "pitako.reviewer",
+        { label: "Check whole-spec compliance", phase: "compliance" }, `${fullContext()}
 INDIVIDUAL READ-ONLY WHOLE-SPEC COMPLIANCE ANALYSIS. You are ONE fresh analyst, not a council,
 director checklist, implementation worker or final presentation agent. No delegation, writes or tests.
 Before examining the solution, load and apply verify-behavior. Reconstruct material outcomes

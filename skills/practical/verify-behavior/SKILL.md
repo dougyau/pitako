@@ -66,7 +66,7 @@ verification does not authorize maintaining the guide.
 
 In Pitako, verify owned composition, rules, resources, adapters, and instruction
 assembly through controlled external boundaries. This does not certify Pi, SDK,
-ACP, pi-subagents, providers, classifiers, CodeGraph, or LSP. Reading an external
+pi-subagents, providers, classifiers, CodeGraph, or LSP. Reading an external
 boundary grants no certification or repair task. Other projects retain authorized
 integration requirements from their scope, contracts, and active guide.
 

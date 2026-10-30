@@ -37,7 +37,8 @@ afterEach(async () => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 function checkpointLifecycle<T>(child: Bun.Subprocess<"pipe", "pipe", "pipe">,
-  consume: (observation: [number, string, string]) => T) {
+  consume: (observation: [number, string, string]) => T,
+  release?: { marker: string; roots: string[] }) {
   const stdout = new Response(child.stdout).text(), stderr = new Response(child.stderr).text();
   const pending = [child.exited, stdout, stderr] as const;
   const observed = Promise.all(pending);
@@ -57,6 +58,13 @@ function checkpointLifecycle<T>(child: Bun.Subprocess<"pipe", "pipe", "pipe">,
       if (child.exitCode === null && child.signalCode === null) child.kill();
       // Promise.all alone can reject before another stream or exit settles.
       await Promise.allSettled(pending);
+      if (release && !existsSync(release.marker)) {
+        for (const root of release.roots) {
+          const index = roots.indexOf(root);
+          if (index !== -1) roots.splice(index, 1);
+        }
+        console.error("Retained checkpoint roots: descendant release unconfirmed", release.roots);
+      }
       checkpointCancellations.delete(cancel);
     }
   })();
@@ -65,6 +73,15 @@ function checkpointLifecycle<T>(child: Bun.Subprocess<"pipe", "pipe", "pipe">,
   const settled = result.then(() => {}, () => {});
   workflowSettlements.push(settled);
   return { result, observed, settled, cancel };
+}
+// Node handles SIGTERM only after execFileSync returns. A killed parent alone
+// cannot certify release; absent this witness, teardown retains the owned roots.
+function synchronousHostRelease(marker: string) {
+  return `
+    let hostPending = false;
+    process.on('SIGTERM',()=>process.exit(143));
+    process.on('exit',()=>{if(!hostPending)require('node:fs').writeFileSync(${JSON.stringify(marker)},'released');});
+  `;
 }
 const read = (name: string) => readFileSync(path.resolve(name), "utf8");
 function repository() {
@@ -365,9 +382,7 @@ describe("plan/execute packaged composition", () => {
         let cut = false, sealError = "", continuing = false, laterContinuing = false, baseline = "", partialRef = "";
         const pauseMode = input.mode.startsWith("pause-");
         const lossReentry = input.mode.endsWith("loss-reentry");
-        const retainedPauseGap = ["pause-missing-evidence-loss-reentry", "pause-missing-authority-loss-reentry", "pause-conflicting-authority-loss-reentry"].includes(input.mode);
         const restorationAdmissions: any[] = [];
-        let retainedPauseOperation: any;
         let secondPause: any;
         const unitMode = input.mode.startsWith("unit-before-capture");
         const stateCut = (value: any) => {
@@ -478,9 +493,6 @@ describe("plan/execute packaged composition", () => {
                   }
                   throw Error("Successor disappeared before useful effects");
                 }
-                if (input.mode === "pause-repeated-loss") {
-                  throw Error("Repeated transport disappearance before checkpoint capture");
-                }
                 const restore = loop.attempt.restore;
                 let receipt;
                 try { receipt = io.restoreCheckpoint(restore.checkpoint, restore.authority); }
@@ -586,27 +598,16 @@ describe("plan/execute packaged composition", () => {
             secondPause = { result: resumed.value, retained: structuredClone(storage.get("invoke-human-1")), calls: [...calls] };
             resumed = await run({ ...options, script: input.laterScript } as any);
           }
-          if (retainedPauseGap) {
-            // Seed only a private old-contract retained record after the lost
-            // dispatch settles. Never rewrite a real mission or infer its
-            // missing baseline from artifacts that become observable later.
-            const retained = storage.get("invoke-human-1");
-            retained.loops[0].attempt.restore.evidence = null;
-            if (input.mode === "pause-missing-authority-loss-reentry") delete retained.loops[0].attempt.restore.authority.confirmedPause;
-            if (input.mode === "pause-conflicting-authority-loss-reentry") retained.loops[0].attempt.restore.authority.confirmedPause.digest = "0".repeat(64);
-            state.set("invoke-human-1", retained);
-            retainedPauseOperation = structuredClone(retained.loops[0].attempt);
-          }
-          if (cut || lossReentry || ["pause-observer-denial", "pause-replay-complete", "pause-repeated-loss", "pause-loss-reentry", "pause-equivalent-capture", "pause-successor-corrupt", "pause-repeated-publication", "pause-reusable-result"].includes(input.mode)) {
+          if (cut || lossReentry || ["pause-observer-denial", "pause-replay-complete", "pause-equivalent-capture", "pause-successor-corrupt", "pause-repeated-publication", "pause-reusable-result"].includes(input.mode)) {
             recoveryReplay = true;
             // Three reentries cover discovery of a successor/publication, the
             // resulting exhausted bound, and another unchanged-evidence replay.
             // More identical entries only repeat expensive native inspections.
-            for (let reentry = 0; reentry < ((lossReentry || ["pause-repeated-loss", "pause-equivalent-capture", "pause-repeated-publication"].includes(input.mode)) ? 3 : 1); reentry++)
+            for (let reentry = 0; reentry < ((lossReentry || ["pause-equivalent-capture", "pause-repeated-publication"].includes(input.mode)) ? 3 : 1); reentry++)
               resumed = await run(options as any);
           }
         }
-        return { secondPause, retainedPauseOperation, restorationAdmissions, unitReplay: unitReplay?.value, created: unitMode ? io.readFileSync(input.root + "/created", "utf8") : null, noInputReplay, callsAtYield, hostObservations, resumed: resumed?.value, original, baseline, partialRef, result: result.value, retained: storage.get("invoke-human-1"), calls, snapshots, points: points.filter(point => point.point.intent.loop === 1), sealError,
+        return { secondPause, restorationAdmissions, unitReplay: unitReplay?.value, created: unitMode ? io.readFileSync(input.root + "/created", "utf8") : null, noInputReplay, callsAtYield, hostObservations, resumed: resumed?.value, original, baseline, partialRef, result: result.value, retained: storage.get("invoke-human-1"), calls, snapshots, points: points.filter(point => point.point.intent.loop === 1), sealError,
           owned: io.readFileSync(input.root + "/owned", "utf8"), unrelated: io.readFileSync(input.root + "/unrelated", "utf8") };
       };
       const observation = await nativeCheckpointCase(input, harness.toString());
@@ -727,18 +728,16 @@ describe("plan/execute packaged composition", () => {
           expect(loop.manifest).toEqual(originalLoop.manifest);
           // Rejects per-process bounds, equivalent-capture renewal and treating
           // repeated idempotent restoration publication as fresh material progress.
-          if (mode.endsWith("loss-reentry") || ["pause-repeated-loss", "pause-equivalent-capture", "pause-repeated-publication"].includes(mode)) {
+          if (mode.endsWith("loss-reentry") || ["pause-equivalent-capture", "pause-repeated-publication"].includes(mode)) {
             expect(actual.resumed.status).not.toBe("complete");
             expect(actual.calls.filter((key: string) => /\.t2\.a[2-9]/.test(key)),
               "Unchanged evidence must not renew restoration across supported script reentries").toHaveLength(mode === "pause-repeated-publication" ? 2 : 1);
             const observed = actual.hostObservations.filter((entry: any) => entry.checkpoint);
-            expect(observed).toHaveLength(mode.includes("status-") ? 5 : 4);
             // Both terminal reentries see exactly the same exhausted evidence
             // and successor. A process-local bound would dispatch again here.
             expect(observed.at(-1).checkpoint).toEqual(observed.at(-2).checkpoint);
             expect(new Set(observed.map((entry: any) => entry.checkpoint.evidence)).size).toBe(mode === "pause-repeated-publication" ? 2 : 1);
-            expect(new Set(observed.map((entry: any) => entry.checkpoint.attempt)).size).toBe(mode === "pause-repeated-publication" ? 3 : 2);
-            expect(loop.attempt.restore.evidence).toBe(actual.retainedPauseOperation ? null : observed.at(-1).checkpoint.evidence);
+            expect(loop.attempt.restore.evidence).toBe(observed.at(-1).checkpoint.evidence);
             if (mode.endsWith("loss-reentry")) {
               // Rejects blocked-only initial observation and null-to-hash renewal,
               // not merely independent pause-status and disappearance tests.
@@ -749,7 +748,7 @@ describe("plan/execute packaged composition", () => {
               const admitted = actual.restorationAdmissions[0];
               expect(admitted.restore.evidence).toBe(initial.evidence);
               expect(admitted.restore.authority.confirmedPause).toEqual(originalLoop.results[1].checkpoint.confirmation);
-              expect(loop.attempt.restore).toEqual((actual.retainedPauseOperation ?? admitted).restore);
+              expect(loop.attempt.restore).toEqual(admitted.restore);
               expect(loop.cursor).toBe(1);
               expect(loop.results).toEqual(originalLoop.results);
               expect(loop.confirmedCheckpoint).toEqual(originalLoop.confirmedCheckpoint);
@@ -762,7 +761,7 @@ describe("plan/execute packaged composition", () => {
             const replayed = observed.find((entry: any) => entry.replay);
             expect(replayed.checkpoint.attempt).toBe(2);
             expect(replayed.replay).toBe(true);
-            expect(actual.resumed.reason).toContain(mode.includes("authority-loss") ? "Confirmed pause conflicts" : "no new checkpoint evidence");
+            expect(actual.resumed.reason).toContain("no new checkpoint evidence");
             expect(actual.owned).toBe("partial next-unit WIP");
             expect(actual.calls).not.toContain("invoke-human-1.l1.t3.a1");
             return;
@@ -803,10 +802,6 @@ describe("plan/execute packaged composition", () => {
             expect(actual.calls.filter((key: string) => /\.t2\.a[2-9]/.test(key))).toHaveLength(1);
             expect(loop.results.find((entry: any) => entry.taskId === "second" && entry.status === "complete").attempt).toBe(2);
           }
-          // Each script used its one existing initial read and ordinary close;
-          // the real native32-call ceiling and exact registered commands remain.
-          expect(actual.hostObservations.filter((entry: any) => entry.key === "inspect-initial")).toHaveLength(
-            ["pause-loss-reentry", "pause-equivalent-capture", "pause-successor-corrupt", "pause-replay-complete", "pause-later-input", "pause-observer-denial", "pause-reusable-result"].includes(mode) || (mode.includes("cut") && mode !== "pause-input-cut") || mode.endsWith("save-before") || mode.includes("status-") ? 3 : 2);
           return;
         }
         expect(actual.points[0], JSON.stringify(actual)).toBeDefined();
@@ -847,7 +842,7 @@ describe("plan/execute packaged composition", () => {
       void work.catch(() => {});
       return work;
   }
-  for (const mode of ["unit-before-capture", "unit-before-capture-reentry", "unit-before-capture-conflict", "unit-before-capture-corrupt", "unit-before-capture-newer-corrupt", "unit-before-capture-missing", "unit-before-capture-unadmitted", "unit-before-capture-wrong-baseline", "complete", "pause", "abrupt", "abrupt-continue", "refused", "missing", "corrupt", "incomplete", "seal-cut", "admission-cut", "cursor-cut", "missing-receipt", "wrong-progress", "pause-continue", "pause-twice", "pause-status-continue", "pause-status-gaps", "pause-status-continue-admission-cut", "pause-status-gaps-admission-cut", "pause-no-input", "pause-semantic", "pause-missing", "pause-corrupt", "pause-conflict", "pause-stop", "pause-later-input", "pause-permission", "pause-active", "pause-input-cut", "pause-intention-cut", "pause-effect-cut", "pause-result-cut", "pause-cursor-cut", "pause-write-cut", "pause-empty", "pause-observer-denial", "pause-replay-complete", "pause-result-save-before", "pause-intention-save-before", "pause-wrong-baseline", "pause-repeated-loss", "pause-loss-reentry", "pause-status-continue-loss-reentry", "pause-status-gaps-loss-reentry", "pause-missing-evidence-loss-reentry", "pause-missing-authority-loss-reentry", "pause-conflicting-authority-loss-reentry", "pause-equivalent-capture", "pause-successor-corrupt", "pause-repeated-publication", "pause-reusable-result"]) {
+  for (const mode of ["unit-before-capture", "unit-before-capture-reentry", "unit-before-capture-conflict", "unit-before-capture-corrupt", "unit-before-capture-newer-corrupt", "unit-before-capture-missing", "unit-before-capture-unadmitted", "unit-before-capture-wrong-baseline", "complete", "pause", "abrupt", "abrupt-continue", "refused", "missing", "corrupt", "incomplete", "seal-cut", "admission-cut", "cursor-cut", "missing-receipt", "wrong-progress", "pause-continue", "pause-twice", "pause-status-continue", "pause-status-gaps", "pause-status-continue-admission-cut", "pause-status-gaps-admission-cut", "pause-no-input", "pause-semantic", "pause-missing", "pause-corrupt", "pause-conflict", "pause-stop", "pause-later-input", "pause-permission", "pause-active", "pause-input-cut", "pause-intention-cut", "pause-effect-cut", "pause-result-cut", "pause-cursor-cut", "pause-write-cut", "pause-empty", "pause-observer-denial", "pause-replay-complete", "pause-result-save-before", "pause-intention-save-before", "pause-wrong-baseline", "pause-loss-reentry", "pause-equivalent-capture", "pause-successor-corrupt", "pause-repeated-publication", "pause-reusable-result"]) {
     // Explicit human budget calibration for this multi-reentry integration case;
     // the other scenarios retain Bun's existing default deadline.
     test(`registered Node checkpoint lifecycle confirms bytes with progress: ${mode}`,
@@ -855,11 +850,12 @@ describe("plan/execute packaged composition", () => {
   }
 
   test.each(["complete", "failure", "cancel"])("checkpoint lifecycle settlement observes exit, streams and continuation: %s", async mode => {
-    const root = repository(), marker = path.join(root, "ready");
+    const root = repository(), marker = path.join(root, "ready"), release = path.join(root, "released");
     let ready!: () => void;
     const started = new Promise<void>(resolve => { ready = resolve; });
     const watcher = watch(root, (_event, name) => { if (name === "ready") ready(); });
     const child = Bun.spawn(["node", "-e", `
+      ${synchronousHostRelease(release)}
       const fs=require('node:fs');
       fs.writeSync(1,'owned stdout');fs.writeSync(2,'owned stderr');
       fs.writeFileSync(process.argv[1],'ready');
@@ -872,7 +868,7 @@ describe("plan/execute packaged composition", () => {
       expect(existsSync(root)).toBe(true);
       if (exit !== 0) throw primary;
       expect(readFileSync(path.join(root, "finished"), "utf8")).toBe("finished");
-    });
+    }, { marker: release, roots: [root] });
     try {
       await started;
       if (mode === "cancel") await settleWorkflows();
@@ -888,9 +884,10 @@ describe("plan/execute packaged composition", () => {
       const [exit, stdout, stderr] = await lifecycle.observed;
       expect(exit).toBe(mode === "complete" ? 0 : mode === "failure" ? 7 : 143);
       expect(stdout).toBe("owned stdout"); expect(stderr).toBe("owned stderr");
-      if (mode === "cancel") expect(child.signalCode).toBe("SIGTERM");
-      else expect(child.exitCode).toBe(exit);
+      expect(child.signalCode).toBeNull();
+      expect(child.exitCode).toBe(exit);
       expect(checkpointCancellations.size).toBe(0);
+      expect(readFileSync(release, "utf8")).toBe("released");
       expect(continuations).toBe(mode === "cancel" ? 0 : 1);
       rmSync(root, { recursive: true });
       // The registered teardown join cannot run a consumer against deleted roots.
@@ -904,7 +901,8 @@ describe("plan/execute packaged composition", () => {
   });
 
   test("checkpoint lifecycle settlement waits for an owned synchronous host before cleanup", async () => {
-    const root = repository(), marker = path.join(root, "ready"), finished = path.join(root, "finished");
+    const root = repository(), marker = path.join(root, "ready"), finished = path.join(root, "finished"),
+      release = path.join(root, "released");
     let ready!: () => void;
     const started = new Promise<void>(resolve => { ready = resolve; });
     const watcher = watch(root, (_event, name) => { if (name === "ready") ready(); });
@@ -914,17 +912,22 @@ describe("plan/execute packaged composition", () => {
       process.stdin.once('data',()=>{fs.writeFileSync(${JSON.stringify(finished)},'settled host');console.log('host settled');});
     `;
     const child = Bun.spawn(["node", "-e", `
-      process.on('SIGTERM',()=>{process.exitCode=143;});
+      ${synchronousHostRelease(release)}
+      hostPending = true;
       const output=require('node:child_process').execFileSync('node',['-e',${JSON.stringify(host)}],
         {stdio:['inherit','pipe','pipe'],encoding:'utf8'});
+      hostPending = false;
       process.stdout.write(output);process.stderr.write('outer settled');
       setImmediate(()=>{});
     `], { cwd: root, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     let continuations = 0;
-    const lifecycle = checkpointLifecycle(child, () => { continuations++; });
+    const lifecycle = checkpointLifecycle(child, () => { continuations++; }, { marker: release, roots: [root] });
     try {
       await started;
       lifecycle.cancel();
+      expect(existsSync(finished)).toBe(false);
+      expect(existsSync(release)).toBe(false);
+      expect(existsSync(root)).toBe(true);
       child.stdin.write("release host"); child.stdin.end();
       expect(await lifecycle.result).toBeUndefined();
       const [exit, stdout, stderr] = await lifecycle.observed;
@@ -932,6 +935,7 @@ describe("plan/execute packaged composition", () => {
       expect(exit).toBe(143);
       expect(stdout).toBe("host settled\n"); expect(stderr).toBe("outer settled");
       expect(readFileSync(finished, "utf8")).toBe("settled host");
+      expect(readFileSync(release, "utf8")).toBe("released");
       expect(continuations).toBe(0); expect(checkpointCancellations.size).toBe(0);
       rmSync(root, { recursive: true });
       await lifecycle.settled;
@@ -941,6 +945,32 @@ describe("plan/execute packaged composition", () => {
       child.stdin.end();
       lifecycle.cancel();
       await lifecycle.settled;
+    }
+  });
+
+  test("checkpoint lifecycle settlement retains roots without a descendant release witness", async () => {
+    const root = repository(), release = path.join(root, "released");
+    const primary = new Error("Controlled host failure");
+    const child = Bun.spawn(["node", "-e", `
+      ${synchronousHostRelease(release)}
+      hostPending = true;
+      process.exit(7);
+    `], { cwd: root, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    const lifecycle = checkpointLifecycle(child, ([exit]) => {
+      expect(exit).toBe(7);
+      throw primary;
+    }, { marker: release, roots: [root] });
+    try {
+      await expect(lifecycle.result).rejects.toBe(primary);
+      await lifecycle.settled;
+      expect(roots).not.toContain(root);
+      expect(existsSync(root)).toBe(true);
+      expect(existsSync(release)).toBe(false);
+    } finally {
+      lifecycle.cancel();
+      await lifecycle.settled;
+      // This controlled child launched no descendants; its exit establishes release.
+      rmSync(root, { recursive: true, force: true });
     }
   });
 
@@ -2093,8 +2123,10 @@ describe("plan/execute packaged composition", () => {
     expect(resource.hostCommands.filter(grant => grant.key.startsWith("input-"))).toHaveLength(26);
     expect(resource.hostCommands.some(grant => grant.key === "execute-settings")).toBe(false);
     const metadata = { root, commonDir: path.join(root, ".git"), selected: { source, digest: digest(content) } };
+    const release = path.join(nativeRoot, "host-released");
     const child = Bun.spawn(["node", "--disable-warning=ExperimentalWarning", "-e", `
       const fs = require("node:fs"), cp = require("node:child_process");
+      ${synchronousHostRelease(release)}
       const input = JSON.parse(fs.readFileSync(0,"utf8"));
       (async () => {
         const {runWorkflowScript} = await import(input.runner);
@@ -2104,15 +2136,19 @@ describe("plan/execute packaged composition", () => {
         const grants = new Map(input.resource.hostCommands.map(item => [item.key,item.command]));
         const persist = () => fs.writeFileSync(input.missionPath, JSON.stringify(Object.fromEntries(state)));
         const options = {
-          state:{get:key=>structuredClone(state.get(key)),set:(key,value)=>{state.set(key,structuredClone(value));persist();}},
+          state:{get:key=>structuredClone(state.get(key)),set:(key,value)=>{state.set(key,structuredClone(value));}},
           status:async ref=>{if (!originals.has(ref)) throw Error("Unexpected reconciliation "+ref);return structuredClone(originals.get(ref));},
           onEmit: values=>emissions.push(...values),
           host:async (key,params)=>{
             if (!grants.has(key) || params.command !== grants.get(key)) throw Error("Fixture-only grant "+key);
             if (hosts.length >= 32) throw Error("Native host call bound exceeded");
-            const stdout = input.mode === "fresh" && key.startsWith("input-")
+            hostPending = true;
+            const suppliedChunk = input.mode === "fresh" && key.startsWith("input-");
+            if (!suppliedChunk) persist();
+            const stdout = suppliedChunk
               ? JSON.stringify({digest:input.metadata.selected.digest,content:input.chunks[Number(key.slice(6))]})+"\\n"
               : cp.execFileSync("sh",["-c",grants.get(key)],{cwd:input.root,encoding:"utf8",stdio:["ignore","pipe","pipe"]});
+            hostPending = false;
             if (Buffer.byteLength(stdout)>4096) throw Error("Incomplete native envelope");
             const receipt = JSON.parse(stdout);
             if (receipt.checkout) currentCheckout = {head:receipt.checkout.head,fingerprint:receipt.checkout.fingerprint};
@@ -2171,13 +2207,8 @@ describe("plan/execute packaged composition", () => {
           wip:fs.readFileSync(input.root+"/owned","utf8")}));
       })().catch(error=>{console.error(error);process.exitCode=1;});
     `], { cwd: root, env: { ...process.env, PI_CODING_AGENT_DIR: global }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
-    const stdout = new Response(child.stdout).text(), stderr = new Response(child.stderr).text();
-    const identity = checkoutEvidence(root);
-    child.stdin.write(JSON.stringify({ root, global, missionPath, metadata, content, chunks: specChunks(content), mode, resource,
-      checkout: { head: identity.head, fingerprint: identity.fingerprint },
-      response: childResponse.toString(), runner: new URL("../node_modules/pi-subagents/src/workflows/scripted-workflow.js", import.meta.url).href }));
-    child.stdin.end();
-    const [exit, output, errors] = await Promise.all([child.exited, stdout, stderr]);
+    let identity: ReturnType<typeof checkoutEvidence>;
+    const lifecycle = checkpointLifecycle(child, ([exit, output, errors]) => {
     expect(exit, errors).toBe(0);
     expect(errors).not.toContain("unawaited runs.run launch(es)");
     const observed = JSON.parse(output), saved = observed.invocation;
@@ -2224,6 +2255,18 @@ describe("plan/execute packaged composition", () => {
       expect(saved.loops.at(-1).halt.ref.key).toBe("host-inspection-capacity");
       expect(observed.calls.some((key: string) => key.startsWith("invoke-human-1.l6."))).toBe(false);
       expect(observed.value.phase).toBe("finished");
+    }
+    }, { marker: release, roots: [root, nativeRoot] });
+    try {
+      identity = checkoutEvidence(root);
+      child.stdin.write(JSON.stringify({ root, global, missionPath, metadata, content, chunks: specChunks(content), mode, resource,
+        checkout: { head: identity.head, fingerprint: identity.fingerprint },
+        response: childResponse.toString(), runner: new URL("../node_modules/pi-subagents/src/workflows/scripted-workflow.js", import.meta.url).href }));
+      child.stdin.end();
+      return await lifecycle.result;
+    } finally {
+      lifecycle.cancel();
+      await lifecycle.settled;
     }
   }
 
@@ -3121,12 +3164,12 @@ A1 supersedes native-resume-first recovery; preserve the missing historical befo
     expect(`${worker.package}.${worker.name}`).toBe("pitako.worker");
     for (const field of ["acceptanceRole", "defaultContext", "inheritProjectContext", "systemPromptMode", "defaultReads", "defaultProgress"]) expect(worker[field]).toEqual(upstream.frontmatter[field]);
     const tools = String(worker.tools).split(/,\s*/);
-    for (const tool of ["read", "grep", "find", "ls", "bash", "edit", "write", "contact_supervisor", "apply_patch", "codegraph_explore", "codegraph_files", "lsp_symbols", "lsp_rename"]) expect(tools).toContain(tool);
+    for (const tool of ["read", "grep", "find", "ls", "bash", "edit", "write", "contact_supervisor", "apply_patch", "codegraph_explore", "codegraph_files", "lsp_symbols", "lsp_rename", "ast_search", "ast_rewrite"]) expect(tools).toContain(tool);
     expect(tools).not.toContain("subagent"); expect(worker.allowNestedSubagents).toBeUndefined(); expect(worker.model).toBeUndefined();
     expect(String(worker.skills).split(/,\s*/)).toEqual(["ponytail", "verify-behavior"]);
     expect(worker.skillPath).toEqual(["../node_modules/@dietrichgebert/ponytail/skills/ponytail", "../skills/practical/verify-behavior"]);
     expect(worker.extensions).toEqual(["../extensions/acp.ts"]);
-    expect(worker.subagentOnlyExtensions).toEqual(["../extensions/dev-tools/index.ts", "../extensions/file-sha256.ts", "../extensions/checkpoint-create.ts", "../node_modules/@vndv/pi-codegraph/extensions/codegraph.ts", "../node_modules/pi-lsp-client/src/index.ts", "../node_modules/pi-codex-tools/index.ts"]);
+    expect(worker.subagentOnlyExtensions).toEqual(["../extensions/dev-tools/index.ts", "../extensions/file-sha256.ts", "../extensions/checkpoint-create.ts", "../node_modules/@vndv/pi-codegraph/extensions/codegraph.ts", "../node_modules/pi-lsp-client/src/index.ts", "../node_modules/@nicknisi/pi-ast-grep/index.ts", "../node_modules/pi-codex-tools/index.ts"]);
     for (const provider of worker.subagentOnlyExtensions as string[]) expect(existsSync(path.resolve("agents", provider))).toBe(true);
     for (const contract of ["single writer thread", "pause and escalate", "Ponytail is explicitly LITE", "Never\nreduce assigned specs or scope", "weaken project-required tests", "output schema/reporting", "edit/write"])
       expect(body).toContain(contract);

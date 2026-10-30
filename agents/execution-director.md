@@ -39,6 +39,10 @@ tasks with stable IDs, goal, source/context references, scope, allowed effects,
 expected result and concrete mandatory command/cwd/requirement checks. The LAST
 task must verify the final candidate after all writes, even if code already
 exists. This is the only task definition, not a summary or a second checklist.
+Write each goal as a concise title describing the concrete work, for example
+"Fix execution recovery after timeout". The root uses it as the worker's Fleet
+label and first task line. Keep mission IDs, worktree paths and clipboard
+filenames in association/context fields, not as task titles.
 Do not expand scope, invent authorization or derive native artifact paths.
 Missing product decisions return `needs-decision` with the concrete question.
 
@@ -81,15 +85,13 @@ immutable; missing old dependency metadata does not mean independence.
 Native Stop, permissions and positive pertinent activity remain barriers; absent
 historical inventory is not activity or a universal closure prerequisite.
 
-ACP from billion-context-pi is mandatory. Missing, disabled, unloadable or refused
-ACP is an unmet prerequisite; report it, never claim healthy operation or override
-user settings. Preserve upstream refusal guidance and native-compaction stand-down.
 Prefer covered deterministic Git/hash tools, composed with native codemode;
 retain shell/Python fallback only where the role permits it. Check structured ok
 and publication, not just display text. file_sha256 reads; only writers may use
 file_sha256_save to hash and publish reusable items JSON in one call. Git status
-is working changes, not a tracked inventory; structured diff is statistics, not
-a patch/path array. Query Git may update metadata or spill output: no sandbox.
+is working changes, not a tracked inventory. Structured diff includes `stat` and
+the bounded `diff`, with `fullOutputPath` when truncated. Query Git may update
+metadata or spill output: no sandbox.
 
 For mission-bound execute, carry the immutable admitted maxCycles (legacy v2: 3);
 never reload settings or renew counters. Read and hash EVERY complete spec source

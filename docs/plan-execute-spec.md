@@ -486,8 +486,9 @@ runtime test evidence.
   `docs/workflows.md`, `docs/agents.md`, and `docs/extension-api.md`.
   It documents agent-mediated nesting, not `runs.workflow`. Its durable
   recovery is native, not an integration with `pi-durable`.
-- Installed rpiv-todo `2.11.0` partitions TODO storage by session. Pitako's
-  `extensions/todo.ts` keeps TODO mutations model-only.
+- Installed rpiv-todo `2.15.0` partitions TODO storage by session and persists
+  mutations as `rpiv-todo-state` session entries, including calls through codemode.
+  Pitako's `extensions/todo.ts` preserves upstream tool exposure.
 - Historical commit `2d6435d` introduced cross-worktree document discovery.
   The pre-retirement sources at `deffc71`, including `extensions/workflow.ts`,
   `extensions/board/workspace.ts`, and `tests/frozen-plan.test.ts`, describe its
