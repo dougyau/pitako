@@ -112,7 +112,7 @@ async function inspectSelected() {
           association.missionId !== context.missionId || association.missionPath !== context.missionPath ||
           association.invocation !== context.invocation || !isDeepStrictEqual(association.sourceRefs, context.sourceRefs))
         throw new Error("Checkpoint observation association mismatch.");
-      const sources = [attempt.checkpoint, ...[].concat(attempt.restore?.checkpoint ?? [])].filter(Boolean);
+      const sources = [attempt.checkpoint, ...[].concat(attempt.restore?.checkpoint ?? attempt.pauseSource?.sources ?? attempt.pauseSource?.checkpoint ?? [])].filter(Boolean);
       const subject = { key: attempt.key, taskId: attempt.taskId, attempt: attempt.number, loop: loop.number, cursor: loop.cursor };
       try {
         if (sources.some(source => !isDeepStrictEqual(source.association, association) || source.taskId !== subject.taskId ||

@@ -979,7 +979,7 @@ function checkpointFallback(observed, ref, task) {
   // A restoration intention consumes this material witness durably, before
   // dispatch. Reentry reconciles that exact operation first; fresh status,
   // renamed keys and equivalent captures cannot renew its modifying route.
-  const prior = [descriptor, ...(loop.interruptions ?? [])].filter(item =>
+  const prior = [descriptor, ...(loop.interruptions ?? []), ...(descriptor.pauseSource?.restorations ?? [])].filter(item =>
     item.taskId === task.id && item.index === loop.cursor && item.restore);
   const pauseRestoration = loop.confirmedCheckpoint?.kind === "pause" ||
     loop.results.some(item => item.taskId === task.id && item.checkpoint?.confirmation?.kind === "pause") ||
@@ -987,6 +987,9 @@ function checkpointFallback(observed, ref, task) {
   if (pauseRestoration) {
     const { taskId, attempt, resultRef, ...receipt } = loop.confirmedCheckpoint ?? {};
     const result = loop.results.find(item => item.taskId === taskId && item.attempt === attempt && same(item.ref, resultRef));
+    if (descriptor.pauseSource && (!same(descriptor.pauseSource.confirmation, receipt) ||
+        descriptor.pauseSource.checkpoint.key !== result?.checkpoint?.key))
+      throw new Error("Confirmed pause source conflicts with admitted pending progress.");
     if (taskId !== task.id || !["blocked", "continue", "gaps"].includes(result?.status) || !(result.remainingCount > 0) ||
         receipt.kind !== "pause" || !same(receipt, result.checkpoint?.confirmation) ||
         !same(receipt.position, { loop: loop.number, cursor: loop.cursor, phase: "implementation" }) ||
@@ -1008,9 +1011,10 @@ function checkpointFallback(observed, ref, task) {
   // An old pause's missing witness is not a baseline for newly visible files.
   // Reconcile the exact operation/result without inventing its original evidence.
   // Non-pause recovery retains its existing material-progress routes.
-  if (descriptor.restore && (!evidence || prior.some(item => item.restore.evidence === evidence ||
+  const lastRestore = descriptor.restore ?? descriptor.pauseSource?.restorations?.at(-1)?.restore;
+  if (lastRestore && (!evidence || prior.some(item => item.restore.evidence === evidence ||
       pauseRestoration && !item.restore.evidence &&
-        same(item.restore.authority?.confirmedPause, descriptor.result?.checkpoint?.confirmation ?? descriptor.restore.authority?.confirmedPause)))) {
+        same(item.restore.authority?.confirmedPause, descriptor.result?.checkpoint?.confirmation ?? lastRestore.authority?.confirmedPause)))) {
     const error = new Error("Restoration remains pending with no new checkpoint evidence; reconcile the exact operation or supply material progress, no replacement writer authorized.");
     error.nativeFailure = { code: "recovery", reason: error.message, ref: clone(ref) };
     throw error;
@@ -1021,7 +1025,7 @@ function checkpointFallback(observed, ref, task) {
   // helper before any effect. No model inspector/result rescue is a prerequisite.
   const checkpoint = { key: descriptor.checkpoint.key, manifest };
   const sources = [clone(descriptor.checkpoint),
-    ...[].concat(descriptor.restore?.checkpoint ?? [])];
+    ...[].concat(descriptor.restore?.checkpoint ?? descriptor.pauseSource?.sources ?? descriptor.pauseSource?.checkpoint ?? [])];
   const confirmedUnit = descriptor.restore?.authority?.confirmedUnit ?? confirmedUnitForPending();
   const observations = sources.map(source => ({ key: source.key,
     manifest: `${config.root}/.pi/subagents/checkpoints/${source.key}/manifest.json` }));
@@ -1034,12 +1038,13 @@ function checkpointFallback(observed, ref, task) {
   loop.interruptions.push(clone(descriptor));
   loop.attempt = { taskId: task.id, index: loop.cursor, number: descriptor.number + 1,
     key: `${key}.l${loop.number}.t${loop.cursor + 1}.a${descriptor.number + 1}`, stage: "intention",
-    continuationRef: descriptor.result?.ref ?? null, restore: { undispatched: true,
+    continuationRef: descriptor.result?.ref ?? null, ...(descriptor.pauseSource ? { pauseSource: clone(descriptor.pauseSource) } : {}), restore: { undispatched: true,
       checkpoint: sources.length === 1 ? sources[0] : sources, evidence, observation: checkpoint, observations,
       producer: clone(ref), authority: { pending: true, stop: false, permissionDenied: false,
         activeWriter: null, references: [ref.runId ?? ref.key, manifest],
         ...(confirmedUnit ? { confirmedUnit } : {}),
-        ...(descriptor.restore?.authority?.confirmedPause ? { confirmedPause: clone(descriptor.restore.authority.confirmedPause) } : {}),
+        ...(descriptor.restore?.authority?.confirmedPause || descriptor.pauseSource?.confirmation
+          ? { confirmedPause: clone(descriptor.restore?.authority?.confirmedPause ?? descriptor.pauseSource.confirmation) } : {}),
         ...(descriptor.result?.checkpoint?.confirmation?.kind === "pause"
           ? { confirmedPause: clone(descriptor.result.checkpoint.confirmation) } : {}) } } };
   // Essential admission of the restoration intention precedes modifying dispatch.
@@ -1179,7 +1184,7 @@ function admitWorker(result, descriptor, task, recoveryRef, statusRef) {
   loop.attempt.result = projected;
   loop.attempt.stage = "result";
   if (["recovery", "native-barrier"].includes(loop.halt?.code)) delete loop.halt;
-  if (projected.status === "blocked" || confirmedPausePending()) retainWorkerBlock(projected);
+  if (projected.status === "blocked") retainWorkerBlock(projected);
   currentCandidate = projected.candidate;
   return parsed.value;
 }
@@ -1451,6 +1456,15 @@ try {
   checkpointObservation = metadata.checkpointObservation;
   currentCandidate = candidate(current.checkout);
   loop = invocation.loops[invocation.loops.length - 1];
+  // Older readers promoted a saved non-blocked pause into a human impediment.
+  // Reconcile only that exact admitted result, never a native or worker barrier.
+  if (confirmedPausePending() && loop.attempt.result.status !== "blocked" &&
+      loop.halt?.code === "semantic-block" && same(loop.halt.ref, loop.attempt.result.ref) &&
+      loop.halt.reason === loop.attempt.result.diagnosis) {
+    delete loop.halt;
+    delete loop.outcome;
+    await save();
+  }
   if (resolution?.currentBarrier)
     return finish(["stopped", "interrupted"].includes(resolution.currentBarrier.cause) ? "cancelled" : "blocked",
       `Current continuation encountered a native barrier: ${resolution.currentBarrier.cause}; this input does not authorize another interruption.`);
@@ -1508,7 +1522,7 @@ try {
     await checkpointFallback(observed, ref, { id: paused.taskId });
   }
   // Recover the old result-committed/outcome-not-committed cut before plan recovery.
-  if (loop?.attempt?.stage === "result" && (loop.attempt.result?.status === "blocked" || confirmedPausePending()) &&
+  if (loop?.attempt?.stage === "result" && loop.attempt.result?.status === "blocked" &&
       (!loop.halt || loop.halt.code === "semantic-block"))
     retainWorkerBlock(loop.attempt.result);
   // Historical read-only parser rejection is re-evaluated from exact originals,
@@ -1680,14 +1694,26 @@ No replacement task list elsewhere. Carry the exact association above. Native pe
         if (loop.attempt?.stage === "result") {
           // Result is committed before cursor movement: do not repeat completed edits.
           const previous = loop.attempt.result;
-          if (previous.status === "blocked" || confirmedPausePending()) return finish("blocked", loop.halt.reason);
+          if (previous.status === "blocked") return finish("blocked", loop.halt.reason);
           if (previous.status === "complete") {
             loop.cursor++; loop.attempt = null; await save(); continue;
           }
           if (!previous.usefulContinuation) break;
+          let pauseSource = confirmedPausePending() ? { checkpoint: clone(loop.attempt.checkpoint),
+            confirmation: clone(previous.checkpoint.confirmation) } : loop.attempt.pauseSource && clone(loop.attempt.pauseSource);
+          if (loop.attempt.restore && !confirmedPausePending() && loop.attempt.restore.authority?.confirmedPause) {
+            const source = pauseSource ?? { checkpoint: clone([].concat(loop.attempt.restore.checkpoint).at(-1)),
+              confirmation: clone(loop.attempt.restore.authority.confirmedPause) };
+            source.sources = [clone(loop.attempt.checkpoint), ...[].concat(clone(loop.attempt.restore.checkpoint))];
+            source.restorations = [...(source.restorations ?? []), { taskId: task.id, index: loop.cursor,
+              number: loop.attempt.number, restore: clone(loop.attempt.restore) }];
+            pauseSource = source;
+          } else if (pauseSource && !confirmedPausePending()) {
+            pauseSource.sources = [clone(loop.attempt.checkpoint), ...[].concat(pauseSource.sources ?? pauseSource.checkpoint)];
+          }
           loop.attempt = { taskId: task.id, index: loop.cursor, number: previous.attempt + 1,
             key: `${key}.l${loop.number}.t${loop.cursor + 1}.a${previous.attempt + 1}`,
-            stage: "intention", continuationRef: previous.ref };
+            stage: "intention", continuationRef: previous.ref, ...(pauseSource ? { pauseSource } : {}) };
           await save();
         } else if (loop.attempt && !loop.attempt.restore?.undispatched) {
           // Never call an unresolved writer key as if native reuse were read-only.
@@ -1853,7 +1879,7 @@ continue requires useful progress plus concrete diagnosed continuation, not a re
             loop.recoveries.find(item => item.subject === `attempt-result:${descriptor.taskId}:${descriptor.number}`).ref);
         } else value = admitWorker(result, loop.attempt, task);
         await save();
-        if (value.status === "blocked" || confirmedPausePending()) {
+        if (value.status === "blocked") {
           return finish("blocked", loop.halt.reason);
         }
       }

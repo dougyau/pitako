@@ -250,8 +250,9 @@ promises of pi-subagents.
 - [Verification](GATES.md)
 - [Third-party provenance and licenses](THIRD_PARTY.md)
 
-The packaged `pitako.worker` explicitly loads the existing Ponytail skill in
-LITE mode: reuse code, avoid speculative abstractions and keep diffs small. This
+The packaged architect, execution director and worker load Ponytail in FULL mode:
+reuse code, avoid speculative abstractions and choose the simplest complete solution.
+Reviewers always apply ponytail-review to correctness, safety, tests and simplicity. This
 never reduces assigned specs/scope, weakens required tests or replaces acceptance
 criteria. Project instructions and output schemas/reporting take precedence over
 generic Ponytail prose/test-minimization preferences; upstream bytes are unchanged.

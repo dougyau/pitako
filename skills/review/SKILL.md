@@ -15,7 +15,7 @@ The caller interprets the report and retains authority over any further action.
    `workflows/scripted-workflows` and `tool-reference/retained-children` guides.
 2. Inspect profiles with `subagent({ action: "list" })`. Confirm that
    `pitako.reviewer` is available and suitable for read-only review without
-   delegation. It supplies CodeGraph, read-only LSP, and verify-behavior.
+   delegation. It supplies CodeGraph, read-only LSP, verify-behavior, and ponytail-review.
    If absent, reload the installed package before dispatch; do not substitute a
    profile, create agent files, or change settings to make the pass work.
 3. Capture the target and requirements. Supply a target with `kind` (`diff`,
@@ -66,8 +66,8 @@ The script fixes three phases; the director selects two to four angles on the
 same complete target, not files or subtasks:
 
 1. **Independent review.** Fresh reviewers see no peer conclusions. Each may
-   return zero findings. verify-behavior is common; additional skills are chosen
-   from the script's bounded list by risk. Use ponytail-review for complexity.
+   return zero findings. verify-behavior and ponytail-review are common; additional skills are chosen
+   from the script's bounded list by risk. Apply ponytail-review to correctness, safety, useful tests and simplicity; require reachable cases and evidence, not speculative guards.
 2. **Cross-critique and defense.** A different reviewer examines every finding.
    Each author then gets one response: maintain, narrow, or withdraw.
    Native resumes preserve each child's profile and context. Reviewers without

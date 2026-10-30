@@ -581,8 +581,9 @@ Installed dependency version does not prove a running host has reloaded it.
 Controlled implementation tests are evidence of owned behavior, not provider or
 host certification. Independent review and the parent-owned full gate remain.
 
-The packaged `pitako.worker` explicitly loads the existing Ponytail skill in
-LITE mode: reuse code, avoid speculative abstractions and keep diffs small. This
+The packaged architect, execution director and worker load Ponytail in FULL mode:
+reuse code, avoid speculative abstractions and choose the simplest complete solution.
+Reviewers always apply ponytail-review to correctness, safety, tests and simplicity. This
 never reduces assigned specs/scope, weakens required tests or replaces acceptance
 criteria. Project instructions and output schemas/reporting take precedence over
 generic Ponytail prose/test-minimization preferences; upstream bytes are unchanged.

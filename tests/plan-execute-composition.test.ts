@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, watch, writeFileSync } from "node:fs";
@@ -230,8 +230,6 @@ async function startNativeCheckpoint() {
   await started;
   expect(nativeCheckpoint, errors).toBeDefined();
 }
-beforeAll(startNativeCheckpoint);
-beforeEach(async () => { if (!nativeCheckpoint) await startNativeCheckpoint(); });
 afterAll(async () => {
   if (nativeCheckpoint?.connected) nativeCheckpoint.disconnect();
   for (const operation of nativeCheckpointExits) {
@@ -239,9 +237,10 @@ afterAll(async () => {
     expect(exit, errors).toBe(operation.cancelled ? 143 : 0);
     expect(errors).not.toContain("unawaited runs.run launch(es)");
   }
-  rmSync(nativeCheckpointRoot, { recursive: true, force: true });
+  if (nativeCheckpointRoot) rmSync(nativeCheckpointRoot, { recursive: true, force: true });
 });
-function nativeCheckpointCase(input: any, harness: string) {
+async function nativeCheckpointCase(input: any, harness: string) {
+  if (!nativeCheckpoint) await startNativeCheckpoint();
   if (!nativeCheckpoint || nativeCheckpointReply) throw Error("Native checkpoint fixture unavailable or busy");
   const child = nativeCheckpoint;
   let cancelled = false;
@@ -274,6 +273,7 @@ const nativeCheckpointInput = () => ({ root: process.cwd(), missionPath: path.jo
   evidence: new URL("../extensions/spec-plans.ts", import.meta.url).href });
 
 test("native checkpoint fixture cancellation joins process, streams and case continuation", async () => {
+  await startNativeCheckpoint();
   const pending = nativeCheckpointCase(nativeCheckpointInput(), "async () => new Promise(() => {})");
   const cancel = [...checkpointCancellations][0]!;
   cancel(); cancel();
@@ -285,6 +285,7 @@ test("native checkpoint fixture cancellation joins process, streams and case con
 });
 
 test("native checkpoint fixture cancellation after IPC disconnect joins late continuation and streams", async () => {
+  if (!nativeCheckpoint) await startNativeCheckpoint();
   const child = nativeCheckpoint!;
   const disconnected = new Promise<void>(resolve => child.once("disconnect", resolve));
   const pending = nativeCheckpointCase(nativeCheckpointInput(), `async () => {
@@ -323,6 +324,7 @@ test("native checkpoint fixture cancellation after IPC disconnect joins late con
 });
 
 test("native checkpoint fixture preserves genuine failure and subsequent normal completion", async () => {
+  if (!nativeCheckpoint) await startNativeCheckpoint();
   const failure = await nativeCheckpointCase(nativeCheckpointInput(), "async () => { throw Error('controlled case failure'); }");
   expect(failure?.[0]).toBe(1);
   expect(failure?.[2]).toContain("controlled case failure");
@@ -331,6 +333,7 @@ test("native checkpoint fixture preserves genuine failure and subsequent normal 
 });
 
 test("native checkpoint fixture close without a reply is not a successful case", async () => {
+  if (!nativeCheckpoint) await startNativeCheckpoint();
   const outcome = await nativeCheckpointCase(nativeCheckpointInput(), "async () => { process.disconnect(); return 'lost reply'; }");
   expect(outcome?.[0]).toBe(1);
   expect(outcome?.[2]).toContain("closed before replying");
@@ -352,6 +355,10 @@ describe("plan/execute packaged composition", () => {
       const content = `---\npitako-spec: 1\nid: assignment\nstatus: complete\n---\n${SPEC_SECTIONS.map(title => `## ${title}\nAgreed ${title}.\n`).join("\n")}`;
       mkdirSync(path.join(root, ".pitako/plans"), { recursive: true });
       writeFileSync(path.join(root, ".pitako/plans/assignment.md"), content);
+      if (mode.startsWith("pause-status-gaps")) {
+        mkdirSync(path.join(root, ".pi"), { recursive: true });
+        writeFileSync(path.join(root, ".pi/settings.json"), JSON.stringify({ pitako: { execute: { maxCycles: 1 } } }));
+      }
       writeFileSync(path.join(root, "owned"), "previous uncommitted WIP");
       writeFileSync(path.join(root, "unrelated"), "unrelated WIP");
       const hooks = new Map<string, any>();
@@ -368,14 +375,21 @@ describe("plan/execute packaged composition", () => {
       if (!resource.ok) throw Error(resource.error);
       const permit = consumeWorkflowResourcePermit(resource.resource.permit, resource.resource.script);
       if (typeof permit === "string") throw Error(permit);
-      const continuationResource = resolveWorkflowResource("pitako.execute", { ...args, unblock: true,
-        resolution: { loop: 1, text: "Continue the cooperative pause from its saved pending work" } }, sessionId);
-      if (!continuationResource.ok) throw Error(continuationResource.error);
-      const laterResource = resolveWorkflowResource("pitako.execute", { ...args, unblock: true,
-        resolution: { loop: 1, text: "New human continuation after the recorded Stop" } }, sessionId);
-      if (!laterResource.ok) throw Error(laterResource.error);
+      let continuationScript: string | undefined, laterScript: string | undefined;
+      if (mode.startsWith("pause-") && !mode.startsWith("pause-status-")) {
+        const continuationResource = resolveWorkflowResource("pitako.execute", { ...args, unblock: true,
+          resolution: { loop: 1, text: "Continue the cooperative pause from its saved pending work" } }, sessionId);
+        if (!continuationResource.ok) throw Error(continuationResource.error);
+        continuationScript = continuationResource.resource.script;
+        if (mode === "pause-later-input" || mode === "pause-twice") {
+          const laterResource = resolveWorkflowResource("pitako.execute", { ...args, unblock: true,
+            resolution: { loop: 1, text: "New human continuation after the recorded Stop" } }, sessionId);
+          if (!laterResource.ok) throw Error(laterResource.error);
+          laterScript = laterResource.resource.script;
+        }
+      }
       const input = { mode, root, missionPath, statePath, script: resource.resource.script,
-        continuationScript: continuationResource.resource.script, laterScript: laterResource.resource.script,
+        continuationScript, laterScript,
         metadata: { root, commonDir: path.join(root, ".git"), selected: { source: path.join(root, ".pitako/plans/assignment.md"), digest: digest(content) } },
         module: new URL("../extensions/execute-checkpoint.ts", import.meta.url).href,
         toolModule: path.resolve("extensions/checkpoint-create.ts"),
@@ -388,6 +402,7 @@ describe("plan/execute packaged composition", () => {
         let pauseAdmissionCut = false;
         let cut = false, sealError = "", continuing = false, laterContinuing = false, baseline = "", partialRef = "";
         const pauseMode = input.mode.startsWith("pause-");
+        const cooperativePause = input.mode.startsWith("pause-status-");
         const lossReentry = input.mode.endsWith("loss-reentry");
         const restorationAdmissions: any[] = [];
         let secondPause: any;
@@ -416,6 +431,8 @@ describe("plan/execute packaged composition", () => {
           if (!pauseAdmissionCut && input.mode.includes("status-") && input.mode.endsWith("admission-cut") && value.loops?.[0]?.attempt?.stage === "result" && value.loops[0].attempt.taskId === "second") {
             pauseAdmissionCut = true; throw Error("Cut after durable pause admission before yield");
           }
+          if (input.mode === "pause-status-continue" && !cut && value.loops?.[0]?.attempt?.taskId === "second" &&
+              value.loops[0].attempt.number === 3 && value.loops[0].attempt.stage === "launched") { cut = true; throw Error("Cut after successor loss"); }
           if (unitMode && input.mode.endsWith("reentry") && !cut && value.loops?.[0]?.attempt?.restore?.undispatched) { cut = true; throw Error("Cut after durable unit recovery intention"); }
           if (stateCut(value)) { cut = true; throw Error("Controlled pause persistence cut"); }
           if (!cut && input.mode === "cursor-cut" && admission && value.loops[0].attempt?.stage === "result") {
@@ -461,7 +478,7 @@ describe("plan/execute packaged composition", () => {
             const needsCandidate = key.endsWith(".compliance") || (request.agent === "pitako.worker" && key.includes(".t3."));
             const result = response(key, request, input.metadata, needsCandidate ? candidate() : undefined);
             if (key.endsWith(".director")) {
-              result.structuredOutput.association.missionPath = input.missionPath;
+              result.structuredOutput.association = JSON.parse(request.task.split("ASSOCIATION (data): ")[1].split("\n")[0]);
               result.structuredOutput.tasks[0].dependsOn = [{ taskId: "second", reason: "Verify the completed pending unit" }];
               result.structuredOutput.tasks.unshift(firstTask(result.structuredOutput, "first"), firstTask(result.structuredOutput, "second"));
               result.structuredOutput.tasks[0].dependsOn = []; result.structuredOutput.tasks[1].dependsOn = [];
@@ -469,6 +486,12 @@ describe("plan/execute packaged composition", () => {
             } else if (request.agent === "pitako.worker" && !key.includes(".t3.")) {
               const invocation = storage.get("invoke-human-1"), loop = invocation.loops[0], intent = loop.attempt.checkpoint;
               const second = intent.taskId === "second";
+              if (cooperativePause && second && intent.attempt > 1) {
+                continuing = true;
+                baseline = io.readFileSync(input.root + "/owned", "utf8");
+              }
+              if (input.mode === "pause-status-continue" && second && [3, 6].includes(intent.attempt))
+                throw Error("Successor disappeared before pre-capture");
               const checkpoint = await loadCheckpoint(request, input.root, io.loadExtensions, input.toolModule, key).catch((error: unknown) => { console.error(error); throw error; });
               let restoreReceipt: any;
               if (unitMode && second && intent.attempt === 1) {
@@ -522,7 +545,21 @@ describe("plan/execute packaged composition", () => {
                 if (input.mode === "pause-repeated-publication") throw Error("Disappeared after the same durable restoration publication");
                 if (input.mode === "pause-effect-cut" && !cut) { cut = true; throw Error("Cut after actual pause restoration"); }
               }
-              await checkpoint("pre", unitMode && !second ? ["owned", "created"] : ["owned"]);
+              if (!(input.mode === "pause-status-continue" && second && intent.attempt === 2))
+                await checkpoint("pre", unitMode && !second ? ["owned", "created"] : ["owned"]);
+              if (input.mode === "pause-status-continue" && second && [2, 4, 5].includes(intent.attempt)) {
+                if (intent.attempt === 5)
+                  io.applyCheckpoint(intent, [{ path: "owned", image: { bytes: Buffer.from("journaled pending WIP").toString("base64"), mode: 420 } }]);
+                const current = intent.attempt === 5 ? candidate() : restoreReceipt?.candidate ?? loop.results.at(-1).candidate;
+                Object.assign(result.structuredOutput, { taskId: intent.taskId, attempt: intent.attempt,
+                  status: "continue", usefulProgress: true, diagnosis: `Further work ${intent.attempt} requires a fresh capture for another path`,
+                  remaining: ["Finish the diagnosed pending work"], continuation: "Complete the newly diagnosed work",
+                  candidate: current, ...(restoreReceipt ? { restoreReceipt } : {}),
+                  git: { head: current.head, checkpoints: restoreReceipt ? [restoreReceipt.partialRef, restoreReceipt.restoredRef] : [], wip: "Unchanged pause WIP" },
+                  checks: [{ id: "second-check", command: "bun test affected", cwd: input.root,
+                    output: "Pending implementation", logPaths: [], result: "not-run", before: current, after: current }] });
+                return result;
+              }
               const manifestPath = input.root + "/.pi/subagents/checkpoints/" + intent.key + "/manifest.json";
               const before = JSON.parse(JSON.parse(io.readFileSync(manifestPath, "utf8")).data);
               const bytes = second && input.mode === "pause-twice" && intent.attempt === 2 ? "new pending pause work" : second ? (continuing ? "completed pending work from pause" : "partial next-unit WIP") : "confirmed first work";
@@ -555,7 +592,7 @@ describe("plan/execute packaged composition", () => {
               // persistence is outside checkoutEvidence's candidate inventory.
               const current = receipt.candidate;
               Object.assign(result.structuredOutput, { taskId: intent.taskId, attempt: intent.attempt,
-                status: kind === "pause" ? (input.mode.includes("status-continue") || input.mode === "pause-twice" && intent.attempt === 2 ? "continue" : input.mode.includes("status-gaps") ? "gaps" : "blocked") : "complete", remaining: kind === "pause" && input.mode !== "pause-empty" ? ["Pending second unit"] : [],
+                status: kind === "pause" ? (input.mode.includes("status-continue") ? "continue" : input.mode.includes("status-gaps") ? "gaps" : "blocked") : "complete", remaining: kind === "pause" && input.mode !== "pause-empty" ? ["Pending second unit"] : [],
                 continuation: kind === "pause" ? "Resume pending second unit from its exact pause" : null,
                 checkpointReceipt: receipt, ...(restoreReceipt ? { restoreReceipt } : {}), candidate: current,
                 git: { head: current.head, checkpoints: [receipt.checkpointRef, ...(restoreReceipt ? [restoreReceipt.partialRef, restoreReceipt.restoredRef] : [])], wip: "Real owned WIP" },
@@ -588,11 +625,16 @@ describe("plan/execute packaged composition", () => {
         }
         let noInputReplay: any;
         if (input.mode.includes("status-")) {
+          recoveryReplay = true;
           const replayed = await run(options as any);
           noInputReplay = { result: replayed.value, calls: [...calls], cursor: storage.get("invoke-human-1").loops[0].cursor };
+          if (input.mode === "pause-status-continue") {
+            const again = await run(options as any);
+            noInputReplay = { ...noInputReplay, again: again.value };
+          }
         }
         let resumed: any;
-        if (pauseMode) {
+        if (pauseMode && !cooperativePause) {
           const checkpoint = original.loops[0].confirmedCheckpoint;
           if (input.mode === "pause-missing") io.unlinkSync(checkpoint.checkpointRef);
           if (input.mode === "pause-corrupt") io.writeFileSync(checkpoint.checkpointRef, "corrupt pause");
@@ -673,11 +715,75 @@ describe("plan/execute packaged composition", () => {
         }
         if (mode.startsWith("pause-")) {
           const originalLoop = actual.original.loops[0];
+          if (mode.startsWith("pause-status-")) {
+            const status = mode.includes("status-continue") ? "continue" : "gaps";
+            const paused = originalLoop.results[1], pause = paused.checkpoint.confirmation;
+            expect(paused.status).toBe(status);
+            expect(pause).toMatchObject({ kind: "pause", position: { cursor: 1 } });
+            expect(createHash("sha256").update(readFileSync(pause.checkpointRef)).digest("hex")).toBe(pause.digest);
+            if (mode.endsWith("admission-cut") || mode === "pause-status-continue") expect(actual.result.status).not.toBe("complete");
+            else expect(actual.result.status).toBe(status === "continue" ? "complete" : "partial");
+            if (mode === "pause-status-continue") {
+              expect(actual.noInputReplay.result.reason).toContain("no new checkpoint evidence");
+              expect(actual.noInputReplay.calls.some((key: string) => key.endsWith(".t2.a7"))).toBe(false);
+              expect(actual.noInputReplay.again.status, JSON.stringify(actual.noInputReplay.again)).toBe("complete");
+            } else expect(actual.noInputReplay.result.status, JSON.stringify(actual.noInputReplay.result)).toBe(status === "continue" ? "complete" : "partial");
+            expect(actual.retained.association).toEqual(actual.original.association);
+            expect(actual.retained.loops).toHaveLength(1);
+            expect(loop.halt).toBeUndefined();
+            expect(loop.results[1]).toEqual(paused);
+            expect(actual.unrelated).toBe("unrelated WIP");
+            if (mode === "pause-status-continue") {
+              expect(actual.restorationAdmissions).toHaveLength(2);
+              expect(actual.restorationAdmissions[0].restore.authority.confirmedPause).toEqual(pause);
+              expect(loop.results[3].restore.receipt.confirmedPause).toEqual({ checkpointRef: pause.checkpointRef, digest: pause.digest });
+              expect(actual.restorationAdmissions[1].restore.checkpoint.map((source: any) => source.key)).toEqual([
+                "invoke-human-1.l1.t2.a6", "invoke-human-1.l1.t2.a5", "invoke-human-1.l1.t2.a4",
+                "invoke-human-1.l1.t2.a3", "invoke-human-1.l1.t2.a2", "invoke-human-1.l1.t2.a1",
+              ]);
+              expect(actual.restorationAdmissions[1].restore.authority.confirmedPause).toEqual(pause);
+              expect(actual.restorationAdmissions[1].pauseSource.restorations.map((item: any) => item.number)).toEqual([4]);
+              expect(actual.restorationAdmissions[1].restore.evidence).toBeTruthy();
+              expect(actual.restorationAdmissions[1].restore.evidence).not.toBe(actual.restorationAdmissions[0].restore.evidence);
+              expect(loop.results[5].restore.receipt.checkpointRef).toEndWith(".t2.a5/manifest.json");
+              const partial = JSON.parse(JSON.parse(readFileSync(loop.results[5].restore.receipt.partialRef, "utf8")).data);
+              expect(Buffer.from(partial.partial[0].image.bytes, "base64").toString()).toBe("journaled pending WIP");
+              expect(actual.hostObservations.some((o: any) => o.replay && o.checkpoint?.evidence)).toBe(true);
+              expect(loop.results[2]).toMatchObject({ attempt: 2, status: "continue", usefulContinuation: true });
+              expect(loop.results[2].checkpoint.confirmation).toBeUndefined();
+              expect(existsSync(pause.checkpointRef.replace(/t2\.a1\/pause\.json$/, "t2.a2/manifest.json"))).toBe(false);
+              expect(existsSync(pause.checkpointRef.replace(/t2\.a1\/pause\.json$/, "t2.a3/manifest.json"))).toBe(false);
+              expect(actual.calls.filter((key: string) => key.endsWith(".t2.a3"))).toHaveLength(1);
+              expect(actual.calls.filter((key: string) => key.endsWith(".t2.a4"))).toHaveLength(1);
+            } else expect(actual.restorationAdmissions).toEqual([]);
+            expect(actual.calls.filter((key: string) => key.endsWith(".director"))).toHaveLength(1);
+            expect(actual.calls.filter((key: string) => key.endsWith(".t1.a1"))).toHaveLength(1);
+            expect(actual.calls.filter((key: string) => key.endsWith(".t2.a1"))).toHaveLength(1);
+            if (status === "continue") {
+              expect(loop.cursor).toBe(3);
+              expect(loop.results.map((r: any) => r.status)).toEqual(mode === "pause-status-continue"
+                ? ["complete", "continue", "continue", "continue", "continue", "complete", "complete"]
+                : ["complete", "continue", "complete", "complete"]);
+              expect(actual.retained.association.maxCycles).toBe(3);
+              expect(actual.baseline).toBe("partial next-unit WIP");
+              expect(actual.owned).toBe("completed pending work from pause");
+              expect(actual.calls.filter((key: string) => key.endsWith(".t2.a2"))).toHaveLength(1);
+              expect(actual.calls.filter((key: string) => key.endsWith(".review.director-synthesis"))).toHaveLength(1);
+              expect(actual.calls.filter((key: string) => key.endsWith(".compliance"))).toHaveLength(1);
+            } else {
+              expect(loop.cursor).toBe(1);
+              expect(loop.outcome).toBe("gaps");
+              expect(actual.retained.association.maxCycles).toBe(1);
+              expect(actual.owned).toBe("partial next-unit WIP");
+              expect(actual.calls.some((key: string) => key.endsWith(".t2.a2") || key.endsWith(".compliance"))).toBe(false);
+            }
+            return;
+          }
           if (mode === "pause-twice") {
             const paused = actual.secondPause.retained.loops[0];
             expect(actual.secondPause.result.status).toBe("blocked");
             expect(paused.cursor).toBe(1);
-            expect(paused.results.map((r: any) => r.status)).toEqual(["complete", "blocked", "continue"]);
+            expect(paused.results.map((r: any) => r.status)).toEqual(["complete", "blocked", "blocked"]);
             expect(paused.confirmedCheckpoint).toMatchObject(paused.results[2].checkpoint.confirmation);
             expect(actual.secondPause.calls).not.toContain("invoke-human-1.l1.t3.a1");
             expect(actual.resumed.status, JSON.stringify(actual.resumed)).toBe("complete");
@@ -701,25 +807,6 @@ describe("plan/execute packaged composition", () => {
             expect(actual.calls).toContain("invoke-human-1.l1.t3.a1");
             expect(actual.calls).toContain("invoke-human-1.l1.compliance");
             return;
-          }
-          if (mode.includes("status-")) {
-            const status = mode.includes("status-continue") ? "continue" : "gaps";
-            expect(originalLoop.cursor).toBe(1);
-            expect(originalLoop.results).toHaveLength(2);
-            expect(originalLoop.results[1].status).toBe(status);
-            expect(originalLoop.confirmedCheckpoint).toMatchObject({ kind: "pause", position: { cursor: 1 }, resultRef: originalLoop.results[1].ref });
-            expect(originalLoop.confirmedCheckpoint).toMatchObject(originalLoop.results[1].checkpoint.confirmation);
-            expect(actual.result.status).toBe("blocked");
-            expect(actual.noInputReplay.result.status).toBe("blocked");
-            expect(actual.noInputReplay.cursor).toBe(1);
-            expect(actual.noInputReplay.calls).toEqual(actual.callsAtYield);
-            expect(actual.callsAtYield).toEqual(["invoke-human-1.l1.director", "invoke-human-1.l1.t1.a1", "invoke-human-1.l1.t2.a1"]);
-            expect(loop.results.filter((r: any) => r.taskId === "second" && r.status === status)).toHaveLength(1);
-            const pause = originalLoop.confirmedCheckpoint;
-            expect(createHash("sha256").update(readFileSync(pause.checkpointRef)).digest("hex")).toBe(pause.digest);
-            const completed = loop.results.find((r: any) => r.taskId === "second" && r.status === "complete");
-            if (!mode.endsWith("loss-reentry"))
-              expect(completed.restore.receipt.confirmedPause).toEqual({ checkpointRef: pause.checkpointRef, digest: pause.digest });
           }
           expect(actual.retained.association).toEqual(actual.original.association);
           expect(actual.retained.loops).toHaveLength(1);
@@ -3168,7 +3255,7 @@ A1 supersedes native-resume-first recovery; preserve the missing historical befo
     expect(validateWorkflowScript(read("skills/architecture/workflow.js")).ok).toBe(true);
   });
 
-  test("worker preserves upstream implementation core, explicit providers, Ponytail LITE and no delegation; all packaged children stay nondelegating", () => {
+  test("worker preserves upstream implementation core, explicit providers, Ponytail FULL and no delegation; all packaged children stay nondelegating", () => {
     const { frontmatter: worker, body } = parseFrontmatter(read("agents/worker.md"));
     const upstream = parseFrontmatter(read("node_modules/pi-subagents/agents/worker.md"));
     expect(`${worker.package}.${worker.name}`).toBe("pitako.worker");
@@ -3181,8 +3268,14 @@ A1 supersedes native-resume-first recovery; preserve the missing historical befo
     expect(worker.extensions).toEqual(["../extensions/acp.ts"]);
     expect(worker.subagentOnlyExtensions).toEqual(["../extensions/dev-tools/index.ts", "../extensions/file-sha256.ts", "../extensions/checkpoint-create.ts", "../node_modules/@vndv/pi-codegraph/extensions/codegraph.ts", "../node_modules/pi-lsp-client/src/index.ts", "../node_modules/@nicknisi/pi-ast-grep/index.ts", "../node_modules/pi-codex-tools/index.ts"]);
     for (const provider of worker.subagentOnlyExtensions as string[]) expect(existsSync(path.resolve("agents", provider))).toBe(true);
-    for (const contract of ["single writer thread", "pause and escalate", "Ponytail is explicitly LITE", "Never\nreduce assigned specs or scope", "weaken project-required tests", "output schema/reporting", "edit/write"])
+    for (const contract of ["single writer thread", "pause and escalate", "Ponytail in FULL mode", "schema/reporting", "edit/write"])
       expect(body).toContain(contract);
+    for (const role of ["architect", "execution-director", "reviewer"]) {
+      const profile = parseFrontmatter(read(`agents/${role}.md`));
+      expect(profile.frontmatter.skills).toContain("ponytail");
+      expect(profile.body).toContain("FULL");
+      if (role === "reviewer") expect(profile.frontmatter.skills).toContain("ponytail-review");
+    }
     const director = parseFrontmatter(read("agents/execution-director.md"));
     for (const tool of ["subagent", "bg_wait", "todo", "contact_supervisor", "subagent_supervisor"]) expect(String(director.frontmatter.tools).split(/,\s*/)).not.toContain(tool);
     expect(String(director.frontmatter.tools)).not.toMatch(/\b(?:bash|edit|write|apply_patch)\b/);

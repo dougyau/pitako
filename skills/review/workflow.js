@@ -99,7 +99,7 @@ Implementation choices and stronger alternatives do not create new product requi
 Substantiation is not blocking priority or authorization to fix; the caller admits work.
 Missing tests, personal style preferences, and unavailable navigation are not automatically bugs.
 For a proposed new test, name its distinct guarantee and why existing evidence is insufficient.
-Ponytail is complexity-only; its line metric and Ship phrase are not a global verdict.
+Always load and apply ponytail-review to correctness, safety, useful tests and simplicity. Require a reachable case and evidence; do not demand speculative validation layers or guards that reject valid inputs. Its line metric and Ship phrase are not a global verdict.
 Preserve uncertainty; do not vote or force consensus. No issues is a valid result.
 Finish with structured_output matching the requested schema, not JSON in prose.`;
     const context = `REQUIREMENTS:\n${args.brief}\nCOMPLETE TARGET:\n${JSON.stringify(target)}`;
@@ -113,7 +113,7 @@ Finish with structured_output matching the requested schema, not JSON in prose.`
     function request(task, outputSchema, runId, skills = []) {
       return {
         ...(runId ? { resume: runId } : {
-          agent: "pitako.reviewer", context: "fresh", skill: ["verify-behavior", ...skills],
+          agent: "pitako.reviewer", context: "fresh", skill: [...new Set(["verify-behavior", "ponytail-review", ...skills])],
         }),
         task: `${rules}\n${task}`, output: false, outputSchema,
       };
@@ -182,7 +182,7 @@ Finish with structured_output matching the requested schema, not JSON in prose.`
     return Promise.resolve().then(() => collect("director-prepare", request(`${context}
 You are the reasoning director. Choose two to four distinct adversarial review angles
 according to the agreed review boundary and its risks. Every reviewer has the complete target.
-Choose optional skills only when relevant, with ponytail-review for unnecessary complexity:
+Choose optional skills only when relevant (ponytail-review is mandatory for all reviewers):
 ${optionalSkills.join(", ")}.
 Your focus explains the angle and why its skills help. Do not supply suspected findings
 or peer conclusions to the independent reviewers. Use blocked for missing material context.`,

@@ -61,12 +61,12 @@ Validation: Z.
 Open risks/questions: R.
 Recommended next step: N.
 
-Ponytail is explicitly LITE for this worker, overriding its upstream full default.
-Reuse existing code, avoid speculative abstractions, and keep diffs small. Never
-reduce assigned specs or scope, weaken project-required tests, or replace
-acceptance criteria with simplicity preferences. Project instructions and the
-assigned output schema/reporting override generic Ponytail prose and test-
-minimization preferences. Do not apply full/ultra unless the actual human asks.
+Load and apply Ponytail in FULL mode. Choose the simplest solution that meets the
+whole assigned contract and demonstrably works. Reuse existing code; do not add
+layers or validations based only on assumptions. Preserve required boundary
+validation, security and error handling. Simplicity does not reduce assigned
+scope or acceptance criteria. Project instructions and the assigned output
+schema/reporting take precedence over generic Ponytail prose.
 
 Choose navigation by question before broad grep:
 - Use `lsp_goto_definition`, `lsp_find_references`, `lsp_symbols`, and
@@ -169,6 +169,11 @@ actual error/test and trace causality before choosing repair, focused analysis,
 fixture/stability simplification or justified test retirement. Preserve required
 spec guarantees and recommend out-of-scope edits instead of making them. Do not
 hide flakes with green retries or fix timeouts by inflating deadlines.
+Before adding a test, identify the observable behavior, its real requirement or
+demonstrated defect, existing coverage and the distinct signal it would add.
+A hypothetical possibility alone is insufficient. Prefer updating an existing
+test; add one only for a useful uncovered guarantee. Improve evidence quality,
+not test volume or runtime, and retain coverage when simplifying.
 
 Prefer covered deterministic Git/hash tools, composed with native codemode;
 retain shell/Python fallback only where the role permits it. Check structured ok

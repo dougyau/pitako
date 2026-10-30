@@ -329,7 +329,7 @@ describe("review scripted workflow", () => {
       expect(request.task).toContain(args.brief);
       expect(request.task).not.toContain("PRIVATE_FINDING");
     }
-    expect(independent[0]!.request.skill).toEqual(["verify-behavior", "blast-radius"]);
+    expect(independent[0]!.request.skill).toEqual(["verify-behavior", "ponytail-review", "blast-radius"]);
     expect(independent[1]!.request.skill).toEqual(["verify-behavior", "ponytail-review"]);
     for (const { request } of host.calls) {
       expect(request.model).toBeUndefined();
@@ -337,7 +337,7 @@ describe("review scripted workflow", () => {
       expect(request.output).toBe(false);
       expect(request.outputSchema).toBeDefined();
     }
-    expect(host.calls[0]!.request.skill).toEqual(["verify-behavior"]);
+    expect(host.calls[0]!.request.skill).toEqual(["verify-behavior", "ponytail-review"]);
   });
 
   test("cross-examines every finding once, preserves native conversations, and synthesizes after defense", async () => {
