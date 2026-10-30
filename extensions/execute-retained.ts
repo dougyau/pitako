@@ -1,6 +1,7 @@
 import { readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
+import { executionStatePath } from "./execute-state.ts";
 
 const record = (value: unknown): value is Record<string, unknown> =>
 	!!value && typeof value === "object" && !Array.isArray(value);
@@ -14,7 +15,7 @@ export function retainedAnalyses(root: string, source: string, digest: string, c
 	if (!record(context) || typeof context.missionPath !== "string" || !path.isAbsolute(context.missionPath) ||
 		typeof context.invocation !== "string" || typeof context.missionId !== "string")
 		throw new Error("Expected exact mission and invocation for retained analysis inspection.");
-	const mission = readJson(context.missionPath);
+	const mission = readJson(executionStatePath({ missionPath: context.missionPath, missionId: context.missionId }));
 	const invocation = record(mission) ? mission[`invoke-${context.invocation}`] : undefined;
 	if (!record(invocation)) return [];
 	const association = invocation.association;
