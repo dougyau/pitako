@@ -5,6 +5,7 @@ import path from "node:path";
 import { retainedAnalyses } from "../../extensions/execute-retained.ts";
 import { checkpointEvidence } from "../../extensions/execute-checkpoint.ts";
 import { isDeepStrictEqual } from "node:util";
+import { executionStatePath } from "../../extensions/execute-state.ts";
 
 // Planning validates only the root; execution uses the named resource's exact inspections. No writes.
 const [root, id, source, part] = process.argv.slice(2);
@@ -18,7 +19,7 @@ function emitBounded(value: unknown) {
 // is admission; a partial/conflicting association is never a fresh invocation.
 function admittedInvocation(context: any) {
   let mission: any;
-  try { mission = JSON.parse(readFileSync(context.missionPath, "utf8")); }
+  try { mission = JSON.parse(readFileSync(executionStatePath(context), "utf8")); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
   const invocation = mission?.[`invoke-${context.invocation}`], legacy = mission?.["pitako-execution"];
   if (invocation === undefined && legacy === undefined) return false;
@@ -100,7 +101,7 @@ async function inspectSelected() {
   let checkpointObservation;
   if (context && admitted && found.selected && part === "metadata") {
     let mission;
-    try { mission = JSON.parse(readFileSync(context.missionPath, "utf8")); }
+    try { mission = JSON.parse(readFileSync(executionStatePath(context), "utf8")); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     const invocation = mission?.[`invoke-${context.invocation}`];
     const loop = invocation?.loops?.at(-1), attempt = loop?.attempt;

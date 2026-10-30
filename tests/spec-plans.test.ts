@@ -251,7 +251,7 @@ describe("spec-plan discovery and concrete input", () => {
     const installed = path.join(base, "install with ' quotes & %PATH% !", "node_modules", "pitako");
     // Copy only owned shipped resources; no dependency install, Pi loader or provider.
     for (const file of ["package.json", "skills/execute/inspect.mjs", "skills/execute/inspect.ts",
-      "extensions/spec-plans.ts", "extensions/execute-retained.ts", "extensions/execute-checkpoint.ts", "extensions/board/workspace.ts", "extensions/board/paths.ts", "extensions/errors.ts"]) {
+      "extensions/spec-plans.ts", "extensions/execute-retained.ts", "extensions/execute-checkpoint.ts", "extensions/execute-state.ts", "extensions/board/workspace.ts", "extensions/board/paths.ts", "extensions/errors.ts"]) {
       const target = path.join(installed, file); mkdirSync(path.dirname(target), { recursive: true }); cpSync(path.resolve(file), target);
     }
     const entry = path.join(installed, "skills/execute/inspect.mjs");

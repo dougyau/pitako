@@ -16,6 +16,8 @@ import { setSessionProfile } from "../extensions/profile.ts";
 import { parseFrontmatter, parseFrontmatterList } from "../node_modules/pi-subagents/src/agents/frontmatter.js";
 import { createDefaultChildSessionFactory } from "../node_modules/pi-subagents/src/runs/shared/child-session.js";
 import { resolvePiLaunchToolPlan } from "../node_modules/pi-subagents/src/runs/shared/child-tool-plan.js";
+import { createMission, missionRecordPath, resolveMissionStoreLocation } from "../node_modules/pi-subagents/src/missions/store.js";
+import { createMissionWorkflowState } from "../node_modules/pi-subagents/src/missions/workflow-state.js";
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -29,8 +31,11 @@ function fixture() {
   git("add", "modified"); git("-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "Base");
   writeFileSync(path.join(root, "modified"), "prior uncommitted WIP\n");
   writeFileSync(path.join(root, "untracked"), "new untracked bytes\n");
-  const missionPath = path.join(root, "mission.json");
-  const association = { root, commonDir: git("rev-parse", "--path-format=absolute", "--git-common-dir"), missionId: "mission", missionPath,
+  const location = resolveMissionStoreLocation({ projectRoot: root, agentDir: path.join(root, ".pi", "subagents", "agent") });
+  const mission = createMission(location, { title: "Checkpoint fixture", objective: "Capture the pending writer unit" });
+  const missionPath = missionRecordPath(location, mission.id);
+  const state = createMissionWorkflowState(location, mission.id);
+  const association = { root, commonDir: git("rev-parse", "--path-format=absolute", "--git-common-dir"), missionId: mission.id, missionPath,
     invocation: "fixture", source: path.join(root, "spec.md"), digest: "a".repeat(64), maxCycles: 5, sourceRefs: [] };
   const intent: CheckpointIntent = { version: 1, association, key: "invoke-fixture.l1.t1.a1", taskId: "owned", attempt: 1,
     loop: 1, cursor: 0, phase: "implementation", planRef: { key: "plan", runId: "director" },
@@ -38,7 +43,7 @@ function fixture() {
   const loop = { number: 1, phase: "implementation", cursor: 0, manifest: ["owned", "next"], results: [], plan: { stage: "admitted", ref: intent.planRef },
     attempt: { key: intent.key, taskId: "owned", index: 0, number: 1, stage: "intention", checkpoint: intent } };
   const record = { version: 3, association, loops: [loop] };
-  const persist = () => writeFileSync(missionPath, JSON.stringify({ "invoke-fixture": record })); persist();
+  const persist = () => state.set("invoke-fixture", record); persist();
   const binding = JSON.stringify({ "pitako.checkpoint/1": { association, key: intent.key } });
   let tool: any;
   const old = process.env.PI_SUBAGENT_EXTENSION_BINDINGS;
@@ -46,12 +51,14 @@ function fixture() {
   finally { if (old === undefined) delete process.env.PI_SUBAGENT_EXTENSION_BINDINGS; else process.env.PI_SUBAGENT_EXTENSION_BINDINGS = old; }
   const manager = {};
   const call = async (kind: string, paths?: string[], signal?: AbortSignal) => (await tool.execute("call", { kind, ...(paths ? { paths } : {}) }, signal, undefined, { cwd: root, sessionManager: manager })).structuredContent;
-  return { root, git, intent, loop, record, persist, binding, call, tool, manager };
+  return { root, git, intent, loop, record, persist, statePath: state.path, binding, call, tool, manager };
 }
 const paths = ["modified", "untracked", "absent"];
 
 test("registered checkpoint_create captures actual WIP, untracked bytes, absence and admitted progress; repeats without overwrite", async () => {
-  const f = fixture(), beforeState = readFileSync(f.intent.association.missionPath, "utf8");
+  const f = fixture(), beforeState = readFileSync(f.statePath, "utf8");
+  const beforeMission = readFileSync(f.intent.association.missionPath, "utf8");
+  expect(JSON.parse(beforeMission)).not.toHaveProperty("invoke-fixture");
   expect(f.tool.annotations).toEqual({ readOnlyHint: false, destructiveHint: true });
   const first = await f.call("pre", paths);
   expect(first).toMatchObject({ ok: true, status: "created", kind: "pre", confirmed: false, position: { cursor: 0 }, progress: { consumedLoops: 1, admittedResults: [] } });
@@ -69,18 +76,19 @@ test("registered checkpoint_create captures actual WIP, untracked bytes, absence
   writeFileSync(path.join(f.root, "modified"), "unrelated conflict");
   expect(await f.call("pre", paths)).toMatchObject({ ok: false });
   expect(readFileSync(first.manifestRef)).toEqual(bytes);
-  expect(readFileSync(f.intent.association.missionPath, "utf8")).toBe(beforeState);
+  expect(readFileSync(f.statePath, "utf8")).toBe(beforeState);
+  expect(readFileSync(f.intent.association.missionPath, "utf8")).toBe(beforeMission);
 });
 
 test.each(["unit", "pause"] as const)("%s seal has actual journaled bytes but no task admission or root cursor effect", async kind => {
-  const f = fixture(); const pre = await f.call("pre", paths), state = readFileSync(f.intent.association.missionPath, "utf8");
+  const f = fixture(); const pre = await f.call("pre", paths), state = readFileSync(f.statePath, "utf8");
   applyCheckpoint(f.intent, [{ path: "modified", image: { bytes: Buffer.from("owned change").toString("base64"), mode: 0o644 } }]);
   const sealed = await f.call(kind);
   expect(sealed).toMatchObject({ ok: true, confirmed: false, kind, position: { cursor: kind === "unit" ? 1 : 0 }, checkpointReceipt: { kind } });
   expect(Buffer.from(artifact(sealed.checkpointRef).files[0].image.bytes, "base64").toString()).toBe("owned change");
   expect(sealed.checkpointReceipt.digest).toBe(digest(readFileSync(sealed.checkpointRef)));
   expect((await f.call(kind)).status).toBe("existing");
-  expect(readFileSync(f.intent.association.missionPath, "utf8")).toBe(state);
+  expect(readFileSync(f.statePath, "utf8")).toBe(state);
   expect(artifact(pre.manifestRef).intent.progress.admittedResults).toEqual([]);
 });
 
@@ -147,7 +155,26 @@ test.each(["valid", "missing", "foreign", "unadmitted", "corrupt", "conflict", "
     expect(existsSync(path.join(checkpointDirectory(pending), "manifest.json"))).toBe(false);
   });
 
-test("missing, mismatched, stale, stopped and analysis context cannot publish; aborted calls cannot capture", async () => {
+test.each(["missing", "malformed", "metadata-only", "association", "progress", "attempt", "stopped"])(
+  "invalid durable writer context cannot publish: %s", async mode => {
+    const f = fixture();
+    if (mode === "association") f.record.association = { ...f.record.association, invocation: "other" };
+    if (mode === "progress") f.loop.attempt.checkpoint.progress!.consumedLoops = 2;
+    if (mode === "attempt") f.loop.attempt.key = "other";
+    if (mode === "stopped") (f.loop as any).halt = { code: "stop", reason: "native Stop" };
+    f.persist();
+    if (mode === "missing") rmSync(f.statePath);
+    if (mode === "malformed") writeFileSync(f.statePath, "{");
+    if (mode === "metadata-only") {
+      writeFileSync(f.intent.association.missionPath, JSON.stringify({ "invoke-fixture": f.record }));
+      writeFileSync(f.statePath, "{}");
+    }
+    expect(await f.call("pre", paths)).toMatchObject({ ok: false, status: "failed" });
+    expect(existsSync(checkpointDirectory(f.intent))).toBe(false);
+    expect(readFileSync(path.join(f.root, "modified"), "utf8")).toBe("prior uncommitted WIP\n");
+  });
+
+test("missing and analysis context cannot publish; aborted calls cannot capture", async () => {
   const f = fixture();
   const abort = new AbortController(); abort.abort(new Error("Stop before capture"));
   expect(await f.call("pre", paths, abort.signal)).toMatchObject({ ok: false, error: { message: "Stop before capture" } });
@@ -155,10 +182,6 @@ test("missing, mismatched, stale, stopped and analysis context cannot publish; a
   setSessionProfile(f.manager, "analysis");
   expect(await f.call("pre", paths)).toMatchObject({ ok: false, error: { message: "Pitako analysis forbids checkpoint_create." } });
   setSessionProfile(f.manager, "coding");
-  for (const mutate of [() => { f.loop.attempt.checkpoint.progress!.consumedLoops = 2; },
-    () => { f.loop.attempt.key = "other"; }, () => { (f.loop as any).halt = { code: "stop", reason: "native Stop" }; }]) {
-    mutate(); f.persist(); expect(await f.call("pre", paths)).toMatchObject({ ok: false });
-  }
   expect(existsSync(checkpointDirectory(f.intent))).toBe(false);
   let tool: any; checkpointCreate({ registerTool(t: any) { tool = t; } } as ExtensionAPI);
   const missing = await tool.execute("missing", { kind: "pre", paths }, undefined, undefined, { cwd: f.root, sessionManager: {} });
@@ -256,7 +279,7 @@ test("capture failure and actual filesystem write denial publish no valid checkp
 
 test("interruption at atomic publication leaves only temporary bytes and cannot move confirmation", async () => {
   const f = fixture(), directory = checkpointDirectory(f.intent);
-  const state = readFileSync(f.intent.association.missionPath);
+  const state = readFileSync(f.statePath);
   const original = fs.linkSync;
   const publish = spyOn(fs, "linkSync").mockImplementation((source, destination) => {
     if (String(destination) === path.join(directory, "manifest.json")) throw new Error("Interrupted manifest publication");
@@ -279,7 +302,7 @@ test("interruption at atomic publication leaves only temporary bytes and cannot 
     expect(digest(readFileSync(pre.manifestRef))).toBe(pre.digest);
   } finally { seal.mockRestore(); }
   expect(await f.call("pause")).toMatchObject({ ok: true, status: "created", position: { cursor: 0 } });
-  expect(readFileSync(f.intent.association.missionPath)).toEqual(state);
+  expect(readFileSync(f.statePath)).toEqual(state);
 });
 
 test("native inspector composition cannot discover or invoke checkpoint writes", async () => {

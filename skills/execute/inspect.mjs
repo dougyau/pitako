@@ -8,6 +8,7 @@ const sources = new Set([
   "../../extensions/spec-plans.ts",
   "../../extensions/execute-retained.ts",
   "../../extensions/execute-checkpoint.ts",
+  "../../extensions/execute-state.ts",
   "../../extensions/board/workspace.ts",
   "../../extensions/board/paths.ts",
   "../../extensions/errors.ts",

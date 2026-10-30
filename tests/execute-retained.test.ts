@@ -5,7 +5,7 @@ import path from "node:path";
 import { retainedAnalyses } from "../extensions/execute-retained.ts";
 
 function fixture(run: (value: {
-	root: string; file: string; native: string; mission: string;
+	root: string; file: string; native: string; mission: string; statePath: string;
 	ref: Record<string, unknown>; original: Record<string, unknown>; load: () => unknown;
 }) => void) {
 	const root = mkdtempSync(path.join(os.tmpdir(), "pitako-retained-"));
@@ -17,6 +17,9 @@ function fixture(run: (value: {
 		const ref = { key: "invoke-human-1.l1.review.director-synthesis", runId: "producer-1", asyncDir: native,
 			results: [{ structuredOutputPath: file }] };
 		const mission = path.join(root, "mission.json");
+		const statePath = path.join(root, "mission-1", "state.json");
+		mkdirSync(path.dirname(statePath));
+		writeFileSync(mission, JSON.stringify({ schemaVersion: 1, id: "mission-1", title: "Fixture mission" }));
 		const context = { missionId: "mission-1", missionPath: mission, invocation: "human-1" };
 		writeFileSync(file, JSON.stringify(original));
 		writeFileSync(path.join(native, "status.json"), JSON.stringify({
@@ -24,10 +27,10 @@ function fixture(run: (value: {
 			steps: [{ exitCode: 0, structuredOutput: original }],
 		}));
 		const association = { ...context, root, source: "/spec.md", digest: "e".repeat(64) };
-		writeFileSync(mission, JSON.stringify({ "invoke-human-1": {
+		writeFileSync(statePath, JSON.stringify({ "invoke-human-1": {
 			association, loops: [{ number: 1, phase: "review", review: { references: [ref] } }],
 		} }));
-		run({ root, file, native, mission, ref, original,
+		run({ root, file, native, mission, statePath, ref, original,
 			load: () => retainedAnalyses(root, "/spec.md", "e".repeat(64), context) });
 	} finally { rmSync(root, { recursive: true, force: true }); }
 }
@@ -53,9 +56,9 @@ test("reports conflicting originals instead of choosing the convenient value", (
 }));
 
 test("does not load an unrelated invocation's references", () => fixture(f => {
-	const state = JSON.parse(readFileSync(f.mission, "utf8"));
+	const state = JSON.parse(readFileSync(f.statePath, "utf8"));
 	state["invoke-human-1"].association.missionId = "other";
-	writeFileSync(f.mission, JSON.stringify(state));
+	writeFileSync(f.statePath, JSON.stringify(state));
 	expect(f.load).toThrow("Retained analysis association differs");
 }));
 
@@ -90,14 +93,15 @@ test("does not promote a stopped attempt that already emitted JSON", () => fixtu
 }));
 
 test("a new invocation has no historical reference scan", () => fixture(f => {
-	writeFileSync(f.mission, "{}");
+	writeFileSync(f.mission, readFileSync(f.statePath));
+	writeFileSync(f.statePath, "{}");
 	expect(f.load()).toEqual([]);
 }));
 
 test.each(["stopped", "interrupted", "detached"])("missing status does not erase a retained %s observation", field => fixture(f => {
 	rmSync(path.join(f.native, "status.json"));
-	const state = JSON.parse(readFileSync(f.mission, "utf8"));
+	const state = JSON.parse(readFileSync(f.statePath, "utf8"));
 	state["invoke-human-1"].loops[0].review.references[0].results[0][field] = true;
-	writeFileSync(f.mission, JSON.stringify(state));
+	writeFileSync(f.statePath, JSON.stringify(state));
 	expect(f.load()).toMatchObject([{ ok: false, [field]: true }]);
 }));

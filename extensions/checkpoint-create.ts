@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { isDeepStrictEqual } from "node:util";
 import { Type } from "typebox";
 import { createCheckpoint, type CheckpointIntent } from "./execute-checkpoint.ts";
+import { executionStatePath } from "./execute-state.ts";
 import { effectiveProfile } from "./profile.ts";
 
 const namespace = "pitako.checkpoint/1";
@@ -36,7 +37,7 @@ export default function checkpointCreate(pi: ExtensionAPI): void {
         const association = binding.association;
         if (association.root !== ctx.cwd || typeof association.invocation !== "string" ||
             typeof association.missionPath !== "string") throw new Error("Checkpoint execution workspace mismatch.");
-        const record = JSON.parse(readFileSync(association.missionPath, "utf8"))[`invoke-${association.invocation}`];
+        const record = JSON.parse(readFileSync(executionStatePath(association), "utf8"))[`invoke-${association.invocation}`];
         if (!record || record.version !== 3 || !equal(record.association, association))
           throw new Error("Checkpoint durable association mismatch.");
         const loop = record.loops?.at(-1), attempt = loop?.attempt;
