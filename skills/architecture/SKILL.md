@@ -26,6 +26,7 @@ An ordinary architecture discussion does not start execution.
    uses the packaged `pitako.architect` for its reasoning director and perspective
    members. It supplies CodeGraph, read-only LSP tools, and selected design
    principles, plus `architecture-design`, `how`, `why`, and `blast-radius`.
+   Each architect loads and applies Ponytail FULL while preserving required boundaries and read-only scope.
    The workflow assigns each child's responsibility and perspective.
    Confirm its effective contract is suitable for read-only analysis without
    delegation. User or project overrides can change the profile. If it is absent,

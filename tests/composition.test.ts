@@ -376,13 +376,13 @@ describe("engineering-layer composition", () => {
     expect(profile.subagentOnlyExtensions).toEqual(providers);
     for (const provider of providers)
       expect(readRepo(path.join("agents", provider)).length).toBeGreaterThan(0);
-    expect(profile.skillPath).toEqual(["../skills/principles", "../skills/practical"]);
+    expect(profile.skillPath).toEqual(["../node_modules/@dietrichgebert/ponytail/skills/ponytail", "../skills/principles", "../skills/practical"]);
     const practical = ["architecture-design", "how", "why", "blast-radius"];
     const principles = [
       "principle-foundational-thinking", "principle-boundary-discipline",
       "principle-type-system-discipline", "principle-minimize-reader-load",
     ];
-    expect(profile.skills).toEqual([...practical, ...principles]);
+    expect(profile.skills).toEqual(["ponytail", ...practical, ...principles]);
     for (const [directory, names] of [["practical", practical], ["principles", principles]] as const)
       for (const name of names) {
         const source = readRepo(`skills/${directory}/${name}/SKILL.md`);
@@ -421,7 +421,7 @@ describe("engineering-layer composition", () => {
     expect(profile).toMatchObject({
       acceptanceRole: "read-only", defaultContext: "fresh", systemPromptMode: "replace",
       inheritProjectContext: true, inheritGlobalContext: false, inheritSkills: false,
-      skills: ["verify-behavior"],
+      skills: ["verify-behavior", "ponytail", "ponytail-review"],
     });
     expect(profile.model).toBeUndefined();
     if (!Array.isArray(architect.tools) || !Array.isArray(architect.subagentOnlyExtensions) ||

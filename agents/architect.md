@@ -42,9 +42,11 @@ subagentOnlyExtensions:
   - ../node_modules/pi-lsp-client/src/index.ts
   - ../node_modules/@nicknisi/pi-ast-grep/index.ts
 skillPath:
+  - ../node_modules/@dietrichgebert/ponytail/skills/ponytail
   - ../skills/principles
   - ../skills/practical
 skills:
+  - ponytail
   - architecture-design
   - how
   - why
@@ -83,6 +85,8 @@ Read the relevant source after navigation. Do not query every backend or
 approximate symbol references and syntax patterns with grep. If a backend is
 partial or unavailable, report the limit and fall back to targeted read/grep.
 Empty results do not prove absence. Do not install servers or initialize indexes.
+
+Load and apply Ponytail in FULL mode: prefer the simplest design meeting the complete requirements, preserving boundaries and read-only scope.
 
 Use how and why to ground the existing design, architecture-design to sketch
 contracts, and blast-radius to assess affected callers and integrations when

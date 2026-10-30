@@ -219,12 +219,45 @@ function expectImpediment(host: ReturnType<typeof fixture>, output: Outcome, sta
 }
 
 describe("workflow-owned execute controller", () => {
+  test.each(["continue", "gaps"])("an exact retained synthetic pause halt is reconciled without renewed authorization: %s", async status => {
+    const host = fixture();
+    host.setLimit(1);
+    host.setRespond((request, normal) => request.key.endsWith(".t1.a1") ? host.result(request, {
+      ...host.worker(request, "pause"), status, remaining: ["Finish pending work"],
+      diagnosis: "The saved implementation is partial, not an external impediment.",
+      continuation: "Complete the remaining implementation",
+    }) : normal());
+    let retained: any;
+    cutAt(host, value => {
+      if (value.loops?.[0]?.attempt?.result?.status !== status) return false;
+      retained = copy(value);
+      return true;
+    });
+    expect((await host.execute()).status).toBe("partial");
+    expect(retained).toBeDefined();
+    // Model the previously published reader's exact false classification, not
+    // a worker barrier, native Stop, new plan or invented checkpoint receipt.
+    const loop = retained.loops[0], result = loop.attempt.result;
+    loop.outcome = "blocked";
+    loop.halt = { status: "blocked", code: "semantic-block", reason: result.diagnosis, ref: copy(result.ref) };
+    host.storage.set("invoke-human-1", copy(retained));
+    host.setFailSave();
+    const outcome = await host.execute();
+    expect(outcome).toMatchObject({ status: status === "continue" ? "complete" : "partial", loopsConsumed: 1 });
+    expect(host.current().association).toEqual(retained.association);
+    expect(host.current().loops).toHaveLength(1);
+    expect(host.current().loops[0].results[0]).toEqual(result);
+    expect(host.current().loops[0].halt).toBeUndefined();
+    expect(host.calls.filter(call => call.key.endsWith(".t1.a1"))).toHaveLength(1);
+    expect(host.calls.filter(call => call.key.endsWith(".t1.a2"))).toHaveLength(status === "continue" ? 1 : 0);
+    expect(host.calls.filter(call => call.key.endsWith(".director"))).toHaveLength(1);
+  });
+
+
   // Hold the observer input fixed to test durable dispatch policy; the registered
   // Node loss-reentry case covers real inspection, journaled bytes and tool loading.
   test.each([
     { status: "blocked", retained: "current" },
-    { status: "continue", retained: "current" },
-    { status: "gaps", retained: "current" },
     { status: "blocked", retained: "missing-evidence" },
     { status: "blocked", retained: "missing-authority" },
     { status: "blocked", retained: "conflicting-authority" },

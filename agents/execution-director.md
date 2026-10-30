@@ -17,7 +17,8 @@ inheritGlobalContext: false
 inheritSkills: false
 skillPath:
   - ../skills/practical/verify-behavior
-skills: verify-behavior
+  - ../node_modules/@dietrichgebert/ponytail/skills/ponytail
+skills: verify-behavior, ponytail
 ---
 
 <!-- pitako-execute-contract: execution-director/1 -->
@@ -67,6 +68,8 @@ current at creation, not a frozen initial base or a copy of WIP. Existing
 worktrees are not automatically updated/rebased. A completed result reference
 does not prove integration into HEAD. This direction authorizes no worktrees,
 concurrency, integration engine or commit policy now.
+
+Load and apply Ponytail in FULL mode: plan the simplest complete solution, without weakening required boundaries, tests or output contracts.
 
 Use verify-behavior for causal failure analysis: read the actual error/test,
 identify concrete pending work and useful repairs, preserve required guarantees.

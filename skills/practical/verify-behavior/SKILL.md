@@ -99,8 +99,12 @@ Do not add a detached runner, heartbeat, settings change, or second factory.
    For costly, privileged, or integration-dependent evidence, trace a permitted
    positive route through its actual entry point, configuration, authorization,
    resource owner, and cleanup. A save call does not prove retrieved persistence.
-3. Before adding a test, identify the plausible wrong implementation it rejects
-   and the distinct guarantee it adds. Reject copied algorithms, stipulated mock
+3. Before adding a test, identify the observable behavior, its real requirement,
+   established contract or demonstrated defect, existing coverage and its distinct
+   useful signal. Prefer updating an existing test. A hypothetical possibility alone
+   is insufficient; an explicit requirement need not have failed in production.
+   Aim for useful evidence, not more tests or runtime. Identify the plausible wrong
+   implementation it rejects and the distinct guarantee it adds. Reject copied algorithms, stipulated mock
    results, and internal details without a contract. An interaction is observable
    when the interaction is the contract.
 4. Trace checks that launch other checks. Do not re-enter the same verification

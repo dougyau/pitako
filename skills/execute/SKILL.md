@@ -57,10 +57,12 @@ confirm completion or move the cursor. Only root durable result admission confir
 the new continuation point. A normal cooperative pause may call
 `checkpoint_create({kind:"pause"})` and return its actual receipt with non-complete
 status only while native control permits capture, without extra task edits.
-Pause position remains pending. Every admitted pause with remaining work yields
-control regardless of blocked, continue or gaps status; it never starts another
-attempt or director loop until supported human continuation restores its exact
-seal. Abrupt disappearance or Stop/refusal uses the
+Pause position remains pending. Its receipt saves WIP, not a human impediment.
+Useful `continue` work follows the same-task continuation path without human input.
+`gaps` or exhausted useful continuation reaches the next director within the
+admitted budget. Only an actual `blocked` result or native barrier halts work;
+the receipt alone does not require human resolution or restoration.
+Abrupt disappearance or Stop/refusal uses the
 last confirmed checkpoint: no promised or invented post-cut capture. Preserve
 partial bytes before selective restoration, unrelated changes and confirmed work.
 Renew only evidence invalidated by the restored candidate, then reach pending
@@ -166,7 +168,7 @@ Unknown or unobservable native trust is neither approval nor denial. Never
 require marker trust certificates, coerce user overrides, edit settings or
 bypass actual native refusal, Stop, permission or pertinent activity barriers.
 Profile inspection is optional diagnosis, not an exact child-selection certificate
-or mandatory preflight ceremony. The director is read-only planning, the worker
+or mandatory preflight ceremony. The director and worker load and apply Ponytail FULL without weakening required scope, boundaries or checks. The director is read-only planning, the worker
 is the nondelegating writer with normal tools and CodeGraph/LSP/Codex (edit/write
 fallback), and reviewer/exceptional inspector are read-only. Missing required
 providers are unmet prerequisites, not fabricated passes.

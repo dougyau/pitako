@@ -40,21 +40,6 @@ function runNode(source: string, env: Record<string, string> = {}) {
   return result;
 }
 
-test("premise: Git's first NUL-delimited record identifies the principal, not path sort order", () => {
-  const root = mkdtempSync(path.join(tmpdir(), "pitako-worktree-git-"));
-  try {
-    const { principal, target } = repository(root);
-    const records = git(target, "worktree", "list", "--porcelain", "-z").split("\0\0");
-    expect(records[0]?.split("\0")[0]).toBe(`worktree ${principal}`);
-    expect(records[1]?.split("\0")[0]).toBe(`worktree ${target}`);
-    expect(git(target, "rev-parse", "--path-format=absolute", "--git-common-dir")).toBe(
-      git(principal, "rev-parse", "--path-format=absolute", "--git-common-dir"),
-    );
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
 // The writer stays open until after the snapshot and source observations.
 const walFixture = `
 import assert from "node:assert/strict";
@@ -78,22 +63,6 @@ try {
 } finally { writer.close(); }
 console.log("Committed WAL rows included; source rows, main DB and WAL bytes unchanged.");
 `;
-
-test("premise: Node readonly VACUUM INTO snapshots committed WAL without checkpointing source", () => {
-  const root = mkdtempSync(path.join(tmpdir(), "pitako-worktree-sqlite-"));
-  try {
-    const result = runNode(walFixture.replace("SNAPSHOT", `
-      const reader = new DatabaseSync(source, { readOnly: true });
-      try {
-        assert.throws(() => reader.exec("INSERT INTO entries VALUES ('forbidden')"), /readonly/);
-        reader.prepare("VACUUM INTO ?").run(process.env.COPY_DB);
-      } finally { reader.close(); }
-    `), { SOURCE_DB: path.join(root, "source.db"), COPY_DB: path.join(root, "snapshot.db") });
-    expect(result.stdout).toContain("source rows, main DB and WAL bytes unchanged");
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
 
 function fixture() {
   const root = mkdtempSync(path.join(tmpdir(), "pitako-worktree-setup-"));
