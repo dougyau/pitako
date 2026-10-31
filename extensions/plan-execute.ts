@@ -1,8 +1,10 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { registerAgentViaEvents, type RuntimeAgentRegistration } from "pi-subagents/agents";
 import { registerWorkflowResource, type WorkflowResourceRegistration } from "pi-subagents/workflow-resources";
-import { designatedWorkspace, validatePlanId } from "./spec-plans.ts";
+import { designatedWorkspace, executionAmendments, preliminarySpec, validatePlanId } from "./spec-plans.ts";
+import { boundRetainedAnalyses } from "./execute-retained.ts";
 import { packageRoot } from "./stack.ts";
 
 function inspectionCommand(args: string[], platform: NodeJS.Platform): string {
@@ -31,7 +33,7 @@ export function executionResource(platform: NodeJS.Platform = process.platform) 
   const inspectorEntry = path.join(packageRoot(), "skills/execute/inspect.mjs");
   return { name: "pitako.execute", version: 1, resolve(args: Readonly<Record<string, unknown>>) {
     validateResolution(args);
-    if (Object.keys(args).some(key => !["id", "root", "source", "sourceRefs", "invocation", "missionId", "missionPath", "unblock", "resolution"].includes(key))) throw new Error("Unknown execution argument.");
+    if (Object.keys(args).some(key => !["id", "root", "source", "sourceRefs", "amendments", "invocation", "missionId", "missionPath", "unblock", "resolution"].includes(key))) throw new Error("Unknown execution argument.");
     if (!isMissionId(args.missionId)) throw new Error("Expected an existing native missionId data pointer.");
     if (typeof args.missionPath !== "string" || !path.isAbsolute(args.missionPath) || args.missionPath.includes("\0"))
       throw new Error("Expected the actual absolute missionPath returned by native mission.create or mission.show.");
@@ -47,24 +49,21 @@ export function executionResource(platform: NodeJS.Platform = process.platform) 
       typeof ref.path !== "string" || !path.isAbsolute(ref.path) || ref.path.includes("\0") ||
       !/^[a-f0-9]{64}$/.test(ref.digest)))
       throw new Error("Expected at most two complete spec sourceRefs with absolute path and SHA-256 digest.");
-    const context = { missionId: args.missionId, missionPath: args.missionPath, invocation: args.invocation, sourceRefs };
-    const input = [inspectorEntry, root, args.id, args.source ?? ""];
-    const command = (part: string, initial = false) => inspectionCommand([
-      ...input, part, JSON.stringify({ ...context, admissionTransport: true,
-        ...(initial ? { admission: { sourceRefs, agentDir } } : {}) }),
-    ], platform);
-    const chunks = Array.from({ length: 26 }, (_, index) => ({ key: `input-${index}`, command: command(String(index)) }));
-    // The initial read includes settings only before this invocation is frozen.
-    // All remaining grants are required closing observations, not extra budget.
-    const closingCapacity = 32 - chunks.length - 1;
-    const inspections = ["initial", ...Array.from({ length: closingCapacity }, (_, index) => `loop-${index + 1}`)].map((phase, index) => ({
-      key: `inspect-${phase}`, command: command("metadata", index === 0),
-    }));
-    const config = { root, id: args.id, invocation: args.invocation, missionId: args.missionId, missionPath: args.missionPath, sourceRefs, inspections, chunks,
+    const amendments = executionAmendments(root, args.amendments);
+    const context = { missionId: args.missionId, missionPath: args.missionPath, invocation: args.invocation, sourceRefs, amendments };
+    // Preliminary synchronous discovery is data capture, not native admission.
+    const preliminary = preliminarySpec(root, args.id, args.source as string | undefined);
+    const recovery = boundRetainedAnalyses(preliminary.root, preliminary.commonDir, preliminary.source,
+      preliminary.digest, preliminary.binding, context);
+    const input = [inspectorEntry, preliminary.root, args.id, args.source ?? ""];
+    const inspections = [{ key: "inspect-initial", command: inspectionCommand([
+      ...input, "admission", JSON.stringify({ ...context, admission: { sourceRefs, agentDir } }),
+    ], platform) }];
+    const config = { root: preliminary.root, id: args.id, invocation: args.invocation, missionId: args.missionId, missionPath: args.missionPath, sourceRefs, amendments, inspections, preliminary, ...(recovery ? { recovery } : {}),
       checkpointHelper: path.join(packageRoot(), "skills/execute/checkpoint.mjs"),
       ...(args.unblock === true ? { unblock: true, resolution: args.resolution } : {}) };
     return { script: `const config = ${JSON.stringify(config)};\nconst pitakoReviewLibraryMode = true;\n${reviewScript}\n${rootScript}`,
-      hostCommands: [...inspections, ...chunks] };
+      hostCommands: inspections };
   } };
 }
 export default function planExecute(pi: ExtensionAPI): void {
@@ -88,9 +87,27 @@ export default function planExecute(pi: ExtensionAPI): void {
     } catch (error) { return { block: true, reason: String(error instanceof Error ? error.message : error) }; }
   });
   let registration: WorkflowResourceRegistration | undefined;
+  let observer: RuntimeAgentRegistration | undefined;
+  function dispose() {
+    registration?.dispose(); registration = undefined;
+    observer?.dispose(); observer = undefined;
+  }
   pi.on("session_start", (_event, ctx) => {
-    registration?.dispose();
-    registration = registerWorkflowResource({ sessionId: ctx.sessionManager.getSessionId(), definition: executionResource() });
+    dispose();
+    try {
+      observer = registerAgentViaEvents({ pi, name: "pitako.checkout-observer", definition: {
+        description: "Deterministic actual-cwd checkout evidence; no model or prompt execution.",
+        systemPrompt: "Fixed checkout observer; stdin is ignored.", systemPromptMode: "replace", tools: [], allowNestedSubagents: false,
+        inheritProjectContext: false, inheritGlobalContext: false, inheritSkills: false,
+        defaultContext: "fresh", defaultAsync: false,
+        runner: { type: "external-cli", command: process.execPath,
+          args: [path.join(packageRoot(), "skills/execute/observe.mjs")], promptDelivery: "stdin" },
+      } });
+      registration = registerWorkflowResource({ sessionId: ctx.sessionManager.getSessionId(), definition: executionResource() });
+    } catch (error) {
+      dispose();
+      throw new Error(`Checkout observer registration failed: ${String(error instanceof Error ? error.message : error)}. Inspect the installed pi-subagents registration listener and conflicting agent; reconcile it before preparing execution. No fallback was registered.`);
+    }
   });
-  pi.on("session_shutdown", () => { registration?.dispose(); registration = undefined; });
+  pi.on("session_shutdown", dispose);
 }

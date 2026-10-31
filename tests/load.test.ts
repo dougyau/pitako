@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import devTools from "../extensions/dev-tools/index.ts";
 import fileSha256 from "../extensions/file-sha256.ts";
@@ -11,6 +11,7 @@ import pitako from "../extensions/index.ts";
 import profilePolicy from "../extensions/profile-policy.ts";
 import { packageRoot, readStack } from "../extensions/stack.ts";
 import { toolsForProfile } from "../extensions/profile.ts";
+import { RUNTIME_AGENT_REGISTER_EVENT, type RuntimeAgentRegistrationRequest } from "../node_modules/pi-subagents/src/agents/runtime-agent-events.js";
 
 const configDirs: string[] = [];
 const shutdowns: Array<() => Promise<void>> = [];
@@ -53,6 +54,24 @@ function loadProfileExtensions(pi: ExtensionAPI, codex: (pi: ExtensionAPI) => vo
   }
 }
 
+// The real provider is excluded; only its synchronous registration boundary is modeled.
+function observerRegistrationEvents() {
+  const active = new Set<string>();
+  return {
+    emit(event: string, request: RuntimeAgentRegistrationRequest) {
+      expect(event).toBe(RUNTIME_AGENT_REGISTER_EVENT);
+      expect(request.version).toBe(1);
+      expect(request.name).toBe("pitako.checkout-observer");
+      expect(active.has(request.name)).toBe(false);
+      active.add(request.name);
+      request.result = { ok: true, registration: { dispose() {
+        expect(active.delete(request.name)).toBe(true);
+      } } };
+    },
+    assertDisposed() { expect(active.size).toBe(0); },
+  };
+}
+
 function profileHarness(profileFlag?: string, external?: () => Promise<void>) {
   const writes: string[] = [];
   const registeredTools: string[] = [];
@@ -74,7 +93,9 @@ function profileHarness(profileFlag?: string, external?: () => Promise<void>) {
     ui: { notify() {}, setStatus() {} },
     sessionManager: { getSessionId: () => `test-${profileFlag ?? "coding"}`, getEntries: () => [] },
   };
+  const events = observerRegistrationEvents();
   const pi = {
+    events,
     registerFlag() {},
     registerTool(tool: { name: string }) {
       registeredTools.push(tool.name);
@@ -108,7 +129,7 @@ function profileHarness(profileFlag?: string, external?: () => Promise<void>) {
     api.on("session_start", synchronize);
     api.on("model_select", synchronize);
   }, writes);
-  shutdowns.push(async () => { await handlers.get("session_shutdown")?.({}, context); });
+  shutdowns.push(async () => { await handlers.get("session_shutdown")?.({}, context); events.assertDisposed(); });
   return {
     active, available, writes, registeredTools, registeredCommands,
     context,
@@ -134,14 +155,18 @@ function profileHarness(profileFlag?: string, external?: () => Promise<void>) {
     },
     async shutdown() {
       await handlers.get("session_shutdown")?.({}, context);
+      events.assertDisposed();
     },
   };
 }
 
 describe("Pitako resources and policy", () => {
-  test.each(["reader", "worker", "foreground"])(
-    "isolated native child lifecycle and actual call boundary: %s", mode => {
-      const owned = configDirectory("pitako-profile-policy-");
+  const prepared = new Map<string, { run: () => Promise<void>; settle: () => Promise<void> }>();
+  const profileRoots: string[] = [];
+  beforeAll(async () => {
+    await Promise.all(["reader", "worker", "foreground"].map(async mode => {
+      const owned = mkdtempSync(path.join(tmpdir(), "pitako-profile-policy-"));
+      profileRoots.push(owned);
       const cwd = path.join(owned, "worktree"), home = path.join(owned, "home");
       mkdirSync(cwd); mkdirSync(home);
       const env = {
@@ -151,24 +176,41 @@ describe("Pitako resources and policy", () => {
       };
       const init = spawnSync("git", ["init", "--quiet"], { cwd, env, encoding: "utf8" });
       expect(init.error).toBeUndefined(); expect(init.status).toBe(0);
+      let ready!: () => void, isReady = false;
+      const started = new Promise<void>(resolve => { ready = resolve; });
       const child = Bun.spawn([process.execPath, path.join(packageRoot(), "tests/fixtures/profile-child.ts"), mode], {
-        cwd, env, stdout: "pipe", stderr: "pipe",
+        cwd, env, stdin: "pipe", stdout: "pipe", stderr: "pipe",
+        ipc(message: any) { if (message?.ready) { isReady = true; ready(); } },
       });
-      const pending = [new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited] as const;
-      let cancelled = false;
-      const work = (async () => {
-        const [output, stderr, exit] = await Promise.all(pending);
-        if (cancelled) return;
-        expect({ exit, stderr, output }).toMatchObject({ exit: 0 });
-        const report = JSON.parse(output.trim().split("\n").at(-1)!);
-        expect(report).toMatchObject({ mode, disposed: true, sideEffects: 0, errors: [] });
-      })();
+      const pending = Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+      void pending.finally(ready).catch(() => {});
+      prepared.set(mode, {
+        async run() {
+          child.stdin.write("run"); child.stdin.end();
+          const [output, stderr, exit] = await pending;
+          expect({ exit, stderr, output }).toMatchObject({ exit: 0 });
+          const report = JSON.parse(output.trim().split("\n").at(-1)!);
+          expect(report).toMatchObject({ mode, disposed: true, sideEffects: 0, errors: [] });
+        },
+        async settle() {
+          if (child.exitCode === null) child.kill("SIGTERM");
+          await Promise.allSettled([pending]);
+        },
+      });
+      await started;
+      if (!isReady) throw Error(`Profile fixture failed before readiness: ${(await pending)[1]}`);
+    }));
+  });
+  afterAll(async () => {
+    await Promise.all([...prepared.values()].map(child => child.settle()));
+    for (const root of profileRoots) rmSync(root, { recursive: true, force: true });
+  });
+  test.each(["reader", "worker", "foreground"])(
+    "isolated native child lifecycle and actual call boundary: %s", mode => {
+      const child = prepared.get(mode)!;
+      const work = child.run();
       void work.catch(() => {});
-      shutdowns.push(async () => {
-        cancelled = true;
-        if (child.exitCode === null) child.kill("SIGTERM");
-        await Promise.allSettled([...pending, work]);
-      });
+      shutdowns.push(async () => { await child.settle(); await Promise.allSettled([work]); });
       return work;
     },
   );
@@ -278,7 +320,9 @@ describe("Pitako resources and policy", () => {
         "lsp_diagnostics", "lsp_rename", "codegraph_search",
       ];
       const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
+      const events = observerRegistrationEvents();
       const pi = {
+        events,
         registerFlag() {},
         registerTool() {},
         getFlag() {
@@ -314,7 +358,7 @@ describe("Pitako resources and policy", () => {
       if (!start) throw new Error("session_start was not registered");
       const ctx = { cwd: packageRoot(), hasUI: false, ui: { notify() {}, setStatus() {} },
         sessionManager: { getSessionId: () => "analysis-wiring", getEntries: () => [] } };
-      shutdowns.push(async () => { await handlers.get("session_shutdown")?.({}, ctx); });
+      shutdowns.push(async () => { await handlers.get("session_shutdown")?.({}, ctx); events.assertDisposed(); });
       await start({}, ctx);
       await handlers.get("session_shutdown")?.({}, ctx);
       expect(active).toContain("read");

@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { retainedAnalyses } from "../extensions/execute-retained.ts";
+import { boundRetainedAnalyses, retainedAnalyses } from "../extensions/execute-retained.ts";
 
 function fixture(run: (value: {
 	root: string; file: string; native: string; mission: string; statePath: string;
@@ -115,4 +115,26 @@ test("missing native state never substitutes metadata containing invocation-shap
 test("corrupt native state is not treated as a fresh invocation", () => fixture(f => {
 	writeFileSync(f.statePath, "{invalid");
 	expect(f.load).toThrow();
+}));
+
+
+test.each(["eligible", "legacy", "binding", "sources"])("bound admission recovery captures only eligible new-root originals: %s", mode => fixture(f => {
+	const state = JSON.parse(readFileSync(f.statePath, "utf8")), invocation = state["invoke-human-1"];
+	const binding = "b".repeat(64), commonDir = path.join(f.root, ".git");
+	Object.assign(invocation, { version: mode === "legacy" ? 2 : 3, admissionBinding: mode === "binding" ? "c".repeat(64) : binding });
+	Object.assign(invocation.association, { commonDir, maxCycles: 3, sourceRefs: [] });
+	writeFileSync(f.statePath, JSON.stringify(state));
+	const load = () => boundRetainedAnalyses(f.root, commonDir, "/spec.md", "e".repeat(64), binding,
+		{ missionId: "mission-1", missionPath: f.mission, invocation: "human-1", sourceRefs: mode === "sources" ? [{ path: "/changed", digest: "f".repeat(64) }] : [] });
+	if (mode !== "eligible") {
+		expect(load).toThrow("Retained recovery binding differs or predates bound admission");
+		expect(load).toThrow("without redispatch or automatic recapture");
+	} else {
+		const captured = load()!;
+		expect(captured.association).toEqual(invocation.association);
+		expect(captured.references).toEqual([f.ref]);
+		expect(captured.originals[0]).toMatchObject({ structuredOutput: f.original });
+		expect(captured.digest).toMatch(/^[a-f0-9]{64}$/);
+	}
+	expect(readFileSync(f.statePath, "utf8")).toBe(JSON.stringify(state));
 }));

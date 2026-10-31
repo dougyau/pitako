@@ -177,7 +177,32 @@ Early fulfillment stops; last-slot gaps need a new human invocation. Stop,
 permissions, persistence and actual native host/child capacity outrank the limit.
 Higher limits grant no extra native capacity. Hash-associated complete inherited
 spec refs remain in all phase contexts without enlarging the selected snapshot.
-See the execute skill for settings examples, sourceRefs and bounded host grants.
+See the execute skill for settings examples, sourceRefs and native capacity limits.
+
+New admissions use A1 hybrid capture: synchronous, bounded local-first discovery
+in resource resolution embeds the complete spec as JSON data. This preliminary
+read is not host-cancellable and is not native admission. One compact native host
+receipt independently validates selection/content/physical identity, full source
+hashes, designated settings and checkout. Matching bindings precede snapshot and
+frozen-budget persistence, then the first director; no cross-file atomicity is
+claimed. The 39,936-byte UTF-8 spec limit remains, without packet transport.
+
+Ordinary closing uses a fixed package-owned external CLI observer, not a model:
+it ignores stdin and observes actual cwd without rereading the plan. Each close
+uses one awaited native child and retains its distinct run/directory/stdout/stderr
+references. It consumes no host call; gaps without a proposed close consume no
+observation. There is no five-close or inspection-pool model. Native child, tree,
+session, concurrency, output, global mission-state (256 KiB) and policy limits
+still apply. A limit of ten is accepted unchanged, not a guarantee of ten loops.
+Capacity/doctor information is contextual, never reserved capacity; unknown stays
+unknown. Essential save failures block protected dispatch/advance, with no promise
+of post-Stop persistence, fsync or permanent artifact retention. New admission
+support does not migrate retained legacy executions or revive terminal roots.
+Blocking diagnostics name the cause/source, available expected/observed identity
+and exact evidence, then recommend state-valid reconciliation: intended-source
+admission before binding, reliable original restoration plus a human addendum
+after binding, or supported native inspection for native barriers. No generic
+`--unblock`, forced hash replacement or terminal-root resume is offered.
 
 Workers retain normal tools and defaults; execute alone disables private
 read/progress diaries and applies four hours per implementation attempt.
@@ -225,8 +250,18 @@ control; abrupt loss/Stop uses the last confirmed point, not a post-cut backup.
 Preserve partial bytes before selective restoration, unrelated changes, confirmed
 work and consumed accounting. Renew invalidated checks and reach review/compliance.
 
+New `pitako.execute` admissions can pass multiple worktree-local Markdown
+`amendments: [{path, sha256, provenance}]` (default `[]`). Native admission verifies
+complete bytes before planning and freezes these references separately from the
+base, without renewing budget. Reentry preserves references and rechecks hashes;
+all phases receive them through the existing shared context. Human message
+ID/timestamp provenance is descriptive, not authentication. See the execute skill
+for foreground syntax; the existing resolution route stays unchanged.
+
 Separately delivered current human amendments remain separate from the admitted
-base snapshot/sourceRefs/association. Carry their complete path, SHA-256 and
+base snapshot/sourceRefs/association. They remain effective without replacing base
+hashes, renewing the budget or causing a false base-source discrepancy; editing
+a frozen source still blocks. Carry their complete path, SHA-256 and
 human-delivery provenance in existing admitted plan shared context and exact
 plan/result references. Workers, review and compliance must read/hash the FULL
 amendment before affected work or whole-spec assessment and retain that provenance

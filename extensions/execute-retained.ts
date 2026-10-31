@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -12,19 +13,42 @@ function readJson(file: string): unknown {
 
 /** Only read-only originals already referenced by this invocation's current loop. */
 export function retainedAnalyses(root: string, source: string, digest: string, context: unknown) {
+	return retainedProjection(root, source, digest, context)?.originals ?? [];
+}
+
+/** Preliminary inert originals, independently compared by native admission. */
+export function boundRetainedAnalyses(root: string, commonDir: string, source: string, digest: string,
+	binding: string, context: unknown) {
+	try {
+		const projection = retainedProjection(root, source, digest, context, { commonDir, binding });
+		if (!projection?.originals.length) return undefined;
+		return { ...projection, digest: createHash("sha256").update(JSON.stringify(projection)).digest("hex") };
+	} catch (error) {
+		throw new Error(`${String(error instanceof Error ? error.message : error)} Selected source ${source}; expected binding ${binding}; observed recovery projection unavailable. Preserve the admitted snapshot and exact native references; inspect the linked originals and reconcile the pending subject under current native authority, without redispatch or automatic recapture.`);
+	}
+}
+function retainedProjection(root: string, source: string, digest: string, context: unknown,
+	bound?: { commonDir: string; binding: string }) {
 	if (!record(context) || typeof context.missionPath !== "string" || !path.isAbsolute(context.missionPath) ||
 		typeof context.invocation !== "string" || typeof context.missionId !== "string")
 		throw new Error("Expected exact mission and invocation for retained analysis inspection.");
 	const mission = readJson(executionStatePath({ missionPath: context.missionPath, missionId: context.missionId }));
 	const invocation = record(mission) ? mission[`invoke-${context.invocation}`] : undefined;
-	if (!record(invocation)) return [];
+	if (!record(invocation)) return undefined;
 	const association = invocation.association;
+	// A failed pre-admission request has no originals. Legacy roots never acquire
+	// this delivery route, and a changed bound association is not recaptured.
+	if (bound && association === undefined) return undefined;
+	if (bound && (invocation.version !== 3 || invocation.admissionBinding !== bound.binding ||
+		!record(association) || association.commonDir !== bound.commonDir ||
+		!isDeepStrictEqual(association.sourceRefs, context.sourceRefs)))
+		throw new Error("Retained recovery binding differs or predates bound admission. Preserve the original snapshot and native references; restore reliable exact bytes or inspect native state, never migrate or recapture this root.");
 	if (!record(association) || association.root !== root || association.source !== source ||
 		association.digest !== digest || association.invocation !== context.invocation ||
 		association.missionId !== context.missionId || association.missionPath !== context.missionPath)
 		throw new Error("Retained analysis association differs from the selected invocation.");
 	const loop = Array.isArray(invocation.loops) ? invocation.loops.at(-1) : undefined;
-	if (!record(loop) || !["director", "implementation", "review", "compliance"].includes(String(loop.phase))) return [];
+	if (!record(loop) || !["director", "implementation", "review", "compliance"].includes(String(loop.phase))) return undefined;
 	const review = record(loop.review) ? loop.review : {};
 	const compliance = record(loop.compliance) ? loop.compliance : {};
 	const refs: unknown[] = [
@@ -49,7 +73,7 @@ export function retainedAnalyses(root: string, source: string, digest: string, c
 			throw new Error("Retained read-only producer has duplicate subjects.");
 		refs.push(reference);
 	}
-	return refs.filter(record).map(ref => {
+	const originals = refs.filter(record).map(ref => {
 		const identity = { key: ref.key, runId: ref.runId };
 		try {
 			const prefix = `invoke-${context.invocation}.l${loop.number}.`;
@@ -99,4 +123,5 @@ export function retainedAnalyses(root: string, source: string, digest: string, c
 			return { ...identity, ok: false, error: String(error instanceof Error ? error.message : error) };
 		}
 	});
+	return { version: 1, association, loop: loop.number, references: refs, originals };
 }

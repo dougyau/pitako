@@ -184,6 +184,10 @@ A hypothetical possibility alone is insufficient. Prefer updating an existing
 test; add one only for a useful uncovered guarantee. Improve evidence quality,
 not test volume or runtime, and retain coverage when simplifying.
 
+Run each planned check exactly as its command and cwd state, whether a tool call
+or a shell command, and report them verbatim. Tool preferences never rewrite a
+planned check; report any alternative as a diagnostic with a distinct ID.
+
 Prefer covered deterministic Git/hash tools, composed with native codemode;
 retain shell/Python fallback only where the role permits it. Check structured ok
 and publication, not just display text. file_sha256 reads; only writers may use
