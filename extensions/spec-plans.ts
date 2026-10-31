@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { closeSync, lstatSync, openSync, readFileSync, readSync, readlinkSync, realpathSync } from "node:fs";
 import path from "node:path";
-import { currentWorkspace, registeredWorktrees, repositoryIdentity } from "./board/workspace.ts";
+import { registeredWorktrees, workspacePaths } from "./board/workspace.ts";
 
 export const SPEC_SECTIONS = ["Objective", "Scope", "Exclusions", "Expected behavior", "Constraints", "Decisions and reasons", "Acceptance criteria", "Verification", "Source context", "Non-blocking uncertainty"] as const;
 export const MAX_SPEC_BYTES = 26 * 1536;
@@ -17,14 +17,17 @@ export function gitRead(root: string, ...args: string[]): string {
 export function designatedWorkspace(root: string) {
   if (!path.isAbsolute(root)) throw new Error("Designated worktree must be absolute.");
   const physical = realpathSync(root);
-  if (currentWorkspace(physical) !== physical || gitRead(physical, "rev-parse", "--is-inside-work-tree").trim() !== "true") throw new Error("Designate a registered Git worktree root, not a subdirectory.");
+  // One discovery yields both root and identity. Git discovery already requires a
+  // non-bare worktree; outside Git both paths are the cwd and Git reports the error.
+  const { worktreeRoot, commonDir } = workspacePaths(physical);
+  if (worktreeRoot !== physical || (commonDir === physical && gitRead(physical, "rev-parse", "--is-inside-work-tree").trim() !== "true")) throw new Error("Designate a registered Git worktree root, not a subdirectory.");
   const registered = gitRead(physical, "worktree", "list", "--porcelain", "-z").split("\0").some(field => {
     if (!field.startsWith("worktree ")) return false;
     try { return realpathSync(field.slice("worktree ".length)) === physical; }
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
   });
   if (!registered) throw new Error(`Designated worktree is not registered with Git: ${physical}`);
-  return { physicalRoot: physical, identity: repositoryIdentity(physical) };
+  return { physicalRoot: physical, identity: commonDir };
 }
 export function validateSpec(content: string, id: string): void {
   validatePlanId(id);
@@ -157,8 +160,8 @@ export function preliminarySpec(root: string, id: string, source?: string) {
 /** Content identity, not a test receipt. Ignore only native transient workflow artifacts. */
 export function checkoutEvidence(root: string) {
   const hash = createHash("sha256");
-  const head = gitRead(root, "rev-parse", "HEAD").trim();
-  const branch = gitRead(root, "rev-parse", "--abbrev-ref", "HEAD").trim();
+  // Ref names cannot contain newlines.
+  const [head, branch] = gitRead(root, "rev-parse", "HEAD", "--abbrev-ref", "HEAD").trim().split("\n") as [string, string];
   hash.update(head).update(gitRead(root, "diff", "--cached", "--binary"));
   const gitlinks = new Map<string, string[]>();
   for (const entry of gitRead(root, "ls-files", "--stage", "-z").split("\0")) {
