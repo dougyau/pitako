@@ -37,12 +37,12 @@ function fixture() {
   const state = createMissionWorkflowState(location, mission.id);
   const association = { root, commonDir: git("rev-parse", "--path-format=absolute", "--git-common-dir"), missionId: mission.id, missionPath,
     invocation: "fixture", source: path.join(root, "spec.md"), digest: "a".repeat(64), maxCycles: 5, sourceRefs: [] };
-  const intent: CheckpointIntent = { version: 1, association, key: "invoke-fixture.l1.t1.a1", taskId: "owned", attempt: 1,
+  const intent: CheckpointIntent = { version: 2, association, key: "invoke-fixture.l1.t1.a1", taskId: "owned", attempt: 1,
     loop: 1, cursor: 0, phase: "implementation", planRef: { key: "plan", runId: "director" },
-    progress: { consumedLoops: 1, admittedResults: [] } };
+    progress: { consumedLoops: 1, admitted: {}, previous: null } };
   const loop = { number: 1, phase: "implementation", cursor: 0, manifest: ["owned", "next"], results: [], plan: { stage: "admitted", ref: intent.planRef },
     attempt: { key: intent.key, taskId: "owned", index: 0, number: 1, stage: "intention", checkpoint: intent } };
-  const record = { version: 3, association, loops: [loop] };
+  const record = { version: 4, association, loop, consumedLoops: 1, tasks: {}, lastConfirmed: null };
   const persist = () => state.set("invoke-fixture", record); persist();
   const binding = JSON.stringify({ "pitako.checkpoint/1": { association, key: intent.key } });
   let tool: any;
@@ -61,7 +61,7 @@ test("registered checkpoint_create captures actual WIP, untracked bytes, absence
   expect(JSON.parse(beforeMission)).not.toHaveProperty("invoke-fixture");
   expect(f.tool.annotations).toEqual({ readOnlyHint: false, destructiveHint: true });
   const first = await f.call("pre", paths);
-  expect(first).toMatchObject({ ok: true, status: "created", kind: "pre", confirmed: false, position: { cursor: 0 }, progress: { consumedLoops: 1, admittedResults: [] } });
+  expect(first).toMatchObject({ ok: true, status: "created", kind: "pre", confirmed: false, position: { cursor: 0 }, progress: { consumedLoops: 1, admitted: {}, previous: null } });
   expect(first.files).toEqual([
     { path: "modified", exists: true, sha256: digest("prior uncommitted WIP\n"), mode: statSync(path.join(f.root, "modified")).mode & 0o777 },
     { path: "untracked", exists: true, sha256: digest("new untracked bytes\n"), mode: statSync(path.join(f.root, "untracked")).mode & 0o777 },
@@ -89,7 +89,7 @@ test.each(["unit", "pause"] as const)("%s seal has actual journaled bytes but no
   expect(sealed.checkpointReceipt.digest).toBe(digest(readFileSync(sealed.checkpointRef)));
   expect((await f.call(kind)).status).toBe("existing");
   expect(readFileSync(f.statePath, "utf8")).toBe(state);
-  expect(artifact(pre.manifestRef).intent.progress.admittedResults).toEqual([]);
+  expect(artifact(pre.manifestRef).intent.progress.admitted).toEqual({});
 });
 
 test("a tool publication remains a usable existing rollback source with unknown historical writer status", async () => {
@@ -106,7 +106,7 @@ test("a tool publication remains a usable existing rollback source with unknown 
 
 // Rejects using a nominal intention, foreign/unadmitted seal, or the unit's
 // preimages as the next task's baseline. The seal is an actual registered call.
-test.each(["valid", "missing", "foreign", "unadmitted", "corrupt", "conflict", "newer-corrupt"])(
+test.each(["valid", "missing", "foreign", "unadmitted", "corrupt", "conflict", "newer-corrupt", "previous-ref", "previous-digest", "previous-checkpoint", "previous-attempt", "cursor", "plan"])(
   "tool-published admitted unit supplies postimages before the next capture: %s", async mode => {
     const f = fixture();
     await f.call("pre", paths);
@@ -117,14 +117,20 @@ test.each(["valid", "missing", "foreign", "unadmitted", "corrupt", "conflict", "
     const ref = { key: f.intent.key, runId: "actual-unit-producer" };
     const result = { taskId: f.intent.taskId, attempt: 1, status: "complete", ref };
     const pending: CheckpointIntent = { ...f.intent, key: "invoke-fixture.l1.t2.a1", taskId: "next", cursor: 1,
-      progress: { consumedLoops: 1, admittedResults: [result] } };
+      progress: { consumedLoops: 1, admitted: { owned: ["complete"] }, previous: { taskId: result.taskId, attempt: result.attempt, resultRef: ref, checkpointRef: receipt.checkpointRef, digest: receipt.digest } } };
     const confirmedUnit = { ...receipt, taskId: result.taskId, attempt: result.attempt, resultRef: ref };
     const authority = { pending: true, stop: false, permissionDenied: false, activeWriter: null, references: [receipt.checkpointRef], confirmedUnit };
     const originalSeal = readFileSync(receipt.checkpointRef);
     if (mode === "missing") rmSync(receipt.checkpointRef);
     if (mode === "corrupt") writeFileSync(receipt.checkpointRef, "corrupt seal");
     if (mode === "foreign") pending.association = { ...pending.association, invocation: "foreign" };
-    if (mode === "unadmitted") pending.progress!.admittedResults = [];
+    if (mode === "unadmitted") pending.progress!.previous = null;
+    if (mode === "previous-ref") pending.progress!.previous!.resultRef = { key: "other" };
+    if (mode === "previous-digest") pending.progress!.previous!.digest = "0".repeat(64);
+    if (mode === "previous-checkpoint") pending.progress!.previous!.checkpointRef += ".other";
+    if (mode === "previous-attempt") pending.progress!.previous!.attempt++;
+    if (mode === "cursor") pending.cursor++;
+    if (mode === "plan") pending.planRef = { key: "other-plan" };
     if (mode === "conflict") writeFileSync(path.join(f.root, "modified"), "unattributed edit");
     if (mode === "newer-corrupt") {
       // Use the real shared capture, then damage its publication: absence-only
@@ -133,7 +139,7 @@ test.each(["valid", "missing", "foreign", "unadmitted", "corrupt", "conflict", "
       captureCheckpoint(pending, ["modified"]);
       writeFileSync(path.join(checkpointDirectory(pending), "manifest.json"), "corrupt newer manifest");
     }
-    const observe = () => checkpointEvidence([pending], { consumedLoops: 1, admittedResults: [result] }, confirmedUnit);
+    const observe = () => checkpointEvidence([pending], pending.progress!, confirmedUnit);
     if (mode !== "valid") {
       expect(observe).toThrow(); expect(() => restoreCheckpoint(pending, authority)).toThrow();
       expect(readFileSync(path.join(f.root, "modified"), "utf8")).toBe(mode === "conflict" ? "unattributed edit" : "confirmed WIP");
@@ -344,4 +350,23 @@ test("native inspector composition cannot discover or invoke checkpoint writes",
     expect(existsSync(checkpointDirectory(f.intent))).toBe(false);
     expect(readFileSync(path.join(f.root, "modified"), "utf8")).toBe("prior uncommitted WIP\n");
   } finally { await child.dispose(); await factory.dispose(); }
+});
+
+// v3 hashes flattened logical pairs, not the references or attempts in history.
+test("CheckpointIntent v2 evidence has v3 hash parity for the same logical pairs", async () => {
+  const f = fixture();
+  await f.call("pre", paths);
+  applyCheckpoint(f.intent, [{ path: "modified", image: { bytes: Buffer.from("owned change").toString("base64"), mode: 0o644 } }]);
+  const v3 = { consumedLoops: 1, admittedResults: [
+    { taskId: "second", status: "blocked", attempt: 1, ref: { key: "older" } },
+    { taskId: "first", status: "complete", attempt: 1, ref: { key: "first" } },
+    { taskId: "second", status: "blocked", attempt: 2, ref: { key: "retry" } },
+    { taskId: "second", status: "continue", attempt: 3, ref: { key: "latest" } },
+  ] };
+  const v2 = { consumedLoops: 1, admitted: { first: ["complete"], second: ["blocked", "continue"] } };
+  const expected = checkpointEvidence([f.intent], v3);
+  expect(checkpointEvidence([f.intent], v2)).toBe(expected);
+  expect(checkpointEvidence([f.intent], { ...v2, admitted: { second: ["continue", "blocked"], first: ["complete"] } })).toBe(expected);
+  expect(checkpointEvidence([f.intent], { ...v2, admitted: { first: ["complete"] } })).not.toBe(expected);
+  expect(checkpointEvidence([f.intent], { ...v2, consumedLoops: 2 })).not.toBe(expected);
 });

@@ -6,11 +6,13 @@ import { checkoutEvidence, designatedWorkspace, gitRead } from "./spec-plans.ts"
 
 type Image = { bytes: string; mode: number } | null;
 export type CheckpointIntent = {
-  version: 1; association: { root: string; commonDir: string; missionId: string; missionPath: string; invocation: string; source: string; digest: string; maxCycles: number; sourceRefs: unknown[] };
+  version: 2; association: { root: string; commonDir: string; missionId: string; missionPath: string; invocation: string; source: string; digest: string; maxCycles: number; sourceRefs: unknown[] };
   key: string; taskId: string; attempt: number; loop: number; cursor: number;
   phase: "implementation"; planRef: unknown;
-  progress?: { consumedLoops: number; admittedResults: unknown[] };
+  progress?: CheckpointProgress;
 };
+export type CheckpointProgress = { consumedLoops: number; admitted: Record<string, string[]>;
+  previous: { taskId: string; attempt: number; resultRef: unknown; checkpointRef: string; digest: string } | null };
 type Entry = { path: string; before: Image; after: Image };
 type Manifest = { intent: CheckpointIntent; base: ReturnType<typeof checkoutEvidence>; index: string; files: { path: string; image: Image }[] };
 export type RestoreAuthority = {
@@ -83,7 +85,7 @@ function read<T>(file: string): T {
   return JSON.parse(envelope.data);
 }
 export function checkpointDirectory(intent: CheckpointIntent) {
-  if (intent.version !== 1 || !/^[A-Za-z0-9._-]+$/.test(intent.key) || intent.key.includes("..") ||
+  if (intent.version !== 2 || !/^[A-Za-z0-9._-]+$/.test(intent.key) || intent.key.includes("..") ||
       !intent.taskId || !Number.isSafeInteger(intent.attempt) || intent.attempt < 1 ||
       !Number.isSafeInteger(intent.loop) || intent.loop < 1 ||
       !Number.isSafeInteger(intent.cursor) || intent.cursor < 0 || intent.phase !== "implementation")
@@ -194,10 +196,9 @@ export function applyCheckpoint(intent: CheckpointIntent, changes: { path: strin
 // Only the exact root-admitted unit immediately preceding the pending cursor
 // can supply a baseline when that pending writer never published its capture.
 function confirmedUnitSource(pending: CheckpointIntent, unit: ConfirmedUnit) {
-  const admitted = pending.progress?.admittedResults as { taskId: string; attempt: number; status: string; ref: unknown }[] | undefined;
-  const resultIndex = admitted?.findIndex(item => item.taskId === unit.taskId && item.attempt === unit.attempt &&
-    item.status === "complete" && equal(item.ref, unit.resultRef)) ?? -1;
-  if (unit.kind !== "unit" || resultIndex < 0 || admitted!.slice(resultIndex + 1).some(item => item.status === "complete") ||
+  if (unit.kind !== "unit" || !equal(pending.progress?.previous, {
+      taskId: unit.taskId, attempt: unit.attempt, resultRef: unit.resultRef,
+      checkpointRef: unit.checkpointRef, digest: unit.digest }) ||
       !equal(unit.position, { loop: pending.loop, cursor: pending.cursor, phase: pending.phase }) ||
       !/^([a-f0-9]{64})$/.test(unit.digest) || !/^([A-Za-z0-9_-][A-Za-z0-9._-]*)\/unit\.json$/.test(path.relative(path.join(pending.association.root, ".pi/subagents/checkpoints"), unit.checkpointRef).split(path.sep).join("/")) ||
       path.relative(path.join(pending.association.root, ".pi/subagents/checkpoints"), unit.checkpointRef).includes(".."))
@@ -211,7 +212,7 @@ function confirmedUnitSource(pending: CheckpointIntent, unit: ConfirmedUnit) {
       intent.cursor + 1 !== pending.cursor || intent.phase !== pending.phase ||
       unit.checkpointRef !== path.join(checkpointDirectory(intent), "unit.json") || point.kind !== "unit" ||
       !equal(point.position, unit.position) || !equal(point.progress, unit.progress) ||
-      !equal(intent.progress, point.progress) || !equal(intent.progress?.admittedResults, admitted!.slice(0, resultIndex)) ||
+      !equal(intent.progress, point.progress) ||
       intent.progress!.consumedLoops !== pending.progress!.consumedLoops ||
       !equal({ head: point.candidate.head, fingerprint: point.candidate.fingerprint }, unit.candidate))
     throw new Error("Confirmed unit association/progress mismatch.");
@@ -238,7 +239,7 @@ function publishedSource(sources: CheckpointIntent[]) {
 // Read-only recovery witness. Keys, timestamps and renamed manifests are not
 // progress: only validated file states, admitted progress and durable restoration
 // publication contribute. Repeated equivalent captures therefore cannot renew it.
-export function checkpointEvidence(sources: CheckpointIntent[], progress: { consumedLoops: number; admittedResults: { taskId: string; status: string }[] }, confirmedUnit?: ConfirmedUnit) {
+export function checkpointEvidence(sources: CheckpointIntent[], progress: Pick<CheckpointProgress, "consumedLoops" | "admitted"> | { consumedLoops: number; admittedResults: { taskId: string; status: string }[] }, confirmedUnit?: ConfirmedUnit) {
   const first = sources[0];
   if (!first || sources.some(item => !equal(item.association, first.association) ||
       item.taskId !== first.taskId || item.loop !== first.loop || item.cursor !== first.cursor))
@@ -289,7 +290,9 @@ export function checkpointEvidence(sources: CheckpointIntent[], progress: { cons
   // Current admitted logical progress, not the progress copied into each old
   // capture. Attempt numbers/references and equivalent repeated admissions are
   // nominal; owned file images above retain actual pending-work effects.
-  const admitted = [...new Set(progress.admittedResults.map(({ taskId, status }) =>
+  const pairs = "admitted" in progress ? Object.entries(progress.admitted).flatMap(([taskId, states]) =>
+    states.map(status => ({ taskId, status }))) : progress.admittedResults;
+  const admitted = [...new Set(pairs.map(({ taskId, status }) =>
     JSON.stringify({ taskId, status })))].sort();
   return hash(JSON.stringify({ material: [...material].sort(), consumedLoops: progress.consumedLoops, admitted }));
 }
@@ -372,6 +375,21 @@ export function restoreCheckpoint(source: CheckpointIntent | CheckpointIntent[],
   return restored;
 }
 
+function admittedProgress(intent: CheckpointIntent) {
+  const progress = intent.progress;
+  if (!progress || !Number.isSafeInteger(progress.consumedLoops) || progress.consumedLoops < intent.loop ||
+      progress.consumedLoops > intent.association.maxCycles ||
+      !progress.admitted || typeof progress.admitted !== "object" || Array.isArray(progress.admitted) ||
+      !Object.values(progress.admitted).every(states => Array.isArray(states) &&
+        states.every(state => typeof state === "string") && new Set(states).size === states.length) ||
+      !(progress.previous === null || (progress.previous && typeof progress.previous.taskId === "string" &&
+        Number.isSafeInteger(progress.previous.attempt) && progress.previous.attempt > 0 &&
+        typeof progress.previous.checkpointRef === "string" && /^[a-f0-9]{64}$/.test(progress.previous.digest) &&
+        progress.previous.resultRef !== undefined)))
+    throw new Error("Checkpoint lacks coherent admitted progress.");
+  return progress;
+}
+
 // A seal contains bytes, not admission authority. Only the root's durable result
 // admission confirms it as a continuation point. A pause never completes a task.
 export function sealCheckpoint(intent: CheckpointIntent, kind: "unit" | "pause", controlPermitsCapture: boolean) {
@@ -379,9 +397,7 @@ export function sealCheckpoint(intent: CheckpointIntent, kind: "unit" | "pause",
   if (kind !== "unit" && kind !== "pause") throw new Error("Invalid checkpoint seal kind.");
   const { directory, manifest, steps } = load(intent), root = intent.association.root;
   if (existsSync(path.join(directory, "restore.json"))) throw new Error("Checkpoint restoration already started.");
-  const progress = intent.progress;
-  if (!progress || !Number.isSafeInteger(progress.consumedLoops) || progress.consumedLoops < intent.loop ||
-      !Array.isArray(progress.admittedResults)) throw new Error("Checkpoint lacks coherent admitted progress.");
+  const progress = admittedProgress(intent);
   const latest = new Map(manifest.files.map(file => [file.path, file.image]));
   for (const step of steps) for (const entry of step) latest.set(entry.path, entry.after);
   const files = manifest.files.map(file => ({ path: file.path, image: image(root, file.path) }));
@@ -405,10 +421,7 @@ export function sealCheckpoint(intent: CheckpointIntent, kind: "unit" | "pause",
 export function createCheckpoint(intent: CheckpointIntent, kind: "pre" | "unit" | "pause", paths?: string[], signal?: AbortSignal) {
   signal?.throwIfAborted();
   if (!["pre", "unit", "pause"].includes(kind)) throw new Error("Invalid checkpoint point kind.");
-  const progress = intent.progress;
-  if (!progress || !Number.isSafeInteger(progress.consumedLoops) || progress.consumedLoops < intent.loop ||
-      progress.consumedLoops > intent.association.maxCycles || !Array.isArray(progress.admittedResults))
-    throw new Error("Checkpoint lacks coherent admitted progress.");
+  const progress = admittedProgress(intent);
   const directory = checkpointDirectory(intent), manifestRef = path.join(directory, "manifest.json");
   let existed = existsSync(kind === "pre" ? manifestRef : path.join(directory, `${kind}.json`));
   if (kind === "pre") {

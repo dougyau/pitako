@@ -28,7 +28,7 @@ function fixture(run: (value: {
 		}));
 		const association = { ...context, root, source: "/spec.md", digest: "e".repeat(64) };
 		writeFileSync(statePath, JSON.stringify({ "invoke-human-1": {
-			association, loops: [{ number: 1, phase: "review", review: { references: [ref] } }],
+			version: 4, association, loop: { number: 1, phase: "review", review: { references: [ref] } },
 		} }));
 		run({ root, file, native, mission, statePath, ref, original,
 			load: () => retainedAnalyses(root, "/spec.md", "e".repeat(64), context) });
@@ -101,7 +101,7 @@ test("a new invocation has no historical reference scan", () => fixture(f => {
 test.each(["stopped", "interrupted", "detached"])("missing status does not erase a retained %s observation", field => fixture(f => {
 	rmSync(path.join(f.native, "status.json"));
 	const state = JSON.parse(readFileSync(f.statePath, "utf8"));
-	state["invoke-human-1"].loops[0].review.references[0].results[0][field] = true;
+	state["invoke-human-1"].loop.review.references[0].results[0][field] = true;
 	writeFileSync(f.statePath, JSON.stringify(state));
 	expect(f.load()).toMatchObject([{ ok: false, [field]: true }]);
 }));
@@ -121,7 +121,7 @@ test("corrupt native state is not treated as a fresh invocation", () => fixture(
 test.each(["eligible", "legacy", "binding", "sources"])("bound admission recovery captures only eligible new-root originals: %s", mode => fixture(f => {
 	const state = JSON.parse(readFileSync(f.statePath, "utf8")), invocation = state["invoke-human-1"];
 	const binding = "b".repeat(64), commonDir = path.join(f.root, ".git");
-	Object.assign(invocation, { version: mode === "legacy" ? 2 : 3, admissionBinding: mode === "binding" ? "c".repeat(64) : binding });
+	Object.assign(invocation, { version: mode === "legacy" ? 2 : 4, admissionBinding: mode === "binding" ? "c".repeat(64) : binding });
 	Object.assign(invocation.association, { commonDir, maxCycles: 3, sourceRefs: [] });
 	writeFileSync(f.statePath, JSON.stringify(state));
 	const load = () => boundRetainedAnalyses(f.root, commonDir, "/spec.md", "e".repeat(64), binding,

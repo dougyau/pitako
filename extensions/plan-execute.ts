@@ -59,6 +59,7 @@ export function executionResource(platform: NodeJS.Platform = process.platform) 
     const inspections = [{ key: "inspect-initial", command: inspectionCommand([
       ...input, "admission", JSON.stringify({ ...context, admission: { sourceRefs, agentDir } }),
     ], platform) }];
+    inspections.push(...[1, 2].map(retry => ({ ...inspections[0]!, key: `inspect-initial.r${retry}` })));
     const config = { root: preliminary.root, id: args.id, invocation: args.invocation, missionId: args.missionId, missionPath: args.missionPath, sourceRefs, amendments, inspections, preliminary, ...(recovery ? { recovery } : {}),
       checkpointHelper: path.join(packageRoot(), "skills/execute/checkpoint.mjs"),
       ...(args.unblock === true ? { unblock: true, resolution: args.resolution } : {}) };
@@ -88,25 +89,35 @@ export default function planExecute(pi: ExtensionAPI): void {
   });
   let registration: WorkflowResourceRegistration | undefined;
   let observer: RuntimeAgentRegistration | undefined;
+  let ledger: RuntimeAgentRegistration | undefined;
   function dispose() {
     registration?.dispose(); registration = undefined;
     observer?.dispose(); observer = undefined;
+    ledger?.dispose(); ledger = undefined;
   }
   pi.on("session_start", (_event, ctx) => {
     dispose();
     try {
       observer = registerAgentViaEvents({ pi, name: "pitako.checkout-observer", definition: {
         description: "Deterministic actual-cwd checkout evidence; no model or prompt execution.",
-        systemPrompt: "Fixed checkout observer; stdin is ignored.", systemPromptMode: "replace", tools: [], allowNestedSubagents: false,
+        systemPrompt: "Fixed actual-cwd observer and ledger publisher; stdin is a JSON {expected, body} request, never a workspace selector.", systemPromptMode: "replace", tools: [], allowNestedSubagents: false,
         inheritProjectContext: false, inheritGlobalContext: false, inheritSkills: false,
         defaultContext: "fresh", defaultAsync: false,
         runner: { type: "external-cli", command: process.execPath,
           args: [path.join(packageRoot(), "skills/execute/observe.mjs")], promptDelivery: "stdin" },
       } });
+      ledger = registerAgentViaEvents({ pi, name: "pitako.execution-ledger", definition: {
+        description: "Deterministic hash-chained execution ledger publication; no model execution.",
+        systemPrompt: "Fixed execution ledger; stdin is a JSON publication request.", systemPromptMode: "replace", tools: [], allowNestedSubagents: false,
+        inheritProjectContext: false, inheritGlobalContext: false, inheritSkills: false,
+        defaultContext: "fresh", defaultAsync: false,
+        runner: { type: "external-cli", command: process.execPath,
+          args: [path.join(packageRoot(), "skills/execute/ledger.mjs")], promptDelivery: "stdin" },
+      } });
       registration = registerWorkflowResource({ sessionId: ctx.sessionManager.getSessionId(), definition: executionResource() });
     } catch (error) {
       dispose();
-      throw new Error(`Checkout observer registration failed: ${String(error instanceof Error ? error.message : error)}. Inspect the installed pi-subagents registration listener and conflicting agent; reconcile it before preparing execution. No fallback was registered.`);
+      throw new Error(`Checkout observer or execution ledger registration failed: ${String(error instanceof Error ? error.message : error)}. Inspect the installed pi-subagents registration listener and conflicting agent; reconcile it before preparing execution. No fallback was registered.`);
     }
   });
   pi.on("session_shutdown", dispose);

@@ -57,7 +57,7 @@ const call = async (name: string, args: JsonObject) => {
 const text = (outcome: Awaited<ReturnType<typeof call>>) =>
   outcome.result.content.map(part => part.type === "text" ? part.text : "").join("\n");
 let disposed = false;
-let observerRegistered = false;
+const registered = new Set<string>();
 let removeRegistrationListener = () => {};
 try {
   const role = mode === "worker" ? "worker" : "researcher";
@@ -94,12 +94,19 @@ try {
     removeRegistrationListener = pi.events.on(RUNTIME_AGENT_REGISTER_EVENT, raw => {
       const request = raw as RuntimeAgentRegistrationRequest;
       assert.equal(request.version, 1);
-      assert.equal(request.name, "pitako.checkout-observer");
-      assert.equal(observerRegistered, false);
-      observerRegistered = true;
+      const script = { "pitako.checkout-observer": "observe.mjs", "pitako.execution-ledger": "ledger.mjs" }[request.name];
+      assert.ok(script);
+      assert.deepEqual(request.definition.runner, { type: "external-cli", command: process.execPath,
+        args: [path.join(root, "skills/execute", script)], promptDelivery: "stdin" });
+      assert.deepEqual(request.definition.tools, []);
+      for (const field of ["allowNestedSubagents", "inheritProjectContext", "inheritGlobalContext", "inheritSkills", "defaultAsync"] as const)
+        assert.equal(request.definition[field], false);
+      assert.equal(request.definition.systemPromptMode, "replace");
+      assert.equal(request.definition.defaultContext, "fresh");
+      assert.equal(registered.has(request.name), false);
+      registered.add(request.name);
       request.result = { ok: true, registration: { dispose() {
-        assert.equal(observerRegistered, true);
-        observerRegistered = false;
+        assert.equal(registered.delete(request.name), true);
       } } };
     });
     pitako(pi);
@@ -126,7 +133,7 @@ try {
       process.send({ ready: true });
       assert.equal(await Bun.stdin.text(), "run");
     }
-    assert.equal(observerRegistered, mode === "foreground");
+    assert.deepEqual([...registered].sort(), mode === "foreground" ? ["pitako.checkout-observer", "pitako.execution-ledger"] : []);
     await session.extensionRunner!.emit({ type: "agent_start" });
     assert.deepEqual(captured.toolDiagnostic()?.missing ?? [], []);
     if (mode === "foreground") {
@@ -192,7 +199,7 @@ try {
 } finally {
   await factory.dispose();
   removeRegistrationListener();
-  assert.equal(observerRegistered, false);
+  assert.equal(registered.size, 0);
   disposed = true;
 }
 console.log(JSON.stringify({ mode, disposed, sideEffects, errors }));

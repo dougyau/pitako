@@ -55,10 +55,17 @@ export function resourceWithAgentDir(agentDir: string) {
 // Responses implement schemas only; no provider or model obedience is certified.
 export function childResponse(key: string, request: any, metadata: any, checkout: any, completeLoop = 1) {
   const loop = Number(key.match(/\.l(\d+)\./)?.[1] ?? 1);
+  if (request.agent === "pitako.execution-ledger") {
+    const pending = JSON.parse(request.task);
+    return { key, ok: true, agent: request.agent, runId: `native-${key}`, asyncDir: `/native/async/${key}`,
+      output: JSON.stringify({ count: Math.max(1, pending.expected.count) + 1, head: "c".repeat(64), ...(pending.record.kind === "loop" ? { summaries: [{ loop, status: "gaps", gaps: "", review: "", compliance: "", rejection: pending.record.body.plan?.rejection?.diagnostic ?? "" }] } : {}) }),
+      externalAdapter: { outputArtifacts: { stdoutPath: `/native/async/${key}/stdout.log`, stderrPath: `/native/async/${key}/stderr.log` } },
+      results: [{ exitCode: 0 }] } as WorkflowScriptChildResult;
+  }
   if (request.agent === "pitako.checkout-observer") return { key, ok: true,
     agent: request.agent, runId: `native-${key}`, asyncDir: `/native/async/${key}`, artifactPaths: [],
-    output: JSON.stringify({ version: 1, ok: true, root: metadata.root, commonDir: metadata.commonDir,
-      checkout: { ...checkout, branch: "test", status: "" } }), results: [{ index: 0, agent: request.agent, task: request.task ?? "", exitCode: 0,
+    output: JSON.stringify({ version: 1, ok: true, ledger: { count: Math.max(1, (request.task ? JSON.parse(request.task).expected.count : 0)) + 1, head: "c".repeat(64) }, root: metadata.root, commonDir: metadata.commonDir,
+      summaries: [{ loop, status: "gaps", gaps: "", review: "", compliance: "", rejection: "" }], checkout: { ...checkout } }), results: [{ index: 0, agent: request.agent, task: request.task ?? "", exitCode: 0,
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } }],
     externalAdapter: {
       adapter: { id: "external-cli", version: 1, executionMode: "one-shot-stdin" },

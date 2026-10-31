@@ -126,6 +126,33 @@ required checks or analyses, renew slots or create another mission to evade it.
 Available capacity/doctor information retains its provenance: it is context, not
 a reservation or guaranteed effective limit. Unknown capacity stays unknown.
 
+The exact native pre-launch fan-out rejection returns `budget-exhausted` after
+saving current state, without closing/archiving the loop or spending another slot.
+The foreground automatically relaunches the same invocation/mission as a new
+top-level run; native resume retains the per-run `maxSubagentSpawnsPerRun` budget
+(default 64). Ordinary frozen-source/digest/association reentry reconciles pending
+seals, intentions and retries; admitted work is not repeated. Compact rejected-key
+evidence licenses only launches the native receipt proves never started, and is
+consumed durably before dispatch. An O(1) last-exhaustion marker tracks the latest
+admitted seal, ledger count/head and closed loop. Repeated exhaustion without
+progress halts for a human because one step needs more spawns than the configured
+budget. Progress allows another automatic relaunch. Relaunch supplies no human
+continuation or unblock authority: recorded Stop/refusal and other human-needed
+barriers return unchanged with no dispatch. Per-seal archiving is unchanged.
+
+Transient non-archive state-save failures (native lock timeout or I/O errno)
+retry at most three times with the identical frozen projection and no intervening
+effects. Saves are ordered; the native setter freshly reads the merged state
+under lock, so a write that committed before throwing is safely rewritten.
+Cached `get` cannot confirm disk state. Size-limit, invalid JSON and other
+deterministic failures halt immediately; capped failures name the repeated cause.
+Fixed pure host reconstruction also retries transient lock/I/O/transport failures
+up to three attempts, in order through `inspect-initial`, `inspect-initial.r1`
+and `inspect-initial.r2` with byte-identical commands. Unused aliases spend no
+host or child capacity. Deterministic failures and observed Stop/refusal/pending
+activity never retry; no retry clears a human-needed barrier. Failed reconstruction
+retains its repeated cause and cannot silently renew its route.
+
 The admitted `pitako.execute.maxCycles` is a positive safe integer (default 3).
 Pi global agent-dir `settings.json` is overridden by the designated worktree's
 `.pi/settings.json`, never the source/sibling cwd. Invalid settings stop before
@@ -182,7 +209,8 @@ follows review. Native closing compares the candidate with check/analysis eviden
 The session-scoped `pitako.checkout-observer` is registered outside resolution via
 public `registerAgentViaEvents`, using an absolute executable and fixed owned
 `observe.mjs` argument vector. Conflict/rejection is an error, not an overwrite or
-fallback. It uses no model, delegation or conversational context, ignores stdin,
+fallback. It uses no model, delegation or conversational context, consumes
+`{expected, body}` on stdin to verify and publish the close ledger record,
 and calls `designatedWorkspace`/`checkoutEvidence` on actual cwd without reading
 the spec. All stdout is bounded before emission below 65,536 bytes, emitting
 complete failure JSON instead of a truncated success.
@@ -204,8 +232,26 @@ Compact explicit native-state result projections retain exact producer/run,
 outputReference/outputArtifactPath/outputPathMapping/artifactPaths and optional
 structuredOutputPath. No whole prompts/reports/child objects are duplicated.
 The identical active-plan cache is optional within the entire 256 KiB state file;
-essential snapshot/frozen descriptor/progress failure stops dispatch, never prunes
-history. Exceptional inspector recovery reads original full values via retained
+essential snapshot/frozen descriptor/progress failure stops unsafe dispatch.
+Closed-loop history goes to a verified ledger; superseded recovery data is
+archived then discarded. New v4 state holds current control/progress and usage
+totals, not an accumulating loop array. Full completed results are stored once
+per task, with completed attempts referencing them; pending continuations retain
+their last result. Closing rebuilds deterministic bytes from immutable source
+fields, freezing only mutable usage/resolution inputs.
+Three-loop rings retain plan-rejection diagnostics, native closing references
+and bounded summaries. Reports, review/compliance and directors receive these
+summaries with `{ledgerPath, head}`. Publishers verify the chain via `ledger.mjs`
+and return the last three loop summaries, replacing direct director reads
+(the director has no shell). Further reads verify against that head; missing or
+altered records block. The inspector still reads only supplied exact references.
+`--unblock` searches invocation resolutions, last closed disposition, then the
+open loop; older closed entries cannot resume or conflict. Plan defects beyond
+three loops are not automatically detected; duplicate completions fail at
+admission. Loop-owned keys contain `.l<n>.`. Seals add one spawn; fused closing
+adds none, retries unpublished output with `.checkout.r<n>`, and never lets
+stdin choose the workspace. Retained v2/v3 states are not migrated.
+Exceptional inspector recovery reads original full values via retained
 refs only when unavailable directly. Compare full JSON where binding/original
 survive. Missing binding uses original in place; conflict forbids edits; optional
 artifact loss does not block admitted payload/cache; full loss needs remaining
@@ -324,7 +370,9 @@ retained evidence and report only operations valid for that state, never resume
 advice or a generic `--unblock`. No `--force`, silent hash replacement, extra
 arbitrary approvals or restart that erases consumed work is supported.
 
-The mission-state limit is global, currently 256 KiB. Essential saves precede
+Self-resolvable failures retry automatically; halts require human-needed
+conditions, including actual native barriers or integrity conflicts, not ordinary
+technical reconstruction. The mission-state limit is global, currently 256 KiB. Essential saves precede
 protected dispatch/advance; no post-Stop save, fsync or permanent artifact-retention
 guarantee is added.
 

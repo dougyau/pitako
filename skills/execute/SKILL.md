@@ -130,11 +130,25 @@ Stop remains observed history, not a fabricated new receipt or permanent veto.
 For a retained host transport failure with unknown cause, ordinary reentry can
 perform one bounded read-only reconstruction without `--unblock`. It saves the
 exact observation and intention before inspection and admission after validating
-the immutable state. A pending or failed reconstruction is not a fresh route;
+the immutable state. Transient native lock/I/O or transport failures retry the
+fixed pure inspection at most three times, sequentially through `inspect-initial`,
+`inspect-initial.r1` and `inspect-initial.r2`, with the identical command. Unused
+aliases consume no host calls or child spawns. Deterministic failures, Stop,
+refusal and positive pending activity never use a retry alias. After the cap,
+the halt names the repeated cause. A pending or failed reconstruction is not a fresh route;
 changing a key does not authorize another inspection. Original observations remain
 retained. This does not settle interrupted writers or pending recovery queries.
 Observed Stop, permission denial or positive pending activity still blocks automatic
 replacement; explicit current input and native reconciliation remain necessary.
+
+State saves likewise retry transient lock/I/O errors at most three times, without
+dispatch or state mutation between attempts. Each attempt writes the identical
+frozen projection; the native setter re-reads disk under its lock, so an uncertain
+post-commit error is safe to retry. Cached `state.get` is not disk evidence.
+Saves are ordered so an older retry cannot overwrite a newer receipt. Size-limit,
+invalid JSON and other deterministic errors halt immediately with their cause;
+the retry-cap halt names the repeated error. No retry clears a recorded Stop,
+native refusal or human-needed barrier, or discards unpublished evidence.
 
 On an explicit CURRENT HUMAN continuation request, pass `unblock:true` with
 `resolution:{loop,text}` through the registered route, retaining the same native
@@ -241,6 +255,25 @@ validation turn is required.
 
 ## Native root process continuation
 
+`budget-exhausted` is a resumable workflow result, not a human-needed halt.
+On receiving it, the foreground automatically launches the SAME `pitako.execute`
+invocation as a NEW top-level run using the launch call above, with the same
+missionId/missionPath, root, sourceRefs, amendments and immutable snapshot.
+Do not ask the human, create a mission, change settings or use native `resume`:
+resume retains the exhausted `maxSubagentSpawnsPerRun` budget (default 64).
+Do not carry `unblock`/`resolution` as new input; the saved disposition already
+survives reentry. This relaunch is neither human continuation nor unblock authority.
+Recorded Stop/refusal and other human-needed barriers return unchanged without
+dispatch. The root uses ordinary frozen-source/digest/association admission and
+reconciles saved intentions, seals and retries; no admitted work or loop slot is
+repeated. Only keys proven unlaunched by the native admission rejection may launch.
+
+The root saves an O(1) progress marker (latest admitted seal, ledger count/head
+and last closed loop) at each `budget-exhausted` end. Repeated exhaustion without
+progress becomes a human-needed halt: one step needs more spawns than the
+per-run budget, requiring a change to `maxSubagentSpawnsPerRun` or the step.
+Progress permits another automatic relaunch. Per-seal archiving remains required.
+
 For an accidentally interrupted root, use the existing public operation in the
 same designated root, under its actual native policy:
 
@@ -253,7 +286,8 @@ running script itself. Keep the same missionId, missionPath, invocation, complet
 snapshot/source associations, admitted definitions/order, limit and consumed
 slots. A native successor process is not another execution invocation. Let its
 root reconcile saved state and pending operations; do not supervise tasks from
-the foreground or relaunch the registered resource as a replacement root.
+the foreground or relaunch the registered resource as a replacement root except
+for the explicit `budget-exhausted` result above.
 
 If management reports the root already resumed, follow the EXACT successor run
 reference actually returned or retained by that public operation. Observe that
@@ -275,7 +309,8 @@ Process continuation is distinct from `--unblock`: that input delivers the real
 human answer to the retained question/impediment in the same invocation. Keep its
 original loop and durable answer, do not repeat the completed director, reuse an
 old answer for a later question or spend the same slot twice. `--unblock` does
-not make an ineligible terminal native root resumable. A retained native launch
+not make an ineligible terminal native root resumable. Except for the explicit
+`budget-exhausted` top-level relaunch above, a retained native launch
 must still be resumed through a supported public operation; no helper supervisor,
 polling daemon or replacement root is introduced.
 
@@ -406,7 +441,8 @@ The package registers session-scoped `pitako.checkout-observer` through public
 `registerAgentViaEvents`, outside resolution, with an absolute executable and
 fixed package-owned `observe.mjs` args. No model, delegation, inherited
 conversation or configurable shell command is used. Conflicts/native rejections
-are errors, not overwrite or fallback. The observer ignores stdin, observes actual
+are errors, not overwrite or fallback. The observer consumes `{expected, body}`
+on stdin for verified ledger publication (never workspace selection), observes actual
 cwd via `designatedWorkspace`/`checkoutEvidence`, verifies physical identity and
 does not reread the full plan. All stdout is bounded before emission below the
 native 65,536-byte capture ceiling; failure is complete bounded JSON, not truncation.
@@ -536,7 +572,31 @@ outputPathMapping, artifactPaths and optional results[].structuredOutputPath.
 Distinguish binding JSON, optional native value and debug artifacts. Consume the
 original full structuredOutput, not previews. Cache at most the identical active
 plan when it fits the ENTIRE 256 KiB native state file. Essential snapshot/frozen
-descriptor/progress persistence failure halts dispatch; do not prune history.
+descriptor/progress persistence failure blocks unsafe dispatch.
+Closed-loop history goes to a verified ledger; superseded recovery data is
+archived then discarded. New runs use v4, with no migration of retained v2/v3.
+Keep current task/control progress and usage totals, not a closed-loop array.
+Full completed results live once per task; completed attempts reference them,
+while pending tasks retain the last result for continuation. Closing record
+bytes are rebuilt from immutable source fields, freezing mutable usage and
+resolution inputs. Archive each seal before discarding, and every consumed loop
+including gaps. Seals add one dispatch; fused closing adds none and retries
+unpublished output with `.checkout.r<n>`.
+
+Retain three-loop rings of rejection diagnostics, native closing references and
+bounded summaries. Reports, review/compliance and the director receive summaries
+plus `{ledgerPath, head}`. The publisher verifies through `ledger.mjs` and returns
+the last three loop summaries, instead of requiring a shell-less director to
+read the ledger itself. Further reads verify the chain against head; missing or
+altered records block. Inspectors remain limited to exact supplied references.
+`--unblock` looks in invocation resolutions, last closed disposition, then the
+open loop; older closed entries cannot resume or conflict. Repeated defects
+beyond three loops are not automatically detected. Reject duplicate completion
+at admission, not dependent dispatch. Loop-owned keys contain `.l<n>.`;
+pre-admission `inspect-initial` is the sole configured-host exemption.
+Self-resolvable failures retry automatically; halt only for human-needed
+conditions. Do not turn technical reconstruction into a new approval gate.
+Actual native Stop, permission, integrity and capacity barriers remain binding.
 Persist compact explicit result projections and exact refs, not whole child
 objects, prompts or reports disguised under allowed string fields.
 
@@ -652,7 +712,7 @@ arbitrary approvals or restart that erases consumed work is supported.
 
 The 256 KiB mission-state limit is global. Essential intention/evidence saves
 precede the operations they protect; failed saves block dispatch/advance without
-pruning history. No persistence after every Stop, fsync or permanent artifact
+discarding unpublished evidence. No persistence after every Stop, fsync or permanent artifact
 retention is promised.
 
 A persisted host reconstruction intention may repeat only the registered fixed

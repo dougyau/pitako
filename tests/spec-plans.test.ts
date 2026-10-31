@@ -47,7 +47,7 @@ describe("spec-plan discovery and concrete input", () => {
     }
   });
   function checkpoint(root: string): CheckpointIntent {
-    return { version: 1, association: { root, commonDir: designatedWorkspace(root).identity,
+    return { version: 2, association: { root, commonDir: designatedWorkspace(root).identity,
       missionId: "mission", missionPath: "/native/mission.json", invocation: "run",
       source: "/immutable/spec.md", digest: "a".repeat(64), maxCycles: 5, sourceRefs: [] },
       key: "run.l2.t2.a1", taskId: "unit", attempt: 1, loop: 2, cursor: 1,
@@ -270,7 +270,7 @@ describe("spec-plan discovery and concrete input", () => {
     const { base, main, sibling } = fixture();
     const installed = path.join(base, "install with ' quotes & %PATH% !", "node_modules", "pitako");
     // Copy only owned shipped resources; no dependency install, Pi loader or provider.
-    for (const file of ["package.json", "skills/execute/inspect.mjs", "skills/execute/loader.mjs", "skills/execute/inspect.ts",
+    for (const file of ["package.json", "skills/execute/inspect.mjs", "skills/execute/ledger.mjs", "skills/execute/loader.mjs", "skills/execute/inspect.ts",
       "extensions/spec-plans.ts", "extensions/execute-retained.ts", "extensions/execute-checkpoint.ts", "extensions/execute-state.ts", "extensions/board/workspace.ts", "extensions/board/paths.ts", "extensions/errors.ts"]) {
       const target = path.join(installed, file); mkdirSync(path.dirname(target), { recursive: true }); cpSync(path.resolve(file), target);
     }
