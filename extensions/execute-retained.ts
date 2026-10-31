@@ -39,7 +39,7 @@ function retainedProjection(root: string, source: string, digest: string, contex
 	// A failed pre-admission request has no originals. Legacy roots never acquire
 	// this delivery route, and a changed bound association is not recaptured.
 	if (bound && association === undefined) return undefined;
-	if (bound && (invocation.version !== 3 || invocation.admissionBinding !== bound.binding ||
+	if (bound && (invocation.version !== 4 || invocation.admissionBinding !== bound.binding ||
 		!record(association) || association.commonDir !== bound.commonDir ||
 		!isDeepStrictEqual(association.sourceRefs, context.sourceRefs)))
 		throw new Error("Retained recovery binding differs or predates bound admission. Preserve the original snapshot and native references; restore reliable exact bytes or inspect native state, never migrate or recapture this root.");
@@ -47,7 +47,7 @@ function retainedProjection(root: string, source: string, digest: string, contex
 		association.digest !== digest || association.invocation !== context.invocation ||
 		association.missionId !== context.missionId || association.missionPath !== context.missionPath)
 		throw new Error("Retained analysis association differs from the selected invocation.");
-	const loop = Array.isArray(invocation.loops) ? invocation.loops.at(-1) : undefined;
+	const loop = invocation.version === 4 ? invocation.loop : Array.isArray(invocation.loops) ? invocation.loops.at(-1) : undefined;
 	if (!record(loop) || !["director", "implementation", "review", "compliance"].includes(String(loop.phase))) return undefined;
 	const review = record(loop.review) ? loop.review : {};
 	const compliance = record(loop.compliance) ? loop.compliance : {};

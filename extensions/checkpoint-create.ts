@@ -38,20 +38,23 @@ export default function checkpointCreate(pi: ExtensionAPI): void {
         if (association.root !== ctx.cwd || typeof association.invocation !== "string" ||
             typeof association.missionPath !== "string") throw new Error("Checkpoint execution workspace mismatch.");
         const record = JSON.parse(readFileSync(executionStatePath(association), "utf8"))[`invoke-${association.invocation}`];
-        if (!record || record.version !== 3 || !equal(record.association, association))
+        if (!record || record.version !== 4 || !equal(record.association, association))
           throw new Error("Checkpoint durable association mismatch.");
-        const loop = record.loops?.at(-1), attempt = loop?.attempt;
+        const loop = record.loop, attempt = loop?.attempt;
         if (!loop || loop.phase !== "implementation" || loop.halt || record.outcome ||
             attempt?.key !== binding.key || attempt.index !== loop.cursor || attempt.result ||
             !["intention", "launched"].includes(attempt.stage) || loop.plan?.stage !== "admitted" ||
             loop.manifest?.[loop.cursor] !== attempt.taskId)
           throw new Error("Checkpoint execution is stale, stopped or not a pending writer unit.");
-        const intent: CheckpointIntent = { version: 1, association, key: attempt.key,
+        const intent: CheckpointIntent = { version: 2, association, key: attempt.key,
           taskId: attempt.taskId, attempt: attempt.number, loop: loop.number, cursor: loop.cursor,
           phase: "implementation", planRef: loop.plan.ref,
-          progress: { consumedLoops: record.loops.length, admittedResults: loop.results.map((item: any) => ({
-            taskId: item.taskId, attempt: item.attempt, status: item.status, ref: item.ref,
-          })) } };
+          progress: { consumedLoops: record.consumedLoops,
+            admitted: Object.fromEntries(Object.entries(record.tasks).filter(([, task]: [string, any]) => task.admitted.length)
+              .map(([id, task]: [string, any]) => [id, task.admitted])),
+            previous: record.lastConfirmed?.kind === "unit" && record.lastConfirmed.position.loop === loop.number
+              ? (({ taskId, attempt, resultRef, checkpointRef, digest }) =>
+                ({ taskId, attempt, resultRef, checkpointRef, digest }))(record.lastConfirmed) : null } };
         if (!equal(attempt.checkpoint, intent)) throw new Error("Checkpoint intention/progress differs from durable execution context.");
         signal?.throwIfAborted();
         result = createCheckpoint(intent, input.kind, input.paths, signal);

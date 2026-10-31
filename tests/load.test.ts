@@ -61,7 +61,15 @@ function observerRegistrationEvents() {
     emit(event: string, request: RuntimeAgentRegistrationRequest) {
       expect(event).toBe(RUNTIME_AGENT_REGISTER_EVENT);
       expect(request.version).toBe(1);
-      expect(request.name).toBe("pitako.checkout-observer");
+      const script = { "pitako.checkout-observer": "observe.mjs", "pitako.execution-ledger": "ledger.mjs" }[request.name];
+      expect(script).toBeDefined();
+      expect(request.definition).toMatchObject({
+        tools: [], allowNestedSubagents: false, systemPromptMode: "replace",
+        inheritProjectContext: false, inheritGlobalContext: false, inheritSkills: false,
+        defaultContext: "fresh", defaultAsync: false,
+      });
+      expect(request.definition.runner).toEqual({ type: "external-cli", command: process.execPath,
+        args: [path.join(packageRoot(), "skills/execute", script!)], promptDelivery: "stdin" });
       expect(active.has(request.name)).toBe(false);
       active.add(request.name);
       request.result = { ok: true, registration: { dispose() {

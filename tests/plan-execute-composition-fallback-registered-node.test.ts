@@ -58,7 +58,7 @@ describe("plan/execute packaged composition", () => {
         let interrupted: any, cut = false, restores = 0, beforeRestore = "", originalManifest = "";
         const retainedMode = input.mode.startsWith("retained-");
         const statusCalls: string[] = [];
-        const restoreAuthorities: any[] = [];
+        const restoreAuthorities: any[] = [], archives: any[] = [];
         const file = (name: string) => input.root + "/" + name;
         const candidate = () => { const { head, fingerprint } = io.checkoutEvidence(input.root); return { head, fingerprint }; };
         // Load owned functions once in this private Node process. Repeated loader
@@ -70,14 +70,14 @@ describe("plan/execute packaged composition", () => {
           state: { get: (key: string) => structuredClone(storage.get(key)), set: (key: string, value: any) => {
             storage.set(key, structuredClone(value));
             io.writeFileSync(input.statePath, JSON.stringify(Object.fromEntries(storage)));
-            if (!cut && (["intention-cut", "stale-producer"].includes(input.mode) && value.loops?.[0]?.attempt?.restore?.undispatched ||
-                input.mode === "dispatch-intention-cut" && value.loops?.[0]?.attempt?.restore &&
-                  !value.loops[0].attempt.restore.undispatched && !value.loops[0].attempt.launch ||
-                input.mode === "query-admission-cut" && value.loops?.[0]?.recoveries?.[0]?.stage === "observed" ||
-                input.mode === "result-cut" && value.loops?.[0]?.attempt?.restore && value.loops[0].attempt.stage === "result" ||
-                ["retained-permission-accepted-cut", "retained-stop-observer-permission-accepted-cut"].includes(input.mode) && value.loops?.[0]?.resolutions?.[0]?.stage === "accepted" ||
-                input.mode === "retained-stop-observer-permission-observed-cut" && value.loops?.[0]?.resolutions?.[0]?.currentBarrier?.cause === "native permission denial" ||
-                input.mode === "retained-stop-input-applied-cut" && value.loops?.[0]?.resolutions?.[0]?.stage === "applied" && !value.loops[0].halt)) {
+            if (!cut && (["intention-cut", "stale-producer"].includes(input.mode) && value.loop?.attempt?.restore?.undispatched ||
+                input.mode === "dispatch-intention-cut" && value.loop?.attempt?.restore &&
+                  !value.loop.attempt.restore.undispatched && !value.loop.attempt.launch ||
+                input.mode === "query-admission-cut" && value.loop?.recoveries?.[0]?.stage === "observed" ||
+                input.mode === "result-cut" && value.loop?.attempt?.restore && value.loop.attempt.stage === "result" ||
+                ["retained-permission-accepted-cut", "retained-stop-observer-permission-accepted-cut"].includes(input.mode) && value.loop?.resolutions?.[0]?.stage === "accepted" ||
+                input.mode === "retained-stop-observer-permission-observed-cut" && value.loop?.resolutions?.[0]?.currentBarrier?.cause === "native permission denial" ||
+                input.mode === "retained-stop-input-applied-cut" && value.loop?.resolutions?.[0]?.stage === "applied" && !value.loop.halt)) {
               cut = true; throw Error("Controlled post-save fallback cut");
             }
           } },
@@ -115,6 +115,7 @@ describe("plan/execute packaged composition", () => {
             throw Error("No exact controlled producer " + ref);
           },
           launch: async (key: string, request: any) => {
+            if (request.agent === "pitako.execution-ledger") archives.push(JSON.parse(request.task).record);
             calls.push(key);
             if (request.resume && key.includes(".t1.")) throw Error("Non-resumable producer must not be resumed");
             if (key.endsWith(".director")) return director(key);
@@ -124,7 +125,7 @@ describe("plan/execute packaged composition", () => {
             const needsCandidate = request.agent === "pitako.checkout-observer" || key.endsWith(".compliance") || request.agent === "pitako.worker" && key.includes(".t2.");
             const result = response(key, request, input.metadata, needsCandidate ? candidate() : undefined);
             if (request.agent === "pitako.worker" && key.endsWith(".t1.a1")) {
-              const intent = storage.get("invoke-human-1").loops[0].attempt.checkpoint;
+              const intent = storage.get("invoke-human-1").loop.attempt.checkpoint;
               if (input.mode !== "missing") {
                 const checkpoint = await loadCheckpoint(request, input.root, io.loadExtensions, input.toolModule, key).catch((error: unknown) => { console.error(error); throw error; });
                 const capture = await checkpoint("pre", ["owned"]);
@@ -149,23 +150,23 @@ describe("plan/execute packaged composition", () => {
               return structuredClone(interrupted);
             }
             if (request.agent === "pitako.worker" && /\.t1\.a[23]$/.test(key)) {
-              const attempt = storage.get("invoke-human-1").loops[0].attempt;
+              const attempt = storage.get("invoke-human-1").loop.attempt;
               const restore = attempt.restore;
               if (["retained-stop-new-stop", "retained-stop-new-permission"].includes(input.mode))
                 return { ...result, ok: false, structuredOutput: undefined,
                   ...(input.mode.endsWith("new-stop") ? { stopped: true } : { error: "Blocked by pi-subagents permission rule: replacement denied." }) };
-              if (!request.task.includes(JSON.stringify(restore))) throw Error("Missing exact fallback delivery");
+              if (!request.task.includes(`"sourceKeys":${JSON.stringify(restore.sourceKeys)}`)) throw Error("Missing exact fallback delivery");
               beforeRestore = io.readFileSync(file("owned"), "utf8");
               restoreAuthorities.push(structuredClone(restore.authority));
               let restored: any;
-              try { restored = JSON.parse(helper("restore", { intent: restore.checkpoint, authority: restore.authority })); }
+              try { restored = JSON.parse(helper("restore", { intent: restore.sourceKeys.map((key: string) => storage.get("invoke-human-1").taskFrame.sources.find((source: any) => source.key === key)), authority: restore.authority })); }
               catch (error) { return { ...result, ok: true, structuredOutput: { ...result.structuredOutput, taskId: "unit", attempt: attempt.number,
                 status: "blocked", diagnosis: "Checkpoint restore not performed: " + String(error), candidate: candidate(),
                 git: { head: candidate().head, checkpoints: [], wip: "Foreign bytes retained" } } }; }
               restores++;
               if (io.readFileSync(file("owned"), "utf8") !== "prior owned WIP") throw Error("Earlier WIP not restored");
               // Replay helper before later work is idempotent, and retains original partial bytes.
-              helper("restore", { intent: restore.checkpoint, authority: restore.authority });
+              helper("restore", { intent: restore.sourceKeys.map((key: string) => storage.get("invoke-human-1").taskFrame.sources.find((source: any) => source.key === key)), authority: restore.authority });
               const checkpoint = await loadCheckpoint(request, input.root, io.loadExtensions, input.toolModule, key).catch((error: unknown) => { console.error(error); throw error; });
               await checkpoint("pre", ["owned"]);
               if (key.endsWith(".t1.a2") && ["successor-capture-cut", "corrupt-successor"].includes(input.mode)) {
@@ -208,7 +209,7 @@ describe("plan/execute packaged composition", () => {
         const second = cut || retainedMode || ["later-stop-input", "successor-capture-cut", "corrupt-successor"].includes(input.mode) ? await run({ ...options, script: continuationScript } as any) : null;
         const secondRetained = structuredClone(storage.get("invoke-human-1"));
         const third = retainedMode && (cut || input.mode.includes("-new-") || input.mode.startsWith("retained-stop-observer-permission")) ? await run(options as any) : null;
-        return { first: first.value, second: second?.value, third: third?.value, firstRetained, secondRetained, statusCalls, calls, restores, beforeRestore, observations, restoreAuthorities,
+        return { archives, first: first.value, second: second?.value, third: third?.value, firstRetained, secondRetained, statusCalls, calls, restores, beforeRestore, observations, restoreAuthorities,
           witnesses, retained: storage.get("invoke-human-1"), owned: io.readFileSync(file("owned"), "utf8"), earlier: io.readFileSync(file("earlier"), "utf8"), originalManifest };
       };
       const observation = await nativeCheckpointCase(input, harness.toString());
@@ -246,17 +247,18 @@ describe("plan/execute packaged composition", () => {
           expect(actual.calls).toContain("invoke-human-1.l1.t2.a1"); expect(actual.calls).toContain("invoke-human-1.l1.compliance");
           expect(actual.calls.some((key: string) => key.includes(".review."))).toBe(true);
           const repeat = ["dispatch-intention-cut", "successor-capture-cut"].includes(mode);
-          expect(actual.retained.loops[0].interruptions).toHaveLength(repeat ? 2 : 1);
-          expect(actual.retained.loops[0].results.map((entry: any) => [entry.taskId, entry.attempt])).toEqual([["unit", repeat ? 3 : 2], ["final", 1]]);
+          expect(actual.archives.at(-1).body.frame.operations).toHaveLength(repeat ? 2 : 1);
+          expect(actual.retained.taskFrame).toBeNull();
+          expect(actual.retained.loop.results.map((entry: any) => [entry.taskId, entry.attempt])).toEqual([["unit", repeat ? 3 : 2], ["final", 1]]);
           if (repeat) {
-            const restored = actual.retained.loops[0].results[0].restore.receipt;
+            const restored = actual.retained.tasks.unit.completed.restore.receipt;
             expect(restored.checkpointRef).toContain(mode === "dispatch-intention-cut" ? ".t1.a1/manifest.json" : ".t1.a2/manifest.json");
           }
           const partial = JSON.parse(JSON.parse(readFileSync(actual.originalManifest.replace("manifest.json", "restore.json"), "utf8")).data);
           expect(Buffer.from(partial.partial[0].image.bytes, "base64").toString()).toBe("partial pending work");
         } else expect(actual.calls).not.toContain("invoke-human-1.l1.compliance");
         if (mode.startsWith("retained-")) {
-          const firstLoop = actual.firstRetained.loops[0], finalLoop = actual.retained.loops[0];
+          const firstLoop = actual.firstRetained.loop, finalLoop = actual.retained.loop;
           if (mode !== "retained-unknown") expect(firstLoop.halt).toMatchObject({ code: "native-barrier",
             cause: mode.startsWith("retained-permission") ? "native permission denial" : "stopped" });
           if (!success) {
@@ -268,7 +270,7 @@ describe("plan/execute packaged composition", () => {
             expect(existsSync(actual.originalManifest.replace("manifest.json", "restore.json"))).toBe(false);
           }
           if (mode === "retained-permission-accepted-cut")
-            expect(actual.secondRetained.loops[0]).toMatchObject({ halt: { cause: "native permission denial" }, resolutions: [{ stage: "accepted" }] });
+            expect(actual.secondRetained.loop).toMatchObject({ halt: { cause: "native permission denial" }, resolutions: [{ stage: "accepted" }] });
           if (mode.includes("-new-") || mode.startsWith("retained-stop-observer-permission"))
             expect(finalLoop.resolutions[0].currentBarrier.cause).toBe(mode.includes("permission") ? "native permission denial" : "stopped");
         }
@@ -290,7 +292,7 @@ describe("plan/execute packaged composition", () => {
     const storage = new Map<string, any>(), calls: string[] = [];
     const operation = runWorkflowScript({ script: resource.script,
       state: { get: (key: string) => structuredClone(storage.get(key)), set: (key: string, value: any) => {
-        if (value.loops?.some((loop: any) => loop.attempt?.checkpoint)) throw Error("checkpoint intention persistence unavailable");
+        if (value.loop?.attempt?.checkpoint) throw Error("checkpoint intention persistence unavailable");
         storage.set(key, structuredClone(value));
       } },
       host: async (key: string) => ({ key, kind: "command" as const, state: "passed" as const, ok: true, exitCode: 0,
@@ -307,7 +309,7 @@ describe("plan/execute packaged composition", () => {
     expect((result.value as any).status).toBe("partial");
     expect((result.value as any).reason).toContain("persistence");
     expect(calls).toEqual(["invoke-human-1.l1.director"]);
-    expect(storage.get("invoke-human-1").loops).toHaveLength(1);
+    expect(storage.get("invoke-human-1").consumedLoops).toBe(1);
   });
 });
 
@@ -325,7 +327,7 @@ describe("plan/execute packaged composition", () => {
       root, id: "assignment", invocation: "human-1", missionId: "native.mission-1", missionPath });
     const grants = new Map(resource.hostCommands.map(grant => [grant.key, grant.command]));
     const storage = new Map<string, any>(), calls: string[] = [];
-    let intention: any, checkpointRef = "", beforeRestore: any, restoreReceipt: any;
+    let intention: any, checkpointRef = "", beforeRestore: any, restoreReceipt: any, archivedFrame: any;
     const observedCandidate = () => { const { head, fingerprint } = checkoutEvidence(root); return { head, fingerprint }; };
     const helper = path.resolve("skills/execute/checkpoint.mjs"), request = path.join(nativeRoot, "request.json");
     const invoke = (operation: string, data: any) => {
@@ -343,6 +345,7 @@ describe("plan/execute packaged composition", () => {
         stderr: "", outputPath: path.join(nativeRoot, key + ".log"), durationMs: 0 }),
       launch: async (key: string, request: any) => {
         calls.push(key);
+        if (request.agent === "pitako.execution-ledger") archivedFrame = JSON.parse(request.task).record.body.frame;
         if (request.agent === "pitako.worker" && request.resume) return { key, ok: false, output: "Controlled native resume unavailable",
           error: "Controlled native resume unavailable", artifactPaths: [] };
         const response = childResponse(key, request, metadata, observedCandidate());
@@ -358,7 +361,7 @@ describe("plan/execute packaged composition", () => {
           const descriptor = JSON.parse(request.task.split("FROZEN ATTEMPT:\n")[1].split("\n")[0]);
           if (descriptor.restore) {
             expect(descriptor.restore.authority.activeWriter).toBeNull();
-            restoreReceipt = JSON.parse(invoke("restore", { intent: descriptor.restore.checkpoint, authority: descriptor.restore.authority }));
+            restoreReceipt = JSON.parse(invoke("restore", { intent: descriptor.restore.sourceKeys.map((key: string) => storage.get("invoke-human-1").taskFrame.sources.find((source: any) => source.key === key)), authority: descriptor.restore.authority }));
             expect(readFileSync(path.join(root, "owned"), "utf8")).toBe("valid prior WIP");
             expect(readFileSync(path.join(root, "deleted"), "utf8")).toBe("prior deletion target");
             expect(existsSync(path.join(root, "new"))).toBe(false);
@@ -376,7 +379,7 @@ describe("plan/execute packaged composition", () => {
             return response;
           }
           const stored = structuredClone(storage.get("invoke-human-1"));
-          intention = stored.loops[0].attempt.checkpoint;
+          intention = stored.loop.attempt.checkpoint;
           expect(intention).toMatchObject({ taskId: "unit", loop: 1, cursor: 0, phase: "implementation" });
           expect(intention.association).toEqual(stored.association);
           expect(request.task).toContain(JSON.stringify(intention));
@@ -412,15 +415,16 @@ describe("plan/execute packaged composition", () => {
     expect(existsSync(path.join(root, "new"))).toBe(false);
     expect(readFileSync(path.join(root, "earlier"), "utf8")).toBe("valid earlier WIP");
     expect(persisted.association).toEqual(beforeRestore.association);
-    expect(persisted.loops).toHaveLength(1);
-    expect(persisted.loops[0].cursor).toBe(2);
-    expect(persisted.loops[0].results.filter((result: any) => result.status === "complete")).toHaveLength(2);
-    expect(persisted.loops[0].interruptions[0].checkpoint).toEqual(intention);
+    expect(persisted.consumedLoops).toBe(1);
+    expect(persisted.loop.cursor).toBe(2);
+    expect(persisted.loop.results.filter((result: any) => persisted.tasks[result.taskId].completed?.attempt === result.attempt)).toHaveLength(2);
+    expect(archivedFrame.sources.find((source: any) => source.key === intention.key)).toEqual(intention);
+    expect(persisted.taskFrame).toBeNull();
     expect(calls.filter(key => /\.t\d+\.a\d+$/.test(key))).toHaveLength(3);
     expect(calls).toContain("invoke-human-1.l1.t2.a1");
     expect(calls).toContain("invoke-human-1.l1.review.director-synthesis");
     expect(calls).toContain("invoke-human-1.l1.compliance");
-    expect(resource.hostCommands).toHaveLength(1);
+    expect(resource.hostCommands).toHaveLength(3);
   });
 
   test.each(["complete", "recovered", "unresolved-plan", "rejected-plan", "needs-decision", "mismatched-association", "stopped", "permission",
@@ -442,7 +446,7 @@ describe("plan/execute packaged composition", () => {
       const metadata = { root, commonDir: path.join(root, ".git"), candidates: [],
         selected: { source: `${root}/.pitako/plans/assignment.md`, digest: digest(content), chunks: 1 } };
       const storage = new Map<string, any>(), children: Record<string, any> = {}, hosts: Record<string, any> = {};
-      const calls: string[] = [], inspections: string[] = [], originals: any[] = [];
+      const calls: string[] = [], inspections: string[] = [], originals: any[] = [], publications: any[] = [];
       let recoveredWorker: any;
       const permission = "Blocked by pi-subagents permission rule: 'run' is denied.";
       const hostTarget = !mode.startsWith("host-") ? null : mode.includes("-capture-") ? "input-0"
@@ -463,6 +467,7 @@ describe("plan/execute packaged composition", () => {
         } },
         launch: async (key, request) => {
           calls.push(key);
+          if (request.agent === "pitako.checkout-observer") publications.push(JSON.parse(String(request.task)));
           const response = request.agent === "pitako.execution-inspector"
             ? { key, ok: true, output: "", runId: `native-${key}`, agent: request.agent, artifactPaths: [],
               structuredOutput: { status: "recovered", reason: "Exact settled original recovered without edits",
@@ -493,7 +498,7 @@ describe("plan/execute packaged composition", () => {
             });
           }
           if (request.agent === "pitako.execution-inspector" && mode !== "unresolved-plan") {
-            expect(storage.get("invoke-human-1").loops[0].recoveries[0]).toMatchObject({
+            expect(storage.get("invoke-human-1").loop.recoveries[0]).toMatchObject({
               stage: "intention", subject: "attempt-result:final:1",
             });
             expect(request.task).toContain("specific scope/effects expansion needed");
@@ -520,10 +525,8 @@ describe("plan/execute packaged composition", () => {
             if (mode === "rejected-plan") {
               if (plan.association.loop === 1) plan.tasks[0].dependsOn = [{ taskId: "missing", reason: "Requires missing output" }];
               else {
-                expect(storage.get("invoke-human-1").loops[0]).toMatchObject({
-                  outcome: "gaps", plan: { stage: "rejected", rejection: { ref: { runId: "native-invoke-human-1.l1.director" } } },
-                });
-                expect(request.task).toContain("Publish a NEW complete plan");
+                expect(storage.get("invoke-human-1").planRejections).toEqual([{ loop: 1, diagnostic: expect.stringContaining("loop_plan dependencies require") }]);
+                expect(request.task).toContain("VERIFIED RETAINED LOOP SUMMARIES");
                 expect(request.task).toContain("loop_plan dependencies require");
               }
             }
@@ -547,12 +550,13 @@ describe("plan/execute packaged composition", () => {
           return hostFailure(key, response);
         },
       });
-      expect(expected.value).toMatchObject({ status: ["complete", "recovered", "rejected-plan"].includes(mode) ? "complete" : mode === "stopped" || mode.endsWith("-stop") ? "cancelled" : "blocked",
-        ...hostTarget ? { status: "blocked" } : {},
-        loopsConsumed: hostTarget && hostTarget !== "inspect-loop-1" ? 0 : ["complete", "rejected-plan"].includes(mode) ? 2 : 1 });
+      const recoveredHost = mode === "host-opening-timeout";
+      expect(expected.value).toMatchObject({ status: ["complete", "recovered", "rejected-plan"].includes(mode) || recoveredHost ? "complete" : mode === "stopped" || mode.endsWith("-stop") ? "cancelled" : "blocked",
+        ...hostTarget && !recoveredHost ? { status: "blocked" } : {},
+        loopsConsumed: recoveredHost ? 2 : hostTarget && hostTarget !== "inspect-loop-1" ? 0 : ["complete", "rejected-plan"].includes(mode) ? 2 : 1 });
       expect(calls).toHaveLength(analysisTarget ? mode.includes("-prepare-") ? 3 : mode.includes("-later-") ? 5 : 7
-        : hostTarget ? hostTarget === "inspect-loop-1" ? 7 : 0
-        : mode === "complete" ? 16 : mode === "recovered" ? 9 : mode === "rejected-plan" ? 9 : ["stopped", "permission", "unresolved-plan"].includes(mode) ? 2 : 1);
+        : recoveredHost ? 16 : hostTarget ? hostTarget === "inspect-loop-1" ? 7 : 0
+        : mode === "complete" ? 16 : mode === "recovered" ? 9 : mode === "rejected-plan" ? 10 : ["stopped", "permission", "unresolved-plan"].includes(mode) ? 2 : 1);
       if (ambiguousHost) {
         expect((expected.value as any).reason).toContain("ambiguous");
         expect((expected.value as any).action.actor).toBe(mode.endsWith("persistence-failure") ? "persistence operator" : "native run operator");
@@ -560,17 +564,20 @@ describe("plan/execute packaged composition", () => {
         if (mode.endsWith("persistence-failure")) expect((expected.value as any).reason).toContain("could not be retained");
         else expect(storage.get("invoke-human-1").hostHalt).toMatchObject({ ref: { key: hostTarget },
           observedError: `Host command '${hostTarget}' failed: Command stopped because the workflow was aborted.` });
+      } else if (recoveredHost) {
+        expect(inspections).toEqual(["inspect-initial", "inspect-initial.r1"]);
+        expect(storage.get("invoke-human-1").hostHalt).toBeUndefined();
       } else if (hostTarget) expect(storage.get("invoke-human-1")?.hostHalt).toMatchObject({ ref: { key: hostTarget } });
       if (mode === "unresolved-plan") {
         expect(expected.value).toMatchObject({ reason: expect.stringContaining("Expansion needed: read access"),
           action: { actor: "evidence owner", started: false } });
-        expect(storage.get("invoke-human-1").loops[0].recoveries[0].disposition).toBe("unresolved");
+        expect(storage.get("invoke-human-1").loop.recoveries[0].disposition).toBe("unresolved");
         expect(calls).toEqual(["invoke-human-1.l1.director", "invoke-human-1.l1.recover1"]);
       }
       if (mode === "recovered") {
-        const recovered = storage.get("invoke-human-1").loops[0];
-        expect(recovered.recoveries[0]).toMatchObject({ stage: "observed", disposition: "recovered" });
-        expect(recovered.results[0].checks).toMatchObject({ current: true, failed: 1, notRun: 1 });
+        const recovered = storage.get("invoke-human-1").loop;
+        expect(publications[0].body.record.body.recoveries[0]).toMatchObject({ stage: "observed", disposition: "recovered" });
+        expect(storage.get("invoke-human-1").tasks.final.completed.checks).toMatchObject({ current: true, failed: 1, notRun: 1 });
         expect(calls.filter(key => key.includes(".recover"))).toHaveLength(1);
         expect(calls.indexOf("invoke-human-1.l1.review.director-prepare")).toBeGreaterThan(calls.indexOf("invoke-human-1.l1.recover1"));
       }
@@ -645,7 +652,7 @@ describe("plan/execute packaged composition", () => {
         expect(exit, errors).toBe(0);
         const actual = JSON.parse(output);
         expect(actual.value).toMatchObject({ status: (expected.value as any).status, reason: (expected.value as any).reason,
-          loopsConsumed: hostTarget && hostTarget !== "inspect-loop-1" ? 0 : ["complete", "rejected-plan"].includes(mode) ? 2 : 1 });
+          loopsConsumed: (expected.value as any).loopsConsumed });
         expect(actual.calls).toEqual(calls);
         if (ambiguousHost && !mode.endsWith("persistence-failure")) {
           expect(actual.repeated).toMatchObject({ status: "blocked", loopsConsumed: (expected.value as any).loopsConsumed });
@@ -688,7 +695,7 @@ describe("plan/execute packaged composition", () => {
       if (!resolved.ok) throw Error(resolved.error);
       const permit = consumeWorkflowResourcePermit(resolved.resource.permit, resolved.resource.script);
       if (typeof permit === "string") throw Error(permit);
-      expect(permit.authority.host).toHaveLength(1);
+      expect(permit.authority.host).toHaveLength(3);
       expect(permit.authority.host![0]!.key).toBe("inspect-initial");
       const metadata = { root, commonDir: spec.commonDir, selected: { source: spec.source, digest: digest(content) } };
       const child = Bun.spawn(["node", "--disable-warning=ExperimentalWarning", "-e", `
@@ -697,9 +704,9 @@ describe("plan/execute packaged composition", () => {
           const input=JSON.parse(fs.readFileSync(0,"utf8"));
           const {runWorkflowScript}=await import(input.runner);
           const respond=eval("("+input.response+")");
-          const storage=new Map(),calls=[],hosts=[],originals=new Map();let checkout=input.checkout;
+          const storage=new Map(),calls=[],hosts=[],originals=new Map(),closings=new Map();let checkout=input.checkout;
           if(input.mode==="legacy") storage.set("invoke-human-1",{version:2,association:{...input.metadata,invocation:"human-1"},snapshot:{content:input.content},loops:[]});
-          const options={script:input.script,state:{get:key=>structuredClone(storage.get(key)),set:(key,value)=>storage.set(key,structuredClone(value))},
+          const options={script:input.script,state:{get:key=>structuredClone(storage.get(key)),set:(key,value)=>{storage.set(key,structuredClone(value));if(value.loop?.closing)closings.set(value.loop.number,structuredClone(value.loop));}},
             status:async key=>originals.get(key),
             host:async(key,params)=>{
               if(key!==input.grant.key || params.command!==input.grant.command)throw Error("Unexpected host operation "+key);
@@ -728,7 +735,7 @@ describe("plan/execute packaged composition", () => {
             fs.writeFileSync(input.global+"/settings.json",'{"pitako":{"execute":{"maxCycles":false}}}');
             second=await runWorkflowScript(options);
           }
-          console.log(JSON.stringify({first:first.value,second:second?.value,calls,hosts,saved:storage.get("invoke-human-1")}));
+          console.log(JSON.stringify({first:first.value,second:second?.value,calls,hosts,closings:[...closings.values()],saved:storage.get("invoke-human-1")}));
         })().catch(error=>{console.error(error);process.exitCode=1;});
       `], { cwd: root, env: { ...process.env, PI_CODING_AGENT_DIR: global }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
       const identity = checkoutEvidence(root);
@@ -739,10 +746,10 @@ describe("plan/execute packaged composition", () => {
         expect(observed.first).toMatchObject({ status: success ? "complete" : mode === "stop" ? "cancelled" : ["exhausted", "capacity"].includes(mode) ? "partial" : "blocked",
           loopsConsumed: early ? 0 : success ? 8 : mode === "exhausted" ? 10 : 7 });
         expect(observed.hosts).toHaveLength(mode === "legacy" ? 0 : mode === "reentry" ? 2 : 1);
-        const closing = saved?.loops?.filter((loop: any) => loop.closing) ?? [];
+        const closing = observed.closings;
         expect(closing).toHaveLength(early ? 0 : success ? 8 : mode === "exhausted" ? 10 : 6);
         if (!early) {
-          expect(saved.association.maxCycles).toBe(10); expect(saved.snapshot.content).toBe(content);
+          expect(saved.association.maxCycles).toBe(10); expect(saved.association.digest).toBe(digest(content));
           expect(new Set(closing.map((loop: any) => loop.closing.ref.asyncDir)).size).toBe(closing.length);
           for (const loop of closing) {
             expect(loop.closing.ref.key).toBe(`invoke-human-1.l${loop.number}.checkout`);
@@ -857,17 +864,17 @@ test.each(["complete", "receipt-save-cut", "result-save-cut", "cursor-save-cut",
           const resumeKey = "invoke-human-1.l1.t1.a1.resume";
           const options = { script: input.script,
             state: { get: key => structuredClone(storage.get(key)), set: (key, value) => {
-              const attempt = value.loops?.[0]?.attempt;
+              const attempt = value.loop?.attempt;
               if (cut && ((attempt?.nativeContinuation?.stage === "receipt" &&
                   (input.mode === "receipt-save-cut" || (input.mode === "result-save-cut" && attempt.stage === "result"))) ||
-                  (input.mode === "cursor-save-cut" && value.loops?.[0]?.cursor === 1))) throw Error("Controlled continuation save cut");
+                  (input.mode === "cursor-save-cut" && value.loop?.cursor === 1))) throw Error("Controlled continuation save cut");
               storage.set(key, structuredClone(value));
             } },
             launch: async (key, params) => {
               if (key.endsWith(".t2.a1")) {
                 const stored = storage.get("invoke-human-1");
-                const first = stored.loops[0].results[0];
-                if (stored.loops[0].cursor !== 1 || first.status !== "complete" || first.ref.runId !== "exact-successor")
+                const first = stored.tasks.repair.completed;
+                if (stored.loop.cursor !== 1 || first.status !== "complete" || first.ref.runId !== "exact-successor")
                   throw Error("Next task dispatched before durable resumed-result admission");
                 const refs = JSON.parse(params.task.split("DIRECT PREREQUISITE COMPLETED RESULTS (historical references, not current check evidence):\\n")[1].split("\\n")[0]);
                 if (refs[0]?.taskId !== "repair" || refs[0]?.ref?.runId !== "exact-successor") throw Error("Wrong prerequisite successor");
@@ -911,7 +918,7 @@ test.each(["complete", "receipt-save-cut", "result-save-cut", "cursor-save-cut",
     const observed = JSON.parse(output);
     expect(observed.calls.filter((call: any) => call.key.endsWith(".resume"))).toHaveLength(1);
     expect(observed.calls.filter((call: any) => call.key.endsWith(".t1.a1"))).toHaveLength(1);
-    expect(observed.invocation.loops).toHaveLength(1);
+    expect(observed.invocation.consumedLoops).toBe(1);
     expect(observed.calls.some((call: any) => call.key.includes(".restore"))).toBe(false);
     expect(readFileSync(path.join(root, "owned"), "utf8")).toBe("Existing interrupted-unit WIP");
     if (mode === "pending") {
@@ -923,11 +930,12 @@ test.each(["complete", "receipt-save-cut", "result-save-cut", "cursor-save-cut",
       expect(observed.calls.filter((call: any) => call.key.endsWith(".t2.a1"))).toHaveLength(1);
       expect(observed.calls.filter((call: any) => call.key.endsWith("director-synthesis"))).toHaveLength(1);
       expect(observed.calls.filter((call: any) => call.key.endsWith(".compliance"))).toHaveLength(1);
-      expect(observed.invocation.loops[0].cursor).toBe(2);
-      expect(observed.invocation.loops[0].results.map((result: any) => [result.taskId, result.status, result.attempt]))
+      expect(observed.invocation.loop.cursor).toBe(2);
+      expect(observed.invocation.loop.results.map((result: any) => observed.invocation.tasks[result.taskId].completed)
+        .map((result: any) => [result.taskId, result.status, result.attempt]))
         .toEqual([["repair", "complete", 1], ["final", "complete", 1]]);
       if (mode !== "complete") expect(observed.third.status).toBe("complete");
-      expect(observed.invocation.loops[0].results[0].ref).toMatchObject({ runId: "exact-successor",
+      expect(observed.invocation.tasks.repair.completed.ref).toMatchObject({ runId: "exact-successor",
         resumedFrom: {runId: "native-invoke-human-1.l1.t1.a1"} });
     }
   });
@@ -994,7 +1002,7 @@ test("registered Node public root resume consumes durable results and closes the
       let cut = false;
       const seeded = await runWorkflowScript({script, ...boundary, state:{get:key=>state.get(key),set:(key,value)=>{
         state.set(key,value);
-        if (!cut && value.loops?.[0]?.attempt?.stage === "result") {cut=true;throw Error("Controlled root interruption after durable result");}
+        if (!cut && value.loop?.attempt?.stage === "result") {cut=true;throw Error("Controlled root interruption after durable result");}
       }}});
       if (!cut) throw Error("Did not reach durable cut");
       const before = JSON.parse(fs.readFileSync(statePath,"utf8"))["invoke-human-1"];
@@ -1035,14 +1043,14 @@ test("registered Node public root resume consumes durable results and closes the
   expect(exit,errors).toBe(0);
   expect(errors).not.toContain("unawaited runs.run launch(es)");
   const observed = JSON.parse(output);
-  expect(observed.before.loops[0].attempt.stage).toBe("result");
-  expect(observed.final.loops[0].outcome, JSON.stringify(observed.successor.workflow.value)).toBe("complete");
+  expect(observed.before.loop.attempt.stage).toBe("result");
+  expect(observed.final.loop.outcome, JSON.stringify(observed.successor.workflow.value)).toBe("complete");
   expect(observed.final.association.maxCycles).toBe(3);
   expect(observed.successor.state).toBe("complete");
   expect(observed.successor.workflow.value.invocation).toBe("human-1");
   expect(observed.successor.workflow.value.loopsConsumed).toBe(1);
-  expect(observed.final.loops).toHaveLength(1);
-  expect(observed.final.loops[0].cursor).toBe(1);
+  expect(observed.final.consumedLoops).toBe(1);
+  expect(observed.final.loop.cursor).toBe(1);
   expect(observed.calls.filter((key:string)=>key.endsWith(".t1.a1"))).toHaveLength(1);
   expect(observed.calls.filter((key:string)=>key.endsWith("director-synthesis"))).toHaveLength(1);
   expect(observed.calls.filter((key:string)=>key.endsWith(".compliance"))).toHaveLength(1);

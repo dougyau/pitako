@@ -293,7 +293,38 @@ structuredOutput, not previews or invented paths. Store compact explicit result
 projections, not full child objects/prompts/reports under allowed string fields.
 Snapshot/frozen descriptor/progress are essential; failure to persist halts new
 dispatch. Cache at most one identical active plan if it fits the entire 256 KiB
-native state file. Do not delete history to make room.
+native state file. Closed-loop history goes to a verified ledger; superseded
+recovery data is archived then discarded. New runs use v4; retained v2/v3 runs
+are neither replayed nor migrated.
+
+Native state retains only current control/progress, full admitted task results,
+usage totals and three-loop rings of plan-rejection diagnostics, close-native
+references and bounded loop summaries. Completed attempts point to their task's
+single full result; `last` is only needed for pending continuation. Closing
+rebuilds its deterministic record from immutable source fields, freezing only
+usage and resolutions that may change during publication/reentry.
+Every seal publishes before discarding recovery data. Every consumed loop,
+including a gaps final, has a ledger record anchored by native `{count, head}`.
+The close observer verifies, observes and publishes in one spawn; an unpublished
+close retries with `.checkout.r<n>`. Seals cost one additional child dispatch.
+
+Reports, review/compliance and the director receive retained summaries plus
+`{ledgerPath, head}`. The publisher verifies the chain with `ledger.mjs` and
+returns the last three bounded loop summaries. This replaces direct director
+ledger reads because the director has no shell. Further reads must verify
+against that head; missing/altered records block. The inspector remains limited
+to exact supplied references.
+
+`--unblock` searches invocation resolutions, the literal last closed
+disposition, then the open loop. Older closed entries cannot be resumed and
+are excluded from conflicting-request detection. Repeated plan defects beyond
+three loops are not automatically detected. Duplicate task completion is
+rejected at admission, rather than when dispatching a dependent.
+All loop-owned dispatch/observation keys include `.l<n>.`; pre-admission
+`inspect-initial` is not loop-owned. Self-resolvable failures retry automatically;
+halts are reserved for conditions requiring human intervention, not routine
+technical reconstruction. Native Stop, permission, integrity and real capacity
+barriers remain binding.
 
 When full values are unavailable directly, exceptional read-only inspector
 recovery uses existing reads and exact retained refs, no new host loader. Compare
@@ -408,6 +439,39 @@ child per genuine closing observation. There is no packet transport, inspection
 pool or loop-indexed closing-grant ceiling. Gaps without a proposed close consume
 no observation. `maxCycles = 10` is accepted unchanged, not clamped or rejected
 from a worst-case default child budget; it does not promise ten complete loops.
+The specific native pre-launch `Run fan-out limit reached` rejection instead
+saves state and returns resumable `budget-exhausted`, without consuming another
+loop slot, closing/archiving the loop or discarding pending data. The foreground
+automatically relaunches the same invocation and mission as a new top-level run
+with fresh `maxSubagentSpawnsPerRun` (default 64); native resume does not renew it.
+Ordinary frozen-source/digest/association admission accepts unchanged reentry
+without human input. Saved seals, intentions and retries reconcile normally;
+admitted work is not repeated. Only native-proven unlaunched keys may dispatch.
+An O(1) marker retains the latest admitted seal, ledger count/head and last closed
+loop plus the marker at the previous budget end. Repeated exhaustion without
+progress is a human-needed halt explaining that one step needs more spawns than
+the per-run budget and naming `maxSubagentSpawnsPerRun`. Progress permits another
+automatic relaunch. Relaunch never supplies human continuation or unblock input;
+recorded Stop/refusal or other human-needed barriers return unchanged without
+dispatch. The per-seal archiver remains mandatory.
+
+Transient non-archive state-save failures retry automatically up to three
+attempts of the identical frozen projection, without dispatch, mutation or
+discard between attempts. Ordered saves prevent older retries overwriting newer
+receipts. Each native setter re-reads disk under lock; this also reconciles a
+write that committed before reporting failure. Cached `state.get` is not disk
+evidence. Native lock timeouts and I/O errno identify retryable failures; size
+limits, invalid JSON and other deterministic errors halt immediately with the
+cause. At the retry cap, the halt explains the repeated error.
+
+Fixed pure host reconstruction retries transient lock/I/O/transport failures up
+to three times, sequentially using `inspect-initial`, `inspect-initial.r1` and
+`inspect-initial.r2`. All three grants have the identical command and workspace;
+unused aliases consume no host calls or child spawns. Deterministic failures,
+Stop, refusal and positive pending activity never use retry aliases. A capped
+reconstruction retains the repeated cause and cannot silently renew its route.
+Neither save nor host retries lift a human-needed barrier.
+
 Native child, tree, session, concurrency, output, state and policy limits remain
 real. Report the actual rejection with phase/work/references intact, never skip
 required checks or analyses, renew slots or create another mission to evade it.
@@ -418,7 +482,8 @@ Ordinary observations use a fixed session-scoped external CLI agent registered
 outside resolution through public `registerAgentViaEvents`: absolute executable,
 fixed package-owned `observe.mjs` args, no model, delegation, inherited conversation
 or configurable commands. Conflicting registration/native rejection is an error,
-not overwrite or fallback. It ignores stdin, uses `designatedWorkspace` and
+not overwrite or fallback. It consumes `{expected, body}` on stdin for verified
+ledger publication; stdin cannot choose the workspace. It uses `designatedWorkspace` and
 `checkoutEvidence` on actual cwd, checks physical identity and never rereads the
 full plan. All stdout is bounded before emission below 65,536 bytes; an oversized
 result becomes bounded complete failure JSON, never truncated JSON.

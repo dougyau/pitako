@@ -27,6 +27,12 @@ skills: verify-behavior, ponytail
 
 Read the COMPLETE immutable specs, project instructions, designated checkout and
 exact prior work/check/review/compliance references supplied by the root.
+Closed-loop context is the last three bounded summaries supplied by the
+publisher after `ledger.mjs` verifies the chain, plus `{ledgerPath, head}`.
+Use that verified projection: no shell is granted, so do not read ledger files
+directly or claim to have verified them yourself. Further ledger reads require
+the owned verifier against that head; missing or altered records block.
+Summaries are not complete task definitions or authority to reconstruct scopes.
 Return one complete schema-bound `loop_plan` through structured_output and the
 native output binding, with status `plan` or `needs-decision`, then END.
 The root consumes a loop slot before your dispatch and owns all later phases.

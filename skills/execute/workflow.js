@@ -48,7 +48,8 @@ workerSchema.properties.restoreReceipt.properties.confirmedPause = object({ chec
 workerSchema.properties.checkpointReceipt = object({
   kind: { enum: ["unit", "pause"] }, checkpointRef: string, digest: string, candidate: candidateSchema,
   position: object({ loop: integer, cursor: { type: "integer", minimum: 0 }, phase: { const: "implementation" } }),
-  progress: object({ consumedLoops: integer, admittedResults: list({ type: "object" }) }),
+  progress: object({ consumedLoops: integer, admitted: { type: "object", additionalProperties: list(string) },
+    previous: nullable(object({ taskId: string, attempt: integer, resultRef: { type: "object" }, checkpointRef: string, digest: string })) }),
 });
 const complianceSchema = object({
   status: { enum: ["fulfilled", "gaps", "blocked"] }, reason: string,
@@ -159,7 +160,26 @@ function nativeFailure(childKey, error, result) {
     ref: nativeReference(childKey, result) };
 }
 function dispatch(requests) {
-  return Promise.resolve().then(() => retainNativeCall(runs.all(requests))).then(results => {
+  return Promise.resolve().then(() => {
+    if (requests.some(request => budgetRejected(request.key))) {
+      invocation.budgetRejectedKeys = invocation.budgetRejectedKeys.filter(childKey => !requests.some(request => request.key === childKey));
+      // Consume the no-launch evidence before launch; an uncertain new call must reconcile normally.
+      return save();
+    }
+  }).then(() => retainNativeCall(runs.all(requests))).then(results => {
+    const rejected = results.filter((result, index) => {
+      // 0.83.0 strips RunFanoutLimitError's type at the sandbox boundary.
+      // Only its complete admission receipt, without a child identity, proves no launch.
+      const message = result?.error;
+      return result?.ok === false && result.key === requests[index].key && !result.runId && !result.agent &&
+        result.output === message && Array.isArray(result.artifactPaths) && !result.artifactPaths.length &&
+        Object.keys(result).every(field => ["key", "ok", "output", "error", "artifactPaths"].includes(field)) &&
+        /^Run fan-out limit reached at .+ \(\d+\/\d+ used; \d+ requested, \d+ remaining\)\. No children from this admission group were started\. Start a new top-level run or raise config\.maxSubagentSpawnsPerRun\.$/.test(message ?? "");
+    });
+    if (rejected.length) {
+      invocation.budgetRejectedKeys = [...new Set([...(invocation.budgetRejectedKeys ?? []), ...rejected.map(result => result.key)])];
+      throw Object.assign(new Error(rejected[0].error), { spawnBudgetExhausted: true });
+    }
     results.forEach((result, index) => {
       const cause = barrier(result);
       if (resolution && ["stopped", "interrupted", "native permission denial"].includes(cause))
@@ -171,6 +191,7 @@ function dispatch(requests) {
     });
     return results;
   }).catch(error => {
+    if (error?.spawnBudgetExhausted) throw error;
     if (error?.nativeBarrier) {
       if (resolution && ["stopped", "interrupted", "native permission denial"].includes(error.nativeBarrier))
         resolution.currentBarrier = { cause: error.nativeBarrier, ref: { key: requests[0].key } };
@@ -185,6 +206,9 @@ function dispatch(requests) {
     failure.nativeFailure = cause;
     throw failure;
   });
+}
+function budgetRejected(childKey) {
+  return invocation?.budgetRejectedKeys?.includes(childKey);
 }
 function observeStatus(ref, retainUnknown = false) {
   return runs.status(ref).catch(error => {
@@ -203,7 +227,7 @@ function observeStatus(ref, retainUnknown = false) {
     if (retainUnknown) return { ok: false, state: "unknown", output: message };
   });
 }
-function host(grant) {
+function host(grant, attempt = 1, original = grant) {
   if (!grant) return Promise.reject(new Error("Missing trusted inspection grant."));
   let receipt;
   return retainNativeCall(runs.host(grant.key, { kind: "command", command: grant.command, timeoutMs: 86400000 })).then(result => {
@@ -211,13 +235,24 @@ function host(grant) {
     if (text(result.outputPath)) references.push({ key: grant.key, outputReference: result.outputPath });
     if (barrier(result)) throw nativeBarrier(barrier(result));
     if (!result.ok) throw new Error([result.error || "Read-only inspection failed.", result.stderr].filter(Boolean).join("\n"));
-    return JSON.parse(result.stdout);
+    const value = JSON.parse(result.stdout);
+    // The fixed inspector transports even failed reads in a successful bounded JSON envelope.
+    if (text(value.error) && transientSaveError(new Error(value.error)))
+      throw new Error([value.error, value.next].filter(Boolean).join(" "));
+    return value;
   }).catch(error => {
     // The native wrapper discards the receipt on failure. This exact message at
     // this boundary is compatible with abort, but identical command output can
     // produce it too: retain the ambiguity, never manufacture a Stop receipt.
     if (/^Blocked by pi-subagents permission rule:/.test(String(error?.message ?? error)))
       error.nativeBarrier = "native permission denial";
+    const message = String(error?.message ?? error);
+    const transient = transientSaveError(error) || /(?:^|[\s:])(ECONNRESET|ECONNREFUSED|EPIPE)(?=[:\s,]|$)/.test(message) ||
+      /^Host command '[^']+' failed: Command timed out after \d+ms\.$/.test(message);
+    const next = config.inspections.find(item => item.key === `${original.key}.r${attempt}`);
+    if (transient && !error.nativeBarrier &&
+        !["queued", "running", "pending", "stopped", "interrupted"].includes(receipt?.state) && attempt < 3 && next)
+      return host(next, attempt + 1, original);
     error.hostHalt = { status: ["stopped", "interrupted"].includes(error.nativeBarrier) ? "cancelled" : "blocked", code: "host-observation",
         reason: error?.message === `Host command '${grant.key}' failed: Command stopped because the workflow was aborted.`
           ? "Native host abort/failure observation is ambiguous; retain the unknown cause for bounded reconstruction under current native authority."
@@ -227,6 +262,7 @@ function host(grant) {
         ...(receipt?.state !== undefined ? { observedState: receipt.state } : {}),
         ...(error.nativeBarrier ? { observedBarrier: error.nativeBarrier } : {}),
         ...(receipt?.outputPath !== undefined ? { outputReference: receipt.outputPath } : {}) };
+    if (attempt === 3) error.hostHalt.reason += ` Three inspection attempts failed: ${String(error?.message ?? error)}`;
     throw error;
   });
 }
@@ -262,25 +298,68 @@ let inspectedAnalyses = [];
 let admissionValidated = false;
 let persistenceFailed = false;
 let persistenceReason = null;
-function maxCycles() { return invocation?.version === 3 ? invocation.association?.maxCycles ?? null : 3; }
+let saveTail = Promise.resolve();
+function deterministicSaveError(error) {
+  return /256 KiB limit|^Invalid mission state file |must contain only JSON|state key must/.test(String(error?.message ?? error));
+}
+function transientSaveError(error) {
+  const message = String(error?.message ?? error);
+  // Native workflow responses retain messages, not errno/type (scripted-workflow.js:1321).
+  if (deterministicSaveError(error)) return false;
+  return /^Timed out acquiring mission state lock '[^']+'\.$/.test(message) ||
+    /(?:^|[\s:])(EAGAIN|EBUSY|EIO|EINTR|ETIMEDOUT|ENOSPC|EDQUOT|EMFILE|ENFILE|EACCES|EPERM)(?=[:\s,]|$)/.test(message);
+}
+function persistState(stateKey, value, optionalPlan = null) {
+  // Freeze once and serialize saves: a retried older projection must not overwrite a newer receipt.
+  const frozen = clone(value);
+  const projections = [frozen, ...(optionalPlan ? [{ ...frozen, activePlan: clone(optionalPlan) }] : [])];
+  function writeProjection(index, attempt = 1) {
+    return Promise.resolve().then(() => state.set(stateKey, projections[index])).catch(error => {
+      if (index === 1 && /^Mission state exceeds the 256 KiB limit/.test(String(error?.message ?? error))) return;
+      if (!transientSaveError(error)) throw Object.assign(error, {
+        terminalPersistence: deterministicSaveError(error),
+      });
+      if (attempt === 3) throw new Error(`Three state-save attempts failed: ${String(error?.message ?? error)}`);
+      // set re-reads disk under its lock; get is cached and cannot confirm a failed write.
+      return writeProjection(index, attempt + 1);
+    });
+  }
+  const pending = saveTail.then(() => writeProjection(0)).then(() =>
+    projections.length === 2 ? writeProjection(1).catch(error => {
+      throw Object.assign(new Error(`Optional active-plan persistence failed; dispatch halted: ${String(error?.message ?? error)}`),
+        { optionalPersistence: true, terminalPersistence: error.terminalPersistence === true });
+    }) : undefined);
+  saveTail = pending.catch(() => {});
+  return pending;
+}
+function maxCycles() { return invocation?.version === 4 ? invocation.association?.maxCycles ?? null : 3; }
 function save() {
+  if ((loop?.phase === "closing" && !loop.closing || loop?.outcome === "gaps") && !loop.archivePending && !loop.archived)
+    {
+      loop.archivePending = loopArchive();
+      if (loop.phase === "closing") {
+        const pending = loop.archivePending;
+        pending.bodyIdentity = bodyIdentity(pending.record.body);
+        pending.frozen = { usage: clone(loop.usage), ...(loop.resolutions ? { resolutions: archiveProjection(loop.resolutions) } : {}) };
+        delete pending.record.body;
+      }
+    }
+  if (loop?.phase === "closing" && loop.archivePending && !loop.archived) closingRecord();
   // The native setter measures the ENTIRE merged file, including unrelated keys.
   // Essential state is committed first. One optional identical active plan cannot
   // displace snapshot, frozen descriptor, progress, or historical records.
   const essential = { ...invocation, activePlan: null };
-  return state.set(key, essential).catch(error => {
+  return persistState(key, essential, activePlan).catch(error => {
+    if (error.optionalPersistence) throw error;
     persistenceFailed = true;
     persistenceReason = `Essential persistence failed; dispatch halted: ${String(error?.message ?? error)}`;
-    throw new Error(persistenceReason);
-  }).then(() => activePlan ? state.set(key, { ...essential, activePlan }).catch(error => {
-    if (!/Mission state exceeds the 256 KiB limit/.test(String(error?.message ?? error)))
-      throw new Error(`Optional active-plan persistence failed; dispatch halted: ${String(error?.message ?? error)}`);
-  }) : undefined);
+    throw Object.assign(new Error(persistenceReason), { terminalPersistence: error.terminalPersistence === true });
+  });
 }
 function progress() {
   const value = {
     type: "execution-progress", invocation: config.invocation, loop: loop?.number ?? 0,
-    loopsConsumed: invocation?.loops?.length ?? 0, maxLoops: maxCycles(),
+    loopsConsumed: invocation?.consumedLoops ?? 0, maxLoops: maxCycles(),
     label: `Loop ${loop?.number ?? 0} de ${maxCycles()}`, phase: loop?.phase ?? "admission",
     ...(loop?.attempt ? { taskId: loop.attempt.taskId, attempt: loop.attempt.number } : {}),
     elapsedMs: invocation ? Date.now() - invocation.startedAt : null, tokens: metrics(),
@@ -290,10 +369,20 @@ function progress() {
   return value;
 }
 function metrics(selectedLoop) {
-  const values = (selectedLoop ? [selectedLoop] : invocation?.loops ?? []).flatMap(item => item.usage ?? []);
-  const known = values.filter(item => item.tokens !== null);
-  return { value: known.length ? known.reduce((total, item) => total + item.tokens, 0) : null,
-    coverage: !known.length ? "unavailable" : known.length === values.length ? "reported" : "partial" };
+  const values = (selectedLoop ? [selectedLoop] : [loop]).flatMap(item => item?.usage ?? []);
+  const totals = selectedLoop ? selectedLoop.usageSummary ?? { tokens: 0, known: 0, unknown: 0 } : invocation?.usageTotals ?? { tokens: 0, known: 0, unknown: 0 };
+  const known = totals.known + values.filter(item => item.tokens !== null).length;
+  const unknown = totals.unknown + values.filter(item => item.tokens === null).length;
+  return { value: known ? totals.tokens + values.reduce((sum, item) => sum + (item.tokens ?? 0), 0) : null,
+    coverage: !known ? "unavailable" : unknown ? "partial" : "reported" };
+}
+function foldUsage() {
+  loop.usageSummary = { tokens: 0, known: 0, unknown: 0 };
+  for (const value of loop.usage) {
+    if (value.tokens === null) { invocation.usageTotals.unknown++; loop.usageSummary.unknown++; }
+    else { invocation.usageTotals.known++; invocation.usageTotals.tokens += value.tokens; loop.usageSummary.known++; loop.usageSummary.tokens += value.tokens; }
+  }
+  loop.usage = [];
 }
 function usage(result, childKey) {
   if (!loop) return;
@@ -302,7 +391,7 @@ function usage(result, childKey) {
   const entries = result?.results?.length ? result.results : [null];
   entries.forEach((entry, index) => {
     const id = `${result?.runId ?? childKey}:${index}`;
-    if (invocation.loops.some(item => item.usage.some(value => value.id === id))) return;
+    if (loop.usage.some(value => value.id === id)) return;
     const reported = entry?.usage;
     const fields = ["input", "output", "cacheRead", "cacheWrite"];
     const tokens = reported && fields.every(field => Number.isFinite(reported[field]) && reported[field] >= 0)
@@ -389,7 +478,7 @@ function reconcileAnalysis() {
   loop.analysisCalls = calls;
   // Observe the whole retained group before a missing sibling may be launched.
   return (loop.analysisCalls ?? []).reduce((settled, call) =>
-    settled.then(() => analysisResults.get(call.key) ?? observeAnalysis(call)), Promise.resolve()).then(() => {
+    settled.then(() => budgetRejected(call.key) ? undefined : analysisResults.get(call.key) ?? observeAnalysis(call)), Promise.resolve()).then(() => {
       if (loop.analysisCalls?.length && loop.halt?.code === "native-barrier") delete loop.halt;
     });
 }
@@ -496,6 +585,21 @@ function reconcileInterruptedOperations() {
   // native permissions, even when a later management view omits that denial.
   if (!same(resolution.halt, loop.halt)) throw nativeBarrier(loop.halt.cause);
   if (loop.halt.cause === "native permission denial") throw nativeBarrier(loop.halt.cause);
+  if (invocation.sealPending && loop.halt.ref?.agent === "pitako.execution-ledger") {
+    const ref = loop.halt.ref;
+    return observeStatus(ref.runId ?? ref.key, true).then(observed => {
+      const cause = barrier(observed, ref.runId ?? ref.key);
+      if (cause && !["stopped", "interrupted"].includes(cause)) throw nativeBarrier(cause, ref);
+      if ((observed?.runId && ref.runId && observed.runId !== ref.runId) ||
+          (observed?.agent && observed.agent !== "pitako.execution-ledger"))
+        throw new Error("Archiver producer/run identity conflicts with pending seal.");
+      resolution.observations = [projection(ref.key, observed)];
+      resolution.stage = confirmedPausePending() ? "accepted" : "applied";
+      delete loop.halt;
+      delete loop.outcome;
+      return save();
+    });
+  }
   if (pendingCheckpointUnit()) {
     const ref = loop.attempt.launch ?? { key: loop.attempt.key };
     if (!resolution.operations?.some(item => same(item, ref)))
@@ -549,12 +653,14 @@ function reconcileInterruptedOperations() {
     });
 }
 function analysisDispatch(requests) {
-  return Promise.all(requests.map(request => Promise.resolve().then(() => {
+  return Promise.allSettled(requests.map(request => Promise.resolve().then(() => {
     loop.analysisCalls ??= [];
     let call = loop.analysisCalls.find(entry => entry.key === request.key);
-    if (call) return analysisResults.get(call.key) ?? observeAnalysis(call);
-    call = { key: request.key, stage: "intention", ref: { key: request.key } };
-    loop.analysisCalls.push(call);
+    if (call && !budgetRejected(call.key)) return analysisResults.get(call.key) ?? observeAnalysis(call);
+    if (!call) {
+      call = { key: request.key, stage: "intention", ref: { key: request.key } };
+      loop.analysisCalls.push(call);
+    }
     return save().then(() => {
       if (persistenceFailed) throw new Error(persistenceReason);
       return dispatch([request]);
@@ -573,7 +679,13 @@ function analysisDispatch(requests) {
       call.barrier = error?.nativeBarrier ?? null;
       return save().then(() => { throw error; });
     });
-  })));
+  }))).then(settled => {
+    // Settle sibling receipt saves before the root persists an exhaustion/barrier.
+    const failure = settled.find(item => item.status === "rejected" && !item.reason?.spawnBudgetExhausted) ??
+      settled.find(item => item.status === "rejected");
+    if (failure) throw failure.reason;
+    return settled.map(item => item.value);
+  });
 }
 function collect(childKey, agent, display, task, outputSchema, implementation = false, dispatcher = dispatch, resume) {
   const label = display.label.replace(/\s+/g, " ").trim().slice(0, 120);
@@ -658,20 +770,19 @@ function validatePlan(value, number, manifest) {
 }
 function prerequisiteResults(task) {
   return task.dependsOn.map(dependency => {
-    const completed = loop.results.filter(result => result.taskId === dependency.taskId && result.status === "complete");
-    if (completed.length !== 1 || !text(completed[0].ref?.key) ||
-        !text(completed[0].ref?.runId) || !Number.isSafeInteger(completed[0].attempt) ||
-        completed[0].attempt < 1)
+    const completed = invocation.tasks[dependency.taskId]?.completed;
+    if (!completed || !text(completed.ref?.key) || !text(completed.ref?.runId) ||
+        !Number.isSafeInteger(completed.attempt) || completed.attempt < 1)
       throw new Error(`Prerequisite ${dependency.taskId} has no unique durable completed attempt; no dependent writer dispatched.`);
-    return { taskId: dependency.taskId, attempt: completed[0].attempt, ref: completed[0].ref };
+    return { taskId: dependency.taskId, attempt: completed.attempt, ref: completed.ref };
   });
 }
 function fullContext() {
   return `CURRENT HUMAN RESOLUTIONS (accepted input, not new permissions): ${JSON.stringify([
-    ...(invocation.resolutions ?? []), ...invocation.loops.flatMap(item => item.resolutions ?? []),
+    ...retainedResolutions(),
   ])}
 ASSOCIATION (data): ${JSON.stringify(association(loop.number))}
-COMPLETE IMMUTABLE SPEC SNAPSHOT:\n${invocation.snapshot.content}
+COMPLETE IMMUTABLE SPEC SNAPSHOT:\n${config.preliminary.content}
 ADDITIONAL COMPLETE SPEC SOURCES (immutable path + SHA-256): ${JSON.stringify(invocation.association.sourceRefs ?? [])}
 BEFORE reasoning, planning, editing, checking, reviewing or compliance: read EVERY referenced source IN FULL
 and verify its SHA-256 with existing read/hash tools. Missing/mismatched/incomplete sources => blocked,
@@ -686,11 +797,11 @@ in results/reasons alongside unchanged base sources. A missing/changed amendment
 gap, not permission to replace frozen sourceRefs/snapshot/association or renew maxCycles.
 Agent text and files alone are not human authority. Preserve known unmet obligations and evidence
 limits from the admitted context; new checkpoint observations do not fulfill a missing historical contrast.
-Prior loop/result references (data): ${JSON.stringify(invocation.loops.filter(item => item !== loop).map(item => ({
-    loop: item.number, outcome: item.outcome, plan: item.plan?.ref,
-    rejection: item.plan?.rejection, attempts: item.results,
-    review: item.review, compliance: item.compliance, closing: item.closing,
-  })))}`;
+VERIFIED RETAINED LOOP SUMMARIES (data, not complete task originals): ${JSON.stringify(invocation.loopSummaries ?? [])}
+CLOSED HISTORY REFERENCE (data): ${JSON.stringify(historyReference())}
+These summaries were read by the publisher through ledger.mjs chain verification against this head.
+Any further ledger read must use ledger.mjs verification against head; missing/altered records block.
+The director uses these last-three summaries (no shell); the inspector reads only exact supplied native refs.`;
 }
 function inspectRecovery(kind, ref, retained) {
   // Subject identity comes from the frozen work, not a replaceable output path
@@ -712,15 +823,16 @@ function inspectRecovery(kind, ref, retained) {
     return Promise.reject(new Error("Recovery association/stage conflict; retained unchanged."));
   if (!recovery) {
     recovery = { subject, phase: kind, association: association(loop.number),
-      source: clone(ref), ref: { key: `${key}.l${loop.number}.recover${loop.recoveries.length + 1}` },
+      source: clone(ref), ref: { key: `${key}.l${loop.number}.recover${++invocation.recoverySeq}` },
       stage: "intention", disposition: "pending" };
     loop.recoveries.push(recovery);
+    invocation.lastRecoveryRef = clone(recovery.ref);
   }
   const recoveryKey = recovery.ref.key;
   const recoveryRunId = recovery.ref.runId;
   // Persist intent before the external query. An uncertain launch is reconciled
   // by status only: repeating runs.all with the same key is not reattachment.
-  return (existing ? observeStatus(recovery.ref.runId ?? recoveryKey).then(result => {
+  return (existing && !budgetRejected(recoveryKey) ? observeStatus(recovery.ref.runId ?? recoveryKey).then(result => {
     if ((recoveryRunId && result?.runId && result.runId !== recoveryRunId) ||
         (result?.agent && result.agent !== "pitako.execution-inspector") ||
         (result?.key && result.key !== recoveryKey && result.key !== recoveryRunId))
@@ -766,6 +878,7 @@ Use structured_output.`, recoverySchema))).then(result => {
       throw new Error("Recovery producer/run identity conflict.");
     if (result?.runId) {
       recovery.ref = { ...recovery.ref, ...nativeReference(recoveryKey, result) };
+      invocation.lastRecoveryRef = clone(recovery.ref);
     }
     // Save the query receipt before body validation or admission.
     return (result?.runId ? save() : Promise.resolve()).then(() => {
@@ -845,7 +958,7 @@ function recoverPlan() {
       planAuthority(observed.original);
       if (activePlan && !same(activePlan, observed.original)) planConflict("Conflicting complete loop_plan values.");
       activePlan = observed.original;
-      loop.plan.recoverySource = { ref: loop.recoveries[loop.recoveries.length - 1].ref,
+      loop.plan.recoverySource = { ref: invocation.lastRecoveryRef,
         binding: observed.binding, comparison: observed.comparison };
     }
     // Admitted cache is itself a complete value; optional witnesses are not mandatory.
@@ -881,7 +994,7 @@ function continueAttempt(observed, ref, task, prerequisites) {
     return checkpointFallback(observed, ref, task);
   }
   let continuation = descriptor.nativeContinuation;
-  if (!continuation) {
+  if (!continuation || budgetRejected(continuation.ref.key)) {
     const runId = observed?.runId ?? ref.runId;
     if (!text(runId)) throw new Error("Exact interrupted writer run ID unavailable; no replacement writer authorized.");
     continuation = descriptor.nativeContinuation = {
@@ -948,7 +1061,7 @@ function assertFallbackProducer(observed, ref) {
     results: observed?.results?.map(item => ({ ...item, stopped: false, interrupted: false })) }, ref.runId ?? ref.key);
   if (independent && !["stopped", "interrupted"].includes(independent)) throw nativeBarrier(independent, ref);
   const cause = barrier(observed, ref.runId ?? ref.key);
-  const historicalStop = cause === "stopped" && ["accepted", "applied"].includes(resolution?.stage) &&
+  const historicalStop = cause === "stopped" && resolution?.loop === loop.number && !loop.archived && ["accepted", "applied"].includes(resolution?.stage) &&
     !resolution.currentBarrier && resolution.halt?.cause === "stopped" &&
     resolution.operations?.some(item => item.key === ref.key && item.runId === ref.runId);
   if (cause && cause !== "interrupted" && !historicalStop) throw nativeBarrier(cause, ref);
@@ -957,10 +1070,10 @@ function assertFallbackProducer(observed, ref) {
     throw new Error("Worker producer/run identity conflicts with frozen attempt.");
 }
 function confirmedUnitForPending() {
-  const point = loop.confirmedCheckpoint;
-  if (point?.kind !== "unit") return undefined;
+  const point = invocation.lastConfirmed;
+  if (point?.kind !== "unit" || point.position.loop !== loop.number) return undefined;
   const { taskId, attempt, resultRef, ...receipt } = point;
-  const result = loop.results.find(item => item.taskId === taskId && item.attempt === attempt && same(item.ref, resultRef));
+  const result = loopResults().find(item => item.taskId === taskId && item.attempt === attempt && same(item.ref, resultRef));
   if (!result || result.status !== "complete" || !same(result.checkpoint?.confirmation, receipt) ||
       !same(point.position, { loop: loop.number, cursor: loop.cursor, phase: "implementation" }) ||
       receipt.checkpointRef !== `${config.root}/.pi/subagents/checkpoints/${result.checkpoint.key}/unit.json`)
@@ -970,7 +1083,7 @@ function confirmedUnitForPending() {
 function checkpointFallback(observed, ref, task) {
   const descriptor = loop.attempt;
   assertFallbackProducer(observed, ref);
-  if (!descriptor.checkpoint || loop.results.some(result => result.taskId === task.id && result.status === "complete"))
+  if (!descriptor.checkpoint || loopResults().some(result => result.taskId === task.id && result.status === "complete"))
     throw new Error("Checkpoint fallback cannot restore a completed task or missing checkpoint.");
   const witness = checkpointObservation;
   if (witness && (witness.key !== descriptor.key || witness.taskId !== task.id || witness.attempt !== descriptor.number ||
@@ -981,14 +1094,20 @@ function checkpointFallback(observed, ref, task) {
   // A restoration intention consumes this material witness durably, before
   // dispatch. Reentry reconciles that exact operation first; fresh status,
   // renamed keys and equivalent captures cannot renew its modifying route.
-  const prior = [descriptor, ...(loop.interruptions ?? []), ...(descriptor.pauseSource?.restorations ?? [])].filter(item =>
-    item.taskId === task.id && item.index === loop.cursor && item.restore);
-  const pauseRestoration = loop.confirmedCheckpoint?.kind === "pause" ||
-    loop.results.some(item => item.taskId === task.id && item.checkpoint?.confirmation?.kind === "pause") ||
-    prior.some(item => item.restore.authority?.confirmedPause);
+  const frame = invocation.taskFrame;
+  const prior = frame.operations;
+  if (descriptor.restore) {
+    const operation = prior.find(item => item.key === descriptor.key);
+    if (!operation || operation.evidence !== descriptor.restore.evidence ||
+        !same(operation.confirmedPause, descriptor.restore.authority?.confirmedPause ?? null))
+      throw new Error("Confirmed pause conflicts with retained restoration authority.");
+  }
+  const pauseRestoration = invocation.lastConfirmed?.kind === "pause" && invocation.lastConfirmed.position.loop === loop.number ||
+    loopResults().some(item => item.taskId === task.id && item.checkpoint?.confirmation?.kind === "pause") ||
+    prior.some(item => item.confirmedPause);
   if (pauseRestoration) {
-    const { taskId, attempt, resultRef, ...receipt } = loop.confirmedCheckpoint ?? {};
-    const result = loop.results.find(item => item.taskId === taskId && item.attempt === attempt && same(item.ref, resultRef));
+    const { taskId, attempt, resultRef, ...receipt } = invocation.lastConfirmed ?? {};
+    const result = loopResults().find(item => item.taskId === taskId && item.attempt === attempt && same(item.ref, resultRef));
     if (descriptor.pauseSource && (!same(descriptor.pauseSource.confirmation, receipt) ||
         descriptor.pauseSource.checkpoint.key !== result?.checkpoint?.key))
       throw new Error("Confirmed pause source conflicts with admitted pending progress.");
@@ -996,27 +1115,16 @@ function checkpointFallback(observed, ref, task) {
         receipt.kind !== "pause" || !same(receipt, result.checkpoint?.confirmation) ||
         !same(receipt.position, { loop: loop.number, cursor: loop.cursor, phase: "implementation" }) ||
         receipt.checkpointRef !== `${config.root}/.pi/subagents/checkpoints/${result.checkpoint.key}/pause.json` ||
-        prior.some(item => {
-          // Each retained operation consumed the pause admitted BEFORE that
-          // operation, not a newer pause its worker may legitimately publish.
-          const source = loop.results.filter(entry => entry.taskId === task.id && entry.attempt < item.number &&
-            entry.checkpoint?.confirmation?.kind === "pause").at(-1);
-          const authority = item.restore.authority?.confirmedPause;
-          return source ? !["blocked", "continue", "gaps"].includes(source.status) || !(source.remainingCount > 0) ||
-            !same(authority, source.checkpoint.confirmation) ||
-            !same(authority.position, receipt.position) ||
-            authority.checkpointRef !== `${config.root}/.pi/subagents/checkpoints/${source.checkpoint.key}/pause.json`
-            : !!authority;
-        }))
+        prior.some(item => item.confirmedPause && !same(item.confirmedPause.position, receipt.position)))
       throw new Error("Confirmed pause conflicts with admitted pending progress or retained restoration authority.");
   }
   // An old pause's missing witness is not a baseline for newly visible files.
   // Reconcile the exact operation/result without inventing its original evidence.
   // Non-pause recovery retains its existing material-progress routes.
-  const lastRestore = descriptor.restore ?? descriptor.pauseSource?.restorations?.at(-1)?.restore;
-  if (lastRestore && (!evidence || prior.some(item => item.restore.evidence === evidence ||
-      pauseRestoration && !item.restore.evidence &&
-        same(item.restore.authority?.confirmedPause, descriptor.result?.checkpoint?.confirmation ?? lastRestore.authority?.confirmedPause)))) {
+  const lastRestore = descriptor.restore ?? frame.operations.at(-1);
+  if (lastRestore && (!evidence || frame.evidence.includes(evidence) || prior.some(item => item.evidence === evidence ||
+      pauseRestoration && !item.evidence &&
+        same(item.confirmedPause, descriptor.result?.checkpoint?.confirmation ?? lastRestore.authority?.confirmedPause ?? lastRestore.confirmedPause)))) {
     const error = new Error("Restoration remains pending with no new checkpoint evidence; reconcile the exact operation or supply material progress, no replacement writer authorized.");
     error.nativeFailure = { code: "recovery", reason: error.message, ref: clone(ref) };
     throw error;
@@ -1026,8 +1134,7 @@ function checkpointFallback(observed, ref, task) {
   // The modifying worker reads and validates these exact bytes through the owned
   // helper before any effect. No model inspector/result rescue is a prerequisite.
   const checkpoint = { key: descriptor.checkpoint.key, manifest };
-  const sources = [clone(descriptor.checkpoint),
-    ...[].concat(descriptor.restore?.checkpoint ?? descriptor.pauseSource?.sources ?? descriptor.pauseSource?.checkpoint ?? [])];
+  const sources = [clone(descriptor.checkpoint), ...(frame.sources ?? []).filter(source => source.key !== descriptor.checkpoint.key)].sort((a, b) => b.attempt - a.attempt);
   const confirmedUnit = descriptor.restore?.authority?.confirmedUnit ?? confirmedUnitForPending();
   const observations = sources.map(source => ({ key: source.key,
     manifest: `${config.root}/.pi/subagents/checkpoints/${source.key}/manifest.json` }));
@@ -1036,12 +1143,11 @@ function checkpointFallback(observed, ref, task) {
   descriptor.fallback = { stage: "admitted", source: clone(ref),
     observation: observed === undefined ? { state: "unknown", reason: "Public writer status unavailable" } : clone(observed),
     checkpoint: clone(checkpoint) };
-  loop.interruptions ??= [];
-  loop.interruptions.push(clone(descriptor));
+
   loop.attempt = { taskId: task.id, index: loop.cursor, number: descriptor.number + 1,
     key: `${key}.l${loop.number}.t${loop.cursor + 1}.a${descriptor.number + 1}`, stage: "intention",
     continuationRef: descriptor.result?.ref ?? null, ...(descriptor.pauseSource ? { pauseSource: clone(descriptor.pauseSource) } : {}), restore: { undispatched: true,
-      checkpoint: sources.length === 1 ? sources[0] : sources, evidence, observation: checkpoint, observations,
+      sourceKeys: sources.map(source => source.key), evidence, observation: checkpoint, observations,
       producer: clone(ref), authority: { pending: true, stop: false, permissionDenied: false,
         activeWriter: null, references: [ref.runId ?? ref.key, manifest],
         ...(confirmedUnit ? { confirmedUnit } : {}),
@@ -1049,6 +1155,14 @@ function checkpointFallback(observed, ref, task) {
           ? { confirmedPause: clone(descriptor.restore?.authority?.confirmedPause ?? descriptor.pauseSource.confirmation) } : {}),
         ...(descriptor.result?.checkpoint?.confirmation?.kind === "pause"
           ? { confirmedPause: clone(descriptor.result.checkpoint.confirmation) } : {}) } } };
+  frame.operations.push({ key: loop.attempt.key, evidence,
+    confirmedPause: clone(loop.attempt.restore.authority.confirmedPause ?? null) });
+  if (evidence && !frame.evidence.includes(evidence)) frame.evidence.push(evidence);
+  // Unsealed interrupted sources have no admitted manifest digest; retain their full v2 intents.
+  for (const source of sources) if (!frame.restorationKeys.includes(source.key)) {
+    frame.restorationKeys.push(source.key);
+    (frame.sources ??= []).push(clone(source));
+  }
   // Essential admission of the restoration intention precedes modifying dispatch.
   return save().then(() => null);
 }
@@ -1167,6 +1281,9 @@ function admitWorker(result, descriptor, task, recoveryRef, statusRef) {
     parsed = { rejection: String(error.message) };
   }
   const value = parsed.value;
+  const taskState = invocation.tasks[task.id];
+  if (value?.status === "complete" && taskState.completed)
+    throw new Error("Duplicate task completion rejected at admission.");
   const base = { ...projection(descriptor.key, result), taskId: descriptor.taskId, attempt: descriptor.number,
     ...(descriptor.checkpoint ? { checkpoint: {
       key: descriptor.checkpoint.key, manifest: `.pi/subagents/checkpoints/${descriptor.checkpoint.key}/manifest.json`,
@@ -1190,19 +1307,27 @@ function admitWorker(result, descriptor, task, recoveryRef, statusRef) {
     resumedFrom: descriptor.nativeContinuation.source };
   if (recoveryRef) projected.ref = { ...projected.ref, ...descriptor.launch,
     recovery: { ref: recoveryRef, field: "structuredOutput.workerResult" } };
-  if (loop.results.some(previous => previous.taskId === descriptor.taskId &&
-      previous.continuationIdentity === projected.continuationIdentity))
+  if (invocation.taskFrame.identities.includes(projected.continuationIdentity))
     projected.usefulContinuation = false;
   // The seal is not confirmed until this result and pointer are saved together.
   // A failed essential save leaves the previous durable point authoritative.
   if (value?.checkpointReceipt) {
     projected.checkpoint.confirmation = clone(value.checkpointReceipt);
-    loop.confirmedCheckpoint = { ...clone(value.checkpointReceipt), taskId: descriptor.taskId,
+    invocation.lastConfirmed = { ...clone(value.checkpointReceipt), taskId: descriptor.taskId,
       attempt: descriptor.number, resultRef: clone(projected.ref) };
   }
-  loop.results.push(projected);
+  if (projected.continuationIdentity) invocation.taskFrame.identities.push(projected.continuationIdentity);
+  if (!taskState.admitted.includes(projected.status)) taskState.admitted.push(projected.status);
+  // A superseded pending attempt no longer has a task-owned full result.
+  loop.results = loop.results.map(entry => !entry.ref && entry.taskId === projected.taskId &&
+    entry.attempt === taskState.last?.attempt ? taskState.last : entry);
+  taskState.last = projected.status === "complete" ? null : projected;
+  if (projected.status === "complete") taskState.completed = { ...clone(projected),
+    prerequisiteResults: clone(prerequisiteResults(task)) };
+  loop.results.push({ taskId: projected.taskId, attempt: projected.attempt });
   loop.attempt.result = projected;
   loop.attempt.stage = "result";
+  if (value?.checkpointReceipt) prepareSeal(projected);
   // A recovered rejection does not settle the interrupted producer.
   if (["recovery", "native-barrier"].includes(loop.halt?.code) &&
       !(resolution?.stage === "accepted" && same(resolution.halt, loop.halt))) delete loop.halt;
@@ -1211,9 +1336,201 @@ function admitWorker(result, descriptor, task, recoveryRef, statusRef) {
   currentCandidate = projected.candidate;
   return parsed.value;
 }
+// A pending seal contains only frozen, persisted material; reentry diagnostics never enter its bytes.
+function archiveProjection(value) {
+  return JSON.parse(JSON.stringify(value, (name, child) =>
+    ["halt", "interruption", "interruptions", "currentBarrier", "hostHalt", "failedHostObservation"].includes(name) ? undefined : child));
+}
+function prepareSeal(projected) {
+  invocation.sealPending = { expected: clone(invocation.ledger), record: { kind: "unit", loop: loop.number,
+    body: archiveProjection({ taskId: projected.taskId, attempt: projected.attempt, result: clone(projected),
+      results: clone(loopResults().filter(item => item.taskId === projected.taskId)),
+      frame: clone(invocation.taskFrame), recoveries: clone(loop.recoveries),
+      checkpoint: clone(invocation.lastConfirmed) }) } };
+}
+function loopResults(strict = true) {
+  return loop.results.map(entry => {
+    if (entry.ref) return entry;
+    const task = invocation.tasks[entry.taskId];
+    const result = [task?.completed, task?.last].find(value => value?.attempt === entry.attempt);
+    if (!result) {
+      if (!strict) return entry; // Reports retain the actual diagnosis for corrupt state.
+      throw new Error(`Prerequisite ${entry.taskId} has no unique durable completed attempt; no dependent writer dispatched.`);
+    }
+    return result;
+  });
+}
+function bodyIdentity(body) {
+  const encoded = JSON.stringify(body);
+  let hash = 2166136261;
+  for (let index = 0; index < encoded.length; index++) hash = Math.imul(hash ^ encoded.charCodeAt(index), 16777619);
+  return `${encoded.length}:${hash >>> 0}`; // Programming invariant, not ledger authentication.
+}
+function closingRecord() {
+  const pending = loop.archivePending;
+  const record = loopArchive(pending.frozen).record;
+  if (bodyIdentity(record.body) !== pending.bodyIdentity)
+    throw new Error("Closing archive source fields changed before publication.");
+  return record;
+}
+function loopArchive(frozen) {
+  const body = {};
+  for (const field of ["number", "cursor", "manifest", "plan", "attempt", "results",
+    "recoveries", "analysisCalls", "review", "compliance", "candidate", "resolutions", "usage"]) {
+    const value = field === "results" ? loopResults()
+      : frozen && ["usage", "resolutions"].includes(field) ? frozen[field] : loop[field];
+    if (value !== undefined) body[field] = archiveProjection(value);
+  }
+  return { expected: clone(invocation.ledger), record: { kind: "loop", loop: loop.number, body } };
+}
+function retainedResolutions() {
+  return [...(invocation?.resolutions ?? []).slice().reverse(),
+    ...(invocation?.lastClosedResolution ? [invocation.lastClosedResolution] : []),
+    ...(loop?.resolutions ?? []).slice().reverse()];
+}
+function historyReference() {
+  return { ledgerPath: `${config.root}/.pi/subagents/execute/${config.invocation}`, head: invocation.ledger.head };
+}
+function validSummaries(values) {
+  return Array.isArray(values) && values.length > 0 && values.length <= 3 &&
+    values.every((value, index) => value && Object.keys(value).sort().join(",") === "compliance,gaps,loop,rejection,review,status" &&
+      Number.isSafeInteger(value.loop) && value.loop > 0 && value.loop <= loop.number &&
+      (!index || values[index - 1].loop < value.loop) && ["complete", "gaps"].includes(value.status) &&
+      ["gaps", "review", "compliance", "rejection"].every(field => typeof value[field] === "string" && value[field].length <= 1100)) &&
+    values.at(-1).loop === loop.number;
+}
+function foldLoop(summaries) {
+  invocation.loopSummaries = summaries;
+  invocation.planRejections = [...invocation.planRejections.filter(item => item.loop !== loop.number),
+    { loop: loop.number, diagnostic: loop.plan?.rejection?.diagnostic ?? null }].slice(-3);
+  const ref = loop.closing?.ref;
+  invocation.closeReferences = [...invocation.closeReferences.filter(item => item.loop !== loop.number),
+    { loop: loop.number, ...(ref ? { runId: ref.runId, asyncDir: ref.asyncDir,
+      stdoutPath: ref.externalAdapter.outputArtifacts.stdoutPath, stderrPath: ref.externalAdapter.outputArtifacts.stderrPath } : {}) }].slice(-3);
+  const disposition = loop.resolutions?.at(-1);
+  invocation.lastClosedResolution = disposition ? Object.fromEntries(
+    ["request", "stage", "loop", "text", "currentBarrier", "hostHalt", "failedHostObservation"]
+      .filter(field => disposition[field] !== undefined).map(field => [field, clone(disposition[field])])) : null;
+  foldUsage();
+  delete loop.analysisCalls;
+  loop.recoveries = [];
+}
+function archiveGaps() {
+  if (loop.archived) return Promise.resolve();
+  loop.archivePending ??= loopArchive();
+  return archiveSeal(loop.archivePending);
+}
+function archiveSeal(pending = invocation.sealPending) {
+  const closingGap = pending.record.kind === "loop";
+  let tries = 0;
+  function publish() {
+    tries++;
+    const retry = pending.retry ?? 0;
+    const sealKey = `${key}.l${pending.record.loop}.${closingGap ? "gaps" : `seal${Math.max(1, pending.expected.count)}`}${retry ? `.r${retry}` : ""}`;
+    return Promise.resolve().then(() => {
+      if (config.preliminary.digest !== invocation.association.digest)
+        throw Object.assign(new Error("Spec digest mismatch requires reliable admitted source bytes."), { ledgerIntegrity: true });
+      pending.retry = retry + 1;
+      return save();
+    }).then(() => dispatch([{ key: sealKey, agent: "pitako.execution-ledger",
+      task: JSON.stringify({ invocation: config.invocation, expected: pending.expected, record: pending.record,
+        ...(pending.expected.count === 0 ? { spec: { content: config.preliminary.content, digest: invocation.association.digest } } : {}) }),
+      cwd: config.root, context: "fresh", output: false, outputMode: "inline", outputSchema: false,
+      acceptance: false, reads: false, progress: false }])).then(results => {
+      const result = results[0];
+      if (result?.nativeFailure) throw Object.assign(new Error(result.nativeFailure.reason), { nativeFailure: result.nativeFailure });
+      const cause = barrier(result, sealKey);
+      if (cause) throw nativeBarrier(cause, nativeReference(sealKey, result));
+      let anchor;
+      if (typeof result?.output === "string" && utf8Bytes(result.output) <= 61440) {
+        try { anchor = JSON.parse(result.output); } catch (_) { /* Retry exact bytes through the ledger. */ }
+      }
+      if (result?.agent === "pitako.execution-ledger" && anchor &&
+          Object.keys(anchor).sort().join(",") === "error,reason" &&
+          anchor.error === "ledger-integrity" && text(anchor.reason))
+        throw Object.assign(new Error(`Ledger integrity requires human reconciliation: ${anchor.reason}`), { ledgerIntegrity: true });
+      const failures = [result, ...(result?.results ?? [])].filter(Boolean);
+      if (!result?.ok || result.agent !== "pitako.execution-ledger" || !text(result.runId) ||
+          result.key !== undefined && result.key !== sealKey || result.state !== undefined || result.terminalOutcome ||
+          !text(result.asyncDir) || !text(result.externalAdapter?.outputArtifacts?.stdoutPath) ||
+          !text(result.externalAdapter?.outputArtifacts?.stderrPath) ||
+          !Array.isArray(result.results) || result.results.length !== 1 || result.results[0].exitCode !== 0 ||
+          failures.some(item => item.error || item.outputSaveError || item.metadataSaveError || item.transcriptError ||
+            item.outputPartial || item.truncation || item.timedOut || item.processSignal ||
+            item.exitCode !== undefined && item.exitCode !== 0) ||
+          !anchor || Object.keys(anchor).sort().join(",") !== (closingGap ? "count,head,summaries" : "count,head") ||
+          closingGap && !validSummaries(anchor.summaries) ||
+          anchor.count !== Math.max(1, pending.expected.count) + 1 || !/^[a-f0-9]{64}$/.test(anchor.head ?? ""))
+        throw new Error("Ledger publication lacks valid successful terminal stdout/anchor.");
+      const before = { ledger: invocation.ledger, frame: invocation.taskFrame, results: loop.results,
+        recoveries: loop.recoveries, interruptions: loop.interruptions, attempt: clone(loop.attempt) };
+      invocation.ledger = { count: anchor.count, head: anchor.head };
+      if (closingGap) {
+        const beforeLoop = clone(loop), beforeTotals = clone(invocation.usageTotals);
+        loop.archived = true;
+        delete loop.archivePending;
+        foldLoop(anchor.summaries);
+        return save().then(() => {
+          persistenceFailed = false; persistenceReason = null;
+        }, error => {
+          Object.keys(loop).forEach(name => delete loop[name]); Object.assign(loop, beforeLoop);
+          loop.archivePending = pending;
+          invocation.usageTotals = beforeTotals; invocation.ledger = before.ledger;
+          throw error;
+        });
+      }
+      loop.results = loop.results.filter(entry => !entry.ref ||
+        same(invocation.tasks[entry.taskId]?.last, entry) || same(entry.ref, invocation.lastConfirmed.resultRef));
+      const cited = JSON.stringify(loop.resolutions ?? []);
+      loop.recoveries = loop.recoveries.filter(item => cited.includes(item.ref.key));
+      if (pending.record.body.result.status === "complete") {
+        invocation.taskFrame = null;
+        delete loop.interruptions;
+        delete loop.attempt.pauseSource;
+        delete loop.attempt.restore;
+      }
+      invocation.sealPending = null;
+      return save().then(() => {
+        persistenceFailed = false; persistenceReason = null;
+      }, error => {
+        invocation.ledger = before.ledger; invocation.taskFrame = before.frame;
+        loop.results = before.results; loop.recoveries = before.recoveries;
+        loop.interruptions = before.interruptions; loop.attempt = before.attempt;
+        invocation.sealPending = pending;
+        throw error;
+      });
+    }).catch(error => {
+      if (error.spawnBudgetExhausted) {
+        pending.retry = retry;
+        throw error;
+      }
+      if (error.terminalPersistence) throw error;
+      if (!error.ledgerIntegrity && !error.nativeBarrier && error.nativeFailure?.code !== "capacity" && tries < 3) {
+        persistenceFailed = false; persistenceReason = null;
+        return publish();
+      }
+      if (error.nativeBarrier) {
+        loop.halt = { status: ["stopped", "interrupted"].includes(error.nativeBarrier) ? "cancelled" : "blocked",
+          code: "native-barrier", cause: error.nativeBarrier, reason: String(error.message),
+          ref: clone(error.nativeReference ?? { key: sealKey, agent: "pitako.execution-ledger" }) };
+        return save().then(() => { throw error; }, saveError => { error.message += ` ${saveError.message}`; throw error; });
+      }
+      if (error.nativeFailure?.code === "capacity") throw error;
+      persistenceFailed = true;
+      persistenceReason = `Essential persistence failed; ${closingGap ? "loop" : "seal"} publication pending: ${error.ledgerIntegrity
+        ? error.message : `three publication attempts failed (${String(error?.message ?? error)}); repeated failure requires operator repair`}`;
+      throw new Error(persistenceReason);
+    });
+  }
+  return publish();
+}
+function validLoopAnchor(anchor) {
+  return anchor && Object.keys(anchor).sort().join(",") === "count,head" &&
+    anchor.count === Math.max(1, loop.archivePending.expected.count) + 1 && /^[a-f0-9]{64}$/.test(anchor.head ?? "");
+}
 function confirmedPausePending() {
   const result = loop?.attempt?.stage === "result" && loop.attempt.result;
-  const { taskId, attempt, resultRef, ...receipt } = loop?.confirmedCheckpoint ?? {};
+  const { taskId, attempt, resultRef, ...receipt } = invocation?.lastConfirmed ?? {};
   return loop?.phase === "implementation" && ["blocked", "continue", "gaps"].includes(result?.status) && result.remainingCount > 0 &&
     result.checkpoint?.confirmation?.kind === "pause" && taskId === result.taskId && attempt === result.attempt &&
     same(resultRef, result.ref) && same(receipt, result.checkpoint.confirmation);
@@ -1224,24 +1541,24 @@ function retainWorkerBlock(result) {
 }
 function loopReport(status, reason) {
   const now = Date.now();
-  const last = loop.results[loop.results.length - 1];
+  const last = loopResults(false).at(-1);
   const stale = !!loop.invalidated || loop.closing?.sameCandidate === false;
   if (persistenceFailed && persistenceReason && !reason.includes(persistenceReason)) reason += ` ${persistenceReason}`;
-  const exhausted = !persistenceFailed && !loop.halt && status === "gaps" && invocation.loops.length >= maxCycles();
+  const exhausted = !persistenceFailed && !loop.halt && status === "gaps" && invocation.consumedLoops >= maxCycles();
   if (exhausted) reason = `${maxCycles()} authorized loops consumed; execution partial. Remaining work requires a new invocation with human authorization.` +
     (stale ? " Candidate changed; affected checks and analyses are stale." : "");
   const report = {
     type: "execution-loop", invocation: config.invocation, loop: loop.number, maxLoops: maxCycles(),
     status: exhausted ? "partial" : status, reason, phase: loop.phase, candidate: loop.closing?.candidate ?? last?.candidate ?? null,
-    halt: loop.halt ?? null,
+    halt: loop.halt ?? null, history: { summaries: invocation.loopSummaries, ...historyReference() },
     elapsedMs: (loop.endedAt ?? now) - loop.startedAt, totalElapsedMs: now - invocation.startedAt,
     tokens: metrics(loop), totalTokens: metrics(),
-    work: loop.results.map(result => ({ taskId: result.taskId, attempt: result.attempt,
+    work: loopResults(false).map(result => ({ taskId: result.taskId, attempt: result.attempt,
       status: result.status, reference: result.ref, workDone: result.workDone ?? "See native failure result",
       remaining: result.remaining ?? [], remainingCount: result.remainingCount ?? null,
       diagnosis: result.diagnosis ?? "See native failure result" })),
     verification: {
-      checks: loop.results.filter(result => result.checks).map(result => ({
+      checks: loopResults(false).filter(result => result.checks).map(result => ({
         taskId: result.taskId, ...result.checks, current: result.checks.current && !stale,
         status: stale ? "stale" : result.checks.current ? "passed" : "failed-or-not-run", reference: result.ref,
       })),
@@ -1255,18 +1572,23 @@ function loopReport(status, reason) {
       last?.ref, loop.review?.references, loop.compliance?.ref, loop.halt?.ref, loop.plan?.rejection?.ref,
       ...(loop.analysisCalls ?? []).map(call => call.ref),
     ].filter(Boolean) }],
-    next: loop.halt ? (persistenceFailed ? "restore essential persistence; resolve observed impediment before any continuation" : "resolve observed impediment") : persistenceFailed ? "restore essential persistence; continuation requires supported native reconciliation" : status === "complete" ? "close" : status === "gaps" && invocation.loops.length < maxCycles()
+    next: status === "budget-exhausted" ? "automatically relaunch the same invocation and mission as a new top-level run"
+      : loop.halt ? (persistenceFailed ? "restore essential persistence; resolve observed impediment before any continuation" : "resolve observed impediment") : persistenceFailed ? "restore essential persistence; continuation requires supported native reconciliation" : status === "complete" ? "close" : status === "gaps" && invocation.consumedLoops < maxCycles()
       ? `continue loop ${loop.number + 1}` : status === "gaps" ? "new invocation requires human authorization" : "resolve observed impediment",
-    actionRequired: !persistenceFailed && !loop.halt && (status === "complete" || (status === "gaps" && invocation.loops.length < maxCycles())) ? "none" : reason,
+    actionRequired: !persistenceFailed && !loop.halt && (["complete", "budget-exhausted"].includes(status) || (status === "gaps" && invocation.consumedLoops < maxCycles())) ? "none" : reason,
     action: action(exhausted ? "partial" : status, reason),
   };
   if (typeof emit === "function") emit(report);
   return report;
 }
 function action(status, reason) {
+  if (status === "budget-exhausted") return { actor: "foreground", operation: "relaunch the same invocation and mission as a new top-level run",
+    reason, references: [], started: false };
+  if (loop?.halt?.code === "spawn-budget") return { actor: "human",
+    operation: "raise config.maxSubagentSpawnsPerRun or reduce the step's spawn demand", reason, references: [], started: false };
   const required = status !== "complete";
   const exhausted = !persistenceFailed && !loop?.halt && status === "partial" &&
-    invocation?.loops?.length >= maxCycles();
+    invocation?.consumedLoops >= maxCycles();
   const decision = loop?.plan?.status === "needs-decision";
   return {
     actor: !required ? "none" : persistenceFailed ? "persistence operator" : decision || exhausted ? "human"
@@ -1290,11 +1612,11 @@ function finish(status, reason) {
   return {
     status, heading: `Execution ${status}`, reason, invocation: config.invocation,
     missionId: config.missionId, missionPath: config.missionPath,
-    loopsConsumed: invocation?.loops?.length ?? 0, maxLoops: maxCycles(),
+    loopsConsumed: invocation?.consumedLoops ?? 0, maxLoops: maxCycles(),
     elapsedMs: Number.isFinite(invocation?.startedAt) ? Date.now() - invocation.startedAt : null, tokens: metrics(),
     phase: loop?.phase ?? "admission", candidate: loop?.closing?.candidate ?? currentCandidate ?? null,
     loopReport: loop ? loopReport(status === "partial" && loop.outcome === "gaps" && !persistenceFailed ? "gaps" : status, reason) : null,
-    actionRequired: status === "complete" ? "none" : reason,
+    actionRequired: ["complete", "budget-exhausted"].includes(status) ? "none" : reason,
     action: action(status, reason),
     publication: "not performed by workflow", references,
   };
@@ -1309,14 +1631,16 @@ try {
   if (!text(config.missionId) || !text(config.missionPath) || !text(config.invocation))
     return finish("blocked", "Existing native missionId and actually returned missionPath are required.");
   invocation = await state.get(key);
+  if (invocation && invocation.version !== 4)
+    return finish("blocked", "Retained execution predates state v4; no migration or replay is supported; retained unchanged.");
   activePlan = invocation?.activePlan;
-  loop = invocation?.loops?.at(-1);
+  loop = invocation?.loop;
   // Validate the stored request before even read-only reconstruction. Snapshot
   // equality is checked against the inspector below, never repaired from input.
   if (invocation?.association) {
     if (!same(invocation.amendments ?? [], config.amendments ?? []))
       return finish("blocked", "Immutable admission amendments changed; preserve retained path, SHA-256 and provenance, no recovery merge or replacement.");
-    if (invocation.version !== 3 || !/^[a-f0-9]{64}$/.test(invocation.admissionBinding ?? ""))
+    if (invocation.version !== 4 || !/^[a-f0-9]{64}$/.test(invocation.admissionBinding ?? ""))
       return finish("blocked", "Retained execution predates bound native admission; no migration or replay is supported. Preserve its evidence. Inspect its actual native terminal/barrier state; a revised assignment and new admission require actual human authorization, not resuming a terminal root.");
     const expected = invocation.association;
     if (expected.missionId !== config.missionId || expected.missionPath !== config.missionPath ||
@@ -1330,26 +1654,41 @@ try {
       return finish("blocked", "Retained host observation belongs to a different immutable request; retained unchanged.");
   }
   const legacy = await state.get("pitako-execution");
-  if ((invocation && ![2, 3].includes(invocation.version)) || (legacy && ![2, 3].includes(legacy.version)))
+  if ((invocation && ![4].includes(invocation.version)) || (legacy && ![4].includes(legacy.version)))
     return finish("blocked", "Obsolete execute supervisor state cannot be replayed or migrated; retained unchanged.");
   if (legacy && (legacy.version !== invocation?.version || !same(legacy.association, invocation?.association) ||
       legacy.association.invocation !== config.invocation))
     return finish("blocked", "Native mission already belongs to another immutable invocation; no replacement writer dispatched.");
+  if (!config.unblock && invocation?.lastBudgetProgress) {
+    if (loop?.halt) return finish(loop.halt.status, loop.halt.reason);
+    const blockedResolution = retainedResolutions().find(item => item.currentBarrier);
+    if (blockedResolution) return finish(["stopped", "interrupted"].includes(blockedResolution.currentBarrier.cause) ? "cancelled" : "blocked",
+      `Current continuation encountered a native barrier: ${blockedResolution.currentBarrier.cause}; this input does not authorize another interruption.`);
+    const resolvedHost = hostHalt && !["queued", "running", "pending"].includes(hostHalt.observedState) &&
+      (invocation.hostReconstruction?.stage === "admitted" && same(invocation.hostReconstruction.source, hostHalt) &&
+          !hostHalt.observedBarrier && hostHalt.status !== "cancelled" && !["stopped", "interrupted"].includes(hostHalt.observedState) ||
+        retainedResolutions().some(item => ["accepted", "applied"].includes(item.stage) &&
+          !item.failedHostObservation && same(item.hostHalt, hostHalt)));
+    if (hostHalt && !resolvedHost) return finish(hostHalt.status, hostHalt.reason);
+  }
+  const sealBarrier = invocation?.sealPending && loop?.halt?.code === "native-barrier" &&
+    ["stopped", "interrupted", "native permission denial"].includes(loop.halt.cause);
+  if (sealBarrier && !config.unblock) return finish(loop.halt.status, loop.halt.reason);
+  if (invocation?.sealPending && !sealBarrier) await archiveSeal();
   if (!config.unblock) {
     // A durable human input survives technical replay without another flag.
     // Matching its original observation does not settle subsequent intentions.
-    const retained = [...(invocation?.resolutions ?? []),
-      ...(invocation?.loops ?? []).flatMap(item => item.resolutions ?? [])];
+    const retained = retainedResolutions();
     if (retained.some(item => !same(item.request, hostRequest())))
       return finish("blocked", "Retained continuation input association conflicts; retained unchanged.");
     // Keep the latest disposition, including a later native barrier. Falling
     // back to an older successful input could otherwise revive its authority.
-    resolution = retained.reverse().find(item => same(item.request, hostRequest()));
+    resolution = retained.find(item => same(item.request, hostRequest()));
   }
   if (config.unblock) {
-    const target = config.resolution.loop === 0 ? invocation : invocation?.loops?.find(item => item.number === config.resolution.loop);
-    const existing = target?.resolutions?.find(item => item.text === config.resolution.text && item.loop === config.resolution.loop);
-    if (!target || (!existing && (config.resolution.loop !== (loop?.number ?? 0) ||
+    const existing = retainedResolutions().find(item => item.text === config.resolution.text && item.loop === config.resolution.loop);
+    const target = config.resolution.loop === 0 ? invocation : loop?.number === config.resolution.loop && !loop.archived ? loop : null;
+    if ((!target && !existing) || (!existing && (config.resolution.loop !== (loop?.number ?? 0) ||
         !(hostHalt || loop?.halt || loop?.outcome === "blocked" || loop?.outcome === "cancelled"))))
       return finish("blocked", "Current resolution must name the retained interrupted loop/request, not a new invocation or an unrelated loop.");
     resolution = existing;
@@ -1397,7 +1736,7 @@ try {
       return finish(hostHalt.status, `${hostHalt.reason} Retained native barrier requires reconciliation or current continuation input.`);
     hostReconstruction = invocation.hostReconstruction;
     if (hostReconstruction && (!same(hostReconstruction.source, hostHalt) || !["intention", "admitted"].includes(hostReconstruction.stage)))
-      return finish("blocked", "Bounded host reconstruction is unresolved or failed; retain the exact operation, no replacement inspection authorized.");
+      return finish("blocked", `Bounded host reconstruction is unresolved or failed; retain the exact operation, no replacement inspection authorized. ${hostReconstruction.failure?.reason ?? ""}`);
     // A committed intention has no admitted observation yet. Only the fixed
     // pure inspection/capture projections below may repeat: this is neither
     // reattachment nor evidence that an earlier host call or writer settled.
@@ -1420,11 +1759,14 @@ try {
     if (!Number.isSafeInteger(admitted.maxCycles) || admitted.maxCycles < 1)
       throw new Error("Invalid pitako.execute.maxCycles admission receipt.");
     invocation = {
-      version: 3, association: { missionId: config.missionId, missionPath: config.missionPath,
+      version: 4, association: { missionId: config.missionId, missionPath: config.missionPath,
         invocation: config.invocation, root: metadata.root, commonDir: metadata.commonDir,
         source: metadata.selected.source, digest: metadata.selected.digest,
         maxCycles: admitted.maxCycles, sourceRefs: config.sourceRefs ?? [] },
-      admissionBinding: current.binding, amendments: clone(config.amendments ?? []), snapshot: { content: captured.content }, startedAt: Date.now(), loops: [], activePlan: null,
+      admissionBinding: current.binding, amendments: clone(config.amendments ?? []), startedAt: Date.now(), consumedLoops: 0, ledger: { count: 0, head: null }, sealPending: null,
+      recoverySeq: 0, lastRecoveryRef: null, lastConfirmed: null, usageTotals: { tokens: 0, known: 0, unknown: 0 },
+      tasks: {}, taskFrame: null, loop: null,
+      planRejections: [], closeReferences: [], loopSummaries: [], lastClosedResolution: null, activePlan: null,
       ...(requestState?.hostHalt ? { hostHalt: requestState.hostHalt } : {}),
       ...(requestState?.resolutions ? { resolutions: requestState.resolutions } : {}),
       ...(requestState?.hostReconstruction ? { hostReconstruction: requestState.hostReconstruction } : {}),
@@ -1433,12 +1775,12 @@ try {
     await save();
   } else {
     replay = true;
-    if (invocation.version === 3 && (!Number.isSafeInteger(invocation.association?.maxCycles) ||
+    if (invocation.version === 4 && (!Number.isSafeInteger(invocation.association?.maxCycles) ||
         invocation.association.maxCycles < 1 || !same(invocation.association.sourceRefs, config.sourceRefs ?? [])))
       throw new Error("Incompatible immutable maxCycles/sourceRefs association; retained unchanged.");
     if (invocation.version === 2 && ((config.sourceRefs ?? []).length || invocation.association?.maxCycles !== undefined))
       throw new Error("Legacy fixed-three association cannot acquire configuration or source references.");
-    if (captured.content !== invocation.snapshot.content)
+    if (metadata.selected.digest !== invocation.association.digest)
       throw new Error(`Immutable full snapshot content changed: ${metadata.selected.source}; retained unchanged. Restore exact bytes from a reliable original and deliver desired changes as an explicit human addendum; without reliable originals remain blocked. A revised admission needs actual human authorization.`);
     const observed = metadata.selected;
     const expected = invocation.association;
@@ -1451,13 +1793,13 @@ try {
     invocation.activePlan = null;
   }
   admissionValidated = true;
-  if (invocation.version === 3) {
+  if (invocation.version === 4) {
     associationSchema.properties.maxCycles = integer;
     associationSchema.properties.sourceRefs = list(object({ path: string, digest: string }));
     associationSchema.required.push("maxCycles", "sourceRefs");
   }
   if (!legacy) {
-    try { await state.set("pitako-execution", { version: invocation.version, association: invocation.association }); }
+    try { await persistState("pitako-execution", { version: invocation.version, association: invocation.association }); }
     catch (error) { persistenceFailed = true; throw new Error(`Essential persistence failed; dispatch halted: ${String(error)}`); }
   }
   if (hostReconstruction?.stage === "intention") {
@@ -1471,7 +1813,7 @@ try {
   inspectedAnalyses = metadata.retainedAnalyses ?? [];
   checkpointObservation = metadata.checkpointObservation;
   currentCandidate = candidate(current.checkout);
-  loop = invocation.loops[invocation.loops.length - 1];
+  loop = invocation.loop;
   // Older readers promoted a saved non-blocked pause into a human impediment.
   // Reconcile only that exact admitted result, never a native or worker barrier.
   if (confirmedPausePending() && loop.attempt.result.status !== "blocked" &&
@@ -1491,22 +1833,24 @@ try {
     resolution.stage = "accepted";
     await save();
   }
-  if (resolution?.stage === "accepted" && resolution.loop === loop?.number && !confirmedPausePending())
+  if (resolution?.stage === "accepted" && resolution.loop === loop?.number && !loop.archived && !confirmedPausePending())
     await reconcileRetainedRecoveries();
   // A completed needs-decision producer is not redispatched. Current useful
   // input goes to the next ordinary budgeted loop; retain its question/ref.
-  if (resolution?.stage === "accepted" && resolution.loop === loop?.number &&
+  if (resolution?.stage === "accepted" && resolution.loop === loop?.number && !loop.archived &&
       loop.plan?.status === "needs-decision" && loop.outcome === "blocked") {
     resolution.stage = "applied";
     loop.outcome = "gaps";
     delete loop.halt;
     await save();
   }
-  if (resolution?.stage === "accepted" && resolution.loop === loop?.number &&
-      loop.halt?.code === "native-barrier" && !confirmedPausePending() &&
+  if (resolution?.stage === "accepted" && resolution.loop === loop?.number && !loop.archived &&
+      loop.halt?.code === "native-barrier" && (!confirmedPausePending() ||
+        invocation.sealPending && loop.halt.ref?.agent === "pitako.execution-ledger") &&
       ["stopped", "interrupted", "native permission denial"].includes(loop.halt.cause))
     await reconcileInterruptedOperations();
-  if (resolution?.stage === "accepted" && resolution.hostHalt && !loop?.halt) {
+  if (invocation.sealPending && !loop?.halt) await archiveSeal();
+  if (resolution?.stage === "accepted" && (resolution.loop === 0 || resolution.loop === loop?.number && !loop.archived) && resolution.hostHalt && !loop?.halt) {
     // The bounded reconstruction is applied, not a claim that a historical
     // host receipt or a later writer has settled.
     resolution.stage = "applied";
@@ -1515,9 +1859,11 @@ try {
   // Only an admitted cooperative pause with pending work consumes current input.
   // A checkpoint alone does not resolve an unrelated semantic/product impediment.
   const paused = loop?.attempt?.stage === "result" && loop.attempt.result;
-  if (resolution?.stage === "accepted" && resolution.loop === loop?.number && confirmedPausePending() &&
-      same(resolution.halt, loop.halt) && (loop.halt?.code === "semantic-block" ||
-        (loop.halt?.code === "native-barrier" && ["stopped", "interrupted"].includes(loop.halt.cause)))) {
+  const resolvedSealPause = !invocation.sealPending && !loop?.halt &&
+    resolution?.halt?.ref?.agent === "pitako.execution-ledger" && resolution.observations?.length;
+  if (resolution?.stage === "accepted" && resolution.loop === loop?.number && !loop.archived && confirmedPausePending() &&
+      (resolvedSealPause || same(resolution.halt, loop.halt) && (loop.halt?.code === "semantic-block" ||
+        (loop.halt?.code === "native-barrier" && ["stopped", "interrupted"].includes(loop.halt.cause))))) {
     const ref = loop.attempt.launch ?? paused.ref;
     resolution.stage = "applied";
     let observed;
@@ -1575,20 +1921,25 @@ try {
   if (loop?.outcome === "blocked" || loop?.outcome === "cancelled")
     return finish(loop.outcome, "Retained native/decision impediment requires explicit resolution; slots are not renewed.");
   while (true) {
+    if (loop?.outcome === "gaps" && !loop.archived) await archiveGaps();
     if (!loop || loop.outcome) {
-      if (invocation.loops.length >= maxCycles()) return finish("partial", `${maxCycles()} authorized loops consumed; remaining work requires new human authorization.`);
+      if (invocation.consumedLoops >= maxCycles()) return finish("partial", `${maxCycles()} authorized loops consumed; remaining work requires new human authorization.`);
 
       activePlan = null;
-      loop = { number: invocation.loops.length + 1, startedAt: Date.now(), phase: "director",
+      loop = { number: invocation.consumedLoops + 1, startedAt: Date.now(), phase: "director",
         cursor: 0, manifest: null, plan: null, attempt: null, results: [], recoveries: [], usage: [] };
-      invocation.loops.push(loop);
+      invocation.loop = loop;
+      invocation.consumedLoops++;
+      resolution = undefined;
+      invocation.tasks = {};
+      invocation.taskFrame = null;
       // Slot is consumed durably BEFORE calling a fresh read-only director.
       await save();
     }
     associationSchema.const = association(loop.number);
     if (loop.phase === "director") {
       const directorKey = `${key}.l${loop.number}.director`;
-      if (!loop.plan) {
+      if (!loop.plan || budgetRejected(directorKey)) {
         loop.plan = { stage: "intention", ref: { key: directorKey } };
         await save();
         const result = await collect(directorKey, "pitako.execution-director",
@@ -1642,12 +1993,13 @@ No replacement task list elsewhere. Carry the exact association above. Native pe
         if (loop.plan.stage === "admitted" || loop.manifest ||
             !/^loop_plan (?:needs full ordered task scopes|dependencies require)/.test(diagnostic))
           throw error;
-        if (invocation.loops.some(item => item !== loop && item.plan?.rejection?.diagnostic === diagnostic)) {
+        if (invocation.planRejections.some(item => item.diagnostic === diagnostic)) {
           const reason = `No new useful corrective input for repeated plan defect: ${diagnostic}`;
           // This diagnosed route is exhausted, not an unknown/missing payload.
           // Keep its terminal disposition in essential state, independent of
           // the optional full-plan cache and later original availability.
           loop.halt = { status: "blocked", code: "semantic-block", reason, ref: clone(loop.plan.ref) };
+          activePlan = null;
           throw new Error(reason);
         }
         const rejection = { diagnostic,
@@ -1671,6 +2023,7 @@ No replacement task list elsewhere. Carry the exact association above. Native pe
         return finish("blocked", loop.halt.reason);
       }
       loop.manifest = activePlan.tasks.map(task => task.id);
+      invocation.tasks = Object.fromEntries(loop.manifest.map(id => [id, { admitted: [], completed: null, last: null }]));
       loop.plan.stage = "admitted";
       loop.phase = "implementation";
       await save();
@@ -1679,7 +2032,7 @@ No replacement task list elsewhere. Carry the exact association above. Native pe
       // An unsaved halt still has its exact native writer receipt. Observe that
       // barrier before dispatching even an optional read-only plan inspector.
       let attemptObservation;
-      if (replay && loop.attempt && loop.attempt.stage !== "result") {
+      if (replay && loop.attempt && loop.attempt.stage !== "result" && !budgetRejected(loop.attempt.key)) {
         const ref = loop.attempt.launch ?? { key: loop.attempt.key };
         attemptObservation = await observeStatus(ref.runId ?? ref.key, !!loop.attempt.checkpoint);
         assertFallbackProducer(attemptObservation, ref);
@@ -1694,6 +2047,8 @@ No replacement task list elsewhere. Carry the exact association above. Native pe
       }
       while (loop.cursor < loop.manifest.length) {
         const task = activePlan.tasks[loop.cursor];
+        if (invocation.sealPending) await archiveSeal();
+        if (!invocation.taskFrame) invocation.taskFrame = { taskId: task.id, identities: [], evidence: [], operations: [], restorationKeys: [] };
         const prerequisites = prerequisiteResults(task);
         let value;
         if (loop.attempt?.stage === "result") {
@@ -1701,26 +2056,25 @@ No replacement task list elsewhere. Carry the exact association above. Native pe
           const previous = loop.attempt.result;
           if (previous.status === "blocked") return finish("blocked", loop.halt.reason);
           if (previous.status === "complete") {
-            loop.cursor++; loop.attempt = null; await save(); continue;
+            loop.cursor++; loop.attempt = null; invocation.taskFrame = null; await save(); continue;
           }
           if (!previous.usefulContinuation) break;
           let pauseSource = confirmedPausePending() ? { checkpoint: clone(loop.attempt.checkpoint),
             confirmation: clone(previous.checkpoint.confirmation) } : loop.attempt.pauseSource && clone(loop.attempt.pauseSource);
           if (loop.attempt.restore && !confirmedPausePending() && loop.attempt.restore.authority?.confirmedPause) {
-            const source = pauseSource ?? { checkpoint: clone([].concat(loop.attempt.restore.checkpoint).at(-1)),
+            const source = pauseSource ?? { checkpoint: clone(invocation.taskFrame.sources.at(-1)),
               confirmation: clone(loop.attempt.restore.authority.confirmedPause) };
-            source.sources = [clone(loop.attempt.checkpoint), ...[].concat(clone(loop.attempt.restore.checkpoint))];
-            source.restorations = [...(source.restorations ?? []), { taskId: task.id, index: loop.cursor,
-              number: loop.attempt.number, restore: clone(loop.attempt.restore) }];
             pauseSource = source;
-          } else if (pauseSource && !confirmedPausePending()) {
-            pauseSource.sources = [clone(loop.attempt.checkpoint), ...[].concat(pauseSource.sources ?? pauseSource.checkpoint)];
+          }
+          if (pauseSource && !invocation.taskFrame.restorationKeys.includes(loop.attempt.checkpoint.key)) {
+            invocation.taskFrame.restorationKeys.unshift(loop.attempt.checkpoint.key);
+            (invocation.taskFrame.sources ??= []).unshift(clone(loop.attempt.checkpoint));
           }
           loop.attempt = { taskId: task.id, index: loop.cursor, number: previous.attempt + 1,
             key: `${key}.l${loop.number}.t${loop.cursor + 1}.a${previous.attempt + 1}`,
             stage: "intention", continuationRef: previous.ref, ...(pauseSource ? { pauseSource } : {}) };
           await save();
-        } else if (loop.attempt && !loop.attempt.restore?.undispatched) {
+        } else if (loop.attempt && !loop.attempt.restore?.undispatched && !budgetRejected(loop.attempt.key)) {
           // Never call an unresolved writer key as if native reuse were read-only.
           const ref = loop.attempt.launch ?? { key: loop.attempt.key };
           let observed = attemptObservation ?? await observeStatus(ref.runId ?? ref.key);
@@ -1748,7 +2102,9 @@ No replacement task list elsewhere. Carry the exact association above. Native pe
               loop.recoveries.find(item => item.subject === `attempt-result:${loop.attempt.taskId}:${loop.attempt.number}`).ref,
               ref.runId ?? ref.key);
           }
-          await save(); continue;
+          await save();
+          if (invocation.sealPending) await archiveSeal();
+          continue;
         } else if (!loop.attempt) {
           loop.attempt = { taskId: task.id, index: loop.cursor, number: 1,
             key: `${key}.l${loop.number}.t${loop.cursor + 1}.a1`, stage: "intention", continuationRef: null };
@@ -1757,12 +2113,14 @@ No replacement task list elsewhere. Carry the exact association above. Native pe
         // Essential intention before dispatch; only the writer's published
         // preimages turn this pointer into a recoverable checkpoint.
         if (!loop.attempt.checkpoint) {
-          loop.attempt.checkpoint = { version: 1, association: clone(invocation.association),
+          loop.attempt.checkpoint = { version: 2, association: clone(invocation.association),
             key: loop.attempt.key, taskId: task.id, attempt: loop.attempt.number,
             loop: loop.number, cursor: loop.cursor, phase: loop.phase, planRef: clone(loop.plan.ref),
-            progress: { consumedLoops: invocation.loops.length,
-              admittedResults: loop.results.map(result => ({ taskId: result.taskId, attempt: result.attempt,
-                status: result.status, ref: clone(result.ref) })) } };
+            progress: { consumedLoops: invocation.consumedLoops,
+              admitted: Object.fromEntries(Object.entries(invocation.tasks).filter(([, task]) => task.admitted.length)
+                .map(([id, task]) => [id, clone(task.admitted)])),
+              previous: invocation.lastConfirmed?.kind === "unit" && invocation.lastConfirmed.position.loop === loop.number ? (({ taskId, attempt, resultRef, checkpointRef, digest }) =>
+                clone({ taskId, attempt, resultRef, checkpointRef, digest }))(invocation.lastConfirmed) : null } };
           await save();
         }
         if (loop.attempt.restore) {
@@ -1774,6 +2132,11 @@ No replacement task list elsewhere. Carry the exact association above. Native pe
           await save();
         }
         const descriptor = clone(loop.attempt);
+        if (descriptor.restore) descriptor.restore.checkpoint = descriptor.restore.sourceKeys.map(sourceKey => {
+          const source = invocation.taskFrame.sources.find(item => item.key === sourceKey);
+          if (!source) throw new Error("Missing authenticated restoration source intent.");
+          return clone(source);
+        });
         let result = await collect(descriptor.key, "pitako.worker",
           { label: task.goal, phase: "implementation" }, `${fullContext()}
 EXECUTE SINGLE TASK. No delegation, next-task selection, private diary/progress file or parallel TODO.
@@ -1886,6 +2249,7 @@ continue requires useful progress plus concrete diagnosed continuation, not a re
             loop.recoveries.find(item => item.subject === `attempt-result:${descriptor.taskId}:${descriptor.number}`).ref);
         } else value = admitWorker(result, loop.attempt, task);
         await save();
+        if (invocation.sealPending) await archiveSeal();
         if (value.status === "blocked") {
           return finish("blocked", loop.halt.reason);
         }
@@ -1897,12 +2261,13 @@ continue requires useful progress plus concrete diagnosed continuation, not a re
           : "Task has pending work without a useful diagnosed same-task continuation.");
         continue;
       }
-      loop.candidate = loop.results[loop.results.length - 1].candidate;
+      loop.candidate = loopResults().at(-1).candidate;
       loop.phase = "review"; await save();
     }
     if (loop.phase === "review") {
       await reconcileAnalysis();
       progress();
+      let reviewBudgetError;
       // reviewPhase owns its actual dynamic angles/critique/one-defense/synthesis.
       // Replay reconciles each retained call; repeating a key is not observation.
       const reviewRuns = { all: requests => analysisDispatch(requests.map(request => ({
@@ -1910,6 +2275,9 @@ continue requires useful progress plus concrete diagnosed continuation, not a re
       }))).then(results => {
         results.forEach((result, index) => usage(result, requests[index].key));
         return results;
+      }).catch(error => {
+        if (error?.spawnBudgetExhausted) reviewBudgetError = error;
+        throw error;
       }) };
       const reviewed = await reviewPhase({
         brief: `${fullContext()}\nReview the COMPLETE authorized result against ALL specs, not director tasks alone.
@@ -1917,12 +2285,13 @@ Admitted COMPLETE plan references: ${JSON.stringify(loop.plan.ref)}.
 Assess single-outcome decomposition and necessary dependencies independently; schema cannot certify semantics.
 Do not repeat correct completed implementation merely to improve its past decomposition.
 Candidate including WIP: ${JSON.stringify(loop.candidate)}.
-Actual final checks/result references: ${JSON.stringify(loop.results)}.
+Actual final checks/result references: ${JSON.stringify(loopResults())}.
 No own writer is active. Do not run checks or repair. Only clear screening permits compliance.`,
         target: { kind: "solution", reference: JSON.stringify(loop.candidate),
           material: `Entire designated checkout ${config.root}, immutable full specs above and native work/check artifacts.
 Read the actual sources and full referenced reports, not previews. Candidate: ${JSON.stringify(loop.candidate)}.` },
       }, reviewRuns, { prefix: `${key}.l${loop.number}.review.`, mode: "execute" });
+      if (reviewBudgetError) throw reviewBudgetError;
       if (persistenceFailed) throw new Error(persistenceReason);
       // A second failed observation must not erase the original lookup refs.
       const reviewRefs = new Map((loop.review?.references ?? []).map(ref => [ref.key, ref]));
@@ -1931,6 +2300,7 @@ Read the actual sources and full referenced reports, not previews. Candidate: ${
       }));
       loop.review = { status: reviewed.status, phase: reviewed.phase,
         verdict: reviewed.screening?.verdict ?? "blocked", reason: excerpt(reviewed.screening?.reason ?? reviewed.error),
+        unresolved: reviewed.screening?.assessments?.filter(item => item.material) ?? [],
         nativeFailure: reviewed.nativeFailure ?? null,
         references: [...reviewRefs.values()] };
       const reviewBarrier = reviewed.references.map(ref => barrier(ref)).find(Boolean);
@@ -1970,7 +2340,7 @@ not-applicable requires a source-grounded reason. Identify missing obligations a
 You are accountable for semantic coverage of the complete specs; script shape validation cannot
 certify it. An empty or entirely not-applicable inventory cannot justify fulfilled.
 Candidate INCLUDING WIP: ${JSON.stringify(loop.candidate)}.
-Work and actual final mandatory checks: ${JSON.stringify(loop.results)}.
+Work and actual final mandatory checks: ${JSON.stringify(loopResults())}.
 Reasoned shared adversarial clear: ${JSON.stringify(loop.review)}.
 Admitted COMPLETE plan references: ${JSON.stringify(loop.plan.ref)}.
 Independently assess single-outcome decomposition and dependency completeness against the full spec;
@@ -1982,7 +2352,9 @@ no unresolved material gaps and this SAME candidate. Otherwise gaps or blocked. 
       const value = result?.structuredOutput;
       const complianceRef = loop.compliance?.ref;
       loop.compliance = { ...projection(complianceKey, result), candidate: value?.candidate ? candidate(value.candidate) : null,
-        reason: excerpt(value?.reason) };
+        reason: excerpt(value?.reason),
+        unresolved: Array.isArray(value?.requirements) ? value.requirements.filter(item => ["gap", "blocked"].includes(item?.status))
+          .map(item => ({ id: item.id, source: item.source, status: item.status, reason: item.reason })) : [] };
       loop.compliance.ref = { ...complianceRef, ...loop.compliance.ref };
       if (barrier(result)) throw nativeBarrier(barrier(result));
       if (!result?.ok || !["fulfilled", "gaps", "blocked"].includes(value?.status) || !text(value.reason) ||
@@ -2004,26 +2376,32 @@ no unresolved material gaps and this SAME candidate. Otherwise gaps or blocked. 
     if (loop.phase === "closing") {
       progress();
       const retainedClosing = !!(loop.closing || loop.observation);
-       // An intention is durable before dispatch. Replay observes its exact key;
-       // it never calls runs.all again to guess whether an earlier launch happened.
-       if (!loop.closing) {
-         const fresh = !loop.observation;
-         if (fresh) {
+       // Reconcile the retained producer first; a new retry key publishes only
+       // through the ledger's identical-byte comparison.
+       let closeTries = 0;
+       while (!loop.closing) {
+        closeTries++;
+        try {
+         const fresh = !loop.observation || budgetRejected(loop.observation.key);
+         if (!loop.observation) {
            loop.observation = { invocation: config.invocation, loop: loop.number,
-             key: `${key}.l${loop.number}.checkout`, stage: "intention" };
+             key: `${key}.l${loop.number}.checkout${loop.checkoutRetry ? `.r${loop.checkoutRetry}` : ""}`, stage: "intention" };
            await save();
          }
          const intention = loop.observation;
          if (intention.invocation !== config.invocation || intention.loop !== loop.number ||
-             intention.key !== `${key}.l${loop.number}.checkout`)
+             intention.key !== `${key}.l${loop.number}.checkout${loop.checkoutRetry ? `.r${loop.checkoutRetry}` : ""}`)
            throw new Error("Closing observation intention conflicts with this invocation/loop; inspect the retained exact operation, no replacement dispatch.");
          let observed;
          try {
            observed = fresh ? (await dispatch([{ key: intention.key, agent: "pitako.checkout-observer",
-             task: "Observe actual cwd checkout.", cwd: config.root, context: "fresh",
+             task: JSON.stringify({ expected: { invocation: config.invocation, ...loop.archivePending.expected },
+               body: { record: closingRecord(), ...(loop.archivePending.expected.count === 0
+                 ? { spec: { content: config.preliminary.content, digest: invocation.association.digest } } : {}) } }), cwd: config.root, context: "fresh",
              output: false, outputMode: "inline", outputSchema: false, acceptance: false, reads: false, progress: false }]))[0]
              : await observeStatus(intention.ref?.runId ?? intention.key, true);
          } catch (error) {
+           if (error.nativeBarrier) error.nativeReference ??= { key: intention.key, agent: "pitako.checkout-observer" };
            intention.failure = { reason: String(error?.message ?? error) };
            if (!persistenceFailed) await save();
            throw error;
@@ -2032,7 +2410,7 @@ no unresolved material gaps and this SAME candidate. Otherwise gaps or blocked. 
              intention.ref?.asyncDir && observed?.asyncDir !== undefined && observed.asyncDir !== intention.ref.asyncDir)
            throw new Error(`Closing producer identity changed for ${intention.key}; expected ${intention.ref.runId ?? "unavailable"}, observed ${observed?.runId ?? "unavailable"}. Inspect retained native references; no replacement dispatch.`);
          const cause = barrier(observed, intention.ref?.runId ?? intention.key);
-         if (cause && intention.validated) throw nativeBarrier(cause, intention.ref);
+         if (cause && (intention.validated || !fresh)) throw nativeBarrier(cause, intention.ref);
          let observation = intention.validated;
          if (observation) {
            if (intention.stage !== "receipt" || intention.ref?.key !== intention.key ||
@@ -2041,10 +2419,10 @@ no unresolved material gaps and this SAME candidate. Otherwise gaps or blocked. 
                !text(intention.ref?.externalAdapter?.outputArtifacts?.stdoutPath) ||
                !text(intention.ref?.externalAdapter?.outputArtifacts?.stderrPath) ||
                utf8Bytes(JSON.stringify(observation)) > 61440 || observation.version !== 1 || observation.ok !== true ||
-               Object.keys(observation).sort().join(",") !== "checkout,commonDir,ok,root,version" ||
+               Object.keys(observation).sort().join(",") !== "checkout,commonDir,ledger,ok,root,summaries,version" ||
                observation.root !== invocation.association.root || observation.commonDir !== invocation.association.commonDir ||
                Object.keys(observation.checkout ?? {}).sort().join(",") !== "fingerprint,head" ||
-               !candidate(observation.checkout))
+               !candidate(observation.checkout) || !validLoopAnchor(observation.ledger) || !validSummaries(observation.summaries))
              throw new Error(`Invalid retained closing evidence for ${intention.key}: ${JSON.stringify(intention.ref)}. Reconcile the exact original stdout/stderr and producer; no replacement dispatch.`);
          } else {
            if (!fresh && (!observed?.externalAdapter || !observed?.asyncDir))
@@ -2069,30 +2447,48 @@ no unresolved material gaps and this SAME candidate. Otherwise gaps or blocked. 
              throw new Error(`Invalid closing stdout for ${intention.key}; inspect its native stdout reference, not a preview or truncated tail.`);
            try { observation = JSON.parse(observed.output); }
            catch { throw new Error(`Invalid closing JSON document for ${intention.key}; retain stdout/stderr and reconcile the exact native producer without redispatch.`); }
+           if (observation?.error === "ledger-integrity")
+             throw Object.assign(new Error(`Ledger integrity requires human reconciliation: ${observation.reason}`), { ledgerIntegrity: true });
            if (!observation || observation.version !== 1 || observation.ok !== true ||
-               Object.keys(observation).sort().join(",") !== "checkout,commonDir,ok,root,version" ||
+               Object.keys(observation).sort().join(",") !== "checkout,commonDir,ledger,ok,root,summaries,version" ||
                observation.root !== invocation.association.root || observation.commonDir !== invocation.association.commonDir ||
-               !candidate(observation.checkout) || typeof observation.checkout.branch !== "string" ||
-               typeof observation.checkout.status !== "string")
+               !validLoopAnchor(observation.ledger) || !validSummaries(observation.summaries) || !candidate(observation.checkout) ||
+               Object.keys(observation.checkout ?? {}).sort().join(",") !== "fingerprint,head")
              throw new Error(`Invalid closing observation or physical workspace mismatch for ${intention.key}; expected ${invocation.association.root} / ${invocation.association.commonDir}, observed ${observation?.root ?? "unavailable"} / ${observation?.commonDir ?? "unavailable"}. ${observation?.ok === false ? [observation.reason, observation.nextStep].filter(text).join(" ") : "Inspect the exact native stdout/stderr and designated cwd; preserve the snapshot and pending intention."}`);
            // Retain only the validated candidate/workspace projection, not potentially large Git status text.
            observation = { version: 1, ok: true, root: observation.root, commonDir: observation.commonDir,
-             checkout: candidate(observation.checkout) };
+             checkout: candidate(observation.checkout), ledger: observation.ledger, summaries: observation.summaries };
            intention.validated = observation;
            await save();
          }
          const producer = intention.ref;
-         if (invocation.loops.some(previous => previous !== loop && previous.closing &&
-             (previous.closing.ref?.runId === producer.runId || previous.closing.ref?.asyncDir === producer.asyncDir ||
-               previous.closing.ref?.externalAdapter?.outputArtifacts?.stdoutPath === producer.externalAdapter.outputArtifacts.stdoutPath ||
-               previous.closing.ref?.externalAdapter?.outputArtifacts?.stderrPath === producer.externalAdapter.outputArtifacts.stderrPath)))
+         if (invocation.closeReferences.some(previous => previous.loop !== loop.number &&
+             (previous.runId === producer.runId || previous.asyncDir === producer.asyncDir ||
+               previous.stdoutPath === producer.externalAdapter.outputArtifacts.stdoutPath ||
+               previous.stderrPath === producer.externalAdapter.outputArtifacts.stderrPath)))
            throw new Error("Closing observation reuses another loop's native evidence; inspect the exact producer references before continuation.");
+         const oldLedger = invocation.ledger;
+         invocation.ledger = observation.ledger;
          loop.closing = { candidate: candidate(observation.checkout),
            sameCandidate: same(candidate(observation.checkout), loop.candidate),
            observation, ref: intention.ref };
+         intention.stage = "receipt";
+         try { await save(); } catch (error) { invocation.ledger = oldLedger; delete loop.closing; throw error; }
          intention.stage = "complete";
          delete intention.validated;
-         await save();
+        } catch (error) {
+          if (error.terminalPersistence || error.spawnBudgetExhausted || error.ledgerIntegrity || error.nativeBarrier || error.nativeFailure?.code === "capacity" ||
+              /Closing archive source fields changed|Invalid retained closing evidence|producer identity changed|reuses another loop/.test(error.message)) throw error;
+          if (closeTries >= 3) throw new Error(`Checkout publication pending: three attempts failed (${error.message}); repeated failure requires operator repair.`);
+          persistenceFailed = false; persistenceReason = null;
+          // Validated bytes can be admitted again after a state-save cut. Otherwise
+          // reobserve and let the ledger reject a changed post-publication retry.
+          if (!loop.observation?.validated) {
+            loop.checkoutRetry = (loop.checkoutRetry ?? 0) + 1;
+            delete loop.observation;
+          }
+          await save();
+        }
        }
       // Recovered evidence predates admission; a freshly dispatched observation does not.
       if (retainedClosing && replay && !same(loop.closing.candidate, currentCandidate)) {
@@ -2102,13 +2498,21 @@ no unresolved material gaps and this SAME candidate. Otherwise gaps or blocked. 
       }
       const fulfilled = loop.closing.sameCandidate && loop.review?.verdict === "clear" &&
         loop.compliance?.status === "fulfilled" && same(loop.compliance.candidate, loop.candidate) &&
-        loop.results[loop.results.length - 1]?.checks?.current;
+        loopResults().at(-1)?.checks?.current;
+      const beforeClose = clone(loop), beforeTotals = clone(invocation.usageTotals);
       loop.outcome = fulfilled ? "complete" : "gaps"; loop.endedAt = Date.now();
       loop.phase = "finished"; activePlan = null;
-      try { await save(); } catch (error) {
-        // A failed essential close is a suspension, not a durable loop outcome.
-        delete loop.outcome; delete loop.endedAt; loop.phase = "closing";
-        throw error;
+      loop.archived = true;
+      delete loop.archivePending;
+      foldLoop(loop.closing.observation.summaries);
+      for (let attempt = 1; ; attempt++) {
+        try { await save(); persistenceFailed = false; persistenceReason = null; break; } catch (error) {
+          if (!error.terminalPersistence && attempt < 3) { persistenceFailed = false; persistenceReason = null; continue; }
+          // Keep the published anchor, but do not lose the still-open frame.
+          Object.keys(loop).forEach(name => delete loop[name]); Object.assign(loop, beforeClose);
+          invocation.usageTotals = beforeTotals;
+          throw error;
+        }
       }
       if (fulfilled) return finish("complete", "Whole-spec fulfillment and mandatory checks verified for the current candidate. No more loops required.");
       loopReport("gaps", !loop.closing.sameCandidate ? "Candidate changed; affected checks and analyses are stale."
@@ -2117,6 +2521,21 @@ no unresolved material gaps and this SAME candidate. Otherwise gaps or blocked. 
   }
 } catch (error) {
   let reason = String(error?.message ?? error);
+  if (error?.spawnBudgetExhausted && invocation?.association && !persistenceFailed && !loop?.halt &&
+      !resolution?.currentBarrier && !hostHalt) {
+    const marker = { checkpoint: invocation.lastConfirmed?.digest ?? null,
+      closedLoop: loop?.archived ? loop.number : (loop?.number ?? 1) - 1,
+      ledger: clone(invocation.ledger) };
+    const stalled = same(marker, invocation.lastBudgetProgress);
+    invocation.lastBudgetProgress = marker;
+    if (stalled) loop.halt = { status: "blocked", code: "spawn-budget",
+      reason: "No seals admitted or loops closed since the previous budget-exhausted end; one step needs more spawns than the per-run budget. Human intervention must raise config.maxSubagentSpawnsPerRun or reduce that step's spawn demand." };
+    try {
+      await save();
+      return finish(stalled ? "blocked" : "budget-exhausted", stalled ? loop.halt.reason :
+        "Native per-run spawn budget exhausted before any child in the admission group started; state saved. Automatically relaunch the same invocation and mission as a new top-level run.");
+    } catch (saveError) { reason += ` ${String(saveError?.message ?? saveError)}`; }
+  }
   if (error?.hostHalt) {
     hostHalt = error.hostHalt;
     references.push(hostHalt.ref);
@@ -2127,7 +2546,7 @@ no unresolved material gaps and this SAME candidate. Otherwise gaps or blocked. 
       hostReconstruction.stage = "failed";
       hostReconstruction.failure = clone(hostHalt);
     }
-    try { await state.set(key, { ...(invocation ?? { version: 3 }), hostHalt }); }
+    try { await persistState(key, { ...(invocation ?? { version: 4 }), hostHalt }); }
     catch (saveError) {
       persistenceFailed = true;
       persistenceReason = `Essential persistence failed; host observation could not be retained: ${String(saveError?.message ?? saveError)}`;

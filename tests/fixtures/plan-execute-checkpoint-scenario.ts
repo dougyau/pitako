@@ -82,12 +82,12 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
         const pauseMode = input.mode.startsWith("pause-");
         const cooperativePause = input.mode.startsWith("pause-status-");
         const lossReentry = input.mode.endsWith("loss-reentry");
-        const restorationAdmissions: any[] = [];
+        const restorationAdmissions: any[] = [], archives: any[] = [];
         let secondPause: any;
         const unitMode = input.mode.startsWith("unit-before-capture");
         const stateCut = (value: any) => {
           if (!continuing || cut) return false;
-          const l = value.loops?.[0];
+          const l = value.loop;
           return (input.mode === "pause-input-cut" && l?.resolutions?.at(-1)?.stage === "intention") ||
             (input.mode === "pause-intention-cut" && l?.attempt?.restore?.undispatched) ||
             (input.mode === "pause-result-cut" && l?.attempt?.number === 2 && l.attempt.stage === "result") ||
@@ -95,25 +95,25 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
         };
         const candidate = () => { const { head, fingerprint } = io.checkoutEvidence(input.root); return { head, fingerprint }; };
         const state = { get: (key: string) => structuredClone(storage.get(key)), set: (key: string, value: any) => {
-          const checkpoint = value.loops?.[0]?.confirmedCheckpoint;
+          const checkpoint = value.lastConfirmed;
           const admission = checkpoint?.taskId === "second";
           if (!cut && input.mode === "admission-cut" && admission) { cut = true; throw Error("Before checkpoint admission save"); }
-          if (continuing && !cut && ((input.mode === "pause-result-save-before" && value.loops?.[0]?.attempt?.number === 2 && value.loops[0].attempt.stage === "result") ||
-              (input.mode === "pause-intention-save-before" && value.loops?.[0]?.attempt?.restore?.undispatched))) {
+          if (continuing && !cut && ((input.mode === "pause-result-save-before" && value.loop?.attempt?.number === 2 && value.loop.attempt.stage === "result") ||
+              (input.mode === "pause-intention-save-before" && value.loop?.attempt?.restore?.undispatched))) {
             cut = true; throw Error("Controlled pause before essential save");
           }
           storage.set(key, structuredClone(value)); io.writeFileSync(input.statePath, JSON.stringify(Object.fromEntries(storage))); // Only the admission/cursor ordering projection is observed below;
           // retain full native state in storage/on disk, not in every IPC snapshot.
-          snapshots.push({ loops: value.loops?.map((loop: any) => ({ cursor: loop.cursor,
-            results: loop.results?.map(({ taskId, status }: any) => ({ taskId, status })) })) });
-          if (!pauseAdmissionCut && input.mode.includes("status-") && input.mode.endsWith("admission-cut") && value.loops?.[0]?.attempt?.stage === "result" && value.loops[0].attempt.taskId === "second") {
+          snapshots.push({ loops: value.loop ? [value.loop].map((loop: any) => ({ cursor: loop.cursor,
+            results: loop.results?.map((entry: any) => ({ taskId: entry.taskId, status: entry.status ?? value.tasks[entry.taskId]?.completed?.status ?? value.tasks[entry.taskId]?.last?.status })) })) : [] });
+          if (!pauseAdmissionCut && input.mode.includes("status-") && input.mode.endsWith("admission-cut") && value.loop?.attempt?.stage === "result" && value.loop.attempt.taskId === "second") {
             pauseAdmissionCut = true; throw Error("Cut after durable pause admission before yield");
           }
-          if (input.mode === "pause-status-continue" && !cut && value.loops?.[0]?.attempt?.taskId === "second" &&
-              value.loops[0].attempt.number === 3 && value.loops[0].attempt.stage === "launched") { cut = true; throw Error("Cut after successor loss"); }
-          if (unitMode && input.mode.endsWith("reentry") && !cut && value.loops?.[0]?.attempt?.restore?.undispatched) { cut = true; throw Error("Cut after durable unit recovery intention"); }
+          if (input.mode === "pause-status-continue" && !cut && value.loop?.attempt?.taskId === "second" &&
+              value.loop.attempt.number === 3 && value.loop.attempt.stage === "launched") { cut = true; throw Error("Cut after successor loss"); }
+          if (unitMode && input.mode.endsWith("reentry") && !cut && value.loop?.attempt?.restore?.undispatched) { cut = true; throw Error("Cut after durable unit recovery intention"); }
           if (stateCut(value)) { cut = true; throw Error("Controlled pause persistence cut"); }
-          if (!cut && input.mode === "cursor-cut" && admission && value.loops[0].attempt?.stage === "result") {
+          if (!cut && input.mode === "cursor-cut" && admission && value.loop.attempt?.stage === "result") {
             cut = true; throw Error("After checkpoint admission before cursor advance");
           }
         } };
@@ -142,7 +142,8 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
           },
           launch: async (key: string, request: any) => {
             calls.push(key);
-            const pending = storage.get("invoke-human-1")?.loops?.[0];
+            if (request.agent === "pitako.execution-ledger") archives.push(JSON.parse(request.task).record);
+            const pending = storage.get("invoke-human-1")?.loop;
             if (request.agent === "pitako.worker" && pending?.attempt?.restore)
               restorationAdmissions.push(structuredClone(pending.attempt));
             // Original lifecycle modes isolate confirmation. Pause-continuation modes
@@ -162,7 +163,7 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
               result.structuredOutput.tasks[0].dependsOn = []; result.structuredOutput.tasks[1].dependsOn = [];
 
             } else if (request.agent === "pitako.worker" && !key.includes(".t3.")) {
-              const invocation = storage.get("invoke-human-1"), loop = invocation.loops[0], intent = loop.attempt.checkpoint;
+              const invocation = storage.get("invoke-human-1"), loop = invocation.loop, intent = loop.attempt.checkpoint;
               const second = intent.taskId === "second";
               if (cooperativePause && second && intent.attempt > 1) {
                 continuing = true;
@@ -173,22 +174,22 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
               const checkpoint = await loadCheckpoint(request, input.root, io.loadExtensions, input.toolModule, key).catch((error: unknown) => { console.error(error); throw error; });
               let restoreReceipt: any;
               if (unitMode && second && intent.attempt === 1) {
-                if (input.mode.endsWith("missing")) io.unlinkSync(loop.confirmedCheckpoint.checkpointRef);
+                if (input.mode.endsWith("missing")) io.unlinkSync(invocation.lastConfirmed.checkpointRef);
                 if (input.mode.endsWith("unadmitted")) {
-                  const point = io.readFileSync(loop.confirmedCheckpoint.checkpointRef, "utf8");
+                  const point = io.readFileSync(invocation.lastConfirmed.checkpointRef, "utf8");
                   const envelope = JSON.parse(point), value = JSON.parse(envelope.data);
                   value.intent.association.invocation = "foreign-unit";
                   // A self-consistent foreign publication is still not the root's
                   // exact admitted bytes. Do not fabricate a replacement receipt.
                   const data = JSON.stringify(value);
-                  io.writeFileSync(loop.confirmedCheckpoint.checkpointRef, JSON.stringify({sha256: io.hash(data), data}));
+                  io.writeFileSync(invocation.lastConfirmed.checkpointRef, JSON.stringify({sha256: io.hash(data), data}));
                 }
                 if (input.mode.endsWith("conflict")) io.writeFileSync(input.root + "/owned", "unattributed edit");
                 if (input.mode.endsWith("corrupt")) {
                   if (input.mode.endsWith("newer-corrupt")) {
                     await checkpoint("pre", ["owned"]);
                     io.writeFileSync(input.root + "/.pi/subagents/checkpoints/" + intent.key + "/manifest.json", "corrupt newer manifest");
-                  } else io.writeFileSync(loop.confirmedCheckpoint.checkpointRef, "corrupt confirmed seal");
+                  } else io.writeFileSync(invocation.lastConfirmed.checkpointRef, "corrupt confirmed seal");
                 }
                 throw Error("Abrupt disappearance before pre-capture");
               }
@@ -203,7 +204,8 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
                 }
                 const restore = loop.attempt.restore;
                 let receipt;
-                try { receipt = io.restoreCheckpoint(restore.checkpoint, restore.authority); }
+                try { receipt = io.restoreCheckpoint(restore.sourceKeys.map((key: string) =>
+                  invocation.taskFrame.sources.find((source: any) => source.key === key)), restore.authority); }
                 catch (error) {
                   // A real worker reports its concrete helper impediment, not a
                   // transport disappearance that would invite checkpoint replay.
@@ -228,7 +230,7 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
               if (input.mode === "pause-status-continue" && second && [2, 4, 5].includes(intent.attempt)) {
                 if (intent.attempt === 5)
                   io.applyCheckpoint(intent, [{ path: "owned", image: { bytes: Buffer.from("journaled pending WIP").toString("base64"), mode: 420 } }]);
-                const current = intent.attempt === 5 ? candidate() : restoreReceipt?.candidate ?? loop.results.at(-1).candidate;
+                const current = intent.attempt === 5 ? candidate() : restoreReceipt?.candidate ?? invocation.tasks[intent.taskId].last.candidate;
                 Object.assign(result.structuredOutput, { taskId: intent.taskId, attempt: intent.attempt,
                   status: "continue", usefulProgress: true, diagnosis: `Further work ${intent.attempt} requires a fresh capture for another path`,
                   remaining: ["Finish the diagnosed pending work"], continuation: "Complete the newly diagnosed work",
@@ -281,12 +283,12 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
                 ...receipt, progress: { ...receipt.progress, consumedLoops: 2 } };
             }
             if (request.agent === "pitako.worker" && key.includes(".t3.") && (unitMode || pauseMode || input.mode === "abrupt-continue")) {
-              const l = storage.get("invoke-human-1").loops[0];
-              const completed = l.results.find((entry: any) => entry.taskId === "second" && entry.status === "complete");
+              const l = storage.get("invoke-human-1").loop;
+              const completed = storage.get("invoke-human-1").tasks.second.completed;
               if (!completed || io.readFileSync(input.root + "/owned", "utf8") !== "completed pending work from pause" ||
                   !request.task.includes(completed.ref.key)) throw Error("Final verification preceded durable pending-work admission");
             }
-            originals.set(result.runId, structuredClone(result));
+            originals.set(result.runId!, structuredClone(result));
             if (input.mode === "pause-reusable-result" && continuing && key.endsWith(".t2.a2")) {
               originals.set(key, structuredClone(result));
               throw Error("Transport disappeared after the complete result survived");
@@ -306,7 +308,7 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
         if (input.mode.includes("status-")) {
           recoveryReplay = true;
           const replayed = await run(options as any);
-          noInputReplay = { result: replayed.value, calls: [...calls], cursor: storage.get("invoke-human-1").loops[0].cursor };
+          noInputReplay = { result: replayed.value, calls: [...calls], cursor: storage.get("invoke-human-1").loop.cursor };
           if (input.mode === "pause-status-continue") {
             const again = await run(options as any);
             noInputReplay = { ...noInputReplay, again: again.value };
@@ -314,7 +316,7 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
         }
         let resumed: any;
         if (pauseMode && !cooperativePause) {
-          const checkpoint = original.loops[0].confirmedCheckpoint;
+          const checkpoint = original.lastConfirmed;
           if (input.mode === "pause-missing") io.unlinkSync(checkpoint.checkpointRef);
           if (input.mode === "pause-corrupt") io.writeFileSync(checkpoint.checkpointRef, "corrupt pause");
           if (input.mode === "pause-conflict") io.writeFileSync(input.root + "/owned", "unattributed edit");
@@ -323,7 +325,7 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
           resumed = await run({ ...options, script: input.mode === "pause-no-input" ? input.script : input.continuationScript } as any);
           if (input.mode === "pause-later-input") { laterContinuing = true; resumed = await run({ ...options, script: input.laterScript } as any); }
           if (input.mode === "pause-twice") {
-            secondPause = { result: resumed.value, retained: structuredClone(storage.get("invoke-human-1")), calls: [...calls] };
+            secondPause = { result: resumed.value, retained: structuredClone(storage.get("invoke-human-1")), calls: [...calls], archives: structuredClone(archives) };
             resumed = await run({ ...options, script: input.laterScript } as any);
           }
           if (cut || lossReentry || ["pause-observer-denial", "pause-replay-complete", "pause-equivalent-capture", "pause-successor-corrupt", "pause-repeated-publication", "pause-reusable-result"].includes(input.mode)) {
@@ -335,7 +337,7 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
               resumed = await run(options as any);
           }
         }
-        return { secondPause, restorationAdmissions, unitReplay: unitReplay?.value, created: unitMode ? io.readFileSync(input.root + "/created", "utf8") : null, noInputReplay, callsAtYield, hostObservations, resumed: resumed?.value, original, baseline, partialRef, result: result.value, retained: storage.get("invoke-human-1"), calls, snapshots, points: points.filter(point => point.point.intent.loop === 1), sealError,
+        return { archives, secondPause, restorationAdmissions, unitReplay: unitReplay?.value, created: unitMode ? io.readFileSync(input.root + "/created", "utf8") : null, noInputReplay, callsAtYield, hostObservations, resumed: resumed?.value, original, baseline, partialRef, result: result.value, retained: storage.get("invoke-human-1"), calls, snapshots, points: points.filter(point => point.point.intent.loop === 1), sealError,
           owned: io.readFileSync(input.root + "/owned", "utf8"), unrelated: io.readFileSync(input.root + "/unrelated", "utf8") };
         };
         if (input.preparePause) {
@@ -356,14 +358,21 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
       const [exit, output, errors] = observation;
       {
         expect(exit, errors).toBe(0); expect(errors).not.toContain("unawaited runs.run launch(es)");
-        const actual = JSON.parse(output); expect(actual.retained?.loops, JSON.stringify(actual)).toBeDefined(); const loop = actual.retained.loops[0];
+        const actual = JSON.parse(output); expect(actual.retained?.loop, JSON.stringify(actual)).toBeDefined(); const loop = actual.retained.loop;
+        const history = (records: any[], retained: any[], tasks: any) => [...new Map(
+          [...records.flatMap(record => record.body.results ?? []), ...retained.map(entry => entry.ref ? entry : (tasks[entry.taskId].completed ?? tasks[entry.taskId].last))]
+            .map(result => [`${result.taskId}:${result.attempt}`, result])).values()]
+          .sort((a: any, b: any) => ["first", "second", "final"].indexOf(a.taskId) - ["first", "second", "final"].indexOf(b.taskId) || a.attempt - b.attempt);
+        loop.results = history(actual.archives.filter((record: any) => record.loop === loop.number), loop.results, actual.retained.tasks);
+        if (actual.secondPause) actual.secondPause.retained.loop.results =
+          history(actual.secondPause.archives, actual.secondPause.retained.loop.results, actual.secondPause.retained.tasks);
         if (mode.startsWith("unit-before-capture")) {
           const success = !["conflict", "corrupt", "missing", "unadmitted", "wrong-baseline"].some(suffix => mode.endsWith(suffix));
           expect((actual.unitReplay ?? actual.result).status, JSON.stringify(actual)).toBe(success ? "complete" : "blocked");
           expect(loop.results.filter((r: any) => r.taskId === "first" && r.status === "complete")).toHaveLength(1);
           expect(actual.created).toBe("created by confirmed unit");
           expect(actual.unrelated).toBe("unrelated WIP");
-          expect(actual.retained.loops).toHaveLength(1);
+          expect(actual.retained.consumedLoops).toBe(1);
           expect(actual.retained.association.maxCycles).toBe(3);
           expect(actual.calls.filter((key: string) => key.endsWith(".t1.a1"))).toHaveLength(1);
           if (success) {
@@ -399,14 +408,16 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
           expect(loop.results.filter((entry: any) => entry.taskId === "first" && entry.status === "complete")).toHaveLength(1);
           expect(loop.results.find((entry: any) => entry.taskId === "second")).toMatchObject({ status: "complete", attempt: 2 });
           expect(loop.cursor).toBe(3);
-          expect(loop.confirmedCheckpoint).toMatchObject({ taskId: "second", attempt: 2 });
+          expect(actual.retained.lastConfirmed).toMatchObject({ taskId: "second", attempt: 2 });
           for (const suffix of [".t1.a1", ".t2.a1", ".t2.a2", ".t3.a1", ".review.director-synthesis", ".compliance"])
             expect(actual.calls.filter((key: string) => key.endsWith(suffix))).toHaveLength(1);
           expect(actual.points).toHaveLength(2); // No post-cut seal for the interrupted attempt.
           return;
         }
         if (mode.startsWith("pause-")) {
-          const originalLoop = actual.original.loops[0];
+          const originalLoop = actual.original.loop;
+          originalLoop.results = originalLoop.results.map((entry: any) => entry.ref ? entry :
+            (actual.original.tasks[entry.taskId].completed ?? actual.original.tasks[entry.taskId].last));
           if (mode.startsWith("pause-status-")) {
             const status = mode.includes("status-continue") ? "continue" : "gaps";
             const paused = originalLoop.results[1], pause = paused.checkpoint.confirmation;
@@ -421,7 +432,7 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
               expect(actual.noInputReplay.again.status, JSON.stringify(actual.noInputReplay.again)).toBe("complete");
             } else expect(actual.noInputReplay.result.status, JSON.stringify(actual.noInputReplay.result)).toBe(status === "continue" ? "complete" : "partial");
             expect(actual.retained.association).toEqual(actual.original.association);
-            expect(actual.retained.loops).toHaveLength(1);
+            expect(actual.retained.consumedLoops).toBe(1);
             expect(loop.halt).toBeUndefined();
             expect(loop.results[1]).toEqual(paused);
             expect(actual.unrelated).toBe("unrelated WIP");
@@ -429,12 +440,12 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
               expect(actual.restorationAdmissions).toHaveLength(2);
               expect(actual.restorationAdmissions[0].restore.authority.confirmedPause).toEqual(pause);
               expect(loop.results[3].restore.receipt.confirmedPause).toEqual({ checkpointRef: pause.checkpointRef, digest: pause.digest });
-              expect(actual.restorationAdmissions[1].restore.checkpoint.map((source: any) => source.key)).toEqual([
+              expect(actual.restorationAdmissions[1].restore.sourceKeys).toEqual([
                 "invoke-human-1.l1.t2.a6", "invoke-human-1.l1.t2.a5", "invoke-human-1.l1.t2.a4",
                 "invoke-human-1.l1.t2.a3", "invoke-human-1.l1.t2.a2", "invoke-human-1.l1.t2.a1",
               ]);
               expect(actual.restorationAdmissions[1].restore.authority.confirmedPause).toEqual(pause);
-              expect(actual.restorationAdmissions[1].pauseSource.restorations.map((item: any) => item.number)).toEqual([4]);
+              expect(actual.archives.at(-1).body.frame.operations.map((item: any) => Number(item.key.match(/a(\d+)$/)[1]))).toEqual([4, 7]);
               expect(actual.restorationAdmissions[1].restore.evidence).toBeTruthy();
               expect(actual.restorationAdmissions[1].restore.evidence).not.toBe(actual.restorationAdmissions[0].restore.evidence);
               expect(loop.results[5].restore.receipt.checkpointRef).toEndWith(".t2.a5/manifest.json");
@@ -472,17 +483,17 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
             return;
           }
           if (mode === "pause-twice") {
-            const paused = actual.secondPause.retained.loops[0];
+            const paused = actual.secondPause.retained.loop;
             expect(actual.secondPause.result.status).toBe("blocked");
             expect(paused.cursor).toBe(1);
             expect(paused.results.map((r: any) => r.status)).toEqual(["complete", "blocked", "blocked"]);
-            expect(paused.confirmedCheckpoint).toMatchObject(paused.results[2].checkpoint.confirmation);
+            expect(actual.secondPause.retained.lastConfirmed).toMatchObject(paused.results[2].checkpoint.confirmation);
             expect(actual.secondPause.calls).not.toContain("invoke-human-1.l1.t3.a1");
             expect(actual.resumed.status, JSON.stringify(actual.resumed)).toBe("complete");
             expect(loop.cursor).toBe(3);
             expect(loop.results.slice(0, 3)).toEqual(paused.results);
             expect(actual.retained.association).toEqual(actual.original.association);
-            expect(actual.retained.loops).toHaveLength(1);
+            expect(actual.retained.consumedLoops).toBe(1);
             expect(actual.restorationAdmissions).toHaveLength(2);
             for (const [index, admission] of actual.restorationAdmissions.entries()) {
               expect(admission.restore.evidence).toMatch(/^[a-f0-9]{64}$/);
@@ -501,7 +512,7 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
             return;
           }
           expect(actual.retained.association).toEqual(actual.original.association);
-          expect(actual.retained.loops).toHaveLength(1);
+          expect(actual.retained.consumedLoops).toBe(1);
           expect(loop.results[0]).toEqual(originalLoop.results[0]);
           expect(loop.results[1]).toEqual(originalLoop.results[1]);
           expect(actual.unrelated).toBe("unrelated WIP");
@@ -537,9 +548,9 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
               expect(loop.attempt.restore).toEqual(admitted.restore);
               expect(loop.cursor).toBe(1);
               expect(loop.results).toEqual(originalLoop.results);
-              expect(loop.confirmedCheckpoint).toEqual(originalLoop.confirmedCheckpoint);
-              expect(loop.interruptions).toHaveLength(1);
-              expect(loop.interruptions[0].result).toEqual(originalLoop.results[1]);
+              expect(actual.retained.lastConfirmed).toEqual(actual.original.lastConfirmed);
+              expect(actual.retained.taskFrame.operations).toHaveLength(1);
+              expect(actual.retained.tasks.second.last).toEqual(originalLoop.results[1]);
               expect(actual.retained.association.maxCycles).toBe(3);
               expect(actual.calls).toEqual([...actual.callsAtYield, "invoke-human-1.l1.t2.a2"]);
             }
@@ -555,7 +566,7 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
           const blocked = ["pause-no-input", "pause-semantic", "pause-missing", "pause-corrupt", "pause-conflict", "pause-stop", "pause-permission", "pause-active", "pause-empty", "pause-observer-denial", "pause-wrong-baseline", "pause-successor-corrupt"].includes(mode);
           if (blocked) {
             if (mode === "pause-empty") {
-              expect(originalLoop.confirmedCheckpoint.taskId).toBe("first");
+              expect(actual.original.lastConfirmed.taskId).toBe("first");
               expect(originalLoop.results.some((r: any) => r.checkpoint?.confirmation?.kind === "pause")).toBe(false);
             }
             expect(actual.resumed.status, JSON.stringify(actual.resumed)).not.toBe("complete");
@@ -599,23 +610,27 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
         // A restoration denied by the native boundary cannot repeat unit work.
         // An unsealed complete report is rejected instead: loop 1 ends as gaps
         // and the next director starts.
-        expect(actual.retained.loops).toHaveLength(mode === "missing-receipt" ? 2 : 1);
+        expect(actual.retained.consumedLoops).toBe(mode === "missing-receipt" ? 3 : 1);
+        if (mode === "missing-receipt") for (const item of actual.archives.filter((record: any) => record.kind === "loop").map((record: any) => record.body))
+          expect(item.results.find((result: any) => result.taskId === "second")).toMatchObject({
+            status: "rejected", rejection: "New implementation unit lacks required sealed file/progress checkpoint.",
+          });
         if (mode === "missing-receipt") expect(loop).toMatchObject({ outcome: "gaps", results: [{ taskId: "first", status: "complete" },
           { taskId: "second", status: "rejected", rejection: "New implementation unit lacks required sealed file/progress checkpoint." }] });
-        expect(actual.result.loopsConsumed).toBe(actual.retained.loops.length);
-        const confirmed = loop.confirmedCheckpoint;
+        expect(actual.result.loopsConsumed).toBe(actual.retained.consumedLoops);
+        const confirmed = actual.retained.lastConfirmed;
         const secondConfirmed = ["complete", "pause", "cursor-cut"].includes(mode);
         expect(confirmed.taskId).toBe(secondConfirmed ? "second" : "first");
-        expect(confirmed).toMatchObject({ kind: mode === "pause" ? "pause" : "unit", position: { loop: 1, cursor: mode === "complete" || mode === "cursor-cut" ? 2 : 1 } });
+        expect(confirmed).toMatchObject({ kind: mode === "pause" ? "pause" : "unit", position: { loop: actual.retained.consumedLoops, cursor: mode === "complete" || mode === "cursor-cut" ? 2 : 1 } });
         const point = JSON.parse(JSON.parse(readFileSync(confirmed.checkpointRef, "utf8")).data);
         expect(point.position).toEqual(confirmed.position); expect(point.progress).toEqual(confirmed.progress);
         expect(createHash("sha256").update(readFileSync(confirmed.checkpointRef)).digest("hex")).toBe(confirmed.digest);
-        expect(point.progress.consumedLoops).toBe(1);
+        expect(point.progress.consumedLoops).toBe(actual.retained.consumedLoops);
         expect(loop.results.find((entry: any) => entry.taskId === confirmed.taskId).ref).toEqual(confirmed.resultRef);
         expect(point.files[0].image.bytes).toBe(Buffer.from(secondConfirmed ? "partial next-unit WIP" : "confirmed first work").toString("base64"));
         if (secondConfirmed) {
-          expect(point.progress.admittedResults).toHaveLength(1);
-          expect(point.progress.admittedResults[0].ref).toEqual(loop.results[0].ref);
+          expect(point.progress.admitted).toEqual({ first: ["complete"] });
+          expect(point.progress.previous.resultRef).toEqual(loop.results[0].ref);
         }
         if (mode === "complete") { expect(actual.result.status).toBe("complete"); expect(actual.calls).toContain("invoke-human-1.l1.compliance"); }
         else expect(actual.calls).not.toContain("invoke-human-1.l1.t3.a1");
