@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstatSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
+import { closeSync, lstatSync, openSync, readFileSync, readSync, readlinkSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { currentWorkspace, registeredWorktrees, repositoryIdentity } from "./board/workspace.ts";
 
@@ -38,6 +38,40 @@ export function validateSpec(content: string, id: string): void {
   }
 }
 export function digest(content: string | Buffer): string { return createHash("sha256").update(content).digest("hex"); }
+
+export type ExecutionAmendment = { path: string; sha256: string; provenance: string };
+export function executionAmendments(root: string, value: unknown = [], verify = false): ExecutionAmendment[] {
+  if (!Array.isArray(value)) throw new Error("Expected amendments: [{path, sha256, provenance}].");
+  return value.map(ref => {
+    if (!ref || Object.keys(ref).sort().join(",") !== "path,provenance,sha256" ||
+        typeof ref.path !== "string" || ref.path.includes("\0") || !/\.md$/i.test(ref.path) ||
+        !/^[a-f0-9]{64}$/.test(ref.sha256) || typeof ref.provenance !== "string" ||
+        !ref.provenance.trim() || ref.provenance.includes("\0"))
+      throw new Error("Expected Markdown amendment path, SHA-256 and human message ID/timestamp provenance.");
+    let source = path.resolve(root, ref.path);
+    const inside = (base: string, file: string) => {
+      const relative = path.relative(base, file);
+      return relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+    };
+    const physicalRoot = realpathSync(root);
+    // Rebase alias-local paths, but preserve already physical absolute paths.
+    if (inside(root, source)) source = path.resolve(physicalRoot, path.relative(root, source));
+    else if (!inside(physicalRoot, source)) throw new Error(`Amendment must be inside designated worktree: ${source}`);
+    if (verify) {
+      let actual = "unavailable";
+      try {
+        if (!inside(physicalRoot, realpathSync(source))) throw new Error("Physical path escapes designated worktree");
+        const bytes = readFileSync(source);
+        actual = digest(bytes);
+        if (actual !== ref.sha256) throw new Error("Full source hash mismatch");
+        if (!bytes.toString("utf8").trim() || bytes.includes(0)) throw new Error("Expected complete nonempty Markdown text");
+      } catch (error) {
+        throw new Error(`Amendment ${source}; expected SHA-256 ${ref.sha256}, observed ${actual}: ${String(error instanceof Error ? error.message : error)}. Reconcile this source and explicitly prepare admission with the intended hash; after admission restore reliable exact bytes and preserve frozen references. No automatic recapture.`);
+      }
+    }
+    return { path: source, sha256: ref.sha256, provenance: ref.provenance };
+  });
+}
 export function specChunks(content: string): string[] {
   if (Buffer.byteLength(content) > MAX_SPEC_BYTES) throw new Error("Spec-plan exceeds the native chunk snapshot boundary.");
   const chunks: string[] = [];
@@ -78,7 +112,18 @@ function candidate(root: string, id: string): SpecCandidate | undefined {
   // Symlinked directories/documents must not escape this registered worktree.
   const source = realpathSync(target);
   if (source !== target || !lstatSync(source).isFile()) throw new Error(`Invalid local spec-plan path: ${target}`);
-  const content = readFileSync(source, "utf8");
+  // Bound even a file that grows after stat; oversized invalid inputs never load in full.
+  const fd = openSync(source, "r"), bytes = Buffer.alloc(MAX_SPEC_BYTES + 1);
+  let length = 0;
+  try {
+    while (length < bytes.length) {
+      const count = readSync(fd, bytes, length, bytes.length - length, null);
+      if (!count) break;
+      length += count;
+    }
+  } finally { closeSync(fd); }
+  if (length > MAX_SPEC_BYTES) throw new Error(`Spec-plan size exceeds ${MAX_SPEC_BYTES} UTF-8 bytes: ${source}`);
+  const content = bytes.subarray(0, length).toString("utf8");
   validateSpec(content, id);
   return { source, sourceRoot: root, digest: digest(content), content };
 }
@@ -92,6 +137,22 @@ export function discoverSpec(root: string, id: string, selectedSource?: string) 
   if (selectedSource !== undefined && (!path.isAbsolute(selectedSource) || !candidates.some(item => item.source === selectedSource))) throw new Error("Explicit source is not an eligible candidate; local-first discovery still applies.");
   const selected = selectedSource ? candidates.find(item => item.source === selectedSource) : candidates.length === 1 ? candidates[0] : undefined;
   return { root: workspace.physicalRoot, commonDir: workspace.identity, candidates, selected };
+}
+/** Fixed-order comparison of preliminary and native observations, never authority. */
+export function specBinding(id: string, root: string, commonDir: string, selected: Pick<SpecCandidate, "source" | "digest">) {
+  const descriptor = { version: 1, id, root, commonDir, source: selected.source, digest: selected.digest };
+  return { ...descriptor, binding: digest(JSON.stringify(descriptor)) };
+}
+export function preliminarySpec(root: string, id: string, source?: string) {
+  try {
+    const found = discoverSpec(root, id, source);
+    if (!found.selected) throw new Error(found.candidates.length
+      ? `Ambiguous spec-plan ${id}; select an explicit source from: ${found.candidates.map(item => item.source).join(", ")}`
+      : `Missing complete spec-plan ${id} for designated root ${root}`);
+    return { ...specBinding(id, found.root, found.commonDir, found.selected), content: found.selected.content };
+  } catch (error) {
+    throw new Error(`${String(error instanceof Error ? error.message : error)}. Reconcile the identified input for ${root} (selector ${source ?? id}); explicitly prepare admission with the intended version. No automatic recapture.`);
+  }
 }
 /** Content identity, not a test receipt. Ignore only native transient workflow artifacts. */
 export function checkoutEvidence(root: string) {

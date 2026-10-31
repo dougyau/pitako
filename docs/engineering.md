@@ -94,18 +94,37 @@ session-scoped named root resource, replaced/disposed on lifecycle events.
 Registration preloads COMPLETE trusted sources: lexical review library marker,
 complete shared review source, then execute controller. No slicing, protocol
 copy, sandbox imports, nested async helpers or nested workflows are introduced.
-The bounded resolver has no discovery I/O; physical registered-root/Git checks
-remain launch hooks and host inspection. POSIX quoting and Windows encoded
-argument transport retain exact arguments through the Node-hook inspect.mjs loader.
+The resolver now performs accepted synchronous preliminary discovery I/O, without
+host cancellation during the read. Local-first/explicit selection stays in the
+designated physical checkout and its registered repository worktrees, never the
+installed package checkout or unrelated projects. Invalid oversized candidates
+have bounded reads; the complete spec limit remains 39,936 UTF-8 bytes, with no
+arbitrary worktree/path count limit. Full content and a small descriptor enter
+the preloaded script via `JSON.stringify`, as data, not commands/instructions.
+No settings, referenced-source validation or checkout evidence is read at this
+preliminary boundary. POSIX quoting/Windows encoded arguments retain the exact
+Node-hook `inspect.mjs` argument vector.
 
-Native mission state binds actual returned missionPath/missionId, invocation,
-full immutable specs and designated Git common root. The 39,936-byte snapshot
-uses the existing 26 chunk grants and a combined initial inspection/settings
-admission, leaving five closing inspections (32 host grants/calls maximum). No arbitrary check
-commands or artifact loader are added to host authority. The finite native host
-read deadline is not an execution budget. Child spawn capacity is separate;
-exhaustion returns incomplete with phase/work/refs, not overrides or renewed slots.
+One compact native host admission independently rediscovers with the same selectors,
+validates every complete source hash, reads designated settings and computes
+checkout evidence once. A fixed-order versioned binding covers spec ID, physical
+root, canonical common directory, selected source and complete content digest.
+The root compares it before any director or snapshot persistence; disagreement
+blocks, not automatic recapture. Matching admission persists one complete snapshot,
+association, sourceRefs and frozen budget. The receipt stays within 4,096 bytes
+without echoing the spec. This is explicit comparison plus required persistence,
+not cross-file atomicity or authority from a digest.
 
+New admissions use one initial host operation, no initial child, and one native
+child per genuine closing observation. There is no packet transport, inspection
+pool or loop-indexed closing-grant ceiling. Gaps without a proposed close consume
+no observation. `maxCycles = 10` is accepted unchanged, not clamped or rejected
+from a worst-case default child budget; it does not promise ten complete loops.
+Native child, tree, session, concurrency, output, state and policy limits remain
+real. Report the actual rejection with phase/work/references intact, never skip
+required checks or analyses, renew slots or create another mission to evade it.
+Available capacity/doctor information retains its provenance: it is context, not
+a reservation or guaranteed effective limit. Unknown capacity stays unknown.
 
 The admitted `pitako.execute.maxCycles` is a positive safe integer (default 3).
 Pi global agent-dir `settings.json` is overridden by the designated worktree's
@@ -114,14 +133,13 @@ a director; no settings are written. The immutable native association freezes
 the limit across recovery/settings edits; legacy version-2 records stay fixed
 at three without migration. Initial inspection reads neither settings file for
 an admitted invocation; incompatible or partial associations are not fresh admission.
-Reentry reevaluates a historical own-registration capacity halt only against the
-current closing allocation, retaining history and cumulative consumption, not
-overriding a native rejection. Reports use `Loop n de max` and consumed/max.
+Reports use `Loop n de max` and consumed/max.
+
 Early fulfillment stops; last-slot gaps need a new human invocation. Stop,
 permissions, persistence and actual native host/child capacity outrank the limit.
 Higher limits grant no extra native capacity. Hash-associated complete inherited
 spec refs remain in all phase contexts without enlarging the selected snapshot.
-See the execute skill for settings examples, sourceRefs and bounded host grants.
+See the execute skill for settings examples, sourceRefs and native capacity limits.
 
 The root consumes one of the admitted loops before each fresh read-only director. That
 director publishes the sole schema-bound full loop_plan and ends before workers.
@@ -161,6 +179,24 @@ reviewer-profile full-spec compliance analyst only on clear screening. Both
 receive complete specs and the same candidate with no own writer active.
 Material gaps end the loop and go to another director; no global repair phase
 follows review. Native closing compares the candidate with check/analysis evidence.
+The session-scoped `pitako.checkout-observer` is registered outside resolution via
+public `registerAgentViaEvents`, using an absolute executable and fixed owned
+`observe.mjs` argument vector. Conflict/rejection is an error, not an overwrite or
+fallback. It uses no model, delegation or conversational context, ignores stdin,
+and calls `designatedWorkspace`/`checkoutEvidence` on actual cwd without reading
+the spec. All stdout is bounded before emission below 65,536 bytes, emitting
+complete failure JSON instead of a truncated success.
+
+The root persists invocation/loop/unique-key intention, dispatches singleton
+`runs.all` with `output:false`, inline output and effective implicit waiting,
+then validates native completion, identity, one JSON output document and
+publication. It saves closing evidence before outcome/advance, keeping operation
+key, run ID, `asyncDir` and actual `externalAdapter.outputArtifacts` stdout/stderr
+references. Missing/invalid/nonterminal output or `outputSaveError` cannot close;
+failures retain only fields that exist. Different closes have distinct artifacts.
+The predicate remains `sameCandidate && review clear && compliance fulfilled &&
+checks current`; observation replaces neither checks/review/compliance nor worker
+reports/checkpoint evidence.
 Complete requires reasoned fulfillment/current mandatory checks/no material gaps;
 the admitted loops without it return partial. Standalone /review remains advisory.
 
@@ -254,16 +290,43 @@ or consuming an implementation loop. Findings associate screening assessments by
 `findingId`, not literal requirement wording; sources, consequences and verdict
 consistency remain required. Originals are never rewritten.
 
-The registered Node inspector reads only exact native producer references already
-retained by that invocation's current read-only phase. It delivers complete JSON
-from native state or an associated `structuredOutputPath`, rejects conflicting
-bodies and producer escapes, and preserves references after a failed observation.
-Current Stop, permission and positive pertinent activity barriers still apply.
-Unknown historical writer settlement is not a checkpoint-restoration veto. Delivery
-shares the existing 26 input grants with the unchanged 39,936-byte spec limit;
-every complete escaped JSON envelope must fit 4,096 bytes. Excess transport or
-essential persistence stops dispatch rather than truncating evidence or enlarging
-native limits. Complete originals stay outside essential mission state.
+For newly bound invocations, resource expansion carries exact retained read-only
+originals as inert data, separately from the full spec. Native admission
+independently recomputes their projection digest; a difference blocks before
+consumption. Only already-associated current-loop producers qualify, including
+pending recovery inspectors; conflicting bodies or producer escapes are rejected.
+The compact admission receipt carries the comparison digest and applicable
+checkpoint observation, not complete originals. Ordinary cwd-only closing does
+not deliver recovery payloads. `inspectionSnapshot` and unrelated inspector
+consumers remain available. This path does not migrate or revive legacy roots.
+Complete originals stay outside essential mission state. Required originals that
+remain unavailable are evidence gaps, not permission to reconstruct from previews;
+optional witness loss alone does not block a surviving authoritative original.
+Comparison or essential-save failure prevents admission, never truncates evidence
+or silently recaptures it.
+
+### Actionable blocking diagnostics
+
+Keep the actual cause/input, expected and observed identity/version where
+available, and exact evidence references; explicitly mark unavailable observations.
+Before admission, reconcile ambiguous selection, missing/read/size errors or a
+disputed version, then explicitly prepare admission with the intended source.
+Do not label every failure a hash mismatch or automatically select newer bytes.
+After admission, preserve the original snapshot and frozen source hashes: restore
+exact bytes from a reliable original, and deliver desired changes as explicit
+human addenda. Without reliable originals remain blocked/partial; a revised
+assignment and new admission require actual human authorization.
+
+Retain concurrent barriers. Native Stop, rejection, uncertain activity and
+essential-save failure need their supported native inspection/reconciliation
+route; correcting a source cannot override them. For terminal roots, inspect
+retained evidence and report only operations valid for that state, never resume
+advice or a generic `--unblock`. No `--force`, silent hash replacement, extra
+arbitrary approvals or restart that erases consumed work is supported.
+
+The mission-state limit is global, currently 256 KiB. Essential saves precede
+protected dispatch/advance; no post-Stop save, fsync or permanent artifact-retention
+guarantee is added.
 
 ### Scoped checkpoint artifacts
 
@@ -308,7 +371,9 @@ originals. Renew evidence invalidated by the restored candidate, then reach pend
 work, final checks, review and compliance.
 
 Separately delivered current human amendments remain separate from the admitted
-base snapshot/sourceRefs/association. Carry their complete path, SHA-256 and
+base snapshot/sourceRefs/association. They remain effective without replacing base
+hashes, renewing the budget or causing a false base-source discrepancy; editing
+a frozen source still blocks. Carry their complete path, SHA-256 and
 human-delivery provenance in existing admitted plan shared context and exact
 plan/result references. Workers, review and compliance must read/hash the FULL
 amendment before affected work or whole-spec assessment and retain that provenance

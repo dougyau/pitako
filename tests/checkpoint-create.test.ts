@@ -174,7 +174,7 @@ test.each(["missing", "malformed", "metadata-only", "association", "progress", "
     expect(readFileSync(path.join(f.root, "modified"), "utf8")).toBe("prior uncommitted WIP\n");
   });
 
-test("missing and analysis context cannot publish; aborted calls cannot capture", async () => {
+test("missing, foreign and analysis context cannot publish; aborted calls cannot capture", async () => {
   const f = fixture();
   const abort = new AbortController(); abort.abort(new Error("Stop before capture"));
   expect(await f.call("pre", paths, abort.signal)).toMatchObject({ ok: false, error: { message: "Stop before capture" } });
@@ -183,9 +183,21 @@ test("missing and analysis context cannot publish; aborted calls cannot capture"
   expect(await f.call("pre", paths)).toMatchObject({ ok: false, error: { message: "Pitako analysis forbids checkpoint_create." } });
   setSessionProfile(f.manager, "coding");
   expect(existsSync(checkpointDirectory(f.intent))).toBe(false);
-  let tool: any; checkpointCreate({ registerTool(t: any) { tool = t; } } as ExtensionAPI);
-  const missing = await tool.execute("missing", { kind: "pre", paths }, undefined, undefined, { cwd: f.root, sessionManager: {} });
-  expect(missing.structuredContent).toMatchObject({ ok: false, error: { message: "Missing native checkpoint execution context." } });
+  for (const binding of [undefined, f.binding]) {
+    let tool: any;
+    const old = process.env.PI_SUBAGENT_EXTENSION_BINDINGS;
+    try {
+      if (binding === undefined) delete process.env.PI_SUBAGENT_EXTENSION_BINDINGS;
+      else process.env.PI_SUBAGENT_EXTENSION_BINDINGS = binding;
+      checkpointCreate({ registerTool(t: any) { tool = t; } } as ExtensionAPI);
+    } finally { if (old === undefined) delete process.env.PI_SUBAGENT_EXTENSION_BINDINGS; else process.env.PI_SUBAGENT_EXTENSION_BINDINGS = old; }
+    expect(process.env.PI_SUBAGENT_EXTENSION_BINDINGS).toBe(old);
+    const rejected = await tool.execute("context", { kind: "pre", paths }, undefined, undefined,
+      { cwd: binding === undefined ? f.root : path.join(f.root, "foreign"), sessionManager: {} });
+    expect(rejected.structuredContent).toMatchObject({ ok: false, error: { message: binding === undefined
+      ? "Missing native checkpoint execution context." : "Checkpoint execution workspace mismatch." } });
+    expect(existsSync(checkpointDirectory(f.intent))).toBe(false);
+  }
 });
 
 test("failed publication and conflicting effects cannot produce a seal or replace a confirmed artifact", async () => {

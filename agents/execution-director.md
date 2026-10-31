@@ -40,6 +40,12 @@ tasks with stable IDs, goal, source/context references, scope, allowed effects,
 expected result and concrete mandatory command/cwd/requirement checks. The LAST
 task must verify the final candidate after all writes, even if code already
 exists. This is the only task definition, not a summary or a second checklist.
+Inspection/check-only tasks, or tasks that may finish without edits, are
+`verification`. Use `implementation` only for a concrete editing repair requiring
+real pre-write capture and a sealed file/progress checkpoint.
+When a provided tool covers a check, its command is that tool call, for example
+`file_sha256` for hashes, not a shell equivalent such as `sha256sum`. Never add a
+tool preference that contradicts a check's command.
 Write each goal as a concise title describing the concrete work, for example
 "Fix execution recovery after timeout". The root uses it as the worker's Fleet
 label and first task line. Keep mission IDs, worktree paths and clipboard

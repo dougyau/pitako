@@ -1,8 +1,8 @@
-import { checkoutEvidence, designatedWorkspace, discoverSpec, inspectionSnapshot, specChunks, validatePlanId, validateSpec } from "../../extensions/spec-plans.ts";
+import { checkoutEvidence, designatedWorkspace, discoverSpec, executionAmendments, inspectionSnapshot, preliminarySpec, specChunks, validatePlanId, validateSpec } from "../../extensions/spec-plans.ts";
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
-import { retainedAnalyses } from "../../extensions/execute-retained.ts";
+import { boundRetainedAnalyses, retainedAnalyses } from "../../extensions/execute-retained.ts";
 import { checkpointEvidence } from "../../extensions/execute-checkpoint.ts";
 import { isDeepStrictEqual } from "node:util";
 import { executionStatePath } from "../../extensions/execute-state.ts";
@@ -25,7 +25,11 @@ function admittedInvocation(context: any) {
   if (invocation === undefined && legacy === undefined) return false;
   if (!invocation || ![2, 3].includes(invocation.version))
     throw new Error("Incompatible retained invocation; no settings admission.");
+  if (invocation.association && !isDeepStrictEqual(invocation.amendments ?? [], context.amendments ?? []))
+    throw new Error("Immutable admission amendments changed; preserve the retained path, SHA-256 and provenance. Do not merge or replace references on recovery.");
   const association = invocation.association;
+  if (association && part === "admission" && (invocation.version !== 3 || !/^[a-f0-9]{64}$/.test(invocation.admissionBinding ?? "")))
+    throw new Error("Retained execution predates bound native admission; no migration or replay is supported. Preserve its evidence; inspect actual native state. A terminal root cannot resume.");
   if (association === undefined) {
     const request = invocation.hostHalt?.request;
     if (legacy || invocation.version !== 3 || !request || invocation.hostHalt.code !== "host-observation" ||
@@ -48,7 +52,41 @@ function admittedInvocation(context: any) {
     throw new Error("Incompatible retained association; no settings admission.");
   return true;
 }
-if (part === "settings") {
+if (part === "admission") {
+  try {
+    const observed = preliminarySpec(root, id, source || undefined);
+    const context = JSON.parse(process.argv[6] ?? "null");
+    const admitted = admittedInvocation(context);
+    executionAmendments(observed.root, context.amendments, true);
+    const { sourceRefs, agentDir } = context.admission;
+    for (const ref of sourceRefs) {
+      const content = readFileSync(ref.path, "utf8");
+      validateSpec(content, path.basename(ref.path, ".md"));
+      const actual = createHash("sha256").update(content).digest("hex");
+      if (actual !== ref.digest) throw new Error(`Complete spec source hash mismatch: ${ref.path}; expected ${ref.digest}, observed ${actual}`);
+    }
+    let admission;
+    if (!admitted) {
+      if (!agentDir || !path.isAbsolute(agentDir)) throw new Error("Expected absolute host agent directory for settings admission.");
+      const { executeMaxCycles } = await import("../../extensions/execute-settings.ts");
+      admission = { maxCycles: executeMaxCycles(observed.root, agentDir) };
+    }
+    const { head, fingerprint } = checkoutEvidence(observed.root);
+    const recovery = admitted ? boundRetainedAnalyses(observed.root, observed.commonDir, observed.source,
+      observed.digest, observed.binding, context) : undefined;
+    const checkpointObservation = admitted ? observeCheckpoint({ root: observed.root, commonDir: observed.commonDir, selected: observed }, context) : undefined;
+    emitBounded({ version: 1, binding: observed.binding, checkout: { head, fingerprint }, ...(admission ? { admission } : {}),
+      ...(recovery ? { recoveryDigest: recovery.digest } : {}), ...(checkpointObservation ? { checkpointObservation } : {}) });
+  } catch (error) {
+    const message = String(error instanceof Error ? error.message : error);
+    const next = "Reconcile the identified input and explicitly prepare admission with the intended version. For an admitted invocation preserve its snapshot, restore reliable exact originals and deliver desired changes as a human addendum; unavailable originals remain blocked. Native barriers require supported native inspection/reconciliation, not source correction.";
+    const failure = { version: 1, error: message, next };
+    // Even unusually long paths/errors must produce a complete failure document.
+    if (Buffer.byteLength(JSON.stringify(failure) + "\n") > 4096)
+      failure.error = "Admission failed; detailed diagnostic exceeds envelope. Inspect the exact authorized host command inputs and selected source; observed identity unavailable.";
+    emitBounded(failure);
+  }
+} else if (part === "settings") {
   try {
     const { executeMaxCycles } = await import("../../extensions/execute-settings.ts");
     const agentDir = process.argv[7];
@@ -98,39 +136,7 @@ async function inspectSelected() {
   }
   const retained = context && admitted && found.selected && (part !== "metadata" || context.admission || !context.admissionTransport)
     ? retainedAnalyses(found.root, found.selected.source, found.selected.digest, context) : undefined;
-  let checkpointObservation;
-  if (context && admitted && found.selected && part === "metadata") {
-    let mission;
-    try { mission = JSON.parse(readFileSync(executionStatePath(context), "utf8")); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-    const invocation = mission?.[`invoke-${context.invocation}`];
-    const loop = invocation?.loops?.at(-1), attempt = loop?.attempt;
-    if (loop?.phase === "implementation" && (attempt?.checkpoint || attempt?.restore?.checkpoint) && (attempt.stage !== "result" || ["blocked", "continue", "gaps"].includes(attempt.result?.status))) {
-      const association = invocation.association;
-      if (association.root !== found.root || association.commonDir !== found.commonDir ||
-          association.source !== found.selected.source || association.digest !== found.selected.digest ||
-          association.missionId !== context.missionId || association.missionPath !== context.missionPath ||
-          association.invocation !== context.invocation || !isDeepStrictEqual(association.sourceRefs, context.sourceRefs))
-        throw new Error("Checkpoint observation association mismatch.");
-      const sources = [attempt.checkpoint, ...[].concat(attempt.restore?.checkpoint ?? attempt.pauseSource?.sources ?? attempt.pauseSource?.checkpoint ?? [])].filter(Boolean);
-      const subject = { key: attempt.key, taskId: attempt.taskId, attempt: attempt.number, loop: loop.number, cursor: loop.cursor };
-      try {
-        if (sources.some(source => !isDeepStrictEqual(source.association, association) || source.taskId !== subject.taskId ||
-            source.loop !== subject.loop || source.cursor !== subject.cursor || source.attempt > subject.attempt))
-          throw new Error("Checkpoint observation pending-task mismatch.");
-        const unit = attempt.restore?.authority?.confirmedUnit ?? (loop.confirmedCheckpoint?.kind === "unit" ? loop.confirmedCheckpoint : undefined);
-        if (unit) {
-          const { taskId, attempt: number, resultRef, ...receipt } = unit;
-          const result = loop.results.find((item: any) => item.taskId === taskId && item.attempt === number && isDeepStrictEqual(item.ref, resultRef));
-          if (!result || result.status !== "complete" || !isDeepStrictEqual(result.checkpoint?.confirmation, receipt) ||
-              !isDeepStrictEqual(unit.position, { loop: loop.number, cursor: loop.cursor, phase: "implementation" }) ||
-              unit.checkpointRef !== `${found.root}/.pi/subagents/checkpoints/${result.checkpoint.key}/unit.json`)
-            throw new Error("Confirmed unit conflicts with admitted pending progress.");
-        }
-        checkpointObservation = { ...subject, evidence: checkpointEvidence(sources, { consumedLoops: invocation.loops.length, admittedResults: loop.results }, unit) };
-      } catch (error) { checkpointObservation = { ...subject, error: String(error instanceof Error ? error.message : error) }; }
-    }
-  }
+  const checkpointObservation = context && admitted && part === "metadata" ? observeCheckpoint(found, context) : undefined;
   const metadata = { root: found.root, commonDir: found.commonDir, candidates,
     selected: found.selected ? { source: found.selected.source, digest: found.selected.digest, chunks: specChunks(found.selected.content).length } : null,
     ...(retained?.length ? { retainedAnalyses: retained } : {}),
@@ -173,4 +179,41 @@ async function inspectSelected() {
       }
     }
   }
+}
+
+function observeCheckpoint(found: { root: string; commonDir: string; selected?: { source: string; digest: string } }, context: any) {
+  let observation;
+  if (context && found.selected) {
+    let mission;
+    try { mission = JSON.parse(readFileSync(executionStatePath(context), "utf8")); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    const invocation = mission?.[`invoke-${context.invocation}`];
+    const loop = invocation?.loops?.at(-1), attempt = loop?.attempt;
+    if (loop?.phase === "implementation" && (attempt?.checkpoint || attempt?.restore?.checkpoint) && (attempt.stage !== "result" || ["blocked", "continue", "gaps"].includes(attempt.result?.status))) {
+      const association = invocation.association;
+      if (association.root !== found.root || association.commonDir !== found.commonDir ||
+          association.source !== found.selected.source || association.digest !== found.selected.digest ||
+          association.missionId !== context.missionId || association.missionPath !== context.missionPath ||
+          association.invocation !== context.invocation || !isDeepStrictEqual(association.sourceRefs, context.sourceRefs))
+        throw new Error("Checkpoint observation association mismatch.");
+      const sources = [attempt.checkpoint, ...[].concat(attempt.restore?.checkpoint ?? attempt.pauseSource?.sources ?? attempt.pauseSource?.checkpoint ?? [])].filter(Boolean);
+      const subject = { key: attempt.key, taskId: attempt.taskId, attempt: attempt.number, loop: loop.number, cursor: loop.cursor };
+      try {
+        if (sources.some(source => !isDeepStrictEqual(source.association, association) || source.taskId !== subject.taskId ||
+            source.loop !== subject.loop || source.cursor !== subject.cursor || source.attempt > subject.attempt))
+          throw new Error("Checkpoint observation pending-task mismatch.");
+        const unit = attempt.restore?.authority?.confirmedUnit ?? (loop.confirmedCheckpoint?.kind === "unit" ? loop.confirmedCheckpoint : undefined);
+        if (unit) {
+          const { taskId, attempt: number, resultRef, ...receipt } = unit;
+          const result = loop.results.find((item: any) => item.taskId === taskId && item.attempt === number && isDeepStrictEqual(item.ref, resultRef));
+          if (!result || result.status !== "complete" || !isDeepStrictEqual(result.checkpoint?.confirmation, receipt) ||
+              !isDeepStrictEqual(unit.position, { loop: loop.number, cursor: loop.cursor, phase: "implementation" }) ||
+              unit.checkpointRef !== `${found.root}/.pi/subagents/checkpoints/${result.checkpoint.key}/unit.json`)
+            throw new Error("Confirmed unit conflicts with admitted pending progress.");
+        }
+        observation = { ...subject, evidence: checkpointEvidence(sources, { consumedLoops: invocation.loops.length, admittedResults: loop.results }, unit) };
+      } catch (error) { observation = { ...subject, error: String(error instanceof Error ? error.message : error) }; }
+    }
+  }
+  return observation;
 }

@@ -15,6 +15,7 @@ import type { ChildRuntimeConfig } from "../../node_modules/pi-subagents/src/run
 import pitako from "../../extensions/index.ts";
 import fileSha256 from "../../extensions/file-sha256.ts";
 import { readStack } from "../../extensions/stack.ts";
+import { RUNTIME_AGENT_REGISTER_EVENT, type RuntimeAgentRegistrationRequest } from "../../node_modules/pi-subagents/src/agents/runtime-agent-events.js";
 
 const root = path.resolve(import.meta.dir, "../.."), cwd = process.cwd();
 const mode = process.argv[2]!;
@@ -56,6 +57,8 @@ const call = async (name: string, args: JsonObject) => {
 const text = (outcome: Awaited<ReturnType<typeof call>>) =>
   outcome.result.content.map(part => part.type === "text" ? part.text : "").join("\n");
 let disposed = false;
+let observerRegistered = false;
+let removeRegistrationListener = () => {};
 try {
   const role = mode === "worker" ? "worker" : "researcher";
   const profile = parseFrontmatter(readFileSync(path.join(root, "agents", `${role}.md`), "utf8")).frontmatter;
@@ -87,7 +90,18 @@ try {
     runtime.requiredTools = undefined;
   }
   const foreground = { name: "foreground-policy", factory(pi: sdk.ExtensionAPI) {
-    // No real mutator executes: these owned counters reveal any boundary leak.
+    // Own the excluded provider's registration listener without loading its runtime.
+    removeRegistrationListener = pi.events.on(RUNTIME_AGENT_REGISTER_EVENT, raw => {
+      const request = raw as RuntimeAgentRegistrationRequest;
+      assert.equal(request.version, 1);
+      assert.equal(request.name, "pitako.checkout-observer");
+      assert.equal(observerRegistered, false);
+      observerRegistered = true;
+      request.result = { ok: true, registration: { dispose() {
+        assert.equal(observerRegistered, true);
+        observerRegistered = false;
+      } } };
+    });
     pitako(pi);
     fileSha256(pi);
     pi.registerTool({
@@ -95,6 +109,7 @@ try {
       parameters: Type.Object({}),
       execute: async () => ({ content: [], details: {} }),
     });
+    // No real mutator executes: these owned counters reveal any boundary leak.
     for (const name of mutators.filter(name => name !== "file_sha256_save")) pi.registerTool({
       name, label: name, description: "controlled side effect", exposure: "deferred", parameters: Type.Object({}),
       execute: async () => { sideEffects++; return { content: [], details: {} }; },
@@ -107,6 +122,11 @@ try {
     onExtensionError(error) { errors.push(String(error.error)); },
   });
   try {
+    if (process.send) {
+      process.send({ ready: true });
+      assert.equal(await Bun.stdin.text(), "run");
+    }
+    assert.equal(observerRegistered, mode === "foreground");
     await session.extensionRunner!.emit({ type: "agent_start" });
     assert.deepEqual(captured.toolDiagnostic()?.missing ?? [], []);
     if (mode === "foreground") {
@@ -171,6 +191,8 @@ try {
   } finally { await child.dispose(); }
 } finally {
   await factory.dispose();
+  removeRegistrationListener();
+  assert.equal(observerRegistered, false);
   disposed = true;
 }
 console.log(JSON.stringify({ mode, disposed, sideEffects, errors }));

@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { checkoutEvidence, designatedWorkspace, digest, discoverSpec, inspectionSnapshot, MAX_SPEC_BYTES, SPEC_SECTIONS, specChunks, validateSpec } from "../extensions/spec-plans.ts";
+import { checkoutEvidence, designatedWorkspace, digest, discoverSpec, executionAmendments, inspectionSnapshot, MAX_SPEC_BYTES, preliminarySpec, specBinding, SPEC_SECTIONS, specChunks, validateSpec } from "../extensions/spec-plans.ts";
 import { boardWorkspace } from "../extensions/board/workspace.ts";
 import { applyCheckpoint, captureCheckpoint, checkpointDirectory, completeCheckpoint, prepareCheckpoint, restoreCheckpoint, type CheckpointIntent } from "../extensions/execute-checkpoint.ts";
 
@@ -26,6 +26,26 @@ function put(root: string, content = spec()) {
 }
 
 describe("spec-plan discovery and concrete input", () => {
+  test("admission amendment paths stay inside the designated worktree, including symlinks", () => {
+    const { main, other } = fixture(), source = path.join(main, "human.md");
+    const content = "# Human amendment\nFull source.\n";
+    writeFileSync(source, content); writeFileSync(path.join(other, "outside.md"), content);
+    const ref = { path: "human.md", sha256: digest(content), provenance: "human message h1 at 2026-10-31T06:12:50Z" };
+    expect(executionAmendments(main)).toEqual([]);
+    expect(executionAmendments(main, [ref], true)).toEqual([{ ...ref, path: source }]);
+    expect(() => executionAmendments(main, [{ ...ref, path: "../other/outside.md" }])).toThrow("inside designated worktree");
+    symlinkSync(path.join(other, "outside.md"), path.join(main, "link.md"));
+    expect(() => executionAmendments(main, [{ ...ref, path: "link.md" }], true)).toThrow("Physical path escapes");
+    expect(() => executionAmendments(main, [{ ...ref, sha256: "0".repeat(64) }], true)).toThrow("Full source hash mismatch");
+    for (const invalidContent of ["", " \n", "# Invalid\0text"]) {
+      writeFileSync(source, invalidContent);
+      expect(() => executionAmendments(main, [{ ...ref, sha256: digest(invalidContent) }], true)).toThrow("Expected complete nonempty Markdown text");
+    }
+    for (const invalid of [null, {}, [{ ...ref, sha256: "" }], [{ ...ref, provenance: "" }],
+      [{ ...ref, path: "human.txt" }], [{ ...ref, extra: true }]]) {
+      expect(() => executionAmendments(main, invalid)).toThrow();
+    }
+  });
   function checkpoint(root: string): CheckpointIntent {
     return { version: 1, association: { root, commonDir: designatedWorkspace(root).identity,
       missionId: "mission", missionPath: "/native/mission.json", invocation: "run",
@@ -250,7 +270,7 @@ describe("spec-plan discovery and concrete input", () => {
     const { base, main, sibling } = fixture();
     const installed = path.join(base, "install with ' quotes & %PATH% !", "node_modules", "pitako");
     // Copy only owned shipped resources; no dependency install, Pi loader or provider.
-    for (const file of ["package.json", "skills/execute/inspect.mjs", "skills/execute/inspect.ts",
+    for (const file of ["package.json", "skills/execute/inspect.mjs", "skills/execute/loader.mjs", "skills/execute/inspect.ts",
       "extensions/spec-plans.ts", "extensions/execute-retained.ts", "extensions/execute-checkpoint.ts", "extensions/execute-state.ts", "extensions/board/workspace.ts", "extensions/board/paths.ts", "extensions/errors.ts"]) {
       const target = path.join(installed, file); mkdirSync(path.dirname(target), { recursive: true }); cpSync(path.resolve(file), target);
     }
@@ -331,5 +351,45 @@ describe("spec-plan discovery and concrete input", () => {
     git(main, "checkout", "--detach", "-q"); expect(checkoutEvidence(main).branch).toBe("HEAD");
     const link = path.join(main, "link"); symlinkSync("owned.ts", link); const linked = checkoutEvidence(main).fingerprint;
     rmSync(link); symlinkSync("other.ts", link); expect(checkoutEvidence(main).fingerprint).not.toBe(linked);
+  });
+});
+
+
+describe("preliminary capture", () => {
+  test("preserves maximum bytes as inert escaped data and binds all physical selectors", () => {
+    const { main, sibling } = fixture();
+    const prefix = spec() + "中😀\n'; throw Error('not code'); //\n";
+    const content = prefix + '"'.repeat(MAX_SPEC_BYTES - Buffer.byteLength(prefix));
+    const source = put(sibling, content);
+    const preliminary = preliminarySpec(main, "demo", source);
+    expect(Buffer.byteLength(content)).toBe(39936);
+    expect(Buffer.byteLength(JSON.stringify(preliminary))).toBeGreaterThan(65536);
+    expect(JSON.parse(JSON.stringify(preliminary)).content).toBe(content);
+    expect(preliminary).toMatchObject({ root: main, commonDir: path.join(main, ".git"), source, digest: digest(content), version: 1 });
+    const { binding } = preliminary;
+    for (const changed of [specBinding("other", main, preliminary.commonDir, preliminary),
+      specBinding("demo", sibling, preliminary.commonDir, preliminary),
+      specBinding("demo", main, sibling, preliminary),
+      specBinding("demo", main, preliminary.commonDir, { ...preliminary, source: source + "x" }),
+      specBinding("demo", main, preliminary.commonDir, { ...preliminary, digest: "f".repeat(64) })])
+      expect(changed.binding).not.toBe(binding);
+    put(main, spec());
+    expect(() => preliminarySpec(main, "demo", source)).toThrow("local-first");
+    expect(preliminarySpec(main, "demo").source).toBe(path.join(main, ".pitako/plans/demo.md"));
+  });
+  test("invalid oversized local candidates are bounded and cannot fall back to a valid sibling", () => {
+    const { main, sibling } = fixture(); put(sibling); put(main, spec() + "x".repeat(MAX_SPEC_BYTES * 2));
+    expect(() => preliminarySpec(main, "demo")).toThrow("size exceeds 39936");
+    expect(() => preliminarySpec(main, "demo")).toThrow("explicitly prepare admission");
+    put(main, "invalid");
+    expect(() => preliminarySpec(main, "demo")).toThrow("Not a complete");
+  });
+  test("missing and ambiguous inputs identify the correction instead of a hash mismatch", () => {
+    const { main, sibling, base } = fixture();
+    expect(() => preliminarySpec(main, "demo")).toThrow("Missing complete spec-plan");
+    put(sibling);
+    const third = path.join(base, "third"); git(main, "worktree", "add", "-qb", "third", third); const source = put(third);
+    expect(() => preliminarySpec(main, "demo")).toThrow("Ambiguous spec-plan");
+    expect(preliminarySpec(main, "demo", source).source).toBe(source);
   });
 });
