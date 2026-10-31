@@ -30,7 +30,8 @@ export function boardWorkspace(cwd = process.cwd()): BoardWorkspace {
   return { identity, physicalRoot, legacyRoots };
 }
 
-function workspacePaths(cwd: string): { worktreeRoot: string; commonDir: string } {
+/** Physical worktree root and common directory; both are the canonical cwd outside Git. */
+export function workspacePaths(cwd: string): { worktreeRoot: string; commonDir: string } {
   const physicalCwd = canonicalPath(cwd);
   const git = gitPaths(physicalCwd);
   return git ?? { worktreeRoot: physicalCwd, commonDir: physicalCwd };

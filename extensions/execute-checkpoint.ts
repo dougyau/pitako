@@ -100,7 +100,7 @@ function load(intent: CheckpointIntent) {
   if (!equal(manifest.intent, intent)) throw new Error("Checkpoint intention association mismatch.");
   if (!manifest.base?.fingerprint || !manifest.files?.length || !manifest.index)
     throw new Error("Checkpoint lacks reconstructible preimages.");
-  if (checkoutEvidence(intent.association.root).head !== manifest.base.head ||
+  if (gitRead(intent.association.root, "rev-parse", "HEAD").trim() !== manifest.base.head ||
       index(intent.association.root) !== manifest.index)
     throw new Error("Checkpoint HEAD/index changed; no Git reset is permitted.");
   const known = new Set<string>();
