@@ -78,6 +78,32 @@ The architecture and review skills initiate their existing file-backed
 pi-subagents workflows. Scripts own dispatch. Directors and participants only
 reason about the same supplied problem or target.
 
+The [architecture](../skills/architecture/SKILL.md) and
+[review](../skills/review/SKILL.md) skills own the request, continuation and
+evidence contracts. Callers provide a concrete single-line `workDescription`.
+New and resumed producers receive readable labels, explicit phases and a concrete
+first task line. This includes context providers, initial directors, doubts,
+the relay and execute's integrated review. Review angles and initial provider
+identities precede the work description. Integrated review uses available
+admitted task goals or completed-work descriptions, not just the spec ID.
+These titles do not rename retained sessions or control all native views
+or notices.
+Architecture requires a complete versioned decision before dispatch. Its skill
+defines replacement, reentry and selective factual retry. Execute recovery is
+separate.
+
+Reasoning originals use native file-only publication. Ordered manifests retain
+publication witnesses, returned references and producing provenance rather than
+duplicate reports. `structuredOutputPath` or generic artifact references alone
+do not prove required publication. The skills define access checks, retention
+of failed originals and the whole-file capacity limit. Missing or contradictory
+essentials block dependent conclusions, including after resume. Publication,
+delivery, sufficiency, access and optional observability are distinct.
+Foreground receives concise supporting context, and the file-blind relay receives
+a self-contained frontier. Final memos retain material reasons, disagreement
+and limits. This adds no summarizer, phase, filesystem capability, profile
+delegation, exactly-once guarantee or dependency certification.
+
 The workflows return advice with native references. They do not grant authority,
 freeze plans, accept implementation, or reproduce the removed runtime's
 reservation, fencing, disposal, fallback, or delivery guarantees.

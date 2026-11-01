@@ -103,6 +103,8 @@ export default function planExecute(pi: ExtensionAPI): void {
         systemPrompt: "Fixed actual-cwd observer and ledger publisher; stdin is a JSON {expected, body} request, never a workspace selector.", systemPromptMode: "replace", tools: [], allowNestedSubagents: false,
         inheritProjectContext: false, inheritGlobalContext: false, inheritSkills: false,
         defaultContext: "fresh", defaultAsync: false,
+        // Deterministic: no inferred acceptance contract may be appended to the JSON stdin request.
+        acceptanceRole: "read-only",
         runner: { type: "external-cli", command: process.execPath,
           args: [path.join(packageRoot(), "skills/execute/observe.mjs")], promptDelivery: "stdin" },
       } });
@@ -111,6 +113,8 @@ export default function planExecute(pi: ExtensionAPI): void {
         systemPrompt: "Fixed execution ledger; stdin is a JSON publication request.", systemPromptMode: "replace", tools: [], allowNestedSubagents: false,
         inheritProjectContext: false, inheritGlobalContext: false, inheritSkills: false,
         defaultContext: "fresh", defaultAsync: false,
+        // Deterministic: no inferred acceptance contract may be appended to the JSON stdin request.
+        acceptanceRole: "read-only",
         runner: { type: "external-cli", command: process.execPath,
           args: [path.join(packageRoot(), "skills/execute/ledger.mjs")], promptDelivery: "stdin" },
       } });

@@ -137,6 +137,13 @@ function publish(directory, record) {
   return { count: record.seq + 1, head: digest(bytes) };
 }
 
+// pi-subagents external-cli stdin is "<System instructions>\n...\n\n<Task>\n<task>".
+// The JSON task cannot contain a raw newline, so the first frame marker is unambiguous.
+export function readRequest(input) {
+  const marker = "\n<Task>\n", at = input.indexOf(marker);
+  return JSON.parse(at === -1 ? input : input.slice(at + marker.length));
+}
+
 /** Bodies are explicit persisted projections owned by the workflow, never live runtime objects. */
 export function appendLedger(root, invocation, request) {
   if (!(keys(request, "expected,record,spec") || keys(request, "expected,record")) || !keys(request.record, "body,kind,loop") ||
@@ -166,7 +173,7 @@ export function appendLedger(root, invocation, request) {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   try {
-    const request = JSON.parse(readFileSync(0, "utf8"));
+    const request = readRequest(readFileSync(0, "utf8"));
     if (!(keys(request, "expected,invocation,record,spec") || keys(request, "expected,invocation,record"))) throw new Error("Invalid ledger CLI request.");
     const { invocation, ...append } = request;
     const anchor = appendLedger(process.cwd(), invocation, append);

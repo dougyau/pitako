@@ -6,7 +6,7 @@ import { validateToolArguments } from "@earendil-works/pi-ai";
 import { validateWorkflowScript } from "../node_modules/pi-subagents/src/workflows/scripted-workflow.js";
 import { MISSION_STATE_MAX_BYTES } from "../node_modules/pi-subagents/src/missions/workflow-state.js";
 import { digest, MAX_SPEC_BYTES } from "../extensions/spec-plans.ts";
-import { executeControllerFixture, resolvedLoop, source, copy, gaps, closedInterruptedProducer, cutAt, config, candidate, expectImpediment, removeCache, type Result } from "./fixtures/execute-workflow.ts";
+import { executeControllerFixture, resolvedLoop, source, copy, gaps, closedInterruptedProducer, cutAt, config, candidate, expectImpediment, removeCache, publicationWitness, type Result } from "./fixtures/execute-workflow.ts";
 
 const { fixture } = executeControllerFixture();
 
@@ -222,6 +222,69 @@ describe("workflow-owned execute controller", () => {
     expect(readFileSync(path.join(host.root, ".pi/subagents/execute/human-1/000001.json"), "utf8"))
       .not.toContain("Injected reentry diagnostic");
   });
+  test("a saved cooperative pause continues the same task without human input or another loop", async () => {
+    const host = fixture();
+    host.setRespond((request, normal) => request.key.endsWith(".t1.a1") ? host.result(request, {
+      ...host.worker(request, "pause"), status: "continue",
+      remaining: ["Finish original publication and access guarantees"],
+      diagnosis: "Useful metadata changes are saved; the original evidence implementation remains pending.",
+      continuation: "Complete the remaining evidence guarantees without repeating metadata work",
+    }) : normal());
+    const outcome = await host.executeNative();
+    expect(outcome).toMatchObject({ status: "complete", loopsConsumed: 1 });
+    // State v4 seals the superseded pause into the ledger and keeps only current results.
+    const units = host.records().filter((record: any) => record.kind === "unit").map((record: any) => record.body.result);
+    expect(units.slice(0, 2).map((result: any) => [result.taskId, result.attempt, result.status]))
+      .toEqual([["change1", 1, "continue"], ["change1", 2, "complete"]]);
+    expect(units[0]).toMatchObject({
+      usefulContinuation: true, checkpoint: { confirmation: { kind: "pause", position: { cursor: 0 } } },
+    });
+    const loop = resolvedLoop(host.current());
+    expect(loop.results[0]).toMatchObject({ taskId: "change1", attempt: 2, status: "complete" });
+    expect(loop.cursor).toBe(2);
+    expect(loop.halt).toBeUndefined();
+    expect(host.calls.filter(call => call.key.endsWith(".director"))).toHaveLength(1);
+    for (const suffix of [".t1.a1", ".t1.a2", ".t2.a1", ".review.director-synthesis", ".compliance"])
+      expect(host.calls.filter(call => call.key.endsWith(suffix))).toHaveLength(1);
+    expect(host.calls.find(call => call.key.endsWith(".t1.a2"))!.task).toContain("invoke-human-1.l1.t1.a1");
+  });
+
+  test("a pause with gaps exhausts the ordinary budget without inventing a human impediment", async () => {
+    const host = fixture();
+    host.setLimit(1);
+    host.setRespond((request, normal) => request.key.endsWith(".t1.a1") ? host.result(request, {
+      ...host.worker(request, "pause"), status: "gaps", usefulProgress: false,
+      remaining: ["Replan the remaining implementation"], continuation: null,
+    }) : normal());
+    const outcome = await host.execute();
+    expect(outcome).toMatchObject({ status: "partial", loopsConsumed: 1 });
+    expect(resolvedLoop(host.current())).toMatchObject({ outcome: "gaps", cursor: 0 });
+    expect(resolvedLoop(host.current()).halt).toBeUndefined();
+    expect(host.current().lastConfirmed.kind).toBe("pause");
+    expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(1);
+    expect(host.calls.some(call => call.key.endsWith(".compliance"))).toBe(false);
+  });
+
+  test.each(["stopped", "permission"] as const)("automatic pause continuation still honors native %s", async cause => {
+    const host = fixture();
+    host.setRespond((request, normal) => {
+      if (request.key.endsWith(".t1.a1")) return host.result(request, {
+        ...host.worker(request, "pause"), status: "continue", remaining: ["Finish pending work"],
+        continuation: "Continue the same authorized task",
+      });
+      return request.key.endsWith(".t1.a2") ? closedInterruptedProducer(normal(), cause) : normal();
+    });
+    const outcome = await host.execute();
+    expect(outcome.status).toBe(cause === "stopped" ? "cancelled" : "blocked");
+    expect(resolvedLoop(host.current()).halt).toMatchObject({
+      code: "native-barrier", cause: cause === "stopped" ? "stopped" : "native permission denial",
+    });
+    expect(outcome.loopsConsumed).toBe(1);
+    expect(resolvedLoop(host.current()).results).toHaveLength(1);
+    expect(host.current().lastConfirmed.kind).toBe("pause");
+    expect(host.calls.some(call => call.key.endsWith(".compliance"))).toBe(false);
+  });
+
   test.each(["continue", "gaps"])("an exact retained synthetic pause halt is reconciled without renewed authorization: %s", async status => {
     const host = fixture();
     host.setLimit(1);
@@ -1656,10 +1719,185 @@ describe("workflow-owned execute controller", () => {
 
   test.each([2, 3, 4])("real %s-angle review includes critiques, one defense and synthesis, not include=material", async angles => {
     const host = fixture("FULL SPECS", { angles, findings: true });
+    const goal = "Improve record selection\n " + "with complete caller evidence ".repeat(12);
+    host.setRespond((request, normal) => {
+      const result = normal();
+      if (request.key.endsWith(".director")) result.structuredOutput.tasks[0].goal = goal;
+      return result;
+    });
+    // A scoped-defect finding returned as ready reaches synthesis instead of stopping execute.
     expect((await host.execute()).status).toBe("complete");
     expect(host.calls.filter(call => call.key.includes(".review."))).toHaveLength(3 * angles + 2);
+    for (const call of host.calls.filter(item => item.key.includes(".review.")))
+      expect(call.task).toContain("Return status blocked only when missing material context prevents this review phase.");
     expect(host.calls.filter(call => call.key.includes(".review.") && call.resume)).toHaveLength(2 * angles + 1);
+    const requests = host.calls.filter(call => call.key.includes(".review."));
+    expect(new Set(requests.map(request => request.phase))).toEqual(new Set([
+      "review-prepare", "review-independent", "review-critique", "review-defense", "review-synthesis",
+    ]));
+    const manifest = host.storage.get("review-invoke-human-1");
+    expect(manifest.originals).toHaveLength(requests.length);
+    for (const request of requests) {
+      const label = request.label ?? "";
+      expect(label).toBe(request.task.split("\n")[0]);
+      expect(label).toContain(`Loop 1 result — ${goal.replace(/\s+/g, " ").trim()}; Goal final`);
+      const angle = request.key.match(/(?:independent|critique|defense)-angle(\d+)$/)?.[1];
+      if (angle) expect(label.indexOf(`Whole-result angle ${angle}`)).toBeLessThan(label.indexOf("Loop 1 result"));
+      expect(request.task).toContain("FULL SPECS");
+      expect(request.task).toContain("FULL SHARED CONTEXT");
+      expect(request.task).toContain("COMPLETE TARGET:");
+      expect(request.outputMode).toBe("file-only");
+      expect(request.output).toBe(`review/${request.key}.json`);
+      expect(request).toMatchObject({ cwd: host.root, reads: false, progress: false });
+      const ref = resolvedLoop(host.current()).review.references.find((entry: any) => entry.key === request.key);
+      const original = { ...manifest.originalDefaults, ...manifest.originals.find((entry: any) => entry.key === request.key) };
+      expect(ref.runId).toBe(original.runId);
+      expect(ref.outputReference).toBe(`/native/output/${request.key}.json`);
+      expect(original.results).toBeUndefined(); // canonical witnesses belong to execute, not a second manifest copy
+      expect(manifest.decision.reference).toMatchObject({ stateKey: "invoke-human-1", loop: 1 });
+      const witness = publicationWitness(ref.results[0], host.native.get(ref.runId)!.results![0]);
+      expect(witness.outputReference).toEqual({ path: witness.savedOutputPath,
+        bytes: readFileSync(witness.savedOutputPath).byteLength, lines: 1, message: "Saved" });
+      expect(witness.structuredOutputPath).toBe(`/native/witness/${request.key}.json`);
+      const recovered = JSON.parse(readFileSync(witness.savedOutputPath, "utf8"));
+      expect(recovered.association).toEqual(Object.fromEntries(Object.entries(request.outputSchema.properties.association.properties)
+        .map(([key, schema]: [string, any]) => [key, schema.const])));
+      expect(recovered.delivery).toBe("complete");
+      expect(original).toMatchObject({ terminal: "succeeded", publication: "published", sufficient: true });
+      expect(original.failedOriginal).toBeUndefined();
+    }
   });
+
+  test.each(["key", "agent", "runId", "workflowKey", "failed-state", "failed-outcome", "nested-running", "nested-timeout"])(
+    "integrated review rejects and retains contradictory native witnesses: %s", async fault => {
+      const host = fixture();
+      let observed: Result | undefined;
+      host.setRespond((request, normal) => {
+        const result = normal();
+        if (request.key.endsWith("review.director-prepare")) {
+          const receipt = result.results![0]! as any;
+          if (["key", "agent", "runId", "workflowKey"].includes(fault)) receipt[fault] = "conflicting-native-producer";
+          if (fault === "failed-state") result.state = "failed";
+          if (fault === "failed-outcome") receipt.terminalOutcome = { state: "partial", reason: "budget_exhausted" };
+          if (fault === "nested-running") receipt.state = "running";
+          if (fault === "nested-timeout") receipt.timedOut = true;
+          observed = copy(result);
+        }
+        return result;
+      });
+      const output = await host.executeNative();
+      expect(output.status).toBe("blocked");
+      expect(host.calls.filter(request => request.key.includes(".review."))).toHaveLength(1);
+      expect(host.calls.some(request => request.key.endsWith(".compliance"))).toBe(false);
+      const manifest = host.storage.get("review-invoke-human-1");
+      const original = { ...manifest.originalDefaults, ...manifest.originals[0] };
+      expect(original.sufficient).toBe(false);
+      expect(original.failedOriginal).toBeUndefined();
+      const reference = resolvedLoop(host.current()).review.references[0];
+      const actual = observed!.results![0]!;
+      const witness = publicationWitness(reference.results[0], actual);
+      expect(witness.savedOutputPath).toBe(actual.savedOutputPath);
+      expect(witness.outputReference).toEqual(actual.outputReference);
+      for (const field of ["key", "agent", "runId", "workflowKey", "terminalOutcome", "state", "timedOut"])
+        expect(witness[field]).toEqual((actual as any)[field]);
+      if (fault === "failed-state") expect(reference.state).toBe("failed");
+      const prior = copy(reference), count = host.calls.length;
+      expect((await host.executeNative()).status).toBe("blocked");
+      expect(host.calls).toHaveLength(count);
+      expect(resolvedLoop(host.current()).review.references[0]).toEqual(prior);
+    });
+
+  test.each(["different-path", "no-reference"])("integrated review retains distinct or missing publication references: %s", async mode => {
+    const host = fixture();
+    host.setRespond((request, normal) => {
+      const result = normal();
+      if (request.phase?.startsWith("review-")) {
+        const witness = result.results![0]!;
+        if (mode === "no-reference") delete witness.outputReference;
+        else witness.outputReference = { ...witness.outputReference!, path: "/native/distinct-returned-reference" };
+      }
+      return result;
+    });
+    const output = await host.execute();
+    expect(output.status).toBe("complete");
+    for (const ref of resolvedLoop(host.current()).review.references) {
+      const witness = ref.results[0], actual = host.native.get(ref.runId)!.results![0];
+      expect(witness.savedOutputPath).toBe(actual.savedOutputPath);
+      expect(witness.outputReference).toEqual(actual.outputReference);
+      expect(JSON.parse(readFileSync(witness.savedOutputPath, "utf8")).association.key).toBe(ref.key);
+    }
+  });
+
+  test.each(["optional-artifact", "mandatory-publication", "partial-failed", "non-delivery", "unknown-completeness", "inaccessible-essential"])(
+    "integrated review distinguishes publication/delivery/access: %s", async mode => {
+      const host = fixture();
+      let observed: Result | undefined;
+      host.setRespond((request, normal) => {
+        const result = normal();
+        if (request.key.endsWith(mode === "inaccessible-essential" ? "review.director-synthesis" : "review.director-prepare")) {
+          if (mode === "optional-artifact") result.metadataSaveError = "Optional debug artifact unavailable";
+          if (["mandatory-publication", "partial-failed"].includes(mode)) {
+            delete result.results![0]!.savedOutputPath;
+            result.results![0]!.outputSaveError = "Required output save failed";
+          }
+          // Native failures can embed the delivered body after the diagnostic.
+          if (mode === "mandatory-publication")
+            result.error = `Required output save failed\n\nOutput:\n${JSON.stringify(result.structuredOutput, null, 2)}`;
+          if (mode === "partial-failed") {
+            result.ok = false; result.error = "Terminal partial analysis";
+            result.structuredOutput.status = "blocked";
+            result.structuredOutput.reason = "Contrary partial evidence, not sufficient";
+          }
+          if (mode === "non-delivery") delete result.structuredOutput;
+          if (mode === "unknown-completeness") delete result.structuredOutput.delivery;
+          if (mode === "inaccessible-essential") result.structuredOutput.access[0] = {
+            ...result.structuredOutput.access[0], state: "unavailable", source: "none", reason: "Exact original no longer accessible",
+          };
+          observed = copy(result);
+        }
+        return result;
+      });
+      // The failed original must exist once in every durable merged checkpoint.
+      const bodyCopies: number[] = [];
+      host.setSaveObserver(() => {
+        if (!observed?.structuredOutput) return;
+        const merged = JSON.stringify(Object.fromEntries(host.storage));
+        bodyCopies.push(merged.split(JSON.stringify(observed.structuredOutput.reason).slice(1, -1)).length - 1);
+      });
+      const output = await host.executeNative();
+      if (mode === "mandatory-publication") {
+        expect(bodyCopies.length).toBeGreaterThan(0);
+        expect(Math.max(...bodyCopies)).toBe(1);
+      }
+      if (mode === "optional-artifact") {
+        expect(output.status).toBe("complete");
+      } else {
+        expect(output.status).toBe("blocked");
+        expect(host.calls.some(request => request.key.endsWith(".compliance"))).toBe(false);
+      }
+      const manifest = host.storage.get("review-invoke-human-1");
+      const retainedOriginal = manifest.originals.find((entry: any) => entry.runId === observed!.runId);
+      expect(retainedOriginal).toBeDefined();
+      const original = { ...manifest.originalDefaults, ...retainedOriginal };
+      expect(manifest.originals.filter((entry: any) => entry.id === original.id)).toHaveLength(1);
+      if (["mandatory-publication", "partial-failed"].includes(mode)) {
+        expect(original).toMatchObject({ publication: "unpublished", delivery: "complete", sufficient: false });
+        expect(original.failedOriginal).toEqual(observed!.structuredOutput);
+      } else expect(original.failedOriginal).toBeUndefined();
+      if (mode === "non-delivery") expect(original.delivery).toBe("not-delivered");
+      if (mode === "unknown-completeness") expect(original.delivery).toBe("unproved");
+      if (mode === "inaccessible-essential") expect(original).toMatchObject({ essentialAccess: "incomplete", sufficient: false });
+      if (mode === "optional-artifact") expect(original).toMatchObject({ publication: "published", observability: "failed", sufficient: true });
+      if (mode === "partial-failed") {
+        host.setStatus(ref => ({ ...copy(host.native.get(ref)!), ok: true,
+          structuredOutput: { ...observed!.structuredOutput, delivery: undefined } }));
+        expect((await host.executeNative()).status).toBe("blocked");
+        const retained = host.storage.get("review-invoke-human-1").originals;
+        expect(retained).toHaveLength(1);
+        expect(retained[0].failedOriginal).toEqual(observed!.structuredOutput);
+        expect(retained[0]).toMatchObject({ sufficient: false, publication: "unpublished" });
+      }
+    });
 
   test("director has settled before first worker and no next worker starts before prior settlement", async () => {
     const host = fixture(); let active = false;
@@ -2819,8 +3057,24 @@ describe("workflow-owned execute controller", () => {
     expect(Buffer.byteLength(content)).toBe(39936);
     const host = fixture(content, { metadataPadding: 7000, angles: 4, findings: true });
     host.storage.set("other-owned-history", { content: "h".repeat(90000) });
+    const essentialBytes: number[] = [];
+    const originalSet = host.state.set;
+    host.state.set = async (key, value) => {
+      if (!(value as any)?.activePlan)
+        essentialBytes.push(Buffer.byteLength(JSON.stringify({ ...Object.fromEntries(host.storage), [key]: value }, null, 2)));
+      await originalSet(key, value);
+    };
     host.setRespond((request, normal) => {
       const result = normal();
+      if (request.phase?.startsWith("review-")) {
+        // This capacity case publishes only the actual original. The default
+        // double's extra /native optional paths are not real publications here;
+        // dedicated adapter cases below/above retain every supplied witness.
+        const saved = result.results![0]!.savedOutputPath!;
+        result.outputReference = saved;
+        delete result.outputArtifactPath; delete result.outputPathMapping; delete result.artifactPaths;
+        delete result.results![0]!.structuredOutputPath;
+      }
       if (request.key.endsWith(".director")) result.structuredOutput.sharedContext.material = "context".repeat(25000);
       if (request.agent === "pitako.worker") {
         result.structuredOutput.workDone = "w".repeat(300000); result.structuredOutput.diagnosis = "d".repeat(300000);
@@ -2836,6 +3090,31 @@ describe("workflow-owned execute controller", () => {
     expect(host.current().association.digest).toBe(digest(content)); expect(host.storage.get("other-owned-history").content).toHaveLength(90000);
     expect(host.hostCalls).toEqual(["inspect-initial"]); expect(host.calls.filter(call => call.agent === "pitako.checkout-observer")).toHaveLength(3);
     expect(host.history().map((loop: any) => loop.number)).toEqual([1, 2, 3]);
+    expect(Math.max(...essentialBytes)).toBeLessThanOrEqual(MISSION_STATE_MAX_BYTES);
+    // One review slot per execute invocation: archived loops never re-enter review.
+    expect([...host.storage.keys()].filter(key => key.startsWith("review-"))).toEqual(["review-invoke-human-1"]);
+    for (const loop of host.history().slice(-1)) {
+      const manifest = host.storage.get("review-invoke-human-1");
+      expect(manifest.decision).toEqual({ reference: { stateKey: "invoke-human-1", loop: loop.number } });
+      expect(manifest.query).toBe(JSON.stringify(loop.candidate));
+      expect(manifest.revision).toBe(1);
+      expect(manifest.originals).toHaveLength(14);
+      for (const retained of manifest.originals) {
+        const original = { ...manifest.originalDefaults, ...retained };
+        expect(original).toMatchObject({ attempt: 1, terminal: "succeeded", publication: "published",
+          delivery: "complete", essentialAccess: "accessible", sufficient: true, diagnostic: "" });
+        const ref = loop.review.references.find((entry: any) => entry.key === original.key);
+        expect(ref.runId).toBe(original.runId);
+        const witness = publicationWitness(ref.results[0], host.native.get(ref.runId)!.results![0]);
+        const exact = JSON.parse(readFileSync(witness.savedOutputPath, "utf8"));
+        expect(exact.association).toEqual({ namespace: manifest.namespace, query: manifest.query, revision: manifest.revision,
+          phase: original.phase, producer: original.producer, key: original.key, attempt: original.attempt });
+        expect(original.id).toBe(`${exact.association.key}.v1.a1`);
+        expect(ref.outputReference).toBe(witness.savedOutputPath);
+        expect(witness.outputReference).toEqual({ path: witness.savedOutputPath,
+          bytes: readFileSync(witness.savedOutputPath).byteLength, lines: 1, message: "Saved" });
+      }
+    }
   });
 
   test.each(["before-director", "before-worker", "after-result"])("essential state failure %s halts new dispatch and retains frozen snapshot/descriptor/history", async phase => {

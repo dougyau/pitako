@@ -221,3 +221,16 @@ describe("fused loop ledger publication", () => {
     expect(host.current().loop.archived).toBeUndefined();
   });
 });
+
+// pi-subagents rejects these launch fields for runner.type='external-cli'
+// (acceptance:false included) before any process starts.
+test("external-cli ledger and observer launches carry no field that runner rejects", async () => {
+  const host = fixture(undefined, { findings: true }); host.setLimit(2);
+  expect((await host.execute()).status).toBe("complete");
+  const external = host.calls.filter(call => ["pitako.execution-ledger", "pitako.checkout-observer"].includes(call.agent!));
+  expect(new Set(external.map(call => call.agent))).toEqual(new Set(["pitako.execution-ledger", "pitako.checkout-observer"]));
+  for (const call of external as any[]) {
+    for (const field of ["acceptance", "agentContract", "toolBudget", "model", "fast"]) expect(call, call.key).not.toHaveProperty(field);
+    expect(call.outputSchema === undefined || call.outputSchema === false, call.key).toBe(true);
+  }
+});

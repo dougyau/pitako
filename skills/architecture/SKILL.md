@@ -32,9 +32,13 @@ An ordinary architecture discussion does not start execution.
    delegation. User or project overrides can change the profile. If it is absent,
    reload the installed package before dispatch. Do not substitute another profile,
    change settings, or create agent files to make a discussion work.
-4. Write a complete brief with the decision, desired outcome, constraints,
-   non-goals, shared evidence, and open questions. Resolve material ambiguity
-   before dispatch. Arguments are persisted, so do not include secrets.
+4. Supply a complete `currentDecision` snapshot with the decision, desired
+   outcome, constraints, non-goals, evidence and open questions. Include active
+   human decisions and their exact provenance, plus identified obligations.
+   Resolve material ambiguity before dispatch. Arguments persist; omit secrets.
+   Choose a stable consultation ID and an explicit native mission for both
+   ordinary and planning consultations. Allow only one active entry per
+   consultation; mission state is not an atomic caller lock.
 
 ## Launch one background workflow
 
@@ -45,8 +49,22 @@ at the project being discussed.
 ```js
 subagent({
 	workflow: "<absolute skill directory>/workflow.js",
+	cwd: "<project root>",
 	async: true,
-	args: { brief: "<complete decision brief>", maxRounds: 10 }
+	options: { mission: { title: "Design stream parser limits" } },
+	args: {
+		consultation: "stream-parser",
+		workDescription: "Stream parser memory limits",
+		currentDecision: {
+			version: 1,
+			brief: "<complete current problem, alternatives, non-goals, evidence and questions>",
+			constraints: ["Read-only design advice"],
+			obligations: [{ id: "bounded-memory", content: "Bound parser memory", provenance: "<request source>" }],
+			humanDecisions: [{ id: "streaming", content: "Keep streaming input", provenance: "<actual human message>" }],
+			provenance: "<caller request and source references>"
+		},
+		maxRounds: 10
+	}
 })
 ```
 
@@ -64,8 +82,9 @@ Resuming an older consultation also preserves its old profile. To use the new
 profile instead, start a fresh consultation explicitly. Do not silently replace
 a retained child.
 
-The first round uses `runs.all` for independent recommendations. Later rounds
-use rolling `runs.run` promises and `Promise.race`. An early report can challenge
+The first round uses configuration-object `runs.all` for independent recommendations.
+Later rounds use singleton configuration-object `runs.all` with rolling
+`Promise.race` coordination. An early report can challenge
 still-running peers through awaited `runs.steer`, then the script collects the
 remaining results. No child uses `async: true`, which would return an admission
 receipt instead of its report.
@@ -101,39 +120,138 @@ Steering states `queued`, `delivered`, `missed`, and `failed` describe transport
 They do not prove the model incorporated the challenge. A missed late challenge
 does not trigger a retry. Judge the resulting report instead.
 
+## Evidence and presentation
+
+Full reasoning reports request explicit native persistence and `outputMode: "file-only"`. The ordered manifest retains stable original IDs, producing
+consultation/revision/phase/producer/key/attempt/run and actual returned
+references. Operational resume IDs do not replace original provenance.
+Preserve `results[].savedOutputPath`, returned reference objects and textual
+`outputReference` paths. Generic artifact references or `structuredOutputPath`
+alone do not prove mandatory publication; `runs.status` previews are not originals.
+
+Each handoff names essential originals and why they matter. Children use their
+existing readers to recover exact content and validate schema/association.
+Fresh sessions need all necessary evidence; resumed sessions reread essentials
+lost from accessible context, including after compaction. Previous delivery is
+not current access, and an access receipt is not proof of reasoning. Missing,
+inaccessible or contradictory essentials block dependent conclusions. Do not
+require universal history rereads or hide contrary non-finding narrative.
+
+Native Stop, interruption, detachment, partial terminal outcomes, child timeout or
+nonzero exit override a schema-valid value and prevent dependent dispatch/reentry.
+Returned native producer witnesses must agree with the request and producing run.
+Retain these outcomes and all returned publication witnesses without rewriting
+the original association. Top-level outputSaveError overrides child saved paths;
+combined control, publication and essential-save diagnostics remain visible.
+Mandatory publication failure remains failure despite inline JSON. Optional
+observability failure alone is different when required witnesses and access
+survive. A complete identifiable failed/partial original genuinely delivered
+can be retained exactly once in existing native state, failed, unpublished and
+insufficient, without requiring ready analysis. Mere `structuredOutput`, preview,
+error, reference, rejected call without an object, or text lacking a truncation
+flag does not prove complete delivery. Do not reconstruct, republish, duplicate,
+truncate, erase history or open another store to fit the whole-file 256 KiB
+limit. Distinguish non-delivery from unproved completeness.
+
+The caller's concrete single-line `workDescription` supplies readable labels,
+explicit phases and first-line task titles for all fresh/resumed producers,
+including initial director, doubts, factual providers and relay. Keys remain
+stable. Pitako does not rename retained sessions, control every native notice
+or view, guarantee artifact retention/recovery, or certify dependencies. The
+final memo remains self-contained: decisions, reasons, disagreements, limits
+and references, not just paths.
+
 ## Continue a consultation
 
-Retain the exact returned `continuation`, especially the latest director and
-member `runId` values. Invoke the same file in background with:
+Retain the exact returned version-2 `continuation` (`{version: 2, consultation}`)
+and actual mission ID. Both ordinary and planning consultations return this
+compact reference, not the retained control state.
+Use the same mission, consultation ID and planning mode on reentry. The native
+state keeps the phase cursor, producer intentions, terminal evidence, current
+revision, original maximum, consumed rounds and valid rounds. Missing,
+incompatible or wrong-identity continuations fail before dispatch; duplicate
+initial admission is not a restart. Do not migrate old continuations.
+
+For unchanged decisions, omit `currentDecision` and `replacement`; optional
+`evidence` is factual data, not a revision or human decision:
 
 ```js
 subagent({
 	workflow: "<absolute skill directory>/workflow.js",
+	cwd: "<project root>",
 	async: true,
+	options: { missionId: "<actual existing mission ID>" },
 	args: {
-		brief: "<new question or evidence>",
-		continuation: previousResult.continuation
+		consultation: "stream-parser",
+		workDescription: "Stream parser memory limits",
+		continuation: previousResult.continuation,
+		evidence: "<new factual evidence and sources, not revised instructions>"
 	}
 })
 ```
 
-The original decision and consumed round count remain in effect. Do not reset
-the count to extend the same discussion. Failed rounds consume that budget.
-The separate `validRounds` count increases only after every member returns a
-ready report. Completion requires at least one such round, including after a
-failed consultation is resumed. For an ordinary explicitly NEW human-authorized decision, `newDecision: true`
-with its complete new brief may reuse the director but starts fresh perspective
-members and a new count. Unchanged briefs cannot reset the same decision. The
-flag or slightly changed text is not proof of human authorization; the foreground
-must obtain the actual instruction. Normal continuations retain their count.
-Planning is stricter: it uses an explicit mission and stable consultation ID;
-native state retains consumed rounds even on repeated entry. `newDecision` may
-not reset that planning consultation. A genuinely new planning assignment needs
-its own separately authorized consultation. Its doubts phase dispatches factual
-providers between rounds. Reentry uses the same mission and consultation ID;
-the returned planning continuation is a bounded reference, not the retained
-reports. Do not resend full accumulated evidence in workflow arguments.
-It launches pitako.interview-relay through the native
+For a changed decision use that same call with `replacement` instead of
+`evidence`. `completeSnapshot` has the full initial `currentDecision` shape;
+it is not a patch or a concatenation of past briefs:
+
+```js
+const replacement = {
+	consultation: "stream-parser",
+	expectedRevision: confirmedRevision,
+	snapshot: completeSnapshot,
+	preservedObligations: ["bounded-memory"],
+	replacedObligations: []
+};
+```
+
+`confirmedRevision` is the current confirmed decision revision (initially 1;
+advance it only on confirmed replacement). Do not try to read the revision
+from the compact continuation reference; the native state remains authoritative. Every prior obligation must appear exactly once in either
+`preservedObligations` (unchanged content/provenance in the snapshot) or
+`replacedObligations: [{id, reason, provenance}]`. Preserve every active human
+decision's content and provenance. The controller persists the replacement
+before dependent work. Structural identity/revision checks do not prove semantic
+equivalence or human authority; a director's proposal is not human approval.
+Unchanged resume and factual evidence do not increment the revision. History
+and contrary originals remain separate from current instructions.
+
+Do not change `maxRounds` on continuation. Failed admitted rounds consume it;
+`validRounds` counts rounds with sufficient terminal evidence, admitted once.
+No reentry grants an eleventh round. Planning's distinct doubts phase remains
+after each round. At the ceiling, reconciliation and synthesis remain possible.
+A genuinely different human-authorized ordinary decision may use `newDecision: true`, a new consultation ID and complete `currentDecision`, reusing the prior
+director through its continuation but starting fresh members/counts. This flag
+is not authority and cannot reset the same consultation; planning requires a
+separately authorized new consultation.
+
+If dispatch may have occurred without durable terminal/evidence confirmation,
+stop before another child launch, including the initial director or human relay.
+Correlation IDs and later `reused: true` do not establish safe dispatch or
+exactly-once execution. Essential save/capacity failure stops new dispatch and
+is not recursively retried. Settle owned work when native controls permit;
+report inherited settlement uncertainty and any simultaneous Stop/permission
+barrier, rather than advising continuation over it.
+
+Only after prior factual work is known terminal may an explicitly human-authorized
+selective retry use the same continuation with:
+
+```js
+const factualRetry = {
+	consultation: "stream-parser",
+	revision: confirmedRevision,
+	originalIds: ["<latest insufficient terminal factual original ID>"],
+	authorization: { content: "<actual human retry instruction>", provenance: "<human message reference>" }
+};
+```
+
+Use `planning: true` on this call. Do not combine it with a replacement. It
+retries only missing/insufficient factual providers at the retained frontier,
+including known terminal non-delivery, keeps sufficient providers, attempts and
+counters, and starts no new comparison round. Ambiguous dispatch blocks again;
+a further failed attempt needs new authorization targeting that latest attempt.
+Do not resend retained full reports in arguments.
+
+Planning launches pitako.interview-relay through the native
 supervisor channel concurrently with independent research. Each doubt names
 explicit factual prerequisite IDs; only dependent human questions wait for those
 facts. The read-only relay does not decide: when its interview_request arrives,

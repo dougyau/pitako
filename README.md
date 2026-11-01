@@ -149,6 +149,14 @@ test evidence. The caller retains scope, authorization, and interpretation.
 `pre-pr` reuses the review skill for independent whole-diff review and assesses
 local publication readiness without committing or publishing.
 
+Callers supply concrete `workDescription` text for launch titles that identify
+the work and phase. Architecture requires a mission, stable consultation ID and
+complete `currentDecision`, with explicit continuations and replacements.
+Full reasoning originals use native file-only artifacts, with publication
+witnesses and access checks, instead of repeated foreground reports.
+Final memos are self-contained. Pitako does not uniformly control native notices
+or retained session names.
+
 See [architecture](docs/architecture.md) and [review](docs/review.md).
 
 ## Plan and execute

@@ -35,7 +35,11 @@ contents. Preserve binary material or file references needed to review it.
 Supply `target.kind: "diff"`, a `target.reference` identifying the base, merge-base,
 HEAD, and captured material, and `target.material` containing the complete
 reviewable text or exact read-only artifact paths. Include scope, criteria,
-requirements, and current check evidence in `brief`. A base label alone is not
+requirements, active human decisions/provenance, and current check evidence in
+`brief`. Supply a concrete single-line `workDescription`, such as "Parser memory
+safety before publication", for both whole-diff and closure passes. Preserve
+review's actual native publication witnesses and exact-original access limits;
+references alone do not prove a sufficient review. A base label alone is not
 review material. Review does not require a clean tree.
 
 Keep the captured material and source files stable during review. Retain the

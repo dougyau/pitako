@@ -10,6 +10,8 @@ import { loadPromptTemplates, expandPromptTemplate } from "../node_modules/@eare
 import { resolveWorkflowResource } from "../node_modules/pi-subagents/src/workflows/workflow-resources.js";
 import { consumeWorkflowResourcePermit } from "../node_modules/pi-subagents/src/shared/workflow-child-permit.js";
 import { runWorkflowScript, validateWorkflowScript } from "../node_modules/pi-subagents/src/workflows/scripted-workflow.js";
+import { buildExternalCliPrompt } from "../node_modules/pi-subagents/src/runs/shared/external-cli-runner.js";
+import { formatAcceptancePrompt, resolveEffectiveAcceptance } from "../node_modules/pi-subagents/src/runs/shared/acceptance.js";
 import { resolvePiLaunchToolPlan } from "../node_modules/pi-subagents/src/runs/shared/child-tool-plan.js";
 import { discoverAgents, discoverAgentsAll } from "../node_modules/pi-subagents/src/agents/agents.js";
 import { resolveSkills } from "../node_modules/pi-subagents/src/agents/skills.js";
@@ -228,6 +230,8 @@ describe("plan/execute packaged composition", () => {
           originalPlan = structuredClone(response.structuredOutput);
         }
         if (request.agent === "pitako.checkout-observer") return response;
+        if (request.phase?.startsWith("review-")) Object.assign(response,
+          childResponse(key, request, metadata, observedCandidate(), 1, response.structuredOutput));
         const native = path.join(nativeRoot, response.runId), file = path.join(native, "structured-output/original.json");
         mkdirSync(path.dirname(file), { recursive: true });
         const original = JSON.stringify(response.structuredOutput);
@@ -240,7 +244,7 @@ describe("plan/execute packaged composition", () => {
         }));
         return { ...response, ...(query && key.endsWith(".director") ? { structuredOutput: undefined } : {}),
           outputReference: file, outputArtifactPath: file, outputPathMapping: { requestedPath: String(request.output), savedPath: file },
-          artifactPaths: [native, file], asyncDir: native, results: [{ structuredOutputPath: file }] };
+          artifactPaths: [native, file], asyncDir: native, results: [{ ...response.results?.[0], structuredOutputPath: file }] };
       },
       status: async (runId: string) => {
         statusCalls.push(runId);
@@ -259,7 +263,7 @@ describe("plan/execute packaged composition", () => {
     const marker = '!(text(entry.requirement) || entry.requirement === null) ||';
     expect(expanded.script).toContain(marker);
     const failed = await runWorkflowScript({ ...boundary,
-      script: query ? closingScript(expanded) : closingScript(expanded).replace(marker, "entry.requirement !== synthesis.dispositions.find(item => item.findingId === entry.findingId).requirement ||") });
+      script: query ? closingScript(expanded) : closingScript(expanded).replace(marker, "entry.requirement !== value.dispositions.find(item => item.findingId === entry.findingId).requirement ||") });
     expect(failed.value).toMatchObject({ status: query ? "partial" : "blocked", phase: query ? "director" : "review", loopsConsumed: 1 });
     expect((failed.value as any).reason).toContain(query ? "Essential persistence failed" : "screening contradicts");
     failQueryAdmission = false;
@@ -333,7 +337,9 @@ describe("plan/execute packaged composition", () => {
           if (input.queryMode === "persistence" && value.loop?.recoveries?.[0]?.stage === "observed") throw Error("Controlled retained-original save failure");
           storage.set(key, structuredClone(value));
         } },
-        launch: async (key, request) => { calls.push(key); if (request.agent === "pitako.checkout-observer") publications.push(JSON.parse(request.task)); const value = input.children[key]; if (!value) throw Error("Forbidden relaunch: " + key); return value; },
+        launch: async (key, request) => { calls.push(key); if (request.agent === "pitako.checkout-observer") publications.push(JSON.parse(request.task)); let value = input.children[key]; if (!value) throw Error("Forbidden relaunch: " + key);
+          if (request.phase?.startsWith("review-")) value = (${childResponse.toString()})(key, request, input.metadata, input.checkout, 1, value.structuredOutput);
+          return value; },
         status: async ref => { statuses.push(ref); return { key: ref, runId: ref, ok: true, output: input.queryMode === "unknown-settlement" ? "Current settlement unavailable" : "Run: " + ref + "\\nState: complete", results: [] }; },
         host: async key => { const stdout = key === "fixture-closing" ? JSON.stringify(input.closing)
           : execFileSync("sh", ["-c", input.grants[key]], { cwd: input.root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
@@ -353,7 +359,7 @@ describe("plan/execute packaged composition", () => {
       console.log(JSON.stringify({ result, old, storage: [...storage], calls, statuses, bytes, publications, injected: globalThis.recoveryInjected ?? false }));
     })().catch(error => { console.error(error); process.exitCode = 1; });
     `], { cwd: root, stdin: new TextEncoder().encode(JSON.stringify({ script: closingScript(continuation), root, closing: { ...metadata, checkout: observedCandidate() },
-      storage: [...storage], grants: Object.fromEntries(grants), queryMode,
+      storage: [...storage], grants: Object.fromEntries(grants), queryMode, metadata, checkout: observedCandidate(),
       children: query ? queryChildren : { [compliance.key]: compliance, [next.key]: next, [closing.key]: closing } })), stdout: "pipe", stderr: "pipe" });
     const [exit, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
     expect(stderr).toBe(""); expect(exit).toBe(0);
@@ -1414,20 +1420,191 @@ A1 supersedes native-resume-first recovery; preserve the missing historical befo
     expect(bodies.get("execution-inspector")).not.toContain("Prepare\nan implementation TODO");
   });
 
-  test("native sandbox runs initial independent read-only evidence providers, not human confirmation or product effects", async () => {
-    const calls: Record<string, unknown>[] = [];
-    const result = await runWorkflowScript({ script: read("skills/plan/context.js"), args: { brief: "Assignment and version-specific sources" },
-      launch: async (key, request) => { calls.push(request); return { key, ok: true, output: "", artifactPaths: [], runId: key,
-        structuredOutput: { status: "ready", report: `Factual evidence from ${request.agent}` } }; },
-      status: async () => { throw new Error("Unexpected status"); },
+  test.each(["published", "optional-failure", "missing-publication", "failed-publication", "partial-failed", "incomplete", "wrong-producer", "missing-run", "failed-missing-run", "failed-native-producer", "native-producer-mismatch", "native-key-mismatch", "native-run-mismatch", "no-original", "output-only", "blocked", "inaccessible", "pending-save", "rejected-save", "capacity", "terminal-success", "running", "nested-running", "running-failed", "detached-failed", "recovery-failed", "acceptance-recovery-failed", "contradictory-state", "contradictory-outcome", "contradictory-stop", "contradictory-interrupted", "contradictory-timeout", "contradictory-exit", "contradictory-budget", "contradictory-permission", "stop-rejected-save", "permission-capacity", "published-contradictory-state", "published-contradictory-outcome", "published-contradictory-stop", "published-contradictory-interrupted", "published-contradictory-timeout", "published-contradictory-exit", "published-contradictory-budget", "published-contradictory-permission"])("initial planning handoff keeps exact originals separate: %s", async mode => {
+    const root = mkdtempSync(path.join(tmpdir(), "pitako-plan-context-")); roots.push(root);
+    const calls: Record<string, any>[] = [], originals = new Map<string, any>(), storage = new Map<string, any>();
+    const brief = "Assignment with active human decisions, provenance and version-specific sources";
+    const contextExample = read("skills/plan/SKILL.md").match(/args: (\{ brief, workDescription: [^`]+\})/)![1]!;
+    const contextArgs = new Function("brief", `return (${contextExample});`)(brief);
+    contextArgs.workDescription = contextArgs.workDescription.replace("<concrete single-line work>", "Stream parser limits " + "with complete bounded memory evidence ".repeat(12));
+    contextArgs.consultation = contextArgs.consultation.replace("<stable-id>", "parser-plan");
+    let releaseSave!: () => void, enteredSave!: () => void;
+    const saveGate = new Promise<void>(resolve => { releaseSave = resolve; });
+    const saveEntered = new Promise<void>(resolve => { enteredSave = resolve; });
+    const missionPath = path.join(root, "state.json");
+    // Model the external whole-file UTF-8 boundary, including unrelated keys.
+    const priorState = { unrelated: ["capacity", "permission-capacity"].includes(mode) ? "é".repeat(127 * 1024) : "retained history" };
+    const priorBytes = JSON.stringify(priorState, null, 2);
+    expect(Buffer.byteLength(priorBytes)).toBeLessThan(256 * 1024);
+    writeFileSync(missionPath, priorBytes);
+    let writes = 0, providersSettled = 0, returned = false;
+    const work = runWorkflowScript({ script: read("skills/plan/context.js"), args: contextArgs,
+      state: { get: key => storage.get(key), set: async (key, value) => {
+        writes++;
+        expect(providersSettled).toBe(2);
+        enteredSave();
+        await saveGate;
+        if (["rejected-save", "stop-rejected-save"].includes(mode)) throw Error("Controlled essential save denied");
+        const next = JSON.stringify({ ...JSON.parse(readFileSync(missionPath, "utf8")), [key]: value }, null, 2);
+        if (Buffer.byteLength(next) > 256 * 1024) throw Error("Mission state exceeds the 256 KiB limit");
+        writeFileSync(missionPath, next);
+        storage.set(key, structuredClone(value));
+      } },
+      launch: async (key, request) => {
+        calls.push(request);
+        if (typeof request.agent !== "string" || typeof request.task !== "string") throw Error("Expected named provider and task");
+        const association = Object.fromEntries(Object.entries((request.outputSchema as any).properties.association.properties).map(([key, value]: [string, any]) => [key, value.const]));
+        const original = { association, delivery: "complete", status: mode === "blocked" ? "blocked" : "ready",
+          report: `FULL-ORIGINAL-${key}: extensive evidence, counterarguments and coverage not for inline delivery.`,
+          briefing: { facts: ["Parser buffers whole input"], reasons: ["Memory grows with input"], contradictions: ["A faster path retains more memory"],
+            limits: ["Host memory unmeasured"], questions: ["Independent human question: prefer bounded memory?", "Dependent question: verify host limit before sizing"],
+            sources: ["src/parser.ts:10; library 1.2"], essentialReasons: ["Sizing requires exact measurements in this original, then host evidence"] } };
+        if (["capacity", "permission-capacity"].includes(mode)) original.report += "é".repeat(2048);
+        if (mode === "partial-failed") { original.status = "blocked"; original.briefing.facts = []; }
+        if (mode === "incomplete") delete (original as any).delivery;
+        if (mode === "wrong-producer") original.association.producer = "pitako.other";
+        originals.set(key, original);
+        const savedOutputPath = path.join(root, `${key}.json`);
+        writeFileSync(savedOutputPath, JSON.stringify(original));
+        if (mode === "inaccessible") rmSync(savedOutputPath);
+        providersSettled++;
+        const receiptMode = mode.replace(/^published-/, "");
+        const receipts: Record<string, any> = {
+          "terminal-success": { state: "completed" },
+          running: { state: "running" },
+          "running-failed": { ok: false, state: "running", terminalOutcome: { state: "partial", reason: "timeout" } },
+          "detached-failed": { ok: false, detached: true },
+          "recovery-failed": { ok: false, recovery: { reason: "acceptance-metadata-rejected" } },
+          "acceptance-recovery-failed": { ok: false, acceptance: { recovery: { reason: "pending" } } },
+          "contradictory-state": { state: "failed" },
+          "contradictory-outcome": { terminalOutcome: { state: "partial", reason: "budget_exhausted" } },
+          "contradictory-stop": { stopped: true },
+          "contradictory-interrupted": { interrupted: true },
+          "contradictory-budget": { toolBudgetBlocked: true },
+          "contradictory-permission": { error: "Blocked by pi-subagents permission rule: controlled refusal" },
+          "stop-rejected-save": { ok: false, state: "stopped", stopped: true, error: "Controlled user Stop" },
+          "permission-capacity": { ok: false, state: "failed", error: "Blocked by pi-subagents permission rule: controlled refusal" },
+        };
+        const nonpublishedReceipt = mode.endsWith("-failed") || mode.startsWith("contradictory-") || mode === "permission-capacity";
+        return { key, ok: !["failed-publication", "partial-failed", "capacity", "failed-missing-run", "failed-native-producer", "no-original", "output-only"].includes(mode), output: mode === "output-only" ? JSON.stringify(original) : "NOT A FULL ORIGINAL", ...(["missing-run", "failed-missing-run"].includes(mode) ? {} : { runId: `run-${key}` }), artifactPaths: [],
+          ...(["no-original", "output-only"].includes(mode) ? {} : { structuredOutput: original }), outputReference: savedOutputPath,
+          ...(receipts[receiptMode] ?? {}),
+          ...(["failed-publication", "partial-failed"].includes(mode) ? {
+            error: `Mandatory output save failed\n\nOutput:\n${JSON.stringify(original, null, 2)}`,
+          } : {}),
+          ...(nonpublishedReceipt ? { outputSaveError: "Required save denied" } : {}),
+          ...(mode === "optional-failure" ? { metadataSaveError: "Optional trace unavailable" } : {}),
+          ...(["failed-publication", "partial-failed", "capacity", "failed-missing-run", "failed-native-producer", "no-original", "output-only"].includes(mode) ? { outputSaveError: "Required save denied" } : {}),
+          results: [{ index: 0, agent: ["native-producer-mismatch", "failed-native-producer"].includes(mode) ? "pitako.other" : request.agent,
+            ...(mode === "native-key-mismatch" ? { workflowKey: "other-key" } : {}),
+            ...(mode === "native-run-mismatch" ? { runId: "other-run" } : {}), task: request.task, exitCode: receiptMode === "contradictory-exit" ? 1 : 0,
+            ...(mode === "nested-running" ? { state: "running" } : {}),
+            ...(receiptMode === "contradictory-timeout" ? { timedOut: true } : {}),
+            ...(mode === "partial-failed" ? { state: "failed", terminalOutcome: { state: "partial", reason: "timeout" } } : {}),
+            usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 }, structuredOutputPath: path.join(root, "optional.json"),
+            ...(["missing-publication", "failed-publication", "partial-failed", "capacity", "failed-missing-run", "failed-native-producer", "no-original", "output-only"].includes(mode) ? {} : { savedOutputPath, outputReference: { path: savedOutputPath, bytes: Buffer.byteLength(JSON.stringify(original)), lines: 1, message: "Saved" } }) }] };
+      },
+      status: async () => { throw new Error("Status preview is not an original"); },
     });
-    expect(result.value).toMatchObject({ status: "ready" }); expect(calls.map(call => call.agent)).toEqual(["pitako.scout", "pitako.researcher"]);
-    expect(calls.every(call => call.context === "fresh" && call.output === false)).toBe(true);
-    for (const call of calls) expect(call.task).toContain("Human preferences belong to the foreground user");
+    const observed = work.then(result => { returned = true; return { result }; }, error => { returned = true; return { error }; });
+    try {
+      await Promise.race([saveEntered, observed.then(() => { throw Error("Workflow ended before persistence"); })]);
+      if (mode === "pending-save") {
+        await new Promise<void>(resolve => setImmediate(resolve));
+        expect(returned).toBe(false);
+        expect(readFileSync(missionPath, "utf8")).toBe(priorBytes);
+        expect(storage.size).toBe(0);
+      }
+    } finally {
+      releaseSave();
+      await observed;
+    }
+    const outcome = await observed;
+    expect(writes).toBe(1);
+    expect(providersSettled).toBe(2);
+    if (["rejected-save", "capacity", "stop-rejected-save", "permission-capacity"].includes(mode)) {
+      expect("error" in outcome ? String(outcome.error) : "successful return").toContain(
+        ["capacity", "permission-capacity"].includes(mode) ? "256 KiB" : "Controlled essential save denied");
+      if (["stop-rejected-save", "permission-capacity"].includes(mode)) {
+        expect(String((outcome as any).error)).toContain(mode === "stop-rejected-save" ? "Controlled user Stop" : "Blocked by pi-subagents permission rule:");
+        expect(String((outcome as any).error)).toContain("observed provider control barriers");
+      }
+      expect(storage.size).toBe(0);
+      expect(readFileSync(missionPath, "utf8")).toBe(priorBytes);
+      return;
+    }
+    if (!("result" in outcome)) throw outcome.error;
+    const value = structuredClone(outcome.result.value) as any;
+    expect(JSON.parse(readFileSync(missionPath, "utf8"))["initial-context"]).toEqual(storage.get("initial-context"));
+    const ready = ["published", "optional-failure", "inaccessible", "pending-save", "terminal-success"].includes(mode);
+    expect(value.status).toBe(ready ? "ready" : "blocked");
+    expect(calls.map(call => call.agent)).toEqual(["pitako.scout", "pitako.researcher"]);
+    expect(calls.every(call => call.context === "fresh" && call.outputMode === "file-only" && typeof call.output === "string")).toBe(true);
+    for (const [index, call] of calls.entries()) {
+      expect(call.label).toBe(`Initial ${index ? "researcher" : "scout"} evidence: ${contextArgs.workDescription.trim()}`);
+      expect(call.outputSchema.properties.association.properties.key.const).toBe(`initial-${index ? "researcher" : "scout"}`);
+      expect(call.phase).toBe("initial-context"); expect(call.task.split("\n")[0]).toBe(call.label);
+      expect(call.task).toContain(brief); expect(call.task).toContain("Human preferences belong to the foreground user");
+      expect(call.task).toContain("Only the real human in foreground");
+      const evidence = value.evidence[index], reference = value.originals[index];
+      expect(reference).toMatchObject({ query: "parser-plan", revision: 1, producer: call.agent, key: `initial-${index ? "researcher" : "scout"}`, attempt: 1, access: "unobserved" });
+      expect(JSON.stringify(value)).not.toContain("FULL-ORIGINAL-");
+      if (ready || mode === "blocked") expect(evidence.briefing).toEqual(originals.get(reference.key).briefing);
+      else expect(evidence.briefing).toBeNull();
+      if (reference.published) {
+        const exact = reference.results[0].savedOutputPath;
+        expect(reference.results[0].outputReference).toEqual({ path: exact,
+          bytes: Buffer.byteLength(JSON.stringify(originals.get(reference.key))), lines: 1, message: "Saved" });
+        if (mode === "inaccessible") {
+          expect(() => readFileSync(exact)).toThrow();
+          expect(reference.access).toBe("unobserved");
+          expect(value.guidance).toContain("block dependent conclusions if inaccessible");
+          expect(evidence.briefing.questions[0]).toContain("Independent human question");
+        } else expect(JSON.parse(readFileSync(exact, "utf8"))).toEqual(originals.get(reference.key));
+      }
+      const retained = storage.get("initial-context").originals[index];
+      // Native failure projection can use output as error; retain diagnostics privately,
+      // never mistake that text for a complete original or import it into the briefing.
+      if (mode === "output-only") expect(retained.nativeError).toContain("FULL-ORIGINAL-");
+      if (["missing-publication", "failed-publication", "partial-failed"].includes(mode)) {
+        expect(reference.sufficient).toBe(false);
+        expect(reference.published).toBe(false);
+        expect(retained.failedOriginal).toEqual(originals.get(reference.key));
+        expect(JSON.stringify(storage.get("initial-context")).split(`FULL-ORIGINAL-${reference.key}:`).length - 1).toBe(1);
+        if (["failed-publication", "partial-failed"].includes(mode)) {
+          expect(retained.nativeError).toContain("Mandatory output save failed");
+          expect(retained.diagnostic).toContain("publication failed");
+          expect(retained.succeeded).toBe(false);
+        }
+      } else expect(retained.failedOriginal).toBeUndefined();
+      if (!ready) expect(reference.sufficient).toBe(false);
+      if (["running", "nested-running", "running-failed", "detached-failed", "recovery-failed", "acceptance-recovery-failed"].includes(mode)) {
+        expect(reference.terminal).toBe(false);
+        expect(reference.succeeded).toBe(false);
+        expect(retained.failedOriginal).toBeUndefined();
+      }
+      if (mode.includes("contradictory-")) {
+        expect(reference.succeeded).toBe(false);
+        expect(retained.failedOriginal).toBeUndefined();
+      }
+      if (mode === "partial-failed") {
+        expect(reference.terminal).toBe(true);
+        expect(reference.succeeded).toBe(false);
+        expect(retained.failedOriginal.status).toBe("blocked");
+      }
+    }
     const skill = read("skills/plan/SKILL.md");
     for (const contract of ["ACTUAL\nHUMAN", "then wait", "ONLY", "Never implements product code", "approved: true", "ENTIRE currently unblocked frontier"])
       expect(skill).toContain(contract);
-    expect(validateWorkflowScript(read("skills/architecture/workflow.js")).ok).toBe(true);
+    expect(validateWorkflowScript(read("skills/plan/context.js")).ok).toBe(true);
+  });
+
+  test("initial context rejects a missing concrete caller work description before dispatch", async () => {
+    let launches = 0;
+    await expect(runWorkflowScript({ script: read("skills/plan/context.js"), args: { brief: "Administrative rules first" },
+      launch: async () => { launches++; throw Error("Unexpected launch"); }, status: async () => { throw Error("Unexpected status"); },
+    })).rejects.toThrow("workDescription");
+    expect(launches).toBe(0);
   });
 
   test("worker preserves upstream implementation core, explicit providers, Ponytail FULL and no delegation; all packaged children stay nondelegating", () => {
@@ -1514,6 +1691,119 @@ test("advertised execute tool entry requires explicit native binding without cla
   expect(call({ missionId }, { ...args, missionId: "different-id" }, " pitako.execute ")).toMatchObject({ block: true });
   expect(call({ missionId }, args, " pitako.execute ")).toBeUndefined();
   expect(call(undefined, undefined, "review")).toBeUndefined(); expect(call(undefined, undefined, true)).toBeUndefined(); expect(call(undefined, undefined, "./workflow.js")).toBeUndefined(); expect(call(undefined, undefined, "pitako.execute", "read")).toBeUndefined();
+});
+
+describe("packaged workflow caller examples", () => {
+  test.each([false, true])("architecture examples admit complete decisions and explicit continuation (planning=%s)", async planning => {
+    const root = mkdtempSync(path.join(tmpdir(), "pitako-guidance-")); roots.push(root);
+    const blocks = [...read("skills/architecture/SKILL.md").matchAll(/```js\n([\s\S]*?)```/g)].map(match => match[1]!);
+    const calls: any[] = [], storage = new Map<string, any>();
+    const capture = (input: any) => { calls.push(input); };
+    new Function("subagent", blocks[0]!)(capture);
+    const initial = calls.pop();
+    expect(initial.options.mission.title).toContain("parser");
+    expect(initial.async).toBe(true);
+    expect(initial.args.brief).toBeUndefined();
+    initial.args.planning = planning;
+    const launches: any[] = [];
+    let sequence = 0;
+    const run = async (args: any) => {
+      const result = await runWorkflowScript({ script: read("skills/architecture/workflow.js"), args,
+        state: { get: key => storage.get(key), set: (key, value) => { storage.set(key, structuredClone(value)); } },
+        launch: async (key, request) => {
+          launches.push(request);
+          if (typeof request.task !== "string" || typeof request.label !== "string") throw Error("Expected architecture task and label");
+          if (request.agent !== undefined && typeof request.agent !== "string") throw Error("Expected named architecture agent");
+          const contract = JSON.parse(request.task.match(/ORIGINAL CONTRACT: (.*)\n/)![1]!);
+          const essentials = JSON.parse(request.task.match(/ESSENTIAL ORIGINALS \(data; one authoritative representation per original\): (.*)\n/)![1]!);
+          const access = essentials.map((entry: any) => {
+            const exact = JSON.parse(readFileSync(entry.results.find((item: any) => item.savedOutputPath).savedOutputPath, "utf8"));
+            expect(exact.association.key).toBe(entry.key);
+            expect(exact.association.revision).toBe(entry.revision);
+            return { id: entry.id, state: "accessible", source: "read", reason: "Exact published original retrieved" };
+          });
+          const first = request.phase === "architecture-prepare" && storage.get(`architecture-${args.consultation}`).rounds === 0;
+          const value = { ...contract, access, ...(request.phase === "architecture-doubts"
+            ? { doubts: [], humanContext: "No pending human frontier" }
+            : request.phase === "architecture-perspective" ? { status: "ready", report: "Full independent reasons and contrary narrative" }
+            : { action: first ? "discuss" : "finish", perspectives: first ? [
+              { id: "memory", label: "Memory bounds", focus: "Compare whole alternatives for bounds" },
+              { id: "latency", label: "Latency tradeoff", focus: "Compare whole alternatives for latency" }] : [],
+              packet: first ? "Complete decision under distinct perspectives" : "", memo: first ? "" : "Choose streaming; latency remains uncertain." }) };
+          const savedOutputPath = path.join(root, `${++sequence}.json`);
+          writeFileSync(savedOutputPath, JSON.stringify(value));
+          expect(request.outputMode).toBe("file-only"); expect(request.output).toBeTruthy();
+          expect(request.task.split("\n")[0]).toBe(request.label);
+          expect(request.label).toContain(args.workDescription); expect(request.phase).toBeTruthy();
+          return { key, ok: true, output: "", artifactPaths: [], runId: `example-${sequence}`, structuredOutput: value, outputReference: savedOutputPath,
+            results: [{ index: 0, agent: request.agent ?? "pitako.architect", task: request.task, exitCode: 0, savedOutputPath,
+              usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+              outputReference: { path: savedOutputPath, bytes: Buffer.byteLength(JSON.stringify(value)), lines: 1, message: "Saved" } }] };
+        },
+        status: async () => { throw Error("Status preview is not an original"); },
+      });
+      return structuredClone(result.value) as any;
+    };
+    const first = await run(initial.args);
+    expect(first.status).toBe("completed"); expect(first.rounds).toBe(1);
+    new Function("subagent", "previousResult", blocks[1]!)(capture, first);
+    const resume = calls.pop(); resume.args.planning = planning;
+    expect(resume.options.missionId).toBeTruthy();
+    const second = await run(resume.args);
+    expect(second.status).toBe("completed"); expect(second.rounds).toBe(1);
+    const retained = storage.get(`architecture-${initial.args.consultation}`);
+    expect(retained.currentDecision.revision).toBe(1); expect(retained.maxRounds).toBe(10);
+    const completeSnapshot = { ...initial.args.currentDecision, brief: "Complete revised memory decision, not a partial patch" };
+    // The caller tracks confirmed revision; planning returns only its bounded reference.
+    const replacement = new Function("confirmedRevision", "completeSnapshot", `${blocks[2]}\nreturn replacement;`)(retained.currentDecision.revision, completeSnapshot);
+    const replaced = await run({ ...resume.args, continuation: second.continuation, evidence: undefined, replacement });
+    expect(replaced.status).toBe("completed");
+    const updated = storage.get(`architecture-${initial.args.consultation}`);
+    expect(updated.currentDecision.revision).toBe(2);
+    expect(updated.currentDecision.snapshot).toEqual(completeSnapshot);
+    expect(updated.currentDecision.snapshot.humanDecisions).toEqual(initial.args.currentDecision.humanDecisions);
+    expect(updated.decisionHistory[0].snapshot).toEqual(initial.args.currentDecision);
+    expect(updated.rounds).toBe(1); expect(updated.maxRounds).toBe(10);
+    expect(launches.slice(2).some(call => call.resume)).toBe(true);
+    const before = launches.length;
+    await expect(run({ ...resume.args, continuation: replaced.continuation, replacement })).rejects.toThrow("expected revision");
+    expect(launches).toHaveLength(before);
+    // The packaged retry shape names confirmed revision and real human provenance;
+    // it must not permit retrying a completed consultation without a missing fact.
+    const factualRetry = new Function("confirmedRevision", `${blocks[3]}\nreturn factualRetry;`)(2);
+    await expect(run({ ...resume.args, continuation: replaced.continuation, factualRetry })).rejects.toThrow("Invalid factual retry");
+    expect(launches).toHaveLength(before);
+  });
+
+  test("review launch example reaches the real controller with concrete title and complete target", async () => {
+    let input: any;
+    const block = read("skills/review/SKILL.md").match(/```js\n([\s\S]*?)```/)![1]!;
+    new Function("subagent", block)((value: any) => { input = value; });
+    const launches: any[] = [];
+    const persisted = new Map<string, any>();
+    expect(input.options.mission.title).toContain("parser");
+    const result = await runWorkflowScript({ script: read("skills/review/workflow.js"), args: input.args,
+      state: { get: key => persisted.get(key), set: (key, value) => { persisted.set(key, structuredClone(value)); } },
+      launch: async (key, request) => { launches.push(request); return { key, ok: false, output: "", artifactPaths: [], error: "Controlled terminal failure, no original delivered" }; },
+      status: async () => { throw Error("Status preview is not an original"); } });
+    expect((result.value as any).status).toBe("failed");
+    expect(launches).toHaveLength(1); // Argument admission succeeded, not a fabricated review success.
+    expect(launches[0].task.split("\n")[0]).toBe(launches[0].label);
+    expect(launches[0].label).toContain(input.args.workDescription);
+    expect(launches[0].task).toContain(input.args.brief);
+    expect(launches[0].task).toContain(input.args.target.material);
+    expect(launches[0].outputMode).toBe("file-only");
+    for (const file of ["skills/plan/SKILL.md", "skills/pre-pr/SKILL.md", "skills/execute/SKILL.md"])
+      expect(read(file)).toContain("workDescription");
+    const plan = read("skills/plan/SKILL.md").replace(/\s+/g, " ");
+    expect(plan).toContain("args: { currentDecision, workDescription:");
+    expect(plan).toContain("exact returned version-2 `continuation`");
+    expect(plan).toContain("file-blind relay receives self-contained facts");
+    expect(plan).toContain("Ask the ACTUAL HUMAN to confirm it, then wait");
+    const prepr = read("skills/pre-pr/SKILL.md");
+    expect(prepr).toContain("Readiness is an assessment, not authorization");
+    expect(prepr).toContain("closure review through the same workflow");
+  });
 });
 
 describe("compact admission and preliminary capture", () => {
@@ -1607,7 +1897,7 @@ describe("compact admission and preliminary capture", () => {
 
 
 describe("deterministic observer", () => {
-  test("deterministic observer registers a fixed external CLI through public events and owns session disposal", () => {
+  test("deterministic observer registers a fixed external CLI through public events and owns session disposal", async () => {
     const hooks = new Map<string, (...args: any[]) => any>();
     const requests: any[] = []; let disposed = 0;
     const pi = { on: (name: string, hook: (...args: any[]) => any) => hooks.set(name, hook), registerTool() {},
@@ -1638,6 +1928,16 @@ describe("deterministic observer", () => {
       expect(ledger.definition).toMatchObject({ tools: [], allowNestedSubagents: false, defaultContext: "fresh",
         inheritProjectContext: false, inheritGlobalContext: false, inheritSkills: false, defaultAsync: false });
       expect(ledger.definition.model).toBeUndefined(); expect(ledger.definition.outputSchema).toBeUndefined();
+      // Reproduce the native async launch: inferred acceptance is appended to the task, then framed.
+      for (const { definition: agent } of requests.slice(0, 2)) {
+        const request = { expected: { invocation: "exec-1", count: 0, head: null }, record: { kind: "unit", loop: 1, body: { fix: "Implement" } } };
+        const task = JSON.stringify(request);
+        const acceptance = resolveEffectiveAcceptance({ acceptanceRole: agent.acceptanceRole, agentName: "deterministic", task, mode: "single", async: true });
+        const prompt = formatAcceptancePrompt(acceptance);
+        expect(prompt).toBe("");
+        const { readRequest } = await import(path.resolve("skills/execute/ledger.mjs"));
+        expect(readRequest(buildExternalCliPrompt(agent.systemPrompt, prompt ? `${task}\n${prompt}` : task))).toEqual(request);
+      }
       expect(() => registerAgent({ pi: pi as unknown as ExtensionAPI, name: requests[0].name, definition })).toThrow();
       expect(disposed).toBe(0);
       hooks.get("session_start")!({}, first);
@@ -1672,7 +1972,8 @@ describe("deterministic observer", () => {
       body: { spec, record: { kind: "loop", loop: 1, body: { review: "clear" } } } };
     const run = async (input = request) => {
       const child = Bun.spawn(["node", entry], { cwd: root, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
-      child.stdin.write(typeof input === "string" ? input : JSON.stringify(input)); child.stdin.end();
+      // Deliver the request exactly as the registered external-cli runner frames stdin.
+      child.stdin.write(buildExternalCliPrompt("Fixed actual-cwd observer", typeof input === "string" ? input : JSON.stringify(input))); child.stdin.end();
       return checkpointLifecycle(child, ([exit, stdout]) => {
         expect(exit).toBe(0); expect(Buffer.byteLength(stdout)).toBeLessThan(65536);
         return JSON.parse(stdout);
@@ -1779,7 +2080,7 @@ describe("plan/execute packaged composition", () => {
           usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } }] }) });
       const input = { mode, binding: spec.binding, initial: initial.resource.script, resumed: automatic ? initial.resource.script : resumed.resource.script, renewed: renewed.resource.script, children, metadata, checkout, content, target, interruptedLoop };
       // Keep one identical harness for Bun and the owned Node process.
-      const harness = async (input: any, run: typeof runWorkflowScript) => {
+      const harness = async (input: any, run: typeof runWorkflowScript, respond: typeof childResponse) => {
         const storage = new Map<string, any>(), calls: string[] = [], hosts: string[] = [];
         const publications: any[] = [];
         const statusCalls: string[] = [], inspectors: Record<string, any> = {};
@@ -1829,12 +2130,15 @@ describe("plan/execute packaged composition", () => {
                   workerResult: null, originalAvailable: !input.mode.endsWith("unknown"), binding: "absent",
                   comparison: input.mode.endsWith("unknown") ? "neither" : "only-original", provenance: [original.runId] } };
             }
-            const response = structuredClone(input.children[key]);
+            let response = structuredClone(input.children[key]);
             if (!response) throw Error("Unexpected child " + key);
             if (request.agent === "pitako.checkout-observer") {
               const observation = JSON.parse(response.output);
               observation.ledger = { count: Math.max(1, JSON.parse(request.task).expected.count) + 1, head: "c".repeat(64) };
               response.output = JSON.stringify(observation);
+            } else if (request.phase?.startsWith("review-")) {
+              response = respond(key, request, input.metadata, input.checkout, 1, response.structuredOutput);
+              input.children[key] = structuredClone(response);
             }
             if (retainedRecovery && !replay && key === producer)
               return operationRecovery ? stopped(response) : { ...response, structuredOutput: undefined };
@@ -1926,7 +2230,7 @@ describe("plan/execute packaged composition", () => {
         }
         return { first: first.value, second: second.value, third: third.value, fourth, later, oldDefect, original, retained: storage.get("invoke-human-1"), calls, hosts, statusCalls, publications, before, after };
       };
-      const expected = await harness(input, runWorkflowScript);
+      const expected = await harness(input, runWorkflowScript, childResponse);
       if (retainedRecovery) {
         expect(expected.second).toMatchObject({ status: mode.endsWith("usable") ? "complete" : mode.endsWith("pending") ? "blocked" : "cancelled",
           loopsConsumed: mode.endsWith("usable") ? 2 : 1 });
@@ -1997,7 +2301,7 @@ describe("plan/execute packaged composition", () => {
       const child = Bun.spawn(["node", "-e", `
         const input = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
         import(${JSON.stringify(new URL("../node_modules/pi-subagents/src/workflows/scripted-workflow.js", import.meta.url).href)})
-          .then(async ({runWorkflowScript}) => console.log(JSON.stringify(await (${harness.toString()})(input, runWorkflowScript))))
+          .then(async ({runWorkflowScript}) => console.log(JSON.stringify(await (${harness.toString()})(input, runWorkflowScript, ${childResponse.toString()}))))
           .catch(error => {console.error(error); process.exitCode=1;});
       `], { cwd: root, env: { ...process.env, PI_CODING_AGENT_DIR: path.join(root, "private-agent") }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
       const stdout = new Response(child.stdout).text(), stderr = new Response(child.stderr).text();

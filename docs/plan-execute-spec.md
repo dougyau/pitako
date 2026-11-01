@@ -109,6 +109,43 @@ Each request identifies what is unknown and which decision the answer could
 change. Sources, relevant versions, limitations, and unresolved contradictions
 accompany the findings.
 
+Initial context callers supply `brief` and a concrete single-line `workDescription`.
+Providers publish full native file-only originals separately from concise facts,
+reasons, contradictions, limits, questions and sources for foreground grilling.
+The [architecture skill](../skills/architecture/SKILL.md) owns the executable
+request and continuation contracts. It requires a complete versioned
+`currentDecision`, stable consultation ID and explicit mission, not just a brief.
+Version-2 continuation preserves the phase, original maximum, consumed count and
+valid count. Decision replacements account for prior obligations and preserve
+human content and provenance. Resuming or adding facts alone does not revise the
+decision. Ambiguous dispatch stops reentry. Only an explicitly human-authorized
+selective terminal factual retry can preserve sufficient work and counts without
+another comparison round. This is separate from execute writer recovery.
+
+New and resumed requests carry readable labels, explicit phases and first-line
+task titles without renaming retained sessions or changing keys. Execute's
+in-root review preserves these fields, publication witnesses and the original
+producing identity through final reprojection, under the
+[review skill's evidence contract](../skills/review/SKILL.md).
+Witnesses include `results[].savedOutputPath`, returned reference objects and
+textual `outputReference`. Generic paths or `structuredOutputPath` alone do not
+prove required publication. Existing child readers check access to exact essential
+originals. Lost access blocks dependent conclusions.
+
+A complete failed or partial original that was genuinely delivered may be retained
+once as failed, unpublished and insufficient. Previews, field presence or text
+without a truncation flag do not prove completeness. Do not reconstruct, republish,
+truncate, erase history or add alternate storage. The whole-file native capacity
+limit remains binding. Optional observability failure is not required publication
+failure.
+
+The coordinator does not routinely import intermediate reports. The file-blind
+relay receives self-contained frontiers. Independent human questions do not wait
+for unrelated facts. Only the actual foreground human confirms shared
+understanding. Final synthesis is self-contained, with reasons, contrary
+narrative, coverage, dispositions and limits. Pitako does not universally control
+or certify native notices, retention or recovery.
+
 ### Doubts are resolved between architecture rounds
 
 After each round, the architecture director identifies material uncertainty:
@@ -124,7 +161,7 @@ decision and do not acquire delegation responsibility. Updated context reaches
 the relevant perspectives, including contrary evidence and unanswered questions.
 The workflow does not silently replace their reports with the director's view.
 
-Increase architecture's current maximum from five to ten rounds. The ten-round
+Architecture has a maximum of ten rounds. The ten-round
 ceiling applies to the same consultation, including continuations. Native
 continuation references retain the consumed count. Repeated entry must not
 reset the limit. Auxiliary research calls are not separate architecture rounds.
@@ -828,8 +865,8 @@ and reconciliation guidance, without automatic recapture. Human message
 ID/timestamp provenance is descriptive, not authentication. References freeze
 in `invocation.amendments`, outside the base association/snapshot/sourceRefs and
 without renewing budget. Recovery requires identical references and revalidates
-the bytes. The director retains paths in sharedContext.references and hashes/
-provenance in sharedContext.material for worker, review and compliance. The
+the bytes. The root delivers the exact frozen references to director, worker,
+review and compliance; plans need not copy them into sharedContext. The
 existing resolution delivery route is unchanged. See execute skill syntax.
 
 Separately delivered current human amendments remain separate from the admitted
