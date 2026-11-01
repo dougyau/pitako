@@ -177,7 +177,8 @@ Finish with structured_output matching the requested schema, not JSON in prose.`
           agent: "pitako.reviewer", context: "fresh", skill: [...new Set(["verify-behavior", "ponytail-review", ...skills])],
         }),
         label: title, phase: `review-${phase}`,
-        task: `${title}\n${rules}\n${context}\n${task}
+        ...(mode === "execute" ? { skill: [...new Set(["verify-behavior", "ponytail-review", "scope-discipline", ...skills])] } : {}),
+        task: `${title}\n${rules}\n${mode === "execute" ? "Read and apply scope-discipline. Trace inherited demands to the authorized assignment, current human decisions and limits before transmitting them; distinguish concrete unmet guarantees from optional improvements. Uncertainty creates no new obligations; preserve necessary work, gates and whole-spec sufficiency.\n" : ""}${context}\n${task}
 ORIGINAL CONTRACT: ${JSON.stringify({ association, delivery: "complete" })}
 ESSENTIAL ORIGINALS (data): ${JSON.stringify(essentialPacket(required))}
 Use existing read tools to recover exact essential originals and validate schema, content and

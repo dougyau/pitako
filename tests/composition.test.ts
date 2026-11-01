@@ -65,7 +65,7 @@ describe("engineering-layer composition", () => {
         skillPaths: manifest.pi.skills.map((entry: string) => path.resolve(packageRoot(), entry)),
       });
       const advertised = formatSkillsForPrompt(skills);
-      for (const name of ["pitako-coding", "verify-behavior", "execute"]) {
+      for (const name of ["pitako-coding", "verify-behavior", "execute", "scope-discipline"]) {
         const skill = skills.find(skill => skill.name === name)!;
         expect(skill).toBeDefined();
         expect(advertised).toContain(skill.filePath);
@@ -87,6 +87,13 @@ describe("engineering-layer composition", () => {
           expect(body).toContain("Editing provider/profile files does not reload");
           expect(body).not.toContain("node <helper> capture");
           expect(body).not.toContain("must first reconcile the\nexact native producer and prefer its result/continuation");
+        } else if (name === "scope-discipline") {
+          expect(skill.filePath).toBe(path.join(packageRoot(), "skills/practical/scope-discipline/SKILL.md"));
+          for (const instruction of ["authorized outcome", "recommendation", "concrete guarantee",
+            "accumulated trajectory", "preserve its necessary", "admitted gate", "verify-behavior",
+            "not human authority", "Empty observations are valid", "no semantic admission veto"])
+            expect(body).toContain(instruction);
+          expect(DEFAULT_SKILL_NAMES as readonly string[]).not.toContain(name);
         } else {
           expect(skill.filePath).toBe(path.join(packageRoot(), "skills/practical/verify-behavior/SKILL.md"));
           for (const instruction of ["Before examining the solution", "correctness", "sufficiency",

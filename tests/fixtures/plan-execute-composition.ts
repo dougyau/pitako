@@ -86,6 +86,8 @@ export function childResponse(key: string, request: any, metadata: any, checkout
     remaining: [], diagnosis: "No pending task work", usefulProgress: true, continuation: null,
     git: { head: checkout?.head, checkpoints: [], wip: "Current WIP included" }, candidate: checkout,
     checks: task.checks.map(({ requirement: _requirement, ...check }) => ({ ...check, output: "Controlled check passed", logPaths: ["/native/check.log"], result: "passed", before: checkout, after: checkout })) };
+  else if (key.endsWith(".demand-observation")) value = { memo: "Inherited demands remain advisory",
+    evidenceLimits: ["Controlled source evidence only"], observations: [] };
   else if (key.endsWith("director-prepare")) value = { status: "ready", reason: "Whole result perspectives", angles: [
     { id: "a", focus: "Correctness", skills: [] }, { id: "b", focus: "Requirements", skills: [] }] };
   else if (key.includes("independent-")) value = { status: "ready", reason: "Source inspected", coverage: "Complete candidate", findings: [] };

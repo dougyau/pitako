@@ -56,6 +56,8 @@ function retainedProjection(root: string, source: string, digest: string, contex
 		...(compliance.ref ? [compliance.ref] : []),
 	];
 	for (const call of Array.isArray(loop.analysisCalls) ? loop.analysisCalls : []) {
+		if (record(call) && call.key === `invoke-${context.invocation}.l${loop.number}.demand-observation` &&
+			(loop.phase !== "director" || loop.plan || !record(call.ref) || typeof call.ref.runId !== "string")) continue;
 		const reference = record(call) ? call.ref : undefined;
 		if (record(reference) && !refs.some(ref => record(ref) && ref.key === reference.key))
 			refs.push(reference);
@@ -79,6 +81,7 @@ function retainedProjection(root: string, source: string, digest: string, contex
 			const prefix = `invoke-${context.invocation}.l${loop.number}.`;
 			if (typeof ref.key !== "string" ||
 				!(ref.key.startsWith(`${prefix}review.`) || ref.key === `${prefix}compliance` ||
+				ref.key === `${prefix}demand-observation` && loop.phase === "director" && !loop.plan ||
 				ref.key.startsWith(`${prefix}recover`) && recoveries.some(item => record(item.ref) &&
 					item.ref.key === ref.key && isDeepStrictEqual(item.ref, ref))) ||
 				typeof ref.runId !== "string" || typeof ref.asyncDir !== "string" ||

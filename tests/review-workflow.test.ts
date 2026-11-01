@@ -187,6 +187,13 @@ describe("review scripted workflow", () => {
       const result = await host.library(args, { prefix: "loop1.", mode: "execute" });
       expect(result.status).toBe("completed");
       expect(result.screening).toEqual(screening);
+      // Includes fresh preparation/angles and resumed critique/defense/synthesis.
+      expect(host.calls.some(call => call.request.resume)).toBe(true);
+      for (const { request } of host.calls) {
+        expect(request.skill).toContain("scope-discipline");
+        expect(request.task).toContain("Read and apply scope-discipline");
+        expect(request.task).toContain("Trace inherited demands");
+      }
       expect(result.dispositions?.[0]?.decision).toBe("include");
       expect(host.calls.at(-1)?.request.task).toContain("Clear permits a separate whole-spec compliance analysis");
       expect(host.calls.at(-1)?.request.outputSchema).toMatchObject({
@@ -378,6 +385,8 @@ describe("review scripted workflow", () => {
     expect(independent[0]!.request.skill).toEqual(["verify-behavior", "ponytail-review", "blast-radius"]);
     expect(independent[1]!.request.skill).toEqual(["verify-behavior", "ponytail-review"]);
     for (const { request } of host.calls) {
+      expect(request.skill ?? []).not.toContain("scope-discipline");
+      expect(request.task).not.toContain("Read and apply scope-discipline");
       expect(request.model).toBeUndefined();
       expect(request.async).toBeUndefined();
       expect(request.output).toBeString();

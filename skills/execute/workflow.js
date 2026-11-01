@@ -51,6 +51,8 @@ workerSchema.properties.checkpointReceipt = object({
   progress: object({ consumedLoops: integer, admitted: { type: "object", additionalProperties: list(string) },
     previous: nullable(object({ taskId: string, attempt: integer, resultRef: { type: "object" }, checkpointRef: string, digest: string })) }),
 });
+const demandObservationSchema = object({ memo: string, evidenceLimits: list(string),
+  observations: list(object({ source: string, demand: string, reason: string })) });
 const complianceSchema = object({
   status: { enum: ["fulfilled", "gaps", "blocked"] }, reason: string,
   candidate: candidateSchema,
@@ -500,7 +502,7 @@ function reconcileAnalysis() {
   // Older retained phase receipts already identify producers; missing intention
   // metadata never licenses relaunching them.
   const hasIntentions = !!loop.analysisCalls?.length;
-  const calls = [...(loop.analysisCalls ?? [])];
+  const calls = [...(loop.analysisCalls ?? [])].filter(call => call.key !== `${key}.l${loop.number}.demand-observation`);
   for (const ref of [...(loop.review?.references ?? []), loop.compliance?.ref].filter(Boolean)) {
     if (!calls.some(call => call.key === ref.key))
       calls.push({ key: ref.key, stage: "receipt", ref: { key: ref.key, ...(text(ref.runId) ? { runId: ref.runId } : {}) },
@@ -508,9 +510,9 @@ function reconcileAnalysis() {
   }
   if (!hasIntentions && loop.halt?.code === "native-barrier" && !calls.some(call => call.barrier))
     return Promise.reject(nativeBarrier(loop.halt.cause ?? "analysis receipt unavailable; settlement uncertain"));
-  loop.analysisCalls = calls;
+  loop.analysisCalls = [...(loop.analysisCalls ?? []).filter(call => call.key === `${key}.l${loop.number}.demand-observation`), ...calls];
   // Observe the whole retained group before a missing sibling may be launched.
-  return (loop.analysisCalls ?? []).reduce((settled, call) =>
+  return calls.reduce((settled, call) =>
     settled.then(() => budgetRejected(call.key) ? undefined : analysisResults.get(call.key) ?? observeAnalysis(call)), Promise.resolve()).then(() => {
       if (loop.analysisCalls?.length && loop.halt?.code === "native-barrier") delete loop.halt;
     });
@@ -699,11 +701,12 @@ function analysisDispatch(requests) {
       return dispatch([request]);
     }).then(([result]) => {
       call.stage = "receipt";
-      call.ref = request.key.includes(".review.") ? nativeReference(request.key, result)
+      call.ref = request.key.includes(".review.") || request.key === `${key}.l${loop.number}.demand-observation`
+        ? nativeReference(request.key, result)
         : { key: request.key, ...(text(result?.runId) ? { runId: result.runId } : {}) };
       call.barrier = barrier(result);
       return save().then(() => {
-        if (call.barrier) throw nativeBarrier(call.barrier);
+        if (call.barrier) throw nativeBarrier(call.barrier, request.key.endsWith(".demand-observation") ? call.ref : undefined);
         analysisResults.set(call.key, result);
         return result;
       });
@@ -721,13 +724,15 @@ function analysisDispatch(requests) {
     return settled.map(item => item.value);
   });
 }
-function collect(childKey, agent, display, task, outputSchema, implementation = false, dispatcher = dispatch, resume) {
+function collect(childKey, agent, display, task, outputSchema, implementation = false, dispatcher = dispatch, resume, demandObservation = false) {
   const label = display.label.replace(/\s+/g, " ").trim().slice(0, 120);
   progress();
+  const scopeDiscipline = ["pitako.execution-director", "pitako.worker"].includes(agent) || demandObservation;
   return dispatcher([{
     key: childKey, ...(resume ? { resume } : { agent, context: "fresh" }), label, phase: display.phase, cwd: config.root,
     output: `${childKey}.json`, outputMode: "file-only", reads: false, progress: false,
-    skill: ["verify-behavior"], task: `${label}\n\n${task}`, outputSchema,
+    skill: ["verify-behavior", ...(scopeDiscipline ? ["scope-discipline"] : [])],
+    task: `${label}\n\n${scopeDiscipline ? "Read and apply scope-discipline before expanding work or verification; preserve admitted tasks and gates.\n" : ""}${task}`, outputSchema,
     ...(implementation ? { timeoutMs: 14400000,
       ...(!resume ? { extensionBindings: { "pitako.checkpoint/1": { association: clone(invocation.association), key: loop.attempt.key } } } : {}),
       acceptance: {
@@ -833,6 +838,44 @@ CLOSED HISTORY REFERENCE (data): ${JSON.stringify(historyReference())}
 These summaries were read by the publisher through ledger.mjs chain verification against this head.
 Any further ledger read must use ledger.mjs verification against head; missing/altered records block.
 The director uses these last-three summaries (no shell); the inspector reads only exact supplied native refs.`;
+}
+function demandHistory() {
+  return invocation.demandObservations ?? [];
+}
+function pendingDemandSources() {
+  const last = invocation.closedDemandSources;
+  return last?.loop === loop.number - 1 ? last.sources : [];
+}
+function observeDemands() {
+  const sources = loop.demandObservation?.sources ?? pendingDemandSources();
+  if (!sources.length) return Promise.resolve(null);
+  const childKey = `${key}.l${loop.number}.demand-observation`;
+  return collect(childKey, "pitako.reviewer", { label: "Observe inherited demands", phase: "director" }, `${fullContext()}
+INDIVIDUAL READ-ONLY DEMAND OBSERVATION, not product review or a future plan.
+Read and apply scope-discipline. Read exact full originals and relevant causal references below.
+Observe only candidate demands and their justification against the authorized assignment,
+current human decisions and limits. Follow relevant provenance, not an exhaustive historical audit.
+Do not find general product defects, design additional tests, or publish another plan.
+NEW CAUSAL SOURCES (exact original references): ${JSON.stringify(sources)}
+PREVIOUS OBSERVATIONS AND ORIGINALS: ${JSON.stringify(demandHistory())}
+Return memo, evidenceLimits and observations with source reference, demand and reason.
+Empty observations and analytical uncertainty are valid advice, not veto, approval,
+certification, removal orders, investigation/tests or extra human approval. Preserve necessary
+work in mixed tasks, explicit requirements, admitted gates and whole-spec sufficiency.`,
+    demandObservationSchema, false, analysisDispatch, undefined, true).then(result => {
+      const value = result?.structuredOutput;
+      if (!result?.ok || !text(value?.memo) || !Array.isArray(value.evidenceLimits) ||
+          !value.evidenceLimits.every(text) || !Array.isArray(value.observations) ||
+          value.observations.some(item => !text(item?.source) || !text(item.demand) || !text(item.reason)))
+        throw new Error("Demand observation lacks a usable structured original.");
+      loop.demandObservation = { ref: { ...loop.analysisCalls.find(call => call.key === childKey).ref,
+        ...nativeReference(childKey, result) }, sources };
+      // Constant-size ring: the closed loop itself is archived without this field.
+      invocation.demandObservations = [...demandHistory().filter(item => item.loop !== loop.number),
+        { loop: loop.number, ...loop.demandObservation }].slice(-3);
+      // The native receipt is already durable; the director intention saves this projection.
+      return { ref: loop.demandObservation.ref, body: value };
+    });
 }
 function inspectRecovery(kind, ref, retained) {
   // Subject identity comes from the frozen work, not a replaceable output path
@@ -1431,6 +1474,17 @@ function validSummaries(values) {
     values.at(-1).loop === loop.number;
 }
 function foldLoop(summaries) {
+  const sources = [];
+  const exit = loop.manifest && loop.cursor < loop.manifest.length ? loopResults().at(-1) : null;
+  if (exit?.ok && ["gaps", "continue"].includes(exit.status))
+    sources.push({ kind: "worker", ref: exit.ref, taskId: exit.taskId, attempt: exit.attempt,
+      status: exit.status, diagnosis: excerpt(exit.diagnosis) });
+  if (loop.review?.verdict === "material-gaps")
+    sources.push({ kind: "review", references: loop.review.references, reason: excerpt(loop.review.reason) });
+  if (loop.compliance?.status === "gaps")
+    sources.push({ kind: "compliance", ref: loop.compliance.ref, reason: excerpt(loop.compliance.reason) });
+  // Replace the previous loop's sources; generic gaps are not inherited demands.
+  invocation.closedDemandSources = { loop: loop.number, sources };
   invocation.loopSummaries = summaries;
   invocation.planRejections = [...invocation.planRejections.filter(item => item.loop !== loop.number),
     { loop: loop.number, diagnostic: loop.plan?.rejection?.diagnostic ?? null }].slice(-3);
@@ -1971,10 +2025,17 @@ try {
     if (loop.phase === "director") {
       const directorKey = `${key}.l${loop.number}.director`;
       if (!loop.plan || budgetRejected(directorKey)) {
+        const observation = await observeDemands();
         loop.plan = { stage: "intention", ref: { key: directorKey } };
         await save();
         const result = await collect(directorKey, "pitako.execution-director",
           { label: "Plan execution work", phase: "planning" }, `${fullContext()}
+INDEPENDENT DEMAND OBSERVATION (advisory): ${JSON.stringify(observation)}
+PREVIOUS OBSERVATIONS AND EXACT ORIGINAL SOURCES: ${JSON.stringify(demandHistory())}
+Read pertinent full originals alongside observations; agent reports are not human authority.
+An old expansion is not legitimized by repetition; resolved historical work is not automatically pending.
+Formulate your sole plan from authorized sources, retaining necessary work without automatically
+inheriting questioned expansions. No ceremonial response to each observation is required.
 READ-ONLY PLANNING ONLY. Do not delegate, implement, run checks/review, select workers,
 maintain private TODOs or supervise execution. Return one COMPLETE loop_plan using structured_output
 and the native output binding, then END. Status is plan or needs-decision, never implementation complete.
@@ -2237,6 +2298,8 @@ Report taskId/attempt/status, workDone, concrete remaining, causal diagnosis, us
 Git HEAD/checkpoints/WIP and actual command/cwd/output/logPaths/result for EVERY planned check.
 Run each planned check exactly as its command/cwd state (tool call or shell) and report them verbatim;
 tool preferences never rewrite it. Alternatives are diagnostics with distinct IDs.
+Use native tool output capture; do not add tee, redirection or another shell wrapper solely for logging.
+Sufficient captured output belongs in output; logPaths may be [] when no additional log file is needed.
 Identify each check by its admitted ID. Requirement wording comes from the plan; an optional
 requirement echo is descriptive only. Never replace execution evidence with an ID or native ok.
 Additional diagnostic checks use distinct IDs and retain actual results; they are not new mandatory gates.
