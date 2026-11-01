@@ -92,7 +92,7 @@ test("30 loops of eight tasks retain constant state across pauses, recoveries an
   // inspect-initial.r2 repeats that fixed pure grant before any loop exists.
   for (const key of [...host.calls.map(call => call.key), ...host.statusCalls, ...host.hostCalls])
     if (!["inspect-initial", "inspect-initial.r1", "inspect-initial.r2"].includes(key)) expect(key).toMatch(/\.l\d+\./);
-});
+}, 20_000); // Human decision m01583: AGENTS.md timeout exception for the 30-loop workload.
 
 test.each([1, 2])("closed dispositions never enter operation consumers, including the retained terminal loop (%s)", async number => {
   const host = fixture(undefined, { readOnly: true }); host.setLimit(2);

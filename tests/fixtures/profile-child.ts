@@ -186,12 +186,20 @@ try {
           const denied = await call(name, name === "file_sha256_save"
             ? { items: [{ path: "source" }], outputFile: "forbidden" } : {});
           assert.equal(denied.isError, true, name);
-          const nested = await call("codemode", {
-            code: `await tools.${name}(${name === "file_sha256_save"
-              ? '{items:[{path:"source"}],outputFile:"forbidden"}' : "{}"});`,
-          });
-          assert.equal(nested.isError, true, `${name}: ${text(nested)}`);
         }
+        // One sandbox still exercises every excluded native nested call; do not restart it per name.
+        const nested = await call("codemode", { code: `
+          const rejected = [];
+          ${mutators.map(name => `
+            try { await tools.${name}(${name === "file_sha256_save"
+              ? '{items:[{path:"source"}],outputFile:"forbidden"}' : "{}"}); }
+            catch { rejected.push(${JSON.stringify(name)}); }
+          `).join("\n")}
+          if (rejected.length !== ${mutators.length}) throw new Error("mutator accepted: " + JSON.stringify(rejected));
+          return { rejected: rejected.length };
+        ` });
+        assert.equal(nested.isError, false, text(nested));
+        assert.match(text(nested), new RegExp(`"rejected":${mutators.length}`));
         assert.equal(existsSync(path.join(cwd, "forbidden")), false);
       }
     }

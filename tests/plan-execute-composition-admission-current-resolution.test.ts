@@ -325,6 +325,7 @@ describe("plan/execute packaged composition", () => {
         return [key, childResponse(key, { agent: phase === "t1.a1" ? "pitako.worker" : "pitako.reviewer" }, metadata, observedCandidate())];
       })) : {};
     const closing = childResponse("invoke-human-1.l1.checkout", { agent: "pitako.checkout-observer" }, metadata, observedCandidate());
+    const observation = childResponse("invoke-human-1.l2.demand-observation", { agent: "pitako.reviewer" }, metadata, observedCandidate());
     queryChildren[closing.key] = closing;
     const child = Bun.spawn(["node", "-e", `(async () => {
       const { readFileSync } = require("node:fs");
@@ -360,7 +361,7 @@ describe("plan/execute packaged composition", () => {
     })().catch(error => { console.error(error); process.exitCode = 1; });
     `], { cwd: root, stdin: new TextEncoder().encode(JSON.stringify({ script: closingScript(continuation), root, closing: { ...metadata, checkout: observedCandidate() },
       storage: [...storage], grants: Object.fromEntries(grants), queryMode, metadata, checkout: observedCandidate(),
-      children: query ? queryChildren : { [compliance.key]: compliance, [next.key]: next, [closing.key]: closing } })), stdout: "pipe", stderr: "pipe" });
+      children: query ? queryChildren : { [compliance.key]: compliance, [next.key]: next, [closing.key]: closing, [observation.key]: observation } })), stdout: "pipe", stderr: "pipe" });
     const [exit, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
     expect(stderr).toBe(""); expect(exit).toBe(0);
     const recovered = JSON.parse(stdout);
@@ -397,7 +398,7 @@ describe("plan/execute packaged composition", () => {
       return;
     }
     expect(recovered.result.value).toMatchObject({ status: verdict === "clear" ? "complete" : "blocked", loopsConsumed: verdict === "clear" ? 1 : 2, maxLoops: 3 });
-    expect(recovered.calls).toEqual(verdict === "clear" ? [compliance.key, closing.key] : [closing.key, next.key]);
+    expect(recovered.calls).toEqual(verdict === "clear" ? [compliance.key, closing.key] : [closing.key, observation.key, next.key]);
     expect(recovered.statuses).toHaveLength(6);
     expect(recovered.bytes.every((bytes: number) => bytes <= 4096)).toBe(true);
     for (const [key, value] of recovered.storage) storage.set(key, value);
@@ -2068,7 +2069,7 @@ describe("plan/execute packaged composition", () => {
       const metadata = { root, commonDir: path.join(root, ".git"), candidates: [],
         selected: { source: `${root}/.pitako/plans/assignment.md`, digest: digest(content), chunks: 1 } };
       const children: Record<string, any> = {};
-      for (const loop of [1, 2]) for (const phase of ["director", "t1.a1", "review.director-prepare", "review.independent-a", "review.independent-b", "review.director-synthesis", "compliance", "checkout"]) {
+      for (const loop of [1, 2]) for (const phase of [...loop > 1 ? ["demand-observation"] : [], "director", "t1.a1", "review.director-prepare", "review.independent-a", "review.independent-b", "review.director-synthesis", "compliance", "checkout"]) {
         const key = `invoke-human-1.l${loop}.${phase}`;
         children[key] = childResponse(key, { agent: phase === "director" ? "pitako.execution-director" : phase === "checkout" ? "pitako.checkout-observer" : phase === "t1.a1" ? "pitako.worker" : "pitako.reviewer" }, metadata, checkout);
       }

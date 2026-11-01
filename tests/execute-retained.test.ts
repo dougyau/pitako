@@ -138,3 +138,25 @@ test.each(["eligible", "legacy", "binding", "sources"])("bound admission recover
 	}
 	expect(readFileSync(f.statePath, "utf8")).toBe(JSON.stringify(state));
 }));
+
+test("pending demand observation retains exact original only until director dispatch", () => fixture(f => {
+  const state = JSON.parse(readFileSync(f.statePath, "utf8"));
+  const loop = state["invoke-human-1"].loop;
+  const ref = { ...f.ref, key: "invoke-human-1.l1.demand-observation" };
+  loop.phase = "director"; delete loop.review;
+  loop.analysisCalls = [{ key: ref.key, stage: "receipt", ref }];
+  const statusFile = path.join(f.native, "status.json");
+  const status = JSON.parse(readFileSync(statusFile, "utf8")); status.workflowKey = ref.key;
+  writeFileSync(statusFile, JSON.stringify(status));
+  writeFileSync(f.statePath, JSON.stringify(state));
+  expect(f.load()).toMatchObject([{ key: ref.key, ok: true, structuredOutput: f.original }]);
+  // No local body is needed; the retained native witness is the source.
+  rmSync(statusFile);
+  expect(f.load()).toMatchObject([{ key: ref.key, ok: true, structuredOutput: f.original }]);
+  loop.plan = { stage: "intention", ref: { key: "invoke-human-1.l1.director" } };
+  writeFileSync(f.statePath, JSON.stringify(state));
+  expect(f.load()).toEqual([]);
+  loop.phase = "compliance";
+  writeFileSync(f.statePath, JSON.stringify(state));
+  expect(f.load()).toEqual([]);
+}));

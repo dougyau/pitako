@@ -2244,7 +2244,8 @@ describe("workflow-owned execute controller", () => {
     expect(host.calls.filter(call => call.key.endsWith(".compliance")).map(call => call.key)).toEqual(["invoke-human-1.l2.compliance"]);
     const synthesis = host.calls.findIndex(call => call.key === "invoke-human-1.l1.review.director-synthesis");
     expect(host.calls[synthesis + 1]!.key).toBe("invoke-human-1.l1.checkout");
-    expect(host.calls[synthesis + 2]!.key).toBe("invoke-human-1.l2.director");
+    expect(host.calls[synthesis + 2]!.key).toBe("invoke-human-1.l2.demand-observation");
+    expect(host.calls[synthesis + 3]!.key).toBe("invoke-human-1.l2.director");
     const report = host.emits.find(value => value.type === "execution-loop" && value.loop === 1);
     expect(report.next).toBe("continue loop 2"); expect(report.verification.compliance.status).toBe("not-run");
   });

@@ -555,8 +555,8 @@ describe("plan/execute packaged composition", () => {
         ...hostTarget && !recoveredHost ? { status: "blocked" } : {},
         loopsConsumed: recoveredHost ? 2 : hostTarget && hostTarget !== "inspect-loop-1" ? 0 : ["complete", "rejected-plan"].includes(mode) ? 2 : 1 });
       expect(calls).toHaveLength(analysisTarget ? mode.includes("-prepare-") ? 3 : mode.includes("-later-") ? 5 : 7
-        : recoveredHost ? 16 : hostTarget ? hostTarget === "inspect-loop-1" ? 7 : 0
-        : mode === "complete" ? 16 : mode === "recovered" ? 9 : mode === "rejected-plan" ? 10 : ["stopped", "permission", "unresolved-plan"].includes(mode) ? 2 : 1);
+        : recoveredHost ? 17 : hostTarget ? hostTarget === "inspect-loop-1" ? 7 : 0
+        : mode === "complete" ? 17 : mode === "recovered" ? 9 : mode === "rejected-plan" ? 10 : ["stopped", "permission", "unresolved-plan"].includes(mode) ? 2 : 1);
       if (ambiguousHost) {
         expect((expected.value as any).reason).toContain("ambiguous");
         expect((expected.value as any).action.actor).toBe(mode.endsWith("persistence-failure") ? "persistence operator" : "native run operator");
