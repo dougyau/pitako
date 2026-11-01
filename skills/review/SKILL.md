@@ -41,15 +41,20 @@ coverage instead of claiming closure.
 ## Launch
 
 Resolve [workflow.js](workflow.js) beside this installed skill, not against the
-project being reviewed. Make one background call with that absolute path:
+project being reviewed. Use an explicit native mission for the original manifest,
+creating one as below (or supply its actual existing `options.missionId`). Each
+new review pass needs its own mission/state namespace; a retained standalone pass
+is not implicitly restarted or migrated. Make one background call with that absolute path:
 
 ```js
 subagent({
   workflow: "<absolute skill directory>/workflow.js",
   cwd: "<project being reviewed>",
   async: true,
+  options: { mission: { title: "Review stream parser memory safety" } },
   args: {
-    brief: "<requirements, context, exclusions, and evidence>",
+    workDescription: "Stream parser memory safety",
+    brief: "<complete requirements, human decisions/provenance, context, exclusions, and evidence>",
     target: {
       kind: "diff",
       reference: "<exact candidate identity>",
@@ -85,12 +90,54 @@ same complete target, not files or subtasks:
 The workflow makes no model overrides. Pi-subagents owns native child model
 selection.
 
+## Evidence handoff
+
+Every fresh/resumed request carries the complete current brief and target,
+caller-supplied single-line `workDescription`, readable `label`, explicit `phase`
+and concrete first task line. This includes angle selection, independent review,
+cross-critique, defense and synthesis. Keys and native resume identity remain
+unchanged; titles do not promise historical session renaming or uniform native views.
+
+Full originals request native persistence and `outputMode: "file-only"`. Finding
+indexes identify each authoritative original/ordinal/ID rather than copying
+finding bodies into a second table. Reasons, coverage, uncertainty and contrary
+narrative outside findings remain recoverable; every finding gets a disposition.
+Essential-original references explain why the exact original is needed. Existing
+child readers validate content/schema/association and report missing access;
+resumed children reread essentials no longer in accessible context, not all history
+universally. Earlier delivery or a child access receipt cannot certify reasoning.
+
+Retain actual `results[].savedOutputPath`, returned reference objects and text
+`outputReference` paths with producing query/revision/phase/producer/key/attempt/run.
+Never derive native filenames or replace historical provenance with latest resume
+IDs. Generic artifact paths and `structuredOutputPath` alone are not mandatory
+publication proof; `runs.status` is observation/previews, not an original archive.
+Missing, inaccessible or contradictory essentials block dependent conclusions.
+
+Mandatory publication failure is not repaired by inline JSON. Optional
+observability failure alone does not invalidate required publication/access.
+Only a complete identifiable failed/partial original genuinely delivered can be
+retained exactly once in existing native state, failed/unpublished/insufficient;
+partial analysis need not be ready to preserve it. A field's presence, reference,
+preview, rejection without an object or text without a truncation marker is not
+completeness evidence. Distinguish non-delivery from unproved completeness; never
+reconstruct, republish, duplicate successful originals, truncate evidence, delete
+history or add alternate storage to evade the whole-file 256 KiB bound. Essential
+save failure stops new dispatch, preserves diagnostics and settles owned work
+when native controls allow; unknown inherited settlement remains unknown.
+
+The final memo stays self-contained, not a bundle of intermediate reports or
+only paths. Pitako limits its own prompts/emissions, not all native notices;
+no fixed token savings, universal retention/recovery, exactly-once execution or
+dependency certification is promised. This does not add a review continuation engine.
+
 ## Interpret
 
 Read the returned `status`, not just workflow process success:
 
 - `completed`: all phases completed, with a final `memo` and dispositions.
-- `blocked`: usable review could not proceed; read the question or evidence gap.
+- `blocked`: missing material context prevented a review phase; read the question
+  or evidence gap. Findings, however severe, never produce `blocked`.
 - `failed`: a child or protocol failed; no complete review is claimed.
 
 Completion is not a clean verdict, merge approval, or acceptance. The memo must

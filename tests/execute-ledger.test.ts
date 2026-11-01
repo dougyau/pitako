@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { buildExternalCliPrompt } from "../node_modules/pi-subagents/src/runs/shared/external-cli-runner.js";
 
 const entry = path.resolve("skills/execute/ledger.mjs");
 const { appendLedger, verifyLedger, ledgerPath, loopSummaries } = await import(entry);
@@ -19,7 +20,8 @@ afterEach(() => { for (const workspace of roots.splice(0)) rmSync(workspace, { r
 
 async function cli(workspace: string, value: unknown) {
   const child = Bun.spawn(["node", entry], { cwd: workspace, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
-  child.stdin.write(JSON.stringify(value)); child.stdin.end();
+  // Deliver the request exactly as the registered external-cli runner frames stdin.
+  child.stdin.write(buildExternalCliPrompt("Fixed execution ledger; stdin is a JSON publication request.", JSON.stringify(value))); child.stdin.end();
   const [exit, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
   return { exit, stdout, stderr };
 }

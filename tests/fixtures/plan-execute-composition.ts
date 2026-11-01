@@ -53,7 +53,7 @@ export function resourceWithAgentDir(agentDir: string) {
 
 // Controlled child boundary: actual root/review scripts execute in the native sandbox.
 // Responses implement schemas only; no provider or model obedience is certified.
-export function childResponse(key: string, request: any, metadata: any, checkout: any, completeLoop = 1) {
+export function childResponse(key: string, request: any, metadata: any, checkout: any, completeLoop = 1, suppliedValue?: any) {
   const loop = Number(key.match(/\.l(\d+)\./)?.[1] ?? 1);
   if (request.agent === "pitako.execution-ledger") {
     const pending = JSON.parse(request.task);
@@ -77,7 +77,8 @@ export function childResponse(key: string, request: any, metadata: any, checkout
   const task = { id: "final", kind: "verification", goal: "Verify complete candidate", contextRefs: ["full spec"],
     sourceRefs: [metadata.selected.source], scope: [metadata.root], allowedEffects: ["checks"], expectedResult: "Current required checks", dependsOn: [],
     checks: [{ id: "final-check", requirement: "All specs", command: "bun test affected", cwd: metadata.root }] };
-  if (key.endsWith(".director")) value = { status: "plan", reason: "Complete ordered work", association: {
+  if (suppliedValue) value = suppliedValue;
+  else if (key.endsWith(".director")) value = { status: "plan", reason: "Complete ordered work", association: {
     missionId: "native.mission-1", missionPath: "/native/actual-mission.json", invocation: "human-1", loop, maxCycles: 3, sourceRefs: [],
     root: metadata.root, commonDir: metadata.commonDir, source: metadata.selected.source, digest: metadata.selected.digest,
   }, sharedContext: { material: "Full shared context", references: [metadata.selected.source] }, tasks: [task] };
@@ -94,7 +95,26 @@ export function childResponse(key: string, request: any, metadata: any, checkout
     candidate: checkout, requirements: Array.from({ length: 17 }, (_, index) => ({ id: `criterion-${index + 1}`, source: `spec:criterion-${index + 1}`,
       reason: "Current source/check evidence", status: loop >= completeLoop ? "fulfilled" : "gap", evidence: ["src/entry.ts:1"], checks: ["/native/check.log"] })) };
   else throw Error(`Unexpected child ${key}`);
-  return { key, ok: true, output: "", runId: `native-${key}`, agent: request.agent ?? "pitako.reviewer", artifactPaths: [], structuredOutput: value } satisfies WorkflowScriptChildResult;
+  const results: any[] = [];
+  if (request.phase?.startsWith("review-")) {
+    // The harness passes its file-owned fs boundary, including in Node children.
+    const fs = require("node:fs");
+    const association = Object.fromEntries(Object.entries(request.outputSchema.properties.association.properties)
+      .map(([name, schema]: [string, any]) => [name, schema.const]));
+    const required = JSON.parse(request.task.split("ESSENTIAL ORIGINALS (data): ")[1].split("\n")[0]);
+    const access = required.map((entry: any) => {
+      const original = JSON.parse(fs.readFileSync(entry.results.find((item: any) => item.savedOutputPath).savedOutputPath, "utf8"));
+      if (original.association.key !== entry.key || original.delivery !== "complete") throw Error("Wrong exact original");
+      return { id: entry.id, state: "accessible", source: "read", reason: "Exact associated original retrieved" };
+    });
+    value = { ...value, association, delivery: "complete", access };
+    const savedOutputPath = metadata.root + "/.pi/subagents/review-originals/" + key + ".json";
+    fs.mkdirSync(metadata.root + "/.pi/subagents/review-originals", { recursive: true });
+    fs.writeFileSync(savedOutputPath, JSON.stringify(value));
+    results.push({ savedOutputPath, outputReference: { path: savedOutputPath }, exitCode: 0,
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } });
+  }
+  return { key, ok: true, output: "", runId: `native-${key}`, agent: request.agent ?? "pitako.reviewer", artifactPaths: [], results, structuredOutput: value };
 }
 // Controlled child loading boundary: use the launch binding emitted by the real root,
 // never construct an intention or tool result. Factory registration and publication are real.

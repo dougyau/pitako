@@ -36,7 +36,7 @@ List existing foreground TODOs; create pending context, clarification,
 architecture and materialization stages. Preserve unrelated entries and keep
 only one in_progress. Write a complete conversation/source brief without secrets.
 Launch one background file-backed context workflow at the absolute
-[context.js](context.js) path with `args: { brief }`, `cwd` at the designated
+[context.js](context.js) path with `args: { brief, workDescription: "<concrete single-line work>", consultation: "<stable-id>" }`, `cwd` at the designated
 root, `async: true`, and explicit `options: { mission: { title: "Plan <id>" } }`.
 This dispatches initial independent Scout and researcher evidence. Return control
 after admission; interpret the full native returned value, not its preview.
@@ -50,12 +50,22 @@ that recommendation. Wait for actual human answers. A factual investigation
 blocks only its dependent questions, not the rest of the frontier. Never ask
 the human to research facts you can obtain through a read-only provider.
 
-Feed the complete assignment, all provider evidence (including contradictions),
-settled human decisions and remaining questions to the existing
+Use the concise provider facts, reasons, contradictions, limits, pending
+questions and sources for grilling; full originals remain separately recoverable.
+Missing access blocks dependent conclusions; the context handoff does not claim
+foreground access was observed or require another acknowledgement phase.
+Feed the complete assignment, material evidence (including contradictions),
+settled human decisions/provenance and remaining questions to the existing
 [architecture workflow](../architecture/workflow.js). Launch it in background
-with `args: { brief, planning: true, consultation: "<stable-id>", maxRounds: 10 }`
+with `args: { currentDecision, workDescription: "<concrete single-line work>", planning: true, consultation: "<stable-id>", maxRounds: 10 }`
 and explicit `options: { missionId: "<planning-mission-id>" }` in the same cwd.
 Do not invent runs.workflow, import/fs APIs or child agentOverrides.
+
+Build `currentDecision` using the complete version-1 snapshot shape in the
+[architecture skill](../architecture/SKILL.md): brief, constraints, identified
+obligations, active human decisions and provenance. Do not pass `brief` as an
+architecture argument. Both initial providers and the first director receive
+the caller description; it is not extracted from administrative prompt text.
 
 The script owns dispatch. After EACH architecture round it runs a distinct
 doubts phase: local unknowns to Scout, external contracts to researcher,
@@ -76,14 +86,26 @@ The script submits each dependent frontier's prerequisites and then its relay
 before later groups or unrelated facts. It does not await human answers before
 continuing research. Some unrelated facts start later to avoid native FIFO
 admission delaying a newly answerable question; this is not preemption.
+The file-blind relay receives self-contained facts, reasons, contradictions,
+limits and questions; do not tell it to open artifacts. Essential originals
+stay available to factual readers under architecture's publication/access contract.
 The relay's report or a transport receipt is context, not new permission to
 implement/materialize and never replaces final actual-human confirmation.
 
 For useful further evidence or answered human questions, invoke the SAME script,
-consultation ID and mission with an updated complete brief. Do not resend the
-retained reports or full continuation: the bounded consultation reference
-selects the full evidence and consumed counts in native mission state. The
-returned planning continuation contains only that reference. Native mission
+consultation ID, `planning: true` and mission with the exact returned version-2
+`continuation`. For unchanged instructions use `evidence` for factual input;
+for changed instructions use an explicit complete `replacement` with consultation,
+expected current revision and preserved/replaced obligations, as documented in
+architecture. Preserve active human decisions and provenance; never concatenate
+briefs or silently patch instructions. Resume/evidence alone does not increment
+revision. The bounded planning continuation selects phase/evidence/counters in
+native state; it contains only version and consultation, not current revision.
+Retain the confirmed decision revision separately. Do not resend retained reports.
+Stop on ambiguous dispatch before another launch. Only explicit human-authorized
+`factualRetry` of known terminal missing/insufficient providers may reconcile
+that frontier without another comparison round; preserve sufficient providers,
+attempts and counters. Missing/incompatible state is not a new consultation. Native mission
 state retains consumed rounds, including failed
 rounds; ten is the TOTAL ceiling across this consultation. Do not reset counts,
 omit its mission, use newDecision or choose a new ID for trivial reentry. Start

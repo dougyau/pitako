@@ -225,3 +225,17 @@ test.each([false, true])("closing rebuilds identical bytes after a save cut; sou
     expect(host.records()).toHaveLength(2);
   }
 });
+
+test("admission amendments reach every phase without the director copying them into the plan", async () => {
+  const host = fixture();
+  const amendments = [{ path: "/worktree/.pitako/amendments/human.md", sha256: "a".repeat(64),
+    provenance: "human message h1 at 2026-10-31T06:12:50Z" }];
+  // The fixture director paraphrases nothing and omits amendments from sharedContext entirely.
+  const output = await host.execute({ amendments });
+  expect(output.status, output.reason).toBe("complete");
+  expect(host.current().amendments).toEqual(amendments);
+  const phases = host.calls.filter(call => /\.director$|\.t\d+\.a\d+$|\.compliance$|\.review\./.test(call.key));
+  for (const pattern of [/\.director$/, /\.t\d+\.a\d+$/, /\.compliance$/, /\.review\./])
+    expect(phases.some(call => pattern.test(call.key))).toBe(true);
+  for (const call of phases) expect(call.task, call.key).toContain(JSON.stringify(amendments));
+});

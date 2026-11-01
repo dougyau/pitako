@@ -1,12 +1,12 @@
 import "./loader.mjs";
 import { readFileSync } from "node:fs";
-import { appendLedger, verifyLedger, loopSummaries } from "./ledger.mjs";
+import { appendLedger, verifyLedger, loopSummaries, readRequest } from "./ledger.mjs";
 
 const keys = (value, names) => value && typeof value === "object" && !Array.isArray(value) &&
   Object.keys(value).sort().join(",") === names;
 try {
   const { observeCheckout, observationOutput } = await import("./observe.ts");
-  const { expected, body, ...extra } = JSON.parse(readFileSync(0, "utf8"));
+  const { expected, body, ...extra } = readRequest(readFileSync(0, "utf8"));
   if (Object.keys(extra).length || !keys(expected, "count,head,invocation") ||
       !keys(body, expected.count === 0 ? "record,spec" : "record") ||
       !keys(body.record, "body,kind,loop") || body.record.kind !== "loop")

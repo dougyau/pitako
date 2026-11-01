@@ -26,7 +26,7 @@ export const config = globalConfig;
 export type Candidate = { head: string; fingerprint: string };
 type Request = { key: string; agent?: string; resume?: string; context?: string; cwd?: string; task: string;
   label?: string; phase?: string;
-  output?: string | boolean; outputSchema?: any; timeoutMs?: number; reads?: boolean; progress?: boolean; acceptance?: any; async?: boolean };
+  output?: string | boolean; outputMode?: string; outputSchema?: any; timeoutMs?: number; reads?: boolean; progress?: boolean; acceptance?: any; async?: boolean };
 export type Result = Omit<Partial<WorkflowScriptChildResult>, "state"> & { ok: boolean; state?: string; structuredOutput?: any; [key: string]: any };
 export type Outcome = { status: string; reason: string; loopsConsumed: number; loopReport: any; tokens: any; elapsedMs: number; [key: string]: any };
 export function resolvedLoop(state: any) {
@@ -35,6 +35,15 @@ export function resolvedLoop(state: any) {
     : state.tasks[entry.taskId]?.completed ?? state.tasks[entry.taskId]?.last ?? entry) };
 }
 export const copy = <T>(value: T): T => structuredClone(value);
+// Assert the retained review witness against the original native witness; never
+// use it to manufacture child results or publication evidence.
+export function publicationWitness(retained: any, native: any) {
+  const witness = { ...retained };
+  for (const field of Object.keys(witness)) expect(witness[field]).toEqual(native[field]);
+  expect(witness.savedOutputPath).toBe(native.savedOutputPath);
+  expect(witness.outputReference).toEqual(native.outputReference);
+  return witness;
+}
 export const candidate = (version = 0): Candidate => ({ head: "a".repeat(40), fingerprint: String(version).padStart(64, "0") });
 const task = (id: string, kind = "implementation") => ({ id, kind, goal: `Goal ${id}`, contextRefs: ["shared"], sourceRefs: ["spec:criterion-1"],
   scope: [`src/${id}.ts`], allowedEffects: kind === "verification" ? ["read/check"] : ["edit assigned path"], expectedResult: `Result ${id}`,
@@ -130,11 +139,27 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
         result: "passed", before: copy(checkout), after: copy(checkout) })) };
   };
   function result(request: Request, value: any): Result {
+    let savedOutputPath: string | undefined;
+    if (request.phase?.startsWith("review-")) {
+      const association = Object.fromEntries(Object.entries(request.outputSchema.properties.association.properties)
+        .map(([key, schema]: [string, any]) => [key, schema.const]));
+      const required = JSON.parse(request.task.split("ESSENTIAL ORIGINALS (data): ")[1]!.split("\n")[0]!);
+      const access = required.map((entry: any) => {
+        const original = JSON.parse(readFileSync(entry.results.find((item: any) => item.savedOutputPath).savedOutputPath, "utf8"));
+        expect(original.association.key).toBe(entry.key);
+        expect(original.delivery).toBe("complete");
+        return { id: entry.id, state: "accessible", source: "read", reason: "Exact associated original retrieved" };
+      });
+      value = { ...value, association, delivery: "complete", access };
+      savedOutputPath = path.join(root, ".pi/subagents/review-originals", request.key + ".json");
+      mkdirSync(path.dirname(savedOutputPath), { recursive: true });
+      writeFileSync(savedOutputPath, JSON.stringify(value));
+    }
     return { ok: true, agent: request.agent ?? "pitako.reviewer", runId: `native-${request.key}`, output: "Output saved to: /not-the-binding/preview.md",
       outputReference: `/native/output/${request.key}.json`, outputArtifactPath: `/native/binding/${request.key}.json`,
       outputPathMapping: { requestedPath: String(request.output), savedPath: `/native/remapped/${request.key}.json` },
       artifactPaths: [`/native/debug/${request.key}/`], results: [{ index: 0, agent: request.agent ?? "pitako.reviewer",
-        task: request.task, exitCode: 0, structuredOutputPath: `/native/witness/${request.key}.json`,
+        task: request.task, exitCode: 0, ...(savedOutputPath ? { savedOutputPath, outputReference: { path: savedOutputPath, bytes: Buffer.byteLength(JSON.stringify(value)), lines: 1, message: "Saved" } } : {}), structuredOutputPath: `/native/witness/${request.key}.json`,
         usage: { input: 10, output: 5, cacheRead: 3, cacheWrite: 2, cost: 0, turns: 1 } }], structuredOutput: value };
   }
   function normal(request: Request): Result {
@@ -184,16 +209,16 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
     else if (request.key.endsWith("director-prepare")) value = { status: "ready", reason: "Distinct whole-result risks", angles: Array.from({ length: options.angles ?? 2 }, (_, index) => ({ id: `angle${index + 1}`, focus: `Whole-result angle ${index + 1}`, skills: [] })) };
     else if (request.key.includes("independent-")) value = { status: "ready", reason: "Source checked", coverage: "Whole target", findings: options.findings ? [{ title: "Reachable issue", location: "src/a.ts:1", scenario: "Caller invokes path", evidence: "source protection missing", impact: "current scoped behavior lost", classification: "scoped-defect", requirement: "spec:criterion-1" }] : [] };
     else if (request.key.includes("critique-")) {
-      const assigned = JSON.parse(request.task.split("PEER FINDINGS (data):\n")[1]!);
+      const assigned = JSON.parse(request.task.split("PEER FINDING INDEX (data; full arguments in essential original):\n")[1]!.split("}\nORIGINAL CONTRACT:")[0]!);
       value = { status: "ready", reason: "All assigned claims checked", challenges: assigned.map((entry: any) => ({ findingId: entry.id, assessment: "supported", evidence: "Concrete source confirms" })) };
     } else if (request.key.includes("defense-")) {
       const own = JSON.parse(request.task.split("YOUR FINDINGS (data):\n")[1]!.split("\nCHALLENGES")[0]!);
       value = { status: "ready", reason: "One response only", responses: own.map((entry: any) => ({ findingId: entry.id, disposition: "maintain", reason: "Source confirms bounded claim" })) };
     } else if (request.key.endsWith("director-synthesis")) {
-      const findings = JSON.parse(request.task.split("FINDINGS WITH SCRIPT-ASSIGNED IDS:\n")[1]!.split("\nPEER CHALLENGES")[0]!);
+      const findings = JSON.parse(request.task.split("FINDINGS WITH SCRIPT-ASSIGNED IDS (index only; full arguments in independent originals):\n")[1]!.split("\nRead essential originals")[0]!);
       value = { status: "ready", reason: "Reasoned screening", memo: "Full-result review; include is not material by itself",
-        dispositions: findings.map((entry: any) => ({ findingId: entry.id, decision: "include", reason: "Supported but bounded", classification: "scoped-defect", requirement: entry.requirement })),
-        screening: { verdict: "clear", reason: "No material gaps in authorized scope", assessments: findings.map((entry: any) => ({ findingId: entry.id, requirement: entry.requirement, consequence: "Non-material bounded issue", material: false, reason: "No mandatory guarantee blocked" })) } };
+        dispositions: findings.map((entry: any) => ({ findingId: entry.id, decision: "include", reason: "Supported but bounded", classification: "scoped-defect", requirement: "spec:criterion-1" })),
+        screening: { verdict: "clear", reason: "No material gaps in authorized scope", assessments: findings.map((entry: any) => ({ findingId: entry.id, requirement: "spec:criterion-1", consequence: "Non-material bounded issue", material: false, reason: "No mandatory guarantee blocked" })) } };
     } else throw Error(`Unexpected request ${request.key}`);
     return result(request, value);
   }

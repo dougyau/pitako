@@ -119,9 +119,50 @@ describe("workflow-owned execute controller", () => {
     expect(count).toBe(cut === "intention" ? 0 : 1);
     host.setFailSave();
     const next = await host.executeNative();
-    expect(next.status).toBe("complete");
+    expect(next.status, JSON.stringify(next)).toBe("complete");
     expect(host.calls.filter(call => call.key === target)).toHaveLength(1);
     if (cut !== "intention") expect(host.statusCalls).toContain(cut === "receipt" ? target : `native-${target}`);
+  });
+
+  test.each(["intact", "producer-conflict"])("completed review references survive a phase cut: %s", async mode => {
+    const host = fixture();
+    host.setRespond((request, normal) => {
+      const result = normal();
+      if (request.phase?.startsWith("review-")) Object.assign(result.results![0]!, {
+        workflowKey: request.key, runId: result.runId, agent: "pitako.reviewer",
+        state: "complete",
+      });
+      return result;
+    });
+    cutAt(host, value => value.loop?.phase === "closing");
+    expect((await host.executeNative()).status).toBe("partial");
+    host.setFailSave();
+    const retained = host.current().loop;
+    // The review projection owns full witnesses; the analysis journal keeps only call identity.
+    for (const call of retained.analysisCalls.filter((entry: any) => entry.key.includes(".review.")))
+      expect(Object.keys(call.ref).sort().join(",")).toBe("key,runId");
+    const originals = copy(retained.review.references), count = host.calls.length;
+    if (mode === "producer-conflict") {
+      const ref = retained.review.references[0], actual = copy(host.native.get(ref.runId)!);
+      ref.runId = "different-producer";
+      host.setStatus(key => key === "different-producer" ? actual : copy(host.native.get(key)!));
+    }
+    const replay = await host.executeNative();
+    expect(replay.status).toBe(mode === "intact" ? "complete" : "blocked");
+    // Only the fixed closing observer may run; no review or other child is replaced.
+    expect(host.calls.slice(count).map(call => call.agent)).toEqual(mode === "intact" ? ["pitako.checkout-observer"] : []);
+    if (mode === "intact") {
+      expect(host.history().at(-1).review.references).toEqual(originals);
+      expect(host.statusCalls).toContain(originals[0].runId);
+      for (const ref of replay.loopReport.verification.adversarial.references) {
+        const witness = ref.results[0], actual = host.native.get(ref.runId)!.results![0];
+        expect(witness.savedOutputPath).toBe(actual.savedOutputPath);
+        expect(witness.outputReference).toEqual(actual.outputReference);
+        expect(witness).toMatchObject({ workflowKey: ref.key, runId: ref.runId, agent: "pitako.reviewer",
+          state: "complete" });
+        expect(witness).not.toHaveProperty("terminalOutcome");
+      }
+    } else expect(replay.reason).toMatch(/producer conflicts with analysis identity/);
   });
 
   test("retained analysis intention without a settled producer cannot launch a replacement", async () => {

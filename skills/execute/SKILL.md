@@ -401,7 +401,20 @@ After final mandatory checks the root runs the REAL shared adversarial review:
 two to four dynamic whole-result perspectives, cross-critique, one defense and
 synthesis. The trusted assembly is a lexical library marker, COMPLETE unchanged
 review source, then execute source; no protocol copy, slicing, imports or nested
-workflow API. `clear`, `material-gaps`, `blocked` screening gives reasons and
+workflow API. The root supplies a concrete `workDescription` and preserves
+`label`, `phase` and first-line task titles through fresh/resumed adapters.
+Shared review uses file-only native originals, not duplicated full report/finding
+collections. Preserve actual `results[].savedOutputPath`, returned reference
+objects and textual `outputReference` paths with original producer provenance,
+including final reprojection. Generic artifacts or `structuredOutputPath` alone
+are not proof of mandatory reasoning-report publication; execute's narrow
+exact-reference recovery remains separate. Required original access, complete
+delivery, publication, sufficiency and optional observability are distinct.
+A genuinely complete delivered failed/partial original can be retained once as
+failed/unpublished/insufficient, never reconstructed from previews or republished.
+Missing or inaccessible essentials block dependent conclusions. Architecture's
+ambiguous-dispatch rules do not replace execute writer recovery/checkpoints.
+`clear`, `material-gaps`, `blocked` screening gives reasons and
 consequences; include is not blocking priority, completed is not acceptance.
 Only clear screening launches exactly ONE fresh reviewer-profile compliance
 analyst. This analyst derives a meaningful inventory of ALL obligations from the
@@ -550,9 +563,9 @@ The references freeze in `invocation.amendments`, separately from the base
 association/snapshot/sourceRefs, before planning and without renewing maxCycles.
 Reentry must pass the same entries/order/provenance; it rechecks their bytes and
 cannot add, merge or replace them. The existing `--unblock` resolution route is
-unchanged. The director carries every path in sharedContext.references and full
-SHA-256/provenance in sharedContext.material, through the existing shared context
-to worker, review and compliance; every phase must read/hash the full sources.
+unchanged. The root itself delivers the exact frozen references to director,
+worker, review and compliance; the director does not copy them into
+sharedContext. Every phase must read/hash the full sources.
 
 Separately delivered current human amendments remain separate from the admitted
 base snapshot/sourceRefs/association. They remain effective without replacing base

@@ -101,10 +101,28 @@ function candidate(value) {
 }
 function nativeReference(childKey, result) {
   const ref = { key: childKey };
-  for (const field of ["agent", "runId", "asyncDir", "outputReference", "outputArtifactPath", "outputPathMapping", "artifactPaths", "externalAdapter"])
+  // Review publication and control witnesses are projected only for review children;
+  // other children keep the stable reference used for recovery reconciliation.
+  const review = childKey.includes(".review.");
+  // Review retains a failed original once in its own state; keep only the diagnostic here.
+  if (review && text(result?.error)) ref.error = result.structuredOutput === undefined ? result.error
+    : result.error.split("\n\nOutput:\n")[0]
+      .replaceAll(JSON.stringify(result.structuredOutput, null, 2), "[retained failed original]")
+      .replaceAll(JSON.stringify(result.structuredOutput), "[retained failed original]");
+  for (const field of ["agent", "runId", "asyncDir", "outputReference", "outputArtifactPath", "outputPathMapping", "artifactPaths", "externalAdapter",
+    ...(review ? ["nativeKey", "workflowKey", "outputSaveError", "metadataSaveError", "exitCode", "timedOut", "terminalOutcome", "stopped", "interrupted", "detached", "recovery", "toolBudgetBlocked", "acceptance", "state"] : [])])
     if (result?.[field] !== undefined) ref[field] = result[field];
-  const witnesses = result?.results?.filter(entry => text(entry.structuredOutputPath))
-    .map(entry => ({ structuredOutputPath: entry.structuredOutputPath }));
+  if (!review) {
+    const witnesses = result?.results?.filter(entry => text(entry.structuredOutputPath))
+      .map(entry => ({ structuredOutputPath: entry.structuredOutputPath }));
+    if (witnesses?.length) ref.results = witnesses;
+    return ref;
+  }
+  if (result?.key !== undefined && result.key !== childKey && result.key !== result.runId) ref.nativeKey = result.key;
+  const witnesses = result?.results?.map(entry => Object.fromEntries(
+    ["index", "key", "agent", "runId", "workflowKey", "savedOutputPath", "outputReference", "structuredOutputPath",
+      "outputSaveError", "metadataSaveError", "artifactPaths", "exitCode", "terminalOutcome", "state", "stopped", "interrupted", "timedOut", "detached", "recovery", "toolBudgetBlocked", "acceptance"]
+      .filter(field => entry[field] !== undefined).map(field => [field, entry[field]])));
   if (witnesses?.length) ref.results = witnesses;
   return ref;
 }
@@ -447,7 +465,22 @@ function observeAnalysis(call) {
       throw new Error("Analysis producer/run identity conflicts with retained receipt.");
     const cause = barrier(observed, ref);
     if (cause) throw nativeBarrier(cause);
-    observed = retainedReadOnlyOriginal(observed, call.ref);
+    const publishedRef = loop.review?.references?.find(ref => ref.key === call.key);
+    const originalRef = publishedRef ?? call.ref;
+    if (publishedRef && publishedRef.runId !== call.ref.runId)
+      throw new Error("Retained review publication producer conflicts with analysis identity.");
+    observed = retainedReadOnlyOriginal(observed, originalRef);
+    if (call.key.includes(".review.") && observed?.structuredOutput && observed.runId === originalRef.runId) {
+      // Exact narrow recovery delivers the body, not new publication. Retain the
+      // original launch's witnesses without treating structuredOutputPath as one.
+      const publicationFields = ["asyncDir", "outputReference", "outputArtifactPath", "outputPathMapping", "outputSaveError", "metadataSaveError", "artifactPaths"];
+      const publication = Object.fromEntries(publicationFields.filter(field => originalRef[field] !== undefined).map(field => [field, originalRef[field]]));
+      observed = { ...publication, ...observed, results: (observed.results?.length ? observed.results : originalRef.results ?? []).map((entry, index) => ({
+        ...Object.fromEntries(Object.entries(originalRef.results?.find(item => (item.index ?? index) === (entry.index ?? index)) ?? {})
+          .filter(([field]) => !["exitCode", "interrupted", "timedOut"].includes(field))),
+        ...Object.fromEntries(Object.entries(entry).filter(([field]) => observed.results?.length || !["exitCode", "interrupted", "timedOut"].includes(field))),
+      })) };
+    }
     if (!observed?.ok || !text(observed.runId) || !observed.structuredOutput) {
       if (call.barrier) throw nativeBarrier(call.barrier);
       throw new Error(`Complete retained analysis unavailable for ${ref}; no replacement dispatched.`);
@@ -666,7 +699,8 @@ function analysisDispatch(requests) {
       return dispatch([request]);
     }).then(([result]) => {
       call.stage = "receipt";
-      call.ref = { key: request.key, ...(text(result?.runId) ? { runId: result.runId } : {}) };
+      call.ref = request.key.includes(".review.") ? nativeReference(request.key, result)
+        : { key: request.key, ...(text(result?.runId) ? { runId: result.runId } : {}) };
       call.barrier = barrier(result);
       return save().then(() => {
         if (call.barrier) throw nativeBarrier(call.barrier);
@@ -733,9 +767,6 @@ function validatePlan(value, number, manifest) {
   if (!value || !["plan", "needs-decision"].includes(value.status) || !text(value.reason) ||
       !same(value.association, association(number))) throw new Error("loop_plan association mismatch.");
   if (value.status === "needs-decision") return value;
-  if ((invocation.amendments ?? []).some(ref => !value.sharedContext?.references?.includes(ref.path) ||
-      !value.sharedContext?.material?.includes(ref.sha256) || !value.sharedContext?.material?.includes(ref.provenance)))
-    throw new Error("loop_plan sharedContext must retain every admission amendment path, SHA-256 and human-delivery provenance.");
   if (!text(value.sharedContext?.material) || !Array.isArray(value.sharedContext.references) ||
       !Array.isArray(value.tasks) || !value.tasks.length ||
       new Set(value.tasks.map(task => task.id)).size !== value.tasks.length ||
@@ -789,7 +820,7 @@ and verify its SHA-256 with existing read/hash tools. Missing/mismatched/incompl
 never silently omit inherited obligations or treat summaries as full specs. Selected snapshot remains intact.
 ADMITTED PLAN CONTEXT (separate from immutable base association): ${JSON.stringify(activePlan?.sharedContext ?? null)}
 ADMISSION HUMAN AMENDMENTS (immutable, separate from base): ${JSON.stringify(invocation.amendments ?? [])}
-Carry every amendment path in sharedContext.references and its SHA-256/provenance in sharedContext.material.
+The root delivers these exact frozen references to every phase; do not copy or restate them in sharedContext.
 Read the COMPLETE admitted plan via its exact retained reference when context is unavailable here.
 For admission amendments above and separately delivered current human amendments in that context, read and hash the FULL source
 before affected work or whole-spec analysis. Retain its path, SHA-256 and human-delivery provenance
@@ -1436,7 +1467,7 @@ function archiveSeal(pending = invocation.sealPending) {
       task: JSON.stringify({ invocation: config.invocation, expected: pending.expected, record: pending.record,
         ...(pending.expected.count === 0 ? { spec: { content: config.preliminary.content, digest: invocation.association.digest } } : {}) }),
       cwd: config.root, context: "fresh", output: false, outputMode: "inline", outputSchema: false,
-      acceptance: false, reads: false, progress: false }])).then(results => {
+      reads: false, progress: false }])).then(results => {
       const result = results[0];
       if (result?.nativeFailure) throw Object.assign(new Error(result.nativeFailure.reason), { nativeFailure: result.nativeFailure });
       const cause = barrier(result, sealKey);
@@ -2280,6 +2311,7 @@ continue requires useful progress plus concrete diagnosed continuation, not a re
         throw error;
       }) };
       const reviewed = await reviewPhase({
+        workDescription: `Loop ${loop.number} result — ${(activePlan?.tasks.map(task => task.goal) ?? loopResults(false).map(result => result.workDone ?? result.taskId)).map(goal => goal.replace(/\s+/g, " ").trim()).join("; ")}`,
         brief: `${fullContext()}\nReview the COMPLETE authorized result against ALL specs, not director tasks alone.
 Admitted COMPLETE plan references: ${JSON.stringify(loop.plan.ref)}.
 Assess single-outcome decomposition and necessary dependencies independently; schema cannot certify semantics.
@@ -2290,7 +2322,9 @@ No own writer is active. Do not run checks or repair. Only clear screening permi
         target: { kind: "solution", reference: JSON.stringify(loop.candidate),
           material: `Entire designated checkout ${config.root}, immutable full specs above and native work/check artifacts.
 Read the actual sources and full referenced reports, not previews. Candidate: ${JSON.stringify(loop.candidate)}.` },
-      }, reviewRuns, { prefix: `${key}.l${loop.number}.review.`, mode: "execute" });
+      }, reviewRuns, { prefix: `${key}.l${loop.number}.review.`, mode: "execute",
+        decisionReference: { stateKey: key, loop: loop.number, plan: loop.plan.ref, candidate: loop.candidate },
+      });
       if (reviewBudgetError) throw reviewBudgetError;
       if (persistenceFailed) throw new Error(persistenceReason);
       // A second failed observation must not erase the original lookup refs.
@@ -2303,6 +2337,10 @@ Read the actual sources and full referenced reports, not previews. Candidate: ${
         unresolved: reviewed.screening?.assessments?.filter(item => item.material) ?? [],
         nativeFailure: reviewed.nativeFailure ?? null,
         references: [...reviewRefs.values()] };
+      // The final review projection becomes the durable native-reference owner.
+      // Keep only call identity in the analysis journal, not a second full copy.
+      for (const call of loop.analysisCalls ?? []) if (reviewRefs.has(call.key))
+        call.ref = { key: call.key, ...(text(call.ref.runId) ? { runId: call.ref.runId } : {}) };
       const reviewBarrier = reviewed.references.map(ref => barrier(ref)).find(Boolean);
       if (reviewBarrier) throw nativeBarrier(reviewBarrier);
       if (reviewed.nativeBarrier) throw nativeBarrier(reviewed.nativeBarrier);
@@ -2398,7 +2436,7 @@ no unresolved material gaps and this SAME candidate. Otherwise gaps or blocked. 
              task: JSON.stringify({ expected: { invocation: config.invocation, ...loop.archivePending.expected },
                body: { record: closingRecord(), ...(loop.archivePending.expected.count === 0
                  ? { spec: { content: config.preliminary.content, digest: invocation.association.digest } } : {}) } }), cwd: config.root, context: "fresh",
-             output: false, outputMode: "inline", outputSchema: false, acceptance: false, reads: false, progress: false }]))[0]
+             output: false, outputMode: "inline", outputSchema: false, reads: false, progress: false }]))[0]
              : await observeStatus(intention.ref?.runId ?? intention.key, true);
          } catch (error) {
            if (error.nativeBarrier) error.nativeReference ??= { key: intention.key, agent: "pitako.checkout-observer" };

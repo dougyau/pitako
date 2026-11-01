@@ -14,7 +14,9 @@ alone is not review material. Source files and captured artifacts remain stable
 during review.
 
 The returned status distinguishes a completed report from blocked or failed
-work. Completion supplies a memo and dispositions, not a clean verdict or merge
+work. A child blocks only when missing material context prevents its phase;
+findings, however severe, are reported in a completed review. Completion
+supplies a memo and dispositions, not a clean verdict or merge
 approval. The caller assesses findings, uncertainties, coverage, currentness,
 and required checks before taking an authorized action. Findings and final
 dispositions distinguish scoped defects, related improvements, out-of-scope
@@ -29,6 +31,19 @@ workflow for a closure review of the delta, admitted findings, and affected
 guarantees. Reviewers retain access to the complete candidate. Prior unaffected
 coverage and closure coverage can together cover the final diff. Missing prior
 coverage or unbounded interactions require broader review, not assumed closure.
+
+Callers supply concrete `workDescription` text, not a name extracted from
+a brief.
+New and resumed child requests expose readable labels, explicit phases and a
+concrete first task line, with phase and angle before the work description so
+sibling jobs stay distinguishable even for long descriptions.
+This changes neither keys nor retained native session names.
+Originals use native file-only publication with actual saved-output witnesses;
+references alone do not establish access or sufficiency.
+Exact essential originals remain recoverable with producing provenance;
+missing access blocks conclusions.
+The final synthesis remains self-contained. See the skill for failed-original
+retention limits and distinctions from optional observability.
 
 The former `review_start/read/control` tools, Team report reader, and managed
 judgments are retired. There is no compatibility route.
