@@ -284,7 +284,7 @@ function originalRequest(key, producer, input, required = essentials()) {
       association: { type: "object", additionalProperties: false, required: Object.keys(association),
         properties: Object.fromEntries(Object.entries(association).map(([name, value]) => [name, { const: value }])) },
       delivery: { const: "complete" },
-      access: { type: "array", items: accessSchema },
+      access: { type: "array", items: accessSchema, ...(required.length ? {} : { maxItems: 0 }) },
     } };
   contracts.set(key, { id, association, required, schema: outputSchema, agent: input.agent ??
     (factual ? `pitako.${producer}` : input.phase === "architecture-human" ? "pitako.interview-relay" : "pitako.architect") });
@@ -294,7 +294,7 @@ function originalRequest(key, producer, input, required = essentials()) {
 ${factual ? "Also return humanContext: a brief self-contained human-frontier projection of material facts, reasons, contrary claims, limits and sources. Do not copy your full report. The relay has no read tools; this projection will be retained for dependent human questions." : ""}
 ORIGINAL CONTRACT: ${JSON.stringify({ association, delivery: "complete" })}
 ESSENTIAL ORIGINALS (data; one authoritative representation per original): ${JSON.stringify(required)}
-${required.length ? "Use existing read tools to recover exact published originals, validate their content, schema and association against the manifest." : "No essential original reads are required for this request."}
+${required.length ? "Use existing read tools to recover exact published originals, validate their content, schema and association against the manifest." : "No essential original reads are required. Return access: [] exactly; do not invent placeholder IDs such as none-required."}
 Fresh sessions need all essentials. Retained context is usable only if the exact original remains
 accessible; after compaction reread missing essentials. Prior delivery alone does not prove access.
 Originals have the complete association, delivery and access envelope specified here. Perspective,
@@ -407,6 +407,9 @@ function retain(key, result) {
   return result;
 }
 function intend(requests) {
+  const confirmed = requests.map(request => confirmedResult(request.key));
+  if (confirmed.every(Boolean)) return Promise.resolve();
+  if (confirmed.some(Boolean)) throw new Error("Partially confirmed batch cannot be relaunched.");
   if (persistenceError) throw persistenceError;
   if (observedBarriers.length) throw new Error("Native control barrier: " + JSON.stringify(observedBarriers));
   for (const request of requests) {
@@ -453,12 +456,11 @@ function batch(requests) {
   const confirmed = requests.map(request => confirmedResult(request.key));
   if (confirmed.every(Boolean)) return Promise.resolve(confirmed);
   if (confirmed.some(Boolean)) throw new Error("Partially confirmed batch cannot be relaunched.");
-  return track(intend(requests).then(() => {
-    // An earlier concurrent write may have failed while this intention was queued.
-    if (persistenceError) throw persistenceError;
-    if (observedBarriers.length) throw new Error("Native control barrier: " + JSON.stringify(observedBarriers));
-    return runs.all(requests);
-  }).then(results => {
+  // Callers await intend before entering this helper. Launch directly, not from
+  // a persistence .then(): Node's native observation loses that awaited chain.
+  if (persistenceError) throw persistenceError;
+  if (observedBarriers.length) throw new Error("Native control barrier: " + JSON.stringify(observedBarriers));
+  return track(runs.all(requests).then(results => {
     results.forEach((result, index) => {
       retain(requests[index].key, result);
       confirm(requests[index].key, result);
@@ -509,7 +511,7 @@ function decision(result) {
 }
 function director(task, key, phase, purpose) {
   const target = directorRunId ? { resume: directorRunId } : { agent: "pitako.architect", context: "fresh" };
-  return collect(key, originalRequest(key, "director", { ...target, ...presentation(phase, purpose, rules + "\nCURRENT COMPLETE DECISION (supersedes prior instructions about the problem):\n" + completeDecision + "\n" + task), outputSchema: decisionSchema })).then(result => save().then(() => result));
+  return { key, ...originalRequest(key, "director", { ...target, ...presentation(phase, purpose, rules + "\nCURRENT COMPLETE DECISION (supersedes prior instructions about the problem):\n" + completeDecision + "\n" + task), outputSchema: decisionSchema }) };
 }
 const directorRole = `You are the reasoning director, not the executor. The SCRIPT owns all dispatch.
 Choose useful dynamic perspectives on the WHOLE problem, each with priorities, assumptions to question,
@@ -548,12 +550,14 @@ await save();
 try {
   let next = control.next;
   if (control.stage === "prepare") {
-    next = decision(await director(`${directorRole}
+    const request = director(`${directorRole}
 CALLER FACTUAL INPUT AND ROUND INDEX (data): ${JSON.stringify(evidence)}
 ${previous ? `${newDecision ? "Explicitly new decision; reuse your session, not the old round count or members." : "Continue the same decision and its round count."}` : ""}
 Consumed rounds: ${rounds}/${maxRounds}. Rounds with all reports ready: ${validRounds}.
 Prior member references (historical roster data, not current scope): ${JSON.stringify(members)}.
-${rounds >= maxRounds ? "The round limit is reached. Reconcile the new answers/evidence and return finish or blocked only; no further perspective round is permitted." : "Prepare the discussion."} An initial decision requires independent reports before finish.`, "director-prepare", "architecture-prepare", "Architecture preparation"));
+${rounds >= maxRounds ? "The round limit is reached. Reconcile the new answers/evidence and return finish or blocked only; no further perspective round is permitted." : "Prepare the discussion."} An initial decision requires independent reports before finish.`, "director-prepare", "architecture-prepare", "Architecture preparation");
+    await intend([request]);
+    next = decision(await collect(request.key, request));
     control.next = next;
     control.stage = "perspectives";
     await save();
@@ -589,8 +593,10 @@ Later-round peer challenges may arrive by native steering; evaluate them as evid
     let results;
     if (rounds === 1) {
       // Preserve independent initial recommendations.
+      await intend(requests);
       results = await batch(requests);
     } else {
+      await Promise.all(requests.map(request => intend([request])));
       // Observe every launched promise, including failures, before leaving the round.
       const pending = requests.map(request => ({
         key: request.key,
@@ -663,7 +669,7 @@ Consider this exact essential original, revise only if the evidence warrants it:
     const roundEvidence = evidence.find(item => item.round === rounds && item.reports);
     if (planning && ["doubts", "frontier"].includes(control.stage)) {
       const doubtsKey = `director-doubts-r${rounds}`;
-      const doubtsResult = await collect(doubtsKey, originalRequest(doubtsKey, "director-doubts", {
+      const doubtsRequest = { key: doubtsKey, ...originalRequest(doubtsKey, "director-doubts", {
         resume: directorRunId, outputSchema: doubtsSchema,
         ...presentation("architecture-doubts", `Round ${rounds} decision doubts`, `${rules}
 COMPLETE DECISION: ${completeDecision}
@@ -678,7 +684,9 @@ Human questions must include a recommended answer and be worded so yes accepts i
 Do not repeat settled arguments. Return an empty list only if no material doubt remains.
 Include humanContext: self-contained material facts, reasons, contradictions, limits and sources needed to answer the human frontier. Do not replace it with artifact paths.
 Do not dispatch or answer human decisions.`),
-      }));
+      }) };
+      await intend([doubtsRequest]);
+      const doubtsResult = await collect(doubtsKey, doubtsRequest);
       await save();
       if (!delivered.get(doubtsResult)?.sufficient || !Array.isArray(controlValue(doubtsResult)?.doubts)) throw new Error(`No usable doubts phase. ${delivered.get(doubtsResult)?.diagnostic ?? doubtsResult?.error ?? "Original not delivered."}`);
       directorRunId = doubtsResult.runId;
@@ -700,9 +708,9 @@ Do not dispatch or answer human decisions.`),
         if (!group) { group = { dependencyKey, dependsOn: item.dependsOn, questions: [] }; groups.push(group); }
         group.questions.push(item);
       }
-      function interview(group, index, facts) {
+      function interviewRequest(group, index, facts) {
         const key = `human-r${rounds}-${index}`;
-        return collect(key, originalRequest(key, "human-relay", { agent: "pitako.interview-relay", context: "fresh", outputSchema: providerSchema,
+        return { key, ...originalRequest(key, "human-relay", { agent: "pitako.interview-relay", context: "fresh", outputSchema: providerSchema,
             ...presentation("architecture-human", `Round ${rounds} human frontier ${index + 1}`, `Relay this ENTIRE unblocked human frontier through native contact_supervisor interview_request NOW.
 Ask the foreground to present it to the actual human without waiting for unrelated research, wait for
 that actual human's response, and reply via subagent_supervisor with your request's replyTo.
@@ -713,36 +721,59 @@ MATERIAL CONTEXT (data): ${controlValue(doubtsResult).humanContext}
 SETTLED PREREQUISITE FACTS (data): ${JSON.stringify(facts.map(({ key, result }) => ({ key, originalId: delivered.get(result)?.id, humanContext: controlValue(result).humanContext })))}
 The relay has no file access. The frontier is self-contained; do not ask it to open originals.
 Return ready with the faithfully relayed human answers, or blocked with unanswered questions.`),
-        }, [])).then(result => ({ key, result }), error => ({ key, result: { ok: false, error: String(error) } }));
+        }, []) };
       }
-      // Submit ready questions before research can occupy the native launch slots.
-      // Do not defer this call through a resolved promise: submission order matters.
-      const interviews = groups.map((group, index) => group.dependsOn.length ? null : interview(group, index, []));
+      function answer(request) {
+        return collect(request.key, request).then(result => ({ key: request.key, result }),
+          error => ({ key: request.key, result: { ok: false, error: String(error) } }));
+      }
+      // Persist before launching, and submit ready questions before research can
+      // occupy native slots. No launch is deferred through a persistence promise.
+      const readyInterviews = groups.map((group, index) => group.dependsOn.length ? null : interviewRequest(group, index, []));
       const providers = doubts.filter(factual).map((item, index) => ({ item, key: `doubts-r${rounds}-${index}`, promise: null }));
-      function provide(provider) {
+      function providerRequest(provider) {
         const { item, key } = provider;
         // Undelivered sibling facts cannot gate an unrelated prerequisite group.
-        return provider.promise ??= collect(key, originalRequest(key, item.kind, {
+        return provider.request ??= { key, ...originalRequest(key, item.kind, {
           agent: `pitako.${item.kind}`, context: "fresh", outputSchema: providerSchema,
           ...presentation("architecture-factual", `Round ${rounds} ${item.kind} ${item.question}`, `${rules}\nAnswer this factual unknown, not a preference. Unknown: ${item.question}. Decision affected: ${item.decision}.
 COMPLETE DECISION: ${completeDecision}. Existing evidence and contrary claims: ${JSON.stringify(evidence)}
 Return sources, versions, limitations and contradictions. The script owns dispatch.`),
-        }, essentials().filter(original => original.delivery === "complete" || !providers.some(other => other.key === original.key))))
-          .then(result => ({ key, result }), error => ({ key, result: { ok: false, error: String(error) } }));
+        }, essentials().filter(original => original.delivery === "complete" || !providers.some(other => other.key === original.key))) };
+      }
+      function provide(provider) {
+        return provider.promise ??= answer(provider.request);
       }
       // Do not FIFO-queue unrelated facts ahead of a frontier that its prerequisites unlock.
       // Submit the relay, not its awaited human answer, before starting the next group.
       const pending = groups.map((group, index) => ({ group, index })).filter(({ group }) => group.dependsOn.length);
       const missing = group => providers.filter(provider => group.dependsOn.includes(provider.item.id) && !provider.promise).length;
+      pending.sort((left, right) => missing(left.group) - missing(right.group) || left.index - right.index);
+      const firstProviders = pending.length
+        ? providers.filter(provider => pending[0].group.dependsOn.includes(provider.item.id)) : providers;
+      // Commit the first launch wave together so a fast relay cannot prevent
+      // its factual siblings from starting between separate intention awaits.
+      await Promise.all([...readyInterviews.filter(Boolean), ...firstProviders.map(providerRequest)]
+        .map(request => intend([request])));
+      const interviews = readyInterviews.map(request => request ? answer(request) : null);
+      firstProviders.forEach(provide);
       while (pending.length) {
         // A smaller missing subset must not wait behind a larger prerequisite batch.
         pending.sort((left, right) => missing(left.group) - missing(right.group) || left.index - right.index);
         const { group, index } = pending.shift();
         const key = `human-r${rounds}-${index}`;
-        const facts = await Promise.all(providers.filter(provider => group.dependsOn.includes(provider.item.id)).map(provide));
-        interviews[index] = facts.some(({ result }) => !delivered.get(result)?.sufficient || controlValue(result)?.status !== "ready")
-          ? Promise.resolve({ key, withheld: group.questions, result: null }) : interview(group, index, facts);
+        const prerequisites = providers.filter(provider => group.dependsOn.includes(provider.item.id));
+        await Promise.all(prerequisites.filter(provider => !provider.promise).map(provider => intend([providerRequest(provider)])));
+        const facts = await Promise.all(prerequisites.map(provide));
+        if (facts.some(({ result }) => !delivered.get(result)?.sufficient || controlValue(result)?.status !== "ready")) {
+          interviews[index] = Promise.resolve({ key, withheld: group.questions, result: null });
+        } else {
+          const request = interviewRequest(group, index, facts);
+          await intend([request]);
+          interviews[index] = answer(request);
+        }
       }
+      await Promise.all(providers.filter(provider => !provider.promise).map(provider => intend([providerRequest(provider)])));
       const [answers, humanAnswers] = await Promise.all([
         Promise.all(providers.map(provide)), Promise.all(interviews),
       ]);
@@ -763,14 +794,16 @@ Return sources, versions, limitations and contradictions. The script owns dispat
     }
     control.stage = "evaluate";
     await save();
-    next = decision(await director(`${directorRole}
+    const evaluation = director(`${directorRole}
 Consumed rounds: ${rounds}/${maxRounds}. Rounds with all reports ready: ${validRounds}.
 ROUND INDEX AND UNANSWERED DOUBTS (originals supplied once by reference):\n${JSON.stringify(evidence)}
 STEERING RECEIPTS:\n${JSON.stringify(steering)}
 Receipts do not prove the model followed steering. Missed delivery requires no blind retry.
 Evaluate report adequacy, agreements and decision-changing disagreements.
 ${control.factualRetry ? "This is an authorized selective factual retry, not another comparison. Reconcile the retained sufficient providers and new factual answer. Return finish or blocked only; do not request discuss." : rounds === maxRounds ? "The round limit is reached: return finish with explicit unresolved disagreements, or blocked. Do not request discuss." : "Return discuss only if another round can materially change the recommendation. Otherwise finish."}`,
-    `director-after-r${rounds}`, "architecture-evaluate", `Round ${rounds} architecture evaluation`));
+    `director-after-r${rounds}`, "architecture-evaluate", `Round ${rounds} architecture evaluation`);
+    await intend([evaluation]);
+    next = decision(await collect(evaluation.key, evaluation));
     if (control.factualRetry && next.action === "discuss") throw new Error("A selective factual retry cannot start another comparison round.");
     control.next = next;
     control.round = null;
