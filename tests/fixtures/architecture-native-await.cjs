@@ -65,8 +65,6 @@ async function main() {
             if (key.startsWith("director-doubts-")) value = {
               doubts: [
                 { id: "fact", kind: "scout", dependsOn: [], question: "Local seam?", decision: "Reuse" },
-                { id: "ready", kind: "human", dependsOn: [], question: "Prefer scope A?", decision: "Scope" },
-                { id: "dependent", kind: "human", dependsOn: ["fact"], question: "Reuse this seam?", decision: "Reuse" },
               ],
               humanContext: "Controlled factual and human questions",
             };
@@ -107,8 +105,7 @@ async function main() {
         assert.equal(outcome.validRounds, 2);
         assert.deepEqual(steered, ["r2-recovery"]);
         for (const round of [1, 2]) {
-          assert(calls.indexOf(`human-r${round}-0`) < calls.indexOf(`doubts-r${round}-0`));
-          assert(calls.indexOf(`doubts-r${round}-0`) < calls.indexOf(`human-r${round}-1`));
+          assert(calls.indexOf(`doubts-r${round}-0`) < calls.indexOf(`director-after-r${round}`));
           assert(calls.includes(`director-after-r${round}`));
         }
         const retained = storage.get("architecture-await-regression");

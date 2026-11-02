@@ -2,9 +2,6 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createChildSafeState } from "../node_modules/pi-subagents/src/extension/fanout-child.js";
-import { createNativeSupervisorChannel, registerNativeSupervisorClient } from "../node_modules/pi-subagents/src/intercom/native-supervisor-channel.js";
 import { runWorkflowScript, validateWorkflowScript, type WorkflowScriptChildResult } from "../node_modules/pi-subagents/src/workflows/scripted-workflow.js";
 import { normalizeWorkflowArgs } from "../node_modules/pi-subagents/src/workflows/workflow-resources.js";
 import type { WorkflowTerminalOutcome } from "../node_modules/pi-subagents/src/shared/types.js";
@@ -103,7 +100,8 @@ interface DecisionRecord { id: string; content: string; provenance: string }
 interface DecisionSnapshot { version: number; brief: string; constraints: string[]; obligations: DecisionRecord[]; humanDecisions: DecisionRecord[]; provenance: string }
 interface Continuation { version: number; consultation: string }
 interface Outcome {
-  status: "completed" | "blocked" | "failed";
+  status: "completed" | "blocked" | "failed" | "needs-human";
+  frontier?: { consultation: string; revision: number; round: number; humanContext: string; questions: { id: string; question: string; decision: string; recommendation?: string; dependsOn: string[]; prerequisiteFacts: { id: string; humanContext: string }[] }[] };
   memo?: string;
   error?: string;
   rounds: number;
@@ -141,6 +139,7 @@ function fixture(
   steer: (key: string) => { state: string } | Promise<{ state: string }> = () => ({ state: "missed" }),
   beforeWrite: (value: DurableConsultation) => void = () => {},
   afterWrite: (value: DurableConsultation) => void = () => {},
+  clock: Pick<typeof Date, "now"> = Date,
 ) {
   const calls: { key: string; request: Request }[] = [];
   const batches: Request[][] = [];
@@ -171,12 +170,14 @@ function fixture(
   };
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor as new (
     ...parameters: string[]
-  ) => (args: unknown, runner: typeof runs, state?: unknown) => Promise<Outcome>;
+  ) => (args: unknown, runner: typeof runs, state?: unknown, clock?: Pick<typeof Date, "now">) => Promise<Outcome>;
   const privateState = new Map<string, unknown>();
   const stateFile = path.join(originalsRoot, `mission-${++publicationSequence}.json`);
   const stateWrites: { bytes: number; persisted: boolean }[] = [];
-  const execute = (args: unknown = { currentDecision: snapshot("Choose a complete persistence design") }, storage: Map<string, unknown> = privateState) =>
-    new AsyncFunction("args", "runs", "state", source)({ consultation: "decision", workDescription: "Choose persistence architecture", ...(args as object) }, runs, storage && {
+  const execute = async (args: unknown = { currentDecision: snapshot("Choose a complete persistence design") }, storage: Map<string, unknown> = privateState) => {
+    const normalized = normalizeWorkflowArgs(JSON.parse(JSON.stringify(args)));
+    if ("error" in normalized && (args as Record<string, unknown>).humanAnswers !== undefined) throw new Error(normalized.error);
+    return new AsyncFunction("args", "runs", "state", "Date", source)({ consultation: "decision", workDescription: "Choose persistence architecture", ...(args as object) }, runs, storage && {
       get: async (key: string) => structuredClone(storage.get(key)),
       set: async (key: string, value: unknown) => {
         const merged = { mission: "owned-test-mission", state: { ...Object.fromEntries(storage), [key]: value } };
@@ -190,12 +191,13 @@ function fixture(
         write.persisted = true;
         afterWrite(value as DurableConsultation);
       },
-    });
+    }, clock);
+  };
   return { execute, calls, batches, steered, storage: privateState, stateWrites, stateFile };
 }
 
 describe("architecture dynamic perspective roles", () => {
-  const ids = ["scout", "researcher", "evidence-auditor", "human-relay"];
+  const ids = ["scout", "researcher", "evidence-auditor", "preferences"];
   const roster = ids.map(id => ({ id, label: id + " perspective", focus: "Compare the whole decision" }));
   const decision = { ...discuss, perspectives: roster };
   const continuation = { version: 2, consultation: "decision" };
@@ -286,14 +288,14 @@ describe("architecture scripted workflow", () => {
         : key.startsWith("director-after-") ? "architecture-evaluate"
         : key.startsWith("director-doubts-") ? "architecture-doubts"
         : key.startsWith("doubts-") ? "architecture-factual"
-        : key.startsWith("human-") ? "architecture-human" : "architecture-perspective";
+        : "architecture-perspective";
       expect(request.phase).toBe(expected);
       if (key.startsWith("r")) expect(title).toContain(key.startsWith("r1-") ? "Round 1" : "Round 2");
       if (key.startsWith("director-doubts-")) return { ...child(key), structuredOutput: { doubts: [
         { id: "fact", kind: "scout", dependsOn: [], question: "Local contract?", decision: "Reuse" },
         { id: "external", kind: "researcher", dependsOn: [], question: "External contract?", decision: "Reuse" },
         { id: "conflict", kind: "evidence-auditor", dependsOn: [], question: "Contradictory claims?", decision: "Reuse" },
-        { id: "human", kind: "human", dependsOn: ["fact"], question: "Prefer reuse (recommended)?", decision: "Scope" },
+        { id: "human", kind: "deliberation", dependsOn: [], question: "Prefer reuse (recommended)?", decision: "Scope" },
       ] } };
       return child(key, key === "director-after-r1" ? discuss : finish);
     });
@@ -301,7 +303,7 @@ describe("architecture scripted workflow", () => {
       currentDecision: snapshot("ADMINISTRATIVE PREAMBLE: whole current problem") });
     expect(result.status).toBe("completed");
     expect(result.rounds).toBe(2);
-    for (const phase of ["architecture-prepare", "architecture-evaluate", "architecture-doubts", "architecture-perspective", "architecture-factual", "architecture-human"])
+    for (const phase of ["architecture-prepare", "architecture-evaluate", "architecture-doubts", "architecture-perspective", "architecture-factual"])
       expect(host.calls.some(call => call.request.phase === phase)).toBe(true);
     expect(host.calls.find(call => call.key === "director-prepare")?.request.context).toBe("fresh");
     expect(host.calls.find(call => call.key === "director-after-r1")?.request.resume).toBe("native-director-doubts-r1");
@@ -617,7 +619,7 @@ describe("architecture current complete decision", () => {
       if (key === "director-prepare") return { ...child(key), structuredOutput: { ...discuss, perspectives: [perspectives[0], { id: "new", label: "New view", focus: "Same whole problem" }] } };
       if (key.startsWith("director-doubts-")) return { ...child(key), structuredOutput: { doubts: [
         { id: "fact", kind: "researcher", dependsOn: [], question: "Contrary evidence?", decision: "Mechanism B" },
-        { id: "human", kind: "human", dependsOn: [], question: "Keep scope (recommended)?", decision: "Scope" },
+        { id: "human", kind: "deliberation", dependsOn: [], question: "Keep scope (recommended)?", decision: "Scope" },
       ] } };
       return child(key);
     });
@@ -625,7 +627,7 @@ describe("architecture current complete decision", () => {
     expect(result).toMatchObject({ status: "completed", rounds: 2 });
     expect(host.calls.find(call => call.key === "r2-simple")?.request.resume).toBe("native-r1-simple");
     expect(host.calls.find(call => call.key === "r2-new")?.request.context).toBe("fresh");
-    expect(host.calls.some(call => call.key.startsWith("human-"))).toBe(planning);
+    expect(host.calls.some(call => call.request.agent !== undefined && call.request.agent !== "pitako.architect" && call.request.phase !== "architecture-factual")).toBe(false);
     expect(host.calls.some(call => call.key.startsWith("doubts-"))).toBe(planning);
     expect(storage.get("architecture-current")).toMatchObject({ currentDecision: { revision: 2 }, decisionHistory: [{ revision: 1 }] });
     const resumed = fixture((key, request) => {
@@ -793,11 +795,11 @@ describe("planning architecture evidence and doubts", () => {
   test("human doubts return to foreground without asking a child to approve, then continue the same retained counter", async () => {
     const storage = new Map<string, unknown>();
     const first = fixture(key => key.startsWith("director-doubts-") ? { ok: true, runId: `native-${key}`, structuredOutput: { doubts: [
-      { id: "scope", dependsOn: [], kind: "human", question: "Prefer scope A?", decision: "Scope boundary" },
-    ] } } : key.startsWith("human-") ? { ok: true, runId: key, structuredOutput: { status: "blocked", report: "Prefer scope A? Awaiting actual human answer." } } : child(key));
+      { id: "scope", dependsOn: [], kind: "human", question: "Prefer scope A?", decision: "Scope boundary", recommendation: "Use scope A" },
+    ] } } : child(key));
     const blocked = await first.execute({ currentDecision: snapshot("Decision"), planning: true, consultation: "same", maxRounds: 2 }, storage);
-    expect(blocked.status).toBe("blocked"); expect(blocked.memo).toContain("unanswered"); expect(blocked.rounds).toBe(1);
-    expect(first.calls.find(call => call.key.startsWith("human-"))?.request.task).toContain("Prefer scope A?");
+    expect(blocked.status).toBe("needs-human"); expect(blocked.rounds).toBe(1);
+    expect(blocked.frontier?.questions[0]?.question).toBe("Prefer scope A?");
     expect(first.calls.some(call => call.key.startsWith("doubts-"))).toBe(false);
     const resumed = fixture(key => key.startsWith("director-doubts-") ? { ok: true, runId: key, structuredOutput: { doubts: [] } } : child(key));
     const done = await resumed.execute({ replacement: replacement("same", 1, snapshot("Decision; Actual human answered A", { humanDecisions: [{ id: "scope", content: "A", provenance: "Actual foreground human answer" }] })), planning: true, consultation: "same", continuation: blocked.continuation }, storage);
@@ -824,346 +826,7 @@ describe("planning architecture evidence and doubts", () => {
   });
 });
 
-// Controlled model boundary: drive the packaged relay's sole tool through a private
-// native supervisor channel. No model/provider, detached runner, or host UI is used.
-function supervisorRelay() {
-  const root = mkdtempSync(path.join(tmpdir(), "pitako-architecture-interview-"));
-  type Tool = { name: string; execute: (id: string, params: Record<string, unknown>) => Promise<{ content: { text?: string }[] }> };
-  const tools = new Map<string, Tool>();
-  const notices: { details: { requestId: string; requestBody: string } }[] = [];
-  const first = deferred<void>(), second = deferred<void>();
-  const api = { registerTool: (tool: Tool) => { tools.set(tool.name, tool); },
-    getAllTools: () => [...tools.values()], on: () => {}, events: { on: () => () => {}, emit: () => {} } } as unknown as ExtensionAPI;
-  const state = createChildSafeState(); state.supervisorOwnerSessionId = "owned-planning-parent";
-  const channel = createNativeSupervisorChannel(api, state, { getChannelDirs: () => ({ dirs: [root] }),
-    parentWake: { sendMessage: message => {
-      notices.push(message as unknown as typeof notices[number]);
-      (notices.length === 1 ? first : second).resolve();
-      return true;
-    } } });
-  channel.start();
-  return { notices, first: first.promise, second: second.promise,
-    launch(key: string, request: Request): Promise<Result> {
-      const questions = JSON.parse(request.task.match(/FRONTIER \(data\): (.+)\n/)![1]!);
-      let contact!: Tool;
-      registerNativeSupervisorClient({ registerTool: (tool: Tool) => { contact = tool; }, getAllTools: () => [] } as unknown as ExtensionAPI,
-        { channelDir: root, runId: key, agent: "pitako.interview-relay", childIndex: 0, orchestratorSessionId: "owned-planning-parent" });
-      const reply = contact.execute(key, {
-        reason: "interview_request", message: JSON.stringify(questions), interview: { title: "Planning decisions", questions },
-      });
-      channel.activateTransport();
-      return reply.then(value => ({ ok: true, runId: `native-${key}`, structuredOutput: {
-        status: "ready", report: value.content.map(item => item.text ?? "").join("\n"),
-      } }));
-    },
-    reply: (requestId: string) => tools.get("subagent_supervisor")!.execute("human-reply", {
-      action: "reply", replyTo: requestId, message: "Actual human answered: yes to the recommended scope.",
-    }),
-    dispose: () => { channel.dispose(); rmSync(root, { recursive: true, force: true }); },
-  };
-}
-
 describe("architecture foreground human frontier", () => {
-  test.each(["unrelated-provider", "prerequisite-provider", "human", "dispatch"])("retains available native %s failure evidence and settles every frontier child", async failure => {
-    const storage = new Map<string, unknown>(), started = new Set<string>();
-    const entered = deferred<void>(), human = deferred<void>(), research = deferred<void>(), researchSettled = deferred<void>();
-    const failedKey = failure === "human" ? "human-r1-1" : failure === "prerequisite-provider" ? "doubts-r1-0" : "doubts-r1-1";
-    const pointers = { runId: `native-${failedKey}`, artifactPaths: ["/native/failed/report.json"],
-      outputReference: "/native/failed/report.md", asyncDir: "/native/failed" };
-    const failedReport = "Contrary evidence survives the infrastructure failure";
-    const infrastructureError = "Controlled child infrastructure failure";
-    let finished = false;
-    const work = nativeScript({
-      script: source, args: { workDescription: "Choose persistence architecture", currentDecision: snapshot("Complete decision"), planning: true, consultation: "native-failure", maxRounds: 1 },
-      state: { get: key => storage.get(key), set: (key, value) => { storage.set(key, structuredClone(value)); } },
-      launch: async key => {
-        if (key.startsWith("director-doubts-")) return { key, ok: true, runId: key, output: "", artifactPaths: [], structuredOutput: { doubts: [
-          { id: "needed", kind: "scout", dependsOn: [], question: "Local seam?", decision: "Reuse" },
-          { id: "external", kind: "researcher", dependsOn: [], question: "External contract?", decision: "Adapter" },
-          { id: "other", kind: "researcher", dependsOn: [], question: "Other evidence?", decision: "Other" },
-          { id: "scope", kind: "human", dependsOn: [], question: "Prefer scope A (recommended)?", decision: "Scope" },
-          { id: "dependent", kind: "human", dependsOn: ["needed"], question: "Reuse seam (recommended)?", decision: "Reuse" },
-        ] } };
-        if (key.startsWith("human-") || key.startsWith("doubts-")) {
-          started.add(key);
-          if (["human-r1-0", "doubts-r1-2", failedKey, ...(failure === "prerequisite-provider" ? [] : ["human-r1-1"])].every(key => started.has(key))) entered.resolve();
-          if (key === failedKey) {
-            if (failure === "dispatch") throw new Error(infrastructureError); // No child identity exists.
-            return { key, ok: false, ...pointers, output: "Native failure output", error: infrastructureError,
-              structuredOutput: { status: "blocked", report: failedReport } };
-          }
-          if (key.startsWith("human-")) await human.promise;
-          if (key === "doubts-r1-2") { await research.promise; researchSettled.resolve(); }
-        }
-        return { key, ...child(key), output: "", artifactPaths: [] };
-      },
-      status: async () => { throw new Error("Unexpected status fallback"); },
-    }).then(result => { finished = true; return result; });
-    try {
-      await Promise.race([entered.promise, work.then(() => { throw new Error("Workflow ended before sibling dispatch"); })]);
-      expect(finished).toBe(false);
-      research.resolve();
-      await researchSettled.promise;
-      expect(finished).toBe(false); // Independent (and, when unblocked, dependent) human answers remain pending.
-    } finally {
-      research.resolve(); human.resolve(); await work;
-    }
-    expect((await work).value).toMatchObject({ status: failure === "human" ? "blocked" : "failed", rounds: 1, validRounds: 1 });
-    const retained = structuredClone(storage.get("architecture-native-failure")) as { evidence: { key?: string }[] };
-    expect(retained).toMatchObject({ rounds: 1, validRounds: 1, maxRounds: 1 });
-    const failed = retained.evidence.find(item => item.key === failedKey);
-    expect(failed).toMatchObject({ key: failedKey, diagnostic: expect.stringContaining(infrastructureError) });
-    const original = (retained as unknown as { originals: Original[] }).originals.find(item => item.key === failedKey);
-    if (failure !== "dispatch") {
-      expect(original).toMatchObject({ sufficient: false, publication: "published", runId: pointers.runId });
-      expect(originalValue(original!)).toMatchObject({ status: "blocked", report: failedReport });
-    }
-    if (failure === "dispatch") {
-      for (const field of ["runId", "outputReference", "asyncDir"]) expect(failed).not.toHaveProperty(field);
-    }
-    if (failure === "prerequisite-provider") {
-      expect(started.has("human-r1-1")).toBe(false);
-      expect(structuredClone(storage.get("architecture-native-failure"))).toMatchObject({ evidence: expect.arrayContaining([
-        expect.objectContaining({ key: "human-r1-1", withheld: expect.arrayContaining([expect.objectContaining({ id: "dependent" })]) }),
-      ]) });
-    }
-    const resumed = fixture((key, request) => {
-      expect(key).toBe("director-prepare"); expect(request.resume).toBe("director-doubts-r1");
-      for (const value of failure === "dispatch" ? [infrastructureError] : [failedReport, infrastructureError, pointers.runId, pointers.asyncDir, ...pointers.artifactPaths]) expect(evidenceText(request)).toContain(value);
-      expect(request.task).toContain("Consumed rounds: 1/1"); expect(request.task).toContain("finish or blocked only");
-      return { ...child(key), structuredOutput: finish };
-    });
-    const reentry = { evidence: "Actual human answered; reconcile failure", planning: true, consultation: "native-failure", continuation: ((await work).value as unknown as Outcome).continuation };
-    if (failure === "dispatch") {
-      await expect(resumed.execute(reentry, storage)).rejects.toThrow("Unconfirmed architecture dispatch boundary");
-      expect(resumed.calls).toHaveLength(0);
-    } else {
-      expect(await resumed.execute(reentry, storage)).toMatchObject({ status: failure === "human" ? "completed" : "failed", rounds: 1, validRounds: 1 });
-      expect(resumed.calls).toHaveLength(failure === "human" ? 1 : 0);
-    }
-  });
-
-  test("an overlapping smaller frontier is relayed before a larger prerequisite batch, without awaiting its human answer", async () => {
-    const first = deferred<void>(), entered = deferred<void>(), next = deferred<string>(), later = deferred<void>();
-    const human = deferred<void>(), facts = deferred<void>();
-    const started: string[] = [], storage = new Map<string, unknown>();
-    let firstSettled = false;
-    const work = nativeScript({
-      script: source, args: { workDescription: "Choose persistence architecture", currentDecision: snapshot("Decision"), planning: true, consultation: "overlap" }, globalConcurrencyLimit: 2,
-      state: { get: key => storage.get(key), set: (key, value) => { storage.set(key, structuredClone(value)); } },
-      launch: async (key, request) => {
-        let result: Result;
-        if (key.startsWith("director-doubts-")) result = { ok: true, runId: key, structuredOutput: { doubts: [
-          ...["a", "b", "c", "unrelated"].map(id => ({ id, kind: "scout", dependsOn: [], question: `Fact ${id}?`, decision: "Design" })),
-          { id: "large", kind: "human", dependsOn: ["a", "b", "c"], question: "Use all facts (recommended)?", decision: "Design" },
-          { id: "small", kind: "human", dependsOn: ["a"], question: "Accept A (recommended)?", decision: "Design" },
-        ] } };
-        else {
-          if (key.startsWith("doubts-") || key.startsWith("human-")) {
-            started.push(key);
-            if (key === "doubts-r1-0") { entered.resolve(); await first.promise; }
-            else {
-              if (firstSettled) next.resolve(key);
-              if (key.startsWith("human-")) {
-                expect(request.task).toContain("Brief factual frontier from doubts-r1-0");
-                expect(request.task).not.toContain("Private report from doubts-r1-0");
-                await human.promise;
-              } else {
-                later.resolve(); await facts.promise;
-              }
-            }
-          }
-          result = child(key);
-        }
-        return { key, ...result, output: "", artifactPaths: [] };
-      },
-      status: async () => { throw new Error("Unexpected status fallback"); },
-    });
-    try {
-      await entered.promise; firstSettled = true; first.resolve();
-      expect(await Promise.race([next.promise, work.then(() => "ended")])).toBe("human-r1-1");
-      await Promise.race([later.promise, work.then(() => { throw new Error("Research waited for the human answer"); })]);
-    } finally {
-      first.resolve(); human.resolve(); facts.resolve(); await work;
-    }
-    expect((await work).value).toMatchObject({ status: "completed" });
-    expect(started.indexOf("human-r1-1")).toBeLessThan(started.indexOf("doubts-r1-1"));
-    expect(started.indexOf("human-r1-0")).toBeLessThan(started.indexOf("doubts-r1-3"));
-    expect(started.filter(key => key === "doubts-r1-0")).toHaveLength(1);
-  });
-
-  test.each([1, 2])("newly answerable frontiers precede unrelated FIFO research with %s prerequisite groups", async groupCount => {
-    const scout = deferred<void>(), entered = deferred<void>(), next = deferred<string>();
-    const human = deferred<void>(), research = deferred<void>(), researchBoth = deferred<void>();
-    const started: string[] = [], storage = new Map<string, unknown>();
-    const work = nativeScript({
-      script: source, args: { workDescription: "Choose persistence architecture", currentDecision: snapshot("Decision"), planning: true, consultation: "dependent-capacity" },
-      globalConcurrencyLimit: 2,
-      state: { get: key => storage.get(key), set: (key, value) => { storage.set(key, structuredClone(value)); } },
-      launch: async (key, request) => {
-        let result: Result;
-        if (key.startsWith("director-doubts-")) result = { ok: true, runId: key, structuredOutput: { doubts: [
-          { id: "needed", kind: "scout", dependsOn: [], question: "Local seam?", decision: "Reuse" },
-          { id: "a", kind: "researcher", dependsOn: [], question: "Unrelated A?", decision: "Other" },
-          { id: "b", kind: "researcher", dependsOn: [], question: "Unrelated B?", decision: "Other" },
-          { id: "scope", kind: "human", dependsOn: ["needed"], question: "Reuse seam (recommended)?", decision: "Reuse" },
-          ...(groupCount === 2 ? [
-            { id: "later", kind: "scout", dependsOn: [], question: "Other prerequisite?", decision: "Adapter" },
-            { id: "adapter", kind: "human", dependsOn: ["needed", "later"], question: "Use adapter (recommended)?", decision: "Adapter" },
-          ] : []),
-        ] } };
-        else {
-          if (key.startsWith("doubts-") || key.startsWith("human-")) {
-            started.push(key);
-            if (key === "doubts-r1-0") { entered.resolve(); await scout.promise; }
-            else {
-              if (started.includes("doubts-r1-0") && key !== "doubts-r1-1") next.resolve(key);
-              if (key === "doubts-r1-3") expect(started).toContain("human-r1-0");
-              if (key.startsWith("human-")) {
-                expect(request.task).toContain("SETTLED PREREQUISITE FACTS");
-                await human.promise;
-              } else if (key !== "doubts-r1-3") {
-                if (started.includes("doubts-r1-1") && started.includes("doubts-r1-2")) researchBoth.resolve();
-                await research.promise;
-              }
-            }
-          }
-          result = child(key);
-        }
-        return { key, ...result, output: "", artifactPaths: [] };
-      },
-      status: async () => { throw new Error("Unexpected status fallback"); },
-    });
-    try {
-      await entered.promise;
-      expect(started).not.toContain("human-r1-0");
-      scout.resolve();
-      expect(await Promise.race([next.promise, work.then(() => "ended")])).toBe("human-r1-0");
-      human.resolve();
-      await Promise.race([researchBoth.promise, work.then(() => { throw new Error("Independent research never overlapped"); })]);
-    } finally {
-      scout.resolve(); human.resolve(); research.resolve(); await work;
-    }
-    expect((await work).value).toMatchObject({ status: "completed" });
-    expect(started.filter(key => key === "doubts-r1-0")).toHaveLength(1);
-    expect(started.indexOf("human-r1-0")).toBeLessThan(started.indexOf("doubts-r1-2"));
-    if (groupCount === 2) expect(started.indexOf("human-r1-1")).toBeLessThan(started.indexOf("doubts-r1-1"));
-  });
-
-  test.each([false, true])("delivers a real native interview before unrelated research settles (research fails=%s)", async fails => {
-    const relay = supervisorRelay(), research = deferred<Result>();
-    const host = fixture((key, request) => {
-      if (key.startsWith("director-doubts-")) return { ok: true, runId: key, structuredOutput: { doubts: [
-        { id: "facts", kind: "researcher", dependsOn: [], question: "Which external API exists?", decision: "Adapter" },
-        { id: "scope", kind: "human", dependsOn: [], question: "Prefer scope A (recommended)?", decision: "Scope" },
-        { id: "dependent", kind: "human", dependsOn: ["facts"], question: "Use the supported adapter (recommended)?", decision: "Adapter" },
-      ] } };
-      if (key.startsWith("doubts-")) return research.promise;
-      if (key.startsWith("human-")) return relay.launch(key, request);
-      return child(key);
-    });
-    const storage = new Map<string, unknown>();
-    let finished = false;
-    const work = host.execute({ currentDecision: snapshot("Complete decision"), planning: true, consultation: "frontier" }, storage).then(value => { finished = true; return value; });
-    let result!: Outcome;
-    try {
-      await Promise.race([relay.first, work.then(() => { throw new Error("Workflow ended before the foreground interview"); })]);
-      expect(finished).toBe(false);
-      expect(relay.notices[0]!.details.requestBody).toContain('"scope"');
-      expect(relay.notices[0]!.details.requestBody).not.toContain('"dependent"');
-      expect(host.calls.filter(call => call.key.startsWith("human-"))).toHaveLength(1);
-      await relay.reply(relay.notices[0]!.details.requestId);
-      research.resolve(fails ? { ok: false, runId: "failed-research" } : child("facts"));
-      if (!fails) { await relay.second; await relay.reply(relay.notices[1]!.details.requestId); }
-      result = await work;
-      expect(result.status).toBe(fails ? "failed" : "completed");
-      expect(relay.notices).toHaveLength(fails ? 1 : 2);
-      expect(JSON.stringify(storage.get("architecture-frontier"))).toContain("native-human-r1-0");
-      if (fails) expect(JSON.stringify(storage.get("architecture-frontier"))).toContain("failed-research");
-    } finally {
-      research.resolve({ ok: false, runId: "cleanup-research" });
-      for (const notice of relay.notices) { try { await relay.reply(notice.details.requestId); } catch {} }
-      await work;
-      relay.dispose();
-    }
-  });
-
-  test("submits the ready human frontier before factual work occupies two launch slots", async () => {
-    const release = deferred<void>(), occupied = deferred<void>();
-    const started: string[] = [], storage = new Map<string, unknown>();
-    const work = nativeScript({
-      script: source, args: { workDescription: "Choose persistence architecture", currentDecision: snapshot("Decision"), planning: true, consultation: "launch-priority" },
-      globalConcurrencyLimit: 2,
-      state: { get: key => storage.get(key), set: (key, value) => { storage.set(key, structuredClone(value)); } },
-      launch: async key => {
-        let result: Result;
-        if (key.startsWith("director-doubts-")) result = { ok: true, runId: key, structuredOutput: { doubts: [
-          { id: "first", kind: "scout", dependsOn: [], question: "First local fact?", decision: "Reuse" },
-          { id: "second", kind: "researcher", dependsOn: [], question: "Second external fact?", decision: "Adapter" },
-          { id: "scope", kind: "human", dependsOn: [], question: "Prefer scope A (recommended)?", decision: "Scope" },
-        ] } };
-        else {
-          if (key.startsWith("human-") || key.startsWith("doubts-")) {
-            started.push(key);
-            if (started.length === 2) occupied.resolve();
-            await release.promise;
-          }
-          result = child(key);
-        }
-        return { key, ...result, output: "", artifactPaths: [] };
-      },
-      status: async () => { throw new Error("Unexpected status fallback"); },
-    });
-    try {
-      await Promise.race([occupied.promise, work.then(() => { throw new Error("Workflow ended before the launch slots were occupied"); })]);
-      expect(started.slice(0, 2)).toContain("human-r1-0");
-    } finally {
-      release.resolve();
-      await work;
-    }
-  });
-
-  test.each(["pending", "failed"])("a dependent frontier waits only for its named facts, not %s unrelated providers", async mode => {
-    const relay = supervisorRelay(), prerequisite = deferred<Result>(), unrelated = deferred<Result>();
-    const storage = new Map<string, unknown>();
-    const host = fixture((key, request) => {
-      if (key.startsWith("director-doubts-")) return { ok: true, runId: key, structuredOutput: { doubts: [
-        { id: "other", kind: "researcher", dependsOn: [], question: "Unrelated external fact?", decision: "Other" },
-        { id: "needed", kind: "scout", dependsOn: [], question: "Local seam?", decision: "Reuse" },
-        ...(mode === "failed" ? [{ id: "other-choice", kind: "human", dependsOn: ["other"], question: "Use external option?", decision: "Other" }] : []),
-        { id: "scope", kind: "human", dependsOn: ["needed"], question: "Reuse seam (recommended)?", decision: "Reuse" },
-      ] } };
-      if (key === "doubts-r1-1") { prerequisite.resolve(child("needed")); return prerequisite.promise; }
-      if (key === "doubts-r1-0") return mode === "failed"
-        ? { ok: false, runId: "native-missing-other", error: "Unrelated fact failed without original", raw: true } : unrelated.promise;
-      if (key.startsWith("human-")) return relay.launch(key, request);
-      return child(key);
-    });
-    let finished = false;
-    const work = host.execute({ currentDecision: snapshot("Decision"), planning: true, consultation: "dependent" }, storage).then(value => { finished = true; return value; });
-    try {
-      await Promise.race([relay.first, work.then(() => { throw new Error("Interview was hidden by unrelated work"); })]);
-      expect(finished).toBe(false); expect(relay.notices[0]!.details.requestBody).toContain('"scope"');
-      await relay.reply(relay.notices[0]!.details.requestId);
-    } finally {
-      unrelated.resolve(child("other"));
-      for (const notice of relay.notices) { try { await relay.reply(notice.details.requestId); } catch {} }
-      await work; relay.dispose();
-    }
-    if (mode === "failed") {
-      const retained = storage.get("architecture-dependent") as { originals: Original[]; evidence: unknown[] };
-      expect(retained.originals.find(item => item.key === "doubts-r1-0")).toMatchObject({
-        sufficient: false, delivery: "not-delivered", diagnostic: expect.stringContaining("Unrelated fact failed without original"),
-      });
-      expect(retained.originals.find(item => item.key === "doubts-r1-1")).toMatchObject({ sufficient: true });
-      expect(retained.evidence).toContainEqual(expect.objectContaining({
-        key: "human-r1-0", withheld: [expect.objectContaining({ id: "other-choice" })],
-      }));
-      expect(host.calls.some(call => call.key === "human-r1-0")).toBe(false);
-      expect(relay.notices).toHaveLength(1);
-    }
-  });
-
   test("fresh continuation research receives original context, updated human choices and contrary reports", async () => {
     const storage = new Map<string, unknown>();
     const retained = await fixture(key => key.startsWith("director-doubts-") ? { ...child(key), structuredOutput: { doubts: [] } } : child(key)).execute({ currentDecision: snapshot("Original complete assignment"), planning: true, consultation: "updated" }, storage);
@@ -1227,14 +890,14 @@ describe("architecture foreground human frontier", () => {
       .toContain(`r1-${view.id}:` + "x".repeat(4090));
   });
 
-  test("rejects unknown or nonfactual prerequisites before dispatching any providers or relay", async () => {
+  test("rejects unknown or nonfactual prerequisites before dispatching any providers", async () => {
     for (const dependsOn of [["missing"], ["scope"]]) {
       const host = fixture(key => key.startsWith("director-doubts-") ? { ok: true, runId: key, structuredOutput: { doubts: [
-        { id: "scope", kind: "human", dependsOn, question: "Scope A?", decision: "Scope" },
+        { id: "scope", kind: "deliberation", dependsOn, question: "Scope A?", decision: "Scope" },
       ] } } : child(key));
       const result = await host.execute({ currentDecision: snapshot("Decision"), planning: true, consultation: "invalid" }, new Map());
       expect(result.status).toBe("failed"); expect(result.error).toContain("dependencies");
-      expect(host.calls.some(call => call.key.startsWith("human-") || call.key.startsWith("doubts-"))).toBe(false);
+      expect(host.calls.some(call => call.request.phase === "architecture-factual")).toBe(false);
     }
   });
 });
@@ -1383,11 +1046,11 @@ describe("architecture recoverable originals", () => {
   });
 
   for (const control of ["stopped", "child-stopped", "recovery", "top-timeout"]) {
-  test.each(["director-prepare", "r1-simple", "director-doubts-r1", "doubts-r1-0", "human-r1-0", "director-after-r1"])(`honors native ${control} at %s rather than advancing or hiding the barrier`, async failedKey => {
+  test.each(["director-prepare", "r1-simple", "director-doubts-r1", "doubts-r1-0", "director-after-r1"])(`honors native ${control} at %s rather than advancing or hiding the barrier`, async failedKey => {
     const host = fixture((key, request) => {
       const value = key.startsWith("director-doubts-") ? { ...child(key), structuredOutput: { doubts: [
         { id: "fact", kind: "scout", dependsOn: [], question: "Local seam?", decision: "Reuse" },
-        { id: "human", kind: "human", dependsOn: [], question: "Reuse (recommended)?", decision: "Scope" },
+        { id: "human", kind: "deliberation", dependsOn: [], question: "Reuse (recommended)?", decision: "Scope" },
       ] } } : child(key);
       if (key !== failedKey) return value;
       const result = published(value, request);
@@ -1646,11 +1309,11 @@ describe("architecture durable dispatch boundaries", () => {
   function planningChild(key: string) {
     if (key === "director-doubts-r1") return { ...child(key), structuredOutput: { doubts: [
       { id: "fact", kind: "scout", dependsOn: [], question: "Which local contract applies?", decision: "Reuse" },
-      { id: "human", kind: "human", dependsOn: [], question: "Prefer reuse?", decision: "Scope" },
+      { id: "human", kind: "deliberation", dependsOn: [], question: "Prefer reuse?", decision: "Scope" },
     ] } };
     return child(key);
   }
-  test.each(["director-prepare", "r1-simple", "r1-recover", "director-doubts-r1", "doubts-r1-0", "human-r1-0", "director-after-r1"])
+  test.each(["director-prepare", "r1-simple", "r1-recover", "director-doubts-r1", "doubts-r1-0", "director-after-r1"])
     ("persists %s intention before dispatch and blocks reentry if its terminal save fails", async key => {
       let failures = 0;
       const host = fixture((producer, request) => {
@@ -1677,7 +1340,7 @@ describe("architecture durable dispatch boundaries", () => {
       expect(resumed.calls).toHaveLength(0);
     });
 
-  test.each(["director-prepare", "r1-simple", "director-doubts-r1", "doubts-r1-0", "human-r1-0", "director-after-r1"])
+  test.each(["director-prepare", "r1-simple", "director-doubts-r1", "doubts-r1-0", "director-after-r1"])
     ("does not launch %s when its intention cannot be persisted", async key => {
       let failures = 0;
       const host = fixture(planningChild, undefined, value => {
@@ -1742,14 +1405,18 @@ describe("architecture durable dispatch boundaries", () => {
 
   test("waits started siblings and retains long unsaved evidence plus permission and persistence diagnostics without another write", async () => {
     const sibling = deferred<Result>(); const started = deferred<void>();
-    const publicationFailure = "Unsaved relay evidence: " + "mandatory publication unavailable; ".repeat(100);
+    const publicationFailure = "Unsaved factual evidence: " + "mandatory publication unavailable; ".repeat(100);
     let settled = false, failures = 0, writesAtFailure = 0;
     const host = fixture(key => {
       if (key === "doubts-r1-0") { started.resolve(); return sibling.promise.then(value => { settled = true; return value; }); }
-      if (key === "human-r1-0") return { ...child(key), ok: false, error: "Permission denied; Stop observed", outputSaveError: publicationFailure, structuredOutput: { status: "blocked", report: "Actual human frontier remains unanswered" } };
+      if (key === "doubts-r1-1") return { ...child(key), ok: false, error: "Permission denied; Stop observed", outputSaveError: publicationFailure, structuredOutput: { status: "blocked", report: "Actual human frontier remains unanswered" } };
+      if (key === "director-doubts-r1") return { ...child(key), structuredOutput: { doubts: [
+        { id: "first", kind: "scout", dependsOn: [], question: "First?", decision: "Design" },
+        { id: "second", kind: "researcher", dependsOn: [], question: "Second?", decision: "Design" },
+      ] } };
       return planningChild(key);
     }, undefined, value => {
-      if (value.cursor.dispatches.some(item => item.key === "human-r1-0" && item.boundary === "confirmed")) {
+      if (value.cursor.dispatches.some(item => item.key === "doubts-r1-1" && item.boundary === "confirmed")) {
         writesAtFailure = host.stateWrites.length;
         failures++; throw new Error("Essential persistence unavailable");
       }
@@ -1779,10 +1446,10 @@ describe("architecture confirmed phase advancement", () => {
   function planningResult(key: string) {
     return key.startsWith("director-doubts-") ? { ...child(key), structuredOutput: { doubts: [
       { id: "fact", kind: "scout", dependsOn: [], question: "Local evidence?", decision: "Reuse" },
-      { id: "human", kind: "human", dependsOn: [], question: "Prefer reuse?", decision: "Scope" },
+      { id: "human", kind: "deliberation", dependsOn: [], question: "Prefer reuse?", decision: "Scope" },
     ] } } : child(key);
   }
-  test.each(["admission", "director-prepare", "perspective-terminal", "round-index", "validity", "director-doubts-r1", "doubts-r1-0", "human-r1-0", "director-after-r1"])
+  test.each(["admission", "director-prepare", "perspective-terminal", "round-index", "validity", "director-doubts-r1", "doubts-r1-0", "director-after-r1"])
     ("advances after a committed %s cut without replaying confirmed children or validity", async boundary => {
       let cut = false;
       const first = fixture(planningResult, undefined, undefined, value => {
@@ -1793,10 +1460,7 @@ describe("architecture confirmed phase advancement", () => {
           : boundary === "round-index" ? (value as unknown as { evidence: { reports?: unknown }[] }).evidence.some(item => item.reports) && value.validRounds === 0
           : boundary === "validity" ? value.validRounds === 1
           : rows.some(item => item.key === boundary && item.boundary === "confirmed");
-        // Frontiers run concurrently: wait for both terminals, so the durable image
-        // deliberately has no ambiguous sibling when demonstrating permitted reentry.
-        if (matches && (["doubts-r1-0", "human-r1-0"].includes(boundary)
-            ? ["doubts-r1-0", "human-r1-0"].every(key => rows.some(item => item.key === key && item.boundary === "confirmed")) : true)) {
+        if (matches) {
           cut = true; throw new Error("Interruption after committed " + boundary);
         }
       });
@@ -1837,7 +1501,7 @@ describe("architecture selective factual retry", () => {
     if (key.startsWith("director-doubts-")) return { ...child(key), structuredOutput: { doubts: [
       { id: "retained", kind: "scout", dependsOn: [], question: "Sufficient local fact?", decision: "Reuse" },
       { id: "missing", kind: "researcher", dependsOn: [], question: "Missing external fact?", decision: "Reuse" },
-      { id: "scope", kind: "human", dependsOn: ["retained", "missing"], question: "Prefer reuse?", decision: "Scope" },
+      { id: "scope", kind: "deliberation", dependsOn: [], question: "Prefer reuse?", decision: "Scope" },
     ] } };
     if (key === "doubts-r1-1") return { ...child(key), ok: false, error: "Terminal factual failure",
       structuredOutput: { status: "blocked", report: "Complete but insufficient contrary analysis" } };
@@ -1852,20 +1516,17 @@ describe("architecture selective factual retry", () => {
     return { first, original, retry: { consultation: "decision", revision: 1, originalIds: [original.id],
       authorization: { content: "Actual human authorizes retry of the missing factual answer", provenance: "Foreground human message 55" } } };
   }
-  test("retries only the authorized terminal factual provider, retains sufficient facts, then unblocks the human frontier without a new round", async () => {
+  test("retries only the authorized terminal factual provider, retains sufficient facts, then evaluates without a new round", async () => {
     const { first, original, retry } = await failed();
     const second = fixture((key, request) => {
       expect(key).not.toBe("director-prepare"); expect(key).not.toStartWith("r2-");
       if (key === "doubts-r1-1") expect(request.output).toContain("a2.json");
-      if (key === "human-r1-0") {
-        expect(request.task).toContain("Brief factual frontier");
-        expect(request.task).not.toContain("Private report from");
-      }
+
       return child(key);
     });
     expect(await second.execute({ planning: true, continuation, factualRetry: retry }, first.storage))
       .toMatchObject({ status: "completed", rounds: 1, validRounds: 1 });
-    expect(second.calls.map(item => item.key)).toEqual(["doubts-r1-1", "human-r1-0", "director-after-r1"]);
+    expect(second.calls.map(item => item.key)).toEqual(["doubts-r1-1", "director-after-r1"]);
     const state = first.storage.get("architecture-decision") as { originals: Original[]; currentDecision: { revision: number }; cursor: { retries: unknown[] } };
     expect(state.currentDecision.revision).toBe(1);
     expect(state.originals.filter(item => item.key === "doubts-r1-0")).toHaveLength(1);
@@ -1884,7 +1545,7 @@ describe("architecture selective factual retry", () => {
     });
     expect(await second.execute({ planning: true, continuation, factualRetry: retry }, first.storage))
       .toMatchObject({ status: "completed", rounds: 1, validRounds: 1 });
-    expect(second.calls.map(call => call.key)).toEqual(["doubts-r1-1", "human-r1-0", "director-after-r1"]);
+    expect(second.calls.map(call => call.key)).toEqual(["doubts-r1-1", "director-after-r1"]);
     const retained = first.storage.get("architecture-decision") as { originals: Original[] };
     expect(retained.originals.find(item => item.id === original.id)).toEqual(original);
     expect(original).toMatchObject({ delivery: "not-delivered", sufficient: false, publication: "unpublished" });
@@ -1913,19 +1574,16 @@ describe("architecture selective factual retry", () => {
     expect(second.calls).toHaveLength(0);
   });
   for (const missing of [false, true]) {
-    test.each(["authorization", "intention", "terminal", "human-intention", "human-terminal", "evaluation"])
+    test.each(["authorization", "intention", "terminal", "evaluation"])
       (`retry with missing=${missing} survives committed %s cuts without replay`, async boundary => {
         const { first, retry } = await failed(missing);
         let cut = false;
         const second = fixture(key => child(key), undefined, undefined, value => {
           const cursor = value.cursor as unknown as { retries?: unknown[]; dispatches: { key: string; boundary: string; attempt: number }[] };
           const factual = cursor.dispatches.find(item => item.key === "doubts-r1-1" && item.attempt === 2);
-          const human = cursor.dispatches.find(item => item.key === "human-r1-0");
           const matches = boundary === "authorization" ? cursor.retries?.length === 1 && !factual
             : boundary === "intention" ? factual?.boundary === "intended"
-            : boundary === "terminal" ? factual?.boundary === "confirmed" && !human
-            : boundary === "human-intention" ? human?.boundary === "intended"
-            : boundary === "human-terminal" ? human?.boundary === "confirmed"
+            : boundary === "terminal" ? factual?.boundary === "confirmed"
             : cursor.dispatches.some(item => item.key === "director-after-r1" && item.boundary === "confirmed");
           if (!cut && matches) { cut = true; throw new Error("Committed retry cut " + boundary); }
         });
@@ -1933,7 +1591,7 @@ describe("architecture selective factual retry", () => {
         catch (error) { expect(String(error)).toContain("Committed retry cut"); }
         expect(cut).toBe(true);
         const third = fixture();
-        if (["intention", "human-intention"].includes(boundary)) {
+        if (boundary === "intention") {
           await expect(third.execute({ planning: true, continuation }, first.storage)).rejects.toThrow("Unconfirmed architecture dispatch boundary");
           expect(third.calls).toHaveLength(0);
         } else {
@@ -1995,12 +1653,12 @@ describe("architecture selective factual retry", () => {
 
 
 describe("architecture committed dispatch intentions", () => {
-  test.each(["director-prepare", "r1-simple", "director-doubts-r1", "doubts-r1-0", "human-r1-0", "director-after-r1"])
+  test.each(["director-prepare", "r1-simple", "director-doubts-r1", "doubts-r1-0", "director-after-r1"])
     ("never redispatches after an interruption following the committed %s intention", async key => {
       let interrupted = false;
       const first = fixture(producer => producer.startsWith("director-doubts-") ? { ...child(producer), structuredOutput: { doubts: [
         { id: "fact", kind: "scout", dependsOn: [], question: "Local contract?", decision: "Reuse" },
-        { id: "human", kind: "human", dependsOn: [], question: "Prefer reuse?", decision: "Scope" },
+        { id: "human", kind: "deliberation", dependsOn: [], question: "Prefer reuse?", decision: "Scope" },
       ] } } : child(producer), undefined, undefined, value => {
         if (!interrupted && value.cursor.dispatches.some(item => item.key === key && item.boundary === "intended")) {
           interrupted = true; throw new Error("Interrupted after durable intention " + key);
@@ -2097,4 +1755,198 @@ test("architecture persists a full replacement at a confirmed mid-round boundary
   expect(first.storage.get("architecture-decision")).toMatchObject({ currentDecision: { revision: 2 }, decisionHistory: [
     { revision: 1, snapshot: { brief: "OBSOLETE mechanism A" } },
   ] });
+});
+
+describe("architecture paused human answers", () => {
+  const continuation = { version: 2, consultation: "decision" };
+  const reentry = { planning: true, continuation };
+  const questions = [
+    { id: "unrelated", kind: "researcher", dependsOn: [], question: "External contract?", decision: "Adapter" },
+    { id: "needed", kind: "scout", dependsOn: [], question: "Local seam?", decision: "Reuse" },
+    { id: "scope", kind: "human", dependsOn: [], question: "Use scope A?", decision: "Scope", recommendation: "Use scope A" },
+    { id: "reuse", kind: "human", dependsOn: ["needed"], question: "Reuse seam?", decision: "Reuse", recommendation: "Reuse seam" },
+  ];
+  function respond(key: string): Result {
+    return key.startsWith("director-doubts-") ? { ...child(key), structuredOutput: { doubts: questions } } : child(key);
+  }
+  async function pause() {
+    const first = fixture(respond);
+    const result = await first.execute({ planning: true, currentDecision: snapshot("Decision") });
+    expect(result).toMatchObject({ status: "needs-human", rounds: 1, validRounds: 1 });
+    return { first, result };
+  }
+  function answers(result: Outcome) {
+    const { consultation, revision, round, questions } = result.frontier!;
+    return { consultation, revision, round, answers: questions.map(({ id }) => ({
+      id, disposition: "answer", content: "approve implementation", provenance: `Actual human message 55, ${id}`,
+    })) };
+  }
+  test("awaits one complete factual wave before pausing the entire human frontier", async () => {
+    const research = deferred<Result>(), entered = deferred<void>();
+    const first = fixture(key => {
+      if (key === "doubts-r1-0") { entered.resolve(); return research.promise; }
+      return respond(key);
+    });
+    let settled = false;
+    const work = first.execute({ planning: true, currentDecision: snapshot("Decision") }).then(value => { settled = true; return value; });
+    let result: Outcome;
+    try {
+      await entered.promise;
+      expect(settled).toBe(false);
+      expect(first.batches.find(batch => batch.some(request => request.key === "doubts-r1-0"))?.map(request => request.key))
+        .toEqual(["doubts-r1-0", "doubts-r1-1"]);
+      expect(first.calls.some(call => call.key === "director-after-r1")).toBe(false);
+    } finally { research.resolve(child("doubts-r1-0")); result = await work; }
+    expect(result!).toMatchObject({ status: "needs-human", rounds: 1, validRounds: 1, continuation,
+      frontier: { consultation: "decision", revision: 1, round: 1, humanContext: expect.stringContaining("Material facts"), questions: [
+        { ...questions[2], prerequisiteFacts: [] },
+        { ...questions[3], prerequisiteFacts: [{ id: "needed", key: "doubts-r1-1", originalId: expect.any(String), humanContext: expect.stringContaining("Brief factual frontier") }] },
+      ].map(({ kind: _kind, ...item }) => item) } });
+    const retained = first.storage.get("architecture-decision") as DurableConsultation;
+    expect(retained.cursor).toMatchObject({ control: { stage: "awaiting-human", pending: { round: 1, revision: 1, ids: ["scope", "reuse"] } } });
+    expect(retained.cursor.dispatches.every(item => item.boundary === "confirmed")).toBe(true);
+    expect(first.calls.map(call => call.request.phase)).not.toContain("architecture-human");
+    expect(first.calls.some(call => call.key === "director-after-r1")).toBe(false);
+  });
+  test("restart after both native deadlines returns identical frontier without writes, then evaluates actual answers once", async () => {
+    const { first, result } = await pause();
+    const before = JSON.stringify([...first.storage]), persisted = readFileSync(first.stateFile, "utf8");
+    // Pass a controlled clock as an AsyncFunction global; do not mutate the host clock.
+    const late = Date.now() + 60 * 60 * 1000;
+    const clock = class extends Date { static now() { return late; } };
+    const restarted = fixture(undefined, undefined, undefined, undefined, clock);
+    expect(await restarted.execute(reentry, first.storage)).toEqual(result);
+    expect(JSON.stringify([...first.storage])).toBe(before);
+    expect(restarted.calls).toHaveLength(0); expect(restarted.stateWrites).toHaveLength(0);
+    expect(readFileSync(first.stateFile, "utf8")).toBe(persisted);
+    let firstWrite: DurableConsultation | undefined;
+    const input = answers(result);
+    input.answers[1]!.disposition = "defer";
+    const resumed = fixture((key, request) => {
+      expect(key).toBe("director-after-r1");
+      for (const phrase of ["actual-human decision context", "never", "implementation authority or final confirmation", "defer and unknown remain unresolved", "approve implementation", "Actual human message 55"])
+        expect(request.task).toContain(phrase);
+      return child(key);
+    }, undefined, value => {
+      firstWrite ??= structuredClone(value);
+    }, undefined, clock);
+    const done = await resumed.execute({ ...reentry, humanAnswers: input }, first.storage);
+    expect(firstWrite).toMatchObject({ cursor: { control: { stage: "evaluate" } }, evidence: expect.arrayContaining([
+      expect.objectContaining({ key: "human-answers-r1", answers: input.answers }),
+    ]) });
+    expect(firstWrite!.cursor).not.toHaveProperty("control.pending");
+    expect(done).toMatchObject({ status: "completed", rounds: 1, validRounds: 1 });
+    expect(done).not.toHaveProperty("authorization"); expect(done).not.toHaveProperty("confirmation");
+    expect(resumed.calls.map(call => call.key)).toEqual(["director-after-r1"]);
+    const duplicate = fixture(), saved = JSON.stringify([...first.storage]);
+    await expect(duplicate.execute({ ...reentry, humanAnswers: input }, first.storage)).rejects.toThrow("Invalid humanAnswers");
+    expect(JSON.stringify([...first.storage])).toBe(saved);
+    expect(duplicate.stateWrites).toHaveLength(0); expect(duplicate.calls).toHaveLength(0);
+  });
+  test.each(["missing", "extra", "duplicate", "round", "revision", "consultation", "no-pending", "missing-pending", "not-planning", "replacement", "evidence", "factualRetry", "content", "provenance", "disposition", "bytes", "items", "fields", "depth", "state-capacity"])
+    ("rejects %s with byte-identical storage and no dispatch", async fault => {
+      const { first, result } = await pause();
+      const input = answers(result);
+      const args: Record<string, unknown> = { ...reentry, humanAnswers: input };
+      if (fault === "missing") input.answers.pop();
+      if (fault === "extra") input.answers.push({ ...input.answers[0]!, id: "extra" });
+      if (fault === "duplicate") input.answers[1]!.id = input.answers[0]!.id;
+      if (fault === "round") input.round++;
+      if (fault === "revision") input.revision++;
+      if (fault === "consultation") input.consultation = "other";
+      if (fault === "not-planning") args.planning = false;
+      if (fault === "missing-pending") {
+        const value = first.storage.get("architecture-decision") as { cursor: { control: { pending?: unknown } } };
+        delete value.cursor.control.pending;
+      }
+      if (fault === "no-pending") {
+        const value = first.storage.get("architecture-decision") as { cursor: { control: { stage: string; pending?: unknown } } };
+        value.cursor.control.stage = "evaluate"; delete value.cursor.control.pending;
+      }
+      if (fault === "replacement") args.replacement = replacement("decision", 1, snapshot("Changed"));
+      if (fault === "evidence" || fault === "factualRetry") { delete args.humanAnswers; args[fault] = fault === "evidence" ? "Caller fact" : {}; }
+      if (fault === "content" || fault === "provenance") input.answers[0]![fault] = "";
+      if (fault === "disposition") input.answers[0]!.disposition = "approve";
+      if (fault === "bytes") input.answers[0]!.content = "é".repeat(9000);
+      if (fault === "items") input.answers = Array.from({ length: 65 }, (_, index) => ({ ...input.answers[0]!, id: `q${index}` }));
+      if (fault === "fields") Object.assign(input.answers[0]!, Object.fromEntries(Array.from({ length: 17 }, (_, i) => [`field${i}`, "x"])));
+      if (fault === "depth") Object.assign(input.answers[0]!, { nested: { a: { b: { c: { d: { e: { f: { g: "deep" } } } } } } } });
+      if (fault === "state-capacity") first.storage.set("unrelated", "x".repeat(256 * 1024 - Buffer.byteLength(JSON.stringify(Object.fromEntries(first.storage))) - 100));
+      const before = JSON.stringify([...first.storage]), persisted = readFileSync(first.stateFile, "utf8");
+      const resumed = fixture();
+      await expect(resumed.execute(args, first.storage)).rejects.toThrow();
+      expect(JSON.stringify([...first.storage])).toBe(before);
+      expect(readFileSync(first.stateFile, "utf8")).toBe(persisted);
+      expect(resumed.calls).toHaveLength(0);
+      expect(resumed.stateWrites.filter(write => write.persisted)).toHaveLength(0);
+      if (fault === "state-capacity") expect(resumed.stateWrites).toEqual([{ bytes: expect.any(Number), persisted: false }]);
+      else expect(resumed.stateWrites).toHaveLength(0);
+    });
+  test.each(["defer", "unknown"])("accepts %s without content as unresolved decision context", async disposition => {
+    const { first, result } = await pause();
+    const input = answers(result);
+    const humanAnswers = { ...input, answers: input.answers.map(({ content: _content, ...answer }) => ({ ...answer, disposition })) };
+    const resumed = fixture((key, request) => {
+      expect(key).toBe("director-after-r1");
+      expect(request.task).toContain(`"disposition":"${disposition}"`);
+      expect(request.task).toContain("defer and unknown remain unresolved questions");
+      return { ...child(key), structuredOutput: { ...finish, action: "blocked", memo: "Human question remains unresolved" } };
+    });
+    expect(await resumed.execute({ ...reentry, humanAnswers }, first.storage)).toMatchObject({ status: "blocked", rounds: 1, validRounds: 1 });
+    expect(first.storage.get("architecture-decision")).toMatchObject({ evidence: expect.arrayContaining([
+      expect.objectContaining({ key: "human-answers-r1", answers: humanAnswers.answers }),
+    ]) });
+  });
+  test("replacement discards pending at prepare with counters and human snapshot provenance preserved", async () => {
+    const { first } = await pause();
+    const prior = { id: "earlier", content: "Use A", provenance: "Actual human message 54" };
+    const retained = first.storage.get("architecture-decision") as { currentDecision: { snapshot: DecisionSnapshot } };
+    retained.currentDecision.snapshot.humanDecisions = [prior];
+    const resumed = fixture((key, request) => {
+      expect(key).toBe("director-prepare"); expect(request.task).toContain(prior.provenance);
+      return { ...child(key), structuredOutput: { ...finish, action: "blocked" } };
+    }, undefined, value => {
+      if (resumed.stateWrites.length !== 1) return;
+      expect(value).toMatchObject({ rounds: 1, validRounds: 1, cursor: { control: { stage: "prepare", round: null } } });
+      expect(value.cursor).not.toHaveProperty("control.pending");
+    });
+    expect(await resumed.execute({ ...reentry, replacement: replacement("decision", 1, snapshot("Changed scope", { humanDecisions: [prior] })) }, first.storage))
+      .toMatchObject({ status: "blocked", rounds: 1, validRounds: 1 });
+    expect(JSON.stringify([...first.storage])).not.toContain("human-answers-r1");
+  });
+  test.each(["finish", "blocked"])("a round-ten pause accepts answers then returns only %s", async action => {
+    const first = fixture(key => key === "director-doubts-r10" ? respond(key)
+      : key.startsWith("director-doubts-") ? { ...child(key), structuredOutput: { doubts: [] } } : child(key, discuss));
+    const result = await first.execute({ planning: true, currentDecision: snapshot("Decision"), maxRounds: 10 });
+    expect(result).toMatchObject({ status: "needs-human", rounds: 10, validRounds: 10 });
+    const resumed = fixture((key, request) => {
+      expect(key).toBe("director-after-r10"); expect(request.task).toContain("round limit is reached");
+      return { ...child(key), structuredOutput: { ...finish, action } };
+    });
+    expect(await resumed.execute({ ...reentry, humanAnswers: answers(result) }, first.storage))
+      .toMatchObject({ status: action === "finish" ? "completed" : "blocked", rounds: 10, validRounds: 10 });
+    expect(resumed.calls).toHaveLength(1);
+  });
+  test("failed prerequisite stays frontier, then authorized factualRetry pauses without another round", async () => {
+    const first = fixture(key => key === "doubts-r1-1" ? { ...child(key), structuredOutput: { status: "blocked", report: "Missing prerequisite" } } : respond(key));
+    const failed = await first.execute({ planning: true, currentDecision: snapshot("Decision") });
+    expect(failed).toMatchObject({ status: "failed", error: expect.stringContaining("No adequate report"), rounds: 1, validRounds: 1 });
+    const retained = first.storage.get("architecture-decision") as { cursor: { control: { stage: string } }; originals: Original[] };
+    expect(retained.cursor.control.stage).toBe("frontier");
+    const resumed = fixture();
+    expect(await resumed.execute({ ...reentry, factualRetry: { consultation: "decision", revision: 1,
+      originalIds: [retained.originals.find(item => item.key === "doubts-r1-1")!.id],
+      authorization: { content: "Retry prerequisite", provenance: "Actual human message 56" } } }, first.storage))
+      .toMatchObject({ status: "needs-human", rounds: 1, validRounds: 1 });
+    expect(resumed.calls.map(call => call.key)).toEqual(["doubts-r1-1"]);
+  });
+  test("more than 64 pending IDs fails explicitly instead of truncating", async () => {
+    const first = fixture(key => key.startsWith("director-doubts-") ? { ...child(key), structuredOutput: {
+      doubts: Array.from({ length: 65 }, (_, index) => ({ ...questions[2], id: `q${index}` })),
+    } } : child(key));
+    expect(await first.execute({ planning: true, currentDecision: snapshot("Decision") }))
+      .toMatchObject({ status: "failed", error: expect.stringContaining("64 pending IDs") });
+    expect(first.calls.some(call => call.key === "director-after-r1")).toBe(false);
+    expect(first.storage.get("architecture-decision")).toMatchObject({ cursor: { control: { stage: "frontier" } } });
+  });
 });

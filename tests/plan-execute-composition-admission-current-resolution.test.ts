@@ -1647,17 +1647,13 @@ A1 supersedes native-resume-first recovery; preserve the missing historical befo
     }
   });
 
-  test("director required-tool plan has no fanout or private TODO provider; interview relay retains native contact", () => {
+  test("director required-tool plan has no fanout or private TODO provider", () => {
     const { frontmatter, body } = parseFrontmatter(read("agents/execution-director.md"));
     const plan = resolvePiLaunchToolPlan({ tools: String(frontmatter.tools).split(/,\s*/), extensions: [],
       subagentOnlyExtensions: (frontmatter.subagentOnlyExtensions as string[]).map(provider => path.resolve("agents", provider)) });
     expect(plan.fanoutAuthorized).toBe(false);
     expect(plan.requiredChildTools).not.toContain("todo"); expect(plan.requiredChildTools).not.toContain("subagent");
     expect(body).toContain("then END"); expect(body).toContain("needs-decision");
-    const relay = parseFrontmatter(read("agents/interview-relay.md"));
-    const relayPlan = resolvePiLaunchToolPlan({ tools: String(relay.frontmatter.tools).split(/,\s*/), extensions: [] });
-    expect(relayPlan.fanoutAuthorized).toBe(false); expect(relayPlan.effectiveToolAllowlist).toContain("contact_supervisor");
-    expect(relay.body).toContain("ACTUAL HUMAN"); expect(relay.body).toContain("await the real supervisor reply");
   });
 
   test("grilling retains exact pinned primary bytes, MIT notice, source mapping and package discovery", () => {
@@ -1799,7 +1795,11 @@ describe("packaged workflow caller examples", () => {
     const plan = read("skills/plan/SKILL.md").replace(/\s+/g, " ");
     expect(plan).toContain("args: { currentDecision, workDescription:");
     expect(plan).toContain("exact returned version-2 `continuation`");
-    expect(plan).toContain("file-blind relay receives self-contained facts");
+    for (const instruction of [
+      "On `needs-human`", "`status.json` at `workflow.value`", "ENTIRE frontier in one round",
+      "actual per-ID human provenance", "`humanAnswers: { consultation, revision, round, answers }`",
+      "at most one in-flight run per consultation", "Answers are decision context only",
+    ]) expect(plan).toContain(instruction);
     expect(plan).toContain("Ask the ACTUAL HUMAN to confirm it, then wait");
     const prepr = read("skills/pre-pr/SKILL.md");
     expect(prepr).toContain("Readiness is an assessment, not authorization");
