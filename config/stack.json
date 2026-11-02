@@ -5,7 +5,7 @@
   "required": [
     {
       "id": "pi-codex-tools",
-      "spec": "pi-codex-tools@0.4.0",
+      "spec": "pi-codex-tools@0.4.1",
       "entry": "node_modules/pi-codex-tools/index.ts",
       "tools": ["apply_patch"]
     },
@@ -119,7 +119,7 @@
     },
     {
       "id": "pi-subagents",
-      "spec": "pi-subagents@0.83.0",
+      "spec": "pi-subagents@0.84.0",
       "entry": "node_modules/pi-subagents/bundle/index.js",
       "tools": ["subagent", "subagents_enable", "bg_wait", "subagent_supervisor", "contact_supervisor"]
     },
@@ -137,13 +137,13 @@
     },
     {
       "id": "pi-web-access",
-      "spec": "pi-web-access@0.45.0",
+      "spec": "pi-web-access@0.46.0",
       "entry": "node_modules/pi-web-access/dist/index.js",
       "tools": ["web_search", "fetch_content", "source_check", "get_search_content", "web_enable"]
     },
     {
       "id": "pi-markdown-preview",
-      "spec": "pi-markdown-preview@0.25.0",
+      "spec": "pi-markdown-preview@0.26.2",
       "entry": "node_modules/pi-markdown-preview/index.ts",
       "tools": ["preview_export"]
     },
