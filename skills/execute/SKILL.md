@@ -346,7 +346,9 @@ differs from the plan, missing candidate identities or a missing unit seal, is a
 rejected attempt, not a root halt. Its original stays in the native record and
 nothing from it is admitted. The loop ends as `gaps` with the exact reason, and
 the next director repeats only the affected work without rewriting planned checks.
-Identity, binding, restoration and seal conflicts still halt.
+A valid seal whose kind contradicts the status (a unit with non-complete status,
+or a pause with complete) is likewise a rejected attempt. Identity, binding,
+restoration and seal conflicts still halt.
 
 Each new task has one concrete observable `expectedResult` and mandatory
 `dependsOn: [{taskId, reason}]` (or `[]`). Split separable outcomes, not coordinated

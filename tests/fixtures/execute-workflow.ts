@@ -50,7 +50,7 @@ const task = (id: string, kind = "implementation") => ({ id, kind, goal: `Goal $
   dependsOn: [] as { taskId: string; reason: string }[],
   checks: [{ id: `${id}-check`, requirement: "spec:criterion-1", command: `bun test ${id}`, cwd: config.root }] });
 type FixtureOptions = { metadataPadding?: number; taskCount?: number; angles?: number; findings?: boolean; readOnly?: boolean;
-  controlledCheckpoints?: boolean; controlledPublisher?: boolean; retainSnapshots?: boolean };
+  controlledCheckpoints?: boolean; controlledPublisher?: boolean; retainSnapshots?: boolean; rawWorkerReceipts?: boolean };
 type OwnedResources = { roots: string[]; settlements: Promise<unknown>[] };
 export function executeControllerFixture() {
   const owned: OwnedResources = { roots: [], settlements: [] };
@@ -261,7 +261,7 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
     all: async (requests: Request[]) => Promise.all(requests.map(async request => {
       calls.push(copy(request)); clock += 10;
       const response = responder ? await responder(request, () => normal(request)) : normal(request);
-      if (request.agent === "pitako.worker" && response.structuredOutput?.status !== "complete" && response.structuredOutput &&
+      if (!options.rawWorkerReceipts && request.agent === "pitako.worker" && response.structuredOutput?.status !== "complete" && response.structuredOutput &&
           response.structuredOutput.checkpointReceipt?.kind !== "pause")
         delete response.structuredOutput.checkpointReceipt;
       if (response.runId) native.set(response.runId, copy(response)); native.set(request.key, copy(response));

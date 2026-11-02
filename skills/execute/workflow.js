@@ -1309,8 +1309,11 @@ function workerValue(result, descriptor, task, statusRef) {
       loop.halt = { status: "blocked", code: "semantic-block", reason, ref: clone(descriptor.launch ?? { key: descriptor.key }) };
       throw new Error(reason);
     }
+    // A valid seal whose kind contradicts the reported status is a worker report
+    // defect (unit seals only complete results): reject the attempt, don't halt.
+    if (["unit", "pause"].includes(receipt.kind) && complete !== (value.status === "complete"))
+      throw rejectReport(`Checkpoint kind ${receipt.kind} contradicts worker status ${value.status}; unit seals only complete results, other statuses use pause.`);
     if (!intent?.progress || !["unit", "pause"].includes(receipt.kind) ||
-        complete !== (value.status === "complete") ||
         receipt.checkpointRef !== `${config.root}/.pi/subagents/checkpoints/${intent.key}/${receipt.kind}.json` ||
         !/^[a-f0-9]{64}$/.test(receipt.digest ?? "") ||
         !same(receipt.candidate, value.candidate) || !same(receipt.progress, intent.progress) ||
@@ -2276,6 +2279,8 @@ same-task continuation before writing it; the next attempt captures a new unit.
 Capture failure means no modifying work. Existing artifacts require reconciliation, never overwrite.
 Retain checkpoint refs in git.checkpoints. Never restore a unit with an admitted complete result.
 After all owned writes settle, call checkpoint_create({kind:"unit"}) for a completed implementation unit.
+Seal kind must match status: unit only with status complete; blocked, continue or gaps use pause.
+Status and remaining describe THIS task; inherited mission gaps outside its scope go in diagnosis.
 Return its actual structured checkpointReceipt and retain checkpointRef in git.checkpoints; do not
 reconstruct the receipt. Tool success/sealing is NOT task confirmation or cursor advancement.
 Only root durable result admission confirms that point.

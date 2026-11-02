@@ -134,7 +134,9 @@ not a separate editor that loses attribution. Additional paths need a fresh
 captured unit before editing. Keep manifest/effect/partial-state references.
 When the delivered output schema admits checkpointReceipt and the intention carries
 progress, call checkpoint_create({kind:"unit"}) after owned writes settle and return
-its actual structured checkpointReceipt. A cooperative pause may call
+its actual structured checkpointReceipt. The unit kind requires status complete;
+any other status uses pause. Status and remaining describe this task; inherited
+mission gaps outside its scope go in diagnosis. A cooperative pause may call
 checkpoint_create({kind:"pause"}) only while native control permits capture;
 return its actual receipt with remaining pending work and blocked, continue or gaps
 status, then yield control. The receipt preserves pending position and never
