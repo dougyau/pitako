@@ -16,11 +16,11 @@
     "license": "MIT"
   },
   "@dietrichgebert/ponytail": {
-    "version": "5.3.2",
-    "registry": "https://registry.npmjs.org/@dietrichgebert/ponytail/5.3.2",
-    "tarball": "https://registry.npmjs.org/@dietrichgebert/ponytail/-/ponytail-5.3.2.tgz",
-    "integrity": "sha512-AjJnMi54AXO55kXi0ISNPacLuTjb7e9V4lV2oidyxBOnVoPih8CIAmnfHgwX2VyPsDqwQhJthJ9bNu30MaHuOg==",
-    "gitHead": "16352ac229eb08a9598dcae48fe9f2b342567d86",
+    "version": "5.3.3",
+    "registry": "https://registry.npmjs.org/@dietrichgebert/ponytail/5.3.3",
+    "tarball": "https://registry.npmjs.org/@dietrichgebert/ponytail/-/ponytail-5.3.3.tgz",
+    "integrity": "sha512-Gq0ESMi1ZkcY+dvH1dyhOzR3+pYQ/LGW39E4dExcCzhaLe1AMPE43sPrW/JbEiaC986dUWeSzs97WfTABLkdDg==",
+    "gitHead": "7801d061243d7b753bad0e0b3c057cd250b11755",
     "license": "MIT"
   },
   "@juicesharp/rpiv-ask-user-question": {
@@ -71,11 +71,11 @@
     "license": "MIT"
   },
   "pi-codex-tools": {
-    "version": "0.4.0",
-    "registry": "https://registry.npmjs.org/pi-codex-tools/0.4.0",
-    "tarball": "https://registry.npmjs.org/pi-codex-tools/-/pi-codex-tools-0.4.0.tgz",
-    "integrity": "sha512-A5gK8/XnQ8qSwOhuRKdWY3GSawPOF4ToIjfbzXDIj07q/SWBNitOCkmgANUtjjav7J1+ieWY00EzH3mWvxrd4g==",
-    "gitHead": "306242f2c802ea4c0067d64d4fd5fd103d89a6b5",
+    "version": "0.4.1",
+    "registry": "https://registry.npmjs.org/pi-codex-tools/0.4.1",
+    "tarball": "https://registry.npmjs.org/pi-codex-tools/-/pi-codex-tools-0.4.1.tgz",
+    "integrity": "sha512-iFdA7ciRydfWftFBRrEt/H/YddQPuzHzriZqWPe7sXcqYQw1XqPw3PAc61goIUG34wawzk0UAdRv3/QyJjtMQg==",
+    "gitHead": "91fd55fdfd7c5516ac8d08267f34b49f1b37d050",
     "license": "Apache-2.0"
   },
   "pi-hermes-memory": {
@@ -87,27 +87,27 @@
     "license": "MIT"
   },
   "pi-markdown-preview": {
-    "version": "0.25.0",
-    "registry": "https://registry.npmjs.org/pi-markdown-preview/0.25.0",
-    "tarball": "https://registry.npmjs.org/pi-markdown-preview/-/pi-markdown-preview-0.25.0.tgz",
-    "integrity": "sha512-SGhniEWU/o4wBYfvkAZJj9KTmheCh6ntSvV/fTiHok1uRpATo+zDrlGLqi1+0jKf41yw3ZAeJFU+pnaedpptVA==",
-    "gitHead": "da8ca37328ee8b80f2f21a13316e9b009abcde5e",
+    "version": "0.26.2",
+    "registry": "https://registry.npmjs.org/pi-markdown-preview/0.26.2",
+    "tarball": "https://registry.npmjs.org/pi-markdown-preview/-/pi-markdown-preview-0.26.2.tgz",
+    "integrity": "sha512-b6YR1E0Dpdi3VQwvJbqMjPTHaYtEG6dKHLsTyGzLmSrOa+pWjyQV5Rg7tYoZHXVoalsE+MT4i4awYlYPUIe7xg==",
+    "gitHead": "49cef33514aedb64928457cc7b97a7bc3d7aa8d7",
     "license": "MIT"
   },
   "pi-subagents": {
-    "version": "0.83.0",
-    "registry": "https://registry.npmjs.org/pi-subagents/0.83.0",
-    "tarball": "https://registry.npmjs.org/pi-subagents/-/pi-subagents-0.83.0.tgz",
-    "integrity": "sha512-MlmLLa8Cb2/RCkkhCgbRDdeigpFL8v0rKqa+HjWpa/3ylZb49Fg+XDsbMeNu+zQ6268dnxGt1sTDhXsAKxBzKg==",
-    "gitHead": "3a63e0ad8898cf116ce671feabb0f8a7b31731a4",
+    "version": "0.84.0",
+    "registry": "https://registry.npmjs.org/pi-subagents/0.84.0",
+    "tarball": "https://registry.npmjs.org/pi-subagents/-/pi-subagents-0.84.0.tgz",
+    "integrity": "sha512-IagE1hcBxLi82jTxTmcy/pIWckBuqhMH1GfAOe6/aIMVfnopMybCbcTMUS5K0CNy4tqSwHGleaXabaDmJS1QOg==",
+    "gitHead": "0398b9e8d6f03dc6054dbf13dfe851c7a20bff3a",
     "license": "MIT"
   },
   "pi-web-access": {
-    "version": "0.45.0",
-    "registry": "https://registry.npmjs.org/pi-web-access/0.45.0",
-    "tarball": "https://registry.npmjs.org/pi-web-access/-/pi-web-access-0.45.0.tgz",
-    "integrity": "sha512-AHgUKUas1vvBtdKbcv+7rWTPTIOl8xHR4E7s4dLBAz6soSGGPC4YNq1uVGuH5+bVrMx4X/fmPCm4rsOQIxexdQ==",
-    "gitHead": "35e57ef30f4b8ac771f4062a381493993af41ebe",
+    "version": "0.46.0",
+    "registry": "https://registry.npmjs.org/pi-web-access/0.46.0",
+    "tarball": "https://registry.npmjs.org/pi-web-access/-/pi-web-access-0.46.0.tgz",
+    "integrity": "sha512-UfeJKU0TPmQU/3hmfAC5Ot/e5Ib0uHkg2+VHM7Ae4kVilLZf7ocGqHFzBzOkYuGLZ87LobzkrhwTAq8lO/N7cQ==",
+    "gitHead": "4af1a7f7757d450ba0afefe2d98737384dc9a9b4",
     "license": "MIT"
   },
   "@earendil-works/pi-agent-core": {
