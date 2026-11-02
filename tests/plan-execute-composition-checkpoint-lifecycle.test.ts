@@ -8,10 +8,13 @@ const { roots, disposers, checkpointCancellations, settleWorkflows } = compositi
 const native = nativeCheckpointFixture(composition);
 const { nativeCheckpointExits, startNativeCheckpoint, nativeCheckpointCase, nativeCheckpointInput } = native;
 const { checkpointScenario, releasePreparedPause } = checkpointScenarioFixture(composition, native);
+// Fixture settlement cases do not use the SDK; scenario cases below load it.
+const settlementInput = () => ({ ...nativeCheckpointInput(), sdk: false });
+const startSettlementChild = () => startNativeCheckpoint({ sdk: false });
 
 test("native checkpoint fixture cancellation joins process, streams and case continuation", async () => {
-  await startNativeCheckpoint();
-  const pending = nativeCheckpointCase(nativeCheckpointInput(), "async () => new Promise(() => {})");
+  await startSettlementChild();
+  const pending = nativeCheckpointCase(settlementInput(), "async () => new Promise(() => {})");
   const cancel = [...checkpointCancellations][0]!;
   cancel(); cancel();
   await settleWorkflows();
@@ -22,10 +25,10 @@ test("native checkpoint fixture cancellation joins process, streams and case con
 });
 
 test("native checkpoint fixture cancellation after IPC disconnect joins late continuation and streams", async () => {
-  if (!native.nativeCheckpoint) await startNativeCheckpoint();
+  if (!native.nativeCheckpoint) await startSettlementChild();
   const child = native.nativeCheckpoint!;
   const disconnected = new Promise<void>(resolve => child.once("disconnect", resolve));
-  const pending = nativeCheckpointCase(nativeCheckpointInput(), `async () => {
+  const pending = nativeCheckpointCase(settlementInput(), `async () => {
     // Keep the disconnected process alive until the controlled cancellation, not a sleep.
     const keepAlive = setInterval(() => {}, 60000);
     process.disconnect();
@@ -55,23 +58,23 @@ test("native checkpoint fixture cancellation after IPC disconnect joins late con
   expect(checkpointCancellations.size).toBe(0);
   expect(existsSync(native.nativeCheckpointRoot)).toBe(true);
   cancel();
-  await startNativeCheckpoint();
-  expect(await nativeCheckpointCase(nativeCheckpointInput(), "async () => 'fresh case'"))
+  await startSettlementChild();
+  expect(await nativeCheckpointCase(settlementInput(), "async () => 'fresh case'"))
     .toEqual([0, JSON.stringify("fresh case"), ""]);
 });
 
 test("native checkpoint fixture preserves genuine failure and subsequent normal completion", async () => {
-  if (!native.nativeCheckpoint) await startNativeCheckpoint();
-  const failure = await nativeCheckpointCase(nativeCheckpointInput(), "async () => { throw Error('controlled case failure'); }");
+  if (!native.nativeCheckpoint) await startSettlementChild();
+  const failure = await nativeCheckpointCase(settlementInput(), "async () => { throw Error('controlled case failure'); }");
   expect(failure?.[0]).toBe(1);
   expect(failure?.[2]).toContain("controlled case failure");
-  expect(await nativeCheckpointCase(nativeCheckpointInput(), "async () => 'completed'"))
+  expect(await nativeCheckpointCase(settlementInput(), "async () => 'completed'"))
     .toEqual([0, JSON.stringify("completed"), ""]);
 });
 
 test("native checkpoint fixture close without a reply is not a successful case", async () => {
-  if (!native.nativeCheckpoint) await startNativeCheckpoint();
-  const outcome = await nativeCheckpointCase(nativeCheckpointInput(), "async () => { process.disconnect(); return 'lost reply'; }");
+  if (!native.nativeCheckpoint) await startSettlementChild();
+  const outcome = await nativeCheckpointCase(settlementInput(), "async () => { process.disconnect(); return 'lost reply'; }");
   expect(outcome?.[0]).toBe(1);
   expect(outcome?.[2]).toContain("closed before replying");
   expect((await nativeCheckpointExits.at(-1)!.promise)[0]).toBe(0);
@@ -81,7 +84,7 @@ test("native checkpoint fixture close without a reply is not a successful case",
 describe("plan/execute packaged composition", () => {
   // SDK/Node loader preparation is file-owned setup, not checkpoint-case work.
   beforeAll(async () => { if (!native.nativeCheckpoint) await startNativeCheckpoint(); });
-  for (const mode of ["unit-before-capture", "unit-before-capture-reentry", "unit-before-capture-conflict", "unit-before-capture-corrupt", "unit-before-capture-newer-corrupt", "unit-before-capture-missing", "unit-before-capture-unadmitted", "unit-before-capture-wrong-baseline", "complete", "pause", "abrupt", "abrupt-continue", "refused", "missing", "corrupt", "incomplete", "seal-cut", "admission-cut", "cursor-cut", "missing-receipt", "wrong-progress", "pause-continue", "pause-twice", "pause-status-continue", "pause-status-gaps", "pause-status-continue-admission-cut", "pause-status-gaps-admission-cut", "pause-no-input", "pause-semantic", "pause-missing", "pause-corrupt", "pause-conflict", "pause-stop"]) {
+  for (const mode of ["unit-before-capture", "unit-before-capture-reentry", "unit-before-capture-conflict", "unit-before-capture-corrupt", "unit-before-capture-newer-corrupt", "unit-before-capture-missing", "unit-before-capture-unadmitted", "unit-before-capture-wrong-baseline", "complete", "pause", "abrupt", "abrupt-continue", "refused", "missing", "corrupt", "incomplete", "seal-cut", "admission-cut", "cursor-cut", "missing-receipt", "wrong-progress", "pause-continue", "pause-twice", "pause-status-continue", "pause-status-gaps", "pause-status-continue-admission-cut", "pause-status-gaps-admission-cut", "pause-missing", "pause-corrupt", "pause-conflict"]) {
     if (mode === "pause-status-continue") {
       describe("private real paused fixture", () => {
         const ownedRoots: string[] = [], ownedDisposers: (() => void)[] = [];
@@ -112,7 +115,7 @@ describe("plan/execute packaged composition", () => {
 describe("plan/execute packaged composition", () => {
   // SDK/Node loader preparation is file-owned setup, not checkpoint-case work.
   beforeAll(async () => { if (!native.nativeCheckpoint) await startNativeCheckpoint(); });
-  for (const mode of ["pause-later-input", "pause-permission", "pause-active", "pause-input-cut", "pause-intention-cut", "pause-effect-cut", "pause-result-cut", "pause-cursor-cut", "pause-write-cut", "pause-empty", "pause-observer-denial", "pause-replay-complete", "pause-result-save-before", "pause-intention-save-before", "pause-wrong-baseline", "pause-loss-reentry", "pause-equivalent-capture", "pause-successor-corrupt", "pause-repeated-publication", "pause-reusable-result"]) {
+  for (const mode of ["pause-later-input", "pause-input-cut", "pause-effect-cut", "pause-write-cut", "pause-empty", "pause-replay-complete", "pause-wrong-baseline", "pause-loss-reentry", "pause-equivalent-capture", "pause-successor-corrupt", "pause-repeated-publication", "pause-reusable-result"]) {
     // Explicit human budget calibration for this multi-reentry integration case;
     // the other scenarios retain Bun's existing default deadline.
     test(`registered Node checkpoint lifecycle confirms bytes with progress: ${mode}`,

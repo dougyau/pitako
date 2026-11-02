@@ -221,7 +221,9 @@ export function nativeCheckpointFixture({ workflowSettlements, checkpointCancell
   let nativeCheckpointExit: Promise<[number, string, string]>;
   let nativeCheckpointReply: ((value: [number, string, string] | undefined) => void) | undefined;
   const nativeCheckpointExits: { promise: Promise<[number, string, string]>; cancelled: boolean }[] = [];
-  async function startNativeCheckpoint() {
+  // Settlement-only harness cases pass `sdk: false`: process, IPC and stream
+  // ownership do not depend on the SDK, which otherwise loads once before ready.
+  async function startNativeCheckpoint({ sdk = true } = {}) {
     nativeCheckpointRoot ??= mkdtempSync(path.join(tmpdir(), "pitako-checkpoint-node-"));
     let ready!: () => void;
     const started = new Promise<void>(resolve => { ready = resolve; });
@@ -233,16 +235,22 @@ export function nativeCheckpointFixture({ workflowSettlements, checkpointCancell
           if(error){console.error(error);process.exitCode=1;disconnect();}
         });
       };
-      (async()=>{
+      let loaded;
+      const sdk=()=>loaded??=(async()=>{
         const {runWorkflowScript}=await import(${JSON.stringify(new URL("../../node_modules/pi-subagents/src/workflows/scripted-workflow.js", import.meta.url).href)});
         const loadExtensions=(await import(${JSON.stringify(new URL("../../node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/loader.js", import.meta.url).href)})).loadExtensionsCached;
         await loadExtensions([${JSON.stringify(path.resolve("extensions/checkpoint-create.ts"))}],process.cwd());
+        return {runWorkflowScript,loadExtensions};
+      })();
+      (async()=>{
+        if(${sdk})await sdk();
         process.on('message',async ({input,harness})=>{
           const prior=process.env.PI_CODING_AGENT_DIR, cwd=process.cwd();
           try {
             process.chdir(input.root);process.env.PI_CODING_AGENT_DIR=input.agentDir;
+            const {runWorkflowScript,loadExtensions}=input.sdk===false?{}:await sdk();
             const value=await (0,eval)('('+harness+')')(input,runWorkflowScript,${childResponse.toString()},
-              {...require('node:fs'),...require('node:child_process'),...await import(input.module??input.checkpointModule),...await import(input.evidence??input.evidenceModule),loadExtensions,hash:data=>require('node:crypto').createHash('sha256').update(data).digest('hex')},${registeredCheckpoint.toString()});
+              input.sdk===false?{}:{...require('node:fs'),...require('node:child_process'),...await import(input.module??input.checkpointModule),...await import(input.evidence??input.evidenceModule),loadExtensions,hash:data=>require('node:crypto').createHash('sha256').update(data).digest('hex')},${registeredCheckpoint.toString()});
             send({value});
           } catch(error) {
             if(process.connected)send({error:String(error.stack??error)});
