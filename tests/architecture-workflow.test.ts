@@ -890,15 +890,72 @@ describe("architecture foreground human frontier", () => {
       .toContain(`r1-${view.id}:` + "x".repeat(4090));
   });
 
-  test("rejects unknown or nonfactual prerequisites before dispatching any providers", async () => {
-    for (const dependsOn of [["missing"], ["scope"]]) {
-      const host = fixture(key => key.startsWith("director-doubts-") ? { ok: true, runId: key, structuredOutput: { doubts: [
-        { id: "scope", kind: "deliberation", dependsOn, question: "Scope A?", decision: "Scope" },
-      ] } } : child(key));
-      const result = await host.execute({ currentDecision: snapshot("Decision"), planning: true, consultation: "invalid" }, new Map());
-      expect(result.status).toBe("failed"); expect(result.error).toContain("dependencies");
-      expect(host.calls.some(call => call.request.phase === "architecture-factual")).toBe(false);
-    }
+  test.each([
+    ["deliberation", ["missing"]], ["deliberation", ["scope"]], ["deliberation", ["ask"]], ["deliberation", ["weigh"]],
+    ["human", ["missing"]], ["human", ["weigh"]], ["human", ["ask"]], ["scout", ["fact"]], ["researcher", ["fact"]],
+  ])("rejects a %s doubt depending on %p before dispatching any providers", async (kind, dependsOn) => {
+    const host = fixture(key => key.startsWith("director-doubts-") ? { ok: true, runId: key, structuredOutput: { doubts: [
+      { id: "fact", kind: "scout", dependsOn: [], question: "Local seam?", decision: "Reuse" },
+      { id: "ask", kind: "human", dependsOn: [], question: "Scope B?", decision: "Scope", recommendation: "Use scope B" },
+      { id: "weigh", kind: "deliberation", dependsOn: [], question: "Weigh seams?", decision: "Seams" },
+      { id: "scope", kind, dependsOn, question: "Scope A?", decision: "Scope", recommendation: "Use scope A" },
+    ] } } : child(key));
+    const result = await host.execute({ currentDecision: snapshot("Decision"), planning: true, consultation: "invalid" }, new Map());
+    expect(result.status).toBe("failed"); expect(result.error).toContain("dependencies");
+    expect(host.calls.some(call => call.request.phase === "architecture-factual")).toBe(false);
+  });
+
+  const layered = [
+    { id: "identity", kind: "scout", dependsOn: [], question: "Identity plane limits?", decision: "SEG path" },
+    { id: "edges", kind: "researcher", dependsOn: [], question: "Readmodel edges?", decision: "Critical path" },
+    { id: "seams", kind: "deliberation", dependsOn: ["edges", "identity"], question: "Settle the DAG seams", decision: "Crate edges" },
+    { id: "limits", kind: "human", dependsOn: ["identity"], question: "Accept limits?", decision: "Volume limits", recommendation: "Accept limits" },
+  ];
+  function layeredRespond(key: string): Result {
+    return key.startsWith("director-doubts-") ? { ...child(key), structuredOutput: { doubts: layered } } : child(key);
+  }
+
+  test("resolves deliberation doubts in evaluation only after their factual prerequisites", async () => {
+    const doubts = layered.filter(item => item.kind !== "human");
+    const host = fixture((key, request) => {
+      if (key === "director-after-r1") {
+        expect(request.task).toContain("Resolve deliberation doubts here");
+        expect(request.task).toContain(JSON.stringify(doubts[2]));
+        for (const id of ["identity", "edges"]) expect(request.task).toMatch(new RegExp(`"key":"doubts-r1-\\d","doubtId":"${id}","originalId":"decision\\.v1\\.doubts-r1-\\d\\.a1"`));
+        return child(key, finish);
+      }
+      return key.startsWith("director-doubts-") ? { ...child(key), structuredOutput: { doubts } } : child(key);
+    });
+    expect(await host.execute({ currentDecision: snapshot("Decision"), planning: true, maxRounds: 1 }))
+      .toMatchObject({ status: "completed", rounds: 1, validRounds: 1 });
+    const keys = host.calls.map(call => call.key);
+    expect(host.calls.filter(call => call.request.phase === "architecture-factual").map(call => call.request.agent))
+      .toEqual(["pitako.scout", "pitako.researcher"]);
+    expect(keys.indexOf("director-after-r1")).toBeGreaterThan(keys.indexOf("doubts-r1-1"));
+  });
+
+  test("reenters a confirmed doubts stage with deliberation prerequisites without relaunching the director", async () => {
+    // Reproduce the retained shape of a run rejected before this rule: doubts confirmed, stage still doubts.
+    let cut = false;
+    const first = fixture(layeredRespond, undefined, undefined, value => {
+      const control = (value.cursor as unknown as { control: { stage: string } }).control;
+      if (!cut && control.stage === "doubts" && value.cursor.dispatches.some(item => item.key === "director-doubts-r1" && item.boundary === "confirmed")) {
+        cut = true; throw new Error("Cut after confirmed doubts");
+      }
+    });
+    expect(await first.execute({ planning: true, currentDecision: snapshot("Decision"), maxRounds: 5 }))
+      .toMatchObject({ status: "failed", rounds: 1, validRounds: 1 });
+    expect(first.storage.get("architecture-decision")).toMatchObject({ rounds: 1, validRounds: 1,
+      cursor: { control: { stage: "doubts", round: 1 } } });
+    const resumed = fixture();
+    const result = await resumed.execute({ planning: true, continuation: { version: 2, consultation: "decision" } }, first.storage);
+    expect(result).toMatchObject({ status: "needs-human", rounds: 1, validRounds: 1, frontier: { round: 1, questions: [
+      { id: "limits", dependsOn: ["identity"], prerequisiteFacts: [{ id: "identity", key: "doubts-r1-0" }] },
+    ] } });
+    expect(resumed.calls.map(call => call.key)).toEqual(["doubts-r1-0", "doubts-r1-1"]);
+    const retained = first.storage.get("architecture-decision") as DurableConsultation;
+    expect(retained.cursor.dispatches.filter(item => item.key === "director-doubts-r1").map(item => item.originalId))
+      .toEqual(["decision.v1.director-doubts-r1.a1"]);
   });
 });
 

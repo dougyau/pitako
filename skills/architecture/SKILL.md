@@ -259,6 +259,9 @@ once every provider is settled, its dispatch boundary confirmed and its report
 sufficient, with no native barrier, does a human frontier pause the round.
 Failed prerequisites retain stage `frontier`; only an authorized `factualRetry`
 can reconcile them before pausing. There are no partial or withheld frontiers.
+Human and deliberation doubts may depend only on factual doubt IDs. Deliberation
+doubts are never dispatched: `director-after-rN` resolves them after the factual
+wave and any human answers, matching factual evidence by `doubtId`.
 
 The controller saves stage `awaiting-human` and `pending: { round, revision, ids }`,
 then returns `{ status: "needs-human", frontier, rounds, validRounds, continuation }`.
