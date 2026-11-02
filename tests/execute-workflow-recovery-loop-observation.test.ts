@@ -381,6 +381,36 @@ describe("workflow-owned execute controller", () => {
     expect(host.calls.map(call => call.key)).toEqual([...yieldedCalls.map(call => call.key), "invoke-human-1.l1.t2.a2"]);
   });
 
+  // Human input cannot restore a confirmed pause while its producer currently
+  // reports Stop, denial or activity; the restoration writer is never dispatched.
+  test.each([
+    { mode: "stopped", status: "cancelled", cause: "stopped" },
+    { mode: "permission", status: "blocked", cause: "native permission denial" },
+    { mode: "observer-permission", status: "blocked", cause: "native permission denial" },
+    { mode: "active", status: "blocked", cause: "current pertinent writer activity or native refusal" },
+  ])("pause restoration honors the paused producer's current $mode", async ({ mode, status, cause }) => {
+    const host = fixture("FULL SPECS", { taskCount: 2 });
+    host.setRespond((request, normal) => request.key.endsWith(".t2.a1") ? host.result(request, {
+      ...host.worker(request, "pause"), status: "blocked", remaining: ["Finish pending second unit"],
+      continuation: "Resume the admitted pause",
+    }) : normal());
+    expect((await host.execute()).status).toBe("blocked");
+    const paused = copy(host.current()), calls = copy(host.calls);
+    expect(paused.lastConfirmed).toMatchObject({ kind: "pause", taskId: "change2" });
+    host.setStatus(ref => {
+      if (!ref.includes(".t2.a1")) return copy(host.native.get(ref) ?? { ok: true, output: "", results: [] });
+      if (mode === "observer-permission") throw Error("Blocked by pi-subagents permission rule: 'status' is denied.");
+      return { ...copy(host.native.get(ref)!), ...(mode === "stopped" ? { stopped: true } : mode === "active" ? { state: "running" }
+        : { error: "Blocked by pi-subagents permission rule: current denial" }) };
+    });
+    const outcome = await host.execute({ unblock: true, resolution: { loop: 1, text: "Resume the saved pending unit" } });
+    expect(outcome).toMatchObject({ status, loopsConsumed: 1 });
+    expect(host.calls).toEqual(calls);
+    expect(host.history()[0]).toMatchObject({ cursor: 1, halt: { code: "native-barrier", cause } });
+    expect(host.history()[0].attempt.restore).toBeUndefined();
+    expect(host.current().lastConfirmed).toEqual(paused.lastConfirmed);
+  });
+
   // Rejects both retroactive checkpoint fabrication for a retained legacy
   // intention and accidental exemption of the next newly dispatched writer.
   // This is a controlled old-contract fixture, not historical-state replay.

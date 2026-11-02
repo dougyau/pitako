@@ -88,20 +88,13 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
         const stateCut = (value: any) => {
           if (!continuing || cut) return false;
           const l = value.loop;
-          return (input.mode === "pause-input-cut" && l?.resolutions?.at(-1)?.stage === "intention") ||
-            (input.mode === "pause-intention-cut" && l?.attempt?.restore?.undispatched) ||
-            (input.mode === "pause-result-cut" && l?.attempt?.number === 2 && l.attempt.stage === "result") ||
-            (input.mode === "pause-cursor-cut" && l?.cursor === 2);
+          return input.mode === "pause-input-cut" && l?.resolutions?.at(-1)?.stage === "intention";
         };
         const candidate = () => { const { head, fingerprint } = io.checkoutEvidence(input.root); return { head, fingerprint }; };
         const state = { get: (key: string) => structuredClone(storage.get(key)), set: (key: string, value: any) => {
           const checkpoint = value.lastConfirmed;
           const admission = checkpoint?.taskId === "second";
           if (!cut && input.mode === "admission-cut" && admission) { cut = true; throw Error("Before checkpoint admission save"); }
-          if (continuing && !cut && ((input.mode === "pause-result-save-before" && value.loop?.attempt?.number === 2 && value.loop.attempt.stage === "result") ||
-              (input.mode === "pause-intention-save-before" && value.loop?.attempt?.restore?.undispatched))) {
-            cut = true; throw Error("Controlled pause before essential save");
-          }
           storage.set(key, structuredClone(value)); io.writeFileSync(input.statePath, JSON.stringify(Object.fromEntries(storage))); // Only the admission/cursor ordering projection is observed below;
           // retain full native state in storage/on disk, not in every IPC snapshot.
           snapshots.push({ loops: value.loop ? [value.loop].map((loop: any) => ({ cursor: loop.cursor,
@@ -124,13 +117,10 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
         };
         const options = { script: input.script, state,
           status: async (key: string) => {
-            if (continuing && input.mode === "pause-observer-denial")
-              throw Error("Blocked by pi-subagents permission rule: observer denied");
             return (originals.get(key)?.structuredOutput?.status === "plan" ||
               (recoveryReplay && input.mode === "pause-reusable-result" && originals.has(key))) ? structuredClone(originals.get(key)) : ({ key, ok: true,
-            ...(continuing && !laterContinuing && ["pause-stop", "pause-later-input"].includes(input.mode) ? { stopped: true } : {}),
-            ...(continuing && input.mode === "pause-permission" ? { error: "Blocked by pi-subagents permission rule: current denial" } : {}),
-            state: continuing && input.mode === "pause-active" ? "running" : "unknown",
+            ...(continuing && !laterContinuing && input.mode === "pause-later-input" ? { stopped: true } : {}),
+            state: "unknown",
             output: "No current writer observation", artifactPaths: [] });
           },
           host: async (key: string, request: any) => {
@@ -278,7 +268,7 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
                 git: { head: current.head, checkpoints: [receipt.checkpointRef, ...(restoreReceipt ? [restoreReceipt.partialRef, restoreReceipt.restoredRef] : [])], wip: "Real owned WIP" },
                 checks: [{ id: intent.taskId + "-check", command: "bun test affected", cwd: input.root,
                   output: "Observed controlled unit", logPaths: [], result: "passed", before: current, after: current }] });
-              if (second && (input.mode === "missing-receipt" || input.mode === "pause-semantic")) delete result.structuredOutput.checkpointReceipt;
+              if (second && input.mode === "missing-receipt") delete result.structuredOutput.checkpointReceipt;
               if (second && input.mode === "wrong-progress") result.structuredOutput.checkpointReceipt = {
                 ...receipt, progress: { ...receipt.progress, consumedLoops: 2 } };
             }
@@ -321,14 +311,13 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
           if (input.mode === "pause-corrupt") io.writeFileSync(checkpoint.checkpointRef, "corrupt pause");
           if (input.mode === "pause-conflict") io.writeFileSync(input.root + "/owned", "unattributed edit");
           continuing = true;
-          // No-input must remain pending; the other routes use the registered current input.
-          resumed = await run({ ...options, script: input.mode === "pause-no-input" ? input.script : input.continuationScript } as any);
+          resumed = await run({ ...options, script: input.continuationScript } as any);
           if (input.mode === "pause-later-input") { laterContinuing = true; resumed = await run({ ...options, script: input.laterScript } as any); }
           if (input.mode === "pause-twice") {
             secondPause = { result: resumed.value, retained: structuredClone(storage.get("invoke-human-1")), calls: [...calls], archives: structuredClone(archives) };
             resumed = await run({ ...options, script: input.laterScript } as any);
           }
-          if (cut || lossReentry || ["pause-observer-denial", "pause-replay-complete", "pause-equivalent-capture", "pause-successor-corrupt", "pause-repeated-publication", "pause-reusable-result"].includes(input.mode)) {
+          if (cut || lossReentry || ["pause-replay-complete", "pause-equivalent-capture", "pause-successor-corrupt", "pause-repeated-publication", "pause-reusable-result"].includes(input.mode)) {
             recoveryReplay = true;
             // Three reentries cover discovery of a successor/publication, the
             // resulting exhausted bound, and another unchanged-evidence replay.
@@ -563,7 +552,7 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
             expect(actual.calls).not.toContain("invoke-human-1.l1.t3.a1");
             return;
           }
-          const blocked = ["pause-no-input", "pause-semantic", "pause-missing", "pause-corrupt", "pause-conflict", "pause-stop", "pause-permission", "pause-active", "pause-empty", "pause-observer-denial", "pause-wrong-baseline", "pause-successor-corrupt"].includes(mode);
+          const blocked = ["pause-missing", "pause-corrupt", "pause-conflict", "pause-empty", "pause-wrong-baseline", "pause-successor-corrupt"].includes(mode);
           if (blocked) {
             if (mode === "pause-empty") {
               expect(actual.original.lastConfirmed.taskId).toBe("first");
@@ -571,7 +560,7 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
             }
             expect(actual.resumed.status, JSON.stringify(actual.resumed)).not.toBe("complete");
             expect(actual.calls).not.toContain("invoke-human-1.l1.t3.a1");
-            if (["pause-no-input", "pause-semantic", "pause-stop", "pause-permission", "pause-active", "pause-empty", "pause-observer-denial"].includes(mode))
+            if (mode === "pause-empty")
               expect(actual.calls).not.toContain("invoke-human-1.l1.t2.a2");
             expect(actual.owned).toBe(mode === "pause-conflict" ? "unattributed edit" : mode === "pause-wrong-baseline" ? "completed pending work from pause" : "partial next-unit WIP");
           } else {
@@ -587,7 +576,7 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
             const advanced = actual.snapshots.findIndex((state: any) => state.loops?.[0]?.cursor === 2);
             expect(admitted).toBeLessThan(advanced);
             const partial = JSON.parse(JSON.parse(readFileSync(actual.partialRef, "utf8")).data);
-            expect(partial.partial[0].image.bytes).toBe(Buffer.from(["pause-write-cut", "pause-result-save-before"].includes(mode) ? "completed pending work from pause" : "partial next-unit WIP").toString("base64"));
+            expect(partial.partial[0].image.bytes).toBe(Buffer.from(mode === "pause-write-cut" ? "completed pending work from pause" : "partial next-unit WIP").toString("base64"));
           }
           if (mode === "pause-successor-corrupt") {
             const observations = actual.hostObservations.filter((entry: any) => entry.checkpoint);

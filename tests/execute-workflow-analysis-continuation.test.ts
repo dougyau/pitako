@@ -74,37 +74,36 @@ describe("workflow-owned execute controller", () => {
 
   // Reject blind keyed redispatch: the second responder would turn a retained
   // barrier into fulfillment, so absence of new calls is the observable guarantee.
-  test.each(["review.director-prepare", "review.independent-angle1", "compliance"])(
-    "retained analysis barrier at %s is observed before replay dispatch", async phase => {
-      for (const mode of ["stop", "permission", "thrown-permission", "thrown-status-stop", "pending", "unknown"]) {
-        const host = fixture();
-        const target = `invoke-human-1.l1.${phase}`;
-        host.setRespond((request, normal) => {
-          const result = normal();
-          if (request.key !== target) return result;
-          if (mode === "thrown-permission") throw Error("Blocked by pi-subagents permission rule: 'run' is denied.");
-          return { ...result, ok: false, ...(mode.includes("stop") ? { stopped: true }
-            : { error: "Blocked by pi-subagents permission rule: 'run' is denied." }) };
-        });
-        const first = await host.executeNative();
-        expect(first.status).toBe(mode.includes("stop") ? "cancelled" : "blocked");
-        expect(host.history()[0].analysisCalls.find((call: any) => call.key === target)).toMatchObject({ stage: "receipt" });
-        const calls = host.calls.length, hosts = host.hostCalls.length;
-        host.setRespond((_request, normal) => normal());
-        if (mode === "thrown-status-stop") host.setStatus(ref => {
-          if (ref === `native-${target}`) throw Error(`Status '${ref}' failed: Run: ${ref}\nState: stopped`);
-          return copy(host.native.get(ref)!);
-        });
-        if (mode === "pending" || mode === "unknown") host.setStatus(ref =>
-          ref === `native-${target}` ? mode === "pending" ? { ok: true, state: "running" } : { ok: true, output: "", results: [] }
-            : copy(host.native.get(ref)!));
-        const second = await host.executeNative();
-        expect(second.status).toBe(mode.includes("stop") ? "cancelled" : "blocked");
-        expect(host.calls).toHaveLength(calls);
-        expect(host.hostCalls.slice(hosts)).not.toContain("inspect-1");
-        expect(host.history()).toHaveLength(1);
-        expect(host.statusCalls).toContain(mode === "thrown-permission" ? target : `native-${target}`);
-      }
+  test.each(["review.director-prepare", "review.independent-angle1", "compliance"].flatMap(phase =>
+    ["stop", "permission", "thrown-permission", "thrown-status-stop", "pending", "unknown"].map(mode => ({ phase, mode }))))(
+    "retained analysis barrier at $phase ($mode) is observed before replay dispatch", async ({ phase, mode }) => {
+      const host = fixture();
+      const target = `invoke-human-1.l1.${phase}`;
+      host.setRespond((request, normal) => {
+        const result = normal();
+        if (request.key !== target) return result;
+        if (mode === "thrown-permission") throw Error("Blocked by pi-subagents permission rule: 'run' is denied.");
+        return { ...result, ok: false, ...(mode.includes("stop") ? { stopped: true }
+          : { error: "Blocked by pi-subagents permission rule: 'run' is denied." }) };
+      });
+      const first = await host.executeNative();
+      expect(first.status).toBe(mode.includes("stop") ? "cancelled" : "blocked");
+      expect(host.history()[0].analysisCalls.find((call: any) => call.key === target)).toMatchObject({ stage: "receipt" });
+      const calls = host.calls.length, hosts = host.hostCalls.length;
+      host.setRespond((_request, normal) => normal());
+      if (mode === "thrown-status-stop") host.setStatus(ref => {
+        if (ref === `native-${target}`) throw Error(`Status '${ref}' failed: Run: ${ref}\nState: stopped`);
+        return copy(host.native.get(ref)!);
+      });
+      if (mode === "pending" || mode === "unknown") host.setStatus(ref =>
+        ref === `native-${target}` ? mode === "pending" ? { ok: true, state: "running" } : { ok: true, output: "", results: [] }
+          : copy(host.native.get(ref)!));
+      const second = await host.executeNative();
+      expect(second.status).toBe(mode.includes("stop") ? "cancelled" : "blocked");
+      expect(host.calls).toHaveLength(calls);
+      expect(host.hostCalls.slice(hosts)).not.toContain("inspect-1");
+      expect(host.history()).toHaveLength(1);
+      expect(host.statusCalls).toContain(mode === "thrown-permission" ? target : `native-${target}`);
     });
 
   test.each(["review.director-prepare", "review.independent-angle1", "compliance"].flatMap(phase =>
