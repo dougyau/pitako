@@ -730,8 +730,9 @@ ROUND INDEX (recover complete contrary narratives via essential originals): ${JS
 Classify each unknown as scout (local), researcher (external contract), evidence-auditor
 (uncertain/conflicting claims), human (preferences/scope), or deliberation (adequate facts).
 Every question must name the decision it could change and have a unique id.
-Use dependsOn: [] for independent questions. Only human questions may depend on factual
-scout/researcher/evidence-auditor ids in this list; list ONLY their actual prerequisites.
+Use dependsOn: [] for independent questions. Only human and deliberation questions may depend on
+factual scout/researcher/evidence-auditor ids in this list; list ONLY their actual prerequisites.
+Factual questions are answered first; deliberation questions are resolved in your next evaluation.
 Human questions must include recommendation with a recommended answer and be worded so yes accepts it.
 Do not repeat settled arguments. Return an empty list only if no material doubt remains.
 Include humanContext: self-contained material facts, reasons, contradictions, limits and sources needed to answer the human frontier. Do not replace it with artifact paths.
@@ -747,7 +748,8 @@ Do not dispatch or answer human decisions.`),
       if (doubts.some(item => !["scout", "researcher", "evidence-auditor", "human", "deliberation"].includes(item.kind) ||
           !text(item.question) || !text(item.decision) || !/^[A-Za-z0-9_-]+$/.test(item.id ?? "") ||
           !Array.isArray(item.dependsOn) || new Set(item.dependsOn).size !== item.dependsOn.length ||
-          (item.kind !== "human" && item.dependsOn.length) ||
+          // Factual answers settle before human pauses and evaluation, so only their consumers may depend on them.
+          (!["human", "deliberation"].includes(item.kind) && item.dependsOn.length) ||
           (item.kind === "human" && !text(item.recommendation)) ||
           item.dependsOn.some(id => !doubts.some(other => other.id === id && factual(other)))) ||
           new Set(doubts.map(item => item.id)).size !== doubts.length) throw new Error("Invalid doubts or dependencies.");
@@ -772,7 +774,7 @@ Return sources, versions, limitations and contradictions. The script owns dispat
       answers.forEach((result, index) => {
         const key = providers[index].key;
         if (!evidence.some(item => item.key === key && item.originalId === delivered.get(result)?.id))
-          evidence.push({ key, originalId: delivered.get(result)?.id ?? null, ...nativeReference(result),
+          evidence.push({ key, doubtId: doubts.filter(factual)[index].id, originalId: delivered.get(result)?.id ?? null, ...nativeReference(result),
             diagnostic: delivered.get(result)?.diagnostic ?? result?.error ?? "Original not delivered." });
       });
       await save();
@@ -797,6 +799,7 @@ ROUND INDEX AND UNANSWERED DOUBTS (originals supplied once by reference):\n${JSO
 STEERING RECEIPTS:\n${JSON.stringify(steering)}
 Receipts do not prove the model followed steering. Missed delivery requires no blind retry.
 Evaluate report adequacy, agreements and decision-changing disagreements.
+Resolve deliberation doubts here, using the factual answers whose doubtId they list in dependsOn.
 ${control.factualRetry ? "This is an authorized selective factual retry, not another comparison. Reconcile the retained sufficient providers and new factual answer. Return finish or blocked only; do not request discuss." : rounds === maxRounds ? "The round limit is reached: return finish with explicit unresolved disagreements, or blocked. Do not request discuss." : "Return discuss only if another round can materially change the recommendation. Otherwise finish."}`,
     `director-after-r${rounds}`, "architecture-evaluate", `Round ${rounds} architecture evaluation`);
     await intend([evaluation]);
