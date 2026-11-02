@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { closeSync, existsSync, fchmodSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { checkoutEvidence, designatedWorkspace, gitRead } from "./spec-plans.ts";
+import { checkoutEvidence, designatedWorkspace, gitRead, withIndexReads } from "./spec-plans.ts";
 
 type Image = { bytes: string; mode: number } | null;
 export type CheckpointIntent = {
@@ -26,15 +26,15 @@ type ConfirmedUnit = { kind: "unit"; checkpointRef: string; digest: string;
   candidate: unknown; position: unknown; progress: unknown; taskId: string; attempt: number; resultRef: unknown };
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 const equal = isDeepStrictEqual;
-// Each public operation is synchronous, so its designated worktree cannot be
-// re-registered between internal reads. Validate it once per operation, not
-// once per checkpoint path: every validation spawns Git three times.
+// Each public operation is synchronous and never changes HEAD, the index or
+// worktree registration. Validate the worktree and read HEAD/index once per
+// operation, not once per checkpoint path or internal check.
 let workspaces: Map<string, ReturnType<typeof designatedWorkspace>> | undefined;
 function operation<A extends unknown[], R>(run: (...args: A) => R) {
   return (...args: A): R => {
     if (workspaces) return run(...args);
     workspaces = new Map();
-    try { return run(...args); } finally { workspaces = undefined; }
+    try { return withIndexReads(() => run(...args)); } finally { workspaces = undefined; }
   };
 }
 function syncDirectory(directory: string) {

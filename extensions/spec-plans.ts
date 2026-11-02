@@ -9,10 +9,24 @@ export const MAX_SPEC_BYTES = 26 * 1536;
 export function validatePlanId(id: unknown): asserts id is string {
   if (typeof id !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(id)) throw new Error("Invalid spec-plan ID.");
 }
+// Reads that depend only on HEAD and the index, never on worktree files.
+const indexReads = new Set(["rev-parse\0HEAD", "rev-parse\0HEAD\0--abbrev-ref\0HEAD", "ls-files\0--stage\0-z", "diff\0--cached\0--binary"]);
+let indexReadCache: Map<string, string> | undefined;
+// A synchronous operation that never changes HEAD or the index reads each of
+// them once: rereading within the same call cannot detect a concurrent change.
+export function withIndexReads<R>(run: () => R): R {
+  if (indexReadCache) return run();
+  indexReadCache = new Map();
+  try { return run(); } finally { indexReadCache = undefined; }
+}
 export function gitRead(root: string, ...args: string[]): string {
+  const key = args.join("\0"), cached = indexReads.has(key) ? indexReadCache?.get(root + "\0" + key) : undefined;
+  if (cached !== undefined) return cached;
   const env = { ...process.env, LC_ALL: "C", GIT_OPTIONAL_LOCKS: "0" };
   for (const key of Object.keys(env)) if (key.startsWith("GIT_") && key !== "GIT_OPTIONAL_LOCKS") delete (env as NodeJS.ProcessEnv)[key];
-  return execFileSync("git", args, { cwd: root, env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 32 * 1024 * 1024 });
+  const output = execFileSync("git", args, { cwd: root, env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 32 * 1024 * 1024 });
+  if (indexReads.has(key)) indexReadCache?.set(root + "\0" + key, output);
+  return output;
 }
 export function designatedWorkspace(root: string) {
   if (!path.isAbsolute(root)) throw new Error("Designated worktree must be absolute.");
