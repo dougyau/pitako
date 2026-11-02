@@ -2263,6 +2263,26 @@ describe("workflow-owned execute controller", () => {
     expect(director!.task).toContain("Missing checkoutEvidence candidate identity.");
   });
 
+  test.each(["gaps", "continue"])("a unit seal with %s status is a rejected attempt, not a root halt", async status => {
+    const host = fixture("FULL SPECS", { rawWorkerReceipts: true });
+    host.setRespond((request, normal) => {
+      const result = normal();
+      if (request.key === "invoke-human-1.l1.t1.a1") {
+        const value = result.structuredOutput;
+        expect(value.checkpointReceipt).toMatchObject({ kind: "unit" });
+        Object.assign(value, { status, remaining: ["Inherited mission gap outside this task"],
+          continuation: status === "continue" ? "Continue the same task" : null });
+      }
+      return result;
+    });
+    const output = await host.execute();
+    expect(output.status, output.reason).toBe("complete");
+    expect(host.history()[0]).toMatchObject({ outcome: "gaps", results: [{ status: "rejected",
+      rejection: expect.stringContaining(`Checkpoint kind unit contradicts worker status ${status}`) }] });
+    expect(host.history()[0].results[0].checkpoint).not.toHaveProperty("confirmation");
+    expect(host.calls.some(call => call.key.startsWith("invoke-human-1.l1.review."))).toBe(false);
+  });
+
   test("material review gaps skip compliance and all repairs until next director", async () => {
     const host = fixture("FULL SPECS", { findings: true }); host.setRespond((request, normal) => {
       const result = normal(); if (request.key.endsWith("director-synthesis") && request.key.includes(".l1.")) {
