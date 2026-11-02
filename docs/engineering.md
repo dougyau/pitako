@@ -58,8 +58,7 @@ navigation available. Analysis removes known editing tools and introduced
 mutators (including locally writing `ssh_pull`, Python/Cargo execution effects
 and hash saving) and blocks them at the tool-call boundary, including codemode.
 It retains shell, so this is not a sandbox. Child strict allowlists retain
-hash queries for read-only roles, saving/full tools for workers, no packaged child delegation and the narrow
-interview relay.
+hash queries for read-only roles, saving/full tools for workers, and no packaged child delegation.
 
 `extensions/index.ts` registers only `/pitako`, profile guidance, automatic
 ordinary session naming, profile mutation and edit/write protected-path guards. Startup does not
@@ -83,7 +82,7 @@ The [architecture](../skills/architecture/SKILL.md) and
 evidence contracts. Callers provide a concrete single-line `workDescription`.
 New and resumed producers receive readable labels, explicit phases and a concrete
 first task line. This includes context providers, initial directors, doubts,
-the relay and execute's integrated review. Review angles and initial provider
+and execute's integrated review. Review angles and initial provider
 identities precede the work description. Integrated review uses available
 admitted task goals or completed-work descriptions, not just the spec ID.
 These titles do not rename retained sessions or control all native views
@@ -99,9 +98,13 @@ do not prove required publication. The skills define access checks, retention
 of failed originals and the whole-file capacity limit. Missing or contradictory
 essentials block dependent conclusions, including after resume. Publication,
 delivery, sufficiency, access and optional observability are distinct.
-Foreground receives concise supporting context, and the file-blind relay receives
-a self-contained frontier. Final memos retain material reasons, disagreement
-and limits. This adds no summarizer, phase, filesystem capability, profile
+Planning awaits all factual providers in one wave, then pauses in native mission
+state with `needs-human` and a self-contained frontier for the foreground human.
+No child waits for human answers. Re-entry uses the exact `continuation` plus
+`humanAnswers` with per-ID provenance; continuation alone replays the pause
+without dispatch or writes, with no expiry. Keep one in-flight run per consultation;
+native state is not an atomic lock. Answers are decision context only. Final memos retain material reasons,
+disagreement and limits. This adds no summarizer, filesystem capability, profile
 delegation, exactly-once guarantee or dependency certification.
 
 The workflows return advice with native references. They do not grant authority,

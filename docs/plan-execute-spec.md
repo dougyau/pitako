@@ -139,11 +139,17 @@ truncate, erase history or add alternate storage. The whole-file native capacity
 limit remains binding. Optional observability failure is not required publication
 failure.
 
-The coordinator does not routinely import intermediate reports. The file-blind
-relay receives self-contained frontiers. Independent human questions do not wait
-for unrelated facts. Only the actual foreground human confirms shared
-understanding. Final synthesis is self-contained, with reasons, contrary
-narrative, coverage, dispositions and limits. Pitako does not universally control
+The coordinator does not routinely import intermediate reports. Planning awaits
+all factual providers in one wave before returning `needs-human`; failed
+prerequisites block the pause until an authorized factual retry. The foreground
+reads the full `status.json` `workflow.value`, asks the actual human the entire
+frontier in one round, records per-ID provenance, and re-enters the same mission
+and consultation with `planning: true`, the exact `continuation` and `humanAnswers`.
+No child waits for a human; the pause has no expiry and consumes no extra round.
+Keep at most one in-flight run per consultation: native state is not an atomic
+caller lock. Answers are decision context, not implementation authority or final
+confirmation. Only the actual foreground human confirms shared understanding.
+Final synthesis is self-contained, with reasons, contrary narrative, coverage, dispositions and limits. Pitako does not universally control
 or certify native notices, retention or recovery.
 
 ### Doubts are resolved between architecture rounds

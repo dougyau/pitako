@@ -90,6 +90,22 @@ if (previous && (!text(previous.cursor.phase) ||
     (previous.cursor.barriers !== undefined && (!Array.isArray(previous.cursor.barriers) ||
       previous.cursor.barriers.some(item => !text(item?.key) || !text(item?.diagnostic))))))
   throw new Error("Invalid architecture continuation cursor association or confirmed evidence.");
+const paused = previous?.cursor.control?.stage === "awaiting-human";
+if (paused && (args.evidence !== undefined || args.factualRetry !== undefined))
+  throw new Error("Evidence and factualRetry are not accepted while awaiting-human.");
+if (args.humanAnswers !== undefined) {
+  const input = args.humanAnswers, pending = previous?.cursor.control?.pending;
+  if (!planning || !paused || args.replacement !== undefined || args.newDecision === true ||
+      !pending || pending.round !== previous.cursor.control.round || pending.round !== previous.rounds ||
+      pending.revision !== previous.currentDecision.revision || input?.consultation !== args.consultation ||
+      input.revision !== pending.revision || input.round !== pending.round ||
+      !Array.isArray(input.answers) || !Array.isArray(pending.ids) ||
+      input.answers.length !== pending.ids.length || new Set(input.answers.map(item => item?.id)).size !== pending.ids.length ||
+      input.answers.some(item => !pending.ids.includes(item?.id) ||
+        !["answer", "defer", "unknown"].includes(item.disposition) || !text(item.provenance) ||
+        (item.disposition === "answer" && !text(item.content))))
+    throw new Error("Invalid humanAnswers: submit exact pending IDs, consultation, revision and round while awaiting-human, without replacement.");
+}
 const newDecision = args.newDecision === true;
 if (previous && newDecision && (planning || args.currentDecision?.brief?.trim() === previous.currentDecision.snapshot.brief.trim()))
   throw new Error("A continuation cannot reset the same consultation. Start a genuinely new planning consultation separately.");
@@ -148,7 +164,7 @@ if (!previous || cursor.phase === "concluded" || newDecision || args.replacement
 };
 const control = cursor.control;
 if (control.version !== 1 || control.planning !== planning || !Number.isInteger(control.start) || control.start < 0 ||
-    control.start > cursor.dispatches.length || !["prepare", "perspectives", "doubts", "frontier", "evaluate"].includes(control.stage))
+    control.start > cursor.dispatches.length || !["prepare", "perspectives", "doubts", "frontier", "awaiting-human", "evaluate"].includes(control.stage))
   throw new Error("Invalid architecture phase control.");
 if (args.factualRetry !== undefined) {
   const retry = args.factualRetry;
@@ -188,6 +204,7 @@ const doubtsSchema = { type: "object", additionalProperties: false, required: ["
       dependsOn: { type: "array", uniqueItems: true, items: { type: "string" } },
       kind: { enum: ["scout", "researcher", "evidence-auditor", "human", "deliberation"] },
       question: { type: "string", minLength: 1 }, decision: { type: "string", minLength: 1 },
+      recommendation: { type: "string", minLength: 1 },
     } } },
 } };
 const rules = `Architecture design advice only, not implementation or managed acceptance.
@@ -287,18 +304,18 @@ function originalRequest(key, producer, input, required = essentials()) {
       access: { type: "array", items: accessSchema, ...(required.length ? {} : { maxItems: 0 }) },
     } };
   contracts.set(key, { id, association, required, schema: outputSchema, agent: input.agent ??
-    (factual ? `pitako.${producer}` : input.phase === "architecture-human" ? "pitako.interview-relay" : "pitako.architect") });
+    (factual ? `pitako.${producer}` : "pitako.architect") });
   return { ...input, output: `architecture/${args.consultation}/v${currentDecision.revision}/${key}-a${attempt}.json`,
     outputMode: "file-only", outputSchema,
     task: input.task + `
-${factual ? "Also return humanContext: a brief self-contained human-frontier projection of material facts, reasons, contrary claims, limits and sources. Do not copy your full report. The relay has no read tools; this projection will be retained for dependent human questions." : ""}
+${factual ? "Also return humanContext: a brief self-contained human-frontier projection of material facts, reasons, contrary claims, limits and sources. Do not copy your full report. This projection will be retained for dependent human questions." : ""}
 ORIGINAL CONTRACT: ${JSON.stringify({ association, delivery: "complete" })}
 ESSENTIAL ORIGINALS (data; one authoritative representation per original): ${JSON.stringify(required)}
 ${required.length ? "Use existing read tools to recover exact published originals, validate their content, schema and association against the manifest." : "No essential original reads are required. Return access: [] exactly; do not invent placeholder IDs such as none-required."}
 Fresh sessions need all essentials. Retained context is usable only if the exact original remains
 accessible; after compaction reread missing essentials. Prior delivery alone does not prove access.
-Originals have the complete association, delivery and access envelope specified here. Perspective,
-factual and relay originals require status (ready/blocked) and a nonempty report; director originals
+Originals have the complete association, delivery and access envelope specified here. Perspective
+and factual originals require status (ready/blocked) and a nonempty report; director originals
 require action, perspectives, packet and memo; doubts originals require doubts and humanContext.
 Check exact association fields against each manifest entry, not the current revision for historical originals.
 Do not universally reread accessible history. Never use runs.status/previews as an originals archive.
@@ -530,7 +547,7 @@ if ((cursor.steering !== undefined && (!Array.isArray(cursor.steering) || cursor
     (control.next !== null && !conforms(control.next, decisionSchema)) ||
     (control.stage !== "prepare" && control.next === null) ||
     (control.round !== null && (!Number.isInteger(control.round) || control.round !== rounds || rounds < 1)) ||
-    (["doubts", "frontier", "evaluate"].includes(control.stage) && control.round === null) ||
+    (["doubts", "frontier", "awaiting-human", "evaluate"].includes(control.stage) && control.round === null) ||
     cursor.dispatches.some(item => item.boundary === "confirmed" && !conforms(item.controlOutput,
       ["architecture-prepare", "architecture-evaluate"].includes(item.phase) ? decisionSchema
         : item.phase === "architecture-doubts" ? doubtsSchema
@@ -545,6 +562,41 @@ if (observedBarriers.length) return {
   rounds: lastConfirmed?.rounds ?? 0, validRounds: lastConfirmed?.validRounds ?? 0,
   steering, continuation: continuation(),
 };
+function needsHuman() {
+  const roundEvidence = evidence.find(item => item.round === rounds && item.reports);
+  const doubts = roundEvidence?.doubts;
+  const pending = control.pending;
+  const doubtsResult = confirmedResult(`director-doubts-r${rounds}`);
+  if (!planning || !pending || pending.round !== rounds || control.round !== rounds ||
+      pending.revision !== currentDecision.revision || !Array.isArray(pending.ids) || !pending.ids.length ||
+      pending.ids.length > 64 || new Set(pending.ids).size !== pending.ids.length || !Array.isArray(doubts) ||
+      doubts.filter(item => item.kind === "human").length !== pending.ids.length ||
+      pending.ids.some(id => !doubts.some(item => item.id === id && item.kind === "human")) || !doubtsResult)
+    throw new Error("Invalid pending human frontier.");
+  const factual = doubts.filter(item => ["scout", "researcher", "evidence-auditor"].includes(item.kind));
+  const facts = factual.map((item, index) => {
+    const key = `doubts-r${rounds}-${index}`, result = confirmedResult(key);
+    report(result, key);
+    return { id: item.id, key, originalId: delivered.get(result).id, humanContext: controlValue(result).humanContext };
+  });
+  return { status: "needs-human", frontier: {
+    consultation: args.consultation, revision: currentDecision.revision, round: rounds,
+    questions: pending.ids.map(id => {
+      const { question, decision, recommendation, dependsOn } = doubts.find(item => item.id === id);
+      return { id, question, decision, recommendation, dependsOn,
+        prerequisiteFacts: facts.filter(item => dependsOn.includes(item.id)) };
+    }), humanContext: controlValue(doubtsResult).humanContext,
+  }, rounds, validRounds, continuation: continuation() };
+}
+if (control.stage === "awaiting-human") {
+  const frontier = needsHuman();
+  if (args.humanAnswers === undefined) return frontier;
+  evidence.push({ key: `human-answers-r${rounds}`, kind: "actual-human-decision-context",
+    consultation: args.consultation, revision: currentDecision.revision, round: rounds,
+    answers: args.humanAnswers.answers });
+  delete control.pending;
+  control.stage = "evaluate";
+}
 // Persist admission/replacement before any participant can use it. A failed write cannot be retried by the catch below.
 await save();
 try {
@@ -680,7 +732,7 @@ Classify each unknown as scout (local), researcher (external contract), evidence
 Every question must name the decision it could change and have a unique id.
 Use dependsOn: [] for independent questions. Only human questions may depend on factual
 scout/researcher/evidence-auditor ids in this list; list ONLY their actual prerequisites.
-Human questions must include a recommended answer and be worded so yes accepts it.
+Human questions must include recommendation with a recommended answer and be worded so yes accepts it.
 Do not repeat settled arguments. Return an empty list only if no material doubt remains.
 Include humanContext: self-contained material facts, reasons, contradictions, limits and sources needed to answer the human frontier. Do not replace it with artifact paths.
 Do not dispatch or answer human decisions.`),
@@ -696,106 +748,51 @@ Do not dispatch or answer human decisions.`),
           !text(item.question) || !text(item.decision) || !/^[A-Za-z0-9_-]+$/.test(item.id ?? "") ||
           !Array.isArray(item.dependsOn) || new Set(item.dependsOn).size !== item.dependsOn.length ||
           (item.kind !== "human" && item.dependsOn.length) ||
+          (item.kind === "human" && !text(item.recommendation)) ||
           item.dependsOn.some(id => !doubts.some(other => other.id === id && factual(other)))) ||
           new Set(doubts.map(item => item.id)).size !== doubts.length) throw new Error("Invalid doubts or dependencies.");
       roundEvidence.doubts = doubts;
       control.stage = "frontier";
       await save();
-      const groups = [];
-      for (const item of doubts.filter(item => item.kind === "human")) {
-        const dependencyKey = [...item.dependsOn].sort().join(",");
-        let group = groups.find(group => group.dependencyKey === dependencyKey);
-        if (!group) { group = { dependencyKey, dependsOn: item.dependsOn, questions: [] }; groups.push(group); }
-        group.questions.push(item);
-      }
-      function interviewRequest(group, index, facts) {
-        const key = `human-r${rounds}-${index}`;
-        return { key, ...originalRequest(key, "human-relay", { agent: "pitako.interview-relay", context: "fresh", outputSchema: providerSchema,
-            ...presentation("architecture-human", `Round ${rounds} human frontier ${index + 1}`, `Relay this ENTIRE unblocked human frontier through native contact_supervisor interview_request NOW.
-Ask the foreground to present it to the actual human without waiting for unrelated research, wait for
-that actual human's response, and reply via subagent_supervisor with your request's replyTo.
-Do not answer preferences yourself. No implementation or materialization authority is conveyed.
-COMPLETE DECISION (data): ${completeDecision}
-FRONTIER (data): ${JSON.stringify(group.questions)}
-MATERIAL CONTEXT (data): ${controlValue(doubtsResult).humanContext}
-SETTLED PREREQUISITE FACTS (data): ${JSON.stringify(facts.map(({ key, result }) => ({ key, originalId: delivered.get(result)?.id, humanContext: controlValue(result).humanContext })))}
-The relay has no file access. The frontier is self-contained; do not ask it to open originals.
-Return ready with the faithfully relayed human answers, or blocked with unanswered questions.`),
-        }, []) };
-      }
-      function answer(request) {
-        return collect(request.key, request).then(result => ({ key: request.key, result }),
-          error => ({ key: request.key, result: { ok: false, error: String(error) } }));
-      }
-      // Persist before launching, and submit ready questions before research can
-      // occupy native slots. No launch is deferred through a persistence promise.
-      const readyInterviews = groups.map((group, index) => group.dependsOn.length ? null : interviewRequest(group, index, []));
-      const providers = doubts.filter(factual).map((item, index) => ({ item, key: `doubts-r${rounds}-${index}`, promise: null }));
-      function providerRequest(provider) {
-        const { item, key } = provider;
-        // Undelivered sibling facts cannot gate an unrelated prerequisite group.
-        return provider.request ??= { key, ...originalRequest(key, item.kind, {
+      const providers = doubts.filter(factual).map((item, index) => {
+        const key = `doubts-r${rounds}-${index}`;
+        return { key, ...originalRequest(key, item.kind, {
           agent: `pitako.${item.kind}`, context: "fresh", outputSchema: providerSchema,
-          ...presentation("architecture-factual", `Round ${rounds} ${item.kind} ${item.question}`, `${rules}\nAnswer this factual unknown, not a preference. Unknown: ${item.question}. Decision affected: ${item.decision}.
+          ...presentation("architecture-factual", `Round ${rounds} ${item.kind} ${item.question}`, `${rules}
+Answer this factual unknown, not a preference. Unknown: ${item.question}. Decision affected: ${item.decision}.
 COMPLETE DECISION: ${completeDecision}. Existing evidence and contrary claims: ${JSON.stringify(evidence)}
 Return sources, versions, limitations and contradictions. The script owns dispatch.`),
-        }, essentials().filter(original => original.delivery === "complete" || !providers.some(other => other.key === original.key))) };
-      }
-      function provide(provider) {
-        return provider.promise ??= answer(provider.request);
-      }
-      // Do not FIFO-queue unrelated facts ahead of a frontier that its prerequisites unlock.
-      // Submit the relay, not its awaited human answer, before starting the next group.
-      const pending = groups.map((group, index) => ({ group, index })).filter(({ group }) => group.dependsOn.length);
-      const missing = group => providers.filter(provider => group.dependsOn.includes(provider.item.id) && !provider.promise).length;
-      pending.sort((left, right) => missing(left.group) - missing(right.group) || left.index - right.index);
-      const firstProviders = pending.length
-        ? providers.filter(provider => pending[0].group.dependsOn.includes(provider.item.id)) : providers;
-      // Commit the first launch wave together so a fast relay cannot prevent
-      // its factual siblings from starting between separate intention awaits.
-      await Promise.all([...readyInterviews.filter(Boolean), ...firstProviders.map(providerRequest)]
-        .map(request => intend([request])));
-      const interviews = readyInterviews.map(request => request ? answer(request) : null);
-      firstProviders.forEach(provide);
-      while (pending.length) {
-        // A smaller missing subset must not wait behind a larger prerequisite batch.
-        pending.sort((left, right) => missing(left.group) - missing(right.group) || left.index - right.index);
-        const { group, index } = pending.shift();
-        const key = `human-r${rounds}-${index}`;
-        const prerequisites = providers.filter(provider => group.dependsOn.includes(provider.item.id));
-        await Promise.all(prerequisites.filter(provider => !provider.promise).map(provider => intend([providerRequest(provider)])));
-        const facts = await Promise.all(prerequisites.map(provide));
-        if (facts.some(({ result }) => !delivered.get(result)?.sufficient || controlValue(result)?.status !== "ready")) {
-          interviews[index] = Promise.resolve({ key, withheld: group.questions, result: null });
-        } else {
-          const request = interviewRequest(group, index, facts);
-          await intend([request]);
-          interviews[index] = answer(request);
-        }
-      }
-      await Promise.all(providers.filter(provider => !provider.promise).map(provider => intend([providerRequest(provider)])));
-      const [answers, humanAnswers] = await Promise.all([
-        Promise.all(providers.map(provide)), Promise.all(interviews),
-      ]);
-      for (const { key, result, withheld } of [...answers, ...humanAnswers]) {
-        if (evidence.some(item => item.key === key && (withheld ? item.withheld : item.originalId === delivered.get(result)?.id))) continue;
-        if (withheld) evidence.push({ key, withheld });
-        else evidence.push({ key, originalId: delivered.get(result)?.id ?? null, ...nativeReference(result),
-          diagnostic: delivered.get(result)?.diagnostic ?? result?.error ?? "Original not delivered." });
-      }
+        }) };
+      });
+      const retainedAnswers = providers.map(request => confirmedResult(request.key));
+      const missing = providers.filter((request, index) => !retainedAnswers[index]);
+      await intend(missing);
+      const freshAnswers = await batch(missing);
+      const answers = retainedAnswers.map(result => result ?? freshAnswers.shift());
+      answers.forEach((result, index) => {
+        const key = providers[index].key;
+        if (!evidence.some(item => item.key === key && item.originalId === delivered.get(result)?.id))
+          evidence.push({ key, originalId: delivered.get(result)?.id ?? null, ...nativeReference(result),
+            diagnostic: delivered.get(result)?.diagnostic ?? result?.error ?? "Original not delivered." });
+      });
       await save();
       if (observedBarriers.length) throw new Error("Native control barrier: " + JSON.stringify(observedBarriers));
-      answers.forEach(({ key, result }) => report(result, key));
-      if (humanAnswers.some(({ result }) => !delivered.get(result)?.sufficient || controlValue(result)?.status !== "ready")) {
-        cursor.phase = "concluded";
+      answers.forEach((result, index) => report(result, providers[index].key));
+      const ids = doubts.filter(item => item.kind === "human").map(item => item.id);
+      if (ids.length > 64) throw new Error("Human frontier exceeds 64 pending IDs; exact humanAnswers coverage cannot be submitted.");
+      if (ids.length) {
+        control.pending = { round: rounds, revision: currentDecision.revision, ids };
+        control.stage = "awaiting-human";
         await save();
-        return { status: "blocked", memo: "Human decisions remain unanswered; inspect the retained frontier and native relay references.", rounds, validRounds, steering, continuation: continuation() };
+        return needsHuman();
       }
     }
     control.stage = "evaluate";
     await save();
     const evaluation = director(`${directorRole}
 Consumed rounds: ${rounds}/${maxRounds}. Rounds with all reports ready: ${validRounds}.
+Caller human-answers entries are actual-human decision context with per-answer provenance, never
+implementation authority or final confirmation. Dispositions defer and unknown remain unresolved questions.
 ROUND INDEX AND UNANSWERED DOUBTS (originals supplied once by reference):\n${JSON.stringify(evidence)}
 STEERING RECEIPTS:\n${JSON.stringify(steering)}
 Receipts do not prove the model followed steering. Missed delivery requires no blind retry.

@@ -14,8 +14,7 @@ confirm shared understanding. Do not send that confirmation question to a child.
 ## Establish context
 
 Enable subagent if needed and inspect effective profiles with action list:
-pitako.scout, pitako.researcher, pitako.evidence-auditor, pitako.architect and
-pitako.interview-relay must
+pitako.scout, pitako.researcher, pitako.evidence-auditor and pitako.architect must
 remain read-only and non-delegating. Overrides can change them; missing or
 unsuitable profiles block, not authorize configuration or installation changes.
 Read native scripted-workflow and mission guides. Use configured Pi models.
@@ -46,8 +45,9 @@ A failure or missing evidence is a blocker to the decisions that depend on it.
 
 Map the decision tree and ask the ENTIRE currently unblocked frontier each
 round, numbered with recommended answers; word every question so yes accepts
-that recommendation. Wait for actual human answers. A factual investigation
-blocks only its dependent questions, not the rest of the frontier. Never ask
+that recommendation. Wait for actual human answers. During initial grilling a factual investigation
+blocks only its dependent questions, not the rest of the frontier. Architecture
+rounds use the full-provider pause boundary below. Never ask
 the human to research facts you can obtain through a read-only provider.
 
 Use the concise provider facts, reasons, contradictions, limits, pending
@@ -74,25 +74,35 @@ and adequately evidenced design disagreements back to deliberation. All reports
 and contrary evidence reach the next round, not only the director's view.
 Participants reason on the whole design; they never delegate.
 
-During factual research, pitako.interview-relay presents the independent human
-frontier through native contact_supervisor interview_request. On that request,
-ask the ACTUAL HUMAN the ENTIRE supplied frontier immediately, without waiting
-for unrelated research. Wait for their answers, then reply through native
-subagent_supervisor action reply using that request's replyTo. Never answer
-human preferences yourself. Explicit factual prerequisite IDs withhold only
-dependent questions until those facts settle. Failed research does not suppress
-independent questions; all launched work and native references are retained.
-The script submits each dependent frontier's prerequisites and then its relay
-before later groups or unrelated facts. It does not await human answers before
-continuing research. Some unrelated facts start later to avoid native FIFO
-admission delaying a newly answerable question; this is not preemption.
-The file-blind relay receives self-contained facts, reasons, contradictions,
-limits and questions; do not tell it to open artifacts. Essential originals
-stay available to factual readers under architecture's publication/access contract.
-The relay's report or a transport receipt is context, not new permission to
-implement/materialize and never replaces final actual-human confirmation.
+On `needs-human`, the architecture round has paused in native mission state after
+ALL factual providers settled successfully in one awaited wave. Failed prerequisite
+research blocks the pause until a human-authorized `factualRetry`; independent
+questions wait too. No child waits for a person. Read the full returned value from
+`status.json` at `workflow.value`; the completion wake preview is truncated.
+Ask the ACTUAL HUMAN the ENTIRE frontier in one round using the grilling format:
+number questions with recommendations and word them so yes accepts the recommendation.
+Use `frontier.humanContext` and each question's `prerequisiteFacts`, including facts,
+reasons, contradictions, limits and sources. Never answer preferences yourself.
+Record actual per-ID human provenance, including explicit deferrals or unknowns.
 
-For useful further evidence or answered human questions, invoke the SAME script,
+Re-enter the SAME script, consultation, mission and `planning: true` with the exact
+returned `continuation` plus `humanAnswers: { consultation, revision, round, answers }`.
+Take revision and round from the returned frontier; each answer is
+`{ id, disposition: "answer" | "defer" | "unknown", content, provenance }`.
+Content is required for `answer`; provenance is required for every ID. Cover the
+exact pending ID set once with no extras. See the architecture skill for the full
+shape, native payload bounds and rejection rules. Do not combine answers with a
+replacement or send `evidence`/`factualRetry` while paused. Continuation alone
+returns the same frontier without dispatch or writes; the pause has no expiry and
+survives restart. Keep at most one in-flight run per consultation, including
+re-entry: native mission state is not an atomic lock against concurrent submissions.
+Answers are decision context only, not permission to implement/materialize and
+never final actual-human confirmation. Deferrals and unknowns remain unresolved.
+A pause adds no round; even at round ten answers lead only to finish or blocked.
+Native Stop, cancellation, permission rejection and ambiguous/unsettled dispatch
+remain fatal, not `needs-human`.
+
+Outside the paused stage, for useful further factual evidence invoke the SAME script,
 consultation ID, `planning: true` and mission with the exact returned version-2
 `continuation`. For unchanged instructions use `evidence` for factual input;
 for changed instructions use an explicit complete `replacement` with consultation,

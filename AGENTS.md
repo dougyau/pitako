@@ -7,7 +7,7 @@ This guide applies to this checkout. Pitako is a TypeScript ESM package that com
 Start with [README.md](README.md) for project orientation and [Engineering layer](docs/engineering.md) for design decisions. The main directories are:
 
 - [extensions/](extensions/) contains profiles, Board, and composition adapters.
-- [agents/](agents/) contains the nine role-specific pi-subagents profiles.
+- [agents/](agents/) contains the eight role-specific pi-subagents profiles.
 - [skills/](skills/) contains the coding baseline, workflows, and contextual skills.
 - [config/](config/) contains structured defaults and configuration examples.
 - [scripts/](scripts/) contains checkout preparation, loaders, verification, and vendoring tools.
@@ -37,8 +37,7 @@ Registration and instruction sources:
 | Other composition | [extensions/index.ts](extensions/index.ts) and [extensions/profile.ts](extensions/profile.ts) assemble profile instructions; [extensions/catalog.ts](extensions/catalog.ts) advertises skills. [extensions/todo.ts](extensions/todo.ts) adapts rpiv-todo; [extensions/board/index.ts](extensions/board/index.ts) owns Board. CodeGraph, Codex patch tools, memory and web entries are linked in the stack manifest. |
 
 Availability is role-specific, not inherited from the foreground tool inventory.
-Eight of the nine [profiles](agents/) load dev-tools and hashes.
-The interview relay has no shell or file tools. Four roles
+All eight [profiles](agents/) load dev-tools and hashes. Four roles
 (architect, reviewer, scout, worker) load LSP/CodeGraph and ast-grep. Only the
 worker allows `ast_rewrite`; the other three allow only `ast_search`.
 The execute root workflow owns

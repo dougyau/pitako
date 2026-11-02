@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -198,13 +198,16 @@ describe("engineering-layer composition", () => {
     }
   });
 
-  test("all nine profiles pass the native parser and required-tool plan with explicit ACP and role ceilings", async () => {
+  test("all eight profiles pass the native parser and required-tool plan with explicit ACP and role ceilings", async () => {
     const parser = await import("../node_modules/pi-subagents/src/agents/frontmatter.js");
     const { resolvePiLaunchToolPlan } = await import("../node_modules/pi-subagents/src/runs/shared/child-tool-plan.js");
     const acpTools = ["compress", "decompress", "search_context", "acp_status", "acp_cache"];
     const queries = ["git_worktree_list", "git_status", "git_diff", "git_log", "git_show", "resource_snapshot", "file_sha256", "codemode"];
     const provider = readStack(packageRoot()).required.find(({ id }) => id === "pitako-dev-tools")!;
-    for (const role of ["architect", "reviewer", "scout", "researcher", "evidence-auditor", "execution-inspector", "worker", "execution-director", "interview-relay"]) {
+    const roles = ["architect", "reviewer", "scout", "researcher", "evidence-auditor", "execution-inspector", "worker", "execution-director"];
+    expect(readdirSync(path.join(packageRoot(), "agents")).filter(file => file.endsWith(".md")).sort())
+      .toEqual(roles.map(role => `${role}.md`).sort());
+    for (const role of roles) {
       const { frontmatter, body } = parser.parseFrontmatter(readRepo(`agents/${role}.md`));
       const resolve = (raw?: string) => parser.parseFrontmatterList(raw)?.map(entry => path.resolve(packageRoot(), "agents", entry));
       const plan = resolvePiLaunchToolPlan({
@@ -234,11 +237,6 @@ describe("engineering-layer composition", () => {
           "grep for literal text, logs, and config",
           "Empty results do not prove absence", "partial or unavailable",
         ]) expect(instructions).toContain(instruction);
-      }
-      if (role === "interview-relay") {
-        expect(plan.effectiveToolAllowlist).toEqual(["contact_supervisor", ...acpTools]);
-        expect(plan.configuredExtensions).toEqual([path.join(packageRoot(), "extensions/acp.ts")]);
-        continue;
       }
       for (const tool of queries) expect(plan.requiredChildTools).toContain(tool);
       expect(plan.extensionArgs).toContain(path.join(packageRoot(), provider.entry));

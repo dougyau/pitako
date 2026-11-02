@@ -109,6 +109,7 @@ Check the returned `status`, not just process success:
 
 - `completed` includes the director's design memo.
 - `blocked` includes a question or limit requiring a user decision.
+- `needs-human` pauses a planning round for foreground human answers (see below).
 - `failed` includes a failure and any captured continuation references.
 
 The director compares complete alternatives and records accepted and rejected
@@ -155,7 +156,7 @@ limit. Distinguish non-delivery from unproved completeness.
 
 The caller's concrete single-line `workDescription` supplies readable labels,
 explicit phases and first-line task titles for all fresh/resumed producers,
-including initial director, doubts, factual providers and relay. Keys remain
+including initial director, doubts and factual providers. Keys remain
 stable. Pitako does not rename retained sessions, control every native notice
 or view, guarantee artifact retention/recovery, or certify dependencies. The
 final memo remains self-contained: decisions, reasons, disagreements, limits
@@ -225,7 +226,7 @@ is not authority and cannot reset the same consultation; planning requires a
 separately authorized new consultation.
 
 If dispatch may have occurred without durable terminal/evidence confirmation,
-stop before another child launch, including the initial director or human relay.
+stop before another child launch, including the initial director.
 Correlation IDs and later `reused: true` do not establish safe dispatch or
 exactly-once execution. Essential save/capacity failure stops new dispatch and
 is not recursively retried. Settle owned work when native controls permit;
@@ -251,19 +252,67 @@ counters, and starts no new comparison round. Ambiguous dispatch blocks again;
 a further failed attempt needs new authorization targeting that latest attempt.
 Do not resend retained full reports in arguments.
 
-Planning launches pitako.interview-relay through the native
-supervisor channel concurrently with independent research. Each doubt names
-explicit factual prerequisite IDs; only dependent human questions wait for those
-facts. The read-only relay does not decide: when its interview_request arrives,
-present the ENTIRE supplied frontier to the ACTUAL HUMAN immediately, wait for
-their answers, then use subagent_supervisor action reply with that request's
-replyTo. Do not answer preferences yourself or wait for unrelated research.
-Relay reports/receipts are decision context, not implementation permission or
-final confirmation. All launched work is awaited and native references retained.
-Prerequisites for each dependent frontier run before later groups or unrelated
-facts; its relay is submitted without waiting for the human answer. This delays
-some unrelated research to avoid FIFO admission delaying answerable questions,
-without a custom priority scheduler or preemption.
+### Planning pause and human re-entry
+
+With `planning: true`, all factual providers launch in one awaited wave. Only
+once every provider is settled, its dispatch boundary confirmed and its report
+sufficient, with no native barrier, does a human frontier pause the round.
+Failed prerequisites retain stage `frontier`; only an authorized `factualRetry`
+can reconcile them before pausing. There are no partial or withheld frontiers.
+
+The controller saves stage `awaiting-human` and `pending: { round, revision, ids }`,
+then returns `{ status: "needs-human", frontier, rounds, validRounds, continuation }`.
+`frontier` contains `consultation`, `revision`, `round`, `humanContext`, and
+`questions`: each has `id`, `question`, `decision`, `recommendation`, `dependsOn`,
+and `prerequisiteFacts` (`id`, `key`, `originalId`, `humanContext`). The foreground
+reads the full `workflow.value` from native `status.json`, not the truncated wake
+preview, and asks the actual human the entire frontier in one grilling round.
+No child remains alive waiting for a person. The pause has no expiry, survives
+restart, does not run `director-after-rN`, and adds no consumed or valid round.
+Continuation-only re-entry returns the identical value without dispatch or writes.
+
+Re-enter the SAME script, mission and consultation with `planning: true`, the exact
+returned `continuation`, and:
+
+```js
+const humanAnswers = {
+	consultation: "stream-parser",
+	revision: pausedResult.frontier.revision,
+	round: pausedResult.frontier.round,
+	answers: pausedResult.frontier.questions.map(({ id }) => ({
+		id,
+		disposition: "answer", // or "defer" / "unknown"
+		content: "<actual human answer; required for answer>",
+		provenance: "<actual human message reference for this ID>"
+	}))
+};
+```
+
+Use actual answers, never inferred preferences. Every pending ID must appear
+exactly once, with no extras; all dispositions require nonempty caller provenance.
+`defer` and `unknown` remain unresolved. Validation requires the same consultation,
+revision and round, with `pending.round === control.round === rounds`, planning
+mode and stage `awaiting-human`. It precedes every write. Accepted answers become
+`human-answers-rN` evidence with per-answer provenance, clear pending, and advance
+to `evaluate`; the first save bears the answers before `director-after-rN` runs
+exactly once. They are actual-human decision context, NOT implementation authority
+or final confirmation.
+
+Reject without state/counter changes or child calls: answers outside the paused
+stage (including sequential duplicate submissions), wrong identity/revision/round,
+missing/extra/duplicate IDs, answers combined with `replacement`, and `evidence`
+or `factualRetry` while paused. Replacement alone resets to `prepare`, discards
+pending and preserves consumed counters; retain prior human decisions with their
+provenance in `snapshot.humanDecisions`.
+
+Native args bounds are 16384 compact UTF-8 bytes, 64 array items, 16 fields per
+object and depth 8. More than 64 pending IDs fails explicitly before pausing.
+Mission state over 256 KiB throws before write, including the answer-bearing save;
+never truncate. Keep at most one in-flight run per consultation: native state has
+no atomic caller lock, so concurrent re-entry can duplicate evaluation. Native
+Stop, cancellation, permission rejection and ambiguous/unsettled dispatch remain
+fatal, not human pauses.
+
 At the ceiling, answer/evidence reconciliation and synthesis-only reentry remain
 available; no eleventh perspective round is permitted.
 
