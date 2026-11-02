@@ -7,17 +7,15 @@ import { checkpointEvidence } from "../../extensions/execute-checkpoint.ts";
 import { isDeepStrictEqual } from "node:util";
 import { executionStatePath } from "../../extensions/execute-state.ts";
 
-// Planning validates only the root; execution uses the named resource's exact inspections. No writes.
-const [root, id, source, part] = process.argv.slice(2);
-if (!root || !id || source === undefined) throw new Error("Expected root, ID, and source selector.");
-function emitBounded(value: unknown) {
+type Inspection = { root: string; id: string; source: string; part?: string; context?: string; agentDir?: string; lines: string[] };
+function emitBounded(run: Inspection, value: unknown) {
   const encoded = JSON.stringify(value);
   if (Buffer.byteLength(encoded + "\n") > 4096) throw new Error("Inspection envelope exceeds the native 4096-byte stdout boundary.");
-  console.log(encoded);
+  run.lines.push(encoded);
 }
 // The exact mission is the same durable state read by the active root. Absence
 // is admission; a partial/conflicting association is never a fresh invocation.
-function admittedInvocation(context: any) {
+function admittedInvocation({ root, id, part }: Inspection, context: any) {
   let mission: any;
   try { mission = JSON.parse(readFileSync(executionStatePath(context), "utf8")); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
@@ -52,69 +50,78 @@ function admittedInvocation(context: any) {
     throw new Error("Incompatible retained association; no settings admission.");
   return true;
 }
-if (part === "admission") {
-  try {
-    const observed = preliminarySpec(root, id, source || undefined);
-    const context = JSON.parse(process.argv[6] ?? "null");
-    const admitted = admittedInvocation(context);
-    executionAmendments(observed.root, context.amendments, true);
-    const { sourceRefs, agentDir } = context.admission;
-    for (const ref of sourceRefs) {
-      const content = readFileSync(ref.path, "utf8");
-      validateSpec(content, path.basename(ref.path, ".md"));
-      const actual = createHash("sha256").update(content).digest("hex");
-      if (actual !== ref.digest) throw new Error(`Complete spec source hash mismatch: ${ref.path}; expected ${ref.digest}, observed ${actual}`);
+// Planning validates only the root; execution uses the named resource's exact
+// inspections. No writes. Returns the exact stdout of the inspect.mjs argument vector.
+export async function inspect(argv: string[]): Promise<string> {
+  const [root, id, source, part] = argv;
+  if (!root || !id || source === undefined) throw new Error("Expected root, ID, and source selector.");
+  const run: Inspection = { root, id, source, part, context: argv[4], agentDir: argv[5], lines: [] };
+  if (part === "admission") {
+    try {
+      const observed = preliminarySpec(root, id, source || undefined);
+      const context = JSON.parse(run.context ?? "null");
+      const admitted = admittedInvocation(run, context);
+      executionAmendments(observed.root, context.amendments, true);
+      const { sourceRefs, agentDir } = context.admission;
+      for (const ref of sourceRefs) {
+        const content = readFileSync(ref.path, "utf8");
+        validateSpec(content, path.basename(ref.path, ".md"));
+        const actual = createHash("sha256").update(content).digest("hex");
+        if (actual !== ref.digest) throw new Error(`Complete spec source hash mismatch: ${ref.path}; expected ${ref.digest}, observed ${actual}`);
+      }
+      let admission;
+      if (!admitted) {
+        if (!agentDir || !path.isAbsolute(agentDir)) throw new Error("Expected absolute host agent directory for settings admission.");
+        const { executeMaxCycles } = await import("../../extensions/execute-settings.ts");
+        admission = { maxCycles: executeMaxCycles(observed.root, agentDir) };
+      }
+      const { head, fingerprint } = checkoutEvidence(observed.root);
+      const recovery = admitted ? boundRetainedAnalyses(observed.root, observed.commonDir, observed.source,
+        observed.digest, observed.binding, context) : undefined;
+      const checkpointObservation = admitted ? observeCheckpoint({ root: observed.root, commonDir: observed.commonDir, selected: observed }, context) : undefined;
+      emitBounded(run, { version: 1, binding: observed.binding, checkout: { head, fingerprint }, ...(admission ? { admission } : {}),
+        ...(recovery ? { recoveryDigest: recovery.digest } : {}), ...(checkpointObservation ? { checkpointObservation } : {}) });
+    } catch (error) {
+      const message = String(error instanceof Error ? error.message : error);
+      const next = "Reconcile the identified input and explicitly prepare admission with the intended version. For an admitted invocation preserve its snapshot, restore reliable exact originals and deliver desired changes as a human addendum; unavailable originals remain blocked. Native barriers require supported native inspection/reconciliation, not source correction.";
+      const failure = { version: 1, error: message, next };
+      // Even unusually long paths/errors must produce a complete failure document.
+      if (Buffer.byteLength(JSON.stringify(failure) + "\n") > 4096)
+        failure.error = "Admission failed; detailed diagnostic exceeds envelope. Inspect the exact authorized host command inputs and selected source; observed identity unavailable.";
+      emitBounded(run, failure);
     }
-    let admission;
-    if (!admitted) {
-      if (!agentDir || !path.isAbsolute(agentDir)) throw new Error("Expected absolute host agent directory for settings admission.");
+  } else if (part === "settings") {
+    try {
       const { executeMaxCycles } = await import("../../extensions/execute-settings.ts");
-      admission = { maxCycles: executeMaxCycles(observed.root, agentDir) };
+      const agentDir = run.agentDir;
+      if (!agentDir || !path.isAbsolute(agentDir)) throw new Error("Expected absolute host agent directory for settings admission.");
+      const sourceRefs = JSON.parse(run.context ?? "[]") as { path: string; digest: string }[];
+      for (const ref of sourceRefs) {
+        const content = readFileSync(ref.path, "utf8");
+        validateSpec(content, path.basename(ref.path, ".md"));
+        if (createHash("sha256").update(content).digest("hex") !== ref.digest)
+          throw new Error(`Complete spec source hash mismatch: ${ref.path}`);
+      }
+      emitBounded(run, { maxCycles: executeMaxCycles(root, agentDir) });
+    } catch (error) {
+      // Native failed-command summaries truncate at 200 characters. Transport the
+      // complete admission diagnostic; this successful read is NOT admission.
+      emitBounded(run, { error: String(error instanceof Error ? error.message : error) });
     }
-    const { head, fingerprint } = checkoutEvidence(observed.root);
-    const recovery = admitted ? boundRetainedAnalyses(observed.root, observed.commonDir, observed.source,
-      observed.digest, observed.binding, context) : undefined;
-    const checkpointObservation = admitted ? observeCheckpoint({ root: observed.root, commonDir: observed.commonDir, selected: observed }, context) : undefined;
-    emitBounded({ version: 1, binding: observed.binding, checkout: { head, fingerprint }, ...(admission ? { admission } : {}),
-      ...(recovery ? { recoveryDigest: recovery.digest } : {}), ...(checkpointObservation ? { checkpointObservation } : {}) });
-  } catch (error) {
-    const message = String(error instanceof Error ? error.message : error);
-    const next = "Reconcile the identified input and explicitly prepare admission with the intended version. For an admitted invocation preserve its snapshot, restore reliable exact originals and deliver desired changes as a human addendum; unavailable originals remain blocked. Native barriers require supported native inspection/reconciliation, not source correction.";
-    const failure = { version: 1, error: message, next };
-    // Even unusually long paths/errors must produce a complete failure document.
-    if (Buffer.byteLength(JSON.stringify(failure) + "\n") > 4096)
-      failure.error = "Admission failed; detailed diagnostic exceeds envelope. Inspect the exact authorized host command inputs and selected source; observed identity unavailable.";
-    emitBounded(failure);
+  } else if (part === "root") {
+    validatePlanId(id);
+    run.lines.push(JSON.stringify(designatedWorkspace(root)));
+  } else {
+    await inspectSelected(run);
   }
-} else if (part === "settings") {
-  try {
-    const { executeMaxCycles } = await import("../../extensions/execute-settings.ts");
-    const agentDir = process.argv[7];
-    if (!agentDir || !path.isAbsolute(agentDir)) throw new Error("Expected absolute host agent directory for settings admission.");
-    const sourceRefs = JSON.parse(process.argv[6] ?? "[]") as { path: string; digest: string }[];
-    for (const ref of sourceRefs) {
-      const content = readFileSync(ref.path, "utf8");
-      validateSpec(content, path.basename(ref.path, ".md"));
-      if (createHash("sha256").update(content).digest("hex") !== ref.digest)
-        throw new Error(`Complete spec source hash mismatch: ${ref.path}`);
-    }
-    emitBounded({ maxCycles: executeMaxCycles(root, agentDir) });
-  } catch (error) {
-    // Native failed-command summaries truncate at 200 characters. Transport the
-    // complete admission diagnostic; this successful read is NOT admission.
-    emitBounded({ error: String(error instanceof Error ? error.message : error) });
-  }
-} else if (part === "root") {
-  validatePlanId(id);
-  console.log(JSON.stringify(designatedWorkspace(root)));
-} else {
-  await inspectSelected();
+  return run.lines.map(line => line + "\n").join("");
 }
-async function inspectSelected() {
+async function inspectSelected(run: Inspection) {
+  const { root, id, source, part } = run;
   const found = discoverSpec(root, id, source || undefined);
   const candidates = found.selected ? [] : found.candidates.map(({ source, digest }) => ({ source, digest }));
-  const context = process.argv[6] ? JSON.parse(process.argv[6]) : undefined;
-  const admitted = context?.admissionTransport ? admittedInvocation(context) : true;
+  const context = run.context ? JSON.parse(run.context) : undefined;
+  const admitted = context?.admissionTransport ? admittedInvocation(run, context) : true;
   let admission: { maxCycles: number } | undefined;
   if (context?.admission && !admitted) {
     try {
@@ -129,7 +136,7 @@ async function inspectSelected() {
       const { executeMaxCycles } = await import("../../extensions/execute-settings.ts");
       admission = { maxCycles: executeMaxCycles(root, agentDir) };
     } catch (error) {
-      emitBounded({ error: String(error instanceof Error ? error.message : error) });
+      emitBounded(run, { error: String(error instanceof Error ? error.message : error) });
       // No partial metadata or default limit accompanies an admission error.
       return;
     }
@@ -141,7 +148,7 @@ async function inspectSelected() {
     selected: found.selected ? { source: found.selected.source, digest: found.selected.digest, chunks: specChunks(found.selected.content).length } : null,
     ...(retained?.length ? { retainedAnalyses: retained } : {}),
     ...(checkpointObservation ? { checkpointObservation } : {}) };
-  if (part === undefined) console.log(JSON.stringify({ ...metadata, checkout: checkoutEvidence(found.root) }));
+  if (part === undefined) run.lines.push(JSON.stringify({ ...metadata, checkout: checkoutEvidence(found.root) }));
   else if (!found.selected) {
     if (part !== "metadata") throw new Error("Invalid snapshot chunk request.");
     // Only ambiguity needs locations. Foreground inspection above retains the complete list.
@@ -153,7 +160,7 @@ async function inspectSelected() {
       if (Buffer.byteLength(JSON.stringify(next) + "\n") > 4096) break;
       ambiguity.candidates = next.candidates; ambiguity.candidatesOmitted = next.candidatesOmitted;
     }
-    emitBounded({ ...ambiguity, ...(admission ? { admission } : {}) });
+    emitBounded(run, { ...ambiguity, ...(admission ? { admission } : {}) });
   } else {
     const checkout = checkoutEvidence(found.root);
     const inline = { ...metadata, checkout };
@@ -163,19 +170,19 @@ async function inspectSelected() {
     // rereading settings. Error receipts above use their own complete envelope.
     const envelope = context?.admissionTransport ? { ...inline, admission: { maxCycles: Number.MAX_SAFE_INTEGER } } : inline;
     if (Buffer.byteLength(JSON.stringify(envelope) + "\n") <= 4096) {
-      if (part === "metadata") emitBounded({ ...inline, ...(admission ? { admission } : {}) });
+      if (part === "metadata") emitBounded(run, { ...inline, ...(admission ? { admission } : {}) });
       else {
         if (!/^(0|[1-9]\d*)$/.test(part) || Number(part) >= content.length) throw new Error("Invalid snapshot chunk request.");
-        emitBounded({ digest: found.selected.digest, content: content[Number(part)] });
+        emitBounded(run, { digest: found.selected.digest, content: content[Number(part)] });
       }
     } else {
       // Share the existing 26 snapshot grants: spec text stays unencoded, while metadata
       // uses only the remaining measured bytes of each complete JSON envelope.
       const { transport, packets } = inspectionSnapshot(metadata, found.selected.content);
-      if (part === "metadata") emitBounded({ selected: { digest: found.selected.digest }, transport, checkout, ...(admission ? { admission } : {}) });
+      if (part === "metadata") emitBounded(run, { selected: { digest: found.selected.digest }, transport, checkout, ...(admission ? { admission } : {}) });
       else {
         if (!/^(0|[1-9]\d*)$/.test(part) || Number(part) >= packets.length) throw new Error("Invalid snapshot chunk request.");
-        emitBounded(packets[Number(part)]);
+        emitBounded(run, packets[Number(part)]);
       }
     }
   }

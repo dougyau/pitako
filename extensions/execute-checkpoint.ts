@@ -26,6 +26,17 @@ type ConfirmedUnit = { kind: "unit"; checkpointRef: string; digest: string;
   candidate: unknown; position: unknown; progress: unknown; taskId: string; attempt: number; resultRef: unknown };
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 const equal = isDeepStrictEqual;
+// Each public operation is synchronous, so its designated worktree cannot be
+// re-registered between internal reads. Validate it once per operation, not
+// once per checkpoint path: every validation spawns Git three times.
+let workspaces: Map<string, ReturnType<typeof designatedWorkspace>> | undefined;
+function operation<A extends unknown[], R>(run: (...args: A) => R) {
+  return (...args: A): R => {
+    if (workspaces) return run(...args);
+    workspaces = new Map();
+    try { return run(...args); } finally { workspaces = undefined; }
+  };
+}
 function syncDirectory(directory: string) {
   const fd = openSync(directory, "r");
   try { fsyncSync(fd); } finally { closeSync(fd); }
@@ -90,7 +101,8 @@ export function checkpointDirectory(intent: CheckpointIntent) {
       !Number.isSafeInteger(intent.loop) || intent.loop < 1 ||
       !Number.isSafeInteger(intent.cursor) || intent.cursor < 0 || intent.phase !== "implementation")
     throw new Error("Invalid checkpoint intention.");
-  const workspace = designatedWorkspace(intent.association.root);
+  const workspace = workspaces?.get(intent.association.root) ?? designatedWorkspace(intent.association.root);
+  workspaces?.set(intent.association.root, workspace);
   if (workspace.physicalRoot !== intent.association.root || workspace.identity !== intent.association.commonDir)
     throw new Error("Checkpoint worktree association mismatch.");
   return safePath(workspace.physicalRoot, `.pi/subagents/checkpoints/${intent.key}`, true);
@@ -239,7 +251,7 @@ function publishedSource(sources: CheckpointIntent[]) {
 // Read-only recovery witness. Keys, timestamps and renamed manifests are not
 // progress: only validated file states, admitted progress and durable restoration
 // publication contribute. Repeated equivalent captures therefore cannot renew it.
-export function checkpointEvidence(sources: CheckpointIntent[], progress: Pick<CheckpointProgress, "consumedLoops" | "admitted"> | { consumedLoops: number; admittedResults: { taskId: string; status: string }[] }, confirmedUnit?: ConfirmedUnit) {
+function evidence(sources: CheckpointIntent[], progress: Pick<CheckpointProgress, "consumedLoops" | "admitted"> | { consumedLoops: number; admittedResults: { taskId: string; status: string }[] }, confirmedUnit?: ConfirmedUnit) {
   const first = sources[0];
   if (!first || sources.some(item => !equal(item.association, first.association) ||
       item.taskId !== first.taskId || item.loop !== first.loop || item.cursor !== first.cursor))
@@ -296,7 +308,7 @@ export function checkpointEvidence(sources: CheckpointIntent[], progress: Pick<C
     JSON.stringify({ taskId, status })))].sort();
   return hash(JSON.stringify({ material: [...material].sort(), consumedLoops: progress.consumedLoops, admitted }));
 }
-export function restoreCheckpoint(source: CheckpointIntent | CheckpointIntent[], authority: RestoreAuthority) {
+function restore(source: CheckpointIntent | CheckpointIntent[], authority: RestoreAuthority) {
   // A restoration dispatch may disappear before capturing its own unit. Keep
   // the exact older source, not a fictional backup at the new attempt key.
   const sources = Array.isArray(source) ? source : [source];
@@ -418,7 +430,7 @@ export function sealCheckpoint(intent: CheckpointIntent, kind: "unit" | "pause",
 
 // Public writer operation over the same capture/seal storage used by the CLI.
 // Publication is not root admission; this function never changes mission state.
-export function createCheckpoint(intent: CheckpointIntent, kind: "pre" | "unit" | "pause", paths?: string[], signal?: AbortSignal) {
+function create(intent: CheckpointIntent, kind: "pre" | "unit" | "pause", paths?: string[], signal?: AbortSignal) {
   signal?.throwIfAborted();
   if (!["pre", "unit", "pause"].includes(kind)) throw new Error("Invalid checkpoint point kind.");
   const progress = admittedProgress(intent);
@@ -452,3 +464,6 @@ export function createCheckpoint(intent: CheckpointIntent, kind: "pre" | "unit" 
     progress, candidate: receipt?.candidate ?? { head: manifest.base.head, fingerprint: manifest.base.fingerprint },
     ...(receipt ? { checkpointReceipt: receipt } : {}), confirmed: false };
 }
+export const checkpointEvidence = operation(evidence);
+export const restoreCheckpoint = operation(restore);
+export const createCheckpoint = operation(create);

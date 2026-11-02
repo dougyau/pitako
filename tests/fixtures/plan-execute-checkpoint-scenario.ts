@@ -72,7 +72,9 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
         module: new URL("../../extensions/execute-checkpoint.ts", import.meta.url).href,
         toolModule: path.resolve("extensions/checkpoint-create.ts"),
         loaderModule: new URL("../../node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/loader.js", import.meta.url).href,
-        evidence: new URL("../../extensions/spec-plans.ts", import.meta.url).href };
+        evidence: new URL("../../extensions/spec-plans.ts", import.meta.url).href,
+        inspectorEntry: path.resolve("skills/execute/inspect.mjs"),
+        inspector: new URL("../../skills/execute/inspect.ts", import.meta.url).href };
       const harness = async (input: any, run: typeof runWorkflowScript, response: typeof childResponse, io: any, loadCheckpoint: typeof registeredCheckpoint) => {
         const storage = new Map<string, any>(), originals = new Map<string, any>(), calls: string[] = [], snapshots: any[] = [], points: any[] = [];
         const hostObservations: any[] = [];
@@ -124,7 +126,14 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
             output: "No current writer observation", artifactPaths: [] });
           },
           host: async (key: string, request: any) => {
-            const stdout = io.execFileSync("sh", ["-c", request.command], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+            // Run the granted inspector in this Node: the exact POSIX argument vector
+            // must round-trip. Shell quoting and the Node transport are covered by the
+            // fallback and settings admission tests, which spawn the real command.
+            const argv = [...request.command.matchAll(/'((?:[^']|'\\'')*)'/g)].map(match => match[1].replaceAll("'\\''", "'"));
+            if (argv[0] !== "node" || argv[1] !== input.inspectorEntry ||
+                argv.map(value => `'${value.replaceAll("'", "'\\''")}'`).join(" ") !== request.command)
+              throw Error("Unexpected inspection command: " + request.command);
+            const stdout = await (await import(input.inspector)).inspect(argv.slice(2));
             const observed = JSON.parse(stdout);
             hostObservations.push({ key, replay: recoveryReplay, checkpoint: observed.checkpointObservation ?? null });
             return { key, kind: "command", state: "passed", ok: true, exitCode: 0,
