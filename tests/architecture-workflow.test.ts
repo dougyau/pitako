@@ -10,6 +10,18 @@ import { normalizeWorkflowArgs } from "../node_modules/pi-subagents/src/workflow
 import type { WorkflowTerminalOutcome } from "../node_modules/pi-subagents/src/shared/types.js";
 
 const source = readFileSync(new URL("../skills/architecture/workflow.js", import.meta.url), "utf8");
+
+test.each(["node", "bun"])("packaged architecture preserves awaited dispatch and failure diagnostics under %s", async runtime => {
+  const child = Bun.spawn([
+    runtime, path.join(import.meta.dir, "fixtures/architecture-native-await.cjs"),
+    path.join(import.meta.dir, "../skills/architecture/workflow.js"),
+  ], { cwd: path.join(import.meta.dir, ".."), stdout: "pipe", stderr: "pipe" });
+  const [exit, stdout, stderr] = await Promise.all([
+    child.exited, new Response(child.stdout).text(), new Response(child.stderr).text(),
+  ]);
+  expect({ exit, stdout, stderr }).toEqual({ exit: 0, stdout: "", stderr: "" });
+});
+
 interface Request {
   key?: string;
   agent?: string;
