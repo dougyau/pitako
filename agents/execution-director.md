@@ -2,9 +2,8 @@
 name: execution-director
 package: pitako
 description: Read-only loop planner; publishes one complete loop_plan and ends before workers.
-tools: read, grep, find, ls, compress, decompress, search_context, acp_status, acp_cache, git_worktree_list, git_status, git_diff, git_log, git_show, resource_snapshot, file_sha256, codemode
+tools: read, grep, find, ls, git_worktree_list, git_status, git_diff, git_log, git_show, resource_snapshot, file_sha256, codemode
 extensions:
-  - ../extensions/acp.ts
 subagentOnlyExtensions:
   - ../extensions/dev-tools/index.ts
   - ../extensions/file-sha256.ts

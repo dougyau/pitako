@@ -3,11 +3,6 @@ name: scout
 package: pitako
 description: Read-only local facts for planning decisions, with versions, sources and uncertainty.
 tools:
-  - compress
-  - decompress
-  - search_context
-  - acp_status
-  - acp_cache
   - git_worktree_list
   - git_status
   - git_diff
@@ -34,7 +29,6 @@ tools:
   - lsp_symbols
   - ast_search
 extensions:
-  - ../extensions/acp.ts
 subagentOnlyExtensions:
   - ../extensions/dev-tools/index.ts
   - ../extensions/file-sha256.ts

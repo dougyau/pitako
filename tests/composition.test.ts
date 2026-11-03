@@ -3,12 +3,10 @@ import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, mock, spyOn, test } from "bun:test";
-import * as acp from "billion-context-pi";
 import * as rpivTodo from "../vendor/rpiv-todo/index.ts";
 import { createMockPi, createMockCtx } from "../vendor/rpiv-todo/test-utils.ts";
 import type { TaskDetails } from "../vendor/rpiv-todo/tool/types.ts";
 import { loadSkills, formatSkillsForPrompt, parseFrontmatter, type ExtensionAPI, type ExtensionToolContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
 import { validateToolArguments } from "@earendil-works/pi-ai";
 import {
   DEFAULT_SKILL_NAMES,
@@ -203,10 +201,11 @@ describe("engineering-layer composition", () => {
     }
   });
 
-  test("all eight profiles pass the native parser and required-tool plan with explicit ACP and role ceilings", async () => {
+  test("all eight profiles keep isolated extension plans and role ceilings without retired context providers", async () => {
     const parser = await import("../node_modules/pi-subagents/src/agents/frontmatter.js");
     const { resolvePiLaunchToolPlan } = await import("../node_modules/pi-subagents/src/runs/shared/child-tool-plan.js");
-    const acpTools = ["compress", "decompress", "search_context", "acp_status", "acp_cache"];
+    const retiredTools = ["compress", "decompress", "search_context", "acp_status", "acp_cache", "vcc_recall",
+      "memory_add", "memory_replace", "memory_remove", "memory_search", "session_search", "skill_manage"];
     const queries = ["git_worktree_list", "git_status", "git_diff", "git_log", "git_show", "resource_snapshot", "file_sha256", "codemode"];
     const provider = readStack(packageRoot()).required.find(({ id }) => id === "pitako-dev-tools")!;
     const roles = ["architect", "reviewer", "scout", "researcher", "evidence-auditor", "execution-inspector", "worker", "execution-director"];
@@ -222,9 +221,9 @@ describe("engineering-layer composition", () => {
         subagentOnlyExtensions: resolve(frontmatter.subagentOnlyExtensions),
       });
       expect(plan.disableAmbientExtensions).toBe(true);
-      expect(plan.extensionArgs).toContain(path.join(packageRoot(), "extensions/acp.ts"));
-      for (const tool of acpTools) expect(plan.requiredChildTools).toContain(tool);
-      // Context management stays wired without model-directed preflight guidance.
+      expect(parser.parseFrontmatterList(frontmatter.extensions)).toEqual([]);
+      for (const tool of retiredTools) expect(plan.requiredChildTools).not.toContain(tool);
+      // Context compaction belongs to Pi, without model-directed provider preflight.
       expect(body).not.toMatch(/ACP|billion-context-pi|acp_status|native-compaction/);
       expect(plan.fanoutAuthorized).toBe(false);
       expect(plan.requiredChildTools.includes("todo")).toBe(role === "worker");
@@ -379,29 +378,6 @@ describe("engineering-layer composition", () => {
     }
   });
 
-  test("ACP defaults disable implicit bash deadlines without starting the external runtime", async () => {
-    const tools: ToolDefinition[] = [];
-    const known = ["compress", "decompress", "search_context", "acp_status", "acp_cache"];
-    const definitions = [...known, "delegate", "execute", "future_context"].map(name => ({
-      name, label: name, description: name, parameters: Type.Object({}),
-      execute: async () => ({ content: [], details: {} }),
-    }));
-    const factory = (pi: ExtensionAPI) => { for (const tool of definitions) pi.registerTool(tool); };
-    const registration = spyOn(acp, "createAcpExtension").mockReturnValue(factory);
-    try {
-      const extension = await import("../extensions/acp.ts");
-      expect(registration).toHaveBeenCalledTimes(1);
-      expect(registration).toHaveBeenCalledWith({
-        delegate: false, autoUpdate: false, toolBashDefaultTimeout: 0,
-      });
-      extension.default({ registerTool(tool: ToolDefinition) { tools.push(tool); } } as unknown as ExtensionAPI);
-      expect(tools).toEqual(definitions);
-      for (const [index, tool] of tools.entries()) expect(tool).toBe(definitions[index]);
-    } finally {
-      registration.mockRestore();
-    }
-  });
-
   test("declares curated resources without executing external extensions", () => {
     const manifest = JSON.parse(readRepo("package.json")).pi;
     expect(readRepo("skills/pre-pr/SKILL.md")).toContain("Prepare the current worktree");
@@ -449,14 +425,13 @@ describe("engineering-layer composition", () => {
     // The agent adapter's scalar/list parser differs from Pi's YAML parser.
     const agentParser = await import(path.join(packageRoot(), "node_modules/pi-subagents/src/agents/frontmatter.js"));
     const nativeProfile = agentParser.parseFrontmatter(source).frontmatter;
-    expect(agentParser.parseFrontmatterList(nativeProfile.extensions)).toEqual(["../extensions/acp.ts"]);
+    expect(agentParser.parseFrontmatterList(nativeProfile.extensions)).toEqual([]);
     expect(`${profile.package}.${profile.name}`).toBe("pitako.architect");
     expect(profile).toMatchObject({
       acceptanceRole: "read-only", defaultContext: "fresh", systemPromptMode: "replace",
       inheritProjectContext: true, inheritGlobalContext: false, inheritSkills: false,
     });
     expect(profile.tools).toEqual([
-      "compress", "decompress", "search_context", "acp_status", "acp_cache",
       "git_worktree_list", "git_status", "git_diff", "git_log", "git_show", "resource_snapshot", "file_sha256", "codemode",
       "read", "grep", "find", "ls",
       "codegraph_search", "codegraph_callers", "codegraph_callees", "codegraph_impact",

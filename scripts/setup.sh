@@ -38,30 +38,16 @@ printf 'Bun %s (%s)\n' "$actual_bun" "$(command -v bun)"
 bun install --frozen-lockfile
 
 node --input-type=module <<'NODE'
-import { createRequire } from "node:module";
-import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-const require = createRequire(resolve("package.json"));
-const hermes = require.resolve("pi-hermes-memory");
-const hermesRequire = createRequire(hermes);
-const native = hermesRequire.resolve("better-sqlite3");
-console.log(`pi-hermes-memory: ${hermes}`);
-console.log(`better-sqlite3 (from Hermes): ${native}`);
-const BetterSqlite3 = hermesRequire("better-sqlite3");
-for (const [name, Database] of [
-  ["better-sqlite3", BetterSqlite3],
-  ["node:sqlite", DatabaseSync],
-]) {
-  const db = new Database(":memory:");
-  try {
-    const row = db.prepare("SELECT 42 AS value").get();
-    if (row.value !== 42) throw new Error(`${name}: unexpected SQL result`);
-    console.log(`${name}: SELECT 42 = ${row.value}`);
-  } finally {
-    db.close();
-  }
-  console.log(`${name}: closed`);
+const db = new DatabaseSync(":memory:");
+try {
+  const row = db.prepare("SELECT 42 AS value").get();
+  if (row.value !== 42) throw new Error("node:sqlite: unexpected SQL result");
+  console.log(`node:sqlite: SELECT 42 = ${row.value}`);
+} finally {
+  db.close();
 }
+console.log("node:sqlite: closed");
 NODE
 
 if "$skip_codegraph"; then exit 0; fi

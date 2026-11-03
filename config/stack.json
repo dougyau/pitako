@@ -124,18 +124,6 @@
       "tools": ["subagent", "subagents_enable", "bg_wait", "subagent_supervisor", "contact_supervisor"]
     },
     {
-      "id": "billion-context-pi",
-      "spec": "billion-context-pi@0.1.83",
-      "entry": "extensions/acp.ts",
-      "tools": ["compress", "search_context", "decompress", "acp_status", "acp_cache"]
-    },
-    {
-      "id": "pi-hermes-memory",
-      "spec": "pi-hermes-memory@0.9.11",
-      "entry": "node_modules/pi-hermes-memory/src/index.ts",
-      "tools": ["memory_add", "memory_replace", "memory_remove", "memory_search", "session_search", "skill_manage"]
-    },
-    {
       "id": "pi-web-access",
       "spec": "pi-web-access@0.46.0",
       "entry": "node_modules/pi-web-access/dist/index.js",
@@ -152,6 +140,12 @@
       "spec": "@juicesharp/rpiv-ask-user-question@2.15.0",
       "entry": "node_modules/@juicesharp/rpiv-ask-user-question/index.ts",
       "tools": ["ask_user_question"]
+    },
+    {
+      "id": "pi-blackhole",
+      "spec": "pi-blackhole@0.5.17",
+      "entry": "node_modules/pi-blackhole/dist/index.js",
+      "tools": ["recall"]
     }
   ],
   "optional": []

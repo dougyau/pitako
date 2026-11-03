@@ -14,7 +14,7 @@ function withSetup(check: (fixture: ReturnType<typeof setupFixture>) => void) {
   }
 }
 
-// Command doubles prove shell orchestration only, not installation, SQLite, or CodeGraph indexing.
+// Command doubles isolate installation and CodeGraph; Node runs the built-in prerequisites.
 function setupFixture(root: string) {
   const checkout = path.join(root, "checkout with spaces");
   const bin = path.join(root, "bin");
@@ -43,7 +43,7 @@ case "${command}:$1" in
   bun:install) exit "\${INSTALL_EXIT:-0}" ;;
   node:--input-type=module)
     source="$(</dev/stdin)"
-    if [[ "$source" == *createRequire* ]]; then exit "\${NATIVE_EXIT:-0}"; fi
+    if [[ "$source" == *node:sqlite* && "\${NATIVE_EXIT:-0}" != 0 ]]; then exit "$NATIVE_EXIT"; fi
     if [[ "\${NODE_EXIT:-0}" != 0 ]]; then exit "$NODE_EXIT"; fi
     exec "$REAL_NODE" "$@" <<< "$source" ;;
 esac

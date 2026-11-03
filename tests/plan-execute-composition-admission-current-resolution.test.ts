@@ -834,8 +834,7 @@ describe("plan/execute packaged composition", () => {
     process.env.PI_CODING_AGENT_DIR = path.join(root, "private-agent-config");
     const marker = "<!-- pitako-execute-contract: execution-inspector/1 -->";
     const source = read("agents/execution-inspector.md")
-      .replace("tools: read, grep, find, ls, bash", "tools: read, grep, find, ls, bash, acp_status, file_sha256, codemode")
-      .replace("extensions:\n", "extensions:\n  - ../extensions/acp.ts\n")
+      .replace("extensions:\n", "extensions:\n  - ../extensions/file-sha256.ts\n")
       .replace(marker, mode === "missing" ? "" : mode === "wrong" ? "<!-- pitako-execute-contract: execution-inspector/0 -->" : marker);
     const sourcePath = path.join(agentDir, "execution-inspector.md");
     writeFileSync(sourcePath, source);
@@ -858,8 +857,8 @@ describe("plan/execute packaged composition", () => {
       const detail = response.content.filter(item => item.type === "text").map(item => item.text).join("\n");
       expect(detail).toContain(`Path: ${sourcePath}`);
       expect(detail).toContain("Agent: pitako.execution-inspector (package)");
-      expect(detail).toContain("Tools: read, grep, find, ls, bash, acp_status, file_sha256, codemode");
-      expect(detail).toContain(`Extensions: ${path.join(root, "extensions/acp.ts")}`);
+      expect(detail).toContain("Tools: read, grep, find, ls, bash, git_worktree_list");
+      expect(detail).toContain(`Extensions: ${path.join(root, "extensions/file-sha256.ts")}`);
       const body = detail.split("\nSystem Prompt:\n")[1]!;
       expect(body).toBeDefined();
       expect(body.split("\n").includes(marker)).toBe(mode === "compatible");
@@ -1626,7 +1625,7 @@ A1 supersedes native-resume-first recovery; preserve the missing historical befo
       "../skills/language/rust-review",
       "../skills/language/rust-port",
     ]);
-    expect(worker.extensions).toEqual(["../extensions/acp.ts"]);
+    expect(worker.extensions).toBeNull();
     expect(worker.subagentOnlyExtensions).toEqual(["../extensions/dev-tools/index.ts", "../extensions/file-sha256.ts", "../extensions/checkpoint-create.ts", "../extensions/todo.ts", "../node_modules/@vndv/pi-codegraph/extensions/codegraph.ts", "../node_modules/pi-lsp-client/src/index.ts", "../node_modules/@nicknisi/pi-ast-grep/index.ts", "../node_modules/pi-codex-tools/index.ts"]);
     for (const provider of worker.subagentOnlyExtensions as string[]) expect(existsSync(path.resolve("agents", provider))).toBe(true);
     for (const contract of ["single writer thread", "pause and escalate", "Ponytail in FULL mode", "schema/reporting", "edit/write"])
@@ -1640,7 +1639,7 @@ A1 supersedes native-resume-first recovery; preserve the missing historical befo
     const director = parseFrontmatter(read("agents/execution-director.md"));
     for (const tool of ["subagent", "bg_wait", "todo", "contact_supervisor", "subagent_supervisor"]) expect(String(director.frontmatter.tools).split(/,\s*/)).not.toContain(tool);
     expect(String(director.frontmatter.tools)).not.toMatch(/\b(?:bash|edit|write|apply_patch)\b/);
-    expect(director.frontmatter.extensions).toEqual(["../extensions/acp.ts"]);
+    expect(director.frontmatter.extensions).toBeNull();
     expect(director.frontmatter.subagentOnlyExtensions).toEqual(["../extensions/dev-tools/index.ts", "../extensions/file-sha256.ts"]);
     for (const role of ["architect", "reviewer", "scout", "researcher", "evidence-auditor", "execution-inspector"]) {
       const profile = parseFrontmatter(read(`agents/${role}.md`)).frontmatter;

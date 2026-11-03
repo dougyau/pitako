@@ -1,8 +1,8 @@
 # Pitako
 
 Pitako is a TypeScript ESM Pi package for coding sessions. It composes navigation,
-editing, context management, memory, TODOs, Board, and pi-subagents. Pi owns models,
-providers, and the session runtime.
+editing, TODOs, Board, pi-subagents, and automatic compaction through pi-blackhole.
+Pi owns models, providers, and the session runtime.
 
 ## Prepare this checkout
 
@@ -110,6 +110,12 @@ Pitako also bundles Markdown previews through `/preview` and structured question
 through `ask_user_question`. See [preview settings](docs/configuration.md#previews-and-questions)
 for external prerequisites. Mermaid renders in previews independently of Pi's
 native inline renderer.
+
+`pi-blackhole` loads directly for automatic deterministic compaction and
+session observational memory, without a Pitako adapter. Its background memory
+workers make billed model calls when configured. Upstream defaults disable
+fallback to the session model. Configure it through `/blackhole settings`;
+Pitako does not change your settings or add it to child profiles.
 
 Load specialized skills only when they apply. The default collection includes
 Ponytail, Caveman, investigation, architecture, review, verification, and

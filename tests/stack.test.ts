@@ -83,8 +83,8 @@ describe("stack configuration", () => {
     expect(manifest.dependencies["pi-lsp-client"]).toBe(lsp.spec);
     expect(Object.keys(manifest.dependencies)).toEqual(expect.arrayContaining([
       "@ast-grep/cli", "@colbymchenry/codegraph", "@vndv/pi-codegraph", "@dietrichgebert/ponytail",
-      "@juicesharp/rpiv-config", "billion-context-pi", "pi-codex-tools",
-      "pi-hermes-memory", "pi-lsp-client", "pi-subagents", "pi-web-access", "smol-toml",
+      "@juicesharp/rpiv-config", "pi-codex-tools",
+      "pi-lsp-client", "pi-subagents", "pi-web-access", "smol-toml",
       "typescript", "typescript-language-server", "pyright", "intelephense",
     ]));
     expect(lsp.bins).toEqual(["typescript-language-server", "pyright-langserver", "intelephense"]);
@@ -146,19 +146,13 @@ describe("stack configuration", () => {
     });
     expect(manifest.bundledDependencies).toContain("@juicesharp/rpiv-config");
     expect(JSON.parse(readFileSync(path.join(root, "package.json"), "utf8")).files).toContain("vendor");
-    expect(manifest.bundledDependencies).toContain("pi-hermes-memory");
-    expect(manifest.bundledDependencies).toContain("billion-context-pi");
-    expect(stack.required.find(({ id }) => id === "billion-context-pi")).toEqual({
-      id: "billion-context-pi", spec: `billion-context-pi@${manifest.dependencies["billion-context-pi"]}`, entry: "extensions/acp.ts",
-      tools: ["compress", "search_context", "decompress", "acp_status", "acp_cache"],
-    });
-    expect(stack.required.findIndex(({ id }) => id === "billion-context-pi")).toBeLessThan(stack.required.findIndex(({ id }) => id === "pi-hermes-memory"));
-    expect(stack.required.find(({ id }) => id === "pi-hermes-memory")).toEqual({
-      id: "pi-hermes-memory",
-      spec: `pi-hermes-memory@${manifest.dependencies["pi-hermes-memory"]}`,
-      entry: "node_modules/pi-hermes-memory/src/index.ts",
-      tools: ["memory_add", "memory_replace", "memory_remove", "memory_search", "session_search", "skill_manage"],
-    });
+    for (const id of ["billion-context-pi", "@sting8k/pi-vcc", "pi-hermes-memory"]) {
+      expect(manifest.dependencies[id]).toBeUndefined();
+      expect(manifest.bundledDependencies).not.toContain(id);
+      expect(stack.required.some(extension => extension.id === id)).toBe(false);
+      expect(manifest.pi.extensions.some(entry => entry.includes(id))).toBe(false);
+    }
+    expect(existsSync(path.join(root, "extensions/acp.ts"))).toBe(false);
     expect(manifest.bundledDependencies).toContain("pi-web-access");
     for (const extension of [
       { id: "pi-markdown-preview", tools: ["preview_export"] },
