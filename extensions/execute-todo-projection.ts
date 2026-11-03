@@ -14,6 +14,8 @@ export type ExecuteTodoSnapshot = {
   tasks: (DisplayRow & { id: string; blockedBy: string[] })[];
   active: { taskId: string; attempt: number; workflowKey: string } | null;
   outcome: string | null;
+  /** Display-only: the run ended without emitting a closing snapshot. Never read from emits. */
+  halted?: true;
 };
 export type WorkerTodoSnapshot = { taskId: string; attempt: number; tasks: readonly Task[] };
 export type OwnerSnapshot = { owner: string; rows: SyncRow[] };
@@ -42,6 +44,16 @@ export function latestExecuteTodoSnapshot(emits: unknown): ExecuteTodoSnapshot |
   }
   return latest;
 }
+/** A blocked or crashed root stops emitting; its last snapshot must not stay "in progress". */
+export function haltedView(snapshot: ExecuteTodoSnapshot, run: {state?: unknown; error?: unknown; workflow?: {value?: any}}): ExecuteTodoSnapshot {
+  if (snapshot.outcome || !terminalRun(String(run.state))) return snapshot;
+  const value = run.workflow?.value;
+  const cause = String((object(value) ? value.reason : undefined) ?? run.error ?? "ejecución terminada");
+  const reason = `${object(value) && text(value.status,64) ? value.status : String(run.state)}: ${cause}`.replace(/\s+/g," ").slice(0,240);
+  const stop = <T extends DisplayRow>(row: T): T => terminal(row.status) ? row
+    : {...row,status:"cancelled",...(row.status === "in_progress" ? {reason} : {})};
+  return {...snapshot,phases:snapshot.phases.map(stop),tasks:snapshot.tasks.map(stop),active:null,halted:true};
+}
 const taskKey = (runId: string, loop: number, taskId: string) => `exec:${runId}:task:${loop}:${taskId}`;
 const subject = (row: DisplayRow) => `${row.subject}${row.reason ? ` · ${row.reason.replace(/\s+/g," ")}` : ""}`.slice(0,2000);
 const workerOwner = (runId: string, taskId: string, attempt: number) => `worker:${runId}:${taskId}:${attempt}`;
@@ -52,7 +64,7 @@ const toRow = (task: Task): SyncRow => ({ key: String(task.metadata?.key), subje
 export function projectExecuteTodos(runId: string, snapshot: ExecuteTodoSnapshot, workers: readonly WorkerTodoSnapshot[], state: TaskState, predecessors: readonly string[] = [], deletions: ReadonlySet<string> = new Set(), summaryDeleted = false): OwnerSnapshot[] {
   const owner = `execute:${runId}`, prefix = `exec:${runId}:`;
   const rows: SyncRow[] = state.tasks.filter(t => t.owner === owner && t.status !== "deleted" && t.metadata?.summary === true && t.metadata.loop !== snapshot.loop).map(toRow);
-  const metadata = { invocation:snapshot.invocation, loop:snapshot.loop };
+  const metadata = { invocation:snapshot.invocation, loop:snapshot.loop, ...(snapshot.halted ? {halted:true} : {}) };
   const lineage = [runId,...predecessors];
   // Retirement deletes are not display decisions; only durable deletes or pending requests carry over.
   const priorTask = (id: string) => lineage.map(run => state.tasks.find(t => t.owner === `execute:${run}` && t.metadata?.key === taskKey(run,snapshot.loop,id) && (run === runId || t.status !== "deleted" || deletions.has(id) || t.metadata?.cancelRequested))).find(Boolean);
@@ -64,7 +76,9 @@ export function projectExecuteTodos(runId: string, snapshot: ExecuteTodoSnapshot
     // A pruned tombstone must not allocate a fresh row on every hint.
     rows.push(...snapshot.tasks.filter(t => !deletions.has(t.id) || priorTask(t.id)).map(t => {
       const prior = priorTask(t.id);
-      const status = deletions.has(t.id) ? "deleted" : prior && terminal(prior.status) && (prior.owner === owner || prior.status !== "deleted") ? prior.status : t.status;
+      // A predecessor's halt is not a decision about the relaunched work.
+      const inherited = prior && terminal(prior.status) && (prior.owner === owner || prior.status !== "deleted" && !(prior.status === "cancelled" && prior.metadata?.halted));
+      const status = deletions.has(t.id) ? "deleted" : inherited ? prior.status : t.status;
       const marker = prior?.metadata?.cancelRequested && !terminal(status) ? " (cancelación pedida)" : "";
       return {key:taskKey(runId,snapshot.loop,t.id),subject:subject(t).slice(0,2000-marker.length)+marker,status,
         metadata:{...metadata,taskId:t.id,cancel:"request",...(prior?.metadata?.cancelRequested ? {cancelRequested:true,cancelledBy:prior.metadata.cancelledBy} : {}),
@@ -227,6 +241,8 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
   let context: ExtensionContext | undefined, generation = 0;
   let running: Promise<void> | undefined, dirty = false;
   const known = new Map<string,string | undefined>();
+  // Retention removes old runs and branch history names non-execute runs: absence is normal, not a warning.
+  const absent = new Set<string>();
   const latest = new Map<string,ExecuteTodoSnapshot>();
   const invocationRoots = new Map<string,string>();
   const workerSnapshots = new Map<string,{loop:number; workers:Map<string,WorkerTodoSnapshot>}>();
@@ -248,21 +264,39 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
       pi.events.emit("subagents:rpc:v1:request",{version:1,requestId,method,params});
     });
   }
-  function remember(value: any) {
+  // Live events are fresh evidence that a run exists again; branch history is not.
+  function remember(value: any, fresh = false) {
     if (!object(value)) return;
     const id = value.runId ?? value.id;
-    if (text(id,256)) known.set(id,typeof value.asyncDir === "string" ? value.asyncDir : known.get(id));
-    for (const child of value.childRuns ?? []) remember(child);
+    if (text(id,256)) {
+      known.set(id,typeof value.asyncDir === "string" ? value.asyncDir : known.get(id));
+      if (fresh) absent.delete(id);
+    }
+    for (const child of value.childRuns ?? []) remember(child,fresh);
   }
   async function status(runId: string) {
+    if (absent.has(runId)) return;
     let directory = known.get(runId);
     if (!directory) {
-      const response = await rpc("status",{id:runId});
+      let response: any;
+      try { response = await rpc("status",{id:runId}); }
+      catch (error) {
+        if (!/Async run not found/.test(String(error))) throw error;
+        absent.add(runId); return;
+      }
       remember(response?.details);
       directory = known.get(runId);
     }
     if (!directory) return;
-    const value = JSON.parse(readFileSync(path.join(directory,"status.json"),"utf8"));
+    let bytes: string;
+    try { bytes = readFileSync(path.join(directory,"status.json"),"utf8"); }
+    catch (error: any) {
+      if (error?.code !== "ENOENT") throw error;
+      // A missing directory is retention; a missing file in a live directory may not be written yet.
+      if (!existsSync(directory)) absent.add(runId);
+      return;
+    }
+    const value = JSON.parse(bytes);
     if ((value.runId ?? value.id) !== runId) throw new Error("Execute todo status run mismatch");
     return value;
   }
@@ -313,6 +347,33 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
       } catch (error) { warn(error); }
     }
     if (epoch !== generation) return;
+    // Unblock and budget relaunches are new top-level runs without native links. One invocation
+    // has one live root, so the newest run of an invocation succeeds the earlier ones.
+    const relaunches = new Map<string,string[]>();
+    for (const [runId,{run}] of runs) {
+      const invocation = latest.get(runId)!.invocation;
+      if (!Number.isFinite(run.startedAt)) continue;
+      relaunches.set(invocation,[...relaunches.get(invocation) ?? [],runId]);
+    }
+    for (const family of relaunches.values()) {
+      family.sort((a,b) => runs.get(a)!.run.startedAt - runs.get(b)!.run.startedAt);
+      for (let index = 1; index < family.length; index++) {
+        const links = predecessors.get(family[index])!;
+        if (!links.includes(family[index-1])) links.push(family[index-1]);
+      }
+    }
+    // Rows of a run removed by retention stay frozen; the live run of their invocation adopts them.
+    const orphans = new Map<string,string>();
+    for (const row of state().tasks) {
+      const runId = row.owner?.startsWith("execute:") ? row.owner.slice(8) : undefined;
+      if (!runId || !absent.has(runId) || row.status === "deleted" || row.metadata?.summary === true || !invocationId(row.metadata?.invocation)) continue;
+      const family = relaunches.get(row.metadata.invocation) ?? [...runs.keys()].filter(id => latest.get(id)?.invocation === row.metadata!.invocation);
+      const successor = family.at(-1);
+      if (!successor || orphans.has(runId)) continue;
+      orphans.set(runId,row.metadata.invocation);
+      predecessors.set(runId,[]);
+      predecessors.get(successor)!.push(runId);
+    }
     recordDeletedExecuteTodoSummaries(ctx.cwd,state(),invocationRoots);
     const rootFor = (invocation: string) => invocationRoots.get(invocation) ?? ctx.cwd;
     function lineage(runId: string, seen = new Set<string>(), invocation = latest.get(runId)?.invocation): string[] {
@@ -339,11 +400,11 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
       if (!retired) { retired = readRetiredExecuteTodoRuns(rootFor(invocation),invocation); retirements.set(invocation,retired); }
       return retired;
     }
-    function retire(runId: string, snapshot: ExecuteTodoSnapshot) {
-      const retired = retiredRuns(snapshot.invocation);
+    function retire(runId: string, invocation: string) {
+      const retired = retiredRuns(invocation);
       if (retired.has(runId)) return;
-      appendExecuteTodoRecords(rootFor(snapshot.invocation),snapshot.invocation,"retired-runs.jsonl",[
-        {requestId:digest(`${snapshot.invocation}\0retired:${runId}`),...{v:1,invocation:snapshot.invocation,runId}},
+      appendExecuteTodoRecords(rootFor(invocation),invocation,"retired-runs.jsonl",[
+        {requestId:digest(`${invocation}\0retired:${runId}`),...{v:1,invocation,runId}},
       ]);
       retired.add(runId);
     }
@@ -352,7 +413,7 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
       const rows = state().tasks.filter(t => t.owner === `execute:${runId}`);
       const active = rows.some(t => t.status !== "deleted" && t.metadata?.summary !== true);
       // Upgrade legacy retirement before projection can recreate a phase. Old-loop history is not retirement.
-      if (!active && !snapshot.outcome && rows.some(t => t.status === "deleted" && t.metadata?.summary !== true && t.metadata?.loop === snapshot.loop)) retire(runId,snapshot);
+      if (!active && !snapshot.outcome && rows.some(t => t.status === "deleted" && t.metadata?.summary !== true && t.metadata?.loop === snapshot.loop)) retire(runId,snapshot.invocation);
       return active;
     }
     for (const runId of superseded) {
@@ -367,7 +428,7 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
       if (epoch !== generation) return;
       if (superseded.has(runId)) continue;
       try {
-        const snapshot = latest.get(runId)!;
+        const snapshot = haltedView(latest.get(runId)!,run);
         let cache = workerSnapshots.get(runId);
         if (!cache || cache.loop !== snapshot.loop) {
           cache = {loop:snapshot.loop,workers:new Map()}; workerSnapshots.set(runId,cache);
@@ -387,7 +448,9 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
           for (const step of run.steps ?? []) {
             if (step.workflowKey !== binding.workflowKey || !text(step.runId,256)) continue;
             remember(step);
-            const child = await status(step.runId);
+            let child: any;
+            // One unreadable worker must not stop the other runs or retirement.
+            try { child = await status(step.runId); } catch (error) { warn(error); continue; }
             if (!child || !lineage(runId).includes(child.parentWorkflowRunId) || child.workflowKey !== binding.workflowKey) continue;
             const file = child.steps?.[0]?.sessionFile;
             if (typeof file !== "string" || !existsSync(file)) continue;
@@ -425,10 +488,10 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
       } catch (error) { warn(error); return; }
     }
     // Retire only after successor display decisions have been durably carried over.
-    for (const runId of superseded) {
+    for (const [runId,invocation] of [...[...superseded].map(id => [id,latest.get(id)!.invocation] as const),...orphans]) {
       if (epoch !== generation) return;
       try {
-        retire(runId,latest.get(runId)!);
+        retire(runId,invocation);
         const owners = new Set(state().tasks.filter(t => t.owner?.startsWith(`worker:${runId}:`)).map(t => t.owner!));
         for (const owner of owners) sync({owner,rows:[]});
         const family = [...runs.keys()].filter(id => lineage(id).includes(runId)).flatMap(id => lineage(id));
@@ -460,7 +523,7 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
     context = undefined; generation++; dirty = false;
     for (const watcher of watchers.values()) watcher.close(); watchers.clear();
     for (const cancel of pending) cancel();
-    await running; known.clear(); latest.clear(); workerSnapshots.clear(); invocationRoots.clear();
+    await running; known.clear(); absent.clear(); latest.clear(); workerSnapshots.clear(); invocationRoots.clear();
   }
   pi.on("session_start",async (_event,ctx) => { await stop(); context=ctx; await refresh(); });
   pi.on("session_shutdown",async () => { await stop(); for (const off of unsubscribe) off(); });
@@ -471,15 +534,15 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
       try { recordDeletedExecuteTodoSummaries(context.cwd,getState(context.sessionManager.getSessionId()),invocationRoots); }
       catch (error) { warn(error); return; }
     }
-    if (event.toolName === "subagent" && object(event.details)) { remember(event.details); if (Array.isArray(event.details.results)) for (const run of event.details.results) remember(run); }
+    if (event.toolName === "subagent" && object(event.details)) { remember(event.details,true); if (Array.isArray(event.details.results)) for (const run of event.details.results) remember(run,true); }
     if (event.toolName === "todo" || event.toolName === "subagent") await refresh();
   });
   pi.on("message_end",async (event) => {
     const message = event.message as any;
-    if (message.customType === "subagent-notify") { for (const run of message.details?.runs ?? []) remember(run); await refresh(); }
+    if (message.customType === "subagent-notify") { for (const run of message.details?.runs ?? []) remember(run,true); await refresh(); }
   });
   for (const event of ["subagent:child-status","subagent:jobs-changed","subagent:async-started","subagent:async-complete","subagents:rpc:v1:ready"]) {
-    unsubscribe.push(pi.events.on(event,payload => { remember(payload); void refresh(); }));
+    unsubscribe.push(pi.events.on(event,payload => { remember(payload,true); void refresh(); }));
   }
 }
 function terminalRun(state: string) { return ["complete","completed","failed","stopped"].includes(state); }

@@ -231,14 +231,15 @@ describe("engineering-layer composition", () => {
       expect(plan.extensionArgs.includes(path.join(packageRoot(), "extensions/todo.ts"))).toBe(role === "worker");
       if (role === "worker") {
         const instructions = body.replace(/\s+/g, " ");
-        expect(instructions).toContain("`todo` only to display your own task steps");
+        expect(instructions).toContain("three or more steps, record them with `todo` before the first edit");
         expect(instructions).toContain("structured result stays authoritative");
         expect(instructions).toContain("cancelled or deleted step never drops required work or checks");
         const prompt = readRepo("skills/execute/workflow.js");
         expect(prompt).toContain("Todo is display, not evidence");
+        expect(prompt).toContain("three or more steps, record them with todo before the first edit");
         expect(prompt).toContain("cancelled or deleted step never drops required work or checks");
         const skill = readRepo("skills/execute/SKILL.md").replace(/\s+/g, " ");
-        for (const instruction of ["Do not mirror execute rows", "via `todo`", "pasos en vivo no disponibles", "pitako.request-observer", "observe.mjs --requests", "never as human intent"])
+        for (const instruction of ["Do not mirror execute rows", "via `todo`", "child session file", "pitako.request-observer", "observe.mjs --requests", "never as human intent"])
           expect(skill).toContain(instruction);
       }
       const usesAstGrep = ["architect", "reviewer", "scout", "worker"].includes(role);

@@ -194,21 +194,28 @@ function runtimeFixture() {
   const writeChild=(extra:Record<string,unknown>={})=>writeFileSync(path.join(child,"status.json"),JSON.stringify({runId:"child",parentWorkflowRunId:"run",workflowKey:"work.t1.a1",state:"running",steps:[{sessionFile:childSession.getSessionFile()}],...extra}));
   writeMain(snapshot());writeChild();
   const directories = new Map([["run",main],["child",child]]);
-  function addRun(id: string, s: ExecuteTodoSnapshot, workflow: Record<string,unknown> = {}) {
+  function addRun(id: string, s: ExecuteTodoSnapshot, workflow: Record<string,unknown> = {}, top: Record<string,unknown> = {}) {
     const directory=path.join(root,id); mkdirSync(directory); directories.set(id,directory);
-    writeFileSync(path.join(directory,"status.json"),JSON.stringify({runId:id,cwd:root,workflow:{emits:[s],...workflow},steps:[{runId:"child",workflowKey:"work.t1.a1",asyncDir:child}]}));
+    writeFileSync(path.join(directory,"status.json"),JSON.stringify({runId:id,cwd:root,workflow:{emits:[s],...workflow},steps:[{runId:"child",workflowKey:"work.t1.a1",asyncDir:child}],...top}));
     return directory;
   }
   let snapshotRuns: unknown[]=[{id:"run"}];
+  const statusIds: string[]=[];
   bus.on("subagents:rpc:v1:request",(request:any)=>{
     if(request.method==="steer") steers.push(request.params);
+    if(request.method==="status" && request.params.id) statusIds.push(request.params.id);
+    // pi-subagents answers unknown ids with this error after retention or for non-run ids.
+    if(request.method==="status" && request.params.id && !directories.has(request.params.id))
+      return events.emit(`subagents:rpc:v1:reply:${request.requestId}`,{version:1,requestId:request.requestId,success:false,
+        error:{message:`Status target: run ${request.params.id} Spawn budget: unlimited Active async capacity: 0/unlimited used Async run not found. Provide id or dir.`}});
     events.emit(`subagents:rpc:v1:reply:${request.requestId}`,{version:1,requestId:request.requestId,success:true,data:request.method==="steer" ? {ok:true,state:"delivered"} :
       request.params.id ? {details:{runId:request.params.id,asyncDir:directories.get(request.params.id)}} : {asyncSnapshot:{runs:snapshotRuns}}});
   });
   const commit=createTodoCommit(pi);
   registerExecuteTodoProjection(pi,commit);
   const fire=async (name:string,event:unknown={})=>{for(const handler of captured.events.get(name)??[]) await handler(event,ctx);};
-  return {root,sid,ctx,pi,captured,commit,fire,steers,events,writeMain,writeChild,childSession,
+  const warnings=():string[]=>(ctx.ui.notify as any).mock.calls.map((call:unknown[])=>String(call[0]));
+  return {root,sid,ctx,pi,captured,commit,fire,steers,events,writeMain,writeChild,childSession,statusIds,warnings,
     addRun, setRuns:(runs:unknown[])=>{snapshotRuns=runs;},
     noSnapshot:()=>{snapshotRuns=[];},
     close:async()=>{await fire("session_shutdown"); evictSession(sid);
@@ -590,16 +597,76 @@ describe("execute todo registration and reconciliation",()=>{
     } finally {off?.(); await todoResult; await f.close();}
   });
 
-  test("unlinked runs of the same invocation and linked runs of different invocations remain separate",async()=>{
+  test("a relaunch of the same invocation supersedes the earlier run; linked runs of different invocations remain separate",async()=>{
     const f=runtimeFixture();
     try {
-      f.addRun("unlinked",snapshot());
+      const main=path.join(f.root,"main","status.json");
+      writeFileSync(main,JSON.stringify({...JSON.parse(readFileSync(main,"utf8")),startedAt:1}));
+      f.addRun("relaunch",snapshot({active:{taskId:"t1",attempt:2,workflowKey:"work.t1.a2"}}),{},{startedAt:2});
       f.addRun("different",snapshot({invocation:"other"}),{reusedFrom:"run"});
-      f.setRuns([{id:"different"},{id:"unlinked"},{id:"run"}]);
+      f.setRuns([{id:"different"},{id:"relaunch"},{id:"run"}]);
       await f.fire("session_start");
-      expect(visible(getState(f.sid).tasks).filter(t=>t.owner?.startsWith("execute:")&&t.status==="in_progress").map(t=>t.owner).sort()).toEqual(["execute:different","execute:run","execute:unlinked"]);
+      expect(visible(getState(f.sid).tasks).filter(t=>t.owner?.startsWith("execute:")&&t.status==="in_progress").map(t=>t.owner).sort()).toEqual(["execute:different","execute:relaunch"]);
+      expect(visible(getState(f.sid).tasks).some(t=>t.owner==="execute:run"||t.owner?.startsWith("worker:run:"))).toBe(false);
+      expect(readFileSync(path.join(f.root,".pi/subagents/execute/invocation/retired-runs.jsonl"),"utf8")).toContain('"runId":"run"');
       const count=f.captured.entries.length;
       await f.fire("session_start");expect(f.captured.entries).toHaveLength(count);
+    } finally {await f.close();}
+  });
+
+  test("a halted run cancels its open rows with the reason, and its unblock relaunch neither inherits nor duplicates them",async()=>{
+    const f=runtimeFixture();
+    try {
+      await f.fire("session_start");
+      expect(visible(getState(f.sid).tasks).filter(t=>t.owner==="worker:run:t1:1")).toHaveLength(2);
+      const main=path.join(f.root,"main","status.json");
+      writeFileSync(main,JSON.stringify({...JSON.parse(readFileSync(main,"utf8")),state:"complete",startedAt:1,
+        workflow:{emits:[snapshot()],value:{status:"blocked",reason:"Fallback lacks evidence."}}}));
+      f.writeChild({state:"complete"});
+      await f.fire("tool_result",{toolName:"subagent"});
+      const halted=visible(getState(f.sid).tasks);
+      expect(halted.find(t=>t.metadata?.key==="exec:run:task:1:t1")).toMatchObject({status:"cancelled",subject:"Build · blocked: Fallback lacks evidence."});
+      expect(halted.filter(t=>t.owner==="worker:run:t1:1").map(t=>t.status)).toEqual(["cancelled","cancelled"]);
+      expect(halted.some(t=>t.status==="in_progress")).toBe(false);
+      f.addRun("relaunch",snapshot({active:{taskId:"t1",attempt:2,workflowKey:"work.t1.a2"}}),{},{startedAt:2});
+      f.setRuns([{id:"relaunch"},{id:"run"}]);
+      await f.fire("tool_result",{toolName:"subagent"});
+      const rows=visible(getState(f.sid).tasks);
+      expect(rows.map(t=>[t.owner,t.subject,t.status])).toEqual([
+        ["execute:relaunch","Loop 1/3 · Plan","completed"],["execute:relaunch","Build","in_progress"]]);
+      expect(existsSync(path.join(f.root,".pi/subagents/execute/invocation/requests.jsonl"))).toBe(false);
+      const count=f.captured.entries.length;
+      await f.fire("session_start");expect(f.captured.entries).toHaveLength(count);
+      expect(f.warnings()).toEqual([]);
+    } finally {await f.close();}
+  });
+
+  test("runs removed by retention or unknown to pi-subagents are silent, queried once, and orphan rows move to the live run",async()=>{
+    const f=runtimeFixture();
+    try {
+      await f.fire("session_start");
+      f.setRuns([{id:"run"},{id:"gone"},{id:"unavailable"},{id:"removed",asyncDir:path.join(f.root,"missing")}]);
+      await f.fire("session_start");
+      await f.fire("tool_result",{toolName:"todo"});
+      await f.fire("tool_result",{toolName:"todo"});
+      expect(f.warnings()).toEqual([]);
+      expect(f.statusIds.filter(id=>id==="gone")).toHaveLength(1);
+      // Live events are fresh evidence: the id is queried again.
+      f.events.emit("subagent:async-started",{runId:"gone"});
+      await f.fire("tool_result",{toolName:"todo"});
+      expect(f.statusIds.filter(id=>id==="gone")).toHaveLength(2);
+      // Retention removes the original run; its frozen rows move to the relaunch.
+      rmSync(path.join(f.root,"main"),{recursive:true});
+      f.addRun("relaunch",snapshot({active:{taskId:"t1",attempt:2,workflowKey:"work.t1.a2"}}));
+      f.setRuns([{id:"relaunch"}]);
+      await f.fire("session_start");
+      expect(visible(getState(f.sid).tasks).map(t=>t.owner)).toEqual(["execute:relaunch","execute:relaunch"]);
+      expect(readFileSync(path.join(f.root,".pi/subagents/execute/invocation/retired-runs.jsonl"),"utf8")).toContain('"runId":"run"');
+      expect(f.warnings()).toEqual([]);
+      // Real failures still warn.
+      writeFileSync(path.join(f.root,"relaunch","status.json"),"{");
+      await f.fire("tool_result",{toolName:"subagent"});
+      expect(f.warnings().some(w=>w.startsWith("Execute todo: SyntaxError"))).toBe(true);
     } finally {await f.close();}
   });
 
