@@ -190,7 +190,7 @@ contain responses; synthesis originals contain memo and exhaustive dispositions.
 Retained context is usable only while the exact
 original is accessible; after compaction reread missing essentials. Prior delivery is not access.
 Do not universally reread available history or use status/previews as an originals archive.
-Report exactly one access receipt for each essential ID, with source and reason. Missing,
+Report exactly one access receipt for each essential ID, with source and reason (access: [] when none). Missing,
 inaccessible or contradictory evidence must block dependent conclusions. Access declarations
 are interface evidence, not certification of reasoning. Preserve coverage and contrary narrative,
 not only findings. Return the entire requested value with delivery: complete even for blocked
@@ -251,10 +251,13 @@ Findings, however severe, and defects that prevent a clear result are reported w
         if (Object.entries(reference).some(([field, value]) =>
             field !== "key" && (!Array.isArray(value) || value.length > 0)))
           references.push(reference);
-        const access = complete && value.access.length === contract.required.length &&
+        // Essential access is judged over required IDs. Extra accessible receipts are
+        // harmless; any declared unavailable/contradictory evidence still blocks.
+        const access = complete &&
           new Set(value.access.map(item => item.id)).size === value.access.length &&
+          value.access.every(receipt => receipt.state === "accessible") &&
           contract.required.every(item => value.access.some(receipt => receipt.id === item.id &&
-            receipt.state === "accessible" && ["read", "context"].includes(receipt.source)));
+            ["read", "context"].includes(receipt.source)));
         if (complete) for (const receipt of value.access) {
           const original = originals.find(item => item.id === receipt.id);
           if (original) original.accessibility = receipt.state;

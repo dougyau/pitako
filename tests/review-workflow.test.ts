@@ -893,6 +893,30 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
     expect(host.calls.at(-1)?.key).toBe("critique-b");
   });
 
+  test("extra accessible receipts beyond the essential IDs do not block prepare without essentials", async () => {
+    const extra = ["spec:base", "amendment:one", "result:l1.t1.a1"].map(id =>
+      ({ id, state: "accessible", source: "read", reason: "Read for angle selection" }));
+    const host = fixture((key, request) => child(key, key === "director-prepare" ? (expect(packet(request)).toEqual([]), { access: extra }) : {}));
+    const result = await host.execute();
+    expect(result.status).toBe("completed");
+    expect(host.calls.map(call => call.key)).toContain("director-synthesis");
+  });
+
+  test.each([
+    ["missing essential", (receipts: any[]) => receipts.slice(1)],
+    ["duplicate essential", (receipts: any[]) => [...receipts, receipts[0]]],
+    ["extra unavailable", (receipts: any[]) => [...receipts, { id: "spec:other", state: "unavailable", source: "none", reason: "Not found" }]],
+    ["extra contradictory", (receipts: any[]) => [...receipts, { id: "spec:other", state: "contradictory", source: "read", reason: "Digest differs" }]],
+  ])("%s access receipt still prevents dependent review completion", async (_name, mutate) => {
+    const host = fixture((key, request) => child(key, key === "critique-b" ? {
+      access: mutate(packet(request).map(original => ({ id: original.id, state: "accessible", source: "read", reason: "Exact original checked" }))),
+    } : {}));
+    const result = await host.execute();
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("Essential access incomplete");
+    expect(host.calls.at(-1)?.key).toBe("critique-b");
+  });
+
   test("unrecoverable physical original is not replaced by status or optional references", async () => {
     // Delete only an owned published original immediately before its consuming read boundary.
     const broken = fixture((key, request) => {
