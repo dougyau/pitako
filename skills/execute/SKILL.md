@@ -50,8 +50,9 @@ Only regular files and absence are supported; unsupported types remain explicit
 gaps. A missing checkpoint cannot be reconstructed from HEAD plus fingerprint.
 
 Capture actual affected-file bytes, including earlier WIP, before modifying.
-After owned writes settle, call `checkpoint_create({kind:"unit"})` and return its
+For implementation tasks, after owned writes settle, call `checkpoint_create({kind:"unit"})` and return its
 actual structured `checkpointReceipt`, retaining `checkpointRef` in `git.checkpoints`.
+Verification tasks without checkout writes return no `checkpointReceipt`, while every planned check still reports captured before/after `checkoutEvidence`.
 The tool seals task/cursor/admitted-progress references; it does not admit results,
 confirm completion or move the cursor. Only root durable result admission confirms
 the new continuation point. A normal cooperative pause may call
@@ -342,7 +343,7 @@ does not qualify; exact settled recovery can establish eligibility. Admitted
 contracts are never repaired or migrated through this path.
 
 A worker report that breaks the result contract, such as a check command that
-differs from the plan, missing candidate identities or a missing unit seal, is a
+differs from the plan, missing candidate identities or a missing implementation unit seal, is a
 rejected attempt, not a root halt. Its original stays in the native record and
 nothing from it is admitted. The loop ends as `gaps` with the exact reason, and
 the next director repeats only the affected work without rewriting planned checks.

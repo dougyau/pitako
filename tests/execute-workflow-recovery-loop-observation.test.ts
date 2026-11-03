@@ -2085,6 +2085,9 @@ describe("workflow-owned execute controller", () => {
         return result;
       });
       const output = await host.executeNative();
+      const worker = host.calls.find(call => call.agent === "pitako.worker")!;
+      expect(worker.task).toContain("Bracket EVERY planned check, including tool-call checks such as file_sha256 or git_status");
+      expect(worker.task).toContain("Verification tasks are not checkpoint units: without checkout writes, do not call checkpoint_create and return no checkpointReceipt");
       expect(output.status).not.toBe("complete");
       expect(host.calls.some(call => call.key.includes(".review.") || call.key.endsWith(".compliance"))).toBe(false);
       expect(host.native.get("invoke-human-1.l1.t1.a1")!.structuredOutput).toEqual(original);
@@ -2092,7 +2095,7 @@ describe("workflow-owned execute controller", () => {
       if (status === "complete") {
         expect(output.status).toBe("partial");
         expect(results).toEqual([expect.objectContaining({ status: "rejected",
-          rejection: "Missing checkoutEvidence candidate identity." })]);
+          rejection: "Planned check change1-check lacks checkoutEvidence before identity; complete needs captured before/after for every planned check." })]);
       } else {
         expect(results).toHaveLength(1);
         expect(results[0]).toMatchObject({ status, diagnosis: "Checkpoint durable association mismatch.",
@@ -2186,6 +2189,8 @@ describe("workflow-owned execute controller", () => {
         return result;
       });
       expect((await host.execute()).status).not.toBe("complete");
+      if (mode === "bad-before" || mode === "bad-after")
+        expect(host.history()[0].results[0].rejection).toBe(`Planned check change1-check lacks checkoutEvidence ${mode === "bad-before" ? "before" : "after"} identity; complete needs captured before/after for every planned check.`);
       expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(1);
       expect(host.calls.filter(call => call.key.includes(".review.") || call.key.endsWith(".compliance"))).toHaveLength(0);
       expect(host.history()[0].results.every((entry: any) => !entry.checks?.current)).toBe(true);
@@ -2240,6 +2245,10 @@ describe("workflow-owned execute controller", () => {
     else {
       expect(output.status).toBe("partial");
       expect(host.history()[0].results).toEqual([expect.objectContaining({ status: "rejected" })]);
+      if (["stale-check", "failed", "not-run"].includes(mode))
+        expect(host.history()[0].results[0].rejection).toContain("Non-current planned checks: change1-check.");
+      if (mode === "pending-complete")
+        expect(host.history()[0].results[0].rejection).toContain("Pending work remains.");
     }
     expect(host.calls.some(call => call.key.includes(".review."))).toBe(false);
   });
@@ -2257,10 +2266,10 @@ describe("workflow-owned execute controller", () => {
     expect((await host.execute()).status).toBe("complete");
     expect(host.history()).toHaveLength(2);
     expect(host.history()[0]).toMatchObject({ outcome: "gaps", results: [{ status: "rejected",
-      rejection: "Missing checkoutEvidence candidate identity." }] });
+      rejection: "Planned check change1-check lacks checkoutEvidence before identity; complete needs captured before/after for every planned check." }] });
     expect(host.calls.some(call => call.key.startsWith("invoke-human-1.l1.review."))).toBe(false);
     const director = host.calls.find(call => call.key === "invoke-human-1.l2.director");
-    expect(director!.task).toContain("Missing checkoutEvidence candidate identity.");
+    expect(director!.task).toContain("Planned check change1-check lacks checkoutEvidence before identity; complete needs captured before/after for every planned check.");
   });
 
   test.each(["gaps", "continue"])("a unit seal with %s status is a rejected attempt, not a root halt", async status => {
