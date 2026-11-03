@@ -3,11 +3,6 @@ name: reviewer
 package: pitako
 description: Evidence-based read-only review with CodeGraph, LSP, and risk-selected skills. The task assigns the review angle or director responsibility.
 tools:
-  - compress
-  - decompress
-  - search_context
-  - acp_status
-  - acp_cache
   - git_worktree_list
   - git_status
   - git_diff
@@ -35,7 +30,6 @@ tools:
   - lsp_symbols
   - ast_search
 extensions:
-  - ../extensions/acp.ts
 subagentOnlyExtensions:
   - ../extensions/dev-tools/index.ts
   - ../extensions/file-sha256.ts

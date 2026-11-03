@@ -42,6 +42,12 @@ an optional projection registration callback with that handle, keeping consumers
 in the same module graph and store instance.
 Board is repository-scoped storage shared by its worktrees.
 Web access and pi-subagents are direct upstream entries.
+`pi-blackhole` is a direct upstream entry for automatic deterministic compaction,
+session observational memory, and read-only `recall`. Pitako adds no adapter or
+configuration overrides. Background memory workers use configured models;
+upstream defaults disable fallback to the session model.
+Child profiles retain an empty `extensions:` override to disable ambient
+extensions, with their required providers in `subagentOnlyExtensions`.
 No managed workflow guards wrap TODO or Board.
 
 The owned `extensions/dev-tools/index.ts` factory supplies Git, SSH, Python,

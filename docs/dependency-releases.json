@@ -54,12 +54,12 @@
     "gitHead": "f193644d98e0c3a3f130364a393301408450d185",
     "license": "MIT"
   },
-  "billion-context-pi": {
-    "version": "0.1.83",
-    "registry": "https://registry.npmjs.org/billion-context-pi/0.1.83",
-    "tarball": "https://registry.npmjs.org/billion-context-pi/-/billion-context-pi-0.1.83.tgz",
-    "integrity": "sha512-122CcPmZvC5Yqqbj75UMppOFlkdAN8kbzvJ4OugV6xBPW6wbiHbaZ9YDYWQwDy4hJ/Vc98eOREGkWLWKflbnZw==",
-    "gitHead": "1cb6340df262933c8e640a7f45e19a7b34fe1ed8",
+  "pi-blackhole": {
+    "version": "0.5.17",
+    "registry": "https://registry.npmjs.org/pi-blackhole/0.5.17",
+    "tarball": "https://registry.npmjs.org/pi-blackhole/-/pi-blackhole-0.5.17.tgz",
+    "integrity": "sha512-DgnIkh/Xy+ugz6VR79wMpQG+i2OnflvUMiQc2tur2FC7GIr7kG4CSMOuNVQUXqu7Hz0VndPDCRFsb6Lz5QpTXw==",
+    "gitHead": "c0e282ae1938eaf8eb9faae6e473e3a1027b5c1f",
     "license": "MIT"
   },
   "pi-codex-tools": {
@@ -69,14 +69,6 @@
     "integrity": "sha512-iFdA7ciRydfWftFBRrEt/H/YddQPuzHzriZqWPe7sXcqYQw1XqPw3PAc61goIUG34wawzk0UAdRv3/QyJjtMQg==",
     "gitHead": "91fd55fdfd7c5516ac8d08267f34b49f1b37d050",
     "license": "Apache-2.0"
-  },
-  "pi-hermes-memory": {
-    "version": "0.9.11",
-    "registry": "https://registry.npmjs.org/pi-hermes-memory/0.9.11",
-    "tarball": "https://registry.npmjs.org/pi-hermes-memory/-/pi-hermes-memory-0.9.11.tgz",
-    "integrity": "sha512-94mMGy65ys/3VKzzI1M2ZMNDBC2WZ/QTw3IyftqNF4SBq0mQ21DazoM9flomMksjqccGqPz/hh6KsIG0Sth1Tg==",
-    "gitHead": "71cf5ab7d909318a383bf52bb3ad3cf83a9efc03",
-    "license": "MIT"
   },
   "pi-markdown-preview": {
     "version": "0.26.2",

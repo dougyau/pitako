@@ -41,10 +41,10 @@ function loadProfileExtensions(pi: ExtensionAPI, codex: (pi: ExtensionAPI) => vo
     "./node_modules/@vndv/pi-codegraph/extensions/codegraph.ts",
     "./node_modules/@nicknisi/pi-ast-grep/index.ts",
     "./extensions/todo.ts", "./extensions/board/index.ts",
-    "./node_modules/pi-subagents/bundle/index.js", "./extensions/acp.ts",
-    "./node_modules/pi-hermes-memory/src/index.ts", "./node_modules/pi-web-access/dist/index.js",
+    "./node_modules/pi-subagents/bundle/index.js", "./node_modules/pi-web-access/dist/index.js",
     "./node_modules/pi-markdown-preview/index.ts",
     "./node_modules/@juicesharp/rpiv-ask-user-question/index.ts",
+    "./node_modules/pi-blackhole/dist/index.js",
   ]);
   for (const entry of JSON.parse(readFileSync(path.join(packageRoot(), "package.json"), "utf8")).pi.extensions) {
     if (excluded.has(entry)) continue;
@@ -260,7 +260,7 @@ describe("Pitako resources and policy", () => {
     const root = packageRoot(), manifest = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
     expect(manifest.pi.extensions[0]).toBe("./extensions/index.ts");
     expect(manifest.pi.extensions).toEqual(expect.arrayContaining([
-      "./extensions/board/index.ts", "./extensions/acp.ts",
+      "./extensions/board/index.ts",
       "./node_modules/@vndv/pi-codegraph/extensions/codegraph.ts", "./node_modules/pi-lsp-client/src/index.ts",
     ]));
     expect(manifest.pi.skills).toContain("./skills/practical");

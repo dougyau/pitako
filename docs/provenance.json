@@ -99,17 +99,6 @@
     "reason": "Commit-pinned session TODO fork. rpiv-config is exact-pinned and bundled; rpiv-i18n remains an optional peer.",
     "evidenceLimits": "Imported from the Git tree, not the npm artifact; npm integrity is traceability, not source equivalence."
   },
-  "pi-hermes-memory": {
-    "decision": "dependency",
-    "package": "pi-hermes-memory",
-    "version": "0.9.11",
-    "repository": "https://github.com/chandra447/pi-hermes-memory",
-    "license": "MIT",
-    "loaded": [
-      "src/index.ts"
-    ],
-    "reason": "Bundle the upstream extension unchanged for persistent learning and conversation search. Independent of the Board, with no synchronization or post promotion."
-  },
   "pi-codex-tools": {
     "decision": "dependency",
     "package": "pi-codex-tools",

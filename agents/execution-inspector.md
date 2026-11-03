@@ -2,9 +2,8 @@
 name: execution-inspector
 package: pitako
 description: Exceptional read-only observation and original full-plan/result recovery through exact native references.
-tools: read, grep, find, ls, bash, compress, decompress, search_context, acp_status, acp_cache, git_worktree_list, git_status, git_diff, git_log, git_show, resource_snapshot, file_sha256, codemode
+tools: read, grep, find, ls, bash, git_worktree_list, git_status, git_diff, git_log, git_show, resource_snapshot, file_sha256, codemode
 extensions:
-  - ../extensions/acp.ts
 subagentOnlyExtensions:
   - ../extensions/dev-tools/index.ts
   - ../extensions/file-sha256.ts
