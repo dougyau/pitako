@@ -74,7 +74,8 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
         loaderModule: new URL("../../node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/loader.js", import.meta.url).href,
         evidence: new URL("../../extensions/spec-plans.ts", import.meta.url).href,
         inspectorEntry: path.resolve("skills/execute/inspect.mjs"),
-        inspector: new URL("../../skills/execute/inspect.ts", import.meta.url).href };
+        inspector: new URL("../../skills/execute/inspect.ts", import.meta.url).href,
+        validator: import.meta.resolve("@earendil-works/pi-ai") };
       const harness = async (input: any, run: typeof runWorkflowScript, response: typeof childResponse, io: any, loadCheckpoint: typeof registeredCheckpoint) => {
         const storage = new Map<string, any>(), originals = new Map<string, any>(), calls: string[] = [], snapshots: any[] = [], points: any[] = [];
         const hostObservations: any[] = [];
@@ -218,7 +219,12 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
                 }
                 baseline = io.readFileSync(input.root + "/owned", "utf8");
                 partialRef = receipt.partialRef;
-                restoreReceipt = { ...receipt, restoredRef: receipt.partialRef.replace(/restore\.json$/, "restored.json") };
+                // Project the helper receipt as instructed, including its confirmed baseline.
+                restoreReceipt = { checkpointRef: receipt.checkpointRef, digest: receipt.digest, partialRef: receipt.partialRef,
+                  restoredRef: receipt.partialRef.replace(/restore\.json$/, "restored.json"), position: receipt.position,
+                  candidate: { head: receipt.candidate.head, fingerprint: receipt.candidate.fingerprint },
+                  ...(receipt.confirmedPause ? { confirmedPause: receipt.confirmedPause } : {}),
+                  ...(receipt.confirmedUnit ? { confirmedUnit: receipt.confirmedUnit } : {}) };
                 if (input.mode === "pause-wrong-baseline") delete restoreReceipt.confirmedPause;
                 if (input.mode === "unit-before-capture-wrong-baseline") delete restoreReceipt.confirmedUnit;
                 if (input.mode === "pause-repeated-publication") throw Error("Disappeared after the same durable restoration publication");
@@ -287,6 +293,11 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
               if (!completed || io.readFileSync(input.root + "/owned", "utf8") !== "completed pending work from pause" ||
                   !request.task.includes(completed.ref.key)) throw Error("Final verification preceded durable pending-work admission");
             }
+            // A real worker can only return what its structured output schema admits,
+            // including the helper's confirmedPause/confirmedUnit restore baseline.
+            if (request.agent === "pitako.worker" && result.structuredOutput?.restoreReceipt)
+              (await import(input.validator)).validateToolArguments({ name: "worker_result", description: "Result", parameters: request.outputSchema },
+                { type: "toolCall", id: "worker", name: "worker_result", arguments: result.structuredOutput });
             originals.set(result.runId!, structuredClone(result));
             if (input.mode === "pause-reusable-result" && continuing && key.endsWith(".t2.a2")) {
               originals.set(key, structuredClone(result));
