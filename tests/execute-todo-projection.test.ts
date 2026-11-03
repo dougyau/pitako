@@ -200,10 +200,13 @@ function runtimeFixture() {
     return directory;
   }
   let snapshotRuns: unknown[]=[{id:"run"}];
+  let statusError: {code:string; message:string} | undefined;
   const statusIds: string[]=[];
   bus.on("subagents:rpc:v1:request",(request:any)=>{
     if(request.method==="steer") steers.push(request.params);
     if(request.method==="status" && request.params.id) statusIds.push(request.params.id);
+    if(request.method==="status" && statusError)
+      return events.emit(`subagents:rpc:v1:reply:${request.requestId}`,{version:1,requestId:request.requestId,success:false,error:statusError});
     // pi-subagents answers unknown ids with this error after retention or for non-run ids.
     if(request.method==="status" && request.params.id && !directories.has(request.params.id))
       return events.emit(`subagents:rpc:v1:reply:${request.requestId}`,{version:1,requestId:request.requestId,success:false,
@@ -217,6 +220,7 @@ function runtimeFixture() {
   const warnings=():string[]=>(ctx.ui.notify as any).mock.calls.map((call:unknown[])=>String(call[0]));
   return {root,sid,ctx,pi,captured,commit,fire,steers,events,writeMain,writeChild,childSession,statusIds,warnings,
     addRun, setRuns:(runs:unknown[])=>{snapshotRuns=runs;},
+    setStatusError:(error?: {code:string; message:string})=>{statusError=error;},
     noSnapshot:()=>{snapshotRuns=[];},
     close:async()=>{await fire("session_shutdown"); evictSession(sid);
       try { expect(existsSync(path.join(foreground,".pi"))).toBe(false); }
@@ -224,6 +228,42 @@ function runtimeFixture() {
 }
 
 describe("execute todo registration and reconciliation",()=>{
+  test("reload defers historical runs until RPC is ready without warnings or TODO writes",async()=>{
+    const f=runtimeFixture();
+    try {
+      const notes=SessionManager.inMemory(f.root);
+      notes.appendCustomMessageEntry("subagent-notify","Done",false,{runs:[{runId:"run"},{runId:"historical"}]});
+      Object.assign(f.ctx.sessionManager,{getBranch:()=>notes.getBranch()});
+      f.setStatusError({code:"no_active_session",message:"No active extension context for subagent RPC."});
+      await f.fire("session_start",{reason:"reload"});
+      await f.fire("tool_result",{toolName:"todo"});
+      expect(f.warnings()).toEqual([]);
+      expect(f.statusIds).toEqual([]);
+      expect(f.captured.entries).toHaveLength(0);
+
+      f.setStatusError();
+      f.events.emit("subagents:rpc:v1:ready",{session:{sessionId:f.sid}});
+      await f.fire("tool_result",{toolName:"todo"});
+      const rows=visible(getState(f.sid).tasks);
+      expect(rows.find(t=>t.metadata?.key==="exec:run:task:1:t1")?.status).toBe("in_progress");
+      expect(rows.filter(t=>t.parentId)).toHaveLength(2);
+      expect(f.warnings()).toEqual([]);
+    } finally {await f.close();}
+  });
+
+  test("RPC errors other than no_active_session remain visible even with the same message",async()=>{
+    const f=runtimeFixture();
+    try {
+      const notes=SessionManager.inMemory(f.root);
+      notes.appendCustomMessageEntry("subagent-notify","Done",false,{runs:[{runId:"run"}]});
+      Object.assign(f.ctx.sessionManager,{getBranch:()=>notes.getBranch()});
+      f.setStatusError({code:"execution_failed",message:"No active extension context for subagent RPC."});
+      await f.fire("session_start");
+      expect(f.warnings()).toContain("Execute todo: Error: No active extension context for subagent RPC.");
+      expect(f.captured.entries).toHaveLength(0);
+    } finally {await f.close();}
+  });
+
   test("headless session-start reads public status and child session; duplicate/out-of-order hints do not write",async()=>{
     const f=runtimeFixture();
     try {

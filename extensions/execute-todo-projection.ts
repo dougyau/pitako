@@ -257,7 +257,7 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
       const timer = setTimeout(cancel,2000);
       const off = pi.events.on(`subagents:rpc:v1:reply:${requestId}`, (reply: any) => {
         if (reply?.version !== 1 || reply.requestId !== requestId) return;
-        finish(reply.success ? null : new Error(reply.error?.message ?? "status failed"),reply.data);
+        finish(reply.success ? null : Object.assign(new Error(reply.error?.message ?? "status failed"),{code:reply.error?.code}),reply.data);
       });
       function finish(error: Error|null, data?: unknown) { clearTimeout(timer); off(); pending.delete(cancel); error ? reject(error) : resolve(data); }
       pending.add(cancel);
@@ -320,7 +320,11 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
     try {
       const response = await rpc("status");
       for (const run of response?.asyncSnapshot?.runs ?? []) remember(run);
-    } catch (error) { if (known.size) warn(error); }
+    } catch (error) {
+      // A later extension may not have bound its session yet; its ready event retries reconciliation.
+      if (object(error) && error.code === "no_active_session") return;
+      if (known.size) warn(error);
+    }
     const files = new Set<string>();
     const runs = new Map<string,{run:any; prior:ExecuteTodoSnapshot|undefined}>();
     const predecessors = new Map<string,string[]>();
