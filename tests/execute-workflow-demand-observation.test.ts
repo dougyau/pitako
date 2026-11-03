@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
-import { executeControllerFixture, gaps, cutAt } from "./fixtures/execute-workflow.ts";
+import { executeControllerFixture, gaps, cutAt, copy, type ControllerHost } from "./fixtures/execute-workflow.ts";
+import { MISSION_STATE_MAX_BYTES } from "../node_modules/pi-subagents/src/missions/workflow-state.js";
 
 const { fixture } = executeControllerFixture();
 
@@ -131,7 +132,7 @@ test.each(["observation-receipt", "director-intention"])("%s cut recovers the ex
     return normal();
   });
   cutAt(host, value => value.loop?.number === 2 && (cut === "observation-receipt"
-    ? !!value.loop.demandObservation : value.loop.plan?.stage === "published"));
+    ? value.demandObservations?.some((item: any) => item.loop === 2) : value.loop.plan?.stage === "published"));
   const first = await host.executeNative();
   expect(first.status).toBe("partial");
   expect(first.reason).toContain("Essential persistence failed");
@@ -139,7 +140,7 @@ test.each(["observation-receipt", "director-intention"])("%s cut recovers the ex
   expect(retained.analysisCalls.find((call: any) => call.key === target)).toMatchObject({ stage: "receipt",
     ref: { runId: `native-${target}`, outputReference: `/native/output/${target}.json` } });
   if (cut === "observation-receipt") {
-    expect(retained.demandObservation).toBeUndefined();
+    expect(host.current().demandObservations ?? []).toEqual([]);
     expect(retained.plan).toBeNull();
   } else expect(retained.plan).toMatchObject({ stage: "intention", ref: { key: "invoke-human-1.l2.director" } });
   host.setFailSave();
@@ -148,4 +149,79 @@ test.each(["observation-receipt", "director-intention"])("%s cut recovers the ex
   expect(host.calls.filter(call => call.key === target)).toHaveLength(1);
   expect(host.calls.filter(call => call.key === "invoke-human-1.l2.director")).toHaveLength(1);
   expect(host.statusCalls).toContain(cut === "observation-receipt" ? `native-${target}` : "invoke-human-1.l2.director");
+});
+
+const synthesis = (number: number) => `native-invoke-human-1.l${number}.review.director-synthesis`;
+// Every loop's review screening reports material gaps, so each next loop observes demands.
+function materialReviewGaps(host: ControllerHost, acceptance?: any) {
+  host.setRespond((request, normal) => {
+    const result = normal();
+    if (acceptance && request.phase?.startsWith("review-")) result.results = result.results!.map(entry => ({ ...entry, acceptance }));
+    if (request.key.endsWith(".review.director-synthesis")) {
+      result.structuredOutput.screening.verdict = "material-gaps";
+      result.structuredOutput.screening.reason = "Required parser branch missing";
+      result.structuredOutput.screening.assessments.forEach((entry: any) => { entry.material = true; });
+    }
+    return result;
+  });
+}
+
+test("closed demand sources persist once while observations keep every retained original", async () => {
+  const host = fixture(undefined, { findings: true, angles: 3, readOnly: true }); host.setLimit(7);
+  // Realistic review witnesses: each child reference carries a sizeable native acceptance record.
+  materialReviewGaps(host, { status: "not-required", evidenceStatus: "not-required", explicit: false, criteria: [],
+    inferredReason: ["x".repeat(2000)], runtimeChecks: [], verifyRuns: [] });
+  const saves: { value: string; loop: number; bytes: number }[] = [];
+  host.setSaveObserver((value, bytes) => { if (value.loop) saves.push({ value: JSON.stringify(value), loop: value.loop.number, bytes }); });
+  const output = await host.execute();
+  expect(output.status, output.reason).toBe("partial");
+  const observations = host.calls.filter(call => call.key.endsWith(".demand-observation"));
+  expect(observations.map(call => call.key)).toEqual([2, 3, 4, 5, 6, 7].map(number => `invoke-human-1.l${number}.demand-observation`));
+  for (const call of observations) {
+    const number = Number(call.key.match(/\.l(\d+)\./)![1]);
+    const [fresh, previous] = call.task.split("NEW CAUSAL SOURCES (exact original references): ")[1]!.split("\nPREVIOUS OBSERVATIONS AND ORIGINALS: ");
+    expect(fresh).toContain(synthesis(number - 1));
+    // The three-entry history still delivers each earlier observation with its exact causal originals.
+    for (let earlier = Math.max(2, number - 3); earlier < number; earlier++) {
+      expect(previous).toContain(`native-invoke-human-1.l${earlier}.demand-observation`);
+      expect(previous).toContain(synthesis(earlier - 1));
+    }
+  }
+  for (const save of saves) for (let closed = 1; closed < save.loop; closed++)
+    expect(save.value.split(`"${synthesis(closed)}"`).length - 1, `loop ${save.loop} copies of loop ${closed}`).toBeLessThanOrEqual(1);
+  const maximum = (from: number, to: number) => Math.max(...saves.filter(save => save.loop >= from && save.loop <= to).map(save => save.bytes));
+  expect(maximum(6, 7)).toBeLessThanOrEqual(maximum(4, 5) + 4096);
+  // Half the native envelope stays free for real reports, paths and one long open loop.
+  expect(maximum(1, 7)).toBeLessThan(MISSION_STATE_MAX_BYTES / 2);
+});
+
+test.each([false, true])("legacy triplicated demand state resumes once folded; conflicting copies=%s", async conflicting => {
+  const host = fixture(undefined, { findings: true, readOnly: true }); host.setLimit(4);
+  materialReviewGaps(host);
+  cutAt(host, value => value.loop?.number === 3 && value.loop.plan?.stage === "published");
+  expect((await host.execute()).reason).toContain("Essential persistence failed");
+  host.setFailSave();
+  // Rebuild the pre-fix layout: loop N-1's sources copied into all three fields.
+  const state = host.current(), sources = (number: number) => copy(state.demandSources.find((item: any) => item.loop === number).sources);
+  expect(state.demandSources.map((item: any) => item.loop)).toEqual([1, 2]);
+  state.closedDemandSources = { loop: 2, sources: sources(2) };
+  state.demandObservations = state.demandObservations.map((item: any) => ({ ...item, sources: sources(item.loop - 1) }));
+  state.loop.demandObservation = { ref: copy(state.demandObservations.at(-1).ref), sources: sources(2) };
+  delete state.demandSources;
+  if (conflicting) state.loop.demandObservation.sources[0].reason = "Altered copy";
+  const legacy = copy(state), before = host.calls.length;
+  const output = await host.execute();
+  if (conflicting) {
+    expect(output.reason).toContain("Legacy demand observation state is inconsistent (loop.demandObservation disagrees for loop 2)");
+    expect(host.calls).toHaveLength(before);
+    expect(host.current()).toEqual(legacy);
+    return;
+  }
+  expect(output.status, output.reason).toBe("partial");
+  const current = host.current();
+  expect(current).not.toHaveProperty("closedDemandSources");
+  expect(current.demandObservations.every((item: any) => !("sources" in item))).toBe(true);
+  const observation = host.calls.find(call => call.key === "invoke-human-1.l4.demand-observation")!;
+  expect(observation.task).toContain(JSON.stringify(legacy.closedDemandSources.sources));
+  expect(observation.task).toContain(JSON.stringify(legacy.demandObservations.map(({ loop, ref, sources }: any) => ({ loop, ref, sources }))));
 });
