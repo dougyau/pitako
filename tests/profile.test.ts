@@ -117,6 +117,11 @@ describe("profiles", () => {
       expect(note).toContain("newly discovered stages");
       expect(note).toContain("Skip TODOs for trivial tasks");
       expect(note).not.toContain("navigation baseline");
+      expect(note).toContain("pending/in_progress/completed/cancelled/deleted");
+      expect(note).toContain("at most one in_progress per owner");
+      expect(note).toContain("Only owners edit; others only cancel/delete");
+      expect(note).toContain("completed: delete only; cancelled/deleted terminal");
+      expect(note).toContain("protected bars both; cancel=request asks");
       expect(note.length).toBeLessThan(3200);
     }
     expect(coding).toContain("Use apply_patch when available; otherwise edit");

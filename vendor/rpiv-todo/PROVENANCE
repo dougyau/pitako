@@ -1,0 +1,10 @@
+{
+  "kind": "commit-pinned",
+  "repository": "https://github.com/juicesharp/rpiv-mono",
+  "path": "packages/rpiv-todo",
+  "gitHead": "ce6d3530410812ca504ec294995581a52170f9e1",
+  "version": "2.15.0",
+  "npmPackage": "@juicesharp/rpiv-todo",
+  "integrity": "sha512-8WfYssdgQgSWzFNsRzdw5Z6ZJIjO2ecM/YqEzYpR/ore+Hh5aNmafGVy94uFbIofAv2wGGitx5e3J/ucRrViXQ==",
+  "license": "MIT"
+}

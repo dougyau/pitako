@@ -1,0 +1,302 @@
+import { isolateTodoConfig } from "./test-isolation.ts";
+isolateTodoConfig();
+import type { Theme } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
+import { createMockCtx, createMockPi, makeTheme } from "./test-utils.ts";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { __resetState, registerTodoTool, setActiveRenderSession, type TaskDetails, TOOL_NAME } from "./todo.ts";
+import { STATE_ENTRY_TYPE } from "./tool/types.ts";
+
+const theme = makeTheme() as unknown as Theme;
+
+function setup() {
+	__resetState();
+	setActiveRenderSession("test-session");
+	const { pi, captured } = createMockPi();
+	registerTodoTool(pi);
+	const tool = captured.tools.get(TOOL_NAME);
+	if (!tool) throw new Error("tool not registered");
+	return { tool, captured };
+}
+
+async function call(tool: ReturnType<typeof setup>["tool"], params: Record<string, unknown>) {
+	return tool.execute?.("tc", params as never, undefined as never, undefined as never, createMockCtx() as never);
+}
+
+beforeEach(() => {
+	__resetState();
+});
+afterEach(() => {
+	__resetState();
+});
+
+describe("registerTodoTool — registration shape", () => {
+	it("registers under the tool name 'todo' with the expected label and guidelines", () => {
+		const { captured } = setup();
+		const tool = captured.tools.get("todo")!;
+		expect(tool.name).toBe("todo");
+		expect(tool.label).toBe("Todo");
+		expect(tool.promptSnippet).toContain("task list");
+		expect(Array.isArray(tool.promptGuidelines)).toBe(true);
+		expect((tool.promptGuidelines as string[]).length).toBeGreaterThan(0);
+	});
+
+	it("exposes a typebox parameters schema declaring the seven actions", () => {
+		const { tool } = setup();
+		const raw = JSON.stringify(tool.parameters);
+		for (const action of ["create", "update", "list", "get", "delete", "clear", "cancel"]) {
+			expect(raw).toContain(action);
+		}
+		expect(raw).toContain("tasks");
+	});
+
+	it("requires subject on every tasks[] item in the schema", () => {
+		const { tool } = setup();
+		const items = (tool.parameters as { properties: { tasks: { items: { required?: string[] } } } }).properties.tasks
+			.items;
+		expect(items.required).toEqual(["subject"]);
+	});
+
+	it("names tasks[] batch create in the tool description", () => {
+		const { tool } = setup();
+		expect(tool.description).toContain("tasks[]");
+	});
+
+	it("decodes a double-encoded tasks[] before validation", () => {
+		const { tool } = setup();
+		expect(tool.prepareArguments?.({ action: "create", tasks: '[{"subject":"a"}]' })).toEqual({
+			action: "create",
+			tasks: [{ subject: "a" }],
+		});
+	});
+});
+
+describe("registerTodoTool — execute mutates module state", () => {
+	it("create → list returns the seeded row", async () => {
+		const { tool } = setup();
+		const r1 = await call(tool, { action: "create", subject: "first" });
+		expect((r1!.details as TaskDetails).action).toBe("create");
+		const r2 = await call(tool, { action: "list" });
+		expect(r2?.content[0]).toMatchObject({ text: expect.stringContaining("first") });
+	});
+
+	it("create with tasks[] seeds every row in one call", async () => {
+		const { tool } = setup();
+		const r = await call(tool, {
+			action: "create",
+			tasks: [{ subject: "Inspect existing implementation" }, { subject: "Add tests for batch create" }],
+		});
+		expect(r?.content[0]).toMatchObject({
+			text: "Created #1: Inspect existing implementation (pending)\nCreated #2: Add tests for batch create (pending)",
+		});
+		const d = r?.details as TaskDetails;
+		expect(d.tasks.map((t) => t.subject)).toEqual(["Inspect existing implementation", "Add tests for batch create"]);
+		expect(d.nextId).toBe(3);
+	});
+
+	it("clear resets module state without lowering nextId", async () => {
+		const { tool } = setup();
+		await call(tool, { action: "create", subject: "a" });
+		await call(tool, { action: "create", subject: "b" });
+		const r = await call(tool, { action: "clear" });
+		const d = r?.details as TaskDetails;
+		expect(d.tasks).toEqual([]);
+		expect(d.nextId).toBe(3);
+	});
+});
+
+describe("registerTodoTool — execute persists a state entry for every state change", () => {
+	it("appends the call's details snapshot as a state entry on create / update / delete / clear", async () => {
+		const { tool, captured } = setup();
+		const results = [
+			await call(tool, { action: "create", subject: "a" }),
+			await call(tool, { action: "update", id: 1, status: "in_progress" }),
+			await call(tool, { action: "delete", id: 1 }),
+			await call(tool, { action: "clear" }),
+		];
+		expect(captured.entries.map((e) => e.customType)).toEqual(Array(4).fill(STATE_ENTRY_TYPE));
+		expect(captured.entries.map((e) => e.data)).toEqual(results.map((r) => ({ version: 1, tasks: r?.details.tasks, nextId: r?.details.nextId })));
+		const cleared = captured.entries.at(-1)?.data as TaskDetails;
+		expect(cleared.tasks).toEqual([]);
+		expect(cleared.nextId).toBe(2);
+	});
+
+	it("appends nothing for reads, failures, or a no-effect update", async () => {
+		const { tool, captured } = setup();
+		await call(tool, { action: "create", subject: "a" });
+		captured.entries.length = 0;
+		await call(tool, { action: "list" });
+		await call(tool, { action: "get", id: 1 });
+		await call(tool, { action: "update", id: 99, status: "completed" });
+		await call(tool, { action: "update", id: 1, status: "pending" });
+		expect(captured.entries).toEqual([]);
+	});
+});
+
+describe("registerTodoTool — renderCall", () => {
+	it("create action emits 'todo +' and includes the subject", () => {
+		const { tool } = setup();
+		const node = tool.renderCall?.(
+			{ action: "create", subject: "hello" } as never,
+			theme,
+			undefined as never,
+		) as unknown as Text;
+		expect(node).toBeInstanceOf(Text);
+		const text = (node as unknown as { text: string }).text;
+		expect(text).toContain("todo ");
+		expect(text).toContain("+");
+		expect(text).toContain("hello");
+	});
+
+	it("create action with tasks[] renders the batch size", () => {
+		const { tool } = setup();
+		const node = tool.renderCall?.(
+			{ action: "create", tasks: [{ subject: "a" }, { subject: "b" }] } as never,
+			theme,
+			undefined as never,
+		) as unknown as Text;
+		expect((node as unknown as { text: string }).text).toContain("2 tasks");
+	});
+
+	it("update action renders '#id' when the task has not been registered yet", () => {
+		const { tool } = setup();
+		const node = tool.renderCall?.(
+			{ action: "update", id: 42 } as never,
+			theme,
+			undefined as never,
+		) as unknown as Text;
+		expect((node as unknown as { text: string }).text).toContain("#42");
+	});
+
+	it("update action renders the task subject when seeded", async () => {
+		const { tool } = setup();
+		await call(tool, { action: "create", subject: "seeded-subject" });
+		const node = tool.renderCall?.(
+			{ action: "update", id: 1 } as never,
+			theme,
+			undefined as never,
+		) as unknown as Text;
+		expect((node as unknown as { text: string }).text).toContain("seeded-subject");
+	});
+
+	it("list action with a status filter renders the humanized status label", () => {
+		const { tool } = setup();
+		const node = tool.renderCall?.(
+			{ action: "list", status: "in_progress" } as never,
+			theme,
+			undefined as never,
+		) as unknown as Text;
+		expect((node as unknown as { text: string }).text).toContain("in progress");
+	});
+
+	it("clear action renders only the base prefix + glyph", () => {
+		const { tool } = setup();
+		const node = tool.renderCall?.({ action: "clear" } as never, theme, undefined as never) as unknown as Text;
+		expect((node as unknown as { text: string }).text).toContain("∅");
+	});
+
+	it("a call without an action renders the bare prefix, never 'undefined'", () => {
+		const { tool } = setup();
+		const node = tool.renderCall?.(
+			{ subject: "flat args", id: 1 } as never,
+			theme,
+			undefined as never,
+		) as unknown as Text;
+		const text = (node as unknown as { text: string }).text;
+		expect(text).toContain("todo");
+		expect(text).not.toContain("undefined");
+	});
+});
+
+describe("registerTodoTool — renderResult", () => {
+	it("create renders the new task's status label (pending)", async () => {
+		const { tool } = setup();
+		const r = await call(tool, { action: "create", subject: "a" });
+		const node = tool.renderResult?.(r as never, {} as never, theme, undefined as never) as unknown as Text;
+		expect((node as unknown as { text: string }).text).toContain("pending");
+		expect((node as unknown as { text: string }).text).toContain("○");
+	});
+
+	it("update renders the transitioned status (in progress)", async () => {
+		const { tool } = setup();
+		await call(tool, { action: "create", subject: "a" });
+		const r = await call(tool, { action: "update", id: 1, status: "in_progress" });
+		const node = tool.renderResult?.(r as never, {} as never, theme, undefined as never) as unknown as Text;
+		const text = (node as unknown as { text: string }).text;
+		expect(text).toContain("in progress");
+		expect(text).toContain("◐");
+	});
+
+	it("delete renders the deleted-tombstone label", async () => {
+		const { tool } = setup();
+		await call(tool, { action: "create", subject: "a" });
+		const r = await call(tool, { action: "delete", id: 1 });
+		const node = tool.renderResult?.(r as never, {} as never, theme, undefined as never) as unknown as Text;
+		const text = (node as unknown as { text: string }).text;
+		expect(text).toContain("deleted");
+		expect(text).toContain("⊘");
+	});
+
+	it("list renders the plain '✓' fallback (no status leakage)", async () => {
+		const { tool } = setup();
+		await call(tool, { action: "create", subject: "a" });
+		const r = await call(tool, { action: "list" });
+		const node = tool.renderResult?.(r as never, {} as never, theme, undefined as never) as unknown as Text;
+		expect((node as unknown as { text: string }).text).toContain("✓");
+	});
+
+	it("get renders the plain '✓' fallback", async () => {
+		const { tool } = setup();
+		await call(tool, { action: "create", subject: "a" });
+		const r = await call(tool, { action: "get", id: 1 });
+		const node = tool.renderResult?.(r as never, {} as never, theme, undefined as never) as unknown as Text;
+		expect((node as unknown as { text: string }).text).toContain("✓");
+	});
+
+	it("clear renders the plain '✓' fallback", async () => {
+		const { tool } = setup();
+		await call(tool, { action: "clear" });
+		const r = await call(tool, { action: "clear" });
+		const node = tool.renderResult?.(r as never, {} as never, theme, undefined as never) as unknown as Text;
+		expect((node as unknown as { text: string }).text).toContain("✓");
+	});
+
+	it("missing details falls back to plain '✓'", () => {
+		const { tool } = setup();
+		const node = tool.renderResult?.(
+			{ content: [], details: undefined } as never,
+			{} as never,
+			theme,
+			undefined as never,
+		) as unknown as Text;
+		expect((node as unknown as { text: string }).text).toContain("✓");
+	});
+
+	it("a rejected mutation renders '✗' with the reason, not the requested status", async () => {
+		const { tool } = setup();
+		const r = await call(tool, { action: "update", id: 99, status: "completed" });
+		const node = tool.renderResult?.(r as never, {} as never, theme, { isError: false } as never) as unknown as Text;
+		const text = (node as unknown as { text: string }).text;
+		expect(text).toContain("✗");
+		expect(text).toContain("#99");
+		expect(text).not.toContain("completed");
+		expect(text).not.toContain("✓");
+	});
+
+	it("a call Pi rejected before execute renders '✗' with the first line of its message", () => {
+		const { tool } = setup();
+		const node = tool.renderResult?.(
+			{
+				content: [{ type: "text", text: 'Validation failed for tool "todo":\n  - action: must be present' }],
+			} as never,
+			{} as never,
+			theme,
+			{ isError: true } as never,
+		) as unknown as Text;
+		const text = (node as unknown as { text: string }).text;
+		expect(text).toContain("✗");
+		expect(text).toContain('Validation failed for tool "todo":');
+		expect(text).not.toContain("must be present");
+		expect(text).not.toContain("✓");
+	});
+});

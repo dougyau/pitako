@@ -62,6 +62,10 @@ fs.writeFileSync("bun.lock", "controlled regenerated lockfile\\n");
   writeFileSync(path.join(bin, "npm"), `#!/usr/bin/env node
 const fs = require("node:fs");
 fs.appendFileSync("metadata-calls.jsonl", JSON.stringify(process.argv.slice(2)) + "\\n");
+if (process.argv[3] === "@example/todo@latest") {
+  console.log(JSON.stringify({ version: process.env.TODO_VERSION || "2.15.0", gitHead: process.env.TODO_HEAD || "pinned" }));
+  process.exit(0);
+}
 if (process.env.METADATA_EXIT) process.exit(Number(process.env.METADATA_EXIT));
 console.log(JSON.stringify({
   name: "alpha", version: process.env.METADATA_VERSION || "2.0.0",
@@ -156,6 +160,26 @@ test("does not synchronize or report success when the package update fails", () 
     expect(result.stderr).toContain("19");
     expect(files.map(read)).toEqual(before);
   }));
+
+test("reports vendored todo drift without updating the fork or its metadata", () => {
+  const scenarios: Record<string, string>[] = [{}, { TODO_VERSION: "3.0.0" }, { TODO_HEAD: "new-head" }];
+  for (const env of scenarios) {
+    withUpdater(({ root, read, run }) => {
+      const ledger = JSON.parse(read("docs/dependency-releases.json"));
+      const fork = { kind: "commit-pinned", npmPackage: "@example/todo", version: "2.15.0", gitHead: "pinned" };
+      ledger["pitako-todo"] = fork;
+      writeFileSync(path.join(root, "docs/dependency-releases.json"), JSON.stringify(ledger));
+      const stack = read("config/stack.json");
+      const result = run(env);
+      expect(result.status).toBe(0);
+      expect(result.stdout.includes("Vendored todo upstream drift")).toBe(Object.keys(env).length > 0);
+      expect(JSON.parse(read("docs/dependency-releases.json"))["pitako-todo"]).toEqual(fork);
+      expect(JSON.parse(read("calls.json"))).not.toContain(fork.npmPackage);
+      expect(JSON.parse(read("config/stack.json")).required.slice(1)).toEqual(JSON.parse(stack).required.slice(1));
+      expect(read("THIRD_PARTY.md")).toContain("[vendored](https://example.com/vendor) 1.0.0");
+    });
+  }
+});
 
 interface WorkflowStep {
   id?: string;

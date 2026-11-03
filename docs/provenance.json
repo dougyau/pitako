@@ -80,18 +80,24 @@
     "evidenceLimits": "The npm artifact publishes dist, not src. This import uses the recorded authoritative Git source; no built artifact equality or signature authentication is claimed."
   },
   "rpiv-todo": {
-    "decision": "dependency",
-    "package": "@juicesharp/rpiv-todo",
+    "decision": "vendored-fork",
+    "kind": "commit-pinned",
+    "repository": "https://github.com/juicesharp/rpiv-mono",
+    "path": "packages/rpiv-todo",
+    "gitHead": "ce6d3530410812ca504ec294995581a52170f9e1",
     "version": "2.15.0",
-    "repository": "https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-todo",
+    "npmPackage": "@juicesharp/rpiv-todo",
+    "integrity": "sha512-8WfYssdgQgSWzFNsRzdw5Z6ZJIjO2ecM/YqEzYpR/ore+Hh5aNmafGVy94uFbIofAv2wGGitx5e3J/ucRrViXQ==",
     "license": "MIT",
+    "sourceMapping": {
+      "packages/rpiv-todo/": "vendor/rpiv-todo/"
+    },
+    "localModifications": "vendor/rpiv-todo/pitako.patch",
     "loaded": [
-      "index.ts"
+      "extensions/todo.ts"
     ],
-    "notLoaded": [
-      "@juicesharp/rpiv-i18n"
-    ],
-    "reason": "Official Pi package. Session-local TODO overlay, tool, and /todos. Pitako does not vendor the reducer, overlay, or schemas. i18n remains an optional peer."
+    "reason": "Commit-pinned session TODO fork. rpiv-config is exact-pinned and bundled; rpiv-i18n remains an optional peer.",
+    "evidenceLimits": "Imported from the Git tree, not the npm artifact; npm integrity is traceability, not source equivalence."
   },
   "pi-hermes-memory": {
     "decision": "dependency",
@@ -231,15 +237,7 @@
         "reason": "Compact Pitako contract for observable evidence, read-only diff review, and explicitly authorized test simplification; retains pstack MIT attribution."
       }
     ],
-    "excluded": [
-      "poteto-mode",
-      "setup-pstack",
-      "arena",
-      "interrogate",
-      "swarm",
-      "principle-never-block-on-the-human",
-      "principle-laziness-protocol"
-    ],
+    "excluded": ["poteto-mode", "setup-pstack", "arena", "interrogate", "swarm", "principle-never-block-on-the-human", "principle-laziness-protocol"],
     "localModifications": [
       "Practical skills rewritten for a single agent using CodeGraph and LSP",
       "architect is renamed architecture-design; it stops after the sketch unless the user asked to implement; reapply the interface-design adaptation after vendoring",

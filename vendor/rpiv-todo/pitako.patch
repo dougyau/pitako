@@ -1,0 +1,2141 @@
+diff --git a/config.test.ts b/config.test.ts
+index 90313d8..7d4f077 100644
+--- a/config.test.ts
++++ b/config.test.ts
+@@ -1,6 +1,7 @@
+-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+ import { dirname, join } from "node:path";
+-import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import { afterAll, afterEach, beforeEach, describe, expect, it } from "bun:test";
+ import {
+ 	COLLAPSE_KEY_OFF,
+ 	DEFAULT_COLLAPSE_KEY,
+@@ -11,7 +12,19 @@ import {
+ 	resolveCollapseKey,
+ } from "./config.ts";
+ 
+-const CONFIG_PATH = join(process.env.HOME!, ".config", "rpiv-todo", "config.json");
++const originalHome = process.env.HOME;
++const originalXdg = process.env.XDG_CONFIG_HOME;
++const home = mkdtempSync(join(tmpdir(), "rpiv-todo-config-"));
++process.env.HOME = home;
++process.env.XDG_CONFIG_HOME = join(home, ".config");
++const CONFIG_PATH = join(process.env.XDG_CONFIG_HOME, "rpiv-todo", "config.json");
++afterAll(() => {
++	if (originalHome === undefined) delete process.env.HOME;
++	else process.env.HOME = originalHome;
++	if (originalXdg === undefined) delete process.env.XDG_CONFIG_HOME;
++	else process.env.XDG_CONFIG_HOME = originalXdg;
++	rmSync(home, { recursive: true, force: true });
++});
+ 
+ function writeConfigFile(contents: string): void {
+ 	mkdirSync(dirname(CONFIG_PATH), { recursive: true });
+diff --git a/index.ts b/index.ts
+index b371c5f..13e6125 100644
+--- a/index.ts
++++ b/index.ts
+@@ -23,6 +23,9 @@ import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding
+ import type { KeyId } from "@earendil-works/pi-tui";
+ import { COLLAPSE_KEY_OFF, resolveCollapseKey } from "./config.ts";
+ import { I18N_NAMESPACE } from "./state/i18n-bridge.ts";
++import { createTodoCommit, type TodoCommit } from "./state/commit.ts";
++export { createTodoCommit, type TodoCommit, type CommitOperation, type CommitResult } from "./state/commit.ts";
++export { replayFromBranch } from "./state/replay.ts";
+ import { replayFromBranch } from "./state/replay.ts";
+ import {
+ 	clearActiveRenderSession,
+@@ -125,7 +128,7 @@ function formatError(e: unknown): string {
+ 	return e instanceof Error ? e.message : String(e);
+ }
+ 
+-export default function (pi: ExtensionAPI, importOverlay: TodoOverlayImporter = () => import("./todo-overlay.ts")) {
++export default function (pi: ExtensionAPI, importOverlay: TodoOverlayImporter = () => import("./todo-overlay.ts")): TodoCommit {
+ 	let todoOverlay: TodoOverlay | undefined;
+ 	const loadTodoOverlay = makeTodoOverlayLoader(importOverlay);
+ 	let uiCtx: ExtensionUIContext | undefined;
+@@ -138,6 +141,12 @@ export default function (pi: ExtensionAPI, importOverlay: TodoOverlayImporter =
+ 		const hasVisibleTasks = getRenderState().tasks.some((task) => task.status !== "deleted");
+ 		if (!uiCtx || (!todoOverlay && !hasVisibleTasks)) return;
+ 
++		if (todoOverlay) {
++			todoOverlay.setUICtx(uiCtx);
++			if (resetCompletedDisplayState) todoOverlay.resetCompletedDisplayState();
++			todoOverlay.update();
++			return;
++		}
+ 		const { TodoOverlay } = await loadTodoOverlay();
+ 		if (generation !== lifecycleGeneration || !uiCtx) return;
+ 
+@@ -147,7 +156,17 @@ export default function (pi: ExtensionAPI, importOverlay: TodoOverlayImporter =
+ 		todoOverlay.update();
+ 	}
+ 
+-	registerTodoTool(pi);
++	let commitRefresh: Promise<void> | undefined;
++	const commit = createTodoCommit(pi, () => {
++		commitRefresh = updateTodoOverlay().catch((error: unknown) => {
++			if (isStaleOverlayModuleError(error)) throw error;
++			console.warn(`[rpiv-todo] overlay refresh failed (will retry on next update): ${formatError(error)}`);
++		});
++		// A seam call need not have a tool event. Observe rejection now; the
++		// tool event still propagates the latched restart error when present.
++		void commitRefresh.catch(() => undefined);
++	});
++	registerTodoTool(pi, commit);
+ 	registerTodosCommand(pi);
+ 
+ 	// Collapse/expand hotkey for the todo overlay. The key is resolved once at
+@@ -263,6 +282,12 @@ export default function (pi: ExtensionAPI, importOverlay: TodoOverlayImporter =
+ 	// (branch is stale — message_end runs after tool_execution_end).
+ 	pi.on("tool_execution_end", async (event) => {
+ 		if (event.toolName !== TOOL_NAME || event.isError) return;
++		if (commitRefresh) {
++			const pending = commitRefresh;
++			commitRefresh = undefined;
++			await pending;
++			return;
++		}
+ 		try {
+ 			await updateTodoOverlay();
+ 		} catch (e) {
+@@ -287,4 +312,5 @@ export default function (pi: ExtensionAPI, importOverlay: TodoOverlayImporter =
+ 	pi.on("agent_start", async () => {
+ 		todoOverlay?.hideCompletedTasksFromPreviousTurn();
+ 	});
++	return commit;
+ }
+diff --git a/lazy-overlay.regression.test.ts b/lazy-overlay.regression.test.ts
+index 9917f75..bde9963 100644
+--- a/lazy-overlay.regression.test.ts
++++ b/lazy-overlay.regression.test.ts
+@@ -1,16 +1,16 @@
+-import { buildSessionEntries, createMockCtx, createMockPi, makeTodoToolResult } from "@juicesharp/rpiv-test-utils";
+-import { afterEach, beforeEach, expect, it, vi } from "vitest";
++import { isolateTodoConfig } from "./test-isolation.ts";
++isolateTodoConfig();
++import { buildSessionEntries, createMockCtx, createMockPi, makeTodoToolResult } from "./test-utils.ts";
++import { afterEach, beforeEach, expect, it, vi } from "bun:test";
+ 
+-const overlayMock = vi.hoisted(() => ({
+-	importGate: undefined as Promise<void> | undefined,
+-	moduleLoads: 0,
+-}));
++import { __resetState } from "./todo.ts";
+ 
+-vi.mock("./todo-overlay.ts", async (importOriginal) => {
++const overlayMock = { importGate: undefined as Promise<void> | undefined, moduleLoads: 0 };
++async function importOverlay() {
+ 	overlayMock.moduleLoads++;
+ 	await overlayMock.importGate;
+-	return importOriginal<typeof import("./todo-overlay.ts")>();
+-});
++	return import("./todo-overlay.ts");
++}
+ 
+ function resumedBranch(subject: string) {
+ 	return buildSessionEntries([
+@@ -23,10 +23,12 @@ function resumedBranch(subject: string) {
+ 	]);
+ }
+ 
++const defaultImporter = importOverlay;
++
+ async function setup(importOverlay?: () => Promise<typeof import("./todo-overlay.ts")>) {
+ 	const { default: registerTodo } = await import("./index.ts");
+ 	const { pi, captured } = createMockPi();
+-	registerTodo(pi, importOverlay);
++	registerTodo(pi, importOverlay ?? defaultImporter);
+ 	const start = captured.events.get("session_start")?.[0];
+ 	const shutdown = captured.events.get("session_shutdown")?.[0];
+ 	const toolEnd = captured.events.get("tool_execution_end")?.[0];
+@@ -36,7 +38,8 @@ async function setup(importOverlay?: () => Promise<typeof import("./todo-overlay
+ }
+ 
+ beforeEach(() => {
+-	vi.resetModules();
++	__resetState();
++	vi.useFakeTimers();
+ 	overlayMock.importGate = undefined;
+ 	overlayMock.moduleLoads = 0;
+ });
+@@ -44,6 +47,7 @@ beforeEach(() => {
+ afterEach(() => {
+ 	if (vi.isFakeTimers()) vi.clearAllTimers();
+ 	vi.useRealTimers();
++	vi.restoreAllMocks();
+ });
+ 
+ it("keeps overlay construction task-gated and ignores stale imports", async () => {
+@@ -72,7 +76,7 @@ it("keeps overlay construction task-gated and ignores stale imports", async () =
+ 		staleCtx as never,
+ 	);
+ 	const staleUpdate = staleLifecycle.toolEnd({ toolName: "todo", isError: false } as never, staleCtx as never);
+-	await vi.waitFor(() => expect(overlayMock.moduleLoads).toBe(1));
++	expect(overlayMock.moduleLoads).toBe(1);
+ 	await staleLifecycle.shutdown({} as never, staleCtx as never);
+ 
+ 	const replacementCtx = createMockCtx({
+@@ -145,9 +149,10 @@ it("schedules the overlay pre-warm after startup", async () => {
+ 	const lifecycle = await setup(importer);
+ 
+ 	expect(importer).not.toHaveBeenCalled();
+-	await vi.advanceTimersByTimeAsync(PREWARM_DELAY_MS - 1);
++	vi.advanceTimersByTime(PREWARM_DELAY_MS - 1);
+ 	expect(importer).not.toHaveBeenCalled();
+-	await vi.advanceTimersByTimeAsync(1);
++	vi.advanceTimersByTime(1);
++	await importer.mock.results[0].value;
+ 	expect(importer).toHaveBeenCalledTimes(1);
+ 
+ 	const ctx = createMockCtx({ hasUI: true, sessionId: "empty" });
+@@ -178,7 +183,8 @@ it("swallows a failed pre-warm, then retries on the first real update", async ()
+ 	});
+ 	const lifecycle = await setup(importer);
+ 
+-	await vi.advanceTimersByTimeAsync(PREWARM_DELAY_MS);
++	vi.advanceTimersByTime(PREWARM_DELAY_MS);
++	await importer.mock.results[0].value.catch(() => undefined);
+ 	expect(importer).toHaveBeenCalledTimes(1);
+ 
+ 	const ctx = createMockCtx({ hasUI: true, sessionId: "retry" });
+@@ -213,8 +219,13 @@ it("concurrent awaiters of one rejected import share a single retry", async () =
+ 	// only one underlying import ran, and only one retry runs afterwards.
+ 	const first = load();
+ 	const second = load();
+-	await expect(first).rejects.toThrow("shared load failure");
+-	await expect(second).rejects.toThrow("shared load failure");
++	const outcomes = await Promise.allSettled([first, second]);
++	for (const outcome of outcomes) {
++		expect(outcome.status).toBe("rejected");
++		if (outcome.status === "rejected") {
++			expect(() => { throw outcome.reason; }).toThrow("shared load failure");
++		}
++	}
+ 	expect(importer).toHaveBeenCalledTimes(1);
+ 
+ 	await expect(load()).resolves.toBe(healthyModule);
+diff --git a/package.json b/package.json
+index b3ac89f..4efeb58 100644
+--- a/package.json
++++ b/package.json
+@@ -24,7 +24,7 @@
+ 		"access": "public"
+ 	},
+ 	"scripts": {
+-		"test": "vitest run"
++		"test": "bun test --parallel"
+ 	},
+ 	"files": [
+ 		"config.ts",
+@@ -38,6 +38,7 @@
+ 		"!docs/*.jpg",
+ 		"!docs/*.svg",
+ 		"README.md",
++		"state/commit.ts",
+ 		"state/invariants.ts",
+ 		"state/i18n-bridge.ts",
+ 		"state/replay.ts",
+diff --git a/ship-manifest.test.ts b/ship-manifest.test.ts
+index 36ffb9e..85f839b 100644
+--- a/ship-manifest.test.ts
++++ b/ship-manifest.test.ts
+@@ -1,5 +1,5 @@
+-import { verifyShipManifest } from "@juicesharp/rpiv-test-utils";
+-import { describe, expect, it } from "vitest";
++import { verifyShipManifest } from "./test-utils.ts";
++import { describe, expect, it } from "bun:test";
+ 
+ describe("publish manifest", () => {
+ 	it("`package.json` `files` array covers every production .ts module across the tree", () => {
+diff --git a/state/commit.ts b/state/commit.ts
+new file mode 100644
+index 0000000..dbd5251
+--- /dev/null
++++ b/state/commit.ts
+@@ -0,0 +1,57 @@
++import type { TaskAction, TaskMutationParams, SyncRow } from "../tool/types.ts";
++import { STATE_ENTRY_TYPE } from "../tool/types.ts";
++import type { TaskState } from "./state.ts";
++import { applyTaskMutation, applyTaskSync, finalizeTaskState, type Op } from "./state-reducer.ts";
++import { commitState, commitSyncSequences, getActiveRenderSession, getState, getSyncSequences } from "./store.ts";
++
++export type CommitOperation =
++	| { action: TaskAction; params: TaskMutationParams }
++	| { action: "sync"; owner: string; seq: number; rows: readonly SyncRow[] };
++
++export interface CommitResult {
++	state: TaskState;
++	changed: boolean;
++	error?: string;
++	/** Last reducer outcome, used by the tool's response formatter. */
++	op?: Op;
++}
++
++export type TodoCommit = (sessionId: string, actor: string | undefined, ops: readonly CommitOperation[]) => CommitResult;
++
++/** One synchronous write boundary. Replay replacement is a separate lifecycle read. */
++export function createTodoCommit(
++	pi: { appendEntry(type: string, data: unknown): void },
++	refreshOverlay: () => void = () => {},
++): TodoCommit {
++	return (sessionId, actor, ops) => {
++		const before = getState(sessionId);
++		let state = before;
++		let op: Op | undefined;
++		const sequences = new Map(getSyncSequences(sessionId));
++		const fail = (error: string): CommitResult => ({ state: before, changed: false, error, op: { kind: "error", message: error } });
++		for (const operation of ops) {
++			if (operation.action === "sync") {
++				const result = applyTaskSync(state, actor, operation.owner, operation.seq, operation.rows, sequences.get(operation.owner));
++				if (result.error) return fail(result.error);
++				state = result.state;
++				if (result.lastSyncSeq !== undefined) sequences.set(operation.owner, result.lastSyncSeq);
++			} else {
++				const result = applyTaskMutation(state, operation.action, operation.params, actor);
++				if (result.op.kind === "error") return fail(result.op.message);
++				state = result.state;
++				op = result.op;
++			}
++		}
++		const checked = finalizeTaskState(state);
++		if (checked.error) return fail(checked.error);
++		state = checked.state;
++		const changed = JSON.stringify(before) !== JSON.stringify(state);
++		commitSyncSequences(sessionId, sequences);
++		if (!changed) return { state: before, changed: false, op };
++		commitState(sessionId, state);
++		// A pending lazy import schedules a render of the committed store, not a captured snapshot.
++		if (sessionId === getActiveRenderSession()) refreshOverlay();
++		pi.appendEntry(STATE_ENTRY_TYPE, { version: 1, tasks: state.tasks, nextId: state.nextId });
++		return { state, changed: true, op };
++	};
++}
+diff --git a/state/i18n-bridge.shim.test.ts b/state/i18n-bridge.shim.test.ts
+index 208be63..cb13a0b 100644
+--- a/state/i18n-bridge.shim.test.ts
++++ b/state/i18n-bridge.shim.test.ts
+@@ -23,7 +23,7 @@
+ import { readFileSync } from "node:fs";
+ import { dirname, resolve } from "node:path";
+ import { fileURLToPath } from "node:url";
+-import { describe, expect, it } from "vitest";
++import { describe, expect, it } from "bun:test";
+ 
+ const PACKAGE_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
+ const BRIDGE = resolve(PACKAGE_DIR, "state/i18n-bridge.ts");
+diff --git a/state/i18n-bridge.test.ts b/state/i18n-bridge.test.ts
+index ac35599..951d9a3 100644
+--- a/state/i18n-bridge.test.ts
++++ b/state/i18n-bridge.test.ts
+@@ -1,10 +1,11 @@
+-import { applyLocale, registerStrings } from "@juicesharp/rpiv-i18n";
+-import { beforeEach, describe, expect, it } from "vitest";
++import { __resetState, applyLocale, registerStrings } from "@juicesharp/rpiv-i18n";
++import { beforeEach, describe, expect, it } from "bun:test";
+ import { formatStatusLabel, I18N_NAMESPACE, t } from "./i18n-bridge.ts";
+ 
+ describe("i18n-bridge", () => {
+ 	beforeEach(() => {
+-		// `i18n.__resetState()` is invoked by the global test/setup.ts hook;
++		__resetState();
++		// Reset locale before registering this file's strings.
+ 		// re-register the namespace fresh per test to exercise registration.
+ 		registerStrings(I18N_NAMESPACE, {
+ 			en: {
+diff --git a/state/i18n-bridge.ts b/state/i18n-bridge.ts
+index 6e5f623..dbbe5c2 100644
+--- a/state/i18n-bridge.ts
++++ b/state/i18n-bridge.ts
+@@ -58,6 +58,8 @@ export function formatStatusLabel(status: TaskStatus): string {
+ 			return t("status.in_progress", STATUS_LABEL_IN_PROGRESS);
+ 		case "completed":
+ 			return t("status.completed", STATUS_LABEL_COMPLETED);
++		case "cancelled":
++			return t("status.cancelled", "cancelled");
+ 		case "deleted":
+ 			return t("status.deleted", STATUS_LABEL_DELETED);
+ 	}
+diff --git a/state/invariants.ts b/state/invariants.ts
+index 0e9bd0b..87a45fa 100644
+--- a/state/invariants.ts
++++ b/state/invariants.ts
+@@ -8,9 +8,10 @@ import type { TaskStatus } from "../tool/types.ts";
+  * table only enumerates actual transitions.
+  */
+ export const VALID_TRANSITIONS: Record<TaskStatus, ReadonlySet<TaskStatus>> = {
+-	pending: new Set(["in_progress", "completed", "deleted"]),
+-	in_progress: new Set(["pending", "completed", "deleted"]),
++	pending: new Set(["in_progress", "completed", "cancelled", "deleted"]),
++	in_progress: new Set(["pending", "completed", "cancelled", "deleted"]),
+ 	completed: new Set(["deleted"]),
++	cancelled: new Set(),
+ 	deleted: new Set(),
+ };
+ 
+diff --git a/state/replay.test.ts b/state/replay.test.ts
+index 27e0286..0924b7d 100644
+--- a/state/replay.test.ts
++++ b/state/replay.test.ts
+@@ -5,8 +5,8 @@ import {
+ 	makeMessageEntry,
+ 	makeTodoToolResult,
+ 	makeUserMessage,
+-} from "@juicesharp/rpiv-test-utils";
+-import { describe, expect, it } from "vitest";
++} from "../test-utils.ts";
++import { describe, expect, it } from "bun:test";
+ import { STATE_ENTRY_TYPE, type Task, type TaskDetails } from "../tool/types.ts";
+ import { isTaskDetails, replayFromBranch } from "./replay.ts";
+ 
+@@ -164,12 +164,12 @@ describe("replayFromBranch", () => {
+ // ---------------------------------------------------------------------------
+ 
+ const snap = (tasks: Task[], nextId: number): TaskDetails => ({ action: "update", params: {}, tasks, nextId });
+-const stateEntry = (details: unknown) => makeCustomEntry(STATE_ENTRY_TYPE, details);
++const stateEntry = (details: unknown) => makeCustomEntry(STATE_ENTRY_TYPE, { version: 1, ...(details as object) });
+ const todoResult = (details: TaskDetails) => makeMessageEntry(makeTodoToolResult(details));
+ 
+ describe("replayFromBranch — state entries", () => {
+ 	it("matches the STATE_ENTRY_TYPE the tool writes (replay.ts keeps the literal)", () => {
+-		expect(STATE_ENTRY_TYPE).toBe("rpiv-todo-state");
++		expect(STATE_ENTRY_TYPE).toBe("pitako-todo-state");
+ 	});
+ 
+ 	it("replays a branch whose only snapshots are state entries (codemode-only session)", () => {
+@@ -195,16 +195,15 @@ describe("replayFromBranch — state entries", () => {
+ 		expect(replayFromBranch(ctx).tasks[0]?.status).toBe("completed");
+ 	});
+ 
+-	it("state entries are authoritative over a toolResult that lands after them", () => {
+-		// A direct call's entry is appended during execute(), before its toolResult message;
+-		// a read (list/get) result carries no entry. Neither may override the entry trail.
++	it("a later toolResult wins in branch order", () => {
++		// Entries precede toolResults; all valid snapshots participate in branch order.
+ 		const ctx = createMockCtx({
+ 			branch: [
+ 				stateEntry(snap([taskFixture(1, "T", { status: "completed" })], 2)),
+ 				todoResult(snap([taskFixture(1, "T", { status: "in_progress" })], 2)),
+ 			],
+ 		});
+-		expect(replayFromBranch(ctx).tasks[0]?.status).toBe("completed");
++		expect(replayFromBranch(ctx).tasks[0]?.status).toBe("in_progress");
+ 	});
+ 
+ 	it("a malformed snapshot keeps the last valid state, on both replay sources", () => {
+@@ -230,7 +229,7 @@ describe("replayFromBranch — state entries", () => {
+ 		});
+ 		const state = replayFromBranch(ctx);
+ 		expect(state.tasks).toEqual([]);
+-		expect(state.nextId).toBe(1);
++		expect(state.nextId).toBe(2);
+ 	});
+ 
+ 	it("ignores malformed state entries and other custom entry types", () => {
+diff --git a/state/replay.ts b/state/replay.ts
+index 707a620..4fb839b 100644
+--- a/state/replay.ts
++++ b/state/replay.ts
+@@ -1,7 +1,7 @@
+ import type { Task, TaskDetails, TaskStatus } from "../tool/types.ts";
+ import { EMPTY_STATE, type TaskState } from "./state.ts";
+ 
+-const TASK_STATUSES: ReadonlySet<unknown> = new Set<TaskStatus>(["pending", "in_progress", "completed", "deleted"]);
++const TASK_STATUSES: ReadonlySet<unknown> = new Set<TaskStatus>(["pending", "in_progress", "completed", "cancelled", "deleted"]);
+ 
+ const optional = (value: unknown, valid: (v: unknown) => boolean): boolean => value === undefined || valid(value);
+ const isString = (v: unknown): boolean => typeof v === "string";
+@@ -10,14 +10,15 @@ function isTask(value: unknown): value is Task {
+ 	if (!value || typeof value !== "object") return false;
+ 	const t = value as Record<string, unknown>;
+ 	return (
+-		Number.isSafeInteger(t.id) &&
+-		typeof t.subject === "string" &&
++		Number.isSafeInteger(t.id) && Number(t.id) > 0 &&
++		typeof t.subject === "string" && t.subject.length <= 2000 && t.subject.trim().length > 0 &&
+ 		TASK_STATUSES.has(t.status) &&
+ 		optional(t.description, isString) &&
+ 		optional(t.activeForm, isString) &&
+ 		optional(t.owner, isString) &&
++		optional(t.parentId, (v) => Number.isSafeInteger(v) && Number(v) > 0) &&
+ 		optional(t.blockedBy, (v) => Array.isArray(v) && v.every((id) => Number.isSafeInteger(id))) &&
+-		optional(t.metadata, (v) => typeof v === "object" && v !== null)
++		optional(t.metadata, (v) => typeof v === "object" && v !== null && !Array.isArray(v))
+ 	);
+ }
+ 
+@@ -27,57 +28,37 @@ function isTask(value: unknown): value is Task {
+  * session (e.g. a `tasks[]` another extension truncated with a marker string)
+  * is skipped whole, so replay keeps the last valid one.
+  */
+-export function isTaskDetails(value: unknown): value is TaskDetails {
++export function isTaskDetails(value: unknown): value is Pick<TaskDetails, "tasks" | "nextId"> {
+ 	if (!value || typeof value !== "object") return false;
+ 	const v = value as Record<string, unknown>;
+-	return Array.isArray(v.tasks) && v.tasks.every(isTask) && Number.isSafeInteger(v.nextId);
++	return Array.isArray(v.tasks) && v.tasks.every(isTask) && Number.isSafeInteger(v.nextId) &&
++		Number(v.nextId) > Math.max(0, ...v.tasks.map((t: Task) => t.id)) &&
++		new Set(v.tasks.map((t: Task) => t.id)).size === v.tasks.length;
+ }
+ 
+ /** Fresh `TaskState` from a persisted snapshot — copies each task so replay never aliases branch data. */
+-function stateOf(details: TaskDetails): TaskState {
+-	return { tasks: details.tasks.map((t) => ({ ...t })), nextId: details.nextId };
++function stateOf(details: Pick<TaskDetails, "tasks" | "nextId">): TaskState {
++	return { tasks: structuredClone(details.tasks), nextId: details.nextId };
+ }
+ 
+-/**
+- * Walk the current branch in chronological order and return the last persisted
+- * snapshot (last-write-wins). Two sources carry the same `TaskDetails` shape:
+- *
+- * - `custom` entries of type `"rpiv-todo-state"` (mirrors `STATE_ENTRY_TYPE` in
+- *   `tool/types.ts` — a literal here, like `"todo"`, so `state/` keeps no value
+- *   import of the Pi-aware tool layer). Written by `todo.ts` for EVERY
+- *   state-changing call, including calls made through another tool
+- *   (`ctx.executeTool`, e.g. codemode) that never land as a `toolResult`.
+- * - `toolResult` messages with `toolName === "todo"` — the `details` envelope.
+- *
+- * Once the branch carries any state entry, state entries are authoritative:
+- * they are appended at commit time for every change, so a `toolResult`
+- * snapshot can only repeat or predate them. Branches with no state entry
+- * (sessions written before entries existed) replay from `toolResult` snapshots.
+- * When neither exists, returns `EMPTY_STATE`.
+- *
+- * Pure of module state — `index.ts` writes the returned snapshot into the
+- * store after this returns. The function explicitly does NOT touch the store
+- * cell.
+- */
++/** Latest valid snapshot in branch order; entries precede their toolResults. Pure. */
+ export function replayFromBranch(ctx: { sessionManager: { getBranch(): Iterable<unknown> } }): TaskState {
+-	let fromEntries: TaskState | undefined;
+-	let fromToolResults: TaskState | undefined;
++	let state: TaskState = { tasks: [...EMPTY_STATE.tasks], nextId: EMPTY_STATE.nextId };
+ 	for (const entry of ctx.sessionManager.getBranch()) {
+-		const e = entry as {
+-			type?: string;
+-			customType?: string;
+-			data?: unknown;
+-			message?: { role?: string; toolName?: string; details?: unknown };
+-		};
+-		if (e.type === "custom") {
+-			if (e.customType === "rpiv-todo-state" && isTaskDetails(e.data)) fromEntries = stateOf(e.data);
+-			continue;
++		if (!entry || typeof entry !== "object") continue;
++		const e = entry as { type?: string; customType?: string; data?: unknown;
++			message?: { role?: string; toolName?: string; details?: unknown } };
++		let snapshot: unknown;
++		if (e.type === "custom" && e.customType === "pitako-todo-state") {
++			if (!e.data || typeof e.data !== "object" || !("version" in e.data) || e.data.version !== 1) continue;
++			snapshot = e.data;
++		} else if (e.type === "custom" && e.customType === "rpiv-todo-state") snapshot = e.data;
++		else if (e.type === "message" && e.message?.role === "toolResult" && e.message.toolName === "todo") snapshot = e.message.details;
++		if (isTaskDetails(snapshot)) {
++			const nextId = Math.max(state.nextId, snapshot.nextId);
++			state = stateOf(snapshot);
++			state.nextId = nextId;
+ 		}
+-		if (e.type !== "message") continue;
+-		const msg = e.message;
+-		if (msg?.role !== "toolResult" || msg.toolName !== "todo") continue;
+-		if (!isTaskDetails(msg.details)) continue;
+-		fromToolResults = stateOf(msg.details);
+ 	}
+-	return fromEntries ?? fromToolResults ?? { tasks: [...EMPTY_STATE.tasks], nextId: EMPTY_STATE.nextId };
++	return state;
+ }
+diff --git a/state/selectors.ts b/state/selectors.ts
+index 193bacc..65cb24a 100644
+--- a/state/selectors.ts
++++ b/state/selectors.ts
+@@ -3,7 +3,19 @@ import type { TaskState } from "./state.ts";
+ 
+ /** Tasks excluding deleted tombstones — the canonical "what's visible". */
+ export function selectVisibleTasks(state: TaskState): readonly Task[] {
+-	return state.tasks.filter((t) => t.status !== "deleted");
++	const visible = state.tasks.filter((t) => t.status !== "deleted");
++	return visible.filter((task) => !selectTaskParent(state, task)).flatMap((parent) => [
++		parent, ...visible.filter((task) => parent.parentId === undefined && task.parentId === parent.id),
++	]);
++}
++
++/** Only a visible, top-level parent establishes one-level indentation. */
++export function selectTaskParent(state: TaskState, task: Task): Task | undefined {
++	return state.tasks.find((parent) => parent.id === task.parentId && parent.parentId === undefined && parent.status !== "deleted");
++}
++
++export function isTaskDone(task: Task): boolean {
++	return task.status === "completed" || task.status === "cancelled";
+ }
+ 
+ /**
+@@ -21,7 +33,7 @@ export function selectTasksByStatus(state: TaskState): TasksByStatus {
+ 	return {
+ 		pending: visible.filter((t) => t.status === "pending"),
+ 		inProgress: visible.filter((t) => t.status === "in_progress"),
+-		completed: visible.filter((t) => t.status === "completed"),
++		completed: visible.filter(isTaskDone),
+ 	};
+ }
+ 
+@@ -78,16 +90,16 @@ export function selectOverlayLayout(state: TaskState, budget: number): OverlayLa
+ 		return { visible: all, hiddenCompleted: 0, truncatedTail: 0 };
+ 	}
+ 	const innerBudget = budget - 1;
+-	const nonCompleted = all.filter((t) => t.status !== "completed");
++	const nonCompleted = all.filter((t) => !isTaskDone(t));
+ 	const totalCompleted = all.length - nonCompleted.length;
+ 	if (nonCompleted.length <= innerBudget) {
+ 		const kept = new Set<Task>(nonCompleted);
+ 		for (const t of all) {
+ 			if (kept.size >= innerBudget) break;
+-			if (t.status === "completed") kept.add(t);
++			if (isTaskDone(t)) kept.add(t);
+ 		}
+ 		const visible = all.filter((t) => kept.has(t));
+-		const shownCompleted = visible.filter((t) => t.status === "completed").length;
++		const shownCompleted = visible.filter(isTaskDone).length;
+ 		return { visible, hiddenCompleted: totalCompleted - shownCompleted, truncatedTail: 0 };
+ 	}
+ 	const visible = nonCompleted.slice(0, innerBudget);
+diff --git a/state/state-reducer.test.ts b/state/state-reducer.test.ts
+index 9b35c4c..afd3f63 100644
+--- a/state/state-reducer.test.ts
++++ b/state/state-reducer.test.ts
+@@ -1,4 +1,4 @@
+-import { describe, expect, it } from "vitest";
++import { describe, expect, it } from "bun:test";
+ import type { Task } from "../tool/types.ts";
+ import { isTransitionValid } from "./invariants.ts";
+ import type { TaskState } from "./state.ts";
+@@ -91,7 +91,6 @@ describe("applyTaskMutation — create", () => {
+ 				subject: "Add tests for batch create",
+ 				status: "pending",
+ 				description: "reducer + envelope",
+-				owner: "rpiv-todo",
+ 			},
+ 		]);
+ 	});
+@@ -165,7 +164,7 @@ describe("applyTaskMutation — update", () => {
+ 		expect(result.op).toEqual({
+ 			kind: "error",
+ 			message:
+-				"update requires at least one mutable field: subject, description, activeForm, status, owner, metadata, addBlockedBy, or removeBlockedBy",
++				"update requires at least one mutable field: subject, description, activeForm, status, metadata, addBlockedBy, or removeBlockedBy",
+ 		});
+ 	});
+ 
+@@ -174,7 +173,7 @@ describe("applyTaskMutation — update", () => {
+ 		const result = applyTaskMutation(state, "update", { id: 1, status: "in_progress" });
+ 		expect(result.op).toEqual({
+ 			kind: "error",
+-			message: "illegal transition completed → in_progress",
++			message: "completed rows are read-only except delete",
+ 		});
+ 	});
+ 
+@@ -292,12 +291,12 @@ describe("applyTaskMutation — list/get/delete/clear", () => {
+ 		expect(result.state.tasks[0].status).toBe("deleted");
+ 	});
+ 
+-	it("clear emits Op with prior count and resets nextId to 1", () => {
++	it("clear emits Op with prior count and preserves nextId", () => {
+ 		const state = stateWith(task({ id: 5, subject: "x" }));
+ 		const result = applyTaskMutation(state, "clear", {});
+ 		expect(result.op).toEqual({ kind: "clear", count: 1 });
+ 		expect(result.state.tasks).toHaveLength(0);
+-		expect(result.state.nextId).toBe(1);
++		expect(result.state.nextId).toBe(6);
+ 	});
+ 
+ 	it("get emits Op with the resolved task", () => {
+diff --git a/state/state-reducer.ts b/state/state-reducer.ts
+index ad79f55..82fc384 100644
+--- a/state/state-reducer.ts
++++ b/state/state-reducer.ts
+@@ -1,4 +1,4 @@
+-import type { Task, TaskAction, TaskMutationParams, TaskStatus } from "../tool/types.ts";
++import type { Task, TaskAction, TaskMutationParams, TaskStatus, SyncRow } from "../tool/types.ts";
+ import { isTransitionValid } from "./invariants.ts";
+ import type { TaskState } from "./state.ts";
+ import { detectCycle } from "./task-graph.ts";
+@@ -36,8 +36,9 @@ export function changesState(op: Op): boolean {
+ 	switch (op.kind) {
+ 		case "create":
+ 		case "delete":
+-		case "clear":
+ 			return true;
++		case "clear":
++			return op.count > 0;
+ 		case "update":
+ 			return op.changed;
+ 		case "list":
+@@ -52,14 +53,14 @@ function errorResult(state: TaskState, message: string): ApplyResult {
+ }
+ 
+ /** Per-task create fields: on a batch they belong to each `tasks[]` item. */
+-const BATCH_ITEM_FIELDS = ["description", "activeForm", "blockedBy", "owner", "metadata"] as const;
++const BATCH_ITEM_FIELDS = ["description", "activeForm", "blockedBy", "metadata", "parentId"] as const;
+ 
+ function asCreateItem(value: unknown): TaskMutationParams | undefined {
+ 	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+ 	return value as TaskMutationParams;
+ }
+ 
+-function buildCreatedTask(id: number, spec: TaskMutationParams, subject: string): Task {
++function buildCreatedTask(id: number, spec: TaskMutationParams, subject: string, actor?: string): Task {
+ 	const newTask: Task = {
+ 		id,
+ 		subject,
+@@ -68,7 +69,8 @@ function buildCreatedTask(id: number, spec: TaskMutationParams, subject: string)
+ 	if (spec.description) newTask.description = spec.description;
+ 	if (spec.activeForm) newTask.activeForm = spec.activeForm;
+ 	if (spec.blockedBy?.length) newTask.blockedBy = [...spec.blockedBy];
+-	if (spec.owner) newTask.owner = spec.owner;
++	if (actor !== undefined) newTask.owner = actor;
++	if (spec.parentId !== undefined) newTask.parentId = spec.parentId;
+ 	if (spec.metadata) newTask.metadata = { ...spec.metadata };
+ 	return newTask;
+ }
+@@ -133,8 +135,9 @@ function taskChanged(before: Task, after: Task): boolean {
+  * dangling/deleted blockedBy, self-block, cycles). Decision: validation stays
+  * in-reducer.
+  */
+-export function applyTaskMutation(state: TaskState, action: TaskAction, params: TaskMutationParams): ApplyResult {
++function reduceTaskMutation(state: TaskState, action: TaskAction, params: TaskMutationParams, actor?: string): ApplyResult {
+ 	switch (action) {
++		case "cancel": return errorResult(state, "cancel must pass ownership checks");
+ 		case "create": {
+ 			const batch = params.tasks;
+ 
+@@ -158,7 +161,7 @@ export function applyTaskMutation(state: TaskState, action: TaskAction, params:
+ 				for (let i = 0; i < batch.length; i++) {
+ 					const spec = asCreateItem(batch[i]);
+ 					const subject = spec?.subject;
+-					if (!spec || !subject?.trim()) {
++					if (!spec || (typeof subject !== "string" || !subject.trim())) {
+ 						return errorResult(state, `tasks[${i}]: subject required for create`);
+ 					}
+ 					items.push({ spec, subject });
+@@ -168,19 +171,19 @@ export function applyTaskMutation(state: TaskState, action: TaskAction, params:
+ 					const blockedError = validateCreateBlockedBy(state, item.spec.blockedBy, siblingIds);
+ 					if (blockedError) return errorResult(state, blockedError);
+ 				}
+-				const created = items.map((item, i) => buildCreatedTask(state.nextId + i, item.spec, item.subject));
++				const created = items.map((item, i) => buildCreatedTask(state.nextId + i, item.spec, item.subject, actor));
+ 				return {
+ 					state: { tasks: [...state.tasks, ...created], nextId: state.nextId + created.length },
+ 					op: { kind: "create", taskIds: created.map((t) => t.id) },
+ 				};
+ 			}
+ 
+-			if (!params.subject?.trim()) {
++			if (typeof params.subject !== "string" || !params.subject.trim()) {
+ 				return errorResult(state, "subject required for create");
+ 			}
+ 			const blockedError = validateCreateBlockedBy(state, params.blockedBy, new Set());
+ 			if (blockedError) return errorResult(state, blockedError);
+-			const newTask = buildCreatedTask(state.nextId, params, params.subject);
++			const newTask = buildCreatedTask(state.nextId, params, params.subject, actor);
+ 			return {
+ 				state: { tasks: [...state.tasks, newTask], nextId: state.nextId + 1 },
+ 				op: { kind: "create", taskIds: [newTask.id] },
+@@ -198,14 +201,13 @@ export function applyTaskMutation(state: TaskState, action: TaskAction, params:
+ 				params.description !== undefined ||
+ 				params.activeForm !== undefined ||
+ 				params.status !== undefined ||
+-				params.owner !== undefined ||
+ 				params.metadata !== undefined ||
+ 				(params.addBlockedBy && params.addBlockedBy.length > 0) ||
+ 				(params.removeBlockedBy && params.removeBlockedBy.length > 0);
+ 			if (!hasMutation)
+ 				return errorResult(
+ 					state,
+-					"update requires at least one mutable field: subject, description, activeForm, status, owner, metadata, addBlockedBy, or removeBlockedBy",
++					"update requires at least one mutable field: subject, description, activeForm, status, metadata, addBlockedBy, or removeBlockedBy",
+ 				);
+ 
+ 			let newStatus = current.status;
+@@ -248,7 +250,7 @@ export function applyTaskMutation(state: TaskState, action: TaskAction, params:
+ 			if (params.subject !== undefined) updated.subject = params.subject;
+ 			if (params.description !== undefined) updated.description = params.description;
+ 			if (params.activeForm !== undefined) updated.activeForm = params.activeForm;
+-			if (params.owner !== undefined) updated.owner = params.owner;
++
+ 			if (newBlockedBy.length) updated.blockedBy = newBlockedBy;
+ 			else delete updated.blockedBy;
+ 			if (newMetadata === undefined) delete updated.metadata;
+@@ -302,11 +304,136 @@ export function applyTaskMutation(state: TaskState, action: TaskAction, params:
+ 		}
+ 
+ 		case "clear": {
+-			const count = state.tasks.length;
++			const count = state.tasks.filter(t => t.owner === actor).length;
+ 			return {
+-				state: { tasks: [], nextId: 1 },
++				state: { tasks: state.tasks.filter(t => t.owner !== actor), nextId: state.nextId },
+ 				op: { kind: "clear", count },
+ 			};
+ 		}
+ 	}
+ }
++
++function isTerminal(task: Task): boolean {
++	return task.status === "cancelled" || task.status === "deleted";
++}
++
++/** Validate the resulting snapshot, then order children and prune only scoped tombstones. */
++export function finalizeTaskState(state: TaskState): { state: TaskState; error?: string } {
++	const fail = (error: string) => ({state, error});
++	const ids = new Set<number>();
++	const running = new Set<string | undefined>();
++	for (const task of state.tasks) {
++		if (!Number.isSafeInteger(task.id) || task.id < 1 || ids.has(task.id)) return fail("ids must be unique positive integers");
++		ids.add(task.id);
++		if (typeof task.subject !== "string" || !task.subject.trim() || task.subject.length > 2000) return fail("subject must be 1..2000 nonblank characters");
++		if (!["pending", "in_progress", "completed", "cancelled", "deleted"].includes(task.status)) return fail("invalid status");
++		if (task.status === "in_progress") {
++			if (running.has(task.owner)) return fail("at most one in_progress task per owner");
++			running.add(task.owner);
++		}
++		if (task.parentId !== undefined && task.status !== "deleted") {
++			const parent = state.tasks.find(p => p.id === task.parentId);
++			if (!parent || parent === task || parent.parentId !== undefined || parent.status === "deleted") return fail("parentId must name a top-level non-deleted parent");
++			if (parent.status === "completed" && (task.status === "pending" || task.status === "in_progress")) return fail("completed parent cannot have active children");
++			if (task.status === "in_progress" && parent.status !== "in_progress") return fail("parent must stay in_progress while a child runs");
++		}
++	}
++	if (!Number.isSafeInteger(state.nextId) || state.nextId <= Math.max(0, ...ids)) return fail("nextId must exceed every id");
++	const ordered: Task[] = [];
++	for (const task of state.tasks) {
++		if (task.parentId === undefined || !ids.has(task.parentId)) {
++			ordered.push(task);
++			ordered.push(...state.tasks.filter(child => child.parentId === task.id));
++		}
++	}
++	// Deleted descendants with a deleted/nested parent are still retained as tombstones.
++	for (const task of state.tasks) if (!ordered.includes(task)) ordered.push(task);
++	let result = {tasks: ordered, nextId: state.nextId};
++	const overLimit = () => result.tasks.length > 1000 || new TextEncoder().encode(JSON.stringify({version:1, ...result})).byteLength > 262144;
++	for (const task of [...result.tasks].sort((a,b) => a.id-b.id)) {
++		if (!overLimit()) break;
++		if (task.status === "deleted" && /^(execute:|worker:)/.test(task.owner ?? "")) result = {...result, tasks: result.tasks.filter(t => t.id !== task.id)};
++	}
++	if (overLimit()) return fail("todo state exceeds 1000 tasks or 262144 bytes");
++	return {state: result};
++}
++
++/** Pure actor-aware entry: all failures retain the exact input snapshot. */
++export function applyTaskMutation(state: TaskState, action: TaskAction, params: TaskMutationParams, actor?: string): ApplyResult {
++	if (params.owner !== undefined && actor === undefined && /^(execute:|worker:)/.test(params.owner) ||
++					params.tasks?.some(t => actor === undefined && /^(execute:|worker:)/.test(t.owner ?? ""))) return errorResult(state, "reserved owner prefix");
++	if (action === "list" || action === "get") return reduceTaskMutation(state, action, params, actor);
++
++	if (action === "update" || action === "delete" || action === "cancel") {
++		const current = state.tasks.find(t => t.id === params.id);
++		if (!current) return errorResult(state, params.id === undefined ? `id required for ${action}` : `#${params.id} not found`);
++		if (current.status === "deleted") return errorResult(state, `#${current.id} is already deleted`);
++		if (current.status === "cancelled") return errorResult(state, "cancelled is terminal");
++		if (current.status === "completed" && action !== "delete" && !(action === "update" && params.status === "deleted" && Object.keys(params).every(k => ["action", "id", "status"].includes(k)))) return errorResult(state, "completed rows are read-only except delete");
++		if (current.owner !== actor) {
++			if (action === "update") return errorResult(state, "only the owner may edit a task");
++			if (current.metadata?.protected === true) return errorResult(state, "task is protected");
++		}
++		if (action === "cancel") {
++			const requested = current.owner !== actor && current.metadata?.cancel === "request";
++			const updated: Task = requested ? {...current, metadata: {...current.metadata, cancelRequested: true, cancelledBy: actor ?? "main"}} : {...current, status:"cancelled"};
++			const candidate = finalizeTaskState({...state, tasks:state.tasks.map(t => t.id === current.id ? updated : t)});
++			if (candidate.error) return errorResult(state, candidate.error);
++			const changed = taskChanged(current, updated);
++			return {state: changed ? candidate.state : state, op:{kind:"update", id:current.id, fromStatus:current.status, toStatus:updated.status, changed}};
++		}
++	}
++	const reduced = reduceTaskMutation(state, action, params, actor);
++	if (reduced.op.kind === "error") return reduced;
++	const checked = finalizeTaskState(reduced.state);
++	if (checked.error) return errorResult(state, checked.error);
++	return {...reduced, state: JSON.stringify(checked.state) === JSON.stringify(state) ? state : checked.state};
++}
++
++export interface SyncResult {
++	state: TaskState;
++	changed: boolean;
++	lastSyncSeq?: number;
++	error?: string;
++}
++
++/** lastSyncSeq is per-owner, in-memory slot data; callers commit it only on success. */
++export function applyTaskSync(state: TaskState, actor: string | undefined, owner: string, seq: number, rows: readonly SyncRow[], lastSyncSeq?: number): SyncResult {
++	const fail = (error: string): SyncResult => ({state, changed:false, lastSyncSeq, error});
++	if (actor !== owner || !/^(execute:|worker:)/.test(owner)) return fail("sync requires the scoped owner actor");
++	if (!Number.isSafeInteger(seq) || seq < 0) return fail("sync seq must be a nonnegative integer");
++	if (lastSyncSeq !== undefined && seq <= lastSyncSeq) return {state, changed:false, lastSyncSeq};
++	const keys = new Set<string>();
++	for (const row of rows) {
++		if (!row.key || keys.has(row.key)) return fail("sync keys must be nonempty and unique");
++		keys.add(row.key);
++	}
++	let nextId = state.nextId;
++	const owned = state.tasks.filter(t => t.owner === owner);
++	const byKey = new Map(owned.map(t => [t.metadata?.key, t]));
++	const incoming = rows.map(row => {
++		const prior = byKey.get(row.key);
++		if (prior && isTerminal(prior)) return prior;
++		if (prior?.status === "completed") return row.status === "deleted" ? {...prior, status:"deleted" as const} : prior;
++		return {...prior, id: prior?.id ?? nextId++, owner, subject:row.subject, status:row.status, activeForm:row.activeForm,
++			metadata:{...row.metadata, key:row.key, ...(prior?.metadata?.cancelRequested ? {cancelRequested:true, cancelledBy:prior.metadata.cancelledBy} : {})}};
++	});
++	for (let i=0; i<rows.length; i++) {
++		const row = rows[i], task = incoming[i];
++		const prior = byKey.get(row.key);
++		if (prior && (isTerminal(prior) || prior.status === "completed")) continue;
++		if (row.parentKey !== undefined) {
++			const parent = incoming.find(t => t.metadata?.key === row.parentKey);
++			if (!parent) return fail("sync parentKey not found in snapshot");
++			task.parentId = parent.id;
++		} else delete task.parentId;
++	}
++	const absent = owned.filter(t => !keys.has(String(t.metadata?.key))).map(t => isTerminal(t) ? t : {...t, status:"deleted" as const});
++	const replacements = new Map([...incoming, ...absent].map(t => [t.id, t]));
++	const tasks = state.tasks.map(t => replacements.get(t.id) ?? t);
++	tasks.push(...incoming.filter(t => !state.tasks.some(prior => prior.id === t.id)));
++	const checked = finalizeTaskState({tasks, nextId});
++	if (checked.error) return fail(checked.error);
++	const changed = JSON.stringify(checked.state) !== JSON.stringify(state);
++	return {state:changed ? checked.state : state, changed, lastSyncSeq:seq};
++}
+diff --git a/state/store.test.ts b/state/store.test.ts
+index eb16f8c..42a94f6 100644
+--- a/state/store.test.ts
++++ b/state/store.test.ts
+@@ -1,4 +1,4 @@
+-import { describe, expect, it } from "vitest";
++import { beforeEach, describe, expect, it } from "bun:test";
+ import type { Task } from "../tool/types.ts";
+ import { EMPTY_STATE, type TaskState } from "./state.ts";
+ import {
+@@ -16,6 +16,8 @@ import {
+ 	sid,
+ } from "./store.ts";
+ 
++beforeEach(__resetState);
++
+ const SID = "s1";
+ 
+ function makeTask(id: number, subject = `t${id}`): Task {
+diff --git a/state/store.ts b/state/store.ts
+index d0812be..457b9aa 100644
+--- a/state/store.ts
++++ b/state/store.ts
+@@ -5,10 +5,19 @@ import { EMPTY_STATE, type TaskState } from "./state.ts";
+  * Per-session live state: a Map partitioned by session id, so a detached/child
+  * session (distinct sid) can never read or clobber another session's tasks.
+  *
+- * The Map is the single mutation seam — only `commitState` / `replaceState` /
+- * `evictSession` write it; the reducer (`state/state-reducer.ts`) stays pure.
++ * Production mutations enter through `createTodoCommit`; replay replacement
++ * and lifecycle eviction remain separate from mutation. The reducer stays pure.
+  */
+ const sessions = new Map<string, TaskState>();
++const syncSequences = new Map<string, Map<string, number>>();
++
++export function getSyncSequences(sessionId: string): ReadonlyMap<string, number> {
++	return syncSequences.get(sessionId) ?? new Map();
++}
++
++export function commitSyncSequences(sessionId: string, sequences: Map<string, number>): void {
++	syncSequences.set(sessionId, sequences);
++}
+ 
+ /**
+  * Ctx-less render pointer: which slot do the ctx-free readers (the overlay's
+@@ -68,7 +77,7 @@ export function replaceState(sessionId: string, next: TaskState): void {
+ }
+ 
+ /**
+- * Post-reducer commit seam. Tool `execute()` calls this with the reducer's
++ * Post-reducer store publication. The commit seam calls this with the reducer's
+  * `state` output to publish the new canonical state to live readers (overlay,
+  * `/todos`, `renderCall`), keyed to the calling session.
+  */
+@@ -79,6 +88,7 @@ export function commitState(sessionId: string, next: TaskState): void {
+ /** Drop a session's slot on `session_shutdown`. No-op if the slot is absent. */
+ export function evictSession(sessionId: string): void {
+ 	sessions.delete(sessionId);
++	syncSequences.delete(sessionId);
+ }
+ 
+ /**
+@@ -121,5 +131,6 @@ export function clearActiveRenderSession(): void {
+  */
+ export function __resetState(): void {
+ 	sessions.clear();
++	syncSequences.clear();
+ 	activeRenderSession = "";
+ }
+diff --git a/state/task-graph.test.ts b/state/task-graph.test.ts
+index 9488c48..d01d93b 100644
+--- a/state/task-graph.test.ts
++++ b/state/task-graph.test.ts
+@@ -1,4 +1,4 @@
+-import { describe, expect, it } from "vitest";
++import { describe, expect, it } from "bun:test";
+ import type { Task } from "../tool/types.ts";
+ import { deriveBlocks, detectCycle } from "./task-graph.ts";
+ 
+diff --git a/test-isolation.ts b/test-isolation.ts
+new file mode 100644
+index 0000000..b208a20
+--- /dev/null
++++ b/test-isolation.ts
+@@ -0,0 +1,27 @@
++import { mkdtempSync, rmSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { afterAll, beforeEach } from "bun:test";
++import { __resetState as resetI18n } from "@juicesharp/rpiv-i18n";
++
++// Call at file scope before any config read; Bun isolates each test file's env.
++export function isolateTodoConfig(): string {
++	const originalHome = process.env.HOME;
++	const originalXdg = process.env.XDG_CONFIG_HOME;
++	const home = mkdtempSync(join(tmpdir(), "pitako-todo-test-"));
++	process.env.HOME = home;
++	process.env.XDG_CONFIG_HOME = join(home, ".config");
++	const configDir = join(home, ".config", "rpiv-todo");
++	beforeEach(() => {
++		rmSync(configDir, { recursive: true, force: true });
++		resetI18n();
++	});
++	afterAll(() => {
++		if (originalHome === undefined) delete process.env.HOME;
++		else process.env.HOME = originalHome;
++		if (originalXdg === undefined) delete process.env.XDG_CONFIG_HOME;
++		else process.env.XDG_CONFIG_HOME = originalXdg;
++		rmSync(home, { recursive: true, force: true });
++	});
++	return join(configDir, "config.json");
++}
+diff --git a/test-utils.ts b/test-utils.ts
+new file mode 100644
+index 0000000..730f9c6
+--- /dev/null
++++ b/test-utils.ts
+@@ -0,0 +1,416 @@
++// Ported from juicesharp/rpiv-mono ce6d3530410812ca504ec294995581a52170f9e1
++// packages/test-utils/{pi,session,theme,manifest}.ts (MIT; see LICENSE).
++// Only todo's helper graph is retained; mocks use Bun instead of Vitest.
++import type { Api, Model } from "@earendil-works/pi-ai";
++import type {
++	ExtensionAPI,
++	ExtensionCommandContext,
++	ExtensionToolContext,
++	ExtensionUIContext,
++	RegisteredCommand,
++	SessionEntry,
++	Theme,
++	ToolDefinition,
++	ToolInfo,
++} from "@earendil-works/pi-coding-agent";
++import { vi } from "bun:test";
++/** A captured `registerShortcut` registration (KeyId → handler). */
++export interface CapturedShortcut {
++	description?: string;
++	handler: (ctx: unknown) => Promise<void> | void;
++}
++
++export interface CapturedPi {
++	tools: Map<string, ToolDefinition>;
++	commands: Map<string, Omit<RegisteredCommand, "name" | "sourceInfo">>;
++	/** Keyboard shortcuts registered via `pi.registerShortcut(keyId, opts)`. */
++	shortcuts: Map<string, CapturedShortcut>;
++	flags: Map<string, unknown>;
++	events: Map<string, Array<(...args: unknown[]) => unknown>>;
++	eventsEmitted: Map<string, unknown[]>;
++	activeTools: string[];
++	allTools: ToolInfo[];
++	/** Custom entries appended via `pi.appendEntry(customType, data)`, in call order. */
++	entries: Array<{ customType: string; data: unknown }>;
++}
++
++export interface MockPi {
++	pi: ExtensionAPI;
++	captured: CapturedPi;
++}
++
++export interface CreateMockPiOptions extends Partial<ExtensionAPI> {
++	/**
++	 * Skill names to surface from `getCommands()` as `RegisteredCommand`s with
++	 * `source: "skill"` (matching the shape Pi emits from
++	 * `agent-session.js:1699` — `name` prefixed with `"skill:"`, `source`
++	 * `"skill"`). Lets tests of programmatic `/skill:<name>` dispatch (the
++	 * `rpiv-workflow` runner gates dispatch on this registry to prevent
++	 * raw-text leakage to the LLM) register the skills their workflow uses
++	 * without hand-rolling RegisteredCommand objects.
++	 *
++	 * Overridden completely by a `getCommands` override in the same call —
++	 * `getCommands` takes precedence when both are present.
++	 */
++	skills?: readonly string[];
++}
++
++export function createMockPi(options: CreateMockPiOptions = {}): MockPi {
++	const captured: CapturedPi = {
++		tools: new Map(),
++		commands: new Map(),
++		shortcuts: new Map(),
++		flags: new Map(),
++		events: new Map(),
++		eventsEmitted: new Map(),
++		activeTools: [],
++		allTools: [],
++		entries: [],
++	};
++
++	const { skills, ...overrides } = options;
++	const skillCommands: RegisteredCommand[] = (skills ?? []).map(
++		(name) =>
++			({
++				name: `skill:${name}`,
++				source: "skill",
++				sourceInfo: { path: `/mock/skills/${name}/SKILL.md`, baseDir: `/mock/skills/${name}` },
++			}) as unknown as RegisteredCommand,
++	);
++
++	const pi = {
++		registerTool: vi.fn((tool: ToolDefinition) => {
++			captured.tools.set(tool.name, tool);
++			if (!captured.activeTools.includes(tool.name)) captured.activeTools.push(tool.name);
++		}),
++		registerCommand: vi.fn((name: string, cmd: Omit<RegisteredCommand, "name" | "sourceInfo">) => {
++			captured.commands.set(name, cmd);
++		}),
++		registerShortcut: vi.fn((shortcut: string, opts: CapturedShortcut) => {
++			captured.shortcuts.set(shortcut, opts);
++		}),
++		registerFlag: vi.fn((name: string, value: unknown) => {
++			captured.flags.set(name, value);
++		}),
++		getFlag: vi.fn((name: string) => captured.flags.get(name)),
++		on: vi.fn((event: string, handler: (...args: unknown[]) => unknown) => {
++			const list = captured.events.get(event) ?? [];
++			list.push(handler);
++			captured.events.set(event, list);
++		}),
++		appendEntry: vi.fn((customType: string, data?: unknown) => {
++			captured.entries.push({ customType, data });
++		}),
++		sendMessage: vi.fn(async () => {}),
++		sendUserMessage: vi.fn((_content: unknown, _options?: unknown) => {
++			// Sync fire-and-forget in production; mock captures nothing extra.
++			// Tests assert on sentMessages via the chain or directly on this spy.
++		}),
++		exec: vi.fn(async () => ({ stdout: "", stderr: "", code: 0, killed: false })),
++		getActiveTools: vi.fn(() => [...captured.activeTools]),
++		setActiveTools: vi.fn((names: string[]) => {
++			captured.activeTools = [...names];
++		}),
++		getAllTools: vi.fn(() => [...captured.allTools]),
++		getThinkingLevel: vi.fn(() => "medium" as unknown as string),
++		events: {
++			emit: vi.fn((channel: string, data: unknown) => {
++				const list = captured.eventsEmitted.get(channel) ?? [];
++				list.push(data);
++				captured.eventsEmitted.set(channel, list);
++			}),
++			on: vi.fn(() => () => {}),
++		},
++		// Default skill registry: just the user-passed `skills` list. Tests
++		// that need a custom getCommands can still pass one via overrides
++		// (it'll replace this default via the spread below).
++		getCommands: vi.fn(() => skillCommands),
++		...overrides,
++	} as unknown as ExtensionAPI;
++
++	return { pi, captured };
++}
++
++export interface MockUI {
++	notify: ReturnType<typeof vi.fn>;
++	confirm: ReturnType<typeof vi.fn>;
++	input: ReturnType<typeof vi.fn>;
++	select: ReturnType<typeof vi.fn>;
++	setWidget: ReturnType<typeof vi.fn>;
++	setStatus: ReturnType<typeof vi.fn>;
++	setWorkingMessage: ReturnType<typeof vi.fn>;
++	setHiddenThinkingLabel: ReturnType<typeof vi.fn>;
++	onTerminalInput: ReturnType<typeof vi.fn>;
++	pasteToEditor: ReturnType<typeof vi.fn>;
++	setEditorComponent: ReturnType<typeof vi.fn>;
++	/** Only present when a test passes one in; overlay renders fall back to the factory theme otherwise. */
++	theme?: Theme | MockTheme;
++}
++
++export function createMockUI(
++	overrides: Partial<Omit<ExtensionUIContext, "theme">> & { theme?: Theme | MockTheme } = {},
++): MockUI {
++	return {
++		notify: vi.fn(),
++		confirm: vi.fn(async () => true),
++		input: vi.fn(async () => ""),
++		select: vi.fn(async () => undefined),
++		setWidget: vi.fn(),
++		setStatus: vi.fn(),
++		setWorkingMessage: vi.fn(),
++		setHiddenThinkingLabel: vi.fn(),
++		onTerminalInput: vi.fn(() => () => {}),
++		pasteToEditor: vi.fn(),
++		setEditorComponent: vi.fn(),
++		...overrides,
++	} as unknown as MockUI;
++}
++
++export function createMockSessionManager(
++	branch: SessionEntry[] = [],
++	sessionId = "test-session",
++	sessionName?: string,
++) {
++	return {
++		getBranch: vi.fn(() => branch),
++		getEntries: vi.fn(() => branch),
++		getLeafId: vi.fn(() => (branch.length ? branch[branch.length - 1].id : null)),
++		getSessionFile: vi.fn(() => "/tmp/test-session.jsonl"),
++		getSessionId: vi.fn(() => sessionId),
++		// Pi reports an UNNAMED session as `undefined`, so the default mirrors a
++		// session the user never renamed.
++		getSessionName: vi.fn(() => sessionName),
++	};
++}
++
++export function createMockModelRegistry(models: Model<Api>[] = []) {
++	return {
++		find: vi.fn((provider: string, id: string) => models.find((m) => m.provider === provider && m.id === id)),
++		getAvailable: vi.fn(() => [...models]),
++		getApiKeyAndHeaders: vi.fn(async () => ({ ok: true, apiKey: "test-key", headers: {} })),
++	};
++}
++
++export interface MockCtxOptions {
++	hasUI?: boolean;
++	/** Host mode the ctx advertises (`"rpc"` for ACP hosts). Pi ≥0.79 field — omitted by default, matching the pinned 0.74 peer types. */
++	mode?: string;
++	cwd?: string;
++	model?: Model<Api>;
++	branch?: SessionEntry[];
++	models?: Model<Api>[];
++	ui?: Partial<ExtensionUIContext>;
++	/** Concurrency cap the ctx advertises. Defaults to 1 (sequential). */
++	maxConcurrency?: number;
++	/** Session id the ctx advertises via `sessionManager.getSessionId()`. Defaults to "test-session". */
++	sessionId?: string;
++	/** Display name the ctx advertises via `sessionManager.getSessionName()`. Omitted = unnamed session. */
++	sessionName?: string;
++	/**
++	 * Session id a `spawnChild`-minted child ctx advertises. Defaults to
++	 * `${sessionId}-child` so parent/child isolation is exercised, not masked.
++	 */
++	childSessionId?: string;
++}
++
++/** A tool `execute()` ctx (Pi ≥ 1.1: `ExtensionToolContext`), which also satisfies `ExtensionContext`. */
++export function createMockCtx(opts: MockCtxOptions = {}): ExtensionToolContext {
++	return {
++		hasUI: opts.hasUI ?? false,
++		mode: opts.mode,
++		cwd: opts.cwd ?? "/tmp/test-cwd",
++		model: opts.model,
++		ui: createMockUI(opts.ui),
++		sessionManager: createMockSessionManager(opts.branch ?? [], opts.sessionId, opts.sessionName),
++		modelRegistry: createMockModelRegistry(opts.models ?? []),
++		isIdle: vi.fn(() => true),
++		tools: [],
++		executeTool: vi.fn(),
++	} as unknown as ExtensionToolContext;
++}
++import type { AssistantMessage, JsonObject, Message, ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
++export function makeUserMessage(text: string): UserMessage {
++	return {
++		role: "user",
++		content: [{ type: "text", text }],
++		timestamp: Date.now(),
++	};
++}
++export interface ToolResultInput {
++	toolCallId?: string;
++	toolName: string;
++	text?: string;
++	details?: unknown;
++	isError?: boolean;
++}
++
++export function makeToolResult(input: ToolResultInput): ToolResultMessage {
++	return {
++		role: "toolResult",
++		toolCallId: input.toolCallId ?? `call-${input.toolName}-${Date.now()}`,
++		toolName: input.toolName,
++		content: input.text ? [{ type: "text", text: input.text }] : [],
++		details: input.details,
++		isError: input.isError ?? false,
++		timestamp: Date.now(),
++	} as unknown as ToolResultMessage;
++}
++
++export function makeMessageEntry(message: Message): SessionEntry {
++	return { type: "message", message } as unknown as SessionEntry;
++}
++
++/** A `custom` session entry, as `pi.appendEntry(customType, data)` persists it (never sent to the LLM). */
++export function makeCustomEntry(customType: string, data: unknown): SessionEntry {
++	return { type: "custom", customType, data } as unknown as SessionEntry;
++}
++
++/** A root→leaf branch of message entries, chained by `id`/`parentId` like a real
++ *  session path, so Pi's path-walking builders (`buildSessionContext`) traverse it. */
++export function buildSessionEntries(messages: Message[]): SessionEntry[] {
++	return messages.map(
++		(message, i) =>
++			({
++				type: "message",
++				id: `entry-${i}`,
++				parentId: i === 0 ? null : `entry-${i - 1}`,
++				message,
++			}) as unknown as SessionEntry,
++	);
++}
++export function makeTodoToolResult(details: unknown, text = "ok"): ToolResultMessage {
++	return makeToolResult({ toolName: "todo", text, details });
++}
++type ColorKey = string;
++
++export interface MockTheme {
++	fg: (_color: ColorKey, text: string) => string;
++	bg: (_color: ColorKey, text: string) => string;
++	bold: (text: string) => string;
++	strikethrough: (text: string) => string;
++}
++
++export function makeTheme(overrides: Partial<MockTheme> = {}): MockTheme {
++	return {
++		fg: (_color, text) => text,
++		bg: (_color, text) => text,
++		bold: (text) => text,
++		strikethrough: (text) => text,
++		...overrides,
++	};
++}
++/**
++ * Ship-manifest verification helper.
++ *
++ * Walks a package directory for production `.ts` files and compares them to
++ * the `files` array in `package.json`. Used by `ship-manifest.test.ts` files
++ * across the monorepo so every published package can prove its npm tarball
++ * actually contains the modules it imports at runtime.
++ *
++ * Replaces the previous copy-pasted `walkProductionTs` helper in three
++ * packages with one canonical implementation.
++ */
++
++import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
++import { dirname, relative, resolve } from "node:path";
++import { fileURLToPath } from "node:url";
++
++const SKIP_DIRS = new Set(["node_modules", "docs"]);
++const SKIP_FILES = new Set(["test-fixtures.ts", "test-utils.ts", "test-isolation.ts"]);
++
++export interface ShipManifestResult {
++	/** Entries declared in `package.json` `files`. */
++	declared: readonly string[];
++	/** Production `.ts` files discovered on disk (relative to packageDir). */
++	onDisk: readonly string[];
++	/** On-disk files NOT covered by the `files` array — these would be missing from the published tarball. */
++	missing: readonly string[];
++	/** `files` entries with no corresponding path on disk — ghost entries that ship nothing. */
++	stale: readonly string[];
++}
++
++/**
++ * Verify a package's ship manifest against its on-disk production .ts tree.
++ *
++ * Accepts either a directory path or a `file:` URL string (so callers can
++ * pass `import.meta.url` directly — the helper resolves it to the test file's
++ * parent directory).
++ *
++ * Skips: dotfiles/dotdirs, `node_modules`, `docs`, `*.test.ts`, `test-fixtures.ts`.
++ * Does NOT check: asset directories (e.g. `locales/*.json`), `exports` map,
++ * `main`/`module` fields.
++ *
++ * The check is two-way: `missing` flags on-disk production files the tarball
++ * would omit; `stale` flags `files` entries that point at nothing on disk
++ * (asset entries like `README.md` count as present — staleness is plain
++ * existence, not the production-`.ts` walk). `!`-prefixed negation patterns
++ * (the npm test-file exclusion glob, for instance) are exclusion rules, not
++ * paths — they are skipped by both checks.
++ */
++export function verifyShipManifest(packageDirOrUrl: string): ShipManifestResult {
++	const packageDir = packageDirOrUrl.startsWith("file:") ? dirname(fileURLToPath(packageDirOrUrl)) : packageDirOrUrl;
++	const pkgRaw = readFileSync(resolve(packageDir, "package.json"), "utf8");
++	const pkg = JSON.parse(pkgRaw) as { files?: string[] };
++	const declared = pkg.files ?? [];
++	const exactFiles = new Set<string>();
++	const dirPrefixes: string[] = [];
++	for (const entry of declared) {
++		// `!`-prefixed entries are npm negation/exclusion patterns (the
++		// test-file exclusion glob, for instance), not paths on disk — they
++		// carve files OUT of the tarball rather than declaring inclusion, so
++		// they neither cover an on-disk file nor count toward staleness. The
++		// production-`.ts` walk already omits test files, so the common
++		// test-file exclusion has no effect on the `missing` computation.
++		if (entry.startsWith("!")) continue;
++		// Treat trailing-slash entries AND bare directory names that exist on
++		// disk as recursive directory inclusion — matches npm's own `files`
++		// semantics so the test answers "would npm publish actually include this?"
++		// rather than enforcing a stylistic preference. Bare dir names are
++		// normalized to a trailing-slash prefix so a `"load"` entry covers
++		// `load/cache.ts` without spuriously matching a sibling `loader.ts`.
++		if (entry.endsWith("/")) dirPrefixes.push(entry);
++		else if (isDirOnDisk(packageDir, entry)) dirPrefixes.push(`${entry}/`);
++		else exactFiles.add(entry);
++	}
++
++	const onDisk = walkProductionTs(packageDir, packageDir);
++	const missing = onDisk.filter((f) => !isCovered(f, exactFiles, dirPrefixes));
++	const stale = declared.filter((entry) => !entry.startsWith("!") && !existsSync(resolve(packageDir, entry)));
++
++	return { declared, onDisk, missing, stale };
++}
++
++function isDirOnDisk(packageDir: string, entry: string): boolean {
++	try {
++		return statSync(resolve(packageDir, entry)).isDirectory();
++	} catch {
++		// Entry not present on disk (e.g. an asset/extraneous `files` entry) —
++		// not a directory we can recurse into; the caller treats it as an exact file.
++		return false;
++	}
++}
++
++function isCovered(file: string, exactFiles: Set<string>, dirPrefixes: readonly string[]): boolean {
++	if (exactFiles.has(file)) return true;
++	for (const prefix of dirPrefixes) {
++		if (file.startsWith(prefix)) return true;
++	}
++	return false;
++}
++
++function walkProductionTs(root: string, dir: string): string[] {
++	const out: string[] = [];
++	for (const entry of readdirSync(dir, { withFileTypes: true })) {
++		if (entry.name.startsWith(".")) continue;
++		if (entry.isDirectory() && SKIP_DIRS.has(entry.name)) continue;
++		const abs = resolve(dir, entry.name);
++		if (entry.isDirectory()) {
++			out.push(...walkProductionTs(root, abs));
++			continue;
++		}
++		if (!entry.isFile() || !entry.name.endsWith(".ts")) continue;
++		if (entry.name.endsWith(".test.ts") || SKIP_FILES.has(entry.name)) continue;
++		out.push(relative(root, abs));
++	}
++	return out;
++}
+diff --git a/todo-overlay.lifecycle.test.ts b/todo-overlay.lifecycle.test.ts
+index 8b7273b..5f6dcaa 100644
+--- a/todo-overlay.lifecycle.test.ts
++++ b/todo-overlay.lifecycle.test.ts
+@@ -1,6 +1,8 @@
++import { isolateTodoConfig } from "./test-isolation.ts";
++isolateTodoConfig();
+ import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+-import { createMockCtx, createMockPi, createMockUI } from "@juicesharp/rpiv-test-utils";
+-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { createMockCtx, createMockPi, createMockUI } from "./test-utils.ts";
++import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+ import { __resetState, registerTodoTool, setActiveRenderSession } from "./todo.ts";
+ import { TodoOverlay } from "./todo-overlay.ts";
+ 
+diff --git a/todo-overlay.render.test.ts b/todo-overlay.render.test.ts
+index ce90864..fd1b5ab 100644
+--- a/todo-overlay.render.test.ts
++++ b/todo-overlay.render.test.ts
+@@ -1,12 +1,13 @@
++import { isolateTodoConfig } from "./test-isolation.ts";
+ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+ import { dirname, join } from "node:path";
+ import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+-import { createMockCtx, createMockPi, createMockUI } from "@juicesharp/rpiv-test-utils";
+-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { createMockCtx, createMockPi, createMockUI } from "./test-utils.ts";
++import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+ import { __resetState, registerTodoTool, setActiveRenderSession, type TaskAction } from "./todo.ts";
+ import { TodoOverlay } from "./todo-overlay.ts";
+ 
+-const CONFIG_PATH = join(process.env.HOME!, ".config", "rpiv-todo", "config.json");
++const CONFIG_PATH = isolateTodoConfig();
+ 
+ function writeConfigFile(contents: string): void {
+ 	mkdirSync(dirname(CONFIG_PATH), { recursive: true });
+diff --git a/todo-overlay.shortcut.test.ts b/todo-overlay.shortcut.test.ts
+index 069cf47..99339cd 100644
+--- a/todo-overlay.shortcut.test.ts
++++ b/todo-overlay.shortcut.test.ts
+@@ -1,11 +1,12 @@
++import { isolateTodoConfig } from "./test-isolation.ts";
+ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+ import { dirname, join } from "node:path";
+-import { createMockCtx, createMockPi } from "@juicesharp/rpiv-test-utils";
+-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { createMockCtx, createMockPi } from "./test-utils.ts";
++import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+ import registerTodo from "./index.ts";
+ import { __resetState } from "./todo.ts";
+ 
+-const CONFIG_PATH = join(process.env.HOME!, ".config", "rpiv-todo", "config.json");
++const CONFIG_PATH = isolateTodoConfig();
+ 
+ function writeConfigFile(contents: string): void {
+ 	mkdirSync(dirname(CONFIG_PATH), { recursive: true });
+diff --git a/todo-overlay.ts b/todo-overlay.ts
+index 8933e1b..b68a79c 100644
+--- a/todo-overlay.ts
++++ b/todo-overlay.ts
+@@ -16,7 +16,7 @@ import type { ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent"
+ import { type TUI, truncateToWidth } from "@earendil-works/pi-tui";
+ import { COLLAPSE_KEY_OFF, getMaxWidgetLines, resolveCollapseKey } from "./config.ts";
+ import { formatStatusLabel, t } from "./state/i18n-bridge.ts";
+-import { selectHasActive, selectOverlayLayout, selectShowTaskIds, selectTodoCounts } from "./state/selectors.ts";
++import { isTaskDone, selectTaskParent, selectHasActive, selectOverlayLayout, selectShowTaskIds, selectTodoCounts } from "./state/selectors.ts";
+ import { getRenderState } from "./state/store.ts";
+ import { formatOverlayTaskLine } from "./view/format.ts";
+ 
+@@ -116,7 +116,7 @@ export class TodoOverlay {
+ 		}
+ 		this.lastNextId = state.nextId;
+ 		const completedTaskIds = new Set(
+-			state.tasks.filter((task) => task.status === "completed").map((task) => task.id),
++			state.tasks.filter((task) => isTaskDone(task)).map((task) => task.id),
+ 		);
+ 		for (const taskId of this.completedTaskIdsPendingHide) {
+ 			if (!completedTaskIds.has(taskId)) this.completedTaskIdsPendingHide.delete(taskId);
+@@ -132,7 +132,7 @@ export class TodoOverlay {
+ 	}
+ 
+ 	private shouldHideCompletedTask(task: ReturnType<TodoOverlay["getSnapshot"]>["tasks"][number]): boolean {
+-		return task.status === "completed" && this.hiddenCompletedTaskIds.has(task.id);
++		return isTaskDone(task) && this.hiddenCompletedTaskIds.has(task.id);
+ 	}
+ 
+ 	private renderWidget(theme: Theme, width: number): string[] {
+@@ -178,13 +178,14 @@ export class TodoOverlay {
+ 		const bodyBudget = this.uiCtx?.getToolsExpanded?.() === true ? overlayTasks.length : getMaxWidgetLines() - 1;
+ 		const layout = selectOverlayLayout(overlayState, bodyBudget);
+ 		for (const task of layout.visible) {
+-			lines.push(truncate(`${theme.fg("dim", "├─")} ${formatOverlayTaskLine(task, theme, showIds)}`));
++			const indent = selectTaskParent(overlayState, task) ? "  " : "";
++			lines.push(truncate(`${indent}${theme.fg("dim", "├─")} ${formatOverlayTaskLine(task, theme, showIds)}`));
+ 		}
+ 
+ 		const newlyDisplayedCompletedTaskIds = overlayTasks
+ 			.filter(
+ 				(task) =>
+-					task.status === "completed" &&
++					isTaskDone(task) &&
+ 					!this.completedTaskIdsPendingHide.has(task.id) &&
+ 					!this.hiddenCompletedTaskIds.has(task.id),
+ 			)
+diff --git a/todo.codemode-replay.test.ts b/todo.codemode-replay.test.ts
+index 0ed77c0..e61a68a 100644
+--- a/todo.codemode-replay.test.ts
++++ b/todo.codemode-replay.test.ts
+@@ -1,3 +1,5 @@
++import { isolateTodoConfig } from "./test-isolation.ts";
++isolateTodoConfig();
+ /**
+  * Codemode replay regression (#290) — REAL Pi sessions, no mocks.
+  *
+@@ -25,8 +27,9 @@ import {
+ 	SessionManager,
+ 	SettingsManager,
+ } from "@earendil-works/pi-coding-agent";
+-import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+ import todo from "./index.ts";
++import { isTaskDetails } from "./state/replay.ts";
+ 
+ describe("todo calls made through codemode survive session replay (#290)", () => {
+ 	let home: string;
+@@ -99,14 +102,31 @@ describe("todo calls made through codemode survive session replay (#290)", () =>
+ 	const codemode = (code: string) => toolCall("codemode", { code });
+ 
+ 	/** Run each turn's scripted tool calls, close, reopen from disk, and return a direct `todo list`. */
+-	async function listAfterResume(turns: ReturnType<typeof toolCall>[]): Promise<string> {
++	async function listAfterResume(turns: ReturnType<typeof toolCall>[], mutations: number): Promise<string> {
+ 		const first = await openSession(SessionManager.create(cwd, sessionDir));
+ 		for (const step of turns) {
+ 			faux.setResponses([step, fauxAssistantMessage("done")]);
+ 			await first.prompt("go");
+ 		}
++		const branch = first.sessionManager.getBranch();
+ 		const file = first.sessionFile;
+ 		await closeSession(first);
++		const snapshots = branch.filter(e => e.type === "custom" && e.customType === "pitako-todo-state");
++		expect(snapshots).toHaveLength(mutations);
++		expect(branch.some(e => e.type === "custom" && e.customType === "rpiv-todo-state")).toBe(false);
++		for (const entry of snapshots) {
++			if (entry.type !== "custom") throw new Error("not a custom entry");
++			expect(entry.data).toMatchObject({version:1});
++			expect(isTaskDetails(entry.data)).toBe(true);
++		}
++		for (let i=0; i<branch.length; i++) {
++			const entry = branch[i];
++			if (entry.type !== "message" || entry.message.role !== "toolResult" || entry.message.toolName !== "todo") continue;
++			const details = entry.message.details;
++			if (!isTaskDetails(details)) throw new Error("missing todo details");
++			expect(branch.slice(0,i).some(prior => prior.type === "custom" && prior.customType === "pitako-todo-state" &&
++				isTaskDetails(prior.data) && JSON.stringify(prior.data.tasks) === JSON.stringify(details.tasks) && prior.data.nextId === details.nextId)).toBe(true);
++		}
+ 		if (!file) throw new Error("session was not persisted");
+ 
+ 		const resumed = await openSession(SessionManager.open(file, sessionDir));
+@@ -132,7 +152,7 @@ await tools.todo({ action: "create", subject: "Task B" });
+ await tools.todo({ action: "create", subject: "Task C" });
+ await tools.todo({ action: "update", id: 1, status: "in_progress" });
+ text("ok");`),
+-		]);
++		], 4);
+ 		expect(listed).toBe("[in_progress] #1 Task A\n[pending] #2 Task B\n[pending] #3 Task C");
+ 	});
+ 
+@@ -141,7 +161,7 @@ text("ok");`),
+ 			toolCall("todo", { action: "create", subject: "Completion persistence test" }),
+ 			toolCall("todo", { action: "update", id: 1, status: "in_progress" }),
+ 			codemode(`text(await tools.todo({ action: "update", id: 1, status: "completed" }));`),
+-		]);
++		], 3);
+ 		expect(listed).toBe("[completed] #1 Completion persistence test");
+ 	});
+ });
+diff --git a/todo.command.test.ts b/todo.command.test.ts
+index 6def86f..96e06b5 100644
+--- a/todo.command.test.ts
++++ b/todo.command.test.ts
+@@ -1,6 +1,8 @@
++import { isolateTodoConfig } from "./test-isolation.ts";
++isolateTodoConfig();
+ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+-import { createMockCtx, createMockPi } from "@juicesharp/rpiv-test-utils";
+-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { createMockCtx, createMockPi } from "./test-utils.ts";
++import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+ import { __resetState, registerTodosCommand, registerTodoTool, TOOL_NAME } from "./todo.ts";
+ 
+ function setup() {
+diff --git a/todo.guidance.test.ts b/todo.guidance.test.ts
+index 7ebad69..0091b9e 100644
+--- a/todo.guidance.test.ts
++++ b/todo.guidance.test.ts
+@@ -1,10 +1,11 @@
++import { isolateTodoConfig } from "./test-isolation.ts";
+ import { mkdirSync, writeFileSync } from "node:fs";
+ import { dirname, join } from "node:path";
+-import { createMockPi } from "@juicesharp/rpiv-test-utils";
+-import { beforeEach, describe, expect, it } from "vitest";
++import { createMockPi } from "./test-utils.ts";
++import { beforeEach, describe, expect, it } from "bun:test";
+ import { DEFAULT_PROMPT_GUIDELINES, DEFAULT_PROMPT_SNIPPET, registerTodoTool, TOOL_NAME } from "./todo.ts";
+ 
+-const CONFIG_PATH = join(process.env.HOME!, ".config", "rpiv-todo", "config.json");
++const CONFIG_PATH = isolateTodoConfig();
+ const DEFAULT_GUIDELINES_LENGTH = DEFAULT_PROMPT_GUIDELINES.length;
+ 
+ function writeConfig(data: Record<string, unknown>): void {
+@@ -12,9 +13,6 @@ function writeConfig(data: Record<string, unknown>): void {
+ 	writeFileSync(CONFIG_PATH, JSON.stringify(data, null, 2), "utf-8");
+ }
+ 
+-beforeEach(() => {
+-	// test/setup.ts rmSyncs CONFIG_PATH in shared beforeEach
+-});
+ 
+ describe("registerTodoTool — guidance overrides", () => {
+ 	it("uses built-in defaults when no config file exists", () => {
+diff --git a/todo.invalidation.test.ts b/todo.invalidation.test.ts
+index 598766c..1292687 100644
+--- a/todo.invalidation.test.ts
++++ b/todo.invalidation.test.ts
+@@ -1,5 +1,7 @@
+-import { createMockPi } from "@juicesharp/rpiv-test-utils";
+-import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import { isolateTodoConfig } from "./test-isolation.ts";
++isolateTodoConfig();
++import { createMockPi } from "./test-utils.ts";
++import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+ import registerTodo from "./index.ts";
+ import { getState, replaceState } from "./state/store.ts";
+ import { __resetState } from "./todo.ts";
+diff --git a/todo.register.test.ts b/todo.register.test.ts
+index 3e2b2b4..bbf0ea8 100644
+--- a/todo.register.test.ts
++++ b/todo.register.test.ts
+@@ -1,7 +1,9 @@
++import { isolateTodoConfig } from "./test-isolation.ts";
++isolateTodoConfig();
+ import type { Theme } from "@earendil-works/pi-coding-agent";
+ import { Text } from "@earendil-works/pi-tui";
+-import { createMockCtx, createMockPi, makeTheme } from "@juicesharp/rpiv-test-utils";
+-import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import { createMockCtx, createMockPi, makeTheme } from "./test-utils.ts";
++import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+ import { __resetState, registerTodoTool, setActiveRenderSession, type TaskDetails, TOOL_NAME } from "./todo.ts";
+ import { STATE_ENTRY_TYPE } from "./tool/types.ts";
+ 
+@@ -39,10 +41,10 @@ describe("registerTodoTool — registration shape", () => {
+ 		expect((tool.promptGuidelines as string[]).length).toBeGreaterThan(0);
+ 	});
+ 
+-	it("exposes a typebox parameters schema declaring the six actions", () => {
++	it("exposes a typebox parameters schema declaring the seven actions", () => {
+ 		const { tool } = setup();
+ 		const raw = JSON.stringify(tool.parameters);
+-		for (const action of ["create", "update", "list", "get", "delete", "clear"]) {
++		for (const action of ["create", "update", "list", "get", "delete", "clear", "cancel"]) {
+ 			expect(raw).toContain(action);
+ 		}
+ 		expect(raw).toContain("tasks");
+@@ -92,14 +94,14 @@ describe("registerTodoTool — execute mutates module state", () => {
+ 		expect(d.nextId).toBe(3);
+ 	});
+ 
+-	it("clear resets module state and nextId", async () => {
++	it("clear resets module state without lowering nextId", async () => {
+ 		const { tool } = setup();
+ 		await call(tool, { action: "create", subject: "a" });
+ 		await call(tool, { action: "create", subject: "b" });
+ 		const r = await call(tool, { action: "clear" });
+ 		const d = r?.details as TaskDetails;
+ 		expect(d.tasks).toEqual([]);
+-		expect(d.nextId).toBe(1);
++		expect(d.nextId).toBe(3);
+ 	});
+ });
+ 
+@@ -113,10 +115,10 @@ describe("registerTodoTool — execute persists a state entry for every state ch
+ 			await call(tool, { action: "clear" }),
+ 		];
+ 		expect(captured.entries.map((e) => e.customType)).toEqual(Array(4).fill(STATE_ENTRY_TYPE));
+-		expect(captured.entries.map((e) => e.data)).toEqual(results.map((r) => r?.details));
++		expect(captured.entries.map((e) => e.data)).toEqual(results.map((r) => ({ version: 1, tasks: r?.details.tasks, nextId: r?.details.nextId })));
+ 		const cleared = captured.entries.at(-1)?.data as TaskDetails;
+ 		expect(cleared.tasks).toEqual([]);
+-		expect(cleared.nextId).toBe(1);
++		expect(cleared.nextId).toBe(2);
+ 	});
+ 
+ 	it("appends nothing for reads, failures, or a no-effect update", async () => {
+diff --git a/todo.session-isolation.test.ts b/todo.session-isolation.test.ts
+index fabc2b5..38f26cf 100644
+--- a/todo.session-isolation.test.ts
++++ b/todo.session-isolation.test.ts
+@@ -1,5 +1,7 @@
+-import { createMockCtx, createMockPi } from "@juicesharp/rpiv-test-utils";
+-import { afterEach, beforeEach, describe, expect, it, type vi } from "vitest";
++import { isolateTodoConfig } from "./test-isolation.ts";
++isolateTodoConfig();
++import { createMockCtx, createMockPi } from "./test-utils.ts";
++import { afterEach, beforeEach, describe, expect, it, type vi } from "bun:test";
+ import registerTodo from "./index.ts";
+ import { EMPTY_STATE } from "./state/state.ts";
+ import { getActiveRenderSession, getRenderState, getState } from "./state/store.ts";
+diff --git a/todo.ts b/todo.ts
+index 97b1e98..84c09a7 100644
+--- a/todo.ts
++++ b/todo.ts
+@@ -15,22 +15,20 @@
+ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+ import { loadConfig, validateGuidanceFields } from "./config.ts";
+ import { formatStatusLabel, t } from "./state/i18n-bridge.ts";
+-import { selectTasksByStatus, selectTodoCounts, selectVisibleTasks } from "./state/selectors.ts";
+-import { applyTaskMutation, changesState } from "./state/state-reducer.ts";
+-import { commitState, getRenderState, getState, sid } from "./state/store.ts";
++import { selectTaskParent, selectTasksByStatus, selectTodoCounts, selectVisibleTasks } from "./state/selectors.ts";
++import { createTodoCommit, type TodoCommit } from "./state/commit.ts";
++import { getRenderState, getState, sid } from "./state/store.ts";
+ import { prepareTodoArguments } from "./tool/normalize-params.ts";
+ import { buildToolResult } from "./tool/response-envelope.ts";
+ import {
+ 	COMMAND_NAME,
+ 	ERR_REQUIRES_INTERACTIVE,
+ 	MSG_NO_TODOS,
+-	STATE_ENTRY_TYPE,
+-	type TaskMutationParams,
+ 	TOOL_LABEL,
+ 	TOOL_NAME,
+ 	TodoParamsSchema,
+ } from "./tool/types.ts";
+-import { formatCommandTaskLine, renderTodoCall, renderTodoResult } from "./view/format.ts";
++import { STATUS_GLYPH, formatCommandTaskLine, renderTodoCall, renderTodoResult } from "./view/format.ts";
+ 
+ // English fallbacks for localized /todos section headers — the box-drawing
+ // decoration is part of the localized string so translators can adjust spacing.
+@@ -57,9 +55,10 @@ export { TOOL_NAME } from "./tool/types.ts";
+ export const DEFAULT_PROMPT_SNIPPET = "Manage a task list to track multi-step progress";
+ export const DEFAULT_PROMPT_GUIDELINES: string[] = [
+ 	"Use `todo` for complex work with 3+ steps, when the user gives you a list of tasks, or immediately after receiving new instructions to capture requirements. Skip it for single trivial tasks and purely conversational requests.",
+-	"When starting a task from the todo list, mark it in_progress BEFORE beginning work. Mark it completed IMMEDIATELY when done — never batch completions. Exactly one task in_progress at a time.",
++	"When starting a task from the todo list, mark it in_progress BEFORE beginning work. Mark it completed IMMEDIATELY when done — never batch completions. At most one in_progress task per owner.",
+ 	"Never mark a task completed if tests are failing, the implementation is partial, or you hit unresolved errors — keep it in_progress and create a new task for the blocker instead.",
+-	"Task status is a 4-state machine: pending → in_progress → completed, plus deleted as a tombstone. Pass activeForm (present-continuous label, e.g. 'researching existing tool') when marking in_progress.",
++	"Task status: pending → in_progress → completed, plus cancelled and deleted. completed rows are read-only except delete; cancelled and deleted are terminal. Use cancel (optional short reason) to abandon a task. Pass activeForm (present-continuous label, e.g. 'researching existing tool') when marking in_progress.",
++	"Only a task's owner may update it. Others may only cancel or delete it, and not when metadata.protected is true; with metadata.cancel set to \"request\", their cancel only records a cancellation request.",
+ 	'To change a task\'s status, call update with the task id and the target status, e.g. {"action":"update","id":3,"status":"completed"} or {"action":"update","id":3,"status":"in_progress","activeForm":"writing tests"}. status is the field that changes the task; an update without a mutable field (status or another) is rejected.',
+ 	"Use blockedBy to express dependencies (A is blocked by B). On create, pass blockedBy as the initial set. On update, use addBlockedBy / removeBlockedBy (additive merge — do not resend the full array). Cycles are rejected.",
+ 	"To create several independent tasks at once, pass create with tasks: [{subject}, ...]. Do not also pass subject. tasks[] cannot blockedBy each other (ids do not exist until the call commits); create the prerequisite first, then the dependent with blockedBy. Dependency chains stay single-create.",
+@@ -67,13 +66,13 @@ export const DEFAULT_PROMPT_GUIDELINES: string[] = [
+ 	"Subject must be short and imperative (e.g. 'Research existing tool'); description is for long-form detail. activeForm is a present-continuous label shown while in_progress.",
+ ];
+ 
+-export function registerTodoTool(pi: ExtensionAPI): void {
++export function registerTodoTool(pi: ExtensionAPI, commit: TodoCommit = createTodoCommit(pi)): void {
+ 	const guidance = validateGuidanceFields(loadConfig().guidance);
+ 	pi.registerTool({
+ 		name: TOOL_NAME,
+ 		label: TOOL_LABEL,
+ 		description:
+-			"Manage a task list for tracking multi-step progress. Actions: create (new task, or several independent tasks at once via tasks[]), update (change status/fields/dependencies), list (all tasks, optionally filtered by status), get (single task details), delete (tombstone), clear (reset all). Status: pending → in_progress → completed, plus deleted tombstone. Use this to plan and track multi-step work like research, design, and implementation.",
++			"Manage a task list for tracking multi-step progress. Actions: create (new task, or several independent tasks at once via tasks[]), update (change status/fields/dependencies), list (all tasks, optionally filtered by status), get (single task details), cancel (abandon a task), delete (tombstone), clear (remove your own tasks). Status: pending → in_progress → completed, plus terminal cancelled and deleted. Use this to plan and track multi-step work like research, design, and implementation.",
+ 		promptSnippet: guidance.promptSnippet ?? DEFAULT_PROMPT_SNIPPET,
+ 		promptGuidelines: guidance.promptGuidelines ?? DEFAULT_PROMPT_GUIDELINES,
+ 		parameters: TodoParamsSchema,
+@@ -81,15 +80,9 @@ export function registerTodoTool(pi: ExtensionAPI): void {
+ 		prepareArguments: prepareTodoArguments,
+ 
+ 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+-			const result = applyTaskMutation(getState(sid(ctx)), params.action, params as TaskMutationParams);
+-			commitState(sid(ctx), result.state);
+-			const toolResult = buildToolResult(params.action, params as TaskMutationParams, result.state, result.op);
+-			// Persist the snapshot as a custom entry on the calling session's branch, however the
+-			// tool was reached: a call made through another tool (`ctx.executeTool`, e.g. codemode)
+-			// never lands as a standalone `toolResult`, so its `details` alone would not survive
+-			// replay. Pi's own codemode persists its `store()` the same way.
+-			if (changesState(result.op)) pi.appendEntry(STATE_ENTRY_TYPE, toolResult.details);
+-			return toolResult;
++			const result = commit(sid(ctx), undefined, [{ action: params.action, params }]);
++			if (!result.op) throw new Error("todo commit returned no operation");
++			return buildToolResult(params.action, params, result.state, result.op);
+ 		},
+ 
+ 		// renderCall reflects the FOREGROUND slot, not the calling session's. Pi's
+@@ -128,7 +121,14 @@ export function registerTodosCommand(pi: ExtensionAPI): void {
+ 				ctx.ui.notify(t("command.no_todos", MSG_NO_TODOS), "info");
+ 				return;
+ 			}
+-			const groups = selectTasksByStatus(state);
++			// Group roots by status, keeping children directly under their parent.
++			const groups = selectTasksByStatus({ ...state, tasks: visible.filter((task) => !selectTaskParent(state, task)) });
++			const appendTask = (task: (typeof visible)[number]) => {
++				lines.push(formatCommandTaskLine(task, task.status === "completed" ? "✓" : STATUS_GLYPH[task.status]));
++				for (const child of visible.filter((child) => task.parentId === undefined && child.parentId === task.id)) {
++					lines.push(formatCommandTaskLine(child, child.status === "completed" ? "✓" : STATUS_GLYPH[child.status], true));
++				}
++			};
+ 			const counts = selectTodoCounts(state);
+ 
+ 			const header: string[] = [];
+@@ -139,15 +139,15 @@ export function registerTodosCommand(pi: ExtensionAPI): void {
+ 			const lines: string[] = [header.join(" · ")];
+ 			if (groups.pending.length > 0) {
+ 				lines.push(t("command.section.pending", SECTION_PENDING));
+-				for (const task of groups.pending) lines.push(formatCommandTaskLine(task, "○"));
++				for (const task of groups.pending) appendTask(task);
+ 			}
+ 			if (groups.inProgress.length > 0) {
+ 				lines.push(t("command.section.in_progress", SECTION_IN_PROGRESS));
+-				for (const task of groups.inProgress) lines.push(formatCommandTaskLine(task, "◐"));
++				for (const task of groups.inProgress) appendTask(task);
+ 			}
+ 			if (groups.completed.length > 0) {
+ 				lines.push(t("command.section.completed", SECTION_COMPLETED));
+-				for (const task of groups.completed) lines.push(formatCommandTaskLine(task, "✓"));
++				for (const task of groups.completed) appendTask(task);
+ 			}
+ 
+ 			ctx.ui.notify(lines.join("\n"), "info");
+diff --git a/tool/normalize-params.test.ts b/tool/normalize-params.test.ts
+index 398915b..45fecaf 100644
+--- a/tool/normalize-params.test.ts
++++ b/tool/normalize-params.test.ts
+@@ -1,4 +1,4 @@
+-import { describe, expect, it } from "vitest";
++import { describe, expect, it } from "bun:test";
+ import { prepareTodoArguments } from "./normalize-params.ts";
+ 
+ describe("prepareTodoArguments — double-encoded tasks[] (#244 shape)", () => {
+diff --git a/tool/response-envelope.test.ts b/tool/response-envelope.test.ts
+index d9310ca..1232f3a 100644
+--- a/tool/response-envelope.test.ts
++++ b/tool/response-envelope.test.ts
+@@ -1,4 +1,4 @@
+-import { describe, expect, it } from "vitest";
++import { describe, expect, it } from "bun:test";
+ import type { TaskState } from "../state/state.ts";
+ import type { Op } from "../state/state-reducer.ts";
+ import { buildToolResult, formatContent } from "./response-envelope.ts";
+diff --git a/tool/sanitize.test.ts b/tool/sanitize.test.ts
+index 198f4d2..263c1fd 100644
+--- a/tool/sanitize.test.ts
++++ b/tool/sanitize.test.ts
+@@ -1,4 +1,4 @@
+-import { describe, expect, it } from "vitest";
++import { describe, expect, it } from "bun:test";
+ import { sanitizeTerminalText } from "./sanitize.ts";
+ 
+ describe("sanitizeTerminalText", () => {
+diff --git a/tool/types.ts b/tool/types.ts
+index 523443e..66534db 100644
+--- a/tool/types.ts
++++ b/tool/types.ts
+@@ -1,4 +1,3 @@
+-import { StringEnum } from "@earendil-works/pi-ai";
+ import { type Static, Type } from "typebox";
+ 
+ // ---------------------------------------------------------------------------
+@@ -19,7 +18,7 @@ export const COMMAND_NAME = "todos";
+  * never land on the branch as standalone `toolResult` messages. Persistence key
+  * for branch replay, like `TOOL_NAME`. DO NOT rename.
+  */
+-export const STATE_ENTRY_TYPE = "rpiv-todo-state";
++export const STATE_ENTRY_TYPE = "pitako-todo-state";
+ 
+ // ---------------------------------------------------------------------------
+ // User-facing strings (kept stable for /todos UX parity).
+@@ -32,9 +31,9 @@ export const MSG_NO_TODOS = "No todos yet. Ask the agent to add some!";
+ // Public domain types
+ // ---------------------------------------------------------------------------
+ 
+-export type TaskStatus = "pending" | "in_progress" | "completed" | "deleted";
++export type TaskStatus = "pending" | "in_progress" | "completed" | "cancelled" | "deleted";
+ 
+-export type TaskAction = "create" | "update" | "list" | "get" | "delete" | "clear";
++export type TaskAction = "create" | "update" | "list" | "get" | "delete" | "clear" | "cancel";
+ 
+ export interface Task {
+ 	id: number;
+@@ -43,6 +42,7 @@ export interface Task {
+ 	activeForm?: string;
+ 	status: TaskStatus;
+ 	blockedBy?: number[];
++	parentId?: number;
+ 	owner?: string;
+ 	metadata?: Record<string, unknown>;
+ }
+@@ -72,6 +72,7 @@ export interface CreateTaskInput {
+ 	description?: string;
+ 	activeForm?: string;
+ 	blockedBy?: number[];
++	parentId?: number;
+ 	owner?: string;
+ 	metadata?: Record<string, unknown>;
+ }
+@@ -85,8 +86,10 @@ export interface TaskMutationParams {
+ 	blockedBy?: number[];
+ 	addBlockedBy?: number[];
+ 	removeBlockedBy?: number[];
++	parentId?: number;
+ 	owner?: string;
+ 	metadata?: Record<string, unknown>;
++	reason?: string;
+ 	id?: number;
+ 	includeDeleted?: boolean;
+ 	/** Batch create items. One-of with `subject` on `create`. */
+@@ -99,7 +102,7 @@ export interface TaskMutationParams {
+ // ---------------------------------------------------------------------------
+ 
+ const CreateTaskInputSchema = Type.Object({
+-	subject: Type.String({ description: "Task subject line" }),
++	subject: Type.String({ minLength: 1, maxLength: 2000, description: "Task subject line" }),
+ 	description: Type.Optional(Type.String({ description: "Long-form task description" })),
+ 	activeForm: Type.Optional(
+ 		Type.String({
+@@ -112,7 +115,8 @@ const CreateTaskInputSchema = Type.Object({
+ 				"Existing task ids this item waits on. Cannot name another item in this same batch; create the prerequisite first, then the dependent with blockedBy.",
+ 		}),
+ 	),
+-	owner: Type.Optional(Type.String({ description: "Agent/owner assigned to this task" })),
++	parentId: Type.Optional(Type.Integer({ minimum: 1, description: "Top-level parent id (create only)" })),
++	owner: Type.Optional(Type.String({ description: "Ignored by the tool; execute: and worker: prefixes are reserved" })),
+ 	metadata: Type.Optional(
+ 		Type.Record(Type.String(), Type.Unknown(), {
+ 			description: "Arbitrary metadata",
+@@ -121,10 +125,10 @@ const CreateTaskInputSchema = Type.Object({
+ });
+ 
+ export const TodoParamsSchema = Type.Object({
+-	action: StringEnum(["create", "update", "list", "get", "delete", "clear"] as const),
++	action: Type.Enum(["create", "update", "list", "get", "delete", "clear", "cancel"], { type: "string" }),
+ 	subject: Type.Optional(
+ 		Type.String({
+-			description: "Task subject line (required for create unless tasks[] is set)",
++			minLength: 1, maxLength: 2000, description: "Task subject line, 1..2000 nonblank characters (required for create unless tasks[] is set)",
+ 		}),
+ 	),
+ 	description: Type.Optional(Type.String({ description: "Long-form task description" })),
+@@ -134,9 +138,10 @@ export const TodoParamsSchema = Type.Object({
+ 		}),
+ 	),
+ 	status: Type.Optional(
+-		StringEnum(["pending", "in_progress", "completed", "deleted"] as const, {
++		Type.Enum(["pending", "in_progress", "completed", "cancelled", "deleted"], {
++			type: "string",
+ 			description:
+-				"Set this task's status (update): one of pending, in_progress, completed, deleted. When action is list, filters returned tasks by this status.",
++				"Set this task's status (update): one of pending, in_progress, completed, cancelled, deleted. When action is list, filters returned tasks by this status.",
+ 		}),
+ 	),
+ 	blockedBy: Type.Optional(
+@@ -154,15 +159,17 @@ export const TodoParamsSchema = Type.Object({
+ 			description: "Task ids to remove from blockedBy (update only, additive merge)",
+ 		}),
+ 	),
+-	owner: Type.Optional(Type.String({ description: "Agent/owner assigned to this task" })),
++	parentId: Type.Optional(Type.Integer({ minimum: 1, description: "Top-level parent id (create only)" })),
++	owner: Type.Optional(Type.String({ description: "Ignored by the tool; execute: and worker: prefixes are reserved" })),
+ 	metadata: Type.Optional(
+ 		Type.Record(Type.String(), Type.Unknown(), {
+ 			description: "Arbitrary metadata; pass null value for a key to delete that key on update",
+ 		}),
+ 	),
++	reason: Type.Optional(Type.String({ maxLength: 256, description: "Short cancellation code" })),
+ 	id: Type.Optional(
+ 		Type.Number({
+-			description: "Task id (required for update, get, delete)",
++			description: "Task id (required for update, get, cancel, delete)",
+ 		}),
+ 	),
+ 	includeDeleted: Type.Optional(
+@@ -179,3 +186,13 @@ export const TodoParamsSchema = Type.Object({
+ });
+ 
+ export type TodoParams = Static<typeof TodoParamsSchema>;
++
++/** Snapshot rows accepted only by the internal owner-scoped sync reducer. */
++export interface SyncRow {
++	key: string;
++	parentKey?: string;
++	subject: string;
++	status: TaskStatus;
++	activeForm?: string;
++	metadata?: Record<string, unknown>;
++}
+diff --git a/view/format.test.ts b/view/format.test.ts
+index 85efd27..5d0215d 100644
+--- a/view/format.test.ts
++++ b/view/format.test.ts
+@@ -1,6 +1,6 @@
+ import type { Theme } from "@earendil-works/pi-coding-agent";
+-import { makeTheme } from "@juicesharp/rpiv-test-utils";
+-import { describe, expect, it } from "vitest";
++import { makeTheme } from "../test-utils.ts";
++import { describe, expect, it } from "bun:test";
+ import type { Task } from "../tool/types.ts";
+ import { formatOverlayTaskLine } from "./format.ts";
+ 
+diff --git a/view/format.ts b/view/format.ts
+index 540dc66..e2b61e8 100644
+--- a/view/format.ts
++++ b/view/format.ts
+@@ -1,6 +1,6 @@
+ import type { Theme } from "@earendil-works/pi-coding-agent";
+ import { Text } from "@earendil-works/pi-tui";
+-import { formatStatusLabel } from "../state/i18n-bridge.ts";
++import { formatStatusLabel, t as translate } from "../state/i18n-bridge.ts";
+ import { selectTaskSubjectById } from "../state/selectors.ts";
+ import type { TaskState } from "../state/state.ts";
+ import { sanitizeTerminalText } from "../tool/sanitize.ts";
+@@ -18,6 +18,7 @@ export const STATUS_GLYPH: Record<TaskStatus, string> = {
+ 	pending: "○",
+ 	in_progress: "◐",
+ 	completed: "●",
++	cancelled: "⊘",
+ 	deleted: "⊘",
+ };
+ 
+@@ -30,6 +31,7 @@ export const STATUS_COLOR: Record<TaskStatus, "dim" | "warning" | "success" | "m
+ 	pending: "dim",
+ 	in_progress: "warning",
+ 	completed: "success",
++	cancelled: "muted",
+ 	deleted: "muted",
+ };
+ 
+@@ -41,6 +43,7 @@ export const ACTION_GLYPH: Record<TaskAction, string> = {
+ 	create: "+",
+ 	update: "→",
+ 	delete: "×",
++	cancel: "⊘",
+ 	get: "›",
+ 	list: "☰",
+ 	clear: "∅",
+@@ -60,6 +63,8 @@ export function overlayStatusGlyph(status: TaskStatus, theme: Theme): string {
+ 			return theme.fg("warning", "◐");
+ 		case "completed":
+ 			return theme.fg("success", "✓");
++		case "cancelled":
++			return theme.fg("muted", "⊘");
+ 		case "deleted":
+ 			return theme.fg("error", "✗");
+ 	}
+@@ -72,9 +77,9 @@ export function overlayStatusGlyph(status: TaskStatus, theme: Theme): string {
+ export function formatOverlayTaskLine(t: Task, theme: Theme, showId: boolean): string {
+ 	const glyph = overlayStatusGlyph(t.status, theme);
+ 	const subjectColor =
+-		t.status === "in_progress" ? "accent" : t.status === "completed" || t.status === "deleted" ? "muted" : "text";
++		t.status === "in_progress" ? "accent" : t.status === "completed" || t.status === "cancelled" || t.status === "deleted" ? "muted" : "text";
+ 	let subject = theme.fg(subjectColor, sanitizeTerminalText(t.subject));
+-	if (t.status === "completed" || t.status === "deleted") {
++	if (t.status === "completed" || t.status === "cancelled" || t.status === "deleted") {
+ 		subject = theme.strikethrough(subject);
+ 	}
+ 	let line = `${glyph}`;
+@@ -86,17 +91,21 @@ export function formatOverlayTaskLine(t: Task, theme: Theme, showId: boolean): s
+ 	if (t.blockedBy && t.blockedBy.length > 0) {
+ 		line += ` ${theme.fg("muted", `⛓ ${t.blockedBy.map((id) => `#${id}`).join(",")}`)}`;
+ 	}
+-	return line;
++	return line + cancelRequestedMarker(t);
+ }
+ 
+ /**
+  * Format a single task line for the `/todos` slash command (no glyph color,
+  * indented bullet prefix).
+  */
+-export function formatCommandTaskLine(t: Task, glyph: string): string {
++export function formatCommandTaskLine(t: Task, glyph: string, nested = false): string {
+ 	const form = t.status === "in_progress" && t.activeForm ? ` (${sanitizeTerminalText(t.activeForm)})` : "";
+ 	const block = t.blockedBy?.length ? `    ⛓ ${t.blockedBy.map((id) => `#${id}`).join(",")}` : "";
+-	return `  ${glyph} #${t.id} ${sanitizeTerminalText(t.subject)}${form}${block}`;
++	return `${nested ? "    " : "  "}${glyph} #${t.id} ${sanitizeTerminalText(t.subject)}${form}${block}${cancelRequestedMarker(t)}`;
++}
++
++function cancelRequestedMarker(task: Task): string {
++	return task.metadata?.cancelRequested ? ` [${translate("status.cancel_requested", "cancel requested")}]` : "";
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -121,7 +130,7 @@ export function renderTodoCall(
+ 	} else if (args.action === "create" && Array.isArray(args.tasks)) {
+ 		text += ` ${theme.fg("dim", `${args.tasks.length} tasks`)}`;
+ 	} else if (
+-		(args.action === "update" || args.action === "get" || args.action === "delete") &&
++		(args.action === "update" || args.action === "get" || args.action === "delete" || args.action === "cancel") &&
+ 		args.id !== undefined
+ 	) {
+ 		const subject = selectTaskSubjectById(state, args.id);
+@@ -170,6 +179,7 @@ function echoedStatus(details: TaskDetails | undefined): TaskStatus | undefined
+ 			return details.tasks.at(-1)?.status;
+ 		case "update":
+ 			return params.status ?? details.tasks.find((t) => t.id === params.id)?.status;
++		case "cancel":
+ 		case "delete":
+ 			return details.tasks.find((t) => t.id === params.id)?.status;
+ 		case "list":

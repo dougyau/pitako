@@ -31,14 +31,6 @@
     "gitHead": "ce6d3530410812ca504ec294995581a52170f9e1",
     "license": "MIT"
   },
-  "@juicesharp/rpiv-todo": {
-    "version": "2.15.0",
-    "registry": "https://registry.npmjs.org/@juicesharp/rpiv-todo/2.15.0",
-    "tarball": "https://registry.npmjs.org/@juicesharp/rpiv-todo/-/rpiv-todo-2.15.0.tgz",
-    "integrity": "sha512-8WfYssdgQgSWzFNsRzdw5Z6ZJIjO2ecM/YqEzYpR/ore+Hh5aNmafGVy94uFbIofAv2wGGitx5e3J/ucRrViXQ==",
-    "gitHead": "ce6d3530410812ca504ec294995581a52170f9e1",
-    "license": "MIT"
-  },
   "@juicesharp/rpiv-i18n": {
     "version": "2.15.0",
     "registry": "https://registry.npmjs.org/@juicesharp/rpiv-i18n/2.15.0",
@@ -111,31 +103,31 @@
     "license": "MIT"
   },
   "@earendil-works/pi-agent-core": {
-    "version": "1.4.0",
-    "registry": "https://registry.npmjs.org/@earendil-works/pi-agent-core/1.4.0",
-    "tarball": "https://registry.npmjs.org/@earendil-works/pi-agent-core/-/pi-agent-core-1.4.0.tgz",
-    "integrity": "sha512-PoKY84SKUwnt7S5QBZaGUqfNO1kjP3KHpHUA9QpFTj4cOjaVWMYIcBPJ6FDRCdE8Zen9OSECQUd0uUfVgtSmgA==",
+    "version": "1.5.0",
+    "registry": "https://registry.npmjs.org/@earendil-works/pi-agent-core/1.5.0",
+    "tarball": "https://registry.npmjs.org/@earendil-works/pi-agent-core/-/pi-agent-core-1.5.0.tgz",
+    "integrity": "sha512-FOj+jXj48DbzMycR/ghNa2KcsqWmvOln24e0FnQOVgnd8vn5H79g335WdHaZUVdRo+zCeogb40/qPPlCWFuvmA==",
     "license": "MIT"
   },
   "@earendil-works/pi-ai": {
-    "version": "1.4.0",
-    "registry": "https://registry.npmjs.org/@earendil-works/pi-ai/1.4.0",
-    "tarball": "https://registry.npmjs.org/@earendil-works/pi-ai/-/pi-ai-1.4.0.tgz",
-    "integrity": "sha512-hQM/C4+1w8rHYACzDDf+0vQMnEnpzIop1tptIERVgR3ZeT/hHSzBNG8PaWPgxWQjqSeKCyBZSyp8uTT6eKK1pQ==",
+    "version": "1.5.0",
+    "registry": "https://registry.npmjs.org/@earendil-works/pi-ai/1.5.0",
+    "tarball": "https://registry.npmjs.org/@earendil-works/pi-ai/-/pi-ai-1.5.0.tgz",
+    "integrity": "sha512-VeWxNqTHSqRCf8AcY/6kvNwh+neRL6MPxZPePVztIQy6qqK9MR/YoCSN/ZgDnIyCD3pqEXgRyQbzk4KV4uvjbg==",
     "license": "MIT"
   },
   "@earendil-works/pi-coding-agent": {
-    "version": "1.4.0",
-    "registry": "https://registry.npmjs.org/@earendil-works/pi-coding-agent/1.4.0",
-    "tarball": "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-1.4.0.tgz",
-    "integrity": "sha512-Z41LpZ3yYHSC/UUps6Mr39UMFPwH8elhJBG9DY1P7kuzsE5qSK/6eMj2EHzO5evJRQWLbKSqUMw+4nCNtIyiQg==",
+    "version": "1.5.0",
+    "registry": "https://registry.npmjs.org/@earendil-works/pi-coding-agent/1.5.0",
+    "tarball": "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-1.5.0.tgz",
+    "integrity": "sha512-xNDZ5kqowO6Z03FS2gwAkPEGk1ssxVcYKQ6qZId84mFEvwACvvyc2l0vAMOS+c5zvxLRMLBE9r4y44IGYkMJaQ==",
     "license": "MIT"
   },
   "@earendil-works/pi-tui": {
-    "version": "1.4.0",
-    "registry": "https://registry.npmjs.org/@earendil-works/pi-tui/1.4.0",
-    "tarball": "https://registry.npmjs.org/@earendil-works/pi-tui/-/pi-tui-1.4.0.tgz",
-    "integrity": "sha512-4obPOjgOD7g4mGSlngIvxyujC1UPdmyI9zdVthbr8GufacFEX+Ce0+scPgHg++k2xj5+QjESM2d5TxvIuzCVmg==",
+    "version": "1.5.0",
+    "registry": "https://registry.npmjs.org/@earendil-works/pi-tui/1.5.0",
+    "tarball": "https://registry.npmjs.org/@earendil-works/pi-tui/-/pi-tui-1.5.0.tgz",
+    "integrity": "sha512-56KqrDVeLF18k+syppVbT35Ai1opbM44ot+sL7O3K40CaWwXCiwOpqEFugDBAILtAhseZh6uYIuYxPPOJHLFAA==",
     "license": "MIT"
   },
   "@types/bun": {
@@ -204,5 +196,23 @@
     "tag": "v0.2.0",
     "tagObject": "6b5026c5cae7443ed2cec9dd9c6e6e17606a9624",
     "revision": "9d029fb32b721c038b58fb418b98bbfcf720cf0a"
+  },
+  "pitako-todo": {
+    "kind": "commit-pinned",
+    "repository": "https://github.com/juicesharp/rpiv-mono",
+    "path": "packages/rpiv-todo",
+    "gitHead": "ce6d3530410812ca504ec294995581a52170f9e1",
+    "version": "2.15.0",
+    "npmPackage": "@juicesharp/rpiv-todo",
+    "integrity": "sha512-8WfYssdgQgSWzFNsRzdw5Z6ZJIjO2ecM/YqEzYpR/ore+Hh5aNmafGVy94uFbIofAv2wGGitx5e3J/ucRrViXQ==",
+    "license": "MIT"
+  },
+  "@juicesharp/rpiv-config": {
+    "version": "2.15.0",
+    "registry": "https://registry.npmjs.org/@juicesharp/rpiv-config/2.15.0",
+    "tarball": "https://registry.npmjs.org/@juicesharp/rpiv-config/-/rpiv-config-2.15.0.tgz",
+    "integrity": "sha512-S2BAGX4dJjQ2AyNYOEjC6ha04p9f6CdEfmtxpdxzSKrfDMwqIvOjjO9HiHc1IPY7jDY1q2Q8cGCtpIZWV6Y8NQ==",
+    "gitHead": "ce6d3530410812ca504ec294995581a52170f9e1",
+    "license": "MIT"
   }
 }

@@ -7,7 +7,7 @@ Pitako composes Pi packages and vendors selected MIT skills. It does not ship BS
 | Project | License | Use |
 | --- | --- | --- |
 | [@dietrichgebert/ponytail](https://github.com/DietrichGebert/ponytail) 5.3.3 | MIT | Skills `ponytail` and `ponytail-review`. The Pi extension is installed but not loaded. |
-| [@juicesharp/rpiv-todo](https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-todo) 2.15.0 | MIT | Session-local `todo` tool, `/todos`, overlay, and branch replay. `@juicesharp/rpiv-i18n` stays optional. |
+| [@juicesharp/rpiv-config](https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-config) 2.15.0 | MIT | Exact-pinned, bundled configuration dependency of the vendored TODO fork. |
 | [@juicesharp/rpiv-ask-user-question](https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-ask-user-question) 2.15.0 | MIT | Structured questions through `ask_user_question`. Bundled unchanged with its LICENSE. |
 | [pi-markdown-preview](https://github.com/omaclaren/pi-markdown-preview) 0.26.2 | MIT | Markdown and LaTeX previews and artifact export. Bundled unchanged with its LICENSE. |
 | [pi-web-access](https://github.com/nicobailon/pi-web-access) 0.46.0 (Nico Bailon) | MIT | Web search, page extraction, and source checking. Bundled into the Pitako package tarball. |
@@ -29,6 +29,10 @@ Pitako composes Pi packages and vendors selected MIT skills. It does not ship BS
 | [smol-toml](https://github.com/squirrelchat/smol-toml) 1.9.1 | BSD-3-Clause | Read Herdr worktree configuration without executing it. |
 
 License text for pi-hermes-memory: `docs/licenses/pi-hermes-memory-LICENSE`. License texts for pi-web-access: `docs/licenses/pi-web-access-LICENSE`. For Ponytail, see `docs/licenses/ponytail-LICENSE` and the package's own `LICENSE` after install. For pi-codex-tools, see `docs/licenses/pi-codex-tools-LICENSE` and `docs/licenses/pi-codex-tools-NOTICE`.
+
+## Vendored TODO fork
+
+[rpiv-todo](https://github.com/juicesharp/rpiv-mono/tree/ce6d3530410812ca504ec294995581a52170f9e1/packages/rpiv-todo) 2.15.0, MIT, is commit-pinned at `ce6d3530410812ca504ec294995581a52170f9e1`. Source and upstream tests are in `vendor/rpiv-todo/`, with its `LICENSE`, `PROVENANCE` and single local-delta record `pitako.patch`. `extensions/todo.ts` is the only Pi entry. `@juicesharp/rpiv-i18n` stays optional. Dependency automation reports upstream drift without updating the fork.
 
 ## Owned provider source
 

@@ -8,7 +8,7 @@ Dependencies (not copied into this repository's source):
 - @vndv/pi-codegraph is MIT.
 - @colbymchenry/codegraph is MIT.
 - @dietrichgebert/ponytail is MIT. Pitako loads the ponytail and ponytail-review skills only.
-- @juicesharp/rpiv-todo is MIT. Pitako loads the extension as the session TODO layer.
+- @juicesharp/rpiv-config 2.15.0 is MIT and bundled for the vendored TODO fork.
 - pi-web-access 0.45.0 (Nico Bailon) is MIT. Pitako bundles it for web search and page extraction. The license is docs/licenses/pi-web-access-LICENSE.
 - pi-hermes-memory 0.9.11 (Chandra Teja) is MIT. Pitako bundles it unchanged for persistent memory and conversation search, separate from the Board. The license is docs/licenses/pi-hermes-memory-LICENSE.
 - billion-context-pi 0.1.83 (ranxianglei) is MIT. Pitako uses it for ACP context
@@ -22,6 +22,10 @@ Dependencies (not copied into this repository's source):
 - pi-codex-tools 0.4.0 is Apache-2.0 and includes parser/grammar behavior derived from OpenAI Codex, Copyright 2025 OpenAI. Its attribution is retained in docs/licenses/pi-codex-tools-NOTICE; the license is docs/licenses/pi-codex-tools-LICENSE.
 
 Vendored MIT material (see THIRD_PARTY.md and docs/licenses/):
+
+- rpiv-todo 2.15.0 (juicesharp), commit ce6d3530410812ca504ec294995581a52170f9e1.
+  Source, upstream tests and MIT LICENSE: vendor/rpiv-todo/.
+  Provenance: vendor/rpiv-todo/PROVENANCE; local delta: vendor/rpiv-todo/pitako.patch.
 
 - Caveman coding skills (Julius Brussee). skills/ is MIT. BSL engine/runtime
   paths are not shipped.

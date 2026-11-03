@@ -99,8 +99,8 @@
       "tools": ["checkpoint_create"]
     },
     {
-      "id": "@juicesharp/rpiv-todo",
-      "spec": "@juicesharp/rpiv-todo@2.15.0",
+      "id": "pitako-todo",
+      "spec": "vendor/rpiv-todo#ce6d3530410812ca504ec294995581a52170f9e1",
       "entry": "extensions/todo.ts",
       "tools": ["todo"]
     },
