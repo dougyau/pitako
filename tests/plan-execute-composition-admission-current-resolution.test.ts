@@ -1868,6 +1868,13 @@ describe("compact admission and preliminary capture", () => {
     const config = JSON.parse(expanded.script.split("const config = ")[1]!.split(";\nconst pitakoReviewLibraryMode")[0]!);
     expect(config.preliminary.content).toBe(content);
     expect(config.chunks).toBeUndefined();
+    expect(config.originalProblem).toBeNull();
+    // A v2 anchor reaches the root from the same captured bytes it binds.
+    writeFileSync(source, spec().replace("pitako-spec: 1", "pitako-spec: 2").replace("## Acceptance criteria\nAgreed Acceptance criteria.",
+      "## Acceptance criteria\n1. Fixed. [origin: human msg-1]\n2. Extra. [origin: repo note]") + "## Original problem\nSymptom.\nVerified by: #2, #1\n");
+    const anchored = JSON.parse(resource.resolve(args).script.split("const config = ")[1]!.split(";\nconst pitakoReviewLibraryMode")[0]!);
+    expect(anchored.originalProblem).toEqual({ criteria: [2, 1] });
+    writeFileSync(source, content);
     expect(Buffer.byteLength(JSON.stringify(config.preliminary))).toBeGreaterThan(65536);
     expect(inspect(expanded, root).error).toContain("settings.json");
     writeFileSync(path.join(store, "settings.json"), JSON.stringify({ pitako: { execute: { maxCycles: 4 } } }));

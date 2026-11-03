@@ -714,6 +714,23 @@ Child timeout does not prove invocation cancellation. Show current HEAD/WIP,
 check/review/compliance refs, elapsed time, loops and token coverage. Publication
 is separate from fulfillment and is not performed automatically.
 
+### Original-problem notice
+
+For a v2 spec whose `Original problem` names `Verified by: #n`, the director may
+mark planned checks with `verifies: [n]`. Each accepted worker result records the
+latest marked check per criterion; `originalProblem` in loop reports and the result
+is `fulfilled` (every named criterion passed on its recorded candidate),
+`unfulfilled` (one failed) or `unknown` (unverified, v1, or `Verified by: spec`).
+The projection shows one protected row only when it is fulfilled or unfulfilled.
+This is an advisory notice, not compliance: it adds no phase, gate, veto or round,
+and does not change whole-spec completion or source/amendment freezing.
+
+When it is `fulfilled` and the result is not `complete`, say so before closing
+and offer the human: continue (no action); stop (native Stop of the root); or
+close as a publishable partial delivery (after Stop, rerun the recorded checks on
+the current tree, then prepare publication through `pre-pr`). The root status stays
+as observed; "partial delivery" describes the offer, not a new result.
+
 Read-only review/compliance protocol rejections can be re-evaluated in the same
 invocation after a reader correction, without relaunching their completed producers
 or consuming an implementation loop. Findings associate screening assessments by

@@ -108,6 +108,23 @@ describe("execute todo pure projection", () => {
     } finally {f.close();}
   });
 
+  test("original-problem notice is one protected row per run that updates across loops and closure", () => {
+    const notice=(status: "pending", subject: string) => ({originalProblem:{status,subject}});
+    expect(latestExecuteTodoSnapshot([snapshot({originalProblem:{status:"in_progress",subject:"bad"}})])).toBeUndefined();
+    const f=fixture();
+    try {
+      f.apply(snapshot());
+      expect(visible(getState(f.sid).tasks).some(t=>t.metadata?.key==="exec:run:original-problem")).toBe(false);
+      f.apply(snapshot({seq:2,...notice("pending","Problema original · cumplido (#1)")}));
+      f.apply(snapshot({seq:3,outcome:"gaps",active:null,...notice("pending","Problema original · cumplido (#1)")}));
+      let state=f.apply(snapshot({seq:4,loop:2,tasks:[],active:null,phases:[{name:"plan",subject:"Loop 2/3 · Plan",status:"in_progress"}],...notice("pending","Problema original · no cumplido (#1)")}));
+      const rows=visible(state.tasks).filter(t=>t.metadata?.key==="exec:run:original-problem");
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({subject:"Problema original · no cumplido (#1)",status:"pending",metadata:{protected:true,loop:2}});
+      expect(f.commit(f.sid,undefined,[{action:"delete",params:{id:rows[0]!.id}}]).error).toContain("protected");
+    } finally {f.close();}
+  });
+
   test("Q7 collapses cancelled loop rows and prunes steps; Q8 retains terminal summaries and permits hiding", () => {
     const f=fixture();
     try {
