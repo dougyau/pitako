@@ -449,7 +449,7 @@ describe("engineering-layer composition", () => {
     for (const provider of providers)
       expect(readRepo(path.join("agents", provider)).length).toBeGreaterThan(0);
     expect(profile.skillPath).toEqual(["../node_modules/@dietrichgebert/ponytail/skills/ponytail", "../skills/principles", "../skills/practical"]);
-    const practical = ["architecture-design", "how", "why", "blast-radius"];
+    const practical = ["architecture-design", "how", "why", "blast-radius", "scope-discipline"];
     const principles = [
       "principle-foundational-thinking", "principle-boundary-discipline",
       "principle-type-system-discipline", "principle-minimize-reader-load",

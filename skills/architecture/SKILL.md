@@ -25,7 +25,8 @@ An ordinary architecture discussion does not start execution.
 3. Inspect available profiles with `subagent({ action: "list" })`. The workflow
    uses the packaged `pitako.architect` for its reasoning director and perspective
    members. It supplies CodeGraph, read-only LSP tools, and selected design
-   principles, plus `architecture-design`, `how`, `why`, and `blast-radius`.
+   principles, plus `architecture-design`, `how`, `why`, `blast-radius`, and
+   `scope-discipline`.
    Each architect loads and applies Ponytail FULL while preserving required boundaries and read-only scope.
    The workflow assigns each child's responsibility and perspective.
    Confirm its effective contract is suitable for read-only analysis without
@@ -33,7 +34,8 @@ An ordinary architecture discussion does not start execution.
    reload the installed package before dispatch. Do not substitute another profile,
    change settings, or create agent files to make a discussion work.
 4. Supply a complete `currentDecision` snapshot with the decision, desired
-   outcome, constraints, non-goals, evidence and open questions. Include active
+   outcome, constraints, non-goals, evidence and open questions. When a reported
+   problem motivates it, start the brief with that problem and its minimal fix. Include active
    human decisions and their exact provenance, plus identified obligations.
    Resolve material ambiguity before dispatch. Arguments persist; omit secrets.
    Choose a stable consultation ID and an explicit native mission for both

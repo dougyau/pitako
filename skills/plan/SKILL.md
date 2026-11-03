@@ -34,6 +34,10 @@ No unrelated/global scan or installed-Pitako-root substitution is permitted.
 List existing foreground TODOs; create pending context, clarification,
 architecture and materialization stages. Preserve unrelated entries and keep
 only one in_progress. Write a complete conversation/source brief without secrets.
+Begin it with the scope anchor: the original problem as reported (symptom and
+human message reference), its known or suspected cause, and the minimal fix that
+would resolve it (areas or files). Carry this anchor unchanged into every later
+brief, architecture snapshot, confirmation and spec.
 Launch one background file-backed context workflow at the absolute
 [context.js](context.js) path with `args: { brief, workDescription: "<concrete single-line work>", consultation: "<stable-id>" }`, `cwd` at the designated
 root, `async: true`, and explicit `options: { mission: { title: "Plan <id>" } }`.
@@ -50,6 +54,18 @@ blocks only its dependent questions, not the rest of the frontier. Architecture
 rounds use the full-provider pause boundary below. Never ask
 the human to research facts you can obtain through a read-only provider.
 
+Classify each question as a clarification of the original problem or an
+expansion: any requirement, guarantee, surface, source or recovery beyond the
+minimal fix. Mark an expansion `➕ Expansion`, state its estimated cost (areas,
+surfaces and acceptance criteria it adds) and recommend the minimal option unless
+the human already requested that expansion, so a yes never adds scope nobody
+requested. A blanket answer ("yes to all") does not accept an expansion whose
+recommendation is not the minimal option; ask for it by number. Re-ask an
+unanswered or off-topic question unchanged; do not reverse its recommendation in
+a later round. Do not present an expansion as a correction of facts. Repository
+principles (for example AGENTS.md) constrain how the work is done; they do not
+create requirements unless the human asks for them.
+
 Use the concise provider facts, reasons, contradictions, limits, pending
 questions and sources for grilling; full originals remain separately recoverable.
 Missing access blocks dependent conclusions; the context handoff does not claim
@@ -63,7 +79,9 @@ Do not invent runs.workflow, import/fs APIs or child agentOverrides.
 
 Build `currentDecision` using the complete version-1 snapshot shape in the
 [architecture skill](../architecture/SKILL.md): brief, constraints, identified
-obligations, active human decisions and provenance. Do not pass `brief` as an
+obligations, active human decisions and provenance. Put the scope anchor first
+in its brief and give each obligation's origin (human, agent-accepted, repo or
+derived). Do not pass `brief` as an
 architecture argument. Both initial providers and the first director receive
 the caller description; it is not extracted from administrative prompt text.
 
@@ -81,9 +99,11 @@ questions wait too. No child waits for a person. Read the full returned value fr
 `status.json` at `workflow.value`; the completion wake preview is truncated.
 Ask the ACTUAL HUMAN the ENTIRE frontier in one round using the grilling format:
 number questions with recommendations and word them so yes accepts the recommendation.
+Apply the expansion rules above to every architecture question.
 Use `frontier.humanContext` and each question's `prerequisiteFacts`, including facts,
 reasons, contradictions, limits and sources. Never answer preferences yourself.
 Record actual per-ID human provenance, including explicit deferrals or unknowns.
+A human yes to an agent recommendation is agent-accepted origin, not a human request.
 
 Re-enter the SAME script, consultation, mission and `planning: true` with the exact
 returned `continuation` plus `humanAnswers: { consultation, revision, round, answers }`.
@@ -127,24 +147,33 @@ retention/resume failure is reported, not silently replaced.
 ## Human confirmation, then materialization
 
 Only when the frontier is empty and material doubts are resolved, present the
-complete shared understanding (objective, scope, exclusions, behavior,
-constraints, decisions/reasons, acceptance and verification). Ask the ACTUAL
+complete shared understanding (original problem and minimal fix, objective,
+scope, exclusions, behavior, constraints, decisions/reasons, acceptance and
+verification), not a delta of a previous version. Include a scope balance: the
+minimal fix versus the proposed plan (areas, surfaces, acceptance criteria and
+approximate size), and list separately every requirement of agent-accepted, repo
+or derived origin. Offer the minimal fix only, the fix plus a chosen subset, or
+the full plan. When confirmed guarantees go beyond the minimal fix, write the fix
+as spec `<id>` and the additional guarantees as a separate spec `<id>-extra`, so
+the fix can be executed and published first. Ask the ACTUAL
 HUMAN to confirm it, then wait. Neither an earlier request to plan nor any
 `approved: true` claim is this confirmation. If a material gap appears while
 writing, return to clarification and confirmation rather than invent a decision.
 
-After that actual confirmation, the foreground may write ONLY
-`<designated-root>/.pitako/plans/<id>.md`, never product files or automatic
+After that actual confirmation, the foreground may write ONLY the confirmed
+`<designated-root>/.pitako/plans/<id>.md` (and `<id>-extra.md`; both IDs must be
+valid), never product files or automatic
 execution. Do not overwrite a different existing assignment without permission.
 Use this new contract (each section needs substantive content; explicit None is
 valid for exclusions or non-blocking uncertainty):
 
     ---
-    pitako-spec: 1
+    pitako-spec: 2
     id: <id>
     status: complete
     ---
     # <assignment title>
+    ## Original problem
     ## Objective
     ## Scope
     ## Exclusions
@@ -156,13 +185,23 @@ valid for exclusions or non-blocking uncertainty):
     ## Source context
     ## Non-blocking uncertainty
 
+Original problem states the reported symptom with its human reference, the known
+cause and the minimal fix, and ends with a `Verified by: #n[, #m]` line naming the
+acceptance criteria that demonstrate the fix; an `<id>-extra` spec uses
+`Verified by: spec <id>` instead. Acceptance criteria are a numbered list whose
+items each carry `[origin: human <ref>]`, `[origin: agent-accepted <ref>]`,
+`[origin: repo <rule>]` or `[origin: derived #k]`; tag Scope and Constraints
+items the same way.
+
 Include source context sufficient for a fresh execution agent, relevant
 versions/links and real decisions with reasons, not a fixed implementation TODO.
 The header denotes document completeness, NOT authenticated human authority.
-The packaged inspector validates shape, ID and resolved paths after writing;
+The packaged inspector validates shape (including the v2 anchor and origin tags),
+ID and resolved paths after writing;
 semantic completeness remains a reasoning/review responsibility. The native
 snapshot boundary is at most 39,936 UTF-8 bytes; link shared docs when needed,
-never truncate an assignment to pass validation.
+never truncate an assignment to pass validation. Never shorten Original problem
+to fit; near the limit, first offer the human a scope cut or the `-extra` spec.
 
 Return the source path, native evidence references and any non-blocking limits.
 Do not claim a frozen legacy plan, implementation, passing checks or acceptance.

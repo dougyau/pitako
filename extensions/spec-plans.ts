@@ -5,6 +5,9 @@ import path from "node:path";
 import { registeredWorktrees, workspacePaths } from "./board/workspace.ts";
 
 export const SPEC_SECTIONS = ["Objective", "Scope", "Exclusions", "Expected behavior", "Constraints", "Decisions and reasons", "Acceptance criteria", "Verification", "Source context", "Non-blocking uncertainty"] as const;
+// Version 2 anchors the plan to the reported problem and requires an origin per criterion.
+export const ORIGINAL_PROBLEM = "Original problem";
+const ORIGIN_TAG = /\[origin: (?:human|agent-accepted|repo|derived) [^\]\n]+\]/;
 export const MAX_SPEC_BYTES = 26 * 1536;
 export function validatePlanId(id: unknown): asserts id is string {
   if (typeof id !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(id)) throw new Error("Invalid spec-plan ID.");
@@ -47,12 +50,33 @@ export function validateSpec(content: string, id: string): void {
   validatePlanId(id);
   if (Buffer.byteLength(content) > MAX_SPEC_BYTES || /[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(content)) throw new Error("Spec-plan exceeds the native snapshot boundary or contains control characters.");
   const header = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n/);
-  if (!header || !/^pitako-spec: 1$/m.test(header[1]!) || !new RegExp(`^id: ${id}$`, "m").test(header[1]!) || !/^status: complete$/m.test(header[1]!)) throw new Error("Not a complete Pitako spec-plan v1; legacy frozen status is insufficient.");
+  const version = header?.[1]!.match(/^pitako-spec: ([12])$/m)?.[1];
+  if (!header || !version || !new RegExp(`^id: ${id}$`, "m").test(header[1]!) || !/^status: complete$/m.test(header[1]!)) throw new Error("Not a complete Pitako spec-plan v1 or v2; legacy frozen status is insufficient.");
   const sections = content.slice(header[0].length).split(/^## /m).slice(1);
-  for (const title of SPEC_SECTIONS) {
+  const bodies = new Map<string, string>();
+  for (const title of version === "2" ? [ORIGINAL_PROBLEM, ...SPEC_SECTIONS] : SPEC_SECTIONS) {
     const matches = sections.filter(section => section.split(/\r?\n/, 1)[0] === title);
     if (matches.length !== 1 || !matches[0]!.slice(title.length).trim()) throw new Error(`Spec-plan requires a nonempty '${title}' section.`);
+    bodies.set(title, matches[0]!.slice(title.length));
   }
+  if (version === "2") validateScopeAnchor(bodies.get(ORIGINAL_PROBLEM)!, bodies.get("Acceptance criteria")!);
+}
+// Every top-level criterion names its origin; the original problem names the criteria that verify it.
+function validateScopeAnchor(problem: string, acceptance: string): void {
+  const items: { number?: number; text: string }[] = [];
+  for (const line of acceptance.split(/\r?\n/)) {
+    const marker = line.match(/^(?:(\d+)\.|[-*])\s/);
+    if (marker) items.push({ number: marker[1] ? Number(marker[1]) : undefined, text: line });
+    else if (items.length) items[items.length - 1]!.text += "\n" + line;
+  }
+  if (!items.some(item => item.number !== undefined)) throw new Error("Spec-plan v2 requires numbered acceptance criteria.");
+  const untagged = items.find(item => !ORIGIN_TAG.test(item.text));
+  if (untagged) throw new Error(`Acceptance criterion lacks an [origin: human|agent-accepted|repo|derived <reference>] tag: ${untagged.text.split("\n", 1)[0]!.slice(0, 80)}`);
+  // An additional-guarantees spec names the spec that fixes the original problem instead.
+  if (/^Verified by: spec [a-zA-Z0-9][a-zA-Z0-9_-]{0,63}\s*$/m.test(problem)) return;
+  const verified = problem.match(/^Verified by: (#\d+(?:, #\d+)*)\s*$/m)?.[1]!.split(", ").map(ref => Number(ref.slice(1)));
+  if (!verified?.every(number => items.some(item => item.number === number)))
+    throw new Error("Spec-plan v2 'Original problem' must name existing acceptance criteria with 'Verified by: #n' or the fixing spec with 'Verified by: spec <id>'.");
 }
 export function digest(content: string | Buffer): string { return createHash("sha256").update(content).digest("hex"); }
 

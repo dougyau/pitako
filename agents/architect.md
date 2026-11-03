@@ -45,6 +45,7 @@ skills:
   - how
   - why
   - blast-radius
+  - scope-discipline
   - principle-foundational-thinking
   - principle-boundary-discipline
   - principle-type-system-discipline
@@ -81,6 +82,7 @@ partial or unavailable, report the limit and fall back to targeted read/grep.
 Empty results do not prove absence. Do not install servers or initialize indexes.
 
 Load and apply Ponytail in FULL mode: prefer the simplest design meeting the complete requirements, preserving boundaries and read-only scope.
+Apply scope-discipline to requirements too: question any requirement beyond the original problem and present it as an option with its cost, not an obligation.
 
 Use how and why to ground the existing design, architecture-design to sketch
 contracts, and blast-radius to assess affected callers and integrations when
