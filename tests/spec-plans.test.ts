@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { checkoutEvidence, designatedWorkspace, digest, discoverSpec, executionAmendments, inspectionSnapshot, MAX_SPEC_BYTES, preliminarySpec, specBinding, SPEC_SECTIONS, specChunks, validateSpec } from "../extensions/spec-plans.ts";
+import { checkoutEvidence, designatedWorkspace, digest, discoverSpec, executionAmendments, inspectionSnapshot, MAX_SPEC_BYTES, ORIGINAL_PROBLEM, preliminarySpec, specBinding, SPEC_SECTIONS, specChunks, validateSpec } from "../extensions/spec-plans.ts";
 import { boardWorkspace } from "../extensions/board/workspace.ts";
 import { applyCheckpoint, captureCheckpoint, checkpointDirectory, completeCheckpoint, prepareCheckpoint, restoreCheckpoint, type CheckpointIntent } from "../extensions/execute-checkpoint.ts";
 
@@ -232,6 +232,20 @@ describe("spec-plan discovery and concrete input", () => {
     expect(() => discoverSpec(main, "demo")).toThrow("Objective");
     expect(() => validateSpec(spec("wrong"), "demo")).toThrow();
     expect(() => validateSpec(spec() + "x".repeat(MAX_SPEC_BYTES), "demo")).toThrow("snapshot boundary");
+  });
+
+  test("v2 anchors acceptance to the original problem and requires an origin per criterion", () => {
+    const v2 = (problem: string, criteria: string) => `---\npitako-spec: 2\nid: demo\nstatus: complete\n---\n# Example\n## ${ORIGINAL_PROBLEM}\n${problem}\n${SPEC_SECTIONS.map(title => `## ${title}\n${title === "Acceptance criteria" ? criteria : `Substantive agreed ${title}.`}`).join("\n")}\n`;
+    const problem = "Seven of nine children appear; a 99 KB status.json is discarded.\nVerified by: #1";
+    const criteria = "1. All nine children appear. [origin: human msg-1]\n   Includes the discarded file.\n2. History stays accessible. [origin: agent-accepted msg-2]";
+    validateSpec(v2(problem, criteria), "demo");
+    expect(() => validateSpec(spec().replace("pitako-spec: 1", "pitako-spec: 2"), "demo")).toThrow(`'${ORIGINAL_PROBLEM}'`);
+    expect(() => validateSpec(v2(problem, "1. All nine children appear. [origin: human msg-1]\n- Untagged guarantee."), "demo")).toThrow("Untagged guarantee");
+    expect(() => validateSpec(v2(problem, "All nine children appear. [origin: human msg-1]"), "demo")).toThrow("numbered");
+    expect(() => validateSpec(v2(problem.replace("#1", "#3"), criteria), "demo")).toThrow("Verified by");
+    expect(() => validateSpec(v2("Seven of nine children appear.", criteria), "demo")).toThrow("Verified by");
+    validateSpec(v2("Fixed separately.\nVerified by: spec demo-fix", criteria), "demo");
+    expect(() => validateSpec(spec().replace("pitako-spec: 1", "pitako-spec: 3"), "demo")).toThrow("complete Pitako");
   });
 
   test("validates IDs, physical roots and symlink escapes before reading candidates", () => {

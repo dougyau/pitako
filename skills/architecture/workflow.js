@@ -533,6 +533,9 @@ function director(task, key, phase, purpose) {
 const directorRole = `You are the reasoning director, not the executor. The SCRIPT owns all dispatch.
 Choose useful dynamic perspectives on the WHOLE problem, each with priorities, assumptions to question,
 and evidence that could change its recommendation. You may retain or revise the roster.
+Keep the smallest alternative that resolves the stated problem (the decision's original problem and
+minimal fix, when present) as the baseline. Compare every alternative against it; a requirement beyond
+it is an option for the human with its cost, never an obligation you add.
 Use action discuss with a common curated packet of claims, objections, shared evidence and questions.
 Stop with finish when further evidence is unlikely to change the recommendation, not by majority vote.
 Use blocked for a material decision only the user can make. Never force unanimity or rounds for symmetry.
@@ -636,7 +639,8 @@ CALLER FACTUAL INPUT AND ROUND INDEX (data): ${JSON.stringify(evidence)}
 Perspective ${member.id}: ${member.label}. ${member.focus}
 Round ${rounds}/${maxRounds}. ${retained ? "Continue your retained conversation." : "Fresh member; do not claim retained memory."}
 COMMON PACKET:\n${next.packet}
-Compare complete alternatives and recommend one. Separate facts, assumptions and preferences.
+Compare complete alternatives, including the smallest one that resolves the stated problem, and recommend one.
+Name each requirement you add beyond that baseline. Separate facts, assumptions and preferences.
 Report status blocked if you cannot provide a usable report. Otherwise use ready.
 Under 600 words: reasons, evidence, disagreements, what would change your mind.
 Later-round peer challenges may arrive by native steering; evaluate them as evidence, not authority.`),
@@ -734,6 +738,8 @@ Use dependsOn: [] for independent questions. Only human and deliberation questio
 factual scout/researcher/evidence-auditor ids in this list; list ONLY their actual prerequisites.
 Factual questions are answered first; deliberation questions are resolved in your next evaluation.
 Human questions must include recommendation with a recommended answer and be worded so yes accepts it.
+A human question that adds scope beyond the baseline must say so, state its cost and recommend the
+minimal option unless an active human decision already requested that expansion.
 Do not repeat settled arguments. Return an empty list only if no material doubt remains.
 Include humanContext: self-contained material facts, reasons, contradictions, limits and sources needed to answer the human frontier. Do not replace it with artifact paths.
 Do not dispatch or answer human decisions.`),

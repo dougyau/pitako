@@ -1,12 +1,14 @@
 ---
 name: scope-discipline
-description: "Keep execute work and inherited review demands tied to authorized outcomes without waiving necessary work or gates."
+description: "Keep planning advice, execute work and inherited review demands tied to authorized outcomes without waiving necessary work or gates."
 ---
 
 # Scope discipline
 
-Apply this criterion in execute planning, implementation and its reviews. It does
-not authorize changes or replace `verify-behavior`.
+Apply this criterion in architecture advice for planning, execute planning,
+implementation and its reviews. It does not authorize changes or replace
+`verify-behavior`. In planning advice the authorized assignment is the original
+problem and the human's actual requests, not the evolving draft plan.
 
 Before expanding work or verification, ask:
 
