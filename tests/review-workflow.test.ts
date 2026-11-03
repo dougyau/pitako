@@ -259,6 +259,10 @@ describe("review scripted workflow", () => {
     const result = await host.library(args, { prefix: "loop1.", mode: "execute" });
     expect(result.status).toBe("failed");
     expect(result.screening).toBeUndefined();
+    if (finalDisposition.decision === "discard" || ["out-of-scope", "related-improvement"].includes(finalDisposition.classification))
+      expect(result.error).toContain("Execute screening contradicts dispositions or lacks consequences. a-1");
+    expect(host.calls.find(call => call.key.endsWith("director-synthesis"))!.request.task)
+      .toContain("A discarded duplicate, out-of-scope or related-improvement finding is assessed material:false; the kept finding carries its consequence.");
   });
 
   test("retains exact native references without copying child reports or deriving paths", async () => {
