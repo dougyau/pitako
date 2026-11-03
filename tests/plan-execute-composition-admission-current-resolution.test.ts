@@ -17,6 +17,7 @@ import { discoverAgents, discoverAgentsAll } from "../node_modules/pi-subagents/
 import { resolveSkills } from "../node_modules/pi-subagents/src/agents/skills.js";
 import { buildEffectiveSystemPrompt } from "../node_modules/pi-subagents/src/runs/shared/effective-system-prompt.js";
 import { handleManagementAction } from "../node_modules/pi-subagents/src/agents/agent-management.js";
+import { handleMissionAction } from "../node_modules/pi-subagents/src/missions/actions.js";
 import { captureCheckpoint, sealCheckpoint } from "../extensions/execute-checkpoint.ts";
 import { executeMaxCycles } from "../extensions/execute-settings.ts";
 import registerPlanExecute, { executionResource } from "../extensions/plan-execute.ts";
@@ -818,7 +819,8 @@ describe("plan/execute packaged composition", () => {
       expect(text).toContain("missionPath"); expect(text).toContain("loop_plan");
       expect(text).toContain("--unblock"); expect(text).not.toContain("effective-profile preflight");
     }
-    expect(skill).toContain("details.missionId"); expect(skill).toContain("details.missionPath");
+    expect(skill.replace(/\s+/g, " ")).toContain("`Mission record path (pitako.execute args.missionPath): <path>`");
+    expect(skill.replace(/\s+/g, " ")).toContain("the `State:` line is NOT the mission path");
     expect(skill.replace(/\s+/g, " ")).toContain("all mission management and run reconciliation calls");
     expect(skill).toContain("never derive a storage path");
     expect(skill).toContain("without polling or new");
@@ -1045,7 +1047,7 @@ describe("plan/execute packaged composition", () => {
     const sessionId = randomUUID(), ctx = { cwd: nested, sessionManager: { getSessionId: () => sessionId } };
     hooks.get("session_start")!({}, ctx);
     disposers.push(() => hooks.get("session_shutdown")!({}, ctx));
-    const args = { root, id: "assignment", invocation: "human-1", missionId: "native.mission-1", missionPath: "/native/actual-mission.json" };
+    const args = { root, id: "assignment", invocation: "human-1", missionId: "native.mission-1", missionPath: missionFiles(repository()).missionPath };
     const input = { workflow: "pitako.execute", args, options: { missionId: args.missionId } };
     const call = (cwd?: string, designatedRoot = root) => hooks.get("tool_call")!({ toolName: "subagent", input: { ...input, cwd, args: { ...args, root: designatedRoot } } }, ctx);
     expect(resolveWorkflowResource("pitako.execute", args, sessionId).ok).toBe(true);
@@ -1674,7 +1676,8 @@ test("advertised execute tool entry requires explicit native binding without cla
   planExecute({ on: (name: string, handler: (event: unknown) => unknown) => { if (name === "tool_call") guard = handler; } } as unknown as ExtensionAPI);
   const root = repository();
   const call = (options?: unknown, args?: unknown, workflow: unknown = "pitako.execute", toolName = "subagent") => guard!({ toolName, input: { workflow, args, options } }, { cwd: root });
-  const missionId = "explicit.native-id", args = { missionId, missionPath: "/native/actual-mission.json", root };
+  const missionId = "explicit.native-id", missionPath = path.join(root, `${missionId}.json`), args = { missionId, missionPath, root };
+  writeFileSync(missionPath, JSON.stringify({ id: missionId }));
   for (const options of [undefined, {}, { mission: false }, { mission: true }, { mission: [] }, { mission: {} }, { missionId: "" }, { missionId: false }]) expect(call(options, args)).toMatchObject({ block: true });
   for (const missingOrInvalid of [undefined, {}, null, [], { missionId: "" }, { missionId: false }, { missionId: "different-id" }, { missionId: "../escape" }])
     expect(call({ missionId }, missingOrInvalid)).toMatchObject({ block: true });
@@ -1683,11 +1686,42 @@ test("advertised execute tool entry requires explicit native binding without cla
     expect(call({ missionId, mission }, args)).toMatchObject({ block: true });
   }
   expect(call({ missionId }, args)).toBeUndefined();
-  // Native ownership validates storage existence; matching DATA pointers are not approval or confinement.
-  expect(call({ missionId: "missing-id-native-must-reject" }, { missionId: "missing-id-native-must-reject", missionPath: "/native/actual-mission.json", root })).toBeUndefined();
+  // Native validates options.missionId; Pitako validates only its own record pointer. Not approval or confinement.
+  for (const missionPath of [undefined, "relative.json", "/native/actual-mission.json", path.join(root, "missing.json")])
+    expect(call({ missionId }, { ...args, missionPath })).toMatchObject({ block: true, reason: expect.stringContaining("missionPath") });
   expect(call({ missionId }, { ...args, missionId: "different-id" }, " pitako.execute ")).toMatchObject({ block: true });
   expect(call({ missionId }, args, " pitako.execute ")).toBeUndefined();
   expect(call(undefined, undefined, "review")).toBeUndefined(); expect(call(undefined, undefined, true)).toBeUndefined(); expect(call(undefined, undefined, "./workflow.js")).toBeUndefined(); expect(call(undefined, undefined, "pitako.execute", "read")).toBeUndefined();
+});
+
+test("model-visible mission output yields the record path the launch hook admits; the State path is rejected before launch", () => {
+  const handlers = new Map<string, (event: any, context?: unknown) => any>();
+  planExecute({ on: (name: string, handler: (event: any) => unknown) => { handlers.set(name, handler); } } as unknown as ExtensionAPI);
+  const root = repository(), agentDir = path.join(root, "agent");
+  // Controlled native boundary: real pi-subagents mission actions against a private store.
+  const native = (action: string, params: object) => {
+    const result = handleMissionAction(action as Parameters<typeof handleMissionAction>[0], params, { cwd: root, agentDir });
+    const input = { action, cwd: root, options: params };
+    const patched = handlers.get("tool_result")!({ toolName: "subagent", input, ...result, isError: false });
+    return { details: result.details, text: (patched?.content ?? result.content).map((part: { text: string }) => part.text).join("\n") };
+  };
+  const created = native("mission.create", { mission: { title: "Execute" } });
+  const missionId = created.details.missionId as string;
+  const shown = native("mission.show", { missionId });
+  const launch = (missionPath: string) => handlers.get("tool_call")!({ toolName: "subagent", input: {
+    workflow: "pitako.execute", cwd: root, args: { id: "assignment", root, invocation: "human-1", missionId, missionPath }, options: { missionId } } }, { cwd: root });
+  for (const { text, details } of [created, shown]) {
+    const visible = /^Mission record path \(pitako\.execute args\.missionPath\): (.+)$/m.exec(text)?.[1];
+    expect(visible).toBe(details.missionPath);
+    expect(text.split(details.missionPath).length).toBe(2);
+    expect(launch(visible!)).toBeUndefined();
+  }
+  const state = /^State: (.+)$/m.exec(shown.text)?.[1];
+  expect(state).toBeDefined();
+  expect(launch(state!)).toMatchObject({ block: true, reason: expect.stringContaining(`${missionId}.json`) });
+  // Errors and unrelated subagent results are not rewritten.
+  expect(handlers.get("tool_result")!({ toolName: "subagent", input: { action: "mission.show" }, content: [], details: created.details, isError: true })).toBeUndefined();
+  expect(handlers.get("tool_result")!({ toolName: "subagent", input: { workflow: "review" }, content: [], details: created.details, isError: false })).toBeUndefined();
 });
 
 describe("packaged workflow caller examples", () => {
@@ -2054,7 +2088,7 @@ describe("plan/execute packaged composition", () => {
       const retainedRecovery = mode.startsWith("retained-");
       const interruptedLoop = ["closing", "decision"].includes(mode) || historicalChild || retainedRecovery ? 1 : 0;
       const continued = { ...args, unblock: true, resolution: { loop: interruptedLoop, text: "Current human request: reconstruct the same invocation and continue under current native policy." } };
-      expect(hooks.get("tool_call")!({ toolName: "subagent", input: { workflow: "pitako.execute", cwd: root, args: continued, options: { missionId: args.missionId } } }, ctx)).toBeUndefined();
+      expect(hooks.get("tool_call")!({ toolName: "subagent", input: { workflow: "pitako.execute", cwd: root, args: { ...continued, missionPath: missionFiles(repository()).missionPath }, options: { missionId: args.missionId } } }, ctx)).toBeUndefined();
       expect(hooks.get("tool_call")!({ toolName: "subagent", input: { workflow: "pitako.execute", cwd: root, args: { ...args, unblock: true }, options: { missionId: args.missionId } } }, ctx)).toMatchObject({ block: true });
       const initial = resolveWorkflowResource("pitako.execute", args, sessionId);
       const resumed = resolveWorkflowResource("pitako.execute", continued, sessionId);
