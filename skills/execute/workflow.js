@@ -13,6 +13,8 @@ const associationSchema = object({
   root: string, commonDir: string, source: string, digest: string,
 });
 const checkDefinitionSchema = object({ id: string, requirement: string, command: string, cwd: string });
+// Optional advisory mark: acceptance-criterion numbers of the spec's original problem this check verifies.
+checkDefinitionSchema.properties.verifies = list(integer);
 const taskSchema = object({
   id: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$" },
   kind: { enum: ["implementation", "verification"] }, goal: string,
@@ -412,8 +414,16 @@ function emitTodoSnapshot() {
   }) : [];
   const active = admitted && loop.phase === "implementation" && loop.attempt && loop.attempt.stage !== "result"
     ? { taskId: loop.attempt.taskId, attempt: loop.attempt.number, workflowKey: loop.attempt.key } : null;
+  const notice = originalProblem();
+  const verified = notice.criteria?.filter(item => item.status !== "not-run")
+    .map(item => `#${item.criterion} ${item.check.id} ${item.status === "passed" ? "pasó" : "falló"} en loop ${item.loop}, candidato ${item.candidate.head.slice(0, 7)}`).join("; ");
   const snapshot = { schema: "pitako.execute-todo", v: 1, invocation: config.invocation,
-    loop: loop.number, maxLoops: maxCycles(), phases, tasks, active, outcome: loop.outcome ?? null };
+    loop: loop.number, maxLoops: maxCycles(), phases, tasks, active, outcome: loop.outcome ?? null,
+    // Completed rows are sticky and in_progress is reserved for active work, so the notice
+    // stays pending (its subject carries the state) until the invocation completes.
+    ...(notice.status === "unknown" ? {} : { originalProblem: notice.status === "fulfilled"
+      ? { status: loop.outcome === "complete" ? "completed" : "pending", subject: `Problema original · cumplido (${verified}) · seguir, cortar o cerrar como entrega parcial`.slice(0, 2000) }
+      : { status: "pending", subject: `Problema original · no cumplido (${verified})`.slice(0, 2000) } }) };
   if (same(snapshot, lastTodoSnapshot)) return;
   lastTodoSnapshot = clone(snapshot);
   emit({ ...snapshot, seq: ++todoSeq });
@@ -470,6 +480,37 @@ function observeMainRequests(cursor = 0, records = []) {
     // No cancellation-driven state transition or display is exposed before this essential save.
     return changed ? save() : undefined;
   });
+}
+// Advisory notice only: the latest designated planned check per original-problem criterion
+// from accepted worker results. It never gates, vetoes or replaces compliance.
+function recordOriginalProblem(task, value, checks, projected) {
+  const criteria = config.originalProblem?.criteria;
+  if (!Array.isArray(criteria)) return;
+  for (const criterion of criteria) {
+    const marked = checks.filter(check => {
+      const verifies = task.checks.find(definition => definition.id === check.id)?.verifies;
+      return Array.isArray(verifies) && verifies.includes(criterion);
+    });
+    const failed = marked.find(check => check.result === "failed");
+    const check = failed ?? marked.find(check => check.result === "passed" &&
+      same(check.before, value.candidate) && same(check.after, value.candidate));
+    if (!check) continue;
+    (invocation.originalProblem ??= {})[criterion] = { status: failed ? "failed" : "passed", loop: loop.number,
+      taskId: task.id, attempt: projected.attempt, candidate: projected.candidate,
+      check: { id: check.id, command: check.command, cwd: check.cwd }, ref: projected.ref ? clone(projected.ref) : null };
+  }
+}
+function originalProblem() {
+  const anchor = config.originalProblem;
+  if (text(anchor?.spec)) return { status: "unknown", reason: `Original problem is verified by spec ${anchor.spec}.` };
+  if (!Array.isArray(anchor?.criteria)) return { status: "unknown", reason: "Spec has no original-problem anchor." };
+  const criteria = anchor.criteria.map(criterion => ({ criterion, ...clone(invocation?.originalProblem?.[criterion] ?? { status: "not-run" }) }));
+  const pick = status => criteria.filter(item => item.status === status).map(item => `#${item.criterion}`).join(", ");
+  return criteria.some(item => item.status === "failed") ? { status: "unfulfilled", criteria,
+      reason: `Designated original-problem checks failed for ${pick("failed")}.` }
+    : criteria.every(item => item.status === "passed") ? { status: "fulfilled", criteria,
+      reason: "Designated original-problem checks passed on their recorded candidates; advisory, not whole-spec compliance." }
+    : { status: "unknown", criteria, reason: `Original-problem criteria not yet verified: ${pick("not-run")}.` };
 }
 function cancelledScope() { return Object.values(invocation?.excludedScope ?? {}); }
 function unfulfilledCancellations() { return cancelledScope().filter(task => !task.completed); }
@@ -1567,6 +1608,7 @@ function admitWorker(result, descriptor, task, recoveryRef, statusRef) {
       attempt: descriptor.number, resultRef: clone(projected.ref) };
   }
   if (projected.continuationIdentity) invocation.taskFrame.identities.push(projected.continuationIdentity);
+  if (!parsed.rejection) recordOriginalProblem(task, value, parsed.checks, projected);
   if (!taskState.admitted.includes(projected.status)) taskState.admitted.push(projected.status);
   // A superseded pending attempt no longer has a task-owned full result.
   loop.results = loop.results.map(entry => !entry.ref && entry.taskId === projected.taskId &&
@@ -1817,7 +1859,7 @@ function loopReport(status, reason) {
   const report = {
     type: "execution-loop", invocation: config.invocation, loop: loop.number, maxLoops: maxCycles(),
     status: exhausted ? "partial" : status, reason, phase: loop.phase, candidate: loop.closing?.candidate ?? last?.candidate ?? null,
-    cancelledScope: cancelledScope(),
+    cancelledScope: cancelledScope(), originalProblem: originalProblem(),
     halt: loop.halt ?? null, history: { summaries: invocation.loopSummaries, ...historyReference() },
     elapsedMs: (loop.endedAt ?? now) - loop.startedAt, totalElapsedMs: now - invocation.startedAt,
     tokens: metrics(loop), totalTokens: metrics(),
@@ -1887,6 +1929,7 @@ function finish(status, reason) {
     actionRequired: ["complete", "budget-exhausted"].includes(status) ? "none" : reason,
     action: action(status, reason),
     publication: "not performed by workflow", references, cancelledScope: cancelledScope(),
+    originalProblem: originalProblem(),
   };
 }
 try {
@@ -2233,7 +2276,11 @@ shared resources, not concurrency authority.
 Inspection/check-only tasks, or tasks that may finish without edits, are verification.
 Planned checks gate the task's FINAL candidate after its last write; pre-edit diagnosis belongs in goal/expectedResult, not checks.
 Use implementation only for a concrete editing repair requiring real pre-write capture and sealed file/progress checkpoint.
-Include a LAST verification task for final checks after all writes even when the implementation already exists. Shared context is complete.
+Include a LAST verification task for final checks after all writes even when the implementation already exists. Shared context is complete.${
+  Array.isArray(config.originalProblem?.criteria) ? `
+ORIGINAL PROBLEM (advisory notice, not a gate or scope change): the spec's Original problem is verified by acceptance
+criteria ${config.originalProblem.criteria.map(criterion => `#${criterion}`).join(", ")}. Set verifies: [criterion numbers] on each planned check
+that demonstrates one of them, preferably in the last verification task. Omit verifies on other checks.` : ""}
 No replacement task list elsewhere. Carry the exact association above. Native permissions and Stop apply.`,
           planSchema);
         loop.plan = { ...projection(directorKey, result), stage: "published" };

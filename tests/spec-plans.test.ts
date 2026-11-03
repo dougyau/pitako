@@ -238,13 +238,15 @@ describe("spec-plan discovery and concrete input", () => {
     const v2 = (problem: string, criteria: string) => `---\npitako-spec: 2\nid: demo\nstatus: complete\n---\n# Example\n## ${ORIGINAL_PROBLEM}\n${problem}\n${SPEC_SECTIONS.map(title => `## ${title}\n${title === "Acceptance criteria" ? criteria : `Substantive agreed ${title}.`}`).join("\n")}\n`;
     const problem = "Seven of nine children appear; a 99 KB status.json is discarded.\nVerified by: #1";
     const criteria = "1. All nine children appear. [origin: human msg-1]\n   Includes the discarded file.\n2. History stays accessible. [origin: agent-accepted msg-2]";
-    validateSpec(v2(problem, criteria), "demo");
+    expect(validateSpec(v2(problem, criteria), "demo")).toEqual({ criteria: [1] });
+    expect(validateSpec(v2(problem.replace("#1", "#2, #1"), criteria), "demo")).toEqual({ criteria: [2, 1] });
+    expect(validateSpec(spec(), "demo")).toBeNull();
     expect(() => validateSpec(spec().replace("pitako-spec: 1", "pitako-spec: 2"), "demo")).toThrow(`'${ORIGINAL_PROBLEM}'`);
     expect(() => validateSpec(v2(problem, "1. All nine children appear. [origin: human msg-1]\n- Untagged guarantee."), "demo")).toThrow("Untagged guarantee");
     expect(() => validateSpec(v2(problem, "All nine children appear. [origin: human msg-1]"), "demo")).toThrow("numbered");
     expect(() => validateSpec(v2(problem.replace("#1", "#3"), criteria), "demo")).toThrow("Verified by");
     expect(() => validateSpec(v2("Seven of nine children appear.", criteria), "demo")).toThrow("Verified by");
-    validateSpec(v2("Fixed separately.\nVerified by: spec demo-fix", criteria), "demo");
+    expect(validateSpec(v2("Fixed separately.\nVerified by: spec demo-fix", criteria), "demo")).toEqual({ spec: "demo-fix" });
     expect(() => validateSpec(spec().replace("pitako-spec: 1", "pitako-spec: 3"), "demo")).toThrow("complete Pitako");
   });
 

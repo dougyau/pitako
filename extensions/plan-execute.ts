@@ -3,7 +3,7 @@ import path from "node:path";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerAgentViaEvents, type RuntimeAgentRegistration } from "pi-subagents/agents";
 import { registerWorkflowResource, type WorkflowResourceRegistration } from "pi-subagents/workflow-resources";
-import { designatedWorkspace, executionAmendments, preliminarySpec, validatePlanId } from "./spec-plans.ts";
+import { designatedWorkspace, executionAmendments, preliminarySpec, validatePlanId, validateSpec } from "./spec-plans.ts";
 import { boundRetainedAnalyses } from "./execute-retained.ts";
 import { packageRoot } from "./stack.ts";
 
@@ -75,6 +75,8 @@ export function executionResource(platform: NodeJS.Platform = process.platform) 
     ], platform) }];
     inspections.push(...[1, 2].map(retry => ({ ...inspections[0]!, key: `inspect-initial.r${retry}` })));
     const config = { root: preliminary.root, id: args.id, invocation: args.invocation, missionId: args.missionId, missionPath: args.missionPath, sourceRefs, amendments, inspections, preliminary, ...(recovery ? { recovery } : {}),
+      // Derived from the same bytes the root binds at admission; advisory only.
+      originalProblem: validateSpec(preliminary.content, args.id),
       checkpointHelper: path.join(packageRoot(), "skills/execute/checkpoint.mjs"),
       ...(args.unblock === true ? { unblock: true, resolution: args.resolution } : {}) };
     return { script: `const config = ${JSON.stringify(config)};\nconst pitakoReviewLibraryMode = true;\n${reviewScript}\n${rootScript}`,

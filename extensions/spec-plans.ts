@@ -46,7 +46,9 @@ export function designatedWorkspace(root: string) {
   if (!registered) throw new Error(`Designated worktree is not registered with Git: ${physical}`);
   return { physicalRoot: physical, identity: commonDir };
 }
-export function validateSpec(content: string, id: string): void {
+/** Criteria that verify the original problem, or the separate spec that fixes it; v1 has no anchor. */
+export type OriginalProblemAnchor = { criteria: number[] } | { spec: string } | null;
+export function validateSpec(content: string, id: string): OriginalProblemAnchor {
   validatePlanId(id);
   if (Buffer.byteLength(content) > MAX_SPEC_BYTES || /[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(content)) throw new Error("Spec-plan exceeds the native snapshot boundary or contains control characters.");
   const header = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n/);
@@ -59,10 +61,10 @@ export function validateSpec(content: string, id: string): void {
     if (matches.length !== 1 || !matches[0]!.slice(title.length).trim()) throw new Error(`Spec-plan requires a nonempty '${title}' section.`);
     bodies.set(title, matches[0]!.slice(title.length));
   }
-  if (version === "2") validateScopeAnchor(bodies.get(ORIGINAL_PROBLEM)!, bodies.get("Acceptance criteria")!);
+  return version === "2" ? validateScopeAnchor(bodies.get(ORIGINAL_PROBLEM)!, bodies.get("Acceptance criteria")!) : null;
 }
 // Every top-level criterion names its origin; the original problem names the criteria that verify it.
-function validateScopeAnchor(problem: string, acceptance: string): void {
+function validateScopeAnchor(problem: string, acceptance: string): Exclude<OriginalProblemAnchor, null> {
   const items: { number?: number; text: string }[] = [];
   for (const line of acceptance.split(/\r?\n/)) {
     const marker = line.match(/^(?:(\d+)\.|[-*])\s/);
@@ -73,10 +75,12 @@ function validateScopeAnchor(problem: string, acceptance: string): void {
   const untagged = items.find(item => !ORIGIN_TAG.test(item.text));
   if (untagged) throw new Error(`Acceptance criterion lacks an [origin: human|agent-accepted|repo|derived <reference>] tag: ${untagged.text.split("\n", 1)[0]!.slice(0, 80)}`);
   // An additional-guarantees spec names the spec that fixes the original problem instead.
-  if (/^Verified by: spec [a-zA-Z0-9][a-zA-Z0-9_-]{0,63}\s*$/m.test(problem)) return;
+  const fixing = problem.match(/^Verified by: spec ([a-zA-Z0-9][a-zA-Z0-9_-]{0,63})\s*$/m)?.[1];
+  if (fixing) return { spec: fixing };
   const verified = problem.match(/^Verified by: (#\d+(?:, #\d+)*)\s*$/m)?.[1]!.split(", ").map(ref => Number(ref.slice(1)));
   if (!verified?.every(number => items.some(item => item.number === number)))
     throw new Error("Spec-plan v2 'Original problem' must name existing acceptance criteria with 'Verified by: #n' or the fixing spec with 'Verified by: spec <id>'.");
+  return { criteria: [...new Set(verified)] };
 }
 export function digest(content: string | Buffer): string { return createHash("sha256").update(content).digest("hex"); }
 

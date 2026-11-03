@@ -14,6 +14,8 @@ export type ExecuteTodoSnapshot = {
   tasks: (DisplayRow & { id: string; blockedBy: string[] })[];
   active: { taskId: string; attempt: number; workflowKey: string } | null;
   outcome: string | null;
+  /** Advisory original-problem notice; absent while unknown or without a spec anchor. */
+  originalProblem?: DisplayRow;
   /** Display-only: the run ended without emitting a closing snapshot. Never read from emits. */
   halted?: true;
 };
@@ -39,6 +41,7 @@ export function latestExecuteTodoSnapshot(emits: unknown): ExecuteTodoSnapshot |
         !Array.isArray(value.tasks) || value.tasks.length > 1000 || !value.tasks.every(t => displayRow(t) && object(t) && planId(t.id) && Array.isArray(t.blockedBy) && t.blockedBy.every(planId)) ||
         new Set(value.tasks.map(t => t.id)).size !== value.tasks.length ||
         !(value.outcome === null || text(value.outcome,240)) ||
+        !(value.originalProblem === undefined || displayRow(value.originalProblem) && ["pending","completed"].includes(value.originalProblem.status)) ||
         !(value.active === null || object(value.active) && planId(value.active.taskId) && positive(value.active.attempt) && text(value.active.workflowKey,256) && value.tasks.some(t => t.id === value.active.taskId))) continue;
     if (!latest || value.seq > latest.seq) latest = value as ExecuteTodoSnapshot;
   }
@@ -66,6 +69,8 @@ export function projectExecuteTodos(runId: string, snapshot: ExecuteTodoSnapshot
   const rows: SyncRow[] = state.tasks.filter(t => t.owner === owner && t.status !== "deleted" && t.metadata?.summary === true && t.metadata.loop !== snapshot.loop).map(toRow);
   const metadata = { invocation:snapshot.invocation, loop:snapshot.loop, ...(snapshot.halted ? {halted:true} : {}) };
   const lineage = [runId,...predecessors];
+  // One row per run carries the latest invocation-wide notice across loops.
+  if (snapshot.originalProblem) rows.push({key:`${prefix}original-problem`,subject:subject(snapshot.originalProblem),status:snapshot.originalProblem.status,metadata:{...metadata,protected:true}});
   // Retirement deletes are not display decisions; only durable deletes or pending requests carry over.
   const priorTask = (id: string) => lineage.map(run => state.tasks.find(t => t.owner === `execute:${run}` && t.metadata?.key === taskKey(run,snapshot.loop,id) && (run === runId || t.status !== "deleted" || deletions.has(id) || t.metadata?.cancelRequested))).find(Boolean);
   if (snapshot.outcome) {
