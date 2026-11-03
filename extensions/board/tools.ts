@@ -1,4 +1,3 @@
-import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
@@ -17,8 +16,8 @@ import {
 import { resolveBoardAuthor } from "./author.ts";
 import { boardWorkspace } from "./workspace.ts";
 
-const PostTypeSchema = StringEnum(POST_TYPES);
-const TopicStatusSchema = StringEnum(TOPIC_STATUSES);
+const PostTypeSchema = Type.Enum(POST_TYPES, { type: "string" });
+const TopicStatusSchema = Type.Enum(TOPIC_STATUSES, { type: "string" });
 const noExtra = { additionalProperties: false } as const;
 
 export function registerBoard(pi: ExtensionAPI): void {

@@ -101,6 +101,11 @@ Use `/pitako` for profile and skill status, `/todos` for the session task list,
 and `/board` for shared topics. Board tools are pull-only. They do not inject
 posts into every turn.
 
+Session TODOs come from the commit-pinned vendored [rpiv-todo fork](vendor/rpiv-todo/),
+loaded only through `extensions/todo.ts`. Its local delta is recorded in
+`vendor/rpiv-todo/pitako.patch`; the `todo` tool uses Pi's default exposure and is
+callable from codemode. See the [engineering layer](docs/engineering.md) for details.
+
 Pitako also bundles Markdown previews through `/preview` and structured questions
 through `ask_user_question`. See [preview settings](docs/configuration.md#previews-and-questions)
 for external prerequisites. Mermaid renders in previews independently of Pi's

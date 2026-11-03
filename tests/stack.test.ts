@@ -39,7 +39,7 @@ describe("stack configuration", () => {
     const manifest = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
     const identities = JSON.parse(readFileSync(path.join(root, "docs/dependency-releases.json"), "utf8"));
     const dependencies = { ...manifest.dependencies, ...manifest.devDependencies };
-    expect(Object.keys(identities).sort()).toEqual(Object.keys(dependencies).sort());
+    expect(Object.keys(identities).filter(name => identities[name].kind !== "commit-pinned").sort()).toEqual(Object.keys(dependencies).sort());
     for (const [name, spec] of Object.entries(dependencies)) {
       const identity = identities[name];
       expect(spec).toBe(name === "pi-lsp-client"
@@ -53,8 +53,8 @@ describe("stack configuration", () => {
     expect(manifest.devDependencies["typescript-compiler"]).toBe("npm:typescript@7.0.2");
     expect(existsSync(path.join(root, "node_modules/typescript/lib/tsserver.js"))).toBe(true);
     for (const name of ["pi-ai", "pi-agent-core", "pi-coding-agent", "pi-tui"]) {
-      expect(manifest.devDependencies[`@earendil-works/${name}`]).toBe("1.4.0");
-      expect(manifest.peerDependencies[`@earendil-works/${name}`]).toBe(">=1.4.0");
+      expect(manifest.devDependencies[`@earendil-works/${name}`]).toBe("1.5.0");
+      expect(manifest.peerDependencies[`@earendil-works/${name}`]).toBe(name === "pi-coding-agent" ? ">=1.5.0" : ">=1.4.0");
     }
   });
 
@@ -83,7 +83,7 @@ describe("stack configuration", () => {
     expect(manifest.dependencies["pi-lsp-client"]).toBe(lsp.spec);
     expect(Object.keys(manifest.dependencies)).toEqual(expect.arrayContaining([
       "@ast-grep/cli", "@colbymchenry/codegraph", "@vndv/pi-codegraph", "@dietrichgebert/ponytail",
-      "@juicesharp/rpiv-todo", "billion-context-pi", "pi-codex-tools",
+      "@juicesharp/rpiv-config", "billion-context-pi", "pi-codex-tools",
       "pi-hermes-memory", "pi-lsp-client", "pi-subagents", "pi-web-access", "smol-toml",
       "typescript", "typescript-language-server", "pyright", "intelephense",
     ]));
@@ -136,14 +136,16 @@ describe("stack configuration", () => {
         "cargo_run", "cargo_doc", "cargo_bench", "cargo_add", "resource_snapshot",
       ],
     });
-    expect(stack.required.find(({ id }) => id === "@juicesharp/rpiv-todo")).toEqual({
-      id: "@juicesharp/rpiv-todo", spec: `@juicesharp/rpiv-todo@${manifest.dependencies["@juicesharp/rpiv-todo"]}`,
+    expect(stack.required.find(({ id }) => id === "pitako-todo")).toEqual({
+      id: "pitako-todo", spec: "vendor/rpiv-todo#ce6d3530410812ca504ec294995581a52170f9e1",
       entry: "extensions/todo.ts", tools: ["todo"],
     });
     expect(stack.required.find(({ id }) => id === "pitako-file-sha256")).toEqual({
       id: "pitako-file-sha256", spec: "pitako", entry: "extensions/file-sha256.ts",
       tools: ["file_sha256", "file_sha256_save"],
     });
+    expect(manifest.bundledDependencies).toContain("@juicesharp/rpiv-config");
+    expect(JSON.parse(readFileSync(path.join(root, "package.json"), "utf8")).files).toContain("vendor");
     expect(manifest.bundledDependencies).toContain("pi-hermes-memory");
     expect(manifest.bundledDependencies).toContain("billion-context-pi");
     expect(stack.required.find(({ id }) => id === "billion-context-pi")).toEqual({

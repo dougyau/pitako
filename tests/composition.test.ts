@@ -4,7 +4,9 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, mock, spyOn, test } from "bun:test";
 import * as acp from "billion-context-pi";
-import * as rpivTodo from "@juicesharp/rpiv-todo";
+import * as rpivTodo from "../vendor/rpiv-todo/index.ts";
+import { createMockPi, createMockCtx } from "../vendor/rpiv-todo/test-utils.ts";
+import type { TaskDetails } from "../vendor/rpiv-todo/tool/types.ts";
 import { loadSkills, formatSkillsForPrompt, parseFrontmatter, type ExtensionAPI, type ExtensionToolContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { validateToolArguments } from "@earendil-works/pi-ai";
@@ -108,19 +110,19 @@ describe("engineering-layer composition", () => {
   });
 
   test("selected external LSP entry preserves the declared six-tool surface and symbol scopes", async () => {
-    const tools: ToolDefinition[] = [];
-    const commands: string[] = [];
-    const extension = await import(path.join(packageRoot(), "node_modules/pi-lsp-client/src/index.ts"));
-    const { disposeDefaultLspManager } = await import(path.join(packageRoot(), "node_modules/pi-lsp-client/src/lsp/manager.ts"));
+    // Use Pi's loader itself: its pi-ai extension view supplies legacy Type/StringEnum exports.
+    const { loadExtensions } = await import("../node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/loader.js");
+    const providers = ["pi-lsp-client", "@vndv/pi-codegraph"].map(id =>
+      readStack(packageRoot()).required.find(provider => provider.id === id)!);
+    const loaded = await loadExtensions(providers.map(provider => path.join(packageRoot(), provider.entry)), packageRoot());
     try {
-      extension.default({
-        registerTool(tool: ToolDefinition) { tools.push(tool); },
-        registerCommand(name: string) { commands.push(name); },
-        on() {},
-      } as unknown as ExtensionAPI);
-      expect(tools.map(tool => tool.name)).toEqual(
-        readStack(packageRoot()).required.find(({ id }) => id === "pi-lsp-client")!.tools);
-      expect(commands).toEqual(["lsp"]);
+      expect(loaded.errors).toEqual([]);
+      expect(loaded.extensions).toHaveLength(providers.length);
+      for (const [index, provider] of providers.entries())
+        expect([...loaded.extensions[index]!.tools.keys()]).toEqual(provider.tools);
+      const lsp = loaded.extensions[0]!;
+      const tools = [...lsp.tools.values()].map(tool => tool.definition);
+      expect([...lsp.commands.keys()]).toEqual(["lsp"]);
       const symbols = tools.find(tool => tool.name === "lsp_symbols")!;
       for (const scope of ["document", "workspace"]) {
         const arguments_ = { filePath: "source.ts", scope, ...(scope === "workspace" ? { query: "owned" } : {}) };
@@ -133,8 +135,11 @@ describe("engineering-layer composition", () => {
       expect(toolsForProfile({ profile: "analysis", available })).not.toContain("lsp_rename");
       expect(toolsForProfile({ profile: "coding", available })).toContain("lsp_rename");
     } finally {
-      // Registration owns the client's idle reaper even without a server request.
-      await disposeDefaultLspManager();
+      // Shutdown the same loader-isolated module graph that registered the idle reaper.
+      for (const extension of loaded.extensions)
+        for (const shutdown of extension.handlers.get("session_shutdown") ?? [])
+          await shutdown({ type: "session_shutdown" }, createMockCtx({ hasUI: false }));
+      loaded.runtime.invalidate();
     }
   });
 
@@ -295,56 +300,57 @@ describe("engineering-layer composition", () => {
       { cwd: packageRoot() } as ExtensionToolContext)).rejects.toBe(reason);
   });
 
-  test("TODO composition sets only todo model-only and preserves upstream registration", async () => {
-    const upstream = { content: [], details: { tasks: [], nextId: 1 } };
-    const execute = mock(async (..._args: unknown[]) => {
-      return upstream;
-    });
-    const todo: ToolDefinition = Object.freeze({
-      name: "todo", label: "TODO", description: "controlled upstream tool",
-      parameters: Type.Object({}), execute,
-    });
-    const other = { ...todo, name: "other", exposure: "codemode" as const };
-    const tools: ToolDefinition[] = [];
-    const unsubscribe = () => {};
-    const on = mock(() => unsubscribe), registerCommand = mock(() => {});
-    const handler = async () => {};
-    const command = { description: "controlled command", handler };
-    const pi = {
-      registerTool(tool: ToolDefinition) { tools.push(tool); },
-      on,
-      registerCommand,
-    } as unknown as ExtensionAPI;
-    let forwarded: ExtensionAPI | undefined;
-    const registration = spyOn(rpivTodo, "default").mockImplementation(api => {
-      forwarded = api;
-      api.registerTool(todo);
-      api.registerTool(other);
-      expect(api.on("session_start", handler)).toBe(unsubscribe);
-      api.registerCommand("todos", command);
-    });
+  test("TODO entry uses default exposure and gives projections the tool's commit handle", async () => {
+    const home = mkdtempSync(path.join(tmpdir(), "pitako-entry-composition-"));
+    const originalHome = process.env.HOME, originalXdg = process.env.XDG_CONFIG_HOME;
+    process.env.HOME = home;
+    process.env.XDG_CONFIG_HOME = path.join(home, ".config");
+    const { pi, captured } = createMockPi();
+    const ctx = createMockCtx({ sessionId: "entry-composition", hasUI: false });
+    const registration = spyOn(rpivTodo, "default");
     try {
       const extension = await import("../extensions/todo.ts");
-      extension.default(pi);
+      let projectedCommit: rpivTodo.TodoCommit | undefined;
+      const commit = extension.default(pi, (api, handle) => {
+        expect(api).toBe(pi);
+        expect(captured.tools.has("todo")).toBe(true);
+        projectedCommit = handle;
+      });
       expect(registration).toHaveBeenCalledTimes(1);
-      expect(forwarded!.on).toBe(pi.on);
-      expect(forwarded!.registerCommand).toBe(pi.registerCommand);
-      expect(on).toHaveBeenCalledWith("session_start", handler);
-      expect(registerCommand).toHaveBeenCalledWith("todos", command);
-      expect(tools[0]).toEqual({ ...todo, exposure: "model-only" });
-      expect(tools[0]!.execute).toBe(execute);
-      expect(tools[0]!.parameters).toBe(todo.parameters);
-      const controller = new AbortController(), update = () => {};
-      const ctx = { cwd: packageRoot(), sessionManager: {} } as unknown as ExtensionToolContext, args = {};
-      const result = await tools[0]!.execute("native-id", args, controller.signal, update, ctx);
-      expect(execute).toHaveBeenCalledTimes(1);
-      expect(execute).toHaveBeenCalledWith("native-id", args, controller.signal, update, ctx);
-      expect(result).toBe(upstream);
-      expect(tools[1]).toBe(other);
-      expect(todo.exposure).toBeUndefined();
-      expect(pi.registerTool).not.toBe(forwarded!.registerTool);
+      expect(registration).toHaveBeenCalledWith(pi);
+      expect(projectedCommit).toBe(commit);
+      await captured.events.get("session_start")![0]!({}, ctx);
+      const tool = captured.tools.get("todo")!;
+      expect(tool.exposure).toBeUndefined();
+      expect(captured.commands.has("todos")).toBe(true);
+      const synced = projectedCommit!("entry-composition", "execute:composition", [{
+        action: "sync", owner: "execute:composition", seq: 1,
+        rows: [{ key: "task", subject: "projection row", status: "pending" }],
+      }]);
+      expect(synced.error).toBeUndefined();
+      expect(synced.changed).toBe(true);
+      expect(captured.entries).toEqual([{
+        customType: "pitako-todo-state",
+        data: { version: 1, tasks: synced.state.tasks, nextId: 2 },
+      }]);
+      const list = await tool.execute("list", { action: "list" }, undefined, undefined, ctx);
+      expect(list.details).toMatchObject({ tasks: synced.state.tasks, nextId: 2 });
+      expect(captured.entries).toHaveLength(1);
+      const created = await tool.execute("nested-call", { action: "create", subject: "tool row" }, undefined, undefined, ctx);
+      expect((created.details as TaskDetails).tasks.map(row => row.subject)).toEqual(["projection row", "tool row"]);
+      expect(captured.entries).toHaveLength(2);
+      expect(captured.entries[1]).toEqual({ customType: "pitako-todo-state", data: {
+        version: 1, tasks: (created.details as TaskDetails).tasks, nextId: 3,
+      } });
+      expect(commit("entry-composition", undefined, [{ action: "list", params: {} }]).state.tasks)
+        .toEqual((created.details as TaskDetails).tasks);
+      expect(captured.entries).toHaveLength(2);
     } finally {
+      await captured.events.get("session_shutdown")?.[0]?.({}, ctx);
       registration.mockRestore();
+      if (originalHome === undefined) delete process.env.HOME; else process.env.HOME = originalHome;
+      if (originalXdg === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = originalXdg;
+      rmSync(home, { recursive: true, force: true });
     }
   });
 
@@ -379,7 +385,7 @@ describe("engineering-layer composition", () => {
       "./node_modules/@vndv/pi-codegraph/extensions/codegraph.ts", "./node_modules/pi-lsp-client/src/index.ts",
       "./extensions/todo.ts"]) expect(manifest.extensions).toContain(entry);
     expect(manifest.extensions.filter((entry: string) => entry === "./extensions/todo.ts")).toHaveLength(1);
-    expect(manifest.extensions).not.toContain("./node_modules/@juicesharp/rpiv-todo/index.ts");
+    expect(manifest.extensions.some((entry: string) => entry.includes("rpiv-todo"))).toBe(false);
     expect(manifest.extensions.some((entry: string) => entry.includes("ponytail"))).toBe(false);
     const skills = manifest.skills.filter((entry: string) => !entry.includes("node_modules"));
     expect(skills).toEqual(expect.arrayContaining(["./skills/pitako-coding", "./skills/practical", "./skills/principles"]));
@@ -522,8 +528,8 @@ describe("engineering-layer composition", () => {
     const piPackages = new Set([...Object.keys(manifest.devDependencies), ...Object.keys(manifest.peerDependencies)]);
     for (const name of piPackages) {
       if (!name.startsWith("@earendil-works/")) continue;
-      expect(manifest.devDependencies[name]).toBe("1.4.0");
-      expect(manifest.peerDependencies[name]).toBe(">=1.4.0");
+      expect(manifest.devDependencies[name]).toBe("1.5.0");
+      expect(manifest.peerDependencies[name]).toBe(name === "@earendil-works/pi-coding-agent" ? ">=1.5.0" : ">=1.4.0");
     }
     expect(manifest.pi.extensions.filter((entry: string) => entry.includes("pi-subagents")))
       .toEqual(["./node_modules/pi-subagents/bundle/index.js"]);

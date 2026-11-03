@@ -30,9 +30,16 @@ Analysis blocks `ast_rewrite` at the call boundary, including previews and
 codemode calls, while retaining `ast_search`. Architect, reviewer, and scout
 allow only `ast_search`; the worker also allows `ast_rewrite`. These four roles
 explicitly load the extension alongside LSP/CodeGraph.
-`extensions/todo.ts` adapts rpiv-todo registration to make only `todo` model-only,
-available directly to the model but not through codemode.
-Upstream persists mutations as session entries for replay.
+`extensions/todo.ts` is the single Pi entry for the vendored, commit-pinned
+rpiv-todo fork in `vendor/rpiv-todo/`. Pi's default tool exposure makes `todo`
+available to both the model and codemode. The single
+`commit(sessionId, actor, ops)` seam checks ownership and invariants, reduces,
+prunes and enforces limits, commits the store, refreshes the foreground overlay,
+and appends one `pitako-todo-state` entry `{version: 1, tasks, nextId}` per real
+mutation. Reads and no-ops append nothing. Replay also accepts `rpiv-todo-state`
+and legacy `todo` toolResults. The entry builds the commit handle and provides
+an optional projection registration callback with that handle, keeping consumers
+in the same module graph and store instance.
 Board is repository-scoped storage shared by its worktrees.
 Web access and pi-subagents are direct upstream entries.
 No managed workflow guards wrap TODO or Board.

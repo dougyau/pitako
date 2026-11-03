@@ -1,11 +1,11 @@
-import todo from "@juicesharp/rpiv-todo";
+import todo, { type TodoCommit } from "../vendor/rpiv-todo/index.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-export default function todoExtension(pi: ExtensionAPI) {
-  return todo({
-    ...pi,
-    registerTool(tool) {
-      pi.registerTool(tool.name === "todo" ? { ...tool, exposure: "model-only" } : tool);
-    },
-  });
+export type TodoProjectionRegistration = (pi: ExtensionAPI, commit: TodoCommit) => void;
+
+// Register projections here, in the tool's module graph, rather than in another Pi entry.
+export default function todoExtension(pi: ExtensionAPI, registerProjection?: TodoProjectionRegistration): TodoCommit {
+  const commit = todo(pi);
+  registerProjection?.(pi, commit);
+  return commit;
 }

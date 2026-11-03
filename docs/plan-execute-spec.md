@@ -651,14 +651,18 @@ runtime test evidence.
 - [Engineering boundaries](engineering.md),
   [current architecture](architecture.md), and [current review](review.md)
   establish the existing composition and retirement boundary.
-- Installed pi-subagents `0.82.0` documents native missions, script-owned dispatch,
+- Installed pi-subagents `0.84.0` documents native missions, script-owned dispatch,
   explicit child delegation, and async-workflow relaunch in `docs/missions.md`,
   `docs/workflows.md`, `docs/agents.md`, and `docs/extension-api.md`.
   It documents agent-mediated nesting, not `runs.workflow`. Its durable
   recovery is native, not an integration with `pi-durable`.
-- Installed rpiv-todo `2.15.0` partitions TODO storage by session and persists
-  mutations as `rpiv-todo-state` session entries, including calls through codemode.
-  Pitako's `extensions/todo.ts` preserves upstream tool exposure.
+- The vendored rpiv-todo fork under `vendor/rpiv-todo/` is commit-pinned to
+  upstream `ce6d3530410812ca504ec294995581a52170f9e1` (2.15.0), with Pitako's
+  delta recorded separately. `extensions/todo.ts` registers it with Pi's default
+  exposure so both model and codemode calls work. Its single
+  `commit(sessionId, actor, ops)` seam persists one `pitako-todo-state` entry
+  `{version: 1, tasks, nextId}` per real mutation, none for reads or no-ops.
+  Replay also reads `rpiv-todo-state` entries and legacy `todo` toolResults.
 - Historical commit `2d6435d` introduced cross-worktree document discovery.
   The pre-retirement sources at `deffc71`, including `extensions/workflow.ts`,
   `extensions/board/workspace.ts`, and `tests/frozen-plan.test.ts`, describe its

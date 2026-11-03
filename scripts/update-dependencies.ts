@@ -23,6 +23,15 @@ function updateDependencies(root: string): void {
   const identitiesPath = path.join(root, "docs/dependency-releases.json");
   const identitiesSource = readFileSync(identitiesPath, "utf8");
   const identities = JSON.parse(identitiesSource);
+  // The fork is source-pinned: observe upstream drift, never synchronize it.
+  const fork = identities["pitako-todo"];
+  if (fork) {
+    const latest = JSON.parse(execFileSync("npm", [
+      "view", `${fork.npmPackage}@latest`, "--json", "--registry=https://registry.npmjs.org",
+    ], { cwd: root, encoding: "utf8" }));
+    if (latest.version !== fork.version || latest.gitHead !== fork.gitHead)
+      console.log(`Vendored todo upstream drift: ${latest.version} (${latest.gitHead}); retained ${fork.version} (${fork.gitHead}). Manual fork update only.`);
+  }
   let identitiesChanged = false;
   for (const name of names) {
     const version = dependencies[name];
