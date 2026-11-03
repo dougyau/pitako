@@ -45,6 +45,7 @@ workerSchema.properties.restoreReceipt = object({ checkpointRef: string, digest:
   partialRef: string, restoredRef: string, candidate: candidateSchema,
   position: object({ loop: integer, cursor: { type: "integer", minimum: 0 }, phase: { const: "implementation" } }) });
 workerSchema.properties.restoreReceipt.properties.confirmedPause = object({ checkpointRef: string, digest: string });
+workerSchema.properties.restoreReceipt.properties.confirmedUnit = object({ checkpointRef: string, digest: string });
 workerSchema.properties.checkpointReceipt = object({
   kind: { enum: ["unit", "pause"] }, checkpointRef: string, digest: string, candidate: candidateSchema,
   position: object({ loop: integer, cursor: { type: "integer", minimum: 0 }, phase: { const: "implementation" } }),
@@ -2456,7 +2457,8 @@ source is usable only when pending captures are absent: preserve its sealed POST
 and pending position, never its manifest preimages or an unadmitted seal. If attribution/conflict fails, stop.
 Retain returned partialRef/checkpointRef and restored.json in git.checkpoints.
 Return restoreReceipt with the complete actual helper receipt position/candidate/checkpointRef/partialRef,
-plus restoredRef (actual restored.json path) and digest (actual original manifest file SHA-256 from the helper receipt).
+plus restoredRef (actual restored.json path) and digest (actual original manifest file SHA-256 from the helper receipt),
+and its exact confirmedPause or confirmedUnit {checkpointRef, digest} whenever restore.authority carries one.
 This is direct writer execution evidence, not an independent inspector attestation. A settled restore
 receipt means do NOT restore again after later task edits. Then capture the NEW checkpoint below
 before pending work. Complete only this task and run current required checks.
