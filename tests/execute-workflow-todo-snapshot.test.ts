@@ -17,7 +17,7 @@ test("execute todo transitions expose only validated tasks and retain awaited wo
       expect(latest.phases[0].status).toBe("completed");
       expect(latest.tasks.find((task: any) => task.id === latest.active.taskId)).toMatchObject({
         status: "in_progress", metadata: { cancel: "request" }, blockedBy: [],
-        subject: expect.stringContaining("(pasos en vivo no disponibles)"),
+        subject: `${latest.active.taskId} Goal ${latest.active.taskId} (intento 1)`,
       });
       expect(latest.active).toMatchObject({ attempt: 1, workflowKey: request.key });
     }
@@ -30,7 +30,7 @@ test("execute todo transitions expose only validated tasks and retain awaited wo
   const admitted = values.find(value => value.tasks.length);
   expect(admitted.phases[0].status).toBe("completed");
   expect(admitted.tasks.map((task: any) => task.subject)).toEqual([
-    "change1 Goal change1 (pasos en vivo no disponibles)", "final Goal final (pasos en vivo no disponibles)",
+    "change1 Goal change1", "final Goal final",
   ]);
   expect(admitted.tasks[1].blockedBy).toEqual(["change1"]);
   expect(values.some(value => value.tasks.some((task: any) => task.id === "change1" && task.status === "completed"))).toBe(true);

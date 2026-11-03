@@ -404,8 +404,8 @@ function emitTodoSnapshot() {
     const attempt = loop.attempt?.taskId === task.id ? loop.attempt : null;
     const running = attempt?.launch && !["result", "settled"].includes(attempt.stage);
     const status = retained?.completed ? "completed" : running ? "in_progress" : retained?.cancel ? "cancelled" : attempt ? "in_progress" : "pending";
-    // shortcut: explicit async returns only a launch receipt in 0.84; upgrade when a public awaited-async result seam exists.
-    const suffix = `${attempt ? ` (intento ${attempt.number})` : ""} (pasos en vivo no disponibles)`;
+    // Worker steps come from the child session through the main-session projection, not this snapshot.
+    const suffix = attempt ? ` (intento ${attempt.number})` : "";
     return { id: task.id, status, subject: `${task.id} ${task.goal}`.slice(0, 2000 - suffix.length) + suffix,
       blockedBy: task.dependsOn.filter(dependency => !invocation.tasks[dependency.taskId]?.completed).map(dependency => dependency.taskId),
       metadata: { cancel: "request" }, ...(retained?.cancel ? { reason: line(retained.cancel.reason) } : {}) };
@@ -831,7 +831,7 @@ function collect(childKey, agent, display, task, outputSchema, implementation = 
     output: `${childKey}.json`, outputMode: "file-only", reads: false, progress: false,
     skill: ["verify-behavior", ...(scopeDiscipline ? ["scope-discipline"] : [])],
     task: `${label}\n\n${scopeDiscipline ? "Read and apply scope-discipline before expanding work or verification; preserve admitted tasks and gates.\n" : ""}${task}`, outputSchema,
-    // Keep awaited final-result admission; the todo subject explicitly discloses the live-step limitation.
+    // Keep awaited final-result admission; live steps reach the main session from the child session file.
     ...(implementation ? { timeoutMs: 14400000,
       ...(!resume ? { extensionBindings: { "pitako.checkpoint/1": { association: clone(invocation.association), key: loop.attempt.key } } } : {}),
       acceptance: {
@@ -2431,7 +2431,7 @@ No replacement task list elsewhere. Carry the exact association above. Native pe
         let result = await collect(descriptor.key, "pitako.worker",
           { label: task.goal, phase: "implementation" }, `${fullContext()}
 EXECUTE SINGLE TASK. No delegation, next-task selection, private diary/progress file.
-Use todo only to display your own steps, not to mirror the execute plan. Todo is display, not evidence; the structured result stays authoritative. A cancelled or deleted step never drops required work or checks.
+When your task has three or more steps, record them with todo before the first edit and keep their status current. Show only your own steps, not the execute plan. Todo is display, not evidence; the structured result stays authoritative. A cancelled or deleted step never drops required work or checks.
 The workflow owns review and compliance; do not launch or infer another reviewer.
 Preserve required checks and native permissions/Stop. Do not commit or publish unless task authority explicitly permits it.
 COMPLETE SHARED CONTEXT:\n${JSON.stringify(activePlan.sharedContext)}

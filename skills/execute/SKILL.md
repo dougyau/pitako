@@ -386,8 +386,8 @@ The root dispatches fresh ordinary workers sequentially and awaits final results
 never treating async launch receipts as task results or using transcript forks.
 Use explicit async only where the public workflow contract preserves awaited final
 results. In pi-subagents 0.84.0 explicit async returns only a launch receipt, so the
-current workflow retains awaited dispatch and visibly marks task subjects with
-"pasos en vivo no disponibles" rather than silently omitting live steps.
+current workflow retains awaited dispatch. Live worker steps still reach the main
+session: the projection reads the running step's child session file.
 Each implementation attempt uses
 timeoutMs:14400000 (four hours), not a director/root/logical-task deadline.
 Normal worker tools/read/progress defaults remain; execute calls alone set
