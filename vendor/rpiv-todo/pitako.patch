@@ -767,7 +767,7 @@ index ad79f55..82fc384 100644
  			if (newBlockedBy.length) updated.blockedBy = newBlockedBy;
  			else delete updated.blockedBy;
  			if (newMetadata === undefined) delete updated.metadata;
-@@ -302,11 +304,136 @@ export function applyTaskMutation(state: TaskState, action: TaskAction, params:
+@@ -302,11 +304,146 @@ export function applyTaskMutation(state: TaskState, action: TaskAction, params:
  		}
  
  		case "clear": {
@@ -837,10 +837,10 @@ index ad79f55..82fc384 100644
 +		const current = state.tasks.find(t => t.id === params.id);
 +		if (!current) return errorResult(state, params.id === undefined ? `id required for ${action}` : `#${params.id} not found`);
 +		if (current.status === "deleted") return errorResult(state, `#${current.id} is already deleted`);
-+		if (current.status === "cancelled") return errorResult(state, "cancelled is terminal");
++		if (current.status === "cancelled" && !(action === "delete" || action === "update" && params.status === "deleted" && Object.keys(params).every(k => ["action", "id", "status"].includes(k)))) return errorResult(state, "cancelled is terminal except delete");
 +		if (current.status === "completed" && action !== "delete" && !(action === "update" && params.status === "deleted" && Object.keys(params).every(k => ["action", "id", "status"].includes(k)))) return errorResult(state, "completed rows are read-only except delete");
 +		if (current.owner !== actor) {
-+			if (action === "update") return errorResult(state, "only the owner may edit a task");
++			if (action === "update" && !(current.status === "cancelled" && params.status === "deleted")) return errorResult(state, "only the owner may edit a task");
 +			if (current.metadata?.protected === true) return errorResult(state, "task is protected");
 +		}
 +		if (action === "cancel") {
@@ -852,8 +852,17 @@ index ad79f55..82fc384 100644
 +			return {state: changed ? candidate.state : state, op:{kind:"update", id:current.id, fromStatus:current.status, toStatus:updated.status, changed}};
 +		}
 +	}
-+	const reduced = reduceTaskMutation(state, action, params, actor);
++	// The wrapper has validated the one allowed exit from cancelled. Use delete's
++	// existing reduction rather than relaxing the general transition table.
++	const deletingCancelled = action === "update" && params.status === "deleted" && state.tasks.find(t => t.id === params.id)?.status === "cancelled";
++	const reduced = reduceTaskMutation(state, deletingCancelled ? "delete" : action, params, actor);
 +	if (reduced.op.kind === "error") return reduced;
++	const parent = reduced.state.tasks.find(t => t.id === params.id);
++	if ((action === "delete" || action === "update" && params.status === "deleted") && parent?.status === "deleted" && parent.parentId === undefined) {
++		const children = reduced.state.tasks.filter(t => t.parentId === parent.id && t.status !== "deleted");
++		if (children.some(t => t.metadata?.protected === true)) return errorResult(state, "child task is protected");
++		reduced.state = {...reduced.state, tasks:reduced.state.tasks.map(t => children.includes(t) ? {...t,status:"deleted"} : t)};
++	}
 +	const checked = finalizeTaskState(reduced.state);
 +	if (checked.error) return errorResult(state, checked.error);
 +	return {...reduced, state: JSON.stringify(checked.state) === JSON.stringify(state) ? state : checked.state};
@@ -892,12 +901,13 @@ index ad79f55..82fc384 100644
 +		const prior = byKey.get(row.key);
 +		if (prior && (isTerminal(prior) || prior.status === "completed")) continue;
 +		if (row.parentKey !== undefined) {
-+			const parent = incoming.find(t => t.metadata?.key === row.parentKey);
-+			if (!parent) return fail("sync parentKey not found in snapshot");
++			const parent = incoming.find(t => t.metadata?.key === row.parentKey)
++				?? state.tasks.find(t => t.metadata?.key === row.parentKey && t.parentId === undefined && t.status !== "deleted");
++			if (!parent) return fail("sync parentKey must name a top-level non-deleted row");
 +			task.parentId = parent.id;
 +		} else delete task.parentId;
 +	}
-+	const absent = owned.filter(t => !keys.has(String(t.metadata?.key))).map(t => isTerminal(t) ? t : {...t, status:"deleted" as const});
++	const absent = owned.filter(t => !keys.has(String(t.metadata?.key))).map(t => t.status === "deleted" ? t : {...t, status:"deleted" as const});
 +	const replacements = new Map([...incoming, ...absent].map(t => [t.id, t]));
 +	const tasks = state.tasks.map(t => replacements.get(t.id) ?? t);
 +	tasks.push(...incoming.filter(t => !state.tasks.some(prior => prior.id === t.id)));

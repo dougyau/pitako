@@ -94,10 +94,10 @@ try {
     removeRegistrationListener = pi.events.on(RUNTIME_AGENT_REGISTER_EVENT, raw => {
       const request = raw as RuntimeAgentRegistrationRequest;
       assert.equal(request.version, 1);
-      const script = { "pitako.checkout-observer": "observe.mjs", "pitako.execution-ledger": "ledger.mjs" }[request.name];
+      const script = { "pitako.checkout-observer": "observe.mjs", "pitako.execution-ledger": "ledger.mjs", "pitako.request-observer": "observe.mjs" }[request.name];
       assert.ok(script);
       assert.deepEqual(request.definition.runner, { type: "external-cli", command: process.execPath,
-        args: [path.join(root, "skills/execute", script)], promptDelivery: "stdin" });
+        args: [path.join(root, "skills/execute", script), ...(request.name === "pitako.request-observer" ? ["--requests"] : [])], promptDelivery: "stdin" });
       assert.deepEqual(request.definition.tools, []);
       for (const field of ["allowNestedSubagents", "inheritProjectContext", "inheritGlobalContext", "inheritSkills", "defaultAsync"] as const)
         assert.equal(request.definition[field], false);
@@ -133,7 +133,7 @@ try {
       process.send({ ready: true });
       assert.equal(await Bun.stdin.text(), "run");
     }
-    assert.deepEqual([...registered].sort(), mode === "foreground" ? ["pitako.checkout-observer", "pitako.execution-ledger"] : []);
+    assert.deepEqual([...registered].sort(), mode === "foreground" ? ["pitako.checkout-observer", "pitako.execution-ledger", "pitako.request-observer"] : []);
     await session.extensionRunner!.emit({ type: "agent_start" });
     assert.deepEqual(captured.toolDiagnostic()?.missing ?? [], []);
     if (mode === "foreground") {

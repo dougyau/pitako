@@ -378,7 +378,7 @@ describe("workflow-owned execute controller", () => {
       expect(host.current().lastConfirmed).toEqual(point);
       expect(host.history()[0].attempt.restore).toEqual(pending);
     }
-    expect(host.calls.map(call => call.key)).toEqual([...yieldedCalls.map(call => call.key), "invoke-human-1.l1.t2.a2"]);
+    expect(host.calls.filter(call => call.agent !== "pitako.request-observer").map(call => call.key)).toEqual([...yieldedCalls.filter((call: any) => call.agent !== "pitako.request-observer").map((call: any) => call.key), "invoke-human-1.l1.t2.a2"]);
   });
 
   // Human input cannot restore a confirmed pause while its producer currently
@@ -896,7 +896,7 @@ describe("workflow-owned execute controller", () => {
       expect(record.resolutions[0]).toMatchObject({ ...input.resolution, stage: "applied", halt: original.halt });
       expect(host.calls.slice(prior).every(call => (call.key.startsWith("invoke-human-1.l4.") || call.key === "invoke-human-1.l3.gaps"))).toBe(true);
       expect(host.calls.filter(call => call.key.endsWith(".director"))).toHaveLength(4);
-      expect(host.calls.filter(call => call.agent !== "pitako.checkout-observer" && call.agent !== "pitako.execution-ledger").at(-1)?.task).toContain(input.resolution.text);
+      expect(host.calls.filter(call => call.agent !== "pitako.checkout-observer" && call.agent !== "pitako.execution-ledger" && call.agent !== "pitako.request-observer").at(-1)?.task).toContain(input.resolution.text);
     });
 
   test("resolution cannot invent an invocation, clear a scope gap, or replace a pending writer", async () => {
@@ -1661,7 +1661,7 @@ describe("workflow-owned execute controller", () => {
     const sourceRefs = [{ path: "/stable/.pitako/plans/inherited.md", digest: "f".repeat(64) }];
     expect((await host.execute({ sourceRefs })).status).toBe("complete");
     expect(host.current().association.sourceRefs).toEqual(sourceRefs);
-    for (const request of host.calls.filter(call => !call.resume && call.agent !== "pitako.checkout-observer" && call.agent !== "pitako.execution-ledger")) {
+    for (const request of host.calls.filter(call => !call.resume && call.agent !== "pitako.checkout-observer" && call.agent !== "pitako.execution-ledger" && call.agent !== "pitako.request-observer")) {
       expect(request.task).toContain("SELECTED SNAPSHOT INTACT");
       expect(request.task).toContain(JSON.stringify(sourceRefs));
       expect(request.task).toContain("read EVERY referenced source IN FULL");
@@ -2527,6 +2527,7 @@ describe("workflow-owned execute controller", () => {
     }
     if (mode === "absent-witness") for (const value of host.native.values()) delete value.results;
     if (mode.startsWith("direct-")) for (const value of host.native.values()) {
+      if (!value.structuredOutput?.tasks) continue;
       const binding = copy(value.structuredOutput);
       if (mode === "direct-conflict") binding.tasks[0].scope = ["conflicting-native-binding"];
       value.output = JSON.stringify(binding);

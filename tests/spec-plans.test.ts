@@ -279,9 +279,11 @@ describe("spec-plan discovery and concrete input", () => {
     const unborn = path.join(base, "unborn"); mkdirSync(unborn); git(unborn, "init", "-q");
     expect(invoke(unborn, "root")).toEqual({ physicalRoot: unborn, identity: path.join(unborn, ".git") });
     expect(() => invoke(unborn)).toThrow(); // Root-only planning does not weaken strict execution.
-    const source = put(sibling, spec() + "é中😀\n".repeat(700));
+    // Two chunks cover installed UTF-8 transport; the repo-path test below covers the larger fixture.
+    const source = put(sibling, spec() + "é中😀\n".repeat(200));
     const before = checkoutEvidence(main), selected = invoke(main);
     expect(selected.root).toBe(main); expect(selected.selected.source).toBe(source);
+    expect(selected.selected.chunks).toBeGreaterThan(1);
     let content = "";
     for (let index = 0; index < selected.selected.chunks; index++) {
       const chunk = invoke(main, String(index)); expect(chunk.digest).toBe(selected.selected.digest); content += chunk.content;
@@ -296,6 +298,7 @@ describe("spec-plan discovery and concrete input", () => {
     const inspect = (...extra: string[]) => JSON.parse(execFileSync("node", [script, main, "demo", "", ...extra], { encoding: "utf8" }));
     const before = checkoutEvidence(main);
     const first = inspect(); expect(inspect()).toEqual(first);
+    expect(first.selected.chunks).toBeGreaterThan(1);
     expect(checkoutEvidence(main)).toEqual(before);
     let captured = "";
     for (let part = 0; part < first.selected.chunks; part++) {
@@ -306,8 +309,9 @@ describe("spec-plan discovery and concrete input", () => {
     expect(digest(captured)).toBe(first.selected.digest);
     expect(specChunks(captured).join("")).toBe(captured);
     writeFileSync(source, spec() + "Changed objective context");
-    expect(inspect().selected.digest).not.toBe(first.selected.digest);
-    expect(inspect().root).toBe(main);
+    const changed = inspect();
+    expect(changed.selected.digest).not.toBe(first.selected.digest);
+    expect(changed.root).toBe(main);
   });
 
   test("oversized combined inspection metadata fails explicitly without truncating accepted specs", () => {

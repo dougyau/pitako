@@ -227,6 +227,20 @@ describe("engineering-layer composition", () => {
       // Context management stays wired without model-directed preflight guidance.
       expect(body).not.toMatch(/ACP|billion-context-pi|acp_status|native-compaction/);
       expect(plan.fanoutAuthorized).toBe(false);
+      expect(plan.requiredChildTools.includes("todo")).toBe(role === "worker");
+      expect(plan.extensionArgs.includes(path.join(packageRoot(), "extensions/todo.ts"))).toBe(role === "worker");
+      if (role === "worker") {
+        const instructions = body.replace(/\s+/g, " ");
+        expect(instructions).toContain("`todo` only to display your own task steps");
+        expect(instructions).toContain("structured result stays authoritative");
+        expect(instructions).toContain("cancelled or deleted step never drops required work or checks");
+        const prompt = readRepo("skills/execute/workflow.js");
+        expect(prompt).toContain("Todo is display, not evidence");
+        expect(prompt).toContain("cancelled or deleted step never drops required work or checks");
+        const skill = readRepo("skills/execute/SKILL.md").replace(/\s+/g, " ");
+        for (const instruction of ["Do not mirror execute rows", "via `todo`", "pasos en vivo no disponibles", "pitako.request-observer", "observe.mjs --requests", "never as human intent"])
+          expect(skill).toContain(instruction);
+      }
       const usesAstGrep = ["architect", "reviewer", "scout", "worker"].includes(role);
       expect(plan.requiredChildTools.includes("ast_search")).toBe(usesAstGrep);
       expect(plan.requiredChildTools.includes("ast_rewrite")).toBe(role === "worker");
@@ -298,6 +312,16 @@ describe("engineering-layer composition", () => {
     // The provider awaits sampler disposal before this rejection settles.
     await expect(observer.execute("cancelled-resource", {}, cancellation.signal, undefined,
       { cwd: packageRoot() } as ExtensionToolContext)).rejects.toBe(reason);
+  });
+
+  test("TODO entry registers the execute projection by default without requiring a UI", async () => {
+    const {pi,captured}=createMockPi();
+    const extension=await import("../extensions/todo.ts");
+    expect(typeof extension.default(pi)).toBe("function");
+    expect(captured.events.get("session_start")).toHaveLength(2);
+    expect(captured.events.get("tool_result")).toHaveLength(1);
+    expect(captured.events.get("message_end")).toHaveLength(1);
+    // No session was started, so no watches or asynchronous work exist.
   });
 
   test("TODO entry uses default exposure and gives projections the tool's commit handle", async () => {
@@ -472,7 +496,7 @@ describe("engineering-layer composition", () => {
     expect(note).toContain("Load a specialized skill only when it applies.");
     expect(note).toContain("Research or design does not authorize implementation.");
     // Include authority/provenance and shared TODO policy, not workflow bodies.
-    expect(note.length).toBeLessThan(3200);
+    expect(note.length).toBeLessThan(3400);
     for (const marker of THIRD_PARTY_ALWAYS_ON_MARKERS) {
       expect(note).not.toContain(marker);
     }

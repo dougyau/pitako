@@ -248,7 +248,10 @@ subagent({
 Use the registered resource, not raw sandbox code to evade capacity. Missing
 registration requires package reload, not fallback. Installed version alone does
 not prove a running host reloaded. Return control after admission; do not poll,
-add watchers, maintain foreground Preparation/Loop TODOs, or supervise each task.
+add watchers or supervise each task. The projection updates execute-owned phases,
+validated tasks and worker steps in the main todo list without model turns. Do not
+mirror execute rows yourself; you may cancel or delete task/step rows via `todo`.
+Phase rows are protected; deleting finished rows only hides history.
 Use status/mission.show only for exceptional diagnosis. Attend indispensable
 human decisions and Stop, then present native progress and the full result
 (read its exact native artifact if preview truncates). No extra model or final
@@ -380,13 +383,21 @@ including WIP. This design direction adds no worktree engine, concurrency,
 integration or commit policy.
 
 The root dispatches fresh ordinary workers sequentially and awaits final results,
-never async child receipts or transcript forks. Each implementation attempt uses
+never treating async launch receipts as task results or using transcript forks.
+Use explicit async only where the public workflow contract preserves awaited final
+results. In pi-subagents 0.84.0 explicit async returns only a launch receipt, so the
+current workflow retains awaited dispatch and visibly marks task subjects with
+"pasos en vivo no disponibles" rather than silently omitting live steps.
+Each implementation attempt uses
 timeoutMs:14400000 (four hours), not a director/root/logical-task deadline.
 Normal worker tools/read/progress defaults remain; execute calls alone set
 reads:false, progress:false and explicit native acceptance-suppression reason
 because the root owns checks/review/compliance. This does not waive required
-checks or native permissions. Workers write no diaries/private TODOs, choose no
-next task and launch no reviewer. They report task/attempt, work done, concrete
+checks or native permissions. Workers write no diaries, choose no next task and
+launch no reviewer. Their `todo` tool displays only their own steps, projected
+under the active task; it is not evidence. The structured result is authoritative,
+and a cancelled or deleted step never drops required work or checks. They report
+task/attempt, work done, concrete
 pending work, causal diagnosis, Git/checkpoints/WIP, actual command/cwd/output/
 logs/result and checkoutEvidence identity around checks and after final writes.
 The plan owns canonical check requirements by ID; optional descriptive echoes
@@ -450,6 +461,19 @@ child capacity is distinct from host grants; exhaustion preserves phase/work/
 refs and returns incomplete, not skipped phases, slot renewal or another mission.
 No capacity overrides or private budget replace native limits.
 
+
+### Deterministic request observation
+
+The projection derives idempotent cancel/delete requests from main todo state in
+`requests.jsonl` beside the invocation ledger. Before every worker dispatch, retry
+or continuation, `pitako.request-observer` runs the model-free `observe.mjs --requests`
+mode, registered by `extensions/plan-execute.ts`. The workflow persists observed
+cancellation and dependent cascades before acting or emitting; replays are no-ops.
+Requests do not interrupt an active attempt (native Stop still does); they prevent
+further attempts/continuations. Later loops exclude that scope and result/compliance
+report "cancelled by main-session request" with origin, never as human intent.
+Worker-step cancel/delete is sticky in main; best-effort steer and its receipt do
+not waive checks or replace the structured result.
 
 ### Deterministic ordinary closing
 

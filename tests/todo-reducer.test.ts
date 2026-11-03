@@ -60,7 +60,8 @@ describe("actor-aware todo reducer", () => {
 		for (const status of ["cancelled", "deleted"] as const) {
 			const terminal = state(task(1, {owner, status, metadata:{key:"a"}}));
 			rejects(terminal, "update", {id:1, status:"pending"}, owner);
-			rejects(terminal, "delete", {id:1}, owner);
+			if (status === "deleted") rejects(terminal, "delete", {id:1}, owner);
+			else expect(mutate(terminal, "delete", {id:1}, owner).state.tasks[0].status).toBe("deleted");
 			const updated = sync(terminal, owner, owner, 1, [row("a", {subject:"revive"})]);
 			expect(updated.state).toBe(terminal);
 			expect(updated.changed).toBe(false);
@@ -84,7 +85,8 @@ describe("actor-aware todo reducer", () => {
 		expect(created.state.tasks.map(t => t.id)).toEqual([1,3,2]);
 		rejects(original, "create", {subject:"missing", parentId:99});
 		rejects(created.state, "create", {subject:"nested", parentId:3});
-		rejects(created.state, "delete", {id:1});
+		const deleted = mutate(created.state, "delete", {id:1});
+		expect(deleted.state.tasks.map(t => [t.id,t.status])).toEqual([[1,"deleted"],[3,"deleted"],[2,"pending"]]);
 		rejects(created.state, "update", {id:1, status:"completed"});
 		const scopedChild = state(task(1), task(2, {owner, parentId:1}));
 		rejects(scopedChild, "clear", {});
@@ -174,6 +176,39 @@ describe("actor-aware todo reducer", () => {
 		expect(revived.state.nextId).toBe(first.state.nextId);
 	});
 
+	it("sync resolves existing top-level parent keys across owners without changing their rows", () => {
+		for (const parentOwner of [owner, "worker:other:task:1", undefined]) {
+			const parent = task(1, {owner:parentOwner, status:"in_progress", metadata:{key:"plan"}});
+			const input = state(parent);
+			const before = JSON.stringify(input);
+			const rows = [row("step", {parentKey:"plan", status:"in_progress"})];
+			const result = sync(input, worker, worker, 1, rows);
+			expect(result.error).toBeUndefined();
+			expect(result.state.tasks.map(t => t.id)).toEqual([1,2]);
+			expect(result.state.tasks[1]).toMatchObject({owner:worker, parentId:1, metadata:{key:"step"}});
+			expect(JSON.stringify(input)).toBe(before);
+			expect(result.state.tasks[0]).toBe(parent);
+			expect(sync(result.state, worker, worker, 2, rows, 1).changed).toBe(false);
+		}
+	});
+
+	it("sync fallback rejects missing, deleted and nested parents atomically and prefers snapshot parents", () => {
+		for (const input of [state(), state(task(1, {owner, status:"deleted", metadata:{key:"plan"}})), state(task(1, {owner}), task(2, {owner, parentId:1, metadata:{key:"plan"}}))]) {
+			const before = JSON.stringify(input);
+			const result = sync(input, worker, worker, 2, [row("step", {parentKey:"plan"})], 1);
+			expect(result.error).toBeDefined();
+			expect(result.state).toBe(input);
+			expect(result.changed).toBe(false);
+			expect(result.lastSyncSeq).toBe(1);
+			expect(JSON.stringify(input)).toBe(before);
+		}
+		const input = state(task(1, {owner, metadata:{key:"plan"}}));
+		const result = sync(input, worker, worker, 1, [row("step", {parentKey:"plan"}), row("plan")]);
+		expect(result.error).toBeUndefined();
+		expect(result.state.tasks.find(t => t.metadata?.key === "step")?.parentId).toBe(3);
+		expect(result.state.tasks[0]).toBe(input.tasks[0]);
+	});
+
 	it("owner cancellation by update and sync cannot be undone by later snapshots", () => {
 		const initial = sync(state(), owner, owner, 1, [row("a")]);
 		const cancelled = mutate(initial.state, "update", {id:1, status:"cancelled"}, owner);
@@ -183,7 +218,7 @@ describe("actor-aware todo reducer", () => {
 		const deleted = sync(completed.state, owner, owner, 2, [row("done", {status:"deleted", subject:"ignored"})], 1);
 		expect(deleted.state.tasks[0]).toMatchObject({subject:"done", status:"deleted"});
 		const directly = sync(state(), owner, owner, 1, [row("a", {status:"cancelled"})]);
-		expect(sync(directly.state, owner, owner, 2, [], 1).state.tasks[0].status).toBe("cancelled");
+		expect(sync(directly.state, owner, owner, 2, [], 1).state.tasks[0].status).toBe("deleted");
 		const requested = mutate(initial.state, "update", {id:1, metadata:{cancel:"request"}}, owner);
 		const pending = mutate(requested.state, "cancel", {id:1});
 		const refreshed = sync(pending.state, owner, owner, 2, [row("a")], 1);
@@ -198,4 +233,49 @@ describe("actor-aware todo reducer", () => {
 			expect(result.lastSyncSeq).toBeUndefined();
 		}
 	});
+});
+
+// Human amendment: cancelled history can hide, but cannot revive or change fields.
+it("cancelled-to-deleted fork prerequisite honors ownership and sync omission", () => {
+ const original = state(task(1, {owner, status:"cancelled", metadata:{key:"a"}}));
+ for (const actor of [owner, undefined, worker]) {
+  for (const action of ["delete", "update"] as const) {
+   const result = mutate(original, action, {id:1, ...(action === "update" ? {status:"deleted" as const} : {})}, actor);
+   expect(result.op.kind).not.toBe("error");
+   expect(result.state.tasks[0]).toEqual({...original.tasks[0],status:"deleted"});
+  }
+  for (const status of ["pending","in_progress","completed","cancelled"] as const)
+   rejects(original,"update",{id:1,status},actor);
+  rejects(original,"update",{id:1,status:"deleted",subject:"edit"},actor);
+  rejects(original,"update",{id:1,metadata:{edit:true}},actor);
+ }
+ const protectedRow = state({...original.tasks[0],metadata:{key:"a",protected:true}});
+ rejects(protectedRow,"delete",{id:1});
+ rejects(protectedRow,"update",{id:1,status:"deleted"});
+ expect(mutate(protectedRow,"delete",{id:1},owner).state.tasks[0].status).toBe("deleted");
+ const present = sync(original,owner,owner,1,[row("a",{status:"deleted",subject:"changed"})]);
+ expect(present.state).toBe(original);
+ const absent = sync(original,owner,owner,2,[]);
+ expect(absent.error).toBeUndefined();
+ expect(absent.state.tasks[0]).toEqual({...original.tasks[0],status:"deleted"});
+ expect(sync(absent.state,owner,owner,3,[row("a")]).state).toBe(absent.state);
+});
+
+it("parent delete cascades across owners, including completed and cancelled children, atomically", () => {
+ for (const action of ["delete", "update"] as const) for (const actor of [owner, undefined]) {
+  const original=state(task(1,{owner}),task(2,{owner:worker,parentId:1,status:"pending"}),task(3,{owner:worker,parentId:1,status:"completed"}),task(4,{owner:worker,parentId:1,status:"cancelled"}),task(5,{owner:worker,parentId:1,status:"deleted"}));
+  const params={id:1,...(action==="update" ? {status:"deleted" as const} : {})};
+  if(action==="update" && actor!==owner) {rejects(original,action,params,actor);continue;}
+  const result=mutate(original,action,params,actor);
+  expect(result.op.kind).not.toBe("error");
+  expect(result.state.tasks.every(t=>t.status==="deleted")).toBe(true);
+  expect(result.state.nextId).toBe(original.nextId);
+  expect(original.tasks[0].status).toBe("pending");
+  const protectedChild=state(original.tasks[0],{...original.tasks[1],metadata:{protected:true}});
+  rejects(protectedChild,action,params,actor);
+  const alone=state(original.tasks[0]);
+  expect(mutate(alone,action,params,actor).state.tasks[0]).toEqual({...alone.tasks[0],status:"deleted"});
+ }
+ const protectedParent=state(task(1,{owner,metadata:{protected:true}}),task(2,{owner:worker,parentId:1}));
+ rejects(protectedParent,"delete",{id:1});
 });
