@@ -435,6 +435,8 @@ function create(intent: CheckpointIntent, kind: "pre" | "unit" | "pause", paths?
   if (!["pre", "unit", "pause"].includes(kind)) throw new Error("Invalid checkpoint point kind.");
   const progress = admittedProgress(intent);
   const directory = checkpointDirectory(intent), manifestRef = path.join(directory, "manifest.json");
+  if (kind !== "pre" && !existsSync(manifestRef))
+    throw new Error("No pre capture exists for this attempt; there are no captured effects to seal. A task without checkout writes returns without checkpointReceipt.");
   let existed = existsSync(kind === "pre" ? manifestRef : path.join(directory, `${kind}.json`));
   if (kind === "pre") {
     if (!paths?.length || new Set(paths).size !== paths.length) throw new Error("Checkpoint needs unique exact affected paths.");

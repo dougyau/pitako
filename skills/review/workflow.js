@@ -371,7 +371,8 @@ Findings, however severe, and defects that prevent a clear result are reported w
                 (item.decision === "discard" || ["out-of-scope", "related-improvement"].includes(item.classification))))) ||
               (screening.verdict === "clear" && screening.assessments.some(entry => entry.material)) ||
               (screening.verdict === "material-gaps" && !screening.assessments.some(entry => entry.material)))
-            throw new Error("Execute screening contradicts dispositions or lacks consequences.");
+            throw new Error(`Execute screening contradicts dispositions or lacks consequences.${screening.assessments.filter(entry => entry.material && value.dispositions.some(item => item.findingId === entry.findingId &&
+              (item.decision === "discard" || ["out-of-scope", "related-improvement"].includes(item.classification)))).map(entry => ` ${entry.findingId}`).join("")}`);
         }
         break;
       }
@@ -522,6 +523,7 @@ No supported findings is valid, but does not prove unrun tests or merge readines
 ${mode === "execute" ? `Also provide reasoned screening: clear, material-gaps, or blocked.
     Account for each disposition in assessments, citing the applicable requirement source (not a literal copy), concrete
     consequence, and why it is or is not material to this candidate within the agreed scope.
+    A discarded duplicate, out-of-scope or related-improvement finding is assessed material:false; the kept finding carries its consequence.
     Include means substantiated, NOT material. Completed phases, green checks or zero findings
     are NOT acceptance. Clear permits a separate whole-spec compliance analysis; it does not
     prove fulfillment. Use blocked when missing evidence prevents a reasoned screening.` : ""}`,

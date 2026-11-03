@@ -1337,15 +1337,21 @@ function workerValue(result, descriptor, task, statusRef) {
       throw rejectReport("Check command/cwd/output/result differs from loop_plan.");
     // Only planned checks attest to the candidate. Diagnostic identities may be
     // unknown or non-verifiable; preserve them without normalization.
+    const identity = field => {
+      try { return candidate(check[field]); } catch (_) {
+        throw rejectReport(`Planned check ${check.id} lacks checkoutEvidence ${field} identity; complete needs captured before/after for every planned check.`);
+      }
+    };
     return definition ? { ...check, requirement: definition.requirement,
-      ...(value.status === "complete" ? { before: reportCandidate(check.before), after: reportCandidate(check.after) } : {}) } : { ...check };
+      ...(value.status === "complete" ? { before: identity("before"), after: identity("after") } : {}) } : { ...check };
   });
   // Historical diagnostics retain their evidence without becoming new mandatory gates.
-  const checksCurrent = checks.filter(check => task.checks.some(required => required.id === check.id))
-    .every(check => check.result === "passed" &&
-      same(check.before, value.candidate) && same(check.after, value.candidate));
+  const staleChecks = checks.filter(check => task.checks.some(required => required.id === check.id))
+    .filter(check => check.result !== "passed" ||
+      !same(check.before, value.candidate) || !same(check.after, value.candidate)).map(check => check.id);
+  const checksCurrent = staleChecks.length === 0;
   if (value.status === "complete" && (!checksCurrent || value.remaining.length))
-    throw rejectReport("Task complete contradicts current mandatory checks or pending work.");
+    throw rejectReport(`Task complete contradicts current mandatory checks or pending work.${staleChecks.length ? ` Non-current planned checks: ${staleChecks.join(", ")}.` : ""}${value.remaining.length ? " Pending work remains." : ""}`);
   return { value, checks, checksCurrent };
 }
 function admitWorker(result, descriptor, task, recoveryRef, statusRef) {
@@ -2048,6 +2054,7 @@ Every task includes dependsOn: [{taskId, reason}] for necessary justified earlie
 or [] when none. Prefer independent outcomes, not artificial fragments; scope/effects declare
 shared resources, not concurrency authority.
 Inspection/check-only tasks, or tasks that may finish without edits, are verification.
+Planned checks gate the task's FINAL candidate after its last write; pre-edit diagnosis belongs in goal/expectedResult, not checks.
 Use implementation only for a concrete editing repair requiring real pre-write capture and sealed file/progress checkpoint.
 Include a LAST verification task for final checks after all writes even when the implementation already exists. Shared context is complete.
 No replacement task list elsewhere. Carry the exact association above. Native permissions and Stop apply.`,
@@ -2278,6 +2285,7 @@ The manifest limits rollback, not scope. If another affected path is needed, ret
 same-task continuation before writing it; the next attempt captures a new unit.
 Capture failure means no modifying work. Existing artifacts require reconciliation, never overwrite.
 Retain checkpoint refs in git.checkpoints. Never restore a unit with an admitted complete result.
+Verification tasks are not checkpoint units: without checkout writes, do not call checkpoint_create and return no checkpointReceipt; if writing, capture pre first and seal as usual.
 After all owned writes settle, call checkpoint_create({kind:"unit"}) for a completed implementation unit.
 Seal kind must match status: unit only with status complete; blocked, continue or gaps use pause.
 Status and remaining describe THIS task; inherited mission gaps outside its scope go in diagnosis.
@@ -2309,6 +2317,7 @@ Identify each check by its admitted ID. Requirement wording comes from the plan;
 requirement echo is descriptive only. Never replace execution evidence with an ID or native ok.
 Additional diagnostic checks use distinct IDs and retain actual results; they are not new mandatory gates.
 Use null for uncaptured diagnostic before/after identities; retain declared identities without inventing hashes.
+Bracket EVERY planned check, including tool-call checks such as file_sha256 or git_status, with checkoutEvidence; capture it immediately before the first planned check. One capture may serve as after of one check and before of the next only if nothing runs in between. Null identities are allowed only for diagnostic checks; a planned check without captured before/after must be re-run bracketed, never reported complete.
 Do not conceal material defects in diagnostics: report them as pending work. Only planned checks determine mandatory currency.
 Use existing extensions/spec-plans.ts checkoutEvidence(root) identity BEFORE/AFTER checks and AFTER LAST writes;
 include head/fingerprint candidate. A check only passes for that unchanged final candidate (including WIP).

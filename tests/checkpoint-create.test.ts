@@ -81,7 +81,11 @@ test("registered checkpoint_create captures actual WIP, untracked bytes, absence
 });
 
 test.each(["unit", "pause"] as const)("%s seal has actual journaled bytes but no task admission or root cursor effect", async kind => {
-  const f = fixture(); const pre = await f.call("pre", paths), state = readFileSync(f.statePath, "utf8");
+  const f = fixture();
+  expect(await f.call(kind)).toMatchObject({ ok: false, error: { message: "No pre capture exists for this attempt; there are no captured effects to seal. A task without checkout writes returns without checkpointReceipt." } });
+  expect(existsSync(checkpointDirectory(f.intent))).toBe(false);
+  expect(existsSync(path.join(checkpointDirectory(f.intent), "unit.json"))).toBe(false);
+  const pre = await f.call("pre", paths), state = readFileSync(f.statePath, "utf8");
   applyCheckpoint(f.intent, [{ path: "modified", image: { bytes: Buffer.from("owned change").toString("base64"), mode: 0o644 } }]);
   const sealed = await f.call(kind);
   expect(sealed).toMatchObject({ ok: true, confirmed: false, kind, position: { cursor: kind === "unit" ? 1 : 0 }, checkpointReceipt: { kind } });
