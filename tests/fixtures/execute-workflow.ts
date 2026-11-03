@@ -165,6 +165,9 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
   function normal(request: Request): Result {
     const loop = Number(request.key.match(/\.l(\d+)\./)?.[1] ?? 1);
     let value: any;
+    if (request.agent === "pitako.request-observer") return { ok: true, agent: request.agent,
+      runId: `native-${request.key}`, output: JSON.stringify({ version: 1, ok: true,
+        invocation: JSON.parse(request.task).invocation, requests: [], next: null }), results: [{ index: 0, agent: request.agent!, task: request.task, exitCode: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } }] };
     if (request.agent === "pitako.execution-ledger") {
       const { invocation, ...append } = JSON.parse(request.task);
       return { ok: true, key: request.key, agent: request.agent, runId: `native-${request.key}`,

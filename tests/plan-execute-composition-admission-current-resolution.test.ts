@@ -229,7 +229,7 @@ describe("plan/execute packaged composition", () => {
           if (query) response.structuredOutput.sharedContext.material = "中😀\"\n'; globalThis.recoveryInjected = true; //".repeat(3000);
           originalPlan = structuredClone(response.structuredOutput);
         }
-        if (request.agent === "pitako.checkout-observer") return response;
+        if (request.agent === "pitako.checkout-observer" || request.agent === "pitako.request-observer") return response;
         if (request.phase?.startsWith("review-")) Object.assign(response,
           childResponse(key, request, metadata, observedCandidate(), 1, response.structuredOutput));
         const native = path.join(nativeRoot, response.runId), file = path.join(native, "structured-output/original.json");
@@ -338,7 +338,7 @@ describe("plan/execute packaged composition", () => {
           if (input.queryMode === "persistence" && value.loop?.recoveries?.[0]?.stage === "observed") throw Error("Controlled retained-original save failure");
           storage.set(key, structuredClone(value));
         } },
-        launch: async (key, request) => { calls.push(key); if (request.agent === "pitako.checkout-observer") publications.push(JSON.parse(request.task)); let value = input.children[key]; if (!value) throw Error("Forbidden relaunch: " + key);
+        launch: async (key, request) => { calls.push(key); if (request.agent === "pitako.checkout-observer") publications.push(JSON.parse(request.task)); let value = request.agent === "pitako.request-observer" ? (${childResponse.toString()})(key, request, input.metadata, input.checkout) : input.children[key]; if (!value) throw Error("Forbidden relaunch: " + key);
           if (request.phase?.startsWith("review-")) value = (${childResponse.toString()})(key, request, input.metadata, input.checkout, 1, value.structuredOutput);
           return value; },
         status: async ref => { statuses.push(ref); return { key: ref, runId: ref, ok: true, output: input.queryMode === "unknown-settlement" ? "Current settlement unavailable" : "Run: " + ref + "\\nState: complete", results: [] }; },
@@ -373,7 +373,7 @@ describe("plan/execute packaged composition", () => {
       if (queryMode === "persistence") expect(recovered.result.value.reason).toContain("Essential persistence failed");
       expect(recovered.bytes).toHaveLength(1);
       expect(recovered.bytes.every((bytes: number) => bytes <= 4096)).toBe(true);
-      expect(recovered.calls).toEqual(succeeds ? Object.keys(queryChildren) : []);
+      expect(recovered.calls.filter((key: string) => !key.includes(".requests-"))).toEqual(succeeds ? Object.keys(queryChildren) : []);
       expect(recovered.calls.some((key: string) => key.includes(".recover") || key.endsWith(".director"))).toBe(false);
       const after = new Map<string, any>(recovered.storage).get("invoke-human-1");
       expect(after.association).toEqual(before.association);
@@ -1153,7 +1153,7 @@ describe("plan/execute packaged composition", () => {
       state: { get: key => storage.get(key), set: (key, value) => { storage.set(key, structuredClone(value)); } },
       launch: async (key, request) => {
         if (key.endsWith(".director")) expect(request.task).toContain(JSON.stringify(selected.source));
-        if (!request.resume && request.agent !== "pitako.checkout-observer") expect(request.task).toContain(content);
+        if (!request.resume && request.agent !== "pitako.checkout-observer" && request.agent !== "pitako.request-observer") expect(request.task).toContain(content);
         return childResponse(key, request, metadata, checkout, 3);
 
       },
@@ -1328,7 +1328,7 @@ A1 supersedes native-resume-first recovery; preserve the missing historical befo
         expect(request.cwd).toBe(root); expect(request.outputSchema).toBeDefined();
         const response = childResponse(key, request, metadata, checkout);
         if (key.endsWith(".director")) response.structuredOutput.sharedContext = amendmentContext;
-        else if (!request.resume && request.agent !== "pitako.checkout-observer" && request.agent !== "pitako.execution-ledger") {
+        else if (!request.resume && request.agent !== "pitako.checkout-observer" && request.agent !== "pitako.execution-ledger" && request.agent !== "pitako.request-observer") {
           expect(request.task, key).toContain(amendmentPath);
           expect(request.task, key).toContain(digest(amendmentBody));
           expect(request.task, key).toContain("Current human delivered A1 before plan publication");
@@ -1344,7 +1344,7 @@ A1 supersedes native-resume-first recovery; preserve the missing historical befo
       },
     });
     expect(result.value).toMatchObject({ status: "complete", loopsConsumed: 1, actionRequired: "none" });
-    expect(calls.map(call => call.key)).toEqual(["invoke-human-1.l1.director", "invoke-human-1.l1.t1.a1",
+    expect(calls.filter(call => call.agent !== "pitako.request-observer").map(call => call.key)).toEqual(["invoke-human-1.l1.director", "invoke-human-1.l1.t1.a1",
       "invoke-human-1.l1.review.director-prepare", "invoke-human-1.l1.review.independent-a", "invoke-human-1.l1.review.independent-b",
       "invoke-human-1.l1.review.director-synthesis", "invoke-human-1.l1.compliance", "invoke-human-1.l1.checkout"]);
     expect(inspections).toEqual(["inspect-initial"]);
@@ -1366,7 +1366,7 @@ A1 supersedes native-resume-first recovery; preserve the missing historical befo
       return [agent.name.replace("pitako.", ""), buildEffectiveSystemPrompt({ agent, resolvedSkills: resolved, cwd: root })];
     }));
     const priorContexts = new Map<string, string>();
-    for (const call of calls.filter(call => call.agent !== "pitako.checkout-observer")) {
+    for (const call of calls.filter(call => call.agent !== "pitako.checkout-observer" && call.agent !== "pitako.request-observer")) {
       const role = (call.agent ?? "pitako.reviewer").replace("pitako.", "");
       const assembled = [read("AGENTS.md"), bodies.get(role),
         call.resume ? priorContexts.get(call.resume) : "", call.task].join("\n");
@@ -1407,7 +1407,7 @@ A1 supersedes native-resume-first recovery; preserve the missing historical befo
     expect(retained.loop.plan.ref).toBeDefined();
     expect(readFileSync(amendmentPath, "utf8")).toBe(amendmentBody);
     expect(calls[0].task).toContain("then END");
-    expect(calls[1]).toMatchObject({ reads: false, progress: false, timeoutMs: 14400000, acceptance: { level: "none" } });
+    expect(calls.find(call => call.agent === "pitako.worker")).toMatchObject({ reads: false, progress: false, timeoutMs: 14400000, acceptance: { level: "none" } });
     for (const instructions of [profileNote("coding"), read("skills/pitako-coding/SKILL.md"), read("prompts/execute.md"), read("skills/execute/SKILL.md")])
       expect(instructions).not.toContain("Only the execution director delegates");
     for (const role of ["worker", "execution-inspector"]) {
@@ -1625,7 +1625,7 @@ A1 supersedes native-resume-first recovery; preserve the missing historical befo
       "../skills/language/rust-port",
     ]);
     expect(worker.extensions).toEqual(["../extensions/acp.ts"]);
-    expect(worker.subagentOnlyExtensions).toEqual(["../extensions/dev-tools/index.ts", "../extensions/file-sha256.ts", "../extensions/checkpoint-create.ts", "../node_modules/@vndv/pi-codegraph/extensions/codegraph.ts", "../node_modules/pi-lsp-client/src/index.ts", "../node_modules/@nicknisi/pi-ast-grep/index.ts", "../node_modules/pi-codex-tools/index.ts"]);
+    expect(worker.subagentOnlyExtensions).toEqual(["../extensions/dev-tools/index.ts", "../extensions/file-sha256.ts", "../extensions/checkpoint-create.ts", "../extensions/todo.ts", "../node_modules/@vndv/pi-codegraph/extensions/codegraph.ts", "../node_modules/pi-lsp-client/src/index.ts", "../node_modules/@nicknisi/pi-ast-grep/index.ts", "../node_modules/pi-codex-tools/index.ts"]);
     for (const provider of worker.subagentOnlyExtensions as string[]) expect(existsSync(path.resolve("agents", provider))).toBe(true);
     for (const contract of ["single writer thread", "pause and escalate", "Ponytail in FULL mode", "schema/reporting", "edit/write"])
       expect(body).toContain(contract);
@@ -1929,8 +1929,11 @@ describe("deterministic observer", () => {
       expect(ledger.definition).toMatchObject({ tools: [], allowNestedSubagents: false, defaultContext: "fresh",
         inheritProjectContext: false, inheritGlobalContext: false, inheritSkills: false, defaultAsync: false });
       expect(ledger.definition.model).toBeUndefined(); expect(ledger.definition.outputSchema).toBeUndefined();
+      expect(requests[2].name).toBe("pitako.request-observer");
+      expect(requests[2].definition.runner).toEqual({ type: "external-cli", command: process.execPath,
+        args: [path.resolve("skills/execute/observe.mjs"), "--requests"], promptDelivery: "stdin" });
       // Reproduce the native async launch: inferred acceptance is appended to the task, then framed.
-      for (const { definition: agent } of requests.slice(0, 2)) {
+      for (const { definition: agent } of requests.slice(0, 3)) {
         const request = { expected: { invocation: "exec-1", count: 0, head: null }, record: { kind: "unit", loop: 1, body: { fix: "Implement" } } };
         const task = JSON.stringify(request);
         const acceptance = resolveEffectiveAcceptance({ acceptanceRole: agent.acceptanceRole, agentName: "deterministic", task, mode: "single", async: true });
@@ -1942,15 +1945,15 @@ describe("deterministic observer", () => {
       expect(() => registerAgent({ pi: pi as unknown as ExtensionAPI, name: requests[0].name, definition })).toThrow();
       expect(disposed).toBe(0);
       hooks.get("session_start")!({}, first);
-      expect(disposed).toBe(2); expect(otherDisposed).toBe(0);
+      expect(disposed).toBe(3); expect(otherDisposed).toBe(0);
       hooks.get("session_shutdown")!(); hooks.get("session_shutdown")!();
-      expect(disposed).toBe(4); expect(otherDisposed).toBe(0);
+      expect(disposed).toBe(6); expect(otherDisposed).toBe(0);
     } finally { hooks.get("session_shutdown")!(); otherHooks.get("session_shutdown")!(); }
-    expect(otherDisposed).toBe(2);
+    expect(otherDisposed).toBe(3);
   });
 
   test("deterministic agents report conflicts and native rejection without fallback or replacement", () => {
-    for (const rejectedAgent of [1, 2]) for (const failure of ["conflicting deterministic agent", "native registration rejected", null]) {
+    for (const rejectedAgent of [1, 2, 3]) for (const failure of ["conflicting deterministic agent", "native registration rejected", null]) {
       const hooks = new Map<string, (...args: any[]) => any>(); let calls = 0;
       registerPlanExecute({ on: (name: string, hook: (...args: any[]) => any) => hooks.set(name, hook),
         events: { emit: (_name: string, request: any) => {
@@ -2131,7 +2134,7 @@ describe("plan/execute packaged composition", () => {
                   workerResult: null, originalAvailable: !input.mode.endsWith("unknown"), binding: "absent",
                   comparison: input.mode.endsWith("unknown") ? "neither" : "only-original", provenance: [original.runId] } };
             }
-            let response = structuredClone(input.children[key]);
+            let response = request.agent === "pitako.request-observer" ? respond(key, request, input.metadata, input.checkout) : structuredClone(input.children[key]);
             if (!response) throw Error("Unexpected child " + key);
             if (request.agent === "pitako.checkout-observer") {
               const observation = JSON.parse(response.output);

@@ -120,9 +120,12 @@ describe("profiles", () => {
       expect(note).toContain("pending/in_progress/completed/cancelled/deleted");
       expect(note).toContain("at most one in_progress per owner");
       expect(note).toContain("Only owners edit; others only cancel/delete");
-      expect(note).toContain("completed: delete only; cancelled/deleted terminal");
+      expect(note).toContain("completed/cancelled: delete only; deleted terminal");
+      expect(note).toContain("projection owns phases/tasks/worker steps; do not mirror rows");
+      expect(note).toContain("You may cancel/delete task/step rows via todo; phases are protected");
+      expect(note).not.toContain("no private/foreground TODOs");
       expect(note).toContain("protected bars both; cancel=request asks");
-      expect(note.length).toBeLessThan(3200);
+      expect(note.length).toBeLessThan(3400);
     }
     expect(coding).toContain("Use apply_patch when available; otherwise edit");
     expect(coding).toContain("Keep diffs small");

@@ -90,10 +90,12 @@ export default function planExecute(pi: ExtensionAPI): void {
   let registration: WorkflowResourceRegistration | undefined;
   let observer: RuntimeAgentRegistration | undefined;
   let ledger: RuntimeAgentRegistration | undefined;
+  let requests: RuntimeAgentRegistration | undefined;
   function dispose() {
     registration?.dispose(); registration = undefined;
     observer?.dispose(); observer = undefined;
     ledger?.dispose(); ledger = undefined;
+    requests?.dispose(); requests = undefined;
   }
   pi.on("session_start", (_event, ctx) => {
     dispose();
@@ -118,10 +120,19 @@ export default function planExecute(pi: ExtensionAPI): void {
         runner: { type: "external-cli", command: process.execPath,
           args: [path.join(packageRoot(), "skills/execute/ledger.mjs")], promptDelivery: "stdin" },
       } });
+      requests = registerAgentViaEvents({ pi, name: "pitako.request-observer", definition: {
+        description: "Deterministic main-session execute request reader; no model execution.",
+        systemPrompt: "Fixed execute request observer; stdin is JSON {invocation, cursor}.",
+        systemPromptMode: "replace", tools: [], allowNestedSubagents: false,
+        inheritProjectContext: false, inheritGlobalContext: false, inheritSkills: false,
+        defaultContext: "fresh", defaultAsync: false, acceptanceRole: "read-only",
+        runner: { type: "external-cli", command: process.execPath,
+          args: [path.join(packageRoot(), "skills/execute/observe.mjs"), "--requests"], promptDelivery: "stdin" },
+      } });
       registration = registerWorkflowResource({ sessionId: ctx.sessionManager.getSessionId(), definition: executionResource() });
     } catch (error) {
       dispose();
-      throw new Error(`Checkout observer or execution ledger registration failed: ${String(error instanceof Error ? error.message : error)}. Inspect the installed pi-subagents registration listener and conflicting agent; reconcile it before preparing execution. No fallback was registered.`);
+      throw new Error(`Checkout observer, request observer or execution ledger registration failed: ${String(error instanceof Error ? error.message : error)}. Inspect the installed pi-subagents registration listener and conflicting agent; reconcile it before preparing execution. No fallback was registered.`);
     }
   });
   pi.on("session_shutdown", dispose);

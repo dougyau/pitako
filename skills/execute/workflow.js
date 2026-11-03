@@ -369,14 +369,111 @@ function save() {
   // Essential state is committed first. One optional identical active plan cannot
   // displace snapshot, frozen descriptor, progress, or historical records.
   const essential = { ...invocation, activePlan: null };
-  return persistState(key, essential, activePlan).catch(error => {
+  return persistState(key, essential, activePlan).then(() => { emitTodoSnapshot(); }).catch(error => {
     if (error.optionalPersistence) throw error;
     persistenceFailed = true;
     persistenceReason = `Essential persistence failed; dispatch halted: ${String(error?.message ?? error)}`;
     throw Object.assign(new Error(persistenceReason), { terminalPersistence: error.terminalPersistence === true });
   });
 }
+// Display snapshots contain no evidence, prompts or clocks; repeated saves are not heartbeats.
+let todoSeq = 0, lastTodoSnapshot;
+function emitTodoSnapshot() {
+  if (persistenceFailed || typeof emit !== "function" || !loop || !invocation?.association) return;
+  const line = value => String(value ?? "").replace(/\s+/g, " ").trim().slice(0, 240);
+  const admitted = loop.plan?.stage === "admitted";
+  // A retained incompatible plan must fail through the controller, not through its display.
+  if (admitted && activePlan) {
+    try { validatePlan(activePlan, loop.number, loop.manifest); } catch (_) { return; }
+  }
+  const planCancelled = !admitted && (loop.plan?.stage === "rejected" || loop.plan?.status === "needs-decision" || loop.halt || loop.outcome);
+  const phase = (name, title, status, reason) => ({ name,
+    subject: `Loop ${loop.number}/${maxCycles()} · ${title}`, status, metadata: { protected: true },
+    ...(reason ? { reason: line(reason) } : {}) });
+  const phases = [phase("plan", "Plan", admitted ? "completed" : planCancelled ? "cancelled" : "in_progress",
+    planCancelled ? loop.plan?.rejection?.diagnostic ?? loop.halt?.reason ?? loop.outcome : null)];
+  if (loop.review || ["review", "compliance", "closing", "finished"].includes(loop.phase))
+    phases.push(phase("review", "Review compartido", loop.phase === "review" && !loop.halt ? "in_progress"
+      : loop.review?.status === "completed" ? "completed" : "cancelled", loop.review?.reason));
+  if (loop.compliance || loop.phase === "compliance")
+    phases.push(phase("compliance", "Compliance", loop.phase === "compliance" && !loop.halt ? "in_progress"
+      : loop.compliance?.status === "fulfilled" ? "completed" : "cancelled", loop.compliance?.reason));
+  const tasks = admitted && activePlan ? activePlan.tasks.map(task => {
+    const retained = invocation.tasks[task.id];
+    const attempt = loop.attempt?.taskId === task.id ? loop.attempt : null;
+    const running = attempt?.launch && !["result", "settled"].includes(attempt.stage);
+    const status = retained?.completed ? "completed" : running ? "in_progress" : retained?.cancel ? "cancelled" : attempt ? "in_progress" : "pending";
+    // shortcut: explicit async returns only a launch receipt in 0.84; upgrade when a public awaited-async result seam exists.
+    const suffix = `${attempt ? ` (intento ${attempt.number})` : ""} (pasos en vivo no disponibles)`;
+    return { id: task.id, status, subject: `${task.id} ${task.goal}`.slice(0, 2000 - suffix.length) + suffix,
+      blockedBy: task.dependsOn.filter(dependency => !invocation.tasks[dependency.taskId]?.completed).map(dependency => dependency.taskId),
+      metadata: { cancel: "request" }, ...(retained?.cancel ? { reason: line(retained.cancel.reason) } : {}) };
+  }) : [];
+  const active = admitted && loop.phase === "implementation" && loop.attempt && loop.attempt.stage !== "result"
+    ? { taskId: loop.attempt.taskId, attempt: loop.attempt.number, workflowKey: loop.attempt.key } : null;
+  const snapshot = { schema: "pitako.execute-todo", v: 1, invocation: config.invocation,
+    loop: loop.number, maxLoops: maxCycles(), phases, tasks, active, outcome: loop.outcome ?? null };
+  if (same(snapshot, lastTodoSnapshot)) return;
+  lastTodoSnapshot = clone(snapshot);
+  emit({ ...snapshot, seq: ++todoSeq });
+}
+// Each observation gets a fresh durable key: native child reuse must not cache a file read.
+function observeMainRequests(cursor = 0, records = []) {
+  invocation.requestObservation = (invocation.requestObservation ?? 0) + 1;
+  const observerKey = `${key}.l${loop.number}.requests-${invocation.requestObservation}`;
+  return save().then(() => dispatch([{ key: observerKey, agent: "pitako.request-observer",
+    context: "fresh", cwd: config.root, task: JSON.stringify({ invocation: config.invocation, cursor }),
+    output: false, outputMode: "inline", outputSchema: false, reads: false, progress: false,
+  }])).then(([result]) => {
+    references.push(nativeReference(observerKey, result));
+    const cause = barrier(result);
+    if (cause) throw nativeBarrier(cause);
+    if (!result?.ok || result.agent !== "pitako.request-observer" || !text(result.runId) ||
+        !Array.isArray(result.results) || result.results.length !== 1 || result.results[0].exitCode !== 0 ||
+        typeof result.output !== "string" || utf8Bytes(result.output) > 65536 ||
+        [result, ...result.results].some(item => item.error || item.outputPartial || item.truncation || item.timedOut || item.processSignal))
+      throw new Error("Execute request observation lacks a complete successful result; no worker dispatched.");
+    const page = JSON.parse(result.output);
+    if (page.version !== 1 || page.ok !== true || page.invocation !== config.invocation ||
+        !Array.isArray(page.requests) || page.requests.some(request => request.v !== 1 ||
+          request.invocation !== config.invocation || !text(request.requestId) || !text(request.taskId) ||
+          !["cancel", "delete"].includes(request.kind) || !/^[a-z][a-z0-9_-]{0,31}$/.test(request.origin ?? "")) ||
+        !(page.next === null || Number.isSafeInteger(page.next) && page.next === cursor + page.requests.length && page.next > cursor))
+      throw new Error(`Invalid execute request observation: ${page.reason ?? "invalid page"}; no worker dispatched.`);
+    records.push(...page.requests);
+    if (page.next !== null) return observeMainRequests(page.next, records);
+    let changed = false;
+    const cancelTask = (task, cancel) => {
+      const retained = invocation.tasks[task.id];
+      if (!retained || retained.cancel || retained.completed) return;
+      retained.cancel = clone(cancel);
+      (invocation.excludedScope ??= {})[task.id] = { id: task.id, goal: task.goal,
+        scope: clone(task.scope), expectedResult: task.expectedResult, cancel: clone(cancel) };
+      changed = true;
+    };
+    for (const request of records) {
+      const task = activePlan.tasks.find(task => task.id === request.taskId);
+      if (!task) continue; // Finished-loop history deletes have no execution effect.
+      cancelTask(task, { requestId: request.requestId, origin: request.origin, kind: request.kind,
+        reason: `cancelled by main-session request (origin: ${request.origin}; ${request.kind})` });
+    }
+    // Validated plans are topologically ordered, so one pass includes transitive dependents.
+    for (const task of activePlan.tasks) {
+      const dependency = task.dependsOn.find(dependency => invocation.tasks[dependency.taskId]?.cancel);
+      if (dependency) {
+        const source = invocation.tasks[dependency.taskId].cancel;
+        cancelTask(task, { ...source, cascadeFrom: dependency.taskId,
+          reason: `cancelled by main-session request (origin: ${source.origin}; dependency: ${dependency.taskId})` });
+      }
+    }
+    // No cancellation-driven state transition or display is exposed before this essential save.
+    return changed ? save() : undefined;
+  });
+}
+function cancelledScope() { return Object.values(invocation?.excludedScope ?? {}); }
+function unfulfilledCancellations() { return cancelledScope().filter(task => !task.completed); }
 function progress() {
+  emitTodoSnapshot();
   const value = {
     type: "execution-progress", invocation: config.invocation, loop: loop?.number ?? 0,
     loopsConsumed: invocation?.consumedLoops ?? 0, maxLoops: maxCycles(),
@@ -733,6 +830,7 @@ function collect(childKey, agent, display, task, outputSchema, implementation = 
     output: `${childKey}.json`, outputMode: "file-only", reads: false, progress: false,
     skill: ["verify-behavior", ...(scopeDiscipline ? ["scope-discipline"] : [])],
     task: `${label}\n\n${scopeDiscipline ? "Read and apply scope-discipline before expanding work or verification; preserve admitted tasks and gates.\n" : ""}${task}`, outputSchema,
+    // Keep awaited final-result admission; the todo subject explicitly discloses the live-step limitation.
     ...(implementation ? { timeoutMs: 14400000,
       ...(!resume ? { extensionBindings: { "pitako.checkpoint/1": { association: clone(invocation.association), key: loop.attempt.key } } } : {}),
       acceptance: {
@@ -787,6 +885,8 @@ function validatePlan(value, number, manifest) {
     throw new Error("loop_plan needs full ordered task scopes and a final verification task, even for existing code.");
   if (manifest && !same(manifest, value.tasks.map(task => task.id)))
     throw new Error("Original loop_plan order or task identity changed.");
+  if (!manifest && loop.plan?.stage !== "admitted" && value.tasks.some(task => invocation.excludedScope?.[task.id]))
+    throw new Error("loop_plan needs full ordered task scopes excluding work cancelled by main-session request; excluded IDs cannot be replanned.");
   const positions = new Map(value.tasks.map((task, index) => [task.id, index]));
   for (const [index, task] of value.tasks.entries()) {
     let defect = !Array.isArray(task.dependsOn) ? "missing dependsOn array" : task.dependsOn.some(dependency =>
@@ -1098,6 +1198,24 @@ function recoverPlan() {
 // Checkpoint-backed pending units restore first. Legacy attempts without real
 // modifying checkpoint intentions retain their exact native continuation route.
 function continueAttempt(observed, ref, task, prerequisites) {
+  assertFallbackProducer(observed, ref);
+  // Observing an existing continuation or an unresolved checkpoint is not a dispatch.
+  if (loop.attempt.nativeContinuation && !budgetRejected(loop.attempt.nativeContinuation.ref.key) ||
+      pendingCheckpointUnit() && barrier(observed, ref.runId ?? ref.key) !== "interrupted")
+    return continueObservedAttempt(observed, ref, task, prerequisites);
+  return observeMainRequests().then(() => {
+    if (invocation.tasks[task.id]?.cancel) {
+      const cause = barrier(observed, ref.runId ?? ref.key);
+      if (cause) throw nativeBarrier(cause);
+      // Unknown writer settlement cannot be treated as cancellation or permission to replace it.
+      if (!(observed?.ok && observed.structuredOutput && text(observed.runId)))
+        throw new Error("Cancelled task has an unresolved current attempt; no continuation or replacement dispatched.");
+      return observed;
+    }
+    return continueObservedAttempt(observed, ref, task, prerequisites);
+  });
+}
+function continueObservedAttempt(observed, ref, task, prerequisites) {
   const descriptor = loop.attempt;
   const cause = barrier(observed, ref.runId ?? ref.key);
   if (pendingCheckpointUnit()) assertFallbackProducer(observed, ref);
@@ -1453,8 +1571,10 @@ function admitWorker(result, descriptor, task, recoveryRef, statusRef) {
   loop.results = loop.results.map(entry => !entry.ref && entry.taskId === projected.taskId &&
     entry.attempt === taskState.last?.attempt ? taskState.last : entry);
   taskState.last = projected.status === "complete" ? null : projected;
-  if (projected.status === "complete") taskState.completed = { ...clone(projected),
-    prerequisiteResults: clone(prerequisiteResults(task)) };
+  if (projected.status === "complete") {
+    taskState.completed = { ...clone(projected), prerequisiteResults: clone(prerequisiteResults(task)) };
+    if (invocation.excludedScope?.[task.id]) invocation.excludedScope[task.id].completed = true;
+  }
   loop.results.push({ taskId: projected.taskId, attempt: projected.attempt });
   loop.attempt.result = projected;
   loop.attempt.stage = "result";
@@ -1512,6 +1632,7 @@ function loopArchive(frozen) {
       : frozen && ["usage", "resolutions"].includes(field) ? frozen[field] : loop[field];
     if (value !== undefined) body[field] = archiveProjection(value);
   }
+  if (cancelledScope().length) body.cancelledScope = clone(cancelledScope());
   return { expected: clone(invocation.ledger), record: { kind: "loop", loop: loop.number, body } };
 }
 function retainedResolutions() {
@@ -1684,6 +1805,7 @@ function retainWorkerBlock(result) {
   loop.halt = { status: "blocked", code: "semantic-block", reason: result.diagnosis, ref: result.ref };
 }
 function loopReport(status, reason) {
+  emitTodoSnapshot();
   const now = Date.now();
   const last = loopResults(false).at(-1);
   const stale = !!loop.invalidated || loop.closing?.sameCandidate === false;
@@ -1694,6 +1816,7 @@ function loopReport(status, reason) {
   const report = {
     type: "execution-loop", invocation: config.invocation, loop: loop.number, maxLoops: maxCycles(),
     status: exhausted ? "partial" : status, reason, phase: loop.phase, candidate: loop.closing?.candidate ?? last?.candidate ?? null,
+    cancelledScope: cancelledScope(),
     halt: loop.halt ?? null, history: { summaries: invocation.loopSummaries, ...historyReference() },
     elapsedMs: (loop.endedAt ?? now) - loop.startedAt, totalElapsedMs: now - invocation.startedAt,
     tokens: metrics(loop), totalTokens: metrics(),
@@ -1762,7 +1885,7 @@ function finish(status, reason) {
     loopReport: loop ? loopReport(status === "partial" && loop.outcome === "gaps" && !persistenceFailed ? "gaps" : status, reason) : null,
     actionRequired: ["complete", "budget-exhausted"].includes(status) ? "none" : reason,
     action: action(status, reason),
-    publication: "not performed by workflow", references,
+    publication: "not performed by workflow", references, cancelledScope: cancelledScope(),
   };
 }
 try {
@@ -2090,6 +2213,8 @@ try {
         await save();
         const result = await collect(directorKey, "pitako.execution-director",
           { label: "Plan execution work", phase: "planning" }, `${fullContext()}
+EXCLUDED SCOPE (not human intent; do not plan this work again, including under new IDs): ${JSON.stringify(cancelledScope())}
+Report this work as unfulfilled: cancelled by main-session request, with its origin.
 INDEPENDENT DEMAND OBSERVATION (advisory): ${JSON.stringify(observation)}
 PREVIOUS OBSERVATIONS AND EXACT ORIGINAL SOURCES: ${JSON.stringify(demandHistory())}
 Read pertinent full originals alongside observations; agent reports are not human authority.
@@ -2202,6 +2327,12 @@ No replacement task list elsewhere. Carry the exact association above. Native pe
         const task = activePlan.tasks[loop.cursor];
         if (invocation.sealPending) await archiveSeal();
         if (!invocation.taskFrame) invocation.taskFrame = { taskId: task.id, identities: [], evidence: [], operations: [], restorationKeys: [] };
+        const cancelled = invocation.tasks[task.id]?.cancel;
+        // A current attempt is allowed to settle. Only undispatched or settled work is skipped.
+        if (cancelled && (!loop.attempt || ["result", "settled"].includes(loop.attempt.stage) ||
+            loop.attempt.stage === "intention" && !loop.attempt.launch)) {
+          loop.cursor++; loop.attempt = null; invocation.taskFrame = null; await save(); continue;
+        }
         const prerequisites = prerequisiteResults(task);
         let value;
         if (loop.attempt?.stage === "result") {
@@ -2242,6 +2373,7 @@ No replacement task list elsewhere. Carry the exact association above. Native pe
           if (barrier(observed)) throw nativeBarrier(barrier(observed));
           if (observed?.runId && observed?.structuredOutput &&
               (!ref.runId || observed.runId === (loop.attempt.nativeContinuation?.ref.runId ?? ref.runId))) {
+            await observeMainRequests();
             admitWorker(observed, loop.attempt, task, undefined, ref.runId ?? ref.key);
           } else {
             if (ref.runId && observed?.runId && observed.runId !== ref.runId)
@@ -2250,6 +2382,7 @@ No replacement task list elsewhere. Carry the exact association above. Native pe
             const recovered = await inspectRecovery("attempt-result", loop.attempt.launch ?? ref);
             if (recovered.status !== "recovered" || !recovered.workerResult)
               throw new Error(`Unresolved writer dispatch: ${recovered.reason}; no blind reattachment or replacement.`);
+            await observeMainRequests();
             admitWorker({ ...observed, ok: true, runId: loop.attempt.launch?.runId ?? ref.runId,
               structuredOutput: recovered.workerResult }, loop.attempt, task,
               loop.recoveries.find(item => item.subject === `attempt-result:${loop.attempt.taskId}:${loop.attempt.number}`).ref,
@@ -2262,6 +2395,10 @@ No replacement task list elsewhere. Carry the exact association above. Native pe
           loop.attempt = { taskId: task.id, index: loop.cursor, number: 1,
             key: `${key}.l${loop.number}.t${loop.cursor + 1}.a1`, stage: "intention", continuationRef: null };
           await save();
+        }
+        await observeMainRequests();
+        if (invocation.tasks[task.id]?.cancel) {
+          loop.cursor++; loop.attempt = null; invocation.taskFrame = null; await save(); continue;
         }
         // Essential intention before dispatch; only the writer's published
         // preimages turn this pointer into a recoverable checkpoint.
@@ -2292,7 +2429,8 @@ No replacement task list elsewhere. Carry the exact association above. Native pe
         });
         let result = await collect(descriptor.key, "pitako.worker",
           { label: task.goal, phase: "implementation" }, `${fullContext()}
-EXECUTE SINGLE TASK. No delegation, next-task selection, private diary/progress file or parallel TODO.
+EXECUTE SINGLE TASK. No delegation, next-task selection, private diary/progress file.
+Use todo only to display your own steps, not to mirror the execute plan. Todo is display, not evidence; the structured result stays authoritative. A cancelled or deleted step never drops required work or checks.
 The workflow owns review and compliance; do not launch or infer another reviewer.
 Preserve required checks and native permissions/Stop. Do not commit or publish unless task authority explicitly permits it.
 COMPLETE SHARED CONTEXT:\n${JSON.stringify(activePlan.sharedContext)}
@@ -2392,6 +2530,7 @@ continue requires useful progress plus concrete diagnosed continuation, not a re
         }
         loop.attempt.stage = "launched";
         await save();
+        await observeMainRequests();
         if (!result?.ok) {
           loop.attempt.stage = "settled";
           loop.results.push({ ...projection(descriptor.key, result), taskId: descriptor.taskId, attempt: descriptor.number,
@@ -2420,7 +2559,7 @@ continue requires useful progress plus concrete diagnosed continuation, not a re
           : "Task has pending work without a useful diagnosed same-task continuation.");
         continue;
       }
-      loop.candidate = loopResults().at(-1).candidate;
+      loop.candidate = loopResults().at(-1)?.candidate ?? currentCandidate;
       loop.phase = "review"; await save();
     }
     if (loop.phase === "review") {
@@ -2507,6 +2646,9 @@ You are accountable for semantic coverage of the complete specs; script shape va
 certify it. An empty or entirely not-applicable inventory cannot justify fulfilled.
 Candidate INCLUDING WIP: ${JSON.stringify(loop.candidate)}.
 Work and actual final mandatory checks: ${JSON.stringify(loopResults())}.
+MAIN-SESSION CANCELLATIONS (not human intent): ${JSON.stringify(cancelledScope())}.
+Unfulfilled entries must be reported as "cancelled by main-session request" with origin,
+never as human intent or fulfilled scope: ${JSON.stringify(unfulfilledCancellations())}.
 Reasoned shared adversarial clear: ${JSON.stringify(loop.review)}.
 Admitted COMPLETE plan references: ${JSON.stringify(loop.plan.ref)}.
 Independently assess single-outcome decomposition and dependency completeness against the full spec;
@@ -2536,6 +2678,12 @@ no unresolved material gaps and this SAME candidate. Otherwise gaps or blocked. 
       if (value.status === "blocked") {
         loop.halt = { status: "blocked", code: "semantic-block", reason: excerpt(value.reason) };
         await save(); return finish("blocked", loop.halt.reason);
+      }
+      if (unfulfilledCancellations().length) {
+        loop.compliance.status = "gaps";
+        loop.compliance.reason = unfulfilledCancellations().map(task => `${task.id}: ${task.cancel.reason}`).join("; ");
+        loop.compliance.unresolved.push(...unfulfilledCancellations().map(task => ({ id: task.id,
+          source: "main-session request", status: "gap", reason: task.cancel.reason })));
       }
       loop.phase = "closing"; await save();
     }

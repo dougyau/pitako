@@ -55,6 +55,9 @@ export function resourceWithAgentDir(agentDir: string) {
 // Responses implement schemas only; no provider or model obedience is certified.
 export function childResponse(key: string, request: any, metadata: any, checkout: any, completeLoop = 1, suppliedValue?: any) {
   const loop = Number(key.match(/\.l(\d+)\./)?.[1] ?? 1);
+  if (request.agent === "pitako.request-observer") return { key, ok: true, agent: request.agent,
+    runId: `native-${key}`, artifactPaths: [], output: JSON.stringify({ version: 1, ok: true,
+      invocation: JSON.parse(request.task).invocation, requests: [], next: null }), results: [{ index: 0, agent: request.agent!, task: request.task, exitCode: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } }] } as WorkflowScriptChildResult;
   if (request.agent === "pitako.execution-ledger") {
     const pending = JSON.parse(request.task);
     return { key, ok: true, agent: request.agent, runId: `native-${key}`, asyncDir: `/native/async/${key}`,
@@ -286,7 +289,7 @@ export function nativeCheckpointFixture({ workflowSettlements, checkpointCancell
     }));
     nativeCheckpointExits.push({ promise: nativeCheckpointExit, cancelled: false });
     await started;
-    expect(nativeCheckpoint, errors).toBeDefined();
+    if (!nativeCheckpointExits.at(-1)!.cancelled) expect(nativeCheckpoint, errors).toBeDefined();
   }
   afterAll(async () => {
     if (nativeCheckpoint?.connected) nativeCheckpoint.disconnect();
@@ -297,32 +300,44 @@ export function nativeCheckpointFixture({ workflowSettlements, checkpointCancell
     }
     if (nativeCheckpointRoot) rmSync(nativeCheckpointRoot, { recursive: true, force: true });
   });
-  async function nativeCheckpointCase(input: any, harness: string) {
-    if (!nativeCheckpoint) await startNativeCheckpoint();
-    if (!nativeCheckpoint || nativeCheckpointReply) throw Error("Native checkpoint fixture unavailable or busy");
-    const child = nativeCheckpoint;
+  function nativeCheckpointCase(input: any, harness: string): Promise<[number, string, string] | undefined>;
+  function nativeCheckpointCase<T>(input: any, harness: string, consume: (value: [number, string, string]) => T): Promise<T | undefined>;
+  function nativeCheckpointCase(input: any, harness: string, consume: (value: [number, string, string]) => unknown = value => value) {
     let cancelled = false;
-    let resolve!: (value: [number, string, string] | undefined) => void;
-    const response = new Promise<[number, string, string] | undefined>(done => { resolve = done; });
-    nativeCheckpointReply = value => resolve(cancelled ? undefined : value);
-    const operation = nativeCheckpointExits.at(-1)!;
+    let child: ReturnType<typeof spawn> | undefined;
+    let operation: typeof nativeCheckpointExits[number] | undefined;
+    // Own cancellation before startup can yield, including an abandoned first case.
     const cancel = () => {
-      if (cancelled || child.exitCode !== null || child.signalCode !== null) return;
+      if (cancelled) return;
       cancelled = true;
-      operation.cancelled = true;
-      child.kill();
+      child ??= nativeCheckpoint;
+      operation ??= nativeCheckpointExits.at(-1);
+      if (operation) operation.cancelled = true;
+      if (child && child.exitCode === null && child.signalCode === null) child.kill();
     };
     checkpointCancellations.add(cancel);
-    const result = response.then(async value => {
-      if (cancelled || !child.connected) await operation.promise; // Joins this child and both streams.
-      checkpointCancellations.delete(cancel);
-      return cancelled ? undefined : value;
-    });
-    // Observe the original case continuation, including an abandoned caller.
+    const result = (async () => {
+      try {
+        if (!nativeCheckpoint) await startNativeCheckpoint();
+        child ??= nativeCheckpoint;
+        operation ??= nativeCheckpointExits.at(-1);
+        if (cancelled) { await operation?.promise; return; }
+        if (!child || nativeCheckpointReply) throw Error("Native checkpoint fixture unavailable or busy");
+        const response = new Promise<[number, string, string] | undefined>(resolve => {
+          nativeCheckpointReply = value => resolve(cancelled ? undefined : value);
+          child!.send({input:{...input,agentDir:path.join(path.dirname(input.missionPath),"private-agent")},harness}, error => {
+            if (error) resolve(cancelled ? undefined : [1, "", String(error.stack ?? error)]);
+          });
+        });
+        const value = await response;
+        if (cancelled || !child.connected) await operation!.promise; // Joins this child and both streams.
+        if (!cancelled && value) return consume(value);
+      } finally {
+        checkpointCancellations.delete(cancel);
+      }
+    })();
+    // Own the assertion consumer as well as IPC, even if the caller times out.
     workflowSettlements.push(result.then(() => {}, () => {}));
-    child.send({input:{...input,agentDir:path.join(path.dirname(input.missionPath),"private-agent")},harness}, error => {
-      if (error) resolve(cancelled ? undefined : [1, "", String(error.stack ?? error)]);
-    });
     return result;
   }
 

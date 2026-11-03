@@ -11,7 +11,7 @@ import { planExecute, missionFiles, childResponse, registeredCheckpoint, type Co
 
 // Shared registered checkpoint lifecycle scenario for the two checkpoint lifecycle
 // test files; each file passes its own composition and native process fixtures.
-export function checkpointScenarioFixture({ repository, disposers }: CompositionFixture, { nativeCheckpointCase }: NativeCheckpointFixture) {
+export function checkpointScenarioFixture({ repository, disposers, workflowSettlements }: CompositionFixture, { nativeCheckpointCase }: NativeCheckpointFixture) {
   // Rejects treating an intention, a sealed-but-unadmitted file, or a pause as
   // completed progress. Continuation also rejects pre-unit rollback, dispatch-only
   // "success", answer reuse after a later Stop, lost admission and duplicate writers.
@@ -328,10 +328,11 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
           }
           if (cut || lossReentry || ["pause-replay-complete", "pause-equivalent-capture", "pause-successor-corrupt", "pause-repeated-publication", "pause-reusable-result"].includes(input.mode)) {
             recoveryReplay = true;
-            // Three reentries cover discovery of a successor/publication, the
-            // resulting exhausted bound, and another unchanged-evidence replay.
-            // More identical entries only repeat expensive native inspections.
-            for (let reentry = 0; reentry < ((lossReentry || ["pause-equivalent-capture", "pause-repeated-publication"].includes(input.mode)) ? 3 : 1); reentry++)
+            // Equivalent capture already has exhausted evidence on the first
+            // reentry; two terminal observations prove that it cannot renew.
+            const reentries = input.mode === "pause-equivalent-capture" ? 2 :
+              (lossReentry || input.mode === "pause-repeated-publication") ? 3 : 1;
+            for (let reentry = 0; reentry < reentries; reentry++)
               resumed = await run(options as any);
           }
         }
@@ -550,7 +551,7 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
               expect(actual.retained.taskFrame.operations).toHaveLength(1);
               expect(actual.retained.tasks.second.last).toEqual(originalLoop.results[1]);
               expect(actual.retained.association.maxCycles).toBe(3);
-              expect(actual.calls).toEqual([...actual.callsAtYield, "invoke-human-1.l1.t2.a2"]);
+              expect(actual.calls.filter((key: string) => !key.includes(".requests-"))).toEqual([...actual.callsAtYield.filter((key: string) => !key.includes(".requests-")), "invoke-human-1.l1.t2.a2"]);
             }
             expect(actual.resumed.action.started).toBe(false);
             const replayed = observed.find((entry: any) => entry.replay);
@@ -642,7 +643,8 @@ export function checkpointScenarioFixture({ repository, disposers }: Composition
       })();
       // Bun may abandon the returned test promise on timeout. Own its eventual
       // cancellation rejection as well as the child/stream settlement promise.
-      void work.catch(() => {});
+      // Own the assertion consumer as well as the native IPC operation.
+      workflowSettlements.push(work.then(() => {}, () => {}));
       return work;
   }
   return { checkpointScenario, releasePreparedPause() { preparedPauseInput = undefined; } };

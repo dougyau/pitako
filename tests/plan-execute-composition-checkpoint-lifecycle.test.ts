@@ -12,6 +12,19 @@ const { checkpointScenario, releasePreparedPause } = checkpointScenarioFixture(c
 const settlementInput = () => ({ ...nativeCheckpointInput(), sdk: false });
 const startSettlementChild = () => startNativeCheckpoint({ sdk: false });
 
+test("native checkpoint fixture owns cancellation and consumer before startup settles", async () => {
+  let consumed = false;
+  const pending = nativeCheckpointCase({ root: process.cwd(), missionPath: "/unused/mission.json", sdk: false },
+    "async () => 'must not dispatch'", () => { consumed = true; });
+  expect(checkpointCancellations.size).toBe(1);
+  [...checkpointCancellations][0]!();
+  await settleWorkflows();
+  expect(await pending).toBeUndefined();
+  expect(consumed).toBe(false);
+  expect(native.nativeCheckpoint).toBeUndefined();
+  expect((await nativeCheckpointExits.at(-1)!.promise)[0]).toBe(143);
+});
+
 test("native checkpoint fixture cancellation joins process, streams and case continuation", async () => {
   await startSettlementChild();
   const pending = nativeCheckpointCase(settlementInput(), "async () => new Promise(() => {})");
