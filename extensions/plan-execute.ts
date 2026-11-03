@@ -16,6 +16,20 @@ function inspectionCommand(args: string[], platform: NodeJS.Platform): string {
 function isMissionId(value: unknown): value is string {
   return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value) && !value.includes("..");
 }
+const RECORD_LINE = "Mission record path (pitako.execute args.missionPath): ";
+/**
+ * Checkpoints resolve execute state beside the native record (execute-state.ts), so only the
+ * existing record `<store>/<missionId>.json` qualifies. Native validates options.missionId,
+ * never this Pitako pointer; a wrong pointer would otherwise fail only at the first worker write.
+ */
+function validateMissionRecord(missionId: string, missionPath: unknown): void {
+  let id: unknown;
+  if (typeof missionPath === "string" && path.isAbsolute(missionPath) && !missionPath.includes("\0") &&
+      path.basename(missionPath) === `${missionId}.json`)
+    try { id = (JSON.parse(readFileSync(missionPath, "utf8")) as { id?: unknown } | null)?.id; } catch { id = undefined; }
+  if (id !== missionId)
+    throw new Error(`Expected missionPath to be the existing native mission record ${missionId}.json, shown as "${RECORD_LINE.trim()}" by mission.create or mission.show. Its "State:" path or a derived path is not the record.`);
+}
 function validateResolution(args: Readonly<Record<string, unknown>>): void {
   if (args.unblock === undefined && args.resolution === undefined) return;
   const value = args.resolution as { loop?: unknown; text?: unknown } | undefined;
@@ -78,14 +92,24 @@ export default function planExecute(pi: ExtensionAPI): void {
     if (options?.mission !== undefined || !isMissionId(input.args?.missionId) || input.args.missionId !== options?.missionId)
       return { block: true, reason: "pitako.execute requires a mission already created via mission.create, with the same native missionId in args and options. One-step mission creation is unsupported; this is data association, not approval or confinement." };
     try {
-      if (typeof input.args.missionPath !== "string" || !path.isAbsolute(input.args.missionPath) || input.args.missionPath.includes("\0"))
-        throw new Error("Retain the actual missionPath returned by native mission.create or mission.show.");
+      validateMissionRecord(input.args.missionId, input.args.missionPath);
       if (typeof input.args?.root !== "string" || (input.cwd !== undefined && typeof input.cwd !== "string")) throw new Error("Expected designated root and launch cwd.");
       // The resolver receives args only. The public tool call owns the actual launch cwd.
       const launch = input.cwd ? path.resolve(ctx.cwd, input.cwd) : ctx.cwd;
       if (designatedWorkspace(launch).physicalRoot !== designatedWorkspace(input.args.root).physicalRoot)
         throw new Error("Workflow cwd must be the designated worktree, not the spec's source worktree.");
     } catch (error) { return { block: true, reason: String(error instanceof Error ? error.message : error) }; }
+  });
+  // Native returns the record path only in details, which the model never sees.
+  pi.on("tool_result", event => {
+    const action = (event.input as { action?: unknown }).action;
+    const details = event.details as { missionId?: unknown; missionPath?: unknown } | undefined;
+    if (event.toolName !== "subagent" || event.isError || typeof action !== "string" || !action.startsWith("mission.") ||
+        typeof details?.missionId !== "string" || typeof details.missionPath !== "string") return;
+    const line = RECORD_LINE + details.missionPath;
+    if (event.content.some(part => part.type === "text" && part.text.includes(line))) return;
+    return { content: [...event.content, { type: "text", text: line }],
+      ...(event.structuredContent === undefined ? {} : { structuredContent: event.structuredContent }) };
   });
   let registration: WorkflowResourceRegistration | undefined;
   let observer: RuntimeAgentRegistration | undefined;

@@ -224,10 +224,14 @@ subagent({
 })
 ```
 
-Retain BOTH actual returned `details.missionId` and `details.missionPath` from
-mission.create or mission.show; never derive a storage path. Carry the same
-missionId in args and options and actual missionPath in args. This is DATA
-association, not approval or confinement. Native validates storage existence.
+Retain BOTH the actual returned missionId and missionPath from mission.create or
+mission.show; never derive a storage path. Native returns missionPath only in
+result details, so Pitako appends it to the visible text as `Mission record path
+(pitako.execute args.missionPath): <path>`. Copy that exact path; the `State:`
+line is NOT the mission path. Carry the same missionId in args and options and
+actual missionPath in args. This is DATA association, not approval or
+confinement. Native validates the mission; the launch hook rejects a missionPath
+that is not the existing native record `<missionId>.json` before any child starts.
 Choose a stable safe invocation ID for this explicit authorization; technical
 recovery keeps the same ID, mission, immutable snapshot and worktree, never
 renews consumed slots. A wake, timeout or Stop is not a new human invocation.
