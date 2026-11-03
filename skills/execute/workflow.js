@@ -839,15 +839,63 @@ These summaries were read by the publisher through ledger.mjs chain verification
 Any further ledger read must use ledger.mjs verification against head; missing/altered records block.
 The director uses these last-three summaries (no shell); the inspector reads only exact supplied native refs.`;
 }
+// Each closed loop's demand sources are persisted once. Observation N always reads
+// loop N-1's sources, so its ring entry keeps only the ref and derives the rest.
+function closedSources(number) {
+  return invocation.demandSources?.find(item => item.loop === number)?.sources ?? [];
+}
+function retainDemandSources(latest) {
+  invocation.demandSources = (invocation.demandSources ?? []).filter(item => item.loop === latest ||
+    (invocation.demandObservations ?? []).some(observation => observation.loop - 1 === item.loop));
+}
 function demandHistory() {
-  return invocation.demandObservations ?? [];
+  return (invocation.demandObservations ?? []).map(item => ({ loop: item.loop, ref: item.ref, sources: closedSources(item.loop - 1) }));
 }
 function pendingDemandSources() {
-  const last = invocation.closedDemandSources;
-  return last?.loop === loop.number - 1 ? last.sources : [];
+  return closedSources(loop.number - 1);
+}
+// The archived loop review owns full control witnesses; a demand source keeps the
+// stable reference shape used for other children plus each saved original path.
+function demandReference(ref) {
+  const value = Object.fromEntries(["key", "agent", "runId", "asyncDir", "outputReference", "outputArtifactPath",
+    "outputPathMapping", "artifactPaths", "externalAdapter", "error", "barrier"]
+    .filter(field => ref[field] !== undefined && ref[field] !== null).map(field => [field, clone(ref[field])]));
+  const witnesses = ref.results?.map(entry => Object.fromEntries(["savedOutputPath", "structuredOutputPath"]
+    .filter(field => text(entry[field])).map(field => [field, entry[field]]))).filter(entry => Object.keys(entry).length);
+  if (witnesses?.length) value.results = witnesses;
+  return value;
+}
+// Earlier v4 states copied loop N-1's sources into closedDemandSources, every ring
+// entry and loop.demandObservation. Fold them only when every copy agrees.
+function migrateLegacyDemandState() {
+  const closed = invocation.closedDemandSources, open = loop?.demandObservation;
+  const ring = invocation.demandObservations ?? [];
+  if (closed === undefined && open === undefined && !ring.some(item => item && "sources" in item)) return;
+  const conflict = detail => new Error(`Legacy demand observation state is inconsistent (${detail}); retained unchanged, no observation replayed.`);
+  if (invocation.demandSources !== undefined) throw conflict("legacy and single-copy fields coexist");
+  const known = new Map();
+  const record = (number, sources, origin) => {
+    if (!Number.isSafeInteger(number) || !Array.isArray(sources)) throw conflict(`malformed ${origin}`);
+    if (known.has(number) && !same(known.get(number), sources)) throw conflict(`${origin} disagrees for loop ${number}`);
+    known.set(number, sources);
+  };
+  if (closed !== undefined && closed !== null) record(closed.loop, closed.sources, "closedDemandSources");
+  for (const item of ring) {
+    if (!Number.isSafeInteger(item?.loop) || !item.ref) throw conflict("malformed demandObservations entry");
+    record(item.loop - 1, item.sources, `demandObservations loop ${item.loop}`);
+  }
+  if (open !== undefined) {
+    if (!loop || !same(ring.find(item => item.loop === loop.number)?.ref, open?.ref)) throw conflict("loop.demandObservation lacks its ring entry");
+    record(loop.number - 1, open.sources, "loop.demandObservation");
+  }
+  invocation.demandSources = [...known].filter(([, sources]) => sources.length).sort(([a], [b]) => a - b)
+    .map(([number, sources]) => ({ loop: number, sources }));
+  invocation.demandObservations = ring.map(item => ({ loop: item.loop, ref: item.ref }));
+  delete invocation.closedDemandSources;
+  if (loop) delete loop.demandObservation;
 }
 function observeDemands() {
-  const sources = loop.demandObservation?.sources ?? pendingDemandSources();
+  const sources = pendingDemandSources();
   if (!sources.length) return Promise.resolve(null);
   const childKey = `${key}.l${loop.number}.demand-observation`;
   return collect(childKey, "pitako.reviewer", { label: "Observe inherited demands", phase: "director" }, `${fullContext()}
@@ -868,13 +916,13 @@ work in mixed tasks, explicit requirements, admitted gates and whole-spec suffic
           !value.evidenceLimits.every(text) || !Array.isArray(value.observations) ||
           value.observations.some(item => !text(item?.source) || !text(item.demand) || !text(item.reason)))
         throw new Error("Demand observation lacks a usable structured original.");
-      loop.demandObservation = { ref: { ...loop.analysisCalls.find(call => call.key === childKey).ref,
-        ...nativeReference(childKey, result) }, sources };
-      // Constant-size ring: the closed loop itself is archived without this field.
-      invocation.demandObservations = [...demandHistory().filter(item => item.loop !== loop.number),
-        { loop: loop.number, ...loop.demandObservation }].slice(-3);
+      const ref = { ...loop.analysisCalls.find(call => call.key === childKey).ref, ...nativeReference(childKey, result) };
+      // Constant-size ring of refs; the closed loop itself is archived without it.
+      invocation.demandObservations = [...(invocation.demandObservations ?? []).filter(item => item.loop !== loop.number),
+        { loop: loop.number, ref }].slice(-3);
+      retainDemandSources(loop.number - 1);
       // The native receipt is already durable; the director intention saves this projection.
-      return { ref: loop.demandObservation.ref, body: value };
+      return { ref, body: value };
     });
 }
 function inspectRecovery(kind, ref, retained) {
@@ -1489,11 +1537,13 @@ function foldLoop(summaries) {
     sources.push({ kind: "worker", ref: exit.ref, taskId: exit.taskId, attempt: exit.attempt,
       status: exit.status, diagnosis: excerpt(exit.diagnosis) });
   if (loop.review?.verdict === "material-gaps")
-    sources.push({ kind: "review", references: loop.review.references, reason: excerpt(loop.review.reason) });
+    sources.push({ kind: "review", references: loop.review.references.map(demandReference), reason: excerpt(loop.review.reason) });
   if (loop.compliance?.status === "gaps")
     sources.push({ kind: "compliance", ref: loop.compliance.ref, reason: excerpt(loop.compliance.reason) });
-  // Replace the previous loop's sources; generic gaps are not inherited demands.
-  invocation.closedDemandSources = { loop: loop.number, sources };
+  // Replace the previous loop's pending sources; generic gaps are not inherited demands.
+  invocation.demandSources = [...(invocation.demandSources ?? []).filter(item => item.loop !== loop.number),
+    ...(sources.length ? [{ loop: loop.number, sources }] : [])];
+  retainDemandSources(loop.number);
   invocation.loopSummaries = summaries;
   invocation.planRejections = [...invocation.planRejections.filter(item => item.loop !== loop.number),
     { loop: loop.number, diagnostic: loop.plan?.rejection?.diagnostic ?? null }].slice(-3);
@@ -1885,6 +1935,7 @@ try {
       return finish("blocked", `Immutable mission/invocation/snapshot/worktree association changed at ${metadata.selected.source}; expected ${JSON.stringify(expected)}, observed binding ${current.binding}, source ${observed.source}, digest ${observed.digest}, root ${metadata.root}, commonDir ${metadata.commonDir}. Preserve the admitted snapshot; restore exact bytes from a reliable original and deliver desired changes as an explicit human addendum. If originals are unavailable remain blocked; a revised admission requires actual human authorization. Native barriers require supported native reconciliation.`);
     activePlan = invocation.activePlan;
     invocation.activePlan = null;
+    migrateLegacyDemandState();
   }
   admissionValidated = true;
   if (invocation.version === 4) {
