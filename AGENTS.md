@@ -42,7 +42,10 @@ All eight [profiles](agents/) load dev-tools and hashes. Four roles
 worker allows `ast_rewrite`; the other three allow only `ast_search`.
 The execute root workflow owns
 dispatch; its director only publishes a read-only plan and ends. No packaged
-child delegates; the worker is the single writer. The inspector is exceptional
+child delegates; the worker is the only writer of checkout content. Root-dispatched
+deterministic runtime agents (checkpoint sealer, execution ledger, observers and
+access verifier) write only Pitako metadata such as seals under
+`.pi/subagents/checkpoints`, ledger records and access receipts. The inspector is exceptional
 read-only observation/recovery, not preparation or final validation. Preserve these ceilings and the
 coding/analysis mutation policy: shell is not a sandbox, query Git can write
 metadata, and Python/Cargo/SSH are not read-only merely because of annotations.

@@ -8,11 +8,10 @@ const object = properties => ({ type: "object", additionalProperties: false, req
 const list = items => ({ type: "array", items });
 const integer = { type: "integer", minimum: 1 };
 const candidateSchema = object({ head: string, fingerprint: string });
-const associationSchema = object({
-  missionId: string, missionPath: string, invocation: string, loop: integer,
-  root: string, commonDir: string, source: string, digest: string,
-});
-const checkDefinitionSchema = object({ id: string, requirement: string, command: string, cwd: string });
+// tier: focused checks gate one task's outcome; acceptance (the project's complete
+// procedure) runs only in the LAST verification task, on the loop's final candidate.
+const checkDefinitionSchema = object({ id: string, requirement: string, command: string, cwd: string,
+  tier: { enum: ["focused", "acceptance"] } });
 // Optional advisory mark: acceptance-criterion numbers of the spec's original problem this check verifies.
 checkDefinitionSchema.properties.verifies = list(integer);
 const taskSchema = object({
@@ -25,7 +24,6 @@ const taskSchema = object({
 });
 const planSchema = object({
   status: { enum: ["plan", "needs-decision"] }, reason: string,
-  association: associationSchema,
   sharedContext: object({ material: string, references: list(string) }),
   tasks: list(taskSchema),
 });
@@ -37,28 +35,15 @@ const checkSchema = object({
 // The admitted plan owns requirement text; an optional worker echo is descriptive only.
 checkSchema.required = checkSchema.required.filter(field => field !== "requirement");
 const workerSchema = object({
-  taskId: string, attempt: integer, status: { enum: ["complete", "continue", "gaps", "blocked"] },
+  status: { enum: ["complete", "continue", "gaps", "blocked"] },
   workDone: string, remaining: list(string), diagnosis: string,
   usefulProgress: { type: "boolean" }, continuation: nullable(string),
-  git: object({ head: string, checkpoints: list(string), wip: string }),
-  candidate: candidateSchema, checks: list(checkSchema),
-});
-workerSchema.properties.restoreReceipt = object({ checkpointRef: string, digest: string,
-  partialRef: string, restoredRef: string, candidate: candidateSchema,
-  position: object({ loop: integer, cursor: { type: "integer", minimum: 0 }, phase: { const: "implementation" } }) });
-workerSchema.properties.restoreReceipt.properties.confirmedPause = object({ checkpointRef: string, digest: string });
-workerSchema.properties.restoreReceipt.properties.confirmedUnit = object({ checkpointRef: string, digest: string });
-workerSchema.properties.checkpointReceipt = object({
-  kind: { enum: ["unit", "pause"] }, checkpointRef: string, digest: string, candidate: candidateSchema,
-  position: object({ loop: integer, cursor: { type: "integer", minimum: 0 }, phase: { const: "implementation" } }),
-  progress: object({ consumedLoops: integer, admitted: { type: "object", additionalProperties: list(string) },
-    previous: nullable(object({ taskId: string, attempt: integer, resultRef: { type: "object" }, checkpointRef: string, digest: string })) }),
+  git: object({ wip: string }), checks: list(checkSchema),
 });
 const demandObservationSchema = object({ memo: string, evidenceLimits: list(string),
   observations: list(object({ source: string, demand: string, reason: string })) });
 const complianceSchema = object({
   status: { enum: ["fulfilled", "gaps", "blocked"] }, reason: string,
-  candidate: candidateSchema,
   requirements: { ...list(object({
     id: string, source: string, reason: string, evidence: list(string), checks: list(string),
     status: { enum: ["fulfilled", "gap", "blocked", "not-applicable"] },
@@ -355,7 +340,7 @@ function persistState(stateKey, value, optionalPlan = null) {
   saveTail = pending.catch(() => {});
   return pending;
 }
-function maxCycles() { return invocation?.version === 4 ? invocation.association?.maxCycles ?? null : 3; }
+function maxCycles() { return invocation?.association?.maxCycles ?? null; }
 function save() {
   if ((loop?.phase === "closing" && !loop.closing || loop?.outcome === "gaps") && !loop.archivePending && !loop.archived)
     {
@@ -774,6 +759,24 @@ function reconcileInterruptedOperations() {
       return save();
     });
   }
+  if (loop.halt.ref?.agent === "pitako.checkpoint-sealer" && loop.attempt?.seal && loop.attempt.stage !== "result") {
+    // Observe the settled sealer before input applies; normal replay then
+    // re-observes the worker and dispatches a fresh seal under the next key.
+    const ref = loop.halt.ref;
+    return observeStatus(ref.runId ?? ref.key, true).then(observed => {
+      const cause = observed?.state === "unknown" ? null : barrier(observed, ref.runId ?? ref.key);
+      if (cause && !["stopped", "interrupted"].includes(cause)) throw nativeBarrier(cause, ref);
+      if ((observed?.runId && ref.runId && observed.runId !== ref.runId) ||
+          (observed?.agent && observed.agent !== "pitako.checkpoint-sealer"))
+        throw new Error("Sealer producer/run identity conflicts with the pending seal.");
+      resolution.observations = [projection(ref.key, observed ?? { ok: false, state: "unknown" })];
+      resolution.stage = "applied";
+      loop.attempt.seal.reconciled = ref.key;
+      delete loop.halt;
+      delete loop.outcome;
+      return save();
+    });
+  }
   if (pendingCheckpointUnit()) {
     const ref = loop.attempt.launch ?? { key: loop.attempt.key };
     if (!resolution.operations?.some(item => same(item, ref)))
@@ -897,8 +900,7 @@ function planConflict(reason) {
   throw new Error(reason);
 }
 function planAuthority(value, result) {
-  if (!value || !["plan", "needs-decision"].includes(value.status) || !text(value.reason) ||
-      !same(value.association, association(loop.number))) planConflict("loop_plan association mismatch.");
+  if (!value || !["plan", "needs-decision"].includes(value.status) || !text(value.reason)) planConflict("Invalid loop_plan decision.");
   if (result && ((result.agent && result.agent !== "pitako.execution-director") ||
       !text(result.runId) || (loop.plan.ref.runId && result.runId !== loop.plan.ref.runId)))
     planConflict("loop_plan producer/run identity conflict.");
@@ -909,8 +911,7 @@ function planAuthority(value, result) {
   }
 }
 function validatePlan(value, number, manifest) {
-  if (!value || !["plan", "needs-decision"].includes(value.status) || !text(value.reason) ||
-      !same(value.association, association(number))) throw new Error("loop_plan association mismatch.");
+  if (!value || !["plan", "needs-decision"].includes(value.status) || !text(value.reason)) throw new Error("Invalid loop_plan decision.");
   if (value.status === "needs-decision") return value;
   if (!text(value.sharedContext?.material) || !Array.isArray(value.sharedContext.references) ||
       !Array.isArray(value.tasks) || !value.tasks.length ||
@@ -922,9 +923,15 @@ function validatePlan(value, number, manifest) {
           Array.isArray(task[field]) && task[field].every(text)) ||
         !task.scope.length || !task.sourceRefs.length || !Array.isArray(task.checks) || !task.checks.length ||
         new Set(task.checks.map(check => check.id)).size !== task.checks.length ||
-        task.checks.some(check => !["id", "requirement", "command", "cwd"].every(field => text(check[field])))) ||
+        task.checks.some(check => !["id", "requirement", "command", "cwd"].every(field => text(check[field])) ||
+          !["focused", "acceptance"].includes(check.tier))) ||
       value.tasks[value.tasks.length - 1].kind !== "verification")
     throw new Error("loop_plan needs full ordered task scopes and a final verification task, even for existing code.");
+  const early = value.tasks.slice(0, -1).filter(task => task.checks.some(check => check.tier === "acceptance")).map(task => task.id);
+  if (early.length)
+    throw new Error(`loop_plan acceptance-tier checks belong only to the LAST verification task; earlier tasks need focused checks: ${early.join(", ")}.`);
+  if (!value.tasks[value.tasks.length - 1].checks.some(check => check.tier === "acceptance"))
+    throw new Error("loop_plan LAST verification task needs at least one acceptance-tier check (the project's complete verification procedure).");
   if (manifest && !same(manifest, value.tasks.map(task => task.id)))
     throw new Error("Original loop_plan order or task identity changed.");
   if (!manifest && loop.plan?.stage !== "admitted" && value.tasks.some(task => invocation.excludedScope?.[task.id]))
@@ -1006,35 +1013,6 @@ function demandReference(ref) {
     .filter(field => text(entry[field])).map(field => [field, entry[field]]))).filter(entry => Object.keys(entry).length);
   if (witnesses?.length) value.results = witnesses;
   return value;
-}
-// Earlier v4 states copied loop N-1's sources into closedDemandSources, every ring
-// entry and loop.demandObservation. Fold them only when every copy agrees.
-function migrateLegacyDemandState() {
-  const closed = invocation.closedDemandSources, open = loop?.demandObservation;
-  const ring = invocation.demandObservations ?? [];
-  if (closed === undefined && open === undefined && !ring.some(item => item && "sources" in item)) return;
-  const conflict = detail => new Error(`Legacy demand observation state is inconsistent (${detail}); retained unchanged, no observation replayed.`);
-  if (invocation.demandSources !== undefined) throw conflict("legacy and single-copy fields coexist");
-  const known = new Map();
-  const record = (number, sources, origin) => {
-    if (!Number.isSafeInteger(number) || !Array.isArray(sources)) throw conflict(`malformed ${origin}`);
-    if (known.has(number) && !same(known.get(number), sources)) throw conflict(`${origin} disagrees for loop ${number}`);
-    known.set(number, sources);
-  };
-  if (closed !== undefined && closed !== null) record(closed.loop, closed.sources, "closedDemandSources");
-  for (const item of ring) {
-    if (!Number.isSafeInteger(item?.loop) || !item.ref) throw conflict("malformed demandObservations entry");
-    record(item.loop - 1, item.sources, `demandObservations loop ${item.loop}`);
-  }
-  if (open !== undefined) {
-    if (!loop || !same(ring.find(item => item.loop === loop.number)?.ref, open?.ref)) throw conflict("loop.demandObservation lacks its ring entry");
-    record(loop.number - 1, open.sources, "loop.demandObservation");
-  }
-  invocation.demandSources = [...known].filter(([, sources]) => sources.length).sort(([a], [b]) => a - b)
-    .map(([number, sources]) => ({ loop: number, sources }));
-  invocation.demandObservations = ring.map(item => ({ loop: item.loop, ref: item.ref }));
-  delete invocation.closedDemandSources;
-  if (loop) delete loop.demandObservation;
 }
 function observeDemands() {
   const sources = pendingDemandSources();
@@ -1453,11 +1431,9 @@ function checkpointFallback(observed, ref, task) {
 function rejectReport(message) {
   return Object.assign(new Error(message), { reportRejection: true });
 }
-function reportCandidate(value) {
-  try { return candidate(value); } catch (error) { throw rejectReport(error.message); }
-}
-function workerValue(result, descriptor, task, statusRef) {
-  const value = result?.structuredOutput;
+function workerValue(result, descriptor, task, statusRef, observed) {
+  const original = result?.structuredOutput;
+  const value = original && { ...original };
   if ((result?.agent !== undefined && result.agent !== "pitako.worker") ||
       // A status response may echo its exact queried run ID as key. That is
       // transport association, not a different producer dispatch key.
@@ -1471,65 +1447,35 @@ function workerValue(result, descriptor, task, statusRef) {
   if (text(result?.output) && /^[\s]*\{/.test(result.output)) {
     let binding;
     try { binding = JSON.parse(result.output); } catch (_) { throw new Error("Invalid complete worker binding JSON."); }
-    if (!same(binding, value)) throw new Error("Changed/conflicting worker binding.");
+    if (!same(binding, original)) throw new Error("Changed/conflicting worker binding.");
   }
-  if (!result?.ok || !value || value.taskId !== descriptor.taskId || value.attempt !== descriptor.number)
-    throw new Error("Worker returned no result for the frozen task/attempt.");
+  if (!result?.ok || !value)
+    throw new Error("Worker returned no result for the frozen attempt.");
   if (!["complete", "continue", "gaps", "blocked"].includes(value.status) ||
       !text(value.workDone) || !text(value.diagnosis) || !Array.isArray(value.remaining) ||
       !value.remaining.every(text) || typeof value.usefulProgress !== "boolean" ||
       !(value.continuation === null || text(value.continuation)) ||
-      !text(value.git?.head) || !text(value.git?.wip) || !Array.isArray(value.git.checkpoints) ||
-      !value.git.checkpoints.every(text))
+      !text(value.git?.wip))
     throw rejectReport("Worker returned no complete task/attempt/progress/diagnosis/Git contract.");
-  if (descriptor.restore && value.status !== "blocked") {
-    const receipt = value.restoreReceipt;
-    const observation = (descriptor.restore.observations ?? [descriptor.restore.observation])
-      .find(item => item.manifest === receipt?.checkpointRef);
-    if (!receipt || !observation || receipt.checkpointRef !== observation.manifest ||
-        !/^[a-f0-9]{64}$/.test(receipt.digest ?? "") || (observation.digest && receipt.digest !== observation.digest) ||
-        receipt.partialRef !== observation.manifest.replace(/manifest\.json$/, "restore.json") ||
-        receipt.restoredRef !== observation.manifest.replace(/manifest\.json$/, "restored.json") ||
-        !same(receipt.position, { loop: loop.number, cursor: loop.cursor, phase: "implementation" }) ||
-        !value.git.checkpoints.includes(receipt.partialRef) || !value.git.checkpoints.includes(receipt.restoredRef))
-      throw new Error("Fallback worker lacks complete actual restoration evidence; no result admitted.");
-    const pause = descriptor.restore.authority?.confirmedPause;
-    if (pause && pause.checkpointRef === observation.manifest.replace(/manifest\.json$/, "pause.json") &&
-        !same(receipt.confirmedPause, { checkpointRef: pause.checkpointRef, digest: pause.digest }))
-      throw new Error("Fallback result lacks exact confirmed pause baseline evidence.");
-    const unit = descriptor.restore.authority?.confirmedUnit;
-    if (unit && unit.checkpointRef === observation.manifest.replace(/manifest\.json$/, "unit.json") &&
-        !same(receipt.confirmedUnit, { checkpointRef: unit.checkpointRef, digest: unit.digest }))
-      throw new Error("Fallback result lacks exact confirmed unit baseline evidence.");
-    candidate(receipt.candidate);
+  // Known identities and checkpoint receipts are supplied only by the current sealer.
+  delete value.checkpointReceipt;
+  delete value.restoreReceipt;
+  delete value.candidate;
+  value.taskId = descriptor.taskId;
+  value.attempt = descriptor.number;
+  if (observed) {
+    value.candidate = candidate(observed.candidate);
+    if (observed.restored) value.restoreReceipt = clone(observed.restored);
+    if (observed.outcome === "sealed") value.checkpointReceipt = {
+      kind: observed.kind, checkpointRef: observed.checkpointRef, digest: observed.digest,
+      candidate: value.candidate, position: clone(observed.position), progress: clone(descriptor.checkpoint.progress),
+    };
+    if (descriptor.restore && value.status !== "blocked" && !value.restoreReceipt)
+      throw new Error("Fallback worker lacks actual restoration evidence; no result admitted.");
+    if (task.kind === "implementation" && value.status === "complete" && !value.checkpointReceipt)
+      throw rejectReport("New implementation unit lacks required sealed file/progress checkpoint.");
   }
-  reportCandidate(value.candidate);
-  // Presence of progress versions new modifying intentions. Retained pre-contract
-  // intentions remain readable, but cannot imply bytes that were never captured.
-  if (task.kind === "implementation" && descriptor.checkpoint?.progress &&
-      value.status === "complete" && !value.checkpointReceipt)
-    throw rejectReport("New implementation unit lacks required sealed file/progress checkpoint.");
-  if (value.checkpointReceipt) {
-    const receipt = value.checkpointReceipt, intent = descriptor.checkpoint;
-    const complete = receipt.kind === "unit";
-    if (receipt.kind === "pause" && !value.remaining.length) {
-      const reason = "Pause checkpoint contradicts missing pending work; no continuation point admitted.";
-      loop.halt = { status: "blocked", code: "semantic-block", reason, ref: clone(descriptor.launch ?? { key: descriptor.key }) };
-      throw new Error(reason);
-    }
-    // A valid seal whose kind contradicts the reported status is a worker report
-    // defect (unit seals only complete results): reject the attempt, don't halt.
-    if (["unit", "pause"].includes(receipt.kind) && complete !== (value.status === "complete"))
-      throw rejectReport(`Checkpoint kind ${receipt.kind} contradicts worker status ${value.status}; unit seals only complete results, other statuses use pause.`);
-    if (!intent?.progress || !["unit", "pause"].includes(receipt.kind) ||
-        receipt.checkpointRef !== `${config.root}/.pi/subagents/checkpoints/${intent.key}/${receipt.kind}.json` ||
-        !/^[a-f0-9]{64}$/.test(receipt.digest ?? "") ||
-        !same(receipt.candidate, value.candidate) || !same(receipt.progress, intent.progress) ||
-        !same(receipt.position, { loop: loop.number, cursor: loop.cursor + (complete ? 1 : 0), phase: "implementation" }) ||
-        !value.git.checkpoints.includes(receipt.checkpointRef))
-      throw new Error("Checkpoint seal does not match admitted unit/pending progress.");
-  }
-  if (value.git.head !== value.candidate.head || !Array.isArray(value.checks) ||
+  if (!Array.isArray(value.checks) ||
       new Set(value.checks.map(check => check?.id)).size !== value.checks.length ||
       task.checks.some(required => !value.checks.some(check => check?.id === required.id)))
     throw rejectReport("Worker result lacks planned check evidence or has duplicate check IDs.");
@@ -1558,17 +1504,20 @@ function workerValue(result, descriptor, task, statusRef) {
     .filter(check => check.result !== "passed" ||
       !same(check.before, value.candidate) || !same(check.after, value.candidate)).map(check => check.id);
   const checksCurrent = staleChecks.length === 0;
-  if (value.status === "complete" && (!checksCurrent || value.remaining.length))
+  if (value.status === "complete" && ((observed && !checksCurrent) || value.remaining.length))
     throw rejectReport(`Task complete contradicts current mandatory checks or pending work.${staleChecks.length ? ` Non-current planned checks: ${staleChecks.join(", ")}.` : ""}${value.remaining.length ? " Pending work remains." : ""}`);
   return { value, checks, checksCurrent };
 }
-function admitWorker(result, descriptor, task, recoveryRef, statusRef) {
+function admitWorker(result, descriptor, task, recoveryRef, statusRef, observed, structural) {
   let parsed;
-  try { parsed = workerValue(result, descriptor, task, statusRef); } catch (error) {
-    // A report that breaks the result contract is a rejected attempt, not a root
-    // halt. Its original stays in the native record; nothing from it is admitted.
-    // A worker-declared block still halts with the validation reason.
-    if (!error?.reportRejection || result?.structuredOutput?.status === "blocked") throw error;
+  // A report that breaks the result contract is a rejected attempt, not a root
+  // halt. Its original stays in the native record; nothing from it is admitted.
+  // A worker-declared block still halts with the validation reason, after the
+  // root's kind-null journal verification already ran in sealAndAdmit.
+  const declaredBlock = result?.structuredOutput?.status === "blocked";
+  if (structural?.rejection && declaredBlock) throw new Error(structural.rejection);
+  try { parsed = structural?.rejection ? structural : workerValue(result, descriptor, task, statusRef, observed); } catch (error) {
+    if (!error?.reportRejection || declaredBlock) throw error;
     parsed = { rejection: String(error.message) };
   }
   const value = parsed.value;
@@ -1576,6 +1525,7 @@ function admitWorker(result, descriptor, task, recoveryRef, statusRef) {
   if (value?.status === "complete" && taskState.completed)
     throw new Error("Duplicate task completion rejected at admission.");
   const base = { ...projection(descriptor.key, result), taskId: descriptor.taskId, attempt: descriptor.number,
+    ...(observed ? { candidate: candidate(observed.candidate) } : {}),
     ...(descriptor.checkpoint ? { checkpoint: {
       key: descriptor.checkpoint.key, manifest: `.pi/subagents/checkpoints/${descriptor.checkpoint.key}/manifest.json`,
     } } : {}) };
@@ -1626,9 +1576,125 @@ function admitWorker(result, descriptor, task, recoveryRef, statusRef) {
   if (["recovery", "native-barrier"].includes(loop.halt?.code) &&
       !(resolution?.stage === "accepted" && same(resolution.halt, loop.halt))) delete loop.halt;
   if (projected.status === "blocked") retainWorkerBlock(projected);
+  if (observed) currentCandidate = candidate(observed.candidate);
   if (parsed.rejection) return projected;
   currentCandidate = projected.candidate;
   return parsed.value;
+}
+function sealerKey(attemptKey, retry) {
+  return `${attemptKey}.seal${retry ? `.r${retry}` : ""}`;
+}
+// A retained seal intention is observed before any fallback, recovery or re-seal.
+// Positive sealer activity is a barrier; settled or unknown status takes the
+// existing route. A reentered seal is never admitted: only a fresh dispatch is.
+function observePendingSealer() {
+  const pending = loop?.attempt?.seal;
+  if (!pending?.retry || loop.attempt.stage === "result") return Promise.resolve();
+  const key = sealerKey(loop.attempt.key, pending.retry - 1);
+  if (budgetRejected(key) || pending.reconciled === key) return Promise.resolve();
+  return observeStatus(key, true).then(observed => {
+    const cause = observed?.state === "unknown" ? null : barrier(observed, key);
+    if (cause) throw nativeBarrier(cause, { key, agent: "pitako.checkpoint-sealer" });
+  });
+}
+// Only the active root can turn the current cooperative result into a seal.
+function sealAndAdmit(result, descriptor, task, recoveryRef, statusRef) {
+  if (loop.attempt.stage === "result") throw new Error("Duplicate attempt admission rejected.");
+  let structural;
+  try { structural = workerValue(result, descriptor, task, statusRef); } catch (error) {
+    if (!error?.reportRejection) throw error;
+    structural = { rejection: String(error.message) };
+  }
+  const kind = recoveryRef || structural.rejection ? null : structural.value.status === "complete" ? "unit"
+    : structural.value.remaining.length ? "pause" : null;
+  const pending = loop.attempt.seal ??= { retry: 0 };
+  const retry = pending.retry;
+  const sealKey = sealerKey(descriptor.key, retry);
+  const intent = descriptor.checkpoint;
+  if (!intent) throw new Error("Missing checkpoint intention for root observation.");
+  let ref = { key: sealKey, agent: "pitako.checkpoint-sealer" };
+  pending.retry = retry + 1;
+  return save().then(() => dispatch([{ key: sealKey, agent: "pitako.checkpoint-sealer",
+    task: JSON.stringify({ v: 1, intent, kind,
+      ...(descriptor.restore ? { restoreSources: descriptor.restore.sourceKeys.map(sourceKey => {
+        const source = invocation.taskFrame.sources.find(item => item.key === sourceKey);
+        if (!source) throw new Error("Missing authenticated restoration source intent.");
+        return source;
+      }) } : {}) }), cwd: config.root, context: "fresh", output: false, outputMode: "inline",
+    outputSchema: false, reads: false, progress: false }])).then(results => {
+    const sealed = results[0];
+    ref = { ...nativeReference(sealKey, sealed), agent: "pitako.checkpoint-sealer" };
+    const cause = barrier(sealed, sealKey);
+    if (cause) throw nativeBarrier(cause, ref);
+    let observed;
+    if (typeof sealed?.output === "string" && utf8Bytes(sealed.output) <= 61440) {
+      try { observed = JSON.parse(sealed.output); } catch (_) { /* Invalid stdout is a barrier, not evidence. */ }
+    }
+    const failures = [sealed, ...(sealed?.results ?? [])].filter(Boolean);
+    if (!sealed?.ok || sealed.agent !== "pitako.checkpoint-sealer" || !text(sealed.runId) ||
+        sealed.key !== undefined && sealed.key !== sealKey || sealed.state !== undefined || sealed.terminalOutcome ||
+        !text(sealed.asyncDir) || !text(sealed.externalAdapter?.outputArtifacts?.stdoutPath) ||
+        !text(sealed.externalAdapter?.outputArtifacts?.stderrPath) ||
+        !Array.isArray(sealed.results) || sealed.results.length !== 1 || sealed.results[0].exitCode !== 0 ||
+        failures.some(item => item.error || item.outputSaveError || item.metadataSaveError || item.transcriptError ||
+          item.outputPartial || item.truncation || item.timedOut || item.processSignal ||
+          item.exitCode !== undefined && item.exitCode !== 0) ||
+        !observed || observed.v !== 1 || observed.kind !== kind ||
+        !["sealed", "observed", "mismatch"].includes(observed.outcome))
+      throw nativeBarrier("Checkpoint sealer lacks successful terminal stdout.", ref);
+    candidate(observed.candidate);
+    const fields = Object.keys(observed).sort().join(",");
+    const baseFields = "candidate,kind,outcome,v";
+    if (observed.outcome === "mismatch") {
+      if (fields !== "candidate,kind,outcome,paths,v" || !Array.isArray(observed.paths) ||
+          !observed.paths.length || observed.paths.length > 10 || observed.paths.some(entry =>
+            !same(Object.keys(entry).sort(), ["actual", "journaled", "partiallyApplied", "path"]) || !text(entry.path) ||
+            ![entry.actual, entry.journaled].every(hash => hash === null || /^[a-f0-9]{64}$/.test(hash)) ||
+            typeof entry.partiallyApplied !== "boolean"))
+        throw nativeBarrier("Invalid checkpoint mismatch observation.", ref);
+      const reason = `Checkpoint journal integrity conflict: ${observed.paths.map(entry =>
+        `${entry.path}: journaled sha256 ${entry.journaled ?? "absence"}, actual sha256 ${entry.actual ?? "absence"}, last step partially applied: ${entry.partiallyApplied}`).join("; ")}.
+Return the files to their journaled bytes and resume (the sealer retries under the next .rN), or start a new mission.`;
+      loop.halt = { status: "blocked", code: "checkpoint-integrity", reason, ref };
+      return save().then(() => { throw Object.assign(new Error(reason), { checkpointIntegrity: true }); });
+    }
+    if (observed.outcome === "sealed") {
+      if (kind === null || fields !== (observed.restored ? "candidate,checkpointRef,digest,kind,outcome,position,restored,v" : "candidate,checkpointRef,digest,kind,outcome,position,v") ||
+          observed.checkpointRef !== `${config.root}/.pi/subagents/checkpoints/${intent.key}/${kind}.json` ||
+          !/^[a-f0-9]{64}$/.test(observed.digest ?? "") || !same(observed.position,
+            { loop: intent.loop, cursor: intent.cursor + (kind === "unit" ? 1 : 0), phase: intent.phase }))
+        throw nativeBarrier("Invalid checkpoint seal receipt.", ref);
+    } else if (fields !== baseFields && fields !== "candidate,kind,outcome,restored,v")
+      throw nativeBarrier("Invalid checkpoint candidate observation.", ref);
+    if (observed.restored) {
+      const receipt = observed.restored, restore = descriptor.restore;
+      const directory = receipt.checkpointRef?.replace(/\/manifest\.json$/, "");
+      const allowed = restore && [...restore.sourceKeys.map(key => `${config.root}/.pi/subagents/checkpoints/${key}`),
+        ...(restore.authority.confirmedUnit ? [restore.authority.confirmedUnit.checkpointRef.replace(/\/unit\.json$/, "")] : [])];
+      const confirmed = field => restore?.authority[field]?.checkpointRef === `${directory}/${field === "confirmedPause" ? "pause" : "unit"}.json` ? {
+        checkpointRef: restore.authority[field].checkpointRef, digest: restore.authority[field].digest,
+      } : undefined;
+      candidate(receipt.candidate);
+      if (!allowed?.includes(directory) || receipt.partialRef !== `${directory}/restore.json` ||
+          receipt.restoredRef !== `${directory}/restored.json` || !/^[a-f0-9]{64}$/.test(receipt.digest ?? "") ||
+          !same(receipt.position, { loop: intent.loop, cursor: intent.cursor, phase: intent.phase }) ||
+          !same(receipt.confirmedPause, confirmed("confirmedPause")) ||
+          !same(receipt.confirmedUnit, confirmed("confirmedUnit")))
+        throw nativeBarrier("Invalid checkpoint restoration observation.", ref);
+    }
+    // This synchronous admission consumes only this dispatch's in-memory result.
+    const admitted = admitWorker(result, descriptor, task, recoveryRef, statusRef, observed, structural);
+    return save().then(() => admitted);
+  }).catch(error => {
+    if (error.spawnBudgetExhausted) { pending.retry = retry; throw error; }
+    if (error.nativeBarrier) {
+      loop.halt = { status: ["stopped", "interrupted"].includes(error.nativeBarrier) ? "cancelled" : "blocked",
+        code: "native-barrier", cause: error.nativeBarrier, reason: String(error.message),
+        ref: clone(error.nativeReference ?? ref) };
+      return save().then(() => { throw error; });
+    }
+    throw error;
+  });
 }
 // A pending seal contains only frozen, persisted material; reentry diagnostics never enter its bytes.
 function archiveProjection(value) {
@@ -1942,8 +2008,10 @@ try {
   if (!text(config.missionId) || !text(config.missionPath) || !text(config.invocation))
     return finish("blocked", "Existing native missionId and actually returned missionPath are required.");
   invocation = await state.get(key);
-  if (invocation && invocation.version !== 4)
-    return finish("blocked", "Retained execution predates state v4; no migration or replay is supported; retained unchanged.");
+  // Incompatible retained state fails before any resume or dispatch.
+  if (!Number.isSafeInteger(config.stateVersion)) return finish("blocked", "Missing resolved execute state contract version.");
+  if (invocation && invocation.version !== config.stateVersion)
+    return finish("blocked", `Retained execution created by an incompatible Pitako contract v${invocation.version}; start a new mission. No migration or replay is supported; retained unchanged.`);
   activePlan = invocation?.activePlan;
   loop = invocation?.loop;
   // Validate the stored request before even read-only reconstruction. Snapshot
@@ -1951,7 +2019,7 @@ try {
   if (invocation?.association) {
     if (!same(invocation.amendments ?? [], config.amendments ?? []))
       return finish("blocked", "Immutable admission amendments changed; preserve retained path, SHA-256 and provenance, no recovery merge or replacement.");
-    if (invocation.version !== 4 || !/^[a-f0-9]{64}$/.test(invocation.admissionBinding ?? ""))
+    if (!/^[a-f0-9]{64}$/.test(invocation.admissionBinding ?? ""))
       return finish("blocked", "Retained execution predates bound native admission; no migration or replay is supported. Preserve its evidence. Inspect its actual native terminal/barrier state; a revised assignment and new admission require actual human authorization, not resuming a terminal root.");
     const expected = invocation.association;
     if (expected.missionId !== config.missionId || expected.missionPath !== config.missionPath ||
@@ -1965,8 +2033,8 @@ try {
       return finish("blocked", "Retained host observation belongs to a different immutable request; retained unchanged.");
   }
   const legacy = await state.get("pitako-execution");
-  if ((invocation && ![4].includes(invocation.version)) || (legacy && ![4].includes(legacy.version)))
-    return finish("blocked", "Obsolete execute supervisor state cannot be replayed or migrated; retained unchanged.");
+  if (legacy && legacy.version !== config.stateVersion)
+    return finish("blocked", `Retained execution created by an incompatible Pitako contract v${legacy.version}; start a new mission. No migration or replay is supported; retained unchanged.`);
   if (legacy && (legacy.version !== invocation?.version || !same(legacy.association, invocation?.association) ||
       legacy.association.invocation !== config.invocation))
     return finish("blocked", "Native mission already belongs to another immutable invocation; no replacement writer dispatched.");
@@ -2070,7 +2138,7 @@ try {
     if (!Number.isSafeInteger(admitted.maxCycles) || admitted.maxCycles < 1)
       throw new Error("Invalid pitako.execute.maxCycles admission receipt.");
     invocation = {
-      version: 4, association: { missionId: config.missionId, missionPath: config.missionPath,
+      version: config.stateVersion, association: { missionId: config.missionId, missionPath: config.missionPath,
         invocation: config.invocation, root: metadata.root, commonDir: metadata.commonDir,
         source: metadata.selected.source, digest: metadata.selected.digest,
         maxCycles: admitted.maxCycles, sourceRefs: config.sourceRefs ?? [] },
@@ -2086,11 +2154,9 @@ try {
     await save();
   } else {
     replay = true;
-    if (invocation.version === 4 && (!Number.isSafeInteger(invocation.association?.maxCycles) ||
+    if ((!Number.isSafeInteger(invocation.association?.maxCycles) ||
         invocation.association.maxCycles < 1 || !same(invocation.association.sourceRefs, config.sourceRefs ?? [])))
       throw new Error("Incompatible immutable maxCycles/sourceRefs association; retained unchanged.");
-    if (invocation.version === 2 && ((config.sourceRefs ?? []).length || invocation.association?.maxCycles !== undefined))
-      throw new Error("Legacy fixed-three association cannot acquire configuration or source references.");
     if (metadata.selected.digest !== invocation.association.digest)
       throw new Error(`Immutable full snapshot content changed: ${metadata.selected.source}; retained unchanged. Restore exact bytes from a reliable original and deliver desired changes as an explicit human addendum; without reliable originals remain blocked. A revised admission needs actual human authorization.`);
     const observed = metadata.selected;
@@ -2102,14 +2168,8 @@ try {
       return finish("blocked", `Immutable mission/invocation/snapshot/worktree association changed at ${metadata.selected.source}; expected ${JSON.stringify(expected)}, observed binding ${current.binding}, source ${observed.source}, digest ${observed.digest}, root ${metadata.root}, commonDir ${metadata.commonDir}. Preserve the admitted snapshot; restore exact bytes from a reliable original and deliver desired changes as an explicit human addendum. If originals are unavailable remain blocked; a revised admission requires actual human authorization. Native barriers require supported native reconciliation.`);
     activePlan = invocation.activePlan;
     invocation.activePlan = null;
-    migrateLegacyDemandState();
   }
   admissionValidated = true;
-  if (invocation.version === 4) {
-    associationSchema.properties.maxCycles = integer;
-    associationSchema.properties.sourceRefs = list(object({ path: string, digest: string }));
-    associationSchema.required.push("maxCycles", "sourceRefs");
-  }
   if (!legacy) {
     try { await persistState("pitako-execution", { version: invocation.version, association: invocation.association }); }
     catch (error) { persistenceFailed = true; throw new Error(`Essential persistence failed; dispatch halted: ${String(error)}`); }
@@ -2206,7 +2266,16 @@ try {
     delete loop.outcome;
     await save();
   }
-  if (["capacity", "native-dispatch", "semantic-block"].includes(loop?.halt?.code))
+  // After the human returns the files to their journaled bytes, current input
+  // clears the integrity halt; replay re-seals under the next sealer key.
+  if (resolution?.stage === "accepted" && resolution.loop === loop?.number && !loop.archived &&
+      loop.halt?.code === "checkpoint-integrity" && same(resolution.halt, loop.halt)) {
+    resolution.stage = "applied";
+    delete loop.halt;
+    delete loop.outcome;
+    await save();
+  }
+  if (["capacity", "native-dispatch", "semantic-block", "checkpoint-integrity"].includes(loop?.halt?.code))
     return finish(loop.halt.status, loop.halt.reason);
   // A prior barrier is not a historical universal hold. Recovery re-observes the
   // exact writer or analysis producer before any further external dispatch.
@@ -2248,7 +2317,6 @@ try {
       // Slot is consumed durably BEFORE calling a fresh read-only director.
       await save();
     }
-    associationSchema.const = association(loop.number);
     if (loop.phase === "director") {
       const directorKey = `${key}.l${loop.number}.director`;
       if (!loop.plan || budgetRejected(directorKey)) {
@@ -2275,13 +2343,17 @@ or [] when none. Prefer independent outcomes, not artificial fragments; scope/ef
 shared resources, not concurrency authority.
 Inspection/check-only tasks, or tasks that may finish without edits, are verification.
 Planned checks gate the task's FINAL candidate after its last write; pre-edit diagnosis belongs in goal/expectedResult, not checks.
+Every check has a tier. Non-final tasks use ONLY focused checks: the narrowest commands that exercise the
+task's affected behavior (named test files, not broad directory globs or the whole suite).
+The project's complete verification procedure (for example GATES.md) is tier acceptance and belongs ONLY
+to the LAST verification task; never schedule an intermediate complete gate.
 Use implementation only for a concrete editing repair requiring real pre-write capture and sealed file/progress checkpoint.
 Include a LAST verification task for final checks after all writes even when the implementation already exists. Shared context is complete.${
   Array.isArray(config.originalProblem?.criteria) ? `
 ORIGINAL PROBLEM (advisory notice, not a gate or scope change): the spec's Original problem is verified by acceptance
 criteria ${config.originalProblem.criteria.map(criterion => `#${criterion}`).join(", ")}. Set verifies: [criterion numbers] on each planned check
 that demonstrates one of them, preferably in the last verification task. Omit verifies on other checks.` : ""}
-No replacement task list elsewhere. Carry the exact association above. Native permissions and Stop apply.`,
+No replacement task list elsewhere. The root attaches the known association. Native permissions and Stop apply.`,
           planSchema);
         loop.plan = { ...projection(directorKey, result), stage: "published" };
         if (barrier(result)) throw nativeBarrier(barrier(result));
@@ -2317,7 +2389,7 @@ No replacement task list elsewhere. Carry the exact association above. Native pe
       } catch (error) {
         const diagnostic = String(error?.message ?? error);
         if (loop.plan.stage === "admitted" || loop.manifest ||
-            !/^loop_plan (?:needs full ordered task scopes|dependencies require)/.test(diagnostic))
+            !/^loop_plan (?:needs full ordered task scopes|dependencies require|acceptance-tier checks|LAST verification task needs)/.test(diagnostic))
           throw error;
         if (invocation.planRejections.some(item => item.diagnostic === diagnostic)) {
           const reason = `No new useful corrective input for repeated plan defect: ${diagnostic}`;
@@ -2329,7 +2401,7 @@ No replacement task list elsewhere. Carry the exact association above. Native pe
           throw new Error(reason);
         }
         const rejection = { diagnostic,
-          correction: "Publish a NEW complete plan with full task scopes/checks, final verification last, and dependsOn: [{taskId, reason}] containing only unique necessary earlier IDs with nonblank reasons. Do not repair or reuse the rejected original.",
+          correction: "Publish a NEW complete plan with full task scopes/checks, focused-tier checks before a final verification task that alone carries the acceptance tier, and dependsOn: [{taskId, reason}] containing only unique necessary earlier IDs with nonblank reasons. Do not repair or reuse the rejected original.",
           ref: clone(loop.plan.ref), recoverySource: loop.plan.recoverySource ?? null };
         // Rejection and its accounted gap are one essential write. A replay of
         // this committed cut advances, never recovers or readmits that plan.
@@ -2342,6 +2414,7 @@ No replacement task list elsewhere. Carry the exact association above. Native pe
         loopReport("gaps", `New plan rejected before workers: ${diagnostic}`);
         continue;
       }
+      loop.plan.association = association(loop.number);
       loop.plan.status = activePlan.status;
       if (activePlan.status === "needs-decision") {
         loop.halt = { status: "blocked", code: "semantic-block", reason: excerpt(activePlan.reason), ref: loop.plan.ref };
@@ -2359,6 +2432,7 @@ No replacement task list elsewhere. Carry the exact association above. Native pe
       // barrier before dispatching even an optional read-only plan inspector.
       let attemptObservation;
       if (replay && loop.attempt && loop.attempt.stage !== "result" && !budgetRejected(loop.attempt.key)) {
+        await observePendingSealer();
         const ref = loop.attempt.launch ?? { key: loop.attempt.key };
         attemptObservation = await observeStatus(ref.runId ?? ref.key, !!loop.attempt.checkpoint);
         assertFallbackProducer(attemptObservation, ref);
@@ -2408,6 +2482,7 @@ No replacement task list elsewhere. Carry the exact association above. Native pe
           await save();
         } else if (loop.attempt && !loop.attempt.restore?.undispatched && !budgetRejected(loop.attempt.key)) {
           // Never call an unresolved writer key as if native reuse were read-only.
+          await observePendingSealer();
           const ref = loop.attempt.launch ?? { key: loop.attempt.key };
           let observed = attemptObservation ?? await observeStatus(ref.runId ?? ref.key);
           attemptObservation = null;
@@ -2422,7 +2497,7 @@ No replacement task list elsewhere. Carry the exact association above. Native pe
           if (observed?.runId && observed?.structuredOutput &&
               (!ref.runId || observed.runId === (loop.attempt.nativeContinuation?.ref.runId ?? ref.runId))) {
             await observeMainRequests();
-            admitWorker(observed, loop.attempt, task, undefined, ref.runId ?? ref.key);
+            await sealAndAdmit(observed, loop.attempt, task, undefined, ref.runId ?? ref.key);
           } else {
             if (ref.runId && observed?.runId && observed.runId !== ref.runId)
               throw new Error("Worker producer/run identity conflicts with frozen attempt.");
@@ -2431,7 +2506,7 @@ No replacement task list elsewhere. Carry the exact association above. Native pe
             if (recovered.status !== "recovered" || !recovered.workerResult)
               throw new Error(`Unresolved writer dispatch: ${recovered.reason}; no blind reattachment or replacement.`);
             await observeMainRequests();
-            admitWorker({ ...observed, ok: true, runId: loop.attempt.launch?.runId ?? ref.runId,
+            await sealAndAdmit({ ...observed, ok: true, runId: loop.attempt.launch?.runId ?? ref.runId,
               structuredOutput: recovered.workerResult }, loop.attempt, task,
               loop.recoveries.find(item => item.subject === `attempt-result:${loop.attempt.taskId}:${loop.attempt.number}`).ref,
               ref.runId ?? ref.key);
@@ -2502,10 +2577,7 @@ restoration. Never restore other paths,
 completed tasks to pre-unit bytes, earlier WIP, Git or native mission state. A confirmedUnit
 source is usable only when pending captures are absent: preserve its sealed POST-unit bytes
 and pending position, never its manifest preimages or an unadmitted seal. If attribution/conflict fails, stop.
-Retain returned partialRef/checkpointRef and restored.json in git.checkpoints.
-Return restoreReceipt with the complete actual helper receipt position/candidate/checkpointRef/partialRef,
-plus restoredRef (actual restored.json path) and digest (actual original manifest file SHA-256 from the helper receipt),
-and its exact confirmedPause or confirmedUnit {checkpointRef, digest} whenever restore.authority carries one.
+The root sealer reads the actual restore.json and restored.json; do not echo a restore receipt.
 This is direct writer execution evidence, not an independent inspector attestation. A settled restore
 receipt means do NOT restore again after later task edits. Then capture the NEW checkpoint below
 before pending work. Complete only this task and run current required checks.
@@ -2522,18 +2594,13 @@ Do not bypass the effect journal with ordinary edit/write/patch commands.
 The manifest limits rollback, not scope. If another affected path is needed, return useful
 same-task continuation before writing it; the next attempt captures a new unit.
 Capture failure means no modifying work. Existing artifacts require reconciliation, never overwrite.
-Retain checkpoint refs in git.checkpoints. Never restore a unit with an admitted complete result.
-Verification tasks are not checkpoint units: without checkout writes, do not call checkpoint_create and return no checkpointReceipt; if writing, capture pre first and seal as usual.
-After all owned writes settle, call checkpoint_create({kind:"unit"}) for a completed implementation unit.
-Seal kind must match status: unit only with status complete; blocked, continue or gaps use pause.
+Never restore a unit with an admitted complete result.
+Verification tasks without checkout writes do not call checkpoint_create.
+After all owned journaled writes settle, return your decision-only structured result.
+The root chooses the checkpoint kind and seals metadata; do not call unit/pause, construct
+checkpointReceipt, restoreReceipt or candidate identity, or transcribe checkpoint references.
 Status and remaining describe THIS task; inherited mission gaps outside its scope go in diagnosis.
-Return its actual structured checkpointReceipt and retain checkpointRef in git.checkpoints; do not
-reconstruct the receipt. Tool success/sealing is NOT task confirmation or cursor advancement.
-Only root durable result admission confirms that point.
-For a cooperative normal pause, when native control still permits capture, call checkpoint_create({kind:"pause"}) and
-return the actual receipt with non-complete status (blocked, continue or gaps), remaining pending work, and yield control: its cursor stays pending. This captures current
-WIP, not task completion. Stop/refusal or abrupt disappearance does NOT trigger seal or extra edits;
-the previous confirmed point remains authoritative. Never fabricate a post-cut checkpoint.
+Stop/refusal or abrupt disappearance never authorizes extra edits or a promised post-cut capture.
 Restoration is checkpoint-first after best-effort pertinent writer observation. Missing or
 inconclusive historical receipts do not require resume/inspector chains. Positive current
 activity and native Stop/refusal/permission/capacity remain barriers; never fabricate settlement.
@@ -2545,8 +2612,8 @@ If inline definition is unavailable, read ORIGINAL COMPLETE loop_plan through th
 validate full association, manifest ${JSON.stringify(loop.manifest)}, order/index and selected task ID BEFORE edits.
 No definition => report blocked, never reconstruct scopes. Continuation reads the exact preceding result
 ${JSON.stringify(descriptor.continuationRef)} and addresses only useful diagnosed pending work on THIS task.
-Report taskId/attempt/status, workDone, concrete remaining, causal diagnosis, usefulProgress/continuation,
-Git HEAD/checkpoints/WIP and actual command/cwd/output/logPaths/result for EVERY planned check.
+Report status, workDone, concrete remaining, causal diagnosis, usefulProgress/continuation,
+Git WIP and actual command/cwd/output/logPaths/result for EVERY planned check.
 Run each planned check exactly as its command/cwd state (tool call or shell) and report them verbatim;
 tool preferences never rewrite it. Alternatives are diagnostics with distinct IDs.
 Use native tool output capture; do not add tee, redirection or another shell wrapper solely for logging.
@@ -2558,7 +2625,7 @@ Use null for uncaptured diagnostic before/after identities; retain declared iden
 Bracket EVERY planned check, including tool-call checks such as file_sha256 or git_status, with checkoutEvidence; capture it immediately before the first planned check. One capture may serve as after of one check and before of the next only if nothing runs in between. Null identities are allowed only for diagnostic checks; a planned check without captured before/after must be re-run bracketed, never reported complete.
 Do not conceal material defects in diagnostics: report them as pending work. Only planned checks determine mandatory currency.
 Use existing extensions/spec-plans.ts checkoutEvidence(root) identity BEFORE/AFTER checks and AFTER LAST writes;
-include head/fingerprint candidate. A check only passes for that unchanged final candidate (including WIP).
+record those identities in each check before/after only. A check only passes for that unchanged final candidate (including WIP); the root observes the final candidate.
 Use ordinary tools, inspect host resources and actual tasks before large checks. No blind retries.
 Return structured_output; complete requires all planned checks current and no pending work.
 continue requires useful progress plus concrete diagnosed continuation, not a replacement plan.`,
@@ -2592,9 +2659,9 @@ continue requires useful progress plus concrete diagnosed continuation, not a re
           const recovered = await inspectRecovery("attempt-result", loop.attempt.launch);
           if (recovered.status !== "recovered" || !recovered.workerResult)
             throw new Error(`Unresolved writer result: ${recovered.reason}`);
-          value = admitWorker({ ...result, structuredOutput: recovered.workerResult }, descriptor, task,
+          value = await sealAndAdmit({ ...result, structuredOutput: recovered.workerResult }, descriptor, task,
             loop.recoveries.find(item => item.subject === `attempt-result:${descriptor.taskId}:${descriptor.number}`).ref);
-        } else value = admitWorker(result, loop.attempt, task);
+        } else value = await sealAndAdmit(result, loop.attempt, task);
         await save();
         if (invocation.sealPending) await archiveSeal();
         if (value.status === "blocked") {
@@ -2617,12 +2684,16 @@ continue requires useful progress plus concrete diagnosed continuation, not a re
       let reviewBudgetError;
       // reviewPhase owns its actual dynamic angles/critique/one-defense/synthesis.
       // Replay reconciles each retained call; repeating a key is not observation.
-      const reviewRuns = { all: requests => analysisDispatch(requests.map(request => ({
+      // The deterministic access verifier is idempotent, model-free and writes only
+      // receipts: dispatch it directly, not as a retained model analysis call.
+      const reviewRuns = { all: requests => (requests.every(request => request.agent === "pitako.access-verifier")
+        ? dispatch(requests.map(request => ({ ...request, cwd: config.root, reads: false, progress: false })))
+        : analysisDispatch(requests.map(request => ({
         ...request, cwd: config.root, reads: false, progress: false,
       }))).then(results => {
         results.forEach((result, index) => usage(result, requests[index].key));
         return results;
-      }).catch(error => {
+      })).catch(error => {
         if (error?.spawnBudgetExhausted) reviewBudgetError = error;
         throw error;
       }) };
@@ -2640,6 +2711,7 @@ No own writer is active. Do not run checks or repair. Only clear screening permi
 Read the actual sources and full referenced reports, not previews. Candidate: ${JSON.stringify(loop.candidate)}.` },
       }, reviewRuns, { prefix: `${key}.l${loop.number}.review.`, mode: "execute",
         decisionReference: { stateKey: key, loop: loop.number, plan: loop.plan.ref, candidate: loop.candidate },
+        access: { missionPath: config.missionPath, namespace: `execute-${config.invocation}` },
       });
       if (reviewBudgetError) throw reviewBudgetError;
       if (persistenceFailed) throw new Error(persistenceReason);
@@ -2708,7 +2780,8 @@ no unresolved material gaps and this SAME candidate. Otherwise gaps or blocked. 
         complianceSchema, false, analysisDispatch);
       const value = result?.structuredOutput;
       const complianceRef = loop.compliance?.ref;
-      loop.compliance = { ...projection(complianceKey, result), candidate: value?.candidate ? candidate(value.candidate) : null,
+      // The judged candidate is workflow-known (it is in the prompt); never a model echo.
+      loop.compliance = { ...projection(complianceKey, result), candidate: candidate(loop.candidate),
         reason: excerpt(value?.reason),
         unresolved: Array.isArray(value?.requirements) ? value.requirements.filter(item => ["gap", "blocked"].includes(item?.status))
           .map(item => ({ id: item.id, source: item.source, status: item.status, reason: item.reason })) : [] };
@@ -2909,7 +2982,7 @@ no unresolved material gaps and this SAME candidate. Otherwise gaps or blocked. 
       hostReconstruction.stage = "failed";
       hostReconstruction.failure = clone(hostHalt);
     }
-    try { await persistState(key, { ...(invocation ?? { version: 4 }), hostHalt }); }
+    try { await persistState(key, { ...(invocation ?? { version: config.stateVersion }), hostHalt }); }
     catch (saveError) {
       persistenceFailed = true;
       persistenceReason = `Essential persistence failed; host observation could not be retained: ${String(saveError?.message ?? saveError)}`;

@@ -71,10 +71,13 @@ questions and sources for grilling; full originals remain separately recoverable
 Missing access blocks dependent conclusions; the context handoff does not claim
 foreground access was observed or require another acknowledgement phase.
 Feed the complete assignment, material evidence (including contradictions),
-settled human decisions/provenance and remaining questions to the existing
-[architecture workflow](../architecture/workflow.js). Launch it in background
-with `args: { currentDecision, workDescription: "<concrete single-line work>", planning: true, consultation: "<stable-id>", maxRounds: 10 }`
+settled human decisions/provenance and remaining questions to the registered
+named resource `pitako.architecture` (see the [architecture skill](../architecture/SKILL.md));
+raw script paths fail. Run `mission.show` for the planning mission and copy the
+exact `Mission record path (args.missionPath): <path>` line. Launch it in background
+with `workflow: "pitako.architecture"`, `args: { currentDecision, workDescription: "<concrete single-line work>", planning: true, consultation: "<stable-id>", maxRounds: 10, missionId: "<planning-mission-id>", missionPath: "<planning mission record path>" }`
 and explicit `options: { missionId: "<planning-mission-id>" }` in the same cwd.
+Plan semantics are unchanged; only the launch is by name.
 Do not invent runs.workflow, import/fs APIs or child agentOverrides.
 
 Build `currentDecision` using the complete version-1 snapshot shape in the
@@ -105,7 +108,7 @@ reasons, contradictions, limits and sources. Never answer preferences yourself.
 Record actual per-ID human provenance, including explicit deferrals or unknowns.
 A human yes to an agent recommendation is agent-accepted origin, not a human request.
 
-Re-enter the SAME script, consultation, mission and `planning: true` with the exact
+Re-enter the SAME named resource, consultation, mission and `planning: true` with the exact
 returned `continuation` plus `humanAnswers: { consultation, revision, round, answers }`.
 Take revision and round from the returned frontier; each answer is
 `{ id, disposition: "answer" | "defer" | "unknown", content, provenance }`.
@@ -122,8 +125,8 @@ A pause adds no round; even at round ten answers lead only to finish or blocked.
 Native Stop, cancellation, permission rejection and ambiguous/unsettled dispatch
 remain fatal, not `needs-human`.
 
-Outside the paused stage, for useful further factual evidence invoke the SAME script,
-consultation ID, `planning: true` and mission with the exact returned version-2
+Outside the paused stage, for useful further factual evidence invoke the SAME named resource,
+consultation ID, `planning: true` and mission with the exact returned version-3
 `continuation`. For unchanged instructions use `evidence` for factual input;
 for changed instructions use an explicit complete `replacement` with consultation,
 expected current revision and preserved/replaced obligations, as documented in

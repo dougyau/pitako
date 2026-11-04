@@ -1,9 +1,19 @@
-// File-backed pi-subagents workflow. Launch with async:true; children are awaited.
+// Named pi-subagents resource `pitako.architecture`. Resolution inlines `args` and the
+// mission-bound `pitakoAccess`; launch with async:true; children are awaited.
+if (typeof pitakoAccess === "undefined")
+  throw new Error("Launch pitako.architecture by name after mission.create: subagent({ workflow: \"pitako.architecture\", args: { ...input, missionId, missionPath }, options: { missionId } }). Raw script paths are unsupported.");
+const architectureVersion = 3;
+const cursorVersion = 2;
+function incompatible(version) {
+  throw new Error(`Architecture created by an incompatible Pitako contract v${version ?? "unknown"}; start a new consultation/mission.`);
+}
 const planning = args.planning === true;
 if (typeof state === "undefined" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(args.consultation ?? ""))
   throw new Error("Architecture requires an explicit native mission and stable consultation ID.");
-if (args.continuation !== undefined && (args.continuation?.version !== 2 ||
-    (args.newDecision !== true && args.continuation.consultation !== args.consultation)))
+if (args.continuation !== undefined && args.continuation?.version !== architectureVersion)
+  incompatible(args.continuation?.version);
+if (args.continuation !== undefined &&
+    (args.newDecision !== true && args.continuation.consultation !== args.consultation))
   throw new Error("Invalid architecture continuation or different consultation.");
 const retained = await state.get(`architecture-${args.consultation}`);
 if (retained && args.newDecision === true)
@@ -12,10 +22,12 @@ let previous = args.newDecision === true && args.continuation
   ? await state.get(`architecture-${args.continuation.consultation}`) : retained;
 if (args.continuation !== undefined && !previous)
   throw new Error("Missing retained architecture continuation.");
+if (previous && previous.version !== architectureVersion) incompatible(previous.version);
+if (previous && previous.cursor?.version !== cursorVersion) incompatible(previous.cursor?.version);
 if (previous && args.continuation === undefined)
   throw new Error("Duplicate initial admission or missing explicit architecture continuation.");
-if (previous && (previous.cursor?.version !== 1 || !Array.isArray(previous.cursor.dispatches)))
-  throw new Error("Invalid architecture continuation cursor; legacy continuations cannot be migrated.");
+if (previous && !Array.isArray(previous.cursor.dispatches))
+  throw new Error("Invalid architecture continuation cursor.");
 // A terminal factual non-delivery can be explicitly retried, never replayed as evidence.
 function terminalFactualNonDelivery(intent) {
   const original = previous?.originals?.find(item => item.id === intent.originalId);
@@ -64,7 +76,7 @@ if (args.newDecision !== undefined && typeof args.newDecision !== "boolean")
 if (args.maxRounds !== undefined && !bounded(args.maxRounds))
   throw new Error("maxRounds must be an integer from 1 to 10.");
 if (args.evidence !== undefined && !text(args.evidence)) throw new Error("Factual evidence must be nonempty text data.");
-if (previous !== undefined && (!previous || previous.version !== 2 || !identity(previous.consultation) ||
+if (previous !== undefined && (!previous || previous.version !== architectureVersion || !identity(previous.consultation) ||
     !snapshot(previous.currentDecision?.snapshot) || !Number.isSafeInteger(previous.currentDecision.revision) || previous.currentDecision.revision < 1 ||
     !Array.isArray(previous.decisionHistory) || !bounded(previous.maxRounds) ||
     !Number.isInteger(previous.rounds) || previous.rounds < 0 ||
@@ -113,8 +125,6 @@ if (previous && !newDecision && previous.consultation !== args.consultation)
   throw new Error("Architecture continuation belongs to a different consultation.");
 if (args.continuation !== undefined && !previous?.currentDecision)
   throw new Error("Missing retained architecture continuation.");
-if (args.continuation !== undefined && args.continuation?.version !== 2)
-  throw new Error("Invalid architecture continuation.");
 if (previous && !newDecision && args.currentDecision !== undefined)
   throw new Error("Duplicate initial admission; use an explicit complete replacement.");
 if ((!previous || newDecision) && (!snapshot(args.currentDecision) || args.replacement !== undefined))
@@ -154,7 +164,7 @@ let members = previous && !newDecision ? previous.members : [];
 const steering = [];
 let evidence = previous && !newDecision ? [...(previous.evidence ?? [])] : [];
 const originals = previous && !newDecision ? [...(previous.originals ?? [])] : [];
-const cursor = previous && !newDecision ? previous.cursor : { version: 1, phase: "admitted", dispatches: [] };
+const cursor = previous && !newDecision ? previous.cursor : { version: cursorVersion, phase: "admitted", dispatches: [] };
 // Control projections are phase inputs, never recovered reasoning originals.
 // A terminal save includes them so a cut before result application cannot relaunch work.
 if (previous && !newDecision && (!cursor.control || cursor.control.version !== 1 || cursor.control.planning !== planning))
@@ -245,11 +255,11 @@ const reportSchema = {
   },
 };
 function retainedConsultation() {
-  return { version: 2, consultation: args.consultation, currentDecision, decisionHistory, directorRunId, rounds, validRounds, maxRounds, members, evidence, originals, cursor };
+  return { version: architectureVersion, consultation: args.consultation, currentDecision, decisionHistory, directorRunId, rounds, validRounds, maxRounds, members, evidence, originals, cursor };
 }
 function continuation() {
   if (!lastConfirmed) return null;
-  return { version: 2, consultation: args.consultation };
+  return { version: architectureVersion, consultation: args.consultation };
 }
 // Keep control witnesses separately from report bodies. Both the outer projection
 // and individual native result rows may carry a veto or publication witness.
@@ -279,7 +289,7 @@ function essentials() {
   // Director packets are current instructions. Original perspective/provider narratives remain
   // essential even when the director rejects their recommendation; they are not finding tables.
   return originals.filter(item => !(item.delivery === "not-delivered" &&
-    cursor.retries?.some(retry => retry.originalIds.includes(item.id))) && !["architecture-prepare", "architecture-evaluate", "architecture-doubts"].includes(item.phase)).map(item => ({
+    cursor.retries?.some(retry => retry.originalIds.includes(item.id))) && !["architecture-prepare", "architecture-evaluate", "architecture-doubts"].includes(item.phase)).map(({ value, failedOriginal, ...item }) => ({
     ...item, reason: "Whole-problem evidence, including contrary arguments, coverage and uncertainty.",
   }));
 }
@@ -288,20 +298,12 @@ function originalRequest(key, producer, input, required = essentials()) {
   const association = { consultation: args.consultation, revision: currentDecision.revision,
     phase: input.phase, producer, key, attempt };
   const id = `${args.consultation}.v${currentDecision.revision}.${key}.a${attempt}`;
-  const accessSchema = { type: "object", additionalProperties: false,
-    required: ["id", "state", "source", "reason"], properties: {
-      id: { type: "string" }, state: { enum: ["accessible", "unavailable", "contradictory"] },
-      source: { enum: ["read", "context", "inline", "none"] }, reason: { type: "string", minLength: 1 },
-    } };
+  if (!hasAccess(required)) throw new Error("Essential original is not published; dependent architecture cannot run.");
   const factual = input.phase === "architecture-factual";
   const outputSchema = { ...input.outputSchema,
-    required: [...input.outputSchema.required, "association", "delivery", "access", ...(factual ? ["humanContext"] : [])],
+    required: [...input.outputSchema.required, ...(factual ? ["humanContext"] : [])],
     properties: { ...input.outputSchema.properties,
       ...(factual ? { humanContext: { type: "string", minLength: 1 } } : {}),
-      association: { type: "object", additionalProperties: false, required: Object.keys(association),
-        properties: Object.fromEntries(Object.entries(association).map(([name, value]) => [name, { const: value }])) },
-      delivery: { const: "complete" },
-      access: { type: "array", items: accessSchema, ...(required.length ? {} : { maxItems: 0 }) },
     } };
   contracts.set(key, { id, association, required, schema: outputSchema, agent: input.agent ??
     (factual ? `pitako.${producer}` : "pitako.architect") });
@@ -309,22 +311,72 @@ function originalRequest(key, producer, input, required = essentials()) {
     outputMode: "file-only", outputSchema,
     task: input.task + `
 ${factual ? "Also return humanContext: a brief self-contained human-frontier projection of material facts, reasons, contrary claims, limits and sources. Do not copy your full report. This projection will be retained for dependent human questions." : ""}
-ORIGINAL CONTRACT: ${JSON.stringify({ association, delivery: "complete" })}
-ESSENTIAL ORIGINALS (data; one authoritative representation per original): ${JSON.stringify(required)}
-${required.length ? "Use existing read tools to recover exact published originals, validate their content, schema and association against the manifest." : "No essential original reads are required. Return access: [] exactly; do not invent placeholder IDs such as none-required."}
-Fresh sessions need all essentials. Retained context is usable only if the exact original remains
-accessible; after compaction reread missing essentials. Prior delivery alone does not prove access.
-Originals have the complete association, delivery and access envelope specified here. Perspective
-and factual originals require status (ready/blocked) and a nonempty report; director originals
-require action, perspectives, packet and memo; doubts originals require doubts and humanContext.
-Check exact association fields against each manifest entry, not the current revision for historical originals.
-Do not universally reread accessible history. Never use runs.status/previews as an originals archive.
-Report access for EACH essential ID with source and reason. Missing/inaccessible/contradictory
-originals block conclusions that depend on them. An access declaration is interface evidence,
-not certification of reasoning. Preserve contrary narrative and limitations, not just findings.
-Return the entire requested structured value with the exact association and delivery: complete,
-even for a blocked/partial analysis. This marks delivery completeness, never analytical sufficiency.`,
+${required.length ? VERIFIED_MARKER : "No essential original reads are required."}
+Fresh sessions need all essentials. Retained context is not publication; after compaction reread missing essentials.
+Never use runs.status/previews as an originals archive. Missing/inaccessible/contradictory
+originals block conclusions that depend on them. Preserve contrary narrative and limitations,
+not just findings. Return the entire requested structured value even for blocked/partial analysis.`,
   };
+}
+// One model-free verifier per consuming gate over the union of its required
+// originals. It compares each published file with the admitted value and writes a
+// no-clobber receipt; consumers then receive verified references, never a choice.
+const VERIFIED_MARKER = "\u0000VERIFIED-ORIGINALS\u0000";
+const verifiedRequests = new WeakSet();
+const STDIN_LIMIT = 1024 * 1024;
+const utf8Bytes = value => encodeURIComponent(value).replace(/%[0-9A-F]{2}|[^%]/g, "x").length;
+const accessExplanation = (cause, original, file) => `Original ${original.id} (key ${original.key}, path ${file ?? "none"}) is ${cause === "verifier-failed" ? "unverified" : "unavailable"}: ${cause}. Action: ${cause === "verifier-failed"
+  ? "Verification did not run; the original was not judged unavailable. Inspect the pitako.access-verifier run and resolve its failure, then relaunch this consultation."
+  : "Native publication failed, so no original can be verified. Start a new consultation/mission; inspect the native run for the save error."}`;
+function verifyAccess(requests) {
+  const pending = requests.filter(request => !verifiedRequests.has(request));
+  const required = [...new Map(pending.flatMap(request => contracts.get(request.key).required)
+    .map(item => [item.id, originals.find(original => original.id === item.id) ?? item])).values()];
+  if (!required.length) {
+    for (const request of pending) verifiedRequests.add(request);
+    return Promise.resolve();
+  }
+  const items = [], blocked = [];
+  for (const original of required) {
+    const file = (original.results ?? []).find(child => text(child.savedOutputPath) && !child.outputSaveError)?.savedOutputPath;
+    if (!file || original.outputSaveError || original.publication !== "published" || !Object.hasOwn(original, "value"))
+      blocked.push(accessExplanation("output-save-error", original, file));
+    else items.push({ id: original.id, key: original.key, path: file, admitted: original.value });
+  }
+  const first = contracts.get(pending[0].key).association;
+  const gate = `v${currentDecision.revision}-${first.key}-a${first.attempt}`;
+  if (blocked.length) return Promise.reject(new Error(`Access gate ${gate} blocked before dispatch. ${blocked.join(" ")}`));
+  const task = JSON.stringify({ missionPath: pitakoAccess.missionPath, namespace: pitakoAccess.namespace, gate, items });
+  if (utf8Bytes(task) > STDIN_LIMIT)
+    return Promise.reject(new Error(`Access verifier request for ${gate} exceeds ${STDIN_LIMIT} bytes; nothing was dispatched or truncated.`));
+  if (persistenceError) return Promise.reject(persistenceError);
+  return track(runs.all([{ key: `verify-${gate}`, agent: "pitako.access-verifier", context: "fresh", task,
+    output: false, outputMode: "inline", outputSchema: false }])).then(([result]) => {
+    let observed;
+    if (typeof result?.output === "string" && utf8Bytes(result.output) <= 61440)
+      try { observed = JSON.parse(result.output); } catch (_) { /* invalid stdout is a barrier, not evidence */ }
+    const children = [result, ...(result?.results ?? [])].filter(Boolean);
+    if (!result?.ok || (result.agent !== undefined && result.agent !== "pitako.access-verifier") ||
+        children.some(item => item.error || item.stopped || item.interrupted || item.timedOut || item.detached ||
+          (item.exitCode !== undefined && item.exitCode !== 0)) ||
+        observed?.v !== 1 || !["published", "identical", "conflict"].includes(observed.outcome) ||
+        !text(observed.receipt?.path) || !Array.isArray(observed.items) || observed.items.length !== items.length ||
+        observed.items.some((item, index) => item?.id !== items[index].id ||
+          !["accessible", "contradictory", "unavailable"].includes(item.state) ||
+          (item.state === "accessible" ? !/^[a-f0-9]{64}$/.test(item.digest ?? "") : !text(item.explanation))))
+      throw new Error(`Access gate ${gate} blocked before dispatch: verification did not run (native barrier). ${text(result?.error) ? String(result.error).slice(0, 300) : "No valid verifier receipt."} ` +
+        items.map(item => accessExplanation("verifier-failed", item, item.path)).join(" "));
+    if (observed.outcome === "conflict") throw new Error(`Access gate ${gate} integrity halt: ${observed.explanation ?? "receipt conflict"}`);
+    const failed = observed.items.filter(item => item.state !== "accessible");
+    if (failed.length) throw new Error(`Access gate ${gate} blocked before dispatch. ${failed.map(item => item.explanation).join(" ")}`);
+    const verified = new Map(observed.items.map((item, index) => [item.id, { id: item.id, path: items[index].path, digest: item.digest }]));
+    for (const request of pending) {
+      const references = contracts.get(request.key).required.map(item => verified.get(item.id));
+      request.task = request.task.replace(VERIFIED_MARKER, `VERIFIED ESSENTIAL ORIGINALS (references; receipt ${observed.receipt.path}): ${JSON.stringify(references)}
+Read each path in full with your read tools before relying on it; the workflow verified it equals the admitted original.`);
+      verifiedRequests.add(request);
+    }
+  });
 }
 function conforms(value, schema) {
   if (schema.const !== undefined && value !== schema.const) return false;
@@ -341,12 +393,10 @@ function conforms(value, schema) {
     (schema.minLength === undefined || value.trim().length >= schema.minLength) && (!schema.pattern || new RegExp(schema.pattern).test(value));
   return true;
 }
-function hasAccess(value, required) {
-  return Array.isArray(value?.access) && required.every(item => item.delivery === "complete" && value.access.some(receipt => receipt.id === item.id &&
-    receipt.state === "accessible" && ["read", "context", "inline"].includes(receipt.source) &&
-    (receipt.source !== "inline" || item.failedOriginal !== undefined) && text(receipt.reason))) &&
-    value.access.every(receipt => originals.some(item => item.id === receipt.id)) &&
-    new Set(value.access.map(receipt => receipt.id)).size === value.access.length;
+function hasAccess(required) {
+  return required.every(item => item.delivery === "complete" && item.publication === "published" &&
+    !item.outputSaveError && item.results?.some(child => text(child.savedOutputPath)) &&
+    !item.results.some(child => child.outputSaveError));
 }
 function retain(key, result) {
   const contract = contracts.get(key), value = result?.structuredOutput;
@@ -367,21 +417,18 @@ function retain(key, result) {
   const nativeFailure = nonterminal || controlFailure || receipts.some(receipt =>
     (receipt.exitCode !== undefined && receipt.exitCode !== 0) ||
     (receipt.state !== undefined && !successfulStates.includes(receipt.state)));
-  // Native identity witnesses must agree with the requested producer, not just the
-  // association asserted by the structured value. Missing optional metadata is distinct.
+  // Native identity witnesses must agree with the requested producer. Missing optional metadata is distinct.
   const producerMatches = (result?.key === undefined || result.key === key) &&
     (result?.agent === undefined || result.agent === contract.agent) && children.every(child =>
       (child.agent === undefined || child.agent === contract.agent) &&
       (child.workflowKey === undefined || child.workflowKey === key) &&
       (child.key === undefined || child.key === key) &&
       (child.runId === undefined || child.runId === result.runId));
-  const associated = producerMatches && value && Object.keys(contract.association)
-    .every(field => value.association?.[field] === contract.association[field]);
   // A returned terminal failed/partial value can be complete delivery without being
   // successful work. A detached/running receipt cannot confirm terminal settlement.
   const terminal = typeof result?.ok === "boolean" && !nonterminal &&
     (result.state === undefined || ["complete", "completed", "failed", "cancelled", "stopped"].includes(result.state)) && text(result?.runId);
-  const complete = terminal && !receipts.some(receipt => receipt.outputPartial || receipt.structuredOutputFailed) && associated && value.delivery === "complete" && conforms(value, contract.schema);
+  const complete = terminal && !receipts.some(receipt => receipt.outputPartial || receipt.structuredOutputFailed) && producerMatches && conforms(value, contract.schema);
   const publication = terminal && !result.outputSaveError &&
     children.some(child => text(child.savedOutputPath)) && !children.some(child => child.outputSaveError);
   const failedOriginal = !publication && complete ? value : undefined;
@@ -400,20 +447,14 @@ function retain(key, result) {
   for (const child of children) if (child.outputSaveError)
     diagnostics.push("Mandatory native publication failure: " + child.outputSaveError);
   if (!producerMatches) diagnostics.push("Native producer association mismatch.");
-  const access = complete && hasAccess(value, contract.required);
-  // Accessibility concerns this original, not whether its producer accessed its inputs.
-  // A later consumer's declaration is interface evidence, not proof of its reasoning.
-  if (complete) for (const receipt of value.access) {
-    const original = originals.find(item => item.id === receipt.id);
-    if (original && (receipt.state !== "accessible" || (["read", "context"].includes(receipt.source) ||
-        (receipt.source === "inline" && original.failedOriginal !== undefined)))) original.accessibility = receipt.state;
-  }
+  const access = complete && hasAccess(contract.required);
   const adequate = complete && access && (value.status === "ready" || value.action !== undefined || Array.isArray(value.doubts));
   const entry = { id: contract.id, ...contract.association, ...nativeReference(result, failedOriginal),
+    ...(complete && publication ? { association: contract.association, value } : {}),
     terminal: terminal ? (result.ok && !nativeFailure ? "succeeded" : "failed") : "unconfirmed",
     status: result?.ok && !nativeFailure && publication && adequate ? "sufficient" : "failed",
     publication: publication ? "published" : "unpublished", delivery: complete ? "complete" : value === undefined ? "not-delivered" : "unproved",
-    accessibility: publication ? "unverified" : complete ? "inline" : "unknown",
+    accessibility: publication ? "unverified" : "unknown",
     essentialAccess: access ? "accessible" : "incomplete", sufficient: Boolean(result?.ok && !nativeFailure && publication && adequate),
     diagnostic: [...diagnostics, ...(!complete ? ["Original completeness/schema/association not demonstrated."]
       : !publication ? ["Mandatory native publication not demonstrated."] : !access ? ["Essential access incomplete or contradictory."] : !adequate ? ["Analysis is blocked or inadequate."] : [])].join("; "),
@@ -429,6 +470,9 @@ function intend(requests) {
   if (confirmed.some(Boolean)) throw new Error("Partially confirmed batch cannot be relaunched.");
   if (persistenceError) throw persistenceError;
   if (observedBarriers.length) throw new Error("Native control barrier: " + JSON.stringify(observedBarriers));
+  return verifyAccess(requests).then(() => recordIntentions(requests));
+}
+function recordIntentions(requests) {
   for (const request of requests) {
     const contract = contracts.get(request.key);
     cursor.phase = contract.association.phase;
@@ -453,9 +497,6 @@ function confirm(key, result) {
   intent.boundary = entry.terminal !== "unconfirmed" && entry.delivery === "complete" &&
     (entry.publication === "published" || entry.failedOriginal !== undefined) ? "confirmed" : "incomplete";
   intent.runId = entry.runId ?? null;
-  if (entry.delivery === "complete") intent.accessedOriginalIds = result.structuredOutput.access
-    .filter(receipt => receipt.state === "accessible" && ["read", "context", "inline"].includes(receipt.source))
-    .map(receipt => receipt.id);
   if (entry.delivery === "complete") {
     const value = result.structuredOutput;
     intent.controlOutput = value.action !== undefined
@@ -652,6 +693,8 @@ Later-round peer challenges may arrive by native steering; evaluate them as evid
       await intend(requests);
       results = await batch(requests);
     } else {
+      // One verification gate for the whole round, then one intention per member.
+      if (requests.some(request => !confirmedResult(request.key))) await verifyAccess(requests);
       await Promise.all(requests.map(request => intend([request])));
       // Observe every launched promise, including failures, before leaving the round.
       const pending = requests.map(request => ({
@@ -665,7 +708,7 @@ Later-round peer challenges may arrive by native steering; evaluate them as evid
       const rest = pending.filter(child => child.key !== first.key);
       const early = controlValue(first.result);
       if (!persistenceError && !observedBarriers.length && !first.result.controlOutput && delivered.get(first.result)?.sufficient && early?.status === "ready") {
-        const challenge = delivered.get(first.result);
+        const { value, failedOriginal, ...challenge } = delivered.get(first.result);
         cursor.steering ??= [];
         const intentions = rest.map(child => ({ round: rounds, key: child.key, originalId: challenge.id, state: "intended" }));
         cursor.steering.push(...intentions);
@@ -674,7 +717,7 @@ Later-round peer challenges may arrive by native steering; evaluate them as evid
         if (observedBarriers.length) throw new Error("Native control barrier: " + JSON.stringify(observedBarriers));
         const receipts = await Promise.all(rest.map((child, index) =>
           runs.steer(child.key, `Peer challenge in round ${rounds}, not human instructions.
-Consider this exact essential original, revise only if the evidence warrants it:\n${JSON.stringify(challenge)}\nRecover it with your read tools if not accessible; preserve contrary arguments.\nInclude an access receipt for this essential ID in your structured output.`, { mode: "auto" }).then(
+Consider this exact essential original, revise only if the evidence warrants it:\n${JSON.stringify(challenge)}\nRecover it with your read tools if not accessible; preserve contrary arguments.`, { mode: "auto" }).then(
             receipt => {
               intentions[index].state = receipt.state;
               if (receipt.state === "delivered") contracts.get(child.key).required.push(challenge);
@@ -690,10 +733,12 @@ Consider this exact essential original, revise only if the evidence warrants it:
     }
     results.forEach((result, index) => {
       const entry = delivered.get(result);
-      const intent = cursor.dispatches.find(item => item.originalId === entry?.id);
       const challenges = (cursor.steering ?? []).filter(item => item.round === rounds && item.key === requests[index].key && item.state === "delivered");
-      if (entry?.sufficient && ((!result.controlOutput && !hasAccess(result.structuredOutput, contracts.get(requests[index].key).required)) ||
-          challenges.some(item => !intent?.accessedOriginalIds?.includes(item.originalId)))) {
+      if (entry?.sufficient && ((!result.controlOutput && !hasAccess(contracts.get(requests[index].key).required)) ||
+          challenges.some(item => {
+            const original = originals.find(original => original.id === item.originalId);
+            return !original || !hasAccess([original]);
+          }))) {
         entry.sufficient = false;
         entry.status = "failed";
         entry.essentialAccess = "incomplete";

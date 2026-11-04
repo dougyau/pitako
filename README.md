@@ -190,8 +190,7 @@ The admitted `pitako.execute.maxCycles` is a positive safe integer (default 3).
 Pi global agent-dir `settings.json` is overridden by the designated worktree's
 `.pi/settings.json`, never the source/sibling cwd. Invalid settings stop before
 a director; no settings are written. The immutable native association freezes
-the limit across recovery/settings edits; legacy version-2 records stay fixed
-at three without migration. Reports use `Loop n de max` and consumed/max.
+the limit across recovery/settings edits. Reports use `Loop n de max` and consumed/max.
 Early fulfillment stops; last-slot gaps need a new human invocation. Stop,
 permissions, persistence and actual native host/child capacity outrank the limit.
 Higher limits grant no extra native capacity. Hash-associated complete inherited
@@ -253,10 +252,12 @@ historical records or Git. Installed
 pi-subagents 0.83.0 does not prove a running host reloaded it. No models, settings,
 capacity overrides, private execution store or replacement scheduler are added.
 
-Bound execute writers use registered `checkpoint_create` for pre-write capture,
-completed-unit seals and permitted pending-pause seals. It publishes actual WIP
-and progress through the existing journal; only durable root result admission
-confirms the point. Missing context blocks capture, and file edits do not reload
+Bound execute writers use registered `checkpoint_create` only for pre-write
+capture. After the worker ends, the root's model-free `pitako.checkpoint-sealer`
+verifies the journal and seals the unit or pending pause; a journal mismatch halts
+with the differing paths. Only durable root result admission confirms the point.
+The worker is the only writer of checkout content; deterministic root agents
+write only Pitako metadata. Missing context blocks capture, and file edits do not reload
 active sessions. Analysis and inspection remain read-only.
 
 Recovery is checkpoint-first from the last confirmed reconstructible file/progress

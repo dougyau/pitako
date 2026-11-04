@@ -14,13 +14,18 @@ registerHooks({
       source: stripTypeScriptTypes(readFileSync(new URL(url), "utf8"), { sourceUrl: url }) };
   },
 });
-const { captureCheckpoint, applyCheckpoint, prepareCheckpoint, completeCheckpoint, restoreCheckpoint, sealCheckpoint } = await import("../../extensions/execute-checkpoint.ts");
+const { captureCheckpoint, applyCheckpoint, prepareCheckpoint, completeCheckpoint, restoreCheckpoint, sealCheckpointRequest } = await import("../../extensions/execute-checkpoint.ts");
+const { readRequest } = await import("./ledger.mjs");
 const [operation, requestFile] = process.argv.slice(2);
-const request = JSON.parse(readFileSync(requestFile, "utf8"));
-if (operation === "capture") console.log(JSON.stringify(captureCheckpoint(request.intent, request.paths)));
+// The registered sealer receives pi-subagents' framed external-cli stdin.
+const request = operation === "--seal-stdin" ? readRequest(readFileSync(0, "utf8")) : JSON.parse(readFileSync(requestFile, "utf8"));
+if (operation === "--seal-stdin") {
+  const output = JSON.stringify(sealCheckpointRequest(request));
+  if (Buffer.byteLength(output, "utf8") > 60 * 1024) throw new Error("Checkpoint sealer output exceeds 60 KiB.");
+  console.log(output);
+} else if (operation === "capture") console.log(JSON.stringify(captureCheckpoint(request.intent, request.paths)));
 else if (operation === "apply") applyCheckpoint(request.intent, request.changes);
 else if (operation === "prepare") prepareCheckpoint(request.intent, request.changes);
 else if (operation === "complete") completeCheckpoint(request.intent);
-else if (operation === "seal") console.log(JSON.stringify(sealCheckpoint(request.intent, request.kind, request.controlPermitsCapture)));
 else if (operation === "restore") console.log(JSON.stringify(restoreCheckpoint(request.intent, request.authority)));
-else throw new Error("Expected checkpoint capture, prepare, complete, apply, seal or restore and an associated request JSON file.");
+else throw new Error("Expected checkpoint capture, prepare, complete, apply or restore and an associated request JSON file.");

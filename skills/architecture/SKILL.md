@@ -44,17 +44,28 @@ An ordinary architecture discussion does not start execution.
 
 ## Launch one background workflow
 
-Resolve [workflow.js](workflow.js) beside this installed skill, not against the
-project's working directory. Pass its absolute path as `workflow`. Keep `cwd`
-at the project being discussed.
+Launch the registered named resource `pitako.architecture`, never a script path:
+raw paths fail with "launch by name after mission.create". Keep `cwd` at the
+project being discussed. First create the mission (or `mission.show` an existing
+one) and copy the actual missionId and the exact `Mission record path
+(args.missionPath): <path>` line, not the `State:` path:
+
+```js
+subagent({ action: "mission.create", cwd: "<project root>",
+	options: { mission: { title: "Design stream parser limits" } } })
+```
+
+Then launch with the same missionId in args and options:
 
 ```js
 subagent({
-	workflow: "<absolute skill directory>/workflow.js",
+	workflow: "pitako.architecture",
 	cwd: "<project root>",
 	async: true,
-	options: { mission: { title: "Design stream parser limits" } },
+	options: { missionId: "<actual missionId>" },
 	args: {
+		missionId: "<actual missionId>",
+		missionPath: "<actual mission record path>",
 		consultation: "stream-parser",
 		workDescription: "Stream parser memory limits",
 		currentDecision: {
@@ -132,12 +143,18 @@ Preserve `results[].savedOutputPath`, returned reference objects and textual
 `outputReference` paths. Generic artifact references or `structuredOutputPath`
 alone do not prove mandatory publication; `runs.status` previews are not originals.
 
-Each handoff names essential originals and why they matter. Children use their
-existing readers to recover exact content and validate schema/association.
-Fresh sessions need all necessary evidence; resumed sessions reread essentials
-lost from accessible context, including after compaction. Previous delivery is
-not current access, and an access receipt is not proof of reasoning. Missing,
-inaccessible or contradictory essentials block dependent conclusions. Do not
+Each consuming gate first dispatches the model-free `pitako.access-verifier` once
+over the union of its required originals. It compares each published file with
+the admitted value in canonical form and writes a no-clobber receipt under
+`<mission>/receipts/architecture-<consultation>/<gate>.json`. Consumers then
+receive verified references `{ id, path, digest }` with an instruction to read
+each path in full. No model creates, chooses or copies receipts, IDs, paths or
+digests. A contradictory or unavailable original blocks the gate before dispatch
+with the original, key, path, differing JSON pointers and the action to take;
+the workflow never chooses a version. A verifier failure reports that
+verification did not run. Fresh sessions need all necessary evidence; resumed
+sessions reread essentials lost from accessible context, including after
+compaction. A receipt attests content identity, not reasoning. Do not
 require universal history rereads or hide contrary non-finding narrative.
 
 Native Stop, interruption, detachment, partial terminal outcomes, child timeout or
@@ -166,7 +183,7 @@ and references, not just paths.
 
 ## Continue a consultation
 
-Retain the exact returned version-2 `continuation` (`{version: 2, consultation}`)
+Retain the exact returned version-3 `continuation` (`{version: 3, consultation}`)
 and actual mission ID. Both ordinary and planning consultations return this
 compact reference, not the retained control state.
 Use the same mission, consultation ID and planning mode on reentry. The native
@@ -180,11 +197,13 @@ For unchanged decisions, omit `currentDecision` and `replacement`; optional
 
 ```js
 subagent({
-	workflow: "<absolute skill directory>/workflow.js",
+	workflow: "pitako.architecture",
 	cwd: "<project root>",
 	async: true,
 	options: { missionId: "<actual existing mission ID>" },
 	args: {
+		missionId: "<actual existing mission ID>",
+		missionPath: "<actual mission record path>",
 		consultation: "stream-parser",
 		workDescription: "Stream parser memory limits",
 		continuation: previousResult.continuation,
@@ -276,7 +295,7 @@ No child remains alive waiting for a person. The pause has no expiry, survives
 restart, does not run `director-after-rN`, and adds no consumed or valid round.
 Continuation-only re-entry returns the identical value without dispatch or writes.
 
-Re-enter the SAME script, mission and consultation with `planning: true`, the exact
+Re-enter the SAME named resource, mission and consultation with `planning: true`, the exact
 returned `continuation`, and:
 
 ```js

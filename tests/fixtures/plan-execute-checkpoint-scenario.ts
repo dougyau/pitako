@@ -71,6 +71,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
         metadata: { root, commonDir: path.join(root, ".git"), selected: { source: path.join(root, ".pitako/plans/assignment.md"), digest: digest(content) } },
         module: new URL("../../extensions/execute-checkpoint.ts", import.meta.url).href,
         toolModule: path.resolve("extensions/checkpoint-create.ts"),
+        sealer: path.resolve("skills/execute/checkpoint.mjs"),
         loaderModule: new URL("../../node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/loader.js", import.meta.url).href,
         evidence: new URL("../../extensions/spec-plans.ts", import.meta.url).href,
         inspectorEntry: path.resolve("skills/execute/inspect.mjs"),
@@ -116,7 +117,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
         const firstTask = (value: any, id: string) => {
           const unit = structuredClone(value.tasks[0]);
           Object.assign(unit, { id, kind: "implementation", scope: ["owned"], allowedEffects: ["edit owned"] });
-          unit.checks[0].id = id + "-check"; return unit;
+          unit.checks[0].id = id + "-check"; unit.checks[0].tier = "focused"; return unit;
         };
         const options = { script: input.script, state,
           status: async (key: string) => {
@@ -144,6 +145,32 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
             calls.push(key);
             if (request.agent === "pitako.execution-ledger") archives.push(JSON.parse(request.task).record);
             const pending = storage.get("invoke-human-1")?.loop;
+            if (request.agent === "pitako.checkpoint-sealer") {
+              const seal = JSON.parse(request.task), second = seal.intent.taskId === "second";
+              if (second && input.mode === "refused") { sealError = "Native control refuses checkpoint capture"; throw Error(sealError); }
+              const stateBeforeSeal = io.readFileSync(input.statePath, "utf8");
+              let observed;
+              try {
+                observed = JSON.parse(io.execFileSync("node", [input.sealer, "--seal-stdin"], {
+                  cwd: input.root, input: request.task, encoding: "utf8",
+                }));
+              } catch (error) { sealError = String(error); throw error; }
+              if (io.readFileSync(input.statePath, "utf8") !== stateBeforeSeal) throw Error("Sealer changed admission/cursor state");
+              if (observed.outcome === "sealed") {
+                const receipt = { kind: observed.kind, checkpointRef: observed.checkpointRef, digest: observed.digest,
+                  candidate: observed.candidate, position: observed.position, progress: seal.intent.progress };
+                const before = JSON.parse(JSON.parse(io.readFileSync(observed.checkpointRef.replace(/(unit|pause)\.json$/, "manifest.json"), "utf8")).data);
+                points.push({ receipt, before, point: JSON.parse(JSON.parse(io.readFileSync(receipt.checkpointRef, "utf8")).data) });
+                if (["complete", "pause"].includes(input.mode)) {
+                  const replay = JSON.parse(io.execFileSync("node", [input.sealer, "--seal-stdin"], { cwd: input.root, input: request.task, encoding: "utf8" }));
+                  if (JSON.stringify(replay) !== JSON.stringify(observed)) throw Error("Non-idempotent root seal replay");
+                }
+                if (second && input.mode === "seal-cut") throw Error("Abrupt cut after seal before admission");
+              }
+              return { key, ok: true, agent: request.agent, runId: `native-${key}`, asyncDir: `/native/async/${key}`,
+                output: JSON.stringify(observed), results: [{ exitCode: 0 }], externalAdapter: {
+                  outputArtifacts: { stdoutPath: `/native/async/${key}/stdout.log`, stderrPath: `/native/async/${key}/stderr.log` } } };
+            }
             if (request.agent === "pitako.worker" && pending?.attempt?.restore)
               restorationAdmissions.push(structuredClone(pending.attempt));
             // Original lifecycle modes isolate confirmation. Pause-continuation modes
@@ -157,7 +184,6 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
             const needsCandidate = request.agent === "pitako.checkout-observer" || key.endsWith(".compliance") || (request.agent === "pitako.worker" && key.includes(".t3."));
             const result = response(key, request, input.metadata, needsCandidate ? candidate() : undefined);
             if (key.endsWith(".director")) {
-              result.structuredOutput.association = JSON.parse(request.task.split("ASSOCIATION (data): ")[1].split("\n")[0]);
               result.structuredOutput.tasks[0].dependsOn = [{ taskId: "second", reason: "Verify the completed pending unit" }];
               result.structuredOutput.tasks.unshift(firstTask(result.structuredOutput, "first"), firstTask(result.structuredOutput, "second"));
               result.structuredOutput.tasks[0].dependsOn = []; result.structuredOutput.tasks[1].dependsOn = [];
@@ -225,8 +251,12 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
                   candidate: { head: receipt.candidate.head, fingerprint: receipt.candidate.fingerprint },
                   ...(receipt.confirmedPause ? { confirmedPause: receipt.confirmedPause } : {}),
                   ...(receipt.confirmedUnit ? { confirmedUnit: receipt.confirmedUnit } : {}) };
-                if (input.mode === "pause-wrong-baseline") delete restoreReceipt.confirmedPause;
-                if (input.mode === "unit-before-capture-wrong-baseline") delete restoreReceipt.confirmedUnit;
+                if (["pause-wrong-baseline", "unit-before-capture-wrong-baseline"].includes(input.mode)) {
+                  const data = JSON.parse(JSON.parse(io.readFileSync(restoreReceipt.restoredRef, "utf8")).data);
+                  delete data[input.mode === "pause-wrong-baseline" ? "confirmedPause" : "confirmedUnit"];
+                  const bytes = JSON.stringify(data);
+                  io.writeFileSync(restoreReceipt.restoredRef, JSON.stringify({ data: bytes, sha256: io.hash(bytes) }));
+                }
                 if (input.mode === "pause-repeated-publication") throw Error("Disappeared after the same durable restoration publication");
                 if (input.mode === "pause-effect-cut" && !cut) { cut = true; throw Error("Cut after actual pause restoration"); }
               }
@@ -256,36 +286,17 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
               if (second && input.mode === "missing") io.unlinkSync(manifestPath);
               if (second && input.mode === "corrupt") io.writeFileSync(manifestPath, "{broken");
               if (second && input.mode === "incomplete") io.prepareCheckpoint(intent, [{ path: "owned", image: { bytes: Buffer.from("not yet written").toString("base64"), mode: 420 } }]);
-              let receipt: any;
-              const kind = second && (input.mode === "pause" || pauseMode) && (!continuing || input.mode === "pause-twice" && intent.attempt === 2) ? "pause" : "unit";
-              const stop = new AbortController();
-              if (second && input.mode === "refused") stop.abort(new Error("Native control refuses checkpoint capture"));
-              const stateBeforeSeal = io.readFileSync(input.statePath, "utf8");
-              try { receipt = (await checkpoint(kind, undefined, stop.signal)).checkpointReceipt; }
-              catch (error) { sealError = String(error); throw error; }
-              // Replay is a tool guarantee, not extra setup for every recovery cut.
-              // The complete/pause cases exercise actual unit and pause replay;
-              // other modes retain one real publication per reached boundary.
-              if (["complete", "pause"].includes(input.mode) &&
-                  JSON.stringify((await checkpoint(kind)).checkpointReceipt) !== JSON.stringify(receipt))
-                throw Error("Non-idempotent tool replay");
-              if (io.readFileSync(input.statePath, "utf8") !== stateBeforeSeal) throw Error("Tool changed admission/cursor state");
-              points.push({ receipt, before, point: JSON.parse(JSON.parse(io.readFileSync(receipt.checkpointRef, "utf8")).data) });
-              if (second && input.mode === "seal-cut") throw Error("Abrupt cut after seal before returning result");
-              // No checkout effects follow the registered seal. Reuse its real
-              // identity instead of hashing the same bytes again; native mission
-              // persistence is outside checkoutEvidence's candidate inventory.
-              const current = receipt.candidate;
+              const paused = second && (input.mode === "pause" || pauseMode) && (!continuing || input.mode === "pause-twice" && intent.attempt === 2);
+              const current = candidate();
               Object.assign(result.structuredOutput, { taskId: intent.taskId, attempt: intent.attempt,
-                status: kind === "pause" ? (input.mode.includes("status-continue") ? "continue" : input.mode.includes("status-gaps") ? "gaps" : "blocked") : "complete", remaining: kind === "pause" && input.mode !== "pause-empty" ? ["Pending second unit"] : [],
-                continuation: kind === "pause" ? "Resume pending second unit from its exact pause" : null,
-                checkpointReceipt: receipt, ...(restoreReceipt ? { restoreReceipt } : {}), candidate: current,
-                git: { head: current.head, checkpoints: [receipt.checkpointRef, ...(restoreReceipt ? [restoreReceipt.partialRef, restoreReceipt.restoredRef] : [])], wip: "Real owned WIP" },
+                status: paused ? (input.mode.includes("status-continue") ? "continue" : input.mode.includes("status-gaps") ? "gaps" : "blocked") : "complete", remaining: paused && input.mode !== "pause-empty" ? ["Pending second unit"] : [],
+                continuation: paused ? "Resume pending second unit from its exact pause" : null,
+                git: { wip: "Real owned WIP" },
                 checks: [{ id: intent.taskId + "-check", command: "bun test affected", cwd: input.root,
                   output: "Observed controlled unit", logPaths: [], result: "passed", before: current, after: current }] });
               if (second && input.mode === "missing-receipt") delete result.structuredOutput.checkpointReceipt;
               if (second && input.mode === "wrong-progress") result.structuredOutput.checkpointReceipt = {
-                ...receipt, progress: { ...receipt.progress, consumedLoops: 2 } };
+                progress: { consumedLoops: 2 } };
             }
             if (request.agent === "pitako.worker" && key.includes(".t3.") && (unitMode || pauseMode || input.mode === "abrupt-continue")) {
               const l = storage.get("invoke-human-1").loop;
@@ -293,9 +304,12 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
               if (!completed || io.readFileSync(input.root + "/owned", "utf8") !== "completed pending work from pause" ||
                   !request.task.includes(completed.ref.key)) throw Error("Final verification preceded durable pending-work admission");
             }
-            // A real worker can only return what its structured output schema admits,
-            // including the helper's confirmedPause/confirmedUnit restore baseline.
-            if (request.agent === "pitako.worker" && result.structuredOutput?.restoreReceipt)
+            // Workers report decisions/checks only; restoration is observed from metadata.
+            if (request.agent === "pitako.worker") {
+              for (const field of ["taskId", "attempt", "candidate", "checkpointReceipt", "restoreReceipt"]) delete result.structuredOutput[field];
+              result.structuredOutput.git = { wip: result.structuredOutput.git.wip };
+            }
+            if (request.agent === "pitako.worker")
               (await import(input.validator)).validateToolArguments({ name: "worker_result", description: "Result", parameters: request.outputSchema },
                 { type: "toolCall", id: "worker", name: "worker_result", arguments: result.structuredOutput });
             originals.set(result.runId!, structuredClone(result));
@@ -454,7 +468,13 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
                 "invoke-human-1.l1.t2.a6", "invoke-human-1.l1.t2.a5", "invoke-human-1.l1.t2.a4",
                 "invoke-human-1.l1.t2.a3", "invoke-human-1.l1.t2.a2", "invoke-human-1.l1.t2.a1",
               ]);
-              expect(actual.restorationAdmissions[1].restore.authority.confirmedPause).toEqual(pause);
+              // The root pause-sealed a5's journaled pending work: that newer
+              // confirmed pause, not a1's, is the second restoration baseline.
+              const later = actual.restorationAdmissions[1].restore.authority.confirmedPause;
+              expect(later).toMatchObject({ kind: "pause", position: { loop: 1, cursor: 1, phase: "implementation" },
+                progress: { admitted: { first: ["complete"], second: ["continue"] } } });
+              expect(later.checkpointRef).toEndWith(".t2.a5/pause.json");
+              expect(createHash("sha256").update(readFileSync(later.checkpointRef)).digest("hex")).toBe(later.digest);
               expect(actual.archives.at(-1).body.frame.operations.map((item: any) => Number(item.key.match(/a(\d+)$/)[1]))).toEqual([4, 7]);
               expect(actual.restorationAdmissions[1].restore.evidence).toBeTruthy();
               expect(actual.restorationAdmissions[1].restore.evidence).not.toBe(actual.restorationAdmissions[0].restore.evidence);
@@ -478,7 +498,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
                 ? ["complete", "continue", "continue", "continue", "continue", "complete", "complete"]
                 : ["complete", "continue", "complete", "complete"]);
               expect(actual.retained.association.maxCycles).toBe(3);
-              expect(actual.baseline).toBe("partial next-unit WIP");
+              expect(actual.baseline).toBe(mode === "pause-status-continue" ? "journaled pending WIP" : "partial next-unit WIP");
               expect(actual.owned).toBe("completed pending work from pause");
               expect(actual.calls.filter((key: string) => key.endsWith(".t2.a2"))).toHaveLength(1);
               expect(actual.calls.filter((key: string) => key.endsWith(".review.director-synthesis"))).toHaveLength(1);
@@ -516,7 +536,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
             expect(actual.baseline).toBe("new pending pause work");
             expect(actual.owned).toBe("completed pending work from pause");
             expect(actual.unrelated).toBe("unrelated WIP");
-            expect(actual.calls.filter((key: string) => /\.t2\.a[2-9]/.test(key))).toHaveLength(2);
+            expect(actual.calls.filter((key: string) => /\.t2\.a[2-9]$/.test(key))).toHaveLength(2);
             expect(actual.calls).toContain("invoke-human-1.l1.t3.a1");
             expect(actual.calls).toContain("invoke-human-1.l1.compliance");
             return;
@@ -537,7 +557,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
           // repeated idempotent restoration publication as fresh material progress.
           if (mode.endsWith("loss-reentry") || ["pause-equivalent-capture", "pause-repeated-publication"].includes(mode)) {
             expect(actual.resumed.status).not.toBe("complete");
-            expect(actual.calls.filter((key: string) => /\.t2\.a[2-9]/.test(key)),
+            expect(actual.calls.filter((key: string) => /\.t2\.a[2-9]$/.test(key)),
               "Unchanged evidence must not renew restoration across supported script reentries").toHaveLength(mode === "pause-repeated-publication" ? 2 : 1);
             const observed = actual.hostObservations.filter((entry: any) => entry.checkpoint);
             // Both terminal reentries see exactly the same exhausted evidence
@@ -606,7 +626,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
             expect(actual.calls).not.toContain("invoke-human-1.l1.t2.a3");
           }
           if (mode === "pause-reusable-result") {
-            expect(actual.calls.filter((key: string) => /\.t2\.a[2-9]/.test(key))).toHaveLength(1);
+            expect(actual.calls.filter((key: string) => /\.t2\.a[2-9]$/.test(key))).toHaveLength(1);
             expect(loop.results.find((entry: any) => entry.taskId === "second" && entry.status === "complete").attempt).toBe(2);
           }
           return;
@@ -620,18 +640,19 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
         // A restoration denied by the native boundary cannot repeat unit work.
         // An unsealed complete report is rejected instead: loop 1 ends as gaps
         // and the next director starts.
-        expect(actual.retained.consumedLoops).toBe(mode === "missing-receipt" ? 3 : 1);
-        if (mode === "missing-receipt") for (const item of actual.archives.filter((record: any) => record.kind === "loop").map((record: any) => record.body))
+        expect(actual.retained.consumedLoops).toBe(mode === "missing" ? 3 : 1);
+        if (mode === "missing") for (const item of actual.archives.filter((record: any) => record.kind === "loop").map((record: any) => record.body))
           expect(item.results.find((result: any) => result.taskId === "second")).toMatchObject({
             status: "rejected", rejection: "New implementation unit lacks required sealed file/progress checkpoint.",
           });
-        if (mode === "missing-receipt") expect(loop).toMatchObject({ outcome: "gaps", results: [{ taskId: "first", status: "complete" },
+        if (mode === "missing") expect(loop).toMatchObject({ outcome: "gaps", results: [{ taskId: "first", status: "complete" },
           { taskId: "second", status: "rejected", rejection: "New implementation unit lacks required sealed file/progress checkpoint." }] });
         expect(actual.result.loopsConsumed).toBe(actual.retained.consumedLoops);
         const confirmed = actual.retained.lastConfirmed;
-        const secondConfirmed = ["complete", "pause", "cursor-cut"].includes(mode);
+        const complete = ["complete", "missing-receipt", "wrong-progress"].includes(mode);
+        const secondConfirmed = complete || ["pause", "cursor-cut"].includes(mode);
         expect(confirmed.taskId).toBe(secondConfirmed ? "second" : "first");
-        expect(confirmed).toMatchObject({ kind: mode === "pause" ? "pause" : "unit", position: { loop: actual.retained.consumedLoops, cursor: mode === "complete" || mode === "cursor-cut" ? 2 : 1 } });
+        expect(confirmed).toMatchObject({ kind: mode === "pause" ? "pause" : "unit", position: { loop: actual.retained.consumedLoops, cursor: complete || mode === "cursor-cut" ? 2 : 1 } });
         const point = JSON.parse(JSON.parse(readFileSync(confirmed.checkpointRef, "utf8")).data);
         expect(point.position).toEqual(confirmed.position); expect(point.progress).toEqual(confirmed.progress);
         expect(createHash("sha256").update(readFileSync(confirmed.checkpointRef)).digest("hex")).toBe(confirmed.digest);
@@ -642,10 +663,16 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
           expect(point.progress.admitted).toEqual({ first: ["complete"] });
           expect(point.progress.previous.resultRef).toEqual(loop.results[0].ref);
         }
-        if (mode === "complete") { expect(actual.result.status).toBe("complete"); expect(actual.calls).toContain("invoke-human-1.l1.compliance"); }
+        if (complete) { expect(actual.result.status).toBe("complete"); expect(actual.calls).toContain("invoke-human-1.l1.compliance"); }
         else expect(actual.calls).not.toContain("invoke-human-1.l1.t3.a1");
-        if (["refused", "missing", "corrupt", "incomplete"].includes(mode)) {
+        if (["refused", "corrupt"].includes(mode)) {
           expect(actual.sealError).not.toBe(""); expect(actual.points).toHaveLength(1);
+        }
+        if (mode === "incomplete") {
+          expect(loop.halt).toMatchObject({ code: "checkpoint-integrity", ref: { agent: "pitako.checkpoint-sealer" } });
+          expect(loop.halt.reason).toContain("last step partially applied: true");
+          expect(loop.results.some((entry: any) => entry.taskId === "second")).toBe(false);
+          expect(actual.points).toHaveLength(1);
         }
         if (["seal-cut", "admission-cut", "missing-receipt", "wrong-progress"].includes(mode)) expect(actual.points).toHaveLength(2);
         if (mode === "cursor-cut") expect(loop.cursor).toBe(1);

@@ -5,7 +5,7 @@ import path from "node:path";
 import { boundRetainedAnalyses, retainedAnalyses } from "../../extensions/execute-retained.ts";
 import { checkpointEvidence } from "../../extensions/execute-checkpoint.ts";
 import { isDeepStrictEqual } from "node:util";
-import { executionStatePath } from "../../extensions/execute-state.ts";
+import { EXECUTE_STATE_VERSION, executionStatePath, incompatibleExecuteState } from "../../extensions/execute-state.ts";
 
 type Inspection = { root: string; id: string; source: string; part?: string; context?: string; agentDir?: string; lines: string[] };
 function emitBounded(run: Inspection, value: unknown) {
@@ -21,16 +21,18 @@ function admittedInvocation({ root, id, part }: Inspection, context: any) {
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
   const invocation = mission?.[`invoke-${context.invocation}`], legacy = mission?.["pitako-execution"];
   if (invocation === undefined && legacy === undefined) return false;
-  if (!invocation || ![2, 3, 4].includes(invocation.version))
-    throw new Error("Incompatible retained invocation; no settings admission.");
+  // Three-way gate: absent (new admission), current contract, or explicit failure.
+  for (const retained of [invocation, legacy]) if (retained !== undefined && retained?.version !== EXECUTE_STATE_VERSION)
+    throw new Error(incompatibleExecuteState(retained?.version));
+  if (!invocation) throw new Error("Incompatible retained invocation; no settings admission.");
   if (invocation.association && !isDeepStrictEqual(invocation.amendments ?? [], context.amendments ?? []))
     throw new Error("Immutable admission amendments changed; preserve the retained path, SHA-256 and provenance. Do not merge or replace references on recovery.");
   const association = invocation.association;
-  if (association && part === "admission" && (invocation.version !== 4 || !/^[a-f0-9]{64}$/.test(invocation.admissionBinding ?? "")))
+  if (association && part === "admission" && !/^[a-f0-9]{64}$/.test(invocation.admissionBinding ?? ""))
     throw new Error("Retained execution predates bound native admission; no migration or replay is supported. Preserve its evidence; inspect actual native state. A terminal root cannot resume.");
   if (association === undefined) {
     const request = invocation.hostHalt?.request;
-    if (legacy || invocation.version !== 4 || !request || invocation.hostHalt.code !== "host-observation" ||
+    if (legacy || !request || invocation.hostHalt.code !== "host-observation" ||
         Object.keys(invocation).some(key => !["version", "hostHalt", "resolutions", "hostReconstruction", "activePlan"].includes(key)) ||
         (invocation.activePlan !== undefined && invocation.activePlan !== null) ||
         request.missionId !== context.missionId || request.missionPath !== context.missionPath ||
@@ -43,10 +45,9 @@ function admittedInvocation({ root, id, part }: Inspection, context: any) {
   if (!association || association.missionId !== context.missionId || association.missionPath !== context.missionPath ||
       association.invocation !== context.invocation || association.root !== root ||
       typeof association.source !== "string" || typeof association.digest !== "string" ||
-      (invocation.version === 4 && (!Number.isSafeInteger(association.maxCycles) || association.maxCycles < 1 ||
-        !isDeepStrictEqual(association.sourceRefs, context.sourceRefs))) ||
-      (invocation.version === 2 && (association.maxCycles !== undefined || context.sourceRefs.length)) ||
-      (legacy && (legacy.version !== invocation.version || !isDeepStrictEqual(legacy.association, association))))
+      !Number.isSafeInteger(association.maxCycles) || association.maxCycles < 1 ||
+      !isDeepStrictEqual(association.sourceRefs, context.sourceRefs) ||
+      (legacy && !isDeepStrictEqual(legacy.association, association)))
     throw new Error("Incompatible retained association; no settings admission.");
   return true;
 }
@@ -195,7 +196,8 @@ function observeCheckpoint(found: { root: string; commonDir: string; selected?: 
     try { mission = JSON.parse(readFileSync(executionStatePath(context), "utf8")); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     const invocation = mission?.[`invoke-${context.invocation}`];
-    const loop = invocation?.version === 4 ? invocation.loop : invocation?.loops?.at(-1), attempt = loop?.attempt;
+    if (invocation !== undefined && invocation?.version !== EXECUTE_STATE_VERSION) throw new Error(incompatibleExecuteState(invocation?.version));
+    const loop = invocation?.loop, attempt = loop?.attempt;
     if (loop?.phase === "implementation" && (attempt?.checkpoint || attempt?.restore?.checkpoint || attempt?.restore?.sourceKeys) && (attempt.stage !== "result" || ["blocked", "continue", "gaps"].includes(attempt.result?.status))) {
       const association = invocation.association;
       if (association.root !== found.root || association.commonDir !== found.commonDir ||
@@ -203,18 +205,18 @@ function observeCheckpoint(found: { root: string; commonDir: string; selected?: 
           association.missionId !== context.missionId || association.missionPath !== context.missionPath ||
           association.invocation !== context.invocation || !isDeepStrictEqual(association.sourceRefs, context.sourceRefs))
         throw new Error("Checkpoint observation association mismatch.");
-      const retainedSources = invocation.version === 4 ? (attempt.restore?.sourceKeys ?? invocation.taskFrame?.restorationKeys ?? []).map((key: string) => {
+      const retainedSources = (attempt.restore?.sourceKeys ?? invocation.taskFrame?.restorationKeys ?? []).map((key: string) => {
         const intent = invocation.taskFrame?.sources?.find((item: any) => item.key === key);
         if (!intent) throw new Error("Missing authenticated restoration source intent.");
         return intent;
-      }) : [].concat(attempt.restore?.checkpoint ?? attempt.pauseSource?.sources ?? attempt.pauseSource?.checkpoint ?? []);
+      });
       const sources = [attempt.checkpoint, ...retainedSources.filter((item: any) => item.key !== attempt.checkpoint?.key)].filter(Boolean);
       const subject = { key: attempt.key, taskId: attempt.taskId, attempt: attempt.number, loop: loop.number, cursor: loop.cursor };
       try {
         if (sources.some(source => !isDeepStrictEqual(source.association, association) || source.taskId !== subject.taskId ||
             source.loop !== subject.loop || source.cursor !== subject.cursor || source.attempt > subject.attempt))
           throw new Error("Checkpoint observation pending-task mismatch.");
-        const confirmed = invocation.version === 4 ? invocation.lastConfirmed : loop.confirmedCheckpoint;
+        const confirmed = invocation.lastConfirmed;
         const unit = attempt.restore?.authority?.confirmedUnit ?? (confirmed?.kind === "unit" && confirmed.position.loop === loop.number ? confirmed : undefined);
         if (unit) {
           const { taskId, attempt: number, resultRef, ...receipt } = unit;
@@ -228,11 +230,9 @@ function observeCheckpoint(found: { root: string; commonDir: string; selected?: 
               unit.checkpointRef !== `${found.root}/.pi/subagents/checkpoints/${result.checkpoint.key}/unit.json`)
             throw new Error("Confirmed unit conflicts with admitted pending progress.");
         }
-        observation = { ...subject, evidence: checkpointEvidence(sources, invocation.version === 4
-          ? { consumedLoops: invocation.consumedLoops, admitted: Object.fromEntries(
-            Object.entries(invocation.tasks).filter(([, task]: [string, any]) => task.admitted.length)
-              .map(([id, task]: [string, any]) => [id, task.admitted])) }
-          : { consumedLoops: invocation.loops.length, admittedResults: loop.results }, unit) };
+        observation = { ...subject, evidence: checkpointEvidence(sources, { consumedLoops: invocation.consumedLoops,
+          admitted: Object.fromEntries(Object.entries(invocation.tasks).filter(([, task]: [string, any]) => task.admitted.length)
+            .map(([id, task]: [string, any]) => [id, task.admitted])) }, unit) };
       } catch (error) { observation = { ...subject, error: String(error instanceof Error ? error.message : error) }; }
     }
   }

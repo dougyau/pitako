@@ -62,9 +62,9 @@ test("native admission rejection saves budget-exhausted before any child starts;
   expect(new Set(host.calls.map(call => call.key)).size).toBe(host.calls.length);
 });
 
-test.each(["worker", "implementation", "seal", "review", "compliance", "checkout", "recovery", "gaps"])(
+test.each(["worker", "implementation", "sealer", "seal", "review", "compliance", "checkout", "recovery", "gaps"])(
   "%s rejection retains pending work and reentry never repeats admitted launches", async phase => {
-    const host = fixture(undefined, { readOnly: !["seal", "implementation"].includes(phase) });
+    const host = fixture(undefined, { readOnly: !["sealer", "seal", "implementation"].includes(phase) });
     if (phase === "gaps") host.setLimit(1);
     let denied = false;
     let original: any;
@@ -73,6 +73,7 @@ test.each(["worker", "implementation", "seal", "review", "compliance", "checkout
         const value = normal(); original = copy(value.structuredOutput); delete value.structuredOutput; return value;
       }
       const selected = ["worker", "implementation"].includes(phase) ? request.agent === "pitako.worker"
+        : phase === "sealer" ? request.agent === "pitako.checkpoint-sealer"
         : phase === "seal" ? request.agent === "pitako.execution-ledger"
         : phase === "review" ? request.key.includes(".review.independent-")
         : phase === "recovery" ? request.agent === "pitako.execution-inspector"
@@ -97,6 +98,12 @@ test.each(["worker", "implementation", "seal", "review", "compliance", "checkout
       if (rejected.includes(ref)) throw new Error("Rejected admission has no native child to observe.");
       return copy(host.native.get(ref) ?? { ok: true, output: "", results: [] });
     });
+    if (phase === "sealer") {
+      // The retry counter is restored on budget rejection, so reentry reuses the unlaunched key.
+      expect(rejected).toEqual(["invoke-human-1.l1.t1.a1.seal"]);
+      expect(before.loop.attempt.seal).toEqual({ retry: 0 });
+      expect(before.loop.attempt.stage).not.toBe("result");
+    }
     if (phase === "seal") {
       expect(before.sealPending).not.toBeNull();
       expect(before.ledger.count).toBe(0);
@@ -189,4 +196,21 @@ test.each(["throw", "prose", "child"])("non-budget %s failure is not misclassifi
   const output = await host.execute();
   expect(output.status).not.toBe("budget-exhausted");
   expect(host.current()).not.toHaveProperty("lastBudgetProgress");
+});
+
+// The root sealer costs one native fan-out slot per attempt: an implementation
+// attempt dispatches 5 children and a verification attempt 4 (default budget 64).
+test("each attempt adds exactly one checkpoint-sealer dispatch to its spawn cost", async () => {
+  const host = fixture();
+  expect((await host.execute()).status).toBe("complete");
+  const attempt = (key: string, count: number) => {
+    const index = host.calls.findIndex(call => call.key === key);
+    return host.calls.slice(index - 1, index - 1 + count).map(call => call.agent);
+  };
+  expect(attempt("invoke-human-1.l1.t1.a1", 5)).toEqual(["pitako.request-observer", "pitako.worker",
+    "pitako.request-observer", "pitako.checkpoint-sealer", "pitako.execution-ledger"]);
+  expect(attempt("invoke-human-1.l1.t2.a1", 5)).toEqual(["pitako.request-observer", "pitako.worker",
+    "pitako.request-observer", "pitako.checkpoint-sealer", "pitako.reviewer"]);
+  expect(host.calls.filter(call => call.agent === "pitako.checkpoint-sealer").map(call => call.key))
+    .toEqual(["invoke-human-1.l1.t1.a1.seal", "invoke-human-1.l1.t2.a1.seal"]);
 });

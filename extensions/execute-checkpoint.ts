@@ -251,7 +251,7 @@ function publishedSource(sources: CheckpointIntent[]) {
 // Read-only recovery witness. Keys, timestamps and renamed manifests are not
 // progress: only validated file states, admitted progress and durable restoration
 // publication contribute. Repeated equivalent captures therefore cannot renew it.
-function evidence(sources: CheckpointIntent[], progress: Pick<CheckpointProgress, "consumedLoops" | "admitted"> | { consumedLoops: number; admittedResults: { taskId: string; status: string }[] }, confirmedUnit?: ConfirmedUnit) {
+function evidence(sources: CheckpointIntent[], progress: Pick<CheckpointProgress, "consumedLoops" | "admitted">, confirmedUnit?: ConfirmedUnit) {
   const first = sources[0];
   if (!first || sources.some(item => !equal(item.association, first.association) ||
       item.taskId !== first.taskId || item.loop !== first.loop || item.cursor !== first.cursor))
@@ -302,8 +302,8 @@ function evidence(sources: CheckpointIntent[], progress: Pick<CheckpointProgress
   // Current admitted logical progress, not the progress copied into each old
   // capture. Attempt numbers/references and equivalent repeated admissions are
   // nominal; owned file images above retain actual pending-work effects.
-  const pairs = "admitted" in progress ? Object.entries(progress.admitted).flatMap(([taskId, states]) =>
-    states.map(status => ({ taskId, status }))) : progress.admittedResults;
+  const pairs = Object.entries(progress.admitted).flatMap(([taskId, states]) =>
+    states.map(status => ({ taskId, status })));
   const admitted = [...new Set(pairs.map(({ taskId, status }) =>
     JSON.stringify({ taskId, status })))].sort();
   return hash(JSON.stringify({ material: [...material].sort(), consumedLoops: progress.consumedLoops, admitted }));
@@ -428,43 +428,140 @@ export function sealCheckpoint(intent: CheckpointIntent, kind: "unit" | "pause",
     position: point.position, progress };
 }
 
-// Public writer operation over the same capture/seal storage used by the CLI.
-// Publication is not root admission; this function never changes mission state.
-function create(intent: CheckpointIntent, kind: "pre" | "unit" | "pause", paths?: string[], signal?: AbortSignal) {
-  signal?.throwIfAborted();
-  if (!["pre", "unit", "pause"].includes(kind)) throw new Error("Invalid checkpoint point kind.");
-  const progress = admittedProgress(intent);
-  const directory = checkpointDirectory(intent), manifestRef = path.join(directory, "manifest.json");
-  if (kind !== "pre" && !existsSync(manifestRef))
-    throw new Error("No pre capture exists for this attempt; there are no captured effects to seal. A task without checkout writes returns without checkpointReceipt.");
-  let existed = existsSync(kind === "pre" ? manifestRef : path.join(directory, `${kind}.json`));
-  if (kind === "pre") {
-    if (!paths?.length || new Set(paths).size !== paths.length) throw new Error("Checkpoint needs unique exact affected paths.");
-    if (existed) {
-      const { manifest, steps } = load(intent);
-      if (steps.length || !equal(manifest.files.map(file => file.path), paths) ||
-          !equal(manifest.files, paths.map(file => ({ path: file, image: image(intent.association.root, file) }))) ||
-          manifest.base.fingerprint !== checkoutEvidence(intent.association.root).fingerprint)
-        throw new Error("Checkpoint operation conflicts with retained original content.");
-    } else {
-      signal?.throwIfAborted();
-      captureCheckpoint(intent, paths);
+export type SealerRequest = { v: 1; intent: CheckpointIntent; kind: "unit" | "pause" | null; restoreSources?: CheckpointIntent[] };
+// This runtime operation writes seal metadata only; it never completes journal effects.
+function sealRequest(request: SealerRequest) {
+  if (!request || request.v !== 1 || ![null, "unit", "pause"].includes(request.kind) ||
+      Object.keys(request).some(key => !["v", "intent", "kind", "restoreSources"].includes(key)))
+    throw new Error("Invalid checkpoint sealer request.");
+  const { intent, kind } = request, root = intent.association.root;
+  if (process.cwd() !== root) throw new Error("Checkpoint sealer cwd must equal intent.association.root.");
+  const directory = checkpointDirectory(intent);
+  const observed = checkoutEvidence(root);
+  const candidate = { head: observed.head, fingerprint: observed.fingerprint };
+  const base = { v: 1 as const, kind, candidate };
+  let selected = intent;
+  if (request.restoreSources) {
+    if (!request.restoreSources.length || request.restoreSources.some(source =>
+        !equal(source.association, intent.association) || source.taskId !== intent.taskId ||
+        source.loop !== intent.loop || source.cursor !== intent.cursor))
+      throw new Error("Checkpoint restoration sources conflict with pending unit.");
+    const published = publishedSource(request.restoreSources);
+    selected = published ?? intent;
+    if (!published && intent.progress?.previous) {
+      const previous = intent.progress.previous;
+      const relative = path.relative(path.join(root, ".pi/subagents/checkpoints"), previous.checkpointRef).split(path.sep).join("/");
+      if (!/^[A-Za-z0-9_-][A-Za-z0-9._-]*\/unit\.json$/.test(relative) || relative.includes(".."))
+        throw new Error("Confirmed unit is outside checkpoint storage.");
+      const point = read<{ candidate: { head: string; fingerprint: string }; position: unknown; progress: unknown }>(previous.checkpointRef);
+      selected = confirmedUnitSource(intent, { ...previous, kind: "unit", candidate: { head: point.candidate.head, fingerprint: point.candidate.fingerprint },
+        position: point.position, progress: point.progress }).intent;
     }
   }
-  const { manifest } = load(intent);
-  if (paths && !equal(paths, manifest.files.map(file => file.path))) throw new Error("Checkpoint affected paths conflict with retained original.");
+  const selectedDirectory = checkpointDirectory(selected);
+  if (!existsSync(path.join(selectedDirectory, "manifest.json"))) return { ...base, outcome: "observed" as const };
+  const { manifest, steps } = load(selected);
+  let expected = new Map(manifest.files.map(file => [file.path, file.image]));
+  for (const step of steps) for (const entry of step) expected.set(entry.path, entry.after);
+  let restored: ReturnType<typeof restore> | undefined;
+  if (request.restoreSources) {
+    const partialRef = path.join(selectedDirectory, "restore.json");
+    const partial = read<{ intent: CheckpointIntent; authority: RestoreAuthority; partial: Manifest["files"] }>(partialRef);
+    restored = read<ReturnType<typeof restore>>(path.join(selectedDirectory, "restored.json"));
+    if (!equal(partial.intent, selected) || restored.partialRef !== partialRef ||
+        restored.checkpointRef !== path.join(selectedDirectory, "manifest.json") ||
+        restored.digest !== hash(readFileSync(restored.checkpointRef, "utf8")) ||
+        !equal(restored.position, { loop: intent.loop, cursor: intent.cursor, phase: intent.phase }))
+      throw new Error("Checkpoint restoration observation conflicts.");
+    let baseline = manifest.files;
+    const unit = partial.authority.confirmedUnit;
+    if (unit && unit.checkpointRef === path.join(selectedDirectory, "unit.json"))
+      baseline = confirmedUnitSource(intent, unit).files;
+    const pause = partial.authority.confirmedPause;
+    if (pause && pause.checkpointRef === path.join(selectedDirectory, "pause.json")) {
+      if (hash(readFileSync(pause.checkpointRef, "utf8")) !== pause.digest)
+        throw new Error("Confirmed pause digest mismatch.");
+      const point = read<{ intent: CheckpointIntent; files: Manifest["files"] }>(pause.checkpointRef);
+      if (!equal(point.intent, selected)) throw new Error("Confirmed pause association mismatch.");
+      baseline = point.files;
+    }
+    expected = new Map(baseline.map(file => [file.path, file.image]));
+  }
+  // Restoration attests to the historical baseline. New task effects belong to
+  // the current attempt's journal, not to that historical candidate.
+  const current = selected.key === intent.key ? { manifest, steps } :
+    existsSync(path.join(directory, "manifest.json")) ? load(intent) : undefined;
+  if (restored && current && selected.key !== intent.key) {
+    if (!equal(current.manifest.base, restored.candidate))
+      throw new Error("Current checkpoint does not capture the restored baseline.");
+    for (const file of current.manifest.files) expected.set(file.path, file.image);
+    for (const step of current.steps) for (const entry of step) expected.set(entry.path, entry.after);
+  }
+  const sha256 = (value: Image) => value === null ? null : createHash("sha256").update(Buffer.from(value.bytes, "base64")).digest("hex");
+  const paths = [...expected.keys()].flatMap(filePath => {
+    const file = { path: filePath };
+    const actual = image(root, file.path), journaled = expected.get(file.path)!;
+    const pending = (current?.steps ?? steps).at(-1)?.find(entry => entry.path === file.path);
+    return equal(actual, journaled) ? [] : [{ path: file.path, journaled: sha256(journaled), actual: sha256(actual),
+      partiallyApplied: !!pending && equal(actual, pending.before) && !equal(pending.before, pending.after) }];
+  });
+  if (paths.length) return { ...base, outcome: "mismatch" as const, paths: paths.slice(0, 10) };
+  const restoration = restored ? { restored: { ...restored, restoredRef: path.join(selectedDirectory, "restored.json") } } : {};
+  if (restored && (!current || selected.key === intent.key)) {
+    if (!equal({ head: restored.candidate.head, fingerprint: restored.candidate.fingerprint }, candidate))
+      throw new Error("Restored checkpoint candidate conflicts with current checkout.");
+    return { ...base, outcome: "observed" as const, ...restoration };
+  }
+  // A retained seal of this attempt is identified, never rewritten: identical
+  // sealed content is idempotent (its sealing candidate stays the admitted one);
+  // different content is an integrity conflict naming the differing files.
+  if (kind !== null) for (const retainedKind of ["unit", "pause"]) {
+    const ref = path.join(directory, `${retainedKind}.json`);
+    if (!existsSync(ref)) continue;
+    const point = read<{ intent: CheckpointIntent; candidate: typeof observed; files: Manifest["files"];
+      position: { loop: number; cursor: number; phase: string } }>(ref);
+    const differing = manifest.files.filter(file =>
+      !equal(point.files.find(entry => entry.path === file.path)?.image, image(root, file.path)));
+    if (kind === retainedKind && !differing.length && equal(point.intent, intent))
+      return { ...base, candidate: { head: point.candidate.head, fingerprint: point.candidate.fingerprint },
+        outcome: "sealed" as const, checkpointRef: ref, digest: hash(readFileSync(ref, "utf8")), position: point.position, ...restoration };
+    return { ...base, outcome: "mismatch" as const, paths: (differing.length ? differing : manifest.files).slice(0, 10).map(file => ({
+      path: file.path, journaled: sha256(point.files.find(entry => entry.path === file.path)?.image ?? null),
+      actual: sha256(image(root, file.path)), partiallyApplied: false })) };
+  }
+  if (kind === null) return { ...base, outcome: "observed" as const, ...restoration };
+  const sealed = sealCheckpoint(intent, kind, true);
+  return { ...base, outcome: "sealed" as const, checkpointRef: sealed.checkpointRef, digest: sealed.digest, position: sealed.position, ...restoration };
+}
+export const sealCheckpointRequest = operation(sealRequest);
+
+// Public pre-write capture over the same storage used by the CLI. Sealing is
+// root-owned; publication is not root admission and never changes mission state.
+function create(intent: CheckpointIntent, kind: "pre", paths?: string[], signal?: AbortSignal) {
   signal?.throwIfAborted();
-  const receipt = kind === "pre" ? undefined : sealCheckpoint(intent, kind, true);
-  const checkpointRef = receipt?.checkpointRef ?? manifestRef;
-  const point = read<{ files: Manifest["files"] }>(checkpointRef);
-  return { ok: true, status: existed ? "existing" : "created", kind, directory, checkpointRef,
-    digest: hash(readFileSync(checkpointRef, "utf8")), manifestRef,
-    files: point.files.map(file => ({ path: file.path, exists: file.image !== null,
+  if (kind !== "pre") throw new Error("Invalid checkpoint point kind.");
+  const progress = admittedProgress(intent);
+  const directory = checkpointDirectory(intent), manifestRef = path.join(directory, "manifest.json");
+  const existed = existsSync(manifestRef);
+  if (!paths?.length || new Set(paths).size !== paths.length) throw new Error("Checkpoint needs unique exact affected paths.");
+  if (existed) {
+    const { manifest, steps } = load(intent);
+    if (steps.length || !equal(manifest.files.map(file => file.path), paths) ||
+        !equal(manifest.files, paths.map(file => ({ path: file, image: image(intent.association.root, file) }))) ||
+        manifest.base.fingerprint !== checkoutEvidence(intent.association.root).fingerprint)
+      throw new Error("Checkpoint operation conflicts with retained original content.");
+  } else {
+    signal?.throwIfAborted();
+    captureCheckpoint(intent, paths);
+  }
+  const { manifest } = load(intent);
+  return { ok: true, status: existed ? "existing" : "created", kind, directory, checkpointRef: manifestRef,
+    digest: hash(readFileSync(manifestRef, "utf8")), manifestRef,
+    files: manifest.files.map(file => ({ path: file.path, exists: file.image !== null,
       sha256: file.image === null ? null : createHash("sha256").update(Buffer.from(file.image.bytes, "base64")).digest("hex"),
       mode: file.image?.mode ?? null })),
-    position: receipt?.position ?? { loop: intent.loop, cursor: intent.cursor, phase: intent.phase },
-    progress, candidate: receipt?.candidate ?? { head: manifest.base.head, fingerprint: manifest.base.fingerprint },
-    ...(receipt ? { checkpointReceipt: receipt } : {}), confirmed: false };
+    position: { loop: intent.loop, cursor: intent.cursor, phase: intent.phase },
+    progress, candidate: { head: manifest.base.head, fingerprint: manifest.base.fingerprint }, confirmed: false };
 }
 export const checkpointEvidence = operation(evidence);
 export const restoreCheckpoint = operation(restore);

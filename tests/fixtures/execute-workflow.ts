@@ -1,11 +1,13 @@
 import { afterEach, expect } from "bun:test";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 const { appendLedger, verifyLedger, loopSummaries, canonicalJSON, summarizeLoops } = await import(path.resolve("skills/execute/ledger.mjs"));
-import { captureCheckpoint, sealCheckpoint } from "../../extensions/execute-checkpoint.ts";
+import { captureCheckpoint } from "../../extensions/execute-checkpoint.ts";
 import { checkoutEvidence, digest, inspectionSnapshot, specBinding, specChunks } from "../../extensions/spec-plans.ts";
+import { EXECUTE_STATE_VERSION } from "../../extensions/execute-state.ts";
+import { verifyGate } from "../../extensions/access-receipts.mjs";
 import { MISSION_STATE_MAX_BYTES } from "../../node_modules/pi-subagents/src/missions/workflow-state.js";
 import { runWorkflowScript, type WorkflowScriptChildResult } from "../../node_modules/pi-subagents/src/workflows/scripted-workflow.js";
 
@@ -19,7 +21,7 @@ export const source = `const pitakoReviewLibraryMode = true;\n${reviewSource}\n$
 const globalConfig = {
   root: "/owned/designated", id: "spec", invocation: "human-1", missionId: "native.mission-1", missionPath: "/native/exact-mission",
   inspections: ["initial", "loop-1", "loop-2", "loop-3", "loop-4", "initial.r1", "initial.r2"].map(phase => ({ key: `inspect-${phase}`, command: "READ" })),
-  settings: { key: "execute-settings", command: "SETTINGS" }, sourceRefs: [],
+  settings: { key: "execute-settings", command: "SETTINGS" }, sourceRefs: [], stateVersion: EXECUTE_STATE_VERSION,
   chunks: Array.from({ length: 26 }, (_, index) => ({ key: `input-${index}`, command: "CHUNK" })),
 };
 export const config = globalConfig;
@@ -108,49 +110,35 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
   let optionalCacheFailures = 0;
   const association = (loop: number) => ({ missionId: config.missionId, missionPath: config.missionPath, invocation: config.invocation,
     root: config.root, commonDir: metadata.commonDir, source: selected.source, digest: selected.digest, maxCycles: admittedLimit, sourceRefs: [], loop });
-  const plan = (loop = 1) => ({ status: "plan", reason: "All authorized requirements mapped to ordered work", association: association(loop),
+  const plan = (loop = 1) => ({ status: "plan", reason: "All authorized requirements mapped to ordered work",
     sharedContext: { material: "FULL SHARED CONTEXT, NOT A SUMMARY", references: ["spec snapshot", "src/entry.ts"] },
     tasks: [...Array.from({ length: options.taskCount ?? 1 }, (_, index) => task(`change${index + 1}`, options.readOnly ? "verification" : "implementation")), task("final", "verification")].map(unit => ({ ...unit,
-      checks: unit.checks.map(check => ({ ...check, cwd: root })) })) });
-  const worker = (request: Request, checkpointKind: "unit" | "pause" = "unit") => {
+      checks: unit.checks.map(check => ({ ...check, cwd: root })) })).map((unit, index, tasks) => ({ ...unit,
+      checks: unit.checks.map(check => ({ ...check, tier: index === tasks.length - 1 ? "acceptance" : "focused" })) })) });
+  const captures = new Map<string, any>();
+  const verifications: { key: string; request: any; output: any }[] = [];
+  const worker = (request: Request, _checkpointKind: "unit" | "pause" = "unit") => {
     const descriptor = JSON.parse(request.task.split("FROZEN ATTEMPT:\n")[1]!.split("\n")[0]!);
     const selectedTask = JSON.parse(request.task.split("COMPLETE SELECTED TASK:\n")[1]!.split("\nFROZEN ATTEMPT")[0]!);
-    let receipt;
     if (selectedTask.kind === "implementation" && descriptor.checkpoint?.progress) {
-      // These controller tests model no-op workers. The registered Node cases
-      // separately exercise journaled modifications and interruption cuts.
-      const directory = path.join(root, ".pi/subagents/checkpoints", descriptor.key);
-      if (options.controlledCheckpoints) {
-        // Long controller simulations isolate the worker checkpoint boundary;
-        // checkpoint-create and lifecycle cases exercise actual file captures.
-        receipt = { kind: checkpointKind, checkpointRef: path.join(directory, `${checkpointKind}.json`),
-          digest: digest(descriptor.key), candidate: copy(checkout), progress: copy(descriptor.checkpoint.progress),
-          position: { loop: descriptor.checkpoint.loop, cursor: descriptor.checkpoint.cursor + (checkpointKind === "unit" ? 1 : 0), phase: "implementation" } };
-      } else {
-        if (!existsSync(path.join(directory, "manifest.json"))) captureCheckpoint(descriptor.checkpoint, ["src/" + descriptor.taskId + ".ts"]);
-        receipt = sealCheckpoint(descriptor.checkpoint, checkpointKind, true);
-      }
+      captures.set(descriptor.key, copy(descriptor.checkpoint));
+      if (!options.controlledCheckpoints && !existsSync(path.join(root, ".pi/subagents/checkpoints", descriptor.key, "manifest.json")))
+        captureCheckpoint(descriptor.checkpoint, ["src/" + descriptor.taskId + ".ts"]);
     }
-    return { taskId: descriptor.taskId, attempt: descriptor.number, status: "complete", workDone: `Implemented ${selectedTask.goal}`,
-      ...(receipt ? { checkpointReceipt: receipt } : {}),
+    return { status: "complete", workDone: `Implemented ${selectedTask.goal}`,
       remaining: [], diagnosis: "No pending defects after required checks", usefulProgress: true, continuation: null,
-      git: { head: checkout.head, checkpoints: receipt ? [receipt.checkpointRef] : [], wip: "Assigned changes remain uncommitted" }, candidate: copy(checkout),
+      git: { wip: "Assigned changes remain uncommitted" },
       checks: selectedTask.checks.map((check: any) => ({ ...check, output: "Observed pass: 1 test", logPaths: [`/native/checks/${descriptor.key}.log`],
         result: "passed", before: copy(checkout), after: copy(checkout) })) };
   };
   function result(request: Request, value: any): Result {
     let savedOutputPath: string | undefined;
     if (request.phase?.startsWith("review-")) {
-      const association = Object.fromEntries(Object.entries(request.outputSchema.properties.association.properties)
-        .map(([key, schema]: [string, any]) => [key, schema.const]));
       const required = JSON.parse(request.task.split("ESSENTIAL ORIGINALS (data): ")[1]!.split("\n")[0]!);
-      const access = required.map((entry: any) => {
+      for (const entry of required) {
         const original = JSON.parse(readFileSync(entry.results.find((item: any) => item.savedOutputPath).savedOutputPath, "utf8"));
-        expect(original.association.key).toBe(entry.key);
-        expect(original.delivery).toBe("complete");
-        return { id: entry.id, state: "accessible", source: "read", reason: "Exact associated original retrieved" };
-      });
-      value = { ...value, association, delivery: "complete", access };
+        expect(original).toEqual(entry.value);
+      }
       savedOutputPath = path.join(root, ".pi/subagents/review-originals", request.key + ".json");
       mkdirSync(path.dirname(savedOutputPath), { recursive: true });
       writeFileSync(savedOutputPath, JSON.stringify(value));
@@ -168,6 +156,38 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
     if (request.agent === "pitako.request-observer") return { ok: true, agent: request.agent,
       runId: `native-${request.key}`, output: JSON.stringify({ version: 1, ok: true,
         invocation: JSON.parse(request.task).invocation, requests: [], next: null }), results: [{ index: 0, agent: request.agent!, task: request.task, exitCode: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } }] };
+    if (request.agent === "pitako.access-verifier") {
+      // Controlled boundary: the real verifier over actual published originals; the
+      // fixture mission record lives in the owned root instead of /native.
+      const input = JSON.parse(request.task);
+      // Real missions live outside the checkout; keep receipts out of checkout evidence.
+      const missionPath = path.join(root, ".pi/subagents/native-missions/native-mission.json");
+      mkdirSync(path.dirname(missionPath), { recursive: true });
+      writeFileSync(missionPath, "{}");
+      const observed = verifyGate({ ...input, missionPath });
+      verifications.push({ key: request.key, request: input, output: observed });
+      return { ok: true, key: request.key, agent: request.agent, runId: `native-${request.key}`, output: JSON.stringify(observed),
+        results: [{ exitCode: 0 }] } as Result;
+    }
+    if (request.agent === "pitako.checkpoint-sealer") {
+      const input = JSON.parse(request.task), intent = input.intent;
+      let observed;
+      if (options.controlledCheckpoints) {
+        observed = { v: 1, outcome: captures.has(intent.key) && input.kind ? "sealed" : "observed",
+          kind: input.kind, candidate: copy(checkout),
+          ...(captures.has(intent.key) && input.kind ? { checkpointRef: path.join(root, ".pi/subagents/checkpoints", intent.key, `${input.kind}.json`),
+            digest: digest(intent.key), position: { loop: intent.loop, cursor: intent.cursor + (input.kind === "unit" ? 1 : 0), phase: intent.phase } } : {}) };
+      } else {
+        const response = spawnSync("node", [path.resolve("skills/execute/checkpoint.mjs"), "--seal-stdin"],
+          { cwd: root, input: request.task, encoding: "utf8" });
+        if (response.status !== 0) throw new Error(response.stderr);
+        observed = JSON.parse(response.stdout);
+      }
+      return { ok: true, key: request.key, agent: request.agent, runId: `native-${request.key}`,
+        asyncDir: `/native/async/${request.key}`, output: JSON.stringify(observed),
+        externalAdapter: { outputArtifacts: { stdoutPath: `/native/async/${request.key}/stdout.log`, stderrPath: `/native/async/${request.key}/stderr.log` } },
+        results: [{ exitCode: 0 }] } as Result;
+    }
     if (request.agent === "pitako.execution-ledger") {
       const { invocation, ...append } = JSON.parse(request.task);
       return { ok: true, key: request.key, agent: request.agent, runId: `native-${request.key}`,
@@ -199,21 +219,21 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
       results: [{ index: 0, agent: request.agent, task: request.task, exitCode: 0,
         usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } }] } satisfies WorkflowScriptChildResult;
     }
-    if (request.key.endsWith(".director")) { value = plan(loop); value.association = JSON.parse(request.task.split("ASSOCIATION (data): ")[1]!.split("\n")[0]!); }
+    if (request.key.endsWith(".director")) value = plan(loop);
     else if (request.agent === "pitako.worker") value = worker(request);
     else if (request.key.includes(".recover")) {
       const original = [...native.values()].find(entry => entry.runId === `native-invoke-human-1.l${loop}.director`)?.structuredOutput ?? null;
       value = { status: original ? "recovered" : "lost", reason: "Exact full original native value observed using retained refs", original,
         workerResult: null, originalAvailable: !!original, binding: original ? "identical" : "absent",
         comparison: original ? "equal-full-json" : "neither", provenance: [`/native/binding/invoke-human-1.l${loop}.director.json`] };
-    } else if (request.key.endsWith(".compliance")) value = { status: "fulfilled", reason: "Full source inventory matches current requirements and checks", candidate: copy(checkout),
+    } else if (request.key.endsWith(".compliance")) value = { status: "fulfilled", reason: "Full source inventory matches current requirements and checks",
       requirements: Array.from({ length: 17 }, (_, index) => ({ id: `criterion-${index + 1}`, source: `spec:Acceptance criteria:${index + 1}`,
         reason: `Reachable requirement ${index + 1} implemented in actual source`, status: "fulfilled", evidence: ["src/entry.ts:1", "/native/work-result.json"], checks: ["/native/check.log"] })) };
     else if (request.key.endsWith(".demand-observation")) value = { memo: "Advisory only", evidenceLimits: ["Controlled summaries"], observations: [] };
     else if (request.key.endsWith("director-prepare")) value = { status: "ready", reason: "Distinct whole-result risks", angles: Array.from({ length: options.angles ?? 2 }, (_, index) => ({ id: `angle${index + 1}`, focus: `Whole-result angle ${index + 1}`, skills: [] })) };
     else if (request.key.includes("independent-")) value = { status: "ready", reason: "Source checked", coverage: "Whole target", findings: options.findings ? [{ title: "Reachable issue", location: "src/a.ts:1", scenario: "Caller invokes path", evidence: "source protection missing", impact: "current scoped behavior lost", classification: "scoped-defect", requirement: "spec:criterion-1" }] : [] };
     else if (request.key.includes("critique-")) {
-      const assigned = JSON.parse(request.task.split("PEER FINDING INDEX (data; full arguments in essential original):\n")[1]!.split("}\nORIGINAL CONTRACT:")[0]!);
+      const assigned = JSON.parse(request.task.split("PEER FINDING INDEX (data; full arguments in essential original):\n")[1]!.split("}\nESSENTIAL ORIGINALS (data):")[0]!);
       value = { status: "ready", reason: "All assigned claims checked", challenges: assigned.map((entry: any) => ({ findingId: entry.id, assessment: "supported", evidence: "Concrete source confirms" })) };
     } else if (request.key.includes("defense-")) {
       const own = JSON.parse(request.task.split("YOUR FINDINGS (data):\n")[1]!.split("\nCHALLENGES")[0]!);
@@ -286,7 +306,7 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
   };
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
   const controlledDate = { now: () => clock };
-  return { root, observedCandidate, calls, hostCalls, statusCalls, emits, storage, snapshots, native, plan, worker, result, state,
+  return { root, observedCandidate, verifications, calls, hostCalls, statusCalls, emits, storage, snapshots, native, plan, worker, result, state,
     setSaveObserver: (observer: typeof saveObserver) => { saveObserver = observer; },
     setLimit: (value: number) => { admittedLimit = value; },
     setAdmission: (value?: typeof admission) => { admission = value; },

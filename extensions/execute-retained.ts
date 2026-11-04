@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { executionStatePath } from "./execute-state.ts";
+import { EXECUTE_STATE_VERSION, executionStatePath, incompatibleExecuteState } from "./execute-state.ts";
 
 const record = (value: unknown): value is Record<string, unknown> =>
 	!!value && typeof value === "object" && !Array.isArray(value);
@@ -39,7 +39,8 @@ function retainedProjection(root: string, source: string, digest: string, contex
 	// A failed pre-admission request has no originals. Legacy roots never acquire
 	// this delivery route, and a changed bound association is not recaptured.
 	if (bound && association === undefined) return undefined;
-	if (bound && (invocation.version !== 4 || invocation.admissionBinding !== bound.binding ||
+	if (invocation.version !== EXECUTE_STATE_VERSION) throw new Error(incompatibleExecuteState(invocation.version));
+	if (bound && (invocation.admissionBinding !== bound.binding ||
 		!record(association) || association.commonDir !== bound.commonDir ||
 		!isDeepStrictEqual(association.sourceRefs, context.sourceRefs)))
 		throw new Error("Retained recovery binding differs or predates bound admission. Preserve the original snapshot and native references; restore reliable exact bytes or inspect native state, never migrate or recapture this root.");
@@ -47,7 +48,7 @@ function retainedProjection(root: string, source: string, digest: string, contex
 		association.digest !== digest || association.invocation !== context.invocation ||
 		association.missionId !== context.missionId || association.missionPath !== context.missionPath)
 		throw new Error("Retained analysis association differs from the selected invocation.");
-	const loop = invocation.version === 4 ? invocation.loop : Array.isArray(invocation.loops) ? invocation.loops.at(-1) : undefined;
+	const loop = invocation.loop;
 	if (!record(loop) || !["director", "implementation", "review", "compliance"].includes(String(loop.phase))) return undefined;
 	const review = record(loop.review) ? loop.review : {};
 	const compliance = record(loop.compliance) ? loop.compliance : {};

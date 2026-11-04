@@ -6,6 +6,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import devTools from "../extensions/dev-tools/index.ts";
 import fileSha256 from "../extensions/file-sha256.ts";
+import accessReceiptVerify from "../extensions/access-receipt-verify.ts";
 import checkpointCreate from "../extensions/checkpoint-create.ts";
 import pitako from "../extensions/index.ts";
 import profilePolicy from "../extensions/profile-policy.ts";
@@ -33,6 +34,7 @@ function loadProfileExtensions(pi: ExtensionAPI, codex: (pi: ExtensionAPI) => vo
     ["./extensions/profile-policy.ts", profilePolicy],
     ["./extensions/dev-tools/index.ts", devTools],
     ["./extensions/file-sha256.ts", fileSha256],
+    ["./extensions/access-receipt-verify.ts", accessReceiptVerify],
     ["./extensions/checkpoint-create.ts", checkpointCreate],
   ]);
   // These providers are outside this profile fixture's controlled boundary.
@@ -61,7 +63,9 @@ function observerRegistrationEvents() {
     emit(event: string, request: RuntimeAgentRegistrationRequest) {
       expect(event).toBe(RUNTIME_AGENT_REGISTER_EVENT);
       expect(request.version).toBe(1);
-      const script = { "pitako.checkout-observer": "observe.mjs", "pitako.execution-ledger": "ledger.mjs", "pitako.request-observer": "observe.mjs" }[request.name];
+      const script = { "pitako.checkout-observer": ["skills/execute/observe.mjs"], "pitako.execution-ledger": ["skills/execute/ledger.mjs"],
+        "pitako.request-observer": ["skills/execute/observe.mjs", "--requests"], "pitako.checkpoint-sealer": ["skills/execute/checkpoint.mjs", "--seal-stdin"],
+        "pitako.access-verifier": ["extensions/access-receipts.mjs", "--verify-stdin"] }[request.name];
       expect(script).toBeDefined();
       expect(request.definition).toMatchObject({
         tools: [], allowNestedSubagents: false, systemPromptMode: "replace",
@@ -69,7 +73,7 @@ function observerRegistrationEvents() {
         defaultContext: "fresh", defaultAsync: false,
       });
       expect(request.definition.runner).toEqual({ type: "external-cli", command: process.execPath,
-        args: [path.join(packageRoot(), "skills/execute", script!), ...(request.name === "pitako.request-observer" ? ["--requests"] : [])], promptDelivery: "stdin" });
+        args: [path.join(packageRoot(), script![0]!), ...script!.slice(1)], promptDelivery: "stdin" });
       expect(active.has(request.name)).toBe(false);
       active.add(request.name);
       request.result = { ok: true, registration: { dispose() {
@@ -229,7 +233,7 @@ describe("Pitako resources and policy", () => {
       await host.start();
       const provider = readStack(packageRoot()).required.find(({ id }) => id === "pitako-dev-tools");
       expect(provider).toBeDefined();
-      expect(host.registeredTools).toEqual(["apply_patch", ...provider!.tools, "file_sha256", "file_sha256_save", "checkpoint_create"]);
+      expect(host.registeredTools).toEqual(["apply_patch", ...provider!.tools, "file_sha256", "file_sha256_save", "access_receipt_verify", "checkpoint_create"]);
       for (const name of provider!.tools) expect(host.active).toContain(name);
       for (const name of ["file_sha256", "file_sha256_save", "ast_search", "ast_rewrite"]) expect(host.active).toContain(name);
       expect(host.registeredCommands).toEqual(["pitako"]);

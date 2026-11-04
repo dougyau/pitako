@@ -115,7 +115,7 @@ reasons, contradictions, limits, questions and sources for foreground grilling.
 The [architecture skill](../skills/architecture/SKILL.md) owns the executable
 request and continuation contracts. It requires a complete versioned
 `currentDecision`, stable consultation ID and explicit mission, not just a brief.
-Version-2 continuation preserves the phase, original maximum, consumed count and
+Version-3 continuation preserves the phase, original maximum, consumed count and
 valid count. Decision replacements account for prior obligations and preserve
 human content and provenance. Resuming or adding facts alone does not revise the
 decision. Ambiguous dispatch stops reentry. Only an explicitly human-authorized
@@ -250,8 +250,7 @@ The admitted `pitako.execute.maxCycles` is a positive safe integer (default 3).
 Pi global agent-dir `settings.json` is overridden by the designated worktree's
 `.pi/settings.json`, never the source/sibling cwd. Invalid settings stop before
 a director; no settings are written. The immutable native association freezes
-the limit across recovery/settings edits; legacy version-2 records stay fixed
-at three without migration. Reports use `Loop n de max` and consumed/max.
+the limit across recovery/settings edits. Reports use `Loop n de max` and consumed/max.
 Early fulfillment stops; last-slot gaps need a new human invocation. Stop,
 permissions, persistence and actual native host/child capacity outrank the limit.
 Higher limits grant no extra native capacity. Hash-associated complete inherited
@@ -266,7 +265,9 @@ binding, then ends before implementation. It has no delegation, TODO or
 supervisor orchestration. The full `loop_plan` is the sole task definition:
 association, complete shared context and ordered stable IDs, goals, sources,
 context references, scope/effects, expected results and concrete checks. A last
-verification task is mandatory even when code already exists. A derived ID/order
+verification task is mandatory even when code already exists. Checks carry a
+tier: `focused` for earlier tasks and `acceptance`, the complete project
+procedure, only in that last task, so no intermediate complete gate runs. A derived ID/order
 manifest recovers position only, not another checklist or permission set.
 
 Ordinary packaged workers start fresh and sequentially, with no prior transcript
@@ -276,10 +277,10 @@ acceptance with explicit supported reason, and apply timeoutMs:14400000 per
 implementation attempt. This does not waive required checks or native barriers,
 extend the director/root or impose a logical-task deadline. No private diaries,
 progress files or TODOs. A worker implements only the selected full task and
-returns task/attempt, work done, concrete pending work, causal diagnosis,
-Git/checkpoints/WIP, final candidate and actual command/cwd/output/log/result.
-Existing checkoutEvidence identity is recorded before/after checks and after
-last writes. Useful diagnosed same-task continuations get new attempt keys;
+returns work done, concrete pending work, causal diagnosis, Git WIP and actual
+command/cwd/output/log/result. Existing checkoutEvidence identity is recorded
+before/after checks; the root attaches task/attempt and the sealer observes the
+final candidate and checkpoint identities. Useful diagnosed same-task continuations get new attempt keys;
 blind repetition/material replanning goes to a remaining director, without
 arbitrary quotas, retries-until-green or deadline inflation.
 
@@ -337,8 +338,9 @@ projections, not full child objects/prompts/reports under allowed string fields.
 Snapshot/frozen descriptor/progress are essential; failure to persist halts new
 dispatch. Cache at most one identical active plan if it fits the entire 256 KiB
 native state file. Closed-loop history goes to a verified ledger; superseded
-recovery data is archived then discarded. New runs use v4; retained v2/v3 runs
-are neither replayed nor migrated.
+recovery data is archived then discarded. Execute state uses one contract
+version (v5); older retained runs fail before any resume or dispatch with an
+actionable message and are neither replayed nor migrated.
 
 Native state retains only current control/progress, full admitted task results,
 usage totals and three-loop rings of plan-rejection diagnostics, close-native
@@ -798,11 +800,15 @@ The bound writer calls registered `checkpoint_create({kind:"pre", paths:[...]})`
 before checkout writes; native launch context supplies the actual durable attempt
 and progress. It returns structured artifact references, not model-assembled
 capture/seal scripts or receipts. Missing/stale context fails closed. The same
-owned capture/seal operations back the tool and existing helper, not a parallel
+owned capture operations back the tool and existing helper, not a parallel
 journal. Keep `skills/execute/checkpoint.mjs` for journaled apply and selective
-restore; see the execute skill. `kind:"unit"` seals completed writes and `kind:"pause"`
-preserves pending WIP only while native control permits capture. Return the actual
-`checkpointReceipt`; root durable result admission, not tool success, confirms it.
+restore; see the execute skill. The tool accepts only `kind:"pre"`. After a
+cooperative worker terminal the root dispatches the model-free
+`pitako.checkpoint-sealer`, which verifies the journal, observes the candidate and
+seals `unit` for a valid complete report or `pause` for pending work. A journal
+mismatch halts with the differing paths and hashes. Root durable result admission,
+not the seal, confirms the point. The worker is the only writer of checkout
+content; deterministic root agents write only Pitako metadata.
 Repeated identical requests identify the existing immutable publication. Analysis
 and inspector roles gain no writer capability, including via codemode. Editing
 provider/profile files does not reload already active sessions. Retained legacy

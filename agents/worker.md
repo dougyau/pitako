@@ -112,8 +112,9 @@ Todo is display, not evidence: the structured result stays authoritative.
 A cancelled or deleted step never drops required work or checks. Execute passes
 reads:false and progress:false; these override only this call, not ordinary worker defaults. Return the task's structured_output
 schema instead of the generic prose shape above. Report work done, concrete
-remaining work, causal diagnosis, Git/checkpoints/WIP and actual check commands,
-cwd, output/logs, result and final candidate identity including uncommitted work.
+remaining work, causal diagnosis, Git WIP and actual check commands, cwd,
+output/logs, result and per-check before/after checkoutEvidence. The root attaches
+task/attempt, candidate and checkpoint identities.
 Identify each planned check by its admitted ID and return real execution evidence
 for every entry, including failed or not-run checks. The admitted plan owns the
 canonical requirement; omit its optional echo or use descriptive wording without
@@ -136,17 +137,15 @@ native execution context. Do not assemble capture/seal scripts, manifests or rec
 A fingerprint is not a backup. Apply writes through the helper's durable pre/postimage journal,
 not a separate editor that loses attribution. Additional paths need a fresh
 captured unit before editing. Keep manifest/effect/partial-state references.
-When the delivered output schema admits checkpointReceipt and the intention carries
-progress, call checkpoint_create({kind:"unit"}) after owned writes settle and return
-its actual structured checkpointReceipt. The unit kind requires status complete;
-any other status uses pause. Status and remaining describe this task; inherited
-mission gaps outside its scope go in diagnosis. A cooperative pause may call
-checkpoint_create({kind:"pause"}) only while native control permits capture;
-return its actual receipt with remaining pending work and blocked, continue or gaps
-status, then yield control. The receipt preserves pending position and never
-completes the task. Stop/refusal or abrupt loss uses the previous
-confirmed checkpoint, without extra edits or a promised post-cut capture. The root
-confirms the sealed point together with durable result admission, not before.
+After owned writes settle, return only your decision-only structured result. The
+root dispatches a model-free sealer that observes the candidate and chooses the
+seal kind from your status and remaining work: never call unit/pause, construct
+checkpoint or restoration receipts, or transcribe task/attempt, candidate, Git HEAD
+or checkpoint references. Status and remaining describe this task; inherited
+mission gaps outside its scope go in diagnosis. Stop/refusal or abrupt loss uses
+the previous confirmed checkpoint, without extra edits or a promised post-cut
+capture. The root confirms the sealed point together with durable result
+admission, not before.
 Never mutate Git or native mission metadata to restore a unit. Restoration is
 checkpoint-first after best-effort pertinent-writer status/stop through authorized
 public operations, not native-resume-first or dependent on perfect settlement.

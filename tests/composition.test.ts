@@ -77,13 +77,13 @@ describe("engineering-layer composition", () => {
           // Native discovery resolves the actual resource, not a pasted skill body.
           for (const instruction of ["checkpoint-first", "best-effort pertinent-writer",
             "conclusive historical settlement are not prerequisites", "partial bytes before selective restoration",
-            "root durable result admission", "last confirmed checkpoint", "FULL",
-            "human-delivery provenance", "read/hash", "verify-behavior"])
+            "durable root admission", "last confirmed checkpoint", "FULL",
+            "human-delivery provenance", "read/hash", "verify-behavior", "pitako.checkpoint-sealer"])
             expect(body).toContain(instruction);
-          for (const call of ['checkpoint_create({kind:"pre"', 'checkpoint_create({kind:"unit"})', 'checkpoint_create({kind:"pause"})'])
-            expect(body).toContain(call);
-          expect(body).toContain("actual structured `checkpointReceipt`");
-          expect(body).toContain("does not admit results");
+          expect(body).toContain('checkpoint_create({kind:"pre"');
+          for (const call of ['checkpoint_create({kind:"unit"})', 'checkpoint_create({kind:"pause"})'])
+            expect(body).not.toContain(call);
+          expect(body).toContain("workers never call unit/pause or echo receipts");
           expect(body).toContain("Editing provider/profile files does not reload");
           expect(body).not.toContain("node <helper> capture");
           expect(body).not.toContain("must first reconcile the\nexact native producer and prefer its result/continuation");
@@ -636,7 +636,7 @@ describe("engineering-layer composition", () => {
   test("pre-pr reuses review and keeps readiness with the coordinator", () => {
     const skill = readRepo("skills/pre-pr/SKILL.md");
     for (const contract of [
-      "[review skill](../review/SKILL.md)", "existing pi-subagents workflow",
+      "[review skill](../review/SKILL.md)", "named resource\n`pitako.review`",
       'target.kind: "diff"', "target.reference", "target.material",
       "untracked files with their", "source files stable during review",
       'status: "completed"', "Completion is not approval",

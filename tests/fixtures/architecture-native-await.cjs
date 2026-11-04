@@ -6,8 +6,12 @@ const path = require("node:path");
 
 async function main() {
   const { runWorkflowScript } = await import("../../node_modules/pi-subagents/src/workflows/scripted-workflow.js");
-  const source = readFileSync(process.argv[2], "utf8");
+  const { verifyGate } = await import("../../extensions/access-receipts.mjs");
   const root = mkdtempSync(path.join(tmpdir(), "pitako-architecture-await-"));
+  // The named resource inlines the mission binding; the raw path alone refuses to run.
+  const missionPath = path.join(root, "mission.json");
+  writeFileSync(missionPath, "{}");
+  const raw = readFileSync(process.argv[2], "utf8");
   const launches = [], releases = [];
   const perspectives = [
     { id: "simple", label: "Simplicity", focus: "Compare complete designs." },
@@ -16,11 +20,12 @@ async function main() {
   const discuss = { action: "discuss", perspectives, packet: "Complete common problem", memo: "" };
   const finish = { action: "finish", perspectives: [], packet: "", memo: "Keep the simpler design." };
   try {
-    for (const scenario of ["complete", "invalid-access", "intention-failure"]) {
+    for (const scenario of ["complete", "invalid-schema", "intention-failure"]) {
       const storage = new Map(), calls = [], steered = [];
       let failedWrites = 0, releasePeer, peerChallenge;
       const peer = new Promise(resolve => { releasePeer = resolve; });
       releases.push(releasePeer);
+      const source = `const pitakoAccess = ${JSON.stringify({ missionPath: path.join(root, `${scenario}.json`), namespace: "architecture-await" })};\n${raw}`;
       const result = await runWorkflowScript({
         script: source, timeoutMs: 2000,
         args: {
@@ -43,23 +48,28 @@ async function main() {
           },
         },
         launch: (key, request) => {
+          // The real model-free verifier runs before each consuming gate's intention.
+          if (request.agent === "pitako.access-verifier") return Promise.resolve({ key, ok: true, agent: request.agent,
+            runId: `native-${key}`, output: JSON.stringify(verifyGate(JSON.parse(request.task))), artifactPaths: [],
+            results: [{ index: 0, agent: request.agent, task: request.task, exitCode: 0,
+              usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } }] });
           const work = (async () => {
             calls.push(key);
             const retained = storage.get("architecture-await-regression");
             assert(retained.cursor.dispatches.some(item => item.key === key && item.boundary === "intended"),
               "Every launch must follow its persisted intention");
             if (key === "r2-recovery") await peer;
-            const contract = JSON.parse(request.task.match(/ORIGINAL CONTRACT: (.*)\n/)[1]);
-            const originals = JSON.parse(request.task.match(/ESSENTIAL ORIGINALS \(data; one authoritative representation per original\): (.*)\n/)[1]);
+            for (const field of ["association", "delivery", "access"])
+              assert(!Object.hasOwn(request.outputSchema.properties, field));
+            const references = request.task.match(/VERIFIED ESSENTIAL ORIGINALS \(references; receipt [^)]*\): (.*)\n/);
+            const originals = references ? JSON.parse(references[1]) : [];
             if (key === "r2-recovery") originals.push(peerChallenge);
-            const access = originals.map(original => {
-              const exact = JSON.parse(readFileSync(original.results[0].savedOutputPath, "utf8"));
-              assert.equal(exact.association.key, original.key);
-              return { id: original.id, state: "accessible", source: "read", reason: "Read exact controlled original" };
-            });
-            if (!originals.length) {
-              assert.equal(request.outputSchema.properties.access.maxItems, 0);
-              assert(request.task.includes("Return access: [] exactly"));
+            for (const original of originals) {
+              const exact = JSON.parse(readFileSync(original.path ?? original.results[0].savedOutputPath, "utf8"));
+              const admitted = storage.get("architecture-await-regression").originals.find(item => item.id === original.id);
+              assert.equal(admitted.runId, `native-${admitted.key}`);
+              assert.equal(admitted.delivery, "complete");
+              assert.deepEqual(exact, admitted.value);
             }
             let value;
             if (key.startsWith("director-doubts-")) value = {
@@ -73,9 +83,8 @@ async function main() {
               status: "ready", report: `Controlled report from ${key}`,
               ...(request.phase === "architecture-factual" ? { humanContext: "Controlled answer" } : {}),
             };
-            if (scenario === "invalid-access" && key === "r1-simple")
-              access.push({ id: "none-required", state: "accessible", source: "context", reason: "Invalid placeholder" });
-            const structuredOutput = { ...contract, access, ...value };
+            if (scenario === "invalid-schema" && key === "r1-simple") value.status = "invalid";
+            const structuredOutput = value;
             const savedOutputPath = path.join(root, `${scenario}-${key}.json`);
             writeFileSync(savedOutputPath, JSON.stringify(structuredOutput));
             return {
@@ -115,7 +124,7 @@ async function main() {
         assert.equal(outcome.rounds, 1);
         assert.equal(outcome.validRounds, 0);
         assert(!calls.includes("director-doubts-r1"));
-        if (scenario === "invalid-access") {
+        if (scenario === "invalid-schema") {
           assert.match(outcome.error, /Original completeness\/schema\/association not demonstrated/);
           assert(calls.includes("r1-recovery"));
         } else {

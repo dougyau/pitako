@@ -28,7 +28,7 @@ function fixture(run: (value: {
 		}));
 		const association = { ...context, root, source: "/spec.md", digest: "e".repeat(64) };
 		writeFileSync(statePath, JSON.stringify({ "invoke-human-1": {
-			version: 4, association, loop: { number: 1, phase: "review", review: { references: [ref] } },
+			version: 5, association, loop: { number: 1, phase: "review", review: { references: [ref] } },
 		} }));
 		run({ root, file, native, mission, statePath, ref, original,
 			load: () => retainedAnalyses(root, "/spec.md", "e".repeat(64), context) });
@@ -121,12 +121,13 @@ test("corrupt native state is not treated as a fresh invocation", () => fixture(
 test.each(["eligible", "legacy", "binding", "sources"])("bound admission recovery captures only eligible new-root originals: %s", mode => fixture(f => {
 	const state = JSON.parse(readFileSync(f.statePath, "utf8")), invocation = state["invoke-human-1"];
 	const binding = "b".repeat(64), commonDir = path.join(f.root, ".git");
-	Object.assign(invocation, { version: mode === "legacy" ? 2 : 4, admissionBinding: mode === "binding" ? "c".repeat(64) : binding });
+	Object.assign(invocation, { version: mode === "legacy" ? 4 : 5, admissionBinding: mode === "binding" ? "c".repeat(64) : binding });
 	Object.assign(invocation.association, { commonDir, maxCycles: 3, sourceRefs: [] });
 	writeFileSync(f.statePath, JSON.stringify(state));
 	const load = () => boundRetainedAnalyses(f.root, commonDir, "/spec.md", "e".repeat(64), binding,
 		{ missionId: "mission-1", missionPath: f.mission, invocation: "human-1", sourceRefs: mode === "sources" ? [{ path: "/changed", digest: "f".repeat(64) }] : [] });
-	if (mode !== "eligible") {
+	if (mode === "legacy") expect(load).toThrow("Retained execution created by an incompatible Pitako contract v4; start a new mission.");
+	else if (mode !== "eligible") {
 		expect(load).toThrow("Retained recovery binding differs or predates bound admission");
 		expect(load).toThrow("without redispatch or automatic recapture");
 	} else {
