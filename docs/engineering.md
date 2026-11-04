@@ -167,6 +167,13 @@ real. Report the actual rejection with phase/work/references intact, never skip
 required checks or analyses, renew slots or create another mission to evade it.
 Available capacity/doctor information retains its provenance: it is context, not
 a reservation or guaranteed effective limit. Unknown capacity stays unknown.
+Each implementation attempt spends one extra slot on the root checkpoint sealer
+(5 per implementation attempt, 4 per verification attempt), and each execute review
+spends one `pitako.access-verifier` slot per consuming gate with required
+originals (critique, defense, synthesis: at most 3). Measured locally on a real
+four-angle review, one verifier process took about 40-50 ms (Node startup about
+26 ms) with 33-125 KB of stdin, well under its explicit 1 MiB ceiling; native
+dispatch overhead was not measured.
 
 The exact native pre-launch fan-out rejection returns `budget-exhausted` after
 saving current state, without closing/archiving the loop or spending another slot.
@@ -199,8 +206,7 @@ The admitted `pitako.execute.maxCycles` is a positive safe integer (default 3).
 Pi global agent-dir `settings.json` is overridden by the designated worktree's
 `.pi/settings.json`, never the source/sibling cwd. Invalid settings stop before
 a director; no settings are written. The immutable native association freezes
-the limit across recovery/settings edits; legacy version-2 records stay fixed
-at three without migration. Initial inspection reads neither settings file for
+the limit across recovery/settings edits. Initial inspection reads neither settings file for
 an admitted invocation; incompatible or partial associations are not fresh admission.
 Reports use `Loop n de max` and consumed/max.
 
@@ -276,7 +282,7 @@ structuredOutputPath. No whole prompts/reports/child objects are duplicated.
 The identical active-plan cache is optional within the entire 256 KiB state file;
 essential snapshot/frozen descriptor/progress failure stops unsafe dispatch.
 Closed-loop history goes to a verified ledger; superseded recovery data is
-archived then discarded. New v4 state holds current control/progress and usage
+archived then discarded. Current v5 state holds current control/progress and usage
 totals, not an accumulating loop array. Full completed results are stored once
 per task, with completed attempts referencing them; pending continuations retain
 their last result. Closing rebuilds deterministic bytes from immutable source
@@ -292,7 +298,8 @@ open loop; older closed entries cannot resume or conflict. Plan defects beyond
 three loops are not automatically detected; duplicate completions fail at
 admission. Loop-owned keys contain `.l<n>.`. Seals add one spawn; fused closing
 adds none, retries unpublished output with `.checkout.r<n>`, and never lets
-stdin choose the workspace. Retained v2/v3 states are not migrated.
+stdin choose the workspace. Older retained states fail explicitly and are not
+migrated. Each attempt adds one checkpoint-sealer spawn.
 Exceptional inspector recovery reads original full values via retained
 refs only when unavailable directly. Compare full JSON where binding/original
 survive. Missing binding uses original in place; conflict forbids edits; optional
@@ -425,10 +432,13 @@ guarantee is added.
 write-ahead effects. They use normal worker authority, not read-only inspector
 grants. The registered root saves an associated intention before dispatch;
 the bound worker calls registered `checkpoint_create` with `kind:"pre"` and exact
-paths before editing, and `kind:"unit"` or permitted pending `kind:"pause"` after
-writes settle. The tool resolves real durable context, reuses the same owned
-capture/seal operations and returns actual structured artifacts/receipts; it
-never confirms results or advances the root cursor. Missing/stale context fails,
+paths before editing. After a cooperative worker terminal, the root dispatches the
+model-free `pitako.checkpoint-sealer` runtime agent: it verifies the journal,
+observes the candidate and writes `unit` or `pause` seal metadata by a fixed table
+on the report status. No model chooses the kind or transcribes receipts. The tool
+and sealer never confirm results or advance the root cursor. The worker is the
+only writer of checkout content; root-dispatched deterministic agents write only
+Pitako metadata (seals, ledger records, access receipts). Missing/stale context fails,
 identical repeats preserve publications, and analysis/inspector calls remain
 nonwriting directly and through codemode. The helper remains the journaled
 apply/restore entry. File edits do not reload existing sessions. Artifacts under the

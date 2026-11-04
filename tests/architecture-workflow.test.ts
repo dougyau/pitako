@@ -5,8 +5,9 @@ import path from "node:path";
 import { runWorkflowScript, validateWorkflowScript, type WorkflowScriptChildResult } from "../node_modules/pi-subagents/src/workflows/scripted-workflow.js";
 import { normalizeWorkflowArgs } from "../node_modules/pi-subagents/src/workflows/workflow-resources.js";
 import type { WorkflowTerminalOutcome } from "../node_modules/pi-subagents/src/shared/types.js";
+import { verifyGate } from "../extensions/access-receipts.mjs";
 
-const source = readFileSync(new URL("../skills/architecture/workflow.js", import.meta.url), "utf8");
+const rawSource = readFileSync(new URL("../skills/architecture/workflow.js", import.meta.url), "utf8");
 
 test.each(["node", "bun"])("packaged architecture preserves awaited dispatch and failure diagnostics under %s", async runtime => {
   const child = Bun.spawn([
@@ -41,21 +42,40 @@ interface Result { ok: boolean; runId?: string; structuredOutput?: unknown; erro
   raw?: boolean; output?: string; results?: Record<string, unknown>[]; outputReference?: string; state?: "running" }
 interface Original { id: string; producer: string; key: string; revision: number; runId?: string;
   delivery: string; publication: string; sufficient: boolean; accessibility?: string; diagnostic?: string; failedOriginal?: Record<string, unknown>;
-  results?: { savedOutputPath?: string }[] }
+  outputSaveError?: string; results?: { savedOutputPath?: string }[] }
 const originalsRoot = mkdtempSync(path.join(tmpdir(), "pitako-architecture-originals-"));
 afterAll(() => rmSync(originalsRoot, { recursive: true, force: true }));
 let publicationSequence = 0;
+// Named-resource resolution inlines the mission binding; the raw path alone refuses to run.
+// Each run owns its mission so receipts never collide across tests.
+function boundSource() {
+  const missionPath = path.join(originalsRoot, `architecture-mission-${++publicationSequence}.json`);
+  writeFileSync(missionPath, "{}");
+  return `const pitakoAccess = ${JSON.stringify({ missionPath, namespace: "architecture-test" })};\n${rawSource}`;
+}
+const source = boundSource();
+// Verified references a consumer receives: {id, path, digest}.
 function essentials(request: Request): Original[] {
-  return JSON.parse(request.task.match(/ESSENTIAL ORIGINALS \(data; one authoritative representation per original\): (.*)\n/)?.[1] ?? "[]");
+  const references = JSON.parse(request.task.match(/VERIFIED ESSENTIAL ORIGINALS \(references; receipt [^)]*\): (.*)\n/)?.[1] ?? "[]");
+  return references.map((reference: { id: string; path: string }) => ({ ...reference, results: [{ savedOutputPath: reference.path }] }));
+}
+// The real model-free verifier at the controlled launch boundary.
+function verifierResult(key: string, request: Request): Result {
+  return { ok: true, agent: "pitako.access-verifier", runId: `native-${key}`, output: JSON.stringify(verifyGate(JSON.parse(request.task))),
+    results: [{ exitCode: 0 }] };
 }
 function originalValue(original: Original): Record<string, unknown> {
   if (original.failedOriginal) return original.failedOriginal;
   const saved = original.results?.find(child => child.savedOutputPath)?.savedOutputPath;
   if (!saved) throw new Error(`No publication for ${original.id}. ${original.diagnostic ?? "Original not delivered."}`);
   const value = JSON.parse(readFileSync(saved, "utf8"));
-  for (const field of ["consultation", "revision", "phase", "producer", "key", "attempt"] as const)
-    expect(value.association[field]).toEqual((original as unknown as Record<string, unknown>)[field]);
-  expect(value.delivery).toBe("complete");
+  expect(value).not.toHaveProperty("association");
+  expect(value).not.toHaveProperty("delivery");
+  expect(value).not.toHaveProperty("access");
+  if (original.producer !== undefined && original.producer !== "director-doubts" && !original.key.startsWith("director-")) {
+    expect(["ready", "blocked"]).toContain(value.status);
+    expect(typeof value.report).toBe("string");
+  }
   return value;
 }
 function evidenceText(request: Request) {
@@ -64,13 +84,9 @@ function evidenceText(request: Request) {
 function published(result: Result, request: Request): Result {
   if (result.raw) { const { raw, ...value } = result; return value; }
   if (result.structuredOutput === undefined) return result;
-  const contract = JSON.parse(request.task.match(/ORIGINAL CONTRACT: (.*)\n/)![1]!);
-  const access = (result.structuredOutput as { access?: unknown }).access ?? essentials(request).map(original => {
-    originalValue(original); // Controlled reader physically retrieves and validates the exact published original.
-    return { id: original.id, state: "accessible", source: original.failedOriginal ? "inline" : "read", reason: "Read and validated exact original and association" };
-  });
-  const value = { ...contract, access, ...(result.structuredOutput as object) };
-  if (request.phase === "architecture-factual") Object.assign(value, { humanContext: `Brief factual frontier from ${contract.association.key}: material facts, reasons, contrary claims, limits and sources.`, ...(result.structuredOutput as object) });
+  for (const original of essentials(request)) originalValue(original);
+  const value = { ...(result.structuredOutput as object) };
+  if (request.phase === "architecture-factual") Object.assign(value, { humanContext: `Brief factual frontier from ${request.key}: material facts, reasons, contrary claims, limits and sources.`, ...(result.structuredOutput as object) });
   if (request.phase === "architecture-doubts") Object.assign(value, { humanContext: "Material facts, rationale, contrary evidence and limits for the actual human frontier.", ...(result.structuredOutput as object) });
   const savedOutputPath = path.join(originalsRoot, `${++publicationSequence}.json`);
   const serialized = JSON.stringify(value, null, 2);
@@ -145,9 +161,14 @@ function fixture(
   const batches: Request[][] = [];
   const steered: { key: string; message: string; options: unknown }[] = [];
   const seen = new Set<string>();
+  const verifications: { key: string; request: Request }[] = [];
   function launch(key: string, request: Request): Promise<Result> {
     expect(seen.has(key)).toBe(false);
     seen.add(key);
+    if (request.agent === "pitako.access-verifier") {
+      verifications.push({ key, request });
+      return Promise.resolve().then(() => verifierResult(key, request));
+    }
     calls.push({ key, request });
     return Promise.resolve().then(() => respond(key, request)).then(result => published(result, request)).catch(error => ({ ok: false, error: String(error) }));
   }
@@ -160,7 +181,7 @@ function fixture(
       });
     },
     all(requests: Request[]): Promise<Result[]> {
-      batches.push(requests);
+      if (requests.every(request => request.agent !== "pitako.access-verifier")) batches.push(requests);
       return Promise.all(requests.map(request => launch(request.key!, request)));
     },
     steer(key: string, message: string, options: unknown) {
@@ -174,10 +195,11 @@ function fixture(
   const privateState = new Map<string, unknown>();
   const stateFile = path.join(originalsRoot, `mission-${++publicationSequence}.json`);
   const stateWrites: { bytes: number; persisted: boolean }[] = [];
+  const fixtureSource = boundSource();
   const execute = async (args: unknown = { currentDecision: snapshot("Choose a complete persistence design") }, storage: Map<string, unknown> = privateState) => {
     const normalized = normalizeWorkflowArgs(JSON.parse(JSON.stringify(args)));
     if ("error" in normalized && (args as Record<string, unknown>).humanAnswers !== undefined) throw new Error(normalized.error);
-    return new AsyncFunction("args", "runs", "state", "Date", source)({ consultation: "decision", workDescription: "Choose persistence architecture", ...(args as object) }, runs, storage && {
+    return new AsyncFunction("args", "runs", "state", "Date", fixtureSource)({ consultation: "decision", workDescription: "Choose persistence architecture", ...(args as object) }, runs, storage && {
       get: async (key: string) => structuredClone(storage.get(key)),
       set: async (key: string, value: unknown) => {
         const merged = { mission: "owned-test-mission", state: { ...Object.fromEntries(storage), [key]: value } };
@@ -193,14 +215,14 @@ function fixture(
       },
     }, clock);
   };
-  return { execute, calls, batches, steered, storage: privateState, stateWrites, stateFile };
+  return { execute, calls, verifications, batches, steered, storage: privateState, stateWrites, stateFile };
 }
 
 describe("architecture dynamic perspective roles", () => {
   const ids = ["scout", "researcher", "evidence-auditor", "preferences"];
   const roster = ids.map(id => ({ id, label: id + " perspective", focus: "Compare the whole decision" }));
   const decision = { ...discuss, perspectives: roster };
-  const continuation = { version: 2, consultation: "decision" };
+  const continuation = { version: 3, consultation: "decision" };
 
   test("keeps all role-like IDs as architect perspectives fresh, resumed and after a confirmed cut", async () => {
     let cut = false;
@@ -380,9 +402,7 @@ describe("architecture scripted workflow", () => {
           if (state !== "delivered") return result;
           const challenge = JSON.parse(host.steered[0]!.message.split("\n")[2]!) as Original;
           originalValue(challenge);
-          return { ...result, structuredOutput: { ...(result.structuredOutput as object), access: [...essentials(request), challenge].map(item => ({
-            id: item.id, state: "accessible", source: "read", reason: "Read and validated exact original, including newly steered challenge",
-          })) } };
+          return result;
         },
         key => {
           late.resolve(child(key));
@@ -456,7 +476,7 @@ describe("architecture scripted workflow", () => {
     const storage = new Map<string, unknown>();
     const first = await fixture().execute(undefined, storage);
     const host = fixture();
-    expect(first.continuation).toEqual({ version: 2, consultation: "decision" });
+    expect(first.continuation).toEqual({ version: 3, consultation: "decision" });
     expect(structuredClone(storage.get("architecture-decision"))).toMatchObject({ cursor: { dispatches: expect.arrayContaining([
       expect.objectContaining({ key: "director-prepare", controlOutput: expect.objectContaining({ memo: "" }) }),
       expect.objectContaining({ key: "director-after-r1", controlOutput: expect.objectContaining({ packet: "" }) }),
@@ -691,11 +711,11 @@ describe("architecture current complete decision", () => {
   test.each([false, true])("initial admission is durable before the first director; incompatible state and foreign continuation reject (planning=%s)", async planning => {
     const storage = new Map<string, unknown>();
     const host = fixture(key => {
-      expect(storage.get("architecture-current")).toMatchObject({ version: 2, currentDecision: { revision: 1, snapshot: initial() } });
+      expect(storage.get("architecture-current")).toMatchObject({ version: 3, currentDecision: { revision: 1, snapshot: initial() } });
       return { ...child(key), structuredOutput: { ...finish, action: "blocked" } };
     });
-    await host.execute({ consultation: "current", planning, currentDecision: initial() }, storage);
-    for (const continuation of [{ version: 1, consultation: "current" }, { version: 2, consultation: "foreign" }]) {
+    expect(await host.execute({ consultation: "current", planning, currentDecision: initial() }, storage)).toMatchObject({ status: "blocked" });
+    for (const continuation of [{ version: 2, consultation: "current" }, { version: 3, consultation: "foreign" }]) {
       const rejected = fixture(); await expect(rejected.execute({ consultation: "current", planning, continuation }, storage)).rejects.toThrow();
       expect(rejected.calls).toHaveLength(0);
     }
@@ -730,7 +750,7 @@ describe("planning architecture evidence and doubts", () => {
     expect(failedOriginal).toMatchObject({ sufficient: false, runId: `native-r${round}-simple`, publication: "published" });
     expect(originalValue(failedOriginal)).toMatchObject({ status: "blocked", report: blocker });
     expect(originalValue(retained.originals.find(item => item.key === `r${round}-recover`)!)).toMatchObject({ report: objection });
-    expect(JSON.stringify(retained)).not.toContain(blocker); // Published originals are never copied into native state.
+    expect(JSON.stringify(retained)).toContain(blocker); // The workflow retains the admitted envelope, not a model identity echo.
     const resumed = fixture((key, request) => {
       expect(key).toBe("director-prepare"); expect(request.resume).toBe(`native-director-after-r${round - 1}`);
       for (const evidence of [objection, blocker, "Native failure with blocked report"]) expect(evidenceText(request)).toContain(evidence);
@@ -845,14 +865,14 @@ describe("architecture foreground human frontier", () => {
   });
 
   test("reconciles human answers at ten consumed rounds without an eleventh comparison or counter reset", async () => {
-    const previous = { version: 2, consultation: "cap", currentDecision: { revision: 1, snapshot: snapshot("Original decision") }, decisionHistory: [], rounds: 10, validRounds: 10, maxRounds: 10, directorRunId: "native-doubts-r10", members: [], cursor: { version: 1, phase: "concluded", dispatches: [], control: { version: 1, planning: true, start: 0, stage: "prepare", next: null, round: null } }, evidence: [{ round: 10, question: "Prefer scope A?" }] };
+    const previous = { version: 3, consultation: "cap", currentDecision: { revision: 1, snapshot: snapshot("Original decision") }, decisionHistory: [], rounds: 10, validRounds: 10, maxRounds: 10, directorRunId: "native-doubts-r10", members: [], cursor: { version: 2, phase: "concluded", dispatches: [], control: { version: 1, planning: true, start: 0, stage: "prepare", next: null, round: null } }, evidence: [{ round: 10, question: "Prefer scope A?" }] };
     const storage = new Map<string, unknown>([["architecture-cap", previous]]);
     const host = fixture((key, request) => {
       expect(key).toBe("director-prepare"); expect(request.task).toContain("Actual human answered A");
       expect(request.task).toContain("finish or blocked only");
       return { ok: true, runId: "native-synthesis", structuredOutput: finish };
     });
-    const result = await host.execute({ replacement: replacement("cap", 1, snapshot("Original decision; Actual human answered A", { humanDecisions: [{ id: "scope", content: "A", provenance: "Actual foreground human answer" }] })), planning: true, consultation: "cap", continuation: { version: 2, consultation: "cap" } }, storage);
+    const result = await host.execute({ replacement: replacement("cap", 1, snapshot("Original decision; Actual human answered A", { humanDecisions: [{ id: "scope", content: "A", provenance: "Actual foreground human answer" }] })), planning: true, consultation: "cap", continuation: { version: 3, consultation: "cap" } }, storage);
     expect(result.status).toBe("completed"); expect(result.rounds).toBe(10); expect(result.validRounds).toBe(10);
     expect(host.calls).toHaveLength(1); expect(storage.get("architecture-cap")).toMatchObject({ rounds: 10, directorRunId: "native-synthesis" });
     const lower = fixture();
@@ -873,7 +893,7 @@ describe("architecture foreground human frontier", () => {
     const first = await host.execute({ currentDecision: snapshot("Complete assignment"), planning: true, consultation: "large", maxRounds: 1 }, storage);
     expect(first.status).toBe("completed");
     expect(normalizeWorkflowArgs({ evidence: "x".repeat(17000) })).toMatchObject({ error: expect.stringContaining("16384") });
-    expect(JSON.stringify(storage.get("architecture-large"))).not.toContain("x".repeat(4090));
+    expect(JSON.stringify(storage.get("architecture-large"))).toContain("x".repeat(4090));
     const reentry = { evidence: "Actual human answers", planning: true, consultation: "large", continuation: first.continuation };
     expect(normalizeWorkflowArgs(reentry)).toEqual({ args: reentry });
     const resumed = fixture((key, request) => {
@@ -885,7 +905,7 @@ describe("architecture foreground human frontier", () => {
     const done = await resumed.execute(reentry, storage);
     expect(done.status).toBe("completed"); expect(done.rounds).toBe(1); expect(resumed.calls).toHaveLength(1);
     const retained = storage.get("architecture-large") as { originals: Original[] };
-    expect(JSON.stringify(retained)).not.toContain("x".repeat(4090));
+    expect(JSON.stringify(retained)).toContain("x".repeat(4090));
     for (const view of roster) expect(JSON.stringify(originalValue(retained.originals.find(item => item.producer === view.id)!)))
       .toContain(`r1-${view.id}:` + "x".repeat(4090));
   });
@@ -948,7 +968,7 @@ describe("architecture foreground human frontier", () => {
     expect(first.storage.get("architecture-decision")).toMatchObject({ rounds: 1, validRounds: 1,
       cursor: { control: { stage: "doubts", round: 1 } } });
     const resumed = fixture();
-    const result = await resumed.execute({ planning: true, continuation: { version: 2, consultation: "decision" } }, first.storage);
+    const result = await resumed.execute({ planning: true, continuation: { version: 3, consultation: "decision" } }, first.storage);
     expect(result).toMatchObject({ status: "needs-human", rounds: 1, validRounds: 1, frontier: { round: 1, questions: [
       { id: "limits", dependsOn: ["identity"], prerequisiteFacts: [{ id: "identity", key: "doubts-r1-0" }] },
     ] } });
@@ -969,24 +989,21 @@ describe("architecture recoverable originals", () => {
       if (key === "r1-recover") return { ...child(key), structuredOutput: { status: "ready", report: contrary } };
       if (key === "director-after-r1") {
         expect(request.task).not.toContain(contrary);
-        const originals = essentials(request);
+        const originals = essentials(request) as unknown as { id: string; path: string; digest: string }[];
         expect(originals).toHaveLength(2);
-        // A publication witness is not yet evidence of physical access by a consumer.
-        expect(originals.every(item => item.accessibility === "unverified")).toBe(true);
+        // Consumers receive verified references only: {id, path, digest}, never metadata to transcribe.
+        expect(originals.every(item => Object.keys(item).sort().join(",") === "digest,id,path,results")).toBe(true);
+        expect(originals.every(item => /^[a-f0-9]{64}$/.test(item.digest) && item.id.startsWith("decision.v1."))).toBe(true);
         expect(new Set(originals.map(item => item.id)).size).toBe(2);
-        expect(originals.map(item => originalValue(item).report)).toContain(contrary);
-        for (const original of originals) {
-          expect(original.publication).toBe("published");
-          expect(original.results?.[0]?.savedOutputPath).toBeTruthy();
-          expect(originalValue(original).association).toMatchObject({ producer: original.producer, revision: 1 });
-        }
+        expect(originals.map(item => originalValue(item as never).report)).toContain(contrary);
+        expect(request.task).toContain("Read each path in full with your read tools");
       }
       return child(key);
     });
     expect(await host.execute()).toMatchObject({ status: "completed", memo: finish.memo });
     const retained = host.storage.get("architecture-decision") as { originals: Original[]; evidence: unknown[] };
-    expect(JSON.stringify(retained)).not.toContain(contrary);
-    expect(retained.originals.find(item => item.producer === "recover")).toMatchObject({ runId: "native-r1-recover", accessibility: "accessible" });
+    expect(JSON.stringify(retained)).toContain(contrary);
+    expect(retained.originals.find(item => item.producer === "recover")).toMatchObject({ runId: "native-r1-recover", accessibility: "unverified" });
     expect(host.calls.every(call => !call.request.agent || call.request.agent === "pitako.architect")).toBe(true);
   });
 
@@ -1163,57 +1180,50 @@ describe("architecture recoverable originals", () => {
     expect(outcome.error).toContain("Essential persistence denied");
     expect(outcome.error).toContain("Mandatory publication denied");
     expect(outcome.error).toContain('\\"stopped\\":true');
-    expect(exact).toMatchObject({ status: "blocked", delivery: "complete" });
+    expect(exact).toMatchObject({ status: "blocked" });
+    expect(exact).not.toHaveProperty("delivery");
     // The failed essential save must not claim that its inline evidence was persisted.
     const last = host.storage.get("architecture-decision") as { originals: Original[] };
     expect(last.originals).toHaveLength(1);
     expect(host.calls).toHaveLength(3);
   });
 
-  for (const field of ["consultation", "revision", "producer", "phase", "key", "attempt"]) {
-    test(`rejects an original with a mismatched ${field} rather than retaining a reconstructed original`, async () => {
-      const host = fixture((key, request) => {
-        if (key !== "r1-simple") return child(key);
-        const result = published(child(key), request);
-        (result.structuredOutput as { association: Record<string, unknown> }).association[field] = "wrong";
-        return { ...result, raw: true };
-      });
-      expect(await host.execute()).toMatchObject({ status: "failed", validRounds: 0 });
-      const entry = (host.storage.get("architecture-decision") as { originals: Original[] }).originals.find(item => item.producer === "simple")!;
-      expect(entry).toMatchObject({ delivery: "unproved", sufficient: false });
-      expect(entry.failedOriginal).toBeUndefined();
-    });
-  }
-
-  for (const failure of ["missing", "contradictory", "unavailable-receipt"]) {
-    test(`blocks a dependent synthesis when an essential original is ${failure}`, async () => {
-      const host = fixture((key, request) => {
-        if (key !== "director-after-r1") return child(key);
-        const first = essentials(request)[0]!;
-        if (failure === "missing") rmSync(first.results![0]!.savedOutputPath!);
-        if (failure === "contradictory") {
-          const saved = first.results![0]!.savedOutputPath!;
-          const value = JSON.parse(readFileSync(saved, "utf8"));
-          value.association.producer = "other-producer";
-          writeFileSync(saved, JSON.stringify(value));
-        }
-        if (failure === "unavailable-receipt") {
-          return { ...child(key), structuredOutput: { ...finish, access: essentials(request).map(item => ({
-            id: item.id, state: "unavailable", source: "none", reason: "Exact original is no longer accessible after compaction",
-          })) } };
-        }
-        return child(key);
-      });
-      const result = await host.execute();
-      expect(result.status).toBe("failed");
-      expect(result.error).toBeTruthy();
-      expect(host.calls.at(-1)?.key).toBe("director-after-r1");
-      if (failure === "unavailable-receipt") {
-        const retained = host.storage.get("architecture-decision") as { originals: Original[] };
-        expect(retained.originals.filter(item => ["simple", "recover"].includes(item.producer)).every(item => item.accessibility === "unavailable")).toBe(true);
+  test("requests decisions only and attaches identity envelopes after native admission", async () => {
+    const host = fixture((key, request) => {
+      const schema = request.outputSchema as { required: string[]; properties: Record<string, unknown> };
+      for (const echo of ["association", "delivery", "access"]) {
+        expect(schema.required).not.toContain(echo);
+        expect(schema.properties).not.toHaveProperty(echo);
       }
+      expect(request.task).not.toContain("ORIGINAL CONTRACT");
+      expect(request.task).not.toContain("access receipt");
+      expect(request.task).not.toContain("Return access");
+      if (essentials(request).length) expect(request.task).toContain("Read each path in full with your read tools");
+      return key.startsWith("director-doubts-") ? { ...child(key), structuredOutput: { doubts: [
+        { id: "local", kind: "scout", dependsOn: [], question: "Local fact?", decision: "Reuse" },
+      ] } } : child(key);
     });
-  }
+    expect(await host.execute({ planning: true, currentDecision: snapshot("Whole decision") })).toMatchObject({ status: "completed" });
+    const retained = host.storage.get("architecture-decision") as { originals: (Original & { association: unknown; value: unknown })[] };
+    for (const original of retained.originals) {
+      expect(original).toMatchObject({ id: expect.any(String), delivery: "complete",
+        association: { consultation: "decision", revision: 1, key: original.key, producer: original.producer },
+        value: originalValue(original) });
+    }
+  });
+
+  test.each(["missing", "invalid"])("a controlled reader blocks synthesis for a %s published file", async failure => {
+    const host = fixture((key, request) => {
+      if (key === "director-after-r1") {
+        const saved = essentials(request)[0]!.results![0]!.savedOutputPath!;
+        if (failure === "missing") rmSync(saved);
+        else writeFileSync(saved, "not JSON");
+      }
+      return child(key);
+    });
+    expect(await host.execute()).toMatchObject({ status: "failed" });
+    expect(host.calls.at(-1)?.key).toBe("director-after-r1");
+  });
 
   test("new and resumed/compacted participants recover all essentials without replacing original producer run IDs", async () => {
     const storage = new Map<string, unknown>();
@@ -1223,8 +1233,8 @@ describe("architecture recoverable originals", () => {
       if (key === "director-prepare") {
         expect(request.resume).toBe("native-director-after-r1");
         const old = essentials(request);
-        expect(old.map(item => item.runId)).toEqual(["native-r1-simple", "native-r1-recover"]);
-        for (const item of old) expect(originalValue(item).report).toBe(`Private report from ${item.key}`);
+        expect(old.map(item => item.id)).toEqual(["decision.v1.r1-simple.a1", "decision.v1.r1-recover.a1"]);
+        for (const item of old) expect(originalValue(item).report).toBe(`Private report from ${item.id.split(".")[2]}`);
         return { ...child(key), structuredOutput: { ...discuss, perspectives: [perspectives[0], { id: "new", label: "New whole-problem view", focus: "Reevaluate the full decision" }] } };
       }
       if (key === "r2-simple" || key === "r2-new") {
@@ -1238,6 +1248,9 @@ describe("architecture recoverable originals", () => {
     });
     expect(await host.execute({ evidence: "New factual evidence, not a replacement", continuation: first.continuation }, storage))
       .toMatchObject({ status: "completed", rounds: 2, validRounds: 2 });
+    // Consumers got verified references; retained originals keep their producer run IDs.
+    const retainedOriginals = (storage.get("architecture-decision") as { originals: Original[] }).originals;
+    for (const key of ["r1-simple", "r1-recover"]) expect(retainedOriginals.find(item => item.key === key)?.runId).toBe(`native-${key}`);
     const after = (storage.get("architecture-decision") as { originals: Original[] }).originals;
     expect(after.slice(0, before.length)).toEqual(before);
     expect(after.filter(item => item.producer === "simple").map(item => item.runId)).toEqual(["native-r1-simple", "native-r2-simple"]);
@@ -1254,7 +1267,7 @@ describe("architecture recoverable originals", () => {
         } }, request);
         result.results = [];
         delete result.outputReference;
-        if (delivery === "unknown") delete (result.structuredOutput as Record<string, unknown>).delivery;
+        if (delivery === "unknown") delete (result.structuredOutput as Record<string, unknown>).report;
         if (delivery === "no-original" || delivery === "text-preview") delete result.structuredOutput;
         if (delivery === "text-preview") result.output = JSON.stringify({ status: "ready", report: "Not an authenticated full delivery" });
         if (delivery === "running") result.state = "running";
@@ -1307,35 +1320,32 @@ describe("architecture recoverable originals", () => {
 });
 
 
-test("architecture requires access to a delivered essential peer challenge before counting the round valid", async () => {
+test("architecture accepts a published peer challenge without model access receipts", async () => {
   const late = deferred<Result>();
   const host = fixture(key => key === "r2-recover" ? late.promise : child(key, key === "director-after-r1" ? discuss : finish), key => {
     late.resolve(child(key));
     return { state: "delivered" };
   });
-  const result = await host.execute();
-  expect(result).toMatchObject({ status: "failed", rounds: 2, validRounds: 1 });
-  expect(result.error).toContain("Essential access incomplete");
-  expect(host.calls.some(call => call.key === "director-after-r2")).toBe(false);
+  expect(await host.execute()).toMatchObject({ status: "completed", rounds: 2, validRounds: 2 });
+  expect(host.steered[0]!.message).toContain("read tools");
+  expect(host.steered[0]!.message).not.toContain("access receipt");
 });
 
 
-test("architecture accepts exact originals still accessible in retained context without universally rereading missing files", async () => {
-  const storage = new Map<string, unknown>();
-  const first = await fixture().execute(undefined, storage);
-  const host = fixture((key, request) => {
-    expect(key).toBe("director-prepare");
-    expect(request.resume).toBe("native-director-after-r1");
-    const accessibleContext = new Map(essentials(request).map(item => [item.id, originalValue(item)]));
-    rmSync(essentials(request)[0]!.results![0]!.savedOutputPath!);
-    const access = essentials(request).map(item => {
-      expect(accessibleContext.get(item.id)?.report).toBe(`Private report from ${item.key}`);
-      return { id: item.id, state: "accessible", source: "context", reason: "Exact original and association remain accessible in retained conversation" };
-    });
-    return { ...child(key), structuredOutput: { ...finish, access } };
+test.each(["context", "inline"])("architecture does not treat %s as publication on reentry", async source => {
+  const first = fixture();
+  const result = await first.execute();
+  const prior = first.storage.get("architecture-decision") as { originals: Original[] };
+  const original = prior.originals.find(item => item.key === "r1-simple")!;
+  original.publication = "unpublished";
+  original.accessibility = source;
+  original.failedOriginal = originalValue(original);
+  original.results = [];
+  const host = fixture();
+  expect(await host.execute({ continuation: result.continuation }, first.storage)).toMatchObject({
+    status: "failed", error: expect.stringContaining("Essential original is not published"),
   });
-  expect(await host.execute({ continuation: first.continuation }, storage)).toMatchObject({ status: "completed", rounds: 1, validRounds: 1 });
-  expect(host.calls).toHaveLength(1);
+  expect(host.calls).toHaveLength(0);
 });
 
 
@@ -1345,21 +1355,13 @@ test("architecture preserves evidence from dynamically named perspectives even w
       perspectives: [perspectives[0], { id: "director-dissent", label: "Contrary whole-problem view", focus: "Challenge the recommendation" }],
     } };
     if (key === "director-after-r1") {
-      expect(essentials(request).map(item => item.producer)).toEqual(["simple", "director-dissent"]);
+      expect(essentials(request).map(item => item.id)).toEqual(["decision.v1.r1-simple.a1", "decision.v1.r1-director-dissent.a1"]);
       expect(originalValue(essentials(request)[1]!).report).toBe("Private report from r1-director-dissent");
     }
     return child(key);
   });
   expect(await host.execute()).toMatchObject({ status: "completed" });
 });
-
-test("architecture does not accept an inline access claim for a published original never delivered inline", async () => {
-  const host = fixture((key, request) => key === "director-after-r1" ? { ...child(key), structuredOutput: { ...finish,
-    access: essentials(request).map(item => ({ id: item.id, state: "accessible", source: "inline", reason: "Assumed earlier delivery" })),
-  } } : child(key));
-  expect(await host.execute()).toMatchObject({ status: "failed", error: expect.stringContaining("Essential access incomplete") });
-});
-
 
 describe("architecture durable dispatch boundaries", () => {
   const initial = { currentDecision: snapshot("Keep the complete current decision"), planning: true };
@@ -1438,13 +1440,28 @@ describe("architecture durable dispatch boundaries", () => {
 
   test("rejects missing/incompatible durable cursors rather than migrating legacy state", async () => {
     const first = fixture(); const result = await first.execute();
-    for (const cursor of [undefined, { version: 99, dispatches: [] }, { version: 1 }]) {
+    for (const cursor of [undefined, { version: 1, dispatches: [] }, { version: 99, dispatches: [] }]) {
       const storage = new Map(first.storage);
       const prior = storage.get("architecture-decision") as object;
       storage.set("architecture-decision", { ...prior, cursor });
       const resumed = fixture();
-      await expect(resumed.execute({ continuation: result.continuation }, storage)).rejects.toThrow("cursor");
+      await expect(resumed.execute({ continuation: result.continuation }, storage)).rejects.toThrow("created by an incompatible Pitako contract");
       expect(resumed.calls).toHaveLength(0);
+    }
+  });
+
+  test.each([1, 2, 99])("rejects incompatible state and continuation v%i before writes or dispatch", async version => {
+    const first = fixture(); const result = await first.execute();
+    for (const target of ["state", "continuation"]) {
+      const storage = new Map(structuredClone([...first.storage]));
+      const continuation = { ...result.continuation! };
+      if (target === "state") (storage.get("architecture-decision") as { version: number }).version = version;
+      else continuation.version = version;
+      const resumed = fixture();
+      await expect(resumed.execute({ continuation }, storage)).rejects.toThrow(
+        `created by an incompatible Pitako contract v${version}; start a new consultation/mission`);
+      expect(resumed.calls).toHaveLength(0);
+      expect(resumed.stateWrites).toHaveLength(0);
     }
   });
 
@@ -1498,7 +1515,7 @@ describe("architecture durable dispatch boundaries", () => {
 
 
 describe("architecture confirmed phase advancement", () => {
-  const continuation = { version: 2, consultation: "decision" };
+  const continuation = { version: 3, consultation: "decision" };
   const decisionInput = { currentDecision: snapshot("Keep the whole decision"), planning: true, maxRounds: 2 };
   function planningResult(key: string) {
     return key.startsWith("director-doubts-") ? { ...child(key), structuredOutput: { doubts: [
@@ -1533,7 +1550,7 @@ describe("architecture confirmed phase advancement", () => {
       expect(final.cursor.dispatches.filter(item => item.key.startsWith("r1-")).map(item => item.key).sort()).toEqual(["r1-recover", "r1-simple"]);
       expect(final).toMatchObject({ rounds: 1, validRounds: 1, maxRounds: 2, currentDecision: { revision: 1 } });
       const serialized = JSON.stringify(final);
-      expect(serialized).not.toContain("Private report from");
+      expect(serialized).toContain("Private report from");
     });
 
   test("does not treat a committed intention without a terminal as a safe reentry point", async () => {
@@ -1553,7 +1570,7 @@ describe("architecture confirmed phase advancement", () => {
 
 
 describe("architecture selective factual retry", () => {
-  const continuation = { version: 2, consultation: "decision" };
+  const continuation = { version: 3, consultation: "decision" };
   function reply(key: string): Result {
     if (key.startsWith("director-doubts-")) return { ...child(key), structuredOutput: { doubts: [
       { id: "retained", kind: "scout", dependsOn: [], question: "Sufficient local fact?", decision: "Reuse" },
@@ -1615,7 +1632,7 @@ describe("architecture selective factual retry", () => {
       if (fault === "permission") return { ok: false, runId: "denied-fact", error: "Permission denied; Stop" };
       if (fault === "published-missing") return { ok: false, runId: "saved-fact", results: [{ savedOutputPath: "/missing-original" }] };
       const result = published(reply(key), request);
-      delete (result.structuredOutput as Record<string, unknown>).delivery;
+      delete (result.structuredOutput as Record<string, unknown>).report;
       return { ...result, raw: true };
     });
     await first.execute({ planning: true, currentDecision: snapshot("Complete problem"), maxRounds: 1 });
@@ -1725,7 +1742,7 @@ describe("architecture committed dispatch intentions", () => {
       expect(interrupted).toBe(true);
       expect(first.calls.some(call => call.key === key)).toBe(false);
       const second = fixture();
-      await expect(second.execute({ planning: true, continuation: { version: 2, consultation: "decision" } }, first.storage))
+      await expect(second.execute({ planning: true, continuation: { version: 3, consultation: "decision" } }, first.storage))
         .rejects.toThrow("Unconfirmed architecture dispatch boundary");
       expect(second.calls).toHaveLength(0);
     });
@@ -1750,7 +1767,7 @@ describe("architecture committed dispatch intentions", () => {
 
 
 describe("architecture rolling-round durable evidence", () => {
-  test("preserves delivered steering obligations across a terminal-before-validity interruption", async () => {
+  test.each([true, false])("uses publication rather than receipts for delivered steering after a terminal cut (published=%s)", async published => {
     const second = deferred<Result>(), receipt = deferred<{ state: string }>();
     let cut = false;
     const first = fixture(key => key === "r2-recover" ? second.promise : child(key, key === "director-after-r1" ? discuss : finish),
@@ -1765,10 +1782,20 @@ describe("architecture rolling-round durable evidence", () => {
     const result = await first.execute();
     expect(result).toMatchObject({ status: "failed", rounds: 2, validRounds: 1 });
     expect(cut).toBe(true);
+    if (!published) {
+      const retained = first.storage.get("architecture-decision") as { originals: Original[] };
+      retained.originals.find(item => item.key === "r2-simple")!.outputSaveError = "Publication no longer valid";
+    }
     const resumed = fixture();
-    expect(await resumed.execute({ continuation: result.continuation }, first.storage))
-      .toMatchObject({ status: "failed", rounds: 2, validRounds: 1, error: expect.stringContaining("peer challenge") });
-    expect(resumed.calls).toHaveLength(0); expect(resumed.steered).toHaveLength(0);
+    const outcome = await resumed.execute({ continuation: result.continuation }, first.storage);
+    if (published) {
+      expect(outcome).toMatchObject({ status: "completed", rounds: 2, validRounds: 2 });
+      expect(resumed.calls.map(call => call.key)).toEqual(["director-after-r2"]);
+    } else {
+      expect(outcome).toMatchObject({ status: "failed", rounds: 2, validRounds: 1, error: expect.stringContaining("Essential original is not published") });
+      expect(resumed.calls).toHaveLength(0);
+    }
+    expect(resumed.steered).toHaveLength(0);
   });
 
   test("does not repeat steering whose delivery is unconfirmed, even when both producers are terminal", async () => {
@@ -1815,7 +1842,7 @@ test("architecture persists a full replacement at a confirmed mid-round boundary
 });
 
 describe("architecture paused human answers", () => {
-  const continuation = { version: 2, consultation: "decision" };
+  const continuation = { version: 3, consultation: "decision" };
   const reentry = { planning: true, continuation };
   const questions = [
     { id: "unrelated", kind: "researcher", dependsOn: [], question: "External contract?", decision: "Adapter" },
@@ -2005,5 +2032,42 @@ describe("architecture paused human answers", () => {
       .toMatchObject({ status: "failed", error: expect.stringContaining("64 pending IDs") });
     expect(first.calls.some(call => call.key === "director-after-r1")).toBe(false);
     expect(first.storage.get("architecture-decision")).toMatchObject({ cursor: { control: { stage: "frontier" } } });
+  });
+});
+
+describe("architecture deterministic access receipts", () => {
+  test("a raw script path refuses to run before any state or dispatch", async () => {
+    const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+    let touched = false;
+    await expect(new AsyncFunction("args", "runs", "state", rawSource)({ consultation: "decision", workDescription: "x" },
+      { all: () => { touched = true; } }, { get: () => { touched = true; } })).rejects.toThrow("Launch pitako.architecture by name after mission.create");
+    expect(touched).toBe(false);
+  });
+
+  test("one verifier per consuming gate over its required originals; none when nothing is required", async () => {
+    const host = fixture();
+    expect(await host.execute()).toMatchObject({ status: "completed" });
+    // director-prepare and round-1 perspectives have no essentials; the evaluation consumes both reports.
+    expect(host.verifications.map(entry => entry.key)).toEqual(["verify-v1-director-after-r1-a1"]);
+    const request = JSON.parse(host.verifications[0]!.request.task);
+    expect(request).toMatchObject({ namespace: "architecture-test", gate: "v1-director-after-r1-a1" });
+    expect(request.items.map((item: { id: string }) => item.id)).toEqual(["decision.v1.r1-simple.a1", "decision.v1.r1-recover.a1"]);
+    const consumer = host.calls.find(call => call.key === "director-after-r1")!.request;
+    expect(essentials(consumer).map(item => (item as unknown as { id: string }).id)).toEqual(request.items.map((item: { id: string }) => item.id));
+  });
+
+  test("a contradictory published original blocks the consumer before dispatch with an explanation", async () => {
+    // Rewrite the published file after its admission is saved, before the evaluation gate verifies it.
+    const watched = fixture(undefined, undefined, undefined, value => {
+      const recover = (value as unknown as { originals?: Original[] }).originals?.find(item => item.key === "r1-recover");
+      const saved = recover?.results?.find(item => item.savedOutputPath)?.savedOutputPath;
+      if (saved && value.cursor.dispatches.some(item => item.key === "r1-recover" && item.boundary === "confirmed"))
+        writeFileSync(saved, JSON.stringify({ status: "ready", report: "Edited after admission" }));
+    });
+    const outcome = await watched.execute();
+    expect(outcome.status).toBe("failed");
+    for (const part of ["Access gate v1-director-after-r1-a1 blocked before dispatch", "is contradictory: content-differs", "/report", "does not choose a version"])
+      expect(outcome.error).toContain(part);
+    expect(watched.calls.map(call => call.key)).not.toContain("director-after-r1");
   });
 });

@@ -6,6 +6,7 @@ const originalsRoot = mkdtempSync(join(tmpdir(), "pitako-review-originals-"));
 let originalNumber = 0;
 afterAll(() => rmSync(originalsRoot, { recursive: true, force: true }));
 import { runWorkflowScript, type WorkflowScriptChildResult } from "../node_modules/pi-subagents/src/workflows/scripted-workflow.js";
+import { verifyGate } from "../extensions/access-receipts.mjs";
 
 const source = readFileSync(new URL("../skills/review/workflow.js", import.meta.url), "utf8");
 interface Request {
@@ -68,23 +69,24 @@ function packet(request: Request): any[] {
 }
 function nativeOriginal(key: string, request: Request, result: Result): Result {
   if (!result.structuredOutput) return result;
-  const schema = request.outputSchema as any;
-  const association = Object.fromEntries(Object.entries(schema.properties.association.properties)
-    .map(([name, item]) => [name, (item as any).const]));
-  const access = (result.structuredOutput as any).access ?? packet(request).map(original => {
-    const witness = original.results.find((entry: any) => entry.savedOutputPath);
-    const recovered = JSON.parse(readFileSync(witness.savedOutputPath, "utf8"));
-    expect(recovered.association).toEqual(original.association ?? Object.fromEntries(
-      ["namespace", "query", "revision", "phase", "producer", "key", "attempt"].map(name => [name, original[name]])));
-    return { id: original.id, state: "accessible", source: "read", reason: "Exact file and association checked" };
-  });
-  const value = { association, delivery: "complete", access, ...(result.structuredOutput as object) };
+  const value = result.structuredOutput;
   const savedOutputPath = join(originalsRoot, `${++originalNumber}.json`);
   writeFileSync(savedOutputPath, JSON.stringify(value));
   if (result.results?.some(entry => entry.savedOutputPath === "/native/mandatory/original.json"))
     return { ...result, structuredOutput: value, results: [{ ...result.results[0], savedOutputPath }] };
   return { ...result, structuredOutput: value,
     results: result.results ?? [{ savedOutputPath, outputReference: { path: savedOutputPath } } as any] };
+}
+// Named-resource binding for native-sandbox runs, and the real verifier at the launch boundary.
+function nativeAccess() {
+  const missionPath = join(originalsRoot, `native-mission-${++originalNumber}.json`);
+  writeFileSync(missionPath, "{}");
+  return { prefix: `const pitakoAccess = ${JSON.stringify({ missionPath, namespace: "review" })};\n` };
+}
+function verifierLaunch(key: string, request: any) {
+  if (request.agent !== "pitako.access-verifier") return undefined;
+  return { key, ok: true, agent: request.agent, runId: `native-${key}`, output: JSON.stringify(verifyGate(JSON.parse(request.task))),
+    artifactPaths: [], results: [{ exitCode: 0 }] } as any;
 }
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -111,7 +113,15 @@ function fixture(
     writeFileSync(missionFile, bytes);
     persisted.set(key, JSON.parse(JSON.stringify(value)));
   } };
+  const access = { missionPath: missionFile, namespace: "review" };
+  const verifications: { key: string; request: any; output: any }[] = [];
   function dispatch(key: string, request: Request): Promise<Result> {
+    // The real model-free verifier runs over the actual published temp files.
+    if (request.agent === "pitako.access-verifier") return Promise.resolve().then(() => {
+      const output = verifyGate(JSON.parse(request.task));
+      verifications.push({ key, request: JSON.parse(request.task), output });
+      return { ok: true, agent: request.agent, runId: `native-${key}`, output: JSON.stringify(output), results: [{ exitCode: 0 } as any] };
+    });
     expect(calls.some(call => call.key === key)).toBe(false);
     calls.push({ key, request });
     if (key === synchronousFailureKey) throw new Error("Synchronous dispatch rejection");
@@ -133,11 +143,14 @@ function fixture(
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor as new (
     ...parameters: string[]
   ) => (input: unknown, runner: typeof runs, state: unknown) => Promise<Outcome>;
+  // Named-resource resolution inlines pitakoAccess; the raw source alone refuses to run.
+  const bound = `const pitakoAccess = ${JSON.stringify(access)};\n`;
   return {
-    calls, persisted, missionFile, saves: () => saveCount,
-    execute: (input: unknown = args) => new AsyncFunction("args", "runs", "state", source)(input, runs, state),
+    calls, persisted, missionFile, verifications, saves: () => saveCount,
+    execute: (input: unknown = args) => new AsyncFunction("args", "runs", "state", bound + source)(input, runs, state),
+    raw: (input: unknown = args) => new AsyncFunction("args", "runs", "state", source)(input, runs, state),
     library: <T = Outcome>(input: unknown = args, options: object = {}, tail?: string) =>
-      new AsyncFunction("args", "runs", "state", `const pitakoReviewLibraryMode = true;\n${source}\n${
+      new AsyncFunction("args", "runs", "state", `${bound}const pitakoReviewLibraryMode = true;\n${source}\n${
         tail ?? `return reviewPhase(args, runs, ${JSON.stringify(options)});`
       }`)(input, runs, state) as Promise<T>,
   };
@@ -288,11 +301,14 @@ describe("review scripted workflow", () => {
     const outcomes: unknown[] = [];
     for (const library of [false, true]) {
       const calls: string[] = [];
+      const bound = nativeAccess().prefix;
       const result = await runWorkflowScript({
-        script: library ? `const pitakoReviewLibraryMode = true;\n${source}\nreturn reviewPhase(args, runs);` : source,
+        script: library ? `${bound}const pitakoReviewLibraryMode = true;\n${source}\nreturn reviewPhase(args, runs);` : bound + source,
         args,
         state: { get: () => undefined, set: () => {} },
         launch: async (key, request) => {
+          const verified = verifierLaunch(key, request);
+          if (verified) return verified;
           calls.push(key);
           const id = key.slice(key.indexOf("-") + 1);
           const index = roster.findIndex(angle => angle.id === id);
@@ -326,10 +342,12 @@ describe("review scripted workflow", () => {
     const calls: string[] = [];
     const attempted: string[] = [];
     const result = await runWorkflowScript({
-      script: `const pitakoReviewLibraryMode = true;\n${source}\nreturn reviewPhase(args, runs, { prefix: "loop1." });`,
+      script: `${nativeAccess().prefix}const pitakoReviewLibraryMode = true;\n${source}\nreturn reviewPhase(args, runs, { prefix: "loop1." });`,
       args,
       state: { get: () => undefined, set: () => {} },
       launch: async (key, request) => {
+        const verified = verifierLaunch(key, request);
+        if (verified) return verified;
         attempted.push(key);
         // The public sandbox delegates runtime admission to its launch boundary.
         if (calls.length === 3) throw new Error("Native spawn capacity exhausted");
@@ -411,15 +429,15 @@ describe("review scripted workflow", () => {
       "defense-a", "director-synthesis",
     ]);
     const byKey = (key: string) => host.calls.find(call => call.key === key)!.request;
-    expect(byKey("critique-b").task).not.toContain("PRIVATE_FINDING");
+    expect(byKey("critique-b").task).toContain("PRIVATE_FINDING");
     expect(packet(byKey("critique-b"))).toHaveLength(1);
     expect(byKey("critique-b").task).toContain("Challenge both factual support and belonging");
     expect(byKey("critique-b").resume).toBe("native-independent-b");
     expect(byKey("defense-a").resume).toBe("native-independent-a");
-    expect(byKey("defense-a").task).not.toContain(challenge.evidence);
+    expect(byKey("defense-a").task).toContain(challenge.evidence);
     expect(packet(byKey("defense-a")).some(original => original.phase === "critique")).toBe(true);
     expect(byKey("director-synthesis").resume).toBe("native-director-prepare");
-    expect(byKey("director-synthesis").task).not.toContain(response.reason);
+    expect(byKey("director-synthesis").task).toContain(response.reason);
     expect(packet(byKey("director-synthesis"))).toHaveLength(4);
     for (const { request } of host.calls.filter(call => call.request.resume)) {
       expect(request.agent).toBeUndefined();
@@ -805,12 +823,16 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
       expect(request.task).toContain(args.brief);
       expect(request.task).toContain(JSON.stringify(args.target));
       expect(request.phase).toStartWith("review-");
-      expect(request.task).not.toContain(finding.title);
+      if (packet(request).length === 0) expect(request.task).not.toContain(finding.title);
       for (const original of packet(request)) {
         const exact = JSON.parse(readFileSync(original.results[0].savedOutputPath, "utf8"));
-        expect(exact.association.key).toBe(original.key);
-        expect(exact.association.phase).toBe(original.phase);
-        if (original.key === "independent-a") expect(JSON.stringify(exact).split(finding.title)).toHaveLength(2);
+        expect(exact).toEqual(original.value);
+        expect(original.association.key).toBe(original.key);
+        expect(original.association.phase).toBe(original.phase);
+        if (original.key === "independent-a") {
+          expect(JSON.stringify(exact).split(finding.title)).toHaveLength(2);
+          expect(original.value.findings).toEqual([finding]);
+        }
         if (key === "director-synthesis" && original.key === "independent-b")
           expect(exact.coverage).toContain("CONTRARY_NON_FINDING");
       }
@@ -883,52 +905,106 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
     expect(host.calls).toHaveLength(3);
   });
 
-  test.each(["unavailable", "contradictory"])("essential %s access prevents dependent review completion", async accessState => {
-    const host = fixture((key, request) => child(key, key === "critique-b" ? {
-      access: packet(request).map(original => ({ id: original.id, state: accessState, source: "none", reason: "Exact original cannot be used" })),
-    } : {}));
-    const result = await host.execute();
-    expect(result.status).toBe("failed");
-    expect(result.error).toContain("Essential access incomplete");
-    expect(host.calls.at(-1)?.key).toBe("critique-b");
-  });
-
-  test("extra accessible receipts beyond the essential IDs do not block prepare without essentials", async () => {
-    const extra = ["spec:base", "amendment:one", "result:l1.t1.a1"].map(id =>
-      ({ id, state: "accessible", source: "read", reason: "Read for angle selection" }));
-    const host = fixture((key, request) => child(key, key === "director-prepare" ? (expect(packet(request)).toEqual([]), { access: extra }) : {}));
-    const result = await host.execute();
-    expect(result.status).toBe("completed");
-    expect(host.calls.map(call => call.key)).toContain("director-synthesis");
-  });
-
-  test.each([
-    ["missing essential", (receipts: any[]) => receipts.slice(1)],
-    ["duplicate essential", (receipts: any[]) => [...receipts, receipts[0]]],
-    ["extra unavailable", (receipts: any[]) => [...receipts, { id: "spec:other", state: "unavailable", source: "none", reason: "Not found" }]],
-    ["extra contradictory", (receipts: any[]) => [...receipts, { id: "spec:other", state: "contradictory", source: "read", reason: "Digest differs" }]],
-  ])("%s access receipt still prevents dependent review completion", async (_name, mutate) => {
-    const host = fixture((key, request) => child(key, key === "critique-b" ? {
-      access: mutate(packet(request).map(original => ({ id: original.id, state: "accessible", source: "read", reason: "Exact original checked" }))),
-    } : {}));
-    const result = await host.execute();
-    expect(result.status).toBe("failed");
-    expect(result.error).toContain("Essential access incomplete");
-    expect(host.calls.at(-1)?.key).toBe("critique-b");
-  });
-
-  test("unrecoverable physical original is not replaced by status or optional references", async () => {
-    // Delete only an owned published original immediately before its consuming read boundary.
-    const broken = fixture((key, request) => {
-      if (key === "independent-b") {
-        const original = broken.persisted.get("review-standalone")?.originals;
-        expect(original?.length).toBe(1); // only preparation is confirmed until the batch settles
+  test("schemas and prompts request decisions only; envelopes are workflow-owned", async () => {
+    const host = fixture();
+    expect((await host.execute()).status).toBe("completed");
+    for (const { request } of host.calls) {
+      const schema = request.outputSchema as any;
+      for (const field of ["association", "delivery", "access"])
+        expect(schema.properties).not.toHaveProperty(field);
+      expect(request.task).not.toContain("ORIGINAL CONTRACT");
+      expect(request.task).not.toContain("receipt");
+      for (const original of packet(request)) {
+        expect(original).toMatchObject({ id: expect.any(String), association: { key: original.key },
+          delivery: "complete", publication: "published", value: { status: "ready" } });
+        expect(original).not.toHaveProperty("access");
       }
-      if (key === "critique-b") rmSync(packet(request)[0].results[0].savedOutputPath);
+    }
+    expect(packet(host.calls[0]!.request)).toEqual([]);
+    expect(packet(host.calls[1]!.request)).toEqual([]);
+    expect(host.persisted.get("review-standalone").version).toBe(2);
+  });
+
+  test.each(["context", "inline"])("%s cannot replace native publication", async source => {
+    const host = fixture(key => key === "independent-a"
+      ? { ...child(key, { coverage: `Complete ${source} analysis available` }), results: [] } : child(key));
+    expect((await host.execute()).status).toBe("failed");
+    expect(host.calls.map(call => call.key)).toEqual(["director-prepare", "independent-a", "independent-b"]);
+    expect(host.persisted.get("review-standalone").originals[1]).toMatchObject({
+      publication: "unpublished", sufficient: false, failedOriginal: { coverage: `Complete ${source} analysis available` },
+    });
+  });
+
+  test.each([undefined, 1, 3])("incompatible review state v%s blocks before dispatch", async version => {
+    const host = fixture();
+    host.persisted.set("review-standalone", { version, originals: [] });
+    const result = await host.execute();
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain(`created by an incompatible Pitako contract v${version ?? 1}; start a new consultation/mission`);
+    expect(host.calls).toEqual([]);
+    expect(host.saves()).toBe(0);
+  });
+
+  test("old integrated review state cannot be superseded or reconciled", async () => {
+    const host = fixture();
+    host.persisted.set("review-root", { version: 1, decision: { reference: { stateKey: "root", loop: 1 } } });
+    const result = await host.library(args, { prefix: "loop2.", mode: "execute",
+      decisionReference: { stateKey: "root", loop: 2 } });
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("incompatible Pitako contract v1");
+    expect(host.calls).toEqual([]);
+    expect(host.saves()).toBe(0);
+  });
+
+  test("verified inline originals reach consumers; a later missing original blocks the next gate before dispatch", async () => {
+    const host = fixture((key, request) => {
+      if (key === "critique-b") {
+        const original = packet(request)[0];
+        expect(original.value.findings).toEqual([finding]);
+        rmSync(original.results[0].savedOutputPath);
+      }
       return child(key);
     });
-    expect((await broken.execute()).status).toBe("failed");
-    expect(broken.calls.at(-1)?.key).toBe("critique-b");
+    const result = await host.execute();
+    expect(result.status).toBe("blocked");
+    expect(result.error).toContain("Access gate defense blocked before dispatch");
+    expect(result.error).toContain("is unavailable: missing-file");
+    expect(result.error).toContain("This pass cannot resume: start a new consultation/mission.");
+    expect(host.calls.map(call => call.key)).not.toContain("defense-a");
+    expect(host.verifications.map(entry => [entry.key, entry.output.items.map((item: any) => item.state)]))
+      .toEqual([["verify-critique", ["accessible"]], ["verify-defense", ["unavailable", "accessible"]]]);
+  });
+
+  test("a raw script path refuses to run; only the named resource binds receipts to a mission", async () => {
+    const host = fixture();
+    await expect(host.raw()).rejects.toThrow("Launch pitako.review by name after mission.create");
+    expect(host.calls).toEqual([]);
+  });
+
+  test("a changed published original is contradictory and stops the consumer before dispatch", async () => {
+    const host = fixture((key, request) => {
+      if (key === "critique-b") {
+        const path = packet(request)[0].results[0].savedOutputPath;
+        writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, "utf8")), coverage: "Rewritten after admission" }));
+      }
+      return child(key);
+    });
+    const result = await host.execute();
+    expect(result.status).toBe("blocked");
+    for (const part of ["is contradictory: content-differs", "/coverage", "does not choose a version"]) expect(result.error).toContain(part);
+    expect(host.calls.map(call => call.key)).not.toContain("defense-a");
+  });
+
+  test("gates with no required originals dispatch no verifier; verified gates retain only receipt path and digest", async () => {
+    const host = fixture();
+    expect((await host.execute()).status).toBe("completed");
+    expect(host.verifications.map(entry => entry.key)).toEqual(["verify-critique", "verify-defense", "verify-synthesis"]);
+    expect(host.verifications.every(entry => entry.output.items.every((item: any) => item.state === "accessible"))).toBe(true);
+    const receipts = host.persisted.get("review-standalone").receipts;
+    expect(receipts.map((entry: any) => Object.keys(entry).sort())).toEqual(Array(3).fill(["accessible", "digest", "gate"]));
+    expect(receipts.every((entry: any) => entry.accessible)).toBe(true);
+    expect(host.verifications[0].output.receipt.path).toContain(join("receipts", "review", "critique.json"));
+    expect(receipts[0].digest).toBe(host.verifications[0].output.receipt.digest);
   });
 
   test("whole-mission UTF-8 capacity includes unrelated keys and failed originals, without retrying save", async () => {
@@ -996,7 +1072,7 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
   });
 
 
-  test.each(["key", "workflowKey", "agent", "runId"])("rejects contradictory nested native %s even with a matching structured association", async field => {
+  test.each(["key", "workflowKey", "agent", "runId"])("rejects contradictory nested native %s without model identity echoes", async field => {
     for (const published of [true, false]) {
       const host = fixture(key => key === "director-prepare" ? { ...child(key),
         results: [{ [field]: "different-producer", ...(published ? { savedOutputPath: "/native/mandatory/original.json" } : {}) } as any],
@@ -1096,7 +1172,7 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
   test("missing native mission state blocks before any producer dispatch", async () => {
     const calls: string[] = [];
     const result = await runWorkflowScript({
-      script: source, args,
+      script: nativeAccess().prefix + source, args,
       launch: async key => { calls.push(key); throw new Error("Must not launch"); },
       status: async () => { throw new Error("Must not query status"); },
     });

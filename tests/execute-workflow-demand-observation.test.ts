@@ -91,7 +91,7 @@ test.each(["stopped", "permission", "technical"])("demand observation preserves 
 test.each(["gaps", "continue"])("unfinished worker %s with no remaining entries triggers one observation", async status => {
   const host = fixture(undefined, { readOnly: true });
   host.setRespond((request, normal) => {
-    if (request.key.startsWith("invoke-human-1.l1.t1.")) return host.result(request, {
+    if (request.agent === "pitako.worker" && request.key.startsWith("invoke-human-1.l1.t1.")) return host.result(request, {
       ...host.worker(request), status, remaining: [],
       diagnosis: "Required parser branch is still missing", usefulProgress: status === "continue",
       continuation: status === "continue" ? "Implement the missing parser branch" : null,
@@ -118,7 +118,7 @@ test("an intermediate continuation completed in the same loop creates no demand 
   }) : normal());
   const outcome = await host.executeNative();
   expect(outcome.status, JSON.stringify(outcome)).toBe("complete");
-  expect(host.calls.filter(call => call.key.startsWith("invoke-human-1.l1.t1.")).map(call => call.key))
+  expect(host.calls.filter(call => call.agent === "pitako.worker" && call.key.startsWith("invoke-human-1.l1.t1.")).map(call => call.key))
     .toEqual(["invoke-human-1.l1.t1.a1", "invoke-human-1.l1.t1.a2"]);
   expect(host.calls.some(call => call.key.endsWith(".demand-observation"))).toBe(false);
   expect(host.history()).toHaveLength(1);
@@ -167,7 +167,7 @@ function materialReviewGaps(host: ControllerHost, acceptance?: any) {
 }
 
 test("closed demand sources persist once while observations keep every retained original", async () => {
-  const host = fixture(undefined, { findings: true, angles: 3, readOnly: true }); host.setLimit(7);
+  const host = fixture(undefined, { findings: true, angles: 3, readOnly: true, controlledCheckpoints: true }); host.setLimit(7);
   // Realistic review witnesses: each child reference carries a sizeable native acceptance record.
   materialReviewGaps(host, { status: "not-required", evidenceStatus: "not-required", explicit: false, criteria: [],
     inferredReason: ["x".repeat(2000)], runtimeChecks: [], verifyRuns: [] });
@@ -193,35 +193,4 @@ test("closed demand sources persist once while observations keep every retained 
   expect(maximum(6, 7)).toBeLessThanOrEqual(maximum(4, 5) + 4096);
   // Half the native envelope stays free for real reports, paths and one long open loop.
   expect(maximum(1, 7)).toBeLessThan(MISSION_STATE_MAX_BYTES / 2);
-});
-
-test.each([false, true])("legacy triplicated demand state resumes once folded; conflicting copies=%s", async conflicting => {
-  const host = fixture(undefined, { findings: true, readOnly: true }); host.setLimit(4);
-  materialReviewGaps(host);
-  cutAt(host, value => value.loop?.number === 3 && value.loop.plan?.stage === "published");
-  expect((await host.execute()).reason).toContain("Essential persistence failed");
-  host.setFailSave();
-  // Rebuild the pre-fix layout: loop N-1's sources copied into all three fields.
-  const state = host.current(), sources = (number: number) => copy(state.demandSources.find((item: any) => item.loop === number).sources);
-  expect(state.demandSources.map((item: any) => item.loop)).toEqual([1, 2]);
-  state.closedDemandSources = { loop: 2, sources: sources(2) };
-  state.demandObservations = state.demandObservations.map((item: any) => ({ ...item, sources: sources(item.loop - 1) }));
-  state.loop.demandObservation = { ref: copy(state.demandObservations.at(-1).ref), sources: sources(2) };
-  delete state.demandSources;
-  if (conflicting) state.loop.demandObservation.sources[0].reason = "Altered copy";
-  const legacy = copy(state), before = host.calls.length;
-  const output = await host.execute();
-  if (conflicting) {
-    expect(output.reason).toContain("Legacy demand observation state is inconsistent (loop.demandObservation disagrees for loop 2)");
-    expect(host.calls).toHaveLength(before);
-    expect(host.current()).toEqual(legacy);
-    return;
-  }
-  expect(output.status, output.reason).toBe("partial");
-  const current = host.current();
-  expect(current).not.toHaveProperty("closedDemandSources");
-  expect(current.demandObservations.every((item: any) => !("sources" in item))).toBe(true);
-  const observation = host.calls.find(call => call.key === "invoke-human-1.l4.demand-observation")!;
-  expect(observation.task).toContain(JSON.stringify(legacy.closedDemandSources.sources));
-  expect(observation.task).toContain(JSON.stringify(legacy.demandObservations.map(({ loop, ref, sources }: any) => ({ loop, ref, sources }))));
 });

@@ -26,8 +26,10 @@ Use `verify-behavior` for check selection, stopping, and test quality in the dif
 ## Procedure
 
 Use the [review skill](../review/SKILL.md) for the independent review after step 6.
-That skill starts its existing pi-subagents workflow. Do not add a second review
-workflow, substitute self-review, or use the retired tables.
+That skill runs `mission.create` first, then launches the named resource
+`pitako.review` with the same missionId and the actual mission record path; raw
+script paths fail. Do not add a second review workflow, substitute self-review,
+or use the retired tables.
 
 Capture the complete final diff, including commits since the selected merge-base,
 staged and unstaged edits, and applicable non-ignored untracked files with their
@@ -43,7 +45,12 @@ references alone do not prove a sufficient review. A base label alone is not
 review material. Review does not require a clean tree.
 
 Keep the captured material and source files stable during review. Retain the
-native workflow run reference. Return control after admission and use its final
+native workflow run reference. The review's model-free verifier writes access
+receipts under the mission directory; before relying on a completed review, you
+may recheck them read-only with `access_receipt_verify` or
+`node <pitako>/extensions/access-receipts.mjs check --mission <mission record path> --namespace review --gate <gate>`.
+Drift after a gate, or "receipt unavailable (mission pruned)", means the receipt
+no longer attests current bytes; it is not a review failure by itself. Return control after admission and use its final
 report, not child notifications, as evidence. If the preview truncates, read only
 the returned value from the cited result artifact.
 

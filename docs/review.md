@@ -3,10 +3,16 @@
 Use `/skill:review <target and requirements>` with the complete material to
 review and its requirements.
 
-The [review skill](../skills/review/SKILL.md) initiates one background
-pi-subagents workflow. `skills/review/workflow.js` dispatches the packaged
-`pitako.reviewer` profile for independent angles, cross-critique, one author
-response, and a final synthesis.
+The [review skill](../skills/review/SKILL.md) creates a native mission and
+launches the named resource `pitako.review` (raw script paths fail). The resource
+runs `skills/review/workflow.js`, which dispatches the packaged `pitako.reviewer`
+profile for independent angles, cross-critique, one author response, and a final
+synthesis. Before each consuming phase, the model-free `pitako.access-verifier`
+compares the published originals with the admitted values and writes a
+no-clobber receipt in the mission directory; a contradictory or unavailable
+original blocks that phase with an explanation. Receipts follow mission
+retention; `access_receipt_verify` and `extensions/access-receipts.mjs check`
+recompute them read-only and report drift or a pruned mission.
 
 Every reviewer sees the complete target. The caller supplies a target kind,
 reference, and material, plus requirements and evidence. A label or branch name

@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { isDeepStrictEqual } from "node:util";
 import { Type } from "typebox";
 import { createCheckpoint, type CheckpointIntent } from "./execute-checkpoint.ts";
-import { executionStatePath } from "./execute-state.ts";
+import { EXECUTE_STATE_VERSION, executionStatePath, incompatibleExecuteState } from "./execute-state.ts";
 import { effectiveProfile } from "./profile.ts";
 
 const namespace = "pitako.checkpoint/1";
@@ -20,9 +20,9 @@ export default function checkpointCreate(pi: ExtensionAPI): void {
   } catch { bindingError = "Invalid native checkpoint extension binding."; }
   pi.registerTool({
     name: "checkpoint_create", label: "checkpoint_create",
-    description: "Capture real affected bytes and admitted progress for this execute unit. kind=pre before writes (paths required once); kind=unit after journaled writes settle; kind=pause for pending WIP while native control permits. Reuses the owned checkpoint journal. Returns actual artifacts and seal receipt; does not confirm a task or advance the root cursor. Missing/stale execution context fails without fabricating an intention. Never call after Stop/refusal.",
+    description: "Capture real affected bytes and admitted progress before writes (kind=pre, exact paths required). The root seals settled journaled work; this tool never seals, confirms a task or advances the root cursor. Missing/stale execution context fails without fabricating an intention. Never call after Stop/refusal.",
     parameters: Type.Object({
-      kind: Type.Union([Type.Literal("pre"), Type.Literal("unit"), Type.Literal("pause")]),
+      kind: Type.Literal("pre"),
       paths: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, uniqueItems: true })),
     }, { additionalProperties: false }),
     outputSchema: Type.Object({ ok: Type.Boolean(), status: Type.String() }, { additionalProperties: true }),
@@ -32,13 +32,15 @@ export default function checkpointCreate(pi: ExtensionAPI): void {
       try {
         if (effectiveProfile(ctx.sessionManager) === "analysis") throw new Error("Pitako analysis forbids checkpoint_create.");
         signal?.throwIfAborted();
+        if (input.kind !== "pre") throw new Error("checkpoint_create accepts only kind pre; the execute root seals settled work.");
         if (bindingError) throw new Error(bindingError);
         if (!binding?.association || typeof binding.key !== "string") throw new Error("Missing native checkpoint execution context.");
         const association = binding.association;
         if (association.root !== ctx.cwd || typeof association.invocation !== "string" ||
             typeof association.missionPath !== "string") throw new Error("Checkpoint execution workspace mismatch.");
         const record = JSON.parse(readFileSync(executionStatePath(association), "utf8"))[`invoke-${association.invocation}`];
-        if (!record || record.version !== 4 || !equal(record.association, association))
+        if (record && record.version !== EXECUTE_STATE_VERSION) throw new Error(incompatibleExecuteState(record.version));
+        if (!record || !equal(record.association, association))
           throw new Error("Checkpoint durable association mismatch.");
         const loop = record.loop, attempt = loop?.attempt;
         if (!loop || loop.phase !== "implementation" || loop.halt || record.outcome ||

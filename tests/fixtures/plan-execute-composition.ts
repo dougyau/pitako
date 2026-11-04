@@ -51,6 +51,8 @@ export function resourceWithAgentDir(agentDir: string) {
   finally { if (prior === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = prior; }
 }
 
+// Absolute script paths survive stringified childResponse use in subprocesses with another cwd.
+export const deterministicScripts = { verifier: path.resolve("extensions/access-receipts.mjs"), sealer: path.resolve("skills/execute/checkpoint.mjs") };
 // Controlled child boundary: actual root/review scripts execute in the native sandbox.
 // Responses implement schemas only; no provider or model obedience is certified.
 export function childResponse(key: string, request: any, metadata: any, checkout: any, completeLoop = 1, suppliedValue?: any) {
@@ -58,6 +60,29 @@ export function childResponse(key: string, request: any, metadata: any, checkout
   if (request.agent === "pitako.request-observer") return { key, ok: true, agent: request.agent,
     runId: `native-${key}`, artifactPaths: [], output: JSON.stringify({ version: 1, ok: true,
       invocation: JSON.parse(request.task).invocation, requests: [], next: null }), results: [{ index: 0, agent: request.agent!, task: request.task, exitCode: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } }] } as WorkflowScriptChildResult;
+  if (request.agent === "pitako.access-verifier") {
+    // The real verifier over the actual published originals. Fixture mission
+    // records under /native are relocated beside the owned checkout metadata.
+    const input = JSON.parse(request.task), path = require("node:path"), fs = require("node:fs");
+    const missionPath = path.join(metadata.root, ".pi/subagents/native-missions", path.basename(input.missionPath));
+    fs.mkdirSync(path.dirname(missionPath), { recursive: true });
+    const output = require("node:child_process").execFileSync("node", [metadata.verifier ?? path.resolve("extensions/access-receipts.mjs"), "--verify-stdin"], {
+      input: JSON.stringify({ ...input, missionPath }), encoding: "utf8" });
+    return { key, ok: true, agent: request.agent, runId: `native-${key}`, output, results: [{ index: 0, agent: request.agent!, task: request.task, exitCode: 0,
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } }] } as WorkflowScriptChildResult;
+  }
+  if (request.agent === "pitako.checkpoint-sealer") {
+    const input = JSON.parse(request.task);
+    const manifest = metadata.root + "/.pi/subagents/checkpoints/" + input.intent.key + "/manifest.json";
+    const output = require("node:fs").existsSync(manifest) || input.restoreSources ?
+      require("node:child_process").execFileSync("node", [metadata.sealer ?? require("node:path").resolve("skills/execute/checkpoint.mjs"), "--seal-stdin"], {
+        cwd: metadata.root, input: request.task, encoding: "utf8",
+      }) : JSON.stringify({ v: 1, kind: input.kind, outcome: "observed", candidate: checkout });
+    return { key, ok: true, agent: request.agent, runId: `native-${key}`, asyncDir: `/native/async/${key}`,
+      output,
+      externalAdapter: { outputArtifacts: { stdoutPath: `/native/async/${key}/stdout.log`, stderrPath: `/native/async/${key}/stderr.log` } },
+      results: [{ exitCode: 0 }] } as WorkflowScriptChildResult;
+  }
   if (request.agent === "pitako.execution-ledger") {
     const pending = JSON.parse(request.task);
     return { key, ok: true, agent: request.agent, runId: `native-${key}`, asyncDir: `/native/async/${key}`,
@@ -79,16 +104,13 @@ export function childResponse(key: string, request: any, metadata: any, checkout
   let value: any;
   const task = { id: "final", kind: "verification", goal: "Verify complete candidate", contextRefs: ["full spec"],
     sourceRefs: [metadata.selected.source], scope: [metadata.root], allowedEffects: ["checks"], expectedResult: "Current required checks", dependsOn: [],
-    checks: [{ id: "final-check", requirement: "All specs", command: "bun test affected", cwd: metadata.root }] };
+    checks: [{ id: "final-check", requirement: "All specs", command: "bun test affected", cwd: metadata.root, tier: "acceptance" }] };
   if (suppliedValue) value = suppliedValue;
-  else if (key.endsWith(".director")) value = { status: "plan", reason: "Complete ordered work", association: {
-    missionId: "native.mission-1", missionPath: "/native/actual-mission.json", invocation: "human-1", loop, maxCycles: 3, sourceRefs: [],
-    root: metadata.root, commonDir: metadata.commonDir, source: metadata.selected.source, digest: metadata.selected.digest,
-  }, sharedContext: { material: "Full shared context", references: [metadata.selected.source] }, tasks: [task] };
-  else if (request.agent === "pitako.worker") value = { taskId: "final", attempt: 1, status: "complete", workDone: "Required checks executed",
+  else if (key.endsWith(".director")) value = { status: "plan", reason: "Complete ordered work", sharedContext: { material: "Full shared context", references: [metadata.selected.source] }, tasks: [task] };
+  else if (request.agent === "pitako.worker") value = { status: "complete", workDone: "Required checks executed",
     remaining: [], diagnosis: "No pending task work", usefulProgress: true, continuation: null,
-    git: { head: checkout?.head, checkpoints: [], wip: "Current WIP included" }, candidate: checkout,
-    checks: task.checks.map(({ requirement: _requirement, ...check }) => ({ ...check, output: "Controlled check passed", logPaths: ["/native/check.log"], result: "passed", before: checkout, after: checkout })) };
+    git: { wip: "Current WIP included" },
+    checks: task.checks.map(({ requirement: _requirement, tier: _tier, ...check }) => ({ ...check, output: "Controlled check passed", logPaths: ["/native/check.log"], result: "passed", before: checkout, after: checkout })) };
   else if (key.endsWith(".demand-observation")) value = { memo: "Inherited demands remain advisory",
     evidenceLimits: ["Controlled source evidence only"], observations: [] };
   else if (key.endsWith("director-prepare")) value = { status: "ready", reason: "Whole result perspectives", angles: [
@@ -104,15 +126,13 @@ export function childResponse(key: string, request: any, metadata: any, checkout
   if (request.phase?.startsWith("review-")) {
     // The harness passes its file-owned fs boundary, including in Node children.
     const fs = require("node:fs");
-    const association = Object.fromEntries(Object.entries(request.outputSchema.properties.association.properties)
-      .map(([name, schema]: [string, any]) => [name, schema.const]));
     const required = JSON.parse(request.task.split("ESSENTIAL ORIGINALS (data): ")[1].split("\n")[0]);
-    const access = required.map((entry: any) => {
+    for (const entry of required) {
       const original = JSON.parse(fs.readFileSync(entry.results.find((item: any) => item.savedOutputPath).savedOutputPath, "utf8"));
-      if (original.association.key !== entry.key || original.delivery !== "complete") throw Error("Wrong exact original");
-      return { id: entry.id, state: "accessible", source: "read", reason: "Exact associated original retrieved" };
-    });
-    value = { ...value, association, delivery: "complete", access };
+      if (entry.association.key !== entry.key || entry.delivery !== "complete" || entry.runId !== `native-${entry.key}`)
+        throw Error("Wrong exact original envelope");
+      require("node:assert/strict").deepEqual(original, entry.value, "Published original differs from admitted value");
+    }
     const savedOutputPath = metadata.root + "/.pi/subagents/review-originals/" + key + ".json";
     fs.mkdirSync(metadata.root + "/.pi/subagents/review-originals", { recursive: true });
     fs.writeFileSync(savedOutputPath, JSON.stringify(value));
@@ -125,8 +145,8 @@ export function childResponse(key: string, request: any, metadata: any, checkout
 // never construct an intention or tool result. Factory registration and publication are real.
 export async function registeredCheckpoint(request: any, root: string, loadExtensions: any, toolPath: string, key: string) {
   if (!request.task.includes('checkpoint_create({kind:"pre"') ||
-      !request.task.includes('checkpoint_create({kind:"unit"})') ||
-      !request.task.includes('checkpoint_create({kind:"pause"})') ||
+      request.task.includes('checkpoint_create({kind:"unit"})') ||
+      request.task.includes('checkpoint_create({kind:"pause"})') ||
       request.task.includes("helper's capture operation") || request.task.includes("helper seal operation"))
     throw Error("Effective checkpoint consumer still requires manual capture/seal assembly");
   const binding = request.extensionBindings?.["pitako.checkpoint/1"];
@@ -250,6 +270,7 @@ export function nativeCheckpointFixture({ workflowSettlements, checkpointCancell
         process.on('message',async ({input,harness})=>{
           const prior=process.env.PI_CODING_AGENT_DIR, cwd=process.cwd();
           try {
+            if(input.metadata){input.metadata.sealer=${JSON.stringify(path.resolve("skills/execute/checkpoint.mjs"))};input.metadata.verifier=${JSON.stringify(path.resolve("extensions/access-receipts.mjs"))};}
             process.chdir(input.root);process.env.PI_CODING_AGENT_DIR=input.agentDir;
             const {runWorkflowScript,loadExtensions}=input.sdk===false?{}:await sdk();
             const value=await (0,eval)('('+harness+')')(input,runWorkflowScript,${childResponse.toString()},

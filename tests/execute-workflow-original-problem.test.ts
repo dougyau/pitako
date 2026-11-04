@@ -13,7 +13,10 @@ function marking(host: ReturnType<typeof fixture>, verifies: Record<string, numb
       for (const task of result.structuredOutput.tasks ?? [])
         for (const check of task.checks) if (verifies[check.id]) check.verifies = verifies[check.id];
     }
-    if (request.agent === "pitako.worker" && failing.includes(result.structuredOutput.taskId)) {
+    // Workers no longer echo taskId; the root's frozen attempt descriptor names it.
+    const taskId = request.agent === "pitako.worker"
+      ? JSON.parse(request.task!.split("FROZEN ATTEMPT:\n")[1]!.split("\n")[0]!).taskId : undefined;
+    if (taskId && failing.includes(taskId)) {
       const value = result.structuredOutput;
       value.status = "gaps"; value.remaining = ["Repair the failing designated check"];
       value.checks = value.checks.map((check: any) => ({ ...check, result: "failed", output: "Observed failure: 1 test" }));

@@ -11,7 +11,7 @@ import { consumeWorkflowResourcePermit } from "../node_modules/pi-subagents/src/
 import { runWorkflowScript } from "../node_modules/pi-subagents/src/workflows/scripted-workflow.js";
 import { executionResource } from "../extensions/plan-execute.ts";
 import { digest, preliminarySpec, SPEC_SECTIONS, checkoutEvidence, MAX_SPEC_BYTES } from "../extensions/spec-plans.ts";
-import { planExecute, checkout, missionFiles, childResponse, registeredCheckpoint, compositionFixture, nativeCheckpointFixture, assignmentSpec, resourceWithAgentDir } from "./fixtures/plan-execute-composition.ts";
+import { deterministicScripts, planExecute, checkout, missionFiles, childResponse, registeredCheckpoint, compositionFixture, nativeCheckpointFixture, assignmentSpec, resourceWithAgentDir } from "./fixtures/plan-execute-composition.ts";
 
 const composition = compositionFixture();
 const { disposers, workflowSettlements, repository, checkpointLifecycle } = composition;
@@ -47,7 +47,7 @@ describe("plan/execute packaged composition", () => {
       if (!resource.ok) throw Error(resource.error);
       const permit = consumeWorkflowResourcePermit(resource.resource.permit, resource.resource.script);
       if (typeof permit === "string") throw Error(permit);
-      const metadata = { root, commonDir: path.join(root, ".git"), selected: { source: path.join(root, ".pitako/plans/assignment.md"), digest: digest(content) } };
+      const metadata = { ...deterministicScripts, root, commonDir: path.join(root, ".git"), selected: { source: path.join(root, ".pitako/plans/assignment.md"), digest: digest(content) } };
       const script = resource.resource.script;
       const input = { mode, root, nativeRoot, missionPath, statePath, metadata, script,
         toolModule: path.resolve("extensions/checkpoint-create.ts"),
@@ -122,7 +122,7 @@ describe("plan/execute packaged composition", () => {
             if (request.agent === "pitako.execution-inspector") throw Error("Checkpoint recovery must not require an inspector chain");
             // Only final checks/compliance consume the candidate; restored unit
             // results get their actual post-write identity below.
-            const needsCandidate = request.agent === "pitako.checkout-observer" || key.endsWith(".compliance") || request.agent === "pitako.worker" && key.includes(".t2.");
+            const needsCandidate = request.agent === "pitako.checkpoint-sealer" || request.agent === "pitako.checkout-observer" || key.endsWith(".compliance") || request.agent === "pitako.worker" && key.includes(".t2.");
             const result = response(key, request, input.metadata, needsCandidate ? candidate() : undefined);
             if (request.agent === "pitako.worker" && key.endsWith(".t1.a1")) {
               const intent = storage.get("invoke-human-1").loop.attempt.checkpoint;
@@ -162,7 +162,9 @@ describe("plan/execute packaged composition", () => {
               try { restored = JSON.parse(helper("restore", { intent: restore.sourceKeys.map((key: string) => storage.get("invoke-human-1").taskFrame.sources.find((source: any) => source.key === key)), authority: restore.authority })); }
               catch (error) { return { ...result, ok: true, structuredOutput: { ...result.structuredOutput, taskId: "unit", attempt: attempt.number,
                 status: "blocked", diagnosis: "Checkpoint restore not performed: " + String(error), candidate: candidate(),
-                git: { head: candidate().head, checkpoints: [], wip: "Foreign bytes retained" } } }; }
+                remaining: ["Resolve restoration"], checks: [{ id: "unit-check", command: "bun test affected", cwd: input.root,
+                  output: String(error), logPaths: [], result: "not-run", before: candidate(), after: candidate() }],
+                git: { wip: "Foreign bytes retained" } } }; }
               restores++;
               if (io.readFileSync(file("owned"), "utf8") !== "prior owned WIP") throw Error("Earlier WIP not restored");
               // Replay helper before later work is idempotent, and retains original partial bytes.
@@ -175,26 +177,20 @@ describe("plan/execute packaged composition", () => {
                 return { ...result, ok: false, interrupted: true, structuredOutput: undefined };
               }
               helper("apply", { intent: attempt.checkpoint, changes: [{ path: "owned", image: { bytes: Buffer.from("finished task").toString("base64"), mode: 420 } }] });
-              const checkpointReceipt = (await checkpoint("unit")).checkpointReceipt;
               const current = candidate();
-              Object.assign(result.structuredOutput, { taskId: "unit", attempt: attempt.number, candidate: current, checkpointReceipt,
-                restoreReceipt: { checkpointRef: restored.checkpointRef, digest: restored.digest,
-                  partialRef: restored.partialRef, restoredRef: restored.partialRef.replace("restore.json", "restored.json"),
-                  position: restored.position, candidate: { head: restored.candidate.head, fingerprint: restored.candidate.fingerprint } },
-                git: { head: current.head, checkpoints: [checkpointReceipt.checkpointRef, restored.partialRef, restored.checkpointRef, restored.partialRef.replace("restore.json", "restored.json")], wip: "Earlier WIP preserved" } });
+              Object.assign(result.structuredOutput, { git: { wip: "Earlier WIP preserved" } });
+              if (input.mode === "missing-receipt") io.unlinkSync(restored.partialRef.replace("restore.json", "restored.json"));
               result.structuredOutput.checks = [{ id: "unit-check", command: "bun test affected", cwd: input.root,
                 output: "Controlled current check", logPaths: [], result: "passed", before: current, after: current }];
             }
-            if (input.mode === "missing-receipt" && key.endsWith(".t1.a2")) delete result.structuredOutput.restoreReceipt;
             return result;
           },
         };
         function director(key: string) {
           const result = response(key.replace(/^native-/, ""), { agent: "pitako.execution-director" }, input.metadata, undefined);
-          result.structuredOutput.association.missionPath = input.missionPath;
           const unit = structuredClone(result.structuredOutput.tasks[0]);
           Object.assign(unit, { id: "unit", kind: "implementation", scope: ["owned"], allowedEffects: ["Modify owned pending unit"] });
-          unit.checks[0].id = "unit-check"; result.structuredOutput.tasks.unshift(unit);
+          unit.checks[0].id = "unit-check"; unit.checks[0].tier = "focused"; result.structuredOutput.tasks.unshift(unit);
           return result;
         }
         const first = await run(options as any);
@@ -282,7 +278,7 @@ describe("plan/execute packaged composition", () => {
   test("checkpoint intention persistence failure prevents modifying dispatch", async () => {
     const root = repository();
     const content = `---\npitako-spec: 1\nid: assignment\nstatus: complete\n---\n${SPEC_SECTIONS.map(title => `## ${title}\nAgreed ${title}.\n`).join("\n")}`;
-    const metadata = { root, commonDir: path.join(root, ".git"),
+    const metadata = { ...deterministicScripts, root, commonDir: path.join(root, ".git"),
       selected: { source: path.join(root, ".pitako/plans/assignment.md"), digest: digest(content), chunks: 1 } };
     mkdirSync(path.dirname(metadata.selected.source), { recursive: true });
     writeFileSync(metadata.selected.source, content);
@@ -308,7 +304,7 @@ describe("plan/execute packaged composition", () => {
     const result = await operation;
     expect((result.value as any).status).toBe("partial");
     expect((result.value as any).reason).toContain("persistence");
-    expect(calls.filter(key => !key.includes(".requests-"))).toEqual(["invoke-human-1.l1.director"]);
+    expect(calls.filter(key => !key.includes(".requests-") && !key.includes(".review.verify-") && !/\.seal(?:\.r\d+)?$/.test(key))).toEqual(["invoke-human-1.l1.director"]);
     expect(storage.get("invoke-human-1").consumedLoops).toBe(1);
   });
 });
@@ -322,13 +318,13 @@ describe("plan/execute packaged composition", () => {
     writeFileSync(path.join(root, "earlier"), "valid earlier WIP");
     writeFileSync(path.join(root, "owned"), "valid prior WIP");
     writeFileSync(path.join(root, "deleted"), "prior deletion target");
-    const metadata = { root, commonDir: path.join(root, ".git"), selected: { source, digest: digest(content) } };
+    const metadata = { ...deterministicScripts, root, commonDir: path.join(root, ".git"), selected: { source, digest: digest(content) } };
     const resource = resourceWithAgentDir(path.join(nativeRoot, "agent")).resolve({
       root, id: "assignment", invocation: "human-1", missionId: "native.mission-1", missionPath });
     const harness = async (input: any, run: typeof runWorkflowScript, response: typeof childResponse, io: any) => {
       const { root, nativeRoot, missionPath, metadata, script, hostCommands, observation, helper } = input;
       const grants = new Map<string, string>(hostCommands.map((grant: any) => [grant.key, grant.command]));
-      const { writeFileSync, readFileSync, existsSync, execFileSync, captureCheckpoint, applyCheckpoint, restoreCheckpoint, sealCheckpoint, checkoutEvidence } = io;
+      const { writeFileSync, readFileSync, existsSync, execFileSync, captureCheckpoint, applyCheckpoint, restoreCheckpoint, checkoutEvidence } = io;
       const path = await import("node:path");
       let initial: any, restored: any;
       const storage = new Map<string, any>(), calls: string[] = [];
@@ -345,7 +341,6 @@ describe("plan/execute packaged composition", () => {
         if (operation === "capture") return JSON.stringify(captureCheckpoint(data.intent, data.paths));
         if (operation === "apply") { applyCheckpoint(data.intent, data.changes); return ""; }
         if (operation === "restore") return JSON.stringify(restoreCheckpoint(data.intent, data.authority));
-        if (operation === "seal") return JSON.stringify(sealCheckpoint(data.intent, data.kind, data.controlPermitsCapture));
         throw Error("Unexpected checkpoint operation: " + operation);
     };
     const operation = run({ script,
@@ -362,15 +357,14 @@ describe("plan/execute packaged composition", () => {
         if (request.agent === "pitako.execution-ledger") archivedFrame = JSON.parse(request.task).record.body.frame;
         if (request.agent === "pitako.worker" && request.resume) return { key, ok: false, output: "Controlled native resume unavailable",
           error: "Controlled native resume unavailable", artifactPaths: [] };
-        const needsCandidate = request.agent === "pitako.checkout-observer" || key.endsWith(".compliance") ||
+        const needsCandidate = request.agent === "pitako.checkpoint-sealer" || request.agent === "pitako.checkout-observer" || key.endsWith(".compliance") ||
           (request.agent === "pitako.worker" && key.includes(".t2."));
         const child = response(key, request, metadata, needsCandidate ? observedCandidate() : undefined);
         if (key.endsWith(".director")) {
-          child.structuredOutput.association.missionPath = missionPath;
           const unit = structuredClone(child.structuredOutput.tasks[0]);
           Object.assign(unit, { id: "unit", kind: "implementation", scope: ["owned", "deleted", "new"],
             allowedEffects: ["Modify only unit paths"], expectedResult: "Recoverable unit" });
-          unit.checks[0].id = "unit-check";
+          unit.checks[0].id = "unit-check"; unit.checks[0].tier = "focused";
           child.structuredOutput.tasks.unshift(unit);
         }
         if (request.agent === "pitako.worker" && key.includes(".t1.")) {
@@ -385,11 +379,8 @@ describe("plan/execute packaged composition", () => {
             invoke("apply", { intent: descriptor.checkpoint, changes: [
               { path: "owned", image: { bytes: Buffer.from("completed pending work").toString("base64"), mode: 420 } },
             ] });
-            const checkpointReceipt = JSON.parse(invoke("seal", { intent: descriptor.checkpoint, kind: "unit", controlPermitsCapture: true }));
-            const current = checkpointReceipt.candidate;
-            Object.assign(child.structuredOutput, { taskId: "unit", attempt: descriptor.number, candidate: current,
-              checkpointReceipt, restoreReceipt: { ...restoreReceipt, restoredRef: path.join(path.dirname(restoreReceipt.checkpointRef), "restored.json") },
-              git: { head: current.head, checkpoints: [checkpointReceipt.checkpointRef, restoreReceipt.checkpointRef, restoreReceipt.partialRef, path.join(path.dirname(restoreReceipt.checkpointRef), "restored.json")], wip: "Recovered pending work" },
+            const current = (({ head, fingerprint }) => ({ head, fingerprint }))(checkoutEvidence(root));
+            Object.assign(child.structuredOutput, { git: { wip: "Recovered pending work" },
               checks: [{ id: "unit-check", command: "bun test affected", cwd: root, output: "Controlled current check", logPaths: [], result: "passed", before: current, after: current }] });
             return child;
           }
@@ -473,7 +464,7 @@ describe("plan/execute packaged composition", () => {
       const resolved = resolveWorkflowResource("pitako.execute", args, sessionId);
       if (!resolved.ok) throw Error(resolved.error);
       const content = spec.content;
-      const metadata = { root, commonDir: path.join(root, ".git"), candidates: [],
+      const metadata = { ...deterministicScripts, root, commonDir: path.join(root, ".git"), candidates: [],
         selected: { source: `${root}/.pitako/plans/assignment.md`, digest: digest(content), chunks: 1 } };
       const storage = new Map<string, any>(), children: Record<string, any> = {}, hosts: Record<string, any> = {};
       const calls: string[] = [], inspections: string[] = [], originals: any[] = [], publications: any[] = [];
@@ -535,25 +526,15 @@ describe("plan/execute packaged composition", () => {
           }
           if (key.endsWith(".director") && mode !== "unresolved-plan") {
             const plan = response.structuredOutput;
-            const schema = request.outputSchema as TSchema & { properties: { association: { const: unknown } } };
-            expect(schema.properties.association.const).toEqual(plan.association);
-            expect(plan.association).toEqual({
-              root, invocation: args.invocation, missionId: args.missionId, missionPath: args.missionPath,
-              loop: Number(key.match(/\.l(\d+)\./)![1]), commonDir: metadata.commonDir,
-              source: metadata.selected.source, digest: metadata.selected.digest, maxCycles: 3, sourceRefs: [],
-            });
+            const schema = request.outputSchema as TSchema;
+            expect((schema as any).properties).not.toHaveProperty("association");
             const tool = { name: "loop_plan", description: "Plan", parameters: schema };
             const validate = (value: any) => validateToolArguments(tool, { type: "toolCall", id: "plan", name: tool.name, arguments: value });
             expect(validate(plan)).toEqual(plan);
-            for (const [field, value] of Object.entries(plan.association)) {
-              const changed = structuredClone(plan);
-              changed.association[field] = typeof value === "number" ? value + 1 : Array.isArray(value) ? [{ path: "/wrong", digest: "f".repeat(64) }] : "/wrong";
-              expect(() => validate(changed)).toThrow();
-            }
             if (mode === "needs-decision") Object.assign(plan, { status: "needs-decision", reason: "Controlled product decision", tasks: [] });
-            if (mode === "mismatched-association") plan.association.missionPath = "/wrong";
+            if (mode === "mismatched-association") plan.association = { missionPath: "/wrong" };
             if (mode === "rejected-plan") {
-              if (plan.association.loop === 1) plan.tasks[0].dependsOn = [{ taskId: "missing", reason: "Requires missing output" }];
+              if (Number(key.match(/\.l(\d+)\./)![1]) === 1) plan.tasks[0].dependsOn = [{ taskId: "missing", reason: "Requires missing output" }];
               else {
                 expect(storage.get("invoke-human-1").planRejections).toEqual([{ loop: 1, diagnostic: expect.stringContaining("loop_plan dependencies require") }]);
                 expect(request.task).toContain("VERIFIED RETAINED LOOP SUMMARIES");
@@ -581,12 +562,12 @@ describe("plan/execute packaged composition", () => {
         },
       });
       const recoveredHost = mode === "host-opening-timeout";
-      expect(expected.value).toMatchObject({ status: ["complete", "recovered", "rejected-plan"].includes(mode) || recoveredHost ? "complete" : mode === "stopped" || mode.endsWith("-stop") ? "cancelled" : "blocked",
+      expect(expected.value).toMatchObject({ status: ["complete", "recovered", "rejected-plan", "mismatched-association"].includes(mode) || recoveredHost ? "complete" : mode === "stopped" || mode.endsWith("-stop") ? "cancelled" : "blocked",
         ...hostTarget && !recoveredHost ? { status: "blocked" } : {},
-        loopsConsumed: recoveredHost ? 2 : hostTarget && hostTarget !== "inspect-loop-1" ? 0 : ["complete", "rejected-plan"].includes(mode) ? 2 : 1 });
-      expect(calls.filter(key => !key.includes(".requests-"))).toHaveLength(analysisTarget ? mode.includes("-prepare-") ? 3 : mode.includes("-later-") ? 5 : 7
+        loopsConsumed: recoveredHost ? 2 : hostTarget && hostTarget !== "inspect-loop-1" ? 0 : ["complete", "rejected-plan", "mismatched-association"].includes(mode) ? 2 : 1 });
+      expect(calls.filter(key => !key.includes(".requests-") && !key.includes(".review.verify-") && !/\.seal(?:\.r\d+)?$/.test(key))).toHaveLength(analysisTarget ? mode.includes("-prepare-") ? 3 : mode.includes("-later-") ? 5 : 7
         : recoveredHost ? 17 : hostTarget ? hostTarget === "inspect-loop-1" ? 7 : 0
-        : mode === "complete" ? 17 : mode === "recovered" ? 9 : mode === "rejected-plan" ? 10 : ["stopped", "permission", "unresolved-plan"].includes(mode) ? 2 : 1);
+        : ["complete", "mismatched-association"].includes(mode) ? 17 : mode === "recovered" ? 9 : mode === "rejected-plan" ? 10 : ["stopped", "permission", "unresolved-plan"].includes(mode) ? 2 : 1);
       if (ambiguousHost) {
         expect((expected.value as any).reason).toContain("ambiguous");
         expect((expected.value as any).action.actor).toBe(mode.endsWith("persistence-failure") ? "persistence operator" : "native run operator");
@@ -728,7 +709,7 @@ describe("plan/execute packaged composition", () => {
       if (typeof permit === "string") throw Error(permit);
       expect(permit.authority.host).toHaveLength(3);
       expect(permit.authority.host![0]!.key).toBe("inspect-initial");
-      const metadata = { root, commonDir: spec.commonDir, selected: { source: spec.source, digest: digest(content) } };
+      const metadata = { ...deterministicScripts, root, commonDir: spec.commonDir, selected: { source: spec.source, digest: digest(content) } };
       const child = Bun.spawn(["node", "--disable-warning=ExperimentalWarning", "-e", `
         (async()=>{
           const fs=require("node:fs"),cp=require("node:child_process");
@@ -758,7 +739,6 @@ describe("plan/execute packaged composition", () => {
                 if(input.mode==="active")return {key,ok:true,state:"running",output:"",artifactPaths:[]};
               }
               const result=respond(key,request,input.metadata,checkout,input.mode==="exhausted"?11:8);
-              if(key.endsWith(".director"))result.structuredOutput.association=JSON.parse(request.task.split("ASSOCIATION (data): ")[1].split("\\n")[0]);
               originals.set(key,result);originals.set(result.runId,result);return result;
             }};
           const first=await runWorkflowScript(options);let second;
@@ -804,7 +784,7 @@ describe("plan/execute packaged composition", () => {
       } finally { lifecycle.cancel(); await lifecycle.settled; }
     });
 
-  test.each(["partial-association", "foreign", "partial-without-association", "legacy-conflict"])(
+  test.each(["partial-association", "foreign", "partial-without-association", "legacy-conflict", "v4"])(
     "conditional initial admission never replaces incompatible retained state: %s", async mode => {
       const root = repository(), nativeRoot = repository();
     assignmentSpec(root);
@@ -814,17 +794,18 @@ describe("plan/execute packaged composition", () => {
       const resource = resourceWithAgentDir(global).resolve({ root, id: "assignment", invocation: "human-1",
         missionId: "native.mission-1", missionPath });
       const association = { root, missionId: "native.mission-1", missionPath, invocation: "human-1", maxCycles: 5, sourceRefs: [] };
-      const retained = { version: 3, ...(mode === "partial-without-association" ? { snapshot: { content: "partial" } } :
+      const retained = { version: mode === "v4" ? 4 : 5, ...(mode === "partial-without-association" ? { snapshot: { content: "partial" } } :
         { association: mode === "partial-association" ? {} : { ...association, ...(mode === "foreign" ? { missionId: "other" } : {}) } }) };
       const state: Record<string, any> = { "invoke-human-1": retained,
-        ...(mode === "legacy-conflict" ? { "pitako-execution": { version: 2, association } } : {}) };
+        ...(mode === "legacy-conflict" ? { "pitako-execution": { version: 5, association: { ...association, invocation: "other" } } } : {}) };
       const original = JSON.stringify(state); writeFileSync(statePath, original);
       const command = resource.hostCommands.find(grant => grant.key === "inspect-initial")!.command;
       // The inspector itself must not hide the conflict behind invalid settings.
       let failure = "";
       try { failure = execFileSync("sh", ["-c", command], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }); }
       catch (error) { failure = String((error as { stderr: unknown }).stderr); }
-      expect(failure).toMatch(/retained (invocation|association)|predates bound native admission/i);
+      expect(failure).toMatch(mode === "v4" ? /created by an incompatible Pitako contract v4; start a new mission/
+        : /retained (invocation|association)|predates bound native admission/i);
       expect(failure).not.toContain("pitako.execute.maxCycles");
       const calls: string[] = [];
       const result = await runWorkflowScript({ script: resource.script,
@@ -858,7 +839,7 @@ test.each(["complete", "receipt-save-cut", "result-save-cut", "cursor-save-cut",
     const resolved = resolveWorkflowResource("pitako.execute", args, sessionId);
     if (!resolved.ok) throw Error(resolved.error);
     const content = spec.content;
-    const metadata = { root, commonDir: path.join(root, ".git"), candidates: [],
+    const metadata = { ...deterministicScripts, root, commonDir: path.join(root, ".git"), candidates: [],
       selected: { source: `${root}/.pitako/plans/assignment.md`, digest: digest(content), chunks: 1 } };
     // Prepare complete native originals at the controlled boundary, not another
     // copy of the root. The registered resource itself runs inside Node below.
@@ -873,7 +854,7 @@ test.each(["complete", "receipt-save-cut", "result-save-cut", "cursor-save-cut",
           const final = response.structuredOutput.tasks[0];
           response.structuredOutput.tasks = [{ ...structuredClone(final), id: "repair", kind: "verification",
             goal: "Verify authorized behavior without writes", expectedResult: "Current verification check",
-            checks: [{ ...final.checks[0], id: "repair-check" }] },
+            checks: [{ ...final.checks[0], id: "repair-check", tier: "focused" }] },
             { ...final, dependsOn: [{ taskId: "repair", reason: "Verify the completed repair" }] }];
         } else if (key.endsWith(".t1.a1")) {
           response.structuredOutput.taskId = "repair";
@@ -912,7 +893,7 @@ test.each(["complete", "receipt-save-cut", "result-save-cut", "cursor-save-cut",
               }
               calls.push({key, resume: params.resume, agent: params.agent});
               let response;
-              if (params.agent === "pitako.request-observer") response = (${childResponse.toString()})(key, params, input.metadata, input.checkout);
+              if (params.agent === "pitako.request-observer" || params.agent === "pitako.checkpoint-sealer" || params.agent === "pitako.access-verifier") response = (${childResponse.toString()})(key, params, input.metadata, input.checkout);
               else if (key.endsWith(".t1.a1")) response = { ...structuredClone(input.templates[key]),
                 ok: false, state: "interrupted", structuredOutput: undefined, results: [] };
               else if (key.endsWith(".resume")) {
@@ -958,7 +939,7 @@ test.each(["complete", "receipt-save-cut", "result-save-cut", "cursor-save-cut",
       expect(observed.calls.some((call: any) => call.key.endsWith(".t2.a1"))).toBe(false);
       expect(observed.calls.some((call: any) => call.key.endsWith(".compliance"))).toBe(false);
     } else {
-      expect((observed.second ?? observed.first).status).toBe("complete");
+      expect((observed.second ?? observed.first).status, (observed.second ?? observed.first).reason).toBe("complete");
       expect(observed.calls.filter((call: any) => call.key.endsWith(".t2.a1"))).toHaveLength(1);
       expect(observed.calls.filter((call: any) => call.key.endsWith("director-synthesis"))).toHaveLength(1);
       expect(observed.calls.filter((call: any) => call.key.endsWith(".compliance"))).toHaveLength(1);
@@ -1014,6 +995,7 @@ test("registered Node public root resume consumes durable results and closes the
       if (!resolved.ok) throw Error(resolved.error);
       const script = resolved.resource.script, calls = [], content = input.content;
       const metadata = {root:input.root, commonDir:path.join(input.root,".git"), candidates:[],
+        verifier:input.packageRoot + "/extensions/access-receipts.mjs", sealer:input.packageRoot + "/skills/execute/checkpoint.mjs",
         selected:{source:path.join(input.root,".pitako/plans/assignment.md"), digest:input.digest, chunks:1}};
       const response = eval('(' + input.response + ')');
       const originals = new Map();
@@ -1022,7 +1004,6 @@ test("registered Node public root resume consumes durable results and closes the
         launch:async (key, request)=>{
           calls.push(key);
           const result = response(key, request, metadata, input.checkout);
-          if (key.endsWith(".director")) Object.assign(result.structuredOutput.association,{missionId:mission.missionId, missionPath});
           originals.set(key,result); originals.set(result.runId,result);
           return result;
         },

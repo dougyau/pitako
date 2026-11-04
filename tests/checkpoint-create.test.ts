@@ -11,7 +11,7 @@ import { runToolCall } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, JsonObject } from "@earendil-works/pi-ai";
 import checkpointCreate from "../extensions/checkpoint-create.ts";
 import pitako from "../extensions/index.ts";
-import { applyCheckpoint, checkpointDirectory, checkpointEvidence, restoreCheckpoint, type CheckpointIntent } from "../extensions/execute-checkpoint.ts";
+import { applyCheckpoint, checkpointDirectory, checkpointEvidence, restoreCheckpoint, sealCheckpoint, type CheckpointIntent } from "../extensions/execute-checkpoint.ts";
 import { setSessionProfile } from "../extensions/profile.ts";
 import { parseFrontmatter, parseFrontmatterList } from "../node_modules/pi-subagents/src/agents/frontmatter.js";
 import { createDefaultChildSessionFactory } from "../node_modules/pi-subagents/src/runs/shared/child-session.js";
@@ -42,7 +42,7 @@ function fixture() {
     progress: { consumedLoops: 1, admitted: {}, previous: null } };
   const loop = { number: 1, phase: "implementation", cursor: 0, manifest: ["owned", "next"], results: [], plan: { stage: "admitted", ref: intent.planRef },
     attempt: { key: intent.key, taskId: "owned", index: 0, number: 1, stage: "intention", checkpoint: intent } };
-  const record = { version: 4, association, loop, consumedLoops: 1, tasks: {}, lastConfirmed: null };
+  const record = { version: 5, association, loop, consumedLoops: 1, tasks: {}, lastConfirmed: null };
   const persist = () => state.set("invoke-fixture", record); persist();
   const binding = JSON.stringify({ "pitako.checkpoint/1": { association, key: intent.key } });
   let tool: any;
@@ -80,18 +80,15 @@ test("registered checkpoint_create captures actual WIP, untracked bytes, absence
   expect(readFileSync(f.intent.association.missionPath, "utf8")).toBe(beforeMission);
 });
 
-test.each(["unit", "pause"] as const)("%s seal has actual journaled bytes but no task admission or root cursor effect", async kind => {
+test.each(["unit", "pause"] as const)("worker cannot publish a %s seal, with or without pre-capture", async kind => {
   const f = fixture();
-  expect(await f.call(kind)).toMatchObject({ ok: false, error: { message: "No pre capture exists for this attempt; there are no captured effects to seal. A task without checkout writes returns without checkpointReceipt." } });
+  expect(f.tool.parameters.properties.kind).toEqual({ type: "string", const: "pre" });
+  expect(await f.call(kind)).toMatchObject({ ok: false, error: { message: "checkpoint_create accepts only kind pre; the execute root seals settled work." } });
   expect(existsSync(checkpointDirectory(f.intent))).toBe(false);
-  expect(existsSync(path.join(checkpointDirectory(f.intent), "unit.json"))).toBe(false);
   const pre = await f.call("pre", paths), state = readFileSync(f.statePath, "utf8");
   applyCheckpoint(f.intent, [{ path: "modified", image: { bytes: Buffer.from("owned change").toString("base64"), mode: 0o644 } }]);
-  const sealed = await f.call(kind);
-  expect(sealed).toMatchObject({ ok: true, confirmed: false, kind, position: { cursor: kind === "unit" ? 1 : 0 }, checkpointReceipt: { kind } });
-  expect(Buffer.from(artifact(sealed.checkpointRef).files[0].image.bytes, "base64").toString()).toBe("owned change");
-  expect(sealed.checkpointReceipt.digest).toBe(digest(readFileSync(sealed.checkpointRef)));
-  expect((await f.call(kind)).status).toBe("existing");
+  expect(await f.call(kind)).toMatchObject({ ok: false });
+  expect(existsSync(path.join(checkpointDirectory(f.intent), `${kind}.json`))).toBe(false);
   expect(readFileSync(f.statePath, "utf8")).toBe(state);
   expect(artifact(pre.manifestRef).intent.progress.admitted).toEqual({});
 });
@@ -109,20 +106,19 @@ test("a tool publication remains a usable existing rollback source with unknown 
 });
 
 // Rejects using a nominal intention, foreign/unadmitted seal, or the unit's
-// preimages as the next task's baseline. The seal is an actual registered call.
+// preimages as the next task's baseline. Only the root seals metadata.
 test.each(["valid", "missing", "foreign", "unadmitted", "corrupt", "conflict", "newer-corrupt", "previous-ref", "previous-digest", "previous-checkpoint", "previous-attempt", "cursor", "plan"])(
-  "tool-published admitted unit supplies postimages before the next capture: %s", async mode => {
+  "root-sealed admitted unit supplies postimages before the next capture: %s", async mode => {
     const f = fixture();
     await f.call("pre", paths);
     applyCheckpoint(f.intent, [{ path: "modified", image: { bytes: Buffer.from("confirmed WIP").toString("base64"), mode: 0o640 } },
       { path: "absent", image: { bytes: Buffer.from("created by confirmed unit").toString("base64"), mode: 0o644 } }]);
-    const sealed = await f.call("unit"), receipt = sealed.checkpointReceipt;
-    expect(sealed.ok).toBe(true);
+    const receipt = sealCheckpoint(f.intent, "unit", true);
     const ref = { key: f.intent.key, runId: "actual-unit-producer" };
     const result = { taskId: f.intent.taskId, attempt: 1, status: "complete", ref };
     const pending: CheckpointIntent = { ...f.intent, key: "invoke-fixture.l1.t2.a1", taskId: "next", cursor: 1,
       progress: { consumedLoops: 1, admitted: { owned: ["complete"] }, previous: { taskId: result.taskId, attempt: result.attempt, resultRef: ref, checkpointRef: receipt.checkpointRef, digest: receipt.digest } } };
-    const confirmedUnit = { ...receipt, taskId: result.taskId, attempt: result.attempt, resultRef: ref };
+    const confirmedUnit = { ...receipt, kind: "unit" as const, taskId: result.taskId, attempt: result.attempt, resultRef: ref };
     const authority = { pending: true, stop: false, permissionDenied: false, activeWriter: null, references: [receipt.checkpointRef], confirmedUnit };
     const originalSeal = readFileSync(receipt.checkpointRef);
     if (mode === "missing") rmSync(receipt.checkpointRef);
@@ -165,9 +161,10 @@ test.each(["valid", "missing", "foreign", "unadmitted", "corrupt", "conflict", "
     expect(existsSync(path.join(checkpointDirectory(pending), "manifest.json"))).toBe(false);
   });
 
-test.each(["missing", "malformed", "metadata-only", "association", "progress", "attempt", "stopped"])(
+test.each(["missing", "malformed", "metadata-only", "association", "progress", "attempt", "stopped", "v4"])(
   "invalid durable writer context cannot publish: %s", async mode => {
     const f = fixture();
+    if (mode === "v4") (f.record as any).version = 4;
     if (mode === "association") f.record.association = { ...f.record.association, invocation: "other" };
     if (mode === "progress") f.loop.attempt.checkpoint.progress!.consumedLoops = 2;
     if (mode === "attempt") f.loop.attempt.key = "other";
@@ -179,7 +176,9 @@ test.each(["missing", "malformed", "metadata-only", "association", "progress", "
       writeFileSync(f.intent.association.missionPath, JSON.stringify({ "invoke-fixture": f.record }));
       writeFileSync(f.statePath, "{}");
     }
-    expect(await f.call("pre", paths)).toMatchObject({ ok: false, status: "failed" });
+    const result = await f.call("pre", paths);
+    expect(result).toMatchObject({ ok: false, status: "failed" });
+    if (mode === "v4") expect(JSON.stringify(result)).toContain("created by an incompatible Pitako contract v4; start a new mission");
     expect(existsSync(checkpointDirectory(f.intent))).toBe(false);
     expect(readFileSync(path.join(f.root, "modified"), "utf8")).toBe("prior uncommitted WIP\n");
   });
@@ -218,7 +217,8 @@ test("failed publication and conflicting effects cannot produce a seal or replac
   rmSync(path.join(directory, "manifest.json"), { recursive: true });
   const pre = await f.call("pre", paths);
   writeFileSync(path.join(f.root, "modified"), "unattributed foreign edit");
-  expect(await f.call("unit")).toMatchObject({ ok: false, error: { message: "Cannot seal incomplete or conflicting checkpoint effects." } });
+  expect(await f.call("unit")).toMatchObject({ ok: false });
+  expect(() => sealCheckpoint(f.intent, "unit", true)).toThrow("Cannot seal incomplete or conflicting checkpoint effects.");
   expect(digest(readFileSync(pre.checkpointRef))).toBe(pre.digest);
   expect(existsSync(path.join(directory, "unit.json"))).toBe(false);
 });
@@ -256,14 +256,14 @@ test("native loaded writer composition invokes directly and through codemode; in
     expect(nested.isError, text(nested)).toBe(false); expect(text(nested)).toContain('"confirmed":false');
     setSessionProfile(session.sessionManager, "analysis");
     for (const name of ["checkpoint_create", "codemode"]) {
-      const denied = await call(name, name === "codemode" ? { code: `await tools.checkpoint_create({kind:"pause"});` } : { kind: "pause" });
+      const denied = await call(name, name === "codemode" ? { code: `await tools.checkpoint_create({kind:"pre",paths:["modified"]});` } : { kind: "pre", paths: ["modified"] });
       expect(denied.isError, text(denied)).toBe(true); expect(text(denied)).toContain("Pitako analysis forbids checkpoint_create");
     }
     session.setActiveToolsByName(session.getAllTools().map(t => t.name).filter(name => name !== "checkpoint_create"));
     const inactive = await call("checkpoint_create", { kind: "pause" });
     expect(inactive.isError).toBe(true);
     expect(text(inactive)).toContain("Tool checkpoint_create not found");
-    const deferred = await call("codemode", { code: `await tools.checkpoint_create({kind:"pause"});` });
+    const deferred = await call("codemode", { code: `await tools.checkpoint_create({kind:"pre",paths:["modified"]});` });
     expect(deferred.isError, text(deferred)).toBe(true);
     expect(text(deferred)).toContain("tools.checkpoint_create does not exist");
     expect(existsSync(path.join(checkpointDirectory(f.intent), "pause.json"))).toBe(false);
@@ -278,7 +278,7 @@ test("journal image property order cannot turn owned writes into conflicts", asy
   const f = fixture(); await f.call("pre", paths);
   applyCheckpoint(f.intent, [{ path: "modified", image: { mode: 0o640, bytes: Buffer.from("first").toString("base64") } }]);
   applyCheckpoint(f.intent, [{ path: "modified", image: { bytes: Buffer.from("second").toString("base64"), mode: 0o640 } }]);
-  expect(await f.call("unit")).toMatchObject({ ok: true, kind: "unit" });
+  expect(sealCheckpoint(f.intent, "unit", true)).toMatchObject({ kind: "unit" });
   expect(readFileSync(path.join(f.root, "modified"), "utf8")).toBe("second");
 });
 
@@ -314,16 +314,9 @@ test("interruption at atomic publication leaves only temporary bytes and cannot 
   } finally { publish.mockRestore(); }
   const pre = await f.call("pre", paths);
   expect(pre).toMatchObject({ ok: true, status: "created" });
-  const seal = spyOn(fs, "linkSync").mockImplementation((source, destination) => {
-    if (String(destination) === path.join(directory, "pause.json")) throw new Error("Interrupted pause publication");
-    return original(source, destination);
-  });
-  try {
-    expect(await f.call("pause")).toMatchObject({ ok: false, error: { message: "Interrupted pause publication" } });
-    expect(existsSync(path.join(directory, "pause.json"))).toBe(false);
-    expect(digest(readFileSync(pre.manifestRef))).toBe(pre.digest);
-  } finally { seal.mockRestore(); }
-  expect(await f.call("pause")).toMatchObject({ ok: true, status: "created", position: { cursor: 0 } });
+  expect(await f.call("pause")).toMatchObject({ ok: false });
+  expect(existsSync(path.join(directory, "pause.json"))).toBe(false);
+  expect(digest(readFileSync(pre.manifestRef))).toBe(pre.digest);
   expect(readFileSync(f.statePath)).toEqual(state);
 });
 
@@ -357,20 +350,13 @@ test("native inspector composition cannot discover or invoke checkpoint writes",
 });
 
 // v3 hashes flattened logical pairs, not the references or attempts in history.
-test("CheckpointIntent v2 evidence has v3 hash parity for the same logical pairs", async () => {
+test("checkpoint evidence hashes logical admitted pairs independent of order", async () => {
   const f = fixture();
   await f.call("pre", paths);
   applyCheckpoint(f.intent, [{ path: "modified", image: { bytes: Buffer.from("owned change").toString("base64"), mode: 0o644 } }]);
-  const v3 = { consumedLoops: 1, admittedResults: [
-    { taskId: "second", status: "blocked", attempt: 1, ref: { key: "older" } },
-    { taskId: "first", status: "complete", attempt: 1, ref: { key: "first" } },
-    { taskId: "second", status: "blocked", attempt: 2, ref: { key: "retry" } },
-    { taskId: "second", status: "continue", attempt: 3, ref: { key: "latest" } },
-  ] };
-  const v2 = { consumedLoops: 1, admitted: { first: ["complete"], second: ["blocked", "continue"] } };
-  const expected = checkpointEvidence([f.intent], v3);
-  expect(checkpointEvidence([f.intent], v2)).toBe(expected);
-  expect(checkpointEvidence([f.intent], { ...v2, admitted: { second: ["continue", "blocked"], first: ["complete"] } })).toBe(expected);
-  expect(checkpointEvidence([f.intent], { ...v2, admitted: { first: ["complete"] } })).not.toBe(expected);
-  expect(checkpointEvidence([f.intent], { ...v2, consumedLoops: 2 })).not.toBe(expected);
+  const progress = { consumedLoops: 1, admitted: { first: ["complete"], second: ["blocked", "continue"] } };
+  const expected = checkpointEvidence([f.intent], progress);
+  expect(checkpointEvidence([f.intent], { ...progress, admitted: { second: ["continue", "blocked"], first: ["complete"] } })).toBe(expected);
+  expect(checkpointEvidence([f.intent], { ...progress, admitted: { first: ["complete"] } })).not.toBe(expected);
+  expect(checkpointEvidence([f.intent], { ...progress, consumedLoops: 2 })).not.toBe(expected);
 });

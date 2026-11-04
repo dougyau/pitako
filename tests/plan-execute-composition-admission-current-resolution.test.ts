@@ -20,11 +20,12 @@ import { handleManagementAction } from "../node_modules/pi-subagents/src/agents/
 import { handleMissionAction } from "../node_modules/pi-subagents/src/missions/actions.js";
 import { captureCheckpoint, sealCheckpoint } from "../extensions/execute-checkpoint.ts";
 import { executeMaxCycles } from "../extensions/execute-settings.ts";
-import registerPlanExecute, { executionResource } from "../extensions/plan-execute.ts";
+import registerPlanExecute, { analysisResource, executionResource } from "../extensions/plan-execute.ts";
+import { verifyGate } from "../extensions/access-receipts.mjs";
 import { profileNote } from "../extensions/profile.ts";
 import { DEFAULT_SKILL_NAMES } from "../extensions/catalog.ts";
 import { checkoutEvidence, digest, MAX_SPEC_BYTES, preliminarySpec, SPEC_SECTIONS, validateSpec } from "../extensions/spec-plans.ts";
-import { planExecute, checkout, synchronousHostRelease, read, assignmentSpec, missionFiles, resourceWithAgentDir, childResponse, compositionFixture, nativeCheckpointFixture } from "./fixtures/plan-execute-composition.ts";
+import { deterministicScripts, planExecute, checkout, synchronousHostRelease, read, assignmentSpec, missionFiles, resourceWithAgentDir, childResponse, compositionFixture, nativeCheckpointFixture } from "./fixtures/plan-execute-composition.ts";
 
 const composition = compositionFixture();
 const { roots, disposers, workflowSettlements, checkpointCancellations, settleWorkflows, checkpointLifecycle, repository } = composition;
@@ -184,7 +185,7 @@ describe("plan/execute packaged composition", () => {
     const source = path.join(root, ".pitako/plans/assignment.md");
     writeFileSync(source, content);
     const observedCandidate = () => { const { head, fingerprint } = checkoutEvidence(root); return { head, fingerprint }; };
-    const metadata = { root, commonDir: path.join(root, ".git"), selected: { source, digest: digest(content) } };
+    const metadata = { ...deterministicScripts, root, commonDir: path.join(root, ".git"), selected: { source, digest: digest(content) } };
     const resource = resourceWithAgentDir(path.join(nativeRoot, "private-agent"));
     const args = { root, id: "assignment", invocation: "human-1", missionId: "native.mission-1", missionPath };
     const closingScript = (value: ReturnType<typeof resource.resolve>) => value.script;
@@ -226,11 +227,10 @@ describe("plan/execute packaged composition", () => {
           screening: { verdict, reason: "Current consequence assessed", assessments: [{ findingId: "a-1", requirement: "spec: selection respects caller input", consequence: "Wrong selection", material: verdict === "material-gaps", reason: "Current caller evidence" }] },
         });
         if (key.endsWith(".director")) {
-          response.structuredOutput.association.missionPath = missionPath;
           if (query) response.structuredOutput.sharedContext.material = "中😀\"\n'; globalThis.recoveryInjected = true; //".repeat(3000);
           originalPlan = structuredClone(response.structuredOutput);
         }
-        if (request.agent === "pitako.checkout-observer" || request.agent === "pitako.request-observer") return response;
+        if (request.agent === "pitako.checkout-observer" || request.agent === "pitako.request-observer" || request.agent === "pitako.checkpoint-sealer" || request.agent === "pitako.access-verifier") return response;
         if (request.phase?.startsWith("review-")) Object.assign(response,
           childResponse(key, request, metadata, observedCandidate(), 1, response.structuredOutput));
         const native = path.join(nativeRoot, response.runId), file = path.join(native, "structured-output/original.json");
@@ -319,7 +319,6 @@ describe("plan/execute packaged composition", () => {
     const compliance = childResponse("invoke-human-1.l1.compliance", { agent: "pitako.reviewer" }, metadata, observedCandidate());
     const next = childResponse("invoke-human-1.l2.director", { agent: "pitako.execution-director" }, metadata, observedCandidate());
     Object.assign(next.structuredOutput, { status: "needs-decision", tasks: [], reason: "Intercept next ordinary director" });
-    next.structuredOutput.association.missionPath = missionPath;
     const queryChildren = query ? Object.fromEntries(["t1.a1", "review.director-prepare", "review.independent-a",
       "review.independent-b", "review.director-synthesis", "compliance"].map(phase => {
         const key = `invoke-human-1.l1.${phase}`;
@@ -339,7 +338,7 @@ describe("plan/execute packaged composition", () => {
           if (input.queryMode === "persistence" && value.loop?.recoveries?.[0]?.stage === "observed") throw Error("Controlled retained-original save failure");
           storage.set(key, structuredClone(value));
         } },
-        launch: async (key, request) => { calls.push(key); if (request.agent === "pitako.checkout-observer") publications.push(JSON.parse(request.task)); let value = request.agent === "pitako.request-observer" ? (${childResponse.toString()})(key, request, input.metadata, input.checkout) : input.children[key]; if (!value) throw Error("Forbidden relaunch: " + key);
+        launch: async (key, request) => { calls.push(key); if (request.agent === "pitako.checkout-observer") publications.push(JSON.parse(request.task)); let value = (request.agent === "pitako.request-observer" || request.agent === "pitako.checkpoint-sealer" || request.agent === "pitako.access-verifier") ? (${childResponse.toString()})(key, request, input.metadata, input.checkout) : input.children[key]; if (!value) throw Error("Forbidden relaunch: " + key);
           if (request.phase?.startsWith("review-")) value = (${childResponse.toString()})(key, request, input.metadata, input.checkout, 1, value.structuredOutput);
           return value; },
         status: async ref => { statuses.push(ref); return { key: ref, runId: ref, ok: true, output: input.queryMode === "unknown-settlement" ? "Current settlement unavailable" : "Run: " + ref + "\\nState: complete", results: [] }; },
@@ -374,7 +373,7 @@ describe("plan/execute packaged composition", () => {
       if (queryMode === "persistence") expect(recovered.result.value.reason).toContain("Essential persistence failed");
       expect(recovered.bytes).toHaveLength(1);
       expect(recovered.bytes.every((bytes: number) => bytes <= 4096)).toBe(true);
-      expect(recovered.calls.filter((key: string) => !key.includes(".requests-"))).toEqual(succeeds ? Object.keys(queryChildren) : []);
+      expect(recovered.calls.filter((key: string) => !key.includes(".requests-") && !key.includes(".review.verify-") && !/\.seal(?:\.r\d+)?$/.test(key))).toEqual(succeeds ? Object.keys(queryChildren) : []);
       expect(recovered.calls.some((key: string) => key.includes(".recover") || key.endsWith(".director"))).toBe(false);
       const after = new Map<string, any>(recovered.storage).get("invoke-human-1");
       expect(after.association).toEqual(before.association);
@@ -625,7 +624,7 @@ describe("plan/execute packaged composition", () => {
     const expanded = resource.resolve(args);
     const changed = resource.resolve({ ...args, amendments: count ? amendments.slice(1) :
       [{ path: ".pitako/amendments/new.md", sha256: "0".repeat(64), provenance: "human new at 2026-10-31T06:12:50Z" }] });
-    const metadata = { root, commonDir: spec.commonDir, selected: { source: spec.source, digest: spec.digest } };
+    const metadata = { ...deterministicScripts, root, commonDir: spec.commonDir, selected: { source: spec.source, digest: spec.digest } };
     const outcome = await nativeCheckpointCase({ ...nativeCheckpointInput(), ...args, statePath,
       metadata, script: expanded.script, changedScript: changed.script, grant: expanded.hostCommands[0], amendments }, `
       async (input, runWorkflowScript, respond, io) => {
@@ -650,7 +649,6 @@ describe("plan/execute packaged composition", () => {
             prompts.push({agent:request.agent,key,task:request.task});
             const result=respond(key,request,input.metadata,candidate);
             if(key.endsWith(".director")){
-              result.structuredOutput.association=JSON.parse(request.task.split("ASSOCIATION (data): ")[1].split("\\n")[0]);
               result.structuredOutput.sharedContext={
                 material:JSON.stringify(input.amendments),references:input.amendments.map(ref=>ref.path)};
               if(!request.task.includes("tasks that may finish without edits, are verification"))
@@ -684,7 +682,7 @@ describe("plan/execute packaged composition", () => {
     expect(observed.mismatch.reason).toContain("Immutable admission amendments changed");
     expect(observed.before.amendments).toEqual(amendments);
     expect(observed.after.amendments).toEqual(amendments);
-    expect(observed.before).toMatchObject({ version: 4, association: { digest: digest(spec.content) } });
+    expect(observed.before).toMatchObject({ version: 5, association: { digest: digest(spec.content) } });
     expect(observed.after.snapshot).toEqual(observed.before.snapshot);
     expect(observed.after.association).toEqual(observed.before.association);
     expect(observed.after.association.sourceRefs).toEqual([]);
@@ -819,7 +817,7 @@ describe("plan/execute packaged composition", () => {
       expect(text).toContain("missionPath"); expect(text).toContain("loop_plan");
       expect(text).toContain("--unblock"); expect(text).not.toContain("effective-profile preflight");
     }
-    expect(skill.replace(/\s+/g, " ")).toContain("`Mission record path (pitako.execute args.missionPath): <path>`");
+    expect(skill.replace(/\s+/g, " ")).toContain("`Mission record path (args.missionPath): <path>`");
     expect(skill.replace(/\s+/g, " ")).toContain("the `State:` line is NOT the mission path");
     expect(skill.replace(/\s+/g, " ")).toContain("all mission management and run reconciliation calls");
     expect(skill).toContain("never derive a storage path");
@@ -1128,8 +1126,8 @@ describe("plan/execute packaged composition", () => {
     }
     const chosen = await execute(selected);
     expect(chosen.value).toMatchObject({ status: "complete" });
-    expect(chosen.storage.get("invoke-human-1")).toMatchObject({ association: { source: selected, digest: digest(content) }, version: 4 });
-    expect(chosen.storage.get("pitako-execution")).toMatchObject({ version: 4, association: { root, commonDir: path.join(main, ".git") } });
+    expect(chosen.storage.get("invoke-human-1")).toMatchObject({ association: { source: selected, digest: digest(content) }, version: 5 });
+    expect(chosen.storage.get("pitako-execution")).toMatchObject({ version: 5, association: { root, commonDir: path.join(main, ".git") } });
     expect(chosen.envelopes).toHaveLength(1);
     expect(JSON.parse(chosen.envelopes[0]!).binding).toBe(preliminarySpec(root, "assignment", selected).binding);
   }
@@ -1145,7 +1143,7 @@ describe("plan/execute packaged composition", () => {
     mkdirSync(path.dirname(source), { recursive: true }); writeFileSync(source, content);
     const preliminary = preliminarySpec(root, "assignment");
     const selected = { source, digest: digest(content) };
-    const metadata = { root, commonDir: preliminary.commonDir, selected };
+    const metadata = { ...deterministicScripts, root, commonDir: preliminary.commonDir, selected };
     const expanded = executionResource().resolve({ root, id: "assignment", invocation: "human-1", missionId: "native.mission-1", missionPath: "/native/actual-mission.json" });
     expect(expanded.hostCommands).toHaveLength(3);
     const grants = new Map(expanded.hostCommands.map(grant => [grant.key, grant.command]));
@@ -1154,7 +1152,7 @@ describe("plan/execute packaged composition", () => {
       state: { get: key => storage.get(key), set: (key, value) => { storage.set(key, structuredClone(value)); } },
       launch: async (key, request) => {
         if (key.endsWith(".director")) expect(request.task).toContain(JSON.stringify(selected.source));
-        if (!request.resume && request.agent !== "pitako.checkout-observer" && request.agent !== "pitako.request-observer") expect(request.task).toContain(content);
+        if (!request.resume && request.agent !== "pitako.checkout-observer" && request.agent !== "pitako.request-observer" && request.agent !== "pitako.checkpoint-sealer" && request.agent !== "pitako.access-verifier") expect(request.task).toContain(content);
         return childResponse(key, request, metadata, checkout, 3);
 
       },
@@ -1186,7 +1184,7 @@ describe("plan/execute packaged composition", () => {
       const args = { root, id: "assignment", invocation: "human-1", missionId: "native.mission-1", missionPath: "/native/actual-mission.json" };
       const resolved = resolveWorkflowResource("pitako.execute", args, sessionId);
       if (!resolved.ok) throw Error(resolved.error);
-      const metadata = { root, commonDir: path.join(root, ".git"), candidates: [],
+      const metadata = { ...deterministicScripts, root, commonDir: path.join(root, ".git"), candidates: [],
         selected: { source: `${root}/.pitako/plans/assignment.md`, digest: digest(spec.content), chunks: 1 } };
       const storage = new Map<string, any>(), calls: string[] = [], originals: any[] = [], archivedLoops: any[] = [];
       const invalidDependency = mode.startsWith("invalid-dependency");
@@ -1208,6 +1206,7 @@ describe("plan/execute packaged composition", () => {
           if (key.endsWith(".director")) {
             const final = response.structuredOutput.tasks[0];
             const change = { ...structuredClone(final), id: "change", kind: "implementation", expectedResult: "Implement the scoped behavior" };
+            change.checks[0].tier = "focused";
             final.dependsOn = [{ taskId: "change", reason: "Verify the implemented candidate" }];
             if (invalidDependency) change.dependsOn = [{ taskId: "final", reason: "Invalid forward prerequisite" }];
             response.structuredOutput.tasks.unshift(change);
@@ -1215,16 +1214,15 @@ describe("plan/execute packaged composition", () => {
           }
           if (request.agent === "pitako.worker") {
             const task = JSON.parse(String(request.task).split("COMPLETE SELECTED TASK:\n")[1]!.split("\nFROZEN ATTEMPT")[0]!);
+            // The cached original carries no association echo; the root attaches it.
             expect(storage.get("invoke-human-1").activePlan).toEqual(published);
             const value = response.structuredOutput;
-            value.taskId = task.id;
             if (task.kind === "implementation") {
               // New modifying dispatches require real sealed bytes, even at a
               // controlled child boundary with no additional file effects.
               const intent = storage.get("invoke-human-1").loop.attempt.checkpoint;
               captureCheckpoint(intent, ["owned"]);
-              value.checkpointReceipt = sealCheckpoint(intent, "unit", true);
-              value.git.checkpoints.push(value.checkpointReceipt.checkpointRef);
+              expect((request.outputSchema as any).properties).not.toHaveProperty("checkpointReceipt");
             }
             const mandatory = value.checks[0];
             if (mode === "descriptive") mandatory.requirement = "Observed behavior rather than canonical wording";
@@ -1245,7 +1243,7 @@ describe("plan/execute packaged composition", () => {
               if (mode === "duplicate") value.checks.push(structuredClone(mandatory));
               if (mode === "malformed-later") value.checks.at(-1).output = "";
               if (mode === "producer-conflict") response.agent = "pitako.reviewer";
-              if (mode === "binding-conflict") response.output = JSON.stringify({ ...value, attempt: 99 });
+              if (mode === "binding-conflict") response.output = JSON.stringify({ ...value, workDone: "Different complete binding" });
             } else {
               const completed = storage.get("invoke-human-1").tasks.change.completed;
               expect(completed).toMatchObject({ taskId: "change", status: "complete", checks: { current: true, count: 4, passed: 2, failed: 1, notRun: 1 } });
@@ -1268,7 +1266,7 @@ describe("plan/execute packaged composition", () => {
         loopsConsumed: rejected ? 3 : invalidDependency ? 2 : 1 });
       if (rejected) for (const loop of archivedLoops) expect(loop).toMatchObject({
         results: [{ taskId: "change", status: "rejected", rejection: expect.any(String) }] });
-      expect(calls.filter(key => /\.t\d+\.a/.test(key))).toEqual(invalidDependency ? [] : valid ?
+      expect(calls.filter(key => /\.t\d+\.a\d+$/.test(key))).toEqual(invalidDependency ? [] : valid ?
         ["invoke-human-1.l1.t1.a1", "invoke-human-1.l1.t2.a1"] : rejected ? [1, 2, 3].map(loop => `invoke-human-1.l${loop}.t1.a1`)
         : ["invoke-human-1.l1.t1.a1"]);
       expect(calls.filter(key => key.endsWith(".director"))).toHaveLength(rejected ? 3 : invalidDependency ? 2 : 1);
@@ -1309,7 +1307,7 @@ describe("plan/execute packaged composition", () => {
 
   test("registered amendment context reaches verify-behavior workers and whole-spec review/compliance assembly", async () => {
     const root = repository(), spec = assignmentSpec(root);
-    const metadata = { root, commonDir: path.join(root, ".git"), candidates: [],
+    const metadata = { ...deterministicScripts, root, commonDir: path.join(root, ".git"), candidates: [],
       selected: { source: `${root}/.pitako/plans/assignment.md`, digest: digest(spec.content), chunks: 1 } };
     const expanded = executionResource().resolve({ root, id: "assignment", invocation: "human-1", missionId: "native.mission-1", missionPath: "/native/actual-mission.json" });
     const review = read("skills/review/workflow.js"), execute = read("skills/execute/workflow.js");
@@ -1329,7 +1327,7 @@ A1 supersedes native-resume-first recovery; preserve the missing historical befo
         expect(request.cwd).toBe(root); expect(request.outputSchema).toBeDefined();
         const response = childResponse(key, request, metadata, checkout);
         if (key.endsWith(".director")) response.structuredOutput.sharedContext = amendmentContext;
-        else if (!request.resume && request.agent !== "pitako.checkout-observer" && request.agent !== "pitako.execution-ledger" && request.agent !== "pitako.request-observer") {
+        else if (!request.resume && request.agent !== "pitako.checkout-observer" && request.agent !== "pitako.execution-ledger" && request.agent !== "pitako.request-observer" && request.agent !== "pitako.checkpoint-sealer" && request.agent !== "pitako.access-verifier") {
           expect(request.task, key).toContain(amendmentPath);
           expect(request.task, key).toContain(digest(amendmentBody));
           expect(request.task, key).toContain("Current human delivered A1 before plan publication");
@@ -1345,7 +1343,7 @@ A1 supersedes native-resume-first recovery; preserve the missing historical befo
       },
     });
     expect(result.value).toMatchObject({ status: "complete", loopsConsumed: 1, actionRequired: "none" });
-    expect(calls.filter(call => call.agent !== "pitako.request-observer").map(call => call.key)).toEqual(["invoke-human-1.l1.director", "invoke-human-1.l1.t1.a1",
+    expect(calls.filter(call => call.agent !== "pitako.request-observer" && call.agent !== "pitako.checkpoint-sealer" && call.agent !== "pitako.access-verifier").map(call => call.key)).toEqual(["invoke-human-1.l1.director", "invoke-human-1.l1.t1.a1",
       "invoke-human-1.l1.review.director-prepare", "invoke-human-1.l1.review.independent-a", "invoke-human-1.l1.review.independent-b",
       "invoke-human-1.l1.review.director-synthesis", "invoke-human-1.l1.compliance", "invoke-human-1.l1.checkout"]);
     expect(inspections).toEqual(["inspect-initial"]);
@@ -1367,7 +1365,7 @@ A1 supersedes native-resume-first recovery; preserve the missing historical befo
       return [agent.name.replace("pitako.", ""), buildEffectiveSystemPrompt({ agent, resolvedSkills: resolved, cwd: root })];
     }));
     const priorContexts = new Map<string, string>();
-    for (const call of calls.filter(call => call.agent !== "pitako.checkout-observer" && call.agent !== "pitako.request-observer")) {
+    for (const call of calls.filter(call => call.agent !== "pitako.checkout-observer" && call.agent !== "pitako.request-observer" && call.agent !== "pitako.checkpoint-sealer" && call.agent !== "pitako.access-verifier")) {
       const role = (call.agent ?? "pitako.reviewer").replace("pitako.", "");
       const assembled = [read("AGENTS.md"), bodies.get(role),
         call.resume ? priorContexts.get(call.resume) : "", call.task].join("\n");
@@ -1628,8 +1626,10 @@ A1 supersedes native-resume-first recovery; preserve the missing historical befo
     expect(worker.extensions).toBeNull();
     expect(worker.subagentOnlyExtensions).toEqual(["../extensions/dev-tools/index.ts", "../extensions/file-sha256.ts", "../extensions/checkpoint-create.ts", "../extensions/todo.ts", "../node_modules/@vndv/pi-codegraph/extensions/codegraph.ts", "../node_modules/pi-lsp-client/src/index.ts", "../node_modules/@nicknisi/pi-ast-grep/index.ts", "../node_modules/pi-codex-tools/index.ts"]);
     for (const provider of worker.subagentOnlyExtensions as string[]) expect(existsSync(path.resolve("agents", provider))).toBe(true);
-    for (const contract of ["single writer thread", "pause and escalate", "Ponytail in FULL mode", "schema/reporting", "edit/write"])
+    for (const contract of ["single writer thread", "pause and escalate", "Ponytail in FULL mode", "schema/reporting", "edit/write",
+      "never call unit/pause"])
       expect(body).toContain(contract);
+    for (const removed of ['checkpoint_create({kind:"unit"})', 'checkpoint_create({kind:"pause"})']) expect(body).not.toContain(removed);
     for (const role of ["architect", "execution-director", "reviewer"]) {
       const profile = parseFrontmatter(read(`agents/${role}.md`));
       expect(profile.frontmatter.skills).toContain("ponytail");
@@ -1710,7 +1710,7 @@ test("model-visible mission output yields the record path the launch hook admits
   const launch = (missionPath: string) => handlers.get("tool_call")!({ toolName: "subagent", input: {
     workflow: "pitako.execute", cwd: root, args: { id: "assignment", root, invocation: "human-1", missionId, missionPath }, options: { missionId } } }, { cwd: root });
   for (const { text, details } of [created, shown]) {
-    const visible = /^Mission record path \(pitako\.execute args\.missionPath\): (.+)$/m.exec(text)?.[1];
+    const visible = /^Mission record path \(args\.missionPath\): (.+)$/m.exec(text)?.[1];
     expect(visible).toBe(details.missionPath);
     expect(text.split(details.missionPath).length).toBe(2);
     expect(launch(visible!)).toBeUndefined();
@@ -1726,34 +1726,46 @@ test("model-visible mission output yields the record path the launch hook admits
 describe("packaged workflow caller examples", () => {
   test.each([false, true])("architecture examples admit complete decisions and explicit continuation (planning=%s)", async planning => {
     const root = mkdtempSync(path.join(tmpdir(), "pitako-guidance-")); roots.push(root);
-    const blocks = [...read("skills/architecture/SKILL.md").matchAll(/```js\n([\s\S]*?)```/g)].map(match => match[1]!);
+    const [creationBlock, ...blocks] = [...read("skills/architecture/SKILL.md").matchAll(/```js\n([\s\S]*?)```/g)].map(match => match[1]!);
     const calls: any[] = [], storage = new Map<string, any>();
     const capture = (input: any) => { calls.push(input); };
+    new Function("subagent", creationBlock!)(capture);
+    expect(calls.pop()).toMatchObject({ action: "mission.create", options: { mission: { title: expect.stringContaining("parser") } } });
+    const { missionPath } = missionFiles(root);
     new Function("subagent", blocks[0]!)(capture);
     const initial = calls.pop();
-    expect(initial.options.mission.title).toContain("parser");
+    expect(initial).toMatchObject({ workflow: "pitako.architecture", options: { missionId: initial.args.missionId } });
     expect(initial.async).toBe(true);
     expect(initial.args.brief).toBeUndefined();
     initial.args.planning = planning;
     const launches: any[] = [];
     let sequence = 0;
     const run = async (args: any) => {
-      const result = await runWorkflowScript({ script: read("skills/architecture/workflow.js"), args,
+      // The named resource inlines args and the mission binding; raw script paths refuse.
+      const resolved = analysisResource("pitako.architecture").resolve({ ...args, missionId: "native.mission-1", missionPath });
+      const result = await runWorkflowScript({ script: resolved.script,
         state: { get: key => storage.get(key), set: (key, value) => { storage.set(key, structuredClone(value)); } },
         launch: async (key, request) => {
+          if (request.agent === "pitako.access-verifier") return { key, ok: true, agent: request.agent, runId: `verify-${++sequence}`,
+            output: JSON.stringify(verifyGate(JSON.parse(String(request.task)))), artifactPaths: [],
+            results: [{ index: 0, agent: request.agent, task: String(request.task), exitCode: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } }] };
           launches.push(request);
           if (typeof request.task !== "string" || typeof request.label !== "string") throw Error("Expected architecture task and label");
           if (request.agent !== undefined && typeof request.agent !== "string") throw Error("Expected named architecture agent");
-          const contract = JSON.parse(request.task.match(/ORIGINAL CONTRACT: (.*)\n/)![1]!);
-          const essentials = JSON.parse(request.task.match(/ESSENTIAL ORIGINALS \(data; one authoritative representation per original\): (.*)\n/)![1]!);
-          const access = essentials.map((entry: any) => {
-            const exact = JSON.parse(readFileSync(entry.results.find((item: any) => item.savedOutputPath).savedOutputPath, "utf8"));
-            expect(exact.association.key).toBe(entry.key);
-            expect(exact.association.revision).toBe(entry.revision);
-            return { id: entry.id, state: "accessible", source: "read", reason: "Exact published original retrieved" };
-          });
+          for (const field of ["association", "delivery", "access"])
+            expect(request.outputSchema).not.toHaveProperty("properties." + field);
+          const references = request.task.match(/VERIFIED ESSENTIAL ORIGINALS \(references; receipt [^)]*\): (.*)\n/);
+          for (const entry of references ? JSON.parse(references[1]!) : []) {
+            expect(Object.keys(entry).sort()).toEqual(["digest", "id", "path"]);
+            const exact = JSON.parse(readFileSync(entry.path, "utf8"));
+            const admitted = storage.get(`architecture-${args.consultation}`).originals.find((item: any) => item.id === entry.id);
+            expect(admitted.association.revision).toBe(Number(entry.id.split(".v")[1].split(".")[0]));
+            expect(admitted.runId).toMatch(/^example-/);
+            expect(admitted.delivery).toBe("complete");
+            expect(exact).toEqual(admitted.value);
+          }
           const first = request.phase === "architecture-prepare" && storage.get(`architecture-${args.consultation}`).rounds === 0;
-          const value = { ...contract, access, ...(request.phase === "architecture-doubts"
+          const value = { ...(request.phase === "architecture-doubts"
             ? { doubts: [], humanContext: "No pending human frontier" }
             : request.phase === "architecture-perspective" ? { status: "ready", report: "Full independent reasons and contrary narrative" }
             : { action: first ? "discuss" : "finish", perspectives: first ? [
@@ -1806,13 +1818,19 @@ describe("packaged workflow caller examples", () => {
   });
 
   test("review launch example reaches the real controller with concrete title and complete target", async () => {
-    let input: any;
-    const block = read("skills/review/SKILL.md").match(/```js\n([\s\S]*?)```/)![1]!;
-    new Function("subagent", block)((value: any) => { input = value; });
+    const calls: any[] = [];
+    for (const [, block] of read("skills/review/SKILL.md").matchAll(/```js\n([\s\S]*?)```/g))
+      new Function("subagent", block!)((value: any) => { calls.push(value); });
+    const [creation, input] = calls;
+    expect(creation).toMatchObject({ action: "mission.create", options: { mission: { title: expect.stringContaining("parser") } } });
+    expect(input).toMatchObject({ workflow: "pitako.review", async: true, options: { missionId: input.args.missionId } });
     const launches: any[] = [];
     const persisted = new Map<string, any>();
-    expect(input.options.mission.title).toContain("parser");
-    const result = await runWorkflowScript({ script: read("skills/review/workflow.js"), args: input.args,
+    const store = mkdtempSync(path.join(tmpdir(), "pitako-review-launch-")); roots.push(store);
+    const { missionPath } = missionFiles(store);
+    // The named resource inlines args and the mission binding; the raw path alone refuses.
+    const resolved = analysisResource("pitako.review").resolve({ ...input.args, missionId: "native.mission-1", missionPath });
+    const result = await runWorkflowScript({ script: resolved.script,
       state: { get: key => persisted.get(key), set: (key, value) => { persisted.set(key, structuredClone(value)); } },
       launch: async (key, request) => { launches.push(request); return { key, ok: false, output: "", artifactPaths: [], error: "Controlled terminal failure, no original delivered" }; },
       status: async () => { throw Error("Status preview is not an original"); } });
@@ -1827,7 +1845,7 @@ describe("packaged workflow caller examples", () => {
       expect(read(file)).toContain("workDescription");
     const plan = read("skills/plan/SKILL.md").replace(/\s+/g, " ");
     expect(plan).toContain("args: { currentDecision, workDescription:");
-    expect(plan).toContain("exact returned version-2 `continuation`");
+    expect(plan).toContain("exact returned version-3 `continuation`");
     for (const instruction of [
       "On `needs-human`", "`status.json` at `workflow.value`", "ENTIRE frontier in one round",
       "actual per-ID human provenance", "`humanAnswers: { consultation, revision, round, answers }`",
@@ -1985,11 +2003,16 @@ describe("deterministic observer", () => {
       expect(() => registerAgent({ pi: pi as unknown as ExtensionAPI, name: requests[0].name, definition })).toThrow();
       expect(disposed).toBe(0);
       hooks.get("session_start")!({}, first);
-      expect(disposed).toBe(3); expect(otherDisposed).toBe(0);
+      // Five deterministic agents: observer, ledger, request observer, sealer, access verifier.
+      expect(requests.slice(0, 5).map(request => request.name)).toEqual(["pitako.checkout-observer", "pitako.execution-ledger",
+        "pitako.request-observer", "pitako.checkpoint-sealer", "pitako.access-verifier"]);
+      expect(requests[4].definition.runner).toEqual({ type: "external-cli", command: process.execPath,
+        args: [path.resolve("extensions/access-receipts.mjs"), "--verify-stdin"], promptDelivery: "stdin" });
+      expect(disposed).toBe(5); expect(otherDisposed).toBe(0);
       hooks.get("session_shutdown")!(); hooks.get("session_shutdown")!();
-      expect(disposed).toBe(6); expect(otherDisposed).toBe(0);
+      expect(disposed).toBe(10); expect(otherDisposed).toBe(0);
     } finally { hooks.get("session_shutdown")!(); otherHooks.get("session_shutdown")!(); }
-    expect(otherDisposed).toBe(3);
+    expect(otherDisposed).toBe(5);
   });
 
   test("deterministic agents report conflicts and native rejection without fallback or replacement", () => {
@@ -2109,7 +2132,7 @@ describe("plan/execute packaged composition", () => {
       expect(initialAuthority.authority.host?.length).toBeGreaterThan(0);
       expect(resumedAuthority.authority.host).toEqual(initialAuthority.authority.host);
       const content = spec.content;
-      const metadata = { root, commonDir: path.join(root, ".git"), candidates: [],
+      const metadata = { ...deterministicScripts, root, commonDir: path.join(root, ".git"), candidates: [],
         selected: { source: `${root}/.pitako/plans/assignment.md`, digest: digest(content), chunks: 1 } };
       const children: Record<string, any> = {};
       for (const loop of [1, 2]) for (const phase of [...loop > 1 ? ["demand-observation"] : [], "director", "t1.a1", "review.director-prepare", "review.independent-a", "review.independent-b", "review.director-synthesis", "compliance", "checkout"]) {
@@ -2174,7 +2197,7 @@ describe("plan/execute packaged composition", () => {
                   workerResult: null, originalAvailable: !input.mode.endsWith("unknown"), binding: "absent",
                   comparison: input.mode.endsWith("unknown") ? "neither" : "only-original", provenance: [original.runId] } };
             }
-            let response = request.agent === "pitako.request-observer" ? respond(key, request, input.metadata, input.checkout) : structuredClone(input.children[key]);
+            let response = (request.agent === "pitako.request-observer" || request.agent === "pitako.checkpoint-sealer" || request.agent === "pitako.access-verifier") ? respond(key, request, input.metadata, input.checkout) : structuredClone(input.children[key]);
             if (!response) throw Error("Unexpected child " + key);
             if (request.agent === "pitako.checkout-observer") {
               const observation = JSON.parse(response.output);

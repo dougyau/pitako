@@ -50,15 +50,13 @@ Only regular files and absence are supported; unsupported types remain explicit
 gaps. A missing checkpoint cannot be reconstructed from HEAD plus fingerprint.
 
 Capture actual affected-file bytes, including earlier WIP, before modifying.
-For implementation tasks, after owned writes settle, call `checkpoint_create({kind:"unit"})` and return its
-actual structured `checkpointReceipt`, retaining `checkpointRef` in `git.checkpoints`.
-Verification tasks without checkout writes return no `checkpointReceipt`, while every planned check still reports captured before/after `checkoutEvidence`.
-The tool seals task/cursor/admitted-progress references; it does not admit results,
-confirm completion or move the cursor. Only root durable result admission confirms
-the new continuation point. A normal cooperative pause may call
-`checkpoint_create({kind:"pause"})` and return its actual receipt with non-complete
-status only while native control permits capture, without extra task edits.
-Pause position remains pending. Its receipt saves WIP, not a human impediment.
+After journaled writes settle, return a decision-only worker report. The root dispatches
+`pitako.checkpoint-sealer` to observe the candidate and seal `unit` for valid complete
+reports or `pause` for pending work; workers never call unit/pause or echo receipts,
+final candidate identity, task/attempt identity, Git HEAD or checkpoint references.
+Verification tasks without checkout writes need no pre-capture. Every planned check
+still records captured before/after `checkoutEvidence`. Only durable root admission
+confirms a continuation point; a seal alone never moves the cursor.
 Useful `continue` work follows the same-task continuation path without human input.
 `gaps` or exhausted useful continuation reaches the next director within the
 admitted budget. Only an actual `blocked` result or native barrier halts work;
@@ -227,7 +225,7 @@ subagent({
 Retain BOTH the actual returned missionId and missionPath from mission.create or
 mission.show; never derive a storage path. Native returns missionPath only in
 result details, so Pitako appends it to the visible text as `Mission record path
-(pitako.execute args.missionPath): <path>`. Copy that exact path; the `State:`
+(args.missionPath): <path>`. Copy that exact path; the `State:`
 line is NOT the mission path. Carry the same missionId in args and options and
 actual missionPath in args. This is DATA association, not approval or
 confinement. Native validates the mission; the launch hook rejects a missionPath
@@ -330,8 +328,11 @@ director. That director publishes one schema-bound COMPLETE `loop_plan`, then
 ends before workers. It does not delegate, maintain private TODOs, run checks or
 review, or supervise implementation. The full plan contains shared context and
 ordered stable task IDs, scopes/effects, sources, expected results and checks,
-including final verification even when the implementation exists. It is the
-only task definition; the root's derived ID/order manifest is not another plan.
+including final verification even when the implementation exists. Each check
+has a tier: earlier tasks carry only `focused` checks; the project's complete
+procedure is `acceptance`: the last task needs at least one and no earlier task may carry it (the root rejects
+other plans). It is the only task definition; the root's derived ID/order
+manifest is not another plan.
 
 A new never-admitted plan is first published, with settled producer, exact
 association and consistent complete original/binding links established before
@@ -350,13 +351,14 @@ does not qualify; exact settled recovery can establish eligibility. Admitted
 contracts are never repaired or migrated through this path.
 
 A worker report that breaks the result contract, such as a check command that
-differs from the plan, missing candidate identities or a missing implementation unit seal, is a
+differs from the plan, missing per-check identities or a missing implementation pre-capture, is a
 rejected attempt, not a root halt. Its original stays in the native record and
 nothing from it is admitted. The loop ends as `gaps` with the exact reason, and
 the next director repeats only the affected work without rewriting planned checks.
-A valid seal whose kind contradicts the status (a unit with non-complete status,
-or a pause with complete) is likewise a rejected attempt. Identity, binding,
-restoration and seal conflicts still halt.
+The root chooses seal kinds from the report, not worker echoes. Identity, binding,
+restoration and journal-integrity conflicts still halt. A journal mismatch reports
+up to ten paths with journaled and actual sha256 (or absence) and partial-application
+state. Return the files to their journaled bytes and resume, or start a new mission.
 
 Each new task has one concrete observable `expectedResult` and mandatory
 `dependsOn: [{taskId, reason}]` (or `[]`). Split separable outcomes, not coordinated
@@ -401,9 +403,9 @@ checks or native permissions. Workers write no diaries, choose no next task and
 launch no reviewer. Their `todo` tool displays only their own steps, projected
 under the active task; it is not evidence. The structured result is authoritative,
 and a cancelled or deleted step never drops required work or checks. They report
-task/attempt, work done, concrete
-pending work, causal diagnosis, Git/checkpoints/WIP, actual command/cwd/output/
-logs/result and checkoutEvidence identity around checks and after final writes.
+work done, concrete pending work, causal diagnosis, Git WIP, actual
+command/cwd/output/logs/result and checkoutEvidence identity around checks; the
+root attaches task/attempt and observes the final candidate through the sealer.
 The plan owns canonical check requirements by ID; optional descriptive echoes
 remain unchanged in originals. Coverage is inclusion, not a check-count match.
 Mandatory checks require current valid before/after candidate identities.
@@ -533,19 +535,18 @@ is strictly read-only: Pi 1.4.0's public SettingsManager catches load errors and
 may migrate known fields, so this boundary reads the JSON without constructing
 that manager or writing settings.
 
-Version-3 native association freezes the admitted maximum before director
+The native association freezes the admitted maximum before director
 consumption. All dispatch, recovery, contexts and reports use that value:
 `Loop n de max` and consumed/max. Settings edits, pauses and wakes cannot renew
-or change it. Legacy version-2 records retain fixed-three semantics without
-settings reads, migration or backfill. A later human-authorized invocation may
+or change it. A later human-authorized invocation may
 admit a different limit; incompatible associations are diagnosed, not rewritten.
 Early fulfillment closes with no more loops; last-slot gaps return partial and
 require a new human invocation. Persistence, Stop, permissions, decisions and
 actual native capacity outrank exhaustion.
 
 The initial inspector reads settings only for a new, not-yet-frozen invocation
-or its exactly associated interrupted admission. An admitted association, including
-legacy version 2, bypasses both settings files. Partial/conflicting state is not
+or its exactly associated interrupted admission. An admitted association bypasses
+both settings files. Partial/conflicting state is not
 new admission; a missing admission receipt never supplies a default.
 
 New admissions use one initial host operation, no initial child, and one native
@@ -618,7 +619,9 @@ original full structuredOutput, not previews. Cache at most the identical active
 plan when it fits the ENTIRE 256 KiB native state file. Essential snapshot/frozen
 descriptor/progress persistence failure blocks unsafe dispatch.
 Closed-loop history goes to a verified ledger; superseded recovery data is
-archived then discarded. New runs use v4, with no migration of retained v2/v3.
+archived then discarded. Execute state uses one contract version (v5). Older
+retained state fails before any resume or dispatch: "created by an incompatible
+Pitako contract vN; start a new mission". Nothing is migrated.
 Keep current task/control progress and usage totals, not a closed-loop array.
 Full completed results live once per task; completed attempts reference them,
 while pending tasks retain the last result for continuation. Closing record

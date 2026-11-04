@@ -5,6 +5,7 @@ import { registerAgentViaEvents, type RuntimeAgentRegistration } from "pi-subage
 import { registerWorkflowResource, type WorkflowResourceRegistration } from "pi-subagents/workflow-resources";
 import { designatedWorkspace, executionAmendments, preliminarySpec, validatePlanId, validateSpec } from "./spec-plans.ts";
 import { boundRetainedAnalyses } from "./execute-retained.ts";
+import { EXECUTE_STATE_VERSION } from "./execute-state.ts";
 import { packageRoot } from "./stack.ts";
 
 function inspectionCommand(args: string[], platform: NodeJS.Platform): string {
@@ -16,7 +17,7 @@ function inspectionCommand(args: string[], platform: NodeJS.Platform): string {
 function isMissionId(value: unknown): value is string {
   return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value) && !value.includes("..");
 }
-const RECORD_LINE = "Mission record path (pitako.execute args.missionPath): ";
+const RECORD_LINE = "Mission record path (args.missionPath): ";
 /**
  * Checkpoints resolve execute state beside the native record (execute-state.ts), so only the
  * existing record `<store>/<missionId>.json` qualifies. Native validates options.missionId,
@@ -77,24 +78,70 @@ export function executionResource(platform: NodeJS.Platform = process.platform) 
     const config = { root: preliminary.root, id: args.id, invocation: args.invocation, missionId: args.missionId, missionPath: args.missionPath, sourceRefs, amendments, inspections, preliminary, ...(recovery ? { recovery } : {}),
       // Derived from the same bytes the root binds at admission; advisory only.
       originalProblem: validateSpec(preliminary.content, args.id),
-      checkpointHelper: path.join(packageRoot(), "skills/execute/checkpoint.mjs"),
+      checkpointHelper: path.join(packageRoot(), "skills/execute/checkpoint.mjs"), stateVersion: EXECUTE_STATE_VERSION,
       ...(args.unblock === true ? { unblock: true, resolution: args.resolution } : {}) };
     return { script: `const config = ${JSON.stringify(config)};\nconst pitakoReviewLibraryMode = true;\n${reviewScript}\n${rootScript}`,
       hostCommands: inspections };
   } };
 }
+const ANALYSIS_WORKFLOWS = {
+  "pitako.review": { source: "skills/review/workflow.js", namespace: () => "review" },
+  "pitako.architecture": { source: "skills/architecture/workflow.js",
+    namespace: (args: Readonly<Record<string, unknown>>) => {
+      if (typeof args.consultation !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(args.consultation))
+        throw new Error("Provide a stable architecture consultation ID.");
+      return `architecture-${args.consultation}`;
+    } },
+} as const;
+/**
+ * Review and architecture run only as named resources with a pre-created mission:
+ * receipts need the resolve-time mission record path and a receipt namespace.
+ * The trusted source is read at setup; args are inlined as data.
+ */
+export function analysisResource(name: keyof typeof ANALYSIS_WORKFLOWS) {
+  const workflow = ANALYSIS_WORKFLOWS[name];
+  const source = readFileSync(path.join(packageRoot(), workflow.source), "utf8");
+  return { name, version: 1, resolve(args: Readonly<Record<string, unknown>>) {
+    const { missionId, missionPath, ...input } = args;
+    if (!isMissionId(missionId)) throw new Error(`${name} requires an existing native missionId from mission.create.`);
+    if (typeof missionPath !== "string" || !path.isAbsolute(missionPath) || missionPath.includes("\0") ||
+        path.basename(missionPath) !== `${missionId}.json`)
+      throw new Error(`${name} requires the actual mission record path returned by mission.create or mission.show.`);
+    const access = { missionPath, namespace: workflow.namespace(input) };
+    return { script: `const args = ${JSON.stringify(input)};\nconst pitakoAccess = ${JSON.stringify(access)};\n${source}` };
+  } };
+}
+const NAMED_WORKFLOWS = ["pitako.execute", ...Object.keys(ANALYSIS_WORKFLOWS)];
+type RuntimeAgent = { name: string; description: string; systemPrompt: string; args: string[] };
+const RUNTIME_AGENTS: RuntimeAgent[] = [
+  { name: "pitako.checkout-observer", description: "Deterministic actual-cwd checkout evidence; no model or prompt execution.",
+    systemPrompt: "Fixed actual-cwd observer and ledger publisher; stdin is a JSON {expected, body} request, never a workspace selector.",
+    args: ["skills/execute/observe.mjs"] },
+  { name: "pitako.execution-ledger", description: "Deterministic hash-chained execution ledger publication; no model execution.",
+    systemPrompt: "Fixed execution ledger; stdin is a JSON publication request.", args: ["skills/execute/ledger.mjs"] },
+  { name: "pitako.request-observer", description: "Deterministic main-session execute request reader; no model execution.",
+    systemPrompt: "Fixed execute request observer; stdin is JSON {invocation, cursor}.", args: ["skills/execute/observe.mjs", "--requests"] },
+  { name: "pitako.checkpoint-sealer", description: "Deterministic checkpoint journal verification and seal metadata publication; no model execution.",
+    systemPrompt: "Fixed checkpoint sealer; stdin is a JSON {v, intent, kind, restoreSources?} request.", args: ["skills/execute/checkpoint.mjs", "--seal-stdin"] },
+  { name: "pitako.access-verifier", description: "Deterministic access receipt verification of published originals; no model execution.",
+    systemPrompt: "Fixed access verifier; stdin is a JSON {missionPath, namespace, gate, items} request.", args: ["extensions/access-receipts.mjs", "--verify-stdin"] },
+];
 export default function planExecute(pi: ExtensionAPI): void {
   pi.on("tool_call", (event, ctx) => {
     if (event.toolName !== "subagent") return;
     const input = event.input as { workflow?: unknown; cwd?: unknown; args?: { missionId?: unknown; missionPath?: unknown; root?: unknown; unblock?: unknown }; options?: { missionId?: unknown; mission?: unknown } };
-    if (typeof input.workflow !== "string" || input.workflow.trim() !== "pitako.execute") return;
+    const name = typeof input.workflow === "string" ? input.workflow.trim() : undefined;
+    if (!name || !NAMED_WORKFLOWS.includes(name)) return;
     const options = input.options;
-    try { validateResolution(input.args ?? {}); }
-    catch (error) { return { block: true, reason: String(error instanceof Error ? error.message : error) }; }
+    if (name === "pitako.execute") {
+      try { validateResolution(input.args ?? {}); }
+      catch (error) { return { block: true, reason: String(error instanceof Error ? error.message : error) }; }
+    }
     if (options?.mission !== undefined || !isMissionId(input.args?.missionId) || input.args.missionId !== options?.missionId)
-      return { block: true, reason: "pitako.execute requires a mission already created via mission.create, with the same native missionId in args and options. One-step mission creation is unsupported; this is data association, not approval or confinement." };
+      return { block: true, reason: `${name} requires a mission already created via mission.create, with the same native missionId in args and options. One-step mission creation is unsupported; this is data association, not approval or confinement.` };
     try {
       validateMissionRecord(input.args.missionId, input.args.missionPath);
+      if (name !== "pitako.execute") return;
       if (typeof input.args?.root !== "string" || (input.cwd !== undefined && typeof input.cwd !== "string")) throw new Error("Expected designated root and launch cwd.");
       // The resolver receives args only. The public tool call owns the actual launch cwd.
       const launch = input.cwd ? path.resolve(ctx.cwd, input.cwd) : ctx.cwd;
@@ -113,52 +160,30 @@ export default function planExecute(pi: ExtensionAPI): void {
     return { content: [...event.content, { type: "text", text: line }],
       ...(event.structuredContent === undefined ? {} : { structuredContent: event.structuredContent }) };
   });
-  let registration: WorkflowResourceRegistration | undefined;
-  let observer: RuntimeAgentRegistration | undefined;
-  let ledger: RuntimeAgentRegistration | undefined;
-  let requests: RuntimeAgentRegistration | undefined;
+  const registrations: (RuntimeAgentRegistration | WorkflowResourceRegistration)[] = [];
   function dispose() {
-    registration?.dispose(); registration = undefined;
-    observer?.dispose(); observer = undefined;
-    ledger?.dispose(); ledger = undefined;
-    requests?.dispose(); requests = undefined;
+    for (const registration of registrations.splice(0).reverse()) registration.dispose();
   }
   pi.on("session_start", (_event, ctx) => {
     dispose();
     try {
-      observer = registerAgentViaEvents({ pi, name: "pitako.checkout-observer", definition: {
-        description: "Deterministic actual-cwd checkout evidence; no model or prompt execution.",
-        systemPrompt: "Fixed actual-cwd observer and ledger publisher; stdin is a JSON {expected, body} request, never a workspace selector.", systemPromptMode: "replace", tools: [], allowNestedSubagents: false,
-        inheritProjectContext: false, inheritGlobalContext: false, inheritSkills: false,
-        defaultContext: "fresh", defaultAsync: false,
-        // Deterministic: no inferred acceptance contract may be appended to the JSON stdin request.
-        acceptanceRole: "read-only",
-        runner: { type: "external-cli", command: process.execPath,
-          args: [path.join(packageRoot(), "skills/execute/observe.mjs")], promptDelivery: "stdin" },
-      } });
-      ledger = registerAgentViaEvents({ pi, name: "pitako.execution-ledger", definition: {
-        description: "Deterministic hash-chained execution ledger publication; no model execution.",
-        systemPrompt: "Fixed execution ledger; stdin is a JSON publication request.", systemPromptMode: "replace", tools: [], allowNestedSubagents: false,
-        inheritProjectContext: false, inheritGlobalContext: false, inheritSkills: false,
-        defaultContext: "fresh", defaultAsync: false,
-        // Deterministic: no inferred acceptance contract may be appended to the JSON stdin request.
-        acceptanceRole: "read-only",
-        runner: { type: "external-cli", command: process.execPath,
-          args: [path.join(packageRoot(), "skills/execute/ledger.mjs")], promptDelivery: "stdin" },
-      } });
-      requests = registerAgentViaEvents({ pi, name: "pitako.request-observer", definition: {
-        description: "Deterministic main-session execute request reader; no model execution.",
-        systemPrompt: "Fixed execute request observer; stdin is JSON {invocation, cursor}.",
+      for (const agent of RUNTIME_AGENTS) registrations.push(registerAgentViaEvents({ pi, name: agent.name, definition: {
+        description: agent.description, systemPrompt: agent.systemPrompt,
         systemPromptMode: "replace", tools: [], allowNestedSubagents: false,
         inheritProjectContext: false, inheritGlobalContext: false, inheritSkills: false,
-        defaultContext: "fresh", defaultAsync: false, acceptanceRole: "read-only",
+        defaultContext: "fresh", defaultAsync: false,
+        // Deterministic: no inferred acceptance contract may be appended to the JSON stdin request.
+        acceptanceRole: "read-only",
         runner: { type: "external-cli", command: process.execPath,
-          args: [path.join(packageRoot(), "skills/execute/observe.mjs"), "--requests"], promptDelivery: "stdin" },
-      } });
-      registration = registerWorkflowResource({ sessionId: ctx.sessionManager.getSessionId(), definition: executionResource() });
+          args: [path.join(packageRoot(), agent.args[0]!), ...agent.args.slice(1)], promptDelivery: "stdin" },
+      } }));
+      const sessionId = ctx.sessionManager.getSessionId();
+      registrations.push(registerWorkflowResource({ sessionId, definition: executionResource() }));
+      for (const name of Object.keys(ANALYSIS_WORKFLOWS) as (keyof typeof ANALYSIS_WORKFLOWS)[])
+        registrations.push(registerWorkflowResource({ sessionId, definition: analysisResource(name) }));
     } catch (error) {
       dispose();
-      throw new Error(`Checkout observer, request observer or execution ledger registration failed: ${String(error instanceof Error ? error.message : error)}. Inspect the installed pi-subagents registration listener and conflicting agent; reconcile it before preparing execution. No fallback was registered.`);
+      throw new Error(`Deterministic runtime agent or workflow resource registration failed: ${String(error instanceof Error ? error.message : error)}. Inspect the installed pi-subagents registration listener and conflicting agent; reconcile it before preparing execution. No fallback was registered.`);
     }
   });
   pi.on("session_shutdown", dispose);

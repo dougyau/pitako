@@ -298,8 +298,8 @@ describe("workflow-owned execute controller", () => {
       if (observation === "binding") receipt.output = JSON.stringify({ ...receipt.structuredOutput, reason: "Different full value" });
       if (observation === "provenance") receipt.structuredOutput.provenance = [];
       if (observation === "invalid-value") {
-        if (subject === "loop-plan") receipt.structuredOutput.original.association.invocation = "different";
-        else if (subject === "attempt-result") receipt.structuredOutput.workerResult.taskId = "different";
+        if (subject === "loop-plan") receipt.structuredOutput.original.status = "different";
+        else if (subject === "attempt-result") receipt.structuredOutput.workerResult.status = "different";
         else receipt.structuredOutput.original.runId = "different";
       }
       if (observation === "incomplete-value" || observation.startsWith("rejected-")) {
@@ -337,7 +337,9 @@ describe("workflow-owned execute controller", () => {
       }
       // An exact recovered report that breaks the result contract no longer
       // halts reconciliation: its loop ends as gaps and the next loop repairs it.
-      const rejectedReport = subject === "attempt-result" && (observation === "incomplete-value" || observation.startsWith("rejected-"));
+      // Workers echo no identities, so an invalid recovered status is also a rejected report.
+      const rejectedReport = subject === "attempt-result" &&
+        (["incomplete-value", "invalid-value"].includes(observation) || observation.startsWith("rejected-"));
       const canContinue = (["usable", "cache-missing", "key-only"].includes(observation) || observation.endsWith("-cut") || rejectedReport) &&
         (producer === "closed" || producer === "unavailable" && subject === "interrupted-operation");
       if (canContinue) expect(output.status, JSON.stringify({ reason: output.reason, statuses: host.statusCalls, halt: host.history()[0].halt })).toBe("complete");
@@ -353,7 +355,8 @@ describe("workflow-owned execute controller", () => {
         const rejected = host.history()[0].results;
         expect(rejected).toHaveLength(1);
         expect(host.history()[0].outcome).toBe("gaps");
-        const reason = "Worker result lacks planned check evidence or has duplicate check IDs.";
+        const reason = observation === "invalid-value" ? "Worker returned no complete task/attempt/progress/diagnosis/Git contract."
+          : "Worker result lacks planned check evidence or has duplicate check IDs.";
         expect(rejected[0]).toMatchObject({ status: "rejected", taskId: "change1", attempt: 1,
           rejection: reason, diagnosis: reason,
           ref: { ...retained.source, recovery: { ref: recoveries[0].ref, field: "structuredOutput.workerResult" } } });

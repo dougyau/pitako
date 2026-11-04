@@ -35,17 +35,17 @@ test("30 loops of eight tasks retain constant state across pauses, recoveries an
     if (request.agent === "pitako.worker" && request.key.endsWith(".t1.a1"))
       return host.result(request, { ...host.worker(request, "pause"), status: "blocked",
         remaining: ["Finish pending unit"], continuation: "Resume admitted pause" });
-    if (request.agent === "pitako.worker" && request.key.endsWith(".t1.a2")) {
-      const descriptor = JSON.parse(request.task.split("FROZEN ATTEMPT:\n")[1]!.split("\n")[0]!);
+    if (request.agent === "pitako.checkpoint-sealer" && request.key.endsWith(".t1.a2.seal")) {
+      const descriptor = host.current().loop.attempt;
       const observation = descriptor.restore.observations[0], pause = descriptor.restore.authority.confirmedPause;
-      const restored = { checkpointRef: observation.manifest, digest: digest(descriptor.key),
+      const result = normal(), observed = JSON.parse(result.output!);
+      observed.restored = { checkpointRef: observation.manifest, digest: digest(descriptor.key),
         partialRef: observation.manifest.replace(/manifest\.json$/, "restore.json"),
+        restoredRef: observation.manifest.replace(/manifest\.json$/, "restored.json"),
         position: { loop: number, cursor: 0, phase: "implementation" },
         candidate, confirmedPause: { checkpointRef: pause.checkpointRef, digest: pause.digest } };
-      const restoredRef = observation.manifest.replace(/manifest\.json$/, "restored.json");
-      const value = host.worker(request);
-      value.git.checkpoints.push(restored.partialRef, restoredRef);
-      return host.result(request, { ...value, restoreReceipt: { ...restored, restoredRef } });
+      result.output = JSON.stringify(observed);
+      return result;
     }
     const result = normal();
     if (request.agent === "pitako.execution-director") {
@@ -113,6 +113,24 @@ test.each([1, 2])("closed dispositions never enter operation consumers, includin
   expect(host.calls).toHaveLength(before);
   expect(host.current().lastClosedResolution).not.toHaveProperty("operations");
   expect(host.current().lastClosedResolution).not.toHaveProperty("halt");
+});
+
+test.each([
+  ["an intermediate acceptance gate", (tasks: any[]) => { tasks[0].checks[0].tier = "acceptance"; },
+    "acceptance-tier checks belong only to the LAST verification task; earlier tasks need focused checks: change1"],
+  ["a final task without acceptance", (tasks: any[]) => { tasks.at(-1).checks[0].tier = "focused"; },
+    "LAST verification task needs at least one acceptance-tier check"],
+  ["a missing tier", (tasks: any[]) => { delete tasks[0].checks[0].tier; }, "loop_plan needs full ordered task scopes"],
+] as const)("the root rejects %s before any worker runs", async (_name, mutate, rejection) => {
+  const host = fixture(undefined, { readOnly: true }); host.setLimit(2);
+  host.setRespond((request, normal) => {
+    const result = normal();
+    if (request.key === "invoke-human-1.l1.director") mutate(result.structuredOutput.tasks);
+    return result;
+  });
+  expect((await host.execute()).status).toBe("complete");
+  expect(host.calls.some(call => call.key.startsWith("invoke-human-1.l1.t"))).toBe(false);
+  expect(host.calls.find(call => call.key === "invoke-human-1.l2.director")!.task).toContain(rejection);
 });
 
 test("a gaps publisher delivers its verified rejection summary to the very next director", async () => {
@@ -234,7 +252,8 @@ test("admission amendments reach every phase without the director copying them i
   const output = await host.execute({ amendments });
   expect(output.status, output.reason).toBe("complete");
   expect(host.current().amendments).toEqual(amendments);
-  const phases = host.calls.filter(call => /\.director$|\.t\d+\.a\d+$|\.compliance$|\.review\./.test(call.key));
+  // The model-free access verifier receives only originals to compare, not model context.
+  const phases = host.calls.filter(call => /\.director$|\.t\d+\.a\d+$|\.compliance$|\.review\./.test(call.key) && call.agent !== "pitako.access-verifier");
   for (const pattern of [/\.director$/, /\.t\d+\.a\d+$/, /\.compliance$/, /\.review\./])
     expect(phases.some(call => pattern.test(call.key))).toBe(true);
   for (const call of phases) expect(call.task, call.key).toContain(JSON.stringify(amendments));

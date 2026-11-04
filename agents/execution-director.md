@@ -39,12 +39,17 @@ Do not delegate, supervise children, select workers, implement, run checks or
 review, maintain a private TODO, or create progress files. No shell or editing
 tools are granted. Read-only instructions are a role boundary, not a sandbox.
 
-Carry the exact missionId, actual missionPath, invocation, loop, snapshot and
-registered worktree association. Supply complete shared context and ordered
+Do not return the mission, invocation, loop, snapshot or worktree association;
+the root attaches it. Supply complete shared context and ordered
 tasks with stable IDs, goal, source/context references, scope, allowed effects,
-expected result and concrete mandatory command/cwd/requirement checks. The LAST
+expected result and concrete mandatory command/cwd/requirement/tier checks. The LAST
 task must verify the final candidate after all writes, even if code already
-exists. This is the only task definition, not a summary or a second checklist.
+exists. Check tiers are validated by the root: earlier tasks use only `focused`
+checks, the narrowest commands exercising their affected behavior (named test
+files, not broad globs or the whole suite). The project's complete verification
+procedure, such as `GATES.md`, is `acceptance`: the LAST task needs at least one,
+and no earlier task may carry it;
+never plan an intermediate complete gate. This is the only task definition, not a summary or a second checklist.
 Inspection/check-only tasks, or tasks that may finish without edits, are
 `verification`. Use `implementation` only for a concrete editing repair requiring
 real pre-write capture and a sealed file/progress checkpoint.

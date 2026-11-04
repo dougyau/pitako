@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import path from "node:path";
 import { restoreCheckpoint } from "../extensions/execute-checkpoint.ts";
 import { validateToolArguments } from "@earendil-works/pi-ai";
@@ -44,7 +44,7 @@ describe("workflow-owned execute controller", () => {
         remaining: ["Same pending defect"], diagnosis: "The same defect is still present",
         continuation: "Fix the same branch", usefulProgress: true }) : normal());
     expect((await host.execute()).status).toBe("complete");
-    expect(host.calls.filter(call => call.key.includes(".l1.t1.")).map(call => call.key))
+    expect(host.calls.filter(call => call.agent === "pitako.worker" && call.key.includes(".l1.t1.")).map(call => call.key))
       .toEqual(["invoke-human-1.l1.t1.a1", "invoke-human-1.l1.t1.a2"]);
     const pauses = host.records().filter((record: any) => record.loop === 1 && record.kind === "unit");
     expect(pauses).toHaveLength(2);
@@ -71,7 +71,6 @@ describe("workflow-owned execute controller", () => {
         const restored = restoreCheckpoint(descriptor.restore.checkpoint, descriptor.restore.authority);
         const restoredRef = restored.partialRef.replace(/restore\.json$/, "restored.json");
         const value = host.worker(request);
-        value.git.checkpoints.push(restored.partialRef, restoredRef);
         return host.result(request, { ...value, restoreReceipt: { ...restored, restoredRef } });
       }
       return normal();
@@ -106,7 +105,7 @@ describe("workflow-owned execute controller", () => {
       const outcome = await host.execute();
       expect(injected).toBe(true);
       expect(outcome.status, outcome.reason).toBe("complete");
-      expect(host.current()).toMatchObject({ version: 4, consumedLoops: 1, sealPending: null, taskFrame: null,
+      expect(host.current()).toMatchObject({ version: 5, consumedLoops: 1, sealPending: null, taskFrame: null,
         ledger: { count: 3 }, loop: { cursor: 2 } });
       expect(host.calls.filter(call => call.agent === "pitako.execution-ledger").map(call => call.key))
         .toEqual(["invoke-human-1.l1.seal1", "invoke-human-1.l1.seal1.r1"]);
@@ -174,7 +173,6 @@ describe("workflow-owned execute controller", () => {
       const restored = restoreCheckpoint(descriptor.restore.checkpoint, descriptor.restore.authority);
       const restoredRef = restored.partialRef.replace(/restore\.json$/, "restored.json");
       const value = host.worker(request);
-      value.git.checkpoints.push(restored.partialRef, restoredRef);
       return host.result(request, { ...value, restoreReceipt: { ...restored, restoredRef } });
     });
     expect((await host.execute()).status).toBe("cancelled");
@@ -411,51 +409,24 @@ describe("workflow-owned execute controller", () => {
     expect(host.current().lastConfirmed).toEqual(paused.lastConfirmed);
   });
 
-  // Rejects both retroactive checkpoint fabrication for a retained legacy
-  // intention and accidental exemption of the next newly dispatched writer.
-  // This is a controlled old-contract fixture, not historical-state replay.
-  test.each(["sealed", "missing-receipt"])("checkpoint legacy intention replay enforces the next new unit: %s", async mode => {
-    const host = fixture("FULL SPECS", { taskCount: 2 });
-    const progressStart = source.indexOf(",\n            progress: { consumedLoops:");
-    const progressEnd = source.indexOf(" : null }", progressStart) + " : null }".length;
-    expect(progressStart).toBeGreaterThan(0);
-    const legacySource = source.slice(0, progressStart) + source.slice(progressEnd);
-    cutAt(host, value => value.loop?.attempt?.stage === "result");
-    expect((await host.execute({}, legacySource)).status).toBe("partial");
-    const retained = copy(host.current()), original = copy(host.native.get("native-invoke-human-1.l1.t1.a1"));
-    expect(retained.loop.attempt.checkpoint).not.toHaveProperty("progress");
-    expect(original!.structuredOutput).not.toHaveProperty("checkpointReceipt");
-    host.setFailSave();
+  // The root seals only a captured unit: a complete implementation report whose
+  // worker never published its pre-capture is rejected, never sealed or admitted.
+  test("complete implementation without a pre-capture manifest is rejected; the next loop seals the unit", async () => {
+    const host = fixture("FULL SPECS");
     host.setRespond((request, normal) => {
       const result = normal();
-      if (request.key === "invoke-human-1.l1.t2.a1") {
-        const intent = host.history()[0].attempt.checkpoint;
-        expect(intent.progress).toMatchObject({ consumedLoops: 1,
-          admitted: { change1: ["complete"] } });
-        expect(result.structuredOutput.checkpointReceipt).toMatchObject({ kind: "unit", progress: intent.progress });
-        // The seal really exists; omission from the new result still forbids admission.
-        expect(existsSync(result.structuredOutput.checkpointReceipt.checkpointRef)).toBe(true);
-        if (mode === "missing-receipt") delete result.structuredOutput.checkpointReceipt;
-      }
+      if (request.key === "invoke-human-1.l1.t1.a1")
+        rmSync(path.join(host.root, ".pi/subagents/checkpoints", request.key), { recursive: true, force: true });
       return result;
     });
     const output = await host.execute();
-    // The unsealed report is rejected; only the next loop's valid unit completes.
     expect(output.status, output.reason).toBe("complete");
-    expect(host.calls.filter(call => call.key === "invoke-human-1.l1.t1.a1")).toHaveLength(1);
-    expect(host.native.get("native-invoke-human-1.l1.t1.a1")).toEqual(original);
-    expect(host.current().association).toEqual(retained.association);
-    expect(host.history()).toHaveLength(mode === "sealed" ? 1 : 2);
+    const sealer = host.calls.filter(call => call.agent === "pitako.checkpoint-sealer").map(call => [call.key, JSON.parse(call.task).kind]);
+    expect(sealer).toContainEqual(["invoke-human-1.l1.t1.a1.seal", "unit"]);
+    expect(host.history()[0]).toMatchObject({ outcome: "gaps", results: [
+      { status: "rejected", rejection: expect.stringContaining("lacks required sealed file/progress checkpoint") }] });
     expect(host.history()[0].results[0].checkpoint).not.toHaveProperty("confirmation");
-    if (mode === "sealed") {
-      expect(host.current().lastConfirmed).toMatchObject({ taskId: "change2", kind: "unit", position: { cursor: 2 } });
-      expect(host.calls.some(call => call.key.endsWith(".compliance"))).toBe(true);
-    } else {
-      expect(host.history()[0]).toMatchObject({ outcome: "gaps", results: [{ status: "complete" },
-        { status: "rejected", rejection: expect.stringContaining("lacks required sealed file/progress checkpoint") }] });
-      expect(host.current().lastConfirmed?.position.loop === 1 ? host.current().lastConfirmed : undefined).toBeUndefined();
-      expect(host.calls.some(call => call.key.startsWith("invoke-human-1.l1.") && call.key.endsWith(".compliance"))).toBe(false);
-    }
+    expect(host.current().lastConfirmed).toMatchObject({ taskId: "change1", kind: "unit", position: { loop: 2, cursor: 1 } });
   });
 
   test.each(["unknown", "complete", "wrapped-complete", "native-complete"])(
@@ -913,10 +884,13 @@ describe("workflow-owned execute controller", () => {
     const scope = fixture();
     scope.setRespond((request, normal) => {
       const result = normal();
-      if (request.agent === "pitako.worker") Object.assign(result.structuredOutput, { status: "blocked", diagnosis: "Expansion needed: unauthorized external resource", remaining: ["Missing resource permission"] });
+      // No pending work means no root pause seal: the impediment is not a resumable pause.
+      if (request.agent === "pitako.worker")
+        Object.assign(result.structuredOutput, { status: "blocked", diagnosis: "Expansion needed: unauthorized external resource", remaining: [] });
       return result;
     });
     expect((await scope.execute()).status).toBe("blocked");
+    expect(scope.calls.filter(call => call.agent === "pitako.checkpoint-sealer").map(call => JSON.parse(call.task).kind)).toEqual([null]);
     const before = scope.calls.length;
     expect((await scope.execute({ ...input, resolution: { ...input.resolution, loop: 1 } })).status).toBe("blocked");
     expect(scope.calls).toHaveLength(before);
@@ -1153,7 +1127,7 @@ describe("workflow-owned execute controller", () => {
     expect(host.calls.filter(call => call.agent === "pitako.worker").every(call => call.key.includes(".l3."))).toBe(true);
   });
 
-  test.each(["producer", "association", "binding", "stopped", "permission", "pending", "schema-no-original"])(
+  test.each(["producer", "binding", "stopped", "permission", "pending", "schema-no-original"])(
     "structural defect cannot hide %s barrier or authority conflict", async mode => {
       const host = fixture();
       host.setRespond((request, normal) => {
@@ -1166,7 +1140,6 @@ describe("workflow-owned execute controller", () => {
         }
         result.structuredOutput.tasks = [];
         if (mode === "producer") result.agent = "unrelated-producer";
-        if (mode === "association") result.structuredOutput.association.missionId = "wrong";
         if (mode === "binding") result.output = JSON.stringify({ ...result.structuredOutput, reason: "Different binding" });
         if (mode === "stopped") result.stopped = true;
         if (mode === "pending") result.state = "pending";
@@ -1179,7 +1152,7 @@ describe("workflow-owned execute controller", () => {
       expect(host.history()[0].plan.stage).not.toBe("rejected");
       expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(0);
       expect(host.calls.filter(call => call.key.endsWith(".director"))).toHaveLength(1);
-      if (["producer", "association", "binding"].includes(mode)) {
+      if (["producer", "binding"].includes(mode)) {
         const calls = host.calls.length;
         host.setRespond(undefined);
         host.setStatus(() => ({ ok: true, output: "", structuredOutput: host.plan() }));
@@ -1250,61 +1223,36 @@ describe("workflow-owned execute controller", () => {
     expect(host.calls.some(call => call.agent === "pitako.execution-inspector")).toBe(false);
   });
 
-  test("native director binding fixes the complete actual association on each loop", async () => {
+  test("native director returns decisions while the root attaches the complete actual association on each loop", async () => {
     const host = fixture();
     const sourceRefs = [{ path: "/stable/inherited.md", digest: "f".repeat(64) }];
-    host.setRespond((request, normal) => request.key === "invoke-human-1.l1.compliance" ? gaps(normal()) : normal());
+    const known: any[] = [];
+    host.setRespond((request, normal) => {
+      if (request.agent === "pitako.worker") {
+        const expected = JSON.parse(request.task.split("ASSOCIATION (data): ")[1]!.split("\n")[0]!);
+        expect(host.current().loop.plan.association).toEqual(expected);
+        known.push(copy(expected));
+      }
+      return request.key === "invoke-human-1.l1.compliance" ? gaps(normal()) : normal();
+    });
     expect((await host.executeNative({ sourceRefs })).status).toBe("complete");
     const directors = host.calls.filter(request => request.key.endsWith(".director"));
     expect(directors).toHaveLength(2);
-    for (const [index, request] of directors.entries()) {
+    for (const request of directors) {
       const plan = host.native.get(request.key)!.structuredOutput;
       const original = copy(plan);
       const tool = { name: "loop_plan", description: "Published loop plan", parameters: request.outputSchema };
       const validate = (value: any) => validateToolArguments(tool, { type: "toolCall", id: "plan", name: tool.name, arguments: value });
-      expect(plan.association).toEqual({ ...host.plan(index + 1).association, sourceRefs });
+      expect(plan).not.toHaveProperty("association");
+      expect(request.outputSchema.properties).not.toHaveProperty("association");
       expect(validate(plan)).toEqual(plan);
-      expect(request.outputSchema.properties.association.const).toEqual(plan.association);
-      // A shape-only binding accepts these plausible mis-transcriptions.
-      for (const field of Object.keys(plan.association)) {
-        const changed = copy(plan);
-        changed.association[field] = field === "loop" || field === "maxCycles" ? 9
-          : field === "sourceRefs" ? [] : "/wrong";
-        expect(() => validate(changed)).toThrow();
-        const omitted = copy(plan);
-        delete omitted.association[field];
-        expect(() => validate(omitted)).toThrow();
-      }
-      for (const field of ["path", "digest"]) {
-        const changed = copy(plan);
-        changed.association.sourceRefs[0][field] = field === "digest" ? "e".repeat(64) : "/wrong";
-        expect(() => validate(changed)).toThrow();
-      }
+      expect(() => validate({ ...plan, association: { digest: "mistyped" } })).toThrow();
       expect(plan).toEqual(original);
     }
+    expect(known.map(value => value.loop)).toContain(1);
+    expect(known.map(value => value.loop)).toContain(2);
+    expect(known.every(value => JSON.stringify(value.sourceRefs) === JSON.stringify(sourceRefs))).toBe(true);
   });
-
-  test.each(["missionId", "missionPath", "invocation", "root", "commonDir", "source", "digest", "loop", "maxCycles", "sourceRefs"])(
-    "post-binding validation rejects conflicting %s without editing the original or launching workers", async field => {
-      const host = fixture();
-      let original: any, retained: any;
-      host.setRespond((request, normal) => {
-        const result = normal();
-        if (request.key.endsWith(".director")) {
-          result.structuredOutput.association[field] = field === "loop" || field === "maxCycles" ? 9
-            : field === "sourceRefs" ? [{ path: "/wrong", digest: "e".repeat(64) }] : "/wrong";
-          original = result.structuredOutput; retained = copy(original);
-        }
-        return result;
-      });
-      const output = await host.executeNative();
-      expect(output.status).toBe("blocked");
-      expect(output.reason).toContain("association mismatch");
-      expect(host.calls.filter(request => request.agent === "pitako.worker")).toHaveLength(0);
-      expect(original).toEqual(retained);
-      expect(host.native.get(host.calls[0]!.key)!.structuredOutput).toEqual(retained);
-    },
-  );
 
   test.each([false, true])("independent permutations preserve full admitted definitions, verification last (%s)", async reverse => {
     const host = fixture("FULL SPECS WITH INDEPENDENT OBLIGATIONS", { taskCount: 2 });
@@ -1523,17 +1471,21 @@ describe("workflow-owned execute controller", () => {
     expect(next.storage.get("prior-invocation-history")).toEqual(oldStore);
   });
 
-  test("legacy version-2 replay is blocked without settings reads or backfill", async () => {
+  test.each([2, 3, 4])("non-v5 retained state v%s fails before any resume or dispatch with the actionable message", async version => {
     const host = fixture();
     host.setRespond((request, normal) => request.key.endsWith(".compliance") ? gaps(normal()) : normal());
     await host.execute();
-    const old = copy(host.current()); old.version = 2; delete old.association.maxCycles; delete old.association.sourceRefs;
-    host.storage.set("invoke-human-1", old); host.storage.set("pitako-execution", { version: 2, association: old.association });
-    const before = copy(old), reads = host.hostCalls.filter(key => key === "execute-settings").length;
-    host.setLimit(1); const calls = host.calls.length;
-    expect(await host.execute()).toMatchObject({ status: "blocked", loopsConsumed: 3, maxLoops: 3 });
-    expect(host.current()).toEqual(before); expect(host.calls).toHaveLength(calls);
-    expect(host.hostCalls.filter(key => key === "execute-settings")).toHaveLength(reads);
+    for (const field of ["invoke-human-1", "pitako-execution"]) {
+      const old = copy(host.storage.get(field)); old.version = version;
+      host.storage.set(field, old);
+      const before = copy([...host.storage.entries()]), reads = host.hostCalls.length, calls = host.calls.length;
+      const output = await host.execute();
+      expect(output.status).toBe("blocked");
+      expect(output.reason).toContain(`created by an incompatible Pitako contract v${version}; start a new mission`);
+      expect([...host.storage.entries()]).toEqual(before);
+      expect(host.calls).toHaveLength(calls); expect(host.hostCalls).toHaveLength(reads);
+      old.version = 5; host.storage.set(field, old);
+    }
   });
 
   test.each([0, -1, 1.5, "4", true, null, Number.MAX_SAFE_INTEGER + 1])("invalid admission receipt %s consumes no cycle or director", async invalid => {
@@ -1644,8 +1596,13 @@ describe("workflow-owned execute controller", () => {
     host.setLimit(4); host.emits.length = 0;
     const replay = await host.execute();
     expectImpediment(host, replay, "blocked", reason);
-    expect(replay.maxLoops).toBe(limit); expect(host.calls).toEqual(calls);
-    expect(host.current()).toEqual(before);
+    // The root pause seal of the blocked result may only finish its idempotent
+    // archive under the already-dispatched ledger key; no worker/director repeats.
+    expect(replay.maxLoops).toBe(limit); expect(host.calls.slice(0, calls.length)).toEqual(calls);
+    const sealKeys = calls.filter((call: any) => call.agent === "pitako.execution-ledger").map((call: any) => call.key);
+    expect(host.calls.slice(calls.length).every(call => call.agent === "pitako.execution-ledger" && sealKeys.includes(call.key))).toBe(true);
+    expect(host.current().loop.attempt).toEqual(before.loop.attempt);
+    expect(host.current().tasks).toEqual(before.tasks);
     expect(host.hostCalls.filter(key => key === "execute-settings")).toHaveLength(reads);
     expect(committed.loop).toMatchObject({ outcome: "blocked",
       halt: { status: "blocked", code: "semantic-block", reason } });
@@ -1661,7 +1618,7 @@ describe("workflow-owned execute controller", () => {
     const sourceRefs = [{ path: "/stable/.pitako/plans/inherited.md", digest: "f".repeat(64) }];
     expect((await host.execute({ sourceRefs })).status).toBe("complete");
     expect(host.current().association.sourceRefs).toEqual(sourceRefs);
-    for (const request of host.calls.filter(call => !call.resume && call.agent !== "pitako.checkout-observer" && call.agent !== "pitako.execution-ledger" && call.agent !== "pitako.request-observer")) {
+    for (const request of host.calls.filter(call => !call.resume && call.agent !== "pitako.checkout-observer" && call.agent !== "pitako.execution-ledger" && call.agent !== "pitako.request-observer" && call.agent !== "pitako.checkpoint-sealer" && call.agent !== "pitako.access-verifier")) {
       expect(request.task).toContain("SELECTED SNAPSHOT INTACT");
       expect(request.task).toContain(JSON.stringify(sourceRefs));
       expect(request.task).toContain("read EVERY referenced source IN FULL");
@@ -1747,6 +1704,22 @@ describe("workflow-owned execute controller", () => {
     expect(selectedTask.goal).toBe(goal);
   });
 
+  test.each([["stopped", "cancelled"], ["failed", "blocked"]] as const)("a %s access verifier in review is a native barrier, not a semantic block", async (mode, status) => {
+    const host = fixture("FULL SPECS", { findings: true });
+    host.setRespond((request, normal) => {
+      const result = normal();
+      if (request.agent !== "pitako.access-verifier") return result;
+      const child = { ...result.results![0]!, exitCode: 1, ...(mode === "stopped" ? { stopped: true } : {}) };
+      return mode === "stopped" ? { ...result, ok: false, stopped: true, output: "", results: [child] }
+        : { ...result, ok: false, error: "verifier exited 1", output: "", results: [child] };
+    });
+    const output = await host.execute();
+    expect(output.status).toBe(status);
+    expect(host.current().loop.halt?.code).not.toBe("semantic-block");
+    expect(output.reason).not.toContain("task owner");
+    expect(host.calls.some(call => call.key.endsWith(".review.defense-a") || call.key.includes(".review.defense"))).toBe(false);
+  });
+
   test.each([2, 3, 4])("real %s-angle review includes critiques, one defense and synthesis, not include=material", async angles => {
     const host = fixture("FULL SPECS", { angles, findings: true });
     const goal = "Improve record selection\n " + "with complete caller evidence ".repeat(12);
@@ -1757,11 +1730,15 @@ describe("workflow-owned execute controller", () => {
     });
     // A scoped-defect finding returned as ready reaches synthesis instead of stopping execute.
     expect((await host.execute()).status).toBe("complete");
-    expect(host.calls.filter(call => call.key.includes(".review."))).toHaveLength(3 * angles + 2);
-    for (const call of host.calls.filter(item => item.key.includes(".review.")))
+    const verifiers = host.calls.filter(call => call.agent === "pitako.access-verifier");
+    // One model-free verifier per consuming gate: critique, defense and synthesis.
+    expect(verifiers.map(call => call.key)).toEqual(["critique", "defense", "synthesis"].map(gate => `invoke-human-1.l1.review.verify-${gate}`));
+    expect(host.verifications.every(entry => entry.output.items.every((item: any) => item.state === "accessible"))).toBe(true);
+    expect(host.calls.filter(call => call.key.includes(".review.") && call.agent !== "pitako.access-verifier")).toHaveLength(3 * angles + 2);
+    for (const call of host.calls.filter(item => item.key.includes(".review.") && item.agent !== "pitako.access-verifier"))
       expect(call.task).toContain("Return status blocked only when missing material context prevents this review phase.");
     expect(host.calls.filter(call => call.key.includes(".review.") && call.resume)).toHaveLength(2 * angles + 1);
-    const requests = host.calls.filter(call => call.key.includes(".review."));
+    const requests = host.calls.filter(call => call.key.includes(".review.") && call.agent !== "pitako.access-verifier");
     expect(new Set(requests.map(request => request.phase))).toEqual(new Set([
       "review-prepare", "review-independent", "review-critique", "review-defense", "review-synthesis",
     ]));
@@ -1790,9 +1767,11 @@ describe("workflow-owned execute controller", () => {
         bytes: readFileSync(witness.savedOutputPath).byteLength, lines: 1, message: "Saved" });
       expect(witness.structuredOutputPath).toBe(`/native/witness/${request.key}.json`);
       const recovered = JSON.parse(readFileSync(witness.savedOutputPath, "utf8"));
-      expect(recovered.association).toEqual(Object.fromEntries(Object.entries(request.outputSchema.properties.association.properties)
-        .map(([key, schema]: [string, any]) => [key, schema.const])));
-      expect(recovered.delivery).toBe("complete");
+      for (const field of ["association", "delivery", "access"])
+        expect(request.outputSchema.properties).not.toHaveProperty(field);
+      expect(original.association).toMatchObject({ key: request.key, namespace: manifest.namespace,
+        query: manifest.query, revision: manifest.revision, attempt: 1 });
+      expect(original.value).toEqual(recovered);
       expect(original).toMatchObject({ terminal: "succeeded", publication: "published", sufficient: true });
       expect(original.failedOriginal).toBeUndefined();
     }
@@ -1854,7 +1833,9 @@ describe("workflow-owned execute controller", () => {
       const witness = ref.results[0], actual = host.native.get(ref.runId)!.results![0];
       expect(witness.savedOutputPath).toBe(actual.savedOutputPath);
       expect(witness.outputReference).toEqual(actual.outputReference);
-      expect(JSON.parse(readFileSync(witness.savedOutputPath, "utf8")).association.key).toBe(ref.key);
+      const original = host.storage.get("review-invoke-human-1").originals.find((entry: any) => entry.key === ref.key);
+      expect(original.association.key).toBe(ref.key);
+      expect(JSON.parse(readFileSync(witness.savedOutputPath, "utf8"))).toEqual(original.value);
     }
   });
 
@@ -1864,9 +1845,9 @@ describe("workflow-owned execute controller", () => {
       let observed: Result | undefined;
       host.setRespond((request, normal) => {
         const result = normal();
-        if (request.key.endsWith(mode === "inaccessible-essential" ? "review.director-synthesis" : "review.director-prepare")) {
+        if (mode === "inaccessible-essential" ? request.phase === "review-independent" : request.key.endsWith("review.director-prepare")) {
           if (mode === "optional-artifact") result.metadataSaveError = "Optional debug artifact unavailable";
-          if (["mandatory-publication", "partial-failed"].includes(mode)) {
+          if (["mandatory-publication", "partial-failed", "inaccessible-essential"].includes(mode)) {
             delete result.results![0]!.savedOutputPath;
             result.results![0]!.outputSaveError = "Required output save failed";
           }
@@ -1879,10 +1860,7 @@ describe("workflow-owned execute controller", () => {
             result.structuredOutput.reason = "Contrary partial evidence, not sufficient";
           }
           if (mode === "non-delivery") delete result.structuredOutput;
-          if (mode === "unknown-completeness") delete result.structuredOutput.delivery;
-          if (mode === "inaccessible-essential") result.structuredOutput.access[0] = {
-            ...result.structuredOutput.access[0], state: "unavailable", source: "none", reason: "Exact original no longer accessible",
-          };
+          if (mode === "unknown-completeness") delete result.structuredOutput.angles;
           observed = copy(result);
         }
         return result;
@@ -1910,17 +1888,20 @@ describe("workflow-owned execute controller", () => {
       expect(retainedOriginal).toBeDefined();
       const original = { ...manifest.originalDefaults, ...retainedOriginal };
       expect(manifest.originals.filter((entry: any) => entry.id === original.id)).toHaveLength(1);
-      if (["mandatory-publication", "partial-failed"].includes(mode)) {
+      if (["mandatory-publication", "partial-failed", "inaccessible-essential"].includes(mode)) {
         expect(original).toMatchObject({ publication: "unpublished", delivery: "complete", sufficient: false });
         expect(original.failedOriginal).toEqual(observed!.structuredOutput);
       } else expect(original.failedOriginal).toBeUndefined();
       if (mode === "non-delivery") expect(original.delivery).toBe("not-delivered");
       if (mode === "unknown-completeness") expect(original.delivery).toBe("unproved");
-      if (mode === "inaccessible-essential") expect(original).toMatchObject({ essentialAccess: "incomplete", sufficient: false });
+      if (mode === "inaccessible-essential") {
+        expect(original).toMatchObject({ publication: "unpublished", sufficient: false });
+        expect(host.calls.some(request => ["review-critique", "review-defense", "review-synthesis"].includes(request.phase!))).toBe(false);
+      }
       if (mode === "optional-artifact") expect(original).toMatchObject({ publication: "published", observability: "failed", sufficient: true });
       if (mode === "partial-failed") {
         host.setStatus(ref => ({ ...copy(host.native.get(ref)!), ok: true,
-          structuredOutput: { ...observed!.structuredOutput, delivery: undefined } }));
+          structuredOutput: { ...observed!.structuredOutput, angles: undefined } }));
         expect((await host.executeNative()).status).toBe("blocked");
         const retained = host.storage.get("review-invoke-human-1").originals;
         expect(retained).toHaveLength(1);
@@ -1975,11 +1956,20 @@ describe("workflow-owned execute controller", () => {
     expect(host.calls.filter(call => call.key.endsWith(".director"))).toHaveLength(2);
   });
 
-  test.each(["missing-final-checks", "mismatched-association", "duplicate-id", "preview-only"])("rejects %s before any edit", async mode => {
+  test("a mistyped plan association echo cannot halt or consume a loop; the root attaches it", async () => {
+    const host = fixture(); host.setRespond((request, normal) => {
+      const result = normal();
+      if (request.key.endsWith(".director")) result.structuredOutput.association = { root: "/wrong", invocation: "different" };
+      return result;
+    });
+    expect(await host.execute()).toMatchObject({ status: "complete", loopsConsumed: 1 });
+    expect(host.calls.find(call => call.key.endsWith(".director"))!.task).toContain("The root attaches the known association.");
+  });
+
+  test.each(["missing-final-checks", "duplicate-id", "preview-only"])("rejects %s before any edit", async mode => {
     const host = fixture(); host.setRespond((request, normal) => {
       const result = normal(); if (request.key.endsWith(".director")) {
         if (mode === "missing-final-checks") result.structuredOutput.tasks.pop();
-        if (mode === "mismatched-association") result.structuredOutput.association.root = "/wrong";
         if (mode === "duplicate-id") result.structuredOutput.tasks[1].id = "change1";
         if (mode === "preview-only") { result.output = "{preview...}"; delete result.structuredOutput; }
       } return result;
@@ -2087,7 +2077,8 @@ describe("workflow-owned execute controller", () => {
       const output = await host.executeNative();
       const worker = host.calls.find(call => call.agent === "pitako.worker")!;
       expect(worker.task).toContain("Bracket EVERY planned check, including tool-call checks such as file_sha256 or git_status");
-      expect(worker.task).toContain("Verification tasks are not checkpoint units: without checkout writes, do not call checkpoint_create and return no checkpointReceipt");
+      expect(worker.task).toContain("Verification tasks without checkout writes do not call checkpoint_create.");
+      expect(worker.task).not.toContain('checkpoint_create({kind:"unit"})');
       expect(output.status).not.toBe("complete");
       expect(host.calls.some(call => call.key.includes(".review.") || call.key.endsWith(".compliance"))).toBe(false);
       expect(host.native.get("invoke-human-1.l1.t1.a1")!.structuredOutput).toEqual(original);
@@ -2159,7 +2150,7 @@ describe("workflow-owned execute controller", () => {
 
   test.each(["missing-id", "unknown-id", "duplicate-id", "null-entry", "empty-output", "bad-logs",
     "bad-log-entry", "bad-before", "bad-after", "bad-result", "bad-echo", "wrong-producer",
-    "wrong-nested-producer", "failed-exit", "wrong-key", "wrong-task", "wrong-attempt", "binding-conflict", "native-ok-only"])(
+    "wrong-nested-producer", "failed-exit", "wrong-key", "binding-conflict", "native-ok-only"])(
     "worker %s is rejected before further worker or review dispatch", async mode => {
       const host = fixture(undefined, { readOnly: true }); host.setLimit(1);
       host.setRespond((request, normal) => {
@@ -2181,8 +2172,6 @@ describe("workflow-owned execute controller", () => {
           if (mode === "wrong-nested-producer") result.results![0]!.agent = "pitako.reviewer";
           if (mode === "failed-exit") result.results![0]!.exitCode = 1;
           if (mode === "wrong-key") result.key = "another-invocation.l2.t1.a1";
-          if (mode === "wrong-task") value.taskId = "final";
-          if (mode === "wrong-attempt") value.attempt = 2;
           if (mode === "binding-conflict") result.output = JSON.stringify({ ...value, taskId: "other" });
           if (mode === "native-ok-only") delete result.structuredOutput;
         }
@@ -2223,14 +2212,13 @@ describe("workflow-owned execute controller", () => {
   });
 
   test.each(["wrong-command", "wrong-cwd", "stale-check", "no-diagnosis", "pending-complete",
-    "failed", "not-run", "stale-wip"])("worker %s cannot satisfy current mandatory checks", async mode => {
+    "failed", "not-run"])("worker %s cannot satisfy current mandatory checks", async mode => {
     const host = fixture(); host.setRespond((request, normal) => {
       const result = normal(); if (request.agent === "pitako.worker") {
         const value = result.structuredOutput;
         if (mode === "wrong-command") value.checks[0].command = "echo green";
         if (mode === "wrong-cwd") value.checks[0].cwd = "/other";
          if (mode === "stale-check") value.checks[0].after = candidate(2);
-         if (mode === "stale-wip") value.candidate = candidate(2);
          if (mode === "failed" || mode === "not-run") value.checks[0].result = mode;
         if (mode === "no-diagnosis") value.diagnosis = "";
         if (mode === "pending-complete") value.remaining = ["Not done"];
@@ -2238,11 +2226,7 @@ describe("workflow-owned execute controller", () => {
     });
     host.setLimit(1);
     const output = await host.execute();
-    // A changed WIP breaks the checkpoint seal, which still halts; every other
-    // report defect is a rejected attempt that consumes the loop.
-    if (mode === "stale-wip") expect(output).toMatchObject({ status: "blocked",
-      reason: expect.stringContaining("Checkpoint seal does not match") });
-    else {
+    {
       expect(output.status).toBe("partial");
       expect(host.history()[0].results).toEqual([expect.objectContaining({ status: "rejected" })]);
       if (["stale-check", "failed", "not-run"].includes(mode))
@@ -2272,23 +2256,35 @@ describe("workflow-owned execute controller", () => {
     expect(director!.task).toContain("Planned check change1-check lacks checkoutEvidence before identity; complete needs captured before/after for every planned check.");
   });
 
-  test.each(["gaps", "continue"])("a unit seal with %s status is a rejected attempt, not a root halt", async status => {
-    const host = fixture("FULL SPECS", { rawWorkerReceipts: true });
+  test("known worker identity echoes cannot override deterministic observation", async () => {
+    const host = fixture(undefined, { readOnly: true });
     host.setRespond((request, normal) => {
       const result = normal();
-      if (request.key === "invoke-human-1.l1.t1.a1") {
-        const value = result.structuredOutput;
-        expect(value.checkpointReceipt).toMatchObject({ kind: "unit" });
-        Object.assign(value, { status, remaining: ["Inherited mission gap outside this task"],
-          continuation: status === "continue" ? "Continue the same task" : null });
+      if (request.agent === "pitako.worker") {
+        for (const field of ["taskId", "attempt", "candidate", "checkpointReceipt", "restoreReceipt"])
+          expect(request.outputSchema.properties).not.toHaveProperty(field);
+        expect(request.outputSchema.properties.git.properties).toEqual({ wip: { type: "string", minLength: 1 } });
+        Object.assign(result.structuredOutput, { taskId: "wrong", attempt: 99, candidate: candidate(2),
+          checkpointReceipt: { kind: "pause" }, restoreReceipt: { digest: "wrong" } });
       }
       return result;
     });
-    const output = await host.execute();
-    expect(output.status, output.reason).toBe("complete");
-    expect(host.history()[0]).toMatchObject({ outcome: "gaps", results: [{ status: "rejected",
-      rejection: expect.stringContaining(`Checkpoint kind unit contradicts worker status ${status}`) }] });
-    expect(host.history()[0].results[0].checkpoint).not.toHaveProperty("confirmation");
+    expect((await host.execute()).status).toBe("complete");
+    expect(host.history()[0].results[0]).toMatchObject({ taskId: "change1", attempt: 1, candidate: host.observedCandidate() });
+  });
+
+  test.each(["gaps", "continue"])("root chooses a pause for %s with pending work, never a worker kind", async status => {
+    const host = fixture();
+    host.setRespond((request, normal) => {
+      const result = normal();
+      if (request.key === "invoke-human-1.l1.t1.a1") Object.assign(result.structuredOutput, {
+        status, usefulProgress: false, remaining: ["Finish this task"], continuation: null,
+      });
+      return result;
+    });
+    expect((await host.execute()).status).toBe("complete");
+    expect(host.history()[0]).toMatchObject({ outcome: "gaps", results: [{ status,
+      checkpoint: { confirmation: { kind: "pause", position: { cursor: 0 } } } }] });
     expect(host.calls.some(call => call.key.startsWith("invoke-human-1.l1.review."))).toBe(false);
   });
 
@@ -2309,7 +2305,7 @@ describe("workflow-owned execute controller", () => {
     expect(report.next).toBe("continue loop 2"); expect(report.verification.compliance.status).toBe("not-run");
   });
 
-  test.each(["empty", "all-not-applicable", "duplicate", "missing-source", "reasonless", "green-only", "wrong-candidate"])("%s compliance never completes", async mode => {
+  test.each(["empty", "all-not-applicable", "duplicate", "missing-source", "reasonless", "green-only"])("%s compliance never completes", async mode => {
     const host = fixture(); host.setRespond((request, normal) => {
       const result = normal(); if (request.key.endsWith(".compliance")) {
         const value = result.structuredOutput;
@@ -2319,12 +2315,20 @@ describe("workflow-owned execute controller", () => {
         if (mode === "missing-source") value.requirements[0].source = "";
         if (mode === "reasonless") value.requirements[0].reason = "";
         if (mode === "green-only") value.requirements[0].evidence = [];
-        if (mode === "wrong-candidate") value.candidate = candidate(3);
       } return result;
     });
-    const output = await host.execute(); expect(output.status).toBe(mode === "wrong-candidate" ? "partial" : "blocked");
-    if (mode === "wrong-candidate")
-      expect(host.current().loopSummaries.every((summary: any) => summary.status === "gaps")).toBe(true);
+    expect((await host.execute()).status).toBe("blocked");
+  });
+
+  test("a stray compliance candidate echo is ignored; the workflow attaches the judged candidate", async () => {
+    const host = fixture(); host.setRespond((request, normal) => {
+      const result = normal();
+      if (request.key.endsWith(".compliance")) result.structuredOutput.candidate = candidate(3);
+      return result;
+    });
+    // Completion requires the closing gate and the ledger loop record to match
+    // compliance.candidate to the loop candidate, so the echo cannot leak in.
+    expect((await host.execute()).status).toBe("complete");
   });
 
   test.each([{ ids: ["AC-output", "constraint-no-publication"] }, { ids: ["REQ-A"] }])("complete selected specs admit their own shorter inventory: %j", async ({ ids }) => {
@@ -2654,7 +2658,7 @@ describe("workflow-owned execute controller", () => {
         if (request.agent === "pitako.execution-inspector") {
           const intent = host.history()[0].recoveries[0];
           expect(intent).toMatchObject({ subject: "attempt-result:change1:1", phase: "attempt-result",
-            association: host.plan().association, stage: "intention", disposition: "pending",
+            association: { ...host.current().association, loop: 1 }, stage: "intention", disposition: "pending",
             source: { key: "invoke-human-1.l1.t1.a1", runId: "native-invoke-human-1.l1.t1.a1" } });
           expect(request.task).toContain("specific scope/effects expansion needed");
           expect(request.task).toContain("/native/binding/invoke-human-1.l1.t1.a1.json");
@@ -3168,9 +3172,12 @@ describe("workflow-owned execute controller", () => {
         expect(ref.runId).toBe(original.runId);
         const witness = publicationWitness(ref.results[0], host.native.get(ref.runId)!.results![0]);
         const exact = JSON.parse(readFileSync(witness.savedOutputPath, "utf8"));
-        expect(exact.association).toEqual({ namespace: manifest.namespace, query: manifest.query, revision: manifest.revision,
-          phase: original.phase, producer: original.producer, key: original.key, attempt: original.attempt });
-        expect(original.id).toBe(`${exact.association.key}.v1.a1`);
+        expect(original.association).toEqual({ namespace: manifest.namespace, query: manifest.query, revision: manifest.revision,
+          phase: host.calls.find(call => call.key === original.key)!.phase!.replace("review-", ""),
+          producer: original.key.includes(".director-") ? "director" : original.key.split("-").at(-1),
+          key: original.key, attempt: original.attempt });
+        expect(original.value).toEqual(exact);
+        expect(original.id).toBe(`${original.association.key}.v1.a1`);
         expect(ref.outputReference).toBe(witness.savedOutputPath);
         expect(witness.outputReference).toEqual({ path: witness.savedOutputPath,
           bytes: readFileSync(witness.savedOutputPath).byteLength, lines: 1, message: "Saved" });

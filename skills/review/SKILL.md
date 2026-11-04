@@ -40,19 +40,29 @@ coverage instead of claiming closure.
 
 ## Launch
 
-Resolve [workflow.js](workflow.js) beside this installed skill, not against the
-project being reviewed. Use an explicit native mission for the original manifest,
-creating one as below (or supply its actual existing `options.missionId`). Each
-new review pass needs its own mission/state namespace; a retained standalone pass
-is not implicitly restarted or migrated. Make one background call with that absolute path:
+Launch the registered named resource `pitako.review`, never a script path: raw
+paths fail with "launch by name after mission.create". Each new review pass needs
+its own mission; a retained standalone pass is not implicitly restarted or
+migrated. First create the mission in the project being reviewed:
+
+```js
+subagent({ action: "mission.create", cwd: "<project being reviewed>",
+  options: { mission: { title: "Review stream parser memory safety" } } })
+```
+
+Copy the actual returned missionId and the exact `Mission record path
+(args.missionPath): <path>` line (not the `State:` path). Then make one
+background call with the same missionId in args and options:
 
 ```js
 subagent({
-  workflow: "<absolute skill directory>/workflow.js",
+  workflow: "pitako.review",
   cwd: "<project being reviewed>",
   async: true,
-  options: { mission: { title: "Review stream parser memory safety" } },
+  options: { missionId: "<actual missionId>" },
   args: {
+    missionId: "<actual missionId>",
+    missionPath: "<actual mission record path>",
     workDescription: "Stream parser memory safety",
     brief: "<complete requirements, human decisions/provenance, context, exclusions, and evidence>",
     target: {
@@ -102,10 +112,18 @@ Full originals request native persistence and `outputMode: "file-only"`. Finding
 indexes identify each authoritative original/ordinal/ID rather than copying
 finding bodies into a second table. Reasons, coverage, uncertainty and contrary
 narrative outside findings remain recoverable; every finding gets a disposition.
-Essential-original references explain why the exact original is needed. Existing
-child readers validate content/schema/association and report missing access;
-resumed children reread essentials no longer in accessible context, not all history
-universally. Earlier delivery or a child access receipt cannot certify reasoning.
+Essential-original references explain why the exact original is needed. Before
+each consuming phase (critique, defense, synthesis) the workflow dispatches the
+model-free `pitako.access-verifier` once over the phase's required originals. It
+compares each published file with the admitted value in canonical form and
+writes a no-clobber receipt under the mission directory
+(`<mission>/receipts/review/<gate>.json`). A contradictory or unavailable
+original blocks the whole phase before dispatch with an explanation naming the
+original, key, path, differing JSON pointers and the action to take; a verifier
+failure is reported as "verification did not run". No model creates, chooses or
+copies receipts, IDs, paths or digests; reviewers receive the verified originals
+inline. Receipts follow mission retention; check them later with the
+`access_receipt_verify` tool or `node <pitako>/extensions/access-receipts.mjs check <receipt>`.
 
 Retain actual `results[].savedOutputPath`, returned reference objects and text
 `outputReference` paths with producing query/revision/phase/producer/key/attempt/run.

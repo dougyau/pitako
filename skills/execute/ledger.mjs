@@ -1,23 +1,12 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { closeSync, constants, fsyncSync, fstatSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { canonicalJSON, sha256 as digest } from "../../extensions/canonical.mjs";
 
-const digest = bytes => createHash("sha256").update(bytes).digest("hex");
+export { canonicalJSON };
 const isHash = value => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 const keys = (value, names) => value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).sort().join(",") === names;
-
-export function canonicalJSON(value) {
-  if (value === null || typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
-  if (typeof value === "number" && Number.isFinite(value)) return JSON.stringify(value);
-  if (Array.isArray(value)) {
-    return "[" + Array.from(value, item => canonicalJSON(item)).join(",") + "]";
-  }
-  if (value && Object.getPrototypeOf(value) === Object.prototype) {
-    return "{" + Object.keys(value).sort().map(key => JSON.stringify(key) + ":" + canonicalJSON(value[key])).join(",") + "}";
-  }
-  throw new Error("Ledger requires JSON values only.");
-}
 
 function syncDirectory(directory) {
   const fd = openSync(directory, "r");

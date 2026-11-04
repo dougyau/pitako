@@ -94,10 +94,12 @@ try {
     removeRegistrationListener = pi.events.on(RUNTIME_AGENT_REGISTER_EVENT, raw => {
       const request = raw as RuntimeAgentRegistrationRequest;
       assert.equal(request.version, 1);
-      const script = { "pitako.checkout-observer": "observe.mjs", "pitako.execution-ledger": "ledger.mjs", "pitako.request-observer": "observe.mjs" }[request.name];
+      const script = { "pitako.checkout-observer": ["skills/execute/observe.mjs"], "pitako.execution-ledger": ["skills/execute/ledger.mjs"],
+        "pitako.request-observer": ["skills/execute/observe.mjs", "--requests"], "pitako.checkpoint-sealer": ["skills/execute/checkpoint.mjs", "--seal-stdin"],
+        "pitako.access-verifier": ["extensions/access-receipts.mjs", "--verify-stdin"] }[request.name];
       assert.ok(script);
       assert.deepEqual(request.definition.runner, { type: "external-cli", command: process.execPath,
-        args: [path.join(root, "skills/execute", script), ...(request.name === "pitako.request-observer" ? ["--requests"] : [])], promptDelivery: "stdin" });
+        args: [path.join(root, script[0]!), ...script.slice(1)], promptDelivery: "stdin" });
       assert.deepEqual(request.definition.tools, []);
       for (const field of ["allowNestedSubagents", "inheritProjectContext", "inheritGlobalContext", "inheritSkills", "defaultAsync"] as const)
         assert.equal(request.definition[field], false);
@@ -133,7 +135,7 @@ try {
       process.send({ ready: true });
       assert.equal(await Bun.stdin.text(), "run");
     }
-    assert.deepEqual([...registered].sort(), mode === "foreground" ? ["pitako.checkout-observer", "pitako.execution-ledger", "pitako.request-observer"] : []);
+    assert.deepEqual([...registered].sort(), mode === "foreground" ? ["pitako.access-verifier", "pitako.checkout-observer", "pitako.checkpoint-sealer", "pitako.execution-ledger", "pitako.request-observer"] : []);
     await session.extensionRunner!.emit({ type: "agent_start" });
     assert.deepEqual(captured.toolDiagnostic()?.missing ?? [], []);
     if (mode === "foreground") {

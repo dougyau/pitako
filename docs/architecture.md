@@ -1,8 +1,12 @@
 # Architecture discussions
 
-The [architecture skill](../skills/architecture/SKILL.md) initiates one background
-pi-subagents workflow. `skills/architecture/workflow.js` owns dispatch and uses
-the packaged `pitako.architect` profile for the director and perspective members.
+The [architecture skill](../skills/architecture/SKILL.md) creates or shows a native
+mission and launches the named resource `pitako.architecture` (raw script paths
+fail). `skills/architecture/workflow.js` owns dispatch and uses the packaged
+`pitako.architect` profile for the director and perspective members. Each
+consuming gate first runs the model-free `pitako.access-verifier`; consumers then
+receive verified references `{ id, path, digest }` and read them, and a
+contradictory or unavailable original blocks the gate with an explanation.
 Agents reason about the same complete decision rather than specialist subtasks.
 
 The workflow supports up to ten rounds. Native continuation references preserve
@@ -25,8 +29,8 @@ retention limits and distinctions from optional observability.
 The skill is the authoritative usage procedure.
 
 All consultations require an explicit mission, stable consultation identity and
-complete versioned `currentDecision`. Reentry requires the exact version-2
-continuation. A changed decision requires a full associated `replacement` with
+complete versioned `currentDecision`. Reentry requires the exact version-3
+continuation. Older consultation state fails with an actionable message. A changed decision requires a full associated `replacement` with
 the expected revision. It accounts for preserved and replaced obligations and
 retains active human content and provenance. Resuming an unchanged decision or
 adding facts changes neither the revision nor the original round maximum.
