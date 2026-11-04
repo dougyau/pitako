@@ -330,7 +330,7 @@ review, or supervise implementation. The full plan contains shared context and
 ordered stable task IDs, scopes/effects, sources, expected results and checks,
 including final verification even when the implementation exists. Each check
 has a tier: earlier tasks carry only `focused` checks; the project's complete
-procedure is `acceptance` and only the last task may carry it (the root rejects
+procedure is `acceptance`: the last task needs at least one and no earlier task may carry it (the root rejects
 other plans). It is the only task definition; the root's derived ID/order
 manifest is not another plan.
 

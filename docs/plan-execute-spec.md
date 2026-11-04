@@ -262,8 +262,8 @@ See the execute skill for settings examples, sourceRefs and native capacity limi
 The root durably consumes a loop before director dispatch. A fresh read-only
 director returns `plan` or `needs-decision` using outputSchema and the native
 binding, then ends before implementation. It has no delegation, TODO or
-supervisor orchestration. The full `loop_plan` is the sole task definition:
-association, complete shared context and ordered stable IDs, goals, sources,
+supervisor orchestration. The full `loop_plan` is the sole task definition
+(the root attaches the association): complete shared context and ordered stable IDs, goals, sources,
 context references, scope/effects, expected results and concrete checks. A last
 verification task is mandatory even when code already exists. Checks carry a
 tier: `focused` for earlier tasks and `acceptance`, the complete project
@@ -677,10 +677,11 @@ runtime test evidence.
 
 ### Single-result task contract
 
-The director output binding fixes the complete association to the active root
-and current loop, including mission paths, invocation, worktree/common Git root,
-selected source/digest, admitted limit and complete inherited source identities.
-Post-binding admission still rejects conflicting originals without rewriting them.
+The root attaches the complete association to the director output for the active
+root and current loop, including mission paths, invocation, worktree/common Git root,
+selected source/digest, admitted limit and complete inherited source identities;
+the director never returns it. Producer identity checks still reject conflicting
+originals without rewriting them.
 
 New director tasks use `expectedResult` for one concrete observable outcome and
 include `dependsOn: [{taskId, reason}]` (or `[]`). Split separable outcomes while

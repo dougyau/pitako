@@ -121,7 +121,8 @@ canonical requirement; omit its optional echo or use descriptive wording without
 changing the retained report. An ID, matching wording or native ok is not evidence
 that a check ran or passed.
 Read original full native definitions via exact retained refs if required; validate
-association, task ID and order before edits, never rebuild scope from previews.
+task ID and order before edits (the root owns the association), never rebuild
+scope from previews.
 The root owns mandatory checks, shared adversarial review and individual
 compliance; native acceptance suppression avoids duplicate inferred gates, not
 required checks or native permissions. A continuation is useful diagnosed work

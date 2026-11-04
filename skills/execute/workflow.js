@@ -2345,8 +2345,8 @@ Inspection/check-only tasks, or tasks that may finish without edits, are verific
 Planned checks gate the task's FINAL candidate after its last write; pre-edit diagnosis belongs in goal/expectedResult, not checks.
 Every check has a tier. Non-final tasks use ONLY focused checks: the narrowest commands that exercise the
 task's affected behavior (named test files, not broad directory globs or the whole suite).
-The project's complete verification procedure (for example GATES.md) is tier acceptance and belongs ONLY
-to the LAST verification task; never schedule an intermediate complete gate.
+The project's complete verification procedure (for example GATES.md) is tier acceptance: the LAST verification
+task needs at least one, and no earlier task may carry it; never schedule an intermediate complete gate.
 Use implementation only for a concrete editing repair requiring real pre-write capture and sealed file/progress checkpoint.
 Include a LAST verification task for final checks after all writes even when the implementation already exists. Shared context is complete.${
   Array.isArray(config.originalProblem?.criteria) ? `
@@ -2609,7 +2609,7 @@ or roll back consumed slots/history. Returned position is for existing root stat
 not permission to overwrite native mission state or promote stale checks.
 ORIGINAL COMPLETE PLAN REFERENCES (fallback, never previews): ${JSON.stringify(loop.plan.ref)}
 If inline definition is unavailable, read ORIGINAL COMPLETE loop_plan through these exact references,
-validate full association, manifest ${JSON.stringify(loop.manifest)}, order/index and selected task ID BEFORE edits.
+validate manifest ${JSON.stringify(loop.manifest)}, order/index and selected task ID BEFORE edits (the root owns the association).
 No definition => report blocked, never reconstruct scopes. Continuation reads the exact preceding result
 ${JSON.stringify(descriptor.continuationRef)} and addresses only useful diagnosed pending work on THIS task.
 Report status, workDone, concrete remaining, causal diagnosis, usefulProgress/continuation,
