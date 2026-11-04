@@ -1571,6 +1571,7 @@ function admitWorker(result, descriptor, task, recoveryRef, statusRef, observed,
   loop.results.push({ taskId: projected.taskId, attempt: projected.attempt });
   loop.attempt.result = projected;
   loop.attempt.stage = "result";
+  delete loop.attempt.received;
   if (value?.checkpointReceipt) prepareSeal(projected);
   // A recovered rejection does not settle the interrupted producer.
   if (["recovery", "native-barrier"].includes(loop.halt?.code) &&
@@ -1580,6 +1581,28 @@ function admitWorker(result, descriptor, task, recoveryRef, statusRef, observed,
   if (parsed.rejection) return projected;
   currentCandidate = projected.candidate;
   return parsed.value;
+}
+// Native status of a settled async child carries no structuredOutput, and a
+// budget relaunch is a new top-level run without the old run's child receipts.
+// Retain the exact received writer result until admission so reentry seals and
+// admits it instead of rolling back finished journaled work. Admission consumes it.
+const RECEIVED_RESULT_LIMIT = 65536;
+function retainReceived(result) {
+  if (barrier(result) || !result?.ok || !result.structuredOutput || !text(result.runId)) return;
+  const received = clone({ ok: true, agent: result.agent, key: result.key, runId: result.runId,
+    structuredOutput: result.structuredOutput,
+    ...(text(result.output) && /^[\s]*\{/.test(result.output) ? { output: result.output } : {}),
+    ...(Array.isArray(result.results) ? { results: result.results.map(entry => ({ agent: entry?.agent, exitCode: entry?.exitCode })) } : {}) });
+  if (utf8Bytes(JSON.stringify(received)) <= RECEIVED_RESULT_LIMIT) loop.attempt.received = received;
+}
+// A positive barrier or another producer keeps the existing route; only the
+// same settled launch, without its payload in this observation, is completed.
+function receivedResult(observed, ref) {
+  const received = loop.attempt.received;
+  if (!received || loop.attempt.nativeContinuation || received.runId !== ref.runId ||
+      barrier(observed, ref.runId ?? ref.key) || observed?.structuredOutput ||
+      (observed?.runId && observed.runId !== received.runId)) return observed;
+  return clone(received);
 }
 function sealerKey(attemptKey, retry) {
   return `${attemptKey}.seal${retry ? `.r${retry}` : ""}`;
@@ -2487,6 +2510,7 @@ No replacement task list elsewhere. The root attaches the known association. Nat
           let observed = attemptObservation ?? await observeStatus(ref.runId ?? ref.key);
           attemptObservation = null;
           assertFallbackProducer(observed, ref);
+          observed = receivedResult(observed, ref);
           const cause = barrier(observed, ref.runId ?? ref.key);
           if (pendingCheckpointUnit() && !(observed?.ok && observed.structuredOutput && text(observed.runId)))
             observed = await continueAttempt(observed, ref, task, prerequisites);
@@ -2631,6 +2655,7 @@ Return structured_output; complete requires all planned checks current and no pe
 continue requires useful progress plus concrete diagnosed continuation, not a replacement plan.`,
           workerSchema, true);
         loop.attempt.launch = nativeReference(descriptor.key, result);
+        retainReceived(result);
         // Missing modifying results use the same checkpoint route on first
         // receipt as on replay; an inspector is not a rollback prerequisite.
         if (barrier(result) === "interrupted" || (pendingCheckpointUnit() && !barrier(result) &&
