@@ -273,6 +273,9 @@ Recorded Stop/refusal and other human-needed barriers return unchanged without
 dispatch. The root uses ordinary frozen-source/digest/association admission and
 reconciles saved intentions, seals and retries; no admitted work or loop slot is
 repeated. Only keys proven unlaunched by the native admission rejection may launch.
+Native status of a settled child carries no structured result, so the root keeps
+each received writer result in its state until admission. A relaunch seals and
+admits that result; it never restores a unit whose result was already received.
 
 The root saves an O(1) progress marker (latest admitted seal, ledger count/head
 and last closed loop) at each `budget-exhausted` end. Repeated exhaustion without

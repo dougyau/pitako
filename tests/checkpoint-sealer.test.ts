@@ -375,12 +375,32 @@ test("an active retained sealer blocks fallback and re-seal; unknown status take
     .toEqual(["invoke-human-1.l1.t1.a1.seal", "invoke-human-1.l1.t1.a1.seal.r1"]);
 });
 
+test("replay with a seal record and a retained worker result re-seals idempotently and admits it once", async () => {
+  const host = controller();
+  cutAt(host, value => value.loop?.attempt?.taskId === "change1" && value.loop.attempt.stage === "result");
+  expect((await host.execute()).status).toBe("partial");
+  expect(host.current().loop.attempt).toMatchObject({ key: "invoke-human-1.l1.t1.a1", stage: "launched", seal: { retry: 1 } });
+  host.setFailSave();
+  host.setStatus(ref => { throw Error(`Status '${ref}' unavailable`); });
+  const calls = host.calls.length;
+  const output = await host.execute();
+  expect(output.status, output.reason).toBe("complete");
+  expect(host.statusCalls.slice(0, 1)).toEqual(["invoke-human-1.l1.t1.a1.seal"]);
+  expect(host.calls.slice(calls).map(call => call.key)).toContain("invoke-human-1.l1.t1.a1.seal.r1");
+  expect(host.calls.some(call => call.key === "invoke-human-1.l1.t1.a2")).toBe(false);
+  expect(host.current().tasks.change1.admitted).toEqual(["complete"]);
+  expect(host.current().tasks.change1.completed).toMatchObject({ attempt: 1 });
+});
+
 test("replay with a seal record and unknown worker status observes the sealer, falls back, and admits nothing", async () => {
   const host = controller();
   cutAt(host, value => value.loop?.attempt?.taskId === "change1" && value.loop.attempt.stage === "result");
   expect((await host.execute()).status).toBe("partial");
   expect(host.current().loop.attempt).toMatchObject({ key: "invoke-human-1.l1.t1.a1", stage: "launched", seal: { retry: 1 } });
   host.setFailSave();
+  // Without a retained received result the worker result is unknown.
+  const retained = host.current(); delete retained.loop.attempt.received;
+  host.storage.set("invoke-human-1", retained);
   host.setStatus(ref => { throw Error(`Status '${ref}' unavailable`); });
   host.setRespond((request, normal) => {
     if (request.key === "invoke-human-1.l1.t1.a2") throw Error("Controlled fallback transport stop");
