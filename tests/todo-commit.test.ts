@@ -1,7 +1,7 @@
 import { beforeEach, expect, it } from "bun:test";
 import { isolateTodoConfig } from "../vendor/rpiv-todo/test-isolation.ts";
 import { createMockPi, createMockCtx, makeCustomEntry } from "../vendor/rpiv-todo/test-utils.ts";
-import { createTodoCommit } from "../vendor/rpiv-todo/state/commit.ts";
+import { createTodoCommit, PROJECTION_ACTOR } from "../vendor/rpiv-todo/state/commit.ts";
 import { __resetState, getState, setActiveRenderSession, replaceState } from "../vendor/rpiv-todo/state/store.ts";
 import type { TaskDetails } from "../vendor/rpiv-todo/tool/types.ts";
 import { registerTodoTool } from "../vendor/rpiv-todo/todo.ts";
@@ -55,6 +55,40 @@ it("records unchanged sync sequences, rolls them back on error, and preserves te
  expect(getState("resumed").tasks[0].status).toBe("cancelled");
  expect(commit("resumed",owner,[{...sync(2), rows:[...rows,{key:"deleted",subject:"gone",status:"deleted"}]}]).changed).toBe(true);
  expect(commit("resumed",owner,[{...sync(3),rows:[...rows,{key:"deleted",subject:"revived",status:"pending"}]}]).changed).toBe(false);
+ expect(entries).toHaveLength(4);
+});
+
+it("projection actor batches many owners into one entry, purges only safe tombstones, and cannot mutate main rows", () => {
+ const entries: unknown[] = [];
+ const commit = createTodoCommit({appendEntry(_type,data) { entries.push(data); }});
+ const row = (key:string, extra:Record<string,unknown> = {}) => ({key,subject:key,status:"pending" as const,...extra});
+ const first = commit("p",PROJECTION_ACTOR,[
+   {action:"sync",owner:"execute:a",seq:1,rows:[row("a1"),row("a2"),row("sum",{metadata:{summary:true}}),row("asked",{metadata:{cancel:"request"}})]},
+   {action:"sync",owner:"worker:a:t:1",seq:1,rows:[row("w1",{parentKey:"a2"})]},
+ ]);
+ expect(first.error).toBeUndefined();
+ expect(entries).toHaveLength(1);
+ const id = (key:string) => getState("p").tasks.find(t=>t.metadata?.key===key)!.id;
+ // A main-session cancel request on a reserved row is information the purge must keep.
+ expect(commit("p",undefined,[{action:"cancel",params:{id:id("asked")}}]).error).toBeUndefined();
+ expect(commit("p",undefined,[{action:"create",params:{subject:"main"}}]).error).toBeUndefined();
+ // Retirement: every row is deleted except the live child's parent stays referenced.
+ expect(commit("p",PROJECTION_ACTOR,[{action:"sync",owner:"execute:a",seq:2,rows:[]}]).error).toContain("parent");
+ const retired = commit("p",PROJECTION_ACTOR,[
+   {action:"sync",owner:"worker:a:t:1",seq:2,rows:[]},
+   {action:"sync",owner:"execute:a",seq:2,rows:[]},
+   {action:"purge",owner:"worker:a:t:1"},
+   {action:"purge",owner:"execute:a"},
+ ]);
+ expect(retired.error).toBeUndefined();
+ expect(entries).toHaveLength(4);
+ expect(getState("p").tasks.map(t=>[t.metadata?.key ?? t.subject,t.status])).toEqual([["sum","deleted"],["asked","deleted"],["main","pending"]]);
+ expect(getState("p").nextId).toBe(7);
+ // Purging nothing is a no-op; the projection actor cannot touch main rows; a string actor cannot purge another owner.
+ expect(commit("p",PROJECTION_ACTOR,[{action:"purge",owner:"execute:a"}]).changed).toBe(false);
+ expect(commit("p",PROJECTION_ACTOR,[{action:"create",params:{subject:"x"}}]).error).toContain("projection");
+ expect(commit("p","execute:b",[{action:"purge",owner:"execute:a"}]).error).toContain("scoped owner");
+ expect(commit("p",PROJECTION_ACTOR,[{action:"purge",owner:"main"}]).error).toContain("scoped owner");
  expect(entries).toHaveLength(4);
 });
 

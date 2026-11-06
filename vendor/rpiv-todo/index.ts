@@ -24,7 +24,7 @@ import type { KeyId } from "@earendil-works/pi-tui";
 import { COLLAPSE_KEY_OFF, resolveCollapseKey } from "./config.ts";
 import { I18N_NAMESPACE } from "./state/i18n-bridge.ts";
 import { createTodoCommit, type TodoCommit } from "./state/commit.ts";
-export { createTodoCommit, type TodoCommit, type CommitOperation, type CommitResult } from "./state/commit.ts";
+export { createTodoCommit, PROJECTION_ACTOR, type TodoCommit, type CommitOperation, type CommitResult } from "./state/commit.ts";
 export { replayFromBranch } from "./state/replay.ts";
 import { replayFromBranch } from "./state/replay.ts";
 import {

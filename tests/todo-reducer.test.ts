@@ -145,6 +145,24 @@ describe("actor-aware todo reducer", () => {
 		rejects(base, "update", {id:1, description:"x".repeat(262145-overhead)});
 	});
 
+	it("byte pruning stops at the first fitting prefix of scoped tombstones, measured exactly in UTF-8", () => {
+		const size = (s: TaskState) => new TextEncoder().encode(JSON.stringify({version:1, ...s})).byteLength;
+		// Varied multibyte tombstones put the limit between two removals, not on a row boundary.
+		const tombstones = Array.from({length:120}, (_,i) => task(i+1, {owner:i % 2 ? owner : worker, status:"deleted", description:"é".repeat(900 + i * 7)}));
+		const live = Array.from({length:40}, (_,i) => task(i+121, {description:"ü".repeat(1500)}));
+		const input = state(...tombstones, ...live);
+		expect(size(input)).toBeGreaterThan(262144);
+		const result = finalizeTaskState(input);
+		expect(result.error).toBeUndefined();
+		const kept = new Set(result.state.tasks.map(t => t.id));
+		const pruned = tombstones.filter(t => !kept.has(t.id));
+		expect(pruned.map(t => t.id)).toEqual(pruned.map((_,i) => i+1));
+		expect(size(result.state)).toBeLessThanOrEqual(262144);
+		const oneFewer = {...result.state, tasks:[pruned.at(-1)!, ...result.state.tasks]};
+		expect(size(oneFewer)).toBeGreaterThan(262144);
+		expect(live.every(t => kept.has(t.id))).toBe(true);
+	});
+
 	it("byte pruning preserves non-scoped tombstones and never lowers nextId", () => {
 		const input = state(task(1, {owner, status:"deleted", description:"x".repeat(200000)}), task(2, {status:"deleted"}));
 		const result = mutate(input, "create", {subject:"live", description:"x".repeat(100000)});

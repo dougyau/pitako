@@ -1,12 +1,20 @@
 import type { TaskAction, TaskMutationParams, SyncRow } from "../tool/types.ts";
 import { STATE_ENTRY_TYPE } from "../tool/types.ts";
 import type { TaskState } from "./state.ts";
-import { applyTaskMutation, applyTaskSync, finalizeTaskState, type Op } from "./state-reducer.ts";
+import { applyTaskMutation, applyTaskPurge, applyTaskSync, finalizeTaskState, type Op } from "./state-reducer.ts";
 import { commitState, commitSyncSequences, getActiveRenderSession, getState, getSyncSequences } from "./store.ts";
 
 export type CommitOperation =
 	| { action: TaskAction; params: TaskMutationParams }
-	| { action: "sync"; owner: string; seq: number; rows: readonly SyncRow[] };
+	| { action: "sync"; owner: string; seq: number; rows: readonly SyncRow[] }
+	| { action: "purge"; owner: string };
+
+/**
+ * In-process actor for the execute projection: each sync or purge acts as its own
+ * scoped owner, so one commit can carry many owners. Model input cannot name it.
+ */
+export const PROJECTION_ACTOR: unique symbol = Symbol("pitako.todo.projection");
+export type CommitActor = string | undefined | typeof PROJECTION_ACTOR;
 
 export interface CommitResult {
 	state: TaskState;
@@ -16,7 +24,7 @@ export interface CommitResult {
 	op?: Op;
 }
 
-export type TodoCommit = (sessionId: string, actor: string | undefined, ops: readonly CommitOperation[]) => CommitResult;
+export type TodoCommit = (sessionId: string, actor: CommitActor, ops: readonly CommitOperation[]) => CommitResult;
 
 /** One synchronous write boundary. Replay replacement is a separate lifecycle read. */
 export function createTodoCommit(
@@ -30,12 +38,20 @@ export function createTodoCommit(
 		const sequences = new Map(getSyncSequences(sessionId));
 		const fail = (error: string): CommitResult => ({ state: before, changed: false, error, op: { kind: "error", message: error } });
 		for (const operation of ops) {
-			if (operation.action === "sync") {
-				const result = applyTaskSync(state, actor, operation.owner, operation.seq, operation.rows, sequences.get(operation.owner));
+			if (operation.action === "sync" || operation.action === "purge") {
+				const scoped = actor === PROJECTION_ACTOR ? operation.owner : actor;
+				if (operation.action === "purge") {
+					const result = applyTaskPurge(state, scoped, operation.owner);
+					if (result.error) return fail(result.error);
+					state = result.state;
+					continue;
+				}
+				const result = applyTaskSync(state, scoped, operation.owner, operation.seq, operation.rows, sequences.get(operation.owner));
 				if (result.error) return fail(result.error);
 				state = result.state;
 				if (result.lastSyncSeq !== undefined) sequences.set(operation.owner, result.lastSyncSeq);
 			} else {
+				if (actor === PROJECTION_ACTOR) return fail("the projection actor may only sync or purge");
 				const result = applyTaskMutation(state, operation.action, operation.params, actor);
 				if (result.op.kind === "error") return fail(result.op.message);
 				state = result.state;

@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, constants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, watch, writeSync, type FSWatcher } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, statSync, watch, writeSync, type FSWatcher } from "node:fs";
 import path from "node:path";
 import { SessionManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { replayFromBranch, type TodoCommit } from "../vendor/rpiv-todo/index.ts";
+import { PROJECTION_ACTOR, replayFromBranch, type CommitOperation, type TodoCommit } from "../vendor/rpiv-todo/index.ts";
+import { applyTaskPurge, applyTaskSync } from "../vendor/rpiv-todo/state/state-reducer.ts";
 import { getState, getSyncSequences } from "../vendor/rpiv-todo/state/store.ts";
 import type { TaskState } from "../vendor/rpiv-todo/state/state.ts";
 import type { SyncRow, Task, TaskStatus } from "../vendor/rpiv-todo/tool/types.ts";
@@ -252,6 +253,14 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
   const invocationRoots = new Map<string,string>();
   const workerSnapshots = new Map<string,{loop:number; workers:Map<string,WorkerTodoSnapshot>}>();
   const watchers = new Map<string,FSWatcher>();
+  // Rows last committed per owner. A repeat of the same rows is a no-op sync, so it is skipped
+  // instead of paying a full-state commit for every owner on every refresh.
+  const synced = new Map<string,string>();
+  // Retired runs already synced and purged in this session need no further work.
+  const settled = new Set<string>();
+  // Append-only worker sessions: an unchanged size means an unchanged replay.
+  const replays = new Map<string,{key:string; tasks:readonly Task[]}>();
+  let watchTimer: ReturnType<typeof setTimeout> | undefined;
   const unsubscribe: (()=>void)[] = [];
   const pending = new Set<()=>void>();
   const warn = (error: unknown) => context?.ui.notify(`Execute todo: ${String(error)}`,"warning");
@@ -309,210 +318,253 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
     const ctx = context;
     if (!ctx) return;
     const sessionId = ctx.sessionManager.getSessionId();
-    const state = () => getState(sessionId);
-    for (const row of state().tasks) if (row.owner?.startsWith("execute:")) remember({runId:row.owner.slice(8)});
-    for (const entry of ctx.sessionManager.getBranch()) {
-      if (entry.type === "custom_message" && entry.customType === "subagent-notify" && object(entry.details))
-        for (const run of entry.details.runs ?? []) remember(run);
-      if (entry.type !== "message") continue;
-      const message = entry.message as any;
-      if (message.customType === "subagent-notify") for (const run of message.details?.runs ?? []) remember(run);
-      if (message.role === "toolResult" && message.toolName === "subagent") {
-        remember(message.details);
-        for (const run of message.details?.results ?? []) remember(run);
+    // Stage every sync of this pass on a working copy, then publish one commit and at most one
+    // session entry. Later projections in the same pass read the staged state, as before.
+    let working: TaskState | undefined;
+    const queued: CommitOperation[] = [], staged = new Map<string,string>(), stagedSettled: string[] = [];
+    const sequences = new Map<string,number>();
+    const state = () => working ?? getState(sessionId);
+    try { await project(ctx); }
+    finally {
+      if (epoch === generation) {
+        const result = queued.length ? commit(sessionId,PROJECTION_ACTOR,queued) : undefined;
+        if (result?.error) warn(result.error);
+        else { for (const [owner,rows] of staged) synced.set(owner,rows); for (const runId of stagedSettled) settled.add(runId); }
       }
     }
-    try {
-      const response = await rpc("status");
-      for (const run of response?.asyncSnapshot?.runs ?? []) remember(run);
-    } catch (error) {
-      // A later extension may not have bound its session yet; its ready event retries reconciliation.
-      if (object(error) && error.code === "no_active_session") return;
-      if (known.size) warn(error);
-    }
-    const files = new Set<string>();
-    const runs = new Map<string,{run:any; prior:ExecuteTodoSnapshot|undefined}>();
-    const predecessors = new Map<string,string[]>();
-    // Load lineage before projecting: discovery order must not choose the active run.
-    for (const runId of known.keys()) {
-      if (epoch !== generation) return;
-      try {
-        const run = await status(runId);
-        if (!run) continue;
-        const links = [run.workflow?.reusedFrom,run.workflow?.resumeOrigin?.sourceRunId]
-          .filter((id): id is string => text(id,256) && id !== runId);
-        predecessors.set(runId,links);
-        for (const predecessor of links) remember({runId:predecessor});
-        const found = latestExecuteTodoSnapshot(run.workflow?.emits);
-        if (!found) continue;
-        if (typeof run.cwd === "string" && path.isAbsolute(run.cwd)) {
-          let root = run.cwd;
-          try { root = realpathSync(root); } catch { /* Retained history may refer to a removed worktree. */ }
-          invocationRoots.set(found.invocation,root);
-        }
-        const prior = latest.get(runId);
-        if (!prior || found.seq > prior.seq) latest.set(runId,found);
-        runs.set(runId,{run,prior});
-      } catch (error) { warn(error); }
-    }
-    if (epoch !== generation) return;
-    // Unblock and budget relaunches are new top-level runs without native links. One invocation
-    // has one live root, so the newest run of an invocation succeeds the earlier ones.
-    const relaunches = new Map<string,string[]>();
-    for (const [runId,{run}] of runs) {
-      const invocation = latest.get(runId)!.invocation;
-      if (!Number.isFinite(run.startedAt)) continue;
-      relaunches.set(invocation,[...relaunches.get(invocation) ?? [],runId]);
-    }
-    for (const family of relaunches.values()) {
-      family.sort((a,b) => runs.get(a)!.run.startedAt - runs.get(b)!.run.startedAt);
-      for (let index = 1; index < family.length; index++) {
-        const links = predecessors.get(family[index])!;
-        if (!links.includes(family[index-1])) links.push(family[index-1]);
-      }
-    }
-    // Rows of a run removed by retention stay frozen; the live run of their invocation adopts them.
-    const orphans = new Map<string,string>();
-    for (const row of state().tasks) {
-      const runId = row.owner?.startsWith("execute:") ? row.owner.slice(8) : undefined;
-      if (!runId || !absent.has(runId) || row.status === "deleted" || row.metadata?.summary === true || !invocationId(row.metadata?.invocation)) continue;
-      const family = relaunches.get(row.metadata.invocation) ?? [...runs.keys()].filter(id => latest.get(id)?.invocation === row.metadata!.invocation);
-      const successor = family.at(-1);
-      if (!successor || orphans.has(runId)) continue;
-      orphans.set(runId,row.metadata.invocation);
-      predecessors.set(runId,[]);
-      predecessors.get(successor)!.push(runId);
-    }
-    recordDeletedExecuteTodoSummaries(ctx.cwd,state(),invocationRoots);
-    const rootFor = (invocation: string) => invocationRoots.get(invocation) ?? ctx.cwd;
-    function lineage(runId: string, seen = new Set<string>(), invocation = latest.get(runId)?.invocation): string[] {
-      seen.add(runId);
-      for (const id of predecessors.get(runId) ?? []) {
-        const snapshot = latest.get(id);
-        // A snapshot-free relaunch bridges lineage, but cannot bridge different invocations.
-        if (!seen.has(id) && predecessors.has(id) && (!snapshot || snapshot.invocation === invocation))
-          lineage(id,seen,invocation);
-      }
-      return [...seen];
-    }
-    const superseded = new Set<string>();
-    for (const runId of runs.keys()) for (const id of lineage(runId))
-      if (id !== runId && runs.has(id)) superseded.add(id);
     function sync(projection: OwnerSnapshot) {
-      const seq = (getSyncSequences(sessionId).get(projection.owner) ?? 0)+1;
-      const result = commit(sessionId,projection.owner,[{action:"sync",owner:projection.owner,seq,rows:projection.rows}]);
+      const rows = JSON.stringify(projection.rows);
+      if ((staged.get(projection.owner) ?? synced.get(projection.owner)) === rows) return;
+      const last = sequences.get(projection.owner) ?? getSyncSequences(sessionId).get(projection.owner);
+      const seq = (last ?? 0)+1;
+      const result = applyTaskSync(state(),projection.owner,projection.owner,seq,projection.rows,last);
       if (result.error) throw new Error(result.error);
+      staged.set(projection.owner,rows);
+      if (!result.changed) return;
+      working = result.state; sequences.set(projection.owner,seq);
+      queued.push({action:"sync",owner:projection.owner,seq,rows:projection.rows});
     }
-    const retirements = new Map<string,Set<string>>();
-    function retiredRuns(invocation: string) {
-      let retired = retirements.get(invocation);
-      if (!retired) { retired = readRetiredExecuteTodoRuns(rootFor(invocation),invocation); retirements.set(invocation,retired); }
-      return retired;
+    function purge(owner: string) {
+      const result = applyTaskPurge(state(),owner,owner);
+      if (!result.changed) return;
+      working = result.state;
+      queued.push({action:"purge",owner});
     }
-    function retire(runId: string, invocation: string) {
-      const retired = retiredRuns(invocation);
-      if (retired.has(runId)) return;
-      appendExecuteTodoRecords(rootFor(invocation),invocation,"retired-runs.jsonl",[
-        {requestId:digest(`${invocation}\0retired:${runId}`),...{v:1,invocation,runId}},
-      ]);
-      retired.add(runId);
-    }
-    function canDeriveRequests(runId: string, snapshot: ExecuteTodoSnapshot) {
-      if (retiredRuns(snapshot.invocation).has(runId)) return false;
-      const rows = state().tasks.filter(t => t.owner === `execute:${runId}`);
-      const active = rows.some(t => t.status !== "deleted" && t.metadata?.summary !== true);
-      // Upgrade legacy retirement before projection can recreate a phase. Old-loop history is not retirement.
-      if (!active && !snapshot.outcome && rows.some(t => t.status === "deleted" && t.metadata?.summary !== true && t.metadata?.loop === snapshot.loop)) retire(runId,snapshot.invocation);
-      return active;
-    }
-    for (const runId of superseded) {
-      if (epoch !== generation) return;
-      try {
-        const snapshot = latest.get(runId)!;
-        if (canDeriveRequests(runId,snapshot))
-          appendExecuteTodoRecords(rootFor(snapshot.invocation),snapshot.invocation,"requests.jsonl",deriveExecuteTodoRequests(runId,snapshot,state()));
-      } catch (error) { warn(error); return; }
-    }
-    for (const [runId,{run,prior}] of runs) {
-      if (epoch !== generation) return;
-      if (superseded.has(runId)) continue;
-      try {
-        const snapshot = haltedView(latest.get(runId)!,run);
-        let cache = workerSnapshots.get(runId);
-        if (!cache || cache.loop !== snapshot.loop) {
-          cache = {loop:snapshot.loop,workers:new Map()}; workerSnapshots.set(runId,cache);
+    async function project(ctx: ExtensionContext) {
+      for (const row of state().tasks) if (row.owner?.startsWith("execute:")) remember({runId:row.owner.slice(8)});
+      for (const entry of ctx.sessionManager.getBranch()) {
+        if (entry.type === "custom_message" && entry.customType === "subagent-notify" && object(entry.details))
+          for (const run of entry.details.runs ?? []) remember(run);
+        if (entry.type !== "message") continue;
+        const message = entry.message as any;
+        if (message.customType === "subagent-notify") for (const run of message.details?.runs ?? []) remember(run);
+        if (message.role === "toolResult" && message.toolName === "subagent") {
+          remember(message.details);
+          for (const run of message.details?.results ?? []) remember(run);
         }
-        const bindings = new Map<string,NonNullable<ExecuteTodoSnapshot["active"]>>();
-        // Retain the last task/attempt mapping when the completing snapshot clears active.
-        for (const emit of run.workflow?.emits ?? []) {
-          const value = latestExecuteTodoSnapshot([emit]);
-          if (value?.loop === snapshot.loop && value.seq <= snapshot.seq && value.active) bindings.set(value.active.taskId,value.active);
-        }
-        if (prior?.loop === snapshot.loop && prior.active) bindings.set(prior.active.taskId,prior.active);
-        if (snapshot.active) bindings.set(snapshot.active.taskId,snapshot.active);
-        const childIds = new Map<string,string>();
-        if (!snapshot.outcome) for (const binding of bindings.values()) {
-          const parent = state().tasks.find(t => t.metadata?.key === taskKey(runId,snapshot.loop,binding.taskId));
-          if (snapshot.active?.taskId !== binding.taskId && parent?.status !== "in_progress") continue;
-          for (const step of run.steps ?? []) {
-            if (step.workflowKey !== binding.workflowKey || !text(step.runId,256)) continue;
-            remember(step);
-            let child: any;
-            // One unreadable worker must not stop the other runs or retirement.
-            try { child = await status(step.runId); } catch (error) { warn(error); continue; }
-            if (!child || !lineage(runId).includes(child.parentWorkflowRunId) || child.workflowKey !== binding.workflowKey) continue;
-            const file = child.steps?.[0]?.sessionFile;
-            if (typeof file !== "string" || !existsSync(file)) continue;
-            const owner = workerOwner(runId,binding.taskId,binding.attempt);
-            childIds.set(owner,step.runId);
-            const replay = replayFromBranch({sessionManager:SessionManager.open(file)});
-            cache.workers.set(owner,{taskId:binding.taskId,attempt:binding.attempt,tasks:replay.tasks});
-            if (snapshot.active?.workflowKey === binding.workflowKey && !terminalRun(child.state)) files.add(file);
+      }
+      try {
+        const response = await rpc("status");
+        for (const run of response?.asyncSnapshot?.runs ?? []) remember(run);
+      } catch (error) {
+        // A later extension may not have bound its session yet; its ready event retries reconciliation.
+        if (object(error) && error.code === "no_active_session") return;
+        if (known.size) warn(error);
+      }
+      const files = new Set<string>();
+      const runs = new Map<string,{run:any; prior:ExecuteTodoSnapshot|undefined}>();
+      const predecessors = new Map<string,string[]>();
+      // Load lineage before projecting: discovery order must not choose the active run.
+      for (const runId of known.keys()) {
+        // Yield to I/O between runs so RPC requests are answered during a long pass.
+        await new Promise(resolve => setImmediate(resolve));
+        if (epoch !== generation) return;
+        try {
+          const run = await status(runId);
+          if (!run) continue;
+          const links = [run.workflow?.reusedFrom,run.workflow?.resumeOrigin?.sourceRunId]
+            .filter((id): id is string => text(id,256) && id !== runId);
+          predecessors.set(runId,links);
+          for (const predecessor of links) remember({runId:predecessor});
+          const found = latestExecuteTodoSnapshot(run.workflow?.emits);
+          if (!found) continue;
+          if (typeof run.cwd === "string" && path.isAbsolute(run.cwd)) {
+            let root = run.cwd;
+            try { root = realpathSync(root); } catch { /* Retained history may refer to a removed worktree. */ }
+            invocationRoots.set(found.invocation,root);
           }
-        }
-        const workers = [...cache.workers.values()];
-        if (epoch !== generation) return;
-        if (canDeriveRequests(runId,snapshot))
-          appendExecuteTodoRecords(rootFor(snapshot.invocation),snapshot.invocation,"requests.jsonl",deriveExecuteTodoRequests(runId,snapshot,state()));
-        // Persist best-effort steer receipts; terminal main steps remain sticky regardless of delivery.
-        for (const worker of workers) for (const step of worker.tasks) {
-          if (snapshot.active?.taskId !== worker.taskId || snapshot.active.attempt !== worker.attempt) continue;
-          const key = `exec:${runId}:step:${snapshot.loop}:${worker.taskId}:${worker.attempt}:${step.id}`;
-          const main = state().tasks.find(t => t.metadata?.key === key);
-          if (!main || !["cancelled","deleted"].includes(main.status) || terminal(step.status) || state().tasks.some(t => t.id === main.parentId && t.status === "deleted")) continue;
-          const requestId = digest(`${key}\0${main.status}`);
-          const receiptFile = path.join(requestDirectory(rootFor(snapshot.invocation),snapshot.invocation),"step-receipts.jsonl");
-          if (existsSync(receiptFile) && readFileSync(receiptFile,"utf8").split("\n").filter(Boolean).some(line => JSON.parse(line).requestId === requestId)) continue;
-          let receipt: unknown;
-          try { receipt = await rpc("steer",{id:childIds.get(workerOwner(runId,worker.taskId,worker.attempt)),message:`Main-session model requested ${main.status === "deleted" ? "delete" : "cancel"} of todo step ${step.id}. Display only: this never drops required work or checks.`,mode:"steer"}); }
-          catch (error) { receipt = {state:"failed",reason:String(error).slice(0,240)}; }
-          if (epoch !== generation) return;
-          appendExecuteTodoRecords(rootFor(snapshot.invocation),snapshot.invocation,"step-receipts.jsonl",[{requestId, ...{v:1,origin:"model",taskId:worker.taskId,todoId:step.id,receipt}}]);
-        }
-        if (epoch !== generation) return;
-        const family = lineage(runId);
-        const deletions = readExecuteTodoDeletions(rootFor(snapshot.invocation),snapshot,family,state());
-        const summaryDeleted = deletedExecuteTodoSummary(rootFor(snapshot.invocation),snapshot,family);
-        for (const projection of projectExecuteTodos(runId,snapshot,workers,state(),family.filter(id => id !== runId),deletions,summaryDeleted)) sync(projection);
-      } catch (error) { warn(error); return; }
-    }
-    // Retire only after successor display decisions have been durably carried over.
-    for (const [runId,invocation] of [...[...superseded].map(id => [id,latest.get(id)!.invocation] as const),...orphans]) {
+          const prior = latest.get(runId);
+          if (!prior || found.seq > prior.seq) latest.set(runId,found);
+          runs.set(runId,{run,prior});
+        } catch (error) { warn(error); }
+      }
       if (epoch !== generation) return;
-      try {
-        retire(runId,invocation);
-        const owners = new Set(state().tasks.filter(t => t.owner?.startsWith(`worker:${runId}:`)).map(t => t.owner!));
-        for (const owner of owners) sync({owner,rows:[]});
-        const family = [...runs.keys()].filter(id => lineage(id).includes(runId)).flatMap(id => lineage(id));
-        const summaries = state().tasks.filter(t => family.includes(t.owner?.slice(8) ?? "") && t.owner?.startsWith("execute:") && t.metadata?.summary === true);
-        sync({owner:`execute:${runId}`,rows:summaries.filter(t => t.owner === `execute:${runId}` && summaries.find(p => p.metadata?.loop === t.metadata?.loop)?.id === t.id).map(toRow)});
-      } catch (error) { warn(error); return; }
-    }
-    if (epoch !== generation) return;
-    for (const [file,watcher] of watchers) if (!files.has(file)) { watcher.close(); watchers.delete(file); }
-    for (const file of files) if (!watchers.has(file)) {
-      const watcher = watch(file,() => { void refresh(); });
-      watcher.on("error",warn); watchers.set(file,watcher);
+      // Unblock and budget relaunches are new top-level runs without native links. One invocation
+      // has one live root, so the newest run of an invocation succeeds the earlier ones.
+      const relaunches = new Map<string,string[]>();
+      for (const [runId,{run}] of runs) {
+        const invocation = latest.get(runId)!.invocation;
+        if (!Number.isFinite(run.startedAt)) continue;
+        relaunches.set(invocation,[...relaunches.get(invocation) ?? [],runId]);
+      }
+      for (const family of relaunches.values()) {
+        family.sort((a,b) => runs.get(a)!.run.startedAt - runs.get(b)!.run.startedAt);
+        for (let index = 1; index < family.length; index++) {
+          const links = predecessors.get(family[index])!;
+          if (!links.includes(family[index-1])) links.push(family[index-1]);
+        }
+      }
+      // Rows of a run removed by retention stay frozen; the live run of their invocation adopts them.
+      const orphans = new Map<string,string>();
+      for (const row of state().tasks) {
+        const runId = row.owner?.startsWith("execute:") ? row.owner.slice(8) : undefined;
+        if (!runId || !absent.has(runId) || row.status === "deleted" || row.metadata?.summary === true || !invocationId(row.metadata?.invocation)) continue;
+        const family = relaunches.get(row.metadata.invocation) ?? [...runs.keys()].filter(id => latest.get(id)?.invocation === row.metadata!.invocation);
+        const successor = family.at(-1);
+        if (!successor || orphans.has(runId)) continue;
+        orphans.set(runId,row.metadata.invocation);
+        predecessors.set(runId,[]);
+        predecessors.get(successor)!.push(runId);
+      }
+      recordDeletedExecuteTodoSummaries(ctx.cwd,state(),invocationRoots);
+      const rootFor = (invocation: string) => invocationRoots.get(invocation) ?? ctx.cwd;
+      function lineage(runId: string, seen = new Set<string>(), invocation = latest.get(runId)?.invocation): string[] {
+        seen.add(runId);
+        for (const id of predecessors.get(runId) ?? []) {
+          const snapshot = latest.get(id);
+          // A snapshot-free relaunch bridges lineage, but cannot bridge different invocations.
+          if (!seen.has(id) && predecessors.has(id) && (!snapshot || snapshot.invocation === invocation))
+            lineage(id,seen,invocation);
+        }
+        return [...seen];
+      }
+      const superseded = new Set<string>();
+      for (const runId of runs.keys()) for (const id of lineage(runId))
+        if (id !== runId && runs.has(id)) superseded.add(id);
+      const retirements = new Map<string,Set<string>>();
+      function retiredRuns(invocation: string) {
+        let retired = retirements.get(invocation);
+        if (!retired) { retired = readRetiredExecuteTodoRuns(rootFor(invocation),invocation); retirements.set(invocation,retired); }
+        return retired;
+      }
+      function retire(runId: string, invocation: string) {
+        const retired = retiredRuns(invocation);
+        if (retired.has(runId)) return;
+        appendExecuteTodoRecords(rootFor(invocation),invocation,"retired-runs.jsonl",[
+          {requestId:digest(`${invocation}\0retired:${runId}`),...{v:1,invocation,runId}},
+        ]);
+        retired.add(runId);
+      }
+      function canDeriveRequests(runId: string, snapshot: ExecuteTodoSnapshot) {
+        if (retiredRuns(snapshot.invocation).has(runId)) return false;
+        const rows = state().tasks.filter(t => t.owner === `execute:${runId}`);
+        const active = rows.some(t => t.status !== "deleted" && t.metadata?.summary !== true);
+        // Upgrade legacy retirement before projection can recreate a phase. Old-loop history is not retirement.
+        if (!active && !snapshot.outcome && rows.some(t => t.status === "deleted" && t.metadata?.summary !== true && t.metadata?.loop === snapshot.loop)) retire(runId,snapshot.invocation);
+        return active;
+      }
+      for (const runId of superseded) {
+        if (epoch !== generation) return;
+        try {
+          const snapshot = latest.get(runId)!;
+          if (canDeriveRequests(runId,snapshot))
+            appendExecuteTodoRecords(rootFor(snapshot.invocation),snapshot.invocation,"requests.jsonl",deriveExecuteTodoRequests(runId,snapshot,state()));
+        } catch (error) { warn(error); return; }
+      }
+      for (const [runId,{run,prior}] of runs) {
+        if (superseded.has(runId)) continue;
+        await new Promise(resolve => setImmediate(resolve));
+        if (epoch !== generation) return;
+        try {
+          const snapshot = haltedView(latest.get(runId)!,run);
+          let cache = workerSnapshots.get(runId);
+          if (!cache || cache.loop !== snapshot.loop) {
+            cache = {loop:snapshot.loop,workers:new Map()}; workerSnapshots.set(runId,cache);
+          }
+          const bindings = new Map<string,NonNullable<ExecuteTodoSnapshot["active"]>>();
+          // Retain the last task/attempt mapping when the completing snapshot clears active.
+          for (const emit of run.workflow?.emits ?? []) {
+            const value = latestExecuteTodoSnapshot([emit]);
+            if (value?.loop === snapshot.loop && value.seq <= snapshot.seq && value.active) bindings.set(value.active.taskId,value.active);
+          }
+          if (prior?.loop === snapshot.loop && prior.active) bindings.set(prior.active.taskId,prior.active);
+          if (snapshot.active) bindings.set(snapshot.active.taskId,snapshot.active);
+          const childIds = new Map<string,string>();
+          if (!snapshot.outcome) for (const binding of bindings.values()) {
+            const parent = state().tasks.find(t => t.metadata?.key === taskKey(runId,snapshot.loop,binding.taskId));
+            if (snapshot.active?.taskId !== binding.taskId && parent?.status !== "in_progress") continue;
+            for (const step of run.steps ?? []) {
+              if (step.workflowKey !== binding.workflowKey || !text(step.runId,256)) continue;
+              remember(step);
+              let child: any;
+              // One unreadable worker must not stop the other runs or retirement.
+              try { child = await status(step.runId); } catch (error) { warn(error); continue; }
+              if (!child || !lineage(runId).includes(child.parentWorkflowRunId) || child.workflowKey !== binding.workflowKey) continue;
+              const file = child.steps?.[0]?.sessionFile;
+              if (typeof file !== "string" || !existsSync(file)) continue;
+              const owner = workerOwner(runId,binding.taskId,binding.attempt);
+              childIds.set(owner,step.runId);
+              const stat = statSync(file), key = `${stat.ino}:${stat.size}`;
+              let replay = replays.get(file);
+              if (replay?.key !== key) { replay = {key,tasks:replayFromBranch({sessionManager:SessionManager.open(file)}).tasks}; replays.set(file,replay); }
+              cache.workers.set(owner,{taskId:binding.taskId,attempt:binding.attempt,tasks:replay.tasks});
+              if (snapshot.active?.workflowKey === binding.workflowKey && !terminalRun(child.state)) files.add(file);
+            }
+          }
+          const workers = [...cache.workers.values()];
+          if (epoch !== generation) return;
+          if (canDeriveRequests(runId,snapshot))
+            appendExecuteTodoRecords(rootFor(snapshot.invocation),snapshot.invocation,"requests.jsonl",deriveExecuteTodoRequests(runId,snapshot,state()));
+          // Persist best-effort steer receipts; terminal main steps remain sticky regardless of delivery.
+          for (const worker of workers) for (const step of worker.tasks) {
+            if (snapshot.active?.taskId !== worker.taskId || snapshot.active.attempt !== worker.attempt) continue;
+            const key = `exec:${runId}:step:${snapshot.loop}:${worker.taskId}:${worker.attempt}:${step.id}`;
+            const main = state().tasks.find(t => t.metadata?.key === key);
+            if (!main || !["cancelled","deleted"].includes(main.status) || terminal(step.status) || state().tasks.some(t => t.id === main.parentId && t.status === "deleted")) continue;
+            const requestId = digest(`${key}\0${main.status}`);
+            const receiptFile = path.join(requestDirectory(rootFor(snapshot.invocation),snapshot.invocation),"step-receipts.jsonl");
+            if (existsSync(receiptFile) && readFileSync(receiptFile,"utf8").split("\n").filter(Boolean).some(line => JSON.parse(line).requestId === requestId)) continue;
+            let receipt: unknown;
+            try { receipt = await rpc("steer",{id:childIds.get(workerOwner(runId,worker.taskId,worker.attempt)),message:`Main-session model requested ${main.status === "deleted" ? "delete" : "cancel"} of todo step ${step.id}. Display only: this never drops required work or checks.`,mode:"steer"}); }
+            catch (error) { receipt = {state:"failed",reason:String(error).slice(0,240)}; }
+            if (epoch !== generation) return;
+            appendExecuteTodoRecords(rootFor(snapshot.invocation),snapshot.invocation,"step-receipts.jsonl",[{requestId, ...{v:1,origin:"model",taskId:worker.taskId,todoId:step.id,receipt}}]);
+          }
+          if (epoch !== generation) return;
+          const family = lineage(runId);
+          const deletions = readExecuteTodoDeletions(rootFor(snapshot.invocation),snapshot,family,state());
+          const summaryDeleted = deletedExecuteTodoSummary(rootFor(snapshot.invocation),snapshot,family);
+          for (const projection of projectExecuteTodos(runId,snapshot,workers,state(),family.filter(id => id !== runId),deletions,summaryDeleted)) sync(projection);
+        } catch (error) { warn(error); return; }
+      }
+      // Retire only after successor display decisions have been durably carried over.
+      for (const [runId,invocation] of [...[...superseded].map(id => [id,latest.get(id)!.invocation] as const),...orphans]) {
+        if (epoch !== generation) return;
+        if (settled.has(runId)) continue;
+        try {
+          retire(runId,invocation);
+          const owners = new Set(state().tasks.filter(t => t.owner?.startsWith(`worker:${runId}:`)).map(t => t.owner!));
+          for (const owner of owners) sync({owner,rows:[]});
+          const family = [...runs.keys()].filter(id => lineage(id).includes(runId)).flatMap(id => lineage(id));
+          const summaries = state().tasks.filter(t => family.includes(t.owner?.slice(8) ?? "") && t.owner?.startsWith("execute:") && t.metadata?.summary === true);
+          sync({owner:`execute:${runId}`,rows:summaries.filter(t => t.owner === `execute:${runId}` && summaries.find(p => p.metadata?.loop === t.metadata?.loop)?.id === t.id).map(toRow)});
+          // Retirement is journaled and its successor carried the display decisions over above,
+          // so its tombstones only cost commit and session bytes from here on.
+          for (const owner of owners) purge(owner);
+          purge(`execute:${runId}`);
+          stagedSettled.push(runId);
+        } catch (error) { warn(error); return; }
+      }
+      if (epoch !== generation) return;
+      for (const [file,watcher] of watchers) if (!files.has(file)) { watcher.close(); watchers.delete(file); }
+      for (const file of files) if (!watchers.has(file)) {
+        // Worker sessions write in bursts; one trailing refresh covers a burst.
+        const watcher = watch(file,() => {
+          if (watchTimer) return;
+          watchTimer = setTimeout(() => { watchTimer = undefined; void refresh(); },250);
+        });
+        watcher.on("error",warn); watchers.set(file,watcher);
+      }
     }
   }
   function refresh(): Promise<void> {
@@ -530,14 +582,18 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
       catch (error) { warn(error); }
     }
     context = undefined; generation++; dirty = false;
+    clearTimeout(watchTimer); watchTimer = undefined;
     for (const watcher of watchers.values()) watcher.close(); watchers.clear();
     for (const cancel of pending) cancel();
     await running; known.clear(); absent.clear(); latest.clear(); workerSnapshots.clear(); invocationRoots.clear();
+    synced.clear(); settled.clear(); replays.clear();
   }
+  // Branch moves replace the todo state from replay; prior sync knowledge no longer holds.
+  function forget() { synced.clear(); settled.clear(); }
   pi.on("session_start",async (_event,ctx) => { await stop(); context=ctx; await refresh(); });
   pi.on("session_shutdown",async () => { await stop(); for (const off of unsubscribe) off(); });
-  pi.on("session_tree",async (_event,ctx) => { context=ctx; await refresh(); });
-  pi.on("session_compact",async (_event,ctx) => { context=ctx; await refresh(); });
+  pi.on("session_tree",async (_event,ctx) => { context=ctx; forget(); await refresh(); });
+  pi.on("session_compact",async (_event,ctx) => { context=ctx; forget(); await refresh(); });
   pi.on("tool_result",async (event) => {
     if (event.toolName === "todo" && context) {
       try { recordDeletedExecuteTodoSummaries(context.cwd,getState(context.sessionManager.getSessionId()),invocationRoots); }
