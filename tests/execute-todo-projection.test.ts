@@ -357,6 +357,31 @@ describe("execute todo registration and reconciliation",()=>{
     } finally {await f.close();}
   });
 
+  test("history child runs are never inspected and finished snapshot-free runs are read once but still bridge lineage",async()=>{
+    const f=runtimeFixture();
+    try {
+      const children=Array.from({length:50},(_,i)=>({runId:`history-child-${i}`}));
+      const notes=SessionManager.inMemory(f.root);
+      notes.appendCustomMessageEntry("subagent-notify","Done",false,{runs:[{runId:"run",childRuns:children}]});
+      Object.assign(f.ctx.sessionManager,{getBranch:()=>notes.getBranch()});
+      await f.fire("session_start");
+      // The root's own steps still bind its live worker.
+      expect(visible(getState(f.sid).tasks).filter(t=>t.parentId)).toHaveLength(2);
+      expect(f.statusIds.filter(id=>id.startsWith("history-child-"))).toEqual([]);
+      const middle=f.addRun("middle",snapshot(),{reusedFrom:"run",emits:[]},{state:"complete"});
+      f.addRun("successor",snapshot(),{reusedFrom:"middle"});
+      f.setRuns([{id:"successor"}]);
+      await f.fire("tool_result",{toolName:"subagent"});
+      const owners=()=>new Set(visible(getState(f.sid).tasks).map(t=>t.owner));
+      expect(owners()).toEqual(new Set(["execute:successor","worker:successor:t1:1"]));
+      // A later read of the finished middle run would now throw and warn.
+      writeFileSync(path.join(middle,"status.json"),"not json");
+      for (let i=0;i<3;i++) await f.fire("tool_result",{toolName:"subagent"});
+      expect(f.ctx.ui.notify).not.toHaveBeenCalled();
+      expect(owners()).toEqual(new Set(["execute:successor","worker:successor:t1:1"]));
+    } finally {await f.close();}
+  });
+
   test("worker binding is verified; main step cancel persists a single best-effort steer receipt",async()=>{
     const f=runtimeFixture();
     try {

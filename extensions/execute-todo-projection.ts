@@ -249,6 +249,8 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
   const known = new Map<string,string | undefined>();
   // Retention removes old runs and branch history names non-execute runs: absence is normal, not a warning.
   const absent = new Set<string>();
+  // Finished runs that never emitted an execute snapshot cannot start to; keep only their lineage links.
+  const inert = new Map<string,string[]>();
   const latest = new Map<string,ExecuteTodoSnapshot>();
   const invocationRoots = new Map<string,string>();
   const workerSnapshots = new Map<string,{loop:number; workers:Map<string,WorkerTodoSnapshot>}>();
@@ -279,14 +281,14 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
     });
   }
   // Live events are fresh evidence that a run exists again; branch history is not.
-  function remember(value: any, fresh = false) {
+  function remember(value: any, fresh = false, children = true) {
     if (!object(value)) return;
     const id = value.runId ?? value.id;
     if (text(id,256)) {
       known.set(id,typeof value.asyncDir === "string" ? value.asyncDir : known.get(id));
-      if (fresh) absent.delete(id);
+      if (fresh) { absent.delete(id); inert.delete(id); }
     }
-    for (const child of value.childRuns ?? []) remember(child,fresh);
+    if (children) for (const child of value.childRuns ?? []) remember(child,fresh);
   }
   async function status(runId: string) {
     if (absent.has(runId)) return;
@@ -300,8 +302,9 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
       }
       remember(response?.details);
       directory = known.get(runId);
+      // A run without an async directory has no status file to read, now or on the next pass.
+      if (!directory) { absent.add(runId); return; }
     }
-    if (!directory) return;
     let bytes: string;
     try { bytes = readFileSync(path.join(directory,"status.json"),"utf8"); }
     catch (error: any) {
@@ -352,15 +355,17 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
     }
     async function project(ctx: ExtensionContext) {
       for (const row of state().tasks) if (row.owner?.startsWith("execute:")) remember({runId:row.owner.slice(8)});
+      // History names execute roots at top level. Its child runs are workers and runtime agents,
+      // which never emit execute snapshots; a root's own steps reach the live ones.
       for (const entry of ctx.sessionManager.getBranch()) {
         if (entry.type === "custom_message" && entry.customType === "subagent-notify" && object(entry.details))
-          for (const run of entry.details.runs ?? []) remember(run);
+          for (const run of entry.details.runs ?? []) remember(run,false,false);
         if (entry.type !== "message") continue;
         const message = entry.message as any;
-        if (message.customType === "subagent-notify") for (const run of message.details?.runs ?? []) remember(run);
+        if (message.customType === "subagent-notify") for (const run of message.details?.runs ?? []) remember(run,false,false);
         if (message.role === "toolResult" && message.toolName === "subagent") {
-          remember(message.details);
-          for (const run of message.details?.results ?? []) remember(run);
+          remember(message.details,false,false);
+          for (const run of message.details?.results ?? []) remember(run,false,false);
         }
       }
       try {
@@ -380,6 +385,12 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
         await new Promise(resolve => setImmediate(resolve));
         if (epoch !== generation) return;
         try {
+          const cached = inert.get(runId);
+          if (cached) {
+            predecessors.set(runId,cached);
+            for (const predecessor of cached) remember({runId:predecessor});
+            continue;
+          }
           const run = await status(runId);
           if (!run) continue;
           const links = [run.workflow?.reusedFrom,run.workflow?.resumeOrigin?.sourceRunId]
@@ -387,7 +398,7 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
           predecessors.set(runId,links);
           for (const predecessor of links) remember({runId:predecessor});
           const found = latestExecuteTodoSnapshot(run.workflow?.emits);
-          if (!found) continue;
+          if (!found) { if (terminalRun(String(run.state))) inert.set(runId,links); continue; }
           if (typeof run.cwd === "string" && path.isAbsolute(run.cwd)) {
             let root = run.cwd;
             try { root = realpathSync(root); } catch { /* Retained history may refer to a removed worktree. */ }
@@ -585,7 +596,7 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
     clearTimeout(watchTimer); watchTimer = undefined;
     for (const watcher of watchers.values()) watcher.close(); watchers.clear();
     for (const cancel of pending) cancel();
-    await running; known.clear(); absent.clear(); latest.clear(); workerSnapshots.clear(); invocationRoots.clear();
+    await running; known.clear(); absent.clear(); inert.clear(); latest.clear(); workerSnapshots.clear(); invocationRoots.clear();
     synced.clear(); settled.clear(); replays.clear();
   }
   // Branch moves replace the todo state from replay; prior sync knowledge no longer holds.
