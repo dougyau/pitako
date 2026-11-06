@@ -22,6 +22,7 @@ import { captureCheckpoint, sealCheckpoint } from "../extensions/execute-checkpo
 import { executeMaxCycles } from "../extensions/execute-settings.ts";
 import registerPlanExecute, { analysisResource, executionResource } from "../extensions/plan-execute.ts";
 import { verifyGate } from "../extensions/access-receipts.mjs";
+import { canonicalDigest } from "../extensions/canonical.mjs";
 import { profileNote } from "../extensions/profile.ts";
 import { DEFAULT_SKILL_NAMES } from "../extensions/catalog.ts";
 import { checkoutEvidence, digest, MAX_SPEC_BYTES, preliminarySpec, SPEC_SECTIONS, validateSpec } from "../extensions/spec-plans.ts";
@@ -1728,6 +1729,7 @@ describe("packaged workflow caller examples", () => {
     const root = mkdtempSync(path.join(tmpdir(), "pitako-guidance-")); roots.push(root);
     const [creationBlock, ...blocks] = [...read("skills/architecture/SKILL.md").matchAll(/```js\n([\s\S]*?)```/g)].map(match => match[1]!);
     const calls: any[] = [], storage = new Map<string, any>();
+    const { appendLedger, verifyLedger } = await import(path.resolve("skills/architecture/ledger.mjs"));
     const capture = (input: any) => { calls.push(input); };
     new Function("subagent", creationBlock!)(capture);
     expect(calls.pop()).toMatchObject({ action: "mission.create", options: { mission: { title: expect.stringContaining("parser") } } });
@@ -1746,6 +1748,9 @@ describe("packaged workflow caller examples", () => {
       const result = await runWorkflowScript({ script: resolved.script,
         state: { get: key => storage.get(key), set: (key, value) => { storage.set(key, structuredClone(value)); } },
         launch: async (key, request) => {
+          if (request.agent === "pitako.architecture-ledger") return { key, ok: true, agent: request.agent, runId: `ledger-${++sequence}`,
+            output: JSON.stringify(appendLedger(JSON.parse(String(request.task)))), artifactPaths: [],
+            results: [{ index: 0, agent: request.agent, task: String(request.task), exitCode: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } }] };
           if (request.agent === "pitako.access-verifier") return { key, ok: true, agent: request.agent, runId: `verify-${++sequence}`,
             output: JSON.stringify(verifyGate(JSON.parse(String(request.task)))), artifactPaths: [],
             results: [{ index: 0, agent: request.agent, task: String(request.task), exitCode: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } }] };
@@ -1758,11 +1763,26 @@ describe("packaged workflow caller examples", () => {
           for (const entry of references ? JSON.parse(references[1]!) : []) {
             expect(Object.keys(entry).sort()).toEqual(["digest", "id", "path"]);
             const exact = JSON.parse(readFileSync(entry.path, "utf8"));
-            const admitted = storage.get(`architecture-${args.consultation}`).originals.find((item: any) => item.id === entry.id);
-            expect(admitted.association.revision).toBe(Number(entry.id.split(".v")[1].split(".")[0]));
-            expect(admitted.runId).toMatch(/^example-/);
-            expect(admitted.delivery).toBe("complete");
-            expect(exact).toEqual(admitted.value);
+            expect(canonicalDigest(exact)).toBe(entry.digest);
+            if (entry.id.startsWith("context-")) {
+              const context = storage.get(`architecture-${args.consultation}`).cursor.control.context;
+              expect(context[entry.id.slice("context-".length)]).toEqual({ seq: Number(path.basename(entry.path, ".json")), digest: entry.digest });
+              expect(exact.kind).toBe("context");
+              continue;
+            }
+            const admitted = storage.get(`architecture-${args.consultation}`).originals.find((item: any) => (Array.isArray(item) ? item[0] : item.id) === entry.id);
+            const retained = storage.get(`architecture-${args.consultation}`);
+            const snapshots = [retained, ...verifyLedger(missionPath, args.consultation, retained.ledger)
+              .filter((record: any) => record.kind === "round").map((record: any) => record.body)];
+            const snapshot = snapshots.find(value => value.cursor.dispatches.some((item: any) => item.originalId === entry.id));
+            const dispatch = snapshot.cursor.dispatches.find((item: any) => item.originalId === entry.id);
+            expect(dispatch.a ? JSON.parse(dispatch.a)[0] : dispatch.revision).toBe(Number(entry.id.split(".v")[1].split(".")[0]));
+            expect(dispatch.runId).toMatch(/^example-/);
+            const original = snapshot.originals.find((item: any) => (Array.isArray(item) ? item[0] : item.id) === entry.id);
+            expect(Array.isArray(original) ? JSON.parse(original[4])[0] : original.delivery).toBe("complete");
+            expect(admitted).not.toHaveProperty("value");
+            expect(canonicalDigest(exact)).toBe(entry.digest);
+            expect(admitted[3]).toBe(entry.digest);
           }
           const first = request.phase === "architecture-prepare" && storage.get(`architecture-${args.consultation}`).rounds === 0;
           const value = { ...(request.phase === "architecture-doubts"
@@ -1787,12 +1807,12 @@ describe("packaged workflow caller examples", () => {
       return structuredClone(result.value) as any;
     };
     const first = await run(initial.args);
-    expect(first.status).toBe("completed"); expect(first.rounds).toBe(1);
+    expect(first.status, first.error).toBe("completed"); expect(first.rounds).toBe(1);
     new Function("subagent", "previousResult", blocks[1]!)(capture, first);
     const resume = calls.pop(); resume.args.planning = planning;
     expect(resume.options.missionId).toBeTruthy();
     const second = await run(resume.args);
-    expect(second.status).toBe("completed"); expect(second.rounds).toBe(1);
+    expect(second.status, second.error).toBe("completed"); expect(second.rounds).toBe(1);
     const retained = storage.get(`architecture-${initial.args.consultation}`);
     expect(retained.currentDecision.revision).toBe(1); expect(retained.maxRounds).toBe(10);
     const completeSnapshot = { ...initial.args.currentDecision, brief: "Complete revised memory decision, not a partial patch" };
@@ -1802,9 +1822,11 @@ describe("packaged workflow caller examples", () => {
     expect(replaced.status).toBe("completed");
     const updated = storage.get(`architecture-${initial.args.consultation}`);
     expect(updated.currentDecision.revision).toBe(2);
-    expect(updated.currentDecision.snapshot).toEqual(completeSnapshot);
-    expect(updated.currentDecision.snapshot.humanDecisions).toEqual(initial.args.currentDecision.humanDecisions);
-    expect(updated.decisionHistory[0].snapshot).toEqual(initial.args.currentDecision);
+    expect(JSON.parse(updated.currentDecision.snapshot)).toEqual(completeSnapshot);
+    expect(JSON.parse(updated.currentDecision.snapshot).humanDecisions).toEqual(initial.args.currentDecision.humanDecisions);
+    expect(updated).not.toHaveProperty("decisionHistory");
+    expect(verifyLedger(missionPath, initial.args.consultation, updated.ledger)
+      .find((record: { kind: string }) => record.kind === "decision")?.body.snapshot).toEqual(initial.args.currentDecision);
     expect(updated.rounds).toBe(1); expect(updated.maxRounds).toBe(10);
     expect(launches.slice(2).some(call => call.resume)).toBe(true);
     const before = launches.length;
@@ -1845,11 +1867,13 @@ describe("packaged workflow caller examples", () => {
       expect(read(file)).toContain("workDescription");
     const plan = read("skills/plan/SKILL.md").replace(/\s+/g, " ");
     expect(plan).toContain("args: { currentDecision, workDescription:");
-    expect(plan).toContain("exact returned version-3 `continuation`");
+    expect(plan).toContain("exact returned version-4 `continuation`");
     for (const instruction of [
       "On `needs-human`", "`status.json` at `workflow.value`", "ENTIRE frontier in one round",
       "actual per-ID human provenance", "`humanAnswers: { consultation, revision, round, answers }`",
       "at most one in-flight run per consultation", "Answers are decision context only",
+      "`frontier.original: {path, digest}`", "each prerequisite fact's `original: {path, digest}`",
+      "read `memo: {path, digest}` in full", "only authorized probes outside the repository",
     ]) expect(plan).toContain(instruction);
     expect(plan).toContain("Ask the ACTUAL HUMAN to confirm it, then wait");
     const prepr = read("skills/pre-pr/SKILL.md");
@@ -1987,11 +2011,14 @@ describe("deterministic observer", () => {
       expect(ledger.definition).toMatchObject({ tools: [], allowNestedSubagents: false, defaultContext: "fresh",
         inheritProjectContext: false, inheritGlobalContext: false, inheritSkills: false, defaultAsync: false });
       expect(ledger.definition.model).toBeUndefined(); expect(ledger.definition.outputSchema).toBeUndefined();
-      expect(requests[2].name).toBe("pitako.request-observer");
+      expect(requests[2].name).toBe("pitako.architecture-ledger");
       expect(requests[2].definition.runner).toEqual({ type: "external-cli", command: process.execPath,
+        args: [path.resolve("skills/architecture/ledger.mjs")], promptDelivery: "stdin" });
+      expect(requests[3].name).toBe("pitako.request-observer");
+      expect(requests[3].definition.runner).toEqual({ type: "external-cli", command: process.execPath,
         args: [path.resolve("skills/execute/observe.mjs"), "--requests"], promptDelivery: "stdin" });
       // Reproduce the native async launch: inferred acceptance is appended to the task, then framed.
-      for (const { definition: agent } of requests.slice(0, 3)) {
+      for (const { definition: agent } of requests.slice(0, 6)) {
         const request = { expected: { invocation: "exec-1", count: 0, head: null }, record: { kind: "unit", loop: 1, body: { fix: "Implement" } } };
         const task = JSON.stringify(request);
         const acceptance = resolveEffectiveAcceptance({ acceptanceRole: agent.acceptanceRole, agentName: "deterministic", task, mode: "single", async: true });
@@ -2003,16 +2030,16 @@ describe("deterministic observer", () => {
       expect(() => registerAgent({ pi: pi as unknown as ExtensionAPI, name: requests[0].name, definition })).toThrow();
       expect(disposed).toBe(0);
       hooks.get("session_start")!({}, first);
-      // Five deterministic agents: observer, ledger, request observer, sealer, access verifier.
-      expect(requests.slice(0, 5).map(request => request.name)).toEqual(["pitako.checkout-observer", "pitako.execution-ledger",
+      // Six model-free agents own only metadata and observations.
+      expect(requests.slice(0, 6).map(request => request.name)).toEqual(["pitako.checkout-observer", "pitako.execution-ledger", "pitako.architecture-ledger",
         "pitako.request-observer", "pitako.checkpoint-sealer", "pitako.access-verifier"]);
-      expect(requests[4].definition.runner).toEqual({ type: "external-cli", command: process.execPath,
+      expect(requests[5].definition.runner).toEqual({ type: "external-cli", command: process.execPath,
         args: [path.resolve("extensions/access-receipts.mjs"), "--verify-stdin"], promptDelivery: "stdin" });
-      expect(disposed).toBe(5); expect(otherDisposed).toBe(0);
+      expect(disposed).toBe(6); expect(otherDisposed).toBe(0);
       hooks.get("session_shutdown")!(); hooks.get("session_shutdown")!();
-      expect(disposed).toBe(10); expect(otherDisposed).toBe(0);
+      expect(disposed).toBe(12); expect(otherDisposed).toBe(0);
     } finally { hooks.get("session_shutdown")!(); otherHooks.get("session_shutdown")!(); }
-    expect(otherDisposed).toBe(5);
+    expect(otherDisposed).toBe(6);
   });
 
   test("deterministic agents report conflicts and native rejection without fallback or replacement", () => {

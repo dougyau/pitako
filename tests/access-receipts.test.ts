@@ -63,6 +63,27 @@ test("a changed field is contradictory with pointers, cause, key, path and an ac
     expect(result.items[0].explanation).toContain(part);
 });
 
+test("digest-only verification accepts canonical equality, explains changed digests and reports missing originals", () => {
+  const f = fixture();
+  const digest = canonicalDigest(f.admitted);
+  const request = (gate: string) => ({ ...f.request(gate),
+    items: [{ id: "independent-a.v1.a1", key: "independent-a", path: f.file, digest }] });
+  writeFileSync(f.file, JSON.stringify(Object.fromEntries(Object.entries(f.admitted).reverse())));
+  const matched = verifyGate(request("digest-match"));
+  expect(matched.items[0]).toMatchObject({ state: "accessible", digest });
+  expect(checkReceipt({ receiptPath: matched.receipt.path }).status).toBe("verified");
+  writeFileSync(f.file, "{}");
+  const changed = verifyGate(request("digest-changed"));
+  expect(changed.items[0]).toMatchObject({ state: "contradictory", cause: "content-differs", digest: canonicalDigest({}) });
+  expect(changed.items[0].explanation).toContain(`Expected digest: ${digest}; actual digest: ${canonicalDigest({})}`);
+  expect(changed.items[0].explanation).not.toContain("JSON pointers");
+  expect(JSON.parse(readFileSync(changed.receipt.path, "utf8")).items[0].pointers).toEqual([]);
+  rmSync(f.file);
+  expect(verifyGate(request("digest-missing")).items[0]).toMatchObject({ state: "unavailable", cause: "missing-file" });
+  expect(() => verifyGate({ ...request("invalid"), items: [{ ...request("invalid").items[0], digest: "invalid" }] })).toThrow("Invalid access verifier request");
+  expect(() => verifyGate({ ...request("ambiguous"), items: [{ ...request("ambiguous").items[0], admitted: f.admitted }] } as never)).toThrow("Invalid access verifier request");
+});
+
 test("only execute namespaces offer restore-and-resume; standalone passes direct to a new pass", () => {
   const f = fixture();
   writeFileSync(f.file, JSON.stringify({ ...f.admitted, reason: "Edited after admission" }));

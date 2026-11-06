@@ -115,7 +115,7 @@ reasons, contradictions, limits, questions and sources for foreground grilling.
 The [architecture skill](../skills/architecture/SKILL.md) owns the executable
 request and continuation contracts. It requires a complete versioned
 `currentDecision`, stable consultation ID and explicit mission, not just a brief.
-Version-3 continuation preserves the phase, original maximum, consumed count and
+Version-4 continuation preserves the phase, original maximum, consumed count and
 valid count. Decision replacements account for prior obligations and preserve
 human content and provenance. Resuming or adding facts alone does not revise the
 decision. Ambiguous dispatch stops reentry. Only an explicitly human-authorized
@@ -135,13 +135,23 @@ originals. Lost access blocks dependent conclusions.
 A complete failed or partial original that was genuinely delivered may be retained
 once as failed, unpublished and insufficient. Previews, field presence or text
 without a truncation flag do not prove completeness. Do not reconstruct, republish,
-truncate, erase history or add alternate storage. The whole-file native capacity
+truncate or erase history. Architecture v4 uses its verified mission-local ledger
+for closed-round/decision history and digest-pinned references instead of report
+bodies in state. The whole-file native capacity
 limit remains binding. Optional observability failure is not required publication
 failure.
 
 The coordinator does not routinely import intermediate reports. Planning awaits
-all factual providers in one wave before returning `needs-human`; failed
-prerequisites block the pause until an authorized factual retry. The foreground
+all factual providers in one wave before returning `needs-human`; native failures
+block the pause until an authorized factual retry where eligible. A published
+schema-valid factual status `blocked` from a successful native run is an unresolved
+fact, carried with status and verified original references into prerequisiteFacts
+and evaluation; the foreground reads humanContext from those originals.
+Execution needs are `experiment` doubts with proposed probes and expected
+observations, never read-only provider tasks. The foreground runs only authorized
+probes outside the repository and returns results as humanAnswers with provenance.
+No factualRetry is accepted while paused; unresolved facts reach evaluation and
+may be raised as narrower facts or experiments in the next round. The foreground
 reads the full `status.json` `workflow.value`, asks the actual human the entire
 frontier in one round, records per-ID provenance, and re-enters the same mission
 and consultation with `planning: true`, the exact `continuation` and `humanAnswers`.
@@ -897,3 +907,16 @@ in results/reasons. Missing/changed bytes are a prerequisite gap, not permission
 to replace frozen sources, infer authority from agent text, or renew the budget.
 Preserve known unmet historical evidence obligations; new checkpoint observations
 do not establish an unavailable historical before-state contrast.
+
+Architecture admission reserves a derived 108306 pretty-printed bytes (<=112 KiB),
+including maximal structural controls, escaping and indentation; unrelated mission
+state plus that reservation must fit 262144 bytes. This admits /plan initial-context
+alongside a consultation without relaxing rejection of genuinely large unrelated
+state. Artifact roots are stored per original, published paths are reconstructed exactly
+from validated relative descendants, and prior originals retain only id/root/path/digest.
+A pending replacement contains only kind/expectedRevision/canonical SHA-256; resubmit
+the identical complete replacement to finish an interrupted append/save. Omission or
+a different digest blocks before children. Confirmed failed comparisons archive as
+failed ledger rounds before an explicitly requested new prepare, preserving counts
+and history without making their originals later essentials. Native barriers remain
+binding. Execute and review contracts are unchanged.

@@ -109,13 +109,13 @@ agreement. The script rejects an extra round.
 
 ## Interpret the result
 
-Only the final memo, status, round counts, steering receipts, and native
-continuation references return to the foreground conversation. Reports and
-challenge packets stay in child sessions and the workflow's native artifacts.
-Do not import them unless diagnosis requires it.
+Final/blocked results carry either a memo or an error. A memo returns as `memo: {path, digest}` plus a short `excerpt`,
+status, counts, steering receipts and continuation. The foreground reads the
+verified memo file in full; the excerpt is not a substitute. Perspective reports
+and packets remain in published originals, not the returned result.
 
 Native completion can truncate its preview. Recover only the workflow's returned
-value from the cited native result artifact to read the full memo and continuation.
+value from the cited native result artifact, then read its verified memo reference.
 Do not load the child reports to recover that value.
 
 Check the returned `status`, not just process success:
@@ -144,8 +144,9 @@ Preserve `results[].savedOutputPath`, returned reference objects and textual
 alone do not prove mandatory publication; `runs.status` previews are not originals.
 
 Each consuming gate first dispatches the model-free `pitako.access-verifier` once
-over the union of its required originals. It compares each published file with
-the admitted value in canonical form and writes a no-clobber receipt under
+over the union of its required originals. The workflow computes canonical
+SHA-256 of each complete structured value at confirmation (pure JS UTF-8, sorted
+JSON keys), without a pinning child. The next consuming gate verifies that digest and writes a no-clobber receipt under
 `<mission>/receipts/architecture-<consultation>/<gate>.json`. Consumers then
 receive verified references `{ id, path, digest }` with an instruction to read
 each path in full. No model creates, chooses or copies receipts, IDs, paths or
@@ -166,12 +167,77 @@ combined control, publication and essential-save diagnostics remain visible.
 Mandatory publication failure remains failure despite inline JSON. Optional
 observability failure alone is different when required witnesses and access
 survive. A complete identifiable failed/partial original genuinely delivered
-can be retained exactly once in existing native state, failed, unpublished and
+can be retained by reference, failed, unpublished and
 insufficient, without requiring ready analysis. Mere `structuredOutput`, preview,
 error, reference, rejected call without an object, or text lacking a truncation
 flag does not prove complete delivery. Do not reconstruct, republish, duplicate,
-truncate, erase history or open another store to fit the whole-file 256 KiB
-limit. Distinguish non-delivery from unproved completeness.
+truncate or erase history to fit capacity. Distinguish non-delivery from unproved
+completeness.
+
+Contract v4 keeps all model-authored prose in published originals, never mission
+state: packets, perspective focus, memos, doubt questions/decisions/recommendations
+and humanContext are read by id from the verified director/doubts/factual files.
+The verified hash-chain ledger at
+`<missionDirectory>/ledger/architecture-<consultation>/` holds admission, replacements,
+caller context (human answers, caller evidence and retry authorization, with original
+provenance), and closed rounds. Latest caller-context `{path, digest}` references
+chain through each record's `priorActive` references: ALL earlier answers/evidence
+remain ACTIVE decision context with their provenance in later prompts, not mere
+history or director paraphrases.
+State contains bounded control skeletons, per-original artifact roots and
+relative paths/digests. The reconstructed absolute path must exactly equal the
+native published savedOutputPath. Each root is derived from that original's native
+saved path; digest pins, path normalization and traversal checks protect retained
+references. Previous/closed-round live originals retain only `{id, artifactRoot, relativePath,
+digest}`. Each current association/native witness is stored once in its dispatch;
+control tuples/bitmasks expand back to the validated logical controls on reentry.
+Only insufficient/failed originals retain diagnostics. The active current decision
+is an inline JSON string (at most twice the 16 KiB native args bytes). Dependency
+masks expand to factual IDs for prompts/frontiers. Perspectives read their focus
+and packet from the director original, never state projections of model prose.
+
+`ledgerPending` is only `{kind: "decision", expectedRevision, digest}`; the digest
+is script-computed canonical SHA-256 of the complete replacement. After an
+append/save interruption, **resubmit the identical replacement** with the same
+continuation. Matching digest completes the append idempotently, saves the new
+snapshot/anchor and clears the marker. Omitted or different replacements return
+`blocked` with an error before any child, with this resubmission instruction; the marker never
+contains replacement prose.
+
+Only one active consultation per mission at a time; D8 does not reserve concurrent consultations.
+
+D8 admission is: unrelated = current `stateBytes` minus this consultation's retained
+entry (measured conservatively); unrelated + **108306 bytes (<= 112 KiB)** must be
+<= 262144. Otherwise return `blocked` with numbers and use a new mission. This
+leaves over 150 KiB for /plan's initial-context and other mission keys. The maximal
+pretty-printed skeleton is filled at every tested save point, accounting for JSON
+escaping and indentation.
+Only discuss controls retain perspectives; their packet roster is cleared before
+evaluation, so only one director roster can be populated at once. Nine diagnostic
+slots cover eight blocked/failed factual providers plus a failed evaluation.
+Pending frontier IDs are stored as a JSON-encoded list, preserving logical IDs
+without per-item pretty indentation. A native barrier stops later dispatch.
+
+Structural limits (JSON UTF-8 bytes, including quotes/escaping): artifact root
+384, relative original path 160, ledger path 1024, runId 96, diagnostic 512 and
+perspective label 128 (also at most 64 characters). Doubt IDs are at most 32 ASCII
+characters; generated keys/IDs are bounded to 36/137 characters. Each round permits
+8 factual doubts, 64 combined human/experiment IDs and 8 deliberation doubts.
+Invalid output fails before confirmation/provider dispatch, with a new-consultation
+recovery action. Prose has no D4 character/projection budget or compaction-resume
+mechanism. Essential save failures poison the queue and identify the failed
+boundary; unconfirmed dispatch must be reconciled, never blindly replayed.
+Missing digests have an integrity diagnosis distinct from publication failure.
+
+Before a caller-requested new prepare after a confirmed failed comparison, the
+script archives that comparison as a ledger round with `comparison: "failed"`.
+Counts are unchanged (no valid round or refunded round); originals/diagnostics
+remain reachable in history, not required essentials for later work. An
+append/anchor cut reconciles identical bytes before any model child. Stop,
+permission and unconfirmed-dispatch barriers are never archived away. Selective
+retries replace only their targeted live references/dispatches and retain one
+retry authorization skeleton; repeated ceiling synthesis/replacements prune live
+controls while retaining their ledger history.
 
 The caller's concrete single-line `workDescription` supplies readable labels,
 explicit phases and first-line task titles for all fresh/resumed producers,
@@ -183,14 +249,15 @@ and references, not just paths.
 
 ## Continue a consultation
 
-Retain the exact returned version-3 `continuation` (`{version: 3, consultation}`)
+Retain the exact returned version-4 `continuation` (`{version: 4, consultation}`)
 and actual mission ID. Both ordinary and planning consultations return this
 compact reference, not the retained control state.
 Use the same mission, consultation ID and planning mode on reentry. The native
 state keeps the phase cursor, producer intentions, terminal evidence, current
 revision, original maximum, consumed rounds and valid rounds. Missing,
-incompatible or wrong-identity continuations fail before dispatch; duplicate
-initial admission is not a restart. Do not migrate old continuations.
+incompatible or wrong-identity continuations fail before dispatch; v3 requires a
+new consultation/mission, with no migration. Duplicate
+initial admission is not a restart.
 
 For unchanged decisions, omit `currentDecision` and `replacement`; optional
 `evidence` is factual data, not a revision or human decision:
@@ -276,24 +343,42 @@ Do not resend retained full reports in arguments.
 ### Planning pause and human re-entry
 
 With `planning: true`, all factual providers launch in one awaited wave. Only
-once every provider is settled, its dispatch boundary confirmed and its report
-sufficient, with no native barrier, does a human frontier pause the round.
+once every provider is settled, published and schema-valid, with verified access
+and no native barrier, does a human/experiment frontier pause the round.
+Status `blocked` from a successfully completed native factual run is an unresolved
+fact, not an abort or adequate evidence. Its status and verified original reference accompany
+dependent questions; director-after reads humanContext there as unresolved.
 Failed prerequisites retain stage `frontier`; only an authorized `factualRetry`
 can reconcile them before pausing. There are no partial or withheld frontiers.
-Human and deliberation doubts may depend only on factual doubt IDs. Deliberation
+Human, experiment and deliberation doubts may depend only on factual doubt IDs. Deliberation
 doubts are never dispatched: `director-after-rN` resolves them after the factual
 wave and any human answers, matching factual evidence by `doubtId`.
 
 The controller saves stage `awaiting-human` and `pending: { round, revision, ids }`,
 then returns `{ status: "needs-human", frontier, rounds, validRounds, continuation }`.
-`frontier` contains `consultation`, `revision`, `round`, `humanContext`, and
-`questions`: each has `id`, `question`, `decision`, `recommendation`, `dependsOn`,
-and `prerequisiteFacts` (`id`, `key`, `originalId`, `humanContext`). The foreground
-reads the full `workflow.value` from native `status.json`, not the truncated wake
-preview, and asks the actual human the entire frontier in one grilling round.
+`frontier` contains `consultation`, `revision`, `round`, `original: {path, digest}`
+for the doubts original, and question skeletons (`id`, `kind`, `dependsOn`,
+`prerequisiteFacts`). Each prerequisite fact has `id`, `key`, `originalId`, `status`
+and `original: {path, digest}` for its factual original. The foreground reads the
+full `workflow.value` from native `status.json`, not the truncated wake preview,
+then reads those verified files in full: recover questions, decisions, recommendations
+and common humanContext from the doubts original by id, and humanContext, sources
+and limits from factual originals. Ask the actual human the entire frontier in one
+grilling round, preserving unresolved facts and provenance.
 No child remains alive waiting for a person. The pause has no expiry, survives
 restart, does not run `director-after-rN`, and adds no consumed or valid round.
-Continuation-only re-entry returns the identical value without dispatch or writes.
+Continuation-only re-entry returns the identical value without model dispatch or
+mission-state writes; read-only ledger/access verification can run again.
+
+Providers are read-only and cannot execute code, install tools or measure runtime
+behavior. Such unknowns MUST be `experiment` doubts, never provider tasks.
+An experiment recommendation states the proposed probe and expected observation.
+The foreground runs only authorized experiments outside the repository and
+returns the command, environment/version, observed result and source/log provenance
+through that ID's humanAnswers entry. If not authorized or not observed, use
+`defer` or `unknown`; never invent a result. No retry is accepted while paused:
+unresolved blocked facts flow to the next evaluation. If still decision-critical,
+the director can ask a narrower factual question or an experiment next round.
 
 Re-enter the SAME named resource, mission and consultation with `planning: true`, the exact
 returned `continuation`, and:
@@ -316,10 +401,11 @@ Use actual answers, never inferred preferences. Every pending ID must appear
 exactly once, with no extras; all dispositions require nonempty caller provenance.
 `defer` and `unknown` remain unresolved. Validation requires the same consultation,
 revision and round, with `pending.round === control.round === rounds`, planning
-mode and stage `awaiting-human`. It precedes every write. Accepted answers become
-`human-answers-rN` evidence with per-answer provenance, clear pending, and advance
-to `evaluate`; the first save bears the answers before `director-after-rN` runs
-exactly once. They are actual-human decision context, NOT implementation authority
+mode and stage `awaiting-human`. It precedes every write. Accepted answers are
+published as a ledger context record with per-answer provenance; state keeps only
+its digest-pinned reference, clears pending and advances to `evaluate` before
+`director-after-rN` runs exactly once. An append/save cut requires identical caller
+input to reconcile an unanchored context record; it never silently discards answers. They are actual-human decision context, NOT implementation authority
 or final confirmation.
 
 Reject without state/counter changes or child calls: answers outside the paused
@@ -331,8 +417,8 @@ provenance in `snapshot.humanDecisions`.
 
 Native args bounds are 16384 compact UTF-8 bytes, 64 array items, 16 fields per
 object and depth 8. More than 64 pending IDs fails explicitly before pausing.
-Mission state over 256 KiB throws before write, including the answer-bearing save;
-never truncate. Keep at most one in-flight run per consultation: native state has
+Admission and byte backstops protect the whole-file 256 KiB limit, including the
+answer-bearing save; never truncate. Keep at most one in-flight run per consultation: native state has
 no atomic caller lock, so concurrent re-entry can duplicate evaluation. Native
 Stop, cancellation, permission rejection and ambiguous/unsettled dispatch remain
 fatal, not human pauses.

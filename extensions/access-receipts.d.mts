@@ -5,8 +5,10 @@ export type AccessCause = "missing-file" | "parse-error" | "content-differs" | "
 export function receiptLocation(missionPath: string, namespace: string, gate: string): { missionDirectory: string; receiptPath: string };
 export function resumableNamespace(namespace: unknown): boolean;
 export function accessAction(cause: AccessCause, resumable: boolean): string;
-export function explainAccess(entry: { state: AccessState; cause: AccessCause; id: string; key?: string; path?: string | null; pointers?: string[] }, resumable?: boolean): string;
-export function verifyGate(request: { missionPath: string; namespace: string; gate: string; items: { id: string; key: string; path: string; admitted: unknown }[] }): {
+export function explainAccess(entry: { state: AccessState; cause: AccessCause; id: string; key?: string; path?: string | null; pointers?: string[]; expectedDigest?: string; digest?: string | null }, resumable?: boolean): string;
+export type AccessVerifierItem = { id: string; key: string; path: string } &
+  ({ admitted: unknown; digest?: never } | { digest: string; admitted?: never });
+export function verifyGate(request: { missionPath: string; namespace: string; gate: string; items: AccessVerifierItem[] }): {
   v: 1; outcome: "published" | "identical" | "conflict"; receipt: { path: string; digest: string }; explanation?: string;
   items: { id: string; state: AccessState; cause: AccessCause | null; digest: string | null; explanation?: string }[];
 };
