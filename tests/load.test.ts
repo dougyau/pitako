@@ -64,6 +64,7 @@ function observerRegistrationEvents() {
       expect(event).toBe(RUNTIME_AGENT_REGISTER_EVENT);
       expect(request.version).toBe(1);
       const script = { "pitako.checkout-observer": ["skills/execute/observe.mjs"], "pitako.execution-ledger": ["skills/execute/ledger.mjs"],
+        "pitako.architecture-ledger": ["skills/architecture/ledger.mjs"],
         "pitako.request-observer": ["skills/execute/observe.mjs", "--requests"], "pitako.checkpoint-sealer": ["skills/execute/checkpoint.mjs", "--seal-stdin"],
         "pitako.access-verifier": ["extensions/access-receipts.mjs", "--verify-stdin"] }[request.name];
       expect(script).toBeDefined();

@@ -44,8 +44,9 @@ export function accessAction(cause, resumable) {
 }
 
 /** One explanation format for every cause, workflow- or verifier-detected. */
-export function explainAccess({ state, cause, id, key, path: file, pointers = [] }, resumable = false) {
+export function explainAccess({ state, cause, id, key, path: file, pointers = [], expectedDigest, digest }, resumable = false) {
   return `Original ${id} (key ${key ?? "unknown"}, path ${file ?? "none"}) is ${state}: ${cause}.` +
+    (expectedDigest ? ` Expected digest: ${expectedDigest}; actual digest: ${digest}.` : "") +
     (pointers.length ? ` Differing JSON pointers: ${pointers.join(", ")}.` : "") + ` Action: ${accessAction(cause, resumable)}`;
 }
 
@@ -59,20 +60,26 @@ function verifyItem(item) {
   try { published = JSON.parse(bytes); } catch {
     return { id: item.id, key: item.key, path: item.path, digest: null, state: "unavailable", cause: "parse-error", pointers: [] };
   }
-  const pointers = jsonDifferences(published, item.admitted, 10);
-  return { id: item.id, key: item.key, path: item.path, digest: canonicalDigest(published),
-    state: pointers.length ? "contradictory" : "accessible", cause: pointers.length ? "content-differs" : null, pointers };
+  const digest = canonicalDigest(published);
+  const digestMode = Object.hasOwn(item, "digest");
+  const pointers = digestMode ? [] : jsonDifferences(published, item.admitted, 10);
+  const differs = digestMode ? digest !== item.digest.toLowerCase() : pointers.length > 0;
+  return { id: item.id, key: item.key, path: item.path, digest,
+    ...(digestMode && differs ? { expectedDigest: item.digest.toLowerCase() } : {}),
+    state: differs ? "contradictory" : "accessible", cause: differs ? "content-differs" : null, pointers };
 }
 
 function validateRequest(request) {
   if (!record(request) || Object.keys(request).sort().join(",") !== "gate,items,missionPath,namespace" ||
       !Array.isArray(request.items) || !request.items.length || request.items.some(item => !record(item) ||
-        Object.keys(item).some(field => !["id", "key", "path", "admitted"].includes(field)) ||
+        Object.keys(item).some(field => !["id", "key", "path", "admitted", "digest"].includes(field)) ||
         typeof item.id !== "string" || !item.id || typeof item.key !== "string" || !item.key ||
-        typeof item.path !== "string" || !path.isAbsolute(item.path) || item.path.includes("\0") || !Object.hasOwn(item, "admitted")) ||
+        typeof item.path !== "string" || !path.isAbsolute(item.path) || item.path.includes("\0") ||
+        (Object.hasOwn(item, "admitted") === Object.hasOwn(item, "digest")) ||
+        (Object.hasOwn(item, "digest") && (typeof item.digest !== "string" || !/^[a-f0-9]{64}$/i.test(item.digest)))) ||
       new Set(request.items.map(item => item.id)).size !== request.items.length)
-    throw new Error("Invalid access verifier request: expected {missionPath, namespace, gate, items:[{id, key, path, admitted}]}.");
-  for (const item of request.items) canonicalJSON(item.admitted);
+    throw new Error("Invalid access verifier request: expected {missionPath, namespace, gate, items:[{id, key, path, admitted|digest}]}.");
+  for (const item of request.items) if (Object.hasOwn(item, "admitted")) canonicalJSON(item.admitted);
 }
 
 function publish(file, bytes) {
@@ -91,8 +98,8 @@ function publish(file, bytes) {
 export function verifyGate(request) {
   validateRequest(request);
   const { receiptPath } = receiptLocation(request.missionPath, request.namespace, request.gate);
-  const items = request.items.map(verifyItem).map(item => ({ ...item,
-    explanation: item.state === "accessible" ? "Published original equals the admitted value." : explainAccess(item, resumableNamespace(request.namespace)) }));
+  const items = request.items.map(verifyItem).map(({ expectedDigest, ...item }) => ({ ...item,
+    explanation: item.state === "accessible" ? "Published original equals the admitted value." : explainAccess({ ...item, expectedDigest }, resumableNamespace(request.namespace)) }));
   const receipt = { v: 1, namespace: request.namespace, gate: request.gate,
     items: items.map(({ pointers, ...item }) => ({ ...item, pointers })) };
   const bytes = canonicalJSON(receipt) + "\n";

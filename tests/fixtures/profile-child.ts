@@ -95,6 +95,7 @@ try {
       const request = raw as RuntimeAgentRegistrationRequest;
       assert.equal(request.version, 1);
       const script = { "pitako.checkout-observer": ["skills/execute/observe.mjs"], "pitako.execution-ledger": ["skills/execute/ledger.mjs"],
+        "pitako.architecture-ledger": ["skills/architecture/ledger.mjs"],
         "pitako.request-observer": ["skills/execute/observe.mjs", "--requests"], "pitako.checkpoint-sealer": ["skills/execute/checkpoint.mjs", "--seal-stdin"],
         "pitako.access-verifier": ["extensions/access-receipts.mjs", "--verify-stdin"] }[request.name];
       assert.ok(script);
@@ -135,7 +136,7 @@ try {
       process.send({ ready: true });
       assert.equal(await Bun.stdin.text(), "run");
     }
-    assert.deepEqual([...registered].sort(), mode === "foreground" ? ["pitako.access-verifier", "pitako.checkout-observer", "pitako.checkpoint-sealer", "pitako.execution-ledger", "pitako.request-observer"] : []);
+    assert.deepEqual([...registered].sort(), mode === "foreground" ? ["pitako.access-verifier", "pitako.architecture-ledger", "pitako.checkout-observer", "pitako.checkpoint-sealer", "pitako.execution-ledger", "pitako.request-observer"] : []);
     await session.extensionRunner!.emit({ type: "agent_start" });
     assert.deepEqual(captured.toolDiagnostic()?.missing ?? [], []);
     if (mode === "foreground") {

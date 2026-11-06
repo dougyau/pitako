@@ -112,10 +112,19 @@ of failed originals and the whole-file capacity limit. Missing or contradictory
 essentials block dependent conclusions, including after resume. Publication,
 delivery, sufficiency, access and optional observability are distinct.
 Planning awaits all factual providers in one wave, then pauses in native mission
-state with `needs-human` and a self-contained frontier for the foreground human.
+state with `needs-human` and a by-reference frontier for the foreground human.
+Published schema-valid factual `blocked` outputs from successful native runs are
+unresolved facts, not round failures; prerequisiteFacts carry their status and
+verified factual originals; director-after reads humanContext there as unresolved.
+Native failures and publication/access barriers still abort. Execution needs are
+`experiment` doubts, never read-only provider tasks. Recommendations identify the
+probe and expected observation; the foreground runs only authorized probes outside
+the repository and returns results through humanAnswers with provenance.
+No factualRetry is accepted while paused; unresolved facts reach evaluation and
+may become narrower factual questions or experiments in the next round.
 No child waits for human answers. Re-entry uses the exact `continuation` plus
 `humanAnswers` with per-ID provenance; continuation alone replays the pause
-without dispatch or writes, with no expiry. Keep one in-flight run per consultation;
+without model dispatch or mission-state writes, with no expiry. Keep one in-flight run per consultation;
 native state is not an atomic lock. Answers are decision context only. Final memos retain material reasons,
 disagreement and limits. This adds no summarizer, filesystem capability, profile
 delegation, exactly-once guarantee or dependency certification.
@@ -262,6 +271,34 @@ fallback. It uses no model, delegation or conversational context, consumes
 and calls `designatedWorkspace`/`checkoutEvidence` on actual cwd without reading
 the spec. All stdout is bounded before emission below 65,536 bytes, emitting
 complete failure JSON instead of a truncated success.
+
+The same registration owns `pitako.execution-ledger` and
+`pitako.architecture-ledger`, both model-free fixed external CLIs. Their shared
+`extensions/hash-ledger.mjs` core verifies canonical hash chains and publishes
+fsynced, no-clobber records with identical-byte retries. Execute retains its
+existing record format and checkout-local location. Architecture's
+CLI stores admission, decision replacement, caller context (answers, evidence and
+retry authorization), and closed-round projections under
+`<missionDirectory>/ledger/architecture-<consultation>/`, deriving the native
+mission directory exactly as access receipts do. Its `{count, head, stateBytes}`
+response measures the current native `state.json` (zero when absent).
+Architecture contract v4 keeps all model-authored prose in published originals,
+not phase projections: members read focus/packet from the director file and factual
+providers read doubts by id. State holds skeletons, references, args-bounded current
+decision and transient digest-only ledgerPending. Caller answers/evidence/authorization are
+ledger context records, carried by digest-pinned reference with provenance into
+later rounds. The script computes canonical SHA-256 at confirmation; the next
+consuming gate verifies published files. No per-batch pinning children run.
+Before model dispatch, unrelated = stateBytes minus this consultation's retained
+entry (measured conservatively); unrelated + derived worst case 108306 <= 262144.
+Capacity failure returns blocked with numbers and the action to use a new mission.
+The maximal skeleton derives that bound from reference counts/bytes, args-bounded
+fields and measured pretty overhead. Prose is uncapped, without projection
+compaction. Eight factual doubts, eight deliberation doubts and 64 human/experiment IDs are checked before
+confirmation. Essential-save failures leave a diagnosed boundary; unanchored
+caller context requires identical-input reconciliation. Foreground reads verified
+frontier originals and memo `{path, digest}` rather than inline prose; continuation
+alone returns identical values. Older contracts require a new consultation/mission.
 
 The root persists invocation/loop/unique-key intention, dispatches singleton
 `runs.all` with `output:false`, inline output and effective implicit waiting,
@@ -481,3 +518,6 @@ in results/reasons. Missing/changed bytes are a prerequisite gap, not permission
 to replace frozen sources, infer authority from agent text, or renew the budget.
 Preserve known unmet historical evidence obligations; new checkpoint observations
 do not establish an unavailable historical before-state contrast.
+
+See [Architecture](architecture.md) for the derived per-consultation state bound,
+reference limits and pending replacement recovery.

@@ -91,22 +91,36 @@ the caller description; it is not extracted from administrative prompt text.
 The script owns dispatch. After EACH architecture round it runs a distinct
 doubts phase: local unknowns to Scout, external contracts to researcher,
 uncertain/conflicting claims to evidence-auditor, human preferences back here,
-and adequately evidenced design disagreements back to deliberation. All reports
-and contrary evidence reach the next round, not only the director's view.
+execution needs to experiment questions back here, and adequately evidenced design
+disagreements back to deliberation. Providers are read-only: never ask them to run
+code, install anything or measure execution. Experiments require a recommendation
+with the proposed probe and expected observation. Previous-round reports
+and contrary evidence reach fresh perspectives, not only the director's view;
+older rounds remain in verified ledger history rather than accumulating in state.
 Participants reason on the whole design; they never delegate.
 
 On `needs-human`, the architecture round has paused in native mission state after
-ALL factual providers settled successfully in one awaited wave. Failed prerequisite
-research blocks the pause until a human-authorized `factualRetry`; independent
-questions wait too. No child waits for a person. Read the full returned value from
+ALL factual providers settled in one awaited wave with published, schema-valid
+answers and verified access. A native-success answer with status `blocked` is an
+unresolved fact, not a failed delivery: its status and verified original reference remain in
+dependent questions' prerequisiteFacts. Native failures still abort; terminal
+failed prerequisite research requires human-authorized `factualRetry` before a
+pause. No child waits for a person. Read the full returned value from
 `status.json` at `workflow.value`; the completion wake preview is truncated.
 Ask the ACTUAL HUMAN the ENTIRE frontier in one round using the grilling format:
 number questions with recommendations and word them so yes accepts the recommendation.
 Apply the expansion rules above to every architecture question.
-Use `frontier.humanContext` and each question's `prerequisiteFacts`, including facts,
-reasons, contradictions, limits and sources. Never answer preferences yourself.
+Read `frontier.original: {path, digest}` (the verified doubts original) in full;
+match each question skeleton by id to recover question, decision, recommendation
+and common humanContext. Read each prerequisite fact's `original: {path, digest}`
+in full for humanContext, facts, reasons, contradictions, limits and sources. Never answer preferences yourself.
 Record actual per-ID human provenance, including explicit deferrals or unknowns.
 A human yes to an agent recommendation is agent-accepted origin, not a human request.
+Questions carry `kind: human | experiment`. For experiments the foreground runs
+only authorized probes outside the repository; return the actual command,
+environment/version, observation and source/log provenance as the experiment ID's
+humanAnswers content/provenance. Otherwise defer or mark unknown. This is not
+permission for a child to execute or for the foreground to modify product files.
 
 Re-enter the SAME named resource, consultation, mission and `planning: true` with the exact
 returned `continuation` plus `humanAnswers: { consultation, revision, round, answers }`.
@@ -116,17 +130,24 @@ Content is required for `answer`; provenance is required for every ID. Cover the
 exact pending ID set once with no extras. See the architecture skill for the full
 shape, native payload bounds and rejection rules. Do not combine answers with a
 replacement or send `evidence`/`factualRetry` while paused. Continuation alone
-returns the same frontier without dispatch or writes; the pause has no expiry and
+returns the same frontier without model dispatch or state writes (read-only
+verification may run); the pause has no expiry and
 survives restart. Keep at most one in-flight run per consultation, including
 re-entry: native mission state is not an atomic lock against concurrent submissions.
+Answers and caller evidence are ledger records with digest-pinned references carried
+to later-round prompts with their original provenance, not director paraphrases.
+Final/blocked results carry either a memo or an error. For results carrying a memo, read `memo: {path, digest}` in full; `excerpt` is only a
+short preview. Continuation alone returns the identical memo result.
 Answers are decision context only, not permission to implement/materialize and
 never final actual-human confirmation. Deferrals and unknowns remain unresolved.
+Blocked facts also remain unresolved in director-after. Do not retry while paused;
+the director can raise a narrower factual doubt or an experiment next round.
 A pause adds no round; even at round ten answers lead only to finish or blocked.
 Native Stop, cancellation, permission rejection and ambiguous/unsettled dispatch
 remain fatal, not `needs-human`.
 
 Outside the paused stage, for useful further factual evidence invoke the SAME named resource,
-consultation ID, `planning: true` and mission with the exact returned version-3
+consultation ID, `planning: true` and mission with the exact returned version-4
 `continuation`. For unchanged instructions use `evidence` for factual input;
 for changed instructions use an explicit complete `replacement` with consultation,
 expected current revision and preserved/replaced obligations, as documented in
@@ -210,3 +231,26 @@ Return the source path, native evidence references and any non-blocking limits.
 Do not claim a frozen legacy plan, implementation, passing checks or acceptance.
 On actual user Stop use native cancellation; do not start replacements while
 child settlement is uncertain. No historical engine or Board binding is resumed.
+
+### Architecture mission capacity and interrupted replacements
+
+Only one active consultation per mission at a time; D8 does not reserve concurrent consultations.
+
+Architecture reserves a derived **108306 pretty-printed bytes (<=112 KiB)** per
+consultation, rather than nearly the whole 256 KiB mission. The real initial-context
+reference envelope and consultation can coexist; genuinely oversized unrelated
+mission state still blocks before model dispatch. Roots are derived per original
+from the native saved path. Relative paths reconstruct that path exactly; digest
+pins, path normalization and traversal checks protect retained references.
+Limits are 8 factual, 64 human/experiment and 8 deliberation doubts per
+round, with doubt IDs at most 32 ASCII characters. Read full originals by verified
+absolute references as before.
+
+A replacement append/save interruption leaves only a digest intention. Re-enter
+with the exact continuation AND resubmit the same complete replacement (canonical
+SHA-256 must match). Missing/different input blocks before any child. Identical
+resubmission completes publication idempotently and clears the marker after saving
+the new snapshot/anchor. Do not infer that continuation alone carries replacement
+content. Failed confirmed comparisons are archived before a newly requested prepare;
+they consume their original round, do not become valid and are not later essentials.
+Native Stop/permission/unconfirmed-dispatch barriers remain binding.

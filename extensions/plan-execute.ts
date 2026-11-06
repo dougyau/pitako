@@ -119,6 +119,8 @@ const RUNTIME_AGENTS: RuntimeAgent[] = [
     args: ["skills/execute/observe.mjs"] },
   { name: "pitako.execution-ledger", description: "Deterministic hash-chained execution ledger publication; no model execution.",
     systemPrompt: "Fixed execution ledger; stdin is a JSON publication request.", args: ["skills/execute/ledger.mjs"] },
+  { name: "pitako.architecture-ledger", description: "Deterministic hash-chained architecture ledger publication; no model execution.",
+    systemPrompt: "Fixed architecture ledger; stdin is a JSON publication request or {missionPath, consultation, expected, observe:true} for read-only chain and state-size observation.", args: ["skills/architecture/ledger.mjs"] },
   { name: "pitako.request-observer", description: "Deterministic main-session execute request reader; no model execution.",
     systemPrompt: "Fixed execute request observer; stdin is JSON {invocation, cursor}.", args: ["skills/execute/observe.mjs", "--requests"] },
   { name: "pitako.checkpoint-sealer", description: "Deterministic checkpoint journal verification and seal metadata publication; no model execution.",

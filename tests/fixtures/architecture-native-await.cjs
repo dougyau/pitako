@@ -6,6 +6,8 @@ const path = require("node:path");
 
 async function main() {
   const { runWorkflowScript } = await import("../../node_modules/pi-subagents/src/workflows/scripted-workflow.js");
+  const { appendLedger } = await import("../../skills/architecture/ledger.mjs");
+  const { canonicalDigest } = await import("../../extensions/canonical.mjs");
   const { verifyGate } = await import("../../extensions/access-receipts.mjs");
   const root = mkdtempSync(path.join(tmpdir(), "pitako-architecture-await-"));
   // The named resource inlines the mission binding; the raw path alone refuses to run.
@@ -48,6 +50,8 @@ async function main() {
           },
         },
         launch: (key, request) => {
+          if (request.agent === "pitako.architecture-ledger") return Promise.resolve({ key, ok: true, agent: request.agent,
+            runId: `native-${key}`, output: JSON.stringify(appendLedger(JSON.parse(request.task))), artifactPaths: [], results: [] });
           // The real model-free verifier runs before each consuming gate's intention.
           if (request.agent === "pitako.access-verifier") return Promise.resolve({ key, ok: true, agent: request.agent,
             runId: `native-${key}`, output: JSON.stringify(verifyGate(JSON.parse(request.task))), artifactPaths: [],
@@ -65,11 +69,13 @@ async function main() {
             const originals = references ? JSON.parse(references[1]) : [];
             if (key === "r2-recovery") originals.push(peerChallenge);
             for (const original of originals) {
-              const exact = JSON.parse(readFileSync(original.path ?? original.results[0].savedOutputPath, "utf8"));
-              const admitted = storage.get("architecture-await-regression").originals.find(item => item.id === original.id);
-              assert.equal(admitted.runId, `native-${admitted.key}`);
-              assert.equal(admitted.delivery, "complete");
-              assert.deepEqual(exact, admitted.value);
+              const exact = JSON.parse(readFileSync(original.path ?? original.savedOutputPath, "utf8"));
+              const admitted = storage.get("architecture-await-regression").originals.find(item => item[0] === original.id);
+              const dispatch = storage.get("architecture-await-regression").cursor.dispatches.find(item => item.originalId === original.id);
+              if (dispatch) assert.equal(dispatch.runId, `native-${dispatch.key}`);
+              if (admitted[4]) assert.equal(JSON.parse(admitted[4])[0], "complete");
+              assert.equal(canonicalDigest(exact), admitted[3]);
+              assert(!Object.hasOwn(admitted, "value"));
             }
             let value;
             if (key.startsWith("director-doubts-")) value = {
