@@ -320,6 +320,9 @@ function isTerminal(task: Task): boolean {
 /** Validate the resulting snapshot, then order children and prune only scoped tombstones. */
 export function finalizeTaskState(state: TaskState): { state: TaskState; error?: string } {
 	const fail = (error: string) => ({state, error});
+	// First occurrence wins, as a linear scan would find it; duplicates still fail below.
+	const byId = new Map<number, Task>();
+	for (const task of state.tasks) if (!byId.has(task.id)) byId.set(task.id, task);
 	const ids = new Set<number>();
 	const running = new Set<string | undefined>();
 	for (const task of state.tasks) {
@@ -332,30 +335,48 @@ export function finalizeTaskState(state: TaskState): { state: TaskState; error?:
 			running.add(task.owner);
 		}
 		if (task.parentId !== undefined && task.status !== "deleted") {
-			const parent = state.tasks.find(p => p.id === task.parentId);
+			const parent = byId.get(task.parentId);
 			if (!parent || parent === task || parent.parentId !== undefined || parent.status === "deleted") return fail("parentId must name a top-level non-deleted parent");
 			if (parent.status === "completed" && (task.status === "pending" || task.status === "in_progress")) return fail("completed parent cannot have active children");
 			if (task.status === "in_progress" && parent.status !== "in_progress") return fail("parent must stay in_progress while a child runs");
 		}
 	}
-	if (!Number.isSafeInteger(state.nextId) || state.nextId <= Math.max(0, ...ids)) return fail("nextId must exceed every id");
+	let maxId = 0;
+	for (const id of ids) if (id > maxId) maxId = id;
+	if (!Number.isSafeInteger(state.nextId) || state.nextId <= maxId) return fail("nextId must exceed every id");
+	// Linear in the task count: callers run this on every commit and sync.
+	const children = new Map<number, Task[]>();
+	for (const task of state.tasks) if (task.parentId !== undefined) {
+		const list = children.get(task.parentId);
+		if (list) list.push(task); else children.set(task.parentId, [task]);
+	}
 	const ordered: Task[] = [];
+	const placed = new Set<Task>();
 	for (const task of state.tasks) {
-		if (task.parentId === undefined || !ids.has(task.parentId)) {
-			ordered.push(task);
-			ordered.push(...state.tasks.filter(child => child.parentId === task.id));
+		if (task.parentId === undefined || !byId.has(task.parentId)) {
+			ordered.push(task); placed.add(task);
+			for (const child of children.get(task.id) ?? []) { ordered.push(child); placed.add(child); }
 		}
 	}
 	// Deleted descendants with a deleted/nested parent are still retained as tombstones.
-	for (const task of state.tasks) if (!ordered.includes(task)) ordered.push(task);
-	let result = {tasks: ordered, nextId: state.nextId};
-	const overLimit = () => result.tasks.length > 1000 || new TextEncoder().encode(JSON.stringify({version:1, ...result})).byteLength > 262144;
-	for (const task of [...result.tasks].sort((a,b) => a.id-b.id)) {
+	for (const task of state.tasks) if (!placed.has(task)) ordered.push(task);
+	// Measure once; removing one array element removes its JSON and one separating comma.
+	const encoder = new TextEncoder();
+	const bytes = (value: unknown) => encoder.encode(JSON.stringify(value)).byteLength;
+	let size = bytes({version:1, tasks: ordered, nextId: state.nextId});
+	let count = ordered.length;
+	const overLimit = () => count > 1000 || size > 262144;
+	const pruned = new Set<number>();
+	if (overLimit()) for (const task of [...ordered].sort((a,b) => a.id-b.id)) {
 		if (!overLimit()) break;
-		if (task.status === "deleted" && /^(execute:|worker:)/.test(task.owner ?? "")) result = {...result, tasks: result.tasks.filter(t => t.id !== task.id)};
+		if (task.status === "deleted" && /^(execute:|worker:)/.test(task.owner ?? "")) {
+			pruned.add(task.id);
+			size -= bytes(task) + (count > 1 ? 1 : 0);
+			count--;
+		}
 	}
 	if (overLimit()) return fail("todo state exceeds 1000 tasks or 262144 bytes");
-	return {state: result};
+	return {state: {tasks: pruned.size ? ordered.filter(t => !pruned.has(t.id)) : ordered, nextId: state.nextId}};
 }
 
 /** Pure actor-aware entry: all failures retain the exact input snapshot. */
@@ -427,13 +448,22 @@ export function applyTaskSync(state: TaskState, actor: string | undefined, owner
 		return {...prior, id: prior?.id ?? nextId++, owner, subject:row.subject, status:row.status, activeForm:row.activeForm,
 			metadata:{...row.metadata, key:row.key, ...(prior?.metadata?.cancelRequested ? {cancelRequested:true, cancelledBy:prior.metadata.cancelledBy} : {})}};
 	});
+	const incomingByKey = new Map<unknown, Task>();
+	for (const task of incoming) if (!incomingByKey.has(task.metadata?.key)) incomingByKey.set(task.metadata?.key, task);
+	let parents: Map<unknown, Task> | undefined;
+	const existingParent = (key: string) => {
+		if (!parents) {
+			parents = new Map();
+			for (const t of state.tasks) if (t.parentId === undefined && t.status !== "deleted" && !parents.has(t.metadata?.key)) parents.set(t.metadata?.key, t);
+		}
+		return parents.get(key);
+	};
 	for (let i=0; i<rows.length; i++) {
 		const row = rows[i], task = incoming[i];
 		const prior = byKey.get(row.key);
 		if (prior && (isTerminal(prior) || prior.status === "completed")) continue;
 		if (row.parentKey !== undefined) {
-			const parent = incoming.find(t => t.metadata?.key === row.parentKey)
-				?? state.tasks.find(t => t.metadata?.key === row.parentKey && t.parentId === undefined && t.status !== "deleted");
+			const parent = incomingByKey.get(row.parentKey) ?? existingParent(row.parentKey);
 			if (!parent) return fail("sync parentKey must name a top-level non-deleted row");
 			task.parentId = parent.id;
 		} else delete task.parentId;
@@ -441,9 +471,22 @@ export function applyTaskSync(state: TaskState, actor: string | undefined, owner
 	const absent = owned.filter(t => !keys.has(String(t.metadata?.key))).map(t => t.status === "deleted" ? t : {...t, status:"deleted" as const});
 	const replacements = new Map([...incoming, ...absent].map(t => [t.id, t]));
 	const tasks = state.tasks.map(t => replacements.get(t.id) ?? t);
-	tasks.push(...incoming.filter(t => !state.tasks.some(prior => prior.id === t.id)));
+	const priorIds = new Set(state.tasks.map(t => t.id));
+	tasks.push(...incoming.filter(t => !priorIds.has(t.id)));
 	const checked = finalizeTaskState({tasks, nextId});
 	if (checked.error) return fail(checked.error);
 	const changed = JSON.stringify(checked.state) !== JSON.stringify(state);
 	return {state:changed ? checked.state : state, changed, lastSyncSeq:seq};
+}
+
+/**
+ * Drop an owner's tombstones once its display decisions are durable elsewhere.
+ * Keeps summaries, pending cancellation markers and parents of live rows.
+ */
+export function applyTaskPurge(state: TaskState, actor: string | undefined, owner: string): SyncResult {
+	if (actor !== owner || !/^(execute:|worker:)/.test(owner)) return {state, changed:false, error:"purge requires the scoped owner actor"};
+	const liveParents = new Set(state.tasks.filter(t => t.status !== "deleted" && t.parentId !== undefined).map(t => t.parentId));
+	const tasks = state.tasks.filter(t => !(t.owner === owner && t.status === "deleted" && t.metadata?.summary !== true &&
+		!t.metadata?.cancelRequested && !liveParents.has(t.id)));
+	return tasks.length === state.tasks.length ? {state, changed:false} : {state:{tasks, nextId:state.nextId}, changed:true};
 }

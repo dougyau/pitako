@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { SessionManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { appendExecuteTodoRecords, deriveExecuteTodoRequests, latestExecuteTodoSnapshot, projectExecuteTodos, registerExecuteTodoProjection, type ExecuteTodoSnapshot, type WorkerTodoSnapshot } from "../extensions/execute-todo-projection.ts";
-import { createTodoCommit } from "../vendor/rpiv-todo/index.ts";
+import { createTodoCommit, type TodoCommit } from "../vendor/rpiv-todo/index.ts";
 import { getState, getSyncSequences, evictSession, replaceState } from "../vendor/rpiv-todo/state/store.ts";
 import { createMockPi, createMockCtx } from "../vendor/rpiv-todo/test-utils.ts";
 import type { Task } from "../vendor/rpiv-todo/tool/types.ts";
@@ -232,10 +232,12 @@ function runtimeFixture() {
       request.params.id ? {details:{runId:request.params.id,asyncDir:directories.get(request.params.id)}} : {asyncSnapshot:{runs:snapshotRuns}}});
   });
   const commit=createTodoCommit(pi);
-  registerExecuteTodoProjection(pi,commit);
+  // The commit seam is the projection's only writer; count its calls as the cost of a pass.
+  const commits: unknown[][]=[];
+  registerExecuteTodoProjection(pi,((...args)=>{commits.push(args);return commit(...args);}) as TodoCommit);
   const fire=async (name:string,event:unknown={})=>{for(const handler of captured.events.get(name)??[]) await handler(event,ctx);};
   const warnings=():string[]=>(ctx.ui.notify as any).mock.calls.map((call:unknown[])=>String(call[0]));
-  return {root,sid,ctx,pi,captured,commit,fire,steers,events,writeMain,writeChild,childSession,statusIds,warnings,
+  return {root,sid,ctx,pi,captured,commit,commits,fire,steers,events,writeMain,writeChild,childSession,statusIds,warnings,
     addRun, setRuns:(runs:unknown[])=>{snapshotRuns=runs;},
     setStatusError:(error?: {code:string; message:string})=>{statusError=error;},
     noSnapshot:()=>{snapshotRuns=[];},
@@ -327,11 +329,11 @@ describe("execute todo registration and reconciliation",()=>{
       }]}}));
       await f.fire("tool_result",{toolName:"subagent"});
       const entries=f.captured.entries.slice(before).map(e=>e.data as {tasks:Task[]});
-      const cleared=entries.findIndex(e=>steps.every(step=>e.tasks.find(t=>t.id===step.id)?.status==="deleted"));
-      const retired=entries.findIndex(e=>e.tasks.find(t=>t.id===parent.id)?.status==="deleted");
-      expect(cleared).toBeGreaterThanOrEqual(0);
-      expect(retired).toBeGreaterThan(cleared);
-      expect(entries[cleared].tasks.find(t=>t.id===parent.id)?.status).toBe("in_progress");
+      // One pass persists one snapshot; no persisted state shows the retired parent over live old steps.
+      expect(entries).toHaveLength(1);
+      const live=(e:{tasks:Task[]},id:number)=>{const t=e.tasks.find(t=>t.id===id); return !!t && t.status!=="deleted";};
+      for (const e of entries) if (!live(e,parent.id)) expect(steps.some(step=>live(e,step.id))).toBe(false);
+      expect(live(entries[0],parent.id)).toBe(false);
       const current=visible(getState(f.sid).tasks);
       expect(current.filter(t=>t.owner==="execute:run").map(t=>t.subject)).toEqual(["Loop 2/3 · Plan","Next loop"]);
       const nextParent=current.find(t=>t.metadata?.key==="exec:run:task:2:t1")!;
@@ -388,6 +390,36 @@ describe("execute todo registration and reconciliation",()=>{
       await updated;
       expect(visible(getState(f.sid).tasks).some(t=>t.subject==="Testing live")).toBe(true);
     } finally {clearTimeout(timer);await f.close();}
+  });
+
+  test("one pass publishes one commit for every changed owner; unchanged and retired owners cost none",async()=>{
+    const f=runtimeFixture();
+    try {
+      await f.fire("session_start");
+      // The execute owner and the live worker owner land in a single commit and entry.
+      expect(f.commits).toHaveLength(1);
+      expect(f.captured.entries).toHaveLength(1);
+      const owners=new Set(visible(getState(f.sid).tasks).map(t=>t.owner));
+      expect(owners).toEqual(new Set(["execute:run","worker:run:t1:1"]));
+      for (let i=0;i<5;i++) await f.fire("tool_result",{toolName:"subagent"});
+      f.events.emit("subagent:jobs-changed",{runId:"run"});
+      await f.fire("tool_result",{toolName:"todo"});
+      expect(f.commits).toHaveLength(1);
+      expect(f.captured.entries).toHaveLength(1);
+      const retired=getState(f.sid).tasks.filter(t=>t.owner==="execute:run"||t.owner==="worker:run:t1:1").map(t=>t.id);
+      f.addRun("successor",snapshot(),{reusedFrom:"run"});
+      f.setRuns([{id:"successor"}]);
+      await f.fire("tool_result",{toolName:"subagent"});
+      // Successor rows, predecessor retirement and its tombstone purge are one commit.
+      expect(f.commits).toHaveLength(2);
+      expect(f.captured.entries).toHaveLength(2);
+      const after=getState(f.sid).tasks;
+      expect(after.some(t=>retired.includes(t.id))).toBe(false);
+      expect(visible(after).map(t=>t.owner).sort()).toEqual(["execute:successor","execute:successor","worker:successor:t1:1","worker:successor:t1:1"]);
+      for (let i=0;i<5;i++) await f.fire("tool_result",{toolName:"subagent"});
+      expect(f.commits).toHaveLength(2);
+      expect(f.ctx.ui.notify).not.toHaveBeenCalled();
+    } finally {await f.close();}
   });
 
   for (const link of ["reusedFrom","resumeOrigin"] as const) for (const middleHasSnapshot of [true,false]) test(`${link} retires predecessors transitively (middle snapshot: ${middleHasSnapshot}) after persisting requests; repeats and reload write nothing`,async()=>{
@@ -467,16 +499,19 @@ describe("execute todo registration and reconciliation",()=>{
     const f=runtimeFixture();
     try {
       await f.fire("session_start");
+      const retired=getState(f.sid).tasks.filter(t=>t.owner==="execute:run");
+      expect(retired.length).toBeGreaterThan(0);
       const successor=f.addRun("successor",snapshot(),{reusedFrom:"run"});
       f.setRuns([{id:"successor"}]);
       await f.fire("session_start");
-      const retired=getState(f.sid).tasks.filter(t=>t.owner==="execute:run");
-      expect(retired.length).toBeGreaterThan(0);
-      expect(retired.every(t=>t.status==="deleted")).toBe(true);
+      // Retirement hides the predecessor and purges its tombstones once journaled.
+      expect(getState(f.sid).tasks.some(t=>retired.some(old=>old.id===t.id))).toBe(false);
       appendExecuteTodoRecords(f.root,"invocation","requests.jsonl",[{requestId:"existing",kind:"cancel",...{v:1,invocation:"invocation",taskId:"unrelated",origin:"model",at:"2026-11-03T00:00:00Z"}}]);
       const requests=path.join(f.root,".pi/subagents/execute/invocation/requests.jsonl");
       const bytes=readFileSync(requests,"utf8");
-      // Legacy snapshots have no retirement journal yet.
+      // Legacy snapshots kept retirement tombstones and had no retirement journal yet.
+      if (legacy) expect(f.commit(f.sid,"execute:run",[{action:"sync",owner:"execute:run",seq:1000,
+        rows:retired.map(t=>({key:String(t.metadata?.key),subject:t.subject,status:"deleted" as const,metadata:t.metadata}))}]).error).toBeUndefined();
       if (legacy) rmSync(path.join(f.root,".pi/subagents/execute/invocation/retired-runs.jsonl"),{force:true});
       // session_start clears cached lineage; only the predecessor's status remains readable.
       rmSync(path.join(successor,"status.json"));
@@ -550,7 +585,8 @@ describe("execute todo registration and reconciliation",()=>{
       f.addRun("successor",s,{reusedFrom:"run"});f.setRuns([{id:"successor"}]);
       await f.fire("session_start");
       expect(getState(f.sid).tasks.some(t=>t.metadata?.taskId==="t2")).toBe(false);
-      expect(getState(f.sid).tasks).toHaveLength(1000);
+      // Capacity pruning or the retirement purge removed the tombstone; the durable request still hides it.
+      expect(getState(f.sid).tasks.length).toBeLessThanOrEqual(1000);
       const transferred=f.captured.entries.length;
       await f.fire("tool_result",{toolName:"subagent"});
       await f.fire("session_start");
