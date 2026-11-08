@@ -6,6 +6,7 @@ import path from "node:path";
 const { appendLedger, verifyLedger, loopSummaries, canonicalJSON, summarizeLoops } = await import(path.resolve("skills/execute/ledger.mjs"));
 import { captureCheckpoint } from "../../extensions/execute-checkpoint.ts";
 import { checkoutEvidence, digest, inspectionSnapshot, specBinding, specChunks } from "../../extensions/spec-plans.ts";
+import { updateProgress, apply, cancelledScope, readBacklog } from "../../skills/execute/loop.ts";
 import { EXECUTE_STATE_VERSION } from "../../extensions/execute-state.ts";
 import { verifyGate } from "../../extensions/access-receipts.mjs";
 import { MISSION_STATE_MAX_BYTES } from "../../node_modules/pi-subagents/src/missions/workflow-state.js";
@@ -110,26 +111,30 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
   let optionalCacheFailures = 0;
   const association = (loop: number) => ({ missionId: config.missionId, missionPath: config.missionPath, invocation: config.invocation,
     root: config.root, commonDir: metadata.commonDir, source: selected.source, digest: selected.digest, maxCycles: admittedLimit, sourceRefs: [], loop });
-  const plan = (loop = 1) => ({ status: "plan", reason: "All authorized requirements mapped to ordered work",
-    sharedContext: { material: "FULL SHARED CONTEXT, NOT A SUMMARY", references: ["spec snapshot", "src/entry.ts"] },
-    tasks: [...Array.from({ length: options.taskCount ?? 1 }, (_, index) => task(`change${index + 1}`, options.readOnly ? "verification" : "implementation")), task("final", "verification")].map(unit => ({ ...unit,
-      checks: unit.checks.map(check => ({ ...check, cwd: root })) })).map((unit, index, tasks) => ({ ...unit,
-      checks: unit.checks.map(check => ({ ...check, tier: index === tasks.length - 1 ? "acceptance" : "focused" })) })) });
+  const backlogTask = (id: string) => ({ id, goal: `Goal ${id}`, expectedResult: `Result ${id}`, status: "pending" as const,
+    origin: { kind: "spec" as const, ref: "spec:criterion-1" }, specRefs: ["spec:criterion-1"], dependsOn: [],
+    gates: [{ id: `${id}-check`, command: `bun test ${id}`, cwd: root, timeoutMs: 1800000 }], metric: null,
+    parent: null, remaining: "", progress: { nonImproving: 0, last5: [] }, history: [] });
+  const plan = (loop = 1) => {
+    const existing = readBacklog(root, "spec").backlog;
+    const tasks = existing?.tasks ?? Array.from({ length: options.taskCount ?? 1 }, (_, index) => backlogTask(`change${index + 1}`));
+    return { select: tasks.find(t => t.status === "pending")?.id ?? null,
+      changes: existing ? tasks.filter(t => t.status === "pending" && !t.gates.length).map(t => ({ kind: "update", id: t.id, patch: { gates: backlogTask(t.id).gates }, reason: "Assign focused repair gates" })) : tasks.map(task => ({ kind: "add", task, reason: "From complete spec" })),
+      reason: "Most important eligible backlog task", ...(!existing ? { acceptance: [{ id: "full", command: "true", cwd: root }] } : {}) };
+  };
   const captures = new Map<string, any>();
   const verifications: { key: string; request: any; output: any }[] = [];
   const worker = (request: Request, _checkpointKind: "unit" | "pause" = "unit") => {
-    const descriptor = JSON.parse(request.task.split("FROZEN ATTEMPT:\n")[1]!.split("\n")[0]!);
-    const selectedTask = JSON.parse(request.task.split("COMPLETE SELECTED TASK:\n")[1]!.split("\nFROZEN ATTEMPT")[0]!);
+    const checkpoint = JSON.parse(request.task.split("PRE-WRITE CHECKPOINT INTENTION (not a backup until published):\n")[1]!.split("\n")[0]!);
+    const descriptor = { key: checkpoint.key, taskId: checkpoint.taskId, checkpoint };
+    const selectedTask = JSON.parse(request.task.split("COMPLETE SELECTED TASK:\n")[1]!.split("\nTASK CONTINUATION")[0]!);
     if (selectedTask.kind === "implementation" && descriptor.checkpoint?.progress) {
       captures.set(descriptor.key, copy(descriptor.checkpoint));
       if (!options.controlledCheckpoints && !existsSync(path.join(root, ".pi/subagents/checkpoints", descriptor.key, "manifest.json")))
         captureCheckpoint(descriptor.checkpoint, ["src/" + descriptor.taskId + ".ts"]);
     }
-    return { status: "complete", workDone: `Implemented ${selectedTask.goal}`,
-      remaining: [], diagnosis: "No pending defects after required checks", usefulProgress: true, continuation: null,
-      git: { wip: "Assigned changes remain uncommitted" },
-      checks: selectedTask.checks.map((check: any) => ({ ...check, output: "Observed pass: 1 test", logPaths: [`/native/checks/${descriptor.key}.log`],
-        result: "passed", before: copy(checkout), after: copy(checkout) })) };
+    return { status: "complete", work: `Implemented ${selectedTask.goal}`,
+      remaining: [], knowledge: { findings: [], handoff: "Current assigned source has no pending defects." } };
   };
   function result(request: Request, value: any): Result {
     let savedOutputPath: string | undefined;
@@ -169,6 +174,57 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
       return { ok: true, key: request.key, agent: request.agent, runId: `native-${request.key}`, output: JSON.stringify(observed),
         results: [{ exitCode: 0 }] } as Result;
     }
+    if (request.agent === "pitako.loop-io") {
+      const input = JSON.parse(request.task);
+      const view = { topicId: 1, authority: "spec and frozen amendments > DECISION > FINDING > HANDOFF; code wins over any map", posts: [], omitted: 0 };
+      if (input.operation !== "gate") {
+        try {
+          const current = readBacklog(root, "spec");
+          const value = input.operation === "prepare" ? { ...current, cancelledScope: current.backlog ? cancelledScope(current.backlog) : [], view, lastConfirmedUnit: null }
+            : { ...apply(input), view };
+          const { backlog, ...receipt } = value;
+          return { ok: true, key: request.key, agent: request.agent, runId: `native-${request.key}`,
+            output: JSON.stringify({ ...receipt, ...(backlog ? { acceptance: backlog.acceptance } : {}) }), results: [{ exitCode: 0 }] } as Result;
+        } catch (error) {
+          return { ok: false, key: request.key, agent: request.agent, runId: `native-${request.key}`,
+            output: JSON.stringify({ error: "loop-io", reason: String((error as Error).message), selectionRejected: (error as any).selectionRejected === true }), results: [{ exitCode: 1 }] } as Result;
+        }
+      }
+      if (input.task.id === "final-acceptance") {
+        const before = observedCandidate();
+        const directory = path.join(root, ".pi/subagents/execute", config.invocation, "gates", request.key);
+        mkdirSync(directory, { recursive: true });
+        const gates = input.task.gates.map((gate: any, index: number) => {
+          const start = Date.now();
+          const command = spawnSync("sh", ["-c", gate.command], { cwd: path.resolve(root, gate.cwd),
+            encoding: "utf8", timeout: gate.timeoutMs });
+          const output = (command.stdout ?? "") + (command.stderr ?? "");
+          const logRef = path.join(directory, `${index}.log`);
+          writeFileSync(logRef, output);
+          return { id: gate.id, status: command.error ? "error" : command.status === 0 ? "pass" : "fail",
+            exit: command.status, ms: Date.now() - start, tail: output.slice(-2048), logRef };
+        });
+        checkout = observedCandidate();
+        const progress = updateProgress(input.task.progress, { value: null, fingerprint: checkout.fingerprint,
+          gatesPassed: gates.filter((gate: any) => gate.status === "pass").length, gatesTotal: gates.length }, null);
+        return { ok: true, key: request.key, agent: request.agent, runId: `native-${request.key}`,
+          output: JSON.stringify({ before, after: copy(checkout), mutated: before.fingerprint !== checkout.fingerprint || before.head !== checkout.head,
+            gates, metric: null, progress, stalled: progress.nonImproving >= 3, view }), results: [{ exitCode: 0 }] } as Result;
+      }
+      const previous = input.task.progress;
+      const shouldRun = input.workerStatus === "complete" || !input.task.metric;
+      const passed = shouldRun ? input.task.gates.length : 0;
+      const progress = updateProgress(previous, { value: input.task.metric?.target ?? null,
+        fingerprint: checkout.fingerprint, gatesPassed: passed, gatesTotal: input.task.gates.length }, input.task.metric?.target ?? null);
+      const value = { before: copy(checkout), after: copy(checkout), mutated: false,
+        gates: shouldRun ? input.task.gates.map((gate: any) => ({ id: gate.id,
+          status: "pass", exit: 0, ms: 1, tail: "Focused gate passed", logRef: `/native/gates/${request.key}/${gate.id}.log` })) : [],
+        metric: input.task.metric ? { value: input.task.metric.target, error: null } : null,
+        progress, stalled: progress.nonImproving >= 3,
+        view: { topicId: 1, authority: "spec and frozen amendments > DECISION > FINDING > HANDOFF; code wins over any map", posts: [], omitted: 0 } };
+      return { ok: true, key: request.key, agent: request.agent, runId: `native-${request.key}`,
+        output: JSON.stringify(value), results: [{ exitCode: 0 }] } as Result;
+    }
     if (request.agent === "pitako.checkpoint-sealer") {
       const input = JSON.parse(request.task), intent = input.intent;
       let observed;
@@ -178,8 +234,11 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
           ...(captures.has(intent.key) && input.kind ? { checkpointRef: path.join(root, ".pi/subagents/checkpoints", intent.key, `${input.kind}.json`),
             digest: digest(intent.key), position: { loop: intent.loop, cursor: intent.cursor + (input.kind === "unit" ? 1 : 0), phase: intent.phase } } : {}) };
       } else {
-        const response = spawnSync("node", [path.resolve("skills/execute/checkpoint.mjs"), "--seal-stdin"],
-          { cwd: root, input: request.task, encoding: "utf8" });
+        // A private process preserves the sealer's cwd boundary without reloading Node's TS hook.
+        const response = spawnSync(process.execPath, ["--eval", `
+          import { sealCheckpointRequest } from ${JSON.stringify(path.resolve("extensions/execute-checkpoint.ts"))};
+          console.log(JSON.stringify(sealCheckpointRequest(JSON.parse(await Bun.stdin.text()))));
+        `], { cwd: root, input: request.task, encoding: "utf8" });
         if (response.status !== 0) throw new Error(response.stderr);
         observed = JSON.parse(response.stdout);
       }

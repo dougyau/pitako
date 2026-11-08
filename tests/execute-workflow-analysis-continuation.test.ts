@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
+import { applyCheckpoint, restoreCheckpoint, type CheckpointIntent } from "../extensions/execute-checkpoint.ts";
 import { executeControllerFixture, copy, closedInterruptedProducer, cutAt, type Result, removeCache } from "./fixtures/execute-workflow.ts";
 
 const { fixture } = executeControllerFixture();
@@ -6,9 +9,10 @@ const { fixture } = executeControllerFixture();
 describe("workflow-owned execute controller", () => {
   // Reject treating terminal-looking prose/labels as settlement, laundering a
   // different producer, or spending the same authorization after a new Stop.
+  // Exercise read-only operations in a final loop, with no implementation pending.
   test.each(["missing", "terminal-missing", "run-conflict", "key-conflict", "active", "inspector-stop", "inspector-permission", "inspector-pending"])(
     "interrupted-operation observation preserves %s barrier and original", async mode => {
-      const host = fixture(undefined, { readOnly: true }), target = "invoke-human-1.l1.t1.a1";
+      const host = fixture(undefined, { taskCount: 0 }), target = "invoke-human-1.l1.compliance";
       host.setRespond((request, normal) => request.key === target ? closedInterruptedProducer(normal()) : normal());
       expect((await host.executeNative()).status).toBe("cancelled");
       const original = copy(host.native.get(target)!);
@@ -37,12 +41,12 @@ describe("workflow-owned execute controller", () => {
       expect((await host.executeNative()).status).not.toBe("complete");
       expect(host.calls).toHaveLength(count);
       expect(host.native.get(target)).toEqual(original);
-      expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(1);
+      expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(0);
     });
 
   test.each(["intention", "observation", "admission", "next-slot"])(
     "interrupted-operation %s cut reconciles exactly one observer and ordinary slot", async cut => {
-      const host = fixture(undefined, { readOnly: true }), target = "invoke-human-1.l1.t1.a1";
+      const host = fixture(undefined, { taskCount: 0 }), target = "invoke-human-1.l1.compliance";
       host.setRespond((request, normal) => request.key === target ? closedInterruptedProducer(normal()) : normal());
       expect((await host.executeNative()).status).toBe("cancelled");
       const original = copy(host.native.get(target)!);
@@ -77,7 +81,7 @@ describe("workflow-owned execute controller", () => {
   test.each(["review.director-prepare", "review.independent-angle1", "compliance"].flatMap(phase =>
     ["stop", "permission", "thrown-permission", "thrown-status-stop", "pending", "unknown"].map(mode => ({ phase, mode }))))(
     "retained analysis barrier at $phase ($mode) is observed before replay dispatch", async ({ phase, mode }) => {
-      const host = fixture();
+      const host = fixture(undefined, { taskCount: 0 });
       const target = `invoke-human-1.l1.${phase}`;
       host.setRespond((request, normal) => {
         const result = normal();
@@ -108,7 +112,7 @@ describe("workflow-owned execute controller", () => {
 
   test.each(["review.director-prepare", "review.independent-angle1", "compliance"].flatMap(phase =>
     ["intention", "receipt", "phase"].map(cut => ({ phase, cut }))))("analysis $phase $cut persistence cut never blindly replaces a call", async ({ phase, cut }) => {
-    const host = fixture(), target = `invoke-human-1.l1.${phase}`;
+    const host = fixture(undefined, { taskCount: 0 }), target = `invoke-human-1.l1.${phase}`;
     cutAt(host, value => {
       const loop = value.loop, call = loop?.analysisCalls?.find((entry: any) => entry.key === target);
       return cut === "phase" ? loop?.phase === (phase === "compliance" ? "closing" : "compliance") : call?.stage === cut;
@@ -124,7 +128,7 @@ describe("workflow-owned execute controller", () => {
   });
 
   test.each(["intact", "producer-conflict"])("completed review references survive a phase cut: %s", async mode => {
-    const host = fixture();
+    const host = fixture(undefined, { taskCount: 0 });
     host.setRespond((request, normal) => {
       const result = normal();
       if (request.phase?.startsWith("review-")) Object.assign(result.results![0]!, {
@@ -165,7 +169,7 @@ describe("workflow-owned execute controller", () => {
   });
 
   test("retained analysis intention without a settled producer cannot launch a replacement", async () => {
-    const host = fixture();
+    const host = fixture(undefined, { taskCount: 0 });
     cutAt(host, value => value.loop?.analysisCalls?.some((call: any) => call.stage === "receipt"));
     expect((await host.executeNative()).status).toBe("partial");
     host.setFailSave();
@@ -177,7 +181,7 @@ describe("workflow-owned execute controller", () => {
   });
 
   test("current exact settled analysis supersedes a historical Stop without relaunch", async () => {
-    const host = fixture(), target = "invoke-human-1.l1.review.director-prepare";
+    const host = fixture(undefined, { taskCount: 0 }), target = "invoke-human-1.l1.review.director-prepare";
     let settled: Result;
     host.setRespond((request, normal) => {
       const result = normal();
@@ -193,7 +197,7 @@ describe("workflow-owned execute controller", () => {
   });
 
   test.each(["running", "unknown", "mismatched"])("retained analysis %s status never becomes success", async state => {
-    const host = fixture(), target = "invoke-human-1.l1.compliance";
+    const host = fixture(undefined, { taskCount: 0 }), target = "invoke-human-1.l1.compliance";
     host.setRespond((request, normal) => request.key === target ? { ...normal(), ok: false, stopped: true } : normal());
     expect((await host.executeNative()).status).toBe("cancelled");
     host.setRespond((_request, normal) => normal());
@@ -208,7 +212,7 @@ describe("workflow-owned execute controller", () => {
   });
 
   test("a legacy analysis barrier without its failed call receipt stays uncertain across replays", async () => {
-    const host = fixture();
+    const host = fixture(undefined, { taskCount: 0 });
     host.setRespond((request, normal) => {
       if (request.key.endsWith(".compliance")) throw Error("Blocked by pi-subagents permission rule: 'run' is denied.");
       return normal();
@@ -225,7 +229,7 @@ describe("workflow-owned execute controller", () => {
   test.each(["review.director-prepare", "review.independent-angle1", "compliance"])(
     "native status exceptions at %s preserve their current barrier, not the old receipt", async phase => {
       for (const mode of ["stop", "permission"]) {
-        const host = fixture(), target = `invoke-human-1.l1.${phase}`;
+        const host = fixture(undefined, { taskCount: 0 }), target = `invoke-human-1.l1.${phase}`;
         // Persist an ordinary successful original but interrupt its receipt write.
         // There is no old Stop to accidentally satisfy the cancellation assertion.
         cutAt(host, value => value.loop?.analysisCalls?.some((call: any) =>
@@ -251,7 +255,7 @@ describe("workflow-owned execute controller", () => {
   // Read-only continuation still reconciles its exact query; it has no file
   // checkpoint to restore. Modifying recovery is covered by real checkpoint
   // composition below, and must not inherit this historical-query prerequisite.
-  test.each(["loop-plan", "attempt-result", "interrupted-operation"].flatMap(subject =>
+  test.each(["loop-plan"].flatMap(subject =>
     ["unavailable", "closed", "complete"].flatMap(producer =>
       ["pending", "unknown", "conflict", "binding", "unresolved", "provenance", "invalid-value", "incomplete-value", "usable",
         ...(producer === "closed" && subject === "attempt-result" ? ["cache-missing", "scope", "rejected-observed-cut", "rejected-validated-cut", "rejected-applied-cut", "rejected-next-slot-cut"] : []),
@@ -298,12 +302,12 @@ describe("workflow-owned execute controller", () => {
       if (observation === "binding") receipt.output = JSON.stringify({ ...receipt.structuredOutput, reason: "Different full value" });
       if (observation === "provenance") receipt.structuredOutput.provenance = [];
       if (observation === "invalid-value") {
-        if (subject === "loop-plan") receipt.structuredOutput.original.status = "different";
+        if (subject === "loop-plan") receipt.structuredOutput.original.reason = null;
         else if (subject === "attempt-result") receipt.structuredOutput.workerResult.status = "different";
         else receipt.structuredOutput.original.runId = "different";
       }
       if (observation === "incomplete-value" || observation.startsWith("rejected-")) {
-        if (subject === "loop-plan") receipt.structuredOutput.original.tasks = [];
+        if (subject === "loop-plan") delete receipt.structuredOutput.original.changes;
         else if (subject === "attempt-result") receipt.structuredOutput.workerResult.checks = [];
         else { receipt.structuredOutput.original.ok = true; receipt.structuredOutput.original.results = []; }
       }
@@ -345,8 +349,8 @@ describe("workflow-owned execute controller", () => {
       if (canContinue) expect(output.status, JSON.stringify({ reason: output.reason, statuses: host.statusCalls, halt: host.history()[0].halt })).toBe("complete");
       else expect(output.status).not.toBe("complete");
       expect(host.statusCalls).toContain(retained.ref.runId ?? retained.ref.key);
-      expect(host.calls.slice(count).every(call => canContinue && (call.key.startsWith("invoke-human-1.l2.") || call.key === "invoke-human-1.l1.gaps"))).toBe(true);
-      expect(host.history()).toHaveLength(canContinue ? 2 : 1);
+      expect(host.calls.slice(count).every(call => canContinue && (/^invoke-human-1\.l[23]\./.test(call.key) || call.key === "invoke-human-1.l1.gaps"))).toBe(true);
+      expect(host.history()).toHaveLength(canContinue ? 3 : 1);
       // Its incomplete checks never attest the discharged loop.
       const recoveries = canContinue
         ? host.records().find((record: any) => record.kind === "loop" && record.loop === 1).body.recoveries
@@ -381,4 +385,143 @@ describe("workflow-owned execute controller", () => {
       await host.execute();
       expect(host.calls).toHaveLength(after);
     });
+});
+
+// Worker payload/inspector observations were replaced by checkpoint-first v6
+// recovery: producer conflicts and native barriers remain barriers; missing
+// payload/provenance uses the durable journal, never an invented inspector report.
+describe("checkpoint-first modifying recovery", () => {
+  test.each(["running", "queued", "pending", "paused", "detached", "recovery", "capacity", "permission", "stop", "run-conflict", "agent-conflict"])(
+    "producer %s prevents a replacement writer and survives replay", async mode => {
+      const host = fixture(), target = "invoke-human-1.l1.t1.a1";
+      let original!: Result;
+      host.setRespond((request, normal) => {
+        const result = normal();
+        if (request.key !== target) return result;
+        delete result.structuredOutput;
+        original = { ...result, ...(mode === "permission" ? { ok: false, error: "Blocked by pi-subagents permission rule: worker denied." }
+          : mode === "stop" ? { ok: false, stopped: true }
+          : mode === "capacity" ? { toolBudgetBlocked: true }
+          : mode === "run-conflict" ? { ok: false, stopped: true }
+          : mode === "agent-conflict" ? { agent: "pitako.reviewer" }
+          : { state: mode }) };
+        return original;
+      });
+      const output = await host.executeNative();
+      expect(output.status).not.toBe("complete");
+      expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(1);
+      expect(host.calls.filter(call => call.agent === "pitako.execution-inspector")).toHaveLength(0);
+      const count = host.calls.length;
+      host.setRespond((_request, normal) => normal());
+      host.setStatus(ref => ref === target || ref === `native-${target}` ? mode === "run-conflict" ? { ...copy(original), runId: "different-writer" } : copy(original) : copy(host.native.get(ref)!));
+      expect((await host.executeNative()).status).not.toBe("complete");
+      expect(host.calls).toHaveLength(count);
+      expect(host.current().loop.attempt.restore).toBeUndefined();
+      expect(host.native.get(target)).toEqual(original);
+    });
+
+  test.each(["missing", "interrupted", "cache-missing", "key-only"].flatMap(mode =>
+    ["none", "restoration-intent", "new-checkpoint", "result", "next-loop"].map(cut => ({ mode, cut })) ))(
+    "$mode restores before capture across $cut cut and replays idempotently", async ({ mode, cut }) => {
+      const host = fixture(), target = "invoke-human-1.l1.t1.a1";
+      let source: CheckpointIntent, restored: ReturnType<typeof restoreCheckpoint>;
+      host.setRespond((request, normal) => {
+        if (request.key === target) {
+          const result = normal(); source = copy(host.current().loop.attempt.checkpoint);
+          applyCheckpoint(source, [{ path: "src/change1.ts", image: { bytes: Buffer.from("interrupted owned bytes").toString("base64"), mode: 0o644 } }]);
+          delete result.structuredOutput;
+          if (mode === "interrupted") { result.ok = false; result.state = "interrupted"; }
+          if (mode === "key-only") delete result.runId;
+          return result;
+        }
+        if (request.key === "invoke-human-1.l1.t1.a2") {
+          expect(request.task).toContain("CHECKPOINT FALLBACK");
+          expect(request.task).toContain(source.key);
+          expect(readFileSync(path.join(host.root, "src/change1.ts"), "utf8")).toBe("interrupted owned bytes");
+          restored = restoreCheckpoint(source, host.current().loop.attempt.restore.authority);
+          expect(existsSync(path.join(host.root, "src/change1.ts"))).toBe(false);
+          expect(existsSync(path.join(host.root, ".pi/subagents/checkpoints", request.key, "manifest.json"))).toBe(false);
+        }
+        return normal();
+      });
+      if (cut !== "none") cutAt(host, value => cut === "next-loop" ? value.consumedLoops === 2
+        : value.loop?.attempt?.number === 2 && (cut === "restoration-intent" ? !!value.loop.attempt.restore
+          : cut === "new-checkpoint" ? !!value.loop.attempt.checkpoint : value.loop.attempt.stage === "result"));
+      let output = await host.executeNative();
+      if (cut !== "none") {
+        expect(output.status).not.toBe("complete");
+        expect(output.reason).toContain("Essential persistence failed");
+        host.setFailSave();
+        if (mode === "cache-missing") removeCache(host);
+        host.setStatus(ref => ref.includes(".t1.a1") ? { ok: false, results: [] } : copy(host.native.get(ref)!));
+        output = await host.executeNative();
+      }
+      expect(output.status, output.reason).toBe("complete");
+      expect(host.calls.filter(call => call.agent === "pitako.execution-inspector")).toHaveLength(0);
+      expect(host.calls.filter(call => call.agent === "pitako.worker").map(call => call.key)).toEqual([target, "invoke-human-1.l1.t1.a2"]);
+      const partial = JSON.parse(JSON.parse(readFileSync(restored!.partialRef, "utf8")).data).partial;
+      expect(partial[0].image.bytes).toBe(Buffer.from("interrupted owned bytes").toString("base64"));
+      expect(host.history()[0].results[0]).toMatchObject({ status: "complete", attempt: 2,
+        checkpoint: { confirmation: { kind: "unit" } } });
+      const count = host.calls.length;
+      expect((await host.executeNative()).status).toBe("complete");
+      expect(host.calls).toHaveLength(count);
+    });
+
+  test.each(["missing", "corrupt"])("%s checkpoint is refused by the restoring worker before capture", async mode => {
+    const host = fixture();
+    host.setRespond((request, normal) => {
+      if (request.key === "invoke-human-1.l1.t1.a2") {
+        const state = host.current();
+        expect(() => restoreCheckpoint(state.taskFrame.sources[0], state.loop.attempt.restore.authority)).toThrow();
+        expect(existsSync(path.join(host.root, ".pi/subagents/checkpoints", request.key, "manifest.json"))).toBe(false);
+        throw new Error("Cannot restore corrupt or incomplete checkpoint; no capture or edits performed");
+      }
+      const result = normal();
+      if (request.key === "invoke-human-1.l1.t1.a1") {
+        const file = path.join(host.root, ".pi/subagents/checkpoints", request.key, "manifest.json");
+        // Missing bytes and mismatched manifest binding are both integrity gaps.
+        writeFileSync(file, mode === "missing" ? "" : "{}");
+        delete result.structuredOutput;
+      }
+      return result;
+    });
+    expect((await host.executeNative()).status).not.toBe("complete");
+    expect(host.calls.filter(call => call.agent === "pitako.worker").map(call => call.key)).toEqual(["invoke-human-1.l1.t1.a1", "invoke-human-1.l1.t1.a2"]);
+    expect(host.calls.filter(call => call.agent === "pitako.execution-inspector")).toHaveLength(0);
+    expect(host.current().tasks.change1.completed).toBeFalsy();
+    const count = host.calls.length;
+    expect((await host.executeNative()).status).not.toBe("complete");
+    expect(host.calls).toHaveLength(count);
+  });
+});
+
+
+test.each(["binding", "invalid-value", "incomplete-value", "blocked"])("settled worker %s preserves result authority without inspector payload rescue", async mode => {
+  const host = fixture();
+  host.setRespond((request, normal) => {
+    const result = normal();
+    if (request.key === "invoke-human-1.l1.t1.a1") {
+      if (mode === "binding") result.output = JSON.stringify({ ...result.structuredOutput, work: "Conflicting complete binding" });
+      if (mode === "invalid-value") result.structuredOutput.status = "different";
+      if (mode === "incomplete-value") delete result.structuredOutput.work;
+      if (mode === "blocked") Object.assign(result.structuredOutput, { status: "blocked", remaining: ["Required scope expansion remains unapproved"] });
+    }
+    return result;
+  });
+  const output = await host.executeNative();
+  expect(host.calls.filter(call => call.agent === "pitako.execution-inspector")).toHaveLength(0);
+  if (["invalid-value", "incomplete-value"].includes(mode)) {
+    expect(output.status, output.reason).toBe("complete");
+    expect(host.history()[0].results[0]).toMatchObject({ status: "rejected", taskId: "change1", attempt: 1 });
+    expect(host.history()[0].results[0].checkpoint?.confirmation).toBeUndefined();
+    expect(host.calls.find(call => call.key === "invoke-human-1.l2.director")!.task).toContain("Worker returned an invalid work/status/remaining contract.");
+  } else {
+    expect(output.status).toBe("blocked");
+    if (mode === "binding") expect(output.reason).toContain("Changed/conflicting worker binding");
+    else expect(host.current().loop.attempt.result.checkpoint.confirmation.kind).toBe("pause");
+    const count = host.calls.filter(call => call.agent === "pitako.worker").length;
+    expect((await host.executeNative()).status).toBe("blocked");
+    expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(count);
+  }
 });

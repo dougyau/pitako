@@ -4,7 +4,7 @@ import { DEFAULT_BOARD_AUTHOR } from "./author.ts";
 import { getBoardDbPath } from "./paths.ts";
 import { openSqlite, type SqlDatabase } from "./sqlite.ts";
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 5;
 export const BOARD_AUTHOR = "pi";
 export const BOARD_SCOPE = "global";
 
@@ -96,10 +96,20 @@ export interface QueryResult {
   capped: boolean;
 }
 
+export interface PostInput {
+  topicId: number;
+  type: string;
+  subject?: string;
+  content: string;
+  replyTo?: number;
+  metadata?: unknown;
+}
+
 export interface Board {
   close(): void;
   migrateLegacyWorkspaces(identity: string, physicalRoots: readonly string[]): void;
   createTopic(workspace: string, input: { title: string; description?: string }, author?: string): Topic;
+  ensureOwnedTopic(workspace: string, ownerPlanId: string, input: { title: string; description?: string }, author?: string): Topic;
   listTopics(workspace: string, filter?: { status?: TopicStatus; limit?: number }): TopicList;
   findTopicOwnedByPlan(workspace: string, planId: string): number | undefined;
   readTopic(
@@ -112,18 +122,9 @@ export interface Board {
     topicId: number,
     patch: { status?: TopicStatus; title?: string; description?: string },
   ): Topic;
-  post(
-    workspace: string,
-    input: {
-      topicId: number;
-      type: string;
-      subject?: string;
-      content: string;
-      replyTo?: number;
-      metadata?: unknown;
-    },
-    author?: string,
-  ): Post;
+  post(workspace: string, input: PostInput, author?: string): Post;
+  // Reserves metadata.idempotencyKey per topic; HANDOFF metadata.taskId scopes supersedes.
+  postOnce(workspace: string, key: string, input: PostInput, author?: string): Post;
   claimTopic(workspace: string, topicId: number, planId: string): Topic;
   claimTopicExecution(workspace: string, topicId: number, planId: string, binding: { revision: number; hash: string; executionRoot: string }): Topic;
   transitionOwnedTopic(
@@ -138,6 +139,10 @@ export interface Board {
     filter?: { topicId?: number; type?: string; author?: string; text?: string; limit?: number },
   ): QueryResult;
 }
+
+const POST_ONCE_INDEX = `CREATE UNIQUE INDEX IF NOT EXISTS posts_idempotency_key
+  ON posts(topic_id, json_extract(metadata_json, '$.idempotencyKey'))
+  WHERE json_valid(metadata_json) AND json_type(metadata_json, '$.idempotencyKey') = 'text'`;
 
 const SCHEMA_STATEMENTS = [
   `CREATE TABLE topics (
@@ -206,6 +211,7 @@ function initialize(db: SqlDatabase, dbPath: string): void {
       }
       for (const statement of SCHEMA_STATEMENTS) db.exec(statement);
       db.exec("CREATE UNIQUE INDEX topics_workspace_owner_plan ON topics(workspace, owner_plan_id) WHERE owner_plan_id IS NOT NULL");
+      db.exec(POST_ONCE_INDEX);
       version = SCHEMA_VERSION;
       db.exec(`PRAGMA user_version = ${version}`);
     } else if (version === 1) {
@@ -223,7 +229,25 @@ function initialize(db: SqlDatabase, dbPath: string): void {
       version = 3;
       db.exec("PRAGMA user_version = 3");
     }
-    if (version === SCHEMA_VERSION) validateV3(db, dbPath);
+    if (version === 3) {
+      validateV3(db, dbPath);
+      db.exec(POST_ONCE_INDEX);
+      version = 4;
+      db.exec("PRAGMA user_version = 4");
+    }
+    if (version === 4) {
+      validateV3(db, dbPath);
+      db.exec("DROP INDEX posts_idempotency_key");
+      db.exec(POST_ONCE_INDEX);
+      version = 5;
+      db.exec("PRAGMA user_version = 5");
+    }
+    if (version === SCHEMA_VERSION) {
+      validateV3(db, dbPath);
+      if (!db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'posts_idempotency_key'").get()) {
+        throw initError(dbPath, "schema v5 is incomplete: missing posts_idempotency_key");
+      }
+    }
     else throw initError(dbPath, `schema version ${version} is not supported (expected ${SCHEMA_VERSION}). Refusing to migrate or discard data.`);
     db.exec("COMMIT");
   } catch (error) {
@@ -295,6 +319,26 @@ class SqliteBoard implements Board {
       )
       .run(requireWorkspace(workspace), BOARD_SCOPE, title, description, authorOrDefault(author), createdAt, createdAt);
     return this.requireTopic(workspace, inserted.lastInsertRowid);
+  }
+
+  ensureOwnedTopic(workspace: string, ownerPlanId: string, input: { title: string; description?: string }, author = DEFAULT_BOARD_AUTHOR): Topic {
+    const owner = requireText(ownerPlanId, "ownerPlanId");
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const existing = this.findTopicOwnedByPlan(workspace, owner);
+      let topic: Topic;
+      if (existing !== undefined) topic = this.requireTopic(workspace, existing);
+      else {
+        topic = this.createTopic(workspace, input, author);
+        this.db.prepare("UPDATE topics SET owner_plan_id = ? WHERE id = ?").run(owner, topic.id);
+        topic = this.requireTopic(workspace, topic.id);
+      }
+      this.db.exec("COMMIT");
+      return topic;
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch { /* transaction already ended */ }
+      throw error;
+    }
   }
 
   listTopics(workspace: string, filter: { status?: TopicStatus; limit?: number } = {}): TopicList {
@@ -507,18 +551,51 @@ class SqliteBoard implements Board {
     return this.requireTopic(workspace, id);
   }
 
-  post(
-    workspace: string,
-    input: {
-      topicId: number;
-      type: string;
-      subject?: string;
-      content: string;
-      replyTo?: number;
-      metadata?: unknown;
-    },
-    author = DEFAULT_BOARD_AUTHOR,
-  ): Post {
+  post(workspace: string, input: PostInput, author = DEFAULT_BOARD_AUTHOR): Post {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const post = this.insertPost(workspace, input, author);
+      this.db.exec("COMMIT");
+      return post;
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch { /* transaction already ended */ }
+      throw error instanceof BoardError ? error : new BoardError(`Board post failed: ${messageOf(error)}`);
+    }
+  }
+
+  postOnce(workspace: string, key: string, input: PostInput, author = DEFAULT_BOARD_AUTHOR): Post {
+    const idempotencyKey = requireText(key, "key");
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const topic = this.requireTopic(workspace, input.topicId);
+      const existing = this.db.prepare(`${POST_SELECT} WHERE topic_id = ? AND json_valid(metadata_json)
+        AND json_extract(metadata_json, '$.idempotencyKey') = ?`).get(topic.id, idempotencyKey);
+      if (existing) {
+        const post = parsePost(existing);
+        this.db.exec("COMMIT");
+        return post;
+      }
+      const serialized = serializeMetadata(input.metadata);
+      const metadata: Record<string, unknown> = serialized === null ? {} : JSON.parse(serialized);
+      metadata.idempotencyKey = idempotencyKey;
+      if (input.type === "HANDOFF" && metadata.taskId !== undefined) {
+        const taskId = requireText(metadata.taskId as string, "taskId");
+        metadata.taskId = taskId;
+        const previous = this.db.prepare(`${POST_SELECT} WHERE topic_id = ? AND type = 'HANDOFF'
+          AND json_valid(metadata_json) AND json_extract(metadata_json, '$.taskId') = ?
+          ORDER BY id DESC LIMIT 1`).get(topic.id, taskId);
+        if (previous) metadata.supersedes = integer(previous.id, "post id");
+      }
+      const post = this.insertPost(workspace, { ...input, metadata }, author);
+      this.db.exec("COMMIT");
+      return post;
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch { /* transaction already ended */ }
+      throw error instanceof BoardError ? error : new BoardError(`Board post failed: ${messageOf(error)}`);
+    }
+  }
+
+  private insertPost(workspace: string, input: PostInput, author: string): Post {
     const topic = this.requireTopic(workspace, input.topicId);
     const type = parsePostType(input.type);
     const content = requireText(input.content, "content");
@@ -526,25 +603,14 @@ class SqliteBoard implements Board {
     const metadata = serializeMetadata(input.metadata);
     const replyTo = input.replyTo === undefined ? null : this.requireReply(topic.id, input.replyTo);
     const createdAt = timestamp();
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      const inserted = this.db
-        .prepare(
-          `INSERT INTO posts (topic_id, author, type, subject, content, reply_to, metadata_json, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(topic.id, authorOrDefault(author), type, subject, content, replyTo, metadata, createdAt);
-      this.db.prepare("UPDATE topics SET updated_at = ? WHERE id = ?").run(createdAt, topic.id);
-      this.db.exec("COMMIT");
-      return this.requirePost(inserted.lastInsertRowid);
-    } catch (error) {
-      try {
-        this.db.exec("ROLLBACK");
-      } catch {
-        // Already rolled back.
-      }
-      throw error instanceof BoardError ? error : new BoardError(`Board post failed: ${messageOf(error)}`);
-    }
+    const inserted = this.db
+      .prepare(
+        `INSERT INTO posts (topic_id, author, type, subject, content, reply_to, metadata_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(topic.id, authorOrDefault(author), type, subject, content, replyTo, metadata, createdAt);
+    this.db.prepare("UPDATE topics SET updated_at = ? WHERE id = ?").run(createdAt, topic.id);
+    return this.requirePost(inserted.lastInsertRowid);
   }
 
   query(

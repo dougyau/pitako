@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { executeControllerFixture, copy, gaps } from "./fixtures/execute-workflow.ts";
+import { executeControllerFixture, copy } from "./fixtures/execute-workflow.ts";
 import { RunFanoutLimitError } from "../node_modules/pi-subagents/src/runs/shared/run-fanout-budget.js";
 
 const { fixture } = executeControllerFixture();
@@ -55,14 +55,14 @@ test("native admission rejection saves budget-exhausted before any child starts;
   expect(host.current().ledger).toEqual({ count: 0, head: null });
   expect(host.current().loop).not.toHaveProperty("archived");
   expect(host.current().loop).not.toHaveProperty("halt");
-  expect(host.current().budgetRejectedKeys).toEqual(["invoke-human-1.l1.director"]);
+  expect(host.current().budgetRejectedKeys).toEqual(["invoke-human-1.l1.prepare"]);
   host.setAdmission();
   expect((await host.executeNative()).status).toBe("complete");
-  expect(host.current().consumedLoops).toBe(1);
+  expect(host.current().consumedLoops).toBe(2);
   expect(new Set(host.calls.map(call => call.key)).size).toBe(host.calls.length);
 });
 
-test.each(["worker", "implementation", "sealer", "seal", "review", "compliance", "checkout", "recovery", "gaps"])(
+test.each(["worker", "implementation", "gate", "sealer", "seal", "review", "compliance", "checkout", "recovery", "gaps"])(
   "%s rejection retains pending work and reentry never repeats admitted launches", async phase => {
     const host = fixture(undefined, { readOnly: !["sealer", "seal", "implementation"].includes(phase) });
     if (phase === "gaps") host.setLimit(1);
@@ -73,6 +73,7 @@ test.each(["worker", "implementation", "sealer", "seal", "review", "compliance",
         const value = normal(); original = copy(value.structuredOutput); delete value.structuredOutput; return value;
       }
       const selected = ["worker", "implementation"].includes(phase) ? request.agent === "pitako.worker"
+        : phase === "gate" ? request.key.endsWith(".t1.a1.gate")
         : phase === "sealer" ? request.agent === "pitako.checkpoint-sealer"
         : phase === "seal" ? request.agent === "pitako.execution-ledger"
         : phase === "review" ? request.key.includes(".review.independent-")
@@ -84,7 +85,7 @@ test.each(["worker", "implementation", "sealer", "seal", "review", "compliance",
         return host.result(request, { status: "recovered", reason: "Exact original plan", original,
           workerResult: null, originalAvailable: true, binding: "absent", comparison: "only-original", provenance: ["/native/plan"] });
       const result = normal();
-      if (phase === "gaps" && request.agent === "pitako.execution-director") result.structuredOutput.tasks = [];
+      if (phase === "gaps" && request.agent === "pitako.execution-director") result.structuredOutput.select = "missing";
       return result;
     });
     const first = await host.execute();
@@ -101,7 +102,7 @@ test.each(["worker", "implementation", "sealer", "seal", "review", "compliance",
     if (phase === "sealer") {
       // The retry counter is restored on budget rejection, so reentry reuses the unlaunched key.
       expect(rejected).toEqual(["invoke-human-1.l1.t1.a1.seal"]);
-      expect(before.loop.attempt.seal).toEqual({ retry: 0 });
+      expect(before.loop.attempt.seal).toEqual({ retry: 0, kind: "unit" });
       expect(before.loop.attempt.stage).not.toBe("result");
     }
     if (phase === "seal") {
@@ -112,21 +113,21 @@ test.each(["worker", "implementation", "sealer", "seal", "review", "compliance",
     }
     const resumed = await host.execute();
     expect(resumed.status, resumed.reason).toBe(phase === "gaps" ? "partial" : "complete");
-    expect(resumed.loopsConsumed).toBe(1);
+    expect(resumed.loopsConsumed).toBe(phase === "gaps" ? 1 : 2);
     expect(host.current().budgetRejectedKeys).toEqual([]);
     for (const key of admittedKeys) expect(host.calls.filter(call => call.key === key)).toHaveLength(1);
     for (const key of rejected) expect(host.calls.filter(call => call.key === key)).toHaveLength(2);
   });
 
 test("a closed loop permits another exhaustion even without any checkpoint seals", async () => {
-  const host = fixture(undefined, { readOnly: true }); host.setLimit(2);
+  const host = fixture(undefined, { taskCount: 0 }); host.setLimit(2);
   const rejected = new Set<string>();
   host.setRespond((request, normal) => {
     if (request.key.endsWith(".director") && !rejected.has(request.key)) {
       rejected.add(request.key); return receipt(request.key);
     }
     const result = normal();
-    return request.key === "invoke-human-1.l1.compliance" ? gaps(result) : result;
+    return request.key === "invoke-human-1.l1.director" ? { ...result, structuredOutput: { ...result.structuredOutput, select: "missing" } } : result;
   });
   expect((await host.execute()).status).toBe("budget-exhausted");
   const second = await host.execute();
@@ -198,19 +199,16 @@ test.each(["throw", "prose", "child"])("non-budget %s failure is not misclassifi
   expect(host.current()).not.toHaveProperty("lastBudgetProgress");
 });
 
-// The root sealer costs one native fan-out slot per attempt: an implementation
-// attempt dispatches 5 children and a verification attempt 4 (default budget 64).
-test("each attempt adds exactly one checkpoint-sealer dispatch to its spawn cost", async () => {
+// Task attempts include workflow-owned gates; final acceptance has no worker or sealer.
+test("a task attempt dispatches its gate before exactly one checkpoint sealer", async () => {
   const host = fixture();
   expect((await host.execute()).status).toBe("complete");
   const attempt = (key: string, count: number) => {
     const index = host.calls.findIndex(call => call.key === key);
     return host.calls.slice(index - 1, index - 1 + count).map(call => call.agent);
   };
-  expect(attempt("invoke-human-1.l1.t1.a1", 5)).toEqual(["pitako.request-observer", "pitako.worker",
-    "pitako.request-observer", "pitako.checkpoint-sealer", "pitako.execution-ledger"]);
-  expect(attempt("invoke-human-1.l1.t2.a1", 5)).toEqual(["pitako.request-observer", "pitako.worker",
-    "pitako.request-observer", "pitako.checkpoint-sealer", "pitako.reviewer"]);
+  expect(attempt("invoke-human-1.l1.t1.a1", 6)).toEqual(["pitako.request-observer", "pitako.worker",
+    "pitako.request-observer", "pitako.loop-io", "pitako.checkpoint-sealer", "pitako.execution-ledger"]);
   expect(host.calls.filter(call => call.agent === "pitako.checkpoint-sealer").map(call => call.key))
-    .toEqual(["invoke-human-1.l1.t1.a1.seal", "invoke-human-1.l1.t2.a1.seal"]);
+    .toEqual(["invoke-human-1.l1.t1.a1.seal"]);
 });

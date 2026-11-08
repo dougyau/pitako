@@ -46,6 +46,16 @@ describe("execute todo pure projection", () => {
     expect(result).toEqual([{owner:"execute:run",rows:[{key:"exec:run:phase:1:plan",subject:"Loop 1/3 · Plan",status:"in_progress",metadata:{invocation:"invocation",loop:1,protected:true}}]}]);
   });
 
+  test("task progress survives snapshot validation and projects into the rendered row", () => {
+    const subject = "Build · metric 18→8/0 · gates 3/5 · stall 1/3";
+    const value = snapshot({tasks:[{...snapshot().tasks[0]!,subject}]});
+    expect(latestExecuteTodoSnapshot([value])).toEqual(value);
+    const f=fixture();
+    try {
+      expect(f.apply(value).tasks.find(t=>t.metadata?.taskId==="t1")?.subject).toBe(subject);
+    } finally {f.close();}
+  });
+
   test("whole snapshots nest worker steps, protect phases, and no-op across repeats and reload", () => {
     const f=fixture();
     try {

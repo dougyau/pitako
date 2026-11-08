@@ -85,6 +85,13 @@ describe("engineering-layer composition", () => {
             expect(body).not.toContain(call);
           expect(body).toContain("workers never call unit/pause or echo receipts");
           expect(body).toContain("Editing provider/profile files does not reload");
+          for (const instruction of [".pitako/backlog/<spec-id>.json", "compare-and-swap",
+            "{work, status, remaining, knowledge:{findings, handoff}}", "### Final phase",
+            "supersedes", "Spec-by-sections delivery is deferred", "contract version (v6)"])
+            expect(body).toContain(instruction);
+          const ceiling = readRepo("AGENTS.md");
+          for (const instruction of ["pitako.loop-io", "gitignored", "no command allow-list"])
+            expect(ceiling).toContain(instruction);
           expect(body).not.toContain("node <helper> capture");
           expect(body).not.toContain("must first reconcile the\nexact native producer and prefer its result/continuation");
         } else if (name === "scope-discipline") {
@@ -232,6 +239,9 @@ describe("engineering-layer composition", () => {
         const instructions = body.replace(/\s+/g, " ");
         expect(instructions).toContain("three or more steps, record them with `todo` before the first edit");
         expect(instructions).toContain("structured result stays authoritative");
+        for (const rule of ["Do not ask the supervisor about concurrency", "need no reconfirmation",
+          "{work, status, remaining, knowledge:{findings, handoff}}", "No per-check evidence"])
+          expect(instructions).toContain(rule);
         expect(instructions).toContain("cancelled or deleted step never drops required work or checks");
         const prompt = readRepo("skills/execute/workflow.js");
         expect(prompt).toContain("Todo is display, not evidence");

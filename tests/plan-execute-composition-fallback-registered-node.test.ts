@@ -12,6 +12,8 @@ import { runWorkflowScript } from "../node_modules/pi-subagents/src/workflows/sc
 import { executionResource } from "../extensions/plan-execute.ts";
 import { digest, preliminarySpec, SPEC_SECTIONS, checkoutEvidence, MAX_SPEC_BYTES } from "../extensions/spec-plans.ts";
 import { deterministicScripts, planExecute, checkout, missionFiles, childResponse, registeredCheckpoint, compositionFixture, nativeCheckpointFixture, assignmentSpec, resourceWithAgentDir } from "./fixtures/plan-execute-composition.ts";
+import { prepare, apply, readBacklog, updateProgress } from "../skills/execute/loop.ts";
+import { captureCheckpoint, restoreCheckpoint } from "../extensions/execute-checkpoint.ts";
 
 const composition = compositionFixture();
 const { disposers, workflowSettlements, repository, checkpointLifecycle } = composition;
@@ -50,10 +52,20 @@ describe("plan/execute packaged composition", () => {
       const metadata = { ...deterministicScripts, root, commonDir: path.join(root, ".git"), selected: { source: path.join(root, ".pitako/plans/assignment.md"), digest: digest(content) } };
       const script = resource.resource.script;
       const input = { mode, root, nativeRoot, missionPath, statePath, metadata, script,
+        loopLoader: new URL("../skills/execute/loader.mjs", import.meta.url).href,
+        loopModule: new URL("../skills/execute/loop.ts", import.meta.url).href,
         toolModule: path.resolve("extensions/checkpoint-create.ts"),
         loaderModule: new URL("../node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/loader.js", import.meta.url).href,
         grants: permit.authority.host, checkpointModule: new URL("../extensions/execute-checkpoint.ts", import.meta.url).href, evidenceModule: new URL("../extensions/spec-plans.ts", import.meta.url).href };
       const harness = async (input: any, run: typeof runWorkflowScript, response: typeof childResponse, io: any, loadCheckpoint: typeof registeredCheckpoint) => {
+        if (!process.versions.bun) await import(input.loopLoader);
+        const loopIo = await import(input.loopModule);
+        const directors = new Map<string, any>();
+        const legacyResponse = response;
+        response = ((key: string, request: any, metadata: any, checkout: any) => {
+          return legacyResponse(key, request, metadata, checkout, 1, request.agent === "pitako.worker"
+            ? { status: "complete", work: "Restored and completed owned unit", remaining: [], knowledge: { findings: [], handoff: "Owned unit is complete" } } : undefined);
+        }) as typeof response;
         const storage = new Map<string, any>(), calls: string[] = [], observations: any[] = [], witnesses: any[] = [];
         let interrupted: any, cut = false, restores = 0, beforeRestore = "", originalManifest = "";
         const retainedMode = input.mode.startsWith("retained-");
@@ -84,9 +96,9 @@ describe("plan/execute packaged composition", () => {
           host: async (key: string, request: any) => {
             const stdout = key === "fixture-closing" ? JSON.stringify({ ...input.metadata, checkout: candidate() })
               : io.execFileSync("sh", ["-c", request.command], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-            const value = JSON.parse(stdout); if (value.checkpoint) observations.push(value.checkpoint);
+            const value = JSON.parse(stdout); if (value.admission) value.admission.maxCycles = 1; if (value.checkpoint) observations.push(value.checkpoint);
             if (value.checkpointObservation) witnesses.push(value.checkpointObservation);
-            return { key, kind: "command", state: "passed", ok: true, exitCode: 0, stdout, stderr: "", durationMs: 0, outputPath: input.nativeRoot + "/" + key + ".log" };
+            return { key, kind: "command", state: "passed", ok: true, exitCode: 0, stdout: JSON.stringify(value), stderr: "", durationMs: 0, outputPath: input.nativeRoot + "/" + key + ".log" };
           },
           status: async (ref: string) => {
             statusCalls.push(ref);
@@ -117,6 +129,14 @@ describe("plan/execute packaged composition", () => {
           launch: async (key: string, request: any) => {
             if (request.agent === "pitako.execution-ledger") archives.push(JSON.parse(request.task).record);
             calls.push(key);
+            if (request.agent === "pitako.loop-io") {
+              const { operation, ...data } = JSON.parse(request.task);
+              const value = await loopIo[operation](data);
+              if (operation === "apply") value.view = (await loopIo.prepare({ ...data, taskId: value.selected?.id, previousConfirmedUnit: null })).view;
+              const { backlog, ...receipt } = value;
+              if (backlog) receipt.acceptance = backlog.acceptance;
+              return { key, ok: true, agent: request.agent, runId: `native-${key}`, output: JSON.stringify(receipt), results: [{ exitCode: 0 }] };
+            }
             if (request.resume && key.includes(".t1.")) throw Error("Non-resumable producer must not be resumed");
             if (key.endsWith(".director")) return director(key);
             if (request.agent === "pitako.execution-inspector") throw Error("Checkpoint recovery must not require an inspector chain");
@@ -187,10 +207,17 @@ describe("plan/execute packaged composition", () => {
           },
         };
         function director(key: string) {
-          const result = response(key.replace(/^native-/, ""), { agent: "pitako.execution-director" }, input.metadata, undefined);
-          const unit = structuredClone(result.structuredOutput.tasks[0]);
-          Object.assign(unit, { id: "unit", kind: "implementation", scope: ["owned"], allowedEffects: ["Modify owned pending unit"] });
-          unit.checks[0].id = "unit-check"; unit.checks[0].tier = "focused"; result.structuredOutput.tasks.unshift(unit);
+          key = key.replace(/^native-/, "");
+          if (directors.has(key)) return structuredClone(directors.get(key));
+          const task = { id: "unit", goal: "Recover owned unit", expectedResult: "Owned unit completed without losing earlier WIP",
+            status: "pending", origin: { kind: "spec", ref: input.metadata.selected.source }, specRefs: [input.metadata.selected.source],
+            dependsOn: [], gates: [{ id: "unit-check", command: "test \"$(cat owned)\" = \"finished task\"", cwd: input.root, timeoutMs: 30000 }],
+            metric: null, parent: null, remaining: "", progress: { nonImproving: 0, last5: [] }, history: [] };
+          const exists = io.existsSync(file(".pitako/backlog/assignment.json"));
+          const result = legacyResponse(key, { agent: "pitako.execution-director" }, input.metadata, undefined, 1,
+            { select: exists ? null : "unit", changes: exists ? [] : [{ kind: "add", task, reason: "Spec requires owned unit" }],
+              reason: "Select the pending recovery unit", ...(!exists ? { acceptance: [{ id: "full", command: "true", cwd: input.root }] } : {}) });
+          directors.set(key, structuredClone(result));
           return result;
         }
         const first = await run(options as any);
@@ -215,7 +242,7 @@ describe("plan/execute packaged composition", () => {
         expect(exit, errors).toBe(0); expect(errors).not.toContain("unawaited runs.run launch(es)");
         const actual = JSON.parse(output);
         const success = ["restored", "unsettled", "unknown", "unavailable", "inconclusive", "later-stop-input", "intention-cut", "result-cut", "dispatch-intention-cut", "successor-capture-cut", "retained-stop-input", "retained-stop-input-applied-cut", "retained-unknown"].includes(mode);
-        expect(actual.third ?? actual.second ?? actual.first).toMatchObject({ status: success ? "complete" : mode === "observer-capacity" ? "partial" : ["stop", "current-stop", "retained-stop", "retained-stop-new-stop"].includes(mode) ? "cancelled" : "blocked", loopsConsumed: 1 });
+        expect(actual.third ?? actual.second ?? actual.first).toMatchObject({ status: success ? "partial" : mode === "observer-capacity" ? "partial" : ["stop", "current-stop", "retained-stop", "retained-stop-new-stop"].includes(mode) ? "cancelled" : "blocked", loopsConsumed: 1 });
         expect(actual.earlier).toBe("earlier independent WIP");
         if (mode.startsWith("retained-") && mode !== "retained-unknown" || ["intention-cut", "dispatch-intention-cut", "successor-capture-cut"].includes(mode)) {
           expect(actual.witnesses.length).toBeGreaterThan(0);
@@ -227,7 +254,7 @@ describe("plan/execute packaged composition", () => {
         expect(actual.calls.filter((key: string) => key.endsWith(".t1.a3"))).toHaveLength(["dispatch-intention-cut", "successor-capture-cut"].includes(mode) ? 1 : 0);
         expect(actual.restores).toBe(mode === "successor-capture-cut" ? 2 : success || ["missing-receipt", "corrupt-successor"].includes(mode) ? 1 : 0);
         expect(actual.calls.filter((key: string) => key.includes(".recover") || key.endsWith(".resume"))).toHaveLength(0);
-        expect(actual.retained.association.maxCycles).toBe(3);
+        expect(actual.retained.association.maxCycles).toBe(1);
         for (const authority of actual.restoreAuthorities) {
           expect(authority.activeWriter).toBeNull();
           expect(authority).not.toHaveProperty("settled");
@@ -240,12 +267,12 @@ describe("plan/execute packaged composition", () => {
         if (success) {
           expect(actual.owned).toBe("finished task");
           expect(actual.beforeRestore).toBe(mode === "successor-capture-cut" ? "partial successor work" : "partial pending work");
-          expect(actual.calls).toContain("invoke-human-1.l1.t2.a1"); expect(actual.calls).toContain("invoke-human-1.l1.compliance");
-          expect(actual.calls.some((key: string) => key.includes(".review."))).toBe(true);
+          expect(actual.calls).not.toContain("invoke-human-1.l1.t2.a1");
+          expect(actual.calls.some((key: string) => key.includes(".review.") || key.endsWith(".compliance"))).toBe(false);
           const repeat = ["dispatch-intention-cut", "successor-capture-cut"].includes(mode);
-          expect(actual.archives.at(-1).body.frame.operations).toHaveLength(repeat ? 2 : 1);
+          expect(actual.archives.find((entry: any) => entry.body.frame)?.body.frame.operations).toHaveLength(repeat ? 2 : 1);
           expect(actual.retained.taskFrame).toBeNull();
-          expect(actual.retained.loop.results.map((entry: any) => [entry.taskId, entry.attempt])).toEqual([["unit", repeat ? 3 : 2], ["final", 1]]);
+          expect(actual.retained.tasks.unit.completed).toMatchObject({ taskId: "unit", attempt: repeat ? 3 : 2, status: "complete" });
           if (repeat) {
             const restored = actual.retained.tasks.unit.completed.restore.receipt;
             expect(restored.checkpointRef).toContain(mode === "dispatch-intention-cut" ? ".t1.a1/manifest.json" : ".t1.a2/manifest.json");
@@ -271,7 +298,11 @@ describe("plan/execute packaged composition", () => {
             expect(finalLoop.resolutions[0].currentBarrier.cause).toBe(mode.includes("permission") ? "native permission denial" : "stopped");
         }
         if (mode === "conflict") expect(actual.owned).toBe("foreign edit");
-        if (mode === "corrupt-successor") expect(actual.owned).toBe("partial successor work");
+        if (mode === "corrupt-successor") {
+          expect(actual.owned).toBe("partial successor work");
+          expect(actual.retained.loop.halt).toMatchObject({ status: "blocked", code: "checkpoint-integrity",
+            reason: expect.stringContaining("Checkpoint observation unavailable:") });
+        }
       }
     });
 
@@ -296,15 +327,34 @@ describe("plan/execute packaged composition", () => {
         stderr: "", durationMs: 0, outputPath: "/controlled/inspection.json" }),
       launch: async (key: string, request: any) => {
         calls.push(key);
-        return childResponse(key, request, metadata, checkout);
+        if (request.agent === "pitako.loop-io") {
+          const { operation, ...data } = JSON.parse(request.task);
+          const input = { ...data, dbPath: path.join(root, ".pi/test-board.db") };
+          let value;
+          if (operation === "prepare") value = await prepare(input);
+          else {
+            const applied = apply(input);
+            value = { ...applied, view: (await prepare({ ...input, taskId: applied.selected?.id, previousConfirmedUnit: null })).view };
+          }
+          const { backlog, ...fields } = value;
+          const receipt = { ...fields, ...(backlog ? { acceptance: backlog.acceptance } : {}) };
+          return { key, ok: true, agent: request.agent, runId: `native-${key}`, output: JSON.stringify(receipt), results: [{ exitCode: 0 }] };
+        }
+        const task = { id: "unit", goal: "Implement unit", expectedResult: "Implementation completed", status: "pending",
+          origin: { kind: "spec", ref: metadata.selected.source }, specRefs: [metadata.selected.source], dependsOn: [],
+          gates: [{ id: "unit-check", command: "true", cwd: root, timeoutMs: 30000 }], metric: null, parent: null,
+          remaining: "", progress: { nonImproving: 0, last5: [] }, history: [] };
+        return childResponse(key, request, metadata, checkout, 1, { select: "unit",
+          changes: [{ kind: "add", task, reason: "Derive implementation from spec" }], reason: "Implement the unit",
+          acceptance: [{ id: "full", command: "true", cwd: root }] });
       },
       status: async () => { throw Error("No status query expected before modifying dispatch"); },
     });
     workflowSettlements.push(operation.then(() => {}, () => {}));
     const result = await operation;
-    expect((result.value as any).status).toBe("partial");
+    expect((result.value as any).status, (result.value as any).reason).toBe("partial");
     expect((result.value as any).reason).toContain("persistence");
-    expect(calls.filter(key => !key.includes(".requests-") && !key.includes(".review.verify-") && !/\.seal(?:\.r\d+)?$/.test(key))).toEqual(["invoke-human-1.l1.director"]);
+    expect(calls.filter(key => !key.includes(".requests-") && !key.includes(".review.verify-") && !/\.seal(?:\.r\d+)?$/.test(key))).toEqual(["invoke-human-1.l1.prepare", "invoke-human-1.l1.director", "invoke-human-1.l1.selection"]);
     expect(storage.get("invoke-human-1").consumedLoops).toBe(1);
   });
 });
@@ -322,6 +372,13 @@ describe("plan/execute packaged composition", () => {
     const resource = resourceWithAgentDir(path.join(nativeRoot, "agent")).resolve({
       root, id: "assignment", invocation: "human-1", missionId: "native.mission-1", missionPath });
     const harness = async (input: any, run: typeof runWorkflowScript, response: typeof childResponse, io: any) => {
+      if (!process.versions.bun) await import(input.loopLoader);
+      const loopIo = await import(input.loopModule);
+      const legacyResponse = response;
+      response = ((key: string, request: any, metadata: any, candidate: any) => legacyResponse(key, request, metadata, candidate, 1,
+        request.agent === "pitako.worker" ? { work: "Recovered pending unit", status: "complete", remaining: [],
+          knowledge: { findings: [], handoff: "Owned file contains completed pending work" } } : undefined)) as typeof response;
+      let director: any;
       const { root, nativeRoot, missionPath, metadata, script, hostCommands, observation, helper } = input;
       const grants = new Map<string, string>(hostCommands.map((grant: any) => [grant.key, grant.command]));
       const { writeFileSync, readFileSync, existsSync, execFileSync, captureCheckpoint, applyCheckpoint, restoreCheckpoint, checkoutEvidence } = io;
@@ -346,29 +403,44 @@ describe("plan/execute packaged composition", () => {
     const operation = run({ script,
       state: { get: (key: string) => structuredClone(storage.get(key)), set: (key: string, value: any) => { storage.set(key, structuredClone(value)); } },
       status: async key => {
+        if (key.endsWith(".director")) return structuredClone(director);
         if (observation === "unavailable") throw Error("Public status unavailable");
         return { key, ok: false, output: observation === "inconclusive" ? "No current writer inventory" : "", artifactPaths: [] };
       },
-      host: async (key: string) => ({ key, kind: "command" as const, state: "passed" as const, ok: true, exitCode: 0,
-        stdout: execFileSync("sh", ["-c", grants.get(key)!], { cwd: root, encoding: "utf8" }),
-        stderr: "", outputPath: path.join(nativeRoot, key + ".log"), durationMs: 0 }),
+      host: async (key: string) => {
+        const value = JSON.parse(execFileSync("sh", ["-c", grants.get(key)!], { cwd: root, encoding: "utf8" }));
+        if (value.admission) value.admission.maxCycles = 1;
+        return { key, kind: "command" as const, state: "passed" as const, ok: true, exitCode: 0,
+          stdout: JSON.stringify(value), stderr: "", outputPath: path.join(nativeRoot, key + ".log"), durationMs: 0 };
+      },
       launch: async (key: string, request: any) => {
         calls.push(key);
-        if (request.agent === "pitako.execution-ledger") archivedFrame = JSON.parse(request.task).record.body.frame;
+        if (request.agent === "pitako.loop-io") {
+          const { operation, ...data } = JSON.parse(request.task);
+          const value = await loopIo[operation](data);
+          if (operation === "apply") value.view = (await loopIo.prepare({ ...data, taskId: value.selected?.id, previousConfirmedUnit: null })).view;
+          const { backlog, ...receipt } = value;
+              if (backlog) receipt.acceptance = backlog.acceptance;
+          return { key, ok: true, agent: request.agent, runId: `native-${key}`, output: JSON.stringify(receipt), results: [{ exitCode: 0 }] };
+        }
+        if (request.agent === "pitako.execution-ledger" && JSON.parse(request.task).record.body.frame) archivedFrame = JSON.parse(request.task).record.body.frame;
         if (request.agent === "pitako.worker" && request.resume) return { key, ok: false, output: "Controlled native resume unavailable",
           error: "Controlled native resume unavailable", artifactPaths: [] };
         const needsCandidate = request.agent === "pitako.checkpoint-sealer" || request.agent === "pitako.checkout-observer" || key.endsWith(".compliance") ||
           (request.agent === "pitako.worker" && key.includes(".t2."));
         const child = response(key, request, metadata, needsCandidate ? observedCandidate() : undefined);
         if (key.endsWith(".director")) {
-          const unit = structuredClone(child.structuredOutput.tasks[0]);
-          Object.assign(unit, { id: "unit", kind: "implementation", scope: ["owned", "deleted", "new"],
-            allowedEffects: ["Modify only unit paths"], expectedResult: "Recoverable unit" });
-          unit.checks[0].id = "unit-check"; unit.checks[0].tier = "focused";
-          child.structuredOutput.tasks.unshift(unit);
+          const task = { id: "unit", goal: "Recover owned unit", expectedResult: "Restore owned paths and complete the unit",
+            status: "pending", origin: { kind: "spec", ref: metadata.selected.source }, specRefs: [metadata.selected.source],
+            dependsOn: [], gates: [{ id: "unit-check", command: 'test "$(cat owned)" = "completed pending work"', cwd: root, timeoutMs: 30000 }],
+            metric: null, parent: null, remaining: "", progress: { nonImproving: 0, last5: [] }, history: [] };
+          director = legacyResponse(key, request, metadata, undefined, 1, { select: "unit",
+            changes: [{ kind: "add", task, reason: "Implement the spec unit" }], reason: "Recover the pending unit",
+            acceptance: [{ id: "full", command: "true", cwd: root }] });
+          return structuredClone(director);
         }
         if (request.agent === "pitako.worker" && key.includes(".t1.")) {
-          const descriptor = JSON.parse(request.task.split("FROZEN ATTEMPT:\n")[1].split("\n")[0]);
+          const descriptor = storage.get("invoke-human-1").loop.attempt;
           if (descriptor.restore) {
             restored = { activeWriter: descriptor.restore.authority.activeWriter };
             restoreReceipt = JSON.parse(invoke("restore", { intent: descriptor.restore.sourceKeys.map((key: string) => storage.get("invoke-human-1").taskFrame.sources.find((source: any) => source.key === key)), authority: descriptor.restore.authority }));
@@ -379,9 +451,6 @@ describe("plan/execute packaged composition", () => {
             invoke("apply", { intent: descriptor.checkpoint, changes: [
               { path: "owned", image: { bytes: Buffer.from("completed pending work").toString("base64"), mode: 420 } },
             ] });
-            const current = (({ head, fingerprint }) => ({ head, fingerprint }))(checkoutEvidence(root));
-            Object.assign(child.structuredOutput, { git: { wip: "Recovered pending work" },
-              checks: [{ id: "unit-check", command: "bun test affected", cwd: root, output: "Controlled current check", logPaths: [], result: "passed", before: current, after: current }] });
             return child;
           }
           const stored = structuredClone(storage.get("invoke-human-1"));
@@ -409,6 +478,8 @@ describe("plan/execute packaged composition", () => {
       beforeRestore, archivedFrame, intention, initial, restored };
     };
     return nativeCheckpointCase({ root, nativeRoot, missionPath, metadata, script: resource.script,
+      loopLoader: new URL("../skills/execute/loader.mjs", import.meta.url).href,
+      loopModule: new URL("../skills/execute/loop.ts", import.meta.url).href,
       hostCommands: resource.hostCommands, observation, helper: path.resolve("skills/execute/checkpoint.mjs"),
       module: new URL("../extensions/execute-checkpoint.ts", import.meta.url).href,
       evidence: new URL("../extensions/spec-plans.ts", import.meta.url).href }, harness.toString(), ([exit, stdout, stderr]) => {
@@ -425,7 +496,8 @@ describe("plan/execute packaged composition", () => {
       expect(initial.task).toContain(path.resolve("skills/execute/checkpoint.mjs"));
       expect(initial.captured).toBe(true);
       expect(initial.owned).toBe("valid prior WIP");
-      expect((completed.value as any).status, (completed.value as any).reason).toBe("complete");
+      expect((completed.value as any).status, (completed.value as any).reason).toBe("partial");
+      expect(persisted.tasks.unit.completed).toMatchObject({ taskId: "unit", status: "complete", attempt: 2 });
       expect(calls.filter((key: string) => key.endsWith(".resume"))).toHaveLength(0);
       expect(calls.filter((key: string) => key.includes(".recover"))).toHaveLength(0);
       expect(restoreReceipt.position).toEqual({ loop: 1, cursor: 0, phase: "implementation" });
@@ -436,25 +508,26 @@ describe("plan/execute packaged composition", () => {
       expect(readFileSync(path.join(root, "earlier"), "utf8")).toBe("valid earlier WIP");
       expect(persisted.association).toEqual(beforeRestore.association);
       expect(persisted.consumedLoops).toBe(1);
-      expect(persisted.loop.cursor).toBe(2);
-      expect(persisted.loop.results.filter((result: any) => persisted.tasks[result.taskId].completed?.attempt === result.attempt)).toHaveLength(2);
+      expect(persisted.loop.cursor).toBe(1);
+      expect(persisted.loop.results.filter((result: any) => persisted.tasks[result.taskId].completed?.attempt === result.attempt)).toHaveLength(1);
       expect(archivedFrame.sources.find((source: any) => source.key === intention.key)).toEqual(intention);
       expect(persisted.taskFrame).toBeNull();
-      expect(calls.filter((key: string) => /\.t\d+\.a\d+$/.test(key))).toHaveLength(3);
-      expect(calls).toContain("invoke-human-1.l1.t2.a1");
-      expect(calls).toContain("invoke-human-1.l1.review.director-synthesis");
-      expect(calls).toContain("invoke-human-1.l1.compliance");
+      expect(calls.filter((key: string) => /\.t\d+\.a\d+$/.test(key))).toHaveLength(2);
+      expect(calls).not.toContain("invoke-human-1.l1.t2.a1");
+      expect(calls.some((key: string) => key.includes(".review."))).toBe(false);
+      expect(calls).not.toContain("invoke-human-1.l1.compliance");
       expect(resource.hostCommands).toHaveLength(3);
     });
   });
 
-  test.each(["complete", "recovered", "unresolved-plan", "rejected-plan", "needs-decision", "mismatched-association", "stopped", "permission",
+  test.each(["complete", "recovered", "unresolved-plan", "rejected-plan", "decision-overflow", "mismatched-association", "stopped", "permission",
     "analysis-prepare-stop", "analysis-prepare-permission", "analysis-later-stop", "analysis-later-permission",
     "analysis-compliance-stop", "analysis-compliance-permission", "analysis-prepare-thrown-permission",
     "host-opening-stop", "host-opening-identical-failure",
     "host-opening-timeout", "host-opening-command-failure", "host-opening-similar-text", "host-opening-persistence-failure"])(
     "registered Node root settles native calls without changing the %s outcome", async mode => {
       const root = repository(), spec = assignmentSpec(root);
+      const { head, fingerprint } = checkoutEvidence(root), checkout = { head, fingerprint };
       const hooks = new Map<string, (event: unknown, context: unknown) => unknown>();
       planExecute({ on: (name: string, hook: (event: unknown, context: unknown) => unknown) => { hooks.set(name, hook); } } as unknown as ExtensionAPI);
       const sessionId = randomUUID(), ctx = { cwd: root, sessionManager: { getSessionId: () => sessionId } };
@@ -479,7 +552,7 @@ describe("plan/execute packaged composition", () => {
           : mode.endsWith("command-failure") ? "Command exited with code 1."
           : mode.endsWith("similar-text") ? "Model said: Command stopped because the workflow was aborted."
           : "Command stopped because the workflow was aborted." };
-      const analysisTarget = !mode.startsWith("analysis-") ? null : `invoke-human-1.l1.${mode.includes("-prepare-")
+      const analysisTarget = !mode.startsWith("analysis-") ? null : `invoke-human-1.l2.${mode.includes("-prepare-")
         ? "review.director-prepare" : mode.includes("-later-") ? "review.independent-a" : "compliance"}`;
       const expected = await runWorkflowScript({ script: resolved.resource.script,
         state: { get: key => structuredClone(storage.get(key)), set: (key, value) => {
@@ -489,24 +562,62 @@ describe("plan/execute packaged composition", () => {
         launch: async (key, request) => {
           calls.push(key);
           if (request.agent === "pitako.checkout-observer") publications.push(JSON.parse(String(request.task)));
+          if (request.agent === "pitako.loop-io") {
+            const input = JSON.parse(String(request.task));
+            const view = { topicId: 1, authority: "spec and frozen amendments > DECISION > FINDING > HANDOFF; code wins over any map", posts: [], omitted: 0 };
+            let value: any;
+            try {
+              if (input.operation === "prepare" && mode === "decision-overflow") throw Error("Current DECISIONs exceed 8 KiB; ask the human to consolidate them.");
+              if (input.operation === "prepare") value = { ...readBacklog(root, "assignment"), view, lastConfirmedUnit: null };
+              else if (input.operation === "apply") value = { ...apply(input), view };
+              else {
+                const progress = updateProgress(input.task.progress, { value: null, fingerprint: checkout.fingerprint,
+                  gatesPassed: input.task.gates.length, gatesTotal: input.task.gates.length }, null);
+                value = { before: checkout, after: checkout, mutated: false, metric: null, progress, stalled: false, view,
+                  gates: input.task.gates.map((gate: any) => ({ id: gate.id, status: "pass", exit: 0, ms: 1,
+                    tail: "Controlled gate passed", logRef: `/native/gates/${key}/${gate.id}.log` })) };
+              }
+            } catch (error) {
+              value = { error: "loop-io", reason: (error as Error).message, selectionRejected: (error as any).selectionRejected === true };
+            }
+            const { backlog, ...receipt } = value;
+            if (backlog) receipt.acceptance = backlog.acceptance;
+            const response = { key, agent: request.agent, runId: `native-${key}`, ok: !value.error,
+              output: JSON.stringify(receipt), results: [{ exitCode: value.error ? 1 : 0 }] };
+            children[key] = structuredClone(response);
+            originals.push({ response, original: structuredClone(response) });
+            return response;
+          }
+          const pending = readBacklog(root, "assignment").backlog;
+          const selected = { id: "final", goal: "Verify complete candidate", expectedResult: "Focused verification passes", status: "pending",
+            origin: { kind: "spec", ref: spec.source }, specRefs: [spec.source], dependsOn: [],
+            gates: [{ id: "final-check", command: "true", cwd: root, timeoutMs: 1800000 }], metric: null,
+            parent: null, remaining: "", progress: { nonImproving: 0, last5: [] }, history: [] };
+          const selection = { select: pending ? pending.tasks.find(task => task.status === "pending")?.id ?? null : selected.id,
+            changes: pending ? [] : [{ kind: "add", task: selected, reason: "From admitted spec" }],
+            reason: "Most important eligible task", ...(!pending ? { acceptance: [{ id: "full", command: "true", cwd: root }] } : {}) };
           const response = request.agent === "pitako.execution-inspector"
             ? { key, ok: true, output: "", runId: `native-${key}`, agent: request.agent, artifactPaths: [],
               structuredOutput: { status: "recovered", reason: "Exact settled original recovered without edits",
                 original: null, workerResult: structuredClone(recoveredWorker), originalAvailable: true,
                 binding: "absent", comparison: "only-original", provenance: ["/native/original-worker.json"] } }
-            : childResponse(key, request, metadata, checkout, mode === "recovered" ? 1 : 2);
+            : childResponse(key, request, metadata, checkout, 2,
+              request.agent === "pitako.execution-director" ? selection : request.agent === "pitako.worker"
+                ? { status: "complete", work: "Required task verified", remaining: [], knowledge: { findings: [], handoff: "Current candidate verified" } } : undefined);
+          if (request.agent === "pitako.worker") {
+            const saved = storage.get("invoke-human-1"), attempt = saved.loop.attempt;
+            if (attempt.restore) restoreCheckpoint(attempt.restore.sourceKeys.map((key: string) =>
+              saved.taskFrame.sources.find((source: any) => source.key === key)), attempt.restore.authority);
+            captureCheckpoint(attempt.checkpoint, ["owned"]);
+          }
           if (request.agent === "pitako.worker" && ["complete", "recovered"].includes(mode)) {
             const value = response.structuredOutput;
-            value.checks.push(
-              { ...structuredClone(value.checks[0]), id: "unknown-history", result: "failed", before: null, after: null },
-              { ...structuredClone(value.checks[0]), id: "uncaptured-history", result: "not-run",
-                before: { head: "not-captured", fingerprint: "temporary-defect" },
-                after: { head: "not-captured", fingerprint: "restored" } },
-            );
+            // Malformed advisory knowledge never invalidates an otherwise complete result.
+            value.knowledge = { findings: [null, 42, "Current controlled observation"], handoff: { invalid: true } };
             const schema = request.outputSchema as TSchema;
             expect(validateToolArguments({ name: "worker_result", description: "Result", parameters: schema },
               { type: "toolCall", id: "worker", name: "worker_result", arguments: value })).toEqual(value);
-            if (mode === "recovered") {
+            if (mode === "recovered" && key.endsWith(".a1")) {
               recoveredWorker = structuredClone(value);
               delete (response as { structuredOutput?: unknown }).structuredOutput;
             }
@@ -528,17 +639,16 @@ describe("plan/execute packaged composition", () => {
             const plan = response.structuredOutput;
             const schema = request.outputSchema as TSchema;
             expect((schema as any).properties).not.toHaveProperty("association");
-            const tool = { name: "loop_plan", description: "Plan", parameters: schema };
+            const tool = { name: "selection", description: "Backlog selection", parameters: schema };
             const validate = (value: any) => validateToolArguments(tool, { type: "toolCall", id: "plan", name: tool.name, arguments: value });
             expect(validate(plan)).toEqual(plan);
-            if (mode === "needs-decision") Object.assign(plan, { status: "needs-decision", reason: "Controlled product decision", tasks: [] });
             if (mode === "mismatched-association") plan.association = { missionPath: "/wrong" };
             if (mode === "rejected-plan") {
-              if (Number(key.match(/\.l(\d+)\./)![1]) === 1) plan.tasks[0].dependsOn = [{ taskId: "missing", reason: "Requires missing output" }];
-              else {
-                expect(storage.get("invoke-human-1").planRejections).toEqual([{ loop: 1, diagnostic: expect.stringContaining("loop_plan dependencies require") }]);
+              if (Number(key.match(/\.l(\d+)\./)![1]) === 1) plan.select = "missing";
+              else if (Number(key.match(/\.l(\d+)\./)![1]) === 2) {
+                expect(storage.get("invoke-human-1").planRejections).toEqual([{ loop: 1, diagnostic: expect.stringContaining("Selected task must be pending") }]);
                 expect(request.task).toContain("VERIFIED RETAINED LOOP SUMMARIES");
-                expect(request.task).toContain("loop_plan dependencies require");
+                expect(request.task).toContain("Selected task must be pending");
               }
             }
           }
@@ -551,7 +661,12 @@ describe("plan/execute packaged composition", () => {
           if (key === analysisTarget && mode.includes("-thrown-")) throw Error(permission);
           return response;
         },
-        status: async () => { if (mode === "unresolved-plan") return { key: "director", ok: true, output: "", artifactPaths: [] }; throw Error("No recovery expected"); },
+        status: async ref => {
+          if (mode === "unresolved-plan") return { key: "director", ok: true, output: "", artifactPaths: [] };
+          const original = children[ref] ?? Object.values(children).find(child => child.runId === ref);
+          if (!original) throw Error("No exact producer " + ref);
+          return structuredClone(original);
+        },
         host: async key => {
           inspections.push(key);
           const response = { key, kind: "command" as const, state: "passed" as const, ok: true, exitCode: 0,
@@ -564,10 +679,14 @@ describe("plan/execute packaged composition", () => {
       const recoveredHost = mode === "host-opening-timeout";
       expect(expected.value).toMatchObject({ status: ["complete", "recovered", "rejected-plan", "mismatched-association"].includes(mode) || recoveredHost ? "complete" : mode === "stopped" || mode.endsWith("-stop") ? "cancelled" : "blocked",
         ...hostTarget && !recoveredHost ? { status: "blocked" } : {},
-        loopsConsumed: recoveredHost ? 2 : hostTarget && hostTarget !== "inspect-loop-1" ? 0 : ["complete", "rejected-plan", "mismatched-association"].includes(mode) ? 2 : 1 });
-      expect(calls.filter(key => !key.includes(".requests-") && !key.includes(".review.verify-") && !/\.seal(?:\.r\d+)?$/.test(key))).toHaveLength(analysisTarget ? mode.includes("-prepare-") ? 3 : mode.includes("-later-") ? 5 : 7
-        : recoveredHost ? 17 : hostTarget ? hostTarget === "inspect-loop-1" ? 7 : 0
-        : ["complete", "mismatched-association"].includes(mode) ? 17 : mode === "recovered" ? 9 : mode === "rejected-plan" ? 10 : ["stopped", "permission", "unresolved-plan"].includes(mode) ? 2 : 1);
+        loopsConsumed: recoveredHost ? 2 : hostTarget && hostTarget !== "inspect-loop-1" ? 0 : ["complete", "recovered", "mismatched-association"].includes(mode) || analysisTarget ? 2 : mode === "rejected-plan" ? 3 : 1 });
+      expect(calls.filter(key => !key.includes(".requests-") && !/\.(prepare|selection|settlement|gate)(?:\.r\d+)?$/.test(key) && !key.includes(".review.verify-") && !/\.seal(?:\.r\d+)?$/.test(key))).toHaveLength(analysisTarget ? mode.includes("-prepare-") ? 6 : mode.includes("-later-") ? 8 : 10
+        : recoveredHost ? 11 : hostTarget ? hostTarget === "inspect-loop-1" ? 7 : 0
+        : mode === "decision-overflow" ? 0 : ["complete", "mismatched-association"].includes(mode) ? 11 : mode === "recovered" ? 12 : mode === "rejected-plan" ? 13 : ["stopped", "permission", "unresolved-plan"].includes(mode) ? 2 : 1);
+      if (mode === "decision-overflow") {
+        expect((expected.value as any).reason).toContain("human to consolidate");
+        expect(calls).toEqual(["invoke-human-1.l1.prepare"]);
+      }
       if (ambiguousHost) {
         expect((expected.value as any).reason).toContain("ambiguous");
         expect((expected.value as any).action.actor).toBe(mode.endsWith("persistence-failure") ? "persistence operator" : "native run operator");
@@ -583,14 +702,13 @@ describe("plan/execute packaged composition", () => {
         expect(expected.value).toMatchObject({ reason: expect.stringContaining("Expansion needed: read access"),
           action: { actor: "evidence owner", started: false } });
         expect(storage.get("invoke-human-1").loop.recoveries[0].disposition).toBe("unresolved");
-        expect(calls).toEqual(["invoke-human-1.l1.director", "invoke-human-1.l1.recover1"]);
+        expect(calls.filter(key => !key.endsWith(".prepare"))).toEqual(["invoke-human-1.l1.director", "invoke-human-1.l1.recover1"]);
       }
       if (mode === "recovered") {
-        const recovered = storage.get("invoke-human-1").loop;
-        expect(publications[0].body.record.body.recoveries[0]).toMatchObject({ stage: "observed", disposition: "recovered" });
-        expect(storage.get("invoke-human-1").tasks.final.completed.checks).toMatchObject({ current: true, failed: 1, notRun: 1 });
-        expect(calls.filter(key => key.includes(".recover"))).toHaveLength(1);
-        expect(calls.indexOf("invoke-human-1.l1.review.director-prepare")).toBeGreaterThan(calls.indexOf("invoke-human-1.l1.recover1"));
+        expect(readBacklog(root, "assignment").backlog!.tasks.find(task => task.id === "final")!.status).toBe("done");
+        expect(calls).toContain("invoke-human-1.l1.t1.a2.seal");
+        expect(calls.filter(key => /\.t1\.a\d+$/.test(key))).toHaveLength(2);
+        expect(calls.filter(key => key.includes(".recover"))).toHaveLength(0);
       }
       for (const { response, original } of originals) expect(response).toEqual(original);
       const child = Bun.spawn(["node", "-e", `
@@ -619,7 +737,7 @@ describe("plan/execute packaged composition", () => {
               },
               status: async ref => {
                 statuses.push(ref);
-                if (input.analysisTarget) {
+                if (input.analysisTarget || ref.includes("director")) {
                   const result = Object.values(input.children).find(child => child.runId === ref || child.key === ref);
                   if (!result) throw Error("Missing exact producer " + ref);
                   return structuredClone(result);
@@ -671,7 +789,7 @@ describe("plan/execute packaged composition", () => {
           expect(actual.retained).toEqual(storage.get("invoke-human-1").hostHalt);
         }
         if (analysisTarget) {
-          expect(actual.repeated).toMatchObject({ status: (expected.value as any).status, loopsConsumed: 1 });
+          expect(actual.repeated).toMatchObject({ status: (expected.value as any).status, loopsConsumed: 2 });
           expect(actual.statuses).toContain(mode.includes("-thrown-") ? analysisTarget : `native-${analysisTarget}`);
           expect(actual.inspections.filter((key: string) => key === "inspect-loop-1")).toHaveLength(0);
         } else if (ambiguousHost && !mode.endsWith("persistence-failure")) {
@@ -710,35 +828,35 @@ describe("plan/execute packaged composition", () => {
       expect(permit.authority.host).toHaveLength(3);
       expect(permit.authority.host![0]!.key).toBe("inspect-initial");
       const metadata = { ...deterministicScripts, root, commonDir: spec.commonDir, selected: { source: spec.source, digest: digest(content) } };
-      const child = Bun.spawn(["node", "--disable-warning=ExperimentalWarning", "-e", `
-        (async()=>{
-          const fs=require("node:fs"),cp=require("node:child_process");
-          const input=JSON.parse(fs.readFileSync(0,"utf8"));
-          const {runWorkflowScript}=await import(input.runner);
-          const respond=eval("("+input.response+")");
-          const storage=new Map(),calls=[],hosts=[],originals=new Map(),closings=new Map();let checkout=input.checkout;
+      const harness = async (input: any, runWorkflowScript: any, respond: any, io: any) => {
+          const fs = io;
+          const storage=new Map<string, any>(),calls: string[]=[],hosts: string[]=[],originals=new Map<string, any>(),closings=new Map<number, any>();let checkout=input.checkout;
           if(input.mode==="legacy") storage.set("invoke-human-1",{version:2,association:{...input.metadata,invocation:"human-1"},snapshot:{content:input.content},loops:[]});
-          const options={script:input.script,state:{get:key=>structuredClone(storage.get(key)),set:(key,value)=>{storage.set(key,structuredClone(value));if(value.loop?.closing)closings.set(value.loop.number,structuredClone(value.loop));}},
-            status:async key=>originals.get(key),
-            host:async(key,params)=>{
+          const options={script:input.script,state:{get:(key: string)=>structuredClone(storage.get(key)),set:(key: string,value: any)=>{storage.set(key,structuredClone(value));if(value.loop?.closing)closings.set(value.loop.number,structuredClone(value.loop));}},
+            status:async (key: string)=>originals.get(key),
+            host:async(key: string,params: any)=>{
               if(key!==input.grant.key || params.command!==input.grant.command)throw Error("Unexpected host operation "+key);
               hosts.push(key);
               if(input.mode==="interrupted-admission")return {key,kind:"command",state:"failed",ok:false,exitCode:1,stdout:"",stderr:"Controlled admission read failed",durationMs:0};
               fs.writeFileSync(input.statePath,JSON.stringify(Object.fromEntries(storage)));
-              const stdout=cp.execFileSync("sh",["-c",params.command],{cwd:input.root,encoding:"utf8",stdio:["ignore","pipe","pipe"]});
+              const stdout=io.execFileSync("sh",["-c",params.command],{cwd:input.root,encoding:"utf8",stdio:["ignore","pipe","pipe"]});
               if(Buffer.byteLength(stdout)>4096)throw Error("Invalid admission envelope");
               const receipt=JSON.parse(stdout);if(receipt.checkout)checkout=receipt.checkout;
               return {key,kind:"command",state:"passed",ok:true,exitCode:0,stdout,stderr:"",durationMs:0,outputPath:input.missionPath+".admission.log"};
             },
-            launch:async(key,request)=>{
-              calls.push(key);const loop=Number(key.match(/\\.l(\\d+)\\./)?.[1]??1);
+            launch:async(key: string,request: any)=>{
+              calls.push(key);const loop=Number(key.match(/\.l(\d+)\./)?.[1]??1);
               if(loop===7 && key.endsWith(".director")){
                 if(input.mode==="capacity")throw Error("Active async run capacity exhausted: 4/4 used.");
                 if(input.mode==="permission")throw Error("Blocked by pi-subagents permission rule: 'run' is denied.");
                 if(input.mode==="stop")return {key,ok:false,stopped:true,output:"Stopped",artifactPaths:[]};
                 if(input.mode==="active")return {key,ok:true,state:"running",output:"",artifactPaths:[]};
               }
-              const result=respond(key,request,input.metadata,checkout,input.mode==="exhausted"?11:8);
+              let result;
+              if(request.agent==="pitako.worker")io.captureCheckpoint(storage.get("invoke-human-1").loop.attempt.checkpoint,["owned"]);
+              result=await respond(key,request,input.metadata,checkout,input.mode==="exhausted"?11:8);
+              // This test owns capacity/closing accounting, not gate subprocesses.
+              if(key.endsWith(".compliance"))result.structuredOutput.requirements=result.structuredOutput.requirements.slice(0,1);
               originals.set(key,result);originals.set(result.runId,result);return result;
             }};
           const first=await runWorkflowScript(options);let second;
@@ -746,19 +864,24 @@ describe("plan/execute packaged composition", () => {
             fs.writeFileSync(input.global+"/settings.json",'{"pitako":{"execute":{"maxCycles":false}}}');
             second=await runWorkflowScript(options);
           }
-          console.log(JSON.stringify({first:first.value,second:second?.value,calls,hosts,closings:[...closings.values()],saved:storage.get("invoke-human-1")}));
-        })().catch(error=>{console.error(error);process.exitCode=1;});
-      `], { cwd: root, env: { ...process.env, PI_CODING_AGENT_DIR: global }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+          return {first:first.value,second:second?.value,calls,hosts,closings:[...closings.values()],saved:storage.get("invoke-human-1")};
+      };
       const identity = checkoutEvidence(root);
-      const lifecycle = checkpointLifecycle(child, ([exit, output, errors]) => {
+      await nativeCheckpointCase({ root, global, missionPath, statePath, content, mode,
+        metadata: { ...metadata, inlineLoopIO: true, inlineSealer: true }, script: resolved.resource.script,
+        grant: permit.authority.host![0], checkout: { head: identity.head, fingerprint: identity.fingerprint },
+        module: new URL("../extensions/execute-checkpoint.ts", import.meta.url).href,
+        evidence: new URL("../extensions/spec-plans.ts", import.meta.url).href }, harness.toString(), ([exit, output, errors]) => {
         expect(exit, errors).toBe(0);
         const observed = JSON.parse(output), saved = observed.saved;
+        // Final gaps alternate with repair tasks; the first final candidate after loop 8 is loop 9.
         const success = ["fresh", "reentry"].includes(mode), early = ["legacy", "interrupted-admission"].includes(mode);
         expect(observed.first).toMatchObject({ status: success ? "complete" : mode === "stop" ? "cancelled" : ["exhausted", "capacity"].includes(mode) ? "partial" : "blocked",
-          loopsConsumed: early ? 0 : success ? 8 : mode === "exhausted" ? 10 : 7 });
+          loopsConsumed: early ? 0 : success ? 9 : mode === "exhausted" ? 10 : 7 });
         expect(observed.hosts).toHaveLength(mode === "legacy" ? 0 : mode === "reentry" ? 2 : 1);
         const closing = observed.closings;
-        expect(closing).toHaveLength(early ? 0 : success ? 8 : mode === "exhausted" ? 10 : 6);
+        // Only final loops dispatch a closing observer; repair loops seal their task instead.
+        expect(closing.map((loop: any) => loop.number)).toEqual(early ? [] : success || mode === "exhausted" ? [1, 3, 5, 7, 9] : [1, 3, 5]);
         if (!early) {
           expect(saved.association.maxCycles).toBe(10); expect(saved.association.digest).toBe(digest(content));
           expect(new Set(closing.map((loop: any) => loop.closing.ref.asyncDir)).size).toBe(closing.length);
@@ -770,18 +893,13 @@ describe("plan/execute packaged composition", () => {
         }
         if (mode === "reentry") {
           expect(observed.second.status).toBe("complete");
-          expect(observed.calls.filter((key: string) => key.endsWith(".checkout"))).toHaveLength(8);
+          expect(observed.calls.filter((key: string) => key.endsWith(".checkout"))).toHaveLength(5);
         }
         if (mode === "capacity") expect(observed.first.reason).toContain("capacity exhausted");
         if (mode === "legacy") expect(observed.calls).toEqual([]);
         expect(readFileSync(path.join(root, "owned"), "utf8")).toBe("existing WIP");
       });
-      try {
-        child.stdin.write(JSON.stringify({ root, global, missionPath, statePath, content, mode, metadata,
-          script: resolved.resource.script, grant: permit.authority.host![0], checkout: { head: identity.head, fingerprint: identity.fingerprint },
-          response: childResponse.toString(), runner: new URL("../node_modules/pi-subagents/src/workflows/scripted-workflow.js", import.meta.url).href }));
-        child.stdin.end(); await lifecycle.result;
-      } finally { lifecycle.cancel(); await lifecycle.settled; }
+
     });
 
   test.each(["partial-association", "foreign", "partial-without-association", "legacy-conflict", "v4"])(
@@ -794,10 +912,10 @@ describe("plan/execute packaged composition", () => {
       const resource = resourceWithAgentDir(global).resolve({ root, id: "assignment", invocation: "human-1",
         missionId: "native.mission-1", missionPath });
       const association = { root, missionId: "native.mission-1", missionPath, invocation: "human-1", maxCycles: 5, sourceRefs: [] };
-      const retained = { version: mode === "v4" ? 4 : 5, ...(mode === "partial-without-association" ? { snapshot: { content: "partial" } } :
+      const retained = { version: mode === "v4" ? 4 : 6, ...(mode === "partial-without-association" ? { snapshot: { content: "partial" } } :
         { association: mode === "partial-association" ? {} : { ...association, ...(mode === "foreign" ? { missionId: "other" } : {}) } }) };
       const state: Record<string, any> = { "invoke-human-1": retained,
-        ...(mode === "legacy-conflict" ? { "pitako-execution": { version: 5, association: { ...association, invocation: "other" } } } : {}) };
+        ...(mode === "legacy-conflict" ? { "pitako-execution": { version: 6, association: { ...association, invocation: "other" } } } : {}) };
       const original = JSON.stringify(state); writeFileSync(statePath, original);
       const command = resource.hostCommands.find(grant => grant.key === "inspect-initial")!.command;
       // The inspector itself must not hide the conflict behind invalid settings.
@@ -821,136 +939,130 @@ describe("plan/execute packaged composition", () => {
     });
 });
 
-// Rejects abandoning a pending successor, replaying an admitted writer, or
-// declaring completion without the following task and final analysis connection.
-// This is a read-only unit: nominal checkpoint descriptors must not require
-// nonexistent modifying preimages. Implementation rollback is covered separately.
-test.each(["complete", "receipt-save-cut", "result-save-cut", "cursor-save-cut", "pending", "pending-settled"])(
+// A v6 read-only task still owns a captured checkpoint. Interrupted work uses
+// checkpoint-first fallback, never a verification-kind legacy native resume.
+test.each(["complete", "receipt-save-cut", "result-save-cut", "seal-save-cut", "cursor-save-cut", "pending", "pending-settled"])(
   "registered Node interrupted check continuation retains task ownership: %s", async mode => {
-    const root = repository(), spec = assignmentSpec(root);
+    const root = repository(), nativeRoot = repository(), spec = assignmentSpec(root);
     writeFileSync(path.join(root, "owned"), "Existing interrupted-unit WIP");
+    const { missionPath, statePath } = missionFiles(nativeRoot);
     const { head, fingerprint } = checkoutEvidence(root), checkout = { head, fingerprint };
-    const hooks = new Map<string, (event: unknown, context: unknown) => unknown>();
-    planExecute({ on: (name: string, hook: (event: unknown, context: unknown) => unknown) => { hooks.set(name, hook); } } as unknown as ExtensionAPI);
-    const sessionId = randomUUID(), ctx = { cwd: root, sessionManager: { getSessionId: () => sessionId } };
-    hooks.get("session_start")!({}, ctx);
-    disposers.push(() => hooks.get("session_shutdown")!({}, ctx));
-    const args = { root, id: "assignment", invocation: "human-1", missionId: "native.mission-1", missionPath: "/native/actual-mission.json" };
-    const resolved = resolveWorkflowResource("pitako.execute", args, sessionId);
-    if (!resolved.ok) throw Error(resolved.error);
-    const content = spec.content;
+    const resource = resourceWithAgentDir(path.join(nativeRoot, "agent")).resolve({ root, id: "assignment", invocation: "human-1",
+      missionId: "native.mission-1", missionPath });
     const metadata = { ...deterministicScripts, root, commonDir: path.join(root, ".git"), candidates: [],
-      selected: { source: `${root}/.pitako/plans/assignment.md`, digest: digest(content), chunks: 1 } };
-    // Prepare complete native originals at the controlled boundary, not another
-    // copy of the root. The registered resource itself runs inside Node below.
-    const templates: Record<string, any> = {};
-    const seed = new Map<string, any>();
-    const prepared = await runWorkflowScript({ script: resolved.resource.script,
-      state: { get: key => seed.get(key), set: (key, value) => { seed.set(key, structuredClone(value)); } },
-      status: async () => { throw Error("Unexpected seed status"); },
-      launch: async (key, params) => {
-        const response = childResponse(key, params, metadata, checkout);
-        if (key.endsWith(".director")) {
-          const final = response.structuredOutput.tasks[0];
-          response.structuredOutput.tasks = [{ ...structuredClone(final), id: "repair", kind: "verification",
-            goal: "Verify authorized behavior without writes", expectedResult: "Current verification check",
-            checks: [{ ...final.checks[0], id: "repair-check", tier: "focused" }] },
-            { ...final, dependsOn: [{ taskId: "repair", reason: "Verify the completed repair" }] }];
-        } else if (key.endsWith(".t1.a1")) {
-          response.structuredOutput.taskId = "repair";
-          response.structuredOutput.checks[0].id = "repair-check";
-        }
-        templates[key] = structuredClone(response);
-        return response;
-      },
-      host: async key => ({ key, kind: "command", ok: true, state: "passed", exitCode: 0, stderr: "", durationMs: 0,
-        outputPath: `/native/${key}.log`, stdout: JSON.stringify({ version: 1, binding: spec.binding, checkout, admission: { maxCycles: 3 } }) }),
-    });
-    expect(prepared.value).toMatchObject({ status: "complete" });
-    const process = Bun.spawn(["node", "-e", `
-      const input = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
-      import(${JSON.stringify(new URL("../node_modules/pi-subagents/src/workflows/scripted-workflow.js", import.meta.url).href)})
-        .then(async ({runWorkflowScript}) => {
-          const storage = new Map(), calls = [], statuses = [], originals = new Map();
-          let cut = input.mode.includes("cut");
-          const resumeKey = "invoke-human-1.l1.t1.a1.resume";
-          const options = { script: input.script,
-            state: { get: key => structuredClone(storage.get(key)), set: (key, value) => {
-              const attempt = value.loop?.attempt;
-              if (cut && ((attempt?.nativeContinuation?.stage === "receipt" &&
-                  (input.mode === "receipt-save-cut" || (input.mode === "result-save-cut" && attempt.stage === "result"))) ||
-                  (input.mode === "cursor-save-cut" && value.loop?.cursor === 1))) throw Error("Controlled continuation save cut");
-              storage.set(key, structuredClone(value));
-            } },
-            launch: async (key, params) => {
-              if (key.endsWith(".t2.a1")) {
-                const stored = storage.get("invoke-human-1");
-                const first = stored.tasks.repair.completed;
-                if (stored.loop.cursor !== 1 || first.status !== "complete" || first.ref.runId !== "exact-successor")
-                  throw Error("Next task dispatched before durable resumed-result admission");
-                const refs = JSON.parse(params.task.split("DIRECT PREREQUISITE COMPLETED RESULTS (historical references, not current check evidence):\\n")[1].split("\\n")[0]);
-                if (refs[0]?.taskId !== "repair" || refs[0]?.ref?.runId !== "exact-successor") throw Error("Wrong prerequisite successor");
+      selected: { source: path.join(root, ".pitako/plans/assignment.md"), digest: digest(spec.content), chunks: 1 } };
+    const child = Bun.spawn(["node", "--disable-warning=ExperimentalWarning", "-e", `
+      const fs = require("node:fs"), path = require("node:path"), {pathToFileURL} = require("node:url");
+      const input = JSON.parse(fs.readFileSync(0, "utf8"));
+      (async () => {
+        await import(pathToFileURL(input.packageRoot + "/skills/execute/loader.mjs"));
+        const {runWorkflowScript} = await import(pathToFileURL(input.packageRoot + "/node_modules/pi-subagents/src/workflows/scripted-workflow.js"));
+        const {captureCheckpoint,restoreCheckpoint} = await import(pathToFileURL(input.packageRoot + "/extensions/execute-checkpoint.ts"));
+        const loopIo = await import(pathToFileURL(input.packageRoot + "/skills/execute/loop.ts"));
+        const response = eval('(' + input.response + ')');
+        const storage = new Map(), calls = [], statuses = [], originals = new Map();
+        let cut = input.mode.includes("cut"), pendingResult;
+        const options = { script: input.script,
+          state: { get: key => structuredClone(storage.get(key)), set: (key, value) => {
+            storage.set(key, structuredClone(value));
+            fs.writeFileSync(input.statePath, JSON.stringify(Object.fromEntries(storage)));
+            const attempt = value.loop?.attempt;
+            if (cut && ((attempt?.number === 2 && (
+                input.mode === "receipt-save-cut" && attempt.gate?.stage === "receipt" ||
+                input.mode === "result-save-cut" && attempt.stage === "result" ||
+                input.mode === "seal-save-cut" && attempt.seal)) ||
+                input.mode === "cursor-save-cut" && value.loop?.cursor === 1)) {
+              cut = false; throw Error("Controlled continuation save cut");
+            }
+          } },
+          launch: async (key, request) => {
+            calls.push({key, resume:request.resume, agent:request.agent});
+            if (request.resume) throw Error("v6 backlog task must use checkpoint-first continuation");
+            let result;
+            if (request.agent === "pitako.loop-io") {
+              const {operation,...payload} = JSON.parse(request.task);
+              const value = await loopIo[operation](payload);
+              if (operation === "apply") value.view = (await loopIo.prepare({...payload,previousConfirmedUnit:null,taskId:value.selected?.id})).view;
+              const {backlog,...receipt} = value;
+              if (backlog) receipt.acceptance = backlog.acceptance;
+              result = {key,ok:true,agent:request.agent,runId:"native-"+key,output:JSON.stringify(receipt),results:[{exitCode:0}]};
+            } else {
+              result = response(key, request, input.metadata, input.checkout);
+              if (request.agent === "pitako.execution-director") {
+                const task = {id:"repair",goal:"Verify authorized behavior without writes",expectedResult:"Focused verification passes",
+                  status:"pending",origin:{kind:"spec",ref:input.metadata.selected.source},specRefs:[input.metadata.selected.source],
+                  dependsOn:[],gates:[{id:"repair-check",command:"true",cwd:input.root,timeoutMs:30000}],metric:null,
+                  parent:null,remaining:"",progress:{nonImproving:0,last5:[]},history:[]};
+                result.structuredOutput = {select:"repair",changes:[{kind:"add",task,reason:"Spec requires verification"}],
+                  reason:"Select remaining work",acceptance:[{id:"full",command:"true",cwd:input.root}]};
               }
-              calls.push({key, resume: params.resume, agent: params.agent});
-              let response;
-              if (params.agent === "pitako.request-observer" || params.agent === "pitako.checkpoint-sealer" || params.agent === "pitako.access-verifier") response = (${childResponse.toString()})(key, params, input.metadata, input.checkout);
-              else if (key.endsWith(".t1.a1")) response = { ...structuredClone(input.templates[key]),
-                ok: false, state: "interrupted", structuredOutput: undefined, results: [] };
-              else if (key.endsWith(".resume")) {
-                if (params.agent !== undefined || params.resume !== "native-invoke-human-1.l1.t1.a1") throw Error("Wrong native resume contract");
-                const frozen = JSON.parse(params.task.split("FROZEN ATTEMPT:\\n")[1].split("\\n")[0]);
-                if (frozen.taskId !== "repair" || frozen.number !== 1) throw Error("Attempt contract changed");
-                response = { ...structuredClone(input.templates["invoke-human-1.l1.t1.a1"]), key, runId: "exact-successor" };
-                if (input.mode.startsWith("pending")) { originals.set(key, { key, runId: "exact-successor", ok: true, state: "running" }); throw Error("Controlled post-launch transport loss"); }
-              } else response = structuredClone(input.templates[key]);
-              if (!response) throw Error("Unplanned child " + key);
-              originals.set(key, response); originals.set(response.runId, response);
-              return response;
-            },
-            status: async ref => { statuses.push(ref); const found = originals.get(ref); if (!found) throw Error("Unknown exact native reference"); return structuredClone(found); },
-            host: async key => ({ key, kind: "command", ok: true, state: "passed", exitCode: 0, stderr: "", durationMs: 0,
-              outputPath: "/native/" + key + ".log", stdout: JSON.stringify({ version: 1, binding: input.binding, checkout: input.checkout, admission: { maxCycles: 3 } }) }),
-          };
-          const first = await runWorkflowScript(options);
-          cut = false;
-          if (input.mode === "pending-settled") {
-            const completed = { ...structuredClone(input.templates["invoke-human-1.l1.t1.a1"]), key: resumeKey, runId: "exact-successor" };
-            originals.set(resumeKey, completed); originals.set(completed.runId, completed);
-          }
-          const second = input.mode === "complete" ? null : await runWorkflowScript(options);
-          const third = second?.value?.status === "complete" ? await runWorkflowScript(options) : null;
-          console.log(JSON.stringify({third: third?.value, first: first.value, second: second?.value, calls, statuses, invocation: storage.get("invoke-human-1")}));
-        }).catch(error => {console.error(error); process.exitCode=1;});
-    `], { cwd: root, env: { ...globalThis.process.env, PI_CODING_AGENT_DIR: path.join(root, "private-agent") }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
-    const stdout = new Response(process.stdout).text(), stderr = new Response(process.stderr).text();
-    process.stdin.write(JSON.stringify({script: resolved.resource.script, templates, metadata, content, checkout, mode, binding: spec.binding}));
-    process.stdin.end();
-    const [exit, output, errors] = await Promise.all([process.exited, stdout, stderr]);
+              if (request.agent === "pitako.worker") {
+                const task = JSON.parse(request.task.split("COMPLETE SELECTED TASK:\\n")[1].split("\\n")[0]);
+                const attempt = storage.get("invoke-human-1").loop.attempt;
+                if (task.id !== "repair" || attempt.taskId !== "repair") throw Error("Task ownership changed");
+                if (attempt.restore) {
+                  const frame = storage.get("invoke-human-1").taskFrame;
+                  restoreCheckpoint(attempt.restore.sourceKeys.map(key => frame.sources.find(source => source.key === key)),attempt.restore.authority);
+                }
+                captureCheckpoint(attempt.checkpoint,["owned"]);
+                result.structuredOutput = {work:"Verified authorized behavior",status:"complete",remaining:[],knowledge:{findings:[],handoff:""}};
+                if (attempt.number === 1) result = {...result,ok:false,interrupted:true,structuredOutput:undefined,results:[]};
+                else if (input.mode.startsWith("pending")) {
+                  pendingResult = structuredClone(result);
+                  result = {...result,ok:true,state:"running",structuredOutput:undefined,results:[]};
+                  originals.set(key,result); originals.set(result.runId,result);
+                  throw Error("Controlled post-launch transport loss");
+                }
+              }
+            }
+            originals.set(key,result); originals.set(result.runId,result);
+            return result;
+          },
+          status: async ref => { statuses.push(ref); const found = originals.get(ref); if (!found) throw Error("Unknown exact native reference " + ref); return structuredClone(found); },
+          host: async (key,request) => {
+            const stdout = require("node:child_process").execFileSync("sh",["-c",request.command],{encoding:"utf8",stdio:["ignore","pipe","pipe"]});
+            const value = JSON.parse(stdout); if (value.admission) value.admission.maxCycles = 1;
+            return {key,kind:"command",ok:true,state:"passed",exitCode:0,stderr:"",durationMs:0,outputPath:"/native/"+key+".log",stdout:JSON.stringify(value)};
+          },
+        };
+        const first = await runWorkflowScript(options);
+        cut = false;
+        if (input.mode === "pending-settled" && pendingResult) {
+          originals.set(pendingResult.key,pendingResult); originals.set(pendingResult.runId,pendingResult);
+        }
+        const second = input.mode === "complete" ? null : await runWorkflowScript(options);
+        const third = input.mode === "pending" ? null : await runWorkflowScript(options);
+        console.log(JSON.stringify({third:third?.value,first:first.value,second:second?.value,calls,statuses,
+          invocation:storage.get("invoke-human-1"),backlog:fs.existsSync(input.root+"/.pitako/backlog/assignment.json") ? JSON.parse(fs.readFileSync(input.root+"/.pitako/backlog/assignment.json","utf8")) : null}));
+      })().catch(error => {console.error(error);process.exitCode=1;});
+    `], { cwd: root, env: { ...process.env, PI_CODING_AGENT_DIR: path.join(nativeRoot, "private-agent") }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    const stdout = new Response(child.stdout).text(), stderr = new Response(child.stderr).text();
+    child.stdin.write(JSON.stringify({script:resource.script,metadata,checkout,mode,root,statePath,packageRoot:path.resolve("."),response:childResponse.toString()}));
+    child.stdin.end();
+    const [exit, output, errors] = await Promise.all([child.exited, stdout, stderr]);
     expect(exit, errors).toBe(0);
     expect(errors).not.toContain("unawaited runs.run launch(es)");
     const observed = JSON.parse(output);
-    expect(observed.calls.filter((call: any) => call.key.endsWith(".resume"))).toHaveLength(1);
-    expect(observed.calls.filter((call: any) => call.key.endsWith(".t1.a1"))).toHaveLength(1);
+    const workers = observed.calls.filter((call: any) => call.agent === "pitako.worker");
+    expect(workers.map((call: any) => call.key), JSON.stringify(observed)).toEqual(["invoke-human-1.l1.t1.a1", "invoke-human-1.l1.t1.a2"]);
+    expect(observed.calls.some((call: any) => call.resume)).toBe(false);
     expect(observed.invocation.consumedLoops).toBe(1);
-    expect(observed.calls.some((call: any) => call.key.includes(".restore"))).toBe(false);
     expect(readFileSync(path.join(root, "owned"), "utf8")).toBe("Existing interrupted-unit WIP");
+    const gates = observed.calls.filter((call: any) => call.key.endsWith(".gate"));
     if (mode === "pending") {
       expect(observed.second.status).not.toBe("complete");
-      expect(observed.calls.some((call: any) => call.key.endsWith(".t2.a1"))).toBe(false);
-      expect(observed.calls.some((call: any) => call.key.endsWith(".compliance"))).toBe(false);
+      expect(observed.backlog.tasks[0].status).toBe("pending");
+      expect(gates).toHaveLength(0);
     } else {
-      expect((observed.second ?? observed.first).status, (observed.second ?? observed.first).reason).toBe("complete");
-      expect(observed.calls.filter((call: any) => call.key.endsWith(".t2.a1"))).toHaveLength(1);
-      expect(observed.calls.filter((call: any) => call.key.endsWith("director-synthesis"))).toHaveLength(1);
-      expect(observed.calls.filter((call: any) => call.key.endsWith(".compliance"))).toHaveLength(1);
-      expect(observed.invocation.loop.cursor).toBe(2);
-      expect(observed.invocation.loop.results.map((result: any) => observed.invocation.tasks[result.taskId].completed)
-        .map((result: any) => [result.taskId, result.status, result.attempt]))
-        .toEqual([["repair", "complete", 1], ["final", "complete", 1]]);
-      if (mode !== "complete") expect(observed.third.status).toBe("complete");
-      expect(observed.invocation.tasks.repair.completed.ref).toMatchObject({ runId: "exact-successor",
-        resumedFrom: {runId: "native-invoke-human-1.l1.t1.a1"} });
+      expect((observed.second ?? observed.first).status, JSON.stringify(observed)).toBe("partial");
+      expect(gates).toHaveLength(1);
+      expect(observed.invocation.loop.cursor).toBe(1);
+      expect(observed.backlog.tasks[0]).toMatchObject({id:"repair",status:"done"});
+      expect(observed.invocation.tasks.repair.completed).toMatchObject({status:"complete",attempt:2,ref:{runId:"native-invoke-human-1.l1.t1.a2"}});
+      expect(observed.third.status).toBe("partial");
     }
+    expect(observed.calls.filter((call: any) => call.key.endsWith(".director"))).toHaveLength(1);
+    expect(observed.calls.some((call: any) => call.key.endsWith("director-synthesis") || call.key.endsWith(".compliance"))).toBe(false);
   });
 
 // Rejects a prompt-only resume claim or a replacement root that loses the saved
@@ -958,6 +1070,8 @@ test.each(["complete", "receipt-save-cut", "result-save-cut", "cursor-save-cut",
 // only host checks and model-facing child responses are controlled.
 test("registered Node public root resume consumes durable results and closes the same invocation", async () => {
   const root = repository(), spec = assignmentSpec(root);
+  writeFileSync(path.join(root, ".git/info/exclude"), "private-agent/\nnative/\nsessions/\nartifacts/\n");
+  const {head,fingerprint} = checkoutEvidence(root), candidate = {head,fingerprint};
   const child = Bun.spawn(["node", "--disable-warning=ExperimentalWarning", "-e", `
     const fs = require("node:fs"), path = require("node:path"), {pathToFileURL} = require("node:url");
     const {registerHooks, stripTypeScriptTypes} = require("node:module");
@@ -998,18 +1112,46 @@ test("registered Node public root resume consumes durable results and closes the
         verifier:input.packageRoot + "/extensions/access-receipts.mjs", sealer:input.packageRoot + "/skills/execute/checkpoint.mjs",
         selected:{source:path.join(input.root,".pitako/plans/assignment.md"), digest:input.digest, chunks:1}};
       const response = eval('(' + input.response + ')');
+      const {captureCheckpoint} = await import(pathToFileURL(input.packageRoot + "/extensions/execute-checkpoint.ts"));
+      await import(pathToFileURL(input.packageRoot + "/skills/execute/loader.mjs"));
+      const loopIo = await import(pathToFileURL(input.packageRoot + "/skills/execute/loop.ts"));
       const originals = new Map();
       const boundary = {
         resolveResume:async ref=>{if (!originals.has(ref)) throw Error("Unknown controlled child " + ref); return ref;},
         launch:async (key, request)=>{
           calls.push(key);
-          const result = response(key, request, metadata, input.checkout);
+          let result;
+          if (request.agent === "pitako.loop-io") {
+            const {operation,...payload} = JSON.parse(request.task);
+            const value = await loopIo[operation](payload);
+            if (operation === "apply") value.view = (await loopIo.prepare({...payload,previousConfirmedUnit:null,taskId:value.selected?.id})).view;
+            const {backlog,...receipt} = value;
+              if (backlog) receipt.acceptance = backlog.acceptance;
+            const output = JSON.stringify(receipt);
+            result = {key,ok:true,agent:request.agent,runId:"native-"+key,output,results:[{exitCode:0,usage:{input:0,output:0,cacheRead:0,cacheWrite:0,cost:0,turns:0}}]};
+          } else {
+            result = response(key, request, metadata, input.checkout);
+            if (request.agent === "pitako.execution-director") {
+              const exists = fs.existsSync(path.join(input.root,".pitako/backlog/assignment.json"));
+              const task = {id:"unit",goal:"Verify authorized behavior",expectedResult:"Focused verification passes",
+                status:"pending",origin:{kind:"spec",ref:metadata.selected.source},specRefs:[metadata.selected.source],
+                dependsOn:[],gates:[{id:"unit-check",command:"true",cwd:input.root,timeoutMs:30000}],metric:null,
+                parent:null,remaining:"",progress:{nonImproving:0,last5:[]},history:[]};
+              result.structuredOutput = {select:exists?null:"unit",changes:exists?[]:[{kind:"add",task,reason:"Spec requires verification"}],
+                reason:"Select remaining work",...(!exists?{acceptance:[{id:"full",command:"true",cwd:input.root}]}:{})};
+            }
+            if (request.agent === "pitako.worker") {
+              captureCheckpoint(state.get("invoke-human-1").loop.attempt.checkpoint,["owned"]);
+              result.structuredOutput = {work:"Verified authorized behavior",status:"complete",remaining:[],knowledge:{findings:[],handoff:""}};
+            }
+          }
+          for (const entry of result.results ?? []) entry.usage ??= {input:0,output:0,cacheRead:0,cacheWrite:0,cost:0,turns:0};
           originals.set(key,result); originals.set(result.runId,result);
           return result;
         },
         status:async ref=>{const result = originals.get(ref); if (!result) throw Error("Unexpected retained query " + ref); return structuredClone(result);},
         host:async key=>({key,kind:"command",ok:true,state:"passed",exitCode:0,stderr:"",durationMs:0,outputPath:"/controlled/"+key+".log",
-          stdout:JSON.stringify({version:1,binding:input.binding,checkout:input.checkout,admission:{maxCycles:3}})}),
+          stdout:JSON.stringify({version:1,binding:input.binding,checkout:input.checkout,admission:{maxCycles:1}})}),
       };
       const state = createMissionWorkflowState(mission.location, mission.missionId);
       let cut = false;
@@ -1017,7 +1159,7 @@ test("registered Node public root resume consumes durable results and closes the
         state.set(key,value);
         if (!cut && value.loop?.attempt?.stage === "result") {cut=true;throw Error("Controlled root interruption after durable result");}
       }}});
-      if (!cut) throw Error("Did not reach durable cut");
+      if (!cut) throw Error("Did not reach durable cut: " + JSON.stringify(seeded.value));
       const before = JSON.parse(fs.readFileSync(statePath,"utf8"))["invoke-human-1"];
       const params = {workflow:"pitako.execute",args,cwd:input.root,async:true,missionId:mission.missionId};
       const sourceDir = path.join(DIRS.async,sourceId);
@@ -1046,29 +1188,39 @@ test("registered Node public root resume consumes durable results and closes the
       const final = JSON.parse(fs.readFileSync(statePath,"utf8"))["invoke-human-1"];
       const again = await executor.executePublic("public-resume-again",{action:"resume",id:sourceId},new AbortController().signal,undefined,ctx);
       hooks.get("session_shutdown")({},ctx);
-      console.log(JSON.stringify({before,final,calls,resumed,again,sourceId,successor,claim,seeded:seeded.value}));
+      console.log(JSON.stringify({before,final,calls,resumed,again,sourceId,successor,claim,backlog:JSON.parse(fs.readFileSync(path.join(input.root,".pitako/backlog/assignment.json"),"utf8")),seeded:seeded.value}));
     })().catch(error=>{console.error(error);process.exitCode=1;});
   `], { cwd: root, env: { ...process.env, PI_CODING_AGENT_DIR: path.join(root,"private-agent"), PI_SUBAGENTS_TEMP_ROOT:path.join(root,"native") }, stdin:"pipe",stdout:"pipe",stderr:"pipe" });
-  const stdout = new Response(child.stdout).text(), stderr = new Response(child.stderr).text();
-  child.stdin.write(JSON.stringify({packageRoot:path.resolve("."),root,response:childResponse.toString(),checkout,digest:digest(spec.content),content:spec.content,binding:spec.binding}));
-  child.stdin.end();
-  const [exit,output,errors] = await Promise.all([child.exited,stdout,stderr]);
-  expect(exit,errors).toBe(0);
-  expect(errors).not.toContain("unawaited runs.run launch(es)");
-  const observed = JSON.parse(output);
-  expect(observed.before.loop.attempt.stage).toBe("result");
-  expect(observed.final.loop.outcome, JSON.stringify(observed.successor.workflow.value)).toBe("complete");
-  expect(observed.final.association.maxCycles).toBe(3);
-  expect(observed.successor.state).toBe("complete");
-  expect(observed.successor.workflow.value.invocation).toBe("human-1");
-  expect(observed.successor.workflow.value.loopsConsumed).toBe(1);
-  expect(observed.final.consumedLoops).toBe(1);
-  expect(observed.final.loop.cursor).toBe(1);
-  expect(observed.calls.filter((key:string)=>key.endsWith(".t1.a1"))).toHaveLength(1);
-  expect(observed.calls.filter((key:string)=>key.endsWith("director-synthesis"))).toHaveLength(1);
-  expect(observed.calls.filter((key:string)=>key.endsWith(".compliance"))).toHaveLength(1);
-  expect(observed.successor.workflow.resumeOrigin).toMatchObject({sourceRunId:observed.sourceId,attempt:1});
-  expect(observed.successor.workflow.value.status).toBe("complete");
-  expect(observed.again.isError).toBe(true);
-  expect(JSON.stringify(observed.again.content)).toContain(observed.claim.newRunId);
-});
+  const lifecycle = checkpointLifecycle(child, ([exit, output, errors]) => {
+    expect(exit,errors).toBe(0);
+    expect(errors).not.toContain("unawaited runs.run launch(es)");
+    const observed = JSON.parse(output);
+    expect(observed.before.loop.attempt.stage).toBe("result");
+    // One task consumes the frozen slot; final acceptance belongs to a later loop.
+    expect(observed.final.loop.outcome).toBe("gaps");
+    expect(observed.final.association.maxCycles).toBe(1);
+    expect(observed.successor.state, observed.successor.error).toBe("complete");
+    expect(observed.successor.workflow.value.invocation).toBe("human-1");
+    expect(observed.successor.workflow.value.loopsConsumed).toBe(1);
+    expect(observed.final.consumedLoops).toBe(1);
+    expect(observed.final.loop.cursor).toBe(1);
+    expect(observed.calls.filter((key:string)=>key.endsWith(".t1.a1"))).toHaveLength(1);
+    expect(observed.calls.filter((key:string)=>key.endsWith("director-synthesis"))).toHaveLength(0);
+    expect(observed.calls.filter((key:string)=>key.endsWith(".compliance"))).toHaveLength(0);
+    expect(observed.successor.workflow.resumeOrigin).toMatchObject({sourceRunId:observed.sourceId,attempt:1});
+    expect(observed.successor.workflow.value.status).toBe("partial");
+    expect(observed.backlog.tasks[0]).toMatchObject({id:"unit",status:"done"});
+    expect(observed.calls.filter((key:string)=>key.endsWith(".gate"))).toHaveLength(1);
+    expect(observed.again.isError).toBe(true);
+    expect(JSON.stringify(observed.again.content)).toContain(observed.claim.newRunId);
+  });
+  try {
+    child.stdin.write(JSON.stringify({packageRoot:path.resolve("."),root,response:childResponse.toString(),checkout:candidate,digest:digest(spec.content),content:spec.content,binding:spec.binding}));
+    child.stdin.end();
+    await lifecycle.result;
+  } finally {
+    lifecycle.cancel();
+    await lifecycle.settled;
+  }
+  // Cold Node/SDK loading measured ~2.5s, plus ~2s for durable seed and public resume.
+}, 10000);

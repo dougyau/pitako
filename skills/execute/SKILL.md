@@ -1,6 +1,6 @@
 ---
 name: execute
-description: Execute complete specs through one native mission-bound root workflow with configurable read-only planning loops, sequential fresh workers, shared adversarial review and individual compliance.
+description: Execute complete specs through one-task ralph loops with a persistent backlog, workflow-run gates, Board memory and final-phase review/compliance.
 ---
 
 ## Recoverable writer units
@@ -52,10 +52,10 @@ gaps. A missing checkpoint cannot be reconstructed from HEAD plus fingerprint.
 Capture actual affected-file bytes, including earlier WIP, before modifying.
 After journaled writes settle, return a decision-only worker report. The root dispatches
 `pitako.checkpoint-sealer` to observe the candidate and seal `unit` for valid complete
-reports or `pause` for pending work; workers never call unit/pause or echo receipts,
+reports backed by passing gates and an unchanged candidate, or `pause` otherwise; workers never call unit/pause or echo receipts,
 final candidate identity, task/attempt identity, Git HEAD or checkpoint references.
-Verification tasks without checkout writes need no pre-capture. Every planned check
-still records captured before/after `checkoutEvidence`. Only durable root admission
+Verification tasks without checkout writes need no pre-capture. The workflow
+captures before/after `checkoutEvidence` around gates, not the worker. Only durable root admission
 confirms a continuation point; a seal alone never moves the cursor.
 Useful `continue` work follows the same-task continuation path without human input.
 `gaps` or exhausted useful continuation reaches the next director within the
@@ -176,8 +176,9 @@ or a closed original producer does not settle a separately launched inspector.
 Never rename a payload recovery to `interrupted-operation` to replace it. A
 completed, already consumed historical observation is not an all-history gate.
 
-A completed needs-decision outcome plus useful current input proceeds to the next
-ordinary budgeted loop, preserving the completed director and original question.
+A worker blocked result retains its question/halt and checkpoint. Useful current
+human input continues the same pending task without repeating its director or
+renewing a loop slot. Invalid director selection instead ends the loop as gaps.
 A recorded Stop requires an actual later human continuation request before effects;
 preserve its record, never reuse an old answer for a later Stop or question.
 Current denial remains binding. Reuse a valid immediately available original,
@@ -277,7 +278,7 @@ Native status of a settled child carries no structured result, so the root keeps
 each received writer result in its state until admission. A relaunch seals and
 admits that result; it never restores a unit whose result was already received.
 
-The root saves an O(1) progress marker (latest admitted seal, ledger count/head
+The root saves an O(1) progress marker (latest admitted seal, ledger count/head, backlog digest
 and last closed loop) at each `budget-exhausted` end. Repeated exhaustion without
 progress becomes a human-needed halt: one step needs more spawns than the
 per-run budget, requiring a change to `maxSubagentSpawnsPerRun` or the step.
@@ -325,100 +326,99 @@ polling daemon or replacement root is introduced.
 
 ## Root-owned execution
 
-The root retains the complete immutable specs and mission/invocation/Git common
-root association. It durably consumes a loop slot BEFORE each fresh read-only
-director. That director publishes one schema-bound COMPLETE `loop_plan`, then
-ends before workers. It does not delegate, maintain private TODOs, run checks or
-review, or supervise implementation. The full plan contains shared context and
-ordered stable task IDs, scopes/effects, sources, expected results and checks,
-including final verification even when the implementation exists. Each check
-has a tier: earlier tasks carry only `focused` checks; the project's complete
-procedure is `acceptance`: the last task needs at least one and no earlier task may carry it (the root rejects
-other plans). It is the only task definition; the root's derived ID/order
-manifest is not another plan.
+The root retains the complete immutable specs and frozen amendments. Each loop
+consumes one frozen maxCycles slot and starts a fresh read-only director, which
+returns `{select, changes, reason}`: one most important pending task and keyed
+`add | split | obsolete | update` changes with reasons, not an ordered loop_plan.
+The first director derives the backlog using adds; later directors reconcile
+changed authority digests explicitly. Selection requires a pending task, focused
+gates and all dependency tasks done; invalid selection ends as gaps with a diagnosis.
+Directors neither edit nor run checks, delegate, supervise or keep private TODOs.
 
-A new never-admitted plan is first published, with settled producer, exact
-association and consistent complete original/binding links established before
-structural diagnosis. A useful diagnosed scope/check/dependency defect can be
-durably rejected together with that loop's accounted gap, before any worker.
-The next ordinary director receives the exact rejection reference and corrective
-diagnosis; it publishes a new plan, never edits/readmits the rejected original.
-Replay repeats pure validation before that write, or advances after it without
-double-counting. Repeating the same defect without new corrective information
-blocks rather than spending remaining slots blindly. This halt survives loss of
-the optional plan cache or original; replay cannot replace it with a lost-plan
-gap and another director. Exhaustion, capacity, Stop,
-permissions, uncertain settlement, identity conflicts and essential persistence
-remain barriers. Native schema failure without a usable authoritative original
-does not qualify; exact settled recovery can establish eligibility. Admitted
-contracts are never repaired or migrated through this path.
+### Persistent backlog and workflow gates
 
-A worker report that breaks the result contract, such as a check command that
-differs from the plan, missing per-check identities or a missing implementation pre-capture, is a
-rejected attempt, not a root halt. Its original stays in the native record and
-nothing from it is admitted. The loop ends as `gaps` with the exact reason, and
-the next director repeats only the affected work without rewriting planned checks.
-The root chooses seal kinds from the report, not worker echoes. Identity, binding,
-restoration and journal-integrity conflicts still halt. A journal mismatch reports
-up to ten paths with journaled and actual sha256 (or absence) and partial-application
-state. Return the files to their journaled bytes and resume, or start a new mission.
+`.pitako/backlog/<spec-id>.json` persists across invocations. Only the workflow
+through `pitako.loop-io` writes it, with expected-digest compare-and-swap,
+temp-file/fsync/rename and keyed idempotent replay. Task IDs are never reused;
+done/obsolete tombstones remain. There is no reopen: final-phase gaps are new
+tasks. Humans may edit between loops; invalid schema halts naming the file/error,
+and digest drift halts as `backlog-conflict`. Relaunch adopts the human file.
+Mission state stores the digest and selected task, not a copy of the file.
 
-Each new task has one concrete observable `expectedResult` and mandatory
-`dependsOn: [{taskId, reason}]` (or `[]`). Split separable outcomes, not coordinated
-code/tests needed for correctness; no file, line or task quotas. Prefer genuine
-independence and declare shared resources through scope/effects. Empty dependencies
-do not authorize concurrency. Admission checks full dependency shapes, known IDs,
-nonblank reasons, no self/duplicate entries and strictly earlier prerequisites
-(excluding cycles), without sorting or repairing the published order. Independent
-tasks may be permuted before admission. Final verification remains last even
-with `[]`. Missing metadata in an admitted old contract is incompatible, not
-inferred independence or permission to migrate the original.
+`loop-io prepare` validates the backlog and ensures the Board topic; `apply`
+checks the digest, applies changes and validates selection. Only the workflow
+marks tasks done after a gate-backed unit seal. The worker is the only product
+writer. Sequential fresh workers use four-hour attempts, reads:false and
+progress:false, no private diaries and no next-task selection. Their todo steps
+are display only, projected from the child session file, not evidence.
 
-Before a dependent writer starts, its direct prerequisites must have durable
-completed attempts. The worker receives exact full-result references from the
-existing results, never failed/intermediate attempts. These are historical
-evidence: check relevant current assumptions without automatically repeating all
-prerequisite gates. Review and compliance receive the admitted plan by reference
-and independently cover full specs, including semantic decomposition/dependency
-completeness that schema cannot prove. Do not repeat correct completed work just
-to improve past decomposition.
+Attempt order is worker settles → save gate intention → loop-io gate → save
+receipt → seal. No writer is active during gates. The workflow measures the
+metric every attempt; focused gates run when the worker reports complete or the
+task has no metric. Commands have timeouts and process-group termination, bounded
+receipt tails and full logs under `.pi/subagents/execute/<invocation>/gates/`.
+Mutation outside `.pi/`, `.pitako/` and gitignored outputs fails the gate.
+`loop-io` has no command allow-list; its effects are limited to backlog, Board
+posts, `.pi/` logs/metadata and gitignored build outputs, never product edits.
 
-Candidate HEAD/WIP evolves while specs, full task definitions and admitted order
-remain immutable. Future task worktrees start from candidate HEAD current at
-creation, not a single frozen initial base or copied WIP. No automatic updates
-or rebases of existing worktrees follow; completion/result references do not prove
-integration into HEAD. Current verification remains tied to the actual candidate,
-including WIP. This design direction adds no worktree engine, concurrency,
-integration or commit policy.
+Worker results are `{work, status, remaining, knowledge:{findings, handoff}}`;
+no per-check evidence or candidate identities. Advisory knowledge defects never
+reject work. The workflow chooses unit only for complete plus passing focused
+gates and no mutation, otherwise pause for a same-task continuation. A failed
+gate alone never ends the loop. Once seal intention exists gates are not rerun;
+the sealer candidate must equal the receipt after-fingerprint or recovery is needed.
+Checkpoint/journal integrity conflicts remain barriers, not ordinary gate failures.
 
-The root dispatches fresh ordinary workers sequentially and awaits final results,
-never treating async launch receipts as task results or using transcript forks.
-Use explicit async only where the public workflow contract preserves awaited final
-results. In pi-subagents 0.84.0 explicit async returns only a launch receipt, so the
-current workflow retains awaited dispatch. Live worker steps still reach the main
-session: the projection reads the running step's child session file.
-Each implementation attempt uses
-timeoutMs:14400000 (four hours), not a director/root/logical-task deadline.
-Normal worker tools/read/progress defaults remain; execute calls alone set
-reads:false, progress:false and explicit native acceptance-suppression reason
-because the root owns checks/review/compliance. This does not waive required
-checks or native permissions. Workers write no diaries, choose no next task and
-launch no reviewer. Their `todo` tool displays only their own steps, projected
-under the active task; it is not evidence. The structured result is authoritative,
-and a cancelled or deleted step never drops required work or checks. They report
-work done, concrete pending work, causal diagnosis, Git WIP, actual
-command/cwd/output/logs/result and checkoutEvidence identity around checks; the
-root attaches task/attempt and observes the final candidate through the sealer.
-The plan owns canonical check requirements by ID; optional descriptive echoes
-remain unchanged in originals. Coverage is inclusion, not a check-count match.
-Mandatory checks require current valid before/after candidate identities.
-Additional diagnostics retain output, logs, result and declared identities
-without normalization (`null` when uncaptured); historical failures, unknown or
-non-verifiable identities do not alone become mandatory gates. Validate all
-entries, including those after failures, and keep material contradictions open.
-Useful diagnosed same-task pending work may continue under a new attempt key;
-blind repetition or material replanning goes to the next director. No arbitrary
-attempt quota, green retries, timeout inflation or verification weakening.
+Continuations contain task, metric series, last handoff, Board view, gate failure
+summary and previous-result path, with no frozen attempt descriptor. Full specs
+and frozen amendments remain delivered. Metrics parse the last nonempty stdout
+line as a finite number regardless of exit code; timeout/unparseable output is
+non-improving. Improvement is strictly closer to target than the best so far.
+Without a metric, progress is passing gates/total. Three consecutive
+non-improving attempts end the loop and return the task to the director.
+Todo rows show e.g. `metric 18→8/0 · gates 3/5 · stall 1/3`.
+
+### Board memory
+
+The Git-common-dir workspace has one topic per spec and canonical worktree root,
+owned by `execute:<specId>:<first 16 hex of sha256(canonical root)>`. Execute status
+shows the topic id. The workflow ensures it idempotently and publishes FINDINGs
+and HANDOFFs with postOnce; a task HANDOFF supersedes its previous HANDOFF.
+Directors and workers have no Board tools. Views are byte-capped, newest first,
+with an omitted count: directors get current DECISIONs plus global/task FINDINGs;
+workers also get their task's current HANDOFF. Current DECISIONs exceeding about
+8 KB halt for human consolidation; binding rules are never silently dropped.
+
+Authority: spec and frozen amendments > DECISION > FINDING > HANDOFF; code wins
+over any map. Current DECISIONs are binding working rules, need no reconfirmation
+and cannot expand scope. HANDOFF is current repository state (locations, seams,
+metric value), not narrative or next steps; keep it at most 2 KB. Pending work
+belongs in the backlog, dead ends in FINDINGs.
+
+When answering a supervisor request, the foreground posts the ruling or standing
+approval as a DECISION in the execution topic. Use `supersedes` to replace the
+previous ruling, preserving the actual human answer/provenance. Do not promote
+agent opinion to human authority or override the frozen spec/amendments. Posting
+is foreground guidance, not an automatic supervisor-reply hook.
+
+Execute workers have no concurrent agents in this execution; resource_snapshot
+is enough for host load and they must not ask the supervisor about concurrency.
+The global dev-tools resource prompt is unchanged for other roles.
+
+Spec-by-sections delivery is deferred: full deterministic spec loading is retained
+to avoid dropping cross-cutting constraints for a small context saving.
+
+### Final phase
+
+Only when no implementation task is pending, a final-phase loop (also consuming
+one maxCycles slot) runs backlog acceptance commands: the project's complete
+procedure, then full shared adversarial review, then frozen-spec/amendment
+compliance, all on the same candidate. No task-loop review or compliance runs.
+Review receives done/obsolete reasons and current DECISIONs. Review/compliance
+gaps become new tasks with origin final-phase and a finding reference; the next
+director selects among them. Full-suite timeout/error halts blocked/environment
+with its log reference, not a new task. No blind retries, deadline inflation,
+arbitrary attempt quotas or weakened verification.
 
 After final mandatory checks the root runs the REAL shared adversarial review:
 two to four dynamic whole-result perspectives, cross-critique, one defense and
@@ -447,8 +447,8 @@ reasons and current candidate/check/evidence refs. Missing obligations are gaps;
 an empty or entirely not-applicable inventory cannot justify fulfillment. The
 analyst owns semantic coverage; script shape checks cannot certify it.
 It returns fulfilled, gaps or blocked. Standalone /review
-remains advisory. Material adversarial/compliance gaps END the loop and reach
-the next fresh director; no hidden global same-loop review/repair cycle.
+remains advisory. Material adversarial/compliance gaps become new final-phase backlog tasks and
+reach the next fresh director; no hidden global same-loop review/repair cycle.
 
 Checks and both analyses concern the SAME final candidate including WIP, with
 no own writer active during analyses. A genuine proposed close uses one fixed
@@ -622,7 +622,7 @@ original full structuredOutput, not previews. Cache at most the identical active
 plan when it fits the ENTIRE 256 KiB native state file. Essential snapshot/frozen
 descriptor/progress persistence failure blocks unsafe dispatch.
 Closed-loop history goes to a verified ledger; superseded recovery data is
-archived then discarded. Execute state uses one contract version (v5). Older
+archived then discarded. Execute state uses one contract version (v6). Older
 retained state fails before any resume or dispatch: "created by an incompatible
 Pitako contract vN; start a new mission". Nothing is migrated.
 Keep current task/control progress and usage totals, not a closed-loop array.

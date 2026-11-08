@@ -114,6 +114,9 @@ export function analysisResource(name: keyof typeof ANALYSIS_WORKFLOWS) {
 const NAMED_WORKFLOWS = ["pitako.execute", ...Object.keys(ANALYSIS_WORKFLOWS)];
 type RuntimeAgent = { name: string; description: string; systemPrompt: string; args: string[] };
 const RUNTIME_AGENTS: RuntimeAgent[] = [
+  { name: "pitako.loop-io", description: "Deterministic execute backlog, Board memory and command gates; no model execution.",
+    systemPrompt: "Fixed loop I/O; stdin is a JSON prepare, apply or gate request. Gates require a settled worker.",
+    args: ["skills/execute/loop-io.mjs"] },
   { name: "pitako.checkout-observer", description: "Deterministic actual-cwd checkout evidence; no model or prompt execution.",
     systemPrompt: "Fixed actual-cwd observer and ledger publisher; stdin is a JSON {expected, body} request, never a workspace selector.",
     args: ["skills/execute/observe.mjs"] },

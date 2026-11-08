@@ -12,8 +12,9 @@ export const MAX_SPEC_BYTES = 26 * 1536;
 export function validatePlanId(id: unknown): asserts id is string {
   if (typeof id !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(id)) throw new Error("Invalid spec-plan ID.");
 }
+const checkoutPaths = [".", ":(top,exclude).pi", ":(top,exclude).pitako"];
 // Reads that depend only on HEAD and the index, never on worktree files.
-const indexReads = new Set(["rev-parse\0HEAD", "rev-parse\0HEAD\0--abbrev-ref\0HEAD", "ls-files\0--stage\0-z", "diff\0--cached\0--binary"]);
+const indexReads = new Set(["rev-parse\0HEAD", "rev-parse\0HEAD\0--abbrev-ref\0HEAD", "ls-files\0--stage\0-z", "diff\0--cached\0--binary", ["diff", "--cached", "--binary", "--", ...checkoutPaths].join("\0")]);
 let indexReadCache: Map<string, string> | undefined;
 // A synchronous operation that never changes HEAD or the index reads each of
 // them once: rereading within the same call cannot detect a concurrent change.
@@ -199,18 +200,18 @@ export function preliminarySpec(root: string, id: string, source?: string) {
     throw new Error(`${String(error instanceof Error ? error.message : error)}. Reconcile the identified input for ${root} (selector ${source ?? id}); explicitly prepare admission with the intended version. No automatic recapture.`);
   }
 }
-/** Content identity, not a test receipt. Ignore only native transient workflow artifacts. */
+/** Content identity, not a test receipt. Exclude tool metadata, whose authority is verified separately. */
 export function checkoutEvidence(root: string) {
   const hash = createHash("sha256");
   // Ref names cannot contain newlines.
   const [head, branch] = gitRead(root, "rev-parse", "HEAD", "--abbrev-ref", "HEAD").trim().split("\n") as [string, string];
-  hash.update(head).update(gitRead(root, "diff", "--cached", "--binary"));
+  hash.update(head).update(gitRead(root, "diff", "--cached", "--binary", "--", ...checkoutPaths));
   const gitlinks = new Map<string, string[]>();
   for (const entry of gitRead(root, "ls-files", "--stage", "-z").split("\0")) {
     const match = entry.match(/^160000 ([0-9a-f]+) ([0-3])\t([\s\S]+)$/);
     if (match) gitlinks.set(match[3]!, [...(gitlinks.get(match[3]!) ?? []), `${match[1]} ${match[2]}`]);
   }
-  const files = gitRead(root, "ls-files", "-z", "--cached", "--others", "--exclude-standard").split("\0").filter(Boolean).filter(file => !file.startsWith(".pi/subagents/"));
+  const files = gitRead(root, "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", ...checkoutPaths).split("\0").filter(Boolean);
   for (const file of [...new Set(files)].sort()) {
     const target = path.join(root, file);
     hash.update(file).update("\0");

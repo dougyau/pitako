@@ -17,10 +17,14 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
   // "success", answer reuse after a later Stop, lost admission and duplicate writers.
   // These execute registered code and real writer bytes in Node.
   let preparedPauseInput: any;
-  function checkpointScenario(mode: string, preparePause = false) {
+  let preparedNative: { input: any; harness: string } | undefined;
+  function checkpointScenario(mode: string, preparePause = false, prepareNative = false) {
       const work = (async () => {
       let observation: [number, string, string] | undefined;
-      if (mode === "pause-status-continue" && !preparePause) {
+      if (mode === "abrupt-continue" && preparedNative && !prepareNative) {
+        observation = await nativeCheckpointCase(preparedNative.input, preparedNative.harness);
+        preparedNative = undefined;
+      } else if (mode === "pause-status-continue" && !preparePause) {
         observation = await nativeCheckpointCase(preparedPauseInput, `async () => {
           const finish = globalThis.finishPreparedPause;
           delete globalThis.finishPreparedPause;
@@ -35,7 +39,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
       writeFileSync(path.join(root, ".pitako/plans/assignment.md"), content);
       if (mode.startsWith("pause-status-gaps")) {
         mkdirSync(path.join(root, ".pi"), { recursive: true });
-        writeFileSync(path.join(root, ".pi/settings.json"), JSON.stringify({ pitako: { execute: { maxCycles: 1 } } }));
+        writeFileSync(path.join(root, ".pi/settings.json"), JSON.stringify({ pitako: { execute: { maxCycles: 2 } } }));
       }
       writeFileSync(path.join(root, "owned"), "previous uncommitted WIP");
       writeFileSync(path.join(root, "unrelated"), "unrelated WIP");
@@ -56,19 +60,19 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
       let continuationScript: string | undefined, laterScript: string | undefined;
       if (mode.startsWith("pause-") && !mode.startsWith("pause-status-")) {
         const continuationResource = resolveWorkflowResource("pitako.execute", { ...args, unblock: true,
-          resolution: { loop: 1, text: "Continue the cooperative pause from its saved pending work" } }, sessionId);
+          resolution: { loop: 2, text: "Continue the cooperative pause from its saved pending work" } }, sessionId);
         if (!continuationResource.ok) throw Error(continuationResource.error);
         continuationScript = continuationResource.resource.script;
         if (mode === "pause-later-input" || mode === "pause-twice") {
           const laterResource = resolveWorkflowResource("pitako.execute", { ...args, unblock: true,
-            resolution: { loop: 1, text: "New human continuation after the recorded Stop" } }, sessionId);
+            resolution: { loop: 2, text: "New human continuation after the recorded Stop" } }, sessionId);
           if (!laterResource.ok) throw Error(laterResource.error);
           laterScript = laterResource.resource.script;
         }
       }
       const input = { mode, root, missionPath, statePath, script: resource.resource.script, preparePause,
         continuationScript, laterScript,
-        metadata: { root, commonDir: path.join(root, ".git"), selected: { source: path.join(root, ".pitako/plans/assignment.md"), digest: digest(content) } },
+        metadata: { inlineLoopIO: true, withTask: true, root, commonDir: path.join(root, ".git"), selected: { source: path.join(root, ".pitako/plans/assignment.md"), digest: digest(content) } },
         module: new URL("../../extensions/execute-checkpoint.ts", import.meta.url).href,
         toolModule: path.resolve("extensions/checkpoint-create.ts"),
         sealer: path.resolve("skills/execute/checkpoint.mjs"),
@@ -108,17 +112,12 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
           }
           if (input.mode === "pause-status-continue" && !cut && value.loop?.attempt?.taskId === "second" &&
               value.loop.attempt.number === 3 && value.loop.attempt.stage === "launched") { cut = true; throw Error("Cut after successor loss"); }
-          if (unitMode && input.mode.endsWith("reentry") && !cut && value.loop?.attempt?.restore?.undispatched) { cut = true; throw Error("Cut after durable unit recovery intention"); }
+          if (unitMode && input.mode.includes("reentry") && !cut && value.loop?.attempt?.restore?.undispatched) { cut = true; throw Error("Cut after durable unit recovery intention"); }
           if (stateCut(value)) { cut = true; throw Error("Controlled pause persistence cut"); }
           if (!cut && input.mode === "cursor-cut" && admission && value.loop.attempt?.stage === "result") {
             cut = true; throw Error("After checkpoint admission before cursor advance");
           }
         } };
-        const firstTask = (value: any, id: string) => {
-          const unit = structuredClone(value.tasks[0]);
-          Object.assign(unit, { id, kind: "implementation", scope: ["owned"], allowedEffects: ["edit owned"] });
-          unit.checks[0].id = id + "-check"; unit.checks[0].tier = "focused"; return unit;
-        };
         const options = { script: input.script, state,
           status: async (key: string) => {
             return (originals.get(key)?.structuredOutput?.status === "plan" ||
@@ -150,10 +149,12 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
               if (second && input.mode === "refused") { sealError = "Native control refuses checkpoint capture"; throw Error(sealError); }
               const stateBeforeSeal = io.readFileSync(input.statePath, "utf8");
               let observed;
+              const cli = input.mode === "complete" && !second && seal.kind !== null;
               try {
-                observed = JSON.parse(io.execFileSync("node", [input.sealer, "--seal-stdin"], {
+                // One unit and its replay cover CLI transport; remaining observations reuse the sealer.
+                observed = cli ? JSON.parse(io.execFileSync("node", [input.sealer, "--seal-stdin"], {
                   cwd: input.root, input: request.task, encoding: "utf8",
-                }));
+                })) : io.sealCheckpointRequest(seal);
               } catch (error) { sealError = String(error); throw error; }
               if (io.readFileSync(input.statePath, "utf8") !== stateBeforeSeal) throw Error("Sealer changed admission/cursor state");
               if (observed.outcome === "sealed") {
@@ -162,7 +163,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
                 const before = JSON.parse(JSON.parse(io.readFileSync(observed.checkpointRef.replace(/(unit|pause)\.json$/, "manifest.json"), "utf8")).data);
                 points.push({ receipt, before, point: JSON.parse(JSON.parse(io.readFileSync(receipt.checkpointRef, "utf8")).data) });
                 if (["complete", "pause"].includes(input.mode)) {
-                  const replay = JSON.parse(io.execFileSync("node", [input.sealer, "--seal-stdin"], { cwd: input.root, input: request.task, encoding: "utf8" }));
+                  const replay = cli ? JSON.parse(io.execFileSync("node", [input.sealer, "--seal-stdin"], { cwd: input.root, input: request.task, encoding: "utf8" })) : io.sealCheckpointRequest(seal);
                   if (JSON.stringify(replay) !== JSON.stringify(observed)) throw Error("Non-idempotent root seal replay");
                 }
                 if (second && input.mode === "seal-cut") throw Error("Abrupt cut after seal before admission");
@@ -179,16 +180,18 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
             // no extra effects occur after its failed/unsealed second unit.
             if (!unitMode && !pauseMode && input.mode !== "abrupt-continue" && request.task?.includes("CHECKPOINT FALLBACK (same pending task"))
               return { key, ok: false, output: "", artifactPaths: [], error: "Blocked by pi-subagents permission rule: restoration denied in lifecycle fixture" };
-            // Director/review do not consume a candidate. Modifying workers
-            // receive their real identity below, after their owned effects.
-            const needsCandidate = request.agent === "pitako.checkout-observer" || key.endsWith(".compliance") || (request.agent === "pitako.worker" && key.includes(".t3."));
-            const result = response(key, request, input.metadata, needsCandidate ? candidate() : undefined);
+            const result = await response(key, request, input.metadata, candidate());
             if (key.endsWith(".director")) {
-              result.structuredOutput.tasks[0].dependsOn = [{ taskId: "second", reason: "Verify the completed pending unit" }];
-              result.structuredOutput.tasks.unshift(firstTask(result.structuredOutput, "first"), firstTask(result.structuredOutput, "second"));
-              result.structuredOutput.tasks[0].dependsOn = []; result.structuredOutput.tasks[1].dependsOn = [];
-
-            } else if (request.agent === "pitako.worker" && !key.includes(".t3.")) {
+              const selection = result.structuredOutput;
+              if (selection.changes.some((change: any) => change.kind === "add")) {
+                const first = selection.changes[0].task;
+                first.id = "first";
+                const second = structuredClone(first);
+                second.id = "second"; second.dependsOn = ["first"];
+                selection.select = "first";
+                selection.changes.push({ kind: "add", task: second, reason: "Preserve the next pending unit" });
+              }
+            } else if (request.agent === "pitako.worker") {
               const invocation = storage.get("invoke-human-1"), loop = invocation.loop, intent = loop.attempt.checkpoint;
               const second = intent.taskId === "second";
               if (cooperativePause && second && intent.attempt > 1) {
@@ -298,34 +301,39 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
               if (second && input.mode === "wrong-progress") result.structuredOutput.checkpointReceipt = {
                 progress: { consumedLoops: 2 } };
             }
-            if (request.agent === "pitako.worker" && key.includes(".t3.") && (unitMode || pauseMode || input.mode === "abrupt-continue")) {
-              const l = storage.get("invoke-human-1").loop;
-              const completed = storage.get("invoke-human-1").tasks.second.completed;
-              if (!completed || io.readFileSync(input.root + "/owned", "utf8") !== "completed pending work from pause" ||
-                  !request.task.includes(completed.ref.key)) throw Error("Final verification preceded durable pending-work admission");
-            }
-            // Workers report decisions/checks only; restoration is observed from metadata.
             if (request.agent === "pitako.worker") {
-              for (const field of ["taskId", "attempt", "candidate", "checkpointReceipt", "restoreReceipt"]) delete result.structuredOutput[field];
-              result.structuredOutput.git = { wip: result.structuredOutput.git.wip };
+              const value = result.structuredOutput;
+              result.structuredOutput = { work: value.diagnosis ?? "Owned checkpoint effects applied", status: value.status,
+                remaining: value.remaining, knowledge: { findings: [], handoff: "Owned file reflects this settled attempt" } };
             }
             if (request.agent === "pitako.worker")
               (await import(input.validator)).validateToolArguments({ name: "worker_result", description: "Result", parameters: request.outputSchema },
                 { type: "toolCall", id: "worker", name: "worker_result", arguments: result.structuredOutput });
             originals.set(result.runId!, structuredClone(result));
-            if (input.mode === "pause-reusable-result" && continuing && key.endsWith(".t2.a2")) {
+            if (input.mode === "pause-reusable-result" && continuing && key.endsWith(".l2.t1.a2")) {
               originals.set(key, structuredClone(result));
               throw Error("Transport disappeared after the complete result survived");
             }
             return result;
           },
         };
+        const launch = options.launch, launchErrors: string[] = [];
+        options.launch = async (key, request) => {
+          try { return await launch(key, request); }
+          catch (error) { launchErrors.push(`${key}: ${String(error)}`); throw error; }
+        };
         const result = await run(options as any);
         const finish = async () => {
         const original = structuredClone(storage.get("invoke-human-1"));
+        const originalArchives = structuredClone(archives);
         const callsAtYield = [...calls];
         let unitReplay: any;
-        if (unitMode && input.mode.endsWith("reentry")) {
+        if (unitMode && input.mode.includes("reentry")) {
+          if (input.mode.endsWith("reentry-mismatched-previous")) {
+            const retained = storage.get("invoke-human-1");
+            retained.taskFrame.sources[0].progress.previous.digest = "0".repeat(64);
+            io.writeFileSync(input.statePath, JSON.stringify(Object.fromEntries(storage)));
+          }
           recoveryReplay = true; unitReplay = await run(options as any);
         }
         let noInputReplay: any;
@@ -361,7 +369,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
               resumed = await run(options as any);
           }
         }
-        return { archives, secondPause, restorationAdmissions, unitReplay: unitReplay?.value, created: unitMode ? io.readFileSync(input.root + "/created", "utf8") : null, noInputReplay, callsAtYield, hostObservations, resumed: resumed?.value, original, baseline, partialRef, result: result.value, retained: storage.get("invoke-human-1"), calls, snapshots, points: points.filter(point => point.point.intent.loop === 1), sealError,
+        return { launchErrors, archives, originalArchives, secondPause, restorationAdmissions, unitReplay: unitReplay?.value, created: unitMode ? io.readFileSync(input.root + "/created", "utf8") : null, noInputReplay, callsAtYield, hostObservations, resumed: resumed?.value, original, baseline, partialRef, result: result.value, retained: storage.get("invoke-human-1"), calls, snapshots, points, sealError,
           owned: io.readFileSync(input.root + "/owned", "utf8"), unrelated: io.readFileSync(input.root + "/unrelated", "utf8") };
         };
         if (input.preparePause) {
@@ -370,6 +378,16 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
         }
         return finish();
       };
+      if (prepareNative) {
+        preparedNative = { input, harness: harness.toString() };
+        const loaded = await nativeCheckpointCase(input, `async (input, _run, _response, io) => {
+          const loaded = await io.loadExtensions([input.toolModule], input.root);
+          if (loaded.errors.length) throw Error(JSON.stringify(loaded.errors));
+          return "prepared";
+        }`);
+        expect(loaded?.[0], loaded?.[2]).toBe(0);
+        return;
+      }
       if (preparePause) preparedPauseInput = input;
       observation = await nativeCheckpointCase(input, harness.toString());
       if (preparePause) {
@@ -382,48 +400,58 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
       const [exit, output, errors] = observation;
       {
         expect(exit, errors).toBe(0); expect(errors).not.toContain("unawaited runs.run launch(es)");
-        const actual = JSON.parse(output); expect(actual.retained?.loop, JSON.stringify(actual)).toBeDefined(); const loop = actual.retained.loop;
+        const actual = JSON.parse(output); expect(actual.retained?.loop, JSON.stringify(actual)).toBeDefined();
+        // Each implementation unit now has its own loop; final verification has no worker.
+        const loop = actual.retained.loop.number === 3
+          ? actual.archives.find((record: any) => record.kind === "loop" && record.loop === 2).body
+          : actual.retained.loop;
         const history = (records: any[], retained: any[], tasks: any) => [...new Map(
-          [...records.flatMap(record => record.body.results ?? []), ...retained.map(entry => entry.ref ? entry : (tasks[entry.taskId].completed ?? tasks[entry.taskId].last))]
+          [...records.flatMap(record => record.body.results ?? []), ...retained.flatMap(entry => entry.ref ? [entry] :
+            [tasks[entry.taskId].completed, tasks[entry.taskId].last].filter(result => result?.attempt === entry.attempt))]
             .map(result => [`${result.taskId}:${result.attempt}`, result])).values()]
           .sort((a: any, b: any) => ["first", "second", "final"].indexOf(a.taskId) - ["first", "second", "final"].indexOf(b.taskId) || a.attempt - b.attempt);
-        loop.results = history(actual.archives.filter((record: any) => record.loop === loop.number), loop.results, actual.retained.tasks);
+        loop.results = history(actual.archives, loop.results, actual.retained.tasks);
         if (actual.secondPause) actual.secondPause.retained.loop.results =
           history(actual.secondPause.archives, actual.secondPause.retained.loop.results, actual.secondPause.retained.tasks);
         if (mode.startsWith("unit-before-capture")) {
-          const success = !["conflict", "corrupt", "missing", "unadmitted", "wrong-baseline"].some(suffix => mode.endsWith(suffix));
+          const success = !["conflict", "corrupt", "missing", "unadmitted", "wrong-baseline", "mismatched-previous"].some(suffix => mode.endsWith(suffix));
           expect((actual.unitReplay ?? actual.result).status, JSON.stringify(actual)).toBe(success ? "complete" : "blocked");
           expect(loop.results.filter((r: any) => r.taskId === "first" && r.status === "complete")).toHaveLength(1);
           expect(actual.created).toBe("created by confirmed unit");
           expect(actual.unrelated).toBe("unrelated WIP");
-          expect(actual.retained.consumedLoops).toBe(1);
+          expect(actual.retained.consumedLoops).toBe(success ? 3 : 2);
           expect(actual.retained.association.maxCycles).toBe(3);
-          expect(actual.calls.filter((key: string) => key.endsWith(".t1.a1"))).toHaveLength(1);
+          expect(actual.calls.filter((key: string) => key.endsWith(".l1.t1.a1"))).toHaveLength(1);
           if (success) {
             expect(actual.baseline).toBe("confirmed first work");
             expect(actual.owned).toBe("completed pending work from pause");
             const receipt = loop.results.find((r: any) => r.taskId === "second").restore.receipt;
-            expect(receipt.position).toEqual({loop: 1, cursor: 1, phase: "implementation"});
+            expect(receipt.position).toEqual({loop: 2, cursor: 0, phase: "implementation"});
             expect(receipt.confirmedUnit).toEqual({checkpointRef: actual.points[0].receipt.checkpointRef, digest: actual.points[0].receipt.digest});
             expect(receipt.checkpointRef).toBe(actual.points[0].receipt.checkpointRef.replace(/unit.json$/, "manifest.json"));
-            expect(loop.cursor).toBe(3);
-            for (const suffix of [".t2.a1", ".t2.a2", ".t3.a1", ".compliance"])
+            expect(loop.cursor).toBe(1);
+            for (const suffix of [".l2.t1.a1", ".l2.t1.a2", ".l3.acceptance.gate", ".compliance"])
               expect(actual.calls.filter((key: string) => key.endsWith(suffix))).toHaveLength(1);
             expect(actual.points).toHaveLength(2);
             expect(loop.results[0].checkpoint.confirmation).toEqual(actual.points[0].receipt);
-            expect(existsSync(actual.points[0].receipt.checkpointRef.replace(/t1\.a1\/unit\.json$/, "t2.a1/manifest.json"))).toBe(false);
+            expect(existsSync(actual.points[0].receipt.checkpointRef.replace(/l1\.t1\.a1\/unit\.json$/, "l2.t1.a1/manifest.json"))).toBe(false);
             const partial = JSON.parse(JSON.parse(readFileSync(receipt.partialRef, "utf8")).data);
             expect(Buffer.from(partial.partial[0].image.bytes, "base64").toString()).toBe("confirmed first work");
             if (mode.endsWith("reentry")) expect(actual.hostObservations.some((o: any) => o.replay && o.checkpoint?.evidence), JSON.stringify(actual.hostObservations)).toBe(true);
           } else {
-            expect(loop.cursor).toBe(1);
-            expect(actual.calls).not.toContain("invoke-human-1.l1.t3.a1");
+            if (mode.endsWith("reentry-mismatched-previous")) {
+              expect(actual.hostObservations.some((o: any) => o.replay &&
+                o.checkpoint?.error === "Confirmed unit conflicts with admitted pending progress.")).toBe(true);
+              expect(actual.calls).not.toContain("invoke-human-1.l2.t1.a3");
+            }
+            expect(loop.cursor).toBe(0);
+            expect(actual.calls).not.toContain("invoke-human-1.l3.acceptance.gate");
             expect(actual.owned).toBe(mode.endsWith("conflict") ? "unattributed edit" : mode.endsWith("wrong-baseline") ? "completed pending work from pause" : "confirmed first work");
           }
           return;
         }
         if (mode === "abrupt-continue") {
-          expect(actual.result).toMatchObject({ status: "complete", loopsConsumed: 1 });
+          expect(actual.result).toMatchObject({ status: "complete", loopsConsumed: 3 });
           expect(actual.baseline).toBe("confirmed first work");
           expect(actual.owned).toBe("completed pending work from pause");
           expect(actual.unrelated).toBe("unrelated WIP");
@@ -431,32 +459,31 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
           expect(Buffer.from(partial.partial[0].image.bytes, "base64").toString()).toBe("partial next-unit WIP");
           expect(loop.results.filter((entry: any) => entry.taskId === "first" && entry.status === "complete")).toHaveLength(1);
           expect(loop.results.find((entry: any) => entry.taskId === "second")).toMatchObject({ status: "complete", attempt: 2 });
-          expect(loop.cursor).toBe(3);
+          expect(loop.cursor).toBe(1);
           expect(actual.retained.lastConfirmed).toMatchObject({ taskId: "second", attempt: 2 });
-          for (const suffix of [".t1.a1", ".t2.a1", ".t2.a2", ".t3.a1", ".review.director-synthesis", ".compliance"])
+          for (const suffix of [".l1.t1.a1", ".l2.t1.a1", ".l2.t1.a2", ".l3.acceptance.gate", ".review.director-synthesis", ".compliance"])
             expect(actual.calls.filter((key: string) => key.endsWith(suffix))).toHaveLength(1);
           expect(actual.points).toHaveLength(2); // No post-cut seal for the interrupted attempt.
           return;
         }
         if (mode.startsWith("pause-")) {
           const originalLoop = actual.original.loop;
-          originalLoop.results = originalLoop.results.map((entry: any) => entry.ref ? entry :
-            (actual.original.tasks[entry.taskId].completed ?? actual.original.tasks[entry.taskId].last));
+          originalLoop.results = history(actual.originalArchives, originalLoop.results, actual.original.tasks);
           if (mode.startsWith("pause-status-")) {
-            const status = mode.includes("status-continue") ? "continue" : "gaps";
+            const finalBudget = mode.includes("status-continue");
             const paused = originalLoop.results[1], pause = paused.checkpoint.confirmation;
-            expect(paused.status).toBe(status);
-            expect(pause).toMatchObject({ kind: "pause", position: { cursor: 1 } });
+            expect(paused.status).toBe("continue");
+            expect(pause).toMatchObject({ kind: "pause", position: { loop: 2, cursor: 0 } });
             expect(createHash("sha256").update(readFileSync(pause.checkpointRef)).digest("hex")).toBe(pause.digest);
             if (mode.endsWith("admission-cut") || mode === "pause-status-continue") expect(actual.result.status).not.toBe("complete");
-            else expect(actual.result.status).toBe(status === "continue" ? "complete" : "partial");
+            else expect(actual.result.status).toBe(finalBudget ? "complete" : "partial");
             if (mode === "pause-status-continue") {
               expect(actual.noInputReplay.result.reason).toContain("no new checkpoint evidence");
-              expect(actual.noInputReplay.calls.some((key: string) => key.endsWith(".t2.a7"))).toBe(false);
+              expect(actual.noInputReplay.calls.some((key: string) => key.endsWith(".l2.t1.a7"))).toBe(false);
               expect(actual.noInputReplay.again.status, JSON.stringify(actual.noInputReplay.again)).toBe("complete");
-            } else expect(actual.noInputReplay.result.status, JSON.stringify(actual.noInputReplay.result)).toBe(status === "continue" ? "complete" : "partial");
+            } else expect(actual.noInputReplay.result.status, JSON.stringify(actual.noInputReplay.result)).toBe(finalBudget ? "complete" : "partial");
             expect(actual.retained.association).toEqual(actual.original.association);
-            expect(actual.retained.consumedLoops).toBe(1);
+            expect(actual.retained.consumedLoops).toBe(finalBudget ? 3 : 2);
             expect(loop.halt).toBeUndefined();
             expect(loop.results[1]).toEqual(paused);
             expect(actual.unrelated).toBe("unrelated WIP");
@@ -465,65 +492,66 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
               expect(actual.restorationAdmissions[0].restore.authority.confirmedPause).toEqual(pause);
               expect(loop.results[3].restore.receipt.confirmedPause).toEqual({ checkpointRef: pause.checkpointRef, digest: pause.digest });
               expect(actual.restorationAdmissions[1].restore.sourceKeys).toEqual([
-                "invoke-human-1.l1.t2.a6", "invoke-human-1.l1.t2.a5", "invoke-human-1.l1.t2.a4",
-                "invoke-human-1.l1.t2.a3", "invoke-human-1.l1.t2.a2", "invoke-human-1.l1.t2.a1",
+                "invoke-human-1.l2.t1.a6", "invoke-human-1.l2.t1.a5", "invoke-human-1.l2.t1.a4",
+                "invoke-human-1.l2.t1.a3", "invoke-human-1.l2.t1.a2", "invoke-human-1.l2.t1.a1",
               ]);
               // The root pause-sealed a5's journaled pending work: that newer
               // confirmed pause, not a1's, is the second restoration baseline.
               const later = actual.restorationAdmissions[1].restore.authority.confirmedPause;
-              expect(later).toMatchObject({ kind: "pause", position: { loop: 1, cursor: 1, phase: "implementation" },
-                progress: { admitted: { first: ["complete"], second: ["continue"] } } });
-              expect(later.checkpointRef).toEndWith(".t2.a5/pause.json");
+              expect(later).toMatchObject({ kind: "pause", position: { loop: 2, cursor: 0, phase: "implementation" },
+                progress: { admitted: { second: ["continue"] } } });
+              expect(later.checkpointRef).toEndWith(".l2.t1.a5/pause.json");
               expect(createHash("sha256").update(readFileSync(later.checkpointRef)).digest("hex")).toBe(later.digest);
-              expect(actual.archives.at(-1).body.frame.operations.map((item: any) => Number(item.key.match(/a(\d+)$/)[1]))).toEqual([4, 7]);
+              expect(actual.archives.filter((record: any) => record.kind === "unit" && record.loop === 2).at(-1).body.frame.operations.map((item: any) => Number(item.key.match(/a(\d+)$/)[1]))).toEqual([4, 7]);
               expect(actual.restorationAdmissions[1].restore.evidence).toBeTruthy();
               expect(actual.restorationAdmissions[1].restore.evidence).not.toBe(actual.restorationAdmissions[0].restore.evidence);
-              expect(loop.results[5].restore.receipt.checkpointRef).toEndWith(".t2.a5/manifest.json");
+              expect(loop.results[5].restore.receipt.checkpointRef).toEndWith(".l2.t1.a5/manifest.json");
               const partial = JSON.parse(JSON.parse(readFileSync(loop.results[5].restore.receipt.partialRef, "utf8")).data);
               expect(Buffer.from(partial.partial[0].image.bytes, "base64").toString()).toBe("journaled pending WIP");
               expect(actual.hostObservations.some((o: any) => o.replay && o.checkpoint?.evidence)).toBe(true);
               expect(loop.results[2]).toMatchObject({ attempt: 2, status: "continue", usefulContinuation: true });
               expect(loop.results[2].checkpoint.confirmation).toBeUndefined();
-              expect(existsSync(pause.checkpointRef.replace(/t2\.a1\/pause\.json$/, "t2.a2/manifest.json"))).toBe(false);
-              expect(existsSync(pause.checkpointRef.replace(/t2\.a1\/pause\.json$/, "t2.a3/manifest.json"))).toBe(false);
-              expect(actual.calls.filter((key: string) => key.endsWith(".t2.a3"))).toHaveLength(1);
-              expect(actual.calls.filter((key: string) => key.endsWith(".t2.a4"))).toHaveLength(1);
+              expect(existsSync(pause.checkpointRef.replace(/a1\/pause\.json$/, "a2/manifest.json"))).toBe(false);
+              expect(existsSync(pause.checkpointRef.replace(/a1\/pause\.json$/, "a3/manifest.json"))).toBe(false);
+              expect(actual.calls.filter((key: string) => key.endsWith(".l2.t1.a3"))).toHaveLength(1);
+              expect(actual.calls.filter((key: string) => key.endsWith(".l2.t1.a4"))).toHaveLength(1);
             } else expect(actual.restorationAdmissions).toEqual([]);
-            expect(actual.calls.filter((key: string) => key.endsWith(".director"))).toHaveLength(1);
-            expect(actual.calls.filter((key: string) => key.endsWith(".t1.a1"))).toHaveLength(1);
-            expect(actual.calls.filter((key: string) => key.endsWith(".t2.a1"))).toHaveLength(1);
-            if (status === "continue") {
-              expect(loop.cursor).toBe(3);
+            expect(actual.calls.filter((key: string) => key.endsWith(".director"))).toHaveLength(finalBudget ? 3 : 2);
+            expect(actual.calls.filter((key: string) => key.endsWith(".l1.t1.a1"))).toHaveLength(1);
+            expect(actual.calls.filter((key: string) => key.endsWith(".l2.t1.a1"))).toHaveLength(1);
+            if (finalBudget) {
+              expect(loop.cursor).toBe(1);
               expect(loop.results.map((r: any) => r.status)).toEqual(mode === "pause-status-continue"
-                ? ["complete", "continue", "continue", "continue", "continue", "complete", "complete"]
-                : ["complete", "continue", "complete", "complete"]);
+                ? ["complete", "continue", "continue", "continue", "continue", "complete"]
+                : ["complete", "continue", "complete"]);
               expect(actual.retained.association.maxCycles).toBe(3);
               expect(actual.baseline).toBe(mode === "pause-status-continue" ? "journaled pending WIP" : "partial next-unit WIP");
               expect(actual.owned).toBe("completed pending work from pause");
-              expect(actual.calls.filter((key: string) => key.endsWith(".t2.a2"))).toHaveLength(1);
+              expect(actual.calls.filter((key: string) => key.endsWith(".l2.t1.a2"))).toHaveLength(1);
               expect(actual.calls.filter((key: string) => key.endsWith(".review.director-synthesis"))).toHaveLength(1);
               expect(actual.calls.filter((key: string) => key.endsWith(".compliance"))).toHaveLength(1);
             } else {
               expect(loop.cursor).toBe(1);
-              expect(loop.outcome).toBe("gaps");
-              expect(actual.retained.association.maxCycles).toBe(1);
-              expect(actual.owned).toBe("partial next-unit WIP");
-              expect(actual.calls.some((key: string) => key.endsWith(".t2.a2") || key.endsWith(".compliance"))).toBe(false);
+              expect(loop.results.map((r: any) => r.status)).toEqual(["complete", "continue", "complete"]);
+              expect(actual.retained.association.maxCycles).toBe(2);
+              expect(actual.owned).toBe("completed pending work from pause");
+              expect(actual.calls.filter((key: string) => key.endsWith(".l2.t1.a2"))).toHaveLength(1);
+              expect(actual.calls.some((key: string) => key.endsWith(".compliance"))).toBe(false);
             }
             return;
           }
           if (mode === "pause-twice") {
             const paused = actual.secondPause.retained.loop;
             expect(actual.secondPause.result.status).toBe("blocked");
-            expect(paused.cursor).toBe(1);
+            expect(paused.cursor).toBe(0);
             expect(paused.results.map((r: any) => r.status)).toEqual(["complete", "blocked", "blocked"]);
             expect(actual.secondPause.retained.lastConfirmed).toMatchObject(paused.results[2].checkpoint.confirmation);
-            expect(actual.secondPause.calls).not.toContain("invoke-human-1.l1.t3.a1");
+            expect(actual.secondPause.calls).not.toContain("invoke-human-1.l3.acceptance.gate");
             expect(actual.resumed.status, JSON.stringify(actual.resumed)).toBe("complete");
-            expect(loop.cursor).toBe(3);
+            expect(loop.cursor).toBe(1);
             expect(loop.results.slice(0, 3)).toEqual(paused.results);
             expect(actual.retained.association).toEqual(actual.original.association);
-            expect(actual.retained.consumedLoops).toBe(1);
+            expect(actual.retained.consumedLoops).toBe(3);
             expect(actual.restorationAdmissions).toHaveLength(2);
             for (const [index, admission] of actual.restorationAdmissions.entries()) {
               expect(admission.restore.evidence).toMatch(/^[a-f0-9]{64}$/);
@@ -536,28 +564,31 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
             expect(actual.baseline).toBe("new pending pause work");
             expect(actual.owned).toBe("completed pending work from pause");
             expect(actual.unrelated).toBe("unrelated WIP");
-            expect(actual.calls.filter((key: string) => /\.t2\.a[2-9]$/.test(key))).toHaveLength(2);
-            expect(actual.calls).toContain("invoke-human-1.l1.t3.a1");
-            expect(actual.calls).toContain("invoke-human-1.l1.compliance");
+            expect(actual.calls.filter((key: string) => /\.l2\.t1\.a[2-9]$/.test(key))).toHaveLength(2);
+            expect(actual.calls).toContain("invoke-human-1.l3.acceptance.gate");
+            expect(actual.calls).toContain("invoke-human-1.l3.compliance");
             return;
           }
           expect(actual.retained.association).toEqual(actual.original.association);
-          expect(actual.retained.consumedLoops).toBe(1);
+          expect(actual.retained.consumedLoops).toBe([
+            "pause-missing", "pause-corrupt", "pause-conflict", "pause-empty", "pause-wrong-baseline",
+            "pause-successor-corrupt", "pause-loss-reentry", "pause-equivalent-capture", "pause-repeated-publication",
+          ].includes(mode) ? 2 : 3);
           expect(loop.results[0]).toEqual(originalLoop.results[0]);
           expect(loop.results[1]).toEqual(originalLoop.results[1]);
           expect(actual.unrelated).toBe("unrelated WIP");
-          expect(actual.calls.filter((key: string) => key.endsWith(".t1.a1"))).toHaveLength(1);
-          expect(actual.calls.filter((key: string) => key.endsWith(".t2.a1"))).toHaveLength(1);
+          expect(actual.calls.filter((key: string) => key.endsWith(".l1.t1.a1"))).toHaveLength(1);
+          expect(actual.calls.filter((key: string) => key.endsWith(".l2.t1.a1"))).toHaveLength(1);
           expect(new Set(actual.calls).size).toBe(actual.calls.length);
           expect(actual.calls.some((key: string) => key.includes(".recover"))).toBe(false);
-          expect(actual.resumed.loopsConsumed).toBe(1);
+          expect(actual.resumed.loopsConsumed).toBe(actual.retained.consumedLoops);
           expect(loop.plan.ref).toEqual(originalLoop.plan.ref);
           expect(loop.manifest).toEqual(originalLoop.manifest);
           // Rejects per-process bounds, equivalent-capture renewal and treating
           // repeated idempotent restoration publication as fresh material progress.
           if (mode.endsWith("loss-reentry") || ["pause-equivalent-capture", "pause-repeated-publication"].includes(mode)) {
             expect(actual.resumed.status).not.toBe("complete");
-            expect(actual.calls.filter((key: string) => /\.t2\.a[2-9]$/.test(key)),
+            expect(actual.calls.filter((key: string) => /\.l2\.t1\.a[2-9]$/.test(key)),
               "Unchanged evidence must not renew restoration across supported script reentries").toHaveLength(mode === "pause-repeated-publication" ? 2 : 1);
             const observed = actual.hostObservations.filter((entry: any) => entry.checkpoint);
             // Both terminal reentries see exactly the same exhausted evidence
@@ -576,13 +607,13 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
               expect(admitted.restore.evidence).toBe(initial.evidence);
               expect(admitted.restore.authority.confirmedPause).toEqual(originalLoop.results[1].checkpoint.confirmation);
               expect(loop.attempt.restore).toEqual(admitted.restore);
-              expect(loop.cursor).toBe(1);
+              expect(loop.cursor).toBe(0);
               expect(loop.results).toEqual(originalLoop.results);
               expect(actual.retained.lastConfirmed).toEqual(actual.original.lastConfirmed);
               expect(actual.retained.taskFrame.operations).toHaveLength(1);
               expect(actual.retained.tasks.second.last).toEqual(originalLoop.results[1]);
               expect(actual.retained.association.maxCycles).toBe(3);
-              expect(actual.calls.filter((key: string) => !key.includes(".requests-"))).toEqual([...actual.callsAtYield.filter((key: string) => !key.includes(".requests-")), "invoke-human-1.l1.t2.a2"]);
+              expect(actual.calls.filter((key: string) => !key.includes(".requests-"))).toEqual([...actual.callsAtYield.filter((key: string) => !key.includes(".requests-")), "invoke-human-1.l2.t1.a2"]);
             }
             expect(actual.resumed.action.started).toBe(false);
             const replayed = observed.find((entry: any) => entry.replay);
@@ -590,31 +621,32 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
             expect(replayed.replay).toBe(true);
             expect(actual.resumed.reason).toContain("no new checkpoint evidence");
             expect(actual.owned).toBe("partial next-unit WIP");
-            expect(actual.calls).not.toContain("invoke-human-1.l1.t3.a1");
+            expect(actual.calls).not.toContain("invoke-human-1.l3.acceptance.gate");
             return;
           }
           const blocked = ["pause-missing", "pause-corrupt", "pause-conflict", "pause-empty", "pause-wrong-baseline", "pause-successor-corrupt"].includes(mode);
           if (blocked) {
             if (mode === "pause-empty") {
-              expect(actual.original.lastConfirmed.taskId).toBe("first");
-              expect(originalLoop.results.some((r: any) => r.checkpoint?.confirmation?.kind === "pause")).toBe(false);
+              expect(actual.original.lastConfirmed).toMatchObject({ taskId: "second", kind: "pause" });
+              expect(originalLoop.results[1]).toMatchObject({ status: "blocked", remainingCount: 0 });
+              expect(originalLoop.results[1].checkpoint.confirmation).toBeDefined();
             }
             expect(actual.resumed.status, JSON.stringify(actual.resumed)).not.toBe("complete");
-            expect(actual.calls).not.toContain("invoke-human-1.l1.t3.a1");
+            expect(actual.calls).not.toContain("invoke-human-1.l3.acceptance.gate");
             if (mode === "pause-empty")
-              expect(actual.calls).not.toContain("invoke-human-1.l1.t2.a2");
+              expect(actual.calls).not.toContain("invoke-human-1.l2.t1.a2");
             expect(actual.owned).toBe(mode === "pause-conflict" ? "unattributed edit" : mode === "pause-wrong-baseline" ? "completed pending work from pause" : "partial next-unit WIP");
           } else {
             expect(actual.resumed.status, JSON.stringify(actual.resumed)).toBe("complete");
             expect(actual.baseline).toBe("partial next-unit WIP");
             expect(actual.owned).toBe("completed pending work from pause");
-            expect(actual.calls).toContain("invoke-human-1.l1.t3.a1");
-            expect(actual.calls).toContain("invoke-human-1.l1.review.director-synthesis");
-            expect(actual.calls).toContain("invoke-human-1.l1.compliance");
-            expect(loop.cursor).toBe(3);
+            expect(actual.calls).toContain("invoke-human-1.l3.acceptance.gate");
+            expect(actual.calls).toContain("invoke-human-1.l3.review.director-synthesis");
+            expect(actual.calls).toContain("invoke-human-1.l3.compliance");
+            expect(loop.cursor).toBe(1);
             expect(loop.results.find((entry: any) => entry.taskId === "second" && entry.status === "complete")).toBeDefined();
             const admitted = actual.snapshots.findIndex((state: any) => state.loops?.[0]?.results?.some((entry: any) => entry.taskId === "second" && entry.status === "complete"));
-            const advanced = actual.snapshots.findIndex((state: any) => state.loops?.[0]?.cursor === 2);
+            const advanced = actual.snapshots.findIndex((state: any) => state.loops?.[0]?.cursor === 1 && state.loops[0].results?.some((entry: any) => entry.taskId === "second"));
             expect(admitted).toBeLessThan(advanced);
             const partial = JSON.parse(JSON.parse(readFileSync(actual.partialRef, "utf8")).data);
             expect(partial.partial[0].image.bytes).toBe(Buffer.from(mode === "pause-write-cut" ? "completed pending work from pause" : "partial next-unit WIP").toString("base64"));
@@ -622,11 +654,11 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
           if (mode === "pause-successor-corrupt") {
             const observations = actual.hostObservations.filter((entry: any) => entry.checkpoint);
             expect(observations).toHaveLength(2);
-            expect(observations[1].checkpoint.error).toContain("corrupt successor");
-            expect(actual.calls).not.toContain("invoke-human-1.l1.t2.a3");
+            expect(observations[1].checkpoint.error).toContain("corrupt");
+            expect(actual.calls).not.toContain("invoke-human-1.l2.t1.a3");
           }
           if (mode === "pause-reusable-result") {
-            expect(actual.calls.filter((key: string) => /\.t2\.a[2-9]$/.test(key))).toHaveLength(1);
+            expect(actual.calls.filter((key: string) => /\.l2\.t1\.a[2-9]$/.test(key))).toHaveLength(1);
             expect(loop.results.find((entry: any) => entry.taskId === "second" && entry.status === "complete").attempt).toBe(2);
           }
           return;
@@ -636,35 +668,34 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
         expect(actual.points[0].before.files[0].image.bytes).toBe(Buffer.from("previous uncommitted WIP").toString("base64"));
         expect(actual.unrelated).toBe("unrelated WIP");
         expect(actual.retained.association.maxCycles).toBe(3);
+        const complete = ["complete", "missing-receipt", "wrong-progress"].includes(mode);
         // Failed/unsealed writes remain pending in the same consumed loop.
         // A restoration denied by the native boundary cannot repeat unit work.
-        // An unsealed complete report is rejected instead: loop 1 ends as gaps
-        // and the next director starts.
-        expect(actual.retained.consumedLoops).toBe(mode === "missing" ? 3 : 1);
-        if (mode === "missing") for (const item of actual.archives.filter((record: any) => record.kind === "loop").map((record: any) => record.body))
-          expect(item.results.find((result: any) => result.taskId === "second")).toMatchObject({
-            status: "rejected", rejection: "New implementation unit lacks required sealed file/progress checkpoint.",
-          });
-        if (mode === "missing") expect(loop).toMatchObject({ outcome: "gaps", results: [{ taskId: "first", status: "complete" },
-          { taskId: "second", status: "rejected", rejection: "New implementation unit lacks required sealed file/progress checkpoint." }] });
+        // A missing second-task capture cannot inherit completion from the first loop.
+        expect(actual.retained.consumedLoops).toBe(complete ? 3 : 2);
+        if (mode === "missing") {
+          expect(actual.result.status).toBe("blocked");
+          expect(loop.halt).toBeDefined();
+          expect(loop.results.some((result: any) => result.taskId === "second")).toBe(false);
+          expect(actual.calls).not.toContain("invoke-human-1.l3.acceptance.gate");
+        }
         expect(actual.result.loopsConsumed).toBe(actual.retained.consumedLoops);
         const confirmed = actual.retained.lastConfirmed;
-        const complete = ["complete", "missing-receipt", "wrong-progress"].includes(mode);
         const secondConfirmed = complete || ["pause", "cursor-cut"].includes(mode);
         expect(confirmed.taskId).toBe(secondConfirmed ? "second" : "first");
-        expect(confirmed).toMatchObject({ kind: mode === "pause" ? "pause" : "unit", position: { loop: actual.retained.consumedLoops, cursor: complete || mode === "cursor-cut" ? 2 : 1 } });
+        expect(confirmed).toMatchObject({ kind: mode === "pause" ? "pause" : "unit", position: { loop: secondConfirmed ? 2 : 1, cursor: mode === "pause" ? 0 : 1 } });
         const point = JSON.parse(JSON.parse(readFileSync(confirmed.checkpointRef, "utf8")).data);
         expect(point.position).toEqual(confirmed.position); expect(point.progress).toEqual(confirmed.progress);
         expect(createHash("sha256").update(readFileSync(confirmed.checkpointRef)).digest("hex")).toBe(confirmed.digest);
-        expect(point.progress.consumedLoops).toBe(actual.retained.consumedLoops);
+        expect(point.progress.consumedLoops).toBe(secondConfirmed ? 2 : 1);
         expect(loop.results.find((entry: any) => entry.taskId === confirmed.taskId).ref).toEqual(confirmed.resultRef);
         expect(point.files[0].image.bytes).toBe(Buffer.from(secondConfirmed ? "partial next-unit WIP" : "confirmed first work").toString("base64"));
         if (secondConfirmed) {
-          expect(point.progress.admitted).toEqual({ first: ["complete"] });
+          expect(point.progress.admitted).toEqual({});
           expect(point.progress.previous.resultRef).toEqual(loop.results[0].ref);
         }
-        if (complete) { expect(actual.result.status).toBe("complete"); expect(actual.calls).toContain("invoke-human-1.l1.compliance"); }
-        else expect(actual.calls).not.toContain("invoke-human-1.l1.t3.a1");
+        if (complete) { expect(actual.result.status).toBe("complete"); expect(actual.calls).toContain("invoke-human-1.l3.compliance"); }
+        else expect(actual.calls).not.toContain("invoke-human-1.l3.acceptance.gate");
         if (["refused", "corrupt"].includes(mode)) {
           expect(actual.sealError).not.toBe(""); expect(actual.points).toHaveLength(1);
         }
@@ -675,7 +706,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
           expect(actual.points).toHaveLength(1);
         }
         if (["seal-cut", "admission-cut", "missing-receipt", "wrong-progress"].includes(mode)) expect(actual.points).toHaveLength(2);
-        if (mode === "cursor-cut") expect(loop.cursor).toBe(1);
+        if (mode === "cursor-cut") expect(loop.cursor).toBe(0);
         if (mode === "pause") expect(loop.results[1].status).toBe("blocked");
       }
       })();

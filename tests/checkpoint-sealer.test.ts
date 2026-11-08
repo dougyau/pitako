@@ -148,9 +148,19 @@ test("runtime registration includes a model-free sealer and rolls all agents bac
 // The real CLI tests above verify bytes; these controller cases verify dispatch,
 // admission ordering and the absence of model-owned checkpoint identities.
 const { fixture: controller } = executeControllerFixture();
+// These cases change real worker bytes; the controlled gate must observe them,
+// rather than the fixture's unchanged synthetic candidate.
+function observeGate(host: ReturnType<typeof controller>, request: any, normal: () => any) {
+  const result = normal();
+  if (request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "gate" && JSON.parse(request.task).task.id !== "final-acceptance") {
+    const receipt = JSON.parse(result.output), candidate = host.observedCandidate();
+    result.output = JSON.stringify({ ...receipt, before: candidate, after: candidate });
+  }
+  return result;
+}
 test.each([
   ["complete", [], "unit"], ["continue", ["pending"], "pause"],
-  ["gaps", ["pending"], "pause"], ["gaps", [], null], ["continue", [], null],
+  ["gaps", ["pending"], "pause"], ["gaps", [], "pause"], ["continue", [], "pause"],
 ] as const)("root chooses seal kind for %s remaining=%j", async (status, remaining, expected) => {
   const host = controller(undefined, { controlledCheckpoints: true });
   host.setLimit(1);
@@ -158,10 +168,9 @@ test.each([
     if (request.key === "invoke-human-1.l1.t1.a1") {
       const value = host.worker(request);
       expect(Object.keys(request.outputSchema.properties).sort()).toEqual([
-        "checks", "continuation", "diagnosis", "git", "remaining", "status", "usefulProgress", "workDone",
+        "knowledge", "remaining", "status", "work",
       ]);
-      expect(request.outputSchema.properties.git.properties).toEqual({ wip: { type: "string", minLength: 1 } });
-      return host.result(request, { ...value, status, remaining, usefulProgress: false });
+      return host.result(request, { ...value, status, remaining });
     }
     if (request.agent === "pitako.checkpoint-sealer") {
       const input = JSON.parse(request.task);
@@ -172,22 +181,22 @@ test.each([
       }
     }
     if (request.agent === "pitako.execution-director") expect(request.outputSchema.properties).not.toHaveProperty("association");
-    return normal();
+    return observeGate(host, request, normal);
   });
   const output = await host.execute();
-  expect(output.status).toBe(status === "complete" ? "complete" : "partial");
+  expect(output.status).toBe("partial"); // One slot completes the task, not the separate final phase.
   const receipt = host.history()[0].results.find((entry: any) => entry.taskId === "change1").checkpoint.confirmation;
-  if (expected) expect(receipt.kind).toBe(expected); else expect(receipt).toBeUndefined();
+  expect(receipt.kind).toBe(expected);
 });
 
-test("a declared block that breaks the result contract still halts after kind-null journal verification", async () => {
+test("a schema-invalid declared block still halts after kind-null journal verification", async () => {
   const host = controller();
   const sealed: unknown[] = [];
   host.setRespond((request, normal) => {
     if (request.key === "invoke-human-1.l1.t1.a1")
-      return host.result(request, { ...host.worker(request), status: "blocked", remaining: ["needs a decision"], checks: [] });
+      return host.result(request, { ...host.worker(request), status: "blocked", remaining: ["needs a decision"], work: null });
     if (request.agent === "pitako.checkpoint-sealer") sealed.push(JSON.parse(request.task).kind);
-    return normal();
+    return observeGate(host, request, normal);
   });
   const output = await host.execute();
   expect(output.status).toBe("blocked");
@@ -201,14 +210,14 @@ test.each(["complete", "pause", "rejected"])("journal mismatch for %s blocks bef
   host.setRespond((request, normal) => {
     if (request.key === "invoke-human-1.l1.t1.a1") {
       const value = host.worker(request);
-      const descriptor = JSON.parse(request.task.split("FROZEN ATTEMPT:\n")[1]!.split("\n")[0]!);
+      const descriptor = JSON.parse(request.task.split("PRE-WRITE CHECKPOINT INTENTION (not a backup until published):\n")[1]!.split("\n")[0]!);
       const file = "src/" + descriptor.taskId + ".ts";
       mkdirSync(path.dirname(path.join(host.root, file)), { recursive: true });
       writeFileSync(path.join(host.root, file), "not journaled");
       return host.result(request, mode === "pause" ? { ...value, status: "gaps", remaining: ["pending"] }
-        : mode === "rejected" ? { ...value, checks: [] } : value);
+        : mode === "rejected" ? { ...value, work: null } : value);
     }
-    return normal();
+    return observeGate(host, request, normal);
   });
   const output = await host.execute();
   expect(output.status).toBe("blocked");
@@ -225,62 +234,65 @@ test.each(["complete", "pause", "rejected"])("journal mismatch for %s blocks bef
 test("structurally rejected worker reports verify the journal without sealing", async () => {
   const host = controller(undefined, { controlledCheckpoints: true }); host.setLimit(1);
   host.setRespond((request, normal) => {
-    if (request.agent === "pitako.worker") return host.result(request, { ...host.worker(request), checks: [] });
+    if (request.agent === "pitako.worker") return host.result(request, { ...host.worker(request), work: null });
     if (request.agent === "pitako.checkpoint-sealer") expect(JSON.parse(request.task).kind).toBeNull();
-    return normal();
+    return observeGate(host, request, normal);
   });
   expect((await host.execute()).status).toBe("partial");
   expect(host.history()[0].results[0].status).toBe("rejected");
   expect(host.current().lastConfirmed).toBeNull();
 });
 
-test("root observes missing manifests and rejects a complete implementation without one", async () => {
+test("root observes missing manifests and blocks changed candidates without a journal-backed unit", async () => {
   const host = controller(); host.setLimit(1);
   host.setRespond((request, normal) => {
     if (request.agent === "pitako.worker") {
       const value = host.worker(request);
-      const descriptor = JSON.parse(request.task.split("FROZEN ATTEMPT:\n")[1]!.split("\n")[0]!);
+      const descriptor = JSON.parse(request.task.split("PRE-WRITE CHECKPOINT INTENTION (not a backup until published):\n")[1]!.split("\n")[0]!);
+      host.changeCheckout();
       rmSync(path.join(host.root, ".pi/subagents/checkpoints", descriptor.key), { recursive: true });
       return host.result(request, value);
     }
-    return normal();
+    return observeGate(host, request, normal);
   });
-  expect((await host.execute()).status).toBe("partial");
-  expect(host.history()[0].results[0].rejection).toContain("lacks required sealed file/progress checkpoint");
+  const output = await host.execute();
+  expect(output.status).toBe("blocked");
+  expect(output.reason).toContain("Implementation completion requires a journal-backed unit seal or an unchanged gated baseline");
+  expect(host.current().loop.attempt).not.toHaveProperty("result");
   expect(host.current().lastConfirmed).toBeNull();
 });
 
-test.each([false, true])("inspector recovery verifies without sealing (mismatch=%s)", async mismatch => {
-  const host = controller(undefined, { readOnly: true });
-  let original: any;
+test.each([false, true])("missing implementation result restores before the next capture (written=%s)", async written => {
+  const host = controller();
+  let source: CheckpointIntent;
+  let restored: any;
   host.setRespond((request, normal) => {
-    const result = normal();
     if (request.key === "invoke-human-1.l1.t1.a1") {
-      original = result.structuredOutput;
+      const result = normal();
+      source = host.current().loop.attempt.checkpoint;
+      if (written) applyCheckpoint(source, [{ path: "src/change1.ts", image: {
+        bytes: Buffer.from("interrupted owned bytes").toString("base64"), mode: 0o644,
+      } }]);
       delete result.structuredOutput;
-      if (mismatch) {
-        const descriptor = JSON.parse(request.task.split("FROZEN ATTEMPT:\n")[1]!.split("\n")[0]!);
-        captureCheckpoint(descriptor.checkpoint, ["src/change1.ts"]);
-        const file = path.join(host.root, "src/change1.ts");
-        mkdirSync(path.dirname(file), { recursive: true }); writeFileSync(file, "foreign");
-      }
+      return result;
     }
-    if (request.agent === "pitako.execution-inspector")
-      Object.assign(result.structuredOutput, { status: "recovered", workerResult: original, original: null });
-    if (request.agent === "pitako.checkpoint-sealer" && JSON.parse(request.task).intent.taskId === "change1")
-      expect(JSON.parse(request.task).kind).toBeNull();
-    return result;
+    if (request.key === "invoke-human-1.l1.t1.a2") {
+      restored = restoreCheckpoint(source, host.current().loop.attempt.restore.authority);
+      expect(existsSync(path.join(host.root, "src/change1.ts"))).toBe(false);
+    }
+    return observeGate(host, request, normal);
   });
   const output = await host.execute();
-  expect(output.status, output.reason).toBe(mismatch ? "blocked" : "complete");
-  if (mismatch) {
-    expect(host.current().loop.halt).toMatchObject({ code: "checkpoint-integrity", ref: { agent: "pitako.checkpoint-sealer" } });
-    expect(host.current().loop.attempt).not.toHaveProperty("result");
-    expect(output.reason).toContain("src/change1.ts");
-  } else {
-    expect(host.history()[0].results[0]).toMatchObject({ status: "complete", checks: { current: true } });
-    expect(host.history()[0].results[0].checkpoint).not.toHaveProperty("confirmation");
-  }
+  expect(output.status, output.reason).toBe("complete");
+  expect(host.calls.filter(call => call.agent === "pitako.execution-inspector")).toHaveLength(0);
+  expect(host.calls.filter(call => call.agent === "pitako.worker").map(call => call.key))
+    .toEqual(["invoke-human-1.l1.t1.a1", "invoke-human-1.l1.t1.a2"]);
+  expect(host.history()[0].results[0]).toMatchObject({ status: "complete", attempt: 2,
+    checks: { current: true }, checkpoint: { confirmation: { kind: "unit" } } });
+  const partial = JSON.parse(JSON.parse(readFileSync(restored.partialRef, "utf8")).data).partial;
+  expect(partial[0].image).toEqual(written ? {
+    bytes: Buffer.from("interrupted owned bytes").toString("base64"), mode: 0o644,
+  } : null);
 });
 
 test("sealer retry is restored when native budget rejects dispatch", async () => {
@@ -292,14 +304,14 @@ test("sealer retry is restored when native budget rejects dispatch", async () =>
       const error = new RunFanoutLimitError({ code: "RUN_FANOUT_LIMIT", path: `workflow[${request.key}]`, used: 64, limit: 64, requested: 1, remaining: 0 }).message;
       return { key: request.key, ok: false, error, output: error, artifactPaths: [] };
     }
-    return normal();
+    return observeGate(host, request, normal);
   });
   expect((await host.execute()).status).toBe("budget-exhausted");
   expect(host.current().loop.attempt.seal.retry).toBe(0);
   expect(host.current().loop.attempt).not.toHaveProperty("result");
 });
 
-test("integrity halt holds without input; restored journaled bytes plus current input re-seal under .r1", async () => {
+test("integrity halt holds without input; repaired bytes cannot reuse a different saved gate candidate", async () => {
   const host = controller();
   const file = path.join(host.root, "src/change1.ts");
   host.setRespond((request, normal) => {
@@ -308,7 +320,7 @@ test("integrity halt holds without input; restored journaled bytes plus current 
       mkdirSync(path.dirname(file), { recursive: true }); writeFileSync(file, "not journaled");
       return host.result(request, value);
     }
-    return normal();
+    return observeGate(host, request, normal);
   });
   expect((await host.execute()).status).toBe("blocked");
   const calls = host.calls.length;
@@ -316,11 +328,15 @@ test("integrity halt holds without input; restored journaled bytes plus current 
   expect(host.calls).toHaveLength(calls);
   rmSync(file); // the human returns the file to its journaled absence
   const output = await host.execute({ unblock: true, resolution: { loop: 1, text: "Returned src/change1.ts to its journaled bytes." } });
-  expect(output.status, output.reason).toBe("complete");
+  expect(output.status, output.reason).toBe("blocked");
+  expect(output.reason).toContain("Sealer candidate differs from the saved gate receipt");
+  expect(host.current().loop.attempt).not.toHaveProperty("result");
+  expect(host.current().lastConfirmed).toBeNull();
+  expect(host.calls.filter(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "gate")).toHaveLength(1);
   expect(host.calls.filter(call => call.agent === "pitako.checkpoint-sealer" && call.key.includes(".t1.")).map(call => call.key))
     .toEqual(["invoke-human-1.l1.t1.a1.seal", "invoke-human-1.l1.t1.a1.seal.r1"]);
   expect(host.calls.filter(call => call.key === "invoke-human-1.l1.t1.a1")).toHaveLength(1);
-  expect(host.current().tasks.change1.admitted).toEqual(["complete"]);
+  expect(host.history()[0].results.filter((entry: any) => entry.taskId === "change1")).toEqual([]);
 });
 
 test("a stopped sealer admits nothing; current input reconciles it before a fresh seal admits once", async () => {
@@ -343,7 +359,7 @@ test("a stopped sealer admits nothing; current input reconciles it before a fres
   expect(host.calls.filter(call => call.key === "invoke-human-1.l1.t1.a1")).toHaveLength(1);
   expect(host.calls.filter(call => call.key.startsWith("invoke-human-1.l1.t1.a1.seal")).map(call => call.key))
     .toEqual(["invoke-human-1.l1.t1.a1.seal", "invoke-human-1.l1.t1.a1.seal.r1"]);
-  expect(host.current().tasks.change1.admitted).toEqual(["complete"]);
+  expect(host.history()[0].results.filter((entry: any) => entry.taskId === "change1").map((entry: any) => entry.status)).toEqual(["complete"]);
 });
 
 test("an active retained sealer blocks fallback and re-seal; unknown status takes the existing route", async () => {
@@ -388,8 +404,8 @@ test("replay with a seal record and a retained worker result re-seals idempotent
   expect(host.statusCalls.slice(0, 1)).toEqual(["invoke-human-1.l1.t1.a1.seal"]);
   expect(host.calls.slice(calls).map(call => call.key)).toContain("invoke-human-1.l1.t1.a1.seal.r1");
   expect(host.calls.some(call => call.key === "invoke-human-1.l1.t1.a2")).toBe(false);
-  expect(host.current().tasks.change1.admitted).toEqual(["complete"]);
-  expect(host.current().tasks.change1.completed).toMatchObject({ attempt: 1 });
+  expect(host.history()[0].results.filter((entry: any) => entry.taskId === "change1").map((entry: any) => entry.status)).toEqual(["complete"]);
+  expect(host.history()[0].results.find((entry: any) => entry.taskId === "change1")).toMatchObject({ attempt: 1, status: "complete" });
 });
 
 test("replay with a seal record and unknown worker status observes the sealer, falls back, and admits nothing", async () => {
@@ -404,13 +420,13 @@ test("replay with a seal record and unknown worker status observes the sealer, f
   host.setStatus(ref => { throw Error(`Status '${ref}' unavailable`); });
   host.setRespond((request, normal) => {
     if (request.key === "invoke-human-1.l1.t1.a2") throw Error("Controlled fallback transport stop");
-    return normal();
+    return observeGate(host, request, normal);
   });
   const calls = host.calls.length;
   await host.execute();
   expect(host.statusCalls.slice(0, 1)).toEqual(["invoke-human-1.l1.t1.a1.seal"]);
   expect(host.calls.slice(calls).some(call => call.agent === "pitako.checkpoint-sealer" && call.key.startsWith("invoke-human-1.l1.t1.a1.seal"))).toBe(false);
-  expect(host.current().tasks.change1.admitted).toEqual([]);
+  expect(host.history()[0].results.filter((entry: any) => entry.taskId === "change1").map((entry: any) => entry.status)).toEqual([]);
   expect(host.current().lastConfirmed).toBeNull();
   expect(host.current().loop.attempt).toMatchObject({ taskId: "change1", number: 2, restore: expect.anything() });
 });
