@@ -14,14 +14,24 @@ const { safePath } = require("../../extensions/hash-ledger.mjs") as { safePath(f
 export type Command = { id: string; command: string; cwd: string; timeoutMs: number; verifies?: number[] };
 export type Metric = { command: string; unit: string; target: number };
 export type Sample = { value: number | null; best: number | null; fingerprint: string; gatesPassed: number; gatesTotal: number };
-export type Progress = { nonImproving: number; last5: Sample[] };
+export type Progress = { nonImproving: number; last5: Sample[]; stalls?: number };
 export type Task = {
   id: string; goal: string; expectedResult: string; status: "pending" | "done" | "obsolete" | "blocked";
   origin: { kind: "spec" | "director" | "final-phase" | "human"; ref: string };
   specRefs: string[]; dependsOn: string[]; gates: Command[]; metric: Metric | null; parent: string | null;
   remaining: string; progress: Progress;
-  history: { invocation: string; loop: number; event: string; reason: string }[];
+  history: { invocation: string; loop: number; event: string; reason: string; definitionDigest?: string }[];
 };
+export type StallDecision = { taskId: string; metricSeries: Sample[]; diagnoses: string[] };
+function definitionDigest({ goal, expectedResult, gates, metric, dependsOn }: Task) {
+  return canonicalDigest({ goal, expectedResult, gates, metric, dependsOn });
+}
+function stallDecision(backlog: Backlog, invocation: string, loop: number, taskId?: string): StallDecision | null {
+  const task = backlog.tasks.find(t => t.id === taskId);
+  return task && (task.progress.stalls ?? 0) >= 2 &&
+    task.history.some(h => h.event === "stall" && h.invocation === invocation && h.loop === loop) ? { taskId: task.id, metricSeries: task.progress.last5,
+    diagnoses: task.history.filter(h => h.event === "stall").map(h => h.reason) } : null;
+}
 export type Authority = { specDigest: string; amendmentDigests: string[] };
 export type AcceptanceHistory = { invocation: string; loop: number; kind: "init" | "replace" | "human"; reason: string; digest: string };
 export type Backlog = { version: 1; acceptanceHistory: AcceptanceHistory[]; specId: string; authority: Authority;
@@ -72,11 +82,13 @@ export function validateBacklog(value: unknown): asserts value is Backlog {
     assert(typeof task.remaining === "string" && Buffer.byteLength(task.remaining) <= 1024, `Invalid remaining for ${task.id}`);
     const p = task.progress;
     assert(record(p) && Number.isSafeInteger(p.nonImproving) && Number(p.nonImproving) >= 0 && Array.isArray(p.last5) && p.last5.length <= 5, `Invalid progress for ${task.id}`);
+    assert(p.stalls === undefined || Number.isSafeInteger(p.stalls) && Number(p.stalls) >= 0, `Invalid stalls for ${task.id}`);
     for (const s of p.last5) assert(record(s) && (s.value === null || typeof s.value === "number" && Number.isFinite(s.value)) &&
       (s.best === null || typeof s.best === "number" && Number.isFinite(s.best)) && digest(s.fingerprint) &&
       Number.isSafeInteger(s.gatesPassed) && Number(s.gatesPassed) >= 0 && Number.isSafeInteger(s.gatesTotal) && Number(s.gatesTotal) >= Number(s.gatesPassed), `Invalid sample for ${task.id}`);
     assert(Array.isArray(task.history) && task.history.length <= 8, `Invalid history for ${task.id}`);
-    for (const h of task.history) assert(record(h) && text(h.invocation) && Number.isSafeInteger(h.loop) && Number(h.loop) >= 1 && text(h.event) && text(h.reason), `Invalid history entry for ${task.id}`);
+    for (const h of task.history) assert(record(h) && text(h.invocation) && Number.isSafeInteger(h.loop) && Number(h.loop) >= 1 && text(h.event) && text(h.reason) &&
+      (h.definitionDigest === undefined || digest(h.definitionDigest)) && (h.event !== "stall" || digest(h.definitionDigest)), `Invalid history entry for ${task.id}`);
   }
   for (const task of value.tasks as Task[]) {
     for (const entry of task.history.filter(h => ["cancel", "late-cancel"].includes(h.event))) {
@@ -168,11 +180,16 @@ export function apply(input: { root: string; specId: string; expectedDigest: str
   if (current.backlog?.lastApplied?.key === input.key) {
     assert(current.backlog.lastApplied.requestDigest === requestDigest &&
       current.backlog.lastApplied.contentDigest === canonicalDigest({ ...current.backlog, lastApplied: null }), `backlog-conflict: ${current.path} (replay differs)`);
-    return { ...current, completedTasks: completedTasks(current.backlog), cancelledScope: cancelledScope(current.backlog), selected: input.settle || input.recordGaps || input.cancellations ? null : selectTask(current.backlog, input.director.select), replay: true };
+    return { ...current, completedTasks: completedTasks(current.backlog), cancelledScope: cancelledScope(current.backlog), selected: input.settle || input.recordGaps || input.cancellations ? null : selectTask(current.backlog, input.director.select),
+      needsDecision: input.settle ? stallDecision(current.backlog, input.invocation, input.loop, input.progress?.taskId) : null, replay: true };
   }
   assert(current.digest === input.expectedDigest, `backlog-conflict: ${current.path}`);
   const backlog: Backlog = structuredClone(current.backlog ?? { version: 1, specId: input.specId, authority: input.authority, acceptance: [], acceptanceHistory: [], lastApplied: null, tasks: [] });
-  const history = (task: Task, event: string, reason: string) => { task.history = [...task.history, { invocation: input.invocation, loop: input.loop, event, reason }].slice(-8); };
+  for (const task of backlog.tasks) task.progress.stalls ??= 0;
+  const history = (task: Task, event: string, reason: string, digest?: string) => {
+    task.history.push({ invocation: input.invocation, loop: input.loop, event, reason, ...(digest ? { definitionDigest: digest } : {}) });
+    if (task.history.length > 8) task.history.splice(task.history.findIndex(h => h.event !== "stall"), 1);
+  };
   if (input.confirmedUnit) {
     const unit = input.confirmedUnit, task = backlog.tasks.find(t => t.id === unit.taskId);
     assert(unit.kind === "unit" && unit.workerStatus === "complete" && task?.status === "pending" && !unit.receipt.mutated && unit.receipt.gates.length === task.gates.length && task.gates.every(g => unit.receipt.gates.some(r => r.id === g.id && r.status === "pass")), "Done requires workflow-confirmed unit backed by passing focused gates");
@@ -180,7 +197,12 @@ export function apply(input: { root: string; specId: string; expectedDigest: str
   }
   if (input.progress) {
     const task = backlog.tasks.find(t => t.id === input.progress!.taskId); assert(task, "Unknown progress task");
-    task.progress = input.progress.progress; task.remaining = input.progress.remaining;
+    const stalls = task.progress.stalls ?? 0;
+    task.progress = { ...input.progress.progress, stalls }; task.remaining = input.progress.remaining;
+    if (input.settle && !input.confirmedUnit && task.progress.nonImproving >= 3 &&
+      !task.history.some(h => h.event === "stall" && h.invocation === input.invocation && h.loop === input.loop)) {
+      task.progress.stalls = stalls + 1; history(task, "stall", input.director.reason, definitionDigest(task));
+    }
   }
   let selected: Task | null;
   try {
@@ -206,7 +228,7 @@ export function apply(input: { root: string; specId: string; expectedDigest: str
     const add = (task: Task, reason: string, parent: string | null = null) => {
       assert(!backlog.tasks.some(t => t.id === task.id), `Task ID never reused: ${task.id}`);
       assert(task.status === "pending", "New tasks must be pending");
-      const added = structuredClone(task); added.parent = parent ?? task.parent; added.history = []; history(added, "add", reason); backlog.tasks.push(added);
+      const added = structuredClone(task); added.parent = parent ?? task.parent; added.progress = { nonImproving: 0, last5: [], stalls: 0 }; added.history = []; history(added, "add", reason); backlog.tasks.push(added);
     };
     for (const change of input.director.changes) {
       assert(text(change.reason), "Every backlog change needs a reason");
@@ -237,6 +259,17 @@ export function apply(input: { root: string; specId: string; expectedDigest: str
           reason: late ? "cancellation arrived after settlement" : `cancelled by main-session request (origin: ${cancel.origin}; ${cancel.kind})` }));
       }
     }
+    if (!input.settle && !input.recordGaps && !input.cancellations && input.director.select !== null) {
+      const task = backlog.tasks.find(t => t.id === input.director.select);
+      const previous = current.backlog?.tasks.find(t => t.id === task?.id);
+      if (task && previous && previous.progress.nonImproving >= 3 && previous.history.some(h => h.event === "stall")) {
+        const stalled = previous.history.filter(h => h.event === "stall").at(-1)!;
+        assert(input.director.changes.some(c => c.kind === "update" && c.id === task.id) &&
+          definitionDigest(task) !== stalled.definitionDigest && definitionDigest(task) !== definitionDigest(previous),
+          "stalled task re-selected without a changed definition");
+        task.progress = { nonImproving: 0, last5: [], stalls: previous.progress.stalls ?? 0 };
+      }
+    }
     backlog.authority = input.authority; backlog.lastApplied = null;
     backlog.lastApplied = { key: input.key, requestDigest, contentDigest: canonicalDigest(backlog) };
     validateBacklog(backlog);
@@ -248,7 +281,7 @@ export function apply(input: { root: string; specId: string; expectedDigest: str
   }
   const excluded = cancelledScope(backlog);
   const written = writeBacklog(input.root, current, backlog);
-  return { ...written, backlog, completedTasks: completedTasks(backlog), cancelledScope: excluded, selected, replay: false };
+  return { ...written, backlog, completedTasks: completedTasks(backlog), cancelledScope: excluded, selected, needsDecision: input.settle ? stallDecision(backlog, input.invocation, input.loop, input.progress?.taskId) : null, replay: false };
 }
 export type Cancellation = { taskId: string; requestId: string; kind: "cancel" | "delete"; origin: string };
 export function cancelledScope(backlog: Backlog) {
@@ -318,7 +351,7 @@ export function updateProgress(previous: Progress, sample: Omit<Sample, "best">,
   const objective = target ?? 1;
   const improved = !timeout && value !== null && (old === null || Math.abs(value - objective) < Math.abs(old - objective));
   const next: Sample = { ...sample, best: improved ? value : old };
-  return { nonImproving: improved ? 0 : previous.nonImproving + 1, last5: [...previous.last5, next].slice(-5) };
+  return { stalls: previous.stalls ?? 0, nonImproving: improved ? 0 : previous.nonImproving + 1, last5: [...previous.last5, next].slice(-5) };
 }
 
 function clipped(value: string, maxBytes: number): string {

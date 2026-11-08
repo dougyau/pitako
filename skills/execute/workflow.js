@@ -389,7 +389,8 @@ function emitTodoSnapshot() {
     const gatesPassed = receipt ? receipt.gates.filter(gate => gate.status === "pass").length : latest?.gatesPassed ?? 0;
     const gatesTotal = task.gates?.length ?? task.checks.length;
     const metric = task.metric ? `metric ${samples[0]?.value ?? "?"}→${latest?.value ?? "?"}/${task.metric.target} · ` : "";
-    const suffix = `${attempt ? ` (intento ${attempt.number})` : ""} · ${metric}gates ${gatesPassed}/${gatesTotal} · stall ${progress?.nonImproving ?? 0}/3`;
+    const stalls = (loop.task?.progress?.stalls ?? 0) + (loop.settlement?.applied && loop.metricSeries?.nonImproving >= 3 && !retained?.completed ? 1 : 0);
+    const suffix = `${attempt ? ` (intento ${attempt.number})` : ""} · ${metric}gates ${gatesPassed}/${gatesTotal} · stall ${progress?.nonImproving ?? 0}/3 · stalls ${stalls}/2`;
     return { id: task.id, status, subject: `${task.id} ${task.goal}`.slice(0, 2000 - suffix.length) + suffix,
       blockedBy: task.dependsOn.filter(dependency => !invocation.tasks[dependency.taskId]?.completed).map(dependency => dependency.taskId),
       metadata: { cancel: "request" }, ...(retained?.cancel ? { reason: line(retained.cancel.reason) } : {}) };
@@ -968,6 +969,10 @@ function settleTask() {
     invocation.backlogDigest = value.digest; invocation.currentView = null;
     if (result.status === "complete") invocation.lastBacklogUnit = loop.task.id;
     loop.settlement.applied = true;
+    if (value.needsDecision) {
+      loop.halt = { status: "needs-decision", code: "needs-decision", ...clone(value.needsDecision),
+        reason: `Task ${value.needsDecision.taskId} reached two stalls. Metric series: ${JSON.stringify(value.needsDecision.metricSeries)}. Stall diagnoses: ${JSON.stringify(value.needsDecision.diagnoses)}. Human decision required: edit the backlog or deliver an amendment, then relaunch or unblock through the existing routes.` };
+    }
     return save();
   });
 }
@@ -2061,6 +2066,8 @@ function loopReport(status, reason) {
 function action(status, reason) {
   if (status === "budget-exhausted") return { actor: "foreground", operation: "relaunch the same invocation and mission as a new top-level run",
     reason, references: [], started: false };
+  if (loop?.halt?.code === "needs-decision") return { actor: "human",
+    operation: "edit the backlog or deliver an amendment, then relaunch or unblock through the existing routes", reason, references: [], started: false };
   if (loop?.halt?.code === "spawn-budget") return { actor: "human",
     operation: "raise config.maxSubagentSpawnsPerRun or reduce the step's spawn demand", reason, references: [], started: false };
   const required = status !== "complete";
@@ -2366,6 +2373,14 @@ try {
     delete loop.outcome;
     await save();
   }
+  if (loop?.halt?.code === "needs-decision") {
+    if (resolution?.stage !== "accepted" || resolution.loop !== loop.number || !same(resolution.halt, loop.halt))
+      return finish(loop.halt.status, loop.halt.reason);
+    resolution.stage = "applied";
+    delete loop.halt; loop.outcome = "gaps"; loop.endedAt = Date.now();
+    invocation.currentView = null; activePlan = null;
+    await save();
+  }
   if (["capacity", "native-dispatch", "semantic-block", "checkpoint-integrity"].includes(loop?.halt?.code))
     return finish(loop.halt.status, loop.halt.reason);
   // A prior barrier is not a historical universal hold. Recovery re-observes the
@@ -2444,6 +2459,14 @@ CURRENT BACKLOG DIGEST: ${JSON.stringify(invocation.backlogDigest)}
 CURRENT BOARD VIEW: ${JSON.stringify(invocation.currentView)}
 Return exactly {select, changes, reason}: select the single most important pending task whose dependencies are done.
 Changes are keyed add | split | obsolete | update operations, each with a reason; first creation uses only add.
+Three consecutive non-improving attempts stall a task loop; this threshold is unchanged.
+After a stall, re-selection requires a changed definition: the same output must include an update with a reason
+that changes the definition digest over {goal, expectedResult, gates, metric, dependsOn}; remaining does not count.
+Alternatively, split with a reason obsoletes the stalled parent and creates new child IDs with stalls = 0, which may be selected.
+loop-io apply rejects unchanged re-selection as gaps: "stalled task re-selected without a changed definition".
+Each stall increments progress.stalls and records the definition digest and diagnosis in history; todo rows show stalls N/2.
+The second stall of the same task ID halts needs-decision for the human with task ID, metric series and both stall diagnoses.
+The human edits the backlog or delivers an amendment, then relaunches or unblocks through existing routes.
 New tasks follow the supplied backlog task schema. Gates are focused commands, not the complete suite.
 Tasks needing multiple attempts declare a numeric metric {command, unit, target}.
 Never reuse IDs or reopen done/obsolete tasks. Reconcile changed spec/amendment authority with reasons.
@@ -2745,6 +2768,7 @@ Return structured_output after all owned journaled writes settle.`,
       }
       if (loop.cursor < loop.manifest.length) {
         await settleTask();
+        if (loop.halt?.code === "needs-decision") return finish(loop.halt.status, loop.halt.reason);
         invocation.currentView = null;
         loop.outcome = "gaps"; loop.endedAt = Date.now(); await save();
         const rejected = loop.attempt?.result?.rejection;

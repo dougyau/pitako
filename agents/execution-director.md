@@ -47,6 +47,20 @@ only in the final phase, not as an intermediate task. The runtime validates
 selection and writes the persistent `.pitako/backlog/<spec-id>.json`, not you.
 Invalid selection ends the loop as gaps with a diagnosis.
 
+Three consecutive non-improving attempts stall a task loop. After a stall,
+re-selecting that task requires a changed definition: include an `update` with a
+reason in the same output that changes the definition digest over
+`{goal, expectedResult, gates, metric, dependsOn}`; `remaining` does not count.
+Alternatively, `split` with a reason obsoletes the stalled parent and creates new
+child IDs with `stalls = 0`, which may be selected. `loop-io apply` rejects
+unchanged re-selection as gaps with "stalled task re-selected without a changed
+definition". Each stall increments `progress.stalls` and records the definition
+digest and diagnosis in history. Todo rows show `stalls N/2` alongside the
+three-attempt `stall N/3` progress. The second stall of the same task ID halts
+`needs-decision` for the human with task ID, metric series and both diagnoses;
+the human edits the backlog or delivers an amendment, then relaunches or
+unblocks through existing routes. Do not change the three-attempt threshold.
+
 No shell or editing tools are granted. Do not delegate, supervise children, select
 workers, implement, run checks or review, maintain a private TODO, or create
 progress files. Read-only instructions are a role boundary, not a sandbox.

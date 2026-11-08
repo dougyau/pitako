@@ -17,7 +17,7 @@ test("execute todo transitions expose only validated tasks and retain awaited wo
       expect(latest.phases[0].status).toBe("completed");
       expect(latest.tasks.find((task: any) => task.id === latest.active.taskId)).toMatchObject({
         status: "in_progress", metadata: { cancel: "request" }, blockedBy: [],
-        subject: `${latest.active.taskId} Goal ${latest.active.taskId} (intento 1) · gates 0/1 · stall 0/3`,
+        subject: `${latest.active.taskId} Goal ${latest.active.taskId} (intento 1) · gates 0/1 · stall 0/3 · stalls 0/2`,
       });
       expect(latest.active).toMatchObject({ attempt: 1, workflowKey: request.key });
     }
@@ -29,10 +29,10 @@ test("execute todo transitions expose only validated tasks and retain awaited wo
   const admitted = values.find(value => value.tasks.length);
   expect(admitted.phases[0].status).toBe("completed");
   expect(admitted.tasks.map((task: any) => task.subject)).toEqual([
-    "change1 Goal change1 · gates 0/1 · stall 0/3",
+    "change1 Goal change1 · gates 0/1 · stall 0/3 · stalls 0/2",
   ]);
   expect(admitted.tasks[0].blockedBy).toEqual([]);
-  expect(values.some(value => value.tasks.some((task: any) => task.id === "change1" && task.status === "completed" && task.subject.endsWith("gates 1/1 · stall 0/3") && !task.subject.includes("metric")))).toBe(true);
+  expect(values.some(value => value.tasks.some((task: any) => task.id === "change1" && task.status === "completed" && task.subject.endsWith("gates 1/1 · stall 0/3 · stalls 0/2") && !task.subject.includes("metric")))).toBe(true);
   expect(values.some(value => value.phases.some((phase: any) => phase.name === "review" && phase.status === "in_progress"))).toBe(true);
   expect(values.some(value => value.phases.some((phase: any) => phase.name === "compliance" && phase.status === "in_progress"))).toBe(true);
   expect(values.at(-1)).toMatchObject({ outcome: "complete", active: null });
@@ -100,6 +100,6 @@ test("execute todo renders saved metric series, gate receipts and stall through 
   });
   await host.execute();
   const rows = snapshots(host).flatMap(value=>value.tasks);
-  expect(rows.some(task=>task.subject.endsWith("metric 18→8/0 · gates 3/5 · stall 1/3"))).toBe(true);
-  expect(rows.some(task=>task.subject.includes("(intento 2) · metric 18→8/0 · gates 3/5 · stall 1/3"))).toBe(true);
+  expect(rows.some(task=>task.subject.endsWith("metric 18→8/0 · gates 3/5 · stall 1/3 · stalls 0/2"))).toBe(true);
+  expect(rows.some(task=>task.subject.includes("(intento 2) · metric 18→8/0 · gates 3/5 · stall 1/3 · stalls 0/2"))).toBe(true);
 });

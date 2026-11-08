@@ -376,7 +376,21 @@ line as a finite number regardless of exit code; timeout/unparseable output is
 non-improving. Improvement is strictly closer to target than the best so far.
 Without a metric, progress is passing gates/total. Three consecutive
 non-improving attempts end the loop and return the task to the director.
-Todo rows show e.g. `metric 18→8/0 · gates 3/5 · stall 1/3`.
+Each stalled loop increments `progress.stalls` and records its definition digest
+and diagnosis in task history. Re-selection requires a changed definition: the
+same director output must include an `update` with a reason that changes the
+digest over `{goal, expectedResult, gates, metric, dependsOn}`; changing only
+`remaining` does not count. Alternatively, `split` with a reason obsoletes the
+stalled parent and creates new child IDs with `stalls = 0`, which may be selected.
+`loop-io apply` rejects unchanged re-selection as gaps with the diagnosis
+"stalled task re-selected without a changed definition".
+
+The second stall of the same task ID halts the run as `needs-decision` for the
+human, naming the task ID, metric series and both stall diagnoses. The human can
+edit the backlog or deliver an amendment, then relaunch or unblock through the
+existing routes. This does not change the three-attempt stall threshold.
+Todo rows show e.g. `metric 18→8/0 · gates 3/5 · stall 1/3 · stalls 1/2`:
+`stall N/3` counts non-improving attempts; `stalls N/2` counts stalled loops.
 
 ### Board memory
 

@@ -4,9 +4,12 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync, statSync, watch } fro
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { createRequire } from "node:module";
 import { apply, backlogPath, boardView, gate, metricBefore, parseMetric, prepare, readBacklog, runCommand, topicOwner, updateProgress, validateBacklog, type Backlog, type GateInput, type Progress, type Task } from "../skills/execute/loop.ts";
 import { openBoard } from "../extensions/board/store.ts";
 import { repositoryIdentity } from "../extensions/board/workspace.ts";
+
+const { canonicalDigest } = createRequire(import.meta.url)("../extensions/canonical.mjs") as { canonicalDigest(value: unknown): string };
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -413,4 +416,129 @@ test("final-phase findings add new tasks atomically without reopening tombstones
   expect(() => apply({ ...next, key: "another", expectedDigest: written.digest })).toThrow("finished implementation backlog");
   expect(() => apply({ ...initial(root), key: "select-gap", expectedDigest: written.digest,
     director: { select: gap.id, changes: [], reason: "Repair" } })).toThrow("focused gates");
+});
+
+function stalledSettlement(root: string, state: { digest: string | null }, loop = 1, diagnosis = "Three attempts without progress") {
+  return { root, specId: "example", expectedDigest: state.digest, key: `settle${loop}`, invocation: "exec1", loop, authority,
+    settle: true, director: { select: null, changes: [], reason: diagnosis },
+    progress: { taskId: "one", remaining: "Still pending", progress: { nonImproving: 3,
+      last5: [{ value: 8, best: 8, fingerprint: "a".repeat(64), gatesPassed: 0, gatesTotal: 1 }] } } };
+}
+
+test("stall settlement counts loops, persists definition and diagnosis, and replays idempotently", () => {
+  const { root } = fixture(), first = apply(initial(root));
+  // Old persisted backlogs have no counter; the next apply starts it at zero.
+  const legacy = structuredClone(first.backlog!); delete legacy.tasks[0]!.progress.stalls;
+  validateBacklog(legacy); writeFileSync(first.path, JSON.stringify(legacy));
+  const adopted = { ...first, digest: readBacklog(root, "example").digest! };
+  const request = stalledSettlement(root, adopted);
+  const notStalled = apply({ ...request, key: "not-stalled", progress: { ...request.progress, progress: { nonImproving: 2, last5: [] } } });
+  expect(notStalled.backlog!.tasks[0]!.progress.stalls).toBe(0);
+  expect(notStalled.backlog!.tasks[0]!.history.some(h => h.event === "stall")).toBe(false);
+  const settlement = { ...request, expectedDigest: notStalled.digest };
+  const stalled = apply(settlement), stored = readBacklog(root, "example").backlog!.tasks[0]!;
+  const { goal, expectedResult, gates, metric, dependsOn } = stored;
+  expect(stored.progress.stalls).toBe(1); expect(stalled.needsDecision).toBeNull();
+  expect(stored.history.at(-1)).toEqual({ invocation: "exec1", loop: 1, event: "stall", reason: request.director.reason,
+    definitionDigest: canonicalDigest({ goal, expectedResult, gates, metric, dependsOn }) });
+  const before = readFileSync(stalled.path, "utf8");
+  expect(apply(settlement)).toMatchObject({ replay: true, digest: stalled.digest, needsDecision: null });
+  expect(readFileSync(stalled.path, "utf8")).toBe(before);
+  const duplicate = apply({ ...settlement, key: "same-loop", expectedDigest: stalled.digest });
+  expect(duplicate.backlog!.tasks[0]!.progress.stalls).toBe(1);
+  expect(duplicate.backlog!.tasks[0]!.history.filter(h => h.event === "stall")).toHaveLength(1);
+  for (const stalls of [-1, 0.5, "1", null]) {
+    const bad = structuredClone(stalled.backlog!); Object.assign(bad.tasks[0]!.progress, { stalls });
+    expect(() => validateBacklog(bad)).toThrow("Invalid stalls");
+  }
+});
+
+test("stalled selection rejects no-op, remaining-only, unrelated or reasonless updates without writes", () => {
+  const { root } = fixture(), first = apply(initial(root, [task(), task("other")]));
+  const stalled = apply(stalledSettlement(root, first)), before = readFileSync(stalled.path, "utf8");
+  const request = { ...initial(root), expectedDigest: stalled.digest, key: "select", loop: 2 };
+  for (const changes of [[],
+    [{ kind: "update", id: "one", patch: { goal: task().goal }, reason: "Same definition" }],
+    [{ kind: "update", id: "one", patch: { remaining: "Try again", specRefs: ["More context"] }, reason: "More detail" }],
+    [{ kind: "update", id: "other", patch: { goal: "Different task" }, reason: "Not selected task" }],
+    [{ kind: "update", id: "one", patch: { goal: "Changed" }, reason: "Change" },
+      { kind: "update", id: "one", patch: { goal: task().goal }, reason: "Undo" }],
+  ]) {
+    let error: any;
+    try { apply({ ...request, director: { select: "one", changes: changes as never, reason: "Select" } }); }
+    catch (caught) { error = caught; }
+    expect(error?.selectionRejected).toBe(true);
+    expect(error?.message).toBe("stalled task re-selected without a changed definition");
+    expect(readFileSync(stalled.path, "utf8")).toBe(before);
+  }
+  expect(() => apply({ ...request, director: { select: "one", reason: "Select", changes: [
+    { kind: "update", id: "one", patch: { goal: "Changed" }, reason: "" }] } })).toThrow("needs a reason");
+  const other = apply({ ...request, director: { select: "other", changes: [], reason: "Work elsewhere" } });
+  expect(other.selected!.id).toBe("other"); expect(other.selected!.progress.stalls).toBe(0);
+});
+
+test.each(["goal", "expectedResult", "gates", "metric"] as const)("changed stalled %s is selectable and starts a fresh loop without losing stalls", field => {
+  const { root } = fixture(), first = apply(initial(root)), stalled = apply(stalledSettlement(root, first));
+  const patches = { goal: { goal: "Smaller goal" }, expectedResult: { expectedResult: "Refined outcome" },
+    gates: { gates: [{ ...task().gates[0]!, command: "printf refined" }] },
+    metric: { metric: { command: "printf 0", unit: "errors", target: 0 } } };
+  const selected = apply({ ...initial(root), key: "changed", loop: 2, expectedDigest: stalled.digest,
+    director: { select: "one", reason: "Refine stalled work", changes: [
+      { kind: "update", id: "one", patch: patches[field], reason: "New definition based on stall" }] } });
+  expect(selected.selected!.progress).toEqual({ stalls: 1, nonImproving: 0, last5: [] });
+  expect(updateProgress(selected.selected!.progress, { value: null, fingerprint: "a".repeat(64), gatesPassed: 0, gatesTotal: 1 }, null).stalls).toBe(1);
+});
+
+test("splitting stalled work leaves its tombstone and selectable children with fresh counters", () => {
+  const { root } = fixture(), first = apply(initial(root)), stalled = apply(stalledSettlement(root, first));
+  const child = { ...task("child"), progress: { stalls: 1, nonImproving: 3, last5: [] } };
+  const split = apply({ ...initial(root), key: "split", loop: 2, expectedDigest: stalled.digest,
+    director: { select: "child", reason: "Smaller seams", changes: [
+      { kind: "split", id: "one", tasks: [child], reason: "Break up stalled work" }] } });
+  expect(split.backlog!.tasks[0]).toMatchObject({ id: "one", status: "obsolete", progress: { stalls: 1 } });
+  expect(split.selected).toMatchObject({ id: "child", parent: "one", progress: { stalls: 0, nonImproving: 0, last5: [] } });
+});
+
+test("second stall signals needs-decision with task, metric series and both retained diagnoses, including replay", () => {
+  const { root } = fixture(), first = apply(initial(root)), stalled = apply(stalledSettlement(root, first, 1, "First stall diagnosis"));
+  let state = stalled;
+  // Ordinary history remains bounded without evicting the diagnoses needed by the human.
+  for (let i = 0; i < 9; i++) state = apply({ ...initial(root), key: `refine${i}`, loop: 2, expectedDigest: state.digest,
+    director: { select: "one", reason: "Refine", changes: [
+      { kind: "update", id: "one", patch: { goal: `Smaller scope ${i}` }, reason: "Refine definition" }] } });
+  const request = stalledSettlement(root, state, 2, "Second stall diagnosis"), second = apply(request);
+  expect(second.backlog!.tasks[0]!.progress.stalls).toBe(2);
+  expect(second.backlog!.tasks[0]!.history.length).toBeLessThanOrEqual(8);
+  expect(second.needsDecision).toEqual({ taskId: "one", metricSeries: request.progress.progress.last5,
+    diagnoses: ["First stall diagnosis", "Second stall diagnosis"] });
+  expect(apply(request)).toMatchObject({ replay: true, needsDecision: second.needsDecision });
+  expect(readBacklog(root, "example").backlog!.tasks[0]!.progress.stalls).toBe(2);
+});
+
+
+test.each(["unit", "progress"] as const)("%s settlement after resolving two stalls does not halt again, including replay", async outcome => {
+  const f = fixture(), first = apply(initial(f.root));
+  const stalled = apply(stalledSettlement(f.root, first));
+  const refined = apply({ ...initial(f.root), key: "refine", loop: 2, expectedDigest: stalled.digest,
+    director: { select: "one", reason: "Refine stalled work", changes: [
+      { kind: "update", id: "one", patch: { goal: "Smaller scope" }, reason: "First stall diagnosis" }] } });
+  const second = apply(stalledSettlement(f.root, refined, 2, "Second stall diagnosis"));
+  expect(second.backlog!.tasks[0]!.progress.stalls).toBe(2);
+  // Cover a later loop in the same invocation and the same loop number after relaunch.
+  const context = outcome === "unit" ? { invocation: "exec1", loop: 3 } : { invocation: "exec2", loop: 2 };
+  const selected = apply({ ...initial(f.root), ...context, key: "resolved", expectedDigest: second.digest,
+    director: { select: "one", reason: "Human resolution supplied a refined definition", changes: [
+      { kind: "update", id: "one", patch: { goal: "Resolved scope" }, reason: "Apply resolution" }] } });
+  expect(selected.selected!.progress).toEqual({ stalls: 2, nonImproving: 0, last5: [] });
+  const receipt = await gate(attempt(f, { ...context, task: selected.selected! }));
+  const request = { ...stalledSettlement(f.root, selected), ...context, key: "resolved-settle",
+    progress: { taskId: "one", remaining: outcome === "unit" ? "" : "Work remains", progress: receipt.progress },
+    ...(outcome === "unit" ? { confirmedUnit: { taskId: "one", kind: "unit" as const, workerStatus: "complete" as const, receipt } } : {}) };
+  const settled = apply(request);
+  expect(settled.needsDecision).toBeNull();
+  expect(settled.backlog!.tasks[0]).toMatchObject({ status: outcome === "unit" ? "done" : "pending", progress: { stalls: 2 } });
+  expect(settled.backlog!.tasks[0]!.history.filter(h => h.event === "stall")).toHaveLength(2);
+  const before = readFileSync(settled.path, "utf8");
+  expect(apply(request)).toMatchObject({ replay: true, digest: settled.digest, needsDecision: null });
+  expect(readFileSync(settled.path, "utf8")).toBe(before);
 });

@@ -108,6 +108,34 @@ test("three non-improving gate attempts end the task loop", async () => {
   expect(host.history()[0]!.results.at(-1)!.diagnosis).toContain("Three consecutive non-improving");
 });
 
+test("a retained native barrier with an admitted result does not block task settlement", async () => {
+  const host = taskFixture();
+  let attempts = 0;
+  host.setRespond((request, normal) => {
+    const result = normal();
+    if (isGate(request)) {
+      const receipt = JSON.parse(result.output!);
+      receipt.gates[0].status = "fail"; receipt.gates[0].exit = 1;
+      receipt.progress.nonImproving = ++attempts; receipt.stalled = attempts >= 3;
+      result.output = JSON.stringify(receipt);
+    }
+    return result;
+  });
+  host.setFailSave(value => value.loop?.settlement?.applied);
+  await host.execute();
+  const retained = copy(host.current());
+  expect(retained.loop.attempt.result).toBeDefined();
+  retained.loop.halt = { status: "blocked", code: "native-barrier", cause: "capacity",
+    reason: "Previously observed native barrier" };
+  host.storage.set("invoke-human-1", retained);
+  host.setFailSave(undefined);
+  const output = await host.execute();
+  expect(output.status).toBe("partial");
+  expect(host.history()[0]!.outcome).toBe("gaps");
+  expect(readBacklog(host.root, "spec").backlog!.tasks[0]!.progress.stalls).toBe(1);
+  expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(3);
+});
+
 test("the sealer cannot admit a candidate changed after gates", async () => {
   const host = taskFixture(); let changed = false;
   host.setRespond((request, normal) => {
@@ -242,23 +270,69 @@ test.each(["conflict", "schema", "decisions"])("backlog %s halts without a write
   expect(host.calls.some(call => call.agent === "pitako.worker")).toBe(false);
 });
 
-test("a stalled task is returned to a fresh director with durable progress", async () => {
-  const host = fixture(); host.setLimit(2); let attempts = 0;
+test.each(["unchanged", "changed", "second-stall"])("stalled task selection: %s", async mode => {
+  const host = fixture(); host.setLimit(mode === "changed" ? 2 : 3);
+  const attempts = new Map<string, number>();
   host.setRespond((request, normal) => {
-    if (isGate(request) && request.key.includes(".l1.")) {
-      const { result, receipt } = gateReceipt(normal);
+    const result = normal();
+    if (request.agent === "pitako.execution-director" && request.key.endsWith(".l2.director") && mode !== "unchanged")
+      result.structuredOutput.changes.push({ kind: "update", id: "change1",
+        patch: { goal: "Narrowed task definition" }, reason: "Address the first stall by narrowing the goal" });
+    if (isGate(request) && (request.key.includes(".l1.") || mode === "second-stall")) {
+      const receipt = JSON.parse(result.output!);
+      const loop = request.key.match(/\.l\d+\./)![0];
+      const count = (attempts.get(loop) ?? 0) + 1; attempts.set(loop, count);
       receipt.gates[0].status = "fail"; receipt.gates[0].exit = 1;
-      receipt.progress.nonImproving = ++attempts; receipt.stalled = attempts >= 3;
-      return { ...result, output: JSON.stringify(receipt) };
+      receipt.progress.nonImproving = count; receipt.stalled = count >= 3;
+      result.output = JSON.stringify(receipt);
     }
-    return normal();
+    return result;
   });
-  expect((await host.execute()).status).toBe("partial");
+  const output = await host.execute();
+  const task = readBacklog(host.root, "spec").backlog!.tasks[0]!;
   expect(host.calls.find(call => call.key.endsWith(".l2.director"))!.task).toContain("Three consecutive non-improving");
-  expect(host.snapshots.some(state => state.loop?.settlement?.receipt && state.loop?.metricSeries?.nonImproving === 3)).toBe(true);
-  expect(host.calls.filter(call => call.agent === "pitako.worker").map(call => call.key)).toEqual([
-    "invoke-human-1.l1.t1.a1", "invoke-human-1.l1.t1.a2", "invoke-human-1.l1.t1.a3", "invoke-human-1.l2.t1.a1"]);
-  expect(readBacklog(host.root, "spec").backlog!.tasks[0]!.status).toBe("done");
+  expect(host.snapshots.some(state => state.loop?.settlement?.applied && state.loop?.metricSeries?.nonImproving === 3)).toBe(true);
+  if (mode === "unchanged") {
+    expect(output.status).toBe("partial");
+    expect(host.history()[1]).toMatchObject({ outcome: "gaps", plan: { stage: "rejected",
+      rejection: { diagnostic: "stalled task re-selected without a changed definition" } } });
+    expect(host.calls.find(call => call.key.endsWith(".l3.director"))!.task).toContain("stalled task re-selected without a changed definition");
+    expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(3);
+    expect(task.progress.stalls).toBe(1);
+  } else if (mode === "changed") {
+    expect(output.status).toBe("partial");
+    expect(host.calls.filter(call => call.agent === "pitako.worker").map(call => call.key)).toEqual([
+      "invoke-human-1.l1.t1.a1", "invoke-human-1.l1.t1.a2", "invoke-human-1.l1.t1.a3", "invoke-human-1.l2.t1.a1"]);
+    expect(task).toMatchObject({ goal: "Narrowed task definition", status: "done", progress: { stalls: 1 } });
+    expect(host.emits.some(value => value.schema === "pitako.execute-todo" && value.tasks.some((row: any) => row.subject.includes("stalls 1/2")))).toBe(true);
+  } else {
+    expect(output.status).toBe("needs-decision");
+    expect(output.action.actor).toBe("human");
+    const diagnoses = task.history.filter(entry => entry.event === "stall").map(entry => entry.reason);
+    expect(diagnoses).toHaveLength(2);
+    expect(output.loopReport.halt).toMatchObject({ code: "needs-decision", taskId: task.id,
+      metricSeries: task.progress.last5, diagnoses });
+    expect(output.reason).toContain(task.id);
+    expect(output.reason).toContain(JSON.stringify(task.progress.last5));
+    expect(output.reason).toContain(JSON.stringify(diagnoses));
+    expect(task.progress.stalls).toBe(2);
+    expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(6);
+    expect(host.calls.filter(call => call.agent === "pitako.execution-director")).toHaveLength(2);
+    expect(host.calls.some(call => call.key.includes(".review."))).toBe(false);
+    const count = host.calls.length;
+    expect((await host.execute()).status).toBe("needs-decision");
+    expect(host.calls.slice(count).some(call => ["pitako.worker", "pitako.execution-director"].includes(call.agent!))).toBe(false);
+    expect(readBacklog(host.root, "spec").backlog!.tasks[0]!.progress.stalls).toBe(2);
+    expect(host.emits.some(value => value.schema === "pitako.execute-todo" && value.tasks.some((row: any) => row.subject.includes("stalls 2/2")))).toBe(true);
+    // The human can retire the task and use the existing explicit unblock route.
+    const human = readBacklog(host.root, "spec");
+    human.backlog!.tasks[0]!.status = "obsolete"; human.backlog!.lastApplied = null;
+    writeFileSync(human.path, JSON.stringify(human.backlog));
+    host.setRespond(undefined);
+    expect((await host.execute({ unblock: true, resolution: { loop: 2, text: "Retired the task in the backlog after reviewing both stalls" } })).status).toBe("complete");
+    expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(6);
+    expect(host.current().consumedLoops).toBe(3);
+  }
 });
 
 
