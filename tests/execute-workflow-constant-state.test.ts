@@ -1,18 +1,23 @@
 import { expect, test } from "bun:test";
 import { executeControllerFixture, copy, gaps, source } from "./fixtures/execute-workflow.ts";
+import { readBacklog } from "../skills/execute/loop.ts";
 import { digest } from "../extensions/spec-plans.ts";
 import { MISSION_STATE_MAX_BYTES } from "../node_modules/pi-subagents/src/missions/workflow-state.js";
 import { RunFanoutLimitError } from "../node_modules/pi-subagents/src/runs/shared/run-fanout-budget.js";
 
 const { fixture } = executeControllerFixture();
 
-test("30 loops of eight tasks retain constant state across pauses, recoveries and --unblock", async () => {
-  const host = fixture(undefined, { taskCount: 7, controlledCheckpoints: true, controlledPublisher: true, retainSnapshots: false }); host.setLimit(30);
+test("30 single-task loops retain constant state across pauses, recoveries and --unblock", async () => {
+  const host = fixture(undefined, { taskCount: 30, controlledCheckpoints: true, controlledPublisher: true, retainSnapshots: false }); host.setLimit(30);
   const candidate = host.observedCandidate(), sizes: { loop: number; bytes: number }[] = [];
   const admittedSeals = new Set<string>();
   let peak: any, peakBytes = 0;
   host.setSaveObserver((value, bytes) => {
     expect(value).not.toHaveProperty("loops");
+    if (value.loop?.kind === "task") {
+      expect(value.loop.selection?.receipt).not.toHaveProperty("completedTasks");
+      if (value.loop.settlement?.receipt) expect(value.loop.settlement.receipt).not.toHaveProperty("completedTasks");
+    }
     sizes.push({ loop: value.consumedLoops, bytes });
     if (bytes > peakBytes) { peakBytes = bytes; peak = copy(value); }
     if (!value.sealPending && value.lastConfirmed)
@@ -22,7 +27,7 @@ test("30 loops of eight tasks retain constant state across pauses, recoveries an
   let budgetCut = false;
   host.setRespond((request, normal) => {
     const number = Number(request.key.match(/\.l(\d+)\./)![1]);
-    if (!budgetCut && number === 15 && request.key.endsWith(".t2.a1")) {
+    if (!budgetCut && number === 15 && request.key.endsWith(".t1.a2")) {
       budgetCut = true;
       const error = new RunFanoutLimitError({ code: "RUN_FANOUT_LIMIT", path: `workflow[${request.key}]`,
         used: 64, limit: 64, requested: 1, remaining: 0 }).message;
@@ -34,7 +39,7 @@ test("30 loops of eight tasks retain constant state across pauses, recoveries an
         binding: "absent", comparison: "only-original", provenance: ["/native/plan"] });
     if (request.agent === "pitako.worker" && request.key.endsWith(".t1.a1"))
       return host.result(request, { ...host.worker(request, "pause"), status: "blocked",
-        remaining: ["Finish pending unit"], continuation: "Resume admitted pause" });
+        remaining: ["Finish pending unit"] });
     if (request.agent === "pitako.checkpoint-sealer" && request.key.endsWith(".t1.a2.seal")) {
       const descriptor = host.current().loop.attempt;
       const observation = descriptor.restore.observations[0], pause = descriptor.restore.authority.confirmedPause;
@@ -70,7 +75,7 @@ test("30 loops of eight tasks retain constant state across pauses, recoveries an
   expect(records.filter((record: any) => record.kind === "loop").map((record: any) => record.loop))
     .toEqual(Array.from({ length: 30 }, (_, index) => index + 1));
   const units = records.filter((record: any) => record.kind === "unit");
-  expect(units).toHaveLength(30 * 8); // one pause plus seven completed implementations per loop
+  expect(units).toHaveLength(30 * 2); // one pause plus one gated unit per loop
   expect(new Set(units.map((record: any) => `${record.loop}:${record.body.checkpoint.digest}`))).toEqual(admittedSeals);
   const maximum = (from: number, to: number) => Math.max(...sizes
     .filter(value => value.loop >= from && value.loop <= to).map(value => value.bytes));
@@ -79,7 +84,7 @@ test("30 loops of eight tasks retain constant state across pauses, recoveries an
   const breakdown = (value: any) => Object.fromEntries(Object.entries(value).map(([name, item]) =>
     [name, Buffer.byteLength(JSON.stringify({ [name]: item }, null, 2))]).sort((a, b) => Number(b[1]) - Number(a[1])));
   console.log("peak breakdown", JSON.stringify({ top: breakdown(peak), loop: breakdown(peak.loop),
-    tasks: breakdown(peak.tasks), task: breakdown(peak.tasks.change1) }));
+    tasks: breakdown(peak.tasks), task: breakdown(Object.values(peak.tasks)[0]) }));
   expect(late).toBeLessThanOrEqual(early + margin);
   // Preserve half the native envelope for real reports, paths and one long open loop.
   expect(peakBytes).toBeLessThan(MISSION_STATE_MAX_BYTES / 2);
@@ -116,19 +121,21 @@ test.each([1, 2])("closed dispositions never enter operation consumers, includin
 });
 
 test.each([
-  ["an intermediate acceptance gate", (tasks: any[]) => { tasks[0].checks[0].tier = "acceptance"; },
-    "acceptance-tier checks belong only to the LAST verification task; earlier tasks need focused checks: change1"],
-  ["a final task without acceptance", (tasks: any[]) => { tasks.at(-1).checks[0].tier = "focused"; },
-    "LAST verification task needs at least one acceptance-tier check"],
-  ["a missing tier", (tasks: any[]) => { delete tasks[0].checks[0].tier; }, "loop_plan needs full ordered task scopes"],
+  ["an unknown selection", (selection: any) => { selection.select = "missing"; }, "Selected task must be pending"],
+  ["an unfinished dependency", (selection: any) => {
+    const task = copy(selection.changes[0].task); task.id = "prerequisite";
+    selection.changes.push({ kind: "add", task, reason: "Required prerequisite" });
+    selection.changes[0].task.dependsOn = [task.id];
+  }, "Selected task has unfinished dependencies"],
+  ["premature final selection", (selection: any) => { selection.select = null; }, "Invalid final selection: unfinished tasks remain"],
 ] as const)("the root rejects %s before any worker runs", async (_name, mutate, rejection) => {
-  const host = fixture(undefined, { readOnly: true }); host.setLimit(2);
+  const host = fixture(); host.setLimit(2);
   host.setRespond((request, normal) => {
     const result = normal();
-    if (request.key === "invoke-human-1.l1.director") mutate(result.structuredOutput.tasks);
+    if (request.key === "invoke-human-1.l1.director") mutate(result.structuredOutput);
     return result;
   });
-  expect((await host.execute()).status).toBe("complete");
+  expect((await host.execute()).status).toBe("partial");
   expect(host.calls.some(call => call.key.startsWith("invoke-human-1.l1.t"))).toBe(false);
   expect(host.calls.find(call => call.key === "invoke-human-1.l2.director")!.task).toContain(rejection);
 });
@@ -137,52 +144,55 @@ test("a gaps publisher delivers its verified rejection summary to the very next 
   const host = fixture(undefined, { readOnly: true }); host.setLimit(2);
   host.setRespond((request, normal) => {
     const result = normal();
-    if (request.key === "invoke-human-1.l1.director") result.structuredOutput.tasks = [];
+    if (request.key === "invoke-human-1.l1.director") result.structuredOutput.select = "missing";
     return result;
   });
   const output = await host.execute();
-  expect(output.status).toBe("complete");
+  expect(output.status).toBe("partial");
   const next = host.calls.find(call => call.key === "invoke-human-1.l2.director")!;
-  expect(next.task).toContain("loop_plan needs full ordered task scopes");
+  expect(next.task).toContain("Selected task must be pending");
   expect(next.task).toContain(JSON.stringify(host.current().loopSummaries[0]));
   expect(next.task).toContain('"ledgerPath":');
-  const consumers = host.calls.filter(call => call.key === "invoke-human-1.l2.review.director-prepare" ||
-    call.key === "invoke-human-1.l2.compliance");
-  expect(consumers).toHaveLength(2);
-  for (const call of consumers) {
-    expect(call.task).toContain(JSON.stringify(host.current().loopSummaries[0]));
-    expect(call.task).toContain('"ledgerPath":');
-    expect(call.task).toContain("ledger.mjs");
-  }
+  const worker = host.calls.find(call => call.agent === "pitako.worker")!;
+  expect(worker.task).toContain(JSON.stringify(host.current().loopSummaries[0]));
+  expect(worker.task).toContain('"ledgerPath":');
+  expect(worker.task).toContain("ledger.mjs");
+  expect(host.calls.some(call => call.key.includes(".review.") || call.key.endsWith(".compliance"))).toBe(false);
   expect(output.loopReport.history).toEqual({ summaries: host.current().loopSummaries,
     ledgerPath: `${host.root}/.pi/subagents/execute/human-1`, head: host.current().ledger.head });
   expect(host.current()).not.toHaveProperty("loops");
 });
 
-test.each([4, 5])("plan rejection ring remembers three loops, not all history (repeat at %s)", async repeat => {
-  const host = fixture(undefined, { readOnly: true }); host.setLimit(6);
+test.each([4, 5])("selection rejection ring remembers three loops, not all history (repeat at %s)", async repeat => {
+  const host = fixture(undefined, { taskCount: 6 }); host.setLimit(6);
   host.setRespond((request, normal) => {
     const number = Number(request.key.match(/\.l(\d+)\./)![1]), result = normal();
     if (request.agent === "pitako.execution-director" && [1, repeat].includes(number))
-      result.structuredOutput.tasks = [];
-    return request.key.endsWith(".compliance") && number < repeat ? gaps(result) : result;
+      result.structuredOutput.select = "missing";
+    return result;
   });
-  const output = await host.execute();
-  expect(output.status, output.reason).toBe(repeat === 4 ? "blocked" : "complete");
-  expect(host.calls.some(call => call.key === "invoke-human-1.l6.director")).toBe(repeat === 5);
+  expect((await host.execute()).status).toBe("partial");
+  expect(host.current().planRejections.map((item: any) => item.loop)).toEqual([4, 5, 6]);
+  expect(host.current().planRejections.filter((item: any) => item.diagnostic)).toEqual([
+    { loop: repeat, diagnostic: "Selected task must be pending" },
+  ]);
 });
 
 test.each([4, 5])("native closing references ring rejects only last three loops (reuse at %s)", async repeat => {
-  const host = fixture(undefined, { readOnly: true }); host.setLimit(repeat);
+  const host = fixture(undefined, { taskCount: 0 }); host.setLimit(repeat);
   let original: any;
   host.setRespond((request, normal) => {
     const number = Number(request.key.match(/\.l(\d+)\./)![1]), result = normal();
+    if (request.agent === "pitako.execution-director") Object.assign(result.structuredOutput, { select: null,
+      changes: (readBacklog(host.root, "spec").backlog?.tasks ?? []).filter(task => task.status === "pending")
+        .map(task => ({ kind: "obsolete", id: task.id, reason: "Controlled duplicate finding; exercise final closing identity" })) });
     if (request.agent === "pitako.checkout-observer") {
       if (number === 1) original = copy(result);
       if (number === repeat) Object.assign(result, { runId: original.runId, asyncDir: original.asyncDir,
         externalAdapter: original.externalAdapter });
     }
-    return request.key.endsWith(".compliance") ? gaps(result) : result;
+    if (request.key.endsWith(".compliance")) return gaps(result);
+    return result;
   });
   const output = await host.execute();
   expect(output.status, output.reason).toBe(repeat === 4 ? "blocked" : "partial");
@@ -191,16 +201,27 @@ test.each([4, 5])("native closing references ring rejects only last three loops 
 });
 
 test("unblock selects invocation, last closed, then open resolutions; older closed requests are unavailable", async () => {
-  const host = fixture(undefined, { readOnly: true }); host.setLimit(2);
+  const host = fixture(undefined, { controlledCheckpoints: true }); host.setLimit(1);
   host.setRespond((request, normal) => {
     const result = normal();
-    if (request.agent === "pitako.execution-director")
-      Object.assign(result.structuredOutput, { status: "needs-decision", tasks: [] });
+    if (request.agent === "pitako.worker" && request.key.endsWith(".t1.a1"))
+      Object.assign(result.structuredOutput, { status: "blocked", remaining: ["Standing task ruling needed"] });
+    if (request.agent === "pitako.checkpoint-sealer" && request.key.endsWith(".t1.a2.seal")) {
+      const descriptor = host.current().loop.attempt;
+      const observation = descriptor.restore.observations[0], pause = descriptor.restore.authority.confirmedPause;
+      const observed = JSON.parse(result.output!);
+      observed.restored = { checkpointRef: observation.manifest, digest: digest(descriptor.key),
+        partialRef: observation.manifest.replace(/manifest\.json$/, "restore.json"),
+        restoredRef: observation.manifest.replace(/manifest\.json$/, "restored.json"),
+        position: { loop: 1, cursor: 0, phase: "implementation" }, candidate: host.observedCandidate(),
+        confirmedPause: { checkpointRef: pause.checkpointRef, digest: pause.digest } };
+      result.output = JSON.stringify(observed);
+    }
     return result;
   });
   expect((await host.execute()).status).toBe("blocked");
   const input = { unblock: true, resolution: { loop: 1, text: "Continue after answering the question." } };
-  expect((await host.execute(input)).status).toBe("blocked");
+  expect((await host.execute(input)).status).toBe("partial");
   const state = host.current(), disposition = copy(state.lastClosedResolution);
   expect(disposition).toMatchObject({ ...input.resolution, stage: "applied" });
   expect(Object.keys(disposition).sort()).toEqual(["loop", "request", "stage", "text"]);
@@ -218,7 +239,13 @@ test("unblock selects invocation, last closed, then open resolutions; older clos
 });
 
 test.each([false, true])("closing rebuilds identical bytes after a save cut; source mutation=%s", async mutate => {
-  const host = fixture(undefined, { readOnly: true });
+  const host = fixture(undefined, { taskCount: 0 });
+  host.setLimit(1);
+  host.setRespond((request, normal) => {
+    const result = normal();
+    if (request.agent === "pitako.execution-director") Object.assign(result.structuredOutput, { select: null, changes: [] });
+    return result;
+  });
   host.setFailSave(value => !!value.loop?.closing);
   expect((await host.execute()).reason).toContain("Essential persistence failed");
   const request = host.calls.find(call => call.agent === "pitako.checkout-observer")!;
@@ -228,7 +255,8 @@ test.each([false, true])("closing rebuilds identical bytes after a save cut; sou
   if (mutate) host.current().loop.compliance.reason = "Changed during closing";
   else {
     delete host.current().loop.observation.validated;
-    host.setStatus(() => ({ ...published, output: "Controlled receipt loss; republish frozen body" }));
+    host.setStatus(ref => ref === published.runId || ref === request.key
+      ? { ...published, output: "Controlled receipt loss; republish frozen body" } : copy(host.native.get(ref)!));
   }
   const output = await host.execute();
   if (mutate) {

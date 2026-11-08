@@ -5,7 +5,7 @@ import { MISSION_STATE_MAX_BYTES } from "../node_modules/pi-subagents/src/missio
 const { fixture } = executeControllerFixture();
 
 test.each(["compliance", "review"])("%s gaps reaches a fresh read-only reviewer before the next director", async source => {
-  const host = fixture(undefined, { findings: source === "review" });
+  const host = fixture(undefined, { taskCount: 0, findings: source === "review" });
   host.setRespond((request, normal) => {
     if (source === "compliance" && request.key === "invoke-human-1.l1.compliance") return gaps(normal());
     if (source === "review" && request.key === "invoke-human-1.l1.review.director-synthesis") {
@@ -34,18 +34,18 @@ test.each(["compliance", "review"])("%s gaps reaches a fresh read-only reviewer 
   const keys = host.calls.map(call => call.key);
   expect(keys.filter(key => key.endsWith(".demand-observation"))).toEqual(["invoke-human-1.l2.demand-observation"]);
   expect(keys.indexOf("invoke-human-1.l2.demand-observation")).toBeLessThan(keys.indexOf("invoke-human-1.l2.director"));
-  const worker = host.calls.find(call => call.key === "invoke-human-1.l1.t1.a1")!;
+  const worker = host.calls.find(call => call.key === "invoke-human-1.l2.t1.a1")!;
   expect(worker.agent).toBe("pitako.worker");
   expect(worker.skill).toContain("scope-discipline");
-  expect(worker.task).toContain("Use native tool output capture; do not add tee, redirection or another shell wrapper solely for logging.");
-  expect(worker.task).toContain("Sufficient captured output belongs in output; logPaths may be [] when no additional log file is needed.");
+  expect(worker.task).toContain("The workflow runs the metric and gates");
+  expect(worker.task).not.toContain("FROZEN ATTEMPT");
 });
 
 test.each(["first-loop", "rejected-plan"])("%s alone dispatches no observation", async mode => {
   const host = fixture();
   host.setRespond((request, normal) => {
     const result = normal();
-    if (mode === "rejected-plan" && request.key === "invoke-human-1.l1.director") result.structuredOutput.tasks = [];
+    if (mode === "rejected-plan" && request.key === "invoke-human-1.l1.director") result.structuredOutput.select = "missing";
     return result;
   });
   expect((await host.execute()).status).toBe("complete");
@@ -57,8 +57,8 @@ test.each(["rejected-report", "unusable-failure", "candidate-change"])("%s gaps 
   host.setRespond((request, normal) => {
     if (request.key === "invoke-human-1.l1.t1.a1") {
       const result = normal();
-      if (mode === "rejected-report") result.structuredOutput.checks[0].command += " --altered";
-      if (mode === "unusable-failure") return { ...result, ok: false, structuredOutput: undefined };
+      if (mode === "rejected-report") result.structuredOutput.status = "invalid";
+      if (mode === "unusable-failure") delete result.structuredOutput.work;
       return result;
     }
     if (mode === "candidate-change" && request.key === "invoke-human-1.l1.checkout") host.changeCheckout();
@@ -72,7 +72,7 @@ test.each(["rejected-report", "unusable-failure", "candidate-change"])("%s gaps 
 });
 
 test.each(["stopped", "permission", "technical"])("demand observation preserves native %s route without director dispatch", async mode => {
-  const host = fixture();
+  const host = fixture(undefined, { taskCount: 0 });
   host.setRespond((request, normal) => {
     if (request.key === "invoke-human-1.l1.compliance") return gaps(normal());
     if (request.key.endsWith(".demand-observation")) {
@@ -93,11 +93,11 @@ test.each(["gaps", "continue"])("unfinished worker %s with no remaining entries 
   host.setRespond((request, normal) => {
     if (request.agent === "pitako.worker" && request.key.startsWith("invoke-human-1.l1.t1.")) return host.result(request, {
       ...host.worker(request), status, remaining: [],
-      diagnosis: "Required parser branch is still missing", usefulProgress: status === "continue",
+      work: "Required parser branch is still missing",
       continuation: status === "continue" ? "Implement the missing parser branch" : null,
     });
     if (request.key.endsWith(".demand-observation")) {
-      expect(request.task).toContain("Required parser branch is still missing");
+      expect(request.task).toContain("Three consecutive non-improving attempts");
     }
     return normal();
   });
@@ -121,11 +121,11 @@ test("an intermediate continuation completed in the same loop creates no demand 
   expect(host.calls.filter(call => call.agent === "pitako.worker" && call.key.startsWith("invoke-human-1.l1.t1.")).map(call => call.key))
     .toEqual(["invoke-human-1.l1.t1.a1", "invoke-human-1.l1.t1.a2"]);
   expect(host.calls.some(call => call.key.endsWith(".demand-observation"))).toBe(false);
-  expect(host.history()).toHaveLength(1);
+  expect(host.history()).toHaveLength(2);
 });
 
 test.each(["observation-receipt", "director-intention"])("%s cut recovers the existing producer without another observation", async cut => {
-  const host = fixture(), target = "invoke-human-1.l2.demand-observation";
+  const host = fixture(undefined, { taskCount: 0 }), target = "invoke-human-1.l2.demand-observation";
   host.setRespond((request, normal) => {
     if (request.key === "invoke-human-1.l1.compliance") return gaps(normal());
     if (request.key === "invoke-human-1.l2.director") expect(request.task).toContain('"memo":"Advisory only"');
@@ -152,7 +152,7 @@ test.each(["observation-receipt", "director-intention"])("%s cut recovers the ex
 });
 
 const synthesis = (number: number) => `native-invoke-human-1.l${number}.review.director-synthesis`;
-// Every loop's review screening reports material gaps, so each next loop observes demands.
+// Final loops report material gaps; the intervening task loops repair them.
 function materialReviewGaps(host: ControllerHost, acceptance?: any) {
   host.setRespond((request, normal) => {
     const result = normal();
@@ -167,7 +167,7 @@ function materialReviewGaps(host: ControllerHost, acceptance?: any) {
 }
 
 test("closed demand sources persist once while observations keep every retained original", async () => {
-  const host = fixture(undefined, { findings: true, angles: 3, readOnly: true, controlledCheckpoints: true }); host.setLimit(7);
+  const host = fixture(undefined, { taskCount: 0, findings: true, angles: 3, controlledCheckpoints: true }); host.setLimit(9);
   // Realistic review witnesses: each child reference carries a sizeable native acceptance record.
   materialReviewGaps(host, { status: "not-required", evidenceStatus: "not-required", explicit: false, criteria: [],
     inferredReason: ["x".repeat(2000)], runtimeChecks: [], verifyRuns: [] });
@@ -176,13 +176,13 @@ test("closed demand sources persist once while observations keep every retained 
   const output = await host.execute();
   expect(output.status, output.reason).toBe("partial");
   const observations = host.calls.filter(call => call.key.endsWith(".demand-observation"));
-  expect(observations.map(call => call.key)).toEqual([2, 3, 4, 5, 6, 7].map(number => `invoke-human-1.l${number}.demand-observation`));
+  expect(observations.map(call => call.key)).toEqual([2, 4, 6, 8].map(number => `invoke-human-1.l${number}.demand-observation`));
   for (const call of observations) {
     const number = Number(call.key.match(/\.l(\d+)\./)![1]);
     const [fresh, previous] = call.task.split("NEW CAUSAL SOURCES (exact original references): ")[1]!.split("\nPREVIOUS OBSERVATIONS AND ORIGINALS: ");
     expect(fresh).toContain(synthesis(number - 1));
     // The three-entry history still delivers each earlier observation with its exact causal originals.
-    for (let earlier = Math.max(2, number - 3); earlier < number; earlier++) {
+    for (const earlier of [2, 4, 6, 8].filter(earlier => earlier < number && earlier >= number - 6)) {
       expect(previous).toContain(`native-invoke-human-1.l${earlier}.demand-observation`);
       expect(previous).toContain(synthesis(earlier - 1));
     }
@@ -190,7 +190,7 @@ test("closed demand sources persist once while observations keep every retained 
   for (const save of saves) for (let closed = 1; closed < save.loop; closed++)
     expect(save.value.split(`"${synthesis(closed)}"`).length - 1, `loop ${save.loop} copies of loop ${closed}`).toBeLessThanOrEqual(1);
   const maximum = (from: number, to: number) => Math.max(...saves.filter(save => save.loop >= from && save.loop <= to).map(save => save.bytes));
-  expect(maximum(6, 7)).toBeLessThanOrEqual(maximum(4, 5) + 4096);
-  // Half the native envelope stays free for real reports, paths and one long open loop.
-  expect(maximum(1, 7)).toBeLessThan(MISSION_STATE_MAX_BYTES / 2);
+  expect(maximum(8, 9)).toBeLessThanOrEqual(maximum(6, 7) + 4096);
+  // Full v6 task definitions and the bounded demand ring fit the native envelope.
+  expect(maximum(1, 9)).toBeLessThan(MISSION_STATE_MAX_BYTES);
 });

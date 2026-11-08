@@ -1,4 +1,6 @@
 import { expect, test } from "bun:test";
+import { writeFileSync } from "node:fs";
+import { readBacklog } from "../skills/execute/loop.ts";
 import { executeControllerFixture, cutAt, copy, type ControllerHost } from "./fixtures/execute-workflow.ts";
 
 const { fixture } = executeControllerFixture();
@@ -16,9 +18,9 @@ test.each(["cancel", "delete"])("execute observes %s before dispatch, persists a
     if (call.agent === "pitako.request-observer") return page(call, [request(kind)]);
     const result = normal();
     if (call.agent === "pitako.execution-director") {
-      const tasks = result.structuredOutput.tasks;
-      tasks[1].dependsOn = [{ taskId: "change1", reason: "Requires implementation" }];
-      tasks[2].dependsOn = [{ taskId: "change2", reason: "Requires integration" }];
+      const tasks = result.structuredOutput.changes.map((change: any) => change.task);
+      tasks[1].dependsOn = ["change1"];
+      tasks[2].dependsOn = ["change2"];
     }
     if (call.agent === "pitako.worker") {
       expect(host.current().tasks.change1.cancel.origin).toBe("model");
@@ -32,17 +34,18 @@ test.each(["cancel", "delete"])("execute observes %s before dispatch, persists a
   });
   const result = await host.executeNative();
   expect(result.status, result.reason).toBe("partial");
-  expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(1);
-  expect(host.current().tasks.change2.cancel.cascadeFrom).toBe("change1");
-  expect(host.current().tasks.change3.cancel.cascadeFrom).toBe("change2");
-  expect(host.current().loop.compliance.status).toBe("gaps");
+  expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(0);
+  expect(result.cancelledScope.find((task: any) => task.id === "change2").cancel.cascadeFrom).toBe("change1");
+  expect(result.cancelledScope.find((task: any) => task.id === "change3").cancel.cascadeFrom).toBe("change2");
+  expect(readBacklog(host.root, "spec").backlog!.tasks.map(task => task.status)).toEqual(["obsolete", "pending", "pending"]);
+  expect(host.current().loop.compliance).toBeUndefined();
   expect(result.cancelledScope).toHaveLength(3);
   expect(result.cancelledScope[0].cancel).toMatchObject({ kind, origin: "model", requestId: "request-change1" });
   expect(rows(host).some(row => row.id === "change1" && row.status === "cancelled")).toBe(true);
   expect(host.records().some((record: any) => record.kind === "loop" && record.body.cancelledScope?.length === 3)).toBe(true);
 });
 
-test.each(["complete", "continue", "gaps"])("execute lets a running attempt settle %s but never dispatches another attempt", async status => {
+test.each(["complete", "continue", "gaps", "blocked"])("execute lets a running attempt settle %s but never dispatches another attempt", async status => {
   const host = fixture(undefined, { readOnly: true }); host.setLimit(1);
   let cancel = false, workerFinished = false, started!: () => void, settle!: () => void;
   const running = new Promise<void>(resolve => { started = resolve; });
@@ -67,16 +70,19 @@ test.each(["complete", "continue", "gaps"])("execute lets a running attempt sett
   expect(host.calls).toHaveLength(before); // No interruption or observer while the attempt is live.
   settle();
   const result = await execution;
-  expect(result.status, result.reason).toBe(status === "complete" ? "complete" : "partial");
+  expect(result.status, result.reason).toBe(status === "blocked" ? "blocked" : "partial");
   expect(host.calls.filter(call => call.agent === "pitako.worker" && call.key.includes(".t1."))).toHaveLength(1);
   expect(host.current().tasks.change1.cancel.origin).toBe("model");
   const final = rows(host).filter(row => row.id === "change1").at(-1);
+  expect(readBacklog(host.root, "spec").backlog!.tasks[0]!.status).toBe(status === "complete" ? "done" : "obsolete");
+  if (status === "complete") expect(result.cancelledScope[0].cancel.reason).toBe("cancellation arrived after settlement");
   expect(final.status).toBe(status === "complete" ? "completed" : "cancelled");
   if (status === "complete") expect(rows(host).filter(row => row.id === "change1").some(row => row.status === "cancelled")).toBe(false);
 });
 
 test("execute drains observation pages and replayed records do not replace the original cancellation", async () => {
   const host = fixture(undefined, { readOnly: true }); host.setLimit(1);
+  host.setLimit(2);
   const original = request(); let observed = 0;
   host.setRespond((call, normal) => {
     if (call.agent === "pitako.request-observer") {
@@ -88,10 +94,14 @@ test("execute drains observation pages and replayed records do not replace the o
     return normal();
   });
   expect((await host.execute()).status).toBe("partial");
-  expect(observed).toBeGreaterThan(2);
-  expect(host.current().tasks.change1.cancel).toEqual({ requestId: original.requestId, origin: "model", kind: "cancel",
+  expect(observed).toBe(2); // Both pages; final acceptance is no longer a worker task.
+  const before = readBacklog(host.root, "spec").digest;
+  await host.execute();
+  expect(readBacklog(host.root, "spec").digest).toBe(before);
+  expect(host.current().excludedScope.change1.cancel).toMatchObject({ requestId: original.requestId, origin: "model", kind: "cancel",
     reason: "cancelled by main-session request (origin: model; cancel)" });
   expect(Object.keys(host.current().excludedScope)).toEqual(["change1"]);
+  expect(readBacklog(host.root, "spec").backlog!.tasks[0]!.status).toBe("obsolete");
 });
 
 test("execute cancellation persistence failure prevents action and emission", async () => {
@@ -113,9 +123,9 @@ test("execute carries excluded cancelled scope to later directors and cannot cla
     const result = normal();
     if (call.key === "invoke-human-1.l2.director") {
       expect(call.task).toContain("EXCLUDED SCOPE (not human intent");
-      expect(call.task).toContain('"scope":["src/change1.ts"]');
+      expect(call.task).toContain('"id":"change1"');
       expect(call.task).toContain("cancelled by main-session request (origin: model; delete)");
-      result.structuredOutput.tasks = result.structuredOutput.tasks.filter((task: any) => task.id !== "change1");
+      expect(result.structuredOutput.select).toBeNull();
     }
     return result;
   });
@@ -180,14 +190,14 @@ test("execute observes a new request immediately before a useful retry", async (
 
 
 test.each(["cancel", "delete"])("execute observes %s before admitting a recovered successful attempt and cancels dependents", async kind => {
-  for (const recovery of ["status", "inspector"]) {
+  for (const recovery of ["status", "received"]) {
     const host = fixture(undefined, { readOnly: true, taskCount: 2 }); host.setLimit(1);
-    let pending = false;
+    let pending = false, armed = false;
     host.setRespond((call, normal) => {
-      if (call.agent === "pitako.request-observer") return page(call, pending ? [request(kind)] : []);
+      if (call.agent === "pitako.request-observer") return page(call, pending && armed ? [request(kind)] : []);
       const result = normal();
       if (call.agent === "pitako.execution-director")
-        result.structuredOutput.tasks[1].dependsOn = [{ taskId: "change1", reason: "Requires implementation" }];
+        result.structuredOutput.changes[1].task.dependsOn = ["change1"];
       if (call.agent === "pitako.worker" && call.key.endsWith(".t1.a1")) pending = true;
       if (call.phase === "recovery" && call.task.includes("EXCEPTIONAL READ-ONLY attempt-result")) {
         const worker = host.native.get("invoke-human-1.l1.t1.a1")!;
@@ -201,26 +211,88 @@ test.each(["cancel", "delete"])("execute observes %s before admitting a recovere
       return result;
     });
     // Lose the controller after the worker has settled but before its result is admitted.
-    cutAt(host, value => !!value.loop?.attempt?.launch);
+    cutAt(host, value => value.loop?.attempt?.gate?.stage === "intention");
     expect((await host.execute()).status).toBe("partial"); host.setFailSave();
     expect(pending).toBe(true);
     expect(host.current().tasks.change1.completed).toBeFalsy();
     expect(host.current().tasks.change1.cancel).toBeUndefined();
-    host.setStatus(ref => recovery === "inspector" && ref.includes(".t1.a1")
-      ? { ok: false, results: [], output: "Worker result needs recovery" }
+    armed = true;
+    host.setStatus(ref => recovery === "received" && ref.includes(".t1.a1")
+      ? { ok: false, results: [], output: "Native inventory unavailable; use durably received settled result" }
       : copy(host.native.get(ref)!));
     const result = await host.executeNative();
     expect(host.current().tasks.change1.completed).toBeTruthy();
     expect(host.calls.filter(call => call.agent === "pitako.worker" && call.key.includes(".t1."))).toHaveLength(1);
     expect(host.calls.some(call => call.agent === "pitako.worker" && call.key.includes(".t2."))).toBe(false);
     expect(result.status, result.reason).toBe("partial");
-    expect(host.current().tasks.change2.cancel).toMatchObject({ cascadeFrom: "change1", origin: "model", kind,
+    expect(result.cancelledScope.find((task: any) => task.id === "change2").cancel).toMatchObject({ cascadeFrom: "change1", origin: "model", kind,
       requestId: "request-change1", reason: "cancelled by main-session request (origin: model; dependency: change1)" });
-    expect(host.current().excludedScope.change2.cancel).toEqual(host.current().tasks.change2.cancel);
-    expect(host.current().loop.compliance.status).toBe("gaps");
-    expect(host.current().loop.compliance.reason).toContain("cancelled by main-session request (origin: model; dependency: change1)");
+    expect(host.current().excludedScope.change2.cancel).toEqual(result.cancelledScope.find((task: any) => task.id === "change2").cancel);
+    expect(host.current().loop.compliance).toBeUndefined();
+    expect(readBacklog(host.root, "spec").backlog!.tasks.map(task => task.status)).toEqual(["done", "pending"]);
+    expect(result.cancelledScope.find((task: any) => task.id === "change1").cancel.reason).toBe("cancellation arrived after settlement");
     expect(result.cancelledScope.find((task: any) => task.id === "change2").cancel.cascadeFrom).toBe("change1");
     expect(rows(host).filter(row => row.id === "change1").at(-1).status).toBe("completed");
-    expect(rows(host).filter(row => row.id === "change2").at(-1).status).toBe("cancelled");
+    expect(result.cancelledScope.find((task: any) => task.id === "change2").completed).toBe(false);
   }
+});
+
+
+test.each(["intention", "receipt", "projection"])("cancellation %s persistence cut replays the same durable request", async cut => {
+  const host = fixture(); host.setLimit(1);
+  host.setRespond((call, normal) => call.agent === "pitako.request-observer" ? page(call, [request()]) : normal());
+  cutAt(host, value => cut === "intention" ? !!value.loop?.cancellationInput && !value.loop?.cancellation
+    : cut === "receipt" ? value.loop?.cancellation?.stage === "receipt"
+    : !!value.excludedScope?.change1 && !value.pendingCancellations?.length);
+  const first = await host.executeNative();
+  expect(first.status).not.toBe("complete");
+  expect(first.reason).toContain("Essential persistence failed");
+  const before = readBacklog(host.root, "spec");
+  host.setFailSave();
+  const output = await host.executeNative();
+  expect(output.status, output.reason).toBe("partial");
+  const after = readBacklog(host.root, "spec");
+  expect(after.backlog!.tasks[0]!.status).toBe("obsolete");
+  expect(after.backlog!.tasks[0]!.history.filter(entry => entry.event === "cancel")).toHaveLength(1);
+  if (before.backlog!.tasks[0]!.status === "obsolete") expect(after.digest).toBe(before.digest);
+  expect(output.cancelledScope[0].cancel.requestId).toBe("request-change1");
+  expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(0);
+});
+
+test("cancellation CAS preserves a concurrent human backlog edit", async () => {
+  const host = fixture(); host.setLimit(1);
+  let human = "";
+  host.setRespond((call, normal) => {
+    if (call.agent === "pitako.request-observer") return page(call, [request()]);
+    if (call.agent === "pitako.loop-io" && JSON.parse(call.task).cancellations) {
+      const state = readBacklog(host.root, "spec");
+      state.backlog!.tasks[0]!.goal = "Human edited goal";
+      human = JSON.stringify(state.backlog); writeFileSync(state.path, human);
+    }
+    return normal();
+  });
+  const output = await host.executeNative();
+  expect(output.status).toBe("blocked");
+  expect(output.reason).toContain("backlog-conflict");
+  expect(readBacklog(host.root, "spec").backlog!.tasks[0]!.status).toBe("pending");
+  expect(readBacklog(host.root, "spec").backlog!.tasks[0]!.goal).toBe("Human edited goal");
+  expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(0);
+});
+
+
+test("a later director can reshape a derived excluded dependent without reopening the cancelled task", async () => {
+  const host = fixture(undefined, { taskCount: 2 }); host.setLimit(3);
+  host.setRespond((call, normal) => {
+    if (call.agent === "pitako.request-observer") return page(call, [request()]);
+    const result = normal();
+    if (call.key === "invoke-human-1.l1.director") result.structuredOutput.changes[1].task.dependsOn = ["change1"];
+    if (call.key === "invoke-human-1.l2.director") result.structuredOutput.changes.push({ kind: "update", id: "change2",
+      patch: { dependsOn: [] }, reason: "Code inspection establishes this task no longer needs the cancelled implementation" });
+    return result;
+  });
+  const output = await host.executeNative();
+  expect(output.status, output.reason).toBe("partial");
+  expect(readBacklog(host.root, "spec").backlog!.tasks.slice(0, 2).map(task => task.status)).toEqual(["obsolete", "done"]);
+  expect(output.cancelledScope.map((task: any) => task.id)).toEqual(["change1"]);
+  expect(host.calls.filter(call => call.agent === "pitako.worker").map(call => call.key)).toEqual(["invoke-human-1.l2.t1.a1"]);
 });

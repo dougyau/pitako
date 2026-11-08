@@ -94,7 +94,7 @@ try {
     removeRegistrationListener = pi.events.on(RUNTIME_AGENT_REGISTER_EVENT, raw => {
       const request = raw as RuntimeAgentRegistrationRequest;
       assert.equal(request.version, 1);
-      const script = { "pitako.checkout-observer": ["skills/execute/observe.mjs"], "pitako.execution-ledger": ["skills/execute/ledger.mjs"],
+      const script = { "pitako.loop-io": ["skills/execute/loop-io.mjs"], "pitako.checkout-observer": ["skills/execute/observe.mjs"], "pitako.execution-ledger": ["skills/execute/ledger.mjs"],
         "pitako.architecture-ledger": ["skills/architecture/ledger.mjs"],
         "pitako.request-observer": ["skills/execute/observe.mjs", "--requests"], "pitako.checkpoint-sealer": ["skills/execute/checkpoint.mjs", "--seal-stdin"],
         "pitako.access-verifier": ["extensions/access-receipts.mjs", "--verify-stdin"] }[request.name];
@@ -136,7 +136,7 @@ try {
       process.send({ ready: true });
       assert.equal(await Bun.stdin.text(), "run");
     }
-    assert.deepEqual([...registered].sort(), mode === "foreground" ? ["pitako.access-verifier", "pitako.architecture-ledger", "pitako.checkout-observer", "pitako.checkpoint-sealer", "pitako.execution-ledger", "pitako.request-observer"] : []);
+    assert.deepEqual([...registered].sort(), mode === "foreground" ? ["pitako.access-verifier", "pitako.architecture-ledger", "pitako.checkout-observer", "pitako.checkpoint-sealer", "pitako.execution-ledger", "pitako.loop-io", "pitako.request-observer"] : []);
     await session.extensionRunner!.emit({ type: "agent_start" });
     assert.deepEqual(captured.toolDiagnostic()?.missing ?? [], []);
     if (mode === "foreground") {
@@ -149,10 +149,23 @@ try {
         const direct = await call(name, args);
         assert.equal(direct.isError, true);
         assert.match(text(direct), new RegExp(`Pitako analysis forbids ${name}`));
-        const nested = await call("codemode", { code: `await tools.${name}(${JSON.stringify(args)});` });
-        assert.equal(nested.isError, true);
-        assert.match(text(nested), new RegExp(`Pitako analysis forbids ${name}`));
       }
+      // One native sandbox exercises every deferred denial without repeating its startup.
+      const nested = await call("codemode", { code: `
+        const rejected = [];
+        ${mutators.map(name => `
+          try { await tools.${name}(${name === "file_sha256_save"
+            ? '{items:[{path:"source"}],outputFile:"forbidden"}' : "{}"}); }
+          catch (error) {
+            if (!String(error).includes("Pitako analysis forbids ${name}")) throw error;
+            rejected.push(${JSON.stringify(name)});
+          }
+        `).join("\n")}
+        if (rejected.length !== ${mutators.length}) throw new Error("mutator accepted: " + JSON.stringify(rejected));
+        return { rejected: rejected.length };
+      ` });
+      assert.equal(nested.isError, false, text(nested));
+      assert.match(text(nested), new RegExp(`"rejected":${mutators.length}`));
       assert.equal(sideEffects, 0);
       assert.equal((await call("ast_search", {})).isError, false);
       assert.equal((await call("codemode", { code: "await tools.ast_search({});" })).isError, false);

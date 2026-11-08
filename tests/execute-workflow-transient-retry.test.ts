@@ -22,9 +22,9 @@ test.each([false, true])("transient save retries identical bytes without duplica
   expect(output.status, output.reason).toBe("complete");
   expect(attempts).toHaveLength(2);
   expect(attempts[1]).toEqual(attempts[0]);
-  expect(host.current().consumedLoops).toBe(1);
+  expect(host.current().consumedLoops).toBe(2);
   expect(host.calls.filter(call => call.agent === "pitako.worker").map(call =>
-    JSON.parse(call.task!.split("FROZEN ATTEMPT:\n")[1]!.split("\n")[0]!).taskId)).toEqual(["change1", "final"]);
+    JSON.parse(call.task!.split("COMPLETE SELECTED TASK:\n")[1]!.split("\nTASK CONTINUATION")[0]!).id)).toEqual(["change1"]);
   expect(new Set(host.calls.map(call => call.key)).size).toBe(host.calls.length);
 });
 
@@ -49,10 +49,10 @@ test.each(["seal", "gaps", "observation", "closing"].flatMap(phase => [
   "Invalid mission state file '/state.json': Unexpected end of JSON input",
   "state.set('invoke-human-1') value must contain only JSON data",
 ].map(message => ({ phase, message }))))("deterministic $phase save failure cannot trigger outer retries: $message", async ({ phase, message }) => {
-  const host = fixture(undefined, { readOnly: phase !== "seal" }); host.setLimit(1);
+  const host = fixture(undefined, { readOnly: phase !== "seal" }); host.setLimit(["observation", "closing"].includes(phase) ? 2 : 1);
   if (phase === "gaps") host.setRespond((request, normal) => {
     const result = normal();
-    if (request.agent === "pitako.execution-director") result.structuredOutput.tasks = [];
+    if (request.agent === "pitako.execution-director") result.structuredOutput.select = "missing";
     return result;
   });
   let attempts = 0, calls = 0;

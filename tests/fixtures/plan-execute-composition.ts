@@ -8,6 +8,31 @@ import type { WorkflowScriptChildResult } from "../../node_modules/pi-subagents/
 import registerPlanExecute, { executionResource } from "../../extensions/plan-execute.ts";
 import { preliminarySpec, SPEC_SECTIONS } from "../../extensions/spec-plans.ts";
 
+// Controller tests control external dispatch; native wiring cases retain the real SDK runner.
+export async function controlledWorkflow(options: any) {
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+  const emits: any[] = [];
+  const runs = {
+    all: (requests: any[]) => Promise.all(requests.map(async ({ key, ...request }) => {
+      try { return await options.launch(key, request); }
+      catch (error) { const text = error instanceof Error ? error.message : String(error); return { key, ok: false, output: text, error: text, artifactPaths: [] }; }
+    })),
+    status: (ref: string) => options.status(ref),
+    host: async (key: string, request: any) => {
+      const result = await options.host(key, request);
+      if (!result.ok) {
+        const detail = [result.error, result.stderr.trim() || result.stdout.trim()].filter(Boolean).join(" ").replace(/\s+/g, " ").trim().slice(0, 200);
+        throw Error("Host command '" + key + "' failed: " + (detail || result.error || "exit code " + (result.exitCode ?? "unknown")));
+      }
+      return result;
+    },
+  };
+  const value = await new AsyncFunction("runs", "state", "emit", options.script)(runs,
+    { get: async (key: string) => options.state.get(key), set: async (key: string, value: unknown) => options.state.set(key, value) },
+    (value: unknown) => { emits.push(value); options.onEmit?.(emits); });
+  return { value, emits };
+}
+
 // Shared by tests/plan-execute-composition-*.test.ts. Mutable state lives in the
 // per-file factories below: each test file owns its roots, disposers, settlements
 // and native Node process, even when Bun loads several files in one process.
@@ -52,10 +77,10 @@ export function resourceWithAgentDir(agentDir: string) {
 }
 
 // Absolute script paths survive stringified childResponse use in subprocesses with another cwd.
-export const deterministicScripts = { verifier: path.resolve("extensions/access-receipts.mjs"), sealer: path.resolve("skills/execute/checkpoint.mjs") };
+export const deterministicScripts = { verifier: path.resolve("extensions/access-receipts.mjs"), sealer: path.resolve("skills/execute/checkpoint.mjs"), loopIO: path.resolve("skills/execute/loop-io.mjs"), loopModule: path.resolve("skills/execute/loop.ts") };
 // Controlled child boundary: actual root/review scripts execute in the native sandbox.
 // Responses implement schemas only; no provider or model obedience is certified.
-export function childResponse(key: string, request: any, metadata: any, checkout: any, completeLoop = 1, suppliedValue?: any) {
+export function childResponse(key: string, request: any, metadata: any, checkout: any, completeLoop = 1, suppliedValue?: any): any {
   const loop = Number(key.match(/\.l(\d+)\./)?.[1] ?? 1);
   if (request.agent === "pitako.request-observer") return { key, ok: true, agent: request.agent,
     runId: `native-${key}`, artifactPaths: [], output: JSON.stringify({ version: 1, ok: true,
@@ -71,10 +96,54 @@ export function childResponse(key: string, request: any, metadata: any, checkout
     return { key, ok: true, agent: request.agent, runId: `native-${key}`, output, results: [{ index: 0, agent: request.agent!, task: request.task, exitCode: 0,
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } }] } as WorkflowScriptChildResult;
   }
+  if (request.agent === "pitako.loop-io") {
+    const input = JSON.parse(request.task);
+    // Reuse actual persistence/Board operations without a Node/TypeScript startup per call.
+    if (input.operation !== "gate" && metadata.loopOperations) return (async () => {
+      try {
+        const { operation, ...params } = input;
+        params.dbPath = metadata.boardPath ?? metadata.root + "/.pi/board.db";
+        const value = await metadata.loopOperations[operation](params);
+        if (operation === "apply") {
+          const prepared = await metadata.loopOperations.prepare({ root: params.root, specId: params.specId,
+            previousConfirmedUnit: null, taskId: value.selected?.id, invocation: params.invocation, loop: params.loop, dbPath: params.dbPath });
+          if (prepared.digest !== value.digest) throw Error("backlog-conflict: " + prepared.path);
+          value.view = prepared.view;
+        }
+        const { backlog, ...receipt } = value;
+        if (backlog) receipt.acceptance = backlog.acceptance;
+        return { key, ok: true, agent: request.agent, runId: `native-${key}`,
+          output: JSON.stringify(receipt), results: [{ exitCode: 0 }] };
+      } catch (error: any) {
+        return { key, ok: false, agent: request.agent, runId: `native-${key}`, results: [{ exitCode: 1 }],
+          output: JSON.stringify({ error: "loop-io", reason: error.message, selectionRejected: error.selectionRejected === true }) };
+      }
+    })();
+    if (input.operation !== "gate") {
+      const command = require("node:child_process").spawnSync("node", [metadata.loopIO ?? require("node:path").resolve("skills/execute/loop-io.mjs")], {
+        cwd: metadata.root, input: JSON.stringify({ ...input, dbPath: metadata.boardPath ?? metadata.root + "/.pi/board.db" }), encoding: "utf8",
+      });
+      return { key, ok: command.status === 0, agent: request.agent, runId: `native-${key}`,
+        output: command.stdout, results: [{ exitCode: command.status }] } as WorkflowScriptChildResult;
+    }
+    // Controlled command boundary; loop module tests own gate command execution.
+    const gates = input.workerStatus === "complete" || !input.task.metric ? input.task.gates.map((gate: any) => ({
+      id: gate.id, status: "pass", exit: 0, ms: 1, tail: "Controlled gate passed", logRef: `/native/gates/${key}/${gate.id}.log`,
+    })) : [];
+    const sample = { value: input.task.metric?.target ?? null, best: input.task.metric?.target ?? null,
+      fingerprint: checkout.fingerprint, gatesPassed: gates.length, gatesTotal: input.task.gates.length };
+    return { key, ok: true, agent: request.agent, runId: `native-${key}`,
+      output: JSON.stringify({ before: checkout, after: checkout, mutated: false, gates,
+        metric: input.task.metric ? { value: input.task.metric.target, error: null } : null,
+        progress: { nonImproving: 0, last5: [...input.task.progress.last5, sample].slice(-5) }, stalled: false,
+        view: { topicId: 1, authority: "spec and frozen amendments > DECISION > FINDING > HANDOFF; code wins over any map", posts: [], omitted: 0 } }),
+      results: [{ exitCode: 0 }] } as WorkflowScriptChildResult;
+  }
   if (request.agent === "pitako.checkpoint-sealer") {
     const input = JSON.parse(request.task);
     const manifest = metadata.root + "/.pi/subagents/checkpoints/" + input.intent.key + "/manifest.json";
-    const output = require("node:fs").existsSync(manifest) || input.restoreSources ?
+    const output = metadata.sealCheckpointRequest ? JSON.stringify(metadata.sealCheckpointRequest(input))
+      : require("node:fs").existsSync(manifest) || input.restoreSources ?
       require("node:child_process").execFileSync("node", [metadata.sealer ?? require("node:path").resolve("skills/execute/checkpoint.mjs"), "--seal-stdin"], {
         cwd: metadata.root, input: request.task, encoding: "utf8",
       }) : JSON.stringify({ v: 1, kind: input.kind, outcome: "observed", candidate: checkout });
@@ -102,15 +171,23 @@ export function childResponse(key: string, request: any, metadata: any, checkout
       handoff: { mode: "fresh" }, supervisor: { mode: "unsupported", reason: "Fixed one-shot observer" },
       nonResumableReason: "Fixed one-shot observer", outputArtifacts: { stdoutPath: `/native/async/${key}/stdout.log`, stderrPath: `/native/async/${key}/stderr.log` } } } satisfies WorkflowScriptChildResult;
   let value: any;
-  const task = { id: "final", kind: "verification", goal: "Verify complete candidate", contextRefs: ["full spec"],
-    sourceRefs: [metadata.selected.source], scope: [metadata.root], allowedEffects: ["checks"], expectedResult: "Current required checks", dependsOn: [],
-    checks: [{ id: "final-check", requirement: "All specs", command: "bun test affected", cwd: metadata.root, tier: "acceptance" }] };
   if (suppliedValue) value = suppliedValue;
-  else if (key.endsWith(".director")) value = { status: "plan", reason: "Complete ordered work", sharedContext: { material: "Full shared context", references: [metadata.selected.source] }, tasks: [task] };
-  else if (request.agent === "pitako.worker") value = { status: "complete", workDone: "Required checks executed",
-    remaining: [], diagnosis: "No pending task work", usefulProgress: true, continuation: null,
-    git: { wip: "Current WIP included" },
-    checks: task.checks.map(({ requirement: _requirement, tier: _tier, ...check }) => ({ ...check, output: "Controlled check passed", logPaths: ["/native/check.log"], result: "passed", before: checkout, after: checkout })) };
+  else if (key.endsWith(".director")) {
+    const file = metadata.root + "/.pitako/backlog/assignment.json";
+    const backlog = require("node:fs").existsSync(file) ? JSON.parse(require("node:fs").readFileSync(file, "utf8")) : null;
+    const initial = { id: "change", goal: "Implement scoped behavior", expectedResult: "Required behavior implemented",
+      status: "pending", origin: { kind: "spec", ref: metadata.selected.source }, specRefs: [metadata.selected.source], dependsOn: [],
+      gates: [{ id: "focused", command: "true", cwd: metadata.root, timeoutMs: 1800000 }], metric: null,
+      parent: null, remaining: "", progress: { nonImproving: 0, last5: [] }, history: [] };
+    const pending = backlog?.tasks.filter((task: any) => task.status === "pending") ?? (metadata.withTask ? [initial] : []);
+    value = { select: pending[0]?.id ?? null,
+      changes: !backlog && metadata.withTask ? [{ kind: "add", task: initial, reason: "Implement the spec" }] : pending.filter((task: any) => !task.gates.length).map((task: any) => ({ kind: "update", id: task.id,
+        patch: { gates: [{ id: "repair", command: "true", cwd: metadata.root, timeoutMs: 1800000 }] }, reason: "Assign focused repair gate" })),
+      reason: "Most important pending task, otherwise final verification",
+      ...(!backlog ? { acceptance: [{ id: "final-check", command: "true", cwd: metadata.root }] } : {}) };
+  }
+  else if (request.agent === "pitako.worker") value = { status: "complete", work: "Scoped behavior implemented",
+    remaining: [], knowledge: { findings: [], handoff: "Current scoped source implements the required behavior." } };
   else if (key.endsWith(".demand-observation")) value = { memo: "Inherited demands remain advisory",
     evidenceLimits: ["Controlled source evidence only"], observations: [] };
   else if (key.endsWith("director-prepare")) value = { status: "ready", reason: "Whole result perspectives", angles: [
@@ -235,7 +312,7 @@ export function compositionFixture() {
 }
 export type CompositionFixture = ReturnType<typeof compositionFixture>;
 
-// One file-owned Node process amortizes native SDK/provider loading. Each message
+// One file-owned process runs controlled boundaries; one case retains native SDK loading. Each message
 // still creates fresh storage, roots and launch-bound tool registrations. Cases
 // are awaited by the file's normal test order; other files remain parallel.
 export function nativeCheckpointFixture({ workflowSettlements, checkpointCancellations }: CompositionFixture) {
@@ -245,12 +322,13 @@ export function nativeCheckpointFixture({ workflowSettlements, checkpointCancell
   let nativeCheckpointReply: ((value: [number, string, string] | undefined) => void) | undefined;
   const nativeCheckpointExits: { promise: Promise<[number, string, string]>; cancelled: boolean }[] = [];
   // Settlement-only harness cases pass `sdk: false`: process, IPC and stream
-  // ownership do not depend on the SDK, which otherwise loads once before ready.
-  async function startNativeCheckpoint({ sdk = true } = {}) {
+  // ownership do not depend on the workflow or extension loading boundaries.
+  async function startNativeCheckpoint({ sdk = true, native = false } = {}) {
+    if (nativeCheckpoint) throw Error("Checkpoint fixture already running");
     nativeCheckpointRoot ??= mkdtempSync(path.join(tmpdir(), "pitako-checkpoint-node-"));
     let ready!: () => void;
     const started = new Promise<void>(resolve => { ready = resolve; });
-    const child = spawn("node", ["-e", `
+    const child = spawn(native ? "node" : process.execPath, ["-e", `
       const disconnect=()=>{if(process.connected)process.disconnect();};
       process.on('SIGTERM',()=>{process.exitCode ||= 143;disconnect();});
       const send=value=>{
@@ -260,9 +338,22 @@ export function nativeCheckpointFixture({ workflowSettlements, checkpointCancell
       };
       let loaded;
       const sdk=()=>loaded??=(async()=>{
-        const {runWorkflowScript}=await import(${JSON.stringify(new URL("../../node_modules/pi-subagents/src/workflows/scripted-workflow.js", import.meta.url).href)});
-        const loadExtensions=(await import(${JSON.stringify(new URL("../../node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/loader.js", import.meta.url).href)})).loadExtensionsCached;
-        await loadExtensions([${JSON.stringify(path.resolve("extensions/checkpoint-create.ts"))}],process.cwd());
+        let runWorkflowScript, loadExtensions;
+        if(${native}) {
+          const {runWorkflowScript:nativeRun}=await import(${JSON.stringify(new URL("../../node_modules/pi-subagents/src/workflows/scripted-workflow.js", import.meta.url).href)});
+          const nativeLoad=(await import(${JSON.stringify(new URL("../../node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/loader.js", import.meta.url).href)})).loadExtensionsCached;
+          await nativeLoad([${JSON.stringify(path.resolve("extensions/checkpoint-create.ts"))}],process.cwd());
+          runWorkflowScript = nativeRun;
+          loadExtensions = nativeLoad;
+        } else {
+          // Same controlled AsyncFunction boundary as execute-workflow.ts.
+          runWorkflowScript = ${controlledWorkflow.toString()};
+          loadExtensions = async paths => {
+            const tools = new Map();
+            for(const file of paths) (await import(file)).default({registerTool(tool){tools.set(tool.name,{definition:tool});}});
+            return {errors:[],extensions:[{tools}]};
+          };
+        }
         return {runWorkflowScript,loadExtensions};
       })();
       (async()=>{
@@ -270,9 +361,11 @@ export function nativeCheckpointFixture({ workflowSettlements, checkpointCancell
         process.on('message',async ({input,harness})=>{
           const prior=process.env.PI_CODING_AGENT_DIR, cwd=process.cwd();
           try {
-            if(input.metadata){input.metadata.sealer=${JSON.stringify(path.resolve("skills/execute/checkpoint.mjs"))};input.metadata.verifier=${JSON.stringify(path.resolve("extensions/access-receipts.mjs"))};}
+            if(input.metadata){input.metadata.sealer=${JSON.stringify(path.resolve("skills/execute/checkpoint.mjs"))};input.metadata.loopIO=${JSON.stringify(path.resolve("skills/execute/loop-io.mjs"))};input.metadata.verifier=${JSON.stringify(path.resolve("extensions/access-receipts.mjs"))};}
             process.chdir(input.root);process.env.PI_CODING_AGENT_DIR=input.agentDir;
             const {runWorkflowScript,loadExtensions}=input.sdk===false?{}:await sdk();
+            if(input.metadata?.inlineSealer && input.sdk!==false)input.metadata.sealCheckpointRequest=(await import(input.module??input.checkpointModule)).sealCheckpointRequest;
+            if(input.metadata?.inlineLoopIO && input.sdk!==false){if(${native})await import(${JSON.stringify(new URL("../../skills/execute/loader.mjs", import.meta.url).href)});input.metadata.loopOperations=await import(${JSON.stringify(new URL("../../skills/execute/loop.ts", import.meta.url).href)});}
             const value=await (0,eval)('('+harness+')')(input,runWorkflowScript,${childResponse.toString()},
               input.sdk===false?{}:{...require('node:fs'),...require('node:child_process'),...await import(input.module??input.checkpointModule),...await import(input.evidence??input.evidenceModule),loadExtensions,hash:data=>require('node:crypto').createHash('sha256').update(data).digest('hex')},${registeredCheckpoint.toString()});
             send({value});
@@ -308,9 +401,22 @@ export function nativeCheckpointFixture({ workflowSettlements, checkpointCancell
       ready();
       resolve([exit, output, errors]);
     }));
-    nativeCheckpointExits.push({ promise: nativeCheckpointExit, cancelled: false });
-    await started;
-    if (!nativeCheckpointExits.at(-1)!.cancelled) expect(nativeCheckpoint, errors).toBeDefined();
+    const operation = { promise: nativeCheckpointExit, cancelled: false };
+    nativeCheckpointExits.push(operation);
+    const cancel = () => {
+      operation.cancelled = true;
+      if (child.exitCode === null && child.signalCode === null) child.kill();
+    };
+    const ownsStartup = checkpointCancellations.size === 0;
+    if (ownsStartup) checkpointCancellations.add(cancel);
+    const startup = (async () => {
+      try {
+        await started;
+        if (!operation.cancelled) expect(nativeCheckpoint, errors).toBeDefined();
+      } finally { if (ownsStartup) checkpointCancellations.delete(cancel); }
+    })();
+    workflowSettlements.push(startup.then(() => {}, () => {}));
+    await startup;
   }
   afterAll(async () => {
     if (nativeCheckpoint?.connected) nativeCheckpoint.disconnect();

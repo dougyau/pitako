@@ -95,9 +95,9 @@ test("native checkpoint fixture close without a reply is not a successful case",
 });
 
 describe("plan/execute packaged composition", () => {
-  // SDK/Node loader preparation is file-owned setup, not checkpoint-case work.
+  // Controlled process preparation is file-owned, not checkpoint-case work.
   beforeAll(async () => { if (!native.nativeCheckpoint) await startNativeCheckpoint(); });
-  for (const mode of ["unit-before-capture", "unit-before-capture-reentry", "unit-before-capture-conflict", "unit-before-capture-corrupt", "unit-before-capture-newer-corrupt", "unit-before-capture-missing", "unit-before-capture-unadmitted", "unit-before-capture-wrong-baseline", "complete", "pause", "abrupt", "abrupt-continue", "refused", "missing", "corrupt", "incomplete", "seal-cut", "admission-cut", "cursor-cut", "missing-receipt", "wrong-progress", "pause-continue", "pause-twice", "pause-status-continue", "pause-status-gaps", "pause-status-continue-admission-cut", "pause-status-gaps-admission-cut", "pause-missing", "pause-corrupt", "pause-conflict"]) {
+  for (const mode of ["unit-before-capture", "unit-before-capture-reentry", "unit-before-capture-reentry-mismatched-previous", "unit-before-capture-conflict", "unit-before-capture-corrupt", "unit-before-capture-newer-corrupt", "unit-before-capture-missing", "unit-before-capture-unadmitted", "unit-before-capture-wrong-baseline", "complete", "pause", "abrupt", "refused", "missing", "corrupt", "incomplete", "seal-cut", "admission-cut", "cursor-cut", "missing-receipt", "wrong-progress", "pause-continue", "pause-twice", "pause-status-continue", "pause-status-gaps", "pause-status-continue-admission-cut", "pause-status-gaps-admission-cut", "pause-missing", "pause-corrupt", "pause-conflict"]) {
     if (mode === "pause-status-continue") {
       describe("private real paused fixture", () => {
         const ownedRoots: string[] = [], ownedDisposers: (() => void)[] = [];
@@ -117,21 +117,32 @@ describe("plan/execute packaged composition", () => {
           for (const root of ownedRoots) rmSync(root, { recursive: true, force: true });
           releasePreparedPause();
         });
-        test(`registered Node checkpoint lifecycle confirms bytes with progress: ${mode}`, () => checkpointScenario(mode));
+        test(`registered checkpoint lifecycle confirms bytes with progress: ${mode}`, () => checkpointScenario(mode));
       });
       continue;
     }
-    test(`registered Node checkpoint lifecycle confirms bytes with progress: ${mode}`, () => checkpointScenario(mode));
+    test(`registered checkpoint lifecycle confirms bytes with progress: ${mode}`, () => checkpointScenario(mode));
   }
 });
 
 describe("plan/execute packaged composition", () => {
-  // SDK/Node loader preparation is file-owned setup, not checkpoint-case work.
+  // Controlled process preparation is file-owned, not checkpoint-case work.
   beforeAll(async () => { if (!native.nativeCheckpoint) await startNativeCheckpoint(); });
   for (const mode of ["pause-later-input", "pause-input-cut", "pause-effect-cut", "pause-write-cut", "pause-empty", "pause-replay-complete", "pause-wrong-baseline", "pause-loss-reentry", "pause-equivalent-capture", "pause-successor-corrupt", "pause-repeated-publication", "pause-reusable-result"]) {
     // Explicit human budget calibration for this multi-reentry integration case;
     // the other scenarios retain Bun's existing default deadline.
-    test(`registered Node checkpoint lifecycle confirms bytes with progress: ${mode}`,
+    test(`registered checkpoint lifecycle confirms bytes with progress: ${mode}`,
       () => checkpointScenario(mode), mode === "pause-write-cut" ? 10000 : undefined);
   }
+});
+
+// One real Node/SDK case covers registration, capture, selective restore and seal.
+describe("native SDK checkpoint wiring", () => {
+  beforeAll(async () => {
+    if (native.nativeCheckpoint?.connected) native.nativeCheckpoint.disconnect();
+    await nativeCheckpointExits.at(-1)?.promise;
+    await startNativeCheckpoint({ native: true });
+    await checkpointScenario("abrupt-continue", false, true);
+  });
+  test("registered loader restores an interrupted unit and completes the workflow", () => checkpointScenario("abrupt-continue"));
 });

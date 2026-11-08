@@ -160,7 +160,7 @@ describe("workspace", () => {
 });
 
 describe("board store", () => {
-  test("initializes schema v3, migrates v1 data, and refuses incomplete schemas", fixture.ownedCase("initializes schema v3, migrates v1 data, and refuses incomplete schemas", async () => {
+  test("initializes schema v5, migrates v1 data, and refuses incomplete schemas", fixture.ownedCase("initializes schema v5, migrates v1 data, and refuses incomplete schemas", async () => {
     const file = path.join(tempDir("pitako-board-db-"), "board.db");
     const boardDb = await openBoard(file);
     const other = await openSqlite(file);
@@ -262,6 +262,135 @@ describe("board store", () => {
     expect(page.topic.executionRoot).toBeNull();
     expect(page.posts.map((post) => post.content)).toEqual(["kept"]);
     migrated.close();
+  }));
+
+  test("ensureOwnedTopic preserves one owner per workspace without an execution claim", fixture.ownedCase("ensureOwnedTopic preserves one owner per workspace without an execution claim", async () => {
+    const file = path.join(tempDir("pitako-board-owned-"), "board.db");
+    const left = await openBoard(file);
+    const right = await openBoard(file);
+    const owner = "execute:spec:0123456789abcdef";
+    const topic = left.ensureOwnedTopic("/repo", owner, { title: "Execute spec", description: "memory" });
+    expect(right.ensureOwnedTopic("/repo", owner, { title: "ignored" })).toEqual(topic);
+    expect(topic).toMatchObject({ ownerPlanId: owner, planRevision: null, planHash: null, executionRoot: null });
+    expect(left.listTopics("/repo").total).toBe(1);
+    expect(left.ensureOwnedTopic("/other", owner, { title: "other workspace" }).id).not.toBe(topic.id);
+    expect(left.ensureOwnedTopic("/repo", "execute:other:0123456789abcdef", { title: "other spec" }).id).not.toBe(topic.id);
+    expect(() => left.ensureOwnedTopic("/repo", " ", { title: "invalid" })).toThrow(/ownerPlanId/);
+    left.transitionOwnedTopic("/repo", topic.id, owner, "closed");
+    expect(right.ensureOwnedTopic("/repo", owner, { title: "retry" }).status).toBe("closed");
+    left.close();
+    right.close();
+
+    // Exercise the v3 migration on a database with existing owners and posts.
+    const raw = await openSqlite(file);
+    raw.exec("DROP INDEX posts_idempotency_key");
+    raw.exec("PRAGMA user_version = 3");
+    raw.close();
+    const reopened = await openBoard(file);
+    expect(reopened.ensureOwnedTopic("/repo", owner, { title: "retry" }).id).toBe(topic.id);
+    const finding = { topicId: topic.id, type: "FINDING", content: "persisted" };
+    expect(reopened.postOnce("/repo", "migration-key", finding).id).toBe(reopened.postOnce("/repo", "migration-key", finding).id);
+    reopened.close();
+  }));
+
+  test("migrates v4 global post keys to topic-scoped keys without losing posts", fixture.ownedCase("migrates v4 global post keys to topic-scoped keys without losing posts", async () => {
+    const file = path.join(tempDir("pitako-board-v4-"), "board.db");
+    const initial = await openBoard(file);
+    const topic = initial.createTopic("/repo", { title: "legacy" });
+    const input = { topicId: topic.id, type: "FINDING", content: "kept" };
+    const first = initial.postOnce("/repo", "shared-key", input);
+    initial.close();
+    const raw = await openSqlite(file);
+    raw.exec("DROP INDEX posts_idempotency_key");
+    raw.exec(`CREATE UNIQUE INDEX posts_idempotency_key ON posts(json_extract(metadata_json, '$.idempotencyKey'))
+      WHERE json_valid(metadata_json) AND json_type(metadata_json, '$.idempotencyKey') = 'text'`);
+    raw.exec("PRAGMA user_version = 4");
+    raw.close();
+
+    const migrated = await openBoard(file);
+    expect(migrated.postOnce("/repo", "shared-key", input)).toEqual(first);
+    const other = migrated.createTopic("/other-repo", { title: "other" });
+    const otherInput = { ...input, topicId: other.id };
+    const second = migrated.postOnce("/other-repo", "shared-key", otherInput);
+    expect(second.id).not.toBe(first.id);
+    expect(second.topicId).toBe(other.id);
+    expect(migrated.postOnce("/other-repo", "shared-key", otherInput)).toEqual(second);
+    migrated.close();
+    const reopened = await openBoard(file);
+    expect(reopened.readTopic("/repo", topic.id).posts).toEqual([first]);
+    expect(reopened.readTopic("/other-repo", other.id).posts).toEqual([second]);
+    reopened.close();
+  }));
+
+  test("postOnce persists unique keys and supersedes only the same task HANDOFF", fixture.ownedCase("postOnce persists unique keys and supersedes only the same task HANDOFF", async () => {
+    const file = path.join(tempDir("pitako-board-post-once-"), "board.db");
+    const left = await openBoard(file);
+    const right = await openBoard(file);
+    const topic = left.ensureOwnedTopic("/repo", "execute:spec:root", { title: "memory" });
+    const input = { topicId: topic.id, type: "HANDOFF", content: "first state", metadata: { taskId: "task-a", note: "kept" } };
+    const first = left.postOnce("/repo", "execute:inv:l1:a1:HANDOFF", input);
+    expect(right.postOnce("/repo", "execute:inv:l1:a1:HANDOFF", { ...input, content: "retry must not replace" })).toEqual(first);
+    const other = right.postOnce("/repo", "execute:inv:l1:a2:HANDOFF", { ...input, metadata: { taskId: "task-b" } });
+    expect(other.metadata?.supersedes).toBeUndefined();
+    const second = right.postOnce("/repo", "execute:inv:l1:a3:HANDOFF", { ...input, content: "current state" });
+    expect(second.metadata).toEqual({ taskId: "task-a", note: "kept", idempotencyKey: "execute:inv:l1:a3:HANDOFF", supersedes: first.id });
+    expect(left.postOnce("/repo", "execute:inv:l1:a1:HANDOFF", input)).toEqual(first);
+    const third = left.postOnce("/repo", "execute:inv:l1:a4:HANDOFF", input);
+    expect(third.metadata?.supersedes).toBe(second.id);
+    expect(left.readTopic("/repo", topic.id).total).toBe(4);
+    expect(() => left.postOnce("/other", "execute:inv:l1:a1:HANDOFF", input)).toThrow(/another workspace/);
+    const otherTopic = left.createTopic("/repo", { title: "other topic" });
+    const otherInput = { ...input, topicId: otherTopic.id };
+    const otherPost = right.postOnce("/repo", "execute:inv:l1:a1:HANDOFF", otherInput);
+    expect(otherPost.topicId).toBe(otherTopic.id);
+    expect(otherPost.id).not.toBe(first.id);
+    expect(otherPost.metadata?.supersedes).toBeUndefined();
+    expect(left.postOnce("/repo", "execute:inv:l1:a1:HANDOFF", otherInput)).toEqual(otherPost);
+    expect(left.readTopic("/repo", otherTopic.id).total).toBe(1);
+    expect(() => left.postOnce("/repo", " ", input)).toThrow(/key/);
+    expect(() => left.postOnce("/repo", "invalid", { ...input, metadata: [] })).toThrow(/malformed metadata/);
+    expect(() => left.postOnce("/repo", "invalid", { ...input, metadata: { taskId: 1 } })).toThrow(/taskId/);
+    expect(() => left.postOnce("/repo", "invalid", { ...input, replyTo: 9999 })).toThrow(/not found/);
+    expect(left.postOnce("/repo", "invalid", { topicId: topic.id, type: "FINDING", content: "valid retry" }).type).toBe("FINDING");
+    // Even ordinary posts cannot bypass the database's unique metadata key.
+    expect(() => right.post("/repo", { ...input, metadata: first.metadata })).toThrow(/UNIQUE/);
+    left.close();
+    right.close();
+    const reopened = await openBoard(file);
+    expect(reopened.postOnce("/repo", "execute:inv:l1:a1:HANDOFF", input)).toEqual(first);
+    expect(reopened.readTopic("/repo", topic.id).total).toBe(5);
+    reopened.close();
+  }));
+
+  test("competing processes ensure and publish a single topic and post", fixture.ownedCase("competing processes ensure and publish a single topic and post", async () => {
+    const file = path.join(tempDir("pitako-board-once-race-"), "board.db");
+    const initial = await openBoard(file);
+    initial.close();
+    const moduleUrl = new URL("../extensions/board/store.ts", import.meta.url).href;
+    const source = `import { openBoard } from ${JSON.stringify(moduleUrl)};
+      const board = await openBoard(${JSON.stringify(file)});
+      try {
+        const topic = board.ensureOwnedTopic("/repo", "execute:spec:root", { title: "memory" });
+        const post = board.postOnce("/repo", "execute:inv:l1:a1:FINDING", { topicId: topic.id, type: "FINDING", content: "once" });
+        console.log(JSON.stringify({ topic: topic.id, post: post.id }));
+      } finally { board.close(); }`;
+    const publish = () => new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+      const child = spawn(process.execPath, ["-e", source], { stdio: ["ignore", "pipe", "pipe"] });
+      fixture.observeChild(child);
+      let stdout = "", stderr = "";
+      child.stdout.setEncoding("utf8").on("data", text => (stdout += text));
+      child.stderr.setEncoding("utf8").on("data", text => (stderr += text));
+      child.once("error", reject);
+      child.once("close", code => resolve({ code, stdout, stderr }));
+    });
+    const results = await Promise.all([publish(), publish()]);
+    for (const result of results) expect(result).toMatchObject({ code: 0, stderr: "" });
+    expect(JSON.parse(results[0]!.stdout)).toEqual(JSON.parse(results[1]!.stdout));
+    const board = await openBoard(file);
+    const listed = board.listTopics("/repo");
+    expect(listed.total).toBe(1);
+    expect(board.readTopic("/repo", listed.topics[0]!.id).total).toBe(1);
+    board.close();
   }));
 
   test("family migration preserves topic IDs and rolls back owner collisions", fixture.ownedCase("family migration preserves topic IDs and rolls back owner collisions", async () => {

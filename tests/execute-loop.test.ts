@@ -1,0 +1,416 @@
+import { afterEach, expect, test } from "bun:test";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, statSync, watch } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { createHash } from "node:crypto";
+import { apply, backlogPath, boardView, gate, metricBefore, parseMetric, prepare, readBacklog, runCommand, topicOwner, updateProgress, validateBacklog, type Backlog, type GateInput, type Progress, type Task } from "../skills/execute/loop.ts";
+import { openBoard } from "../extensions/board/store.ts";
+import { repositoryIdentity } from "../extensions/board/workspace.ts";
+
+const roots: string[] = [];
+afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+function fixture() {
+  const root = mkdtempSync(path.join(tmpdir(), "pitako-execute-loop-")); roots.push(root);
+  const git = (...args: string[]) => execFileSync("git", args, { cwd: root, stdio: "pipe", env: { PATH: process.env.PATH, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" } });
+  git("init", "-q"); writeFileSync(path.join(root, "product"), "original"); writeFileSync(path.join(root, ".gitignore"), "cache/\n");
+  git("add", "."); git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "Initial");
+  return { root, previousConfirmedUnit: null, dbPath: path.join(root, ".pi/board.db"), specId: "example" };
+}
+const authority = { specDigest: "a".repeat(64), amendmentDigests: [] };
+const empty: Progress = { nonImproving: 0, last5: [] };
+function task(id = "one"): Task {
+  return { id, goal: `Implement ${id}`, expectedResult: "Observable result", status: "pending", origin: { kind: "spec", ref: "spec" },
+    specRefs: ["Acceptance 2"], dependsOn: [], gates: [{ id: "focused", command: "printf passed", cwd: ".", timeoutMs: 1000 }], metric: null,
+    parent: null, remaining: "", progress: structuredClone(empty), history: [] };
+}
+function initial(root: string, tasks = [task()]) {
+  return { root, specId: "example", expectedDigest: null, key: "first", invocation: "exec1", loop: 1, authority,
+    acceptance: [{ id: "full", command: "true", cwd: "." }], director: { select: tasks[0]!.id, reason: "Most important", changes: tasks.map(t => ({ kind: "add" as const, task: t, reason: "From spec" })) } };
+}
+function attempt(f: ReturnType<typeof fixture>, overrides: Partial<GateInput> = {}): GateInput {
+  return { ...f, invocation: "exec1", loop: 1, attempt: 1, key: "attempt1", task: task(), workerStatus: "complete", writerSettled: true, ...overrides };
+}
+
+test("backlog schema errors name the file, preserve bytes and never repair human edits", () => {
+  const { root } = fixture(); const applied = apply(initial(root)); validateBacklog(applied.backlog);
+  const invalid = structuredClone(applied.backlog); invalid.tasks[0]!.remaining = "é".repeat(513);
+  writeFileSync(applied.path, JSON.stringify(invalid)); const before = readFileSync(applied.path, "utf8");
+  expect(() => readBacklog(root, "example")).toThrow(applied.path);
+  expect(() => readBacklog(root, "example")).toThrow("remaining"); expect(readFileSync(applied.path, "utf8")).toBe(before);
+  for (const bad of [null, { ...applied.backlog, version: 2 }, { ...applied.backlog, tasks: [task(), task()] },
+    { ...applied.backlog, tasks: [{ ...task(), metric: { command: "true", unit: "count", target: Infinity } }] },
+    { ...applied.backlog, tasks: [{ ...task(), dependsOn: ["missing"] }] },
+    { ...applied.backlog, tasks: [{ ...task(), history: Array(9).fill({ invocation: "e", loop: 1, event: "add", reason: "spec" }) }] }]) {
+    expect(() => validateBacklog(bad)).toThrow();
+  }
+});
+
+test("gate and acceptance verifies accept only positive criterion integers", () => {
+  const { root } = fixture(); const first = apply(initial(root));
+  for (const location of ["gate", "acceptance"]) {
+    for (const verifies of [[1, 3], [], [0], [-1], [1.5], ["1"], null]) {
+      const backlog = structuredClone(first.backlog!);
+      const command = location === "gate" ? backlog.tasks[0]!.gates[0]! : backlog.acceptance[0]!;
+      Object.assign(command, { verifies });
+      if (Array.isArray(verifies) && verifies.every(n => typeof n === "number" && Number.isInteger(n) && n > 0))
+        expect(() => validateBacklog(backlog)).not.toThrow();
+      else expect(() => validateBacklog(backlog)).toThrow("verifies");
+    }
+  }
+});
+
+test("keyed apply replays, halts on human edits and adopts valid human bytes on prepare", async () => {
+  const f = fixture(), request = initial(f.root); const first = apply(request);
+  expect(apply(request)).toMatchObject({ digest: first.digest, replay: true });
+  expect(readFileSync(first.path, "utf8")).toContain('"key": "first"');
+  expect(() => apply({ ...request, director: { ...request.director, reason: "Different request" } })).toThrow("backlog-conflict");
+  const edited = { ...first.backlog, tasks: [{ ...first.backlog!.tasks[0]!, goal: "Human goal" }] };
+  writeFileSync(first.path, JSON.stringify(edited)); const human = readFileSync(first.path, "utf8");
+  expect(() => apply(request)).toThrow("backlog-conflict");
+  expect(() => apply({ ...request, key: "second", expectedDigest: first.digest, director: { select: "one", changes: [], reason: "Continue" } })).toThrow("backlog-conflict");
+  expect(readFileSync(first.path, "utf8")).toBe(human);
+  const adopted = await prepare(f); expect(adopted.backlog!.tasks[0]!.goal).toBe("Human goal"); expect(adopted.digest).not.toBe(first.digest);
+  expect(appliedTemporaryFiles(f.root)).toEqual([]);
+});
+function appliedTemporaryFiles(root: string) { return execFileSync("git", ["ls-files", "--others", "--exclude-standard"], { cwd: root, encoding: "utf8" }).split("\n").filter(s => s.endsWith(".tmp")); }
+
+test("add/split/update/obsolete preserve tombstones and reject identity/status changes or reuse", () => {
+  const { root } = fixture(); let state = apply(initial(root));
+  const edit = (changes: Parameters<typeof apply>[0]["director"]["changes"], select: string | null) => apply({ ...initial(root), key: `k${state.digest}`, expectedDigest: state.digest, director: { changes, select, reason: "Reconcile" } });
+  state = edit([{ kind: "split", id: "one", tasks: [task("two"), task("three")], reason: "Smaller seams" }], "two");
+  expect(state.backlog!.tasks[0]!.status).toBe("obsolete"); expect(state.selected!.parent).toBe("one");
+  state = edit([{ kind: "update", id: "two", patch: { goal: "Updated goal" }, reason: "Code evidence" }, { kind: "obsolete", id: "three", reason: "Not needed" }], "two");
+  expect(state.selected!.goal).toBe("Updated goal");
+  expect(() => edit([{ kind: "add", task: task("one"), reason: "Reuse" }], "one")).toThrow("never reused");
+  expect(() => edit([{ kind: "update", id: "two", patch: { status: "done" } as never, reason: "Fake completion" }], "two")).toThrow("status/identity");
+  expect(() => edit([{ kind: "update", id: "one", patch: { goal: "Reopen" }, reason: "No" }], "two")).toThrow("tombstone");
+});
+
+test("director apply errors reject without writes while workflow and storage errors still halt", () => {
+  const { root } = fixture(), first = apply(initial(root));
+  const request = { ...initial(root), key: "next", expectedDigest: first.digest };
+  const before = readFileSync(first.path, "utf8");
+  const rejected = (input: Parameters<typeof apply>[0], message: string, selectionRejected: boolean) => {
+    let caught: any;
+    try { apply(input); } catch (error) { caught = error; }
+    expect(caught?.message).toContain(message);
+    expect(caught?.selectionRejected === true).toBe(selectionRejected);
+    expect(readFileSync(first.path, "utf8")).toBe(before);
+  };
+  for (const [changes, message] of [
+    [[{ kind: "add", task: task(), reason: "Reuse" }], "never reused"],
+    [[{ kind: "update", id: "missing", patch: { goal: "Unknown" }, reason: "Update" }], "unknown task or tombstone"],
+    [[{ kind: "update", id: "one", patch: { status: "done" }, reason: "Fake completion" }], "Invalid update patch"],
+    [[{ kind: "obsolete", id: "one", reason: "Obsolete" }, { kind: "update", id: "one", patch: { goal: "Reopen" }, reason: "Update tombstone" }], "unknown task or tombstone"],
+    [[{ kind: "split", id: "one", tasks: [], reason: "Split" }], "Split needs children"],
+    [[{ kind: "add", task: task("bad/id"), reason: "Invalid identity" }], "Invalid loop key"],
+    [[{ kind: "update", id: "one", patch: { dependsOn: ["missing"] }, reason: "Invalid reference" }], "Unknown/self dependency"],
+  ] as const) rejected({ ...request, director: { select: "one", changes: changes as never, reason: "Reconcile" } }, message, true);
+  rejected({ ...request, authority: { ...authority, specDigest: "b".repeat(64) },
+    director: { select: "one", changes: [], reason: "Continue" } }, "must reconcile", true);
+  rejected({ ...request, acceptance: [], director: { select: "one", changes: [], reason: "Replace" } }, "non-empty acceptance", true);
+  rejected({ ...request, acceptance: [{ id: "full", command: "", cwd: "." }],
+    director: { select: "one", changes: [], reason: "Replace" } }, "Invalid gate command", true);
+  rejected({ ...request, expectedDigest: null }, "backlog-conflict", false);
+  rejected({ ...initial(root), director: { ...initial(root).director, reason: "Changed replay" } }, "replay differs", false);
+  rejected({ ...request, settle: true, progress: { taskId: "one", progress: empty, remaining: "" },
+    director: { select: null, changes: [{ kind: "add", task: task(), reason: "Not settlement" }], reason: "Settle" } }, "Settlement requires", false);
+  rejected({ ...request, recordGaps: true, director: { select: null, changes: [], reason: "Gaps" } }, "finished implementation backlog", false);
+  rejected({ ...request, cancellations: [{ taskId: "missing", requestId: "cancel", kind: "cancel", origin: "user" }],
+    director: { select: null, changes: [], reason: "Cancel" } }, "Unknown cancelled task", false);
+  const uninitialized = fixture();
+  const { acceptance, ...missingAcceptance } = initial(uninitialized.root);
+  let initializationError: any;
+  try { apply(missingAcceptance); } catch (error) { initializationError = error; }
+  expect(initializationError?.message).toContain("non-empty acceptance");
+  expect(initializationError?.selectionRejected).toBe(true);
+  expect(readBacklog(uninitialized.root, "example").backlog).toBeNull();
+  const noAcceptance = JSON.stringify({ ...first.backlog, lastApplied: null, tasks: [], acceptance: [] });
+  writeFileSync(first.path, noAcceptance);
+  let finalError: any;
+  try { apply({ root, specId: "example", key: "final", invocation: "exec1", loop: 1, authority,
+    expectedDigest: readBacklog(root, "example").digest, director: { select: null, changes: [], reason: "Final" } }); }
+  catch (error) { finalError = error; }
+  expect(finalError?.message).toContain("Final phase requires non-empty acceptance");
+  expect(finalError?.selectionRejected === true).toBe(false);
+  expect(readFileSync(first.path, "utf8")).toBe(noAcceptance);
+  const invalid = JSON.stringify({ ...first.backlog, tasks: false });
+  writeFileSync(first.path, invalid);
+  try { apply(request); throw new Error("Expected invalid file rejection"); }
+  catch (error: any) { expect(error.message).toContain("Invalid tasks"); expect(error.selectionRejected).toBeUndefined(); }
+  expect(readFileSync(first.path, "utf8")).toBe(invalid);
+});
+
+test("selection requires pending task, focused gates, done prerequisites and authority reconciliation", () => {
+  const { root } = fixture(); const one = task(), two = task("two"); two.dependsOn = ["one"];
+  const request = initial(root, [one, two]); request.director.select = "two";
+  expect(() => apply(request)).toThrow("unfinished dependencies"); expect(readBacklog(root, "example").backlog).toBeNull();
+  expect(() => apply(initial(root, [{ ...one, gates: [] }]))).toThrow("focused gates");
+  const first = apply(initial(root));
+  expect(() => apply({ ...initial(root), expectedDigest: first.digest, key: "second", authority: { ...authority, specDigest: "b".repeat(64) }, director: { select: "one", changes: [], reason: "Continue" } })).toThrow("reconcile");
+  expect(() => apply({ ...initial(root), expectedDigest: first.digest, key: "second", director: { select: null, changes: [], reason: "Final" } })).toThrow("unfinished");
+});
+
+test("cancellation persists only the explicit task, derives dependents and replays without writes", () => {
+  const f = fixture(), one = task(), two = task("two"), three = task("three");
+  two.dependsOn = ["one"]; three.dependsOn = ["two"];
+  const first = apply(initial(f.root, [one, two, three]));
+  const request = { ...initial(f.root), key: "cancel", expectedDigest: first.digest,
+    director: { select: null, changes: [], reason: "Human cancellation" },
+    cancellations: [{ taskId: "one", requestId: "request-one", kind: "cancel" as const, origin: "model" }] };
+  const cancelled = apply(request), before = statSync(cancelled.path).mtimeMs;
+  expect(cancelled.backlog!.tasks.map(t => t.status)).toEqual(["obsolete", "pending", "pending"]);
+  expect(cancelled.backlog!.tasks[0]!.origin).toEqual({ kind: "human", ref: "request-one" });
+  expect(cancelled.cancelledScope.map(t => t.id)).toEqual(["one", "two", "three"]);
+  expect(cancelled.cancelledScope[2]!.cancel.cascadeFrom).toBe("two");
+  expect(apply(request)).toMatchObject({ replay: true, digest: cancelled.digest });
+  expect(statSync(cancelled.path).mtimeMs).toBe(before);
+  expect(() => apply({ ...request, key: "select", cancellations: undefined, expectedDigest: cancelled.digest,
+    director: { select: "two", changes: [], reason: "Try dependent" } })).toThrow("unfinished dependencies");
+  const reshaped = apply({ ...request, key: "reshape", cancellations: undefined, expectedDigest: cancelled.digest,
+    director: { select: "two", changes: [{ kind: "update", id: "two", patch: { dependsOn: [] }, reason: "Independent implementation after repository inspection" }], reason: "Reshape excluded dependent" } });
+  expect(reshaped.selected!.id).toBe("two"); expect(reshaped.cancelledScope.map(t => t.id)).toEqual(["one"]);
+  const human = JSON.stringify({ ...cancelled.backlog, tasks: cancelled.backlog!.tasks.map(t => ({ ...t, goal: "Human edit" })) }); writeFileSync(cancelled.path, human);
+  expect(() => apply(request)).toThrow("backlog-conflict");
+  expect(readFileSync(cancelled.path, "utf8")).toBe(human);
+});
+
+test("only a confirmed passing unit marks done and unlocks its dependent task", async () => {
+  const f = fixture(), one = task(), two = task("two"); two.dependsOn = ["one"];
+  const first = apply(initial(f.root, [one, two])), receipt = await gate(attempt(f));
+  const request = { ...initial(f.root), expectedDigest: first.digest, key: "second", director: { select: "two", changes: [], reason: "Next dependency" },
+    confirmedUnit: { taskId: "one", kind: "unit" as const, workerStatus: "complete" as const, receipt } };
+  expect(() => apply({ ...request, confirmedUnit: { ...request.confirmedUnit, receipt: { ...receipt, mutated: true } } })).toThrow("confirmed unit");
+  const second = apply(request); expect(second.selected!.id).toBe("two"); expect(second.backlog!.tasks[0]!.status).toBe("done");
+  expect((await prepare({ ...f, previousConfirmedUnit: "one" })).lastConfirmedUnit).toBe("one");
+  expect((await prepare(f)).lastConfirmedUnit).toBeNull();
+  expect((await prepare({ ...f, previousConfirmedUnit: "two" })).lastConfirmedUnit).toBeNull();
+  expect((await prepare({ ...f, previousConfirmedUnit: "missing" })).lastConfirmedUnit).toBeNull();
+  second.backlog!.tasks[0]!.status = "pending";
+  writeFileSync(second.path, JSON.stringify(second.backlog));
+  const human = readFileSync(second.path, "utf8"), adopted = await prepare({ ...f, previousConfirmedUnit: "one" });
+  expect(adopted.backlog!.tasks[0]!.status).toBe("pending");
+  expect(adopted.lastConfirmedUnit).toBeNull(); expect(adopted.digest).not.toBe(second.digest);
+  expect(readFileSync(second.path, "utf8")).toBe(human);
+});
+
+test("metric uses the final nonempty stdout line regardless of exit code; counts best distance and stalls", async () => {
+  expect(parseMetric("noise\n 0 \n\n")).toBe(0);
+  for (const bad of ["", "\nNaN\n", "Infinity", "1\nno value"]) expect(parseMetric(bad)).toBeNull();
+  const f = fixture(); const measured = { ...task(), metric: { command: "printf 'noise\\n0\\n\\n'; exit 1", unit: "errors", target: 0 } };
+  const receipt = await gate(attempt(f, { task: measured, workerStatus: "continue" }));
+  expect(receipt.metric).toEqual({ value: 0, error: null }); expect(receipt.gates).toEqual([]);
+  const trailing = await runCommand(f.root, { id: "stdout", command: "printf '2\\n'; head -c 5000 /dev/zero | tr '\\0' '\\n'", cwd: ".", timeoutMs: 1000 }, path.join(f.root, ".pi/stdout.log"));
+  expect(parseMetric(trailing.stdout)).toBe(2);
+  const sample = (value: number | null) => ({ value, fingerprint: "a".repeat(64), gatesPassed: 0, gatesTotal: 1 });
+  let progress = updateProgress(empty, sample(18), 0); progress = updateProgress(progress, sample(8), 0);
+  expect(progress.nonImproving).toBe(0); progress = updateProgress(progress, sample(9), 0);
+  expect(progress.nonImproving).toBe(1); progress = updateProgress(progress, sample(8), 0); progress = updateProgress(progress, sample(null), 0);
+  expect(progress.nonImproving).toBe(3); expect(progress.last5.at(-1)!.best).toBe(8);
+  expect(metricBefore(progress, "b".repeat(64))).toBeNull(); expect(metricBefore(receipt.progress, receipt.after.fingerprint)).toBe(0);
+  // A focused timeout is a non-improving attempt even when the metric got better.
+  expect(updateProgress(progress, sample(0), 0, true).nonImproving).toBe(4);
+  const towardNegative = updateProgress(updateProgress(empty, sample(1), -5), sample(-4), -5); expect(towardNegative.nonImproving).toBe(0);
+  let ratios = updateProgress(empty, { ...sample(null), gatesPassed: 1, gatesTotal: 2 }, null);
+  ratios = updateProgress(ratios, { ...sample(null), gatesPassed: 2, gatesTotal: 2 }, null); expect(ratios.last5.at(-1)!.best).toBe(1);
+});
+
+test("Board topic is canonical per worktree and prepare/view publication is persistent and idempotent", async () => {
+  const f = fixture(); const emptyPrepared = await prepare(f); expect(emptyPrepared.digest).toBeNull();
+  expect(topicOwner(f.root, f.specId)).toBe(`execute:example:${createHash("sha256").update(f.root).digest("hex").slice(0, 16)}`);
+  expect(topicOwner(path.join(f.root, "."), f.specId)).toBe(topicOwner(f.root, f.specId));
+  expect((await prepare(f)).view.topicId).toBe(emptyPrepared.view.topicId);
+  const knowledge = { findings: ["Dead end", null], handoff: "product is at repository root" };
+  const first = await gate(attempt(f, { knowledge })); const replay = await gate(attempt(f, { knowledge }));
+  expect(replay.view.posts.map(p => p.id)).toEqual(first.view.posts.map(p => p.id));
+  expect(first.view.posts.map(p => p.type)).toEqual(["HANDOFF", "FINDING"]);
+  const next = await gate(attempt(f, { attempt: 2, key: "attempt2", knowledge: { handoff: "new state" } }));
+  expect(next.view.posts.filter(p => p.type === "HANDOFF").map(p => p.content)).toEqual(["new state"]);
+  const director = await prepare(f); expect(director.view.posts.some(p => p.type === "HANDOFF")).toBe(false);
+});
+
+test("Board views retain current decisions, filter task findings and handoff, cap bytes with omitted count", async () => {
+  const f = fixture(), prepared = await prepare(f), board = await openBoard(f.dbPath), workspace = repositoryIdentity(f.root), topicId = prepared.view.topicId;
+  try {
+    const old = board.post(workspace, { topicId, type: "DECISION", content: "Old rule" });
+    board.post(workspace, { topicId, type: "DECISION", content: "Current rule", metadata: { supersedes: old.id } });
+    for (let i = 0; i < 110; i++) board.post(workspace, { topicId, type: "FINDING", content: `finding ${i} ${"é".repeat(100)}`, metadata: { taskId: "one" } });
+    board.post(workspace, { topicId, type: "FINDING", content: "Other task", metadata: { taskId: "two" } });
+    board.postOnce(workspace, "handoff-one", { topicId, type: "HANDOFF", content: "one state", metadata: { taskId: "one" } });
+    const view = boardView(board, workspace, topicId, "one", 1024);
+    expect(Buffer.byteLength(JSON.stringify(view))).toBeLessThanOrEqual(1024); expect(view.omitted).toBeGreaterThan(0);
+    expect(view.posts.some(p => p.content === "Current rule")).toBe(true); expect(view.posts.some(p => p.content === "Old rule" || p.content === "Other task")).toBe(false);
+    expect(view.posts.map(p => p.id)).toEqual(view.posts.map(p => p.id).sort((a,b) => b-a));
+    board.post(workspace, { topicId, type: "DECISION", content: "Binding rule ".repeat(520).trim() });
+    writeFileSync(path.join(f.root, "product"), "Human WIP");
+    for (let i = 0; i < 50; i++) writeFileSync(path.join(f.root, `untracked-product-file-${i}`), "WIP");
+    const receipt = await gate(attempt(f));
+    expect(Buffer.byteLength(JSON.stringify(receipt))).toBeLessThanOrEqual(8191);
+    expect(receipt.view.posts.filter(p => p.type === "DECISION").map(p => p.content)).toEqual(["Binding rule ".repeat(520).trim(), "Current rule"]);
+    expect(receipt.mutated).toBe(false);
+    for (const identity of [receipt.before, receipt.after]) expect(Object.keys(identity).sort()).toEqual(["fingerprint", "head"]);
+    board.post(workspace, { topicId, type: "DECISION", content: "x".repeat(8192) });
+    expect(() => boardView(board, workspace, topicId, "one")).toThrow("DECISION overflow");
+  } finally { board.close(); }
+});
+
+test("gate classifies failures/errors, detects product mutation, ignores metadata/build outputs and bounds logs/receipt", async () => {
+  const f = fixture(); const t = task();
+  t.gates = [
+    { id: "pass", command: "mkdir -p cache; printf built > cache/build; printf meta > .pi/meta", cwd: ".", timeoutMs: 1000 },
+    { id: "fail", command: "printf failure >&2; exit 7", cwd: ".", timeoutMs: 1000 },
+    { id: "error", command: "true", cwd: "missing-dir", timeoutMs: 1000 },
+    { id: "mutate", command: "printf changed > product", cwd: ".", timeoutMs: 1000 },
+    { id: "large", command: "head -c 9000000 /dev/zero", cwd: ".", timeoutMs: 1000 },
+  ];
+  const receipt = await gate(attempt(f, { task: t, knowledge: { findings: false, handoff: 42 } }));
+  expect(receipt.gates.map(g => g.status)).toEqual(["pass", "fail", "error", "pass", "pass"]);
+  expect(receipt.gates[1]!.exit).toBe(7); expect(receipt.mutated).toBe(true); expect(receipt.progress.nonImproving).toBe(1);
+  expect(statSync(receipt.gates[4]!.logRef).size).toBe(8 * 1024 * 1024);
+  for (const g of receipt.gates) expect(Buffer.byteLength(g.tail)).toBeLessThanOrEqual(2048);
+  expect(Buffer.byteLength(JSON.stringify(receipt) + "\n")).toBeLessThanOrEqual(8192);
+  expect(readFileSync(receipt.gates[1]!.logRef, "utf8")).toBe("failure");
+  const ignored = await gate(attempt(f)); expect(ignored.mutated).toBe(false);
+  let stalledTask = { ...task(), gates: [{ id: "fail", command: "false", cwd: ".", timeoutMs: 1000 }] };
+  for (let i = 1; i <= 3; i++) {
+    const failed = await gate(attempt(f, { task: stalledTask, attempt: i, key: `failure${i}` }));
+    expect(failed.progress.nonImproving).toBe(i); expect(failed.stalled).toBe(i === 3); stalledTask.progress = failed.progress;
+  }
+  const noMetric = await gate(attempt(f, { workerStatus: "continue" })); expect(noMetric.gates).toHaveLength(1);
+  await expect(gate(attempt(f, { writerSettled: false as never }))).rejects.toThrow("settled worker");
+});
+
+test("a timed-out command kills its grandchild group and still produces a receipt; metric timeout stalls", async () => {
+  const f = fixture(), t = task();
+  t.gates = [{ id: "timeout", command: "sleep 100 & child=$!; printf '%s\\n' \"$child\"; wait", cwd: ".", timeoutMs: 100 }];
+  const receipt = await gate(attempt(f, { task: t })); expect(receipt.gates[0]!.status).toBe("timeout");
+  expect(receipt.progress.nonImproving).toBe(1);
+  const pid = Number(readFileSync(receipt.gates[0]!.logRef, "utf8").trim()); expect(pid).toBeGreaterThan(0);
+  // A reparented zombie is settled, not a surviving running command.
+  let state = ""; try { state = readFileSync(`/proc/${pid}/stat`, "utf8").split(") ")[1]!.split(" ")[0]!; } catch (error) { expect((error as NodeJS.ErrnoException).code).toBe("ENOENT"); }
+  expect(["", "Z"]).toContain(state);
+  const metric = { ...task(), metric: { command: "printf 1; sleep 100", target: 0, unit: "count" }, progress: { nonImproving: 2, last5: [] } };
+  const timed = await gate(attempt(f, { task: metric, workerStatus: "continue", metricTimeoutMs: 100 }));
+  expect(timed.metric!.value).toBeNull(); expect(timed.metric!.error).toContain("timeout"); expect(timed.stalled).toBe(true);
+});
+
+test("SIGTERM to the real loop-io gate kills its background grandchild", async () => {
+  const f = fixture(), t = task(), pidFile = path.join(f.root, "child.pid");
+  t.gates = [{ id: "stop", command: "sleep 100 & child=$!; printf '%s %s\\n' \"$$\" \"$child\" > child.pid; wait", cwd: ".", timeoutMs: 30000 }];
+  let shellPid = 0, grandchildPid = 0;
+  let readyTimer: ReturnType<typeof setTimeout>;
+  let watcher: ReturnType<typeof watch>;
+  const ready = new Promise<void>((resolve, reject) => {
+    readyTimer = setTimeout(() => reject(new Error("Gate did not record its child pid")), 3000);
+    watcher = watch(f.root, () => {
+      try {
+        const pids = readFileSync(pidFile, "utf8").trim();
+        if (!/^\d+ \d+$/.test(pids)) return;
+        [shellPid, grandchildPid] = pids.split(" ").map(Number) as [number, number];
+        resolve();
+      } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") reject(error); }
+    });
+    watcher.on("error", reject);
+  });
+  const child = spawn("node", [path.resolve(import.meta.dir, "../skills/execute/loop-io.mjs")], { cwd: f.root, stdio: ["pipe", "ignore", "pipe"] });
+  let stderr = "";
+  child.stderr.on("data", data => { stderr += data; });
+  const closed = new Promise<number | null>((resolve, reject) => {
+    child.on("error", reject); child.on("close", resolve);
+  });
+  child.stdin.end(JSON.stringify({ operation: "gate", ...attempt(f, { task: t }) }));
+  try {
+    await Promise.race([ready, closed.then(code => { throw new Error(`loop-io exited before readiness: ${code}: ${stderr}`); })]);
+    expect(grandchildPid).toBeGreaterThan(0);
+    expect(child.kill("SIGTERM")).toBe(true);
+    await closed;
+    let state = "";
+    try { state = readFileSync(`/proc/${grandchildPid}/stat`, "utf8").split(") ")[1]!.split(" ")[0]!; }
+    catch (error) { expect((error as NodeJS.ErrnoException).code).toBe("ENOENT"); }
+    expect(["", "Z"]).toContain(state);
+  } finally {
+    clearTimeout(readyTimer!); watcher!.close();
+    child.kill("SIGTERM");
+    await closed;
+    // Keep a failing forwarding assertion from leaking the test-owned command group.
+    if (shellPid) {
+      try { process.kill(-shellPid, "SIGKILL"); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+    }
+  }
+});
+
+test.each(["prepare", "gate", "invalid"])("Node stdin adapter loads Board and bounds its output: %s", operation => {
+  const f = fixture(), script = path.resolve(import.meta.dir, "../skills/execute/loop-io.mjs");
+  const invoke = (input: object) => spawnSync("node", [script], { cwd: f.root, input: JSON.stringify(input), encoding: "utf8" });
+  if (operation === "prepare") {
+    const prepared = invoke({ operation, ...f }); expect(prepared.status).toBe(0);
+    expect(JSON.parse(prepared.stdout.trim()).view.topicId).toBeGreaterThan(0);
+    expect(JSON.parse(prepared.stdout.trim())).not.toHaveProperty("backlog");
+  } else if (operation === "gate") {
+    const receipt = invoke({ operation, ...attempt(f) }); expect(receipt.status).toBe(0);
+    const lines = receipt.stdout.trim().split("\n"); expect(lines).toHaveLength(1); expect(Buffer.byteLength(receipt.stdout)).toBeLessThanOrEqual(8192);
+    expect(JSON.parse(lines[0]!).gates[0].status).toBe("pass");
+  } else {
+    const invalid = invoke({ operation: "prepare", ...f, root: tmpdir() }); expect(invalid.status).toBe(1); expect(invalid.stdout).toContain("actual cwd");
+  }
+});
+
+
+test("acceptance initialization/replacement is reasoned and human edits are audited", async () => {
+  const f = fixture(), request = initial(f.root);
+  expect(() => apply({ ...request, acceptance: undefined })).toThrow("requires valid non-empty acceptance");
+  const first = apply(request);
+  expect(first.backlog!.acceptanceHistory).toMatchObject([{ kind: "init", reason: "Most important", invocation: "exec1", loop: 1 }]);
+  const replacement = [{ id: "replacement", command: "printf checked", cwd: "." }];
+  const second = apply({ ...request, acceptance: undefined, key: "replace", expectedDigest: first.digest,
+    director: { select: "one", changes: [], reason: "Project procedure changed", acceptance: replacement } });
+  expect(second.backlog!.acceptanceHistory.at(-1)).toMatchObject({ kind: "replace", reason: "Project procedure changed" });
+  const edited = structuredClone(second.backlog!); edited.acceptance = [{ id: "human", command: "true", cwd: "." }];
+  writeFileSync(second.path, JSON.stringify(edited));
+  const adopted = await prepare(f);
+  expect(adopted.backlog!.acceptanceHistory.at(-1)).toMatchObject({ kind: "human" });
+  expect((await prepare(f)).digest).toBe(adopted.digest);
+  const blank = structuredClone(adopted.backlog!); blank.acceptance = [];
+  blank.tasks[0]!.status = "obsolete";
+  writeFileSync(second.path, JSON.stringify(blank));
+  const empty = await prepare(f);
+  expect(() => apply({ ...request, acceptance: undefined, key: "final", expectedDigest: empty.digest,
+    director: { select: null, changes: [], reason: "Final candidate" } })).toThrow("Final phase requires non-empty acceptance");
+});
+
+test("settlement persists a stalled task and a gated unit without selecting another task", async () => {
+  const f = fixture(), first = apply(initial(f.root)), receipt = await gate(attempt(f));
+  const request = { ...initial(f.root), acceptance: undefined, expectedDigest: first.digest, key: "settle", settle: true,
+    director: { select: null, changes: [], reason: "Attempt settled" },
+    progress: { taskId: "one", progress: { ...receipt.progress, nonImproving: 3 }, remaining: "Still pending" } };
+  const paused = apply(request); expect(paused.selected).toBeNull();
+  expect(paused.backlog!.tasks[0]).toMatchObject({ status: "pending", remaining: "Still pending", progress: { nonImproving: 3 } });
+  expect(apply(request).replay).toBe(true);
+  const done = apply({ ...request, key: "done", expectedDigest: paused.digest,
+    confirmedUnit: { taskId: "one", kind: "unit", workerStatus: "complete", receipt } });
+  expect(done.backlog!.tasks[0]!.status).toBe("done");
+});
+
+
+test("final-phase findings add new tasks atomically without reopening tombstones and replay idempotently", () => {
+  const { root } = fixture();
+  const first = apply(initial(root));
+  const gap = { ...task("final-finding"), gates: [], origin: { kind: "final-phase" as const, ref: "/native/review/finding.json" } };
+  const request = { ...initial(root), key: "final-gaps", expectedDigest: first.digest, recordGaps: true,
+    director: { select: null, changes: [{ kind: "add" as const, task: gap, reason: "Missing observable result" }], reason: "Final review gaps" } };
+  expect(() => apply(request)).toThrow("finished implementation backlog");
+  const finished = apply({ ...initial(root), key: "obsolete", expectedDigest: first.digest,
+    director: { select: null, changes: [{ kind: "obsolete", id: "one", reason: "Superseded implementation" }], reason: "Reconcile" } });
+  expect(finished.completedTasks).toContainEqual({ id: "one", goal: "Implement one", status: "obsolete", reasons: ["From spec", "Superseded implementation"] });
+  const next = { ...request, expectedDigest: finished.digest };
+  const written = apply(next);
+  expect(written.selected).toBeNull();
+  expect(written.backlog!.tasks.map(t => t.status)).toEqual(["obsolete", "pending"]);
+  expect(written.backlog!.tasks[1]!.origin).toEqual(gap.origin);
+  expect(apply(next)).toMatchObject({ digest: written.digest, replay: true });
+  expect(() => apply({ ...next, key: "another", expectedDigest: written.digest })).toThrow("finished implementation backlog");
+  expect(() => apply({ ...initial(root), key: "select-gap", expectedDigest: written.digest,
+    director: { select: gap.id, changes: [], reason: "Repair" } })).toThrow("focused gates");
+});

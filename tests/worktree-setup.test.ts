@@ -76,13 +76,13 @@ function fixture() {
       copyFileSync(new URL("../scripts/setup-worktree.sh", import.meta.url), path.join(checkout, "scripts/setup-worktree.sh"));
       writeFileSync(path.join(checkout, "scripts/setup.sh"), `#!/bin/bash
 set -e
-"$REAL_NODE" -e 'require("node:fs").appendFileSync(process.env.CALL_LOG, JSON.stringify({command:"setup", cwd:process.cwd(), args:process.argv.slice(1)})+"\\n")' -- "$@"
+"$FIXTURE_RUNTIME" -e 'require("node:fs").appendFileSync(process.env.CALL_LOG, JSON.stringify({command:"setup", cwd:process.cwd(), args:process.argv.slice(1)})+"\\n")' -- "$@"
 exit "\${SETUP_EXIT:-0}"
 `);
     }
     function cli(file: string, name: string) {
       mkdirSync(path.dirname(file), { recursive: true });
-      writeFileSync(file, `#!${nodePath}
+      writeFileSync(file, `#!${process.execPath}
 const fs = require("node:fs");
 fs.appendFileSync(process.env.CALL_LOG, JSON.stringify({
   command:${JSON.stringify(name)}, cwd:process.cwd(), args:process.argv.slice(2),
@@ -95,10 +95,10 @@ process.exit(Number(process.env.CODEGRAPH_EXIT || 0));
     }
     const onPath = path.join(bin, "codegraph");
     cli(onPath, "codegraph");
-    // Only the CLI is doubled. Git and Node exercise native discovery and SQLite.
+    // Logging doubles use Bun; Git and Node still exercise native discovery and SQLite.
     symlinkSync(nodePath, path.join(bin, "node"));
     const env = {
-      ...gitEnv, PATH: `${bin}:/usr/bin:/bin`, CALL_LOG: log, REAL_NODE: nodePath,
+      ...gitEnv, PATH: `${bin}:/usr/bin:/bin`, CALL_LOG: log, FIXTURE_RUNTIME: process.execPath,
       CODEGRAPH_DIR: "", EXPECTED_GRAPH_DIR: ".codegraph", T3CODE_PROJECT_ROOT: path.join(root, "not-the-principal"),
       CODEGRAPH_NO_WATCH: "1", CODEGRAPH_FORCE_WATCH: "0", CODEGRAPH_NO_DOWNLOAD: "0", DO_NOT_TRACK: "0",
     };

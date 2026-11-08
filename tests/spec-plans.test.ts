@@ -4,6 +4,7 @@ import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writ
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { checkoutEvidence, designatedWorkspace, digest, discoverSpec, executionAmendments, inspectionSnapshot, MAX_SPEC_BYTES, ORIGINAL_PROBLEM, preliminarySpec, specBinding, SPEC_SECTIONS, specChunks, validateSpec } from "../extensions/spec-plans.ts";
+import { inspect as inspectSpec } from "../skills/execute/inspect.ts";
 import { boardWorkspace } from "../extensions/board/workspace.ts";
 import { applyCheckpoint, captureCheckpoint, checkpointDirectory, completeCheckpoint, prepareCheckpoint, restoreCheckpoint, type CheckpointIntent } from "../extensions/execute-checkpoint.ts";
 
@@ -308,24 +309,24 @@ describe("spec-plan discovery and concrete input", () => {
     expect(invoke(main)).toEqual(selected); expect(checkoutEvidence(main)).toEqual(before);
   });
 
-  test("read-only helper repeats idempotently, snapshots exact UTF-8 chunks, and source edits change digest", () => {
+  test("read-only helper repeats idempotently, snapshots exact UTF-8 chunks, and source edits change digest", async () => {
     const { main, sibling } = fixture(); const source = put(sibling, spec() + "é中😀\n".repeat(700));
-    const script = path.resolve("skills/execute/inspect.mjs");
-    const inspect = (...extra: string[]) => JSON.parse(execFileSync("node", [script, main, "demo", "", ...extra], { encoding: "utf8" }));
+    // Installed-resource test above owns Node CLI loading; exercise the shared inspector here.
+    const inspect = async (...extra: string[]) => JSON.parse(await inspectSpec([main, "demo", "", ...extra]));
     const before = checkoutEvidence(main);
-    const first = inspect(); expect(inspect()).toEqual(first);
+    const first = await inspect(); expect(await inspect()).toEqual(first);
     expect(first.selected.chunks).toBeGreaterThan(1);
     expect(checkoutEvidence(main)).toEqual(before);
     let captured = "";
     for (let part = 0; part < first.selected.chunks; part++) {
-      const chunk = inspect(String(part)); expect(chunk.digest).toBe(first.selected.digest); captured += chunk.content;
+      const chunk = await inspect(String(part)); expect(chunk.digest).toBe(first.selected.digest); captured += chunk.content;
       expect(Buffer.byteLength(JSON.stringify(chunk))).toBeLessThan(4096);
     }
     expect(captured).toBe(readFileSync(source, "utf8"));
     expect(digest(captured)).toBe(first.selected.digest);
     expect(specChunks(captured).join("")).toBe(captured);
     writeFileSync(source, spec() + "Changed objective context");
-    const changed = inspect();
+    const changed = await inspect();
     expect(changed.selected.digest).not.toBe(first.selected.digest);
     expect(changed.root).toBe(main);
   });
@@ -359,6 +360,37 @@ describe("spec-plan discovery and concrete input", () => {
     git(main, "submodule", "deinit", "-f", "module");
     expect(() => checkoutEvidence(main)).not.toThrow();
     expect(checkoutEvidence(main).fingerprint).not.toBe(unchanged.fingerprint);
+  });
+
+  test.each([".pi", ".pitako"])("checkout evidence excludes %s metadata without gitignore rules", directory => {
+    const { main } = fixture();
+    const tracked = `${directory}/nested/tracked`, added = `${directory}/nested/added`;
+    mkdirSync(path.dirname(path.join(main, tracked)), { recursive: true });
+    writeFileSync(path.join(main, tracked), "initial metadata");
+    git(main, "add", tracked);
+    git(main, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "Track metadata");
+    const before = checkoutEvidence(main).fingerprint;
+    writeFileSync(path.join(main, added), "untracked metadata");
+    expect(checkoutEvidence(main).fingerprint).toBe(before);
+    writeFileSync(path.join(main, tracked), "dirty metadata");
+    expect(checkoutEvidence(main).fingerprint).toBe(before);
+    git(main, "add", tracked, added);
+    expect(checkoutEvidence(main).fingerprint).toBe(before);
+    rmSync(path.join(main, tracked));
+    expect(checkoutEvidence(main).fingerprint).toBe(before);
+    git(main, "add", tracked);
+    expect(checkoutEvidence(main).fingerprint).toBe(before);
+
+    // Similarly named product paths remain observable, including index-only changes.
+    const product = path.join(main, `${directory}-product`);
+    writeFileSync(product, "product bytes");
+    const untracked = checkoutEvidence(main).fingerprint;
+    expect(untracked).not.toBe(before);
+    git(main, "add", `${directory}-product`);
+    const staged = checkoutEvidence(main).fingerprint;
+    expect(staged).not.toBe(untracked);
+    writeFileSync(product, "different product bytes");
+    expect(checkoutEvidence(main).fingerprint).not.toBe(staged);
   });
 
   test("checkout evidence observes actual bytes, WIP commits, dirty work and detached HEAD", () => {

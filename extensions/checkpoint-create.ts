@@ -3,7 +3,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { readFileSync } from "node:fs";
 import { isDeepStrictEqual } from "node:util";
 import { Type } from "typebox";
-import { createCheckpoint, type CheckpointIntent } from "./execute-checkpoint.ts";
+import { createCheckpoint, previousUnitMatches, type CheckpointIntent } from "./execute-checkpoint.ts";
 import { EXECUTE_STATE_VERSION, executionStatePath, incompatibleExecuteState } from "./execute-state.ts";
 import { effectiveProfile } from "./profile.ts";
 
@@ -54,9 +54,12 @@ export default function checkpointCreate(pi: ExtensionAPI): void {
           progress: { consumedLoops: record.consumedLoops,
             admitted: Object.fromEntries(Object.entries(record.tasks).filter(([, task]: [string, any]) => task.admitted.length)
               .map(([id, task]: [string, any]) => [id, task.admitted])),
-            previous: record.lastConfirmed?.kind === "unit" && record.lastConfirmed.position.loop === loop.number
+            previous: record.lastConfirmed?.kind === "unit"
               ? (({ taskId, attempt, resultRef, checkpointRef, digest }) =>
                 ({ taskId, attempt, resultRef, checkpointRef, digest }))(record.lastConfirmed) : null } };
+        if (record.lastConfirmed?.kind === "unit" && record.lastConfirmed.position.loop !== loop.number &&
+            !previousUnitMatches(intent, record.lastConfirmed))
+          throw new Error("Confirmed unit lacks admitted pending-position provenance.");
         if (!equal(attempt.checkpoint, intent)) throw new Error("Checkpoint intention/progress differs from durable execution context.");
         signal?.throwIfAborted();
         result = createCheckpoint(intent, input.kind, input.paths, signal);

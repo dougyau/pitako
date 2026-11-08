@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { boundRetainedAnalyses, retainedAnalyses } from "../../extensions/execute-retained.ts";
-import { checkpointEvidence } from "../../extensions/execute-checkpoint.ts";
+import { checkpointEvidence, previousUnitMatches } from "../../extensions/execute-checkpoint.ts";
 import { isDeepStrictEqual } from "node:util";
 import { EXECUTE_STATE_VERSION, executionStatePath, incompatibleExecuteState } from "../../extensions/execute-state.ts";
 
@@ -220,15 +220,22 @@ function observeCheckpoint(found: { root: string; commonDir: string; selected?: 
         const unit = attempt.restore?.authority?.confirmedUnit ?? (confirmed?.kind === "unit" && confirmed.position.loop === loop.number ? confirmed : undefined);
         if (unit) {
           const { taskId, attempt: number, resultRef, ...receipt } = unit;
-          const result = loop.results.map((item: any) => {
-            if (item.ref) return item;
-            const completed = invocation.tasks?.[item.taskId]?.completed;
-            return completed?.attempt === item.attempt ? completed : undefined;
-          }).find((item: any) => item?.taskId === taskId && item.attempt === number && isDeepStrictEqual(item.ref, resultRef));
-          if (!result || result.status !== "complete" || !isDeepStrictEqual(result.checkpoint?.confirmation, receipt) ||
-              !isDeepStrictEqual(unit.position, { loop: loop.number, cursor: loop.cursor, phase: "implementation" }) ||
-              unit.checkpointRef !== `${found.root}/.pi/subagents/checkpoints/${result.checkpoint.key}/unit.json`)
-            throw new Error("Confirmed unit conflicts with admitted pending progress.");
+          const pending = attempt.checkpoint ?? retainedSources[0];
+          if (unit.position.loop < loop.number) {
+            if (!pending || !previousUnitMatches(pending, unit) ||
+                unit.checkpointRef !== `${found.root}/.pi/subagents/checkpoints/${unit.resultRef.key}/unit.json`)
+              throw new Error("Confirmed unit conflicts with admitted pending progress.");
+          } else {
+            const result = loop.results.map((item: any) => {
+              if (item.ref) return item;
+              const completed = invocation.tasks?.[item.taskId]?.completed;
+              return completed?.attempt === item.attempt ? completed : undefined;
+            }).find((item: any) => item?.taskId === taskId && item.attempt === number && isDeepStrictEqual(item.ref, resultRef));
+            if (!result || result.status !== "complete" || !isDeepStrictEqual(result.checkpoint?.confirmation, receipt) ||
+                !isDeepStrictEqual(unit.position, { loop: loop.number, cursor: loop.cursor, phase: "implementation" }) ||
+                unit.checkpointRef !== `${found.root}/.pi/subagents/checkpoints/${result.checkpoint.key}/unit.json`)
+              throw new Error("Confirmed unit conflicts with admitted pending progress.");
+          }
         }
         observation = { ...subject, evidence: checkpointEvidence(sources, { consumedLoops: invocation.consumedLoops,
           admitted: Object.fromEntries(Object.entries(invocation.tasks).filter(([, task]: [string, any]) => task.admitted.length)

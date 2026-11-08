@@ -205,13 +205,24 @@ export function applyCheckpoint(intent: CheckpointIntent, changes: { path: strin
   prepareCheckpoint(intent, changes);
   completeCheckpoint(intent);
 }
-// Only the exact root-admitted unit immediately preceding the pending cursor
-// can supply a baseline when that pending writer never published its capture.
+export function previousUnitMatches(pending: CheckpointIntent, unit: ConfirmedUnit): boolean {
+  const position = unit.position as { loop?: number } | null;
+  const progress = unit.progress as CheckpointProgress | null;
+  return unit.kind === "unit" && equal(pending.progress?.previous, {
+    taskId: unit.taskId, attempt: unit.attempt, resultRef: unit.resultRef,
+    checkpointRef: unit.checkpointRef, digest: unit.digest,
+  }) && (equal(unit.position, { loop: pending.loop, cursor: pending.cursor, phase: pending.phase }) ||
+    (typeof position?.loop === "number" && position.loop < pending.loop && pending.cursor === 0 &&
+      Object.keys(pending.progress?.admitted ?? {}).length === 0 &&
+      pending.progress?.consumedLoops === pending.loop && progress?.consumedLoops === position.loop));
+}
+
+// Only the latest root-admitted unit can supply postimages when the pending
+// writer never published its capture, including across v6 task loops.
 function confirmedUnitSource(pending: CheckpointIntent, unit: ConfirmedUnit) {
-  if (unit.kind !== "unit" || !equal(pending.progress?.previous, {
-      taskId: unit.taskId, attempt: unit.attempt, resultRef: unit.resultRef,
-      checkpointRef: unit.checkpointRef, digest: unit.digest }) ||
-      !equal(unit.position, { loop: pending.loop, cursor: pending.cursor, phase: pending.phase }) ||
+  const earlierLoop = unit.position !== null && typeof unit.position === "object" &&
+    "loop" in unit.position && typeof unit.position.loop === "number" && unit.position.loop < pending.loop;
+  if (!previousUnitMatches(pending, unit) ||
       !/^([a-f0-9]{64})$/.test(unit.digest) || !/^([A-Za-z0-9_-][A-Za-z0-9._-]*)\/unit\.json$/.test(path.relative(path.join(pending.association.root, ".pi/subagents/checkpoints"), unit.checkpointRef).split(path.sep).join("/")) ||
       path.relative(path.join(pending.association.root, ".pi/subagents/checkpoints"), unit.checkpointRef).includes(".."))
     throw new Error("Confirmed unit lacks admitted pending-position provenance.");
@@ -219,13 +230,15 @@ function confirmedUnitSource(pending: CheckpointIntent, unit: ConfirmedUnit) {
   const point = read<{ intent: CheckpointIntent; kind: string; sourceManifest: string; files: Manifest["files"];
     candidate: { head: string; fingerprint: string }; position: unknown; progress: unknown }>(unit.checkpointRef);
   const intent = point.intent;
-  if (!equal(intent.association, pending.association) || !equal(intent.planRef, pending.planRef) ||
-      intent.taskId !== unit.taskId || intent.attempt !== unit.attempt || intent.loop !== pending.loop ||
-      intent.cursor + 1 !== pending.cursor || intent.phase !== pending.phase ||
+  if (!equal(intent.association, pending.association) ||
+      (!earlierLoop && (!equal(intent.planRef, pending.planRef) || intent.loop !== pending.loop || intent.cursor + 1 !== pending.cursor)) ||
+      (earlierLoop && (intent.loop >= pending.loop || intent.progress?.consumedLoops !== intent.loop ||
+        !equal(unit.position, { loop: intent.loop, cursor: intent.cursor + 1, phase: intent.phase }))) ||
+      intent.taskId !== unit.taskId || intent.attempt !== unit.attempt || intent.phase !== pending.phase ||
       unit.checkpointRef !== path.join(checkpointDirectory(intent), "unit.json") || point.kind !== "unit" ||
       !equal(point.position, unit.position) || !equal(point.progress, unit.progress) ||
       !equal(intent.progress, point.progress) ||
-      intent.progress!.consumedLoops !== pending.progress!.consumedLoops ||
+      (!earlierLoop && intent.progress!.consumedLoops !== pending.progress!.consumedLoops) ||
       !equal({ head: point.candidate.head, fingerprint: point.candidate.fingerprint }, unit.candidate))
     throw new Error("Confirmed unit association/progress mismatch.");
   const loaded = load(intent);
