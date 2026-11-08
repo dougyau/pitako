@@ -99,7 +99,12 @@ test.each(["gaps", "continue"])("unfinished worker %s with no remaining entries 
     if (request.key.endsWith(".demand-observation")) {
       expect(request.task).toContain("Three consecutive non-improving attempts");
     }
-    return normal();
+    const result = normal();
+    if (request.key === "invoke-human-1.l2.director")
+      result.structuredOutput.changes.push({ kind: "update", id: "change1",
+        patch: { expectedResult: "Implement the missing parser branch" },
+        reason: "Narrow the stalled task to the parser branch identified by the worker" });
+    return result;
   });
   const outcome = await host.executeNative();
   expect(outcome.status, JSON.stringify(outcome)).toBe("complete");

@@ -62,6 +62,13 @@ describe("workflow-owned execute controller", () => {
         return host.result(request, { ...host.worker(request, "pause"), status,
           remaining: ["Same pending defect"], diagnosis: "Still pending",
           continuation: "Fix the same branch", usefulProgress: true });
+      if (request.key === "invoke-human-1.l2.director") {
+        const result = normal();
+        result.structuredOutput.changes.push({ kind: "update", id: "change1",
+          patch: { expectedResult: "Fix the pending branch with recoverable checkpoint evidence" },
+          reason: "Narrow the stalled task to the pending branch before checkpoint recovery" });
+        return result;
+      }
       if (request.key === "invoke-human-1.l2.t1.a1") {
         host.worker(request); // Capture a real recoverable checkpoint before losing the writer.
         return { ok: false, output: "", error: "Writer disappeared" };
@@ -3334,6 +3341,18 @@ describe("native closing observations", () => {
     const host = fixture(undefined, { readOnly: true }); host.setLimit(10);
     host.setRespond((request, normal) => {
       const result = normal();
+      // Each of the first two loops stalls a distinct task, not the same task twice.
+      if (request.key === "invoke-human-1.l2.director") {
+        const stalled = readBacklog(host.root, "spec").backlog!.tasks.find(task => task.id === "change1")!;
+        result.structuredOutput.changes.push({ kind: "split", id: stalled.id,
+          tasks: [{ ...copy(stalled), id: "change1-repair", goal: "Repair the pending implementation branch" }],
+          reason: "Extract the pending implementation branch from the stalled task" });
+        result.structuredOutput.select = "change1-repair";
+      }
+      if (request.key === "invoke-human-1.l3.director")
+        result.structuredOutput.changes.push({ kind: "update", id: "change1-repair",
+          patch: { expectedResult: "Complete the concrete pending implementation before final verification" },
+          reason: "Refine the stalled repair to the concrete defect reported by the worker" });
       if (request.agent === "pitako.worker" && /\.l[12]\./.test(request.key)) {
         result.structuredOutput.status = "gaps";
         result.structuredOutput.remaining = ["Concrete pending implementation"];

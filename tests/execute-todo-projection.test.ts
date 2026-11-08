@@ -47,7 +47,7 @@ describe("execute todo pure projection", () => {
   });
 
   test("task progress survives snapshot validation and projects into the rendered row", () => {
-    const subject = "Build · metric 18→8/0 · gates 3/5 · stall 1/3";
+    const subject = "Build · metric 18→8/0 · gates 3/5 · stall 1/3 · stalls 1/2";
     const value = snapshot({tasks:[{...snapshot().tasks[0]!,subject}]});
     expect(latestExecuteTodoSnapshot([value])).toEqual(value);
     const f=fixture();
