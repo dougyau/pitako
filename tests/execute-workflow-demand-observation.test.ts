@@ -156,7 +156,7 @@ test.each(["observation-receipt", "director-intention"])("%s cut recovers the ex
   expect(host.statusCalls).toContain(cut === "observation-receipt" ? `native-${target}` : "invoke-human-1.l2.director");
 });
 
-const synthesis = (number: number) => `native-invoke-human-1.l${number}.review.director-synthesis`;
+const synthesis = (number: number) => `invoke-human-1.l${number}.review.director-synthesis`;
 // Final loops report material gaps; the intervening task loops repair them.
 function materialReviewGaps(host: ControllerHost, acceptance?: any) {
   host.setRespond((request, normal) => {
@@ -192,8 +192,12 @@ test("closed demand sources persist once while observations keep every retained 
       expect(previous).toContain(synthesis(earlier - 1));
     }
   }
-  for (const save of saves) for (let closed = 1; closed < save.loop; closed++)
-    expect(save.value.split(`"${synthesis(closed)}"`).length - 1, `loop ${save.loop} copies of loop ${closed}`).toBeLessThanOrEqual(1);
+  for (const save of saves) {
+    const sources = JSON.parse(save.value).demandSources ?? [];
+    expect(new Set(sources.map((item: any) => item.loop)).size).toBe(sources.length);
+    for (const entry of sources) for (const original of entry.sources)
+      expect(save.value.split(JSON.stringify(original)).length - 1, `loop ${save.loop} copies of loop ${entry.loop}`).toBe(1);
+  }
   const maximum = (from: number, to: number) => Math.max(...saves.filter(save => save.loop >= from && save.loop <= to).map(save => save.bytes));
   expect(maximum(8, 9)).toBeLessThanOrEqual(maximum(6, 7) + 4096);
   // Full v6 task definitions and the bounded demand ring fit the native envelope.

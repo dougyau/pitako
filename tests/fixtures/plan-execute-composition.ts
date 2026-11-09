@@ -216,6 +216,13 @@ export function childResponse(key: string, request: any, metadata: any, checkout
     results.push({ savedOutputPath, outputReference: { path: savedOutputPath }, exitCode: 0,
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } });
   }
+  if (key.endsWith(".compliance")) {
+    const fs = require("node:fs");
+    const structuredOutputPath = metadata.root + "/.pi/subagents/" + key + ".json";
+    fs.mkdirSync(metadata.root + "/.pi/subagents", { recursive: true });
+    fs.writeFileSync(structuredOutputPath, JSON.stringify(value));
+    results.push({ structuredOutputPath, exitCode: 0 });
+  }
   return { key, ok: true, output: "", runId: `native-${key}`, agent: request.agent ?? "pitako.reviewer", artifactPaths: [], results, structuredOutput: value };
 }
 // Controlled child loading boundary: use the launch binding emitted by the real root,
@@ -315,7 +322,7 @@ export type CompositionFixture = ReturnType<typeof compositionFixture>;
 // One file-owned process runs controlled boundaries; one case retains native SDK loading. Each message
 // still creates fresh storage, roots and launch-bound tool registrations. Cases
 // are awaited by the file's normal test order; other files remain parallel.
-export function nativeCheckpointFixture({ workflowSettlements, checkpointCancellations }: CompositionFixture) {
+export function nativeCheckpointFixture({ workflowSettlements, checkpointCancellations, settleWorkflows }: CompositionFixture) {
   let nativeCheckpoint: ReturnType<typeof spawn> | undefined;
   let nativeCheckpointRoot: string;
   let nativeCheckpointExit: Promise<[number, string, string]>;
@@ -357,7 +364,16 @@ export function nativeCheckpointFixture({ workflowSettlements, checkpointCancell
         return {runWorkflowScript,loadExtensions};
       })();
       (async()=>{
-        if(${sdk})await sdk();
+        if(${sdk}) {
+          await sdk();
+          // File-owned extension and persistence loading must finish before ready.
+          if(!${native})await Promise.all([
+            import(${JSON.stringify(new URL("../../extensions/execute-checkpoint.ts", import.meta.url).href)}),
+            import(${JSON.stringify(new URL("../../extensions/spec-plans.ts", import.meta.url).href)}),
+            import(${JSON.stringify(new URL("../../extensions/checkpoint-create.ts", import.meta.url).href)}),
+            import(${JSON.stringify(new URL("../../skills/execute/loop.ts", import.meta.url).href)}),
+          ]);
+        }
         process.on('message',async ({input,harness})=>{
           const prior=process.env.PI_CODING_AGENT_DIR, cwd=process.cwd();
           try {
@@ -419,6 +435,7 @@ export function nativeCheckpointFixture({ workflowSettlements, checkpointCancell
     await startup;
   }
   afterAll(async () => {
+    await settleWorkflows();
     if (nativeCheckpoint?.connected) nativeCheckpoint.disconnect();
     for (const operation of nativeCheckpointExits) {
       const [exit, , errors] = await operation.promise;

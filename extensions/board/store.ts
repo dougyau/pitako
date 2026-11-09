@@ -4,14 +4,14 @@ import { DEFAULT_BOARD_AUTHOR } from "./author.ts";
 import { getBoardDbPath } from "./paths.ts";
 import { openSqlite, type SqlDatabase } from "./sqlite.ts";
 
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 export const BOARD_AUTHOR = "pi";
 export const BOARD_SCOPE = "global";
 
 export const TOPIC_STATUSES = ["open", "resolved", "closed"] as const;
 export type TopicStatus = (typeof TOPIC_STATUSES)[number];
 
-export const POST_TYPES = ["INFO", "FINDING", "QUESTION", "ANSWER", "DECISION", "BLOCKER", "HANDOFF"] as const;
+export const POST_TYPES = ["INFO", "FINDING", "QUESTION", "ANSWER", "DECISION", "BLOCKER", "HANDOFF", "HUMAN"] as const;
 export type PostType = (typeof POST_TYPES)[number];
 
 export const LIMITS = {
@@ -96,9 +96,12 @@ export interface QueryResult {
   capped: boolean;
 }
 
-export interface PostInput {
+export type InternalPostType = Exclude<PostType, "HUMAN">;
+export const HUMAN_QUOTE_MAX = 16_000;
+
+export interface PostInput<T extends PostType = InternalPostType> {
   topicId: number;
-  type: string;
+  type: T;
   subject?: string;
   content: string;
   replyTo?: number;
@@ -123,6 +126,7 @@ export interface Board {
     patch: { status?: TopicStatus; title?: string; description?: string },
   ): Topic;
   post(workspace: string, input: PostInput, author?: string): Post;
+  postHuman(workspace: string, input: PostInput<"HUMAN">, ctx: { hasUI: boolean }, author?: string): Post;
   // Reserves metadata.idempotencyKey per topic; HANDOFF metadata.taskId scopes supersedes.
   postOnce(workspace: string, key: string, input: PostInput, author?: string): Post;
   claimTopic(workspace: string, topicId: number, planId: string): Topic;
@@ -164,7 +168,7 @@ const SCHEMA_STATEMENTS = [
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     topic_id INTEGER NOT NULL REFERENCES topics(id),
     author TEXT NOT NULL,
-    type TEXT NOT NULL CHECK (type IN ('INFO', 'FINDING', 'QUESTION', 'ANSWER', 'DECISION', 'BLOCKER', 'HANDOFF')),
+    type TEXT NOT NULL CHECK (type IN ('INFO', 'FINDING', 'QUESTION', 'ANSWER', 'DECISION', 'BLOCKER', 'HANDOFF', 'HUMAN')),
     subject TEXT,
     content TEXT NOT NULL,
     reply_to INTEGER REFERENCES posts(id),
@@ -202,6 +206,8 @@ export async function openBoard(dbPath = getBoardDbPath()): Promise<Board> {
 }
 
 function initialize(db: SqlDatabase, dbPath: string): void {
+  // Rebuilding the self-referencing posts table requires disabling FKs outside the transaction.
+  db.exec("PRAGMA foreign_keys = OFF");
   db.exec("BEGIN IMMEDIATE");
   try {
     let version = pragmaInteger(db, "user_version");
@@ -242,10 +248,30 @@ function initialize(db: SqlDatabase, dbPath: string): void {
       version = 5;
       db.exec("PRAGMA user_version = 5");
     }
-    if (version === SCHEMA_VERSION) {
+    if (version === 5) {
       validateV3(db, dbPath);
       if (!db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'posts_idempotency_key'").get()) {
         throw initError(dbPath, "schema v5 is incomplete: missing posts_idempotency_key");
+      }
+      const sequence = db.prepare("SELECT seq FROM sqlite_sequence WHERE name = 'posts'").get()?.seq ?? 0;
+      const posts = SCHEMA_STATEMENTS.find(statement => statement.startsWith("CREATE TABLE posts ("))!;
+      db.exec(posts.replace("CREATE TABLE posts (", "CREATE TABLE posts_new ("));
+      db.exec("INSERT INTO posts_new SELECT * FROM posts");
+      db.exec("DROP TABLE posts");
+      db.exec("ALTER TABLE posts_new RENAME TO posts");
+      db.prepare("UPDATE sqlite_sequence SET seq = max(seq, ?) WHERE name = 'posts'").run(sequence);
+      for (const statement of SCHEMA_STATEMENTS) {
+        if (statement.startsWith("CREATE INDEX posts_") || statement.startsWith("CREATE TRIGGER posts_")) db.exec(statement);
+      }
+      db.exec(POST_ONCE_INDEX);
+      if (db.prepare("PRAGMA foreign_key_check").all().length) throw initError(dbPath, "foreign key check failed");
+      version = 6;
+      db.exec("PRAGMA user_version = 6");
+    }
+    if (version === SCHEMA_VERSION) {
+      validateV3(db, dbPath);
+      if (!db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'posts_idempotency_key'").get()) {
+        throw initError(dbPath, "schema v6 is incomplete: missing posts_idempotency_key");
       }
     }
     else throw initError(dbPath, `schema version ${version} is not supported (expected ${SCHEMA_VERSION}). Refusing to migrate or discard data.`);
@@ -257,6 +283,8 @@ function initialize(db: SqlDatabase, dbPath: string): void {
       // The connection is closing or the transaction never started.
     }
     throw error;
+  } finally {
+    db.exec("PRAGMA foreign_keys = ON");
   }
 }
 
@@ -551,7 +579,22 @@ class SqliteBoard implements Board {
     return this.requireTopic(workspace, id);
   }
 
+  postHuman(workspace: string, input: PostInput<"HUMAN">, ctx: { hasUI: boolean }, author = DEFAULT_BOARD_AUTHOR): Post {
+    if (!ctx.hasUI || process.env.PI_SUBAGENT_CHILD === "1") throw new BoardError("HUMAN is root-session only");
+    if (input.type !== "HUMAN") throw new BoardError("postHuman requires HUMAN");
+    const metadata = input.metadata as Record<string, unknown> | undefined;
+    requireText(metadata?.quote as string, "metadata.quote");
+    if ((metadata?.quote as string).length > HUMAN_QUOTE_MAX) throw new BoardError(`metadata.quote exceeds ${HUMAN_QUOTE_MAX} characters`);
+    requireText(metadata?.saidAt as string, "metadata.saidAt");
+    return this.writePost(workspace, input, author);
+  }
+
   post(workspace: string, input: PostInput, author = DEFAULT_BOARD_AUTHOR): Post {
+    rejectInternalHuman(input.type);
+    return this.writePost(workspace, input, author);
+  }
+
+  private writePost(workspace: string, input: PostInput<PostType>, author: string): Post {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const post = this.insertPost(workspace, input, author);
@@ -564,6 +607,7 @@ class SqliteBoard implements Board {
   }
 
   postOnce(workspace: string, key: string, input: PostInput, author = DEFAULT_BOARD_AUTHOR): Post {
+    rejectInternalHuman(input.type);
     const idempotencyKey = requireText(key, "key");
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -595,7 +639,7 @@ class SqliteBoard implements Board {
     }
   }
 
-  private insertPost(workspace: string, input: PostInput, author: string): Post {
+  private insertPost(workspace: string, input: PostInput<PostType>, author: string): Post {
     const topic = this.requireTopic(workspace, input.topicId);
     const type = parsePostType(input.type);
     const content = requireText(input.content, "content");
@@ -747,6 +791,10 @@ function serializeMetadata(value: unknown): string | null {
   } catch {
     throw new BoardError("malformed metadata: value is not JSON-serializable");
   }
+}
+
+function rejectInternalHuman(type: string): void {
+  if (type === "HUMAN") throw new BoardError("HUMAN is root-session only; use board_post");
 }
 
 function parsePostType(value: string): PostType {

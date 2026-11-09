@@ -125,7 +125,7 @@ record dead ends as findings. The workflow publishes Board memory, not you.
 Continuations supply the task, metric series, last handoff, bounded Board view,
 gate failure summary and previous-result path, not a frozen attempt descriptor.
 Read the complete spec and frozen amendments on every attempt. Authority is
-spec and frozen amendments > DECISION > FINDING > HANDOFF; code wins over any map.
+spec, frozen amendments and current HUMAN rulings (most recent human source wins; cite it) > DECISION > FINDING > HANDOFF; code wins over any map.
 Current DECISIONs are binding working rules, need no reconfirmation and cannot
 expand scope. No other agents of this execution run concurrently;
 resource_snapshot is enough for host load. Do not ask the supervisor about

@@ -1,11 +1,19 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { readBacklog } from "../skills/execute/loop.ts";
 import { executeControllerFixture, copy, type Result } from "./fixtures/execute-workflow.ts";
 
 const { fixture } = executeControllerFixture();
 const isGate = (call: { agent?: string; task: string }) => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "gate";
 const taskFixture = () => { const host = fixture(); host.setLimit(1); return host; };
+const checkOrigin = (ref: string) => {
+  expect(Buffer.byteLength(ref)).toBeLessThanOrEqual(512);
+  const output = JSON.parse(ref);
+  expect(Object.keys(output).sort()).toEqual(["key", "path", "sha256"]);
+  expect(output.sha256).toBe(createHash("sha256").update(readFileSync(output.path)).digest("hex"));
+  return output;
+};
 const gateReceipt = (normal: () => Result) => {
   const result = normal();
   return { result, receipt: JSON.parse(result.output!) };
@@ -52,6 +60,34 @@ test("a complete worker with failed focused gates seals pause and continues the 
   expect(workers[1]!.task).toContain("COMPLETE IMMUTABLE SPEC SNAPSHOT");
   expect(host.calls.filter(call => isGate(call)).every(call => call.timeoutMs === 14400000)).toBe(true);
   expect(host.snapshots.some(value => value.loop?.attempt?.gate?.stage === "receipt" && !value.loop?.attempt.seal)).toBe(true);
+});
+
+test.each(["intact", "id-conflict", "digest-conflict", "legacy", "legacy-conflict"])("compact selection receipt survives admission save failure: %s", async mode => {
+  const host = taskFixture();
+  host.setFailSave(value => value.loop?.plan?.stage === "admitted");
+  expect((await host.execute()).status).not.toBe("complete");
+  const retained = copy(host.current());
+  expect(retained.loop.selection.receipt.selected).toBe(retained.loop.task.id);
+  expect(retained.loop.selection.receipt.digest).toBe(retained.loop.taskBacklogDigest);
+  if (mode.startsWith("legacy")) {
+    retained.loop.selection.receipt.selected = copy(retained.loop.task);
+    delete retained.loop.taskBacklogDigest;
+    if (mode === "legacy-conflict") retained.loop.selection.receipt.selected.goal = "Conflicting full task";
+  }
+  if (mode === "id-conflict") retained.loop.selection.receipt.selected = "other";
+  if (mode === "digest-conflict") retained.loop.selection.receipt.digest = "f".repeat(64);
+  host.storage.set("invoke-human-1", retained);
+  host.setFailSave(undefined);
+  const before = host.calls.length, output = await host.execute();
+  if (["intact", "legacy"].includes(mode)) {
+    expect(output.status, output.reason).toBe("partial");
+    expect(readBacklog(host.root, "spec").backlog!.tasks[0]!.status).toBe("done");
+  } else {
+    expect(output.status).toBe("blocked");
+    expect(output.reason).toContain("Selected task ID or backlog digest conflicts");
+    expect(host.calls.slice(before).some(call => call.agent === "pitako.worker")).toBe(false);
+  }
+  expect(host.calls.filter(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "apply" && !JSON.parse(call.task).settle)).toHaveLength(1);
 });
 
 test("malformed knowledge does not reject an otherwise valid worker result", async () => {
@@ -395,6 +431,7 @@ test.each(["pass", "fail", "stale"])("final acceptance %s uses workflow gates be
       specRefs: ["Final acceptance gate acceptance"] });
     expect(pending[0]!.origin.ref).toContain("invoke-human-1.l2.acceptance");
     expect(pending[0]!.origin.ref).toContain("0.log");
+    expect(checkOrigin(pending[0]!.origin.ref).key).toBe("invoke-human-1.l2.acceptance.gate");
     expect(repairs).toHaveLength(1);
     expect(repairs[0]).toMatchObject({ id: pending[0]!.id, status: "done", origin: pending[0]!.origin });
     const director = host.calls.find(call => call.key.endsWith(".l3.director"))!;
@@ -445,14 +482,47 @@ test.each(["timeout", "error"])("final acceptance %s blocks as environment with 
   expect(output.reason).toContain("environment failure");
   expect(output.reason).toContain("/owned/final-suite.log");
   expect(host.current().loop.halt.code).toBe("environment");
+  expect(host.current().lastFinalAcceptance).toBeUndefined();
   expect(host.calls.some(call => call.agent === "pitako.worker" || call.key.includes(".review.") || call.key.endsWith(".compliance"))).toBe(false);
   expect(readBacklog(host.root, "spec").backlog!.tasks).toEqual([]);
 });
 
 test.each(["review", "compliance"])("final-phase %s findings become durable tasks for the next director", async phase => {
-  const host = fixture(undefined, { taskCount: 0, findings: true }); host.setLimit(3);
+  // The live save observer measures every mission write; historical copies are unused here.
+  const host = fixture(undefined, { taskCount: 0, findings: true, retainSnapshots: false, controlledCheckpoints: true }); host.setLimit(3);
+  let peakBytes = 0, consumed = false;
+  host.setSaveObserver((value, bytes, serialized) => {
+    peakBytes = Math.max(peakBytes, bytes);
+    const retained = host.storage.get("review-invoke-human-1");
+    for (const original of retained?.originals ?? []) if (original.value?.coverage?.startsWith("LARGE_REVIEW_")) {
+      // Search for a second occurrence without splitting on the large repeated padding.
+      const first = serialized.indexOf(original.value.coverage);
+      expect(first).toBeGreaterThanOrEqual(0);
+      expect(serialized.indexOf(original.value.coverage, first + 1)).toBe(-1);
+    }
+    if (value.loop?.task) {
+      expect(value.loop.selection.receipt.selected).toBe(value.loop.task.id);
+      expect(JSON.stringify(value.loop.selection.receipt)).not.toContain(value.loop.task.origin.ref);
+    }
+  });
   host.setRespond((request, normal) => {
+    if (request.key.endsWith(".l2.director")) {
+      const retained = host.storage.get("review-invoke-human-1");
+      expect(retained.originals.length).toBeGreaterThan(0);
+      for (const original of retained.originals) {
+        expect(Object.keys(original).sort()).toEqual(["id", "key", "path", "runId", "sha256"]);
+        expect(original.sha256).toBe(createHash("sha256").update(readFileSync(original.path)).digest("hex"));
+      }
+      const source = host.current().demandSources[0].sources.find((source: any) => source.kind === phase);
+      if (phase === "review") {
+        expect(Object.keys(source.ref).sort()).toEqual(["key", "path", "sha256"]);
+        expect(source).not.toHaveProperty("references");
+      }
+      consumed = true;
+    }
     const result = normal();
+    if (request.key.includes(".review.independent-"))
+      result.structuredOutput.coverage = `LARGE_REVIEW_${request.key}:` + "x".repeat(12 * 1024);
     if (request.key.includes(".l1.")) {
       if (phase === "review" && request.key.endsWith("director-synthesis")) {
         result.structuredOutput.screening.verdict = "material-gaps";
@@ -468,11 +538,18 @@ test.each(["review", "compliance"])("final-phase %s findings become durable task
     return result;
   });
   const output = await host.execute();
-  expect(output.status).toBe("complete");
+  expect(output.status, output.reason).toBe("complete");
+  expect(consumed).toBe(true);
+  console.log(`consumed ${phase} review/repair/final mission peak: ${peakBytes} bytes`);
+  expect(peakBytes).toBeLessThan(80 * 1024);
   const backlog = readBacklog(host.root, "spec").backlog!;
   expect(backlog.tasks).toHaveLength(1);
   expect(backlog.tasks[0]).toMatchObject({ status: "done", origin: { kind: "final-phase" } });
   expect(backlog.tasks[0]!.origin.ref).toContain(phase === "review" ? ".review." : ".compliance");
+  const origin = checkOrigin(backlog.tasks[0]!.origin.ref);
+  expect(origin.key).toBe(`invoke-human-1.l1.${phase === "review" ? "review.director-synthesis" : "compliance"}`);
+  const original = JSON.parse(readFileSync(origin.path, "utf8"));
+  expect(phase === "review" ? original.screening.reason : original.reason).toBe("Required observable behavior missing");
   expect(host.calls.filter(call => call.agent === "pitako.execution-director")).toHaveLength(3);
   expect(host.calls.filter(call => call.agent === "pitako.worker").every(call => call.key.includes(".l2."))).toBe(true);
   expect(host.calls.some(call => call.key.includes(".l2.review.") || call.key === "invoke-human-1.l2.compliance")).toBe(false);
@@ -507,4 +584,236 @@ test("final review receives done and obsolete reasons, current DECISIONs, and fo
   expect(host.calls.indexOf(review)).toBeGreaterThan(gateIndex);
   expect(host.calls.findIndex(call => call.key.endsWith(".compliance"))).toBeGreaterThan(host.calls.indexOf(review));
   expect(host.current().consumedLoops).toBe(2);
+});
+
+test.each(["pass", "fail", "timeout", "error", "superseded", "blocking-failure"])("final verdict honors only current HUMAN exceptions: %s", async mode => {
+  const human = { id: 42, type: "HUMAN", content: "Loader may fail", author: "root", createdAt: "2026-11-08",
+    metadata: { quote: "Loader may fail", saidAt: "2026-11-08" } };
+  const host = fixture(undefined, { taskCount: 0, humanPosts: [human] }); host.setLimit(1);
+  host.setRespond((request, normal) => {
+    const result = normal();
+    if (request.agent === "pitako.execution-director") result.structuredOutput.acceptance = [
+      { id: "blocking", command: "true", cwd: "." },
+      { id: "loader", command: "true", cwd: ".", verifies: [1], exception: { humanRef: 42, reason: "Loader may fail" } },
+    ];
+    if (isGate(request)) {
+      const receipt = JSON.parse(result.output!);
+      if (mode !== "pass") Object.assign(receipt.gates[1], { status: ["timeout", "error"].includes(mode) ? mode : "fail",
+        exit: ["timeout", "error"].includes(mode) ? null : 1 });
+      if (mode === "blocking-failure") Object.assign(receipt.gates[0], { status: "fail", exit: 1 });
+      // Authority changed while the gate ran: the fresh receipt, not the selection, decides.
+      if (mode === "superseded") receipt.view.posts = [{ ...human, id: 43, content: "Loader must now pass" }];
+      result.output = JSON.stringify(receipt);
+    }
+    return result;
+  });
+  const output = await host.execute({ originalProblem: { criteria: [1] } });
+  const blocked = ["superseded", "blocking-failure"].includes(mode);
+  expect(output.status, output.reason).toBe(blocked ? "partial" : "complete");
+  const repairs = readBacklog(host.root, "spec").backlog!.tasks;
+  if (blocked) {
+    expect(repairs).toHaveLength(1);
+    expect(repairs[0]!.specRefs).toEqual([`Final acceptance gate ${mode === "superseded" ? "loader" : "blocking"}`]);
+    expect(host.calls.some(call => call.key.endsWith(".compliance"))).toBe(false);
+  } else {
+    expect(repairs).toEqual([]);
+    for (const suffix of ["review.director-prepare", ".compliance"]) {
+      const brief = host.calls.find(call => call.key.endsWith(suffix))!.task;
+      expect(brief).toContain("Loader may fail");
+      expect(brief).toContain('"humanRef":42');
+      expect(brief).toContain("Excepted acceptance results:");
+      expect(brief).toContain("Acceptance history:");
+      expect(brief).toContain("Inspect acceptanceHistory and report as a gap any acceptance replacement that narrows, filters or relaxes a command and cites no HUMAN post ID that is current in this execute topic.");
+      expect(brief).toContain('"kind":"init"');
+      expect(brief).toContain("not a gap or repair task");
+    }
+    if (mode === "pass") {
+      expect(output.heading).toBe("Execution complete");
+      expect(output).not.toHaveProperty("exceptions");
+      expect(output.originalProblem.status).toBe("fulfilled");
+    } else {
+      expect(output.heading).toBe("Execution complete with exceptions");
+      expect(output.exceptions).toEqual([{ id: "loader", status: mode, exit: mode === "fail" ? 1 : null,
+        logRef: expect.any(String), humanRef: 42, reason: "Loader may fail" }]);
+      expect(output.originalProblem.status).toBe("unfulfilled");
+    }
+  }
+});
+
+
+const finalGates = (host: ReturnType<typeof fixture>) => host.calls.filter(call => isGate(call) && JSON.parse(call.task).task.id === "final-acceptance");
+function repeatedAcceptanceFixture() {
+  const humanPosts: any[] = [];
+  const host = fixture(undefined, { taskCount: 0, humanPosts }); host.setLimit(5);
+  let allowException = false;
+  host.setRespond((request, normal) => {
+    const result = normal();
+    if (request.agent === "pitako.execution-director" && (request.key.includes(".l1.") || allowException))
+      result.structuredOutput.acceptance = [
+        { id: "blocking", command: "true", cwd: "." },
+        { id: "suite", command: "echo run >> .pi/suite-runs; false", cwd: ".",
+          ...(allowException ? { exception: { humanRef: 42, reason: "Human permits suite failure" } } : {}) },
+      ];
+    return result;
+  });
+  return { host, authorizeException: () => {
+    allowException = true;
+    humanPosts.push({ id: 42, type: "HUMAN", content: "Suite may fail", metadata: { quote: "Suite may fail", saidAt: "2026-11-08" } });
+  } };
+}
+
+test("fresh then reused acceptance failure halts with original logs and relaunch re-finishes unchanged", async () => {
+  const { host } = repeatedAcceptanceFixture();
+  const output = await host.execute();
+  expect(output.status, output.reason).toBe("blocked");
+  expect(host.current().loop.halt.code).toBe("repeat-acceptance");
+  const record = copy(host.current().lastFinalAcceptance);
+  expect(record).toMatchObject({ loop: 1, gateKey: "invoke-human-1.l1.acceptance.gate" });
+  expect(Object.keys(record).sort()).toEqual(["candidate", "exec", "gateKey", "loop", "results"]);
+  expect(finalGates(host)).toHaveLength(2);
+  expect(JSON.parse(finalGates(host)[1]!.task).reuse).toEqual(record);
+  expect(readFileSync(`${host.root}/.pi/suite-runs`, "utf8")).toBe("run\n");
+  expect(output.reason).toContain(record.results[1].logRef);
+  const calls = host.calls.length, hostCalls = host.hostCalls.length;
+  const replay = await host.execute();
+  expect(replay.status).toBe("blocked");
+  expect(replay.reason).toBe(output.reason);
+  expect(host.calls).toHaveLength(calls);
+  expect(host.hostCalls).toHaveLength(hostCalls);
+  expect(host.current().lastFinalAcceptance).toEqual(record);
+  expect(host.current().consumedLoops).toBe(3);
+});
+
+test.each(["human", "fresh", "mismatch", "ceiling"])("repeat acceptance unblock preserves budget and re-evaluates before a one-shot fresh run: %s", async mode => {
+  const { host, authorizeException } = repeatedAcceptanceFixture();
+  if (mode === "ceiling") host.setLimit(3);
+  expect((await host.execute()).status).toBe("blocked");
+  const record = copy(host.current().lastFinalAcceptance);
+  if (mode === "human") authorizeException();
+  const calls = host.calls.length;
+  const output = await host.execute({ unblock: true, resolution: { loop: mode === "mismatch" ? 2 : 3, text: "Resolve repeated acceptance" } });
+  if (mode === "mismatch") {
+    expect(output.status).toBe("blocked");
+    expect(output.reason).toContain("must name the retained interrupted loop");
+    expect(host.calls).toHaveLength(calls);
+    expect(host.current().loop.halt.code).toBe("repeat-acceptance");
+  } else if (mode === "human") {
+    expect(output.status, output.reason).toBe("complete");
+    expect(output.heading).toBe("Execution complete with exceptions");
+    expect(output.exceptions![0]).toMatchObject({ id: "suite", humanRef: 42, logRef: record.results[1].logRef });
+    expect(finalGates(host)).toHaveLength(3);
+    expect(readFileSync(`${host.root}/.pi/suite-runs`, "utf8")).toBe("run\n");
+    expect(host.current().consumedLoops).toBe(4);
+    expect(host.current().lastFinalAcceptance).toEqual(record);
+  } else if (mode === "fresh") {
+    expect(output.status, output.reason).toBe("partial");
+    const gates = finalGates(host);
+    expect(gates).toHaveLength(4);
+    expect(JSON.parse(gates[2]!.task).reuse).toEqual(record);
+    expect(JSON.parse(gates[3]!.task).reuse).toBeUndefined();
+    expect(gates[3]!.key).toContain(".fresh.gate");
+    expect(readFileSync(`${host.root}/.pi/suite-runs`, "utf8")).toBe("run\nrun\n");
+    expect(host.current().lastFinalAcceptance.loop).toBe(4);
+    expect(host.current().freshAcceptanceAuthorized).toBe(false);
+    expect(host.current().consumedLoops).toBe(5);
+    const count = host.calls.length;
+    expect((await host.execute()).status).toBe("partial");
+    expect(host.calls).toHaveLength(count);
+  } else {
+    expect(output.status).toBe("partial");
+    expect(host.current().consumedLoops).toBe(3);
+    expect(finalGates(host)).toHaveLength(2);
+    expect(readFileSync(`${host.root}/.pi/suite-runs`, "utf8")).toBe("run\n");
+  }
+});
+
+test("a reused passing receipt proceeds through review on the unchanged candidate", async () => {
+  const host = fixture(undefined, { taskCount: 0, findings: true }); host.setLimit(3);
+  host.setRespond((request, normal) => {
+    const result = normal();
+    if (request.key.includes(".l1.") && request.key.endsWith("director-synthesis")) {
+      result.structuredOutput.screening.verdict = "material-gaps";
+      result.structuredOutput.screening.reason = "Required behavior missing";
+      result.structuredOutput.screening.assessments[0].material = true;
+    }
+    return result;
+  });
+  expect((await host.execute()).status).toBe("complete");
+  const gates = finalGates(host);
+  expect(gates).toHaveLength(2);
+  expect(JSON.parse(gates[1]!.task).reuse.loop).toBe(1);
+  expect(host.current().loop.finalAttempt.gate.receipt.reused.loop).toBe(1);
+  expect(host.calls.some(call => call.key === "invoke-human-1.l3.review.director-prepare")).toBe(true);
+});
+
+
+test.each(["before-launch", "after-receipt"])("one-shot fresh acceptance survives a persistence cut %s without extra command execution", async cut => {
+  const { host } = repeatedAcceptanceFixture();
+  expect((await host.execute()).status).toBe("blocked");
+  host.setFailSave(value => value.loop?.finalAttempt?.freshAuthorized &&
+    (cut === "before-launch" ? value.loop.finalAttempt.gate.stage === "intention" : value.loop.outcome === "gaps"));
+  expect((await host.execute({ unblock: true, resolution: { loop: 3, text: "Run fresh once" } })).status).not.toBe("complete");
+  expect(readFileSync(`${host.root}/.pi/suite-runs`, "utf8")).toBe(cut === "before-launch" ? "run\n" : "run\nrun\n");
+  host.setFailSave(undefined);
+  const output = await host.execute();
+  expect(output.status, output.reason).toBe("partial");
+  expect(readFileSync(`${host.root}/.pi/suite-runs`, "utf8")).toBe("run\nrun\n");
+  expect(finalGates(host).filter(call => call.key.includes(".fresh.gate"))).toHaveLength(1);
+  expect(host.current().freshAcceptanceAuthorized).toBe(false);
+});
+
+test("a new invocation has no reusable final acceptance record", async () => {
+  const first = fixture(undefined, { taskCount: 0 }); first.setLimit(1);
+  expect((await first.execute()).status).toBe("complete");
+  expect(first.current().lastFinalAcceptance).toBeDefined();
+  const second = fixture(undefined, { taskCount: 0 }); second.setLimit(1);
+  expect((await second.execute({ invocation: "human-2" })).status).toBe("complete");
+  expect(finalGates(second)).toHaveLength(1);
+  expect(JSON.parse(finalGates(second)[0]!.task)).not.toHaveProperty("reuse");
+});
+
+
+test.each(["missing", "changed"])("a compact review demand blocks on a %s original with its expected digest", async mode => {
+  const host = fixture(undefined, { taskCount: 0, findings: true }); host.setLimit(3);
+  let expected = "";
+  host.setRespond((request, normal) => {
+    const result = normal();
+    if (request.key === "invoke-human-1.l1.review.director-synthesis") {
+      result.structuredOutput.screening.verdict = "material-gaps";
+      result.structuredOutput.screening.reason = "Required observable behavior missing";
+      result.structuredOutput.screening.assessments[0].material = true;
+    }
+    if (request.agent === "pitako.checkout-observer" && request.key.includes(".l1.")) {
+      const ref = host.storage.get("review-invoke-human-1").originals.at(-1);
+      expected = ref.sha256;
+      if (mode === "missing") unlinkSync(ref.path);
+      else writeFileSync(ref.path, "{}");
+    }
+    return result;
+  });
+  const output = await host.execute();
+  expect(output.status).toBe("blocked");
+  expect(expected).toMatch(/^[a-f0-9]{64}$/);
+  expect(output.reason).toContain(expected);
+  expect(host.calls.some(call => call.key === "invoke-human-1.l2.demand-observation")).toBe(false);
+  expect(host.calls.some(call => call.agent === "pitako.worker")).toBe(false);
+});
+
+
+test.each(["before", "after"])("consumed review compaction survives a %s persistence cut without replaying reviewers", async cut => {
+  const host = fixture(undefined, { taskCount: 0 }); host.setLimit(1);
+  host.setFailSave(value => cut === "before" ? value.loop?.reviewOriginals?.stage === "receipt" : Boolean(value.loop?.reviewSynthesis));
+  expect((await host.execute()).status).not.toBe("complete");
+  const retained = host.storage.get("review-invoke-human-1");
+  expect(retained.originals.every((original: any) => cut === "before" ? Object.hasOwn(original, "value") : Boolean(original.sha256))).toBe(true);
+  const reviewers = host.calls.filter(call => call.key.includes(".review.")).length;
+  host.setFailSave(undefined);
+  const output = await host.execute();
+  expect(output.status, output.reason).toBe("complete");
+  expect(host.calls.filter(call => call.key.includes(".review."))).toHaveLength(reviewers);
+  expect(host.storage.get("review-invoke-human-1").originals.every((original: any) => !Object.hasOwn(original, "value") && Boolean(original.sha256))).toBe(true);
+  expect(host.current().loop).not.toHaveProperty("reviewOriginals");
+  const compliance = host.calls.find(call => call.key.endsWith(".compliance"))!;
+  expect(compliance.task).toContain("Completed review originals:");
+  expect(compliance.task).toContain(retained.originals[0].sha256 ?? host.storage.get("review-invoke-human-1").originals[0].sha256);
 });

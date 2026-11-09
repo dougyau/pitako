@@ -386,7 +386,7 @@ describe("plan/execute packaged composition", () => {
       if (queryMode === "persistence") expect(recovered.result.value.reason).toContain("Essential persistence failed");
       expect(recovered.bytes).toHaveLength(1);
       expect(recovered.bytes.every((bytes: number) => bytes <= 4096)).toBe(true);
-      expect(recovered.calls.filter((key: string) => !key.includes(".requests-") && !key.includes(".review.verify-") && !/\.seal(?:\.r\d+)?$/.test(key))).toEqual(succeeds ? ["invoke-human-1.l1.selection", "invoke-human-1.l1.acceptance.gate", ...Object.keys(queryChildren)] : []);
+      expect(recovered.calls.filter((key: string) => !key.includes(".requests-") && !key.includes(".review.verify-") && !/\.seal(?:\.r\d+)?$/.test(key))).toEqual(succeeds ? ["invoke-human-1.l1.selection", "invoke-human-1.l1.acceptance.gate", ...Object.keys(queryChildren).flatMap(key => key.endsWith(".compliance") ? ["invoke-human-1.l1.reviewOriginals", key] : [key])] : []);
       expect(recovered.calls.some((key: string) => key.includes(".recover") || key.endsWith(".director"))).toBe(false);
       const after = new Map<string, any>(recovered.storage).get("invoke-human-1");
       expect(after.association).toEqual(before.association);
@@ -411,7 +411,7 @@ describe("plan/execute packaged composition", () => {
       return;
     }
     expect(recovered.result.value).toMatchObject({ status: verdict === "clear" ? "complete" : "cancelled", loopsConsumed: verdict === "clear" ? 1 : 2, maxLoops: 3 });
-    expect(recovered.calls).toEqual(verdict === "clear" ? [compliance.key, closing.key] : ["invoke-human-1.l1.finalGaps", closing.key, "invoke-human-1.l2.prepare", observation.key, next.key]);
+    expect(recovered.calls).toEqual(verdict === "clear" ? ["invoke-human-1.l1.reviewOriginals", compliance.key, closing.key] : ["invoke-human-1.l1.finalGaps", "invoke-human-1.l1.reviewOriginals", closing.key, "invoke-human-1.l2.prepare", "invoke-human-1.l2.demandOriginals", observation.key, next.key]);
     expect(recovered.statuses).toHaveLength(6);
     expect(recovered.bytes.every((bytes: number) => bytes <= 4096)).toBe(true);
     for (const [key, value] of recovered.storage) storage.set(key, value);
@@ -1075,14 +1075,19 @@ describe("plan/execute packaged composition", () => {
     expect(call(nested, nested)).toMatchObject({ block: true });
   });
 
-  test.each(["siblings", "long-path"])("inspector metadata crosses a controlled 4096-byte native preview: %s", mode => {
-    const operation = runPreview(mode);
-    // Observe rejection immediately and await either outcome before removing roots.
-    workflowSettlements.push(operation.then(() => {}, () => {}));
-    return operation;
+  for (const mode of ["siblings", "long-path"]) describe(`inspector preview ${mode}`, () => {
+    let runPreview: () => Promise<void>;
+    // Git worktrees and the native inspector's compilation cache belong to the fixture.
+    beforeAll(() => { runPreview = preparePreview(mode); });
+    test(`inspector metadata crosses a controlled 4096-byte native preview: ${mode}`, () => {
+      const operation = runPreview();
+      // Observe rejection immediately and await either outcome before removing roots.
+      workflowSettlements.push(operation.then(() => {}, () => {}));
+      return operation;
+    });
   });
 
-  async function runPreview(mode: string) {
+  function preparePreview(mode: string) {
     const main = repository();
     const parent = path.join(main, ...(mode === "long-path" ? Array.from({ length: 12 }, (_, index) => `${index}-` + '中é"\\'.repeat(22)) : ["siblings"]));
     mkdirSync(parent, { recursive: true });
@@ -1090,7 +1095,7 @@ describe("plan/execute packaged composition", () => {
     const git = (...args: string[]) => execFileSync("git", args, { cwd: main, stdio: "ignore" });
     git("worktree", "add", "-qb", "designated", root);
     const content = `---\npitako-spec: 1\nid: assignment\nstatus: complete\n---\n${SPEC_SECTIONS.map(title => `## ${title}\nAgreed ${title}.`).join("\n")}\n`;
-    const locations = [];
+    const locations: string[] = [];
     // Cross the preview byte limit with longer paths, not more Git worktrees.
     for (let index = 0; index < (mode === "siblings" ? 3 : 1); index++) {
       const sibling = mode === "long-path" ? root : path.join(parent, `sibling-${index}`,
@@ -1100,9 +1105,9 @@ describe("plan/execute packaged composition", () => {
       mkdirSync(path.dirname(target), { recursive: true }); writeFileSync(target, content); locations.push(target);
     }
     const selected = locations.at(-1)!;
-    const rawDiscovery = JSON.parse(execFileSync("node", [path.resolve("skills/execute/inspect.mjs"), root, "assignment", ""], { encoding: "utf8" }));
-    expect(Buffer.byteLength(JSON.stringify(rawDiscovery))).toBeGreaterThan(4096);
-    expect(rawDiscovery.candidates.map((item: { source: string }) => item.source).sort()).toEqual(mode === "siblings" ? [...locations].sort() : []);
+    const env = { ...process.env, PI_CODING_AGENT_DIR: path.join(root, "private-agent-settings"),
+      NODE_COMPILE_CACHE: path.join(main, "inspector-compile-cache") };
+    const rawDiscovery = JSON.parse(execFileSync("node", [path.resolve("skills/execute/inspect.mjs"), root, "assignment", ""], { encoding: "utf8", env }));
     const cache = new Map<string, string>();
     async function execute(source?: string) {
       const expanded = resourceWithAgentDir(path.join(root, "private-agent-settings")).resolve({ root, id: "assignment", invocation: "human-1", missionId: "native.mission-1", missionPath: "/native/actual-mission.json", ...(source ? { source } : {}) });
@@ -1113,7 +1118,8 @@ describe("plan/execute packaged composition", () => {
         launch: async (key, request) => {
           launched.push(key); expect(request.cwd).toBe(root);
           if (key.endsWith(".director")) expect(request.task).toContain(JSON.stringify(selected));
-          return childResponse(key, request, { root, boardPath: path.join(main, "board.db"), commonDir: rawDiscovery.commonDir, selected: { source: selected, digest: digest(content) } }, checkout);
+          // Preview transport keeps the real inspector; persistence uses the existing in-process boundary.
+          return childResponse(key, request, { root, loopOperations, boardPath: path.join(main, "board.db"), commonDir: rawDiscovery.commonDir, selected: { source: selected, digest: digest(content) } }, checkout);
 
         },
         status: async () => { throw new Error("Unexpected status"); },
@@ -1122,8 +1128,7 @@ describe("plan/execute packaged composition", () => {
           let stdout = cache.get(params.command);
           if (stdout === undefined) {
             stdout = execFileSync("sh", ["-c", params.command], { cwd: root,
-              env: { ...process.env, PI_CODING_AGENT_DIR: path.join(root, "private-agent-settings") },
-              encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+              env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
             cache.set(params.command, stdout);
           }
           if (key.startsWith("inspect-")) stdout = JSON.stringify({ ...JSON.parse(stdout), checkout }) + "\n";
@@ -1135,19 +1140,23 @@ describe("plan/execute packaged composition", () => {
       for (const envelope of envelopes) expect(Buffer.byteLength(envelope)).toBeLessThanOrEqual(4096);
       return { value: result.value, storage, launched, envelopes };
     }
-    if (mode === "siblings") {
-      let error = "";
-      try { await execute(); } catch (cause) { error = String(cause); }
-      expect(error).toContain("Ambiguous spec-plan");
-      expect(error).toContain("explicitly prepare admission");
-      for (const source of locations) expect(error).toContain(source);
-    }
-    const chosen = await execute(selected);
-    expect(chosen.value).toMatchObject({ status: "complete" });
-    expect(chosen.storage.get("invoke-human-1")).toMatchObject({ association: { source: selected, digest: digest(content) }, version: 6 });
-    expect(chosen.storage.get("pitako-execution")).toMatchObject({ version: 6, association: { root, commonDir: path.join(main, ".git") } });
-    expect(chosen.envelopes).toHaveLength(1);
-    expect(JSON.parse(chosen.envelopes[0]!).binding).toBe(preliminarySpec(root, "assignment", selected).binding);
+    return async () => {
+      expect(Buffer.byteLength(JSON.stringify(rawDiscovery))).toBeGreaterThan(4096);
+      expect(rawDiscovery.candidates.map((item: { source: string }) => item.source).sort()).toEqual(mode === "siblings" ? [...locations].sort() : []);
+      if (mode === "siblings") {
+        let error = "";
+        try { await execute(); } catch (cause) { error = String(cause); }
+        expect(error).toContain("Ambiguous spec-plan");
+        expect(error).toContain("explicitly prepare admission");
+        for (const source of locations) expect(error).toContain(source);
+      }
+      const chosen = await execute(selected);
+      expect(chosen.value).toMatchObject({ status: "complete" });
+      expect(chosen.storage.get("invoke-human-1")).toMatchObject({ association: { source: selected, digest: digest(content) }, version: 6 });
+      expect(chosen.storage.get("pitako-execution")).toMatchObject({ version: 6, association: { root, commonDir: path.join(main, ".git") } });
+      expect(chosen.envelopes).toHaveLength(1);
+      expect(JSON.parse(chosen.envelopes[0]!).binding).toBe(preliminarySpec(root, "assignment", selected).binding);
+    };
   }
 
   test.each(["escaped", "multibyte"])("maximum-size escaped specs close three cycles with one initial host call: %s", async kind => {

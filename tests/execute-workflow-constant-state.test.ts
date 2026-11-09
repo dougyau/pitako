@@ -16,6 +16,9 @@ test("30 single-task loops retain constant state across pauses, recoveries and -
     expect(value).not.toHaveProperty("loops");
     if (value.loop?.kind === "task") {
       expect(value.loop.selection?.receipt).not.toHaveProperty("completedTasks");
+      expect(value.loop.selection.receipt.selected).toBe(value.loop.task.id);
+      expect(value.loop.selection.receipt.digest).toBe(value.loop.taskBacklogDigest);
+      expect(JSON.stringify(value.loop.selection.receipt)).not.toContain(value.loop.task.goal);
       if (value.loop.settlement?.receipt) expect(value.loop.settlement.receipt).not.toHaveProperty("completedTasks");
     }
     sizes.push({ loop: value.consumedLoops, bytes });

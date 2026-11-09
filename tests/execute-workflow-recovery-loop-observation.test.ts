@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import path from "node:path";
-import { readBacklog } from "../skills/execute/loop.ts";
+import { readReviewOriginal, readBacklog } from "../skills/execute/loop.ts";
 import { restoreCheckpoint } from "../extensions/execute-checkpoint.ts";
 import { validateToolArguments } from "@earendil-works/pi-ai";
 import { validateWorkflowScript } from "../node_modules/pi-subagents/src/workflows/scripted-workflow.js";
@@ -10,6 +10,18 @@ import { digest, MAX_SPEC_BYTES } from "../extensions/spec-plans.ts";
 import { executeControllerFixture, resolvedLoop, source, copy, gaps, closedInterruptedProducer, cutAt, config, candidate, expectImpediment, removeCache, publicationWitness, type Result } from "./fixtures/execute-workflow.ts";
 
 const { fixture } = executeControllerFixture();
+
+// Association/access witnesses belong to the in-progress manifest, not compact references.
+function observeInlineReviewOriginals(host: ReturnType<typeof fixture>) {
+  const originals = new Map<string, any>();
+  host.setSaveObserver(() => {
+    const manifest = host.storage.get("review-invoke-human-1");
+    for (const original of manifest?.originals ?? [])
+      if (Object.hasOwn(original, "value"))
+        originals.set(original.key, copy({ ...manifest.originalDefaults, ...original }));
+  });
+  return originals;
+}
 
 describe("workflow-owned execute controller", () => {
   test.each([2, 3])("v6 never migrates or rewrites a retained v%s invocation", async version => {
@@ -1770,6 +1782,7 @@ describe("workflow-owned execute controller", () => {
 
   test.each([2, 3, 4])("real %s-angle review includes critiques, one defense and synthesis, not include=material", async angles => {
     const host = fixture("FULL SPECS", { angles, findings: true });
+    const inlineOriginals = observeInlineReviewOriginals(host);
     const goal = "Improve record selection\n " + "with complete caller evidence ".repeat(12);
     host.setRespond((request, normal) => {
       const result = normal();
@@ -1805,7 +1818,10 @@ describe("workflow-owned execute controller", () => {
       expect(request.output).toBe(`review/${request.key}.json`);
       expect(request).toMatchObject({ cwd: host.root, reads: false, progress: false });
       const ref = resolvedLoop(host.current()).review.references.find((entry: any) => entry.key === request.key);
-      const original = { ...manifest.originalDefaults, ...manifest.originals.find((entry: any) => entry.key === request.key) };
+      const retained = manifest.originals.find((entry: any) => entry.key === request.key);
+      expect(Object.keys(retained).sort()).toEqual(["id", "key", "path", "runId", "sha256"]);
+      const original = inlineOriginals.get(request.key);
+      expect(readReviewOriginal(retained)).toEqual(original.value);
       expect(ref.runId).toBe(original.runId);
       expect(ref.outputReference).toBe(`/native/output/${request.key}.json`);
       expect(original.results).toBeUndefined(); // canonical witnesses belong to execute, not a second manifest copy
@@ -1866,6 +1882,7 @@ describe("workflow-owned execute controller", () => {
 
   test.each(["different-path", "no-reference"])("integrated review retains distinct or missing publication references: %s", async mode => {
     const host = fixture();
+    const inlineOriginals = observeInlineReviewOriginals(host);
     host.setRespond((request, normal) => {
       const result = normal();
       if (request.phase?.startsWith("review-")) {
@@ -1882,8 +1899,9 @@ describe("workflow-owned execute controller", () => {
       expect(witness.savedOutputPath).toBe(actual.savedOutputPath);
       expect(witness.outputReference).toEqual(actual.outputReference);
       const original = host.storage.get("review-invoke-human-1").originals.find((entry: any) => entry.key === ref.key);
-      expect(original.association.key).toBe(ref.key);
-      expect(JSON.parse(readFileSync(witness.savedOutputPath, "utf8"))).toEqual(original.value);
+      expect(inlineOriginals.get(ref.key).association.key).toBe(ref.key);
+      expect(readReviewOriginal(original)).toEqual(inlineOriginals.get(ref.key).value);
+      expect(JSON.parse(readFileSync(witness.savedOutputPath, "utf8"))).toEqual(readReviewOriginal(original));
     }
   });
 
@@ -1915,7 +1933,11 @@ describe("workflow-owned execute controller", () => {
       });
       // The failed original must exist once in every durable merged checkpoint.
       const bodyCopies: number[] = [];
+      let optionalOriginal: any;
       host.setSaveObserver(() => {
+        const manifest = host.storage.get("review-invoke-human-1");
+        const inline = manifest?.originals.find((entry: any) => entry.runId === observed?.runId && Object.hasOwn(entry, "value"));
+        if (inline) optionalOriginal = copy({ ...manifest.originalDefaults, ...inline });
         if (!observed?.structuredOutput) return;
         const merged = JSON.stringify(Object.fromEntries(host.storage));
         bodyCopies.push(merged.split(JSON.stringify(observed.structuredOutput.reason).slice(1, -1)).length - 1);
@@ -1946,7 +1968,10 @@ describe("workflow-owned execute controller", () => {
         expect(original).toMatchObject({ publication: "unpublished", sufficient: false });
         expect(host.calls.some(request => ["review-critique", "review-defense", "review-synthesis"].includes(request.phase!))).toBe(false);
       }
-      if (mode === "optional-artifact") expect(original).toMatchObject({ publication: "published", observability: "failed", sufficient: true });
+      if (mode === "optional-artifact") {
+        expect(optionalOriginal).toMatchObject({ publication: "published", observability: "failed", sufficient: true });
+        expect(readReviewOriginal(retainedOriginal)).toEqual(optionalOriginal.value);
+      }
       if (mode === "partial-failed") {
         host.setStatus(ref => ({ ...copy(host.native.get(ref)!), ok: true,
           structuredOutput: { ...observed!.structuredOutput, angles: undefined } }));
@@ -2151,11 +2176,13 @@ describe("workflow-owned execute controller", () => {
     const synthesis = host.calls.findIndex(call => call.key === "invoke-human-1.l1.review.director-synthesis");
     expect(host.calls[synthesis + 1]!.agent).toBe("pitako.loop-io");
     expect(host.calls[synthesis + 1]!.task).toContain("final-phase");
-    expect(host.calls[synthesis + 2]!.key).toBe("invoke-human-1.l1.checkout");
-    expect(host.calls[synthesis + 3]!.key).toBe("invoke-human-1.l2.prepare");
-    expect(host.calls[synthesis + 4]!.key).toBe("invoke-human-1.l2.demand-observation");
-    expect(host.calls[synthesis + 5]!.key).toBe("invoke-human-1.l2.director");
-    expect(host.calls.slice(synthesis + 1, synthesis + 6).some(call => call.agent === "pitako.worker")).toBe(false);
+    expect(host.calls[synthesis + 2]!.key).toBe("invoke-human-1.l1.reviewOriginals");
+    expect(host.calls[synthesis + 3]!.key).toBe("invoke-human-1.l1.checkout");
+    expect(host.calls[synthesis + 4]!.key).toBe("invoke-human-1.l2.prepare");
+    expect(host.calls[synthesis + 5]!.key).toBe("invoke-human-1.l2.demandOriginals");
+    expect(host.calls[synthesis + 6]!.key).toBe("invoke-human-1.l2.demand-observation");
+    expect(host.calls[synthesis + 7]!.key).toBe("invoke-human-1.l2.director");
+    expect(host.calls.slice(synthesis + 1, synthesis + 8).some(call => call.agent === "pitako.worker")).toBe(false);
     const report = host.emits.find(value => value.type === "execution-loop" && value.loop === 1);
     expect(report.next).toBe("continue loop 2"); expect(report.verification.compliance.status).toBe("not-run");
   });
@@ -3030,6 +3057,7 @@ describe("workflow-owned execute controller", () => {
     const content = unit.repeat(Math.floor(MAX_SPEC_BYTES / Buffer.byteLength(unit))) + "x".repeat(MAX_SPEC_BYTES % Buffer.byteLength(unit));
     expect(Buffer.byteLength(content)).toBe(39936);
     const host = fixture(content, { metadataPadding: 7000, angles: 4, findings: true, taskCount: 0 });
+    const inlineOriginals = observeInlineReviewOriginals(host);
     host.storage.set("other-owned-history", { content: "h".repeat(90000) });
     const essentialBytes: number[] = [];
     const originalSet = host.state.set;
@@ -3075,7 +3103,9 @@ describe("workflow-owned execute controller", () => {
       expect(manifest.revision).toBe(1);
       expect(manifest.originals).toHaveLength(14);
       for (const retained of manifest.originals) {
-        const original = { ...manifest.originalDefaults, ...retained };
+        expect(Object.keys(retained).sort()).toEqual(["id", "key", "path", "runId", "sha256"]);
+        const original = inlineOriginals.get(retained.key);
+        expect(readReviewOriginal(retained)).toEqual(original.value);
         expect(original).toMatchObject({ attempt: 1, terminal: "succeeded", publication: "published",
           delivery: "complete", essentialAccess: "accessible", sufficient: true, diagnostic: "" });
         const ref = loop.review.references.find((entry: any) => entry.key === original.key);

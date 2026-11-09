@@ -6,7 +6,7 @@ import path from "node:path";
 const { appendLedger, verifyLedger, loopSummaries, canonicalJSON, summarizeLoops } = await import(path.resolve("skills/execute/ledger.mjs"));
 import { captureCheckpoint } from "../../extensions/execute-checkpoint.ts";
 import { checkoutEvidence, digest, inspectionSnapshot, specBinding, specChunks } from "../../extensions/spec-plans.ts";
-import { updateProgress, apply, cancelledScope, readBacklog } from "../../skills/execute/loop.ts";
+import { updateProgress, apply, reviewOriginals, cancelledScope, readBacklog } from "../../skills/execute/loop.ts";
 import { EXECUTE_STATE_VERSION } from "../../extensions/execute-state.ts";
 import { verifyGate } from "../../extensions/access-receipts.mjs";
 import { MISSION_STATE_MAX_BYTES } from "../../node_modules/pi-subagents/src/missions/workflow-state.js";
@@ -52,7 +52,7 @@ const task = (id: string, kind = "implementation") => ({ id, kind, goal: `Goal $
   scope: [`src/${id}.ts`], allowedEffects: kind === "verification" ? ["read/check"] : ["edit assigned path"], expectedResult: `Result ${id}`,
   dependsOn: [] as { taskId: string; reason: string }[],
   checks: [{ id: `${id}-check`, requirement: "spec:criterion-1", command: `bun test ${id}`, cwd: config.root }] });
-type FixtureOptions = { metadataPadding?: number; taskCount?: number; angles?: number; findings?: boolean; readOnly?: boolean;
+type FixtureOptions = { humanPosts?: any[]; metadataPadding?: number; taskCount?: number; angles?: number; findings?: boolean; readOnly?: boolean;
   controlledCheckpoints?: boolean; controlledPublisher?: boolean; retainSnapshots?: boolean; rawWorkerReceipts?: boolean };
 type OwnedResources = { roots: string[]; settlements: Promise<unknown>[] };
 export function executeControllerFixture() {
@@ -95,7 +95,7 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
   };
   const summaries = (anchor: any) => options.controlledPublisher
     ? summarizeLoops(publishedRecords) : loopSummaries(root, config.invocation, anchor);
-  let saveObserver: ((value: any, bytes: number) => void) | undefined;
+  let saveObserver: ((value: any, bytes: number, serialized: string) => void) | undefined;
   const chunks = specChunks(content);
   const selected = { source: "/owned/sibling/" + "s".repeat(options.metadataPadding ?? 0) + "/.pitako/plans/spec.md", digest: digest(content), chunks: chunks.length };
   const metadata = { root: config.root, commonDir: path.join(root, ".git"), selected, candidates: [] };
@@ -148,11 +148,17 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
       mkdirSync(path.dirname(savedOutputPath), { recursive: true });
       writeFileSync(savedOutputPath, JSON.stringify(value));
     }
+    let structuredOutputPath = `/native/witness/${request.key}.json`;
+    if (request.key.endsWith(".compliance")) {
+      structuredOutputPath = path.join(root, ".pi/subagents/compliance-originals", request.key + ".json");
+      mkdirSync(path.dirname(structuredOutputPath), { recursive: true });
+      writeFileSync(structuredOutputPath, JSON.stringify(value));
+    }
     return { ok: true, agent: request.agent ?? "pitako.reviewer", runId: `native-${request.key}`, output: "Output saved to: /not-the-binding/preview.md",
       outputReference: `/native/output/${request.key}.json`, outputArtifactPath: `/native/binding/${request.key}.json`,
       outputPathMapping: { requestedPath: String(request.output), savedPath: `/native/remapped/${request.key}.json` },
       artifactPaths: [`/native/debug/${request.key}/`], results: [{ index: 0, agent: request.agent ?? "pitako.reviewer",
-        task: request.task, exitCode: 0, ...(savedOutputPath ? { savedOutputPath, outputReference: { path: savedOutputPath, bytes: Buffer.byteLength(JSON.stringify(value)), lines: 1, message: "Saved" } } : {}), structuredOutputPath: `/native/witness/${request.key}.json`,
+        task: request.task, exitCode: 0, ...(savedOutputPath ? { savedOutputPath, outputReference: { path: savedOutputPath, bytes: Buffer.byteLength(JSON.stringify(value)), lines: 1, message: "Saved" } } : {}), structuredOutputPath,
         usage: { input: 10, output: 5, cacheRead: 3, cacheWrite: 2, cost: 0, turns: 1 } }], structuredOutput: value };
   }
   function normal(request: Request): Result {
@@ -176,15 +182,15 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
     }
     if (request.agent === "pitako.loop-io") {
       const input = JSON.parse(request.task);
-      const view = { topicId: 1, authority: "spec and frozen amendments > DECISION > FINDING > HANDOFF; code wins over any map", posts: [], omitted: 0 };
+      const view = { topicId: 1, authority: "spec and frozen amendments > DECISION > FINDING > HANDOFF; code wins over any map", posts: options.humanPosts ?? [], omitted: 0 };
       if (input.operation !== "gate") {
         try {
           const current = readBacklog(root, "spec");
-          const value = input.operation === "prepare" ? { ...current, cancelledScope: current.backlog ? cancelledScope(current.backlog) : [], view, lastConfirmedUnit: null }
-            : { ...apply(input), view };
+          const value = input.operation === "reviewOriginals" ? { ...reviewOriginals(input), backlog: undefined } : input.operation === "prepare" ? { ...current, cancelledScope: current.backlog ? cancelledScope(current.backlog) : [], view, lastConfirmedUnit: null }
+            : { ...apply({ ...input, currentHumanIds: view.posts.filter(post => post.type === "HUMAN").map(post => post.id) }), view };
           const { backlog, ...receipt } = value;
           return { ok: true, key: request.key, agent: request.agent, runId: `native-${request.key}`,
-            output: JSON.stringify({ ...receipt, ...(backlog ? { acceptance: backlog.acceptance } : {}) }), results: [{ exitCode: 0 }] } as Result;
+            output: JSON.stringify({ ...receipt, ...(backlog ? { acceptance: backlog.acceptance, acceptanceHistory: backlog.acceptanceHistory } : {}) }), results: [{ exitCode: 0 }] } as Result;
         } catch (error) {
           return { ok: false, key: request.key, agent: request.agent, runId: `native-${request.key}`,
             output: JSON.stringify({ error: "loop-io", reason: String((error as Error).message), selectionRejected: (error as any).selectionRejected === true }), results: [{ exitCode: 1 }] } as Result;
@@ -194,7 +200,8 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
         const before = observedCandidate();
         const directory = path.join(root, ".pi/subagents/execute", config.invocation, "gates", request.key);
         mkdirSync(directory, { recursive: true });
-        const gates = input.task.gates.map((gate: any, index: number) => {
+        const reused = input.reuse && input.reuse.candidate.head === before.head && input.reuse.candidate.fingerprint === before.fingerprint;
+        const gates = reused ? copy(input.reuse.results) : input.task.gates.map((gate: any, index: number) => {
           const start = Date.now();
           const command = spawnSync("sh", ["-c", gate.command], { cwd: path.resolve(root, gate.cwd),
             encoding: "utf8", timeout: gate.timeoutMs });
@@ -209,7 +216,8 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
           gatesPassed: gates.filter((gate: any) => gate.status === "pass").length, gatesTotal: gates.length }, null);
         return { ok: true, key: request.key, agent: request.agent, runId: `native-${request.key}`,
           output: JSON.stringify({ before, after: copy(checkout), mutated: before.fingerprint !== checkout.fingerprint || before.head !== checkout.head,
-            gates, metric: null, progress, stalled: progress.nonImproving >= 3, view }), results: [{ exitCode: 0 }] } as Result;
+            gates, metric: null, progress, stalled: progress.nonImproving >= 3, view,
+            ...(reused ? { reused: { loop: input.reuse.loop, gateKey: input.reuse.gateKey } } : {}) }), results: [{ exitCode: 0 }] } as Result;
       }
       const previous = input.task.progress;
       const shouldRun = input.workerStatus === "complete" || !input.task.metric;
@@ -319,7 +327,7 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
       // Reuse the measured native JSON bytes for the isolated persisted value.
       storage.set(key, JSON.parse(serialized)[key]);
       if (options.retainSnapshots !== false) snapshots.push(copy(value));
-      saveObserver?.(value, bytes);
+      saveObserver?.(value, bytes, serialized);
     },
   };
   // Controlled admission boundary mirrors separate inert data and native digest;
@@ -346,6 +354,10 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
       if (!options.rawWorkerReceipts && request.agent === "pitako.worker" && response.structuredOutput?.status !== "complete" && response.structuredOutput &&
           response.structuredOutput.checkpointReceipt?.kind !== "pause")
         delete response.structuredOutput.checkpointReceipt;
+      // Publish the final controlled response, including caller-supplied findings.
+      for (const entry of response.results ?? []) for (const file of [entry.savedOutputPath, entry.structuredOutputPath])
+        if (file?.startsWith(root + "/") && existsSync(file) && response.structuredOutput)
+          writeFileSync(file, JSON.stringify(response.structuredOutput));
       if (response.runId) native.set(response.runId, copy(response)); native.set(request.key, copy(response));
       return response;
     })),

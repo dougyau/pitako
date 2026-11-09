@@ -28,6 +28,7 @@ const changeSchema = { anyOf: [
 const planSchema = object({ select: nullable(string), changes: list(changeSchema), reason: string });
 const acceptanceSchema = object({ id: string, command: string, cwd: string });
 acceptanceSchema.properties.verifies = list(integer);
+acceptanceSchema.properties.exception = object({ humanRef: integer, reason: string });
 planSchema.properties.acceptance = list(acceptanceSchema);
 const workerSchema = object({
   work: string, status: { enum: ["complete", "continue", "gaps", "blocked"] }, remaining: list(string),
@@ -98,8 +99,8 @@ function nativeReference(childKey, result) {
     ...(review ? ["nativeKey", "workflowKey", "outputSaveError", "metadataSaveError", "exitCode", "timedOut", "terminalOutcome", "stopped", "interrupted", "detached", "recovery", "toolBudgetBlocked", "acceptance", "state"] : [])])
     if (result?.[field] !== undefined) ref[field] = result[field];
   if (!review) {
-    const witnesses = result?.results?.filter(entry => text(entry.structuredOutputPath))
-      .map(entry => ({ structuredOutputPath: entry.structuredOutputPath }));
+    const witnesses = result?.results?.filter(entry => text(entry.structuredOutputPath) || text(entry.savedOutputPath))
+      .map(entry => Object.fromEntries(["structuredOutputPath", "savedOutputPath"].filter(field => text(entry[field])).map(field => [field, entry[field]])));
     if (witnesses?.length) ref.results = witnesses;
     return ref;
   }
@@ -893,7 +894,7 @@ function validatePlan(value) {
   return value;
 }
 function sharedContext() {
-  return { material: "Use the immutable spec, selected backlog task and current Board view. Authority: spec and frozen amendments > DECISION > FINDING > HANDOFF; code wins over any map.",
+  return { material: "Use the immutable spec, selected backlog task and current Board view. Authority: spec, frozen amendments and current HUMAN rulings (most recent human source wins; cite it) > DECISION > FINDING > HANDOFF; code wins over any map.",
     references: [invocation.association.source, invocation.backlogPath].filter(text) };
 }
 function selectedTasks() {
@@ -912,7 +913,11 @@ function backlogAuthority() {
 // Runtime operations have durable intentions and fresh retry keys, like gate.
 function loopIO(slot, input) {
   const pending = loop[slot] ??= { key: `${key}.l${loop.number}.${slot}`, retry: 0, stage: "intention" };
-  if (pending.stage === "receipt") return Promise.resolve(pending.receipt);
+  if (pending.stage === "receipt") {
+    if (slot !== "selection") return Promise.resolve(pending.receipt);
+    assertSelection();
+    return Promise.resolve({ ...pending.receipt, selected: loop.task });
+  }
   function run() {
     const childKey = pending.key + (pending.retry ? `.r${pending.retry}` : "");
     return Promise.resolve().then(() => {
@@ -939,9 +944,14 @@ function loopIO(slot, input) {
       }
       // Backlog content is never mission state: retain only task and digest projections.
       const { backlog, completedTasks, ...projection } = receipt;
-      if (slot === "selection" && projection.selected === null) projection.completedTasks = completedTasks;
+      if (slot === "selection") {
+        loop.task = projection.selected;
+        loop.taskBacklogDigest = projection.digest;
+        projection.selected = loop.task?.id ?? null;
+        if (projection.selected === null) projection.completedTasks = completedTasks;
+      }
       pending.receipt = projection; pending.stage = "receipt";
-      return save().then(() => projection);
+      return save().then(() => slot === "selection" ? { ...projection, selected: loop.task } : projection);
     });
   }
   const previousKey = pending.key + (pending.retry ? `.r${pending.retry}` : "");
@@ -954,6 +964,14 @@ function loopIO(slot, input) {
     });
   }
   return run();
+}
+function assertSelection() {
+  const receipt = loop.selection?.receipt;
+  // Retained pre-compaction missions are read in place, never migrated.
+  const legacy = receipt && typeof receipt.selected === "object" && loop.taskBacklogDigest === undefined;
+  if (!receipt || (legacy ? !same(receipt.selected, loop.task)
+    : receipt.selected !== (loop.task?.id ?? null) || receipt.digest !== loop.taskBacklogDigest))
+    planConflict("Selected task ID or backlog digest conflicts with the selection receipt.");
 }
 function settleTask() {
   if (loop.settlement?.applied) return Promise.resolve();
@@ -976,21 +994,28 @@ function settleTask() {
     return save();
   });
 }
-function recordFinalGaps(kind, findings, references) {
+function recordFinalGaps(kind, findings, outputs) {
   const changes = findings.map((finding, index) => ({ kind: "add", reason: finding.reason,
     task: { id: `final-${invocation.backlogDigest.slice(0, 16)}-${kind}-${index + 1}`, goal: finding.reason,
       expectedResult: `Resolve the final-phase finding: ${finding.reason}`,
-      status: "pending", origin: { kind: "final-phase", ref: JSON.stringify(references) },
+      status: "pending", origin: { kind: "final-phase", ref: JSON.stringify(outputs[index]) },
       specRefs: [finding.source ?? "Final phase: frozen spec and amendments"], dependsOn: [],
       gates: [], metric: null, parent: null, remaining: "Director must assign focused gates before selection.",
       progress: { nonImproving: 0, last5: [] }, history: [] } }));
   return loopIO("finalGaps", { operation: "apply", root: config.root, specId: config.id,
     expectedDigest: invocation.backlogDigest, key: `${key}.l${loop.number}.final-gaps`,
-    invocation: config.invocation, loop: loop.number, authority: backlogAuthority(), recordGaps: true,
+    invocation: config.invocation, loop: loop.number, authority: backlogAuthority(), recordGaps: true, finalGapOutputs: outputs,
     director: { select: null, changes, reason: `Final-phase ${kind} gaps` } }).then(applied => {
     invocation.backlogDigest = applied.digest; invocation.currentView = null;
     return save();
   });
+}
+function findingOutput(ref) {
+  const path = ref?.results?.find(entry => text(entry.savedOutputPath))?.savedOutputPath ??
+    ref?.results?.find(entry => text(entry.structuredOutputPath))?.structuredOutputPath ??
+    (typeof ref?.outputReference === "string" ? ref.outputReference : ref?.outputReference?.path);
+  if (!text(ref?.key) || !text(path)) throw new Error("Final finding lacks an exact output path.");
+  return { key: ref.key, path };
 }
 function fullContext() {
   return `CURRENT HUMAN RESOLUTIONS (accepted input, not new permissions): ${JSON.stringify([
@@ -1033,24 +1058,18 @@ function demandHistory() {
 function pendingDemandSources() {
   return closedSources(loop.number - 1);
 }
-// The archived loop review owns full control witnesses; a demand source keeps the
-// stable reference shape used for other children plus each saved original path.
-function demandReference(ref) {
-  const value = Object.fromEntries(["key", "agent", "runId", "asyncDir", "outputReference", "outputArtifactPath",
-    "outputPathMapping", "artifactPaths", "externalAdapter", "error", "barrier"]
-    .filter(field => ref[field] !== undefined && ref[field] !== null).map(field => [field, clone(ref[field])]));
-  const witnesses = ref.results?.map(entry => Object.fromEntries(["savedOutputPath", "structuredOutputPath"]
-    .filter(field => text(entry[field])).map(field => [field, entry[field]]))).filter(entry => Object.keys(entry).length);
-  if (witnesses?.length) value.results = witnesses;
-  return value;
-}
 function observeDemands() {
   const sources = pendingDemandSources();
   if (!sources.length) return Promise.resolve(null);
+  const retained = sources.filter(source => source.kind === "review").map(source => ({
+    id: source.ref.key, ...source.ref,
+  }));
+  const verified = retained.length ? loopIO("demandOriginals", { operation: "reviewOriginals", originals: retained }) : Promise.resolve();
   const childKey = `${key}.l${loop.number}.demand-observation`;
-  return collect(childKey, "pitako.reviewer", { label: "Observe inherited demands", phase: "director" }, `${fullContext()}
+  return verified.then(() => collect(childKey, "pitako.reviewer", { label: "Observe inherited demands", phase: "director" }, `${fullContext()}
 INDIVIDUAL READ-ONLY DEMAND OBSERVATION, not product review or a future plan.
 Read and apply scope-discipline. Read exact full originals and relevant causal references below.
+For compact references, read the path and verify its SHA-256; missing or changed bytes block with the expected digest.
 Observe only candidate demands and their justification against the authorized assignment,
 current human decisions and limits. Follow relevant provenance, not an exhaustive historical audit.
 Do not find general product defects, design additional tests, or publish another plan.
@@ -1060,7 +1079,7 @@ Return memo, evidenceLimits and observations with source reference, demand and r
 Empty observations and analytical uncertainty are valid advice, not veto, approval,
 certification, removal orders, investigation/tests or extra human approval. Preserve necessary
 work in mixed tasks, explicit requirements, admitted gates and whole-spec sufficiency.`,
-    demandObservationSchema, false, analysisDispatch, undefined, true).then(result => {
+    demandObservationSchema, false, analysisDispatch, undefined, true)).then(result => {
       const value = result?.structuredOutput;
       if (!result?.ok || !text(value?.memo) || !Array.isArray(value.evidenceLimits) ||
           !value.evidenceLimits.every(text) || !Array.isArray(value.observations) ||
@@ -1180,7 +1199,10 @@ Use structured_output.`, recoverySchema))).then(result => {
   });
 }
 function recoverPlan() {
-  if (loop.task && loop.plan?.stage === "admitted") return Promise.resolve(true);
+  if (loop.task && loop.plan?.stage === "admitted") {
+    assertSelection();
+    return Promise.resolve(true);
+  }
   const ref = loop.plan.ref;
   return observeStatus(ref.runId ?? ref.key).then(result => {
     if (barrier(result, ref.runId ?? ref.key)) throw nativeBarrier(barrier(result, ref.runId ?? ref.key), ref);
@@ -1595,7 +1617,7 @@ function observePendingSealer() {
   });
 }
 // Gate intentions and receipts survive relaunch; a saved seal never reruns gates.
-function verifyAttempt(descriptor, task, value) {
+function verifyAttempt(descriptor, task, value, reuse) {
   const pending = descriptor.gate ??= { key: `${descriptor.key}.gate`, stage: "intention", retry: 0 };
   if (pending.stage === "receipt") return Promise.resolve(pending.receipt);
   if (descriptor.seal) return Promise.reject(new Error("Seal intention has no durable gate receipt; recovery required."));
@@ -1620,7 +1642,7 @@ function verifyAttempt(descriptor, task, value) {
       timeoutMs: 14400000,
       task: JSON.stringify({ operation: "gate", root: config.root, specId: config.id, invocation: config.invocation,
         loop: loop.number, attempt: descriptor.number, key: gateKey, task: gateTask,
-        workerStatus: value.status, writerSettled: true, knowledge: value.knowledge }) }])).then(([result]) => {
+        workerStatus: value.status, writerSettled: true, knowledge: value.knowledge, ...(reuse ? { reuse } : {}) }) }])).then(([result]) => {
       pending.ref = nativeReference(gateKey, result);
       const cause = barrier(result, gateKey);
       if (cause) return save().then(() => { throw nativeBarrier(cause, pending.ref); });
@@ -1660,13 +1682,30 @@ function verifyAttempt(descriptor, task, value) {
   return runGate();
 }
 
+function acceptanceResults() {
+  const receipt = loop?.finalAttempt?.gate?.receipt;
+  const humanIds = new Set((receipt?.view?.posts ?? []).filter(post => post.type === "HUMAN").map(post => post.id));
+  const blocking = [], excepted = [];
+  for (const result of receipt?.gates ?? []) {
+    const exception = loop.acceptance?.find(command => command.id === result.id)?.exception;
+    if (exception && humanIds.has(exception.humanRef)) excepted.push({ ...result, ...exception });
+    else blocking.push(result);
+  }
+  return { blocking, excepted };
+}
+function acceptanceBrief() {
+  return `Excepted acceptance results: ${JSON.stringify(acceptanceResults().excepted)}.
+Acceptance history: ${JSON.stringify(loop.selection?.receipt?.acceptanceHistory ?? [])}.
+Inspect acceptanceHistory and report as a gap any acceptance replacement that narrows, filters or relaxes a command and cites no HUMAN post ID that is current in this execute topic.
+An excepted failure covered by a current HUMAN is reported, not a gap or repair task.`;
+}
 function currentAcceptance() {
   const receipt = loop.finalAttempt?.gate?.receipt;
   return loop.kind === "final" && loop.finalAttempt?.gate?.stage === "receipt" &&
     Array.isArray(loop.acceptance) && loop.acceptance.length > 0 &&
     validGateReceipt(receipt, { gates: loop.acceptance, metric: null }, "complete") &&
     !receipt.mutated && same(candidate(receipt.after), currentCandidate) &&
-    receipt.gates.every(gate => gate.status === "pass" && gate.exit === 0);
+    acceptanceResults().blocking.every(gate => gate.status === "pass" && gate.exit === 0);
 }
 
 function validGateReceipt(receipt, task, status) {
@@ -1872,7 +1911,7 @@ function foldLoop(summaries) {
     sources.push({ kind: "worker", ref: exit.ref, taskId: exit.taskId, attempt: exit.attempt,
       status: exit.status, diagnosis: excerpt(exit.diagnosis) });
   if (loop.review?.verdict === "material-gaps")
-    sources.push({ kind: "review", references: loop.review.references.map(demandReference), reason: excerpt(loop.review.reason) });
+    sources.push({ kind: "review", ref: loop.reviewSynthesis, reason: excerpt(loop.review.reason) });
   if (loop.compliance?.status === "gaps")
     sources.push({ kind: "compliance", ref: loop.compliance.ref, reason: excerpt(loop.compliance.reason) });
   // Replace the previous loop's pending sources; generic gaps are not inherited demands.
@@ -2092,8 +2131,12 @@ function action(status, reason) {
 }
 function finish(status, reason) {
   if (persistenceFailed && persistenceReason && !reason.includes(persistenceReason)) reason += ` ${persistenceReason}`;
+  const exceptions = status === "complete" ? acceptanceResults().excepted
+    .filter(gate => gate.status !== "pass" || gate.exit !== 0)
+    .map(({ id, status, exit, logRef, humanRef, reason }) => ({ id, status, exit, logRef, humanRef, reason })) : [];
   return {
-    status, heading: `Execution ${status}`, reason, invocation: config.invocation,
+    status, heading: exceptions.length ? "Execution complete with exceptions" : `Execution ${status}`,
+    ...(exceptions.length ? { exceptions } : {}), reason, invocation: config.invocation,
     missionId: config.missionId, missionPath: config.missionPath, boardTopicId: invocation?.boardTopicId ?? null,
     loopsConsumed: invocation?.consumedLoops ?? 0, maxLoops: maxCycles(),
     elapsedMs: Number.isFinite(invocation?.startedAt) ? Date.now() - invocation.startedAt : null, tokens: metrics(),
@@ -2145,6 +2188,8 @@ try {
   if (legacy && (legacy.version !== invocation?.version || !same(legacy.association, invocation?.association) ||
       legacy.association.invocation !== config.invocation))
     return finish("blocked", "Native mission already belongs to another immutable invocation; no replacement writer dispatched.");
+  if (!config.unblock && loop?.halt?.code === "repeat-acceptance")
+    return finish(loop.halt.status, loop.halt.reason);
   if (!config.unblock && invocation?.lastBudgetProgress) {
     if (loop?.halt) return finish(loop.halt.status, loop.halt.reason);
     const blockedResolution = retainedResolutions().find(item => item.currentBarrier);
@@ -2379,6 +2424,15 @@ try {
     resolution.stage = "applied";
     delete loop.halt; loop.outcome = "gaps"; loop.endedAt = Date.now();
     invocation.currentView = null; activePlan = null;
+    await save();
+  }
+  if (loop?.halt?.code === "repeat-acceptance") {
+    if (resolution?.stage !== "accepted" || resolution.loop !== loop.number || !same(resolution.halt, loop.halt))
+      return finish(loop.halt.status, loop.halt.reason);
+    resolution.stage = "applied";
+    delete loop.halt; loop.outcome = "gaps"; loop.endedAt = Date.now();
+    invocation.currentView = null; activePlan = null;
+    invocation.freshAcceptanceAuthorized = true;
     await save();
   }
   if (["capacity", "native-dispatch", "semantic-block", "checkpoint-integrity"].includes(loop?.halt?.code))
@@ -2670,8 +2724,7 @@ ${JSON.stringify({ metricSeries: loop.metricSeries ?? task.progress ?? null,
   previousResult: descriptor.continuationRef?.outputReference ?? descriptor.continuationRef?.outputArtifactPath ?? null })}
 No other agents of this execution run concurrently. resource_snapshot is enough for host load;
 do not ask the supervisor about concurrency. Current DECISIONs are binding working rules:
-no reconfirmation is needed and they cannot expand scope. Authority: spec and frozen amendments
-> DECISION > FINDING > HANDOFF; code wins over any map.
+no reconfirmation is needed and they cannot expand scope. Authority: spec, frozen amendments and current HUMAN rulings (most recent human source wins; cite it) > DECISION > FINDING > HANDOFF; code wins over any map.
 ${descriptor.restore ? `CHECKPOINT FALLBACK (same pending task, not a metadata repair):
 ${JSON.stringify(descriptor.restore)}
 Validate the complete exact associated checkpoint manifest with the owned helper before effects.
@@ -2786,19 +2839,41 @@ Return structured_output after all owned journaled writes settle.`,
       const acceptanceTask = { id: "final-acceptance", gates: loop.acceptance.map(command => ({ ...command,
         timeoutMs: command.timeoutMs ?? 1800000 })), metric: null };
       const finalAttempt = loop.finalAttempt ??= { key: `${key}.l${loop.number}.acceptance`, number: 1 };
-      const receipt = await verifyAttempt(finalAttempt, acceptanceTask, { status: "complete", knowledge: {} });
+      const exec = acceptanceTask.gates.map(({ id, command, cwd, timeoutMs }) => ({ id, command, cwd, timeoutMs }));
+      const previous = invocation.lastFinalAcceptance;
+      const reuse = !finalAttempt.freshAuthorized && previous?.loop < loop.number && same(previous.exec, exec) ? previous : undefined;
+      let receipt = await verifyAttempt(finalAttempt, acceptanceTask, { status: "complete", knowledge: {} }, reuse);
+      if (receipt.reused && !currentAcceptance() && invocation.freshAcceptanceAuthorized && !receipt.mutated) {
+        // Consume authorization with the fresh intention, before any command can launch.
+        invocation.freshAcceptanceAuthorized = false;
+        finalAttempt.freshAuthorized = true;
+        finalAttempt.gate = { key: `${finalAttempt.key}.fresh.gate`, stage: "intention", retry: 0 };
+        await save();
+        receipt = await verifyAttempt(finalAttempt, acceptanceTask, { status: "complete", knowledge: {} });
+      }
+      invocation.freshAcceptanceAuthorized = false;
+      if (!receipt.reused && !receipt.mutated && !acceptanceResults().blocking.some(gate => ["timeout", "error"].includes(gate.status))) {
+        invocation.lastFinalAcceptance = { loop: loop.number, gateKey: finalAttempt.gate.ref?.key ?? finalAttempt.gate.key,
+          candidate: candidate(receipt.after), exec, results: clone(receipt.gates) };
+      }
+      await save();
+      if (receipt.reused && !currentAcceptance()) {
+        loop.halt = { status: "blocked", code: "repeat-acceptance",
+          reason: `Repeated final acceptance from loop ${receipt.reused.loop} (${receipt.reused.gateKey}) still fails: ${acceptanceResults().blocking.filter(gate => gate.status !== "pass" || gate.exit !== 0).map(gate => `${gate.id}: ${gate.status} (${gate.logRef})`).join("; ")}` };
+        await save(); return finish("blocked", loop.halt.reason);
+      }
       recordOriginalProblem(acceptanceTask, receipt, finalAttempt);
-      const environment = receipt.gates.filter(gate => ["timeout", "error"].includes(gate.status));
+      const environment = acceptanceResults().blocking.filter(gate => ["timeout", "error"].includes(gate.status));
       if (environment.length) {
         loop.halt = { status: "blocked", code: "environment", reason: `Final acceptance environment failure: ${environment.map(gate => `${gate.id}: ${gate.status} (${gate.logRef})`).join("; ")}` };
         await save(); return finish("blocked", loop.halt.reason);
       }
       if (!currentAcceptance()) {
-        const failed = receipt.gates.filter(gate => gate.status === "fail");
+        const failed = acceptanceResults().blocking.filter(gate => gate.status === "fail");
         if (failed.length) await recordFinalGaps("acceptance", failed.map(gate => ({
           reason: `Final acceptance gate ${gate.id} failed (exit ${gate.exit}): ${gate.logRef}`,
           source: `Final acceptance gate ${gate.id}`,
-        })), { receipt: finalAttempt.gate.ref, logs: failed.map(gate => gate.logRef) });
+        })), failed.map(gate => ({ key: finalAttempt.gate.key, path: gate.logRef })));
         loop.outcome = "gaps"; loop.endedAt = Date.now(); await save();
         loopReport("gaps", `Final acceptance failed or candidate changed: ${JSON.stringify(receipt)}`);
         continue;
@@ -2835,7 +2910,9 @@ Do not repeat correct completed implementation merely to improve its past decomp
 Candidate including WIP: ${JSON.stringify(loop.candidate)}.
 Actual final checks/result references: ${JSON.stringify(loopResults())}.
 Done/obsolete tasks and reasons: ${JSON.stringify(loop.completedTasks)}.
-Current Board DECISIONs and authority: ${JSON.stringify(invocation.currentView)}.
+Authority: spec, frozen amendments and current HUMAN rulings (most recent human source wins; cite it) > DECISION > FINDING > HANDOFF; code wins over any map.
+Current Board HUMAN rulings, DECISIONs and authority: ${JSON.stringify(invocation.currentView)}.
+${acceptanceBrief()}
 No own writer is active. Do not run checks or repair. Only clear screening permits compliance.`,
         target: { kind: "solution", reference: JSON.stringify(loop.candidate),
           material: `Entire designated checkout ${config.root}, immutable full specs above and native work/check artifacts.
@@ -2872,14 +2949,35 @@ Read the actual sources and full referenced reports, not previews. Candidate: ${
         return finish(loop.halt.status, loop.halt.reason);
       }
       if (reviewed.screening.verdict !== "clear")
-        await recordFinalGaps("review", [{ reason: loop.review.reason }], loop.review.references);
+        await recordFinalGaps("review", [{ reason: loop.review.reason }],
+          [findingOutput(loop.review.references.find(ref => ref.key.endsWith(".director-synthesis")))]);
       loop.phase = reviewed.screening.verdict === "clear" ? "compliance" : "closing";
       await save();
+    }
+    if (["compliance", "closing"].includes(loop.phase) && loop.review?.status === "completed") {
+      const reviewKey = `review-${key}`, retained = await state.get(reviewKey);
+      if (retained?.decision?.reference?.loop === loop.number && retained.originals.some(original => !original.sha256)) {
+        const originals = retained.originals.map(original => ({ ...original,
+          path: findingOutput(loop.review.references.find(ref => ref.key === original.key)).path,
+        }));
+        const compact = await loopIO("reviewOriginals", { operation: "reviewOriginals", originals });
+        await state.set(reviewKey, { ...retained, originals: compact.originals });
+        const synthesis = compact.originals.find(original => original.key.endsWith(".director-synthesis"));
+        loop.reviewSynthesis = { key: synthesis.key, path: synthesis.path, sha256: synthesis.sha256 };
+        delete loop.reviewOriginals;
+        await save();
+      } else if (retained?.decision?.reference?.loop === loop.number && !loop.reviewSynthesis) {
+        const synthesis = retained.originals.find(original => original.key.endsWith(".director-synthesis"));
+        loop.reviewSynthesis = { key: synthesis.key, path: synthesis.path, sha256: synthesis.sha256 };
+        delete loop.reviewOriginals;
+        await save();
+      }
     }
     if (loop.phase === "compliance") {
       if (loop.kind !== "final" || !currentAcceptance() || loop.review?.verdict !== "clear")
         throw new Error("Final compliance requires current acceptance and clear review on the same candidate.");
       await reconcileAnalysis();
+      const completedReview = await state.get(`review-${key}`);
       const complianceKey = `${key}.l${loop.number}.compliance`;
       const result = await collect(complianceKey, "pitako.reviewer",
         { label: "Check whole-spec compliance", phase: "compliance" }, `${fullContext()}
@@ -2900,12 +2998,18 @@ Cite source, reason, current candidate evidence and actual check references for 
 not-applicable requires a source-grounded reason. Identify missing obligations as gaps, not omissions.
 You are accountable for semantic coverage of the complete specs; script shape validation cannot
 certify it. An empty or entirely not-applicable inventory cannot justify fulfilled.
+Authority: spec, frozen amendments and current HUMAN rulings (most recent human source wins; cite it) > DECISION > FINDING > HANDOFF; code wins over any map.
+Current Board HUMAN rulings, DECISIONs and authority: ${JSON.stringify(invocation.currentView)}.
+${acceptanceBrief()}
 Candidate INCLUDING WIP: ${JSON.stringify(loop.candidate)}.
 Work and actual final mandatory checks: ${JSON.stringify(loopResults())}.
 MAIN-SESSION CANCELLATIONS (not human intent): ${JSON.stringify(cancelledScope())}.
 Unfulfilled entries must be reported as "cancelled by main-session request" with origin,
 never as human intent or fulfilled scope: ${JSON.stringify(unfulfilledCancellations())}.
 Reasoned shared adversarial clear: ${JSON.stringify(loop.review)}.
+Completed review originals: ${JSON.stringify(completedReview.originals)}.
+Read completed originals from their paths and verify SHA-256 before consumption; a missing or mismatched
+file blocks with the expected digest, never reconstruct its value from a summary.
 Admitted COMPLETE plan references: ${JSON.stringify(loop.plan.ref)}.
 Independently assess single-outcome decomposition and dependency completeness against the full spec;
 structural validation cannot prove them. Do not repeat correct work to improve past decomposition.
@@ -2943,7 +3047,8 @@ no unresolved material gaps and this SAME candidate. Otherwise gaps or blocked. 
           source: "main-session request", status: "gap", reason: task.cancel.reason })));
       }
       if (loop.compliance.status === "gaps")
-        await recordFinalGaps("compliance", loop.compliance.unresolved.length ? loop.compliance.unresolved : [{ reason: loop.compliance.reason }], loop.compliance.ref);
+        await recordFinalGaps("compliance", loop.compliance.unresolved.length ? loop.compliance.unresolved : [{ reason: loop.compliance.reason }],
+          (loop.compliance.unresolved.length ? loop.compliance.unresolved : [null]).map(() => findingOutput(loop.compliance.ref)));
       loop.phase = "closing"; await save();
     }
     if (loop.phase === "closing") {

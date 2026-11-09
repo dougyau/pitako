@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
-import { apply, backlogPath, boardView, gate, metricBefore, parseMetric, prepare, readBacklog, runCommand, topicOwner, updateProgress, validateBacklog, type Backlog, type GateInput, type Progress, type Task } from "../skills/execute/loop.ts";
+import { apply, backlogPath, boardView, currentHumanPostIds, gate, metricBefore, parseMetric, prepare, readBacklog, runCommand, topicOwner, updateProgress, validateBacklog, type Backlog, type GateInput, type Progress, type Task } from "../skills/execute/loop.ts";
 import { openBoard } from "../extensions/board/store.ts";
 import { repositoryIdentity } from "../extensions/board/workspace.ts";
 
@@ -47,6 +47,55 @@ test("backlog schema errors name the file, preserve bytes and never repair human
     { ...applied.backlog, tasks: [{ ...task(), history: Array(9).fill({ invocation: "e", loop: 1, event: "add", reason: "spec" }) }] }]) {
     expect(() => validateBacklog(bad)).toThrow();
   }
+});
+
+test.each(["spec", "director", "final-phase", "human"] as const)("new %s origins enforce a UTF-8 byte cap", kind => {
+  const { root } = fixture(), value = task();
+  value.origin = { kind, ref: "é".repeat(257) };
+  expect(() => apply(initial(root, [value]))).toThrow("512 UTF-8 bytes");
+  expect(readBacklog(root, "example").backlog).toBeNull();
+  value.origin.ref = "é".repeat(256);
+  const request = initial(root, [value]), applied = apply(request);
+  expect(applied.selected!.origin.ref).toBe(value.origin.ref);
+  expect(apply(request).replay).toBe(true);
+});
+
+test("unchanged legacy origins survive updates, but split and cancellation writers cannot exceed the cap", () => {
+  const { root } = fixture(), first = apply(initial(root));
+  const legacy = structuredClone(first.backlog!); legacy.tasks[0]!.origin.ref = "é".repeat(1000);
+  writeFileSync(first.path, JSON.stringify(legacy));
+  const current = readBacklog(root, "example");
+  const request = { ...initial(root), key: "legacy", expectedDigest: current.digest,
+    director: { select: "one", changes: [{ kind: "update" as const, id: "one", patch: { goal: "Updated legacy task" }, reason: "Code evidence" }], reason: "Continue legacy task" } };
+  const updated = apply(request);
+  expect(updated.selected!.origin).toEqual(legacy.tasks[0]!.origin);
+  expect(apply(request).replay).toBe(true);
+  const next = { ...initial(root), key: "next", expectedDigest: updated.digest };
+  const child = task("child"); child.origin.ref = "x".repeat(513);
+  expect(() => apply({ ...next, director: { select: "child", reason: "Split", changes: [{ kind: "split", id: "one", tasks: [child], reason: "Split" }] } })).toThrow("512 UTF-8 bytes");
+  expect(() => apply({ ...next, director: { select: null, changes: [], reason: "Cancel" },
+    cancellations: [{ taskId: "one", requestId: "é".repeat(257), origin: "main", kind: "cancel" }] })).toThrow("512 UTF-8 bytes");
+  expect(readBacklog(root, "example").digest).toBe(updated.digest);
+  const cancelled = apply({ ...next, director: { select: null, changes: [], reason: "Cancel" },
+    cancellations: [{ taskId: "one", requestId: "é".repeat(256), origin: "main", kind: "cancel" }] });
+  expect(cancelled.backlog!.tasks[0]!.origin.ref).toBe("é".repeat(256));
+});
+
+test("final-gap recording hashes the finding output, bounds the completed origin and replays without rereading it", () => {
+  const { root } = fixture(), first = apply({ ...initial(root), director: { select: null, changes: [], reason: "Final phase" } });
+  const file = path.join(root, "finding.json"); writeFileSync(file, '{"reason":"missing behavior"}');
+  const value = task("gap"); value.origin = { kind: "final-phase", ref: "pending output hash" };
+  const request = { ...initial(root), key: "gaps", expectedDigest: first.digest, recordGaps: true,
+    finalGapOutputs: [{ key: "exec1.l1.review", path: file }],
+    director: { select: null, changes: [{ kind: "add" as const, task: value, reason: "Missing behavior" }], reason: "Record review" } };
+  expect(() => apply({ ...request, finalGapOutputs: [{ key: "é".repeat(257), path: file }] })).toThrow("512 UTF-8 bytes");
+  expect(() => apply({ ...request, finalGapOutputs: [{ key: "review", path: file + ".missing" }] })).toThrow();
+  expect(readBacklog(root, "example").digest).toBe(first.digest);
+  const recorded = apply(request), ref = recorded.backlog!.tasks[0]!.origin.ref;
+  expect(JSON.parse(ref)).toEqual({ ...request.finalGapOutputs[0], sha256: createHash("sha256").update(readFileSync(file)).digest("hex") });
+  expect(Buffer.byteLength(ref)).toBeLessThanOrEqual(512);
+  writeFileSync(file, "changed after recording");
+  expect(apply(request)).toMatchObject({ replay: true, digest: recorded.digest });
 });
 
 test("gate and acceptance verifies accept only positive criterion integers", () => {
@@ -233,28 +282,56 @@ test("Board topic is canonical per worktree and prepare/view publication is pers
   const director = await prepare(f); expect(director.view.posts.some(p => p.type === "HANDOFF")).toBe(false);
 });
 
-test("Board views retain current decisions, filter task findings and handoff, cap bytes with omitted count", async () => {
+test("Board views retain HUMAN rulings and decisions, filter task findings and handoff, cap bytes with omitted count", async () => {
   const f = fixture(), prepared = await prepare(f), board = await openBoard(f.dbPath), workspace = repositoryIdentity(f.root), topicId = prepared.view.topicId;
   try {
-    const old = board.post(workspace, { topicId, type: "DECISION", content: "Old rule" });
+    const human = (content: string, supersedes?: number) => {
+      const child = process.env.PI_SUBAGENT_CHILD;
+      try {
+        delete process.env.PI_SUBAGENT_CHILD;
+        return board.postHuman(workspace, { topicId, type: "HUMAN", content,
+          metadata: { quote: content, saidAt: "2026-11-08T12:00:00Z", taskId: "other", supersedes } }, { hasUI: true }, "coordinator");
+      } finally {
+        if (child === undefined) delete process.env.PI_SUBAGENT_CHILD;
+        else process.env.PI_SUBAGENT_CHILD = child;
+      }
+    };
+    const oldHuman = human("Old human ruling");
+    const currentHuman = human("Current human ruling", oldHuman.id);
+    // An earlier HUMAN cannot supersede a future one, even with a forward reference.
+    const forwardHuman = human("Earlier human ruling", currentHuman.id + 2);
+    const futureHuman = human("Later independent ruling");
+    const old = board.post(workspace, { topicId, type: "DECISION", content: "Old rule", metadata: { supersedes: currentHuman.id } });
     board.post(workspace, { topicId, type: "DECISION", content: "Current rule", metadata: { supersedes: old.id } });
     for (let i = 0; i < 110; i++) board.post(workspace, { topicId, type: "FINDING", content: `finding ${i} ${"é".repeat(100)}`, metadata: { taskId: "one" } });
     board.post(workspace, { topicId, type: "FINDING", content: "Other task", metadata: { taskId: "two" } });
     board.postOnce(workspace, "handoff-one", { topicId, type: "HANDOFF", content: "one state", metadata: { taskId: "one" } });
-    const view = boardView(board, workspace, topicId, "one", 1024);
-    expect(Buffer.byteLength(JSON.stringify(view))).toBeLessThanOrEqual(1024); expect(view.omitted).toBeGreaterThan(0);
+    for (const type of ["FINDING", "HANDOFF"] as const)
+      board.post(workspace, { topicId, type, content: "Cannot override human", metadata: { supersedes: currentHuman.id } });
+    const view = boardView(board, workspace, topicId, "one", 2048);
+    expect(view.posts.filter(p => p.type === "HUMAN")).toEqual([futureHuman, forwardHuman, currentHuman].map(p => ({
+      id: p.id, type: p.type, content: p.content, metadata: p.metadata, author: "coordinator", createdAt: p.createdAt,
+    })));
+    expect(view.posts.find(p => p.id === currentHuman.id)?.metadata).toMatchObject({ quote: "Current human ruling", saidAt: "2026-11-08T12:00:00Z" });
+    expect(view.authority).toContain("current HUMAN rulings (most recent human source wins; cite it) > DECISION");
+    expect((await prepare(f)).view.posts.filter(p => p.type === "HUMAN")).toHaveLength(3);
+    expect(() => boardView(board, workspace, topicId, "one", 256)).toThrow("human consolidation required");
+    expect(Buffer.byteLength(JSON.stringify(view))).toBeLessThanOrEqual(2048); expect(view.omitted).toBeGreaterThan(0);
     expect(view.posts.some(p => p.content === "Current rule")).toBe(true); expect(view.posts.some(p => p.content === "Old rule" || p.content === "Other task")).toBe(false);
     expect(view.posts.map(p => p.id)).toEqual(view.posts.map(p => p.id).sort((a,b) => b-a));
-    board.post(workspace, { topicId, type: "DECISION", content: "Binding rule ".repeat(520).trim() });
+    board.post(workspace, { topicId, type: "DECISION", content: "Binding rule ".repeat(400).trim() });
     writeFileSync(path.join(f.root, "product"), "Human WIP");
     for (let i = 0; i < 50; i++) writeFileSync(path.join(f.root, `untracked-product-file-${i}`), "WIP");
     const receipt = await gate(attempt(f));
     expect(Buffer.byteLength(JSON.stringify(receipt))).toBeLessThanOrEqual(8191);
-    expect(receipt.view.posts.filter(p => p.type === "DECISION").map(p => p.content)).toEqual(["Binding rule ".repeat(520).trim(), "Current rule"]);
+    expect(receipt.view.posts.filter(p => p.type === "DECISION").map(p => p.content)).toEqual(["Binding rule ".repeat(400).trim(), "Current rule"]);
+    expect(receipt.view.posts.filter(p => p.type === "HUMAN")).toEqual(view.posts.filter(p => p.type === "HUMAN"));
     expect(receipt.mutated).toBe(false);
     for (const identity of [receipt.before, receipt.after]) expect(Object.keys(identity).sort()).toEqual(["fingerprint", "head"]);
-    board.post(workspace, { topicId, type: "DECISION", content: "x".repeat(8192) });
-    expect(() => boardView(board, workspace, topicId, "one")).toThrow("DECISION overflow");
+    human("x".repeat(3000));
+    // Each band member fits alone; the combined HUMAN + DECISION band must halt, not truncate.
+    expect(() => boardView(board, workspace, topicId, "one")).toThrow("HUMAN + DECISION overflow");
+    await expect(prepare(f)).rejects.toThrow("ask the human to consolidate");
   } finally { board.close(); }
 });
 
@@ -541,4 +618,145 @@ test.each(["unit", "progress"] as const)("%s settlement after resolving two stal
   const before = readFileSync(settled.path, "utf8");
   expect(apply(request)).toMatchObject({ replay: true, digest: settled.digest, needsDecision: null });
   expect(readFileSync(settled.path, "utf8")).toBe(before);
+});
+
+test("acceptance exception shape, blocking floor and canonical history include humanRef and reason", () => {
+  const f = fixture(), request = initial(f.root);
+  const excepted = { id: "loader", command: "false", cwd: ".", exception: { humanRef: 1, reason: "HUMAN #1 permits failure" } };
+  const acceptance = [...request.acceptance, excepted];
+  for (const exception of [null, {}, { humanRef: 0, reason: "why" }, { humanRef: 1.5, reason: "why" },
+    { humanRef: "1", reason: "why" }, { humanRef: 1, reason: " " }]) {
+    expect(() => apply({ ...request, acceptance: [...request.acceptance, { ...excepted, exception } as never], currentHumanIds: [1] })).toThrow("Invalid acceptance exception");
+  }
+  expect(() => apply({ ...request, acceptance, currentHumanIds: [] })).toThrow("not a current HUMAN");
+  expect(() => apply({ ...request, acceptance: [excepted], currentHumanIds: [1] })).toThrow("at least one blocking command");
+  expect(readBacklog(f.root, f.specId).backlog).toBeNull();
+  const first = apply({ ...request, acceptance, currentHumanIds: [1] });
+  expect(first.backlog!.acceptance[1]).toEqual(excepted);
+  expect(first.backlog!.acceptanceHistory.at(-1)!.digest).toBe(canonicalDigest(acceptance));
+  const replacement = [acceptance[0]!, { ...excepted, exception: { humanRef: 2, reason: "HUMAN #2 replaces permission" } }];
+  const second = apply({ ...request, key: "replace-exception", expectedDigest: first.digest, acceptance: undefined, currentHumanIds: [2],
+    director: { select: "one", changes: [], reason: "Cite newer ruling", acceptance: replacement } });
+  expect(second.backlog!.acceptanceHistory.at(-1)!.digest).toBe(canonicalDigest(replacement));
+  expect(second.backlog!.acceptanceHistory.at(-1)!.digest).not.toBe(first.backlog!.acceptanceHistory.at(-1)!.digest);
+});
+
+test("Node apply injects current topic HUMAN IDs, rejects forged authority and revalidates final hand edits and replay", async () => {
+  const f = fixture(), prepared = await prepare(f), board = await openBoard(f.dbPath), workspace = repositoryIdentity(f.root);
+  let oldId: number, humanId: number, foreignId: number, decisionId: number;
+  try {
+    const previous = process.env.PI_SUBAGENT_CHILD;
+    try {
+      delete process.env.PI_SUBAGENT_CHILD;
+      const human = (topicId: number, supersedes?: number) => board.postHuman(workspace, { topicId, type: "HUMAN", content: "Loader may fail",
+        metadata: { quote: "Loader may fail", saidAt: "2026-11-08", supersedes } }, { hasUI: true });
+      oldId = human(prepared.view.topicId).id;
+      humanId = human(prepared.view.topicId, oldId).id;
+      const foreign = board.ensureOwnedTopic(workspace, "other-topic", { title: "Other topic" });
+      foreignId = human(foreign.id).id;
+      decisionId = board.post(workspace, { topicId: prepared.view.topicId, type: "DECISION", content: "Not human" }).id;
+    } finally {
+      if (previous === undefined) delete process.env.PI_SUBAGENT_CHILD;
+      else process.env.PI_SUBAGENT_CHILD = previous;
+    }
+  } finally { board.close(); }
+  const script = path.resolve(import.meta.dir, "../skills/execute/loop-io.mjs");
+  const invoke = (input: object) => {
+    const result = spawnSync("node", [script], { cwd: f.root, input: JSON.stringify({ operation: "apply", dbPath: f.dbPath, ...input }), encoding: "utf8" });
+    return { status: result.status, receipt: JSON.parse(result.stdout.trim()) };
+  };
+  const excepted = (humanRef: number) => ({ id: "loader", command: "false", cwd: ".", exception: { humanRef, reason: `HUMAN #${humanRef} permits failure` } });
+  const request = initial(f.root), currentHumanIds = await currentHumanPostIds(f);
+  expect(currentHumanIds).toEqual([humanId!]);
+  for (const invalid of [oldId!, foreignId!, decisionId!, 99999]) {
+    let rejected: any;
+    try { apply({ ...request, currentHumanIds, acceptance: [...request.acceptance, excepted(invalid)] }); } catch (error) { rejected = error; }
+    expect(rejected?.selectionRejected).toBe(true);
+    expect(rejected?.message).toContain(`humanRef ${invalid} is not a current HUMAN of this topic`);
+    expect(readBacklog(f.root, f.specId).backlog).toBeNull();
+  }
+  const forged = invoke({ ...request, currentHumanIds: [foreignId!], acceptance: [...request.acceptance, excepted(foreignId!)] });
+  expect(forged.status).toBe(1); expect(forged.receipt.selectionRejected).toBe(true);
+  expect(forged.receipt.reason).toContain("not a current HUMAN of this topic");
+  // A forged empty list is overwritten too: real current permission is accepted.
+  const first = invoke({ ...request, currentHumanIds: [], acceptance: [...request.acceptance, excepted(humanId!)] });
+  expect(first.status).toBe(0);
+  const initialized = readBacklog(f.root, f.specId);
+  expect(initialized.backlog!.acceptanceHistory.at(-1)!.digest).toBe(canonicalDigest(first.receipt.acceptance));
+  const edited = structuredClone(initialized.backlog!); edited.tasks[0]!.status = "obsolete";
+  const finalRequest = { root: f.root, specId: f.specId, key: "final", invocation: "exec1", loop: 2, authority,
+    director: { select: null, changes: [], reason: "Final candidate" } };
+  for (const invalidAcceptance of [[...request.acceptance, excepted(oldId!)], [excepted(humanId!)]]) {
+    edited.acceptance = invalidAcceptance;
+    writeFileSync(initialized.path, JSON.stringify(edited));
+    const adopted = await prepare(f), before = readFileSync(initialized.path, "utf8");
+    let rejected: any;
+    try { apply({ ...finalRequest, expectedDigest: adopted.digest, currentHumanIds }); } catch (error) { rejected = error; }
+    expect(rejected?.selectionRejected).toBe(true);
+    expect(rejected?.message).toContain(invalidAcceptance.length === 1 ? "at least one blocking command" : "not a current HUMAN");
+    expect(readFileSync(initialized.path, "utf8")).toBe(before);
+  }
+  edited.acceptance = [...request.acceptance, excepted(humanId!)];
+  writeFileSync(initialized.path, JSON.stringify(edited));
+  const ready = await prepare(f), finalInput = { ...finalRequest, expectedDigest: ready.digest, currentHumanIds };
+  expect(apply(finalInput).selected).toBeNull();
+  expect(apply(finalInput).replay).toBe(true);
+  const reopened = await openBoard(f.dbPath), previous = process.env.PI_SUBAGENT_CHILD;
+  try {
+    delete process.env.PI_SUBAGENT_CHILD;
+    reopened.postHuman(workspace, { topicId: prepared.view.topicId, type: "HUMAN", content: "Withdraw permission",
+      metadata: { quote: "Withdraw permission", saidAt: "2026-11-09", supersedes: humanId! } }, { hasUI: true });
+  } finally {
+    reopened.close();
+    if (previous === undefined) delete process.env.PI_SUBAGENT_CHILD;
+    else process.env.PI_SUBAGENT_CHILD = previous;
+  }
+  const freshHumanIds = await currentHumanPostIds(f);
+  expect(freshHumanIds).not.toContain(humanId!);
+  for (const input of [finalInput, { ...finalRequest, key: "later-final", expectedDigest: readBacklog(f.root, f.specId).digest }]) {
+    let rejected: any;
+    try { apply({ ...input, currentHumanIds: freshHumanIds }); } catch (error) { rejected = error; }
+    expect(rejected?.selectionRejected).toBe(true);
+    expect(rejected?.message).toContain("not a current HUMAN");
+  }
+});
+
+
+test.each(["identical", "candidate", "command", "cwd", "timeoutMs", "id", "new-invocation"])("final acceptance reuse observes fresh state and skips spawning only on a match: %s", async mode => {
+  const f = fixture(), t = task("final-acceptance");
+  t.gates = [{ id: "suite", command: "mkdir -p cache; echo run >> cache/runs; printf original; exit 1", cwd: ".", timeoutMs: 1000 }];
+  const first = await gate(attempt(f, { task: t }));
+  expect(first.mutated).toBe(false);
+  const reuse = { loop: 1, gateKey: "attempt1", candidate: first.after, exec: structuredClone(t.gates), results: first.gates };
+  const board = await openBoard(f.dbPath);
+  try {
+    const workspace = repositoryIdentity(f.root);
+    const previous = process.env.PI_SUBAGENT_CHILD;
+    try {
+      delete process.env.PI_SUBAGENT_CHILD;
+      board.postHuman(workspace, { topicId: first.view.topicId, type: "HUMAN", content: "Suite may fail",
+        metadata: { quote: "Suite may fail", saidAt: "2026-11-08" } }, { hasUI: true });
+    } finally {
+      if (previous === undefined) delete process.env.PI_SUBAGENT_CHILD;
+      else process.env.PI_SUBAGENT_CHILD = previous;
+    }
+  } finally { board.close(); }
+  if (mode === "candidate") writeFileSync(path.join(f.root, "product"), "changed");
+  if (mode === "command") t.gates[0]!.command += "; exit 1";
+  if (mode === "cwd") t.gates[0]!.cwd = "cache";
+  if (mode === "timeoutMs") t.gates[0]!.timeoutMs = 2000;
+  if (mode === "id") t.gates[0]!.id = "renamed";
+  const next = await gate(attempt(f, { task: t, key: "attempt2", loop: 2,
+    ...(mode === "new-invocation" ? { invocation: "exec2" } : { reuse }) }));
+  expect(next.mutated).toBe(false);
+  expect(next.view.posts.some(post => post.type === "HUMAN")).toBe(true);
+  if (mode === "identical") {
+    expect(next.reused).toEqual({ loop: 1, gateKey: "attempt1" });
+    expect(next.gates).toEqual(first.gates);
+    expect(readFileSync(path.join(f.root, "cache/runs"), "utf8")).toBe("run\n");
+  } else {
+    expect(next.reused).toBeUndefined();
+    expect(next.gates[0]!.logRef).not.toBe(first.gates[0]!.logRef);
+    if (mode !== "cwd") expect(readFileSync(path.join(f.root, "cache/runs"), "utf8")).toBe("run\nrun\n");
+  }
 });
