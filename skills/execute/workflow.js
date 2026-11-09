@@ -1160,7 +1160,7 @@ function advanceLoop(slot = "advance", number = loop.number) {
 function loopIO(slot, input, owner = loop) {
   const pending = owner[slot] ??= { key: slot === "baselineIO" ? `${input.intent.key}.baseline` : `${key}.l${loop.number}.${slot}${slot === "selection" && loop.directorRetry ? ".d1" : ""}`, retry: 0, stage: "intention" };
   if (pending.stage === "receipt" && slot === "prepare" && !invocation.currentView && !Array.isArray(pending.receipt.view?.posts)) {
-    pending.retry++; pending.dispatched = false; pending.stage = "intention";
+    pending.retry++; delete pending.ref; pending.dispatched = false; pending.stage = "intention";
     return save().then(() => loopIO(slot, input, owner));
   }
   if (pending.stage === "receipt") {
@@ -1191,7 +1191,7 @@ function loopIO(slot, input, owner = loop) {
         const semantic = receipt.selectionRejected || receipt.replayRejected || receipt.viewOverflow ||
           /backlog-conflict:|integrity|digest mismatch|replay differs|completed .* changed|exceeds 61440/.test(receipt.reason ?? "");
         if (!semantic && pending.retry < 2) {
-          pending.retry++; return save().then(run);
+          pending.retry++; delete pending.ref; return save().then(run);
         }
         throw Object.assign(new Error(receipt.viewOverflow && input.operation === "close"
           ? "HUMAN + DECISION overflow: ask the human to consolidate current Board HUMAN rulings and decisions"
@@ -1208,7 +1208,7 @@ function loopIO(slot, input, owner = loop) {
             item.transcriptError || item.outputPartial || item.truncation || item.timedOut || item.processSignal) ||
           !Array.isArray(result.results) || result.results.length !== 1 || result.results[0].exitCode !== 0 || !receipt) {
         if (pending.retry >= 2) throw new Error(`loop-io ${slot} has no terminal receipt: ${result.error ?? childKey}`);
-        pending.retry++; return save().then(run);
+        pending.retry++; delete pending.ref; return save().then(run);
       }
       if (["advance", "selection", "close", "drain"].includes(input.operation)) {
         receiptReference(receipt);
@@ -1231,7 +1231,7 @@ function loopIO(slot, input, owner = loop) {
       return observeStatus(pending.ref?.runId ?? childKey, true).then(observed => {
         const cause = barrier(observed, pending.ref?.runId ?? childKey);
         if (cause) throw nativeBarrier(cause, pending.ref ?? { key: childKey, agent: "pitako.loop-io" });
-        pending.retry++; pending.dispatched = false;
+        pending.retry++; delete pending.ref; pending.dispatched = false;
         return save().then(run);
       });
     });
@@ -1241,7 +1241,7 @@ function loopIO(slot, input, owner = loop) {
     return observeStatus(pending.ref?.runId ?? previousKey, true).then(observed => {
       const cause = barrier(observed, pending.ref?.runId ?? previousKey);
       if (cause) throw nativeBarrier(cause, pending.ref);
-      pending.retry++; pending.dispatched = false;
+      pending.retry++; delete pending.ref; pending.dispatched = false;
       return save().then(run);
     });
   }
@@ -1914,7 +1914,8 @@ function observePendingSealer() {
   if (loop?.attempt?.stage === "result") return Promise.resolve();
   if (!pending?.retry && !close?.dispatched) return Promise.resolve();
   // A grouped close consumes seal index 0; a later legacy re-seal is the newest producer.
-  const ref = close?.dispatched && (pending?.retry ?? 0) <= 1 ? close.ref ?? { key: close.key + (close.retry ? `.r${close.retry}` : ""), agent: "pitako.loop-io" }
+  const closeKey = close && close.key + (close.retry ? `.r${close.retry}` : "");
+  const ref = close?.dispatched && (pending?.retry ?? 0) <= 1 ? close.ref?.key === closeKey ? close.ref : { key: closeKey, agent: "pitako.loop-io" }
     : { key: sealerKey(loop.attempt.key, pending.retry - 1), agent: "pitako.checkpoint-sealer" };
   const key = ref.key;
   if (budgetRejected(key) || pending?.reconciled === key) return Promise.resolve();
@@ -2043,6 +2044,7 @@ function validGateReceipt(receipt, task, status) {
   } catch (_) { return false; }
 }
 function closeAttempt(descriptor, task, value) {
+  const savedReceipt = descriptor.close?.stage === "receipt";
   const gateTask = { id: task.id, gates: task.gates ?? task.checks.map(check => ({ id: check.id,
     command: check.command, cwd: check.cwd, timeoutMs: check.timeoutMs ?? 1800000 })),
     metric: task.metric ?? null, progress: loop.metricSeries ?? task.progress ?? { nonImproving: 0, last5: [] } };
@@ -2088,6 +2090,11 @@ function closeAttempt(descriptor, task, value) {
       requests.next === null && !requests.requests.some(request => request.taskId === task.id) ? outcome : null;
     if (baseline.variant !== variant || baseline.sealOutcome !== outcome || baseline.captured !== (variant !== null))
       throw Object.assign(new Error("Close next-baseline selection differs from workflow evidence."), { checkpointIntegrity: true });
+    if (savedReceipt && !same(currentCandidate, candidate(gate.receipt.after))) {
+      const reason = "Current candidate differs from the saved close gate receipt; recovery required, gates must not be rerun.";
+      loop.halt = { status: "blocked", code: "recovery", reason, ref: clone(descriptor.close.ref) };
+      return save().then(() => { throw new Error(reason); });
+    }
     currentCandidate = candidate(gate.receipt.after);
     loop.metricSeries = clone(gate.receipt.progress);
     invocation.currentView = clone(gate.receipt.view);

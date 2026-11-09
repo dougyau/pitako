@@ -24,7 +24,8 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
       if (mode === "abrupt-continue" && preparedNative && !prepareNative) {
         observation = await nativeCheckpointCase(preparedNative.input, preparedNative.harness);
         preparedNative = undefined;
-      } else if (mode === "pause-status-continue" && !preparePause) {
+      } else if (["pause-status-continue", "pause-corrupt", "pause-twice"].includes(mode) && !preparePause) {
+        expect(preparedPauseInput?.mode).toBe(mode);
         observation = await nativeCheckpointCase(preparedPauseInput, `async () => {
           const finish = globalThis.finishPreparedPause;
           delete globalThis.finishPreparedPause;
@@ -384,16 +385,31 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
           }
         }
         let resumed: any;
+        const collect = () => ({ launchErrors, archives, originalArchives, secondPause, restorationAdmissions, unitReplay: unitReplay?.value, created: unitMode ? io.readFileSync(input.root + "/created", "utf8") : null, noInputReplay, callsAtYield, hostObservations, resumed: resumed?.value, original, baseline, partialRef, result: result.value, retained: storage.get("invoke-human-1"), calls, snapshots, points, sealError,
+          owned: io.readFileSync(input.root + "/owned", "utf8"), unrelated: io.readFileSync(input.root + "/unrelated", "utf8") });
         if (pauseMode && !cooperativePause) {
           const checkpoint = original.lastConfirmed;
           if (input.mode === "pause-missing") io.unlinkSync(checkpoint.checkpointRef);
-          if (input.mode === "pause-corrupt") io.writeFileSync(checkpoint.checkpointRef, "corrupt pause");
+          if (input.mode === "pause-corrupt") {
+            if (checkpoint?.kind !== "pause" || !io.existsSync(checkpoint.checkpointRef))
+              throw Error("Missing private real pause before corruption");
+            io.writeFileSync(checkpoint.checkpointRef, "corrupt pause");
+          }
           if (input.mode === "pause-conflict") io.writeFileSync(input.root + "/owned", "unattributed edit");
           continuing = true;
           resumed = await run({ ...options, script: input.continuationScript } as any);
           if (input.mode === "pause-later-input") { laterContinuing = true; resumed = await run({ ...options, script: input.laterScript } as any); }
           if (input.mode === "pause-twice") {
             secondPause = { result: resumed.value, retained: structuredClone(storage.get("invoke-human-1")), calls: [...calls], archives: structuredClone(archives) };
+            if (input.preparePause) {
+              if (secondPause.retained.lastConfirmed?.kind !== "pause")
+                throw Error("Missing private real second pause");
+              (globalThis as any).finishPreparedPause = async () => {
+                resumed = await run({ ...options, script: input.laterScript } as any);
+                return collect();
+              };
+              return { prepared: true };
+            }
             resumed = await run({ ...options, script: input.laterScript } as any);
           }
           if (cut || lossReentry || ["pause-replay-complete", "pause-equivalent-capture", "pause-successor-corrupt", "pause-repeated-publication", "pause-reusable-result"].includes(input.mode)) {
@@ -406,10 +422,10 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
               resumed = await run(options as any);
           }
         }
-        return { launchErrors, archives, originalArchives, secondPause, restorationAdmissions, unitReplay: unitReplay?.value, created: unitMode ? io.readFileSync(input.root + "/created", "utf8") : null, noInputReplay, callsAtYield, hostObservations, resumed: resumed?.value, original, baseline, partialRef, result: result.value, retained: storage.get("invoke-human-1"), calls, snapshots, points, sealError,
-          owned: io.readFileSync(input.root + "/owned", "utf8"), unrelated: io.readFileSync(input.root + "/unrelated", "utf8") };
+        return collect();
         };
         if (input.preparePause) {
+          if (input.mode === "pause-twice") return finish();
           (globalThis as any).finishPreparedPause = finish;
           return { prepared: true };
         }

@@ -1,4 +1,4 @@
-import { beforeAll, expect, test } from "bun:test";
+import { expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -16,7 +16,6 @@ const { verifyLedger } = await import(path.resolve("skills/execute/ledger.mjs"))
 const composition = compositionFixture();
 const { roots } = composition;
 const runtime = nativeCheckpointFixture(composition);
-beforeAll(() => runtime.startNativeCheckpoint());
 const invocation = "drain-fixture";
 const authority = { specDigest: "a".repeat(64), amendmentDigests: [] };
 
@@ -62,8 +61,10 @@ async function fixture() {
 async function launch(f: Awaited<ReturnType<typeof fixture>>, request: any = f.request, interruption?: { key: string; phase: string }) {
   // Reuse the file-owned loader, not operation state: every replay re-reads disk.
   // The fixture joins cancelled cases and the child before releasing owned roots.
+  // loop-io loads its own Node hooks; these harnesses do not use the Pi SDK.
+  if (!runtime.nativeCheckpoint) await runtime.startNativeCheckpoint({ sdk: false, executable: "node" });
   const result = await runtime.nativeCheckpointCase({ ...runtime.nativeCheckpointInput(),
-    root: f.root, request, interruption }, `async ({request,interruption}) => {
+    sdk: false, root: f.root, request, interruption }, `async ({request,interruption}) => {
     const {drain,grouped,receiptTransport}=await import(${JSON.stringify(pathToFileURL(entry).href)});
     const {operation,...input}=request;
     input.root=process.cwd();

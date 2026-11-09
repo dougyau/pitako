@@ -107,6 +107,53 @@ test.each(["structured", "management"])("pending grouped seal observes its exact
   expect(host.launches).toHaveLength(count);
 });
 
+test("an interrupted close retry observes the in-flight retry rather than its failed predecessor", async () => {
+  const host = fixture(); host.setLimit(1);
+  let closeKey = "";
+  let retryRunning = false;
+  host.setLaunchRespond((request, normal) => {
+    if (request.agent !== "pitako.loop-io" || JSON.parse(request.task).operation !== "close") return normal();
+    closeKey ||= request.key;
+    if (request.key === closeKey) return {
+      ...host.result(request, {}), ok: false, key: request.key,
+      output: JSON.stringify({ error: "loop-io", reason: "Transient close failure" }),
+    };
+    retryRunning = true;
+    throw Error("Native transport disappeared while retry is running");
+  });
+  host.setStatus(ref => retryRunning && ref === `${closeKey}.r1`
+    ? { ok: true, runId: ref, agent: "pitako.loop-io", state: "running" }
+    : host.native.get(ref) ?? { ok: true, state: "unknown" });
+  expect((await host.execute()).status).toBe("blocked");
+  const count = host.launches.length;
+  expect(host.launches.filter(call => call.key.startsWith(closeKey)).map(call => call.key))
+    .toEqual([closeKey, `${closeKey}.r1`]);
+  const observed = host.statusCalls.length;
+  expect((await host.execute()).status).toBe("blocked");
+  expect(host.statusCalls.slice(observed)).toContain(`${closeKey}.r1`);
+  expect(host.launches).toHaveLength(count);
+  expect(host.current().lastConfirmed).toBeNull();
+});
+
+test("a saved close transport cannot admit a candidate changed before replay", async () => {
+  const host = fixture(); host.setLimit(1);
+  host.setFailSave(value => !!value.loop?.attempt?.close?.admitted && !value.loop.attempt.gate);
+  expect((await host.execute()).status).toBe("partial");
+  expect(host.current().loop.attempt.close.stage).toBe("receipt");
+  expect(host.current().loop.attempt.gate).toBeUndefined();
+  const count = host.launches.length;
+  host.setFailSave();
+  host.changeCheckout();
+  const result = await host.execute();
+  expect(result.status, result.reason).toBe("blocked");
+  expect(host.current().loop.halt.code).toBe("recovery");
+  expect(host.launches).toHaveLength(count);
+  expect(host.current().lastConfirmed).toBeNull();
+  expect(host.current().loop.attempt.stage).not.toBe("result");
+  expect(host.current().intentions ?? []).toEqual([]);
+  expect(host.records()).toEqual([]);
+});
+
 test("a legacy re-seal dispatched after a grouped close is observed before any further seal", async () => {
   const host = fixture(); host.setLimit(1);
   host.setFailSave(value => !!value.loop?.attempt?.seal?.retry && value.loop.attempt.stage !== "result");

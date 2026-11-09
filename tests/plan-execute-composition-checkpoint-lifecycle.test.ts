@@ -98,7 +98,7 @@ describe("plan/execute packaged composition", () => {
   // Controlled process preparation is file-owned, not checkpoint-case work.
   beforeAll(async () => { if (!native.nativeCheckpoint) await startNativeCheckpoint(); });
   for (const mode of ["unit-before-capture", "unit-before-capture-reentry", "unit-before-capture-reentry-mismatched-previous", "unit-before-capture-conflict", "unit-before-capture-corrupt", "unit-before-capture-newer-corrupt", "unit-before-capture-missing", "unit-before-capture-unadmitted", "unit-before-capture-wrong-baseline", "complete", "pause", "abrupt", "refused", "missing", "corrupt", "incomplete", "seal-cut", "admission-cut", "cursor-cut", "missing-receipt", "wrong-progress", "pause-continue", "pause-twice", "pause-status-continue", "pause-status-gaps", "pause-status-continue-admission-cut", "pause-status-gaps-admission-cut", "pause-missing", "pause-corrupt", "pause-conflict"]) {
-    if (mode === "pause-status-continue") {
+    if (["pause-status-continue", "pause-corrupt", "pause-twice"].includes(mode)) {
       describe("private real paused fixture", () => {
         const ownedRoots: string[] = [], ownedDisposers: (() => void)[] = [];
         beforeAll(async () => {
@@ -109,7 +109,7 @@ describe("plan/execute packaged composition", () => {
             ownedRoots.push(...roots.splice(firstRoot));
             ownedDisposers.push(...disposers.splice(firstDisposer));
           }
-          console.info(`pause-status-continue beforeAll ${(performance.now() - started).toFixed(2)}ms`);
+          console.info(`${mode} beforeAll ${(performance.now() - started).toFixed(2)}ms`);
         });
         afterAll(async () => {
           await settleWorkflows();
