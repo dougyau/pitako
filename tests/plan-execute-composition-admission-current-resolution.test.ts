@@ -19,7 +19,7 @@ import { resolveSkills } from "../node_modules/pi-subagents/src/agents/skills.js
 import { buildEffectiveSystemPrompt } from "../node_modules/pi-subagents/src/runs/shared/effective-system-prompt.js";
 import { handleManagementAction } from "../node_modules/pi-subagents/src/agents/agent-management.js";
 import { handleMissionAction } from "../node_modules/pi-subagents/src/missions/actions.js";
-import { captureCheckpoint, restoreCheckpoint, sealCheckpoint } from "../extensions/execute-checkpoint.ts";
+import { captureBaseline, captureCheckpoint, restoreCheckpoint, sealCheckpoint } from "../extensions/execute-checkpoint.ts";
 import { executeMaxCycles } from "../extensions/execute-settings.ts";
 import registerPlanExecute, { analysisResource, executionResource } from "../extensions/plan-execute.ts";
 import { verifyGate } from "../extensions/access-receipts.mjs";
@@ -1265,7 +1265,7 @@ describe("plan/execute packaged composition", () => {
             if (record.kind === "loop") archived.push(record.body);
           }
           const response = await childResponse(key, request, { ...metadata, loopOperations }, checkout);
-          if (key.endsWith(".director") && invalidDependency) {
+          if (request.agent === "pitako.execution-director" && invalidDependency) {
             response.structuredOutput.select = "change";
             const change = response.structuredOutput.changes[0];
             change.task.dependsOn = ["prerequisite"];
@@ -1321,6 +1321,8 @@ describe("plan/execute packaged composition", () => {
       }
       if (malformed) { expect(seals).toEqual([]); expect((observed.value as any).reason).toContain("valid terminal receipt"); }
       if (invalidDependency) {
+        expect(calls.filter(key => /\.director\.d1$/.test(key))).toHaveLength(3);
+        expect(calls.filter(key => /\.selection\.d1$/.test(key))).toHaveLength(3);
         expect(archived).toHaveLength(3);
         for (const entry of archived) expect(entry.plan).toMatchObject({ stage: "rejected",
           rejection: { diagnostic: expect.stringContaining("dependencies") } });
@@ -2229,8 +2231,9 @@ describe("plan/execute packaged composition", () => {
           usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } }] }) });
       const input = { mode, binding: spec.binding, initial: initial.resource.script, resumed: automatic ? initial.resource.script : resumed.resource.script, renewed: renewed.resource.script, children, metadata, checkout, content, target, interruptedLoop };
       // Keep one identical harness for Bun and the owned Node process.
-      const harness = async (input: any, run: typeof runWorkflowScript, respond: typeof childResponse, checkpoint: { captureCheckpoint: typeof captureCheckpoint; restoreCheckpoint: typeof restoreCheckpoint }) => {
-        input.metadata.loopOperations = await import(input.metadata.loopModule);
+      const harness = async (input: any, run: typeof runWorkflowScript, respond: typeof childResponse, checkpoint: { captureBaseline: typeof captureBaseline; captureCheckpoint: typeof captureCheckpoint; restoreCheckpoint: typeof restoreCheckpoint }) => {
+        // Keep the real baseline operation, without a fresh TypeScript process per dispatch.
+        input.metadata.loopOperations = { ...await import(input.metadata.loopModule), baseline: checkpoint.captureBaseline };
         const storage = new Map<string, any>(), calls: string[] = [], hosts: string[] = [];
         const publications: any[] = [];
         const statusCalls: string[] = [], inspectors: Record<string, any> = {};
@@ -2388,7 +2391,7 @@ describe("plan/execute packaged composition", () => {
         }
         return { first: first.value, second: second.value, third: third.value, fourth, later, oldDefect, original, retained: storage.get("invoke-human-1"), calls, hosts, statusCalls, publications, before, after };
       };
-      const expected = await harness(input, runWorkflowScript, childResponse, { captureCheckpoint, restoreCheckpoint });
+      const expected = await harness(input, runWorkflowScript, childResponse, { captureBaseline, captureCheckpoint, restoreCheckpoint });
       if (mode === "retained-worker-pending") {
         expect(expected.second).toMatchObject({ status: "blocked", loopsConsumed: 1 });
         expect(expected.retained.loop.recoveries ?? []).toEqual([]);

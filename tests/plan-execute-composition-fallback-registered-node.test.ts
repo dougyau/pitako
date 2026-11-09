@@ -13,7 +13,7 @@ import { executionResource } from "../extensions/plan-execute.ts";
 import { digest, preliminarySpec, SPEC_SECTIONS, checkoutEvidence, MAX_SPEC_BYTES } from "../extensions/spec-plans.ts";
 import { deterministicScripts, planExecute, checkout, missionFiles, childResponse, registeredCheckpoint, compositionFixture, nativeCheckpointFixture, assignmentSpec, resourceWithAgentDir } from "./fixtures/plan-execute-composition.ts";
 import { prepare, apply, readBacklog, updateProgress, reviewOriginals } from "../skills/execute/loop.ts";
-import { captureCheckpoint, restoreCheckpoint } from "../extensions/execute-checkpoint.ts";
+import { captureBaseline, captureCheckpoint, restoreCheckpoint } from "../extensions/execute-checkpoint.ts";
 
 const composition = compositionFixture();
 const { disposers, workflowSettlements, repository, checkpointLifecycle } = composition;
@@ -131,7 +131,7 @@ describe("plan/execute packaged composition", () => {
             calls.push(key);
             if (request.agent === "pitako.loop-io") {
               const { operation, ...data } = JSON.parse(request.task);
-              const value = await loopIo[operation](data);
+              const value = operation === "baseline" ? io.captureBaseline(data) : await loopIo[operation](data);
               if (operation === "apply") value.view = (await loopIo.prepare({ ...data, taskId: value.selected?.id, previousConfirmedUnit: null })).view;
               const { backlog, ...receipt } = value;
               if (backlog) receipt.acceptance = backlog.acceptance;
@@ -209,7 +209,7 @@ describe("plan/execute packaged composition", () => {
         function director(key: string) {
           key = key.replace(/^native-/, "");
           if (directors.has(key)) return structuredClone(directors.get(key));
-          const task = { id: "unit", goal: "Recover owned unit", expectedResult: "Owned unit completed without losing earlier WIP",
+          const task = { id: "unit", title: "unit", goal: "Recover owned unit", expectedResult: "Owned unit completed without losing earlier WIP",
             status: "pending", origin: { kind: "spec", ref: input.metadata.selected.source }, specRefs: [input.metadata.selected.source],
             dependsOn: [], gates: [{ id: "unit-check", command: "test \"$(cat owned)\" = \"finished task\"", cwd: input.root, timeoutMs: 30000 }],
             metric: null, parent: null, remaining: "", progress: { nonImproving: 0, last5: [] }, history: [] };
@@ -340,7 +340,7 @@ describe("plan/execute packaged composition", () => {
           const receipt = { ...fields, ...(backlog ? { acceptance: backlog.acceptance } : {}) };
           return { key, ok: true, agent: request.agent, runId: `native-${key}`, output: JSON.stringify(receipt), results: [{ exitCode: 0 }] };
         }
-        const task = { id: "unit", goal: "Implement unit", expectedResult: "Implementation completed", status: "pending",
+        const task = { id: "unit", title: "unit", goal: "Implement unit", expectedResult: "Implementation completed", status: "pending",
           origin: { kind: "spec", ref: metadata.selected.source }, specRefs: [metadata.selected.source], dependsOn: [],
           gates: [{ id: "unit-check", command: "true", cwd: root, timeoutMs: 30000 }], metric: null, parent: null,
           remaining: "", progress: { nonImproving: 0, last5: [] }, history: [] };
@@ -391,7 +391,7 @@ describe("plan/execute packaged composition", () => {
       const invoke = (operation: string, data: any) => {
         // One case covers the full CLI transport; the other status variants use
         // the same real helpers without repeating six Node startups each.
-        if (observation === "missing") {
+        if (operation !== "apply" && observation === "missing") {
           writeFileSync(request, JSON.stringify(data));
           return execFileSync("node", [helper, operation, request], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
         }
@@ -417,7 +417,7 @@ describe("plan/execute packaged composition", () => {
         calls.push(key);
         if (request.agent === "pitako.loop-io") {
           const { operation, ...data } = JSON.parse(request.task);
-          const value = await loopIo[operation](data);
+          const value = operation === "baseline" ? io.captureBaseline(data) : await loopIo[operation](data);
           if (operation === "apply") value.view = (await loopIo.prepare({ ...data, taskId: value.selected?.id, previousConfirmedUnit: null })).view;
           const { backlog, ...receipt } = value;
               if (backlog) receipt.acceptance = backlog.acceptance;
@@ -430,7 +430,7 @@ describe("plan/execute packaged composition", () => {
           (request.agent === "pitako.worker" && key.includes(".t2."));
         const child = response(key, request, metadata, needsCandidate ? observedCandidate() : undefined);
         if (key.endsWith(".director")) {
-          const task = { id: "unit", goal: "Recover owned unit", expectedResult: "Restore owned paths and complete the unit",
+          const task = { id: "unit", title: "unit", goal: "Recover owned unit", expectedResult: "Restore owned paths and complete the unit",
             status: "pending", origin: { kind: "spec", ref: metadata.selected.source }, specRefs: [metadata.selected.source],
             dependsOn: [], gates: [{ id: "unit-check", command: 'test "$(cat owned)" = "completed pending work"', cwd: root, timeoutMs: 30000 }],
             metric: null, parent: null, remaining: "", progress: { nonImproving: 0, last5: [] }, history: [] };
@@ -571,6 +571,7 @@ describe("plan/execute packaged composition", () => {
               if (input.operation === "prepare") value = { ...readBacklog(root, "assignment"), view, lastConfirmedUnit: null };
               else if (input.operation === "apply") value = { ...apply(input), view };
               else if (input.operation === "reviewOriginals") value = reviewOriginals(input);
+              else if (input.operation === "baseline") value = captureBaseline(input);
               else {
                 const progress = updateProgress(input.task.progress, { value: null, fingerprint: checkout.fingerprint,
                   gatesPassed: input.task.gates.length, gatesTotal: input.task.gates.length }, null);
@@ -590,7 +591,7 @@ describe("plan/execute packaged composition", () => {
             return response;
           }
           const pending = readBacklog(root, "assignment").backlog;
-          const selected = { id: "final", goal: "Verify complete candidate", expectedResult: "Focused verification passes", status: "pending",
+          const selected = { id: "final", title: "final", goal: "Verify complete candidate", expectedResult: "Focused verification passes", status: "pending",
             origin: { kind: "spec", ref: spec.source }, specRefs: [spec.source], dependsOn: [],
             gates: [{ id: "final-check", command: "true", cwd: root, timeoutMs: 1800000 }], metric: null,
             parent: null, remaining: "", progress: { nonImproving: 0, last5: [] }, history: [] };
@@ -636,7 +637,7 @@ describe("plan/execute packaged composition", () => {
             });
             expect(request.task).toContain("specific scope/effects expansion needed");
           }
-          if (key.endsWith(".director") && mode !== "unresolved-plan") {
+          if (request.agent === "pitako.execution-director" && mode !== "unresolved-plan") {
             const plan = response.structuredOutput;
             const schema = request.outputSchema as TSchema;
             expect((schema as any).properties).not.toHaveProperty("association");
@@ -681,9 +682,9 @@ describe("plan/execute packaged composition", () => {
       expect(expected.value).toMatchObject({ status: ["complete", "recovered", "rejected-plan", "mismatched-association"].includes(mode) || recoveredHost ? "complete" : mode === "stopped" || mode.endsWith("-stop") ? "cancelled" : "blocked",
         ...hostTarget && !recoveredHost ? { status: "blocked" } : {},
         loopsConsumed: recoveredHost ? 2 : hostTarget && hostTarget !== "inspect-loop-1" ? 0 : ["complete", "recovered", "mismatched-association"].includes(mode) || analysisTarget ? 2 : mode === "rejected-plan" ? 3 : 1 });
-      expect(calls.filter(key => !key.includes(".requests-") && !/\.(prepare|selection|settlement|gate)(?:\.r\d+)?$/.test(key) && !key.includes(".review.verify-") && !/\.seal(?:\.r\d+)?$/.test(key))).toHaveLength(analysisTarget ? mode.includes("-prepare-") ? 6 : mode.includes("-later-") ? 8 : 11
+      expect(calls.filter(key => !key.includes(".requests-") && !/\.(prepare|selection|settlement|gate|baseline)(?:\.d1)?(?:\.r\d+)?$/.test(key) && !key.includes(".review.verify-") && !/\.seal(?:\.r\d+)?$/.test(key))).toHaveLength(analysisTarget ? mode.includes("-prepare-") ? 6 : mode.includes("-later-") ? 8 : 11
         : recoveredHost ? 12 : hostTarget ? hostTarget === "inspect-loop-1" ? 7 : 0
-        : mode === "decision-overflow" ? 0 : ["complete", "mismatched-association"].includes(mode) ? 12 : mode === "recovered" ? 13 : mode === "rejected-plan" ? 14 : ["stopped", "permission", "unresolved-plan"].includes(mode) ? 2 : 1);
+        : mode === "decision-overflow" ? 0 : ["complete", "mismatched-association"].includes(mode) ? 12 : mode === "recovered" ? 13 : mode === "rejected-plan" ? 15 : ["stopped", "permission", "unresolved-plan"].includes(mode) ? 2 : 1);
       if (mode === "decision-overflow") {
         expect((expected.value as any).reason).toContain("human to consolidate");
         expect(calls).toEqual(["invoke-human-1.l1.prepare"]);
@@ -958,7 +959,7 @@ test.each(["complete", "receipt-save-cut", "result-save-cut", "seal-save-cut", "
       (async () => {
         await import(pathToFileURL(input.packageRoot + "/skills/execute/loader.mjs"));
         const {runWorkflowScript} = await import(pathToFileURL(input.packageRoot + "/node_modules/pi-subagents/src/workflows/scripted-workflow.js"));
-        const {captureCheckpoint,restoreCheckpoint} = await import(pathToFileURL(input.packageRoot + "/extensions/execute-checkpoint.ts"));
+        const {captureBaseline,captureCheckpoint,restoreCheckpoint} = await import(pathToFileURL(input.packageRoot + "/extensions/execute-checkpoint.ts"));
         const loopIo = await import(pathToFileURL(input.packageRoot + "/skills/execute/loop.ts"));
         const response = eval('(' + input.response + ')');
         const storage = new Map(), calls = [], statuses = [], originals = new Map();
@@ -982,7 +983,7 @@ test.each(["complete", "receipt-save-cut", "result-save-cut", "seal-save-cut", "
             let result;
             if (request.agent === "pitako.loop-io") {
               const {operation,...payload} = JSON.parse(request.task);
-              const value = await loopIo[operation](payload);
+              const value = operation === "baseline" ? captureBaseline(payload) : await loopIo[operation](payload);
               if (operation === "apply") value.view = (await loopIo.prepare({...payload,previousConfirmedUnit:null,taskId:value.selected?.id})).view;
               const {backlog,...receipt} = value;
               if (backlog) receipt.acceptance = backlog.acceptance;
@@ -990,7 +991,7 @@ test.each(["complete", "receipt-save-cut", "result-save-cut", "seal-save-cut", "
             } else {
               result = response(key, request, input.metadata, input.checkout);
               if (request.agent === "pitako.execution-director") {
-                const task = {id:"repair",goal:"Verify authorized behavior without writes",expectedResult:"Focused verification passes",
+                const task = {id:"repair",title:"repair",goal:"Verify authorized behavior without writes",expectedResult:"Focused verification passes",
                   status:"pending",origin:{kind:"spec",ref:input.metadata.selected.source},specRefs:[input.metadata.selected.source],
                   dependsOn:[],gates:[{id:"repair-check",command:"true",cwd:input.root,timeoutMs:30000}],metric:null,
                   parent:null,remaining:"",progress:{nonImproving:0,last5:[]},history:[]};
@@ -1113,7 +1114,7 @@ test("registered Node public root resume consumes durable results and closes the
         verifier:input.packageRoot + "/extensions/access-receipts.mjs", sealer:input.packageRoot + "/skills/execute/checkpoint.mjs",
         selected:{source:path.join(input.root,".pitako/plans/assignment.md"), digest:input.digest, chunks:1}};
       const response = eval('(' + input.response + ')');
-      const {captureCheckpoint} = await import(pathToFileURL(input.packageRoot + "/extensions/execute-checkpoint.ts"));
+      const {captureBaseline,captureCheckpoint} = await import(pathToFileURL(input.packageRoot + "/extensions/execute-checkpoint.ts"));
       await import(pathToFileURL(input.packageRoot + "/skills/execute/loader.mjs"));
       const loopIo = await import(pathToFileURL(input.packageRoot + "/skills/execute/loop.ts"));
       const originals = new Map();
@@ -1124,7 +1125,7 @@ test("registered Node public root resume consumes durable results and closes the
           let result;
           if (request.agent === "pitako.loop-io") {
             const {operation,...payload} = JSON.parse(request.task);
-            const value = await loopIo[operation](payload);
+            const value = operation === "baseline" ? captureBaseline(payload) : await loopIo[operation](payload);
             if (operation === "apply") value.view = (await loopIo.prepare({...payload,previousConfirmedUnit:null,taskId:value.selected?.id})).view;
             const {backlog,...receipt} = value;
               if (backlog) receipt.acceptance = backlog.acceptance;
@@ -1134,7 +1135,7 @@ test("registered Node public root resume consumes durable results and closes the
             result = response(key, request, metadata, input.checkout);
             if (request.agent === "pitako.execution-director") {
               const exists = fs.existsSync(path.join(input.root,".pitako/backlog/assignment.json"));
-              const task = {id:"unit",goal:"Verify authorized behavior",expectedResult:"Focused verification passes",
+              const task = {id:"unit",title:"unit",goal:"Verify authorized behavior",expectedResult:"Focused verification passes",
                 status:"pending",origin:{kind:"spec",ref:metadata.selected.source},specRefs:[metadata.selected.source],
                 dependsOn:[],gates:[{id:"unit-check",command:"true",cwd:input.root,timeoutMs:30000}],metric:null,
                 parent:null,remaining:"",progress:{nonImproving:0,last5:[]},history:[]};

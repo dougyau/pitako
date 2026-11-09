@@ -111,7 +111,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
             pauseAdmissionCut = true; throw Error("Cut after durable pause admission before yield");
           }
           if (input.mode === "pause-status-continue" && !cut && value.loop?.attempt?.taskId === "second" &&
-              value.loop.attempt.number === 3 && value.loop.attempt.stage === "launched") { cut = true; throw Error("Cut after successor loss"); }
+              value.loop.attempt.number === 3 && value.loop.attempt.stage === "launched" && calls.includes(value.loop.attempt.key)) { cut = true; throw Error("Cut after successor loss"); }
           if (unitMode && input.mode.includes("reentry") && !cut && value.loop?.attempt?.restore?.undispatched) { cut = true; throw Error("Cut after durable unit recovery intention"); }
           if (stateCut(value)) { cut = true; throw Error("Controlled pause persistence cut"); }
           if (!cut && input.mode === "cursor-cut" && admission && value.loop.attempt?.stage === "result") {
@@ -271,7 +271,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
                 const current = intent.attempt === 5 ? candidate() : restoreReceipt?.candidate ?? invocation.tasks[intent.taskId].last.candidate;
                 Object.assign(result.structuredOutput, { taskId: intent.taskId, attempt: intent.attempt,
                   status: "continue", usefulProgress: true, diagnosis: `Further work ${intent.attempt} requires a fresh capture for another path`,
-                  remaining: ["Finish the diagnosed pending work"], continuation: "Complete the newly diagnosed work",
+                  remaining: ["Finish the diagnosed pending work"], continuation: { mode: "fresh", reason: "Complete the newly diagnosed work" },
                   candidate: current, ...(restoreReceipt ? { restoreReceipt } : {}),
                   git: { head: current.head, checkpoints: restoreReceipt ? [restoreReceipt.partialRef, restoreReceipt.restoredRef] : [], wip: "Unchanged pause WIP" },
                   checks: [{ id: "second-check", command: "bun test affected", cwd: input.root,
@@ -293,7 +293,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
               const current = candidate();
               Object.assign(result.structuredOutput, { taskId: intent.taskId, attempt: intent.attempt,
                 status: paused ? (input.mode.includes("status-continue") ? "continue" : input.mode.includes("status-gaps") ? "gaps" : "blocked") : "complete", remaining: paused && input.mode !== "pause-empty" ? ["Pending second unit"] : [],
-                continuation: paused ? "Resume pending second unit from its exact pause" : null,
+                continuation: { mode: "fresh", reason: paused ? "Resume pending second unit from its exact pause" : "Unit complete" },
                 git: { wip: "Real owned WIP" },
                 checks: [{ id: intent.taskId + "-check", command: "bun test affected", cwd: input.root,
                   output: "Observed controlled unit", logPaths: [], result: "passed", before: current, after: current }] });
@@ -613,7 +613,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
               expect(actual.retained.taskFrame.operations).toHaveLength(1);
               expect(actual.retained.tasks.second.last).toEqual(originalLoop.results[1]);
               expect(actual.retained.association.maxCycles).toBe(3);
-              expect(actual.calls.filter((key: string) => !key.includes(".requests-"))).toEqual([...actual.callsAtYield.filter((key: string) => !key.includes(".requests-")), "invoke-human-1.l2.t1.a2"]);
+              expect(actual.calls.filter((key: string) => !key.includes(".requests-"))).toEqual([...actual.callsAtYield.filter((key: string) => !key.includes(".requests-")), "invoke-human-1.l2.t1.a2.baseline", "invoke-human-1.l2.t1.a2"]);
             }
             expect(actual.resumed.action.started).toBe(false);
             const replayed = observed.find((entry: any) => entry.replay);

@@ -1,7 +1,8 @@
 import { expect, test } from "bun:test";
 import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { readBacklog } from "../skills/execute/loop.ts";
+import { validateToolArguments } from "@earendil-works/pi-ai";
+import { TASK_UPDATE_KEYS, readBacklog } from "../skills/execute/loop.ts";
 import { executeControllerFixture, copy, type Result } from "./fixtures/execute-workflow.ts";
 
 const { fixture } = executeControllerFixture();
@@ -36,7 +37,7 @@ test("a complete worker with failed focused gates seals pause and continues the 
   expect(output.status).toBe("partial");
   expect(readBacklog(host.root, "spec").backlog!.tasks[0]!.status).toBe("done");
   const operations = host.calls.filter(call => call.agent === "pitako.loop-io").map(call => JSON.parse(call.task).operation);
-  expect(operations).toEqual(["prepare", "apply", "gate", "gate", "apply"]);
+  expect(operations).toEqual(["prepare", "apply", "baseline", "gate", "baseline", "gate", "apply"]);
   expect(output.boardTopicId).toBe(1);
   expect(host.calls.some(call => call.agent === "pitako.reviewer")).toBe(false);
   expect(host.snapshots.every(state => !state.activePlan && !state.loop?.selection?.receipt?.backlog)).toBe(true);
@@ -101,7 +102,7 @@ test("malformed knowledge does not reject an otherwise valid worker result", asy
   });
   expect((await host.execute()).status).toBe("partial");
   const request = host.calls.find(call => call.agent === "pitako.worker")!;
-  expect(Object.keys(request.outputSchema.properties)).toEqual(["work", "status", "remaining", "knowledge"]);
+  expect(Object.keys(request.outputSchema.properties)).toEqual(["work", "status", "remaining", "knowledge", "continuation"]);
   expect(request.outputSchema.required).not.toContain("knowledge");
   const knowledge = JSON.parse(host.calls.find(call => isGate(call))!.task).knowledge;
   expect(Buffer.byteLength(knowledge.handoff)).toBe(2048);
@@ -260,8 +261,8 @@ test("the gate-before-seal controller is portable through the native workflow sa
 });
 
 
-test.each(["selection", "unknown-update", "reused-id"])("invalid director %s ends as gaps and the next fresh director receives its diagnosis", async mode => {
-  const host = fixture(); host.setLimit(2);
+test.each(["selection", "unknown-update", "reused-id"])("invalid director %s retries in the same loop with its diagnosis", async mode => {
+  const host = fixture(); host.setLimit(1);
   host.setRespond((request, normal) => {
     const result = normal();
     if (request.key.endsWith(".l1.director")) {
@@ -274,10 +275,11 @@ test.each(["selection", "unknown-update", "reused-id"])("invalid director %s end
   });
   expect((await host.execute()).status).toBe("partial");
   expect(host.calls.filter(call => call.agent === "pitako.execution-director")).toHaveLength(2);
-  expect(host.calls.find(call => call.key.endsWith(".l2.director"))!.task).toContain(mode === "selection" ? "Selected task must be pending"
+  expect(host.calls.find(call => call.key.endsWith(".l1.director.d1"))!.task).toContain(mode === "selection" ? "Selected task must be pending"
     : mode === "unknown-update" ? "Cannot change unknown task or tombstone" : "Task ID never reused");
-  expect(host.calls.filter(call => call.agent === "pitako.worker").map(call => call.key)).toEqual(["invoke-human-1.l2.t1.a1"]);
-  expect(host.history()[0]!.plan.stage).toBe("rejected");
+  expect(host.calls.filter(call => call.agent === "pitako.worker").map(call => call.key)).toEqual(["invoke-human-1.l1.t1.a1"]);
+  expect(host.history()[0]!.plan.stage).toBe("admitted");
+  expect(host.history()[0]!.directorRetry.rejectedRef.key).toBe("invoke-human-1.l1.director");
 });
 
 test.each(["conflict", "schema", "decisions"])("backlog %s halts without a writer", async mode => {
@@ -816,4 +818,107 @@ test.each(["before", "after"])("consumed review compaction survives a %s persist
   const compliance = host.calls.find(call => call.key.endsWith(".compliance"))!;
   expect(compliance.task).toContain("Completed review originals:");
   expect(compliance.task).toContain(retained.originals[0].sha256 ?? host.storage.get("review-invoke-human-1").originals[0].sha256);
+});
+
+
+test("director guidance and update schema match the runtime update whitelist", async () => {
+  const host = taskFixture();
+  await host.execute();
+  const director = host.calls.find(call => call.agent === "pitako.execution-director")!;
+  expect(director.task).toContain("acceptance: [{id, command, cwd, verifies?, exception?: {humanRef, reason}}]");
+  expect(director.task).toContain("only when a current HUMAN in the view exempts that command; humanRef is that post's id");
+  expect(director.task).toContain("At least one entry stays blocking");
+  expect(director.task).toContain("update patches only goal, expectedResult, specRefs, dependsOn, gates, metric, remaining and title");
+  expect(director.task).toContain("never change id, origin or status (use obsolete, split or add)");
+  const update = director.outputSchema.properties.changes.items.anyOf.find((schema: any) => schema.properties.kind.const === "update");
+  expect(Object.keys(update.properties.patch.properties).sort()).toEqual([...TASK_UPDATE_KEYS].sort());
+  expect(update.properties.patch.additionalProperties).toBe(false);
+  const tool = { name: "selection", description: "Backlog selection", parameters: director.outputSchema };
+  const validate = (patch: any) => validateToolArguments(tool, { type: "toolCall", id: "plan", name: tool.name,
+    arguments: { select: null, changes: [{ kind: "update", id: "task", patch, reason: "Revise task" }], reason: "Revise" } });
+  expect(() => validate({ title: "Short title", remaining: "" })).not.toThrow();
+  for (const key of ["id", "origin", "status", "unknown"]) expect(() => validate({ [key]: "changed" })).toThrow();
+});
+
+
+test.each(["HUMAN + DECISION overflow", "Gate receipt exceeds 8 KiB"])("%s stops for consolidation without redispatching the gate", async reason => {
+  const host = taskFixture();
+  host.setRespond((request, normal) => {
+    if (!isGate(request)) return normal();
+    return { ok: false, agent: "pitako.loop-io", runId: "overflow-gate",
+      output: JSON.stringify({ error: "loop-io", reason, viewOverflow: true }) };
+  });
+  const output = await host.execute();
+  expect(output.status).toBe("blocked");
+  expect(output.reason).toContain("ask the human to consolidate");
+  expect(host.calls.filter(isGate)).toHaveLength(1);
+  expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(1);
+  expect(host.calls.some(call => call.agent === "pitako.checkpoint-sealer")).toBe(false);
+});
+
+test("prepare binding overflow stops before any worker launch", async () => {
+  const host = taskFixture();
+  host.setRespond((request, normal) => {
+    if (request.agent !== "pitako.loop-io" || JSON.parse(request.task).operation !== "prepare") return normal();
+    return { ok: false, agent: "pitako.loop-io", runId: "overflow-prepare",
+      output: JSON.stringify({ error: "loop-io", reason: "HUMAN + DECISION overflow: ask the human to consolidate", viewOverflow: true }) };
+  });
+  const output = await host.execute();
+  expect(output.status).toBe("blocked");
+  expect(output.reason).toContain("consolidate");
+  expect(host.calls.some(call => call.agent === "pitako.worker")).toBe(false);
+});
+
+
+test.each(["missing", "fresh", "resume", "too-long", "bad-mode", "missing-reason"])("worker continuation opinion validates and stays separate from diagnosis: %s", async mode => {
+  const host = taskFixture();
+  let first = true;
+  host.setRespond((request, normal) => {
+    const result = normal();
+    if (request.agent === "pitako.worker" && first) {
+      first = false;
+      if (mode !== "missing") result.structuredOutput.continuation = mode === "missing-reason" ? { mode: "resume" }
+        : { mode: mode === "bad-mode" ? "invalid" : mode === "fresh" ? "fresh" : "resume", reason: "x".repeat(mode === "too-long" ? 201 : 200) };
+    }
+    return result;
+  });
+  expect((await host.execute()).status).toBe("partial");
+  const value = host.history()[0]!.results[0]!;
+  if (["too-long", "bad-mode", "missing-reason"].includes(mode)) {
+    expect(value.status).toBe("rejected"); expect(value.rejection).toContain("continuation opinion");
+  } else {
+    expect(value.status).toBe("complete");
+    expect(value.revival).toEqual({ opinion: mode === "resume" ? "resume" : "fresh", reason: mode === "missing" ? "" : "x".repeat(200),
+      decision: "fresh", code: "missing-peak", peak: null });
+    const schema = host.calls.find(call => call.agent === "pitako.worker")!.outputSchema;
+    expect(schema.required).not.toContain("continuation");
+    expect(schema.properties.continuation.properties.reason.maxLength).toBe(200);
+    const validate = (length: number) => validateToolArguments({ name: "worker", description: "Worker result", parameters: schema },
+      { type: "toolCall", id: "report", name: "worker", arguments: { work: "Done", status: "complete", remaining: [],
+        continuation: { mode: "resume", reason: "x".repeat(length) } } });
+    expect(() => validate(200)).not.toThrow();
+    expect(() => validate(201)).toThrow();
+  }
+});
+
+test("attempt metadata preserves a resume opinion alongside gate diagnosis and peak", async () => {
+  const host = taskFixture(); let first = true;
+  host.setRespond((request, normal) => {
+    const result = normal();
+    if (request.agent === "pitako.worker") result.structuredOutput.continuation = { mode: "resume", reason: "Context remains useful" };
+    if (isGate(request)) {
+      const input = JSON.parse(request.task);
+      expect(input.checkpoint.key).toBe(request.key.replace(/\.gate$/, ""));
+      const receipt = JSON.parse(result.output!); receipt.contextPeak = 1234;
+      if (first) { first = false; receipt.gates[0].status = "fail"; receipt.gates[0].exit = 1; receipt.gates[0].tail = "Fix this assertion"; }
+      result.output = JSON.stringify(receipt);
+    }
+    return result;
+  });
+  expect((await host.execute()).status).toBe("partial");
+  const firstResult = host.snapshots.find(state => state.loop?.attempt?.number === 1 && state.loop.attempt.stage === "result")!.loop.attempt.result;
+  expect(firstResult.status).toBe("continue"); expect(firstResult.usefulContinuation).toBe(true);
+  expect(firstResult.diagnosis).toContain("Fix this assertion");
+  expect(firstResult.revival).toEqual({ opinion: "resume", reason: "Context remains useful", decision: "fresh", code: "fresh-dispatch", peak: 1234 });
+  expect(host.snapshots.some(state => state.loop?.attempt?.revival?.peak === 1234)).toBe(true);
 });

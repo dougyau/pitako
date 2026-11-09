@@ -11,7 +11,7 @@ const candidateSchema = object({ head: string, fingerprint: string });
 const commandSchema = object({ id: string, command: string, cwd: string, timeoutMs: integer });
 commandSchema.properties.verifies = list(integer);
 const backlogTaskSchema = object({
-  id: string, goal: string, expectedResult: string, status: { enum: ["pending"] },
+  id: string, title: { ...string, maxLength: 80 }, goal: string, expectedResult: string, status: { enum: ["pending"] },
   origin: object({ kind: { enum: ["spec", "director", "final-phase", "human"] }, ref: string }),
   specRefs: list(string), dependsOn: list(string), gates: { ...list(commandSchema), minItems: 1 },
   metric: nullable(object({ command: string, unit: string, target: { type: "number" } })),
@@ -19,11 +19,14 @@ const backlogTaskSchema = object({
   progress: object({ nonImproving: { type: "integer", minimum: 0 }, last5: list({ type: "object" }) }),
   history: list({ type: "object" }),
 });
+const updatePatchSchema = { type: "object", additionalProperties: false,
+  properties: Object.fromEntries(["goal", "expectedResult", "specRefs", "dependsOn", "gates", "metric", "remaining", "title"]
+    .map(key => [key, backlogTaskSchema.properties[key]])) };
 const changeSchema = { anyOf: [
   object({ kind: { const: "add" }, task: backlogTaskSchema, reason: string }),
   object({ kind: { const: "split" }, id: string, tasks: list(backlogTaskSchema), reason: string }),
   object({ kind: { const: "obsolete" }, id: string, reason: string }),
-  object({ kind: { const: "update" }, id: string, patch: { type: "object" }, reason: string }),
+  object({ kind: { const: "update" }, id: string, patch: updatePatchSchema, reason: string }),
 ] };
 const planSchema = object({ select: nullable(string), changes: list(changeSchema), reason: string });
 const acceptanceSchema = object({ id: string, command: string, cwd: string });
@@ -35,6 +38,7 @@ const workerSchema = object({
   // Knowledge is advisory: malformed or absent knowledge must not reject work.
   knowledge: {},
 });
+workerSchema.properties.continuation = object({ mode: { enum: ["resume", "fresh"] }, reason: { type: "string", maxLength: 200 } });
 workerSchema.required = ["work", "status", "remaining"];
 const demandObservationSchema = object({ memo: string, evidenceLimits: list(string),
   observations: list(object({ source: string, demand: string, reason: string })) });
@@ -72,9 +76,48 @@ function same(a, b) {
   const keys = Object.keys(a);
   return keys.length === Object.keys(b).length && keys.every(k => Object.prototype.hasOwnProperty.call(b, k) && same(a[k], b[k]));
 }
+// Pure policy: a retained worker is useful only on this exact, unhalted continuation.
+function decideRevival(prev, cfg, peak) {
+  const fresh = code => ({ decision: "fresh", code });
+  if (prev?.result?.revival?.opinion !== "resume") return fresh("opinion-fresh");
+  if (prev.taskId !== cfg.taskId) return fresh("different-task");
+  if (prev.checkpoint?.loop !== cfg.loop) return fresh("different-loop");
+  if (prev.result.status !== "continue") return fresh("not-continue");
+  const receipt = prev.gate?.receipt;
+  if (receipt?.stalled || receipt?.progress?.nonImproving >= 3) return fresh("stalled");
+  if (cfg.halt || prev.halt) return fresh("halted");
+  if (prev.restore) return fresh("restore");
+  if (!receipt?.after || !same(cfg.candidate, receipt.after)) return fresh("candidate-changed");
+  if (!Number.isFinite(peak) || peak < 0) return fresh("missing-peak");
+  if (peak > (cfg.revivalContextPeak ?? 120000)) return fresh("context-peak");
+  if (!text(prev.launch?.runId)) return fresh("missing-run");
+  if (prev.revival?.decision === "resume" && receipt.progress?.nonImproving !== 0)
+    return fresh("revived-no-improvement");
+  return { decision: "resume", code: "eligible" };
+}
+function revivalDelta(descriptor, last, posts, metricSeries) {
+  return `Continue the same assigned task; only these inputs changed.
+ATTEMPT: ${JSON.stringify({ key: descriptor.key, number: descriptor.number })}
+GATE FAILURES: ${JSON.stringify(last?.gateFailures ?? null)}
+METRIC SERIES: ${JSON.stringify(metricSeries ?? null)}
+NEW BOARD POSTS: ${JSON.stringify(posts)}
+PREVIOUS RESULT: ${JSON.stringify(descriptor.continuationRef)}
+Write code with edit, write or apply_patch; use bash for commands, tests and builds.
+The checkpoint hook re-reads the new attempt intention and journals first-touch paths in this attempt.
+Return the same decision-only structured result; an optional continuation opinion is advisory.`;
+}
+// Only an explicit no-child resume refusal permits replacement. Unknown failures and
+// all native barriers stay on the existing observation/recovery route.
+function rejectedResume(result) {
+  return result?.ok === false && !result.runId && !result.agent &&
+    (result.results === undefined || Array.isArray(result.results) && result.results.length === 0) &&
+    Object.keys(result).every(field => ["key", "ok", "output", "error", "artifactPaths", "results"].includes(field)) &&
+    !barrier(result) &&
+    /^(?:Cannot resume:|Run not found\. Provide id or runId\.|Status file not found for async run ')/.test(result.error ?? result.output ?? "");
+}
 function continuationIdentity(value) {
   // Bounded equality witness, not authority or a substitute for native reports.
-  const encoded = JSON.stringify([value.candidate, value.remaining, value.diagnosis, value.continuation]);
+  const encoded = JSON.stringify([value.candidate, value.remaining, value.diagnosis, value.revival]);
   let hash = 2166136261;
   for (let index = 0; index < encoded.length; index++) hash = Math.imul(hash ^ encoded.charCodeAt(index), 16777619);
   return `${encoded.length}:${hash >>> 0}`;
@@ -391,8 +434,8 @@ function emitTodoSnapshot() {
     const gatesTotal = task.gates?.length ?? task.checks.length;
     const metric = task.metric ? `metric ${samples[0]?.value ?? "?"}→${latest?.value ?? "?"}/${task.metric.target} · ` : "";
     const stalls = (loop.task?.progress?.stalls ?? 0) + (loop.settlement?.applied && loop.metricSeries?.nonImproving >= 3 && !retained?.completed ? 1 : 0);
-    const suffix = `${attempt ? ` (intento ${attempt.number})` : ""} · ${metric}gates ${gatesPassed}/${gatesTotal} · stall ${progress?.nonImproving ?? 0}/3 · stalls ${stalls}/2`;
-    return { id: task.id, status, subject: `${task.id} ${task.goal}`.slice(0, 2000 - suffix.length) + suffix,
+    const suffix = `${attempt ? ` (intento ${attempt.number}${attempt.revival?.decision === "resume" ? " ↻" : ""}) · paths ${attempt.capturedPaths ?? 0}` : ""} · ${metric}gates ${gatesPassed}/${gatesTotal} · stall ${progress?.nonImproving ?? 0}/3 · stalls ${stalls}/2`;
+    return { id: task.id, status, subject: (task.title ?? task.id).slice(0, 2000 - suffix.length) + suffix,
       blockedBy: task.dependsOn.filter(dependency => !invocation.tasks[dependency.taskId]?.completed).map(dependency => dependency.taskId),
       metadata: { cancel: "request" }, ...(retained?.cancel ? { reason: line(retained.cancel.reason) } : {}) };
   }) : [];
@@ -910,9 +953,19 @@ function prerequisiteResults(task) {
 function backlogAuthority() {
   return { specDigest: invocation.association.digest, amendmentDigests: (invocation.amendments ?? []).map(item => item.sha256) };
 }
+const LOOP_IO_CONTROL = { needsAttentionAfterMs: 1_800_000 };
+function loopIORequest(childKey, input) {
+  return { key: childKey, agent: "pitako.loop-io", cwd: config.root, context: "fresh", output: false,
+    outputMode: "inline", outputSchema: false, reads: false, progress: false,
+    control: LOOP_IO_CONTROL, task: JSON.stringify(input) };
+}
 // Runtime operations have durable intentions and fresh retry keys, like gate.
-function loopIO(slot, input) {
-  const pending = loop[slot] ??= { key: `${key}.l${loop.number}.${slot}`, retry: 0, stage: "intention" };
+function loopIO(slot, input, owner = loop) {
+  const pending = owner[slot] ??= { key: slot === "baselineIO" ? `${input.intent.key}.baseline` : `${key}.l${loop.number}.${slot}${slot === "selection" && loop.directorRetry ? ".d1" : ""}`, retry: 0, stage: "intention" };
+  if (pending.stage === "receipt" && slot === "prepare" && !invocation.currentView && !Array.isArray(pending.receipt.view?.posts)) {
+    pending.retry++; pending.dispatched = false; pending.stage = "intention";
+    return save().then(() => loopIO(slot, input, owner));
+  }
   if (pending.stage === "receipt") {
     if (slot !== "selection") return Promise.resolve(pending.receipt);
     assertSelection();
@@ -926,17 +979,13 @@ function loopIO(slot, input) {
         const cause = barrier(observed, pending.ref?.runId ?? childKey);
         if (cause) throw nativeBarrier(cause, pending.ref);
       });
-    }).then(() => { pending.dispatched = true; return save(); }).then(() => dispatch([{
-      key: childKey, agent: "pitako.loop-io", cwd: config.root, context: "fresh", output: false,
-      outputMode: "inline", outputSchema: false, reads: false, progress: false,
-      task: JSON.stringify(input),
-    }])).then(([result]) => {
+    }).then(() => { pending.dispatched = true; return save(); }).then(() => dispatch([loopIORequest(childKey, input)])).then(([result]) => {
       pending.ref = nativeReference(childKey, result);
       const cause = barrier(result, childKey);
       if (cause) throw nativeBarrier(cause, pending.ref);
       let receipt;
       try { receipt = JSON.parse(result.output?.trim().split("\n").at(-1)); } catch (_) { /* Missing transport output is retried. */ }
-      if (receipt?.error === "loop-io") throw Object.assign(new Error(receipt.reason), { selectionRejected: receipt.selectionRejected === true, backlogConflict: receipt.reason?.startsWith("backlog-conflict:") });
+      if (receipt?.error === "loop-io") throw Object.assign(new Error(receipt.reason), { selectionRejected: receipt.selectionRejected === true, replayRejected: receipt.replayRejected === true, viewOverflow: receipt.viewOverflow === true, backlogConflict: receipt.reason?.startsWith("backlog-conflict:") });
       if (!result.ok || result.agent !== "pitako.loop-io" || !text(result.runId) ||
           !Array.isArray(result.results) || result.results.length !== 1 || result.results[0].exitCode !== 0 || !receipt) {
         if (pending.retry >= 2) throw new Error(`loop-io ${slot} has no terminal receipt: ${result.error ?? childKey}`);
@@ -950,6 +999,7 @@ function loopIO(slot, input) {
         projection.selected = loop.task?.id ?? null;
         if (projection.selected === null) projection.completedTasks = completedTasks;
       }
+      if (["settlement", "cancellation", "finalGaps"].includes(slot)) delete projection.view;
       pending.receipt = projection; pending.stage = "receipt";
       return save().then(() => slot === "selection" ? { ...projection, selected: loop.task } : projection);
     });
@@ -996,7 +1046,7 @@ function settleTask() {
 }
 function recordFinalGaps(kind, findings, outputs) {
   const changes = findings.map((finding, index) => ({ kind: "add", reason: finding.reason,
-    task: { id: `final-${invocation.backlogDigest.slice(0, 16)}-${kind}-${index + 1}`, goal: finding.reason,
+    task: { id: `final-${invocation.backlogDigest.slice(0, 16)}-${kind}-${index + 1}`, title: `final ${kind} gap ${index + 1}`, goal: finding.reason,
       expectedResult: `Resolve the final-phase finding: ${finding.reason}`,
       status: "pending", origin: { kind: "final-phase", ref: JSON.stringify(outputs[index]) },
       specRefs: [finding.source ?? "Final phase: frozen spec and amendments"], dependsOn: [],
@@ -1097,7 +1147,9 @@ work in mixed tasks, explicit requirements, admitted gates and whole-spec suffic
 function inspectRecovery(kind, ref, retained) {
   // Subject identity comes from the frozen work, not a replaceable output path
   // or query key. There is one finite observation route for this subject/stage.
-  const subject = kind === "checkpoint" ? `checkpoint:${loop.attempt.taskId}:${loop.attempt.number}` : kind === "interrupted-operation" ? `interrupted-operation:${ref.key}` : "loop-plan";
+  // The authorized replacement director has its own finite recovery route.
+  const planSubject = ref.key === `${key}.l${loop.number}.director.d1` ? "loop-plan:d1" : "loop-plan";
+  const subject = kind === "checkpoint" ? `checkpoint:${loop.attempt.taskId}:${loop.attempt.number}` : kind === "interrupted-operation" ? `interrupted-operation:${ref.key}` : planSubject;
   if (loop.recoveries.some(item => !text(item.subject)))
     return Promise.reject(new Error("Retained recovery lacks immutable subject/stage; no replacement query or migration authorized."));
   let recovery = loop.recoveries.find(item => item.subject === subject);
@@ -1446,6 +1498,12 @@ function workerValue(result, descriptor, task, statusRef, observed) {
       !(typeof value.work === "string" && value.work.length) || !Array.isArray(value.remaining) ||
       !value.remaining.every(item => typeof item === "string" && item.length))
     throw rejectReport("Worker returned an invalid work/status/remaining contract.");
+  const opinion = original.continuation;
+  if (opinion !== undefined && (!opinion || typeof opinion !== "object" || Array.isArray(opinion) ||
+      Object.keys(opinion).some(key => !["mode", "reason"].includes(key)) ||
+      !["resume", "fresh"].includes(opinion.mode) || typeof opinion.reason !== "string" || [...opinion.reason].length > 200))
+    throw rejectReport("Worker returned an invalid continuation opinion (mode resume/fresh, reason at most 200 characters).");
+  value.continuation = opinion === undefined ? { mode: "fresh", reason: "" } : clone(opinion);
   const bounded = content => {
     let result = "", remaining = 2048;
     for (const point of typeof content === "string" ? content.toWellFormed() : "") {
@@ -1500,7 +1558,7 @@ function workerValue(result, descriptor, task, statusRef, observed) {
   if (observed && value.status === "continue" && !value.remaining.length)
     value.remaining = [checksCurrent ? "Worker has not reported completion." : "Resolve workflow gate failures."];
   value.usefulProgress = !receipt?.stalled;
-  value.continuation = value.status === "continue" ? value.diagnosis : null;
+  value.revival = value.status === "continue" ? value.diagnosis : null;
   return { value, checks, checksCurrent };
 }
 
@@ -1538,9 +1596,14 @@ function admitWorker(result, descriptor, task, recoveryRef, statusRef, observed,
       failed: parsed.checks.filter(check => check.result === "failed").length,
       notRun: parsed.checks.filter(check => check.result === "not-run").length },
     usefulContinuation: value.status === "continue" && value.usefulProgress &&
-      value.remaining.length > 0 && text(value.continuation) && text(value.diagnosis),
+      value.remaining.length > 0 && text(value.revival) && text(value.diagnosis),
     continuationIdentity: continuationIdentity(value),
   };
+  const peak = descriptor.gate?.receipt?.contextPeak ?? null;
+  descriptor.revival = { ...(descriptor.revival ?? { decision: "fresh", code: peak === null ? "missing-peak" : "fresh-dispatch" }),
+    opinion: value?.continuation.mode ?? "fresh", reason: value?.continuation.reason ?? "", peak };
+  descriptor.capturedPaths = observed?.capturedPaths ?? 0;
+  projected.revival = clone(descriptor.revival);
   if (recoveryRef) projected.ref = { ...projected.ref, ...descriptor.launch,
     recovery: { ref: recoveryRef, field: "structuredOutput.workerResult" } };
   if (!descriptor.gate && invocation.taskFrame.identities.includes(projected.continuationIdentity))
@@ -1637,12 +1700,11 @@ function verifyAttempt(descriptor, task, value, reuse) {
       // Admission exhaustion proves no child launched and preserves this key.
       pending.stage = "intention"; pending.dispatched = true;
       return save();
-    }).then(() => dispatch([{ key: gateKey, agent: "pitako.loop-io", cwd: config.root,
-      context: "fresh", output: false, outputMode: "inline", outputSchema: false, reads: false, progress: false,
-      timeoutMs: 14400000,
-      task: JSON.stringify({ operation: "gate", root: config.root, specId: config.id, invocation: config.invocation,
-        loop: loop.number, attempt: descriptor.number, key: gateKey, task: gateTask,
-        workerStatus: value.status, writerSettled: true, knowledge: value.knowledge, ...(reuse ? { reuse } : {}) }) }])).then(([result]) => {
+    }).then(() => dispatch([{ ...loopIORequest(gateKey, {
+      operation: "gate", root: config.root, specId: config.id, invocation: config.invocation,
+      loop: loop.number, attempt: descriptor.number, key: gateKey, task: gateTask,
+      workerStatus: value.status, writerSettled: true, checkpoint: descriptor.checkpoint, knowledge: value.knowledge, ...(reuse ? { reuse } : {}),
+    }), timeoutMs: 14400000 }])).then(([result]) => {
       pending.ref = nativeReference(gateKey, result);
       const cause = barrier(result, gateKey);
       if (cause) return save().then(() => { throw nativeBarrier(cause, pending.ref); });
@@ -1653,6 +1715,9 @@ function verifyAttempt(descriptor, task, value, reuse) {
           try { receipt = JSON.parse(last); } catch (_) { /* Malformed output is not gate evidence. */ }
         }
       }
+      if (receipt?.viewOverflow === true) return save().then(() => {
+        throw Object.assign(new Error("HUMAN + DECISION overflow: ask the human to consolidate current Board HUMAN rulings and decisions"), { viewOverflow: true });
+      });
       const failures = [result, ...(result?.results ?? [])].filter(Boolean);
       const terminal = result?.ok && result.agent === "pitako.loop-io" && text(result.runId) &&
         (result.key === undefined || result.key === gateKey) && !result.state && !result.terminalOutcome &&
@@ -1711,6 +1776,8 @@ function currentAcceptance() {
 function validGateReceipt(receipt, task, status) {
   try {
     candidate(receipt.before); candidate(receipt.after);
+    if (receipt.contextPeak !== undefined && receipt.contextPeak !== null &&
+        (!Number.isSafeInteger(receipt.contextPeak) || receipt.contextPeak < 0)) return false;
     if (typeof receipt.mutated !== "boolean" || receipt.mutated !== !same(candidate(receipt.before), candidate(receipt.after)) ||
         typeof receipt.stalled !== "boolean" || !Array.isArray(receipt.gates) ||
         !Number.isSafeInteger(receipt.progress?.nonImproving) || receipt.progress.nonImproving < 0 ||
@@ -1778,7 +1845,7 @@ function sealAndAdmit(result, descriptor, task, recoveryRef, statusRef) {
           item.outputPartial || item.truncation || item.timedOut || item.processSignal ||
           item.exitCode !== undefined && item.exitCode !== 0) ||
         !observed || observed.v !== 1 || observed.kind !== kind ||
-        !["sealed", "observed", "mismatch"].includes(observed.outcome))
+        !["sealed", "observed", "mismatch", "open"].includes(observed.outcome))
       throw nativeBarrier("Checkpoint sealer lacks successful terminal stdout.", ref);
     candidate(observed.candidate);
     if (receipt && !same(candidate(observed.candidate), candidate(receipt.after))) {
@@ -1786,8 +1853,17 @@ function sealAndAdmit(result, descriptor, task, recoveryRef, statusRef) {
       loop.halt = { status: "blocked", code: "recovery", reason, ref };
       return save().then(() => { throw new Error(reason); });
     }
-    const fields = Object.keys(observed).sort().join(",");
+    if (observed.capturedPaths !== undefined &&
+        (!Number.isSafeInteger(observed.capturedPaths) || observed.capturedPaths < 0))
+      throw nativeBarrier("Invalid captured path count.", ref);
+    const fields = Object.keys(observed).filter(field => field !== "capturedPaths").sort().join(",");
     const baseFields = "candidate,kind,outcome,v";
+    if (observed.outcome === "open") {
+      if (fields !== "candidate,kind,outcome,paths,v" || !Array.isArray(observed.paths) ||
+          !observed.paths.length || observed.paths.length > 10 || !observed.paths.every(text))
+        throw nativeBarrier("Invalid never-closed checkpoint effect observation.", ref);
+      return checkpointFallback(result, nativeReference(descriptor.key, result), task);
+    }
     if (observed.outcome === "mismatch") {
       if (fields !== "candidate,kind,outcome,paths,v" || !Array.isArray(observed.paths) ||
           !observed.paths.length || observed.paths.length > 10 || observed.paths.some(entry =>
@@ -2289,11 +2365,15 @@ try {
     if (text(admitted.error)) throw new Error(admitted.error);
     if (!Number.isSafeInteger(admitted.maxCycles) || admitted.maxCycles < 1)
       throw new Error("Invalid pitako.execute.maxCycles admission receipt.");
+    if (admitted.revivalContextPeak !== undefined &&
+        (!Number.isSafeInteger(admitted.revivalContextPeak) || admitted.revivalContextPeak < 1))
+      throw new Error("Invalid pitako.execute.revivalContextPeak admission receipt.");
     invocation = {
       version: config.stateVersion, association: { missionId: config.missionId, missionPath: config.missionPath,
         invocation: config.invocation, root: metadata.root, commonDir: metadata.commonDir,
         source: metadata.selected.source, digest: metadata.selected.digest,
         maxCycles: admitted.maxCycles, sourceRefs: config.sourceRefs ?? [] },
+      revivalContextPeak: admitted.revivalContextPeak ?? 120000,
       admissionBinding: current.binding, amendments: clone(config.amendments ?? []), startedAt: Date.now(), consumedLoops: 0, ledger: { count: 0, head: null }, sealPending: null,
       recoverySeq: 0, lastRecoveryRef: null, lastConfirmed: null, usageTotals: { tokens: 0, known: 0, unknown: 0 },
       tasks: {}, taskFrame: null, loop: null,
@@ -2492,9 +2572,9 @@ try {
         invocation.currentView = prepared.view; invocation.boardTopicId = prepared.view.topicId;
         await save();
       }
-      const directorKey = `${key}.l${loop.number}.director`;
+      const directorKey = `${key}.l${loop.number}.director${loop.directorRetry ? ".d1" : ""}`;
       if (!loop.plan || budgetRejected(directorKey)) {
-        const observation = await observeDemands();
+        const observation = loop.directorRetry ? null : await observeDemands();
         loop.plan = { stage: "intention", ref: { key: directorKey } };
         await save();
         const result = await collect(directorKey, "pitako.execution-director",
@@ -2511,8 +2591,10 @@ READ-ONLY BACKLOG SELECTION ONLY. Do not delegate, implement, run checks/review 
 Read the complete backlog at ${invocation.backlogPath} (if absent, derive it from the full spec).
 CURRENT BACKLOG DIGEST: ${JSON.stringify(invocation.backlogDigest)}
 CURRENT BOARD VIEW: ${JSON.stringify(invocation.currentView)}
+${loop.directorRetry ? `PREVIOUS SELECTION REJECTED: ${loop.directorRetry.diagnostic}\nCorrect the validation error and publish one replacement selection.` : ""}
 Return exactly {select, changes, reason}: select the single most important pending task whose dependencies are done.
 Changes are keyed add | split | obsolete | update operations, each with a reason; first creation uses only add.
+update patches only goal, expectedResult, specRefs, dependsOn, gates, metric, remaining and title; never change id, origin or status (use obsolete, split or add).
 Three consecutive non-improving attempts stall a task loop; this threshold is unchanged.
 After a stall, re-selection requires a changed definition: the same output must include an update with a reason
 that changes the definition digest over {goal, expectedResult, gates, metric, dependsOn}; remaining does not count.
@@ -2521,7 +2603,7 @@ loop-io apply rejects unchanged re-selection as gaps: "stalled task re-selected 
 Each stall increments progress.stalls and records the definition digest and diagnosis in history; todo rows show stalls N/2.
 The second stall of the same task ID halts needs-decision for the human with task ID, metric series and both stall diagnoses.
 The human edits the backlog or delivers an amendment, then relaunches or unblocks through existing routes.
-New tasks follow the supplied backlog task schema. Gates are focused commands, not the complete suite.
+New and updated tasks require a non-empty title of at most 80 characters; legacy titles fall back to the ID for display. New tasks follow the supplied backlog task schema. Gates are focused commands, not the complete suite.
 Tasks needing multiple attempts declare a numeric metric {command, unit, target}.
 Never reuse IDs or reopen done/obsolete tasks. Reconcile changed spec/amendment authority with reasons.
 Select null only when there is no pending or blocked task; the workflow then enters the final phase.
@@ -2529,8 +2611,9 @@ Acceptances belong to the final phase, never an ordered verification task.
 Backlog authority: ${JSON.stringify(backlogAuthority())}
 ${Array.isArray(config.originalProblem?.criteria) ? `ORIGINAL PROBLEM: criteria ${config.originalProblem.criteria.map(n => `#${n}`).join(", ")}.
 Optionally designate gates and acceptance commands with verifies: [positive criterion numbers]. Only current workflow gate receipts update the advisory notice.` : ""}
-An optional acceptance: [{id, command, cwd, verifies?}] field carries the complete procedure from the spec, GATES.md and AGENTS.md.
+An optional acceptance: [{id, command, cwd, verifies?, exception?: {humanRef, reason}}] field carries the complete procedure from the spec, GATES.md and AGENTS.md.
 It is REQUIRED and non-empty to initialize a backlog. Later replacement requires your reason, retained in acceptanceHistory.
+An exception is allowed only when a current HUMAN in the view exempts that command; humanRef is that post's id. At least one entry stays blocking.
 Do not run the acceptance commands; the final phase runs them.
 Publish one selection with the native output binding then END. Native permissions and Stop apply.`,
           planSchema);
@@ -2565,12 +2648,18 @@ Publish one selection with the native output binding then END. Native permission
       let applied;
       try {
         applied = await loopIO("selection", { operation: "apply", root: config.root, specId: config.id,
-          expectedDigest: invocation.backlogDigest, key: `${key}.l${loop.number}.selection`,
+          expectedDigest: invocation.backlogDigest, key: `${key}.l${loop.number}.selection${loop.directorRetry ? ".d1" : ""}`,
           invocation: config.invocation, loop: loop.number, authority: backlogAuthority(), director: activePlan });
       } catch (error) {
         const diagnostic = String(error?.message ?? error);
-        if (!error.selectionRejected) throw error;
-        loop.plan.stage = "rejected"; loop.plan.rejection = { diagnostic, ref: clone(loop.plan.ref) };
+        if (!error.selectionRejected || error.backlogConflict) throw error;
+        if (!loop.directorRetry && !error.replayRejected) {
+          loop.directorRetry = { diagnostic: diagnostic.slice(0, 2000), rejectedRef: clone(loop.plan.ref) };
+          loop.plan = null; delete loop.selection; activePlan = null;
+          await save(); continue;
+        }
+        loop.plan.stage = "rejected"; loop.plan.rejection = { diagnostic, ref: clone(loop.plan.ref),
+          ...(loop.directorRetry ? { previous: clone(loop.directorRetry) } : {}) };
         loop.outcome = "gaps"; loop.endedAt = Date.now(); activePlan = null; invocation.currentView = null;
         await save(); loopReport("gaps", diagnostic); continue;
       }
@@ -2585,6 +2674,12 @@ Publish one selection with the native output binding then END. Native permission
       invocation.tasks = Object.fromEntries(loop.manifest.map(id => [id, { admitted: [], completed: null, last: null }]));
       loop.plan.association = association(loop.number); loop.plan.stage = "admitted";
       loop.phase = "implementation";
+      // Full views remain replayable until this selection-admission save.
+      for (const slot of ["prepare", "selection"]) {
+        const receipt = loop[slot]?.receipt;
+        if (receipt?.view) receipt.view = { topicId: receipt.view.topicId,
+          viewDigest: receipt.viewDigest, viewBytes: receipt.viewBytes };
+      }
       activePlan = null;
       await save();
     }
@@ -2639,11 +2734,19 @@ Publish one selection with the native output binding then END. Native permission
             invocation.taskFrame.restorationKeys.unshift(loop.attempt.checkpoint.key);
             (invocation.taskFrame.sources ??= []).unshift(clone(loop.attempt.checkpoint));
           }
+          const source = loop.attempt;
+          const peak = source.gate?.receipt?.contextPeak ?? null;
+          const revival = { opinion: previous.revival?.opinion ?? "fresh", reason: previous.revival?.reason ?? "",
+            ...decideRevival(source, { taskId: task.id, loop: loop.number, candidate: currentCandidate,
+              halt: loop.halt, revivalContextPeak: invocation.revivalContextPeak }, peak), peak };
           loop.attempt = { taskId: task.id, index: loop.cursor, number: previous.attempt + 1,
+            revival, ...(revival.decision === "resume" ? { resume: source.launch.runId,
+              bindingKey: source.bindingKey ?? source.key, resumeAfter: source.gate.receipt.after,
+              boardPostIds: source.boardPostIds ?? [] } : {}),
             key: `${key}.l${loop.number}.t${loop.cursor + 1}.a${previous.attempt + 1}`,
             stage: "intention", continuationRef: previous.ref, ...(pauseSource ? { pauseSource } : {}) };
           await save();
-        } else if (loop.attempt && !loop.attempt.restore?.undispatched && !budgetRejected(loop.attempt.key)) {
+        } else if (loop.attempt && !loop.attempt.undispatched && !loop.attempt.restore?.undispatched && !budgetRejected(loop.attempt.key)) {
           // Never call an unresolved writer key as if native reuse were read-only.
           await observePendingSealer();
           const ref = loop.attempt.launch ?? { key: loop.attempt.key };
@@ -2682,7 +2785,7 @@ Publish one selection with the native output binding then END. Native permission
         if (!loop.attempt.checkpoint) {
           loop.attempt.baseline = candidate(currentCandidate);
           loop.attempt.checkpoint = { version: 2, association: clone(invocation.association),
-            key: loop.attempt.key, taskId: task.id, attempt: loop.attempt.number,
+            key: loop.attempt.key, baseline: clone(loop.attempt.baseline), taskId: task.id, attempt: loop.attempt.number,
             loop: loop.number, cursor: loop.cursor, phase: loop.phase, planRef: clone(loop.plan.ref),
             progress: { consumedLoops: invocation.consumedLoops,
               admitted: Object.fromEntries(Object.entries(invocation.tasks).filter(([, task]) => task.admitted.length)
@@ -2691,6 +2794,18 @@ Publish one selection with the native output binding then END. Native permission
                 clone({ taskId, attempt, resultRef, checkpointRef, digest }))(invocation.lastConfirmed) : null } };
           await save();
         }
+        const baseline = await loopIO("baselineIO", { operation: "baseline", root: config.root,
+          intent: clone(loop.attempt.checkpoint) }, loop.attempt);
+        loop.attempt.baseline = clone(baseline.candidate);
+        loop.attempt.checkpoint.baseline = clone(baseline.candidate);
+        currentCandidate = clone(baseline.candidate);
+        if (loop.attempt.resume && !same(currentCandidate, loop.attempt.resumeAfter)) {
+          loop.attempt.revival.decision = "fresh";
+          loop.attempt.revival.code = "candidate-changed";
+          delete loop.attempt.resume;
+          delete loop.attempt.bindingKey;
+        }
+        await save();
         if (loop.attempt.restore) {
           const restoredFrom = await observeStatus(loop.attempt.restore.producer.runId ?? loop.attempt.restore.producer.key, true);
           assertFallbackProducer(restoredFrom, loop.attempt.restore.producer);
@@ -2699,6 +2814,14 @@ Publish one selection with the native output binding then END. Native permission
           delete loop.attempt.restore.undispatched;
           await save();
         }
+        // Hook identity must be durable while the worker is running, not only after it settles.
+        loop.attempt.bindingKey ??= loop.attempt.key;
+        const posts = invocation.currentView?.posts ?? [];
+        const newPosts = posts.filter(post => !(loop.attempt.boardPostIds ?? []).includes(post.id));
+        loop.attempt.boardPostIds = posts.map(post => post.id);
+        delete loop.attempt.undispatched;
+        loop.attempt.stage = "launched";
+        await save();
         const descriptor = clone(loop.attempt);
         if (descriptor.restore) descriptor.restore.checkpoint = descriptor.restore.sourceKeys.map(sourceKey => {
           const source = invocation.taskFrame.sources.find(item => item.key === sourceKey);
@@ -2706,7 +2829,9 @@ Publish one selection with the native output binding then END. Native permission
           return clone(source);
         });
         let result = await collect(descriptor.key, "pitako.worker",
-          { label: task.goal, phase: "implementation" }, `${fullContext()}
+          { label: task.title ?? task.id, phase: "implementation" }, descriptor.resume
+          ? revivalDelta(descriptor, invocation.tasks[task.id]?.last, newPosts, loop.metricSeries ?? task.progress)
+          : `${fullContext()}
 EXECUTE SINGLE TASK. No delegation, next-task selection, private diary/progress file.
 When your task has three or more steps, record them with todo before the first edit and keep their status current. Show only your own steps, not the execute plan. Todo is display, not evidence; the structured result stays authoritative. A cancelled or deleted step never drops required work or checks.
 The workflow owns review and compliance; do not launch or infer another reviewer.
@@ -2742,23 +2867,18 @@ source is usable only when pending captures are absent: preserve its sealed POST
 and pending position, never its manifest preimages or an unadmitted seal. If attribution/conflict fails, stop.
 The root sealer reads the actual restore.json and restored.json; do not echo a restore receipt.
 This is direct writer execution evidence, not an independent inspector attestation. A settled restore
-receipt means do NOT restore again after later task edits. Then capture the NEW checkpoint below
-before pending work. Complete only this task; the workflow runs the required gates after you settle.
+receipt means do NOT restore again after later task edits. Then use the normal write tools with the NEW checkpoint intention below
+for pending work. Complete only this task; the workflow runs the required gates after you settle.
 ` : ""}PRE-WRITE CHECKPOINT INTENTION (not a backup until published):
 ${JSON.stringify(descriptor.checkpoint)}
-Call the registered writer tool checkpoint_create({kind:"pre", paths:[exact authorized relative paths]})
-before ANY checkout write (after the required restore above on fallback). Inspect structured ok/status
-and actual artifact references; a failed or unavailable tool means no modifying work.
-Native launch context binds this attempt to its durable intention/progress. Do not construct request
-scripts, private state paths, manifests or receipts for capture/seal, or invent missing context.
-Writer helper for attributed writes and restoration ONLY: ${config.checkpointHelper ?? "skills/execute/checkpoint.mjs"}.
-Read its source/usage. Use apply for every affected-file write: it journals exact pre/postimages before atomic effects.
-Do not bypass the effect journal with ordinary edit/write/patch commands.
-The manifest limits rollback, not scope. If another affected path is needed, return useful
-same-task continuation before writing it; the next attempt captures a new unit.
-Capture failure means no modifying work. Existing artifacts require reconciliation, never overwrite.
-Never restore a unit with an admitted complete result.
-Verification tasks without checkout writes do not call checkpoint_create.
+Write code with edit, write or apply_patch; use bash for commands, tests and builds.
+The checkpoint extension captures first-touch preimages and journals each call before allowing it.
+Newly discovered paths are captured in this same attempt. Journal failures block writes;
+do not bypass the hooks or invent capture scripts, manifests, private state paths or receipts.
+Native launch context binds this attempt to its durable intention/progress.
+Owned restoration helper ONLY: ${config.checkpointHelper ?? "skills/execute/checkpoint.mjs"}.
+Never restore a unit with an admitted complete result. Editing provider/profile files does not
+reload this session; retained legacy attempts keep their original write contract.
 After all owned journaled writes settle, return your decision-only structured result.
 The root chooses the checkpoint kind and seals metadata; do not call unit/pause, construct
 checkpointReceipt, restoreReceipt or candidate identity, or transcribe checkpoint references.
@@ -2775,15 +2895,34 @@ If the selected task is unavailable inline, read it from ${invocation.backlogPat
 and admitted backlog digest ${invocation.backlogDigest} before effects. Never reconstruct a task from director previews.
 No definition => report blocked, never reconstruct scopes. Continuation reads the exact preceding result
 ${JSON.stringify(descriptor.continuationRef)} and addresses only useful diagnosed pending work on THIS task.
-Report {work, status, remaining, knowledge:{findings, handoff}}. The workflow runs the metric and gates
+Report {work, status, remaining, knowledge:{findings, handoff}, continuation?:{mode:"resume"|"fresh", reason}}.
+The optional continuation opinion has a reason of at most 200 characters; missing means fresh. The workflow decides whether to resume. The workflow runs the metric and gates
 after you settle, then chooses unit or pause from the gate receipt. Do not report per-check evidence,
 candidate identities or checkpoint receipts. Do not run the full suite; the workflow reserves it
 for the final phase. A complete report means the task implementation is ready for focused gates.
 HANDOFF (at most 2 KiB) describes current repository locations, seams and metric state, never
-agent narrative or next steps. Put pending work in remaining and dead ends in FINDINGs.
+agent narrative or next steps. Put pending work in remaining.
+A FINDING records only a fact that changes how this task or another task is done.
+Status or scope notes and tool failures with no consequence for the code are not FINDINGs.
 Return structured_output after all owned journaled writes settle.`,
-          workerSchema, true);
+          workerSchema, true, dispatch, descriptor.resume);
+        if (descriptor.resume && rejectedResume(result)) {
+          const rejection = { ref: nativeReference(descriptor.key, result), reason: excerpt(result.error ?? result.output) };
+          loop.results.push({ ...projection(descriptor.key, result), taskId: task.id, attempt: descriptor.number,
+            status: "rejected", revival: { ...descriptor.revival, decision: "fresh", code: "resume-rejected" },
+            diagnosis: rejection.reason });
+          loop.attempt = { taskId: task.id, index: loop.cursor, number: descriptor.number + 1,
+            key: `${key}.l${loop.number}.t${loop.cursor + 1}.a${descriptor.number + 1}`,
+            stage: "intention", undispatched: true, continuationRef: descriptor.continuationRef,
+            revival: { ...descriptor.revival, decision: "fresh", code: "resume-rejected" }, resumeRejection: rejection };
+          await save();
+          continue;
+        }
         loop.attempt.launch = nativeReference(descriptor.key, result);
+        if (descriptor.resume && !result?.ok && !result?.runId && !barrier(result)) {
+          await save();
+          throw new Error("Resume failed without a definitive no-child refusal; replacement is not authorized.");
+        }
         retainReceived(result);
         // Missing modifying results use the same checkpoint route on first
         // receipt as on replay; an inspector is not a rollback prerequisite.
@@ -2812,6 +2951,7 @@ Return structured_output after all owned journaled writes settle.`,
         if (!result.structuredOutput)
           throw new Error("Pending v6 worker has no complete result/checkpoint route; no inspector or replacement authorized.");
         value = await sealAndAdmit(result, loop.attempt, task);
+        if (value === null) continue; // never-closed effect: restoring worker intention is durable
         await save();
         if (invocation.sealPending) await archiveSeal();
         await persistCancellations();

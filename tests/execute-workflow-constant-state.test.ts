@@ -135,7 +135,7 @@ test.each([
   const host = fixture(); host.setLimit(2);
   host.setRespond((request, normal) => {
     const result = normal();
-    if (request.key === "invoke-human-1.l1.director") mutate(result.structuredOutput);
+    if (/^invoke-human-1\.l1\.director(?:\.d1)?$/.test(request.key)) mutate(result.structuredOutput);
     return result;
   });
   expect((await host.execute()).status).toBe("partial");
@@ -147,7 +147,7 @@ test("a gaps publisher delivers its verified rejection summary to the very next 
   const host = fixture(undefined, { readOnly: true }); host.setLimit(2);
   host.setRespond((request, normal) => {
     const result = normal();
-    if (request.key === "invoke-human-1.l1.director") result.structuredOutput.select = "missing";
+    if (/^invoke-human-1\.l1\.director(?:\.d1)?$/.test(request.key)) result.structuredOutput.select = "missing";
     return result;
   });
   const output = await host.execute();
@@ -288,4 +288,71 @@ test("admission amendments reach every phase without the director copying them i
   for (const pattern of [/\.director$/, /\.t\d+\.a\d+$/, /\.compliance$/, /\.review\./])
     expect(phases.some(call => pattern.test(call.key))).toBe(true);
   for (const call of phases) expect(call.task, call.key).toContain(JSON.stringify(amendments));
+});
+
+
+test("selection admission compacts views atomically while replay retains full views", async () => {
+  const host = fixture();
+  host.setFailSave(value => value.loop?.plan?.stage === "admitted");
+  expect((await host.execute()).reason).toContain("Essential persistence failed");
+  const retained = host.current();
+  for (const slot of ["prepare", "selection"]) {
+    expect(retained.loop[slot].receipt.view).toHaveProperty("posts");
+    expect(retained.loop[slot].receipt.viewDigest).toMatch(/^[a-f0-9]{64}$/);
+  }
+  host.setFailSave();
+  expect((await host.execute()).status).toBe("complete");
+  expect(host.calls.filter(call => call.key === "invoke-human-1.l1.selection")).toHaveLength(1);
+  let admissions = 0, settlements = 0, gates = 0;
+  for (const state of host.snapshots) {
+    if (state.loop?.plan?.stage === "admitted") {
+      admissions++;
+      for (const slot of ["prepare", "selection"]) {
+        const receipt = state.loop[slot].receipt;
+        expect(receipt.view).toEqual({ topicId: 1, viewDigest: receipt.viewDigest, viewBytes: receipt.viewBytes });
+      }
+      if (state.currentView) expect(state.currentView).toHaveProperty("posts");
+    }
+    if (state.loop?.settlement?.receipt) {
+      settlements++;
+      expect(state.loop.settlement.receipt).not.toHaveProperty("view");
+    }
+    const gate = state.loop?.attempt?.gate?.receipt;
+    if (gate) { gates++; expect(gate.view).toHaveProperty("posts"); }
+  }
+  expect(admissions).toBeGreaterThan(0);
+  expect(settlements).toBeGreaterThan(0);
+  expect(gates).toBeGreaterThan(0);
+});
+
+test("a digest-only prepare with no current view is fetched under a fresh retry key", async () => {
+  const host = fixture();
+  host.setFailSave(value => value.loop?.plan?.stage === "intention");
+  expect((await host.execute()).reason).toContain("Essential persistence failed");
+  const retained = host.current(), receipt = retained.loop.prepare.receipt;
+  receipt.view = { topicId: receipt.view.topicId, viewDigest: receipt.viewDigest, viewBytes: receipt.viewBytes };
+  retained.currentView = null;
+  host.setFailSave();
+  expect((await host.execute()).status).toBe("complete");
+  expect(host.calls.filter(call => /\.l1\.prepare/.test(call.key)).map(call => call.key))
+    .toEqual(["invoke-human-1.l1.prepare", "invoke-human-1.l1.prepare.r1"]);
+  const director = host.calls.find(call => call.key === "invoke-human-1.l1.director")!;
+  expect(director.task).toContain('"posts":[]');
+});
+
+test.each(["cancellation", "finalGaps"])("%s projections discard their unused view", async slot => {
+  const host = fixture(undefined, { taskCount: slot === "finalGaps" ? 0 : 1 }); host.setLimit(1);
+  host.setRespond((request, normal) => {
+    const result = normal();
+    if (slot === "cancellation" && request.agent === "pitako.request-observer") {
+      const page = JSON.parse(result.output!);
+      page.requests = [{ v: 1, requestId: "cancel-1", invocation: "human-1", taskId: "change1", kind: "cancel", origin: "model" }];
+      result.output = JSON.stringify(page);
+    }
+    return slot === "finalGaps" && request.key.endsWith(".compliance") ? gaps(result) : result;
+  });
+  expect((await host.execute()).status).toBe("partial");
+  const receipts = host.snapshots.filter(value => value.loop?.[slot]?.receipt).map(value => value.loop[slot].receipt);
+  expect(receipts.length).toBeGreaterThan(0);
+  for (const receipt of receipts) expect(receipt).not.toHaveProperty("view");
 });

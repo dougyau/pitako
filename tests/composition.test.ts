@@ -80,7 +80,8 @@ describe("engineering-layer composition", () => {
             "durable root admission", "last confirmed checkpoint", "FULL",
             "human-delivery provenance", "read/hash", "verify-behavior", "pitako.checkpoint-sealer"])
             expect(body).toContain(instruction);
-          expect(body).toContain('checkpoint_create({kind:"pre"');
+          expect(body).not.toContain("checkpoint_create");
+          expect(body).toContain("`edit`, `write` or `apply_patch`");
           for (const call of ['checkpoint_create({kind:"unit"})', 'checkpoint_create({kind:"pause"})'])
             expect(body).not.toContain(call);
           expect(body).toContain("workers never call unit/pause or echo receipts");

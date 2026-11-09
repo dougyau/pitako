@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { readBacklog } from "../skills/execute/loop.ts";
 import { executeControllerFixture } from "./fixtures/execute-workflow.ts";
 
 const { fixture } = executeControllerFixture();
@@ -13,11 +14,14 @@ test("execute todo transitions expose only validated tasks and retain awaited wo
         phases: [{ name: "plan", subject: "Loop 1/3 · Plan", status: "in_progress", metadata: { protected: true } }] });
     }
     if (request.agent === "pitako.worker") {
+      expect(request.label).toBe(`Title ${latest.active.taskId}`);
+      expect(request.task).toContain(`"goal":"Goal ${latest.active.taskId}"`);
+      expect(JSON.stringify(latest)).not.toContain(`Goal ${latest.active.taskId}`);
       expect(request.async).not.toBe(true); // Explicit async would return a receipt, not the authoritative result.
       expect(latest.phases[0].status).toBe("completed");
       expect(latest.tasks.find((task: any) => task.id === latest.active.taskId)).toMatchObject({
         status: "in_progress", metadata: { cancel: "request" }, blockedBy: [],
-        subject: `${latest.active.taskId} Goal ${latest.active.taskId} (intento 1) · gates 0/1 · stall 0/3 · stalls 0/2`,
+        subject: `Title ${latest.active.taskId} (intento 1) · paths 0 · gates 0/1 · stall 0/3 · stalls 0/2`,
       });
       expect(latest.active).toMatchObject({ attempt: 1, workflowKey: request.key });
     }
@@ -29,7 +33,7 @@ test("execute todo transitions expose only validated tasks and retain awaited wo
   const admitted = values.find(value => value.tasks.length);
   expect(admitted.phases[0].status).toBe("completed");
   expect(admitted.tasks.map((task: any) => task.subject)).toEqual([
-    "change1 Goal change1 · gates 0/1 · stall 0/3 · stalls 0/2",
+    "Title change1 · gates 0/1 · stall 0/3 · stalls 0/2",
   ]);
   expect(admitted.tasks[0].blockedBy).toEqual([]);
   expect(values.some(value => value.tasks.some((task: any) => task.id === "change1" && task.status === "completed" && task.subject.endsWith("gates 1/1 · stall 0/3 · stalls 0/2") && !task.subject.includes("metric")))).toBe(true);
@@ -101,5 +105,42 @@ test("execute todo renders saved metric series, gate receipts and stall through 
   await host.execute();
   const rows = snapshots(host).flatMap(value=>value.tasks);
   expect(rows.some(task=>task.subject.endsWith("metric 18→8/0 · gates 3/5 · stall 1/3 · stalls 0/2"))).toBe(true);
-  expect(rows.some(task=>task.subject.includes("(intento 2) · metric 18→8/0 · gates 3/5 · stall 1/3 · stalls 0/2"))).toBe(true);
+  expect(rows.some(task=>task.subject.includes("(intento 2) · paths 0 · metric 18→8/0 · gates 3/5 · stall 1/3 · stalls 0/2"))).toBe(true);
+});
+
+
+test("legacy selected tasks use their ID in todo subjects and worker labels", async () => {
+  const host = fixture(undefined, { readOnly: true });
+  host.setRespond((request, normal) => {
+    const result = normal();
+    if (request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "apply") {
+      const receipt = JSON.parse(result.output!);
+      if (receipt.selected) { delete receipt.selected.title; result.output = JSON.stringify(receipt); }
+    }
+    if (request.agent === "pitako.worker") {
+      expect(request.label).toBe("change1");
+      expect(snapshots(host).at(-1).tasks[0].subject).toBe("change1 (intento 1) · paths 0 · gates 0/1 · stall 0/3 · stalls 0/2");
+      expect(request.task).toContain('"goal":"Goal change1"');
+    }
+    return result;
+  });
+  expect((await host.execute()).status).toBe("complete");
+});
+
+test("director requires capped titles and workflow-generated final gaps have deterministic titles", async () => {
+  const host = fixture(undefined, { taskCount: 0, readOnly: true }); host.setLimit(1);
+  host.setRespond((request, normal) => {
+    const result = normal();
+    if (request.agent === "pitako.execution-director") {
+      const schema = request.outputSchema.properties.changes.items.anyOf[0].properties.task;
+      expect(schema.required).toContain("title");
+      expect(schema.properties.title).toEqual({ type: "string", minLength: 1, maxLength: 80 });
+      result.structuredOutput.acceptance[0].command = "false";
+    }
+    return result;
+  });
+  await host.execute();
+  const tasks = readBacklog(host.root, "spec").backlog!.tasks;
+  expect(tasks).toHaveLength(1);
+  expect(tasks[0]).toMatchObject({ title: "final acceptance gap 1", origin: { kind: "final-phase" } });
 });

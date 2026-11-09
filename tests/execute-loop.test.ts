@@ -6,7 +6,8 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { apply, backlogPath, boardView, currentHumanPostIds, gate, metricBefore, parseMetric, prepare, readBacklog, runCommand, topicOwner, updateProgress, validateBacklog, type Backlog, type GateInput, type Progress, type Task } from "../skills/execute/loop.ts";
-import { openBoard } from "../extensions/board/store.ts";
+import { openBoard, viewEntry, BINDING_BAND_BYTES, GATE_RESERVE, viewBudget } from "../extensions/board/store.ts";
+import { recordContextPeak, type CheckpointIntent } from "../extensions/execute-checkpoint.ts";
 import { repositoryIdentity } from "../extensions/board/workspace.ts";
 
 const { canonicalDigest } = createRequire(import.meta.url)("../extensions/canonical.mjs") as { canonicalDigest(value: unknown): string };
@@ -23,7 +24,7 @@ function fixture() {
 const authority = { specDigest: "a".repeat(64), amendmentDigests: [] };
 const empty: Progress = { nonImproving: 0, last5: [] };
 function task(id = "one"): Task {
-  return { id, goal: `Implement ${id}`, expectedResult: "Observable result", status: "pending", origin: { kind: "spec", ref: "spec" },
+  return { id, title: `Implement ${id}`, goal: `Implement ${id}`, expectedResult: "Observable result", status: "pending", origin: { kind: "spec", ref: "spec" },
     specRefs: ["Acceptance 2"], dependsOn: [], gates: [{ id: "focused", command: "printf passed", cwd: ".", timeoutMs: 1000 }], metric: null,
     parent: null, remaining: "", progress: structuredClone(empty), history: [] };
 }
@@ -308,30 +309,53 @@ test("Board views retain HUMAN rulings and decisions, filter task findings and h
     board.postOnce(workspace, "handoff-one", { topicId, type: "HANDOFF", content: "one state", metadata: { taskId: "one" } });
     for (const type of ["FINDING", "HANDOFF"] as const)
       board.post(workspace, { topicId, type, content: "Cannot override human", metadata: { supersedes: currentHuman.id } });
-    const view = boardView(board, workspace, topicId, "one", 2048);
+    const view = boardView(board, workspace, topicId, { taskId: "one", maxBytes: 2048 });
     expect(view.posts.filter(p => p.type === "HUMAN")).toEqual([futureHuman, forwardHuman, currentHuman].map(p => ({
       id: p.id, type: p.type, content: p.content, metadata: p.metadata, author: "coordinator", createdAt: p.createdAt,
     })));
     expect(view.posts.find(p => p.id === currentHuman.id)?.metadata).toMatchObject({ quote: "Current human ruling", saidAt: "2026-11-08T12:00:00Z" });
+    expect(boardView(board, workspace, topicId, { doneTaskIds: ["other"] }).posts.filter(p => p.type === "HUMAN")).toEqual(view.posts.filter(p => p.type === "HUMAN"));
     expect(view.authority).toContain("current HUMAN rulings (most recent human source wins; cite it) > DECISION");
     expect((await prepare(f)).view.posts.filter(p => p.type === "HUMAN")).toHaveLength(3);
-    expect(() => boardView(board, workspace, topicId, "one", 256)).toThrow("human consolidation required");
+    expect(() => boardView(board, workspace, topicId, { taskId: "one", maxBytes: 256 })).toThrow("human consolidation required");
     expect(Buffer.byteLength(JSON.stringify(view))).toBeLessThanOrEqual(2048); expect(view.omitted).toBeGreaterThan(0);
     expect(view.posts.some(p => p.content === "Current rule")).toBe(true); expect(view.posts.some(p => p.content === "Old rule" || p.content === "Other task")).toBe(false);
     expect(view.posts.map(p => p.id)).toEqual(view.posts.map(p => p.id).sort((a,b) => b-a));
-    board.post(workspace, { topicId, type: "DECISION", content: "Binding rule ".repeat(400).trim() });
+    board.post(workspace, { topicId, type: "DECISION", content: "Binding rule ".repeat(300).trim() });
     writeFileSync(path.join(f.root, "product"), "Human WIP");
     for (let i = 0; i < 50; i++) writeFileSync(path.join(f.root, `untracked-product-file-${i}`), "WIP");
     const receipt = await gate(attempt(f));
     expect(Buffer.byteLength(JSON.stringify(receipt))).toBeLessThanOrEqual(8191);
-    expect(receipt.view.posts.filter(p => p.type === "DECISION").map(p => p.content)).toEqual(["Binding rule ".repeat(400).trim(), "Current rule"]);
+    expect(receipt.view.posts.filter(p => p.type === "DECISION").map(p => p.content)).toEqual(["Binding rule ".repeat(300).trim(), "Current rule"]);
     expect(receipt.view.posts.filter(p => p.type === "HUMAN")).toEqual(view.posts.filter(p => p.type === "HUMAN"));
     expect(receipt.mutated).toBe(false);
     for (const identity of [receipt.before, receipt.after]) expect(Object.keys(identity).sort()).toEqual(["fingerprint", "head"]);
-    human("x".repeat(3000));
+    human("x".repeat(2500));
     // Each band member fits alone; the combined HUMAN + DECISION band must halt, not truncate.
-    expect(() => boardView(board, workspace, topicId, "one")).toThrow("HUMAN + DECISION overflow");
+    expect(() => boardView(board, workspace, topicId, { taskId: "one" })).toThrow("HUMAN + DECISION overflow");
     await expect(prepare(f)).rejects.toThrow("ask the human to consolidate");
+  } finally { board.close(); }
+});
+
+test("director omits only done-task findings without changing worker views or stored posts", async () => {
+  const f = fixture();
+  const tasks = ["done", "pending", "blocked", "obsolete"].map(task);
+  const applied = apply(initial(f.root, tasks));
+  for (const t of applied.backlog!.tasks) t.status = t.id as Task["status"];
+  writeFileSync(applied.path, JSON.stringify(applied.backlog));
+  const prepared = await prepare(f), board = await openBoard(f.dbPath), workspace = repositoryIdentity(f.root), topicId = prepared.view.topicId;
+  try {
+    for (const t of tasks) board.post(workspace, { topicId, type: "FINDING", content: t.id, metadata: { taskId: t.id } });
+    board.post(workspace, { topicId, type: "FINDING", content: "global" });
+    board.post(workspace, { topicId, type: "DECISION", content: "binding", metadata: { taskId: "done" } });
+    board.post(workspace, { topicId, type: "HANDOFF", content: "done state", metadata: { taskId: "done" } });
+    const stored = board.readTopic(workspace, topicId);
+    const worker = boardView(board, workspace, topicId, { taskId: "done" });
+    expect(boardView(board, workspace, topicId, { taskId: "done", doneTaskIds: ["done"] })).toEqual(worker);
+    expect(worker.posts.map(p => p.content)).toEqual(["done state", "binding", "global", "done"]);
+    const director = (await prepare(f)).view;
+    expect(director.posts.map(p => p.content)).toEqual(["binding", "global", "obsolete", "blocked", "pending"]);
+    expect(board.readTopic(workspace, topicId)).toEqual(stored);
   } finally { board.close(); }
 });
 
@@ -421,13 +445,22 @@ test("SIGTERM to the real loop-io gate kills its background grandchild", async (
   }
 });
 
-test.each(["prepare", "gate", "invalid"])("Node stdin adapter loads Board and bounds its output: %s", operation => {
+test.each(["prepare", "apply", "gate", "invalid"])("Node stdin adapter loads Board and bounds its output: %s", async operation => {
   const f = fixture(), script = path.resolve(import.meta.dir, "../skills/execute/loop-io.mjs");
   const invoke = (input: object) => spawnSync("node", [script], { cwd: f.root, input: JSON.stringify(input), encoding: "utf8" });
-  if (operation === "prepare") {
-    const prepared = invoke({ operation, ...f }); expect(prepared.status).toBe(0);
-    expect(JSON.parse(prepared.stdout.trim()).view.topicId).toBeGreaterThan(0);
-    expect(JSON.parse(prepared.stdout.trim())).not.toHaveProperty("backlog");
+  if (operation === "prepare" || operation === "apply") {
+    const topic = (await prepare(f)).view.topicId, board = await openBoard(f.dbPath);
+    try { board.post(repositoryIdentity(f.root), { topicId: topic, type: "DECISION", content: "Keep é and 日本語" }); }
+    finally { board.close(); }
+    const prepared = invoke(operation === "prepare" ? { operation, ...f } : { operation, ...initial(f.root), dbPath: f.dbPath });
+    expect(prepared.status).toBe(0);
+    const receipt = JSON.parse(prepared.stdout.trim());
+    expect(receipt.view.topicId).toBeGreaterThan(0);
+    expect(receipt).not.toHaveProperty("backlog");
+    expect(receipt.viewDigest).toBe(canonicalDigest(receipt.view));
+    expect(receipt.viewBytes).toBe(Buffer.byteLength(JSON.stringify(receipt.view)));
+    expect(receipt.viewBytes).toBeGreaterThan(JSON.stringify(receipt.view).length);
+    expect(receipt.view).toHaveProperty("posts");
   } else if (operation === "gate") {
     const receipt = invoke({ operation, ...attempt(f) }); expect(receipt.status).toBe(0);
     const lines = receipt.stdout.trim().split("\n"); expect(lines).toHaveLength(1); expect(Buffer.byteLength(receipt.stdout)).toBeLessThanOrEqual(8192);
@@ -718,6 +751,8 @@ test("Node apply injects current topic HUMAN IDs, rejects forged authority and r
     try { apply({ ...input, currentHumanIds: freshHumanIds }); } catch (error) { rejected = error; }
     expect(rejected?.selectionRejected).toBe(true);
     expect(rejected?.message).toContain("not a current HUMAN");
+    // Only the replay-after-write rejection is marked non-retryable (P6e).
+    expect(rejected?.replayRejected === true).toBe(input === finalInput);
   }
 });
 
@@ -759,4 +794,110 @@ test.each(["identical", "candidate", "command", "cwd", "timeoutMs", "id", "new-i
     expect(next.gates[0]!.logRef).not.toBe(first.gates[0]!.logRef);
     if (mode !== "cwd") expect(readFileSync(path.join(f.root, "cache/runs"), "utf8")).toBe("run\nrun\n");
   }
+});
+
+
+test("titles preserve legacy loading and reject invalid present values", () => {
+  const { root } = fixture(), applied = apply(initial(root));
+  const legacy = structuredClone(applied.backlog!); delete legacy.tasks[0]!.title;
+  validateBacklog(legacy);
+  writeFileSync(applied.path, JSON.stringify(legacy));
+  expect(readBacklog(root, "example").backlog!.tasks[0]!.title).toBeUndefined();
+  for (const title of [null, 1, "", " ", "x".repeat(81)]) {
+    const invalid = structuredClone(legacy); Object.assign(invalid.tasks[0]!, { title });
+    expect(() => validateBacklog(invalid)).toThrow("Invalid title");
+  }
+  const request = { ...initial(root), expectedDigest: readBacklog(root, "example").digest, key: "legacy-update" };
+  expect(() => apply({ ...request, director: { select: "one", reason: "Update", changes: [
+    { kind: "update", id: "one", patch: { goal: "New goal" }, reason: "Update" }] } })).toThrow("title");
+  expect(() => apply({ ...request, director: { select: "one", reason: "Update", changes: [
+    { kind: "update", id: "one", patch: { title: "x".repeat(81) }, reason: "Too long" }] } })).toThrow("title");
+  expect(apply({ ...request, director: { select: "one", reason: "Update", changes: [
+    { kind: "update", id: "one", patch: { title: "x".repeat(80) }, reason: "Short title" }] } }).selected!.title).toHaveLength(80);
+});
+
+test("add and split require valid titles and rejected changes preserve backlog bytes", () => {
+  for (const title of [undefined, "", " ", "x".repeat(81)]) {
+    const { root } = fixture(), child = task("child"); child.title = title;
+    expect(() => apply(initial(root, [child]))).toThrow("title");
+    expect(readBacklog(root, "example").backlog).toBeNull();
+    const first = apply(initial(root)), before = readFileSync(first.path, "utf8");
+    expect(() => apply({ ...initial(root), expectedDigest: first.digest, key: "split", director: {
+      select: "child", reason: "Split", changes: [{ kind: "split", id: "one", tasks: [child], reason: "Split" }] } })).toThrow("title");
+    expect(readFileSync(first.path, "utf8")).toBe(before);
+  }
+  const { root } = fixture();
+  expect(apply(initial(root, [{ ...task(), title: "x".repeat(80) }])).selected!.title).toHaveLength(80);
+});
+
+test("title-only edits do not change a stalled definition or reset progress", () => {
+  const { root } = fixture(), first = apply(initial(root, [task(), task("other")])), stalled = apply(stalledSettlement(root, first));
+  const request = { ...initial(root), key: "retitle", loop: 2, expectedDigest: stalled.digest,
+    director: { select: "other", reason: "Retitle", changes: [
+      { kind: "update" as const, id: "one", patch: { title: "Short revised title" }, reason: "Retitle" }] } };
+  expect(() => apply({ ...request, director: { ...request.director, select: "one" } })).toThrow("without a changed definition");
+  const updated = apply(request).backlog!.tasks[0]!;
+  expect(updated.title).toBe("Short revised title");
+  expect(updated.progress).toEqual(stalled.backlog!.tasks[0]!.progress);
+  const beforeDigest = updated.history.find(h => h.event === "stall")!.definitionDigest;
+  const state = readBacklog(root, "example");
+  const restalled = apply(stalledSettlement(root, state, 2));
+  expect(restalled.backlog!.tasks[0]!.history.filter(h => h.event === "stall").at(-1)!.definitionDigest).toBe(beforeDigest);
+});
+
+
+test("shared binding band rejects prepare overflow and leaves room for the gate receipt", async () => {
+  expect(GATE_RESERVE).toBe(2048);
+  expect(viewBudget(GATE_RESERVE)).toBe(6143);
+  const f = fixture(), prepared = await prepare(f), board = await openBoard(f.dbPath);
+  const workspace = repositoryIdentity(f.root), topicId = prepared.view.topicId;
+  try {
+    const base = board.post(workspace, { topicId, type: "DECISION", content: "x" });
+    const prototype = { ...base, id: base.id + 1, metadata: { supersedes: base.id } };
+    const padding = BINDING_BAND_BYTES - Buffer.byteLength(JSON.stringify([viewEntry(prototype)]));
+    const binding = board.post(workspace, { topicId, type: "DECISION", content: "x".repeat(padding + 1), metadata: prototype.metadata });
+    expect(Buffer.byteLength(JSON.stringify([viewEntry(binding)]))).toBe(BINDING_BAND_BYTES);
+    expect((await prepare(f)).view.posts).toEqual([viewEntry(binding)]);
+    const receipt = await gate(attempt(f));
+    expect(receipt.view.posts).toEqual([viewEntry(binding)]);
+    expect(Buffer.byteLength(JSON.stringify(receipt) + "\n")).toBeLessThanOrEqual(8192);
+    const overflow = board.post(workspace, { topicId, type: "DECISION", content: binding.content + "x", metadata: { supersedes: binding.id } });
+    expect(Buffer.byteLength(JSON.stringify([viewEntry(overflow)]))).toBeGreaterThan(BINDING_BAND_BYTES);
+    expect(Buffer.byteLength(JSON.stringify([viewEntry(overflow)]))).toBeLessThan(8192);
+    await expect(prepare(f)).rejects.toMatchObject({ viewOverflow: true });
+    for (const operation of ["prepare", "gate"]) {
+      const result = spawnSync("node", [path.resolve("skills/execute/loop-io.mjs")], {
+        cwd: f.root, input: JSON.stringify({ operation, ...attempt(f) }), encoding: "utf8",
+      });
+      expect(result.status).toBe(1);
+      expect(JSON.parse(result.stdout)).toMatchObject({ error: "loop-io", viewOverflow: true });
+    }
+  } finally { board.close(); }
+});
+
+test("gate receipt overhead overflow is explicitly marked by loop-io", () => {
+  const f = fixture(), input = attempt(f);
+  input.task.gates = Array.from({ length: 60 }, (_, n) => ({ id: `gate-${n}`, command: "true", cwd: ".", timeoutMs: 1000 }));
+  const result = spawnSync("node", [path.resolve("skills/execute/loop-io.mjs")], {
+    cwd: f.root, input: JSON.stringify({ operation: "gate", ...input }), encoding: "utf8",
+  });
+  expect(result.status).toBe(1);
+  expect(JSON.parse(result.stdout)).toMatchObject({ error: "loop-io", viewOverflow: true });
+});
+
+
+test("gate receipt carries the attempt's durable context peak, or explicit absence", async () => {
+  const f = fixture();
+  const checkpoint: CheckpointIntent = { version: 2, key: "worker-attempt", taskId: "one", attempt: 1, loop: 1, cursor: 0,
+    phase: "implementation", planRef: null, association: { root: f.root,
+      commonDir: execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: f.root, encoding: "utf8" }).trim(),
+      missionId: "mission", missionPath: path.join(f.root, ".pi/mission.json"), invocation: "exec1",
+      source: path.join(f.root, "spec.md"), digest: "a".repeat(64), maxCycles: 15, sourceRefs: [] } };
+  expect((await gate(attempt(f, { checkpoint }))).contextPeak).toBeNull();
+  recordContextPeak(checkpoint, 1200); recordContextPeak(checkpoint, 800); recordContextPeak(checkpoint, 1500);
+  const receipt = await gate(attempt(f, { checkpoint }));
+  expect(receipt.contextPeak).toBe(1500);
+  expect(JSON.parse(readFileSync(path.join(f.root, ".pi/subagents/execute/exec1/gates/attempt1/receipt.json"), "utf8")).contextPeak).toBe(1500);
+  const next = { ...checkpoint, key: "worker-next", attempt: 2 };
+  expect((await gate(attempt(f, { checkpoint: next, attempt: 2, key: "next-gate" }))).contextPeak).toBeNull();
 });

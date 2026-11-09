@@ -46,12 +46,13 @@ function fixture() {
   const persist = () => state.set("invoke-fixture", record); persist();
   const binding = JSON.stringify({ "pitako.checkpoint/1": { association, key: intent.key } });
   let tool: any;
+  const handlers = new Map<string, Function>();
   const old = process.env.PI_SUBAGENT_EXTENSION_BINDINGS;
-  try { process.env.PI_SUBAGENT_EXTENSION_BINDINGS = binding; checkpointCreate({ registerTool(t: any) { tool = t; } } as ExtensionAPI); }
+  try { process.env.PI_SUBAGENT_EXTENSION_BINDINGS = binding; checkpointCreate({ on(name: string, handler: Function) { handlers.set(name, handler); }, registerTool(t: any) { tool = t; } } as unknown as ExtensionAPI); }
   finally { if (old === undefined) delete process.env.PI_SUBAGENT_EXTENSION_BINDINGS; else process.env.PI_SUBAGENT_EXTENSION_BINDINGS = old; }
   const manager = {};
   const call = async (kind: string, paths?: string[], signal?: AbortSignal) => (await tool.execute("call", { kind, ...(paths ? { paths } : {}) }, signal, undefined, { cwd: root, sessionManager: manager })).structuredContent;
-  return { root, git, intent, loop, record, persist, statePath: state.path, binding, call, tool, manager };
+  return { root, git, intent, loop, record, persist, statePath: state.path, binding, call, tool, manager, handlers };
 }
 const paths = ["modified", "untracked", "absent"];
 
@@ -235,7 +236,7 @@ test("missing, foreign and analysis context cannot publish; aborted calls cannot
     try {
       if (binding === undefined) delete process.env.PI_SUBAGENT_EXTENSION_BINDINGS;
       else process.env.PI_SUBAGENT_EXTENSION_BINDINGS = binding;
-      checkpointCreate({ registerTool(t: any) { tool = t; } } as ExtensionAPI);
+      checkpointCreate({ on() {}, registerTool(t: any) { tool = t; } } as unknown as ExtensionAPI);
     } finally { if (old === undefined) delete process.env.PI_SUBAGENT_EXTENSION_BINDINGS; else process.env.PI_SUBAGENT_EXTENSION_BINDINGS = old; }
     expect(process.env.PI_SUBAGENT_EXTENSION_BINDINGS).toBe(old);
     const rejected = await tool.execute("context", { kind: "pre", paths }, undefined, undefined,
@@ -272,7 +273,10 @@ test("native loaded writer composition invokes directly and through codemode; in
   const extensionPaths = parseFrontmatterList(worker.subagentOnlyExtensions)!.map(p => path.resolve(repo, "agents", p)).filter(p => p.endsWith("/extensions/checkpoint-create.ts"));
   expect(extensionPaths).toEqual([path.join(repo, "extensions/checkpoint-create.ts")]);
   const plan = resolvePiLaunchToolPlan({ cwd: f.root, agentName: "pitako.worker", tools: parseFrontmatterList(worker.tools), fast: false });
-  expect(plan.effectiveToolAllowlist).toContain("checkpoint_create");
+  expect(plan.effectiveToolAllowlist).not.toContain("checkpoint_create");
+  expect(readFileSync(path.join(repo, "agents/worker.md"), "utf8")).not.toContain("checkpoint_create");
+  // Retain direct legacy library/tool coverage with an explicit test-only allowlist.
+  plan.effectiveToolAllowlist.push("checkpoint_create");
   const child = await factory.create({ cwd: f.root, projectTrusted: true, storage: { kind: "memory" },
     tools: plan.effectiveToolAllowlist, ambientExtensions: false, extensionPaths,
     hooks: [{ name: "owned-policy", factory: pitako }], noSkills: true, noContextFiles: true,
@@ -396,4 +400,25 @@ test("checkpoint evidence hashes logical admitted pairs independent of order", a
   expect(checkpointEvidence([f.intent], { ...progress, admitted: { second: ["continue", "blocked"], first: ["complete"] } })).toBe(expected);
   expect(checkpointEvidence([f.intent], { ...progress, admitted: { first: ["complete"] } })).not.toBe(expected);
   expect(checkpointEvidence([f.intent], { ...progress, consumedLoops: 2 })).not.toBe(expected);
+});
+
+
+test("turn-end context peaks persist only maxima under the current attempt, without product writes", async () => {
+  const f = fixture();
+  f.loop.attempt.stage = "launched";
+  (f.loop.attempt as any).bindingKey = f.intent.key;
+  f.persist();
+  const sample = f.handlers.get("turn_end")!;
+  const ctx = (tokens: number | null | undefined) => ({ cwd: f.root, getContextUsage: () => tokens === undefined ? undefined : { tokens } });
+  await sample({}, ctx(undefined));
+  expect(existsSync(checkpointDirectory(f.intent))).toBe(false);
+  await sample({}, ctx(700)); await sample({}, ctx(400)); await sample({}, ctx(null)); await sample({}, ctx(900));
+  const directory = checkpointDirectory(f.intent);
+  expect(artifact(path.join(directory, "context-peak-700.json"))).toEqual({ intent: f.intent, tokens: 700 });
+  expect(artifact(path.join(directory, "context-peak-900.json"))).toEqual({ intent: f.intent, tokens: 900 });
+  expect(existsSync(path.join(directory, "context-peak-400.json"))).toBe(false);
+  expect(readFileSync(path.join(f.root, "modified"), "utf8")).toBe("prior uncommitted WIP\n");
+  (f.loop.attempt as any).bindingKey = "stale"; f.persist();
+  expect(() => sample({}, ctx(1000))).toThrow("stale");
+  expect(existsSync(path.join(directory, "context-peak-1000.json"))).toBe(false);
 });

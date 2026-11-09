@@ -11,6 +11,8 @@ import {
   BOARD_AUTHOR,
   BOARD_SCOPE,
   HUMAN_QUOTE_MAX,
+  BINDING_BAND_BYTES,
+  viewEntry,
   LIMITS,
   POST_TYPES,
   SCHEMA_VERSION,
@@ -879,6 +881,20 @@ describe("board tools", () => {
       expect(posts).toHaveLength(1);
       expect(posts[0]).toMatchObject({ type: "HUMAN", metadata: params.metadata });
       expect(posts[0]?.author).toContain("root-session");
+      expect(guidance.get("board_post")?.description).toContain(`${BINDING_BAND_BYTES} UTF-8 bytes`);
+      const prototype = { ...posts[0]!, id: posts[0]!.id + 1, content: "é" };
+      const padding = BINDING_BAND_BYTES - Buffer.byteLength(JSON.stringify([viewEntry(prototype)]));
+      const exact = { ...params, content: "é" + "x".repeat(padding) };
+      const ctx = { cwd, hasUI: true, sessionManager: { getSessionId: () => "root-session" } };
+      const rejected = await post.execute("too-large", { ...exact, content: exact.content + "x" }, undefined, undefined, ctx);
+      expect(rejected.isError).toBe(true);
+      expect(rejected.details?.error).toContain(`${BINDING_BAND_BYTES + 1} bytes; limit is ${BINDING_BAND_BYTES} bytes`);
+      expect(db.readTopic(repositoryIdentity(cwd), topicId!).posts).toHaveLength(1);
+      const boundary = await post.execute("boundary", exact, undefined, undefined, ctx);
+      expect(boundary.isError).not.toBe(true);
+      const stored = db.readTopic(repositoryIdentity(cwd), topicId!).posts;
+      expect(stored).toHaveLength(2);
+      expect(Buffer.byteLength(JSON.stringify([viewEntry(stored.at(-1)!)]))).toBe(BINDING_BAND_BYTES);
       db.close();
     } finally {
       if (child === undefined) delete process.env.PI_SUBAGENT_CHILD;

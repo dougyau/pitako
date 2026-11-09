@@ -6,24 +6,16 @@ description: Execute complete specs through one-task ralph loops with a persiste
 ## Recoverable writer units
 
 The root saves a checkpoint intention on each attempt before dispatch. This is
-not a backup: the worker must publish exact preimages before its first write.
-Call the registered writer tool `checkpoint_create({kind:"pre", paths:["relative/file"]})`.
-It binds the native launch to the real durable attempt/progress and publishes actual
-preimages, including prior uncommitted WIP and absence. Inspect structured `ok`,
-`status` and artifact references; failure or missing/stale context blocks edits.
+not a backup. Write code with `edit`, `write` or `apply_patch`; use `bash` for
+commands, tests and builds. The worker's checkpoint extension durably captures
+each first-touch preimage (including prior WIP and absence) and journals each
+call before allowing it. Newly discovered paths join the same append-only
+manifest in the same attempt. Journal failure blocks the call; do not bypass it.
 Do not assemble capture/seal scripts, manifests, private state paths or receipts.
-Repeated identical calls identify the existing publication without overwriting it;
-conflicting content fails. This is writer-only, directly and through codemode,
-never inspector host grants. Editing provider/profile files does not reload an
-active session. Retained legacy attempts keep their original contract, not invented
-bindings or retroactive backups.
+Editing provider/profile files does not reload an active session. Retained legacy
+attempts keep their original contract, not retroactive backups.
 
-Keep the supplied helper for journaled effects and restoration.
-`node <helper> apply <request.json>` accepts
-`{intent, changes: [{path, image: {bytes: "<base64>", mode: 420}}]}`; `image: null`
-deletes a captured file. Every effect must use this journal. Extra paths require
-a newly captured attempt/unit before editing, not a retrospective backup.
-
+Keep the supplied owned helper for authorized restoration.
 `restore` accepts `{intent, authority}`. Recovery is checkpoint-first: use the last
 confirmed reconstructible file/progress point after best-effort pertinent-writer
 status/stop through available authorized public operations. Reuse an immediately
@@ -36,7 +28,9 @@ not prerequisites or certificates. Missing receipts, unavailable observers,
 inconclusive status and historical IDs alone are not current activity. Positive
 current pertinent activity is a conflict; unknown stays unknown. Never fabricate
 observations or bypass actual native Stop/refusal/permission/capacity barriers. Restore refuses changed HEAD/index, unrecorded
-file changes, missing images, symlinks and protected metadata. It publishes
+file changes outside never-closed effects, missing images, symlinks and protected metadata.
+Never-closed effects prevent sealing and route to a restoring worker; arbitrary
+current bytes on their paths are retained in `restore.json` before restoration. It publishes
 partial bytes before selective restoration and returns the coherent position
 and new candidate. The active root reconciles that projection with existing
 history; it must not rewind consumed slots, remove attempts/admitted results or
@@ -262,6 +256,18 @@ validation turn is required.
 
 ## Native root process continuation
 
+An imperative human instruction to relaunch or continue is the authorization;
+do not ask again. If a run is active, neither stop it nor start a second root.
+Act once on its settled result through the documented route below. Such an
+instruction never supplies an unblock, a resolution or a `needs-decision` answer,
+and never overrides a recorded Stop.
+
+A named `/execute` launch cannot set `maxSubagentSpawnsPerRun`. To raise the
+cap globally, set it in `~/.pi/agent/extensions/subagent/config.json` (for example
+`"maxSubagentSpawnsPerRun": 200`) or use `PI_SUBAGENT_MAX_SPAWNS_PER_RUN`.
+This setting affects every workflow; automatic relaunch remains the fallback.
+The human chooses and sets the value outside `/execute`.
+
 `budget-exhausted` is a resumable workflow result, not a human-needed halt.
 On receiving it, the foreground automatically launches the SAME `pitako.execute`
 invocation as a NEW top-level run using the launch call above, with the same
@@ -400,7 +406,8 @@ shows the topic id. The workflow ensures it idempotently and publishes FINDINGs
 and HANDOFFs with postOnce; a task HANDOFF supersedes its previous HANDOFF.
 Directors and workers have no Board tools. Views are byte-capped, newest first,
 with an omitted count: directors get current HUMANs and DECISIONs plus global/task
-FINDINGs; workers also get their task's current HANDOFF. HUMANs and DECISIONs form
+FINDINGs except those tagged with done tasks; workers retain their task/global
+FINDINGs and their task's current HANDOFF. Filtered posts remain on the Board. HUMANs and DECISIONs form
 the never-truncated binding band; overflow (about 8 KB) halts at prepare for human
 consolidation. HUMAN views retain author, createdAt, quote and saidAt.
 
@@ -409,7 +416,9 @@ source wins; cite it) > DECISION > FINDING > HANDOFF; code wins
 over any map. Current DECISIONs are binding working rules, need no reconfirmation
 and cannot expand scope. HANDOFF is current repository state (locations, seams,
 metric value), not narrative or next steps; keep it at most 2 KB. Pending work
-belongs in the backlog, dead ends in FINDINGs.
+belongs in the backlog.
+A FINDING records only a fact that changes how this task or another task is done.
+Status or scope notes and tool failures with no consequence for the code are not FINDINGs.
 
 The foreground coordinator publishes an actual human ruling on the human's behalf
 with `board_post`, type `HUMAN`, in this spec's execute topic (owner_plan_id
@@ -879,3 +888,10 @@ sealed post-unit bytes, not its manifest preimages, preserve completed work and
 earlier WIP. Validate admission, association, seal digest and pending progress;
 retain partial state through the existing helper. A newer published capture takes
 precedence, and corruption or unattributed changes never permit skipping it.
+
+### Worker revival context budget
+
+`pitako.execute.revivalContextPeak` in Pi settings is a positive token limit
+(default `120000`, project settings override global settings). It is read at
+admission and retained for the invocation. A worker's resume opinion never
+overrides task/loop identity, candidate, stall, restoration or native barriers.

@@ -14,7 +14,7 @@ thinking: high
 systemPromptMode: replace
 inheritProjectContext: true
 inheritSkills: false
-tools: read, grep, find, ls, bash, edit, write, contact_supervisor, apply_patch, codegraph_search, codegraph_callers, codegraph_callees, codegraph_impact, codegraph_explore, codegraph_node, codegraph_status, codegraph_files, lsp_diagnostics, lsp_goto_definition, lsp_find_references, lsp_symbols, lsp_prepare_rename, lsp_rename, ast_search, ast_rewrite, git_worktree_list, git_worktree_add, git_worktree_remove, git_worktree_prune, git_status, git_diff, git_log, git_show, git_commit, ssh_exec, ssh_pull, ssh_push, py_lint, py_format, py_typecheck, py_test, py_uv, cargo_check, cargo_clippy, cargo_fmt, cargo_test, cargo_build, cargo_run, cargo_doc, cargo_bench, cargo_add, resource_snapshot, file_sha256, file_sha256_save, checkpoint_create, todo, codemode
+tools: read, grep, find, ls, bash, edit, write, contact_supervisor, apply_patch, codegraph_search, codegraph_callers, codegraph_callees, codegraph_impact, codegraph_explore, codegraph_node, codegraph_status, codegraph_files, lsp_diagnostics, lsp_goto_definition, lsp_find_references, lsp_symbols, lsp_prepare_rename, lsp_rename, ast_search, ast_rewrite, git_worktree_list, git_worktree_add, git_worktree_remove, git_worktree_prune, git_status, git_diff, git_log, git_show, git_commit, ssh_exec, ssh_pull, ssh_push, py_lint, py_format, py_typecheck, py_test, py_uv, cargo_check, cargo_clippy, cargo_fmt, cargo_test, cargo_build, cargo_run, cargo_doc, cargo_bench, cargo_add, resource_snapshot, file_sha256, file_sha256_save, todo, codemode
 extensions:
 subagentOnlyExtensions:
   - ../extensions/dev-tools/index.ts
@@ -94,6 +94,10 @@ Empty results do not prove absence. Do not initialize indexes or install servers
 without permission. For an authorized rename, use `lsp_prepare_rename`, then
 `lsp_rename`. For an authorized syntax replacement, preview `ast_rewrite` in an
 explicit file, inspect the matches, apply with `dryRun:false`, and inspect the diff.
+In execute, the write hook blocks `lsp_rename`, `ast_rewrite` with `dryRun:false`
+and edits under `.pi/` or `.pitako/`: use `lsp_prepare_rename`,
+`lsp_find_references` or an `ast_rewrite` preview to locate the changes, then
+apply them with `edit`, `write` or `apply_patch`.
 
 The official Codex adapter exposes apply_patch only on grammar-capable models;
 otherwise keep ordinary edit/write. Shell, tests and commits remain available.
@@ -132,13 +136,13 @@ resource_snapshot is enough for host load. Do not ask the supervisor about
 concurrency. This execute-only rule does not change ordinary worker resource
 awareness or authorize parallel writers.
 
-When execute supplies a pre-write checkpoint intention, call the registered
-writer tool checkpoint_create({kind:"pre", paths:[exact authorized relative paths]})
-before the first checkout edit. Inspect structured ok/status and actual artifact
-references; missing/stale context or failure blocks edits. Capture existing bytes
-including earlier WIP or absence. A fingerprint is not a backup. Use the supplied
-helper's durable pre/postimage journal for every write. Additional paths require
-a fresh captured unit; never invent intentions, manifests or receipts.
+In /execute, write code with edit, write or apply_patch; use bash for commands,
+tests and builds. The checkpoint extension captures each path's first-touch
+preimage and journals effects before allowing writes, including paths discovered
+later in the same attempt. Journal failures block writes; do not bypass them.
+Use the supplied owned helper only for authorized restoration. Never invent
+intentions, manifests or receipts. Editing provider/profile files does not reload
+an active session; retained legacy attempts keep their original write contract.
 After owned writes settle, return only the decision-only result; never call unit/pause
 or echo checkpoint receipts, task/attempt or candidate identities. The root runs
 gates and the model-free sealer, then confirms durable admission. A failed gate

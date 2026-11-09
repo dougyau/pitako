@@ -201,7 +201,9 @@ export function preliminarySpec(root: string, id: string, source?: string) {
   }
 }
 /** Content identity, not a test receipt. Exclude tool metadata, whose authority is verified separately. */
-export function checkoutEvidence(root: string) {
+export type CheckoutDigest = { hash: string; mode: number } | null;
+export function checkoutSnapshot(root: string) {
+  const digests: Record<string, CheckoutDigest> = Object.create(null);
   const hash = createHash("sha256");
   // Ref names cannot contain newlines.
   const [head, branch] = gitRead(root, "rev-parse", "HEAD", "--abbrev-ref", "HEAD").trim().split("\n") as [string, string];
@@ -217,17 +219,28 @@ export function checkoutEvidence(root: string) {
     hash.update(file).update("\0");
     try {
       const info = lstatSync(target);
-      if (info.isSymbolicLink()) hash.update(readlinkSync(target));
-      else if (info.isFile()) hash.update(readFileSync(target)).update(String(info.mode));
+      if (info.isSymbolicLink()) {
+        const link = readlinkSync(target);
+        hash.update(link);
+        digests[file] = { hash: digest(link), mode: info.mode };
+      } else if (info.isFile()) {
+        const bytes = readFileSync(target);
+        hash.update(bytes).update(String(info.mode));
+        digests[file] = { hash: createHash("sha256").update(bytes).digest("hex"), mode: info.mode };
+      }
       else if (info.isDirectory() && gitlinks.has(file)) {
         hash.update("gitlink").update(JSON.stringify(gitlinks.get(file)));
         // Uninitialized gitlinks have no checkout; initialized ones include nested dirt/bytes.
         let initialized = false;
         try { lstatSync(path.join(target, ".git")); initialized = true; }
         catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-        hash.update(initialized ? JSON.stringify(checkoutEvidence(target)) : "uninitialized");
+        const nested = initialized ? JSON.stringify(checkoutEvidence(target)) : "uninitialized";
+        hash.update(nested);
+        digests[file] = { hash: digest(JSON.stringify(gitlinks.get(file)) + nested), mode: info.mode };
       } else throw new Error(`Unsupported checkout entry: ${file}`);
-    } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") hash.update("missing"); else throw error; }
+    } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") { hash.update("missing"); digests[file] = null; } else throw error; }
   }
-  return { fingerprint: hash.digest("hex"), head, branch, status: gitRead(root, "status", "--porcelain=v1", "--untracked-files=normal").slice(0, 1000) };
+  return { files: digests, evidence: { fingerprint: hash.digest("hex"), head, branch, status: gitRead(root, "status", "--porcelain=v1", "--untracked-files=normal").slice(0, 1000) } };
 }
+
+export function checkoutEvidence(root: string) { return checkoutSnapshot(root).evidence; }
