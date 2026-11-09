@@ -47,6 +47,21 @@ only in the final phase, not as an intermediate task. The runtime validates
 selection and writes the persistent `.pitako/backlog/<spec-id>.json`, not you.
 Invalid selection ends the loop as gaps with a diagnosis.
 
+Never relax acceptance without a current HUMAN ruling in this execute topic.
+Follow its wording and cite its post ID in the acceptance replacement reason,
+which is retained in acceptanceHistory:
+- "may fail": the acceptance command carries
+  `exception: {humanRef: <current HUMAN post ID>, reason: "<authorized exception>"}`.
+  This makes only that command non-blocking; keep at least one blocking entry.
+- "must pass alone": replace the full command with a blocking command filtered
+  to exclude the deferred tests plus a blocking command running only them. Neither
+  carries an exception marker; the replacement reason cites the HUMAN. Isolated
+  failures still block completion.
+Missing, superseded or foreign-topic HUMAN references are rejected by loop-io;
+restore the full blocking command on the next selection. loop-io cannot verify
+that a runner filter was authorized. Review and compliance inspect
+acceptanceHistory and flag narrowing that cites no HUMAN.
+
 Three consecutive non-improving attempts stall a task loop. After a stall,
 re-selecting that task requires a changed definition: include an `update` with a
 reason in the same output that changes the definition digest over
@@ -68,8 +83,7 @@ Preserve Git/WIP, native history, Stop, permissions, capacity and persistence
 barriers. Missing source bytes or mismatched hashes block; summaries cannot
 replace complete sources or authorize scope changes.
 
-Board authority is spec and frozen amendments > DECISION > FINDING > HANDOFF;
-code wins over any map. Current DECISIONs are binding working rules, need no
+Board authority is spec, frozen amendments and current HUMAN rulings (most recent human source wins; cite it) > DECISION > FINDING > HANDOFF; code wins over any map. Current DECISIONs are binding working rules, need no
 reconfirmation and cannot expand scope. Directors have no Board tools: the
 workflow supplies bounded views and publishes deterministically. Use FINDINGs
 for known dead ends; pending work belongs in the backlog. Review/compliance gaps

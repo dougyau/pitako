@@ -10,6 +10,7 @@ import { openSqlite as openSqliteUnowned } from "../extensions/board/sqlite.ts";
 import {
   BOARD_AUTHOR,
   BOARD_SCOPE,
+  HUMAN_QUOTE_MAX,
   LIMITS,
   POST_TYPES,
   SCHEMA_VERSION,
@@ -160,7 +161,7 @@ describe("workspace", () => {
 });
 
 describe("board store", () => {
-  test("initializes schema v5, migrates v1 data, and refuses incomplete schemas", fixture.ownedCase("initializes schema v5, migrates v1 data, and refuses incomplete schemas", async () => {
+  test("initializes schema v6, migrates v1 data, and refuses incomplete schemas", fixture.ownedCase("initializes schema v6, migrates v1 data, and refuses incomplete schemas", async () => {
     const file = path.join(tempDir("pitako-board-db-"), "board.db");
     const boardDb = await openBoard(file);
     const other = await openSqlite(file);
@@ -194,6 +195,90 @@ describe("board store", () => {
     writeFileSync(corrupt, "not sqlite");
     await expect(openBoard(corrupt)).rejects.toThrow(/initialization failed/);
     expect(readFileSync(corrupt, "utf8")).toBe("not sqlite");
+  }));
+
+  test("migrates v5 posts preserving identity, references, sequence and constraints", fixture.ownedCase("migrates v5 posts preserving identity, references, sequence and constraints", async () => {
+    const file = path.join(tempDir("pitako-board-v5-"), "board.db");
+    const initial = await openBoard(file);
+    const topic = initial.createTopic("/repo", { title: "v5" });
+    const other = initial.createTopic("/repo", { title: "other" });
+    initial.close();
+    const raw = await openSqlite(file);
+    raw.exec("DROP TABLE posts");
+    raw.exec(`CREATE TABLE posts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      topic_id INTEGER NOT NULL REFERENCES topics(id), author TEXT NOT NULL,
+      type TEXT NOT NULL CHECK (type IN ('INFO','FINDING','QUESTION','ANSWER','DECISION','BLOCKER','HANDOFF')),
+      subject TEXT, content TEXT NOT NULL, reply_to INTEGER REFERENCES posts(id), metadata_json TEXT, created_at TEXT NOT NULL
+    )`);
+    raw.exec("CREATE INDEX posts_topic_id_id ON posts(topic_id, id)");
+    raw.exec("CREATE INDEX posts_type ON posts(type)");
+    raw.exec(`CREATE UNIQUE INDEX posts_idempotency_key ON posts(topic_id, json_extract(metadata_json, '$.idempotencyKey'))
+      WHERE json_valid(metadata_json) AND json_type(metadata_json, '$.idempotencyKey') = 'text'`);
+    raw.exec(`CREATE TRIGGER posts_reply_same_topic BEFORE INSERT ON posts FOR EACH ROW WHEN NEW.reply_to IS NOT NULL BEGIN
+      SELECT RAISE(ABORT, 'reply references another topic') WHERE (SELECT topic_id FROM posts WHERE id = NEW.reply_to) != NEW.topic_id; END`);
+    raw.prepare(`INSERT INTO posts VALUES (10, ?, 'legacy', 'QUESTION', 'subject', 'kept', NULL, '{"idempotencyKey":"key"}', 'yesterday')`).run(topic.id);
+    raw.prepare("INSERT INTO posts VALUES (20, ?, 'legacy', 'ANSWER', NULL, 'reply', 10, NULL, 'today')").run(topic.id);
+    raw.prepare("INSERT INTO posts VALUES (90, ?, 'legacy', 'INFO', NULL, 'deleted', NULL, NULL, 'today')").run(topic.id);
+    raw.exec("DELETE FROM posts WHERE id = 90");
+    raw.exec("PRAGMA user_version = 5");
+    const before = raw.prepare("SELECT * FROM posts ORDER BY id").all();
+    expect(() => raw.prepare("INSERT INTO posts (topic_id, author, type, content, created_at) VALUES (?, 'a', 'HUMAN', 'no', 't')").run(topic.id)).toThrow(/CHECK/);
+    raw.close();
+
+    const migrated = await openBoard(file);
+    const check = await openSqlite(file);
+    expect(check.prepare("SELECT * FROM posts ORDER BY id").all()).toEqual(before);
+    expect(check.prepare("PRAGMA user_version").get()?.user_version).toBe(6);
+    expect(check.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+    expect(check.prepare("PRAGMA foreign_keys").get()?.foreign_keys).toBe(1);
+    expect(check.prepare("SELECT name FROM sqlite_master WHERE tbl_name = 'posts' AND type IN ('index', 'trigger') ORDER BY name").all().map(row => row.name))
+      .toEqual(["posts_idempotency_key", "posts_reply_same_topic", "posts_topic_id_id", "posts_type"]);
+    expect(() => check.prepare("DELETE FROM posts WHERE id = 10").run()).toThrow(/FOREIGN KEY/);
+    expect(() => check.prepare("DELETE FROM topics WHERE id = ?").run(topic.id)).toThrow(/FOREIGN KEY/);
+    expect(() => check.prepare("INSERT INTO posts (topic_id, author, type, content, created_at) VALUES (999, 'a', 'INFO', 'no', 't')").run()).toThrow(/FOREIGN KEY/);
+    expect(() => migrated.post("/repo", { topicId: other.id, type: "ANSWER", content: "cross", replyTo: 10 })).toThrow(/another topic/);
+    expect(() => check.prepare("INSERT INTO posts (topic_id, author, type, content, reply_to, created_at) VALUES (?, 'a', 'ANSWER', 'cross', 10, 't')").run(other.id)).toThrow(/another topic/);
+    expect(migrated.postOnce("/repo", "key", { topicId: topic.id, type: "INFO", content: "retry" }).id).toBe(10);
+    const next = migrated.postOnce("/repo", "key", { topicId: other.id, type: "INFO", content: "other" });
+    expect(next.id).toBe(91);
+    expect(() => migrated.post("/repo", { topicId: other.id, type: "INFO", content: "duplicate", metadata: { idempotencyKey: "key" } })).toThrow(/UNIQUE/);
+    check.prepare("INSERT INTO posts (topic_id, author, type, content, created_at) VALUES (?, 'root', 'HUMAN', 'accepted', 't')").run(topic.id);
+    check.close();
+    migrated.close();
+    const reopened = await openBoard(file);
+    expect(reopened.query("/repo", { type: "HUMAN" }).posts[0]?.content).toBe("accepted");
+    reopened.close();
+  }));
+
+  test("refuses unknown schemas without changing retained rows or version", fixture.ownedCase("refuses unknown schemas without changing retained rows or version", async () => {
+    for (const version of [0, 7]) {
+      const file = path.join(tempDir("pitako-board-unsupported-"), "board.db");
+      const raw = await openSqlite(file);
+      raw.exec("CREATE TABLE topics (note TEXT)");
+      raw.exec("INSERT INTO topics VALUES ('keep')");
+      raw.exec(`PRAGMA user_version = ${version}`);
+      raw.close();
+      await expect(openBoard(file)).rejects.toThrow(/Refusing/);
+      const check = await openSqlite(file);
+      expect(check.prepare("SELECT * FROM topics").all()).toEqual([{ note: "keep" }]);
+      expect(check.prepare("PRAGMA user_version").get()?.user_version).toBe(version);
+      check.close();
+    }
+  }));
+
+  test("internal post APIs exclude HUMAN even on an idempotent retry", fixture.ownedCase("internal post APIs exclude HUMAN even on an idempotent retry", async () => {
+    const db = await openBoard(path.join(tempDir("pitako-board-internal-human-"), "board.db"));
+    const topic = db.createTopic("/repo", { title: "internal" });
+    db.postOnce("/repo", "existing", { topicId: topic.id, type: "INFO", content: "kept" });
+    // @ts-expect-error HUMAN must not be accepted by the internal post API.
+    expect(() => db.post("/repo", { topicId: topic.id, type: "HUMAN", content: "no" })).toThrow("HUMAN is root-session only");
+    for (const key of ["new", "existing"]) {
+      // @ts-expect-error HUMAN must not be accepted by the internal postOnce API.
+      expect(() => db.postOnce("/repo", key, { topicId: topic.id, type: "HUMAN", content: "no" })).toThrow("HUMAN is root-session only");
+    }
+    expect(db.readTopic("/repo", topic.id).total).toBe(1);
+    db.close();
   }));
 
   test("migrates v1 rows and serializes competing claims", fixture.ownedCase("migrates v1 rows and serializes competing claims", async () => {
@@ -288,7 +373,7 @@ describe("board store", () => {
     raw.close();
     const reopened = await openBoard(file);
     expect(reopened.ensureOwnedTopic("/repo", owner, { title: "retry" }).id).toBe(topic.id);
-    const finding = { topicId: topic.id, type: "FINDING", content: "persisted" };
+    const finding = { topicId: topic.id, type: "FINDING" as const, content: "persisted" };
     expect(reopened.postOnce("/repo", "migration-key", finding).id).toBe(reopened.postOnce("/repo", "migration-key", finding).id);
     reopened.close();
   }));
@@ -297,7 +382,7 @@ describe("board store", () => {
     const file = path.join(tempDir("pitako-board-v4-"), "board.db");
     const initial = await openBoard(file);
     const topic = initial.createTopic("/repo", { title: "legacy" });
-    const input = { topicId: topic.id, type: "FINDING", content: "kept" };
+    const input = { topicId: topic.id, type: "FINDING" as const, content: "kept" };
     const first = initial.postOnce("/repo", "shared-key", input);
     initial.close();
     const raw = await openSqlite(file);
@@ -327,7 +412,7 @@ describe("board store", () => {
     const left = await openBoard(file);
     const right = await openBoard(file);
     const topic = left.ensureOwnedTopic("/repo", "execute:spec:root", { title: "memory" });
-    const input = { topicId: topic.id, type: "HANDOFF", content: "first state", metadata: { taskId: "task-a", note: "kept" } };
+    const input = { topicId: topic.id, type: "HANDOFF" as const, content: "first state", metadata: { taskId: "task-a", note: "kept" } };
     const first = left.postOnce("/repo", "execute:inv:l1:a1:HANDOFF", input);
     expect(right.postOnce("/repo", "execute:inv:l1:a1:HANDOFF", { ...input, content: "retry must not replace" })).toEqual(first);
     const other = right.postOnce("/repo", "execute:inv:l1:a2:HANDOFF", { ...input, metadata: { taskId: "task-b" } });
@@ -508,7 +593,7 @@ describe("board store", () => {
     checked.close();
   }));
 
-  test("isolates workspaces, pages posts, and round-trips every post type", fixture.ownedCase("isolates workspaces, pages posts, and round-trips every post type", async () => {
+  test("isolates workspaces, pages posts, and round-trips every internal post type", fixture.ownedCase("isolates workspaces, pages posts, and round-trips every internal post type", async () => {
     const file = path.join(tempDir("pitako-board-work-"), "board.db");
     const db = await openBoard(file);
     const topic = db.createTopic("/repo-a", { title: "Board persistence", description: "where the file lives" });
@@ -520,9 +605,10 @@ describe("board store", () => {
     expect(db.listTopics("/repo-b").topics.map((item) => item.title)).toEqual(["other repo"]);
     expect(() => db.readTopic("/repo-b", topic.id)).toThrow(/another workspace/);
     expect(() => db.post("/repo-a", { topicId: 999, type: "INFO", content: "missing" })).toThrow(/unknown topic/);
-    expect(() => db.post("/repo-a", { topicId: topic.id, type: "HYPOTHESIS", content: "no" })).toThrow(/invalid post type/);
+    expect(() => db.post("/repo-a", { topicId: topic.id, type: "HYPOTHESIS" as never, content: "no" })).toThrow(/invalid post type/);
 
-    const posts = POST_TYPES.map((type) =>
+    const internalTypes = POST_TYPES.filter(type => type !== "HUMAN");
+    const posts = internalTypes.map((type) =>
       db.post("/repo-a", {
         topicId: topic.id,
         type,
@@ -531,7 +617,7 @@ describe("board store", () => {
         metadata: type === "DECISION" ? { supersedes: 17, note: "later" } : undefined,
       }),
     );
-    expect(posts.map((post) => post.type)).toEqual([...POST_TYPES]);
+    expect(posts.map((post) => post.type)).toEqual(internalTypes);
     const decision = posts.find((post) => post.type === "DECISION");
     if (!decision) throw new Error("missing decision");
     expect(decision.metadata).toEqual({ supersedes: 17, note: "later" });
@@ -685,7 +771,7 @@ interface ToolRunner {
     params: unknown,
     signal: AbortSignal | undefined,
     onUpdate: undefined,
-    ctx: { cwd: string; sessionManager?: { getSessionId: () => string } },
+    ctx: { cwd: string; hasUI?: boolean; sessionManager?: { getSessionId: () => string } },
   ): Promise<ToolResult>;
 }
 
@@ -755,6 +841,49 @@ describe("board tools", () => {
       "TODOs and verification evidence own progress",
       "Board stays pull-based",
     ]) expect(text).toContain(expected);
+  }));
+
+  test("HUMAN publication requires a root UI and quoted dated human message", fixture.ownedCase("HUMAN publication requires a root UI and quoted dated human message", async () => {
+    process.env.PI_CODING_AGENT_DIR = tempDir("pitako-board-human-tools-");
+    const child = process.env.PI_SUBAGENT_CHILD;
+    try {
+      delete process.env.PI_SUBAGENT_CHILD;
+      const cwd = gitRepo();
+      const { tools, guidance } = registeredBoard();
+      expect(guidance.get("board_post")?.description).toContain("HUMAN");
+      const create = tools.get("board_topic_create")!, post = tools.get("board_post")!;
+      const topicId = (await create.execute("topic", { title: "ruling" }, undefined, undefined, { cwd })).details?.topicId;
+      const params = { topicId, type: "HUMAN", content: "Binding ruling", metadata: { quote: "The loader may fail", saidAt: "2026-11-08" } };
+      for (const hasUI of [false, undefined]) {
+        const denied = await post.execute("headless", params, undefined, undefined, { cwd, hasUI });
+        expect(denied.details?.error).toBe("HUMAN is root-session only");
+      }
+      process.env.PI_SUBAGENT_CHILD = "1";
+      const denied = await post.execute("child", params, undefined, undefined, { cwd, hasUI: true });
+      expect(denied.details?.error).toBe("HUMAN is root-session only");
+      delete process.env.PI_SUBAGENT_CHILD;
+      for (const [metadata, field] of [
+        [undefined, "metadata.quote"], [{ saidAt: "2026-11-08" }, "metadata.quote"],
+        [{ quote: " " }, "metadata.quote"], [{ quote: "message" }, "metadata.saidAt"],
+        [{ quote: "message", saidAt: " " }, "metadata.saidAt"],
+        [{ quote: "x".repeat(HUMAN_QUOTE_MAX + 1), saidAt: "date" }, "metadata.quote"],
+      ] as const) {
+        const result = await post.execute("invalid", { ...params, metadata }, undefined, undefined, { cwd, hasUI: true });
+        expect(result.isError).toBe(true);
+        expect(result.details?.error).toContain(field);
+      }
+      const accepted = await post.execute("root", params, undefined, undefined, { cwd, hasUI: true, sessionManager: { getSessionId: () => "root-session" } });
+      expect(accepted.isError).not.toBe(true);
+      const db = await openBoard();
+      const posts = db.readTopic(repositoryIdentity(cwd), topicId!).posts;
+      expect(posts).toHaveLength(1);
+      expect(posts[0]).toMatchObject({ type: "HUMAN", metadata: params.metadata });
+      expect(posts[0]?.author).toContain("root-session");
+      db.close();
+    } finally {
+      if (child === undefined) delete process.env.PI_SUBAGENT_CHILD;
+      else process.env.PI_SUBAGENT_CHILD = child;
+    }
   }));
 
   test("sibling worktree sees legacy topic and posts under same ID without copying", fixture.ownedCase("sibling worktree sees legacy topic and posts under same ID without copying", async () => {

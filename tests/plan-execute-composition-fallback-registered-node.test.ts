@@ -12,7 +12,7 @@ import { runWorkflowScript } from "../node_modules/pi-subagents/src/workflows/sc
 import { executionResource } from "../extensions/plan-execute.ts";
 import { digest, preliminarySpec, SPEC_SECTIONS, checkoutEvidence, MAX_SPEC_BYTES } from "../extensions/spec-plans.ts";
 import { deterministicScripts, planExecute, checkout, missionFiles, childResponse, registeredCheckpoint, compositionFixture, nativeCheckpointFixture, assignmentSpec, resourceWithAgentDir } from "./fixtures/plan-execute-composition.ts";
-import { prepare, apply, readBacklog, updateProgress } from "../skills/execute/loop.ts";
+import { prepare, apply, readBacklog, updateProgress, reviewOriginals } from "../skills/execute/loop.ts";
 import { captureCheckpoint, restoreCheckpoint } from "../extensions/execute-checkpoint.ts";
 
 const composition = compositionFixture();
@@ -570,6 +570,7 @@ describe("plan/execute packaged composition", () => {
               if (input.operation === "prepare" && mode === "decision-overflow") throw Error("Current DECISIONs exceed 8 KiB; ask the human to consolidate them.");
               if (input.operation === "prepare") value = { ...readBacklog(root, "assignment"), view, lastConfirmedUnit: null };
               else if (input.operation === "apply") value = { ...apply(input), view };
+              else if (input.operation === "reviewOriginals") value = reviewOriginals(input);
               else {
                 const progress = updateProgress(input.task.progress, { value: null, fingerprint: checkout.fingerprint,
                   gatesPassed: input.task.gates.length, gatesTotal: input.task.gates.length }, null);
@@ -680,9 +681,9 @@ describe("plan/execute packaged composition", () => {
       expect(expected.value).toMatchObject({ status: ["complete", "recovered", "rejected-plan", "mismatched-association"].includes(mode) || recoveredHost ? "complete" : mode === "stopped" || mode.endsWith("-stop") ? "cancelled" : "blocked",
         ...hostTarget && !recoveredHost ? { status: "blocked" } : {},
         loopsConsumed: recoveredHost ? 2 : hostTarget && hostTarget !== "inspect-loop-1" ? 0 : ["complete", "recovered", "mismatched-association"].includes(mode) || analysisTarget ? 2 : mode === "rejected-plan" ? 3 : 1 });
-      expect(calls.filter(key => !key.includes(".requests-") && !/\.(prepare|selection|settlement|gate)(?:\.r\d+)?$/.test(key) && !key.includes(".review.verify-") && !/\.seal(?:\.r\d+)?$/.test(key))).toHaveLength(analysisTarget ? mode.includes("-prepare-") ? 6 : mode.includes("-later-") ? 8 : 10
-        : recoveredHost ? 11 : hostTarget ? hostTarget === "inspect-loop-1" ? 7 : 0
-        : mode === "decision-overflow" ? 0 : ["complete", "mismatched-association"].includes(mode) ? 11 : mode === "recovered" ? 12 : mode === "rejected-plan" ? 13 : ["stopped", "permission", "unresolved-plan"].includes(mode) ? 2 : 1);
+      expect(calls.filter(key => !key.includes(".requests-") && !/\.(prepare|selection|settlement|gate)(?:\.r\d+)?$/.test(key) && !key.includes(".review.verify-") && !/\.seal(?:\.r\d+)?$/.test(key))).toHaveLength(analysisTarget ? mode.includes("-prepare-") ? 6 : mode.includes("-later-") ? 8 : 11
+        : recoveredHost ? 12 : hostTarget ? hostTarget === "inspect-loop-1" ? 7 : 0
+        : mode === "decision-overflow" ? 0 : ["complete", "mismatched-association"].includes(mode) ? 12 : mode === "recovered" ? 13 : mode === "rejected-plan" ? 14 : ["stopped", "permission", "unresolved-plan"].includes(mode) ? 2 : 1);
       if (mode === "decision-overflow") {
         expect((expected.value as any).reason).toContain("human to consolidate");
         expect(calls).toEqual(["invoke-human-1.l1.prepare"]);

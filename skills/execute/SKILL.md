@@ -399,21 +399,35 @@ owned by `execute:<specId>:<first 16 hex of sha256(canonical root)>`. Execute st
 shows the topic id. The workflow ensures it idempotently and publishes FINDINGs
 and HANDOFFs with postOnce; a task HANDOFF supersedes its previous HANDOFF.
 Directors and workers have no Board tools. Views are byte-capped, newest first,
-with an omitted count: directors get current DECISIONs plus global/task FINDINGs;
-workers also get their task's current HANDOFF. Current DECISIONs exceeding about
-8 KB halt for human consolidation; binding rules are never silently dropped.
+with an omitted count: directors get current HUMANs and DECISIONs plus global/task
+FINDINGs; workers also get their task's current HANDOFF. HUMANs and DECISIONs form
+the never-truncated binding band; overflow (about 8 KB) halts at prepare for human
+consolidation. HUMAN views retain author, createdAt, quote and saidAt.
 
-Authority: spec and frozen amendments > DECISION > FINDING > HANDOFF; code wins
+Authority: spec, frozen amendments and current HUMAN rulings (most recent human
+source wins; cite it) > DECISION > FINDING > HANDOFF; code wins
 over any map. Current DECISIONs are binding working rules, need no reconfirmation
 and cannot expand scope. HANDOFF is current repository state (locations, seams,
 metric value), not narrative or next steps; keep it at most 2 KB. Pending work
 belongs in the backlog, dead ends in FINDINGs.
 
-When answering a supervisor request, the foreground posts the ruling or standing
-approval as a DECISION in the execution topic. Use `supersedes` to replace the
-previous ruling, preserving the actual human answer/provenance. Do not promote
-agent opinion to human authority or override the frozen spec/amendments. Posting
-is foreground guidance, not an automatic supervisor-reply hook.
+The foreground coordinator publishes an actual human ruling on the human's behalf
+with `board_post`, type `HUMAN`, in this spec's execute topic (owner_plan_id
+`execute:<specId>:<first 16 hex of sha256(canonical root)>`). Supply the ruling as
+content and `metadata: {quote: "<exact human message>", saidAt: "<human message date>"}`;
+quote is required and capped at 16,000 characters. Use `supersedes` for a replaced
+ruling; only a later HUMAN can supersede a HUMAN. Do not promote agent opinion to
+human authority. Posting is foreground guidance, not an automatic reply hook.
+
+HUMAN publication requires a root context: `ctx.hasUI &&
+process.env.PI_SUBAGENT_CHILD !== '1'`. Headless/child sessions and missing quote
+or saidAt are rejected; internal callers, including postOnce and loop-io, cannot
+create HUMANs. This predicate is verified only on pi-subagents 0.84.0 / Pi 1.5.0;
+the binary-host async runner branch and other embedding hosts are unverified.
+Shell is not a sandbox: a process with direct sqlite access can forge a HUMAN row.
+Signing/authentication beyond root publication is out of scope. Board schema v6
+requires a coordinated upgrade of all installs sharing the Board database; older
+installs fail closed without data loss.
 
 Execute workers have no concurrent agents in this execution; resource_snapshot
 is enough for host load and they must not ask the supervisor about concurrency.
@@ -428,11 +442,65 @@ Only when no implementation task is pending, a final-phase loop (also consuming
 one maxCycles slot) runs backlog acceptance commands: the project's complete
 procedure, then full shared adversarial review, then frozen-spec/amendment
 compliance, all on the same candidate. No task-loop review or compliance runs.
-Review receives done/obsolete reasons and current DECISIONs. Review/compliance
-gaps become new tasks with origin final-phase and a finding reference; the next
-director selects among them. Full-suite timeout/error halts blocked/environment
-with its log reference, not a new task. No blind retries, deadline inflation,
-arbitrary attempt quotas or weakened verification.
+Review and compliance receive current HUMAN rulings, excepted acceptance results
+and acceptanceHistory (at most eight entries), as well as done/obsolete reasons
+and current DECISIONs. Review/compliance gaps become new tasks with origin
+final-phase and a finding reference; the next director selects among them.
+Timeout/error on a blocking command halts blocked/environment with its log
+reference, not a new task. No blind retries, deadline inflation, arbitrary attempt
+quotas or weakened verification.
+
+#### Human-authorized acceptance exceptions
+
+An acceptance entry may carry `exception: {humanRef: <positive post ID>,
+reason: "<authorized exception>"}`; at least one entry must remain blocking.
+The director may not relax acceptance without a current HUMAN of this topic:
+- "may fail" puts the exception marker on that command only.
+- "must pass alone" replaces the full command with a blocking command excluding
+  the deferred tests plus a blocking command running only them, neither marked
+  excepted, with a replacement reason citing the HUMAN.
+
+loop-io injects current unsuperseded HUMAN IDs and validates exceptions on
+acceptance changes and every final selection, including human/worker edits.
+Missing, superseded or foreign-topic references end the loop as gaps with a
+diagnosis; the next director restores the full blocking command. Limit: loop-io
+cannot verify that a runner filter on a blocking command was authorized. Review
+and compliance inspect acceptanceHistory and flag narrowing that cites no HUMAN.
+
+Every blocking command must pass on the same unmutated candidate. The fresh gate
+receipt's Board view determines whether an exception still applies; supersession
+during the gate makes that command blocking. A currently excepted failure,
+timeout or error is reported only: it neither halts nor creates a gap/repair task.
+Completion keeps status `complete`; failed exceptions yield heading
+"Execution complete with exceptions" and
+`exceptions: [{id, status, exit, logRef, humanRef, reason}]`. If all excepted
+commands pass, completion is plain complete. An excepted failure never counts as
+verified in the original-problem notice.
+
+#### Acceptance reuse and repeat-acceptance
+
+After fresh acceptance with no timeout/error on a blocking command, invocation
+state retains lastFinalAcceptance (loop, gate key, candidate, executed definitions
+and results). A later final loop reuses results without spawning commands only
+when definitions (id, command, cwd, timeoutMs) and a freshly observed candidate
+match. It still observes fresh before/after evidence, mutation and current Board
+rulings. Candidate or definition drift runs fresh; a new invocation always runs
+fresh. The retained record survives relaunch of the same invocation.
+
+Recompute the verdict using current exceptions: a reused pass proceeds to review;
+a reused failure halts `blocked` with code `repeat-acceptance` and original log
+references. Relaunch without a resolution re-finishes that halt unchanged, not
+another cached gate or suite run.
+
+For an actual current human resolution, use the existing `--unblock` route with
+`unblock: true, resolution: {loop: <halted loop>, text: "<actual human input>"}`
+on the same invocation. A mismatching resolution is rejected. A matching one
+closes that loop as gaps, clears the halt/cached view, retains the record and
+sets a durable one-shot fresh-run authorization. The next final loop consumes
+another slot within the frozen maxCycles and re-evaluates the reused results
+first: a newly posted HUMAN can permit completion without rerunning. Only if the
+verdict still fails does it run acceptance fresh once. No slot renewal, seal or
+replay weakening, native barrier bypass or generic restart authority is implied.
 
 After final mandatory checks the root runs the REAL shared adversarial review:
 two to four dynamic whole-result perspectives, cross-critique, one defense and
@@ -724,9 +792,11 @@ was resumed. Recovery/re-emission
 never consumes another loop or double-counts tokens. Do not duplicate reports in
 native state. The last loop report and execution closure may share one message.
 
-Close first with `Execution complete`, `Execution partial`, `Execution blocked`
-or `Execution cancelled`, semantic fulfillment and whether the human must act.
-Complete says spec fulfilled/verified, no more loops, action required none.
+Close first with `Execution complete` (or `Execution complete with exceptions`
+when excepted commands failed), `Execution partial`, `Execution blocked` or
+`Execution cancelled`, semantic fulfillment and whether the human must act.
+Complete says spec fulfilled subject to any listed human-authorized exceptions,
+no more loops, action required none; do not describe excepted failures as verified.
 Partial/blocked names concrete pending work/impediment and necessary action;
 distinguish technical continuation within slots from new human authorization
 after the admitted loops. Pending decisions show the concrete question as blocked.

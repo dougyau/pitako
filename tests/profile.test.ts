@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, test } from "bun:test";
 import { isProtectedEditPath } from "../extensions/paths.ts";
 import { MUTATING_TOOLS, parseProfile, profileNote, toolsForProfile } from "../extensions/profile.ts";
@@ -156,4 +157,15 @@ describe("protected paths", () => {
     expect(isProtectedEditPath("docs/environment.md")).toBe(false);
     expect(isProtectedEditPath("src/main.ts")).toBe(false);
   });
+});
+
+test("execute roles receive the binding HUMAN authority and citation rule", () => {
+  const authority = "spec, frozen amendments and current HUMAN rulings (most recent human source wins; cite it) > DECISION > FINDING > HANDOFF";
+  for (const file of ["agents/execution-director.md", "agents/worker.md"])
+    expect(readFileSync(new URL(`../${file}`, import.meta.url), "utf8")).toContain(authority);
+  const workflow = readFileSync(new URL("../skills/execute/workflow.js", import.meta.url), "utf8");
+  for (const prompt of [workflow.slice(workflow.indexOf("function sharedContext()"), workflow.indexOf("function selectedTasks()")),
+    workflow.slice(workflow.indexOf('if (loop.phase === "review")'), workflow.indexOf('if (loop.phase === "compliance")')),
+    workflow.slice(workflow.indexOf('if (loop.phase === "compliance")'))])
+    expect(prompt).toContain(authority);
 });

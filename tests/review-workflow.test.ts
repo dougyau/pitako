@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 const originalsRoot = mkdtempSync(join(tmpdir(), "pitako-review-originals-"));
@@ -7,6 +7,9 @@ let originalNumber = 0;
 afterAll(() => rmSync(originalsRoot, { recursive: true, force: true }));
 import { runWorkflowScript, type WorkflowScriptChildResult } from "../node_modules/pi-subagents/src/workflows/scripted-workflow.js";
 import { verifyGate } from "../extensions/access-receipts.mjs";
+
+import { readReviewOriginal, reviewOriginals } from "../skills/execute/loop.ts";
+import { createHash } from "node:crypto";
 
 const source = readFileSync(new URL("../skills/review/workflow.js", import.meta.url), "utf8");
 interface Request {
@@ -1192,4 +1195,17 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
     expect(host.saves()).toBe(3);
   });
 
+});
+
+
+test.each(["intact", "missing", "changed"])("consumed review original is read by path and verified: %s", mode => {
+  const path = join(originalsRoot, `retained-${mode}.json`), value = { memo: "Complete original, not a preview" };
+  writeFileSync(path, JSON.stringify(value, null, 2));
+  const sha256 = createHash("sha256").update(readFileSync(path)).digest("hex");
+  const ref = { id: "original", key: "review.synthesis", runId: "native-review", path, sha256 };
+  expect(reviewOriginals({ originals: [{ ...ref, sha256: undefined, value }] }).originals).toEqual([ref]);
+  if (mode === "missing") unlinkSync(path);
+  if (mode === "changed") writeFileSync(path, JSON.stringify({ memo: "Changed" }));
+  if (mode === "intact") expect(readReviewOriginal(ref)).toEqual(value);
+  else expect(() => readReviewOriginal(ref)).toThrow(sha256);
 });
