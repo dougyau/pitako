@@ -581,6 +581,7 @@ Do not use votes, author withdrawal, or a critic's confidence as proof by themse
 Include only substantiated current issues; narrow claims to the supported scenario.
 When rejecting a refutation or withdrawal, explain the contradicting source evidence.
 Keep unproved concerns uncertain; no new findings at synthesis.
+A disposition classified uncertain must use decision uncertain, never include.
 Your concise memo must separate scoped defects (requirement source, location, scenario,
 evidence, impact, smallest correction), non-blocking related improvements and out-of-scope
 observations, uncertainties, checked coverage, and limits. Do not turn suggestions into

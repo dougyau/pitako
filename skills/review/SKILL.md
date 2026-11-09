@@ -96,6 +96,7 @@ same complete target, not files or subtasks:
    source for a scoped defect; it is `null` when none is established.
    Cross-critique challenges both factual support and belonging to the scope.
    Unresolved claims stay uncertain rather than becoming defects automatically.
+   A disposition classified `uncertain` uses decision `uncertain`, never `include`.
 
 The workflow makes no model overrides. Pi-subagents owns native child model
 selection.
