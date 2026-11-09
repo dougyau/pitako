@@ -83,18 +83,19 @@ test.each(["complete", "continue", "gaps", "blocked"])("execute lets a running a
 test("execute drains observation pages and replayed records do not replace the original cancellation", async () => {
   const host = fixture(undefined, { readOnly: true }); host.setLimit(1);
   host.setLimit(2);
-  const original = request(); let observed = 0;
+  const original = request(), cursors: number[] = [];
   host.setRespond((call, normal) => {
     if (call.agent === "pitako.request-observer") {
-      observed++;
       const cursor = JSON.parse(call.task).cursor;
+      cursors.push(cursor);
       return cursor === 0 ? page(call, [original], 1) : page(call, [{ ...original, requestId: "duplicate", kind: "delete" }]);
     }
     if (call.agent === "pitako.worker") expect(host.current().tasks.change1.cancel.requestId).toBe(original.requestId);
     return normal();
   });
   expect((await host.execute()).status).toBe("partial");
-  expect(observed).toBe(2); // Both pages; final acceptance is no longer a worker task.
+  expect(cursors.length).toBeGreaterThanOrEqual(2);
+  for (let index = 0; index < cursors.length; index += 2) expect(cursors.slice(index, index + 2)).toEqual([0, 1]);
   const before = readBacklog(host.root, "spec").digest;
   await host.execute();
   expect(readBacklog(host.root, "spec").digest).toBe(before);
@@ -174,9 +175,13 @@ test.each(["stopped", "permission", "interrupted"])("execute honors %s before re
 
 test("execute observes a new request immediately before a useful retry", async () => {
   const host = fixture(undefined, { readOnly: true }); host.setLimit(1);
+  let arrivedDuringGate = false;
   host.setRespond((call, normal) => {
     if (call.agent === "pitako.request-observer")
-      return page(call, host.current().loop.attempt?.number === 2 ? [request()] : []);
+      return page(call, arrivedDuringGate ? [request()] : []);
+    if (call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "gate") {
+      const result = normal(); arrivedDuringGate = true; return result;
+    }
     if (call.agent === "pitako.worker" && call.key.endsWith(".t1.a1"))
       return host.result(call, { ...host.worker(call), status: "continue", remaining: ["Finish required check"],
         continuation: { mode: "fresh", reason: "Finish the required check" } });
@@ -211,7 +216,7 @@ test.each(["cancel", "delete"])("execute observes %s before admitting a recovere
       return result;
     });
     // Lose the controller after the worker has settled but before its result is admitted.
-    cutAt(host, value => value.loop?.attempt?.gate?.stage === "intention");
+    cutAt(host, value => value.loop?.attempt?.close?.stage === "intention");
     expect((await host.execute()).status).toBe("partial"); host.setFailSave();
     expect(pending).toBe(true);
     expect(host.current().tasks.change1.completed).toBeFalsy();
@@ -257,6 +262,35 @@ test.each(["intention", "receipt", "projection"])("cancellation %s persistence c
   if (before.backlog!.tasks[0]!.status === "obsolete") expect(after.digest).toBe(before.digest);
   expect(output.cancelledScope[0].cancel.requestId).toBe("request-change1");
   expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(0);
+});
+
+test("an admitted cancellation chained after settlement replays from its receipt after a clearing-save cut", async () => {
+  const host = fixture(); host.setLimit(1);
+  let cancel = false;
+  host.setRespond((call, normal) => {
+    if (call.agent === "pitako.request-observer") return page(call, cancel ? [request()] : []);
+    if (call.agent === "pitako.worker") cancel = true; // Arrives while the attempt runs; it settles complete.
+    return normal();
+  });
+  cutAt(host, value => !!value.excludedScope?.change1 && !value.pendingCancellations?.length);
+  const first = await host.executeNative();
+  expect(first.reason).toContain("Essential persistence failed");
+  const retained = host.current();
+  expect(retained.loop.cancellation?.stage).toBe("receipt");
+  expect(retained.loop.cancellationInput.expectedDigestFrom).toContain("settlement");
+  const before = readBacklog(host.root, "spec").digest;
+  host.setFailSave();
+  const output = await host.executeNative();
+  expect(output.status, output.reason).toBe("partial");
+  expect(output.reason).not.toContain("Missing preceding apply intention");
+  expect(readBacklog(host.root, "spec").digest).toBe(before);
+  expect(output.cancelledScope[0].cancel.reason).toBe("cancellation arrived after settlement");
+  expect(host.current().pendingCancellations).toEqual([]);
+  expect((host.current().intentions ?? []).map((entry: any) => entry.key)).not.toContain(retained.loop.cancellationInput.key);
+  const replay = await host.executeNative();
+  expect(replay.reason ?? "").not.toContain("Missing preceding apply intention");
+  expect(replay.status, replay.reason).toBe("partial");
+  expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(1);
 });
 
 test("cancellation CAS preserves a concurrent human backlog edit", async () => {

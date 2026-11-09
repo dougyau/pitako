@@ -334,8 +334,8 @@ test("a digest-only prepare with no current view is fetched under a fresh retry 
   retained.currentView = null;
   host.setFailSave();
   expect((await host.execute()).status).toBe("complete");
-  expect(host.calls.filter(call => /\.l1\.prepare/.test(call.key)).map(call => call.key))
-    .toEqual(["invoke-human-1.l1.prepare", "invoke-human-1.l1.prepare.r1"]);
+  expect(host.launches.filter(call => /\.l1\.advance(?:\.v\d+)?$/.test(call.key)).map(call => call.key))
+    .toEqual(["invoke-human-1.l1.advance", "invoke-human-1.l1.advance.v1"]);
   const director = host.calls.find(call => call.key === "invoke-human-1.l1.director")!;
   expect(director.task).toContain('"posts":[]');
 });

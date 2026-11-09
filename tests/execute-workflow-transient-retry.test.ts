@@ -44,7 +44,7 @@ test.each([
   expect(host.calls).toHaveLength(0);
 });
 
-test.each(["seal", "gaps", "observation", "closing"].flatMap(phase => [
+test.each(["seal", "drain", "gaps", "observation", "closing"].flatMap(phase => [
   "Mission state exceeds the 256 KiB limit (273647 bytes; maximum 262144 bytes).",
   "Invalid mission state file '/state.json': Unexpected end of JSON input",
   "state.set('invoke-human-1') value must contain only JSON data",
@@ -57,7 +57,8 @@ test.each(["seal", "gaps", "observation", "closing"].flatMap(phase => [
   });
   let attempts = 0, calls = 0;
   host.setFailSave(value => {
-    const selected = phase === "seal" ? value.ledger?.count === 2 && !value.sealPending
+    const selected = phase === "seal" ? value.intentions?.some((entry: any) => entry.operation === "ledger" && entry.input.record.kind === "unit") && !value.sealPending
+      : phase === "drain" ? value.ledger?.count >= 2 && value.finishDrain?.admitted
       : phase === "gaps" ? value.loop?.archived
       : phase === "observation" ? !!value.loop?.closing
       : value.loop?.phase === "finished";

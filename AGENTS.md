@@ -46,11 +46,13 @@ child delegates; the worker is the only writer of product content. Root-dispatch
 deterministic runtime agents (checkpoint sealer, execution and architecture ledgers, observers and
 access verifier) write only Pitako metadata such as seals under
 `.pi/subagents/checkpoints`, ledger records and access receipts. The exception is
-`pitako.loop-io`: its prepare/apply/gate operations may write only the backlog file
-under `.pitako/backlog/`, Board posts, logs/metadata under `.pi/`, and gitignored
-build outputs produced by gate commands. There is no command allow-list. Gates
-run only after the worker settles, with no writer active; before/after checkout
-fingerprints detect candidate mutation. The inspector is exceptional
+`pitako.loop-io`: its grouped operations may write only the backlog file under
+`.pitako/backlog/`, Board posts, logs/receipts/metadata under `.pi/`, seal files
+under `.pi/subagents/checkpoints`, execution-ledger records, and gitignored
+build outputs produced by gate commands. It writes no product content and runs
+only after the worker settles, with no writer active. There is no command allow-list;
+before/after checkout fingerprints around gates detect candidate
+mutation. The inspector is exceptional
 read-only observation/recovery, not preparation or final validation. Preserve these ceilings and the
 coding/analysis mutation policy: shell is not a sandbox, query Git can write
 metadata, and Python/Cargo/SSH are not read-only merely because of annotations.

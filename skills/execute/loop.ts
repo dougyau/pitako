@@ -456,6 +456,24 @@ export async function runCommand(root: string, cmd: Command, logRef: string): Pr
 export type GateInput = { root: string; specId: string; invocation: string; loop: number; attempt: number; key: string;
   task: Pick<Task, "id" | "gates" | "metric" | "progress">; workerStatus: string; writerSettled: true;
   checkpoint?: CheckpointIntent; knowledge?: { findings?: unknown; handoff?: unknown }; dbPath?: string; metricTimeoutMs?: number; reuse?: FinalAcceptance };
+type GateIdentity = { attemptKey: string; commandsDigest: string; workerStatus: string; progressInputDigest: string;
+  after: GateReceipt["after"] };
+type SavedGateReceipt = GateReceipt & { identity: GateIdentity; receiptDigest: string };
+
+function publishGateReceipt(directory: string, receipt: GateReceipt, identity: GateIdentity) {
+  const body = { ...receipt, identity };
+  const temporary = path.join(directory, `${randomUUID()}.tmp`);
+  try {
+    const fd = openSync(temporary, "wx", 0o600);
+    try { writeFileSync(fd, JSON.stringify({ ...body, receiptDigest: canonicalDigest(body) }) + "\n"); fsyncSync(fd); }
+    finally { closeSync(fd); }
+    // The directory was exclusively reserved before commands ran; no other run owns this destination.
+    renameSync(temporary, safePath(path.join(directory, "receipt.json")));
+    const dirFd = openSync(directory, "r");
+    try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+  } finally { if (existsSync(temporary)) unlinkSync(temporary); }
+}
+
 export async function gate(input: GateInput): Promise<GateReceipt> {
   assert(input.writerSettled === true, "Gate requires a settled worker and no active writer");
   key(input.invocation); key(input.key); key(input.task.id);
@@ -464,33 +482,61 @@ export async function gate(input: GateInput): Promise<GateReceipt> {
     input.checkpoint.association.invocation === input.invocation && input.checkpoint.loop === input.loop &&
     input.checkpoint.attempt === input.attempt && input.checkpoint.taskId === input.task.id, "Gate checkpoint attempt mismatch");
   const contextPeak = input.checkpoint ? readContextPeak(input.checkpoint) : null;
-  const directory = safePath(path.join(input.root, ".pi/subagents/execute", input.invocation, "gates", input.key));
-  const before = checkoutEvidence(input.root), gates: GateResult[] = [];
+  const current = checkoutEvidence(input.root), gates: GateResult[] = [];
   const executed = (commands: Command[]) => commands.map(({ id, command, cwd, timeoutMs }) => ({ id, command, cwd, timeoutMs }));
   input.task.gates.forEach(cmd => command(cmd, true));
+  // Workflow transport retries append .rN to the gate key, not to the worker's attempt identity.
+  const attemptKey = input.key.replace(/\.gate(?:\.r\d+)?$/, "");
+  const identityInput = { attemptKey, workerStatus: input.workerStatus,
+    commandsDigest: canonicalDigest({ gates: executed(input.task.gates), metric: input.task.metric ?
+      { command: input.task.metric.command, timeoutMs: input.metricTimeoutMs ?? 30 * 60 * 1000, cwd: "." } : null }),
+    progressInputDigest: canonicalDigest({ progress: input.task.progress, target: input.task.metric?.target ?? null }) };
+  const parent = safePath(path.join(input.root, ".pi/subagents/execute", input.invocation, "gates"));
+  mkdirSync(parent, { recursive: true });
+  let directory = "", cached: SavedGateReceipt | undefined;
+  for (let retry = 0; ; retry++) {
+    directory = safePath(path.join(parent, `${attemptKey}.gate${retry ? `.r${retry}` : ""}`));
+    try { mkdirSync(directory); break; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+    const file = safePath(path.join(directory, "receipt.json"));
+    let raw: string;
+    try { raw = readFileSync(file, "utf8"); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+    try {
+      const saved = JSON.parse(raw) as SavedGateReceipt;
+      const { receiptDigest, ...body } = saved;
+      if (raw === JSON.stringify(saved) + "\n" && receiptDigest === canonicalDigest(body) &&
+          canonicalDigest(body.identity) === canonicalDigest({ ...identityInput, after: { head: current.head, fingerprint: current.fingerprint } }) &&
+          body.after.head === current.head && body.after.fingerprint === current.fingerprint) {
+        cached = { ...body, receiptDigest }; break;
+      }
+    } catch { /* An incomplete or corrupt receipt is never reusable. */ }
+  }
+  const before = cached?.before ?? current;
   const reuse = input.reuse;
-  const reused = input.task.id === "final-acceptance" && !input.task.metric && reuse &&
+  const reused = !cached && input.task.id === "final-acceptance" && !input.task.metric && reuse &&
     Number.isSafeInteger(reuse.loop) && reuse.loop > 0 && reuse.loop < input.loop && text(reuse.gateKey) &&
     reuse.candidate?.head === before.head && reuse.candidate?.fingerprint === before.fingerprint &&
     Array.isArray(reuse.exec) && canonicalDigest(executed(reuse.exec)) === canonicalDigest(executed(input.task.gates));
-  if (reused) {
+  if (cached) gates.push(...structuredClone(cached.gates));
+  else if (reused) {
     assert(Array.isArray(reuse.results) && reuse.results.length === input.task.gates.length &&
       reuse.results.every((result, index) => result.id === input.task.gates[index]?.id &&
         ["pass", "fail", "timeout", "error"].includes(result.status) && (result.exit === null || Number.isInteger(result.exit)) &&
         Number.isFinite(result.ms) && result.ms >= 0 && typeof result.tail === "string" && text(result.logRef)), "Invalid reused acceptance results");
     gates.push(...structuredClone(reuse.results));
   }
-  let metric: GateReceipt["metric"] = null;
-  if (input.task.metric) {
+  let metric: GateReceipt["metric"] = cached?.metric ?? null;
+  if (!cached && input.task.metric) {
     const result = await runCommand(input.root, { id: "metric", command: input.task.metric.command, cwd: ".", timeoutMs: input.metricTimeoutMs ?? 30 * 60 * 1000 }, path.join(directory, "metric.log"));
     const value = result.result.status === "timeout" || result.result.status === "error" ? null : parseMetric(result.stdout);
     metric = { value, error: value === null ? `Metric ${result.result.status}: no finite value; ${result.result.logRef}` : null };
   }
-  if (!reused && (input.workerStatus === "complete" || !input.task.metric)) {
+  if (!cached && !reused && (input.workerStatus === "complete" || !input.task.metric)) {
     for (const [index, cmd] of input.task.gates.entries()) gates.push((await runCommand(input.root, cmd, path.join(directory, `${index}.log`))).result);
   }
-  const after = checkoutEvidence(input.root), mutated = before.head !== after.head || before.fingerprint !== after.fingerprint;
-  const progress = updateProgress(input.task.progress, { value: metric?.value ?? null, fingerprint: after.fingerprint,
+  const after = cached?.after ?? checkoutEvidence(input.root), mutated = before.head !== after.head || before.fingerprint !== after.fingerprint;
+  const progress = cached?.progress ?? updateProgress(input.task.progress, { value: metric?.value ?? null, fingerprint: after.fingerprint,
     gatesPassed: gates.filter(g => g.status === "pass").length, gatesTotal: input.task.gates.length }, input.task.metric?.target ?? null,
     mutated || gates.some(g => g.status === "timeout") || !!metric?.error);
   return withBoard(input.root, input.specId, input.dbPath, (board, workspace, topicId) => {
@@ -503,10 +549,9 @@ export async function gate(input: GateInput): Promise<GateReceipt> {
     const receipt: GateReceipt = { before: { head: before.head, fingerprint: before.fingerprint },
       after: { head: after.head, fingerprint: after.fingerprint }, mutated, gates, metric, progress, contextPeak, stalled: progress.nonImproving >= 3,
       view: boardView(board, workspace, topicId, { taskId: input.task.id }),
-      ...(reused ? { reused: { loop: reuse.loop, gateKey: reuse.gateKey } } : {}) };
-    mkdirSync(directory, { recursive: true });
+      ...(cached?.reused ? { reused: cached.reused } : reused ? { reused: { loop: reuse.loop, gateKey: reuse.gateKey } } : {}) };
     // Keep the full diagnostic even when the wire representation needs smaller tails/views.
-    writeFileSync(safePath(path.join(directory, "receipt.json")), JSON.stringify({ ...receipt, before, after }) + "\n");
+    if (!cached) publishGateReceipt(directory, { ...receipt, before, after }, { ...identityInput, after: receipt.after });
     for (const g of receipt.gates) { while (bytes(g.tail) > 2048) g.tail = g.tail.slice(Math.max(1, Math.ceil(g.tail.length / 8))); }
     while (bytes(receipt) > viewBudget(0) && receipt.gates.some(g => g.tail.length > 0)) {
       for (const g of receipt.gates) g.tail = g.tail.slice(Math.ceil(g.tail.length / 2));

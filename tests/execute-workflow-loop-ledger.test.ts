@@ -167,11 +167,15 @@ describe("fused loop ledger publication", () => {
     expect(output.reason).toContain("authorized loops consumed");
     expect(host.current().loop).toMatchObject({ archived: true, outcome: "gaps" });
     expect(host.records()).toHaveLength(2);
-    expect(host.calls.filter(call => call.agent === "pitako.execution-ledger").map(call => call.key))
-      .toEqual(["invoke-human-1.l1.gaps", "invoke-human-1.l1.gaps.r1"]);
+    const publications = host.calls.filter(call => call.agent === "pitako.execution-ledger").map(call => call.key);
+    expect(publications).toEqual(failure === "state-save" ? ["invoke-human-1.l1.gaps"]
+      : ["invoke-human-1.l1.gaps", "invoke-human-1.l1.gaps"]);
+    const drains = host.launches.filter(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "drain");
+    expect(drains.map(call => call.key)).toEqual(failure === "state-save" ? ["invoke-human-1.l1.finishDrain"]
+      : ["invoke-human-1.l1.finishDrain", "invoke-human-1.l1.finishDrain.r1"]);
   });
 
-  test("exhausted gaps admission saves retain the frozen body and the next unused retry key", async () => {
+  test("exhausted gaps admission saves retain the frozen intention and reuse the successful drain", async () => {
     const host = fixture(undefined, { taskCount: 0 }); host.setLimit(1);
     host.setRespond((request, normal) => {
       const result = normal();
@@ -180,16 +184,15 @@ describe("fused loop ledger publication", () => {
     });
     host.setFailSave(value => !!value.loop?.archived);
     expect((await host.execute()).status).toBe("partial");
-    const pending = host.current().loop.archivePending;
-    expect(pending.retry).toBe(3);
-    const body = JSON.stringify(pending.record);
+    const retained = host.current();
+    const body = JSON.stringify(retained.intentions[0].input.record);
+    expect(retained.finishDrain.stage).toBe("receipt");
+    expect(retained.loop.archived).toBeUndefined();
     host.setFailSave();
     expect((await host.execute()).status).toBe("partial"); // Authorized loop budget, not a persistence halt.
     expect(host.current().loop.archived).toBe(true);
     const calls = host.calls.filter(call => call.agent === "pitako.execution-ledger");
-    expect(calls.map(call => call.key)).toEqual([
-      "invoke-human-1.l1.gaps", "invoke-human-1.l1.gaps.r1", "invoke-human-1.l1.gaps.r2", "invoke-human-1.l1.gaps.r3",
-    ]);
+    expect(calls.map(call => call.key)).toEqual(["invoke-human-1.l1.gaps"]);
     expect(calls.every(call => JSON.stringify(JSON.parse(call.task).record) === body)).toBe(true);
     expect(host.records()).toHaveLength(2);
   });

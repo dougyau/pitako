@@ -893,11 +893,11 @@ test("gate receipt carries the attempt's durable context peak, or explicit absen
       commonDir: execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: f.root, encoding: "utf8" }).trim(),
       missionId: "mission", missionPath: path.join(f.root, ".pi/mission.json"), invocation: "exec1",
       source: path.join(f.root, "spec.md"), digest: "a".repeat(64), maxCycles: 15, sourceRefs: [] } };
-  expect((await gate(attempt(f, { checkpoint }))).contextPeak).toBeNull();
+  expect((await gate(attempt(f, { checkpoint, key: "missing-peak" }))).contextPeak).toBeNull();
   recordContextPeak(checkpoint, 1200); recordContextPeak(checkpoint, 800); recordContextPeak(checkpoint, 1500);
   const receipt = await gate(attempt(f, { checkpoint }));
   expect(receipt.contextPeak).toBe(1500);
-  expect(JSON.parse(readFileSync(path.join(f.root, ".pi/subagents/execute/exec1/gates/attempt1/receipt.json"), "utf8")).contextPeak).toBe(1500);
+  expect(JSON.parse(readFileSync(path.join(f.root, ".pi/subagents/execute/exec1/gates/attempt1.gate/receipt.json"), "utf8")).contextPeak).toBe(1500);
   const next = { ...checkpoint, key: "worker-next", attempt: 2 };
   expect((await gate(attempt(f, { checkpoint: next, attempt: 2, key: "next-gate" }))).contextPeak).toBeNull();
 });

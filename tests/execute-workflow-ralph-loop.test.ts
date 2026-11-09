@@ -52,7 +52,9 @@ test("a complete worker with failed focused gates seals pause and continues the 
   const seals = host.calls.filter(call => call.agent === "pitako.checkpoint-sealer").map(call => JSON.parse(call.task));
   expect(seals[0].kind).toBe("pause");
   expect(seals[1].kind).toBe("unit");
-  expect(workers[1]!.task).toContain("Observable failing assertion");
+  expect(workers[1]!.task).toContain("change1-check: fail");
+  expect(workers[1]!.task).toContain("/native/gates/invoke-human-1.l1.t1.a1.gate/change1-check.log");
+  expect(workers[1]!.task).not.toContain("Observable failing assertion");
   expect(workers[1]!.task).toContain("TASK CONTINUATION");
   expect(workers[1]!.task).not.toContain("FROZEN ATTEMPT");
   expect(workers[1]!.task).not.toContain("checkoutEvidence before/after");
@@ -186,17 +188,20 @@ test("the sealer cannot admit a candidate changed after gates", async () => {
   expect(host.calls.filter(call => isGate(call))).toHaveLength(1);
 });
 
-test("a transport retry uses a new .rN gate key and keeps the long explicit deadline", async () => {
+test("a transport retry uses a new .rN close key and keeps the long explicit deadline", async () => {
   const host = taskFixture(); let failed = false;
-  host.setRespond((request, normal) => {
-    const result = normal();
-    if (isGate(request) && !failed) { failed = true; return { ...result, ok: false, error: "Transport output unavailable" }; }
+  host.setLaunchRespond(async (request, normal) => {
+    const result = await normal();
+    if (request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "close" && !failed) {
+      failed = true; return { ...result, output: "Transport output unavailable" };
+    }
     return result;
   });
   expect((await host.execute()).status).toBe("partial");
-  const calls = host.calls.filter(call => isGate(call));
+  const calls = host.launches.filter(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "close");
   expect(calls[1]!.key).toBe(calls[0]!.key + ".r1");
   expect(calls.every(call => call.timeoutMs === 14400000)).toBe(true);
+  expect(host.calls.filter(isGate)).toHaveLength(1);
 });
 
 test("v5 retained state is rejected before any resume or dispatch", async () => {
@@ -367,7 +372,8 @@ test.each(["unchanged", "changed", "second-stall"])("stalled task selection: %s"
     human.backlog!.tasks[0]!.status = "obsolete"; human.backlog!.lastApplied = null;
     writeFileSync(human.path, JSON.stringify(human.backlog));
     host.setRespond(undefined);
-    expect((await host.execute({ unblock: true, resolution: { loop: 2, text: "Retired the task in the backlog after reviewing both stalls" } })).status).toBe("complete");
+    const resolved = await host.execute({ unblock: true, resolution: { loop: 2, text: "Retired the task in the backlog after reviewing both stalls" } });
+    expect(resolved.status, resolved.reason).toBe("complete");
     expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(6);
     expect(host.current().consumedLoops).toBe(3);
   }
@@ -918,7 +924,9 @@ test("attempt metadata preserves a resume opinion alongside gate diagnosis and p
   expect((await host.execute()).status).toBe("partial");
   const firstResult = host.snapshots.find(state => state.loop?.attempt?.number === 1 && state.loop.attempt.stage === "result")!.loop.attempt.result;
   expect(firstResult.status).toBe("continue"); expect(firstResult.usefulContinuation).toBe(true);
-  expect(firstResult.diagnosis).toContain("Fix this assertion");
+  expect(firstResult.diagnosis).toContain("change1-check: fail");
+  expect(firstResult.diagnosis).toContain("/native/gates/invoke-human-1.l1.t1.a1.gate/change1-check.log");
+  expect(firstResult.diagnosis).not.toContain("Fix this assertion");
   expect(firstResult.revival).toEqual({ opinion: "resume", reason: "Context remains useful", decision: "fresh", code: "fresh-dispatch", peak: 1234 });
   expect(host.snapshots.some(state => state.loop?.attempt?.revival?.peak === 1234)).toBe(true);
 });

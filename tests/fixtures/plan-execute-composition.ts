@@ -1,4 +1,4 @@
-import { afterAll, afterEach, expect } from "bun:test";
+import { afterAll, afterEach, beforeAll, expect } from "bun:test";
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { constants as osConstants, tmpdir } from "node:os";
@@ -98,6 +98,35 @@ export function childResponse(key: string, request: any, metadata: any, checkout
   }
   if (request.agent === "pitako.loop-io") {
     const input = JSON.parse(request.task);
+    if (["advance", "selection", "close", "drain"].includes(input.operation)) return (async () => {
+      if (process.cwd() !== metadata.root && metadata.runLoopIO)
+        return metadata.runLoopIO(key, request, metadata, checkout);
+      const { operation, ...params } = input;
+      const dbPath = metadata.boardPath ?? metadata.root + "/.pi/board.db";
+      for (const name of ["prepare", "apply", "gate"]) if (params[name]) params[name].dbPath = dbPath;
+      for (const intention of params.intentions ?? []) if (intention.operation === "apply") intention.input.dbPath = dbPath;
+      const artifacts = { asyncDir: `/native/async/${key}`, externalAdapter: {
+        outputArtifacts: { stdoutPath: `/native/async/${key}/stdout.log`, stderrPath: `/native/async/${key}/stderr.log` } } };
+      if (process.cwd() !== metadata.root) {
+        const command = require("node:child_process").spawnSync("node", [metadata.loopIO ?? require("node:path").resolve("skills/execute/loop-io.mjs")], {
+          cwd: metadata.root, input: JSON.stringify({ operation, ...params }), encoding: "utf8",
+          env: { ...process.env, NODE_COMPILE_CACHE: metadata.root + "/.pi/node-compile-cache" },
+        });
+        return { key, ok: command.status === 0, agent: request.agent, runId: `native-${key}`, ...artifacts,
+          output: command.stdout, results: [{ exitCode: command.status }] };
+      }
+      const runtime = await import(require("node:url").pathToFileURL(metadata.loopIO).href);
+      try {
+        const reference = operation === "drain" ? await runtime.drain(params, metadata.groupedHooks)
+          : await runtime.grouped(operation, params, metadata.groupedHooks);
+        return { key, ok: true, agent: request.agent, runId: `native-${key}`, ...artifacts,
+          output: JSON.stringify(runtime.receiptTransport(reference)), results: [{ exitCode: 0 }] };
+      } catch (error: any) {
+        return { key, ok: false, agent: request.agent, runId: `native-${key}`, ...artifacts, results: [{ exitCode: 1 }],
+          output: JSON.stringify({ error: "loop-io", reason: error.message, selectionRejected: error.selectionRejected === true,
+            replayRejected: error.replayRejected === true, viewOverflow: error.viewOverflow === true }) };
+      }
+    })();
     // Reuse actual persistence/Board operations without a Node/TypeScript startup per call.
     if (input.operation !== "gate" && metadata.loopOperations && (input.operation !== "baseline" || metadata.loopOperations.baseline)) return (async () => {
       try {
@@ -159,17 +188,27 @@ export function childResponse(key: string, request: any, metadata: any, checkout
       externalAdapter: { outputArtifacts: { stdoutPath: `/native/async/${key}/stdout.log`, stderrPath: `/native/async/${key}/stderr.log` } },
       results: [{ exitCode: 0 }] } as WorkflowScriptChildResult;
   }
-  if (request.agent === "pitako.checkout-observer") return { key, ok: true,
+  if (request.agent === "pitako.checkout-observer") {
+    const observation = (ledger: any, summaries: any[]) => ({ key, ok: true,
     agent: request.agent, runId: `native-${key}`, asyncDir: `/native/async/${key}`, artifactPaths: [],
-    output: JSON.stringify({ version: 1, ok: true, ledger: { count: Math.max(1, (request.task ? JSON.parse(request.task).expected.count : 0)) + 1, head: "c".repeat(64) }, root: metadata.root, commonDir: metadata.commonDir,
-      summaries: [{ loop, status: "gaps", gaps: "", review: "", compliance: "", rejection: "" }], checkout: { ...checkout } }), results: [{ index: 0, agent: request.agent, task: request.task ?? "", exitCode: 0,
+    output: JSON.stringify({ version: 1, ok: true, ledger, root: metadata.root, commonDir: metadata.commonDir,
+      summaries, checkout: { ...checkout } }), results: [{ index: 0, agent: request.agent, task: request.task ?? "", exitCode: 0,
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } }],
     externalAdapter: {
       adapter: { id: "external-cli", version: 1, executionMode: "one-shot-stdin" },
       capabilities: { stop: true, steer: false, resume: false, structuredOutput: false, toolEvents: false,
         supervisor: "unsupported", forkContext: false, extensionBindings: false },
       handoff: { mode: "fresh" }, supervisor: { mode: "unsupported", reason: "Fixed one-shot observer" },
-      nonResumableReason: "Fixed one-shot observer", outputArtifacts: { stdoutPath: `/native/async/${key}/stdout.log`, stderrPath: `/native/async/${key}/stderr.log` } } } satisfies WorkflowScriptChildResult;
+      nonResumableReason: "Fixed one-shot observer", outputArtifacts: { stdoutPath: `/native/async/${key}/stdout.log`, stderrPath: `/native/async/${key}/stderr.log` } } } satisfies WorkflowScriptChildResult);
+    if (!request.task) return observation({ count: 2, head: "c".repeat(64) }, [{ loop, status: "gaps", gaps: "", review: "", compliance: "", rejection: "" }]);
+    return (async () => {
+      const input = JSON.parse(request.task), { invocation, ...expected } = input.expected;
+      const ledgerModule = await import(require("node:url").pathToFileURL(
+        require("node:path").join(require("node:path").dirname(metadata.loopIO ?? require("node:path").resolve("skills/execute/loop-io.mjs")), "ledger.mjs")).href);
+      const ledger = ledgerModule.appendLedger(metadata.root, invocation, { expected, ...input.body });
+      return observation(ledger, ledgerModule.loopSummaries(metadata.root, invocation, ledger));
+    })();
+  }
   let value: any;
   if (suppliedValue) value = suppliedValue;
   else if (/\.director(?:\.d1)?$/.test(key)) {
@@ -315,14 +354,28 @@ export function compositionFixture() {
     const git = (...args: string[]) => execFileSync("git", args, { cwd: root, stdio: "ignore" });
     git("init", "-q"); git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "initial"); return root;
   }
-  return { roots, disposers, workflowSettlements, checkpointCancellations, settleWorkflows, checkpointLifecycle, repository };
+  // Reuse a file-owned Node process: grouped operations require their real cwd,
+  // but repeated cold loader processes are not part of the behavior under test.
+  const runtime = nativeCheckpointFixture({ workflowSettlements, checkpointCancellations, settleWorkflows });
+  let useRuntime = false;
+  beforeAll(async () => { if (useRuntime) await runtime.startNativeCheckpoint(); });
+  const scripts = { ...deterministicScripts,
+    runLoopIO: async (key: string, request: any, metadata: any, checkout: any) => {
+      const result = await runtime.nativeCheckpointCase({ ...runtime.nativeCheckpointInput(),
+        root: metadata.root, key, request, metadata, checkout }, `async (input, _, respond) =>
+          respond(input.key, input.request, input.metadata, input.checkout)`);
+      if (!result || result[0] !== 0) throw Error(result?.[2] ?? "Grouped fixture cancelled");
+      return JSON.parse(result[1]);
+    } };
+  return { roots, disposers, workflowSettlements, checkpointCancellations, settleWorkflows, checkpointLifecycle, repository,
+    get scripts() { useRuntime = true; return scripts; } };
 }
 export type CompositionFixture = ReturnType<typeof compositionFixture>;
 
 // One file-owned process runs controlled boundaries; one case retains native SDK loading. Each message
 // still creates fresh storage, roots and launch-bound tool registrations. Cases
 // are awaited by the file's normal test order; other files remain parallel.
-export function nativeCheckpointFixture({ workflowSettlements, checkpointCancellations, settleWorkflows }: CompositionFixture) {
+export function nativeCheckpointFixture({ workflowSettlements, checkpointCancellations, settleWorkflows }: Pick<CompositionFixture, "workflowSettlements" | "checkpointCancellations" | "settleWorkflows">) {
   let nativeCheckpoint: ReturnType<typeof spawn> | undefined;
   let nativeCheckpointRoot: string;
   let nativeCheckpointExit: Promise<[number, string, string]>;
@@ -335,7 +388,7 @@ export function nativeCheckpointFixture({ workflowSettlements, checkpointCancell
     nativeCheckpointRoot ??= mkdtempSync(path.join(tmpdir(), "pitako-checkpoint-node-"));
     let ready!: () => void;
     const started = new Promise<void>(resolve => { ready = resolve; });
-    const child = spawn(native ? "node" : process.execPath, ["-e", `
+    const child = spawn(sdk ? "node" : process.execPath, ["-e", `
       const disconnect=()=>{if(process.connected)process.disconnect();};
       process.on('SIGTERM',()=>{process.exitCode ||= 143;disconnect();});
       const send=value=>{
@@ -345,33 +398,31 @@ export function nativeCheckpointFixture({ workflowSettlements, checkpointCancell
       };
       let loaded;
       const sdk=()=>loaded??=(async()=>{
+        await import(${JSON.stringify(new URL("../../skills/execute/loader.mjs", import.meta.url).href)});
         let runWorkflowScript, loadExtensions;
         if(${native}) {
           const {runWorkflowScript:nativeRun}=await import(${JSON.stringify(new URL("../../node_modules/pi-subagents/src/workflows/scripted-workflow.js", import.meta.url).href)});
           const nativeLoad=(await import(${JSON.stringify(new URL("../../node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/loader.js", import.meta.url).href)})).loadExtensionsCached;
-          await nativeLoad([${JSON.stringify(path.resolve("extensions/checkpoint-create.ts"))}],process.cwd());
           runWorkflowScript = nativeRun;
           loadExtensions = nativeLoad;
         } else {
           // Same controlled AsyncFunction boundary as execute-workflow.ts.
           runWorkflowScript = ${controlledWorkflow.toString()};
-          loadExtensions = async paths => {
-            const tools = new Map(), handlers = new Map();
-            for(const file of paths) (await import(file)).default({on(name,handler){handlers.set(name,handler);},registerTool(tool){tools.set(tool.name,{definition:tool});}});
-            return {errors:[],extensions:[{tools,handlers}]};
-          };
+          loadExtensions = (await import(${JSON.stringify(new URL("../../node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/loader.js", import.meta.url).href)})).loadExtensionsCached;
         }
         return {runWorkflowScript,loadExtensions};
       })();
       (async()=>{
         if(${sdk}) {
-          await sdk();
+          const {loadExtensions}=await sdk();
+          await loadExtensions([${JSON.stringify(path.resolve("extensions/checkpoint-create.ts"))}],process.cwd());
           // File-owned extension and persistence loading must finish before ready.
           if(!${native})await Promise.all([
             import(${JSON.stringify(new URL("../../extensions/execute-checkpoint.ts", import.meta.url).href)}),
             import(${JSON.stringify(new URL("../../extensions/spec-plans.ts", import.meta.url).href)}),
-            import(${JSON.stringify(new URL("../../extensions/checkpoint-create.ts", import.meta.url).href)}),
             import(${JSON.stringify(new URL("../../skills/execute/loop.ts", import.meta.url).href)}),
+            import(${JSON.stringify(new URL("../../skills/execute/loop-io.mjs", import.meta.url).href)}),
+            import(${JSON.stringify(new URL("../../skills/execute/inspect.ts", import.meta.url).href)}),
           ]);
         }
         process.on('message',async ({input,harness})=>{

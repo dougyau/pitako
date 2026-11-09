@@ -45,7 +45,7 @@ gaps. A missing checkpoint cannot be reconstructed from HEAD plus fingerprint.
 
 Capture actual affected-file bytes, including earlier WIP, before modifying.
 After journaled writes settle, return a decision-only worker report. The root dispatches
-`pitako.checkpoint-sealer` to observe the candidate and seal `unit` for valid complete
+`pitako.loop-io close` to observe the candidate and seal `unit` in-process for valid complete
 reports backed by passing gates and an unchanged candidate, or `pause` otherwise; workers never call unit/pause or echo receipts,
 final candidate identity, task/attempt identity, Git HEAD or checkpoint references.
 Verification tasks without checkout writes need no pre-capture. The workflow
@@ -358,14 +358,74 @@ writer. Sequential fresh workers use four-hour attempts, reads:false and
 progress:false, no private diaries and no next-task selection. Their todo steps
 are display only, projected from the child session file, not evidence.
 
-Attempt order is worker settles → save gate intention → loop-io gate → save
-receipt → seal. No writer is active during gates. The workflow measures the
-metric every attempt; focused gates run when the worker reports complete or the
+Attempt order is worker settles → save close intention → loop-io requests →
+gate → seal → save receipt → workflow admission. No writer is active during
+gates. The workflow measures the metric every attempt; focused gates run when
+the worker reports complete or the
 task has no metric. Commands have timeouts and process-group termination, bounded
 receipt tails and full logs under `.pi/subagents/execute/<invocation>/gates/`.
 Mutation outside `.pi/`, `.pitako/` and gitignored outputs fails the gate.
-`loop-io` has no command allow-list; its effects are limited to backlog, Board
-posts, `.pi/` logs/metadata and gitignored build outputs, never product edits.
+`loop-io` has no command allow-list; its effects are limited to `.pitako/backlog/`,
+Board posts, `.pi/` logs/receipts/metadata, seal files under
+`.pi/subagents/checkpoints`, execution-ledger records and gitignored gate build
+outputs, never product edits. It runs only after the worker settles, with no
+writer active.
+
+### Drain-first grouped launches
+
+Admission stays exclusively in the workflow: it admits sealed results, builds
+ledger bodies, decides settlement and folds loops. It persists unit-ledger,
+cancellation/settlement apply and loop/gaps-ledger intentions with their existing
+keys. Every grouped launch drains pending intentions in that order before its
+own steps, retaining ledger link/byte comparisons, same-key apply request/content
+digests and Board `postOnce` replay checks.
+
+- `advance`: drain → prepare → request observation.
+- `selection`: a separate launch after the director; drain → apply selection →
+  request observation → eligible dispatch-baseline capture.
+- `close`: after the worker settles, drain → request observation → gate → seal,
+  with sealer and ledger code running in-process. It also re-observes requests
+  and captures an eligible next-attempt baseline when needed. The context-peak
+  record travels in the close receipt, not the gate receipt.
+- One trailing drain per invocation publishes intentions prepared by the last
+  admission before finish.
+
+A normal single-attempt task loop uses about 5 launches: advance, director,
+selection, worker and close, plus the one trailing drain per invocation. Each
+extra attempt uses 2 (worker and close). This arithmetic excludes retries
+(including `.d1` director/selection retries), pagination, cancellations, recovery
+and final review/compliance flows; it is not a bound on exceptional runs.
+
+Each sub-step has a key and result-digest marker under the invocation's `.pi/`
+metadata. Same-key relaunches and `.rN` retries verify completed markers and
+publications, skip completed effects and resume the first incomplete step.
+Recovery accepts grouped loop-io references as well as legacy sealer/ledger
+references. The standalone `pitako.checkpoint-sealer`, `pitako.execution-ledger`
+and `pitako.request-observer` profiles remain available for recovery and other
+workflows. Stop, permission and capacity barriers and no blind redispatch remain
+unchanged.
+
+Gate receipts are atomic and never overwritten, under
+`gates/<attemptKey>.gate/`; fresh reruns use `.rN` directories. Reuse without
+spawning commands requires an intact receipt with matching attempt key, commands
+digest (`id`, `command`, `cwd`, `timeoutMs` and metric command), worker status,
+progress-input digest and after candidate (HEAD/fingerprint), with the current
+candidate equal to that after candidate. Otherwise the gate runs fresh.
+
+Per HUMAN ruling #2391 (topic #197), grouped advance/selection/close and trailing
+drain print a final stdout line `{path, digest, projection}`. Full receipts stay
+on disk. The compact projection carries the fields the workflow validates and
+stores: seal outcome/kind/candidate/paths (at most 10)/capturedPaths, gate statuses,
+mutation flag and after candidate, request observations, ledger heads/results and
+apply projections. Large seal data, gate stdout/stderr tails and logs stay on
+disk by reference/digest. The stdout JSON has a 61,440-byte (60 KiB) hard cap:
+overflow fails closed with a bounded error, never truncation. The sandbox has no
+file API; the workflow validates the projection and stores `{path, digest}` plus
+its existing compact projections. Each later loop-io launch verifies the on-disk
+digests of receipts it references before reuse. Admitted prepare/selection views
+remain digest-only; full receipt data is not copied into mission state.
+
+### Worker results and continuation
 
 Worker results are `{work, status, remaining, knowledge:{findings, handoff}}`;
 no per-check evidence or candidate identities. Advisory knowledge defects never
@@ -566,8 +626,9 @@ No capacity overrides or private budget replace native limits.
 
 The projection derives idempotent cancel/delete requests from main todo state in
 `requests.jsonl` beside the invocation ledger. Before every worker dispatch, retry
-or continuation, `pitako.request-observer` runs the model-free `observe.mjs --requests`
-mode, registered by `extensions/plan-execute.ts`. The workflow persists observed
+or continuation, grouped `pitako.loop-io` operations run the model-free request
+observer in-process. The standalone `pitako.request-observer` profile retains
+`observe.mjs --requests` for recovery and other workflows. The workflow persists observed
 cancellation and dependent cascades before acting or emitting; replays are no-ops.
 Requests do not interrupt an active attempt (native Stop still does); they prevent
 further attempts/continuations. Later loops exclude that scope and result/compliance
@@ -721,8 +782,8 @@ Full completed results live once per task; completed attempts reference them,
 while pending tasks retain the last result for continuation. Closing record
 bytes are rebuilt from immutable source fields, freezing mutable usage and
 resolution inputs. Archive each seal before discarding, and every consumed loop
-including gaps. Seals add one dispatch; fused closing adds none and retries
-unpublished output with `.checkout.r<n>`.
+including gaps. Seals run inside grouped close with no extra dispatch; fused
+closing adds none and retries unpublished output with `.checkout.r<n>`.
 
 Retain three-loop rings of rejection diagnostics, native closing references and
 bounded summaries. Reports, review/compliance and the director receive summaries
