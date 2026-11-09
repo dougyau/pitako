@@ -491,7 +491,7 @@ human authority. Posting is foreground guidance, not an automatic reply hook.
 HUMAN publication requires a root context: `ctx.hasUI &&
 process.env.PI_SUBAGENT_CHILD !== '1'`. Headless/child sessions and missing quote
 or saidAt are rejected; internal callers, including postOnce and loop-io, cannot
-create HUMANs. This predicate is verified only on pi-subagents 0.84.0 / Pi 1.5.0;
+create HUMANs. This predicate is verified only on pi-subagents 0.87.0 / Pi 1.5.0;
 the binary-host async runner branch and other embedding hosts are unverified.
 Shell is not a sandbox: a process with direct sqlite access can forge a HUMAN row.
 Signing/authentication beyond root publication is out of scope. Board schema v6

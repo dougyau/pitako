@@ -663,7 +663,7 @@ runtime test evidence.
 - [Engineering boundaries](engineering.md),
   [current architecture](architecture.md), and [current review](review.md)
   establish the existing composition and retirement boundary.
-- Installed pi-subagents `0.84.0` documents native missions, script-owned dispatch,
+- Installed pi-subagents `0.87.0` documents native missions, script-owned dispatch,
   explicit child delegation, and async-workflow relaunch in `docs/missions.md`,
   `docs/workflows.md`, `docs/agents.md`, and `docs/extension-api.md`.
   It documents agent-mediated nesting, not `runs.workflow`. Its durable
