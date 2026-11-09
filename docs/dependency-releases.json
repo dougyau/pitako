@@ -79,11 +79,11 @@
     "license": "MIT"
   },
   "pi-subagents": {
-    "version": "0.84.0",
-    "registry": "https://registry.npmjs.org/pi-subagents/0.84.0",
-    "tarball": "https://registry.npmjs.org/pi-subagents/-/pi-subagents-0.84.0.tgz",
-    "integrity": "sha512-IagE1hcBxLi82jTxTmcy/pIWckBuqhMH1GfAOe6/aIMVfnopMybCbcTMUS5K0CNy4tqSwHGleaXabaDmJS1QOg==",
-    "gitHead": "0398b9e8d6f03dc6054dbf13dfe851c7a20bff3a",
+    "version": "0.87.0",
+    "registry": "https://registry.npmjs.org/pi-subagents/0.87.0",
+    "tarball": "https://registry.npmjs.org/pi-subagents/-/pi-subagents-0.87.0.tgz",
+    "integrity": "sha512-+XjSB0xEUqrvodRh3bSQGj5/DqCfI/bLlYb0PYfBPFR757S/oOGTWA6uAAOsg3SqAu2ZYyH04Up2Zbi6q4OPMA==",
+    "gitHead": "52e68e9ef0e563d5c97b28519f9999f1b5fbbbea",
     "license": "MIT"
   },
   "pi-web-access": {

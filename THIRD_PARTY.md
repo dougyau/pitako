@@ -11,7 +11,7 @@ Pitako composes Pi packages and vendors selected MIT skills. It does not ship BS
 | [@juicesharp/rpiv-ask-user-question](https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-ask-user-question) 2.15.0 | MIT | Structured questions through `ask_user_question`. Bundled unchanged with its LICENSE. |
 | [pi-markdown-preview](https://github.com/omaclaren/pi-markdown-preview) 0.26.2 | MIT | Markdown and LaTeX previews and artifact export. Bundled unchanged with its LICENSE. |
 | [pi-web-access](https://github.com/nicobailon/pi-web-access) 0.46.0 (Nico Bailon) | MIT | Web search, page extraction, and source checking. Bundled into the Pitako package tarball. |
-| [pi-subagents](https://github.com/nicobailon/pi-subagents) 0.84.0 (Nico Bailon) | MIT | Native delegation, scripted workflows and missions through the published extension. Bundled unchanged with its LICENSE; Pitako's former managed runtime stays retired. |
+| [pi-subagents](https://github.com/nicobailon/pi-subagents) 0.87.0 (Nico Bailon) | MIT | Native delegation, scripted workflows and missions through the published extension. Bundled unchanged with its LICENSE; Pitako's former managed runtime stays retired. |
 | [pi-blackhole](https://github.com/k0valik/pi-blackhole) 0.5.17 | MIT | Automatic deterministic compaction, session observational memory, and `recall`. Bundled unchanged with its LICENSE. |
 | [pi-lsp-client](https://github.com/code-yeongyu/pi-lsp-client) | MIT | LSP tools |
 | [typescript-language-server](https://github.com/typescript-language-server/typescript-language-server) 5.3.0 | Apache-2.0 | TypeScript and JavaScript LSP server installed as an npm dependency. |

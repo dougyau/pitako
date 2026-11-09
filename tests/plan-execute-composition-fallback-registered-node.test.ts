@@ -1203,7 +1203,7 @@ test("registered Node public root resume consumes durable results and closes the
       fs.mkdirSync(sourceDir,{recursive:true});
       fs.writeFileSync(path.join(sourceDir,"status.json"),JSON.stringify({runId:sourceId,sessionId,mode:"workflow",state:"stopped",cwd:input.root,
         workflow:{scriptDigest:workflowScriptDigest(script),stopCause:"owner-exited"}}));
-      writeWorkflowLaunchRecord(sourceDir,{version:1,source:"resource",params,scriptDigest:workflowScriptDigest(script)});
+      writeWorkflowLaunchRecord(DIRS.async,sourceId,{version:2,source:"resource",params,scriptDigest:workflowScriptDigest(script),sessionId});
       let settle;
       const settled = new Promise(resolve=>settle=resolve);
       globalThis.controlledBoundary = {...boundary};
