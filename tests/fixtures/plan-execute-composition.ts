@@ -381,14 +381,16 @@ export function nativeCheckpointFixture({ workflowSettlements, checkpointCancell
   let nativeCheckpointExit: Promise<[number, string, string]>;
   let nativeCheckpointReply: ((value: [number, string, string] | undefined) => void) | undefined;
   const nativeCheckpointExits: { promise: Promise<[number, string, string]>; cancelled: boolean }[] = [];
-  // Settlement-only harness cases pass `sdk: false`: process, IPC and stream
-  // ownership do not depend on the workflow or extension loading boundaries.
-  async function startNativeCheckpoint({ sdk = true, native = false } = {}) {
+  // Harnesses without workflow/extension loading pass `sdk: false`; those
+  // importing loader.mjs still need the Node executable for its module hooks.
+  async function startNativeCheckpoint({
+    sdk = true, native = false, executable = sdk ? "node" : process.execPath,
+  }: { sdk?: boolean; native?: boolean; executable?: string } = {}) {
     if (nativeCheckpoint) throw Error("Checkpoint fixture already running");
     nativeCheckpointRoot ??= mkdtempSync(path.join(tmpdir(), "pitako-checkpoint-node-"));
     let ready!: () => void;
     const started = new Promise<void>(resolve => { ready = resolve; });
-    const child = spawn(sdk ? "node" : process.execPath, ["-e", `
+    const child = spawn(executable, ["-e", `
       const disconnect=()=>{if(process.connected)process.disconnect();};
       process.on('SIGTERM',()=>{process.exitCode ||= 143;disconnect();});
       const send=value=>{
