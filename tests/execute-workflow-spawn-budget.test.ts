@@ -55,16 +55,16 @@ test("native admission rejection saves budget-exhausted before any child starts;
   expect(host.current().ledger).toEqual({ count: 0, head: null });
   expect(host.current().loop).not.toHaveProperty("archived");
   expect(host.current().loop).not.toHaveProperty("halt");
-  expect(host.current().budgetRejectedKeys).toEqual(["invoke-human-1.l1.prepare"]);
+  expect(host.current().budgetRejectedKeys).toEqual(["invoke-human-1.l1.advance"]);
   host.setAdmission();
   expect((await host.executeNative()).status).toBe("complete");
   expect(host.current().consumedLoops).toBe(2);
   expect(new Set(host.calls.map(call => call.key)).size).toBe(host.calls.length);
 });
 
-test.each(["worker", "implementation", "gate", "sealer", "seal", "review", "compliance", "checkout", "recovery", "gaps"])(
+test.each(["worker", "implementation", "close", "drain", "review", "compliance", "checkout", "recovery", "gaps"])(
   "%s rejection retains pending work and reentry never repeats admitted launches", async phase => {
-    const host = fixture(undefined, { readOnly: !["sealer", "seal", "implementation"].includes(phase) });
+    const host = fixture(undefined, { readOnly: !["close", "drain", "implementation"].includes(phase) });
     if (phase === "gaps") host.setLimit(1);
     let denied = false;
     let original: any;
@@ -72,15 +72,7 @@ test.each(["worker", "implementation", "gate", "sealer", "seal", "review", "comp
       if (phase === "recovery" && request.agent === "pitako.execution-director") {
         const value = normal(); original = copy(value.structuredOutput); delete value.structuredOutput; return value;
       }
-      const selected = ["worker", "implementation"].includes(phase) ? request.agent === "pitako.worker"
-        : phase === "gate" ? request.key.endsWith(".t1.a1.gate")
-        : phase === "sealer" ? request.agent === "pitako.checkpoint-sealer"
-        : phase === "seal" ? request.agent === "pitako.execution-ledger"
-        : phase === "review" ? request.key.includes(".review.independent-")
-        : phase === "recovery" ? request.agent === "pitako.execution-inspector"
-        : phase === "gaps" ? request.agent === "pitako.execution-ledger"
-        : request.key.endsWith(`.${phase}`);
-      if (!denied && selected) { denied = true; return receipt(request.key); }
+
       if (phase === "recovery" && request.agent === "pitako.execution-inspector")
         return host.result(request, { status: "recovered", reason: "Exact original plan", original,
           workerResult: null, originalAvailable: true, binding: "absent", comparison: "only-original", provenance: ["/native/plan"] });
@@ -88,35 +80,43 @@ test.each(["worker", "implementation", "gate", "sealer", "seal", "review", "comp
       if (phase === "gaps" && request.agent === "pitako.execution-director") result.structuredOutput.select = "missing";
       return result;
     });
+    host.setLaunchRespond((request, normal) => {
+      const selected = ["worker", "implementation"].includes(phase) ? request.agent === "pitako.worker"
+        : phase === "close" ? request.key.endsWith(".t1.a1.close")
+        : phase === "drain" ? request.key.endsWith(".nextAdvance")
+        : phase === "review" ? request.key.includes(".review.independent-")
+        : phase === "recovery" ? request.agent === "pitako.execution-inspector"
+        : phase === "gaps" ? request.key.endsWith(".finishDrain")
+        : request.key.endsWith(`.${phase}`);
+      if (!denied && selected) { denied = true; return receipt(request.key); }
+      return normal();
+    });
     const first = await host.execute();
     expect(denied).toBe(true);
     expect(first.status, first.reason).toBe("budget-exhausted");
     const before = copy(host.current()), rejected = before.budgetRejectedKeys;
-    const admittedKeys = host.calls.filter(call => !rejected.includes(call.key)).map(call => call.key);
-    expect(before.loop).not.toHaveProperty("archived");
+    const admittedKeys = host.launches.filter(call => !rejected.includes(call.key)).map(call => call.key);
+    if (!["gaps", "drain"].includes(phase)) expect(before.loop).not.toHaveProperty("archived");
     expect(before.loop).not.toHaveProperty("halt");
     host.setStatus(ref => {
       if (rejected.includes(ref)) throw new Error("Rejected admission has no native child to observe.");
       return copy(host.native.get(ref) ?? { ok: true, output: "", results: [] });
     });
-    if (phase === "sealer") {
-      // The retry counter is restored on budget rejection, so reentry reuses the unlaunched key.
-      expect(rejected).toEqual(["invoke-human-1.l1.t1.a1.seal"]);
-      expect(before.loop.attempt.seal).toEqual({ retry: 0, kind: "unit" });
+    if (phase === "close") {
+      expect(rejected).toEqual(["invoke-human-1.l1.t1.a1.close"]);
+      expect(before.loop.attempt.close.retry).toBe(0);
       expect(before.loop.attempt.stage).not.toBe("result");
     }
-    if (phase === "seal") {
-      expect(before.sealPending).not.toBeNull();
+    if (phase === "drain") {
+      expect(before.intentions.some((entry: any) => entry.input.record?.kind === "unit")).toBe(true);
       expect(before.ledger.count).toBe(0);
-      expect(before.loop.cursor).toBe(0);
-      expect(before.sealPending.retry).toBe(0);
     }
     const resumed = await host.execute();
     expect(resumed.status, resumed.reason).toBe(phase === "gaps" ? "partial" : "complete");
     expect(resumed.loopsConsumed).toBe(phase === "gaps" ? 1 : 2);
     expect(host.current().budgetRejectedKeys).toEqual([]);
-    for (const key of admittedKeys) expect(host.calls.filter(call => call.key === key)).toHaveLength(1);
-    for (const key of rejected) expect(host.calls.filter(call => call.key === key)).toHaveLength(2);
+    for (const key of admittedKeys) expect(host.launches.filter(call => call.key === key)).toHaveLength(1);
+    for (const key of rejected) expect(host.launches.filter(call => call.key === key)).toHaveLength(2);
   });
 
 test("a closed loop permits another exhaustion even without any checkpoint seals", async () => {
@@ -138,7 +138,7 @@ test("a closed loop permits another exhaustion even without any checkpoint seals
 
 test("repeated exhaustion without progress halts for a human and names the native setting", async () => {
   const host = fixture(undefined, { readOnly: true });
-  host.setRespond(request => receipt(request.key));
+  host.setLaunchRespond(request => receipt(request.key));
   expect((await host.execute()).status).toBe("budget-exhausted");
   const second = await host.execute();
   expect(second.status).toBe("blocked");
@@ -154,12 +154,10 @@ test("repeated exhaustion without progress halts for a human and names the nativ
 
 test("an admitted seal permits another budget-exhausted end and relaunch", async () => {
   const host = fixture();
-  let remaining = 2;
-  host.setRespond((request, normal) => request.agent === "pitako.execution-ledger" && remaining-- > 0
-    ? receipt(request.key) : normal());
+  host.setLaunchRespond((request, normal) => request.key.endsWith(".close") ? receipt(request.key) : normal());
   expect((await host.execute()).status).toBe("budget-exhausted");
-  // First rejected seal must publish before another seal can make progress.
-  remaining = 0;
+  // The close is admitted and its seal drained before the next exhaustion.
+  host.setLaunchRespond();
   let denied = false;
   host.setRespond((request, normal) => {
     if (!denied && request.key.endsWith(".compliance")) { denied = true; return receipt(request.key); }
@@ -174,7 +172,7 @@ test("an admitted seal permits another budget-exhausted end and relaunch", async
 test.each(["stopped", "native permission denial", "semantic-block"])(
   "budget relaunch preserves a recorded %s barrier without any dispatch", async cause => {
     const host = fixture();
-    host.setRespond((request, normal) => request.agent === "pitako.execution-ledger" ? receipt(request.key) : normal());
+    host.setLaunchRespond((request, normal) => request.key.endsWith(".close") ? receipt(request.key) : normal());
     expect((await host.execute()).status).toBe("budget-exhausted");
     host.current().loop.halt = { status: cause === "stopped" ? "cancelled" : "blocked",
       code: cause === "semantic-block" ? cause : "native-barrier", cause, reason: `Retained ${cause}` };
@@ -200,15 +198,14 @@ test.each(["throw", "prose", "child"])("non-budget %s failure is not misclassifi
 });
 
 // Task attempts include workflow-owned gates; final acceptance has no worker or sealer.
-test("a task attempt dispatches its gate before exactly one checkpoint sealer", async () => {
+test("a task attempt groups requests, gate and exactly one seal after the writer", async () => {
   const host = fixture();
   expect((await host.execute()).status).toBe("complete");
-  const attempt = (key: string, count: number) => {
-    const index = host.calls.findIndex(call => call.key === key);
-    return host.calls.slice(index - 2, index - 2 + count).map(call => call.agent);
-  };
-  expect(attempt("invoke-human-1.l1.t1.a1", 7)).toEqual(["pitako.request-observer", "pitako.loop-io", "pitako.worker",
-    "pitako.request-observer", "pitako.loop-io", "pitako.checkpoint-sealer", "pitako.execution-ledger"]);
+  const index = host.launches.findIndex(call => call.key === "invoke-human-1.l1.t1.a1");
+  expect(host.launches.slice(index - 1, index + 2).map(call => call.agent === "pitako.loop-io"
+    ? JSON.parse(call.task).operation : call.agent)).toEqual(["selection", "pitako.worker", "close"]);
+  const effects = host.calls.slice(host.calls.findIndex(call => call.key === "invoke-human-1.l1.t1.a1") + 1, -1);
+  expect(effects.findIndex(call => call.key.endsWith(".gate"))).toBeLessThan(effects.findIndex(call => call.agent === "pitako.checkpoint-sealer"));
   const baseline = host.calls.find(call => call.key === "invoke-human-1.l1.t1.a1.baseline")!;
   expect(JSON.parse(baseline.task).operation).toBe("baseline");
   expect(host.calls.filter(call => call.agent === "pitako.checkpoint-sealer").map(call => call.key))

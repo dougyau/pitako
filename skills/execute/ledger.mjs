@@ -58,6 +58,11 @@ export function summarizeLoops(records) {
   });
 }
 
+/** Chain/record failures need human reconciliation; retrying cannot repair them. */
+export function isLedgerIntegrityError(error) {
+  return error?.code === "ENOENT" || /Ledger (?:publication conflict|head mismatch|spec (?:digest|origin) mismatch|has a gap|path traverses)|Invalid ledger record or chain link|Noncanonical ledger record/.test(error?.message ?? "");
+}
+
 /** Bodies are explicit persisted projections owned by the workflow, never live runtime objects. */
 export function appendLedger(root, invocation, request) {
   if (!(keys(request, "expected,record,spec") || keys(request, "expected,record")) || !keys(request.record, "body,kind,loop") ||
@@ -89,7 +94,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
     process.stdout.write(JSON.stringify({ ...anchor, ...(append.record.kind === "loop"
       ? { summaries: loopSummaries(process.cwd(), invocation, anchor) } : {}) }) + "\n");
   } catch (error) {
-    if (error.code === "ENOENT" || /Ledger (?:publication conflict|head mismatch|spec (?:digest|origin) mismatch|has a gap|path traverses)|Invalid ledger record or chain link|Noncanonical ledger record/.test(error.message))
+    if (isLedgerIntegrityError(error))
       process.stdout.write(JSON.stringify({ error: "ledger-integrity", reason: error.message }) + "\n");
     process.stderr.write("Execution ledger publication failed; inspect the retained request and ledger before retrying.\n");
     process.exitCode = 1;

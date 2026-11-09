@@ -29,26 +29,23 @@ function relaunchStatus(host: ControllerHost) {
       : { ok: true, output: "", results: [] };
   });
 }
-// Exhaust the run fan-out budget on the first matching spawn after the worker
-// settles: request observation, gate execution or checkpoint sealing.
-function exhaustAfterWorker(host: ControllerHost, agent: string, shape?: (result: Result) => Result) {
-  let settled = false, denied: string | undefined;
-  host.setRespond((request, normal) => {
-    if (settled && !denied && request.agent === agent) { denied = request.key; return receipt(request.key); }
-    if (request.key !== worker) return normal();
-    settled = true;
-    return shape ? shape(normal()) : normal();
+// Requests, gates and sealing share one native close admission.
+function exhaustAfterWorker(host: ControllerHost, shape?: (result: Result) => Result) {
+  let denied: string | undefined;
+  host.setRespond((request, normal) => request.key === worker && shape ? shape(normal()) : normal());
+  host.setLaunchRespond((request, normal) => {
+    if (!denied && request.key === `${worker}.close`) { denied = request.key; return receipt(request.key); }
+    return normal();
   });
   return () => denied;
 }
 
-test.each(["pitako.request-observer", "pitako.loop-io", "pitako.checkpoint-sealer"])(
-  "a complete worker result received before %s budget exhaustion is sealed and admitted on relaunch, not restored", async agent => {
+test("a complete worker result received before grouped close budget exhaustion is sealed and admitted on relaunch, not restored", async () => {
   const host = fixture(undefined, { taskCount: 1 });
-  const denied = exhaustAfterWorker(host, agent);
+  const denied = exhaustAfterWorker(host);
   const first = await host.execute();
   expect(first.status, first.reason).toBe("budget-exhausted");
-  expect(denied()).toBe(agent === "pitako.checkpoint-sealer" ? `${worker}.seal` : agent === "pitako.loop-io" ? `${worker}.gate` : "invoke-human-1.l1.requests-2");
+  expect(denied()).toBe(`${worker}.close`);
   expect(host.current().loop.attempt).toMatchObject({ key: worker, stage: "launched" });
   expect(checkpoint(host, worker, "manifest.json")).toBe(true);
   expect(checkpoint(host, worker, "unit.json")).toBe(false);
@@ -59,10 +56,11 @@ test.each(["pitako.request-observer", "pitako.loop-io", "pitako.checkpoint-seale
   expect(resumed.status, resumed.reason).toBe("complete");
   expect(host.calls.some(call => call.key === "invoke-human-1.l1.t1.a2")).toBe(false);
   expect(host.calls.filter(call => call.key === worker)).toHaveLength(1);
-  expect(host.calls.filter(call => call.key === `${worker}.seal`)).toHaveLength(agent === "pitako.checkpoint-sealer" ? 2 : 1);
+  expect(host.calls.filter(call => call.key === `${worker}.seal`)).toHaveLength(1);
+  expect(host.launches.filter(call => call.key === `${worker}.close`)).toHaveLength(2);
   expect(checkpoint(host, worker, "unit.json")).toBe(true);
   expect(checkpoint(host, worker, "restore.json")).toBe(false);
-  expect(host.calls.filter(call => call.key === `${worker}.gate`)).toHaveLength(agent === "pitako.loop-io" ? 2 : 1);
+  expect(host.calls.filter(call => call.key === `${worker}.gate`)).toHaveLength(1);
   expect(host.records().find((record: any) => record.kind === "unit").body.result).toMatchObject({ attempt: 1, status: "complete" });
   // The retained copy is admission input only; admission consumes it.
   expect(JSON.stringify(host.current())).not.toContain('"received"');
@@ -70,7 +68,7 @@ test.each(["pitako.request-observer", "pitako.loop-io", "pitako.checkpoint-seale
 
 test("a pause result received before budget exhaustion continues from its seal on relaunch, not a rollback", async () => {
   const host = fixture(undefined, { taskCount: 1 });
-  exhaustAfterWorker(host, "pitako.request-observer", result => {
+  exhaustAfterWorker(host, result => {
     const value = copy(result);
     Object.assign(value.structuredOutput, { status: "continue", remaining: ["Finish src/change1.ts"],
       knowledge: { findings: [], handoff: "src/change1.ts contains the first half." } });
@@ -92,7 +90,7 @@ test("a pause result received before budget exhaustion continues from its seal o
 
 test("without a retained worker result, relaunch keeps the checkpoint-first fallback", async () => {
   const host = fixture(undefined, { taskCount: 1 });
-  exhaustAfterWorker(host, "pitako.request-observer");
+  exhaustAfterWorker(host);
   expect((await host.execute()).status).toBe("budget-exhausted");
   // State written before retention existed has only the launch reference.
   const retained = host.current();

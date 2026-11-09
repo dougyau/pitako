@@ -335,7 +335,10 @@ describe("workflow-owned execute controller", () => {
       if (observation.endsWith("-cut")) {
         expect(output.status).not.toBe("complete");
         expect(output.reason).toContain("Essential persistence failed");
-        expect(host.calls.filter(call => call.agent !== "pitako.execution-ledger")).toHaveLength(count);
+        const nextAdvance = /^invoke-human-1\.l1\.nextAdvance\.(prepare|requests)$/;
+        expect(host.calls.filter(call => call.agent !== "pitako.execution-ledger" &&
+          !(cut === "next-slot-cut" && nextAdvance.test(call.key)))).toHaveLength(count);
+        if (cut === "next-slot-cut") expect(host.history()[0].resolutions.at(-1).stage).toBe("applied");
         host.setFailSave();
         output = await host.execute();
       }
@@ -349,7 +352,8 @@ describe("workflow-owned execute controller", () => {
       if (canContinue) expect(output.status, JSON.stringify({ reason: output.reason, statuses: host.statusCalls, halt: host.history()[0].halt })).toBe("complete");
       else expect(output.status).not.toBe("complete");
       expect(host.statusCalls).toContain(retained.ref.runId ?? retained.ref.key);
-      expect(host.calls.slice(count).every(call => canContinue && (/^invoke-human-1\.l[23]\./.test(call.key) || call.key === "invoke-human-1.l1.gaps"))).toBe(true);
+      expect(host.calls.slice(count).every(call => canContinue && (/^invoke-human-1\.l[23]\./.test(call.key) ||
+        /^invoke-human-1\.l1\.nextAdvance\.(prepare|requests)$/.test(call.key) || call.key === "invoke-human-1.l1.gaps"))).toBe(true);
       expect(host.history()).toHaveLength(canContinue ? 3 : 1);
       // Its incomplete checks never attest the discharged loop.
       const recoveries = canContinue

@@ -105,21 +105,21 @@ describe("workflow-owned execute controller", () => {
     "v6 seal automatically reconciles transient %s without a halt or discarded pending data", async failure => {
       const host = fixture(); host.setLimit(1);
       let injected = false;
-      host.setRespond((request, normal) => {
-        if (request.agent !== "pitako.execution-ledger" || injected) return normal();
+      host.setLaunchRespond(async (request, normal) => {
+        if (request.agent !== "pitako.loop-io" || JSON.parse(request.task).operation !== "drain" || injected) return normal();
         if (failure === "state-save") return normal();
         injected = true;
-        expect(host.current().sealPending).not.toBeNull();
-        expect(host.current().taskFrame).not.toBeNull();
-        expect(host.current().loop.cursor).toBe(0);
-        if (failure === "published-crash") { normal(); throw Error("Archiver disappeared after link"); }
+        expect(host.current().intentions.map((entry: any) => entry.operation)).toEqual(["ledger", "apply", "ledger"]);
+        expect(host.current().ledger.count).toBe(0);
+        expect(host.current().loop.cursor).toBe(1);
+        if (failure === "published-crash") { await normal(); throw Error("Archiver disappeared after link"); }
         if (failure === "spawn") throw Error("Transient spawn failure");
-        const result = normal();
+        const result = await normal();
         return failure === "stdout" ? { ...result, output: "{" } :
           { ...result, ok: false, results: result.results?.map(entry => ({ ...entry, exitCode: 1 })), output: "" };
       });
       if (failure === "state-save") host.setFailSave(value => {
-        if (injected || value.sealPending || value.ledger?.count !== 2) return false;
+        if (injected || value.intentions?.length || value.ledger?.count !== 3) return false;
         injected = true;
         return true;
       });
@@ -129,7 +129,10 @@ describe("workflow-owned execute controller", () => {
       expect(host.current()).toMatchObject({ version: 6, consumedLoops: 1, sealPending: null, taskFrame: null,
         ledger: { count: 3 }, loop: { cursor: 1 } });
       expect(host.calls.filter(call => call.agent === "pitako.execution-ledger").map(call => call.key))
-        .toEqual(["invoke-human-1.l1.seal1", "invoke-human-1.l1.seal1.r1", "invoke-human-1.l1.gaps"]);
+        .toEqual(["invoke-human-1.l1.seal1", "invoke-human-1.l1.gaps"]);
+      expect(host.launches.filter(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "drain").map(call => call.key))
+        .toEqual(failure === "state-save" ? ["invoke-human-1.l1.finishDrain"] :
+          ["invoke-human-1.l1.finishDrain", "invoke-human-1.l1.finishDrain.r1"]);
       expect(host.emits.some(item => item.type === "execution-progress" && ["blocked", "cancelled"].includes(item.status))).toBe(false);
       expect(host.records().map((record: any) => record.kind)).toEqual(["spec", "unit", "loop"]);
       expect(host.current()).not.toHaveProperty("snapshot");
@@ -138,48 +141,51 @@ describe("workflow-owned execute controller", () => {
 
   test("v6 exhausted publication retries preserve all pending data and reentry publishes the same record", async () => {
     const host = fixture(); host.setLimit(1);
-    host.setRespond((request, normal) => {
-      if (request.agent === "pitako.execution-ledger") throw Error("Filesystem temporarily unavailable");
+    host.setLaunchRespond((request, normal) => {
+      if (request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "drain") throw Error("Filesystem temporarily unavailable");
       return normal();
     });
     const outcome = await host.execute();
     expect(outcome.status).toBe("partial");
-    expect(outcome.reason).toContain("three publication attempts failed");
-    expect(outcome.reason).toContain("operator repair");
-    const pending = copy(host.current().sealPending), frame = copy(host.current().taskFrame);
-    expect(host.current()).toMatchObject({ ledger: { count: 0, head: null }, loop: { cursor: 0 } });
-    expect(frame).not.toBeNull();
+    expect(outcome.reason).toContain("Filesystem temporarily unavailable");
+    const pending = copy(host.current().intentions);
+    expect(host.current()).toMatchObject({ ledger: { count: 0, head: null }, loop: { cursor: 1 } });
+    expect(pending.map((entry: any) => entry.operation)).toEqual(["ledger", "apply", "ledger"]);
     expect(host.current().loop.results).toHaveLength(1);
-    expect(host.calls.filter(call => call.agent === "pitako.execution-ledger")).toHaveLength(3);
-    host.setRespond();
+    expect(host.launches.filter(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "drain")).toHaveLength(3);
+    host.setLaunchRespond();
     expect((await host.execute()).status).toBe("partial");
-    expect(host.records()[1].body).toEqual(pending.record.body);
+    expect(host.records()[1].body).toEqual(pending[0].input.record.body);
     expect(host.calls.filter(call => call.agent === "pitako.execution-ledger" && call.key.includes(".seal")).at(-1)?.key)
-      .toBe("invoke-human-1.l1.seal1.r3");
+      .toBe("invoke-human-1.l1.seal1");
+    expect(host.records().map((record: any) => record.kind)).toEqual(["spec", "unit", "loop"]);
   });
 
   test.each(["integrity", "stopped", "capacity"])("v6 seal preserves native or human-only %s barriers without retry", async cause => {
     const host = fixture(); host.setLimit(1);
-    host.setRespond((request, normal) => request.agent !== "pitako.execution-ledger" ? normal() : ({
-      key: request.key, agent: request.agent, ok: false,
-      output: cause === "integrity" ? JSON.stringify({ error: "ledger-integrity", reason: "Ledger head mismatch." }) : "",
+    host.setLaunchRespond((request, normal) => request.agent !== "pitako.loop-io" || JSON.parse(request.task).operation !== "drain" ? normal() : ({
+      key: request.key, agent: request.agent, runId: `native-${request.key}`, ok: false,
+      // The exact loop-io CLI failure line for a real hash-ledger head mismatch.
+      output: cause === "integrity" ? JSON.stringify({ error: "loop-io", reason: "Ledger head mismatch.", selectionRejected: false,
+        replayRejected: false, viewOverflow: false, ledgerIntegrity: true }) : "",
       ...(cause === "stopped" ? { stopped: true } : {}),
-      ...(cause === "capacity" ? { nativeFailure: { code: "capacity", reason: "Native spawn budget exhausted" } } : {}),
+      ...(cause === "capacity" ? { error: "Active async run capacity exhausted: 1/1 used." } : {}),
     }));
     const outcome = await host.execute();
     expect(outcome.status).not.toBe("complete");
-    expect(outcome.reason).toContain(cause === "integrity" ? "human reconciliation" : cause === "stopped" ? "cancelled" : "spawn budget exhausted");
-    expect(host.calls.filter(call => call.agent === "pitako.execution-ledger")).toHaveLength(1);
-    expect(host.current()).toMatchObject({ ledger: { count: 0 }, loop: { cursor: 0 } });
-    expect(host.current().sealPending).not.toBeNull();
-    expect(host.current().taskFrame).not.toBeNull();
+    expect(outcome.reason).toContain(cause === "integrity" ? "Ledger integrity requires human reconciliation: Ledger head mismatch."
+      : cause === "stopped" ? "stopped" : "capacity exhausted");
+    expect(host.launches.filter(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "drain")).toHaveLength(1);
+    expect(host.current()).toMatchObject({ ledger: { count: 0 }, loop: { cursor: 1 } });
+    expect(host.current().intentions.map((entry: any) => entry.operation)).toEqual(["ledger", "apply", "ledger"]);
   });
 
-  test.each(["unit", "pause"] as const)("v6 stale %s seal Stop requires fresh human input before any archiver dispatch", async kind => {
+  test.each(["unit", "pause"].flatMap(kind => ["none", "resolution-cut"].map(cut => [kind, cut])))(
+    "v6 stale %s seal Stop requires fresh human input before any archiver dispatch (%s)", async (kind, cut) => {
     const host = fixture(); host.setLimit(1);
+    host.setLaunchRespond((request, normal) => request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "drain"
+      ? { key: request.key, runId: `native-${request.key}`, agent: request.agent, ok: false, stopped: true, output: "" } : normal());
     host.setRespond((request, normal) => {
-      if (request.agent === "pitako.execution-ledger")
-        return { key: request.key, runId: `native-${request.key}`, agent: request.agent, ok: false, stopped: true, output: "" };
       if (kind === "pause" && request.key.endsWith(".t1.a1")) return host.result(request, {
         ...host.worker(request, "pause"), status: "blocked", remaining: ["Finish saved task"], diagnosis: "Saved partial work",
       });
@@ -187,7 +193,8 @@ describe("workflow-owned execute controller", () => {
     });
     expect((await host.execute()).status).toBe("cancelled");
     const retained = copy(host.current()), count = host.calls.length;
-    expect(retained.loop.halt.ref).toMatchObject({ agent: "pitako.execution-ledger", key: "invoke-human-1.l1.seal1" });
+    expect(retained.loop.halt.ref).toMatchObject({ agent: "pitako.loop-io", key: "invoke-human-1.l1.finishDrain" });
+    host.setLaunchRespond();
     host.setRespond((request, normal) => {
       if (kind !== "pause" || !request.key.endsWith(".t1.a2")) return normal();
       const restore = host.current().loop.attempt.restore;
@@ -198,27 +205,39 @@ describe("workflow-owned execute controller", () => {
     expect((await host.execute()).status).toBe("cancelled");
     expect(host.calls).toHaveLength(count);
     expect(host.current()).toEqual(retained);
-    const resumed = await host.execute({ unblock: true, resolution: { loop: 1, text: "Continue after the actual archiver Stop" } });
+    const input = { unblock: true, resolution: { loop: 1, text: "Continue after the actual archiver Stop" } };
+    if (cut === "resolution-cut") {
+      const set = host.state.set;
+      host.state.set = async (key, value: any) => {
+        await set(key, value);
+        if (value.loop?.resolutions?.at(-1)?.observations?.length && !value.loop.halt)
+          throw Error("Cut after durable grouped drain resolution");
+      };
+      expect((await host.execute(input)).reason).toContain("Essential persistence failed");
+      host.state.set = set;
+    }
+    const resumed = await host.execute(cut === "none" ? input : {});
     expect(resumed.status, resumed.reason).toBe("partial");
+    expect(host.records().map((record: any) => record.kind), resumed.reason).toEqual(kind === "unit" ? ["spec", "unit", "loop"] : ["spec", "unit", "unit", "loop"]);
     expect(host.calls.slice(count).filter(call => call.agent === "pitako.execution-ledger").map(call => call.key))
-      .toEqual(kind === "unit" ? ["invoke-human-1.l1.seal1.r1", "invoke-human-1.l1.gaps"] :
-        ["invoke-human-1.l1.seal1.r1", "invoke-human-1.l1.seal2", "invoke-human-1.l1.gaps"]);
-    expect(host.records()[1].body).toEqual(retained.sealPending.record.body);
+      .toEqual(kind === "unit" ? ["invoke-human-1.l1.seal1", "invoke-human-1.l1.gaps"] :
+        ["invoke-human-1.l1.seal1", "invoke-human-1.l1.seal2", "invoke-human-1.l1.gaps"]);
+    expect(host.records()[1].body).toEqual(retained.intentions[0].input.record.body);
   });
 
   test("v6 a post-publication persistence cut resumes identical bytes before moving the cursor", async () => {
     const host = fixture(); host.setLimit(1);
-    host.setFailSave(value => value.ledger?.count === 2 && !value.sealPending);
+    host.setFailSave(value => value.ledger?.count === 3 && !value.intentions?.length);
     const outcome = await host.execute();
     expect(outcome.status).toBe("partial");
     const file = path.join(host.root, ".pi/subagents/execute/human-1/000001.json");
     const bytes = readFileSync(file);
-    const pending = copy(host.current().sealPending);
-    expect(host.current().loop.cursor).toBe(0);
+    const pending = copy(host.current().intentions);
+    expect(host.current().loop.cursor).toBe(1);
     host.setFailSave();
     expect((await host.execute()).status).toBe("partial");
     expect(readFileSync(file)).toEqual(bytes);
-    expect(host.records()[1].body).toEqual(pending.record.body);
+    expect(host.records()[1].body).toEqual(pending[0].input.record.body);
     expect(host.calls.filter(call => call.key.endsWith(".t1.a1"))).toHaveLength(1);
   });
 
@@ -904,7 +923,8 @@ describe("workflow-owned execute controller", () => {
       expect(host.current().tasks.change3.completed.status).toBe("complete");
       expect(readBacklog(host.root, "spec").backlog?.tasks.find(task => task.id === "change4")?.status).toBe("pending");
       expect(host.calls.slice(prior).every(call => call.agent === "pitako.execution-inspector" ||
-        call.key.startsWith("invoke-human-1.l4.") || call.key === "invoke-human-1.l3.gaps")).toBe(true);
+        call.key.startsWith("invoke-human-1.l4.") || call.key === "invoke-human-1.l3.gaps" ||
+        call.key.startsWith("invoke-human-1.l3.nextAdvance."))).toBe(true);
       expect(host.calls.filter(call => call.key.endsWith(".director"))).toHaveLength(4);
       expect(host.calls.filter(call => call.key === target)).toHaveLength(1);
       expect(host.calls.find(call => call.key === "invoke-human-1.l4.director")?.task).toContain(input.resolution.text);
@@ -1018,7 +1038,8 @@ describe("workflow-owned execute controller", () => {
       } else {
         expect(host.history()).toHaveLength(2);
         expect(host.history()[0].resolutions[0]).toMatchObject({ stage: "applied", halt: original.loop.halt });
-        expect(host.calls.slice(count).every(call => call.agent === "pitako.execution-inspector" || call.key === "invoke-human-1.l1.gaps" || call.key.startsWith("invoke-human-1.l2."))).toBe(true);
+        expect(host.calls.slice(count).every(call => call.agent === "pitako.execution-inspector" || call.key === "invoke-human-1.l1.gaps" ||
+          call.key.startsWith("invoke-human-1.l1.nextAdvance.") || call.key.startsWith("invoke-human-1.l2."))).toBe(true);
         const after = host.calls.length;
         await host.executeNative();
         expect(host.calls).toHaveLength(after);
@@ -1172,7 +1193,7 @@ describe("workflow-owned execute controller", () => {
     expect(await host.execute()).toMatchObject({ status: "partial", loopsConsumed: 1 });
     expect(host.history()[0]).toMatchObject({ outcome: "gaps", plan: { stage: "rejected" } });
     expect(await host.execute()).toMatchObject({ status: "partial", loopsConsumed: 1 });
-    expect(host.calls.filter(call => call.agent !== "pitako.loop-io").map(call => call.key)).toEqual(["invoke-human-1.l1.director", "invoke-human-1.l1.director.d1", "invoke-human-1.l1.gaps"]);
+    expect(host.calls.filter(call => call.agent !== "pitako.loop-io").map(call => call.key)).toEqual(["invoke-human-1.l1.advance.requests", "invoke-human-1.l1.director", "invoke-human-1.l1.director.d1", "invoke-human-1.l1.gaps"]);
     expect(host.records().map((record: any) => record.kind)).toEqual(["spec", "loop"]);
   });
 
@@ -1246,7 +1267,7 @@ describe("workflow-owned execute controller", () => {
     expect(host.history()).toHaveLength(2);
     expect(host.history()[0]).toMatchObject({ outcome: "gaps", plan: { stage: "rejected" } });
     expect(host.history()[1].plan.stage).not.toBe("rejected");
-    expect(host.calls.filter(call => call.agent !== "pitako.loop-io").map(call => call.key)).toEqual(["invoke-human-1.l1.director", "invoke-human-1.l1.director.d1", "invoke-human-1.l1.gaps", "invoke-human-1.l2.director"]);
+    expect(host.calls.filter(call => call.agent !== "pitako.loop-io").map(call => call.key)).toEqual(["invoke-human-1.l1.advance.requests", "invoke-human-1.l1.director", "invoke-human-1.l1.director.d1", "invoke-human-1.l1.gaps", "invoke-human-1.l1.nextAdvance.requests", "invoke-human-1.l2.director"]);
     expect(host.calls.some(call => call.agent === "pitako.worker")).toBe(false);
   });
 
@@ -2187,14 +2208,14 @@ describe("workflow-owned execute controller", () => {
     expect(host.calls.filter(call => call.key.endsWith(".compliance")).map(call => call.key)).toEqual(["invoke-human-1.l3.compliance"]);
     const synthesis = host.calls.findIndex(call => call.key === "invoke-human-1.l1.review.director-synthesis");
     expect(host.calls[synthesis + 1]!.agent).toBe("pitako.loop-io");
-    expect(host.calls[synthesis + 1]!.task).toContain("final-phase");
-    expect(host.calls[synthesis + 2]!.key).toBe("invoke-human-1.l1.reviewOriginals");
-    expect(host.calls[synthesis + 3]!.key).toBe("invoke-human-1.l1.checkout");
-    expect(host.calls[synthesis + 4]!.key).toBe("invoke-human-1.l2.prepare");
-    expect(host.calls[synthesis + 5]!.key).toBe("invoke-human-1.l2.demandOriginals");
-    expect(host.calls[synthesis + 6]!.key).toBe("invoke-human-1.l2.demand-observation");
-    expect(host.calls[synthesis + 7]!.key).toBe("invoke-human-1.l2.director");
-    expect(host.calls.slice(synthesis + 1, synthesis + 8).some(call => call.agent === "pitako.worker")).toBe(false);
+    expect(host.calls[synthesis + 1]!.key).toBe("invoke-human-1.l1.reviewOriginals");
+    const nextDirector = host.calls.findIndex(call => call.key === "invoke-human-1.l2.director");
+    const beforeDirector = host.calls.slice(synthesis + 1, nextDirector);
+    expect(beforeDirector.map(call => call.key)).toEqual(["invoke-human-1.l1.reviewOriginals",
+      "invoke-human-1.l1.final-gaps", "invoke-human-1.l1.checkout", "invoke-human-1.l2.advance.prepare", "invoke-human-1.l2.advance.requests",
+      "invoke-human-1.l2.demandOriginals", "invoke-human-1.l2.demand-observation"]);
+    expect(beforeDirector.find(call => call.key.endsWith(".final-gaps"))!.task).toContain("final-phase");
+    expect(beforeDirector.some(call => call.agent === "pitako.worker")).toBe(false);
     const report = host.emits.find(value => value.type === "execution-loop" && value.loop === 1);
     expect(report.next).toBe("continue loop 2"); expect(report.verification.compliance.status).toBe("not-run");
   });
@@ -3337,7 +3358,8 @@ describe("compact admission", () => {
   test("persists only the spec digest and frozen budget before director", async () => {
     const content = "Unicode 中😀 \n \"; globalThis.untrusted = true; //";
     const host = fixture(content); host.setLimit(10);
-    host.setRespond((request) => {
+    host.setRespond((request, normal) => {
+      if (request.agent !== "pitako.execution-director") return normal();
       expect(host.current().association.digest).toBe(digest(content));
       expect(host.current().association.maxCycles).toBe(10);
       expect(host.hostCalls).toEqual(["inspect-initial"]);
@@ -3347,7 +3369,7 @@ describe("compact admission", () => {
     await host.execute();
     expect(host.current().snapshot).toBeUndefined(); expect(host.current().association.digest).toBe(digest(content));
     expect(JSON.stringify(Object.fromEntries(host.storage)).split(content).length).toBeLessThanOrEqual(2);
-    expect(host.calls).toHaveLength(1);
+    expect(host.launches.map(call => call.agent)).toEqual(["pitako.loop-io", "pitako.execution-director"]);
   });
   test("later settings cannot replace the admitted budget and base changes preserve original bytes", async () => {
     const host = fixture("ORIGINAL FULL SNAPSHOT");

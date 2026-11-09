@@ -91,6 +91,8 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
         const cooperativePause = input.mode.startsWith("pause-status-");
         const lossReentry = input.mode.endsWith("loss-reentry");
         const restorationAdmissions: any[] = [], archives: any[] = [];
+        const archivedKeys = new Set<string>();
+        const sealedPaths = new Set<string>();
         let secondPause: any;
         const unitMode = input.mode.startsWith("unit-before-capture");
         const stateCut = (value: any) => {
@@ -142,6 +144,27 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
           },
           launch: async (key: string, request: any) => {
             calls.push(key);
+            if (request.agent === "pitako.loop-io") {
+              const grouped = JSON.parse(request.task);
+              input.metadata.groupedHooks = {
+                afterEffect: async (step: string) => {
+                  if (grouped.operation === "close" && step === `${grouped.key}.seal`) {
+                    const kind = grouped.gate.workerStatus === "complete" ? "unit" : "pause";
+                    const seal = { ...grouped.seal[kind], kind };
+                    await options.launch(`${seal.intent.key}.seal`, { agent: "pitako.checkpoint-sealer", task: JSON.stringify(seal) });
+                  }
+                },
+                afterStep: (step: string) => {
+                  if (grouped.operation === "close" && step === `${grouped.key}.gate` &&
+                      grouped.gate.checkpoint.taskId === "second" && input.mode === "refused")
+                    throw Error(sealError = "Native control refuses checkpoint capture");
+                  const intention = grouped.intentions?.find((entry: any) => entry.key === step && entry.operation === "ledger");
+                  if (intention && !archivedKeys.has(step)) {
+                    archivedKeys.add(step); archives.push(structuredClone(intention.input.record));
+                  }
+                },
+              };
+            }
             if (request.agent === "pitako.execution-ledger") archives.push(JSON.parse(request.task).record);
             const pending = storage.get("invoke-human-1")?.loop;
             if (request.agent === "pitako.checkpoint-sealer") {
@@ -161,7 +184,10 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
                 const receipt = { kind: observed.kind, checkpointRef: observed.checkpointRef, digest: observed.digest,
                   candidate: observed.candidate, position: observed.position, progress: seal.intent.progress };
                 const before = JSON.parse(JSON.parse(io.readFileSync(observed.checkpointRef.replace(/(unit|pause)\.json$/, "manifest.json"), "utf8")).data);
-                points.push({ receipt, before, point: JSON.parse(JSON.parse(io.readFileSync(receipt.checkpointRef, "utf8")).data) });
+                if (!sealedPaths.has(receipt.checkpointRef)) {
+                  sealedPaths.add(receipt.checkpointRef);
+                  points.push({ receipt, before, point: JSON.parse(JSON.parse(io.readFileSync(receipt.checkpointRef, "utf8")).data) });
+                }
                 if (["complete", "pause"].includes(input.mode)) {
                   const replay = cli ? JSON.parse(io.execFileSync("node", [input.sealer, "--seal-stdin"], { cwd: input.root, input: request.task, encoding: "utf8" })) : io.sealCheckpointRequest(seal);
                   if (JSON.stringify(replay) !== JSON.stringify(observed)) throw Error("Non-idempotent root seal replay");
@@ -180,7 +206,14 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
             // no extra effects occur after its failed/unsealed second unit.
             if (!unitMode && !pauseMode && input.mode !== "abrupt-continue" && request.task?.includes("CHECKPOINT FALLBACK (same pending task"))
               return { key, ok: false, output: "", artifactPaths: [], error: "Blocked by pi-subagents permission rule: restoration denied in lifecycle fixture" };
-            const result = await response(key, request, input.metadata, candidate());
+            // Grouped operations observe their own checkout; do not duplicate it for every launch.
+            const needsCandidate = key.endsWith(".compliance") || request.agent === "pitako.checkout-observer" ||
+              request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "gate";
+            const result = await response(key, request, input.metadata, needsCandidate ? candidate() : undefined);
+            if (request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "close" && !result.ok) {
+              const failure = JSON.parse(result.output);
+              if (input.mode === "corrupt") sealError = failure.reason;
+            }
             if (key.endsWith(".director")) {
               const selection = result.structuredOutput;
               if (selection.changes.some((change: any) => change.kind === "add")) {
@@ -188,6 +221,10 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
                 first.id = "first";
                 const second = structuredClone(first);
                 second.id = "second"; second.dependsOn = ["first"];
+                if (input.mode === "pause-status-continue") second.metric = {
+                  command: `node -e "const value=require('node:fs').readFileSync('owned','utf8'); console.log(value==='completed pending work from pause'?0:value==='journaled pending WIP'?1:2)"`,
+                  unit: "remaining owned-file states", target: 0,
+                };
                 selection.select = "first";
                 selection.changes.push({ kind: "add", task: second, reason: "Preserve the next pending unit" });
               }
@@ -700,7 +737,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
           expect(actual.sealError).not.toBe(""); expect(actual.points).toHaveLength(1);
         }
         if (mode === "incomplete") {
-          expect(loop.halt).toMatchObject({ code: "checkpoint-integrity", ref: { agent: "pitako.checkpoint-sealer" } });
+          expect(loop.halt).toMatchObject({ code: "checkpoint-integrity", ref: { agent: "pitako.loop-io" } });
           expect(loop.halt.reason).toContain("last step partially applied: true");
           expect(loop.results.some((entry: any) => entry.taskId === "second")).toBe(false);
           expect(actual.points).toHaveLength(1);

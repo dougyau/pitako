@@ -77,7 +77,9 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
     const { head, fingerprint } = checkoutEvidence(root); return { head, fingerprint };
   };
   let checkout = observedCandidate(), clock = 1000;
-  const calls: Request[] = [], hostCalls: string[] = [], statusCalls: string[] = [], emits: any[] = [];
+  // calls observes logical operation boundaries for fault injection; launches is
+  // the actual native dispatch inventory, including grouped launches only once.
+  const calls: Request[] = [], launches: Request[] = [], hostCalls: string[] = [], statusCalls: string[] = [], emits: any[] = [];
   const storage = new Map<string, any>(), native = new Map<string, Result>();
   const snapshots: any[] = [];
   const published: string[] = [], publishedRecords: any[] = [];
@@ -106,6 +108,7 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
   let failSave: ((value: any) => boolean) | undefined;
   let status: (ref: string) => Result | Promise<Result> = ref => copy(native.get(ref) ?? { ok: true, output: "", results: [] });
   let responder: ((request: Request, normal: () => Result) => Result | Promise<Result>) | undefined;
+  let launchResponder: ((request: Request, normal: () => Promise<Result>) => Result | Promise<Result>) | undefined;
   let hostResponse: ((key: string, value: any) => any) | undefined;
   let observationResponse: ((key: string, value: any) => any) | undefined;
   let admission: ((calls: { key: string }[]) => void) | undefined;
@@ -338,6 +341,125 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
       saveObserver?.(value, bytes, serialized);
     },
   };
+  const groupSteps = new Map<string, any>();
+  function transport(key: string, value: any) {
+    const file = path.join(root, ".pi/subagents/execute", value.invocation, "loop-io/receipts", digest(key), "000000.json");
+    const bytes = canonicalViewJSON({ seq: 0, result: value, resultDigest: canonicalDigest(value) });
+    mkdirSync(path.dirname(file), { recursive: true }); writeFileSync(file, bytes);
+    const projection = copy(value);
+    for (const step of projection.steps) {
+      if (step.operation === "apply" && (projection.operation !== "selection" || step.result.selected !== null))
+        delete step.result.completedTasks;
+      if (step.operation === "gate") for (const gate of step.result.receipt.gates) gate.tail = "";
+      if (projection.operation === "close" && step.operation === "requests" &&
+          projection.steps.some((step: any) => step.operation === "nextRequests")) {
+        const { requests, ...page } = step.result;
+        step.result = { ...page, count: requests.length };
+      }
+    }
+    return { path: file, digest: digest(bytes), projection };
+  }
+  async function operation(request: Request) {
+    calls.push(copy(request));
+    const response = responder ? await responder(request, () => normal(request)) : normal(request);
+    if (response.runId) native.set(response.runId, copy(response)); native.set(request.key, copy(response));
+    return response;
+  }
+  async function compound(request: Request): Promise<Result> {
+    const input = JSON.parse(request.task), key = request.key.replace(/\.r\d+$/, "");
+    const steps: any[] = [];
+    async function step(name: string, call: Request) {
+      const id = `${key}.${name}`;
+      let result = groupSteps.get(id);
+      if (!result) {
+        const response = await operation(call);
+        if (!response.ok || response.results?.[0]?.exitCode !== 0) throw response;
+        result = JSON.parse(response.output!);
+        groupSteps.set(id, result);
+      }
+      steps.push({ key: id, operation: name, result });
+      return result;
+    }
+    const io = (key: string, input: any): Request => ({ ...request, key, task: JSON.stringify(input) });
+    try {
+      const drained: any[] = [], results = new Map<string, any>();
+      for (const intention of input.intentions) {
+        const { expectedFrom, expectedDigestFrom, ...data } = intention.input;
+        if (expectedFrom) { const anchor = results.get(expectedFrom); data.expected = { count: anchor.count, head: anchor.head }; }
+        if (expectedDigestFrom) data.expectedDigest = results.get(expectedDigestFrom).digest;
+        let value = groupSteps.get(intention.key);
+        if (!value) {
+          const call = intention.operation === "ledger"
+            ? { ...request, key: intention.key, agent: "pitako.execution-ledger", task: JSON.stringify({ invocation: config.invocation, ...data }) }
+            : io(intention.key, data);
+          const response = await operation(call);
+          if (!response.ok) throw response;
+          value = JSON.parse(response.output!); groupSteps.set(intention.key, value);
+        }
+        results.set(intention.key, value);
+        drained.push({ key: intention.key, operation: intention.operation, result: value });
+      }
+      const drain = transport(`${key}.drain`, { invocation: input.invocation, steps: drained });
+      if (input.operation === "drain") return { ...normalExternal(request), output: JSON.stringify(drain) };
+      steps.push({ key: `${key}.drain`, operation: "drain", result: drain });
+      if (input.operation === "advance") await step("prepare", io(`${key}.prepare`, { operation: "prepare", ...input.prepare }));
+      let selected: any;
+      if (input.operation === "selection") selected = await step("apply", io(input.apply.key, { operation: "apply", ...input.apply }));
+      let requests = await step("requests", { ...request, key: `${key}.requests`, agent: "pitako.request-observer",
+        task: JSON.stringify({ invocation: input.invocation, cursor: 0 }) } as Request);
+      async function baseline(name: string, intent: any, eligible: boolean, details: any = {}) {
+        const cancelled = requests.requests.some((entry: any) => entry.taskId === intent.taskId);
+        if (eligible && !cancelled && requests.next === null) {
+          const value = await step(name, io(`${intent.key}.baseline`, { operation: "baseline", intent }));
+          Object.assign(steps.at(-1).result, { captured: true, ...details });
+          return value;
+        }
+        steps.push({ key: `${key}.${name}`, operation: name, result: { captured: false, ...details,
+          ...(details.variant !== undefined ? { variant: null } : {}), reason: cancelled ? "cancelled" : "not-eligible" } });
+      }
+      if (input.operation === "selection" && input.baseline) await baseline("baseline", input.baseline, selected.selected?.id === input.baseline.taskId);
+      let contextPeak: any;
+      if (input.operation === "close") {
+        const gate = await step("gate", io(input.gate.key, { operation: "gate", ...input.gate }));
+        contextPeak = gate.contextPeak ?? null;
+        const kind = input.gate.workerStatus === "complete" && !gate.mutated &&
+          gate.gates.length === input.gate.task.gates.length && input.gate.task.gates.every((command: any) =>
+            gate.gates.some((result: any) => result.id === command.id && result.status === "pass")) ? "unit" : "pause";
+        const sealed = await step("seal", { ...request, key: `${input.gate.checkpoint.key}.seal`,
+          agent: "pitako.checkpoint-sealer",
+          task: JSON.stringify({ ...input.seal[kind], kind }) } as Request);
+        steps[steps.length - 2].result = { receipt: gate, contextPeak };
+        steps.at(-1).result = { kind, workerStatus: input.gate.workerStatus, mutated: gate.mutated,
+          after: gate.after, gate: { path: drain.path, digest: drain.digest }, receipt: sealed };
+        if (input.nextBaseline) {
+          const earlier = requests;
+          requests = await step("nextRequests", { ...request, key: `${key}.nextRequests`, agent: "pitako.request-observer",
+            task: JSON.stringify({ invocation: input.invocation, cursor: 0 }) } as Request);
+          if (requests.requests.length < earlier.requests.length ||
+              canonicalDigest(requests.requests.slice(0, earlier.requests.length)) !== canonicalDigest(earlier.requests))
+            throw new Error("loop-io request snapshot integrity conflict");
+          const outcome = sealed.outcome;
+          const variant = kind === "pause" && input.gate.workerStatus !== "blocked" && ["sealed", "observed"].includes(outcome) ? outcome : null;
+          await baseline("nextBaseline", input.nextBaseline[variant ?? "sealed"], variant !== null, { variant, sealOutcome: outcome });
+        }
+      }
+      return { ...normalExternal(request), output: JSON.stringify(transport(key, {
+        invocation: input.invocation, operation: input.operation, steps,
+        ...(input.operation === "close" ? { contextPeak } : {}),
+      })) };
+    } catch (error) {
+      const failed = error as Result;
+      return { ...normalExternal(request), ok: false, ...(failed.stopped ? { stopped: true } : {}),
+        ...(failed.error ? { error: failed.error } : {}), results: [{ exitCode: 1 }],
+        output: failed.output ?? JSON.stringify({ error: "loop-io", reason: String(error) }) } as Result;
+    }
+  }
+  function normalExternal(request: Request): Result {
+    return { ok: true, key: request.key, agent: request.agent, runId: `native-${request.key}`,
+      asyncDir: `/native/async/${request.key}`,
+      externalAdapter: { outputArtifacts: { stdoutPath: `/native/async/${request.key}/stdout.log`, stderrPath: `/native/async/${request.key}/stderr.log` } },
+      results: [{ exitCode: 0 }] } as Result;
+  }
   // Controlled admission boundary mirrors separate inert data and native digest;
   // the registered Node recovery cases independently exercise the real producer.
   function admissionValue(key = "inspect-initial") {
@@ -357,8 +479,10 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
   }
   const runs = {
     all: async (requests: Request[]) => Promise.all(requests.map(async request => {
-      calls.push(copy(request)); clock += 10;
-      const response = responder ? await responder(request, () => normal(request)) : normal(request);
+      launches.push(copy(request)); clock += 10;
+      const grouped = request.agent === "pitako.loop-io" && ["advance", "selection", "close", "drain"].includes(JSON.parse(request.task).operation);
+      const run = () => grouped ? compound(request) : operation(request);
+      const response = launchResponder ? await launchResponder(request, run) : await run();
       if (!options.rawWorkerReceipts && request.agent === "pitako.worker" && response.structuredOutput?.status !== "complete" && response.structuredOutput &&
           response.structuredOutput.checkpointReceipt?.kind !== "pause")
         delete response.structuredOutput.checkpointReceipt;
@@ -385,12 +509,13 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
   };
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
   const controlledDate = { now: () => clock };
-  return { root, observedCandidate, verifications, calls, hostCalls, statusCalls, emits, storage, snapshots, native, plan, worker, result, state,
+  return { root, observedCandidate, verifications, calls, launches, hostCalls, statusCalls, emits, storage, snapshots, native, plan, worker, result, state,
     setSaveObserver: (observer: typeof saveObserver) => { saveObserver = observer; },
     setLimit: (value: number) => { admittedLimit = value; },
     setAdmission: (value?: typeof admission) => { admission = value; },
     optionalCacheFailures: () => optionalCacheFailures,
     setRespond: (value?: typeof responder) => { responder = value; }, setStatus: (value: typeof status) => { status = value; },
+    setLaunchRespond: (value?: typeof launchResponder) => { launchResponder = value; },
     setObservationResponse: (value?: typeof observationResponse) => { observationResponse = value; },
     setHostResponse: (value?: typeof hostResponse) => { hostResponse = value; }, setFailSave: (value?: typeof failSave) => { failSave = value; },
     changeCheckout: (version = 1) => {

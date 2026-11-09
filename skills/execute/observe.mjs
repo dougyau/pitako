@@ -1,13 +1,14 @@
 import "./loader.mjs";
 import { closeSync, constants, fstatSync, openSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { appendLedger, verifyLedger, loopSummaries, readRequest, ledgerPath } from "./ledger.mjs";
 
 const keys = (value, names) => value && typeof value === "object" && !Array.isArray(value) &&
   Object.keys(value).sort().join(",") === names;
 // Requests are deliberately outside the hash-chained ledger: observing them never
 // publishes a loop/unit record or changes its anchor. Pages fit native CLI stdout.
-function observeRequests(input) {
+export function observeRequests(input) {
   if (!keys(input, "cursor,invocation") || !Number.isSafeInteger(input.cursor) || input.cursor < 0)
     throw new Error("Invalid execute request observation input.");
   const file = path.join(ledgerPath(process.cwd(), input.invocation), "requests.jsonl");
@@ -46,7 +47,7 @@ function observeRequests(input) {
   return { version: 1, ok: true, invocation: input.invocation, requests,
     next: cursor < records.length ? cursor : null };
 }
-try {
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) try {
   if (process.argv[2] === "--requests") {
     process.stdout.write(JSON.stringify(observeRequests(readRequest(readFileSync(0, "utf8")))) + "\n");
   } else {

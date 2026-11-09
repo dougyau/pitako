@@ -456,8 +456,9 @@ function emitTodoSnapshot() {
   emit({ ...snapshot, seq: ++todoSeq });
 }
 // Each observation gets a fresh durable key: native child reuse must not cache a file read.
-function observeMainRequests(cursor = 0, records = [], settling = false) {
+function observeMainRequests(cursor = 0, records = [], settling = false, supplied) {
   if (cursor === 0 && loop.cancellationInput) return persistCancellations().then(() => observeMainRequests());
+  if (supplied) return admitRequests(supplied, cursor, records, settling);
   invocation.requestObservation = (invocation.requestObservation ?? 0) + 1;
   const observerKey = `${key}.l${loop.number}.requests-${invocation.requestObservation}`;
   return save().then(() => dispatch([{ key: observerKey, agent: "pitako.request-observer",
@@ -472,7 +473,10 @@ function observeMainRequests(cursor = 0, records = [], settling = false) {
         typeof result.output !== "string" || utf8Bytes(result.output) > 65536 ||
         [result, ...result.results].some(item => item.error || item.outputPartial || item.truncation || item.timedOut || item.processSignal))
       throw new Error("Execute request observation lacks a complete successful result; no worker dispatched.");
-    const page = JSON.parse(result.output);
+    return admitRequests(JSON.parse(result.output), cursor, records, settling);
+  });
+}
+function admitRequests(page, cursor = 0, records = [], settling = false) {
     if (page.version !== 1 || page.ok !== true || page.invocation !== config.invocation ||
         !Array.isArray(page.requests) || page.requests.some(request => request.v !== 1 ||
           request.invocation !== config.invocation || !text(request.requestId) || !text(request.taskId) ||
@@ -492,7 +496,6 @@ function observeMainRequests(cursor = 0, records = [], settling = false) {
     }
     // A settled worker's effective result is admitted before deciding late cancellation.
     return save().then(() => (settling || loop.attempt?.launch && !loop.attempt.result) ? undefined : persistCancellations());
-  });
 }
 function persistCancellations() {
   if (!invocation.pendingCancellations?.length) return Promise.resolve();
@@ -505,7 +508,13 @@ function persistCancellations() {
         director: { select: null, changes: [], reason: "Persist main-session cancellation requests" },
         cancellations: clone(invocation.pendingCancellations) };
       return save();
-    }).then(() => loopIO("cancellation", loop.cancellationInput)).then(value => {
+    }).then(() => {
+      // An admitted drain is replayed from its receipt; re-queueing it would orphan its chained digest.
+      if (loop.cancellation?.stage === "receipt") return;
+      queueApply("cancellation", loop.cancellationInput);
+      return save().then(() => groupedIO(`cancellationDrain${invocation.requestObservation}`, { operation: "drain" }));
+    }).then(() => {
+      const value = loop.cancellation.receipt;
       invocation.backlogDigest = value.digest; invocation.currentView = null;
       invocation.excludedScope = Object.fromEntries(value.cancelledScope.map(task => [task.id, task]));
       for (const task of value.cancelledScope) {
@@ -765,6 +774,33 @@ function reconcileInterruptedOperations() {
   // native permissions, even when a later management view omits that denial.
   if (!same(resolution.halt, loop.halt)) throw nativeBarrier(loop.halt.cause);
   if (loop.halt.cause === "native permission denial") throw nativeBarrier(loop.halt.cause);
+  if (loop.halt.ref?.agent === "pitako.loop-io") {
+    const ref = loop.halt.ref;
+    const pending = [...Object.values(invocation), ...Object.values(loop), ...Object.values(loop.attempt ?? {})]
+      .find(value => value?.dispatched && value.ref?.key === ref.key &&
+        ["advance", "selection", "close", "drain"].includes(value.input?.operation));
+    if (!pending || pending.ref.runId !== ref.runId)
+      throw new Error("Grouped operation reference conflicts with its retained intention.");
+    return observeStatus(ref.runId ?? ref.key, true).then(observed => {
+      const cause = observed?.state === "unknown" ? null : barrier(observed, ref.runId ?? ref.key);
+      if (cause && !["stopped", "interrupted"].includes(cause)) throw nativeBarrier(cause, ref);
+      if ((observed?.runId && ref.runId && observed.runId !== ref.runId) ||
+          (observed?.agent && observed.agent !== ref.agent))
+        throw new Error("Grouped operation producer/run identity conflicts with its intention.");
+      resolution.observations = [projection(ref.key, observed ?? { ok: false, state: "unknown" })];
+      resolution.stage = confirmedPausePending() ? "accepted" : "applied";
+      // A fresh native key resumes the same on-disk sub-step markers.
+      if (pending.stage !== "receipt") {
+        pending.retry++; pending.dispatched = false; delete pending.ref;
+      }
+      if (pending.input?.operation === "drain") pending.reconciled = ref.key;
+      if (loop.attempt?.seal && loop.attempt.close === pending)
+        loop.attempt.seal.reconciled = ref.key;
+      delete loop.halt;
+      delete loop.outcome;
+      return save();
+    });
+  }
   if (invocation.sealPending && loop.halt.ref?.agent === "pitako.execution-ledger") {
     const ref = loop.halt.ref;
     return observeStatus(ref.runId ?? ref.key, true).then(observed => {
@@ -957,7 +993,163 @@ const LOOP_IO_CONTROL = { needsAttentionAfterMs: 1_800_000 };
 function loopIORequest(childKey, input) {
   return { key: childKey, agent: "pitako.loop-io", cwd: config.root, context: "fresh", output: false,
     outputMode: "inline", outputSchema: false, reads: false, progress: false,
-    control: LOOP_IO_CONTROL, task: JSON.stringify(input) };
+    control: LOOP_IO_CONTROL, ...(input.operation === "close" ? { timeoutMs: 14400000 } : {}),
+    task: JSON.stringify(input) };
+}
+function queueIntention(intention) {
+  const pending = invocation.intentions ??= [];
+  const existing = pending.find(entry => entry.key === intention.key);
+  if (existing) {
+    if (!same(existing, intention)) throw new Error("Pending loop-io intention changed.");
+  } else pending.push(clone(intention));
+}
+function queueApply(slot, input) {
+  if (invocation.intentions?.some(entry => entry.key === input.key)) return;
+  const previous = invocation.intentions?.findLast(entry => entry.operation === "apply");
+  if (previous) { input.expectedDigestFrom = previous.key; delete input.expectedDigest; }
+  queueIntention({ key: input.key, operation: "apply", slot, taskId: loop.task?.id,
+    complete: slot === "settlement" && loopResults().at(-1)?.status === "complete", input });
+}
+function receiptReference(value) {
+  const prefix = `${config.root}/.pi/subagents/execute/${config.invocation}/loop-io/`;
+  if (!value || !text(value.path) || !value.path.startsWith(prefix) ||
+      value.path.slice(prefix.length).split("/").some(part => !part || part === "." || part === "..") ||
+      !/^[a-f0-9]{64}$/.test(value.digest ?? "")) throw new Error(`Invalid loop-io disk receipt reference: ${value?.path ?? "missing path"}.`);
+  return { path: value.path, digest: value.digest };
+}
+function admitDrain(transport, intentions) {
+  receiptReference(transport);
+  const receipt = transport.projection;
+  if (receipt?.invocation !== config.invocation || !Array.isArray(receipt.steps) ||
+      receipt.steps.length !== intentions.length) throw new Error("Invalid loop-io drain projection.");
+  for (let index = 0; index < intentions.length; index++) {
+    const intention = intentions[index], step = receipt.steps[index], value = step.result;
+    if (step.key !== intention.key || step.operation !== intention.operation)
+      throw new Error("loop-io drain order differs from persisted intentions.");
+    if (intention.operation === "ledger") {
+      if (Object.keys(value ?? {}).sort().join(",") !== (intention.input.record.kind === "loop" ? "count,head,summaries" : "count,head") ||
+          value?.count !== Math.max(1, invocation.ledger.count) + 1 || !/^[a-f0-9]{64}$/.test(value.head ?? ""))
+        throw new Error("Invalid drained ledger anchor.");
+      invocation.ledger = { count: value.count, head: value.head };
+      if (intention.input.record.kind === "loop") {
+        if (!validSummaries(value.summaries)) throw new Error("Invalid drained loop summaries.");
+        loop.archived = true; delete loop.archivePending; delete loop.archiveQueued;
+        foldLoop(value.summaries);
+      }
+    } else {
+      if (!/^[a-f0-9]{64}$/.test(value?.digest ?? "") || !Array.isArray(value.cancelledScope))
+        throw new Error("Invalid drained apply projection.");
+      invocation.backlogDigest = value.digest;
+      const { view, completedTasks, ...projection } = value;
+      loop[intention.slot] = { ...loop[intention.slot], stage: "receipt", receipt: projection };
+      if (intention.slot === "settlement") admitSettlement(value, intention);
+      invocation.excludedScope = Object.fromEntries(value.cancelledScope.map(task => [task.id, task]));
+    }
+  }
+}
+function groupedIO(slot, input, owner = loop) {
+  if (slot === "finishDrain" && owner[slot]?.admitted && invocation.intentions?.length) {
+    const generation = (owner[slot].generation ?? 0) + 1;
+    owner[slot] = { key: `${key}.l${loop.number}.${slot}.v${generation}`, generation, retry: 0, stage: "intention" };
+  }
+  const pending = owner[slot] ??= { key: owner === loop || owner === invocation ? `${key}.l${loop.number}.${slot}` : `${owner.key}.${slot}`, retry: 0, stage: "intention" };
+  pending.intentionCount ??= invocation.intentions?.length ?? 0;
+  pending.input ??= { ...clone(input), root: config.root, invocation: config.invocation, key: pending.key,
+    receipts: invocation.receiptReference ? [clone(invocation.receiptReference)] : [],
+    ...(input.operation !== "drain" ? { requests: { cursor: 0 } } : {}) };
+  const intentions = clone((invocation.intentions ?? []).slice(0, pending.intentionCount));
+  return loopIO(slot, { ...pending.input, intentions }, owner).then(transport => {
+    const reference = receiptReference(transport), projection = transport.projection;
+    if (!projection || projection.invocation !== config.invocation || !Array.isArray(projection.steps) ||
+        input.operation !== "drain" && projection.operation !== input.operation)
+      throw new Error("Invalid grouped loop-io projection.");
+    if (input.operation !== "drain") {
+      const names = input.operation === "advance" ? ["drain", "prepare", "requests"]
+        : input.operation === "selection" ? ["drain", "apply", "requests", ...(pending.input.baseline ? ["baseline"] : [])]
+        : ["drain", "requests", "gate", "seal", ...(pending.input.nextBaseline ? ["nextRequests", "nextBaseline"] : [])];
+      if (!same(projection.steps.map(step => step.operation), names) ||
+          projection.steps.some(step => step.key !== `${pending.key}.${step.operation}`))
+        throw new Error("Grouped loop-io step order differs from its intention.");
+    }
+    if (!pending.admitted) {
+      const before = clone(invocation);
+      if (input.operation === "drain") admitDrain(transport, intentions);
+      else {
+        const drain = projection.steps[0];
+        if (drain?.operation !== "drain" || drain.key !== `${pending.key}.drain`) throw new Error("Missing drain-first receipt.");
+        admitDrain(drain.result, intentions);
+      }
+      invocation.intentions = (invocation.intentions ?? []).slice(pending.intentionCount);
+      invocation.receiptReference = reference;
+      pending.admitted = true;
+      function persist(attempt = 1) {
+        return save().then(() => {
+          persistenceFailed = false; persistenceReason = null;
+          return transport;
+        }, error => {
+          if (!error.terminalPersistence && attempt < 3) {
+            persistenceFailed = false; persistenceReason = null;
+            return persist(attempt + 1);
+          }
+          invocation = before; loop = invocation.loop;
+          throw error;
+        });
+      }
+      return persist();
+    }
+    return transport;
+  });
+}
+function groupedStep(transport, operation) {
+  const steps = transport.projection.steps.filter(step => step.operation === operation);
+  if (steps.length !== 1) throw new Error(`Missing or duplicate grouped ${operation} receipt.`);
+  return steps[0].result;
+}
+function observeGroupedRequests(transport, settling = false, page = groupedStep(transport, "requests")) {
+  const reference = receiptReference(transport);
+  if (!same(invocation.lastRequestReceipt, reference)) {
+    invocation.requestObservation = (invocation.requestObservation ?? 0) + 1;
+    invocation.lastRequestReceipt = reference;
+  }
+  return observeMainRequests(0, [], settling, page);
+}
+function checkpointIntent(taskId, number, attemptKey) {
+  return { version: 2, association: clone(invocation.association), key: attemptKey,
+    baseline: candidate(currentCandidate), taskId, attempt: number, loop: loop.number, cursor: loop.cursor,
+    phase: "implementation", planRef: clone(loop.plan.ref),
+    progress: { consumedLoops: invocation.consumedLoops,
+      admitted: Object.fromEntries(Object.entries(invocation.tasks).filter(([, task]) => task.admitted.length)
+        .map(([id, task]) => [id, clone(task.admitted)])),
+      previous: invocation.lastConfirmed?.kind === "unit" ? (({ taskId, attempt, resultRef, checkpointRef, digest }) =>
+        clone({ taskId, attempt, resultRef, checkpointRef, digest }))(invocation.lastConfirmed) : null } };
+}
+function admitBaseline(intent, receipt) {
+  if (typeof receipt?.captured !== "boolean") throw new Error("Invalid grouped baseline receipt.");
+  if (!receipt.captured) return null;
+  return { ...clone(intent), baseline: candidate(receipt.candidate) };
+}
+function advanceLoop(slot = "advance", number = loop.number) {
+  if (loop[slot]?.stage === "receipt" && !loop[slot].receipt?.projection && !invocation.currentView) {
+    // A new observation is not a replay of the completed immutable prepare.
+    const generation = (loop[slot].generation ?? 0) + 1;
+    loop[slot] = { key: `${key}.l${loop.number}.${slot}.v${generation}`, generation, retry: 0, stage: "intention" };
+  }
+  const complete = invocation.intentions?.findLast(entry => entry.slot === "settlement" && entry.complete);
+  return groupedIO(slot, { operation: "advance", prepare: { specId: config.id,
+    previousConfirmedUnit: complete?.taskId ?? invocation.lastBacklogUnit ?? null, loop: number } }).then(transport => {
+    const prepared = groupedStep(transport, "prepare");
+    invocation.backlogPath = prepared.path; invocation.backlogDigest = prepared.digest;
+    invocation.excludedScope = Object.fromEntries((prepared.cancelledScope ?? []).map(task => [task.id, task]));
+    invocation.currentView = prepared.view; invocation.boardTopicId = prepared.view.topicId;
+    if (number === loop.number) loop.prepare = { stage: "receipt", receipt: clone(prepared) };
+    else invocation.preparedNext = { stage: "receipt", receipt: clone(prepared) };
+    return observeGroupedRequests(transport).then(() => {
+      // Keep the ordinary projections, not a second copy of all grouped evidence.
+      loop[slot].receipt = receiptReference(transport);
+      delete loop[slot].input;
+      return save();
+    });
+  });
 }
 // Runtime operations have durable intentions and fresh retry keys, like gate.
 function loopIO(slot, input, owner = loop) {
@@ -975,21 +1167,48 @@ function loopIO(slot, input, owner = loop) {
     const childKey = pending.key + (pending.retry ? `.r${pending.retry}` : "");
     return Promise.resolve().then(() => {
       if (!pending.dispatched || budgetRejected(childKey)) return;
-      return observeStatus(pending.ref?.runId ?? childKey, true).then(observed => {
-        const cause = barrier(observed, pending.ref?.runId ?? childKey);
+      return observeStatus(pending.ref?.runId ?? pending.ref?.key ?? childKey, true).then(observed => {
+        const cause = barrier(observed, pending.ref?.runId ?? pending.ref?.key ?? childKey);
         if (cause) throw nativeBarrier(cause, pending.ref);
       });
     }).then(() => { pending.dispatched = true; return save(); }).then(() => dispatch([loopIORequest(childKey, input)])).then(([result]) => {
       pending.ref = nativeReference(childKey, result);
       const cause = barrier(result, childKey);
       if (cause) throw nativeBarrier(cause, pending.ref);
+      if (result?.nativeFailure) throw Object.assign(new Error(result.nativeFailure.reason),
+        { nativeFailure: result.nativeFailure });
       let receipt;
-      try { receipt = JSON.parse(result.output?.trim().split("\n").at(-1)); } catch (_) { /* Missing transport output is retried. */ }
-      if (receipt?.error === "loop-io") throw Object.assign(new Error(receipt.reason), { selectionRejected: receipt.selectionRejected === true, replayRejected: receipt.replayRejected === true, viewOverflow: receipt.viewOverflow === true, backlogConflict: receipt.reason?.startsWith("backlog-conflict:") });
+      const last = result.output?.trim().split("\n").at(-1);
+      try { if (utf8Bytes(last ?? "") <= 61440) receipt = JSON.parse(last); } catch (_) { /* Missing transport output is retried. */ }
+      if (receipt?.error === "loop-io" && receipt.ledgerIntegrity === true && text(receipt.reason))
+        throw Object.assign(new Error(`Ledger integrity requires human reconciliation: ${receipt.reason}`), { ledgerIntegrity: true });
+      if (receipt?.error === "loop-io") {
+        const semantic = receipt.selectionRejected || receipt.replayRejected || receipt.viewOverflow ||
+          /backlog-conflict:|integrity|digest mismatch|replay differs|completed .* changed|exceeds 61440/.test(receipt.reason ?? "");
+        if (!semantic && pending.retry < 2) {
+          pending.retry++; return save().then(run);
+        }
+        throw Object.assign(new Error(receipt.viewOverflow && input.operation === "close"
+          ? "HUMAN + DECISION overflow: ask the human to consolidate current Board HUMAN rulings and decisions"
+          : receipt.reason), { selectionRejected: receipt.selectionRejected === true,
+          replayRejected: receipt.replayRejected === true, viewOverflow: receipt.viewOverflow === true,
+          backlogConflict: receipt.reason?.startsWith("backlog-conflict:") });
+      }
       if (!result.ok || result.agent !== "pitako.loop-io" || !text(result.runId) ||
+          result.key !== undefined && result.key !== childKey || result.state !== undefined || result.terminalOutcome ||
+          ["advance", "selection", "close", "drain"].includes(input.operation) &&
+            (!text(result.asyncDir) || !text(result.externalAdapter?.outputArtifacts?.stdoutPath) ||
+              !text(result.externalAdapter?.outputArtifacts?.stderrPath)) ||
+          [result, ...(result.results ?? [])].some(item => item.error || item.outputSaveError || item.metadataSaveError ||
+            item.transcriptError || item.outputPartial || item.truncation || item.timedOut || item.processSignal) ||
           !Array.isArray(result.results) || result.results.length !== 1 || result.results[0].exitCode !== 0 || !receipt) {
         if (pending.retry >= 2) throw new Error(`loop-io ${slot} has no terminal receipt: ${result.error ?? childKey}`);
-        pending.retry++; pending.dispatched = false; return save().then(run);
+        pending.retry++; return save().then(run);
+      }
+      if (["advance", "selection", "close", "drain"].includes(input.operation)) {
+        receiptReference(receipt);
+        pending.receipt = receipt; pending.stage = "receipt";
+        return save().then(() => receipt);
       }
       // Backlog content is never mission state: retain only task and digest projections.
       const { backlog, completedTasks, ...projection } = receipt;
@@ -1002,6 +1221,14 @@ function loopIO(slot, input, owner = loop) {
       if (["settlement", "cancellation", "finalGaps"].includes(slot)) delete projection.view;
       pending.receipt = projection; pending.stage = "receipt";
       return save().then(() => slot === "selection" ? { ...projection, selected: loop.task } : projection);
+    }).catch(error => {
+      if (persistenceFailed || error.nativeFailure?.code !== "native-dispatch" || pending.retry >= 2) throw error;
+      return observeStatus(pending.ref?.runId ?? childKey, true).then(observed => {
+        const cause = barrier(observed, pending.ref?.runId ?? childKey);
+        if (cause) throw nativeBarrier(cause, pending.ref ?? { key: childKey, agent: "pitako.loop-io" });
+        pending.retry++; pending.dispatched = false;
+        return save().then(run);
+      });
     });
   }
   const previousKey = pending.key + (pending.retry ? `.r${pending.retry}` : "");
@@ -1024,25 +1251,33 @@ function assertSelection() {
     planConflict("Selected task ID or backlog digest conflicts with the selection receipt.");
 }
 function settleTask() {
-  if (loop.settlement?.applied) return Promise.resolve();
+  if (loop.settlement?.applied || loop.settlement?.queued) return Promise.resolve();
   const result = loopResults().at(-1), receipt = loop.settlementGate ?? loop.attempt?.gate?.receipt;
   if (!result || !receipt) return Promise.resolve();
-  return loopIO("settlement", { operation: "apply", root: config.root, specId: config.id,
+  const input = { operation: "apply", root: config.root, specId: config.id,
     expectedDigest: invocation.backlogDigest, key: `${key}.l${loop.number}.settlement`,
     invocation: config.invocation, loop: loop.number, authority: backlogAuthority(), settle: true,
     director: { select: null, changes: [], reason: result.diagnosis },
     progress: { taskId: loop.task.id, progress: loop.metricSeries, remaining: result.remaining.join("; ").slice(0, 256) },
     ...(result.status === "complete" ? { confirmedUnit: { taskId: loop.task.id, kind: "unit", workerStatus: "complete", receipt } } : {}),
-  }).then(value => {
+  };
+  queueApply("settlement", input);
+  loop.settlement = { queued: true, taskId: loop.task.id, complete: result.status === "complete" };
+  invocation.currentView = null;
+  return save().then(() => {
+    // A possible second stall must be admitted before a loop archive is prepared.
+    if (loop.metricSeries?.nonImproving >= 3 && (loop.task.progress?.stalls ?? 0) >= 1)
+      return groupedIO("finishDrain", { operation: "drain" }, invocation);
+  });
+}
+function admitSettlement(value, intention) {
     invocation.backlogDigest = value.digest; invocation.currentView = null;
-    if (result.status === "complete") invocation.lastBacklogUnit = loop.task.id;
-    loop.settlement.applied = true;
+    if (intention.complete) invocation.lastBacklogUnit = intention.taskId;
+    if (loop.settlement) loop.settlement.applied = true;
     if (value.needsDecision) {
       loop.halt = { status: "needs-decision", code: "needs-decision", ...clone(value.needsDecision),
         reason: `Task ${value.needsDecision.taskId} reached two stalls. Metric series: ${JSON.stringify(value.needsDecision.metricSeries)}. Stall diagnoses: ${JSON.stringify(value.needsDecision.diagnoses)}. Human decision required: edit the backlog or deliver an amendment, then relaunch or unblock through the existing routes.` };
     }
-    return save();
-  });
 }
 function recordFinalGaps(kind, findings, outputs) {
   const changes = findings.map((finding, index) => ({ kind: "add", reason: finding.reason,
@@ -1052,13 +1287,13 @@ function recordFinalGaps(kind, findings, outputs) {
       specRefs: [finding.source ?? "Final phase: frozen spec and amendments"], dependsOn: [],
       gates: [], metric: null, parent: null, remaining: "Director must assign focused gates before selection.",
       progress: { nonImproving: 0, last5: [] }, history: [] } }));
-  return loopIO("finalGaps", { operation: "apply", root: config.root, specId: config.id,
+  const input = { operation: "apply", root: config.root, specId: config.id,
     expectedDigest: invocation.backlogDigest, key: `${key}.l${loop.number}.final-gaps`,
     invocation: config.invocation, loop: loop.number, authority: backlogAuthority(), recordGaps: true, finalGapOutputs: outputs,
-    director: { select: null, changes, reason: `Final-phase ${kind} gaps` } }).then(applied => {
-    invocation.backlogDigest = applied.digest; invocation.currentView = null;
-    return save();
-  });
+    director: { select: null, changes, reason: `Final-phase ${kind} gaps` } };
+  queueApply("finalGaps", input);
+  invocation.currentView = null;
+  return save();
 }
 function findingOutput(ref) {
   const path = ref?.results?.find(entry => text(entry.savedOutputPath))?.savedOutputPath ??
@@ -1667,16 +1902,22 @@ function sealerKey(attemptKey, retry) {
   return `${attemptKey}.seal${retry ? `.r${retry}` : ""}`;
 }
 // A retained seal intention is observed before any fallback, recovery or re-seal.
-// Positive sealer activity is a barrier; settled or unknown status takes the
-// existing route. A reentered seal is never admitted: only a fresh dispatch is.
+// Grouped closes resume verified markers; legacy seals keep the fresh-dispatch route.
 function observePendingSealer() {
   const pending = loop?.attempt?.seal;
-  if (!pending?.retry || loop.attempt.stage === "result") return Promise.resolve();
-  const key = sealerKey(loop.attempt.key, pending.retry - 1);
-  if (budgetRejected(key) || pending.reconciled === key) return Promise.resolve();
-  return observeStatus(key, true).then(observed => {
-    const cause = observed?.state === "unknown" ? null : barrier(observed, key);
-    if (cause) throw nativeBarrier(cause, { key, agent: "pitako.checkpoint-sealer" });
+  const close = loop?.attempt?.close;
+  if (loop?.attempt?.stage === "result") return Promise.resolve();
+  if (!pending?.retry && !close?.dispatched) return Promise.resolve();
+  const ref = close?.dispatched ? close.ref ?? { key: close.key + (close.retry ? `.r${close.retry}` : ""), agent: "pitako.loop-io" }
+    : { key: sealerKey(loop.attempt.key, pending.retry - 1), agent: "pitako.checkpoint-sealer" };
+  const key = ref.key;
+  if (budgetRejected(key) || pending?.reconciled === key) return Promise.resolve();
+  return observeStatus(ref.runId ?? key, true).then(observed => {
+    const cause = observed?.state === "unknown" ? null : barrier(observed, ref.runId ?? key);
+    if (cause) throw nativeBarrier(cause, ref);
+    if ((observed?.runId && ref.runId && observed.runId !== ref.runId) ||
+        (observed?.agent && observed.agent !== ref.agent))
+      throw new Error("Sealer producer/run identity conflicts with the pending seal.");
   });
 }
 // Gate intentions and receipts survive relaunch; a saved seal never reruns gates.
@@ -1795,6 +2036,62 @@ function validGateReceipt(receipt, task, status) {
         (receipt.metric.error === null || text(receipt.metric.error)) : receipt.metric === null);
   } catch (_) { return false; }
 }
+function closeAttempt(descriptor, task, value) {
+  const gateTask = { id: task.id, gates: task.gates ?? task.checks.map(check => ({ id: check.id,
+    command: check.command, cwd: check.cwd, timeoutMs: check.timeoutMs ?? 1800000 })),
+    metric: task.metric ?? null, progress: loop.metricSeries ?? task.progress ?? { nonImproving: 0, last5: [] } };
+  const next = checkpointIntent(task.id, descriptor.number + 1,
+    `${key}.l${loop.number}.t${loop.cursor + 1}.a${descriptor.number + 1}`);
+  const admitted = next.progress.admitted[task.id] ??= [];
+  if (!admitted.includes("continue")) admitted.push("continue");
+  // These variants are inert until the workflow admits the matching pause.
+  const sealed = clone(next); sealed.progress.previous = null;
+  const nextBaselines = descriptor.close?.input?.nextBaseline ?? { sealed, observed: next };
+  const seal = { v: 1, intent: descriptor.checkpoint,
+    ...(descriptor.restore ? { restoreSources: descriptor.restore.sourceKeys.map(sourceKey => {
+      const source = invocation.taskFrame.sources.find(item => item.key === sourceKey);
+      if (!source) throw new Error("Missing authenticated restoration source intent.");
+      return source;
+    }) } : {}) };
+  return groupedIO("close", { operation: "close",
+    gate: { root: config.root, specId: config.id, invocation: config.invocation,
+      loop: loop.number, attempt: descriptor.number, key: `${descriptor.key}.gate`, task: gateTask,
+      workerStatus: value.status, writerSettled: true, checkpoint: descriptor.checkpoint, knowledge: value.knowledge },
+    seal: { unit: seal, pause: seal }, nextBaseline: nextBaselines }, descriptor).then(transport => {
+    const gate = groupedStep(transport, "gate"), selected = groupedStep(transport, "seal");
+    if (!validGateReceipt(gate.receipt, gateTask, value.status) ||
+        gate.contextPeak !== null && (!Number.isSafeInteger(gate.contextPeak) || gate.contextPeak < 0) ||
+        transport.projection.contextPeak !== gate.contextPeak)
+      throw new Error("Close lacks a valid gate receipt.");
+    const passed = !gate.receipt.mutated && gate.receipt.gates.length === gateTask.gates.length &&
+      gateTask.gates.every(command => gate.receipt.gates.some(result => result.id === command.id && result.status === "pass"));
+    const kind = value.status === "complete" && passed ? "unit" : "pause";
+    if (selected.kind !== kind || selected.workerStatus !== value.status || selected.mutated !== gate.receipt.mutated ||
+        !same(candidate(selected.after), candidate(gate.receipt.after)))
+      throw new Error("Close seal selection differs from workflow evidence.");
+    receiptReference(selected.gate);
+    descriptor.gate = { key: `${descriptor.key}.gate`, stage: "receipt", ref: clone(descriptor.close.ref),
+      receipt: { ...gate.receipt, contextPeak: transport.projection.contextPeak } };
+    const requests = groupedStep(transport, "nextRequests"), baseline = groupedStep(transport, "nextBaseline");
+    const earlier = groupedStep(transport, "requests");
+    if (!Number.isSafeInteger(earlier.count) || earlier.count < 0 || !Array.isArray(requests.requests) ||
+        requests.requests.length < earlier.count)
+      throw Object.assign(new Error("Close request snapshot integrity conflict."), { checkpointIntegrity: true });
+    const outcome = selected.receipt.outcome;
+    const variant = kind === "pause" && value.status !== "blocked" && ["sealed", "observed"].includes(outcome) &&
+      requests.next === null && !requests.requests.some(request => request.taskId === task.id) ? outcome : null;
+    if (baseline.variant !== variant || baseline.sealOutcome !== outcome || baseline.captured !== (variant !== null))
+      throw Object.assign(new Error("Close next-baseline selection differs from workflow evidence."), { checkpointIntegrity: true });
+    currentCandidate = candidate(gate.receipt.after);
+    loop.metricSeries = clone(gate.receipt.progress);
+    invocation.currentView = clone(gate.receipt.view);
+    invocation.boardTopicId = gate.receipt.view.topicId;
+    return observeGroupedRequests(transport, true, requests).then(() => {
+      descriptor.foldedNextBaseline = variant ? admitBaseline(nextBaselines[variant], baseline) : null;
+      return save();
+    }).then(() => selected);
+  });
+}
 // Only the active root can turn the settled result and its saved gates into a seal.
 function sealAndAdmit(result, descriptor, task, recoveryRef, statusRef) {
   if (loop.attempt.stage === "result") throw new Error("Duplicate attempt admission rejected.");
@@ -1803,7 +2100,12 @@ function sealAndAdmit(result, descriptor, task, recoveryRef, statusRef) {
     if (!error?.reportRejection) throw error;
     structural = { rejection: String(error.message) };
   }
-  return (!structural.rejection && !recoveryRef ? verifyAttempt(loop.attempt, task, structural.value) : Promise.resolve()).then(() => {
+  let groupedSeal;
+  return (!structural.rejection && !recoveryRef && !descriptor.gate && !descriptor.seal
+    ? closeAttempt(descriptor, task, structural.value).then(receipt => { groupedSeal = receipt; })
+    : descriptor.close?.receipt?.projection
+      ? closeAttempt(descriptor, task, structural.value).then(receipt => { groupedSeal = receipt; })
+      : !structural.rejection && !recoveryRef ? verifyAttempt(loop.attempt, task, structural.value) : Promise.resolve()).then(() => {
   descriptor.gate = loop.attempt.gate;
   const receipt = descriptor.gate?.receipt;
   const definitions = task.gates ?? task.checks;
@@ -1817,33 +2119,33 @@ function sealAndAdmit(result, descriptor, task, recoveryRef, statusRef) {
   const sealKey = sealerKey(descriptor.key, retry);
   const intent = descriptor.checkpoint;
   if (!intent) throw new Error("Missing checkpoint intention for root observation.");
-  let ref = { key: sealKey, agent: "pitako.checkpoint-sealer" };
+  let ref = groupedSeal ? clone(descriptor.close.ref) : { key: sealKey, agent: "pitako.checkpoint-sealer" };
   pending.retry = retry + 1;
-  return save().then(() => dispatch([{ key: sealKey, agent: "pitako.checkpoint-sealer",
+  return (groupedSeal ? save().then(() => null) : save().then(() => dispatch([{ key: sealKey, agent: "pitako.checkpoint-sealer",
     task: JSON.stringify({ v: 1, intent, kind,
       ...(descriptor.restore ? { restoreSources: descriptor.restore.sourceKeys.map(sourceKey => {
         const source = invocation.taskFrame.sources.find(item => item.key === sourceKey);
         if (!source) throw new Error("Missing authenticated restoration source intent.");
         return source;
       }) } : {}) }), cwd: config.root, context: "fresh", output: false, outputMode: "inline",
-    outputSchema: false, reads: false, progress: false }])).then(results => {
-    const sealed = results[0];
-    ref = { ...nativeReference(sealKey, sealed), agent: "pitako.checkpoint-sealer" };
-    const cause = barrier(sealed, sealKey);
+    outputSchema: false, reads: false, progress: false }]))).then(results => {
+    const sealed = results?.[0];
+    if (!groupedSeal) ref = { ...nativeReference(sealKey, sealed), agent: "pitako.checkpoint-sealer" };
+    const cause = groupedSeal ? null : barrier(sealed, sealKey);
     if (cause) throw nativeBarrier(cause, ref);
-    let observed;
+    let observed = groupedSeal?.receipt;
     if (typeof sealed?.output === "string" && utf8Bytes(sealed.output) <= 61440) {
       try { observed = JSON.parse(sealed.output); } catch (_) { /* Invalid stdout is a barrier, not evidence. */ }
     }
     const failures = [sealed, ...(sealed?.results ?? [])].filter(Boolean);
-    if (!sealed?.ok || sealed.agent !== "pitako.checkpoint-sealer" || !text(sealed.runId) ||
+    if (!groupedSeal && (!sealed?.ok || sealed.agent !== "pitako.checkpoint-sealer" || !text(sealed.runId) ||
         sealed.key !== undefined && sealed.key !== sealKey || sealed.state !== undefined || sealed.terminalOutcome ||
         !text(sealed.asyncDir) || !text(sealed.externalAdapter?.outputArtifacts?.stdoutPath) ||
         !text(sealed.externalAdapter?.outputArtifacts?.stderrPath) ||
         !Array.isArray(sealed.results) || sealed.results.length !== 1 || sealed.results[0].exitCode !== 0 ||
         failures.some(item => item.error || item.outputSaveError || item.metadataSaveError || item.transcriptError ||
           item.outputPartial || item.truncation || item.timedOut || item.processSignal ||
-          item.exitCode !== undefined && item.exitCode !== 0) ||
+          item.exitCode !== undefined && item.exitCode !== 0)) ||
         !observed || observed.v !== 1 || observed.kind !== kind ||
         !["sealed", "observed", "mismatch", "open"].includes(observed.outcome))
       throw nativeBarrier("Checkpoint sealer lacks successful terminal stdout.", ref);
@@ -1875,6 +2177,11 @@ function sealAndAdmit(result, descriptor, task, recoveryRef, statusRef) {
         `${entry.path}: journaled sha256 ${entry.journaled ?? "absence"}, actual sha256 ${entry.actual ?? "absence"}, last step partially applied: ${entry.partiallyApplied}`).join("; ")}.
 Return the files to their journaled bytes and resume (the sealer retries under the next .rN), or start a new mission.`;
       loop.halt = { status: "blocked", code: "checkpoint-integrity", reason, ref };
+      // A repaired candidate must be re-observed, not reuse the failed grouped seal.
+      if (groupedSeal) {
+        descriptor.close.receipt = receiptReference(descriptor.close.receipt);
+        delete descriptor.close.input;
+      }
       return save().then(() => { throw Object.assign(new Error(reason), { checkpointIntegrity: true }); });
     }
     if (observed.outcome === "sealed") {
@@ -1903,6 +2210,10 @@ Return the files to their journaled bytes and resume (the sealer retries under t
     }
     // This synchronous admission consumes only this dispatch's in-memory result.
     const admitted = admitWorker(result, descriptor, task, recoveryRef, statusRef, observed, structural.rejection ? structural : undefined);
+    if (groupedSeal) {
+      descriptor.close.receipt = receiptReference(descriptor.close.receipt);
+      delete descriptor.close.input;
+    }
     return save().then(() => admitted);
   }).catch(error => {
     if (error.spawnBudgetExhausted) { pending.retry = retry; throw error; }
@@ -2010,11 +2321,41 @@ function foldLoop(summaries) {
   loop.recoveries = [];
 }
 function archiveGaps() {
-  if (loop.archived) return Promise.resolve();
+  if (loop.archived || loop.archiveQueued) return Promise.resolve();
   loop.archivePending ??= loopArchive();
   return archiveSeal(loop.archivePending);
 }
 function archiveSeal(pending = invocation.sealPending) {
+  // Retained legacy publications still use their original recovery route.
+  if (pending.retry) return legacyArchiveSeal(pending);
+  const closing = pending.record.kind === "loop";
+  const previous = invocation.intentions?.findLast(entry => entry.operation === "ledger");
+  const sealKey = `${key}.l${pending.record.loop}.${closing ? "gaps" : `seal${Math.max(1, pending.expected.count)}`}`;
+  const input = { expected: clone(pending.expected), record: clone(pending.record),
+    ...(pending.expected.count === 0 && !previous ? { spec: { content: config.preliminary.content,
+      digest: invocation.association.digest } } : {}) };
+  if (previous) { input.expectedFrom = previous.key; delete input.expected; }
+  queueIntention({ key: sealKey, operation: "ledger", input });
+  if (closing) {
+    loop.archiveQueued = true;
+    loop.archivePending = { expected: clone(pending.expected),
+      record: { kind: pending.record.kind, loop: pending.record.loop }, intentionKey: sealKey };
+  } else {
+    invocation.sealPending = null;
+    loop.results = loop.results.filter(entry => !entry.ref ||
+      same(invocation.tasks[entry.taskId]?.last, entry) || same(entry.ref, invocation.lastConfirmed.resultRef));
+    const cited = JSON.stringify(loop.resolutions ?? []);
+    loop.recoveries = loop.recoveries.filter(item => cited.includes(item.ref.key));
+    if (pending.record.body.result.status === "complete") {
+      invocation.taskFrame = null;
+      delete loop.interruptions;
+      delete loop.attempt.pauseSource;
+      delete loop.attempt.restore;
+    }
+  }
+  return save();
+}
+function legacyArchiveSeal(pending = invocation.sealPending) {
   const closingGap = pending.record.kind === "loop";
   let tries = 0;
   function publish() {
@@ -2205,7 +2546,40 @@ function action(status, reason) {
     started: false,
   };
 }
-function finish(status, reason) {
+function canSaveBudgetExhaustion(error) {
+  return error?.spawnBudgetExhausted && invocation?.association && !persistenceFailed && !loop?.halt &&
+    !resolution?.currentBarrier && !hostHalt;
+}
+function finishBudgetExhaustion() {
+  const marker = { checkpoint: invocation.lastConfirmed?.digest ?? null,
+    closedLoop: loop?.archived ? loop.number : (loop?.number ?? 1) - 1,
+    ledger: clone(invocation.ledger), backlogDigest: invocation.backlogDigest ?? null };
+  const stalled = same(marker, invocation.lastBudgetProgress);
+  invocation.lastBudgetProgress = marker;
+  if (stalled) loop.halt = { status: "blocked", code: "spawn-budget",
+    reason: "No seals admitted or loops closed since the previous budget-exhausted end; one step needs more spawns than the per-run budget. Human intervention must raise config.maxSubagentSpawnsPerRun or reduce that step's spawn demand." };
+  return save().then(() => finish(stalled ? "blocked" : "budget-exhausted", stalled ? loop.halt.reason :
+    "Native per-run spawn budget exhausted before any child in the admission group started; state saved. Automatically relaunch the same invocation and mission as a new top-level run.", true));
+}
+function finish(status, reason, drained = false) {
+  if (!drained && status !== "budget-exhausted" && !persistenceFailed && (!loop?.halt || ["semantic-block", "needs-decision"].includes(loop.halt.code)) &&
+      invocation?.association && (invocation.intentions?.length || status === "complete" && !invocation.finishDrain) && !hostHalt) {
+    return groupedIO("finishDrain", { operation: "drain" }, invocation).then(() => {
+      invocation.finishDrain.receipt = receiptReference(invocation.finishDrain.receipt);
+      delete invocation.finishDrain.input;
+      return save().then(() => finish(status, reason, true));
+    }).catch(error => {
+      if (canSaveBudgetExhaustion(error))
+        return finishBudgetExhaustion().catch(saveError => finish("partial", `${error.message}; ${saveError.message}`, true));
+      if (error.nativeBarrier) loop.halt = { status: ["stopped", "interrupted"].includes(error.nativeBarrier) ? "cancelled" : "blocked",
+        code: "native-barrier", cause: error.nativeBarrier, reason: String(error.message),
+        ...(error.nativeReference ? { ref: clone(error.nativeReference) } : {}) };
+      const halted = loop?.halt?.status ?? (status === "partial" ? "partial" : "blocked");
+      return (error.nativeBarrier ? save() : Promise.resolve())
+        .then(() => finish(halted, String(error.message), true),
+          saveError => finish(halted, `${error.message}; ${saveError.message}`, true));
+    });
+  }
   if (persistenceFailed && persistenceReason && !reason.includes(persistenceReason)) reason += ` ${persistenceReason}`;
   const exceptions = status === "complete" ? acceptanceResults().excepted
     .filter(gate => gate.status !== "pass" || gate.exit !== 0)
@@ -2441,10 +2815,21 @@ try {
     await reconcileRetainedRecoveries();
   if (resolution?.stage === "accepted" && resolution.loop === loop?.number && !loop.archived &&
       loop.halt?.code === "native-barrier" && (!confirmedPausePending() ||
-        invocation.sealPending && loop.halt.ref?.agent === "pitako.execution-ledger") &&
+        invocation.sealPending && loop.halt.ref?.agent === "pitako.execution-ledger" ||
+        loop.halt.ref?.agent === "pitako.loop-io") &&
       ["stopped", "interrupted", "native permission denial"].includes(loop.halt.cause))
     await reconcileInterruptedOperations();
   if (invocation.sealPending && !loop?.halt) await archiveSeal();
+  // A cut after accepting input must still drain that exact queue before restoration.
+  if (["accepted", "applied"].includes(resolution?.stage) && !loop?.halt) {
+    for (const owner of [invocation, loop, loop?.attempt ?? {}]) {
+      for (const [slot, pending] of Object.entries(owner ?? {})) {
+        if (pending?.input?.operation === "drain" && !pending.admitted && text(pending.reconciled) &&
+            pending.reconciled === resolution.halt?.ref?.key)
+          await groupedIO(slot, pending.input, owner);
+      }
+    }
+  }
   if (resolution?.stage === "accepted" && (resolution.loop === 0 || resolution.loop === loop?.number && !loop.archived) && resolution.hostHalt && !loop?.halt) {
     // The bounded reconstruction is applied, not a claim that a historical
     // host receipt or a later writer has settled.
@@ -2455,7 +2840,7 @@ try {
   // A checkpoint alone does not resolve an unrelated semantic/product impediment.
   const paused = loop?.attempt?.stage === "result" && loop.attempt.result;
   const resolvedSealPause = !invocation.sealPending && !loop?.halt &&
-    resolution?.halt?.ref?.agent === "pitako.execution-ledger" && resolution.observations?.length;
+    ["pitako.execution-ledger", "pitako.loop-io"].includes(resolution?.halt?.ref?.agent) && resolution.observations?.length;
   if (resolution?.stage === "accepted" && resolution.loop === loop?.number && !loop.archived && confirmedPausePending() &&
       (resolvedSealPause || same(resolution.halt, loop.halt) && (loop.halt?.code === "semantic-block" ||
         (loop.halt?.code === "native-barrier" && ["stopped", "interrupted"].includes(loop.halt.cause))))) {
@@ -2549,13 +2934,19 @@ try {
   }
   while (true) {
     if (loop?.outcome === "gaps" && !loop.archived) await archiveGaps();
+    if (loop?.outcome && invocation.intentions?.length && invocation.consumedLoops < maxCycles()) {
+      await advanceLoop("nextAdvance", loop.number + 1);
+      if (loop.halt) return finish(loop.halt.status, loop.halt.reason);
+    }
     if (!loop || loop.outcome) {
       if (invocation.consumedLoops >= maxCycles()) return finish("partial", `${maxCycles()} authorized loops consumed; remaining work requires new human authorization.`);
 
       activePlan = null;
-      loop = { number: invocation.consumedLoops + 1, startedAt: Date.now(), phase: "director",
+      const prepared = invocation.currentView && (invocation.preparedNext ?? loop?.prepare);
+      loop = { ...(prepared ? { prepare: clone(prepared) } : {}), number: invocation.consumedLoops + 1, startedAt: Date.now(), phase: "director",
         cursor: 0, manifest: null, plan: null, attempt: null, results: [], recoveries: [], usage: [] };
       invocation.loop = loop;
+      delete invocation.preparedNext;
       invocation.consumedLoops++;
       resolution = undefined;
       invocation.tasks = {};
@@ -2565,12 +2956,7 @@ try {
     }
     if (loop.phase === "director") {
       if (!invocation.currentView) {
-        const prepared = await loopIO("prepare", { operation: "prepare", root: config.root, specId: config.id,
-          previousConfirmedUnit: invocation.lastBacklogUnit ?? null, invocation: config.invocation, loop: loop.number });
-        invocation.backlogPath = prepared.path; invocation.backlogDigest = prepared.digest;
-        invocation.excludedScope = Object.fromEntries((prepared.cancelledScope ?? []).map(task => [task.id, task]));
-        invocation.currentView = prepared.view; invocation.boardTopicId = prepared.view.topicId;
-        await save();
+        await advanceLoop();
       }
       const directorKey = `${key}.l${loop.number}.director${loop.directorRetry ? ".d1" : ""}`;
       if (!loop.plan || budgetRejected(directorKey)) {
@@ -2647,15 +3033,28 @@ Publish one selection with the native output binding then END. Native permission
       validatePlan(activePlan);
       let applied;
       try {
-        applied = await loopIO("selection", { operation: "apply", root: config.root, specId: config.id,
-          expectedDigest: invocation.backlogDigest, key: `${key}.l${loop.number}.selection${loop.directorRetry ? ".d1" : ""}`,
-          invocation: config.invocation, loop: loop.number, authority: backlogAuthority(), director: activePlan });
+        if (loop.selection?.stage === "receipt") assertSelection();
+        if (text(activePlan.select)) loop.initialCheckpoint ??= checkpointIntent(activePlan.select, 1, `${key}.l${loop.number}.t1.a1`);
+        await save();
+        const transport = await groupedIO(`selectionIO${loop.directorRetry ? ".d1" : ""}`, { operation: "selection",
+          apply: { root: config.root, specId: config.id, expectedDigest: invocation.backlogDigest,
+            key: `${key}.l${loop.number}.selection${loop.directorRetry ? ".d1" : ""}`,
+            invocation: config.invocation, loop: loop.number, authority: backlogAuthority(), director: activePlan },
+          ...(loop.initialCheckpoint ? { baseline: loop.initialCheckpoint } : {}) });
+        applied = groupedStep(transport, "apply");
+        const { selected, completedTasks, ...receipt } = applied;
+        loop.task = selected; loop.taskBacklogDigest = applied.digest;
+        loop.selection = { stage: "receipt", receipt: { ...receipt, selected: selected?.id ?? null,
+          ...(!selected ? { completedTasks } : {}), groupedReference: receiptReference(transport) } };
+        await save();
+        if (loop.initialCheckpoint) loop.selectionBaseline = groupedStep(transport, "baseline");
+        loop.selectionRequests = { reference: receiptReference(transport), page: groupedStep(transport, "requests") };
       } catch (error) {
         const diagnostic = String(error?.message ?? error);
         if (!error.selectionRejected || error.backlogConflict) throw error;
         if (!loop.directorRetry && !error.replayRejected) {
           loop.directorRetry = { diagnostic: diagnostic.slice(0, 2000), rejectedRef: clone(loop.plan.ref) };
-          loop.plan = null; delete loop.selection; activePlan = null;
+          loop.plan = null; delete loop.selection; delete loop.initialCheckpoint; activePlan = null;
           await save(); continue;
         }
         loop.plan.stage = "rejected"; loop.plan.rejection = { diagnostic, ref: clone(loop.plan.ref),
@@ -2681,6 +3080,14 @@ Publish one selection with the native output binding then END. Native permission
           viewDigest: receipt.viewDigest, viewBytes: receipt.viewBytes };
       }
       activePlan = null;
+      await save();
+      await observeGroupedRequests(loop.selectionRequests.reference, false, loop.selectionRequests.page);
+      delete loop.selectionRequests;
+      if (loop.initialCheckpoint) loop.initialCheckpoint = admitBaseline(loop.initialCheckpoint, loop.selectionBaseline);
+      delete loop.selectionBaseline;
+      for (const slot of ["selectionIO", "selectionIO.d1"]) if (loop[slot]?.stage === "receipt") {
+        loop[slot].receipt = receiptReference(loop[slot].receipt); delete loop[slot].input;
+      }
       await save();
     }
     if (loop.phase === "implementation") {
@@ -2744,7 +3151,9 @@ Publish one selection with the native output binding then END. Native permission
               bindingKey: source.bindingKey ?? source.key, resumeAfter: source.gate.receipt.after,
               boardPostIds: source.boardPostIds ?? [] } : {}),
             key: `${key}.l${loop.number}.t${loop.cursor + 1}.a${previous.attempt + 1}`,
-            stage: "intention", continuationRef: previous.ref, ...(pauseSource ? { pauseSource } : {}) };
+            stage: "intention", continuationRef: previous.ref,
+            ...(source.foldedNextBaseline ? { checkpoint: clone(source.foldedNextBaseline), foldedBaseline: clone(source.foldedNextBaseline) } : {}),
+            ...(pauseSource ? { pauseSource } : {}) };
           await save();
         } else if (loop.attempt && !loop.attempt.undispatched && !loop.attempt.restore?.undispatched && !budgetRejected(loop.attempt.key)) {
           // Never call an unresolved writer key as if native reuse were read-only.
@@ -2763,7 +3172,7 @@ Publish one selection with the native output binding then END. Native permission
           if (barrier(observed)) throw nativeBarrier(barrier(observed));
           if (observed?.runId && observed?.structuredOutput &&
               (!ref.runId || observed.runId === ref.runId)) {
-            await observeMainRequests(0, [], true);
+            if (loop.attempt.restore) await observeMainRequests(0, [], true);
             await sealAndAdmit(observed, loop.attempt, task, undefined, ref.runId ?? ref.key);
           } else {
             throw new Error("Pending v6 worker has no complete result/checkpoint route; no inspector or replacement authorized.");
@@ -2776,7 +3185,7 @@ Publish one selection with the native output binding then END. Native permission
             key: `${key}.l${loop.number}.t${loop.cursor + 1}.a1`, stage: "intention", continuationRef: null };
           await save();
         }
-        await observeMainRequests();
+        if (loop.attempt.restore || loop.attempt.resumeRejection) await observeMainRequests();
         if (invocation.tasks[task.id]?.cancel) {
           loop.cursor++; loop.attempt = null; invocation.taskFrame = null; await save(); continue;
         }
@@ -2784,18 +3193,14 @@ Publish one selection with the native output binding then END. Native permission
         // preimages turn this pointer into a recoverable checkpoint.
         if (!loop.attempt.checkpoint) {
           loop.attempt.baseline = candidate(currentCandidate);
-          loop.attempt.checkpoint = { version: 2, association: clone(invocation.association),
-            key: loop.attempt.key, baseline: clone(loop.attempt.baseline), taskId: task.id, attempt: loop.attempt.number,
-            loop: loop.number, cursor: loop.cursor, phase: loop.phase, planRef: clone(loop.plan.ref),
-            progress: { consumedLoops: invocation.consumedLoops,
-              admitted: Object.fromEntries(Object.entries(invocation.tasks).filter(([, task]) => task.admitted.length)
-                .map(([id, task]) => [id, clone(task.admitted)])),
-              previous: invocation.lastConfirmed?.kind === "unit" ? (({ taskId, attempt, resultRef, checkpointRef, digest }) =>
-                clone({ taskId, attempt, resultRef, checkpointRef, digest }))(invocation.lastConfirmed) : null } };
+          loop.attempt.checkpoint = checkpointIntent(task.id, loop.attempt.number, loop.attempt.key);
           await save();
         }
-        const baseline = await loopIO("baselineIO", { operation: "baseline", root: config.root,
+        const folded = loop.attempt.foldedBaseline ?? (loop.attempt.number === 1 ? loop.initialCheckpoint : null);
+        const baseline = folded ? { candidate: folded.baseline } : await loopIO("baselineIO", { operation: "baseline", root: config.root,
           intent: clone(loop.attempt.checkpoint) }, loop.attempt);
+        if (folded) loop.attempt.checkpoint = clone(folded);
+        if (loop.attempt.number === 1) delete loop.initialCheckpoint;
         loop.attempt.baseline = clone(baseline.candidate);
         loop.attempt.checkpoint.baseline = clone(baseline.candidate);
         currentCandidate = clone(baseline.candidate);
@@ -2939,7 +3344,7 @@ Return structured_output after all owned journaled writes settle.`,
         }
         loop.attempt.stage = "launched";
         await save();
-        await observeMainRequests();
+        if (!result?.ok) await observeMainRequests();
         if (!result?.ok) {
           loop.attempt.stage = "settled";
           loop.results.push({ ...projection(descriptor.key, result), taskId: descriptor.taskId, attempt: descriptor.number,
@@ -3192,6 +3597,7 @@ no unresolved material gaps and this SAME candidate. Otherwise gaps or blocked. 
       loop.phase = "closing"; await save();
     }
     if (loop.phase === "closing") {
+      if (invocation.intentions?.length) await groupedIO("closingDrain", { operation: "drain" });
       progress();
       const retainedClosing = !!(loop.closing || loop.observation);
        // Reconcile the retained producer first; a new retry key publishes only
@@ -3339,19 +3745,9 @@ no unresolved material gaps and this SAME candidate. Otherwise gaps or blocked. 
   }
 } catch (error) {
   let reason = String(error?.message ?? error);
-  if (error?.spawnBudgetExhausted && invocation?.association && !persistenceFailed && !loop?.halt &&
-      !resolution?.currentBarrier && !hostHalt) {
-    const marker = { checkpoint: invocation.lastConfirmed?.digest ?? null,
-      closedLoop: loop?.archived ? loop.number : (loop?.number ?? 1) - 1,
-      ledger: clone(invocation.ledger), backlogDigest: invocation.backlogDigest ?? null };
-    const stalled = same(marker, invocation.lastBudgetProgress);
-    invocation.lastBudgetProgress = marker;
-    if (stalled) loop.halt = { status: "blocked", code: "spawn-budget",
-      reason: "No seals admitted or loops closed since the previous budget-exhausted end; one step needs more spawns than the per-run budget. Human intervention must raise config.maxSubagentSpawnsPerRun or reduce that step's spawn demand." };
+  if (canSaveBudgetExhaustion(error)) {
     try {
-      await save();
-      return finish(stalled ? "blocked" : "budget-exhausted", stalled ? loop.halt.reason :
-        "Native per-run spawn budget exhausted before any child in the admission group started; state saved. Automatically relaunch the same invocation and mission as a new top-level run.");
+      return await finishBudgetExhaustion();
     } catch (saveError) { reason += ` ${String(saveError?.message ?? saveError)}`; }
   }
   if (error?.hostHalt) {
