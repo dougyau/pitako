@@ -807,13 +807,15 @@ or silently recaptures it.
 
 Before a writer dispatch the root durably binds a checkpoint intention to the
 unchanged association, loop/cursor, task/attempt and admitted-plan reference.
-The bound writer calls registered `checkpoint_create({kind:"pre", paths:[...]})`
-before checkout writes; native launch context supplies the actual durable attempt
-and progress. It returns structured artifact references, not model-assembled
-capture/seal scripts or receipts. Missing/stale context fails closed. The same
-owned capture operations back the tool and existing helper, not a parallel
-journal. Keep `skills/execute/checkpoint.mjs` for journaled apply and selective
-restore; see the execute skill. The tool accepts only `kind:"pre"`. After a
+The bound writer edits with `edit`, `write` or `apply_patch`; the checkpoint
+extension's `tool_call` hook captures each first-touch preimage into the
+append-only attempt manifest and journals each call before allowing it. Native
+launch context supplies the actual durable attempt and progress. Missing/stale
+context or journal failure blocks the call; there are no model-assembled
+capture/seal scripts or receipts. The same owned capture operations back the
+hook and existing helper, not a parallel journal. Keep
+`skills/execute/checkpoint.mjs` for sealing and selective restore; see the
+execute skill. After a
 cooperative worker terminal the root dispatches the model-free
 `pitako.checkpoint-sealer`, which verifies the journal, observes the candidate and
 seals `unit` for a valid complete report or `pause` for pending work. A journal

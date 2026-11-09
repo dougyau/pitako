@@ -3,9 +3,10 @@ import { createHash, randomUUID } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { readContextPeak, type CheckpointIntent } from "../../extensions/execute-checkpoint.ts";
 import { checkoutEvidence } from "../../extensions/spec-plans.ts";
 import { repositoryIdentity } from "../../extensions/board/workspace.ts";
-import { openBoard, type Board, type Post } from "../../extensions/board/store.ts";
+import { openBoard, viewEntry, viewBudget, BINDING_BAND_BYTES, BOARD_VIEW_AUTHORITY, type Board, type Post } from "../../extensions/board/store.ts";
 
 const require = createRequire(import.meta.url);
 const { canonicalDigest } = require("../../extensions/canonical.mjs") as { canonicalDigest(value: unknown): string };
@@ -17,7 +18,7 @@ export type Metric = { command: string; unit: string; target: number };
 export type Sample = { value: number | null; best: number | null; fingerprint: string; gatesPassed: number; gatesTotal: number };
 export type Progress = { nonImproving: number; last5: Sample[]; stalls?: number };
 export type Task = {
-  id: string; goal: string; expectedResult: string; status: "pending" | "done" | "obsolete" | "blocked";
+  id: string; title?: string; goal: string; expectedResult: string; status: "pending" | "done" | "obsolete" | "blocked";
   origin: { kind: "spec" | "director" | "final-phase" | "human"; ref: string };
   specRefs: string[]; dependsOn: string[]; gates: Command[]; metric: Metric | null; parent: string | null;
   remaining: string; progress: Progress;
@@ -37,10 +38,11 @@ export type Authority = { specDigest: string; amendmentDigests: string[] };
 export type AcceptanceHistory = { invocation: string; loop: number; kind: "init" | "replace" | "human"; reason: string; digest: string };
 export type Backlog = { version: 1; acceptanceHistory: AcceptanceHistory[]; specId: string; authority: Authority;
   acceptance: AcceptanceCommand[]; lastApplied: { key: string; requestDigest: string; contentDigest: string } | null; tasks: Task[] };
+export const TASK_UPDATE_KEYS = ["goal", "expectedResult", "specRefs", "dependsOn", "gates", "metric", "remaining", "title"] as const;
 export type Change = { kind: "add"; task: Task; reason: string } |
   { kind: "split"; id: string; tasks: Task[]; reason: string } |
   { kind: "obsolete"; id: string; reason: string } |
-  { kind: "update"; id: string; patch: Partial<Pick<Task, "goal" | "expectedResult" | "specRefs" | "dependsOn" | "gates" | "metric" | "remaining">>; reason: string };
+  { kind: "update"; id: string; patch: Partial<Pick<Task, typeof TASK_UPDATE_KEYS[number]>>; reason: string };
 export type Selection = { select: string | null; changes: Change[]; reason: string; acceptance?: Backlog["acceptance"] };
 export type BoardView = { topicId: number; authority: string; posts: (Pick<Post, "id" | "type" | "content" | "metadata"> & Partial<Pick<Post, "author" | "createdAt">>)[]; omitted: number };
 export type GateResult = { id: string; status: "pass" | "fail" | "timeout" | "error"; exit: number | null; ms: number; tail: string; logRef: string };
@@ -48,12 +50,13 @@ export type FinalAcceptance = { loop: number; gateKey: string; candidate: { head
   exec: Command[]; results: GateResult[] };
 export type GateReceipt = { before: Pick<ReturnType<typeof checkoutEvidence>, "head" | "fingerprint">; after: Pick<ReturnType<typeof checkoutEvidence>, "head" | "fingerprint">;
   mutated: boolean; gates: GateResult[]; metric: { value: number | null; error: string | null } | null;
-  progress: Progress; stalled: boolean; view: BoardView; reused?: { loop: number; gateKey: string } };
+  progress: Progress; stalled: boolean; contextPeak?: number | null; view: BoardView; reused?: { loop: number; gateKey: string } };
 const bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value));
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 function assert(ok: unknown, message: string): asserts ok { if (!ok) throw new Error(message); }
 function record(value: unknown): value is Record<string, unknown> { return !!value && typeof value === "object" && !Array.isArray(value); }
 const text = (value: unknown): value is string => typeof value === "string" && !!value.trim() && !value.includes("\0");
+const title = (value: unknown): value is string => text(value) && value.length <= 80;
 const strings = (value: unknown): value is string[] => Array.isArray(value) && value.every(text);
 const digest = (value: unknown) => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 function key(value: unknown): asserts value is string { assert(typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value) && !value.includes(".."), "Invalid loop key"); }
@@ -78,6 +81,7 @@ export function validateBacklog(value: unknown): asserts value is Backlog {
   const ids = new Set<string>();
   for (const task of value.tasks) {
     assert(record(task), "Invalid task"); key(task.id); assert(!ids.has(task.id), `Duplicate task ID ${task.id}`); ids.add(task.id);
+    assert(task.title === undefined || title(task.title), `Invalid title for ${task.id}: expected non-empty text of at most 80 characters`);
     assert(text(task.goal) && text(task.expectedResult) && ["pending", "done", "obsolete", "blocked"].includes(String(task.status)), `Invalid task ${task.id}`);
     assert(record(task.origin) && ["spec", "director", "final-phase", "human"].includes(String(task.origin.kind)) && text(task.origin.ref), `Invalid origin for ${task.id}`);
     assert(strings(task.specRefs) && strings(task.dependsOn), `Invalid references for ${task.id}`);
@@ -119,8 +123,10 @@ export function readBacklog(root: string, specId: string) {
   }
 }
 export function topicOwner(root: string, specId: string) { key(specId); return `execute:${specId}:${hash(realpathSync(root)).slice(0, 16)}`; }
-const AUTHORITY = "spec, frozen amendments and current HUMAN rulings (most recent human source wins; cite it) > DECISION > FINDING > HANDOFF; code wins over any map";
-export function boardView(board: Board, workspace: string, topicId: number, taskId?: string, maxBytes = 12 * 1024): BoardView {
+function assertViewFits(ok: boolean, message: string): void {
+  if (!ok) throw Object.assign(new Error(message), { viewOverflow: true });
+}
+export function boardView(board: Board, workspace: string, topicId: number, { taskId, maxBytes = 12 * 1024, doneTaskIds = [] }: { taskId?: string; maxBytes?: number; doneTaskIds?: readonly string[] } = {}): BoardView {
   const posts: Post[] = [];
   let beforePostId: number | undefined;
   do {
@@ -134,13 +140,12 @@ export function boardView(board: Board, workspace: string, topicId: number, task
     const refs = Array.isArray(p.metadata?.supersedes) ? p.metadata.supersedes : [p.metadata?.supersedes];
     for (const ref of refs) if (posts.some(old => old.id === ref && old.id < p.id && old.type === p.type)) superseded.add(ref as number);
   }
-  const relevant = posts.filter(p => !superseded.has(p.id) && (p.type === "HUMAN" || p.type === "DECISION" || p.type === "FINDING" && (!taskId || !p.metadata?.taskId || p.metadata.taskId === taskId) || p.type === "HANDOFF" && taskId && p.metadata?.taskId === taskId));
-  const project = (p: Post) => ({ id: p.id, type: p.type, content: p.content, metadata: p.metadata,
-    ...(p.type === "HUMAN" ? { author: p.author, createdAt: p.createdAt } : {}) });
+  const relevant = posts.filter(p => !superseded.has(p.id) && (p.type === "HUMAN" || p.type === "DECISION" || p.type === "FINDING" && (taskId ? !p.metadata?.taskId || p.metadata.taskId === taskId : !doneTaskIds.includes(p.metadata?.taskId as string)) || p.type === "HANDOFF" && taskId && p.metadata?.taskId === taskId));
+  const project = viewEntry;
   const binding = relevant.filter(p => p.type === "HUMAN" || p.type === "DECISION").map(project);
-  assert(bytes(binding) <= 8192, "HUMAN + DECISION overflow: ask the human to consolidate current Board HUMAN rulings and decisions");
-  const view: BoardView = { topicId, authority: AUTHORITY, posts: [...binding], omitted: relevant.length - binding.length };
-  assert(bytes(view) <= maxBytes, "HUMAN + DECISION overflow: Board view cannot retain binding rules; human consolidation required");
+  assertViewFits(bytes(binding) <= BINDING_BAND_BYTES, "HUMAN + DECISION overflow: ask the human to consolidate current Board HUMAN rulings and decisions");
+  const view: BoardView = { topicId, authority: BOARD_VIEW_AUTHORITY, posts: [...binding], omitted: relevant.length - binding.length };
+  assertViewFits(bytes(view) <= maxBytes, "HUMAN + DECISION overflow: Board view cannot retain binding rules; human consolidation required");
   for (const p of relevant.filter(p => p.type !== "HUMAN" && p.type !== "DECISION")) {
     const entry = project(p); view.posts.push(entry); view.omitted--;
     if (bytes(view) > maxBytes) { view.posts.pop(); view.omitted++; }
@@ -179,7 +184,7 @@ export async function prepare(input: { root: string; specId: string; previousCon
   const lastConfirmedUnit = state.backlog?.tasks.some(t => t.id === input.previousConfirmedUnit && t.status === "done") ? input.previousConfirmedUnit : null;
   return withBoard(input.root, input.specId, input.dbPath, (board, workspace, topicId) => ({ ...state,
     cancelledScope: state.backlog ? cancelledScope(state.backlog) : [],
-    view: boardView(board, workspace, topicId, input.taskId), lastConfirmedUnit }));
+    view: boardView(board, workspace, topicId, { taskId: input.taskId, doneTaskIds: state.backlog?.tasks.filter(t => t.status === "done").map(t => t.id) }), lastConfirmedUnit }));
 }
 function selectTask(backlog: Backlog, selected: string | null, currentHumanIds?: number[]) {
   if (selected === null) { assert(!backlog.tasks.some(t => t.status === "pending" || t.status === "blocked"), "Invalid final selection: unfinished tasks remain"); assert(backlog.acceptance.length > 0, "Final phase requires non-empty acceptance commands"); validateAcceptanceExceptions(backlog.acceptance, currentHumanIds); return null; }
@@ -204,9 +209,11 @@ export function apply(input: { root: string; specId: string; expectedDigest: str
   if (current.backlog?.lastApplied?.key === input.key) {
     assert(current.backlog.lastApplied.requestDigest === requestDigest &&
       current.backlog.lastApplied.contentDigest === canonicalDigest({ ...current.backlog, lastApplied: null }), `backlog-conflict: ${current.path} (replay differs)`);
-    if (input.director.acceptance !== undefined || input.acceptance !== undefined) validateAcceptanceExceptions(current.backlog.acceptance, currentHumanIds);
-    return { ...current, completedTasks: completedTasks(current.backlog), cancelledScope: cancelledScope(current.backlog), selected: input.settle || input.recordGaps || input.cancellations ? null : selectTask(current.backlog, input.director.select, currentHumanIds),
-      needsDecision: input.settle ? stallDecision(current.backlog, input.invocation, input.loop, input.progress?.taskId) : null, replay: true };
+    try {
+      if (input.director.acceptance !== undefined || input.acceptance !== undefined) validateAcceptanceExceptions(current.backlog.acceptance, currentHumanIds);
+      return { ...current, completedTasks: completedTasks(current.backlog), cancelledScope: cancelledScope(current.backlog), selected: input.settle || input.recordGaps || input.cancellations ? null : selectTask(current.backlog, input.director.select, currentHumanIds),
+        needsDecision: input.settle ? stallDecision(current.backlog, input.invocation, input.loop, input.progress?.taskId) : null, replay: true };
+    } catch (error) { throw Object.assign(error as Error, { replayRejected: true }); } // P6e: never retried by a director
   }
   assert(current.digest === input.expectedDigest, `backlog-conflict: ${current.path}`);
   const backlog: Backlog = structuredClone(current.backlog ?? { version: 1, specId: input.specId, authority: input.authority, acceptance: [], acceptanceHistory: [], lastApplied: null, tasks: [] });
@@ -256,6 +263,7 @@ export function apply(input: { root: string; specId: string; expectedDigest: str
     const add = (task: Task, reason: string, parent: string | null = null) => {
       assert(!backlog.tasks.some(t => t.id === task.id), `Task ID never reused: ${task.id}`);
       assert(task.status === "pending", "New tasks must be pending");
+      assert(title(task.title), "New tasks require a non-empty title of at most 80 characters");
       const added = structuredClone(task); added.parent = parent ?? task.parent; added.progress = { nonImproving: 0, last5: [], stalls: 0 }; added.history = []; history(added, "add", reason); backlog.tasks.push(added);
     };
     for (const [index, original] of input.director.changes.entries()) {
@@ -273,8 +281,9 @@ export function apply(input: { root: string; specId: string; expectedDigest: str
         if (change.kind === "obsolete") task.status = "obsolete";
         else if (change.kind === "split") { assert(Array.isArray(change.tasks) && change.tasks.length > 0, "Split needs children"); task.status = "obsolete"; for (const child of change.tasks) add(child, change.reason, task.id); }
         else if (change.kind === "update") {
-          assert(record(change.patch) && Object.keys(change.patch).every(k => ["goal", "expectedResult", "specRefs", "dependsOn", "gates", "metric", "remaining"].includes(k)), "Invalid update patch (status/identity cannot be changed)");
+          assert(record(change.patch) && Object.keys(change.patch).every(k => (TASK_UPDATE_KEYS as readonly string[]).includes(k)), "Invalid update patch (status/identity cannot be changed)");
           Object.assign(task, change.patch);
+          assert(title(task.title), "Updated tasks require a non-empty title of at most 80 characters");
         } else throw new Error("Unknown backlog change");
         history(task, change.kind, change.reason);
       }
@@ -446,11 +455,15 @@ export async function runCommand(root: string, cmd: Command, logRef: string): Pr
 }
 export type GateInput = { root: string; specId: string; invocation: string; loop: number; attempt: number; key: string;
   task: Pick<Task, "id" | "gates" | "metric" | "progress">; workerStatus: string; writerSettled: true;
-  knowledge?: { findings?: unknown; handoff?: unknown }; dbPath?: string; metricTimeoutMs?: number; reuse?: FinalAcceptance };
+  checkpoint?: CheckpointIntent; knowledge?: { findings?: unknown; handoff?: unknown }; dbPath?: string; metricTimeoutMs?: number; reuse?: FinalAcceptance };
 export async function gate(input: GateInput): Promise<GateReceipt> {
   assert(input.writerSettled === true, "Gate requires a settled worker and no active writer");
   key(input.invocation); key(input.key); key(input.task.id);
   assert(Number.isSafeInteger(input.loop) && input.loop > 0 && Number.isSafeInteger(input.attempt) && input.attempt > 0, "Invalid gate attempt");
+  if (input.checkpoint) assert(input.checkpoint.association.root === input.root &&
+    input.checkpoint.association.invocation === input.invocation && input.checkpoint.loop === input.loop &&
+    input.checkpoint.attempt === input.attempt && input.checkpoint.taskId === input.task.id, "Gate checkpoint attempt mismatch");
+  const contextPeak = input.checkpoint ? readContextPeak(input.checkpoint) : null;
   const directory = safePath(path.join(input.root, ".pi/subagents/execute", input.invocation, "gates", input.key));
   const before = checkoutEvidence(input.root), gates: GateResult[] = [];
   const executed = (commands: Command[]) => commands.map(({ id, command, cwd, timeoutMs }) => ({ id, command, cwd, timeoutMs }));
@@ -488,21 +501,21 @@ export async function gate(input: GateInput): Promise<GateReceipt> {
     });
     if (text(input.knowledge?.handoff)) board.postOnce(workspace, `${prefix}:HANDOFF`, { topicId, type: "HANDOFF", content: clipped(input.knowledge.handoff, 2048), metadata: { taskId: input.task.id } });
     const receipt: GateReceipt = { before: { head: before.head, fingerprint: before.fingerprint },
-      after: { head: after.head, fingerprint: after.fingerprint }, mutated, gates, metric, progress, stalled: progress.nonImproving >= 3,
-      view: boardView(board, workspace, topicId, input.task.id),
+      after: { head: after.head, fingerprint: after.fingerprint }, mutated, gates, metric, progress, contextPeak, stalled: progress.nonImproving >= 3,
+      view: boardView(board, workspace, topicId, { taskId: input.task.id }),
       ...(reused ? { reused: { loop: reuse.loop, gateKey: reuse.gateKey } } : {}) };
     mkdirSync(directory, { recursive: true });
     // Keep the full diagnostic even when the wire representation needs smaller tails/views.
     writeFileSync(safePath(path.join(directory, "receipt.json")), JSON.stringify({ ...receipt, before, after }) + "\n");
     for (const g of receipt.gates) { while (bytes(g.tail) > 2048) g.tail = g.tail.slice(Math.max(1, Math.ceil(g.tail.length / 8))); }
-    while (bytes(receipt) > 8191 && receipt.gates.some(g => g.tail.length > 0)) {
+    while (bytes(receipt) > viewBudget(0) && receipt.gates.some(g => g.tail.length > 0)) {
       for (const g of receipt.gates) g.tail = g.tail.slice(Math.ceil(g.tail.length / 2));
     }
-    if (bytes(receipt) > 8191) {
+    if (bytes(receipt) > viewBudget(0)) {
       const overhead = bytes(receipt) - bytes(receipt.view);
-      receipt.view = boardView(board, workspace, topicId, input.task.id, 8191 - overhead);
+      receipt.view = boardView(board, workspace, topicId, { taskId: input.task.id, maxBytes: viewBudget(overhead) });
     }
-    assert(bytes(receipt) <= 8191, `Gate receipt exceeds 8 KiB; see ${path.join(directory, "receipt.json")}`);
+    assertViewFits(bytes(receipt) <= viewBudget(0), `Gate receipt exceeds 8 KiB; see ${path.join(directory, "receipt.json")}`);
     return receipt;
   });
 }

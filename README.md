@@ -252,8 +252,8 @@ historical records or Git. Installed
 pi-subagents 0.83.0 does not prove a running host reloaded it. No models, settings,
 capacity overrides, private execution store or replacement scheduler are added.
 
-Bound execute writers use registered `checkpoint_create` only for pre-write
-capture. After the worker ends, the root's model-free `pitako.checkpoint-sealer`
+Bound execute writers edit with `edit`, `write` or `apply_patch`; the checkpoint
+extension's hook captures first-touch preimages and journals each call. After the worker ends, the root's model-free `pitako.checkpoint-sealer`
 verifies the journal and seals the unit or pending pause; a journal mismatch halts
 with the differing paths. Only durable root result admission confirms the point.
 The worker is the only writer of checkout content; deterministic root agents

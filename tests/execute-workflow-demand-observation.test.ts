@@ -50,6 +50,9 @@ test.each(["first-loop", "rejected-plan"])("%s alone dispatches no observation",
   });
   expect((await host.execute()).status).toBe("complete");
   expect(host.calls.some(call => call.key.endsWith(".demand-observation"))).toBe(false);
+  if (mode === "rejected-plan")
+    expect(host.calls.filter(call => call.key.startsWith("invoke-human-1.l1.director")).map(call => call.key))
+      .toEqual(["invoke-human-1.l1.director", "invoke-human-1.l1.director.d1"]);
 });
 
 test.each(["rejected-report", "unusable-failure", "candidate-change"])("%s gaps alone dispatches no observation", async mode => {
@@ -94,7 +97,7 @@ test.each(["gaps", "continue"])("unfinished worker %s with no remaining entries 
     if (request.agent === "pitako.worker" && request.key.startsWith("invoke-human-1.l1.t1.")) return host.result(request, {
       ...host.worker(request), status, remaining: [],
       work: "Required parser branch is still missing",
-      continuation: status === "continue" ? "Implement the missing parser branch" : null,
+      continuation: { mode: "fresh", reason: "Implement the missing parser branch" },
     });
     if (request.key.endsWith(".demand-observation")) {
       expect(request.task).toContain("Three consecutive non-improving attempts");
@@ -119,7 +122,7 @@ test("an intermediate continuation completed in the same loop creates no demand 
   const host = fixture();
   host.setRespond((request, normal) => request.key === "invoke-human-1.l1.t1.a1" ? host.result(request, {
     ...host.worker(request, "pause"), status: "continue", remaining: ["Implement the missing parser branch"],
-    diagnosis: "Required parser branch is still missing", continuation: "Implement the missing parser branch",
+    diagnosis: "Required parser branch is still missing", continuation: { mode: "fresh", reason: "Implement the missing parser branch" },
   }) : normal());
   const outcome = await host.executeNative();
   expect(outcome.status, JSON.stringify(outcome)).toBe("complete");

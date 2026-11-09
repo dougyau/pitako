@@ -99,6 +99,19 @@ export interface QueryResult {
 export type InternalPostType = Exclude<PostType, "HUMAN">;
 export const HUMAN_QUOTE_MAX = 16_000;
 
+export const BOARD_VIEW_AUTHORITY = "spec, frozen amendments and current HUMAN rulings (most recent human source wins; cite it) > DECISION > FINDING > HANDOFF; code wins over any map";
+export const viewBudget = (overhead: number) => 8191 - overhead;
+// Policy reserve for receipt identities, gate results and progress, excluding tails.
+export const GATE_RESERVE = 2048;
+const VIEW_ENVELOPE_BYTES = Buffer.byteLength(JSON.stringify({
+  topicId: Number.MAX_SAFE_INTEGER, authority: BOARD_VIEW_AUTHORITY, posts: [], omitted: Number.MAX_SAFE_INTEGER,
+})) - 2;
+export const BINDING_BAND_BYTES = viewBudget(GATE_RESERVE) - VIEW_ENVELOPE_BYTES;
+export function viewEntry(post: Post) {
+  return { id: post.id, type: post.type, content: post.content, metadata: post.metadata,
+    ...(post.type === "HUMAN" ? { author: post.author, createdAt: post.createdAt } : {}) };
+}
+
 export interface PostInput<T extends PostType = InternalPostType> {
   topicId: number;
   type: T;
@@ -598,6 +611,10 @@ class SqliteBoard implements Board {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const post = this.insertPost(workspace, input, author);
+      if (post.type === "HUMAN") {
+        const size = Buffer.byteLength(JSON.stringify([viewEntry(post)]));
+        if (size > BINDING_BAND_BYTES) throw new BoardError(`HUMAN view entry is ${size} bytes; limit is ${BINDING_BAND_BYTES} bytes`);
+      }
       this.db.exec("COMMIT");
       return post;
     } catch (error) {

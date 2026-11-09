@@ -5,10 +5,11 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { checkoutEvidence, checkoutSnapshot } from "../extensions/spec-plans.ts";
 import planExecute from "../extensions/plan-execute.ts";
 import { copy, cutAt, executeControllerFixture } from "./fixtures/execute-workflow.ts";
 import { RunFanoutLimitError } from "../node_modules/pi-subagents/src/runs/shared/run-fanout-budget.js";
-import { applyCheckpoint, captureCheckpoint, checkpointDirectory, prepareCheckpoint, restoreCheckpoint, type CheckpointIntent } from "../extensions/execute-checkpoint.ts";
+import { captureBaseline, beginHookEffect, closeHookEffect, applyCheckpoint, captureCheckpoint, checkpointDirectory, prepareCheckpoint, restoreCheckpoint, type CheckpointIntent } from "../extensions/execute-checkpoint.ts";
 import { buildExternalCliPrompt } from "../node_modules/pi-subagents/src/runs/shared/external-cli-runner.js";
 const sealerPrompt = "Fixed checkpoint sealer; stdin is a JSON {v, intent, kind, restoreSources?} request.";
 
@@ -168,8 +169,9 @@ test.each([
     if (request.key === "invoke-human-1.l1.t1.a1") {
       const value = host.worker(request);
       expect(Object.keys(request.outputSchema.properties).sort()).toEqual([
-        "knowledge", "remaining", "status", "work",
+        "continuation", "knowledge", "remaining", "status", "work",
       ]);
+      expect(request.outputSchema.required).not.toContain("continuation");
       return host.result(request, { ...value, status, remaining });
     }
     if (request.agent === "pitako.checkpoint-sealer") {
@@ -250,14 +252,14 @@ test("root observes missing manifests and blocks changed candidates without a jo
       const value = host.worker(request);
       const descriptor = JSON.parse(request.task.split("PRE-WRITE CHECKPOINT INTENTION (not a backup until published):\n")[1]!.split("\n")[0]!);
       host.changeCheckout();
-      rmSync(path.join(host.root, ".pi/subagents/checkpoints", descriptor.key), { recursive: true });
+      rmSync(path.join(host.root, ".pi/subagents/checkpoints", descriptor.key, "manifest.json"));
       return host.result(request, value);
     }
     return observeGate(host, request, normal);
   });
   const output = await host.execute();
   expect(output.status).toBe("blocked");
-  expect(output.reason).toContain("Implementation completion requires a journal-backed unit seal or an unchanged gated baseline");
+  expect(output.reason).toContain("candidate-drift");
   expect(host.current().loop.attempt).not.toHaveProperty("result");
   expect(host.current().lastConfirmed).toBeNull();
 });
@@ -429,4 +431,198 @@ test("replay with a seal record and unknown worker status observes the sealer, f
   expect(host.history()[0].results.filter((entry: any) => entry.taskId === "change1").map((entry: any) => entry.status)).toEqual([]);
   expect(host.current().lastConfirmed).toBeNull();
   expect(host.current().loop.attempt).toMatchObject({ taskId: "change1", number: 2, restore: expect.anything() });
+});
+
+
+test("append-only first touches seal late paths and retain the original preimage", () => {
+  const f = fixture();
+  const first = beginHookEffect(f.intent, "edit", ["owned"]);
+  const manifest = readFileSync(path.join(f.directory, "manifest.json"), "utf8");
+  const capture = readFileSync(path.join(f.directory, "capture-000000.json"), "utf8");
+  writeFileSync(path.join(f.root, "owned"), "first"); closeHookEffect(f.intent, first);
+  const late = beginHookEffect(f.intent, "apply_patch", ["owned", "late"]);
+  writeFileSync(path.join(f.root, "owned"), "second"); writeFileSync(path.join(f.root, "late"), "discovered");
+  closeHookEffect(f.intent, late);
+  expect(readFileSync(path.join(f.directory, "manifest.json"), "utf8")).toBe(manifest);
+  expect(readFileSync(path.join(f.directory, "capture-000000.json"), "utf8")).toBe(capture);
+  expect(existsSync(path.join(f.directory, "capture-000002.json"))).toBe(false);
+  const result = f.run("unit"); expect(result.status, result.stderr).toBe(0);
+  expect(result.value.outcome).toBe("sealed");
+  const point = JSON.parse(JSON.parse(readFileSync(result.value.checkpointRef, "utf8")).data);
+  expect(point.files.map((file: any) => file.path)).toEqual(["owned", "late"]);
+  expect(f.run("unit").value).toEqual(result.value);
+});
+
+test("never-closed effects prevent sealing without product writes and retain arbitrary bytes before restore", () => {
+  const f = fixture(); beginHookEffect(f.intent, "write", ["owned", "late"]);
+  writeFileSync(path.join(f.root, "owned"), "arbitrary partial bytes");
+  writeFileSync(path.join(f.root, "late"), "partial new file");
+  for (const kind of [null, "unit", "pause"] as const) {
+    const result = f.run(kind); expect(result.status, result.stderr).toBe(0);
+    expect(result.value).toMatchObject({ outcome: "open", paths: ["owned", "late"] });
+    expect(readFileSync(path.join(f.root, "owned"), "utf8")).toBe("arbitrary partial bytes");
+  }
+  expect(existsSync(path.join(f.directory, "unit.json"))).toBe(false);
+  const restored = restoreCheckpoint(f.intent, { pending: true, stop: false, permissionDenied: false,
+    activeWriter: null, references: ["unknown writer"] });
+  const partial = JSON.parse(JSON.parse(readFileSync(restored.partialRef, "utf8")).data).partial;
+  expect(Buffer.from(partial[0].image.bytes, "base64").toString()).toBe("arbitrary partial bytes");
+  expect(Buffer.from(partial[1].image.bytes, "base64").toString()).toBe("partial new file");
+  expect(readFileSync(path.join(f.root, "owned"), "utf8")).toBe("before");
+  expect(existsSync(path.join(f.root, "late"))).toBe(false);
+  expect(f.run(null, { restoreSources: [f.intent] }).value.outcome).toBe("observed");
+});
+
+test.each(["capture", "effect", "postimage"])("insufficient %s evidence halts restoration without overwriting product bytes", missing => {
+  const f = fixture(); const seq = beginHookEffect(f.intent, "write", ["owned"]);
+  writeFileSync(path.join(f.root, "owned"), "partial bytes");
+  if (missing === "capture") rmSync(path.join(f.directory, "capture-000000.json"));
+  else {
+    closeHookEffect(f.intent, seq);
+    if (missing === "effect") rmSync(path.join(f.directory, "hook-effect-000000.json"));
+    else {
+      const data = JSON.stringify({ after: null });
+      writeFileSync(path.join(f.directory, "hook-effect-000000-closed.json"), JSON.stringify({ data, sha256: sha(data) }));
+    }
+  }
+  expect(() => restoreCheckpoint(f.intent, { pending: true, stop: false, permissionDenied: false,
+    activeWriter: null, references: ["unknown writer"] })).toThrow(missing === "capture" ? "reconstructible preimages"
+      : missing === "effect" ? "closure lacks an effect intent" : "Invalid hook effect postimages");
+  expect(readFileSync(path.join(f.root, "owned"), "utf8")).toBe("partial bytes");
+  expect(existsSync(path.join(f.directory, "restore.json"))).toBe(false);
+});
+
+test("controller admits a late-discovered path in the original worker attempt", async () => {
+  const host = controller(); host.setLimit(1);
+  host.setRespond((request, normal) => {
+    if (request.key === "invoke-human-1.l1.t1.a1") {
+      const value = host.worker(request), intent = host.current().loop.attempt.checkpoint;
+      expect(host.current().loop.attempt).toMatchObject({ stage: "launched", bindingKey: intent.key });
+      const file = path.join(host.root, "src/change1.ts"); mkdirSync(path.dirname(file), { recursive: true });
+      const first = beginHookEffect(intent, "write", ["src/change1.ts"]);
+      writeFileSync(file, "first write"); closeHookEffect(intent, first);
+      const late = beginHookEffect(intent, "write", ["late.ts"]);
+      writeFileSync(path.join(host.root, "late.ts"), "late discovery"); closeHookEffect(intent, late);
+      return host.result(request, value);
+    }
+    return observeGate(host, request, normal);
+  });
+  expect((await host.execute()).status).toBe("partial");
+  expect(host.calls.filter(call => call.agent === "pitako.worker").map(call => call.key)).toEqual(["invoke-human-1.l1.t1.a1"]);
+  expect(host.history()[0].results[0]).toMatchObject({ status: "complete", attempt: 1,
+    checkpoint: { confirmation: { kind: "unit" } } });
+  expect(readFileSync(path.join(host.root, "late.ts"), "utf8")).toBe("late discovery");
+});
+
+test("controller routes a never-closed effect to a restoring worker before admission", async () => {
+  const host = controller(); host.setLimit(1);
+  let source: CheckpointIntent;
+  host.setRespond((request, normal) => {
+    if (request.key === "invoke-human-1.l1.t1.a1") {
+      const value = host.worker(request); source = host.current().loop.attempt.checkpoint;
+      beginHookEffect(source, "write", ["src/change1.ts"]);
+      mkdirSync(path.join(host.root, "src"), { recursive: true });
+      writeFileSync(path.join(host.root, "src/change1.ts"), "uncertain partial bytes");
+      return host.result(request, value);
+    }
+    if (request.key === "invoke-human-1.l1.t1.a2") {
+      expect(host.current().loop.attempt.restore).toBeDefined();
+      const restored = restoreCheckpoint(source, host.current().loop.attempt.restore.authority);
+      const partial = JSON.parse(JSON.parse(readFileSync(restored.partialRef, "utf8")).data).partial;
+      expect(Buffer.from(partial[0].image.bytes, "base64").toString()).toBe("uncertain partial bytes");
+      expect(existsSync(path.join(host.root, "src/change1.ts"))).toBe(false);
+    }
+    return observeGate(host, request, normal);
+  });
+  const output = await host.execute(); expect(output.status, output.reason).toBe("partial");
+  expect(host.calls.filter(call => call.agent === "pitako.worker").map(call => call.key))
+    .toEqual(["invoke-human-1.l1.t1.a1", "invoke-human-1.l1.t1.a2"]);
+  expect(host.history()[0].results[0]).toMatchObject({ status: "complete", attempt: 2 });
+});
+
+function dispatchBaseline(f: ReturnType<typeof fixture>) {
+  const { head, fingerprint } = checkoutEvidence(f.root);
+  f.intent.baseline = { head, fingerprint };
+  expect(captureBaseline({ intent: f.intent }).candidate).toEqual(f.intent.baseline!);
+}
+test("dispatch map uses checkoutEvidence paths, absence, modes and ignored-output exclusions", () => {
+  const f = fixture();
+  writeFileSync(path.join(f.root, "deleted"), "tracked");
+  execFileSync("git", ["add", "deleted"], { cwd: f.root });
+  const { unlinkSync } = require("node:fs"); unlinkSync(path.join(f.root, "deleted"));
+  writeFileSync(path.join(f.root, ".gitignore"), "ignored\n");
+  writeFileSync(path.join(f.root, "ignored"), "build");
+  mkdirSync(path.join(f.root, ".pitako")); writeFileSync(path.join(f.root, ".pitako", "data"), "metadata");
+  dispatchBaseline(f);
+  const baseline = JSON.parse(JSON.parse(readFileSync(path.join(f.directory, "baseline.json"), "utf8")).data);
+  expect(baseline.files).toEqual(checkoutSnapshot(f.root).files);
+  expect(baseline.files.deleted).toBeNull();
+  expect(baseline.files.owned).toEqual({ hash: sha("before"), mode: require("node:fs").statSync(path.join(f.root, "owned")).mode });
+  expect(baseline.files).not.toHaveProperty("ignored");
+  expect(baseline.files).not.toHaveProperty(".pitako/data");
+  expect(baseline.candidate).toEqual(f.intent.baseline!);
+  expect(captureBaseline({ intent: f.intent }).candidate).toEqual(f.intent.baseline!);
+  writeFileSync(path.join(f.root, "owned"), "changed");
+  expect(() => captureBaseline({ intent: f.intent })).toThrow("conflicts with retained original");
+});
+test.each(["new", "existing", "deleted", "mode", "preimage", "no-manifest"])("strict dispatch attribution rejects %s changes", mode => {
+  const f = fixture();
+  writeFileSync(path.join(f.root, "other"), "baseline");
+  dispatchBaseline(f);
+  if (mode === "preimage") writeFileSync(path.join(f.root, "owned"), "unjournaled before capture");
+  if (mode !== "no-manifest") { f.capture(); f.change("after"); }
+  if (mode === "new" || mode === "no-manifest") writeFileSync(path.join(f.root, "new"), "foreign");
+  if (mode === "existing") writeFileSync(path.join(f.root, "other"), "foreign");
+  if (mode === "deleted") require("node:fs").unlinkSync(path.join(f.root, "other"));
+  if (mode === "mode") require("node:fs").chmodSync(path.join(f.root, "other"), 0o755);
+  const result = f.run("unit");
+  expect(result.status, result.stderr).toBe(0);
+  expect(result.value).toMatchObject({ outcome: "mismatch", paths: [{ path: mode === "preimage" ? "owned" : mode === "new" || mode === "no-manifest" ? "new" : "other" }] });
+  expect(existsSync(path.join(f.directory, "unit.json"))).toBe(false);
+});
+test("strict attribution admits same-attempt late paths and ignores build outputs", () => {
+  const f = fixture(); writeFileSync(path.join(f.root, ".gitignore"), "build\n"); dispatchBaseline(f);
+  f.capture(); f.change("after");
+  const effect = beginHookEffect(f.intent, "write", ["late"]);
+  writeFileSync(path.join(f.root, "late"), "discovered late"); closeHookEffect(f.intent, effect);
+  writeFileSync(path.join(f.root, "build"), "ignored");
+  const result = f.run("unit"); expect(result.status, result.stderr).toBe(0);
+  expect(result.value.outcome).toBe("sealed");
+});
+test.each([false, true])("restoration uses restored images only for restored paths (foreign=%s)", foreign => {
+  const f = fixture(); writeFileSync(path.join(f.root, "other"), "dispatch bytes");
+  f.capture(); f.change("interrupted");
+  const next: CheckpointIntent = { ...f.intent, key: "test.a2", attempt: 2 };
+  const { head, fingerprint } = checkoutEvidence(f.root); next.baseline = { head, fingerprint };
+  captureBaseline({ intent: next });
+  restoreCheckpoint(f.intent, { pending: true, stop: false, permissionDenied: false, activeWriter: null, references: ["settled"] });
+  const restore = JSON.parse(JSON.parse(readFileSync(path.join(f.directory, "restore.json"), "utf8")).data);
+  expect(restore.restored).toEqual([{ path: "owned", image: { bytes: Buffer.from("before").toString("base64"), mode: require("node:fs").statSync(path.join(f.root, "owned")).mode & 0o777 } }]);
+  captureCheckpoint(next, ["owned"]);
+  applyCheckpoint(next, [{ path: "owned", image: { bytes: Buffer.from("completed").toString("base64"), mode: 0o644 } }]);
+  if (foreign) {
+    writeFileSync(path.join(f.root, "other"), "foreign before capture");
+    const effect = beginHookEffect(next, "edit", ["other"]); closeHookEffect(next, effect);
+  }
+  const result = f.run("unit", { intent: next, restoreSources: [f.intent] });
+  if (foreign) {
+    expect(result.status, result.stderr).toBe(0); expect(result.value).toMatchObject({ outcome: "mismatch", paths: [{ path: "other", journaled: sha("dispatch bytes"), actual: sha("foreign before capture") }] });
+  } else { expect(result.status, result.stderr).toBe(0); expect(result.value.outcome).toBe("sealed"); }
+});
+test("controller records the actual dispatch map before launching a writer", async () => {
+  const host = controller(); host.setLimit(1);
+  host.setRespond((request, normal) => {
+    if (request.agent === "pitako.worker") {
+      const attempt = host.current().loop.attempt;
+      expect(attempt.baselineIO.stage).toBe("receipt");
+      expect(attempt.baselineIO.receipt.candidate).toEqual(attempt.baseline);
+      const file = path.join(host.root, ".pi/subagents/checkpoints", attempt.key, "baseline.json");
+      const baseline = JSON.parse(JSON.parse(readFileSync(file, "utf8")).data);
+      expect(baseline.candidate).toEqual(host.observedCandidate());
+      expect(host.calls.findIndex((call: any) => call.key === attempt.key + ".baseline")).toBeLessThan(host.calls.findIndex((call: any) => call.key === request.key));
+    }
+    return observeGate(host, request, normal);
+  });
+  expect((await host.execute()).status).toBe("partial");
+  expect(host.history()[0].results.find((entry: any) => entry.taskId === "change1").status).toBe("complete");
 });

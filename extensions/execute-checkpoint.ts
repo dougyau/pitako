@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { closeSync, existsSync, fchmodSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { checkoutEvidence, designatedWorkspace, gitRead, withIndexReads } from "./spec-plans.ts";
+import { checkoutEvidence, checkoutSnapshot, type CheckoutDigest, designatedWorkspace, gitRead, withIndexReads } from "./spec-plans.ts";
 
 type Image = { bytes: string; mode: number } | null;
 export type CheckpointIntent = {
@@ -10,6 +10,7 @@ export type CheckpointIntent = {
   key: string; taskId: string; attempt: number; loop: number; cursor: number;
   phase: "implementation"; planRef: unknown;
   progress?: CheckpointProgress;
+  baseline?: { head: string; fingerprint: string };
 };
 export type CheckpointProgress = { consumedLoops: number; admitted: Record<string, string[]>;
   previous: { taskId: string; attempt: number; resultRef: unknown; checkpointRef: string; digest: string } | null };
@@ -107,11 +108,76 @@ export function checkpointDirectory(intent: CheckpointIntent) {
     throw new Error("Checkpoint worktree association mismatch.");
   return safePath(workspace.physicalRoot, `.pi/subagents/checkpoints/${intent.key}`, true);
 }
+// Append only new maxima; original samples remain durable across interruption.
+export function readContextPeak(intent: CheckpointIntent): number | null {
+  const directory = checkpointDirectory(intent);
+  if (!existsSync(directory)) return null;
+  let peak: number | null = null;
+  for (const name of readdirSync(directory).filter(name => /^context-peak-\d+\.json$/.test(name))) {
+    const sample = read<{ intent: CheckpointIntent; tokens: number }>(path.join(directory, name));
+    if (!equal(sample.intent, intent) || !Number.isSafeInteger(sample.tokens) || sample.tokens < 0)
+      throw new Error("Invalid attempt context peak metadata.");
+    peak = Math.max(peak ?? 0, sample.tokens);
+  }
+  return peak;
+}
+export function recordContextPeak(intent: CheckpointIntent, tokens: number | null | undefined): void {
+  if (typeof tokens !== "number" || !Number.isSafeInteger(tokens) || tokens < 0) return;
+  const peak = readContextPeak(intent);
+  if (peak !== null && peak >= tokens) return;
+  const directory = checkpointDirectory(intent);
+  durableDirectory(directory);
+  atomic(path.join(directory, `context-peak-${tokens}.json`), { intent, tokens });
+}
+type Baseline = { index: string; intent: CheckpointIntent; files: Record<string, CheckoutDigest>; candidate: { head: string; fingerprint: string } };
+export function captureBaseline({ intent }: { intent: CheckpointIntent }) {
+  const directory = checkpointDirectory(intent), file = path.join(directory, "baseline.json");
+  const snapshot = checkoutSnapshot(intent.association.root);
+  const candidate = { head: snapshot.evidence.head, fingerprint: snapshot.evidence.fingerprint };
+  const baseline: Baseline = { intent: { ...intent, baseline: candidate }, index: index(intent.association.root), files: snapshot.files, candidate };
+  durableDirectory(directory);
+  if (existsSync(file)) {
+    if (!equal(read(file), JSON.parse(JSON.stringify(baseline)))) throw new Error("Dispatch baseline conflicts with retained original.");
+  } else atomic(file, baseline);
+  return { candidate };
+}
+function imageDigest(value: Image): CheckoutDigest {
+  return value === null ? null : { hash: createHash("sha256").update(Buffer.from(value.bytes, "base64")).digest("hex"), mode: 0o100000 | value.mode };
+}
+function attribution(intent: CheckpointIntent, files: Manifest["files"], restored: Manifest["files"] = []) {
+  // Legacy manifests remain readable; all new workflow dispatches bind a baseline.
+  if (!intent.baseline) return;
+  const baseline = read<Baseline>(path.join(checkpointDirectory(intent), "baseline.json"));
+  if (!equal(baseline.intent, intent) || !equal(baseline.candidate, intent.baseline))
+    throw new Error("Dispatch baseline association mismatch.");
+  if (index(intent.association.root) !== baseline.index || checkoutEvidence(intent.association.root).head !== baseline.candidate.head)
+    throw new Error("Dispatch baseline HEAD/index changed.");
+  const expected = new Map(Object.entries(baseline.files));
+  for (const file of restored) expected.set(file.path, imageDigest(file.image));
+  for (const file of files) if (!equal(imageDigest(file.image), expected.get(file.path) ?? null))
+    throw Object.assign(new Error(`First-touch preimage differs from dispatch baseline: ${file.path}`), {
+      attributionPaths: [{ path: file.path, journaled: expected.get(file.path)?.hash ?? null,
+        actual: imageDigest(file.image)?.hash ?? null, partiallyApplied: false }] });
+  const current = new Map(Object.entries(checkoutSnapshot(intent.association.root).files)), journaled = new Set(files.map(file => file.path));
+  for (const file of new Set([...expected.keys(), ...current.keys()])) {
+    if (!equal(expected.get(file) ?? null, current.get(file) ?? null) && !journaled.has(file))
+      throw Object.assign(new Error(`Unjournaled candidate change: ${file}`), {
+        attributionPaths: [{ path: file, journaled: expected.get(file)?.hash ?? null,
+          actual: current.get(file)?.hash ?? null, partiallyApplied: false }] });
+  }
+}
 function index(root: string) { return hash(gitRead(root, "ls-files", "--stage", "-z")); }
 function load(intent: CheckpointIntent) {
   const directory = checkpointDirectory(intent);
   const manifest = read<Manifest>(path.join(directory, "manifest.json"));
   if (!equal(manifest.intent, intent)) throw new Error("Checkpoint intention association mismatch.");
+  const captures = readdirSync(directory).filter(file => /^capture-\d{6}\.json$/.test(file)).sort();
+  for (const [seq, name] of captures.entries()) {
+    if (name !== `capture-${String(seq).padStart(6, "0")}.json`) throw new Error("Checkpoint capture history has a gap.");
+    const capture = read<{ intent: CheckpointIntent; path: string; image: Image }>(path.join(directory, name));
+    if (!equal(capture.intent, intent)) throw new Error("Hook capture intention mismatch.");
+    manifest.files.push({ path: capture.path, image: capture.image });
+  }
   if (!manifest.base?.fingerprint || !manifest.files?.length || !manifest.index)
     throw new Error("Checkpoint lacks reconstructible preimages.");
   if (gitRead(intent.association.root, "rev-parse", "HEAD").trim() !== manifest.base.head ||
@@ -141,7 +207,40 @@ function load(intent: CheckpointIntent) {
     if (!equal(latest.get(entry.path), entry.before)) throw new Error("Checkpoint effect preimage mismatch.");
     latest.set(entry.path, entry.after);
   }
-  return { directory, manifest, steps };
+  const openPaths = new Set<string>();
+  const hooks = readdirSync(directory).filter(file => /^hook-effect-\d{6}\.json$/.test(file)).sort();
+  if (readdirSync(directory).some(file => /^hook-effect-\d{6}-closed\.json$/.test(file) &&
+      !hooks.includes(file.replace("-closed.json", ".json")))) throw new Error("Hook closure lacks an effect intent.");
+  for (const [seq, name] of hooks.entries()) {
+    const effect = read<{ intent: CheckpointIntent; tool: string; seq: number; paths: string[];
+      before: Manifest["files"] }>(path.join(directory, name));
+    if (name !== `hook-effect-${String(seq).padStart(6, "0")}.json` || effect.seq !== seq ||
+        !equal(effect.intent, intent) || !["edit", "write", "apply_patch"].includes(effect.tool) ||
+        !Array.isArray(effect.paths) || !effect.paths.length || new Set(effect.paths).size !== effect.paths.length ||
+        !equal(effect.before?.map(file => file.path), effect.paths)) throw new Error("Invalid hook effect intent.");
+    const closed = path.join(directory, name.replace(".json", "-closed.json"));
+    const after = existsSync(closed) ? read<{ after: Manifest["files"] }>(closed).after : undefined;
+    if (existsSync(closed) && (!Array.isArray(after) || !equal(after.map(file => file.path), effect.paths)))
+      throw new Error("Invalid hook effect postimages.");
+    const entries: Entry[] = [];
+    for (const [i, file] of effect.before.entries()) {
+      validateImage(file.image);
+      if (!known.has(file.path) || openPaths.has(file.path) || !equal(latest.get(file.path), file.image))
+        throw new Error("Hook effect preimage mismatch.");
+      if (after) {
+        validateImage(after[i].image);
+        entries.push({ path: file.path, before: file.image, after: after[i].image });
+        latest.set(file.path, after[i].image);
+      } else openPaths.add(file.path);
+    }
+    if (after) steps.push(entries);
+  }
+  return { directory, manifest, steps, openPaths };
+}
+// Bind seals to the complete append-only first-touch inventory, preserving old digests.
+function manifestDigest(directory: string) {
+  const files = ["manifest.json", ...readdirSync(directory).filter(file => /^capture-\d{6}\.json$/.test(file)).sort()];
+  return hash(files.map(file => readFileSync(path.join(directory, file), "utf8")).join(""));
 }
 export function captureCheckpoint(intent: CheckpointIntent, paths: string[]) {
   const directory = checkpointDirectory(intent), root = intent.association.root;
@@ -153,6 +252,44 @@ export function captureCheckpoint(intent: CheckpointIntent, paths: string[]) {
   durableDirectory(directory);
   atomic(path.join(directory, "manifest.json"), manifest);
   return { directory, base: manifest.base, position: { loop: intent.loop, cursor: intent.cursor, phase: intent.phase } };
+}
+// First-touch records and effect intents are append-only, published with the shared fsync helper.
+export function beginHookEffect(intent: CheckpointIntent, tool: string, paths: string[]) {
+  const directory = checkpointDirectory(intent), root = intent.association.root;
+  durableDirectory(directory);
+  if (["unit.json", "pause.json", "restore.json"].some(file => existsSync(path.join(directory, file))))
+    throw new Error("Checkpoint is sealed or restoration has started.");
+  if (!existsSync(path.join(directory, "manifest.json")))
+    atomic(path.join(directory, "manifest.json"), { intent, base: checkoutEvidence(root), index: index(root), files: [] });
+  const files = readdirSync(directory);
+  const captures = files.filter(file => /^capture-\d{6}\.json$/.test(file)).sort();
+  const known = new Set<string>();
+  if (existsSync(path.join(directory, "manifest.json"))) {
+    const manifest = read<Manifest>(path.join(directory, "manifest.json"));
+    if (!equal(manifest.intent, intent)) throw new Error("Checkpoint intention association mismatch.");
+    for (const file of manifest.files) known.add(file.path);
+  }
+  for (const file of captures) {
+    const capture = read<{ intent: CheckpointIntent; path: string; image: Image }>(path.join(directory, file));
+    if (!equal(capture.intent, intent)) throw new Error("Hook capture intention mismatch.");
+    known.add(capture.path);
+  }
+  const before = paths.map(file => ({ path: file, image: image(root, file) }));
+  let count = captures.length;
+  for (const file of before) if (!known.has(file.path)) {
+    atomic(path.join(directory, `capture-${String(count++).padStart(6, "0")}.json`), { intent, ...file });
+    known.add(file.path);
+  }
+  const seq = files.filter(file => /^hook-effect-\d{6}\.json$/.test(file)).length;
+  atomic(path.join(directory, `hook-effect-${String(seq).padStart(6, "0")}.json`), { intent, tool, seq, paths, before });
+  return seq;
+}
+export function closeHookEffect(intent: CheckpointIntent, seq: number) {
+  const directory = checkpointDirectory(intent), name = `hook-effect-${String(seq).padStart(6, "0")}`;
+  const effect = read<{ intent: CheckpointIntent; paths: string[] }>(path.join(directory, `${name}.json`));
+  if (!equal(effect.intent, intent)) throw new Error("Hook effect intention mismatch.");
+  const after = effect.paths.map(file => ({ path: file, image: image(intent.association.root, file) }));
+  atomic(path.join(directory, `${name}-closed.json`), { after });
 }
 function writeImage(root: string, directory: string, relative: string, value: Image) {
   const file = safePath(root, relative);
@@ -170,6 +307,8 @@ function writeImage(root: string, directory: string, relative: string, value: Im
 }
 export function prepareCheckpoint(intent: CheckpointIntent, changes: { path: string; image: Image }[]) {
   const { directory, manifest, steps } = load(intent), root = intent.association.root;
+  if (readdirSync(directory).some(file => /^hook-effect-/.test(file)))
+    throw new Error("Use edit/write/apply_patch for hook-journaled attempts.");
   if (["unit.json", "pause.json"].some(file => existsSync(path.join(directory, file))))
     throw new Error("Checkpoint unit already sealed; next work requires its own captured intention.");
   if (existsSync(path.join(directory, "restore.json"))) throw new Error("Checkpoint restoration already started.");
@@ -242,7 +381,7 @@ function confirmedUnitSource(pending: CheckpointIntent, unit: ConfirmedUnit) {
       !equal({ head: point.candidate.head, fingerprint: point.candidate.fingerprint }, unit.candidate))
     throw new Error("Confirmed unit association/progress mismatch.");
   const loaded = load(intent);
-  if (point.sourceManifest !== hash(readFileSync(path.join(loaded.directory, "manifest.json"), "utf8")) ||
+  if (point.sourceManifest !== manifestDigest(loaded.directory) ||
       !equal(point.files.map(file => file.path), loaded.manifest.files.map(file => file.path)))
     throw new Error("Confirmed unit manifest mismatch.");
   const latest = new Map(loaded.manifest.files.map(file => [file.path, file.image]));
@@ -277,7 +416,7 @@ function evidence(sources: CheckpointIntent[], progress: Pick<CheckpointProgress
   for (const intent of observedSources) {
     const directory = checkpointDirectory(intent);
     if (!existsSync(path.join(directory, "manifest.json"))) continue;
-    const { manifest, steps } = load(intent);
+    const { manifest, steps, openPaths } = load(intent);
     published = true;
     const states = new Map<string, Image[]>();
     const add = (file: string, value: Image) => {
@@ -299,7 +438,7 @@ function evidence(sources: CheckpointIntent[], progress: Pick<CheckpointProgress
       if (existsSync(restoredFile)) {
         const restored = read<{ checkpointRef: string; digest: string; partialRef: string; position: unknown }>(restoredFile);
         if (restored.checkpointRef !== path.join(directory, "manifest.json") || restored.partialRef !== partialFile ||
-            restored.digest !== hash(readFileSync(restored.checkpointRef, "utf8")) ||
+            restored.digest !== manifestDigest(directory) ||
             !equal(restored.position, { loop: first.loop, cursor: unit ? first.cursor : intent.cursor, phase: intent.phase }))
           throw new Error("Checkpoint restored observation conflicts.");
         material.add(JSON.stringify({ restored: partial.partial }));
@@ -307,7 +446,8 @@ function evidence(sources: CheckpointIntent[], progress: Pick<CheckpointProgress
     }
     // Validate the currently selected file state, not all older unit states.
     if (published && intent === (unit?.intent ?? selected)) {
-      for (const file of manifest.files) if (!(unit ? [unit.files.find(entry => entry.path === file.path)!.image] : states.get(file.path)!).some(value => equal(value, image(intent.association.root, file.path))))
+      for (const file of manifest.files) if (openPaths.has(file.path)) add(file.path, image(intent.association.root, file.path));
+      for (const file of manifest.files) if (!openPaths.has(file.path) && !(unit ? [unit.files.find(entry => entry.path === file.path)!.image] : states.get(file.path)!).some(value => equal(value, image(intent.association.root, file.path))))
         throw new Error(`Unattributed checkpoint changes: ${file.path}`);
     }
   }
@@ -346,7 +486,7 @@ function restore(source: CheckpointIntent | CheckpointIntent[], authority: Resto
       ![false, null].includes(authority.activeWriter) ||
       !Array.isArray(authority.references) || !authority.references.length || authority.references.some(ref => typeof ref !== "string" || !ref.trim()))
     throw new Error("Checkpoint restore requires pending-unit authority without observed current barriers.");
-  const { directory, manifest, steps } = load(intent), root = intent.association.root;
+  const { directory, manifest, steps, openPaths } = load(intent), root = intent.association.root;
   // A root-admitted pause advances the file baseline without completing the task.
   // Newer successor manifests already capture that baseline; only the exact
   // paused source uses its seal instead of rolling confirmed WIP back pre-unit.
@@ -358,7 +498,7 @@ function restore(source: CheckpointIntent | CheckpointIntent[], authority: Resto
     const point = read<{ intent: CheckpointIntent; kind: string; sourceManifest: string;
       files: typeof baseline; candidate: { head: string; fingerprint: string }; position: unknown; progress: unknown }>(pause.checkpointRef);
     if (!equal(point.intent, intent) || point.kind !== "pause" ||
-        point.sourceManifest !== hash(readFileSync(path.join(directory, "manifest.json"), "utf8")) ||
+        point.sourceManifest !== manifestDigest(directory) ||
         !equal({ head: point.candidate.head, fingerprint: point.candidate.fingerprint }, pause.candidate) || !equal(point.position, pause.position) ||
         !equal(point.progress, pause.progress) || !equal(point.files.map(file => file.path), baseline.map(file => file.path)))
       throw new Error("Confirmed pause association/progress mismatch.");
@@ -383,14 +523,15 @@ function restore(source: CheckpointIntent | CheckpointIntent[], authority: Resto
     const allowed = retained
       ? [retained.partial.find(entry => entry.path === file.path)?.image, baseline.find(entry => entry.path === file.path)!.image]
       : possible.get(file.path)!;
+    if (!retained && openPaths.has(file.path)) continue;
     if (!allowed.some(value => equal(value, file.image))) throw new Error(`Unattributed checkpoint changes: ${file.path}`);
   }
-  if (!retained) atomic(restoreFile, { intent, authority, partial, candidate: checkoutEvidence(root) });
+  if (!retained) atomic(restoreFile, { intent, authority, partial, restored: baseline, candidate: checkoutEvidence(root) });
   // Partial bytes and intent are durable before the first restoration effect.
   for (const file of baseline) writeImage(root, directory, file.path, file.image);
   const restored = { position: { loop: first.loop, cursor: unit ? first.cursor : intent.cursor, phase: first.phase },
     candidate: checkoutEvidence(root), partialRef: restoreFile, checkpointRef: path.join(directory, "manifest.json"),
-    digest: hash(readFileSync(path.join(directory, "manifest.json"), "utf8")),
+    digest: manifestDigest(directory),
     ...(pause?.checkpointRef === path.join(directory, "pause.json")
       ? { confirmedPause: { checkpointRef: pause.checkpointRef, digest: pause.digest } } : {}),
     ...(unit ? { confirmedUnit: { checkpointRef: authority.confirmedUnit!.checkpointRef, digest: authority.confirmedUnit!.digest } } : {}),
@@ -417,11 +558,13 @@ function admittedProgress(intent: CheckpointIntent) {
 
 // A seal contains bytes, not admission authority. Only the root's durable result
 // admission confirms it as a continuation point. A pause never completes a task.
-export function sealCheckpoint(intent: CheckpointIntent, kind: "unit" | "pause", controlPermitsCapture: boolean) {
+export function sealCheckpoint(intent: CheckpointIntent, kind: "unit" | "pause", controlPermitsCapture: boolean, restored: Manifest["files"] = []) {
   if (controlPermitsCapture !== true) throw new Error("Native control does not permit checkpoint capture.");
   if (kind !== "unit" && kind !== "pause") throw new Error("Invalid checkpoint seal kind.");
-  const { directory, manifest, steps } = load(intent), root = intent.association.root;
+  const { directory, manifest, steps, openPaths } = load(intent), root = intent.association.root;
+  if (openPaths.size) throw new Error("Cannot seal never-closed checkpoint effects.");
   if (existsSync(path.join(directory, "restore.json"))) throw new Error("Checkpoint restoration already started.");
+  attribution(intent, manifest.files, restored);
   const progress = admittedProgress(intent);
   const latest = new Map(manifest.files.map(file => [file.path, file.image]));
   for (const step of steps) for (const entry of step) latest.set(entry.path, entry.after);
@@ -429,7 +572,7 @@ export function sealCheckpoint(intent: CheckpointIntent, kind: "unit" | "pause",
   for (const file of files) if (!equal(file.image, latest.get(file.path)))
     throw new Error("Cannot seal incomplete or conflicting checkpoint effects.");
   const checkpointRef = path.join(directory, `${kind}.json`);
-  const point = { intent, kind, sourceManifest: hash(readFileSync(path.join(directory, "manifest.json"), "utf8")),
+  const point = { intent, kind, sourceManifest: manifestDigest(directory),
     candidate: checkoutEvidence(root), index: manifest.index, files,
     position: { loop: intent.loop, cursor: intent.cursor + (kind === "unit" ? 1 : 0), phase: intent.phase },
     progress };
@@ -452,7 +595,7 @@ function sealRequest(request: SealerRequest) {
   const directory = checkpointDirectory(intent);
   const observed = checkoutEvidence(root);
   const candidate = { head: observed.head, fingerprint: observed.fingerprint };
-  const base = { v: 1 as const, kind, candidate };
+  const base = { v: 1 as const, kind, candidate, capturedPaths: 0 };
   let selected = intent;
   if (request.restoreSources) {
     if (!request.restoreSources.length || request.restoreSources.some(source =>
@@ -472,18 +615,25 @@ function sealRequest(request: SealerRequest) {
     }
   }
   const selectedDirectory = checkpointDirectory(selected);
-  if (!existsSync(path.join(selectedDirectory, "manifest.json"))) return { ...base, outcome: "observed" as const };
-  const { manifest, steps } = load(selected);
+  if (!existsSync(path.join(selectedDirectory, "manifest.json"))) {
+    attribution(intent, []);
+    return { ...base, outcome: "observed" as const };
+  }
+  const { manifest, steps, openPaths } = load(selected);
+  base.capturedPaths = manifest.files.length;
+  if (openPaths.size && !request.restoreSources)
+    return { ...base, outcome: "open" as const, paths: [...openPaths].slice(0, 10) };
   let expected = new Map(manifest.files.map(file => [file.path, file.image]));
   for (const step of steps) for (const entry of step) expected.set(entry.path, entry.after);
   let restored: ReturnType<typeof restore> | undefined;
+  let restoredFiles: Manifest["files"] = [];
   if (request.restoreSources) {
     const partialRef = path.join(selectedDirectory, "restore.json");
-    const partial = read<{ intent: CheckpointIntent; authority: RestoreAuthority; partial: Manifest["files"] }>(partialRef);
+    const partial = read<{ intent: CheckpointIntent; authority: RestoreAuthority; partial: Manifest["files"]; restored?: Manifest["files"] }>(partialRef);
     restored = read<ReturnType<typeof restore>>(path.join(selectedDirectory, "restored.json"));
     if (!equal(partial.intent, selected) || restored.partialRef !== partialRef ||
         restored.checkpointRef !== path.join(selectedDirectory, "manifest.json") ||
-        restored.digest !== hash(readFileSync(restored.checkpointRef, "utf8")) ||
+        restored.digest !== manifestDigest(selectedDirectory) ||
         !equal(restored.position, { loop: intent.loop, cursor: intent.cursor, phase: intent.phase }))
       throw new Error("Checkpoint restoration observation conflicts.");
     let baseline = manifest.files;
@@ -498,12 +648,17 @@ function sealRequest(request: SealerRequest) {
       if (!equal(point.intent, selected)) throw new Error("Confirmed pause association mismatch.");
       baseline = point.files;
     }
+    if (partial.restored && !equal(partial.restored, baseline)) throw new Error("Restored baseline conflicts with source images.");
+    restoredFiles = baseline;
     expected = new Map(baseline.map(file => [file.path, file.image]));
   }
   // Restoration attests to the historical baseline. New task effects belong to
   // the current attempt's journal, not to that historical candidate.
-  const current = selected.key === intent.key ? { manifest, steps } :
+  const current = selected.key === intent.key ? { manifest, steps, openPaths } :
     existsSync(path.join(directory, "manifest.json")) ? load(intent) : undefined;
+  base.capturedPaths = current?.manifest.files.length ?? 0;
+  if (current?.openPaths.size && selected.key !== intent.key)
+    return { ...base, outcome: "open" as const, paths: [...current.openPaths].slice(0, 10) };
   if (restored && current && selected.key !== intent.key) {
     if (!equal(current.manifest.base, restored.candidate))
       throw new Error("Current checkpoint does not capture the restored baseline.");
@@ -525,28 +680,42 @@ function sealRequest(request: SealerRequest) {
       throw new Error("Restored checkpoint candidate conflicts with current checkout.");
     return { ...base, outcome: "observed" as const, ...restoration };
   }
+  attribution(intent, current?.manifest.files ?? [], restoredFiles);
   // A retained seal of this attempt is identified, never rewritten: identical
   // sealed content is idempotent (its sealing candidate stays the admitted one);
   // different content is an integrity conflict naming the differing files.
   if (kind !== null) for (const retainedKind of ["unit", "pause"]) {
     const ref = path.join(directory, `${retainedKind}.json`);
     if (!existsSync(ref)) continue;
-    const point = read<{ intent: CheckpointIntent; candidate: typeof observed; files: Manifest["files"];
+    const point = read<{ intent: CheckpointIntent; candidate: typeof observed; files: Manifest["files"]; sourceManifest: string;
       position: { loop: number; cursor: number; phase: string } }>(ref);
-    const differing = manifest.files.filter(file =>
+    if (point.sourceManifest !== manifestDigest(directory) ||
+        !equal(point.files.map(file => file.path), current?.manifest.files.map(file => file.path)))
+      throw new Error("Checkpoint seal manifest mismatch.");
+    const activeFiles = current?.manifest.files ?? manifest.files;
+    const differing = activeFiles.filter(file =>
       !equal(point.files.find(entry => entry.path === file.path)?.image, image(root, file.path)));
     if (kind === retainedKind && !differing.length && equal(point.intent, intent))
       return { ...base, candidate: { head: point.candidate.head, fingerprint: point.candidate.fingerprint },
         outcome: "sealed" as const, checkpointRef: ref, digest: hash(readFileSync(ref, "utf8")), position: point.position, ...restoration };
-    return { ...base, outcome: "mismatch" as const, paths: (differing.length ? differing : manifest.files).slice(0, 10).map(file => ({
+    return { ...base, outcome: "mismatch" as const, paths: (differing.length ? differing : activeFiles).slice(0, 10).map(file => ({
       path: file.path, journaled: sha256(point.files.find(entry => entry.path === file.path)?.image ?? null),
       actual: sha256(image(root, file.path)), partiallyApplied: false })) };
   }
   if (kind === null) return { ...base, outcome: "observed" as const, ...restoration };
-  const sealed = sealCheckpoint(intent, kind, true);
+  const sealed = sealCheckpoint(intent, kind, true, restoredFiles);
   return { ...base, outcome: "sealed" as const, checkpointRef: sealed.checkpointRef, digest: sealed.digest, position: sealed.position, ...restoration };
 }
-export const sealCheckpointRequest = operation(sealRequest);
+export const sealCheckpointRequest = operation((request: SealerRequest) => {
+  try { return sealRequest(request); }
+  catch (error) {
+    if (!(error instanceof Error) || !("attributionPaths" in error)) throw error;
+    const observed = checkoutEvidence(request.intent.association.root);
+    return { v: 1 as const, kind: request.kind, outcome: "mismatch" as const,
+      candidate: { head: observed.head, fingerprint: observed.fingerprint },
+      paths: error.attributionPaths as { path: string; journaled: string | null; actual: string | null; partiallyApplied: boolean }[] };
+  }
+});
 
 // Public pre-write capture over the same storage used by the CLI. Sealing is
 // root-owned; publication is not root admission and never changes mission state.

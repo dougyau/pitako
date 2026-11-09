@@ -99,7 +99,7 @@ export function childResponse(key: string, request: any, metadata: any, checkout
   if (request.agent === "pitako.loop-io") {
     const input = JSON.parse(request.task);
     // Reuse actual persistence/Board operations without a Node/TypeScript startup per call.
-    if (input.operation !== "gate" && metadata.loopOperations) return (async () => {
+    if (input.operation !== "gate" && metadata.loopOperations && (input.operation !== "baseline" || metadata.loopOperations.baseline)) return (async () => {
       try {
         const { operation, ...params } = input;
         params.dbPath = metadata.boardPath ?? metadata.root + "/.pi/board.db";
@@ -172,10 +172,10 @@ export function childResponse(key: string, request: any, metadata: any, checkout
       nonResumableReason: "Fixed one-shot observer", outputArtifacts: { stdoutPath: `/native/async/${key}/stdout.log`, stderrPath: `/native/async/${key}/stderr.log` } } } satisfies WorkflowScriptChildResult;
   let value: any;
   if (suppliedValue) value = suppliedValue;
-  else if (key.endsWith(".director")) {
+  else if (/\.director(?:\.d1)?$/.test(key)) {
     const file = metadata.root + "/.pitako/backlog/assignment.json";
     const backlog = require("node:fs").existsSync(file) ? JSON.parse(require("node:fs").readFileSync(file, "utf8")) : null;
-    const initial = { id: "change", goal: "Implement scoped behavior", expectedResult: "Required behavior implemented",
+    const initial = { id: "change", title: "Implement scoped behavior", goal: "Implement scoped behavior", expectedResult: "Required behavior implemented",
       status: "pending", origin: { kind: "spec", ref: metadata.selected.source }, specRefs: [metadata.selected.source], dependsOn: [],
       gates: [{ id: "focused", command: "true", cwd: metadata.root, timeoutMs: 1800000 }], metric: null,
       parent: null, remaining: "", progress: { nonImproving: 0, last5: [] }, history: [] };
@@ -228,7 +228,7 @@ export function childResponse(key: string, request: any, metadata: any, checkout
 // Controlled child loading boundary: use the launch binding emitted by the real root,
 // never construct an intention or tool result. Factory registration and publication are real.
 export async function registeredCheckpoint(request: any, root: string, loadExtensions: any, toolPath: string, key: string) {
-  if (!request.task.includes('checkpoint_create({kind:"pre"') ||
+  if (!request.task.includes('Write code with edit, write or apply_patch') ||
       request.task.includes('checkpoint_create({kind:"unit"})') ||
       request.task.includes('checkpoint_create({kind:"pause"})') ||
       request.task.includes("helper's capture operation") || request.task.includes("helper seal operation"))
@@ -356,9 +356,9 @@ export function nativeCheckpointFixture({ workflowSettlements, checkpointCancell
           // Same controlled AsyncFunction boundary as execute-workflow.ts.
           runWorkflowScript = ${controlledWorkflow.toString()};
           loadExtensions = async paths => {
-            const tools = new Map();
-            for(const file of paths) (await import(file)).default({registerTool(tool){tools.set(tool.name,{definition:tool});}});
-            return {errors:[],extensions:[{tools}]};
+            const tools = new Map(), handlers = new Map();
+            for(const file of paths) (await import(file)).default({on(name,handler){handlers.set(name,handler);},registerTool(tool){tools.set(tool.name,{definition:tool});}});
+            return {errors:[],extensions:[{tools,handlers}]};
           };
         }
         return {runWorkflowScript,loadExtensions};
@@ -381,7 +381,7 @@ export function nativeCheckpointFixture({ workflowSettlements, checkpointCancell
             process.chdir(input.root);process.env.PI_CODING_AGENT_DIR=input.agentDir;
             const {runWorkflowScript,loadExtensions}=input.sdk===false?{}:await sdk();
             if(input.metadata?.inlineSealer && input.sdk!==false)input.metadata.sealCheckpointRequest=(await import(input.module??input.checkpointModule)).sealCheckpointRequest;
-            if(input.metadata?.inlineLoopIO && input.sdk!==false){if(${native})await import(${JSON.stringify(new URL("../../skills/execute/loader.mjs", import.meta.url).href)});input.metadata.loopOperations=await import(${JSON.stringify(new URL("../../skills/execute/loop.ts", import.meta.url).href)});}
+            if(input.metadata?.inlineLoopIO && input.sdk!==false){if(${native})await import(${JSON.stringify(new URL("../../skills/execute/loader.mjs", import.meta.url).href)});input.metadata.loopOperations={...await import(${JSON.stringify(new URL("../../skills/execute/loop.ts", import.meta.url).href)}),baseline:(await import(${JSON.stringify(new URL("../../extensions/execute-checkpoint.ts", import.meta.url).href)})).captureBaseline};}
             const value=await (0,eval)('('+harness+')')(input,runWorkflowScript,${childResponse.toString()},
               input.sdk===false?{}:{...require('node:fs'),...require('node:child_process'),...await import(input.module??input.checkpointModule),...await import(input.evidence??input.evidenceModule),loadExtensions,hash:data=>require('node:crypto').createHash('sha256').update(data).digest('hex')},${registeredCheckpoint.toString()});
             send({value});

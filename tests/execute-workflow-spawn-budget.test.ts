@@ -127,7 +127,7 @@ test("a closed loop permits another exhaustion even without any checkpoint seals
       rejected.add(request.key); return receipt(request.key);
     }
     const result = normal();
-    return request.key === "invoke-human-1.l1.director" ? { ...result, structuredOutput: { ...result.structuredOutput, select: "missing" } } : result;
+    return /^invoke-human-1\.l1\.director(?:\.d1)?$/.test(request.key) ? { ...result, structuredOutput: { ...result.structuredOutput, select: "missing" } } : result;
   });
   expect((await host.execute()).status).toBe("budget-exhausted");
   const second = await host.execute();
@@ -205,10 +205,12 @@ test("a task attempt dispatches its gate before exactly one checkpoint sealer", 
   expect((await host.execute()).status).toBe("complete");
   const attempt = (key: string, count: number) => {
     const index = host.calls.findIndex(call => call.key === key);
-    return host.calls.slice(index - 1, index - 1 + count).map(call => call.agent);
+    return host.calls.slice(index - 2, index - 2 + count).map(call => call.agent);
   };
-  expect(attempt("invoke-human-1.l1.t1.a1", 6)).toEqual(["pitako.request-observer", "pitako.worker",
+  expect(attempt("invoke-human-1.l1.t1.a1", 7)).toEqual(["pitako.request-observer", "pitako.loop-io", "pitako.worker",
     "pitako.request-observer", "pitako.loop-io", "pitako.checkpoint-sealer", "pitako.execution-ledger"]);
+  const baseline = host.calls.find(call => call.key === "invoke-human-1.l1.t1.a1.baseline")!;
+  expect(JSON.parse(baseline.task).operation).toBe("baseline");
   expect(host.calls.filter(call => call.agent === "pitako.checkpoint-sealer").map(call => call.key))
     .toEqual(["invoke-human-1.l1.t1.a1.seal"]);
 });

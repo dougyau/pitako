@@ -2,6 +2,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import { Type } from "typebox";
 import {
   BoardError,
+  BINDING_BAND_BYTES,
   LIMITS,
   POST_TYPES,
   TOPIC_STATUSES,
@@ -123,7 +124,7 @@ export function registerBoard(pi: ExtensionAPI): void {
     name: "board_post",
     label: "Board post",
     description:
-      "Post cross-context knowledge to a current-workspace topic. FINDING: fact or constraint; DECISION: chosen boundary before an authoritative artifact; QUESTION/ANSWER: unresolved cross-context issue and response; BLOCKER: condition preventing another context from continuing correctly; HUMAN: root-session-only human ruling, requiring metadata.quote (at most 16000 characters) and metadata.saidAt (the human message date); HANDOFF: essential context the next agent needs; INFO: sparse mission context. Not a transcript, scratchpad, TODO, or progress log.",
+      `Post cross-context knowledge to a current-workspace topic. FINDING: fact or constraint; DECISION: chosen boundary before an authoritative artifact; QUESTION/ANSWER: unresolved cross-context issue and response; BLOCKER: condition preventing another context from continuing correctly; HUMAN: root-session-only human ruling, requiring metadata.quote (at most 16000 characters) and metadata.saidAt (the human message date); HANDOFF: essential context the next agent needs; INFO: sparse mission context. HUMAN rendered view entries must fit ${BINDING_BAND_BYTES} UTF-8 bytes. Not a transcript, scratchpad, TODO, or progress log.`,
     promptSnippet: "Post cross-context knowledge to a Board topic",
     promptGuidelines: [
       "Use FINDING for a fact or constraint; DECISION for a chosen boundary before its authoritative artifact; QUESTION/ANSWER for cross-context coordination; BLOCKER only when another context cannot correctly continue; HANDOFF only for essential next-context knowledge; INFO sparingly for mission context.",

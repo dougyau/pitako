@@ -4,7 +4,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import path from "node:path";
 const { appendLedger, verifyLedger, loopSummaries, canonicalJSON, summarizeLoops } = await import(path.resolve("skills/execute/ledger.mjs"));
-import { captureCheckpoint } from "../../extensions/execute-checkpoint.ts";
+import { canonicalDigest, canonicalJSON as canonicalViewJSON } from "../../extensions/canonical.mjs";
+import { captureBaseline, captureCheckpoint } from "../../extensions/execute-checkpoint.ts";
 import { checkoutEvidence, digest, inspectionSnapshot, specBinding, specChunks } from "../../extensions/spec-plans.ts";
 import { updateProgress, apply, reviewOriginals, cancelledScope, readBacklog } from "../../skills/execute/loop.ts";
 import { EXECUTE_STATE_VERSION } from "../../extensions/execute-state.ts";
@@ -111,7 +112,7 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
   let optionalCacheFailures = 0;
   const association = (loop: number) => ({ missionId: config.missionId, missionPath: config.missionPath, invocation: config.invocation,
     root: config.root, commonDir: metadata.commonDir, source: selected.source, digest: selected.digest, maxCycles: admittedLimit, sourceRefs: [], loop });
-  const backlogTask = (id: string) => ({ id, goal: `Goal ${id}`, expectedResult: `Result ${id}`, status: "pending" as const,
+  const backlogTask = (id: string) => ({ id, title: `Title ${id}`, goal: `Goal ${id}`, expectedResult: `Result ${id}`, status: "pending" as const,
     origin: { kind: "spec" as const, ref: "spec:criterion-1" }, specRefs: ["spec:criterion-1"], dependsOn: [],
     gates: [{ id: `${id}-check`, command: `bun test ${id}`, cwd: root, timeoutMs: 1800000 }], metric: null,
     parent: null, remaining: "", progress: { nonImproving: 0, last5: [] }, history: [] });
@@ -125,9 +126,11 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
   const captures = new Map<string, any>();
   const verifications: { key: string; request: any; output: any }[] = [];
   const worker = (request: Request, _checkpointKind: "unit" | "pause" = "unit") => {
-    const checkpoint = JSON.parse(request.task.split("PRE-WRITE CHECKPOINT INTENTION (not a backup until published):\n")[1]!.split("\n")[0]!);
+    const checkpoint = request.resume ? storage.get("invoke-human-1").loop.attempt.checkpoint
+      : JSON.parse(request.task.split("PRE-WRITE CHECKPOINT INTENTION (not a backup until published):\n")[1]!.split("\n")[0]!);
     const descriptor = { key: checkpoint.key, taskId: checkpoint.taskId, checkpoint };
-    const selectedTask = JSON.parse(request.task.split("COMPLETE SELECTED TASK:\n")[1]!.split("\nTASK CONTINUATION")[0]!);
+    const selectedTask = request.resume ? { kind: "implementation", ...readBacklog(root, "spec").backlog!.tasks.find(task => task.id === checkpoint.taskId)! }
+      : JSON.parse(request.task.split("COMPLETE SELECTED TASK:\n")[1]!.split("\nTASK CONTINUATION")[0]!);
     if (selectedTask.kind === "implementation" && descriptor.checkpoint?.progress) {
       captures.set(descriptor.key, copy(descriptor.checkpoint));
       if (!options.controlledCheckpoints && !existsSync(path.join(root, ".pi/subagents/checkpoints", descriptor.key, "manifest.json")))
@@ -137,6 +140,7 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
       remaining: [], knowledge: { findings: [], handoff: "Current assigned source has no pending defects." } };
   };
   function result(request: Request, value: any): Result {
+    if (request.resume && /\.t\d+\.a\d+$/.test(request.key)) request = { ...request, agent: "pitako.worker" };
     let savedOutputPath: string | undefined;
     if (request.phase?.startsWith("review-")) {
       const required = JSON.parse(request.task.split("ESSENTIAL ORIGINALS (data): ")[1]!.split("\n")[0]!);
@@ -164,6 +168,7 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
   function normal(request: Request): Result {
     const loop = Number(request.key.match(/\.l(\d+)\./)?.[1] ?? 1);
     let value: any;
+    if (request.resume && /\.t\d+\.a\d+$/.test(request.key)) return result(request, worker(request));
     if (request.agent === "pitako.request-observer") return { ok: true, agent: request.agent,
       runId: `native-${request.key}`, output: JSON.stringify({ version: 1, ok: true,
         invocation: JSON.parse(request.task).invocation, requests: [], next: null }), results: [{ index: 0, agent: request.agent!, task: request.task, exitCode: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } }] };
@@ -186,9 +191,12 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
       if (input.operation !== "gate") {
         try {
           const current = readBacklog(root, "spec");
-          const value = input.operation === "reviewOriginals" ? { ...reviewOriginals(input), backlog: undefined } : input.operation === "prepare" ? { ...current, cancelledScope: current.backlog ? cancelledScope(current.backlog) : [], view, lastConfirmedUnit: null }
+          const value = input.operation === "baseline" ? { ...captureBaseline(input), backlog: undefined } : input.operation === "reviewOriginals" ? { ...reviewOriginals(input), backlog: undefined } : input.operation === "prepare" ? { ...current, cancelledScope: current.backlog ? cancelledScope(current.backlog) : [], view, lastConfirmedUnit: null }
             : { ...apply({ ...input, currentHumanIds: view.posts.filter(post => post.type === "HUMAN").map(post => post.id) }), view };
           const { backlog, ...receipt } = value;
+          if (input.operation === "prepare" || input.operation === "apply") Object.assign(receipt, {
+            viewDigest: canonicalDigest(view), viewBytes: Buffer.byteLength(canonicalViewJSON(view)),
+          });
           return { ok: true, key: request.key, agent: request.agent, runId: `native-${request.key}`,
             output: JSON.stringify({ ...receipt, ...(backlog ? { acceptance: backlog.acceptance, acceptanceHistory: backlog.acceptanceHistory } : {}) }), results: [{ exitCode: 0 }] } as Result;
         } catch (error) {
@@ -286,7 +294,7 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
       results: [{ index: 0, agent: request.agent, task: request.task, exitCode: 0,
         usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } }] } satisfies WorkflowScriptChildResult;
     }
-    if (request.key.endsWith(".director")) value = plan(loop);
+    if (/\.director(?:\.d1)?$/.test(request.key)) value = plan(loop);
     else if (request.agent === "pitako.worker") value = worker(request);
     else if (request.key.includes(".recover")) {
       const original = [...native.values()].find(entry => entry.runId === `native-invoke-human-1.l${loop}.director`)?.structuredOutput ?? null;

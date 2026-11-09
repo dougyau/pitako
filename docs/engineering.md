@@ -468,8 +468,9 @@ guarantee is added.
 `skills/execute/checkpoint.mjs` implement exact-path preimages and immutable
 write-ahead effects. They use normal worker authority, not read-only inspector
 grants. The registered root saves an associated intention before dispatch;
-the bound worker calls registered `checkpoint_create` with `kind:"pre"` and exact
-paths before editing. After a cooperative worker terminal, the root dispatches the
+the bound worker writes with `edit`, `write` or `apply_patch`, and the checkpoint
+extension's `tool_call` hook durably captures each first-touch preimage and
+journals each call before allowing it. After a cooperative worker terminal, the root dispatches the
 model-free `pitako.checkpoint-sealer` runtime agent: it verifies the journal,
 observes the candidate and writes `unit` or `pause` seal metadata by a fixed table
 on the report status. No model chooses the kind or transcribes receipts. The tool

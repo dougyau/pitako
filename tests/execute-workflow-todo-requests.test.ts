@@ -59,7 +59,7 @@ test.each(["complete", "continue", "gaps", "blocked"])("execute lets a running a
       started(); await release; workerFinished = true;
       const value = host.worker(call);
       return host.result(call, { ...value, status,
-        ...(status !== "complete" ? { remaining: ["Required check pending"], continuation: "Finish the required check" } : {}) });
+        ...(status !== "complete" ? { remaining: ["Required check pending"], continuation: { mode: "fresh", reason: "Finish the required check" } } : {}) });
     }
     return normal();
   });
@@ -179,7 +179,7 @@ test("execute observes a new request immediately before a useful retry", async (
       return page(call, host.current().loop.attempt?.number === 2 ? [request()] : []);
     if (call.agent === "pitako.worker" && call.key.endsWith(".t1.a1"))
       return host.result(call, { ...host.worker(call), status: "continue", remaining: ["Finish required check"],
-        continuation: "Finish the required check" });
+        continuation: { mode: "fresh", reason: "Finish the required check" } });
     return normal();
   });
   expect((await host.executeNative()).status).toBe("partial");

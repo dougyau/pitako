@@ -169,3 +169,24 @@ test("execute roles receive the binding HUMAN authority and citation rule", () =
     workflow.slice(workflow.indexOf('if (loop.phase === "compliance")'))])
     expect(prompt).toContain(authority);
 });
+
+test("execute worker prompt and skill explain consequential FINDINGs", () => {
+  for (const file of ["skills/execute/workflow.js", "skills/execute/SKILL.md"]) {
+    const source = readFileSync(new URL(`../${file}`, import.meta.url), "utf8");
+    expect(source).toContain("A FINDING records only a fact that changes how this task or another task is done.");
+    expect(source).toContain("Status or scope notes and tool failures with no consequence for the code are not FINDINGs.");
+  }
+});
+
+test("worker guidance routes execute writes away from hook-blocked tools and directories", () => {
+  const worker = readFileSync(new URL("../agents/worker.md", import.meta.url), "utf8").replace(/\s+/g, " ");
+  expect(worker).toContain("In execute, the write hook blocks `lsp_rename`, `ast_rewrite` with `dryRun:false` and edits under `.pi/` or `.pitako/`");
+  expect(worker).toContain("then apply them with `edit`, `write` or `apply_patch`.");
+});
+
+test("execute skill treats a human relaunch instruction as authorization, never as an unblock answer", () => {
+  const skill = readFileSync(new URL("../skills/execute/SKILL.md", import.meta.url), "utf8").replace(/\s+/g, " ");
+  expect(skill).toContain("An imperative human instruction to relaunch or continue is the authorization; do not ask again.");
+  expect(skill).toContain("Act once on its settled result through the documented route below.");
+  expect(skill).toContain("Such an instruction never supplies an unblock, a resolution or a `needs-decision` answer, and never overrides a recorded Stop.");
+});
