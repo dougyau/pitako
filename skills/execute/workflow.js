@@ -139,8 +139,13 @@ function nativeReference(childKey, result) {
       .replaceAll(JSON.stringify(result.structuredOutput, null, 2), "[retained failed original]")
       .replaceAll(JSON.stringify(result.structuredOutput), "[retained failed original]");
   for (const field of ["agent", "runId", "asyncDir", "outputReference", "outputArtifactPath", "outputPathMapping", "artifactPaths", "externalAdapter",
-    ...(review ? ["nativeKey", "workflowKey", "outputSaveError", "metadataSaveError", "exitCode", "timedOut", "terminalOutcome", "stopped", "interrupted", "detached", "recovery", "toolBudgetBlocked", "acceptance", "state"] : [])])
+    ...(review ? ["nativeKey", "workflowKey", "outputSaveError", "metadataSaveError", "exitCode", "timedOut", "terminalOutcome", "stopped", "interrupted", "detached", "recovery", "toolBudgetBlocked", "state"] : [])])
     if (result?.[field] !== undefined) ref[field] = result[field];
+  // Native acceptance metadata is large and constant for read-only reviewers; only
+  // its recovery barrier is control evidence. Per-result debug paths stay in the
+  // native run, reachable through asyncDir/artifactPaths, not in mission state.
+  const recovery = item => item?.acceptance?.recovery !== undefined ? { acceptance: { recovery: item.acceptance.recovery } } : {};
+  if (review) Object.assign(ref, recovery(result));
   if (!review) {
     const witnesses = result?.results?.filter(entry => text(entry.structuredOutputPath) || text(entry.savedOutputPath))
       .map(entry => Object.fromEntries(["structuredOutputPath", "savedOutputPath"].filter(field => text(entry[field])).map(field => [field, entry[field]])));
@@ -150,8 +155,8 @@ function nativeReference(childKey, result) {
   if (result?.key !== undefined && result.key !== childKey && result.key !== result.runId) ref.nativeKey = result.key;
   const witnesses = result?.results?.map(entry => Object.fromEntries(
     ["index", "key", "agent", "runId", "workflowKey", "savedOutputPath", "outputReference", "structuredOutputPath",
-      "outputSaveError", "metadataSaveError", "artifactPaths", "exitCode", "terminalOutcome", "state", "stopped", "interrupted", "timedOut", "detached", "recovery", "toolBudgetBlocked", "acceptance"]
-      .filter(field => entry[field] !== undefined).map(field => [field, entry[field]])));
+      "outputSaveError", "metadataSaveError", "exitCode", "terminalOutcome", "state", "stopped", "interrupted", "timedOut", "detached", "recovery", "toolBudgetBlocked"]
+      .filter(field => entry[field] !== undefined).map(field => [field, entry[field]]).concat(Object.entries(recovery(entry)))));
   if (witnesses?.length) ref.results = witnesses;
   return ref;
 }
@@ -1908,7 +1913,8 @@ function observePendingSealer() {
   const close = loop?.attempt?.close;
   if (loop?.attempt?.stage === "result") return Promise.resolve();
   if (!pending?.retry && !close?.dispatched) return Promise.resolve();
-  const ref = close?.dispatched ? close.ref ?? { key: close.key + (close.retry ? `.r${close.retry}` : ""), agent: "pitako.loop-io" }
+  // A grouped close consumes seal index 0; a later legacy re-seal is the newest producer.
+  const ref = close?.dispatched && (pending?.retry ?? 0) <= 1 ? close.ref ?? { key: close.key + (close.retry ? `.r${close.retry}` : ""), agent: "pitako.loop-io" }
     : { key: sealerKey(loop.attempt.key, pending.retry - 1), agent: "pitako.checkpoint-sealer" };
   const key = ref.key;
   if (budgetRejected(key) || pending?.reconciled === key) return Promise.resolve();
@@ -2562,7 +2568,8 @@ function finishBudgetExhaustion() {
     "Native per-run spawn budget exhausted before any child in the admission group started; state saved. Automatically relaunch the same invocation and mission as a new top-level run.", true));
 }
 function finish(status, reason, drained = false) {
-  if (!drained && status !== "budget-exhausted" && !persistenceFailed && (!loop?.halt || ["semantic-block", "needs-decision"].includes(loop.halt.code)) &&
+  // Early blocks before admission validation promise no dispatch: retained intentions stay unchanged.
+  if (!drained && admissionValidated && status !== "budget-exhausted" && !persistenceFailed && (!loop?.halt || ["semantic-block", "needs-decision"].includes(loop.halt.code)) &&
       invocation?.association && (invocation.intentions?.length || status === "complete" && !invocation.finishDrain) && !hostHalt) {
     return groupedIO("finishDrain", { operation: "drain" }, invocation).then(() => {
       invocation.finishDrain.receipt = receiptReference(invocation.finishDrain.receipt);
@@ -3067,7 +3074,11 @@ Publish one selection with the native output binding then END. Native permission
       invocation.currentView = applied.view; invocation.boardTopicId = applied.view.topicId;
       loop.kind = applied.selected ? "task" : "final";
       loop.task = applied.selected;
-      if (loop.kind === "final") { loop.acceptance = applied.acceptance; loop.completedTasks = applied.completedTasks; }
+      if (loop.kind === "final") {
+        // One retained copy: the selection receipt's copy only bridges this admission.
+        loop.acceptance = applied.acceptance; loop.completedTasks = applied.completedTasks;
+        delete loop.selection.receipt.completedTasks;
+      }
       loop.metricSeries = clone(applied.selected?.progress ?? { nonImproving: 0, last5: [] });
       loop.manifest = applied.selected ? [applied.selected.id] : [];
       invocation.tasks = Object.fromEntries(loop.manifest.map(id => [id, { admitted: [], completed: null, last: null }]));

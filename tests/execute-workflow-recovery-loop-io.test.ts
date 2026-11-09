@@ -107,6 +107,23 @@ test.each(["structured", "management"])("pending grouped seal observes its exact
   expect(host.launches).toHaveLength(count);
 });
 
+test("a legacy re-seal dispatched after a grouped close is observed before any further seal", async () => {
+  const host = fixture(); host.setLimit(1);
+  host.setFailSave(value => !!value.loop?.attempt?.seal?.retry && value.loop.attempt.stage !== "result");
+  expect((await host.execute()).status).toBe("partial");
+  host.setFailSave();
+  const attempt = host.current().loop.attempt, legacy = `${attempt.key}.seal.r1`;
+  // The grouped close consumed seal index 0; a cleared halt then dispatched the legacy `.seal.r1`.
+  expect(attempt.close.dispatched).toBe(true);
+  attempt.seal = { retry: 2, kind: "unit" };
+  host.setStatus(ref => ref === legacy ? { ok: true, runId: ref, agent: "pitako.checkpoint-sealer", state: "running" }
+    : host.native.get(ref) ?? { ok: true, state: "unknown" });
+  const count = host.launches.length;
+  expect((await host.execute()).status).toBe("blocked");
+  expect(host.statusCalls).toContain(legacy);
+  expect(host.launches).toHaveLength(count);
+});
+
 test("a cut after grouped sealing reuses the receipt without another close or worker", async () => {
   const host = fixture(); host.setLimit(1);
   host.setFailSave(value => !!value.loop?.attempt?.seal?.retry && value.loop.attempt.stage !== "result");
@@ -146,4 +163,8 @@ test.each(["pitako.checkpoint-sealer", "pitako.execution-ledger"])("retained leg
   expect(host.statusCalls).toContain(`legacy-${key}`);
   expect(host.launches.slice(count).some(call => call.agent === agent && call.key === `${key}.r1`)).toBe(true);
   expect(host.launches.filter(call => call.agent === "pitako.worker")).toHaveLength(1);
+  // Only loop-io carries the fixed idle control; the standalone sealer and ledger never do.
+  const standalone = host.launches.filter(call => call.agent === agent);
+  expect(standalone.length).toBeGreaterThan(0);
+  for (const call of standalone) expect(call).not.toHaveProperty("control");
 });

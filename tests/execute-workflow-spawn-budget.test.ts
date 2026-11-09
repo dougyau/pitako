@@ -169,6 +169,24 @@ test("an admitted seal permits another budget-exhausted end and relaunch", async
   expect((await host.execute()).status).toBe("complete");
 });
 
+test.each([
+  ["changed amendments", { amendments: [{ path: ".pitako/amendments/late.md", sha256: "a".repeat(64), provenance: "human message 1" }] }, "Immutable admission amendments changed"],
+  ["changed worktree", { root: "/other/worktree" }, "Immutable mission/invocation/worktree request changed"],
+] as const)("an early %s block after budget exhaustion leaves pending intentions undispatched", async (_name, override, reason) => {
+  const host = fixture();
+  // Loop 1's unit ledger, settlement and loop record stay queued when the next draining advance is rejected.
+  host.setLimit(2);
+  host.setLaunchRespond((request, normal) => request.key.endsWith(".l1.nextAdvance") ? receipt(request.key) : normal());
+  expect((await host.execute()).status).toBe("budget-exhausted");
+  const before = copy(host.current()), calls = host.calls.length;
+  expect(before.intentions?.length ?? 0).toBeGreaterThan(0);
+  const output = await host.execute(override);
+  expect(output.status).toBe("blocked");
+  expect(output.reason).toContain(reason);
+  expect(host.calls).toHaveLength(calls);
+  expect(host.current()).toEqual(before);
+});
+
 test.each(["stopped", "native permission denial", "semantic-block"])(
   "budget relaunch preserves a recorded %s barrier without any dispatch", async cause => {
     const host = fixture();
