@@ -909,7 +909,8 @@ user decisions, and limits. Keep deliberation here; only the final memo reaches 
 // not originals reconstructed from status/previews.
 if ((cursor.steering !== undefined && (!Array.isArray(cursor.steering) || cursor.steering.some(item =>
       !Number.isInteger(item.round) || item.round < 2 || item.round > rounds || !text(item.key) ||
-      !["intended", "delivered", "missed", "failed"].includes(item.state) || !originals.some(original => original.id === item.originalId)))) ||
+      // Native runs.steer receipts may be queued: sent, not yet consumed, never a required challenge.
+      !["intended", "queued", "delivered", "missed", "failed"].includes(item.state) || !originals.some(original => original.id === item.originalId)))) ||
     (control.next !== null && !conforms(nextValue(), decisionControlSchema)) ||
     (control.stage !== "prepare" && control.next === null) ||
     (control.round !== null && (!Number.isInteger(control.round) || control.round !== rounds || rounds < 1)) ||

@@ -459,7 +459,7 @@ describe("architecture scripted workflow", () => {
     expect(result.memo).toBeUndefined();
   });
 
-  test.each(["delivered", "missed", "failed"])(
+  test.each(["queued", "delivered", "missed", "failed"])(
     "rolls later reports into stable-key steering and records %s without a retry",
     async state => {
       const late = deferred<Result>();
@@ -492,6 +492,33 @@ describe("architecture scripted workflow", () => {
       expect(JSON.stringify(result)).not.toContain("Private report");
     },
   );
+
+  test("a planning pause after queued steering accepts human answers on reentry", async () => {
+    const late = deferred<Result>();
+    const scope = { id: "scope", kind: "human", dependsOn: [], question: "Use scope A?", decision: "Scope", recommendation: "Use scope A" };
+    const first = fixture(
+      async key => {
+        if (key === "director-doubts-r1") return { ...child(key), structuredOutput: { doubts: [] } };
+        if (key === "director-after-r1") return child(key, discuss);
+        if (key === "director-doubts-r2") return { ...child(key), structuredOutput: { doubts: [scope] } };
+        if (key === "r2-recover") return late.promise;
+        return child(key);
+      },
+      key => {
+        late.resolve(child(key));
+        return { state: "queued" };
+      },
+    );
+    const paused = await first.execute({ planning: true, currentDecision: snapshot("Decision") });
+    expect(paused).toMatchObject({ status: "needs-human", rounds: 2, validRounds: 2 });
+    expect(first.steered.map(item => item.key)).toEqual(["r2-recover"]);
+    const { consultation, revision, round } = paused.frontier!;
+    const resumed = fixture();
+    const result = await resumed.execute({ planning: true, continuation: paused.continuation, humanAnswers: { consultation, revision, round,
+      answers: [{ id: "scope", disposition: "answer", content: "Use scope A", provenance: "Actual human message" }] } }, first.storage);
+    expect(result).toMatchObject({ status: "completed", rounds: 2, validRounds: 2 });
+    expect(resumed.calls.map(call => call.key)).toEqual(["director-after-r2"]);
+  });
 
   test("does not finish or replace a failed member before its sibling settles", async () => {
     const waiting = deferred<Result>();
