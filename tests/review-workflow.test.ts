@@ -774,6 +774,9 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
     const result = await host.execute();
     expect(result.status).toBe("failed");
     expect(result.memo).toBeUndefined();
+    // The synthesis contract states every rule its validator enforces.
+    if (key === "director-synthesis") expect(host.calls.find(call => call.key === key)!.request.task)
+      .toContain("A disposition classified uncertain must use decision uncertain, never include.");
   });
 
   test.each([
