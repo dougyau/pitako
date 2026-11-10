@@ -15,6 +15,7 @@ import {
   THIRD_PARTY_ALWAYS_ON_MARKERS,
   skillStatusLines,
 } from "../extensions/catalog.ts";
+import { EXECUTE_STATE_VERSION } from "../extensions/execute-state.ts";
 import pitako from "../extensions/index.ts";
 import { profileNote } from "../extensions/profile.ts";
 import { packageRoot, readStack } from "../extensions/stack.ts";
@@ -88,7 +89,7 @@ describe("engineering-layer composition", () => {
           expect(body).toContain("Editing provider/profile files does not reload");
           for (const instruction of [".pitako/backlog/<spec-id>.json", "compare-and-swap",
             "{work, status, remaining, knowledge:{findings, handoff}}", "### Final phase",
-            "supersedes", "Spec-by-sections delivery is deferred", "contract version (v6)"])
+            "supersedes", "Spec-by-sections delivery is deferred", `contract version (v${EXECUTE_STATE_VERSION})`])
             expect(body).toContain(instruction);
           const ceiling = readRepo("AGENTS.md");
           for (const instruction of ["pitako.loop-io", "gitignored", "no command allow-list"])

@@ -361,9 +361,11 @@ writer. Sequential fresh workers use four-hour attempts, reads:false and
 progress:false, no private diaries and no next-task selection. Their todo steps
 are display only, projected from the child session file, not evidence.
 
-Attempt order is worker settles → save close intention → loop-io requests →
-gate → eligible task review → seal → save receipt → workflow admission. No writer is active during
-gates. The workflow measures the metric every attempt; focused gates run when
+For a complete result, attempt order is worker settles → gate → task delta →
+eligible task review → request observation → seal → save receipt → workflow
+admission. Other attempts, and complete ones without task review, seal through
+the grouped close below (save close intention → request observation → gate →
+seal), reusing a matching gate receipt. No writer is active during gates. The workflow measures the metric every attempt; focused gates run when
 the worker reports complete or the
 task has no metric. Commands have timeouts and process-group termination, bounded
 receipt tails and full logs under `.pi/subagents/execute/<invocation>/gates/`.
@@ -394,13 +396,20 @@ digests and Board `postOnce` replay checks.
 - One trailing drain per invocation publishes intentions prepared by the last
   admission before finish.
 
-A single-attempt task loop without task review uses about 5 launches: advance, director,
-selection, worker and close, plus the one trailing drain per invocation. Each
-extra attempt uses 2 (worker and close). This arithmetic excludes retries
-(including `.d1` director/selection retries), pagination, cancellations, recovery
-and task/final review/compliance flows; it is not a bound on exceptional runs.
-Eligible file-writing tasks use non-grouped `verifyAttempt`, delta evidence,
-two read-only review children and the standalone checkpoint sealer before admission.
+A task loop uses advance, director and selection, plus one trailing drain per
+invocation. Each attempt then uses about:
+
+- 2 launches (worker, close) for a continue, gaps or blocked result;
+- 3 (worker, gate, close) for a complete result whose gates fail;
+- 4 (worker, gate, task delta, close) for a complete result with no journaled write;
+- 7 (worker, gate, task delta, two read-only review children, request observer,
+  checkpoint sealer) for a reviewed file-writing attempt, plus a drain when
+  intentions are pending.
+
+A single-attempt reviewed loop therefore uses about 10 launches, and a repair
+adds another reviewed attempt. This arithmetic excludes retries (including `.d1`
+director/selection retries), pagination, cancellations, recovery and final
+review/compliance flows; it is not a bound on exceptional runs.
 
 Each sub-step has a key and result-digest marker under the invocation's `.pi/`
 metadata. Same-key relaunches and `.rN` retries verify completed markers and
@@ -825,7 +834,7 @@ original full structuredOutput, not previews. Cache at most the identical active
 plan when it fits the ENTIRE 256 KiB native state file. Essential snapshot/frozen
 descriptor/progress persistence failure blocks unsafe dispatch.
 Closed-loop history goes to a verified ledger; superseded recovery data is
-archived then discarded. Execute state uses one contract version (v6). Older
+archived then discarded. Execute state uses one contract version (v8). Older
 retained state fails before any resume or dispatch: "created by an incompatible
 Pitako contract vN; start a new mission". Nothing is migrated.
 Keep current task/control progress and usage totals, not a closed-loop array.
