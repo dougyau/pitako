@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { readBacklog } from "../skills/execute/loop.ts";
-import { restoreCheckpoint } from "../extensions/execute-checkpoint.ts";
+import { digest } from "../extensions/spec-plans.ts";
 import { executeControllerFixture, type Result } from "./fixtures/execute-workflow.ts";
 
 const { fixture } = executeControllerFixture();
@@ -130,15 +130,26 @@ test("saved rejection survives a result-save cut without renewing the repair", a
 });
 
 test("interrupted repair fallback retains the single repair allowance", async () => {
+  // This asserts repair accounting, not restored bytes; checkpoint-sealer's
+  // never-closed-effect case retains the real restoring-worker integration.
   const host = fixture(); host.setLimit(1);
   host.setRespond((request, normal) => {
-    if (request.agent === "pitako.worker" && host.current().loop.attempt.restore) {
-      const frame = host.current().taskFrame;
-      const restore = host.current().loop.attempt.restore;
-      restoreCheckpoint(restore.sourceKeys.map((key: string) => frame.sources.find((source: any) => source.key === key)),
-        restore.authority);
-    }
     const result = normal();
+    const descriptor = host.current().loop?.attempt;
+    if (request.agent === "pitako.checkpoint-sealer" && descriptor.restore) {
+      const manifest = descriptor.restore.observations[0].manifest;
+      const directory = manifest.replace(/\/manifest\.json$/, "");
+      const observed = JSON.parse(result.output!);
+      observed.restored = { checkpointRef: manifest, digest: digest(descriptor.key),
+        partialRef: `${directory}/restore.json`, restoredRef: `${directory}/restored.json`,
+        position: { loop: 1, cursor: 0, phase: "implementation" }, candidate: host.observedCandidate() };
+      for (const field of ["confirmedPause", "confirmedUnit"]) {
+        const confirmed = descriptor.restore.authority[field];
+        if (confirmed?.checkpointRef.startsWith(directory + "/"))
+          observed.restored[field] = { checkpointRef: confirmed.checkpointRef, digest: confirmed.digest };
+      }
+      result.output = JSON.stringify(observed);
+    }
     if (request.key.endsWith(".task-synthesis")) reject(result);
     return result;
   });
@@ -159,4 +170,5 @@ test("interrupted repair fallback retains the single repair allowance", async ()
   expect(host.current().lastConfirmed.kind).toBe("pause");
   expect(host.current().consumedLoops).toBe(1);
   expect(host.history()[0].outcome).toBe("gaps");
+  host.expectProcessBudget(2); // Measured zero, plus two.
 });

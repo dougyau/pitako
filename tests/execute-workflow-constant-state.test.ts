@@ -8,7 +8,7 @@ import { RunFanoutLimitError } from "../node_modules/pi-subagents/src/runs/share
 const { fixture } = executeControllerFixture();
 
 test("30 single-task loops retain constant state across pauses, recoveries and --unblock", async () => {
-  const host = fixture(undefined, { taskCount: 30, controlledCheckpoints: true, controlledPublisher: true, retainSnapshots: false }); host.setLimit(30);
+  const host = fixture(undefined, { taskCount: 30, controlledPublisher: true, retainSnapshots: false }); host.setLimit(30);
   const candidate = host.observedCandidate(), sizes: { loop: number; bytes: number }[] = [];
   const admittedSeals = new Set<string>();
   let peak: any, peakBytes = 0;
@@ -168,7 +168,7 @@ test("a gaps publisher delivers its verified rejection summary to the very next 
 
 test.each([4, 5])("selection rejection ring remembers three loops, not all history (repeat at %s)", async repeat => {
   // This checks the rejection ring, not checkpoint filesystem operations.
-  const host = fixture(undefined, { taskCount: 6, controlledCheckpoints: true }); host.setLimit(6);
+  const host = fixture(undefined, { taskCount: 6 }); host.setLimit(6);
   host.setRespond((request, normal) => {
     const number = Number(request.key.match(/\.l(\d+)\./)![1]), result = normal();
     if (request.agent === "pitako.execution-director" && [1, repeat].includes(number))
@@ -205,7 +205,7 @@ test.each([4, 5])("native closing references ring rejects only last three loops 
 });
 
 test("unblock selects invocation, last closed, then open resolutions; older closed requests are unavailable", async () => {
-  const host = fixture(undefined, { controlledCheckpoints: true }); host.setLimit(1);
+  const host = fixture(undefined, {  }); host.setLimit(1);
   host.setRespond((request, normal) => {
     const result = normal();
     if (request.agent === "pitako.worker" && request.key.endsWith(".t1.a1"))
@@ -361,7 +361,7 @@ test.each(["cancellation", "finalGaps"])("%s projections discard their unused vi
 test("a final review with production-sized originals and native metadata stays inside the native state envelope", async () => {
   // Magnitudes mirror exec-elee-20261109-2: eleven completed tasks, four angles, ~113 KB of
   // review values and native reviewer receipts carrying acceptance and debug paths.
-  const host = fixture(undefined, { taskCount: 11, angles: 4, findings: true, retainSnapshots: false, controlledCheckpoints: true });
+  const host = fixture(undefined, { taskCount: 11, angles: 4, findings: true, retainSnapshots: false });
   host.setLimit(12);
   let peakBytes = 0;
   host.setSaveObserver((_value, bytes) => { peakBytes = Math.max(peakBytes, bytes); });

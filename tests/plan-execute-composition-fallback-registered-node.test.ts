@@ -2,7 +2,6 @@ import { beforeAll, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { validateToolArguments } from "@earendil-works/pi-ai";
 import type { TSchema } from "typebox";
@@ -12,11 +11,12 @@ import { runWorkflowScript } from "../node_modules/pi-subagents/src/workflows/sc
 import { executionResource } from "../extensions/plan-execute.ts";
 import { EXECUTE_STATE_VERSION } from "../extensions/execute-state.ts";
 import { digest, preliminarySpec, SPEC_SECTIONS, checkoutEvidence, MAX_SPEC_BYTES } from "../extensions/spec-plans.ts";
-import { planExecute, checkout, missionFiles, childResponse, registeredCheckpoint, compositionFixture, nativeCheckpointFixture, assignmentSpec, resourceWithAgentDir } from "./fixtures/plan-execute-composition.ts";
+import { planExecute, checkout, missionFiles, childResponse, registeredCheckpoint, realCheckoutCompositionFixture, nativeCheckpointFixture, assignmentSpec, resourceWithAgentDir } from "./fixtures/plan-execute-composition.ts";
 import { prepare, apply, readBacklog, updateProgress, reviewOriginals } from "../skills/execute/loop.ts";
 import { captureBaseline, captureCheckpoint, restoreCheckpoint } from "../extensions/execute-checkpoint.ts";
 
-const composition = compositionFixture();
+const composition = realCheckoutCompositionFixture();
+const { execFileSync } = composition;
 const deterministicScripts = composition.scripts;
 const { disposers, workflowSettlements, repository, checkpointLifecycle } = composition;
 const native = nativeCheckpointFixture(composition);
@@ -548,6 +548,8 @@ describe("plan/execute packaged composition", () => {
       expect(calls.some((key: string) => key.includes(".review."))).toBe(false);
       expect(calls).not.toContain("invoke-human-1.l1.compliance");
       expect(resource.hostCommands).toHaveLength(3);
+      // Measured 108 (106 Git + two opaque runtimes), plus 11.
+      if (observation === "missing") composition.expectProcessBudget(119);
     });
   });
 

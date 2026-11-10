@@ -54,8 +54,8 @@ test("missing/invalid peak and context, halt or candidate limits select fresh", 
 
 const { fixture } = executeControllerFixture();
 const lastAttempt = (host: ReturnType<typeof fixture>) => [...host.snapshots].reverse().find(s => s.loop?.attempt?.taskId === "change1").loop.attempt;
-function continuingHost(options: { reject?: boolean; missingPeak?: boolean; stagnant?: boolean; drift?: boolean; refusal?: string } = {}) {
-  const host = fixture(undefined, { humanPosts: [{ id: 2, type: "FINDING", content: "Already loaded" }] });
+function continuingHost(options: { realCheckout?: boolean; reject?: boolean; missingPeak?: boolean; stagnant?: boolean; drift?: boolean; refusal?: string } = {}) {
+  const host = fixture(undefined, { realCheckout: options.realCheckout || options.drift, humanPosts: [{ id: 2, type: "FINDING", content: "Already loaded" }] });
   let workers = 0, gates = 0;
   host.setRespond((request, normal) => {
     if (request.resume && /\.t\d+\.a\d+$/.test(request.key)) {
@@ -89,7 +89,7 @@ function continuingHost(options: { reject?: boolean; missingPeak?: boolean; stag
 }
 
 test("controller resumes a new keyed attempt without bindings and sends only deltas", async () => {
-  const host = continuingHost();
+  const host = continuingHost({ realCheckout: true });
   expect((await host.execute()).status).toBe("complete");
   const first = host.calls.find(request => request.agent === "pitako.worker")!;
   const resumed = host.calls.find(request => request.resume && request.key.includes(".t1."))!;

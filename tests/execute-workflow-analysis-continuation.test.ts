@@ -427,7 +427,7 @@ describe("checkpoint-first modifying recovery", () => {
   test.each(["missing", "interrupted", "cache-missing", "key-only"].flatMap(mode =>
     ["none", "restoration-intent", "new-checkpoint", "result", "next-loop"].map(cut => ({ mode, cut })) ))(
     "$mode restores before capture across $cut cut and replays idempotently", async ({ mode, cut }) => {
-      const host = fixture(), target = "invoke-human-1.l1.t1.a1";
+      const host = fixture(undefined, { realCheckout: true }), target = "invoke-human-1.l1.t1.a1";
       let source: CheckpointIntent, restored: ReturnType<typeof restoreCheckpoint>;
       host.setRespond((request, normal) => {
         if (request.key === target) {
@@ -473,7 +473,7 @@ describe("checkpoint-first modifying recovery", () => {
     });
 
   test.each(["missing", "corrupt"])("%s checkpoint is refused by the restoring worker before capture", async mode => {
-    const host = fixture();
+    const host = fixture(undefined, { realCheckout: true });
     host.setRespond((request, normal) => {
       if (request.key === "invoke-human-1.l1.t1.a2") {
         const state = host.current();

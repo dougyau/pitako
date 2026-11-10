@@ -56,7 +56,7 @@ test.each(["first-loop", "rejected-plan"])("%s alone dispatches no observation",
 });
 
 test.each(["rejected-report", "unusable-failure", "candidate-change"])("%s gaps alone dispatches no observation", async mode => {
-  const host = fixture(undefined, { readOnly: true });
+  const host = fixture(undefined, { realCheckout: mode === "candidate-change", readOnly: true });
   host.setRespond((request, normal) => {
     if (request.key === "invoke-human-1.l1.t1.a1") {
       const result = normal();
@@ -92,7 +92,7 @@ test.each(["stopped", "permission", "technical"])("demand observation preserves 
 
 // Empty remaining lists must not erase the causal diagnosis of unfinished work.
 test.each(["gaps", "continue"])("unfinished worker %s with no remaining entries triggers one observation", async status => {
-  const host = fixture(undefined, { readOnly: true, controlledCheckpoints: true });
+  const host = fixture(undefined, { readOnly: true });
   host.setRespond((request, normal) => {
     if (request.agent === "pitako.worker" && request.key.startsWith("invoke-human-1.l1.t1.")) return host.result(request, {
       ...host.worker(request), status, remaining: [],
@@ -175,7 +175,7 @@ function materialReviewGaps(host: ControllerHost, acceptance?: any) {
 }
 
 test("closed demand sources persist once while observations keep every retained original", async () => {
-  const host = fixture(undefined, { taskCount: 0, findings: true, angles: 3, controlledCheckpoints: true }); host.setLimit(9);
+  const host = fixture(undefined, { taskCount: 0, findings: true, angles: 3 }); host.setLimit(9);
   // Realistic review witnesses: each child reference carries a sizeable native acceptance record.
   materialReviewGaps(host, { status: "not-required", evidenceStatus: "not-required", explicit: false, criteria: [],
     inferredReason: ["x".repeat(2000)], runtimeChecks: [], verifyRuns: [] });

@@ -2,8 +2,8 @@ import { expect, test } from "bun:test";
 import { copy, executeControllerFixture } from "./fixtures/execute-workflow.ts";
 
 const { fixture: createFixture } = executeControllerFixture();
-function fixture() {
-  const host = createFixture();
+function fixture(options: Parameters<typeof createFixture>[1] = {}) {
+  const host = createFixture(undefined, options);
   // These tests exercise grouped close, which is retained for tasks without journaled writes.
   host.setRespond((request, normal) => request.agent === "pitako.worker"
     ? host.result(request, { status: "complete", work: "Read-only task", remaining: [] }) : normal());
@@ -144,7 +144,7 @@ test("an interrupted close retry observes the in-flight retry rather than its fa
 });
 
 test("a saved close transport cannot admit a candidate changed before replay", async () => {
-  const host = fixture(); host.setLimit(1);
+  const host = fixture({ realCheckout: true }); host.setLimit(1);
   host.setFailSave(value => !!value.loop?.attempt?.close?.admitted && !value.loop.attempt.seal);
   expect((await host.execute()).status).toBe("partial");
   expect(host.current().loop.attempt.close.stage).toBe("receipt");

@@ -1,9 +1,9 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, rmSync } from "node:fs";
 import { checkpointScenarioFixture } from "./fixtures/plan-execute-checkpoint-scenario.ts";
-import { compositionFixture, nativeCheckpointFixture } from "./fixtures/plan-execute-composition.ts";
+import { realCheckoutCompositionFixture, nativeCheckpointFixture } from "./fixtures/plan-execute-composition.ts";
 
-const composition = compositionFixture();
+const composition = realCheckoutCompositionFixture();
 const { roots, disposers, checkpointCancellations, settleWorkflows } = composition;
 const native = nativeCheckpointFixture(composition);
 const { nativeCheckpointExits, startNativeCheckpoint, nativeCheckpointCase, nativeCheckpointInput } = native;
@@ -121,7 +121,11 @@ describe("plan/execute packaged composition", () => {
       });
       continue;
     }
-    test(`registered checkpoint lifecycle confirms bytes with progress: ${mode}`, () => checkpointScenario(mode));
+    test(`registered checkpoint lifecycle confirms bytes with progress: ${mode}`, async () => {
+      await checkpointScenario(mode);
+      // Measured 179 (178 Git + one opaque runtime), plus 18.
+      if (mode === "unit-before-capture") composition.expectProcessBudget(197);
+    });
   }
 });
 

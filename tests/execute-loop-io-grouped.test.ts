@@ -9,11 +9,11 @@ import { openBoard } from "../extensions/board/store.ts";
 import { repositoryIdentity } from "../extensions/board/workspace.ts";
 import { canonicalDigest, canonicalJSON, sha256 } from "../extensions/canonical.mjs";
 import { applyCheckpoint, beginHookEffect, captureCheckpoint, checkpointDirectory, recordContextPeak, restoreCheckpoint, type CheckpointIntent } from "../extensions/execute-checkpoint.ts";
-import { compositionFixture, nativeCheckpointFixture } from "./fixtures/plan-execute-composition.ts";
+import { realCheckoutCompositionFixture, nativeCheckpointFixture } from "./fixtures/plan-execute-composition.ts";
 
 const entry = path.resolve("skills/execute/loop-io.mjs");
 const { verifyLedger } = await import(path.resolve("skills/execute/ledger.mjs"));
-const composition = compositionFixture();
+const composition = realCheckoutCompositionFixture();
 const { roots } = composition;
 const runtime = nativeCheckpointFixture(composition);
 const invocation = "drain-fixture";

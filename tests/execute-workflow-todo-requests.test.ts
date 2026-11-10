@@ -196,7 +196,7 @@ test("execute observes a new request immediately before a useful retry", async (
 
 test.each(["cancel", "delete"])("execute observes %s before admitting a recovered successful attempt and cancels dependents", async kind => {
   for (const recovery of ["status", "received"]) {
-    const host = fixture(undefined, { readOnly: true, taskCount: 2, controlledCheckpoints: true }); host.setLimit(1);
+    const host = fixture(undefined, { readOnly: true, taskCount: 2 }); host.setLimit(1);
     let pending = false, armed = false;
     host.setRespond((call, normal) => {
       if (call.agent === "pitako.request-observer") return page(call, pending && armed ? [request(kind)] : []);

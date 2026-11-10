@@ -64,7 +64,7 @@ test("a later failing designated check turns the notice unfulfilled without chan
 
 test("specs without a criteria anchor keep the director prompt and view unchanged", async () => {
   for (const anchor of [undefined, null, { spec: "fix-spec" }]) {
-    const host = fixture(undefined, { readOnly: true, controlledCheckpoints: true });
+    const host = fixture(undefined, { readOnly: true });
     const prompts = marking(host, { "full": [1] });
     const outcome = await host.execute(anchor === undefined ? {} : { originalProblem: anchor });
     expect(outcome.status).toBe("complete");
@@ -114,7 +114,7 @@ test("a missing receipt or a gate without designation cannot verify a criterion"
 });
 
 test("a previously passing receipt cannot verify a changed candidate", async () => {
-  const host = fixture(); host.setLimit(1);
+  const host = fixture(undefined, { realCheckout: true }); host.setLimit(1);
   marking(host, { "change1-check": [1] });
   expect((await host.execute({ originalProblem: { criteria: [1] } })).originalProblem.status).toBe("fulfilled");
   host.changeCheckout();

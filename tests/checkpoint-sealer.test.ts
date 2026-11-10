@@ -11,19 +11,29 @@ import { copy, cutAt, executeControllerFixture } from "./fixtures/execute-workfl
 import { RunFanoutLimitError } from "../node_modules/pi-subagents/src/runs/shared/run-fanout-budget.js";
 import { captureBaseline, beginHookEffect, closeHookEffect, applyCheckpoint, captureCheckpoint, checkpointDirectory, prepareCheckpoint, restoreCheckpoint, type CheckpointIntent } from "../extensions/execute-checkpoint.ts";
 import { buildExternalCliPrompt } from "../node_modules/pi-subagents/src/runs/shared/external-cli-runner.js";
+import { processBudget, expectProcessBudget } from "./fixtures/process-budget.ts";
 const sealerPrompt = "Fixed checkpoint sealer; stdin is a JSON {v, intent, kind, restoreSources?} request.";
 
 const roots: string[] = [];
-afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+const processDisposers: (() => void)[] = [];
+afterEach(() => {
+  for (const dispose of processDisposers.splice(0)) dispose();
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
 const script = path.resolve("skills/execute/checkpoint.mjs");
 const sha = (value: string) => createHash("sha256").update(value).digest("hex");
 function fixture(paths = ["owned"]) {
   const root = mkdtempSync(path.join(tmpdir(), "pitako-sealer-")); roots.push(root);
-  const git = (...args: string[]) => execFileSync("git", args, { cwd: root, encoding: "utf8", env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" } }).trim();
+  const budget = processBudget(root); processDisposers.push(budget.dispose);
+  const git = (...args: string[]) => {
+    budget.counts.git++;
+    return execFileSync("git", args, { cwd: root, encoding: "utf8", env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" } }).trim();
+  };
   git("init", "-q"); git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-qm", "base");
   writeFileSync(path.join(root, "owned"), "before");
   const intent: CheckpointIntent = { version: 2, association: { root, commonDir: git("rev-parse", "--path-format=absolute", "--git-common-dir"), missionId: "mission", missionPath: path.join(root, "mission.json"), invocation: "test", source: path.join(root, "spec.md"), digest: "a".repeat(64), maxCycles: 3, sourceRefs: [] }, key: "test.a1", taskId: "task", attempt: 1, loop: 1, cursor: 0, phase: "implementation", planRef: {}, progress: { consumedLoops: 1, admitted: {}, previous: null } };
   const run = (kind: "unit" | "pause" | null, extra = {}, cwd = root) => {
+    budget.counts.sealer++;
     const result = spawnSync("node", [script, "--seal-stdin"], { cwd, encoding: "utf8",
       // The registered runtime agent's actual stdin framing, not bare JSON.
       input: buildExternalCliPrompt(sealerPrompt, JSON.stringify({ v: 1, intent, kind, ...extra })) });
@@ -31,7 +41,8 @@ function fixture(paths = ["owned"]) {
   };
   const capture = () => captureCheckpoint(intent, paths);
   const change = (value: string) => applyCheckpoint(intent, [{ path: "owned", image: { bytes: Buffer.from(value).toString("base64"), mode: 0o644 } }]);
-  return { root, intent, run, capture, change, directory: checkpointDirectory(intent) };
+  return { root, git, intent, run, capture, change, directory: checkpointDirectory(intent),
+    processes: budget.processes, expectProcessBudget: (maximum: number) => expectProcessBudget(budget.processes(), maximum) };
 }
 
 test.each([null, "unit", "pause"] as const)("no manifest observes candidate without metadata (%s)", kind => {
@@ -163,7 +174,7 @@ test.each([
   ["complete", [], "unit"], ["continue", ["pending"], "pause"],
   ["gaps", ["pending"], "pause"], ["gaps", [], "pause"], ["continue", [], "pause"],
 ] as const)("root chooses seal kind for %s remaining=%j", async (status, remaining, expected) => {
-  const host = controller(undefined, { controlledCheckpoints: true });
+  const host = controller();
   host.setLimit(1);
   host.setRespond((request, normal) => {
     if (request.agent === "pitako.worker") {
@@ -210,7 +221,7 @@ test("a schema-invalid declared block still halts after kind-null journal verifi
 });
 
 test.each(["complete", "pause", "rejected"])("journal mismatch for %s blocks before admission with actionable paths", async mode => {
-  const host = controller();
+  const host = controller(undefined, { realCheckout: true });
   host.setRespond((request, normal) => {
     if (request.key === "invoke-human-1.l1.t1.a1") {
       const value = host.worker(request);
@@ -237,7 +248,7 @@ test.each(["complete", "pause", "rejected"])("journal mismatch for %s blocks bef
 });
 
 test("structurally rejected worker reports verify the journal without sealing", async () => {
-  const host = controller(undefined, { controlledCheckpoints: true }); host.setLimit(1);
+  const host = controller(); host.setLimit(1);
   host.setRespond((request, normal) => {
     if (request.agent === "pitako.worker") return host.result(request, { ...host.worker(request), work: null });
     if (request.agent === "pitako.checkpoint-sealer") expect(JSON.parse(request.task).kind).toBeNull();
@@ -249,7 +260,7 @@ test("structurally rejected worker reports verify the journal without sealing", 
 });
 
 test("root observes missing manifests and blocks changed candidates without a journal-backed unit", async () => {
-  const host = controller(); host.setLimit(1);
+  const host = controller(undefined, { realCheckout: true }); host.setLimit(1);
   host.setRespond((request, normal) => {
     if (request.agent === "pitako.worker") {
       const value = host.worker(request);
@@ -268,7 +279,7 @@ test("root observes missing manifests and blocks changed candidates without a jo
 });
 
 test.each([false, true])("missing implementation result restores before the next capture (written=%s)", async written => {
-  const host = controller();
+  const host = controller(undefined, { realCheckout: true });
   let source: CheckpointIntent;
   let restored: any;
   host.setRespond((request, normal) => {
@@ -317,7 +328,7 @@ test("pre-review gate retry is restored when native budget rejects dispatch", as
 });
 
 test("integrity halt holds without input; repaired bytes cannot reuse a different saved gate candidate", async () => {
-  const host = controller();
+  const host = controller(undefined, { realCheckout: true });
   const file = path.join(host.root, "src/change1.ts");
   host.setRespond((request, normal) => {
     if (request.key === "invoke-human-1.l1.t1.a1") {
@@ -505,7 +516,7 @@ test.each(["capture", "effect", "postimage"])("insufficient %s evidence halts re
 });
 
 test("controller admits a late-discovered path in the original worker attempt", async () => {
-  const host = controller(); host.setLimit(1);
+  const host = controller(undefined, { realCheckout: true }); host.setLimit(1);
   host.setRespond((request, normal) => {
     if (request.key === "invoke-human-1.l1.t1.a1") {
       const value = host.worker(request), intent = host.current().loop.attempt.checkpoint;
@@ -527,7 +538,7 @@ test("controller admits a late-discovered path in the original worker attempt", 
 });
 
 test("controller routes a never-closed effect to a restoring worker before admission", async () => {
-  const host = controller(); host.setLimit(1);
+  const host = controller(undefined, { realCheckout: true }); host.setLimit(1);
   let source: CheckpointIntent;
   host.setRespond((request, normal) => {
     if (request.key === "invoke-human-1.l1.t1.a1") {
@@ -552,6 +563,8 @@ test("controller routes a never-closed effect to a restoring worker before admis
   expect(host.history()[0].results[0]).toMatchObject({ status: "complete", attempt: 2 });
   expect(host.calls.filter(call => /\.task-(reviewer|synthesis)$/.test(call.key)).map(call => call.key))
     .toEqual(["invoke-human-1.l1.t1.a2.task-reviewer", "invoke-human-1.l1.t1.a2.task-synthesis"]);
+  // Measured 71 direct processes, plus eight.
+  host.expectProcessBudget(79);
 });
 
 function dispatchBaseline(f: ReturnType<typeof fixture>) {
@@ -562,7 +575,7 @@ function dispatchBaseline(f: ReturnType<typeof fixture>) {
 test("dispatch map uses checkoutEvidence paths, absence, modes and ignored-output exclusions", () => {
   const f = fixture();
   writeFileSync(path.join(f.root, "deleted"), "tracked");
-  execFileSync("git", ["add", "deleted"], { cwd: f.root });
+  f.git("add", "deleted");
   const { unlinkSync } = require("node:fs"); unlinkSync(path.join(f.root, "deleted"));
   writeFileSync(path.join(f.root, ".gitignore"), "ignored\n");
   writeFileSync(path.join(f.root, "ignored"), "build");
@@ -624,7 +637,7 @@ test.each([false, true])("restoration uses restored images only for restored pat
   } else { expect(result.status, result.stderr).toBe(0); expect(result.value.outcome).toBe("sealed"); }
 });
 test("controller records the actual dispatch map before launching a writer", async () => {
-  const host = controller(); host.setLimit(1);
+  const host = controller(undefined, { realCheckout: true }); host.setLimit(1);
   host.setRespond((request, normal) => {
     if (request.agent === "pitako.worker") {
       const attempt = host.current().loop.attempt;

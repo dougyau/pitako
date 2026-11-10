@@ -1,7 +1,6 @@
 import * as loopOperations from "../skills/execute/loop.ts";
 import { beforeAll, describe, expect, test } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
-import { execFileSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, watch, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -28,9 +27,10 @@ import { canonicalDigest } from "../extensions/canonical.mjs";
 import { profileNote } from "../extensions/profile.ts";
 import { DEFAULT_SKILL_NAMES } from "../extensions/catalog.ts";
 import { checkoutEvidence, digest, MAX_SPEC_BYTES, preliminarySpec, SPEC_SECTIONS, validateSpec } from "../extensions/spec-plans.ts";
-import { controlledWorkflow, planExecute, checkout, synchronousHostRelease, read, assignmentSpec, missionFiles, resourceWithAgentDir, childResponse, compositionFixture, nativeCheckpointFixture } from "./fixtures/plan-execute-composition.ts";
+import { controlledWorkflow, planExecute, checkout, synchronousHostRelease, read, assignmentSpec, missionFiles, resourceWithAgentDir, childResponse, realCheckoutCompositionFixture, nativeCheckpointFixture } from "./fixtures/plan-execute-composition.ts";
 
-const composition = compositionFixture();
+const composition = realCheckoutCompositionFixture();
+const { execFileSync } = composition;
 const deterministicScripts = composition.scripts;
 const { roots, disposers, workflowSettlements, checkpointCancellations, settleWorkflows, checkpointLifecycle, repository } = composition;
 const native = nativeCheckpointFixture(composition);
@@ -213,7 +213,7 @@ describe("plan/execute packaged composition", () => {
     const installed = path.join(nativeRoot, "node_modules/pitako");
     for (const file of ["skills/execute/inspect.mjs", "skills/execute/ledger.mjs", "skills/execute/loader.mjs", "skills/execute/inspect.ts",
       "extensions/spec-plans.ts", "extensions/execute-retained.ts", "extensions/execute-checkpoint.ts", "extensions/execute-settings.ts", "extensions/execute-state.ts",
-      "extensions/canonical.mjs", "extensions/hash-ledger.mjs",
+      "extensions/canonical.mjs", "extensions/hash-ledger.mjs", "extensions/git-process-observer.ts",
       "extensions/board/workspace.ts", "extensions/board/paths.ts", "extensions/errors.ts"]) {
       const target = path.join(installed, file);
       mkdirSync(path.dirname(target), { recursive: true });
@@ -529,6 +529,8 @@ describe("plan/execute packaged composition", () => {
       }
     }
     expect(JSON.parse(JSON.parse(Buffer.from(payload, "base64").toString("utf8")).at(-1)).admission.agentDir).toBe(global);
+    // Measured 31 (25 Git + six children), plus four.
+    composition.expectProcessBudget(35);
   }
 
   test("read-only settings admission uses global then designated project, never sibling or launch settings", () => {

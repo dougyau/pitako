@@ -38,6 +38,14 @@ load, composition, Board, session naming, and the scripted workflows are the
 main retirement regressions. Use small parallel groups when ownership changes.
 No configured-model or provider request is required.
 
+Workflow controller fixtures default to controlled checkout; use
+`realCheckout: true` for byte/identity, drift, restoration and command assertions.
+`processes()` / `expectProcessBudget(maximum)` count owned helper Git and direct
+fixture children; set bounds from measured counts + ~10% (at least +2).
+Registered composition fixtures remain explicitly real: their IPC returns Git
+counts and charges shared native runtimes once per test, excluding other
+descendants of those counted children.
+
 ## Capture through ordinary codemode
 
 `scripts/verification-recipe-v1.js` is an optional existing recipe for raw logs

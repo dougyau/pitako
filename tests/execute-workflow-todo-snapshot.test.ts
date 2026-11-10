@@ -128,7 +128,7 @@ test("legacy selected tasks use their ID in todo subjects and worker labels", as
 });
 
 test("director requires capped titles and workflow-generated final gaps have deterministic titles", async () => {
-  const host = fixture(undefined, { taskCount: 0, readOnly: true }); host.setLimit(1);
+  const host = fixture(undefined, { realCheckout: true, taskCount: 0, readOnly: true }); host.setLimit(1);
   host.setRespond((request, normal) => {
     const result = normal();
     if (request.agent === "pitako.execution-director") {
