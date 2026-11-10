@@ -467,8 +467,8 @@ test.each(["pass", "fail", "stale"])("final acceptance %s uses workflow gates be
     const gapWrite = host.calls.findIndex(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).recordGaps);
     expect(gapWrite).toBeLessThan(host.calls.indexOf(director));
   } else expect(repairs).toEqual([]);
-  // Measured 81 including IPC Git and one shared runtime, plus nine.
-  if (mode === "fail") expectProcessBudget([host.processes(), acceptanceComposition.processes()], 90);
+  // Measured 73 including IPC Git and one shared runtime, plus eight.
+  if (mode === "fail") expectProcessBudget([host.processes(), acceptanceComposition.processes()], 81);
 });
 
 
@@ -788,8 +788,8 @@ test.each(["before-launch", "after-receipt"])("one-shot fresh acceptance survive
   expect(readFileSync(`${host.root}/.pi/suite-runs`, "utf8")).toBe("run\nrun\n");
   expect(finalGates(host).filter(call => call.key.includes(".fresh.gate"))).toHaveLength(1);
   expect(host.current().freshAcceptanceAuthorized).toBe(false);
-  // Measured 114 including IPC Git and one shared runtime, plus twelve.
-  expectProcessBudget([host.processes(), acceptanceComposition.processes()], 126);
+  // Measured 106 including IPC Git and one shared runtime, plus eleven.
+  expectProcessBudget([host.processes(), acceptanceComposition.processes()], 117);
 });
 
 test("a new invocation has no reusable final acceptance record", async () => {

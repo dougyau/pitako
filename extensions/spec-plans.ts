@@ -16,22 +16,23 @@ export function validatePlanId(id: unknown): asserts id is string {
 const checkoutPaths = [".", ":(top,exclude).pi", ":(top,exclude).pitako"];
 // Reads that depend only on HEAD and the index, never on worktree files.
 const indexReads = new Set(["rev-parse\0HEAD", "rev-parse\0HEAD\0--abbrev-ref\0HEAD", "ls-files\0--stage\0-z", "diff\0--cached\0--binary", ["diff", "--cached", "--binary", "--", ...checkoutPaths].join("\0")]);
-let indexReadCache: Map<string, string> | undefined;
+type CheckoutSnapshot = { files: Record<string, CheckoutDigest>; evidence: { fingerprint: string; head: string; branch: string; status: string } };
+let indexReadCache: { reads: Map<string, string>; snapshots?: Map<string, CheckoutSnapshot> } | undefined;
 // A synchronous operation that never changes HEAD or the index reads each of
 // them once: rereading within the same call cannot detect a concurrent change.
-export function withIndexReads<R>(run: () => R): R {
+export function withIndexReads<R>(run: () => R, stableCheckout = false): R {
   if (indexReadCache) return run();
-  indexReadCache = new Map();
+  indexReadCache = { reads: new Map(), ...(stableCheckout ? { snapshots: new Map() } : {}) };
   try { return run(); } finally { indexReadCache = undefined; }
 }
 export function gitRead(root: string, ...args: string[]): string {
-  const key = args.join("\0"), cached = indexReads.has(key) ? indexReadCache?.get(root + "\0" + key) : undefined;
+  const key = args.join("\0"), cached = indexReads.has(key) ? indexReadCache?.reads.get(root + "\0" + key) : undefined;
   if (cached !== undefined) return cached;
   const env = { ...process.env, LC_ALL: "C", GIT_OPTIONAL_LOCKS: "0" };
   for (const key of Object.keys(env)) if (key.startsWith("GIT_") && key !== "GIT_OPTIONAL_LOCKS") delete (env as NodeJS.ProcessEnv)[key];
   gitProcessStarted(root);
   const output = execFileSync("git", args, { cwd: root, env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 32 * 1024 * 1024 });
-  if (indexReads.has(key)) indexReadCache?.set(root + "\0" + key, output);
+  if (indexReads.has(key)) indexReadCache?.reads.set(root + "\0" + key, output);
   return output;
 }
 export function designatedWorkspace(root: string) {
@@ -204,7 +205,9 @@ export function preliminarySpec(root: string, id: string, source?: string) {
 }
 /** Content identity, not a test receipt. Exclude tool metadata, whose authority is verified separately. */
 export type CheckoutDigest = { hash: string; mode: number } | null;
-export function checkoutSnapshot(root: string) {
+export function checkoutSnapshot(root: string): CheckoutSnapshot {
+  const cached = indexReadCache?.snapshots?.get(root);
+  if (cached) return structuredClone(cached);
   const digests: Record<string, CheckoutDigest> = Object.create(null);
   const hash = createHash("sha256");
   // Ref names cannot contain newlines.
@@ -242,7 +245,10 @@ export function checkoutSnapshot(root: string) {
       } else throw new Error(`Unsupported checkout entry: ${file}`);
     } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") { hash.update("missing"); digests[file] = null; } else throw error; }
   }
-  return { files: digests, evidence: { fingerprint: hash.digest("hex"), head, branch, status: gitRead(root, "status", "--porcelain=v1", "--untracked-files=normal").slice(0, 1000) } };
+  const snapshot = { files: digests, evidence: { fingerprint: hash.digest("hex"), head, branch, status: gitRead(root, "status", "--porcelain=v1", "--untracked-files=normal").slice(0, 1000) } };
+  // Callers own their returned objects; mutations must not change the operation's observation.
+  indexReadCache?.snapshots?.set(root, structuredClone(snapshot));
+  return snapshot;
 }
 
 export function checkoutEvidence(root: string) { return checkoutSnapshot(root).evidence; }

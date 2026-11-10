@@ -123,8 +123,8 @@ describe("plan/execute packaged composition", () => {
     }
     test(`registered checkpoint lifecycle confirms bytes with progress: ${mode}`, async () => {
       await checkpointScenario(mode);
-      // Measured 179 (178 Git + one opaque runtime), plus 18.
-      if (mode === "unit-before-capture") composition.expectProcessBudget(197);
+      // Measured 159 (158 Git + one opaque runtime), plus 16.
+      if (mode === "unit-before-capture") composition.expectProcessBudget(175);
     });
   }
 });

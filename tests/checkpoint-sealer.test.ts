@@ -9,7 +9,7 @@ import { checkoutEvidence, checkoutSnapshot } from "../extensions/spec-plans.ts"
 import planExecute from "../extensions/plan-execute.ts";
 import { copy, cutAt, executeControllerFixture } from "./fixtures/execute-workflow.ts";
 import { RunFanoutLimitError } from "../node_modules/pi-subagents/src/runs/shared/run-fanout-budget.js";
-import { captureBaseline, beginHookEffect, closeHookEffect, applyCheckpoint, captureCheckpoint, checkpointDirectory, prepareCheckpoint, restoreCheckpoint, type CheckpointIntent } from "../extensions/execute-checkpoint.ts";
+import { captureBaseline, beginHookEffect, closeHookEffect, applyCheckpoint, captureCheckpoint, checkpointDirectory, prepareCheckpoint, restoreCheckpoint, sealCheckpoint, sealCheckpointRequest, type CheckpointIntent } from "../extensions/execute-checkpoint.ts";
 import { buildExternalCliPrompt } from "../node_modules/pi-subagents/src/runs/shared/external-cli-runner.js";
 import { processBudget, expectProcessBudget } from "./fixtures/process-budget.ts";
 const sealerPrompt = "Fixed checkpoint sealer; stdin is a JSON {v, intent, kind, restoreSources?} request.";
@@ -572,6 +572,48 @@ function dispatchBaseline(f: ReturnType<typeof fixture>) {
   f.intent.baseline = { head, fingerprint };
   expect(captureBaseline({ intent: f.intent }).candidate).toEqual(f.intent.baseline!);
 }
+test("sealing observes the real checkout once per request", () => {
+  const f = fixture(); dispatchBaseline(f); f.capture(); f.change("after");
+  const cwd = process.cwd();
+  try {
+    process.chdir(f.root);
+    const observed = checkoutEvidence(f.root);
+    const before = f.processes().git;
+    expect(sealCheckpointRequest({ v: 1, intent: f.intent, kind: "unit" }).outcome).toBe("sealed");
+    // Three workspace reads, four HEAD/index reads (combined HEAD/branch,
+    // cached diff, stage listing, HEAD), and one full observation's file listing
+    // + status. Before sealing reuse there were six listings/statuses: 19 Git calls.
+    expect(f.processes().git - before).toBe(9);
+    const point = JSON.parse(JSON.parse(readFileSync(path.join(f.directory, "unit.json"), "utf8")).data);
+    expect(point.candidate).toEqual(observed); // Includes status and branch, not only fingerprint.
+    // Standalone publication still performs attribution and retains deep equality.
+    expect(sealCheckpoint(f.intent, "unit", true).digest).toBe(sha(readFileSync(path.join(f.directory, "unit.json"), "utf8")));
+    const again = f.processes().git;
+    expect(sealCheckpointRequest({ v: 1, intent: f.intent, kind: "unit" }).outcome).toBe("sealed");
+    expect(f.processes().git - again).toBe(9);
+    // A later call must not reuse the earlier observation, including in the
+    // attribution-error catch inside the operation's stable-checkout scope.
+    writeFileSync(path.join(f.root, "foreign"), "unjournaled");
+    const changed = f.processes().git;
+    expect(sealCheckpointRequest({ v: 1, intent: f.intent, kind: "unit" })).toMatchObject({
+      outcome: "mismatch", paths: [{ path: "foreign", actual: sha("unjournaled") }],
+    });
+    expect(f.processes().git - changed).toBe(9);
+    expect(() => sealCheckpoint(f.intent, "unit", true)).toThrow("Unjournaled candidate change");
+  } finally { process.chdir(cwd); }
+});
+test.each(["HEAD", "index"])("in-process sealing rejects a real %s change between requests", changed => {
+  const f = fixture(); dispatchBaseline(f); f.capture(); f.change("after");
+  const cwd = process.cwd();
+  try {
+    process.chdir(f.root);
+    expect(sealCheckpointRequest({ v: 1, intent: f.intent, kind: null }).outcome).toBe("observed");
+    if (changed === "index") f.git("add", "owned");
+    else f.git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-qm", "new HEAD");
+    expect(() => sealCheckpointRequest({ v: 1, intent: f.intent, kind: "unit" })).toThrow("HEAD/index changed");
+    expect(existsSync(path.join(f.directory, "unit.json"))).toBe(false);
+  } finally { process.chdir(cwd); }
+});
 test("dispatch map uses checkoutEvidence paths, absence, modes and ignored-output exclusions", () => {
   const f = fixture();
   writeFileSync(path.join(f.root, "deleted"), "tracked");

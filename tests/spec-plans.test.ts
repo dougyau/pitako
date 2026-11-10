@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { checkoutEvidence, designatedWorkspace, digest, discoverSpec, executionAmendments, inspectionSnapshot, MAX_SPEC_BYTES, ORIGINAL_PROBLEM, preliminarySpec, specBinding, SPEC_SECTIONS, specChunks, validateSpec } from "../extensions/spec-plans.ts";
+import { checkoutEvidence, checkoutSnapshot, designatedWorkspace, digest, discoverSpec, executionAmendments, inspectionSnapshot, MAX_SPEC_BYTES, ORIGINAL_PROBLEM, preliminarySpec, specBinding, SPEC_SECTIONS, specChunks, validateSpec, withIndexReads } from "../extensions/spec-plans.ts";
 import { inspect as inspectSpec } from "../skills/execute/inspect.ts";
 import { boardWorkspace } from "../extensions/board/workspace.ts";
 import { applyCheckpoint, captureCheckpoint, checkpointDirectory, completeCheckpoint, prepareCheckpoint, restoreCheckpoint, type CheckpointIntent } from "../extensions/execute-checkpoint.ts";
@@ -27,6 +27,27 @@ function put(root: string, content = spec()) {
 }
 
 describe("spec-plan discovery and concrete input", () => {
+  test("stable checkout observations are root-local, caller-owned and operation-scoped", () => {
+    const { main, other } = fixture();
+    writeFileSync(path.join(main, "owned"), "main");
+    writeFileSync(path.join(other, "owned"), "other");
+    const original = checkoutSnapshot(main);
+    withIndexReads(() => {
+      const first = checkoutSnapshot(main);
+      first.files.owned = null;
+      first.evidence.status = "caller mutation";
+      withIndexReads(() => expect(checkoutSnapshot(main)).toEqual(original));
+      expect(checkoutSnapshot(other).files.owned).not.toEqual(original.files.owned);
+    }, true);
+    writeFileSync(path.join(main, "owned"), "after stable scope");
+    expect(checkoutSnapshot(main).evidence.fingerprint).not.toBe(original.evidence.fingerprint);
+    // Plain operations (notably restoration) must see their own checkout writes.
+    withIndexReads(() => {
+      const before = checkoutEvidence(main);
+      writeFileSync(path.join(main, "owned"), "restored");
+      expect(checkoutEvidence(main).fingerprint).not.toBe(before.fingerprint);
+    });
+  });
   test("admission amendment paths stay inside the designated worktree, including symlinks", () => {
     const { main, other } = fixture(), source = path.join(main, "human.md");
     const content = "# Human amendment\nFull source.\n";

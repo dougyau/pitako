@@ -31,11 +31,11 @@ const equal = isDeepStrictEqual;
 // worktree registration. Validate the worktree and read HEAD/index once per
 // operation, not once per checkpoint path or internal check.
 let workspaces: Map<string, ReturnType<typeof designatedWorkspace>> | undefined;
-function operation<A extends unknown[], R>(run: (...args: A) => R) {
+function operation<A extends unknown[], R>(run: (...args: A) => R, stableCheckout = false) {
   return (...args: A): R => {
     if (workspaces) return run(...args);
     workspaces = new Map();
-    try { return withIndexReads(() => run(...args)); } finally { workspaces = undefined; }
+    try { return withIndexReads(() => run(...args), stableCheckout); } finally { workspaces = undefined; }
   };
 }
 function syncDirectory(directory: string) {
@@ -600,12 +600,16 @@ function admittedProgress(intent: CheckpointIntent) {
 // A seal contains bytes, not admission authority. Only the root's durable result
 // admission confirms it as a continuation point. A pause never completes a task.
 export function sealCheckpoint(intent: CheckpointIntent, kind: "unit" | "pause", controlPermitsCapture: boolean, restored: Manifest["files"] = []) {
+  return seal(intent, kind, controlPermitsCapture, restored);
+}
+function seal(intent: CheckpointIntent, kind: "unit" | "pause", controlPermitsCapture: boolean, restored: Manifest["files"], attributedFiles?: Manifest["files"]) {
   if (controlPermitsCapture !== true) throw new Error("Native control does not permit checkpoint capture.");
   if (kind !== "unit" && kind !== "pause") throw new Error("Invalid checkpoint seal kind.");
   const { directory, manifest, steps, openPaths } = load(intent), root = intent.association.root;
   if (openPaths.size) throw new Error("Cannot seal never-closed checkpoint effects.");
   if (existsSync(path.join(directory, "restore.json"))) throw new Error("Checkpoint restoration already started.");
-  attribution(intent, manifest.files, restored);
+  // The request already attributed these exact files with the same intent/restored images.
+  if (!equal(manifest.files, attributedFiles)) attribution(intent, manifest.files, restored);
   const progress = admittedProgress(intent);
   const latest = new Map(manifest.files.map(file => [file.path, file.image]));
   for (const step of steps) for (const entry of step) latest.set(entry.path, entry.after);
@@ -744,9 +748,14 @@ function sealRequest(request: SealerRequest) {
       actual: sha256(image(root, file.path)), partiallyApplied: false })) };
   }
   if (kind === null) return { ...base, outcome: "observed" as const, ...restoration };
-  const sealed = sealCheckpoint(intent, kind, true, restoredFiles);
+  const sealed = seal(intent, kind, true, restoredFiles, current?.manifest.files);
   return { ...base, outcome: "sealed" as const, checkpointRef: sealed.checkpointRef, digest: sealed.digest, position: sealed.position, ...restoration };
 }
+// No writer is active during sealing. Its only write is the final seal under
+// .pi, excluded from the fingerprint by :(top,exclude).pi and made after the
+// stored candidate is taken (status has no pathspec), so the stored candidate,
+// including status/branch, is exactly the observation attribution verified.
+// Restoration writes checkout paths and must never opt into this scope.
 export const sealCheckpointRequest = operation((request: SealerRequest) => {
   try { return sealRequest(request); }
   catch (error) {
@@ -756,7 +765,7 @@ export const sealCheckpointRequest = operation((request: SealerRequest) => {
       candidate: { head: observed.head, fingerprint: observed.fingerprint },
       paths: error.attributionPaths as { path: string; journaled: string | null; actual: string | null; partiallyApplied: boolean }[] };
   }
-});
+}, true);
 
 // Public pre-write capture over the same storage used by the CLI. Sealing is
 // root-owned; publication is not root admission and never changes mission state.

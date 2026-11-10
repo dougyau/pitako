@@ -109,8 +109,8 @@ describe("workflow-owned execute controller", () => {
     expect(output.status, output.reason).toBe("partial");
     expect(host.calls.filter(call => call.key === "invoke-human-1.l2.t1.a2")).toHaveLength(1);
     expect(host.current().lastConfirmed).toMatchObject({ kind: "unit", taskId: "change1", position: { loop: 2, cursor: 1 } });
-    // Measured 244 including IPC Git and one shared runtime, plus twenty-five.
-    expectProcessBudget([host.processes(), recoveryComposition.processes()], 269);
+    // Measured 194 including IPC Git and one shared runtime, plus twenty.
+    expectProcessBudget([host.processes(), recoveryComposition.processes()], 214);
   });
 
   test.each(["spawn", "nonzero", "stdout", "published-crash", "state-save"])(
