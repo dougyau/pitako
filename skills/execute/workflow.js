@@ -628,6 +628,14 @@ function projection(childKey, result) {
 // Analysis keys are launch identities, not a read-only reattachment API.
 // Keep compact intentions/receipts; replay must observe the exact native producer.
 const analysisResults = new Map();
+function analysisSettled(observed, ref) {
+  let lines = typeof observed?.output === "string" ? observed.output.split(/\r?\n/) : [];
+  if (lines[0] === `Status target: run ${ref.runId ?? ref.key}` &&
+      /^Spawn budget:/.test(lines[1] ?? "") && /^Active async capacity:/.test(lines[2] ?? ""))
+    lines = lines.slice(3);
+  return observed?.ok && (observed.state === "complete" ||
+    ((lines[0] === `Run: ${ref.runId ?? ref.key}` || lines[0] === `Nested run: ${ref.runId ?? ref.key}`) && lines.includes("State: complete")));
+}
 function retainedReadOnlyOriginal(observed, ref) {
   // Management status is not the original. Prefer its complete native body;
   // only fall back to the exact associated original read by the inspector.
@@ -640,29 +648,28 @@ function retainedReadOnlyOriginal(observed, ref) {
     throw new Error("Conflicting complete retained analysis originals.");
   if (!observed?.structuredOutput && original) {
     if (!original.ok) throw new Error(original.error ?? `Complete retained read-only original unavailable for ${ref.runId ?? ref.key}.`);
-    let lines = typeof observed?.output === "string" ? observed.output.split(/\r?\n/) : [];
-    if (lines[0] === `Status target: run ${ref.runId ?? ref.key}` &&
-        /^Spawn budget:/.test(lines[1] ?? "") && /^Active async capacity:/.test(lines[2] ?? ""))
-      lines = lines.slice(3);
-    if (original.state !== "complete" && !(observed?.ok && (observed.state === "complete" ||
-        ((lines[0] === `Run: ${ref.runId ?? ref.key}` || lines[0] === `Nested run: ${ref.runId ?? ref.key}`) && lines.includes("State: complete")))))
+    if (original.state !== "complete" && !analysisSettled(observed, ref))
       throw new Error(`Read-only producer settlement uncertain for ${ref.runId ?? ref.key}; no replacement dispatched.`);
     observed = { ...ref, ...original, reused: true };
   }
   return observed;
 }
-function observeAnalysis(call) {
+function observeAnalysis(call, verifiedTaskOriginal) {
   const ref = call.ref.runId ?? call.key;
   return observeStatus(ref).then(observed => {
     if (call.ref.runId && observed?.runId && call.ref.runId !== observed.runId)
       throw new Error("Analysis producer/run identity conflicts with retained receipt.");
     const cause = barrier(observed, ref);
-    if (cause) throw nativeBarrier(cause);
-    const publishedRef = loop.review?.references?.find(ref => ref.key === call.key);
+    if (cause) throw nativeBarrier(cause, call.ref);
+    const taskOriginal = Object.values(loop.attempt?.taskReview ?? {}).find(ref => ref?.key === call.key && ref.digest);
+    const publishedRef = taskOriginal ?? loop.review?.references?.find(ref => ref.key === call.key);
     const originalRef = publishedRef ?? call.ref;
     if (publishedRef && publishedRef.runId !== call.ref.runId)
       throw new Error("Retained review publication producer conflicts with analysis identity.");
     observed = retainedReadOnlyOriginal(observed, originalRef);
+    if (taskOriginal && observed?.structuredOutput &&
+        canonicalDigest(clone(observed.structuredOutput)) !== taskOriginal.digest)
+      throw new Error(`Task review original integrity conflict with admitted digest: ${call.key}.`);
     if (call.key.includes(".review.") && observed?.structuredOutput && observed.runId === originalRef.runId) {
       // Exact narrow recovery delivers the body, not new publication. Retain the
       // original launch's witnesses without treating structuredOutputPath as one.
@@ -674,7 +681,10 @@ function observeAnalysis(call) {
         ...Object.fromEntries(Object.entries(entry).filter(([field]) => observed.results?.length || !["exitCode", "interrupted", "timedOut"].includes(field))),
       })) };
     }
-    if (!observed?.ok || !text(observed.runId) || !observed.structuredOutput) {
+    // Only reviewTask's fresh disk/digest check permits using the saved projection.
+    const verifiedProjection = verifiedTaskOriginal === taskOriginal && taskOriginal?.projection &&
+      observed?.runId === taskOriginal.runId && analysisSettled(observed, originalRef);
+    if (!observed?.ok || !text(observed.runId) || !observed.structuredOutput && !verifiedProjection) {
       if (call.barrier) throw nativeBarrier(call.barrier);
       throw new Error(`Complete retained analysis unavailable for ${ref}; no replacement dispatched.`);
     }
@@ -905,12 +915,13 @@ function analysisDispatch(requests) {
       return dispatch([request]);
     }).then(([result]) => {
       call.stage = "receipt";
-      call.ref = request.key.includes(".review.") || request.key === `${key}.l${loop.number}.demand-observation`
+      call.ref = request.key.includes(".review.") || /\.task-(reviewer|synthesis)$/.test(request.key) || request.key === `${key}.l${loop.number}.demand-observation`
         ? nativeReference(request.key, result)
         : { key: request.key, ...(text(result?.runId) ? { runId: result.runId } : {}) };
       call.barrier = barrier(result);
       return save().then(() => {
-        if (call.barrier) throw nativeBarrier(call.barrier, request.key.endsWith(".demand-observation") ? call.ref : undefined);
+        if (call.barrier) throw nativeBarrier(call.barrier,
+          request.key.endsWith(".demand-observation") || /\.task-(reviewer|synthesis)$/.test(request.key) ? call.ref : undefined);
         analysisResults.set(call.key, result);
         return result;
       });
@@ -918,6 +929,8 @@ function analysisDispatch(requests) {
       if (persistenceFailed) throw error;
       call.stage = "receipt";
       call.barrier = error?.nativeBarrier ?? null;
+      if (error?.nativeBarrier && /\.task-(reviewer|synthesis)$/.test(request.key))
+        error.nativeReference ??= clone(call.ref);
       return save().then(() => { throw error; });
     });
   }))).then(settled => {
@@ -1005,7 +1018,7 @@ function queueIntention(intention) {
   const pending = invocation.intentions ??= [];
   const existing = pending.find(entry => entry.key === intention.key);
   if (existing) {
-    if (!same(existing, intention)) throw new Error("Pending loop-io intention changed.");
+    if (!same(existing, intention)) throw new Error(`Pending loop-io intention changed: ${intention.key}.`);
   } else pending.push(clone(intention));
 }
 function queueApply(slot, input) {
@@ -1175,8 +1188,13 @@ function loopIO(slot, input, owner = loop) {
       return observeStatus(pending.ref?.runId ?? pending.ref?.key ?? childKey, true).then(observed => {
         const cause = barrier(observed, pending.ref?.runId ?? pending.ref?.key ?? childKey);
         if (cause) throw nativeBarrier(cause, pending.ref);
+        if (input.operation === "taskDelta" && observed?.ok && observed.output) return observed;
       });
-    }).then(() => { pending.dispatched = true; return save(); }).then(() => dispatch([loopIORequest(childKey, input)])).then(([result]) => {
+    }).then(observed => {
+      if (observed) return [observed];
+      pending.dispatched = true;
+      return save().then(() => dispatch([loopIORequest(childKey, input)]));
+    }).then(([result]) => {
       pending.ref = nativeReference(childKey, result);
       const cause = barrier(result, childKey);
       if (cause) throw nativeBarrier(cause, pending.ref);
@@ -1237,6 +1255,7 @@ function loopIO(slot, input, owner = loop) {
     });
   }
   const previousKey = pending.key + (pending.retry ? `.r${pending.retry}` : "");
+  if (input.operation === "taskDelta") return run();
   if (pending.dispatched && !budgetRejected(previousKey)) {
     return observeStatus(pending.ref?.runId ?? previousKey, true).then(observed => {
       const cause = barrier(observed, pending.ref?.runId ?? previousKey);
@@ -1799,10 +1818,29 @@ function workerValue(result, descriptor, task, statusRef, observed) {
     value.remaining = [checksCurrent ? "Worker has not reported completion." : "Resolve workflow gate failures."];
   value.usefulProgress = !receipt?.stalled;
   value.revival = value.status === "continue" ? value.diagnosis : null;
+  const review = descriptor.taskReview?.synthesis?.projection;
+  if (review?.notes) value.diagnosis = `${value.diagnosis.slice(0, 200)}\nNon-blocking inherited notes: ${review.notes.path}`.slice(0, 360);
+  if (review && !review.admitted) {
+    value.remaining = review.remaining?.length ? review.remaining : review.blocking.length
+      ? review.blocking : ["Resolve task review scores or spec-exclusion conflict."];
+    value.diagnosis = review.diagnosis || value.remaining.join("; ").slice(0, 360);
+    value.revival = review.revival || value.diagnosis;
+    value.usefulProgress = !invocation.taskFrame.reviewRepair?.exhausted;
+  }
+  const repair = invocation.taskFrame.reviewRepair;
+  if (repair?.exhausted) {
+    value.usefulProgress = false;
+    if (!review && repair.blocking.length) {
+      value.remaining = [...value.remaining, ...repair.blocking];
+      value.diagnosis = `${value.diagnosis.slice(0, 200)}; Prior review: ${repair.blocking.join("; ").slice(0, 140)}`;
+    }
+  }
   return { value, checks, checksCurrent };
 }
 
 function admitWorker(result, descriptor, task, recoveryRef, statusRef, observed, structural) {
+  const intents = invocation.taskFrame.reviewIntents ??= [];
+  if (!intents.some(intent => intent.key === descriptor.key)) intents.push(clone(descriptor.checkpoint));
   let parsed;
   // A report that breaks the result contract is a rejected attempt, not a root
   // halt. Its original stays in the native record; nothing from it is admitted.
@@ -1829,6 +1867,7 @@ function admitWorker(result, descriptor, task, recoveryRef, statusRef, observed,
     ...(descriptor.restore ? { restore: { observation: descriptor.restore.observation,
       receipt: value.restoreReceipt ?? null, producer: descriptor.restore.producer } } : {}),
     status: value.status, workDone: excerpt(value.workDone), diagnosis: excerpt(value.diagnosis),
+    ...(descriptor.taskReview?.synthesis ? { taskReview: clone(descriptor.taskReview) } : {}),
     knowledge: clone(value.knowledge), gateFailures: value.diagnosis.slice(0, 4096),
     remaining: value.remaining.slice(0, 4).map(excerpt), remainingCount: value.remaining.length,
     checks: { current: parsed.checksCurrent, count: parsed.checks.length,
@@ -1906,6 +1945,7 @@ function receivedResult(observed, ref) {
 function sealerKey(attemptKey, retry) {
   return `${attemptKey}.seal${retry ? `.r${retry}` : ""}`;
 }
+let settledTaskSealer;
 // A retained seal intention is observed before any fallback, recovery or re-seal.
 // Grouped closes resume verified markers; legacy seals keep the fresh-dispatch route.
 function observePendingSealer() {
@@ -1925,6 +1965,13 @@ function observePendingSealer() {
     if ((observed?.runId && ref.runId && observed.runId !== ref.runId) ||
         (observed?.agent && observed.agent !== ref.agent))
       throw new Error("Sealer producer/run identity conflicts with the pending seal.");
+    if (loop.attempt.taskReview?.synthesis && ref.agent === "pitako.checkpoint-sealer" &&
+        observed?.ok && observed.output) {
+      const receipt = JSON.parse(observed.output);
+      if (receipt.outcome === "sealed" && !same(candidate(receipt.candidate), currentCandidate))
+        throw new Error("Current candidate differs from the settled task sealer; recovery required.");
+      if (receipt.outcome === "sealed") settledTaskSealer = { key, result: observed };
+    }
   });
 }
 // Gate intentions and receipts survive relaunch; a saved seal never reruns gates.
@@ -1932,7 +1979,7 @@ function verifyAttempt(descriptor, task, value, reuse) {
   const pending = descriptor.gate ??= { key: `${descriptor.key}.gate`, stage: "intention", retry: 0 };
   if (pending.stage === "receipt") return Promise.resolve(pending.receipt);
   if (descriptor.seal) return Promise.reject(new Error("Seal intention has no durable gate receipt; recovery required."));
-  const gateTask = { id: task.id,
+  const gateTask = pending.task ??= { id: task.id,
     gates: task.gates ?? task.checks.map(check => ({ id: check.id, command: check.command, cwd: check.cwd,
       timeoutMs: check.timeoutMs ?? 1800000 })), metric: task.metric ?? null,
     progress: loop.metricSeries ?? task.progress ?? { nonImproving: 0, last5: [] } };
@@ -1943,16 +1990,18 @@ function verifyAttempt(descriptor, task, value, reuse) {
       return observeStatus(pending.ref?.runId ?? gateKey, true).then(status => {
         const cause = barrier(status, pending.ref?.runId ?? gateKey);
         if (cause) throw nativeBarrier(cause, pending.ref);
+        if (status?.ok && status.output) return status;
       });
-    }).then(() => {
+    }).then(observed => {
+      if (observed) return [observed];
       // Admission exhaustion proves no child launched and preserves this key.
       pending.stage = "intention"; pending.dispatched = true;
-      return save();
-    }).then(() => dispatch([{ ...loopIORequest(gateKey, {
-      operation: "gate", root: config.root, specId: config.id, invocation: config.invocation,
-      loop: loop.number, attempt: descriptor.number, key: gateKey, task: gateTask,
-      workerStatus: value.status, writerSettled: true, checkpoint: descriptor.checkpoint, knowledge: value.knowledge, ...(reuse ? { reuse } : {}),
-    }), timeoutMs: 14400000 }])).then(([result]) => {
+      return save().then(() => dispatch([{ ...loopIORequest(gateKey, {
+        operation: "gate", root: config.root, specId: config.id, invocation: config.invocation,
+        loop: loop.number, attempt: descriptor.number, key: gateKey, task: gateTask,
+        workerStatus: value.status, writerSettled: true, checkpoint: descriptor.checkpoint, knowledge: value.knowledge, ...(reuse ? { reuse } : {}),
+      }), timeoutMs: 14400000 }]));
+    }).then(([result]) => {
       pending.ref = nativeReference(gateKey, result);
       const cause = barrier(result, gateKey);
       if (cause) return save().then(() => { throw nativeBarrier(cause, pending.ref); });
@@ -2045,7 +2094,7 @@ function validGateReceipt(receipt, task, status) {
 }
 function closeAttempt(descriptor, task, value) {
   const savedReceipt = descriptor.close?.stage === "receipt";
-  const gateTask = { id: task.id, gates: task.gates ?? task.checks.map(check => ({ id: check.id,
+  const gateTask = descriptor.gate?.task ?? { id: task.id, gates: task.gates ?? task.checks.map(check => ({ id: check.id,
     command: check.command, cwd: check.cwd, timeoutMs: check.timeoutMs ?? 1800000 })),
     metric: task.metric ?? null, progress: loop.metricSeries ?? task.progress ?? { nonImproving: 0, last5: [] } };
   const next = checkpointIntent(task.id, descriptor.number + 1,
@@ -2105,6 +2154,141 @@ function closeAttempt(descriptor, task, value) {
     }).then(() => selected);
   });
 }
+const taskReviewFinding = object({
+  summary: string, introducedByDelta: { type: "boolean" }, affectsTask: { type: "boolean" },
+  evidence: string,
+});
+taskReviewFinding.properties.predatesTask = { type: "boolean" };
+const taskReviewAnswer = object({
+  verdict: string, score: { type: "integer", minimum: 0, maximum: 10 },
+  findings: { type: "array", items: taskReviewFinding },
+});
+const taskReviewSchema = object({
+  completeness: taskReviewAnswer, correctness: taskReviewAnswer, scope: taskReviewAnswer,
+  conflict: { type: "boolean" },
+});
+Object.assign(taskReviewSchema.properties, {
+  remaining: list(string), diagnosis: string, revival: string,
+});
+function taskReviewProjection(value, reference, carried) {
+  const questions = ["completeness", "correctness", "scope"];
+  const scores = {}, blocking = [], notes = [];
+  for (const name of questions) {
+    const answer = value?.[name];
+    if (!Number.isInteger(answer?.score) || answer.score < 0 || answer.score > 10 ||
+        !text(answer.verdict) || !Array.isArray(answer.findings) ||
+        answer.score < 10 && !answer.findings.length) throw new Error("Invalid anchored task review answer.");
+    scores[name] = answer.score;
+    for (const finding of answer.findings) {
+      if (!text(finding.summary) || !text(finding.evidence) ||
+          typeof finding.introducedByDelta !== "boolean" || typeof finding.affectsTask !== "boolean")
+        throw new Error("Invalid task review finding.");
+      (finding.introducedByDelta || finding.affectsTask || carried && finding.predatesTask !== true
+        ? blocking : notes).push(finding.summary.slice(0, 256));
+    }
+  }
+  if (typeof value.conflict !== "boolean") throw new Error("Invalid task review conflict.");
+  return { scores, admitted: Object.values(scores).every(score => score >= 9) && !blocking.length && !value.conflict,
+    blocking, conflict: value.conflict, notes: notes.length ? reference : null,
+    ...(Array.isArray(value.remaining) && value.remaining.every(text)
+      ? { remaining: value.remaining.slice(0, 4).map(item => item.slice(0, 256)) } : {}),
+    ...(text(value.diagnosis) ? { diagnosis: value.diagnosis.slice(0, 360) } : {}),
+    ...(text(value.revival) ? { revival: value.revival.slice(0, 360) } : {}) };
+}
+function reviewTask(descriptor, task) {
+  const review = descriptor.taskReview ??= {};
+  const originals = [review.reviewer, review.synthesis].filter(Boolean);
+  // Recheck published bytes on every re-entry; a cached decision is not an access receipt.
+  const access = originals.length ? (() => {
+    const prior = descriptor.taskReviewAccess;
+    if (!prior || prior.stage === "receipt")
+      descriptor.taskReviewAccess = { key: `${descriptor.key}.task-access.${(prior?.observation ?? 0) + 1}`,
+        observation: (prior?.observation ?? 0) + 1, retry: 0, stage: "intention" };
+    return loopIO("taskReviewAccess", { operation: "reviewOriginals",
+      originals: originals.map(({ key, runId, path, digest }) => ({ id: key, key, runId, path, digest })) }, descriptor).then(() =>
+      originals.reduce((previous, ref) => previous.then(() => {
+        const call = loop.analysisCalls?.find(call => call.key === ref.key);
+        if (!call) throw new Error(`Missing task review producer: ${ref.key}.`);
+        return observeAnalysis(call, ref);
+      }), Promise.resolve()));
+  })() : Promise.resolve();
+  descriptor.delta ??= { key: `${descriptor.key}.delta`, retry: 0, stage: "intention" };
+  const intents = [...new Map([...(invocation.taskFrame.reviewIntents ?? []), ...(invocation.taskFrame.sources ?? []), descriptor.checkpoint]
+    .map(intent => [intent.key, intent])).values()].sort((a, b) => a.attempt - b.attempt);
+  return access.then(() => loopIO("delta", { operation: "taskDelta", root: config.root, invocation: config.invocation,
+    intents }, descriptor)).then(delta => {
+    if (delta.unsettled === true) { review.unsettled = true; return; }
+    if (!Array.isArray(delta.touched) || !Array.isArray(delta.netChanged) || delta.netChanged.length > 200 ||
+        ![...delta.touched, ...delta.netChanged].every(text)) throw new Error("Invalid task delta evidence.");
+    if (!delta.touched.length) return;
+    const carried = !!task.remaining?.length || (task.progress?.last5?.length ?? 0) > 0 ||
+      (task.progress?.nonImproving ?? 0) > 0;
+    const brief = `Read-only per-task review. Read the complete immutable spec and its Scope and Exclusions:
+${invocation.association.source} (SHA-256 ${invocation.association.digest}).
+${fullContext()}
+Frozen amendments: ${JSON.stringify(invocation.amendments ?? [])}.
+Task definition: ${JSON.stringify(task)}.
+Delta reference: ${JSON.stringify(descriptor.delta.ref)}.
+Changed-file evidence: ${JSON.stringify(delta)}.
+Observed gate results (command definitions and status, exit, bounded tail, log reference):
+${JSON.stringify({ definitions: task.gates, results: descriptor.gate.receipt.gates })}.
+Unavailable checks are unobserved; do not deduct for that alone. carried: ${carried}.
+Answer completeness against expectedResult (for corrections, every admitted finding path);
+correctness against achieving the result without introducing failures; scope against goal,
+specRefs and the spec Scope/Exclusions. Scope limits edit locations, not required outcomes.
+Distinguish correctness from sufficiency; verify every required task outcome against current evidence.
+For each question give a verdict, score 0-10, and concrete source-evidenced findings.
+Anchors: 10 = fully satisfied, no finding; 9 = satisfied with minor concrete non-blocking findings;
+7-8 = material unmet outcome; 4-6 = major defects; 0-3 = absent or fundamentally wrong.
+Every score below 10 requires a concrete finding. Every finding states introducedByDelta,
+affectsTask (leaves goal or expectedResult undone), summary and evidence.
+Inherited-only findings never block: prove they predate the task and do not affect its goal.
+Uncertain provenance blocks; carried task defects affecting its result block regardless of origin.
+For inherited findings set predatesTask true only with concrete evidence they predate the task;
+otherwise set it false. On rejection provide remaining, diagnosis and revival for the repair.
+Prior blocking findings and synthesis original: ${JSON.stringify(invocation.taskFrame.reviewRepair ?? null)}.
+When repairing, review the whole slot delta and verify every prior blocking finding is closed.
+Report conflict when expectedResult requires a spec exclusion. No unrelated improvements.
+Finish with structured_output.`;
+    return ["reviewer", "synthesis"].reduce((previous, stage) => previous.then(() => {
+      const childKey = `${descriptor.key}.task-${stage}`;
+      if (review[stage]) return;
+      const prior = stage === "synthesis" ? review.reviewer : null;
+      return analysisDispatch([{ key: childKey, agent: "pitako.reviewer", context: "fresh",
+        cwd: config.root, label: `Task ${stage}: ${task.id}`, phase: `task-${stage}`,
+        model: invocation[stage === "reviewer" ? "taskReviewer" : "taskSynthesis"],
+        output: `${childKey}.json`, outputMode: "file-only", reads: false, progress: false,
+        skill: ["verify-behavior", "scope-discipline"], outputSchema: taskReviewSchema,
+        task: brief + (prior ? `\nStrict synthesis: read the reviewer original by path ${prior.path}
+(canonical digest ${prior.digest}); re-check every finding against source and rescore independently.
+Admit only if all three scores >=9 and no introduced or task-outcome finding blocks.` : ""),
+      }]).then(([result]) => {
+        if (!result?.ok || !result.structuredOutput) {
+          const setting = `pitako.execute.${stage === "reviewer" ? "taskReviewer" : "taskSynthesis"}`;
+          const model = invocation[stage === "reviewer" ? "taskReviewer" : "taskSynthesis"];
+          const reason = `${setting} model '${model}' failed: ${result?.error ?? "missing original"}. Fix the setting and start a new invocation; no retry or fallback model.`;
+          loop.halt = { status: "blocked", code: "task-review-model", reason,
+            ref: nativeReference(childKey, result) };
+          return save().then(() => { throw new Error(reason); });
+        }
+        const path = result.results?.find(item => text(item.savedOutputPath) && !item.outputSaveError)?.savedOutputPath;
+        if (!path || !text(result.runId)) throw new Error("Task review original was not published.");
+        const body = clone(result.structuredOutput);
+        const reference = { key: childKey, runId: result.runId, path, digest: canonicalDigest(body) };
+        review[stage] = { ...reference, projection: taskReviewProjection(body, reference, carried) };
+        if (stage === "synthesis" && !review[stage].projection.admitted) {
+          const verdict = review[stage].projection;
+          const repair = invocation.taskFrame.reviewRepair;
+          invocation.taskFrame.reviewRepair = { ...repair, source: reference, blocking: verdict.blocking,
+            remaining: verdict.remaining ?? verdict.blocking, diagnosis: verdict.diagnosis ?? "",
+            revival: verdict.revival ?? "",
+            exhausted: !!repair?.attempt || verdict.conflict };
+        }
+        return save();
+      });
+    }), Promise.resolve());
+  });
+}
 // Only the active root can turn the settled result and its saved gates into a seal.
 function sealAndAdmit(result, descriptor, task, recoveryRef, statusRef) {
   if (loop.attempt.stage === "result") throw new Error("Duplicate attempt admission rejected.");
@@ -2114,7 +2298,19 @@ function sealAndAdmit(result, descriptor, task, recoveryRef, statusRef) {
     structural = { rejection: String(error.message) };
   }
   let groupedSeal;
-  return (!structural.rejection && !recoveryRef && !descriptor.gate && !descriptor.seal
+  const complete = !structural.rejection && !recoveryRef && structural.value.status === "complete";
+  return (complete ? verifyAttempt(descriptor, task, structural.value).then(receipt => {
+    const passed = !receipt.mutated && (task.gates ?? task.checks).every(gate =>
+      receipt.gates.some(result => result.id === gate.id && result.status === "pass"));
+    return passed ? reviewTask(descriptor, task) : undefined;
+  }).then(() => {
+    // Ineligible attempts retain the grouped close, including its request observation.
+    if (!descriptor.taskReview?.synthesis && !descriptor.taskReview?.unsettled && !descriptor.seal)
+      return closeAttempt(descriptor, task, structural.value).then(receipt => { groupedSeal = receipt; });
+    return observeMainRequests(0, [], true).then(() => {
+      if (invocation.intentions?.length) return groupedIO("finishDrain", { operation: "drain" }, invocation);
+    });
+  }) : !structural.rejection && !recoveryRef && !descriptor.gate && !descriptor.seal
     ? closeAttempt(descriptor, task, structural.value).then(receipt => { groupedSeal = receipt; })
     : descriptor.close?.receipt?.projection
       ? closeAttempt(descriptor, task, structural.value).then(receipt => { groupedSeal = receipt; })
@@ -2124,17 +2320,25 @@ function sealAndAdmit(result, descriptor, task, recoveryRef, statusRef) {
   const definitions = task.gates ?? task.checks;
   const passed = receipt && !receipt.mutated && receipt.gates.length === definitions.length &&
     definitions.every(gate => receipt.gates.some(result => result.id === gate.id && result.status === "pass"));
+  const admittedReview = descriptor.taskReview?.synthesis?.projection;
+  const repair = invocation.taskFrame.reviewRepair;
+  if (repair?.attempt && (structural.rejection || structural.value.status !== "complete" ||
+      !passed || admittedReview?.admitted === false)) repair.exhausted = true;
   const kind = recoveryRef || structural.rejection ? null :
-    structural.value.status === "complete" && passed ? "unit" : "pause";
+    structural.value.status === "complete" && passed && admittedReview?.admitted !== false ? "unit" : "pause";
   const pending = loop.attempt.seal ??= { retry: 0, kind };
   if (pending.kind !== kind) throw new Error("Saved seal kind differs from its gate receipt; recovery required.");
-  const retry = pending.retry;
+  const reusedSealer = descriptor.taskReview?.synthesis && settledTaskSealer?.key === sealerKey(descriptor.key, pending.retry - 1)
+    ? settledTaskSealer : null;
+  const retry = reusedSealer ? pending.retry - 1 : pending.retry;
   const sealKey = sealerKey(descriptor.key, retry);
   const intent = descriptor.checkpoint;
   if (!intent) throw new Error("Missing checkpoint intention for root observation.");
   let ref = groupedSeal ? clone(descriptor.close.ref) : { key: sealKey, agent: "pitako.checkpoint-sealer" };
   pending.retry = retry + 1;
-  return (groupedSeal ? save().then(() => null) : save().then(() => dispatch([{ key: sealKey, agent: "pitako.checkpoint-sealer",
+  settledTaskSealer = null;
+  return (groupedSeal ? save().then(() => null) : reusedSealer ? Promise.resolve([reusedSealer.result])
+    : save().then(() => dispatch([{ key: sealKey, agent: "pitako.checkpoint-sealer",
     task: JSON.stringify({ v: 1, intent, kind,
       ...(descriptor.restore ? { restoreSources: descriptor.restore.sourceKeys.map(sourceKey => {
         const source = invocation.taskFrame.sources.find(item => item.key === sourceKey);
@@ -2566,7 +2770,14 @@ function canSaveBudgetExhaustion(error) {
 function finishBudgetExhaustion() {
   const marker = { checkpoint: invocation.lastConfirmed?.digest ?? null,
     closedLoop: loop?.archived ? loop.number : (loop?.number ?? 1) - 1,
-    ledger: clone(invocation.ledger), backlogDigest: invocation.backlogDigest ?? null };
+    ledger: clone(invocation.ledger), backlogDigest: invocation.backlogDigest ?? null,
+    taskReview: loop?.attempt ? {
+      key: loop.attempt.key, worker: loop.attempt.launch?.runId ?? null,
+      gate: loop.attempt.gate?.stage === "receipt" ? loop.attempt.gate.key : null,
+      delta: loop.attempt.delta?.stage === "receipt" ? loop.attempt.delta.key : null,
+      analyses: (loop.analysisCalls ?? []).filter(call => /\.task-(reviewer|synthesis)$/.test(call.key) &&
+        call.stage === "receipt" && call.ref.runId).map(call => call.ref.runId),
+    } : null };
   const stalled = same(marker, invocation.lastBudgetProgress);
   invocation.lastBudgetProgress = marker;
   if (stalled) loop.halt = { status: "blocked", code: "spawn-budget",
@@ -2756,12 +2967,18 @@ try {
     if (admitted.revivalContextPeak !== undefined &&
         (!Number.isSafeInteger(admitted.revivalContextPeak) || admitted.revivalContextPeak < 1))
       throw new Error("Invalid pitako.execute.revivalContextPeak admission receipt.");
+    for (const name of ["taskReviewer", "taskSynthesis"])
+      if (admitted[name] !== undefined && (typeof admitted[name] !== "string" || admitted[name].trim() !== admitted[name] ||
+          !/^[^/\s:*?,]+\/[^\s*?,]+(?::(?:off|minimal|low|medium|high|xhigh|max))?$/.test(admitted[name])))
+        throw new Error(`Invalid pitako.execute.${name} admission receipt.`);
     invocation = {
       version: config.stateVersion, association: { missionId: config.missionId, missionPath: config.missionPath,
         invocation: config.invocation, root: metadata.root, commonDir: metadata.commonDir,
         source: metadata.selected.source, digest: metadata.selected.digest,
         maxCycles: admitted.maxCycles, sourceRefs: config.sourceRefs ?? [] },
       revivalContextPeak: admitted.revivalContextPeak ?? 120000,
+      taskReviewer: admitted.taskReviewer ?? "openai-codex/gpt-6.1-sol:xhigh",
+      taskSynthesis: admitted.taskSynthesis ?? "anthropic/claude-opus-5-5:high",
       admissionBinding: current.binding, amendments: clone(config.amendments ?? []), startedAt: Date.now(), consumedLoops: 0, ledger: { count: 0, head: null }, sealPending: null,
       recoverySeq: 0, lastRecoveryRef: null, lastConfirmed: null, usageTotals: { tokens: 0, known: 0, unknown: 0 },
       tasks: {}, taskFrame: null, loop: null,
@@ -2914,7 +3131,7 @@ try {
     invocation.freshAcceptanceAuthorized = true;
     await save();
   }
-  if (["capacity", "native-dispatch", "semantic-block", "checkpoint-integrity"].includes(loop?.halt?.code))
+  if (["capacity", "native-dispatch", "semantic-block", "checkpoint-integrity", "task-review-model"].includes(loop?.halt?.code))
     return finish(loop.halt.status, loop.halt.reason);
   // A prior barrier is not a historical universal hold. Recovery re-observes the
   // exact writer or analysis producer before any further external dispatch.
@@ -3160,12 +3377,15 @@ Publish one selection with the native output binding then END. Native permission
             (invocation.taskFrame.sources ??= []).unshift(clone(loop.attempt.checkpoint));
           }
           const source = loop.attempt;
+          const repair = invocation.taskFrame.reviewRepair;
+          if (repair && !repair.attempt) repair.attempt = previous.attempt + 1;
           const peak = source.gate?.receipt?.contextPeak ?? null;
           const revival = { opinion: previous.revival?.opinion ?? "fresh", reason: previous.revival?.reason ?? "",
             ...decideRevival(source, { taskId: task.id, loop: loop.number, candidate: currentCandidate,
               halt: loop.halt, revivalContextPeak: invocation.revivalContextPeak }, peak), peak };
+          if (repair) Object.assign(revival, { decision: "fresh", code: "task-review-repair" });
           loop.attempt = { taskId: task.id, index: loop.cursor, number: previous.attempt + 1,
-            revival, ...(revival.decision === "resume" ? { resume: source.launch.runId,
+            revival, ...(revival.decision === "resume" && !repair ? { resume: source.launch.runId,
               bindingKey: source.bindingKey ?? source.key, resumeAfter: source.gate.receipt.after,
               boardPostIds: source.boardPostIds ?? [] } : {}),
             key: `${key}.l${loop.number}.t${loop.cursor + 1}.a${previous.attempt + 1}`,
@@ -3270,6 +3490,8 @@ ${JSON.stringify({ metricSeries: loop.metricSeries ?? task.progress ?? null,
   board: invocation.currentView ?? null,
   gateFailures: invocation.tasks[task.id]?.last?.gateFailures ?? null,
   previousResult: descriptor.continuationRef?.outputReference ?? descriptor.continuationRef?.outputArtifactPath ?? null })}
+TASK REVIEW REPAIR (blocking findings and synthesis original; read that original in full):
+${JSON.stringify(invocation.taskFrame.reviewRepair ?? null)}
 No other agents of this execution run concurrently. resource_snapshot is enough for host load;
 do not ask the supervisor about concurrency. Current DECISIONs are binding working rules:
 no reconfirmation is needed and they cannot expand scope. Authority: spec, frozen amendments and current HUMAN rulings (most recent human source wins; cite it) > DECISION > FINDING > HANDOFF; code wins over any map.
@@ -3320,7 +3542,12 @@ No definition => report blocked, never reconstruct scopes. Continuation reads th
 ${JSON.stringify(descriptor.continuationRef)} and addresses only useful diagnosed pending work on THIS task.
 Report {work, status, remaining, knowledge:{findings, handoff}, continuation?:{mode:"resume"|"fresh", reason}}.
 The optional continuation opinion has a reason of at most 200 characters; missing means fresh. The workflow decides whether to resume. The workflow runs the metric and gates
-after you settle, then chooses unit or pause from the gate receipt. Do not report per-check evidence,
+ after you settle. Complete file-writing tasks with passing gates receive a read-only three-question
+ task review before sealing; unit requires review admission. Rejection seals pause and allows one
+ same-slot repair with blocking findings, then gates and re-review. A rejected or incomplete repair
+ or failed repair gates leaves gaps; a spec-exclusion conflict goes to gaps without repair.
+ Tasks with no journaled write, failed gates or incomplete results skip review and retain the
+ existing close path. The root chooses and seals unit or pause; you do not. Do not report per-check evidence,
 candidate identities or checkpoint receipts. Do not run the full suite; the workflow reserves it
 for the final phase. A complete report means the task implementation is ready for focused gates.
 HANDOFF (at most 2 KiB) describes current repository locations, seams and metric state, never
@@ -3331,6 +3558,9 @@ Return structured_output after all owned journaled writes settle.`,
           workerSchema, true, dispatch, descriptor.resume);
         if (descriptor.resume && rejectedResume(result)) {
           const rejection = { ref: nativeReference(descriptor.key, result), reason: excerpt(result.error ?? result.output) };
+          // A refused child has no writes, but its authenticated baseline still belongs to the slot.
+          const intents = invocation.taskFrame.reviewIntents ??= [];
+          if (!intents.some(intent => intent.key === descriptor.key)) intents.push(clone(descriptor.checkpoint));
           loop.results.push({ ...projection(descriptor.key, result), taskId: task.id, attempt: descriptor.number,
             status: "rejected", revival: { ...descriptor.revival, decision: "fresh", code: "resume-rejected" },
             diagnosis: rejection.reason });
@@ -3787,7 +4017,8 @@ no unresolved material gaps and this SAME candidate. Otherwise gaps or blocked. 
   }
   // Child timeout is partial, NOT invocation cancellation. Native Stop is reported
   // only from an observed barrier, not inferred from an exception's task wording.
-  const stopped = ["stopped", "interrupted"].includes(error?.nativeBarrier);
+  const stopped = ["stopped", "interrupted"].includes(error?.nativeBarrier) ||
+    !!error?.nativeBarrier && /\.task-(reviewer|synthesis)$/.test(error.nativeReference?.key ?? "");
   if (stopped) reason = `Execution cancelled: ${reason}`;
   const status = stopped ? "cancelled" : error?.nativeBarrier ? "blocked" :
     loop?.halt ? loop.halt.status : error?.nativeFailure || persistenceFailed ? "partial" : "blocked";

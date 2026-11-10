@@ -9,12 +9,13 @@ import { captureBaseline, captureCheckpoint } from "../../extensions/execute-che
 import { checkoutEvidence, digest, inspectionSnapshot, specBinding, specChunks } from "../../extensions/spec-plans.ts";
 import { updateProgress, apply, reviewOriginals, cancelledScope, readBacklog } from "../../skills/execute/loop.ts";
 import { EXECUTE_STATE_VERSION } from "../../extensions/execute-state.ts";
+import { DEFAULT_TASK_REVIEWER, DEFAULT_TASK_SYNTHESIS } from "../../extensions/execute-settings.ts";
 import { verifyGate } from "../../extensions/access-receipts.mjs";
 import { MISSION_STATE_MAX_BYTES } from "../../node_modules/pi-subagents/src/missions/workflow-state.js";
 import { runWorkflowScript, type WorkflowScriptChildResult } from "../../node_modules/pi-subagents/src/workflows/scripted-workflow.js";
 
 const executeSource = readFileSync(new URL("../../skills/execute/workflow.js", import.meta.url), "utf8");
-const reviewSource = readFileSync(new URL("../../skills/review/workflow.js", import.meta.url), "utf8");
+const reviewSource = readFileSync(new URL("../../skills/workflow-canonical.js", import.meta.url), "utf8") + "\n" + readFileSync(new URL("../../skills/review/workflow.js", import.meta.url), "utf8");
 
 // Shared by tests/execute-workflow-*.test.ts. Mutable state lives in the per-file
 // factory below: each test file owns its roots and settlements, even when Bun
@@ -29,6 +30,7 @@ const globalConfig = {
 export const config = globalConfig;
 export type Candidate = { head: string; fingerprint: string };
 type Request = { key: string; agent?: string; resume?: string; context?: string; cwd?: string; task: string;
+  model?: string;
   label?: string; phase?: string; skill?: string[];
   output?: string | boolean; outputMode?: string; outputSchema?: any; timeoutMs?: number; reads?: boolean; progress?: boolean; acceptance?: any; async?: boolean };
 export type Result = Omit<Partial<WorkflowScriptChildResult>, "state"> & { ok: boolean; state?: string; structuredOutput?: any; [key: string]: any };
@@ -149,8 +151,10 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
       const required = JSON.parse(request.task.split("ESSENTIAL ORIGINALS (data): ")[1]!.split("\n")[0]!);
       for (const entry of required) {
         const original = JSON.parse(readFileSync(entry.results.find((item: any) => item.savedOutputPath).savedOutputPath, "utf8"));
-        expect(original).toEqual(entry.value);
+        expect(canonicalDigest(original)).toBe(entry.digest);
       }
+    }
+    if (request.phase?.startsWith("review-") || request.phase?.startsWith("task-")) {
       savedOutputPath = path.join(root, ".pi/subagents/review-originals", request.key + ".json");
       mkdirSync(path.dirname(savedOutputPath), { recursive: true });
       writeFileSync(savedOutputPath, JSON.stringify(value));
@@ -171,6 +175,10 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
   function normal(request: Request): Result {
     const loop = Number(request.key.match(/\.l(\d+)\./)?.[1] ?? 1);
     let value: any;
+    if (/\.task-(reviewer|synthesis)$/.test(request.key)) {
+      const answer = { verdict: "Satisfied", score: 10, findings: [] };
+      return result(request, { completeness: answer, correctness: answer, scope: answer, conflict: false });
+    }
     if (request.resume && /\.t\d+\.a\d+$/.test(request.key)) return result(request, worker(request));
     if (request.agent === "pitako.request-observer") return { ok: true, agent: request.agent,
       runId: `native-${request.key}`, output: JSON.stringify({ version: 1, ok: true,
@@ -190,6 +198,21 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
     }
     if (request.agent === "pitako.loop-io") {
       const input = JSON.parse(request.task);
+      if (input.operation === "taskDelta") {
+        let delta;
+        if (options.controlledCheckpoints) delta = {
+          touched: captures.has(input.intents.at(-1).key) ? ["src/change1.ts"] : [], netChanged: [], overflow: null,
+        };
+        else {
+          const response = spawnSync("node", [path.resolve("skills/execute/loop-io.mjs")],
+            { cwd: root, input: request.task, encoding: "utf8" });
+          if (response.status !== 0) throw new Error(response.stdout + response.stderr);
+          delta = JSON.parse(response.stdout);
+        }
+        return { ok: true, key: request.key, agent: request.agent, runId: `native-${request.key}`,
+          output: JSON.stringify(delta), results: [{ exitCode: 0 }] } as Result;
+      }
+      if (input.operation === "gate" && native.get(request.key)?.ok) return copy(native.get(request.key)!);
       const view = { topicId: 1, authority: "spec and frozen amendments > DECISION > FINDING > HANDOFF; code wins over any map", posts: options.humanPosts ?? [], omitted: 0 };
       if (input.operation !== "gate") {
         try {
@@ -372,7 +395,9 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
       const id = `${key}.${name}`;
       let result = groupSteps.get(id);
       if (!result) {
-        const response = await operation(call);
+        const cachedGate = call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "gate"
+          ? native.get(call.key) : undefined;
+        const response = cachedGate?.ok ? copy(cachedGate) : await operation(call);
         if (!response.ok || response.results?.[0]?.exitCode !== 0) throw response;
         result = JSON.parse(response.output!);
         groupSteps.set(id, result);
@@ -464,7 +489,8 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
   // the registered Node recovery cases independently exercise the real producer.
   function admissionValue(key = "inspect-initial") {
     const base = { version: 1, binding: config.preliminary.binding, checkout: copy(checkout),
-      ...(!storage.get("invoke-human-1")?.association ? { admission: { maxCycles: admittedLimit } } : {}) };
+      ...(!storage.get("invoke-human-1")?.association ? { admission: { maxCycles: admittedLimit,
+        taskReviewer: DEFAULT_TASK_REVIEWER, taskSynthesis: DEFAULT_TASK_SYNTHESIS } } : {}) };
     const value = hostResponse ? hostResponse(key, base) : base;
     return Array.isArray(value.retainedAnalyses)
       ? { ...value, recoveryDigest: digest(JSON.stringify(value.retainedAnalyses)) } : value;
@@ -498,7 +524,8 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
       hostCalls.push(key); expect(params).toEqual({ kind: "command", command: key === "execute-settings" ? "SETTINGS" : key.startsWith("inspect-") ? "READ" : "CHUNK", timeoutMs: 86400000 });
       let value: any;
       if (["inspect-initial", "inspect-initial.r1", "inspect-initial.r2"].includes(key)) value = admissionValue(key);
-      else if (key === "execute-settings") value = { maxCycles: admittedLimit };
+      else if (key === "execute-settings") value = { maxCycles: admittedLimit,
+        taskReviewer: DEFAULT_TASK_REVIEWER, taskSynthesis: DEFAULT_TASK_SYNTHESIS };
       else if (key.startsWith("inspect-")) value = transported ? { selected: { digest: selected.digest }, transport: transported.transport, checkout: copy(checkout) } : { ...metadata, checkout: copy(checkout) };
       else { const index = Number(key.slice(6)); value = transported ? transported.packets[index] : { digest: selected.digest, content: chunks[index] }; }
       return { ok: true, stdout: JSON.stringify(hostResponse && !["inspect-initial", "inspect-initial.r1", "inspect-initial.r2"].includes(key) ? hostResponse(key, value) : value), outputPath: `/native/host/${key}.log` };

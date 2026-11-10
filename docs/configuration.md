@@ -128,6 +128,40 @@ Pi and pi-subagents own model and child configuration. Pitako's former
 `config.toml`, role policies, developer routing, Head, and worker-history settings
 are not read, validated, or completed. Existing files are left untouched.
 
+Pitako owns two per-task `/execute` review model keys in Pi settings:
+
+| Key | Default |
+| --- | --- |
+| `pitako.execute.taskReviewer` | `openai-codex/gpt-6.1-sol:xhigh` |
+| `pitako.execute.taskSynthesis` | `anthropic/claude-opus-5-5:high` |
+
+Set them as nested JSON, for example:
+
+```json
+{
+  "pitako": {
+    "execute": {
+      "taskReviewer": "openai-codex/gpt-6.1-sol:xhigh",
+      "taskSynthesis": "anthropic/claude-opus-5-5:high"
+    }
+  }
+}
+```
+
+Each value must be one exact `provider/id[:thinking]` string, not a pattern or
+model list. Admission reads global agent `settings.json` (under
+`PI_CODING_AGENT_DIR`, normally `~/.pi/agent`) then project `.pi/settings.json`;
+project values override global values. Invalid values fail admission. Both
+effective models are frozen for the invocation and replay, and are always sent
+explicitly to the two read-only `pitako.reviewer` children, without substitution.
+Unknown or failing models halt blocked with the key, model and native error;
+fix the setting and start a new invocation. There is no retry or fallback model.
+Native barriers cancel and spawn-budget rejection uses the existing relaunch.
+
+This review runs between passing task gates and sealing for complete
+file-writing tasks. Rejection permits one same-slot repair and re-review; unit
+requires admission. It does not change final-phase full review or compliance.
+
 `plan` and `execute` are advertised skills, with `/plan` and `/execute` prompt
 templates. Planning gathers evidence and confirms specs without implementation;
 execution uses native pi-subagents missions and the `pitako.execute` resource

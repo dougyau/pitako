@@ -1,7 +1,14 @@
 import { expect, test } from "bun:test";
 import { copy, executeControllerFixture } from "./fixtures/execute-workflow.ts";
 
-const { fixture } = executeControllerFixture();
+const { fixture: createFixture } = executeControllerFixture();
+function fixture() {
+  const host = createFixture();
+  // These tests exercise grouped close, which is retained for tasks without journaled writes.
+  host.setRespond((request, normal) => request.agent === "pitako.worker"
+    ? host.result(request, { status: "complete", work: "Read-only task", remaining: [] }) : normal());
+  return host;
+}
 const continuation = { unblock: true, resolution: { loop: 1, text: "Continue this interrupted operation under current native policy." } };
 
 test.each(["close", "drain"])("interrupted grouped %s resumes the retained intention after fresh human input", async operation => {
@@ -30,7 +37,8 @@ test.each(["close", "drain"])("interrupted grouped %s resumes the retained inten
   expect(result.status, result.reason).toBe("partial");
   expect(host.launches.slice(count).some(call => call.key === `${retained.loop.halt.ref.key}.r1`)).toBe(true);
   expect(host.launches.filter(call => call.agent === "pitako.worker")).toHaveLength(1);
-  expect(host.records().map((record: any) => record.kind)).toEqual(["spec", "unit", "loop"]);
+  expect(host.records().map((record: any) => record.kind)).toEqual(["spec", "loop"]);
+  expect(host.current().tasks.change1.completed.status).toBe("complete");
   expect(host.current().intentions).toEqual([]);
 });
 
@@ -137,10 +145,10 @@ test("an interrupted close retry observes the in-flight retry rather than its fa
 
 test("a saved close transport cannot admit a candidate changed before replay", async () => {
   const host = fixture(); host.setLimit(1);
-  host.setFailSave(value => !!value.loop?.attempt?.close?.admitted && !value.loop.attempt.gate);
+  host.setFailSave(value => !!value.loop?.attempt?.close?.admitted && !value.loop.attempt.seal);
   expect((await host.execute()).status).toBe("partial");
   expect(host.current().loop.attempt.close.stage).toBe("receipt");
-  expect(host.current().loop.attempt.gate).toBeUndefined();
+  expect(host.current().loop.attempt.gate.stage).toBe("receipt");
   const count = host.launches.length;
   host.setFailSave();
   host.changeCheckout();
@@ -180,11 +188,12 @@ test("a cut after grouped sealing reuses the receipt without another close or wo
   const result = await host.execute();
   expect(result.status, result.reason).toBe("partial");
   expect(host.launches.slice(count).every(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "drain")).toBe(true);
-  expect(host.records().map((record: any) => record.kind)).toEqual(["spec", "unit", "loop"]);
+  expect(host.records().map((record: any) => record.kind)).toEqual(["spec", "loop"]);
+  expect(host.current().tasks.change1.completed.status).toBe("complete");
 });
 
 test.each(["pitako.checkpoint-sealer", "pitako.execution-ledger"])("retained legacy %s references still reconcile", async agent => {
-  const host = fixture(); host.setLimit(1);
+  const host = createFixture(); host.setLimit(1);
   host.setFailSave(value => agent === "pitako.checkpoint-sealer"
     ? !!value.loop?.attempt?.seal?.retry && value.loop.attempt.stage !== "result"
     : value.intentions?.some((entry: any) => entry.operation === "ledger" && entry.input.record.kind === "unit"));

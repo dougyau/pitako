@@ -37,9 +37,10 @@ test("a complete worker with failed focused gates seals pause and continues the 
   expect(output.status).toBe("partial");
   expect(readBacklog(host.root, "spec").backlog!.tasks[0]!.status).toBe("done");
   const operations = host.calls.filter(call => call.agent === "pitako.loop-io").map(call => JSON.parse(call.task).operation);
-  expect(operations).toEqual(["prepare", "apply", "baseline", "gate", "baseline", "gate", "apply"]);
+  expect(operations).toEqual(["prepare", "apply", "baseline", "gate", "baseline", "gate", "taskDelta", "apply"]);
   expect(output.boardTopicId).toBe(1);
-  expect(host.calls.some(call => call.agent === "pitako.reviewer")).toBe(false);
+  expect(host.calls.filter(call => /\.a1\.task-/.test(call.key))).toHaveLength(0);
+  expect(host.calls.filter(call => /\.a2\.task-/.test(call.key))).toHaveLength(2);
   expect(host.snapshots.every(state => !state.activePlan && !state.loop?.selection?.receipt?.backlog)).toBe(true);
   const workers = host.calls.filter(call => call.agent === "pitako.worker");
   expect(workers[0]!.key).toContain(".l1.t1.a1");
@@ -190,6 +191,8 @@ test("the sealer cannot admit a candidate changed after gates", async () => {
 
 test("a transport retry uses a new .rN close key and keeps the long explicit deadline", async () => {
   const host = taskFixture(); let failed = false;
+  host.setRespond((request, normal) => request.agent === "pitako.worker"
+    ? host.result(request, { status: "complete", work: "No writes needed", remaining: [] }) : normal());
   host.setLaunchRespond(async (request, normal) => {
     const result = await normal();
     if (request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "close" && !failed) {
@@ -502,12 +505,8 @@ test.each(["review", "compliance"])("final-phase %s findings become durable task
   host.setSaveObserver((value, bytes, serialized) => {
     peakBytes = Math.max(peakBytes, bytes);
     const retained = host.storage.get("review-invoke-human-1");
-    for (const original of retained?.originals ?? []) if (original.value?.coverage?.startsWith("LARGE_REVIEW_")) {
-      // Search for a second occurrence without splitting on the large repeated padding.
-      const first = serialized.indexOf(original.value.coverage);
-      expect(first).toBeGreaterThanOrEqual(0);
-      expect(serialized.indexOf(original.value.coverage, first + 1)).toBe(-1);
-    }
+    for (const original of retained?.originals ?? []) expect(original).not.toHaveProperty("value");
+    expect(serialized).not.toContain("LARGE_REVIEW_");
     if (value.loop?.task) {
       expect(value.loop.selection.receipt.selected).toBe(value.loop.task.id);
       expect(JSON.stringify(value.loop.selection.receipt)).not.toContain(value.loop.task.origin.ref);
@@ -813,7 +812,8 @@ test.each(["before", "after"])("consumed review compaction survives a %s persist
   host.setFailSave(value => cut === "before" ? value.loop?.reviewOriginals?.stage === "receipt" : Boolean(value.loop?.reviewSynthesis));
   expect((await host.execute()).status).not.toBe("complete");
   const retained = host.storage.get("review-invoke-human-1");
-  expect(retained.originals.every((original: any) => cut === "before" ? Object.hasOwn(original, "value") : Boolean(original.sha256))).toBe(true);
+  expect(retained.originals.every((original: any) => !Object.hasOwn(original, "value") &&
+    (cut === "before" ? Boolean(original.digest) : Boolean(original.sha256)))).toBe(true);
   const reviewers = host.calls.filter(call => call.key.includes(".review.")).length;
   host.setFailSave(undefined);
   const output = await host.execute();

@@ -116,7 +116,8 @@ test("controller resumes a new keyed attempt without bindings and sends only del
 
 test("explicit rejected resume records refusal and dispatches a fresh new key/binding", async () => {
   const host = continuingHost({ reject: true });
-  expect((await host.execute()).status).toBe("complete");
+  const outcome = await host.execute();
+  expect(outcome.status, outcome.reason).toBe("complete");
   const workers = host.calls.filter(request => request.agent === "pitako.worker");
   expect(workers.map(request => request.key)).toEqual(["invoke-human-1.l1.t1.a1", "invoke-human-1.l1.t1.a3"]);
   expect((workers[1] as any).extensionBindings["pitako.checkpoint/1"].key).toBe(workers[1].key);

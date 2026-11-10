@@ -92,7 +92,7 @@ test.each(["stopped", "permission", "technical"])("demand observation preserves 
 
 // Empty remaining lists must not erase the causal diagnosis of unfinished work.
 test.each(["gaps", "continue"])("unfinished worker %s with no remaining entries triggers one observation", async status => {
-  const host = fixture(undefined, { readOnly: true });
+  const host = fixture(undefined, { readOnly: true, controlledCheckpoints: true });
   host.setRespond((request, normal) => {
     if (request.agent === "pitako.worker" && request.key.startsWith("invoke-human-1.l1.t1.")) return host.result(request, {
       ...host.worker(request), status, remaining: [],

@@ -10,6 +10,7 @@ import * as sdk from "@earendil-works/pi-coding-agent";
 import { runToolCall } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, JsonObject } from "@earendil-works/pi-ai";
 import checkpointCreate from "../extensions/checkpoint-create.ts";
+import { EXECUTE_STATE_VERSION } from "../extensions/execute-state.ts";
 import pitako from "../extensions/index.ts";
 import { captureCheckpoint, applyCheckpoint, checkpointDirectory, checkpointEvidence, restoreCheckpoint, sealCheckpoint, type CheckpointIntent } from "../extensions/execute-checkpoint.ts";
 import { setSessionProfile } from "../extensions/profile.ts";
@@ -42,7 +43,7 @@ function fixture() {
     progress: { consumedLoops: 1, admitted: {}, previous: null } };
   const loop = { number: 1, kind: "task", task: { id: "owned" }, phase: "implementation", cursor: 0, manifest: ["owned"], results: [], plan: { stage: "admitted", ref: intent.planRef },
     attempt: { key: intent.key, taskId: "owned", index: 0, number: 1, stage: "intention", checkpoint: intent } };
-  const record = { version: 6, association, loop, consumedLoops: 1, tasks: {}, lastConfirmed: null };
+  const record = { version: EXECUTE_STATE_VERSION, association, loop, consumedLoops: 1, tasks: {}, lastConfirmed: null };
   const persist = () => state.set("invoke-fixture", record); persist();
   const binding = JSON.stringify({ "pitako.checkpoint/1": { association, key: intent.key } });
   let tool: any;

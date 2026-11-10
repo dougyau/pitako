@@ -578,17 +578,19 @@ export function readReviewOriginal(original: { id?: string; key: string; path: s
 }
 type ReviewOriginalReference = { id: string; key: string; runId: string; path: string; sha256: string };
 export function reviewOriginals(input: { originals: (ReviewOriginalReference | {
-  id: string; key: string; runId: string; path: string; value: unknown; sha256?: undefined;
+  id: string; key: string; runId: string; path: string; digest: string; sha256?: undefined;
 })[] }) {
   assert(Array.isArray(input.originals) && input.originals.every(original => record(original) &&
     [original.id, original.key, original.path].every(text) && path.isAbsolute(original.path) &&
-    (original.sha256 ? /^[a-f0-9]{64}$/.test(original.sha256) : text(original.runId) && Object.hasOwn(original, "value"))),
+    (original.sha256 ? /^[a-f0-9]{64}$/.test(original.sha256) : text(original.runId) && "digest" in original && digest(original.digest))),
   "Invalid retained review originals");
   return { originals: input.originals.map(original => {
     if (original.sha256 !== undefined) { readReviewOriginal(original); return original; }
-    const bytes = readFileSync(safePath(original.path));
-    if (canonicalDigest(JSON.parse(bytes.toString("utf8"))) !== canonicalDigest(original.value))
-      throw new Error(`Published review original conflicts with admitted value: ${original.key} at ${original.path}.`);
+    let bytes: Buffer;
+    try { bytes = readFileSync(safePath(original.path)); }
+    catch { throw new Error(`Retained review original ${original.key} missing at ${original.path}.`); }
+    if (canonicalDigest(JSON.parse(bytes.toString("utf8"))) !== original.digest)
+      throw new Error(`Published review original integrity conflict with admitted digest: ${original.key} at ${original.path}.`);
     return { id: original.id, key: original.key, runId: original.runId, path: original.path,
       sha256: createHash("sha256").update(bytes).digest("hex") };
   }) };

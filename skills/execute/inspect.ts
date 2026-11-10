@@ -73,10 +73,15 @@ export async function inspect(argv: string[]): Promise<string> {
       let admission;
       if (!admitted) {
         if (!agentDir || !path.isAbsolute(agentDir)) throw new Error("Expected absolute host agent directory for settings admission.");
-        const { executeMaxCycles, executeRevivalContextPeak } = await import("../../extensions/execute-settings.ts");
+        const { executeMaxCycles, executeRevivalContextPeak, executeTaskReviewer, executeTaskSynthesis,
+          DEFAULT_TASK_REVIEWER, DEFAULT_TASK_SYNTHESIS } = await import("../../extensions/execute-settings.ts");
         const maxCycles = executeMaxCycles(observed.root, agentDir);
         const revivalContextPeak = executeRevivalContextPeak(observed.root, agentDir);
+        const taskReviewer = executeTaskReviewer(observed.root, agentDir);
+        const taskSynthesis = executeTaskSynthesis(observed.root, agentDir);
         admission = { maxCycles,
+          ...(taskReviewer !== DEFAULT_TASK_REVIEWER ? { taskReviewer } : {}),
+          ...(taskSynthesis !== DEFAULT_TASK_SYNTHESIS ? { taskSynthesis } : {}),
           ...(revivalContextPeak !== 120000 ? { revivalContextPeak } : {}) };
       }
       const { head, fingerprint } = checkoutEvidence(observed.root);

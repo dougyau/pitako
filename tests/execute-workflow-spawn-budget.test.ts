@@ -69,6 +69,8 @@ test.each(["worker", "implementation", "close", "drain", "review", "compliance",
     let denied = false;
     let original: any;
     host.setRespond((request, normal) => {
+      if (phase === "close" && request.agent === "pitako.worker")
+        return host.result(request, { status: "complete", work: "Read-only task", remaining: [] });
       if (phase === "recovery" && request.agent === "pitako.execution-director") {
         const value = normal(); original = copy(value.structuredOutput); delete value.structuredOutput; return value;
       }
@@ -154,7 +156,7 @@ test("repeated exhaustion without progress halts for a human and names the nativ
 
 test("an admitted seal permits another budget-exhausted end and relaunch", async () => {
   const host = fixture();
-  host.setLaunchRespond((request, normal) => request.key.endsWith(".close") ? receipt(request.key) : normal());
+  host.setLaunchRespond((request, normal) => request.key.endsWith(".seal") ? receipt(request.key) : normal());
   expect((await host.execute()).status).toBe("budget-exhausted");
   // The close is admitted and its seal drained before the next exhaustion.
   host.setLaunchRespond();
@@ -190,7 +192,7 @@ test.each([
 test.each(["stopped", "native permission denial", "semantic-block"])(
   "budget relaunch preserves a recorded %s barrier without any dispatch", async cause => {
     const host = fixture();
-    host.setLaunchRespond((request, normal) => request.key.endsWith(".close") ? receipt(request.key) : normal());
+    host.setLaunchRespond((request, normal) => request.key.endsWith(".seal") ? receipt(request.key) : normal());
     expect((await host.execute()).status).toBe("budget-exhausted");
     host.current().loop.halt = { status: cause === "stopped" ? "cancelled" : "blocked",
       code: cause === "semantic-block" ? cause : "native-barrier", cause, reason: `Retained ${cause}` };
@@ -218,10 +220,12 @@ test.each(["throw", "prose", "child"])("non-budget %s failure is not misclassifi
 // Task attempts include workflow-owned gates; final acceptance has no worker or sealer.
 test("a task attempt groups requests, gate and exactly one seal after the writer", async () => {
   const host = fixture();
+  host.setRespond((request, normal) => request.agent === "pitako.worker"
+    ? host.result(request, { status: "complete", work: "Read-only task", remaining: [] }) : normal());
   expect((await host.execute()).status).toBe("complete");
   const index = host.launches.findIndex(call => call.key === "invoke-human-1.l1.t1.a1");
   expect(host.launches.slice(index - 1, index + 2).map(call => call.agent === "pitako.loop-io"
-    ? JSON.parse(call.task).operation : call.agent)).toEqual(["selection", "pitako.worker", "close"]);
+    ? JSON.parse(call.task).operation : call.agent)).toEqual(["selection", "pitako.worker", "gate"]);
   const effects = host.calls.slice(host.calls.findIndex(call => call.key === "invoke-human-1.l1.t1.a1") + 1, -1);
   expect(effects.findIndex(call => call.key.endsWith(".gate"))).toBeLessThan(effects.findIndex(call => call.agent === "pitako.checkpoint-sealer"));
   const baseline = host.calls.find(call => call.key === "invoke-human-1.l1.t1.a1.baseline")!;

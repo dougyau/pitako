@@ -1,6 +1,6 @@
 ---
 name: execute
-description: Execute complete specs through one-task ralph loops with a persistent backlog, workflow-run gates, Board memory and final-phase review/compliance.
+description: Execute complete specs through one-task ralph loops with a persistent backlog, workflow-run gates, per-task review, Board memory and final-phase review/compliance.
 ---
 
 ## Recoverable writer units
@@ -44,9 +44,11 @@ Only regular files and absence are supported; unsupported types remain explicit
 gaps. A missing checkpoint cannot be reconstructed from HEAD plus fingerprint.
 
 Capture actual affected-file bytes, including earlier WIP, before modifying.
-After journaled writes settle, return a decision-only worker report. The root dispatches
-`pitako.loop-io close` to observe the candidate and seal `unit` in-process for valid complete
-reports backed by passing gates and an unchanged candidate, or `pause` otherwise; workers never call unit/pause or echo receipts,
+After journaled writes settle, return a decision-only worker report. The root uses
+`pitako.loop-io close` for attempts not receiving task review, or the standalone
+checkpoint sealer after eligible task review. A `unit` requires a valid complete
+report, passing gates, an unchanged candidate and any required review admission;
+ otherwise the seal is `pause`; workers never call unit/pause or echo receipts,
 final candidate identity, task/attempt identity, Git HEAD or checkpoint references.
 Verification tasks without checkout writes need no pre-capture. The workflow
 captures before/after `checkoutEvidence` around gates, not the worker. Only durable root admission
@@ -353,13 +355,14 @@ Mission state stores the digest and selected task, not a copy of the file.
 
 `loop-io prepare` validates the backlog and ensures the Board topic; `apply`
 checks the digest, applies changes and validates selection. Only the workflow
-marks tasks done after a gate-backed unit seal. The worker is the only product
+marks tasks done after a gate-backed unit seal, with review admission required
+for file-writing tasks. The worker is the only product
 writer. Sequential fresh workers use four-hour attempts, reads:false and
 progress:false, no private diaries and no next-task selection. Their todo steps
 are display only, projected from the child session file, not evidence.
 
 Attempt order is worker settles → save close intention → loop-io requests →
-gate → seal → save receipt → workflow admission. No writer is active during
+gate → eligible task review → seal → save receipt → workflow admission. No writer is active during
 gates. The workflow measures the metric every attempt; focused gates run when
 the worker reports complete or the
 task has no metric. Commands have timeouts and process-group termination, bounded
@@ -383,18 +386,21 @@ digests and Board `postOnce` replay checks.
 - `advance`: drain → prepare → request observation.
 - `selection`: a separate launch after the director; drain → apply selection →
   request observation → eligible dispatch-baseline capture.
-- `close`: after the worker settles, drain → request observation → gate → seal,
+- `close`: for attempts not receiving task review, after the worker settles,
+  drain → request observation → gate → seal,
   with sealer and ledger code running in-process. It also re-observes requests
   and captures an eligible next-attempt baseline when needed. The context-peak
   record travels in the close receipt, not the gate receipt.
 - One trailing drain per invocation publishes intentions prepared by the last
   admission before finish.
 
-A normal single-attempt task loop uses about 5 launches: advance, director,
+A single-attempt task loop without task review uses about 5 launches: advance, director,
 selection, worker and close, plus the one trailing drain per invocation. Each
 extra attempt uses 2 (worker and close). This arithmetic excludes retries
 (including `.d1` director/selection retries), pagination, cancellations, recovery
-and final review/compliance flows; it is not a bound on exceptional runs.
+and task/final review/compliance flows; it is not a bound on exceptional runs.
+Eligible file-writing tasks use non-grouped `verifyAttempt`, delta evidence,
+two read-only review children and the standalone checkpoint sealer before admission.
 
 Each sub-step has a key and result-digest marker under the invocation's `.pi/`
 metadata. Same-key relaunches and `.rN` retries verify completed markers and
@@ -430,10 +436,54 @@ remain digest-only; full receipt data is not copied into mission state.
 Worker results are `{work, status, remaining, knowledge:{findings, handoff}}`;
 no per-check evidence or candidate identities. Advisory knowledge defects never
 reject work. The workflow chooses unit only for complete plus passing focused
-gates and no mutation, otherwise pause for a same-task continuation. A failed
-gate alone never ends the loop. Once seal intention exists gates are not rerun;
+gates, no mutation and admission by any required task review; otherwise pause
+for a same-task continuation or gaps as described below. A failed
+gate alone never ends the loop except after the single review repair.
+Once seal intention exists gates are not rerun;
 the sealer candidate must equal the receipt after-fingerprint or recovery is needed.
 Checkpoint/journal integrity conflicts remain barriers, not ordinary gate failures.
+
+### Per-task review and single repair
+
+Every file-writing task reporting `complete` with passing gates receives review
+after the gates and before the seal. Eligibility uses journaled `touched` paths
+across the slot's attempts, so write-then-revert tasks are reviewed even with no
+net change. Tasks with no journaled write, failed gates, or `continue`/`blocked`
+results dispatch no review children and keep the existing grouped close path.
+
+One read-only `pitako.reviewer` child answers completeness against `expectedResult`
+(including every admitted finding path for corrections), correctness without
+introducing failures, and scope against the task goal/specRefs and spec Scope and
+Exclusions. A second read-only `pitako.reviewer` child performs strict synthesis,
+rechecking findings against source and rescoring. Each question has an anchored
+0–10 score and verdict; scores below 10 require concrete findings. The brief
+contains the task, delta reference, observed gate results and deterministic
+`touched`/`netChanged` evidence. Unavailable checks are unobserved, not deductions.
+The models are frozen at admission from `pitako.execute.taskReviewer` and
+`pitako.execute.taskSynthesis`; see [configuration](../../docs/configuration.md).
+
+Admission requires all three final scores at least 9 and no blocking finding.
+Introduced defects and unmet task goals/expected results block. Inherited-only
+findings outside the task goal are non-blocking notes by reference with a bounded
+diagnosis line, not automatically created tasks. Carried-task defects affecting
+the result block regardless of origin; uncertain provenance blocks.
+
+Admission seals `unit` and settles the task done. Rejection seals `pause`,
+projected as `continue`, and allows exactly one repair attempt in the same slot,
+without consuming another `maxCycles` slot, even if the prior attempt stalled.
+The repair brief carries the blocking findings and synthesis-original reference.
+After repair, passing gates and a complete result trigger review of the whole
+slot delta, including closure of prior blocking findings. Admission seals `unit`;
+a second rejection, failed repair gates or incomplete repair seals `pause` and
+leaves the task pending as gaps for the director, with no further same-loop repair.
+A synthesis conflict with spec Exclusions goes directly to gaps without repair.
+
+Review references and compact verdicts are saved before the seal intention;
+report bodies remain on disk, verified by canonical digest. The sealer's
+gate-candidate check ensures reviewed bytes are sealed bytes. Native barriers
+cancel, spawn-budget rejection uses the existing relaunch, and other review-model
+failures halt `blocked` naming the setting, model and native error. There is no
+retry or fallback model; fix the setting and start a new invocation.
 
 Continuations contain task, metric series, last handoff, Board view, gate failure
 summary and previous-result path, with no frozen attempt descriptor. Full specs
@@ -510,7 +560,8 @@ to avoid dropping cross-cutting constraints for a small context saving.
 Only when no implementation task is pending, a final-phase loop (also consuming
 one maxCycles slot) runs backlog acceptance commands: the project's complete
 procedure, then full shared adversarial review, then frozen-spec/amendment
-compliance, all on the same candidate. No task-loop review or compliance runs.
+compliance, all on the same candidate. Per-task review does not replace this
+final-phase review; compliance runs only in the final phase.
 Review and compliance receive current HUMAN rulings, excepted acceptance results
 and acceptanceHistory (at most eight entries), as well as done/obsolete reasons
 and current DECISIONs. Review/compliance gaps become new tasks with origin

@@ -6,6 +6,7 @@ const { fixture } = executeControllerFixture();
 test("only loop-io requests carry the fixed idle control, including transport and director retries", async () => {
   const host = fixture();
   const failed = new Set<string>();
+  let workers = 0;
   host.setLaunchRespond(async (request, normal) => {
     if (request.agent === "pitako.loop-io" && ["advance", "close"].includes(JSON.parse(request.task).operation) &&
         !failed.has(JSON.parse(request.task).operation)) {
@@ -16,6 +17,10 @@ test("only loop-io requests carry the fixed idle control, including transport an
   });
   host.setRespond((request, normal) => {
     const result = normal();
+    if (request.agent === "pitako.worker" && workers++ === 0) {
+      result.structuredOutput.status = "continue";
+      result.structuredOutput.remaining = ["Finish assigned implementation"];
+    }
     if (request.key === "invoke-human-1.l1.director") result.structuredOutput.select = "unknown";
     return result;
   });

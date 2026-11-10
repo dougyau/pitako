@@ -7,7 +7,7 @@ import { publish, safePath } from "../../extensions/hash-ledger.mjs";
 import { canonicalDigest, canonicalJSON, sha256 } from "../../extensions/canonical.mjs";
 import { observeRequests } from "./observe.mjs";
 const { viewBudget } = await import("../../extensions/board/store.ts");
-const { captureBaseline, sealCheckpointRequest } = await import("../../extensions/execute-checkpoint.ts");
+const { captureBaseline, checkpointTaskDelta, sealCheckpointRequest } = await import("../../extensions/execute-checkpoint.ts");
 const { checkoutEvidence } = await import("../../extensions/spec-plans.ts");
 const { prepare, apply, gate, currentHumanPostIds, readBacklog, reviewOriginals } = await import("./loop.ts");
 
@@ -185,9 +185,28 @@ export async function drain(input, { afterEffect = () => {}, afterStep = () => {
   });
 }
 
+export function taskDelta({ root, invocation, intents }) {
+  if (root !== process.cwd() || !Array.isArray(intents) ||
+      intents.some(intent => intent.association.root !== root || intent.association.invocation !== invocation))
+    throw new Error("Task delta loop-io association mismatch");
+  let delta;
+  try { delta = checkpointTaskDelta(intents); }
+  catch (error) {
+    // The sealer owns never-closed-effect recovery; do not review uncertain bytes.
+    if (error.message === "Task delta requires settled checkpoint effects.") return { unsettled: true };
+    throw error;
+  }
+  const { touched, netChanged } = delta;
+  const overflow = netChanged.slice(200);
+  const reference = overflow.length ? publishResult(
+    path.join(ledgerPath(root, invocation), "task-deltas", canonicalDigest(overflow)),
+    { result: overflow, resultDigest: canonicalDigest(overflow) }) : null;
+  return { touched, netChanged: netChanged.slice(0, 200), overflow: reference };
+}
+
 async function runOperation(operation, input) {
-  const operations = { prepare, apply, gate, reviewOriginals, baseline: captureBaseline };
-  if (!Object.hasOwn(operations, operation)) throw new Error("Expected loop-io prepare, apply, gate, reviewOriginals, baseline or drain");
+  const operations = { prepare, apply, gate, reviewOriginals, baseline: captureBaseline, taskDelta };
+  if (!Object.hasOwn(operations, operation)) throw new Error("Expected loop-io prepare, apply, gate, reviewOriginals, baseline, taskDelta or drain");
   if (operation === "apply") input.currentHumanIds = await currentHumanPostIds(input);
   const value = await operations[operation](input);
   if (operation === "apply") {
